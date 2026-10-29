@@ -291,3 +291,70 @@ def test_acceptance_file_runs_only_the_named_file(leerie, tmp_path,
         tmp_path / "l.log", "t"))
     assert len(ran) == 1 and "/pkg/src/a.test.ts" in ran[0], ran
     assert ran[0].count("--exclude ") == 3, ran
+
+
+# --------------------------------------------------------------------------
+# A declared `test_scoped` is the operator's command: its direct form is
+# derived from it, wrapper and environment kept (DESIGN §9 *Operands that
+# are already test files take the runner's direct form*). Before, a repo
+# that declared one ran `related` over every named test file.
+# --------------------------------------------------------------------------
+
+WRAPPED_RELATED = ("NODE_OPTIONS=--max-old-space-size=8192 ./scripts/db.sh "
+                   "npx vitest related --run {files} --passWithNoTests")
+
+
+@pytest.mark.parametrize("declared,derived", [
+    (WRAPPED_RELATED,
+     "NODE_OPTIONS=--max-old-space-size=8192 ./scripts/db.sh "
+     "npx vitest run --run {test_files} --passWithNoTests"),
+    # Quoting survives: the raw text is edited, never rebuilt from a scan.
+    ('NODE_OPTIONS="--a --b" npx vitest related {files}',
+     'NODE_OPTIONS="--a --b" npx vitest run {test_files}'),
+    ("npx jest --ci --findRelatedTests {files} --passWithNoTests",
+     "npx jest --ci --runTestsByPath {test_files} --passWithNoTests"),
+    # Not readable as one: used as written.
+    ("npx vitest related $(cat extra) {files}", None),     # a substitution
+    ("npx jest --findRelatedTests {files} | tee o", None),  # a pipe
+    ("x related {files}", None),                           # no known runner
+    ("npx vitest run related {files}", None),     # `related` is a filter here
+    ("npx vitest related {files} {files}", None),          # {files} twice
+    ("pytest -q {test_files}", None)])
+def test_a_declared_affected_form_yields_its_direct_form(leerie, declared,
+                                                         derived):
+    assert leerie._derive_test_files_scoped(declared) == derived
+
+
+def test_resolution_derives_from_a_declared_test_scoped(leerie, tmp_path):
+    """Inputs disagree: the inferred form (`npx vitest run …`), the declared
+    test_scoped and its derivation are three different strings, so a read
+    of the wrong one cannot pass."""
+    root = _repo(tmp_path / "1", "vitest.config.ts",
+                 f'test_scoped = "{WRAPPED_RELATED}"\n')
+    got = leerie.resolve_test_files_scoped(root)
+    assert got == leerie._derive_test_files_scoped(WRAPPED_RELATED)
+    assert got not in (WRAPPED_RELATED, VITEST_RUN)
+    # The diff proxy keeps the declaration as written.
+    assert leerie.resolve_blt_scoped(root)["test"] == WRAPPED_RELATED
+    # A declared test_files_scoped still wins over the derivation.
+    both = _repo(tmp_path / "2", "vitest.config.ts",
+                 f'test_scoped = "{WRAPPED_RELATED}"\n'
+                 'test_files_scoped = "y run {test_files}"\n')
+    assert leerie.resolve_test_files_scoped(both) == "y run {test_files}"
+
+
+def test_acceptance_runs_the_derived_form_with_its_wrapper(
+        leerie, tmp_path, monkeypatch):
+    """Call site `_run_acceptance_file`, executed, on a repo declaring the
+    wrapped `related` form: the launched command is the direct form behind
+    the same wrapper and heap, and the exclusions still reach vitest."""
+    root = _colliding_repo(tmp_path, f'test_scoped = "{WRAPPED_RELATED}"\n')
+    ran = _capture_runs(leerie, monkeypatch)
+    asyncio.run(leerie._run_acceptance_file(
+        _st(root), dict(leerie.DEFAULT_CAPS), str(root), "src/a.test.ts",
+        tmp_path / "l.log", "t"))
+    assert len(ran) == 1, ran
+    assert ran[0].startswith(
+        "NODE_OPTIONS=--max-old-space-size=8192 ./scripts/db.sh npx vitest "
+        "run --run src/a.test.ts --passWithNoTests --exclude "), ran
+    assert "related" not in ran[0]

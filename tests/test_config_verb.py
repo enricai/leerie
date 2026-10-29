@@ -1446,3 +1446,23 @@ def test_lang_layer_hash_stable_on_identical_regen(tmp_path):
     r1 = _run_lang_layer(tmp_path, **kwargs)
     r2 = _run_lang_layer(tmp_path, **kwargs)
     assert r1.stdout == r2.stdout, "identical inputs must produce identical output"
+
+
+def test_bare_names_test_scoped_as_test_files_scoped_source(tmp_path):
+    """An undeclared test_files_scoped is derived from a declared
+    test_scoped at runtime; the provenance says so instead of 'inferred'."""
+    user_repo = tmp_path / "repo"
+    (user_repo / ".leerie").mkdir(parents=True)
+    (user_repo / ".leerie" / "config.toml").write_text(
+        'test_scoped = "npx vitest related --run {files}"\n')
+    stdout, _, _, _ = _run_config(user_repo, [], tmp_path)
+    line = next(l for l in stdout.splitlines()
+                if l.strip().startswith("test_files_scoped"))
+    assert "derived from test_scoped at runtime" in line, stdout
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    (tmp_path / "b").mkdir()
+    stdout, _, _, _ = _run_config(bare, [], tmp_path / "b")
+    line = next(l for l in stdout.splitlines()
+                if l.strip().startswith("test_files_scoped"))
+    assert "inferred at runtime" in line, stdout

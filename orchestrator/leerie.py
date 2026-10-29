@@ -36039,6 +36039,65 @@ def _js_runner_scoped_templates(repo_root: Path) -> tuple[str, str] | None:
     return None
 
 
+# Each JS runner's impact-analysis selector and its direct-form counterpart,
+# as argv words (a fixed CLI surface): what turns a declared diff template
+# into one over named test files.
+_RUNNER_DIRECT_SELECTORS: dict[str, tuple[str, str]] = {
+    "vitest": ("related", "run"),
+    "jest": ("--findRelatedTests", "--runTestsByPath"),
+}
+
+
+def _derive_test_files_scoped(template: str) -> str | None:
+    """The direct form of a declared impact-analysis `test_scoped`, or None
+    when it cannot be read as one (DESIGN §9 *Operands that are already
+    test files take the runner's direct form*). The declaration is the
+    operator's command — a wrapper, an environment, options — so only two
+    words change: the runner's selector (`_RUNNER_DIRECT_SELECTORS`) and
+    `{files}`, which becomes `{test_files}`. Read only as one simple command
+    whose words carry no substitution, naming exactly one known runner with
+    its selector and `{files}` once each (for vitest, `related` as its first
+    non-option word, the subcommand); the words are replaced in the raw
+    text, never rebuilt from the scan (which drops quotes), and the result
+    is kept only if it scans to the same tokens with exactly those two
+    changed."""
+    scanned = _shell_scan(template)
+    if scanned is None or scanned[1]:
+        return None
+    tokens = scanned[0]
+    if any(k != "word" or d != 0 or "$" in t or "`" in t
+           for k, t, d in tokens):
+        return None
+    words = [t for _k, t, _d in tokens]
+    if words.count("{files}") != 1 or template.count("{files}") != 1:
+        return None
+    found = [(r, at) for r in _RUNNER_DIRECT_SELECTORS
+             for at in _runner_positions(tokens, r)]
+    if len(found) != 1:
+        return None
+    runner, at = found[0]
+    affected, direct = _RUNNER_DIRECT_SELECTORS[runner]
+    after = words[at + 1:]
+    if after.count(affected) != 1:
+        return None
+    if runner == "vitest" and next(
+            (w for w in after if not w.startswith("-")), None) != affected:
+        return None
+    hits = list(re.finditer(rf"(?<![^\s]){re.escape(affected)}(?![^\s])",
+                            template))
+    if len(hits) != 1:
+        return None
+    m = hits[0]
+    derived = (template[:m.start()] + direct + template[m.end():]
+               ).replace("{files}", "{test_files}")
+    rescanned = _shell_scan(derived)
+    want = [(k, {affected: direct, "{files}": "{test_files}"}.get(t, t), d)
+            for k, t, d in tokens]
+    if rescanned is None or rescanned[0] != want:
+        return None
+    return derived
+
+
 def resolve_test_files_scoped(repo_root: Path) -> str | None:
     """The scoped test template for operands that are already test files —
     every caller of `_acceptance_cmd` — or None when there is none.
@@ -36047,14 +36106,17 @@ def resolve_test_files_scoped(repo_root: Path) -> str | None:
     affects; handed test files, its impact-analysis form only adds a
     whole-suite module-graph walk (DESIGN §9 *Operands that are already
     test files take the runner's direct form*). Resolution: a declared
-    `test_files_scoped`; else a declared `test_scoped`, as written (the
-    operator's command, and correct over test files, if slower); else the
-    inferred vitest/jest direct form; else `resolve_blt_scoped`'s inferred
-    template, which for every other runner is already over `{test_files}`."""
+    `test_files_scoped`; else a declared `test_scoped`, its direct form
+    when `_derive_test_files_scoped` can read one off it, else as written
+    (correct over test files, if slower); else the inferred vitest/jest
+    direct form; else `resolve_blt_scoped`'s inferred template, which for
+    every other runner is already over `{test_files}`."""
     declared = _load_blt_config(repo_root) or {}
-    for key in ("test_files_scoped", "test_scoped"):
-        if declared.get(key):
-            return declared[key]
+    if declared.get("test_files_scoped"):
+        return declared["test_files_scoped"]
+    if declared.get("test_scoped"):
+        return (_derive_test_files_scoped(declared["test_scoped"])
+                or declared["test_scoped"])
     js = _js_runner_scoped_templates(repo_root)
     if js:
         return js[1]
@@ -45782,7 +45844,7 @@ def _vitest_filter_colliders(tree: str | Path, files: list[str]) -> list[str]:
     `src/a.test.tsx` and `pkg/src/a.test.ts`. The walk skips what vitest's
     own default exclude skips (`**/node_modules/**`, `**/.git/**`) and does
     not follow a symlinked directory: walking `node_modules` would cost
-    about 1.1 s per render on barnacle (58k of its 61k files), against
+    about 1.1 s per render on funeralworks (58k of its 61k files), against
     0.08 s without it."""
     named = {os.path.normpath(f) for f in files}
     parts = [tuple(Path(f).parts) for f in named]

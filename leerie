@@ -1372,7 +1372,10 @@ test = "$_test_val"
 #
 # Commands over files that are already tests (held-out acceptance sets,
 # reruns) use the runner's direct form instead; {test_files} expands to
-# those files. Without it, a declared test_scoped is used for them as well.
+# those files. Without it, leerie derives it from a declared test_scoped
+# (vitest related -> vitest run, jest --findRelatedTests -> --runTestsByPath,
+# wrapper and environment kept) and uses a test_scoped it cannot read that
+# way as written. Uncomment only to override that:
 # test_files_scoped = "npx vitest run {test_files} --passWithNoTests"
 TOML
         echo "Created $config_path"
@@ -1462,6 +1465,13 @@ PY
           fi
           if [ -n "$val" ]; then
             printf '  %-13s = %-40s  [config]\n' "$axis" "$val"
+            [ "$axis" = test_scoped ] && _test_scoped_declared=1
+          elif [ "$axis" = test_files_scoped ] \
+              && [ -n "${_test_scoped_declared:-}" ]; then
+            # Derived by the orchestrator, not here (no second derivation
+            # to drift): name the source, not a guessed value.
+            printf '  %-13s = %-40s  [%s]\n' "$axis" "(not set)" \
+              "derived from test_scoped at runtime"
           else
             printf '  %-13s = %-40s  [%s]\n' "$axis" "(not set)" \
               "inferred at runtime"

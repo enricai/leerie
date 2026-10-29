@@ -9717,9 +9717,27 @@ runners with no impact analysis the two are the same `{test_files}`-tier
 template. Over `{test_files}`, a name that is not test-shaped renders
 nothing, so a source file can never reach the direct form, where it would
 mean something else. A repo may declare the direct form as
-`test_files_scoped`; otherwise a declared `test_scoped` serves both kinds
-as written (`related` over a test file still runs that test, only slower),
-and only then are the inferred forms used. The direct form must still
+`test_files_scoped`. Otherwise a declared `test_scoped` is the operator's
+command for this runner — its wrapper, its environment, its options — and
+the direct form is derived from it, not from a fresh inference that would
+drop them: the impact-analysis selector of the runner it names is swapped
+for that runner's direct one (`vitest related` → `vitest run`, `jest
+--findRelatedTests` → `jest --runTestsByPath`) and `{files}` for
+`{test_files}`, every other word kept as written. The rule is the
+invariant above applied to a declared command, not a special case: before
+it, a repo that had declared `test_scoped` (funeralworks declares its
+`related` form behind a database wrapper and a raised Node heap, both of
+which an inferred `npx vitest run` would lose, the heap measured as an OOM
+in its own config's note) kept the whole-suite walk for every named test
+file, because the declaration it made for diffs silently also served test
+files: on a funeralworks clone with its real config, one acceptance file
+took a median 18.6 s through the declared `related` form and 2.05 s through
+the derived `run` form, five interleaved runs each, same verdict every
+run. A declared command leerie cannot read that way — not one simple
+command, a substitution in it, no runner it knows, or no selector to swap
+— is used as written (`related` over a test file still runs that test,
+only slower), and only with nothing declared are the inferred forms used.
+The direct form must still
 run exactly the files it names, and vitest's does not by itself: its
 positionals are case-insensitive substring filters over each test file's
 path relative to its project root, with no option for exact selection, so
@@ -9741,7 +9759,7 @@ already matches exactly. When the flags cannot be placed as vitest's own
 last arguments (a package-manager script call, a pipe after it) and a
 collider exists, there is no command at all, never one that runs more than
 it names. The listing skips what vitest's default exclude skips
-(`node_modules`, `.git`), which keeps it at 0.08 s on barnacle's 61k-file
+(`node_modules`, `.git`), which keeps it at 0.08 s on funeralworks' 61k-file
 tree instead of 1.1 s; re-measured there with a planted collider, five
 interleaved runs each, `vitest run <file>` took a median 1.99 s (wrong
 verdict: 1 failed, 1 passed), the rendered command 2.00 s (1 passed), and
