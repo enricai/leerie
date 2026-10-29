@@ -9396,15 +9396,35 @@ Three layers follow, each derived from that one list:
   with pnpm 11.21 in a workspace (root, `@s/a`, `@s/b`) and a
   single-package repo, each `test` echoing a marker: `--filter @s/a`,
   `-F`, `--filter-prod`, `@s/*`, `./packages/**`, `{packages/a}` and
-  `...@s/a` never ran the root's `test`, the script a forbidden `pnpm
-  test` names; `*`, `**`, `.`, the root's own name and a glob matching it
-  did, and in the single-package repo so did `--filter <its name>`. So a
+  `./*` never ran the root's `test`, the script a forbidden `pnpm test`
+  names; `*`, `**`, `.`, the root's own name and a glob matching it did,
+  and in the single-package repo so did `--filter <its name>`. So a
   `--filter`/`-F`/`--filter-prod` value is read like a selector: a
   whole-suite entry that names no filter hits a filtered run only when
-  one of its filters selects the root package — `*`, `**`, `.`, `./`,
-  `{.}`, a name pattern matching the root package's name, or, read
-  conservatively, an exclusion (`!x`) or changed-since (`[ref]`)
-  selector, whose packages the matcher cannot list. The root's name comes
+  the run selects the root package. Round-6 review M1 found four ways a
+  filter list selects it that the first reading missed, each measured
+  with pnpm 11.21 in the same workspace and in one whose root lists
+  `@s/a` as a `workspace:*` devDependency:
+  - `-w`/`--workspace-root` beside a filter adds the root: `pnpm -w
+    --filter @s/a test` ran `a` and the root, wherever the flag stands
+    (before the filter, after it, among `run`'s own options);
+  - a path selector — one starting with `.`, or braced — selects the root
+    when its glob matches `.`: `./**`, `{./**}`, `{**}`, `./`, `{.}` ran
+    the root, while `./*` ran nothing and `{./packages/**}` only the
+    packages;
+  - a dependency-closure selector (`...x`, `x...`, `^x`, `...^x`,
+    `x^...`) selects the root whenever the root is in the closure:
+    `...@s/a` ran `a`, `b` and the root once the root depended on `@s/a`,
+    and `a` and `b` without that edge. The matcher does not read the
+    workspace's dependency graph, so it reads every closure selector
+    conservatively, as it reads an exclusion (`!x`) or a changed-since
+    (`[ref]`) selector, whose packages it cannot list either: as
+    selecting the root. That refuses `pnpm --filter '...@s/a' test` in a
+    repo whose root depends on nothing — a false refusal, never a miss.
+  So a filter list selects the root when any value is `*`, `**`, a path
+  glob matching `.`, a name pattern matching the root package's name, a
+  closure, exclusion or changed-since selector, or when `-w` stands
+  beside it. The root's name comes
   from `package.json`: `_process_constraints` records it on the
   whole-suite entry (`package_name`), since the hook reads no repository.
   `pnpm -r test` with no filter stays a whole-suite run: measured, it ran
@@ -9480,22 +9500,51 @@ Three layers follow, each derived from that one list:
   command's `export NAME=value`, bare assignment or `source <file>`
   statements count for every command it runs, an over-reading that can
   only add hits. A derived entry keeps the body's environment unless that
-  environment tells the script apart from nothing:
+  environment cannot be what the task forbade:
   - the script is the repo's own test command (`_canonical_test_command`):
     it is the suite, and its environment is how the repo runs the suite,
     so the runner in any environment runs what the task forbade. `"test":
     "cross-env TZ=UTC vitest run"` still derives `vitest run`, and a
     worker's `npx vitest run` is refused (review M2);
-  - or no other script, and not the repo's test command, runs that runner
-    without that environment: the environment is how this repo runs that
-    runner at all, not what makes this script different.
+  - or every token of the environment is a test-hygiene assignment, one
+    that changes how a run reports or how much memory it gets, never what
+    it touches: `TZ`, `CI`, `FORCE_COLOR`, `NO_COLOR`, `LANG`, `LC_*`, and
+    `NODE_OPTIONS` carrying only `--max-old-space-size`,
+    `--max-semi-space-size` and `--inspect*` flags. `"test:ui": "cross-env
+    TZ=UTC vitest run"` derives `vitest run`. An env file, `env -i`/`-u`,
+    an env-cmd environment or any other variable is not hygiene.
   Otherwise the derived entry carries the environment
   (`NODE_ENV=production vitest run`), and the sibling scan names only the
-  scripts that set it too. The rule needs no list of which variables
-  matter: the repository says so, by running the same runner both ways.
+  scripts that set it too. The second rule first read "no other script
+  runs that runner without the environment", and round-6 review L2 found
+  its failure: in a turborepo-shaped root (`"test": "turbo run test"`)
+  the only root script that calls vitest is the one carrying the
+  dangerous `DATABASE_URL`, so the rule dropped the environment and a
+  forbidden `pnpm run test:db` refused every vitest run in the repo,
+  leerie's own scoped launches included. The fixed list costs the other
+  direction, accepted: a repo whose only vitest script is `NODE_ENV=test
+  vitest run`, not its test command, keeps that environment, and a plain
+  `vitest run` passes the forbid.
+
+  *An environment set on a script call reaches the script's body.*
+  `NODE_ENV=production pnpm test` and `export NODE_ENV=production && pnpm
+  test` run `"test": "vitest run"` in production, which is exactly a
+  forbidden `"test:db2": "NODE_ENV=production vitest run"` (round-6
+  review L3). The hook reads no `package.json`, so the join is made where
+  the repository is read: the sibling scan also runs each script's body
+  under every forbidden entry's environment, and a script whose body then
+  hits the entry is forbidden by name *in that environment*
+  (`NODE_ENV=production pnpm run test`), under the same containment rule
+  as any entry with an environment. A plain `pnpm test` stays allowed.
+  Such an entry never names its script to the runtime guard
+  (`LEERIE_FORBIDDEN_SCRIPTS`), which sees a lifecycle name and no
+  environment, and would refuse the plain run too.
   What it cannot see: a different spelling of the same environment
   (`NODE_ENV=production` typed against an entry that loads
-  `.env.production`), since an env file's content is not read.
+  `.env.production`), since an env file's content is not read; and an
+  assignment the body makes over the call's (`NODE_ENV=production pnpm
+  test` with `"test": "NODE_ENV=test vitest run"` reads as both, a false
+  refusal), since the environment is read as a set of tokens.
   Hooks fire
   under `--dangerously-skip-permissions`. The hook fails open (a crash
   allows the call; the deny rules still stand) — a matcher bug must not
@@ -9611,6 +9660,57 @@ running `pnpm test` were both refused, and `npm run lint` ran. Not
 covered by any layer, deliberately: running the script's body directly
 (`node scripts/t.js`) — that is a different command, and no package
 manager is involved.
+
+**Scope of the forbidden-command matcher.** Six review rounds widened the
+matcher spelling by spelling; after round 6 its scope is frozen, and the
+limits below are documented rather than chased. What it guarantees:
+
+- *The orchestrator's own commands go through a code gate.* Every
+  orchestrator-side launch of a repository command passes
+  `_blt_shell_argv`, which refuses a hit, and a refused run is no verdict
+  for its caller, never a pass (above). This is the enforced layer: a
+  forbidden command leerie would run itself does not run in any spelling
+  the matcher reads.
+- *Every spelling it reads is read the same in both places.* The worker
+  hook runs the same matcher over the same entries (derived ones
+  included), so a worker and the orchestrator are refused the same set.
+- *Readings it cannot settle lean to refusal* where the run could be the
+  forbidden one and the matcher lacks the repository fact that would tell
+  (a pnpm exclusion, changed-since or closure selector; `npm -w`, `yarn
+  workspace`, `bun --filter`), and to allowing only where the miss is
+  named below.
+- *An entry exists only on the task's own words* (a verbatim quote,
+  checked by code), and the matcher never raises: an error reads as no
+  hit.
+
+For workers, the deny rules plus the hook (and the runtime script guard)
+are a best-effort guard on the command a worker writes, not a security
+boundary: the hook fails open, a deny rule sees only literal text, and a
+worker can always reach the same run through a program the matcher does
+not model. Known limits, each a miss unless marked as a false refusal:
+
+- *Config-dependent selection.* A selector list naming every project
+  (`--project unit --project e2e`, `--selectProjects unit e2e`, `-p p1 -p
+  p2`), a partial glob that matches all (`-p 'p*'`), `cargo test -p` or
+  `--lib` in a workspace that has nothing else, `rspec --only-failures`,
+  and a run listing every package or file by name (`go test ./a ./b`):
+  the answer lives in the runner's config or state.
+- *Workspaces it cannot enumerate.* pnpm closure (`...x`, `x...`, `^`),
+  exclusion (`!x`) and changed-since (`[ref]`) selectors read as selecting
+  the root (false refusal when they do not); `npm -w`, `yarn workspace`
+  and `bun --filter` read as whole-suite runs (false refusal); only the
+  root `package.json`'s scripts are read, so a forbidden script in a
+  workspace package, or the suite a task runner (`turbo run test`, `nx
+  test`) fans out to, derives nothing.
+- *Environment it does not read.* An env file's content (`NODE_ENV=production`
+  against an entry that loads `.env.production`); an assignment the body
+  makes over the caller's (false refusal); and Python's `dotenv run`
+  (python-dotenv's CLI), which the matcher parses as dotenv-cli and reads
+  as running a command named `run`.
+- *Programs it does not model.* A script's body run directly (`node
+  scripts/t.js`), a Makefile target, a test runner launched by another
+  tool it does not unwrap (`coverage run -m pytest`), and a runner not in
+  its runner tables.
 
 The derivation reads the target repo's files on every worker spawn, so it is
 total: an unreadable or odd ini file (`testpaths` from `pytest.ini`,

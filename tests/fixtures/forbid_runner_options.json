@@ -4107,5 +4107,475 @@
     "ran": []
    }
   ]
+ },
+ "pnpm filters r6": {
+  "_how": "Round-6 review M1. Real pnpm 11.21 through real bash: `ws` is a workspace (root package `root`, packages/a `@s/a`, packages/b `@s/b`, `@s/b` depending on `@s/a` as `workspace:*`); `wsdep` is the same with the root also listing `@s/a` as a `workspace:*` devDependency; `single` a one-package repo named `solo`. Every package's `test` echoes a marker, the root's as `root`; `ran` lists whose `test` ran. No install is needed: pnpm reads the graph from the manifests.",
+  "rows": [
+   {
+    "repo": "ws",
+    "cmd": "pnpm test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter './**' test",
+    "ran": [
+     "a",
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '{./**}' test",
+    "ran": [
+     "a",
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '{**}' test",
+    "ran": [
+     "a",
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter './**/*' test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter './*' test",
+    "ran": []
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '{./*}' test",
+    "ran": []
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter './' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '{./}' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '{./packages/**}' test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm -w test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm -w --filter @s/a test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --workspace-root --filter @s/a test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter @s/a -w test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter @s/a run -w test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm -w run --filter @s/a test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '...@s/a' test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '...^@s/a' test",
+    "ran": [
+     "b"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '@s/a...' test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '@s/a^...' test",
+    "ran": []
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '^@s/a' test",
+    "ran": []
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '...@s/b' test",
+    "ran": [
+     "b"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '@s/b...' test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter './**' test",
+    "ran": [
+     "a",
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '{./**}' test",
+    "ran": [
+     "a",
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '{**}' test",
+    "ran": [
+     "a",
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter './**/*' test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter './*' test",
+    "ran": []
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '{./*}' test",
+    "ran": []
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter './' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '{./}' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '{./packages/**}' test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm -w test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm -w --filter @s/a test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --workspace-root --filter @s/a test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter @s/a -w test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter @s/a run -w test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm -w run --filter @s/a test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '...@s/a' test",
+    "ran": [
+     "a",
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '...^@s/a' test",
+    "ran": [
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '@s/a...' test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '@s/a^...' test",
+    "ran": []
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '^@s/a' test",
+    "ran": []
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '...@s/b' test",
+    "ran": [
+     "b"
+    ]
+   },
+   {
+    "repo": "wsdep",
+    "cmd": "pnpm --filter '@s/b...' test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter './**' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '{./**}' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '{**}' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter './**/*' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter './*' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '{./*}' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter './' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '{./}' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '{./packages/**}' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm -w test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm -w --filter @s/a test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --workspace-root --filter @s/a test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter @s/a -w test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter @s/a run -w test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm -w run --filter @s/a test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '...@s/a' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '...^@s/a' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '@s/a...' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '@s/a^...' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '^@s/a' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '...@s/b' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '@s/b...' test",
+    "ran": []
+   }
+  ]
  }
 }

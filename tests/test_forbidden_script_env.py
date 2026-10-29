@@ -66,11 +66,18 @@ def test_an_env_script_forbids_its_env_not_the_runner(leerie, tmp_path,
                                                       forbid, own, scope):
     pc = _pc(leerie, tmp_path, ENVPROBE, forbid, scope)
     cmds = [e["command"] for e in pc["entries"]]
-    assert cmds == [forbid, own]
+    # Each sibling runs the forbidden command when a call sets the env
+    # (round-6 review L3): named in that env, never bare.
+    prefix = own[:-len("vitest run")]
+    assert cmds == [forbid, own] + [
+        prefix + f"pnpm run {n}" for n in ("test", "test:db", "test:db2",
+                                           "test:e2e")
+        if f"pnpm run {n}" != forbid]
     for c in ORDINARY:
         assert not _refused(leerie, c, pc), c
     assert _refused(leerie, own, pc)
     assert _refused(leerie, forbid, pc)
+    assert _refused(leerie, prefix + "pnpm test", pc)
 
 
 def test_the_kept_env_is_required_wherever_it_is_set(leerie, tmp_path):
@@ -92,10 +99,13 @@ def test_one_env_file_reads_the_same_through_either_tool(leerie, tmp_path):
     scripts = dict(ENVPROBE, **{
         "test:db3": "env-cmd -f ./.env.production vitest run"})
     pc = _pc(leerie, tmp_path, scripts, "pnpm run test:db", "any")
+    env = "dotenv -e .env.production -- "
     assert [e["command"] for e in pc["entries"]] == [
-        "pnpm run test:db", "dotenv -e .env.production -- vitest run",
-        "pnpm run test:db3"]
+        "pnpm run test:db", env + "vitest run", env + "pnpm run test",
+        env + "pnpm run test:db2", "pnpm run test:db3",
+        env + "pnpm run test:e2e"]
     assert not _refused(leerie, "vitest run", pc)
+    assert not _refused(leerie, "pnpm test", pc)
 
 
 # --- when the env is dropped ---------------------------------------------
@@ -151,15 +161,102 @@ def test_an_env_nothing_else_lacks_is_dropped(leerie, tmp_path):
 
 
 def test_a_non_test_script_with_a_distinct_env_keeps_it(leerie, tmp_path):
-    # Inputs disagree: test:ci's env differs from the plain sibling's, and
-    # the forbidden script is not the repo's test command.
+    # Inputs disagree: test:stg's env differs from the plain sibling's, is
+    # no hygiene variable, and the forbidden script is not the repo's test
+    # command.
     scripts = {"test": "vitest run",
-               "test:ci": "cross-env CI=1 vitest run --coverage"}
-    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:ci", "whole_suite")
+               "test:stg": "cross-env NODE_ENV=staging vitest run --coverage"}
+    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:stg", "whole_suite")
     assert [e["command"] for e in pc["entries"]] == [
-        "pnpm run test:ci", "CI=1 vitest run --coverage"]
+        "pnpm run test:stg", "NODE_ENV=staging vitest run --coverage",
+        "NODE_ENV=staging pnpm run test"]
     assert not _refused(leerie, "npx vitest run", pc)
-    assert _refused(leerie, "CI=1 npx vitest run", pc)
+    assert not _refused(leerie, "pnpm test", pc)
+    assert _refused(leerie, "NODE_ENV=staging npx vitest run", pc)
+
+
+@pytest.mark.parametrize("env", [
+    "CI=1", "TZ=UTC", "FORCE_COLOR=0", "NO_COLOR=1", "LANG=C.UTF-8",
+    "LC_ALL=C", "TZ=UTC CI=true",
+    "NODE_OPTIONS=--max-old-space-size=4096",
+    "NODE_OPTIONS='--max-old-space-size=8192 --inspect'"])
+def test_a_hygiene_env_is_how_the_repo_runs_the_runner(leerie, tmp_path,
+                                                       env):
+    # Before round 6 this case dropped through "no other script runs the
+    # runner without it"; now through the hygiene list, beside a plain
+    # sibling that the old rule would have kept the env for.
+    scripts = {"test": "vitest run",
+               "test:ci": f"cross-env {env} vitest run --coverage"}
+    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:ci", "whole_suite")
+    assert [e["command"] for e in pc["entries"]][:2] == [
+        "pnpm run test:ci", "vitest run --coverage"]
+    assert _refused(leerie, "npx vitest run", pc)
+
+
+@pytest.mark.parametrize("env", [
+    "NODE_ENV=test", "DATABASE_URL=postgres://prod.example.com/app",
+    "NODE_OPTIONS=--require=./seed-prod.js",
+    "NODE_OPTIONS='--max-old-space-size=4096 --require=./x.js'",
+    "TZ=UTC NODE_ENV=production", "CIRCLE=1"])
+def test_an_env_off_the_hygiene_list_is_kept(leerie, tmp_path, env):
+    scripts = {"test": "turbo run test",
+               "test:x": f"cross-env {env} vitest run"}
+    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:x", "any")
+    assert pc["entries"][1]["command"] != "vitest run"
+    assert not _refused(leerie, "vitest run src/a.test.ts", pc)
+
+
+def test_r6_l2_turborepo_root_keeps_the_dangerous_env(leerie, tmp_path):
+    # Round-6 review L2: the only root script that calls vitest is the one
+    # carrying the prod DATABASE_URL. "No other script runs the runner
+    # without it" dropped the env, refusing every vitest run in the repo.
+    url = "DATABASE_URL=postgres://prod.example.com/app"
+    scripts = {"test": "turbo run test", "test:db": f"{url} vitest run"}
+    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:db", "any")
+    assert [e["command"] for e in pc["entries"]] == [
+        "pnpm run test:db", f"{url} vitest run"]
+    for c in ["vitest run src/a.test.ts", "npx vitest run src/a.test.ts",
+              "vitest run", "pnpm test"]:
+        assert not _refused(leerie, c, pc), c
+    for c in [f"{url} npx vitest run", "pnpm run test:db",
+              f"export {url} && vitest run src/a.test.ts"]:
+        assert _refused(leerie, c, pc), c
+
+
+# --- an env set on a script call (round-6 review L3) ----------------------
+
+@pytest.mark.parametrize("cmd, refused", [
+    ("NODE_ENV=production pnpm test", True),
+    ("export NODE_ENV=production && pnpm test", True),
+    ("env NODE_ENV=production npm run test", True),
+    ("cross-env NODE_ENV=production pnpm run test", True),
+    ("NODE_ENV=production pnpm run test:e2e", True),
+    ("pnpm test", False), ("NODE_ENV=test pnpm test", False),
+    ("NODE_ENV=production pnpm test src/a.test.ts", True),
+])
+def test_an_env_on_a_script_call_reaches_its_body(leerie, tmp_path, cmd,
+                                                  refused):
+    pc = _pc(leerie, tmp_path, ENVPROBE, "pnpm run test:db2", "any")
+    assert _refused(leerie, cmd, pc) is refused, cmd
+
+
+def test_an_env_on_a_script_call_respects_the_scope(leerie, tmp_path):
+    pc = _pc(leerie, tmp_path, ENVPROBE, "pnpm run test:db2", "whole_suite")
+    assert _refused(leerie, "NODE_ENV=production pnpm test", pc)
+    assert not _refused(leerie,
+                        "NODE_ENV=production pnpm test src/a.test.ts", pc)
+
+
+def test_an_env_scoped_script_name_never_reaches_the_guard(leerie,
+                                                           tmp_path):
+    # The runtime guard sees a lifecycle name and no env: naming `test`
+    # there would refuse the plain `pnpm test` the task allows.
+    pc = _pc(leerie, tmp_path, ENVPROBE, "pnpm run test:db2", "any")
+    assert "NODE_ENV=production pnpm run test" in [
+        e["command"] for e in pc["entries"]]
+    assert leerie._forbidden_script_names(pc["entries"]) == ["test:db2"]
+    assert leerie._forbidden_script_names(
+        ["NODE_ENV=production pnpm test", "pnpm run lint"]) == ["lint"]
 
 
 # --- the env round trip ---------------------------------------------------
@@ -299,6 +396,8 @@ def _hook(leerie, pc, command: str) -> str:
     ("cross-env NODE_ENV=production vitest run", True),
     ("npx vitest run", False),
     ("pnpm test", False),
+    ("NODE_ENV=production pnpm test", True),
+    ("export NODE_ENV=production && pnpm test", True),
 ])
 def test_the_hook_process_reads_the_env(leerie, tmp_path, cmd, denied):
     pc = _pc(leerie, tmp_path, ENVPROBE, "pnpm run test:db2", "any")

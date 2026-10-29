@@ -58,9 +58,13 @@ def _rows():
     return json.loads(FIXTURE.read_text())["pnpm filters"]["rows"]
 
 
-# Read conservatively (DESIGN §9): an exclusion selects packages the
-# matcher cannot list, and `-r` runs every package's suite.
-KNOWN = {("ws", "pnpm --filter '!@s/a' test"), ("ws", "pnpm -r test")}
+# Read conservatively (DESIGN §9): an exclusion or a dependency closure
+# selects packages the matcher cannot list (a closure holds the root once
+# the root depends on its package, round-6 review M1), and `-r` runs every
+# package's suite.
+KNOWN = {("ws", "pnpm --filter '!@s/a' test"), ("ws", "pnpm -r test"),
+         ("ws", "pnpm --filter '...@s/a' test"),
+         ("single", "pnpm --filter '...@s/a' test")}
 
 
 @pytest.mark.parametrize("i", range(48))
@@ -100,7 +104,16 @@ def test_derived_entries_carry_the_package(leerie, tmp_path):
 @pytest.mark.parametrize("values, name, scoped", [
     (["@s/a"], "root", True), (["@s/*"], "root", True),
     (["./packages/**"], "root", True), (["{packages/a}"], "root", True),
-    (["...@s/a"], "root", True), (["@s/a^..."], "root", True),
+    (["./*"], "root", True), (["{./*}"], "root", True),
+    (["./**/*"], "root", True), (["{./packages/**}"], "root", True),
+    # Round-6 review M1: a closure is read as holding the root, and a path
+    # glob matching `.` selects it.
+    (["...@s/a"], "root", False), (["@s/a^..."], "root", False),
+    (["@s/a..."], "root", False), (["^@s/a"], "root", False),
+    (["...^@s/a"], "root", False), (["/abs/dir"], "root", False),
+    (["./**"], "root", False), (["{./**}"], "root", False),
+    (["{**}"], "root", False), (["./**/"], "root", False),
+    (["{./}"], "root", False),
     (["*"], "root", False), (["**"], "root", False), (["."], "root", False),
     (["./"], "root", False), (["{.}"], "root", False),
     (["root"], "root", False), (["ro*"], "root", False),
@@ -174,6 +187,115 @@ def test_the_hook_process_reads_the_filter(leerie, tmp_path, cmd, denied):
 def test_the_rows_still_hold_with_the_real_pnpm(tmp_path):
     repos = _repos(tmp_path)
     for row in _rows():
+        out = subprocess.run(["bash", "-c", row["cmd"]],
+                             cwd=repos[row["repo"]], capture_output=True,
+                             text=True, timeout=120).stdout
+        ran = sorted({ln.split("MARK-")[1].strip()
+                      for ln in out.splitlines()
+                      if "MARK-" in ln and "echo" not in ln})
+        assert ran == row["ran"], row
+
+
+# --- round-6 review M1 -----------------------------------------------------
+
+def _write_r6(d: Path, name: str, workspace: bool, root_dep: bool) -> None:
+    d.mkdir(parents=True, exist_ok=True)
+    pj = {"name": name, "private": True,
+          "scripts": {"test": "echo MARK-root"}}
+    if root_dep:
+        pj["devDependencies"] = {"@s/a": "workspace:*"}
+    (d / "package.json").write_text(json.dumps(pj))
+    if workspace:
+        (d / "pnpm-workspace.yaml").write_text(
+            'packages:\n  - "packages/*"\n')
+        for p in "ab":
+            (d / "packages" / p).mkdir(parents=True, exist_ok=True)
+            pp = {"name": f"@s/{p}", "scripts": {"test": f"echo MARK-{p}"}}
+            if p == "b":
+                pp["dependencies"] = {"@s/a": "workspace:*"}
+            (d / "packages" / p / "package.json").write_text(json.dumps(pp))
+
+
+def _repos_r6(tmp_path: Path) -> dict[str, Path]:
+    _write_r6(tmp_path / "ws", "root", True, False)
+    _write_r6(tmp_path / "wsdep", "root", True, True)
+    _write_r6(tmp_path / "single", "solo", False, False)
+    return {k: tmp_path / k for k in ("ws", "wsdep", "single")}
+
+
+def _rows_r6():
+    return json.loads(FIXTURE.read_text())["pnpm filters r6"]["rows"]
+
+
+def _r6_conservative(row) -> bool:
+    """A false refusal the matcher takes on knowingly: a closure selector
+    (it reads no dependency graph), and `-w` outside a workspace, which
+    pnpm rejects (ran nothing)."""
+    words = shlex.split(row["cmd"])
+    closure = any(w.startswith(("...", "^")) or w.endswith("...")
+                  for w in words)
+    return closure or (row["repo"] == "single"
+                       and bool({"-w", "--workspace-root"} & set(words)))
+
+
+def test_the_r6_rows_are_all_there():
+    rows = _rows_r6()
+    assert len(rows) == 69
+    assert {r["repo"] for r in rows} == {"ws", "wsdep", "single"}
+    # The reviewer's five spellings, each running the root's `test`.
+    for cmd in ["pnpm --filter './**' test", "pnpm --filter '{./**}' test",
+                "pnpm -w --filter @s/a test",
+                "pnpm --workspace-root --filter @s/a test"]:
+        assert all("root" in r["ran"] for r in rows
+                   if r["cmd"] == cmd and r["repo"] != "single")
+    assert [r["ran"] for r in rows if r["repo"] == "wsdep"
+            and r["cmd"] == "pnpm --filter '...@s/a' test"] == [
+        ["a", "b", "root"]]
+
+
+@pytest.mark.parametrize("i", range(69))
+def test_the_measured_r6_rows(leerie, tmp_path, i):
+    row = _rows_r6()[i]
+    pc = _pc(leerie, _repos_r6(tmp_path)[row["repo"]])
+    want = "root" in row["ran"] or _r6_conservative(row)
+    got = leerie._forbidden_command_hit(row["cmd"], pc["entries"])
+    assert (got is not None) is want, row
+
+
+def test_no_r6_row_that_runs_the_root_is_conservative():
+    # The false refusals the conservative reading takes on knowingly,
+    # counted so a widening of it shows up here.
+    rows = _rows_r6()
+    assert sum("root" in r["ran"] for r in rows) == 32
+    assert sum(_r6_conservative(r) and "root" not in r["ran"]
+               for r in rows) == 25
+
+
+@pytest.mark.parametrize("words, root", [
+    (["-w", "--filter", "@s/a"], True),
+    (["--workspace-root", "--filter", "@s/a"], True),
+    (["--filter", "@s/a", "-w"], True),
+    (["-F", "@s/a"], False),
+    (["-w"], False),
+])
+def test_workspace_root_beside_a_filter_adds_the_root(leerie, words, root):
+    vals = leerie._FORBID_PM_VALUE_OPTS["pnpm"]
+    toks = leerie._forbidden_pnpm_filters(words + ["test"], vals)
+    assert ("pnpm --filter ." in toks) is root
+
+
+def test_a_lone_workspace_root_entry_still_hits_the_plain_run(leerie):
+    # `-w` alone adds no token, so a forbidden `pnpm -w test` keeps
+    # hitting `pnpm test` (an env token would demand it of the candidate).
+    entry = {"command": "pnpm -w test", "scope": "whole_suite",
+             "test_roots": [], "package_name": "root"}
+    assert leerie._forbidden_command_hit("pnpm test", [entry])
+
+
+@pytest.mark.skipif(shutil.which("pnpm") is None, reason="pnpm not on PATH")
+def test_the_r6_rows_still_hold_with_the_real_pnpm(tmp_path):
+    repos = _repos_r6(tmp_path)
+    for row in _rows_r6():
         out = subprocess.run(["bash", "-c", row["cmd"]],
                              cwd=repos[row["repo"]], capture_output=True,
                              text=True, timeout=120).stdout

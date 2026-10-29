@@ -50,13 +50,15 @@ def test_the_review_body_derives_the_bare_runner(leerie, tmp_path):
 
 
 def test_the_parts_share_only_their_common_env(leerie, tmp_path):
-    body = ("cross-env CI=1 TZ=UTC vitest run --project unit && "
-            "cross-env CI=1 vitest run --project e2e")
+    # NODE_ENV, not CI: a hygiene-only env (CI, TZ) is dropped since round
+    # 6 (DESIGN §9 *A script's environment is part of what it runs*).
+    body = ("cross-env NODE_ENV=staging TZ=UTC vitest run --project unit && "
+            "cross-env NODE_ENV=staging vitest run --project e2e")
     pc = _pc(leerie, tmp_path, {"test": "vitest run", "test:ci": body},
              forbid="pnpm run test:ci")
     assert [e["command"] for e in pc["entries"]][:2] == [
-        "pnpm run test:ci", "CI=1 vitest"]
-    assert _hit(leerie, "CI=1 vitest run", pc)
+        "pnpm run test:ci", "NODE_ENV=staging vitest"]
+    assert _hit(leerie, "NODE_ENV=staging vitest run", pc)
     assert not _hit(leerie, "vitest run", pc)
 
 

@@ -22831,6 +22831,7 @@ def _forbidden_normalize(argv: list[str], depth: int,
             return r[i:]
         raw = a[1:]
         rest = _opts(raw)
+        gopts = raw[:len(raw) - len(rest)]
         if a[0] == "pnpm":
             # Which packages the script runs in (DESIGN §9 *A pnpm filter
             # that names one package of several is scoped*).
@@ -22870,7 +22871,10 @@ def _forbidden_normalize(argv: list[str], depth: int,
                     depth + 1, keep_xargs, fenv)
             if sub in ("run", "run-script"):
                 if a[0] == "pnpm":
-                    fenv = fenv | _forbidden_pnpm_filters(a[2:], vals)
+                    # A `-w` among the global options joins a filter among
+                    # the run's own: one option list to pnpm.
+                    fenv = fenv | _forbidden_pnpm_filters(gopts + a[2:],
+                                                          vals)
                 a = [a[0], "run"] + _opts(a[2:])
             elif sub in _FORBID_PM_SCRIPT_ALIASES:
                 a = [a[0], "run", _FORBID_PM_SCRIPT_ALIASES[sub]] + a[2:]
@@ -22898,8 +22902,12 @@ def _forbidden_pnpm_filters(words: list[str],
                             vals: frozenset[str]) -> frozenset[str]:
     """`pnpm --filter <value>` tokens for each `--filter`/`-F`/
     `--filter-prod` among the leading options of `words` (`=` spellings
-    included)."""
+    included), plus `pnpm --filter .` when `-w`/`--workspace-root` stands
+    beside a filter: pnpm then runs the root too (measured with pnpm
+    11.21, round-6 review M1). Alone, `-w` adds no token — the run is the
+    root's, as an unfiltered one is."""
     out: set[str] = set()
+    root = False
     i = 0
     while i < len(words) and words[i].startswith("-"):
         name, eq, val = words[i].partition("=")
@@ -22908,29 +22916,43 @@ def _forbidden_pnpm_filters(words: list[str],
                 val = words[i + 1] if i + 1 < len(words) else ""
             if val:
                 out.add(_FORBID_PNPM_FILTER + val)
+        root = root or words[i] in ("-w", "--workspace-root")
         i += 2 if words[i] in vals else 1
+    if root and out:
+        out.add(_FORBID_PNPM_FILTER + ".")
     return frozenset(out)
 
 
 def _forbidden_filter_scoped(env: frozenset[str],
                              package_name: str | None) -> bool:
     """True when `env` carries pnpm filters and none selects the root
-    package — `*`, `**`, `.`, `./`, `{.}`, a name pattern matching
-    `package_name`, or (conservatively) an exclusion `!x` or a
-    changed-since `[ref]` selector. Measured with pnpm 11.21 (DESIGN §9 *A
-    pnpm filter that names one package of several is scoped*)."""
+    package — `*`, `**`, a path glob matching `.` (`./**`, `{./**}`,
+    `{**}`, `./`, `{.}`), a name pattern matching `package_name`, or
+    (conservatively, the matcher reads no dependency graph) an exclusion
+    `!x`, a changed-since `[ref]`, a dependency-closure selector (`...x`,
+    `x...`, `^x`) or an absolute path. Measured with pnpm 11.21 (DESIGN
+    §9 *A pnpm filter that names one package of several is scoped*)."""
     vals = [t[len(_FORBID_PNPM_FILTER):] for t in env
             if t.startswith(_FORBID_PNPM_FILTER)]
     if not vals:
         return False
     for v in vals:
-        if v.startswith("!") or "[" in v:
+        if (v.startswith(("!", "^", "...", "/")) or v.endswith("...")
+                or "[" in v):
             return False
-        sel = v.removeprefix("...").removeprefix("^")
-        sel = sel.removesuffix("...").removesuffix("^")
+        sel = v
+        path = sel.startswith(".")
         if sel.startswith("{") and sel.endswith("}"):
-            sel = sel[1:-1]
-        if sel in ("*", "**") or _forbidden_operand(sel) == ".":
+            sel, path = sel[1:-1], True
+        if path:
+            # A path glob selects the root when it matches `.`: only
+            # `**` segments, or the root itself (`./*` matched nothing).
+            norm = _forbidden_operand(sel)
+            if norm == "." or set(norm.split("/")) == {"**"} \
+                    or sel.startswith("/"):
+                return False
+            continue
+        if sel in ("*", "**"):
             return False
         if package_name and fnmatch.fnmatchcase(package_name, sel):
             return False
@@ -23552,18 +23574,20 @@ def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
 
 
 def _forbidden_command_hit(command: str,
-                           forbidden: list[str | dict]) -> str | None:
+                           forbidden: list[str | dict], *,
+                           env: frozenset[str] = frozenset()) -> str | None:
     """The first forbidden command one of `command`'s normalised argvs starts
     with, or None. A `whole_suite` entry hits only a whole-suite run of it
     (`_forbidden_whole_suite_rest`). An entry that sets an environment hits
     only a command that sets at least the same one (DESIGN §9 *A script's
     environment is part of what it runs*). Never raises: a matcher error
     reads as no hit (the deny rules still stand) rather than failing a
-    caller."""
+    caller. `env` is an environment `command` runs in (a script body read
+    as a call in that environment runs it)."""
     try:
         if not forbidden or not isinstance(command, str) or not command.strip():
             return None
-        cands = _forbidden_argvs_env(command)
+        cands = _forbidden_argvs_env(command, env=frozenset(env))
         for f in forbidden:
             spec = _forbidden_spec(f)
             if spec is None:
@@ -23717,17 +23741,6 @@ def _forbidden_runner_key(argv: list[str]) -> tuple[str, ...] | None:
     return None
 
 
-def _forbidden_runner_runs(cmd: str | None
-                           ) -> list[tuple[tuple[str, ...], frozenset[str]]]:
-    """`(runner key, environment)` of every runner `cmd` runs."""
-    out = []
-    for argv, env in _forbidden_argvs_env(cmd) if cmd else []:
-        key = _forbidden_runner_key(argv)
-        if key is not None:
-            out.append((key, env))
-    return out
-
-
 def _forbidden_script_name(cmd: str | None) -> str | None:
     """The package script `cmd` calls when it is exactly one script call
     (`pnpm test`, `npm run test:ci`), else None."""
@@ -23767,6 +23780,38 @@ def _forbidden_env_render(argv: list[str], env: frozenset[str]) -> str:
     return shlex.join(words)
 
 
+# Assignments that change how a test run reports or how much memory it
+# gets, never what it touches (DESIGN §9 *A script's environment is part of
+# what it runs*): a derived entry drops an environment made only of these.
+_FORBID_HYGIENE_ENV = frozenset({"TZ", "CI", "FORCE_COLOR", "NO_COLOR",
+                                 "LANG"})
+_FORBID_HYGIENE_NODE_OPTION = re.compile(
+    r"--max-(old|semi)-space-size=\d+|--inspect(-brk|-wait|-port)?(=\S+)?")
+
+
+def _forbidden_env_bare(env: frozenset[str]) -> frozenset[str]:
+    """`env` without its pnpm filter tokens, which select packages, not an
+    environment."""
+    return frozenset(t for t in env if not t.startswith(_FORBID_PNPM_FILTER))
+
+
+def _forbidden_env_is_hygiene(env: frozenset[str]) -> bool:
+    """True when every environment token of `env` (filters aside) is a
+    test-hygiene assignment (`_FORBID_HYGIENE_ENV`, `LC_*`, `NODE_OPTIONS`
+    of memory and inspect flags only)."""
+    for t in _forbidden_env_bare(env):
+        if not _FORBID_ASSIGN.match(t):
+            return False
+        name, _eq, val = t.partition("=")
+        if name == "NODE_OPTIONS":
+            if not all(_FORBID_HYGIENE_NODE_OPTION.fullmatch(w)
+                       for w in val.split()):
+                return False
+        elif name not in _FORBID_HYGIENE_ENV and not name.startswith("LC_"):
+            return False
+    return True
+
+
 def _forbidden_script_derived(entries: list[dict],
                               repo_root: str | Path) -> list[dict]:
     """The entries a forbidden command implies through `repo_root`'s
@@ -23781,13 +23826,16 @@ def _forbidden_script_derived(entries: list[dict],
       (`tsc --noEmit && vitest run`) are not forbidden — the task forbade
       the suite, not the type check. The environment the body sets is kept
       (`NODE_ENV=production vitest run`, `_forbidden_env_render`) unless the
-      script is the repo's test command, or no other script runs that
-      runner without it (DESIGN §9 *A script's environment is part of what
-      it runs*);
+      script is the repo's test command, or the environment is test hygiene
+      only (`_forbidden_env_is_hygiene`) (DESIGN §9 *A script's environment
+      is part of what it runs*);
     - every script whose resolved body runs a forbidden command (an
       original or one derived above) is forbidden by name too (`pnpm run
       test:ci` whose body is `vitest run --coverage`), so the hook, which
-      reads no package.json, refuses it.
+      reads no package.json, refuses it; and a script whose body runs one
+      only in a forbidden entry's environment is forbidden by name in that
+      environment (`NODE_ENV=production pnpm run test`; DESIGN §9 *An
+      environment set on a script call reaches the script's body*).
 
     Never raises: a resolution error derives nothing."""
     try:
@@ -23808,12 +23856,6 @@ def _forbidden_script_derived(entries: list[dict],
                                 else src[k])
                 out.append(d)
 
-        # Every runner run of every script, to tell whether a body's
-        # environment is what sets its script apart (DESIGN §9 *A script's
-        # environment is part of what it runs*).
-        runs = {name: _forbidden_runner_runs(
-                    _resolve_pm_script(f"npm run {name}", repo_root))
-                for name in scripts if _FORBID_SCRIPT_NAME_RE.fullmatch(name)}
         canon = _forbidden_script_name(_canonical_test_command(repo_root))
         for e in entries:
             body = _resolve_pm_script(e["command"], repo_root)
@@ -23832,10 +23874,8 @@ def _forbidden_script_derived(entries: list[dict],
                 argv, env = ((list(key), frozenset.intersection(
                     *(m[1] for m in members))) if len(members) > 1
                     else members[0])
-                if env and ((own is not None and own == canon) or not any(
-                        k == key and not env <= renv
-                        for name, rs in runs.items() if name != own
-                        for k, renv in rs)):
+                if env and ((own is not None and own == canon)
+                            or _forbidden_env_is_hygiene(env)):
                     env = frozenset()
                 _add(e, _forbidden_env_render(argv, env))
         sources = list(entries) + list(out)
@@ -23854,6 +23894,20 @@ def _forbidden_script_derived(entries: list[dict],
                 if _forbidden_command_hit(body, [src]):
                     _add(src, f"{pm} run {name}")
                     break
+            else:
+                # The body runs a forbidden entry only in that entry's
+                # environment: a call setting it (`NODE_ENV=production pnpm
+                # test`) runs exactly the forbidden command.
+                for src in sources if body else []:
+                    envs = {e for _a, e in _forbidden_argvs_env(
+                        src["command"]) if _forbidden_env_bare(e)}
+                    hit = next((e for e in sorted(envs, key=sorted)
+                                if _forbidden_command_hit(body, [src],
+                                                          env=e)), None)
+                    if hit is not None:
+                        _add(src, _forbidden_env_render([pm, "run", name],
+                                                        hit))
+                        break
         return out
     except Exception:
         return []
@@ -24162,11 +24216,14 @@ def _forbidden_script_names(forbidden: list[str | dict]) -> list[str]:
             continue
         c = spec[0]
         try:
-            argvs = _forbidden_argvs(c)
+            argvs = _forbidden_argvs_env(c)
         except Exception:
             continue
-        for a in argvs:
+        for a, env in argvs:
+            # One set in an environment forbids the script in that
+            # environment only; the guard sees no environment.
             if (len(a) == 3 and a[0] in _FORBID_PMS and a[1] == "run"
+                    and not _forbidden_env_bare(env)
                     and _FORBID_SCRIPT_NAME_RE.fullmatch(a[2])
                     and a[2] not in names):
                 names.append(a[2])
