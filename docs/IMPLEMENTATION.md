@@ -7538,14 +7538,20 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   ignores `_heldout_companion_patterns(rel) -> [(dir, pattern)]` —
   `/__pycache__/<stem>.*` and `/__snapshots__/<name>.*`, passed as
   `_checkout_ignore(wt, rels, *, patterns=())`. `_redrive_unstage(staging,
-  staged, *, swept=None, prints=None)` removes the staged files, their
+  staged, *, swept=None, prints=None, span_held=None)` removes the
+  staged files, their
   `_heldout_companions(staging, rel)` (those entries present now) and,
   under each `made` directory, every file that is a staged file, a
   `_heldout_runner_copy` of one or `_file_holds_span(prints)` — keeping any
   other file there (the implementer's own) and removing the directories
   left empty — appending every removed path that is not a staged file to
   `swept` (recorded as the group's `heldout_removed`, first 20, with
-  the leftovers' `withheld["heldout"]`). Staging, the fingerprints, the
+  the leftovers' `withheld["heldout"]`, each path once), and every removed
+  file that is neither a staged file nor a runner copy — removed for
+  holding a span — to `span_held`, which `_run_delivery_redrive` seeds
+  into the group's `withheld["heldout"]` before `_redrive_commit_leftovers`
+  adds its own, so `_set_redrive_leftovers_gap` lists it (review round 13
+  M2). Staging, the fingerprints, the
   note and the snapshots all run inside the `try` whose `finally` is
   `_redrive_unstage`, so no exception between staging and the drive leaves
   a set staged (review round 12 L1,

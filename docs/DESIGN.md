@@ -7488,7 +7488,11 @@ cannot tell the fix from a copy of the test.
    implementer's own sibling test or conftest written there is the change,
    and goes to the leftovers commit like any other file. Review round 12
    suspected, and a test confirmed, that removing the directory whole
-   deleted it with no entry anywhere but the group's record.
+   deleted it with no entry anywhere but the group's record. A file there
+   removed for holding a span is not a runner copy: someone wrote it, so
+   it is listed in the PR like rule 4's (review round 13 M2: the feature
+   module of a new package written beside the staged test was deleted and
+   listed nowhere). Only the runner copies stay record-only.
 2. *A copy elsewhere is recognised by a span of the test's source.* Each
    staged file is fingerprinted by its spans of `_HELDOUT_SPAN_LINES` (4)
    consecutive lines of code, each line normalised (whitespace trimmed and

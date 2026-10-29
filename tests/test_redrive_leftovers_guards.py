@@ -324,3 +324,62 @@ def test_a_withheld_file_a_later_group_committed_is_not_listed(leerie,
     leerie._set_redrive_leftovers_gap(st, rec, s)
     (e,) = st.data["needs_human_verification"]
     assert "gen.py" not in e["detail"] and "other.sql" in e["detail"]
+
+
+# Review round 13 M2: a file written under a directory staging created that
+# holds a span of the staged set's source was deleted at unstage and kept
+# only on the group's record (`heldout_removed`); the PR listed nothing.
+# The leftovers invariant: every file the implementer changed ships or is
+# listed.
+
+NEW_DIR_SET = ("import { a } from '../src/a';\n"
+               "describe('the codes', () => {\n"
+               "  it('are stable', () => {\n"
+               "    expect(a).toEqual(lookup(table, key));\n"
+               "  });\n"
+               "});\n")
+
+
+def test_a_span_holder_in_a_staging_made_dir_is_listed(leerie, tmp_path,
+                                                       monkeypatch):
+    """End to end through `_run_delivery_redrive`: the shown set lives in a
+    directory staging creates (`acc/`); the implementer writes its own
+    `acc/index.ts` (ships) and `acc/notes.ts` holding the set's lines
+    (removed at unstage). The removed file is in `withheld["heldout"]`
+    and the PR's "Needs human verification" entry names it; a runner copy
+    by name stays record-only."""
+    import test_delivery_redrive
+    w = World(leerie, tmp_path)
+    # The world's held-out stub fails the set's defect file by this name.
+    monkeypatch.setattr(test_delivery_redrive, "DEFECT", "acc/a.test.ts")
+    s0 = w.sets[0]
+    sdir = tmp_path / "set1"
+    (sdir / "acc").mkdir()
+    (sdir / "acc" / "a.test.ts").write_text(NEW_DIR_SET)
+    s0["defect_files"] = ["acc/a.test.ts"]
+    s0["cases"] = {"acc/a.test.ts": ["case 1"],
+                   s0["control_files"][0]: ["control 1"]}
+    w.st.save()
+    w.install(monkeypatch)
+
+    def fix(w):
+        (w.staging / "acc" / "index.ts").write_text(
+            "export const codes = 1\n")
+        (w.staging / "acc" / "notes.ts").write_text(NEW_DIR_SET)
+        (w.staging / "acc" / "__snapshots__").mkdir()
+        (w.staging / "acc" / "__snapshots__" / "a.test.ts.snap"
+         ).write_text("snap\n")
+        w.write("export const a = 1; // FIXED\n")
+    w.edits = [fix]
+    w.run()
+    ge = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
+    assert not ge.get("rolled_back")
+    assert "acc/index.ts" in ge["leftovers"]
+    assert ge["leftovers_withheld"]["heldout"] == ["acc/notes.ts"]
+    assert "acc/__snapshots__/a.test.ts.snap" in ge["heldout_removed"]
+    assert ge["heldout_removed"].count("acc/notes.ts") == 1
+    (e,) = [e for e in w.st.data.get("needs_human_verification") or []
+            if e.get("source") == "redrive_leftovers"]
+    assert "acc/notes.ts" in e["detail"]
+    assert ".snap" not in e["detail"]
+    assert "acc/notes.ts" in leerie._format_pr_end_state_section(w.st.data)

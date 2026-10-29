@@ -51905,8 +51905,8 @@ def _redrive_stage(staging: Path, sets: list[dict]) -> list[dict]:
 
 def _redrive_unstage(staging: Path, staged: list[dict], *,
                      swept: list[str] | None = None,
-                     prints: dict[int, frozenset[bytes]] | None = None
-                     ) -> list[str]:
+                     prints: dict[int, frozenset[bytes]] | None = None,
+                     span_held: list[str] | None = None) -> list[str]:
     """Remove the staged copies, their `.gitignore` files and the
     directories only they needed, with every runner copy of them (DESIGN §8
     *No line of a staged set's source reaches history*, rule 1): beside
@@ -51915,8 +51915,12 @@ def _redrive_unstage(staging: Path, staged: list[dict], *,
     holding one of `prints`' spans; those removed paths are appended to
     `swept`. Any other file there — the implementer's own sibling test or
     conftest — stays, for the leftovers commit (review round 12: the whole
-    directory used to go, silently). Returns the staged files whose bytes
-    changed."""
+    directory used to go, silently). A removed file that is neither a
+    staged file nor a runner copy of one is a file someone wrote there that
+    held a span: it is also appended to `span_held`, which the caller lists
+    in the PR (`withheld["heldout"]`; review round 13 M2: it was deleted
+    with no entry anywhere but the group's record). Returns the staged files
+    whose bytes changed."""
     tampered: list[str] = []
     files = [f for s_ in staged for f in s_["files"]]
     _checkout_unignore(staging, _staged_ignore_dirs(files))
@@ -51947,10 +51951,12 @@ def _redrive_unstage(staging: Path, staged: list[dict], *,
                 if not (p.is_file() or p.is_symlink()):
                     continue
                 rel = os.path.relpath(p, staging)
-                if (rel in files
-                        or any(_heldout_runner_copy(f, rel) for f in files)
-                        or _file_holds_span(p, prints or {})):
+                copy = (rel in files
+                        or any(_heldout_runner_copy(f, rel) for f in files))
+                if copy or _file_holds_span(p, prints or {}):
                     gone.append(rel)
+                    if not copy and span_held is not None:
+                        span_held.append(rel)
                     with contextlib.suppress(OSError):
                         p.chmod(0o644)
                         p.unlink()
@@ -54313,10 +54319,16 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     effort=effort, label=f"delivery-redrive-r{rnd}-g{gi}")
             finally:
                 swept: list[str] = []
+                span_held: list[str] = []
                 ge["tampered"] = _redrive_unstage(staging, staged,
                                                   swept=swept,
-                                                  prints=prints)
-            withheld: dict[str, list[str]] = {}
+                                                  prints=prints,
+                                                  span_held=span_held)
+            # A file written under a directory staging created that held a
+            # span went at unstage; it is listed like any other withheld
+            # leftover (the leftovers invariant: it ships or it is listed).
+            withheld: dict[str, list[str]] = (
+                {"heldout": sorted(set(span_held))} if span_held else {})
             left = await _redrive_commit_leftovers(
                 staging, f"r{rnd} g{gi}", tracked_before, untracked_before,
                 _worker_written_paths(
@@ -54332,7 +54344,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         if (v := withheld.get(k))}
             if kept_out:
                 ge["leftovers_withheld"] = kept_out
-            heldout_removed = swept + withheld.get("heldout", [])
+            heldout_removed = swept + [p for p in withheld.get("heldout",
+                                                            [])
+                                       if p not in swept]
             if heldout_removed:
                 ge["heldout_removed"] = heldout_removed[:20]
             drove = True
