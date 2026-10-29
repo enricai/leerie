@@ -53532,10 +53532,9 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict,
             gen += [p for p in w.get("generated_edited") or []
                     if p not in gen]
     if staging is not None and (over or gen):
-        r = subprocess.run(["git", "--literal-pathspecs", "-C",
-                            str(staging), "ls-files", "-z", "--",
-                            *(over + gen)], capture_output=True, text=True,
-                           check=False)
+        r = _git_z_output(["git", "--literal-pathspecs", "-C",
+                           str(staging), "ls-files", "-z", "--",
+                           *(over + gen)])
         if r.returncode == 0:
             tracked = set(r.stdout.split("\0"))
             over = [p for p in over if p not in tracked]
