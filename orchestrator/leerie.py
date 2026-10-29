@@ -23788,6 +23788,12 @@ _FORBID_HYGIENE_ENV = frozenset({"TZ", "CI", "FORCE_COLOR", "NO_COLOR",
                                  "LANG"})
 _FORBID_HYGIENE_NODE_OPTION = re.compile(
     r"--max-(old|semi)-space-size=\d+|--inspect(-brk|-wait|-port)?(=\S+)?")
+# Runners that set NODE_ENV=test themselves when it is unset, so a script's
+# `NODE_ENV=test` changes nothing they run (measured: jest 30.5.2 and vitest
+# 5.0.5 set it; mocha 12.0.3 leaves it unset, so there it is a real
+# environment). Round-7 review: kept on `NODE_ENV=test jest`, it let a plain
+# `npx jest` pass a forbidden whole-suite script.
+_FORBID_NODE_ENV_TEST_RUNNERS = frozenset({("jest",), ("vitest",)})
 
 
 def _forbidden_env_bare(env: frozenset[str]) -> frozenset[str]:
@@ -23796,14 +23802,18 @@ def _forbidden_env_bare(env: frozenset[str]) -> frozenset[str]:
     return frozenset(t for t in env if not t.startswith(_FORBID_PNPM_FILTER))
 
 
-def _forbidden_env_is_hygiene(env: frozenset[str]) -> bool:
+def _forbidden_env_is_hygiene(env: frozenset[str],
+                              key: tuple[str, ...] | None = None) -> bool:
     """True when every environment token of `env` (filters aside) is a
     test-hygiene assignment (`_FORBID_HYGIENE_ENV`, `LC_*`, `NODE_OPTIONS`
-    of memory and inspect flags only)."""
+    of memory and inspect flags only, and `NODE_ENV=test` when the runner
+    key `key` is in `_FORBID_NODE_ENV_TEST_RUNNERS`)."""
     for t in _forbidden_env_bare(env):
         if not _FORBID_ASSIGN.match(t):
             return False
         name, _eq, val = t.partition("=")
+        if t == "NODE_ENV=test" and key in _FORBID_NODE_ENV_TEST_RUNNERS:
+            continue
         if name == "NODE_OPTIONS":
             if not all(_FORBID_HYGIENE_NODE_OPTION.fullmatch(w)
                        for w in val.split()):
@@ -23876,7 +23886,7 @@ def _forbidden_script_derived(entries: list[dict],
                     *(m[1] for m in members))) if len(members) > 1
                     else members[0])
                 if env and ((own is not None and own == canon)
-                            or _forbidden_env_is_hygiene(env)):
+                            or _forbidden_env_is_hygiene(env, key)):
                     env = frozenset()
                 _add(e, _forbidden_env_render(argv, env))
         sources = list(entries) + list(out)

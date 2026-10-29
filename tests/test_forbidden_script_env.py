@@ -194,7 +194,7 @@ def test_a_hygiene_env_is_how_the_repo_runs_the_runner(leerie, tmp_path,
 
 
 @pytest.mark.parametrize("env", [
-    "NODE_ENV=test", "DATABASE_URL=postgres://prod.example.com/app",
+    "NODE_ENV=testing", "DATABASE_URL=postgres://prod.example.com/app",
     "NODE_OPTIONS=--require=./seed-prod.js",
     "NODE_OPTIONS='--max-old-space-size=4096 --require=./x.js'",
     "TZ=UTC NODE_ENV=production", "CIRCLE=1"])
@@ -204,6 +204,64 @@ def test_an_env_off_the_hygiene_list_is_kept(leerie, tmp_path, env):
     pc = _pc(leerie, tmp_path, scripts, "pnpm run test:x", "any")
     assert pc["entries"][1]["command"] != "vitest run"
     assert not _refused(leerie, "vitest run src/a.test.ts", pc)
+
+
+# --- NODE_ENV=test on a runner that sets it itself (round-7 review) -------
+# jest 30.5.2 and vitest 5.0.5 set NODE_ENV=test when it is unset; mocha
+# 12.0.3 leaves it unset (measured by printing process.env.NODE_ENV from a
+# test). So the assignment is a no-op only for the first two.
+
+@pytest.mark.parametrize("pm_call", [
+    "npx jest", "jest", "pnpm exec jest", "pnpm jest"])
+def test_r7_turbo_root_node_env_test_jest_is_the_suite(leerie, tmp_path,
+                                                       pm_call):
+    # Round-7 review: the derived entry kept NODE_ENV=test, so every plain
+    # jest spelling ran the whole suite past a forbidden test:unit.
+    scripts = {"test": "turbo run test", "test:unit": "NODE_ENV=test jest"}
+    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:unit", "whole_suite")
+    assert [e["command"] for e in pc["entries"]][:2] == [
+        "pnpm run test:unit", "jest"]
+    assert _refused(leerie, pm_call, pc), pm_call
+    assert not _refused(leerie, "pnpm test", pc)
+
+
+def test_r7_node_env_test_vitest_is_dropped(leerie, tmp_path):
+    scripts = {"test": "turbo run test",
+               "test:unit": "cross-env NODE_ENV=test vitest run"}
+    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:unit", "whole_suite")
+    assert [e["command"] for e in pc["entries"]][:2] == [
+        "pnpm run test:unit", "vitest run"]
+    assert _refused(leerie, "npx vitest run", pc)
+
+
+def test_r7_node_env_test_mocha_is_kept(leerie, tmp_path):
+    # Counter-case: mocha does not set NODE_ENV, so NODE_ENV=test is a real
+    # difference and the derived entry keeps it; a plain mocha passes.
+    scripts = {"test": "turbo run test", "test:unit": "NODE_ENV=test mocha"}
+    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:unit", "whole_suite")
+    assert [e["command"] for e in pc["entries"]][:2] == [
+        "pnpm run test:unit", "NODE_ENV=test mocha"]
+    assert not _refused(leerie, "npx mocha", pc)
+    assert _refused(leerie, "NODE_ENV=test npx mocha", pc)
+
+
+@pytest.mark.parametrize("env", [
+    "NODE_ENV=test DATABASE_URL=postgres://prod.example.com/app",
+    "NODE_ENV=production", "NODE_ENV=testing"])
+def test_r7_node_env_hygiene_is_exactly_test(leerie, tmp_path, env):
+    # Only the exact no-op value, and only alone or beside other hygiene.
+    scripts = {"test": "turbo run test", "test:unit": f"{env} jest"}
+    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:unit", "whole_suite")
+    assert pc["entries"][1]["command"] != "jest"
+    assert not _refused(leerie, "npx jest", pc)
+
+
+def test_r7_node_env_test_with_other_hygiene_is_dropped(leerie, tmp_path):
+    scripts = {"test": "turbo run test",
+               "test:unit": "cross-env TZ=UTC NODE_ENV=test jest --ci"}
+    pc = _pc(leerie, tmp_path, scripts, "pnpm run test:unit", "whole_suite")
+    assert pc["entries"][1]["command"] == "jest --ci"
+    assert _refused(leerie, "npx jest", pc)
 
 
 def test_r6_l2_turborepo_root_keeps_the_dangerous_env(leerie, tmp_path):

@@ -9548,9 +9548,17 @@ Three layers follow, each derived from that one list:
     that changes how a run reports or how much memory it gets, never what
     it touches: `TZ`, `CI`, `FORCE_COLOR`, `NO_COLOR`, `LANG`, `LC_*`, and
     `NODE_OPTIONS` carrying only `--max-old-space-size`,
-    `--max-semi-space-size` and `--inspect*` flags. `"test:ui": "cross-env
-    TZ=UTC vitest run"` derives `vitest run`. An env file, `env -i`/`-u`,
-    an env-cmd environment or any other variable is not hygiene.
+    `--max-semi-space-size` and `--inspect*` flags; and `NODE_ENV=test`
+    for a runner that sets it itself when it is unset, jest and vitest
+    (measured: jest 30.5.2 and vitest 5.0.5 each saw `NODE_ENV=test` in a
+    test run with it unset; mocha 12.0.3 saw it unset, so for mocha it
+    stays an environment). For those runners the assignment changes
+    nothing: `"test:unit": "NODE_ENV=test jest"` runs exactly what `jest`
+    runs, and round-7 review found the cost of keeping it — in a
+    turborepo-shaped root, forbidding `pnpm run test:unit` derived
+    `NODE_ENV=test jest`, and `npx jest` ran the whole suite. `"test:ui":
+    "cross-env TZ=UTC vitest run"` derives `vitest run`. An env file, `env
+    -i`/`-u`, an env-cmd environment or any other variable is not hygiene.
   Otherwise the derived entry carries the environment
   (`NODE_ENV=production vitest run`), and the sibling scan names only the
   scripts that set it too. The second rule first read "no other script
@@ -9560,9 +9568,10 @@ Three layers follow, each derived from that one list:
   dangerous `DATABASE_URL`, so the rule dropped the environment and a
   forbidden `pnpm run test:db` refused every vitest run in the repo,
   leerie's own scoped launches included. The fixed list costs the other
-  direction, accepted: a repo whose only vitest script is `NODE_ENV=test
-  vitest run`, not its test command, keeps that environment, and a plain
-  `vitest run` passes the forbid.
+  direction, accepted: a repo whose only mocha script is `NODE_ENV=test
+  mocha`, not its test command, keeps that environment (mocha leaves
+  `NODE_ENV` unset, so it is a real difference), and a plain `mocha`
+  passes the forbid.
 
   *An environment set on a script call reaches the script's body.*
   `NODE_ENV=production pnpm test` and `export NODE_ENV=production && pnpm
@@ -9701,7 +9710,12 @@ manager is involved.
 
 **Scope of the forbidden-command matcher.** Six review rounds widened the
 matcher spelling by spelling; after round 6 its scope is frozen, and the
-limits below are documented rather than chased. What it guarantees:
+limits below are documented rather than chased. One row was closed after
+the freeze, because it was a real whole-suite miss on an ordinary
+monorepo shape and cost nothing to close: round 7 found `NODE_ENV=test`
+kept on a derived jest or vitest entry, so `npx jest` passed a forbidden
+`"test:unit": "NODE_ENV=test jest"`; it is now hygiene for the runners
+that set it themselves (above). What it guarantees:
 
 - *The orchestrator's own commands go through a code gate.* Every
   orchestrator-side launch of a repository command passes
@@ -9742,7 +9756,9 @@ not model. Known limits, each a miss unless marked as a false refusal:
   test`) fans out to, derives nothing.
 - *Environment it does not read.* An env file's content (`NODE_ENV=production`
   against an entry that loads `.env.production`); an assignment the body
-  makes over the caller's (false refusal); and Python's `dotenv run`
+  makes over the caller's (false refusal); `NODE_ENV=test` on a runner
+  that does not set it itself (`NODE_ENV=test mocha` is kept, so a plain
+  `mocha` passes); and Python's `dotenv run`
   (python-dotenv's CLI), which the matcher parses as dotenv-cli and reads
   as running a command named `run`.
 - *Programs it does not model.* A script's body run directly (`node
