@@ -1094,7 +1094,13 @@ def test_measure_axes_replaces_a_forbidden_suite_with_the_coupled_tests(
         dict(leerie.DEFAULT_CAPS), log_path=tmp_path / "l.log",
         verbosity="quiet", memo=False))
     (cmd,) = ran
-    assert cmd.startswith("npx vitest related --run ")
+    # The coupled tests are named test files: the runner's direct form,
+    # never `related`'s whole-suite module-graph walk (DESIGN §9 *Operands
+    # that are already test files take the runner's direct form*).
+    assert cmd.startswith("npx vitest run ")
+    assert "related" not in cmd
+    # ...and the task's forbid lets that scoped command through.
+    leerie._blt_shell_argv(cmd, leerie._forbidden_specs(st.data))
     assert "src/lib/rand.test.ts" in cmd
     assert "src/app/loader.e2e.test.ts" in cmd
     assert "src/other.test.ts" not in cmd

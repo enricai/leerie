@@ -1369,6 +1369,11 @@ test = "$_test_val"
 # to override or to cover a runner it does not know:
 # test_scoped = "npx vitest related --run {files} --passWithNoTests"
 # build_scoped = "npx tsc --noEmit"
+#
+# Commands over files that are already tests (held-out acceptance sets,
+# reruns) use the runner's direct form instead; {test_files} expands to
+# those files. Without it, a declared test_scoped is used for them as well.
+# test_files_scoped = "npx vitest run {test_files} --passWithNoTests"
 TOML
         echo "Created $config_path"
         echo "  Suggested next step: git add .leerie/ && git commit -m 'chore: add leerie config'"
@@ -1444,7 +1449,7 @@ PY
         # live in resolve_blt_scoped and are deliberately not mirrored in
         # bash, so this prints "(not set)" for a repo relying on them rather
         # than guessing a second time and risking drift.
-        for axis in build_scoped test_scoped; do
+        for axis in build_scoped test_scoped test_files_scoped; do
           val=""
           if [ -f "$_user_repo/.leerie/config.toml" ]; then
             # `|| true`: the launcher runs under `set -o pipefail`, so a

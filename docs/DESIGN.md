@@ -8873,7 +8873,10 @@ chains (12 and 4) all converged, in every sample.
 
 **Scoped runners for every runner leerie can read.** A set runs only
 through a scoped test template — the canonical command over the set's own
-files — so a repo with no template got no sets at all, silently. The
+files, in the runner's direct form (`vitest run`, `jest --runTestsByPath`,
+never the impact-analysis form; §9 *Operands that are already test files
+take the runner's direct form*) — so a repo with no template got no sets
+at all, silently. The
 template is inferred, when the repo declares none, from a canonical test
 command that is a bare runner invocation (only options after the runner,
 read from its argv, never from prose): `pytest` (also `python -m pytest`
@@ -9688,6 +9691,52 @@ import-graph kind, running the tests the diff *touched* rather than the
 tests it *affects*, which is the price of working at all on a runner with
 no impact analysis. The absence rule below makes it safe: a diff with no
 test file renders nothing, and the axis is deferred to the whole-tree pass.
+
+**Operands that are already test files take the runner's direct form, not
+its impact analysis.** Two kinds of call hand a scoped test command its
+operands, and they want different commands. The per-subtask proxy above
+gets the implementer's diff — source, docs and tests mixed — and the goal
+is "the tests these changes affect": that is what `vitest related` and
+`jest --findRelatedTests` are for. Every other caller already holds test
+files and wants exactly those run: a held-out acceptance set and its
+parse probe (§8), the re-drive self-check, the coupled tests that replace a
+forbidden suite, discovery repeats, B* confirm reruns, and the delivery
+ratchet's measurements where they run a forbidden suite's replacement. One template once served both, so all of the second kind ran
+`vitest related --run <test files>`, and `related` first resolves the
+module graph of the whole suite to find what imports its operands — work
+that is pure overhead when the operands are the tests themselves. The I3
+bench's paired check on barnacle trees put `related` at 1.9–5× the time of
+`vitest run <files>` over the same acceptance files, about 13–15 s of fixed
+overhead per invocation; re-measured on a barnacle clone (vitest 4.1.11,
+one acceptance file, the two forms interleaved five times each, host load
+42–78): median 42.4 s against 22.2 s, 1.9–3.2× per adjacent pair, the same
+verdict every run (1 failed, 2 passed). That cost is paid on every
+acceptance run, rerun and self-check; the implementers given the `related` command in the I3 bench
+mostly bypassed it for `vitest run` themselves. The invariant restored:
+**a command over named test files runs those files directly; a command
+over a diff resolves the diff's affected tests.** So there are two
+templates, chosen by the call site from its own data, not by inspecting
+the operands: `resolve_blt_scoped` (the diff's affected tests: `vitest
+related --run {files}`, `jest --findRelatedTests {files}`) feeds only the
+per-subtask proxy, and `resolve_test_files_scoped` (named test files:
+`vitest run {test_files}`, `jest --runTestsByPath {test_files}`) feeds
+`_acceptance_cmd`, through which every test-file caller renders. For the
+runners with no impact analysis the two are the same `{test_files}`-tier
+template. Over `{test_files}`, a name that is not test-shaped renders
+nothing, so a source file can never reach the direct form, where it would
+mean something else. A repo may declare the direct form as
+`test_files_scoped`; otherwise a declared `test_scoped` serves both kinds
+as written (`related` over a test file still runs that test, only slower),
+and only then are the inferred forms used. Vitest's positionals are
+case-insensitive substring filters over the included test files, not
+paths: `vitest run src/a.test.ts` also runs a `x/src/a.test.ts`, which
+`related` would not — a file whose whole repo-relative path recurs inside
+another's. jest's `--runTestsByPath` matches exactly. The forbidden-command
+gate (*A command the task forbids*) reads both forms as scoped: `run` is a
+suite subcommand it drops, leaving the files as operands, and
+`--runTestsByPath` takes no value, so the files stay operands; with no
+file either form is a whole-suite run, and `_render_scoped` never renders
+one without a file.
 
 That is why the test proxy is now also **inferred for runners with no
 impact analysis**, which it once was not: with only `{files}` available,

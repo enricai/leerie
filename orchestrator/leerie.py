@@ -36002,18 +36002,9 @@ def resolve_blt_scoped(repo_root: Path) -> dict[str, str]:
             out[key[:-len("_scoped")]] = val
 
     if "test" not in out:
-        if (next(repo_root.glob("vitest.config.*"), None) is not None
-                or next(repo_root.glob("vitest.workspace.*"), None) is not None):
-            # `related` takes SOURCE files and runs the tests importing them
-            # through vitest's own module graph. Preferred over
-            # `--changed <ref>` because the file list stays ours to compute.
-            # Static imports only (per vitest's docs), so a test reached
-            # solely via a dynamic import can be missed — acceptable for an
-            # advisory axis backed by a canonical final pass.
-            out["test"] = "npx vitest related --run {files} --passWithNoTests"
-        elif next(repo_root.glob("jest.config.*"), None) is not None:
-            out["test"] = ("npx jest --findRelatedTests {files} "
-                           "--passWithNoTests")
+        js = _js_runner_scoped_templates(repo_root)
+        if js:
+            out["test"] = js[0]
         else:
             template, _why = _infer_scoped_test_template(
                 _canonical_test_command(repo_root, declared))
@@ -36022,6 +36013,52 @@ def resolve_blt_scoped(repo_root: Path) -> dict[str, str]:
     if "build" not in out and (repo_root / "tsconfig.json").is_file():
         out["build"] = "npx tsc --noEmit"
     return out
+
+
+def _js_runner_scoped_templates(repo_root: Path) -> tuple[str, str] | None:
+    """`(affected, by_path)` templates for a repo with a vitest or jest
+    config, or None. `affected` takes a diff's files — source included —
+    and runs the tests importing them through the runner's own module
+    graph (`vitest related`, `jest --findRelatedTests`): preferred over
+    `--changed <ref>` because the file list stays ours to compute, and
+    static imports only (per vitest's docs), so a test reached solely via a
+    dynamic import can be missed — acceptable for an advisory axis backed
+    by a canonical final pass. `by_path` runs named test files directly
+    (`vitest run`, `jest --runTestsByPath`): handed test files, `related`
+    first resolves the whole suite's module graph to find what imports
+    them, measured 1.9-5x slower on the same files on barnacle (DESIGN §9
+    *Operands that are already test files take the runner's direct
+    form*)."""
+    if (next(repo_root.glob("vitest.config.*"), None) is not None
+            or next(repo_root.glob("vitest.workspace.*"), None) is not None):
+        return ("npx vitest related --run {files} --passWithNoTests",
+                "npx vitest run {test_files} --passWithNoTests")
+    if next(repo_root.glob("jest.config.*"), None) is not None:
+        return ("npx jest --findRelatedTests {files} --passWithNoTests",
+                "npx jest --runTestsByPath {test_files} --passWithNoTests")
+    return None
+
+
+def resolve_test_files_scoped(repo_root: Path) -> str | None:
+    """The scoped test template for operands that are already test files —
+    every caller of `_acceptance_cmd` — or None when there is none.
+
+    `resolve_blt_scoped`'s template takes a diff and finds the tests it
+    affects; handed test files, its impact-analysis form only adds a
+    whole-suite module-graph walk (DESIGN §9 *Operands that are already
+    test files take the runner's direct form*). Resolution: a declared
+    `test_files_scoped`; else a declared `test_scoped`, as written (the
+    operator's command, and correct over test files, if slower); else the
+    inferred vitest/jest direct form; else `resolve_blt_scoped`'s inferred
+    template, which for every other runner is already over `{test_files}`."""
+    declared = _load_blt_config(repo_root) or {}
+    for key in ("test_files_scoped", "test_scoped"):
+        if declared.get(key):
+            return declared[key]
+    js = _js_runner_scoped_templates(repo_root)
+    if js:
+        return js[1]
+    return resolve_blt_scoped(repo_root).get("test")
 
 
 # Bare invocations of runners with no source->test impact analysis, as argv
@@ -36344,7 +36381,8 @@ def _load_blt_config(repo_root: Path) -> dict[str, str] | None:
     Returns None when the file does not exist. Otherwise returns a dict
     containing only the keys that are present in the file: the canonical
     axes (build, lint, test), setup_packages, the delta-proxy templates
-    (build_scoped, test_scoped — read by `resolve_blt_scoped`, DESIGN §9),
+    (build_scoped, test_scoped — read by `resolve_blt_scoped`, DESIGN §9 —
+    and test_files_scoped, read by `resolve_test_files_scoped`),
     and test_file_globs (read by `resolve_test_file_globs`, which feeds
     `_render_scoped`'s `{test_files}` tier).
     Missing keys are not defaulted — the caller (`resolve_blt` for the
@@ -36358,7 +36396,8 @@ def _load_blt_config(repo_root: Path) -> dict[str, str] | None:
         return None
     out: dict[str, str] = {}
     for key in ("build", "lint", "test", "setup_packages",
-                "build_scoped", "test_scoped", "test_file_globs"):
+                "build_scoped", "test_scoped", "test_files_scoped",
+                "test_file_globs"):
         val = _read_toml_key(cfg, key)
         if val is not None:
             out[key] = val
@@ -45823,13 +45862,15 @@ def _acceptance_declared_rel(declared: dict) -> str:
 
 def _acceptance_cmd(st: "State", files: list[str],
                     tree: str | None = None) -> str | None:
-    """The repo's scoped test template rendered over explicit test files,
+    """The repo's scoped test template for named test files
+    (`resolve_test_files_scoped`, the runner's direct form — never the
+    diff's impact-analysis form) rendered over explicit test files,
     or None when there is no template or a file is not test-shaped (or, for
     the package/target forms, not one the runner can select). Over a
     `{test_packages}` template, which runs whole Go packages, the command
     also selects the files' own test functions (`-run`, read from `tree`'s
     copies), so a package's existing tests stay out of the verdict."""
-    template = resolve_blt_scoped(st.repo_root).get("test")
+    template = resolve_test_files_scoped(st.repo_root)
     if not template or not files:
         return None
     globs = resolve_test_file_globs(st.repo_root)
@@ -46079,7 +46120,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         if db_url:
             db_ctx = _prisma_db_context(st.repo_root, base)
             lines += ["", _prisma_real_db_section(
-                db_ctx, resolve_blt_scoped(st.repo_root).get("test") or "")]
+                db_ctx, resolve_test_files_scoped(st.repo_root) or "")]
         user = "\n".join(lines)
         # What existed before the writer (the dependency install's
         # output) is never the writer's file.
@@ -46431,13 +46472,13 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
         return {"skipped": "--skip-acceptance-check"}
     if "bug-fixing" not in (st.data.get("categories") or []):
         return {"skipped": "not a defect-fix run (no defect-scope audit)"}
-    if not resolve_blt_scoped(st.repo_root).get("test"):
+    if not resolve_test_files_scoped(st.repo_root):
         canonical = _canonical_test_command(st.repo_root)
         _template, why = _infer_scoped_test_template(canonical)
         log(f"  WARNING: acceptance: no scoped test runner for "
             f"{canonical or '(no test command)'!r} ({why}) — held-out "
-            "acceptance tests skipped; declare test_scoped in "
-            ".leerie/config.toml to get them")
+            "acceptance tests skipped; declare test_files_scoped (or "
+            "test_scoped) in .leerie/config.toml to get them")
         return {"skipped": "no scoped test command",
                 "skip_kind": "no_scoped_runner", "reason": why,
                 "test_command": canonical}
@@ -48862,7 +48903,7 @@ def _acceptance_can_check(st: "State") -> bool:
     the precondition for holding a no-work confirmation pending them."""
     return (not st.data.get("skip_acceptance_check")
             and "bug-fixing" in (st.data.get("categories") or [])
-            and bool(resolve_blt_scoped(st.repo_root).get("test")))
+            and bool(resolve_test_files_scoped(st.repo_root)))
 
 
 async def _acceptance_rollback(staging: str, before_sha: str) -> bool:
@@ -50867,7 +50908,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         return {"enabled": False, "skipped": "falsifier_samples is 0"}
     if not indices:
         return {"enabled": False, "skipped": "no item for the falsifier"}
-    if not resolve_blt_scoped(st.repo_root).get("test"):
+    if not resolve_test_files_scoped(st.repo_root):
         return {"enabled": False, "skipped": "no scoped test runner"}
     done = progress.setdefault("items", {})
     todo = [i for i in indices if str(i) not in done]
