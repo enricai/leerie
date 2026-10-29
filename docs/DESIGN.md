@@ -10724,7 +10724,11 @@ that side unmeasured, never "failed like the base":
   so it would outlive the outage and every resume: before a final diff
   is taken or reused, the base commit is measured again in a fresh
   checkout (staging has moved on), up to `deps_install_retries` times
-  per process, and one whose install succeeds replaces the baseline;
+  per process, and one whose install succeeds replaces the baseline —
+  for every reader from then on, the final conformance loop's own
+  baseline included (review round 11: the loop kept the copy it read
+  before its first round, so an axis the failed install had counted red
+  stayed forgiven on the final tree for the rest of the loop);
 - a B\* base checkout (the final diff's, a re-drive group's) whose
   install failed reruns nothing: its candidates are `no_verdict`, and on
   the tree that ships they are listed for a human to rerun against the

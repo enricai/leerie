@@ -54042,6 +54042,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             st, caps, str(staging), post,
             log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
             label=f"final-r{c_round}")
+        # The diff may have measured the base again (`_retry_failed_baseline`:
+        # its install had failed), replacing `_baseline` in state; the old
+        # copy's `red_axes` may count an axis red only for want of
+        # dependencies, and would forgive that axis's failure here for the
+        # rest of the loop (review round 11).
+        baseline = (st.data.get("conformance") or {}).get("_baseline")
         clean_baseline = baseline
         if id_diff is not None and id_diff.get("ids_unknown"):
             # No diff (one side's IDs unknown): the axis verdict stands, and
@@ -54083,6 +54089,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             st, caps, str(staging), pre,
             log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
             label=f"final-r{c_round}-pre")
+        fresh = (st.data.get("conformance") or {}).get("_baseline")
+        if fresh is not baseline:
+            # Measured again by that diff, as in the loop: keep the
+            # refinement the last round made, on the new baseline.
+            clean_baseline = (fresh if clean_baseline is baseline
+                              else _baseline_with_red_tests(fresh))
+            baseline = fresh
         if broke is not None and broke.get("new"):
             warnings.append(f"final conformer round {c_round}: "
                             + _format_new_failing_ids(broke))
