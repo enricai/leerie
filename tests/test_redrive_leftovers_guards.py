@@ -201,6 +201,7 @@ def test_a_clean_pytest_redrive_lists_no_bytecode(leerie, tmp_path,
                for p in g["leftovers_withheld"]["artifacts"])
     assert not any(".pyc" in (e.get("detail") or "") for e in
                    w.st.data.get("needs_human_verification") or [])
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
     assert leerie._format_pr_end_state_section(w.st.data) == ""
 
 
