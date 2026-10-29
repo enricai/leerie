@@ -338,7 +338,8 @@ subtask it tests). Three mechanisms reconcile that coupling:
   false answer is drawn again — up to `applicability_samples` (3)
   independent samples in all, a crashed sample being no vote and drawn
   again within two extra attempts — and the first `applicable: true`
-  sample is the one used; false stands only when every sample says so.
+  sample is the one used; false stands only when every sample cast says
+  so, and when crashes use up the attempts first, on the votes cast.
   Measured (Q5/N1, production-faithful strict decoding, 9 audits whose
   task was a real open defect): the single sample said false on 8, the
   3/3 rule on 3 (rescued 5 of 8), and on 5 not-needed tasks the rule
@@ -2547,17 +2548,17 @@ the subtask out:
      production code. Any other failure is code to fix.
 2. **Code checks the round, in order:** the new commit descends from the
    merge, the tracked tree is clean and carries no conflict marker (else the
-   round is spent and reset); then a **full re-judge** — the same judge on a
-   synthetic merge of the repaired tree over both parents, so the repaired
-   result is reviewed as one whole merge with no prior findings shown; then
-   **the tests of the conflicted area**: the test files the merge or the
-   repair changed plus one-hop importers of the changed sources, run on both
-   parents and the repaired HEAD. A test failing on HEAD and on neither
-   parent is a candidate, confirmed under B\* (§9 *Which failures are new*)
-   against the parent it passed on; only a confirmed one counts. They run
-   only through the repo's scoped runner over those files, never the raw
-   test command, and not at all when the task forbids the scoped command
-   (§9 *A command the task forbids*).
+   round is spent and reset); then **the tests of the conflicted area**:
+   the test files the merge or the repair changed plus one-hop importers of
+   the changed sources, run on both parents and the repaired HEAD. A test
+   failing on HEAD and on neither parent is a candidate, confirmed under
+   B\* (§9 *Which failures are new*) against the parent it passed on; only
+   a confirmed one counts. They run only through the repo's scoped runner
+   over those files, never the raw test command, and not at all when the
+   task forbids the scoped command (§9 *A command the task forbids*); then
+   a **full re-judge** — the same judge on a synthetic merge of the
+   repaired tree over both parents, so the repaired result is reviewed as
+   one whole merge with no prior findings shown.
 3. A round passes when the re-judge has no gating defect and no test
    failure is confirmed. The merge then stands, and any listed line still
    absent and not superseded is recorded as residual content loss.
@@ -6081,12 +6082,12 @@ around. An evidence gap keeps today's behaviour (proceed, recorded). No
 re-plan is attempted (the scoped re-plan was benched and deferred).
 Measured (bench P3, live re-planning of 7 historical blocked domains at
 their own base trees, 2 samples each): the 4 domains blocked on unmerged
-prerequisite tasks typed `external_prerequisite` 8/8; the 3 non-external
+prerequisite tasks typed `external_precondition` 8/8; the 3 non-external
 cases (a real evidence gap, and the same prerequisite blocks replayed
 after the prerequisite merged) planned `ready` with `none` on every
 sample that returned (6/6), so no non-external block was typed external.
-The kind names follow the implementer's typed blocker (§8) so the two
-read the same.
+The kind names follow the implementer's typed blocker (§13 *A blocked
+implementer says why, as a type*) so the two read the same.
 
 **Reaching it from finalize, after a plan has fully executed.** The two
 routes above both fire *before* any subtask runs. A third case arrives from
@@ -7894,8 +7895,10 @@ a round left. With
 fewer valid sets every failing set is shown and nothing is held back — a
 weaker check, logged as such, and the repair is not told of hidden tests
 that do not exist. A set whose files could not all be run (a
-missing runner, a path the target tree already uses) is no evidence either
-way: it is left out of the vote rather than counted as passing, and when
+missing runner, a path the target tree already uses) and none of whose
+run files was confirmed failing is no evidence either way: it is left out
+of the vote rather than counted as passing (a confirmed failing file
+still makes it failing), and when
 no set can be run the gate records no evidence instead of a pass. Repair rounds run the conformer at **high
 effort**, regardless of the operator's `--effort`/`--effort-conformer`
 settings — the rounds exist only on failing runs, and effort is the
@@ -9401,7 +9404,10 @@ Three layers follow, each derived from that one list:
     `spec/**{,/*/**}/*_spec.rb`, `**/*_spec.rb`) selects every test file.
     A quoted glob in any operand position is read the same way.
   - cargo `--lib`/`--doc`/`--test`/`--bin`/`--example`/`--bench` select
-    target kinds or one target, so they stay selectors.
+    target kinds or one target, so they stay selectors. cargo's `*` is
+    one match-everything value for all of its selectors, so `--test
+    '*'` (likewise `--bin`/`--example`/`--bench '*'`) reads as a
+    whole-suite run though it runs one target kind: a false refusal.
   What it cannot see: a selector list naming every project (`--project
   unit --project e2e`, `--selectProjects unit e2e`, `-p p1 -p p2`), a
   partial glob that happens to match all (`-p 'p*'`), `cargo test -p` or
@@ -9512,9 +9518,11 @@ Three layers follow, each derived from that one list:
     entry does the same, so a forbidden `vitest run` also forbids
     `pnpm run test`.
   The derived entries travel in the hook's payload like any other, so
-  the worker hook, which reads no `package.json`, refuses them too. They
-  are not shown as the task's own forbids, and a derived entry the task
-  prescribes is dropped like any other.
+  the worker hook, which reads no `package.json`, refuses them too. The
+  run log lists them apart from the task's own forbids, but the worker
+  notice names them with the task's own ("this task forbids running
+  …"), and a derived entry the task prescribes is dropped like any
+  other.
 
   *A script's environment is part of what it runs.* Deriving from a body
   first dropped its environment: `"test:db": "NODE_ENV=production vitest
@@ -9789,8 +9797,9 @@ lacks them:
   nothing and pass. `kill <pid>` of a PID the worker saved stays allowed.
   Because the hook now runs before every Bash call of every acting worker,
   the hook script allows a call whose text contains neither `kill` nor
-  `fuser` without importing leerie (an import costs ~1.7 s where no
-  bytecode cache can be written).
+  `fuser` without importing leerie when the run forbids no command (an
+  import costs ~1.7 s where no bytecode cache can be written); with a
+  forbidden entry in the payload, every call is matched.
 - **A paired notice**: kills by name are denied because other workers share
   the process table; stop your own background command with `TaskStop`, or
   `kill` a PID you saved from `$!`. `TaskStop` is therefore no longer

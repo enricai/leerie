@@ -7627,7 +7627,7 @@ CACHE_MOUNTS=(
   # falling back to ~/.local/share/pnpm/store inside the container —
   # which is NOT bind-mounted, so every run paid full registry cost.
   #
-  # The store lives IN THE STATE MOUNT, next to the worktrees (DESIGN §6½
+  # The store lives IN THE STATE MOUNT, next to the worktrees (DESIGN §6
   # *The pnpm store shares the worktrees' mount*). pnpm hard-links packages
   # from the store into node_modules, and a hard link cannot cross a mount:
   # with the store on its own cache mount every install fell back to
@@ -8326,7 +8326,7 @@ child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 child_env["TZ"] = ${_host_tz_json}
 child_env["LEERIE_COMMIT"] = ${_leerie_commit_json}
 # The pnpm store shares the state volume with the worktrees, so installs
-# hard-link instead of copying (DESIGN 6.5, the pnpm store shares the
+# hard-link instead of copying (DESIGN §6, the pnpm store shares the
 # worktrees mount): the state root here is /work/.leerie.
 child_env["npm_config_store_dir"] = "/work/.leerie/.pnpm-store"
 if "${_BEDROCK_BEARER_ACTIVE}" == "true":

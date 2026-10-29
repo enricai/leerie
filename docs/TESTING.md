@@ -4600,7 +4600,9 @@ tests; see below.)
   2026-10-06 an unacted dispute is re-raised once —
   `test_a_second_failing_run_accepts_no_work`
   asserts the carried-forward marker; `test_a_third_run_still_does_not_dispute`).
-- **Ties are not a passing majority** (`test_majority_rule`).
+- **Ties are not a passing majority** — superseded by the any-failing rule
+  (`_acceptance_any_fails`; `test_majority_rule` was rewritten as
+  `test_any_failing_set_fails`).
 - **No residue** — superseded in round 4: evaluation no longer writes the
   target tree at all (`test_evaluation_never_touches_the_tree_and_never_overwrites`).
 - **Markup check precision** (`test_ordinary_markup_named_like_a_schema_field_is_not_a_hit`):
@@ -4642,8 +4644,9 @@ that coincidence.
   evaluation worktree — `test_evaluation_installs_deps_before_running`).
 - **Created directories** — a round-1 behaviour first pinned in round 2, removed
   in round 4 with in-tree evaluation (a disposable worktree makes it moot).
-- **Validity base** skips an undated sibling
-  (`test_validity_base_prefers_the_earliest_same_task_sibling`).
+- **Validity base** skips an undated sibling — now the informational
+  report base (`_acceptance_report_base`; the validity tree is the run's own
+  start), pinned by `test_report_base_prefers_the_earliest_same_task_sibling`.
 - **No claim of hidden tests that do not exist**
   (`test_no_hidden_sets_means_no_claim_of_hidden_tests`).
 - **Counts over measured sets only** (`test_residual_counts_only_measured_sets`,
@@ -5438,9 +5441,10 @@ called), the per-ID verdict (interleaved base-first pairs, a flake or a
 base failing on some reruns is `resource_affected`, a base failing every
 rerun is `pre_existing`, a gate timeout or an unreadable PSI file
 escalates to 5 pairs, the budget cuts pairs short), the report parser,
-and two end-to-end runs against a real pytest suite in a real git repo — one
-real regression confirmed new while an alternating flake is typed
-`resource_affected`. Its last test executes `_run_final_conformance`: with
+and end-to-end runs against a real pytest suite in a real git repo (the
+`e3_repo` fixture) — among them one real regression confirmed new while an
+alternating flake is typed `resource_affected`. One of them executes
+`_run_final_conformance` (`test_final_loop_continues_only_on_a_confirmed_new_failure`): with
 the `tests` axis red on every round, the loop stops after one round when no
 ID is confirmed new, and spends every round when one is.
 

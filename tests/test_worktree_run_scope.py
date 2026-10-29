@@ -149,7 +149,7 @@ def test_registration_check_survives_a_worktree_list_past_4k(tmp_path):
 
 
 def test_no_registration_check_pipes_git_into_grep():
-    """All seven registration checks read a captured list. A piped
+    """All eight registration checks read a captured list. A piped
     `git worktree list ... | grep` is the SIGPIPE shape."""
     import re
     offenders = []

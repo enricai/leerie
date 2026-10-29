@@ -59977,8 +59977,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "Default: off.")
     ap.add_argument("--stop-on-blocked", action="store_true",
                     help="stop the run and wait for `accept-blocked` when a "
-                         "subtask is blocked, instead of re-driving it from "
-                         "the shared budget and settling it unconverged. "
+                         "subtask is still blocked after its re-drives from "
+                         "the shared budget, instead of settling it "
+                         "unconverged. "
                          f"Also {STOP_ON_BLOCKED_ENV} env or "
                          "stop_on_blocked in leerie.toml. Default: off.")
     ap.add_argument("--stop-on-repo-change", action="store_true",
