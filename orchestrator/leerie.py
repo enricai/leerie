@@ -5676,7 +5676,8 @@ def _helper_worktree_path(st: "State", name: str) -> Path:
                                                         name)
 
 
-def _worktree_add_detached(st: "State", wt: Path, rev: str
+def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
+                           repo: Path | None = None
                            ) -> subprocess.CompletedProcess:
     """`git worktree add --detach <wt> <rev>` under the repository-wide
     worktree lock every script's add and every prune takes
@@ -5684,8 +5685,9 @@ def _worktree_add_detached(st: "State", wt: Path, rev: str
     it a prune of this run racing the add (admin entry written, `.git` link
     not yet) drops the registration. Waits at most
     `_WORKTREE_ADD_LOCK_WAIT_SEC`, then adds unlocked, logged — these
-    helpers fail open."""
-    root = str(st.repo_root)
+    helpers fail open. `repo` (default the run's repository) is the
+    checkout git is run in — any worktree of the same repository."""
+    root = str(repo if repo is not None else st.repo_root)
     argv = ["git", "-C", root, "worktree", "add", "--detach", str(wt), rev]
     lock_fd = None
     try:
@@ -5720,13 +5722,14 @@ def _worktree_add_detached(st: "State", wt: Path, rev: str
             os.close(lock_fd)
 
 
-async def _worktree_add_detached_async(st: "State", wt: Path, rev: str
+async def _worktree_add_detached_async(st: "State", wt: Path, rev: str, *,
+                                       repo: Path | None = None
                                        ) -> subprocess.CompletedProcess:
     """`_worktree_add_detached` off the event loop: its lock wait (up to
     `_WORKTREE_ADD_LOCK_WAIT_SEC`) and the checkout would otherwise stall
     every worker's watchdog and stream reader (review r2 L3)."""
     return await asyncio.to_thread(
-        functools.partial(_worktree_add_detached, st, wt, rev))
+        functools.partial(_worktree_add_detached, st, wt, rev, repo=repo))
 
 
 def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
@@ -38976,7 +38979,8 @@ async def _assert_staging_clean(staging: str | Path,
     that staging holds nothing but it and ignored files (DESIGN §8 *The
     final diff describes the tree that ships*): I1 holds every worker in
     staging to a clean tree and I2 every command of leerie's own, so at a
-    reader — a measurement, a delivery judge, the ratchet, the refresh —
+    reader that measures there — the final conformance, the refresh, the
+    ratchet's and the re-drive's test IDs —
     `_tree_dirt` is []. Anything else is leerie's own invariant broken, not
     unfinished work of the task's: the run stops (`die`) naming the lines,
     rather than measuring, judging or shipping a tree it cannot name. A
@@ -42896,6 +42900,38 @@ def _head_identity(tree: str | Path | None) -> tuple[str, str]:
     return got[0], got[1]
 
 
+@contextlib.asynccontextmanager
+async def _judge_checkout(st: "State", staging: Path,
+                          name: str) -> AsyncIterator[Path]:
+    """Where a delivery judge reads: exactly the commit (DESIGN §8 *Every
+    post-execution verdict is of the committed tree*) — a detached checkout
+    of staging's HEAD at `_helper_worktree_path(st, name)`, removed
+    afterwards. Never staging: its ignored files (a build made before HEAD
+    last moved, installed dependencies) are readable by the judge's
+    `grep -r`/`cat`, and its contract and ratchet verdicts carry no
+    citation to check against HEAD. No install: a judge runs nothing.
+    Raises WorkerError when the checkout cannot be made — the judge read
+    nothing, so it takes the crash path and settles nothing met."""
+    head = await _branch_head_sha(str(staging))
+    wt = _helper_worktree_path(st, name)
+
+    def _remove() -> None:
+        subprocess.run(["git", "-C", str(staging), "worktree", "remove",
+                        "--force", str(wt)], capture_output=True,
+                       check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+    _remove()
+    try:
+        add = (await _worktree_add_detached_async(st, wt, head, repo=staging)
+               if head else None)
+        if add is None or add.returncode != 0:
+            raise WorkerError(f"{name}: no checkout of the committed tree "
+                              "could be made to judge it")
+        yield wt
+    finally:
+        _remove()
+
+
 def _orchestrator_results_digest(st: "State",
                                  tree: str | Path | None) -> str:
     """The orchestrator's OWN results for the executed-commands record
@@ -43349,8 +43385,8 @@ async def _delivery_judge_unmet(
         sections = [
             "TASK:\n" + task,
             "REQUIRED ITEMS (verify each against the CURRENT tree — your "
-            "cwd holds exactly the commit this run is about to ship, "
-            "nothing uncommitted):\n"
+            "cwd is a clean checkout of the commit this run is about to "
+            "ship):\n"
             + json.dumps(entries, indent=2) + slice_note,
         ]
         if exec_digest:
@@ -43410,6 +43446,9 @@ async def _delivery_judge_unmet(
     limit = asyncio.Semaphore(max(1, int(caps.get("max_parallel") or 1)))
     # One HEAD read per cited file per gate pass.
     cite_cache: dict = {}
+    # The judges read a checkout of staging's HEAD (`_judge_checkout`, set
+    # below); their cites are made relative to it.
+    judge_cwd: list[Path] = [staging]
 
     async def _judge_pack(p: int, pack: list[int]) -> list[dict]:
         with_contract = contract_ctx is not None and p == 0
@@ -43435,7 +43474,7 @@ async def _delivery_judge_unmet(
             smp = await claude_p(
                 user_prompt=user_prompt,
                 system_prompt=_load_prompt("delivery_judge"),
-                schema_key="delivery_judge", cwd=str(staging),
+                schema_key="delivery_judge", cwd=str(judge_cwd[0]),
                 allowed_tools=SATISFIED_PROBE_TOOLS,
                 max_turns=judge_max_turns,
                 autonomous=False, caps=caps, st=st,
@@ -43446,7 +43485,7 @@ async def _delivery_judge_unmet(
             # Merge by item_index: a verdict for an index outside this
             # pack is not this prompt's to give.
             smp = {**smp, "verdicts": [
-                _relative_cites(v, staging)
+                _relative_cites(v, judge_cwd[0])
                 for v in (smp.get("verdicts") or [])
                 if isinstance(v, dict) and v.get("item_index") in allowed]}
             # A met resting only on a worker's command run is unknown, not
@@ -43465,21 +43504,19 @@ async def _delivery_judge_unmet(
                     samples.append(await _sample(k))
         return samples
 
-    # The judges read staging itself: it is HEAD plus ignored files (I1 +
-    # I2), asserted here (DESIGN §8 *Every post-execution verdict is of the
-    # committed tree*).
-    await _assert_staging_clean(staging, "the delivery judge")
-    tasks = [asyncio.ensure_future(_judge_pack(p, pack))
-             for p, pack in enumerate(packs)]
-    try:
-        per_pack = await asyncio.gather(*tasks)
-    except BaseException:
-        # One pack's failure ends the gate (the callers treat it as
-        # advisory); the others must not keep spawning judges after it.
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    async with _judge_checkout(st, staging, "delivery-judge") as cwd:
+        judge_cwd[0] = cwd
+        tasks = [asyncio.ensure_future(_judge_pack(p, pack))
+                 for p, pack in enumerate(packs)]
+        try:
+            per_pack = await asyncio.gather(*tasks)
+        except BaseException:
+            # One pack's failure ends the gate (the callers treat it as
+            # advisory); the others must not keep spawning judges after it.
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
     human: dict[int, dict] = {}
     n_samples = 0
     for pack, samples in zip(packs, per_pack):
@@ -52317,11 +52354,11 @@ async def _ratchet_judge(st: "State", caps: dict, models: dict,
                  "met_evidence": {}, "errors": []}
     system_prompt = (_load_prompt("delivery_judge") + "\n\n"
                      + _load_prompt("delivery_ratchet"))
-    await _assert_staging_clean(staging, "the delivery ratchet")
-    return await _ratchet_judge_packs(
-        st, caps, models, efforts, staging, packs, normalized, prior,
-        pre_sha, diff, diff_files, typed_evidence, system_prompt, label,
-        out)
+    async with _judge_checkout(st, staging, "delivery-ratchet") as cwd:
+        return await _ratchet_judge_packs(
+            st, caps, models, efforts, cwd, packs, normalized, prior,
+            pre_sha, diff, diff_files, typed_evidence, system_prompt, label,
+            out)
 
 
 async def _ratchet_judge_packs(st: "State", caps: dict, models: dict,
@@ -52331,8 +52368,8 @@ async def _ratchet_judge_packs(st: "State", caps: dict, models: dict,
                                diff: str, diff_files: set[str],
                                typed_evidence: list[str], system_prompt: str,
                                label: str, out: dict) -> dict:
-    """`_ratchet_judge`'s packs, each judged with `cwd` — staging at the
-    commit after the group, asserted clean — as the tree the items are
+    """`_ratchet_judge`'s packs, each judged with `cwd` — a checkout of the
+    commit after the group (`_judge_checkout`) — as the tree the items are
     re-verified on."""
     for p, pack in enumerate(packs):
         entries = [{"item_index": i, "item": normalized[i]["item"],

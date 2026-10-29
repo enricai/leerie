@@ -7165,8 +7165,8 @@ The tree that ships is the *committed* one, staging's `HEAD^{tree}`:
 finalize pushes the branch, and nothing uncommitted reaches it. With I1
 (§8 *A worker leaves its tree clean*) and I2 (§6½ *Leerie's own commands
 leave a worker's tree as they found it*) holding, staging at every point
-leerie reads it — a measurement, a delivery judge, the ratchet, the
-refresh — is its HEAD plus ignored files: no worker leaves anything
+leerie measures in it — the final conformance, the refresh, the
+ratchet's and the re-drive's test IDs — is its HEAD plus ignored files: no worker leaves anything
 uncommitted there, and no command of leerie's own leaves anything
 behind. So a measurement taken in staging *is* a measurement of the
 committed tree, and is stamped with `HEAD^{tree}`; nothing uncommitted is
@@ -7221,22 +7221,31 @@ one makes nothing *met*:
 - the delivery judges — every item verdict, the DEFECT CONTRACT verdict,
   and the delivery ratchet's judged re-verification of the items a
   re-drive group did not route (its execution-typed items are read from
-  the failing-test-ID diff of the commit, below) — read staging itself,
-  asserted clean first (*The final diff describes the tree that ships*,
-  above): it is HEAD plus ignored files, so no content only the working
-  tree holds is in front of them. Review round 12 drove why the cite rule
-  below was not enough on its own: the contract verdict carries no
-  citation and resolved `met` on a single sample, and the ratchet
-  re-verified kept items with no citation check — both judged staging's
-  working tree, so an untracked helper could hold the contract up. Rounds
-  12 to 14 answered with a disposable checkout of HEAD whenever staging
-  held anything (from round 13 L2, an ignored file too), which every run
-  with installed dependencies then took; I1 and I2 remove the helper
-  itself, so the judges read staging. Ignored files stay in front of
-  them, as they are in front of every test run: by the repository's own
-  declaration they are not source, nothing of them ships, and a met
-  resting on one buys nothing, since every cite is checked against
-  `HEAD`;
+  the failing-test-ID diff of the commit, below) — read exactly the
+  commit: a detached checkout of staging's HEAD (`git worktree add
+  --detach`), with no dependency install, made for each judge pass and
+  removed after it. A judge runs nothing — its tools read files and git —
+  so it needs no environment, and gets none. A checkout that cannot be
+  made fails the judge like a crash (it reads nothing, so it settles
+  nothing *met*), never falls back to staging.
+
+  Why not staging, which I1 and I2 keep at HEAD plus ignored files: the
+  ignored files are exactly what a judge must not read. Its tools include
+  `grep -r`, `cat` and `ls`, which (unlike `rg`) read ignored paths, and
+  two of its verdicts carry no citation — the DEFECT CONTRACT verdict and
+  the ratchet's re-verification — so nothing checks what they rested on
+  against `HEAD`. And ignored output in staging is stale by construction
+  once HEAD moves: the final conformance builds staging (`dist/`, `.next/`,
+  generated clients), then the acceptance repair and the re-drive commit
+  on top without rebuilding, and a worker's own build reflects whatever
+  its tree held then. A `grep -rn` for the fixed symbol then finds it in
+  the stale build of a fix that was rolled back (pinned by
+  `tests/test_judges_read_the_committed_tree.py`). Review round 12 drove
+  the uncited half (an untracked helper held the contract up), and round
+  13 L2 the ignored half (a worker's uncommitted `dist/` build). A test
+  run is the opposite case — it needs the installed dependencies and
+  regenerates its own output — which is why measurements run in staging
+  and judges do not;
 - a judge's `met` counts only when each part cites a quote found in
   `git show HEAD:<path>` (`_verify_delivery_cite`), and an `ABSENT` cite
   is `git grep` over `HEAD`, so content only the working tree holds buys

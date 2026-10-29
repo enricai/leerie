@@ -199,11 +199,12 @@ def test_the_ratchet_judge_sees_prior_evidence_and_the_round_diff(
     diff = up[i_diff:]
     assert f"git diff {start} HEAD" in diff
     assert "-    return a - b" in diff and "+    return a + b" in diff
-    # Staging itself, at the commit after the group and asserted clean
-    # (DESIGN §8 *Every post-execution verdict is of the committed tree*;
+    # A checkout of the commit after the group, never staging (DESIGN §8
+    # *Every post-execution verdict is of the committed tree*;
     # tests/test_judges_read_the_committed_tree.py).
     assert j["schema_key"] == "delivery_ratchet"
-    assert j["cwd"] == str(staging)
+    assert j["cwd"] == str(leerie._helper_worktree_path(st,
+                                                        "delivery-ratchet"))
     assert j["allowed_tools"] == leerie.SATISFIED_PROBE_TOOLS
 
 

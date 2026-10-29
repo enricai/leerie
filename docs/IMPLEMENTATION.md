@@ -6365,9 +6365,7 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     measurement (`pre_tree`, which is also the stamp when the round takes
     no `post`), right after its `post` measurement (`post_stamp`), and
     before the after-loop confirm below; `_refresh_test_id_diff`;
-    `_delivery_judge_unmet` (`"the delivery judge"`) and `_ratchet_judge`
-    (`"the delivery ratchet"`), whose `cwd` is then staging itself
-    (passed to `_ratchet_judge_packs(..., cwd, ...)`); `_ratchet_exec`;
+    `_ratchet_exec`;
     `_redrive_test_ids`; the acceptance gate's `_ids_at`. Every read of
     "the tree that ships" uses `_committed_tree_sha`: the refresh below,
     the test-outcome verdicts of `_delivery_judge_unmet`,
@@ -6410,8 +6408,17 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     records why.
   - Post-execution readers (DESIGN §8 *Every post-execution verdict is of
     the committed tree*): the delivery judges' `cwd` — `_delivery_judge_unmet`'s
-    items and contract and `_ratchet_judge`'s packs — is staging, after
-    `_assert_staging_clean` (above). Each
+    items and contract (`"delivery-judge"`) and `_ratchet_judge`'s packs
+    (`"delivery-ratchet"`, passed to `_ratchet_judge_packs(..., cwd, ...)`)
+    — is `async with _judge_checkout(st, staging, name) as cwd`, always: a
+    detached checkout of staging's HEAD at `_helper_worktree_path(st,
+    name)` (`_worktree_add_detached_async(st, wt, head, repo=staging)` —
+    `repo`, default `st.repo_root`, is the checkout git runs in), no
+    dependency install, removed afterwards (`git -C <staging> worktree
+    remove --force` + `rmtree`); it raises `WorkerError` when the checkout
+    cannot be added, so the delivery judge's crash path
+    (`delivery_judge_crash_retries`, then `unknown`) and the ratchet's
+    (`error` → every prior met item unverified) take it. Each
     judge verdict's citation paths are made relative to that `cwd`
     (`_relative_cites(v, cwd)`, `_delivery_cite_rel`; `RECORD`/`ABSENT`
     left alone) before screening against staging's HEAD. `_verify_delivery_cite` reads
