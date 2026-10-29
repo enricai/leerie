@@ -539,7 +539,10 @@ def test_a_slow_red_gate_is_confirmed_inside_the_budget(leerie, env,
     """`_ci_confirm_red`'s reruns share `confirm_budget_sec` (DESIGN §9
     *The repository's own merge checks run too*, step 5): a gate that takes
     longer than the budget is cut at the budget, not run to its own
-    `worker_timeout_sec`, and the cut never reads as the red going away."""
+    `worker_timeout_sec`, and the cut never reads as the red going away.
+    Nor as a confirmed red: no base/final pair finished, so the check is
+    `budget_short_unsettled` — listed for human verification, never `new`
+    on its first observation (review round 6 H1)."""
     env["checks"][:] = [_check("build", [PY, "build.py"], kind="build")]
     _baseline(env)
     _commit(env, {"build.py": "import sys, time\ntime.sleep(6)\nsys.exit(1)\n"})
@@ -558,10 +561,14 @@ def test_a_slow_red_gate_is_confirmed_inside_the_budget(leerie, env,
     # Before the fix the final rerun ran its full 6 s.
     assert len(took) == 1 and took[0] < 1.5 + 2.0, took
     b = env["st"].data["ci_parity"]["final"]["b_star"]
-    assert b["budget_exhausted"] is True
-    assert b["new"] == ["build"] and b["budget_short"] == ["build"]
-    assert [(u["id"], u["why"]) for u in unmet] == [("build", "red")]
-    assert leerie._decide_outcome(env["st"], any_commits=True) == "unconverged"
+    assert b["budget_exhausted"] is True and b["pairs_run"] == 0
+    assert b["new"] == [] and b["budget_short_unsettled"] == ["build"]
+    assert unmet == []
+    gaps = [e for e in env["st"].data["needs_human_verification"]
+            if e.get("source") == leerie.CONFIRM_BUDGET_GAP_SOURCE]
+    assert [g["site"] for g in gaps] == ["CI parity"]
+    assert "could not confirm within the budget: build" in gaps[0]["detail"]
+    assert leerie._decide_outcome(env["st"], any_commits=True) == "done"
 
 
 def _fake_ci(leerie, monkeypatch, tmp_path, durations, fails):
@@ -597,8 +604,9 @@ def _fake_ci(leerie, monkeypatch, tmp_path, durations, fails):
 def test_each_check_of_a_ci_rerun_gets_only_the_budget_left(
         leerie, env, monkeypatch, tmp_path):
     """Check `a` finished passing on the cut final rerun: that refutes it
-    (never `new`); `b`, which the budget alone kept short, is
-    `new` and `budget_short`. Every check's timeout is what was left."""
+    (never `new`); `b`, which the budget alone kept short with no pair
+    finished, is `budget_short_unsettled`. Every check's timeout is what
+    was left."""
     caps = {**env["caps"], "confirm_pairs": 2, "confirm_budget_sec": 1.2,
             "worker_timeout_sec": 60}
     seen = _fake_ci(leerie, monkeypatch, tmp_path,
@@ -613,8 +621,35 @@ def test_each_check_of_a_ci_rerun_gets_only_the_budget_left(
     t_b = [t for s, i, t in seen if s == "final" and i == "b"][0]
     assert t_b < t_a
     assert v["budget_exhausted"] is True
-    assert v["new"] == ["b"] and v["budget_short"] == ["b"]
+    assert v["new"] == [] and v["budget_short_unsettled"] == ["b"]
     assert v["no_verdict"] == ["a"]
+
+
+def test_a_long_check_is_sized_out_so_it_cannot_starve_the_rest(
+        leerie, env, monkeypatch, tmp_path):
+    """Review round 6 H1: a long red check first in CI order used to eat
+    every rerun's budget, so the short ones behind it were decided on their
+    first observation. Sized by the final run's durations, the short check
+    runs first and alone, gets all its pairs and is `new`; the long one is
+    sized out, `budget_short_unsettled`, never run."""
+    caps = {**env["caps"], "confirm_pairs": 2, "confirm_budget_sec": 2.0,
+            "worker_timeout_sec": 60}
+    seen = _fake_ci(leerie, monkeypatch, tmp_path,
+                    {("final", "long"): 5.0, ("base", "long"): 5.0,
+                     ("final", "short"): 0.05, ("base", "short"): 0.05},
+                    fails={"long", "short"})
+    recs = [_check("long", [PY, "l.py"]), _check("short", [PY, "s.py"])]
+    v = _run(leerie._ci_confirm_red(env["st"], caps, "deadbeef",
+                                    tmp_path / "final", recs,
+                                    durations={"long": 5.0, "short": 0.05}))
+    assert v["new"] == ["short"] and v["pairs_run"] == 2
+    assert v["budget_short_unsettled"] == ["long"]
+    assert v["sized_out"] == ["long"]
+    assert {i for _s, i, _t in seen} == {"short"}
+    # Unsized (no durations), the fixed order lets `long` starve `short`.
+    v = _run(leerie._ci_confirm_red(env["st"], caps, "deadbeef",
+                                    tmp_path / "final", recs))
+    assert v["new"] == []
 
 
 def test_a_check_timing_out_with_budget_left_is_no_verdict_not_a_cut(

@@ -5435,13 +5435,34 @@ against the previous launcher on a Mac; only the static scan is visible to CI.
 new*): the host PSI reader and gate (the gate is pinned to
 `/proc/pressure/cpu`, paired with a test that the default reader is the one
 called), the per-ID verdict (interleaved base-first pairs, a flake or a
-base failure is `resource_affected`, a gate timeout or an unreadable PSI
-file escalates to 5 pairs, the budget cuts pairs short), the report parser,
+base failing on some reruns is `resource_affected`, a base failing every
+rerun is `pre_existing`, a gate timeout or an unreadable PSI file
+escalates to 5 pairs, the budget cuts pairs short), the report parser,
 and two end-to-end runs against a real pytest suite in a real git repo — one
 real regression confirmed new while an alternating flake is typed
 `resource_affected`. Its last test executes `_run_final_conformance`: with
 the `tests` axis red on every round, the loop stops after one round when no
 ID is confirmed new, and spends every round when one is.
+
+Review round 6 H1 (a budget shortfall is unsettled, not `new`): the same
+file pins that a candidate with no finished base/final pair is
+`budget_short_unsettled` (`test_a_rerun_ending_past_the_budget_with_no_verdict_is_not_a_run`,
+rewritten from the zero-rerun `new` it used to pin), that a discovery find
+is never new on a shortfall, that `confirm_budget_sec = 0` runs no gate and
+no rerun, `_confirm_select`'s ranking and sizing, both empty-base-list
+callers of the final diff (a scoped command, unknown baseline IDs — review
+round 6 D-H3), a file sized out of the final diff, and the as-written retry
+bounded by what is left (review round 6 C1).
+`tests/test_bstar_one_off_flake_budget.py` is the reviewer's end-to-end
+driver turned regression test: a one-off flake in a file too slow for one
+pair ends `done` with a "could not confirm within the budget" entry in the
+PR's "Needs human verification", and with a budget that fits the pairs it
+is `resource_affected` with no entry. `tests/test_ci_parity.py` pins the
+CI side (a slow red check is unsettled, a long check is sized out so it
+cannot starve a short one), `tests/test_integration_repair_loop.py` that an
+unsettled merged-tree failure is never a `test_failure`, and
+`tests/test_delivery_ratchet.py` that an unsettled re-drive candidate
+leaves the execution items unchecked, never a rollback.
 
 `tests/test_redrive_budget.py` drives `phase_execute` (DESIGN §13 *One
 re-drive budget per subtask*): a blocked subtask is re-driven with its
@@ -5532,7 +5553,9 @@ pytest command, `claude_p` stubbed and the host PSI pinned quiet:
   `test_acceptance_no_work.py` were rewritten, including a passing-majority
   settle that now disputes); a set that fails once and then passes its B*
   reruns is `resource_affected` and no evidence, a consistent failure is
-  confirmed; `_confirm_still_failing` needs every rerun and escalates on a
+  confirmed; `_confirm_still_failing` needs every rerun (with `seen_failing`,
+every finished one, unless the candidate is in `needs_rerun` and none
+finished) and escalates on a
   gate timeout; HEAD at the validity base is answered without running the
   sets; a set typed broken leaves the next run's residual (all broken: no
   residual), and a residual without set indices is kept.

@@ -504,7 +504,8 @@ class TestConflictedAreaTests:
     on, then routed `stale_by_other_side` when the home parent with the
     other side's production files applied fails it too."""
 
-    def _arrange(self, leerie, tmp_path, monkeypatch, failing: dict):
+    def _arrange(self, leerie, tmp_path, monkeypatch, failing: dict,
+                 **cap_over):
         st, staging, p1, merge = _setup(leerie, tmp_path)
         p2 = _git(staging, "rev-parse", f"{merge}^2").strip()
         # The repair touched a test file and the module it imports.
@@ -545,7 +546,7 @@ class TestConflictedAreaTests:
         monkeypatch.setattr(leerie, "_acceptance_cmd",
                             lambda st_, files, tree=None: "pytest x")
         monkeypatch.setattr(leerie, "_host_cpu_psi", lambda *a: 0.0)
-        caps = dict(leerie.DEFAULT_CAPS, confirm_pairs=1)
+        caps = dict(leerie.DEFAULT_CAPS, confirm_pairs=1, **cap_over)
         return asyncio.run(leerie._integration_test_failures(
             st, SID, staging, p1, p2, merge, caps,
             log_path=tmp_path / "log", parent_cache={}))
@@ -583,6 +584,19 @@ class TestConflictedAreaTests:
                 return dict.__getitem__(self, k)
         out = self._arrange(leerie, tmp_path, monkeypatch, Flaky(failing))
         assert out["test_failure"] == [] and out["stale_by_other_side"] == []
+
+    def test_a_candidate_the_budget_left_unsettled_is_not_a_failure(
+            self, leerie, tmp_path, monkeypatch):
+        """Review round 6 H1: no base/final pair finished inside the
+        confirm budget. The merged-tree failure seen once is unsettled —
+        never sent to the integrator as a `test_failure` (which would fail
+        the round and can back the merge out), never `stale`."""
+        a = "tests/test_app.py::t_a"
+        out = self._arrange(leerie, tmp_path, monkeypatch, {
+            "head": {a}, "integrated": set(), "incoming": set()},
+            confirm_budget_sec=0)
+        assert out["test_failure"] == [] and out["stale_by_other_side"] == []
+        assert out["budget_short_unsettled"] == [a]
 
     def test_scope_includes_one_hop_importers(self, leerie, tmp_path):
         repo = tmp_path / "s"

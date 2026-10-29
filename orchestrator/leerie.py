@@ -6368,7 +6368,8 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
         if e.get("source") == "required_item" and _pr_entry(e.get("item")):
             add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
         elif (e.get("source") in (REGRESSION_GAP_SOURCE,
-                                  TEST_OUTCOME_GAP_SOURCE)
+                                  TEST_OUTCOME_GAP_SOURCE,
+                                  CONFIRM_BUDGET_GAP_SOURCE)
               and _pr_entry(e.get("detail"))):
             add("Regression checks the run could not settle",
                 f"- [ ] {_pr_entry(e.get('detail'))}")
@@ -34357,8 +34358,13 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                            + ", ".join(unconverged))
     diff = st.data.get("test_id_diff")
     if isinstance(diff, dict) and diff.get("new"):
+        short = [x for x in diff.get("budget_short") or []
+                 if x in diff["new"]]
         reasons.append(f"{len(diff['new'])} test(s) newly failing on the "
-                       "final tree, confirmed against the base")
+                       "final tree, confirmed against the base"
+                       + (f" ({len(short)} on fewer than every base/final "
+                          "pair: the confirm budget cut the rest)"
+                          if short else ""))
     acc = st.data.get("acceptance") or {}
     gate = (acc.get("gate") or {}) if isinstance(acc, dict) else {}
     if isinstance(gate, dict):
@@ -38924,6 +38930,37 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
 
 
 REGRESSION_GAP_SOURCE = "regression_check"
+CONFIRM_BUDGET_GAP_SOURCE = "confirm_budget"
+
+
+def _set_confirm_budget_gap(st: "State", site: str,
+                            what: list[str]) -> None:
+    """Record, or clear when `what` is empty, the "Needs human verification"
+    entry for `site`'s B* confirm on the final tree: the candidates (their
+    files, or CI check ids) it could not settle within `confirm_budget_sec`
+    (`budget_short_unsettled`, DESIGN §9 *Which failures are new*, step 4).
+    One entry per site, the latest final tree's."""
+    data = getattr(st, "data", None)
+    if not isinstance(data, dict):
+        return
+    entries = [e for e in (data.get("needs_human_verification") or [])
+               if not (isinstance(e, dict)
+                       and e.get("source") == CONFIRM_BUDGET_GAP_SOURCE
+                       and e.get("site") == site)]
+    if what:
+        shown = ", ".join(str(w) for w in what[:10]) + (
+            f" (+{len(what) - 10} more)" if len(what) > 10 else "")
+        entries.append({
+            "source": CONFIRM_BUDGET_GAP_SOURCE, "site": site,
+            "detail": (f"{site}: could not confirm within the budget: "
+                       f"{shown} — failing on the final tree, but no "
+                       "base/final rerun pair finished inside "
+                       "confirm_budget_sec, so whether the run made them "
+                       "fail is unknown")})
+    if entries != (data.get("needs_human_verification") or []):
+        data["needs_human_verification"] = entries
+        with contextlib.suppress(Exception):
+            st.save()
 
 
 def _set_regression_gap(st: "State", detail: str | None) -> None:
@@ -39098,6 +39135,40 @@ async def _confirm_gate(caps: dict, *,
             "psi": psi, "readable": True}
 
 
+# The gate record of a confirm with no budget (`confirm_budget_sec` <= 0):
+# nothing reruns, so nothing waits on host pressure either.
+_CONFIRM_NO_BUDGET_GATE: dict = {"waited_sec": 0.0, "timed_out": False,
+                                 "psi": None, "readable": False,
+                                 "skipped": "no budget"}
+
+
+def _confirm_select(units: list[str], durations: dict[str, float], *,
+                    rank: dict[str, int], reps: int, budget: float,
+                    overhead: float) -> dict:
+    """Which of a B* confirm's rerun `units` (test files, CI checks) to
+    rerun, sized before the reruns start (DESIGN §9 *Which failures are
+    new*, step 2): ranked by `rank` (lower is more informative — a unit
+    holding a candidate the caller saw fail on its own measurement before
+    one only discovery found), then the shortest measured duration (an
+    unmeasured unit last), then the name; taken while `(sum(duration) +
+    overhead) * reps` stays inside `budget`, the first always (it may still
+    finish a pair). An unmeasured unit costs `overhead` alone. Pure.
+    `{chosen, sized_out}`."""
+    order = sorted(units, key=lambda u: (rank.get(u, 0),
+                                         durations.get(u, float("inf")), u))
+    chosen: list[str] = []
+    sized_out: list[str] = []
+    total = 0.0
+    for u in order:
+        d = float(durations.get(u) or 0.0)
+        if not chosen or (total + d + overhead) * reps <= budget:
+            chosen.append(u)
+            total += d
+        else:
+            sized_out.append(u)
+    return {"chosen": chosen, "sized_out": sized_out}
+
+
 class _RerunCut(NamedTuple):
     """A B* rerun the budget cut short partway (DESIGN §9 *Which failures
     are new*, step 4): the candidates it finished with a verdict
@@ -39120,6 +39191,7 @@ async def _confirm_new_failures(
         run_base: Callable[[float], Awaitable[set[str] | None]],
         run_final: Callable[[float], Awaitable[set[str] | None]],
         caps: dict, *, label: str, seen_failing: bool = False,
+        intermittent: Iterable[str] = (),
         read_psi: Callable[[], float | None] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         clock: Callable[[], float] | None = None) -> dict:
@@ -39136,19 +39208,22 @@ async def _confirm_new_failures(
     serial rerun's failing IDs (None: no verdict).
 
     A rerun the budget cut short is not a run (`_rerun_cut_by_budget`): it
-    ends the confirm and is not counted. With `seen_failing` — the caller
-    saw every candidate fail on the final tree and not on the base — an ID
-    the budget alone kept short of `k` pairs is `new` (and `budget_short`)
-    when every finished final rerun failed it and no finished base rerun
-    did (DESIGN §9 step 4): a budget cut is never evidence that a failure
-    went away.
+    ends the confirm and is not counted. An ID the budget alone kept short
+    of `k` pairs — every finished final rerun failed it, no finished base
+    rerun did — is decided on what finished (DESIGN §9 step 4): `new` (and
+    `budget_short`) only with `seen_failing`, at least one finished pair,
+    and the ID not in `intermittent` (found by discovery repeats, so
+    intermittent by construction); otherwise `budget_short_unsettled` —
+    never `new` on no base evidence, and never "went away". A budget of 0
+    or less runs nothing: every candidate is `budget_short_unsettled`.
 
     Frozen from Q9 (held-out, 124 trials): 0/88 clean trials called new,
     36/36 reverted fixes detected."""
     cand = sorted(set(candidates))
+    weak = set(intermittent)
     out: dict = {"candidates": cand, "new": [], "pre_existing": [],
                  "no_verdict": [], "resource_affected": [],
-                 "budget_short": [],
+                 "budget_short": [], "budget_short_unsettled": [],
                  "pairs_required": 0, "pairs_run": 0,
                  "budget_exhausted": False, "gate": None, "per_id": {}}
     if not cand:
@@ -39157,8 +39232,9 @@ async def _confirm_new_failures(
     async with _confirm_lock():
         budget = float(caps.get("confirm_budget_sec",
                                 DEFAULT_CAPS["confirm_budget_sec"]))
-        gate = await _confirm_gate(caps, read_psi=read_psi, sleep=sleep,
-                                   clock=clock)
+        gate = (_CONFIRM_NO_BUDGET_GATE if budget <= 0 else
+                await _confirm_gate(caps, read_psi=read_psi, sleep=sleep,
+                                    clock=clock))
         out["gate"] = gate
         # The budget's clock starts after the gate: its wait has its own cap
         # and is longest exactly when the pairs escalate (DESIGN §9 *Which
@@ -39208,7 +39284,7 @@ async def _confirm_new_failures(
         out["pairs_run"] = len(base_runs)
         complete = (len(base_runs) == k
                     and all(r is not None for r in base_runs + final_runs))
-        budget_only = (out["budget_exhausted"] and seen_failing
+        budget_only = (out["budget_exhausted"]
                        and all(r is not None
                                for r in base_runs + final_runs))
         for cid in cand:
@@ -39229,9 +39305,17 @@ async def _confirm_new_failures(
                   and cid not in cut_final_passed):
                 # The budget alone stopped the pairs, and every rerun that
                 # finished agreed with what the caller saw (DESIGN §9
-                # *Which failures are new*, step 4).
-                out["new"].append(cid)
-                out["budget_short"].append(cid)
+                # *Which failures are new*, step 4). New only on at least
+                # one finished pair: with none there is no base evidence at
+                # all (a scoped or unknown-baseline diff starts from an
+                # empty base list), and a first final observation under
+                # load is mostly a flake (Q9). A discovery find is
+                # intermittent by construction: never new on a shortfall.
+                if seen_failing and final_seen >= 1 and cid not in weak:
+                    out["new"].append(cid)
+                    out["budget_short"].append(cid)
+                else:
+                    out["budget_short_unsettled"].append(cid)
             elif base_seen == k and base_failed == k:
                 # The base fails it every time: not a flake, and never
                 # reported as one (barnacle 45fa4253: 33 such IDs read as
@@ -39247,7 +39331,10 @@ async def _confirm_new_failures(
         + (f", {len(out['no_verdict'])} no_verdict" if out["no_verdict"]
            else "")
         + (f"; {len(out['budget_short'])} new on the pairs the budget "
-           "allowed" if out["budget_short"] else "") + " "
+           "allowed" if out["budget_short"] else "")
+        + (f"; {len(out['budget_short_unsettled'])} could not be confirmed "
+           "within the budget" if out["budget_short_unsettled"] else "")
+        + " "
         f"({out['pairs_run']}/{k} pair(s); gate waited "
         f"{gate['waited_sec']}s{', timed out' if gate['timed_out'] else ''}"
         f"{'; budget exhausted' if out['budget_exhausted'] else ''})")
@@ -39258,6 +39345,7 @@ async def _confirm_still_failing(
         candidates: Iterable[str],
         run_final: Callable[[float], Awaitable[set[str] | None]],
         caps: dict, *, label: str, seen_failing: bool = False,
+        needs_rerun: Iterable[str] = (),
         read_psi: Callable[[], float | None] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         clock: Callable[[], float] | None = None) -> dict:
@@ -39278,11 +39366,16 @@ async def _confirm_still_failing(
     before the confirm — a candidate the budget alone kept short of `k`
     reruns is `confirmed` (and `budget_short`) when every finished rerun
     failed it and no finished file of the cut rerun passed it (DESIGN §9
-    *Which failures are new*, step 4). Without it (a confirm whose
+    *Which failures are new*, step 4) — except one in `needs_rerun` (its
+    observation was a timeout or a signal death, a resource signature, or
+    the caller is base-compare-shaped) with no finished rerun: that one is
+    `budget_short_unsettled`. Without `seen_failing` (a confirm whose
     `confirmed` exonerates) a shortfall never confirms."""
     cand = sorted(set(candidates))
+    weak = set(needs_rerun)
     out: dict = {"candidates": cand, "confirmed": [], "no_verdict": [],
                  "resource_affected": [], "budget_short": [],
+                 "budget_short_unsettled": [],
                  "reruns_required": 0, "reruns_run": 0,
                  "budget_exhausted": False, "gate": None}
     if not cand:
@@ -39291,8 +39384,9 @@ async def _confirm_still_failing(
     async with _confirm_lock():
         budget = float(caps.get("confirm_budget_sec",
                                 DEFAULT_CAPS["confirm_budget_sec"]))
-        gate = await _confirm_gate(caps, read_psi=read_psi, sleep=sleep,
-                                   clock=clock)
+        gate = (_CONFIRM_NO_BUDGET_GATE if budget <= 0 else
+                await _confirm_gate(caps, read_psi=read_psi, sleep=sleep,
+                                    clock=clock))
         out["gate"] = gate
         # The budget's clock starts after the gate: its wait has its own cap
         # and is longest exactly when the pairs escalate (DESIGN §9 *Which
@@ -39331,6 +39425,12 @@ async def _confirm_still_failing(
             agreed = all(cid in r for r in runs if r is not None)
             if complete and agreed:
                 out["confirmed"].append(cid)
+            elif (budget_only and agreed and cid not in cut_passed
+                  and cid in weak and seen == 0):
+                # Nothing finished, and the caller's own observation is not
+                # enough on its own (DESIGN §9 *Which failures are new*,
+                # step 4): unsettled, never confirmed and never a pass.
+                out["budget_short_unsettled"].append(cid)
             elif budget_only and agreed and cid not in cut_passed:
                 # The budget alone stopped the reruns, and every one that
                 # finished failed it, as the caller's own run did (DESIGN
@@ -39346,7 +39446,10 @@ async def _confirm_still_failing(
         + (f", {len(out['no_verdict'])} no_verdict" if out["no_verdict"]
            else "")
         + (f"; {len(out['budget_short'])} confirmed on the reruns the "
-           "budget allowed" if out["budget_short"] else "") + " "
+           "budget allowed" if out["budget_short"] else "")
+        + (f"; {len(out['budget_short_unsettled'])} could not be confirmed "
+           "within the budget" if out["budget_short_unsettled"] else "")
+        + " "
         f"({out['reruns_run']}/{k} rerun(s); gate waited "
         f"{gate['waited_sec']}s{', timed out' if gate['timed_out'] else ''}"
         f"{'; budget exhausted' if out['budget_exhausted'] else ''})")
@@ -39473,8 +39576,11 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     `_measure_blt` records is never measured with altered flags. With
     `serial`, the runner's `_SERIAL_RUNNER_FLAGS` are appended first; a
     serial form that yields no report (a repo whose config insists on a
-    flag the serial one contradicts) is retried once as written.
-    `env_extra` (a throwaway test database's URL) is laid over the run's
+    flag the serial one contradicts) is retried once as written, inside
+    what is left of `timeout` after the serial run (none left, or under the
+    1 s floor: no retry) — so a B* rerun given the budget left never runs
+    past it twice (DESIGN §9 *Which failures are new*, step 2). `env_extra`
+    (a throwaway test database's URL) is laid over the run's
     environment."""
     run_files = list(files or [])
     if run_files:
@@ -39500,6 +39606,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     attempts.append(cmd)
     reports = st.run_dir / "confirm" / "reports"
     forbidden = _forbidden_specs(getattr(st, "data", None))
+    # Run time spent by earlier attempts: charged to the retry's timeout.
+    spent = 0.0
     for i, attempt in enumerate(attempts):
         report = reports / f"{label}-{i}-{uuid.uuid4().hex[:8]}"
         spec = _acceptance_report_spec(attempt, report, run_files)
@@ -39523,14 +39631,23 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             env = {**(env if env is not None else os.environ), **path_env}
         if env_extra:
             env = {**(env if env is not None else os.environ), **env_extra}
+        left = float(timeout) - spent
+        if spent and left < 1.0:
+            # The serial run used what the caller gave: no as-written retry
+            # past it.
+            return None
         try:
             report.parent.mkdir(parents=True, exist_ok=True)
             async with _blt_semaphore(caps), \
                     _build_class_slot(st, label=f"{label}-ids"):
-                await _run_streaming(
-                    argv, cwd=str(tree), env=env,
-                    timeout=max(1.0, float(timeout)), log_path=log_path,
-                    label=f"{label}-ids: {run_cmd}", verbosity="quiet")
+                t_run = time.monotonic()
+                try:
+                    await _run_streaming(
+                        argv, cwd=str(tree), env=env,
+                        timeout=max(1.0, left), log_path=log_path,
+                        label=f"{label}-ids: {run_cmd}", verbosity="quiet")
+                finally:
+                    spent += time.monotonic() - t_run
         except Exception:
             # A timeout or a spawn failure: no verdict from this run.
             with contextlib.suppress(OSError):
@@ -39549,6 +39666,9 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             return {"ids": sorted(ids), "files": ids, "kind": kind,
                     "messages": messages, "durations": durations}
     return None
+
+
+_FINAL_DIFF_SITE = "failing-test-ID diff"
 
 
 async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
@@ -39621,9 +39741,38 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                        **({"ids_unknown": True} if ids_unknown else {}))
         st.data["test_id_diff"] = verdict
         st.save()
+        _set_confirm_budget_gap(st, _FINAL_DIFF_SITE, [])
         return verdict
-    files = sorted({id_files.get(c) for c in all_cand})
+    files = sorted({id_files.get(c) for c in all_cand}, key=str)
     rerun_files = None if (None in files or not files) else list(files)
+    # Sized before the reruns (DESIGN §9 *Which failures are new*, step 2):
+    # one rerun runs every candidate file serially, so a long file must not
+    # starve the rest. A candidate the final run itself failed ranks before
+    # one only discovery found.
+    sized_out: list[str] = []
+    if rerun_files:
+        rank: dict[str, int] = {}
+        for c in all_cand:
+            f = id_files[c]
+            rank[f] = min(rank.get(f, 1), 0 if c in cand else 1)
+        pairs = int(caps.get("confirm_pairs", DEFAULT_CAPS["confirm_pairs"]))
+        sel = _confirm_select(
+            rerun_files, dict(st.data.get("test_file_durations") or {}),
+            rank=rank, reps=2 * pairs,
+            budget=float(caps.get("confirm_budget_sec",
+                                  DEFAULT_CAPS["confirm_budget_sec"])),
+            overhead=_DISCOVERY_RUN_OVERHEAD_SEC)
+        if sel["sized_out"]:
+            rerun_files = sel["chosen"]
+            sized_out = [c for c in all_cand
+                         if id_files.get(c) in sel["sized_out"]]
+            log(f"  B* {label}: {len(sel['sized_out'])} candidate file(s) "
+                "sized out of the confirm budget by their measured "
+                "durations — unsettled: " + ", ".join(sel["sized_out"][:5]))
+    confirm_cand = [c for c in all_cand if c not in sized_out]
+    # Found only by discovery repeats: intermittent by construction, so
+    # never new on a budget shortfall.
+    weak = [c for c in all_cand if c not in cand]
     wt = _helper_worktree_path(st, "confirm-base")
 
     def _teardown() -> None:
@@ -39641,8 +39790,8 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
 
         async def _none(_t: float) -> set[str] | None:
             return None
-        verdict = await _confirm_new_failures(all_cand, _none, _none, caps,
-                                              label=label)
+        verdict = await _confirm_new_failures(confirm_cand, _none, _none,
+                                              caps, label=label)
         verdict["base_unavailable"] = True
     else:
         try:
@@ -39667,13 +39816,25 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                     return set(got["ids"])
                 return _run
             # Every candidate failed on the final tree (a final run or a
-            # discovery repeat) and not on the base.
+            # discovery repeat) and not on the base list — which is empty
+            # for a scoped command, so a shortfall needs a finished pair.
             verdict = await _confirm_new_failures(
-                all_cand, _runner_for(str(wt), "base"),
+                confirm_cand, _runner_for(str(wt), "base"),
                 _runner_for(staging, "final"), caps, label=label,
-                seen_failing=True)
+                seen_failing=True, intermittent=weak)
         finally:
             _teardown()
+    if sized_out:
+        verdict["candidates"] = list(all_cand)
+        verdict["budget_short_unsettled"] = sorted(
+            set(verdict.get("budget_short_unsettled") or []) | set(sized_out))
+        verdict["sized_out"] = sorted(sized_out)
+    unsettled = list(verdict.get("budget_short_unsettled") or [])
+    if unsettled:
+        verdict["budget_short_unsettled_files"] = sorted(
+            {id_files.get(c) or c for c in unsettled})
+    _set_confirm_budget_gap(st, _FINAL_DIFF_SITE,
+                            verdict.get("budget_short_unsettled_files") or [])
     verdict["final_candidates"] = cand
     verdict["tree_sha"] = tree_sha
     verdict["discovery"] = disc
@@ -40840,10 +41001,13 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
             for r in recs:
                 res: dict = {}
                 if r.get("gate"):
+                    t_gate = time.monotonic()
                     run = await _ci_run(_ci_gate_argv(r), tree=wt, rec=r,
                                         st=st,
                                         caps=caps, label=f"final-{r['id']}")
-                    res.update({"rc": run["rc"], "dirty": run["dirty"]})
+                    res.update({"rc": run["rc"], "dirty": run["dirty"],
+                                "duration_sec": round(
+                                    time.monotonic() - t_gate, 3)})
                     if not run["passed"]:
                         red.append(r["id"])
                 if r.get("ratchet") == "diagnostic":
@@ -40888,10 +41052,15 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
                             "cwd": r.get("cwd"), "thresholds": fired})
                 final["results"][r["id"]] = res
             if red:
-                verdict = await _ci_confirm_red(st, caps, base_sha, wt,
-                                                [x for x in recs
-                                                 if x["id"] in red])
+                verdict = await _ci_confirm_red(
+                    st, caps, base_sha, wt,
+                    [x for x in recs if x["id"] in red],
+                    durations={i: final["results"][i]["duration_sec"]
+                               for i in red if "duration_sec"
+                               in final["results"].get(i, {})})
                 final["b_star"] = verdict
+                final["budget_short_unsettled"] = list(
+                    verdict.get("budget_short_unsettled") or [])
                 final["resource_affected"] = list(
                     verdict.get("resource_affected") or [])
                 final["pre_existing"] = list(
@@ -40908,6 +41077,8 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
             _ci_teardown(st, wt)
     ci["final"] = final
     st.save()
+    _set_confirm_budget_gap(st, "CI parity",
+                            list(final.get("budget_short_unsettled") or []))
     if final["unmet"]:
         log(f"  ci parity: {len(final['unmet'])} merge check(s) red on the "
             "final tree: " + "; ".join(
@@ -40922,13 +41093,43 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
 
 
 async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
-                          final_tree: Path, recs: list[dict]) -> dict:
+                          final_tree: Path, recs: list[dict], *,
+                          durations: dict[str, float] | None = None
+                          ) -> dict:
     """B* for gates red on the final tree: interleaved base/final reruns of
     just those checks; a check is red only if it failed every final rerun
     and passed every base rerun. Every check run of one rerun shares the
     budget left (`_budget_caps`), and a rerun the budget cuts is a
     `_RerunCut`, never a pass (DESIGN §9 *Which failures are new*, steps 2
-    and 4)."""
+    and 4). The checks are sized first by their final-run `durations`
+    (`_confirm_select`, shortest first, so one long check cannot starve
+    the rest); one sized out is `budget_short_unsettled`."""
+    pairs = int(caps.get("confirm_pairs", DEFAULT_CAPS["confirm_pairs"]))
+    sel = _confirm_select(
+        [r["id"] for r in recs], dict(durations or {}), rank={},
+        reps=2 * pairs,
+        budget=float(caps.get("confirm_budget_sec",
+                              DEFAULT_CAPS["confirm_budget_sec"])),
+        overhead=0.0)
+    by_id = {r["id"]: r for r in recs}
+    recs = [by_id[i] for i in sel["chosen"]]
+    out = await _ci_confirm_chosen(st, caps, base_sha, final_tree, recs)
+    if sel["sized_out"]:
+        log(f"  ci parity: {len(sel['sized_out'])} red check(s) sized out "
+            "of the confirm budget by their measured durations — "
+            "unsettled: " + ", ".join(sel["sized_out"]))
+        out["candidates"] = sorted(set(out["candidates"])
+                                   | set(sel["sized_out"]))
+        out["sized_out"] = sorted(sel["sized_out"])
+        out["budget_short_unsettled"] = sorted(
+            set(out.get("budget_short_unsettled") or [])
+            | set(sel["sized_out"]))
+    return out
+
+
+async def _ci_confirm_chosen(st: "State", caps: dict, base_sha: str,
+                             final_tree: Path, recs: list[dict]) -> dict:
+    """`_ci_confirm_red`'s confirm over the checks it chose, in order."""
     cand = [r["id"] for r in recs]
     base_wt = (await _ci_worktree(st, "ci-confirm-base", base_sha)
                if base_sha else None)
@@ -41848,6 +42049,12 @@ def _test_outcome_unknown_reason(diff: dict, tree_sha: str | None) -> str:
         why.append(f"the confirm budget ran out after "
                    f"{diff.get('pairs_run', 0)} of "
                    f"{diff.get('pairs_required', 0)} base/final rerun pair(s)")
+    short = [str(x) for x in (diff.get("budget_short_unsettled_files")
+                              or diff.get("budget_short_unsettled") or [])]
+    if short:
+        why.append("could not confirm within the budget: "
+                   + ", ".join(short[:5])
+                   + (f" (+{len(short) - 5} more)" if len(short) > 5 else ""))
     for key, what in (("no_verdict", "no rerun produced a verdict"),
                       ("resource_affected", "reruns disagreed")):
         ids = [str(x) for x in diff.get(key) or []]
@@ -41869,7 +42076,9 @@ def _test_outcome_verdict(st: "State", tree_sha: str | None) -> dict:
     when it had no candidates on this tree or every one is `pre_existing`,
     `unknown` otherwise — none recorded, one side's IDs unknown, the tree
     moved since, or a candidate B* left unsettled (`no_verdict`,
-    `resource_affected`, budget exhausted, base unavailable)."""
+    `resource_affected`, `budget_short_unsettled`, budget exhausted, base
+    unavailable). A candidate the budget alone kept short with at least
+    one finished pair is `new`, so unmet (DESIGN §9 step 4)."""
     diff = st.data.get("test_id_diff")
     if not isinstance(diff, dict):
         return {"verdict": "unknown", "new": [],
@@ -50097,11 +50306,15 @@ async def _redrive_test_ids(st: "State", caps: dict, staging: Path,
 
 async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
                                 pre_sha: str, before: dict | None,
-                                after: dict | None, label: str) -> dict:
+                                after: dict | None, label: str, *,
+                                intermittent: Iterable[str] = ()) -> dict:
     """B*: the IDs failing after a group and not before it, confirmed
-    against a `redrive-base` worktree at `pre_sha` (`_confirm_new_failures`).
-    `{new, resource_affected, unmeasured}`; no verdict on either side is
-    `unmeasured`, never a regression."""
+    against a `redrive-base` worktree at `pre_sha` (`_confirm_new_failures`;
+    `intermittent`: the IDs only discovery repeats found, never new on a
+    budget shortfall). Candidate files are sized to the budget first
+    (`_confirm_select`); one sized out is `budget_short_unsettled`.
+    `{new, resource_affected, budget_short_unsettled, unmeasured}`; no
+    verdict on either side is `unmeasured`, never a regression."""
     if before is None or after is None:
         return {"new": [], "pre_existing": [], "no_verdict": [],
                 "resource_affected": [], "unmeasured": True}
@@ -50112,6 +50325,25 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     id_files = after.get("files") or {}
     files = sorted({id_files.get(c) for c in cand}, key=str)
     rerun = None if (None in files or not files) else list(files)
+    weak = set(intermittent)
+    sized_out: list[str] = []
+    if rerun:
+        rank: dict[str, int] = {}
+        for c in cand:
+            f = id_files[c]
+            rank[f] = min(rank.get(f, 1), 1 if c in weak else 0)
+        pairs = int(caps.get("confirm_pairs", DEFAULT_CAPS["confirm_pairs"]))
+        sel = _confirm_select(
+            rerun, dict(st.data.get("test_file_durations") or {}),
+            rank=rank, reps=2 * pairs,
+            budget=float(caps.get("confirm_budget_sec",
+                                  DEFAULT_CAPS["confirm_budget_sec"])),
+            overhead=_DISCOVERY_RUN_OVERHEAD_SEC)
+        if sel["sized_out"]:
+            rerun = sel["chosen"]
+            sized_out = [c for c in cand
+                         if id_files.get(c) in sel["sized_out"]]
+    confirm_cand = [c for c in cand if c not in sized_out]
     cmd = after.get("command") or ""
     log_path = st.run_dir / "logs" / _REDRIVE_LOG
     wt = _helper_worktree_path(st, "redrive-base")
@@ -50126,8 +50358,9 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     add = await _worktree_add_detached_async(st, wt, pre_sha)
     try:
         if add.returncode != 0:
-            verdict = await _confirm_new_failures(cand, _no_rerun, _no_rerun,
-                                                  caps, label=label)
+            verdict = await _confirm_new_failures(confirm_cand, _no_rerun,
+                                                  _no_rerun, caps,
+                                                  label=label)
         else:
             await _ensure_worktree_deps(
                 str(wt), st, caps, log_path=log_path,
@@ -50145,14 +50378,23 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
                     return None if got is None else set(got["ids"])
                 return _run
             verdict = await _confirm_new_failures(
-                cand, _runner(str(wt), "base"), _runner(str(staging), "final"),
-                caps, label=label, seen_failing=True)
+                confirm_cand, _runner(str(wt), "base"),
+                _runner(str(staging), "final"),
+                caps, label=label, seen_failing=True,
+                intermittent=sorted(weak))
     finally:
         _teardown()
+    if sized_out:
+        verdict["candidates"] = list(cand)
+        verdict["sized_out"] = sorted(sized_out)
+        verdict["budget_short_unsettled"] = sorted(
+            set(verdict.get("budget_short_unsettled") or []) | set(sized_out))
     return {"new": list(verdict["new"]),
             "pre_existing": list(verdict.get("pre_existing") or []),
             "no_verdict": list(verdict.get("no_verdict") or []),
             "resource_affected": list(verdict["resource_affected"]),
+            "budget_short_unsettled": list(
+                verdict.get("budget_short_unsettled") or []),
             "unmeasured": False, "files": {c: id_files.get(c)
                                            for c in verdict["new"]},
             # The whole B* verdict: the delivery ratchet types intermittent
@@ -50455,8 +50697,9 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
         files.setdefault(c, (disc.get("id_files") or {}).get(c))
     aug = {**after, "ids": sorted(set(after.get("ids") or []) | found),
            "files": files}
-    newv = await _redrive_new_failures(st, caps, staging, pre_sha, before,
-                                       aug, label)
+    newv = await _redrive_new_failures(
+        st, caps, staging, pre_sha, before, aug, label,
+        intermittent=sorted(found - set(after.get("ids") or [])))
     verdict = newv.pop("verdict", None)
     newv["intermittent_regression"] = (_type_intermittent_regressions(
         verdict, final_ids=set(after.get("ids") or []),
@@ -50523,14 +50766,20 @@ async def _delivery_ratchet(st: "State", caps: dict, models: dict,
         if out["new_failures"]:
             out["exec_flagged"] = list(out["execution"])
             regressed |= set(out["execution"])
-        elif ex.get("unmeasured") and out["execution"]:
-            # No ID diff on either side: these items were not checked, and
-            # the record says so rather than reading as held (DESIGN §8 *A
-            # held case that fails again*).
+        elif ((ex.get("unmeasured") or ex.get("budget_short_unsettled"))
+              and out["execution"]):
+            # No ID diff on either side, or candidates the confirm budget
+            # left unsettled: these items were not checked, and the record
+            # says so rather than reading as held (DESIGN §8 *A held case
+            # that fails again*) — never a rollback (DESIGN §9 *Which
+            # failures are new*, step 4).
             out["exec_unchecked"] = list(out["execution"])
             log(f"  delivery ratchet {label}: {len(out['execution'])} "
                 "execution-shaped item(s) unchecked — the failing-test-ID "
-                "diff measured nothing")
+                + ("diff measured nothing" if ex.get("unmeasured") else
+                   "diff could not confirm "
+                   f"{len(ex['budget_short_unsettled'])} candidate(s) "
+                   "within the budget"))
         judged = [i for i in rest if kinds.get(i) != "execution"]
         if judged:
             sec = _intermittent_regression_evidence_section(
@@ -55628,6 +55877,7 @@ async def _integration_test_failures(
             return [f] if f in scope else scope
 
         confirmed: list[tuple[str, str | None]] = []
+        unsettled: list[str] = []
         by_home: dict[str | None, list[str]] = {}
         for cid in cand:
             by_home.setdefault(_home(cid), []).append(cid)
@@ -55638,10 +55888,13 @@ async def _integration_test_failures(
                 return await _ids(staging, f"integ-{sid}-confirm-head", _f,
                                   left)
             if home is None:
+                # Base-compare-shaped (a merged-tree failure): never
+                # confirmed on the merge's own observation alone.
                 verdict = await _confirm_still_failing(
                     ids, _final, caps, label=f"integration {sid}",
-                    seen_failing=True)
+                    seen_failing=True, needs_rerun=ids)
                 confirmed += [(c, None) for c in verdict["confirmed"]]
+                unsettled += verdict.get("budget_short_unsettled") or []
                 continue
             tree = await _tree_for(home)
             if tree is None:
@@ -55654,6 +55907,13 @@ async def _integration_test_failures(
                 ids, _base, _final, caps, label=f"integration {sid}",
                 seen_failing=True)
             confirmed += [(c, home) for c in verdict["new"]]
+            unsettled += verdict.get("budget_short_unsettled") or []
+        if unsettled:
+            # Not a defect of the merge: never sent to the integrator and
+            # never a backed-out merge (DESIGN §9 *Which failures are new*,
+            # step 4). The final failing-test-ID diff settles the shipping
+            # tree.
+            out["budget_short_unsettled"] = sorted(unsettled)
         if not confirmed:
             return out
         base = (await _git_text(staging, "merge-base", p1, p2) or "").strip()

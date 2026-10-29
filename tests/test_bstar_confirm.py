@@ -272,8 +272,9 @@ def test_raising_rerun_is_no_verdict_not_a_crash(leerie):
 
 
 def test_budget_bounds_the_confirm(leerie):
-    """Each rerun costs 400 s of a 1800 s budget: pairs are cut short, every
-    candidate is resource_affected, and each rerun gets the budget left."""
+    """Each rerun costs 400 s of a 1800 s budget: pairs are cut short, and
+    each rerun gets the budget left. Without `seen_failing` a shortfall is
+    never `new`, and never "went away" either: `budget_short_unsettled`."""
     clock = _Clock()
     calls = []
     b, f = _runners([set()] * 3, [{"x"}] * 3, calls, clock=clock, cost=400.0)
@@ -281,7 +282,8 @@ def test_budget_bounds_the_confirm(leerie):
         ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
         sleep=clock.sleep, clock=clock))
     assert v["budget_exhausted"] is True and v["pairs_run"] == 2
-    assert v["new"] == [] and v["resource_affected"] == ["x"]
+    assert v["new"] == [] and v["budget_short_unsettled"] == ["x"]
+    assert v["resource_affected"] == []
     assert [round(c[1]) for c in calls] == [1800, 1400, 1000, 600, 200]
 
 
@@ -291,9 +293,9 @@ def test_a_budget_shortfall_is_never_evidence_a_failure_went_away(
     """DESIGN §9 *Which failures are new*, step 4 (review round 5 H1): the
     same cut as above. Every pair that finished agreed — final failed, base
     passed — and the cut pair's base side passed too. A caller that saw the
-    failure (`seen_failing`) gets `new`, named `budget_short`; a confirm
-    whose verdict exonerates (no `seen_failing`) never confirms on a
-    shortfall."""
+    failure (`seen_failing`) gets `new` on the two finished pairs, named
+    `budget_short`; without it the candidate is `budget_short_unsettled` —
+    unknown, never `new` and never "went away" (review round 6 H1)."""
     clock = _Clock()
     calls = []
     b, f = _runners([set()] * 3, [{"x"}] * 3, calls, clock=clock, cost=400.0)
@@ -302,7 +304,8 @@ def test_a_budget_shortfall_is_never_evidence_a_failure_went_away(
         sleep=clock.sleep, clock=clock, seen_failing=seen_failing))
     assert v["budget_exhausted"] is True and v["pairs_run"] == 2
     assert v["new"] == new and v["budget_short"] == new
-    assert v["resource_affected"] == ([] if new else ["x"])
+    assert v["budget_short_unsettled"] == ([] if new else ["x"])
+    assert v["resource_affected"] == []
     # The wall bound did not move: every rerun still gets the budget left.
     assert [round(c[1]) for c in calls] == [1800, 1400, 1000, 600, 200]
 
@@ -311,7 +314,10 @@ def test_a_rerun_ending_past_the_budget_with_no_verdict_is_not_a_run(leerie):
     """A rerun whose timeout was the budget left, ending with no report, was
     cut by the budget: it is not counted as a pair and not as a no-verdict
     run. Zero finished pairs (the cut pair's base side passed): the
-    caller's own observation stands."""
+    caller's one observation is not a verdict — under load it is mostly a
+    flake (Q9), and before review round 6 H1 this read `new` with zero
+    reruns. It is `budget_short_unsettled`: unknown, never `new`, never
+    "went away"."""
     clock = _Clock()
 
     async def base(timeout):
@@ -324,7 +330,8 @@ def test_a_rerun_ending_past_the_budget_with_no_verdict_is_not_a_run(leerie):
         ["x"], base, final, _caps(leerie), label="t", read_psi=lambda: 0.0,
         sleep=clock.sleep, clock=clock, seen_failing=True))
     assert v["pairs_run"] == 0 and v["budget_exhausted"] is True
-    assert v["new"] == ["x"] and v["budget_short"] == ["x"]
+    assert v["new"] == [] and v["budget_short"] == []
+    assert v["budget_short_unsettled"] == ["x"]
     assert v["no_verdict"] == [] and v["resource_affected"] == []
 
 
@@ -952,6 +959,240 @@ def test_every_measuring_confirm_says_whether_it_saw_the_failure(leerie):
     false = [c for c in calls if not c[2]]
     assert false == [("_integration_test_failures", "_ov", False)], calls
     assert {c[0] for c in calls if c[2]} == {
-        "_confirm_final_test_failures", "_ci_confirm_red",
+        "_confirm_final_test_failures", "_ci_confirm_chosen",
         "_acceptance_run_placed", "_falsifier_gates",
         "_redrive_new_failures", "_integration_test_failures"}, calls
+
+
+# --- review round 6 H1: a budget shortfall is unsettled, not `new` ---------
+
+def test_a_discovery_find_is_never_new_on_a_shortfall(leerie):
+    """Discovery candidates are intermittent by construction (DESIGN §9 *An
+    intermittent failure the run introduced is evidence*): the same two
+    agreeing pairs that make a final-run candidate `new` on a shortfall
+    leave a discovery find `budget_short_unsettled`."""
+    clock = _Clock()
+    b, f = _runners([set()] * 3, [{"x", "d"}] * 3, [], clock=clock,
+                    cost=400.0)
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x", "d"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, seen_failing=True,
+        intermittent=["d"]))
+    assert v["pairs_run"] == 2 and v["budget_exhausted"] is True
+    assert v["new"] == ["x"] and v["budget_short"] == ["x"]
+    assert v["budget_short_unsettled"] == ["d"]
+
+
+def test_a_zero_budget_confirms_nothing_and_waits_for_nothing(leerie):
+    """`confirm_budget_sec = 0` (not an operator setting; DEFAULT_CAPS
+    only): no gate wait, no rerun, every candidate unsettled — never `new`
+    (round 6 found it typed every candidate `new`)."""
+    calls: list = []
+
+    def psi():
+        calls.append("psi")
+        return 99.0
+    b, f = _runners([set()], [{"x"}], calls)
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x", "y"], b, f, _caps(leerie, confirm_budget_sec=0), label="t",
+        read_psi=psi, seen_failing=True))
+    assert calls == [] and v["gate"]["skipped"] == "no budget"
+    assert v["new"] == [] and v["budget_short_unsettled"] == ["x", "y"]
+    v = asyncio.run(leerie._confirm_still_failing(
+        ["x"], f, _caps(leerie, confirm_budget_sec=0), label="t",
+        read_psi=psi, seen_failing=True, needs_rerun=["x"]))
+    assert calls == [] and v["budget_short_unsettled"] == ["x"]
+    assert v["confirmed"] == []
+
+
+@pytest.mark.parametrize("needs,seen_runs,confirmed,unsettled", [
+    # The held-out reading: a file written to fail, seen failing.
+    ((), 0, ["x"], []),
+    # Seen only as a timeout / a merged-tree failure: needs a rerun.
+    (("x",), 0, [], ["x"]),
+    (("x",), 1, ["x"], [])])
+def test_still_failing_needs_a_finished_rerun_for_a_weak_observation(
+        leerie, needs, seen_runs, confirmed, unsettled):
+    clock = _Clock()
+    n = {"i": 0}
+
+    async def run_final(timeout):
+        n["i"] += 1
+        if n["i"] > seen_runs:
+            clock.t += timeout
+            return None
+        clock.t += 10.0
+        return {"x"}
+    v = asyncio.run(leerie._confirm_still_failing(
+        ["x"], run_final, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, seen_failing=True,
+        needs_rerun=needs))
+    assert v["reruns_run"] == seen_runs and v["budget_exhausted"] is True
+    assert v["confirmed"] == confirmed
+    assert v["budget_short_unsettled"] == unsettled
+
+
+def test_confirm_select_ranks_then_sizes(leerie):
+    """Pure: the observed-failing file ranks before a discovery-only one,
+    then shortest first; taken while (sum + overhead) * reps fits, the
+    first always; an unmeasured file costs the overhead alone."""
+    sel = leerie._confirm_select(
+        ["a", "b", "c", "d"], {"a": 100.0, "b": 10.0, "c": 5.0},
+        rank={"c": 1}, reps=6, budget=900.0, overhead=10.0)
+    # b (20*6=120), a (120*6=720), d unmeasured (130*6=780); c ranks last
+    # (145*6=870 fits).
+    assert sel == {"chosen": ["b", "a", "d", "c"], "sized_out": []}
+    sel = leerie._confirm_select(
+        ["a", "b", "c"], {"a": 100.0, "b": 10.0, "c": 5.0},
+        rank={"c": 1}, reps=6, budget=500.0, overhead=10.0)
+    # a's pairs do not fit; c, after it in rank, still does: a sized-out
+    # file never blocks a cheaper one behind it.
+    assert sel == {"chosen": ["b", "c"], "sized_out": ["a"]}
+    # Nothing fits: the first is still taken (it may finish a pair).
+    sel = leerie._confirm_select(["a"], {"a": 1e6}, rank={}, reps=6,
+                                 budget=1.0, overhead=0.0)
+    assert sel == {"chosen": ["a"], "sized_out": []}
+
+
+def _cut_base(leerie, monkeypatch):
+    """Every base rerun is cut by the budget (its timeout was the budget
+    left, and it ends with no report)."""
+    real = leerie._capture_failing_test_ids
+    labels: list[str] = []
+
+    async def capture(tree, cmd, st_, caps_, *, label, timeout, **kw):
+        labels.append(label)
+        if "-base" in label:
+            await asyncio.sleep(timeout)
+            return None
+        return await real(tree, cmd, st_, caps_, label=label,
+                          timeout=timeout, **kw)
+    monkeypatch.setattr(leerie, "_capture_failing_test_ids", capture)
+    return labels
+
+
+def test_scoped_diff_with_no_base_evidence_is_never_new(
+        leerie, e3_repo, monkeypatch):
+    """Review round 6 D-H3, caller 1: a scoped final result starts from an
+    empty base list, so `test_pre_existing` — failing on the base too — is
+    a candidate. The budget cuts the first base rerun: before, it was
+    `new` with no base evidence and the run `unconverged`; now it is
+    unsettled and the run `done` with the gap listed."""
+    monkeypatch.setattr(leerie, "_host_cpu_psi", lambda path=None: 0.0)
+    st, staging = e3_repo["st"], e3_repo["staging"]
+    pre = "tests/test_suite.py :: tests.test_suite.test_pre_existing"
+    st.data["baseline_failing_ids"] = [pre]
+    post = {"tests": {"ran": True, "measured": True, "passed": False,
+                      "command": CMD, "summary": "",
+                      "scoped_replacement": {"replaces": CMD},
+                      "failing_ids": [pre],
+                      "failing_id_files": {pre: "tests/test_suite.py"}}}
+    labels = _cut_base(leerie, monkeypatch)
+    v = asyncio.run(leerie._confirm_final_test_failures(
+        st, _caps(leerie, confirm_budget_sec=1.0,
+                  confirm_intermittent_repeats=0), str(staging), post,
+        log_path=st.run_dir / "logs" / "t.log", label="final-r0"))
+    assert labels == ["final-r0-base1"], labels
+    assert v["pairs_run"] == 0 and v["new"] == []
+    assert v["budget_short_unsettled"] == [pre]
+    assert v["budget_short_unsettled_files"] == ["tests/test_suite.py"]
+    st.data["subtask_status"] = {}
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    gap = [e for e in st.data["needs_human_verification"]
+           if e.get("source") == leerie.CONFIRM_BUDGET_GAP_SOURCE]
+    assert "could not confirm within the budget: tests/test_suite.py" \
+        in gap[0]["detail"]
+    got = leerie._test_outcome_verdict(
+        st, asyncio.run(leerie._worktree_tree_sha(str(staging))))
+    assert got["verdict"] == "unknown"
+    assert "could not confirm within the budget: tests/test_suite.py" \
+        in got["reason"]
+
+
+def test_unknown_baseline_discovery_find_is_never_new_on_a_cut(
+        leerie, e3_repo, monkeypatch):
+    """Review round 6 D-H3, caller 2: base IDs unknown, so the only
+    candidates are discovery finds against an empty base list. The budget
+    cuts the first base rerun: unsettled, never `new`."""
+    monkeypatch.setattr(leerie, "_host_cpu_psi", lambda path=None: 0.0)
+    pre = "tests/test_suite.py :: tests.test_suite.test_pre_existing"
+
+    async def disc(*a, **kw):
+        return {"failed_ids": [pre], "fail_counts": {pre: 1},
+                "id_files": {pre: "tests/test_suite.py"}, "coupled": {},
+                "repeats_run": 20, "_runs": []}
+    monkeypatch.setattr(leerie, "_intermittent_discovery", disc)
+    st, staging = e3_repo["st"], e3_repo["staging"]
+    st.data["baseline_failing_ids"] = None
+    post = {"tests": {"ran": True, "measured": True, "passed": False,
+                      "command": CMD, "failing_ids": [pre]}}
+    _cut_base(leerie, monkeypatch)
+    v = asyncio.run(leerie._confirm_final_test_failures(
+        st, _caps(leerie, confirm_budget_sec=1.0), str(staging), post,
+        log_path=st.run_dir / "logs" / "t.log", label="final-r0"))
+    assert v["ids_unknown"] is True and v["pairs_run"] == 0
+    assert v["new"] == [] and v["budget_short_unsettled"] == [pre]
+    st.data["subtask_status"] = {}
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+
+
+def test_final_diff_sizes_out_a_file_too_slow_for_its_pairs(
+        leerie, e3_repo, monkeypatch):
+    """Sizing by the recorded per-file durations: a candidate file whose
+    pairs cannot fit the budget is not rerun at all and is unsettled; the
+    rerun runs only the files that fit."""
+    monkeypatch.setattr(leerie, "_host_cpu_psi", lambda path=None: 0.0)
+    st, staging = e3_repo["st"], e3_repo["staging"]
+    stable = "tests/test_suite.py :: tests.test_suite.test_stable"
+    slow = "tests/test_slow.py :: tests.test_slow.test_x"
+    st.data["baseline_failing_ids"] = []
+    st.data["test_file_durations"] = {"tests/test_suite.py": 0.1,
+                                      "tests/test_slow.py": 900.0}
+    post = {"tests": {"ran": True, "measured": True, "passed": False,
+                      "command": CMD, "summary": "",
+                      "failing_ids": [stable, slow],
+                      "failing_id_files": {
+                          stable: "tests/test_suite.py",
+                          slow: "tests/test_slow.py"}}}
+    files_run: list = []
+    real = leerie._capture_failing_test_ids
+
+    async def capture(tree, cmd, st_, caps_, *, label, timeout, files=None,
+                      **kw):
+        files_run.append(tuple(files or ()))
+        return await real(tree, cmd, st_, caps_, label=label,
+                          timeout=timeout, files=files, **kw)
+    monkeypatch.setattr(leerie, "_capture_failing_test_ids", capture)
+    v = asyncio.run(leerie._confirm_final_test_failures(
+        st, _caps(leerie, confirm_budget_sec=600.0,
+                  confirm_intermittent_repeats=0), str(staging), post,
+        log_path=st.run_dir / "logs" / "t.log", label="final-r0"))
+    assert set(files_run) == {("tests/test_suite.py",)}, files_run
+    assert v["new"] == [stable] and v["pairs_run"] == 3
+    assert v["sized_out"] == [slow] and v["budget_short_unsettled"] == [slow]
+    assert set(v["candidates"]) == {stable, slow}
+
+
+def test_the_as_written_retry_gets_only_what_is_left(leerie, e3_repo,
+                                                     monkeypatch):
+    """Review round 6 C1: a serial run that wrote no report used to be
+    retried as written with the full timeout again, so one B* rerun could
+    take twice the budget left. The retry gets what is left; none left,
+    no retry."""
+    st = e3_repo["st"]
+    seen: list[float] = []
+
+    async def run(argv, *, timeout, **kw):
+        seen.append(timeout)
+        await asyncio.sleep(0.3)
+    monkeypatch.setattr(leerie, "_run_streaming", run)
+    got = asyncio.run(leerie._capture_failing_test_ids(
+        str(e3_repo["staging"]), CMD, st, _caps(leerie), label="t",
+        log_path=st.run_dir / "logs" / "t.log", timeout=2.0, serial=True))
+    assert got is None and len(seen) == 2, seen
+    assert seen[0] == 2.0 and seen[1] <= 2.0 - 0.3 + 0.05, seen
+    seen.clear()
+    got = asyncio.run(leerie._capture_failing_test_ids(
+        str(e3_repo["staging"]), CMD, st, _caps(leerie), label="t",
+        log_path=st.run_dir / "logs" / "t.log", timeout=1.1, serial=True))
+    assert got is None and seen == [1.1], seen

@@ -4515,7 +4515,7 @@ orthogonal and still applies to all callers regardless of
 | `_serialize_planned_overlap(subtasks, waves, cap)` / `_overlap_first_fit(wave, pairs)` | `_schedule`'s planned-overlap serialisation (DESIGN §5): returns `(waves, serialised_pairs)`; see `overlap_extra_waves`. |
 | `_json_key_merge3(base, ours, theirs)` / `_try_json_key_merge(staging, sid)` | The key-level JSON merge at integration (DESIGN §6 *A conflict confined to JSON files is merged by key*). `integrate_wave` calls `_try_json_key_merge` when `integrate.sh` exits 1, before any integrator: only when every conflicted file (`git diff --diff-filter=U`) is `.json`, each stage parses (`:1:` absent → `{}`), and `_json_key_merge3` reports no key conflict, each file's ours side has a faithful renderer (`_json_faithful_renderer(text)`: the `json.dumps` indent — detected, 2, 4 or tab — and `ensure_ascii` setting, plus final newline, that reproduces `text` byte for byte from its parsed value; None otherwise, and the merge is refused), the merged files are written with it, added and committed with the merge's own message. Any refusal leaves the merge exactly as git left it (`git checkout -m` after a failed commit). No integration judge runs on a key merge. |
 | `_integration_dropped_lines(cwd, p1, p2, head, cap=80)` | S3 dropped lines: `{lines: [{file, side, line}], total, excluded_rewritten}` (DESIGN §6). Files both parents changed vs `merge-base(p1, p2)`; added lines stripped, ≥ `_INTEGRATION_LINE_MIN` (8) characters, absent from `head`'s copy; excluded only when the other side's own diff has that exact line as a `-` line. `line` is cut to 200 characters. |
-| `_integration_test_failures(st, sid, staging, p1, p2, merge_sha, caps, *, log_path, parent_cache)` / `_conflicted_area_tests(tree, files, globs)` | The conflicted area's tests (DESIGN §6): test files among the files changed `p1..HEAD` plus one-hop importers (`git grep -E` on the module name), run through `_capture_failing_test_ids` (serial, with the command `_acceptance_cmd` renders over the files present in each tree — never the raw test command; a tree whose files render no scoped command gives no IDs; skipped with a logged reason when there is no test command, no test in scope, no scoped runner, or the task forbids the scoped command) on `p1`, `p2` (fresh `worktrees/integ-<sid>-<side>` trees with deps, IDs cached per round scope) and HEAD. Candidate = failing on HEAD and on no parent that ran it; confirmed by `_confirm_new_failures` against the parent it passed on, or `_confirm_still_failing` when no parent has its file. A confirmed ID is `stale_by_other_side {test_id, home_side, other_side}` when `_confirm_still_failing` also confirms it on the home parent's tree overlaid with the other side's non-test changed files (`_overlay_other_side`), else a `test_failure`. |
+| `_integration_test_failures(st, sid, staging, p1, p2, merge_sha, caps, *, log_path, parent_cache)` / `_conflicted_area_tests(tree, files, globs)` | The conflicted area's tests (DESIGN §6): test files among the files changed `p1..HEAD` plus one-hop importers (`git grep -E` on the module name), run through `_capture_failing_test_ids` (serial, with the command `_acceptance_cmd` renders over the files present in each tree — never the raw test command; a tree whose files render no scoped command gives no IDs; skipped with a logged reason when there is no test command, no test in scope, no scoped runner, or the task forbids the scoped command) on `p1`, `p2` (fresh `worktrees/integ-<sid>-<side>` trees with deps, IDs cached per round scope) and HEAD. Candidate = failing on HEAD and on no parent that ran it; confirmed by `_confirm_new_failures` against the parent it passed on, or `_confirm_still_failing` (every candidate in `needs_rerun`) when no parent has its file. A candidate either confirm leaves `budget_short_unsettled` is listed in `budget_short_unsettled` on the result, never a `test_failure` or `stale`. A confirmed ID is `stale_by_other_side {test_id, home_side, other_side}` when `_confirm_still_failing` also confirms it on the home parent's tree overlaid with the other side's non-test changed files (`_overlay_other_side`), else a `test_failure`. |
 | `_incoming_subtask_view(leerie_dir, sid, result)` / `_wave_sids_integrated_before(staging, run_id, sids, rev)` | The integration gate's inputs on every path, resume included: intent and criteria from `subtasks/<sid>.json` when the settle result lacks them; the wave's sids a prior invocation already merged (`git merge-base --is-ancestor` of each `leerie/subtasks/<run-id>/<sid>` branch), seeding `integrated_so_far`. |
 | `_repair_prescribed_commands(plans, prescribed, reserved_ids=frozenset())` | Mechanical plan repair for the adherence floor (called by the adherence gate, and again after the whole-suite strip when that strip uncovered a prescribed command; `reserved_ids` — the run's `dropped_subtasks` keys there — are never minted) (DESIGN §8 *Repairing an omitted self-report beats re-driving for it*). Synthesises one subtask carrying every prescribed command, `depends_on` = the plan's current sinks, returns its id — or `None` when the floor is clean, there are no commands, or no plan supplies a valid id prefix. Mutates `plans` in place; never raises; declines rather than guessing (mirrors `_repair_missing_requires`). Called before `check_prescribed_command_coverage` so a repairable gap never reaches the ~125-spawn re-plan path. Deliberately doesn't attach to an existing subtask (a verification-shaped matcher hits 32/36 subtasks on the real incident plan). Pinned by `tests/test_prescribed_command_repair.py`. |
 | `check_replan_affordable(st, caps, gate, plans)` | Budget preflight before a re-plan (DESIGN §13) — a re-plan re-runs the whole P1 decomposition and was previously authorised unchecked. Estimates `n_domains × planner_samples + n_subtasks × replan_decompose_estimate` from the **plans the caller passes in** (not `plan_snapshot`, written only after `_schedule()`). `die()`s with `EXIT_BUDGET_INFEASIBLE` when it exceeds what's left. Called at the top of the re-planning `_on_feedback` callback in `phase_adherence_gate`, and in `phase_overlap_judge` before `phase_plan`. Honours `skip_budget_check`. Pinned by `tests/test_replan_budget_preflight.py`. |
@@ -5155,6 +5155,7 @@ caller of the guard.
 | `_measure_axes` (forbidden skip) | A build or lint axis whose command `_forbidden_command_hit` matches is not run: `{ran: false, measured: false, passed: null, command, summary, skip_kind: "forbidden_by_task"}`, logged, never memoised. A matched `tests` axis goes to `_scoped_test_replacement` instead. |
 | `_scoped_test_replacement(tree, st, canonical, hit, forbidden, *, log_prefix)` | Replaces a forbidden test command. Before `conformance._baseline.sha` exists it returns the unmeasured record `skip_kind: "scoped_at_final"`. Otherwise it computes `_changed_files(tree, base)`, then `_coupled_test_files(repo, HEAD, changed, globs)`, keeps the coupled files present in `tree`, and renders them with `_acceptance_cmd`. It returns `{command, scoped_replacement: {replaces, forbidden, files, coupled}}`. `_measure_axes` measures that command like any axis (memoised under its own key) and copies `scoped_replacement` onto the result. When no file is coupled (`forbidden_no_coupled_tests`), there is no scoped runner (`forbidden_no_scoped_runner`), or the scoped command is forbidden too (`forbidden_scoped_runner`), it returns an unmeasured record, logs a WARNING and calls `_set_regression_gap`. A successful replacement clears that gap. |
 | `_set_regression_gap(st, detail)` | Keeps at most one `needs_human_verification` entry `{source: "regression_check", detail}` (`REGRESSION_GAP_SOURCE`): set from `detail`, removed on None. `_pr_needs_human` lists it under "Regression checks the run could not settle". |
+| `_set_confirm_budget_gap(st, site, what)` | Keeps at most one `needs_human_verification` entry per `site` `{source: "confirm_budget", site, detail}` (`CONFIRM_BUDGET_GAP_SOURCE`), `detail` starting `"<site>: could not confirm within the budget: <what>"` (the first 10, then `(+N more)`); removed when `what` is empty. Sites: `"failing-test-ID diff"` (`_confirm_final_test_failures`, the unsettled candidates' files) and `"CI parity"` (`_run_ci_parity_final`, the unsettled check ids). `_pr_needs_human` lists it under "Regression checks the run could not settle". |
 | `_coupled_test_files(repo, rev, changed, globs=None, *, direct=False)` | The coupled tests: test file -> the changed production files its import closure reaches, sorted. Changed test files map to themselves (possibly `[]`). With `direct=True`, only test files that import a changed production file themselves count (no walk through other modules), and a changed test file is not coupled by itself: these are the import-coupled tests of the intermittent-regression rule. The closure is a reverse walk over `importers` of `_js_source_graph` and `_py_source_graph` at `rev`. The walk goes through non-test modules and stops at test files (`_is_test_case_file`). It never raises; an unreadable graph is logged and couples nothing. |
 | `_py_source_graph(repo, rev)` | The Python import graph at `rev` (`files`, `imp`, `importers`), cached in `_SOURCE_GRAPHS` under `(repo, "py:" + rev)`. Sources come from `_git_tree_sources(repo, rev, (".py",))`. `_py_module_index` maps every dotted suffix of a path's package parts to it. `_py_imports` reads `import` / `from … import` with `ast`: `from a import b` names `a.b` when that is a module, else `a`, and relative imports resolve against the importer's package. |
 | `_git_tree_sources(repo, rev, exts=_JS_SRC_EXT)` | `exts` selects the source suffixes read. |
@@ -5258,7 +5259,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | B\* gate wait (`confirm_gate_wait_sec`) | 300 s | the gate polls every 2 s for at most this long; a timeout (or an unreadable PSI file, which is logged and treated as a timeout) escalates the pairs below. |
 | B\* base/final rerun pairs (`confirm_pairs`) | 3 | interleaved base, final, base, final … reruns per confirm (DESIGN §9 *Which failures are new*). |
 | B\* escalated pairs (`confirm_pairs_escalated`) | 5 | pairs used instead when the gate timed out. |
-| B\* confirm wall-time budget (`confirm_budget_sec`) | 1800 s | bounds one confirm's or discovery's reruns, its clock started when `_confirm_gate` returns — the gate wait is bounded by `confirm_gate_wait_sec` instead, so one call takes at most `confirm_gate_wait_sec` + `_CONFIRM_GATE_POLL_SEC` + `confirm_budget_sec` (2102 s at the defaults; DESIGN §9 *Which failures are new*, step 2); each rerun's timeout is the remaining budget. Pairs cut short type every candidate `resource_affected` (`budget_exhausted: true`). |
+| B\* confirm wall-time budget (`confirm_budget_sec`) | 1800 s | bounds one confirm's or discovery's reruns, its clock started when `_confirm_gate` returns — the gate wait is bounded by `confirm_gate_wait_sec` instead, so one call takes at most `confirm_gate_wait_sec` + `_CONFIRM_GATE_POLL_SEC` + `confirm_budget_sec` (2102 s at the defaults; DESIGN §9 *Which failures are new*, step 2), plus at most 1 s once (the `max(1.0, …)` floor under one rerun's timeout) and the uncharged build-slot waits; each rerun's timeout is the remaining budget, and `_capture_failing_test_ids`' as-written retry gets only what its rerun has left. A rerun the budget cuts short is not a run and ends the confirm (`budget_exhausted: true`); a candidate every finished rerun agreed on is then `new` / `confirmed` and listed in `budget_short`, or `budget_short_unsettled` where the caller's observation needs a finished pair or rerun (DESIGN §9 step 4); otherwise the usual typing applies. Not an operator setting (no flag, env var or `leerie.toml` key); 0 or less runs no gate and no rerun: every base-paired candidate is `budget_short_unsettled`. |
 | B\* intermittent discovery repeats (`confirm_intermittent_repeats`) | 20 | serial reruns of the import-coupled tests on the final tree, per final-tree ID diff (`_intermittent_discovery`), inside their own `confirm_budget_sec`; 0 disables discovery. Only the files whose 20 repeats all fit the budget by measured duration run; the rest are recorded skipped (never fewer repeats). At a 10.5% per-run failure rate, 20 repeats find the test with p ≈ 0.89; at p = 0.1, 2 repeats only 19%. |
 | held-out intermittent discovery repeats (`acceptance_intermittent_repeats`) | 10 | serial reruns, per confirmed set evaluation, of each defect file with held cases that did not end failing (`_acceptance_discover`), inside `confirm_budget_sec`, stopping at the first held case failing with no resource signature (DESIGN §8 *A held case that fails again is a failure, not a flake*). Clamped to 10 (`_ACCEPTANCE_INTERMITTENT_MAX`); 0 disables discovery. At the replay's p = 0.546 per run, a set misses the defect with probability 0.454¹¹ < 0.02%. |
 | total worker invocations per run | 2000 (`--max-workers`, also `LEERIE_MAX_WORKERS` env or `max_workers` in `leerie.toml`) | the cheap, runtime backstop in `State.bump_workers()`: raises `WorkerError`, abort, state saved for `resume`. The complementary early check is `check_budget_feasibility()` at the plan/execute boundary (after `_schedule()`, before `_write_plan()`) — it estimates remaining `claude -p` calls from the planner output and `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value before any implementer spawns. See DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*. |
@@ -6100,44 +6101,57 @@ than re-running once.
   gate, then `confirm_pairs` (or `confirm_pairs_escalated` on a gate
   timeout) interleaved pairs, base first, each rerun given the remaining
   `confirm_budget_sec`, whose clock starts when the gate returns (the gate
-  wait is not charged to it). Returns `{candidates, new, pre_existing,
-  no_verdict, resource_affected, pairs_required, pairs_run,
+  wait is not charged to it; with `confirm_budget_sec <= 0` there is no
+  gate — `gate` is `_CONFIRM_NO_BUDGET_GATE`, `skipped: "no budget"` — and
+  no rerun). Signature adds `intermittent: Iterable[str] = ()`. Returns
+  `{candidates, new, pre_existing, no_verdict, resource_affected,
+  budget_short, budget_short_unsettled, pairs_required, pairs_run,
   budget_exhausted, gate, per_id: {id: {final_failed, base_failed,
   final_runs, base_runs}}}` (`*_runs`: that side's reruns that produced a
   verdict). An ID is `new` iff every required pair ran, it is in every
   final rerun's set and in no base rerun's set, and every rerun produced a
-  verdict; `pre_existing` iff `base_runs == base_failed == pairs_required`
-  (it failed every base rerun, each with a verdict); `no_verdict` iff no
-  rerun on either side produced a verdict (`base_runs == final_runs == 0`:
-  a missing base worktree, a budget spent before the first rerun, reports
-  never written); every other candidate is `resource_affected` — mixed
-  evidence only (DESIGN §9 *Which failures are new*, step 3). No
+  verdict (or the `budget_short` case below); `pre_existing` iff
+  `base_runs == base_failed == pairs_required` (it failed every base
+  rerun, each with a verdict); `no_verdict` iff no rerun on either side
+  produced a verdict (`base_runs == final_runs == 0`: a missing base
+  worktree, reports never written) and the ID is not
+  `budget_short_unsettled`; every other candidate is `resource_affected` —
+  mixed evidence only (DESIGN §9 *Which failures are new*, step 3). No
   candidates → no gate, no reruns. A budget cut (DESIGN §9 step 4,
   `_rerun_cut_by_budget`): a rerun that returns None (or raises) once
   `clock() - t0 >= confirm_budget_sec`, or returns a `_RerunCut`, is not
   appended — `budget_exhausted` is set, its pair (and `pairs_run`) is not
   counted, and the loop ends; a base rerun that finished in that pair still
-  refutes `new` for an ID it failed. With `seen_failing=True` (the caller
-  saw every candidate fail on the final tree and not on the base before
-  the confirm — every live caller with runners), an ID the budget alone
-  kept short is also `new` and listed in `budget_short`: `budget_exhausted`,
-  no rerun recorded with None, every final rerun that finished failed it,
-  no base rerun that finished (the cut pair's included) failed it.
+  refutes `new` for an ID it failed (`cut_base`), and a cut final rerun's
+  finished candidates that passed refute it too (`cut_final_passed`). An
+  ID the budget alone kept short — `budget_exhausted`, no rerun recorded
+  with None, every final rerun that finished failed it, no base rerun that
+  finished (the cut pair's included) failed it, not in `cut_base` or
+  `cut_final_passed` — is `new` and listed in `budget_short` when
+  `seen_failing=True`, `final_runs >= 1` (at least one finished pair: the
+  only base evidence a scoped or unknown-baseline diff has) and it is not
+  in `intermittent` (a discovery find); else `budget_short_unsettled`.
+  Every live caller with runners passes `seen_failing=True`; the final
+  diff and the re-drive pass their discovery-only IDs as `intermittent`.
 - `async _confirm_still_failing(candidates, run_final, caps, *, label,
   seen_failing=False, …) -> dict` — the same gate and budget with no base
-  side: `{candidates, confirmed, budget_short, no_verdict,
-  resource_affected, reruns_required, reruns_run, budget_exhausted,
-  gate}`. `confirmed` iff every required rerun ran, produced a verdict and
-  failed it — or, with `seen_failing=True` (the caller saw every candidate
-  fail on this tree first), `budget_exhausted` with no rerun recorded as
-  None, every finished rerun failing it, and no finished file of the cut
-  rerun (`_RerunCut.measured − _RerunCut.failing`) passing it; those are
-  also listed in `budget_short`. `no_verdict` iff no rerun produced a
-  verdict (and the candidate was not confirmed); every other candidate
+  side, adding `needs_rerun: Iterable[str] = ()`: `{candidates, confirmed,
+  budget_short, budget_short_unsettled, no_verdict, resource_affected,
+  reruns_required, reruns_run, budget_exhausted, gate}`. `confirmed` iff
+  every required rerun ran, produced a verdict and failed it — or, with
+  `seen_failing=True` (the caller saw every candidate fail on this tree
+  first), `budget_exhausted` with no rerun recorded as None, every finished
+  rerun failing it, and no finished file of the cut rerun
+  (`_RerunCut.measured − _RerunCut.failing`) passing it; those are also
+  listed in `budget_short` — except a candidate in `needs_rerun` with no
+  finished rerun, which is `budget_short_unsettled`. `no_verdict` iff no
+  rerun produced a verdict, no finished file of a cut rerun passed it, and
+  the candidate is neither confirmed nor unsettled; every other candidate
   `resource_affected`. Callers passing `seen_failing=True`: the held-out
   vote (`_acceptance_run_placed`), the falsifier probe
   (`_falsifier_gates`), the integration gate's head confirm with no home
-  parent. The integration overlay confirm passes False: its `confirmed`
+  parent (with every candidate in `needs_rerun`). The integration overlay
+  confirm passes False: its `confirmed`
   exonerates (`stale_by_other_side`).
 - `_RerunCut(failing: frozenset[str], measured: frozenset[str])` — what a
   B\* runner returns for a rerun the budget cut short partway: the
@@ -6162,8 +6176,9 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   `_acceptance_report_spec`, appending `_SERIAL_RUNNER_FLAGS[runner]`
   (`--runInBand`, `--no-file-parallelism --maxWorkers=1`, `-p no:xdist`)
   through `_append_runner_flags` when `serial`, retrying once without them
-  when the serial form produced no report. Returns `{ids, files, kind}` or
-  None. A separate run: the axis verdict `_measure_blt` records is never
+  when the serial form produced no report — inside what is left of
+  `timeout` after the serial run (`max(1.0, …)` floor; under 1 s left, no
+  retry and None). Returns `{ids, files, kind}` or None. A separate run: the axis verdict `_measure_blt` records is never
   measured with altered flags. The runner is found through
   `_runner_command(cmd, tree, known, files) -> (cmd, env overlay | None)`:
   `cmd` as written when `_acceptance_runner` finds a runner in it; else,
@@ -6207,7 +6222,18 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   files when every candidate has one (else the canonical `tests` command)
   in a disposable detached worktree `worktrees/<run-id[:12]>-confirm-base` at the
   baseline sha (else the `working_branch` merge-base) with deps installed,
-  against staging for the final side. Persists the verdict to
+  against staging for the final side. When every candidate has a file, the
+  files are first sized by `_confirm_select(units, durations, *, rank,
+  reps, budget, overhead) -> {chosen, sized_out}` over
+  `test_file_durations` (rank 0 for a file holding a final-run candidate,
+  1 for one holding only discovery finds; `reps = 2 × confirm_pairs`,
+  `overhead = _DISCOVERY_RUN_OVERHEAD_SEC`); the reruns run the chosen
+  files, and a sized-out file's candidates join `budget_short_unsettled`
+  (the verdict also gains `sized_out`, and `candidates` keeps every
+  candidate). Discovery-only IDs go to the confirm as `intermittent`. The
+  verdict gains `budget_short_unsettled_files` (each unsettled ID's file,
+  else the ID), and `_set_confirm_budget_gap(st, "failing-test-ID diff",
+  those files)` records or clears its gap. Persists the verdict to
   `state.data["test_id_diff"]`. In the round loop, a non-empty `new` adds
   a `tests:` regression (continuing the loop), and an empty `new` drops
   the round's `tests:` axis regression and treats `tests` as baseline-red
@@ -6968,7 +6994,12 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   staging HEAD. A gate (`_ci_gate_argv`) that fails is confirmed by
   `_ci_confirm_red` — `_confirm_new_failures` with base reruns in a fresh
   `ci-confirm-base` worktree and final reruns in `ci-final`, with
-  `seen_failing=True`. One rerun runs every red check serially; each check's
+  `seen_failing=True`. The red checks are first sized by
+  `_confirm_select` over their final-run `duration_sec` (recorded on
+  `final.results[id]`; `reps = 2 × confirm_pairs`, no overhead, shortest
+  first); a sized-out check is `budget_short_unsettled` (and `sized_out`),
+  and `_ci_confirm_chosen` confirms the rest in that order. One rerun runs
+  every chosen check serially; each check's
   `_ci_run` gets `_budget_caps(caps, rem)`, `rem` being what is left of the
   `left` the rerun was handed. With `rem <= 0` before a check, or a check
   `timed_out` once that `left` is spent, the rerun returns
@@ -6977,7 +7008,8 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   verdict). Only `new` ids
   become `unmet` (`why: red`); `final.pre_existing` and `final.no_verdict`
   record the B\* split of the rest, `final.resource_affected` the mixed
-  ones. A diagnostic
+  ones, `final.budget_short_unsettled` the ones the budget left unsettled
+  (`_set_confirm_budget_gap(st, "CI parity", …)`). A diagnostic
   ratchet is `unmet` (`why: new_diagnostics`) when a key's final count
   exceeds the base's in a file the run changed (`git diff --name-only
   <base_sha>..<final_sha>`, relative to the check's cwd). A coverage ratchet
@@ -7108,9 +7140,13 @@ nor void.
   join `after`'s IDs; `_redrive_new_failures` confirms the candidates under
   B\* against a worktree at `pre_sha` (it now also returns the whole B\*
   `verdict`); `_type_intermittent_regressions` types the evidence rows.
-  Returns `{new, pre_existing, no_verdict, resource_affected, unmeasured,
-  files, intermittent_regression[], discovery}` (the first four as B\*
-  split them). The re-drive calls it in place of `_redrive_new_failures`.
+  Returns `{new, pre_existing, no_verdict, resource_affected,
+  budget_short_unsettled, unmeasured, files, intermittent_regression[],
+  discovery}` (the first five as B\* split them). `_redrive_new_failures(
+  …, *, intermittent=())` gets discovery's IDs that `after` did not fail as
+  `intermittent`, and sizes the candidate files as
+  `_confirm_final_test_failures` does (a sized-out file's IDs are
+  `budget_short_unsettled`). The re-drive calls it in place of `_redrive_new_failures`.
   `_ratchet_test_ids(st, caps, tree, *, label, log_path)` is the test axis
   with IDs: `_capture_failing_test_ids` of the BLT `tests` command, or of
   its `_scoped_test_replacement` when the task forbids it; None with no
@@ -7118,8 +7154,8 @@ nor void.
 - **Result.** `{pre_sha, post_sha, prior_met[], untouched[], execution[],
   exec_flagged[], exec_unchecked[], judge, regressed[], new_failures[],
   intermittent_regression[]}`. `exec_unchecked` lists the `execution`
-  items when `exec_result` was `unmeasured` (no ID diff on either side) —
-  not a rollback, but logged, so an unmeasured execution route never reads
+  items when `exec_result` was `unmeasured` (no ID diff on either side) or
+  carries `budget_short_unsettled` candidates — not a rollback, but logged, so an unmeasured execution route never reads
   as the items holding (DESIGN §8 *A held case that fails again*). `regressed` or `new_failures` non-empty is
   a rollback (`_ratchet_rollback_reason`). `_ratchet_kept(st, rat)` stores
   the judge's `met_evidence` under `delivery_ratchet.evidence[i] = {sha,
@@ -7377,7 +7413,9 @@ does not match `_RESOURCE_FAILURE_RE`. With `confirm`,
 failing without a vote; the rest go to `_confirm_still_failing`, whose
 reruns now pass `cases_out` too and run every file under one deadline of
 the remaining budget they are given (`_budget_caps`; a file that budget
-cut short makes the rerun no verdict, never a failure), and a rerun with an `asserted` case
+cut short ends the rerun as a `_RerunCut` — not a run, never a pass; a
+file every finished rerun failed is confirmed and listed in
+`budget_short_files`), and a rerun with an `asserted` case
 settles its file failing whatever the vote says. Then discovery
 (`_acceptance_discover`): for each defect file with held cases that did
 not end failing, up to `acceptance_intermittent_repeats` (clamped to
@@ -9674,7 +9712,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
 | `test_file_durations` | dict[str, float] \| absent | repo-relative test file → seconds, the newest measurement from any structured report leerie read (`_record_test_durations`); sizes intermittent discovery to its budget (DESIGN §9 *Sized to the budget*). |
-| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed), and `base_unavailable: true` when the base worktree for the confirm could not be created (every candidate `no_verdict`); `new` non-empty makes the outcome `unconverged`. |
+| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed), and `base_unavailable: true` when the base worktree for the confirm could not be created (every candidate `no_verdict`), `sized_out` / `budget_short_unsettled_files` when the confirm budget left candidates unsettled (DESIGN §9 step 4; never counted, they read as the test outcome's `unknown`); `new` non-empty makes the outcome `unconverged`, and the reason says how many of them are `budget_short`. |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
 | `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |
@@ -9771,7 +9809,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `leerie_versions` | list[dict] | append-only resume history (N38), distinct from the immutable `leerie_version`/`leerie_commit` pair above. |
 | `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. |
 | `requirement_coverage` | dict | the requirement-coverage gate's record, written by `phase_classify` (DESIGN §8 *Requirement coverage*): `{spans[{id, parent}], sections[{id, source}], reports[], closure[], holes{}}`. `spans`/`sections` are the IDs `_d1_split_spans`/`_d1_split_sections` assigned (no text); `parent` is the mechanical nesting link `_d1_judge_packs` groups by; `reports` the inlined report paths; `closure` the S/R ids `_d1_closure` derives; `holes` the residual `_d1_coverage_holes` findings after the check rounds (`{}` when none). |
-| `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`), and `source` `"blocker"` — `{source, subtask, resource, blocker}`, plus `via` (the accepted-external predecessors) for a dependent settled without running — for a subtask settled `accepted_external` on an implementer's `external_precondition` or as such a dependent (`_settle_accepted_external`; `phase_classify` rewrites only the `required_item` entries). A third source, `"regression_check"` (`{source, detail}`, at most one), comes from `_set_regression_gap`: the task forbids the test command, and its scoped replacement could not run on the latest measured tree. A fourth, `"test_outcome"` (`{source, detail}`, at most one), from `_set_test_outcome_gap`: required items decided by the failing-test-ID diff whose verdict was `unknown` at final delivery detection. |
+| `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`), and `source` `"blocker"` — `{source, subtask, resource, blocker}`, plus `via` (the accepted-external predecessors) for a dependent settled without running — for a subtask settled `accepted_external` on an implementer's `external_precondition` or as such a dependent (`_settle_accepted_external`; `phase_classify` rewrites only the `required_item` entries). A third source, `"regression_check"` (`{source, detail}`, at most one), comes from `_set_regression_gap`: the task forbids the test command, and its scoped replacement could not run on the latest measured tree. A fourth, `"test_outcome"` (`{source, detail}`, at most one), from `_set_test_outcome_gap`: required items decided by the failing-test-ID diff whose verdict was `unknown` at final delivery detection. A fifth, `"confirm_budget"` (`{source, site, detail}`, at most one per site), from `_set_confirm_budget_gap`: final-tree B\* candidates left `budget_short_unsettled`. |
 | `site_claims` | dict \| null | the site-claims record (DESIGN §5 *Every `fix` site is claimed*), written by `phase_plan` from the first-pass `bug-fixing` plan and rewritten over its leaves after decomposition: `{domain, sites[{site_id, file, symbol, auditor_kind, resolution, claims[{sid, kinds[]}], not_needed, status, surface_other}]}`, `status` one of `claimed`/`mismatch`/`not_needed`/`unclaimed` (`_site_claim_rows`); `surface_other` marks a site resting on an `other` kind, for the PR. Not written when there is no `bug-fixing` plan or the audit is inapplicable. Never gates. |
 | `domain_blocked` | list[dict] | every planner domain that exited `blocked`, `[{domain, blocker_kind, external_resource, gap}]` (`_settle_blocked_domains`; DESIGN §8 *A partially blocked plan is recorded*). Written after planning and again before scheduling; `[]` when none. A row typed `external_precondition` stops the run before execution. |
 | `process_constraints` | dict | the classifier's typed process constraints (DESIGN §9 *A command the task forbids*): `{forbidden_commands[], entries[{command, scope, evidence_quote, test_roots?, package_name?, derived_from?, votes}], dropped[{command, reason, evidence_quote}], draws{draws, crashed}}` from `_process_constraints` over the union of the classifier's and the `forbidden_command_extractor` samples' entries. A state written before scopes existed carries `{forbidden_commands[], evidence}`; `_forbidden_specs` reads that as `scope: "any"`. Read by `claude_p` (deny rules, notice, hook), `_measure_axes`, the plan strip and the planner ctx. |
