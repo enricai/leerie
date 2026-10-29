@@ -9292,8 +9292,10 @@ Three layers follow, each derived from that one list:
   also unwraps `python[3[.x]] [opts] -m <module>` to the module, the
   Python run-wrappers `uv run` (and `uv run -m`, `uv tool run`, `uvx`),
   `poetry run`, `pipenv run`, `hatch run [ENV:]`, `pdm run`, `rye run`,
-  Ruby's `bundle exec`, `node <…>/node_modules/<pkg>/…` to the package's
-  binary, and `pnpm`/`yarn`/`bun <bin>` (a script of that name, else the
+  Ruby's `bundle exec`, `xvfb-run` (its getopt options, clustered
+  `-as ARGS` included), `node <…>/node_modules/<pkg>/…` to the package's
+  binary, a runner proxy's `<pkg>@<version>` (`npx -y vitest@3`, `pnpm
+  dlx`, `yarn dlx`, `bunx`, `npm exec`, `corepack`) to the package, and `pnpm`/`yarn`/`bun <bin>` (a script of that name, else the
   binary: both readings are checked); npm and yarn drop one `--` before
   the binary's arguments, pnpm and npx do not. And every runner gets a
   table of what is not a test-file operand, taken from its real CLI
@@ -9303,8 +9305,9 @@ Three layers follow, each derived from that one list:
   the options whose next word is their value; the subcommands that run the
   suite (`vitest run`/`watch`/`dev` — `vitest related <files>` stays a
   scoped run); the options that themselves select files or targets (jest
-  `--testPathPatterns`/`--onlyChanged`, cargo `--test`/`-p`, rspec
-  `--pattern`); the operands that name the whole suite (`go test ./...`);
+  `--testPathPatterns`/`--onlyChanged`, cargo `--test`/`-p`); the options
+  whose value is a test-path operand (mocha `--spec`, rspec `--pattern`);
+  the operands that name the whole suite (`go test ./...`);
   and two parser quirks the real runners showed — vitest and jest read a
   `true`/`false` after a flag as its value (`jest --ci false` is a
   whole-suite run; mocha does not), and vitest takes nothing after `--` as
@@ -9312,8 +9315,41 @@ Three layers follow, each derived from that one list:
   option, not selection: the runner still loads every test file, which is
   what a whole-suite forbid is about. What it still cannot see: a run that
   lists every package or file by name (`go test ./a ./b`), and a selecting
-  option that happens to select everything (`cargo test -p` in a
-  one-package workspace, `rspec --only-failures` with no failure record).
+  option that happens to select everything (below).
+
+  *A selector reads as scoped unless it selects everything.* A project,
+  package or target selector runs a named subset of the suite. Measured
+  with the real runners on a two-project vitest and jest workspace and a
+  two-crate cargo workspace: `vitest run --project unit`, `jest
+  --selectProjects unit` and `cargo test -p p1` each ran one of the two
+  (round-4 review L3). Like a test directory under the root (`pytest
+  tests/unit`), they stay allowed. A selector selects the whole suite
+  only when its value is the runner's match-everything spelling, or when
+  it names every project, which only the runner's config can tell. The
+  matcher decides per runner from what the CLI does:
+  - vitest `--project` and cargo `-p`/`--package` take globs, so `*` (and
+    vitest's `**`) is a whole-suite run (`select_all`). Measured: both
+    ran everything.
+  - jest `--selectProjects` takes literal names (`'*'` ran nothing), so
+    it stays a selector. `--ignoreProjects` also runs a subset, and was
+    refused as a flags-only run (a false refusal), so it is a selector
+    now. `--runTestsByPath` is a flag that changes how paths are read.
+    Bare, it ran the whole suite, so it is no longer a selector.
+  - mocha `--spec` and rspec `--pattern`/`-P` name test files, so their
+    value is read as an operand (`operand_opts`). `mocha --spec test` is
+    the root, and a recursive glob from a root whose last component is a
+    wildcard (`test/**/*.spec.js`, rspec's default
+    `spec/**{,/*/**}/*_spec.rb`, `**/*_spec.rb`) selects every test file.
+    A quoted glob in any operand position is read the same way.
+  - cargo `--lib`/`--doc`/`--test`/`--bin`/`--example`/`--bench` select
+    target kinds or one target, so they stay selectors.
+  What it cannot see: a selector list naming every project (`--project
+  unit --project e2e`, `--selectProjects unit e2e`, `-p p1 -p p2`), a
+  partial glob that happens to match all (`-p 'p*'`), `cargo test -p` or
+  `--lib` in a workspace that has nothing else, and `rspec
+  --only-failures` with no failure record. Each needs the runner's
+  config or state, which the matcher, running in the hook with no
+  repository, does not read.
 
   *A whole-suite forbid matches on the runner alone.* The extractor is told
   to return the repo's test command for a whole-suite forbid, and on every

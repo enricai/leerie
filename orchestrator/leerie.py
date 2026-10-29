@@ -22401,7 +22401,7 @@ _FORBID_MAX_DEPTH = 5
 _FORBID_WRAPPERS = frozenset({
     "timeout", "nice", "nohup", "stdbuf", "time", "command", "builtin",
     "exec", "sudo", "xargs", "ionice", "setsid", "chronic", "unbuffer",
-    "noglob", "env", "then", "do", "else", "!"})
+    "noglob", "env", "then", "do", "else", "!", "xvfb-run"})
 # Wrapper options that consume the next word. Fixed CLI surface of each tool.
 _FORBID_WRAPPER_VALUE_OPTS: dict[str, frozenset[str]] = {
     "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
@@ -22410,7 +22410,14 @@ _FORBID_WRAPPER_VALUE_OPTS: dict[str, frozenset[str]] = {
     "sudo": frozenset({"-u", "-g", "-C", "-D"}),
     "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
     "xargs": frozenset({"-I", "-i", "-n", "-P", "-L", "-d", "-E", "-s", "-a"}),
+    # getopt `+ae:f:hn:lp:s:w:` (Debian's /usr/bin/xvfb-run)
+    "xvfb-run": frozenset({
+        "-e", "--error-file", "-f", "--auth-file", "-n", "--server-num",
+        "-p", "--xauth-protocol", "-s", "--server-args", "-w", "--wait"}),
 }
+# Short letters taking a value, for wrappers parsed by getopt, whose letters
+# cluster (`xvfb-run -as ARGS`: `-a`, then `-s` taking the next word).
+_FORBID_WRAPPER_VALUE_LETTERS: dict[str, str] = {"xvfb-run": "efnpsw"}
 _FORBID_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
 _FORBID_PROXIES = frozenset({"npx", "pnpx", "bunx", "corepack"})
 _FORBID_PMS = frozenset({"npm", "pnpm", "yarn", "bun"})
@@ -22517,8 +22524,15 @@ def _forbidden_normalize(argv: list[str], depth: int,
                 if head == "env" and opt in ("-S", "--split-string") \
                         and len(a) > 1:
                     return _forbidden_argvs(a[1], depth + 1, keep_xargs)
+                letters = _FORBID_WRAPPER_VALUE_LETTERS.get(head, "")
                 if opt in vals:
                     a = a[2:]
+                elif letters and re.fullmatch(r"-[A-Za-z]+", opt):
+                    # The first value letter takes the rest of the word, or
+                    # the next word when it is last.
+                    k = next((n for n, ch in enumerate(opt[1:], 1)
+                              if ch in letters), 0)
+                    a = a[2:] if k == len(opt) - 1 else a[1:]
                 elif opt.startswith("-") or _FORBID_ASSIGN.match(opt) or (
                         head == "timeout" and opt[:1].isdigit()):
                     a = a[1:]
@@ -22531,6 +22545,8 @@ def _forbidden_normalize(argv: list[str], depth: int,
                 if a[0] in ("-c", "--call") and len(a) > 1:
                     return _forbidden_argvs(a[1], depth + 1, keep_xargs)
                 a = a[2:] if a[0] in ("-p", "--package") else a[1:]
+            if a:
+                a = [_forbidden_package_word(a[0])] + a[1:]
             continue
         if head in _FORBID_SHELLS:
             for i, w in enumerate(a[1:], 1):
@@ -22608,6 +22624,8 @@ def _forbidden_normalize(argv: list[str], depth: int,
                         return _forbidden_argvs(r[1], depth + 1, keep_xargs)
                     ended = ended or r[0] == "--"
                     r = r[1:]
+                if r:
+                    r = [_forbidden_package_word(r[0])] + r[1:]
                 return _forbidden_normalize(
                     r if ended else _forbidden_pm_passthrough(a[0], r),
                     depth + 1, keep_xargs)
@@ -22632,6 +22650,15 @@ def _forbidden_normalize(argv: list[str], depth: int,
                 return [a] + _forbidden_normalize(_forbidden_pm_passthrough(
                     a[0], a[1:]), depth + 1, keep_xargs)
     return [a]
+
+
+def _forbidden_package_word(word: str) -> str:
+    """The package a runner proxy (`npx`, `bunx`, `pnpm dlx`, `yarn dlx`,
+    `npm exec`, `corepack`) is handed, without its version: `vitest@3`
+    → `vitest`, `@scope/pkg@^1` → `@scope/pkg` (npm package-spec syntax, a
+    mechanical string). The proxy runs that package's binary."""
+    at = word.find("@", 1)
+    return word[:at] if at > 0 else word
 
 
 def _forbidden_pnpm_binary(words: list[str]) -> list[str] | None:
@@ -22960,7 +22987,10 @@ _FORBID_NODE_MODULES_BIN = re.compile(
 # (`vitest run`/`watch`/`dev`; `related <files>` is a scoped run and stays
 # an operand); `value` the options whose next word is their value;
 # `select` the options that themselves narrow the run to some files or
-# targets (a scoped run whatever else is said); `suite` the operands that
+# targets (a scoped run whatever else is said, unless its value is one of
+# `select_all`, the runner's match-everything glob); `operand_opts` the
+# options whose value is a test-path operand (`mocha --spec`, `rspec
+# --pattern`); `suite` the operands that
 # name the whole suite (`go test ./...`); `after_dashdash` the value
 # options of the test binary behind `--` (cargo's libtest); `bool_words`
 # the words a flag takes as its value (`jest --ci false`, vitest's
@@ -22978,6 +23008,7 @@ _FORBID_RUNNERS: dict[tuple[str, ...], dict[str, frozenset[str]]] = {
         "subs": frozenset({"run", "watch", "dev"}),
         "value": _VITEST_VALUE_OPTS,
         "select": frozenset({"--changed", "--project"}),
+        "select_all": frozenset({"*", "**"}),
         "bool_words": frozenset({"true", "false"}),
         "dashdash": frozenset({"ends_operands"})},
     ("jest",): {
@@ -22987,9 +23018,9 @@ _FORBID_RUNNERS: dict[tuple[str, ...], dict[str, frozenset[str]]] = {
             "--testPathPatterns", "--testMatch", "--testRegex",
             "--onlyChanged", "-o", "--changedSince", "--lastCommit",
             "--changedFilesWithAncestor", "--onlyFailures", "-f",
-            "--findRelatedTests", "--selectProjects", "--runTestsByPath"})},
+            "--findRelatedTests", "--selectProjects", "--ignoreProjects"})},
     ("mocha",): {"value": _MOCHA_VALUE_OPTS,
-                 "select": frozenset({"--spec"}),
+                 "operand_opts": frozenset({"--spec"}),
                  "dot_scoped": frozenset({"no_recursion"})},
     ("go", "test"): {"value": _GO_TEST_VALUE_OPTS,
                      "suite": frozenset({"./...", "...", "all"}),
@@ -22998,12 +23029,13 @@ _FORBID_RUNNERS: dict[tuple[str, ...], dict[str, frozenset[str]]] = {
         "value": _CARGO_TEST_VALUE_OPTS,
         "select": frozenset({"--test", "--bin", "--example", "--bench",
                              "--lib", "--doc", "-p", "--package"}),
+        "select_all": frozenset({"*"}),
         "after_dashdash": _LIBTEST_VALUE_OPTS,
         "dot_scoped": frozenset({"name_filter"})},
     ("rspec",): {
         "value": _RSPEC_VALUE_OPTS,
-        "select": frozenset({"-P", "--pattern", "--only-failures", "-n",
-                             "--next-failure"})},
+        "operand_opts": frozenset({"-P", "--pattern"}),
+        "select": frozenset({"--only-failures", "-n", "--next-failure"})},
     ("rails", "test"): {"value": _RAILS_TEST_VALUE_OPTS},
 }
 
@@ -23149,33 +23181,61 @@ def _forbidden_runner_operands(rest: list[str],
                                ) -> list[str] | None:
     """The operands among the words after a matched runner, normalised by
     `_forbidden_operand`, or None when one of the runner's selecting
-    options (`spec["select"]`) makes it a scoped run. The word after one of
-    the runner's value options is that option's value, never an operand;
-    after `--` the test binary's value options apply (`after_dashdash`), or
-    nothing more is an operand (`dashdash`)."""
+    options (`spec["select"]`) makes it a scoped run — unless that option's
+    value is one of the runner's match-everything values (`select_all`:
+    `vitest --project '*'`, `cargo test -p '*'`). The word after one of
+    the runner's value options is that option's value, never an operand,
+    except for an `operand_opts` option, whose value is an operand (`mocha
+    --spec test`, `rspec --pattern <glob>`); after `--` the test binary's
+    value options apply (`after_dashdash`), or nothing more is an operand
+    (`dashdash`)."""
     value_opts = value_opts | spec.get("value", frozenset())
     select = spec.get("select", frozenset())
+    select_all = spec.get("select_all", frozenset())
+    operand_opts = spec.get("operand_opts", frozenset())
     bools = spec.get("bool_words", frozenset())
     pos: list[str] = []
-    skip = after_flag = False
-    for w in rest:
-        if skip:
-            skip = False
-        elif w == "--":
+    after_flag = False
+    i = 0
+    while i < len(rest):
+        w = rest[i]
+        i += 1
+        if w == "--":
             if "dashdash" in spec:
                 break
             if "after_dashdash" in spec:
                 value_opts = spec["after_dashdash"]
         elif w.startswith("-"):
-            if w.split("=", 1)[0] in select:
+            name, eq, val = w.partition("=")
+            sep = not eq and name in value_opts
+            if sep:
+                val = rest[i] if i < len(rest) else ""
+                i += 1
+            if name in operand_opts:
+                pos.append(_forbidden_operand(val))
+            elif name in select and val not in select_all:
                 return None
-            skip = w in value_opts
-            after_flag = not skip and "=" not in w
+            after_flag = not sep and not eq
             continue
         elif not (after_flag and w in bools):
             pos.append(_forbidden_operand(w))
         after_flag = False
     return pos
+
+
+def _forbidden_glob_whole(w: str, norm: set[str]) -> bool:
+    """True when the glob operand `w` (a runner reads quoted globs itself:
+    `mocha --spec 'test/**/*.spec.js'`, `rspec -P '**/*_spec.rb'`) selects
+    every test file under a whole-suite operand: its literal directory part
+    is empty or in `norm`, what follows starts with `**`, and its last path
+    component is itself a wildcard (`*.spec.js`, not `a.spec.js`). A
+    mechanical string."""
+    k = next((n for n, ch in enumerate(w) if ch in "*?[{"), -1)
+    if k < 0 or (k and w[k - 1] != "/"):
+        return False
+    if k and _forbidden_operand(w[:k]) not in norm:
+        return False
+    return w[k:].startswith("**") and w.rsplit("/", 1)[-1].startswith("*")
 
 
 def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
@@ -23202,7 +23262,8 @@ def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
     norm |= {_forbidden_operand(w) for w in spec.get("suite", frozenset())}
     if "dot_scoped" not in spec:
         norm.add(".")
-    return not pos or any(w in norm for w in pos)
+    return not pos or any(w in norm or _forbidden_glob_whole(w, norm)
+                          for w in pos)
 
 
 def _forbidden_command_hit(command: str,

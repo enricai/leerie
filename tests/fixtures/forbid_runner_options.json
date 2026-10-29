@@ -2579,5 +2579,423 @@
     "refuse"
    ]
   ]
+ },
+ "selectors and proxies": {
+  "_how": "Round-4 review L2/L3. Run through real bash with the real runners (vitest 5.0.5, jest 30.5.2, mocha 12.0.3, rspec 3.13, cargo 1.99, pytest), the real npx/npm 11 and Debian's xvfb-run, in projects whose test files append a marker when loaded: vitestproj/jestproj have projects unit (a, b) and e2e (c); cargows is a two-crate workspace (p1: a, p2: b); cargo's single crate has lib unit tests (l) and integration tests (a, b). `whole` is true when every file loaded. `forbid` is the whole_suite entry; test roots: tests (vitest*, jest*, cargo), test (mocha), spec (rspec), none (cargows).",
+  "rows": [
+   {
+    "project": "cargo",
+    "forbid": "cargo test",
+    "cmd": "cargo test --tests",
+    "ran": "abl",
+    "whole": true
+   },
+   {
+    "project": "cargo",
+    "forbid": "cargo test",
+    "cmd": "cargo test --lib",
+    "ran": "l",
+    "whole": false
+   },
+   {
+    "project": "cargo",
+    "forbid": "cargo test",
+    "cmd": "cargo test -p ct",
+    "ran": "abl",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "npx vitest@5 run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "npx -y vitest@5.0.5 run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "npx --yes vitest@^5 run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "npx --yes vitest@^5 run tests/a.test.mjs",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "npm exec vitest@5 -- run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "npm exec --yes vitest@5 -- run tests/b.test.mjs",
+    "ran": "b",
+    "whole": false
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "npx --package=vitest@5 vitest run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run -a vitest run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run -a -s '-screen 0 1x1x8' vitest run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run -as '-screen 0 1x1x8' vitest run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run -a -s'-screen 0 1x1x8' vitest run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run --auto-servernum --server-args='-screen 0 1x1x8' vitest run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run --auto-servernum --server-args '-screen 0 1x1x8' vitest run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run -a -- vitest run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run -a npx vitest@5 run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run --server-args='-screen 0 1x1x8' vitest run tests/a.test.mjs",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "xvfb-run -a -s '-screen 0 1x1x8' npx vitest run tests/b.test.mjs",
+    "ran": "b",
+    "whole": false
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest",
+    "cmd": "xvfb-run -a pytest -q",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest",
+    "cmd": "xvfb-run -a python3 -m pytest tests/test_a.py",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "vitestproj",
+    "forbid": "vitest run",
+    "cmd": "vitest run",
+    "ran": "abc",
+    "whole": true
+   },
+   {
+    "project": "vitestproj",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project unit",
+    "ran": "ab",
+    "whole": false
+   },
+   {
+    "project": "vitestproj",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project=unit",
+    "ran": "ab",
+    "whole": false
+   },
+   {
+    "project": "vitestproj",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project unit --project e2e",
+    "ran": "abc",
+    "whole": true
+   },
+   {
+    "project": "vitestproj",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project '*'",
+    "ran": "abc",
+    "whole": true
+   },
+   {
+    "project": "vitestproj",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project='*'",
+    "ran": "abc",
+    "whole": true
+   },
+   {
+    "project": "vitestproj",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project 'u*'",
+    "ran": "ab",
+    "whole": false
+   },
+   {
+    "project": "vitestproj",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project '!e2e'",
+    "ran": "ab",
+    "whole": false
+   },
+   {
+    "project": "vitestproj",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project unit tests/unit/a.test.mjs",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project v",
+    "ran": "",
+    "whole": false
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "vitest run --project '*'",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "jestproj",
+    "forbid": "jest",
+    "cmd": "jest",
+    "ran": "abc",
+    "whole": true
+   },
+   {
+    "project": "jestproj",
+    "forbid": "jest",
+    "cmd": "jest --selectProjects unit",
+    "ran": "ab",
+    "whole": false
+   },
+   {
+    "project": "jestproj",
+    "forbid": "jest",
+    "cmd": "jest --selectProjects unit e2e",
+    "ran": "abc",
+    "whole": true
+   },
+   {
+    "project": "jestproj",
+    "forbid": "jest",
+    "cmd": "jest --selectProjects '*'",
+    "ran": "",
+    "whole": false
+   },
+   {
+    "project": "jestproj",
+    "forbid": "jest",
+    "cmd": "jest --ignoreProjects e2e",
+    "ran": "ab",
+    "whole": false
+   },
+   {
+    "project": "jestproj",
+    "forbid": "jest",
+    "cmd": "jest --runTestsByPath",
+    "ran": "abc",
+    "whole": true
+   },
+   {
+    "project": "jestproj",
+    "forbid": "jest",
+    "cmd": "jest --runTestsByPath tests/unit/a.test.js",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "jest",
+    "forbid": "jest",
+    "cmd": "jest --runTestsByPath",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "jest",
+    "forbid": "jest",
+    "cmd": "jest --selectProjects j",
+    "ran": "",
+    "whole": false
+   },
+   {
+    "project": "cargo",
+    "forbid": "cargo test",
+    "cmd": "cargo test -p '*'",
+    "ran": "abl",
+    "whole": true
+   },
+   {
+    "project": "cargo",
+    "forbid": "cargo test",
+    "cmd": "cargo test --doc",
+    "ran": "",
+    "whole": false
+   },
+   {
+    "project": "cargo",
+    "forbid": "cargo test",
+    "cmd": "cargo test --all-targets",
+    "ran": "abl",
+    "whole": true
+   },
+   {
+    "project": "cargows",
+    "forbid": "cargo test",
+    "cmd": "cargo test",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "cargows",
+    "forbid": "cargo test",
+    "cmd": "cargo test --workspace",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "cargows",
+    "forbid": "cargo test",
+    "cmd": "cargo test -p p1",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "cargows",
+    "forbid": "cargo test",
+    "cmd": "cargo test -p '*'",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "cargows",
+    "forbid": "cargo test",
+    "cmd": "cargo test -p 'p*'",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "cargows",
+    "forbid": "cargo test",
+    "cmd": "cargo test -p p1 -p p2",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "cargows",
+    "forbid": "cargo test",
+    "cmd": "cargo test --lib",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "rspec",
+    "forbid": "rspec",
+    "cmd": "rspec -P 'spec/**{,/*/**}/*_spec.rb'",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "rspec",
+    "forbid": "rspec",
+    "cmd": "rspec --pattern '**/*_spec.rb'",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "rspec",
+    "forbid": "rspec",
+    "cmd": "rspec -P 'spec/**/*_spec.rb'",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "rspec",
+    "forbid": "rspec",
+    "cmd": "rspec -P 'spec/a_*'",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "mocha",
+    "forbid": "mocha",
+    "cmd": "mocha --spec test",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "mocha",
+    "forbid": "mocha",
+    "cmd": "mocha --spec 'test/**/*.spec.js'",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "mocha",
+    "forbid": "mocha",
+    "cmd": "mocha --spec test/a.spec.js",
+    "ran": "a",
+    "whole": false
+   }
+  ]
  }
 }
