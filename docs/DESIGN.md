@@ -7261,15 +7261,46 @@ drove what that dropped: an `mv util.py helpers.py` through Bash shipped
 the deletion and the edited import without `helpers.py`, so HEAD could
 not import what staging could, and a module made with a heredoc stayed
 behind. A shell command makes a source file as often as a tool call
-does, so the tool calls cannot be the only source. The `.pyc` case is
-settled by the repository's own ignore rules instead: a `.pyc` in a
-repository that ignores `__pycache__/` is never listed, and one in a
-repository that does not is committed, exactly as that repository's own
-`git add -A` would commit it. Leerie cannot tell a generated file from a
-hand-made one by its name or its producer's tool, and dropping a real
-file breaks what ships while committing an unignored cache is the
-repository's existing hygiene; between the two, the safe error is the
-second.
+does, so the tool calls cannot be the only source.
+
+Review round 11 M1 drove what that rule alone ships: in a repository that
+ignores neither its dependency tree nor its reports, an implementer that
+ran `npm i` and its tests and left an editor swap file got a leftovers
+commit of 505 files — 500 under `node_modules/`, a coverage report, a
+junit file, a `.coverage` database, a 2 MB core dump and `a.ts.swp`.
+Three guards bound it, and none of them drops a file silently: whatever
+is withheld is listed, by path, in a "Needs human verification" entry of
+the kept groups (`redrive_leftovers`), for the reviewer to commit what
+belongs in the change.
+
+- *First producer.* An untracked file whose first producer was one of
+  leerie's own commands stays leerie's when the implementer's re-run of a
+  command rewrites it (§6½), so the reports, coverage and dependency tree
+  leerie's install and measurements made are never the implementer's.
+- *Artifact shapes no repository wants committed.* An untracked file whose
+  name is one of a short, fixed list is withheld: bytecode (`*.pyc`,
+  `*.pyo`), editor swap and backup files (`*.swp`, `*.swo`, `*~`, `.#*`,
+  `#*#`), Finder metadata (`.DS_Store`), and a core dump (`core` or
+  `core.<digits>` whose bytes begin with the ELF magic). Each is written by
+  a tool as a by-product of running or editing, never as a source file:
+  CPython regenerates bytecode from its source, an editor deletes its swap
+  file on a clean exit, and a core dump is a crash's memory image. The list
+  is deliberately not wider — coverage, reports and build output are
+  committed by some repositories on purpose, so they are left to the first
+  rule and the cap. A `.pyc` used to be committed in a repository that does
+  not ignore `__pycache__/`, as its own `git add -A` would; it is listed
+  instead, since the PR is not the place to start tracking it.
+- *A cap.* When what is left to commit is more than
+  `redrive_leftovers_max_files` files or `redrive_leftovers_max_bytes`
+  bytes, nothing is committed: no implementer's change is that large by
+  accident, and choosing a subset would ship half of whatever it is. The
+  group's commits stand and are measured as they are; its uncommitted
+  files are left in staging and listed.
+
+Leerie still cannot tell a generated file from a hand-made one in general,
+and dropping a real file breaks what ships; so outside those three guards
+a new untracked file is committed, and inside them it is listed, never
+dropped unseen.
 
 **No byte derived from a staged set reaches history.** The shown sets a
 re-drive group stages are held-out tests, and what the implementer's

@@ -83,14 +83,14 @@ def _leftovers(leerie, s, before, written):
 
 
 @pytest.mark.parametrize("ignore", ["__pycache__/\n", ""])
-def test_a_pyc_from_the_implementers_own_test_run_follows_the_repos_ignore(
+def test_a_pyc_from_the_implementers_own_test_run_is_never_committed(
         leerie, tmp_path, monkeypatch, ignore):
     """M2a, the reviewer's driver: the implementer writes a test, runs
     pytest (a new `.pyc` appears) and commits only its test. A repository
-    that ignores `__pycache__/` never sees the `.pyc`; one that does not
-    gets it committed — what its own `git add -A` would do, since a shell
-    command made it and no file name tells an artifact from a source file
-    (DESIGN §8)."""
+    that ignores `__pycache__/` never sees the `.pyc`. One that does not
+    used to get it committed, as its own `git add -A` would; since review
+    round 11 M1 bytecode is an artifact shape the leftovers commit
+    withholds and lists, never ships (DESIGN §8)."""
     s = _staging(tmp_path, monkeypatch, ignore)
     before = _before(leerie, s)
     (s / "tests" / "test_new.py").write_text("def test_n():\n    assert 1\n")
@@ -100,14 +100,16 @@ def test_a_pyc_from_the_implementers_own_test_run_follows_the_repos_ignore(
     head = _head(s)
     written = leerie._worker_written_paths(
         _log(tmp_path, s, ("Write", "tests/test_new.py")), s)
-    got = _leftovers(leerie, s, before, written)
+    withheld: dict = {}
+    got = asyncio.run(leerie._redrive_commit_leftovers(
+        s, "r1 g0", *before, written, withheld=withheld))
+    assert got == [] and _head(s) == head
+    shaped = withheld.get("artifacts") or []
     if ignore:
-        assert got == [] and _head(s) == head
+        assert shaped == []
     else:
-        assert got and all(f.endswith(".pyc") and "test_new" in f
-                           for f in got)
-        # The earlier measurement's `.pyc` predates the group: not taken.
-        assert not any("test_a" in f for f in got)
+        assert shaped and all(f.endswith(".pyc") and "test_new" in f
+                              for f in shaped)
 
 
 def test_a_tracked_edit_that_predates_the_group_is_not_committed(

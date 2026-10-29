@@ -245,6 +245,14 @@ DEFAULT_CAPS = {
     # the budget in 90 of 90 historical runs, max 2 rounds on any subtask.
     "subtask_redrive_rounds": 2,
     "redrive_budget_sec": 14400,
+    # The most a delivery re-drive group's leftovers commit may take
+    # (DESIGN §8 *A re-drive group's leftovers are its implementer's*):
+    # past either, nothing is committed and the paths are listed instead.
+    # Review round 11 M1 drove 505 files (an unignored `node_modules/`, a
+    # coverage report, a core dump) into one leftovers commit; a re-drive
+    # group's own change is a handful of files.
+    "redrive_leftovers_max_files": 100,
+    "redrive_leftovers_max_bytes": 5 * 1024 * 1024,
     # B* flake-robust failure verdicts (DESIGN §9 *Which failures are new*):
     # host-PSI gate, then interleaved serial base/final rerun pairs. Frozen
     # from the Q9 bench (held-out: 0/88 clean trials called new, 36/36
@@ -6378,6 +6386,10 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
                                   FINAL_DIFF_GAP_SOURCE)
               and _pr_entry(e.get("detail"))):
             add("Regression checks the run could not settle",
+                f"- [ ] {_pr_entry(e.get('detail'))}")
+        elif (e.get("source") == _REDRIVE_LEFTOVERS_GAP_SOURCE
+              and _pr_entry(e.get("detail"))):
+            add("Files a re-drive left uncommitted",
                 f"- [ ] {_pr_entry(e.get('detail'))}")
         elif e.get("source") == "blocker" and isinstance(e.get("subtask"),
                                                           str):
@@ -52925,6 +52937,77 @@ def _worker_written_paths(log_path: Path, tree: str | Path) -> set[str]:
     return out
 
 
+# Untracked file names a tool writes as a by-product of running or editing,
+# never as a source file, that the leftovers commit withholds and lists
+# (DESIGN §8 *A re-drive group's leftovers are its implementer's*):
+# bytecode, editor swap/backup files and Finder metadata. Deliberately
+# short — coverage, reports and build output are committed by some
+# repositories on purpose.
+_LEFTOVER_ARTIFACT_GLOBS = ("*.pyc", "*.pyo", "*.swp", "*.swo", "*~", ".#*",
+                            "#*#", ".DS_Store")
+_CORE_DUMP_RE = re.compile(r"core(\.\d+)?")
+_REDRIVE_LEFTOVERS_GAP_SOURCE = "redrive_leftovers"
+
+
+def _leftover_artifact(staging: Path, rel: str) -> bool:
+    """True when the untracked file `rel` has a `_LEFTOVER_ARTIFACT_GLOBS`
+    name, or is a core dump: named `core` / `core.<digits>` and starting
+    with the ELF magic."""
+    name = os.path.basename(rel)
+    if any(fnmatch.fnmatchcase(name, g) for g in _LEFTOVER_ARTIFACT_GLOBS):
+        return True
+    if _CORE_DUMP_RE.fullmatch(name):
+        try:
+            with open(staging / rel, "rb") as f:
+                return f.read(4) == b"\x7fELF"
+        except OSError:
+            return False
+    return False
+
+
+def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
+    """The "Needs human verification" entry for what kept re-drive groups
+    left uncommitted that the leftovers commit withheld (`leftovers_withheld`
+    of every group not rolled back): artifact-shaped files and a whole
+    over-cap set, by path. Cleared when there is none."""
+    data = getattr(st, "data", None)
+    if not isinstance(data, dict):
+        return
+    shapes: list[str] = []
+    over: list[str] = []
+    for r in rec.get("rounds") or []:
+        for g in r.get("groups") or []:
+            w = g.get("leftovers_withheld") if isinstance(g, dict) else None
+            if not isinstance(w, dict) or g.get("rolled_back"):
+                continue
+            shapes += [p for p in w.get("artifacts") or [] if p not in shapes]
+            over += [p for p in w.get("over_cap") or [] if p not in over]
+    entries = [e for e in (data.get("needs_human_verification") or [])
+               if not (isinstance(e, dict) and e.get("source")
+                       == _REDRIVE_LEFTOVERS_GAP_SOURCE)]
+
+    def shown(xs: list[str]) -> str:
+        return ", ".join(xs[:10]) + (f" (+{len(xs) - 10} more)"
+                                     if len(xs) > 10 else "")
+    parts = []
+    if over:
+        parts.append(f"over the leftovers cap, nothing committed: "
+                     f"{shown(over)}")
+    if shapes:
+        parts.append(f"artifact-shaped, not committed: {shown(shapes)}")
+    if parts:
+        entries.append({
+            "source": _REDRIVE_LEFTOVERS_GAP_SOURCE,
+            "detail": ("delivery re-drive leftovers: files a re-drive "
+                       "implementer left uncommitted in staging that leerie "
+                       "did not commit for it — commit the ones that belong "
+                       "in the change. " + "; ".join(parts))})
+    if entries != (data.get("needs_human_verification") or []):
+        data["needs_human_verification"] = entries
+        with contextlib.suppress(Exception):
+            st.save()
+
+
 async def _redrive_commit_leftovers(staging: Path, label: str,
                                     tracked_before: dict[str, str | None]
                                     | None,
@@ -52933,7 +53016,8 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
                                     written: set[str], *,
                                     markers: list[bytes] | tuple = (),
                                     withheld: dict[str, list[str]] | None
-                                    = None) -> list[str]:
+                                    = None,
+                                    caps: dict | None = None) -> list[str]:
     """Commit what a re-drive group's implementer left uncommitted (DESIGN
     §8 *A re-drive group's leftovers are its implementer's*): the tracked
     files whose content changed while the group ran (`_changed_paths`
@@ -52956,7 +53040,13 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
     holds one of `markers` (`_heldout_markers`: the staged sets' bytes) is
     removed — an untracked one unlinked, a tracked one checked out from
     HEAD — and listed in `withheld["heldout"]` (DESIGN §8 *No byte derived
-    from a staged set reaches history*)."""
+    from a staged set reaches history*).
+
+    Of the rest, an untracked file `_leftover_artifact` names is withheld
+    (`withheld["artifacts"]`), and when what remains is more than
+    `redrive_leftovers_max_files` paths or `redrive_leftovers_max_bytes`
+    bytes (`caps`, else `DEFAULT_CAPS`), nothing is committed and every
+    path goes to `withheld["over_cap"]`."""
     now = await asyncio.to_thread(_tracked_content, staging)
     tracked = (_changed_paths(tracked_before, now)
                if tracked_before is not None and now is not None else [])
@@ -52988,7 +53078,15 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
             written = set(written) - set(tainted)
     produced = await asyncio.to_thread(_leerie_produced, staging, sigs)
     untracked = sorted(((moved - produced) | (set(sigs) & set(written))))
+    shaped = [p for p in untracked if _leftover_artifact(staging, p)]
+    if shaped:
+        log(f"  delivery re-drive ({label}): {len(shaped)} artifact-shaped "
+            "untracked file(s) not committed: " + ", ".join(shaped[:5])
+            + (f" (+{len(shaped) - 5} more)" if len(shaped) > 5 else ""))
+        if withheld is not None:
+            withheld.setdefault("artifacts", []).extend(shaped)
     left_out = sorted(set(sigs) - produced - set(untracked))
+    untracked = [p for p in untracked if p not in shaped]
     if left_out:
         log(f"  delivery re-drive ({label}): {len(left_out)} untracked "
             "file(s) predating the group, untouched by it, left uncommitted: "
@@ -52996,6 +53094,24 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
             + (f" (+{len(left_out) - 5} more)" if len(left_out) > 5 else ""))
     paths = sorted(set(tracked) | set(untracked))
     if not paths:
+        return []
+    cp = caps or DEFAULT_CAPS
+    max_files = int(cp.get("redrive_leftovers_max_files",
+                           DEFAULT_CAPS["redrive_leftovers_max_files"]))
+    max_bytes = int(cp.get("redrive_leftovers_max_bytes",
+                           DEFAULT_CAPS["redrive_leftovers_max_bytes"]))
+    size = 0
+    for p in paths:
+        with contextlib.suppress(OSError):
+            size += os.lstat(staging / p).st_size
+    if len(paths) > max_files or size > max_bytes:
+        log(f"  delivery re-drive ({label}): {len(paths)} leftover file(s), "
+            f"{size} bytes — over the leftovers cap ({max_files} files, "
+            f"{max_bytes} bytes); nothing committed: "
+            + ", ".join(paths[:5])
+            + (f" (+{len(paths) - 5} more)" if len(paths) > 5 else ""))
+        if withheld is not None:
+            withheld.setdefault("over_cap", []).extend(paths)
         return []
     await run_proc(["git", "--literal-pathspecs", "add", "-A", "--", *paths],
                    cwd=str(staging))
@@ -53321,9 +53437,13 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 _worker_written_paths(
                     st.run_dir / "logs"
                     / f"delivery-redrive-r{rnd}-g{gi}.log", staging),
-                markers=markers, withheld=withheld)
+                markers=markers, withheld=withheld, caps=caps)
             if left:
                 ge["leftovers"] = left[:20]
+            kept_out = {k: v[:200] for k in ("artifacts", "over_cap")
+                        if (v := withheld.get(k))}
+            if kept_out:
+                ge["leftovers_withheld"] = kept_out
             heldout_removed = swept + withheld.get("heldout", [])
             if heldout_removed:
                 ge["heldout_removed"] = heldout_removed[:20]
@@ -53568,6 +53688,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             st.save()
     rec["final_sha"] = final
     rec["done"] = True
+    _set_redrive_leftovers_gap(st, rec)
     _save()
     log("  delivery re-drive: done"
         + (f" — conflict: {rec['conflict']['reason']}"
