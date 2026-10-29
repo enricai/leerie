@@ -148,6 +148,15 @@ prune_leerie_worktrees "${RUN_DIR}"
 # container), so it never matched and this add ran unconditionally.
 if ! grep -qxF "worktree $STAGING_WT" <<<"$(git worktree list --porcelain)"; then
   git worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
+else
+  # A staging that survived its process: a SIGKILL skipped the cleanup that
+  # removes it, so it holds whatever the killed worker left — partial edits,
+  # a merge half resolved. Every process starts on staging at its branch tip
+  # with nothing uncommitted (DESIGN §8 *The final diff describes the tree
+  # that ships*): reset ends any merge, clean keeps ignored files (installed
+  # dependencies). The run branch itself is untouched.
+  git -C "${STAGING_WT}" reset -q --hard HEAD
+  git -C "${STAGING_WT}" clean -fdq
 fi
 
 echo "working-branch: ${WORKING_BRANCH}"

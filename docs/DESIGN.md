@@ -7194,13 +7194,21 @@ ignored files are not dirt), and a violation **stops the run** (`die`)
 naming the porcelain lines. It is not routed to `unconverged`, for three
 reasons. A violation has no outside cause: every worker's dirt is caught
 by I1's gate at the worker (re-asked, then rolled back), every command of
-leerie's own is bracketed by I2, and an interrupted run's cleanup removes
-staging, so the resume adds a fresh one from the run branch — dirty
-staging at a reader means leerie's own code broke an invariant. (A
-SIGKILL skips that cleanup, so a worker killed mid-round can leave its
-partial edits in a staging the resume reuses; the first reader then
-stops the run, that stop's cleanup removes staging, and the next resume
-starts clean.) Continuing would mean
+leerie's own is bracketed by I2, and every orchestrator process starts
+on a staging at its branch tip with nothing uncommitted — dirty staging
+at a reader means leerie's own code broke an invariant. That last
+property is the resume's own invariant, not a convenience of cleanup:
+an interrupted run's cleanup removes staging, but a SIGKILL (Fly's
+`machine stop`, an OOM kill of the container) skips cleanup and leaves
+staging as the killed worker left it — partial edits, a merge half
+resolved. So `setup-run.sh`, which every process runs once before it
+reads staging, resets a staging that survived (`git reset --hard HEAD`,
+which also ends a merge in progress, then `git clean -fd`, which keeps
+ignored files and so the installed dependencies). Nothing uncommitted in
+it is anything leerie may keep: I1 never commits a worker's leftovers,
+and the run branch — every integrated commit — is untouched. A killed
+integrator's half resolution goes with it, as it already did under a
+Ctrl-C's cleanup. Continuing would mean
 measuring, judging or shipping a tree leerie cannot name — the very guess
 this design removed — and a run that ends `unconverged` because of it
 would present a defect of leerie as unfinished work of the task's, in the
