@@ -9308,7 +9308,18 @@ Three layers follow, each derived from that one list:
   Python run-wrappers `uv run` (and `uv run -m`, `uv tool run`, `uvx`),
   `poetry run`, `pipenv run`, `hatch run [ENV:]`, `pdm run`, `rye run`,
   Ruby's `bundle exec`, `xvfb-run` (its getopt options, clustered
-  `-as ARGS` included), `node <…>/node_modules/<pkg>/…` to the package's
+  `-as ARGS` included), the JS env wrappers `cross-env` and
+  `cross-env-shell` (leading `NAME=value` words, as cross-env's own
+  setter regex reads them; `-shell` runs the rest through a shell),
+  `dotenv` (dotenv-cli parses with minimist and no option table: an
+  option takes the next word unless it starts with `-`, positionals are
+  collected across options, and `--` ends them) and `env-cmd` (commander:
+  `-f`/`-r [path]` take an optional value, `-e [envs...]` is variadic and
+  takes every word up to the next option, the first operand is the
+  command and the words after it are its own; `--use-shell` runs it
+  through a shell) — each measured with the real tool (cross-env 10.1,
+  dotenv-cli 11.1, env-cmd 11.0) —
+  `node <…>/node_modules/<pkg>/…` to the package's
   binary, a runner proxy's `<pkg>@<version>` (`npx -y vitest@3`, `pnpm
   dlx`, `yarn dlx`, `bunx`, `npm exec`, `corepack`) to the package, and `pnpm`/`yarn`/`bun <bin>` (a script of that name, else the
   binary: both readings are checked); npm and yarn drop one `--` before
@@ -9407,6 +9418,37 @@ Three layers follow, each derived from that one list:
   the worker hook, which reads no `package.json`, refuses them too. They
   are not shown as the task's own forbids, and a derived entry the task
   prescribes is dropped like any other.
+
+  *A script's environment is part of what it runs.* Deriving from a body
+  first dropped its environment: `"test:db": "NODE_ENV=production vitest
+  run"` derived `vitest run`, so a task forbidding that one script (it
+  hits the production database) refused every test run in the repo, and
+  the sibling scan then forbade `pnpm test` (round-5 review M1). The task
+  forbade that environment, not the runner. So the environment a command
+  sets is read with it — leading `NAME=value` words, `env`'s assignments
+  and `-u`/`-i`/`-C`, and the JS env wrappers `cross-env`,
+  `cross-env-shell`, `dotenv` (dotenv-cli) and `env-cmd`, whose env files
+  count as the environment they load — and an entry that carries an
+  environment hits only a command that sets at least the same one. A
+  command's `export NAME=value`, bare assignment or `source <file>`
+  statements count for every command it runs, an over-reading that can
+  only add hits. A derived entry keeps the body's environment unless that
+  environment tells the script apart from nothing:
+  - the script is the repo's own test command (`_canonical_test_command`):
+    it is the suite, and its environment is how the repo runs the suite,
+    so the runner in any environment runs what the task forbade. `"test":
+    "cross-env TZ=UTC vitest run"` still derives `vitest run`, and a
+    worker's `npx vitest run` is refused (review M2);
+  - or no other script, and not the repo's test command, runs that runner
+    without that environment: the environment is how this repo runs that
+    runner at all, not what makes this script different.
+  Otherwise the derived entry carries the environment
+  (`NODE_ENV=production vitest run`), and the sibling scan names only the
+  scripts that set it too. The rule needs no list of which variables
+  matter: the repository says so, by running the same runner both ways.
+  What it cannot see: a different spelling of the same environment
+  (`NODE_ENV=production` typed against an entry that loads
+  `.env.production`), since an env file's content is not read.
   Hooks fire
   under `--dangerously-skip-permissions`. The hook fails open (a crash
   allows the call; the deny rules still stand) — a matcher bug must not

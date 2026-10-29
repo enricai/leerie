@@ -2997,5 +2997,567 @@
     "whole": false
    }
   ]
+ },
+ "env wrappers": {
+  "_how": "Round-5 review M2. Each command ran through real bash with the real cross-env 10.1, dotenv-cli 11.1 and env-cmd 11.0 (npm), in a directory whose .env sets NODE_ENV=fromfile, .env.production NODE_ENV=production and .env-cmdrc.json {\"dev\":{\"NODE_ENV\":\"dev\"}}, against a `vitest` stub printing its argv and NODE_ENV/TZ/CI. `ran` is null when the stub never ran, else its args after `vitest` and the variables it saw set.",
+  "files": {
+   ".env": "fromfile",
+   ".env.production": "production"
+  },
+  "rc": {
+   "dev": "dev"
+  },
+  "rows": [
+   {
+    "cmd": "cross-env TZ=UTC vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "TZ": "UTC"
+     }
+    }
+   },
+   {
+    "cmd": "cross-env TZ=UTC NODE_ENV=x vitest run --a=b",
+    "ran": {
+     "args": [
+      "run",
+      "--a=b"
+     ],
+     "env": {
+      "NODE_ENV": "x",
+      "TZ": "UTC"
+     }
+    }
+   },
+   {
+    "cmd": "cross-env vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {}
+    }
+   },
+   {
+    "cmd": "cross-env '' TZ=UTC vitest",
+    "ran": {
+     "args": [],
+     "env": {
+      "TZ": "UTC"
+     }
+    }
+   },
+   {
+    "cmd": "cross-env --x=1 vitest",
+    "ran": {
+     "args": [],
+     "env": {}
+    }
+   },
+   {
+    "cmd": "cross-env \"TZ='UTC'\" vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "TZ": "UTC"
+     }
+    }
+   },
+   {
+    "cmd": "cross-env-shell TZ=UTC 'vitest run && echo hi'",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "TZ": "UTC"
+     }
+    }
+   },
+   {
+    "cmd": "cross-env-shell TZ=UTC vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "TZ": "UTC"
+     }
+    }
+   },
+   {
+    "cmd": "npx cross-env CI=1 vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "CI": "1"
+     }
+    }
+   },
+   {
+    "cmd": "pnpm exec cross-env CI=1 vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "CI": "1"
+     }
+    }
+   },
+   {
+    "cmd": "npx --yes cross-env@10 CI=1 vitest run src/a.test.ts",
+    "ran": {
+     "args": [
+      "run",
+      "src/a.test.ts"
+     ],
+     "env": {
+      "CI": "1"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv vitest run --coverage src",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -- vitest run --coverage",
+    "ran": {
+     "args": [
+      "run",
+      "--coverage"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -e .env.production -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -e .env.production vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -e.env.production vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -e ./.env.production -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -c production -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -c -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -v TZ=UTC -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile",
+      "TZ": "UTC"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv --debug vitest run",
+    "ran": null
+   },
+   {
+    "cmd": "dotenv -p NODE_ENV vitest",
+    "ran": null
+   },
+   {
+    "cmd": "dotenv -o -- vitest",
+    "ran": {
+     "args": [],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv --quiet=false -- vitest",
+    "ran": {
+     "args": [],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv --no-expand vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -qe .env.production -- vitest",
+    "ran": {
+     "args": [],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv -e .env -e .env.production -- vitest",
+    "ran": {
+     "args": [],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv-cli -e .env.production -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "npx dotenv -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "npx dotenv-cli -e .env.production -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "dotenv --foo vitest run",
+    "ran": null
+   },
+   {
+    "cmd": "dotenv -e .env.production -v CI=1 vitest run -t name",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production",
+      "CI": "1"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd -f .env.production vitest run --x",
+    "ran": {
+     "args": [
+      "run",
+      "--x"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd -e dev -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "dev"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd -e dev vitest run",
+    "ran": null
+   },
+   {
+    "cmd": "env-cmd -e dev -x vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "dev"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd --silent vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd -x vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd --use-shell 'vitest run && echo hi'",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "fromfile"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd --file .env.production vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd --file=.env.production vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd -f.env.production vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd -xf .env.production vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "env-cmd -v vitest run",
+    "ran": null
+   },
+   {
+    "cmd": "env-cmd -f .env.production -- vitest run src",
+    "ran": {
+     "args": [
+      "run",
+      "src"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "env -u NODE_ENV -C . vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {}
+    }
+   },
+   {
+    "cmd": "NODE_ENV=production cross-env TZ=UTC vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production",
+      "TZ": "UTC"
+     }
+    }
+   },
+   {
+    "cmd": "cross-env NODE_ENV=production dotenv -- vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "bash -c 'cross-env CI=1 vitest run'",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "CI": "1"
+     }
+    }
+   },
+   {
+    "cmd": "export NODE_ENV=production && vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "set -a && . ./.env.production && vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "NODE_ENV": "production"
+     }
+    }
+   },
+   {
+    "cmd": "timeout 600 cross-env CI=1 vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "CI": "1"
+     }
+    }
+   },
+   {
+    "cmd": "xargs -a /dev/null cross-env CI=1 vitest run",
+    "ran": {
+     "args": [
+      "run"
+     ],
+     "env": {
+      "CI": "1"
+     }
+    }
+   }
+  ]
  }
 }

@@ -22474,6 +22474,179 @@ _FORBID_INTERP_EVAL: dict[str, frozenset[str]] = {
 _FORBID_STR_LIT = re.compile(
     r"""'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`""")
 _FORBID_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# JS wrappers that set an environment, then run a command (DESIGN §9 *A
+# script's environment is part of what it runs*). Each is parsed as its own
+# CLI parser reads it, measured with the real tool: cross-env 10.1
+# (`dist/index.js` `parseCommand`: no options, leading words its setter
+# regex `(\w+)=…` finds — unanchored — are assignments, empty words are
+# skipped), dotenv-cli 11.1 (`cli.js`: minimist with no option table) and
+# env-cmd 11.0 (`dist/parse-args.js`: commander).
+_FORBID_ENV_WRAPPERS = frozenset({
+    "cross-env", "cross-env-shell", "dotenv", "dotenv-cli", "env-cmd"})
+_CROSS_ENV_SETTER = re.compile(r"""(\w+)=('(.*)'|"(.*)"|(.*))""")
+# env-cmd's commander options: `-f`/`-r` take an optional value, `-e` a
+# variadic optional one; the rest are flags. `-v`/`-h` print and exit.
+_ENV_CMD_OPTS = {
+    "-f": "file", "--file": "file", "-r": "rc", "--rc-file": "rc",
+    "-e": "envs", "--environments": "envs", "-x": "", "--expand-envs": "",
+    "--recursive": "", "--fallback": "", "--no-override": "",
+    "--silent": "", "--use-shell": "shell", "--verbose": "",
+    "-v": "exit", "--version": "exit", "-h": "exit", "--help": "exit"}
+
+
+def _forbidden_minimist(words: list[str]
+                        ) -> tuple[list[str], list[tuple[str, str | bool]]]:
+    """`(positionals, [(key, value)])` as minimist 1.2 parses `words` with
+    no option table (dotenv-cli): `--k=v`; `--no-k` is false; `--k` and a
+    short cluster's last letter take the next word unless it starts with
+    `-`; a cluster letter followed by `=`, a number or a non-word
+    character takes the rest of the word; positionals are collected across
+    options; `--` ends options. A port of minimist's `parseArgs` loop (a
+    mechanical CLI grammar)."""
+    pos: list[str] = []
+    opts: list[tuple[str, str | bool]] = []
+    # minimist cuts at the first `--` before parsing, so an option just
+    # before it takes no value (`dotenv -c -- cmd`).
+    tail: list[str] = []
+    if "--" in words:
+        k = words.index("--")
+        words, tail = words[:k], words[k + 1:]
+    i = 0
+    while i < len(words):
+        w = words[i]
+        nxt = words[i + 1] if i + 1 < len(words) else None
+        i += 1
+        if re.match(r"--[^=]+=", w):
+            k, v = w[2:].split("=", 1)
+            opts.append((k, v))
+        elif re.match(r"--no-.", w):
+            opts.append((w[5:], False))
+        elif re.match(r"--.", w):
+            if nxt is not None and not re.match(r"(-|--)[^-]", nxt):
+                opts.append((w[2:], nxt))
+                i += 1
+            else:
+                opts.append((w[2:], True))
+        elif re.match(r"-[^-]", w):
+            letters = w[1:-1]
+            broken = False
+            for j, ch in enumerate(letters):
+                rest = w[j + 2:]
+                if rest == "-":
+                    opts.append((ch, rest))
+                    continue
+                if ch.isalpha() and rest[:1] == "=":
+                    opts.append((ch, rest[1:]))
+                elif ch.isalpha() and re.search(
+                        r"-?\d+(\.\d*)?(e-?\d+)?$", rest):
+                    opts.append((ch, rest))
+                elif j + 1 < len(letters) and re.match(r"\W", letters[j + 1]):
+                    opts.append((ch, rest))
+                else:
+                    opts.append((ch, True))
+                    continue
+                broken = True
+                break
+            key = w[-1]
+            if not broken and key != "-":
+                if nxt and not re.match(r"(-|--)[^-]", nxt):
+                    opts.append((key, nxt))
+                    i += 1
+                else:
+                    opts.append((key, True))
+        else:
+            pos.append(w)
+    return pos + tail, opts
+
+
+def _forbidden_env_opt(a: list[str]) -> set[str]:
+    """The environment tokens of `env`'s option at `a[0]` (`-u NAME`,
+    `--unset=NAME`, `-i`/`-`/`--ignore-environment`, `-C DIR`,
+    `--chdir=DIR`)."""
+    opt = a[0]
+    val = a[1] if len(a) > 1 else ""
+    if opt in ("-i", "-", "--ignore-environment"):
+        return {"-i"}
+    for short, long_ in (("-u", "--unset"), ("-C", "--chdir")):
+        if opt == short or opt == long_:
+            return {f"{short} {val}"} if val else set()
+        if opt.startswith(long_ + "="):
+            return {f"{short} {opt[len(long_) + 1:]}"}
+        if opt.startswith(short) and len(opt) > 2:
+            return {f"{short} {opt[2:]}"}
+    return set()
+
+
+def _forbidden_env_wrapper(a: list[str]
+                           ) -> tuple[list[str], set[str], bool] | None:
+    """`(command argv, environment tokens, via a shell)` an env wrapper
+    (`_FORBID_ENV_WRAPPERS`) runs, or None when it runs nothing (no
+    command, or an option that prints and exits)."""
+    head = os.path.basename(a[0])
+    toks: set[str] = set()
+    if head in ("cross-env", "cross-env-shell"):
+        i = 1
+        while i < len(a):
+            m = _CROSS_ENV_SETTER.search(a[i]) if a[i] else None
+            if a[i] and not m:
+                break
+            if m:
+                val = (m.group(3) if m.group(3) is not None else
+                       m.group(5) or "" if m.group(4) is None else m.group(4))
+                toks.add(f"{m.group(1)}={val}")
+            i += 1
+        return (a[i:], toks, head == "cross-env-shell") if a[i:] else None
+    if head in ("dotenv", "dotenv-cli"):
+        pos, opts = _forbidden_minimist(a[1:])
+        keys = {k for k, _v in opts}
+        if keys & {"help", "debug", "p"} or not pos:
+            return None
+        files = [v for k, v in opts if k == "e" and isinstance(v, str)]
+        files = files or [".env"]
+        casc = [v for k, v in opts if k == "c"]
+        if casc:
+            c = casc[-1]
+            files = [x for f in files for x in (
+                [f"{f}.{c}.local", f"{f}.local", f"{f}.{c}", f]
+                if isinstance(c, str) else [f"{f}.local", f])]
+        toks |= {"envfile:" + _forbidden_operand(f) for f in files}
+        toks |= {v for k, v in opts if k == "v" and isinstance(v, str)
+                 and re.fullmatch(r"\w+=[\s\S]+", v)}
+        return pos, toks, False
+    # env-cmd
+    r = a[1:]
+    vals: dict[str, list[str]] = {"file": [], "envs": []}
+    seen: set[str] = set()
+    while r and r[0].startswith("-") and r[0] != "-":
+        w = r.pop(0)
+        if w == "--":
+            break
+        name, eq, val = w.partition("=") if w.startswith("--") \
+            else (w[:2], "", w[2:])
+        kind = _ENV_CMD_OPTS.get(name)
+        if kind == "exit" or kind == "rc":
+            return None
+        seen.add(kind or "")
+        if kind == "file":
+            if not (eq or val) and r and not r[0].startswith("-"):
+                val = r.pop(0)
+            vals["file"].append(val)
+        elif kind == "envs":
+            got = [val] if (eq or val) else []
+            while r and not r[0].startswith("-"):
+                got.append(r.pop(0))
+            vals["envs"] += [e for g in got for e in g.split(",") if e]
+        elif kind == "" and not w.startswith("--") and val:
+            # A flag cluster (`-xf .env`): commander splits it.
+            r.insert(0, "-" + val)
+    if not r:
+        return None
+    if vals["envs"]:
+        toks |= {f"env-cmd -e {e}" for e in vals["envs"]}
+    else:
+        f = next((x for x in reversed(vals["file"]) if x), ".env")
+        toks.add("envfile:" + _forbidden_operand(f))
+    return r, toks, "shell" in seen
 
 
 def _forbidden_argvs(cmd: str, depth: int = 0,
@@ -22483,13 +22656,46 @@ def _forbidden_argvs(cmd: str, depth: int = 0,
     each subcommand unwrapped by `_forbidden_normalize`. `keep_xargs` keeps
     an `xargs` head as a leading `"xargs"` word instead of unwrapping it
     away, so the process-kill matcher can tell `xargs kill` from `kill`."""
+    return [a for a, _env in _forbidden_argvs_env(cmd, depth, keep_xargs)]
+
+
+def _forbidden_argvs_env(cmd: str, depth: int = 0, keep_xargs: bool = False,
+                         env: frozenset[str] = frozenset()
+                         ) -> list[tuple[list[str], frozenset[str]]]:
+    """`_forbidden_argvs` with the environment each argv runs in (DESIGN §9
+    *A script's environment is part of what it runs*): a set of tokens —
+    `NAME=value`, `-u NAME`, `-i`, `-C <dir>` (env's own options),
+    `envfile:<path>` (a file an env wrapper loads), `env-cmd -e <env>` —
+    collected from the words the unwrapping drops. A command's
+    `export`/bare assignment/`source` statements count for every argv of
+    the command, which can only over-read it."""
     if depth > _FORBID_MAX_DEPTH or not isinstance(cmd, str):
         return []
-    out: list[list[str]] = []
-    for seg in _shell_subcommands(cmd):
-        argv = [w.replace(_QUOTED_SPACE, " ") for w in seg.split()]
-        out.extend(_forbidden_normalize(argv, depth, keep_xargs))
+    argvs = [[w.replace(_QUOTED_SPACE, " ") for w in seg.split()]
+             for seg in _shell_subcommands(cmd)]
+    shared = set(env)
+    for argv in argvs:
+        shared |= _forbidden_env_statement(argv)
+    out: list[tuple[list[str], frozenset[str]]] = []
+    for argv in argvs:
+        out.extend(_forbidden_normalize(argv, depth, keep_xargs,
+                                        frozenset(shared)))
     return out
+
+
+def _forbidden_env_statement(argv: list[str]) -> set[str]:
+    """The environment tokens a shell statement sets for the commands after
+    it: `export`/`declare`/`typeset`/`readonly` assignments, an
+    assignment-only statement, and `source`/`.` of a file."""
+    if not argv:
+        return set()
+    if all(_FORBID_ASSIGN.match(w) for w in argv):
+        return set(argv)
+    if argv[0] in ("export", "declare", "typeset", "readonly"):
+        return {w for w in argv[1:] if _FORBID_ASSIGN.match(w)}
+    if argv[0] in ("source", ".") and len(argv) > 1:
+        return {"envfile:" + _forbidden_operand(argv[1])}
+    return set()
 
 
 def _forbidden_interp_head(word: str) -> str:
@@ -22500,12 +22706,26 @@ def _forbidden_interp_head(word: str) -> str:
 
 
 def _forbidden_normalize(argv: list[str], depth: int,
-                         keep_xargs: bool = False) -> list[list[str]]:
+                         keep_xargs: bool = False,
+                         env: frozenset[str] = frozenset()
+                         ) -> list[tuple[list[str], frozenset[str]]]:
     a = list(argv)
+    env = set(env)
     while a:
         head = os.path.basename(a[0])
         if _FORBID_ASSIGN.match(a[0]):
+            env.add(a[0])
             a = a[1:]
+            continue
+        if head in _FORBID_ENV_WRAPPERS:
+            got = _forbidden_env_wrapper(a)
+            if got is None:
+                return []
+            a, toks, via_shell = got
+            env |= toks
+            if via_shell:
+                return _forbidden_argvs_env(" ".join(a), depth + 1,
+                                            keep_xargs, frozenset(env))
             continue
         if head in _FORBID_WRAPPERS:
             if keep_xargs and head == "xargs":
@@ -22513,16 +22733,20 @@ def _forbidden_normalize(argv: list[str], depth: int,
                 vals = _FORBID_WRAPPER_VALUE_OPTS["xargs"]
                 while rest and rest[0].startswith("-"):
                     rest = rest[2:] if rest[0] in vals else rest[1:]
-                return [["xargs"] + r for r in
-                        (_forbidden_normalize(rest, depth, keep_xargs)
-                         if rest else [[]])]
+                return [(["xargs"] + r, e) for r, e in
+                        (_forbidden_normalize(rest, depth, keep_xargs,
+                                              frozenset(env))
+                         if rest else [([], frozenset(env))])]
             vals = _FORBID_WRAPPER_VALUE_OPTS.get(head, frozenset())
             a = a[1:]
             while a:
                 opt = a[0]
                 if head == "env" and opt in ("-S", "--split-string") \
                         and len(a) > 1:
-                    return _forbidden_argvs(a[1], depth + 1, keep_xargs)
+                    return _forbidden_argvs_env(a[1], depth + 1, keep_xargs,
+                                                frozenset(env))
+                if head == "env":
+                    env |= _forbidden_env_opt(a)
                 letters = _FORBID_WRAPPER_VALUE_LETTERS.get(head, "")
                 if opt in vals:
                     a = a[2:]
@@ -22534,6 +22758,8 @@ def _forbidden_normalize(argv: list[str], depth: int,
                     a = a[2:] if k == len(opt) - 1 else a[1:]
                 elif opt.startswith("-") or _FORBID_ASSIGN.match(opt) or (
                         head == "timeout" and opt[:1].isdigit()):
+                    if _FORBID_ASSIGN.match(opt):
+                        env.add(opt)
                     a = a[1:]
                 else:
                     break
@@ -22542,7 +22768,8 @@ def _forbidden_normalize(argv: list[str], depth: int,
             a = a[1:]
             while a and a[0].startswith("-"):
                 if a[0] in ("-c", "--call") and len(a) > 1:
-                    return _forbidden_argvs(a[1], depth + 1, keep_xargs)
+                    return _forbidden_argvs_env(a[1], depth + 1, keep_xargs,
+                                                frozenset(env))
                 a = a[2:] if a[0] in ("-p", "--package") else a[1:]
             if a:
                 a = [_forbidden_package_word(a[0])] + a[1:]
@@ -22550,11 +22777,13 @@ def _forbidden_normalize(argv: list[str], depth: int,
         if head in _FORBID_SHELLS:
             for i, w in enumerate(a[1:], 1):
                 if w.startswith("-") and not w.startswith("--") and "c" in w:
-                    return (_forbidden_argvs(a[i + 1], depth + 1, keep_xargs)
+                    return (_forbidden_argvs_env(a[i + 1], depth + 1,
+                                                 keep_xargs, frozenset(env))
                             if i + 1 < len(a) else [])
             break
         if head == "eval":
-            return _forbidden_argvs(" ".join(a[1:]), depth + 1, keep_xargs)
+            return _forbidden_argvs_env(" ".join(a[1:]), depth + 1,
+                                        keep_xargs, frozenset(env))
         if head in _FORBID_RUN_WRAPPERS:
             inner = _forbidden_run_wrapper(a)
             if inner is None:
@@ -22576,14 +22805,18 @@ def _forbidden_normalize(argv: list[str], depth: int,
             for i, w in enumerate(a[1:], 1):
                 if w in flags and i + 1 < len(a):
                     code = a[i + 1]
-                    out = _forbidden_argvs(code, depth + 1, keep_xargs)
+                    fenv = frozenset(env)
+                    out = _forbidden_argvs_env(code, depth + 1, keep_xargs,
+                                               fenv)
                     for m in _FORBID_STR_LIT.finditer(code):
                         lit = next(g for g in m.groups() if g is not None)
-                        out.extend(_forbidden_argvs(lit, depth + 1, keep_xargs))
+                        out.extend(_forbidden_argvs_env(
+                            lit, depth + 1, keep_xargs, fenv))
                     return out
         break
     if not a:
         return []
+    fenv = frozenset(env)
     a[0] = os.path.basename(a[0])
     if a[0] in _FORBID_PMS:
         vals = _FORBID_PM_VALUE_OPTS[a[0]]
@@ -22620,14 +22853,15 @@ def _forbidden_normalize(argv: list[str], depth: int,
                 ended = False
                 while r and r[0].startswith("-"):
                     if r[0] in ("-c", "--call") and len(r) > 1:
-                        return _forbidden_argvs(r[1], depth + 1, keep_xargs)
+                        return _forbidden_argvs_env(r[1], depth + 1,
+                                                    keep_xargs, fenv)
                     ended = ended or r[0] == "--"
                     r = r[1:]
                 if r:
                     r = [_forbidden_package_word(r[0])] + r[1:]
                 return _forbidden_normalize(
                     r if ended else _forbidden_pm_passthrough(a[0], r),
-                    depth + 1, keep_xargs)
+                    depth + 1, keep_xargs, fenv)
             if sub in ("run", "run-script"):
                 a = [a[0], "run"] + _opts(a[2:])
             elif sub in _FORBID_PM_SCRIPT_ALIASES:
@@ -22643,12 +22877,13 @@ def _forbidden_normalize(argv: list[str], depth: int,
                 if a[0] == "pnpm":
                     binary = (None if script_only
                               else _forbidden_pnpm_binary(raw))
-                    return [a] + (_forbidden_normalize(
+                    return [(a, fenv)] + (_forbidden_normalize(
                         _forbidden_pm_passthrough("pnpm", binary),
-                        depth + 1, keep_xargs) if binary else [])
-                return [a] + _forbidden_normalize(_forbidden_pm_passthrough(
-                    a[0], a[1:]), depth + 1, keep_xargs)
-    return [a]
+                        depth + 1, keep_xargs, fenv) if binary else [])
+                return [(a, fenv)] + _forbidden_normalize(
+                    _forbidden_pm_passthrough(a[0], a[1:]), depth + 1,
+                    keep_xargs, fenv)
+    return [(a, fenv)]
 
 
 def _forbidden_package_word(word: str) -> str:
@@ -23269,22 +23504,27 @@ def _forbidden_command_hit(command: str,
                            forbidden: list[str | dict]) -> str | None:
     """The first forbidden command one of `command`'s normalised argvs starts
     with, or None. A `whole_suite` entry hits only a whole-suite run of it
-    (`_forbidden_whole_suite_rest`). Never raises: a matcher error reads as
-    no hit (the deny rules still stand) rather than failing a caller."""
+    (`_forbidden_whole_suite_rest`). An entry that sets an environment hits
+    only a command that sets at least the same one (DESIGN §9 *A script's
+    environment is part of what it runs*). Never raises: a matcher error
+    reads as no hit (the deny rules still stand) rather than failing a
+    caller."""
     try:
         if not forbidden or not isinstance(command, str) or not command.strip():
             return None
-        cands = _forbidden_argvs(command)
+        cands = _forbidden_argvs_env(command)
         for f in forbidden:
             spec = _forbidden_spec(f)
             if spec is None:
                 continue
             cmd, scope, roots = spec
-            for forb in _forbidden_argvs(cmd):
+            for forb, fenv in _forbidden_argvs_env(cmd):
                 forb = _forbidden_runner_canon(forb)
                 head, ops = (_forbidden_suite_head(forb)
                              if scope == "whole_suite" else (forb, []))
-                for c in cands:
+                for c, cenv in cands:
+                    if not fenv <= cenv:
+                        continue
                     c = _forbidden_runner_canon(c)
                     if not _forbidden_prefix_match(c, head):
                         continue
@@ -23396,6 +23636,61 @@ def _process_constraints(result: dict, prescribed: dict | None,
             "entries": entries, "dropped": dropped}
 
 
+def _forbidden_runner_key(argv: list[str]) -> tuple[str, ...] | None:
+    """The `_FORBID_RUNNERS` key of the runner `argv` runs, else None."""
+    a = _forbidden_runner_canon(argv)
+    for n in (2, 1):
+        if len(a) >= n and tuple(a[:n]) in _FORBID_RUNNERS:
+            return tuple(a[:n])
+    return None
+
+
+def _forbidden_runner_runs(cmd: str | None
+                           ) -> list[tuple[tuple[str, ...], frozenset[str]]]:
+    """`(runner key, environment)` of every runner `cmd` runs."""
+    out = []
+    for argv, env in _forbidden_argvs_env(cmd) if cmd else []:
+        key = _forbidden_runner_key(argv)
+        if key is not None:
+            out.append((key, env))
+    return out
+
+
+def _forbidden_script_name(cmd: str | None) -> str | None:
+    """The package script `cmd` calls when it is exactly one script call
+    (`pnpm test`, `npm run test:ci`), else None."""
+    argvs = _forbidden_argvs(cmd) if cmd else []
+    if len(argvs) == 1 and len(argvs[0]) >= 3 \
+            and argvs[0][0] in _FORBID_PMS and argvs[0][1] == "run":
+        return argvs[0][2]
+    return None
+
+
+def _forbidden_env_render(argv: list[str], env: frozenset[str]) -> str:
+    """`argv` as a command that sets `env` (`_forbidden_argvs_env`'s
+    tokens), so the entry reads back with the same environment: `env`'s
+    own options, then the assignments, then the env files through `dotenv
+    -e … --` and the env-cmd environments through `env-cmd -e … --`."""
+    opts: list[str] = []
+    assigns: list[str] = []
+    files: list[str] = []
+    rcs: list[str] = []
+    for t in sorted(env):
+        if t.startswith("envfile:"):
+            files += ["-e", t[len("envfile:"):]]
+        elif t.startswith("env-cmd -e "):
+            rcs.append(t[len("env-cmd -e "):])
+        elif t == "-i" or t.startswith(("-u ", "-C ")):
+            opts += t.split(" ", 1)
+        else:
+            assigns.append(t)
+    words = ((["env", *opts] if opts else []) + assigns
+             + (["dotenv", *files, "--"] if files else [])
+             + (["env-cmd", "-e", ",".join(rcs), "--"] if rcs else [])
+             + list(argv))
+    return shlex.join(words)
+
+
 def _forbidden_script_derived(entries: list[dict],
                               repo_root: str | Path) -> list[dict]:
     """The entries a forbidden command implies through `repo_root`'s
@@ -23408,7 +23703,11 @@ def _forbidden_script_derived(entries: list[dict],
       every argv of the resolved body that names a `_FORBID_RUNNERS` runner
       becomes an entry (`vitest run --coverage`). Other commands in the body
       (`tsc --noEmit && vitest run`) are not forbidden — the task forbade
-      the suite, not the type check;
+      the suite, not the type check. The environment the body sets is kept
+      (`NODE_ENV=production vitest run`, `_forbidden_env_render`) unless the
+      script is the repo's test command, or no other script runs that
+      runner without it (DESIGN §9 *A script's environment is part of what
+      it runs*);
     - every script whose resolved body runs a forbidden command (an
       original or one derived above) is forbidden by name too (`pnpm run
       test:ci` whose body is `vitest run --coverage`), so the hook, which
@@ -23431,11 +23730,26 @@ def _forbidden_script_derived(entries: list[dict],
                     d["test_roots"] = list(src["test_roots"])
                 out.append(d)
 
+        # Every runner run of every script, to tell whether a body's
+        # environment is what sets its script apart (DESIGN §9 *A script's
+        # environment is part of what it runs*).
+        runs = {name: _forbidden_runner_runs(
+                    _resolve_pm_script(f"npm run {name}", repo_root))
+                for name in scripts if _FORBID_SCRIPT_NAME_RE.fullmatch(name)}
+        canon = _forbidden_script_name(_canonical_test_command(repo_root))
         for e in entries:
             body = _resolve_pm_script(e["command"], repo_root)
-            for argv in _forbidden_argvs(body) if body else []:
-                if _forbidden_runner(_forbidden_runner_canon(argv)):
-                    _add(e, shlex.join(argv))
+            own = _forbidden_script_name(e["command"])
+            for argv, env in _forbidden_argvs_env(body) if body else []:
+                key = _forbidden_runner_key(argv)
+                if key is None:
+                    continue
+                if env and ((own is not None and own == canon) or not any(
+                        k == key and not env <= renv
+                        for name, rs in runs.items() if name != own
+                        for k, renv in rs)):
+                    env = frozenset()
+                _add(e, _forbidden_env_render(argv, env))
         sources = list(entries) + list(out)
         named: set[str] = set()
         pm = "npm"
