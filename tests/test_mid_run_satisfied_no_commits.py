@@ -194,9 +194,13 @@ class TestSettleWiring:
 
     @staticmethod
     def _no_commits_region(src: str) -> str:
+        # Ends at the next check of a completed result, the clean-tree gate
+        # (I1) — a call, not a comment: the comment this used to end on
+        # went with the old dirty-worktree check (00d4946), which left four
+        # of these guards failing on a missing end, not on the wiring.
         start = src.find("if commit_err")
         assert start != -1, "the no-commits branch is missing"
-        end = src.find("# uncommitted changes", start)
+        end = src.find("_clean_tree_gate(", start)
         assert end != -1
         return src[start:end]
 
