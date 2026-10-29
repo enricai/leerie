@@ -7767,10 +7767,14 @@ non-resource reason is the reported defect showing, however rarely. So:
    signature, which makes the file failing. Discovery always leaves a
    record on the set's result when it had files to rerun, found or not,
    with how many rounds ran of how many required and, when it stopped
-   short, why (the budget ran out, or repeats are set to 0): "held cases
-   rerun ten times clean" must never read the same as "held cases never
-   rerun". A set whose discovery stopped short is logged
-   `discovery_incomplete` and listed in the PR's advisory section.
+   short, why (the budget ran out): "held cases rerun ten times clean"
+   must never read the same as "held cases never rerun". A set whose
+   discovery stopped short is logged `discovery_incomplete` and listed in
+   the PR's advisory section. Discovery the operator turned off
+   (`acceptance_intermittent_repeats` = 0) is recorded `disabled`, not
+   incomplete: nothing stopped short of what was asked, and listing every
+   set with held cases under a deliberate setting was noise (review round
+   5 L4).
 3. *A held case that failed is never unmeasured.* A set whose held case
    failed at least once, but only with resource signatures (or none
    readable), and that neither rule settled, is not "no evidence": it is

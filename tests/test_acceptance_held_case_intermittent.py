@@ -221,7 +221,11 @@ def test_discovery_is_capped_at_ten(leerie, tmp_path):
                        {"acceptance": {"gate": {"final": [res]}}}))
 
 
-def test_discovery_off_keeps_a_passing_first_run(leerie, tmp_path):
+def test_discovery_off_keeps_a_passing_first_run(leerie, tmp_path, capsys):
+    """Discovery the operator turned off is recorded `disabled` — not
+    `discovery_incomplete`, not logged as such, and not listed in the PR's
+    advisory section: nothing stopped short of what was asked (review
+    round 5 L4)."""
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
     marker = tmp_path / "runs"
@@ -229,9 +233,16 @@ def test_discovery_off_keeps_a_passing_first_run(leerie, tmp_path):
     res = _evaluate(leerie, st, repo, [s_],
                     _caps(leerie, acceptance_intermittent_repeats=0))
     assert res["passed"] is True and marker.read_text() == "1"
-    assert res["discovery"]["incomplete"] is True
-    assert res["discovery"]["reason"] == "repeats_disabled"
-    assert res["discovery"]["repeats_run"] == 0
+    d = res["discovery"]
+    assert d["disabled"] is True and d["reason"] == "disabled"
+    assert d["incomplete"] is False
+    assert d["repeats_run"] == 0 and d["repeats_required"] == 0
+    assert "discovery_incomplete" not in capsys.readouterr().out
+    state = {"acceptance": {"gate": {"final": [res]}}}
+    assert not [x for x in leerie._pr_advisory(state)
+                if "Held-out discovery" in x]
+    assert "Held-out discovery" not in leerie._format_pr_end_state_section(
+        state)
 
 
 def test_starved_discovery_is_recorded_and_reaches_the_pr(leerie, tmp_path,

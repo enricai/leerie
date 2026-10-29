@@ -6464,8 +6464,7 @@ def _pr_advisory(state: dict) -> list[str]:
     acc = state.get("acceptance")
     gate = acc.get("gate") if isinstance(acc, dict) else None
     final = gate.get("final") if isinstance(gate, dict) else None
-    why = {"budget_exhausted": "the confirm budget ran out",
-           "repeats_disabled": "acceptance_intermittent_repeats is 0"}
+    why = {"budget_exhausted": "the confirm budget ran out"}
     block("Held-out discovery that did not finish", "acceptance.gate.final",
           [f"- set {_pr_entry(r.get('index'))}: held cases in "
            + ", ".join(_pr_code(f) for f in d.get("files") or [])
@@ -45026,10 +45025,11 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
     records each failing run and is True when a held case failed with no
     resource signature; such a file is not rerun again. Returns `{files,
     repeats_required, repeats_run, budget_exhausted, found[], incomplete,
-    reason}`: `incomplete` when files were still pending after fewer than
-    the required rounds, `reason` why (`budget_exhausted`,
-    `repeats_disabled`) — so a set never rerun is never read as one rerun
-    clean."""
+    reason, disabled?}`: `incomplete` when the budget left files pending
+    after fewer than the required rounds (`reason: budget_exhausted`) — so
+    a set never rerun is never read as one rerun clean; `disabled` (and
+    `reason: disabled`, never incomplete) when the operator set the repeats
+    to 0 (DESIGN §8 *A held case that fails again*, rule 2)."""
     reps = max(0, min(int(caps.get(
         "acceptance_intermittent_repeats",
         DEFAULT_CAPS["acceptance_intermittent_repeats"])),
@@ -45040,7 +45040,8 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
     if not rels:
         return out
     if reps == 0:
-        out.update(incomplete=True, reason="repeats_disabled")
+        # Turned off, not cut short: nothing to report as unfinished.
+        out.update(disabled=True, reason="disabled")
         return out
     clock = clock or time.monotonic
     pending = list(rels)
