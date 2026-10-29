@@ -7019,22 +7019,46 @@ So the diff is a property of the shipping tree, not a side effect of a
 conformer round. Right after the acceptance gate (so detection and the
 re-drive route from the tree they judge) and again immediately before the
 outcome is decided, it is measured again whenever it is missing or of
-another tree than staging's; on the tree it already describes this costs
-nothing. Every row's test-outcome part is then re-read from it, as after a
-re-drive. When the `tests` axis cannot be measured there — the command did
-not run, staging has uncommitted changes, or no test command resolves for
-a run that had a diff — the old diff (if any) is kept and marked stale,
-and the gap is listed under "Needs human verification" ("Regression checks
-the run could not settle") whether or not a required item names the test
-outcome; a run with no test command and no diff has no regression check to
-miss and lists nothing. A final conformance round that breaks before its
-post-measurement still has its pre-measurement: when the tree has not moved
-since, that measurement's failing IDs are confirmed against the base there
-and then, instead of being thrown away. The places HEAD can move after the
+another tree than the one that ships; on the tree it already describes
+this costs nothing. Every row's test-outcome part is then re-read from it,
+as after a re-drive.
+
+The tree that ships is the *committed* one, staging's `HEAD^{tree}`:
+finalize pushes the branch, and nothing uncommitted reaches it. A
+measurement taken in staging itself describes that tree only while staging
+is clean, and the test run alone can make it unclean — `__pycache__/`, a
+coverage file, a JUnit report or a fresh snapshot, in a repository that
+does not ignore them. Review round 8 drove the cost of reading those
+artifacts as "the tree that ships could not be identified": a clean run on
+such a repository listed a regression check it had in fact run, and a run
+whose repair commit fixed a confirmed-new test stayed `unconverged` on a
+tree where the test passes, because the refresh never measured again. So
+the shipping tree is identified by its commit, never by the worktree's
+cleanliness, and when staging holds anything uncommitted the measurement is
+taken in a clean detached checkout of staging's HEAD — the way CI parity
+takes its own — so what is measured is exactly what ships. Untracked files
+never count as a change; uncommitted edits to *tracked* files do not ship
+either, so the diff still describes the committed tree, and they are
+listed under "Needs human verification" for the reviewer to judge whether
+they belonged in the change.
+
+When the `tests` axis cannot be measured on that tree — the command did not
+run, or no test command resolves for a run that had a diff — the old diff
+(if any) is kept and marked stale, and the gap is listed under "Needs human
+verification" ("Regression checks the run could not settle") whether or not
+a required item names the test outcome; a run with no test command and no
+diff has no regression check to miss and lists nothing. A final conformance
+round that breaks before its post-measurement still has its
+pre-measurement: when the committed tree has not moved since and no tracked
+file was edited, that measurement's failing IDs are confirmed against the
+base there and then, instead of being thrown away. The places HEAD can move after the
 diff is measured are the final conformance's own commits and rollbacks
 (each round re-measures, and a round that broke is covered by the pre
 measurement or the refresh), the acceptance gate's repair rounds and
-rollbacks, and the re-drive's groups, rollbacks and leftover commits; the
+rollbacks, and the re-drive's groups, rollbacks and leftover commits (which
+take the group's tracked edits and only the untracked files that appeared
+while it ran — never a measurement's artifact from before it, which would
+otherwise ship in the PR); the
 delivery recheck and detection are read-only on staging (the falsifier works
 in its own checkouts), CI parity runs in its own worktree, and finalize
 only verifies the branch.

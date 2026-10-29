@@ -257,16 +257,21 @@ def test_no_test_command_and_no_diff_lists_nothing(leerie, broken_run,
     assert not st.data.get("needs_human_verification")
 
 
-def test_a_dirty_staging_tree_is_not_measured_and_is_listed(
+def test_an_untracked_file_in_staging_does_not_stop_the_measurement(
         leerie, broken_run):
+    """Review round 8 M1 rewrote this pin: an untracked file never ships,
+    so staging's committed tree is measured (in a clean checkout) and the
+    regression it carries is found; nothing is listed as unmeasured."""
     st, staging = broken_run["st"], broken_run["staging"]
     (staging / "stray.txt").write_text("left behind\n")
     asyncio.run(leerie._refresh_shipping_test_id_diff(
         broken_run["run_dir"], st, broken_run["caps"], label="t"))
-    assert "test_id_diff" not in st.data
-    gap = [e for e in st.data["needs_human_verification"]
-           if e.get("source") == leerie.FINAL_DIFF_GAP_SOURCE]
-    assert len(gap) == 1 and "uncommitted changes" in gap[0]["detail"]
+    diff = st.data["test_id_diff"]
+    assert [x.rsplit(".", 1)[-1] for x in diff["new"]] == ["test_x"]
+    assert diff["tree_sha"] == asyncio.run(
+        leerie._committed_tree_sha(str(staging)))
+    assert not [e for e in st.data.get("needs_human_verification") or []
+                if e.get("source") == leerie.FINAL_DIFF_GAP_SOURCE]
 
 
 def test_a_stale_tree_is_not_measured_twice(leerie, redriven, monkeypatch):

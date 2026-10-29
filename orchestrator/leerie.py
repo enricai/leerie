@@ -38792,6 +38792,38 @@ async def _worktree_tree_sha(tree: str) -> str | None:
     return r.stdout.strip() or None
 
 
+async def _committed_tree_sha(tree: str) -> str | None:
+    """`git rev-parse HEAD^{tree}` for `tree` whatever its worktree holds:
+    the tree that ships (DESIGN §8 *The final diff describes the tree that
+    ships*). Finalize pushes the branch, so nothing uncommitted — least of
+    all a test run's own `__pycache__/` or report file — is part of it.
+    None only when git fails. `_worktree_tree_sha` stays the identity of a
+    *measurement*, where an untracked file can change what a run collects."""
+    r = await run_proc(["git", "rev-parse", "HEAD^{tree}"], cwd=tree)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+async def _tracked_edits(tree: str) -> list[str] | None:
+    """Porcelain lines of `tree`'s uncommitted edits to tracked files
+    (`--untracked-files=no`: an artifact a test run leaves is not an edit),
+    or None when git fails."""
+    r = await run_proc(["git", "status", "--porcelain",
+                        "--untracked-files=no"], cwd=tree)
+    if r.returncode != 0:
+        return None
+    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+async def _unmoved_tree_sha(tree: str) -> str | None:
+    """The committed tree when no tracked file is edited, else None: equal
+    values before and after a step mean the step moved nothing that ships."""
+    if await _tracked_edits(tree) != []:
+        return None
+    return await _committed_tree_sha(tree)
+
+
 def _blt_memo_key(axis: str, cmd: str, tree_sha: str) -> str:
     """Key for one measured axis on one tree.
 
@@ -39850,7 +39882,9 @@ _FINAL_DIFF_SITE = "failing-test-ID diff"
 async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                                        post: dict[str, dict], *,
                                        log_path: Path,
-                                       label: str) -> dict | None:
+                                       label: str,
+                                       tree_sha: str | None = None
+                                       ) -> dict | None:
     """The failing-test-ID diff (E3) for one final-conformance measurement:
     final IDs not failing on the base are candidates, confirmed by B*
     against the base commit. Before the confirm, the import-coupled tests
@@ -39864,7 +39898,9 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     files and the base commit (DESIGN §9 *An intermittent failure the run
     introduced is evidence*), and B*'s base reruns alone decide whether
     the base failed what it finds. Records `final_failing_ids` and the
-    verdict (`test_id_diff`)."""
+    verdict (`test_id_diff`), stamped with `tree_sha` when the caller
+    measured a clean checkout of a known tree, else with `staging`'s
+    `_worktree_tree_sha` (None when anything in it is uncommitted)."""
     base_ids = st.data.get("baseline_failing_ids")
     tests = (post or {}).get("tests") or {}
     if tests.get("scoped_replacement"):
@@ -39885,7 +39921,8 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     id_files = dict(tests.get("failing_id_files") or {})
     # The same candidates on the same tree were already confirmed (a round
     # that committed nothing): a second confirm would only re-measure noise.
-    tree_sha = await _worktree_tree_sha(staging)
+    if tree_sha is None:
+        tree_sha = await _worktree_tree_sha(staging)
     prior = st.data.get("test_id_diff") or {}
     if (tree_sha and prior.get("tree_sha") == tree_sha
             and bool(prior.get("ids_unknown")) == ids_unknown
@@ -42455,7 +42492,7 @@ async def _delivery_judge_unmet(
     test_outcome: list[dict] = []
     confirmed: list[dict] = []
     judge_idx: list[int] = []
-    tid = (_test_outcome_verdict(st, await _worktree_tree_sha(str(staging)))
+    tid = (_test_outcome_verdict(st, await _committed_tree_sha(str(staging)))
            if any(_test_id_diff_item(it) for it in normalized) else None)
     for i, it in enumerate(normalized):
         if it.get("verifiability") == "external":
@@ -50102,7 +50139,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     fitems = progress.get("items") or {}
     rows: list[dict] = []
     unmet_final: list[dict] = []
-    tid = (_test_outcome_verdict(st, await _worktree_tree_sha(str(staging)))
+    tid = (_test_outcome_verdict(st, await _committed_tree_sha(str(staging)))
            if any(_test_id_diff_item(it) for it in normalized) else None)
     unknown_tests: list[str] = []
     for i, it in enumerate(normalized):
@@ -50124,7 +50161,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
             continue
         if tid is None and _test_outcome_parts(it):
             tid = _test_outcome_verdict(
-                st, await _worktree_tree_sha(str(staging)))
+                st, await _committed_tree_sha(str(staging)))
         outcome_parts = _test_outcome_parts(it)
         if (tid is not None and tid["verdict"] == "unknown"
                 and outcome_parts):
@@ -51871,26 +51908,39 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
 async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
                                 log_path: Path, label: str,
                                 log_prefix: str) -> str | None:
-    """Measure the failing-test-ID diff again on staging's tree when it is
-    missing or of another tree (DESIGN §8 *Delivery re-drive*, *The final
-    diff describes the tree that ships*), and return that tree's sha (None
-    when staging has uncommitted changes). Nothing to do when the diff is
-    already of this tree, or when no test command resolves and no diff was
-    ever recorded (no regression check to miss). When the `tests` axis
-    cannot be measured — no command, a dirty tree, an unmeasured run — the
-    old diff is kept, marked `stale_for_tree`, and `_set_final_diff_gap`
-    lists the gap; a tree already tried (`stale_for_tree` is it) is not
-    measured twice."""
+    """Measure the failing-test-ID diff again on the tree that ships when it
+    is missing or of another tree (DESIGN §8 *Delivery re-drive*, *The final
+    diff describes the tree that ships*), and return that tree's sha:
+    staging's committed `HEAD^{tree}` (`_committed_tree_sha`; None only when
+    git fails). Uncommitted files never ship, so they never make the tree
+    unidentifiable: when staging holds any — a test run's own artifacts
+    included — the measurement is taken in a clean detached checkout of its
+    HEAD instead. Nothing to do when the diff is already of this tree, or
+    when no test command resolves and no diff was ever recorded (no
+    regression check to miss). When the `tests` axis cannot be measured —
+    no command, no checkout, an unmeasured run — the old diff is kept,
+    marked `stale_for_tree`, and `_set_final_diff_gap` lists the gap; a tree
+    already tried (`stale_for_tree` is it) is not measured twice. Edits to
+    tracked files staging left uncommitted are listed too: they do not ship."""
     diff = st.data.get("test_id_diff")
     diff = diff if isinstance(diff, dict) else None
     cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"])
            or "").strip()
-    tree_sha = await _worktree_tree_sha(str(staging))
+    tree_sha = await _committed_tree_sha(str(staging))
+    edits = await _tracked_edits(str(staging)) or []
+    edits_note = (
+        "failing-test-ID diff: measured on the committed tree that ships; "
+        f"the staging worktree also holds uncommitted edits to {len(edits)} "
+        "tracked file(s) ("
+        + ", ".join(ln[3:] for ln in edits[:5])
+        + (f", +{len(edits) - 5} more" if len(edits) > 5 else "")
+        + ") that do not ship — check whether they belong in the change."
+        if edits else None)
     if diff is None and not cmd:
         _set_final_diff_gap(st, None)
         return tree_sha
     if tree_sha and diff is not None and diff.get("tree_sha") == tree_sha:
-        _set_final_diff_gap(st, None)
+        _set_final_diff_gap(st, edits_note)
         return tree_sha
     if tree_sha and diff is not None and diff.get("stale_for_tree") == tree_sha:
         return tree_sha
@@ -51899,26 +51949,48 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
     if not cmd:
         why = "no test command resolves for the repository"
     elif not tree_sha:
-        why = ("the staging worktree has uncommitted changes, so the tree "
-               "that ships could not be identified")
+        why = "git could not read the staging worktree's committed tree"
     else:
-        post = await _measure_axes(
-            str(staging), {"tests": cmd}, st, caps, log_path=log_path,
-            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-            label_prefix=label, log_prefix=log_prefix,
-            failing_ids_axes={"tests"})
-        got = await _confirm_final_test_failures(
-            st, caps, str(staging), post, log_path=log_path, label=label)
-        if got is None:
-            summ = str(((post or {}).get("tests") or {}).get("summary")
-                       or "").strip()
-            why = ("the test command did not produce a measurement"
-                   + (f" ({summ[:200]})" if summ else ""))
+        tree, wt = str(staging), None
+        if await _worktree_tree_sha(str(staging)) != tree_sha:
+            # Something uncommitted is in staging: measure exactly what
+            # ships, in a checkout of its HEAD, as CI parity does.
+            wt = _helper_worktree_path(st, "shipping-tree")
+            _remove_acceptance_checkout(st, wt)
+            head = await _branch_head_sha(str(staging))
+            add = (await _worktree_add_detached_async(st, wt, head)
+                   if head else None)
+            if add is None or add.returncode != 0:
+                why = ("a clean checkout of the committed tree that ships "
+                       "could not be created")
+                tree = ""
+            else:
+                tree = str(wt)
+        try:
+            if tree:
+                post = await _measure_axes(
+                    tree, {"tests": cmd}, st, caps, log_path=log_path,
+                    verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                    label_prefix=label, log_prefix=log_prefix,
+                    failing_ids_axes={"tests"})
+                got = await _confirm_final_test_failures(
+                    st, caps, tree, post, log_path=log_path, label=label,
+                    tree_sha=tree_sha)
+                if got is None:
+                    summ = str(((post or {}).get("tests") or {})
+                               .get("summary") or "").strip()
+                    why = ("the test command did not produce a measurement"
+                           + (f" ({summ[:200]})" if summ else ""))
+        finally:
+            if wt is not None:
+                _remove_acceptance_checkout(st, wt)
     if got is None:
+        stale = diff is not None and bool(tree_sha)
         log(f"  {log_prefix}: the failing-test-ID diff could not be measured "
             f"on the tree that ships — {why}"
-            + ("; the old diff is kept, marked stale" if diff else ""))
-        if diff is not None and tree_sha:
+            + ("; the old diff is kept, marked stale" if stale else
+               "; the old diff is kept" if diff is not None else ""))
+        if stale:
             st.data["test_id_diff"] = {**diff, "stale_for_tree": tree_sha}
             st.save()
         _set_final_diff_gap(
@@ -51927,7 +51999,7 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
                 "unknown. Run the tests on the PR branch and compare with "
                 "the base.")
     else:
-        _set_final_diff_gap(st, None)
+        _set_final_diff_gap(st, edits_note)
     return tree_sha
 
 
@@ -51967,10 +52039,24 @@ def _redrive_key_text(key: str) -> str:
     return f"existing test `{key}`"
 
 
-async def _redrive_commit_leftovers(staging: Path, label: str) -> None:
-    st_ = await run_proc(["git", "status", "--porcelain"], cwd=str(staging))
-    if st_.returncode == 0 and st_.stdout.strip():
-        await run_proc(["git", "add", "-A"], cwd=str(staging))
+async def _redrive_commit_leftovers(staging: Path, label: str,
+                                    untracked_before: set[str] | None
+                                    ) -> None:
+    """Commit what a re-drive group's implementer left uncommitted: its
+    tracked edits and the untracked files that appeared while it ran. An
+    untracked file already there before it — a test run's own artifact,
+    left by the re-drive's measurements in a repository that does not
+    ignore it — is not the group's work and must not ship. When git could
+    not list the files before, no untracked file is taken."""
+    now = _untracked_files(staging) or set()
+    new = sorted(now - untracked_before) if untracked_before is not None \
+        else []
+    await run_proc(["git", "add", "-u"], cwd=str(staging))
+    if new:
+        await run_proc(["git", "add", "--", *new], cwd=str(staging))
+    staged = await run_proc(["git", "diff", "--cached", "--quiet"],
+                            cwd=str(staging))
+    if staged.returncode == 1:
         await run_proc(["git", "commit", "-q", "--no-verify", "-m",
                         f"leerie: delivery re-drive leftovers ({label})"],
                        cwd=str(staging))
@@ -52267,13 +52353,15 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 selfcheck_cmd=cmd)
             effort = (EFFORT_REDRIVE_ESCALATION if escalate
                       else efforts.get("implementer"))
+            untracked_before = _untracked_files(staging)
             try:
                 ge["implementer"] = await _redrive_drive(
                     leerie_dir, st, caps, models, staging, members, note,
                     effort=effort, label=f"delivery-redrive-r{rnd}-g{gi}")
             finally:
                 ge["tampered"] = _redrive_unstage(staging, staged)
-            await _redrive_commit_leftovers(staging, f"r{rnd} g{gi}")
+            await _redrive_commit_leftovers(staging, f"r{rnd} g{gi}",
+                                            untracked_before)
             drove = True
             prior_members += [m for m in members if m not in prior_members]
             routed_items |= {n["item_index"] for n in live
@@ -52473,7 +52561,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 leerie_dir, st, caps, models, efforts, staging,
                 sorted(routed_items))
             _redrive_apply_item_verdicts(
-                st, ver, now, await _worktree_tree_sha(str(staging)))
+                st, ver, now, await _committed_tree_sha(str(staging)))
             rechecked_sha = rec["items_rechecked_sha"] = now
             _save()
         if routed_checks and now:
@@ -52490,7 +52578,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                               "redrive-final")
         await _run_ci_parity_final(leerie_dir, st, caps)
         await _redrive_refresh_test_id_diff(leerie_dir, st, caps, staging)
-        final_tree = await _worktree_tree_sha(str(staging))
+        final_tree = await _committed_tree_sha(str(staging))
         if start_items and rechecked_sha != final:
             ver = await _redrive_recheck_items(
                 leerie_dir, st, caps, models, efforts, staging, start_items)
@@ -52639,7 +52727,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
         post_taken = False
-        pre_tree = await _worktree_tree_sha(str(staging))
+        pre_tree = await _unmoved_tree_sha(str(staging))
         pre = await _measure_final(c_round, "pre")
 
         # Build the per-round user prompt. Mirrors _run_conformer's shape
@@ -52854,7 +52942,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                            if open_defects else None)
 
     if (pre is not None and not post_taken and pre_tree
-            and await _worktree_tree_sha(str(staging)) == pre_tree):
+            and await _unmoved_tree_sha(str(staging)) == pre_tree):
         broke = await _confirm_final_test_failures(
             st, caps, str(staging), pre,
             log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",

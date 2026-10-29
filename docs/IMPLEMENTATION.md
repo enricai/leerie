@@ -5156,7 +5156,7 @@ caller of the guard.
 | `_scoped_test_replacement(tree, st, canonical, hit, forbidden, *, log_prefix)` | Replaces a forbidden test command. Before `conformance._baseline.sha` exists it returns the unmeasured record `skip_kind: "scoped_at_final"`. Otherwise it computes `_changed_files(tree, base)`, then `_coupled_test_files(repo, HEAD, changed, globs)`, keeps the coupled files present in `tree`, and renders them with `_acceptance_cmd`. It returns `{command, scoped_replacement: {replaces, forbidden, files, coupled}}`. `_measure_axes` measures that command like any axis (memoised under its own key) and copies `scoped_replacement` onto the result. When no file is coupled (`forbidden_no_coupled_tests`), there is no scoped runner (`forbidden_no_scoped_runner`), or the scoped command is forbidden too (`forbidden_scoped_runner`), it returns an unmeasured record, logs a WARNING and calls `_set_regression_gap`. A successful replacement clears that gap. |
 | `_set_regression_gap(st, detail)` | Keeps at most one `needs_human_verification` entry `{source: "regression_check", detail}` (`REGRESSION_GAP_SOURCE`): set from `detail`, removed on None. `_pr_needs_human` lists it under "Regression checks the run could not settle". |
 | `_acceptance_unmeasured_lines(state)` | Pure. The "Needs human verification" lines for held-out sets the final tree left unmeasured (DESIGN §8 *A held-out set the final tree leaves unmeasured is never silent*): one per unmeasured `acceptance.gate.final` result — `set <k> (<files>): <why>`, from its `unmeasured_reason` / `unmeasured_files` codes through `ACCEPTANCE_UNMEASURED_WHY` (a result recorded before the codes existed reads "no verdict recorded") — one for valid sets with no `gate.final` at all, and one for `gate.final_unremeasured`. Sets typed broken and variant sets (bounded, no counted file) are skipped. `_pr_needs_human` lists them under "Held-out acceptance sets the run could not measure"; never read by `_decide_outcome`. |
-| `_set_final_diff_gap(st, detail)` | Keeps at most one `needs_human_verification` entry `{source: "final_test_diff", detail}` (`FINAL_DIFF_GAP_SOURCE`): set from `detail` by `_refresh_test_id_diff` when the failing-test-ID diff could not be measured on the tree that ships (`"failing-test-ID diff: not measured on the tree that ships — <why>; …"`), removed on None. `_pr_needs_human` lists it under "Regression checks the run could not settle". |
+| `_set_final_diff_gap(st, detail)` | Keeps at most one `needs_human_verification` entry `{source: "final_test_diff", detail}` (`FINAL_DIFF_GAP_SOURCE`): set from `detail` by `_refresh_test_id_diff` when the failing-test-ID diff could not be measured on the committed tree that ships (`"failing-test-ID diff: not measured on the tree that ships — <why>; …"`), or was but staging holds uncommitted tracked edits (`"failing-test-ID diff: measured on the committed tree that ships; the staging worktree also holds uncommitted edits to …"`), removed on None. `_pr_needs_human` lists it under "Regression checks the run could not settle". |
 | `_set_confirm_budget_gap(st, site, what, *, sized_out=(), where="on the final tree", whose="the run", tail="")` | Keeps at most one `needs_human_verification` entry per `site` `{source: "confirm_budget", site, detail}` (`CONFIRM_BUDGET_GAP_SOURCE`): `detail` is `"<site>: could not confirm within the budget: <what> — …"` for the candidates whose reruns the budget cut, and/or `"<site>: not rerun (sized out of the budget): <sized_out> — …"` for those never rerun, joined by `"; "` (each the first 10, then `(+N more)`), then `tail`; removed when both are empty. Sites: `"failing-test-ID diff"` (`_confirm_final_test_failures`, the unsettled candidates' files), `"CI parity"` (`_run_ci_parity_final`, the unsettled check ids) and `"delivery re-drive"` (`_set_redrive_unsettled_gap(st, kept, normalized)`: every kept group's unsettled files from `delivery_redrive.kept_unsettled`, `where="after a re-drive group that was kept"`, `whose="the group"`, the tail naming the items its ratchet left unchecked). `_pr_needs_human` lists it under "Regression checks the run could not settle". |
 | `_coupled_test_files(repo, rev, changed, globs=None, *, direct=False)` | The coupled tests: test file -> the changed production files its import closure reaches, sorted. Changed test files map to themselves (possibly `[]`). With `direct=True`, only test files that import a changed production file themselves count (no walk through other modules), and a changed test file is not coupled by itself: these are the import-coupled tests of the intermittent-regression rule. The closure is a reverse walk over `importers` of `_js_source_graph` and `_py_source_graph` at `rev`. The walk goes through non-test modules and stops at test files (`_is_test_case_file`). It never raises; an unreadable graph is logged and couples nothing. |
 | `_py_source_graph(repo, rev)` | The Python import graph at `rev` (`files`, `imp`, `importers`), cached in `_SOURCE_GRAPHS` under `(repo, "py:" + rev)`. Sources come from `_git_tree_sources(repo, rev, (".py",))`. `_py_module_index` maps every dotted suffix of a path's package parts to it. `_py_imports` reads `import` / `from … import` with `ast`: `from a import b` names `a.b` when that is a module, else `a`, and relative imports resolve against the importer's package. |
@@ -6271,24 +6271,56 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   this run's.
 - The final diff describes the tree that ships (DESIGN §8 *The final diff
   describes the tree that ships*).
+  - The shipping tree is the committed one. `async _committed_tree_sha(tree)
+    -> str | None` is `git rev-parse HEAD^{tree}` (None only when git
+    fails), with no cleanliness check; `async _tracked_edits(tree) ->
+    list[str] | None` is `git status --porcelain --untracked-files=no`'s
+    lines (None when git fails). `_worktree_tree_sha` (None on any
+    porcelain output, untracked files included) stays the identity of a
+    *measurement* — the `_measure_axes` memo key and the `tree_sha`
+    `_confirm_final_test_failures` stamps — because an untracked file can
+    change what a test run collects. Every read of "the tree that ships"
+    uses `_committed_tree_sha`: the refresh below, the test-outcome verdicts
+    of `_delivery_judge_unmet`, `_run_delivery_detection` and the re-drive's item
+    re-checks and tail (`_test_outcome_verdict`, `_redrive_apply_item_verdicts`,
+    `_resettle_test_outcome_rows`).
   - `_run_final_conformance` keeps each round's `pre` measurement and the
-    tree it was taken on (`_worktree_tree_sha` before measuring); when the
-    last round broke before its `post` (WorkerError, timeout, malformed
-    result, protected-path or strict clobber rollback) and staging's tree
-    is still that one, `_confirm_final_test_failures(st, caps, staging,
+    tree it was taken on (`async _unmoved_tree_sha(tree) -> str | None`
+    before measuring: `_committed_tree_sha`, or None when `_tracked_edits`
+    lists any); when the last round broke before its
+    `post` (WorkerError, timeout, malformed result, protected-path or
+    strict clobber rollback) and staging's committed tree is still that one
+    with no tracked edit, `_confirm_final_test_failures(st, caps, staging,
     pre, …, label="final-r<N>-pre")` is called on it, and a non-empty
-    `new` is added to the warnings (`_format_new_failing_ids`).
+    `new` is added to the warnings (`_format_new_failing_ids`). Untracked
+    files — a test run's own `__pycache__/`, coverage or report files — do
+    not count as a move.
   - `async _refresh_test_id_diff(st, caps, staging, *, log_path, label,
-    log_prefix) -> str | None` — returns staging's `_worktree_tree_sha`
-    (None when dirty). Nothing when no `tests` command resolves and no
-    `test_id_diff` was recorded, or the recorded diff's `tree_sha` is that
-    tree (both clear the gap), or its `stale_for_tree` is (already tried;
-    the gap stays). Otherwise, with a command and a clean tree, measures
-    `_measure_axes(staging, {"tests": cmd}, …, failing_ids_axes={"tests"})`
-    and `_confirm_final_test_failures`; when that gives None (or there is no
-    command, or the tree is dirty) an existing diff is kept with
-    `stale_for_tree: <tree sha>` and `_set_final_diff_gap` records why;
-    a measured diff clears the gap.
+    log_prefix) -> str | None` — returns staging's `_committed_tree_sha`.
+    Nothing when no `tests` command resolves and no `test_id_diff` was
+    recorded, or the recorded diff's `tree_sha` is that tree (both set the
+    gap to the tracked-edits note below, or clear it), or its
+    `stale_for_tree` is (already tried; the gap stays). Otherwise, with a
+    command, measures `_measure_axes(tree, {"tests": cmd}, …,
+    failing_ids_axes={"tests"})` and `_confirm_final_test_failures(…,
+    tree_sha=<committed tree>)` on `tree`: staging itself when its
+    `_worktree_tree_sha` is the committed tree (nothing uncommitted, not
+    even untracked), else a disposable detached worktree
+    `worktrees/<run-id[:12]>-shipping-tree` at staging's HEAD
+    (`_worktree_add_detached_async`, removed afterwards; its deps installed
+    by `_measure_axes`). When that gives None (or there is no command, or
+    the checkout could not be created) an existing diff is kept with
+    `stale_for_tree: <tree sha>` — the log line says "marked stale" only
+    when it was — and `_set_final_diff_gap` records why. A measured diff
+    clears the gap, unless `_tracked_edits(staging)` lists any: then the
+    gap reads `"failing-test-ID diff: measured on the committed tree that
+    ships; the staging worktree also holds uncommitted edits to <N> tracked
+    file(s) (<first 5>) that do not ship — …"`.
+  - `_redrive_commit_leftovers(staging, label, untracked_before)` commits a
+    group's leftovers: `git add -u` plus the untracked files
+    (`_untracked_files`) not in `untracked_before`, the set taken just
+    before the group's implementer ran, so an artifact of the re-drive's own
+    earlier measurements is never committed to the branch that ships.
   - `async _refresh_shipping_test_id_diff(leerie_dir, st, caps, *, label)`
     — on `worktrees/staging` (nothing when absent): `_refresh_test_id_diff`
     with `log_prefix="phase 5"`, then `_resettle_test_outcome_rows(st,
