@@ -6109,7 +6109,12 @@ than re-running once.
   gate — `gate` is `_CONFIRM_NO_BUDGET_GATE`, `skipped: "no budget"` — and
   no rerun). Signature adds `intermittent: Iterable[str] = ()` and
   `prior_gate: dict | None = None` (a sized confirm's later pass: that gate
-  is used, and its pair count, instead of waiting again). Returns
+  is used, and its pair count, instead of waiting again), `max_pairs: int |
+  None = None` (stop after that many finished pairs while fewer than `k`
+  are done: `paused: true`, `budget_exhausted: true`, and the finished
+  pairs in `_resume: {base, final}`) and `resume: dict | None = None` (a
+  `_resume` to continue: its pairs count, at most `k` minus them run).
+  Returns
   `{candidates, new, pre_existing, no_verdict, resource_affected,
   budget_short, budget_short_unsettled, pairs_required, pairs_run,
   budget_exhausted, gate, budget_used_sec, per_id: {id: {final_failed,
@@ -6248,9 +6253,16 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   after the passes' `budget_used_sec`, the next pass reruns
   `_confirm_select(remaining, …, budget=left, first_always=False)`'s
   chosen with `confirm_budget_sec = left` and the first pass's gate
-  (`prior_gate`), stopping when none is chosen. `confirm(units,
-  candidates, pass_caps, gate)` is the caller's one `_confirm_new_failures`
-  over those units' files. `_merge_confirm_passes(passes)` joins them
+  (`prior_gate`), stopping when none is chosen. When pass 1's
+  `sized_out` is non-empty, each of these passes runs with
+  `max_pairs=1`; afterwards each pass left `paused`, in order, is
+  continued with `resume=` its `_resume` and `confirm_budget_sec` the
+  budget left (while at least 1 s is), replacing its verdict
+  (`budget_used_sec` the sum of both calls); `_resume` and `paused` are
+  dropped before the merge. `confirm(units, candidates, pass_caps, gate,
+  **pairs)` is the caller's one `_confirm_new_failures` over those units'
+  files, `pairs` forwarded to it (`max_pairs` / `resume`;
+  `_ci_confirm_chosen(…, **pairs)` likewise). `_merge_confirm_passes(passes)` joins them
   (lists the union, `per_id` merged, the first gate and `pairs_required`,
   `pairs_run` the fewest, `budget_exhausted` any; with more than one pass,
   `passes[{candidates, pairs_run, budget_exhausted}]`, and each `per_id`

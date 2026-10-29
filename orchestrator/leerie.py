@@ -39287,7 +39287,8 @@ async def _confirm_new_failures(
         read_psi: Callable[[], float | None] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         clock: Callable[[], float] | None = None,
-        prior_gate: dict | None = None) -> dict:
+        prior_gate: dict | None = None, max_pairs: int | None = None,
+        resume: dict | None = None) -> dict:
     """B*: decide which `candidates` (IDs failing on the final tree and not
     on the base) are NEW. Gate on host pressure, then rerun interleaved
     base/final pairs — `confirm_pairs`, or `confirm_pairs_escalated` when the
@@ -39315,6 +39316,12 @@ async def _confirm_new_failures(
     `prior_gate`: a later pass of one sized confirm (`_confirm_sized`)
     reuses the first pass's gate — and its pair count — instead of waiting
     again. `budget_used_sec`: the budget clock's reading at the end.
+
+    `max_pairs`: stop after that many finished pairs while fewer than `k`
+    are done (`paused`, and `budget_exhausted` — the budget, given to other
+    units first, is what kept it short; step 4 decides it as is). Its pairs
+    are returned in `_resume`, which a later call with `resume=` (and the
+    same gate) continues from, so its verdict is over every pair.
 
     Frozen from Q9 (held-out, 124 trials): 0/88 clean trials called new,
     36/36 reverted fixes detected."""
@@ -39346,8 +39353,11 @@ async def _confirm_new_failures(
                 if gate["timed_out"] else
                 caps.get("confirm_pairs", DEFAULT_CAPS["confirm_pairs"]))
         out["pairs_required"] = k
-        base_runs: list[set[str] | None] = []
-        final_runs: list[set[str] | None] = []
+        base_runs: list[set[str] | None] = list(
+            (resume or {}).get("base") or [])
+        final_runs: list[set[str] | None] = list(
+            (resume or {}).get("final") or [])
+        paused = False
         # The base side of a pair the budget cut, as far as it finished: it
         # can only refute `new`, never make a pair.
         cut_base: set[str] = set()
@@ -39355,7 +39365,10 @@ async def _confirm_new_failures(
         # The cut pair's base rerun ended with no verdict before the budget
         # did: a no-verdict run, not part of the cut (step 4).
         cut_pair_no_verdict = False
-        for _ in range(k):
+        for n_new in range(max(0, k - len(base_runs))):
+            if max_pairs is not None and n_new >= max_pairs:
+                paused = True
+                break
             pair: list[set[str] | None] = []
             cut = False
             for runner in (run_base, run_final):
@@ -39387,6 +39400,10 @@ async def _confirm_new_failures(
                 break
             base_runs.append(pair[0])
             final_runs.append(pair[1])
+        if paused:
+            out.update(paused=True, budget_exhausted=True,
+                       _resume={"base": list(base_runs),
+                                "final": list(final_runs)})
         out["pairs_run"] = len(base_runs)
         out["budget_used_sec"] = round(clock() - t0, 3)
         complete = (len(base_runs) == k
@@ -39495,8 +39512,7 @@ def _merge_confirm_passes(passes: list[dict]) -> dict:
 async def _confirm_sized(
         cand_unit: dict[str, str], durations: dict[str, float], *,
         rank: dict[str, int], caps: dict, overhead: float, label: str,
-        confirm: Callable[[list[str], list[str], dict, dict | None],
-                          Awaitable[dict]]) -> dict:
+        confirm: Callable[..., Awaitable[dict]]) -> dict:
     """A base-paired B* confirm over candidates grouped in rerun units (test
     files, CI checks), sized to `confirm_budget_sec` (DESIGN §9 *Which
     failures are new*, step 2). The first pass reruns the units
@@ -39505,11 +39521,16 @@ async def _confirm_sized(
     pass reruns, with the budget the passes before it left, the units still
     out that one pair of fits (the final run's failures first, then the
     shortest), until none is left or none fits — so no unit is skipped
-    while one pair of it fits what remains. `confirm(units, candidates,
-    pass_caps, gate)` runs one `_confirm_new_failures` (`gate`: None for
-    the first pass, then its gate, so no later pass waits again). A unit
-    never rerun is sized out: its candidates are `budget_short_unsettled`
-    and listed in `sized_out` (the units in `sized_out_units`)."""
+    while one pair of it fits what remains. When the first pass leaves a
+    unit out, every unit gets one pair before any gets a second: each pass
+    stops after one pair (`max_pairs=1`), and once no left-out unit fits,
+    each pass in order continues to its `k` pairs (`resume=`) with what is
+    left. `confirm(units, candidates, pass_caps, gate, **pairs)` runs one
+    `_confirm_new_failures` (`gate`: None for the first pass, then its
+    gate, so no later pass waits again; `pairs`: its `max_pairs` /
+    `resume`). A unit never rerun is sized out: its candidates are
+    `budget_short_unsettled` and listed in `sized_out` (the units in
+    `sized_out_units`)."""
     budget = float(caps.get("confirm_budget_sec",
                             DEFAULT_CAPS["confirm_budget_sec"]))
 
@@ -39519,8 +39540,12 @@ async def _confirm_sized(
     sel = _confirm_select(sorted(set(cand_unit.values())), durations,
                           rank=rank, reps=2, budget=budget,
                           overhead=overhead)
+    # Breadth first only when a unit waits: a first pass that holds every
+    # unit spends its whole budget on its own pairs, as before.
+    one = {"max_pairs": 1} if sel["sized_out"] else {}
+    units_of = [list(sel["chosen"])]
     passes = [await confirm(sel["chosen"], cands_of(sel["chosen"]), caps,
-                            None)]
+                            None, **one)]
     gate = passes[0].get("gate")
     used = float(passes[0].get("budget_used_sec") or 0.0)
     left_units = list(sel["sized_out"])
@@ -39535,10 +39560,31 @@ async def _confirm_sized(
             f"rerunning {len(sel['chosen'])} unit(s) sized out of the first "
             "pass: " + ", ".join(sel["chosen"][:5]))
         v = await confirm(sel["chosen"], cands_of(sel["chosen"]),
-                          {**caps, "confirm_budget_sec": left}, gate)
+                          {**caps, "confirm_budget_sec": left}, gate, **one)
         passes.append(v)
+        units_of.append(list(sel["chosen"]))
         used += float(v.get("budget_used_sec") or left)
         left_units = list(sel["sized_out"])
+    for i, v in enumerate(passes):
+        # Every unit that fits has had its pair: the budget left goes to
+        # the further pairs, in pass order (the final run's failures first).
+        if not v.get("paused") or budget - used < 1.0:
+            continue
+        left = budget - used
+        log(f"  B* {label}: {round(left)}s of the confirm budget left — "
+            f"continuing the pairs of {len(units_of[i])} unit(s): "
+            + ", ".join(units_of[i][:5]))
+        v2 = await confirm(units_of[i], cands_of(units_of[i]),
+                           {**caps, "confirm_budget_sec": left}, gate,
+                           resume=v.get("_resume"))
+        step = float(v2.get("budget_used_sec") or left)
+        used += step
+        v2["budget_used_sec"] = round(
+            float(v.get("budget_used_sec") or 0.0) + step, 3)
+        passes[i] = v2
+    for v in passes:
+        v.pop("_resume", None)
+        v.pop("paused", None)
     verdict = _merge_confirm_passes(passes)
     if left_units:
         out_c = cands_of(left_units)
@@ -40023,12 +40069,13 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
             # discovery repeat) and not on the base list — which is empty
             # for a scoped command, so a shortfall needs a finished pair.
             async def _pass(units: list[str] | None, cands: list[str],
-                            pcaps: dict, gate: dict | None) -> dict:
+                            pcaps: dict, gate: dict | None,
+                            **pairs: object) -> dict:
                 return await _confirm_new_failures(
                     cands, _runner_for(str(wt), "base", units),
                     _runner_for(staging, "final", units), pcaps,
                     label=label, seen_failing=True, intermittent=weak,
-                    prior_gate=gate)
+                    prior_gate=gate, **pairs)
             if rerun_files:
                 verdict = await _confirm_sized(
                     {c: id_files[c] for c in all_cand},
@@ -41333,10 +41380,10 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
     by_id = {r["id"]: r for r in recs}
 
     async def _pass(units: list[str], cands: list[str], pcaps: dict,
-                    gate: dict | None) -> dict:
+                    gate: dict | None, **pairs: object) -> dict:
         return await _ci_confirm_chosen(st, pcaps, base_sha, final_tree,
                                         [by_id[i] for i in units],
-                                        prior_gate=gate)
+                                        prior_gate=gate, **pairs)
     return await _confirm_sized(
         {r["id"]: r["id"] for r in recs}, dict(durations or {}), rank={},
         caps=caps, overhead=0.0, label="ci parity", confirm=_pass)
@@ -41344,8 +41391,10 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
 
 async def _ci_confirm_chosen(st: "State", caps: dict, base_sha: str,
                              final_tree: Path, recs: list[dict], *,
-                             prior_gate: dict | None = None) -> dict:
-    """`_ci_confirm_red`'s confirm over the checks it chose, in order."""
+                             prior_gate: dict | None = None,
+                             **pairs: object) -> dict:
+    """`_ci_confirm_red`'s confirm over the checks it chose, in order
+    (`pairs`: `_confirm_sized`'s `max_pairs` / `resume`)."""
     cand = [r["id"] for r in recs]
     base_wt = (await _ci_worktree(st, "ci-confirm-base", base_sha)
                if base_sha else None)
@@ -41356,7 +41405,7 @@ async def _ci_confirm_chosen(st: "State", caps: dict, base_sha: str,
     if base_wt is None:
         return await _confirm_new_failures(cand, _none, _none, caps,
                                            label="ci parity",
-                                           prior_gate=prior_gate)
+                                           prior_gate=prior_gate, **pairs)
     n = {"i": 0}
 
     def _runner(tree: Path, side: str):
@@ -41392,7 +41441,7 @@ async def _ci_confirm_chosen(st: "State", caps: dict, base_sha: str,
         return await _confirm_new_failures(
             cand, _runner(base_wt, "base"), _runner(final_tree, "final"),
             caps, label="ci parity", seen_failing=True,
-            prior_gate=prior_gate)
+            prior_gate=prior_gate, **pairs)
     finally:
         _ci_teardown(st, base_wt)
 
@@ -50736,12 +50785,13 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
                 return _run
 
             async def _pass(units: list[str] | None, cands: list[str],
-                            pcaps: dict, gate: dict | None) -> dict:
+                            pcaps: dict, gate: dict | None,
+                            **pairs: object) -> dict:
                 return await _confirm_new_failures(
                     cands, _runner(str(wt), "base", units),
                     _runner(str(staging), "final", units),
                     pcaps, label=label, seen_failing=True,
-                    intermittent=sorted(weak), prior_gate=gate)
+                    intermittent=sorted(weak), prior_gate=gate, **pairs)
             if rerun:
                 verdict = await _confirm_sized(
                     {c: id_files[c] for c in cand},

@@ -10218,6 +10218,30 @@ failure new / does this set still fail" verdict uses:
    6 = 1980 > 1800, on every measurement — detection, each re-drive group,
    the refresh — so the regression was never new and the run ended `done`
    with about 1600 s of the budget unused; alone, two of its pairs fit.
+
+   *One pair for every file before a second for any.* Sizing alone still
+   let the first pass spend all `k` of its pairs before a file it left out
+   got its first (review round 8 L3): the estimate decides which files
+   share a pass, but what a pass actually costs is only known once it ran,
+   and a first pass that ran faster than its files' recorded durations
+   spent the difference on its own second and third pairs. So when the
+   first pass leaves a file out, every pass stops after one finished pair
+   while files are still waiting, and only when no left-out file fits what
+   remains does each pass, in the same order, continue to its `k` pairs
+   with the budget left — the pairs it already finished counted, so its
+   verdict is over all of them. A pass that stopped at one pair and never
+   continued is a budget shortfall (step 4): the budget kept it from `k`,
+   whichever file it went to. Driven with a 300 s flake file and a 600 s
+   regression file whose flake file reran in 100 s: the first pass spent
+   660 s on three pairs and left 1140 s, short of the regression file's
+   one pair (1220 s), which was never rerun; stopping at one pair (220 s)
+   leaves 1580 s, and the regression is rerun and confirmed new. When the
+   estimates are right, a file the first pass left out can never get its
+   pair after the first pass's one pair either — the start-up is paid once
+   more by the extra pass — so on the reviewer's own durations the
+   regression file stays sized out, by arithmetic, under any order: (300 +
+   600 + 10) × 2 = 1820 and (300 + 10) × 2 + (600 + 10) × 2 = 1840 both
+   exceed 1800.
 3. *Verdict.* An ID is **new** only if it failed on every final rerun and
    passed on every base rerun. An ID that failed on every one of the `k`
    base reruns, each of which produced a report, is **`pre_existing`**: the
@@ -10356,7 +10380,9 @@ failure new / does this set still fail" verdict uses:
    0.3, 0.5 — the price of counting a real regression whose pairs the
    budget cuts after the first. Sizing for one pair (step 2) reaches this
    regime by design, not only under load: files packed into one rerun so
-   that one pair fits but not `k` get fewer than `k` pairs. That is the
+   that one pair fits but not `k` get fewer than `k` pairs, and a pass
+   held at one pair while left-out files took their first (review round 8)
+   rests on that one pair when nothing is left to continue it. That is the
    trade review round 7 chose — a real regression in such a file is new,
    where sizing for `k` left it unsettled on every measurement. The cost lands when the total
    serial rerun time of all the candidate files outgrows the budget, and

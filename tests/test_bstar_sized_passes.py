@@ -140,7 +140,7 @@ def test_the_budget_a_pass_leaves_goes_to_the_files_it_left_out(
 def _fake_confirm(used_per_pass: list[float]):
     calls: list = []
 
-    async def confirm(units, cands, pcaps, gate):
+    async def confirm(units, cands, pcaps, gate, **_pairs):
         i = len(calls)
         calls.append({"units": list(units), "cands": list(cands),
                       "budget": pcaps["confirm_budget_sec"], "gate": gate})
