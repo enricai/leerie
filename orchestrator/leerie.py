@@ -39080,17 +39080,20 @@ def _read_produced(tree: str | Path) -> dict[str, list]:
 
 def _note_produced(tree: str | Path, before: dict[str, list[int]],
                    after: dict[str, list[int]]) -> None:
-    """Record what one of leerie's own commands left untracked in `tree`,
-    by first producer (DESIGN §6½): every path that appeared while it ran,
-    plus every path already recorded that still exists, at its new
-    signature. A file a worker made stays the worker's even when leerie's
-    command rewrites it; a file leerie's command made stays leerie's even
-    when a worker's re-run of a test command rewrites it (review round 11
-    M2: dropping it emptied the record of every later measurement). A path
-    that is gone leaves the record."""
+    """Record what one of leerie's own commands left untracked in `tree`
+    (DESIGN §6½): membership by first producer — every path that appeared
+    while it ran, plus every path already recorded that still exists; a file
+    a worker made stays the worker's even when leerie's command rewrites it,
+    and a file leerie's command made stays leerie's even when a worker's
+    re-run of a test command rewrites it (review round 11 M2). The
+    signature kept is the one leerie last wrote: a path the command
+    appeared or rewrote takes its new signature, a recorded path it left
+    alone keeps the recorded one, so a worker's rewrite in between stays
+    visible to `_leerie_last_wrote` (review round 12 M2). A path that is
+    gone leaves the record."""
     rec = _read_produced(tree)
-    new = {p: sig for p, sig in after.items()
-           if p not in before or p in rec}
+    new = {p: (sig if p not in before or before[p] != sig else rec[p])
+           for p, sig in after.items() if p not in before or p in rec}
     if new == rec:
         return
     path = _produced_record_path(tree)
@@ -39110,6 +39113,17 @@ def _leerie_produced(tree: str | Path,
     worker's, made through a tool call or through any shell command."""
     rec = _read_produced(tree)
     return {p for p in sigs if p in rec}
+
+
+def _leerie_last_wrote(tree: str | Path,
+                       sigs: dict[str, list[int]]) -> set[str]:
+    """The paths of `sigs` whose content is what one of leerie's own
+    commands last wrote: recorded, at the recorded signature (DESIGN §6½,
+    last writer). A recorded file a worker rewrote since is not, until a
+    leerie command rewrites it again."""
+    rec = _read_produced(tree)
+    return {p for p, sig in sigs.items()
+            if p in rec and list(rec[p]) == list(sig)}
 
 
 @contextlib.asynccontextmanager
@@ -39174,19 +39188,21 @@ async def _measured_tree_sha(tree: str) -> str | None:
     """The committed tree a measurement just taken in `tree` describes, or
     None when it describes something else (DESIGN §8 *The final diff
     describes the tree that ships*): `_unmoved_tree_sha` — no tracked file
-    edited — and every untracked file one leerie's own commands produced
-    (`_leerie_produced`): a test run's `__pycache__/`, coverage, reports,
-    which never ship and are not the change. Any other untracked file — one
-    a worker made, through a Write tool call or a heredoc, `mv` or
-    generator alike — was collected by the measurement and does not ship,
-    so then the clean checkout is measured instead (review round 10 H1)."""
+    edited — and every untracked file holds what one of leerie's own
+    commands last wrote (`_leerie_last_wrote`): a test run's `__pycache__/`,
+    coverage, reports, which never ship and are not the change. Any other
+    untracked file — one a worker made, through a Write tool call or a
+    heredoc, `mv` or generator alike, or a generated file a worker rewrote
+    since leerie's command wrote it (review round 12 M2) — was read by the
+    measurement and does not ship as it is, so then the clean checkout is
+    measured instead (review round 10 H1)."""
     sha = await _unmoved_tree_sha(tree)
     if sha is None:
         return None
     sigs = await asyncio.to_thread(_untracked_signatures, tree)
     if sigs is None:
         return None
-    if set(sigs) - await asyncio.to_thread(_leerie_produced, tree, sigs):
+    if set(sigs) - await asyncio.to_thread(_leerie_last_wrote, tree, sigs):
         return None
     return sha
 
@@ -53109,8 +53125,9 @@ def _leftover_artifact(staging: Path, rel: str) -> bool:
 def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
     """The "Needs human verification" entry for what kept re-drive groups
     left uncommitted that the leftovers commit withheld (`leftovers_withheld`
-    of every group not rolled back): a whole over-cap set and the files
-    removed for holding a span of a staged set's source, by path. An
+    of every group not rolled back): a whole over-cap set, the files a
+    leerie command generated that the implementer then edited, and the
+    files removed for holding a span of a staged set's source, by path. An
     artifact shape (`_leftover_artifact`) is never listed — no reviewer has
     anything to decide about a `.pyc` (review round 12 M1); the leftovers
     commit logs it. Cleared when there is none."""
@@ -53119,6 +53136,7 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
         return
     over: list[str] = []
     copies: list[str] = []
+    gen: list[str] = []
     for r in rec.get("rounds") or []:
         for g in r.get("groups") or []:
             w = g.get("leftovers_withheld") if isinstance(g, dict) else None
@@ -53126,6 +53144,8 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
                 continue
             over += [p for p in w.get("over_cap") or [] if p not in over]
             copies += [p for p in w.get("heldout") or [] if p not in copies]
+            gen += [p for p in w.get("generated_edited") or []
+                    if p not in gen]
     entries = [e for e in (data.get("needs_human_verification") or [])
                if not (isinstance(e, dict) and e.get("source")
                        == _REDRIVE_LEFTOVERS_GAP_SOURCE)]
@@ -53137,6 +53157,9 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
     if over:
         parts.append(f"over the leftovers cap, nothing committed: "
                      f"{shown(over)}")
+    if gen:
+        parts.append("generated by leerie's own command, then edited by the "
+                     f"implementer, not committed: {shown(gen)}")
     if copies:
         parts.append("removed for holding lines of a hidden test's source "
                      f"(a tracked one put back as HEAD has it): "
@@ -53226,6 +53249,19 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
             moved -= set(tainted)
             written = set(written) - set(tainted)
     produced = await asyncio.to_thread(_leerie_produced, staging, sigs)
+    # First producer keeps a generated file out of the commit; one the
+    # group changed and no leerie command wrote last is listed (DESIGN §6½,
+    # review round 12 M2): the edit may be what the fix rests on.
+    last = await asyncio.to_thread(_leerie_last_wrote, staging, sigs)
+    edited = sorted(p for p in (produced & moved) - last
+                    if not _leftover_artifact(staging, p))
+    if edited:
+        log(f"  delivery re-drive ({label}): {len(edited)} file(s) a leerie "
+            "command generated and the group then changed, not committed: "
+            + ", ".join(edited[:5])
+            + (f" (+{len(edited) - 5} more)" if len(edited) > 5 else ""))
+        if withheld is not None:
+            withheld.setdefault("generated_edited", []).extend(edited)
     untracked = sorted(((moved - produced) | (set(sigs) & set(written))))
     shaped = [p for p in untracked if _leftover_artifact(staging, p)]
     if shaped:
@@ -53590,7 +53626,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             if left:
                 ge["leftovers"] = left[:20]
             kept_out = {k: v[:200] for k in ("artifacts", "over_cap",
-                                             "heldout")
+                                             "heldout", "generated_edited")
                         if (v := withheld.get(k))}
             if kept_out:
                 ge["leftovers_withheld"] = kept_out
@@ -53783,6 +53819,22 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                     {"fixed": fa, "tracked_test": fb,
                                      "file": f, "round": rnd})
                         log(f"  WARNING: {reason}")
+            gen = (ge.get("leftovers_withheld") or {}).get(
+                "generated_edited")
+            if gen and not ge.get("rolled_back"):
+                # The group's own measurements are leerie commands: a file
+                # one of them wrote again is leerie's again (last writer).
+                now_sigs = await asyncio.to_thread(_untracked_signatures,
+                                                   staging) or {}
+                lw = await asyncio.to_thread(_leerie_last_wrote, staging,
+                                             now_sigs)
+                gen = [p for p in gen if p in now_sigs and p not in lw]
+                if gen:
+                    ge["leftovers_withheld"]["generated_edited"] = gen
+                else:
+                    del ge["leftovers_withheld"]["generated_edited"]
+                    if not ge["leftovers_withheld"]:
+                        del ge["leftovers_withheld"]
             if not ge.get("rolled_back"):
                 rec["defects_driven"] += [
                     n["key"] for n in live if n["kind"] == "solution_defect"

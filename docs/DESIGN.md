@@ -5189,6 +5189,30 @@ untracked file is a worker's. A file a command leerie does not bracket
 produced is then a worker's too, which costs a measurement (below),
 never a wrong verdict.
 
+The record answers two different questions, and each has one invariant.
+*Is this untracked file part of the change?* — a file leerie's own
+command created never is, and a file that existed before it never
+becomes leerie's: that is first producer, above, and the re-drive's
+leftovers commit reads it. *Does a measurement taken in this tree describe
+the committed tree?* — only when every untracked file in it holds what a
+leerie command last wrote: that is last writer, and `_measured_tree_sha`
+reads it. The record keeps, per path, the signature leerie's command left;
+a later command that rewrites the path takes it back at the new
+signature, one that leaves the path alone keeps the old one, so a worker's
+rewrite in between shows as a signature that differs. Review round 12 M2
+drove why the two cannot share one predicate: leerie's install ran the
+repository's codegen into an unignored `gen.py`, the worker rewrote it
+through Bash to the value its fix rests on, and first producer called the
+measurement of that tree the committed one (a green result describing
+content that does not ship) while the leftovers commit dropped the edit
+with no line anywhere. Under the split, that measurement is of an
+uncommitted tree, and the leftovers commit lists the file (it still never
+commits a generated file — it was not the change until the worker made it
+one, and the reviewer decides). Last writer keeps round 11's case: the
+final measurement is itself a leerie command that rewrites `coverage/` and
+`junit.xml` again, so a conformer's earlier re-run of the tests is
+overwritten by the time the measurement is stamped.
+
 Three details keep the snapshot itself sound. Only the snapshot taken
 before a command writes its blobs to the object store, since only those
 bytes are ever written back; every other snapshot is only compared
@@ -7305,6 +7329,11 @@ logged only, since there is nothing for a reviewer to decide about it.
   leerie's own commands stays leerie's when the implementer's re-run of a
   command rewrites it (§6½), so the reports, coverage and dependency tree
   leerie's install and measurements made are never the implementer's.
+  It is not committed; but when the group changed it and no leerie command
+  wrote it last by the end of the group — the group's own measurements
+  run the repository's commands again, so a re-run's report is leerie's
+  again by then — it is listed by path, since a worker's edit of a
+  generated file can be what the fix rests on (review round 12 M2).
 - *Artifact shapes no repository wants committed.* An untracked file whose
   name is one of a short, fixed list is withheld: bytecode (`*.pyc`,
   `*.pyo`), editor swap and backup files (`*.swp`, `*.swo`, `*~`, `.#*`,

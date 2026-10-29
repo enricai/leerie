@@ -489,3 +489,83 @@ def test_the_record_holds_only_what_leerie_commands_produced(leerie,
     (t / "r.txt").write_text("r")
     assert "r.txt" not in leerie._leerie_produced(
         t, leerie._untracked_signatures(t))
+
+
+def test_a_workers_edit_of_a_generated_file_is_not_leeries(leerie,
+                                                           tmp_path):
+    """Review round 12 M2, the reviewer's driver
+    (`test_zz_r12_first_producer.py`, asserting the defect on b40117f):
+    leerie's install runs the repository's codegen into an unignored
+    `gen.py`, and the worker rewrites it through Bash to the value its fix
+    rests on. First producer alone stamped a measurement of that tree as
+    HEAD's and dropped the edit from the leftovers with no line. The
+    record now answers the two questions apart (DESIGN §6½): `gen.py` is
+    still not part of the change (membership), but the worker wrote it
+    last, so a measurement here is not of the committed tree, and the
+    leftovers commit lists it."""
+    t = _tree(tmp_path, {"mod.py": "from gen import V\n"})
+
+    async def cmd(argv):
+        async with leerie._leaves_tracked_files(t, "build", "t"):
+            subprocess.run(argv, cwd=t, check=True)
+    asyncio.run(cmd(["sh", "-c", "echo 'V = 1' > gen.py"]))
+    head_tree = _git(t, "rev-parse", "HEAD^{tree}")
+    assert asyncio.run(leerie._measured_tree_sha(str(t))) == head_tree
+    before = (leerie._tracked_content(t), leerie._untracked_signatures(t))
+    subprocess.run(["sh", "-c", "echo 'V = 2  # the fix' > gen.py"], cwd=t,
+                   check=True)
+    assert asyncio.run(leerie._measured_tree_sha(str(t))) is None
+    withheld: dict = {}
+    got = asyncio.run(leerie._redrive_commit_leftovers(
+        t, "r1 g0", *before, set(), withheld=withheld))
+    assert got == [] and withheld == {"generated_edited": ["gen.py"]}
+    # A later leerie command that leaves it alone does not adopt the edit;
+    # membership is unchanged either way.
+    asyncio.run(cmd(["true"]))
+    sigs = leerie._untracked_signatures(t)
+    assert leerie._leerie_produced(t, sigs) == {"gen.py"}
+    assert leerie._leerie_last_wrote(t, sigs) == set()
+    assert asyncio.run(leerie._measured_tree_sha(str(t))) is None
+    # One that writes it again makes leerie the last writer again.
+    asyncio.run(cmd(["sh", "-c", "echo 'V = 1' > gen.py"]))
+    sigs = leerie._untracked_signatures(t)
+    assert leerie._leerie_last_wrote(t, sigs) == {"gen.py"}
+    assert asyncio.run(leerie._measured_tree_sha(str(t))) == head_tree
+
+
+def test_a_rerun_report_rewritten_by_the_groups_measurement_is_not_listed(
+        leerie, tmp_path, monkeypatch):
+    """End to end: leerie's install generated `gen.py` and its test run
+    `junit.xml` in staging; the re-drive implementer re-runs the tests
+    (rewriting `junit.xml`), edits `gen.py` and fixes the defect. The
+    group's own measurement — a leerie command — writes `junit.xml` again,
+    so only `gen.py` is listed, and the round-11 M2 case (a worker's re-run
+    of the tests) stays silent."""
+    from test_delivery_redrive import World
+    w = World(leerie, tmp_path)
+    w.install(monkeypatch)
+    s = w.staging
+
+    async def leerie_cmd(body: str) -> None:
+        async with leerie._leaves_tracked_files(s, "test run", "t"):
+            subprocess.run(["sh", "-c", body], cwd=s, check=True)
+    asyncio.run(leerie_cmd("echo 'V = 1' > gen.py; echo '<a/>' > junit.xml"))
+
+    async def ids(*a, **k):
+        await leerie_cmd("echo '<measured/>' > junit.xml")
+        return None
+    monkeypatch.setattr(leerie, "_redrive_test_ids", ids)
+
+    def fix(w):
+        (s / "junit.xml").write_text("<worker/>")
+        (s / "gen.py").write_text("V = 2  # the fix\n")
+        w.write("export const a = 1; // FIXED\n")
+    w.edits = [fix]
+    w.run()
+    g = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
+    assert not g.get("rolled_back") and "FIXED" in w.a_text("HEAD")
+    assert g["leftovers_withheld"] == {"generated_edited": ["gen.py"]}
+    (e,) = [e for e in w.st.data["needs_human_verification"]
+            if e.get("source") == "redrive_leftovers"]
+    assert "then edited by the implementer" in e["detail"]
+    assert "gen.py" in e["detail"] and "junit.xml" not in e["detail"]
