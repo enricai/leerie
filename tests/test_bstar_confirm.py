@@ -211,11 +211,16 @@ def test_still_failing_splits_no_verdict(leerie):
 
 def test_pre_existing_reaches_the_judge_record_apart_from_new(leerie,
                                                               tmp_path):
+    from tests.stub_helpers import _delivery_tree
+    staging = _delivery_tree(tmp_path / "staging")
+    tree = subprocess.run(["git", "-C", str(staging), "rev-parse",
+                           "HEAD^{tree}"], capture_output=True, text=True,
+                          check=True).stdout.strip()
     st = leerie.State(tmp_path / "s", "r")
     st.data = {"test_id_diff": {"candidates": ["a", "b"], "new": ["t :: a"],
                                 "pre_existing": ["t :: b"],
-                                "resource_affected": []}}
-    lines = leerie._orchestrator_results_digest(st).splitlines()
+                                "resource_affected": [], "tree_sha": tree}}
+    lines = leerie._orchestrator_results_digest(st, staging).splitlines()
     assert lines == [
         "[orchestrator B* failing-test diff] tests newly failing on the "
         "final tree, confirmed against the base: t :: a",

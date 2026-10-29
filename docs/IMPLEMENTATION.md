@@ -6354,10 +6354,13 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     leerie's own commands put back what they rewrite
     (`_leaves_tracked_files`, below).
   - Post-execution readers (DESIGN §8 *Every post-execution verdict is of
-    the committed tree*): no code change — `_verify_delivery_cite` reads
+    the committed tree*): `_verify_delivery_cite` reads
     `git show HEAD:<rel>` / `git grep … HEAD`, `_d1_untouched_verdict`
     `git diff <own_start>..HEAD`, `_evaluate_acceptance_sets` a detached
-    worktree at `rev`; pinned by
+    worktree at `rev`, and a `RECORD` cite reads
+    `_orchestrator_results_digest(st, staging)`, whose lines are each
+    present only while they describe staging's HEAD (below); pinned by
+    `tests/test_delivery_detection.py::test_a_result_of_another_tree_is_not_on_the_record`,
     `tests/test_post_execution_readers_read_committed_tree.py` and
     `tests/test_acceptance_gate.py::test_the_final_remeasure_reads_the_committed_tree`.
   - `async _redrive_commit_leftovers(staging, label, tracked_before,
@@ -6989,10 +6992,14 @@ proceeds). It returns at once under `--skip-coverage-check`, with no
 readable staging HEAD, or when `delivery_gate.unmet_final` exists.
 
 - **Judge.** The record is `_delivery_record` — `_executed_commands_digest`
-  plus `_orchestrator_results_digest(st)` (`conformance._final.result`'s
-  measured build/lint/test axes, `test_id_diff.new`, and each
-  `acceptance.gate.final` set's verdict with its residual case names; the
-  same record every delivery pass now gets). `judged_after`, else
+  plus `_orchestrator_results_digest(st, <leerie_dir>/worktrees/staging)`
+  (`conformance._final.result`'s measured build/lint/test axes when
+  `_final.tree_sha` is staging's `HEAD^{tree}`, `test_id_diff.new` when
+  its `tree_sha` is, and each `acceptance.gate.final` set's verdict with
+  its residual case names when `gate.final_sha` is staging's HEAD —
+  `_head_identity(tree) -> (head_sha, head_tree)`, empty strings without
+  a tree or on a git failure, so nothing is included; the same record
+  every delivery pass now gets). `judged_after`, else
   `judged_before`, is reused when its `sha` is the staging HEAD; otherwise
   `_delivery_judge_unmet(..., phase_label="final", item_details=...)` runs
   (items only, no contract). Every judge sample, in every pass, goes through

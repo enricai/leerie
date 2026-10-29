@@ -236,23 +236,39 @@ class TestJudgeScreen:
 
 # === the orchestrator's own results reach the record ======================
 
-def test_orchestrator_results_digest_values_and_order(leerie, tmp_path):
-    st = leerie.State(tmp_path / "s", "r")
+def _head(tree):
+    out = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD",
+                          "HEAD^{tree}"], capture_output=True, text=True,
+                         check=True).stdout.split()
+    return out[0], out[1]
+
+
+def _digest_state(leerie, tmp_path, commit, tree):
+    import uuid
+    st = leerie.State(tmp_path / "s", uuid.uuid4().hex[:8])
     st.data = {
-        "conformance": {"_final": {"result": {
+        "conformance": {"_final": {"tree_sha": tree, "result": {
             "build": {"command": "make build", "measured": True,
                       "passed": True, "summary": "ok"},
             "tests": {"command": "pytest -q", "measured": True,
                       "passed": False, "summary": "1 failed"}}}},
-        "test_id_diff": {"candidates": ["a"], "new": ["t.py :: test_a"]},
+        "test_id_diff": {"candidates": ["a"], "new": ["t.py :: test_a"],
+                         "tree_sha": tree},
         "acceptance": {"gate": {
+            "final_sha": commit,
             "final": [{"index": 1, "passed": True},
                       {"index": 2, "passed": False,
                        "failing_files": ["acc/test_d.py"]},
                       {"index": 3, "passed": False, "unmeasured": True}],
             "residual": {"cases_by_set": {"2": ["acc/test_d.py :: test_x"]}}}},
     }
-    d = leerie._orchestrator_results_digest(st)
+    return st
+
+
+def test_orchestrator_results_digest_values_and_order(leerie, tmp_path):
+    staging = _delivery_tree(tmp_path / "staging")
+    st = _digest_state(leerie, tmp_path, *_head(staging))
+    d = leerie._orchestrator_results_digest(st, staging)
     lines = [ln for ln in d.splitlines() if ln.startswith("[")]
     assert lines == [
         "[orchestrator final-tree build] $ make build",
@@ -267,7 +283,38 @@ def test_orchestrator_results_digest_values_and_order(leerie, tmp_path):
         "tree: not measured"]
     assert "result: passed — ok" in d and "result: failed — 1 failed" in d
     st.data = {}
-    assert leerie._orchestrator_results_digest(st) == ""
+    assert leerie._orchestrator_results_digest(st, staging) == ""
+
+
+def test_a_result_of_another_tree_is_not_on_the_record(leerie, tmp_path):
+    """Review round 10 claims M1: a RECORD cite can make a verdict met, and
+    the final-tree axes were measured on staging's working tree — a
+    worker's uncommitted file included. Each result is on the record only
+    while it describes HEAD: the final axes and the B* diff by the
+    committed tree they measured (None: not a committed tree), the held-out
+    sets by their commit."""
+    staging = _delivery_tree(tmp_path / "staging")
+    commit, tree = _head(staging)
+    for c, t in ((commit, None), ("0" * 40, "f" * 40)):
+        st = _digest_state(leerie, tmp_path, c, t)
+        lines = leerie._orchestrator_results_digest(st, staging).splitlines()
+        assert not any(ln.startswith(("[orchestrator final-tree",
+                                      "[orchestrator B*")) for ln in lines)
+        assert any("held-out" in ln for ln in lines) == (c == commit)
+    st = _digest_state(leerie, tmp_path, commit, tree)
+    assert leerie._orchestrator_results_digest(st, None) == ""
+    # The reviewer's driver: with the axis measured off HEAD, the cite of
+    # its line no longer verifies, so it buys no met.
+    st = _digest_state(leerie, tmp_path, commit, None)
+    rec = leerie._orchestrator_results_digest(st, staging)
+    v = {"met": True, "parts": [{"status": "met", "cites": [
+        {"path": "RECORD",
+         "quote": "[orchestrator final-tree tests] $ pytest -q"}]}]}
+    assert leerie._delivery_verdict_check(v, staging, rec) == (
+        "unverified", "part_uncited")
+    st = _digest_state(leerie, tmp_path, commit, tree)
+    rec = leerie._orchestrator_results_digest(st, staging)
+    assert leerie._delivery_verdict_check(v, staging, rec) == ("met", "")
 
 
 def test_the_judge_payload_carries_the_orchestrator_results(
@@ -277,9 +324,11 @@ def test_the_judge_payload_carries_the_orchestrator_results(
     st = leerie.State(tmp_path / ".leerie", "r")
     st.data = {"task": "t", "worker_count": 0, "working_branch": "main",
                "required_items": [{"item": "the suite passes"}],
-               "conformance": {"_final": {"result": {"tests": {
-                   "command": "pytest -q", "measured": True,
-                   "passed": True}}}}}
+               "conformance": {"_final": {
+                   "tree_sha": _head(run_dir / "worktrees" / "staging")[1],
+                   "result": {"tests": {
+                       "command": "pytest -q", "measured": True,
+                       "passed": True}}}}}
     st.save()
     calls = []
 

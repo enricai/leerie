@@ -42634,15 +42634,41 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
     return {**sample, "verdicts": out}
 
 
-def _orchestrator_results_digest(st: "State") -> str:
+def _head_identity(tree: str | Path | None) -> tuple[str, str]:
+    """`tree`'s HEAD commit and committed tree (`HEAD`, `HEAD^{tree}`);
+    empty strings when there is no tree or git fails."""
+    if tree is None:
+        return "", ""
+    r = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD",
+                        "HEAD^{tree}"], capture_output=True, text=True,
+                       check=False)
+    got = r.stdout.split()
+    if r.returncode != 0 or len(got) != 2:
+        return "", ""
+    return got[0], got[1]
+
+
+def _orchestrator_results_digest(st: "State",
+                                 tree: str | Path | None) -> str:
     """The orchestrator's OWN results for the executed-commands record
     (DESIGN §8 *Execution-shaped items are judged from the run's own
     records*): the final-tree build/lint/test axes it measured, the test IDs
     B* confirmed newly failing, and each held-out acceptance set's final
-    verdict. Read from typed state only; "" when none of it exists yet."""
+    verdict. Read from typed state only; "" when none of it exists yet.
+
+    Each result is in the record only while it describes `tree`'s HEAD
+    (DESIGN §8 *Every post-execution verdict is of the committed tree*): a
+    RECORD citation can make a verdict met, and an axis measured on
+    staging's working tree with a worker's uncommitted file in it, or on a
+    commit a re-drive has since moved past, is not evidence of what ships
+    (review round 10 claims M1). The final axes and the B* diff carry the
+    committed tree they measured (`tree_sha`, None when that was not a
+    committed tree), the held-out sets the commit (`final_sha`)."""
     lines: list[str] = []
+    head_sha, head_tree = _head_identity(tree)
     final = ((st.data.get("conformance") or {}).get("_final") or {})
-    res = final.get("result") if isinstance(final, dict) else None
+    res = (final.get("result") if isinstance(final, dict) and head_tree
+           and final.get("tree_sha") == head_tree else None)
     for axis in ("build", "lint", "tests"):
         a = (res or {}).get(axis) if isinstance(res, dict) else None
         if not isinstance(a, dict) or not a.get("command"):
@@ -42654,7 +42680,8 @@ def _orchestrator_results_digest(st: "State") -> str:
                      f"{str(a['command'])[:200]}\n    result: {verdict}"
                      + (f" — {summary}" if summary else ""))
     diff = st.data.get("test_id_diff")
-    if isinstance(diff, dict) and diff.get("candidates") is not None:
+    if (isinstance(diff, dict) and diff.get("candidates") is not None
+            and head_tree and diff.get("tree_sha") == head_tree):
         new = [str(x)[:160] for x in (diff.get("new") or [])]
         lines.append("[orchestrator B* failing-test diff] tests newly "
                      "failing on the final tree, confirmed against the base: "
@@ -42668,7 +42695,8 @@ def _orchestrator_results_digest(st: "State") -> str:
                 + (f" (+{len(pre) - 10} more)" if len(pre) > 10 else ""))
     acc = st.data.get("acceptance") or {}
     gate = (acc.get("gate") or {}) if isinstance(acc, dict) else {}
-    final_sets = gate.get("final") if isinstance(gate, dict) else None
+    final_sets = (gate.get("final") if isinstance(gate, dict) and head_sha
+                  and gate.get("final_sha") == head_sha else None)
     if isinstance(final_sets, list):
         cases = ((gate.get("residual") or {}).get("cases_by_set") or {}
                  if isinstance(gate.get("residual"), dict) else {})
@@ -42705,7 +42733,8 @@ def _delivery_record(leerie_dir: Path, st: "State",
         log(f"  delivery gate: executed-commands digest failed "
             f"({type(e).__name__}) — judging without the workers' record")
         workers = ""
-    own = _orchestrator_results_digest(st)
+    own = _orchestrator_results_digest(st,
+                                       leerie_dir / "worktrees" / "staging")
     return "\n".join(x for x in (workers, own) if x)
 
 

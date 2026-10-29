@@ -7150,7 +7150,7 @@ judges run with staging as their working directory, and staging can hold
 what does not ship: an edit a worker left, an untracked file. Review
 round 9 asked whether they, and the held-out re-measure, therefore judge
 the wrong tree. They do not, and they were left where they are, because
-every check that can make a verdict *met* already reads the commit:
+every check that can make a verdict *met* reads a commit:
 
 - a judge's `met` counts only when each part cites a quote found in
   `git show HEAD:<path>` (`_verify_delivery_cite`), and an `ABSENT` cite
@@ -7160,7 +7160,22 @@ every check that can make a verdict *met* already reads the commit:
 - a test-outcome part is read from the failing-test-ID diff of the
   committed tree (above);
 - the held-out sets, the re-measure included, and the falsifier run in
-  disposable checkouts of the commit, never in staging.
+  disposable checkouts of the commit, never in staging;
+- a `RECORD` cite verifies against the executed-commands record, and the
+  orchestrator's own lines there — the final-tree build/lint/test axes,
+  the B\* diff, the held-out sets' final verdicts — are in it only while
+  they describe staging's HEAD: the axes and the B\* diff carry the
+  committed tree they measured (none when the measurement saw a worker's
+  uncommitted file, §8 above), the held-out sets their commit.
+
+Review round 10 drove the gap the last bullet closes: the final axes are
+measured in staging's working tree, so a worker's untracked file could
+turn a red axis green, and a cite of that line bought a met no file read
+could. The record's other half — the commands workers ran, from their
+logs — is a record of what was executed in the workers' own trees, not
+a read of the tree that ships; it is the evidence *Execution-shaped
+items are judged from the run's own records* chooses, and stays outside
+this rule.
 
 What staging-only content can still do is make a judge vote *unmet* on
 something that ships correctly — a cost (a re-drive spent), never a false
