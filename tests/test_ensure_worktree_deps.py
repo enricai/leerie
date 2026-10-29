@@ -22,8 +22,10 @@ import pytest
 @pytest.fixture(autouse=True)
 def _clear_deps_memo(leerie):
     leerie._DEPS_INSTALLED.clear()
+    leerie._DEPS_FAILED.clear()
     yield
     leerie._DEPS_INSTALLED.clear()
+    leerie._DEPS_FAILED.clear()
 
 
 @pytest.fixture
@@ -231,11 +233,16 @@ def test_measure_installs_once_across_repeated_rounds(
     assert len(installs) == 1
 
 
-def test_a_failing_install_still_marks_the_tree_done(leerie, st, streaming,
-                                                     tmp_path):
-    """Retrying a broken install once per measurement would multiply the
-    cost this function exists to remove."""
+def test_a_failing_install_is_retried_a_bounded_number_of_times(
+        leerie, st, streaming, tmp_path):
+    """A broken install is retried once per later measurement, but only
+    `deps_install_retries` times (review round 10 M2): one outage must not
+    unmeasure the tree for the whole run, and a permanently broken install
+    must not multiply the cost this function exists to remove."""
     calls = streaming(OSError("boom"))
-    _go(leerie, tmp_path, st)
-    _go(leerie, tmp_path, st)
-    assert len(calls) == 1
+    got = [_go(leerie, tmp_path, st) for _ in range(6)]
+    assert got == [False] * 6
+    assert len(calls) == 1 + leerie.DEFAULT_CAPS["deps_install_retries"]
+    calls.clear()
+    assert _go(leerie, tmp_path, st, {"deps_install_retries": 0}) is False
+    assert calls == []

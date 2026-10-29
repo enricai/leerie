@@ -10525,18 +10525,29 @@ empty end-state section. So an install that failed, on either side, makes
 that side unmeasured, never "failed like the base":
 
 - the install's result is remembered with the install, so a later
-  measurement of the same tree knows it, not only the first;
+  measurement of the same tree knows it, not only the first — but a
+  failure is not remembered for good: the next measurement of that tree
+  installs again, up to `deps_install_retries` (2) times per worktree, and
+  a success clears it. Review round 10 drove the run a single registry
+  503 at staging's first install made: every later measurement carried
+  the failure for the whole run, and a clean run listed "not measured on
+  the tree that ships";
 - a `tests` measurement taken after a failed install carries
   `deps_failed`, is never memoised (an outage is not a fact about the
   tree), and gives the final diff no final side — the refresh lists "not
   measured on the tree that ships" with that reason;
 - a baseline measured that way records no failing IDs (they would make
   every final failure the base's own), and the gap says the base was
-  measured without its dependencies;
+  measured without its dependencies. That baseline is saved run state,
+  so it would outlive the outage and every resume: before a final diff
+  is taken or reused, the base commit is measured again in a fresh
+  checkout (staging has moved on), up to `deps_install_retries` times
+  per process, and one whose install succeeds replaces the baseline;
 - a B\* base checkout (the final diff's, a re-drive group's) whose
   install failed reruns nothing: its candidates are `no_verdict`, and on
   the tree that ships they are listed for a human to rerun against the
-  base.
+  base. Such a diff is never reused as-is: each later refresh measures
+  it again with a fresh base checkout.
 
 The comparison is then unknown and says so; it is never settled by two
 broken installs agreeing.

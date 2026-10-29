@@ -264,6 +264,11 @@ DEFAULT_CAPS = {
     # barnacle 7cc87f9a p = 0.546 per run, a set misses the defect with
     # probability 0.454**11 < 0.02%.
     "acceptance_intermittent_repeats": 10,
+    # Installs retried in one worktree after its recipe install failed
+    # (DESIGN §9 *A failed install is no measurement*): one per later
+    # measurement, so one registry blip at the first install does not
+    # unmeasure the tree for the rest of the run.
+    "deps_install_retries": 2,
     # CRITIC-pattern mechanical-feedback re-invocation caps. Each worker
     # type gets code-enforced structural checks (file existence, graph
     # cycles, lockfile consistency, etc.) and the orchestrator re-invokes
@@ -38313,11 +38318,13 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
 # container has an empty worktree) and cheap against the shared
 # package-manager caches (DESIGN §6½).
 _DEPS_INSTALLED: set[str] = set()
-# The subset of `_DEPS_INSTALLED` whose last install failed: a memo hit
-# answers what the install did, never "installed" (DESIGN §9 *A failed
-# install is no measurement*). Stale entries are harmless — a tree not in
-# `_DEPS_INSTALLED` installs afresh and rewrites its entry.
-_DEPS_FAILED: set[str] = set()
+# The subset of `_DEPS_INSTALLED` whose last install failed, each with the
+# number of installs that have failed there in a row: a memo hit answers
+# what the install did, never "installed", and installs again while that
+# count is within `deps_install_retries` (DESIGN §9 *A failed install is no
+# measurement*). A successful install drops the entry. Stale entries are
+# harmless — a tree not in `_DEPS_INSTALLED` installs afresh.
+_DEPS_FAILED: dict[str, int] = {}
 
 
 async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
@@ -38340,16 +38347,29 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
 
     Returns False when an `install` entry exited non-zero, timed out or
     raised — on this call, or on the call a memo hit stands for — else
-    True. The held-out
+    True. A memo hit on a failed install installs again, up to
+    `deps_install_retries` times per worktree: an outage is transient, and
+    a measurement taken after one must not stand for the whole run (review
+    round 10 M2). The held-out
     acceptance tests judge by exit code alone, so their callers need this:
     a failed install would otherwise read as every test failing. A failed
     `build` entry does not count — a fix that breaks the build is evidence
     against the fix, which the tests then show."""
     key = os.path.realpath(tree)
     if key in _DEPS_INSTALLED:
-        return key not in _DEPS_FAILED
+        fails = _DEPS_FAILED.get(key)
+        if fails is None:
+            return True
+        retries = int(caps.get("deps_install_retries",
+                               DEFAULT_CAPS["deps_install_retries"]))
+        if fails > retries:
+            return False
+        log(f"  {log_prefix}: the dependency install failed here before — "
+            f"retrying it ({fails} of {retries})")
+    else:
+        # A fresh checkout at a path used before starts its own count.
+        _DEPS_FAILED.pop(key, None)
     _DEPS_INSTALLED.add(key)
-    _DEPS_FAILED.discard(key)
     ok = True
     recipe = (st.data.get("provision") or {}).get("recipe") or []
     # Leerie's own install/build never leaves a tracked edit behind
@@ -38397,8 +38417,10 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                 ok = ok and e.get("kind") != "install"
                 log(f"  {log_prefix}: install error "
                     f"({type(ex).__name__}): {' '.join(e['command'])}")
-    if not ok:
-        _DEPS_FAILED.add(key)
+    if ok:
+        _DEPS_FAILED.pop(key, None)
+    else:
+        _DEPS_FAILED[key] = _DEPS_FAILED.get(key, 0) + 1
     return ok
 
 
@@ -40110,7 +40132,11 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     measured a clean checkout of a known tree, else with
     `_measured_tree_sha(staging)`: the committed tree when the only dirt is
     untracked files no worker wrote, so the shipping-tree refresh reuses it
-    instead of measuring the same tree again (review round 9 L1)."""
+    instead of measuring the same tree again (review round 9 L1). A
+    baseline whose install failed is measured again first
+    (`_retry_failed_baseline`), and a prior verdict whose base install
+    failed is never reused."""
+    await _retry_failed_baseline(st, caps, log_path=log_path)
     base_ids = st.data.get("baseline_failing_ids")
     tests = (post or {}).get("tests") or {}
     if tests.get("scoped_replacement"):
@@ -40141,6 +40167,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         tree_sha = await _measured_tree_sha(st, staging)
     prior = st.data.get("test_id_diff") or {}
     if (tree_sha and prior.get("tree_sha") == tree_sha
+            and not prior.get("base_install_failed")
             and bool(prior.get("ids_unknown")) == ids_unknown
             and prior.get("final_candidates",
                           prior.get("candidates")) == cand):
@@ -40823,6 +40850,75 @@ async def _capture_conformance_baseline(
         _write_run_json(st.run_dir,
                         health={"base_suite": {"status": "green",
                                                "red_axes": []}})
+
+
+# Baseline re-measures taken in THIS process, keyed by the base commit
+# (`_retry_failed_baseline`): per-process like `_DEPS_FAILED`, so a resume
+# tries again.
+_BASELINE_RETRIES: dict[str, int] = {}
+
+
+async def _retry_failed_baseline(st: "State", caps: dict, *,
+                                 log_path: Path) -> bool:
+    """Measure the base again when the saved baseline's install failed
+    (DESIGN §9 *A failed install is no measurement*): its `deps_failed`
+    is saved run state, so one outage at phase 4 would otherwise unmeasure
+    the base side of every final diff for the rest of the run and on every
+    resume (review round 10 M2). The base commit (`_baseline.sha`) is
+    measured in a fresh detached checkout, at most `deps_install_retries`
+    times per process; a measurement whose install succeeded replaces the
+    baseline's axes, `red_axes` and `baseline_failing_ids`, and True is
+    returned. Staging has moved on, so the base cannot be measured there.
+    Advisory: never raises past git or the measurement."""
+    conf = st.data.get("conformance") or {}
+    base = conf.get("_baseline")
+    if not isinstance(base, dict):
+        return False
+    sha = str(base.get("sha") or "")
+    if not sha or not (((base.get("axes") or {}).get("tests") or {})
+                       .get("deps_failed")):
+        return False
+    retries = int(caps.get("deps_install_retries",
+                           DEFAULT_CAPS["deps_install_retries"]))
+    if _BASELINE_RETRIES.get(sha, 0) >= retries:
+        return False
+    _BASELINE_RETRIES[sha] = _BASELINE_RETRIES.get(sha, 0) + 1
+    blt = resolve_blt(st.repo_root)
+    cmds = {axis: (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
+            for axis in ("build", "lint", "tests")}
+    log("  base-baseline: the base was measured after a failed dependency "
+        f"install — measuring {sha[:12]} again in a fresh checkout")
+    wt = _helper_worktree_path(st, "baseline-retry")
+    _remove_acceptance_checkout(st, wt)
+    try:
+        add = await _worktree_add_detached_async(st, wt, sha)
+        if add.returncode != 0:
+            log("  base-baseline: could not check out the base again — the "
+                "baseline stays unmeasured")
+            return False
+        axes = await _measure_axes(
+            str(wt), cmds, st, caps, log_path=log_path,
+            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+            label_prefix="baseline-retry", log_prefix="base-baseline",
+            failing_ids_axes={"tests"})
+    finally:
+        _remove_acceptance_checkout(st, wt)
+    if (axes.get("tests") or {}).get("deps_failed"):
+        log("  base-baseline: the install failed again — the baseline stays "
+            "unmeasured")
+        return False
+    red = [a for a in ("build", "lint", "tests")
+           if (axes.get(a) or {}).get("ran") and axes[a].get("measured")
+           and not axes[a].get("passed")]
+    conf = st.data.setdefault("conformance", {})
+    conf["_baseline"] = {**base, "axes": axes, "red_axes": red}
+    ids = (axes.get("tests") or {}).get("failing_ids")
+    st.data["baseline_failing_ids"] = (list(ids) if isinstance(ids, list)
+                                       else None)
+    st.save()
+    log("  base-baseline: the base is measured with its dependencies now"
+        + (f" (red: {', '.join(red)})" if red else " (green)"))
+    return True
 
 
 # --- CI parity (DESIGN §9 *The repository's own merge checks run too*) -----
@@ -52263,11 +52359,17 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
     if diff is None and not cmd:
         _set_final_diff_gap(st, None)
         return tree_sha
-    if tree_sha and diff is not None and diff.get("tree_sha") == tree_sha:
+    # A base side measured without its dependencies is not kept for good
+    # (DESIGN §9 *A failed install is no measurement*): a re-measured
+    # baseline, or a diff whose B* base install failed, is measured again.
+    rebased = await _retry_failed_baseline(st, caps, log_path=log_path)
+    reusable = (diff is not None and not rebased
+                and not diff.get("base_install_failed"))
+    if tree_sha and reusable and diff.get("tree_sha") == tree_sha:
         _set_final_diff_gap(st, _join_gap(_final_diff_base_gap(st, diff),
                                           edits_note))
         return tree_sha
-    if tree_sha and diff is not None and diff.get("stale_for_tree") == tree_sha:
+    if tree_sha and reusable and diff.get("stale_for_tree") == tree_sha:
         return tree_sha
     got = None
     post: dict | None = None

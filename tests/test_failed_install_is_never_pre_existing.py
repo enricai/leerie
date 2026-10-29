@@ -29,10 +29,10 @@ CONFTEST = ("import os, pytest\n\n@pytest.fixture(autouse=True)\n"
 
 
 @pytest.fixture(autouse=True)
-def _clear_deps_memo(leerie):
-    leerie._DEPS_INSTALLED.clear()
-    yield
-    leerie._DEPS_INSTALLED.clear()
+def _clear_deps_memo(leerie, monkeypatch):
+    monkeypatch.setattr(leerie, "_DEPS_INSTALLED", set())
+    monkeypatch.setattr(leerie, "_DEPS_FAILED", {})
+    monkeypatch.setattr(leerie, "_BASELINE_RETRIES", {})
 
 
 def _setup(leerie, tmp_path, monkeypatch):
@@ -48,7 +48,9 @@ def _setup(leerie, tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     tool = bindir / "fakeinst"
-    tool.write_text(f"#!/bin/sh\n[ -e '{flag}' ] && exit 1\n"
+    calls = tmp_path / "install-calls"
+    tool.write_text(f"#!/bin/sh\necho x >> '{calls}'\n"
+                    f"[ -e '{flag}' ] && exit 1\n"
                     "mkdir -p deps && touch deps/ok\n")
     tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
@@ -144,15 +146,115 @@ def test_a_baseline_measured_without_its_deps_has_no_failing_ids(
     assert not st.data.get("blt_results")
 
 
-def test_a_memo_hit_answers_what_the_install_did(leerie, tmp_path,
-                                                monkeypatch):
+def _installs(tmp_path) -> int:
+    p = tmp_path / "install-calls"
+    return len(p.read_text().splitlines()) if p.exists() else 0
+
+
+def test_a_memo_hit_on_a_failed_install_installs_again_bounded(
+        leerie, tmp_path, monkeypatch):
+    """Review round 10 M2: a failed install was memoised for the whole
+    process, so one registry blip unmeasured the tree for the rest of the
+    run. A memo hit on a failed install now installs again, up to
+    `deps_install_retries` times; a success clears the failure, and a
+    success is never reinstalled."""
     run, flag = _setup(leerie, tmp_path, monkeypatch)
-    flag.write_text("")
+    assert run["caps"].get("deps_install_retries",
+                           leerie.DEFAULT_CAPS["deps_install_retries"]) == 2
     go = lambda: asyncio.run(leerie._ensure_worktree_deps(  # noqa: E731
         str(run["repo"]), run["st"], run["caps"],
         log_path=tmp_path / "i.log", verbosity="quiet"))
-    assert go() is False
+    flag.write_text("")
+    assert go() is False and _installs(tmp_path) == 1
     flag.unlink()
-    assert go() is False          # the memo, not a second install
+    assert go() is True and _installs(tmp_path) == 2    # retried, cleared
+    assert go() is True and _installs(tmp_path) == 2    # a memo hit
+    # Down for good: the first install and two retries, then the memo.
     leerie._DEPS_INSTALLED.discard(os.path.realpath(run["repo"]))
-    assert go() is True           # a fresh install
+    flag.write_text("")
+    got = [go() for _ in range(5)]
+    assert got == [False] * 5 and _installs(tmp_path) == 2 + 3
+
+
+def test_a_flaky_first_install_does_not_unmeasure_a_clean_run(
+        leerie, tmp_path, monkeypatch):
+    """The reviewer's driver: staging's install fails the first time only
+    (a registry 503). Before, it ran once, every later measurement carried
+    `deps_failed`, and a clean run listed "not measured on the tree that
+    ships". Now the next measurement installs again, and the run ends
+    `done` with an empty section."""
+    run = _repo(leerie, tmp_path, monkeypatch, ignore="__pycache__/\n")
+    st = run["st"]
+    flag = tmp_path / "registry-was-down-once"
+    calls = tmp_path / "calls"
+    sh = (f"echo x >> {calls}; if [ -f {flag} ]; then exit 0; fi; "
+          f"touch {flag}; exit 1")
+    st.data["provision"] = {"recipe": [
+        {"kind": "install", "command": ["sh", "-c", sh]}]}
+    st.save()
+    _quiet_conformer(leerie, monkeypatch)
+    asyncio.run(leerie._run_final_conformance(
+        run["run_dir"], st, run["caps"], {"conformer": "sonnet"},
+        {"conformer": "low"}))
+    _phase5(leerie, run)
+    assert len(calls.read_text().splitlines()) == 2
+    assert not st.data["test_id_diff"].get("ids_unknown")
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert leerie._format_pr_end_state_section(st.data) == ""
+
+
+def _failed_baseline(leerie, run, tmp_path):
+    st = run["st"]
+    axes = asyncio.run(leerie._measure_axes(
+        str(run["repo"]), {"tests": "python3 -m pytest -q -p "
+                           "no:cacheprovider tests"}, st, run["caps"],
+        log_path=tmp_path / "m.log", verbosity="quiet",
+        failing_ids_axes={"tests"}))
+    assert axes["tests"]["deps_failed"] is True
+    st.data["conformance"]["_baseline"]["axes"] = axes
+    st.data["conformance"]["_baseline"]["red_axes"] = ["tests"]
+    st.data["baseline_failing_ids"] = None
+    st.save()
+
+
+def test_a_baseline_whose_install_failed_is_measured_again(
+        leerie, tmp_path, monkeypatch):
+    """Saved state must not keep an outage for good: the baseline's
+    `deps_failed` is run state, so before, every final diff — and every
+    resume — listed "the base was measured without its dependencies". The
+    base commit is measured again in a fresh checkout; once its install
+    succeeds the baseline is replaced and the gap is gone."""
+    run, flag = _setup(leerie, tmp_path, monkeypatch)
+    st = run["st"]
+    flag.write_text("")
+    _failed_baseline(leerie, run, tmp_path)
+    assert leerie._final_diff_base_gap(st, {})
+    retry = lambda: asyncio.run(leerie._retry_failed_baseline(  # noqa: E731
+        st, run["caps"], log_path=tmp_path / "b.log"))
+    assert retry() is False                      # still down
+    flag.unlink()
+    assert retry() is True                       # back: replaced
+    base = st.data["conformance"]["_baseline"]
+    assert not base["axes"]["tests"].get("deps_failed")
+    assert base["red_axes"] == [] and st.data["baseline_failing_ids"] == []
+    assert leerie._final_diff_base_gap(st, {}) is None
+    assert not leerie._helper_worktree_path(st, "baseline-retry").exists()
+    assert retry() is False                      # nothing left to retry
+
+
+def test_baseline_retries_are_bounded_per_process(leerie, tmp_path,
+                                                  monkeypatch):
+    run, flag = _setup(leerie, tmp_path, monkeypatch)
+    st = run["st"]
+    flag.write_text("")
+    _failed_baseline(leerie, run, tmp_path)
+    n0 = _installs(tmp_path)
+    for _ in range(4):
+        asyncio.run(leerie._retry_failed_baseline(
+            st, run["caps"], log_path=tmp_path / "b.log"))
+    assert _installs(tmp_path) - n0 == 2
+    # A resume is a new process: it tries again.
+    monkeypatch.setattr(leerie, "_BASELINE_RETRIES", {})
+    flag.unlink()
+    assert asyncio.run(leerie._retry_failed_baseline(
+        st, run["caps"], log_path=tmp_path / "b.log")) is True
