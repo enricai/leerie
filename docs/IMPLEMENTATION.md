@@ -5157,7 +5157,7 @@ caller of the guard.
 | `_blt_shell_argv(cmd, forbidden, *, source=None)` / `ForbiddenByTask` | The one gate for every orchestrator-side launch of a repository command. `cmd` is a shell string → `["bash", "-c", cmd]`, or an exec argv (a list) → that argv as `str`s, checked as `shlex.join(cmd)`; either raises `ForbiddenByTask(hit)` when `_forbidden_command_hit` matches `cmd` or `source` (the command `cmd` was rendered from, e.g. before report flags). Used by `_measure_blt` (its `forbidden` keyword is required; a refusal is the unmeasured record with `skip_kind: "forbidden_by_task"`), `_capture_failing_test_ids` (None, logged), `_run_acceptance_file` (None), `_acceptance_parse_probe` (None with the reason), `_ci_run` (`{rc: None, passed: False, skipped: "forbidden_by_task"}`), `_cov_contained` (`{rc: None, timed_out: False, skipped: "forbidden_by_task"}`; its callers read `rc != 0` as not settled), `_ensure_worktree_deps` (a refused `install` entry makes it return False, a refused `build` entry is skipped; both logged) and `_settle_by_execution`'s launch (verdict `none`). `tests/test_blt_forbidden_gate.py` fails when a shell launch (`["bash"|"sh", "-c", …]`, `shell=True`, `create_subprocess_shell`) appears outside this helper; when any launch (`subprocess.*`, `asyncio.create_subprocess_*`, `os.exec*`/`spawn*`, `run_proc`, `_run_streaming`, `_run_contained`) runs an argv that is neither a literal led by a `LEERIE_OWNED_HEADS` program nor a name bound from this helper earlier in the same function, outside the test's `EXEMPT` launchers (each with its reason; a stale entry also fails); or when a call passes it an empty forbidden list. |
 | `_measure_axes` (forbidden skip) | A build or lint axis whose command `_forbidden_command_hit` matches is not run: `{ran: false, measured: false, passed: null, command, summary, skip_kind: "forbidden_by_task"}`, logged, never memoised. A matched `tests` axis goes to `_scoped_test_replacement` instead. |
 | `_scoped_test_replacement(tree, st, canonical, hit, forbidden, *, log_prefix)` | Replaces a forbidden test command. Before `conformance._baseline.sha` exists it returns the unmeasured record `skip_kind: "scoped_at_final"`. Otherwise it computes `_changed_files(tree, base)`, then `_coupled_test_files(repo, HEAD, changed, globs)`, keeps the coupled files present in `tree`, and renders them with `_acceptance_cmd`. It returns `{command, scoped_replacement: {replaces, forbidden, files, coupled}}`. `_measure_axes` measures that command like any axis (memoised under its own key) and copies `scoped_replacement` onto the result. When no file is coupled (`forbidden_no_coupled_tests`), there is no scoped runner (`forbidden_no_scoped_runner`), or the scoped command is forbidden too (`forbidden_scoped_runner`), it returns an unmeasured record, logs a WARNING and calls `_set_regression_gap`. A successful replacement clears that gap. |
-| `_pr_needs_human(state, in_pr) -> dict[str, list[str]]` / `_needs_human_detail_groups() -> dict[str, str]` | The "Needs human verification" groups (DESIGN §6 *The PR's end-state section*): a `required_item` entry renders its `item` under "Task requirements", a `blocker` entry under its `resource`, and every other entry with a `detail` under `_needs_human_detail_groups()[source]` — `record_worker_only`, `delivery_judge_unknown`, `ratchet_unverified` → "Task requirements"; `regression_check`, `test_outcome`, `confirm_budget`, `final_test_diff` → "Regression checks the run could not settle"; `redrive_heldout_removed` → "Files removed for holding a hidden test's source" — or, for a source the table does not name, "Other checks the run could not make". `tests/test_needs_human_sources_render.py` derives the written sources from the code (module `*_GAP_SOURCE` constants and literal `"source"` values in dict literals of functions that write `needs_human_verification`) and requires each in the table or `{required_item, blocker}`, and renders one entry of each. |
+| `_pr_needs_human(state, in_pr) -> dict[str, list[str]]` / `_needs_human_detail_groups() -> dict[str, str]` | The "Needs human verification" groups (DESIGN §6 *The PR's end-state section*): a `required_item` entry renders its `item` under "Task requirements", a `blocker` entry under its `resource`, and every other entry with a `detail` under `_needs_human_detail_groups()[source]` — `record_worker_only`, `delivery_judge_unknown`, `ratchet_unverified` → "Task requirements"; `regression_check`, `test_outcome`, `confirm_budget`, `final_test_diff` → "Regression checks the run could not settle" — or, for a source the table does not name, "Other checks the run could not make". `tests/test_needs_human_sources_render.py` derives the written sources from the code (module `*_GAP_SOURCE` constants and literal `"source"` values in dict literals of functions that write `needs_human_verification`) and requires each in the table or `{required_item, blocker}`, and renders one entry of each. |
 | `_set_regression_gap(st, detail)` | Keeps at most one `needs_human_verification` entry `{source: "regression_check", detail}` (`REGRESSION_GAP_SOURCE`): set from `detail`, removed on None. `_pr_needs_human` lists it under "Regression checks the run could not settle". |
 | `_acceptance_unmeasured_lines(state)` | Pure. The "Needs human verification" lines for held-out sets the final tree left unmeasured (DESIGN §8 *A held-out set the final tree leaves unmeasured is never silent*): one per unmeasured `acceptance.gate.final` result — `set <k> (<files>): <why>`, from its `unmeasured_reason` / `unmeasured_files` codes through `ACCEPTANCE_UNMEASURED_WHY` (a result recorded before the codes existed reads "no verdict recorded") — one for valid sets with no `gate.final` at all, and one for `gate.final_unremeasured`. Sets typed broken and variant sets (bounded, no counted file) are skipped. `_pr_needs_human` lists them under "Held-out acceptance sets the run could not measure"; never read by `_decide_outcome`. |
 | `_set_final_diff_gap(st, detail)` | Keeps at most one `needs_human_verification` entry `{source: "final_test_diff", detail}` (`FINAL_DIFF_GAP_SOURCE`): set from `detail` by `_refresh_test_id_diff` when the failing-test-ID diff could not be measured on the committed tree that ships (`"failing-test-ID diff: not measured on the tree that ships, so whether the run made an existing test fail is unknown — run the tests on the PR branch and compare with the base. Why: <why>"`; not set when the unmeasured `tests` record's `skip_kind` starts `forbidden_` and a `"regression_check"` entry already lists the same gap), or from `_final_diff_base_gap` when it was, removed on None. Every regression-check detail leads with its instruction and ends with the measured output or lists, so `_PR_ENTRY_MAX` cuts only those. `_pr_needs_human` lists it under "Regression checks the run could not settle". |
@@ -6133,7 +6133,7 @@ returned, before leerie runs anything of its own in that tree:
 | per-subtask conformer (`_run_conformance_phase`, each round, after the worker returned, crashed (`None`) or raised `PidExhaustedError` — the crash records its warning, runs the gate, then breaks — and before the result is validated) | subtask worktree | `<sid>-conformer` | `_rollback_conformer_commits(worktree, before_sha)` + `git clean -fdq`; warning `"conformer round <n>: " + _unclean_reason(...)`; `_record_unclean_tree(st, "conformer", "<sid> round <n>", lines)`; `conformer_repair_rolled_back = True`; break |
 | final conformer (`_run_final_conformance`, each round, after the worker returned or raised — a `WorkerError` / timeout records its warning, runs the gate, then breaks — and before `_expand_conformer_output`) | staging | `final-conformer-r<n>` | `_redrive_rollback(staging, before_sha)`; warning; `_record_unclean_tree(st, "final conformer", "round <n>", lines)`; break |
 | acceptance-repair conformer (`_run_acceptance_gate_inner`'s `_round_unclean`, after the worker returned or raised, before the round is measured) | staging | `acceptance-repair-r<n>` | `_record_unclean_tree(st, "acceptance repair", "round <n>", lines)`; `_settle_round({round, pre_sha, unclean_tree, rollback_reason: "left its tree unclean"}, prev, prev_sha)` (its `_undo_round` → `_redrive_rollback`); the repair loop stops |
-| delivery re-drive implementer (`_run_delivery_redrive`, after `_redrive_unstage`) | staging | `delivery-redrive-r<round>-g<group>` | the group's `unclean_tree`; `_record_unclean_tree(st, "delivery re-drive implementer", "r<round> g<group>", lines)`; `_redrive_rollback(staging, pre_sha)` → `rolled_back` (a failed reset: `rollback_failed`, the re-drive stops); next group |
+| delivery re-drive implementer (`_run_delivery_redrive`, after `_redrive_drive`) | staging | `delivery-redrive-r<round>-g<group>` | the group's `unclean_tree`; `_record_unclean_tree(st, "delivery re-drive implementer", "r<round> g<group>", lines)`; `_redrive_rollback(staging, pre_sha)` → `rolled_back` (a failed reset: `rollback_failed`, the re-drive stops); next group |
 | integrator, conflict resolution (`integrate_wave`, after `check_merge_committed`) | staging | `integrator-<sid>` | `_back_out_unmerged(st, staging, sid, pre_sha, _unclean_reason("the integrator", lines))` — `sid` settles `unconverged` |
 | integrator, repair round (`_integration_repair_round`, a status other than `design-conflict`/`failed`) | staging | `integrator-repair-<sid>` | the round entry's `unclean_tree`; `mech.clean` false → `mech_fail`, `_reset` |
 
@@ -6431,16 +6431,13 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `tests/test_delivery_detection.py::test_a_result_of_another_tree_is_not_on_the_record`,
     `tests/test_post_execution_readers_read_committed_tree.py` and
     `tests/test_acceptance_gate.py::test_the_final_remeasure_reads_the_committed_tree`.
-  - The re-drive group's clean-tree gate (*Clean-tree gate (I1)*): after
-    `_redrive_unstage`, unless the group's commits
-    (`git log --format= --name-only -m <pre_sha>..HEAD`) name a staged file
-    — rule 3 voids that group whatever its tree holds, and the unstage's
-    deletion of that tracked path is leerie's, not the worker's — the gate
-    runs with `log_sid = delivery-redrive-r<round>-g<group>`. Leerie never
-    commits a group's leftovers. Such a group's tree is not clean (the
-    unstage deleted a tracked path), so its test IDs are not measured:
-    `ids_after` is None and `_ratchet_exec` returns `unmeasured`, never an
-    `_assert_staging_clean` stop; rule 3 voids and rolls it back.
+  - The re-drive group's clean-tree gate (*Clean-tree gate (I1)*): right
+    after `_redrive_drive`, for every group, with `log_sid =
+    delivery-redrive-r<round>-g<group>`. Leerie never commits a group's
+    leftovers and places nothing in staging (DESIGN §8 *A held-out set
+    never enters a tree a worker commits from*), so a group that committed
+    a set path is gated and measured like any other and voided by the
+    history check.
   - `async _refresh_shipping_test_id_diff(leerie_dir, st, caps, *, label)`
     — on `worktrees/staging` (nothing when absent): `_refresh_test_id_diff`
     with `log_prefix="phase 5"`, then `_resettle_test_outcome_rows(st,
@@ -7555,43 +7552,55 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   skipped (`skipped: nothing_left`); members whose `_redrive_allowed` is
   false are dropped (`skipped: budget` when none is left); each member's
   counter is consumed (`_consume_redrive`); `in_flight {pre_sha, round,
-  group}` is saved; the shown sets are staged (`_redrive_stage`: copied
-  read-only, skipping a set whose path the tree already has or whose
-  directory has a `.gitignore` of its own, ignored in staging only by
-  `_checkout_ignore`, which `_redrive_unstage` undoes; the candidate files
-  are saved as `in_flight.stage_files` first, so a resumed crash removes
-  their `.gitignore` files — and every ancestor directory's,
-  `_staged_ignore_dirs(files)` — before the rollback's `clean -fd`).
-  Staged material (DESIGN §8 *No line of a staged set's source reaches
-  history*): `_redrive_stage` returns `[{set_index, dir, files, made}]`,
-  `made` the top-most directories it had to create, each ignored whole
-  (`<dir>/` to `_checkout_ignore`); beside every staged file it also
-  ignores `_heldout_companion_patterns(rel) -> [(dir, pattern)]` —
-  `/__pycache__/<stem>.*` and `/__snapshots__/<name>.*`, passed as
-  `_checkout_ignore(wt, rels, *, patterns=())`. `_redrive_unstage(staging,
-  staged, *, swept=None, prints=None, span_held=None)` removes the
-  staged files, their
-  `_heldout_companions(staging, rel)` (those entries present now) and,
-  under each `made` directory, every file that is a staged file, a
-  `_heldout_runner_copy` of one or `_file_holds_span(prints)` — keeping any
-  other file there (the implementer's own) and removing the directories
-  left empty — appending every removed path that is not a staged file to
-  `swept` (recorded as the group's `heldout_removed`, first 20, with
-  `span_held`, each path once), and every removed
-  file that is neither a staged file nor a runner copy — removed for
-  holding a span — to `span_held`, recorded as the group's
-  `heldout_listed` (first 200) and listed by
-  `_set_redrive_heldout_gap(st, rec)` as the re-drive ends: one "Needs
-  human verification" entry, `source: "redrive_heldout_removed"`
-  (`_REDRIVE_HELDOUT_GAP_SOURCE`), over every group not `rolled_back`,
-  rendered by `_pr_needs_human` under "Files removed for holding a hidden
-  test's source"; cleared when there is none (review round 13 M2). Staging, the fingerprints, the
-  note and the snapshots all run inside the `try` whose `finally` is
-  `_redrive_unstage`, so no exception between staging and the drive leaves
-  a set staged (review round 12 L1,
-  `test_a_fingerprinting_crash_still_unstages`). Just after staging,
-  `_heldout_fingerprints(staging, staged, pre_sha) -> dict[int,
-  frozenset[bytes]]`: per staged file (its first `_HELDOUT_SOURCE_MAX =
+  group}` is saved; inside `_test_db_session(st)`, the group's throwaway
+  database is made (`_create_test_db(st, staging, "redrive-r<round>g<group>")`,
+  None without a Prisma project or cluster) and the self-check prepared
+  (DESIGN §8 *A held-out set never enters a tree a worker commits from*):
+  `_selfcheck_prepare(st, caps, staging, shown, label, db_url) -> dict`
+  writes `<run>/selfcheck/<label>/` holding `sets/set-<index>/<rel>` (a
+  read-only copy of each shown set's files, the source the note points
+  at; never under the read-denied `acceptance/`), `config.json` (`{tree,
+  repo_root, sets[{index, dir, defect_files, control_files,
+  support_files}] with `dir` the copy, snap_root, env, forbidden, timeout,
+  log}`) and `bin/leerie-selfcheck` (a bash wrapper: `exec python3
+  <leerie>/scripts/selfcheck.py <config.json> "$@"`), and returns `{dir,
+  bin, command, src, run_files, name_flag}` — `run_files` the shown sets'
+  defect and control files, `name_flag` the runner's own test-name flag
+  (`_SELFCHECK_NAME_FLAGS`: vitest/jest `-t`, pytest `-k`; None for any
+  other runner) read off `_acceptance_cmd(st, run_files, staging)`; the
+  bin directory is put first on the implementer's `PATH` (`env_extra`).
+  `scripts/selfcheck.py` imports the orchestrator and calls
+  `_selfcheck_main(argv) -> int`: `_selfcheck_args(args, run_files)`
+  splits the arguments into a subset (each argument naming exactly one
+  set test file: its path, its file name or a unique path suffix; one
+  naming several is a usage error, exit 2), a name filter
+  (`-t`/`--testNamePattern`/`-k` with a value, `=`-joined or not) and the
+  rest, passed through to the runner (bench I3-3's selection); SIGTERM,
+  SIGHUP and SIGINT raise `SystemExit(128 + signum)`, so the copy's
+  deletion runs on every exit. `_selfcheck_snapshot(tree, snap)` copies every path of `git
+  ls-files -z --cached --others --exclude-standard` that exists (gitlinks
+  skipped) through one `tar --null --no-recursion -T - -cf - | tar -xf -`
+  pipe (symlinks as symlinks) — no temporary index, so it writes no git
+  object; `_selfcheck_share_ignored(tree, snap, set_files)` symlinks every
+  path of `git ls-files -z --others --ignored --exclude-standard
+  --directory` into the copy except one that is a set file or an ancestor
+  of one; a set path already present in the copy is refused (exit 3,
+  listed); `_place_set` places every shown set, files `0444`; the command
+  is `_acceptance_cmd(st, run, snap)` over the subset (else every test
+  file), the name filter and the rest appended by `_append_runner_flags`
+  (exit 2 when they cannot be placed), checked by `_blt_shell_argv`
+  against the config's forbidden specs, and run in the copy under `bash
+  -c` with the config's `env` and `GIT_CEILING_DIRECTORIES=<snap_root>`,
+  bounded by the config's timeout (exit 124). It prints the runner's
+  output, then `SELF-CHECK PASSED|FAILED (exit N) …`, deletes the copy
+  (`_rmtree_owned`) and appends `{ts,
+  args, subset, name_filter, rc, secs_*}` to the config's `log`. After the
+  drive the group records the calls (`selfcheck_calls`, first 50) and
+  `_selfcheck_cleanup(sc)` removes `<run>/selfcheck/<label>/`; a resumed
+  crash removes `<run>/selfcheck/` whole. The span fingerprints of the
+  shown sets (`_heldout_fingerprints(staging, [{dir, files}], pre_sha) ->
+  dict[int, frozenset[bytes]]`, the anti-cheat of DESIGN §8): per set file
+  (its first `_HELDOUT_SOURCE_MAX =
   1 MiB`), its normalised lines (`_heldout_pieces(readline)`: pieces of at
   most `_HELDOUT_LINE_MAX = 4096` bytes, `\s+` collapsed to one space and
   trimmed, kept only when they hold `[A-Za-z0-9]` and no NUL and, once
@@ -7606,25 +7615,22 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `pre_sha` holding any of the lines (`git grep -l -z -I -F -f <temp
   pattern file> pre_sha --`), read through one `git cat-file --batch` up
   to `_HELDOUT_BASE_SCAN_MAX = 64 MiB`, windowed the same way.
-  `_holds_heldout_span(pieces, prints)` slides each length over the pieces;
-  `_file_holds_span(path, prints)` streams a file through it (a symlink by
-  its target string); `_heldout_runner_copy(staged_rel, path)` is true for
-  `<dir>/__pycache__/<stem>.*` and `<dir>/__snapshots__/<name>.*`; and
-  `_history_heldout_hits(staging, pre_sha, post_sha, staged, prints) ->
-  list[str]` is every path of `git log --raw -m --no-abbrev --no-renames
-  -z pre..post` (`-m`: a merge's blobs against each parent) that is a
-  staged file, a runner copy of one, or whose new blob, read through one
-  `git cat-file --batch`, holds a span (unreadable history → the staged
-  files); a path under a `made` directory is not a hit by itself. A value
-  the test asserts — a literal, an identifier, a path — is never a span on
-  its own (review round 12 H1, `tests/test_heldout_bytes_never_reach_history.py`). The latter is unioned
+  `_holds_heldout_span(pieces, prints)` slides each length over the
+  pieces; `_history_heldout_hits(staging, pre_sha, post_sha, staged,
+  prints) -> list[str]` is every path of `git log --raw -m --no-abbrev
+  --no-renames -z pre..post` (`-m`: a merge's blobs against each parent)
+  that is a set file's path or whose new blob, read through one `git
+  cat-file --batch`, holds a span (unreadable history → the set files). A
+  value the test asserts — a literal, an identifier, a path — is never a
+  span on its own (`tests/test_heldout_bytes_never_reach_history.py`).
+  The commits' set paths and those hits are unioned
   into `committed_staged`; one implementer runs in staging (`_redrive_drive`:
   `_implementer_base_prompt` of the first member + `NOTE FROM
   ORCHESTRATOR:` `_redrive_note(...)`, `claude_p(schema_key="implementer",
   allowed_tools=ACT_TOOLS, max_turns=120, autonomous=True,
   sid="delivery-redrive-r<round>-g<group>")`, effort the resolved
-  implementer effort or `EFFORT_REDRIVE_ESCALATION`); then the set files
-  are removed (`tampered` recorded), the clean-tree gate runs (a group
+  implementer effort or `EFFORT_REDRIVE_ESCALATION`, with the self-check's
+  bin first on `PATH`); then the clean-tree gate runs (a group
   left dirty past its re-asks is rolled back), and, when HEAD moved, the shown sets (and, in a
   held-back round, the held-back ones) are re-measured and the repo's test
   command re-run for failing IDs (`_redrive_test_ids`, which is
@@ -10192,7 +10198,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `integration_unjudged` | dict[str, str] | per-sid write-ahead marker of an integrator merge not yet judged (`_mark_integration_unjudged`, DESIGN §6 *A committed resolution is not a judged one*): the merge's first parent, saved before the integrator is spawned and dropped once the integration is decided (`_clear_integration_unjudged`); a resume that finds it with no `integration_gate[sid]` and the sid merged runs the integration gate on the committed merge. |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[], unverified?{item_index: {sha, label}}}` (`unverified`: items a failed ratchet did not read on the commit it kept, `_ratchet_mark_unverified`) — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
-| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), tampered[], heldout_removed?[], heldout_listed?[] (files removed at unstage for holding a span of a staged set's source, listed by `_set_redrive_heldout_gap`), unclean_tree?[] (the porcelain lines a group's implementer left past `clean_tree_reasks`; the group is then `rolled_back`), committed_staged[] (staged paths — `git log --name-only -m pre..post` — runner copies of them, and paths whose committed blob holds a span of a staged set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], kept_unsettled?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
+| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), selfcheck_calls?[{args[], subset[], name_filter, rc, secs_total}] (the group's self-check calls, first 50), unclean_tree?[] (the porcelain lines a group's implementer left past `clean_tree_reasks`; the group is then `rolled_back`), committed_staged[] (shown set paths a commit names — `git log --name-only -m pre..post` — and paths whose committed blob holds a span of a shown set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], kept_unsettled?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution` or `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*). |

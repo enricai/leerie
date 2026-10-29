@@ -55,6 +55,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -6393,8 +6394,6 @@ def _needs_human_detail_groups() -> dict[str, str]:
         CONFIRM_BUDGET_GAP_SOURCE:
             "Regression checks the run could not settle",
         FINAL_DIFF_GAP_SOURCE: "Regression checks the run could not settle",
-        _REDRIVE_HELDOUT_GAP_SOURCE:
-            "Files removed for holding a hidden test's source",
     }
 
 
@@ -50787,20 +50786,14 @@ def _checkout_ignorable(wt: Path, rel: str) -> bool:
         return False
 
 
-def _checkout_ignore(wt: Path, rels: Iterable[str], *,
-                     patterns: Iterable[tuple[str, str]] = ()) -> list[str]:
+def _checkout_ignore(wt: Path, rels: Iterable[str]) -> list[str]:
     """Git-ignore the untracked paths `rels` in checkout `wt` only, through
     a self-ignoring `.gitignore` in each one's directory (a rel ending in
-    `/` ignores that whole directory). `patterns` adds raw gitignore
-    patterns `(directory, pattern)` to the same files — the cache entries
-    keyed to a staged file (`_heldout_companion_patterns`). A directory
-    with a `.gitignore` of its own — tracked, or the user's — is never
-    edited: its rels are returned, not ignored."""
+    `/` ignores that whole directory). A directory with a `.gitignore` of
+    its own — tracked, or the user's — is never edited: its rels are
+    returned, not ignored."""
     by_dir: dict[str, list[str]] = {}
     refused: list[str] = []
-    for d, pat in patterns:
-        if _checkout_ignorable(wt, d.strip("/") + "/"):
-            by_dir.setdefault(d.strip("/"), []).append(pat)
     for rel in rels:
         if not _checkout_ignorable(wt, rel):
             refused.append(rel)
@@ -50817,22 +50810,6 @@ def _checkout_ignore(wt: Path, rels: Iterable[str], *,
         gi.parent.mkdir(parents=True, exist_ok=True)
         gi.write_text("\n".join(lines) + "\n")
     return refused
-
-
-def _checkout_unignore(wt: Path, rels: Iterable[str]) -> None:
-    """Remove the `.gitignore` files `_checkout_ignore` wrote for `rels`
-    (only leerie's own: the tag is checked)."""
-    dirs = {rel.strip("/") if rel.endswith("/")
-            else os.path.dirname(rel.strip("/")) for rel in rels}
-    for d in dirs:
-        gi = wt / d / ".gitignore"
-        try:
-            ours = gi.read_text().splitlines()[:1] == [_CHECKOUT_IGNORE_TAG]
-        except (OSError, UnicodeDecodeError):
-            continue
-        if ours:
-            with contextlib.suppress(OSError):
-                gi.unlink()
 
 
 def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
@@ -51858,9 +51835,9 @@ def _redrive_exclude_clear(staging: Path, run_id: str) -> None:
     ex.write_text("\n".join(out) + ("\n" if out else ""))
 
 
-# A staged file is fingerprinted by its spans of this many consecutive
-# normalised source lines (DESIGN §8 *No line of a staged set's source
-# reaches history*, rule 2). A line that is only a literal and punctuation
+# A shown set file is fingerprinted by its spans of this many consecutive
+# normalised source lines (DESIGN §8 *A held-out set never enters a tree a
+# worker commits from*, the anti-cheat's rule 1). A line that is only a literal and punctuation
 # is not a line of code and is never in a span (`_heldout_pieces`), so a
 # value the test asserts — even one a formatter breaks over many lines —
 # is no span, and a span needs at least two code lines (review round 13
@@ -51873,7 +51850,7 @@ _HELDOUT_SPAN_LINES = 4
 # so one huge line (an inline base64 fixture, a minified bundle) is never
 # held whole.
 _HELDOUT_LINE_MAX = 4096
-# At most this many bytes of one staged file are fingerprinted.
+# At most this many bytes of one set file are fingerprinted.
 _HELDOUT_SOURCE_MAX = 1 << 20
 # At most this many bytes of the base's blobs are read to drop the spans the
 # repository already has; past it the rest are kept (the strict side).
@@ -51895,181 +51872,322 @@ _HELDOUT_LITERAL_RE = re.compile(
 _HELDOUT_IDENT_RE = re.compile(rb"[A-Za-z_]")
 
 
-def _heldout_companion_patterns(rel: str) -> list[tuple[str, str]]:
-    """The cache entries a runner keys to the staged file `rel`, as
-    `(directory, gitignore pattern)`: its bytecode (`__pycache__/<stem>.*`)
-    and its snapshots (`__snapshots__/<name>.*`)."""
-    d, name = os.path.split(rel.strip("/"))
-    stem = name.split(".", 1)[0] or name
-    return [(d, "/__pycache__/" + _gitignore_escape(stem) + ".*"),
-            (d, "/__snapshots__/" + _gitignore_escape(name) + ".*")]
+SELFCHECK_SCRIPT = ROOT / "scripts" / "selfcheck.py"
+# The test-name filter of each runner the self-check can pass one to (a
+# fixed CLI surface). vitest and jest share `-t`; pytest's `-k` takes an
+# expression over names.
+_SELFCHECK_NAME_FLAGS: dict[str, str] = {"vitest": "-t", "jest": "-t",
+                                         "pytest": "-k"}
+_SELFCHECK_NAME_ARGS = ("-t", "--testNamePattern", "-k")
+_SELFCHECK_CALLS_MAX = 50
 
 
-def _heldout_companions(staging: Path, rel: str) -> list[str]:
-    """The `_heldout_companion_patterns` entries of `rel` present now."""
-    d, name = os.path.split(rel.strip("/"))
-    stem = name.split(".", 1)[0] or name
-    out: list[str] = []
-    for sub, prefix in (("__pycache__", stem + "."),
-                        ("__snapshots__", name + ".")):
-        base = staging / d / sub
-        with contextlib.suppress(OSError):
-            for e in os.listdir(base):
-                if e.startswith(prefix) and (base / e).is_file():
-                    out.append(os.path.join(d, sub, e))
-    return sorted(out)
+def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
+                       shown: list[dict], label: str,
+                       db_url: str | None) -> dict:
+    """The delivery re-drive's out-of-tree self-check for one group (DESIGN
+    §8 *A held-out set never enters a tree a worker commits from*):
+    `<run>/selfcheck/<label>/` holding a read-only copy of the shown sets
+    (`sets/set-<index>/<rel>`, the source the note points at, outside the
+    read-denied `acceptance/`), the call's `config.json` and
+    `bin/leerie-selfcheck`. Returns `{dir, bin, command, src, run_files,
+    name_flag}`. Nothing is written to `staging`."""
+    root = st.run_dir / "selfcheck" / label
+    _rmtree_owned(root)
+    sets: list[dict] = []
+    for s_ in shown:
+        dst = root / "sets" / f"set-{s_.get('index')}"
+        for rel in _set_files(s_):
+            f = dst / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(s_["dir"]) / rel, f)
+            f.chmod(0o444)
+        sets.append({"index": s_.get("index"), "dir": str(dst),
+                     "defect_files": list(s_.get("defect_files") or []),
+                     "control_files": list(s_.get("control_files") or []),
+                     "support_files": list(s_.get("support_files") or [])})
+    run_files = sorted({r for s_ in sets
+                        for r in s_["defect_files"] + s_["control_files"]})
+    cmd = _acceptance_cmd(st, run_files, str(staging)) if run_files else None
+    runner = (_acceptance_runner(cmd, _RUNNER_REPORTS, run_files)
+              if cmd else None)
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    cfg = {"tree": str(staging), "repo_root": str(st.repo_root),
+           "sets": sets, "run_files": run_files,
+           "snap_root": str(root / "snap"),
+           "env": _test_db_env(db_url) if db_url else {},
+           "forbidden": _forbidden_specs(getattr(st, "data", None)),
+           "timeout": float(caps.get("worker_timeout_sec",
+                                     DEFAULT_CAPS["worker_timeout_sec"])),
+           "log": str(root / "calls.ndjson")}
+    (root / "config.json").write_text(json.dumps(cfg))
+    wrapper = bin_dir / "leerie-selfcheck"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        f"exec python3 {shlex.quote(str(SELFCHECK_SCRIPT))} "
+        f"{shlex.quote(str(root / 'config.json'))} \"$@\"\n")
+    wrapper.chmod(0o755)
+    return {"dir": str(root), "bin": str(bin_dir),
+            "command": str(wrapper) if cmd else None,
+            "src": str(root / "sets"), "run_files": run_files,
+            "name_flag": _SELFCHECK_NAME_FLAGS.get(runner or "")}
 
 
-def _staged_ignore_dirs(files: Iterable[str]) -> list[str]:
-    """`files` plus every ancestor directory of each (with a trailing `/`):
-    every `.gitignore` `_redrive_stage` can have written for them, so
-    `_checkout_unignore` removes all of leerie's (it checks the tag)."""
-    out: set[str] = set()
-    for f in files:
-        out.add(f)
-        d = os.path.dirname(f.strip("/"))
-        while d:
-            out.add(d + "/")
-            d = os.path.dirname(d)
-    return sorted(out)
+def _selfcheck_calls(sc: dict) -> list[dict]:
+    """The group's self-check calls, from the call log (first
+    `_SELFCHECK_CALLS_MAX`)."""
+    out: list[dict] = []
+    with contextlib.suppress(OSError):
+        for line in (Path(sc["dir"]) / "calls.ndjson").read_text(
+                ).splitlines()[:_SELFCHECK_CALLS_MAX]:
+            with contextlib.suppress(ValueError):
+                r = json.loads(line)
+                out.append({k: r.get(k) for k in (
+                    "args", "subset", "name_filter", "rc", "secs_total")})
+    return out
 
 
-def _redrive_stage(staging: Path, sets: list[dict]) -> list[dict]:
-    """X2: copy the shown sets read-only into staging and git-ignore them in
-    staging only (`_checkout_ignore`). A set whose path the tree already
-    has, or another staged set took, is skipped (never overwritten); so is
-    one with a file in a directory that has its own `.gitignore` (never
-    edited, so it could not be ignored). What appears under or beside a
-    staged file while the group runs is staged material too (DESIGN §8
-    *No line of a staged set's source reaches history*): a directory
-    staging had to create is ignored whole (`made`), and beside a file in
-    a directory that existed, its `_heldout_companion_patterns`. Returns
-    `[{set_index, dir, files, made}]`."""
-    taken: set[str] = set()
-    made_all: set[str] = set()
-    staged: list[dict] = []
-    for s_ in sets:
-        rels = _set_files(s_)
-        if not rels or not s_.get("dir") or any(
-                (staging / r).exists() or r in taken for r in rels):
-            log(f"  delivery re-drive: set {s_.get('index')} not staged — a "
-                "path already exists in the tree")
+def _selfcheck_cleanup(sc: dict | None) -> None:
+    if sc:
+        _rmtree_owned(Path(sc["dir"]))
+
+
+def _selfcheck_args(args: list[str], run_files: list[str]
+                    ) -> tuple[list[str], str | None, list[str]] | str:
+    """`(subset, name_filter, rest)` from the self-check's arguments, or a
+    usage error (bench I3-3's selection, FROZEN3): an argument that names
+    exactly one set test file — its path, its file name or a unique path
+    suffix — selects it, one that names several is an error;
+    `-t`/`--testNamePattern`/`-k` with a value (separate or `=`-joined)
+    is the test-name filter; anything else passes through to the
+    runner."""
+    subset: list[str] = []
+    name: str | None = None
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        flag = next((f for f in _SELFCHECK_NAME_ARGS
+                     if a == f or a.startswith(f + "=")), None)
+        if flag is not None and (a != flag or i + 1 < len(args)):
+            if a == flag:
+                name, i = args[i + 1], i + 2
+            else:
+                name, i = a[len(flag) + 1:], i + 1
             continue
-        if not all(_checkout_ignorable(staging, r) for r in rels):
-            log(f"  delivery re-drive: set {s_.get('index')} not staged — "
-                "its directory has a .gitignore of its own")
+        if not a.startswith("-"):
+            want = os.path.normpath(a)
+            hit = [f for f in run_files
+                   if f == want or f.endswith("/" + want)]
+            if len(hit) > 1:
+                return (f"`{a}` matches more than one set file: "
+                        + ", ".join(hit))
+            if hit:
+                if hit[0] not in subset:
+                    subset.append(hit[0])
+                i += 1
+                continue
+        rest.append(a)
+        i += 1
+    return sorted(subset), name, rest
+
+
+def _selfcheck_snapshot(tree: str, snap: Path) -> int:
+    """Copy `tree`'s working files — what `git ls-files --cached --others
+    --exclude-standard` lists and exists: HEAD, its edits, its untracked,
+    not-ignored files — into `snap`. No temporary index: an `add -A`
+    through one would hash every one of them into the object store, a
+    worker's copy of a set included (DESIGN §8 *No set byte enters the
+    repository's object store*); this writes no git object. Returns the
+    number of files copied."""
+    r = subprocess.run(["git", "-C", tree, "ls-files", "-z", "--cached",
+                        "--others", "--exclude-standard"],
+                       capture_output=True, check=False)
+    if r.returncode != 0:
+        raise RuntimeError("git ls-files failed: "
+                           + r.stderr.decode(errors="replace")[-300:])
+    files = []
+    for rel in sorted({x for x in os.fsdecode(r.stdout).split("\0") if x}):
+        src = Path(tree) / rel
+        if src.is_dir() and not src.is_symlink():
+            continue                      # a gitlink
+        if src.is_symlink() or src.exists():
+            files.append(rel)             # else deleted in the working tree
+    # One tar pipe, not a copy per file: measured on a 2,778-file tree,
+    # 0.2 s against 1.2 s. Symlinks stay symlinks (no `-h`).
+    pack = subprocess.Popen(
+        ["tar", "-C", tree, "--null", "--no-recursion", "-T", "-", "-cf",
+         "-"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE)
+    unpack = subprocess.Popen(["tar", "-C", str(snap), "-xf", "-"],
+                              stdin=pack.stdout, stderr=subprocess.PIPE)
+    assert pack.stdin is not None and pack.stdout is not None
+    pack.stdout.close()
+    pack.stdin.write(b"".join(os.fsencode(f) + b"\0" for f in files))
+    pack.stdin.close()
+    if unpack.wait() != 0 or pack.wait() != 0:
+        raise RuntimeError("copying the working tree failed: " + (
+            (pack.stderr.read() if pack.stderr else b"")
+            + (unpack.stderr.read() if unpack.stderr else b"")
+        ).decode(errors="replace")[-300:])
+    return len(files)
+
+
+def _selfcheck_share_ignored(tree: str, snap: Path,
+                             set_files: list[str]) -> list[str]:
+    """Symlink every ignored path of `tree` (`node_modules`, nested ones, a
+    generated client, build output) into `snap`, so nothing is installed
+    or generated per call — except a path that is a set file or holds one:
+    a set file placed through such a link would be written into `tree`."""
+    r = subprocess.run(["git", "-C", tree, "ls-files", "-z", "--others",
+                        "--ignored", "--exclude-standard", "--directory"],
+                       capture_output=True, check=False)
+    linked: list[str] = []
+    for rel in os.fsdecode(r.stdout).split("\0"):
+        rel = rel.rstrip("/")
+        if not rel or any(f == rel or f.startswith(rel + "/")
+                          for f in set_files):
             continue
-        made: set[str] = set()
-        for rel in rels:
-            top = None
-            d = os.path.dirname(rel)
-            while d and not (staging / d).exists():
-                top = d
-                d = os.path.dirname(d)
-            if top and not any(top == m or top.startswith(m + "/")
-                               for m in made_all):
-                made.add(top)
+        dst = snap / rel
+        if dst.exists() or dst.is_symlink():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(Path(tree) / rel, dst)
+        linked.append(rel)
+    return linked
+
+
+def _selfcheck_say(msg: str) -> None:
+    """The self-check's own output: its caller is the worker's shell, which
+    reads stdout verbatim — `log()`'s prefix would only add noise there."""
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+
+def _selfcheck_main(argv: list[str]) -> int:
+    """`scripts/selfcheck.py <config.json> [args…]`: run the shown sets
+    against a copy of the worker's current working tree, outside it (DESIGN
+    §8 *A held-out set never enters a tree a worker commits from*). Exit:
+    the runner's, 3 for a set path the tree already has, 2 for a usage
+    error, 124 for a timeout."""
+    if len(argv) < 2:
+        _selfcheck_say("usage: leerie-selfcheck [set file…] [-t PATTERN] "
+                       "[runner args…]")
+        return 2
+    cfg = json.loads(Path(argv[1]).read_text())
+    tree = os.path.realpath(cfg["tree"])
+    sets = cfg["sets"]
+    run_files = list(cfg["run_files"])
+    set_files = sorted({f for s_ in sets for f in _set_files(s_)})
+    parsed = _selfcheck_args(list(argv[2:]), run_files)
+    if isinstance(parsed, str):
+        _selfcheck_say(f"SELF-CHECK ERROR: {parsed}")
+        return 2
+    subset, name, rest = parsed
+    rec: dict = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                 "args": list(argv[2:]), "subset": subset,
+                 "name_filter": name}
+    t0 = time.monotonic()
+    root = Path(cfg["snap_root"])
+    root.mkdir(parents=True, exist_ok=True)
+
+    def _exit_on(signum: int, _frame: object) -> None:
+        # A shell timeout or a cancelled tool call signals the command; as
+        # an exception it unwinds through the `finally` that deletes the
+        # copy (and `subprocess.run` kills the runner on its way out).
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, _exit_on)
+    snap = Path(tempfile.mkdtemp(prefix="sc-", dir=root))
+    rc = 99
+    try:
+        rec["files"] = _selfcheck_snapshot(tree, snap)
+        rec["shared"] = len(_selfcheck_share_ignored(tree, snap, set_files))
+        rec["secs_snapshot"] = round(time.monotonic() - t0, 2)
+        collide = [f for f in set_files
+                   if (snap / f).exists() or (snap / f).is_symlink()]
+        if collide:
+            _selfcheck_say("SELF-CHECK ERROR: your tree has files at the acceptance "
+                  "set's paths; the set is never placed over them. Remove "
+                  "or rename these in your tree and run again:\n"
+                  + "\n".join("  " + f for f in collide))
+            rc = 3
+            return rc
+        for s_ in sets:
+            copied, _complete = _place_set(s_, snap)
+            for f in copied:
+                f.chmod(0o444)
+        run = subset or run_files
+        cmd = _acceptance_cmd(
+            types.SimpleNamespace(repo_root=Path(cfg["repo_root"])),
+            run, str(snap))
+        if not cmd:
+            _selfcheck_say("SELF-CHECK ERROR: no test command here can run these "
+                  "files")
+            rc = 2
+            return rc
+        runner = _acceptance_runner(cmd, _RUNNER_REPORTS, run)
+        extra: list[str] = []
+        if name is not None:
+            flag = _SELFCHECK_NAME_FLAGS.get(runner or "")
+            if flag is None:
+                _selfcheck_say("SELF-CHECK ERROR: this repository's test runner "
+                      "takes no test-name filter here; name set files "
+                      "instead")
+                rc = 2
+                return rc
+            extra += [flag, name]
+        extra += rest
+        if extra:
+            placed = (_append_runner_flags(
+                cmd, runner, run, " ".join(shlex.quote(x) for x in extra))
+                if runner else None)
+            if placed is None:
+                _selfcheck_say("SELF-CHECK ERROR: those arguments cannot be passed "
+                      "to this repository's test runner")
+                rc = 2
+                return rc
+            cmd = placed
         try:
-            for rel in rels:
-                dst = staging / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(Path(s_["dir"]) / rel, dst)
-                dst.chmod(0o444)
-        except OSError as e:
-            log(f"  delivery re-drive: set {s_.get('index')} not staged "
-                f"({type(e).__name__})")
-            for rel in rels:
-                with contextlib.suppress(OSError):
-                    (staging / rel).chmod(0o644)
-                    (staging / rel).unlink()
-            for m in made:
-                shutil.rmtree(staging / m, ignore_errors=True)
-            continue
-        taken |= set(rels)
-        made_all |= made
-        staged.append({"set_index": s_.get("index"), "dir": s_["dir"],
-                       "files": rels, "made": sorted(made)})
-    _checkout_ignore(
-        staging, sorted(taken) + [m + "/" for m in sorted(made_all)],
-        patterns=[pt for r in sorted(taken)
-                  for pt in _heldout_companion_patterns(r)])
-    return staged
-
-
-def _redrive_unstage(staging: Path, staged: list[dict], *,
-                     swept: list[str] | None = None,
-                     prints: dict[int, frozenset[bytes]] | None = None,
-                     span_held: list[str] | None = None) -> list[str]:
-    """Remove the staged copies, their `.gitignore` files and the
-    directories only they needed, with every runner copy of them (DESIGN §8
-    *No line of a staged set's source reaches history*, rule 1): beside
-    each staged file its `_heldout_companions`, and under each directory
-    staging created every runner copy of a staged file and every file
-    holding one of `prints`' spans; those removed paths are appended to
-    `swept`. Any other file there — the implementer's own sibling test or
-    conftest — stays, for the implementer to commit (review round 12: the
-    whole directory used to go, silently). A removed file that is neither a
-    staged file nor a runner copy of one is a file someone wrote there that
-    held a span: it is also appended to `span_held`, which the caller lists
-    in the PR (`heldout_listed`; review round 13 M2: it was deleted
-    with no entry anywhere but the group's record). Returns the staged files
-    whose bytes changed."""
-    tampered: list[str] = []
-    files = [f for s_ in staged for f in s_["files"]]
-    _checkout_unignore(staging, _staged_ignore_dirs(files))
-    gone: list[str] = []
-    for s_ in staged:
-        for rel in s_["files"]:
-            gone += _heldout_companions(staging, rel)
-            dst = staging / rel
-            if not dst.exists():
-                continue
-            try:
-                if dst.read_bytes() != (Path(s_["dir"]) / rel).read_bytes():
-                    tampered.append(rel)
-            except OSError:
-                tampered.append(rel)
+            run_argv = _blt_shell_argv(cmd, cfg.get("forbidden") or [])
+        except ForbiddenByTask as e:
+            _selfcheck_say(f"SELF-CHECK ERROR: {e}")
+            rc = 2
+            return rc
+        env = {**os.environ, **(cfg.get("env") or {}),
+               "GIT_CEILING_DIRECTORIES": str(root)}
+        _selfcheck_say(f"SELF-CHECK: {cmd}")
+        t1 = time.monotonic()
+        # Its own process group, killed whole on every way out: a runner's
+        # children (a worker pool, a wrapper's server) would otherwise
+        # outlive the copy they run in.
+        proc = subprocess.Popen(run_argv, cwd=snap, env=env,
+                                start_new_session=True)
+        try:
+            rc = proc.wait(timeout=float(cfg.get("timeout") or 1800))
+        except subprocess.TimeoutExpired:
+            _selfcheck_say("SELF-CHECK: the runner timed out")
+            rc = 124
+        finally:
             with contextlib.suppress(OSError):
-                dst.chmod(0o644)
-                dst.unlink()
-    for rel in gone:
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=10)
+        rec["secs_run"] = round(time.monotonic() - t1, 2)
+        return rc
+    finally:
+        _rmtree_owned(snap)
+        rec["rc"] = rc
+        rec["secs_total"] = round(time.monotonic() - t0, 2)
+        if rc not in (2, 3):
+            _selfcheck_say(f"\nSELF-CHECK {'PASSED' if rc == 0 else 'FAILED'} "
+                  f"(exit {rc}) in {rec['secs_total']}s — ran against a "
+                  "copy of your current working tree (uncommitted changes "
+                  "included); nothing was written to your tree.")
         with contextlib.suppress(OSError):
-            (staging / rel).unlink()
-    for s_ in staged:
-        for m in s_.get("made") or []:
-            top = staging / m
-            if not top.is_dir() or top.is_symlink():
-                continue
-            for p in sorted(top.rglob("*")):
-                if not (p.is_file() or p.is_symlink()):
-                    continue
-                rel = os.path.relpath(p, staging)
-                copy = (rel in files
-                        or any(_heldout_runner_copy(f, rel) for f in files))
-                if copy or _file_holds_span(p, prints or {}):
-                    gone.append(rel)
-                    if not copy and span_held is not None:
-                        span_held.append(rel)
-                    with contextlib.suppress(OSError):
-                        p.chmod(0o644)
-                        p.unlink()
-            for p in sorted(top.rglob("*"), key=lambda x: -len(str(x))):
-                if p.is_dir() and not p.is_symlink():
-                    with contextlib.suppress(OSError):
-                        p.rmdir()
-            with contextlib.suppress(OSError):
-                top.rmdir()
-        for d in sorted({(staging / r).parent for r in s_["files"]}
-                        | {(staging / r).parent / sub
-                           for r in s_["files"]
-                           for sub in ("__pycache__", "__snapshots__")},
-                        key=lambda p: -len(str(p))):
-            with contextlib.suppress(OSError):
-                d.rmdir()
-    if swept is not None:
-        own = set(files)
-        swept += sorted(set(g for g in gone if g not in own))
-    return tampered
+            with open(cfg["log"], "a") as f:
+                f.write(json.dumps(rec) + "\n")
 
 
 def _heldout_pieces(read: Callable[[int], bytes]) -> Iterator[bytes]:
@@ -52125,8 +52243,9 @@ def _holds_heldout_span(pieces: Iterable[bytes],
 
 def _heldout_fingerprints(staging: Path, staged: list[dict],
                           base_rev: str) -> dict[int, frozenset[bytes]]:
-    """The spans of source that identify the staged files (DESIGN §8 *No
-    line of a staged set's source reaches history*, rule 2), keyed by span
+    """The spans of source that identify the shown set files (DESIGN §8 *A
+    held-out set never enters a tree a worker commits from*, the
+    anti-cheat's rule 1), keyed by span
     length: every window of `_HELDOUT_SPAN_LINES` consecutive normalised
     code lines (`_heldout_pieces`) of each staged file, or one window of
     all of a shorter file's when it has at least `_HELDOUT_SPAN_MIN`,
@@ -52188,49 +52307,15 @@ def _heldout_fingerprints(staging: Path, staged: list[dict],
     return {n: frozenset(v) for n, v in spans.items() if v}
 
 
-def _file_holds_span(path: Path,
-                     prints: dict[int, frozenset[bytes]]) -> bool:
-    """True when the file at `path` holds one of the staged sets' spans
-    (`_heldout_fingerprints`), read a line piece at a time. A symlink is
-    read as its target's path, never followed."""
-    if not prints:
-        return False
-    try:
-        if path.is_symlink():
-            return _holds_heldout_span(
-                _bytes_pieces(os.fsencode(os.readlink(path))), prints)
-        if not path.is_file():
-            return False
-        with open(path, "rb") as f:
-            return _holds_heldout_span(_heldout_pieces(f.readline), prints)
-    except OSError:
-        return False
-
-
-def _heldout_runner_copy(staged_rel: str, path: str) -> bool:
-    """True when `path` is an entry a runner keys to the staged file
-    `staged_rel` (`_heldout_companion_patterns`): `<dir>/__pycache__/
-    <stem>.*` or `<dir>/__snapshots__/<name>.*`."""
-    d, name = os.path.split(staged_rel.strip("/"))
-    stem = name.split(".", 1)[0] or name
-    pd, pn = os.path.split(path)
-    return ((pd == os.path.join(d, "__pycache__")
-             and pn.startswith(stem + "."))
-            or (pd == os.path.join(d, "__snapshots__")
-                and pn.startswith(name + ".")))
-
-
 def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
                           staged: list[dict],
                           prints: dict[int, frozenset[bytes]]) -> list[str]:
     """The paths any commit in `pre_sha..post_sha` added or changed that
-    carry a staged set's source (DESIGN §8 *No line of a staged set's
-    source reaches history*, rule 3): a staged file, a runner's copy of one
-    (`_heldout_runner_copy`), or a blob holding one of `prints`' spans —
-    never a path merely for lying under a directory staging created, since
-    the implementer's own sibling test there is the change. Every commit's
-    blobs, not the net diff: a file committed and then deleted is still in
-    the history."""
+    carry a shown set's source (DESIGN §8 *A held-out set never enters a
+    tree a worker commits from*, the anti-cheat's rule 2): a set file's
+    path, or a blob holding one of `prints`' spans. Every commit's blobs,
+    not the net diff: a file committed and then deleted is still in the
+    history."""
     own = {f for s_ in staged for f in s_["files"]}
     # `-m`: a merge commit's own blobs (an evil merge's resolution) are
     # shown against each parent; without it `--raw` lists nothing for a
@@ -52253,7 +52338,7 @@ def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
         i += 2
         parts = meta.split()
         new = parts[3] if len(parts) >= 5 else ""
-        if path in own or any(_heldout_runner_copy(f, path) for f in own):
+        if path in own:
             hits.add(path)
         if new and set(new) != {"0"} and prints:
             blobs.setdefault(new, set()).add(path)
@@ -53409,9 +53494,10 @@ def _redrive_escalate(st: "State", caps: dict, members: list[str],
 
 def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
                   merged: list[dict], held_names: list[dict],
-                  defect_shape: str, selfcheck_files: list[str],
-                  selfcheck_cmd: str | None) -> str:
-    """The typed DELIVERY RE-DRIVE note (bench P8d / Q3 L1 wording)."""
+                  defect_shape: str, selfcheck: dict | None) -> str:
+    """The typed DELIVERY RE-DRIVE note (bench P8d / Q3 L1 wording; its
+    SELF-CHECK section the out-of-tree command, bench I3 OUT3 wording).
+    `selfcheck` is `_selfcheck_prepare`'s result, or None."""
     shown: list[dict] = []
     for n in notes:
         k = n["kind"]
@@ -53476,21 +53562,33 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
                                       if h.get("kind") == "control" else "")
                 for h in held_names)
             + "\nDEFECT CONTRACT: " + (defect_shape or "(none recorded)"))
-    if selfcheck_files and selfcheck_cmd:
+    if selfcheck:
+        cmd = selfcheck["command"]
+        files = selfcheck["run_files"]
+        first = os.path.basename(files[0]) if files else ""
         parts.append(
             "SELF-CHECK: the " + ("already-passing part of the "
                                   if held_names else "")
-            + "acceptance set is staged READ-ONLY in this tree at these paths "
-            "(git-ignored; do not edit, move, copy or commit them):\n"
-            + "\n".join("  - " + f for f in selfcheck_files)
-            + f"\nRun exactly this command to check your work against it:\n"
-            f"  {selfcheck_cmd}")
+            + "acceptance set is NOT in this tree. Its source is readable, "
+            f"read-only, under {selfcheck['src']} (one directory per set, "
+            "laid out by repository path); its test files are:\n"
+            + "\n".join("  - " + f for f in files)
+            + "\nRun this command to check your work against it. It copies "
+            "your current working tree (uncommitted changes included) "
+            "outside this tree, places the set there, runs it and prints "
+            "the result; nothing is written to your tree:\n"
+            f"  {cmd}\n"
+            "To check part of the set, name one or more of its files (path "
+            f"or file name), e.g. `{cmd} {first}`"
+            + (f", or filter tests by name, e.g. `{cmd} "
+               f"{selfcheck['name_flag']} '<name pattern>'`"
+               if selfcheck.get("name_flag") else "")
+            + ". Do not copy the set's files into this tree.")
     parts.append(
         "Fix the cause in the production code. Do not special-case test "
         "inputs or copy literals from tests into production code, and do not "
         "weaken, delete or skip any existing test. Done means every listed "
-        "case passes" + (" with the command above"
-                         if selfcheck_files and selfcheck_cmd else "")
+        "case passes" + (" with the command above" if selfcheck else "")
         + ", every listed item is met, and no test that passes on this tree "
         "now fails. Commit your change.")
     return "\n".join(parts)
@@ -53499,10 +53597,12 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
 async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
                          models: dict, staging: Path, members: list[str],
                          note: str, *, effort: str | None,
-                         label: str) -> dict:
+                         label: str, bin_dir: str | None = None) -> dict:
     """One implementer session in staging for the group, as its first
-    member, with the note. A failure is recorded, never raised: what the
-    worker committed is measured all the same."""
+    member, with the note; `bin_dir` (the self-check's, DESIGN §8 *A
+    held-out set never enters a tree a worker commits from*) goes first on
+    its `PATH`. A failure is recorded, never raised: what the worker
+    committed is measured all the same."""
     up = _implementer_base_prompt(
         members[0], leerie_dir, caps, st,
         cwd_line="Your current working directory IS the integrated staging "
@@ -53518,7 +53618,10 @@ async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
             allowed_tools=ACT_TOOLS, max_turns=120, autonomous=True,
             caps=caps, st=st,
             model=models.get("implementer", MODEL_DEFAULT),
-            effort=effort, sid=label)
+            effort=effort, sid=label,
+            **({"env_extra": {"PATH": bin_dir + os.pathsep
+                              + os.environ.get("PATH", "")}}
+               if bin_dir else {}))
         return {"status": res.get("status"),
                 "summary": str(res.get("summary") or "")[:500]}
     except (WorkerError, subprocess.TimeoutExpired) as e:
@@ -53865,42 +53968,6 @@ def _redrive_key_text(key: str) -> str:
     return f"existing test `{key}`"
 
 
-_REDRIVE_HELDOUT_GAP_SOURCE = "redrive_heldout_removed"
-
-
-def _set_redrive_heldout_gap(st: "State", rec: dict) -> None:
-    """The "Needs human verification" entry for the files a kept re-drive
-    group wrote under a directory staging created that held a span of a
-    staged set's source and were removed at unstage (`heldout_listed`;
-    DESIGN §8 *No line of a staged set's source reaches history*, rule 1).
-    Cleared when there is none."""
-    data = getattr(st, "data", None)
-    if not isinstance(data, dict):
-        return
-    paths: list[str] = []
-    for r in rec.get("rounds") or []:
-        for g in r.get("groups") or []:
-            if not isinstance(g, dict) or g.get("rolled_back"):
-                continue
-            paths += [p for p in g.get("heldout_listed") or []
-                      if p not in paths]
-    entries = [e for e in (data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict) and e.get("source")
-                       == _REDRIVE_HELDOUT_GAP_SOURCE)]
-    if paths:
-        entries.append({
-            "source": _REDRIVE_HELDOUT_GAP_SOURCE,
-            "detail": ("delivery re-drive: file(s) an implementer wrote "
-                       "beside a hidden test, removed for holding lines of "
-                       "its source: " + ", ".join(paths[:10])
-                       + (f" (+{len(paths) - 10} more)"
-                          if len(paths) > 10 else ""))})
-    if entries != (data.get("needs_human_verification") or []):
-        data["needs_human_verification"] = entries
-        with contextlib.suppress(Exception):
-            st.save()
-
-
 async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                 models: dict[str, str],
                                 efforts: dict[str, str | None]) -> None:
@@ -53924,11 +53991,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
 
     flight = rec.get("in_flight")
     if isinstance(flight, dict):
-        # A crash mid-group: what it left is unknown, so it is undone. The
-        # staged files' `.gitignore` files go first, so `clean -fd` takes
-        # the files with them.
-        _checkout_unignore(staging, _staged_ignore_dirs(
-            flight.get("stage_files") or []))
+        # A crash mid-group: what it left is unknown, so it is undone; its
+        # self-check directory (never in staging) goes too.
+        _rmtree_owned(st.run_dir / "selfcheck")
         _redrive_exclude_clear(staging, run_id)
         if flight.get("pre_sha"):
             ok = await _redrive_rollback(staging, flight["pre_sha"])
@@ -54068,9 +54133,6 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     prior_members: list[str] = []
     ids_before = await _redrive_test_ids(st, caps, staging, "redrive-ids0")
     rechecked_sha = rec.get("items_rechecked_sha")
-    selfcheck_cmd_files = sorted({r for s_ in shown
-                                  for r in (s_.get("defect_files") or [])
-                                  + (s_.get("control_files") or [])})
 
     def set_note(k: str, v: dict, kind: str) -> dict:
         s_ = by_index.get(v["set_index"]) or {}
@@ -54163,86 +54225,66 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 ge["skipped"] = "head_unreadable"
                 break
             ge["pre_sha"] = pre_sha
-            # The files staging may place, saved before it does: a crash
-            # leaves them git-ignored (they survive `clean -fd`), so the
-            # resume undoes their `.gitignore` files by this list.
-            rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi,
-                                "stage_files": sorted({
-                                    f for s_ in shown
-                                    for f in _set_files(s_)})}
+            rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi}
             for m in members:
                 _consume_redrive(st, m)
             _save()
             t0 = time.monotonic()
-            staged: list[dict] = []
-            prints: dict[int, frozenset[bytes]] = {}
-            try:
-                staged = _redrive_stage(staging, shown)
-                # Inside the `finally` that unstages: nothing between
-                # staging and the drive can leave a hidden test in staging
-                # (review round 12 L1).
-                prints = await asyncio.to_thread(
-                    _heldout_fingerprints, staging, staged, pre_sha)
-                staged_files = sorted({
-                    f for s_ in staged for f in s_["files"]
-                    if f in selfcheck_cmd_files})
-                cmd = (_acceptance_cmd(st, staged_files, str(staging))
-                       if staged_files else None)
-                merged = [{"id": m,
-                           "title": (specs.get(m) or {}).get("title"),
-                           "intent": (specs.get(m) or {}).get("intent")}
-                          for m in members[1:]]
-                held_names = ([{"name": c, "kind": n["kind"][5:]}
-                               for n in live
-                               if n["kind"].startswith("held_")
-                               for c in (n.get("cases")
-                                         or [])[:_REDRIVE_CASES_MAX]]
-                              if held_mode else [])
-                note = _redrive_note(
-                    [n for n in gnotes
-                     if not n["kind"].startswith("held_")],
-                    rnd=rnd, rounds=cap, merged=merged,
-                    held_names=held_names,
-                    defect_shape=shape, selfcheck_files=staged_files,
-                    selfcheck_cmd=cmd)
-                effort = (EFFORT_REDRIVE_ESCALATION if escalate
-                          else efforts.get("implementer"))
-                ge["implementer"] = await _redrive_drive(
-                    leerie_dir, st, caps, models, staging, members, note,
-                    effort=effort, label=f"delivery-redrive-r{rnd}-g{gi}")
-            finally:
-                swept: list[str] = []
-                span_held: list[str] = []
-                ge["tampered"] = _redrive_unstage(staging, staged,
-                                                  swept=swept,
-                                                  prints=prints,
-                                                  span_held=span_held)
-            heldout_removed = swept + [p for p in span_held
-                                       if p not in swept]
-            if heldout_removed:
-                ge["heldout_removed"] = heldout_removed[:20]
-            if span_held:
-                # A file written under a directory staging created that held
-                # a span went at unstage: someone wrote it, so it is listed
-                # (DESIGN §8 *No line of a staged set's source reaches
-                # history*, rule 1).
-                ge["heldout_listed"] = sorted(set(span_held))[:200]
-            # I1 (DESIGN §8 *A worker leaves its tree clean*): after the
-            # staged sets are out again, so it sees what the implementer
-            # left and not what leerie placed. Still dirty after the
-            # re-asks, the group is rolled back like any other and recorded.
-            # A group that committed a staged file is voided below (rule 3)
-            # whatever its tree holds — and unstaging that file is leerie's
-            # own deletion of a tracked path, not the worker's to answer.
-            now_sha = await _branch_head_sha(str(staging))
-            leaked = bool(now_sha and now_sha != pre_sha and set(
-                _redrive_git(staging, "log", "--format=", "--name-only",
-                             "-m", f"{pre_sha}..{now_sha}").split())
-                & {f for s_ in staged for f in s_["files"]})
-            unclean = [] if leaked else await _clean_tree_gate(
+            # The shown sets' source, for the anti-cheat history check
+            # (DESIGN §8 *A held-out set never enters a tree a worker
+            # commits from*); the sets themselves never enter staging.
+            staged = [{"dir": s_["dir"], "files": _set_files(s_)}
+                      for s_ in shown if s_.get("dir")]
+            prints = await asyncio.to_thread(
+                _heldout_fingerprints, staging, staged, pre_sha)
+            sc: dict | None = None
+            label = f"delivery-redrive-r{rnd}-g{gi}"
+            effort = (EFFORT_REDRIVE_ESCALATION if escalate
+                      else efforts.get("implementer"))
+            async with _test_db_session(st):
+                db_url = (await _create_test_db(st, staging,
+                                                f"redrive-r{rnd}g{gi}")
+                          if shown else None)
+                try:
+                    if shown:
+                        sc = _selfcheck_prepare(st, caps, staging, shown,
+                                                label, db_url)
+                    merged = [{"id": m,
+                               "title": (specs.get(m) or {}).get("title"),
+                               "intent": (specs.get(m) or {}).get("intent")}
+                              for m in members[1:]]
+                    held_names = ([{"name": c, "kind": n["kind"][5:]}
+                                   for n in live
+                                   if n["kind"].startswith("held_")
+                                   for c in (n.get("cases")
+                                             or [])[:_REDRIVE_CASES_MAX]]
+                                  if held_mode else [])
+                    note = _redrive_note(
+                        [n for n in gnotes
+                         if not n["kind"].startswith("held_")],
+                        rnd=rnd, rounds=cap, merged=merged,
+                        held_names=held_names, defect_shape=shape,
+                        selfcheck=sc if sc and sc.get("command") else None)
+                    ge["implementer"] = await _redrive_drive(
+                        leerie_dir, st, caps, models, staging, members,
+                        note, effort=effort, label=label,
+                        bin_dir=sc["bin"] if sc else None)
+                finally:
+                    if sc:
+                        calls = _selfcheck_calls(sc)
+                        if calls:
+                            ge["selfcheck_calls"] = calls
+                    _selfcheck_cleanup(sc)
+                    _drop_test_db(db_url)
+            # I1 (DESIGN §8 *A worker leaves its tree clean*): nothing of
+            # leerie's is in staging (its self-check runs outside it), so
+            # this sees exactly what the implementer left. Still dirty after
+            # the re-asks, the group is rolled back like any other and
+            # recorded.
+            unclean = await _clean_tree_gate(
                 staging, caps=caps, label=f"delivery re-drive r{rnd} g{gi}",
                 reask=_clean_tree_reasker(
-                    st, caps, log_sid=f"delivery-redrive-r{rnd}-g{gi}",
+                    st, caps, log_sid=label,
                     cwd=str(staging), schema_key="implementer",
                     system_prompt=_load_prompt("implementer"),
                     model=models.get("implementer", MODEL_DEFAULT),
@@ -54278,7 +54320,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             if not post_sha or post_sha == pre_sha:
                 ge["no_change"] = True
             else:
-                # Every commit's files, not the net diff: a staged file
+                # Every commit's files, not the net diff: a set file
                 # committed and then deleted is still in the history.
                 changed = _redrive_git(staging, "log", "--format=",
                                        "--name-only", "-m",
@@ -54297,12 +54339,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     H1, unm_h = await measure(held, f"redrive-r{rnd}g{gi}-held")
                     H1 = (None if unm_h and len(unm_h) == len(held)
                           else _redrive_carry(H, H1, unm_h))
-                # A group that committed a staged file is void (rule 3), and
-                # its tree is not clean — the unstage deleted that tracked
-                # path — so it is not measured: `_ratchet_exec` reads None as
-                # unmeasured, never a stop of `_assert_staging_clean`.
-                ids_after = (None if leaked else await _redrive_test_ids(
-                    st, caps, staging, f"redrive-r{rnd}g{gi}-ids"))
+                ids_after = await _redrive_test_ids(
+                    st, caps, staging, f"redrive-r{rnd}g{gi}-ids")
                 newv = await _ratchet_exec(
                     st, caps, staging, pre_sha, ids_before, ids_after,
                     label=f"redrive-r{rnd}g{gi}",
@@ -54332,7 +54370,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                              "worse", "trade")})
                 void = False
                 if committed:
-                    void = True   # a hidden test must never reach history
+                    void = True   # a set's source must never reach history
                 # Zero progress: the group had failing set cases it could be
                 # measured on, and fixed none of them — counted in cases,
                 # not files. A change that measurably fixes nothing is
@@ -54539,7 +54577,6 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             st.save()
     rec["final_sha"] = final
     rec["done"] = True
-    _set_redrive_heldout_gap(st, rec)
     _save()
     log("  delivery re-drive: done"
         + (f" — conflict: {rec['conflict']['reason']}"

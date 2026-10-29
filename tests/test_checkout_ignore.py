@@ -6,9 +6,10 @@ rev-parse --git-path info/exclude` resolves to the common dir. The
 falsifier's `_git_exclude` appended its leads and the task's referenced
 files there and never removed them, so the report the user had written
 (`docs/bug-report.md`, untracked) vanished from their own `git status`
-for good, and `_redrive_stage` used the same shared file. These tests are
-the review's driver (`exclude_leak.sh`) on real git, in a linked worktree,
-plus the delivery re-drive's staging and the helper's refusals.
+for good. These tests are the review's driver (`exclude_leak.sh`) on real
+git, in a linked worktree, plus the helper's refusals. (The delivery
+re-drive no longer places anything in its checkout:
+tests/test_redrive_selfcheck_out_of_tree.py.)
 """
 from __future__ import annotations
 
@@ -89,40 +90,6 @@ def test_falsifier_leads_leave_the_users_checkout_alone(leerie, tmp_path):
     assert _git(repo, "status", "--porcelain") == before_status
 
 
-def test_redrive_staging_is_ignored_per_checkout_and_undone(leerie,
-                                                             tmp_path):
-    repo = _user_repo(tmp_path)
-    (repo / "notes.md").write_text("mine\n")            # user's untracked
-    before_ex = _shared_exclude(repo)
-    staging = _linked(repo, "staging")
-    sdir = tmp_path / "set1"
-    (sdir / "src" / "deep").mkdir(parents=True)
-    (sdir / "src" / "a.test.ts").write_text("t\n")
-    (sdir / "src" / "deep" / "b.test.ts").write_text("t\n")
-    s1 = {"index": 1, "dir": str(sdir), "valid": True,
-          "defect_files": ["src/a.test.ts", "src/deep/b.test.ts"],
-          "control_files": [], "support_files": []}
-    staged = leerie._redrive_stage(staging, [s1])
-    assert [s["set_index"] for s in staged] == [1]
-    assert _shared_exclude(repo) == before_ex
-    # An implementer's `git add -A` cannot take them; `clean -fd` keeps them.
-    (staging / "src" / "fix.ts").write_text("ok\n")
-    _git(staging, "add", "-A")
-    assert _git(staging, "diff", "--cached", "--name-only").split() == [
-        "src/fix.ts"]
-    _git(staging, "reset", "-q")
-    (staging / "src" / "fix.ts").unlink()
-    _git(staging, "clean", "-fdq")
-    assert (staging / "src" / "deep" / "b.test.ts").is_file()
-    assert leerie._redrive_unstage(staging, staged) == []
-    assert not (staging / "src" / ".gitignore").exists()
-    assert not (staging / "src" / "deep").exists()
-    assert _git(staging, "status", "--porcelain",
-                "--untracked-files=all") == ""
-    assert _shared_exclude(repo) == before_ex
-    assert "notes.md" in _git(repo, "status", "--porcelain")
-
-
 def test_a_directory_with_its_own_gitignore_is_never_edited(leerie,
                                                            tmp_path):
     repo = _user_repo(tmp_path)
@@ -130,24 +97,12 @@ def test_a_directory_with_its_own_gitignore_is_never_edited(leerie,
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "gi")
     staging = _linked(repo, "staging")
-    sdir = tmp_path / "set1"
-    (sdir / "src").mkdir(parents=True)
-    (sdir / "src" / "a.test.ts").write_text("t\n")
-    (sdir / "tests").mkdir()
-    (sdir / "tests" / "b.test.ts").write_text("t\n")
-    s1 = {"index": 1, "dir": str(sdir), "defect_files": ["src/a.test.ts"],
-          "control_files": [], "support_files": []}
-    s2 = {"index": 2, "dir": str(sdir), "defect_files": ["tests/b.test.ts"],
-          "control_files": [], "support_files": []}
-    staged = leerie._redrive_stage(staging, [s1, s2])
-    # Set 1 could not be ignored without editing the tracked file: refused.
-    assert [s["set_index"] for s in staged] == [2]
-    assert (staging / "src" / ".gitignore").read_text() == "*.log\n"
-    assert not (staging / "src" / "a.test.ts").exists()
+    # Ignoring it would mean editing the tracked file: refused, untouched.
     assert leerie._checkout_ignore(staging, ["src/x.ts"]) == ["src/x.ts"]
-    leerie._checkout_unignore(staging, ["src/x.ts"])
     assert (staging / "src" / ".gitignore").read_text() == "*.log\n"
-    leerie._redrive_unstage(staging, staged)
+    assert leerie._checkout_ignore(staging, ["tests/b.ts"]) == []
+    assert (staging / "tests" / ".gitignore").read_text().splitlines()[
+        :1] == [leerie._CHECKOUT_IGNORE_TAG]
 
 
 def test_names_are_literal_patterns(leerie, tmp_path):

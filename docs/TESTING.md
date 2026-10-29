@@ -5652,3 +5652,24 @@ does the same for gate (d+). `TestFalsifierGates::test_a_facts_script_failure_is
 pins `facts_read: false` with no `assertion_in_case` / `not_coupled`, and
 `test_the_image_ships_the_bundled_typescript_where_leerie_looks` pins the
 Dockerfile's extraction path to the constant.
+
+## I3: a held-out set never enters a tree a worker commits from
+
+`tests/test_redrive_selfcheck_out_of_tree.py` (DESIGN §8 *A held-out set
+never enters a tree a worker commits from*) runs the real self-check
+command (`bin/leerie-selfcheck` → `scripts/selfcheck.py` →
+`_selfcheck_main`) with real pytest on a repository whose state root sits
+inside it: the verdict follows the worker's uncommitted edit, the ignored
+helper package is shared, a set file under an ignored directory is placed
+in a real directory of the copy (never through the link into the worker's
+tree), git run by a test finds no enclosing repository, a subset by file
+name and a `-t` filter run, a set path the tree already has is refused
+(exit 3), and no set file or byte is left in the worker's tree. A whole
+`_run_delivery_redrive`, its implementer stubbed to put a copy of the shown
+set in its tree and run the command, leaves no byte of a shown or held-back
+set in `git cat-file --batch-all-objects`. Live-falsified three ways:
+sharing a set file's ignored parent, dropping `GIT_CEILING_DIRECTORIES`,
+and snapshotting through a temporary index (`add -A`) each fail a test.
+`tests/test_heldout_bytes_never_reach_history.py` keeps the anti-cheat
+history check (spans of the shown sets' source in any commit void a
+group); its staging and unstage tests went with the staging.

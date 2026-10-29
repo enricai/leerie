@@ -8,7 +8,8 @@ staging tree, in sequential groups from the shared re-drive budget. Covered:
   routing of set files, fallbacks, shared-file groups, pending controls;
 - which set failures are work, and the per-group verdict (worse, trade,
   held-back rules), with a missing report never a rollback on its own;
-- staging the shown sets read-only and git-excluded, and undoing it;
+- the shown sets' self-check, given as an out-of-tree command (never
+  staged in the tree; tests/test_redrive_selfcheck_out_of_tree.py);
 - the escalation gates: the audit majority, weakened tracked tests, the
   schema gate's rules and exemptions, the TypeScript AST check (real
   `typescript` when one is available), and the escalation decision;
@@ -25,7 +26,6 @@ import asyncio
 import json
 import os
 import shutil
-import stat
 import subprocess
 from pathlib import Path
 
@@ -327,37 +327,6 @@ def _repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, _git(repo, "rev-parse", "HEAD")
 
 
-class TestStage:
-    def test_stage_readonly_excluded_and_undone(self, leerie, tmp_path):
-        repo, _ = _repo(tmp_path)
-        sdir = tmp_path / "set1"
-        (sdir / "src").mkdir(parents=True)
-        (sdir / "src" / "a.test.ts").write_text("import {a} from './a';\n")
-        s1 = _set(1, dir=str(sdir), defect_files=["src/a.test.ts"],
-                  control_files=[])
-        # A set whose path the tree already has is never overwritten.
-        s2 = _set(2, dir=str(sdir), defect_files=["src/a.ts"],
-                  control_files=[])
-        staged = leerie._redrive_stage(repo, [s1, s2])
-        assert [s["set_index"] for s in staged] == [1]
-        f = repo / "src" / "a.test.ts"
-        assert f.is_file() and not (f.stat().st_mode & stat.S_IWUSR)
-        assert _git(repo, "status", "--porcelain") == ""
-        assert (repo / "src" / "a.ts").read_text().endswith("BUG\n")
-        f.chmod(0o644)
-        f.write_text("tampered\n")
-        tampered = leerie._redrive_unstage(repo, staged)
-        assert tampered == ["src/a.test.ts"]
-        assert not f.exists()
-        # Ignored through a `.gitignore` of its own, removed with the file;
-        # the repository's shared exclude file is never written.
-        assert not (repo / "src" / ".gitignore").exists()
-        assert _git(repo, "status", "--porcelain") == ""
-        ex = Path(_git(repo, "rev-parse", "--git-path", "info/exclude"))
-        ex = ex if ex.is_absolute() else repo / ex
-        assert "leerie" not in ex.read_text()
-
-
 # === escalation gates =======================================================
 
 class TestAuditGate:
@@ -612,8 +581,10 @@ def test_note_typed_entries_held_names_and_selfcheck(leerie):
         rnd=2, rounds=2, merged=[{"id": "s2", "title": "B", "intent": "b"}],
         held_names=[{"name": "held case", "kind": "defect"},
                     {"name": "kept", "kind": "control"}],
-        defect_shape="the shape", selfcheck_files=["src/a.test.ts"],
-        selfcheck_cmd="run src/a.test.ts")
+        defect_shape="the shape",
+        selfcheck={"command": "/run/sc/bin/leerie-selfcheck",
+                   "src": "/run/sc/sets", "run_files": ["src/a.test.ts"],
+                   "name_flag": "-t"})
     head, body = note.split("\n", 1)
     assert head.startswith("DELIVERY RE-DRIVE (round 2 of 2).")
     entries = json.loads(body[:body.index("\nMERGED")])
@@ -625,6 +596,13 @@ def test_note_typed_entries_held_names_and_selfcheck(leerie):
     i_held = note.index("HELD-BACK ACCEPTANCE FAILURES")
     i_self = note.index("SELF-CHECK: the already-passing part")
     assert i_merged < i_held < i_self
+    sc = note[i_self:]
+    assert "is NOT in this tree" in sc and "under /run/sc/sets" in sc
+    assert "  - src/a.test.ts\n" in sc
+    assert "  /run/sc/bin/leerie-selfcheck\n" in sc
+    # The subset forms, each with its example (bench I3 OUT3 wording).
+    assert "`/run/sc/bin/leerie-selfcheck a.test.ts`" in sc
+    assert "`/run/sc/bin/leerie-selfcheck -t '<name pattern>'`" in sc
     assert "  - held case\n" in note
     assert "  - kept  (behaviour that passed" in note
     assert "Fitting these names will fail the recheck." in note
@@ -784,14 +762,15 @@ class World:
 
         async def fake_claude_p(**kw):
             staged = [p for p in (world.staging / "src").glob("*.test.ts")]
+            path = ((kw.get("env_extra") or {}).get("PATH") or "")
             world.calls.append({
                 "sid": kw["sid"], "effort": kw["effort"],
                 "cwd": kw["cwd"], "prompt": kw["user_prompt"],
                 "staged": sorted(str(p.relative_to(world.staging))
                                  for p in staged),
-                "readonly": all(not (p.stat().st_mode & stat.S_IWUSR)
-                                for p in staged),
-                "status": _git(world.staging, "status", "--porcelain")})
+                "bin": path.split(os.pathsep)[0],
+                "status": _git(world.staging, "status", "--porcelain",
+                               "--untracked-files=all")})
             edit = world.edits.pop(0) if world.edits else None
             if edit:
                 edit(world)
@@ -827,12 +806,15 @@ def test_kept_fix_updates_the_final_verdict(leerie, tmp_path, monkeypatch):
     c = w.calls[0]
     assert c["sid"] == "delivery-redrive-r1-g0" and c["effort"] == "low"
     assert c["cwd"] == str(w.staging)
-    # Routed by the import graph to s1 only; the set staged read-only,
-    # invisible to git.
+    # Routed by the import graph to s1 only; nothing staged in the tree it
+    # commits from, the self-check command first on its PATH.
     assert c["prompt"].startswith("Execute subtask `s1`.")
-    assert c["staged"] == [DEFECT, CONTROL] and c["readonly"]
-    assert c["status"] == ""
+    assert c["staged"] == [] and c["status"] == ""
+    assert c["bin"].endswith("/selfcheck/delivery-redrive-r1-g0/bin")
+    assert f"  {c['bin']}/leerie-selfcheck\n" in c["prompt"]
     assert "SELF-CHECK:" in c["prompt"] and DEFECT in c["prompt"]
+    # The group's self-check directory is gone with the group.
+    assert not (w.st.run_dir / "selfcheck" / "delivery-redrive-r1-g0").exists()
     assert not list((w.staging / "src").glob("*.test.ts"))
     assert w.st.data["redrive_rounds"] == {"s1": 1}
     g = w.st.data["acceptance"]["gate"]
@@ -957,7 +939,7 @@ def test_held_back_names_round(leerie, tmp_path, monkeypatch):
     assert "HELD-BACK ACCEPTANCE FAILURES" in p2
     assert "  - case 3" in p2 and "  - case 4" in p2
     # Names only: the held-back files are never staged or named.
-    assert HELD not in p2 and HELD not in w.calls[1]["staged"]
+    assert HELD not in p2 and w.calls[1]["staged"] == []
     assert all(r["passed"] for r in
                w.st.data["acceptance"]["gate"]["final"])
 
@@ -997,24 +979,23 @@ def test_resumed_in_flight_group_is_rolled_back(leerie, tmp_path,
     assert w.st.data["redrive_rounds"] == {"s1": 2}
 
 
-def test_resumed_in_flight_group_removes_staged_sets(leerie, tmp_path,
-                                                    monkeypatch):
-    """A crash after staging leaves the set files git-ignored, so `clean
-    -fd` alone would keep them; the resume removes their `.gitignore` by
-    the write-ahead `stage_files` list first, and they go with the clean."""
+def test_resumed_in_flight_group_removes_its_selfcheck_dir(
+        leerie, tmp_path, monkeypatch):
+    """A crash mid-group leaves its self-check directory (the shown sets'
+    readable copy) in the run directory, never in staging; the resume
+    removes it with the rollback."""
     w = World(leerie, tmp_path)
     w.install(monkeypatch)
     pre = _git(w.staging, "rev-parse", "HEAD")
-    staged = leerie._redrive_stage(w.staging, w.sets)
-    files = sorted({f for s_ in staged for f in s_["files"]})
-    assert files and all((w.staging / f).is_file() for f in files)
+    sc = leerie._selfcheck_prepare(w.st, w.caps, w.staging, w.sets,
+                                   "delivery-redrive-r1-g0", None)
+    assert Path(sc["src"]).is_dir()
     w.st.data["delivery_redrive"] = {"in_flight": {
-        "pre_sha": pre, "round": 1, "group": 0, "stage_files": files},
+        "pre_sha": pre, "round": 1, "group": 0},
         "rounds": [{"round": 1, "groups": []}]}
     w.st.data["redrive_rounds"] = {"s1": 2}         # no budget left
     w.run()
-    assert not any((w.staging / f).exists() for f in files)
-    assert not (w.staging / "src" / ".gitignore").exists()
+    assert not (w.st.run_dir / "selfcheck").exists()
     assert _git(w.staging, "status", "--porcelain",
                 "--untracked-files=all") == ""
 
@@ -1048,8 +1029,11 @@ def test_committed_staged_file_is_rolled_back(leerie, tmp_path,
     start = _git(w.staging, "rev-parse", "HEAD")
 
     def leak(w):
+        # The worker copies the set's file into its tree at the set's path
+        # (its source is readable) and commits it with the fix.
         (w.staging / "src" / "a.ts").write_text("export const a = 1; // FIXED\n")
-        _git(w.staging, "add", "-f", "src/a.ts", DEFECT)
+        shutil.copy(Path(w.sets[0]["dir"]) / DEFECT, w.staging / DEFECT)
+        _git(w.staging, "add", "src/a.ts", DEFECT)
         _git(w.staging, "commit", "-qm", "leak")
     w.edits = [leak, leak]
     w.run()

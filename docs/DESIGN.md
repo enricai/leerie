@@ -2241,13 +2241,14 @@ falsifier once appended its leads and the task's referenced files there and
 never removed them, so the untracked report the task pointed at vanished
 from the user's own `git status`, and `git add` of it was refused as
 ignored. A file leerie places in a checkout and must keep out of commits
-(the falsifier's leads, the delivery re-drive's staged sets) is instead
+(the falsifier's leads) is instead
 ignored by a self-ignoring `.gitignore` beside it — `/.gitignore` and the
 file's literal name, under a leerie tag — written only in a directory that
 has no `.gitignore` of its own and removed with the file. A directory that
-has one is never edited: the re-drive does not stage that set, and the
-falsifier's (disposable, never committed) checkout leaves that file
-visible. The alternatives fail on correctness: a per-worktree
+has one is never edited: the falsifier's (disposable, never committed)
+checkout leaves that file visible. (The delivery re-drive no longer places
+anything in its checkout: §8 *A held-out set never enters a tree a worker
+commits from*.) The alternatives fail on correctness: a per-worktree
 `core.excludesFile` needs `extensions.worktreeConfig`, itself a write to
 the shared `.git/config`, and replaces the user's global excludes file;
 `--assume-unchanged` and `--skip-worktree` apply only to tracked paths
@@ -7114,11 +7115,12 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    as one implementer session (their scopes merged), and groups run one
    after another on the same tree. Before each group the open work is
    re-checked, and a group with nothing left failing is skipped.
-4. *A self-check, then a re-check.* The shown sets are staged read-only and
-   git-ignored in that checkout only (§6 *Ignores are per checkout*),
-   with the exact command that runs them: without
-   that self-check (bench Q3 arm L3) whole-set closure was 0 of 4, against
-   18 of 24 with it (every one of the 24 closed its staged sets). After each
+4. *A self-check, then a re-check.* The implementer is given a command
+   that runs the shown sets against a copy of its current working tree,
+   outside that tree (*A held-out set never enters a tree a worker commits
+   from*, below), and the sets' source, readable outside the tree: without
+   a self-check (bench Q3 arm L3) whole-set closure was 0 of 4, against 18
+   of 24 with one (every one of the 24 closed its sets). After each
    group the orchestrator re-runs the sets and the repository's tests — a
    test command the task forbids replaced by the scoped run of the coupled
    tests, as at final and in the ratchet, never run raw; a
@@ -7542,9 +7544,9 @@ The gate:
   (§6 *Worker subtree termination*), before leerie runs anything of its
   own there — a measurement, a commit, the next worker. Staging is
   written by one stage at a time; a subtask's worktree by its own settle.
-  For the re-drive implementer it runs after the staged held-out sets are
-  taken out again, so it sees what the worker left, not the material
-  leerie placed and ignored.
+  For the re-drive implementer nothing of leerie's is in the tree to
+  take out first: its self-check runs outside it (§8 *A held-out set
+  never enters a tree a worker commits from*).
 - *Bounded.* On a violation the same worker is asked again — its CLI
   session resumed (`--resume`) with one note that carries the porcelain
   lines verbatim and allows exactly two acts per line: commit it (it is
@@ -7617,103 +7619,155 @@ Each of the six, audited:
   so the round's tree is gone exactly, which is what the gate would demand
   of a round that cannot be kept.
 
-**No line of a staged set's source reaches history.** The invariant this
-barrier serves is exactly one: *the held-out test's source never reaches
-history.* The values the test asserts — an error message, an enum value,
-a JSON key, a route, the path of the module it imports — are not covered:
-they are the specification, the shown sets are staged precisely so the
-implementer makes them pass, and the code that does so has to contain
-them. Every rule below is derived from that sentence, and from nothing a
-reviewer's single example suggested.
+**A held-out set never enters a tree a worker commits from.** (I3.) The
+re-drive's self-check used to stage the shown sets read-only in staging,
+the tree the implementer commits from, git-ignored there. That was the
+root cause (RC3) of a class of defects the re-drive kept re-opening:
+whatever a runner made of a staged file — its bytecode under an
+unignored `__pycache__/`, its snapshots — sat beside the implementer's
+change and reached history through a commit (review round 11); the fix
+for that removed files at unstage by name and by content, and each rule
+it needed drew the next review's counter-example (rounds 12 and 13: an
+honest fix voided for a literal it shares with the test, an implementer's
+own module deleted for lying beside the test, a crash between staging and
+unstaging leaving a hidden test in staging). Every one of them existed
+only because the test was in the tree.
 
-Review round 11 drove a group whose implementer ran the staged test as its
-note told it to, in a repository that does not ignore `__pycache__/`: the
-leftovers commit took `tests/__pycache__/test_<set>.cpython-*.pyc`, the
-test compiled. Its fix searched every committed blob for the test's quoted
-literals and identifiers, and review round 12 drove what that costs: a
-re-drive runs exactly when the behaviour the test asserts is missing from
-the base, so "minus what the base already has" removed almost nothing, and
-an honest `throw new Error('quantity must be positive')`, an
-`export * from './orders'` or an uncommitted fix holding the expected
-message voided the group, rolled it back, spent the round and ended the run
-`unconverged` with the cause invisible. A literal is a value; matching one
-cannot tell the fix from a copy of the test.
+So the test never is. The self-check is a command leerie provides on the
+implementer's `PATH` (`scripts/selfcheck.py`, its logic in the
+orchestrator); one call:
 
-1. *Copies the runner makes of a staged file are staged material.* A
-   directory staging had to create is ignored while the group runs; beside
-   a staged file, the entries a runner keys to its name —
-   `__pycache__/<stem>.*` and `__snapshots__/<name>.*` — are ignored the
-   same way, and they are removed at unstage. These are copies of the
-   test by construction (its bytecode, its snapshots), whatever bytes they
-   hold, so they are matched by name; what was removed is recorded on the
-   group, never committed. Inside a directory staging created, only those
-   copies and files holding a span of the test (rule 2) are removed: the
-   implementer's own sibling test or conftest written there is the change,
-   and is the implementer's to commit like any other file. Review round 12
-   suspected, and a test confirmed, that removing the directory whole
-   deleted it with no entry anywhere but the group's record. A file there
-   removed for holding a span is not a runner copy: someone wrote it, so
-   it is listed in the PR by path (review round 13 M2: the feature
-   module of a new package written beside the staged test was deleted and
-   listed nowhere). Only the runner copies stay record-only.
-2. *A copy elsewhere is recognised by a span of the test's source.* Each
-   staged file is fingerprinted by its spans of `_HELDOUT_SPAN_LINES` (4)
+1. copies the worker's current working tree — HEAD, its uncommitted
+   edits and its untracked, not-ignored files, as `git ls-files --cached
+   --others --exclude-standard` lists them — into a run-private
+   directory with no `.git`, with `GIT_CEILING_DIRECTORIES` at that
+   directory's parent so a test that shells out to git resolves no
+   enclosing repository;
+2. shares every ignored path of the worker tree (`node_modules`, nested
+   ones, a generated Prisma client, build output) into the copy as a
+   symlink, so nothing is installed or generated per call — except a path
+   that is a set file or holds one, which the set's own placement needs as
+   a real directory, so a set file is never written through a link into
+   the worker's tree;
+3. places the shown sets (`_place_set`), refusing — exit 3, with the
+   paths — when the copy already has a file at a set's path, since a set is
+   never placed over the tree's own file;
+4. runs the repository's scoped runner over the sets' test files
+   (`_acceptance_cmd`, the same command the evaluation runs, exact file
+   selection included), with the group's throwaway `_test` database in
+   `DATABASE_URL` and `DIRECT_URL` when the repository has one, else the
+   caller's own;
+5. prints the runner's output and a one-line verdict, and deletes the
+   copy.
+
+It also checks part of a set: naming one or more of its files (by path,
+file name or a unique path suffix) runs only those, every set file still
+placed, and `-t`/`--testNamePattern <pattern>` (or
+`-k`) becomes the runner's own test-name filter. A signal to the
+command (a shell timeout, a cancelled call) unwinds through the same
+clean-up as any other exit, so the copy is deleted on every exit.
+
+**The pre-registered latency bar failed, twice.** Each bench round ran
+the in-tree staging (IN) against the out-of-tree command over four
+re-drive cases, three samples each, with a bar frozen in advance: closure
+not lower, invocations at least 0.8 of IN's, median per-call latency
+within IN + 2 s, zero leaks.
+
+- I3-2 (FROZEN2, the whole-set command): closure 9 of 12 against 9 of
+  12, 58 calls against 49, zero leaks, median call 32.6 s against
+  21.8 s — **not met**, on latency. In-tree implementers ran a subset in
+  about a third of their calls; the command could not.
+- I3-3 (FROZEN3, with the subset forms above, which the note documents
+  with one example each): closure 9 of 12 against 9 of 12 (the same
+  cases), 44 calls against 52 (floor 41.6), zero leaks, median call
+  22.8 s against 13.8 s — **not met** again, on latency alone; the
+  median session was 64 s against 122 s.
+
+Measured cause of the gap: worker behaviour and host load, not the
+mechanism. Out-of-tree implementers chained other heavy commands into the
+same Bash call as the self-check in 18 of 44 calls, in-tree ones in 5 of
+52; unchained calls alone took 14.8 s against 13.7 s. Out-of-tree calls
+also ran at higher load (median 1-minute load 19.6 against 13.5) and used
+the subset less (20 % of calls against 35 %). The mechanism's own cost,
+the same command on the same tree, is +0.8 to +2.3 s per call with the
+bench's temporary-index script (b2e's tree exceeds the 2 s bar by itself),
+and +1.2 s for this command on a funeralworks clone (one set file, five
+interleaved runs each: the in-tree run a median 2.09 s, the self-check
+3.31 s, its copy of the 2,778-file tree 0.4 s of that — one `tar` pipe of
+the listed files, where a copy per file took 1.2 s). That copy is the
+next lever if the bar must hold on a heavy tree.
+
+The design takes I3 anyway, because the bar measured the wrong risk for
+this decision: RC3 is the root cause behind review rounds 11 to 14, I3
+removes it rather than patching another exit, and across the three rounds
+the out-of-tree self-check showed no harm on what the bar exists to
+protect — closure, invocations, leaks. Latency is a cost the run pays,
+not a defect it ships. No unmeasured prompt line ("run the self-check as
+its own Bash call") is added to chase the gap: it would be a behavioural
+nudge no bench has measured.
+
+The shown sets' source stays readable to the implementer, in a
+directory under the run's own `selfcheck/` that no read denial covers
+(the run's `acceptance/` stays denied), laid out by repository path, and
+removed with the group. The held-back sets are in neither place.
+
+**No set byte enters the repository's object store.** The copy is made
+from the worker's files directly, never through a temporary index: a
+temp-index `add -A` hashes every not-ignored file of the worker tree into
+the object store, and the worker can read the shown sets — a copy it put
+in its tree would be hashed by leerie's own self-check, unreachable but
+present to `git cat-file --batch-all-objects` (SWE-bench #465 read future
+fixes out of a repository's history). The listing writes no object, the
+sets are placed only into the copy, which has no `.git`, and the held-back
+sets are never read by the self-check at all.
+
+**Kept as anti-cheat, not hygiene: no line of a set's source reaches
+history.** A worker can still copy test source into a commit, and
+self-check feedback raises cheating along with pass rate (ImpossibleBench:
+33 to 38 %). So every group's commits are searched; what this guards is
+exactly one thing, *the held-out test's source never reaches history*. The
+values the test asserts — an error message, an enum value, a JSON key, a
+route, the path of the module it imports — are not covered: they are the
+specification, and the code that makes the test pass has to contain them.
+
+1. *A copy is recognised by a span of the test's source.* Each shown set
+   file is fingerprinted by its spans of `_HELDOUT_SPAN_LINES` (4)
    consecutive lines of code, each line normalised (whitespace trimmed and
    collapsed, a line with no letter or digit skipped). A line that is only
    a literal and punctuation — `"ERR_X",`, `42,`, `"key": 1,` — is a piece
    of a value, not code, and is skipped on both sides: a value is
    specification however many lines a formatter breaks it over, and the
-   fix has to contain it (review round 13 M1: a four-item list of error
-   codes in the test, defined the same way by the fix, was a four-line
-   span, so the honest fix was voided when committed and reverted when
-   not). A file shorter than four code lines is one span of all of them,
-   and one with fewer than two has none: one line is a value. A span the
-   group's starting commit already contains is dropped: it is the
-   repository's idiom, not the test. A file holds the test's source when
-   it holds one of the spans. Why four: a span of lines of code already
-   needs code, not a value; an honest sibling test written in the
-   same idiom shares at most a short header with it (the framework import,
-   the subject import, one client or fixture line — three lines), which a
-   span of four does not match, while a copied case — its signature, its
-   call, its assertion, and the line before it — does. Computing the spans
-   can never leave a hidden test in staging: it runs inside the same
-   `try`/`finally` that unstages, its input is bounded (lines read in
-   pieces of at most 4 KiB, 1 MiB of each staged file, 64 MiB of the
-   base), and the lines go to `git grep` through a pattern file, never
-   the argument vector — review round 12 L1 drove a 160 KB inline base64
-   literal past the kernel's per-argument limit, which raised after
-   staging and outside the `finally`, so the run's re-drive ended with the
-   hidden test still staged while the repository's test command ran.
-3. *Only a span or a staged path voids a group.* Every blob any commit of
-   the group added — not the net diff, since a file committed and then
+   fix has to contain it (review round 13 M1). A file shorter than four
+   code lines is one span of all of them, and one with fewer than two has
+   none: one line is a value. A span the group's starting commit already
+   contains is dropped: it is the repository's idiom, not the test. Why
+   four: an honest sibling test written in the same idiom shares at most
+   a short header with it (the framework import, the subject import, one
+   client or fixture line), while a copied case — its signature, its call,
+   its assertion, and the line before it — does not. The input is bounded
+   (lines read in pieces of at most 4 KiB, 1 MiB of each set file, 64 MiB
+   of the base), and the lines go to `git grep` through a pattern file,
+   never the argument vector (review round 12 L1: a 160 KB inline base64
+   literal past the kernel's per-argument limit).
+2. *A span or a set path voids a group.* Every blob any commit of the
+   group added — not the net diff, since a file committed and then
    deleted is still in the history, and a merge commit's own blobs against
    each of its parents, since an evil merge's resolution is in no other
-   commit — is searched for the spans; a hit, a staged path or a runner
-   copy's path (rule 1) voids the group, which is rolled back. A path is
-   not a hit merely for lying under a directory staging created.
-4. *A leftover cannot carry a span past the clean-tree gate.* The group's
-   implementer leaves nothing uncommitted (*A worker leaves its tree
-   clean*, above): a file holding a span that it commits voids the group
-   by rule 3, and one it deletes is gone. Leerie neither commits nor
-   removes a worker's leftover, so a tracked edit is never reverted for a
-   literal it shares with the test.
+   commit — is searched for the spans; a hit, or a commit naming a set
+   file's path, voids the group, which is rolled back.
 
-These are the only places a set's bytes enter a tree that commits. The
-acceptance evaluation, the set audit, the surrogate witness and the
-falsifier (its `.leerie-falsifier/` leads and the confirm checkout) all
-work in disposable checkouts that are removed and never committed from;
-the final conformer, the integrator and the pr_reviewer never run while a
-set is staged, and the material swept at unstage is gone before any of
-them could see it. What these rules do not cover: a fixer that
-deliberately copies a set out of the run directory with a shell command
-(§8 *Held-out acceptance tests*: hiding reduces the incentive, it does not
-guarantee it) — rule 3 still voids such a group when it is a re-drive's
-and the copy keeps four lines intact; a copy reflowed line by line or
-re-rendered into another form (a coverage report's code frame with line
-numbers, a compiler's output); a copy whose only shared lines are the
-values, which is the specification; and a report that names the test's
-cases or path, which carries no source line — the case names are given to the
-implementer in a held-back round anyway.
+Because nothing of leerie's is ever in the tree, the group's tree is held
+to the clean-tree gate like every other worker's, with no exception for a
+group that committed a set path (that group is clean, and void by rule 2),
+and its test IDs are measured like any other. What these rules do not
+cover: a copy reflowed line by line or re-rendered into another form; a
+copy whose only shared lines are the values, which is the specification;
+and a report that names the test's cases or path, which carries no source
+line — the case names are given to the implementer in a held-back round
+anyway. The acceptance evaluation, the set audit, the surrogate witness
+and the falsifier (its `.leerie-falsifier/` leads and the confirm
+checkout) all work in disposable checkouts that are removed and never
+committed from.
 
 **A finished verdict is reused only on the commit it was measured on.** A
 resume skips a finalize-side gate that already finished, but "finished"

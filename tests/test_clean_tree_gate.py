@@ -414,11 +414,13 @@ def test_integrator_left_dirty_is_backed_out_unconverged(
     assert "?? notes.txt" in rec["reason"]
 
 
-# --- a span holder written beside a staged set (DESIGN §8 *No line of a
-# staged set's source reaches history*, rule 1). Rewritten from
-# tests/test_redrive_leftovers_guards.py: the implementer's own file there
-# is now committed by the implementer when re-asked, never by leerie; the
-# file removed at unstage for holding the set's lines is still listed. ----
+# --- a copy of the set's source in the worker's own tree (DESIGN §8 *A
+# held-out set never enters a tree a worker commits from*). Rewritten from
+# `test_a_span_holder_in_a_staging_made_dir_is_listed`: leerie no longer
+# places the set in staging, so it never removes a file there either. A
+# file the implementer wrote holding the set's lines is its own: the
+# clean-tree gate asks it to commit or delete it, and committing it voids
+# the group by the history check. ----
 
 NEW_DIR_SET = ("import { a } from '../src/a';\n"
                "describe('the codes', () => {\n"
@@ -428,8 +430,8 @@ NEW_DIR_SET = ("import { a } from '../src/a';\n"
                "});\n")
 
 
-def test_a_span_holder_in_a_staging_made_dir_is_listed(leerie, tmp_path,
-                                                       monkeypatch):
+def test_a_committed_copy_of_the_set_source_voids_the_group(
+        leerie, tmp_path, monkeypatch):
     w, tdr = _world(leerie, tmp_path, monkeypatch)
     monkeypatch.setattr(tdr, "DEFECT", "acc/a.test.ts")
     s0 = w.sets[0]
@@ -440,28 +442,24 @@ def test_a_span_holder_in_a_staging_made_dir_is_listed(leerie, tmp_path,
     s0["cases"] = {"acc/a.test.ts": ["case 1"],
                    s0["control_files"][0]: ["control 1"]}
     w.st.save()
+    start = _git(w.staging, "rev-parse", "HEAD")
 
     def fix(w):
-        (w.staging / "acc" / "index.ts").write_text(
-            "export const codes = 1\n")
+        (w.staging / "acc").mkdir()
         (w.staging / "acc" / "notes.ts").write_text(NEW_DIR_SET)
-        (w.staging / "acc" / "__snapshots__").mkdir()
-        (w.staging / "acc" / "__snapshots__" / "a.test.ts.snap"
-         ).write_text("snap\n")
         w.write("export const a = 1; // FIXED\n")
 
-    def commit_index(w):
-        _git(w.staging, "add", "acc/index.ts")
-        _git(w.staging, "commit", "-qm", "codes")
-    w.edits = [fix, commit_index]
+    def commit_notes(w):
+        _git(w.staging, "add", "acc/notes.ts")
+        _git(w.staging, "commit", "-qm", "notes")
+    w.edits = [fix, commit_notes]
+    w.caps["subtask_redrive_rounds"] = 1
     w.run()
+    reask = [c for c in w.calls if c["sid"].endswith("-clean1")]
+    assert len(reask) == 1 and "?? acc/notes.ts" in reask[0]["prompt"]
     ge = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
-    assert not ge.get("rolled_back")
-    assert _git(w.staging, "ls-files", "acc/index.ts") == "acc/index.ts"
-    assert ge["heldout_listed"] == ["acc/notes.ts"]
-    assert "acc/__snapshots__/a.test.ts.snap" in ge["heldout_removed"]
-    assert ge["heldout_removed"].count("acc/notes.ts") == 1
-    (e,) = [e for e in w.st.data.get("needs_human_verification") or []
-            if e.get("source") == leerie._REDRIVE_HELDOUT_GAP_SOURCE]
-    assert "acc/notes.ts" in e["detail"] and ".snap" not in e["detail"]
-    assert "acc/notes.ts" in leerie._format_pr_end_state_section(w.st.data)
+    assert "unclean_tree" not in ge
+    assert ge["committed_staged"] == ["acc/notes.ts"]
+    assert ge["rolled_back"] is True
+    assert _git(w.staging, "rev-parse", "HEAD") == start
+    assert not (w.staging / "acc").exists()

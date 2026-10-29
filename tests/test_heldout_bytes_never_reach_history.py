@@ -1,17 +1,15 @@
-"""Review round 11 H1: no line of a staged held-out set's source reaches
-history (DESIGN §8 *No line of a staged set's source reaches history*).
+"""The anti-cheat that stays after I3: no line of a shown set's source
+reaches history (DESIGN §8 *A held-out set never enters a tree a worker
+commits from*, "Kept as anti-cheat").
 
-The reviewer's driver: a re-drive implementer runs the staged held-out test
-as its note tells it to, in a repository that does not ignore
-`__pycache__/`; pytest compiles the hidden test, and the leftovers commit
-took `tests/__pycache__/test_hidden_accept.cpython-*.pyc`, whose constants
-carry the hidden assertion message into `git show`. The void check compared
-staged file NAMES only, so the group stood. Real git and real pytest.
-
-Review round 12 H1 drove the over-reach of round 11's fix (every literal of
-the test was a marker, so an honest fix holding the expected message was
-voided); the barrier now matches spans of the test's SOURCE, never a value
-it asserts. Both directions are pinned here."""
+The sets are no longer staged in the tree a worker commits from (review
+round 11's bytecode leak, and the unstage rules rounds 12-13 drove, are
+gone with that: tests/test_redrive_selfcheck_out_of_tree.py). A worker can
+still copy a set's readable source into a commit, so every group's commits
+are searched for spans of it. Review round 12 H1 drove the over-reach of a
+literal-based check (an honest fix holding the expected message was
+voided); the check matches spans of the test's SOURCE, never a value it
+asserts. Both directions are pinned here."""
 from __future__ import annotations
 
 import os
@@ -49,6 +47,18 @@ def _held(tmp_path, rel="tests/test_hidden_accept.py"):
             "cases": {rel: ["test_secret_case"]}}
 
 
+def _shown(leerie, sets):
+    """The shown sets as the history check reads them."""
+    return [{"dir": s_["dir"], "files": leerie._set_files(s_)}
+            for s_ in sets]
+
+
+def _holds(leerie, path, prints) -> bool:
+    """Whether the file at `path` holds one of `prints`' spans."""
+    return leerie._holds_heldout_span(
+        leerie._bytes_pieces(path.read_bytes()), prints)
+
+
 def _pytest(s, *args):
     subprocess.run([sys.executable, "-m", "pytest", "-q", "-p",
                     "no:cacheprovider", *args], cwd=s, capture_output=True,
@@ -63,32 +73,6 @@ def _history_bytes(s, since):
             out += subprocess.run(["git", "-C", str(s), "show", f"{c}:{p}"],
                                   capture_output=True).stdout
     return out
-
-
-def test_the_reviewers_driver_ships_no_bytecode_of_the_hidden_test(
-        leerie, tmp_path, monkeypatch):
-    s = _repo(tmp_path, monkeypatch)
-    base = _git(s, "rev-parse", "HEAD")
-    set_ = _held(tmp_path)
-    staged = leerie._redrive_stage(s, [set_])
-    assert staged
-    prints = leerie._heldout_fingerprints(s, staged, base)
-    (s / "mod.py").write_text("def f():\n    return 2\n")
-    _pytest(s, "tests/test_hidden_accept.py")
-    # The staged file's bytecode is ignored while the group runs, so the
-    # implementer's own `git add -A` cannot take it either.
-    assert "test_hidden_accept" not in _git(s, "status", "--porcelain",
-                                            "--untracked-files=all")
-    _git(s, "add", "-A")
-    _git(s, "commit", "-qm", "fix")
-    swept: list[str] = []
-    assert leerie._redrive_unstage(s, staged, swept=swept) == []
-    assert any("test_hidden_accept" in p and p.endswith(".pyc")
-               for p in swept)
-    assert SECRET.encode() not in _history_bytes(s, base)
-    assert not list((s / "tests").rglob("test_hidden_accept*"))
-    assert leerie._history_heldout_hits(s, base, _git(s, "rev-parse", "HEAD"),
-                                        staged, prints) == []
 
 
 def test_spans_already_in_the_base_are_not_distinctive(leerie, tmp_path,
@@ -116,13 +100,13 @@ def test_spans_already_in_the_base_are_not_distinctive(leerie, tmp_path,
     assert len(prints[4]) == 2
     probe = tmp_path / "probe.py"
     probe.write_text(header + "def test_mine():\n    assert f() == 2\n")
-    assert not leerie._file_holds_span(probe, prints)     # idiom only
+    assert not _holds(leerie, probe, prints)     # idiom only
     probe.write_text(f"MSG = '{SECRET}'\nraise ValueError(MSG)\n")
-    assert not leerie._file_holds_span(probe, prints)     # a value only
+    assert not _holds(leerie, probe, prints)     # a value only
     probe.write_text("    from mod import f\n  CLIENT  =  object()\n\n"
                      "def test_only_here():\n}\n"
                      f"  assert f() == 2, '{SECRET}'\n")
-    assert leerie._file_holds_span(probe, prints)         # reindented copy
+    assert _holds(leerie, probe, prints)         # reindented copy
 
 
 def test_every_commit_is_read_not_the_net_diff(leerie, tmp_path,
@@ -133,7 +117,7 @@ def test_every_commit_is_read_not_the_net_diff(leerie, tmp_path,
     s = _repo(tmp_path, monkeypatch)
     base = _git(s, "rev-parse", "HEAD")
     set_ = _held(tmp_path)
-    staged = leerie._redrive_stage(s, [set_])
+    staged = _shown(leerie, [set_])
     prints = leerie._heldout_fingerprints(s, staged, base)
     (s / "mod.py").write_text(f"def f():\n    return 2  # {SECRET}\n")
     _git(s, "add", "mod.py")
@@ -148,44 +132,6 @@ def test_every_commit_is_read_not_the_net_diff(leerie, tmp_path,
     assert leerie._history_heldout_hits(
         s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == [
             "notes.md"]
-    leerie._redrive_unstage(s, staged)
-
-
-def test_a_directory_staging_created_keeps_the_implementers_own_files(
-        leerie, tmp_path, monkeypatch):
-    """Rule 1. Everything under a directory staging had to create is
-    ignored while the group runs; at unstage the staged file, its runner
-    copies and a copy of its source go, and the implementer's own sibling
-    test and conftest stay, for the implementer to commit. Review round 12's
-    suspicion, confirmed: the whole directory was removed, the sibling
-    recorded only in `heldout_removed`. A sibling committed there is not a
-    void hit by its path alone."""
-    s = _repo(tmp_path, monkeypatch)
-    base = _git(s, "rev-parse", "HEAD")
-    set_ = _held(tmp_path, rel="acc/deep/test_hidden_accept.py")
-    staged = leerie._redrive_stage(s, [set_])
-    assert staged[0]["made"] == ["acc"]
-    prints = leerie._heldout_fingerprints(s, staged, base)
-    (s / "acc" / "deep" / "conftest.py").write_text("X = 1\n")
-    (s / "acc" / "test_sibling.py").write_text(
-        "from mod import f\n\ndef test_mine():\n    assert f() == 2\n")
-    (s / "acc" / "deep" / "copy.txt").write_text(HIDDEN)
-    (s / "acc" / "deep" / "__pycache__").mkdir()
-    (s / "acc" / "deep" / "__pycache__"
-     / "test_hidden_accept.cpython-3.pyc").write_bytes(b"pyc")
-    assert _git(s, "status", "--porcelain", "--untracked-files=all") == ""
-    swept: list[str] = []
-    leerie._redrive_unstage(s, staged, swept=swept, prints=prints)
-    assert sorted(swept) == [
-        "acc/deep/__pycache__/test_hidden_accept.cpython-3.pyc",
-        "acc/deep/copy.txt"]
-    assert (s / "acc" / "deep" / "conftest.py").exists()
-    assert (s / "acc" / "test_sibling.py").exists()
-    assert not (s / "acc" / "deep" / "__pycache__").exists()
-    _git(s, "add", "acc")
-    _git(s, "commit", "-qm", "sibling")
-    assert leerie._history_heldout_hits(
-        s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == []
 
 
 def test_a_copy_made_only_in_a_merge_commit_voids(leerie, tmp_path,
@@ -196,7 +142,7 @@ def test_a_copy_made_only_in_a_merge_commit_voids(leerie, tmp_path,
     s = _repo(tmp_path, monkeypatch)
     base = _git(s, "rev-parse", "HEAD")
     set_ = _held(tmp_path)
-    staged = leerie._redrive_stage(s, [set_])
+    staged = _shown(leerie, [set_])
     prints = leerie._heldout_fingerprints(s, staged, base)
     _git(s, "checkout", "-q", "-b", "side")
     (s / "side.txt").write_text("side\n")
@@ -209,7 +155,6 @@ def test_a_copy_made_only_in_a_merge_commit_voids(leerie, tmp_path,
     (s / "notes.md").write_text(HIDDEN)
     _git(s, "add", "notes.md")
     _git(s, "commit", "-qm", "merge side")
-    leerie._redrive_unstage(s, staged)
     assert leerie._history_heldout_hits(
         s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == [
             "notes.md"]
@@ -233,7 +178,8 @@ def test_a_group_whose_commit_carries_the_sets_bytes_is_voided(
 
     def leak(w):
         (w.staging / "src" / "notes.ts").write_text(
-            "/*\n" + (w.staging / DEFECT).read_text() + "*/\n")
+            "/*\n" + open(os.path.join(w.sets[0]["dir"], DEFECT)).read()
+            + "*/\n")
         w.write("export const a = 1; // FIXED\n")
         _git(w.staging, "add", "src/notes.ts")
         _git(w.staging, "commit", "-qm", "notes")
@@ -307,7 +253,7 @@ def test_a_new_module_the_test_imports_is_not_a_hit(leerie, tmp_path):
         "it('sums', () => expect(total([1, 2])).toBe(3));\n")
     set_ = {"index": 0, "dir": str(held),
             "defect_files": ["src/orders.test.ts"]}
-    staged = leerie._redrive_stage(s, [set_])
+    staged = _shown(leerie, [set_])
     prints = leerie._heldout_fingerprints(s, staged, base)
     (s / "src" / "orders.ts").write_text(
         "export const total = (xs: number[]) => xs.reduce((a, b) => a + b, 0);\n")
@@ -315,7 +261,6 @@ def test_a_new_module_the_test_imports_is_not_a_hit(leerie, tmp_path):
         "export * from './cart';\nexport * from './orders';\n")
     _git(s, "add", "src/orders.ts", "src/index.ts")
     _git(s, "commit", "-qm", "add orders")
-    leerie._redrive_unstage(s, staged)
     assert leerie._history_heldout_hits(
         s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == []
 
@@ -345,9 +290,9 @@ def test_no_single_value_of_a_plain_python_test_is_a_span(leerie, tmp_path,
         "    return {'email': email, 'created_at': now(),\n"
         "            'status': 'pending_verification'}\n"
         "def test_create_user_returns_record():\n    pass\n")
-    assert not leerie._file_holds_span(fix, prints)
+    assert not _holds(leerie, fix, prints)
     fix.write_text("'''\n" + src + "'''\n")
-    assert leerie._file_holds_span(fix, prints)
+    assert _holds(leerie, fix, prints)
 
 
 def test_an_honest_tracked_fix_holding_the_message_is_not_a_hit(
@@ -367,37 +312,15 @@ def test_an_honest_tracked_fix_holding_the_message_is_not_a_hit(
         "'quantity must be positive'));\n")
     set_ = {"index": 0, "dir": str(held),
             "defect_files": ["src/cart.test.ts"]}
-    staged = leerie._redrive_stage(s, [set_])
+    staged = _shown(leerie, [set_])
     prints = leerie._heldout_fingerprints(s, staged, base)
     fix = ("export const cart = 1;\nexport const add = (n: number) => {"
            " if (n < 1) throw new Error('quantity must be positive'); };\n")
     (s / "src" / "cart.ts").write_text(fix)
     _git(s, "commit", "-qam", "reject a non-positive quantity")
-    leerie._redrive_unstage(s, staged)
     assert leerie._history_heldout_hits(
         s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == []
     assert _git(s, "show", "HEAD:src/cart.ts") + "\n" == fix
-
-
-def test_a_force_committed_bytecode_of_the_staged_test_voids(
-        leerie, tmp_path, monkeypatch):
-    """Round 11's leak shape through `git add -f`: the bytecode holds no
-    source line, but it is a runner's copy of the staged file by name."""
-    s = _repo(tmp_path, monkeypatch)
-    base = _git(s, "rev-parse", "HEAD")
-    set_ = _held(tmp_path)
-    staged = leerie._redrive_stage(s, [set_])
-    prints = leerie._heldout_fingerprints(s, staged, base)
-    _pytest(s, "tests/test_hidden_accept.py")
-    pyc = [p for p in (s / "tests" / "__pycache__").iterdir()
-           if p.name.startswith("test_hidden_accept.")]
-    assert pyc
-    _git(s, "add", "-f", str(pyc[0].relative_to(s)))
-    _git(s, "commit", "-qm", "oops")
-    leerie._redrive_unstage(s, staged)
-    assert leerie._history_heldout_hits(
-        s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == [
-            str(pyc[0].relative_to(s))]
 
 
 def test_a_copied_test_file_under_another_name_voids(leerie, tmp_path,
@@ -405,14 +328,15 @@ def test_a_copied_test_file_under_another_name_voids(leerie, tmp_path,
     s = _repo(tmp_path, monkeypatch)
     base = _git(s, "rev-parse", "HEAD")
     set_ = _held(tmp_path)
-    staged = leerie._redrive_stage(s, [set_])
+    staged = _shown(leerie, [set_])
     prints = leerie._heldout_fingerprints(s, staged, base)
-    subprocess.run(["cp", "tests/test_hidden_accept.py",
+    # The worker reads the shown set's source and copies it in.
+    subprocess.run(["cp", os.path.join(set_["dir"],
+                                       "tests/test_hidden_accept.py"),
                     "tests/test_mine.py"], cwd=s, check=True)
     (s / "tests" / "test_mine.py").chmod(0o644)
     _git(s, "add", "tests/test_mine.py")
     _git(s, "commit", "-qm", "mine")
-    leerie._redrive_unstage(s, staged)
     assert leerie._history_heldout_hits(
         s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == [
             "tests/test_mine.py"]
@@ -440,7 +364,7 @@ def _value_setup(leerie, tmp_path, monkeypatch):
     held = tmp_path / "held"
     (held / "tests").mkdir(parents=True)
     (held / "tests" / "test_codes.py").write_text(VALUE_TEST)
-    staged = leerie._redrive_stage(s, [{
+    staged = _shown(leerie, [{
         "index": 0, "dir": str(held),
         "defect_files": ["tests/test_codes.py"]}])
     assert staged
@@ -455,7 +379,6 @@ def test_a_committed_fix_defining_a_multiline_value_is_kept(
     assert prints                      # the test's code lines still count
     (s / "mod.py").write_text(VALUE_FIX)
     _git(s, "commit", "-qam", "add error codes")
-    leerie._redrive_unstage(s, staged, prints=prints)
     assert leerie._history_heldout_hits(
         s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == []
 
@@ -467,7 +390,6 @@ def test_a_copy_of_a_value_test_still_voids(leerie, tmp_path, monkeypatch):
     (s / "tests" / "test_mine.py").write_text(VALUE_TEST)
     _git(s, "add", "tests/test_mine.py")
     _git(s, "commit", "-qm", "mine")
-    leerie._redrive_unstage(s, staged, prints=prints)
     assert leerie._history_heldout_hits(
         s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == [
             "tests/test_mine.py"]
@@ -509,18 +431,19 @@ def test_a_huge_one_line_literal_is_fingerprinted_not_raised(
            "    assert len(PNG) > 0\n")
     (held / "tests" / "test_img.py").write_text(src)
     set_ = {"index": 0, "dir": str(held), "defect_files": ["tests/test_img.py"]}
-    staged = leerie._redrive_stage(s, [set_])
+    staged = _shown(leerie, [set_])
     prints = leerie._heldout_fingerprints(s, staged, base)
     assert prints
     copy = tmp_path / "copy.py"
     copy.write_text(src)
-    assert leerie._file_holds_span(copy, prints)
-    leerie._redrive_unstage(s, staged)
-    assert not (s / "tests" / "test_img.py").exists()
+    assert _holds(leerie, copy, prints)
 
 
-def test_a_fingerprinting_crash_still_unstages(leerie, tmp_path,
-                                               monkeypatch):
+def test_a_fingerprinting_crash_leaves_nothing_in_staging(
+        leerie, tmp_path, monkeypatch):
+    """Review round 12 L1's shape after I3: the fingerprints are computed
+    before the drive, and nothing of a set was ever in staging to be left
+    behind by a crash there."""
     w = World(leerie, tmp_path)
     w.install(monkeypatch)
     seen = []
@@ -535,6 +458,5 @@ def test_a_fingerprinting_crash_still_unstages(leerie, tmp_path,
     except OSError:
         pass
     assert seen and DEFECT in seen[0]
-    assert not list((w.staging / "src").glob("*.test.ts"))
     assert "test.ts" not in _git(w.staging, "status", "--porcelain",
                                  "--ignored", "--untracked-files=all")
