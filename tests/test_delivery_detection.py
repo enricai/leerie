@@ -844,11 +844,14 @@ class TestFalsifierGates:
     def test_a_probe_that_fails_only_once_is_not_confirmed_under_bstar(
             self, leerie, gate_env):
         """The first run fails, every rerun passes — a flake, which B*
-        must never confirm."""
+        must never confirm. Its marker lives outside the checkout: one
+        inside it is an untracked file leerie's run created, which I2
+        deletes after every run (DESIGN §6½), so each rerun would fail
+        alike."""
         flaky = ("import pathlib\n\n\n"
                  "def test_add_returns_the_sum():\n"
                  "    m = pathlib.Path(__file__).resolve().parent.parent"
-                 " / '.flaky_marker'\n"
+                 ".parent / '.flaky_marker'\n"
                  "    seen = m.exists()\n"
                  "    m.write_text('x')\n"
                  "    assert seen\n")

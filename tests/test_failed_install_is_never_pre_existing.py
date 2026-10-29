@@ -5,11 +5,13 @@ every failure there read as the base's own and a real regression shipped
 measurement*).
 
 The driver: staging's deps installed fine, then a commit makes `test_x`
-really fail. The install fails from then on (a registry outage). Phase 5
-measures the tree that ships in a fresh checkout — its install fails, so
-every test fails — and B* reruns the base in a fresh checkout whose install
-fails too, so every candidate failed on the base as well: `pre_existing`.
-Before the fix the run ended `done` with an empty end-state section."""
+really fail. The install fails from then on (a registry outage). Phase 5,
+in a resumed process, installs into staging again (the tree that ships,
+measured in place since I1 + I2 keep it at its commit) — the install fails,
+so every test fails — and B* reruns the base in a fresh checkout whose
+install fails too, so every candidate failed on the base as well:
+`pre_existing`. Before the fix the run ended `done` with an empty end-state
+section."""
 from __future__ import annotations
 
 import asyncio
@@ -60,12 +62,6 @@ def _setup(leerie, tmp_path, monkeypatch):
     return run, flag
 
 
-# Red until I2 (DESIGN §6½: leerie's commands leave the tree as they found
-# it): leerie's own test run leaves `__pycache__/` in staging, which this
-# scenario needs unignored, and the clean-tree gate (DESIGN §8 *A worker
-# leaves its tree clean*) holds the final conformer to it. Strict, so the
-# mark goes when I2 lands.
-@pytest.mark.xfail(strict=True, reason="needs I2")
 def test_a_regression_behind_a_failed_install_is_not_done(
         leerie, tmp_path, monkeypatch):
     run, flag = _setup(leerie, tmp_path, monkeypatch)
@@ -79,6 +75,8 @@ def test_a_regression_behind_a_failed_install_is_not_done(
     (staging / "tests" / "test_s.py").write_text(SUITE.format(ok="False"))
     _git(staging, "commit", "-qam", "repair")
     flag.write_text("")                                   # registry down
+    # A resume: a fresh process installs into staging again.
+    leerie._DEPS_INSTALLED.clear()
     _phase5(leerie, run)
     sec = leerie._format_pr_end_state_section(st.data)
     diff = st.data["test_id_diff"]

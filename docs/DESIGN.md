@@ -5129,110 +5129,69 @@ worktree path and lives in the process, not in run state: it records a
 filesystem fact, and re-installing once after a `resume` is correct
 since a fresh container starts with an empty worktree.
 
-**Leerie's own commands leave tracked files as they found them.** An
-install can rewrite a tracked file in ordinary use — `uv sync` relocks
-`uv.lock` under a newer uv, `bundle install` adds the container's
-platform to a `Gemfile.lock` made on a Mac, `pipenv install` rewrites
-`Pipfile.lock` on a hash mismatch — and so can a build (`next build`
-rewrites a tracked `tsconfig.json` or `next-env.d.ts`) or a test run
-(a snapshot written). Left in place, that edit is indistinguishable
-from a worker's: review round 9 drove a clean run whose install appended
-to the tracked `pnpm-lock.yaml` into an end-state line "uncommitted
-edits to 1 tracked file(s) that do not ship — check whether they belong
-in the change", the final conformer's "left 1 uncommitted change(s)"
-warning, and, on a run that re-drove, a leftovers commit shipping the
-churn. So the commands leerie runs to install into or measure a tree
-that workers also work in — the recipe's install and build entries, a
-measured build/lint/test axis, a test-ID report run — are bracketed by a
-snapshot of the tracked files' content (path → blob of the working
-bytes), and whatever tracked file the command changed is put back as it
-was just before it: from HEAD when it matched HEAD, from its saved bytes
-when someone had already edited it (an edit a worker left is never
-lost). Dependencies and other untracked output stay, so the tree stays
-runnable, and staging stays at its commit plus only what workers left.
-The other commands leerie runs in a tree are not bracketed and do not
-need to be: CI parity's and the coverage settle's commands reset their
-tree with `git checkout -- .` themselves; the settle by execution reads
-any dirt its commands leave as its own verdict; the held-out sets' parse
-probe and runs work in disposable checkouts; and the setup hook and
-`mise install` run at the repository root before any worktree exists.
+**Leerie's own commands leave a worker's tree as they found it.** The
+invariant (I2): *every command leerie itself runs in a tree a worker
+works in — the recipe's install and build entries, a measured
+build/lint/test axis, a test-ID report run, a coverage settle's commands,
+a settle by execution's verify commands — leaves that tree as it was just
+before the command, apart from ignored files*: every tracked file the
+command changed is put back, every untracked, not-ignored file it created
+is deleted (with the directories that leaves empty), and an ignored file
+— installed dependencies, a build a repository ignores — stays, so the
+tree stays runnable. Together with I1 (§8 *A worker leaves its tree
+clean*) it makes the tree leerie measures, judges and ships nameable by
+its commit alone: at every point leerie reads it, staging is its HEAD plus
+ignored files.
 
-The bracket also records which untracked files the command produced:
-every untracked, not-ignored path that appeared while it ran, keyed by
-its stat identity (inode, size, mtime, ctime — any rewrite or
-replacement changes it), kept in a file in that worktree's own git
-directory so it lives and dies with the worktree and survives a resume.
-Attribution is by first producer: a path that appeared while one of
-leerie's commands ran stays leerie's for as long as it exists, whoever
-rewrites it later, and a path that existed before the command — a
-worker's — never becomes leerie's, whatever leerie's command does to it.
-Review round 11 drove why the first half is needed: the record used to
-drop a leerie artifact the moment anything else rewrote it, so a final
-conformer that re-ran the repository's tests to check its work (as
-conformers routinely do) turned `coverage/` and `junit.xml` into files of
-unknown origin; every later measurement of staging then read as "not the
-committed tree", `_final.tree_sha` and the diff's `tree_sha` were None,
-and the delivery judges' RECORD lost the orchestrator's final axes and B\*
-line for a tree that was exactly HEAD. A worker re-running a command
-leerie ran makes the same artifact; it does not make a source file. The
-record exists because "which untracked file is the change" cannot be
-read from the files themselves. Review round 9 tried the worker side —
-a file was the worker's only when its Write/Edit tool calls named it —
-and review round 10 drove both ways that fails: a module the final
-conformer made with a heredoc read as an artifact and stamped a staging
-measurement with the committed tree (a false `done`), and a re-drive
-implementer's `mv` shipped the deletion without the new file. Workers
-make files through shell commands all the time; leerie knows every
-command of its own. So the attribution is inverted and fails closed:
-what leerie's bracketed commands produced is leerie's, and every other
-untracked file is a worker's. A file a command leerie does not bracket
-produced is then a worker's too, which costs a measurement (below),
-never a wrong verdict.
+The root cause it removes. An install can rewrite a tracked file in
+ordinary use — `uv sync` relocks `uv.lock` under a newer uv, `bundle
+install` adds the container's platform to a `Gemfile.lock` made on a Mac,
+`pipenv install` rewrites `Pipfile.lock` on a hash mismatch — and so can
+a build (`next build` rewrites a tracked `tsconfig.json`) or a test run (a
+snapshot written). And a test run leaves untracked output in any
+repository that does not ignore it: `__pycache__/`, `coverage/`,
+`junit.xml`, a first-run snapshot. Left in place, that output sat in the
+tree workers commit from and leerie measures, indistinguishable from a
+worker's: review round 9 drove a clean run whose install appended to the
+tracked `pnpm-lock.yaml` into an end-state line "uncommitted edits to 1
+tracked file(s) that do not ship", the final conformer's "left 1
+uncommitted change(s)" warning, and a leftovers commit shipping the churn.
+The tracked half was put back from then on; the untracked half was
+*recorded* instead — which untracked file leerie's command produced
+first, which one it wrote last, which ones a test run writes — so that a
+later reader could tell leerie's output from a worker's file. Rounds 10 to
+14 each found that record answering a question a little wrong (a
+conformer re-running the tests turned `coverage/` into a file of unknown
+origin; a worker's rewrite of a generated file read as leerie's; a test
+run in a checkout no longer refreshed staging's record), and each added a
+record. Every one of them existed only because leerie's own output stayed
+in the tree. Deleting what a command created removes the question.
 
-The record answers two different questions, and each has one invariant.
-*Is this untracked file part of the change?* — a file leerie's own
-command created never is, and a file that existed before it never
-becomes leerie's: that is first producer, above. (The re-drive's
-leftovers commit used to read it; the worker now commits or deletes its
-own files, §8 *A worker leaves its tree clean*.) *Does a measurement taken in this tree describe
-the committed tree?* — only when every untracked file in it holds what a
-leerie command last wrote: that is last writer, and `_measured_tree_sha`
-reads it. The record keeps, per path, the signature leerie's command left;
-a later command that rewrites the path takes it back at the new
-signature, one that leaves the path alone keeps the old one, so a worker's
-rewrite in between shows as a signature that differs. Review round 12 M2
-drove why the two cannot share one predicate: leerie's install ran the
-repository's codegen into an unignored `gen.py`, the worker rewrote it
-through Bash to the value its fix rests on, and first producer called the
-measurement of that tree the committed one (a green result describing
-content that does not ship) while the leftovers commit dropped the edit
-with no line anywhere. Under the split, that measurement is of an
-uncommitted tree, and the worker commits or deletes its edit (§8 *A
-worker leaves its tree clean*). Last writer keeps round 11's case: the
-final measurement is itself a leerie command that rewrites `coverage/` and
-`junit.xml` again, so a conformer's earlier re-run of the tests is
-overwritten by the time the measurement is stamped.
+Measured before building it, across barnacle, funeralworks and api: no
+later step needs a non-ignored file an install, build or test run
+generates — every real output (`dist/`, `.next/`, the Prisma client,
+`coverage/`, `node_modules/`) is ignored, so it stays. The residuals are
+husky's install, which changes git config rather than writing a file, and
+a first-run snapshot file, which a deletion correctly removes: a snapshot
+a test writes on its first run is the worker's to commit, not leerie's.
+A repository that does not ignore its dependency directory (`.venv/`,
+`node_modules/`) gets it deleted after each install; I1 already holds its
+workers to the same rule, and real repositories ignore it.
 
-A third question has its own record: *is this file what a test run
-writes?* Every path one of leerie's own test commands — the measured
-`tests` axis, a test-ID report run — made or rewrote is kept, by path,
-in a second file beside the first (`leerie-test-outputs.json`), and so
-is every such path a test run wrote in a disposable checkout of the
-tree's commit, adopted when that checkout is removed. A worker that
-re-runs the tests rewrites exactly those files, and whatever it leaves in
-one is overwritten by the next test run: it is output, not part of any
-change, whether leerie's run wrote it in this tree or only in a checkout of it. Review
-round 14 drove the second half: once the re-drive's execution route
-measured in a checkout of the commit (§8 *Every post-execution verdict
-is of the committed tree*), its test runs no longer rewrote staging's
-reports, so last writer's rescue above stopped reaching them — a
-`junit.xml` the implementer's own test run rewrote was listed as a
-generated file the implementer then edited, and one it created first was
-committed. The
-record is by path, never by name: a repository may track a fixture
-called `junit.xml` or commit its coverage on purpose, and only leerie's own run shows which files a test
-run writes here. An install or build is not a test command, so codegen
-stays under round 12 M2's rule.
+The bracket: a snapshot of the tracked files' content (path → blob of the
+working bytes) and the list of untracked, not-ignored files (`git
+ls-files --others --exclude-standard`) are taken before the command.
+Afterwards every tracked file whose content changed is put back as it was
+just before — from HEAD when it matched HEAD, from its saved bytes when it
+was already edited, so nothing anyone left is lost — and then every
+untracked, not-ignored file not in the earlier list is deleted. A file
+that existed before the command is never deleted, whatever the command
+did to it. The other commands leerie runs do not need it: CI parity and
+the held-out sets' parse probe and runs work in disposable checkouts no
+worker commits from; the setup hook and
+`mise install` run at the repository root before any worktree exists; and
+the advisory whole-PR review, a worker, has what it leaves undone by the
+same two acts.
 
 Three details keep the snapshot itself sound. Only the snapshot taken
 before a command writes its blobs to the object store, since only those
@@ -5249,8 +5208,8 @@ removed first). Asking the directory itself which commit it has checked
 out answers with the enclosing repository's HEAD, which read that case
 as a submodule that is never restored (review round 11). A path git cannot hash is listed as such
 and left alone instead of failing the snapshot — one dirty submodule
-had switched off the put-back and the leftovers commit for the whole
-tree. And every path goes to git as a literal pathspec: `git checkout
+had switched off the put-back for the whole tree. And every path goes to
+git as a literal pathspec: `git checkout
 HEAD -- app/[slug]/page.tsx` otherwise reads the brackets as a glob and
 also reverts a worker's edit to `app/s/page.tsx`. That holds for every
 git command leerie runs with a path it did not write as a constant, not
@@ -5261,22 +5220,18 @@ and a read-only `git diff -- app/[slug]/p.ts` reporting a line of
 a pathspec a prompt defines as one (`ABSENT:<pathspec>`) — and is named
 as deliberate in the source scan that guards the rest.
 
-Restoring rather than recording-and-excluding was chosen because it is
-one rule at the source instead of three filters downstream (the
-end-state note, the conformer's leftover count, the re-drive commit),
-and because it keeps the tree that was measured byte-identical in its
-tracked files to the tree that ships. Nor is a rewrite committed as part
-of the change. Leerie cannot tell an environment-driven rewrite (a newer
-tool, the container's platform) from one the change caused, and
-committing the first ships churn the user never asked for. The case
-where the change causes it — a worker edited `package.json` and did not
-update the lockfile — is the worker's to commit: workers run the install
-themselves for their own work (above), and the table's JavaScript
-installs are frozen (`pnpm install --frozen-lockfile`, `yarn install
---frozen-lockfile`, `npm ci`), so that drift fails the install instead
-of rewriting the lockfile, which §9 *Which failures are new* treats as
-"could not measure", never as a pass. For the unfrozen installers the
-rewrite is put back like any other and logged by path.
+Nor is a rewrite committed as part of the change. Leerie cannot tell an
+environment-driven rewrite (a newer tool, the container's platform) from
+one the change caused, and committing the first ships churn the user
+never asked for. The case where the change causes it — a worker edited
+`package.json` and did not update the lockfile — is the worker's to
+commit: workers run the install themselves for their own work (above),
+and the table's JavaScript installs are frozen (`pnpm install
+--frozen-lockfile`, `yarn install --frozen-lockfile`, `npm ci`), so that
+drift fails the install instead of rewriting the lockfile, which §9
+*Which failures are new* treats as "could not measure", never as a pass.
+For the unfrozen installers the rewrite is put back like any other and
+logged by path.
 
 The orchestrator addresses both with a dedicated phase between
 classification and planning, layered top-to-bottom by determinism:
@@ -7207,71 +7162,81 @@ this costs nothing. Every row's test-outcome part is then re-read from it,
 as after a re-drive.
 
 The tree that ships is the *committed* one, staging's `HEAD^{tree}`:
-finalize pushes the branch, and nothing uncommitted reaches it. A
-measurement taken in staging itself describes that tree only while staging
-is clean, and the test run alone can make it unclean — `__pycache__/`, a
-coverage file, a JUnit report or a fresh snapshot, in a repository that
-does not ignore them. Review round 8 drove the cost of reading those
-artifacts as "the tree that ships could not be identified": a clean run on
-such a repository listed a regression check it had in fact run, and a run
-whose repair commit fixed a confirmed-new test stayed `unconverged` on a
-tree where the test passes, because the refresh never measured again. So
-the shipping tree is identified by its commit, never by the worktree's
-cleanliness, and when staging holds anything uncommitted the measurement is
-taken in a clean detached checkout of staging's HEAD — the way CI parity
-takes its own — so what is measured is exactly what ships. Untracked files
-never count as a change; uncommitted edits to *tracked* files do not ship
-either, so the diff still describes the committed tree, and they are
-listed under "Needs human verification" for the reviewer to judge whether
-they belonged in the change. Only a worker's edits can be listed there:
-leerie's own installs, builds and test runs put back every tracked file
-they rewrite (§6½ *Leerie's own commands leave tracked files as they
-found them*), so a clean run whose install relocks a lockfile lists
-nothing. The same rule names what a measurement in staging itself described:
-when nothing tracked is edited and every untracked file is one leerie's
-own commands produced (§6½), the measurement saw exactly the committed
-tree plus artifacts that never ship, so the final conformer's diff is
-stamped with the committed tree and the refresh reuses it. Review round
-9 L1 measured the cost of stamping it "unidentifiable" instead: on a
-repository that does not ignore `__pycache__/`, every run paid a second
-checkout, install, discovery and B\* on a tree already measured. Any
-other untracked file — a worker's, made through a tool call or a shell
-command alike — was collected there and does not ship, so then the
-clean checkout is measured. Review round 10 drove the rule this
-replaced, which trusted every untracked file the final conformer's
-Write/Edit calls did not name: a `helper.py` it made with a heredoc
-made the suite pass in staging, the measurement was stamped with a
-committed tree whose `test_m` fails, and the run ended `done` with an
-empty section. A worker that runs the suite itself in a repository
-that does not ignore `__pycache__/` leaves `.pyc` files of unknown
-origin, and that run pays the second measurement; that is the price of
-never calling a worker's file an artifact.
+finalize pushes the branch, and nothing uncommitted reaches it. With I1
+(§8 *A worker leaves its tree clean*) and I2 (§6½ *Leerie's own commands
+leave a worker's tree as they found it*) holding, staging at every point
+leerie reads it — a measurement, a delivery judge, the ratchet, the
+refresh — is its HEAD plus ignored files: no worker leaves anything
+uncommitted there, and no command of leerie's own leaves anything
+behind. So a measurement taken in staging *is* a measurement of the
+committed tree, and is stamped with `HEAD^{tree}`; nothing uncommitted is
+ever listed, because nothing uncommitted can be there.
+
+Review rounds 8 to 14 had built the opposite: staging was allowed to
+hold leerie's test output and a worker's leftovers, and every reader had
+to work out which tree a measurement in it described. A clean run whose
+tests left `__pycache__/` read as "the tree that ships could not be
+identified" (round 8); the answer became a clean detached checkout of
+HEAD whenever staging held anything, a list of tracked edits "that do not
+ship" for the reviewer, and a stamp that called a staging measurement the
+committed tree only when every untracked file was one leerie's commands
+last wrote — and each of those answers was driven wrong by the next
+round: a `helper.py` a conformer made through a heredoc made the suite
+pass in staging under a committed-tree stamp (round 10), a conformer's
+own test re-run made `coverage/` of unknown origin (round 11), a worker's
+rewrite of a generated file was stamped as the committed tree (round 12).
+The root cause was never in the readers: it was the dirt. With I1 and I2
+there is none to classify, and the readers have one rule.
+
+That rule is checked, not trusted. Each reader first asserts that staging
+is clean (`git status --porcelain --untracked-files=all` prints nothing;
+ignored files are not dirt), and a violation **stops the run** (`die`)
+naming the porcelain lines. It is not routed to `unconverged`, for three
+reasons. A violation has no outside cause: every worker's dirt is caught
+by I1's gate at the worker (re-asked, then rolled back), every command of
+leerie's own is bracketed by I2, and an interrupted run's cleanup removes
+staging, so the resume adds a fresh one from the run branch — dirty
+staging at a reader means leerie's own code broke an invariant. (A
+SIGKILL skips that cleanup, so a worker killed mid-round can leave its
+partial edits in a staging the resume reuses; the first reader then
+stops the run, that stop's cleanup removes staging, and the next resume
+starts clean.) Continuing would mean
+measuring, judging or shipping a tree leerie cannot name — the very guess
+this design removed — and a run that ends `unconverged` because of it
+would present a defect of leerie as unfinished work of the task's, in the
+PR the user reads. And the stop costs no work: state is saved, the
+worktrees are cleaned up as on any `die`, and `leerie resume` continues
+from the same step on a clean staging. A git failure while reading the
+status stops the run the same way: nothing was read, so nothing is known
+about the tree.
 
 **Every post-execution verdict is of the committed tree.** The invariant:
 *a verdict becomes `met` only on a read of a commit, or on a measurement
-the orchestrator itself made of the committed tree.* Staging can hold
-what does not ship: an edit a worker left, an untracked file. Review
-round 9 asked whether the delivery judges, and the held-out re-measure,
-therefore judge the wrong tree. Every check that can make a verdict *met*
-reads a commit, and a check that fails to read one makes nothing *met*:
+the orchestrator itself made of the committed tree.* Review round 9
+asked whether the delivery judges, and the held-out re-measure, judge
+the wrong tree when staging holds what does not ship. Every check that
+can make a verdict *met* reads a commit, and a check that fails to read
+one makes nothing *met*:
 
 - the delivery judges — every item verdict, the DEFECT CONTRACT verdict,
   and the delivery ratchet's judged re-verification of the items a
   re-drive group did not route (its execution-typed items are read from
-  the failing-test-ID diff of the commit, below) — read a clean checkout
-  of staging's HEAD — a plain `git worktree add --detach`, with no
-  dependency install, since a judge only reads files (staging itself
-  only when its working tree is byte-identical to HEAD, not even an
-  ignored file differing: review round 13 L2 drove a worker's uncommitted
-  `dist/` build, ignored and so invisible to a plain status, in front of
-  the uncited contract verdict), so content only the working tree holds is
-  not in front of them; a checkout that cannot be
-  made fails the judge, never falls back to staging. Review round 12
-  drove why the cite rule below was not enough on its own: the contract
-  verdict carries no citation and resolved `met` on a single sample, and
-  the ratchet re-verified kept items with no citation check — both judged
-  staging's working tree, so an untracked helper could hold the contract
-  up;
+  the failing-test-ID diff of the commit, below) — read staging itself,
+  asserted clean first (*The final diff describes the tree that ships*,
+  above): it is HEAD plus ignored files, so no content only the working
+  tree holds is in front of them. Review round 12 drove why the cite rule
+  below was not enough on its own: the contract verdict carries no
+  citation and resolved `met` on a single sample, and the ratchet
+  re-verified kept items with no citation check — both judged staging's
+  working tree, so an untracked helper could hold the contract up. Rounds
+  12 to 14 answered with a disposable checkout of HEAD whenever staging
+  held anything (from round 13 L2, an ignored file too), which every run
+  with installed dependencies then took; I1 and I2 remove the helper
+  itself, so the judges read staging. Ignored files stay in front of
+  them, as they are in front of every test run: by the repository's own
+  declaration they are not source, nothing of them ships, and a met
+  resting on one buys nothing, since every cite is checked against
+  `HEAD`;
 - a judge's `met` counts only when each part cites a quote found in
   `git show HEAD:<path>` (`_verify_delivery_cite`), and an `ABSENT` cite
   is `git grep` over `HEAD`, so content only the working tree holds buys
@@ -7285,8 +7250,8 @@ reads a commit, and a check that fails to read one makes nothing *met*:
   the executed-commands record — the final-tree build/lint/test axes,
   the B\* diff, the held-out sets' final verdicts — and those are in it
   only while they describe staging's HEAD: the axes and the B\* diff
-  carry the committed tree they measured (none when the measurement saw
-  a worker's uncommitted file, §8 above), the held-out sets their commit.
+  carry the committed tree they measured (staging asserted clean, §8
+  above), the held-out sets their commit.
   The orchestrator's entries are kept apart from the text the judge reads,
   and a cite is checked against that separate store, never against a
   tag in the text: a worker's entry cannot become one by its contents.
@@ -7333,13 +7298,10 @@ round 13 claims M1 found three paths where it had):
   stamped it with that commit;
 - the ratchet's execution route — the failing-test-ID measurement, its
   intermittent-discovery repeats and B\*'s rerun of the repaired side —
-  runs where only the commit is: staging when nothing but ignored files
-  differs from HEAD (those are the repository's installed dependencies,
-  which every measurement runs with), else a clean checkout of HEAD with
-  its dependencies installed; when that cannot be made the measurement is
-  missing, never one of staging's working tree. It had measured staging
-  as it stood, beside a withheld leftover. A failed checkout is not
-  remembered: the next measurement makes a fresh one.
+  runs where only the commit is: staging, asserted clean (HEAD plus the
+  ignored files every measurement runs with). It had measured staging as
+  it stood, beside a withheld leftover; the leftover no longer exists
+  (I1), and neither does the clean checkout that replaced it.
 
 The judges no longer see staging-only content at all, and the ratchet's
 test IDs are measured on the commit. The final diff measures the committed
@@ -7478,10 +7440,19 @@ Superseded by this: the leftovers commit with its artifact-name list, its
 caps and its saved archive, the "Files a re-drive left uncommitted" PR
 entry, the conformers' advisory dirty-tree warnings, and the per-subtask
 conformer's parse of `-z -uall` porcelain for a `tests` repair cited at an
-uncommitted path — a clean tree has no uncommitted path to cite. Which
-untracked files leerie's own commands produced (§6½) no longer decides
-what is committed; what remains of that record serves the measurement
-stamps until leerie's commands leave the tree as they found it.
+uncommitted path — a clean tree has no uncommitted path to cite. The records of which untracked files leerie's
+own commands produced went with I2 (§6½): those commands now leave
+nothing behind to attribute.
+
+A worker in staging that crashes or times out is held to the same rule
+as one that returns: its round may already have edited the tree, so the
+gate runs after a raised `claude -p` too (the re-ask resumes whatever
+session it recorded, and with none recorded spends its attempt), and only
+then does the round end — the acceptance-repair round always did, the
+re-drive's `_redrive_drive` returns its error rather than raising, and
+the final conformer's round now does: it used to break on a worker error
+before its gate, leaving the crashed worker's edits in staging for every
+later reader (§8 *The final diff describes the tree that ships*).
 
 **No line of a staged set's source reaches history.** The invariant this
 barrier serves is exactly one: *the held-out test's source never reaches

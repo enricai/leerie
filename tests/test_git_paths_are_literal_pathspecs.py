@@ -1,6 +1,6 @@
 """Review round 11 L1: every git invocation in leerie.py that passes a path
 after `--` passes it as a literal pathspec (DESIGN §6½ *Leerie's own
-commands leave tracked files as they found them*: "every path goes to git
+commands leave a worker's tree as they found it*: "every path goes to git
 as a literal pathspec").
 
 Without `--literal-pathspecs`, git reads `app/[slug]/page.tsx` as a glob

@@ -199,12 +199,11 @@ def test_the_ratchet_judge_sees_prior_evidence_and_the_round_diff(
     diff = up[i_diff:]
     assert f"git diff {start} HEAD" in diff
     assert "-    return a - b" in diff and "+    return a + b" in diff
-    # A clean checkout of the commit after the group, unless staging holds
-    # nothing uncommitted (DESIGN §8 *Every post-execution verdict is of
-    # the committed tree*; tests/test_judges_read_the_committed_tree.py).
-    assert j["schema_key"] == "delivery_ratchet" and j["cwd"] in (
-        str(staging), str(leerie._helper_worktree_path(st,
-                                                        "delivery-ratchet")))
+    # Staging itself, at the commit after the group and asserted clean
+    # (DESIGN §8 *Every post-execution verdict is of the committed tree*;
+    # tests/test_judges_read_the_committed_tree.py).
+    assert j["schema_key"] == "delivery_ratchet"
+    assert j["cwd"] == str(staging)
     assert j["allowed_tools"] == leerie.SATISFIED_PROBE_TOOLS
 
 
@@ -591,70 +590,58 @@ def test_a_failed_acceptance_round_ratchet_drops_the_item_from_prior_met(
     assert sorted(leerie._ratchet_prior_met(st)) == [2, 4]
 
 
-def test_the_execution_route_measures_the_commit_not_staging(
-        leerie, tmp_path, monkeypatch):
+def test_the_execution_route_measures_staging_at_its_commit(
+        leerie, tmp_path, monkeypatch, capsys):
     """The failing-test-ID measurement the ratchet's execution route reads
-    runs where only the commit is: a withheld leftover in staging is not
-    in its tree."""
+    runs where only the commit is: staging itself, asserted clean (I1 +
+    I2; DESIGN §8 *The final diff describes the tree that ships*). Round
+    13's withheld leftover in staging no longer exists; a file there now
+    stops the run before anything is measured."""
     w = World(leerie, tmp_path)
-    (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
     seen: list[tuple[str, bool]] = []
 
     async def ids(st, caps, tree, *, label, log_path):
         seen.append((tree, (Path(tree) / "src" / "leftover.ts").exists()))
         return {"ids": [], "files": {}, "command": "t"}
-
-    async def deps(*a, **k):
-        return True
     monkeypatch.setattr(leerie, "_ratchet_test_ids", ids)
-    monkeypatch.setattr(leerie, "_ensure_worktree_deps", deps)
-    asyncio.run(leerie._redrive_test_ids(w.st, w.caps, w.staging, "x"))
-    ((tree, saw),) = seen
-    assert tree != str(w.staging) and not saw
-    assert not Path(tree).exists()            # removed afterwards
-    # A clean staging is measured in place.
-    (w.staging / "src" / "leftover.ts").unlink()
-    seen.clear()
     asyncio.run(leerie._redrive_test_ids(w.st, w.caps, w.staging, "x"))
     assert seen == [(str(w.staging), False)]
-    # No checkout with its dependencies: no measurement, never staging's.
     (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
-
-    async def no_deps(*a, **k):
-        return False
-    monkeypatch.setattr(leerie, "_ensure_worktree_deps", no_deps)
     seen.clear()
-    assert asyncio.run(leerie._redrive_test_ids(
-        w.st, w.caps, w.staging, "x")) is None and seen == []
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie._redrive_test_ids(w.st, w.caps, w.staging, "x"))
+    assert seen == []
+    assert "?? src/leftover.ts" in capsys.readouterr().err
 
 
 def test_the_ratchet_exec_discovery_and_bstar_run_on_the_commit(
         leerie, tmp_path, monkeypatch):
     """`_ratchet_exec`'s discovery repeats and B*'s final side run in the
-    same commit-only tree as the IDs: never beside a withheld leftover."""
+    same tree as the IDs: staging, asserted clean; never beside a file
+    that does not ship."""
     w = World(leerie, tmp_path)
-    (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
-    seen: list[tuple[str, str, bool]] = []
-
-    async def deps(*a, **k):
-        return True
+    seen: list[tuple[str, str]] = []
 
     async def disc(st, caps, tree, cmd, base, **k):
-        seen.append(("discovery", tree,
-                     (Path(tree) / "src" / "leftover.ts").exists()))
+        seen.append(("discovery", str(tree)))
         return {"failed_ids": [], "fail_counts": {}, "id_files": {},
                 "_runs": []}
 
     async def newf(st, caps, tree, pre, before, after, label, **k):
-        seen.append(("bstar", str(tree),
-                     (Path(tree) / "src" / "leftover.ts").exists()))
+        seen.append(("bstar", str(tree)))
         return {"new": [], "resource_affected": [], "unmeasured": False}
-    monkeypatch.setattr(leerie, "_ensure_worktree_deps", deps)
     monkeypatch.setattr(leerie, "_intermittent_discovery", disc)
     monkeypatch.setattr(leerie, "_redrive_new_failures", newf)
     ids = {"ids": [], "files": {}, "command": "t"}
-    asyncio.run(leerie._ratchet_exec(
-        w.st, w.caps, w.staging, "HEAD", ids, ids, label="x",
-        log_path=w.st.run_dir / "x.log"))
-    assert [k for k, _t, _s in seen] == ["discovery", "bstar"]
-    assert all(t != str(w.staging) and not saw for _k, t, saw in seen)
+
+    def run():
+        return asyncio.run(leerie._ratchet_exec(
+            w.st, w.caps, w.staging, "HEAD", ids, ids, label="x",
+            log_path=w.st.run_dir / "x.log"))
+    run()
+    assert seen == [("discovery", str(w.staging)), ("bstar", str(w.staging))]
+    (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
+    seen.clear()
+    with pytest.raises(SystemExit):
+        run()
+    assert seen == []

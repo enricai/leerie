@@ -1,14 +1,16 @@
-"""Review round 9 M1: leerie's own install, build and test commands leave
-tracked files as they found them (DESIGN §6½ *Leerie's own commands leave
-tracked files as they found them*).
+"""I2: leerie's own install, build, test and coverage commands leave a
+worker's tree as they found it, apart from ignored files (DESIGN §6½
+*Leerie's own commands leave a worker's tree as they found it*).
 
-Before: an install that rewrote a tracked lockfile in staging left
-` M pnpm-lock.yaml` behind, and a clean run's PR listed it under "Needs
-human verification" as "uncommitted edits to 1 tracked file(s) that do not
-ship", with the final conformer warning that it "left 1 uncommitted
-change(s)" it never made. The drivers use real git and real executables on
-PATH that rewrite the tracked file the way `uv sync`, `bundle install` and
-`next build` do."""
+Review round 9 M1: an install that rewrote a tracked lockfile in staging
+left ` M pnpm-lock.yaml` behind, and a clean run's PR listed it under
+"Needs human verification" as "uncommitted edits to 1 tracked file(s) that
+do not ship". Rounds 10 to 14: the untracked half — `__pycache__/`,
+`coverage/`, `junit.xml` a test run leaves in a repository that does not
+ignore them — was recorded instead of removed, and every record was driven
+wrong in turn. Now a tracked file is put back and an untracked, not-ignored
+file the command created is deleted. The drivers use real git and real
+executables on PATH."""
 from __future__ import annotations
 
 import asyncio
@@ -18,15 +20,6 @@ import subprocess
 import sys
 
 import pytest
-
-# Red until lane B's I2 step; see the reason.
-_NEEDS_I2 = pytest.mark.xfail(
-    strict=True,
-    reason=("I1 (DESIGN §8 *A worker leaves its tree clean*) holds the final "
-           "conformer to a clean staging, and leerie's own test run leaves "
-           "this untracked output there until I2 (DESIGN §6½: leerie's "
-           "commands leave the tree as they found it) — remove this mark "
-           "when I2 lands; strict, so it cannot be forgotten"))
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_redrive_test_id_diff_refresh import _git  # noqa: E402
@@ -49,7 +42,8 @@ def _clear_deps_memo(leerie):
 
 
 def _status(p) -> str:
-    return subprocess.run(["git", "status", "--porcelain"], cwd=p,
+    return subprocess.run(["git", "status", "--porcelain",
+                           "--untracked-files=all"], cwd=p,
                           capture_output=True, text=True).stdout
 
 
@@ -69,9 +63,10 @@ def _final_and_phase5(leerie, run):
         {"conformer": "low"}))
     _phase5(leerie, run)
     st = run["st"]
-    # What a clean run left untracked is all leerie's own commands' output,
-    # so the final measurement is of the committed tree (round 10 H1): the
-    # diff is stamped with it and the record's final-tree axes cite it.
+    # Leerie's own commands left nothing behind (I2), so the final
+    # measurement is of the committed tree: the diff is stamped with it and
+    # the record's final-tree axes cite it.
+    assert _status(run["staging"]) == ""
     head_tree = _git(run["staging"], "rev-parse", "HEAD^{tree}")
     assert st.data["test_id_diff"]["tree_sha"] == head_tree
     assert st.data["conformance"]["_final"]["tree_sha"] == head_tree
@@ -112,25 +107,29 @@ def _node_repo(leerie, tmp_path, monkeypatch, *, lock_rewrite: bool):
 # The four clean-run shapes: done, with an EMPTY end-state section
 
 
-@_NEEDS_I2
-def test_shape1_pytest_pycache_unignored(leerie, tmp_path, monkeypatch):
+def test_shape1_pytest_pycache_unignored(leerie, tmp_path, monkeypatch,
+                                         capsys):
     run = _repo(leerie, tmp_path, monkeypatch)
     _quiet_conformer(leerie, monkeypatch)
     out, sec = _final_and_phase5(leerie, run)
-    assert "?? " in _status(run["staging"])        # the precondition
+    # The precondition: leerie's test runs did create `__pycache__/`.
+    assert "untracked file(s) its own tests created" in capsys.readouterr().out
+    assert not list(run["staging"].rglob("__pycache__"))
     assert (out, sec) == ("done", "")
 
 
-@_NEEDS_I2
-def test_shape2_vitest_shaped_coverage(leerie, tmp_path, monkeypatch):
+def test_shape2_vitest_shaped_coverage(leerie, tmp_path, monkeypatch, capsys):
     run = _node_repo(leerie, tmp_path, monkeypatch, lock_rewrite=False)
     _quiet_conformer(leerie, monkeypatch)
     out, sec = _final_and_phase5(leerie, run)
-    assert "?? junit.xml" in _status(run["staging"])
+    logged = capsys.readouterr().out
+    assert "untracked file(s) its own tests created" in logged
+    assert "junit.xml" in logged
+    assert not (run["staging"] / "junit.xml").exists()
+    assert not (run["staging"] / "coverage").exists()
     assert (out, sec) == ("done", "")
 
 
-@_NEEDS_I2
 def test_shape3_an_install_that_rewrites_the_lockfile(
         leerie, tmp_path, monkeypatch):
     """The reviewer's driver: the install appends to the tracked
@@ -156,7 +155,6 @@ SNAP_TEST = (
     "    assert True\n")
 
 
-@_NEEDS_I2
 def test_shape4_a_test_that_rewrites_a_tracked_snapshot(
         leerie, tmp_path, monkeypatch):
     """Round 10's fourth shape: a test rewrites the tracked
@@ -176,29 +174,37 @@ def test_shape4_a_test_that_rewrites_a_tracked_snapshot(
     assert (out, sec) == ("done", "")
 
 
-@_NEEDS_I2
 @pytest.mark.parametrize("worker_runs_tests", [False, True])
-def test_a_conformer_rerunning_the_tests_keeps_the_record(
+def test_a_conformer_rerunning_the_tests_ends_done_once_it_cleans_up(
         leerie, tmp_path, monkeypatch, worker_runs_tests):
-    """Review round 11 M2, the reviewer's driver: shape 2, and the final
-    conformer only re-runs the repository's test command through Bash to
-    check its work, changing nothing. Before, that rewrite took `coverage/`
-    and `junit.xml` out of the record for good: `_final.tree_sha` and the
-    diff's `tree_sha` were None and the delivery judges' RECORD
-    (`_orchestrator_results_digest`) was empty, for a tree that was
-    exactly HEAD. The control runs nothing."""
+    """Review round 11 M2's driver, rewritten for I1 + I2: shape 2, and the
+    final conformer re-runs the repository's test command through Bash to
+    check its work, changing nothing. Its `coverage/` and `junit.xml` are
+    its own output now, never recorded as leerie's: the clean-tree gate
+    re-asks it, and it deletes them (as real workers do). The round 11
+    harm — `_final.tree_sha` and the diff's `tree_sha` None and the
+    delivery judges' RECORD (`_orchestrator_results_digest`) empty for a
+    tree that was exactly HEAD — cannot recur: both stamps are HEAD's tree.
+    The control runs nothing and is never re-asked."""
     run = _node_repo(leerie, tmp_path, monkeypatch, lock_rewrite=False)
     _quiet_conformer(leerie, monkeypatch)
     staging, st = run["staging"], run["st"]
     cmd = leerie.resolve_blt(None)["test"]
+    sids = []
 
     async def conformer(*a, **k):
-        if worker_runs_tests:
+        sids.append(k["sid"])
+        if k["sid"].endswith("-clean1"):
+            subprocess.run(["git", "clean", "-fdq"], cwd=staging, check=True)
+        elif worker_runs_tests:
             subprocess.run(cmd, shell=True, cwd=staging, capture_output=True)
         return {}
     monkeypatch.setattr(leerie, "claude_p", conformer)
+    monkeypatch.setattr(leerie, "_log_session_id", lambda p: "sess-1")
     out, sec = _final_and_phase5(leerie, run)     # asserts both tree_shas
     assert (out, sec) == ("done", "")
+    assert sids == (["final-conformer-r0", "final-conformer-r0-clean1"]
+                    if worker_runs_tests else ["final-conformer-r0"])
     digest = leerie._orchestrator_results_digest(st, staging)
     assert "[orchestrator final-tree tests]" in digest
     assert "[orchestrator B* failing-test diff]" in digest
@@ -254,14 +260,17 @@ def test_an_install_that_relocks_is_put_back(leerie, tmp_path, monkeypatch,
 
 def test_a_build_that_rewrites_tsconfig_is_put_back(leerie, tmp_path,
                                                      monkeypatch):
-    t = _tree(tmp_path, {"tsconfig.json": '{"a": 1}\n'})
+    t = _tree(tmp_path, {"tsconfig.json": '{"a": 1}\n',
+                         ".gitignore": ".next/\n"})
     _tool(tmp_path, monkeypatch, "next",
           "printf '{\"a\": 1, \"plugins\": []}\\n' > tsconfig.json;"
-          " printf 'x\\n' > next-env.d.ts")
+          " printf 'x\\n' > next-env.d.ts; mkdir -p .next; touch .next/b")
     _deps(leerie, t, [{"kind": "build", "command": ["next", "build"]}])
     assert (t / "tsconfig.json").read_text() == '{"a": 1}\n'
-    # Untracked output is not leerie's to touch.
-    assert (t / "next-env.d.ts").is_file()
+    # I2: the unignored file it generated goes, the ignored build stays.
+    assert not (t / "next-env.d.ts").exists()
+    assert (t / ".next" / "b").is_file()
+    assert _status(t) == ""
 
 
 def test_a_workers_edit_to_the_same_file_survives(leerie, tmp_path,
@@ -339,7 +348,7 @@ def test_only_the_snapshot_before_a_command_writes_blobs(leerie, tmp_path):
 
     async def run():
         for _ in range(5):
-            async with leerie._leaves_tracked_files(t, "test run", "t"):
+            async with leerie._leaves_tree_as_found(t, "test run", "t"):
                 (t / "fixture.db").write_bytes(os.urandom(4096))
     asyncio.run(run())
     assert (t / "fixture.db").read_text() == "x" * 10 and _status(t) == ""
@@ -378,7 +387,7 @@ def test_a_dirty_submodule_does_not_switch_the_snapshot_off(leerie,
     assert leerie._tracked_content(t) == {}
 
     async def install():
-        async with leerie._leaves_tracked_files(t, "install/build", "t"):
+        async with leerie._leaves_tree_as_found(t, "install/build", "t"):
             (t / "uv.lock").write_text("version = 1\nrevision = 2\n")
     asyncio.run(install())
     assert (t / "uv.lock").read_text() == "version = 1\n"
@@ -396,7 +405,7 @@ def test_a_put_back_never_moves_a_submodule(leerie, tmp_path):
     sub = t / "vendor" / "lib"
 
     async def bump():
-        async with leerie._leaves_tracked_files(t, "install/build", "t"):
+        async with leerie._leaves_tree_as_found(t, "install/build", "t"):
             _git(sub, "commit", "-qam", "bump")
     asyncio.run(bump())
     assert " M vendor/lib" in _status(t)             # left as the command did
@@ -416,7 +425,7 @@ def test_a_tracked_file_a_command_replaced_with_a_directory_is_put_back(
         (t / "cfg").write_text("worker\n")
 
     async def cmd():
-        async with leerie._leaves_tracked_files(t, "build", "t"):
+        async with leerie._leaves_tree_as_found(t, "build", "t"):
             (t / "cfg").unlink()
             (t / "cfg").mkdir()
             (t / "cfg" / "x").write_text("1")
@@ -444,128 +453,115 @@ def test_a_put_back_checks_out_a_bracketed_path_literally(leerie, tmp_path):
     (t / "app" / "s" / "page.tsx").write_text("worker\n")
 
     async def cmd():
-        async with leerie._leaves_tracked_files(t, "build", "t"):
+        async with leerie._leaves_tree_as_found(t, "build", "t"):
             (t / "app" / "[slug]" / "page.tsx").write_text("rewritten\n")
     asyncio.run(cmd())
     assert (t / "app" / "[slug]" / "page.tsx").read_text() == "a\n"
     assert (t / "app" / "s" / "page.tsx").read_text() == "worker\n"
 
 
-def test_the_record_holds_only_what_leerie_commands_produced(leerie,
-                                                             tmp_path):
-    """H1/M1's root: the untracked files leerie's own commands produced are
-    recorded per worktree (in its git directory, not the tree), by first
-    producer (review round 11 M2): any other untracked file — made by a
-    worker, through any tool — is not leerie's even when leerie's command
-    rewrites it, and a file leerie's command made stays leerie's when a
-    worker rewrites it."""
-    t = _tree(tmp_path, {"a.py": "A = 1\n"})
-    (t / "worker.py").write_text("W = 1\n")         # before: a worker's
+# --------------------------------------------------------------------------
+# I2, one regression per command family: a command that rewrites a tracked
+# file, creates unignored files (one nested), creates an ignored file and
+# rewrites a file a worker left untracked before it leaves `git status
+# --porcelain --untracked-files=all` exactly as it found it. The ignored
+# file stays (dependencies), and a file that was there before is never
+# deleted.
 
-    async def cmd(body):
-        async with leerie._leaves_tracked_files(t, "test run", "t"):
-            body()
-    asyncio.run(cmd(lambda: (
-        (t / "junit.xml").write_text("<a/>"),
-        (t / "worker.py").write_text("W = 2\n"))))
-    sigs = leerie._untracked_signatures(t)
-    assert set(sigs) == {"junit.xml", "worker.py"}
-    assert leerie._leerie_produced(t, sigs) == {"junit.xml"}
-    rec = leerie._produced_record_path(t)
-    assert rec.is_file() and ".git" in rec.parts
-    # Rewritten by leerie again: still leerie's.
-    asyncio.run(cmd(lambda: (t / "junit.xml").write_text("<b/>")))
-    assert leerie._leerie_produced(
-        t, leerie._untracked_signatures(t)) == {"junit.xml"}
-    # Rewritten by a worker's re-run of the tests: still leerie's (before
-    # round 11 M2 it became of unknown origin, for good).
-    (t / "junit.xml").write_text("<worker/>")
-    assert leerie._leerie_produced(
-        t, leerie._untracked_signatures(t)) == {"junit.xml"}
-    asyncio.run(cmd(lambda: (t / "junit.xml").write_text("<c/>")))
-    assert leerie._leerie_produced(
-        t, leerie._untracked_signatures(t)) == {"junit.xml"}
-    # The worker's own file stays the worker's after any number of leerie
-    # rewrites.
-    asyncio.run(cmd(lambda: (t / "worker.py").write_text("W = 3\n")))
-    assert "worker.py" not in leerie._leerie_produced(
-        t, leerie._untracked_signatures(t))
-    # Gone when a leerie command ends: it leaves the record, so a worker
-    # making it again makes the worker's file.
-    asyncio.run(cmd(lambda: (t / "r.txt").write_text("r")))
-    (t / "r.txt").unlink()
-    asyncio.run(cmd(lambda: None))
-    (t / "r.txt").write_text("r")
-    assert "r.txt" not in leerie._leerie_produced(
-        t, leerie._untracked_signatures(t))
+BODY = ("printf 'changed\\n' > tracked.txt; mkdir -p out/deep; "
+        "printf r > out/deep/report.xml; printf j > junit.xml; "
+        "mkdir -p deps; printf d > deps/lib; printf w2 > worker.txt")
 
 
-def test_a_workers_edit_of_a_generated_file_is_not_leeries(leerie,
-                                                           tmp_path):
-    """Review round 12 M2, the reviewer's driver
-    (`test_zz_r12_first_producer.py`, asserting the defect on b40117f):
-    leerie's install runs the repository's codegen into an unignored
-    `gen.py`, and the worker rewrites it through Bash to the value its fix
-    rests on. First producer alone stamped a measurement of that tree as
-    HEAD's and dropped the edit from the leftovers with no line. The
-    record now answers the two questions apart (DESIGN §6½): `gen.py` is
-    still not part of the change (membership), but the worker wrote it
-    last, so a measurement here is not of the committed tree. (Whether it
-    ships is the worker's to answer since I1.)"""
-    t = _tree(tmp_path, {"mod.py": "from gen import V\n"})
-
-    async def cmd(argv):
-        async with leerie._leaves_tracked_files(t, "build", "t"):
-            subprocess.run(argv, cwd=t, check=True)
-    asyncio.run(cmd(["sh", "-c", "echo 'V = 1' > gen.py"]))
-    head_tree = _git(t, "rev-parse", "HEAD^{tree}")
-    assert asyncio.run(leerie._measured_tree_sha(str(t))) == head_tree
-    subprocess.run(["sh", "-c", "echo 'V = 2  # the fix' > gen.py"], cwd=t,
-                   check=True)
-    assert asyncio.run(leerie._measured_tree_sha(str(t))) is None
-    # A later leerie command that leaves it alone does not adopt the edit;
-    # membership is unchanged either way.
-    asyncio.run(cmd(["true"]))
-    sigs = leerie._untracked_signatures(t)
-    assert leerie._leerie_produced(t, sigs) == {"gen.py"}
-    assert leerie._leerie_last_wrote(t, sigs) == set()
-    assert asyncio.run(leerie._measured_tree_sha(str(t))) is None
-    # One that writes it again makes leerie the last writer again.
-    asyncio.run(cmd(["sh", "-c", "echo 'V = 1' > gen.py"]))
-    sigs = leerie._untracked_signatures(t)
-    assert leerie._leerie_last_wrote(t, sigs) == {"gen.py"}
-    assert asyncio.run(leerie._measured_tree_sha(str(t))) == head_tree
+def _family_tree(tmp_path):
+    t = _tree(tmp_path, {"tracked.txt": "orig\n", ".gitignore": "deps/\n"})
+    (t / "worker.txt").write_text("w1")       # there before the command
+    return t, _status(t)
 
 
-def test_test_outputs_are_recorded_and_adopted_from_a_checkout(leerie,
-                                                               tmp_path):
-    """The record on its own: a test run's new and rewritten files are test
-    outputs, an install's are not, a path untouched by the run is not, and
-    a checkout's set reaches the tree it was made from."""
-    t = _tree(tmp_path, {"mod.py": "X = 1\n"})
-    (t / "old.txt").write_text("pre-existing")
+def _assert_as_found(t, before: str, sub: str = "") -> None:
+    assert before == "?? worker.txt\n"
+    assert _status(t) == before
+    base = t / sub
+    assert (base / "tracked.txt").read_text() == "orig\n"
+    assert not (base / "junit.xml").exists()
+    assert not (base / "out").exists()            # its emptied dirs too
+    assert (base / "deps" / "lib").read_text() == "d"     # ignored: stays
+    assert (t / "worker.txt").exists()            # never deleted
 
-    async def run(body, *, test_run):
-        async with leerie._leaves_tracked_files(t, "x", "t",
-                                                test_run=test_run):
-            subprocess.run(["sh", "-c", body], cwd=t, check=True)
-    asyncio.run(run("echo 1 > gen.py", test_run=False))
-    asyncio.run(run("echo r > report.xml; echo 2 > gen2.py",
-                    test_run=True))
-    assert leerie._leerie_test_outputs(t) == {"report.xml", "gen2.py"}
-    co = tmp_path / "co"
-    _git(t, "worktree", "add", "-q", "--detach", str(co), "HEAD")
 
-    async def run_co():
-        async with leerie._leaves_tracked_files(co, "x", "t",
-                                                test_run=True):
-            (co / "cov").mkdir()
-            (co / "cov" / "lcov.info").write_text("x")
-    asyncio.run(run_co())
-    leerie._adopt_test_outputs(co, t)
-    assert leerie._leerie_test_outputs(t) == {"report.xml", "gen2.py",
-                                              "cov/lcov.info"}
-    # Unreadable record: empty, never raises.
-    rec = leerie._produced_record_path(t, leerie._TEST_OUTPUTS_RECORD)
-    rec.write_text("{not json")
-    assert leerie._leerie_test_outputs(t) == set()
+def test_i2_an_install_leaves_the_tree_as_found(leerie, tmp_path,
+                                               monkeypatch):
+    t, before = _family_tree(tmp_path)
+    _tool(tmp_path, monkeypatch, "fakeinst", BODY)
+    assert _deps(leerie, t, [{"kind": "install",
+                              "command": ["fakeinst"]}]) is True
+    _assert_as_found(t, before)
+
+
+@pytest.mark.parametrize("axis", ["build", "lint", "tests"])
+def test_i2_a_measured_axis_leaves_the_tree_as_found(leerie, tmp_path,
+                                                    axis):
+    t, before = _family_tree(tmp_path)
+    st = _St([])
+    st.data["blt_results"] = {}
+    res = asyncio.run(leerie._measure_axes(
+        str(t), {axis: BODY}, st, {}, log_path=tmp_path / "m.log",
+        verbosity="quiet", memo=False))
+    assert res[axis]["passed"] is True
+    _assert_as_found(t, before)
+
+
+PY_TEST = (
+    "import os, pathlib\n"
+    "R = pathlib.Path(__file__).resolve().parent.parent\n"
+    "def test_writes():\n"
+    "    os.chdir(R)\n"
+    "    os.system(" + repr(BODY) + ")\n"
+    "    assert False\n")
+
+
+def test_i2_a_test_id_run_leaves_the_tree_as_found(leerie, tmp_path,
+                                                   monkeypatch):
+    """`_capture_failing_test_ids`: the report run itself; its pytest also
+    leaves `tests/__pycache__/`, unignored here."""
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    t, _ = _family_tree(tmp_path)
+    (t / "tests").mkdir()
+    (t / "tests" / "test_w.py").write_text(PY_TEST)
+    _git(t, "add", "tests")
+    _git(t, "commit", "-qm", "test")
+    before = _status(t)
+    st = leerie.State(tmp_path / "state", "r")
+    st.data = {}
+    got = asyncio.run(leerie._capture_failing_test_ids(
+        str(t), "python3 -m pytest -q -p no:cacheprovider tests", st, {},
+        label="ids", log_path=tmp_path / "ids.log", timeout=120))
+    assert [i.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
+            for i in got["ids"]] == ["test_writes"]
+    assert not (t / "tests" / "__pycache__").exists()
+    _assert_as_found(t, before)
+
+
+@pytest.mark.parametrize("sub", ["", "pkg"])
+def test_i2_a_coverage_command_leaves_the_tree_as_found(leerie, tmp_path,
+                                                       sub):
+    """`_cov_contained`, in the worktree and in a recipe `working_dir`
+    below it (the bracket covers the repository root)."""
+    t, _ = _family_tree(tmp_path)
+    if sub:
+        (t / sub).mkdir()
+        (t / sub / "tracked.txt").write_text("orig\n")
+        (t / sub / ".gitignore").write_text("deps/\n")
+        _git(t, "add", sub)
+        _git(t, "commit", "-qm", "pkg")
+    before = _status(t)
+    st = leerie.State(tmp_path / "state", "r")
+    st.data = {"verbosity": "quiet"}
+    (st.run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    out = asyncio.run(leerie._cov_contained(
+        ["sh", "-c", BODY.replace("worker.txt", "../worker.txt")
+         if sub else BODY], tree=t / sub, st=st,
+        caps=dict(leerie.DEFAULT_CAPS), sid="s", tag="t"))
+    assert out["rc"] == 0
+    _assert_as_found(t, before, sub)

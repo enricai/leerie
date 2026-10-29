@@ -8,9 +8,13 @@ measurements themselves left `?? __pycache__/`, so a clean run listed
 "failing-test-ID diff: not measured on the tree that ships — the staging
 worktree has uncommitted changes" (it had been measured, on that very
 tree), and a run whose repair commit fixed a confirmed-new test stayed
-`unconverged`, because the refresh never measured again. Every driver runs
-on a real pytest suite, with `PYTHONDONTWRITEBYTECODE` unset so the
-artifacts really appear."""
+`unconverged`, because the refresh never measured again. Rounds 9 to 14
+answered with a clean checkout of HEAD and a list of edits "that do not
+ship"; with I1 and I2 (DESIGN §8 *The final diff describes the tree that
+ships*) staging is its HEAD plus ignored files at every reader, asserted,
+and any dirt there stops the run. Every driver runs on a real pytest
+suite, with `PYTHONDONTWRITEBYTECODE` unset so the artifacts really
+appear."""
 from __future__ import annotations
 
 import asyncio
@@ -19,15 +23,6 @@ import subprocess
 import sys
 
 import pytest
-
-# Red until lane B's I2 step; see the reason.
-_NEEDS_I2 = pytest.mark.xfail(
-    strict=True,
-    reason=("I1 (DESIGN §8 *A worker leaves its tree clean*) holds the final "
-           "conformer to a clean staging, and leerie's own test run leaves "
-           "this untracked output there until I2 (DESIGN §6½: leerie's "
-           "commands leave the tree as they found it) — remove this mark "
-           "when I2 lands; strict, so it cannot be forgotten"))
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_redrive_test_id_diff_refresh import CMD, SUITE, _git  # noqa: E402
@@ -98,13 +93,13 @@ def _phase5(leerie, run) -> None:
 
 
 def _untracked(staging) -> str:
-    return subprocess.run(["git", "status", "--porcelain"], cwd=staging,
+    return subprocess.run(["git", "status", "--porcelain",
+                           "--untracked-files=all"], cwd=staging,
                           capture_output=True, text=True).stdout
 
 
-@_NEEDS_I2
 def test_a_clean_run_whose_tests_leave_artifacts_ends_done_and_empty(
-        leerie, tmp_path, monkeypatch):
+        leerie, tmp_path, monkeypatch, capsys):
     """The reviewer's driver 1: nothing regressed, the conformer did
     nothing, `__pycache__/` is not ignored. The section is empty."""
     run = _repo(leerie, tmp_path, monkeypatch)
@@ -112,7 +107,9 @@ def test_a_clean_run_whose_tests_leave_artifacts_ends_done_and_empty(
     asyncio.run(leerie._run_final_conformance(
         run["run_dir"], run["st"], run["caps"], {"conformer": "sonnet"},
         {"conformer": "low"}))
-    assert "?? " in _untracked(run["staging"])   # the precondition
+    # The precondition: the test runs made `__pycache__/`, and I2 removed it.
+    assert "untracked file(s) its own tests created" in capsys.readouterr().out
+    assert _untracked(run["staging"]) == ""
     _phase5(leerie, run)
     st = run["st"]
     committed = asyncio.run(leerie._committed_tree_sha(str(run["staging"])))
@@ -121,11 +118,8 @@ def test_a_clean_run_whose_tests_leave_artifacts_ends_done_and_empty(
     assert not st.data.get("needs_human_verification")
     assert leerie._decide_outcome(st, any_commits=True) == "done"
     assert leerie._format_pr_end_state_section(st.data) == ""
-    # The clean checkout is removed afterwards.
-    assert not leerie._helper_worktree_path(st, "shipping-tree").exists()
 
 
-@_NEEDS_I2
 def test_a_repair_commit_that_fixes_a_confirmed_new_test_ends_done(
         leerie, tmp_path, monkeypatch):
     """The reviewer's driver 2: the final conformer confirms `test_x` new,
@@ -141,7 +135,7 @@ def test_a_repair_commit_that_fixes_a_confirmed_new_test_ends_done(
     assert st.data["test_id_diff"]["new"]
     (staging / "tests" / "test_s.py").write_text(SUITE.format(ok="True"))
     _git(staging, "commit", "-qm", "conformer: fix", "tests/test_s.py")
-    assert "?? " in _untracked(staging)
+    assert _untracked(staging) == ""
     _phase5(leerie, run)
     diff = st.data["test_id_diff"]
     assert diff["new"] == [] and diff["tree_sha"] == asyncio.run(
@@ -150,49 +144,46 @@ def test_a_repair_commit_that_fixes_a_confirmed_new_test_ends_done(
     assert leerie._format_pr_end_state_section(st.data) == ""
 
 
-def test_an_untracked_file_that_would_fail_the_suite_is_not_measured(
-        leerie, tmp_path, monkeypatch):
-    """Substance of "the committed tree": an untracked test file in staging
-    that fails is not part of what ships, so it cannot make the diff say
-    the run broke a test."""
+@pytest.mark.parametrize("dirt", ["untracked", "tracked"])
+def test_dirt_in_staging_at_the_refresh_stops_the_run(
+        leerie, tmp_path, monkeypatch, capsys, dirt):
+    """I1 + I2 leave staging at its HEAD plus ignored files at every reader
+    (DESIGN §8 *The final diff describes the tree that ships*); anything
+    else is leerie's own invariant broken. Before, an untracked failing test
+    sent the refresh to a clean checkout and a tracked edit was measured
+    past and listed "for the reviewer"; now the run stops naming the line,
+    and nothing is measured or recorded."""
     run = _repo(leerie, tmp_path, monkeypatch, ignore="__pycache__/\n")
     st, staging = run["st"], run["staging"]
-    (staging / "tests" / "test_stray.py").write_text(
-        "def test_stray():\n    assert False\n")
-    _phase5(leerie, run)
-    diff = st.data["test_id_diff"]
-    assert diff["new"] == [] and diff["candidates"] == []
+    if dirt == "untracked":
+        (staging / "tests" / "test_stray.py").write_text(
+            "def test_stray():\n    assert False\n")
+        line = "?? tests/test_stray.py"
+    else:
+        (staging / "mod.py").write_text("X = 0\n")
+        line = " M mod.py"
+    with pytest.raises(SystemExit):
+        _phase5(leerie, run)
+    err = capsys.readouterr().err
+    assert "staging is not clean at phase 5's shipping-tree refresh" in err
+    assert line in err
+    assert "test_id_diff" not in st.data
     assert not st.data.get("needs_human_verification")
-    # Measured in staging itself, the stray file is what fails.
-    post = asyncio.run(leerie._measure_axes(
-        str(staging), {"tests": CMD}, st, run["caps"],
-        log_path=st.run_dir / "logs" / "x.log", verbosity="quiet",
-        memo=False, failing_ids_axes={"tests"}))
-    assert any("test_stray" in i for i in post["tests"]["failing_ids"])
 
 
-def test_tracked_edits_are_measured_past_and_listed(
-        leerie, tmp_path, monkeypatch):
-    """A tracked edit staging left uncommitted does not ship: the committed
-    tree is still measured (it used to give up), and the edit is listed."""
-    run = _repo(leerie, tmp_path, monkeypatch)
-    st, staging = run["st"], run["staging"]
-    (staging / "mod.py").write_text("X = 0\n")    # would fail test_m
+def test_ignored_files_in_staging_are_not_dirt(leerie, tmp_path,
+                                               monkeypatch):
+    """The converse: an ignored file (dependencies, a cache) is in every
+    tree leerie measures and never stops the run."""
+    run = _repo(leerie, tmp_path, monkeypatch, ignore="__pycache__/\nbuild/\n")
+    staging = run["staging"]
+    (staging / "build").mkdir()
+    (staging / "build" / "x.o").write_text("o")
+    head_tree = _git(staging, "rev-parse", "HEAD^{tree}")
+    assert asyncio.run(leerie._assert_staging_clean(staging, "x")) == \
+        head_tree
     _phase5(leerie, run)
-    diff = st.data["test_id_diff"]
-    assert diff["new"] == [] and diff["tree_sha"] == asyncio.run(
-        leerie._committed_tree_sha(str(staging)))
-    gap = [e for e in st.data["needs_human_verification"]
-           if e.get("source") == leerie.FINAL_DIFF_GAP_SOURCE]
-    assert len(gap) == 1
-    assert "measured on the committed tree that ships" in gap[0]["detail"]
-    assert "mod.py" in gap[0]["detail"]
-    assert "could not be identified" not in gap[0]["detail"]
-    # Committed: the note goes.
-    _git(staging, "checkout", "--", "mod.py")
-    _phase5(leerie, run)
-    assert not [e for e in st.data.get("needs_human_verification") or []
-                if e.get("source") == leerie.FINAL_DIFF_GAP_SOURCE]
+    assert run["st"].data["test_id_diff"]["tree_sha"] == head_tree
 
 
 def test_the_log_says_marked_stale_only_when_it_was(
@@ -215,7 +206,8 @@ def test_the_log_says_marked_stale_only_when_it_was(
 def test_a_broken_round_keeps_its_pre_ids_despite_test_artifacts(
         leerie, tmp_path, monkeypatch):
     """The round-7 H1 fallback compared `_worktree_tree_sha`, None in this
-    repository, so it never fired: an untracked artifact is not a move."""
+    repository, so it never fired. A test run's artifacts are gone now (I2),
+    and the crashed round passes its clean-tree gate before it ends."""
     run = _repo(leerie, tmp_path, monkeypatch, branch_suite_ok="False")
 
     async def boom(*a, **k):
@@ -230,18 +222,55 @@ def test_a_broken_round_keeps_its_pre_ids_despite_test_artifacts(
 
 @pytest.mark.parametrize("ignore", ["", "__pycache__/\n"])
 def test_the_shipping_tree_reads_are_committed_tree_reads(
-        leerie, tmp_path, monkeypatch, ignore):
+        leerie, tmp_path, monkeypatch, capsys, ignore):
     """`_committed_tree_sha` ignores the worktree; `_worktree_tree_sha`
-    (the measurement identity) does not."""
+    (the measurement memo key) does not; `_assert_staging_clean` returns
+    the committed tree when only ignored files differ and stops the run on
+    anything else."""
     run = _repo(leerie, tmp_path, monkeypatch, ignore=ignore)
     staging = str(run["staging"])
     head_tree = _git(run["staging"], "rev-parse", "HEAD^{tree}")
     subprocess.run(["python3", "-m", "pytest", "-q", "tests"], cwd=staging,
                    capture_output=True)
     assert asyncio.run(leerie._committed_tree_sha(staging)) == head_tree
-    assert asyncio.run(leerie._unmoved_tree_sha(staging)) == head_tree
     measured = asyncio.run(leerie._worktree_tree_sha(staging))
     assert measured == (head_tree if ignore else None)
+    if ignore:
+        assert asyncio.run(leerie._assert_staging_clean(staging, "x")) == \
+            head_tree
+    else:
+        with pytest.raises(SystemExit):
+            asyncio.run(leerie._assert_staging_clean(staging, "x"))
+        assert "?? tests/__pycache__/" in capsys.readouterr().err
     (run["staging"] / "mod.py").write_text("X = 5\n")
-    assert asyncio.run(leerie._unmoved_tree_sha(staging)) is None
     assert asyncio.run(leerie._committed_tree_sha(staging)) == head_tree
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie._assert_staging_clean(staging, "x"))
+
+
+def test_a_crashed_final_conformer_is_held_to_a_clean_tree(
+        leerie, tmp_path, monkeypatch):
+    """I1 after a raised worker too (DESIGN §8 *A worker leaves its tree
+    clean*): a final conformer that left a file and then crashed used to
+    break before its gate, leaving the file in staging for every later
+    reader — now an `_assert_staging_clean` stop. It is re-asked (no
+    session recorded: the attempt is spent), its round is rolled back and
+    recorded, and the run goes on to a clean refresh."""
+    run = _repo(leerie, tmp_path, monkeypatch, ignore="__pycache__/\n")
+    staging, st = run["staging"], run["st"]
+
+    async def crash(*a, **k):
+        (staging / "half.py").write_text("X = 1\n")
+        raise leerie.WorkerError("final conformer: transport error")
+    _quiet_conformer(leerie, monkeypatch)
+    monkeypatch.setattr(leerie, "claude_p", crash)
+    asyncio.run(leerie._run_final_conformance(
+        run["run_dir"], st, run["caps"], {"conformer": "sonnet"},
+        {"conformer": "low"}))
+    assert not (staging / "half.py").exists()
+    assert st.data["unclean_trees"]["final conformer:round 0"][
+        "lines"] == ["?? half.py"]
+    _phase5(leerie, run)                       # no stop: staging is clean
+    assert st.data["test_id_diff"]["tree_sha"] == _git(
+        staging, "rev-parse", "HEAD^{tree}")
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"

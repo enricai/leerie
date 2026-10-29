@@ -257,13 +257,15 @@ def test_no_test_command_and_no_diff_lists_nothing(leerie, broken_run,
     assert not st.data.get("needs_human_verification")
 
 
-def test_an_untracked_file_in_staging_does_not_stop_the_measurement(
+def test_staging_is_measured_in_place_and_its_regression_found(
         leerie, broken_run):
-    """Review round 8 M1 rewrote this pin: an untracked file never ships,
-    so staging's committed tree is measured (in a clean checkout) and the
-    regression it carries is found; nothing is listed as unmeasured."""
+    """Review round 8 M1's pin, rewritten for I1 + I2 (DESIGN §8 *The final
+    diff describes the tree that ships*): staging is its commit plus ignored
+    files, so it is measured in place, stamped with its committed tree, and
+    the regression it carries is found; nothing is listed as unmeasured.
+    (A stray untracked file there now stops the run:
+    tests/test_shipping_tree_is_committed.py.)"""
     st, staging = broken_run["st"], broken_run["staging"]
-    (staging / "stray.txt").write_text("left behind\n")
     asyncio.run(leerie._refresh_shipping_test_id_diff(
         broken_run["run_dir"], st, broken_run["caps"], label="t"))
     diff = st.data["test_id_diff"]

@@ -5676,8 +5676,7 @@ def _helper_worktree_path(st: "State", name: str) -> Path:
                                                         name)
 
 
-def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
-                           repo: Path | None = None
+def _worktree_add_detached(st: "State", wt: Path, rev: str
                            ) -> subprocess.CompletedProcess:
     """`git worktree add --detach <wt> <rev>` under the repository-wide
     worktree lock every script's add and every prune takes
@@ -5685,9 +5684,8 @@ def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
     it a prune of this run racing the add (admin entry written, `.git` link
     not yet) drops the registration. Waits at most
     `_WORKTREE_ADD_LOCK_WAIT_SEC`, then adds unlocked, logged — these
-    helpers fail open. `repo` (default the run's repository) is the
-    checkout git is run in — any worktree of the same repository."""
-    root = str(repo if repo is not None else st.repo_root)
+    helpers fail open."""
+    root = str(st.repo_root)
     argv = ["git", "-C", root, "worktree", "add", "--detach", str(wt), rev]
     lock_fd = None
     try:
@@ -5722,14 +5720,13 @@ def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
             os.close(lock_fd)
 
 
-async def _worktree_add_detached_async(st: "State", wt: Path, rev: str, *,
-                                       repo: Path | None = None
+async def _worktree_add_detached_async(st: "State", wt: Path, rev: str
                                        ) -> subprocess.CompletedProcess:
     """`_worktree_add_detached` off the event loop: its lock wait (up to
     `_WORKTREE_ADD_LOCK_WAIT_SEC`) and the checkout would otherwise stall
     every worker's watchdog and stream reader (review r2 L3)."""
     return await asyncio.to_thread(
-        functools.partial(_worktree_add_detached, st, wt, rev, repo=repo))
+        functools.partial(_worktree_add_detached, st, wt, rev))
 
 
 def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
@@ -38495,10 +38492,11 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     _DEPS_INSTALLED.add(key)
     ok = True
     recipe = (st.data.get("provision") or {}).get("recipe") or []
-    # Leerie's own install/build never leaves a tracked edit behind
-    # (DESIGN §6½ *Leerie's own commands leave tracked files as they found
-    # them*): a relocked lockfile or a rewritten tsconfig.json is put back.
-    async with _leaves_tracked_files(tree, "install/build", log_prefix):
+    # Leerie's own install/build leaves the tree as it found it (I2,
+    # DESIGN §6½ *Leerie's own commands leave a worker's tree as they found
+    # it*): a relocked lockfile is put back, an unignored generated file
+    # goes; installed dependencies, being ignored, stay.
+    async with _leaves_tree_as_found(tree, "install/build", log_prefix):
         for e in recipe:
             if (e.get("kind") not in ("install", "build")
                     or not e.get("command")):
@@ -38971,15 +38969,31 @@ async def _committed_tree_sha(tree: str) -> str | None:
     return r.stdout.strip() or None
 
 
-async def _tracked_edits(tree: str) -> list[str] | None:
-    """Porcelain lines of `tree`'s uncommitted edits to tracked files
-    (`--untracked-files=no`: an artifact a test run leaves is not an edit),
-    or None when git fails."""
-    r = await run_proc(["git", "status", "--porcelain",
-                        "--untracked-files=no"], cwd=tree)
-    if r.returncode != 0:
-        return None
-    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+async def _assert_staging_clean(staging: str | Path,
+                                where: str) -> str | None:
+    """Staging's committed tree (`_committed_tree_sha`), after asserting
+    that staging holds nothing but it and ignored files (DESIGN §8 *The
+    final diff describes the tree that ships*): I1 holds every worker in
+    staging to a clean tree and I2 every command of leerie's own, so at a
+    reader — a measurement, a delivery judge, the ratchet, the refresh —
+    `_tree_dirt` is []. Anything else is leerie's own invariant broken, not
+    unfinished work of the task's: the run stops (`die`) naming the lines,
+    rather than measuring, judging or shipping a tree it cannot name. A
+    git failure stops it too — nothing about the tree was read."""
+    dirt = await _tree_dirt(staging)
+    if dirt != []:
+        lines = (["(git status failed — the tree could not be read)"]
+                 if dirt is None else dirt)
+        die(f"staging is not clean at {where}, so what would be measured "
+            "or judged there is not the committed tree — leerie's own "
+            "invariant is broken (DESIGN §8 *The final diff describes the "
+            "tree that ships*: every worker leaves it clean, I1, and so "
+            "does every command of leerie's, I2). Left there: "
+            + "; ".join(lines[:20])
+            + (f" (+{len(lines) - 20} more)" if len(lines) > 20 else "")
+            + ". State is saved and the worktrees are cleaned up: report "
+            "this, then `leerie resume` continues on a fresh staging.")
+    return await _committed_tree_sha(str(staging))
 
 
 _GITLINK = "gitlink:"
@@ -39006,8 +39020,7 @@ def _tracked_content(tree: str | Path, *, write: bool = False
     inside it is the submodule's own state, not an edit of this tree
     (`--ignore-submodules=dirty`). A path git cannot hash is listed as
     `unhashed` rather than failing the snapshot — one such path turned off
-    the put-back and the leftovers commit for the whole tree (review round
-    10 L2)."""
+    the put-back for the whole tree (review round 10 L2)."""
     try:
         r = _git_z_output(["git", "-C", str(tree), "diff", "--name-only",
                            "--no-renames", "--ignore-submodules=dirty", "-z",
@@ -39131,241 +39144,81 @@ def _restore_tracked_content(tree: str | Path,
     return changed
 
 
-# The untracked files leerie's own commands produced in a worktree (DESIGN
-# §6½ *Leerie's own commands leave tracked files as they found them*): a
-# JSON map in that worktree's private git directory (`git rev-parse
-# --git-path`), so it lives and dies with the worktree, survives a resume,
-# and is never itself an untracked file of the tree.
-_PRODUCED_RECORD = "leerie-produced.json"
-# The paths one of leerie's own test commands made or rewrote in a worktree,
-# or in a disposable checkout of its commit (`_adopt_test_outputs`): a JSON
-# list beside `_PRODUCED_RECORD` (DESIGN §6½, review round 14).
-_TEST_OUTPUTS_RECORD = "leerie-test-outputs.json"
+def _remove_new_untracked(tree: str | Path, before: set[str]) -> list[str]:
+    """Delete every untracked, not-ignored file in `tree` that is not in
+    `before` (an `_untracked_files` listing taken before a command), with
+    the directories that leaves empty, and return those paths: what the
+    command created (DESIGN §6½ *Leerie's own commands leave a worker's
+    tree as they found it*). A file in `before` is never touched, whatever
+    the command did to it; ignored files are never listed. [] when git
+    cannot say."""
+    now = _untracked_files(tree)
+    if now is None:
+        return []
+    made = sorted(now - before)
+    for rel in made:
+        with contextlib.suppress(OSError):
+            (Path(tree) / rel).unlink()
+    for d in sorted({os.path.dirname(r) for r in made if "/" in r},
+                    key=lambda x: -len(x)):
+        with contextlib.suppress(OSError):
+            os.removedirs(Path(tree) / d)
+    return made
 
 
-def _untracked_signatures(tree: str | Path) -> dict[str, list[int]] | None:
-    """Each `_untracked_files` path → `[inode, size, mtime_ns, ctime_ns]`:
-    a stat identity that changes whenever anything rewrites or replaces the
-    file (ctime cannot be set back from user space). None when git cannot
-    say; a file gone between the listing and the stat is left out."""
-    files = _untracked_files(tree)
-    if files is None:
-        return None
-    out: dict[str, list[int]] = {}
-    for p in files:
-        try:
-            s = os.lstat(os.path.join(str(tree), p))
-        except OSError:
-            continue
-        out[p] = [s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
-    return out
-
-
-def _produced_record_path(tree: str | Path,
-                          name: str = _PRODUCED_RECORD) -> Path | None:
-    """Where `tree`'s `_PRODUCED_RECORD` (or another record `name`) lives,
-    or None when git fails."""
-    r = subprocess.run(["git", "-C", str(tree), "rev-parse", "--git-path",
-                        name], capture_output=True, text=True,
-                       check=False)
-    rel = r.stdout.strip()
-    if r.returncode != 0 or not rel:
-        return None
-    return Path(rel) if os.path.isabs(rel) else Path(tree) / rel
-
-
-def _leerie_test_outputs(tree: str | Path) -> set[str]:
-    """The paths a leerie test command made or rewrote in `tree`, or in a
-    checkout of its commit (DESIGN §6½: what a test run writes is output,
-    never part of a change). Empty when there is no record or it cannot be
-    read."""
-    path = _produced_record_path(tree, _TEST_OUTPUTS_RECORD)
-    if path is None:
-        return set()
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return set()
-    return ({p for p in data if isinstance(p, str)}
-            if isinstance(data, list) else set())
-
-
-def _note_test_outputs(tree: str | Path, paths: Iterable[str]) -> None:
-    """Add `paths` to `tree`'s test-output record (membership only: a path
-    once written by a test run stays a test output). Never raises."""
-    new = set(paths)
-    rec = _leerie_test_outputs(tree)
-    if not new or new <= rec:
-        return
-    path = _produced_record_path(tree, _TEST_OUTPUTS_RECORD)
-    if path is None:
-        return
-    tmp = path.with_name(path.name + ".tmp")
-    with contextlib.suppress(OSError):
-        tmp.write_text(json.dumps(sorted(rec | new)))
-        os.replace(tmp, path)
-
-
-def _adopt_test_outputs(src: str | Path, dst: str | Path) -> None:
-    """Carry what leerie's test runs wrote in `src`, a disposable checkout
-    of `dst`'s commit, into `dst`'s record before `src` is removed: the
-    same commit's test run writes the same files in `dst` (review round 14:
-    once the re-drive measured in a checkout, staging's reports a worker's
-    test run rewrote read as the change)."""
-    with contextlib.suppress(Exception):
-        _note_test_outputs(dst, _leerie_test_outputs(src))
-
-
-def _read_produced(tree: str | Path) -> dict[str, list]:
-    """`tree`'s record of leerie-produced untracked files; {} when there is
-    none or it cannot be read (nothing is then leerie's — fail closed)."""
-    path = _produced_record_path(tree)
-    if path is None:
-        return {}
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return {k: v for k, v in data.items()
-            if isinstance(k, str) and isinstance(v, list)}
-
-
-def _note_produced(tree: str | Path, before: dict[str, list[int]],
-                   after: dict[str, list[int]]) -> None:
-    """Record what one of leerie's own commands left untracked in `tree`
-    (DESIGN §6½): membership by first producer — every path that appeared
-    while it ran, plus every path already recorded that still exists; a file
-    a worker made stays the worker's even when leerie's command rewrites it,
-    and a file leerie's command made stays leerie's even when a worker's
-    re-run of a test command rewrites it (review round 11 M2). The
-    signature kept is the one leerie last wrote: a path the command
-    appeared or rewrote takes its new signature, a recorded path it left
-    alone keeps the recorded one, so a worker's rewrite in between stays
-    visible to `_leerie_last_wrote` (review round 12 M2). A path that is
-    gone leaves the record."""
-    rec = _read_produced(tree)
-    new = {p: (sig if p not in before or before[p] != sig else rec[p])
-           for p, sig in after.items() if p not in before or p in rec}
-    if new == rec:
-        return
-    path = _produced_record_path(tree)
-    if path is None:
-        return
-    tmp = path.with_name(path.name + ".tmp")
-    with contextlib.suppress(OSError):
-        tmp.write_text(json.dumps(new, sort_keys=True))
-        os.replace(tmp, path)
-
-
-def _leerie_produced(tree: str | Path,
-                     sigs: dict[str, list[int]]) -> set[str]:
-    """The paths of `sigs` (an `_untracked_signatures` snapshot) whose
-    first producer was a command of leerie's own, whoever rewrote them
-    since (DESIGN §6½). Every other untracked file is of unknown origin — a
-    worker's, made through a tool call or through any shell command."""
-    rec = _read_produced(tree)
-    return {p for p in sigs if p in rec}
-
-
-def _leerie_last_wrote(tree: str | Path,
-                       sigs: dict[str, list[int]]) -> set[str]:
-    """The paths of `sigs` whose content is what one of leerie's own
-    commands last wrote: recorded, at the recorded signature (DESIGN §6½,
-    last writer). A recorded file a worker rewrote since is not, until a
-    leerie command rewrites it again."""
-    rec = _read_produced(tree)
-    return {p for p, sig in sigs.items()
-            if p in rec and list(rec[p]) == list(sig)}
+def _log_undone(log_prefix: str, did: str, what: str,
+                paths: list[str]) -> None:
+    if paths:
+        log(f"  {log_prefix}: {did} {len(paths)} {what}: "
+            + ", ".join(paths[:5])
+            + (f" (+{len(paths) - 5} more)" if len(paths) > 5 else ""))
 
 
 @contextlib.asynccontextmanager
-async def _leaves_tracked_files(tree: str | Path, what: str,
-                                log_prefix: str, *, test_run: bool = False):
-    """Around one of leerie's own commands in `tree` — a recipe install or
-    build, a measured build/lint/test axis, a test-ID report run: whatever
-    tracked file the command rewrote is put back afterwards
-    (`_restore_tracked_content`), so leerie's own commands never leave an
-    edit a worker could be blamed for or that could ship (DESIGN §6½
-    *Leerie's own commands leave tracked files as they found them*).
-    Dependencies and other untracked output stay, and every untracked file
-    the command produced is recorded as leerie's (`_note_produced`), so a
-    later reader can tell it from a file a worker made; with `test_run`,
-    every untracked path it made or rewrote is also a test output
-    (`_note_test_outputs`). Never raises from the snapshots, the restore or
-    the record."""
+async def _leaves_tree_as_found(tree: str | Path, what: str,
+                                log_prefix: str):
+    """Around one of leerie's own commands in a tree a worker works in — a
+    recipe install or build, a measured build/lint/test axis, a test-ID
+    report run, a coverage settle's command: afterwards the tree is as it
+    was just before, apart from ignored files (I2, DESIGN §6½ *Leerie's own
+    commands leave a worker's tree as they found it*). Every tracked file
+    the command changed is put back (`_restore_tracked_content`), and
+    every untracked, not-ignored file it created is deleted
+    (`_remove_new_untracked`); dependencies and other ignored output stay,
+    so the tree stays runnable. Never raises from the snapshots, the
+    restore or the removal."""
     try:
         before = await asyncio.to_thread(
             functools.partial(_tracked_content, tree, write=True))
     except Exception:
         before = None
     try:
-        untracked_before = await asyncio.to_thread(_untracked_signatures,
-                                                   tree)
+        untracked_before = await asyncio.to_thread(_untracked_files, tree)
     except Exception:
         untracked_before = None
     try:
         yield
     finally:
-        if untracked_before is not None:
-            try:
-                untracked_after = await asyncio.to_thread(
-                    _untracked_signatures, tree)
-                if untracked_after is not None:
-                    await asyncio.to_thread(_note_produced, tree,
-                                            untracked_before,
-                                            untracked_after)
-                    if test_run:
-                        await asyncio.to_thread(
-                            _note_test_outputs, tree,
-                            [p for p, sig in untracked_after.items()
-                             if untracked_before.get(p) != sig])
-            except Exception:
-                pass
+        put_back: list[str] = []
         if before is not None:
             try:
                 put_back = await asyncio.to_thread(
                     _restore_tracked_content, tree, before)
             except Exception:
                 put_back = []
-            if put_back:
-                log(f"  {log_prefix}: put back {len(put_back)} tracked "
-                    f"file(s) its own {what} rewrote: "
-                    + ", ".join(put_back[:5])
-                    + (f" (+{len(put_back) - 5} more)"
-                       if len(put_back) > 5 else ""))
-
-
-async def _unmoved_tree_sha(tree: str) -> str | None:
-    """The committed tree when no tracked file is edited, else None: equal
-    values before and after a step mean the step moved nothing that ships."""
-    if await _tracked_edits(tree) != []:
-        return None
-    return await _committed_tree_sha(tree)
-
-
-async def _measured_tree_sha(tree: str) -> str | None:
-    """The committed tree a measurement just taken in `tree` describes, or
-    None when it describes something else (DESIGN §8 *The final diff
-    describes the tree that ships*): `_unmoved_tree_sha` — no tracked file
-    edited — and every untracked file holds what one of leerie's own
-    commands last wrote (`_leerie_last_wrote`): a test run's `__pycache__/`,
-    coverage, reports, which never ship and are not the change. Any other
-    untracked file — one a worker made, through a Write tool call or a
-    heredoc, `mv` or generator alike, or a generated file a worker rewrote
-    since leerie's command wrote it (review round 12 M2) — was read by the
-    measurement and does not ship as it is, so then the clean checkout is
-    measured instead (review round 10 H1)."""
-    sha = await _unmoved_tree_sha(tree)
-    if sha is None:
-        return None
-    sigs = await asyncio.to_thread(_untracked_signatures, tree)
-    if sigs is None:
-        return None
-    if set(sigs) - await asyncio.to_thread(_leerie_last_wrote, tree, sigs):
-        return None
-    return sha
+        removed: list[str] = []
+        if untracked_before is not None:
+            # Without the listing from before, nothing tells a file the
+            # command made from one that was already there: none goes.
+            try:
+                removed = await asyncio.to_thread(
+                    _remove_new_untracked, tree, untracked_before)
+            except Exception:
+                removed = []
+        _log_undone(log_prefix, "put back",
+                    f"tracked file(s) its own {what} rewrote", put_back)
+        _log_undone(log_prefix, "removed",
+                    f"untracked file(s) its own {what} created", removed)
 
 
 def _blt_memo_key(axis: str, cmd: str, tree_sha: str) -> str:
@@ -39492,8 +39345,7 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         # memo lookup or the install: a hit must stay free, and serialising
         # installs would throttle the very worktrees waiting to be measured.
         async with _blt_semaphore(caps), \
-                _leaves_tracked_files(tree, axis, log_prefix,
-                                      test_run=axis == "tests"):
+                _leaves_tree_as_found(tree, axis, log_prefix):
             async with (_build_class_slot(st, label=f"{label_prefix}-{axis}")
                         if axis in _BUILD_CLASS_AXES
                         else contextlib.nullcontext()):
@@ -40452,8 +40304,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             report.parent.mkdir(parents=True, exist_ok=True)
             async with _blt_semaphore(caps), \
                     _build_class_slot(st, label=f"{label}-ids"), \
-                    _leaves_tracked_files(tree, "test run", label,
-                                          test_run=True):
+                    _leaves_tree_as_found(tree, "test run", label):
                 t_run = time.monotonic()
                 try:
                     await _run_streaming(
@@ -40505,11 +40356,10 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     introduced is evidence*), and B*'s base reruns alone decide whether
     the base failed what it finds. Records `final_failing_ids` and the
     verdict (`test_id_diff`), stamped with `tree_sha` when the caller
-    measured a clean checkout of a known tree, else with
-    `_measured_tree_sha(staging)`: the committed tree when the only dirt is
-    untracked files leerie's own commands produced, so the shipping-tree
-    refresh reuses it instead of measuring the same tree again (review
-    round 9 L1, round 10 H1). A baseline whose install failed is measured
+    passes it, else with `_assert_staging_clean(staging)`: staging is its
+    commit plus ignored files (I1 + I2), so the measurement is of the
+    committed tree and the shipping-tree refresh reuses it instead of
+    measuring the same tree again (review round 9 L1). A baseline whose install failed is measured
     again first (`_retry_failed_baseline`), and a prior verdict whose base
     install failed is never reused."""
     await _retry_failed_baseline(st, caps, log_path=log_path)
@@ -40540,7 +40390,9 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     # The same candidates on the same tree were already confirmed (a round
     # that committed nothing): a second confirm would only re-measure noise.
     if tree_sha is None:
-        tree_sha = await _measured_tree_sha(staging)
+        tree_sha = await _assert_staging_clean(staging,
+                                               f"{label}'s failing-test-ID "
+                                               "diff")
     prior = st.data.get("test_id_diff") or {}
     if (tree_sha and prior.get("tree_sha") == tree_sha
             and not prior.get("base_install_failed")
@@ -43043,45 +42895,6 @@ def _head_identity(tree: str | Path | None) -> tuple[str, str]:
     return got[0], got[1]
 
 
-@contextlib.asynccontextmanager
-async def _committed_checkout(st: "State", staging: Path,
-                              name: str) -> AsyncIterator[Path]:
-    """Where a judge that can make a verdict met reads the tree that ships
-    (DESIGN §8 *Every post-execution verdict is of the committed tree*):
-    `staging` itself only when its working tree is byte-identical to HEAD —
-    `git status --porcelain --ignored` lists nothing, so not even an
-    ignored file (a `dist/` build, a `.env`, a patched dependency) differs
-    (review round 13 L2: plain `--porcelain` hides ignored files) — else a
-    disposable detached checkout of its HEAD (`_helper_worktree_path(st,
-    name)`, no dependencies — the judge only reads), removed afterwards.
-    Raises RuntimeError when no such checkout can be made: a judge never
-    falls back to reading staging's uncommitted content (review round 12
-    claims M1)."""
-    clean = await run_proc(["git", "status", "--porcelain", "--ignored",
-                            "--untracked-files=all"], cwd=str(staging))
-    if clean.returncode == 0 and not clean.stdout.strip():
-        yield staging
-        return
-    head = await _branch_head_sha(str(staging))
-    wt = _helper_worktree_path(st, name)
-
-    def _remove() -> None:
-        subprocess.run(["git", "-C", str(staging), "worktree", "remove",
-                        "--force", str(wt)], capture_output=True,
-                       check=False)
-        shutil.rmtree(wt, ignore_errors=True)
-    _remove()
-    try:
-        add = (await _worktree_add_detached_async(st, wt, head, repo=staging)
-               if head else None)
-        if add is None or add.returncode != 0:
-            raise RuntimeError("a clean checkout of the committed tree "
-                               f"could not be created for {name}")
-        yield wt
-    finally:
-        _remove()
-
-
 def _orchestrator_results_digest(st: "State",
                                  tree: str | Path | None) -> str:
     """The orchestrator's OWN results for the executed-commands record
@@ -43535,8 +43348,8 @@ async def _delivery_judge_unmet(
         sections = [
             "TASK:\n" + task,
             "REQUIRED ITEMS (verify each against the CURRENT tree — your "
-            "cwd is a clean checkout of the commit this run is about to "
-            "ship):\n"
+            "cwd holds exactly the commit this run is about to ship, "
+            "nothing uncommitted):\n"
             + json.dumps(entries, indent=2) + slice_note,
         ]
         if exec_digest:
@@ -43596,8 +43409,6 @@ async def _delivery_judge_unmet(
     limit = asyncio.Semaphore(max(1, int(caps.get("max_parallel") or 1)))
     # One HEAD read per cited file per gate pass.
     cite_cache: dict = {}
-    # The judges read a clean checkout of staging's HEAD (set below).
-    judge_cwd: list[Path] = [staging]
 
     async def _judge_pack(p: int, pack: list[int]) -> list[dict]:
         with_contract = contract_ctx is not None and p == 0
@@ -43623,7 +43434,7 @@ async def _delivery_judge_unmet(
             smp = await claude_p(
                 user_prompt=user_prompt,
                 system_prompt=_load_prompt("delivery_judge"),
-                schema_key="delivery_judge", cwd=str(judge_cwd[0]),
+                schema_key="delivery_judge", cwd=str(staging),
                 allowed_tools=SATISFIED_PROBE_TOOLS,
                 max_turns=judge_max_turns,
                 autonomous=False, caps=caps, st=st,
@@ -43634,7 +43445,7 @@ async def _delivery_judge_unmet(
             # Merge by item_index: a verdict for an index outside this
             # pack is not this prompt's to give.
             smp = {**smp, "verdicts": [
-                _relative_cites(v, judge_cwd[0])
+                _relative_cites(v, staging)
                 for v in (smp.get("verdicts") or [])
                 if isinstance(v, dict) and v.get("item_index") in allowed]}
             # A met resting only on a worker's command run is unknown, not
@@ -43653,19 +43464,21 @@ async def _delivery_judge_unmet(
                     samples.append(await _sample(k))
         return samples
 
-    async with _committed_checkout(st, staging, "delivery-judge") as cwd:
-        judge_cwd[0] = cwd
-        tasks = [asyncio.ensure_future(_judge_pack(p, pack))
-                 for p, pack in enumerate(packs)]
-        try:
-            per_pack = await asyncio.gather(*tasks)
-        except BaseException:
-            # One pack's failure ends the gate (the callers treat it as
-            # advisory); the others must not keep spawning judges after it.
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+    # The judges read staging itself: it is HEAD plus ignored files (I1 +
+    # I2), asserted here (DESIGN §8 *Every post-execution verdict is of the
+    # committed tree*).
+    await _assert_staging_clean(staging, "the delivery judge")
+    tasks = [asyncio.ensure_future(_judge_pack(p, pack))
+             for p, pack in enumerate(packs)]
+    try:
+        per_pack = await asyncio.gather(*tasks)
+    except BaseException:
+        # One pack's failure ends the gate (the callers treat it as
+        # advisory); the others must not keep spawning judges after it.
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     human: dict[int, dict] = {}
     n_samples = 0
     for pack, samples in zip(packs, per_pack):
@@ -48383,11 +48196,10 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 # Staging moved past it (an interrupted attempt committed
                 # before a resume): that commit's tree is not measurable here.
                 return None
-            async with _committed_test_tree(st, caps, staging,
-                                            "acceptance-ids",
-                                            log_path=repair_log) as ctree:
-                got = (None if ctree is None else await _ratchet_test_ids(
-                    st, caps, str(ctree), label=label, log_path=repair_log))
+            await _assert_staging_clean(staging,
+                                        "the acceptance gate's test IDs")
+            got = await _ratchet_test_ids(st, caps, str(staging),
+                                          label=label, log_path=repair_log)
             if sha:
                 cache[sha] = got if got is not None else {"unmeasured": True}
                 _save_gate()
@@ -52106,74 +51918,19 @@ async def _redrive_rollback(staging: Path, pre_sha: str) -> bool:
     return ok
 
 
-@contextlib.asynccontextmanager
-async def _committed_test_tree(st: "State", caps: dict, staging: Path,
-                               name: str, *, log_path: Path
-                               ) -> AsyncIterator[Path | None]:
-    """Where a test measurement of staging's commit runs (DESIGN §8 *Every
-    post-execution verdict is of the committed tree*): staging itself when
-    nothing but ignored files differs from HEAD (`git status --porcelain
-    --untracked-files=all` prints nothing — the ignored files are the
-    repository's installed dependencies, which every measurement of a tree
-    runs with), else a detached checkout of HEAD at
-    `_helper_worktree_path(st, name)` with its dependencies installed
-    (`_ensure_worktree_deps`), removed afterwards. Yields None when that
-    checkout or its install fails: no measurement, never one of staging's
-    working tree (DESIGN §9 *A failed install is no measurement*; review
-    round 13 claims M1: the ratchet's execution route read staging's
-    working tree, with a withheld leftover in it). Before the checkout is
-    removed, what leerie's test runs wrote in it is adopted into staging's
-    test-output record (`_adopt_test_outputs`). A failed checkout is not
-    remembered: the next entry makes a fresh one."""
-    clean = await run_proc(["git", "status", "--porcelain",
-                            "--untracked-files=all"], cwd=str(staging))
-    if clean.returncode == 0 and not clean.stdout.strip():
-        yield staging
-        return
-    head = await _branch_head_sha(str(staging))
-    wt = _helper_worktree_path(st, name)
-
-    def _remove() -> None:
-        subprocess.run(["git", "-C", str(staging), "worktree", "remove",
-                        "--force", str(wt)], capture_output=True,
-                       check=False)
-        shutil.rmtree(wt, ignore_errors=True)
-        _DEPS_INSTALLED.discard(os.path.realpath(wt))
-    _remove()
-    try:
-        add = (await _worktree_add_detached_async(st, wt, head, repo=staging)
-               if head else None)
-        ok = (add is not None and add.returncode == 0
-              and await _ensure_worktree_deps(
-                  str(wt), st, caps, log_path=log_path,
-                  verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                  label_prefix=name, log_prefix=name))
-        if not ok:
-            log(f"  {name}: no clean checkout of {(head or '?')[:12]} with "
-                "its dependencies — not measured")
-        yield wt if ok else None
-    finally:
-        if wt.is_dir():
-            await asyncio.to_thread(_adopt_test_outputs, wt, staging)
-        _remove()
-
-
 async def _redrive_test_ids(st: "State", caps: dict, staging: Path,
                             label: str) -> dict | None:
     """Failing test IDs of the repo's test command on staging's commit
-    (`_committed_test_tree`), or None (no command, nothing to run, no
-    report, no checkout: no verdict). The ratchet's own measurement
+    (staging asserted clean: HEAD plus ignored files), or None (no command,
+    nothing to run, no report: no verdict). The ratchet's own measurement
     (`_ratchet_test_ids`): a command the task forbids is replaced by its
     scoped run over the coupled tests, never run raw — the orchestrator
     does not run what the task forbids (DESIGN §9 *A command the task
     forbids*)."""
     log_path = st.run_dir / "logs" / _REDRIVE_LOG
-    async with _committed_test_tree(st, caps, staging, "redrive-ids",
-                                    log_path=log_path) as tree:
-        if tree is None:
-            return None
-        return await _ratchet_test_ids(st, caps, str(tree), label=label,
-                                       log_path=log_path)
+    await _assert_staging_clean(staging, "the re-drive's test IDs")
+    return await _ratchet_test_ids(st, caps, str(staging), label=label,
+                                   log_path=log_path)
 
 
 async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
@@ -52444,11 +52201,11 @@ async def _ratchet_judge(st: "State", caps: dict, models: dict,
                  "met_evidence": {}, "errors": []}
     system_prompt = (_load_prompt("delivery_judge") + "\n\n"
                      + _load_prompt("delivery_ratchet"))
-    async with _committed_checkout(st, staging, "delivery-ratchet") as cwd:
-        return await _ratchet_judge_packs(
-            st, caps, models, efforts, cwd, packs, normalized, prior,
-            pre_sha, diff, diff_files, typed_evidence, system_prompt, label,
-            out)
+    await _assert_staging_clean(staging, "the delivery ratchet")
+    return await _ratchet_judge_packs(
+        st, caps, models, efforts, staging, packs, normalized, prior,
+        pre_sha, diff, diff_files, typed_evidence, system_prompt, label,
+        out)
 
 
 async def _ratchet_judge_packs(st: "State", caps: dict, models: dict,
@@ -52458,9 +52215,9 @@ async def _ratchet_judge_packs(st: "State", caps: dict, models: dict,
                                diff: str, diff_files: set[str],
                                typed_evidence: list[str], system_prompt: str,
                                label: str, out: dict) -> dict:
-    """`_ratchet_judge`'s packs, each judged with `cwd` — a clean checkout
-    of the commit after the group (`_committed_checkout`) — as the tree
-    the items are re-verified on."""
+    """`_ratchet_judge`'s packs, each judged with `cwd` — staging at the
+    commit after the group, asserted clean — as the tree the items are
+    re-verified on."""
     for p, pack in enumerate(packs):
         entries = [{"item_index": i, "item": normalized[i]["item"],
                     "prior_verified_evidence": prior.get(i, "")}
@@ -52575,9 +52332,8 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
                         log_path: Path) -> dict:
     """The ratchet's execution route: the failing-test-ID diff of one repair
     — IDs failing after it and not before — confirmed by B* against
-    `pre_sha` (`_redrive_new_failures`), on staging's commit
-    (`_committed_test_tree`: no measurement when no clean checkout of it can
-    be made). The tests that directly import a
+    `pre_sha` (`_redrive_new_failures`), on staging's commit (staging
+    asserted clean: HEAD plus ignored files). The tests that directly import a
     file the repair changed are first rerun `confirm_intermittent_repeats`
     times (`_intermittent_discovery`, base `pre_sha`); every ID they fail
     joins the candidates, and a `resource_affected` ID meeting the
@@ -52588,14 +52344,9 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
         return {"new": [], "pre_existing": [], "no_verdict": [],
                 "resource_affected": [], "unmeasured": True,
                 "intermittent_regression": []}
-    async with _committed_test_tree(st, caps, staging, "ratchet-exec",
-                                    log_path=log_path) as tree:
-        if tree is None:
-            return {"new": [], "pre_existing": [], "no_verdict": [],
-                    "resource_affected": [], "unmeasured": True,
-                    "intermittent_regression": []}
-        return await _ratchet_exec_in(st, caps, tree, pre_sha, before,
-                                      after, label=label, log_path=log_path)
+    await _assert_staging_clean(staging, "the delivery ratchet's test IDs")
+    return await _ratchet_exec_in(st, caps, staging, pre_sha, before, after,
+                                  label=label, log_path=log_path)
 
 
 async def _ratchet_exec_in(st: "State", caps: dict, staging: Path,
@@ -53598,43 +53349,27 @@ def _final_diff_base_gap(st: "State", diff: dict | None) -> str | None:
             + (f" (+{len(ids) - 5} more)" if len(ids) > 5 else ""))
 
 
-def _join_gap(*notes: str | None) -> str | None:
-    """Several notes for one `_set_final_diff_gap` entry, or None."""
-    kept = [n for n in notes if n]
-    return "; ".join(kept) if kept else None
-
-
 async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
                                 log_path: Path, label: str,
                                 log_prefix: str) -> str | None:
     """Measure the failing-test-ID diff again on the tree that ships when it
     is missing or of another tree (DESIGN §8 *Delivery re-drive*, *The final
     diff describes the tree that ships*), and return that tree's sha:
-    staging's committed `HEAD^{tree}` (`_committed_tree_sha`; None only when
-    git fails). Uncommitted files never ship, so they never make the tree
-    unidentifiable: when staging holds any — a test run's own artifacts
-    included — the measurement is taken in a clean detached checkout of its
-    HEAD instead. Nothing to do when the diff is already of this tree, or
-    when no test command resolves and no diff was ever recorded (no
-    regression check to miss). When the `tests` axis cannot be measured —
-    no command, no checkout, an unmeasured run — the old diff is kept,
+    staging's committed `HEAD^{tree}` (`_assert_staging_clean`: staging is
+    that commit plus ignored files, I1 + I2, so it is measured in place;
+    None only when git fails). Nothing to do when the diff is already of
+    this tree, or when no test command resolves and no diff was ever
+    recorded (no regression check to miss). When the `tests` axis cannot be
+    measured — no command, an unmeasured run — the old diff is kept,
     marked `stale_for_tree`, and `_set_final_diff_gap` lists the gap; a tree
-    already tried (`stale_for_tree` is it) is not measured twice. Edits to
-    tracked files staging left uncommitted are listed too: they do not ship."""
+    already tried (`stale_for_tree` is it) is not measured twice."""
     diff = st.data.get("test_id_diff")
     diff = diff if isinstance(diff, dict) else None
     cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"])
            or "").strip()
-    tree_sha = await _committed_tree_sha(str(staging))
-    edits = await _tracked_edits(str(staging)) or []
-    edits_note = (
-        "failing-test-ID diff: measured on the committed tree that ships, "
-        "but the staging worktree holds uncommitted edits to "
-        f"{len(edits)} tracked file(s) that do not ship — check whether "
-        "they belong in the change: "
-        + ", ".join(ln[3:] for ln in edits[:5])
-        + (f" (+{len(edits) - 5} more)" if len(edits) > 5 else "")
-        if edits else None)
+    tree_sha = await _assert_staging_clean(staging,
+                                           f"{log_prefix}'s shipping-tree "
+                                           "refresh")
     if diff is None and not cmd:
         _set_final_diff_gap(st, None)
         return tree_sha
@@ -53645,8 +53380,7 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
     reusable = (diff is not None and not rebased
                 and not diff.get("base_install_failed"))
     if tree_sha and reusable and diff.get("tree_sha") == tree_sha:
-        _set_final_diff_gap(st, _join_gap(_final_diff_base_gap(st, diff),
-                                          edits_note))
+        _set_final_diff_gap(st, _final_diff_base_gap(st, diff))
         return tree_sha
     if tree_sha and reusable and diff.get("stale_for_tree") == tree_sha:
         return tree_sha
@@ -53658,44 +53392,24 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
     elif not tree_sha:
         why = "git could not read the staging worktree's committed tree"
     else:
-        tree, wt = str(staging), None
-        if await _worktree_tree_sha(str(staging)) != tree_sha:
-            # Something uncommitted is in staging: measure exactly what
-            # ships, in a checkout of its HEAD, as CI parity does.
-            wt = _helper_worktree_path(st, "shipping-tree")
-            _remove_acceptance_checkout(st, wt)
-            head = await _branch_head_sha(str(staging))
-            add = (await _worktree_add_detached_async(st, wt, head)
-                   if head else None)
-            if add is None or add.returncode != 0:
-                why = ("a clean checkout of the committed tree that ships "
-                       "could not be created")
-                tree = ""
-            else:
-                tree = str(wt)
-        try:
-            if tree:
-                post = await _measure_axes(
-                    tree, {"tests": cmd}, st, caps, log_path=log_path,
-                    verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                    label_prefix=label, log_prefix=log_prefix,
-                    failing_ids_axes={"tests"})
-                got = await _confirm_final_test_failures(
-                    st, caps, tree, post, log_path=log_path, label=label,
-                    tree_sha=tree_sha)
-                if got is None and ((post or {}).get("tests")
-                                    or {}).get("deps_failed"):
-                    why = ("the dependency install failed in the tree "
-                           "measured, so its failing tests say nothing "
-                           "about the change")
-                elif got is None:
-                    summ = str(((post or {}).get("tests") or {})
-                               .get("summary") or "").strip()
-                    why = ("the test command did not produce a measurement"
-                           + (f" ({summ[:200]})" if summ else ""))
-        finally:
-            if wt is not None:
-                _remove_acceptance_checkout(st, wt)
+        post = await _measure_axes(
+            str(staging), {"tests": cmd}, st, caps, log_path=log_path,
+            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+            label_prefix=label, log_prefix=log_prefix,
+            failing_ids_axes={"tests"})
+        got = await _confirm_final_test_failures(
+            st, caps, str(staging), post, log_path=log_path, label=label,
+            tree_sha=tree_sha)
+        if got is None and ((post or {}).get("tests")
+                            or {}).get("deps_failed"):
+            why = ("the dependency install failed in the tree "
+                   "measured, so its failing tests say nothing "
+                   "about the change")
+        elif got is None:
+            summ = str(((post or {}).get("tests") or {})
+                       .get("summary") or "").strip()
+            why = ("the test command did not produce a measurement"
+                   + (f" ({summ[:200]})" if summ else ""))
     if got is None:
         stale = diff is not None and bool(tree_sha)
         log(f"  {log_prefix}: the failing-test-ID diff could not be measured "
@@ -53719,8 +53433,7 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
                     "is unknown — run the tests on the PR branch and "
                     f"compare with the base. Why: {why}")
     else:
-        _set_final_diff_gap(st, _join_gap(_final_diff_base_gap(st, got),
-                                          edits_note))
+        _set_final_diff_gap(st, _final_diff_base_gap(st, got))
     return tree_sha
 
 
@@ -54193,8 +53906,12 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     H1, unm_h = await measure(held, f"redrive-r{rnd}g{gi}-held")
                     H1 = (None if unm_h and len(unm_h) == len(held)
                           else _redrive_carry(H, H1, unm_h))
-                ids_after = await _redrive_test_ids(
-                    st, caps, staging, f"redrive-r{rnd}g{gi}-ids")
+                # A group that committed a staged file is void (rule 3), and
+                # its tree is not clean — the unstage deleted that tracked
+                # path — so it is not measured: `_ratchet_exec` reads None as
+                # unmeasured, never a stop of `_assert_staging_clean`.
+                ids_after = (None if leaked else await _redrive_test_ids(
+                    st, caps, staging, f"redrive-r{rnd}g{gi}-ids"))
                 newv = await _ratchet_exec(
                     st, caps, staging, pre_sha, ids_before, ids_after,
                     label=f"redrive-r{rnd}g{gi}",
@@ -54553,21 +54270,20 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # measurement is confirmed instead when the tree has not moved since
     # (DESIGN §8 *The final diff describes the tree that ships*).
     pre: dict[str, dict] | None = None
-    pre_tree: str | None = None
     post_taken = False
-    # The committed tree each measurement describes (`_measured_tree_sha`),
-    # None when it saw content that does not ship: stamped on `_final` so
-    # the executed-commands record cites its axes only on that tree (DESIGN
-    # §8 *Every post-execution verdict is of the committed tree*).
-    pre_stamp: str | None = None
+    # The committed tree each measurement describes — staging asserted
+    # clean (I1 + I2), so its HEAD's tree: stamped on `_final` so the
+    # executed-commands record cites its axes only on that tree (DESIGN §8
+    # *Every post-execution verdict is of the committed tree*).
+    pre_tree: str | None = None
     post_stamp: str | None = None
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
         post_taken = False
-        pre_tree = await _unmoved_tree_sha(str(staging))
         pre = await _measure_final(c_round, "pre")
-        pre_stamp = await _measured_tree_sha(str(staging))
+        pre_tree = await _assert_staging_clean(
+            staging, f"final conformance round {c_round}'s pre-measurement")
 
         # Build the per-round user prompt. Mirrors _run_conformer's shape
         # but the spec / criteria lines are replaced with one sentence
@@ -54622,20 +54338,24 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                 effort=efforts["conformer"],
                 sid=f"final-conformer-r{c_round}")
         except WorkerError as e:
-            warnings.append(f"final conformer round {c_round}: "
-                            f"WorkerError: {e}")
-            break
+            crashed = f"WorkerError: {e}"
+            res = None
         except subprocess.TimeoutExpired:
             timeout = resolve_worker_timeout("conformer", caps)
-            warnings.append(f"final conformer round {c_round}: timed out "
-                            f"after {timeout}s")
-            break
+            crashed = f"timed out after {timeout}s"
+            res = None
+        else:
+            crashed = None
+        if crashed is not None:
+            warnings.append(f"final conformer round {c_round}: {crashed}")
 
         # I1 (DESIGN §8 *A worker leaves its tree clean*): before the
-        # round's post-measurement or any later stage reads staging. Still
-        # dirty after the re-asks, the round is rolled back to its start
-        # (`_redrive_rollback`: its commits, and untracked files with
-        # ignored ones kept) and recorded, which makes the run unconverged.
+        # round's post-measurement or any later stage reads staging, and
+        # after a crashed or timed-out worker too — it may have edited the
+        # tree before it stopped. Still dirty after the re-asks, the round
+        # is rolled back to its start (`_redrive_rollback`: its commits, and
+        # untracked files with ignored ones kept) and recorded, which makes
+        # the run unconverged.
         unclean = await _clean_tree_gate(
             staging, caps=caps, label=f"final conformer round {c_round}",
             reask=_clean_tree_reasker(
@@ -54651,6 +54371,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                                               unclean))
             _record_unclean_tree(st, "final conformer", f"round {c_round}",
                                  unclean)
+            break
+        if crashed is not None:
             break
 
         res = _expand_conformer_output(res)
@@ -54742,7 +54464,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # worker's self-reported axes stop being load-bearing here too.
         post = await _measure_final(c_round, "post")
         post_taken = True
-        post_stamp = await _measured_tree_sha(str(staging))
+        post_stamp = await _assert_staging_clean(
+            staging, f"final conformance round {c_round}'s post-measurement")
         res = _apply_measured_axes(res, post)
         last_res = res
         regressions = _round_axis_regressions(pre, post)
@@ -54792,7 +54515,9 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                            if open_defects else None)
 
     if (pre is not None and not post_taken and pre_tree
-            and await _unmoved_tree_sha(str(staging)) == pre_tree):
+            and await _assert_staging_clean(
+                staging, "the final conformance's after-loop confirm")
+            == pre_tree):
         broke = await _confirm_final_test_failures(
             st, caps, str(staging), pre,
             log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
@@ -54841,7 +54566,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         "result": last_res,
         "warnings": warnings,
         "blocked": final_blocked,
-        "tree_sha": post_stamp if post_taken else pre_stamp,
+        "tree_sha": post_stamp if post_taken else pre_tree,
     }
     if final_defects:
         final_rec["residual_defects"] = [
@@ -55272,8 +54997,10 @@ async def _cov_contained(argv: list[str], *, tree: Path, st: "State",
                          caps: dict, sid: str, tag: str,
                          log_path: Path | None = None) -> dict:
     """Run one coverage/settle command in `tree`, spawn-held in a broker
-    cgroup at the worker caps, holding a host build slot (DESIGN §6). A run
-    that changed tracked files is reset. Output goes to the subtask's
+    cgroup at the worker caps, holding a host build slot (DESIGN §6). The
+    subtask's worktree is left as the command found it, apart from ignored
+    files (`_leaves_tree_as_found` over its repository root, so an install
+    in a `working_dir` is covered too). Output goes to the subtask's
     coverage log unless `log_path` names another."""
     name = _CGROUP_NAME_UNSAFE_RE.sub("-", f"cov-{sid}-{tag}")[:60]
     if log_path is None:
@@ -55289,8 +55016,12 @@ async def _cov_contained(argv: list[str], *, tree: Path, st: "State",
         log(f"  coverage {sid} {tag}: not run — {e}")
         out["skipped"] = "forbidden_by_task"
         return out
+    root = ((await _git_text(tree, "rev-parse", "--show-toplevel")
+             or "").strip() or str(tree))
     try:
-        async with _build_class_slot(st, label=f"coverage {sid} {tag}"):
+        async with _leaves_tree_as_found(root, f"coverage {tag}",
+                                         f"coverage {sid}"), \
+                _build_class_slot(st, label=f"coverage {sid} {tag}"):
             run = await _run_contained(
                 argv, cwd=str(tree), name=name, run_id=st.run_id,
                 memory_max_bytes=int(caps.get("worker_memory_max_bytes") or 0),
@@ -55301,10 +55032,6 @@ async def _cov_contained(argv: list[str], *, tree: Path, st: "State",
                    tail=run.get("tail") or "")
     except OSError as e:
         out["error"] = f"{type(e).__name__}: {e}"
-    dirty = await run_proc(["git", "status", "--porcelain",
-                            "--untracked-files=no"], cwd=str(tree))
-    if dirty.returncode == 0 and dirty.stdout.strip():
-        await run_proc(["git", "checkout", "--", "."], cwd=str(tree))
     return out
 
 
@@ -55991,15 +55718,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
                              "did not verify the committed tree")
             await run_proc(["git", "checkout", "--", "."], cwd=worktree)
     if untracked_before is not None:
-        made = sorted((_untracked_files(worktree) or set())
-                      - untracked_before)
-        for rel in made:
-            with contextlib.suppress(OSError):
-                (Path(worktree) / rel).unlink()
-        for d in sorted({os.path.dirname(r) for r in made if "/" in r},
-                        key=lambda x: -len(x)):
-            with contextlib.suppress(OSError):
-                os.removedirs(Path(worktree) / d)
+        made = _remove_new_untracked(worktree, untracked_before)
         if made:
             record["removed_untracked"] = made[:20]
     record["verdict"] = verdict

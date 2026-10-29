@@ -5,12 +5,12 @@ tree again (DESIGN §8 *The final diff describes the tree that ships*).
 
 Before: the stamp was `_worktree_tree_sha(staging)`, None whenever
 `__pycache__/` was not ignored, so every such run paid a fresh checkout,
-a full install, the discovery repeats and B* a second time. The stamp is
-still withheld when the measurement saw something that does not ship: an
-uncommitted tracked edit, or any untracked file leerie's own commands did
-not produce. Round 10 H1: the round 9 rule asked the final conformer's
-Write/Edit tool calls instead, so a module it made through Bash read as an
-artifact, and a run whose shipped tree failed a test ended `done`."""
+a full install, the discovery repeats and B* a second time. Now leerie's
+test runs leave nothing behind (I2) and the final conformer is held to a
+clean tree (I1), so staging is its commit plus ignored files and the stamp
+is that commit's tree. Round 10 H1: a module the final conformer made
+through Bash (or Write) never reaches a measurement — the round is rolled
+back — and a run whose shipped tree fails a test does not end `done`."""
 from __future__ import annotations
 
 import asyncio
@@ -62,15 +62,7 @@ def _drive(leerie, tmp_path, monkeypatch, ignore, *, worker_file=None,
     return run, calls
 
 
-# Red until I2 (DESIGN §6½: leerie's commands leave the tree as they found
-# it): leerie's own test run leaves `__pycache__/` in staging, and the
-# clean-tree gate (DESIGN §8 *A worker leaves its tree clean*) holds the
-# final conformer to it. Strict, so the mark goes when I2 lands.
-_NEEDS_I2 = pytest.mark.xfail(strict=True, reason="needs I2")
-
-
-@pytest.mark.parametrize("ignore", [pytest.param("", marks=_NEEDS_I2),
-                                    "__pycache__/\n"])
+@pytest.mark.parametrize("ignore", ["", "__pycache__/\n"])
 def test_the_same_committed_tree_is_measured_once(leerie, tmp_path,
                                                   monkeypatch, ignore):
     """The reviewer's driver: with `__pycache__/` not ignored, discovery
