@@ -10488,6 +10488,35 @@ failure that B\* types `resource_affected` no longer spends conformer rounds.
 Where the runner has no structured report, nothing changes — the axis
 verdict stands.
 
+**A failed install is no measurement.** Every side of the diff is a tree
+leerie installed into itself, and a suite run without its dependencies
+fails broadly for a reason that has nothing to do with the change. Review
+round 9 drove what that did when the install was ignored: staging's
+install had succeeded, a later commit really broke a test, and then the
+install failed in every fresh checkout (a registry outage, a cache miss,
+a full disk). The clean checkout of the tree that ships failed every test,
+B\*'s base checkout failed every test too, and every candidate — the real
+regression among them — read `pre_existing`: the run ended `done` with an
+empty end-state section. So an install that failed, on either side, makes
+that side unmeasured, never "failed like the base":
+
+- the install's result is remembered with the install, so a later
+  measurement of the same tree knows it, not only the first;
+- a `tests` measurement taken after a failed install carries
+  `deps_failed`, is never memoised (an outage is not a fact about the
+  tree), and gives the final diff no final side — the refresh lists "not
+  measured on the tree that ships" with that reason;
+- a baseline measured that way records no failing IDs (they would make
+  every final failure the base's own), and the gap says the base was
+  measured without its dependencies;
+- a B\* base checkout (the final diff's, a re-drive group's) whose
+  install failed reruns nothing: its candidates are `no_verdict`, and on
+  the tree that ships they are listed for a human to rerun against the
+  base.
+
+The comparison is then unknown and says so; it is never settled by two
+broken installs agreeing.
+
 **An intermittent failure the run introduced is evidence, not a verdict.**
 B\* calls an ID new only when it fails on every final rerun, so a test the
 run made fail one time in ten is never new. Measured (barnacle 7cc87f9a):

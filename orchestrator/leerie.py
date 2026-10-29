@@ -38313,6 +38313,11 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
 # container has an empty worktree) and cheap against the shared
 # package-manager caches (DESIGN §6½).
 _DEPS_INSTALLED: set[str] = set()
+# The subset of `_DEPS_INSTALLED` whose last install failed: a memo hit
+# answers what the install did, never "installed" (DESIGN §9 *A failed
+# install is no measurement*). Stale entries are harmless — a tree not in
+# `_DEPS_INSTALLED` installs afresh and rewrites its entry.
+_DEPS_FAILED: set[str] = set()
 
 
 async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
@@ -38334,15 +38339,17 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     "could not measure" rather than RED).
 
     Returns False when an `install` entry exited non-zero, timed out or
-    raised on this call, else True (a memo hit included). The held-out
+    raised — on this call, or on the call a memo hit stands for — else
+    True. The held-out
     acceptance tests judge by exit code alone, so their callers need this:
     a failed install would otherwise read as every test failing. A failed
     `build` entry does not count — a fix that breaks the build is evidence
     against the fix, which the tests then show."""
     key = os.path.realpath(tree)
     if key in _DEPS_INSTALLED:
-        return True
+        return key not in _DEPS_FAILED
     _DEPS_INSTALLED.add(key)
+    _DEPS_FAILED.discard(key)
     ok = True
     recipe = (st.data.get("provision") or {}).get("recipe") or []
     # Leerie's own install/build never leaves a tracked edit behind
@@ -38390,6 +38397,8 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                 ok = ok and e.get("kind") != "install"
                 log(f"  {log_prefix}: install error "
                     f"({type(ex).__name__}): {' '.join(e['command'])}")
+    if not ok:
+        _DEPS_FAILED.add(key)
     return ok
 
 
@@ -39016,6 +39025,7 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
     tree_sha = await _worktree_tree_sha(tree) if memo else None
     store = st.data.setdefault("blt_results", {}) if memo else {}
     installed = False
+    deps_ok = True
     dirty = False
 
     forbidden = _forbidden_specs(getattr(st, "data", None))
@@ -39069,7 +39079,7 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
             continue
 
         if not installed:
-            await _ensure_worktree_deps(
+            deps_ok = await _ensure_worktree_deps(
                 tree, st, caps, log_path=log_path, verbosity=verbosity,
                 label_prefix=label_prefix, log_prefix=log_prefix)
             installed = True
@@ -39103,9 +39113,14 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                                       label=f"{label_prefix}-{axis}")
         if replacement is not None:
             res["scoped_replacement"] = replacement
+        if not deps_ok:
+            # Measured without its dependencies: what failed says nothing
+            # about the change (DESIGN §9 *A failed install is no
+            # measurement*), and an outage is not a fact about the tree.
+            res["deps_failed"] = True
         results[axis] = res
 
-        if not (memo and tree_sha):
+        if not (memo and tree_sha) or not deps_ok:
             continue
         if not res.get("ran") or not res.get("measured"):
             continue                      # crashed, or runner absent
@@ -40105,6 +40120,12 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         base_ids = []
     if not tests.get("measured"):
         return None
+    if tests.get("deps_failed"):
+        # Every test may fail for want of its dependencies: no final side
+        # (DESIGN §9 *A failed install is no measurement*).
+        log(f"  {label}: the failing-test-ID diff is not taken — the "
+            "dependency install failed in the tree measured")
+        return None
     final_ids = tests.get("failing_ids")
     ids_unknown = base_ids is None or final_ids is None
     if final_ids is not None:
@@ -40185,12 +40206,25 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         verdict = await _confirm_new_failures(all_cand, _none, _none,
                                               caps, label=label)
         verdict["base_unavailable"] = True
+    elif not await _ensure_worktree_deps(
+            str(wt), st, caps, log_path=log_path,
+            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+            label_prefix=f"{label}-base", log_prefix="confirm"):
+        # A base that failed for want of its dependencies would fail every
+        # candidate and call it `pre_existing` (DESIGN §9 *A failed install
+        # is no measurement*): no base side, so no candidate gets a verdict.
+        _teardown()
+        log("  B*: the dependency install failed in the base worktree — "
+            "no candidate gets a verdict (no_verdict)")
+
+        async def _none(_t: float) -> set[str] | None:
+            return None
+        verdict = await _confirm_new_failures(all_cand, _none, _none,
+                                              caps, label=label)
+        verdict["base_unavailable"] = True
+        verdict["base_install_failed"] = True
     else:
         try:
-            await _ensure_worktree_deps(
-                str(wt), st, caps, log_path=log_path,
-                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                label_prefix=f"{label}-base", log_prefix="confirm")
             n = {"i": 0}
 
             def _runner_for(tree: str, side: str, units: list[str] | None):
@@ -40768,8 +40802,11 @@ async def _capture_conformance_baseline(
     # are new*): None when no structured report could be read, which keeps
     # the axis verdict in charge downstream.
     _ids = (axes.get("tests") or {}).get("failing_ids")
-    st.data["baseline_failing_ids"] = (list(_ids) if isinstance(_ids, list)
-                                       else None)
+    st.data["baseline_failing_ids"] = (
+        list(_ids) if isinstance(_ids, list)
+        # A base measured without its dependencies fails everything: its
+        # IDs would make every final failure read as the base's own.
+        and not (axes.get("tests") or {}).get("deps_failed") else None)
     st.save()
 
     if red:
@@ -42469,7 +42506,10 @@ def _test_outcome_unknown_reason(diff: dict, tree_sha: str | None) -> str:
     if not open_ and not diff.get("budget_exhausted"):
         return ""
     why: list[str] = []
-    if diff.get("base_unavailable"):
+    if diff.get("base_install_failed"):
+        why.append("the dependency install failed in the base checkout for "
+                   "the comparison")
+    elif diff.get("base_unavailable"):
         why.append("the base checkout for the comparison could not be "
                    "created")
     if diff.get("budget_exhausted"):
@@ -50923,15 +50963,18 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     _teardown()
     add = await _worktree_add_detached_async(st, wt, pre_sha)
     try:
-        if add.returncode != 0:
+        if add.returncode != 0 or not await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"{label}-base",
+                log_prefix="delivery re-drive"):
+            # No base checkout, or one without its dependencies (DESIGN §9
+            # *A failed install is no measurement*): no verdict, never
+            # `pre_existing`.
             verdict = await _confirm_new_failures(cand, _no_rerun,
                                                   _no_rerun, caps,
                                                   label=label)
         else:
-            await _ensure_worktree_deps(
-                str(wt), st, caps, log_path=log_path,
-                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                label_prefix=f"{label}-base", log_prefix="delivery re-drive")
             n = {"i": 0}
 
             def _runner(tree: str, side: str, units: list[str] | None):
@@ -52152,6 +52195,40 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
         _resettle_test_outcome_rows(st, tree_sha)
 
 
+def _final_diff_base_gap(st: "State", diff: dict | None) -> str | None:
+    """The "Needs human verification" text for a failing-test-ID diff whose
+    base side was never measured with its dependencies (DESIGN §9 *A failed
+    install is no measurement*), or None: the baseline's `tests` axis was
+    measured after a failed install (`deps_failed`), or B* could not rerun
+    the base (`base_unavailable` — no checkout, or `base_install_failed`)
+    for candidates that therefore have no verdict. Instruction first."""
+    base = ((((st.data.get("conformance") or {}).get("_baseline") or {})
+             .get("axes") or {}).get("tests") or {})
+    if isinstance(base, dict) and base.get("deps_failed"):
+        return ("failing-test-ID diff: run the tests on the PR branch and on "
+                "the base, and compare — the base was measured without its "
+                "dependencies (its install failed), so whether the run made "
+                "an existing test fail is unknown")
+    if not isinstance(diff, dict) or not diff.get("base_unavailable"):
+        return None
+    ids = [str(x) for x in diff.get("no_verdict") or []]
+    if not ids:
+        return None
+    why = ("its dependency install failed" if diff.get("base_install_failed")
+           else "it could not be checked out")
+    return ("failing-test-ID diff: rerun these against the base by hand — "
+            "failing on the tree that ships, but the base could not be "
+            f"rerun ({why}), so whether the run made them fail is unknown: "
+            + ", ".join(ids[:5])
+            + (f" (+{len(ids) - 5} more)" if len(ids) > 5 else ""))
+
+
+def _join_gap(*notes: str | None) -> str | None:
+    """Several notes for one `_set_final_diff_gap` entry, or None."""
+    kept = [n for n in notes if n]
+    return "; ".join(kept) if kept else None
+
+
 async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
                                 log_path: Path, label: str,
                                 log_prefix: str) -> str | None:
@@ -52187,7 +52264,8 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
         _set_final_diff_gap(st, None)
         return tree_sha
     if tree_sha and diff is not None and diff.get("tree_sha") == tree_sha:
-        _set_final_diff_gap(st, edits_note)
+        _set_final_diff_gap(st, _join_gap(_final_diff_base_gap(st, diff),
+                                          edits_note))
         return tree_sha
     if tree_sha and diff is not None and diff.get("stale_for_tree") == tree_sha:
         return tree_sha
@@ -52224,7 +52302,12 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
                 got = await _confirm_final_test_failures(
                     st, caps, tree, post, log_path=log_path, label=label,
                     tree_sha=tree_sha)
-                if got is None:
+                if got is None and ((post or {}).get("tests")
+                                    or {}).get("deps_failed"):
+                    why = ("the dependency install failed in the tree "
+                           "measured, so its failing tests say nothing "
+                           "about the change")
+                elif got is None:
                     summ = str(((post or {}).get("tests") or {})
                                .get("summary") or "").strip()
                     why = ("the test command did not produce a measurement"
@@ -52255,7 +52338,8 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
                     "is unknown — run the tests on the PR branch and "
                     f"compare with the base. Why: {why}")
     else:
-        _set_final_diff_gap(st, edits_note)
+        _set_final_diff_gap(st, _join_gap(_final_diff_base_gap(st, got),
+                                          edits_note))
     return tree_sha
 
 
