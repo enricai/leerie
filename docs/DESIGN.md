@@ -5202,7 +5202,14 @@ and left alone instead of failing the snapshot — one dirty submodule
 had switched off the put-back and the leftovers commit for the whole
 tree. And every path goes to git as a literal pathspec: `git checkout
 HEAD -- app/[slug]/page.tsx` otherwise reads the brackets as a glob and
-also reverts a worker's edit to `app/s/page.tsx`.
+also reverts a worker's edit to `app/s/page.tsx`. That holds for every
+git command leerie runs with a path it did not write as a constant, not
+only for the snapshot: review round 11 drove the key-level JSON merge's
+`git add -- cfg/[ab]/x.json` also committing an untracked `cfg/a/x.json`,
+and a read-only `git diff -- app/[slug]/p.ts` reporting a line of
+`app/s/p.ts`. A call site that means a glob says so — `:(glob)` magic, or
+a pathspec a prompt defines as one (`ABSENT:<pathspec>`) — and is named
+as deliberate in the source scan that guards the rest.
 
 Restoring rather than recording-and-excluding was chosen because it is
 one rule at the source instead of three filters downstream (the

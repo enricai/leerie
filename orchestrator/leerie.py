@@ -9608,8 +9608,8 @@ def _switched_branch_only_paths(repo_root: Path, rel: str,
         # and abandon every later task reference, the spec included.
         try:
             r = subprocess.run(
-                ["git", "-C", str(repo_root), "ls-tree", "-r", "-z",
-                 "--name-only", rev, "--", rel],
+                ["git", "--literal-pathspecs", "-C", str(repo_root),
+                 "ls-tree", "-r", "-z", "--name-only", rev, "--", rel],
                 capture_output=True, check=False, timeout=30)
             if r.returncode != 0:
                 return None
@@ -11396,8 +11396,9 @@ def _sweep_site_lines(subtask: dict, repo_root: Path, file: str) -> set[int]:
             continue
         try:
             r = subprocess.run(
-                ["git", "grep", "--no-index", "-n", "-w", "-F", "-e", site,
-                 "--", file], cwd=str(repo_root), capture_output=True,
+                ["git", "--literal-pathspecs", "grep", "--no-index", "-n",
+                 "-w", "-F", "-e", site, "--", file], cwd=str(repo_root),
+                capture_output=True,
                 text=True, check=False, timeout=60)
         except (OSError, subprocess.TimeoutExpired):
             continue
@@ -17714,7 +17715,8 @@ def _is_conflict_marker(line: str, size: int) -> bool:
 
 async def _conflict_marker_size(worktree: Path, path: str) -> int:
     r = await run_proc(
-        ["git", "check-attr", "-z", "conflict-marker-size", "--", path],
+        ["git", "--literal-pathspecs", "check-attr", "-z",
+         "conflict-marker-size", "--", path],
         cwd=str(worktree))
     fields = r.stdout.split("\0") if r.returncode == 0 else []
     value = fields[2] if len(fields) > 2 else ""
@@ -17762,8 +17764,9 @@ async def _introduced_conflict_markers(
             continue
         size = await _conflict_marker_size(worktree, path)
         diff = await run_proc(
-            ["git", "diff", "--text", "--no-textconv", "--no-ext-diff",
-             "--no-color", "--no-renames", "-U0", since, "--", path],
+            ["git", "--literal-pathspecs", "diff", "--text", "--no-textconv",
+             "--no-ext-diff", "--no-color", "--no-renames", "-U0", since,
+             "--", path],
             cwd=str(worktree))
         if diff.returncode != 0:
             return None
@@ -26697,8 +26700,9 @@ def _d1_report_sources(task: str, repo_root: Path) -> dict[str, str]:
             continue
         rel = _repo_rel(f, repo_root)
         tracked = subprocess.run(
-            ["git", "-C", str(repo_root), "ls-files", "--error-unmatch",
-             "--", rel], capture_output=True, check=False).returncode == 0
+            ["git", "--literal-pathspecs", "-C", str(repo_root), "ls-files",
+             "--error-unmatch", "--", rel], capture_output=True,
+            check=False).returncode == 0
         if tracked:
             continue
         try:
@@ -38923,16 +38927,17 @@ def _tracked_content(tree: str | Path, *, write: bool = False
     w = ["-w"] if write else []
     for i in range(0, len(files), 200):
         chunk = files[i:i + 200]
-        h = subprocess.run(["git", "-C", str(tree), "hash-object", *w,
-                            "--no-filters", "--", *chunk],
+        h = subprocess.run(["git", "--literal-pathspecs", "-C", str(tree),
+                            "hash-object", *w, "--no-filters", "--", *chunk],
                            capture_output=True, text=True, check=False)
         hashes = h.stdout.split()
         if h.returncode == 0 and len(hashes) == len(chunk):
             out.update(zip(chunk, hashes))
             continue
         for p in chunk:
-            one = subprocess.run(["git", "-C", str(tree), "hash-object",
-                                  *w, "--no-filters", "--", p],
+            one = subprocess.run(["git", "--literal-pathspecs", "-C",
+                                  str(tree), "hash-object", *w,
+                                  "--no-filters", "--", p],
                                  capture_output=True, text=True, check=False)
             out[p] = (one.stdout.strip()
                       if one.returncode == 0 and one.stdout.strip()
@@ -52282,7 +52287,8 @@ def _redrive_schema_hits(repo: str | Path, base: str, head: str
         if not R:
             continue
         head_lines = _redrive_git(repo, "show", f"{head}:{f}").splitlines()
-        d = _redrive_git(repo, "diff", "-U0", base, head, "--", f)
+        d = _redrive_git(repo, "--literal-pathspecs", "diff", "-U0", base,
+                         head, "--", f)
         wl = _sg_where_lines(base_src)
         hunks: list[dict] = []
         cur: dict | None = None
@@ -54497,8 +54503,8 @@ async def _changed_line_numbers(tree: Path, base_ref: str,
                                 path: str) -> list[int]:
     """New-side line numbers `base_ref..HEAD` changed in `path`, from the
     `-U0` hunk headers."""
-    r = await run_proc(["git", "diff", "-U0", f"{base_ref}..HEAD", "--",
-                        path], cwd=str(tree))
+    r = await run_proc(["git", "--literal-pathspecs", "diff", "-U0",
+                        f"{base_ref}..HEAD", "--", path], cwd=str(tree))
     out: set[int] = set()
     for line in r.stdout.splitlines() if r.returncode == 0 else []:
         m = _DIFF_HUNK_RE.match(line)
@@ -57336,7 +57342,8 @@ async def _diff_side_lines(cwd: str | Path, base: str, tip: str,
                            path: str) -> tuple[set[str], set[str]]:
     """`(added, removed)` stripped lines of `git diff -U0 base tip -- path`;
     added lines shorter than `_INTEGRATION_LINE_MIN` are left out."""
-    out = await _git_text(cwd, "diff", "-U0", base, tip, "--", path) or ""
+    out = await _git_text(cwd, "--literal-pathspecs", "diff", "-U0", base,
+                          tip, "--", path) or ""
     added: set[str] = set()
     removed: set[str] = set()
     for line in out.splitlines():
@@ -58518,14 +58525,15 @@ async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
         merged[f] = render(value)
     for f, text in merged.items():
         (staging / f).write_text(text)
-    add = await run_proc(["git", "add", "--", *files], cwd=str(staging))
+    add = await run_proc(["git", "--literal-pathspecs", "add", "--", *files],
+                         cwd=str(staging))
     commit = (await run_proc(["git", "commit", "--no-edit"],
                              cwd=str(staging))
               if add.returncode == 0 else add)
     if commit.returncode != 0 or await check_merge_committed(staging):
         # Put the conflict back exactly as git left it for the integrator.
-        await run_proc(["git", "checkout", "-m", "--", *files],
-                       cwd=str(staging))
+        await run_proc(["git", "--literal-pathspecs", "checkout", "-m", "--",
+                        *files], cwd=str(staging))
         log(f"  {sid}: JSON key merge could not commit "
             f"({commit.stderr.strip()[:200]}); leaving it to the integrator")
         return None
