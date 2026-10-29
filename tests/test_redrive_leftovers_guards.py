@@ -230,3 +230,64 @@ def test_a_rolled_back_groups_withheld_files_are_not_listed(leerie):
     leerie._set_redrive_leftovers_gap(st, {"rounds": []})
     assert st.data["needs_human_verification"] == [
         {"source": "other", "detail": "kept"}]
+
+
+def test_an_over_cap_set_is_saved_where_the_entry_says(leerie, tmp_path):
+    """Review round 12 L2, the reviewer's driver (`test_zz_r12_overcap.py`):
+    a tracked fix plus 101 new migration files is over the cap, and a later
+    group's rollback (`reset --hard` + `clean -fd`) erased both, while the
+    PR entry still told the reviewer to commit them. The set is now saved
+    under the run directory first, and the entry names where."""
+    import subprocess
+    import tarfile
+    s = _repo(tmp_path)
+    (s / "src" / "a.py").write_text("A = 1\n")
+    _git(s, "add", "-A")
+    _git(s, "commit", "-qm", "a")
+    pre = _git(s, "rev-parse", "HEAD")
+    before = (leerie._tracked_content(s), leerie._untracked_signatures(s))
+    (s / "src" / "a.py").write_text("A = 2  # the fix\n")
+    (s / "migrations").mkdir()
+    for i in range(101):
+        (s / "migrations" / f"{i:04d}_step.sql").write_text(f"-- {i}\n")
+    save = tmp_path / "run" / "redrive-leftovers"
+    withheld: dict = {}
+    got = asyncio.run(leerie._redrive_commit_leftovers(
+        s, "r1 g0", *before, set(), withheld=withheld, save_dir=save))
+    assert got == [] and len(withheld["over_cap"]) == 102
+    assert withheld["saved"] == [str(save / "r1-g0.tar.gz"),
+                                 str(save / "r1-g0.patch")]
+    assert asyncio.run(leerie._redrive_rollback(s, pre))
+    assert (s / "src" / "a.py").read_text() == "A = 1\n"
+    with tarfile.open(save / "r1-g0.tar.gz") as tar:
+        names = tar.getnames()
+        assert len(names) == 102
+        assert tar.extractfile("src/a.py").read() == b"A = 2  # the fix\n"
+    subprocess.run(["git", "-C", str(s), "apply", str(save / "r1-g0.patch")],
+                   check=True)
+    assert (s / "src" / "a.py").read_text() == "A = 2  # the fix\n"
+
+    class St:
+        data: dict = {}
+
+        def save(self):
+            pass
+    st = St()
+    st.data = {}
+    leerie._set_redrive_leftovers_gap(st, {"rounds": [{"groups": [
+        {"leftovers_withheld": {k: withheld[k]
+                                for k in ("over_cap", "saved")}}]}]})
+    (e,) = st.data["needs_human_verification"]
+    assert str(save / "r1-g0.tar.gz") in e["detail"]
+
+
+def test_the_save_cap_bounds_the_archive(leerie, tmp_path):
+    s = _repo(tmp_path)
+    (s / "big.bin").write_bytes(b"x" * 5000)
+    (s / "small.txt").write_text("s\n")
+    got = leerie._save_withheld_leftovers(
+        s, ["big.bin", "small.txt"], tmp_path / "out", "g", 100)
+    import tarfile
+    with tarfile.open(got[0]) as tar:
+        assert tar.getnames() == ["small.txt"]
+    assert leerie.DEFAULT_CAPS["redrive_leftovers_save_max_bytes"] == 64 << 20

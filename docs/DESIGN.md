@@ -7356,7 +7356,14 @@ logged only, since there is nothing for a reviewer to decide about it.
   bytes, nothing is committed: no implementer's change is that large by
   accident, and choosing a subset would ship half of whatever it is. The
   group's commits stand and are measured as they are; its uncommitted
-  files are left in staging and listed.
+  files are left in staging, saved under the run directory — an archive
+  of the files as they stand (up to `redrive_leftovers_save_max_bytes`)
+  and a patch of the tracked part — and listed with where they were saved.
+  Review round 12 L2 drove why the listing alone is not enough: a later
+  group's rollback (`reset --hard` and `clean -fd`) or finalize's removal
+  of the staging worktree erased the implementer's uncommitted tracked fix
+  and the files the entry told the reviewer to commit, so the entry could
+  not be acted on.
 
 Leerie still cannot tell a generated file from a hand-made one in general,
 and dropping a real file breaks what ships; so outside those three guards
