@@ -228,19 +228,20 @@ def test_redrive_leftovers_never_commit_a_measurement_artifact(
                    capture_output=True)
     assert any("__pycache__" in p for p in leerie._untracked_files(staging))
     before = leerie._tracked_content(staging)
+    untracked_before = leerie._untracked_signatures(staging)
     (staging / "mod.py").write_text("X = 3\n")
-    (staging / "new_mod.py").write_text("Y = 1\n")
-    # The implementer's own Write/Edit calls name its files (M2, round 9).
-    written = {"mod.py", "new_mod.py"}
-    asyncio.run(leerie._redrive_commit_leftovers(staging, "r0 g0", before,
-                                                 written))
+    (staging / "new_mod.py").write_text("Y = 1\n")     # through Bash
+    written = {"mod.py"}
+    asyncio.run(leerie._redrive_commit_leftovers(
+        staging, "r0 g0", before, untracked_before, written))
     shipped = _git(staging, "show", "--name-only", "--format=", "HEAD")
     assert sorted(shipped.split()) == ["mod.py", "new_mod.py"]
     assert "leftovers" in _git(staging, "log", "-1", "--format=%s")
     # Nothing new: no commit.
     head = _git(staging, "rev-parse", "HEAD")
     asyncio.run(leerie._redrive_commit_leftovers(
-        staging, "r0 g1", leerie._tracked_content(staging), written))
+        staging, "r0 g1", leerie._tracked_content(staging),
+        leerie._untracked_signatures(staging), written))
     assert _git(staging, "rev-parse", "HEAD") == head
 
 

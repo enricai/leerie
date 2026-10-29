@@ -7,13 +7,16 @@ Before: the stamp was `_worktree_tree_sha(staging)`, None whenever
 `__pycache__/` was not ignored, so every such run paid a fresh checkout,
 a full install, the discovery repeats and B* a second time. The stamp is
 still withheld when the measurement saw something that does not ship: an
-uncommitted tracked edit, or an untracked file the final conformer
-wrote."""
+uncommitted tracked edit, or any untracked file leerie's own commands did
+not produce. Round 10 H1: the round 9 rule asked the final conformer's
+Write/Edit tool calls instead, so a module it made through Bash read as an
+artifact, and a run whose shipped tree failed a test ended `done`."""
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import subprocess
 import sys
 
 import pytest
@@ -88,3 +91,54 @@ def test_a_tracked_edit_is_measured_again(leerie, tmp_path, monkeypatch):
     run, calls = _drive(leerie, tmp_path, monkeypatch, "",
                         tracked_edit=True)
     assert len(calls) == 2 and calls[1].endswith("shipping-tree")
+
+
+MOD = "try:\n    from helper import X\nexcept ImportError:\n    X = 0\n"
+
+
+@pytest.mark.parametrize("tool", ["Bash", "Write"])
+def test_an_untracked_module_that_made_the_suite_pass_is_never_reused(
+        leerie, tmp_path, monkeypatch, tool):
+    """Round 10 H1, the reviewer's driver: the branch commits `mod.py`,
+    which falls back to `X = 0` without a `helper` module that does not
+    ship, so `test_m` fails on HEAD. The final conformer makes `helper.py`
+    and leaves it untracked. Before, through Bash (`cat > helper.py`) the
+    staging measurement — green — was stamped with the committed tree and
+    the run ended `done` with an empty section; only a Write was caught.
+    Either way the clean checkout is measured now and `test_m` is new."""
+    run = _repo(leerie, tmp_path, monkeypatch, ignore="__pycache__/\n")
+    staging, st = run["staging"], run["st"]
+    (staging / "mod.py").write_text(MOD)
+    _git(staging, "commit", "-qam", "use helper")
+
+    async def conformer(*a, **k):
+        p = os.path.join(k["cwd"], "helper.py")
+        with open(p, "w") as f:
+            f.write("X = 2\n")
+        inp = ({"command": "cat > helper.py <<'E'\nX = 2\nE"}
+               if tool == "Bash" else {"file_path": p, "content": "X = 2\n"})
+        with open(run["run_dir"] / "logs" / f"{k['sid']}.log", "a") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": tool,
+                 "input": inp}]}}) + "\n")
+        return {}
+    _quiet_conformer(leerie, monkeypatch)
+    monkeypatch.setattr(leerie, "claude_p", conformer)
+    asyncio.run(leerie._run_final_conformance(
+        run["run_dir"], st, run["caps"], {"conformer": "sonnet"},
+        {"conformer": "low"}))
+    assert st.data["conformance"]["_final"]["tree_sha"] is None
+    _phase5(leerie, run)
+    diff = st.data["test_id_diff"]
+    assert diff["tree_sha"] == _git(staging, "rev-parse", "HEAD^{tree}")
+    assert any("test_m" in i for i in diff["new"])
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert leerie._format_pr_end_state_section(st.data) != ""
+    # What ships really fails test_m.
+    co = tmp_path / "co"
+    _git(run["repo"], "worktree", "add", "-q", "--detach", str(co),
+         _git(staging, "rev-parse", "HEAD"))
+    r = subprocess.run(["python3", "-m", "pytest", "-q", "-p",
+                        "no:cacheprovider", "tests"], cwd=co,
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "test_m" in r.stdout

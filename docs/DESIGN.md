@@ -5141,15 +5141,57 @@ to the tracked `pnpm-lock.yaml` into an end-state line "uncommitted
 edits to 1 tracked file(s) that do not ship — check whether they belong
 in the change", the final conformer's "left 1 uncommitted change(s)"
 warning, and, on a run that re-drove, a leftovers commit shipping the
-churn. So every command leerie itself runs in a tree — the recipe's
-install and build entries, a measured build/lint/test axis, a test-ID
-report run — is bracketed by a snapshot of the tracked files' content
-(path → blob of the working bytes), and whatever tracked file the
-command changed is put back as it was just before it: from HEAD when it
-matched HEAD, from its saved bytes when someone had already edited it
-(an edit a worker left is never lost). Dependencies and other untracked
-output stay, so the tree stays runnable, and staging stays at its
-commit plus only what workers left.
+churn. So the commands leerie runs to install into or measure a tree
+that workers also work in — the recipe's install and build entries, a
+measured build/lint/test axis, a test-ID report run — are bracketed by a
+snapshot of the tracked files' content (path → blob of the working
+bytes), and whatever tracked file the command changed is put back as it
+was just before it: from HEAD when it matched HEAD, from its saved bytes
+when someone had already edited it (an edit a worker left is never
+lost). Dependencies and other untracked output stay, so the tree stays
+runnable, and staging stays at its commit plus only what workers left.
+The other commands leerie runs in a tree are not bracketed and do not
+need to be: CI parity's and the coverage settle's commands reset their
+tree with `git checkout -- .` themselves; the settle by execution reads
+any dirt its commands leave as its own verdict; the held-out sets' parse
+probe and runs work in disposable checkouts; and the setup hook and
+`mise install` run at the repository root before any worktree exists.
+
+The bracket also records which untracked files the command produced:
+every untracked, not-ignored path that appeared while it ran, keyed by
+its stat identity (inode, size, mtime, ctime — any rewrite or
+replacement changes it), kept in a file in that worktree's own git
+directory so it lives and dies with the worktree and survives a resume.
+A file already recorded keeps its place when leerie's next command
+rewrites it; a file anything else wrote or rewrote is not leerie's. The
+record exists because "which untracked file is the change" cannot be
+read from the files themselves. Review round 9 tried the worker side —
+a file was the worker's only when its Write/Edit tool calls named it —
+and review round 10 drove both ways that fails: a module the final
+conformer made with a heredoc read as an artifact and stamped a staging
+measurement with the committed tree (a false `done`), and a re-drive
+implementer's `mv` shipped the deletion without the new file. Workers
+make files through shell commands all the time; leerie knows every
+command of its own. So the attribution is inverted and fails closed:
+what leerie's bracketed commands produced is leerie's, and every other
+untracked file is a worker's. A file a command leerie does not bracket
+produced is then a worker's too, which costs a measurement (below),
+never a wrong verdict.
+
+Three details keep the snapshot itself sound. Only the snapshot taken
+before a command writes its blobs to the object store, since only those
+bytes are ever written back; every other snapshot is only compared
+(review round 10 drove a test that rewrote a 5 MB tracked fixture ten
+times into about 48 MB of loose objects in the store every worktree
+shares).
+A submodule is listed by the commit it has checked out, and only when
+that moved: content modified inside it is its own state, and leerie
+never moves a submodule back. A path git cannot hash is listed as such
+and left alone instead of failing the snapshot — one dirty submodule
+had switched off the put-back and the leftovers commit for the whole
+tree. And every path goes to git as a literal pathspec: `git checkout
+HEAD -- app/[slug]/page.tsx` otherwise reads the brackets as a glob and
+also reverts a worker's edit to `app/s/page.tsx`.
 
 Restoring rather than recording-and-excluding was chosen because it is
 one rule at the source instead of three filters downstream (the
@@ -7084,15 +7126,24 @@ leerie's own installs, builds and test runs put back every tracked file
 they rewrite (§6½ *Leerie's own commands leave tracked files as they
 found them*), so a clean run whose install relocks a lockfile lists
 nothing. The same rule names what a measurement in staging itself described:
-when nothing tracked is edited and no untracked file is one the final
-conformer wrote, what is left untracked is only what commands produced,
-so the final conformer's diff is stamped with the committed tree and the
-refresh reuses it. Review round 9 L1 measured the cost of stamping it
-"unidentifiable" instead: on a repository that does not ignore
-`__pycache__/`, every run paid a second checkout, install, discovery and
-B\* on a tree already measured. A file the conformer wrote and left
-untracked was collected there and does not ship, so then the clean
-checkout is measured.
+when nothing tracked is edited and every untracked file is one leerie's
+own commands produced (§6½), the measurement saw exactly the committed
+tree plus artifacts that never ship, so the final conformer's diff is
+stamped with the committed tree and the refresh reuses it. Review round
+9 L1 measured the cost of stamping it "unidentifiable" instead: on a
+repository that does not ignore `__pycache__/`, every run paid a second
+checkout, install, discovery and B\* on a tree already measured. Any
+other untracked file — a worker's, made through a tool call or a shell
+command alike — was collected there and does not ship, so then the
+clean checkout is measured. Review round 10 drove the rule this
+replaced, which trusted every untracked file the final conformer's
+Write/Edit calls did not name: a `helper.py` it made with a heredoc
+made the suite pass in staging, the measurement was stamped with a
+committed tree whose `test_m` fails, and the run ended `done` with an
+empty section. A worker that runs the suite itself in a repository
+that does not ignore `__pycache__/` leaves `.pyc` files of unknown
+origin, and that run pays the second measurement; that is the price of
+never calling a worker's file an artifact.
 
 **Every post-execution verdict is of the committed tree.** The delivery
 judges run with staging as their working directory, and staging can hold
@@ -7115,8 +7166,10 @@ What staging-only content can still do is make a judge vote *unmet* on
 something that ships correctly — a cost (a re-drive spent), never a false
 `done`. The one staging read that is a measurement, the re-drive ratchet's
 test IDs, compares staging before and after a group with the same
-leftover dirt on both sides, and the final diff measures the committed
-tree again before the outcome is decided.
+leftover dirt on both sides — every file the group made is committed by
+its leftovers commit (below), so what stays uncommitted after it is what
+was there before plus leerie's own artifacts — and the final diff
+measures the committed tree again before the outcome is decided.
 
 When the `tests` axis cannot be measured on that tree — the command did not
 run, or no test command resolves for a run that had a diff — the old diff
@@ -7155,25 +7208,42 @@ recorded for the tenth); of the 10 broken sets, 3 were stopped by gates
 (b), (c) and (d), 3 did not close, and 4 closed, each hand-reviewed in the
 bench.
 
-**A re-drive group's leftovers are its implementer's, and only those.**
+**A re-drive group's leftovers are its implementer's.**
 The implementer is told to commit its work, and what it leaves
-uncommitted is committed for it — but only what it left. A tracked file
-counts when its content changed while the group ran: its bytes are
-snapshotted (path → blob) just before the implementer starts and compared
-just after, so an edit that predates the group — a command's churn, a
-final conformer's uncommitted edit — is never taken, and a group that
-changed nothing moves no HEAD and reads `no_change`. An untracked file
-counts only when the implementer's own Write/Edit tool calls, read from
-its per-worker log, name it — whether or not it existed before the group,
-so a file it finished from one the final conformer left untracked ships
-too. Review round 9 drove both earlier rules into the PR: `git add -u`
-shipped a lockfile an install had rewritten before the group, and "every
-untracked file that appeared while it ran" shipped the `.pyc` of the test
-the implementer had just written and run, because a new `.pyc` is a new
-path. A file name cannot tell an artifact from a source file; the
-implementer's tool calls can. A file it made only through a shell command
-(`mv`, a generator) is not taken, which is the same contract as for its
-own commits: what it made it commits.
+uncommitted is committed for it — but only what the group changed. A
+tracked file counts when its content changed while the group ran: its
+bytes are snapshotted (path → blob) just before the implementer starts
+and compared just after, so an edit that predates the group — a
+command's churn, a final conformer's uncommitted edit — is not taken
+unless the implementer changes that file too, in which case the file is
+committed as it stands; a group that changed nothing moves no HEAD and
+reads `no_change`. An untracked, not-ignored file counts when it
+appeared or changed while the group ran (its stat identity, snapshotted
+the same way), less the files leerie's own commands produced (§6½); a
+file the implementer's Write/Edit tool calls name counts too, even one
+that predates the group, so a file it finished from one the final
+conformer left untracked ships. An untracked file that predates the
+group and that the group did not touch is logged and left, never
+dropped silently.
+
+Review round 9 drove two earlier rules into the PR: `git add -u` shipped
+a lockfile an install had rewritten before the group, and "every
+untracked file that appeared while it ran" shipped the `.pyc` of the
+test the implementer had just written and run. Its fix took an
+untracked file only when a Write/Edit call named it, and review round 10
+drove what that dropped: an `mv util.py helpers.py` through Bash shipped
+the deletion and the edited import without `helpers.py`, so HEAD could
+not import what staging could, and a module made with a heredoc stayed
+behind. A shell command makes a source file as often as a tool call
+does, so the tool calls cannot be the only source. The `.pyc` case is
+settled by the repository's own ignore rules instead: a `.pyc` in a
+repository that ignores `__pycache__/` is never listed, and one in a
+repository that does not is committed, exactly as that repository's own
+`git add -A` would commit it. Leerie cannot tell a generated file from a
+hand-made one by its name or its producer's tool, and dropping a real
+file breaks what ships while committing an unignored cache is the
+repository's existing hygiene; between the two, the safe error is the
+second.
 
 **A finished verdict is reused only on the commit it was measured on.** A
 resume skips a finalize-side gate that already finished, but "finished"

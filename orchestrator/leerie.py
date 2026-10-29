@@ -38859,33 +38859,72 @@ async def _tracked_edits(tree: str) -> list[str] | None:
     return [ln for ln in r.stdout.splitlines() if ln.strip()]
 
 
-def _tracked_content(tree: str | Path) -> dict[str, str | None] | None:
+_GITLINK = "gitlink:"
+# A tracked path `_tracked_content` could not hash: listed, never restored.
+_UNHASHED = "unhashed"
+
+
+def _tracked_content(tree: str | Path, *, write: bool = False
+                     ) -> dict[str, str | None] | None:
     """Every tracked path whose working-tree file differs from HEAD, mapped
-    to the blob of its bytes as they are now (`git hash-object -w
-    --no-filters`, written to the object store so the bytes can be put
-    back) or None when the file is gone; a path absent from the map is as
-    HEAD has it. None when git fails. Paths are mechanical `-z` output."""
+    to the blob of its bytes as they are now (`git hash-object
+    --no-filters`) or None when the file is gone; a path absent from the
+    map is as HEAD has it. None when git fails. Paths are mechanical `-z`
+    output.
+
+    `write=True` also stores the blobs (`-w`) so `_restore_tracked_content`
+    can write the bytes back; only the snapshot taken before a command
+    needs that. Every other snapshot is only compared, and writing each
+    rewrite of a large tracked fixture grew the object store the worktrees
+    share by the fixture's size every time (review round 10 L1).
+
+    A submodule is listed by the commit it has checked out
+    (`gitlink:<sha>`), and only when that is not HEAD's: content modified
+    inside it is the submodule's own state, not an edit of this tree
+    (`--ignore-submodules=dirty`). A path git cannot hash is listed as
+    `unhashed` rather than failing the snapshot — one such path turned off
+    the put-back and the leftovers commit for the whole tree (review round
+    10 L2)."""
     try:
         r = _git_z_output(["git", "-C", str(tree), "diff", "--name-only",
-                           "--no-renames", "-z", "HEAD"])
+                           "--no-renames", "--ignore-submodules=dirty", "-z",
+                           "HEAD"])
     except OSError:
         return None
     if r.returncode != 0:
         return None
     paths = [p for p in r.stdout.split("\0") if p]
     out: dict[str, str | None] = {}
-    present = [p for p in paths if os.path.lexists(os.path.join(tree, p))]
+    files: list[str] = []
     for p in paths:
-        out[p] = None
-    for i in range(0, len(present), 200):
-        chunk = present[i:i + 200]
-        h = subprocess.run(["git", "-C", str(tree), "hash-object", "-w",
+        full = os.path.join(str(tree), p)
+        if not os.path.lexists(full):
+            out[p] = None
+        elif os.path.isdir(full) and not os.path.islink(full):
+            sub = subprocess.run(["git", "-C", full, "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, check=False)
+            out[p] = (_GITLINK + sub.stdout.strip()
+                      if sub.returncode == 0 and sub.stdout.strip()
+                      else _UNHASHED)
+        else:
+            files.append(p)
+    w = ["-w"] if write else []
+    for i in range(0, len(files), 200):
+        chunk = files[i:i + 200]
+        h = subprocess.run(["git", "-C", str(tree), "hash-object", *w,
                             "--no-filters", "--", *chunk],
                            capture_output=True, text=True, check=False)
         hashes = h.stdout.split()
-        if h.returncode != 0 or len(hashes) != len(chunk):
-            return None
-        out.update(zip(chunk, hashes))
+        if h.returncode == 0 and len(hashes) == len(chunk):
+            out.update(zip(chunk, hashes))
+            continue
+        for p in chunk:
+            one = subprocess.run(["git", "-C", str(tree), "hash-object",
+                                  *w, "--no-filters", "--", p],
+                                 capture_output=True, text=True, check=False)
+            out[p] = (one.stdout.strip()
+                      if one.returncode == 0 and one.stdout.strip()
+                      else _UNHASHED)
     return out
 
 
@@ -38905,16 +38944,23 @@ def _restore_tracked_content(tree: str | Path,
     return those paths. A file that matched HEAD is checked out from HEAD,
     one that was edited gets its edited bytes back, one that was deleted is
     removed again — so an edit someone else made before the command is
-    never lost. Untracked files are left alone. [] when git fails."""
+    never lost. Untracked files are left alone, and so is a submodule or
+    a path git could not hash: one either snapshot holds as `gitlink:` or
+    `unhashed` is never touched. Paths go to git
+    as literal pathspecs, so `app/[slug]/page.tsx` cannot also check out
+    `app/s/page.tsx` over a worker's edit. [] when git fails."""
     after = _tracked_content(tree)
     if after is None:
         return []
-    changed = _changed_paths(before, after)
+    changed = [p for p in _changed_paths(before, after)
+               if not any(str(snap.get(p) or "").startswith(
+                   (_GITLINK, _UNHASHED)) for snap in (before, after))]
     for p in changed:
         dst = Path(tree) / p
         if p not in before:
-            subprocess.run(["git", "-C", str(tree), "checkout", "HEAD",
-                            "--", p], capture_output=True, check=False)
+            subprocess.run(["git", "--literal-pathspecs", "-C", str(tree),
+                            "checkout", "HEAD", "--", p],
+                           capture_output=True, check=False)
         elif before[p] is None:
             with contextlib.suppress(OSError):
                 dst.unlink()
@@ -38929,6 +38975,91 @@ def _restore_tracked_content(tree: str | Path,
     return changed
 
 
+# The untracked files leerie's own commands produced in a worktree (DESIGN
+# §6½ *Leerie's own commands leave tracked files as they found them*): a
+# JSON map in that worktree's private git directory (`git rev-parse
+# --git-path`), so it lives and dies with the worktree, survives a resume,
+# and is never itself an untracked file of the tree.
+_PRODUCED_RECORD = "leerie-produced.json"
+
+
+def _untracked_signatures(tree: str | Path) -> dict[str, list[int]] | None:
+    """Each `_untracked_files` path → `[inode, size, mtime_ns, ctime_ns]`:
+    a stat identity that changes whenever anything rewrites or replaces the
+    file (ctime cannot be set back from user space). None when git cannot
+    say; a file gone between the listing and the stat is left out."""
+    files = _untracked_files(tree)
+    if files is None:
+        return None
+    out: dict[str, list[int]] = {}
+    for p in files:
+        try:
+            s = os.lstat(os.path.join(str(tree), p))
+        except OSError:
+            continue
+        out[p] = [s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
+    return out
+
+
+def _produced_record_path(tree: str | Path) -> Path | None:
+    """Where `tree`'s `_PRODUCED_RECORD` lives, or None when git fails."""
+    r = subprocess.run(["git", "-C", str(tree), "rev-parse", "--git-path",
+                        _PRODUCED_RECORD], capture_output=True, text=True,
+                       check=False)
+    rel = r.stdout.strip()
+    if r.returncode != 0 or not rel:
+        return None
+    return Path(rel) if os.path.isabs(rel) else Path(tree) / rel
+
+
+def _read_produced(tree: str | Path) -> dict[str, list]:
+    """`tree`'s record of leerie-produced untracked files; {} when there is
+    none or it cannot be read (nothing is then leerie's — fail closed)."""
+    path = _produced_record_path(tree)
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, list)}
+
+
+def _note_produced(tree: str | Path, before: dict[str, list[int]],
+                   after: dict[str, list[int]]) -> None:
+    """Record what one of leerie's own commands left untracked in `tree`:
+    every path that appeared while it ran, plus every path already recorded
+    as leerie's that nothing else touched since (its signature before the
+    command still the recorded one), at its new signature. A file a worker
+    made stays the worker's even when leerie's command rewrites it, and a
+    recorded file someone else rewrote is dropped."""
+    rec = _read_produced(tree)
+    new = {p: sig for p, sig in after.items()
+           if p not in before or rec.get(p) == before[p]}
+    if new == rec:
+        return
+    path = _produced_record_path(tree)
+    if path is None:
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    with contextlib.suppress(OSError):
+        tmp.write_text(json.dumps(new, sort_keys=True))
+        os.replace(tmp, path)
+
+
+def _leerie_produced(tree: str | Path,
+                     sigs: dict[str, list[int]]) -> set[str]:
+    """The paths of `sigs` (an `_untracked_signatures` snapshot) that a
+    command of leerie's own produced and nothing has rewritten since. Every
+    other untracked file is of unknown origin — a worker's, made through a
+    tool call or through any shell command."""
+    rec = _read_produced(tree)
+    return {p for p, sig in sigs.items() if rec.get(p) == sig}
+
+
 @contextlib.asynccontextmanager
 async def _leaves_tracked_files(tree: str | Path, what: str,
                                 log_prefix: str):
@@ -38938,15 +39069,33 @@ async def _leaves_tracked_files(tree: str | Path, what: str,
     (`_restore_tracked_content`), so leerie's own commands never leave an
     edit a worker could be blamed for or that could ship (DESIGN §6½
     *Leerie's own commands leave tracked files as they found them*).
-    Dependencies and other untracked output stay. Never raises from the
-    snapshot or the restore."""
+    Dependencies and other untracked output stay, and every untracked file
+    the command produced is recorded as leerie's (`_note_produced`), so a
+    later reader can tell it from a file a worker made. Never raises from
+    the snapshots, the restore or the record."""
     try:
-        before = await asyncio.to_thread(_tracked_content, tree)
+        before = await asyncio.to_thread(
+            functools.partial(_tracked_content, tree, write=True))
     except Exception:
         before = None
     try:
+        untracked_before = await asyncio.to_thread(_untracked_signatures,
+                                                   tree)
+    except Exception:
+        untracked_before = None
+    try:
         yield
     finally:
+        if untracked_before is not None:
+            try:
+                untracked_after = await asyncio.to_thread(
+                    _untracked_signatures, tree)
+                if untracked_after is not None:
+                    await asyncio.to_thread(_note_produced, tree,
+                                            untracked_before,
+                                            untracked_after)
+            except Exception:
+                pass
         if before is not None:
             try:
                 put_back = await asyncio.to_thread(
@@ -38969,28 +39118,24 @@ async def _unmoved_tree_sha(tree: str) -> str | None:
     return await _committed_tree_sha(tree)
 
 
-async def _measured_tree_sha(st: "State", tree: str) -> str | None:
+async def _measured_tree_sha(tree: str) -> str | None:
     """The committed tree a measurement just taken in `tree` describes, or
     None when it describes something else (DESIGN §8 *The final diff
     describes the tree that ships*): `_unmoved_tree_sha` — no tracked file
-    edited — and no untracked file one the final conformer wrote (its
-    Write/Edit tool calls in `final-conformer-r*.log`,
-    `_worker_written_paths`). What is left untracked then is only what
-    commands produced — a test run's `__pycache__/`, coverage, reports —
-    which never ships and is not the change; a file a worker wrote and did
-    not commit is part of what the run collected but not of what ships."""
+    edited — and every untracked file one leerie's own commands produced
+    (`_leerie_produced`): a test run's `__pycache__/`, coverage, reports,
+    which never ship and are not the change. Any other untracked file — one
+    a worker made, through a Write tool call or a heredoc, `mv` or
+    generator alike — was collected by the measurement and does not ship,
+    so then the clean checkout is measured instead (review round 10 H1)."""
     sha = await _unmoved_tree_sha(tree)
     if sha is None:
         return None
-    untracked = _untracked_files(tree)
-    if untracked is None:
+    sigs = await asyncio.to_thread(_untracked_signatures, tree)
+    if sigs is None:
         return None
-    if untracked:
-        run_dir = getattr(st, "run_dir", None)
-        logs = (sorted((Path(run_dir) / "logs").glob(
-            "final-conformer-r*.log")) if run_dir else [])
-        if any(untracked & _worker_written_paths(lg, tree) for lg in logs):
-            return None
+    if set(sigs) - await asyncio.to_thread(_leerie_produced, tree, sigs):
+        return None
     return sha
 
 
@@ -40131,11 +40276,11 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     verdict (`test_id_diff`), stamped with `tree_sha` when the caller
     measured a clean checkout of a known tree, else with
     `_measured_tree_sha(staging)`: the committed tree when the only dirt is
-    untracked files no worker wrote, so the shipping-tree refresh reuses it
-    instead of measuring the same tree again (review round 9 L1). A
-    baseline whose install failed is measured again first
-    (`_retry_failed_baseline`), and a prior verdict whose base install
-    failed is never reused."""
+    untracked files leerie's own commands produced, so the shipping-tree
+    refresh reuses it instead of measuring the same tree again (review
+    round 9 L1, round 10 H1). A baseline whose install failed is measured
+    again first (`_retry_failed_baseline`), and a prior verdict whose base
+    install failed is never reused."""
     await _retry_failed_baseline(st, caps, log_path=log_path)
     base_ids = st.data.get("baseline_failing_ids")
     tests = (post or {}).get("tests") or {}
@@ -40164,7 +40309,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     # The same candidates on the same tree were already confirmed (a round
     # that committed nothing): a second confirm would only re-measure noise.
     if tree_sha is None:
-        tree_sha = await _measured_tree_sha(st, staging)
+        tree_sha = await _measured_tree_sha(staging)
     prior = st.data.get("test_id_diff") or {}
     if (tree_sha and prior.get("tree_sha") == tree_sha
             and not prior.get("base_install_failed")
@@ -52507,28 +52652,45 @@ def _worker_written_paths(log_path: Path, tree: str | Path) -> set[str]:
 async def _redrive_commit_leftovers(staging: Path, label: str,
                                     tracked_before: dict[str, str | None]
                                     | None,
+                                    untracked_before: dict[str, list[int]]
+                                    | None,
                                     written: set[str]) -> list[str]:
-    """Commit what a re-drive group's implementer left uncommitted, and
-    nothing else (DESIGN §8 *Delivery re-drive*): the tracked files whose
-    content changed while the group ran (`_changed_paths` between
-    `tracked_before`, the `_tracked_content` snapshot taken just before the
-    implementer started, and now) and the untracked, not-ignored files the
-    implementer itself wrote (`written`, from its Write/Edit tool calls —
-    `_worker_written_paths`), whether or not they existed before the group.
-    A tracked edit that predates the group, and any file only a command
-    produced — a `.pyc`, a coverage page, a report — is never taken: a file
-    name cannot tell an artifact from a source file, the implementer's own
-    tool calls can. Returns the paths committed ([] when nothing was, so
-    HEAD does not move and the group reads `no_change`). With no snapshot
-    (git failed), no tracked file is taken."""
+    """Commit what a re-drive group's implementer left uncommitted (DESIGN
+    §8 *A re-drive group's leftovers are its implementer's*): the tracked
+    files whose content changed while the group ran (`_changed_paths`
+    between `tracked_before`, the `_tracked_content` snapshot taken just
+    before the implementer started, and now), and the untracked, not-ignored
+    files that appeared or changed while it ran (their `_untracked_signatures`
+    differ from `untracked_before`) less those leerie's own commands
+    produced (`_leerie_produced`), plus any untracked file the implementer's
+    Write/Edit tool calls name (`written`, `_worker_written_paths`) even if
+    it predates the group untouched since. A file is made through a shell
+    command as often as through a tool call, so the tool calls cannot be
+    the only source (review round 10 M1: a plain `mv` shipped the deletion
+    without the new file). An untracked file of unknown origin that predates
+    the group and that it did not touch is logged, never taken. Paths go to
+    git as literal pathspecs. Returns the paths committed ([] when nothing
+    was, so HEAD does not move and the group reads `no_change`). With no
+    snapshot (git failed), that side contributes nothing but `written`."""
     now = await asyncio.to_thread(_tracked_content, staging)
     tracked = (_changed_paths(tracked_before, now)
                if tracked_before is not None and now is not None else [])
-    untracked = sorted((_untracked_files(staging) or set()) & set(written))
+    sigs = await asyncio.to_thread(_untracked_signatures, staging) or {}
+    produced = await asyncio.to_thread(_leerie_produced, staging, sigs)
+    moved = (set() if untracked_before is None else
+             {p for p, sig in sigs.items() if untracked_before.get(p) != sig})
+    untracked = sorted(((moved - produced) | (set(sigs) & set(written))))
+    left_out = sorted(set(sigs) - produced - set(untracked))
+    if left_out:
+        log(f"  delivery re-drive ({label}): {len(left_out)} untracked "
+            "file(s) predating the group, untouched by it, left uncommitted: "
+            + ", ".join(left_out[:5])
+            + (f" (+{len(left_out) - 5} more)" if len(left_out) > 5 else ""))
     paths = sorted(set(tracked) | set(untracked))
     if not paths:
         return []
-    await run_proc(["git", "add", "-A", "--", *paths], cwd=str(staging))
+    await run_proc(["git", "--literal-pathspecs", "add", "-A", "--", *paths],
+                   cwd=str(staging))
     staged = await run_proc(["git", "diff", "--cached", "--quiet"],
                             cwd=str(staging))
     if staged.returncode != 1:
@@ -52832,6 +52994,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                       else efforts.get("implementer"))
             tracked_before = await asyncio.to_thread(_tracked_content,
                                                      staging)
+            untracked_before = await asyncio.to_thread(
+                _untracked_signatures, staging)
             try:
                 ge["implementer"] = await _redrive_drive(
                     leerie_dir, st, caps, models, staging, members, note,
@@ -52839,7 +53003,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             finally:
                 ge["tampered"] = _redrive_unstage(staging, staged)
             left = await _redrive_commit_leftovers(
-                staging, f"r{rnd} g{gi}", tracked_before,
+                staging, f"r{rnd} g{gi}", tracked_before, untracked_before,
                 _worker_written_paths(
                     st.run_dir / "logs"
                     / f"delivery-redrive-r{rnd}-g{gi}.log", staging))
@@ -53206,12 +53370,19 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     pre: dict[str, dict] | None = None
     pre_tree: str | None = None
     post_taken = False
+    # The committed tree each measurement describes (`_measured_tree_sha`),
+    # None when it saw content that does not ship: stamped on `_final` so
+    # the executed-commands record cites its axes only on that tree (DESIGN
+    # §8 *Every post-execution verdict is of the committed tree*).
+    pre_stamp: str | None = None
+    post_stamp: str | None = None
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
         post_taken = False
         pre_tree = await _unmoved_tree_sha(str(staging))
         pre = await _measure_final(c_round, "pre")
+        pre_stamp = await _measured_tree_sha(str(staging))
 
         # Build the per-round user prompt. Mirrors _run_conformer's shape
         # but the spec / criteria lines are replaced with one sentence
@@ -53382,6 +53553,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # worker's self-reported axes stop being load-bearing here too.
         post = await _measure_final(c_round, "post")
         post_taken = True
+        post_stamp = await _measured_tree_sha(str(staging))
         res = _apply_measured_axes(res, post)
         last_res = res
         regressions = _round_axis_regressions(pre, post)
@@ -53467,6 +53639,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         "result": last_res,
         "warnings": warnings,
         "blocked": final_blocked,
+        "tree_sha": post_stamp if post_taken else pre_stamp,
     }
     if final_defects:
         final_rec["residual_defects"] = [

@@ -60,6 +60,12 @@ def _final_and_phase5(leerie, run):
         {"conformer": "low"}))
     _phase5(leerie, run)
     st = run["st"]
+    # What a clean run left untracked is all leerie's own commands' output,
+    # so the final measurement is of the committed tree (round 10 H1): the
+    # diff is stamped with it and the record's final-tree axes cite it.
+    head_tree = _git(run["staging"], "rev-parse", "HEAD^{tree}")
+    assert st.data["test_id_diff"]["tree_sha"] == head_tree
+    assert st.data["conformance"]["_final"]["tree_sha"] == head_tree
     return (leerie._decide_outcome(st, any_commits=True),
             leerie._format_pr_end_state_section(st.data))
 
@@ -129,6 +135,34 @@ def test_shape3_an_install_that_rewrites_the_lockfile(
     assert not any("uncommitted change" in w for w in warnings), warnings
 
 
+SNAP_TEST = (
+    "import json, os, time\n"
+    "P = os.path.join(os.path.dirname(__file__), 'snap.json')\n"
+    "def test_snap():\n"
+    "    with open(P, 'w') as f:\n"
+    "        json.dump({'v': 1, 'at': time.time()}, f)\n"
+    "    assert True\n")
+
+
+def test_shape4_a_test_that_rewrites_a_tracked_snapshot(
+        leerie, tmp_path, monkeypatch):
+    """Round 10's fourth shape: a test rewrites the tracked
+    `tests/snap.json` with a timestamp on every run."""
+    run = _repo(leerie, tmp_path, monkeypatch)
+    for wt in (run["repo"], run["staging"]):
+        (wt / "tests" / "test_snap.py").write_text(SNAP_TEST)
+        (wt / "tests" / "snap.json").write_text('{"v": 1, "at": 0}')
+        _git(wt, "add", "tests")
+        _git(wt, "commit", "-qm", "snap")
+    run["st"].data["conformance"]["_baseline"]["sha"] = _git(
+        run["repo"], "rev-parse", "HEAD")
+    run["st"].save()
+    _quiet_conformer(leerie, monkeypatch)
+    out, sec = _final_and_phase5(leerie, run)
+    assert " M tests/snap.json" not in _status(run["staging"])
+    assert (out, sec) == ("done", "")
+
+
 # --------------------------------------------------------------------------
 # `_ensure_worktree_deps`: installs and builds that rewrite tracked files
 
@@ -140,6 +174,7 @@ def _tree(tmp_path, files: dict[str, str]):
     _git(t, "config", "user.email", "t@t")
     _git(t, "config", "user.name", "t")
     for rel, body in files.items():
+        (t / rel).parent.mkdir(parents=True, exist_ok=True)
         (t / rel).write_text(body)
     _git(t, "add", "-A")
     _git(t, "commit", "-qm", "base")
@@ -243,3 +278,142 @@ def test_the_snapshot_helpers_on_their_own(leerie, tmp_path):
     assert leerie._changed_paths({}, snap) == ["a", "b"]
     assert leerie._changed_paths(snap, dict(snap)) == []
     assert leerie._tracked_content(tmp_path / "not-a-repo") is None
+
+
+# --------------------------------------------------------------------------
+# Round 10: the snapshot's own robustness, and the record of what leerie's
+# commands left untracked
+
+
+def test_only_the_snapshot_before_a_command_writes_blobs(leerie, tmp_path):
+    """L1, the reviewer's driver in miniature: a wrapped command rewrote a
+    tracked 5 MB fixture ten times and `.git/objects` grew by ~50 MB, every
+    after-snapshot writing its blob. Only the before-snapshot writes now,
+    and the bytes still come back."""
+    t = _tree(tmp_path, {"fixture.db": "x" * 10})
+
+    def objects():
+        return sum(len(fs) for _d, _s, fs in os.walk(t / ".git" / "objects"))
+    n0 = objects()
+
+    async def run():
+        for _ in range(5):
+            async with leerie._leaves_tracked_files(t, "test run", "t"):
+                (t / "fixture.db").write_bytes(os.urandom(4096))
+    asyncio.run(run())
+    assert (t / "fixture.db").read_text() == "x" * 10 and _status(t) == ""
+    assert objects() == n0             # HEAD's bytes, nothing written
+    (t / "fixture.db").write_text("edited\n")      # a worker's edit
+    asyncio.run(run())
+    assert (t / "fixture.db").read_text() == "edited\n"
+    assert objects() <= n0 + 5         # one blob per before-snapshot only
+
+
+def _with_submodule(tmp_path):
+    sub = tmp_path / "libsrc"
+    sub.mkdir()
+    for args in (["init", "-q", "-b", "main"],
+                 ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        _git(sub, *args)
+    (sub / "lib.c").write_text("int x;\n")
+    _git(sub, "add", "-A")
+    _git(sub, "commit", "-qm", "lib")
+    t = _tree(tmp_path, {"uv.lock": "version = 1\n", "app.py": "A = 1\n"})
+    _git(t, "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+         str(sub), "vendor/lib")
+    _git(t, "commit", "-qm", "sub")
+    (t / "vendor" / "lib" / "lib.c").write_text("int x; int y;\n")
+    return t
+
+
+def test_a_dirty_submodule_does_not_switch_the_snapshot_off(leerie,
+                                                            tmp_path):
+    """L2, the reviewer's driver: modified content inside a submodule made
+    `git hash-object` fail on its directory and the whole snapshot None, so
+    an install's relock was not put back and a re-drive implementer's edit
+    was not committed. The submodule's own content is not this tree's edit;
+    a moved submodule commit is listed as `gitlink:<sha>` and never put
+    back."""
+    t = _with_submodule(tmp_path)
+    assert leerie._tracked_content(t) == {}
+
+    async def install():
+        async with leerie._leaves_tracked_files(t, "install/build", "t"):
+            (t / "uv.lock").write_text("version = 1\nrevision = 2\n")
+    asyncio.run(install())
+    assert (t / "uv.lock").read_text() == "version = 1\n"
+    before = (leerie._tracked_content(t), leerie._untracked_signatures(t))
+    (t / "app.py").write_text("A = 2\n")
+    sub = t / "vendor" / "lib"
+    _git(sub, "commit", "-qam", "bump")              # the submodule moved
+    bumped = _git(sub, "rev-parse", "HEAD")
+    snap = leerie._tracked_content(t)
+    assert snap["vendor/lib"] == "gitlink:" + bumped
+    got = asyncio.run(leerie._redrive_commit_leftovers(t, "r0 g0", *before,
+                                                       set()))
+    assert got == ["app.py", "vendor/lib"]
+    assert _git(t, "rev-parse", "HEAD:vendor/lib") == bumped
+
+
+def test_a_put_back_never_moves_a_submodule(leerie, tmp_path):
+    t = _with_submodule(tmp_path)
+    sub = t / "vendor" / "lib"
+
+    async def bump():
+        async with leerie._leaves_tracked_files(t, "install/build", "t"):
+            _git(sub, "commit", "-qam", "bump")
+    asyncio.run(bump())
+    assert " M vendor/lib" in _status(t)             # left as the command did
+
+
+def test_a_put_back_checks_out_a_bracketed_path_literally(leerie, tmp_path):
+    """`git checkout HEAD -- app/[slug]/page.tsx` read the brackets as a
+    glob and also reverted `app/s/page.tsx`, a worker's edit."""
+    t = _tree(tmp_path, {"app/[slug]/page.tsx": "a\n",
+                         "app/s/page.tsx": "b\n"})
+    (t / "app" / "s" / "page.tsx").write_text("worker\n")
+
+    async def cmd():
+        async with leerie._leaves_tracked_files(t, "build", "t"):
+            (t / "app" / "[slug]" / "page.tsx").write_text("rewritten\n")
+    asyncio.run(cmd())
+    assert (t / "app" / "[slug]" / "page.tsx").read_text() == "a\n"
+    assert (t / "app" / "s" / "page.tsx").read_text() == "worker\n"
+
+
+def test_the_record_holds_only_what_leerie_commands_produced(leerie,
+                                                             tmp_path):
+    """H1/M1's root: the untracked files leerie's own commands produced are
+    recorded per worktree (in its git directory, not the tree); any other
+    untracked file — made by a worker, through any tool — is not leerie's,
+    and neither is a recorded file a worker rewrote since."""
+    t = _tree(tmp_path, {"a.py": "A = 1\n"})
+    (t / "worker.py").write_text("W = 1\n")         # before: a worker's
+
+    async def cmd(body):
+        async with leerie._leaves_tracked_files(t, "test run", "t"):
+            body()
+    asyncio.run(cmd(lambda: (
+        (t / "junit.xml").write_text("<a/>"),
+        (t / "worker.py").write_text("W = 2\n"))))
+    sigs = leerie._untracked_signatures(t)
+    assert set(sigs) == {"junit.xml", "worker.py"}
+    assert leerie._leerie_produced(t, sigs) == {"junit.xml"}
+    rec = leerie._produced_record_path(t)
+    assert rec.is_file() and ".git" in rec.parts
+    # Rewritten by leerie again: still leerie's.
+    asyncio.run(cmd(lambda: (t / "junit.xml").write_text("<b/>")))
+    assert leerie._leerie_produced(
+        t, leerie._untracked_signatures(t)) == {"junit.xml"}
+    # Rewritten by a worker: unknown origin from then on, even when a
+    # later leerie command rewrites it again.
+    (t / "junit.xml").write_text("<worker/>")
+    assert leerie._leerie_produced(t, leerie._untracked_signatures(t)) == set()
+    asyncio.run(cmd(lambda: (t / "junit.xml").write_text("<c/>")))
+    assert leerie._leerie_produced(t, leerie._untracked_signatures(t)) == set()
+    # Deleted and made again by a worker: not leerie's.
+    asyncio.run(cmd(lambda: (t / "r.txt").write_text("r")))
+    (t / "r.txt").unlink()
+    (t / "r.txt").write_text("r")
+    assert "r.txt" not in leerie._leerie_produced(
+        t, leerie._untracked_signatures(t))
