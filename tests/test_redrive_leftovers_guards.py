@@ -383,3 +383,54 @@ def test_a_span_holder_in_a_staging_made_dir_is_listed(leerie, tmp_path,
     assert "acc/notes.ts" in e["detail"]
     assert ".snap" not in e["detail"]
     assert "acc/notes.ts" in leerie._format_pr_end_state_section(w.st.data)
+
+
+def test_a_dependency_tree_never_crowds_out_the_tracked_fix(leerie,
+                                                            tmp_path):
+    """Review round 13 L1, the reviewer's driver (`test_zz_r13_overcap_
+    save.py`): 26k untracked files under `node_modules/` (sorting before
+    `src/`) filled the save budget in path order, so the tracked fix was
+    skipped, and every path on `git diff`'s argv raised E2BIG, so no patch
+    was written. After the rollback the fix was gone while the entry said
+    it was saved. Tracked files are archived first, outside the budget,
+    and the patch is built from a pathspec file."""
+    import subprocess
+    import tarfile
+    s = _repo(tmp_path)
+    (s / "src" / "a.py").write_text("A = 1\n")
+    _git(s, "add", "-A")
+    _git(s, "commit", "-qm", "a")
+    pre = _git(s, "rev-parse", "HEAD")
+    before = _before(leerie, s)
+    (s / "src" / "a.py").write_text("A = 2  # the fix\n")
+    nm = s / "node_modules" / ("pkg-with-a-long-enough-name-" + "x" * 40)
+    nm.mkdir(parents=True)
+    for i in range(26000):
+        (nm / f"lib-helpers-esm-some-module-file-name-{i:06d}.js"
+         ).write_bytes(b"x" * 4)
+    (s / "aaa-big.bin").write_bytes(b"y" * 26000 * 4)
+    withheld: dict = {}
+    caps = {**leerie.DEFAULT_CAPS,
+            "redrive_leftovers_save_max_bytes": 26000 * 4}
+    save = tmp_path / "save"
+    got = asyncio.run(leerie._redrive_commit_leftovers(
+        s, "r1 g0", *before, set(), withheld=withheld, caps=caps,
+        save_dir=save))
+    assert got == [] and "src/a.py" in withheld["over_cap"]
+    assert withheld["saved"] == [str(save / "r1-g0.tar.gz"),
+                                 str(save / "r1-g0.patch")]
+    with tarfile.open(save / "r1-g0.tar.gz") as tar:
+        names = tar.getnames()
+        # Tracked first; then smallest first: the 4-byte files fit, the
+        # one big untracked file does not.
+        assert names[0] == "src/a.py"
+        assert "aaa-big.bin" not in names and len(names) == 26001
+        assert tar.extractfile("src/a.py").read() == b"A = 2  # the fix\n"
+    assert asyncio.run(leerie._redrive_rollback(s, pre))
+    assert (s / "src" / "a.py").read_text() == "A = 1\n"
+    subprocess.run(["git", "-C", str(s), "apply", str(save / "r1-g0.patch")],
+                   check=True)
+    assert (s / "src" / "a.py").read_text() == "A = 2  # the fix\n"
+    # The patch is the tracked part only, and staging's index is untouched.
+    assert "node_modules" not in (save / "r1-g0.patch").read_text()
+    assert _git(s, "diff", "--cached", "--name-only") == ""

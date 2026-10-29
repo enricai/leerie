@@ -7436,13 +7436,20 @@ logged only, since there is nothing for a reviewer to decide about it.
   accident, and choosing a subset would ship half of whatever it is. The
   group's commits stand and are measured as they are; its uncommitted
   files are left in staging, saved under the run directory — an archive
-  of the files as they stand (up to `redrive_leftovers_save_max_bytes`)
-  and a patch of the tracked part — and listed with where they were saved.
-  Review round 12 L2 drove why the listing alone is not enough: a later
-  group's rollback (`reset --hard` and `clean -fd`) or finalize's removal
-  of the staging worktree erased the implementer's uncommitted tracked fix
-  and the files the entry told the reviewer to commit, so the entry could
-  not be acted on.
+  of the files as they stand and a patch of the tracked part — and listed
+  with where they were saved. The tracked files are what the entry exists
+  to preserve, so they are archived first and never count against the
+  save's budget (`redrive_leftovers_save_max_bytes`); the untracked ones
+  fill it smallest first, so one bulk tree cannot crowd out many small
+  sources; and the patch takes its paths from a file, never the argument
+  vector. Review round 12 L2 drove why the listing alone is not enough: a
+  later group's rollback (`reset --hard` and `clean -fd`) or finalize's
+  removal of the staging worktree erased the implementer's uncommitted
+  tracked fix and the files the entry told the reviewer to commit, so the
+  entry could not be acted on. Review round 13 L1 drove the order: filled
+  in path order, a `node_modules/` tree sorting before `src/` used up the
+  budget and the tracked fix was skipped, and 26,000 paths on `git diff`'s
+  argument vector raised E2BIG, so no patch was written either.
 
 A withheld file stays untracked in staging, so a later group's
 implementer can commit it with its own `git add -A`; the entry is built

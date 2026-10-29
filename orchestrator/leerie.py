@@ -53816,42 +53816,73 @@ def _save_withheld_leftovers(staging: Path, paths: list[str],
                              max_bytes: int) -> list[str]:
     """Save an over-cap leftovers set (DESIGN §8 *A re-drive group's
     leftovers are its implementer's*, the cap): `<stem>.tar.gz` of each
-    path that exists, as it stands, until the next file would pass
-    `max_bytes`, and `<stem>.patch`, the tracked part as `git diff --binary
-    HEAD`. Returns the files written; never raises (a save that fails is
-    logged, and the paths are still listed)."""
+    path that exists, as it stands — every tracked one first, outside the
+    byte budget, then the untracked ones smallest first until the next
+    would pass `max_bytes` — and `<stem>.patch`, the tracked part as a
+    binary diff against HEAD, built in a temporary index fed the tracked
+    paths through a NUL-separated pathspec file, never the argument
+    vector. Review round 13 L1: filled in path order, a `node_modules/`
+    tree crowded the tracked fix out of the archive, and 26k paths on
+    `git diff`'s argv raised E2BIG, so no patch was written. Returns the
+    files written; never raises (a save that fails is logged, and the paths
+    are still listed)."""
     out: list[str] = []
     try:
         save_dir.mkdir(parents=True, exist_ok=True)
+        ls = _git_z_output(["git", "-C", str(staging), "ls-files", "-z"])
+        index = set(ls.stdout.split("\0")) if ls.returncode == 0 else set()
+        tracked = [p for p in paths if p in index]
+        sizes: dict[str, int] = {}
+        for p in paths:
+            with contextlib.suppress(OSError):
+                sizes[p] = os.lstat(staging / p).st_size
+        untracked = sorted((p for p in paths if p not in index
+                            and p in sizes), key=lambda p: (sizes[p], p))
         arc = save_dir / f"{stem}.tar.gz"
         total, skipped = 0, []
         with tarfile.open(arc, "w:gz") as tar:
-            for p in paths:
-                full = staging / p
-                try:
-                    size = os.lstat(full).st_size
-                except OSError:
-                    continue
-                if total + size > max_bytes:
+            for p in tracked:
+                if p in sizes:
+                    tar.add(staging / p, arcname=p, recursive=False)
+            for p in untracked:
+                if total + sizes[p] > max_bytes:
                     skipped.append(p)
                     continue
-                total += size
-                tar.add(full, arcname=p, recursive=False)
+                total += sizes[p]
+                tar.add(staging / p, arcname=p, recursive=False)
         out.append(str(arc))
         if skipped:
-            log(f"  delivery re-drive: {len(skipped)} over-cap leftover "
-                f"file(s) not saved, past {max_bytes} bytes: "
+            log(f"  delivery re-drive: {len(skipped)} over-cap untracked "
+                f"leftover file(s) not saved, past {max_bytes} bytes: "
                 + ", ".join(skipped[:5])
                 + (f" (+{len(skipped) - 5} more)" if len(skipped) > 5
                    else ""))
-        diff = subprocess.run(
-            ["git", "--literal-pathspecs", "-C", str(staging), "diff",
-             "--binary", "HEAD", "--", *paths],
-            capture_output=True, check=False)
-        if diff.returncode == 0 and diff.stdout:
-            patch = save_dir / f"{stem}.patch"
-            patch.write_bytes(diff.stdout)
-            out.append(str(patch))
+        if tracked:
+            with tempfile.TemporaryDirectory(prefix="leerie-save-") as tmp:
+                spec = Path(tmp) / "paths"
+                spec.write_bytes(b"".join(os.fsencode(p) + b"\0"
+                                          for p in tracked))
+                env = {**os.environ,
+                       "GIT_INDEX_FILE": str(Path(tmp) / "index")}
+                git = ["git", "--literal-pathspecs", "-C", str(staging)]
+                ok = (subprocess.run(git + ["read-tree", "HEAD"], env=env,
+                                     capture_output=True,
+                                     check=False).returncode == 0
+                      and subprocess.run(
+                          git + ["add", "-A", "-f",
+                                 f"--pathspec-from-file={spec}",
+                                 "--pathspec-file-nul"], env=env,
+                          capture_output=True, check=False).returncode == 0)
+                diff = (subprocess.run(
+                    git + ["diff", "--cached", "--binary", "HEAD"], env=env,
+                    capture_output=True, check=False) if ok else None)
+            if diff is not None and diff.returncode == 0 and diff.stdout:
+                patch = save_dir / f"{stem}.patch"
+                patch.write_bytes(diff.stdout)
+                out.append(str(patch))
+            elif diff is None or diff.returncode != 0:
+                log("  delivery re-drive: could not write the over-cap "
+                    "leftovers' patch")
     except (OSError, tarfile.TarError) as e:
         log(f"  delivery re-drive: could not save the over-cap leftovers "
             f"({type(e).__name__}: {e})")
