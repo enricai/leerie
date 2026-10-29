@@ -39021,6 +39021,11 @@ def _set_confirm_budget_gap(st: "State", site: str, what: list[str], *,
     if parts:
         entries.append({"source": CONFIRM_BUDGET_GAP_SOURCE, "site": site,
                         "detail": "; ".join(parts) + tail})
+    elif tail.strip("; "):
+        # Nothing left unsettled but what `tail` names (a kept re-drive
+        # group's unchecked items): still listed, never dropped with them.
+        entries.append({"source": CONFIRM_BUDGET_GAP_SOURCE, "site": site,
+                        "detail": f"{site}: {tail.strip('; ')}"})
     if entries != (data.get("needs_human_verification") or []):
         data["needs_human_verification"] = entries
         with contextlib.suppress(Exception):
@@ -51190,6 +51195,33 @@ def _set_redrive_unsettled_gap(st: "State", kept: list[dict],
               + "; ".join(named)) if named else "")
 
 
+def _settle_redrive_unsettled_by_diff(st: "State",
+                                      tree_sha: str | None) -> None:
+    """Rewrite the "delivery re-drive" unsettled entry against the
+    failing-test-ID diff of the tree that ships (DESIGN §9 *Which failures
+    are new*, step 4): that diff is what the entry defers to, so a kept
+    group's unsettled ID it settled — not a candidate there, or typed `new`
+    or `pre_existing` — is dropped. Nothing when the diff is not of
+    `tree_sha` or one side's IDs were unknown. The record
+    (`delivery_redrive.kept_unsettled`) is left as it happened."""
+    kept = (st.data.get("delivery_redrive") or {}).get("kept_unsettled")
+    diff = st.data.get("test_id_diff")
+    if (not kept or not tree_sha or not isinstance(diff, dict)
+            or diff.get("tree_sha") != tree_sha or diff.get("ids_unknown")):
+        return
+    cands = {str(c) for c in diff.get("candidates") or []}
+    settled_there = ({str(c) for c in diff.get("new") or []}
+                     | {str(c) for c in diff.get("pre_existing") or []})
+    open_ = cands - settled_there
+    left = [{**g, "ids": [c for c in g.get("ids") or [] if str(c) in open_],
+             "sized_out": [c for c in g.get("sized_out") or []
+                           if str(c) in open_]}
+            for g in kept if isinstance(g, dict)]
+    normalized = [_delivery_norm_item(it)
+                  for it in st.data.get("required_items") or []]
+    _set_redrive_unsettled_gap(st, left, normalized)
+
+
 def _ratchet_rollback_reason(rat: dict) -> str | None:
     """The rollback reason a ratchet verdict gives, or None."""
     if rat.get("regressed"):
@@ -52028,6 +52060,7 @@ async def _refresh_shipping_test_id_diff(leerie_dir: Path, st: "State",
         log_path=st.run_dir / "logs" / f"{label}.log", label=label,
         log_prefix="phase 5")
     _resettle_test_outcome_rows(st, tree_sha)
+    _settle_redrive_unsettled_by_diff(st, tree_sha)
 
 
 def _redrive_key_text(key: str) -> str:

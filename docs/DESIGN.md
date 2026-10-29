@@ -10267,11 +10267,26 @@ failure new / does this set still fail" verdict uses:
      files and the required items its ratchet could not check are listed
      under "Needs human verification" (site "delivery re-drive"), and the
      final diff, measured again on the tree that ships, reruns any of
-     them still failing there against the base. Rerunning the candidate
-     with priority inside the group was rejected: it is unsettled only
-     when one pair of its file does not fit what the group's budget left,
-     so priority buys it nothing a fresh budget on the shipping tree does
-     not,
+     them still failing there against the base. That diff is the
+     authority the entry defers to: an unsettled test it measured on the
+     tree that ships — passing there, or typed `new` or `pre_existing`
+     against the base — leaves the entry, which keeps only the tests still
+     unsettled there and the items no diff can check (review round 8 L1:
+     the entry used to outlive a `done` run whose shipping diff had
+     settled every one of them). A group's candidate is unsettled in
+     three ways: one pair of its file did not fit what the group's budget
+     left (sized out); a discovery find whose pairs the budget cut short
+     of `k` (never new on a shortfall, above); or a candidate with no
+     known file, whose whole-command reruns the budget cut. Rerunning
+     such a candidate with priority inside the group was rejected. For a
+     sized-out file priority buys nothing — its pair still does not fit.
+     With no known file the whole command reruns every candidate at once,
+     so there is nothing to put first. A discovery find's file could get
+     its missing pairs only by taking them from the files of the
+     candidates the group's own run failed, which rank first because one
+     finished pair of them is enough to call them new: priority would
+     trade the stronger evidence for the weaker, while the shipping-tree
+     diff reruns all of them with a fresh budget anyway,
      and in the integration gate it is never sent to the integrator and
      never backs out a merge; the final diff settles the shipping tree.
      A candidate the sizing above left out is unsettled the same way.

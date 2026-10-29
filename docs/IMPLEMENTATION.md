@@ -6324,7 +6324,14 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   - `async _refresh_shipping_test_id_diff(leerie_dir, st, caps, *, label)`
     — on `worktrees/staging` (nothing when absent): `_refresh_test_id_diff`
     with `log_prefix="phase 5"`, then `_resettle_test_outcome_rows(st,
-    tree_sha)`. `_run_phases` calls it after `_run_acceptance_gate`
+    tree_sha)` and `_settle_redrive_unsettled_by_diff(st, tree_sha)`: when
+    `test_id_diff.tree_sha` is that tree and not `ids_unknown`, every
+    `delivery_redrive.kept_unsettled` ID the diff settled — not among its
+    `candidates`, or in its `new` or `pre_existing` — is dropped before
+    `_set_redrive_unsettled_gap` rewrites the "delivery re-drive" entry
+    (the record itself is kept as it happened). A group's
+    `unchecked_items` stay; with no file left they are listed alone
+    (`_set_confirm_budget_gap` with only `tail`: `"<site>: <tail>"`). `_run_phases` calls it after `_run_acceptance_gate`
     (`label="test-id-diff-acceptance"`) and after `_run_delivery_redrive`,
     immediately before `phase_finalize` (`label="test-id-diff-final"`),
     each under its own advisory `try`.
