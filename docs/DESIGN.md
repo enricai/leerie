@@ -9331,6 +9331,31 @@ Three layers follow, each derived from that one list:
   `mocha .` loads only the files directly in the root (each measured with
   the real runner). A run aimed at a package or a test file is still
   scoped: `go test ./pkg/x`, `pytest tests/test_a.py`.
+
+  *A forbidden package script forbids what it runs.* On a JS repo the
+  repo's test command is `<pm> run test`, so that is the entry a
+  whole-suite forbid carries. Matching only that spelling let every other
+  spelling of the same run through (round-4 review M3): on a
+  barnacle-shaped repo whose `test` script is `vitest run`, `vitest run`,
+  `npx vitest run`, `pnpm exec vitest run --coverage`, `pnpm run test:ci`
+  and CI's `pnpm install && pnpm vitest run --coverage` all passed a
+  forbidden `pnpm run test`. The launch side already resolved a script
+  call to its body; the entry side never did. So `_process_constraints`,
+  which has the repository, resolves each forbidden script call through
+  `package.json` (scripts calling scripts included) and adds, with the
+  same scope, roots and quote and a `derived_from` naming the task's
+  entry:
+  - each test runner the body runs (`vitest run --coverage`); a body's
+    other commands (`tsc --noEmit && vitest run`) are not forbidden,
+    because the task forbade the suite, not the type check;
+  - every other script whose resolved body runs a forbidden command
+    (`test:ci` → `vitest run --coverage`), by name. A forbidden runner
+    entry does the same, so a forbidden `vitest run` also forbids
+    `pnpm run test`.
+  The derived entries travel in the hook's payload like any other, so
+  the worker hook, which reads no `package.json`, refuses them too. They
+  are not shown as the task's own forbids, and a derived entry the task
+  prescribes is dropped like any other.
   Hooks fire
   under `--dangerously-skip-permissions`. The hook fails open (a crash
   allows the call; the deny rules still stand) — a matcher bug must not

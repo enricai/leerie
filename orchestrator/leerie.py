@@ -23318,8 +23318,83 @@ def _process_constraints(result: dict, prescribed: dict | None,
         if scope == "whole_suite":
             entry["test_roots"] = list(roots)
         entries.append(entry)
-    return {"forbidden_commands": [x["command"] for x in entries],
+    originals = [x["command"] for x in entries]
+    if repo_root is not None:
+        for d in _forbidden_script_derived(entries, repo_root):
+            if any(x["command"] == d["command"] for x in entries):
+                continue
+            if any(_forbidden_command_hit(p, [d]) for p in keep):
+                log(f"  forbidden command {d['command']!r} (what "
+                    f"{d['derived_from']!r} runs) is also a prescribed "
+                    "command — not forbidden")
+                dropped.append({"command": d["command"],
+                                "reason": "prescribed",
+                                "evidence_quote": d["evidence_quote"]})
+                continue
+            entries.append(d)
+    return {"forbidden_commands": originals,
             "entries": entries, "dropped": dropped}
+
+
+def _forbidden_script_derived(entries: list[dict],
+                              repo_root: str | Path) -> list[dict]:
+    """The entries a forbidden command implies through `repo_root`'s
+    package scripts (DESIGN §9 *A forbidden package script forbids what it
+    runs*), each with its source's scope, roots and quote and
+    `derived_from` naming the task's own entry:
+
+    - a forbidden script call (`pnpm run test`) forbids the test runner its
+      body runs (`_resolve_pm_script`, scripts calling scripts included):
+      every argv of the resolved body that names a `_FORBID_RUNNERS` runner
+      becomes an entry (`vitest run --coverage`). Other commands in the body
+      (`tsc --noEmit && vitest run`) are not forbidden — the task forbade
+      the suite, not the type check;
+    - every script whose resolved body runs a forbidden command (an
+      original or one derived above) is forbidden by name too (`pnpm run
+      test:ci` whose body is `vitest run --coverage`), so the hook, which
+      reads no package.json, refuses it.
+
+    Never raises: a resolution error derives nothing."""
+    try:
+        scripts = _package_json_scripts(Path(repo_root))
+        if not scripts:
+            return []
+        out: list[dict] = []
+
+        def _add(src: dict, command: str) -> None:
+            if all(x["command"] != command for x in out):
+                d = {"command": command, "scope": src["scope"],
+                     "evidence_quote": src["evidence_quote"],
+                     "derived_from": src.get("derived_from",
+                                             src["command"])}
+                if "test_roots" in src:
+                    d["test_roots"] = list(src["test_roots"])
+                out.append(d)
+
+        for e in entries:
+            body = _resolve_pm_script(e["command"], repo_root)
+            for argv in _forbidden_argvs(body) if body else []:
+                if _forbidden_runner(_forbidden_runner_canon(argv)):
+                    _add(e, shlex.join(argv))
+        sources = list(entries) + list(out)
+        named: set[str] = set()
+        pm = "npm"
+        for src in sources:
+            for a in _forbidden_argvs(src["command"]):
+                if len(a) >= 3 and a[0] in _FORBID_PMS and a[1] == "run":
+                    named.add(a[2])
+                    pm = a[0] if pm == "npm" else pm
+        for name in sorted(scripts):
+            if name in named or not _FORBID_SCRIPT_NAME_RE.fullmatch(name):
+                continue
+            body = _resolve_pm_script(f"npm run {name}", repo_root)
+            for src in sources if body else []:
+                if _forbidden_command_hit(body, [src]):
+                    _add(src, f"{pm} run {name}")
+                    break
+        return out
+    except Exception:
+        return []
 
 
 def _forbidden_draw_union(result: dict,
@@ -23362,10 +23437,14 @@ FORBID_EXTRACTOR_MAX_TURNS = 8
 
 
 def _forbidden_commands(data: object) -> list[str]:
-    """The forbidden command strings, for display; matchers read
-    `_forbidden_specs`, which carries each one's scope."""
+    """The forbidden command strings the task itself named, for display —
+    an entry `derived_from` one of them through the package scripts is
+    left out; matchers read `_forbidden_specs`, which carries every entry
+    and its scope."""
     return [spec[0] for spec in
-            (_forbidden_spec(f) for f in _forbidden_specs(data)) if spec]
+            (_forbidden_spec(f) for f in _forbidden_specs(data)
+             if not (isinstance(f, dict) and f.get("derived_from")))
+            if spec]
 
 
 def _forbidden_specs(data: object) -> list[str | dict]:
@@ -26521,11 +26600,16 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
         union, st.data["prescribed_procedure"], sources=quote_sources,
         repo_root=repo_root)
     for e in pc_rec["entries"]:
-        e["votes"] = draws["votes"].get(e["command"], 0)
+        e["votes"] = draws["votes"].get(e.get("derived_from", e["command"]),
+                                        0)
     pc_rec["draws"] = {"draws": draws["draws"], "crashed": draws["crashed"]}
     st.data["process_constraints"] = pc_rec
     if _forbidden_commands(st.data):
         log("  task forbids: " + ", ".join(_forbidden_commands(st.data)))
+    derived = [e["command"] for e in pc_rec["entries"]
+               if e.get("derived_from")]
+    if derived:
+        log("  and what those package scripts run: " + ", ".join(derived))
     items = [it for it in result.get("required_items") or []
              if isinstance(it, dict)]
     st.data["required_items"] = items
