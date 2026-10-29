@@ -41399,6 +41399,36 @@ def _test_outcome_verdict(st: "State", tree_sha: str | None) -> dict:
     return {"verdict": "met", "new": [], "reason": ""}
 
 
+def _met_except_reason(parts: list[str], part: dict) -> str:
+    """The row reason of an item met on every part but its test-outcome
+    `parts`, whose verdict `part` (`_test_outcome_verdict`) is not met:
+    `met except: <parts>, <verdict> — <why>`."""
+    why = str(part.get("reason") or "")
+    if part.get("verdict") == "unmet":
+        new = [str(x) for x in part.get("new") or []]
+        why = ("new failing test(s) confirmed against the base: "
+               + ", ".join(new[:5])
+               + (f" (+{len(new) - 5} more)" if len(new) > 5 else ""))
+    return (f"met except: {'; '.join(parts)}, {part.get('verdict')}"
+            + (f" — {why}" if why else ""))
+
+
+def _settle_test_outcome_part(row: dict) -> dict:
+    """`row` with its test-outcome part's verdict (`test_outcome_part`)
+    applied when nothing else made it unmet: never `met` over a part B*
+    did not settle (DESIGN §8 *A test outcome is the failing-test-ID
+    diff's to settle*; review round 5 L3). `other_parts: "met"` keeps the
+    delivery ratchet protecting the parts the judge held met."""
+    part = row.get("test_outcome_part")
+    if (not isinstance(part, dict) or row.get("by")
+            or part.get("verdict") not in ("unknown", "unmet")):
+        return row
+    return {**row, "verdict": part["verdict"], "by": ["test_id_diff"],
+            "other_parts": "met",
+            "reason": _met_except_reason(
+                [str(p) for p in part.get("parts") or []], part)}
+
+
 def _drop_test_outcome_parts(v: dict) -> dict:
     """A judge verdict without its parts typed `test_outcome` — the failing-
     test-ID diff settles those, not the judge (DESIGN §8). When any was
@@ -49066,8 +49096,9 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
         if tid is None and _test_outcome_parts(it):
             tid = _test_outcome_verdict(
                 st, await _worktree_tree_sha(str(staging)))
+        outcome_parts = _test_outcome_parts(it)
         if (tid is not None and tid["verdict"] == "unknown"
-                and _test_outcome_parts(it)):
+                and outcome_parts):
             unknown_tests.append(it.get("item", ""))
         by: list[str] = []
         evidence: list[str] = []
@@ -49087,6 +49118,13 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
                 f"{s_.get('reason') or ''}".strip())
         row.update(verdict="unmet" if by else "met", by=by,
                    judge=details_by_idx.get(i), falsifier=fi)
+        if outcome_parts and tid is not None and tid["verdict"] != "met":
+            # The judge never voted on these parts (dropped before the
+            # vote): the row carries the diff's verdict for them.
+            row["test_outcome_part"] = {
+                "parts": outcome_parts, "verdict": tid["verdict"],
+                "new": list(tid["new"]), "reason": tid.get("reason") or ""}
+            row = _settle_test_outcome_part(row)
         rows.append(row)
         if by:
             unmet_final.append({"item_index": i, "item": it.get("item", ""),
@@ -49665,7 +49703,9 @@ def _ratchet_prior_met(st: "State") -> dict[int, str]:
     if isinstance(rows, list) and rows:
         for r in rows:
             i = r.get("item_index") if isinstance(r, dict) else None
-            if (r and r.get("verdict") == "met" and isinstance(i, int)
+            if (r and (r.get("verdict") == "met"
+                       or r.get("other_parts") == "met")
+                    and isinstance(i, int)
                     and 0 <= i < len(normalized)):
                 met[i] = str(((r.get("judge") or {}).get("met_evidence"))
                              or "")
@@ -50659,6 +50699,12 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
             r = {**r, "verdict": "unmet" if v["unmet"] else "met",
                  "by": v["by"] if v["unmet"] else [],
                  "redrive_recheck": {"sha": sha}}
+            if isinstance(r.get("test_outcome_part"), dict):
+                # The recheck judged only the other parts: the test-outcome
+                # part's verdict still holds when they are met.
+                r.pop("other_parts", None)
+                r.pop("reason", None)
+                r = _settle_test_outcome_part(r)
         rows.append(r)
     gate.update(unmet_final=unmet, items=rows)
     st.data["delivery_gate"] = gate

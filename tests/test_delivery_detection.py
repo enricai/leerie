@@ -1297,3 +1297,79 @@ def test_an_unsettled_candidate_is_unknown_and_reaches_the_pr(
     assert st.data["delivery_gate"]["items"][0]["verdict"] == "met"
     assert not [e for e in st.data["needs_human_verification"]
                 if e["source"] == "test_outcome"]
+
+
+def test_a_compound_items_unknown_test_part_is_never_read_met(
+        leerie, tmp_path, monkeypatch):
+    """Review round 5 L3: an item with a "no regressions" part beside other
+    parts read `met` in its row while that part was unknown — the gap was
+    written, the row said met. Through `_run_delivery_detection`: the judge
+    holds the other part met, B* left the candidate without a verdict, and
+    the row reads `unknown` with "met except: no regressions, unknown —
+    <why>"; the ratchet still protects the met part; a re-drive recheck
+    that rewrites the row keeps the part's verdict; and once B* settles the
+    part met, the row is plain met."""
+    repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                          judged=False, k=0)
+    part = "no regressions in the existing suite"
+    item = {"item": "Login times out after 30 s, with no regressions in the "
+                    "existing suite",
+            "span": "S9",
+            "parts": ["login times out after 30 s", part],
+            "part_checks": [{"part": part, "check": "test_id_diff",
+                             "verifiability": "execution"}]}
+    st.data["required_items"] = [item]
+    st.data.pop("acceptance")
+    calls = _falsifier_stub(leerie, monkeypatch, st, lambda kw, n: {})
+    tree = asyncio.run(leerie._worktree_tree_sha(
+        str(st.run_dir / "worktrees" / "staging")))
+    cand = "tests/a.test.ts > newly broken"
+    st.data["test_id_diff"] = {"candidates": [cand], "new": [],
+                               "no_verdict": [cand], "tree_sha": tree,
+                               "base_unavailable": True}
+    st.save()
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    assert [c["schema_key"] for c in calls] == ["delivery_judge"]
+    row = st.data["delivery_gate"]["items"][0]
+    assert row["verdict"] == "unknown" and row["by"] == ["test_id_diff"]
+    assert row["reason"].startswith(f"met except: {part}, unknown — ")
+    assert cand in row["reason"] and "base checkout" in row["reason"]
+    assert row["other_parts"] == "met"
+    assert st.data["delivery_gate"]["unmet_final"] == []
+    gap = [e for e in st.data["needs_human_verification"]
+           if e["source"] == "test_outcome"]
+    assert len(gap) == 1 and item["item"] in gap[0]["detail"]
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    # Its met part is still protected by the delivery ratchet.
+    assert 0 in leerie._ratchet_prior_met(st)
+    # A re-drive recheck that holds the other part met keeps the part's
+    # verdict instead of writing a plain met over it.
+    leerie._redrive_apply_item_verdicts(
+        st, {0: {"unmet": False, "by": [], "evidence": ""}}, head)
+    row = st.data["delivery_gate"]["items"][0]
+    assert row["verdict"] == "unknown"
+    assert row["reason"].startswith(f"met except: {part}, unknown")
+    # B* confirming a new failure: the row is unmet, still not a re-drive
+    # note (the run is unconverged on the diff itself).
+    st.data["test_id_diff"] = {"candidates": [cand], "new": [cand],
+                               "tree_sha": tree}
+    st.data.pop("delivery_gate")
+    st.save()
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    row = st.data["delivery_gate"]["items"][0]
+    assert row["verdict"] == "unmet" and row["by"] == ["test_id_diff"]
+    assert row["reason"] == (f"met except: {part}, unmet — new failing "
+                             f"test(s) confirmed against the base: {cand}")
+    assert st.data["delivery_gate"]["unmet_final"] == []
+    # Settled met: the row is plain met, with no part record.
+    st.data["test_id_diff"] = {"candidates": [], "new": [],
+                               "tree_sha": tree}
+    st.data.pop("delivery_gate")
+    st.save()
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    row = st.data["delivery_gate"]["items"][0]
+    assert row["verdict"] == "met" and "test_outcome_part" not in row
+    assert "reason" not in row

@@ -6841,7 +6841,16 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `_run_delivery_detection`'s row for a `_test_id_diff_item` is
   `{verdict: met | unmet | unknown, by: ["test_id_diff"], new[]}`, never
   in `unmet_final` and never falsified; an `unknown` row also carries
-  `reason`. `_set_test_outcome_gap(st, items, reason="")` keeps at most
+  `reason`. A row for any other item with `_test_outcome_parts`, when
+  the test-outcome verdict is not `met`, carries `test_outcome_part:
+  {parts, verdict, new[], reason}`; when nothing else made it unmet
+  (`by` empty) it is settled by `_settle_test_outcome_part(row)`:
+  `verdict` becomes the part's (`unknown` / `unmet`), `by:
+  ["test_id_diff"]`, `other_parts: "met"`, `reason: "met except: <parts>,
+  <verdict> — <why>"` (`_met_except_reason`), and it is still never added
+  to `unmet_final`. `_redrive_apply_item_verdicts`' row rewrite reapplies
+  `_settle_test_outcome_part` to a rechecked-met row, and
+  `_ratchet_prior_met` counts a row with `other_parts: "met"` as met. `_set_test_outcome_gap(st, items, reason="")` keeps at most
   one `needs_human_verification` entry `{source: "test_outcome", detail}`
   naming the items whose verdict is `unknown` and the verdict's `reason`
   (cleared when none is); `_decide_outcome` does not read it (a

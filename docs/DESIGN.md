@@ -6506,7 +6506,15 @@ the right reason in 2 of 34 samples. So the gate judges in packs
   mixed item the judge types such a part `kind: test_outcome` (the
   payload names the classifier's `part_checks` for it), and code drops
   that part from the verdict before it is checked or voted: the item is
-  met or unmet on its other parts. In a replayed run (barnacle 45fa4253,
+  met or unmet on its other parts. Its row still carries the diff's verdict
+  for that part. When the other parts are met and the diff did not say
+  met, the row reads the diff's verdict — `unknown`, its reason
+  `met except: <part>, unknown — <why>`, or `unmet` when B\* confirmed
+  new failures — never `met` over a part B\* did not settle (review round
+  5 L3: a compound item read `met` while its "no regressions" part was
+  unknown, though the gap was written). The row also says its other parts
+  were met, so the delivery ratchet keeps protecting them, and like a pure
+  test-outcome item it never reaches `unmet_final`. In a replayed run (barnacle 45fa4253,
   pass 1) the judges held an item unmet on its "no regressions: the
   final-tree full test run must not show new failures" part, read from a
   record that said only "red", and the delivery re-drive spent its whole
