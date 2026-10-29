@@ -7107,10 +7107,7 @@ base there and then, instead of being thrown away. The places HEAD can move afte
 diff is measured are the final conformance's own commits and rollbacks
 (each round re-measures, and a round that broke is covered by the pre
 measurement or the refresh), the acceptance gate's repair rounds and
-rollbacks, and the re-drive's groups, rollbacks and leftover commits (which
-take the group's tracked edits and only the untracked files that appeared
-while it ran — never a measurement's artifact from before it, which would
-otherwise ship in the PR); the
+rollbacks, and the re-drive's groups, rollbacks and leftover commits; the
 delivery recheck and detection are read-only on staging (the falsifier works
 in its own checkouts), CI parity runs in its own worktree, and finalize
 only verifies the branch.
@@ -7124,6 +7121,26 @@ escalated before): 9 of the 10 fair sets closed (no escalation is
 recorded for the tenth); of the 10 broken sets, 3 were stopped by gates
 (b), (c) and (d), 3 did not close, and 4 closed, each hand-reviewed in the
 bench.
+
+**A re-drive group's leftovers are its implementer's, and only those.**
+The implementer is told to commit its work, and what it leaves
+uncommitted is committed for it — but only what it left. A tracked file
+counts when its content changed while the group ran: its bytes are
+snapshotted (path → blob) just before the implementer starts and compared
+just after, so an edit that predates the group — a command's churn, a
+final conformer's uncommitted edit — is never taken, and a group that
+changed nothing moves no HEAD and reads `no_change`. An untracked file
+counts only when the implementer's own Write/Edit tool calls, read from
+its per-worker log, name it — whether or not it existed before the group,
+so a file it finished from one the final conformer left untracked ships
+too. Review round 9 drove both earlier rules into the PR: `git add -u`
+shipped a lockfile an install had rewritten before the group, and "every
+untracked file that appeared while it ran" shipped the `.pyc` of the test
+the implementer had just written and run, because a new `.pyc` is a new
+path. A file name cannot tell an artifact from a source file; the
+implementer's tool calls can. A file it made only through a shell command
+(`mv`, a generator) is not taken, which is the same contract as for its
+own commits: what it made it commits.
 
 **A finished verdict is reused only on the commit it was measured on.** A
 resume skips a finalize-side gate that already finished, but "finished"

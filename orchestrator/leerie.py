@@ -52269,27 +52269,61 @@ def _redrive_key_text(key: str) -> str:
     return f"existing test `{key}`"
 
 
+_WRITE_TOOL_KINDS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+def _worker_written_paths(log_path: Path, tree: str | Path) -> set[str]:
+    """`tree`-relative paths of every file a worker's Write/Edit/MultiEdit/
+    NotebookEdit tool calls named, read from its per-worker log's
+    `tool_use` records (`_iter_log_tool_use` — mechanical input fields,
+    never its prose). A path outside `tree` is dropped; no log, no paths."""
+    root = os.path.realpath(str(tree))
+    out: set[str] = set()
+    for _kind, inp, _res in _iter_log_tool_use(log_path,
+                                               kinds=_WRITE_TOOL_KINDS):
+        fp = str(inp.get("file_path") or inp.get("notebook_path") or "")
+        if not fp:
+            continue
+        full = os.path.realpath(fp if os.path.isabs(fp)
+                                else os.path.join(root, fp))
+        if full.startswith(root + os.sep):
+            out.add(os.path.relpath(full, root))
+    return out
+
+
 async def _redrive_commit_leftovers(staging: Path, label: str,
-                                    untracked_before: set[str] | None
-                                    ) -> None:
-    """Commit what a re-drive group's implementer left uncommitted: its
-    tracked edits and the untracked files that appeared while it ran. An
-    untracked file already there before it — a test run's own artifact,
-    left by the re-drive's measurements in a repository that does not
-    ignore it — is not the group's work and must not ship. When git could
-    not list the files before, no untracked file is taken."""
-    now = _untracked_files(staging) or set()
-    new = sorted(now - untracked_before) if untracked_before is not None \
-        else []
-    await run_proc(["git", "add", "-u"], cwd=str(staging))
-    if new:
-        await run_proc(["git", "add", "--", *new], cwd=str(staging))
+                                    tracked_before: dict[str, str | None]
+                                    | None,
+                                    written: set[str]) -> list[str]:
+    """Commit what a re-drive group's implementer left uncommitted, and
+    nothing else (DESIGN §8 *Delivery re-drive*): the tracked files whose
+    content changed while the group ran (`_changed_paths` between
+    `tracked_before`, the `_tracked_content` snapshot taken just before the
+    implementer started, and now) and the untracked, not-ignored files the
+    implementer itself wrote (`written`, from its Write/Edit tool calls —
+    `_worker_written_paths`), whether or not they existed before the group.
+    A tracked edit that predates the group, and any file only a command
+    produced — a `.pyc`, a coverage page, a report — is never taken: a file
+    name cannot tell an artifact from a source file, the implementer's own
+    tool calls can. Returns the paths committed ([] when nothing was, so
+    HEAD does not move and the group reads `no_change`). With no snapshot
+    (git failed), no tracked file is taken."""
+    now = await asyncio.to_thread(_tracked_content, staging)
+    tracked = (_changed_paths(tracked_before, now)
+               if tracked_before is not None and now is not None else [])
+    untracked = sorted((_untracked_files(staging) or set()) & set(written))
+    paths = sorted(set(tracked) | set(untracked))
+    if not paths:
+        return []
+    await run_proc(["git", "add", "-A", "--", *paths], cwd=str(staging))
     staged = await run_proc(["git", "diff", "--cached", "--quiet"],
                             cwd=str(staging))
-    if staged.returncode == 1:
-        await run_proc(["git", "commit", "-q", "--no-verify", "-m",
-                        f"leerie: delivery re-drive leftovers ({label})"],
-                       cwd=str(staging))
+    if staged.returncode != 1:
+        return []
+    await run_proc(["git", "commit", "-q", "--no-verify", "-m",
+                    f"leerie: delivery re-drive leftovers ({label})"],
+                   cwd=str(staging))
+    return paths
 
 
 async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
@@ -52583,15 +52617,21 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 selfcheck_cmd=cmd)
             effort = (EFFORT_REDRIVE_ESCALATION if escalate
                       else efforts.get("implementer"))
-            untracked_before = _untracked_files(staging)
+            tracked_before = await asyncio.to_thread(_tracked_content,
+                                                     staging)
             try:
                 ge["implementer"] = await _redrive_drive(
                     leerie_dir, st, caps, models, staging, members, note,
                     effort=effort, label=f"delivery-redrive-r{rnd}-g{gi}")
             finally:
                 ge["tampered"] = _redrive_unstage(staging, staged)
-            await _redrive_commit_leftovers(staging, f"r{rnd} g{gi}",
-                                            untracked_before)
+            left = await _redrive_commit_leftovers(
+                staging, f"r{rnd} g{gi}", tracked_before,
+                _worker_written_paths(
+                    st.run_dir / "logs"
+                    / f"delivery-redrive-r{rnd}-g{gi}.log", staging))
+            if left:
+                ge["leftovers"] = left[:20]
             drove = True
             prior_members += [m for m in members if m not in prior_members]
             routed_items |= {n["item_index"] for n in live

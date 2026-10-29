@@ -6332,11 +6332,23 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     <first 5 paths>[ (+<N-5> more)]"`. Only a worker's edits reach it:
     leerie's own commands put back what they rewrite
     (`_leaves_tracked_files`, below).
-  - `_redrive_commit_leftovers(staging, label, untracked_before)` commits a
-    group's leftovers: `git add -u` plus the untracked files
-    (`_untracked_files`) not in `untracked_before`, the set taken just
-    before the group's implementer ran, so an artifact of the re-drive's own
-    earlier measurements is never committed to the branch that ships.
+  - `async _redrive_commit_leftovers(staging, label, tracked_before,
+    written) -> list[str]` commits a group's leftovers (DESIGN §8 *A
+    re-drive group's leftovers are its implementer's, and only those*):
+    the tracked paths `_changed_paths(tracked_before, _tracked_content(
+    staging))` — `tracked_before` is the `_tracked_content` snapshot taken
+    just before the group's implementer ran (None: no tracked path) — plus
+    the `_untracked_files` that are in `written`, with `git add -A -- <paths>`
+    and one `leerie: delivery re-drive leftovers (<label>)` commit; returns
+    the paths ([] and no commit when nothing staged, so HEAD stays and the
+    group reads `no_change`). The caller passes `written =
+    _worker_written_paths(<run>/logs/delivery-redrive-r<round>-g<group>.log,
+    staging)` and records a non-empty result as the group's `leftovers`
+    (first 20). `_worker_written_paths(log_path, tree) -> set[str]`: the
+    `tree`-relative paths of every `Write`/`Edit`/`MultiEdit`/`NotebookEdit`
+    (`_WRITE_TOOL_KINDS`) `tool_use` in the log (`file_path`, or
+    `notebook_path`; relative ones resolved against `tree`), realpaths
+    outside `tree` dropped; empty with no log.
   - `async _refresh_shipping_test_id_diff(leerie_dir, st, caps, *, label)`
     — on `worktrees/staging` (nothing when absent): `_refresh_test_id_diff`
     with `log_prefix="phase 5"`, then `_resettle_test_outcome_rows(st,
