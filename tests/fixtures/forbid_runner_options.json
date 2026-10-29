@@ -3798,5 +3798,314 @@
     "ran": "c"
    }
   ]
+ },
+ "pnpm filters": {
+  "_how": "Round-5 review L2. Real pnpm 11.21 through real bash: `ws` is a workspace (root package `root`, packages/a `@s/a`, packages/b `@s/b`), `single` a one-package repo named `solo`; every package's `test` echoes a marker, the root's as `root`. `ran` lists whose `test` ran. A whole-suite `pnpm test` forbid names the root's `test` script.",
+  "rows": [
+   {
+    "repo": "ws",
+    "cmd": "pnpm test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter @s/a test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm -F @s/a test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter=@s/a test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter-prod @s/a test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '@s/*' test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter './packages/**' test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '{packages/a}' test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '...@s/a' test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '*' test",
+    "ran": [
+     "a",
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '**' test",
+    "ran": [
+     "a",
+     "b",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter . test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter root test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter 'ro*' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter '!@s/a' test",
+    "ran": [
+     "b"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm -r test",
+    "ran": [
+     "a",
+     "b"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm -r --filter @s/a test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter @s/a --filter root test",
+    "ran": [
+     "a",
+     "root"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter @s/a run test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm run --filter @s/a test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter @s/a recursive run test",
+    "ran": [
+     "a"
+    ]
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter nomatch test",
+    "ran": []
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter solo test",
+    "ran": []
+   },
+   {
+    "repo": "ws",
+    "cmd": "pnpm --filter other test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter @s/a test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm -F @s/a test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter=@s/a test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter-prod @s/a test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '@s/*' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter './packages/**' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '{packages/a}' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '...@s/a' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '*' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '**' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter . test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter root test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter 'ro*' test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter '!@s/a' test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm -r test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm -r --filter @s/a test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter @s/a --filter root test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter @s/a run test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm run --filter @s/a test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter @s/a recursive run test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter nomatch test",
+    "ran": []
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter solo test",
+    "ran": [
+     "root"
+    ]
+   },
+   {
+    "repo": "single",
+    "cmd": "pnpm --filter other test",
+    "ran": []
+   }
+  ]
  }
 }

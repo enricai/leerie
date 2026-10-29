@@ -9386,6 +9386,30 @@ Three layers follow, each derived from that one list:
   forbidden `vitest run --project unit` it contains. Another selector
   (`--project e2e`) and a run naming files stay allowed.
 
+  *A pnpm filter that names one package of several is scoped.* `pnpm
+  --filter <pkg> test` runs that package's `test` script only. It was
+  refused under a whole-suite `pnpm test` forbid, beside vitest's
+  `--project unit`, which reads as scoped (round-5 review L2). Measured
+  with pnpm 11.21 in a workspace (root, `@s/a`, `@s/b`) and a
+  single-package repo, each `test` echoing a marker: `--filter @s/a`,
+  `-F`, `--filter-prod`, `@s/*`, `./packages/**`, `{packages/a}` and
+  `...@s/a` never ran the root's `test`, the script a forbidden `pnpm
+  test` names; `*`, `**`, `.`, the root's own name and a glob matching it
+  did, and in the single-package repo so did `--filter <its name>`. So a
+  `--filter`/`-F`/`--filter-prod` value is read like a selector: a
+  whole-suite entry that names no filter hits a filtered run only when
+  one of its filters selects the root package — `*`, `**`, `.`, `./`,
+  `{.}`, a name pattern matching the root package's name, or, read
+  conservatively, an exclusion (`!x`) or changed-since (`[ref]`)
+  selector, whose packages the matcher cannot list. The root's name comes
+  from `package.json`: `_process_constraints` records it on the
+  whole-suite entry (`package_name`), since the hook reads no repository.
+  `pnpm -r test` with no filter stays a whole-suite run: measured, it ran
+  every workspace package's `test` but not the root's, and those together
+  are the monorepo's suite. `npm -w`, `yarn workspace` and `bun --filter`
+  are the same shape and are still read as whole-suite runs (refused,
+  never missed).
+
   *A whole-suite forbid matches on the runner alone.* The extractor is told
   to return the repo's test command for a whole-suite forbid, and on every
   Go repo that is `go test ./...`. A prefix match on the whole entry then

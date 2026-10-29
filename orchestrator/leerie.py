@@ -22474,6 +22474,8 @@ _FORBID_INTERP_EVAL: dict[str, frozenset[str]] = {
 _FORBID_STR_LIT = re.compile(
     r"""'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`""")
 _FORBID_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# The token a pnpm `--filter` value travels as beside a run's environment.
+_FORBID_PNPM_FILTER = "pnpm --filter "
 # JS wrappers that set an environment, then run a command (DESIGN §9 *A
 # script's environment is part of what it runs*). Each is parsed as its own
 # CLI parser reads it, measured with the real tool: cross-env 10.1
@@ -22829,6 +22831,10 @@ def _forbidden_normalize(argv: list[str], depth: int,
             return r[i:]
         raw = a[1:]
         rest = _opts(raw)
+        if a[0] == "pnpm":
+            # Which packages the script runs in (DESIGN §9 *A pnpm filter
+            # that names one package of several is scoped*).
+            fenv = fenv | _forbidden_pnpm_filters(raw, vals)
         script_only = any(w.split("=", 1)[0] in _FORBID_PNPM_SCRIPT_ONLY_OPTS
                           for w in raw[:len(raw) - len(rest)])
         while rest:
@@ -22863,6 +22869,8 @@ def _forbidden_normalize(argv: list[str], depth: int,
                     r if ended else _forbidden_pm_passthrough(a[0], r),
                     depth + 1, keep_xargs, fenv)
             if sub in ("run", "run-script"):
+                if a[0] == "pnpm":
+                    fenv = fenv | _forbidden_pnpm_filters(a[2:], vals)
                 a = [a[0], "run"] + _opts(a[2:])
             elif sub in _FORBID_PM_SCRIPT_ALIASES:
                 a = [a[0], "run", _FORBID_PM_SCRIPT_ALIASES[sub]] + a[2:]
@@ -22884,6 +22892,49 @@ def _forbidden_normalize(argv: list[str], depth: int,
                     _forbidden_pm_passthrough(a[0], a[1:]), depth + 1,
                     keep_xargs, fenv)
     return [(a, fenv)]
+
+
+def _forbidden_pnpm_filters(words: list[str],
+                            vals: frozenset[str]) -> frozenset[str]:
+    """`pnpm --filter <value>` tokens for each `--filter`/`-F`/
+    `--filter-prod` among the leading options of `words` (`=` spellings
+    included)."""
+    out: set[str] = set()
+    i = 0
+    while i < len(words) and words[i].startswith("-"):
+        name, eq, val = words[i].partition("=")
+        if name in ("--filter", "-F", "--filter-prod"):
+            if not eq:
+                val = words[i + 1] if i + 1 < len(words) else ""
+            if val:
+                out.add(_FORBID_PNPM_FILTER + val)
+        i += 2 if words[i] in vals else 1
+    return frozenset(out)
+
+
+def _forbidden_filter_scoped(env: frozenset[str],
+                             package_name: str | None) -> bool:
+    """True when `env` carries pnpm filters and none selects the root
+    package — `*`, `**`, `.`, `./`, `{.}`, a name pattern matching
+    `package_name`, or (conservatively) an exclusion `!x` or a
+    changed-since `[ref]` selector. Measured with pnpm 11.21 (DESIGN §9 *A
+    pnpm filter that names one package of several is scoped*)."""
+    vals = [t[len(_FORBID_PNPM_FILTER):] for t in env
+            if t.startswith(_FORBID_PNPM_FILTER)]
+    if not vals:
+        return False
+    for v in vals:
+        if v.startswith("!") or "[" in v:
+            return False
+        sel = v.removeprefix("...").removeprefix("^")
+        sel = sel.removesuffix("...").removesuffix("^")
+        if sel.startswith("{") and sel.endswith("}"):
+            sel = sel[1:-1]
+        if sel in ("*", "**") or _forbidden_operand(sel) == ".":
+            return False
+        if package_name and fnmatch.fnmatchcase(package_name, sel):
+            return False
+    return True
 
 
 def _forbidden_package_word(word: str) -> str:
@@ -23518,6 +23569,8 @@ def _forbidden_command_hit(command: str,
             if spec is None:
                 continue
             cmd, scope, roots = spec
+            pkg = f.get("package_name") if isinstance(f, dict) else None
+            pkg = pkg if isinstance(pkg, str) else None
             for forb, fenv in _forbidden_argvs_env(cmd):
                 forb = _forbidden_runner_canon(forb)
                 heads = ([_forbidden_suite_head(forb)]
@@ -23531,6 +23584,13 @@ def _forbidden_command_hit(command: str,
                     heads.append((list(key), []))
                 for c, cenv in cands:
                     if not fenv <= cenv:
+                        continue
+                    # Filters only add packages to an entry that names
+                    # its own; against one that names none, a filter that
+                    # misses the root package is a scoped run.
+                    if scope == "whole_suite" and not any(
+                            t.startswith(_FORBID_PNPM_FILTER) for t in fenv
+                    ) and _forbidden_filter_scoped(cenv, pkg):
                         continue
                     c = _forbidden_runner_canon(c)
                     for head, ops in heads:
@@ -23596,6 +23656,8 @@ def _process_constraints(result: dict, prescribed: dict | None,
         roots = _test_roots(repo_root) if repo_root is not None else []
     except Exception:
         roots = []
+    pkg_name = (_package_json_name(Path(repo_root))
+                if repo_root is not None else None)
     entries: list[dict] = []
     dropped: list[dict] = []
     for e in pc.get("forbidden_commands") or []:
@@ -23625,6 +23687,8 @@ def _process_constraints(result: dict, prescribed: dict | None,
         entry = {"command": c, "scope": scope, "evidence_quote": quote}
         if scope == "whole_suite":
             entry["test_roots"] = list(roots)
+            if pkg_name:
+                entry["package_name"] = pkg_name
         entries.append(entry)
     originals = [x["command"] for x in entries]
     if repo_root is not None:
@@ -23683,11 +23747,14 @@ def _forbidden_env_render(argv: list[str], env: frozenset[str]) -> str:
     assigns: list[str] = []
     files: list[str] = []
     rcs: list[str] = []
+    filters: list[str] = []
     for t in sorted(env):
         if t.startswith("envfile:"):
             files += ["-e", t[len("envfile:"):]]
         elif t.startswith("env-cmd -e "):
             rcs.append(t[len("env-cmd -e "):])
+        elif t.startswith(_FORBID_PNPM_FILTER):
+            filters += ["--filter", t[len(_FORBID_PNPM_FILTER):]]
         elif t == "-i" or t.startswith(("-u ", "-C ")):
             opts += t.split(" ", 1)
         else:
@@ -23695,6 +23762,7 @@ def _forbidden_env_render(argv: list[str], env: frozenset[str]) -> str:
     words = ((["env", *opts] if opts else []) + assigns
              + (["dotenv", *files, "--"] if files else [])
              + (["env-cmd", "-e", ",".join(rcs), "--"] if rcs else [])
+             + (["pnpm", *filters, "exec"] if filters else [])
              + list(argv))
     return shlex.join(words)
 
@@ -23734,8 +23802,10 @@ def _forbidden_script_derived(entries: list[dict],
                      "evidence_quote": src["evidence_quote"],
                      "derived_from": src.get("derived_from",
                                              src["command"])}
-                if "test_roots" in src:
-                    d["test_roots"] = list(src["test_roots"])
+                for k in ("test_roots", "package_name"):
+                    if k in src:
+                        d[k] = (list(src[k]) if isinstance(src[k], list)
+                                else src[k])
                 out.append(d)
 
         # Every runner run of every script, to tell whether a body's
@@ -24014,7 +24084,8 @@ def _forbidden_command_hook_settings(forbidden: list[str | dict],
     # Only what the matcher reads travels: a string, or a scoped entry's
     # command, scope and test roots (never its evidence quote).
     entries = [f if isinstance(f, str) else
-               {k: f[k] for k in ("command", "scope", "test_roots") if k in f}
+               {k: f[k] for k in ("command", "scope", "test_roots",
+                                  "package_name") if k in f}
                for f in forbidden if _forbidden_spec(f) is not None]
     payload = base64.b64encode(json.dumps(
         {"forbidden": entries, "kills": bool(deny_kills)}
@@ -36262,6 +36333,17 @@ def _pm_script_candidates(cmd: str) -> list[str]:
                 if re.fullmatch(r"[A-Za-z0-9:_.-]+", tok):
                     out.append(tok)
     return out
+
+
+def _package_json_name(repo_root: Path) -> str | None:
+    """The repo's `package.json` `name`, or None when absent or not a
+    non-empty string."""
+    try:
+        data = json.loads((repo_root / "package.json").read_text())
+    except (OSError, ValueError):
+        return None
+    name = data.get("name") if isinstance(data, dict) else None
+    return name if isinstance(name, str) and name.strip() else None
 
 
 def _package_json_scripts(repo_root: Path) -> dict[str, str]:
