@@ -53109,13 +53109,14 @@ def _leftover_artifact(staging: Path, rel: str) -> bool:
 def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
     """The "Needs human verification" entry for what kept re-drive groups
     left uncommitted that the leftovers commit withheld (`leftovers_withheld`
-    of every group not rolled back): artifact-shaped files, a whole
-    over-cap set, and the files removed for holding a span of a staged
-    set's source, by path. Cleared when there is none."""
+    of every group not rolled back): a whole over-cap set and the files
+    removed for holding a span of a staged set's source, by path. An
+    artifact shape (`_leftover_artifact`) is never listed — no reviewer has
+    anything to decide about a `.pyc` (review round 12 M1); the leftovers
+    commit logs it. Cleared when there is none."""
     data = getattr(st, "data", None)
     if not isinstance(data, dict):
         return
-    shapes: list[str] = []
     over: list[str] = []
     copies: list[str] = []
     for r in rec.get("rounds") or []:
@@ -53123,7 +53124,6 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
             w = g.get("leftovers_withheld") if isinstance(g, dict) else None
             if not isinstance(w, dict) or g.get("rolled_back"):
                 continue
-            shapes += [p for p in w.get("artifacts") or [] if p not in shapes]
             over += [p for p in w.get("over_cap") or [] if p not in over]
             copies += [p for p in w.get("heldout") or [] if p not in copies]
     entries = [e for e in (data.get("needs_human_verification") or [])
@@ -53137,8 +53137,6 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
     if over:
         parts.append(f"over the leftovers cap, nothing committed: "
                      f"{shown(over)}")
-    if shapes:
-        parts.append(f"artifact-shaped, not committed: {shown(shapes)}")
     if copies:
         parts.append("removed for holding lines of a hidden test's source "
                      f"(a tracked one put back as HEAD has it): "

@@ -9,7 +9,8 @@ file. The leftovers commit took 505 files. Now leerie's artifacts stay
 leerie's when the implementer's run rewrites them (first producer), an
 artifact-shaped name is withheld, and past `redrive_leftovers_max_files`
 or `redrive_leftovers_max_bytes` nothing is committed — every withheld
-path is listed in the PR, never dropped unseen."""
+file that could be a source file is listed in the PR, never dropped unseen.
+Review round 12 M1: an artifact shape is logged only, never listed."""
 from __future__ import annotations
 
 import asyncio
@@ -145,11 +146,13 @@ def test_the_defaults_are_real_caps(leerie):
     assert leerie.DEFAULT_CAPS["redrive_leftovers_max_bytes"] == 5 << 20
 
 
-def test_a_kept_groups_withheld_files_reach_the_pr(leerie, tmp_path,
-                                                   monkeypatch):
+def test_a_kept_groups_artifacts_are_withheld_but_not_listed(
+        leerie, tmp_path, monkeypatch):
     """End to end: the implementer fixes the defect, leaves its new helper
     and an editor swap file uncommitted. The helper ships; the swap file is
-    listed under "Needs human verification" by path."""
+    withheld and recorded on the group, and the PR has nothing to say about
+    it (review round 12 M1 — round 11 listed it under "Needs human
+    verification")."""
     w = World(leerie, tmp_path)
     w.install(monkeypatch)
 
@@ -163,10 +166,42 @@ def test_a_kept_groups_withheld_files_reach_the_pr(leerie, tmp_path,
     assert not ge.get("rolled_back")
     assert ge["leftovers"] == ["src/helper.ts"]
     assert ge["leftovers_withheld"] == {"artifacts": ["src/.a.ts.swp"]}
-    nhv = [e for e in w.st.data.get("needs_human_verification") or []
-           if e.get("source") == "redrive_leftovers"]
-    assert len(nhv) == 1 and "src/.a.ts.swp" in nhv[0]["detail"]
-    assert "src/.a.ts.swp" in leerie._format_pr_end_state_section(w.st.data)
+    assert not [e for e in w.st.data.get("needs_human_verification") or []
+                if e.get("source") == "redrive_leftovers"]
+    assert leerie._format_pr_end_state_section(w.st.data) == ""
+
+
+def test_a_clean_pytest_redrive_lists_no_bytecode(leerie, tmp_path,
+                                                  monkeypatch):
+    """The round-12 reviewer's driver (`test_zz_r12_pyc_noise.py`, which
+    asserted the entry on b40117f): a repository that does not ignore
+    `__pycache__/`, an implementer that adds a module and its test, runs
+    pytest on them and commits only its sources. A fully clean group."""
+    import subprocess
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    w = World(leerie, tmp_path)
+    w.install(monkeypatch)
+
+    def fix(w):
+        s = w.staging
+        (s / "helper.py").write_text("def h():\n    return 1\n")
+        (s / "test_helper.py").write_text(
+            "from helper import h\n\ndef test_h():\n    assert h() == 1\n")
+        subprocess.run([sys.executable, "-m", "pytest", "-q", "-p",
+                        "no:cacheprovider", "test_helper.py"], cwd=s,
+                       capture_output=True)
+        (s / "src" / "a.ts").write_text("export const a = 1; // FIXED\n")
+        _git(s, "add", "helper.py", "test_helper.py", "src/a.ts")
+        _git(s, "commit", "-qm", "fix")
+    w.edits = [fix]
+    w.run()
+    g = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
+    assert not g.get("rolled_back") and "FIXED" in w.a_text("HEAD")
+    assert any(p.endswith(".pyc")
+               for p in g["leftovers_withheld"]["artifacts"])
+    assert not any(".pyc" in (e.get("detail") or "") for e in
+                   w.st.data.get("needs_human_verification") or [])
+    assert leerie._format_pr_end_state_section(w.st.data) == ""
 
 
 def test_a_rolled_back_groups_withheld_files_are_not_listed(leerie):
@@ -187,6 +222,11 @@ def test_a_rolled_back_groups_withheld_files_are_not_listed(leerie):
     assert entries[0] == {"source": "other", "detail": "kept"}
     assert "a.ts, b.ts" in entries[1]["detail"]
     assert "x.swp" not in entries[1]["detail"]
+    # A kept group's artifact shape is never listed on its own.
+    leerie._set_redrive_leftovers_gap(st, {"rounds": [{"groups": [
+        {"leftovers_withheld": {"artifacts": ["y.pyc"]}}]}]})
+    assert st.data["needs_human_verification"] == [
+        {"source": "other", "detail": "kept"}]
     leerie._set_redrive_leftovers_gap(st, {"rounds": []})
     assert st.data["needs_human_verification"] == [
         {"source": "other", "detail": "kept"}]

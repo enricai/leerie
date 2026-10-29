@@ -7259,7 +7259,10 @@ recorded for the tenth); of the 10 broken sets, 3 were stopped by gates
 bench.
 
 **A re-drive group's leftovers are its implementer's.**
-The implementer is told to commit its work, and what it leaves
+The invariant: *every file the group's implementer changed either ships or
+is listed for the reviewer, and nothing that is not a source file — what
+leerie's own commands made, a tool's by-product — ships or is listed as
+if it were one.* The implementer is told to commit its work, and what it leaves
 uncommitted is committed for it — but only what the group changed. A
 tracked file counts when its content changed while the group ran: its
 bytes are snapshotted (path → blob) just before the implementer starts
@@ -7292,10 +7295,11 @@ ignores neither its dependency tree nor its reports, an implementer that
 ran `npm i` and its tests and left an editor swap file got a leftovers
 commit of 505 files — 500 under `node_modules/`, a coverage report, a
 junit file, a `.coverage` database, a 2 MB core dump and `a.ts.swp`.
-Three guards bound it, and none of them drops a file silently: whatever
-is withheld is listed, by path, in a "Needs human verification" entry of
-the kept groups (`redrive_leftovers`), for the reviewer to commit what
-belongs in the change.
+Three guards bound it, and none of them drops a source file silently:
+a file the cap withholds is listed, by path, in a "Needs human
+verification" entry of the kept groups (`redrive_leftovers`), for the
+reviewer to commit what belongs in the change; an artifact shape is
+logged only, since there is nothing for a reviewer to decide about it.
 
 - *First producer.* An untracked file whose first producer was one of
   leerie's own commands stays leerie's when the implementer's re-run of a
@@ -7312,8 +7316,12 @@ belongs in the change.
   is deliberately not wider — coverage, reports and build output are
   committed by some repositories on purpose, so they are left to the first
   rule and the cap. A `.pyc` used to be committed in a repository that does
-  not ignore `__pycache__/`, as its own `git add -A` would; it is listed
-  instead, since the PR is not the place to start tracking it.
+  not ignore `__pycache__/`, as its own `git add -A` would; it is withheld
+  instead, since the PR is not the place to start tracking it, and it is
+  logged rather than listed: review round 12 M1 drove a fully clean
+  pytest re-drive whose PR gained a "Files a re-drive left uncommitted"
+  entry naming the implementer's own `helper.cpython-*.pyc` — noise, by
+  this bullet's own reasoning that no repository wants such a file.
 - *A cap.* When what is left to commit is more than
   `redrive_leftovers_max_files` files or `redrive_leftovers_max_bytes`
   bytes, nothing is committed: no implementer's change is that large by
@@ -7323,8 +7331,8 @@ belongs in the change.
 
 Leerie still cannot tell a generated file from a hand-made one in general,
 and dropping a real file breaks what ships; so outside those three guards
-a new untracked file is committed, and inside them it is listed, never
-dropped unseen.
+a new untracked file is committed, and inside them a file that could be a
+source file is listed, never dropped unseen.
 
 **No line of a staged set's source reaches history.** The invariant this
 barrier serves is exactly one: *the held-out test's source never reaches
