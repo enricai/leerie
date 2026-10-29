@@ -533,39 +533,99 @@ def test_a_workers_edit_of_a_generated_file_is_not_leeries(leerie,
     assert asyncio.run(leerie._measured_tree_sha(str(t))) == head_tree
 
 
-def test_a_rerun_report_rewritten_by_the_groups_measurement_is_not_listed(
-        leerie, tmp_path, monkeypatch):
-    """End to end: leerie's install generated `gen.py` and its test run
-    `junit.xml` in staging; the re-drive implementer re-runs the tests
-    (rewriting `junit.xml`), edits `gen.py` and fixes the defect. The
-    group's own measurement — a leerie command — writes `junit.xml` again,
-    so only `gen.py` is listed, and the round-11 M2 case (a worker's re-run
-    of the tests) stays silent."""
+REPORTER = ("def pytest_sessionfinish(session):\n"
+            "    open('junit.xml', 'w').write('<run/>')\n")
+
+
+@pytest.mark.parametrize("leerie_ran_in_staging", [True, False])
+def test_a_report_the_implementers_test_run_wrote_is_not_listed(
+        leerie, tmp_path, monkeypatch, leerie_ran_in_staging):
+    """Review round 14, end to end through the real measurement path: the
+    repository's test run writes an unignored `junit.xml` (a session hook)
+    and leerie's install generates `gen.py`. The re-drive implementer runs
+    the tests (writing `junit.xml`), edits `gen.py` and fixes the defect.
+    Staging then holds untracked files, so the group's own measurements
+    (`_redrive_test_ids`, `_ratchet_exec`) run in a checkout of the commit
+    and never touch staging's `junit.xml` — round 12 M2's group-end re-read
+    no longer rescues it. What leerie's test run wrote in that checkout
+    marks it a test output, so only `gen.py` is listed and `junit.xml` is
+    neither listed nor committed — whether leerie's own test run had
+    written it in staging first (round 11 M2's shape) or only in the
+    checkout. Nothing is stubbed between the test command and the leftovers
+    commit."""
     from test_delivery_redrive import World
+    real_ids = leerie._redrive_test_ids
     w = World(leerie, tmp_path)
     w.install(monkeypatch)
-    s = w.staging
-
-    async def leerie_cmd(body: str) -> None:
-        async with leerie._leaves_tracked_files(s, "test run", "t"):
-            subprocess.run(["sh", "-c", body], cwd=s, check=True)
-    asyncio.run(leerie_cmd("echo 'V = 1' > gen.py; echo '<a/>' > junit.xml"))
-
-    async def ids(*a, **k):
-        await leerie_cmd("echo '<measured/>' > junit.xml")
-        return None
-    monkeypatch.setattr(leerie, "_redrive_test_ids", ids)
+    monkeypatch.setattr(leerie, "_redrive_test_ids", real_ids)
+    s, st = w.staging, w.st
+    (s / "tsuite").mkdir()
+    (s / "tsuite" / "test_ok.py").write_text("def test_ok():\n    pass\n")
+    (s / "conftest.py").write_text(REPORTER)
+    _git(s, "add", "-A")
+    _git(s, "commit", "-qm", "suite")
+    cmd = "python3 -m pytest -q -p no:cacheprovider tsuite"
+    monkeypatch.setattr(leerie, "resolve_blt", lambda root: {"test": cmd})
+    st.data["provision"] = {"recipe": [{
+        "kind": "install", "command": ["sh", "-c", "echo 'V = 1' > gen.py"]}]}
+    st.save()
+    log_path = tmp_path / "m.log"
+    assert asyncio.run(leerie._ensure_worktree_deps(
+        str(s), st, w.caps, log_path=log_path, verbosity="quiet"))
+    if leerie_ran_in_staging:
+        assert asyncio.run(leerie._ratchet_test_ids(
+            st, w.caps, str(s), label="final", log_path=log_path)) is not None
+        assert (s / "junit.xml").is_file()
+    else:
+        assert not (s / "junit.xml").exists()
 
     def fix(w):
-        (s / "junit.xml").write_text("<worker/>")
+        subprocess.run(cmd.split(), cwd=s, check=True, capture_output=True)
         (s / "gen.py").write_text("V = 2  # the fix\n")
         w.write("export const a = 1; // FIXED\n")
     w.edits = [fix]
     w.run()
-    g = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
+    g = st.data["delivery_redrive"]["rounds"][0]["groups"][0]
     assert not g.get("rolled_back") and "FIXED" in w.a_text("HEAD")
-    assert g["leftovers_withheld"] == {"generated_edited": ["gen.py"]}
-    (e,) = [e for e in w.st.data["needs_human_verification"]
+    assert g["leftovers_withheld"].get("generated_edited") == ["gen.py"]
+    assert "junit.xml" in leerie._leerie_test_outputs(s)
+    assert _git(s, "ls-files", "junit.xml") == ""          # never committed
+    assert (s / "junit.xml").read_text() == "<run/>"       # left as it was
+    (e,) = [e for e in st.data["needs_human_verification"]
             if e.get("source") == "redrive_leftovers"]
     assert "then edited by the implementer" in e["detail"]
     assert "gen.py" in e["detail"] and "junit.xml" not in e["detail"]
+
+
+def test_test_outputs_are_recorded_and_adopted_from_a_checkout(leerie,
+                                                               tmp_path):
+    """The record on its own: a test run's new and rewritten files are test
+    outputs, an install's are not, a path untouched by the run is not, and
+    a checkout's set reaches the tree it was made from."""
+    t = _tree(tmp_path, {"mod.py": "X = 1\n"})
+    (t / "old.txt").write_text("pre-existing")
+
+    async def run(body, *, test_run):
+        async with leerie._leaves_tracked_files(t, "x", "t",
+                                                test_run=test_run):
+            subprocess.run(["sh", "-c", body], cwd=t, check=True)
+    asyncio.run(run("echo 1 > gen.py", test_run=False))
+    asyncio.run(run("echo r > report.xml; echo 2 > gen2.py",
+                    test_run=True))
+    assert leerie._leerie_test_outputs(t) == {"report.xml", "gen2.py"}
+    co = tmp_path / "co"
+    _git(t, "worktree", "add", "-q", "--detach", str(co), "HEAD")
+
+    async def run_co():
+        async with leerie._leaves_tracked_files(co, "x", "t",
+                                                test_run=True):
+            (co / "cov").mkdir()
+            (co / "cov" / "lcov.info").write_text("x")
+    asyncio.run(run_co())
+    leerie._adopt_test_outputs(co, t)
+    assert leerie._leerie_test_outputs(t) == {"report.xml", "gen2.py",
+                                              "cov/lcov.info"}
+    # Unreadable record: empty, never raises.
+    rec = leerie._produced_record_path(t, leerie._TEST_OUTPUTS_RECORD)
+    rec.write_text("{not json")
+    assert leerie._leerie_test_outputs(t) == set()

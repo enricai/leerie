@@ -13,6 +13,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(__file__))
 from stub_helpers import (DELIVERY_CITED_FILE, _delivery_tree,  # noqa: E402
                           _judge_verdict)
@@ -165,3 +167,75 @@ def test_an_ignored_file_is_a_difference_too(leerie, tmp_path, monkeypatch):
         "t", [{"item": "the feature exists"}], staging, st,
         {**leerie.DEFAULT_CAPS}, {}, {}, "final"))
     assert seen == [(str(staging), False)]
+
+
+def test_the_judge_checkout_installs_nothing(leerie, tmp_path, monkeypatch):
+    """Round 14 L2 follow-up: a staging with installed dependencies (ignored
+    files) always takes the checkout, so that checkout must stay a plain
+    `git worktree add --detach` — a judge only reads files. The run has an
+    install recipe that would leave a marker; the judge's checkout runs
+    none of it."""
+    st, staging = _staging(leerie, tmp_path)
+    marker = tmp_path / "installed"
+    st.data["provision"] = {"recipe": [{
+        "kind": "install",
+        "command": ["sh", "-c", f"touch {marker}; mkdir -p node_modules"]}]}
+    called = []
+
+    async def no_install(*a, **k):
+        called.append(a)
+        return True
+    monkeypatch.setattr(leerie, "_ensure_worktree_deps", no_install)
+    seen = []
+
+    async def judge(**kw):
+        seen.append((kw["cwd"], os.path.exists(
+            os.path.join(kw["cwd"], "node_modules"))))
+        return {"verdicts": [_judge_verdict(0, True)]}
+    monkeypatch.setattr(leerie, "claude_p", judge)
+    asyncio.run(leerie._delivery_judge_unmet(
+        "t", [{"item": "the feature exists"}], staging, st,
+        {**leerie.DEFAULT_CAPS}, {}, {}, "final"))
+    ((cwd, saw_deps),) = seen
+    assert cwd != str(staging) and not saw_deps
+    assert called == [] and not marker.exists()
+
+
+def test_a_failed_checkout_is_retried_on_the_next_entry(leerie, tmp_path,
+                                                        monkeypatch):
+    """Round 14: a checkout that could not be made is not remembered. The
+    judges' `_committed_checkout` raises on that entry and makes a fresh
+    checkout on the next; the execution route's `_committed_test_tree`
+    yields None (no measurement) and then a checkout."""
+    st, staging = _staging(leerie, tmp_path)
+    st.data["provision"] = {"recipe": []}
+    real = leerie._worktree_add_detached_async
+    fail = {"n": 1}
+    adds = []
+
+    async def flaky(*a, **k):
+        adds.append(a[1])
+        if fail["n"]:
+            fail["n"] -= 1
+            return subprocess.CompletedProcess([], 128, "", "transient")
+        return await real(*a, **k)
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", flaky)
+
+    async def judge_tree():
+        async with leerie._committed_checkout(st, staging, "j") as cwd:
+            return cwd, os.path.exists(os.path.join(cwd, "helper.py"))
+    with pytest.raises(RuntimeError):
+        asyncio.run(judge_tree())
+    cwd, helper = asyncio.run(judge_tree())
+    assert cwd != staging and not helper and len(adds) == 2
+
+    async def test_tree():
+        async with leerie._committed_test_tree(
+                st, {**leerie.DEFAULT_CAPS}, staging, "t",
+                log_path=tmp_path / "t.log") as tree:
+            return tree, tree is not None and (tree / "helper.py").exists()
+    fail["n"] = 1
+    assert asyncio.run(test_tree()) == (None, False)
+    tree, helper = asyncio.run(test_tree())
+    assert tree is not None and tree != staging and not helper
+    assert len(adds) == 4

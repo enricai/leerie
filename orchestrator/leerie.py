@@ -259,14 +259,6 @@ DEFAULT_CAPS = {
     # the PR entry listing it can be acted on (review round 12 L2: a later
     # rollback erased the files the entry said to commit).
     "redrive_leftovers_save_max_bytes": 64 * 1024 * 1024,
-    # How many worker commands the delivery gate may re-run on the committed
-    # tree in one run to verify a RECORD citation (DESIGN §8 *Execution-
-    # shaped items are judged from the run's own records*). Each is a fresh
-    # checkout, a dependency install and up to `worker_timeout_sec` plus
-    # B* reruns, and its wall time is charged to `redrive_budget_sec`; a
-    # command past either is `unrunnable` and goes to a human (review
-    # round 13 L3: up to 40 cited entries were re-run with no bound).
-    "record_reruns_max": 8,
     # Extra attempts of the final delivery judge after it crashes (a
     # WorkerError or a timeout) before its items are `unknown` and go to a
     # human — never `met` with no read of the commit (review round 13
@@ -886,10 +878,6 @@ STATE_FIELDS = (
     # Settle by execution (DESIGN §8): per-sid record of every execution of
     # a subtask's `verify` argvs, whatever the verdict.
     "settled_by_execution",
-    # A cited worker command re-run on the committed tree (DESIGN §8
-    # *Execution-shaped items are judged from the run's own records*): per
-    # key, the command, the commit and the verdict.
-    "record_reruns",
     # CI parity (DESIGN §9 *The repository's own merge checks run too*): the
     # discovered checks, their baseline and final runs, and the red ones.
     "ci_parity",
@@ -6407,7 +6395,7 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             continue
         if e.get("source") == "required_item" and _pr_entry(e.get("item")):
             add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
-        elif (e.get("source") == RECORD_RERUN_GAP_SOURCE
+        elif (e.get("source") == RECORD_WORKER_GAP_SOURCE
               and _pr_entry(e.get("detail"))):
             add("Task requirements", f"- [ ] {_pr_entry(e.get('detail'))}")
         elif (e.get("source") in (REGRESSION_GAP_SOURCE,
@@ -39060,6 +39048,10 @@ def _restore_tracked_content(tree: str | Path,
 # --git-path`), so it lives and dies with the worktree, survives a resume,
 # and is never itself an untracked file of the tree.
 _PRODUCED_RECORD = "leerie-produced.json"
+# The paths one of leerie's own test commands made or rewrote in a worktree,
+# or in a disposable checkout of its commit (`_adopt_test_outputs`): a JSON
+# list beside `_PRODUCED_RECORD` (DESIGN §6½, review round 14).
+_TEST_OUTPUTS_RECORD = "leerie-test-outputs.json"
 
 
 def _untracked_signatures(tree: str | Path) -> dict[str, list[int]] | None:
@@ -39080,15 +39072,59 @@ def _untracked_signatures(tree: str | Path) -> dict[str, list[int]] | None:
     return out
 
 
-def _produced_record_path(tree: str | Path) -> Path | None:
-    """Where `tree`'s `_PRODUCED_RECORD` lives, or None when git fails."""
+def _produced_record_path(tree: str | Path,
+                          name: str = _PRODUCED_RECORD) -> Path | None:
+    """Where `tree`'s `_PRODUCED_RECORD` (or another record `name`) lives,
+    or None when git fails."""
     r = subprocess.run(["git", "-C", str(tree), "rev-parse", "--git-path",
-                        _PRODUCED_RECORD], capture_output=True, text=True,
+                        name], capture_output=True, text=True,
                        check=False)
     rel = r.stdout.strip()
     if r.returncode != 0 or not rel:
         return None
     return Path(rel) if os.path.isabs(rel) else Path(tree) / rel
+
+
+def _leerie_test_outputs(tree: str | Path) -> set[str]:
+    """The paths a leerie test command made or rewrote in `tree`, or in a
+    checkout of its commit (DESIGN §6½: what a test run writes is output,
+    never part of a change). Empty when there is no record or it cannot be
+    read."""
+    path = _produced_record_path(tree, _TEST_OUTPUTS_RECORD)
+    if path is None:
+        return set()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return set()
+    return ({p for p in data if isinstance(p, str)}
+            if isinstance(data, list) else set())
+
+
+def _note_test_outputs(tree: str | Path, paths: Iterable[str]) -> None:
+    """Add `paths` to `tree`'s test-output record (membership only: a path
+    once written by a test run stays a test output). Never raises."""
+    new = set(paths)
+    rec = _leerie_test_outputs(tree)
+    if not new or new <= rec:
+        return
+    path = _produced_record_path(tree, _TEST_OUTPUTS_RECORD)
+    if path is None:
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    with contextlib.suppress(OSError):
+        tmp.write_text(json.dumps(sorted(rec | new)))
+        os.replace(tmp, path)
+
+
+def _adopt_test_outputs(src: str | Path, dst: str | Path) -> None:
+    """Carry what leerie's test runs wrote in `src`, a disposable checkout
+    of `dst`'s commit, into `dst`'s record before `src` is removed: the
+    same commit's test run writes the same files in `dst` (review round 14:
+    once the re-drive measured in a checkout, staging's reports a worker's
+    test run rewrote read as the change)."""
+    with contextlib.suppress(Exception):
+        _note_test_outputs(dst, _leerie_test_outputs(src))
 
 
 def _read_produced(tree: str | Path) -> dict[str, list]:
@@ -39157,7 +39193,7 @@ def _leerie_last_wrote(tree: str | Path,
 
 @contextlib.asynccontextmanager
 async def _leaves_tracked_files(tree: str | Path, what: str,
-                                log_prefix: str):
+                                log_prefix: str, *, test_run: bool = False):
     """Around one of leerie's own commands in `tree` — a recipe install or
     build, a measured build/lint/test axis, a test-ID report run: whatever
     tracked file the command rewrote is put back afterwards
@@ -39166,8 +39202,10 @@ async def _leaves_tracked_files(tree: str | Path, what: str,
     *Leerie's own commands leave tracked files as they found them*).
     Dependencies and other untracked output stay, and every untracked file
     the command produced is recorded as leerie's (`_note_produced`), so a
-    later reader can tell it from a file a worker made. Never raises from
-    the snapshots, the restore or the record."""
+    later reader can tell it from a file a worker made; with `test_run`,
+    every untracked path it made or rewrote is also a test output
+    (`_note_test_outputs`). Never raises from the snapshots, the restore or
+    the record."""
     try:
         before = await asyncio.to_thread(
             functools.partial(_tracked_content, tree, write=True))
@@ -39189,6 +39227,11 @@ async def _leaves_tracked_files(tree: str | Path, what: str,
                     await asyncio.to_thread(_note_produced, tree,
                                             untracked_before,
                                             untracked_after)
+                    if test_run:
+                        await asyncio.to_thread(
+                            _note_test_outputs, tree,
+                            [p for p, sig in untracked_after.items()
+                             if untracked_before.get(p) != sig])
             except Exception:
                 pass
         if before is not None:
@@ -39360,7 +39403,8 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         # memo lookup or the install: a hit must stay free, and serialising
         # installs would throttle the very worktrees waiting to be measured.
         async with _blt_semaphore(caps), \
-                _leaves_tracked_files(tree, axis, log_prefix):
+                _leaves_tracked_files(tree, axis, log_prefix,
+                                      test_run=axis == "tests"):
             async with (_build_class_slot(st, label=f"{label_prefix}-{axis}")
                         if axis in _BUILD_CLASS_AXES
                         else contextlib.nullcontext()):
@@ -40319,7 +40363,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             report.parent.mkdir(parents=True, exist_ok=True)
             async with _blt_semaphore(caps), \
                     _build_class_slot(st, label=f"{label}-ids"), \
-                    _leaves_tracked_files(tree, "test run", label):
+                    _leaves_tracked_files(tree, "test run", label,
+                                          test_run=True):
                 t_run = time.monotonic()
                 try:
                     await _run_streaming(
@@ -42554,8 +42599,9 @@ def _executed_command_entries(leerie_dir: Path, repo_root: Path,
     (`_repro_verbs`), and the paired tool_result's TAIL is included
     verbatim for the JUDGE to interpret — Python never reads pass/fail
     out of the prose. Each entry is `(text, command)`: the text the judge
-    reads and the command as the worker ran it (`_rerun_record_citations`
-    re-runs it). Empty when nothing matched; caps bound a
+    reads and the command as the worker ran it, which a human-verification
+    entry names (`_mark_worker_only`; leerie never runs it). Empty when
+    nothing matched; caps bound a
     log-heavy run (newest workers first, so the final-conformer's and
     late conformers' runs — the ones that verify the shipping tree —
     survive truncation)."""
@@ -42625,28 +42671,22 @@ class _ExecutedRecord(str):
     the orchestrator's own entries carried apart in `own` (DESIGN §8 *Every
     post-execution verdict is of the committed tree*). A `RECORD` cite
     verifies only against `own`, which `_delivery_record` builds from typed
-    state alone, or against `measured`, the output the orchestrator itself
-    captured from a worker command it re-ran and passed on HEAD
-    (`_rerun_record_citations`); nothing a worker's command or output
-    contains can enter either (review round 12 claims H1: a column-0
-    `[orchestrator ` tag was forgeable through a heredoc; round 13 H1: a
-    re-run's entry had carried the worker's own result tail). A `str` so
-    every reader of the record's text is unchanged; a plain `str` record
-    has neither, so it verifies nothing (the fail-closed side)."""
+    state alone; nothing a worker's command or output contains can enter
+    it (review round 12 claims H1: a column-0 `[orchestrator ` tag was
+    forgeable through a heredoc). A `str` so every reader of the record's
+    text is unchanged; a plain `str` record has no `own`, so it verifies
+    nothing (the fail-closed side)."""
     own: str
-    # `(entry text, command)` of each worker entry, for the re-run of a
-    # cited worker command (`_rerun_record_citations`).
+    # `(entry text, command)` of each worker entry: which commands a met
+    # resting only on a worker's run names (`_mark_worker_only`).
     workers: tuple[tuple[str, str], ...]
-    # The orchestrator's own captured output of each re-run that passed.
-    measured: tuple[str, ...]
 
     def __new__(cls, text: str, own: str = "",
-                workers: Iterable[tuple[str, str]] = (),
-                measured: Iterable[str] = ()) -> "_ExecutedRecord":
+                workers: Iterable[tuple[str, str]] = ()
+                ) -> "_ExecutedRecord":
         obj = super().__new__(cls, text)
         obj.own = own
         obj.workers = tuple(workers)
-        obj.measured = tuple(measured)
         return obj
 
 
@@ -42669,9 +42709,7 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
     `absent` (not in the file), `no_file`, `short`; for `path: "RECORD"`
     (the executed-commands record) `record_ok` when the quote is in the
     orchestrator's own entries (`record.own`, `_ExecutedRecord`: each is on
-    the record only while it describes HEAD's committed tree) or in the
-    output it captured re-running a worker command on HEAD
-    (`record.measured`), `record_worker`
+    the record only while it describes HEAD's committed tree), `record_worker`
     when it is only in a worker's entry — supporting evidence that never
     verifies on its own, since a worker's run in staging can rest on a
     file HEAD lacks (review round 11 claims M1) — else `record_absent`;
@@ -42697,9 +42735,7 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
     if len(q) < _DELIVERY_CITE_MIN_QUOTE:
         return "short"
     if head == "RECORD":
-        if q in _scope_norm(getattr(record, "own", "") or "") or any(
-                q in _scope_norm(m)
-                for m in getattr(record, "measured", ()) or ()):
+        if q in _scope_norm(getattr(record, "own", "") or ""):
             return "record_ok"
         return ("record_worker" if q in _scope_norm(record)
                 else "record_absent")
@@ -42811,188 +42847,10 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
     return {**sample, "verdicts": out}
 
 
-# A worker command the orchestrator re-runs to verify a RECORD citation
-# (`_rerun_record_citations`) is exec'd as one plain argv, never through a
-# shell, so only a command a shell would read as exactly that argv
-# qualifies: no operator, redirection, substitution, expansion or glob.
-_RERUN_UNSAFE_RE = re.compile(r"[;&|<>`$*?~\n\r]")
-# A compound command's leading simple command: everything before the first
-# shell operator, with a trailing `2>&1` dropped. Only ever used when what
-# remains is exactly an allowed argv (`_rerunnable_argv`).
-_RERUN_LEAD_SPLIT_RE = re.compile(r"\|\||&&|\||;|\n")
-_RERUN_LEAD_REDIR_RE = re.compile(r"\s+2>&1\s*$")
-RECORD_RERUN_GAP_SOURCE = "record_rerun"
-# Words that make a runner or an interpreter evaluate code given on the
-# command line, or fetch and run a package, rather than run the
-# repository's own files (review round 13 H1: `python3 -c ...` passed as a
-# re-run of a `python3`-led record entry).
-_RERUN_EVAL_WORDS = frozenset({
-    "-c", "-e", "--eval", "-p", "--print", "--require", "--import",
-    "--loader", "--experimental-loader", "exec", "dlx", "x"})
-# pytest's single-letter flags (`tests/fixtures/pytest_options.json`'s
-# short `flag` entries): with `_PYTEST_LONG_FLAGS`, the options pytest
-# takes with no value. They may cluster (`-qx`).
-_PYTEST_SHORT_FLAGS = frozenset({"-V", "-d", "-f", "-h", "-l", "-q", "-s",
-                                 "-v", "-x"})
-# Options a re-run may add after its allowed argv, per runner: the value
-# options of `_FORBID_RUNNERS` (lane B's matcher tables) and, for pytest,
-# the flags. A runner with no flag table here takes only its value
-# options; anything else leaves the command unrunnable.
-_RERUN_RUNNER_FLAGS: dict[tuple[str, ...], frozenset[str]] = {
-    ("pytest",): _PYTEST_LONG_FLAGS | _PYTEST_SHORT_FLAGS,
-}
-
-
-def _rerun_allowed_argvs(repo_root: str | Path,
-                         repro_command: str | None) -> list[list[str]]:
-    """The argvs a worker command must begin with, verbatim, for the
-    orchestrator to re-run it (DESIGN §8 *Execution-shaped items are
-    judged from the run's own records*): the repository's configured or
-    inferred build, lint and test commands (`resolve_blt`,
-    `_canonical_test_command`) and the audit's typed repro command — each
-    only when it is itself one plain argv. Command strings are mechanical."""
-    cmds: list[str] = []
-    with contextlib.suppress(Exception):
-        blt = resolve_blt(Path(str(repo_root)))
-        cmds += [blt.get(a) or "" for a in ("build", "lint", "test")]
-    with contextlib.suppress(Exception):
-        cmds.append(_canonical_test_command(repo_root))
-    cmds.append(repro_command if isinstance(repro_command, str) else "")
-    out: list[list[str]] = []
-    for c in cmds:
-        c = (c or "").strip()
-        if not c or _RERUN_UNSAFE_RE.search(c):
-            continue
-        try:
-            argv = shlex.split(c)
-        except ValueError:
-            continue
-        if argv and "=" not in argv[0] and argv not in out:
-            out.append(argv)
-    return out
-
-
-def _rerun_runner(prefix: list[str]) -> tuple[str, ...] | None:
-    """The `_FORBID_RUNNERS` key an allowed argv runs (`python3 -m pytest`
-    → `("pytest",)`, `go test ./...` → `("go", "test")`), or None."""
-    for i in range(len(prefix)):
-        head = os.path.basename(prefix[i])
-        head = "pytest" if head == "py.test" else head
-        for key in ((head, prefix[i + 1]) if i + 1 < len(prefix) else None,
-                    (head,)):
-            if key and key in _FORBID_RUNNERS:
-                return key
-    return None
-
-
-def _rerun_path_ok(word: str, at_head: Callable[[str], bool]) -> bool:
-    """A repo-relative path (a pytest node ID's file part) that exists at
-    HEAD: never absolute, never `..`, never `~`."""
-    rel = word.split("::", 1)[0]
-    while rel.startswith("./"):
-        rel = rel[2:]
-    rel = rel.rstrip("/")
-    if (not rel or rel.startswith(("/", "~", "-"))
-            or ".." in Path(rel).parts):
-        return False
-    return at_head(rel)
-
-
-def _rerun_value_ok(value: str) -> bool:
-    """An option's value: never a path out of the checkout, never code."""
-    return not (value.startswith(("/", "~")) or ".." in Path(value).parts
-                or value in _RERUN_EVAL_WORDS)
-
-
-def _rerun_extras_ok(extra: list[str], runner: tuple[str, ...] | None,
-                     at_head: Callable[[str], bool]) -> bool:
-    """Whether every word after an allowed argv is one a re-run may add:
-    an option from `runner`'s own tables (`_FORBID_RUNNERS`' value options,
-    `_RERUN_RUNNER_FLAGS`) with a safe value, or a repo-relative path that
-    exists at HEAD. Mechanical: argv words, never prose."""
-    spec = _FORBID_RUNNERS.get(runner or (), {})
-    values = spec.get("value", frozenset())
-    flags = _RERUN_RUNNER_FLAGS.get(runner or (), frozenset())
-    i = 0
-    while i < len(extra):
-        w = extra[i]
-        if w in _RERUN_EVAL_WORDS:
-            return False
-        if w.startswith("-") and w != "-":
-            name, eq, val = w.partition("=")
-            if name in _RERUN_EVAL_WORDS:
-                return False
-            if name in values:
-                if eq:
-                    if not _rerun_value_ok(val):
-                        return False
-                else:
-                    if i + 1 >= len(extra) or not _rerun_value_ok(
-                            extra[i + 1]):
-                        return False
-                    i += 1
-            elif name in flags and not eq:
-                pass
-            elif (not name.startswith("--") and len(name) > 2
-                  and name[:2] in values and name[:2] not in _RERUN_EVAL_WORDS
-                  and not eq):
-                # An attached short value (`-rA`, `-k1`).
-                if not _rerun_value_ok(name[2:]):
-                    return False
-            elif (not name.startswith("--") and len(name) > 2 and not eq
-                  and all(f"-{ch}" in flags for ch in name[1:])):
-                pass                                # a cluster (`-qx`)
-            else:
-                return False
-        elif not _rerun_path_ok(w, at_head):
-            return False
-        i += 1
-    return True
-
-
-def _rerunnable_argv(cmd: str, allowed: list[list[str]],
-                     at_head: Callable[[str], bool]) -> list[str] | None:
-    """`cmd` as the argv the orchestrator would run, or None when it may
-    not run it (DESIGN §8 *Execution-shaped items are judged from the
-    run's own records*). One plain argv (no shell syntax, `_RERUN_UNSAFE_RE`)
-    that begins verbatim with one of `allowed` (`_rerun_allowed_argvs`),
-    every further word passing `_rerun_extras_ok`. A compound command
-    qualifies only when its leading simple command, a trailing `2>&1`
-    dropped, is exactly one of `allowed` — `pnpm run test 2>&1 | tail -30`
-    runs `pnpm run test`. What runs is the repository's own command on
-    HEAD's files, never a worker's code (review round 13 H1)."""
-    if not isinstance(cmd, str) or not allowed:
-        return None
-    cmd = cmd.strip()
-    if _RERUN_UNSAFE_RE.search(cmd):
-        lead = _RERUN_LEAD_SPLIT_RE.split(cmd, maxsplit=1)[0]
-        lead = _RERUN_LEAD_REDIR_RE.sub("", lead).strip()
-        if not lead or _RERUN_UNSAFE_RE.search(lead):
-            return None
-        try:
-            argv = shlex.split(lead)
-        except ValueError:
-            return None
-        return list(argv) if argv in allowed else None
-    try:
-        argv = shlex.split(cmd)
-    except ValueError:
-        return None
-    for prefix in sorted(allowed, key=len, reverse=True):
-        if argv[:len(prefix)] == prefix and _rerun_extras_ok(
-                argv[len(prefix):], _rerun_runner(prefix), at_head):
-            return argv
-    return None
-
-
-def _path_at_commit(tree: str | Path, head: str) -> Callable[[str], bool]:
-    """Whether a repo-relative path (file or directory) exists in commit
-    `head` of `tree` (`git cat-file -e <head>:<path>`)."""
-    def exists(rel: str) -> bool:
-        return subprocess.run(
-            ["git", "-C", str(tree), "cat-file", "-e", f"{head}:{rel}"],
-            capture_output=True, check=False).returncode == 0
-    return exists
+# The "Needs human verification" source for a required item whose only
+# evidence is a command a worker ran (DESIGN §8 *Execution-shaped items are
+# judged from the run's own records*).
+RECORD_WORKER_GAP_SOURCE = "record_worker_only"
 
 
 def _uncited_worker_commands(v: dict, tree: str | Path, record: str,
@@ -43029,147 +42887,16 @@ def _uncited_worker_commands(v: dict, tree: str | Path, record: str,
     return out or None
 
 
-def _record_reruns_run(st: "State") -> int:
-    """How many re-runs this run has executed (`record_reruns` entries
-    that reached a verdict by running), for `record_reruns_max`."""
-    return sum(1 for r in (st.data.get("record_reruns") or {}).values()
-               if isinstance(r, dict) and r.get("verdict") in ("passed",
-                                                               "failed"))
-
-
-async def _rerun_worker_command(st: "State", caps: dict, staging: Path,
-                                cmd: str, allowed: list[list[str]],
-                                head: str) -> dict:
-    """Re-run one worker command on the committed tree (DESIGN §8
-    *Execution-shaped items are judged from the run's own records*): in a
-    disposable checkout of `head`, through `_settle_by_execution` — exec'd
-    as an argv through the single forbidden-command gate, contained, a
-    failure B*-confirmed. Returns `{argv, head, verdict: passed | failed |
-    unrunnable, rc, output, why}` — only what the orchestrator itself ran
-    and saw, never the worker's text (review round 13 H1) — persisted in
-    `record_reruns[<key>]` and reused for the same command on the same
-    commit. Bounded by `record_reruns_max` and charged to
-    `redrive_budget_sec` (review round 13 L3)."""
-    key = "rerun-" + hashlib.sha256(
-        f"{head}\0{cmd}".encode()).hexdigest()[:16]
-    done = (st.data.get("record_reruns") or {}).get(key)
-    if isinstance(done, dict) and done.get("verdict") in (
-            "passed", "failed", "unrunnable"):
-        return done
-    rec: dict = {"argv": None, "head": head, "verdict": "unrunnable",
-                 "rc": None, "output": "", "why": ""}
-    argv = _rerunnable_argv(cmd, allowed, _path_at_commit(staging, head))
-    hit = _forbidden_command_hit(cmd, _forbidden_specs(st.data))
-    cap = int(caps.get("record_reruns_max",
-                       DEFAULT_CAPS["record_reruns_max"]))
-    if hit:
-        rec["why"] = f"the task forbids `{hit}`"
-    elif argv is None:
-        rec["why"] = ("it is not the repository's build, lint, test or "
-                      "repro command run as one plain argv (only that "
-                      "command, its runner's options and paths in the "
-                      "commit may be re-run)")
-    elif _record_reruns_run(st) >= cap:
-        rec["why"] = f"the run's {cap} command re-runs are spent"
-    elif not _redrive_time_left(st, caps):
-        rec["why"] = "the run's re-drive time budget is spent"
-    else:
-        rec["argv"] = argv
-        wt = _helper_worktree_path(st, "record-rerun")
-
-        def _remove() -> None:
-            subprocess.run(["git", "-C", str(staging), "worktree", "remove",
-                            "--force", str(wt)], capture_output=True,
-                           check=False)
-            shutil.rmtree(wt, ignore_errors=True)
-            _DEPS_INSTALLED.discard(os.path.realpath(wt))
-        _remove()
-        t0 = time.monotonic()
-        try:
-            add = await _worktree_add_detached_async(st, wt, head,
-                                                     repo=staging)
-            if add.returncode != 0:
-                rec["why"] = "a checkout of the committed tree failed"
-            else:
-                got = await _settle_by_execution(
-                    {"verify": [{"argv": argv}]}, str(wt), st, caps,
-                    sid=key, store="record_reruns")
-                rec["verdict"] = {"pass": "passed", "fail": "failed"}.get(
-                    got.get("verdict"), "unrunnable")
-                rec["why"] = str(got.get("why") or "")[:300]
-                last = (got.get("commands") or [{}])[-1]
-                rec["rc"] = last.get("rc")
-                rec["output"] = str(last.get("tail") or "")
-        finally:
-            _remove()
-            _charge_redrive_time(st, time.monotonic() - t0)
-    st.data.setdefault("record_reruns", {})[key] = rec
-    st.save()
-    log(f"  delivery gate: re-ran a cited worker command on "
-        f"{head[:12]} — {rec['verdict']}: `{cmd[:120]}`"
-        + (f" ({rec['why']})" if rec["why"] else ""))
-    return rec
-
-
-async def _rerun_record_citations(st: "State", caps: dict, staging: Path,
-                                  record: str, raw: list[dict],
-                                  allowed: list[list[str]],
-                                  cache: dict | None = None
-                                  ) -> tuple[str, dict[str, dict]]:
-    """Every worker command a met verdict of `raw` (unscreened judge
-    samples) rests on alone — `_uncited_worker_commands` — re-run once on
-    staging's HEAD (`_rerun_worker_command`). Returns the record with the
-    orchestrator's own entry for each re-run that passed — its argv, HEAD,
-    exit code and its own captured output, in the text the judge reads and
-    the output in `measured` (so a quote verifies only when the re-run
-    itself printed it) — and each command's re-run, keyed by the worker's
-    command."""
-    cmds: list[str] = []
-    for smp in raw:
-        for v in smp.get("verdicts") or []:
-            if not isinstance(v, dict):
-                continue
-            per = _uncited_worker_commands(_drop_test_outcome_parts(v),
-                                           staging, record, cache)
-            for cs in per or []:
-                cmds += [c for c in cs if c not in cmds]
-    if not cmds:
-        return record, {}
-    head = await _branch_head_sha(str(staging)) or ""
-    if not head:
-        return record, {}
-    runs = {c: await _rerun_worker_command(st, caps, staging, c, allowed,
-                                           head)
-            for c in cmds}
-    lines: list[str] = []
-    measured: list[str] = []
-    for r in runs.values():
-        if r.get("verdict") != "passed" or not r.get("argv"):
-            continue
-        out = " | ".join(x.strip() for x in str(r.get("output") or "")
-                         .splitlines() if x.strip())
-        if out in measured:
-            continue
-        measured.append(out)
-        lines.append(f"[orchestrator re-run on the committed tree "
-                     f"{str(r.get('head'))[:12]}] $ "
-                     f"{shlex.join(r['argv'])[:200]} — exit {r.get('rc')}"
-                     f"\n    output tail: " + (out or "(no output)"))
-    if not lines:
-        return record, runs
-    return (_ExecutedRecord(
-        str(record) + "\n" + "\n".join(lines), getattr(record, "own", ""),
-        getattr(record, "workers", ()),
-        (*(getattr(record, "measured", ()) or ()), *measured)), runs)
-
-
-def _mark_unrunnable(sample: dict, raw: dict, tree: str | Path,
-                     record: str, runs: dict[str, dict],
-                     cache: dict | None = None) -> dict:
-    """A screened sample whose rejected mets rest only on worker commands
-    leerie could not re-run are typed `rejected: record_unrunnable`, with
-    the commands and why — routed to human verification, never to a
-    re-drive no implementer could satisfy (review round 12 L3)."""
+def _mark_worker_only(sample: dict, raw: dict, tree: str | Path,
+                      record: str, cache: dict | None = None) -> dict:
+    """A screened sample whose rejected mets rest only on commands a worker
+    ran (`_uncited_worker_commands`) are typed `rejected:
+    record_worker_only`, with those commands: a worker's run happened in a
+    worker's tree, and leerie never re-runs a worker's command, so such a
+    met is neither confirmed nor refuted — it goes to human verification,
+    never to a re-drive no implementer could satisfy (DESIGN §8
+    *Execution-shaped items are judged from the run's own records*; review
+    round 12 L3, round 14)."""
     raws = {v.get("item_index"): v for v in raw.get("verdicts") or []
             if isinstance(v, dict)}
     out = []
@@ -43178,40 +42905,36 @@ def _mark_unrunnable(sample: dict, raw: dict, tree: str | Path,
             per = _uncited_worker_commands(
                 _drop_test_outcome_parts(raws.get(v.get("item_index")) or {}),
                 tree, record, cache)
-            if per and all(any((runs.get(c) or {}).get("verdict")
-                               == "unrunnable" for c in cs)
-                           and not any((runs.get(c) or {}).get("verdict")
-                                       == "failed" for c in cs)
-                           for cs in per):
-                v = {**v, "rejected": "record_unrunnable", "rerun": [
-                    {"command": c, "why": (runs.get(c) or {}).get("why")}
-                    for cs in per for c in cs][:5]}
+            if per:
+                v = {**v, "rejected": "record_worker_only", "commands": [
+                    c for cs in per for c in cs][:5]}
         out.append(v)
     return {**sample, "verdicts": out}
 
 
-def _set_record_rerun_gap(st: "State", judged: Iterable[int],
-                          human: dict[int, dict]) -> None:
-    """The "Needs human verification" entries (`RECORD_RERUN_GAP_SOURCE`)
-    for required items whose only evidence is a worker command leerie
-    could not re-run on the committed tree: one per item, replaced for the
-    items this pass judged and kept for the rest."""
+def _set_record_worker_gap(st: "State", judged: Iterable[int],
+                           human: dict[int, dict]) -> None:
+    """The "Needs human verification" entries (`RECORD_WORKER_GAP_SOURCE`)
+    for required items whose only evidence is a command a worker ran: one
+    per item, replaced for the items this pass judged and kept for the
+    rest."""
     data = getattr(st, "data", None)
     if not isinstance(data, dict):
         return
     judged = set(judged)
     entries = [e for e in (data.get("needs_human_verification") or [])
                if not (isinstance(e, dict)
-                       and e.get("source") == RECORD_RERUN_GAP_SOURCE
+                       and e.get("source") == RECORD_WORKER_GAP_SOURCE
                        and e.get("item_index") in judged)]
     for i, h in sorted(human.items()):
-        cmds = "; ".join(f"`{r.get('command')}` ({r.get('why')})"
-                         for r in h.get("rerun") or [])
+        cmds = "; ".join(f"`{' '.join(str(c).split())[:200]}`"
+                         for c in h.get("commands") or [])
         entries.append({
-            "source": RECORD_RERUN_GAP_SOURCE, "item_index": i,
+            "source": RECORD_WORKER_GAP_SOURCE, "item_index": i,
             "detail": (f"{h.get('item')} — its only evidence is a command a "
-                       f"worker ran, which leerie could not re-run on the "
-                       f"PR branch: {cmds}. Run it there and check.")})
+                       f"worker ran in its own working tree, which leerie "
+                       f"does not re-run: {cmds}. Run it on the PR branch "
+                       f"and check.")})
     if entries != (data.get("needs_human_verification") or []):
         data["needs_human_verification"] = entries
         with contextlib.suppress(Exception):
@@ -43787,9 +43510,6 @@ async def _delivery_judge_unmet(
     cite_cache: dict = {}
     # The judges read a clean checkout of staging's HEAD (set below).
     judge_cwd: list[Path] = [staging]
-    # Each screened sample's unscreened original, for the re-screen after
-    # cited worker commands are re-run on HEAD.
-    raw_of: dict[int, dict] = {}
 
     async def _judge_pack(p: int, pack: list[int]) -> list[dict]:
         with_contract = contract_ctx is not None and p == 0
@@ -43829,10 +43549,13 @@ async def _delivery_judge_unmet(
                 _relative_cites(v, judge_cwd[0])
                 for v in (smp.get("verdicts") or [])
                 if isinstance(v, dict) and v.get("item_index") in allowed]}
-            screened = _delivery_screen_sample(smp, staging, exec_digest,
-                                               cite_cache)
-            raw_of[id(screened)] = smp
-            return screened
+            # A met resting only on a worker's command run is unknown, not
+            # unmet: it goes to a human, never to a re-drive (review round
+            # 12 L3; leerie never re-runs it, round 14).
+            return _mark_worker_only(
+                _delivery_screen_sample(smp, staging, exec_digest,
+                                        cite_cache),
+                smp, staging, exec_digest, cite_cache)
 
         async with limit:
             samples = [await _sample(0)]
@@ -43855,22 +43578,6 @@ async def _delivery_judge_unmet(
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-    # A met resting only on a worker's command run: the orchestrator re-runs
-    # that command on the committed tree, and its own pass verifies the
-    # citation; one it cannot run routes the item to a human (review round
-    # 12 L3).
-    allowed = _rerun_allowed_argvs(
-        st.repo_root, (ground_truth or {}).get("repro_command"))
-    exec_digest, reruns = await _rerun_record_citations(
-        st, caps, staging, exec_digest,
-        [raw_of[id(s)] for samples in per_pack for s in samples],
-        allowed, cite_cache)
-    if reruns:
-        per_pack = [[_mark_unrunnable(
-            _delivery_screen_sample(raw_of[id(s)], staging, exec_digest,
-                                    cite_cache),
-            raw_of[id(s)], staging, exec_digest, reruns, cite_cache)
-            for s in samples] for samples in per_pack]
     human: dict[int, dict] = {}
     n_samples = 0
     for pack, samples in zip(packs, per_pack):
@@ -43904,10 +43611,10 @@ async def _delivery_judge_unmet(
         for i in _delivery_unmet_majority(samples, n_items):
             votes = [v for s in samples for v in s.get("verdicts") or []
                      if v.get("item_index") == i and v.get("met") is False]
-            if votes and all(v.get("rejected") == "record_unrunnable"
+            if votes and all(v.get("rejected") == "record_worker_only"
                              for v in votes):
                 human[i] = {"item": normalized[i].get("item", ""),
-                            "rerun": votes[-1].get("rerun") or []}
+                            "commands": votes[-1].get("commands") or []}
                 continue
             evidence = ""
             for s in reversed(samples):
@@ -43921,7 +43628,7 @@ async def _delivery_judge_unmet(
                               "item": normalized[i].get("item", ""),
                               "evidence": evidence})
     confirmed.sort(key=lambda u: u["item_index"])
-    _set_record_rerun_gap(st, judge_idx, human)
+    _set_record_worker_gap(st, judge_idx, human)
     if routing is not None and human:
         routing["human_verification"] = sorted(human)
     contract_result: dict | None = None
@@ -52295,7 +52002,10 @@ async def _committed_test_tree(st: "State", caps: dict, staging: Path,
     checkout or its install fails: no measurement, never one of staging's
     working tree (DESIGN §9 *A failed install is no measurement*; review
     round 13 claims M1: the ratchet's execution route read staging's
-    working tree, with a withheld leftover in it)."""
+    working tree, with a withheld leftover in it). Before the checkout is
+    removed, what leerie's test runs wrote in it is adopted into staging's
+    test-output record (`_adopt_test_outputs`). A failed checkout is not
+    remembered: the next entry makes a fresh one."""
     clean = await run_proc(["git", "status", "--porcelain",
                             "--untracked-files=all"], cwd=str(staging))
     if clean.returncode == 0 and not clean.stdout.strip():
@@ -52324,6 +52034,8 @@ async def _committed_test_tree(st: "State", caps: dict, staging: Path,
                 "its dependencies — not measured")
         yield wt if ok else None
     finally:
+        if wt.is_dir():
+            await asyncio.to_thread(_adopt_test_outputs, wt, staging)
         _remove()
 
 
@@ -54209,7 +53921,11 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
     # group changed and no leerie command wrote last is listed (DESIGN §6½,
     # review round 12 M2): the edit may be what the fix rests on.
     last = await asyncio.to_thread(_leerie_last_wrote, staging, sigs)
-    edited = sorted(p for p in (produced & moved) - last
+    # What a leerie test run writes here or in a checkout of this commit is
+    # output: the implementer's own test run rewriting it is no change
+    # (DESIGN §6½, review round 14).
+    reports = await asyncio.to_thread(_leerie_test_outputs, staging)
+    edited = sorted(p for p in (produced & moved) - last - reports
                     if not _leftover_artifact(staging, p))
     if edited:
         log(f"  delivery re-drive ({label}): {len(edited)} file(s) a leerie "
@@ -54219,7 +53935,8 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
         if withheld is not None:
             withheld.setdefault("generated_edited", []).extend(edited)
     untracked = sorted(((moved - produced) | (set(sigs) & set(written))))
-    shaped = [p for p in untracked if _leftover_artifact(staging, p)]
+    shaped = [p for p in untracked
+              if p in reports or _leftover_artifact(staging, p)]
     if shaped:
         log(f"  delivery re-drive ({label}): {len(shaped)} artifact-shaped "
             "untracked file(s) not committed: " + ", ".join(shaped[:5])
@@ -54818,7 +54535,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                                    staging) or {}
                 lw = await asyncio.to_thread(_leerie_last_wrote, staging,
                                              now_sigs)
-                gen = [p for p in gen if p in now_sigs and p not in lw]
+                outs = await asyncio.to_thread(_leerie_test_outputs, staging)
+                gen = [p for p in gen
+                       if p in now_sigs and p not in lw and p not in outs]
                 if gen:
                     ge["leftovers_withheld"]["generated_edited"] = gen
                 else:
@@ -56297,8 +56016,7 @@ def _at_measured_ceiling(st: "State") -> bool:
 
 
 async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
-                               caps: dict, *, sid: str,
-                               store: str = "settled_by_execution") -> dict:
+                               caps: dict, *, sid: str) -> dict:
     """Run `subtask`'s `verify` argvs in `worktree` and decide its claim
     (DESIGN §8 *Settled by execution*). Each argv is exec'd directly —
     never through a shell — inside a capped broker cgroup at the worker
@@ -56310,8 +56028,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
     command its cgroup killed at the measured ceiling is
     `environment_limit`.
 
-    Returns and persists (`st.data[store][sid]`, `store` defaulting to
-    `settled_by_execution`) `{verdict, why,
+    Returns and persists (`settled_by_execution[sid]`) `{verdict, why,
     commands, dirty}`; `verdict` is `pass` (every command passed and the
     tracked tree is unchanged), `fail`, `environment_limit`, or `none`
     (nothing to run, or the worktree was dirty before it ran). Output is
@@ -56320,7 +56037,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
                     "dirty": []}
 
     def _done() -> dict:
-        st.data.setdefault(store, {})[sid] = record
+        st.data.setdefault("settled_by_execution", {})[sid] = record
         st.save()
         return record
 
