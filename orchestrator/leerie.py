@@ -34361,7 +34361,10 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         short = [x for x in diff.get("budget_short") or []
                  if x in diff["new"]]
         reasons.append(f"{len(diff['new'])} test(s) newly failing on the "
-                       "final tree, confirmed against the base"
+                       + ("an earlier tree (the delivery re-drive's final "
+                          "tree could not be measured), "
+                          if diff.get("stale_for_tree") else "final tree, ")
+                       + "confirmed against the base"
                        + (f" ({len(short)} on fewer than every base/final "
                           "pair: the confirm budget cut the rest)"
                           if short else ""))
@@ -51419,12 +51422,69 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
     return out
 
 
+def _resettle_test_outcome_rows(st: "State", tree_sha: str | None) -> None:
+    """Re-read every `delivery_gate.items` row's test outcome from the
+    failing-test-ID diff of `tree_sha` (`_test_outcome_verdict`), so no row
+    carries a verdict of another tree (DESIGN §8 *Delivery re-drive*): an
+    item typed `test_id_diff` takes the verdict whole; a mixed item's
+    `test_outcome_part` is rewritten (dropped when met) and settled again,
+    after a row the part alone made unmet (`by == ["test_id_diff"]`) is
+    restored to met. The "Needs human verification" test-outcome gap is
+    rewritten to match."""
+    gate = st.data.get("delivery_gate")
+    items = st.data.get("required_items") or []
+    if not isinstance(gate, dict) or not items:
+        return
+    normalized = [_delivery_norm_item(it) for it in items]
+    tid = _test_outcome_verdict(st, tree_sha)
+    rows: list = []
+    unknown: list[str] = []
+    for r in gate.get("items") or []:
+        i = r.get("item_index") if isinstance(r, dict) else None
+        if (not isinstance(i, int) or not 0 <= i < len(normalized)
+                or r.get("verdict") == "external"):
+            rows.append(r)
+            continue
+        it = normalized[i]
+        if _test_id_diff_item(it):
+            r = {k: v for k, v in r.items() if k != "reason"}
+            r.update(verdict=tid["verdict"], by=["test_id_diff"],
+                     new=list(tid["new"]),
+                     **({"reason": tid["reason"]} if tid.get("reason")
+                        else {}))
+            if tid["verdict"] == "unknown":
+                unknown.append(str(it.get("item", "")))
+        elif _test_outcome_parts(it):
+            if r.get("by") == ["test_id_diff"]:
+                r = {k: v for k, v in r.items()
+                     if k not in ("other_parts", "reason")}
+                r.update(verdict="met", by=[])
+            r = {k: v for k, v in r.items() if k != "test_outcome_part"}
+            if tid["verdict"] != "met":
+                r["test_outcome_part"] = {
+                    "parts": _test_outcome_parts(it),
+                    "verdict": tid["verdict"], "new": list(tid["new"]),
+                    "reason": tid.get("reason") or ""}
+                r = _settle_test_outcome_part(r)
+            if tid["verdict"] == "unknown":
+                unknown.append(str(it.get("item", "")))
+        rows.append(r)
+    st.data["delivery_gate"] = {**gate, "items": rows}
+    st.save()
+    _set_test_outcome_gap(st, unknown, tid.get("reason") or "")
+
+
 def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
-                                 sha: str) -> None:
+                                 sha: str, tree_sha: str | None = None
+                                 ) -> None:
     """Rewrite `delivery_gate.unmet_final` / `items[]` for the re-checked
     items: a met one leaves the list, a still-unmet one keeps it with the
-    new evidence."""
+    new evidence. With `tree_sha` (the tree of `sha`), every row's test
+    outcome is then re-read from the diff of that tree
+    (`_resettle_test_outcome_rows`), never re-applied from detection."""
     if not verdicts:
+        if tree_sha is not None:
+            _resettle_test_outcome_rows(st, tree_sha)
         return
     gate = dict(st.data.get("delivery_gate") or {})
     unmet = []
@@ -51454,6 +51514,42 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
     gate.update(unmet_final=unmet, items=rows)
     st.data["delivery_gate"] = gate
     st.save()
+    if tree_sha is not None:
+        _resettle_test_outcome_rows(st, tree_sha)
+
+
+async def _redrive_refresh_test_id_diff(leerie_dir: Path, st: "State",
+                                        caps: dict, staging: Path) -> None:
+    """Measure the failing-test-ID diff again on the tree the delivery
+    re-drive ends on (DESIGN §8 *Delivery re-drive*): nothing recomputes
+    it otherwise, so a "no regressions" verdict, or a `new` count, would
+    describe the tree detection ran on. Nothing when no diff was recorded
+    or it is already of this tree; when the `tests` axis cannot be measured
+    the old diff is kept, marked `stale_for_tree`."""
+    diff = st.data.get("test_id_diff")
+    if not isinstance(diff, dict):
+        return
+    tree_sha = await _worktree_tree_sha(str(staging))
+    if not tree_sha or diff.get("tree_sha") == tree_sha:
+        return
+    cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"])
+           or "").strip()
+    log_path = st.run_dir / "logs" / _REDRIVE_LOG
+    got = None
+    if cmd:
+        post = await _measure_axes(
+            str(staging), {"tests": cmd}, st, caps, log_path=log_path,
+            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+            label_prefix="redrive-final", log_prefix="delivery re-drive",
+            failing_ids_axes={"tests"})
+        got = await _confirm_final_test_failures(
+            st, caps, str(staging), post, log_path=log_path,
+            label="redrive-final")
+    if got is None:
+        log("  delivery re-drive: the failing-test-ID diff could not be "
+            "measured on the final tree — kept, marked stale")
+        st.data["test_id_diff"] = {**diff, "stale_for_tree": tree_sha}
+        st.save()
 
 
 def _redrive_key_text(key: str) -> str:
@@ -51956,7 +52052,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             ver = await _redrive_recheck_items(
                 leerie_dir, st, caps, models, efforts, staging,
                 sorted(routed_items))
-            _redrive_apply_item_verdicts(st, ver, now)
+            _redrive_apply_item_verdicts(
+                st, ver, now, await _worktree_tree_sha(str(staging)))
             rechecked_sha = rec["items_rechecked_sha"] = now
             _save()
         if routed_checks and now:
@@ -51972,10 +52069,14 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                               all_sets, final,
                                               "redrive-final")
         await _run_ci_parity_final(leerie_dir, st, caps)
+        await _redrive_refresh_test_id_diff(leerie_dir, st, caps, staging)
+        final_tree = await _worktree_tree_sha(str(staging))
         if start_items and rechecked_sha != final:
             ver = await _redrive_recheck_items(
                 leerie_dir, st, caps, models, efforts, staging, start_items)
-            _redrive_apply_item_verdicts(st, ver, final)
+            _redrive_apply_item_verdicts(st, ver, final, final_tree)
+        # The diff may have moved even when no item needed a re-check.
+        _resettle_test_outcome_rows(st, final_tree)
         rec["items_rechecked_sha"] = final
         # The detection this pass routed from described the tree it started
         # on, its routed items are now re-checked on `final` and every kept

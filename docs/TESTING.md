@@ -5464,6 +5464,15 @@ unsettled merged-tree failure is never a `test_failure`, and
 `tests/test_delivery_ratchet.py` that an unsettled re-drive candidate
 leaves the execution items unchecked, never a rollback.
 
+`tests/test_redrive_test_id_diff_refresh.py` (review round 6, the stale
+row after a re-drive, driven and fixed): on a real pytest suite a test
+confirmed new at detection and then fixed by a re-drive group is measured
+again on the shipping tree (`_redrive_refresh_test_id_diff`), so the row
+reads met and the run `done`; when the tree cannot be measured the diff is
+marked `stale_for_tree` — its `new` still counts, named as of an earlier
+tree, and with none the row reads unknown, never met. A third test pins
+that the re-drive's end-of-pass block refreshes before re-checking items.
+
 `tests/test_redrive_budget.py` drives `phase_execute` (DESIGN §13 *One
 re-drive budget per subtask*): a blocked subtask is re-driven with its
 blocker as the note and at most `subtask_redrive_rounds` times, then settled

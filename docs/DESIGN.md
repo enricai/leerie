@@ -6974,10 +6974,28 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    `redrive_budget_sec`, the hard stop.
 
 After the last round the sets are measured once more on the tree that
-ships, the merge checks re-run when the tree moved, and each routed item is
-re-checked: re-judged by the cited judge, and an item a falsifier proved
-unmet by re-running its saved probe on the new tree. That verdict is what
-`_decide_outcome` reads.
+ships, the merge checks re-run when the tree moved, the failing-test-ID
+diff (§9 *Which failures are new*) is measured again on that tree, and
+each routed item is re-checked: re-judged by the cited judge, and an item
+a falsifier proved unmet by re-running its saved probe on the new tree.
+Every row's test-outcome part is then re-read from the diff of the tree
+that ships. That verdict is what `_decide_outcome` reads.
+
+The diff is re-measured because nothing else is. Before review round 6
+the re-drive re-applied the test-outcome verdict recorded at detection,
+and `_decide_outcome` read detection's `new`, on a tree the diff never
+measured. Driven on a real suite: a test confirmed new at detection, then
+fixed by a re-drive group, left the row "unmet — new failing test(s)
+confirmed against the base" and the run `unconverged` on a tree where the
+test passes. The opposite direction is the one that matters more: a "no
+regressions" verdict must describe the shipping tree. A group's own
+ratchet confirms only that the group added no new failure against its own
+start, and its unsettled candidates never roll it back (§9 step 4). When
+the test axis cannot be measured on the shipping tree, the diff keeps its
+old tree and is marked stale: with no `new` a test-outcome part reads
+`unknown` ("not of the final tree"), never met; a `new` it carries still
+counts — the item stays unmet and the run `unconverged`, the outcome
+reason saying the failure was confirmed on an earlier tree.
 
 Measured. P8d (fresh cases, rules 1–5): every rollback restored the
 pre-group tree. Q3 (frozen L1, held-back names, 9 cases × up to 3

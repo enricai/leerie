@@ -7320,10 +7320,22 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   ends on a HEAD other than its start, every valid set is measured once:
   `acceptance.gate.final` / `final_sha` and `residual`
   (`_acceptance_residual_of`) are rewritten, or kept when nothing measured;
-  `_run_ci_parity_final` runs; every item still open at the start is
-  re-checked unless that HEAD was already re-checked, and
-  `delivery_gate.unmet_final` / `items[]` are rewritten
-  (`_redrive_apply_item_verdicts`). Then `done`.
+  `_run_ci_parity_final` runs; `_redrive_refresh_test_id_diff(leerie_dir,
+  st, caps, staging)` re-measures the `tests` axis on staging
+  (`_measure_axes(…, {"tests": resolve_blt(repo_root)["test"]},
+  failing_ids_axes={"tests"})`) and recomputes `test_id_diff` through
+  `_confirm_final_test_failures` when the recorded diff's `tree_sha` is not
+  staging's — nothing when no diff was recorded; when the axis is not
+  measured the old diff is kept with `stale_for_tree: <tree sha>`; every
+  item still open at the start is re-checked unless that HEAD was already
+  re-checked, and `delivery_gate.unmet_final` / `items[]` are rewritten
+  (`_redrive_apply_item_verdicts(st, verdicts, sha, tree_sha=None)`, which
+  re-reads a re-checked row's `test_outcome_part` from
+  `_test_outcome_verdict(st, tree_sha)` before settling it); then
+  `_resettle_test_outcome_rows(st, tree_sha)` re-reads every row's
+  `test_outcome_part` the same way (a row the part alone made unmet, `by
+  == ["test_id_diff"]`, is first restored to met), so no row carries
+  detection's test-outcome verdict onto another tree. Then `done`.
 
 ### Report-bounded has-work — `_acceptance_scope_judge_sets`
 
@@ -9712,7 +9724,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
 | `test_file_durations` | dict[str, float] \| absent | repo-relative test file → seconds, the newest measurement from any structured report leerie read (`_record_test_durations`); sizes intermittent discovery to its budget (DESIGN §9 *Sized to the budget*). |
-| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed), and `base_unavailable: true` when the base worktree for the confirm could not be created (every candidate `no_verdict`), `sized_out` / `budget_short_unsettled_files` when the confirm budget left candidates unsettled (DESIGN §9 step 4; never counted, they read as the test outcome's `unknown`); `new` non-empty makes the outcome `unconverged`, and the reason says how many of them are `budget_short`. |
+| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed), and `base_unavailable: true` when the base worktree for the confirm could not be created (every candidate `no_verdict`), `stale_for_tree` (the shipping tree's sha) when the delivery re-drive moved HEAD and could not re-measure it (`_redrive_refresh_test_id_diff`), `sized_out` / `budget_short_unsettled_files` when the confirm budget left candidates unsettled (DESIGN §9 step 4; never counted, they read as the test outcome's `unknown`); `new` non-empty makes the outcome `unconverged`, and the reason says how many of them are `budget_short`. |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
 | `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |
