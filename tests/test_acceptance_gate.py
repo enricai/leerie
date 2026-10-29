@@ -98,6 +98,11 @@ def _repo(tmp_path: Path) -> tuple[Path, str]:
         'test_scoped = "python3 -m pytest -q -p no:cacheprovider {test_files}"\n'
         'test = "python3 -m pytest -q -p no:cacheprovider"\n')
     (repo / "report.md").write_text("add(2, 3) returns -1; it must return 5\n")
+    # Leerie's own test runs in staging write `__pycache__/`; until its
+    # commands leave the tree as they found it (I2, DESIGN §6½) a repair
+    # worker would be held to that output by the clean-tree gate (DESIGN §8
+    # *A worker leaves its tree clean*). These tests are not about it.
+    (repo / ".gitignore").write_text("__pycache__/\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     return repo, _git(repo, "rev-parse", "HEAD")

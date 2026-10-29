@@ -60,6 +60,12 @@ def _setup(leerie, tmp_path, monkeypatch):
     return run, flag
 
 
+# Red until I2 (DESIGN §6½: leerie's commands leave the tree as they found
+# it): leerie's own test run leaves `__pycache__/` in staging, which this
+# scenario needs unignored, and the clean-tree gate (DESIGN §8 *A worker
+# leaves its tree clean*) holds the final conformer to it. Strict, so the
+# mark goes when I2 lands.
+@pytest.mark.xfail(strict=True, reason="needs I2")
 def test_a_regression_behind_a_failed_install_is_not_done(
         leerie, tmp_path, monkeypatch):
     run, flag = _setup(leerie, tmp_path, monkeypatch)

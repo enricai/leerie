@@ -53,7 +53,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import unicodedata
@@ -247,18 +246,13 @@ DEFAULT_CAPS = {
     # the budget in 90 of 90 historical runs, max 2 rounds on any subtask.
     "subtask_redrive_rounds": 2,
     "redrive_budget_sec": 14400,
-    # The most a delivery re-drive group's leftovers commit may take
-    # (DESIGN §8 *A re-drive group's leftovers are its implementer's*):
-    # past either, nothing is committed and the paths are listed instead.
-    # Review round 11 M1 drove 505 files (an unignored `node_modules/`, a
-    # coverage report, a core dump) into one leftovers commit; a re-drive
-    # group's own change is a handful of files.
-    "redrive_leftovers_max_files": 100,
-    "redrive_leftovers_max_bytes": 5 * 1024 * 1024,
-    # What of an over-cap leftovers set is saved under the run directory so
-    # the PR entry listing it can be acted on (review round 12 L2: a later
-    # rollback erased the files the entry said to commit).
-    "redrive_leftovers_save_max_bytes": 64 * 1024 * 1024,
+    # I1 (DESIGN §8 *A worker leaves its tree clean*): how many times a
+    # worker that left its tree dirty is re-asked — its own session resumed
+    # — to commit or delete each line before its round is rolled back and
+    # recorded unconverged. Bounded because an unbounded re-ask is one of
+    # the failure modes the prior art names; 0 of 2,745 measured worker
+    # sessions ended dirty, so it almost never fires.
+    "clean_tree_reasks": 2,
     # Extra attempts of the final delivery judge after it crashes (a
     # WorkerError or a timeout) before its items are `unknown` and go to a
     # human — never `met` with no read of the commit (review round 13
@@ -868,6 +862,11 @@ STATE_FIELDS = (
     # the run-level wall time charged against `redrive_budget_sec`, and the
     # record of every subtask settled `unconverged`.
     "redrive_rounds", "redrive_spent_sec", "unconverged_subtasks",
+    # I1 (DESIGN §8 *A worker leaves its tree clean*): a staging or
+    # conformer round rolled back because its worker left its tree unclean
+    # past `clean_tree_reasks`, keyed "<worker>:<where>", with the porcelain
+    # lines. Makes the run unconverged. Absent on every clean run.
+    "unclean_trees",
     # The failing-test-ID diff (DESIGN §9 *Which failures are new*): base and
     # final failing IDs, and the latest B* verdict on their difference.
     "baseline_failing_ids", "final_failing_ids", "test_id_diff",
@@ -6405,9 +6404,9 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
               and _pr_entry(e.get("detail"))):
             add("Regression checks the run could not settle",
                 f"- [ ] {_pr_entry(e.get('detail'))}")
-        elif (e.get("source") == _REDRIVE_LEFTOVERS_GAP_SOURCE
+        elif (e.get("source") == _REDRIVE_HELDOUT_GAP_SOURCE
               and _pr_entry(e.get("detail"))):
-            add("Files a re-drive left uncommitted",
+            add("Files removed for holding a hidden test's source",
                 f"- [ ] {_pr_entry(e.get('detail'))}")
         elif e.get("source") == "blocker" and isinstance(e.get("subtask"),
                                                           str):
@@ -34467,6 +34466,12 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
     residual_defects = _residual_defects_reason(st)
     if residual_defects:
         reasons.append(residual_defects)
+    unclean = st.data.get("unclean_trees")
+    for rec in (unclean.values() if isinstance(unclean, dict) else ()):
+        if isinstance(rec, dict):
+            reasons.append(_unclean_reason(
+                f"the {rec.get('worker')} at {rec.get('where')}",
+                [str(x) for x in rec.get("lines") or []]))
     if reasons:
         outcome = "unconverged"
     elif not any_commits:
@@ -35554,8 +35559,6 @@ _INFRASTRUCTURE_FAILURE_KINDS = frozenset({
 _WORKER_RETRYABLE_KINDS = frozenset({
     "no_commits",      # check_branch_has_commits — implementer claimed
                        # complete with nothing committed
-    "dirty_worktree",  # inline status-porcelain check in _settle_subtask —
-                       # uncommitted changes would be lost on integration
     "empty_handoff",   # _validate_result — `incomplete-handoff` envelope
                        # with a checkpoint_path that does not exist on
                        # disk. Two known triggers: (a) the Claude Code
@@ -36962,31 +36965,131 @@ async def _rollback_conformer_commits(worktree: str, before_sha: str) -> None:
     """Hard-reset the subtask branch back to `before_sha`. Used when the
     conformer wrote to a protected path — the implementer's commits
     are preserved, the conformer's are dropped. Safe to call when no
-    new commits were made: it's a no-op reset.
-
-    Note: `git reset --hard` also discards uncommitted changes. Callers
-    that want to warn about discarded scribbles should call
-    `_uncommitted_paths` first."""
+    new commits were made: it's a no-op reset. The tree is clean by then
+    (I1, `_clean_tree_gate`), so the reset discards nothing uncommitted."""
     if not before_sha:
         return
     await run_proc(["git", "reset", "--hard", before_sha], cwd=worktree)
 
 
-async def _uncommitted_paths(worktree: str) -> list[str]:
-    """Return tracked-file paths with uncommitted changes in the worktree,
-    or [] if the check fails. Untracked files are excluded — the rollback
-    only touches tracked state. Used as a pre-rollback observability
-    helper: when the conformer leaves uncommitted scribbles alongside a
-    commit that triggers rollback, those scribbles get silently discarded
-    by `git reset --hard`. This lets the caller surface what was lost."""
+# I1 (DESIGN §8 *A worker leaves its tree clean*): the one message a worker
+# that left its tree dirty is re-asked with. It carries the porcelain lines
+# verbatim and allows exactly two acts per line; anything else would be
+# leerie guessing which of the worker's files are its change.
+CLEAN_TREE_REASK_NOTE = (
+    "Your tree is not clean. Leerie measures, integrates and ships only "
+    "committed work, and never commits for you. "
+    "`git status --porcelain --untracked-files=all` in your working "
+    "directory prints:\n{lines}\n"
+    "For EACH line above do exactly one of two things: commit it, if it is "
+    "part of your change; or delete it, if it is not (a scratch file, a "
+    "by-product of a command you ran — restore a modified tracked file "
+    "with `git checkout -- <path>`). Do no other work. Then run that same "
+    "`git status` command, confirm it prints nothing, and return the JSON "
+    "object per your schema.")
+# The most porcelain lines one record or reason carries.
+_UNCLEAN_LINES_MAX = 20
+
+
+async def _tree_dirt(tree: str | Path) -> list[str] | None:
+    """I1's checker: every line `git status --porcelain
+    --untracked-files=all` prints in `tree`, verbatim — a tracked edit, a
+    staged change, or an untracked file `.gitignore` does not cover. An
+    ignored file never appears, so it can never make a tree dirty. [] is
+    clean; None when git could not answer (nothing was read, so not
+    clean)."""
     try:
-        r = await run_proc(["git", "status", "--porcelain"], cwd=worktree)
+        r = await run_proc(["git", "status", "--porcelain",
+                            "--untracked-files=all"], cwd=str(tree))
     except OSError:
-        return []
+        return None
     if r.returncode != 0:
-        return []
-    return [line for line in r.stdout.splitlines()
-            if line and not line.startswith("??")]
+        return None
+    return [line for line in r.stdout.splitlines() if line]
+
+
+def _clean_tree_reasker(st: "State", caps: dict, *, log_sid: str, cwd: str,
+                        schema_key: str, system_prompt: str, model: str,
+                        effort: str | None, max_turns: int
+                        ) -> Callable[[str], Awaitable[None]]:
+    """The re-ask of the SAME worker for `_clean_tree_gate`: its CLI session
+    (the last `session_id` in `<run>/logs/<log_sid>.log`, then in the
+    previous re-ask's log) resumed in `cwd` with the note as the next turn,
+    under the worker's own system prompt, schema and model. Its structured
+    result is not read — only the tree is. Raises WorkerError when no
+    session is recorded (nothing to resume); every other failure is
+    `claude_p`'s own."""
+    last = [log_sid]
+
+    async def reask(note: str) -> None:
+        session = _log_session_id(st.run_dir / "logs" / f"{last[-1]}.log")
+        if not session:
+            raise WorkerError(f"no session recorded in {last[-1]}.log to "
+                              "re-ask")
+        sid = f"{log_sid}-clean{len(last)}"
+        st.bump_workers(caps)
+        await claude_p(user_prompt=note, system_prompt=system_prompt,
+                       schema_key=schema_key, cwd=cwd,
+                       allowed_tools=ACT_TOOLS, max_turns=max_turns,
+                       autonomous=True, caps=caps, st=st, model=model,
+                       effort=effort, sid=sid, resume_session=session)
+        last.append(sid)
+    return reask
+
+
+async def _clean_tree_gate(tree: str | Path, *, caps: dict, label: str,
+                           reask: Callable[[str], Awaitable[None]]
+                           ) -> list[str]:
+    """I1 (DESIGN §8 *A worker leaves its tree clean*), shared by every
+    worker that runs in a tree leerie measures, integrates or ships. Called
+    right after the worker returned, before leerie runs anything of its own
+    in `tree`. While `_tree_dirt` is not empty, `reask` (the same worker,
+    `_clean_tree_reasker`) is called with `CLEAN_TREE_REASK_NOTE` carrying
+    the lines, at most `clean_tree_reasks` times; a re-ask that raises
+    spends its attempt. Returns [] when the tree is clean, else the lines
+    still there — the caller rolls the round back by its own rule and
+    records them. Never commits, never deletes."""
+    reasks = int(caps.get("clean_tree_reasks",
+                          DEFAULT_CAPS["clean_tree_reasks"]))
+    attempt = 0
+    while True:
+        lines = await _tree_dirt(tree)
+        if lines == []:
+            return []
+        if lines is None:
+            lines = ["(git status failed — the tree could not be read)"]
+        if attempt >= reasks:
+            log(f"  {label}: tree still not clean after {reasks} re-ask(s): "
+                + "; ".join(lines[:5])
+                + (f" (+{len(lines) - 5} more)" if len(lines) > 5 else ""))
+            return lines
+        attempt += 1
+        log(f"  {label}: left its tree unclean ({len(lines)} line(s)) — "
+            f"re-asking it to commit or delete each ({attempt}/{reasks})")
+        try:
+            await reask(CLEAN_TREE_REASK_NOTE.format(lines="\n".join(
+                f"    {line}" for line in lines)))
+        except Exception as e:
+            log(f"  {label}: the re-ask failed ({_brief_worker_exc(e)})")
+
+
+def _record_unclean_tree(st: "State", worker: str, where: str,
+                         lines: list[str]) -> None:
+    """Record a staging round rolled back for a tree its worker left unclean
+    (`_clean_tree_gate` exhausted): `unclean_trees["<worker>:<where>"]`.
+    `_decide_outcome` makes the run `unconverged` with it named."""
+    st.data.setdefault("unclean_trees", {})[f"{worker}:{where}"] = {
+        "worker": worker, "where": where,
+        "lines": list(lines[:_UNCLEAN_LINES_MAX])}
+    st.save()
+
+
+def _unclean_reason(what: str, lines: list[str]) -> str:
+    """`what` left its tree unclean, with the first lines, for a reason."""
+    shown = "; ".join(lines[:5]) + (f" (+{len(lines) - 5} more)"
+                                    if len(lines) > 5 else "")
+    return (f"{what} left its tree unclean after its re-asks, so its work "
+            f"was rolled back: {shown}")
 
 
 async def _unprefixed_conformer_commits(worktree: str, before_sha: str,
@@ -38052,6 +38155,31 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                             "phase surfaced as advisory")
             break
 
+        # I1 (DESIGN §8 *A worker leaves its tree clean*): before anything
+        # of leerie's runs here again. Still dirty after the re-asks, the
+        # round is rolled back to its start — its commits and its untracked
+        # files, ignored ones kept — and recorded; its repair records then
+        # describe nothing on the branch.
+        unclean = await _clean_tree_gate(
+            worktree, caps=caps, label=f"{sid} conformer round {c_round}",
+            reask=_clean_tree_reasker(
+                st, caps, log_sid=f"{sid}-conformer", cwd=worktree,
+                schema_key="conformer",
+                system_prompt=_load_prompt("conformer"),
+                model=models.get("conformer", MODEL_DEFAULT),
+                effort=efforts.get("conformer"),
+                max_turns=60))
+        if unclean:
+            await _rollback_conformer_commits(worktree, before_sha)
+            await run_proc(["git", "clean", "-fdq"], cwd=worktree)
+            warnings.append(f"conformer round {c_round}: "
+                            + _unclean_reason("the conformer", unclean))
+            _record_unclean_tree(st, "conformer", f"{sid} round {c_round}",
+                                 unclean)
+            last_res = _apply_measured_axes(last_res, pre)
+            last_res["conformer_repair_rolled_back"] = True
+            break
+
         # Overwrite the worker's self-reported axes as soon as there is a dict
         # to overwrite — BEFORE the gates below, every one of which can `break`
         # out of the round. Without this the malformed-result, protected-path
@@ -38094,12 +38222,6 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         # side-channel and does not surface here.
         scope_err = await check_diff_scope(sid, worktree, subtask, st)
         if scope_err:
-            discarded = await _uncommitted_paths(worktree)
-            if discarded:
-                warnings.append(
-                    f"conformer round {c_round}: discarding "
-                    f"{len(discarded)} uncommitted file(s) during rollback: "
-                    f"{[line[3:] for line in discarded]}")
             await _rollback_conformer_commits(worktree, before_sha)
             warnings.append(f"conformer round {c_round}: protected-path "
                             f"violation reverted ({scope_err})")
@@ -38115,31 +38237,16 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
             last_res["conformer_repair_rolled_back"] = True
             break
 
-        # Dirty-worktree check: the conformer should commit, not leave
-        # uncommitted changes that integration would lose.
-        dirty = await _uncommitted_paths(worktree)
-        if dirty:
-            warnings.append(f"conformer round {c_round}: left "
-                            f"{len(dirty)} uncommitted change(s) — not "
-                            "rolled back, but surfaced as advisory")
-        # Phantom-repair hazard, same class as the rollback arms above: a
-        # `kind: "tests"` file_updates entry whose path is not committed
-        # records a repair integration will lose. Checked against the
-        # FULL porcelain output, not `_uncommitted_paths` — that helper
-        # deliberately excludes untracked (`??`) files, and a test the
-        # conformer wrote but never `git add`ed is exactly this case.
-        # Neutralizes the mitigation act only; the files stay (advisory
-        # arm, nothing reverted).
         tests_paths = {u.get("path") for u in
                        (last_res.get("file_updates") or [])
                        if isinstance(u, dict) and u.get("kind") == "tests"}
         if tests_paths:
             # Canonicalize the cited paths to worktree-relative before
-            # intersecting: porcelain prints canonical relative paths,
-            # while the validator RESOLVES a cited path — so `./x.py`
-            # and the absolute worktree spelling both pass validation
-            # yet never string-match porcelain (two executed evasions,
-            # the most common LLM path spellings).
+            # matching them against the phase's own diff below: git prints
+            # canonical relative paths, while the validator RESOLVES a
+            # cited path — so `./x.py` and the absolute worktree spelling
+            # both pass validation yet never string-match git's output
+            # (two executed evasions, the most common LLM path spellings).
             _wt_resolved = Path(worktree).resolve()
 
             def _canon_rel(p: object) -> str | None:
@@ -38147,9 +38254,9 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                     # .strip() mirrors _validate_conformance_result: the
                     # validator strips a cited path before resolving, so
                     # a padded spelling ("x.py ") passes validation —
-                    # without the same strip here it never matched
-                    # porcelain and the phantom repair counted (executed,
-                    # 4/4 padding variants).
+                    # without the same strip here it never matched git's
+                    # output and the phantom repair counted (executed, 4/4
+                    # padding variants).
                     rp = Path(str(p).strip())
                     if not rp.is_absolute():
                         rp = _wt_resolved / rp
@@ -38158,63 +38265,12 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                     return None
             tests_paths = {c for c in (_canon_rel(p) for p in tests_paths)
                            if c}
-        if tests_paths:
-            # `-z -uall`, parsed as NUL records, not `line[3:]` over the
-            # line form: the line form never prints the verbatim path
-            # for an untracked file under a new directory (`?? dir/`,
-            # collapsed), a path with spaces (quoted), a rename
-            # (`R old -> new`), or non-ASCII under core.quotepath
-            # (octal-escaped) — four executed evasions, each of which
-            # let a genuinely-uncommitted tests path count as a repair.
-            unclean: set[str] = set()
-            try:
-                _porc = await run_proc(
-                    ["git", "status", "--porcelain", "-z", "-uall"],
-                    cwd=worktree)
-            except OSError:
-                _porc = None
-            if _porc is not None and _porc.returncode == 0:
-                _fields = _porc.stdout.split("\0")
-                _i = 0
-                while _i < len(_fields):
-                    _rec = _fields[_i]
-                    _i += 1
-                    if len(_rec) < 4:
-                        continue
-                    unclean.add(_rec[3:])
-                    # Rename/copy records carry the ORIGIN path as the
-                    # following NUL field — on EITHER status side: X=R is
-                    # a staged rename, Y=R (`' R'`) a worktree-side one
-                    # (intent-to-add), and missing the latter desyncs the
-                    # record walk so a later record's path is swallowed
-                    # as a bogus origin (measured).
-                    if ("R" in _rec[:2] or "C" in _rec[:2]) \
-                            and _i < len(_fields):
-                        unclean.add(_fields[_i])
-                        _i += 1
-            # Ancestor-prefix match, not bare intersection: the validator
-            # accepts a DIRECTORY citation (it checks exists(), never
-            # is_file() — a pre-existing laxness this feature makes
-            # load-bearing), while `-uall` porcelain prints only the
-            # files beneath it, so "tests_new" / "." as the cited path
-            # intersected nothing and the phantom counted (executed,
-            # three spellings).
-            _phantom = next(
-                ((c, u) for c in tests_paths for u in unclean
-                 if u and (u == c or c == "." or u.startswith(c + "/"))),
-                None)
-            if _phantom:
-                warnings.append(
-                    f"conformer round {c_round}: tests file_updates "
-                    f"entry {_phantom[0]!r} references the uncommitted "
-                    f"path {_phantom[1]!r} — not counted as a mitigation "
-                    "repair")
-                last_res["conformer_repair_rolled_back"] = True
 
         # DESIGN §9: the repair must be a COMMITTED tests update — i.e.
-        # committed by THIS phase. A citation of a pre-existing,
+        # committed by THIS phase (the tree is clean by now, I1, so no cited
+        # path can be an uncommitted one). A citation of a pre-existing,
         # untouched committed path (or of an always-existing directory)
-        # passes the validator and is invisible to porcelain, yet records
+        # passes the validator and is in no diff of this phase, yet records
         # no repair (executed: a zero-commit pass citing the
         # implementer's own file rendered "addressed (mitigated)"). The
         # cited path must ancestor-match the phase's own diff
@@ -38270,12 +38326,6 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                 f"conformer round {c_round}: reverted/deleted "
                 f"{len(clobbered)} implementer-owned file(s): {clobbered}")
             if caps.get("strict_conformer"):
-                discarded = await _uncommitted_paths(worktree)
-                if discarded:
-                    warnings.append(
-                        f"conformer round {c_round}: discarding "
-                        f"{len(discarded)} uncommitted file(s) during "
-                        f"clobber rollback: {[line[3:] for line in discarded]}")
                 await _rollback_conformer_commits(worktree, impl_head_sha)
                 warnings.append(
                     f"conformer round {c_round}: strict mode — rolled "
@@ -48385,6 +48435,31 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                     f"{entry['pre_sha'][:12]} FAILED — its commits remain")
             _save_gate()
 
+        async def _round_unclean(rnd: int, round_pre: str | None,
+                                 prev: list[dict], prev_sha: str) -> bool:
+            """I1 (DESIGN §8 *A worker leaves its tree clean*) after a
+            round's worker, crashed or not, before the round is measured:
+            still dirty after the re-asks, the round is rolled back to its
+            start by `_settle_round`'s own rule and recorded. True then."""
+            unclean = await _clean_tree_gate(
+                staging, caps=caps, label=f"acceptance repair round {rnd}",
+                reask=_clean_tree_reasker(
+                    st, caps, log_sid=f"acceptance-repair-r{rnd}",
+                    cwd=str(staging), schema_key="conformer",
+                    system_prompt=_load_prompt("conformer"),
+                    model=models.get("conformer", MODEL_DEFAULT),
+                    effort=EFFORT_ACCEPTANCE_REPAIR, max_turns=120))
+            if not unclean:
+                return False
+            _record_unclean_tree(st, "acceptance repair", f"round {rnd}",
+                                 unclean)
+            await _settle_round(
+                {"round": rnd, "pre_sha": round_pre,
+                 "unclean_tree": unclean[:_UNCLEAN_LINES_MAX],
+                 "rollback_reason": "left its tree unclean"},
+                prev, prev_sha)
+            return True
+
         # A round decided rolled back before a crash finishes its reset.
         last = gate["rounds"][-1] if gate["rounds"] else {}
         if (last.get("rollback_reason") and "rolled_back" not in last
@@ -48451,6 +48526,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 # an OSError spawning the worker (EAGAIN) through unchanged,
                 # and after an earlier round's commit that must not skip the
                 # rollback check below.
+                if await _round_unclean(rnd, round_pre, prev, prev_sha):
+                    break
                 entry = {"round": rnd, "error": _brief_worker_exc(e),
                          "pre_sha": round_pre}
                 # A worker can commit and then fail (a schema miss, a
@@ -48466,6 +48543,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                     entry["results"] = final
                     entry["sha"] = final_sha
                 await _settle_round(entry, prev, prev_sha)
+                break
+            if await _round_unclean(rnd, round_pre, prev, prev_sha):
                 break
             # `_evaluate_acceptance_sets` turns a set it cannot place into
             # no evidence rather than raising, so the rollback check below
@@ -51703,11 +51782,11 @@ def _redrive_unstage(staging: Path, staged: list[dict], *,
     staging created every runner copy of a staged file and every file
     holding one of `prints`' spans; those removed paths are appended to
     `swept`. Any other file there — the implementer's own sibling test or
-    conftest — stays, for the leftovers commit (review round 12: the whole
-    directory used to go, silently). A removed file that is neither a
+    conftest — stays, for the implementer to commit (review round 12: the
+    whole directory used to go, silently). A removed file that is neither a
     staged file nor a runner copy of one is a file someone wrote there that
     held a span: it is also appended to `span_held`, which the caller lists
-    in the PR (`withheld["heldout"]`; review round 13 M2: it was deleted
+    in the PR (`heldout_listed`; review round 13 M2: it was deleted
     with no entry anywhere but the group's record). Returns the staged files
     whose bytes changed."""
     tampered: list[str] = []
@@ -53641,357 +53720,40 @@ def _redrive_key_text(key: str) -> str:
     return f"existing test `{key}`"
 
 
-_WRITE_TOOL_KINDS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+_REDRIVE_HELDOUT_GAP_SOURCE = "redrive_heldout_removed"
 
 
-def _worker_written_paths(log_path: Path, tree: str | Path) -> set[str]:
-    """`tree`-relative paths of every file a worker's Write/Edit/MultiEdit/
-    NotebookEdit tool calls named, read from its per-worker log's
-    `tool_use` records (`_iter_log_tool_use` — mechanical input fields,
-    never its prose). A path outside `tree` is dropped; no log, no paths."""
-    root = os.path.realpath(str(tree))
-    out: set[str] = set()
-    for _kind, inp, _res in _iter_log_tool_use(log_path,
-                                               kinds=_WRITE_TOOL_KINDS):
-        fp = str(inp.get("file_path") or inp.get("notebook_path") or "")
-        if not fp:
-            continue
-        full = os.path.realpath(fp if os.path.isabs(fp)
-                                else os.path.join(root, fp))
-        if full.startswith(root + os.sep):
-            out.add(os.path.relpath(full, root))
-    return out
-
-
-# Untracked file names a tool writes as a by-product of running or editing,
-# never as a source file, that the leftovers commit withholds and lists
-# (DESIGN §8 *A re-drive group's leftovers are its implementer's*):
-# bytecode, editor swap/backup files and Finder metadata. Deliberately
-# short — coverage, reports and build output are committed by some
-# repositories on purpose.
-_LEFTOVER_ARTIFACT_GLOBS = ("*.pyc", "*.pyo", "*.swp", "*.swo", "*~", ".#*",
-                            "#*#", ".DS_Store")
-_CORE_DUMP_RE = re.compile(r"core(\.\d+)?")
-_REDRIVE_LEFTOVERS_GAP_SOURCE = "redrive_leftovers"
-
-
-def _leftover_artifact(staging: Path, rel: str) -> bool:
-    """True when the untracked file `rel` has a `_LEFTOVER_ARTIFACT_GLOBS`
-    name, or is a core dump: named `core` / `core.<digits>` and starting
-    with the ELF magic."""
-    name = os.path.basename(rel)
-    if any(fnmatch.fnmatchcase(name, g) for g in _LEFTOVER_ARTIFACT_GLOBS):
-        return True
-    if _CORE_DUMP_RE.fullmatch(name):
-        try:
-            with open(staging / rel, "rb") as f:
-                return f.read(4) == b"\x7fELF"
-        except OSError:
-            return False
-    return False
-
-
-def _set_redrive_leftovers_gap(st: "State", rec: dict,
-                               staging: Path | None = None) -> None:
-    """The "Needs human verification" entry for what kept re-drive groups
-    left uncommitted that the leftovers commit withheld (`leftovers_withheld`
-    of every group not rolled back): a whole over-cap set, the files a
-    leerie command generated that the implementer then edited, and the
-    files removed for holding a span of a staged set's source, by path. An
-    artifact shape (`_leftover_artifact`) is never listed — no reviewer has
-    anything to decide about a `.pyc` (review round 12 M1); the leftovers
-    commit logs it. A withheld path `staging`'s HEAD tracks now — a later
-    group's own `git add -A` committed it — is not listed as uncommitted.
+def _set_redrive_heldout_gap(st: "State", rec: dict) -> None:
+    """The "Needs human verification" entry for the files a kept re-drive
+    group wrote under a directory staging created that held a span of a
+    staged set's source and were removed at unstage (`heldout_listed`;
+    DESIGN §8 *No line of a staged set's source reaches history*, rule 1).
     Cleared when there is none."""
     data = getattr(st, "data", None)
     if not isinstance(data, dict):
         return
-    over: list[str] = []
-    saved: list[str] = []
-    copies: list[str] = []
-    gen: list[str] = []
+    paths: list[str] = []
     for r in rec.get("rounds") or []:
         for g in r.get("groups") or []:
-            w = g.get("leftovers_withheld") if isinstance(g, dict) else None
-            if not isinstance(w, dict) or g.get("rolled_back"):
+            if not isinstance(g, dict) or g.get("rolled_back"):
                 continue
-            over += [p for p in w.get("over_cap") or [] if p not in over]
-            saved += [p for p in w.get("saved") or [] if p not in saved]
-            copies += [p for p in w.get("heldout") or [] if p not in copies]
-            gen += [p for p in w.get("generated_edited") or []
-                    if p not in gen]
-    if staging is not None and (over or gen):
-        r = _git_z_output(["git", "--literal-pathspecs", "-C",
-                           str(staging), "ls-files", "-z", "--",
-                           *(over + gen)])
-        if r.returncode == 0:
-            tracked = set(r.stdout.split("\0"))
-            over = [p for p in over if p not in tracked]
-            gen = [p for p in gen if p not in tracked]
+            paths += [p for p in g.get("heldout_listed") or []
+                      if p not in paths]
     entries = [e for e in (data.get("needs_human_verification") or [])
                if not (isinstance(e, dict) and e.get("source")
-                       == _REDRIVE_LEFTOVERS_GAP_SOURCE)]
-
-    def shown(xs: list[str]) -> str:
-        return ", ".join(xs[:10]) + (f" (+{len(xs) - 10} more)"
-                                     if len(xs) > 10 else "")
-    parts = []
-    if over:
-        parts.append(f"over the leftovers cap, nothing committed"
-                     + (f" (saved to {', '.join(saved)})" if saved
-                        else " (not saved)")
-                     + f": {shown(over)}")
-    if gen:
-        parts.append("generated by leerie's own command, then edited by the "
-                     f"implementer, not committed: {shown(gen)}")
-    if copies:
-        parts.append("removed for holding lines of a hidden test's source "
-                     f"(a tracked one put back as HEAD has it): "
-                     f"{shown(copies)}")
-    if parts:
+                       == _REDRIVE_HELDOUT_GAP_SOURCE)]
+    if paths:
         entries.append({
-            "source": _REDRIVE_LEFTOVERS_GAP_SOURCE,
-            "detail": ("delivery re-drive leftovers: files a re-drive "
-                       "implementer left uncommitted in staging that leerie "
-                       "did not commit for it — commit the ones that belong "
-                       "in the change. " + "; ".join(parts))})
+            "source": _REDRIVE_HELDOUT_GAP_SOURCE,
+            "detail": ("delivery re-drive: file(s) an implementer wrote "
+                       "beside a hidden test, removed for holding lines of "
+                       "its source: " + ", ".join(paths[:10])
+                       + (f" (+{len(paths) - 10} more)"
+                          if len(paths) > 10 else ""))})
     if entries != (data.get("needs_human_verification") or []):
         data["needs_human_verification"] = entries
         with contextlib.suppress(Exception):
             st.save()
-
-
-def _save_withheld_leftovers(staging: Path, paths: list[str],
-                             save_dir: Path, stem: str,
-                             max_bytes: int) -> list[str]:
-    """Save an over-cap leftovers set (DESIGN §8 *A re-drive group's
-    leftovers are its implementer's*, the cap): `<stem>.tar.gz` of each
-    path that exists, as it stands — every tracked one first, outside the
-    byte budget, then the untracked ones smallest first until the next
-    would pass `max_bytes` — and `<stem>.patch`, the tracked part as a
-    binary diff against HEAD, built in a temporary index fed the tracked
-    paths through a NUL-separated pathspec file, never the argument
-    vector. Review round 13 L1: filled in path order, a `node_modules/`
-    tree crowded the tracked fix out of the archive, and 26k paths on
-    `git diff`'s argv raised E2BIG, so no patch was written. Returns the
-    files written; never raises (a save that fails is logged, and the paths
-    are still listed)."""
-    out: list[str] = []
-    try:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        ls = _git_z_output(["git", "-C", str(staging), "ls-files", "-z"])
-        index = set(ls.stdout.split("\0")) if ls.returncode == 0 else set()
-        tracked = [p for p in paths if p in index]
-        sizes: dict[str, int] = {}
-        for p in paths:
-            with contextlib.suppress(OSError):
-                sizes[p] = os.lstat(staging / p).st_size
-        untracked = sorted((p for p in paths if p not in index
-                            and p in sizes), key=lambda p: (sizes[p], p))
-        arc = save_dir / f"{stem}.tar.gz"
-        total, skipped = 0, []
-        with tarfile.open(arc, "w:gz") as tar:
-            for p in tracked:
-                if p in sizes:
-                    tar.add(staging / p, arcname=p, recursive=False)
-            for p in untracked:
-                if total + sizes[p] > max_bytes:
-                    skipped.append(p)
-                    continue
-                total += sizes[p]
-                tar.add(staging / p, arcname=p, recursive=False)
-        out.append(str(arc))
-        if skipped:
-            log(f"  delivery re-drive: {len(skipped)} over-cap untracked "
-                f"leftover file(s) not saved, past {max_bytes} bytes: "
-                + ", ".join(skipped[:5])
-                + (f" (+{len(skipped) - 5} more)" if len(skipped) > 5
-                   else ""))
-        if tracked:
-            with tempfile.TemporaryDirectory(prefix="leerie-save-") as tmp:
-                spec = Path(tmp) / "paths"
-                spec.write_bytes(b"".join(os.fsencode(p) + b"\0"
-                                          for p in tracked))
-                env = {**os.environ,
-                       "GIT_INDEX_FILE": str(Path(tmp) / "index")}
-                # Each argv a literal led by "git", so the forbidden-command
-                # guard reads its program word (tests/
-                # test_blt_forbidden_gate.py); `pre + [...]` hid it.
-                pre = ["--literal-pathspecs", "-C", str(staging)]
-                ok = (subprocess.run(["git", *pre, "read-tree", "HEAD"],
-                                     env=env, capture_output=True,
-                                     check=False).returncode == 0
-                      and subprocess.run(
-                          ["git", *pre, "add", "-A", "-f",
-                           f"--pathspec-from-file={spec}",
-                           "--pathspec-file-nul"], env=env,
-                          capture_output=True, check=False).returncode == 0)
-                diff = (subprocess.run(
-                    ["git", *pre, "diff", "--cached", "--binary", "HEAD"],
-                    env=env, capture_output=True, check=False)
-                    if ok else None)
-            if diff is not None and diff.returncode == 0 and diff.stdout:
-                patch = save_dir / f"{stem}.patch"
-                patch.write_bytes(diff.stdout)
-                out.append(str(patch))
-            elif diff is None or diff.returncode != 0:
-                log("  delivery re-drive: could not write the over-cap "
-                    "leftovers' patch")
-    except (OSError, tarfile.TarError) as e:
-        log(f"  delivery re-drive: could not save the over-cap leftovers "
-            f"({type(e).__name__}: {e})")
-    return out
-
-
-async def _redrive_commit_leftovers(staging: Path, label: str,
-                                    tracked_before: dict[str, str | None]
-                                    | None,
-                                    untracked_before: dict[str, list[int]]
-                                    | None,
-                                    written: set[str], *,
-                                    prints: dict[int, frozenset[bytes]]
-                                    | None = None,
-                                    withheld: dict[str, list[str]] | None
-                                    = None,
-                                    caps: dict | None = None,
-                                    save_dir: Path | None = None
-                                    ) -> list[str]:
-    """Commit what a re-drive group's implementer left uncommitted (DESIGN
-    §8 *A re-drive group's leftovers are its implementer's*): the tracked
-    files whose content changed while the group ran (`_changed_paths`
-    between `tracked_before`, the `_tracked_content` snapshot taken just
-    before the implementer started, and now), and the untracked, not-ignored
-    files that appeared or changed while it ran (their `_untracked_signatures`
-    differ from `untracked_before`) less those leerie's own commands
-    produced (`_leerie_produced`), plus any untracked file the implementer's
-    Write/Edit tool calls name (`written`, `_worker_written_paths`) even if
-    it predates the group untouched since. A file is made through a shell
-    command as often as through a tool call, so the tool calls cannot be
-    the only source (review round 10 M1: a plain `mv` shipped the deletion
-    without the new file). An untracked file of unknown origin that predates
-    the group and that it did not touch is logged, never taken. Paths go to
-    git as literal pathspecs. Returns the paths committed ([] when nothing
-    was, so HEAD does not move and the group reads `no_change`). With no
-    snapshot (git failed), that side contributes nothing but `written`.
-
-    Before anything is chosen, every file the group made or changed that
-    holds a span of a staged set's source (`prints`,
-    `_heldout_fingerprints`) is removed — an untracked one unlinked, a
-    tracked one checked out from HEAD — and listed in `withheld["heldout"]`
-    (DESIGN §8 *No line of a staged set's source reaches history*, rule 4).
-    A value the test asserts is not a span: a file sharing only literals
-    with it is the fix, and stays.
-
-    Of the rest, an untracked file `_leftover_artifact` names is withheld
-    (`withheld["artifacts"]`), and when what remains is more than
-    `redrive_leftovers_max_files` paths or `redrive_leftovers_max_bytes`
-    bytes (`caps`, else `DEFAULT_CAPS`), nothing is committed and every
-    path goes to `withheld["over_cap"]` — saved first under `save_dir`
-    when given (`_save_withheld_leftovers`, the files written to
-    `withheld["saved"]`), so the entry listing them can be acted on after a
-    later rollback erases them (review round 12 L2)."""
-    now = await asyncio.to_thread(_tracked_content, staging)
-    tracked = (_changed_paths(tracked_before, now)
-               if tracked_before is not None and now is not None else [])
-    sigs = await asyncio.to_thread(_untracked_signatures, staging) or {}
-    moved = (set() if untracked_before is None else
-             {p for p, sig in sigs.items() if untracked_before.get(p) != sig})
-    if prints:
-        tainted = sorted(
-            p for p in set(tracked) | ((moved | set(written)) & set(sigs))
-            if _file_holds_span(staging / p, prints))
-        for p in tainted:
-            if p in sigs:
-                with contextlib.suppress(OSError):
-                    (staging / p).unlink()
-            else:
-                await run_proc(["git", "--literal-pathspecs", "checkout",
-                                "HEAD", "--", p], cwd=str(staging))
-        if tainted:
-            log(f"  delivery re-drive ({label}): removed {len(tainted)} "
-                "file(s) holding a span of a staged held-out set's source: "
-                + ", ".join(tainted[:5])
-                + (f" (+{len(tainted) - 5} more)" if len(tainted) > 5
-                   else ""))
-            if withheld is not None:
-                withheld.setdefault("heldout", []).extend(tainted)
-            tracked = [p for p in tracked if p not in tainted]
-            sigs = {p: v for p, v in sigs.items() if p not in tainted}
-            moved -= set(tainted)
-            written = set(written) - set(tainted)
-    produced = await asyncio.to_thread(_leerie_produced, staging, sigs)
-    # First producer keeps a generated file out of the commit; one the
-    # group changed and no leerie command wrote last is listed (DESIGN §6½,
-    # review round 12 M2): the edit may be what the fix rests on.
-    last = await asyncio.to_thread(_leerie_last_wrote, staging, sigs)
-    # What a leerie test run writes here or in a checkout of this commit is
-    # output: the implementer's own test run rewriting it is no change
-    # (DESIGN §6½, review round 14).
-    reports = await asyncio.to_thread(_leerie_test_outputs, staging)
-    edited = sorted(p for p in (produced & moved) - last - reports
-                    if not _leftover_artifact(staging, p))
-    if edited:
-        log(f"  delivery re-drive ({label}): {len(edited)} file(s) a leerie "
-            "command generated and the group then changed, not committed: "
-            + ", ".join(edited[:5])
-            + (f" (+{len(edited) - 5} more)" if len(edited) > 5 else ""))
-        if withheld is not None:
-            withheld.setdefault("generated_edited", []).extend(edited)
-    untracked = sorted(((moved - produced) | (set(sigs) & set(written))))
-    shaped = [p for p in untracked
-              if p in reports or _leftover_artifact(staging, p)]
-    if shaped:
-        log(f"  delivery re-drive ({label}): {len(shaped)} artifact-shaped "
-            "untracked file(s) not committed: " + ", ".join(shaped[:5])
-            + (f" (+{len(shaped) - 5} more)" if len(shaped) > 5 else ""))
-        if withheld is not None:
-            withheld.setdefault("artifacts", []).extend(shaped)
-    left_out = sorted(set(sigs) - produced - set(untracked))
-    untracked = [p for p in untracked if p not in shaped]
-    if left_out:
-        log(f"  delivery re-drive ({label}): {len(left_out)} untracked "
-            "file(s) predating the group, untouched by it, left uncommitted: "
-            + ", ".join(left_out[:5])
-            + (f" (+{len(left_out) - 5} more)" if len(left_out) > 5 else ""))
-    paths = sorted(set(tracked) | set(untracked))
-    if not paths:
-        return []
-    cp = caps or DEFAULT_CAPS
-    max_files = int(cp.get("redrive_leftovers_max_files",
-                           DEFAULT_CAPS["redrive_leftovers_max_files"]))
-    max_bytes = int(cp.get("redrive_leftovers_max_bytes",
-                           DEFAULT_CAPS["redrive_leftovers_max_bytes"]))
-    size = 0
-    for p in paths:
-        with contextlib.suppress(OSError):
-            size += os.lstat(staging / p).st_size
-    if len(paths) > max_files or size > max_bytes:
-        log(f"  delivery re-drive ({label}): {len(paths)} leftover file(s), "
-            f"{size} bytes — over the leftovers cap ({max_files} files, "
-            f"{max_bytes} bytes); nothing committed: "
-            + ", ".join(paths[:5])
-            + (f" (+{len(paths) - 5} more)" if len(paths) > 5 else ""))
-        saved = (await asyncio.to_thread(
-            _save_withheld_leftovers, staging, paths, save_dir,
-            re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-") or "group",
-            int(cp.get("redrive_leftovers_save_max_bytes",
-                       DEFAULT_CAPS["redrive_leftovers_save_max_bytes"])))
-                 if save_dir is not None else [])
-        if withheld is not None:
-            withheld.setdefault("over_cap", []).extend(paths)
-            if saved:
-                withheld.setdefault("saved", []).extend(saved)
-        return []
-    await run_proc(["git", "--literal-pathspecs", "add", "-A", "--", *paths],
-                   cwd=str(staging))
-    staged = await run_proc(["git", "diff", "--cached", "--quiet"],
-                            cwd=str(staging))
-    if staged.returncode != 1:
-        return []
-    await run_proc(["git", "commit", "-q", "--no-verify", "-m",
-                    f"leerie: delivery re-drive leftovers ({label})"],
-                   cwd=str(staging))
-    return paths
 
 
 async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
@@ -54300,10 +54062,6 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     selfcheck_cmd=cmd)
                 effort = (EFFORT_REDRIVE_ESCALATION if escalate
                           else efforts.get("implementer"))
-                tracked_before = await asyncio.to_thread(_tracked_content,
-                                                         staging)
-                untracked_before = await asyncio.to_thread(
-                    _untracked_signatures, staging)
                 ge["implementer"] = await _redrive_drive(
                     leerie_dir, st, caps, models, staging, members, note,
                     effort=effort, label=f"delivery-redrive-r{rnd}-g{gi}")
@@ -54314,31 +54072,56 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                                   swept=swept,
                                                   prints=prints,
                                                   span_held=span_held)
-            # A file written under a directory staging created that held a
-            # span went at unstage; it is listed like any other withheld
-            # leftover (the leftovers invariant: it ships or it is listed).
-            withheld: dict[str, list[str]] = (
-                {"heldout": sorted(set(span_held))} if span_held else {})
-            left = await _redrive_commit_leftovers(
-                staging, f"r{rnd} g{gi}", tracked_before, untracked_before,
-                _worker_written_paths(
-                    st.run_dir / "logs"
-                    / f"delivery-redrive-r{rnd}-g{gi}.log", staging),
-                prints=prints, withheld=withheld, caps=caps,
-                save_dir=st.run_dir / "redrive-leftovers")
-            if left:
-                ge["leftovers"] = left[:20]
-            kept_out = {k: v[:200] for k in ("artifacts", "over_cap",
-                                             "heldout", "generated_edited",
-                                             "saved")
-                        if (v := withheld.get(k))}
-            if kept_out:
-                ge["leftovers_withheld"] = kept_out
-            heldout_removed = swept + [p for p in withheld.get("heldout",
-                                                            [])
+            heldout_removed = swept + [p for p in span_held
                                        if p not in swept]
             if heldout_removed:
                 ge["heldout_removed"] = heldout_removed[:20]
+            if span_held:
+                # A file written under a directory staging created that held
+                # a span went at unstage: someone wrote it, so it is listed
+                # (DESIGN §8 *No line of a staged set's source reaches
+                # history*, rule 1).
+                ge["heldout_listed"] = sorted(set(span_held))[:200]
+            # I1 (DESIGN §8 *A worker leaves its tree clean*): after the
+            # staged sets are out again, so it sees what the implementer
+            # left and not what leerie placed. Still dirty after the
+            # re-asks, the group is rolled back like any other and recorded.
+            # A group that committed a staged file is voided below (rule 3)
+            # whatever its tree holds — and unstaging that file is leerie's
+            # own deletion of a tracked path, not the worker's to answer.
+            now_sha = await _branch_head_sha(str(staging))
+            leaked = bool(now_sha and now_sha != pre_sha and set(
+                _redrive_git(staging, "log", "--format=", "--name-only",
+                             "-m", f"{pre_sha}..{now_sha}").split())
+                & {f for s_ in staged for f in s_["files"]})
+            unclean = [] if leaked else await _clean_tree_gate(
+                staging, caps=caps, label=f"delivery re-drive r{rnd} g{gi}",
+                reask=_clean_tree_reasker(
+                    st, caps, log_sid=f"delivery-redrive-r{rnd}-g{gi}",
+                    cwd=str(staging), schema_key="implementer",
+                    system_prompt=_load_prompt("implementer"),
+                    model=models.get("implementer", MODEL_DEFAULT),
+                    effort=effort, max_turns=120))
+            if unclean:
+                ge["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
+                _record_unclean_tree(st, "delivery re-drive implementer",
+                                     f"r{rnd} g{gi}", unclean)
+                ok = await _redrive_rollback(staging, pre_sha)
+                ge["rolled_back"] = ok
+                drove = True
+                prior_members += [m for m in members
+                                  if m not in prior_members]
+                _charge_redrive_time(st, time.monotonic() - t0)
+                rec.pop("in_flight", None)
+                if not ok:
+                    ge["rollback_failed"] = True
+                    rec["rollback_failed"] = True
+                    log("  WARNING: delivery re-drive: rollback FAILED — "
+                        "stopping with the group's commits on staging")
+                    _save()
+                    break
+                _save()
+                continue
             drove = True
             prior_members += [m for m in members if m not in prior_members]
             routed_items |= {n["item_index"] for n in live
@@ -54529,24 +54312,6 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                     {"fixed": fa, "tracked_test": fb,
                                      "file": f, "round": rnd})
                         log(f"  WARNING: {reason}")
-            gen = (ge.get("leftovers_withheld") or {}).get(
-                "generated_edited")
-            if gen and not ge.get("rolled_back"):
-                # The group's own measurements are leerie commands: a file
-                # one of them wrote again is leerie's again (last writer).
-                now_sigs = await asyncio.to_thread(_untracked_signatures,
-                                                   staging) or {}
-                lw = await asyncio.to_thread(_leerie_last_wrote, staging,
-                                             now_sigs)
-                outs = await asyncio.to_thread(_leerie_test_outputs, staging)
-                gen = [p for p in gen
-                       if p in now_sigs and p not in lw and p not in outs]
-                if gen:
-                    ge["leftovers_withheld"]["generated_edited"] = gen
-                else:
-                    del ge["leftovers_withheld"]["generated_edited"]
-                    if not ge["leftovers_withheld"]:
-                        del ge["leftovers_withheld"]
             if not ge.get("rolled_back"):
                 rec["defects_driven"] += [
                     n["key"] for n in live if n["kind"] == "solution_defect"
@@ -54624,7 +54389,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             st.save()
     rec["final_sha"] = final
     rec["done"] = True
-    _set_redrive_leftovers_gap(st, rec, staging)
+    _set_redrive_heldout_gap(st, rec)
     _save()
     log("  delivery re-drive: done"
         + (f" — conflict: {rec['conflict']['reason']}"
@@ -54825,6 +54590,28 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                             f"after {timeout}s")
             break
 
+        # I1 (DESIGN §8 *A worker leaves its tree clean*): before the
+        # round's post-measurement or any later stage reads staging. Still
+        # dirty after the re-asks, the round is rolled back to its start
+        # (`_redrive_rollback`: its commits, and untracked files with
+        # ignored ones kept) and recorded, which makes the run unconverged.
+        unclean = await _clean_tree_gate(
+            staging, caps=caps, label=f"final conformer round {c_round}",
+            reask=_clean_tree_reasker(
+                st, caps, log_sid=f"final-conformer-r{c_round}",
+                cwd=str(staging), schema_key="conformer",
+                system_prompt=sys_prompt,
+                model=models.get("conformer", MODEL_DEFAULT),
+                effort=efforts.get("conformer"), max_turns=60))
+        if unclean:
+            await _redrive_rollback(staging, before_sha)
+            warnings.append(f"final conformer round {c_round}: "
+                            + _unclean_reason("the final conformer",
+                                              unclean))
+            _record_unclean_tree(st, "final conformer", f"round {c_round}",
+                                 unclean)
+            break
+
         res = _expand_conformer_output(res)
         # Same reason as the per-subtask phase: overwrite the worker's
         # self-reported axes before the gates below, each of which can `break`
@@ -54869,23 +54656,11 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # (those were caught by the per-subtask gates).
         protected = await _protected_paths_since(str(staging), before_sha)
         if protected:
-            discarded = await _uncommitted_paths(str(staging))
-            if discarded:
-                warnings.append(
-                    f"final conformer round {c_round}: discarding "
-                    f"{len(discarded)} uncommitted file(s) during "
-                    f"rollback: {[line[3:] for line in discarded]}")
             await _rollback_conformer_commits(str(staging), before_sha)
             warnings.append(f"final conformer round {c_round}: "
                             f"protected-path violation reverted "
                             f"(touched {protected})")
             break
-
-        dirty = await _uncommitted_paths(str(staging))
-        if dirty:
-            warnings.append(f"final conformer round {c_round}: left "
-                            f"{len(dirty)} uncommitted change(s) — not "
-                            "rolled back, but surfaced as advisory")
 
         # Clobber-survival check (DESIGN §9 *No clobbering the
         # implementer's work*): same guard as the per-subtask phase,
@@ -54901,12 +54676,6 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                 f"final conformer round {c_round}: reverted/deleted "
                 f"{len(clobbered)} integrated file(s): {clobbered}")
             if caps.get("strict_conformer"):
-                discarded = await _uncommitted_paths(str(staging))
-                if discarded:
-                    warnings.append(
-                        f"final conformer round {c_round}: discarding "
-                        f"{len(discarded)} uncommitted file(s) during "
-                        f"clobber rollback: {[line[3:] for line in discarded]}")
                 await _rollback_conformer_commits(
                     str(staging), staging_before_sha)
                 warnings.append(
@@ -57840,32 +57609,31 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 return _block_unbacked_claim(
                     st, sid, f"{message} — not verification-only, and "
                     f"{why}; finish and commit the subtask's work")
-            # uncommitted changes — retryable for a normal `complete`. For a
-            # result rescued from `empty_handoff`, tracked uncommitted changes
-            # are debris a reaped worker left mid-edit; the deliverable is the
-            # already-committed diff, not the debris.
-            wt_status = await run_proc(
-                ["git", "status", "--porcelain"], cwd=worktree)
-            dirty = [l for l in wt_status.stdout.splitlines()
-                     if l and not l.startswith("??")]
-            if dirty:
-                if rescued_from_empty_handoff:
-                    # Discard the debris rather than fail: a `dirty_worktree`
-                    # fail would `_reset_subtask_worktree` and destroy the very
-                    # commits we are keeping. Best-effort — run_proc returns
-                    # (doesn't raise) on nonzero, so a failed checkout leaves
-                    # the debris for the dirty-worktree guard on the next
-                    # integration step; not fatal here.
+            # I1 (DESIGN §8 *A worker leaves its tree clean*): nothing left
+            # uncommitted, untracked files included. A result rescued from
+            # `empty_handoff` came from a reaped worker with no session to
+            # ask: its uncommitted debris is discarded, the deliverable being
+            # the already-committed diff. Otherwise the same worker is
+            # re-asked; still dirty, the subtask settles `unconverged` and is
+            # not integrated — leerie never commits for it.
+            if rescued_from_empty_handoff:
+                if await _tree_dirt(worktree) != []:
                     await run_proc(["git", "checkout", "--", "."],
                                    cwd=worktree)
-                else:
-                    done = await fail(
-                        "dirty_worktree",
-                        f"{sid}: worktree has {len(dirty)} uncommitted "
-                        f"change(s) — changes will be lost on integration")
-                    if done is not None:
-                        return done
-                    continue
+                    await run_proc(["git", "clean", "-fdq"], cwd=worktree)
+            else:
+                left = await _clean_tree_gate(
+                    worktree, caps=caps, label=sid,
+                    reask=_clean_tree_reasker(
+                        st, caps, log_sid=sid, cwd=worktree,
+                        schema_key="implementer",
+                        system_prompt=_load_prompt("implementer"),
+                        model=models.get("implementer", MODEL_DEFAULT),
+                        effort=efforts.get("implementer"), max_turns=120))
+                if left:
+                    return _settle_unconverged(
+                        st, sid, _unclean_reason("its implementer", left),
+                        previous_status="complete", kind="unclean_tree")
             # protected-path violation — the worker wrote to .git/ etc.: it is
             # broken, not merely careless. Non-retryable by `_retryable_failure`.
             scope_err = await check_diff_scope(sid, worktree, subtask, st)
@@ -58979,6 +58747,10 @@ async def _back_out_unmerged(st: State, staging: Path, sid: str,
     the repository, not the merge, is then broken."""
     await run_proc(["git", "merge", "--abort"], cwd=str(staging))
     await run_proc(["git", "reset", "--hard", pre_sha], cwd=str(staging))
+    # Untracked files too (ignored ones kept): the next worker in staging
+    # starts from the tree I1 held (DESIGN §8 *A worker leaves its tree
+    # clean*), never one with this merge's leftovers in it.
+    await run_proc(["git", "clean", "-fdq"], cwd=str(staging))
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
     if not pre_sha or head != pre_sha:
         st.data.setdefault("blocked", {})[sid] = (
@@ -59267,6 +59039,7 @@ async def _integration_repair_round(
 
     async def _reset(verdict: str) -> dict:
         await run_proc(["git", "reset", "--hard", pre], cwd=str(staging))
+        await run_proc(["git", "clean", "-fdq"], cwd=str(staging))
         entry["verdict"] = verdict
         return {"verdict": verdict}
 
@@ -59281,12 +59054,24 @@ async def _integration_repair_round(
         await _reset(status)
         return {"verdict": status, "diagnosis": ires.get("diagnosis")
                 or ires.get("resolution_summary")}
+    # I1 (DESIGN §8 *A worker leaves its tree clean*): untracked files
+    # included; a tree still dirty after the re-asks fails the round's
+    # mechanical checks, and the round is reset.
+    unclean = await _clean_tree_gate(
+        staging, caps=caps, label=f"integration repair {sid}",
+        reask=_clean_tree_reasker(
+            st, caps, log_sid=f"integrator-repair-{sid}", cwd=str(staging),
+            schema_key="integrator", system_prompt=sys_prompt,
+            model=models.get("integrator", MODEL_DEFAULT),
+            effort=efforts.get("integrator"),
+            max_turns=60))
+    if unclean:
+        entry["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
     descends = (await run_proc(["git", "merge-base", "--is-ancestor",
                                 merge_sha, head], cwd=str(staging))
                 ).returncode == 0
-    clean = not (await _git_text(staging, "status", "--porcelain",
-                                 "--untracked-files=no") or "").strip()
+    clean = not unclean
     markers = await _scan_conflict_markers(staging)
     mech = {"new_commit": bool(head) and head != pre,
             "descends_from_merge": descends, "clean": clean,
@@ -59599,6 +59384,7 @@ async def _restart_integration_merge(staging: Path, st: "State", sid: str,
     conflict again; otherwise why the retry cannot proceed."""
     await run_proc(["git", "merge", "--abort"], cwd=str(staging))
     await run_proc(["git", "reset", "--hard", pre_sha], cwd=str(staging))
+    await run_proc(["git", "clean", "-fdq"], cwd=str(staging))
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
     if not pre_sha or head != pre_sha:
         return (f"the reset before a retry left staging at "
@@ -59903,6 +59689,23 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 await _back_out_unmerged(
                     st, staging, sid, pre_sha,
                     f"integrator claimed resolved but {merge_err}")
+                results[sid] = {"subtask_id": sid, "status": "unconverged",
+                                "summary": "integration backed out"}
+                continue
+            # I1 (DESIGN §8 *A worker leaves its tree clean*): before the
+            # gate measures the merge. Still dirty after the re-asks, the
+            # merge is backed out like any the integrator could not make.
+            unclean = await _clean_tree_gate(
+                staging, caps=caps, label=f"integrator for {sid}",
+                reask=_clean_tree_reasker(
+                    st, caps, log_sid=f"integrator-{sid}", cwd=str(staging),
+                    schema_key="integrator", system_prompt=sys_prompt,
+                    model=models.get("integrator", MODEL_DEFAULT),
+                    effort=efforts.get("integrator"), max_turns=60))
+            if unclean:
+                await _back_out_unmerged(
+                    st, staging, sid, pre_sha,
+                    _unclean_reason("the integrator", unclean))
                 results[sid] = {"subtask_id": sid, "status": "unconverged",
                                 "summary": "integration backed out"}
                 continue

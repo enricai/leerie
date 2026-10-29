@@ -167,7 +167,7 @@ class TestSettleWiring:
         assert "not rescued_from_empty_handoff" in src
 
     def test_dirty_check_discards_debris_for_rescued(self, leerie):
-        """A reaped worker may leave uncommitted debris; a dirty_worktree fail
+        """A reaped worker may leave uncommitted debris; a reset-and-retry
         would _reset_subtask_worktree and destroy the kept commits. The dirty
         check must discard the debris for rescued results instead of failing."""
         src = inspect.getsource(leerie._settle_subtask)

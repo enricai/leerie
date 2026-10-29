@@ -373,59 +373,6 @@ def test_protected_path_commit_is_rolled_back(env):
     assert state["i"] == 1  # loop broke after rollback
 
 
-def test_protected_path_rollback_warns_about_discarded_dirty_files(env):
-    """When a protected-path violation triggers rollback AND the worktree
-    also carries uncommitted tracked changes at that moment, the discard
-    warning fires before the rollback proceeds (git reset --hard would
-    silently drop those changes otherwise)."""
-    c = env["leerie"]
-
-    def _bad_commit_and_leave_dirty(wt: Path):
-        (wt / ".claude").mkdir(exist_ok=True)
-        (wt / ".claude" / "settings.json").write_text("{}\n")
-        _run(["git", "add", "-A"], cwd=wt)
-        _run(["git", "commit", "-q", "-m",
-              "conformer: BAD touched protected path"], cwd=wt)
-        # Leave an additional, uncommitted change to a tracked file.
-        (wt / "README.md").write_text("dirty on top of the bad commit\n")
-
-    _stub_claude_p(c, [_clean_result()],
-                   commits={0: _bad_commit_and_leave_dirty})
-
-    asyncio.run(c._run_final_conformance(
-        env["run_dir"], env["st"], env["caps"], env["models"],
-        env["efforts"]))
-
-    block = env["st"].data["conformance"]["_final"]
-    assert any("discarding" in w and "rollback" in w
-               for w in block["warnings"]), block["warnings"]
-    # The rollback still restores README.md to its pre-round content.
-    assert env["staging"].joinpath("README.md").read_text() == "# repo\n"
-
-
-def test_clobber_strict_rollback_warns_about_discarded_dirty_files(env):
-    c = env["leerie"]
-    env["caps"] = dict(env["caps"])
-    env["caps"]["strict_conformer"] = True
-
-    def _clobber_and_leave_dirty(wt: Path):
-        (wt / "src.py").unlink()
-        _run(["git", "add", "-A"], cwd=wt)
-        _run(["git", "commit", "-q", "-m", "conformer: oops"], cwd=wt)
-        (wt / "README.md").write_text("dirty on top of the clobber\n")
-
-    with pytest.raises(SystemExit):
-        _stub_claude_p(c, [_clean_result()],
-                       commits={0: _clobber_and_leave_dirty})
-        asyncio.run(c._run_final_conformance(
-            env["run_dir"], env["st"], env["caps"], env["models"],
-            env["efforts"]))
-
-    block = env["st"].data["conformance"]["_final"]
-    assert any("discarding" in w and "clobber rollback" in w
-               for w in block["warnings"]), block["warnings"]
-
-
 def test_round_regression_between_pre_and_post_is_warned(env):
     """A build that was passing at the top of the round (`pre`) and fails
     by the bottom (`post`) — introduced by the conformer's own edits
@@ -582,28 +529,69 @@ def test_unprefixed_commit_subject_warns(env):
     assert state["i"] == 1
 
 
-# --- dirty uncommitted changes: surfaced, not rolled back -------------------
+# --- I1: the final conformer leaves staging clean (DESIGN §8 *A worker
+# leaves its tree clean*). Rewritten from the advisory "left N uncommitted
+# change(s)" warning, which left the edit in the tree that ships. ----------
 
-def test_dirty_uncommitted_changes_warn_not_rolled_back(env):
+def test_final_conformer_reasked_commits_and_round_completes(env,
+                                                             monkeypatch):
     c = env["leerie"]
+    monkeypatch.setattr(c, "_log_session_id", lambda p: "sess-final")
+    seen: list[dict] = []
 
-    def _leave_dirty(wt: Path):
-        # A TRACKED-file modification: _uncommitted_paths deliberately
-        # excludes untracked files (`?? ` porcelain lines), so an untracked
-        # scratch file would not exercise this branch at all.
-        (wt / "README.md").write_text("dirty, uncommitted\n")
+    def _leave(wt: Path):
+        (wt / "README.md").write_text("# repo, documented\n")
 
-    _stub_claude_p(c, [_clean_result()], commits={0: _leave_dirty})
+    def _commit(wt: Path):
+        _run(["git", "commit", "-q", "-am", "conformer: docs"], cwd=wt)
+    state = _stub_claude_p(c, [_clean_result(), _clean_result()],
+                           commits={0: _leave, 1: _commit})
+    real = c.claude_p
 
+    async def spy(**kw):
+        seen.append(kw)
+        return await real(**kw)
+    c.claude_p = spy
     asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
+    assert state["i"] == 2
+    assert seen[1]["resume_session"] == "sess-final"
+    assert seen[1]["sid"] == "final-conformer-r0-clean1"
+    assert "     M README.md" in seen[1]["user_prompt"]
+    assert (env["staging"] / "README.md").read_text() == \
+        "# repo, documented\n"
+    assert _run(["git", "status", "--porcelain"],
+                cwd=env["staging"]).stdout == ""
+    assert "unclean_trees" not in env["st"].data
 
+
+def test_final_conformer_left_dirty_is_rolled_back_and_unconverged(
+        env, monkeypatch):
+    c = env["leerie"]
+    monkeypatch.setattr(c, "_log_session_id", lambda p: "sess-final")
+    before = _run(["git", "rev-parse", "HEAD"],
+                  cwd=env["staging"]).stdout.strip()
+
+    def _commit_and_leave(wt: Path):
+        (wt / "src.py").write_text("def f():\n    return 1\n")
+        _run(["git", "commit", "-q", "-am", "conformer: fix f"], cwd=wt)
+        (wt / "helper.py").write_text("H = 1\n")
+    state = _stub_claude_p(c, [_clean_result()],
+                           commits={0: _commit_and_leave})
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+    assert state["i"] == 3                      # the worker + 2 re-asks
+    assert _run(["git", "rev-parse", "HEAD"],
+                cwd=env["staging"]).stdout.strip() == before
+    assert not (env["staging"] / "helper.py").exists()
     block = env["st"].data["conformance"]["_final"]
-    assert any("uncommitted change" in w for w in block["warnings"]), \
-        block["warnings"]
-    assert (env["staging"] / "README.md").read_text() == "dirty, uncommitted\n", (
-        "dirty files are surfaced as advisory, not discarded")
+    assert any("left its tree unclean" in w and "?? helper.py" in w
+               for w in block["warnings"]), block["warnings"]
+    assert env["st"].data["unclean_trees"][
+        "final conformer:round 0"]["lines"] == ["?? helper.py"]
+    assert c._decide_outcome(env["st"], any_commits=True) == "unconverged"
 
 
 # --- clobbered owned files: strict mode rolls back and blocks --------------

@@ -384,36 +384,6 @@ class TestProtectedPathsSince:
         assert r == [".leerie/config.toml"], r
 
 
-class TestUncommittedPaths:
-    def test_clean_worktree_returns_empty(self, leerie, tmp_path):
-        d, _base = _single_commit_repo(tmp_path)
-        r = asyncio.run(leerie._uncommitted_paths(str(d)))
-        assert r == []
-
-    def test_tracked_modified_kept_untracked_excluded(self, leerie, tmp_path):
-        d, _base = _single_commit_repo(tmp_path)
-        (d / "a.py").write_text("uncommitted edit\n")
-        (d / "new.py").write_text("untracked\n")
-        r = asyncio.run(leerie._uncommitted_paths(str(d)))
-        assert len(r) == 1
-        assert "a.py" in r[0]
-        assert not any(line.startswith("??") for line in r)
-        assert not any("new.py" in line for line in r)
-
-    def test_non_git_directory_returns_empty(self, leerie, tmp_path):
-        d = tmp_path / "not-a-repo"
-        d.mkdir()
-        r = asyncio.run(leerie._uncommitted_paths(str(d)))
-        assert r == []
-
-    def test_nonexistent_directory_returns_empty(self, leerie, tmp_path):
-        """`run_proc` raising OSError (e.g. cwd does not exist) must
-        degrade to empty, not propagate — the except OSError branch."""
-        missing = tmp_path / "does-not-exist"
-        r = asyncio.run(leerie._uncommitted_paths(str(missing)))
-        assert r == []
-
-
 class TestBranchHeadSha:
     def test_returns_head_sha(self, leerie, tmp_path):
         d, impl = _impl_repo(tmp_path)

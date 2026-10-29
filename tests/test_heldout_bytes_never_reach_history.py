@@ -14,7 +14,6 @@ voided); the barrier now matches spans of the test's SOURCE, never a value
 it asserts. Both directions are pinned here."""
 from __future__ import annotations
 
-import asyncio
 import os
 import subprocess
 import sys
@@ -74,7 +73,6 @@ def test_the_reviewers_driver_ships_no_bytecode_of_the_hidden_test(
     staged = leerie._redrive_stage(s, [set_])
     assert staged
     prints = leerie._heldout_fingerprints(s, staged, base)
-    before = (leerie._tracked_content(s), leerie._untracked_signatures(s))
     (s / "mod.py").write_text("def f():\n    return 2\n")
     _pytest(s, "tests/test_hidden_accept.py")
     # The staged file's bytecode is ignored while the group runs, so the
@@ -87,39 +85,10 @@ def test_the_reviewers_driver_ships_no_bytecode_of_the_hidden_test(
     assert leerie._redrive_unstage(s, staged, swept=swept) == []
     assert any("test_hidden_accept" in p and p.endswith(".pyc")
                for p in swept)
-    got = asyncio.run(leerie._redrive_commit_leftovers(
-        s, "r1 g0", *before, set(), prints=prints))
-    assert not any("test_hidden_accept" in p for p in got)
     assert SECRET.encode() not in _history_bytes(s, base)
     assert not list((s / "tests").rglob("test_hidden_accept*"))
     assert leerie._history_heldout_hits(s, base, _git(s, "rev-parse", "HEAD"),
                                         staged, prints) == []
-
-
-def test_a_file_holding_the_sets_source_is_removed_not_committed(
-        leerie, tmp_path, monkeypatch):
-    """Rule 4: a file that copies the hidden test's source is removed
-    before the leftovers commit and listed; a report naming the hidden case
-    and its message carries no source line (the case names are given to a
-    held-back implementer anyway), so it ships with the implementer's own
-    new source beside it."""
-    s = _repo(tmp_path, monkeypatch)
-    base = _git(s, "rev-parse", "HEAD")
-    set_ = _held(tmp_path)
-    staged = leerie._redrive_stage(s, [set_])
-    prints = leerie._heldout_fingerprints(s, staged, base)
-    before = (leerie._tracked_content(s), leerie._untracked_signatures(s))
-    (s / "report.xml").write_text(
-        f"<testcase name='test_secret_case'><failure>{SECRET}</failure>")
-    (s / "copied.py").write_text("# kept for later\n" + HIDDEN)
-    (s / "helper.py").write_text("H = 1\n")
-    leerie._redrive_unstage(s, staged)
-    withheld: dict = {}
-    got = asyncio.run(leerie._redrive_commit_leftovers(
-        s, "r1 g0", *before, set(), prints=prints, withheld=withheld))
-    assert got == ["helper.py", "report.xml"]
-    assert withheld["heldout"] == ["copied.py"]
-    assert not (s / "copied.py").exists()
 
 
 def test_spans_already_in_the_base_are_not_distinctive(leerie, tmp_path,
@@ -187,7 +156,7 @@ def test_a_directory_staging_created_keeps_the_implementers_own_files(
     """Rule 1. Everything under a directory staging had to create is
     ignored while the group runs; at unstage the staged file, its runner
     copies and a copy of its source go, and the implementer's own sibling
-    test and conftest stay for the leftovers commit. Review round 12's
+    test and conftest stay, for the implementer to commit. Review round 12's
     suspicion, confirmed: the whole directory was removed, the sibling
     recorded only in `heldout_removed`. A sibling committed there is not a
     void hit by its path alone."""
@@ -381,10 +350,13 @@ def test_no_single_value_of_a_plain_python_test_is_a_span(leerie, tmp_path,
     assert leerie._file_holds_span(fix, prints)
 
 
-def test_an_uncommitted_honest_tracked_edit_is_committed(leerie, tmp_path):
+def test_an_honest_tracked_fix_holding_the_message_is_not_a_hit(
+        leerie, tmp_path):
     """On b40117f the implementer's uncommitted fix of a tracked file was
     checked out from HEAD because it held the expected message, and the PR
-    gap did not list it."""
+    gap did not list it. Rewritten for I1 (the implementer commits its own
+    work; leerie no longer commits or reverts leftovers): the committed fix
+    shares only the asserted value with the test, so it is no hit."""
     s = _js_repo(tmp_path)
     base = _git(s, "rev-parse", "HEAD")
     held = tmp_path / "held"
@@ -397,15 +369,13 @@ def test_an_uncommitted_honest_tracked_edit_is_committed(leerie, tmp_path):
             "defect_files": ["src/cart.test.ts"]}
     staged = leerie._redrive_stage(s, [set_])
     prints = leerie._heldout_fingerprints(s, staged, base)
-    before = (leerie._tracked_content(s), leerie._untracked_signatures(s))
     fix = ("export const cart = 1;\nexport const add = (n: number) => {"
            " if (n < 1) throw new Error('quantity must be positive'); };\n")
     (s / "src" / "cart.ts").write_text(fix)
+    _git(s, "commit", "-qam", "reject a non-positive quantity")
     leerie._redrive_unstage(s, staged)
-    withheld: dict = {}
-    got = asyncio.run(leerie._redrive_commit_leftovers(
-        s, "r1 g0", *before, set(), prints=prints, withheld=withheld))
-    assert got == ["src/cart.ts"] and withheld == {}
+    assert leerie._history_heldout_hits(
+        s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == []
     assert _git(s, "show", "HEAD:src/cart.ts") + "\n" == fix
 
 
@@ -488,21 +458,6 @@ def test_a_committed_fix_defining_a_multiline_value_is_kept(
     leerie._redrive_unstage(s, staged, prints=prints)
     assert leerie._history_heldout_hits(
         s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == []
-
-
-def test_an_uncommitted_fix_defining_a_multiline_value_ships(
-        leerie, tmp_path, monkeypatch):
-    """The reviewer's driver, uncommitted side: `mod.py` was checked out
-    from HEAD and listed as `heldout`."""
-    s, base, staged, prints = _value_setup(leerie, tmp_path, monkeypatch)
-    before = (leerie._tracked_content(s), leerie._untracked_signatures(s))
-    (s / "mod.py").write_text(VALUE_FIX)
-    leerie._redrive_unstage(s, staged, prints=prints)
-    withheld: dict = {}
-    got = asyncio.run(leerie._redrive_commit_leftovers(
-        s, "r1 g0", *before, set(), prints=prints, withheld=withheld))
-    assert got == ["mod.py"] and withheld == {}
-    assert "ERROR_CODES" in _git(s, "show", "HEAD:mod.py")
 
 
 def test_a_copy_of_a_value_test_still_voids(leerie, tmp_path, monkeypatch):

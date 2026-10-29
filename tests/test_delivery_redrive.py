@@ -843,14 +843,12 @@ def test_worse_round_rolls_back_then_recurring_trade_is_a_conflict(
 
     def trade(w):
         w.write("export const a = 1; // FIXED BROKE\n")
-        (w.staging / "junk.txt").write_text("x")   # untracked leftover
     w.edits = [trade, trade]
     w.run()
     rec = w.st.data["delivery_redrive"]
     assert len(w.calls) == 2
-    # Every attempt was reset away, untracked leftovers included.
+    # Every attempt was reset away.
     assert _git(w.staging, "rev-parse", "HEAD") == start
-    assert not (w.staging / "junk.txt").exists()
     g1 = rec["rounds"][0]["groups"][0]
     assert g1["worse"] and g1["rolled_back"] and g1["trade"]
     assert g1["ctl_new"] == [f"1:{CONTROL}"]

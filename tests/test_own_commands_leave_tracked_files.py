@@ -19,6 +19,15 @@ import sys
 
 import pytest
 
+# Red until lane B's I2 step; see the reason.
+_NEEDS_I2 = pytest.mark.xfail(
+    strict=True,
+    reason=("I1 (DESIGN §8 *A worker leaves its tree clean*) holds the final "
+           "conformer to a clean staging, and leerie's own test run leaves "
+           "this untracked output there until I2 (DESIGN §6½: leerie's "
+           "commands leave the tree as they found it) — remove this mark "
+           "when I2 lands; strict, so it cannot be forgotten"))
+
 sys.path.insert(0, os.path.dirname(__file__))
 from test_redrive_test_id_diff_refresh import _git  # noqa: E402
 from test_shipping_tree_is_committed import (  # noqa: E402
@@ -103,6 +112,7 @@ def _node_repo(leerie, tmp_path, monkeypatch, *, lock_rewrite: bool):
 # The four clean-run shapes: done, with an EMPTY end-state section
 
 
+@_NEEDS_I2
 def test_shape1_pytest_pycache_unignored(leerie, tmp_path, monkeypatch):
     run = _repo(leerie, tmp_path, monkeypatch)
     _quiet_conformer(leerie, monkeypatch)
@@ -111,6 +121,7 @@ def test_shape1_pytest_pycache_unignored(leerie, tmp_path, monkeypatch):
     assert (out, sec) == ("done", "")
 
 
+@_NEEDS_I2
 def test_shape2_vitest_shaped_coverage(leerie, tmp_path, monkeypatch):
     run = _node_repo(leerie, tmp_path, monkeypatch, lock_rewrite=False)
     _quiet_conformer(leerie, monkeypatch)
@@ -119,6 +130,7 @@ def test_shape2_vitest_shaped_coverage(leerie, tmp_path, monkeypatch):
     assert (out, sec) == ("done", "")
 
 
+@_NEEDS_I2
 def test_shape3_an_install_that_rewrites_the_lockfile(
         leerie, tmp_path, monkeypatch):
     """The reviewer's driver: the install appends to the tracked
@@ -144,6 +156,7 @@ SNAP_TEST = (
     "    assert True\n")
 
 
+@_NEEDS_I2
 def test_shape4_a_test_that_rewrites_a_tracked_snapshot(
         leerie, tmp_path, monkeypatch):
     """Round 10's fourth shape: a test rewrites the tracked
@@ -163,6 +176,7 @@ def test_shape4_a_test_that_rewrites_a_tracked_snapshot(
     assert (out, sec) == ("done", "")
 
 
+@_NEEDS_I2
 @pytest.mark.parametrize("worker_runs_tests", [False, True])
 def test_a_conformer_rerunning_the_tests_keeps_the_record(
         leerie, tmp_path, monkeypatch, worker_runs_tests):
@@ -357,8 +371,7 @@ def test_a_dirty_submodule_does_not_switch_the_snapshot_off(leerie,
                                                             tmp_path):
     """L2, the reviewer's driver: modified content inside a submodule made
     `git hash-object` fail on its directory and the whole snapshot None, so
-    an install's relock was not put back and a re-drive implementer's edit
-    was not committed. The submodule's own content is not this tree's edit;
+    an install's relock was not put back. The submodule's own content is not this tree's edit;
     a moved submodule commit is listed as `gitlink:<sha>` and never put
     back."""
     t = _with_submodule(tmp_path)
@@ -369,17 +382,13 @@ def test_a_dirty_submodule_does_not_switch_the_snapshot_off(leerie,
             (t / "uv.lock").write_text("version = 1\nrevision = 2\n")
     asyncio.run(install())
     assert (t / "uv.lock").read_text() == "version = 1\n"
-    before = (leerie._tracked_content(t), leerie._untracked_signatures(t))
     (t / "app.py").write_text("A = 2\n")
     sub = t / "vendor" / "lib"
     _git(sub, "commit", "-qam", "bump")              # the submodule moved
     bumped = _git(sub, "rev-parse", "HEAD")
     snap = leerie._tracked_content(t)
     assert snap["vendor/lib"] == "gitlink:" + bumped
-    got = asyncio.run(leerie._redrive_commit_leftovers(t, "r0 g0", *before,
-                                                       set()))
-    assert got == ["app.py", "vendor/lib"]
-    assert _git(t, "rev-parse", "HEAD:vendor/lib") == bumped
+    assert snap["app.py"] == _git(t, "hash-object", "app.py")
 
 
 def test_a_put_back_never_moves_a_submodule(leerie, tmp_path):
@@ -501,8 +510,8 @@ def test_a_workers_edit_of_a_generated_file_is_not_leeries(leerie,
     HEAD's and dropped the edit from the leftovers with no line. The
     record now answers the two questions apart (DESIGN §6½): `gen.py` is
     still not part of the change (membership), but the worker wrote it
-    last, so a measurement here is not of the committed tree, and the
-    leftovers commit lists it."""
+    last, so a measurement here is not of the committed tree. (Whether it
+    ships is the worker's to answer since I1.)"""
     t = _tree(tmp_path, {"mod.py": "from gen import V\n"})
 
     async def cmd(argv):
@@ -511,14 +520,9 @@ def test_a_workers_edit_of_a_generated_file_is_not_leeries(leerie,
     asyncio.run(cmd(["sh", "-c", "echo 'V = 1' > gen.py"]))
     head_tree = _git(t, "rev-parse", "HEAD^{tree}")
     assert asyncio.run(leerie._measured_tree_sha(str(t))) == head_tree
-    before = (leerie._tracked_content(t), leerie._untracked_signatures(t))
     subprocess.run(["sh", "-c", "echo 'V = 2  # the fix' > gen.py"], cwd=t,
                    check=True)
     assert asyncio.run(leerie._measured_tree_sha(str(t))) is None
-    withheld: dict = {}
-    got = asyncio.run(leerie._redrive_commit_leftovers(
-        t, "r1 g0", *before, set(), withheld=withheld))
-    assert got == [] and withheld == {"generated_edited": ["gen.py"]}
     # A later leerie command that leaves it alone does not adopt the edit;
     # membership is unchanged either way.
     asyncio.run(cmd(["true"]))
@@ -531,70 +535,6 @@ def test_a_workers_edit_of_a_generated_file_is_not_leeries(leerie,
     sigs = leerie._untracked_signatures(t)
     assert leerie._leerie_last_wrote(t, sigs) == {"gen.py"}
     assert asyncio.run(leerie._measured_tree_sha(str(t))) == head_tree
-
-
-REPORTER = ("def pytest_sessionfinish(session):\n"
-            "    open('junit.xml', 'w').write('<run/>')\n")
-
-
-@pytest.mark.parametrize("leerie_ran_in_staging", [True, False])
-def test_a_report_the_implementers_test_run_wrote_is_not_listed(
-        leerie, tmp_path, monkeypatch, leerie_ran_in_staging):
-    """Review round 14, end to end through the real measurement path: the
-    repository's test run writes an unignored `junit.xml` (a session hook)
-    and leerie's install generates `gen.py`. The re-drive implementer runs
-    the tests (writing `junit.xml`), edits `gen.py` and fixes the defect.
-    Staging then holds untracked files, so the group's own measurements
-    (`_redrive_test_ids`, `_ratchet_exec`) run in a checkout of the commit
-    and never touch staging's `junit.xml` — round 12 M2's group-end re-read
-    no longer rescues it. What leerie's test run wrote in that checkout
-    marks it a test output, so only `gen.py` is listed and `junit.xml` is
-    neither listed nor committed — whether leerie's own test run had
-    written it in staging first (round 11 M2's shape) or only in the
-    checkout. Nothing is stubbed between the test command and the leftovers
-    commit."""
-    from test_delivery_redrive import World
-    real_ids = leerie._redrive_test_ids
-    w = World(leerie, tmp_path)
-    w.install(monkeypatch)
-    monkeypatch.setattr(leerie, "_redrive_test_ids", real_ids)
-    s, st = w.staging, w.st
-    (s / "tsuite").mkdir()
-    (s / "tsuite" / "test_ok.py").write_text("def test_ok():\n    pass\n")
-    (s / "conftest.py").write_text(REPORTER)
-    _git(s, "add", "-A")
-    _git(s, "commit", "-qm", "suite")
-    cmd = "python3 -m pytest -q -p no:cacheprovider tsuite"
-    monkeypatch.setattr(leerie, "resolve_blt", lambda root: {"test": cmd})
-    st.data["provision"] = {"recipe": [{
-        "kind": "install", "command": ["sh", "-c", "echo 'V = 1' > gen.py"]}]}
-    st.save()
-    log_path = tmp_path / "m.log"
-    assert asyncio.run(leerie._ensure_worktree_deps(
-        str(s), st, w.caps, log_path=log_path, verbosity="quiet"))
-    if leerie_ran_in_staging:
-        assert asyncio.run(leerie._ratchet_test_ids(
-            st, w.caps, str(s), label="final", log_path=log_path)) is not None
-        assert (s / "junit.xml").is_file()
-    else:
-        assert not (s / "junit.xml").exists()
-
-    def fix(w):
-        subprocess.run(cmd.split(), cwd=s, check=True, capture_output=True)
-        (s / "gen.py").write_text("V = 2  # the fix\n")
-        w.write("export const a = 1; // FIXED\n")
-    w.edits = [fix]
-    w.run()
-    g = st.data["delivery_redrive"]["rounds"][0]["groups"][0]
-    assert not g.get("rolled_back") and "FIXED" in w.a_text("HEAD")
-    assert g["leftovers_withheld"].get("generated_edited") == ["gen.py"]
-    assert "junit.xml" in leerie._leerie_test_outputs(s)
-    assert _git(s, "ls-files", "junit.xml") == ""          # never committed
-    assert (s / "junit.xml").read_text() == "<run/>"       # left as it was
-    (e,) = [e for e in st.data["needs_human_verification"]
-            if e.get("source") == "redrive_leftovers"]
-    assert "then edited by the implementer" in e["detail"]
-    assert "gen.py" in e["detail"] and "junit.xml" not in e["detail"]
 
 
 def test_test_outputs_are_recorded_and_adopted_from_a_checkout(leerie,

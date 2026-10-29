@@ -20,10 +20,16 @@ from test_redrive_test_id_diff_refresh import CMD  # noqa: E402
 from test_shipping_tree_is_committed import _quiet_conformer, _repo  # noqa
 
 
+# Leerie's own test runs leave `__pycache__/` in staging until I2 (DESIGN
+# §6½); the clean-tree gate (DESIGN §8 *A worker leaves its tree clean*)
+# would hold the final conformer to it. Not what these tests are about.
+_PYCACHE = "__pycache__/\n"
+
+
 @pytest.mark.parametrize("remeasured", [True, False])
 def test_the_loop_judges_against_the_remeasured_baseline(
         leerie, tmp_path, monkeypatch, remeasured):
-    run = _repo(leerie, tmp_path, monkeypatch)
+    run = _repo(leerie, tmp_path, monkeypatch, ignore=_PYCACHE)
     st = run["st"]
     build = f"{sys.executable} -c 'import sys; sys.exit(1)'"
     monkeypatch.setattr(leerie, "resolve_blt",
@@ -89,7 +95,7 @@ def test_a_round_that_breaks_before_its_post_reads_the_remeasure_too(
     its post-measurement, and the pre-measurement's confirm re-measures the
     base successfully. The strict verdict on round 1's red build must read
     the base that builds."""
-    run = _repo(leerie, tmp_path, monkeypatch)
+    run = _repo(leerie, tmp_path, monkeypatch, ignore=_PYCACHE)
     st = run["st"]
     build = f"{sys.executable} -c 'import sys; sys.exit(1)'"
     monkeypatch.setattr(leerie, "resolve_blt",

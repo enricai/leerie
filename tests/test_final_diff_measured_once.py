@@ -62,7 +62,15 @@ def _drive(leerie, tmp_path, monkeypatch, ignore, *, worker_file=None,
     return run, calls
 
 
-@pytest.mark.parametrize("ignore", ["", "__pycache__/\n"])
+# Red until I2 (DESIGN §6½: leerie's commands leave the tree as they found
+# it): leerie's own test run leaves `__pycache__/` in staging, and the
+# clean-tree gate (DESIGN §8 *A worker leaves its tree clean*) holds the
+# final conformer to it. Strict, so the mark goes when I2 lands.
+_NEEDS_I2 = pytest.mark.xfail(strict=True, reason="needs I2")
+
+
+@pytest.mark.parametrize("ignore", [pytest.param("", marks=_NEEDS_I2),
+                                    "__pycache__/\n"])
 def test_the_same_committed_tree_is_measured_once(leerie, tmp_path,
                                                   monkeypatch, ignore):
     """The reviewer's driver: with `__pycache__/` not ignored, discovery
@@ -77,20 +85,30 @@ def test_the_same_committed_tree_is_measured_once(leerie, tmp_path,
     assert leerie._format_pr_end_state_section(st.data) == ""
 
 
-def test_an_untracked_file_the_conformer_wrote_is_measured_again(
+def test_an_untracked_file_the_conformer_wrote_never_reaches_a_measurement(
         leerie, tmp_path, monkeypatch):
-    """The measurement in staging collected a test the conformer wrote and
-    never committed: not the tree that ships, so the refresh measures the
-    clean checkout."""
-    run, calls = _drive(leerie, tmp_path, monkeypatch, "",
+    """Rewritten for I1 (DESIGN §8 *A worker leaves its tree clean*): the
+    measurement in staging used to collect a test the conformer wrote and
+    never committed, so the refresh measured the clean checkout. The
+    conformer is now held to a clean tree: it is re-asked, and, still
+    dirty, its round is rolled back before any measurement of it — the
+    file is gone and the run is unconverged with it named."""
+    run, calls = _drive(leerie, tmp_path, monkeypatch, "__pycache__/\n",
                         worker_file="tests/test_w.py")
-    assert calls == ["staging", f"{run['st'].run_id[:12]}-shipping-tree"]
+    assert not (run["staging"] / "tests" / "test_w.py").exists()
+    (rec,) = run["st"].data["unclean_trees"].values()
+    assert rec["lines"] == ["?? tests/test_w.py"]
+    assert leerie._decide_outcome(run["st"], any_commits=True) == \
+        "unconverged"
 
 
-def test_a_tracked_edit_is_measured_again(leerie, tmp_path, monkeypatch):
-    run, calls = _drive(leerie, tmp_path, monkeypatch, "",
+def test_a_tracked_edit_never_reaches_a_measurement(leerie, tmp_path,
+                                                    monkeypatch):
+    run, calls = _drive(leerie, tmp_path, monkeypatch, "__pycache__/\n",
                         tracked_edit=True)
-    assert len(calls) == 2 and calls[1].endswith("shipping-tree")
+    assert (run["staging"] / "mod.py").read_text() == "X = 2\n"
+    (rec,) = run["st"].data["unclean_trees"].values()
+    assert rec["lines"] == [" M mod.py"]
 
 
 MOD = "try:\n    from helper import X\nexcept ImportError:\n    X = 0\n"
@@ -127,7 +145,12 @@ def test_an_untracked_module_that_made_the_suite_pass_is_never_reused(
     asyncio.run(leerie._run_final_conformance(
         run["run_dir"], st, run["caps"], {"conformer": "sonnet"},
         {"conformer": "low"}))
-    assert st.data["conformance"]["_final"]["tree_sha"] is None
+    # I1 (DESIGN §8 *A worker leaves its tree clean*): the conformer is
+    # re-asked, and, still dirty, its round is rolled back — `helper.py`
+    # never reaches a measurement and the lines are recorded.
+    assert not (staging / "helper.py").exists()
+    assert st.data["unclean_trees"]["final conformer:round 0"][
+        "lines"] == ["?? helper.py"]
     _phase5(leerie, run)
     diff = st.data["test_id_diff"]
     assert diff["tree_sha"] == _git(staging, "rev-parse", "HEAD^{tree}")

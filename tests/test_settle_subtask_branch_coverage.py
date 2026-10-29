@@ -483,3 +483,80 @@ def test_rescue_returns_none_when_update_ref_fails(leerie, tmp_path,
     assert ref is None
     show = _git("for-each-ref", "refs/leerie/rescue/run1/feat-x", cwd=repo)
     assert show.stdout.strip() == ""
+
+
+# --- I1: the implementer leaves its tree clean (DESIGN §8 *A worker leaves
+# its tree clean*). Replaces the `dirty_worktree` retry, which reset the
+# worktree (the worker's commits with it), spawned a fresh worker and never
+# looked at untracked files. ----------------------------------------------
+
+def _stub_impl_leaving(leerie_mod, env, monkeypatch, calls):  # noqa: F811
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        calls.append(note)
+        (env["worktree"] / "feature.py").write_text("def g():\n    pass\n")
+        _git("add", "feature.py", cwd=env["worktree"])
+        _git("commit", "-q", "-m", "work", cwd=env["worktree"])
+        # Made through Bash, never added: the module the commit imports.
+        (env["worktree"] / "helpers.py").write_text("H = 1\n")
+        return {"subtask_id": sid_, "status": "complete",
+                "summary": "done", "criteria_results": [],
+                "production_evidence": {"exercised": True, "how": "n/a",
+                                         "observed": "n/a"}}
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+
+    async def _no_conformance(*a, **k):
+        return None, [], None
+    monkeypatch.setattr(leerie_mod, "_run_conformance_phase",
+                        _no_conformance)
+    monkeypatch.setattr(leerie_mod, "_log_session_id", lambda p: "sess-impl")
+
+
+def test_implementer_reasked_commits_its_untracked_module(env, monkeypatch):  # noqa: F811
+    leerie_mod = env["leerie"]
+    calls: list = []
+    _stub_impl_leaving(leerie_mod, env, monkeypatch, calls)
+    reasks: list[dict] = []
+
+    async def fake_claude_p(**kw):
+        reasks.append(kw)
+        _git("add", "helpers.py", cwd=env["worktree"])
+        _git("commit", "-q", "-m", "helpers", cwd=env["worktree"])
+        return {}
+    monkeypatch.setattr(leerie_mod, "claude_p", fake_claude_p)
+
+    res = _settle(leerie_mod, env, caps_overrides={"failed_retries": 3})
+
+    assert len(calls) == 1                      # never a fresh worker
+    assert [r["sid"] for r in reasks] == ["t1-clean1"]
+    assert reasks[0]["resume_session"] == "sess-impl"
+    assert reasks[0]["schema_key"] == "implementer"
+    assert "    ?? helpers.py" in reasks[0]["user_prompt"]
+    assert res["status"] != "unconverged", res
+    assert _git("ls-files", "helpers.py",
+                cwd=env["worktree"]).stdout.strip() == "helpers.py"
+
+
+def test_implementer_left_dirty_settles_unconverged(env, monkeypatch):  # noqa: F811
+    leerie_mod = env["leerie"]
+    calls: list = []
+    _stub_impl_leaving(leerie_mod, env, monkeypatch, calls)
+    reasks: list[dict] = []
+
+    async def fake_claude_p(**kw):
+        reasks.append(kw)
+        return {}
+    monkeypatch.setattr(leerie_mod, "claude_p", fake_claude_p)
+
+    res = _settle(leerie_mod, env, caps_overrides={"failed_retries": 3})
+
+    assert len(calls) == 1 and len(reasks) == 2
+    assert res["status"] == "unconverged"
+    st = env["st"]
+    assert st.data["subtask_status"]["t1"] == "unconverged"
+    rec = st.data["unconverged_subtasks"]["t1"]
+    assert rec["kind"] == "unclean_tree" and "?? helpers.py" in rec["reason"]
+    # Leerie committed nothing for it and deleted nothing.
+    assert (env["worktree"] / "helpers.py").exists()
+    assert _git("ls-files", "helpers.py",
+                cwd=env["worktree"]).stdout.strip() == ""

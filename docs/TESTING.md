@@ -4316,53 +4316,21 @@ cited path absent from the phase's own diff;
 `test_zero_commit_fixed_claim_is_neutralized` — fixed:true with zero
 phase commits; and the positive control
 `test_committed_cited_repair_is_not_neutralized`, proving a real
-committed repair still clears), and the
-uncommitted-tests-path check via the full `-z -uall` porcelain parse
-(`test_uncommitted_tests_entry_neutralizes_repair`,
-`test_uncommitted_tests_file_in_new_directory_is_caught`, the
-parametrized `test_porcelain_evasion_shapes_are_caught` over
-space/non-ASCII/staged-rename paths,
-`test_worktree_rename_origin_desync_does_not_swallow_records` — the
-two-sided ` R` record walk whose one-sided mutant survived every other
-test in the targeted battery — `test_noncanonical_cited_path_is_still_caught` over
-`./`-prefixed, absolute, trailing-space and tab-prefixed citations
-(the validator strips and resolves; exact-string matching missed
-each), `test_directory_citation_does_not_mask_uncommitted_tests`
-over dir / dir-slash / `.` citations — ancestor-prefix matching,
-because the validator checks existence, never file-ness — and
-`test_partially_committed_directory_citation_is_caught`, the one input
-where the porcelain arm is the SOLE catcher: one file under the cited
-directory committed, a second left uncommitted, so the
-committed-by-this-pass arm sees the directory in the phase diff and
-passes it), `test_staged_rename_origin_under_cited_directory_is_caught`
-(a staged `git mv` out of the cited directory: the rename ORIGIN is the
-only evidence, which no destination-matching pin exercises), the
-`one-char` evasion case (a 1-character path, the record walk's minimum
-length) and a `..` citation spelling (only `.resolve()` folds it). Every
-porcelain pin asserts the porcelain arm's OWN warning
-(`_assert_porcelain_arm_fired`, or the equivalent inline check in
-`test_uncommitted_tests_entry_neutralizes_repair`), not just the flag:
-the committed-by-this-pass arm also flags any wholly-uncommitted
-citation, and with flag-only assertions 5 of 7 porcelain mutants
-(ancestor clause, canonicalization, `.strip()`, one-sided rename parse,
-`-uall`) survived every test in `test_run_conformance_phase.py` and
-`test_risk_register.py` after S-6 (#274) merged, at that two-file
-scope. Three NEGATIVE pins with a dirty worktree guard the other
-direction, where a loosened check discards a real repair:
-`test_sibling_prefix_path_not_flagged` (a string-prefix sibling,
-`tests_new_scratch.txt` beside a cited `tests_new`),
-`test_rename_origin_is_not_reread_as_a_record` (a staged rename's
-origin field must be consumed; re-reading `xx_tests/test.py` as a
-record yields the junk path `tests/test.py`, which matches a cited
-`tests`), and `test_trailing_space_sibling_not_flagged` (record paths
-are compared verbatim; `test_x.py ` is not the cited `test_x.py`).
-Against a combined set of 20 porcelain mutants (the 7 above plus 13
-built independently by a reviewer), all 20 are killed at the same
-two-file scope. The clause-specific mutants are each killed by the pin
-named for their clause. The four that change the record walk's
-structure (record offset, walk start, early break, and a warning
-emitted without setting the flag) are killed by several pins, none
-named for them.
+committed repair still clears), and the clean-tree gate (I1, DESIGN
+§8 *A worker leaves its tree clean*): a round left dirty past its re-asks
+is rolled back and neutralized
+(`test_conformer_left_dirty_is_rolled_back_and_recorded`), one committed
+on the re-ask keeps its repair
+(`test_conformer_reasked_commits_and_its_repair_counts`), and the cited
+path is canonicalized before it meets the phase's diff
+(`test_noncanonical_spelling_of_a_committed_repair_counts`). The I1 gate
+replaced the uncommitted-tests-path check that parsed `-z -uall`
+porcelain; its pins (the porcelain-evasion, directory-citation,
+rename-origin and sibling cases, 15 collected cases) were deleted with it,
+since a tree the gate passed has no uncommitted path to cite, and its
+canonicalization pin was rewritten onto the phase-diff match. The gate itself, at every
+worker site, is pinned in `tests/test_clean_tree_gate.py` and beside the
+implementer, conformer and final-conformer harnesses.
 
 **The PR composition renderers** (two live paths plus `compose_pr_body`,
 the never-invoked canonical reference the bash fallback mirrors):

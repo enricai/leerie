@@ -4130,7 +4130,7 @@ Implements DESIGN §9 *Post-work conformance*.
 | Discover rules files | `_discover_rules_files(repo_root)` | Existing paths from a fixed, capped allowlist (`CLAUDE.md`, `AGENTS.md`, `.agent.md`, `.cursorrules`, `.windsurfrules`, `docs/CLAUDE.md`, `docs/AGENTS.md`, `docs/CONVENTIONS.md`, `docs/STYLE.md`, `docs/DESIGN-SYSTEM.md`, `docs/DESIGN_SYSTEM.md`, `docs/UI.md`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`), deterministic order, never raises, `[]` when nothing matches. The design-system candidates exist so a repo's component/color/banner conventions reach both conformer and implementer (DESIGN §9). |
 | Run conformer | `_run_conformer()` | One `claude -p` invocation with `ACT_TOOLS`, `--dangerously-skip-permissions`, `SCHEMAS["conformer"]`. Optional `extra_feedback` appended to the user prompt (Pattern B backgrounding-retry feedback). `WorkerError` → `None` (warning). Output passed through `_expand_conformer_output()` (N29), restoring the flattened wire shape into the four arrays downstream steps expect. |
 | Validate output | `_validate_conformance_result()` | Cross-field invariants — `rule_violations_residual` non-empty requires `rules_files_read` non-empty; each `rule_violations_fixed` cites a non-empty `rule`; each `docs_updates`/`tests_updates` cites an existing `path`. Failure → warning, loop breaks. |
-| Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions as the implementer, re-applied to conformer commits. A protected-path violation triggers `_rollback_conformer_commits()` (reset to `before_sha`), recorded as a warning, **not** `failed`/`blocked`. |
+| Re-run gates | `_clean_tree_gate` (first, right after the worker), `check_diff_scope` | The clean-tree gate (*Clean-tree gate (I1)*), then the implementer's scope check re-applied to conformer commits. A protected-path violation triggers `_rollback_conformer_commits()` (reset to `before_sha`), recorded as a warning, **not** `failed`/`blocked`. |
 | Clobber-survival check | `_clobbered_owned_files(worktree, run_branch, impl_head_sha)` + `_blob_sha` | DESIGN §9 *No clobbering the implementer's work*. `impl_head_sha` snapshotted **once before the round loop** (a per-round HEAD would miss a round-0 clobber). Owned set = `git diff --name-only <run_branch>..<impl_head_sha>`; a clobber is a deletion at HEAD or a blob reverted to base (three-way `_blob_sha` compare via `git rev-parse --verify -q`); a legit conformer edit leaves a distinct third blob, not flagged. Warns always; under `--strict-conformer` also rolls back to the implementer HEAD **and blocks** — a `clobbered_files` flag forces a block even when `_conformance_clean` is True. Not auto-rolled-back in advisory mode (a legitimate revert-to-base is git-indistinguishable from a clobber). The final-tree pass uses `base=` a **snapshot SHA** (`_merge_base_sha(staging, working_branch, staging_before_sha)`), never `run_branch` — the staging worktree has the run branch checked out, so passing that name collapses the two blob lookups and reports every final-conformer edit as `(reverted-to-base)`. The per-subtask call site is correct with `base=run_branch` since a subtask worktree sits on a genuinely different ref. |
 | Loop bound | `caps["conformance_rounds"]` (default 3) | Re-runs on malformed output or remaining residuals; exhausting the cap is a warning, not a failure. |
 | Loop-continuation predicate | `_conformance_clean(conf_res, baseline)` + `_baseline_red_axes(baseline)` | DESIGN §9 *The signal that continues the loop is a delta, not a verdict*. True (ends loop) when nothing left is this subtask's responsibility. `baseline` is `st.data["conformance"]["_baseline"]` or `None`. **Checked ahead of the red-axis exclusion: `ran && !measured` returns False** — an unmeasurable axis (runner absent, or `_is_fork_exhaustion`) is a third state, not "red at baseline." Then two exclusions keyed on `_baseline_red_axes()` (admits only `_BLT_AXES` names): (1) `ran && !passed` red at baseline doesn't block; (2) a `rule_violations_residual` whose **`axis` field** is red at baseline doesn't block. Everything else blocks — an unlabelled residual, or a failure on an axis green at baseline (a real regression). `axis` is read from the schema field, never inferred from `rule`/`why_not_fixed` prose (*Language-to-JSON*); optional on the schema, absence gates. `baseline=None` reproduces the pre-change absolute-verdict behaviour byte-for-byte. |
@@ -4682,9 +4682,10 @@ ONLY for `"mitigated"` with the repair recorded in a structured field — a
 `file_updates` entry, and only while the record survives and is
 trustworthy: `_run_conformance_phase` sets
 `conformer_repair_rolled_back` on the result when its rollback arms
-reverted the round's commits, a tests entry points at an uncommitted
-path (checked against full `-z -uall` porcelain, cited paths
-canonicalized worktree-relative first), the cited tests path is absent
+reverted the round's commits (protected path, strict clobber, or the
+clean-tree gate exhausted — so no tests entry can point at an
+uncommitted path), the cited tests path, canonicalized worktree-relative
+first, is absent
 from the phase's own diff (`impl_head_sha..HEAD`, ancestor-prefix — a
 zero-commit pass citing a pre-existing file records no repair; a
 `fixed: true` claim with zero phase commits falls to the same rule),
@@ -5257,8 +5258,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | implementer completeness re-drives per subtask (`completeness_retry_rounds`) | 1 | the conformer's gating `solution_defects` axis found concrete behavioral gaps in the implementer's diff (DESIGN §9 *The one gating axis: solution completeness*). Each round folds the found defects into the implementer's next attempt as mandatory criteria and re-drives it (a **separate** counter from `implementer_confidence_retries`/`failed_retries`/`subtask_continuations`). Each round **also draws from the shared per-subtask re-drive counter** (`subtask_redrive_rounds`, below): it runs only while `_redrive_allowed(st, caps, sid)` holds and consumes one `redrive_rounds[sid]` via `_consume_redrive`, so the two budgets cannot multiply. On exhaustion the subtask returns `blocked` with the residual defects named; at wave end it is re-driven only if the shared counter has room, else settled `unconverged` — never silently advisory. Independent of `--strict-conformer`, which governs only the advisory build/lint/test/residual axes. |
 | shared re-drive rounds per subtask (`subtask_redrive_rounds`) | 2 | one persisted counter per subtask, `state.data["redrive_rounds"][sid]`, drawn by every re-drive kind — the completeness gate's in-settle re-drive, the wave-end re-drive of a `blocked` subtask (`_redrive_blocked_subtasks`) and each coverage re-drive round (`_redrive_uncovered_subtasks`); integration repair rounds do NOT draw from it (they have their own counter, `integration_repair_rounds` below). `_redrive_allowed(st, caps, sid)` is `redrive_rounds[sid] < subtask_redrive_rounds and _redrive_time_left(st, caps)`; `_redrive_time_left(st, caps)` is `redrive_spent_sec < redrive_budget_sec`; `_consume_redrive(st, sid)` increments and saves. Per-attempt budgets (`failed_retries`, `implementer_confidence_retries`, `subtask_continuations`) are not re-drives and do not draw from it. On exhaustion the subtask is settled `unconverged` (`_settle_unconverged`) — never left `blocked` — and its dependents settle `unconverged` without running (DESIGN §13 *One re-drive budget per subtask*). |
 | run-level re-drive wall time (`redrive_budget_sec`) | 14400 s (4 h) | the hard stop for every re-drive in the run: `state.data["redrive_spent_sec"]` accumulates, per wave, the longest in-settle re-drive (clock opened by `_open_redrive_clock(st, sid)` at the first in-settle re-drive, closed by `_close_redrive_clock` when the settle returns) plus the wall time of each wave-end re-drive round. Once spent, `_redrive_allowed` is False for every subtask. Measured worst run: 15,017 s. |
-| delivery re-drive leftovers commit (`redrive_leftovers_max_files`, `redrive_leftovers_max_bytes`) | 100 files, 5 MiB (`5 * 1024 * 1024`) | `_redrive_commit_leftovers`: when the paths left to commit (after the held-out and artifact-shape withholds) number more than `redrive_leftovers_max_files` or their `os.lstat` sizes sum past `redrive_leftovers_max_bytes`, nothing is committed and every path goes to `withheld["over_cap"]` → the group's `leftovers_withheld.over_cap` → `_set_redrive_leftovers_gap` (DESIGN §8 *A re-drive group's leftovers are its implementer's*). Review round 11 M1: 505 files in one leftovers commit. |
-| delivery re-drive leftovers save (`redrive_leftovers_save_max_bytes`) | 64 MiB (`64 * 1024 * 1024`) | `_redrive_commit_leftovers` with `save_dir`: an over-cap set is saved by `_save_withheld_leftovers(staging, paths, save_dir, stem, max_bytes) -> list[str]` as `<save_dir>/<stem>.tar.gz` (each path that exists, as it stands, `tarfile` with `recursive=False`: first every path `git ls-files -z` tracks, outside the cap, then the untracked ones by `(size, path)` ascending until the next would pass the cap; the rest are named in the log line) and `<save_dir>/<stem>.patch` (in a temporary `GIT_INDEX_FILE`: `read-tree HEAD`, `git --literal-pathspecs add -A -f --pathspec-from-file=<NUL-separated tracked paths> --pathspec-file-nul`, then `diff --cached --binary HEAD`, when non-empty — never the paths on argv; review round 13 L1); `save_dir` is `<run dir>/redrive-leftovers` and `stem` the group label (`r<round>-g<group>`); the files written go to `withheld["saved"]` → `leftovers_withheld.saved` → named in the `_set_redrive_leftovers_gap` entry (DESIGN §8 *A re-drive group's leftovers are its implementer's*). Review round 12 L2: a later rollback erased what the entry said to commit. |
+| clean-tree re-asks (`clean_tree_reasks`) | 2 | `_clean_tree_gate`: how many times a worker that left its tree dirty (`_tree_dirt` not empty) is re-asked — its own CLI session resumed by `_clean_tree_reasker`, one worker each — before its caller rolls the round back and records the porcelain lines (DESIGN §8 *A worker leaves its tree clean*; IMPLEMENTATION *Clean-tree gate (I1)*). Replaces the caps of the deleted re-drive leftovers commit. |
 | final delivery judge crash retries (`delivery_judge_crash_retries`) | 1 | `_run_delivery_detection`: a `final` judge that raises `WorkerError` or times out is asked again up to this many more times; then its unread items are `unknown` and listed under "Needs human verification" (`delivery_judge_unknown`), never `met` (DESIGN §8 *Every post-execution verdict is of the committed tree*; review round 13 claims M1). |
 | coverage re-drive threshold (`coverage_uncovered_share`) | 0.25 | `_redrive_uncovered_subtasks`: a completed subtask is re-driven when at least this share of its changed executable lines is executed by no test, after the importing-test settle (DESIGN §9 *Changed lines no test executes are re-driven*). Rounds come from `subtask_redrive_rounds`. |
 | B\* host CPU-pressure gate (`confirm_psi_cpu_max`) | 40 | `_confirm_gate` waits until `_host_cpu_psi()` — `some avg10` of the **host** file `_HOST_PSI_CPU_PATH = "/proc/pressure/cpu"`, never a cgroup's `cpu.pressure` — is below this value. |
@@ -6014,7 +6014,7 @@ at the producer eliminates the prose round-trip.
 
 The coupling test in `tests/test_retryable_failure.py` enforces that
 every retryable-path return from a producer (`_validate_result`,
-`check_branch_has_commits`, the inline dirty-worktree check,
+`check_branch_has_commits`,
 `_run_implementer`'s `WorktreeSetupError`, `_invoke`'s
 `PidExhaustedError`/`OomKilledError`) carries a `failure_kind` in
 `_RETRYABLE_FAILURE_KINDS`. When adding a new retryable failure mode,
@@ -6023,7 +6023,6 @@ extend the enum and update the producer in the same change.
 | Failure | Tier | `failure_kind` / source |
 |---------|------|-----------------|
 | branch has no commits ahead of the run branch | Never reaches this tier: `_settle_subtask` settles a verification-only subtask by execution and returns every other no-commits `complete` as `blocked` for the shared re-drive budget (DESIGN §8 *Settled by execution*) | `"no_commits"` from `check_branch_has_commits` (still returned and still in `_RETRYABLE_FAILURE_KINDS`, but `_settle_subtask` no longer routes it to `fail()`) |
-| worktree left dirty | Retryable | `"dirty_worktree"` from the inline dirty-worktree check in `_settle_subtask` |
 | `incomplete-handoff` worker produced no checkpoint on disk | Retryable | `"empty_handoff"` from `_validate_result`'s incomplete-handoff branch when the checkpoint file is missing. Triggers in two known cases: (1) Claude Code session-limit / rate-limit no-op workers leave no checkpoint (primarily caught by `_detect_session_limit()` upstream; this is the safety net for a message-format change), and (2) a worker that hit `--max-turns` with no checkpoint written, which `_run_implementer`'s WorkerError handler synthesizes into the same envelope. Both are corrective-note cases. |
 | cross-field invariant violation (other) | Terminal | `"broken"` from `_validate_result` |
 | diff touched a protected path | Terminal | `"broken"` from `check_diff_scope` |
@@ -6083,6 +6082,66 @@ retry re-runs the script against a still-registered worktree and an existing
 branch — the second `git worktree add -b` fails with
 `fatal: a branch ... already exists`, the `WorkerError` escapes
 `_settle_subtask`, and `_gather_or_cancel` takes down the rest of the wave.
+
+### Clean-tree gate (I1) — `_clean_tree_gate`
+
+DESIGN §8 *A worker leaves its tree clean*. One checker, one re-ask, one
+gate, shared by every site:
+
+- `async _tree_dirt(tree) -> list[str] | None` — every non-empty line of
+  `git status --porcelain --untracked-files=all` in `tree`, verbatim
+  (`run_proc`); `[]` is clean; None when git exits non-zero or cannot be
+  spawned (not clean). No `--ignored`: an ignored file never appears.
+- `CLEAN_TREE_REASK_NOTE` — the re-ask's user prompt, `{lines}` filled
+  with the porcelain lines (each indented four spaces): commit each line
+  that is part of the change, delete each that is not (`git checkout --
+  <path>` for a modified tracked file), do no other work, re-run the same
+  `git status`, return the JSON object per the schema.
+- `_clean_tree_reasker(st, caps, *, log_sid, cwd, schema_key,
+  system_prompt, model, effort, max_turns) -> Callable[[str],
+  Awaitable[None]]` — the re-ask of the SAME worker: `_log_session_id(
+  <run>/logs/<log_sid>.log)` (on the second call, the first re-ask's
+  log), then `st.bump_workers(caps)` and `claude_p(user_prompt=note,
+  system_prompt, schema_key, cwd, allowed_tools=ACT_TOOLS, max_turns,
+  autonomous=True, model, effort, sid=f"{log_sid}-clean<n>",
+  resume_session=<session>)`; the structured result is not read. No
+  recorded session → `WorkerError`, no worker spent.
+- `async _clean_tree_gate(tree, *, caps, label, reask) -> list[str]` —
+  `_tree_dirt`; while not `[]` and fewer than `caps["clean_tree_reasks"]`
+  (`DEFAULT_CAPS` 2) re-asks spent, `reask(CLEAN_TREE_REASK_NOTE.format(
+  lines=...))`; a re-ask that raises is logged and spends its attempt.
+  Returns `[]`, or the lines still there (None from `_tree_dirt` becomes
+  the one line `(git status failed — the tree could not be read)`).
+  Never commits or deletes.
+A tree an implementer left dirty is no longer the retryable
+`"dirty_worktree"` failure (a worktree reset — its commits with it — and
+a fresh worker): that kind is gone from `_WORKER_RETRYABLE_KINDS`.
+
+- `_record_unclean_tree(st, worker, where, lines)` —
+  `st.data["unclean_trees"]["<worker>:<where>"] = {worker, where,
+  lines[:_UNCLEAN_LINES_MAX]}` (`_UNCLEAN_LINES_MAX` = 20), saved.
+  `_decide_outcome` appends one reason per record,
+  `_unclean_reason(f"the {worker} at {where}", lines)` = `"<what> left its
+  tree unclean after its re-asks, so its work was rolled back: <first 5
+  lines joined '; '> (+N more)"`, so the run is `unconverged` and the PR's
+  "Unconverged" section names the lines.
+
+The sites — each calls the gate right after the worker's `claude_p`
+returned, before leerie runs anything of its own in that tree:
+
+| Worker | Tree | `log_sid` | On exhaustion |
+|---|---|---|---|
+| implementer (`_settle_subtask`, a `complete` result that passed the commit check) | subtask worktree | `<sid>` | `_settle_unconverged(st, sid, _unclean_reason("its implementer", lines), previous_status="complete", kind="unclean_tree")` — not integrated. A result rescued from `empty_handoff` is not gated (a reaped worker has no session): when `_tree_dirt` is not `[]`, `git checkout -- .` then `git clean -fdq` |
+| per-subtask conformer (`_run_conformance_phase`, each round, after the crash checks and before the result is validated) | subtask worktree | `<sid>-conformer` | `_rollback_conformer_commits(worktree, before_sha)` + `git clean -fdq`; warning `"conformer round <n>: " + _unclean_reason(...)`; `_record_unclean_tree(st, "conformer", "<sid> round <n>", lines)`; `conformer_repair_rolled_back = True`; break |
+| final conformer (`_run_final_conformance`, each round, before `_expand_conformer_output`) | staging | `final-conformer-r<n>` | `_redrive_rollback(staging, before_sha)`; warning; `_record_unclean_tree(st, "final conformer", "round <n>", lines)`; break |
+| acceptance-repair conformer (`_run_acceptance_gate_inner`'s `_round_unclean`, after the worker returned or raised, before the round is measured) | staging | `acceptance-repair-r<n>` | `_record_unclean_tree(st, "acceptance repair", "round <n>", lines)`; `_settle_round({round, pre_sha, unclean_tree, rollback_reason: "left its tree unclean"}, prev, prev_sha)` (its `_undo_round` → `_redrive_rollback`); the repair loop stops |
+| delivery re-drive implementer (`_run_delivery_redrive`, after `_redrive_unstage`) | staging | `delivery-redrive-r<round>-g<group>` | the group's `unclean_tree`; `_record_unclean_tree(st, "delivery re-drive implementer", "r<round> g<group>", lines)`; `_redrive_rollback(staging, pre_sha)` → `rolled_back` (a failed reset: `rollback_failed`, the re-drive stops); next group |
+| integrator, conflict resolution (`integrate_wave`, after `check_merge_committed`) | staging | `integrator-<sid>` | `_back_out_unmerged(st, staging, sid, pre_sha, _unclean_reason("the integrator", lines))` — `sid` settles `unconverged` |
+| integrator, repair round (`_integration_repair_round`, a status other than `design-conflict`/`failed`) | staging | `integrator-repair-<sid>` | the round entry's `unclean_tree`; `mech.clean` false → `mech_fail`, `_reset` |
+
+The rollbacks are exact: `_back_out_unmerged`, `_restart_integration_merge`
+and `_integration_repair_round`'s `_reset` run `git clean -fdq` after their
+`git reset --hard`, as `_redrive_rollback` always has (ignored files kept).
 
 ### Flake-robust failure verdicts — B\* (`_confirm_new_failures`)
 
@@ -6386,63 +6445,13 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `tests/test_delivery_detection.py::test_a_result_of_another_tree_is_not_on_the_record`,
     `tests/test_post_execution_readers_read_committed_tree.py` and
     `tests/test_acceptance_gate.py::test_the_final_remeasure_reads_the_committed_tree`.
-  - `async _redrive_commit_leftovers(staging, label, tracked_before,
-    untracked_before, written, *, prints=None, withheld=None, caps=None,
-    save_dir=None)
-    -> list[str]`
-    commits a group's leftovers
-    (DESIGN §8 *A re-drive group's leftovers are its implementer's*): first,
-    every changed tracked path and every moved or `written` untracked path
-    whose file `_file_holds_span(prints)` is removed (untracked:
-    unlinked; tracked: `git --literal-pathspecs checkout HEAD -- <p>`),
-    logged `"delivery re-drive (<label>): removed <N> file(s) holding a
-    span of a staged held-out set's source: <first 5>"`, appended to
-    `withheld["heldout"]` and dropped from what follows; an untracked
-    candidate `_leftover_artifact(staging, rel)` names — basename matching
-    `_LEFTOVER_ARTIFACT_GLOBS = ("*.pyc", "*.pyo", "*.swp", "*.swo", "*~",
-    ".#*", "#*#", ".DS_Store")` (`fnmatch.fnmatchcase`), or matching
-    `_CORE_DUMP_RE` (`core` / `core.<digits>`) with an ELF magic first four
-    bytes — is withheld into `withheld["artifacts"]`, logged
-    `"<N> artifact-shaped untracked file(s) not committed: <first 5>"` and
-    never listed in the PR (`_set_redrive_leftovers_gap` reads only
-    `over_cap`, `generated_edited` and `heldout`; review round 12 M1); a
-    `_leerie_produced` path whose signature moved during the group and that
-    is not `_leerie_last_wrote` (nor artifact-shaped) is not committed and
-    goes to `withheld["generated_edited"]`, logged `"<N> file(s) a leerie
-    command generated and the group then changed, not committed: <first
-    5>"`, and the caller re-reads it once the group's own measurements have
-    run, keeping only the paths still present, still not
-    `_leerie_last_wrote` and not `_leerie_test_outputs` (review round 12
-    M2); a path in `_leerie_test_outputs(staging)` is never
-    `generated_edited`, and one that is a moved or `written` untracked
-    candidate (not `_leerie_produced`) is withheld with the artifacts
-    (`withheld["artifacts"]`, logged `"<N> artifact-shaped untracked
-    file(s) not committed: …"`), so neither is committed or listed
-    (review round 14);
-    past the leftovers cap (`caps`, else `DEFAULT_CAPS`;
-    `redrive_leftovers_max_files` / `redrive_leftovers_max_bytes`) nothing
-    is committed and every path goes to `withheld["over_cap"]`, saved first
-    when `save_dir` is given (`_save_withheld_leftovers`, caps table); then
-    the tracked paths `_changed_paths(tracked_before, _tracked_content(
-    staging))` — `tracked_before` is the `_tracked_content` snapshot taken
-    just before the group's implementer ran (None: no tracked path) — plus
-    the `_untracked_signatures(staging)` paths whose signature differs from
-    `untracked_before` (the snapshot taken with `tracked_before`; None: none)
-    and are not `_leerie_produced`, plus those in `written`, with
-    `git --literal-pathspecs add -A -- <paths>` and one `leerie: delivery
-    re-drive leftovers (<label>)` commit; the untracked paths left out
-    (neither produced nor taken) are logged as `"delivery re-drive
-    (<label>): <N> untracked file(s) predating the group, untouched by it,
-    left uncommitted: <first 5>"`; returns
-    the paths ([] and no commit when nothing staged, so HEAD stays and the
-    group reads `no_change`). The caller passes `written =
-    _worker_written_paths(<run>/logs/delivery-redrive-r<round>-g<group>.log,
-    staging)` and records a non-empty result as the group's `leftovers`
-    (first 20). `_worker_written_paths(log_path, tree) -> set[str]`: the
-    `tree`-relative paths of every `Write`/`Edit`/`MultiEdit`/`NotebookEdit`
-    (`_WRITE_TOOL_KINDS`) `tool_use` in the log (`file_path`, or
-    `notebook_path`; relative ones resolved against `tree`), realpaths
-    outside `tree` dropped; empty with no log.
+  - The re-drive group's clean-tree gate (*Clean-tree gate (I1)*): after
+    `_redrive_unstage`, unless the group's commits
+    (`git log --format= --name-only -m <pre_sha>..HEAD`) name a staged file
+    — rule 3 voids that group whatever its tree holds, and the unstage's
+    deletion of that tracked path is leerie's, not the worker's — the gate
+    runs with `log_sid = delivery-redrive-r<round>-g<group>`. Leerie never
+    commits a group's leftovers.
   - `async _refresh_shipping_test_id_diff(leerie_dir, st, caps, *, label)`
     — on `worktrees/staging` (nothing when absent): `_refresh_test_id_diff`
     with `log_prefix="phase 5"`, then `_resettle_test_outcome_rows(st,
@@ -7558,12 +7567,15 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   other file there (the implementer's own) and removing the directories
   left empty — appending every removed path that is not a staged file to
   `swept` (recorded as the group's `heldout_removed`, first 20, with
-  the leftovers' `withheld["heldout"]`, each path once), and every removed
+  `span_held`, each path once), and every removed
   file that is neither a staged file nor a runner copy — removed for
-  holding a span — to `span_held`, which `_run_delivery_redrive` seeds
-  into the group's `withheld["heldout"]` before `_redrive_commit_leftovers`
-  adds its own, so `_set_redrive_leftovers_gap` lists it (review round 13
-  M2). Staging, the fingerprints, the
+  holding a span — to `span_held`, recorded as the group's
+  `heldout_listed` (first 200) and listed by
+  `_set_redrive_heldout_gap(st, rec)` as the re-drive ends: one "Needs
+  human verification" entry, `source: "redrive_heldout_removed"`
+  (`_REDRIVE_HELDOUT_GAP_SOURCE`), over every group not `rolled_back`,
+  rendered by `_pr_needs_human` under "Files removed for holding a hidden
+  test's source"; cleared when there is none (review round 13 M2). Staging, the fingerprints, the
   note and the snapshots all run inside the `try` whose `finally` is
   `_redrive_unstage`, so no exception between staging and the drive leaves
   a set staged (review round 12 L1,
@@ -7602,8 +7614,8 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   allowed_tools=ACT_TOOLS, max_turns=120, autonomous=True,
   sid="delivery-redrive-r<round>-g<group>")`, effort the resolved
   implementer effort or `EFFORT_REDRIVE_ESCALATION`); then the set files
-  are removed (`tampered` recorded), leftovers committed (`leerie: delivery
-  re-drive leftovers`), and, when HEAD moved, the shown sets (and, in a
+  are removed (`tampered` recorded), the clean-tree gate runs (a group
+  left dirty past its re-asks is rolled back), and, when HEAD moved, the shown sets (and, in a
   held-back round, the held-back ones) are re-measured and the repo's test
   command re-run for failing IDs (`_redrive_test_ids`, which is
   `_ratchet_test_ids` in `_committed_test_tree(st, caps, staging,
@@ -10089,7 +10101,8 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `redrive_rounds` | dict[str, int] | per-subtask shared re-drive counter (`subtask_redrive_rounds`; DESIGN §13 *One re-drive budget per subtask*), persisted so `resume` cannot reset it. |
 | `redrive_spent_sec` | float | run-level re-drive wall time charged so far against `redrive_budget_sec`. |
 | `blocker_kinds` | dict[str, dict] | per-sid `{kind, resource?, status, claimed?, external_check?}` — the latest implementer attempt's typed `blocker_kind` (normalised by `_blocker_kind`) on a `blocked`/`failed` result, written by `_route_blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*). An `external_precondition` claim adds `external_check: {verdict, why, claim, reason?}` (`_verify_external_claim`), dropped when a later attempt reports `complete`; one not `verified` is recorded `kind: "other"`, `claimed: "external_precondition"`. |
-| `unconverged_subtasks` | dict[str, dict] | one `{at, previous_status, reason}` record per subtask settled `unconverged` by `_settle_unconverged`, plus `kind: "environment_limit"` when its cgroup killed it at the measured ceiling (DESIGN §6). |
+| `unconverged_subtasks` | dict[str, dict] | one `{at, previous_status, reason}` record per subtask settled `unconverged` by `_settle_unconverged`, plus `kind: "environment_limit"` when its cgroup killed it at the measured ceiling (DESIGN §6), or `kind: "unclean_tree"` when its implementer left its tree unclean past `clean_tree_reasks` (DESIGN §8 *A worker leaves its tree clean*). |
+| `unclean_trees` | dict[str, dict] \| absent | `_record_unclean_tree`: `{"<worker>:<where>": {worker, where, lines[]}}` per conformer, final-conformer, acceptance-repair or re-drive round rolled back because its worker left its tree unclean past `clean_tree_reasks` (lines: the porcelain, first `_UNCLEAN_LINES_MAX`); `_decide_outcome` adds one reason per record (DESIGN §8 *A worker leaves its tree clean*). |
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
 | `test_file_durations` | dict[str, float] \| absent | repo-relative test file → seconds, the newest measurement from any structured report leerie read (`_record_test_durations`); sizes intermittent discovery to its budget (DESIGN §9 *Sized to the budget*). |
@@ -10162,7 +10175,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `integration_unjudged` | dict[str, str] | per-sid write-ahead marker of an integrator merge not yet judged (`_mark_integration_unjudged`, DESIGN §6 *A committed resolution is not a judged one*): the merge's first parent, saved before the integrator is spawned and dropped once the integration is decided (`_clear_integration_unjudged`); a resume that finds it with no `integration_gate[sid]` and the sid merged runs the integration gate on the committed merge. |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[], unverified?{item_index: {sha, label}}}` (`unverified`: items a failed ratchet did not read on the commit it kept, `_ratchet_mark_unverified`) — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
-| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), tampered[], heldout_removed?[], leftovers?[], leftovers_withheld?{artifacts?[], over_cap?[], heldout?[], generated_edited?[], saved?[]} (first 200 each; `saved`: the archive and patch of an over-cap set; `generated_edited`: files a leerie command generated that the group changed and no leerie command rewrote by the group's end; `heldout`: files removed for holding a span of a staged set's source; `artifacts` is recorded and logged but never listed; listed by `_set_redrive_leftovers_gap(st, rec, staging)`, called as the re-drive ends, leaving out every `over_cap`/`generated_edited` path `git --literal-pathspecs ls-files -z` (through `_git_z_output`) shows staging tracks by then: one "Needs human verification" entry, `source: "redrive_leftovers"` (`_REDRIVE_LEFTOVERS_GAP_SOURCE`), over every group not `rolled_back`, rendered by `_pr_needs_human` under "Files a re-drive left uncommitted"; cleared when there is none), committed_staged[] (staged paths — `git log --name-only -m pre..post` — runner copies of them, and paths whose committed blob holds a span of a staged set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], kept_unsettled?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
+| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), tampered[], heldout_removed?[], heldout_listed?[] (files removed at unstage for holding a span of a staged set's source, listed by `_set_redrive_heldout_gap`), unclean_tree?[] (the porcelain lines a group's implementer left past `clean_tree_reasks`; the group is then `rolled_back`), committed_staged[] (staged paths — `git log --name-only -m pre..post` — runner copies of them, and paths whose committed blob holds a span of a staged set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], kept_unsettled?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution` or `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*). |

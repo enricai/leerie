@@ -738,41 +738,6 @@ def test_settle_subtask_survives_unexpected_exception_in_conformance(env, monkey
     assert any("FileNotFoundError" in w for w in warnings)
 
 
-# --- dirty-state warning before rollback (fourth-pass audit follow-up) -----
-
-def test_protected_path_rollback_warns_about_discarded_uncommitted(env):
-    """When the conformer commits to a protected path AND leaves
-    uncommitted changes to tracked files, the rollback (git reset --hard)
-    will silently erase those uncommitted scribbles. The phase must surface
-    a warning naming the discarded files BEFORE rolling back."""
-    c = env["leerie"]
-
-    def _bad_with_uncommitted(wt: Path):
-        # Commit a protected-path change (will trigger rollback).
-        (wt / ".claude").mkdir(exist_ok=True)
-        (wt / ".claude" / "x").write_text("bad\n")
-        _run(["git", "add", "-A"], cwd=wt)
-        _run(["git", "commit", "-q", "-m",
-              "conformer: BAD touched protected path"], cwd=wt)
-        # Now leave an uncommitted modification to a TRACKED file.
-        # (`src.py` was committed by the env fixture.)
-        (wt / "src.py").write_text(
-            "def f():\n    pass\n\n# uncommitted scribble\n")
-
-    _stub_run_conformer(c, [_clean_result()],
-                        commits={0: _bad_with_uncommitted})
-
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-
-    # The protected-path rollback warning should be present (as before).
-    assert any("protected-path" in w for w in warnings)
-    # AND a new warning should call out the discarded uncommitted file.
-    assert any("discarding" in w and "src.py" in w for w in warnings), \
-        f"expected a 'discarding' warning mentioning src.py; got {warnings!r}"
-
-
 # --- Pattern B feedback injection ----------------------------------------- #
 
 def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
@@ -1033,68 +998,6 @@ def test_axes_off_short_circuits_measure(env, monkeypatch):
     assert res is not None
 
 
-# --- dirty worktree that is NOT a protected-path or clobber violation ----
-
-def test_dirty_leftover_warns_without_rollback(env):
-    """A conformer that leaves an uncommitted change to a tracked file —
-    with no protected-path commit and no clobber — must surface a
-    'left N uncommitted change(s)' advisory warning, and must NOT be
-    rolled back (the phase tolerates this; it only warns)."""
-    c = env["leerie"]
-
-    def _leave_dirty(wt: Path):
-        (wt / "src.py").write_text(
-            "def f():\n    pass\n\n# left dirty, never committed\n")
-
-    _stub_run_conformer(c, [_clean_result()], commits={0: _leave_dirty})
-
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-
-    assert any(
-        "left" in w and "uncommitted change" in w
-        and "not rolled back" in w for w in warnings), warnings
-    # Confirm the file is still dirty — no rollback happened.
-    assert "left dirty" in (env["worktree"] / "src.py").read_text()
-
-
-# --- clobber rollback (strict mode) also discards other uncommitted work -
-
-def test_strict_clobber_rollback_warns_about_discarded_uncommitted(env):
-    """Mirrors `test_protected_path_rollback_warns_about_discarded_uncommitted`
-    for the OTHER rollback path: under --strict-conformer, a clobber
-    rollback (`git reset --hard` to the implementer HEAD) will also
-    silently erase any other uncommitted tracked-file scribble. The phase
-    must name it before rolling back."""
-    c = env["leerie"]
-    env["caps"]["strict_conformer"] = True
-
-    def _clobber_with_uncommitted(wt: Path):
-        (wt / "src.py").unlink()
-        (wt / "extra.txt").write_text("tracked\n")
-        subprocess.run(["git", "add", "-A"], cwd=wt, check=True,
-                       capture_output=True, text=True)
-        subprocess.run(["git", "commit", "-q", "-m", "conformer: clobber"],
-                       cwd=wt, check=True, capture_output=True, text=True)
-        # Leave a further uncommitted change to the newly-tracked file.
-        (wt / "extra.txt").write_text("uncommitted scribble\n")
-
-    _stub_run_conformer(c, [_clean_result()],
-                        commits={0: _clobber_with_uncommitted})
-
-    res, warnings, blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-
-    assert blocked is not None
-    assert any(
-        "discarding" in w and "clobber rollback" in w for w in warnings), \
-        warnings
-    # src.py restored by the rollback (implementer's file was clobbered).
-    assert (env["worktree"] / "src.py").exists()
-
-
 # --- a within-round regression continues the loop and is surfaced --------
 
 def test_within_round_regression_surfaces_and_continues(env):
@@ -1268,74 +1171,6 @@ def test_protected_path_rollback_neutralizes_repair_records(env):
     assert risks[0]["addressed"] is False
 
 
-# Every porcelain-arm pin below asserts the porcelain arm's OWN warning,
-# not just the flag: the committed-by-this-pass arm also sets the
-# flag for any wholly-uncommitted citation, so a flag-only assertion
-# passes even with the porcelain arm broken (measured after S-6, #274,
-# merged: 5 of 7 porcelain mutants survived flag-only pins in this file
-# and test_risk_register.py). The committed-by-this-pass arm is skipped
-# once the flag is set, so its different warning appears only when the
-# porcelain arm failed to fire.
-_PORCELAIN_ARM_WARNING = "references the uncommitted path"
-
-
-def _assert_porcelain_arm_fired(warnings):
-    assert any(_PORCELAIN_ARM_WARNING in w for w in warnings), (
-        "flag set by a different arm, not the porcelain check", warnings)
-
-
-def test_uncommitted_tests_entry_neutralizes_repair(env):
-    """The dirty-worktree sibling: a `kind:"tests"` file_updates entry
-    whose path was left UNCOMMITTED records a repair integration will
-    lose — flagged, not counted."""
-    c = env["leerie"]
-
-    def _leave_tests_uncommitted(wt: Path):
-        (wt / "test_g.py").write_text("def test_g():\n    pass\n")
-
-    result = _clean_result()
-    result["tests_updates"] = [{"path": "test_g.py", "reason": "covers g"}]
-    # Production results keep the WIRE `file_updates` array alongside the
-    # expanded tests_updates (_expand_conformer_output copies the dict);
-    # the phase's dirty-path check reads the wire key.
-    result["file_updates"] = [{"kind": "tests", "path": "test_g.py",
-                               "reason": "covers g"}]
-    _stub_run_conformer(c, [result],
-                        commits={0: _leave_tests_uncommitted})
-    _stub_measure_axes(c, {})
-
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
-    assert any("uncommitted path" in w for w in warnings), warnings
-
-
-def test_uncommitted_tests_file_in_new_directory_is_caught(env):
-    """The porcelain LINE form prints `?? dir/` for an untracked new
-    directory — the file path never appears and the phantom repair
-    counted (executed evasion). The `-z -uall` parse must catch it."""
-    c = env["leerie"]
-
-    def _new_dir_uncommitted(wt: Path):
-        (wt / "tests_new").mkdir()
-        (wt / "tests_new" / "test_g.py").write_text("def test_g(): pass\n")
-
-    result = _clean_result()
-    result["tests_updates"] = [{"path": "tests_new/test_g.py",
-                                "reason": "covers g"}]
-    result["file_updates"] = [{"kind": "tests",
-                               "path": "tests_new/test_g.py",
-                               "reason": "covers g"}]
-    _stub_run_conformer(c, [result], commits={0: _new_dir_uncommitted})
-    _stub_measure_axes(c, {})
-    res, warnings, _ = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
-    _assert_porcelain_arm_fired(warnings)
-
-
 def test_malformed_result_neutralizes_repair_records(env):
     """A result the honesty validator rejected (here: a tests_updates
     path that does not exist) has no trustworthy repair records — the
@@ -1396,144 +1231,6 @@ def test_strict_clobber_rollback_neutralizes_repair_records(env):
         dict(res, risk_dispositions=["mitigated"]))
     assert risks[0]["addressed"] is False
 
-
-def _evasion_space(wt: Path):
-    (wt / "test my feature.py").write_text("def test_m(): pass\n")
-
-
-def _evasion_nonascii(wt: Path):
-    (wt / "test_café.py").write_text("def test_c(): pass\n")
-
-
-def _evasion_one_char(wt: Path):
-    # The record walk skips records shorter than "XY p" (4 chars); a
-    # 1-character path is exactly that minimum and must still be read.
-    (wt / "t").write_text("def test_t(): pass\n")
-
-
-def _evasion_staged_rename(wt: Path):
-    (wt / "test_orig.py").write_text("def test_o(): pass\n")
-    _run(["git", "add", "test_orig.py"], cwd=wt)
-    _run(["git", "commit", "-q", "-m", "conformer: orig"], cwd=wt)
-    _run(["git", "mv", "test_orig.py", "test_renamed.py"], cwd=wt)
-    # staged rename, never committed: the repair integration loses
-
-
-import pytest as _pytest
-
-
-@_pytest.mark.parametrize("setup,claimed", [
-    (_evasion_space, "test my feature.py"),
-    (_evasion_nonascii, "test_café.py"),
-    (_evasion_staged_rename, "test_renamed.py"),
-    (_evasion_one_char, "t"),
-], ids=["space-path", "non-ascii", "staged-rename", "one-char"])
-def test_porcelain_evasion_shapes_are_caught(env, setup, claimed):
-    """The line-form porcelain never printed these paths verbatim
-    (quoted, octal-escaped, rename-arrow) — each evasion let a phantom
-    repair count. The `-z -uall` parse must flag all of them."""
-    c = env["leerie"]
-    result = _clean_result()
-    result["tests_updates"] = [{"path": claimed, "reason": "covers it"}]
-    result["file_updates"] = [{"kind": "tests", "path": claimed,
-                               "reason": "covers it"}]
-    _stub_run_conformer(c, [result], commits={0: setup})
-    _stub_measure_axes(c, {})
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
-    _assert_porcelain_arm_fired(warnings)
-
-
-def test_noncanonical_cited_path_is_still_caught(env):
-    """The validator RESOLVES cited paths, porcelain prints canonical
-    relative ones — `./x.py` and the absolute worktree spelling both
-    passed validation yet never string-matched (executed evasions).
-    Canonicalization closes both."""
-    c = env["leerie"]
-
-    def _leave_uncommitted(wt: Path):
-        (wt / "tests_new").mkdir(exist_ok=True)
-        (wt / "test_dot.py").write_text("def test_d(): pass\n")
-
-    for claimed in ("./test_dot.py",
-                    str(env["worktree"] / "test_dot.py"),
-                    "test_dot.py ",      # trailing space: the validator
-                    "\ttest_dot.py",     # strips, so canon must too
-                    "tests_new/../test_dot.py"):  # only .resolve() folds ..
-        result = _clean_result()
-        result["tests_updates"] = [{"path": claimed, "reason": "covers d"}]
-        result["file_updates"] = [{"kind": "tests", "path": claimed,
-                                   "reason": "covers d"}]
-        _stub_run_conformer(c, [result], commits={0: _leave_uncommitted})
-        _stub_measure_axes(c, {})
-        res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-            env["sid"], env["run_dir"], str(env["worktree"]),
-            env["subtask"], env["caps"], env["st"], env["models"],
-            env["efforts"]))
-        assert res.get("conformer_repair_rolled_back") is True, \
-            (claimed, res, warnings)
-        _assert_porcelain_arm_fired(warnings)
-
-
-def test_worktree_rename_origin_desync_does_not_swallow_records(env):
-    """The discriminating shape for the two-sided R/C parse (the one-
-    sided `_rec[0]` form passes every other test): a WORKTREE-side
-    rename (` R new\\0old\\0`) whose origin itself starts with `R`,
-    followed by the claimed untracked path. One-sided parsing misreads
-    the origin as a record and swallows the next record as its bogus
-    origin — the claimed path never enters `unclean` and the phantom
-    repair counts (executed under the mutant)."""
-    import shutil
-    c = env["leerie"]
-
-    def _setup(wt: Path):
-        (wt / "R_orig.py").write_text("x = 1\n")
-        _run(["git", "add", "R_orig.py"], cwd=wt)
-        _run(["git", "commit", "-q", "-m", "conformer: orig"], cwd=wt)
-        shutil.move(str(wt / "R_orig.py"), str(wt / "a_new.py"))
-        _run(["git", "add", "-N", "a_new.py"], cwd=wt)
-        (wt / "test_x.py").write_text("def test_x(): pass\n")
-
-    result = _clean_result()
-    result["tests_updates"] = [{"path": "test_x.py", "reason": "covers x"}]
-    result["file_updates"] = [{"kind": "tests", "path": "test_x.py",
-                               "reason": "covers x"}]
-    _stub_run_conformer(c, [result], commits={0: _setup})
-    _stub_measure_axes(c, {})
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
-    _assert_porcelain_arm_fired(warnings)
-
-
-@_pytest.mark.parametrize("claimed", ["tests_new", "tests_new/", "."],
-                          ids=["dir", "dir-slash", "dot"])
-def test_directory_citation_does_not_mask_uncommitted_tests(env, claimed):
-    """The validator accepts a DIRECTORY citation (exists(), never
-    is_file()), while `-uall` porcelain prints only the files beneath
-    it — a bare intersection matched nothing and the phantom counted
-    (executed, all three spellings). Ancestor-prefix matching closes
-    it."""
-    c = env["leerie"]
-
-    def _new_dir_uncommitted(wt: Path):
-        (wt / "tests_new").mkdir(exist_ok=True)
-        (wt / "tests_new" / "test_d.py").write_text("def test_d(): pass\n")
-
-    result = _clean_result()
-    result["tests_updates"] = [{"path": claimed, "reason": "covers d"}]
-    result["file_updates"] = [{"kind": "tests", "path": claimed,
-                               "reason": "covers d"}]
-    _stub_run_conformer(c, [result], commits={0: _new_dir_uncommitted})
-    _stub_measure_axes(c, {})
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
-    _assert_porcelain_arm_fired(warnings)
 
 
 def test_zero_commit_pass_citing_committed_path_is_neutralized(env):
@@ -1602,155 +1299,121 @@ def test_committed_cited_repair_is_not_neutralized(env):
     assert risks[0]["addressed"] is True
 
 
-def test_partially_committed_directory_citation_is_caught(env):
-    """The one input where the porcelain arm is the SOLE catcher: the
-    pass commits one file under the cited directory (so the
-    committed-by-this-pass arm sees the directory in the phase diff and
-    passes it) but leaves a second file there uncommitted. Only the
-    porcelain arm's ancestor-prefix match flags it — measured, reverting
-    that clause to bare equality left this unflagged."""
-    c = env["leerie"]
 
-    def _partial(wt: Path):
-        (wt / "tests_new").mkdir()
-        (wt / "tests_new" / "test_a.py").write_text("def test_a(): pass\n")
-        _run(["git", "add", "tests_new/test_a.py"], cwd=wt)
-        _run(["git", "commit", "-q", "-m", "conformer: a"], cwd=wt)
-        (wt / "tests_new" / "test_b.py").write_text("def test_b(): pass\n")
 
+# --- I1: the conformer leaves its tree clean (DESIGN §8 *A worker leaves
+# its tree clean*). Replaces the advisory "left N uncommitted change(s)"
+# warning and the `-z -uall` parse of a tests repair cited at an
+# uncommitted path: a tree the gate passed has no uncommitted path. -------
+
+def _reask_stub(c, monkeypatch, action=None):
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kw):
+        calls.append(kw)
+        if action is not None:
+            action(Path(kw["cwd"]))
+        return {}
+    monkeypatch.setattr(c, "claude_p", fake_claude_p)
+    monkeypatch.setattr(c, "_log_session_id", lambda p: "sess-conf")
+    return calls
+
+
+def _tests_result(path):
     result = _clean_result()
-    result["tests_updates"] = [{"path": "tests_new", "reason": "covers a, b"}]
-    result["file_updates"] = [{"kind": "tests", "path": "tests_new",
-                               "reason": "covers a, b"}]
-    _stub_run_conformer(c, [result], commits={0: _partial})
-    _stub_measure_axes(c, {})
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
-    _assert_porcelain_arm_fired(warnings)
+    result["tests_updates"] = [{"path": path, "reason": "covers g"}]
+    result["file_updates"] = [{"kind": "tests", "path": path,
+                               "reason": "covers g"}]
+    return result
 
 
-def test_sibling_prefix_path_not_flagged(env):
-    """NEGATIVE control with a dirty worktree, the direction no other
-    porcelain pin covers: a committed repair under `tests_new`, cited as
-    `tests_new`, beside an unrelated untracked `tests_new_scratch.txt`. A
-    string-prefix sibling is not a descendant, so the porcelain arm must
-    stay silent and the repair must count. A predicate loosened from
-    `startswith(c + "/")` to `startswith(c)` neutralizes this legitimate
-    repair (measured)."""
+def test_conformer_reasked_commits_and_its_repair_counts(env, monkeypatch):
     c = env["leerie"]
+    wt = env["worktree"]
 
-    def _commit_with_sibling(wt: Path):
-        (wt / "tests_new").mkdir()
-        (wt / "tests_new" / "test_a.py").write_text("def test_a(): pass\n")
-        _run(["git", "add", "tests_new/test_a.py"], cwd=wt)
-        _run(["git", "commit", "-q", "-m", "conformer: a"], cwd=wt)
-        (wt / "tests_new_scratch.txt").write_text("x\n")
+    def leave_uncommitted(w: Path):
+        (w / "test_g.py").write_text("def test_g():\n    pass\n")
 
-    result = _clean_result()
-    result["tests_updates"] = [{"path": "tests_new", "reason": "covers a"}]
-    result["file_updates"] = [{"kind": "tests", "path": "tests_new",
-                               "reason": "covers a"}]
-    _stub_run_conformer(c, [result], commits={0: _commit_with_sibling})
+    def commit_it(w: Path):
+        _run(["git", "add", "test_g.py"], cwd=w)
+        _run(["git", "commit", "-q", "-m", "conformer: test g"], cwd=w)
+    _stub_run_conformer(c, [_tests_result("test_g.py")],
+                        commits={0: leave_uncommitted})
     _stub_measure_axes(c, {})
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+    calls = _reask_stub(c, monkeypatch, commit_it)
+    res, warnings, _ = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(wt), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
+    assert len(calls) == 1
+    assert calls[0]["resume_session"] == "sess-conf"
+    assert calls[0]["sid"] == "t1-conformer-clean1"
+    assert calls[0]["schema_key"] == "conformer"
+    assert "    ?? test_g.py" in calls[0]["user_prompt"]
     assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
-    assert not any(_PORCELAIN_ARM_WARNING in w for w in warnings), warnings
+    assert _run(["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=wt).stdout == ""
+    assert "unclean_trees" not in env["st"].data
 
 
-def test_staged_rename_origin_under_cited_directory_is_caught(env):
-    """The rename ORIGIN as the only evidence: a test moved out of the
-    cited directory by an uncommitted `git mv`. Porcelain reports the
-    destination (outside the citation) and the origin (inside it); the
-    other pins only ever match destinations, so the line that adds the
-    origin to the uncommitted set had no pin. `keep.py` is touched and
-    committed so the directory appears in the phase diff, leaving the
-    porcelain arm as the sole catcher."""
+def test_conformer_left_dirty_is_rolled_back_and_recorded(env, monkeypatch):
+    """Rewritten (was `test_dirty_leftover_warns_without_rollback`, and the
+    porcelain-arm pins of an uncommitted tests citation): a conformer that
+    commits a repair and leaves an edit uncommitted is re-asked twice; still
+    dirty, the round is rolled back to its start — its commit and its
+    edit — its repair records neutralized, and the lines recorded."""
     c = env["leerie"]
+    wt = env["worktree"]
+    before = _run(["git", "rev-parse", "HEAD"], cwd=wt).stdout.strip()
 
-    def _move_out_uncommitted(wt: Path):
-        (wt / "tests_old").mkdir()
-        (wt / "tests_old" / "test_x.py").write_text("def test_x(): pass\n")
-        (wt / "tests_old" / "keep.py").write_text("\n")
-        _run(["git", "add", "tests_old"], cwd=wt)
-        _run(["git", "commit", "-q", "-m", "conformer: old"], cwd=wt)
-        (wt / "tests_old" / "keep.py").write_text("# touched\n")
-        _run(["git", "add", "tests_old/keep.py"], cwd=wt)
-        _run(["git", "commit", "-q", "-m", "conformer: touch"], cwd=wt)
-        _run(["git", "mv", "tests_old/test_x.py", "test_x_moved.py"], cwd=wt)
-
-    result = _clean_result()
-    result["tests_updates"] = [{"path": "tests_old", "reason": "covers x"}]
-    result["file_updates"] = [{"kind": "tests", "path": "tests_old",
-                               "reason": "covers x"}]
-    _stub_run_conformer(c, [result], commits={0: _move_out_uncommitted})
+    def commit_and_scribble(w: Path):
+        (w / "test_g.py").write_text("def test_g():\n    pass\n")
+        _run(["git", "add", "test_g.py"], cwd=w)
+        _run(["git", "commit", "-q", "-m", "conformer: test g"], cwd=w)
+        (w / "src.py").write_text("def f():\n    pass\n# scribble\n")
+        (w / "notes.txt").write_text("scratch\n")
+    _stub_run_conformer(c, [_tests_result("test_g.py")],
+                        commits={0: commit_and_scribble})
     _stub_measure_axes(c, {})
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+    calls = _reask_stub(c, monkeypatch)
+    res, warnings, _ = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(wt), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
-    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
-    _assert_porcelain_arm_fired(warnings)
+    assert len(calls) == 2
+    assert res["conformer_repair_rolled_back"] is True
+    assert any("left its tree unclean" in w and " M src.py" in w
+               for w in warnings), warnings
+    assert _run(["git", "rev-parse", "HEAD"], cwd=wt).stdout.strip() == before
+    assert "scribble" not in (wt / "src.py").read_text()
+    assert not (wt / "notes.txt").exists()       # untracked files too
+    rec = env["st"].data["unclean_trees"]["conformer:t1 round 0"]
+    assert rec["lines"] == [" M src.py", "?? notes.txt"]
+    risks = c._collect_subtask_risks(
+        {"production_evidence": {"exercised": False,
+                                 "unexercisable_reason": "r"}},
+        dict(res, risk_dispositions=["mitigated"]))
+    assert risks[0]["addressed"] is False
 
 
-def test_rename_origin_is_not_reread_as_a_record(env):
-    """NEGATIVE: a staged rename's origin field must be consumed, not
-    re-read as a record of its own. If the walk fails to advance past
-    `xx_tests/test.py`, slicing it as a record yields the junk path
-    `tests/test.py`, which then falsely matches a cited `tests` holding a
-    real committed repair (measured: that mutant neutralized this
-    repair)."""
+def test_noncanonical_spelling_of_a_committed_repair_counts(env):
+    """The cited path is canonicalized before it is matched against the
+    phase's own diff: `./x.py`, the absolute spelling, a padded one and a
+    `..` one all name the committed repair, so none is neutralized."""
     c = env["leerie"]
+    wt = env["worktree"]
+    for n, spell in enumerate(("./test_d{n}.py", str(wt / "test_d{n}.py"),
+                               "test_d{n}.py ", "sub/../test_d{n}.py")):
+        name = f"test_d{n}.py"
+        claimed = spell.format(n=n)
+        (wt / "sub").mkdir(exist_ok=True)
 
-    def _repair_plus_unrelated_rename(wt: Path):
-        (wt / "tests").mkdir()
-        (wt / "tests" / "test_real.py").write_text("def test_r(): pass\n")
-        (wt / "xx_tests").mkdir()
-        (wt / "xx_tests" / "test.py").write_text("x = 1\n")
-        _run(["git", "add", "tests", "xx_tests"], cwd=wt)
-        _run(["git", "commit", "-q", "-m", "conformer: repair + other"],
-             cwd=wt)
-        _run(["git", "mv", "xx_tests/test.py", "moved.py"], cwd=wt)
-
-    result = _clean_result()
-    result["tests_updates"] = [{"path": "tests", "reason": "covers r"}]
-    result["file_updates"] = [{"kind": "tests", "path": "tests",
-                               "reason": "covers r"}]
-    _stub_run_conformer(c, [result],
-                        commits={0: _repair_plus_unrelated_rename})
-    _stub_measure_axes(c, {})
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-    assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
-    assert not any(_PORCELAIN_ARM_WARNING in w for w in warnings), warnings
-
-
-def test_trailing_space_sibling_not_flagged(env):
-    """NEGATIVE: porcelain record paths are compared verbatim. An
-    uncommitted file named `test_x.py ` (trailing space) is a different
-    file from the cited, committed `test_x.py`, so stripping the record
-    path would falsely match it and discard the real repair (measured:
-    that mutant did)."""
-    c = env["leerie"]
-
-    def _repair_plus_space_named_file(wt: Path):
-        (wt / "test_x.py").write_text("def test_x(): pass\n")
-        _run(["git", "add", "test_x.py"], cwd=wt)
-        _run(["git", "commit", "-q", "-m", "conformer: x"], cwd=wt)
-        (wt / "test_x.py ").write_text("unrelated\n")
-
-    result = _clean_result()
-    result["tests_updates"] = [{"path": "test_x.py", "reason": "covers x"}]
-    result["file_updates"] = [{"kind": "tests", "path": "test_x.py",
-                               "reason": "covers x"}]
-    _stub_run_conformer(c, [result],
-                        commits={0: _repair_plus_space_named_file})
-    _stub_measure_axes(c, {})
-    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
-        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"], env["efforts"]))
-    assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
-    assert not any(_PORCELAIN_ARM_WARNING in w for w in warnings), warnings
+        def commit(w: Path, name=name):
+            (w / name).write_text("def test_d(): pass\n")
+            _run(["git", "add", name], cwd=w)
+            _run(["git", "commit", "-q", "-m", f"conformer: {name}"], cwd=w)
+        _stub_run_conformer(c, [_tests_result(claimed)], commits={0: commit})
+        _stub_measure_axes(c, {})
+        res, warnings, _ = asyncio.run(c._run_conformance_phase(
+            env["sid"], env["run_dir"], str(wt), env["subtask"],
+            env["caps"], env["st"], env["models"], env["efforts"]))
+        assert res.get("conformer_repair_rolled_back") is None, \
+            (claimed, warnings)

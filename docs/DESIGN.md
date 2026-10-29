@@ -5192,8 +5192,9 @@ never a wrong verdict.
 The record answers two different questions, and each has one invariant.
 *Is this untracked file part of the change?* — a file leerie's own
 command created never is, and a file that existed before it never
-becomes leerie's: that is first producer, above, and the re-drive's
-leftovers commit reads it. *Does a measurement taken in this tree describe
+becomes leerie's: that is first producer, above. (The re-drive's
+leftovers commit used to read it; the worker now commits or deletes its
+own files, §8 *A worker leaves its tree clean*.) *Does a measurement taken in this tree describe
 the committed tree?* — only when every untracked file in it holds what a
 leerie command last wrote: that is last writer, and `_measured_tree_sha`
 reads it. The record keeps, per path, the signature leerie's command left;
@@ -5206,9 +5207,8 @@ through Bash to the value its fix rests on, and first producer called the
 measurement of that tree the committed one (a green result describing
 content that does not ship) while the leftovers commit dropped the edit
 with no line anywhere. Under the split, that measurement is of an
-uncommitted tree, and the leftovers commit lists the file (it still never
-commits a generated file — it was not the change until the worker made it
-one, and the reviewer decides). Last writer keeps round 11's case: the
+uncommitted tree, and the worker commits or deletes its edit (§8 *A
+worker leaves its tree clean*). Last writer keeps round 11's case: the
 final measurement is itself a leerie command that rewrites `coverage/` and
 `junit.xml` again, so a conformer's earlier re-run of the tests is
 overwritten by the time the measurement is stamped.
@@ -5221,8 +5221,7 @@ is every such path a test run wrote in a disposable checkout of the
 tree's commit, adopted when that checkout is removed. A worker that
 re-runs the tests rewrites exactly those files, and whatever it leaves in
 one is overwritten by the next test run: it is output, not part of any
-change, so the leftovers commit neither commits nor lists it, whether
-leerie's run wrote it in this tree or only in a checkout of it. Review
+change, whether leerie's run wrote it in this tree or only in a checkout of it. Review
 round 14 drove the second half: once the re-drive's execution route
 measured in a checkout of the commit (§8 *Every post-execution verdict
 is of the committed tree*), its test runs no longer rewrote staging's
@@ -5231,8 +5230,7 @@ reports, so last writer's rescue above stopped reaching them — a
 generated file the implementer then edited, and one it created first was
 committed. The
 record is by path, never by name: a repository may track a fixture
-called `junit.xml` or commit its coverage on purpose (§8 *A re-drive
-group's leftovers*), and only leerie's own run shows which files a test
+called `junit.xml` or commit its coverage on purpose, and only leerie's own run shows which files a test
 run writes here. An install or build is not a test command, so codegen
 stays under round 12 M2's rule.
 
@@ -7369,7 +7367,7 @@ base there and then, instead of being thrown away. The places HEAD can move afte
 diff is measured are the final conformance's own commits and rollbacks
 (each round re-measures, and a round that broke is covered by the pre
 measurement or the refresh), the acceptance gate's repair rounds and
-rollbacks, and the re-drive's groups, rollbacks and leftover commits; the
+rollbacks, and the re-drive's groups and rollbacks; the
 delivery recheck and detection are read-only on staging (the falsifier works
 in its own checkouts), CI parity runs in its own worktree, and finalize
 only verifies the branch.
@@ -7384,111 +7382,106 @@ recorded for the tenth); of the 10 broken sets, 3 were stopped by gates
 (b), (c) and (d), 3 did not close, and 4 closed, each hand-reviewed in the
 bench.
 
-**A re-drive group's leftovers are its implementer's.**
-The invariant: *every file the group's implementer changed either ships or
-is listed for the reviewer, and nothing that is not a source file — what
-leerie's own commands made, a tool's by-product — ships or is listed as
-if it were one.* The implementer is told to commit its work, and what it leaves
-uncommitted is committed for it — but only what the group changed. A
-tracked file counts when its content changed while the group ran: its
-bytes are snapshotted (path → blob) just before the implementer starts
-and compared just after, so an edit that predates the group — a
-command's churn, a final conformer's uncommitted edit — is not taken
-unless the implementer changes that file too, in which case the file is
-committed as it stands; a group that changed nothing moves no HEAD and
-reads `no_change`. An untracked, not-ignored file counts when it
-appeared or changed while the group ran (its stat identity, snapshotted
-the same way), less the files leerie's own commands produced (§6½); a
-file the implementer's Write/Edit tool calls name counts too, even one
-that predates the group, so a file it finished from one the final
-conformer left untracked ships. An untracked file that predates the
-group and that the group did not touch is logged and left, never
-dropped silently.
+**A worker leaves its tree clean.** The invariant (I1): *after every
+worker that runs in a tree leerie measures, integrates or ships, `git
+status --porcelain --untracked-files=all` in that tree prints nothing* —
+everything the worker means to keep is committed, and nothing untracked
+exists outside `.gitignore`. The workers it binds are the six that run in
+such a tree: the implementer and the per-subtask conformer in a subtask's
+worktree, and the final conformer, the acceptance-repair conformer, the
+delivery re-drive implementer and the integrator (conflict resolution and
+repair rounds) in staging. Leerie never commits on a worker's behalf and
+never decides which of a worker's files are its change.
 
-Review round 9 drove two earlier rules into the PR: `git add -u` shipped
-a lockfile an install had rewritten before the group, and "every
-untracked file that appeared while it ran" shipped the `.pyc` of the
-test the implementer had just written and run. Its fix took an
-untracked file only when a Write/Edit call named it, and review round 10
-drove what that dropped: an `mv util.py helpers.py` through Bash shipped
-the deletion and the edited import without `helpers.py`, so HEAD could
-not import what staging could, and a module made with a heredoc stayed
-behind. A shell command makes a source file as often as a tool call
-does, so the tool calls cannot be the only source.
+The root cause it removes. Only the implementer used to be held to a clean
+tree, and even that check skipped untracked files; every worker that runs
+in staging was unchecked, advisory-only ("left N uncommitted change(s)"),
+or had its leftovers committed by leerie. So leerie measured and shipped a
+tree whose contents it had to guess, and each guess became a defect class
+of its own. Review rounds 9 to 14 drove one such guess after another into
+a leftovers commit for re-drive groups: `git add -u` shipped a lockfile an
+install had rewritten (round 9); taking only files a Write/Edit call named
+dropped a module made through `mv` in Bash (round 10); taking every new
+file committed 505 files of `node_modules/`, reports and a core dump
+(round 11), which brought a fixed artifact-name list, a size cap, a saved
+archive of what the cap withheld and its PR entry (rounds 11–13); and
+first-producer, last-writer and test-output records decided which files
+were leerie's (rounds 12–14). Every round closed the last example and
+opened the next hole, because the question each rule answered — *which
+uncommitted file did the worker mean?* — has no answer leerie can read
+from the files. The worker knows; leerie does not. So the worker is asked.
 
-Review round 11 M1 drove what that rule alone ships: in a repository that
-ignores neither its dependency tree nor its reports, an implementer that
-ran `npm i` and its tests and left an editor swap file got a leftovers
-commit of 505 files — 500 under `node_modules/`, a coverage report, a
-junit file, a `.coverage` database, a 2 MB core dump and `a.ts.swp`.
-Three guards bound it, and none of them drops a source file silently:
-a file the cap withholds is listed, by path, in a "Needs human
-verification" entry of the kept groups (`redrive_leftovers`), for the
-reviewer to commit what belongs in the change; an artifact shape is
-logged only, since there is nothing for a reviewer to decide about it.
+Measured before building it (2,745 worker sessions across 167 snapshot,
+e2e and smoke runs): no session ended with a dirty tree — 0
+`dirty_worktree` retries, 0 conformer "left N uncommitted change(s)"
+warnings, 0 re-drive leftovers commits; the 108 `no_commits` retries all
+ended `complete`, none a forgotten commit. Dirt did appear mid-session —
+scratch tests, a killed e2e run's debris, a formatter's edits to
+unrelated files — and the worker always cleaned it up. So the gate below
+almost never fires and costs little, and the leftovers machinery guarded a
+case real runs did not produce; the dirt real runs had came from leerie's
+own commands (§6½). Prior art agrees on the shape: OpenAI Codex requires a
+clean worktree ("Only committed code will be evaluated"), and Claude Code
+on the web enforces one with a stop hook; SWE-agent, OpenHands and
+SWE-bench capture with `git add -A` instead and document the junk that
+drags in — the pattern the leftovers commit was a variant of. The failure
+modes others hit name the three properties the gate has: a checker that
+is not exact makes a loop that never converges, an unbounded re-ask, and
+checking while something else still writes the tree.
 
-- *First producer.* An untracked file whose first producer was one of
-  leerie's own commands stays leerie's when the implementer's re-run of a
-  command rewrites it (§6½), so the reports, coverage and dependency tree
-  leerie's install and measurements made are never the implementer's.
-  It is not committed; but when the group changed it and no leerie command
-  wrote it last by the end of the group, it is listed by path, since a
-  worker's edit of a generated file can be what the fix rests on (review
-  round 12 M2).
-- *Test outputs.* A file a leerie test command wrote — in staging, or in
-  a checkout of its commit (§6½) — is neither committed nor listed when
-  the implementer's own test run made or rewrote it: it is logged with
-  the artifacts. The group's measurements run in a checkout once staging
-  holds anything untracked, so they no longer rewrite staging's reports,
-  and last writer alone listed every report the implementer's test run
-  touched (review round 14).
-- *Artifact shapes no repository wants committed.* An untracked file whose
-  name is one of a short, fixed list is withheld: bytecode (`*.pyc`,
-  `*.pyo`), editor swap and backup files (`*.swp`, `*.swo`, `*~`, `.#*`,
-  `#*#`), Finder metadata (`.DS_Store`), and a core dump (`core` or
-  `core.<digits>` whose bytes begin with the ELF magic). Each is written by
-  a tool as a by-product of running or editing, never as a source file:
-  CPython regenerates bytecode from its source, an editor deletes its swap
-  file on a clean exit, and a core dump is a crash's memory image. The list
-  is deliberately not wider — coverage, reports and build output are
-  committed by some repositories on purpose, so they are left to the first
-  rule and the cap. A `.pyc` used to be committed in a repository that does
-  not ignore `__pycache__/`, as its own `git add -A` would; it is withheld
-  instead, since the PR is not the place to start tracking it, and it is
-  logged rather than listed: review round 12 M1 drove a fully clean
-  pytest re-drive whose PR gained a "Files a re-drive left uncommitted"
-  entry naming the implementer's own `helper.cpython-*.pyc` — noise, by
-  this bullet's own reasoning that no repository wants such a file.
-- *A cap.* When what is left to commit is more than
-  `redrive_leftovers_max_files` files or `redrive_leftovers_max_bytes`
-  bytes, nothing is committed: no implementer's change is that large by
-  accident, and choosing a subset would ship half of whatever it is. The
-  group's commits stand and are measured as they are; its uncommitted
-  files are left in staging, saved under the run directory — an archive
-  of the files as they stand and a patch of the tracked part — and listed
-  with where they were saved. The tracked files are what the entry exists
-  to preserve, so they are archived first and never count against the
-  save's budget (`redrive_leftovers_save_max_bytes`); the untracked ones
-  fill it smallest first, so one bulk tree cannot crowd out many small
-  sources; and the patch takes its paths from a file, never the argument
-  vector. Review round 12 L2 drove why the listing alone is not enough: a
-  later group's rollback (`reset --hard` and `clean -fd`) or finalize's
-  removal of the staging worktree erased the implementer's uncommitted
-  tracked fix and the files the entry told the reviewer to commit, so the
-  entry could not be acted on. Review round 13 L1 drove the order: filled
-  in path order, a `node_modules/` tree sorting before `src/` used up the
-  budget and the tracked fix was skipped, and 26,000 paths on `git diff`'s
-  argument vector raised E2BIG, so no patch was written either.
+The gate:
 
-A withheld file stays untracked in staging, so a later group's
-implementer can commit it with its own `git add -A`; the entry is built
-when the re-drive ends and leaves out every path HEAD tracks by then, so
-it never says "not committed" of a file that ships.
+- *Exact.* The checker is `git status --porcelain --untracked-files=all`,
+  read line for line (`_tree_dirt`): a tracked edit, a staged change or an
+  untracked file `.gitignore` does not cover. An ignored file — installed
+  dependencies, build output a repository ignores — never appears, so it
+  can never trigger a re-ask; a git failure is not clean (nothing was
+  read).
+- *Only when nothing else writes the tree.* It runs right after the
+  worker's `claude -p` has returned and its process subtree is reaped
+  (§6 *Worker subtree termination*), before leerie runs anything of its
+  own there — a measurement, a commit, the next worker. Staging is
+  written by one stage at a time; a subtask's worktree by its own settle.
+  For the re-drive implementer it runs after the staged held-out sets are
+  taken out again, so it sees what the worker left, not the material
+  leerie placed and ignored.
+- *Bounded.* On a violation the same worker is asked again — its CLI
+  session resumed (`--resume`) with one note that carries the porcelain
+  lines verbatim and allows exactly two acts per line: commit it (it is
+  part of the change) or delete it (it is not; a tracked file is restored
+  with `git checkout`). At most `clean_tree_reasks` (2) re-asks; each is a
+  worker and counts against `max_total_workers`. A re-ask that crashes,
+  or a worker with no session to resume, spends its attempt.
+- *Exhaustion is unfinished work, never a guess.* When the tree is still
+  dirty after the last re-ask, the worker's round is rolled back by the
+  rule that already undoes that round — a subtask is settled `unconverged`
+  and not integrated; a conformer round, an acceptance-repair round or a
+  re-drive group is reset to its start (`git reset --hard`, then `git
+  clean -fd`, which keeps ignored files); an integrator's merge is backed
+  out — and the porcelain lines are recorded with it. A conformer,
+  acceptance-repair or re-drive round's record makes the run
+  `unconverged`, its lines named under "Unconverged" in the PR; an
+  implementer's or an integrator's is its subtask's `unconverged` reason
+  (an integration repair round's is the round's mechanical failure). Nothing a worker left
+  is committed for it, and nothing is dropped without a line saying so.
 
-Leerie still cannot tell a generated file from a hand-made one in general,
-and dropping a real file breaks what ships; so outside those three guards
-a new untracked file is committed, and inside them a file that could be a
-source file is listed, never dropped unseen.
+The rollbacks this rests on are made exact for the same reason: a back-out
+of an integrator's merge and the reset before an integrator is retried
+also remove untracked files (`git clean -fd`), so the next worker in
+staging starts from a tree I1 already held, and is never asked about
+files it did not make. A worker that was reaped mid-turn (an
+`empty_handoff` rescued on its commits) has no session to ask; its
+uncommitted debris, tracked and untracked, is discarded, as its tracked
+debris always was — the deliverable is the committed diff.
+
+Superseded by this: the leftovers commit with its artifact-name list, its
+caps and its saved archive, the "Files a re-drive left uncommitted" PR
+entry, the conformers' advisory dirty-tree warnings, and the per-subtask
+conformer's parse of `-z -uall` porcelain for a `tests` repair cited at an
+uncommitted path — a clean tree has no uncommitted path to cite. Which
+untracked files leerie's own commands produced (§6½) no longer decides
+what is committed; what remains of that record serves the measurement
+stamps until leerie's commands leave the tree as they found it.
 
 **No line of a staged set's source reaches history.** The invariant this
 barrier serves is exactly one: *the held-out test's source never reaches
@@ -7522,11 +7515,11 @@ cannot tell the fix from a copy of the test.
    group, never committed. Inside a directory staging created, only those
    copies and files holding a span of the test (rule 2) are removed: the
    implementer's own sibling test or conftest written there is the change,
-   and goes to the leftovers commit like any other file. Review round 12
+   and is the implementer's to commit like any other file. Review round 12
    suspected, and a test confirmed, that removing the directory whole
    deleted it with no entry anywhere but the group's record. A file there
    removed for holding a span is not a runner copy: someone wrote it, so
-   it is listed in the PR like rule 4's (review round 13 M2: the feature
+   it is listed in the PR by path (review round 13 M2: the feature
    module of a new package written beside the staged test was deleted and
    listed nowhere). Only the runner copies stay record-only.
 2. *A copy elsewhere is recognised by a span of the test's source.* Each
@@ -7564,11 +7557,12 @@ cannot tell the fix from a copy of the test.
    commit — is searched for the spans; a hit, a staged path or a runner
    copy's path (rule 1) voids the group, which is rolled back. A path is
    not a hit merely for lying under a directory staging created.
-4. *A leftover that holds a span is removed, never one that holds a
-   value.* Before the leftovers commit, a file the group made or changed
-   that holds a span is removed (a tracked one is checked out from HEAD)
-   and listed in the PR's "Needs human verification" entry by path. A
-   tracked edit is never reverted for a literal it shares with the test.
+4. *A leftover cannot carry a span past the clean-tree gate.* The group's
+   implementer leaves nothing uncommitted (*A worker leaves its tree
+   clean*, above): a file holding a span that it commits voids the group
+   by rule 3, and one it deletes is gone. Leerie neither commits nor
+   removes a worker's leftover, so a tracked edit is never reverted for a
+   literal it shares with the test.
 
 These are the only places a set's bytes enter a tree that commits. The
 acceptance evaluation, the set audit, the surrogate witness and the
@@ -9343,7 +9337,9 @@ Two further disciplines sit at the §12 axis:
      (`conformer_repair_rolled_back`) and never counts when the PR will
      not contain it or it cannot be trusted: the conformance phase's
      own rollback arms reverted the round's commits (protected-path,
-     strict-clobber), the tests entry points at an uncommitted path, the
+     strict-clobber, or a tree left unclean past its re-asks — §8 *A
+     worker leaves its tree clean*, which also means a cited tests path
+     can never be an uncommitted one), the
      cited tests path does not appear in the phase's own commits (a
      zero-commit pass citing a pre-existing committed file — or an
      always-existing directory — passed every other check and rendered
