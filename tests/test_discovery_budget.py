@@ -211,6 +211,21 @@ def test_gate_wait_does_not_starve_discovery(leerie, hub, monkeypatch):
     assert 300.0 < hub["clock"].t <= 300.0 + budget
 
 
+def test_a_repeat_the_budget_cut_is_not_counted(leerie, hub):
+    """Durations that understate the real cost (2.5 s known, 3 s real):
+    the chosen 32 files' repeats take 101 s each, so the 18th is cut by the
+    budget. It wrote no report, so it is not a repeat run — counted, it
+    would inflate the "failed x of n final runs" a typed row reports — and
+    it ends discovery (DESIGN §9 *Sized to the budget*)."""
+    hub["st"].data["test_file_durations"] = {f: 2.5 for f in hub["files"]}
+    d = _discover(leerie, hub)
+    assert len(d["files"]) == 32
+    repeats = [c for c in hub["calls"] if "-repeat" in c["label"]]
+    assert len(repeats) == 18
+    assert d["repeats_run"] == 17 and d["budget_exhausted"] is True
+    assert hub["clock"].t == leerie.DEFAULT_CAPS["confirm_budget_sec"]
+
+
 def test_capture_records_durations_run_wide(leerie, tmp_path):
     st = leerie.State(tmp_path / "state", "r")
     st.data = {"test_file_durations": {"a": 1.0, "b": 2.0}}

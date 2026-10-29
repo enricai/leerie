@@ -285,6 +285,92 @@ def test_budget_bounds_the_confirm(leerie):
     assert [round(c[1]) for c in calls] == [1800, 1400, 1000, 600, 200]
 
 
+@pytest.mark.parametrize("seen_failing,new", [(True, ["x"]), (False, [])])
+def test_a_budget_shortfall_is_never_evidence_a_failure_went_away(
+        leerie, seen_failing, new):
+    """DESIGN §9 *Which failures are new*, step 4 (review round 5 H1): the
+    same cut as above. Every pair that finished agreed — final failed, base
+    passed — and the cut pair's base side passed too. A caller that saw the
+    failure (`seen_failing`) gets `new`, named `budget_short`; a confirm
+    whose verdict exonerates (no `seen_failing`) never confirms on a
+    shortfall."""
+    clock = _Clock()
+    calls = []
+    b, f = _runners([set()] * 3, [{"x"}] * 3, calls, clock=clock, cost=400.0)
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, seen_failing=seen_failing))
+    assert v["budget_exhausted"] is True and v["pairs_run"] == 2
+    assert v["new"] == new and v["budget_short"] == new
+    assert v["resource_affected"] == ([] if new else ["x"])
+    # The wall bound did not move: every rerun still gets the budget left.
+    assert [round(c[1]) for c in calls] == [1800, 1400, 1000, 600, 200]
+
+
+def test_a_rerun_ending_past_the_budget_with_no_verdict_is_not_a_run(leerie):
+    """A rerun whose timeout was the budget left, ending with no report, was
+    cut by the budget: it is not counted as a pair and not as a no-verdict
+    run. Zero finished pairs (the cut pair's base side passed): the
+    caller's own observation stands."""
+    clock = _Clock()
+
+    async def base(timeout):
+        return set()
+
+    async def final(timeout):
+        clock.t += timeout
+        return None
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], base, final, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, seen_failing=True))
+    assert v["pairs_run"] == 0 and v["budget_exhausted"] is True
+    assert v["new"] == ["x"] and v["budget_short"] == ["x"]
+    assert v["no_verdict"] == [] and v["resource_affected"] == []
+
+
+def test_a_shortfall_never_overrides_disagreeing_evidence(leerie):
+    """Budget-short, but the evidence that finished disagrees: a base rerun
+    failed it (the cut pair's base side), or a rerun ended with no verdict
+    before the budget ran out. Neither is `new`."""
+    clock = _Clock()
+    calls = []
+    b, f = _runners([set(), {"y"}], [{"x", "y"}] * 2, calls, clock=clock,
+                    cost=700.0)
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x", "y"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, seen_failing=True))
+    assert v["pairs_run"] == 1 and v["budget_exhausted"] is True
+    assert v["new"] == ["x"] and v["resource_affected"] == ["y"]
+    clock = _Clock()
+    b, f = _runners([None, set()], [{"x"}] * 2, [], clock=clock, cost=700.0)
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, seen_failing=True))
+    assert v["budget_exhausted"] is True and v["new"] == []
+    assert v["resource_affected"] == ["x"]
+
+
+@pytest.mark.parametrize("seen_failing,confirmed", [(True, ["x"]),
+                                                    (False, [])])
+def test_still_failing_confirms_a_budget_short_vote_only_when_seen(
+        leerie, seen_failing, confirmed):
+    clock = _Clock()
+
+    async def run_final(timeout):
+        cost = 700.0
+        if cost >= timeout:
+            clock.t += timeout
+            return None
+        clock.t += cost
+        return {"x"}
+    v = asyncio.run(leerie._confirm_still_failing(
+        ["x"], run_final, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, seen_failing=seen_failing))
+    assert v["reruns_run"] == 2 and v["budget_exhausted"] is True
+    assert v["confirmed"] == confirmed and v["budget_short"] == confirmed
+    assert v["resource_affected"] == ([] if confirmed else ["x"])
+
+
 def test_gate_wait_is_not_charged_to_the_confirm_budget(leerie):
     """The gate times out on a loaded host after its full 300 s — exactly
     when the pairs escalate to five. The budget's clock starts after it, so
@@ -491,6 +577,47 @@ def test_e3_confirms_the_real_regression_and_types_the_flake(
     assert stable in st.data["final_failing_ids"]
     # The base worktree is disposable.
     assert not leerie._helper_worktree_path(st, "confirm-base").exists()
+
+
+def test_e3_a_regression_the_budget_cut_short_is_still_new(
+        leerie, e3_repo, monkeypatch):
+    """The consumer, end to end on a real suite (review round 5 H1, swept to
+    the new-failure confirm): one pair finishes — the real regression fails
+    on the final tree and passes on the base — and the next final rerun is
+    cut by the budget. Before: `resource_affected`, no `new`, and the run
+    `done`. The cut is not a run: the regression is `new` on the pair the
+    budget allowed, and the run is `unconverged`."""
+    monkeypatch.setattr(leerie, "_host_cpu_psi", lambda path=None: 0.0)
+    st, staging = e3_repo["st"], e3_repo["staging"]
+    stable = "tests/test_suite.py :: tests.test_suite.test_stable"
+    st.data["baseline_failing_ids"] = [
+        "tests/test_suite.py :: tests.test_suite.test_pre_existing"]
+    post = {"tests": {"ran": True, "measured": True, "passed": False,
+                      "command": CMD, "summary": "",
+                      "failing_ids": st.data["baseline_failing_ids"]
+                      + [stable],
+                      "failing_id_files": {stable: "tests/test_suite.py"}}}
+    real = leerie._capture_failing_test_ids
+    labels: list[str] = []
+
+    async def capture(tree, cmd, st_, caps_, *, label, timeout, **kw):
+        labels.append(label)
+        if label.endswith("-final4"):
+            # Cut by the budget: its timeout is the budget left.
+            await asyncio.sleep(timeout)
+            return None
+        return await real(tree, cmd, st_, caps_, label=label,
+                          timeout=timeout, **kw)
+    monkeypatch.setattr(leerie, "_capture_failing_test_ids", capture)
+    v = asyncio.run(leerie._confirm_final_test_failures(
+        st, _caps(leerie, confirm_budget_sec=8.0), str(staging), post,
+        log_path=st.run_dir / "logs" / "t.log", label="final-r0"))
+    assert labels[-1] == "final-r0-final4", labels
+    assert v["pairs_run"] == 1 and v["budget_exhausted"] is True
+    assert v["new"] == [stable] and v["budget_short"] == [stable]
+    st.data["subtask_status"] = {}
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert any("newly failing" in r for r in st.data["outcome_reasons"])
 
 
 def test_e3_unknown_base_ids_leaves_the_axis_verdict_but_runs_discovery(
@@ -792,3 +919,39 @@ def test_base_checkout_failure_is_recorded_and_reads_unknown(
         st, asyncio.run(leerie._worktree_tree_sha(str(staging))))
     assert got["verdict"] == "unknown"
     assert "base checkout" in got["reason"] and stable in got["reason"]
+
+
+def test_every_measuring_confirm_says_whether_it_saw_the_failure(leerie):
+    """Structure, paired with the consumer tests above (the held-out vote,
+    the e3 final diff): every B* call that has real runners states
+    `seen_failing` — True where `confirmed`/`new` counts a failure, False
+    only for the integration overlay, whose `confirmed` exonerates (DESIGN
+    §9 *Which failures are new*, step 4). A call with no runners
+    (`_no_rerun`, `_none`) runs nothing, so it needs none."""
+    import ast
+    tree = ast.parse(inspect.getsource(leerie))
+    calls: list[tuple[str, str, bool]] = []
+    for fn in tree.body:
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for call in ast.walk(fn):
+            if not (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id in ("_confirm_new_failures",
+                                         "_confirm_still_failing")):
+                continue
+            runners = call.args[1:]
+            if all(isinstance(a, ast.Name) and a.id in ("_no_rerun", "_none")
+                   for a in runners if not (isinstance(a, ast.Name)
+                                            and a.id == "caps")):
+                continue
+            kw = {k.arg: k.value for k in call.keywords}
+            assert "seen_failing" in kw, (fn.name, ast.unparse(call))
+            calls.append((fn.name, ast.unparse(call.args[1]),
+                          ast.literal_eval(kw["seen_failing"])))
+    false = [c for c in calls if not c[2]]
+    assert false == [("_integration_test_failures", "_ov", False)], calls
+    assert {c[0] for c in calls if c[2]} == {
+        "_confirm_final_test_failures", "_ci_confirm_red",
+        "_acceptance_run_placed", "_falsifier_gates",
+        "_redrive_new_failures", "_integration_test_failures"}, calls

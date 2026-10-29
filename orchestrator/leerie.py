@@ -66,7 +66,7 @@ from collections.abc import (AsyncIterator, Awaitable, Callable, Iterable,
                              Iterator)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import NamedTuple, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # tenacity is imported lazily inside claude_p() (its sole use site), not at
@@ -38628,11 +38628,28 @@ async def _confirm_gate(caps: dict, *,
             "psi": psi, "readable": True}
 
 
+class _RerunCut(NamedTuple):
+    """A B* rerun the budget cut short partway (DESIGN §9 *Which failures
+    are new*, step 4): the candidates it finished with a verdict
+    (`measured`) and those of them it failed. Never a run — only a finished
+    candidate it passed counts, against that candidate."""
+    failing: frozenset
+    measured: frozenset
+
+
+def _rerun_cut_by_budget(r: object, elapsed: float, budget: float) -> bool:
+    """Whether one B* rerun's result `r` is a budget cut, not a run: a
+    `_RerunCut`, or no verdict once the budget is spent — each rerun's
+    timeout is what is left of it, so a rerun ending past it with nothing
+    was cut by it (DESIGN §9 *Which failures are new*, step 4)."""
+    return isinstance(r, _RerunCut) or (r is None and elapsed >= budget)
+
+
 async def _confirm_new_failures(
         candidates: Iterable[str],
         run_base: Callable[[float], Awaitable[set[str] | None]],
         run_final: Callable[[float], Awaitable[set[str] | None]],
-        caps: dict, *, label: str,
+        caps: dict, *, label: str, seen_failing: bool = False,
         read_psi: Callable[[], float | None] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         clock: Callable[[], float] | None = None) -> dict:
@@ -38648,11 +38665,20 @@ async def _confirm_new_failures(
     `run_final` get the remaining budget as their timeout and return one
     serial rerun's failing IDs (None: no verdict).
 
+    A rerun the budget cut short is not a run (`_rerun_cut_by_budget`): it
+    ends the confirm and is not counted. With `seen_failing` — the caller
+    saw every candidate fail on the final tree and not on the base — an ID
+    the budget alone kept short of `k` pairs is `new` (and `budget_short`)
+    when every finished final rerun failed it and no finished base rerun
+    did (DESIGN §9 step 4): a budget cut is never evidence that a failure
+    went away.
+
     Frozen from Q9 (held-out, 124 trials): 0/88 clean trials called new,
     36/36 reverted fixes detected."""
     cand = sorted(set(candidates))
     out: dict = {"candidates": cand, "new": [], "pre_existing": [],
                  "no_verdict": [], "resource_affected": [],
+                 "budget_short": [],
                  "pairs_required": 0, "pairs_run": 0,
                  "budget_exhausted": False, "gate": None, "per_id": {}}
     if not cand:
@@ -38675,26 +38701,46 @@ async def _confirm_new_failures(
         out["pairs_required"] = k
         base_runs: list[set[str] | None] = []
         final_runs: list[set[str] | None] = []
+        # The base side of a pair the budget cut, as far as it finished: it
+        # can only refute `new`, never make a pair.
+        cut_base: set[str] = set()
+        cut_final_passed: set[str] = set()
         for _ in range(k):
             pair: list[set[str] | None] = []
+            cut = False
             for runner in (run_base, run_final):
                 left = budget - (clock() - t0)
                 if left <= 0:
+                    cut = True
                     break
                 try:
-                    pair.append(await runner(left))
+                    r = await runner(left)
                 except Exception as e:
                     log(f"  B* {label}: rerun raised {type(e).__name__}: "
                         f"{e} — no verdict for this run")
-                    pair.append(None)
-            if len(pair) < 2:
+                    r = None
+                if _rerun_cut_by_budget(r, clock() - t0, budget):
+                    if isinstance(r, _RerunCut):
+                        if not pair:
+                            cut_base = set(r.failing)
+                        else:
+                            cut_final_passed = set(r.measured - r.failing)
+                    cut = True
+                    break
+                pair.append(r)
+            if cut:
                 out["budget_exhausted"] = True
+                if pair and pair[0] is not None:
+                    cut_base = set(pair[0])
                 break
             base_runs.append(pair[0])
             final_runs.append(pair[1])
         out["pairs_run"] = len(base_runs)
         complete = (len(base_runs) == k
                     and all(r is not None for r in base_runs + final_runs))
+        budget_only = (out["budget_exhausted"] and seen_failing
+                       and all(r is not None
+                               for r in base_runs + final_runs))
         for cid in cand:
             final_failed = sum(1 for r in final_runs
                                if r is not None and cid in r)
@@ -38708,6 +38754,14 @@ async def _confirm_new_failures(
                                   "base_runs": base_seen}
             if complete and final_failed == k and base_failed == 0:
                 out["new"].append(cid)
+            elif (budget_only and final_failed == final_seen
+                  and base_failed == 0 and cid not in cut_base
+                  and cid not in cut_final_passed):
+                # The budget alone stopped the pairs, and every rerun that
+                # finished agreed with what the caller saw (DESIGN §9
+                # *Which failures are new*, step 4).
+                out["new"].append(cid)
+                out["budget_short"].append(cid)
             elif base_seen == k and base_failed == k:
                 # The base fails it every time: not a flake, and never
                 # reported as one (barnacle 45fa4253: 33 such IDs read as
@@ -38721,7 +38775,9 @@ async def _confirm_new_failures(
         f"{len(out['pre_existing'])} pre_existing, "
         f"{len(out['resource_affected'])} resource_affected"
         + (f", {len(out['no_verdict'])} no_verdict" if out["no_verdict"]
-           else "") + " "
+           else "")
+        + (f"; {len(out['budget_short'])} new on the pairs the budget "
+           "allowed" if out["budget_short"] else "") + " "
         f"({out['pairs_run']}/{k} pair(s); gate waited "
         f"{gate['waited_sec']}s{', timed out' if gate['timed_out'] else ''}"
         f"{'; budget exhausted' if out['budget_exhausted'] else ''})")
@@ -38731,7 +38787,7 @@ async def _confirm_new_failures(
 async def _confirm_still_failing(
         candidates: Iterable[str],
         run_final: Callable[[float], Awaitable[set[str] | None]],
-        caps: dict, *, label: str,
+        caps: dict, *, label: str, seen_failing: bool = False,
         read_psi: Callable[[], float | None] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         clock: Callable[[], float] | None = None) -> dict:
@@ -38744,10 +38800,19 @@ async def _confirm_still_failing(
     failed it; `no_verdict` when no rerun produced a verdict; anything else
     is `resource_affected` — so a load flake never forces a repair.
     `run_final` gets the remaining budget and returns the failing
-    candidates of one rerun (None: no verdict)."""
+    candidates of one rerun (None: no verdict; a `_RerunCut` when the
+    budget cut it partway).
+
+    A rerun the budget cut short is not a run (`_rerun_cut_by_budget`).
+    With `seen_failing` — the caller saw every candidate fail on this tree
+    before the confirm — a candidate the budget alone kept short of `k`
+    reruns is `confirmed` (and `budget_short`) when every finished rerun
+    failed it and no finished file of the cut rerun passed it (DESIGN §9
+    *Which failures are new*, step 4). Without it (a confirm whose
+    `confirmed` exonerates) a shortfall never confirms."""
     cand = sorted(set(candidates))
     out: dict = {"candidates": cand, "confirmed": [], "no_verdict": [],
-                 "resource_affected": [],
+                 "resource_affected": [], "budget_short": [],
                  "reruns_required": 0, "reruns_run": 0,
                  "budget_exhausted": False, "gate": None}
     if not cand:
@@ -38769,31 +38834,49 @@ async def _confirm_still_failing(
                 caps.get("confirm_pairs", DEFAULT_CAPS["confirm_pairs"]))
         out["reruns_required"] = k
         runs: list[set[str] | None] = []
+        cut_passed: set[str] = set()
         for _ in range(k):
             left = budget - (clock() - t0)
             if left <= 0:
                 out["budget_exhausted"] = True
                 break
             try:
-                runs.append(await run_final(left))
+                r = await run_final(left)
             except Exception as e:
                 log(f"  B* {label}: rerun raised {type(e).__name__}: {e} — "
                     "no verdict for this run")
-                runs.append(None)
+                r = None
+            if _rerun_cut_by_budget(r, clock() - t0, budget):
+                if isinstance(r, _RerunCut):
+                    cut_passed = set(r.measured - r.failing)
+                out["budget_exhausted"] = True
+                break
+            runs.append(r)
         out["reruns_run"] = len(runs)
         complete = len(runs) == k and all(r is not None for r in runs)
+        budget_only = (out["budget_exhausted"] and seen_failing
+                       and all(r is not None for r in runs))
         seen = sum(1 for r in runs if r is not None)
         for cid in cand:
-            if complete and all(cid in r for r in runs if r is not None):
+            agreed = all(cid in r for r in runs if r is not None)
+            if complete and agreed:
                 out["confirmed"].append(cid)
-            elif seen == 0:
+            elif budget_only and agreed and cid not in cut_passed:
+                # The budget alone stopped the reruns, and every one that
+                # finished failed it, as the caller's own run did (DESIGN
+                # §9 *Which failures are new*, step 4).
+                out["confirmed"].append(cid)
+                out["budget_short"].append(cid)
+            elif seen == 0 and cid not in cut_passed:
                 out["no_verdict"].append(cid)
             else:
                 out["resource_affected"].append(cid)
     log(f"  B* {label}: {len(cand)} failing, {len(out['confirmed'])} "
         f"confirmed, {len(out['resource_affected'])} resource_affected"
         + (f", {len(out['no_verdict'])} no_verdict" if out["no_verdict"]
-           else "") + " "
+           else "")
+        + (f"; {len(out['budget_short'])} confirmed on the reruns the "
+           "budget allowed" if out["budget_short"] else "") + " "
         f"({out['reruns_run']}/{k} rerun(s); gate waited "
         f"{gate['waited_sec']}s{', timed out' if gate['timed_out'] else ''}"
         f"{'; budget exhausted' if out['budget_exhausted'] else ''})")
@@ -39113,9 +39196,12 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                             messages.setdefault(cid, []).append(msg)
                     return set(got["ids"])
                 return _run
+            # Every candidate failed on the final tree (a final run or a
+            # discovery repeat) and not on the base.
             verdict = await _confirm_new_failures(
                 all_cand, _runner_for(str(wt), "base"),
-                _runner_for(staging, "final"), caps, label=label)
+                _runner_for(staging, "final"), caps, label=label,
+                seen_failing=True)
         finally:
             _teardown()
     verdict["final_candidates"] = cand
@@ -39303,9 +39389,16 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
                     staging, cmd, st, caps, label=f"{label}-repeat{n + 1}",
                     log_path=log_path, timeout=left, serial=True,
                     files=sel["chosen"])
-                out["repeats_run"] += 1
                 if got is None:
+                    # No report is not a repeat run: counted, it would
+                    # inflate the "x of n final runs" a typed row reports.
+                    # Past the budget, the budget cut it (DESIGN §9 *Sized
+                    # to the budget*).
+                    if _rerun_cut_by_budget(got, clock() - t0, budget):
+                        out["budget_exhausted"] = True
+                        break
                     continue
+                out["repeats_run"] += 1
                 out["_runs"].append(got)
                 for cid in got["ids"]:
                     counts[cid] = counts.get(cid, 0) + 1
@@ -40392,9 +40485,11 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
 
     try:
         await _ci_prepare(base_wt, recs, st, caps, "confirm-base")
+        # A gate is one that passed at the baseline, and each candidate
+        # failed on the final tree.
         return await _confirm_new_failures(
             cand, _runner(base_wt, "base"), _runner(final_tree, "final"),
-            caps, label="ci parity")
+            caps, label="ci parity", seen_failing=True)
     finally:
         _ci_teardown(st, base_wt)
 
@@ -44614,6 +44709,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
     for s_ in sets:
         failing, copied, ran = [], [], []
         resource_affected: list[str] = []
+        budget_short: list[str] = []
         unmeasured = False
         case_ids: dict[str, list[str]] = {}
         # Every failing run of each file, the first and each vote rerun:
@@ -44674,31 +44770,39 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                                  ) -> set[str] | None:
                     _n["i"] += 1
                     still: set[str] = set()
+                    done: set[str] = set()
                     # Every file of one rerun shares the budget left.
                     end = time.monotonic() + _left
                     for rel in _files:
                         left = end - time.monotonic()
                         if left <= 0:
-                            return None
+                            return _RerunCut(frozenset(still),
+                                             frozenset(done))
                         o: dict = {}
                         v = await _run_acceptance_file(
                             st, _budget_caps(caps, left), str(wt), rel,
                             log_path,
                             f"acceptance-{label}-confirm{_n['i']}",
                             cases_out=o, **_env_kw(env_extra))
-                        if v is None or (o.get("resource")
-                                         and time.monotonic() >= end):
-                            # Cut short by the budget: no verdict, never
-                            # a failure.
+                        if v is None:
                             return None
+                        if o.get("resource") and time.monotonic() >= end:
+                            # Cut short by the budget: not a run, and
+                            # never a pass (DESIGN §9 *Which failures are
+                            # new*, step 4).
+                            return _RerunCut(frozenset(still),
+                                             frozenset(done))
+                        done.add(rel)
                         if v is False:
                             still.add(rel)
                             _runs.setdefault(rel, []).append(o)
                             _nt(rel, o)
                     return still
+                # Every file of the vote failed its first run.
                 verdict_ = await _confirm_still_failing(
-                    vote, _rerun, caps,
+                    vote, _rerun, caps, seen_failing=True,
                     label=f"acceptance {label} set {s_['index']}")
+                budget_short = list(verdict_.get("budget_short") or [])
                 # No verdict is no evidence either way, like mixed
                 # evidence: the set is unmeasured unless it also fails.
                 resource_affected = list(
@@ -44755,6 +44859,11 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 "failing_files": failing}
         if resource_affected:
             res_["resource_affected_files"] = resource_affected
+        if any(r in failing for r in budget_short):
+            # Failing on the reruns the budget allowed: said so, never
+            # dropped (DESIGN §8 *Held-out acceptance tests*).
+            res_["budget_short_files"] = [r for r in failing
+                                          if r in budget_short]
         if no_case_evidence:
             # Failing, but no run gave case evidence: never read as a
             # whole-file collapse (DESIGN §8 *Delivery re-drive* rule 4).
@@ -48567,7 +48676,8 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
             return out
         out["case_id"] = cid
         verdict = await _confirm_still_failing(
-            [cid], _run, caps, label=f"falsifier {label}")
+            [cid], _run, caps, label=f"falsifier {label}",
+            seen_failing=True)
         g["fails_under_bstar"] = cid in verdict["confirmed"]
         if not g["fails_under_bstar"]:
             return out
@@ -49502,7 +49612,7 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
                 return _run
             verdict = await _confirm_new_failures(
                 cand, _runner(str(wt), "base"), _runner(str(staging), "final"),
-                caps, label=label)
+                caps, label=label, seen_failing=True)
     finally:
         _teardown()
     return {"new": list(verdict["new"]),
@@ -54987,7 +55097,8 @@ async def _integration_test_failures(
                                   left)
             if home is None:
                 verdict = await _confirm_still_failing(
-                    ids, _final, caps, label=f"integration {sid}")
+                    ids, _final, caps, label=f"integration {sid}",
+                    seen_failing=True)
                 confirmed += [(c, None) for c in verdict["confirmed"]]
                 continue
             tree = await _tree_for(home)
@@ -54998,7 +55109,8 @@ async def _integration_test_failures(
                             _h=home) -> set[str] | None:
                 return await _ids(_t, f"integ-{sid}-confirm-{_h}", _f, left)
             verdict = await _confirm_new_failures(
-                ids, _base, _final, caps, label=f"integration {sid}")
+                ids, _base, _final, caps, label=f"integration {sid}",
+                seen_failing=True)
             confirmed += [(c, home) for c in verdict["new"]]
         if not confirmed:
             return out
@@ -55018,8 +55130,11 @@ async def _integration_test_failures(
                 async def _ov(left: float, _t=overlay,
                               _f=files) -> set[str] | None:
                     return await _ids(_t, f"integ-{sid}-overlay", _f, left)
+                # Never `seen_failing`: a confirmed overlay failure exonerates
+                # the merge, so a budget shortfall must leave it counted
+                # (DESIGN §9 *Which failures are new*, step 4).
                 stale = (await _confirm_still_failing(
-                    ids, _ov, caps,
+                    ids, _ov, caps, seen_failing=False,
                     label=f"integration {sid} overlay"))["confirmed"]
             for cid in ids:
                 if cid in stale:

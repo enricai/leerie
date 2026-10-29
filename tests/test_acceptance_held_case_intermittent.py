@@ -431,12 +431,7 @@ def test_a_discovery_run_the_budget_cut_is_not_a_round(leerie, tmp_path,
     assert clock.t == 250.0
 
 
-def test_a_vote_rerun_the_budget_cut_is_no_verdict_not_a_failure(
-        leerie, tmp_path, monkeypatch):
-    """A vote rerun runs under the budget it is given; cut short by it, the
-    file's runner timeout is not a confirmed failure."""
-    st = leerie.State(tmp_path / "state", "r")
-    st.data = {}
+def _vote_set(tmp_path):
     d = tmp_path / "set-1"
     (d / "acc").mkdir(parents=True)
     (d / REL).write_text("")
@@ -447,6 +442,19 @@ def test_a_vote_rerun_the_budget_cut_is_no_verdict_not_a_failure(
           "defect_files": [REL], "control_files": [CONTROL],
           "cases": {REL: ["a"], CONTROL: ["c"]},
           "base_failing_cases": {REL: ["acc/test_defect_1.py::test_a"]}}
+    return s_, wt
+
+
+def test_a_vote_rerun_the_budget_cut_is_not_a_run_and_never_a_pass(
+        leerie, tmp_path, monkeypatch):
+    """A vote rerun runs under the budget it is given; one the budget cuts
+    short is not a run — and never evidence the failure went away. The
+    first run failed and no rerun finished to say otherwise: the file stays
+    failing, named as budget-short, and the run is not `done` (review round
+    5 H1; DESIGN §9 *Which failures are new*, step 4)."""
+    st = leerie.State(tmp_path / "state", "r")
+    st.data = {"task": "t", "categories": ["bug-fixing"]}
+    s_, wt = _vote_set(tmp_path)
     confirm_timeouts: list[float] = []
 
     async def run(st_, caps_, tree, rel, log_path, label, *, cases_out=None,
@@ -465,6 +473,102 @@ def test_a_vote_rerun_the_budget_cut_is_no_verdict_not_a_failure(
         st, _caps(leerie, confirm_pairs=1, confirm_pairs_escalated=1,
                   confirm_budget_sec=0.3, acceptance_intermittent_repeats=0),
         wt, [s_], "t"))
+    # Still bounded by the budget: the wall bound did not move.
     assert len(confirm_timeouts) == 1 and 0 < confirm_timeouts[0] <= 0.3
+    assert res["failing_files"] == [REL] and res["passed"] is False
+    assert res["unmeasured"] is False
+    assert res.get("budget_short_files") == [REL]
+    assert "resource_affected_files" not in res
+    assert leerie._acceptance_any_fails([res]) is True
+    assert _outcome(leerie, st, [s_], res) == "unconverged"
+
+
+def test_an_always_failing_set_slower_than_its_reruns_is_unconverged(
+        leerie, tmp_path, monkeypatch):
+    """The review's driver (round 5 H1): each run costs 0.4 s and fails
+    deterministically on a non-held case (an assertion, no resource
+    signature); budget 1.0 s, k = 3, so two reruns finish and the third is
+    cut. Before: `unmeasured`, outcome `done`. Every run that finished
+    failed it: it is failing, and the run `unconverged`."""
+    st = leerie.State(tmp_path / "state", "r")
+    st.data = {"task": "t", "categories": ["bug-fixing"]}
+    s_, wt = _vote_set(tmp_path)
+    cost = 0.4
+    reruns: list[str] = []
+
+    async def run(st_, caps_, tree, rel, log_path, label, *, cases_out=None,
+                  **_kw):
+        if rel == CONTROL:
+            return True
+        t = caps_["worker_timeout_sec"]
+        if "-confirm" in label:
+            reruns.append("cut" if cost > t else "ran")
+        if cost > t:
+            await asyncio.sleep(t)
+            cases_out["resource"] = True
+            return False
+        await asyncio.sleep(cost)
+        cases_out["failing_cases"] = [f"{REL}::test_b"]
+        return False
+    monkeypatch.setattr(leerie, "_run_acceptance_file", run)
+    (res,) = asyncio.run(leerie._acceptance_run_placed(
+        st, _caps(leerie, confirm_pairs=3, confirm_pairs_escalated=3,
+                  confirm_budget_sec=1.0, acceptance_intermittent_repeats=0),
+        wt, [s_], "t"))
+    assert reruns == ["ran", "ran", "cut"]
+    assert res["failing_files"] == [REL] and res["unmeasured"] is False
+    assert res["budget_short_files"] == [REL]
+    assert res["failing_cases"] == {REL: [f"{REL}::test_b"]}
+    assert leerie._acceptance_any_fails([res]) is True
+    assert _outcome(leerie, st, [s_], res) == "unconverged"
+    assert any("held-out" in r for r in st.data["outcome_reasons"])
+
+
+def test_a_budget_short_vote_that_saw_a_pass_stays_resource_affected(
+        leerie, tmp_path, monkeypatch):
+    """Control: a rerun that finished and PASSED the file is evidence,
+    budget or not — the shortfall does not confirm it."""
+    st = leerie.State(tmp_path / "state", "r")
+    st.data = {"task": "t", "categories": ["bug-fixing"]}
+    s_, wt = _vote_set(tmp_path)
+    n = {"i": 0}
+
+    async def run(st_, caps_, tree, rel, log_path, label, *, cases_out=None,
+                  **_kw):
+        if rel == CONTROL:
+            return True
+        if "-confirm" not in label:
+            return False
+        n["i"] += 1
+        t = caps_["worker_timeout_sec"]
+        if n["i"] == 1:
+            await asyncio.sleep(0.2)
+            return True                   # a finished rerun passed it
+        await asyncio.sleep(t)
+        cases_out["resource"] = True
+        return False
+    monkeypatch.setattr(leerie, "_run_acceptance_file", run)
+    (res,) = asyncio.run(leerie._acceptance_run_placed(
+        st, _caps(leerie, confirm_pairs=3, confirm_pairs_escalated=3,
+                  confirm_budget_sec=0.5, acceptance_intermittent_repeats=0),
+        wt, [s_], "t"))
     assert res["failing_files"] == []
     assert res.get("resource_affected_files") == [REL]
+    assert "budget_short_files" not in res
+
+
+def test_a_cut_reruns_finished_file_that_passed_refutes_it(leerie):
+    """A rerun cut partway still carries the files it finished: one that
+    passed there is not confirmed by the shortfall; one it failed is."""
+    clock = {"t": 0.0}
+
+    async def run(left):
+        clock["t"] += left
+        return leerie._RerunCut(frozenset({"b"}), frozenset({"a", "b"}))
+    leerie_caps = _caps(leerie, confirm_budget_sec=10)
+    v = asyncio.run(leerie._confirm_still_failing(
+        ["a", "b", "c"], run, leerie_caps, label="t", seen_failing=True,
+        clock=lambda: clock["t"]))
+    assert v["budget_exhausted"] is True and v["reruns_run"] == 0
+    assert v["confirmed"] == ["b", "c"] and v["budget_short"] == ["b", "c"]
+    assert v["resource_affected"] == ["a"] and v["no_verdict"] == []

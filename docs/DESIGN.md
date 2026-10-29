@@ -7721,9 +7721,12 @@ failure is a verdict like a new test failure and is confirmed the same
 way (§9 *Which failures are new*) — with one asymmetry, below: a set file
 that fails on the tree is rerun serially behind the host-pressure gate,
 `confirm_pairs` times (or `confirm_pairs_escalated` after a gate timeout)
-inside `confirm_budget_sec` (a rerun the budget cuts short produces no
-verdict, never a failure), and it stays failing only if it failed on
-every rerun that produced a verdict; anything else is `resource_affected`,
+inside `confirm_budget_sec`, and it stays failing only if it failed on
+every rerun that produced a verdict. A rerun the budget cuts short is not
+a run (§9 *Which failures are new*, step 4): when the budget alone stopped
+the vote short and every rerun that finished failed the file, it stays
+failing — a budget cut is never evidence that a failure went away.
+Anything else is `resource_affected`,
 and a set whose only failures were resource-affected and touched no held
 case is no evidence either way — so a load flake never forces a repair
 round, nor a residual.
@@ -9805,8 +9808,8 @@ failure new / does this set still fail" verdict uses:
    base already fails it deterministically, whatever the final side did.
    An ID for which no rerun on either side produced a report is
    **`no_verdict`**: nothing was measured. Everything else — flaky on
-   either side, failing on some base reruns and not others, pairs cut short
-   by the budget after some evidence — is `resource_affected`. None of the
+   either side, failing on some base reruns and not others — is
+   `resource_affected`. None of the
    three is counted as a regression, but they are reported apart, because
    they mean different things to the reader: `resource_affected` is the
    label for mixed evidence (the flake label), and it is never given to a
@@ -9817,6 +9820,47 @@ failure new / does this set still fail" verdict uses:
    set, a falsifier probe): `confirmed` when every rerun failed it,
    `no_verdict` when no rerun produced a report, `resource_affected`
    otherwise.
+4. *A rerun the budget cuts short is not a run.* A rerun that ends with
+   no verdict once the budget is spent — its timeout was what was left of
+   the budget — is neither a failure nor a pass, and it is not counted; it
+   ends the confirm (`budget_exhausted`). Its files that did finish before
+   the cut still count against a candidate when they passed it. Every
+   caller that asks whether a failure is real has already seen it: the
+   final run failed the candidate and the base did not, the set file
+   failed its first run, the falsifier's probe failed its first run, the
+   merged tree failed the test. The reruns only test that observation. So
+   a candidate kept from the full count by the budget alone — every rerun
+   that finished agreed with the observation (every final rerun failed it,
+   every base rerun passed it), none ended with no verdict for another
+   reason, and no finished file of a cut rerun passed it — is decided on
+   that evidence: **new** (`confirmed` with no base side), listed in
+   `budget_short` and logged as such. One whose finished reruns disagreed
+   stays `resource_affected`. The one confirm whose "confirmed" exonerates
+   — the integration gate's overlay, which confirms a merged-tree failure
+   is the other side's (§6) — takes no such reading: there a shortfall
+   leaves the failure counted.
+
+   The alternative was to give a rerun that has started its full
+   `worker_timeout_sec` and stop only *starting* reruns once the budget is
+   spent (the rule before the budget bounded every rerun). It was rejected
+   on both counts. It bounds nothing: one vote rerun runs every failing
+   file of its set, each up to `worker_timeout_sec` (5400 s), past the
+   budget. And it does not fix the defect: a file whose `k − 1` reruns
+   exceed the budget still ends short of `k`, so a slow set that failed on
+   every run that finished still read `resource_affected`. Measured (review
+   round 5, H1): a held-out set file costing 0.4 s that failed every run
+   deterministically, under a 1.0 s budget with k = 3, read `unmeasured`
+   and the run decided `done`; under this rule it stays failing and the
+   run is `unconverged`. At the defaults (1800 s, k = 3, or 5 escalated) a
+   file taking 600–900 s (360–450 s escalated) was in that window. The
+   price is precision on slow files: a candidate whose rerun cannot finish
+   even once inside the budget is decided on its first observation, which
+   the pairing exists to distrust. That is the side to err on. A false
+   "still fails" costs repair rounds and an `unconverged` outcome whose
+   record names the shortfall; a false "no evidence" ships `done` over a
+   failure no run ever saw pass. The wall bound is unchanged: one confirm
+   takes at most `confirm_gate_wait_sec` + one 2 s gate poll +
+   `confirm_budget_sec` (2102 s at the defaults).
 
 The pairing and `k` carry the guarantee (a p≈0.5 flake goes 3/3 vs 0/3 with
 probability 4⁻³ ≈ 1.6%); the gate only reduces how often `k` must grow.
@@ -9883,7 +9927,10 @@ adds two steps:
    order and in chunks of 1, 2, 4 … files, inside one repeat's share of the
    budget (`confirm_budget_sec` / R); a chunk that does not finish leaves
    its files unmeasured and skipped. Calibration runs are not repeats: a
-   file is counted only over its R repeats. When not even the first file
+   file is counted only over its R repeats. A repeat that wrote no report is
+   not counted as one either, and a repeat the budget cut short ends
+   discovery (`budget_exhausted`): counted, it would inflate the "failed
+   x of n final runs" an intermittent-regression row reports. When not even the first file
    fits, discovery records `skipped: "over budget"` and runs nothing. So one
    discovery — final-tree or the delivery ratchet's (N5), which calls the
    same function — costs at most `confirm_budget_sec` after the gate,
