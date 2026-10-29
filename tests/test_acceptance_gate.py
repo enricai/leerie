@@ -343,6 +343,28 @@ def test_evaluation_never_touches_the_tree_and_never_overwrites(
     assert not leerie._helper_worktree_path(st, "acceptance-eval").exists()
 
 
+@pytest.mark.parametrize("committed,uncommitted,passes", [
+    (FIXED, BUGGY, True), (BUGGY, FIXED, False)])
+def test_the_final_remeasure_reads_the_committed_tree(
+        leerie, tmp_path, committed, uncommitted, passes):
+    """Review round 9 suspicion (b): staging is the re-measure's `tree`,
+    and its working tree may differ from what ships. The verdict follows
+    the commit either way (DESIGN §8 *Every post-execution verdict is of
+    the committed tree*)."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    (staging / "calc.py").write_text(committed)
+    _git(staging, "commit", "-q", "--allow-empty", "-am", "the change")
+    sha = _git(staging, "rev-parse", "HEAD")
+    (staging / "calc.py").write_text(uncommitted)        # does not ship
+    sets = _make_sets(leerie, st, 1)
+    assert asyncio.run(leerie._acceptance_remeasure_final(
+        st, _caps(leerie, 1), str(staging), sets, sha, "final")) is True
+    final = st.data["acceptance"]["gate"]["final"]
+    assert [r["passed"] for r in final] == [passes]
+
+
 def test_a_crashed_evaluations_worktree_is_replaced(leerie, tmp_path):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)

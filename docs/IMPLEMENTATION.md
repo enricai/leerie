@@ -6350,6 +6350,13 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     <first 5 paths>[ (+<N-5> more)]"`. Only a worker's edits reach it:
     leerie's own commands put back what they rewrite
     (`_leaves_tracked_files`, below).
+  - Post-execution readers (DESIGN §8 *Every post-execution verdict is of
+    the committed tree*): no code change — `_verify_delivery_cite` reads
+    `git show HEAD:<rel>` / `git grep … HEAD`, `_d1_untouched_verdict`
+    `git diff <own_start>..HEAD`, `_evaluate_acceptance_sets` a detached
+    worktree at `rev`; pinned by
+    `tests/test_post_execution_readers_read_committed_tree.py` and
+    `tests/test_acceptance_gate.py::test_the_final_remeasure_reads_the_committed_tree`.
   - `async _redrive_commit_leftovers(staging, label, tracked_before,
     written) -> list[str]` commits a group's leftovers (DESIGN §8 *A
     re-drive group's leftovers are its implementer's, and only those*):

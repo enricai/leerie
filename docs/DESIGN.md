@@ -7094,6 +7094,30 @@ B\* on a tree already measured. A file the conformer wrote and left
 untracked was collected there and does not ship, so then the clean
 checkout is measured.
 
+**Every post-execution verdict is of the committed tree.** The delivery
+judges run with staging as their working directory, and staging can hold
+what does not ship: an edit a worker left, an untracked file. Review
+round 9 asked whether they, and the held-out re-measure, therefore judge
+the wrong tree. They do not, and they were left where they are, because
+every check that can make a verdict *met* already reads the commit:
+
+- a judge's `met` counts only when each part cites a quote found in
+  `git show HEAD:<path>` (`_verify_delivery_cite`), and an `ABSENT` cite
+  is `git grep` over `HEAD`, so content only the working tree holds buys
+  no met, and committed content it lost still verifies;
+- an "unchanged paths" item is `git diff <own start>..HEAD`;
+- a test-outcome part is read from the failing-test-ID diff of the
+  committed tree (above);
+- the held-out sets, the re-measure included, and the falsifier run in
+  disposable checkouts of the commit, never in staging.
+
+What staging-only content can still do is make a judge vote *unmet* on
+something that ships correctly — a cost (a re-drive spent), never a false
+`done`. The one staging read that is a measurement, the re-drive ratchet's
+test IDs, compares staging before and after a group with the same
+leftover dirt on both sides, and the final diff measures the committed
+tree again before the outcome is decided.
+
 When the `tests` axis cannot be measured on that tree — the command did not
 run, or no test command resolves for a run that had a diff — the old diff
 (if any) is kept and marked stale, and the gap is listed under "Needs human
