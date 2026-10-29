@@ -38345,43 +38345,51 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     _DEPS_INSTALLED.add(key)
     ok = True
     recipe = (st.data.get("provision") or {}).get("recipe") or []
-    for e in recipe:
-        if e.get("kind") not in ("install", "build") or not e.get("command"):
-            continue
-        wd = Path(tree) / (e.get("working_dir") or ".")
-        # entry env (e.g. _normalize_node_threadpool's thread-pool caps)
-        # layers on top of the orchestrator's own environment rather than
-        # replacing it — `_run_streaming(env=None)` would otherwise mean
-        # "inherit everything," so an explicit dict here must still carry
-        # PATH etc.
-        entry_env = ({**os.environ, **e["env"]} if e.get("env") else None)
-        try:
-            # A recipe entry is a repo command: the task's forbid binds it
-            # too (DESIGN §9 *Recipe install steps fall under the forbid
-            # too*). A refused install is a failed install.
-            argv = _blt_shell_argv(e["command"], _forbidden_specs(st.data))
-        except ForbiddenByTask as ex:
-            ok = ok and e.get("kind") != "install"
-            log(f"  {log_prefix}: {e.get('kind')} not run — {ex}: "
-                f"{' '.join(e['command'])}")
-            continue
-        try:
-            rc, _tail = await _run_streaming(
-                argv, cwd=str(wd), env=entry_env,
-                timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
-                log_path=log_path,
-                label=f"{label_prefix}-install: {' '.join(e['command'])}",
-                verbosity=verbosity)
-            if rc != 0 and e.get("kind") == "install":
-                ok = False
-        except subprocess.TimeoutExpired:
-            ok = ok and e.get("kind") != "install"
-            log(f"  {log_prefix}: install timed out: "
-                f"{' '.join(e['command'])}")
-        except Exception as ex:  # non-fatal: BLT below will show the effect
-            ok = ok and e.get("kind") != "install"
-            log(f"  {log_prefix}: install error "
-                f"({type(ex).__name__}): {' '.join(e['command'])}")
+    # Leerie's own install/build never leaves a tracked edit behind
+    # (DESIGN §6½ *Leerie's own commands leave tracked files as they found
+    # them*): a relocked lockfile or a rewritten tsconfig.json is put back.
+    async with _leaves_tracked_files(tree, "install/build", log_prefix):
+        for e in recipe:
+            if (e.get("kind") not in ("install", "build")
+                    or not e.get("command")):
+                continue
+            wd = Path(tree) / (e.get("working_dir") or ".")
+            # entry env (e.g. _normalize_node_threadpool's thread-pool caps)
+            # layers on top of the orchestrator's own environment rather than
+            # replacing it — `_run_streaming(env=None)` would otherwise mean
+            # "inherit everything," so an explicit dict here must still carry
+            # PATH etc.
+            entry_env = ({**os.environ, **e["env"]} if e.get("env")
+                         else None)
+            try:
+                # A recipe entry is a repo command: the task's forbid binds it
+                # too (DESIGN §9 *Recipe install steps fall under the forbid
+                # too*). A refused install is a failed install.
+                argv = _blt_shell_argv(e["command"],
+                                       _forbidden_specs(st.data))
+            except ForbiddenByTask as ex:
+                ok = ok and e.get("kind") != "install"
+                log(f"  {log_prefix}: {e.get('kind')} not run — {ex}: "
+                    f"{' '.join(e['command'])}")
+                continue
+            try:
+                rc, _tail = await _run_streaming(
+                    argv, cwd=str(wd), env=entry_env,
+                    timeout=_recipe_timeout_s(
+                        e, caps.get("worker_timeout_sec")),
+                    log_path=log_path,
+                    label=f"{label_prefix}-install: {' '.join(e['command'])}",
+                    verbosity=verbosity)
+                if rc != 0 and e.get("kind") == "install":
+                    ok = False
+            except subprocess.TimeoutExpired:
+                ok = ok and e.get("kind") != "install"
+                log(f"  {log_prefix}: install timed out: "
+                    f"{' '.join(e['command'])}")
+            except Exception as ex:  # non-fatal: the BLT run shows it
+                ok = ok and e.get("kind") != "install"
+                log(f"  {log_prefix}: install error "
+                    f"({type(ex).__name__}): {' '.join(e['command'])}")
     return ok
 
 
@@ -38820,6 +38828,108 @@ async def _tracked_edits(tree: str) -> list[str] | None:
     return [ln for ln in r.stdout.splitlines() if ln.strip()]
 
 
+def _tracked_content(tree: str | Path) -> dict[str, str | None] | None:
+    """Every tracked path whose working-tree file differs from HEAD, mapped
+    to the blob of its bytes as they are now (`git hash-object -w
+    --no-filters`, written to the object store so the bytes can be put
+    back) or None when the file is gone; a path absent from the map is as
+    HEAD has it. None when git fails. Paths are mechanical `-z` output."""
+    try:
+        r = _git_z_output(["git", "-C", str(tree), "diff", "--name-only",
+                           "--no-renames", "-z", "HEAD"])
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    paths = [p for p in r.stdout.split("\0") if p]
+    out: dict[str, str | None] = {}
+    present = [p for p in paths if os.path.lexists(os.path.join(tree, p))]
+    for p in paths:
+        out[p] = None
+    for i in range(0, len(present), 200):
+        chunk = present[i:i + 200]
+        h = subprocess.run(["git", "-C", str(tree), "hash-object", "-w",
+                            "--no-filters", "--", *chunk],
+                           capture_output=True, text=True, check=False)
+        hashes = h.stdout.split()
+        if h.returncode != 0 or len(hashes) != len(chunk):
+            return None
+        out.update(zip(chunk, hashes))
+    return out
+
+
+def _changed_paths(before: dict[str, str | None],
+                   after: dict[str, str | None]) -> list[str]:
+    """The tracked paths whose content differs between two
+    `_tracked_content` snapshots of one worktree (absent = HEAD's)."""
+    head = object()
+    return sorted(p for p in set(before) | set(after)
+                  if before.get(p, head) != after.get(p, head))
+
+
+def _restore_tracked_content(tree: str | Path,
+                             before: dict[str, str | None]) -> list[str]:
+    """Put every tracked file a command changed back as it was in `before`
+    (a `_tracked_content` snapshot taken just before the command), and
+    return those paths. A file that matched HEAD is checked out from HEAD,
+    one that was edited gets its edited bytes back, one that was deleted is
+    removed again — so an edit someone else made before the command is
+    never lost. Untracked files are left alone. [] when git fails."""
+    after = _tracked_content(tree)
+    if after is None:
+        return []
+    changed = _changed_paths(before, after)
+    for p in changed:
+        dst = Path(tree) / p
+        if p not in before:
+            subprocess.run(["git", "-C", str(tree), "checkout", "HEAD",
+                            "--", p], capture_output=True, check=False)
+        elif before[p] is None:
+            with contextlib.suppress(OSError):
+                dst.unlink()
+        else:
+            blob = subprocess.run(["git", "-C", str(tree), "cat-file",
+                                   "blob", str(before[p])],
+                                  capture_output=True, check=False)
+            if blob.returncode == 0:
+                with contextlib.suppress(OSError):
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(blob.stdout)
+    return changed
+
+
+@contextlib.asynccontextmanager
+async def _leaves_tracked_files(tree: str | Path, what: str,
+                                log_prefix: str):
+    """Around one of leerie's own commands in `tree` — a recipe install or
+    build, a measured build/lint/test axis, a test-ID report run: whatever
+    tracked file the command rewrote is put back afterwards
+    (`_restore_tracked_content`), so leerie's own commands never leave an
+    edit a worker could be blamed for or that could ship (DESIGN §6½
+    *Leerie's own commands leave tracked files as they found them*).
+    Dependencies and other untracked output stay. Never raises from the
+    snapshot or the restore."""
+    try:
+        before = await asyncio.to_thread(_tracked_content, tree)
+    except Exception:
+        before = None
+    try:
+        yield
+    finally:
+        if before is not None:
+            try:
+                put_back = await asyncio.to_thread(
+                    _restore_tracked_content, tree, before)
+            except Exception:
+                put_back = []
+            if put_back:
+                log(f"  {log_prefix}: put back {len(put_back)} tracked "
+                    f"file(s) its own {what} rewrote: "
+                    + ", ".join(put_back[:5])
+                    + (f" (+{len(put_back) - 5} more)"
+                       if len(put_back) > 5 else ""))
+
+
 async def _unmoved_tree_sha(tree: str) -> str | None:
     """The committed tree when no tracked file is edited, else None: equal
     values before and after a step mean the step moved nothing that ships."""
@@ -38950,7 +39060,8 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         # The gate is held only around the command itself, never around the
         # memo lookup or the install: a hit must stay free, and serialising
         # installs would throttle the very worktrees waiting to be measured.
-        async with _blt_semaphore(caps):
+        async with _blt_semaphore(caps), \
+                _leaves_tracked_files(tree, axis, log_prefix):
             async with (_build_class_slot(st, label=f"{label_prefix}-{axis}")
                         if axis in _BUILD_CLASS_AXES
                         else contextlib.nullcontext()):
@@ -39903,7 +40014,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         try:
             report.parent.mkdir(parents=True, exist_ok=True)
             async with _blt_semaphore(caps), \
-                    _build_class_slot(st, label=f"{label}-ids"):
+                    _build_class_slot(st, label=f"{label}-ids"), \
+                    _leaves_tracked_files(tree, "test run", label):
                 t_run = time.monotonic()
                 try:
                     await _run_streaming(

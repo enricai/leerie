@@ -5129,6 +5129,45 @@ worktree path and lives in the process, not in run state: it records a
 filesystem fact, and re-installing once after a `resume` is correct
 since a fresh container starts with an empty worktree.
 
+**Leerie's own commands leave tracked files as they found them.** An
+install can rewrite a tracked file in ordinary use — `uv sync` relocks
+`uv.lock` under a newer uv, `bundle install` adds the container's
+platform to a `Gemfile.lock` made on a Mac, `pipenv install` rewrites
+`Pipfile.lock` on a hash mismatch — and so can a build (`next build`
+rewrites a tracked `tsconfig.json` or `next-env.d.ts`) or a test run
+(a snapshot written). Left in place, that edit is indistinguishable
+from a worker's: review round 9 drove a clean run whose install appended
+to the tracked `pnpm-lock.yaml` into an end-state line "uncommitted
+edits to 1 tracked file(s) that do not ship — check whether they belong
+in the change", the final conformer's "left 1 uncommitted change(s)"
+warning, and, on a run that re-drove, a leftovers commit shipping the
+churn. So every command leerie itself runs in a tree — the recipe's
+install and build entries, a measured build/lint/test axis, a test-ID
+report run — is bracketed by a snapshot of the tracked files' content
+(path → blob of the working bytes), and whatever tracked file the
+command changed is put back as it was just before it: from HEAD when it
+matched HEAD, from its saved bytes when someone had already edited it
+(an edit a worker left is never lost). Dependencies and other untracked
+output stay, so the tree stays runnable, and staging stays at its
+commit plus only what workers left.
+
+Restoring rather than recording-and-excluding was chosen because it is
+one rule at the source instead of three filters downstream (the
+end-state note, the conformer's leftover count, the re-drive commit),
+and because it keeps the tree that was measured byte-identical in its
+tracked files to the tree that ships. Nor is a rewrite committed as part
+of the change. Leerie cannot tell an environment-driven rewrite (a newer
+tool, the container's platform) from one the change caused, and
+committing the first ships churn the user never asked for. The case
+where the change causes it — a worker edited `package.json` and did not
+update the lockfile — is the worker's to commit: workers run the install
+themselves for their own work (above), and the table's JavaScript
+installs are frozen (`pnpm install --frozen-lockfile`, `yarn install
+--frozen-lockfile`, `npm ci`), so that drift fails the install instead
+of rewriting the lockfile, which §9 *Which failures are new* treats as
+"could not measure", never as a pass. For the unfrozen installers the
+rewrite is put back like any other and logged by path.
+
 The orchestrator addresses both with a dedicated phase between
 classification and planning, layered top-to-bottom by determinism:
 
@@ -7040,7 +7079,11 @@ takes its own — so what is measured is exactly what ships. Untracked files
 never count as a change; uncommitted edits to *tracked* files do not ship
 either, so the diff still describes the committed tree, and they are
 listed under "Needs human verification" for the reviewer to judge whether
-they belonged in the change.
+they belonged in the change. Only a worker's edits can be listed there:
+leerie's own installs, builds and test runs put back every tracked file
+they rewrite (§6½ *Leerie's own commands leave tracked files as they
+found them*), so a clean run whose install relocks a lockfile lists
+nothing.
 
 When the `tests` axis cannot be measured on that tree — the command did not
 run, or no test command resolves for a run that had a diff — the old diff
