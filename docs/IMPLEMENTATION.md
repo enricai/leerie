@@ -5259,6 +5259,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | run-level re-drive wall time (`redrive_budget_sec`) | 14400 s (4 h) | the hard stop for every re-drive in the run: `state.data["redrive_spent_sec"]` accumulates, per wave, the longest in-settle re-drive (clock opened by `_open_redrive_clock(st, sid)` at the first in-settle re-drive, closed by `_close_redrive_clock` when the settle returns) plus the wall time of each wave-end re-drive round. Once spent, `_redrive_allowed` is False for every subtask. Measured worst run: 15,017 s. |
 | delivery re-drive leftovers commit (`redrive_leftovers_max_files`, `redrive_leftovers_max_bytes`) | 100 files, 5 MiB (`5 * 1024 * 1024`) | `_redrive_commit_leftovers`: when the paths left to commit (after the held-out and artifact-shape withholds) number more than `redrive_leftovers_max_files` or their `os.lstat` sizes sum past `redrive_leftovers_max_bytes`, nothing is committed and every path goes to `withheld["over_cap"]` → the group's `leftovers_withheld.over_cap` → `_set_redrive_leftovers_gap` (DESIGN §8 *A re-drive group's leftovers are its implementer's*). Review round 11 M1: 505 files in one leftovers commit. |
 | delivery re-drive leftovers save (`redrive_leftovers_save_max_bytes`) | 64 MiB (`64 * 1024 * 1024`) | `_redrive_commit_leftovers` with `save_dir`: an over-cap set is saved by `_save_withheld_leftovers(staging, paths, save_dir, stem, max_bytes) -> list[str]` as `<save_dir>/<stem>.tar.gz` (each path that exists, as it stands, `tarfile` with `recursive=False`, until the next file would pass the cap; the rest are named in the log line) and `<save_dir>/<stem>.patch` (`git --literal-pathspecs diff --binary HEAD -- <tracked paths>`, when non-empty); `save_dir` is `<run dir>/redrive-leftovers` and `stem` the group label (`r<round>-g<group>`); the files written go to `withheld["saved"]` → `leftovers_withheld.saved` → named in the `_set_redrive_leftovers_gap` entry (DESIGN §8 *A re-drive group's leftovers are its implementer's*). Review round 12 L2: a later rollback erased what the entry said to commit. |
+| worker-command re-runs per run (`record_reruns_max`) | 8 | `_rerun_worker_command`: once `_record_reruns_run(st)` reaches it, or `_redrive_time_left` is false (each re-run's wall time is `_charge_redrive_time`d to `redrive_budget_sec`), a further cited worker command is `unrunnable` — the item goes to "Needs human verification" (DESIGN §8 *Execution-shaped items are judged from the run's own records*; review round 13 L3). |
 | coverage re-drive threshold (`coverage_uncovered_share`) | 0.25 | `_redrive_uncovered_subtasks`: a completed subtask is re-driven when at least this share of its changed executable lines is executed by no test, after the importing-test settle (DESIGN §9 *Changed lines no test executes are re-driven*). Rounds come from `subtask_redrive_rounds`. |
 | B\* host CPU-pressure gate (`confirm_psi_cpu_max`) | 40 | `_confirm_gate` waits until `_host_cpu_psi()` — `some avg10` of the **host** file `_HOST_PSI_CPU_PATH = "/proc/pressure/cpu"`, never a cgroup's `cpu.pressure` — is below this value. |
 | B\* gate wait (`confirm_gate_wait_sec`) | 300 s | the gate polls every 2 s for at most this long; a timeout (or an unreadable PSI file, which is logged and treated as a timeout) escalates the pairs below. |
@@ -7057,10 +7058,12 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `_DELIVERY_CITE_MIN_QUOTE` = 8 characters) is in `git show HEAD:<path>`
   (`ok` within the cited lines ±3, else `drift`), in one of the record's
   orchestrator entries (`RECORD` → `record_ok` when the quote is in
-  `record.own` — `_ExecutedRecord(text, own)`, `own` built by
-  `_delivery_record` from `_orchestrator_results_digest` alone, so no
-  worker text can enter it; a plain `str` record has no `own` and verifies
-  nothing; review round 12 claims H1. `_executed_commands_digest` joins a
+  `record.own` or in one of `record.measured` — `_ExecutedRecord(text,
+  own, workers, measured)`, `own` built by `_delivery_record` from
+  `_orchestrator_results_digest` alone and `measured` holding only the
+  output the orchestrator captured from a re-run that passed, so no worker
+  text can enter either; a plain `str` record has neither and verifies
+  nothing; review round 12 claims H1, round 13 H1. `_executed_commands_digest` joins a
   worker's command onto one line (`" | "`), as it does the tail; a quote
   found only in the record's text is `record_worker`, not in
   `_DELIVERY_CITE_OK`, though `_delivery_unmet_parts` keeps it as a
@@ -7077,21 +7080,42 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `_executed_command_entries`, of which `_executed_commands_digest` is the
   joined text) its `RECORD` quotes are in — None when a part has none;
   each distinct command is re-run once by `async _rerun_worker_command(st,
-  caps, staging, cmd, verbs, head) -> {command, head, verdict: passed |
-  failed | unrunnable, why}`: `unrunnable` when `_forbidden_command_hit`
-  hits or `_rerunnable_argv(cmd, verbs)` is None (`_RERUN_UNSAFE_RE`
-  matches any of ``;&|<>`$*?~`` or a newline; `shlex.split` fails; `=` in
-  the lead; the lead not in `verbs` = `_blt_verbs(repo_root) |
-  _repro_verbs(<audit repro>)`), else `_settle_by_execution({"verify":
-  [{"argv": argv}]}, <checkout>, st, caps, sid=<key>,
-  store="record_reruns")` in a detached checkout of staging's HEAD at
-  `_helper_worktree_path(st, "record-rerun")` (removed after) — `pass` →
-  `passed`, `fail` → `failed`, else `unrunnable`; persisted and reused by
+  caps, staging, cmd, allowed, head) -> {argv, head, verdict: passed |
+  failed | unrunnable, rc, output, why}` (no worker text):
+  `unrunnable` when `_forbidden_command_hit` hits, when
+  `_rerunnable_argv(cmd, allowed, at_head)` is None, when
+  `_record_reruns_run(st)` (entries `passed`/`failed`) has reached
+  `record_reruns_max`, or when `_redrive_time_left` is false; else
+  `_settle_by_execution({"verify": [{"argv": argv}]}, <checkout>, st,
+  caps, sid=<key>, store="record_reruns")` in a detached checkout of
+  staging's HEAD at `_helper_worktree_path(st, "record-rerun")` (removed
+  after; its wall time `_charge_redrive_time`d) — `pass` → `passed`,
+  `fail` → `failed`, else `unrunnable`, `rc` and `output` the last
+  command's exit code and `tail`; persisted and reused by
   `record_reruns[<key>]`, `<key> = "rerun-" + sha256(head + "\0" +
-  cmd)[:16]`. Each worker entry whose command passed adds `[orchestrator
-  re-run on the committed tree <head[:12]>] passed — the worker entry it
-  re-ran: <entry>` to the record and its `own`, and every sample is
-  re-screened; `_mark_unrunnable` types a `part_uncited` rejection whose
+  cmd)[:16]`. `allowed = _rerun_allowed_argvs(repo_root, <audit repro>)`:
+  `resolve_blt`'s build/lint/test, `_canonical_test_command` and the
+  repro, each kept only when `_RERUN_UNSAFE_RE` (any of ``;&|<>`$*?~`` or
+  a newline) does not match, `shlex.split` succeeds and its lead has no
+  `=`. `_rerunnable_argv`: a command matching `_RERUN_UNSAFE_RE` is cut
+  at the first `_RERUN_LEAD_SPLIT_RE` operator (`||`, `&&`, `|`, `;`,
+  newline), a trailing `2>&1` dropped, and qualifies only when the rest is
+  exactly an `allowed` argv; a plain command must begin with an `allowed`
+  argv (longest first) and `_rerun_extras_ok(rest, _rerun_runner(prefix),
+  at_head)`: a word in `_RERUN_EVAL_WORDS` (`-c -e --eval -p --print
+  --require --import --loader --experimental-loader exec dlx x`) refuses;
+  an option must be a value option of the runner's `_FORBID_RUNNERS` entry
+  (value next or after `=`, or attached to a short option) or a flag in
+  `_RERUN_RUNNER_FLAGS` (pytest: `_PYTEST_LONG_FLAGS |
+  _PYTEST_SHORT_FLAGS`, single-letter flags clustering), its value passing
+  `_rerun_value_ok` (not `/`- or `~`-led, no `..`, not an eval word); any
+  other word must pass `_rerun_path_ok` (its part before `::`, `./` and a
+  trailing `/` stripped: not `/`, `~` or `-` led, no `..`, and
+  `_path_at_commit(staging, head)` — `git cat-file -e <head>:<path>`).
+  Each re-run that passed adds `[orchestrator re-run on the committed tree
+  <head[:12]>] $ <shlex.join(argv)> — exit <rc>` and `output tail:
+  <output, lines joined " | ">` to the record's text and the output to
+  `measured`, and every sample is re-screened; `_mark_unrunnable` types a `part_uncited` rejection whose
   every uncited part has an `unrunnable` command and none `failed` as
   `rejected: record_unrunnable` (with `rerun[{command, why}]`). An item
   whose majority-unmet votes are all `record_unrunnable` is not confirmed
@@ -10074,7 +10098,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `acceptance_dispute` | dict | `{failing_sets, total_sets, cases[], accepted?, unacted?, redispute?}` written when held-out sets fail on HEAD — as a new dispute when the previous completed same-task run had NOT already disputed, and again with `accepted: true` when it had (the carry-forward); `_prior_acceptance_dispute` reads it from that sibling on the next run, which then accepts no work instead of disputing again. `unacted: true` is set by `_mark_dispute_unacted` when the disputing run still ended as no work by another exit (empty plans, or the satisfied-probe sweep emptying the plan); `_prior_acceptance_dispute` does not count such a dispute unless it also carries `redispute: true` — written when the dispute was raised because the previous run's dispute was unacted (`_prior_acceptance_dispute_record`), so a second unacted dispute counts and the wrong-tests loop stays bounded at two extra runs (DESIGN §8 *A dispute counts only once it is acted on*). |
 | `declared_unrun_warnings` | dict | per-sid list of `DECLARED_CMD_UNRUN` issues on an `empty_handoff`-rescued subtask that settled `complete` without running them. No longer written — such a rescue is now settled by execution or re-driven (DESIGN §8 *Settled by execution*) — but still read by `phase_finalize`, so a run recorded before the change keeps surfacing it. |
 | `settled_by_execution` | dict[str, dict] | per-sid record of `_settle_by_execution` (DESIGN §8 *Settled by execution*): `{verdict, why, commands: [{argv, rc, attempts, passed, resource_affected, environment_limit, tail}], dirty, removed_untracked?, forbidden?}` (`forbidden[{argv, forbidden}]` only when a verify argv runs a command the task forbids — then nothing ran), written on every execution whatever the verdict. |
-| `record_reruns` | dict[str, dict] | per-key record of `_rerun_worker_command` (DESIGN §8 *Execution-shaped items are judged from the run's own records*): `{command, head, verdict: passed \| failed \| unrunnable, why}`, the `_settle_by_execution` record under the same key while it runs; `<key> = "rerun-" + sha256(head + "\0" + command)[:16]`, so a command is re-run once per commit. |
+| `record_reruns` | dict[str, dict] | per-key record of `_rerun_worker_command` (DESIGN §8 *Execution-shaped items are judged from the run's own records*): `{argv, head, verdict: passed \| failed \| unrunnable, rc, output, why}` — only what the orchestrator ran and captured, never the worker's text (review round 13 H1) — the `_settle_by_execution` record under the same key while it runs; `<key> = "rerun-" + sha256(head + "\0" + command)[:16]`, so a command is re-run once per commit; the entries `passed`/`failed` count against `record_reruns_max`. |
 | `ci_parity` | dict \| absent | CI parity (DESIGN §9 *The repository's own merge checks run too*), written by `_capture_ci_parity_baseline` and `_run_ci_parity_final`: `{baseline_done, config_files[], excluded_by_worker[], skipped?, base_sha, checks[], final?}`. Each check `{id, kind, argv, cwd, env, prerequisites, trigger, requires, strict_argv, source, coverage, selected, reason?, problems?, forbidden?, strict_forbidden?, gate?: plain \| strict, ratchet?: diagnostic \| coverage, base?{rc, dirty, strict_rc?, diagnostics?{"file\ttext": count}, coverage?{"glob\|metric": pct}}}`; `reason` one of `left_to_test_axis`, `not_merge_gating`, `external_resource`, `db_reset`, `forbidden_by_task` (with `forbidden`, the entry the argv hits), `provenance` (with `problems`), `no_base_worktree`, `writes_tracked_files`, `red_at_baseline`, `coverage_unmeasured`; `strict_forbidden` is the entry a selected check's `strict_argv` hit (that `strict_argv` then `null`). `final` `{sha, results{id: {...}}, unmet[{id, kind, why: red \| new_diagnostics \| coverage_ratchet, argv, cwd, rc? \| diagnostics? \| thresholds?}], resource_affected[], pre_existing[], no_verdict[], budget_short_unsettled[], sized_out?[], b_star?, skipped?}`. `baseline_done` is the baseline's resume sentinel; `final.sha` equal to the staging HEAD is the final half's. |
 | `blt_peak` | dict \| absent | the base-health baseline's measured peak (DESIGN §6 *The repo's own build peak*): `{memory_bytes, pids, axis, slots, worker_memory_max_bytes, worker_pids_max}` — the largest `memory.peak` / `pids.peak` across the measured axes, the host build-semaphore slot count sized from it, and the raised caps `_apply_blt_peak` applied. Re-applied on resume. |
 | `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |

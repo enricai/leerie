@@ -259,6 +259,14 @@ DEFAULT_CAPS = {
     # the PR entry listing it can be acted on (review round 12 L2: a later
     # rollback erased the files the entry said to commit).
     "redrive_leftovers_save_max_bytes": 64 * 1024 * 1024,
+    # How many worker commands the delivery gate may re-run on the committed
+    # tree in one run to verify a RECORD citation (DESIGN §8 *Execution-
+    # shaped items are judged from the run's own records*). Each is a fresh
+    # checkout, a dependency install and up to `worker_timeout_sec` plus
+    # B* reruns, and its wall time is charged to `redrive_budget_sec`; a
+    # command past either is `unrunnable` and goes to a human (review
+    # round 13 L3: up to 40 cited entries were re-run with no bound).
+    "record_reruns_max": 8,
     # B* flake-robust failure verdicts (DESIGN §9 *Which failures are new*):
     # host-PSI gate, then interleaved serial base/final rerun pairs. Frozen
     # from the Q9 bench (held-out: 0/88 clean trials called new, 36/36
@@ -42612,22 +42620,28 @@ class _ExecutedRecord(str):
     the orchestrator's own entries carried apart in `own` (DESIGN §8 *Every
     post-execution verdict is of the committed tree*). A `RECORD` cite
     verifies only against `own`, which `_delivery_record` builds from typed
-    state alone; nothing a worker's command or output contains can enter
-    it (review round 12 claims H1: a column-0 `[orchestrator ` tag was
-    forgeable through a heredoc). A `str` so every reader of the record's
-    text is unchanged; a plain `str` record has no `own`, so it verifies
-    nothing (the fail-closed side)."""
+    state alone, or against `measured`, the output the orchestrator itself
+    captured from a worker command it re-ran and passed on HEAD
+    (`_rerun_record_citations`); nothing a worker's command or output
+    contains can enter either (review round 12 claims H1: a column-0
+    `[orchestrator ` tag was forgeable through a heredoc; round 13 H1: a
+    re-run's entry had carried the worker's own result tail). A `str` so
+    every reader of the record's text is unchanged; a plain `str` record
+    has neither, so it verifies nothing (the fail-closed side)."""
     own: str
     # `(entry text, command)` of each worker entry, for the re-run of a
     # cited worker command (`_rerun_record_citations`).
     workers: tuple[tuple[str, str], ...]
+    # The orchestrator's own captured output of each re-run that passed.
+    measured: tuple[str, ...]
 
     def __new__(cls, text: str, own: str = "",
-                workers: Iterable[tuple[str, str]] = ()
-                ) -> "_ExecutedRecord":
+                workers: Iterable[tuple[str, str]] = (),
+                measured: Iterable[str] = ()) -> "_ExecutedRecord":
         obj = super().__new__(cls, text)
         obj.own = own
         obj.workers = tuple(workers)
+        obj.measured = tuple(measured)
         return obj
 
 
@@ -42650,7 +42664,9 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
     `absent` (not in the file), `no_file`, `short`; for `path: "RECORD"`
     (the executed-commands record) `record_ok` when the quote is in the
     orchestrator's own entries (`record.own`, `_ExecutedRecord`: each is on
-    the record only while it describes HEAD's committed tree), `record_worker`
+    the record only while it describes HEAD's committed tree) or in the
+    output it captured re-running a worker command on HEAD
+    (`record.measured`), `record_worker`
     when it is only in a worker's entry — supporting evidence that never
     verifies on its own, since a worker's run in staging can rest on a
     file HEAD lacks (review round 11 claims M1) — else `record_absent`;
@@ -42676,7 +42692,9 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
     if len(q) < _DELIVERY_CITE_MIN_QUOTE:
         return "short"
     if head == "RECORD":
-        if q in _scope_norm(getattr(record, "own", "") or ""):
+        if q in _scope_norm(getattr(record, "own", "") or "") or any(
+                q in _scope_norm(m)
+                for m in getattr(record, "measured", ()) or ()):
             return "record_ok"
         return ("record_worker" if q in _scope_norm(record)
                 else "record_absent")
@@ -42793,25 +42811,183 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
 # shell, so only a command a shell would read as exactly that argv
 # qualifies: no operator, redirection, substitution, expansion or glob.
 _RERUN_UNSAFE_RE = re.compile(r"[;&|<>`$*?~\n\r]")
+# A compound command's leading simple command: everything before the first
+# shell operator, with a trailing `2>&1` dropped. Only ever used when what
+# remains is exactly an allowed argv (`_rerunnable_argv`).
+_RERUN_LEAD_SPLIT_RE = re.compile(r"\|\||&&|\||;|\n")
+_RERUN_LEAD_REDIR_RE = re.compile(r"\s+2>&1\s*$")
 RECORD_RERUN_GAP_SOURCE = "record_rerun"
+# Words that make a runner or an interpreter evaluate code given on the
+# command line, or fetch and run a package, rather than run the
+# repository's own files (review round 13 H1: `python3 -c ...` passed as a
+# re-run of a `python3`-led record entry).
+_RERUN_EVAL_WORDS = frozenset({
+    "-c", "-e", "--eval", "-p", "--print", "--require", "--import",
+    "--loader", "--experimental-loader", "exec", "dlx", "x"})
+# pytest's single-letter flags (`tests/fixtures/pytest_options.json`'s
+# short `flag` entries): with `_PYTEST_LONG_FLAGS`, the options pytest
+# takes with no value. They may cluster (`-qx`).
+_PYTEST_SHORT_FLAGS = frozenset({"-V", "-d", "-f", "-h", "-l", "-q", "-s",
+                                 "-v", "-x"})
+# Options a re-run may add after its allowed argv, per runner: the value
+# options of `_FORBID_RUNNERS` (lane B's matcher tables) and, for pytest,
+# the flags. A runner with no flag table here takes only its value
+# options; anything else leaves the command unrunnable.
+_RERUN_RUNNER_FLAGS: dict[tuple[str, ...], frozenset[str]] = {
+    ("pytest",): _PYTEST_LONG_FLAGS | _PYTEST_SHORT_FLAGS,
+}
 
 
-def _rerunnable_argv(cmd: str, verbs: set[str]) -> list[str] | None:
-    """`cmd` as the argv the orchestrator would run, or None when it cannot
-    be run as one: shell syntax (`_RERUN_UNSAFE_RE`), unparseable quoting,
-    an environment or directory prefix, or a lead token that is not one of
-    `verbs` (the repository's build/lint/test verbs and the audit repro's —
-    what admitted the command to the record). Mechanical: a command
-    string, never prose."""
-    if not isinstance(cmd, str) or _RERUN_UNSAFE_RE.search(cmd):
+def _rerun_allowed_argvs(repo_root: str | Path,
+                         repro_command: str | None) -> list[list[str]]:
+    """The argvs a worker command must begin with, verbatim, for the
+    orchestrator to re-run it (DESIGN §8 *Execution-shaped items are
+    judged from the run's own records*): the repository's configured or
+    inferred build, lint and test commands (`resolve_blt`,
+    `_canonical_test_command`) and the audit's typed repro command — each
+    only when it is itself one plain argv. Command strings are mechanical."""
+    cmds: list[str] = []
+    with contextlib.suppress(Exception):
+        blt = resolve_blt(Path(str(repo_root)))
+        cmds += [blt.get(a) or "" for a in ("build", "lint", "test")]
+    with contextlib.suppress(Exception):
+        cmds.append(_canonical_test_command(repo_root))
+    cmds.append(repro_command if isinstance(repro_command, str) else "")
+    out: list[list[str]] = []
+    for c in cmds:
+        c = (c or "").strip()
+        if not c or _RERUN_UNSAFE_RE.search(c):
+            continue
+        try:
+            argv = shlex.split(c)
+        except ValueError:
+            continue
+        if argv and "=" not in argv[0] and argv not in out:
+            out.append(argv)
+    return out
+
+
+def _rerun_runner(prefix: list[str]) -> tuple[str, ...] | None:
+    """The `_FORBID_RUNNERS` key an allowed argv runs (`python3 -m pytest`
+    → `("pytest",)`, `go test ./...` → `("go", "test")`), or None."""
+    for i in range(len(prefix)):
+        head = os.path.basename(prefix[i])
+        head = "pytest" if head == "py.test" else head
+        for key in ((head, prefix[i + 1]) if i + 1 < len(prefix) else None,
+                    (head,)):
+            if key and key in _FORBID_RUNNERS:
+                return key
+    return None
+
+
+def _rerun_path_ok(word: str, at_head: Callable[[str], bool]) -> bool:
+    """A repo-relative path (a pytest node ID's file part) that exists at
+    HEAD: never absolute, never `..`, never `~`."""
+    rel = word.split("::", 1)[0]
+    while rel.startswith("./"):
+        rel = rel[2:]
+    rel = rel.rstrip("/")
+    if (not rel or rel.startswith(("/", "~", "-"))
+            or ".." in Path(rel).parts):
+        return False
+    return at_head(rel)
+
+
+def _rerun_value_ok(value: str) -> bool:
+    """An option's value: never a path out of the checkout, never code."""
+    return not (value.startswith(("/", "~")) or ".." in Path(value).parts
+                or value in _RERUN_EVAL_WORDS)
+
+
+def _rerun_extras_ok(extra: list[str], runner: tuple[str, ...] | None,
+                     at_head: Callable[[str], bool]) -> bool:
+    """Whether every word after an allowed argv is one a re-run may add:
+    an option from `runner`'s own tables (`_FORBID_RUNNERS`' value options,
+    `_RERUN_RUNNER_FLAGS`) with a safe value, or a repo-relative path that
+    exists at HEAD. Mechanical: argv words, never prose."""
+    spec = _FORBID_RUNNERS.get(runner or (), {})
+    values = spec.get("value", frozenset())
+    flags = _RERUN_RUNNER_FLAGS.get(runner or (), frozenset())
+    i = 0
+    while i < len(extra):
+        w = extra[i]
+        if w in _RERUN_EVAL_WORDS:
+            return False
+        if w.startswith("-") and w != "-":
+            name, eq, val = w.partition("=")
+            if name in _RERUN_EVAL_WORDS:
+                return False
+            if name in values:
+                if eq:
+                    if not _rerun_value_ok(val):
+                        return False
+                else:
+                    if i + 1 >= len(extra) or not _rerun_value_ok(
+                            extra[i + 1]):
+                        return False
+                    i += 1
+            elif name in flags and not eq:
+                pass
+            elif (not name.startswith("--") and len(name) > 2
+                  and name[:2] in values and name[:2] not in _RERUN_EVAL_WORDS
+                  and not eq):
+                # An attached short value (`-rA`, `-k1`).
+                if not _rerun_value_ok(name[2:]):
+                    return False
+            elif (not name.startswith("--") and len(name) > 2 and not eq
+                  and all(f"-{ch}" in flags for ch in name[1:])):
+                pass                                # a cluster (`-qx`)
+            else:
+                return False
+        elif not _rerun_path_ok(w, at_head):
+            return False
+        i += 1
+    return True
+
+
+def _rerunnable_argv(cmd: str, allowed: list[list[str]],
+                     at_head: Callable[[str], bool]) -> list[str] | None:
+    """`cmd` as the argv the orchestrator would run, or None when it may
+    not run it (DESIGN §8 *Execution-shaped items are judged from the
+    run's own records*). One plain argv (no shell syntax, `_RERUN_UNSAFE_RE`)
+    that begins verbatim with one of `allowed` (`_rerun_allowed_argvs`),
+    every further word passing `_rerun_extras_ok`. A compound command
+    qualifies only when its leading simple command, a trailing `2>&1`
+    dropped, is exactly one of `allowed` — `pnpm run test 2>&1 | tail -30`
+    runs `pnpm run test`. What runs is the repository's own command on
+    HEAD's files, never a worker's code (review round 13 H1)."""
+    if not isinstance(cmd, str) or not allowed:
         return None
+    cmd = cmd.strip()
+    if _RERUN_UNSAFE_RE.search(cmd):
+        lead = _RERUN_LEAD_SPLIT_RE.split(cmd, maxsplit=1)[0]
+        lead = _RERUN_LEAD_REDIR_RE.sub("", lead).strip()
+        if not lead or _RERUN_UNSAFE_RE.search(lead):
+            return None
+        try:
+            argv = shlex.split(lead)
+        except ValueError:
+            return None
+        return list(argv) if argv in allowed else None
     try:
         argv = shlex.split(cmd)
     except ValueError:
         return None
-    if not argv or "=" in argv[0] or argv[0] not in verbs:
-        return None
-    return argv
+    for prefix in sorted(allowed, key=len, reverse=True):
+        if argv[:len(prefix)] == prefix and _rerun_extras_ok(
+                argv[len(prefix):], _rerun_runner(prefix), at_head):
+            return argv
+    return None
+
+
+def _path_at_commit(tree: str | Path, head: str) -> Callable[[str], bool]:
+    """Whether a repo-relative path (file or directory) exists in commit
+    `head` of `tree` (`git cat-file -e <head>:<path>`)."""
+    def exists(rel: str) -> bool:
+        return subprocess.run(
+            ["git", "-C", str(tree), "cat-file", "-e", f"{head}:{rel}"],
+            capture_output=True, check=False).returncode == 0
+    return exists
 
 
 def _uncited_worker_commands(v: dict, tree: str | Path, record: str,
@@ -42848,33 +43024,52 @@ def _uncited_worker_commands(v: dict, tree: str | Path, record: str,
     return out or None
 
 
+def _record_reruns_run(st: "State") -> int:
+    """How many re-runs this run has executed (`record_reruns` entries
+    that reached a verdict by running), for `record_reruns_max`."""
+    return sum(1 for r in (st.data.get("record_reruns") or {}).values()
+               if isinstance(r, dict) and r.get("verdict") in ("passed",
+                                                               "failed"))
+
+
 async def _rerun_worker_command(st: "State", caps: dict, staging: Path,
-                                cmd: str, verbs: set[str], head: str
-                                ) -> dict:
+                                cmd: str, allowed: list[list[str]],
+                                head: str) -> dict:
     """Re-run one worker command on the committed tree (DESIGN §8
     *Execution-shaped items are judged from the run's own records*): in a
     disposable checkout of `head`, through `_settle_by_execution` — exec'd
     as an argv through the single forbidden-command gate, contained, a
-    failure B*-confirmed. Returns `{command, head, verdict: passed | failed
-    | unrunnable, why}`, persisted in `record_reruns[<key>]` and reused for
-    the same command on the same commit."""
+    failure B*-confirmed. Returns `{argv, head, verdict: passed | failed |
+    unrunnable, rc, output, why}` — only what the orchestrator itself ran
+    and saw, never the worker's text (review round 13 H1) — persisted in
+    `record_reruns[<key>]` and reused for the same command on the same
+    commit. Bounded by `record_reruns_max` and charged to
+    `redrive_budget_sec` (review round 13 L3)."""
     key = "rerun-" + hashlib.sha256(
         f"{head}\0{cmd}".encode()).hexdigest()[:16]
     done = (st.data.get("record_reruns") or {}).get(key)
     if isinstance(done, dict) and done.get("verdict") in (
             "passed", "failed", "unrunnable"):
         return done
-    rec = {"command": cmd[:500], "head": head, "verdict": "unrunnable",
-           "why": ""}
-    argv = _rerunnable_argv(cmd, verbs)
+    rec: dict = {"argv": None, "head": head, "verdict": "unrunnable",
+                 "rc": None, "output": "", "why": ""}
+    argv = _rerunnable_argv(cmd, allowed, _path_at_commit(staging, head))
     hit = _forbidden_command_hit(cmd, _forbidden_specs(st.data))
+    cap = int(caps.get("record_reruns_max",
+                       DEFAULT_CAPS["record_reruns_max"]))
     if hit:
         rec["why"] = f"the task forbids `{hit}`"
     elif argv is None:
-        rec["why"] = ("it is not one plain command leerie can run as an "
-                      "argv (shell syntax, a prefix, or not a build/test "
-                      "verb)")
+        rec["why"] = ("it is not the repository's build, lint, test or "
+                      "repro command run as one plain argv (only that "
+                      "command, its runner's options and paths in the "
+                      "commit may be re-run)")
+    elif _record_reruns_run(st) >= cap:
+        rec["why"] = f"the run's {cap} command re-runs are spent"
+    elif not _redrive_time_left(st, caps):
+        rec["why"] = "the run's re-drive time budget is spent"
     else:
+        rec["argv"] = argv
         wt = _helper_worktree_path(st, "record-rerun")
 
         def _remove() -> None:
@@ -42884,6 +43079,7 @@ async def _rerun_worker_command(st: "State", caps: dict, staging: Path,
             shutil.rmtree(wt, ignore_errors=True)
             _DEPS_INSTALLED.discard(os.path.realpath(wt))
         _remove()
+        t0 = time.monotonic()
         try:
             add = await _worktree_add_detached_async(st, wt, head,
                                                      repo=staging)
@@ -42896,8 +43092,12 @@ async def _rerun_worker_command(st: "State", caps: dict, staging: Path,
                 rec["verdict"] = {"pass": "passed", "fail": "failed"}.get(
                     got.get("verdict"), "unrunnable")
                 rec["why"] = str(got.get("why") or "")[:300]
+                last = (got.get("commands") or [{}])[-1]
+                rec["rc"] = last.get("rc")
+                rec["output"] = str(last.get("tail") or "")
         finally:
             _remove()
+            _charge_redrive_time(st, time.monotonic() - t0)
     st.data.setdefault("record_reruns", {})[key] = rec
     st.save()
     log(f"  delivery gate: re-ran a cited worker command on "
@@ -42908,14 +43108,17 @@ async def _rerun_worker_command(st: "State", caps: dict, staging: Path,
 
 async def _rerun_record_citations(st: "State", caps: dict, staging: Path,
                                   record: str, raw: list[dict],
-                                  verbs: set[str], cache: dict | None = None
+                                  allowed: list[list[str]],
+                                  cache: dict | None = None
                                   ) -> tuple[str, dict[str, dict]]:
     """Every worker command a met verdict of `raw` (unscreened judge
     samples) rests on alone — `_uncited_worker_commands` — re-run once on
-    staging's HEAD (`_rerun_worker_command`). Returns the record with an
-    orchestrator entry per worker entry whose command passed there (so a
-    quote of that entry verifies as the orchestrator's own measurement of
-    HEAD, `record_ok`), and each command's re-run."""
+    staging's HEAD (`_rerun_worker_command`). Returns the record with the
+    orchestrator's own entry for each re-run that passed — its argv, HEAD,
+    exit code and its own captured output, in the text the judge reads and
+    the output in `measured` (so a quote verifies only when the re-run
+    itself printed it) — and each command's re-run, keyed by the worker's
+    command."""
     cmds: list[str] = []
     for smp in raw:
         for v in smp.get("verdicts") or []:
@@ -42930,18 +43133,29 @@ async def _rerun_record_citations(st: "State", caps: dict, staging: Path,
     head = await _branch_head_sha(str(staging)) or ""
     if not head:
         return record, {}
-    runs = {c: await _rerun_worker_command(st, caps, staging, c, verbs, head)
+    runs = {c: await _rerun_worker_command(st, caps, staging, c, allowed,
+                                           head)
             for c in cmds}
-    extra = [f"[orchestrator re-run on the committed tree {head[:12]}] "
-             f"passed — the worker entry it re-ran: "
-             + " ".join(text.split())
-             for text, c in getattr(record, "workers", ()) or ()
-             if (runs.get(c) or {}).get("verdict") == "passed"]
-    if not extra:
+    lines: list[str] = []
+    measured: list[str] = []
+    for r in runs.values():
+        if r.get("verdict") != "passed" or not r.get("argv"):
+            continue
+        out = " | ".join(x.strip() for x in str(r.get("output") or "")
+                         .splitlines() if x.strip())
+        if out in measured:
+            continue
+        measured.append(out)
+        lines.append(f"[orchestrator re-run on the committed tree "
+                     f"{str(r.get('head'))[:12]}] $ "
+                     f"{shlex.join(r['argv'])[:200]} — exit {r.get('rc')}"
+                     f"\n    output tail: " + (out or "(no output)"))
+    if not lines:
         return record, runs
-    own = "\n".join(x for x in (getattr(record, "own", ""), *extra) if x)
-    return (_ExecutedRecord(str(record) + "\n" + "\n".join(extra), own,
-                            getattr(record, "workers", ())), runs)
+    return (_ExecutedRecord(
+        str(record) + "\n" + "\n".join(lines), getattr(record, "own", ""),
+        getattr(record, "workers", ()),
+        (*(getattr(record, "measured", ()) or ()), *measured)), runs)
 
 
 def _mark_unrunnable(sample: dict, raw: dict, tree: str | Path,
@@ -43615,15 +43829,12 @@ async def _delivery_judge_unmet(
     # that command on the committed tree, and its own pass verifies the
     # citation; one it cannot run routes the item to a human (review round
     # 12 L3).
-    try:
-        verbs = set(_blt_verbs(st.repo_root)) | _repro_verbs(
-            (ground_truth or {}).get("repro_command"))
-    except Exception:
-        verbs = set()
+    allowed = _rerun_allowed_argvs(
+        st.repo_root, (ground_truth or {}).get("repro_command"))
     exec_digest, reruns = await _rerun_record_citations(
         st, caps, staging, exec_digest,
         [raw_of[id(s)] for samples in per_pack for s in samples],
-        verbs, cite_cache)
+        allowed, cite_cache)
     if reruns:
         per_pack = [[_mark_unrunnable(
             _delivery_screen_sample(raw_of[id(s)], staging, exec_digest,

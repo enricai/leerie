@@ -6866,7 +6866,8 @@ final-tree build/lint/test axes it measured, the test IDs B* confirmed
 newly failing, and each held-out acceptance set's final verdict
 (`_orchestrator_results_digest`), so an execution-shaped item is not
 called unmet merely because the run that settled it was leerie's own.
-Only those lines can verify a `met`: a worker's runs happened in a
+Only those lines, and the output of a worker command the orchestrator
+re-ran itself on the committed tree (below), can verify a `met`: a worker's runs happened in a
 worker's working tree — the final conformer's and a re-drive
 implementer's in staging, beside files that may not ship — so a cite of
 one is shown to the judge and kept as a falsifier lead, but verifies
@@ -6882,17 +6883,47 @@ round 12 L3). So the orchestrator makes the measurement itself: a
 worker command that a met verdict rests on alone is re-run once on the
 committed tree — in a disposable checkout of staging's HEAD, exec'd as
 one argv through the single forbidden-command gate, contained, a failure
-re-checked under B\* (the settle-by-execution machinery) — and when it
-passes, an orchestrator entry for that run joins the record's own store,
-so the citation verifies as the orchestrator's measurement of HEAD. Only
-a command a shell would read as exactly one argv qualifies — no operator,
-redirection, substitution, expansion, glob or environment/directory
-prefix, led by a verb that admitted it to the record — since what runs
-must be what is checked. A command that fails there leaves the vote
-unmet, honestly. A command leerie cannot run (the task forbids it, or it
-is not such an argv) cannot be measured by anyone in the loop, so an
-item held back by nothing else goes to "Needs human verification" with
-the command and the reason, never to a re-drive.
+re-checked under B\* (the settle-by-execution machinery). The record
+then gains the orchestrator's own entry for that run: its argv, HEAD,
+exit code and the output *it* captured — never the worker's text — and a
+quote verifies only when that output contains it. The worker's entry
+only pointed at which command to run; what verifies is what the
+orchestrator saw (review round 13 H1: the entry had carried the worker's
+result tail into the store, so whatever a worker's run printed verified
+once a command of that spelling exited 0 on HEAD).
+
+What may run is the repository's own command, never a worker's code. A
+command qualifies only when it begins, verbatim, with the repository's
+configured or inferred build, lint or test command, or with the audit's
+typed repro command — each itself one plain argv — and every further word
+is an option from that runner's own option tables (the forbidden-command
+matcher's) with a value that leaves the checkout nowhere, or a
+repo-relative path that exists in the commit: no absolute path, no `..`,
+no code-evaluating flag (`-c`, `-e`, `--eval`, `-p`, …). Round 13 drove
+it: the earlier rule admitted any argv led by a verb on the record, and
+those verbs are interpreters — `python3 -c <worker code>` ran in the
+orchestrator, and so did a worker's script outside the checkout. A
+compound command (`pnpm run test 2>&1 | tail -30`) is re-run as its
+leading simple command only when that is exactly an allowed argv. That
+is narrow, and measured so: of the 252 distinct worker commands the two
+bench replays' logs put on the record, none is one plain argv, and at
+most one has a leading command that is exactly a build/lint/test argv
+(`npx tsc --noEmit 2>&1 | tail -3; …`, and only if `npx tsc --noEmit` is
+the configured lint command; the replays' final lint axis was empty, which
+makes it none); workers write `pnpm test <file>`,
+not the configured `pnpm run test`, and chain `cd`, `mkdir` and
+heredocs. Most worker-only mets therefore go to a human, which is the
+honest outcome when the orchestrator cannot measure the claim itself.
+
+Re-runs are bounded: at most `record_reruns_max` per run, each one's
+wall time charged to the run's re-drive budget, and a command past
+either is treated as one leerie cannot run (round 13 L3: each re-run is a
+checkout, an install and a full timeout, and up to forty cited entries
+were re-run with no bound). A command that fails on HEAD leaves the vote
+unmet, honestly. A command leerie cannot run (the task forbids it, it is
+not such an argv, or the bound is spent) cannot be measured by anyone in
+the loop, so an item held back by nothing else goes to "Needs human
+verification" with the command and the reason, never to a re-drive.
 
 **Delivery detection: a cited judge, or a falsifier that proves it
 by execution.** A read-only judge misses the defects that only
@@ -7249,13 +7280,16 @@ reads a commit:
   disposable checkouts of the commit, never in staging;
 - a `RECORD` cite verifies only against the orchestrator's own lines of
   the executed-commands record — the final-tree build/lint/test axes,
-  the B\* diff, the held-out sets' final verdicts — and those are in it
-  only while they describe staging's HEAD: the axes and the B\* diff
+  the B\* diff, the held-out sets' final verdicts, and the output the
+  orchestrator captured re-running a worker command on HEAD (§8
+  *Execution-shaped items*) — and those are in it only while they
+  describe staging's HEAD: the axes and the B\* diff
   carry the committed tree they measured (none when the measurement saw
   a worker's uncommitted file, §8 above), the held-out sets their commit.
   The orchestrator's entries are kept apart from the text the judge reads,
   and a cite is checked against that separate store, never against a
-  tag in the text: a worker's entry cannot become one by its contents.
+  tag in the text: a worker's entry cannot become one by its contents,
+  and a re-run adds only what the orchestrator itself ran and printed.
   A quote found only in a worker's entry is `record_worker`: supporting
   evidence the judge sees, never a verified citation.
 
@@ -7276,8 +7310,9 @@ heredoc whose first segment was a test command (`pytest -q; cat <<'EOF'`
 followed by a forged `[orchestrator final-tree tests] … passed` line)
 started an entry of its own, and a cite of the forged line bought `met`.
 A text tag is forgeable by whoever writes the text; the store the cite
-check reads is now built only from the orchestrator's typed state, and a
-worker's command is joined onto one line besides.
+check reads is now built only from the orchestrator's typed state and its
+own captured re-run output, and a worker's command is joined onto one
+line besides.
 
 The judges no longer see staging-only content at all. The one staging
 read that is a measurement, the re-drive ratchet's
