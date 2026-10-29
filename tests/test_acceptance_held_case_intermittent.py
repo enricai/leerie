@@ -646,3 +646,42 @@ def test_a_vote_file_seen_failing_only_by_a_timeout_is_unsettled_not_failing(
     assert res["budget_short_unsettled_files"] == [REL]
     assert leerie._acceptance_any_fails([res]) is False
     assert _outcome(leerie, st, [s_], res) == "done"
+
+
+def test_a_timeout_only_vote_file_is_named_in_the_pr(leerie, tmp_path,
+                                                     monkeypatch):
+    """Review round 7, M3, driven (`held_out_unsettled_pr_silent.patch`):
+    after the round-6 fix above, the same file, every rerun cut, left its
+    set unmeasured, the run `done`, and the PR's end-state section empty —
+    the file named nowhere. The outcome stays `done` (DESIGN §8 *A
+    held-out set the final tree leaves unmeasured is never silent*), and
+    the PR lists the set, the file and the timeout under "Needs human
+    verification"."""
+    st = leerie.State(tmp_path / "state", "r")
+    st.data = {"task": "t", "categories": ["bug-fixing"]}
+    s_, wt = _vote_set(tmp_path)
+
+    async def run(st_, caps_, tree, rel, log_path, label, *, cases_out=None,
+                  **_kw):
+        if rel == CONTROL:
+            return True
+        if "-confirm" in label:
+            await asyncio.sleep(caps_["worker_timeout_sec"] + 0.05)
+        # What `_run_acceptance_file` records for a timeout.
+        cases_out.update(resource=True, timed_out=True)
+        return False
+    monkeypatch.setattr(leerie, "_run_acceptance_file", run)
+    (res,) = asyncio.run(leerie._acceptance_run_placed(
+        st, _caps(leerie, confirm_pairs=1, confirm_pairs_escalated=1,
+                  confirm_budget_sec=0.3, acceptance_intermittent_repeats=0),
+        wt, [s_], "t"))
+    assert res["unmeasured"] is True
+    assert res["unmeasured_files"] == {REL: "timed_out"}
+    assert _outcome(leerie, st, [s_], res) == "done"
+    body = leerie._format_pr_end_state_section(st.data)
+    nhv = body.split("## Needs human verification", 1)[1]
+    line = next(x for x in nhv.splitlines() if "held-out set 1" in x)
+    assert f"`{REL}` timed out on its first run" in line
+    assert "made hang" in line
+    assert nhv.index("**Held-out acceptance sets the run could not "
+                     "measure**") < nhv.index(line)

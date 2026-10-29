@@ -5483,6 +5483,21 @@ timed out and whose every rerun the budget cut is unsettled and the set
 unmeasured, not failing; the assertion-failing control beside it stays
 failing under the same cut.
 
+`tests/test_acceptance_unmeasured_pr.py` (review round 7 M3, driven and
+fixed; DESIGN §8 *A held-out set the final tree leaves unmeasured is never
+silent*): every cause an evaluation can end a held-out set unmeasured —
+a first-run timeout / signal death with every rerun cut, no rerun verdict,
+reruns that disagree, no runner verdict, a path already in the tree,
+placement, commit, worktree, dependency install and evaluation failures —
+records its code on the result and reaches the PR under "Needs human
+verification" with the outcome still `done`; so do valid sets with no
+final verdict and a re-measure of the shipping commit that measured
+nothing (`final_unremeasured`). Broken and variant sets are not listed; a
+measured set records no code. A derivation guard checks the
+`ACCEPTANCE_UNMEASURED_WHY` vocabulary both ways, and a real hanging
+pytest file pins `timed_out`. The reviewer's driver itself is
+`tests/test_acceptance_held_case_intermittent.py::test_a_timeout_only_vote_file_is_named_in_the_pr`.
+
 `tests/test_redrive_budget.py` drives `phase_execute` (DESIGN §13 *One
 re-drive budget per subtask*): a blocked subtask is re-driven with its
 blocker as the note and at most `subtask_redrive_rounds` times, then settled

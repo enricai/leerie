@@ -2814,8 +2814,10 @@ present only when it has an entry:
   typed `external`, subtasks accepted on an `external_precondition`
   blocker (§13), risks a worker typed `gap: unverified_external` (a
   concurrency risk whose tests can only stub the interleaving is labelled
-  so — `simulated_interleaving`), and audited fix sites resolved by an
-  untyped (`other`) change (§5 *Every `fix` site is claimed*).
+  so — `simulated_interleaving`), audited fix sites resolved by an
+  untyped (`other`) change (§5 *Every `fix` site is claimed*), and
+  held-out acceptance sets the final tree left unmeasured, with why (§8
+  *A held-out set the final tree leaves unmeasured is never silent*).
 - `## Untested after re-drive` — changed lines that no test executes after
   the coverage re-drive spent its rounds (§9 *Changed lines no test
   executes are re-driven*). Listed, never a reason to draft.
@@ -7770,6 +7772,47 @@ and a set whose only failures were resource-affected and touched no held
 case is no evidence either way — so a load flake never forces a repair
 round, nor a residual.
 
+**A held-out set the final tree leaves unmeasured is never silent.** The
+sets exist to show the task's own scenario works; one that ends with no
+verdict on the tree that ships is verification the run did not finish.
+It does not make the run `unconverged` — no evidence is not a failure,
+and the last measured failing verdict, when there is one, already counts
+as the residual — but it is always listed under the PR's "Needs human
+verification", one line per set naming its files and why each could not
+be measured, from a fixed vocabulary the evaluation records on the set's
+result (`unmeasured_reason` for the whole set, `unmeasured_files` per
+file): the evaluation could not be set up, the commit or the worktree
+could not be made, the dependency install failed, the files could not be
+placed, a file's path is already used by the tree, the runner gave no
+verdict, a file timed out (or was killed by a signal) on its first run
+and the budget cut every rerun, no rerun produced a verdict, or the
+reruns disagreed. Two whole-gate shapes are listed the same way: valid
+sets with no final verdict at all (the gate raised or never ran), and a
+final verdict of an earlier commit because re-measuring the commit that
+ships measured nothing. A set typed broken, and a variant set of a
+report-pointer task (no counted case), are left out: neither could be
+work. Measured (review round 7, M3): a vote file that only timed out,
+every rerun cut, left its set unmeasured — the run `done` and the PR's
+end-state section empty, the file named nowhere.
+
+*A timeout is not read as failing, even on a file that ran to a verdict
+at the own start* (every valid set file did, by construction). A
+deterministic hang the change introduced looks exactly like this, and
+that reading would end fewer such runs `done`; it is rejected because the
+evidence cannot tell the hang from load. The first run's timeout is one
+observation, recorded the same way as a signal death — the out-of-memory
+kill that is the commonest load signature. A rerun the budget cut is a
+second non-finish only if it was given time the file needed, and the own
+start's duration is not recorded, so a cut after two seconds of a shared
+budget would count the same as one after thirty minutes; any threshold
+would be an unbenched constant. And round 6 measured the failing reading
+directly: a file confirmed failing on a timeout alone sends repair
+rounds at a failure with no case to name and ends the run `unconverged`.
+This is the same trade §9 *Which failures are new* (step 4) makes for a
+base-paired candidate too slow for one pair: unsettled, `done`, named for
+a human. What this rule adds is that the human always sees it, with a
+timeout called out as the hang it may be.
+
 **A held case that fails again is a failure, not a flake.** A set's
 *held* cases are the defect cases validation saw fail at the run's own
 start (`base_failing_cases`; in a set the scope judge bounded, only its
@@ -10144,8 +10187,9 @@ failure new / does this set still fail" verdict uses:
      with none finished. The exception is a vote file whose first run was
      a timeout or a signal death — a resource signature, not an assertion:
      with no finished rerun it is `budget_short_unsettled`, and the set is
-     unmeasured unless another of its files fails (§8 *Held-out acceptance
-     tests*). The integration gate's head confirm with no home parent has
+     unmeasured unless another of its files fails, listed under "Needs
+     human verification" (§8 *A held-out set the final tree leaves
+     unmeasured is never silent*). The integration gate's head confirm with no home parent has
      no base side either, but it is base-paired in kind (a merged-tree
      failure seen once) and needs a finished rerun the same way.
    - The integration gate's overlay confirm (§6), which decides whether a

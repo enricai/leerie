@@ -3646,7 +3646,10 @@ def test_run_acceptance_file_marks_a_timeout_as_a_resource_run(
     assert asyncio.run(leerie._run_acceptance_file(
         st, _caps(leerie, 5), str(repo), "acc/test_x.py",
         st.run_dir / "logs" / "x.log", "t", cases_out=obs)) is False
-    assert obs == {"resource": True}
+    # `timed_out` tells a timeout from a signal death for the PR's line on
+    # an unmeasured set (DESIGN §8 *A held-out set the final tree leaves
+    # unmeasured is never silent*).
+    assert obs == {"resource": True, "timed_out": True}
     assert leerie._acceptance_run_case_evidence(obs) is None
 
 

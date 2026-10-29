@@ -6378,6 +6378,8 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             add(_pr_entry(e.get("resource")) or "Unnamed resource",
                 f"- [ ] **{e['subtask']}** was not done, waiting on it: "
                 f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
+    for line in _acceptance_unmeasured_lines(state):
+        add("Held-out acceptance sets the run could not measure", line)
     for row in _intermittent_regression_rows(state):
         add("Intermittent failures the run may have introduced",
             f"- [ ] {_pr_code(row['id'])} failed {row.get('final_failed')} "
@@ -44789,6 +44791,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             # names no case evidence (DESIGN §8 *Delivery re-drive* rule 4).
             if cases_out is not None:
                 cases_out["resource"] = True
+                cases_out["timed_out"] = True
             return False
         except Exception:
             return None
@@ -44801,6 +44804,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             if got is None and _rc_is_resource_signal(rc):
                 # Killed (an OOM kill, a signal) before writing a report.
                 cases_out["resource"] = True
+                cases_out["killed"] = True
             if (got is not None and not got["collection_error"]
                     and got["executed"]):
                 cases_out["failing_cases"] = sorted(
@@ -45362,7 +45366,8 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
         log(f"  acceptance: evaluation failed ({type(e).__name__}: {e}) — "
             "no evidence either way")
         return [{"index": s_["index"], "passed": False, "unmeasured": True,
-                 "failing_files": []} for s_ in sets]
+                 "failing_files": [], "unmeasured_reason": "evaluation_failed"}
+                for s_ in sets]
 
 
 async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
@@ -45392,19 +45397,20 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
         # not survive the tree it describes.
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
-    unmeasured_all = [{"index": s_["index"], "passed": False,
-                       "unmeasured": True, "failing_files": []}
-                      for s_ in sets]
+    def unmeasured_all(why: str) -> list[dict]:
+        return [{"index": s_["index"], "passed": False, "unmeasured": True,
+                 "failing_files": [], "unmeasured_reason": why}
+                for s_ in sets]
     head = subprocess.run(["git", "-C", tree, "rev-parse", rev],
                           capture_output=True, text=True, check=False)
     if head.returncode != 0:
-        return unmeasured_all
+        return unmeasured_all("no_commit")
     _teardown()                     # what a crashed evaluation left
     add = await _worktree_add_detached_async(st, wt, head.stdout.strip())
     if add.returncode != 0:
         log(f"  acceptance: could not create the evaluation worktree: "
             f"{add.stderr.strip()[:200]} — no evidence either way")
-        return unmeasured_all
+        return unmeasured_all("worktree_failed")
     results = []
     try:
         if not await _ensure_worktree_deps(
@@ -45415,7 +45421,7 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
             # exit-code verdict cannot tell from the fix failing.
             log("  acceptance: dependency install failed in the evaluation "
                 "worktree — no evidence either way")
-            return unmeasured_all
+            return unmeasured_all("deps_failed")
         url = await _create_test_db(st, wt, f"acceptance-eval-{label}")
         try:
             results = await _acceptance_run_placed(
@@ -45453,7 +45459,13 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         resource_affected: list[str] = []
         budget_short: list[str] = []
         unsettled_files: list[str] = []
+        no_verdict_files: list[str] = []
         unmeasured = False
+        # Why each file gave no verdict, and a whole-set cause: what the PR
+        # names for an unmeasured set (DESIGN §8 *A held-out set the final
+        # tree leaves unmeasured is never silent*).
+        why_files: dict[str, str] = {}
+        why_set: str | None = None
         case_ids: dict[str, list[str]] = {}
         # Every failing run of each file, the first and each vote rerun:
         # its cases come from all of them (`_acceptance_vote_cases`).
@@ -45486,6 +45498,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                     # tree already has — and never count the set as
                     # passing on a file it could not run.
                     unmeasured = True
+                    why_files[rel] = "path_in_use"
                     continue
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(Path(s_["dir"]) / rel, dst)
@@ -45500,6 +45513,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                     **_env_kw(env_extra))
                 if verdict is None:
                     unmeasured = True
+                    why_files[rel] = "no_runner_verdict"
                 elif verdict is False:
                     failing.append(rel)
                     runs.setdefault(rel, []).append(obs)
@@ -45552,6 +45566,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 budget_short = list(verdict_.get("budget_short") or [])
                 unsettled_files = list(
                     verdict_.get("budget_short_unsettled") or [])
+                no_verdict_files = list(verdict_.get("no_verdict") or [])
                 # No verdict is no evidence either way, like mixed
                 # evidence: the set is unmeasured unless it also fails.
                 resource_affected = list(
@@ -45597,6 +45612,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
             log(f"  acceptance: set {s_['index']} could not be placed "
                 f"({type(e).__name__}) — no evidence from it")
             unmeasured = True
+            why_set = "placement_failed"
         finally:
             # Sets are isolated from one another: one set's files are
             # gone before the next set's go in.
@@ -45609,6 +45625,20 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 "failing_files": failing}
         if resource_affected:
             res_["resource_affected_files"] = resource_affected
+        if res_["unmeasured"]:
+            for rel in resource_affected:
+                first = (runs.get(rel) or [{}])[0]
+                why_files.setdefault(rel, (
+                    ("timed_out" if first.get("timed_out") else
+                     "killed" if first.get("killed") else
+                     "resource_first_run") if rel in unsettled_files
+                    else "no_verdict" if rel in no_verdict_files
+                    else "resource_affected"))
+            if why_set:
+                res_["unmeasured_reason"] = why_set
+            if why_files:
+                res_["unmeasured_files"] = {r: why_files[r] for r in sorted(
+                    why_files)}
         if any(r in failing for r in budget_short):
             # Failing on the reruns the budget allowed: said so, never
             # dropped (DESIGN §8 *Held-out acceptance tests*).
@@ -45819,6 +45849,100 @@ def _acceptance_discovery_stopped_short(d: dict) -> bool:
     true, reason: "repeats_disabled"` for it."""
     return (d.get("incomplete") is True and not d.get("disabled")
             and d.get("repeats_required") != 0)
+
+
+# Why a held-out set, or one of its files, gave no verdict: the codes an
+# unmeasured result records (`unmeasured_reason` for the whole set,
+# `unmeasured_files` per file) and the words the PR names them with (DESIGN
+# §8 *A held-out set the final tree leaves unmeasured is never silent*).
+ACCEPTANCE_UNMEASURED_WHY: dict[str, str] = {
+    "evaluation_failed": "the evaluation could not be set up or run",
+    "no_commit": "the commit to measure could not be resolved",
+    "worktree_failed": "the evaluation worktree could not be created",
+    "deps_failed": "the dependency install failed in the evaluation worktree",
+    "placement_failed": "its files could not be placed in the evaluation "
+                        "worktree",
+    "path_in_use": "not run: the tree already has a file at that path",
+    "no_runner_verdict": "the runner gave no verdict (no command, it could "
+                         "not start, or the task forbids it)",
+    "timed_out": "timed out on its first run and confirm_budget_sec cut "
+                 "every rerun — a test the change made hang looks exactly "
+                 "like this",
+    "killed": "was killed by a signal on its first run, with no report, "
+              "and confirm_budget_sec cut every rerun",
+    "resource_first_run": "timed out or was killed by a signal on its first "
+                          "run, and confirm_budget_sec cut every rerun",
+    "no_verdict": "failed its first run, and no rerun produced a verdict",
+    "resource_affected": "the reruns disagreed (a load flake or an "
+                         "intermittent failure)",
+}
+
+
+def _acceptance_unmeasured_lines(state: dict) -> list[str]:
+    """The "Needs human verification" lines for the held-out sets the final
+    tree left unmeasured (DESIGN §8 *A held-out set the final tree leaves
+    unmeasured is never silent*): one per unmeasured `gate.final` result,
+    naming its files and why each gave no verdict; one when valid sets have
+    no final verdict at all; one when the final verdict is of an earlier
+    commit because re-measuring the shipping one measured nothing. A set
+    typed broken, or a variant set (bounded, no counted file), is never
+    work and is skipped. Pure; malformed shapes give no line."""
+    acc = state.get("acceptance") if isinstance(state, dict) else None
+    if not isinstance(acc, dict) or acc.get("skipped"):
+        return []
+    sets = {s_.get("index"): s_ for s_ in acc.get("sets") or []
+            if isinstance(s_, dict) and s_.get("valid", True) is not False}
+
+    def counts(set_: dict) -> bool:
+        return (not _acceptance_set_broken(set_)
+                and _acceptance_counted_files(set_) != set())
+
+    def files(set_: dict) -> list[str]:
+        return [f for f in (set_.get("defect_files") or [])
+                + (set_.get("control_files") or []) if isinstance(f, str)]
+
+    gate = acc.get("gate") if isinstance(acc.get("gate"), dict) else {}
+    final = gate.get("final")
+    out: list[str] = []
+    if not isinstance(final, list):
+        idx = [k for k, s_ in sets.items() if counts(s_)]
+        if idx:
+            out.append(
+                "- [ ] held-out set(s) "
+                + ", ".join(_pr_entry(str(k)) for k in idx)
+                + ": no verdict on the final tree — the acceptance gate "
+                "stopped or did not run; run "
+                + ", ".join(_pr_code(f) for k in idx for f in files(sets[k]))
+                + " by hand")
+        return out
+    for r in final:
+        if not isinstance(r, dict) or r.get("unmeasured") is not True:
+            continue
+        set_ = sets.get(r.get("index")) or {}
+        if not counts(set_):
+            continue
+        why = ACCEPTANCE_UNMEASURED_WHY
+        per = r.get("unmeasured_files")
+        per = per if isinstance(per, dict) else {}
+        parts = []
+        if r.get("unmeasured_reason") in why:
+            parts.append(why[r["unmeasured_reason"]])
+        parts += [f"{_pr_code(f)} {why[c]}" for f, c in per.items()
+                  if c in why]
+        shown = files(set_)
+        out.append(f"- [ ] held-out set {_pr_entry(str(r.get('index')))}"
+                   + _pr_paths(shown) + ": no verdict on the final tree — "
+                   + ("; ".join(parts) or "no verdict recorded")
+                   + ". Run it by hand before merging.")
+    stale = gate.get("final_unremeasured")
+    if isinstance(stale, dict) and isinstance(stale.get("sha"), str):
+        out.append(
+            "- [ ] held-out sets: re-measuring them on the final commit "
+            f"{_pr_code(stale['sha'][:12])} gave no verdict, so the verdict "
+            "recorded is of "
+            + _pr_code(str(gate.get("final_sha") or "an earlier commit")[:12])
+            + ". Run them by hand before merging.")
+    return out
 
 
 def _budget_caps(caps: dict, left: float) -> dict:
@@ -46886,10 +47010,18 @@ async def _acceptance_remeasure_final(st: "State", caps: dict, staging: str,
     acceptance tests*)."""
     res = await _evaluate_acceptance_sets(st, caps, staging, sets, label,
                                           rev=sha)
-    if not _acceptance_measured(res):
-        return False
     acc = st.data.get("acceptance") or {}
     g = dict(acc.get("gate") or {})
+    if not _acceptance_measured(res):
+        # `final` now describes another commit than the one that ships: the
+        # PR must say so (DESIGN §8 *A held-out set the final tree leaves
+        # unmeasured is never silent*).
+        g["final_unremeasured"] = {"sha": sha, "label": label}
+        acc["gate"] = g
+        st.data["acceptance"] = acc
+        st.save()
+        return False
+    g.pop("final_unremeasured", None)
     g["final"] = res
     g["final_sha"] = sha
     keep_rb = (g.get("residual") or {}).get("rollback_failed")
@@ -47344,6 +47476,7 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 " — verdicts kept as measured")
         gate["audited"] = True
     gate["final"] = final
+    gate.pop("final_unremeasured", None)
     # The commit `final` describes: the delivery re-drive reuses the verdict
     # only while staging's HEAD is still that commit.
     gate["final_sha"] = await _branch_head_sha(str(staging))
