@@ -7219,7 +7219,20 @@ reads staging, resets a staging that survived (`git reset --hard HEAD`,
 which also ends a merge in progress, then `git clean -fd`, which keeps
 ignored files and so the installed dependencies). Nothing uncommitted in
 it is anything leerie may keep: I1 never commits a worker's leftovers,
-and the run branch — every integrated commit — is untouched. A killed
+and the run branch — every integrated commit — is untouched. The same
+holds for every subtask worktree the process will reuse: a SIGKILL leaves
+each as its implementer or conformer stopped, and `new-worktree.sh`
+reattaches to a registered worktree as it is, so a resumed subtask's
+first measurement, or its next worker, would start on the killed
+worker's half-made edits (a measurement through I2 leaves them; the next
+worker's I1 gate holds it to files it never made). `setup-run.sh` resets
+each worktree of this run on a `leerie/subtasks/<run-id>/` branch the
+same way, before any wave runs, and keeps its commits — exactly what a
+Ctrl-C's cleanup, which removes the worktree and keeps the branch, leaves
+the resume. This runs once per process; within a process the per-attempt
+rules govern a subtask's worktree (I1 on a `complete` result; a handoff
+commits its partial work and leaves its checkpoint in the run
+directory). A killed
 integrator's half resolution goes with it, as it already did under a
 Ctrl-C's cleanup. Continuing would mean
 measuring, judging or shipping a tree leerie cannot name — the very guess

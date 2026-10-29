@@ -159,5 +159,18 @@ else
   git -C "${STAGING_WT}" clean -fdq
 fi
 
+# The same for every subtask worktree of this run that survived its process
+# (new-worktree.sh reattaches to a registered worktree as it is): back to its
+# branch tip, commits kept, ignored files kept — what a Ctrl-C's cleanup,
+# which removes the worktree and keeps the branch, leaves the resume. Matched
+# by branch, so other runs' worktrees and detached helpers are untouched.
+while IFS= read -r subtask_wt; do
+  [ -n "$subtask_wt" ] && [ -d "$subtask_wt" ] || continue
+  git -C "$subtask_wt" reset -q --hard HEAD
+  git -C "$subtask_wt" clean -fdq
+done < <(git worktree list --porcelain | awk -v pre="branch refs/heads/leerie/subtasks/${RUN_ID}/" '
+  /^worktree / { wt = substr($0, 10) }
+  index($0, pre) == 1 { print wt }')
+
 echo "working-branch: ${WORKING_BRANCH}"
 echo "staging-worktree: $(cd "${STAGING_WT}" && pwd)"

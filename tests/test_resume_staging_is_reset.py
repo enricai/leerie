@@ -97,3 +97,44 @@ def test_a_fresh_run_and_a_clean_resume_are_untouched(tmp_path,
     _setup(repo)
     assert _git(staging, "rev-parse", "HEAD") == tip
     assert _git(staging, "status", "--porcelain") == ""
+
+
+def _subtask_worktree(repo: Path, sid: str, run_id: str = RUN_ID) -> Path:
+    out = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "new-worktree.sh"), sid, run_id],
+        cwd=repo, capture_output=True, text=True, check=True)
+    return Path(out.stdout.strip().splitlines()[-1])
+
+
+def test_subtask_worktrees_a_sigkill_left_dirty_are_reset_on_resume(
+        tmp_path, monkeypatch):
+    """The same invariant for every subtask worktree the resume reuses:
+    `new-worktree.sh` reattaches to a registered worktree as it is, so the
+    killed implementer's half-made edits met the resumed subtask's first
+    measurement and its next worker. Commits and ignored files stay; a
+    worktree of another run is not touched."""
+    repo, _staging = _repo(tmp_path, monkeypatch)
+    wt = _subtask_worktree(repo, "feat-001")
+    (wt / "done.py").write_text("x = 1\n")
+    _git(wt, "add", "done.py")
+    _git(wt, "commit", "-q", "-m", "committed half")
+    tip = _git(wt, "rev-parse", "HEAD")
+    (wt / "node_modules").mkdir()
+    (wt / "node_modules" / "dep.js").write_text("dep\n")
+    (wt / "f.txt").write_text("half done\n")              # killed mid-edit
+    (wt / "scratch.py").write_text("y = 2\n")
+    other_run = "20261029-other-run"
+    subprocess.run(["bash", str(REPO_ROOT / "scripts" / "setup-run.sh"),
+                    other_run, "main"], cwd=repo, check=True,
+                   capture_output=True)
+    other = _subtask_worktree(repo, "feat-001", other_run)
+    (other / "f.txt").write_text("another run's live edit\n")
+    _setup(repo)                                       # the resume's setup
+    assert _git(wt, "status", "--porcelain", "--untracked-files=all") == ""
+    assert _git(wt, "rev-parse", "HEAD") == tip        # commits kept
+    assert (wt / "done.py").is_file()
+    assert (wt / "node_modules" / "dep.js").is_file()  # ignored: kept
+    assert (other / "f.txt").read_text() == "another run's live edit\n"
+    # new-worktree.sh then reattaches to the clean worktree.
+    assert _subtask_worktree(repo, "feat-001") == wt
+    assert _git(wt, "status", "--porcelain", "--untracked-files=all") == ""
