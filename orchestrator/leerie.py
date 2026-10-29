@@ -38191,6 +38191,28 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                             "phase surfaced as advisory")
             break
 
+        # Overwrite the worker's self-reported axes as soon as there is a dict
+        # to overwrite — BEFORE the gates below, every one of which can `break`
+        # out of the round. Without this the malformed-result, protected-path
+        # and clobber exits carry the conformer's *claims* about build/lint/
+        # tests into `_summarize_residuals`, into the persisted `conformance`
+        # entry, and (under --strict-conformer) into the post-loop
+        # `_conformance_clean` — which would be gating on a self-report, the
+        # exact thing this phase stopped doing. The I1 clean-tree gate is
+        # one of those exits, so the overwrite precedes it too.
+        #
+        # `pre` rather than a fresh measurement, and that is the accurate
+        # choice on the paths that matter: the protected-path and clobber
+        # exits both roll the worktree back toward its pre-round state, so the
+        # pre-round measurement describes the tree those paths leave behind
+        # (the I1 rollback restores the round's start exactly).
+        # The tail re-applies `post` for rounds that run to completion.
+        #
+        # Safe before validation: `_validate_conformance_result` inspects
+        # `rules_files_read`, `rule_violations_*` and the update paths, never
+        # the axes, so nothing here can launder a schema defect past it.
+        last_res = _apply_measured_axes(last_res, pre)
+
         # I1 (DESIGN §8 *A worker leaves its tree clean*): before anything
         # of leerie's runs here again. Still dirty after the re-asks, the
         # round is rolled back to its start — its commits and its untracked
@@ -38212,29 +38234,8 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                             + _unclean_reason("the conformer", unclean))
             _record_unclean_tree(st, "conformer", f"{sid} round {c_round}",
                                  unclean)
-            last_res = _apply_measured_axes(last_res, pre)
             last_res["conformer_repair_rolled_back"] = True
             break
-
-        # Overwrite the worker's self-reported axes as soon as there is a dict
-        # to overwrite — BEFORE the gates below, every one of which can `break`
-        # out of the round. Without this the malformed-result, protected-path
-        # and clobber exits carry the conformer's *claims* about build/lint/
-        # tests into `_summarize_residuals`, into the persisted `conformance`
-        # entry, and (under --strict-conformer) into the post-loop
-        # `_conformance_clean` — which would be gating on a self-report, the
-        # exact thing this phase stopped doing.
-        #
-        # `pre` rather than a fresh measurement, and that is the accurate
-        # choice on the paths that matter: the protected-path and clobber
-        # exits both roll the worktree back toward its pre-round state, so the
-        # pre-round measurement describes the tree those paths leave behind.
-        # The tail re-applies `post` for rounds that run to completion.
-        #
-        # Safe before validation: `_validate_conformance_result` inspects
-        # `rules_files_read`, `rule_violations_*` and the update paths, never
-        # the axes, so nothing here can launder a schema defect past it.
-        last_res = _apply_measured_axes(last_res, pre)
 
         err = _validate_conformance_result(last_res, worktree)
         if err:

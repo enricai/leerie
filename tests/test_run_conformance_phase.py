@@ -970,6 +970,32 @@ def test_strict_clobber_break_still_reports_measured_axes(env):
         "blocking decision")
 
 
+def test_unclean_tree_break_still_reports_measured_axes(env, monkeypatch):
+    """The I1 clean-tree exit is one more `break` out of the round: a
+    conformer that left its tree dirty past the re-asks is rolled back to
+    the round's start, which `pre` describes, so the result it carries out
+    must hold the measured axes, not the worker's claim."""
+    c = env["leerie"]
+
+    def _scribble(wt: Path):
+        (wt / "notes.txt").write_text("scratch\n")
+
+    _stub_run_conformer(c, [_clean_result(tests=dict(_CLAIMED_GREEN))],
+                        commits={0: _scribble})
+    _stub_measure_axes(c, _MEASURED_RED)
+    _reask_stub(c, monkeypatch)
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert any("left its tree unclean" in w for w in warnings), warnings
+    assert res["conformer_repair_rolled_back"] is True
+    assert res["tests"]["passed"] is False, (
+        "the clean-tree break carried the worker's claimed axes out")
+    assert res["tests"]["summary"] == "2 failed"
+
+
 # --- subtask_tests="off": _measure short-circuits with no axes -----------
 
 def test_axes_off_short_circuits_measure(env, monkeypatch):

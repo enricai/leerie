@@ -9606,10 +9606,14 @@ reads them — the loop-continuation predicate, the residual summary, and the
 persisted `conformance` entry all see what was measured, never what was
 claimed; the worker's own report survives only as telemetry. The overwrite
 happens twice per round: once at the tail for the ordinary case, and once
-immediately after the worker returns for the three gates that abandon a
-round early (a malformed result, a protected-path violation, a strict-mode
-clobber) — also the accurate answer there, since two of those three exits
-roll the worktree back toward the state that earlier measurement describes.
+immediately after the worker returns for the gates that abandon a round
+early (a tree the worker left unclean, §8 *A worker leaves its tree clean*;
+a malformed result; a protected-path violation; a strict-mode clobber) —
+also the accurate answer there, since three of those four exits roll the
+worktree back toward the state that earlier measurement describes. It is
+ONE application ahead of every such gate, never one per gate: a gate added
+between the worker's return and the overwrite, carrying its own copy, is
+the shape that lets the next gate added there carry the claim out.
 
 This does *not* fix over-firing conformers (measured, implementers ran the
 full suite zero times and conformers ran it almost exactly once per round
