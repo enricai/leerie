@@ -201,7 +201,11 @@ class TestGate:
         entries = [e for e in st.data["needs_human_verification"]
                    if e["source"] == "test_outcome"]
         assert len(entries) == 1
-        assert entries[0]["detail"].startswith("why it is open, so the run")
+        # Review round 8 L2: the instruction first, so the PR's entry cap
+        # never cuts what to do.
+        assert entries[0]["detail"] == (
+            "Check by hand that no existing test newly fails: why it is "
+            f"open (required by: {NO_REGRESSIONS})")
         groups = leerie._pr_needs_human(st.data, lambda sid: True)
         assert any(NO_REGRESSIONS in line
                    for lines in groups.values() for line in lines)

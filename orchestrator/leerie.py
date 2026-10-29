@@ -39004,23 +39004,24 @@ def _set_confirm_budget_gap(st: "State", site: str, what: list[str], *,
     def shown(xs: list[str]) -> str:
         return ", ".join(str(w) for w in xs[:10]) + (
             f" (+{len(xs) - 10} more)" if len(xs) > 10 else "")
+    # The instruction first and the lists last: the PR caps an entry at
+    # `_PR_ENTRY_MAX`, and a long list must not cut what to do with it.
     parts: list[str] = []
     if what:
         parts.append(
-            f"{site}: could not confirm within the budget: {shown(what)} — "
-            f"failing {where}, but confirm_budget_sec cut their base/final "
-            f"reruns before they settled, so whether {whose} made them fail "
-            "is unknown")
+            f"could not confirm within the budget: {shown(what)} "
+            "(confirm_budget_sec cut their base/final reruns)")
     if sized_out:
         parts.append(
-            f"{site}: not rerun (sized out of the budget): "
-            f"{shown(list(sized_out))} — failing {where}, but too long for "
-            "one base/final rerun pair in what was left of "
-            f"confirm_budget_sec, so whether {whose} made them fail is "
-            "unknown")
+            "not rerun (sized out of the budget): "
+            f"{shown(list(sized_out))} (one base/final pair did not fit "
+            "what was left of confirm_budget_sec)")
     if parts:
-        entries.append({"source": CONFIRM_BUDGET_GAP_SOURCE, "site": site,
-                        "detail": "; ".join(parts) + tail})
+        entries.append({
+            "source": CONFIRM_BUDGET_GAP_SOURCE, "site": site,
+            "detail": (f"{site}: rerun these against the base by hand — "
+                       f"failing {where}, but whether {whose} made them "
+                       "fail is unknown" + tail + ". " + "; ".join(parts))})
     elif tail.strip("; "):
         # Nothing left unsettled but what `tail` names (a kept re-drive
         # group's unchecked items): still listed, never dropped with them.
@@ -39100,9 +39101,9 @@ async def _scoped_test_replacement(tree: str, st: "State", canonical: str,
             "a scoped run of the tests coupled to the run's changes")
 
     def _gap(kind: str, why: str) -> dict:
-        detail = (f"The task forbids `{hit}`, and the orchestrator could not "
-                  f"run its scoped replacement on the final tree: {why}. "
-                  "Check for regressions by hand.")
+        detail = ("Check for regressions by hand: the task forbids "
+                  f"`{hit}`, and the orchestrator could not run its scoped "
+                  f"replacement on the final tree — {why}.")
         log(f"  WARNING {log_prefix}: regression check not run — {why}")
         _set_regression_gap(st, detail)
         return _unmeasured(kind, f"not run: the task forbids `{hit}` and "
@@ -42382,11 +42383,14 @@ def _set_test_outcome_gap(st: "State", items: list[str],
     if items:
         entries.append({
             "source": TEST_OUTCOME_GAP_SOURCE,
-            "detail": ((reason or "no failing-test-ID diff on the final "
-                        "tree")[:600]
-                       + ", so the run could not check that no existing "
-                       "test newly fails, as required by: " + "; ".join(
-                           x[:200] for x in items))})
+            # The instruction first, then the reason (it names the tests to
+            # rerun), the items last: the PR caps an entry at
+            # `_PR_ENTRY_MAX`, and the items are also on their rows.
+            "detail": ("Check by hand that no existing test newly fails: "
+                       + (reason or "no failing-test-ID diff on the final "
+                          "tree")[:600]
+                       + " (required by: "
+                       + "; ".join(x[:200] for x in items) + ")")})
     if entries != (st.data.get("needs_human_verification") or []):
         st.data["needs_human_verification"] = entries
         st.save()
@@ -51191,7 +51195,8 @@ def _set_redrive_unsettled_gap(st: "State", kept: list[dict],
         st, _REDRIVE_UNSETTLED_SITE, sorted(cut), sized_out=sorted(sized),
         where="after a re-drive group that was kept",
         whose="the group",
-        tail=("; required item(s) its ratchet could not check: "
+        tail=("; check by hand the required item(s) its ratchet could "
+              "not check: "
               + "; ".join(named)) if named else "")
 
 
@@ -51961,12 +51966,12 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
     tree_sha = await _committed_tree_sha(str(staging))
     edits = await _tracked_edits(str(staging)) or []
     edits_note = (
-        "failing-test-ID diff: measured on the committed tree that ships; "
-        f"the staging worktree also holds uncommitted edits to {len(edits)} "
-        "tracked file(s) ("
+        "failing-test-ID diff: measured on the committed tree that ships, "
+        "but the staging worktree holds uncommitted edits to "
+        f"{len(edits)} tracked file(s) that do not ship — check whether "
+        "they belong in the change: "
         + ", ".join(ln[3:] for ln in edits[:5])
-        + (f", +{len(edits) - 5} more" if len(edits) > 5 else "")
-        + ") that do not ship — check whether they belong in the change."
+        + (f" (+{len(edits) - 5} more)" if len(edits) > 5 else "")
         if edits else None)
     if diff is None and not cmd:
         _set_final_diff_gap(st, None)
@@ -51977,6 +51982,7 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
     if tree_sha and diff is not None and diff.get("stale_for_tree") == tree_sha:
         return tree_sha
     got = None
+    post: dict | None = None
     why = ""
     if not cmd:
         why = "no test command resolves for the repository"
@@ -52025,11 +52031,19 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
         if stale:
             st.data["test_id_diff"] = {**diff, "stale_for_tree": tree_sha}
             st.save()
-        _set_final_diff_gap(
-            st, "failing-test-ID diff: not measured on the tree that ships "
-                f"— {why}; whether the run made an existing test fail is "
-                "unknown. Run the tests on the PR branch and compare with "
-                "the base.")
+        skip = str(((post or {}).get("tests") or {}).get("skip_kind") or "")
+        if skip.startswith("forbidden_") and any(
+                isinstance(e, dict) and e.get("source") == REGRESSION_GAP_SOURCE
+                for e in st.data.get("needs_human_verification") or []):
+            # The forbidden command's own gap already lists this, with its
+            # instruction: one fact, one line.
+            _set_final_diff_gap(st, None)
+        else:
+            _set_final_diff_gap(
+                st, "failing-test-ID diff: not measured on the tree that "
+                    "ships, so whether the run made an existing test fail "
+                    "is unknown — run the tests on the PR branch and "
+                    f"compare with the base. Why: {why}")
     else:
         _set_final_diff_gap(st, edits_note)
     return tree_sha

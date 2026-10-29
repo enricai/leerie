@@ -94,5 +94,6 @@ def test_unchecked_items_outlive_their_settled_files(leerie, redriven):
              if e.get("site") == leerie._REDRIVE_UNSETTLED_SITE]
     assert len(entry) == 1
     assert entry[0]["detail"].startswith(
-        "delivery re-drive: required item(s) its ratchet could not check:")
+        "delivery re-drive: check by hand the required item(s) its ratchet "
+        "could not check:")
     assert "fix y" in entry[0]["detail"]

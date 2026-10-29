@@ -7047,7 +7047,16 @@ run, or no test command resolves for a run that had a diff — the old diff
 (if any) is kept and marked stale, and the gap is listed under "Needs human
 verification" ("Regression checks the run could not settle") whether or not
 a required item names the test outcome; a run with no test command and no
-diff has no regression check to miss and lists nothing. A final conformance
+diff has no regression check to miss and lists nothing. One fact is listed
+once: when the axis went unmeasured because the task forbids the test
+command and its scoped replacement could not run, that gap is already
+listed (§9 *A command the task forbids*), and the final-diff gap is not
+listed beside it (review round 8 L2 drove one forbidden suite into three
+lines in one group). And every regression-check entry leads with what the
+reviewer must do, the measured output last: the PR caps an entry at
+`_PR_ENTRY_MAX` characters, and a failed measurement's 200-character
+summary placed first cut "Run the tests on the PR branch and compare
+with the base" mid-word. A final conformance
 round that breaks before its post-measurement still has its
 pre-measurement: when the committed tree has not moved since and no tracked
 file was edited, that measurement's failing IDs are confirmed against the
