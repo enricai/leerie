@@ -233,7 +233,7 @@ class TestVerifyDeliveryCite:
                 {"message": {"content": [{"type": "tool_result",
                                           "tool_use_id": "t1",
                                           "content": "1 passed"}]}}]) + "\n")
-        digest = leerie._executed_commands_digest(run, tmp_path)
+        digest = leerie._executed_commands_digest(leerie._executed_command_entries(run, tmp_path))
         assert "required behaviours pass" in digest
         assert not any(line.startswith("[orchestrator ")
                        for line in digest.splitlines())

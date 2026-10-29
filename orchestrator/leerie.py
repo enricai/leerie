@@ -42576,13 +42576,12 @@ def _repro_verbs(repro_command: str | None) -> set[str]:
     return verbs
 
 
-def _executed_commands_digest(leerie_dir: Path, repo_root: Path,
-                              max_entries: int = 40,
-                              tail_chars: int = 300,
-                              repro_command: str | None = None) -> str:
-    """`_executed_command_entries`' entry texts, one per line group."""
-    return "\n".join(e for e, _c in _executed_command_entries(
-        leerie_dir, repo_root, max_entries, tail_chars, repro_command))
+def _executed_commands_digest(entries: list[tuple[str, str]]) -> str:
+    """`_executed_command_entries`' entry texts, one per line group — the
+    workers' half of `_delivery_record`'s text. It takes the entries, not
+    the logs, so the record's text and its `workers` pairs come from one
+    parse."""
+    return "\n".join(e for e, _c in entries)
 
 
 def _executed_command_entries(leerie_dir: Path, repo_root: Path,
@@ -43080,7 +43079,7 @@ def _delivery_record(leerie_dir: Path, st: "State",
         log(f"  delivery gate: executed-commands digest failed "
             f"({type(e).__name__}) — judging without the workers' record")
         entries = []
-    workers = "\n".join(e for e, _c in entries)
+    workers = _executed_commands_digest(entries)
     own = _orchestrator_results_digest(st,
                                        leerie_dir / "worktrees" / "staging")
     return _ExecutedRecord("\n".join(x for x in (workers, own) if x), own,
@@ -53815,18 +53814,22 @@ def _save_withheld_leftovers(staging: Path, paths: list[str],
                                           for p in tracked))
                 env = {**os.environ,
                        "GIT_INDEX_FILE": str(Path(tmp) / "index")}
-                git = ["git", "--literal-pathspecs", "-C", str(staging)]
-                ok = (subprocess.run(git + ["read-tree", "HEAD"], env=env,
-                                     capture_output=True,
+                # Each argv a literal led by "git", so the forbidden-command
+                # guard reads its program word (tests/
+                # test_blt_forbidden_gate.py); `pre + [...]` hid it.
+                pre = ["--literal-pathspecs", "-C", str(staging)]
+                ok = (subprocess.run(["git", *pre, "read-tree", "HEAD"],
+                                     env=env, capture_output=True,
                                      check=False).returncode == 0
                       and subprocess.run(
-                          git + ["add", "-A", "-f",
-                                 f"--pathspec-from-file={spec}",
-                                 "--pathspec-file-nul"], env=env,
+                          ["git", *pre, "add", "-A", "-f",
+                           f"--pathspec-from-file={spec}",
+                           "--pathspec-file-nul"], env=env,
                           capture_output=True, check=False).returncode == 0)
                 diff = (subprocess.run(
-                    git + ["diff", "--cached", "--binary", "HEAD"], env=env,
-                    capture_output=True, check=False) if ok else None)
+                    ["git", *pre, "diff", "--cached", "--binary", "HEAD"],
+                    env=env, capture_output=True, check=False)
+                    if ok else None)
             if diff is not None and diff.returncode == 0 and diff.stdout:
                 patch = save_dir / f"{stem}.patch"
                 patch.write_bytes(diff.stdout)

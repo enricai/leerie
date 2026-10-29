@@ -56,7 +56,7 @@ def test_digest_extracts_blt_commands_with_result_tails(
         ("pnpm test src/x.test.ts", "Test Files  1 passed (1)"),
         ("git status --short", "M src/x.ts"),
     ])
-    d = leerie._executed_commands_digest(tmp_path, tmp_path)
+    d = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path))
     assert "[bugfix-001] $ pnpm test src/x.test.ts" in d
     assert "Test Files  1 passed (1)" in d
     assert "git status" not in d
@@ -65,10 +65,10 @@ def test_digest_extracts_blt_commands_with_result_tails(
 def test_digest_no_result_and_missing_logs(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
     _write_log(tmp_path / "logs", "s1", [("pnpm typecheck", None)])
-    d = leerie._executed_commands_digest(tmp_path, tmp_path)
+    d = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path))
     assert "(no result recorded)" in d
-    assert leerie._executed_commands_digest(
-        tmp_path / "absent", tmp_path) == ""
+    assert leerie._executed_commands_digest(leerie._executed_command_entries(
+        tmp_path / "absent", tmp_path)) == ""
 
 
 def test_digest_empty_without_blt_verbs(leerie, tmp_path, monkeypatch):
@@ -76,15 +76,15 @@ def test_digest_empty_without_blt_verbs(leerie, tmp_path, monkeypatch):
     without them everything or nothing would be arbitrary)."""
     monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: [])
     _write_log(tmp_path / "logs", "s1", [("pnpm test", "ok")])
-    assert leerie._executed_commands_digest(tmp_path, tmp_path) == ""
+    assert leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path)) == ""
 
 
 def test_digest_entry_cap(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
     _write_log(tmp_path / "logs", "s1", [
         (f"pnpm test f{i}.ts", "ok") for i in range(5)])
-    d = leerie._executed_commands_digest(tmp_path, tmp_path,
-                                         max_entries=2)
+    d = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path,
+                                         max_entries=2))
     assert d.count("$ pnpm test") == 2
 
 
@@ -352,7 +352,7 @@ def test_digest_strips_timeout_and_env_prefixes(
         ("timeout 600 pnpm test src/a.test.ts", "1 passed"),
         ("NODE_ENV=test pnpm test src/b.test.ts", "2 passed"),
     ])
-    d = leerie._executed_commands_digest(tmp_path, tmp_path)
+    d = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path))
     assert "timeout 600 pnpm test src/a.test.ts" in d
     assert "NODE_ENV=test pnpm test src/b.test.ts" in d
 
@@ -421,13 +421,13 @@ def test_digest_admits_repro_led_commands_only_with_repro(
          "--force", "classification: REST; output compiles"),
         ("pnpm test src/x.test.ts", "1 passed"),
     ])
-    without = leerie._executed_commands_digest(tmp_path, tmp_path)
+    without = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path))
     assert "example_repro" not in without
     assert "pnpm test src/x.test.ts" in without
-    with_repro = leerie._executed_commands_digest(
+    with_repro = leerie._executed_commands_digest(leerie._executed_command_entries(
         tmp_path, tmp_path,
         repro_command="EXAMPLE_RUN_ID=example-run node "
-                      "scripts/example_repro.py --force")
+                      "scripts/example_repro.py --force"))
     assert "[accept-001] $ EXAMPLE_RUN_ID=example-run node " \
            "scripts/example_repro.py --force" in with_repro
     assert "classification: REST; output compiles" in with_repro
