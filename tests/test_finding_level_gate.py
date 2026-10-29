@@ -366,7 +366,7 @@ def test_digest_failure_degrades_to_items_only_judging(
     def boom(*_a2, **_k):
         raise UnicodeDecodeError("utf-8", b"", 0, 1, "torn log")
 
-    monkeypatch.setattr(leerie, "_executed_commands_digest", boom)
+    monkeypatch.setattr(leerie, "_executed_command_entries", boom)
     leerie_root = tmp_path / ".leerie"
     run_id = "digest-degrade"
     run_dir = leerie_root / "runs" / run_id

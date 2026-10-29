@@ -6873,6 +6873,27 @@ one is shown to the judge and kept as a falsifier lead, but verifies
 nothing on its own (§8 *Every post-execution verdict is of the committed
 tree*).
 
+That rule alone strands an item whose only evidence is a command the
+orchestrator never runs itself — the audit's repro, `npm run e2e`,
+`make docs`: the judge cites the worker's run, the cite cannot verify,
+the met becomes an unmet vote, and the item is re-driven to an
+implementer who cannot make a worker's past run count either (review
+round 12 L3). So the orchestrator makes the measurement itself: a
+worker command that a met verdict rests on alone is re-run once on the
+committed tree — in a disposable checkout of staging's HEAD, exec'd as
+one argv through the single forbidden-command gate, contained, a failure
+re-checked under B\* (the settle-by-execution machinery) — and when it
+passes, an orchestrator entry for that run joins the record's own store,
+so the citation verifies as the orchestrator's measurement of HEAD. Only
+a command a shell would read as exactly one argv qualifies — no operator,
+redirection, substitution, expansion, glob or environment/directory
+prefix, led by a verb that admitted it to the record — since what runs
+must be what is checked. A command that fails there leaves the vote
+unmet, honestly. A command leerie cannot run (the task forbids it, or it
+is not such an argv) cannot be measured by anyone in the loop, so an
+item held back by nothing else goes to "Needs human verification" with
+the command and the reason, never to a re-drive.
+
 **Delivery detection: a cited judge, or a falsifier that proves it
 by execution.** A read-only judge misses the defects that only
 execution shows — measured on the labelled delivery corpus (bench

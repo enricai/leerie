@@ -7068,6 +7068,40 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   <quote> HEAD -- <pathspec>` finds nowhere (exit 1; exit 0 is
   `absent_found`, anything else `bad_regex`) — otherwise the verdict
   becomes `met: false, rejected: <no_parts | part_not_met | part_uncited>`.
+  Then (review round 12 L3, `tests/test_record_citation_rerun.py`) the
+  raw samples go to `async _rerun_record_citations(st, caps, staging,
+  record, raw, verbs, cache) -> (record, runs)`: for each verdict claiming
+  met, `_uncited_worker_commands(v, tree, record, cache)` gives, per part
+  with no verified citation, the commands of the worker entries
+  (`_ExecutedRecord.workers`, `(text, command)` pairs from
+  `_executed_command_entries`, of which `_executed_commands_digest` is the
+  joined text) its `RECORD` quotes are in — None when a part has none;
+  each distinct command is re-run once by `async _rerun_worker_command(st,
+  caps, staging, cmd, verbs, head) -> {command, head, verdict: passed |
+  failed | unrunnable, why}`: `unrunnable` when `_forbidden_command_hit`
+  hits or `_rerunnable_argv(cmd, verbs)` is None (`_RERUN_UNSAFE_RE`
+  matches any of ``;&|<>`$*?~`` or a newline; `shlex.split` fails; `=` in
+  the lead; the lead not in `verbs` = `_blt_verbs(repo_root) |
+  _repro_verbs(<audit repro>)`), else `_settle_by_execution({"verify":
+  [{"argv": argv}]}, <checkout>, st, caps, sid=<key>,
+  store="record_reruns")` in a detached checkout of staging's HEAD at
+  `_helper_worktree_path(st, "record-rerun")` (removed after) — `pass` →
+  `passed`, `fail` → `failed`, else `unrunnable`; persisted and reused by
+  `record_reruns[<key>]`, `<key> = "rerun-" + sha256(head + "\0" +
+  cmd)[:16]`. Each worker entry whose command passed adds `[orchestrator
+  re-run on the committed tree <head[:12]>] passed — the worker entry it
+  re-ran: <entry>` to the record and its `own`, and every sample is
+  re-screened; `_mark_unrunnable` types a `part_uncited` rejection whose
+  every uncited part has an `unrunnable` command and none `failed` as
+  `rejected: record_unrunnable` (with `rerun[{command, why}]`). An item
+  whose majority-unmet votes are all `record_unrunnable` is not confirmed
+  unmet: `_set_record_rerun_gap(st, judge_idx, human)` writes one
+  `needs_human_verification` entry per such item (`source:
+  RECORD_RERUN_GAP_SOURCE = "record_rerun"`, `item_index`, `detail`),
+  replacing this pass's judged items' entries, rendered under "Task
+  requirements", and `routing["human_verification"]` lists them.
+  `_settle_by_execution` takes `store` (default `"settled_by_execution"`)
+  for the state key it persists under.
 - **Test outcomes** (DESIGN §8 *A test outcome is the failing-test-ID
   diff's to settle*). `_test_outcome_verdict(st, tree_sha)` →
   `{verdict: met | unmet | unknown, new[], reason}` from `state.data
@@ -10040,6 +10074,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `acceptance_dispute` | dict | `{failing_sets, total_sets, cases[], accepted?, unacted?, redispute?}` written when held-out sets fail on HEAD — as a new dispute when the previous completed same-task run had NOT already disputed, and again with `accepted: true` when it had (the carry-forward); `_prior_acceptance_dispute` reads it from that sibling on the next run, which then accepts no work instead of disputing again. `unacted: true` is set by `_mark_dispute_unacted` when the disputing run still ended as no work by another exit (empty plans, or the satisfied-probe sweep emptying the plan); `_prior_acceptance_dispute` does not count such a dispute unless it also carries `redispute: true` — written when the dispute was raised because the previous run's dispute was unacted (`_prior_acceptance_dispute_record`), so a second unacted dispute counts and the wrong-tests loop stays bounded at two extra runs (DESIGN §8 *A dispute counts only once it is acted on*). |
 | `declared_unrun_warnings` | dict | per-sid list of `DECLARED_CMD_UNRUN` issues on an `empty_handoff`-rescued subtask that settled `complete` without running them. No longer written — such a rescue is now settled by execution or re-driven (DESIGN §8 *Settled by execution*) — but still read by `phase_finalize`, so a run recorded before the change keeps surfacing it. |
 | `settled_by_execution` | dict[str, dict] | per-sid record of `_settle_by_execution` (DESIGN §8 *Settled by execution*): `{verdict, why, commands: [{argv, rc, attempts, passed, resource_affected, environment_limit, tail}], dirty, removed_untracked?, forbidden?}` (`forbidden[{argv, forbidden}]` only when a verify argv runs a command the task forbids — then nothing ran), written on every execution whatever the verdict. |
+| `record_reruns` | dict[str, dict] | per-key record of `_rerun_worker_command` (DESIGN §8 *Execution-shaped items are judged from the run's own records*): `{command, head, verdict: passed \| failed \| unrunnable, why}`, the `_settle_by_execution` record under the same key while it runs; `<key> = "rerun-" + sha256(head + "\0" + command)[:16]`, so a command is re-run once per commit. |
 | `ci_parity` | dict \| absent | CI parity (DESIGN §9 *The repository's own merge checks run too*), written by `_capture_ci_parity_baseline` and `_run_ci_parity_final`: `{baseline_done, config_files[], excluded_by_worker[], skipped?, base_sha, checks[], final?}`. Each check `{id, kind, argv, cwd, env, prerequisites, trigger, requires, strict_argv, source, coverage, selected, reason?, problems?, forbidden?, strict_forbidden?, gate?: plain \| strict, ratchet?: diagnostic \| coverage, base?{rc, dirty, strict_rc?, diagnostics?{"file\ttext": count}, coverage?{"glob\|metric": pct}}}`; `reason` one of `left_to_test_axis`, `not_merge_gating`, `external_resource`, `db_reset`, `forbidden_by_task` (with `forbidden`, the entry the argv hits), `provenance` (with `problems`), `no_base_worktree`, `writes_tracked_files`, `red_at_baseline`, `coverage_unmeasured`; `strict_forbidden` is the entry a selected check's `strict_argv` hit (that `strict_argv` then `null`). `final` `{sha, results{id: {...}}, unmet[{id, kind, why: red \| new_diagnostics \| coverage_ratchet, argv, cwd, rc? \| diagnostics? \| thresholds?}], resource_affected[], pre_existing[], no_verdict[], budget_short_unsettled[], sized_out?[], b_star?, skipped?}`. `baseline_done` is the baseline's resume sentinel; `final.sha` equal to the staging HEAD is the final half's. |
 | `blt_peak` | dict \| absent | the base-health baseline's measured peak (DESIGN §6 *The repo's own build peak*): `{memory_bytes, pids, axis, slots, worker_memory_max_bytes, worker_pids_max}` — the largest `memory.peak` / `pids.peak` across the measured axes, the host build-semaphore slot count sized from it, and the raised caps `_apply_blt_peak` applied. Re-applied on resume. |
 | `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |
