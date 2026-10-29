@@ -388,8 +388,19 @@ def test_an_audited_set_is_rewritten_once_at_own_start_and_judged_again(
     assert s["defect_files"] == ["acc2/test_defect_r.py"]
     assert s["rewrite"]["original"]["defect_files"] == ["acc/test_defect_1.py"]
     assert s["rewrite_rounds"] == 1 and not s.get("broken")
-    assert final == [{"index": 1, "passed": True, "unmeasured": False,
-                      "failing_files": []}]
+    # The rewritten set is judged again and passes. Its result carries more
+    # than the verdict (a discovery record, among others), so the verdict
+    # fields are asserted by value rather than the whole dict by equality.
+    (r,) = final
+    assert (r["index"], r["passed"], r["unmeasured"], r["failing_files"]) \
+        == (1, True, False, [])
+    # The re-judgement reran the REWRITTEN set's held case, not the original
+    # one, and every round finished clean (DESIGN §8 *A held case that fails
+    # again*, rule 2).
+    d = r["discovery"]
+    assert d["files"] == ["acc2/test_defect_r.py"]
+    assert d["found"] == [] and d["incomplete"] is False
+    assert d["repeats_run"] == d["repeats_required"] > 0
     # No surrogate when the audit already fired.
     assert w.of("surrogate_fixer") == []
 
