@@ -10123,10 +10123,17 @@ failure new / does this set still fail" verdict uses:
      tests*). The integration gate's head confirm with no home parent has
      no base side either, but it is base-paired in kind (a merged-tree
      failure seen once) and needs a finished rerun the same way.
-   - The one confirm whose "confirmed" exonerates
-   — the integration gate's overlay, which confirms a merged-tree failure
-   is the other side's (§6) — takes no such reading: there a shortfall
-   leaves the failure counted.
+   - The integration gate's overlay confirm (§6), which decides whether a
+     merged-tree failure is the other side's (`stale_by_other_side`),
+     takes no such reading: a shortfall leaves the failure a
+     `test_failure`. Not because "stale" exonerates the merge — a round
+     with a stale failure fails exactly like one with a `test_failure`.
+     The asymmetry is routing: "stale" tells the integrator to update the
+     test and never the production code, so a false "stale" invites it to
+     rewrite a test to match a broken merge, while a shortfall read as a
+     `test_failure` sends it to fix code. And the premise of the reading
+     is false there: nothing ran on the overlay tree before the confirm,
+     so it was never seen failing.
 
    The alternative was to give a rerun that has started its full
    `worker_timeout_sec` and stop only *starting* reruns once the budget is

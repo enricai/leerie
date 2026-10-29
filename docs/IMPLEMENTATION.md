@@ -6151,8 +6151,10 @@ than re-running once.
   vote (`_acceptance_run_placed`), the falsifier probe
   (`_falsifier_gates`), the integration gate's head confirm with no home
   parent (with every candidate in `needs_rerun`). The integration overlay
-  confirm passes False: its `confirmed`
-  exonerates (`stale_by_other_side`).
+  confirm passes False: its `confirmed` makes a failure
+  `stale_by_other_side`, which routes the integrator to update the test,
+  never the production code (the round fails either way), and nothing ran
+  on the overlay tree before it.
 - `_RerunCut(failing: frozenset[str], measured: frozenset[str])` — what a
   B\* runner returns for a rerun the budget cut short partway: the
   candidates it gave a verdict for and those it failed. Never a run.

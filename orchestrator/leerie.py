@@ -39372,8 +39372,9 @@ async def _confirm_still_failing(
     *Which failures are new*, step 4) — except one in `needs_rerun` (its
     observation was a timeout or a signal death, a resource signature, or
     the caller is base-compare-shaped) with no finished rerun: that one is
-    `budget_short_unsettled`. Without `seen_failing` (a confirm whose
-    `confirmed` exonerates) a shortfall never confirms."""
+    `budget_short_unsettled`. Without `seen_failing` (the integration
+    overlay, whose `confirmed` routes a failure to a test update) a
+    shortfall never confirms."""
     cand = sorted(set(candidates))
     weak = set(needs_rerun)
     out: dict = {"candidates": cand, "confirmed": [], "no_verdict": [],
@@ -56046,9 +56047,16 @@ async def _integration_test_failures(
                 async def _ov(left: float, _t=overlay,
                               _f=files) -> set[str] | None:
                     return await _ids(_t, f"integ-{sid}-overlay", _f, left)
-                # Never `seen_failing`: a confirmed overlay failure exonerates
-                # the merge, so a budget shortfall must leave it counted
-                # (DESIGN §9 *Which failures are new*, step 4).
+                # Never `seen_failing`. Not because "stale" exonerates — a
+                # round with a stale failure fails like one with a
+                # test_failure — but because of routing: "stale" tells the
+                # integrator to update the test and never the production
+                # code (DESIGN §6), so a false "stale" invites it to rewrite
+                # a test to match a broken merge, while a shortfall read as
+                # a test_failure routes it to fix code. And nothing ran on
+                # the overlay tree before this confirm, so "seen failing"
+                # would not even be true here (DESIGN §9 *Which failures
+                # are new*, step 4).
                 stale = (await _confirm_still_failing(
                     ids, _ov, caps, seen_failing=False,
                     label=f"integration {sid} overlay"))["confirmed"]

@@ -932,8 +932,9 @@ def test_every_measuring_confirm_says_whether_it_saw_the_failure(leerie):
     """Structure, paired with the consumer tests above (the held-out vote,
     the e3 final diff): every B* call that has real runners states
     `seen_failing` — True where `confirmed`/`new` counts a failure, False
-    only for the integration overlay, whose `confirmed` exonerates (DESIGN
-    §9 *Which failures are new*, step 4). A call with no runners
+    only for the integration overlay, whose `confirmed` routes a failure to
+    a test update rather than a code fix (DESIGN §9 *Which failures are
+    new*, step 4). A call with no runners
     (`_no_rerun`, `_none`) runs nothing, so it needs none."""
     import ast
     tree = ast.parse(inspect.getsource(leerie))
