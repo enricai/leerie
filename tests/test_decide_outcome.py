@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,25 @@ def st(leerie, tmp_path):
     s = leerie.State(tmp_path / ".leerie", "fix-001-abcdef")
     s.data = {"task": "x", "subtask_status": {"a": "complete"}}
     s.save()
+    # A staging worktree whose tree ships: a delivery verdict counts only
+    # on it (DESIGN §6 *A delivery verdict counts only on the tree it was
+    # measured on*); the params below write SHIP for that tree.
+    staging = s.run_dir / "worktrees" / "staging"
+    staging.mkdir(parents=True)
+    for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                 ["config", "user.name", "t"],
+                 ["commit", "-q", "--allow-empty", "-m", "base"]):
+        subprocess.run(["git", *args], cwd=staging, check=True,
+                       capture_output=True)
     return s
+
+
+def _ship(st, extra: dict) -> dict:
+    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"],
+                          cwd=st.run_dir / "worktrees" / "staging",
+                          check=True, capture_output=True,
+                          text=True).stdout.strip()
+    return json.loads(json.dumps(extra).replace("SHIP", tree))
 
 
 def _run_json(st):
@@ -45,15 +64,19 @@ def test_clean_run(leerie, st, any_commits, expected):
         "residual": {"failing_sets": 2, "total_sets": 3}}}},
      "2 held-out acceptance set(s)"),
     ({"delivery_gate": {"unmet_before": [{"item": "i"}],
-                        "unmet_after": [{"item": "i"}]}},
+                        "unmet_after": [{"item": "i"}],
+                        "judged_after": {"tree": "SHIP"}}},
      "1 required item(s)"),
-    ({"delivery_gate": {"unmet_before": [{"item": "i"}]}},
+    ({"delivery_gate": {"unmet_before": [{"item": "i"}],
+                        "judged_before": {"tree": "SHIP"}}},
      "1 required item(s)"),
+    ({"delivery_gate": {"unmet_final": [], "final_tree": "0" * 40}},
+     "not read on the tree that ships"),
 ])
 @pytest.mark.parametrize("any_commits", [True, False])
 def test_unfinished_work_is_unconverged_before_the_empty_branch_check(
         leerie, st, extra, reason_word, any_commits):
-    st.data.update(extra)
+    st.data.update(_ship(st, extra))
     assert leerie._decide_outcome(st, any_commits=any_commits) == "unconverged"
     assert any(reason_word in r for r in st.data["outcome_reasons"]), \
         st.data["outcome_reasons"]
@@ -61,14 +84,15 @@ def test_unfinished_work_is_unconverged_before_the_empty_branch_check(
 
 
 @pytest.mark.parametrize("extra", [
-    {"delivery_gate": {"unmet_before": [{"item": "i"}], "unmet_after": []}},
+    {"delivery_gate": {"unmet_before": [{"item": "i"}], "unmet_after": [],
+                       "judged_after": {"tree": "SHIP"}}},
     {"acceptance": {"gate": {"final": [{"index": 0, "passed": False,
                                         "unmeasured": True}]}}},
     {"test_id_diff": {"new": [], "resource_affected": ["t :: flaky"]}},
     {"subtask_status": {"a": "accepted_external"}},
 ])
 def test_resolved_or_unmeasured_signals_do_not_unconverge(leerie, st, extra):
-    st.data.update(extra)
+    st.data.update(_ship(st, extra))
     assert leerie._decide_outcome(st, any_commits=True) == "done"
 
 

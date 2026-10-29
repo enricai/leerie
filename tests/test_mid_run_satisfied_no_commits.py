@@ -194,13 +194,16 @@ class TestSettleWiring:
 
     @staticmethod
     def _no_commits_region(src: str) -> str:
-        # Ends at the next check of a completed result, the clean-tree gate
-        # (I1) — a call, not a comment: the comment this used to end on
-        # went with the old dirty-worktree check (00d4946), which left four
-        # of these guards failing on a missing end, not on the wiring.
+        # Ends at the next check of a completed result, the scope check — a
+        # call, not a comment: the comment this used to end on went with the
+        # old dirty-worktree check (00d4946), which left four of these
+        # guards failing on a missing end, not on the wiring; and the
+        # clean-tree gate it then ended on now runs before the no-commits
+        # branch (I1 before anything reads the tree, DESIGN §8 *A worker
+        # leaves its tree clean*).
         start = src.find("if commit_err")
         assert start != -1, "the no-commits branch is missing"
-        end = src.find("_clean_tree_gate(", start)
+        end = src.find("check_diff_scope(", start)
         assert end != -1
         return src[start:end]
 

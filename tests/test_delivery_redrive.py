@@ -707,6 +707,7 @@ class World:
             _git(repo, "merge", "-q", "--no-ff", "-m",
                  f"leerie: integrate {sid}", f"sub-{sid}")
         head = _git(repo, "rev-parse", "HEAD")
+        head_tree = _git(repo, "rev-parse", "HEAD^{tree}")
         st = leerie.State(tmp_path / "state", "run-r", repo_root=repo)
         self.st = st
         self.dir = st.run_dir
@@ -744,7 +745,12 @@ class World:
                    "repo_state_before_planning": {"head": base},
                    "subtask_status": {"s1": "complete", "s2": "complete"},
                    "required_items": items or [],
-                   "delivery_gate": {"unmet_final": unmet or []},
+                   # Final detection's verdict, of the tree it read
+                   # (DESIGN §6 *A delivery verdict counts only on the tree
+                   # it was measured on*).
+                   "delivery_gate": {"unmet_final": unmet or [],
+                                     "final_sha": head,
+                                     "final_tree": head_tree},
                    "acceptance": {"validity_base": base, "sets": sets,
                                   "gate": {}}}
         st.save()
@@ -880,7 +886,10 @@ def test_items_go_to_every_claimer_process_items_never(
 
     async def fake_judge(task, its, staging, st, caps, models, efforts,
                          phase_label, **kw):
-        judged.append([i["item"] for i in its])
+        # Handed the whole list and the indices to read (review round 14
+        # M4: indices are the run's, never positions in a subset).
+        assert len(its) == len(items)
+        judged.append([its[i]["item"] for i in kw["only"]])
         return [], 1, None
     monkeypatch.setattr(leerie, "_delivery_judge_unmet", fake_judge)
     monkeypatch.setattr(leerie, "_delivery_record", lambda *a, **k: "")

@@ -86,6 +86,12 @@ def redriven(leerie, tmp_path, monkeypatch):
     _git(staging, "commit", "-qam", "redrive")
     t1 = asyncio.run(leerie._worktree_tree_sha(str(staging)))
     assert t1 and t1 != t0
+    # Detection's item verdicts are of the tree that ships (DESIGN §6 *A
+    # delivery verdict counts only on the tree it was measured on): in a
+    # run, detection reads t1 after an acceptance repair, or the re-drive
+    # re-keys its verdict to t1 at its end.
+    st.data["delivery_gate"]["final_tree"] = t1
+    st.save()
     monkeypatch.setattr(leerie, "resolve_blt", lambda root: {"test": CMD})
     return {"st": st, "staging": staging, "x": v["new"][0], "t0": t0,
             "t1": t1, "caps": caps, "sha": _git(staging, "rev-parse", "HEAD")}

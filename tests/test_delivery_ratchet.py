@@ -586,9 +586,14 @@ def test_a_failed_acceptance_round_ratchet_drops_the_item_from_prior_met(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     (r1,) = st.data["acceptance"]["gate"]["rounds"]
     assert not r1.get("rollback_reason")
-    assert r1["ratchet"]["unverified"] == [0, 1]
-    assert sorted(st.data["delivery_ratchet"]["unverified"]) == ["0", "1"]
-    assert sorted(leerie._ratchet_prior_met(st)) == [2, 4]
+    # Items 0 and 1 for the failed judge; item 2, execution-shaped, because
+    # this round's ID diff measured nothing (review round 14 M3: such an
+    # item was not read either, and used to stay prior met).
+    assert r1["ratchet"]["exec_unchecked"] == [2]
+    assert r1["ratchet"]["unverified"] == [0, 1, 2]
+    assert sorted(st.data["delivery_ratchet"]["unverified"]) == [
+        "0", "1", "2"]
+    assert sorted(leerie._ratchet_prior_met(st)) == [4]
 
 
 def test_the_execution_route_measures_staging_at_its_commit(

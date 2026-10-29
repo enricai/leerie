@@ -641,7 +641,7 @@ STATE_FIELDS = (
     # was remedied by the final-conformer round it was routed into;
     # non-empty unmet_after is the persisted residual the operator (and
     # the next run's planner, via the classifier) can see. judged_before /
-    # judged_after {sha, unmet[], details[]} record what each judge pass
+    # judged_after {sha, tree, unmet[], details[]} record what each judge pass
     # saw; final delivery detection (DESIGN §8 *Delivery detection*) adds
     # items[] (per item: verdict, by[], judge, falsifier), unmet_final[],
     # final_sha, final_judge, falsifier, and final_progress while running.
@@ -6378,6 +6378,26 @@ def _pr_paths(paths: object) -> str:
     return f" ({', '.join(shown)})" if shown else ""
 
 
+def _needs_human_detail_groups() -> dict[str, str]:
+    """The PR group of each `needs_human_verification` source whose entry
+    is a `detail` line (DESIGN §6 *The PR's end-state section*). A
+    function, not a module table: the sources are defined beside their
+    writers, further down the module. `required_item` and `blocker`
+    entries have shapes of their own and are rendered apart."""
+    return {
+        RECORD_WORKER_GAP_SOURCE: "Task requirements",
+        DELIVERY_JUDGE_GAP_SOURCE: "Task requirements",
+        RATCHET_UNVERIFIED_GAP_SOURCE: "Task requirements",
+        REGRESSION_GAP_SOURCE: "Regression checks the run could not settle",
+        TEST_OUTCOME_GAP_SOURCE: "Regression checks the run could not settle",
+        CONFIRM_BUDGET_GAP_SOURCE:
+            "Regression checks the run could not settle",
+        FINAL_DIFF_GAP_SOURCE: "Regression checks the run could not settle",
+        _REDRIVE_HELDOUT_GAP_SOURCE:
+            "Files removed for holding a hidden test's source",
+    }
+
+
 def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
                     ) -> dict[str, list[str]]:
     """The "Needs human verification" checkboxes, grouped by the resource a
@@ -6389,30 +6409,25 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
         if line not in bucket:
             bucket.append(line)
 
+    detail_groups = _needs_human_detail_groups()
     for e in state.get("needs_human_verification") or []:
         if not isinstance(e, dict):
             continue
-        if e.get("source") == "required_item" and _pr_entry(e.get("item")):
-            add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
-        elif (e.get("source") == RECORD_WORKER_GAP_SOURCE
-              and _pr_entry(e.get("detail"))):
-            add("Task requirements", f"- [ ] {_pr_entry(e.get('detail'))}")
-        elif (e.get("source") in (REGRESSION_GAP_SOURCE,
-                                  TEST_OUTCOME_GAP_SOURCE,
-                                  CONFIRM_BUDGET_GAP_SOURCE,
-                                  FINAL_DIFF_GAP_SOURCE)
-              and _pr_entry(e.get("detail"))):
-            add("Regression checks the run could not settle",
-                f"- [ ] {_pr_entry(e.get('detail'))}")
-        elif (e.get("source") == _REDRIVE_HELDOUT_GAP_SOURCE
-              and _pr_entry(e.get("detail"))):
-            add("Files removed for holding a hidden test's source",
-                f"- [ ] {_pr_entry(e.get('detail'))}")
-        elif e.get("source") == "blocker" and isinstance(e.get("subtask"),
-                                                          str):
+        source = e.get("source")
+        if source == "required_item":
+            if _pr_entry(e.get("item")):
+                add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
+        elif source == "blocker" and isinstance(e.get("subtask"), str):
             add(_pr_entry(e.get("resource")) or "Unnamed resource",
                 f"- [ ] **{e['subtask']}** was not done, waiting on it: "
                 f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
+        elif _pr_entry(e.get("detail")):
+            # Every other entry is a `detail` line. One a group table does
+            # not name still renders: an entry in state that the PR leaves
+            # out is a check nobody makes (review round 14 H1).
+            add(detail_groups.get(str(source),
+                                  "Other checks the run could not make"),
+                f"- [ ] {_pr_entry(e.get('detail'))}")
     for line in _acceptance_unmeasured_lines(state):
         add("Held-out acceptance sets the run could not measure", line)
     for row in _intermittent_regression_rows(state):
@@ -34392,6 +34407,38 @@ def _log_run_weight(tel: dict | None, st: State) -> None:
             f"(see {_operator_path(st.path)})")
 
 
+def _delivery_latest_verdict(delivery: object
+                             ) -> tuple[list, str, str] | None:
+    """`(unmet, tree, which)` of the latest delivery verdict
+    `delivery_gate` holds — final detection's (`unmet_final`,
+    `final_tree`), else the recheck's, else the pre-pass's (their
+    `judged_*.tree`) — or None when no pass recorded one."""
+    if not isinstance(delivery, dict):
+        return None
+    for unmet_key, tree_of, which in (
+            ("unmet_final", lambda d: d.get("final_tree"), "final detection"),
+            ("unmet_after", lambda d: (d.get("judged_after") or {}).get(
+                "tree"), "the recheck"),
+            ("unmet_before", lambda d: (d.get("judged_before") or {}).get(
+                "tree"), "the pre-pass")):
+        if unmet_key in delivery:
+            return (list(delivery.get(unmet_key) or []),
+                    str(tree_of(delivery) or ""), which)
+    return None
+
+
+def _shipping_tree(st: "State") -> str:
+    """The tree the run ships: staging's `HEAD^{tree}`, read now; "" when
+    staging or its HEAD cannot be read."""
+    staging = Path(st.run_dir) / "worktrees" / "staging"
+    if not staging.is_dir():
+        return ""
+    r = subprocess.run(["git", "-C", str(staging), "rev-parse", "--verify",
+                        "-q", "HEAD^{tree}"], capture_output=True, text=True,
+                       check=False)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def _decide_outcome(st: State, *, any_commits: bool) -> str:
     """The run's single verdict — `done`, `no_work` or `unconverged` —
     written to `st.data["outcome"]` (and run.json) here and nowhere else
@@ -34447,11 +34494,21 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         if failing:
             reasons.append(f"{failing} held-out acceptance set(s) still fail")
     delivery = st.data.get("delivery_gate")
-    if isinstance(delivery, dict):
-        unmet = (delivery.get("unmet_final") if "unmet_final" in delivery
-                 else delivery.get("unmet_after") if "unmet_after" in delivery
-                 else delivery.get("unmet_before"))
-        if unmet:
+    verdict = _delivery_latest_verdict(delivery)
+    if verdict is not None:
+        # A delivery verdict counts only on the tree it was measured on
+        # (review round 14 M2): an earlier tree's "nothing unmet" says
+        # nothing of what ships.
+        unmet, tree, which = verdict
+        shipping = _shipping_tree(st)
+        if not tree or tree != shipping:
+            reasons.append(
+                "the required items were not read on the tree that ships: "
+                f"the last delivery verdict ({which}) is of "
+                + (f"tree {tree[:12]}" if tree else "an unrecorded tree")
+                + (f", the PR ships tree {shipping[:12]}" if shipping
+                   else ", and the tree that ships could not be read"))
+        elif unmet:
             reasons.append(f"{len(unmet)} required item(s) still unmet")
     ci_unmet = _ci_parity_unmet(st)
     if ci_unmet:
@@ -38249,12 +38306,12 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                             f"worker threads); phase surfaced as "
                             f"advisory: {e}")
             last_res = None
-            break
-
-        if last_res is None:
-            warnings.append(f"conformer round {c_round}: worker crashed; "
-                            "phase surfaced as advisory")
-            break
+            crashed = True
+        else:
+            crashed = last_res is None
+            if crashed:
+                warnings.append(f"conformer round {c_round}: worker "
+                                "crashed; phase surfaced as advisory")
 
         # Overwrite the worker's self-reported axes as soon as there is a dict
         # to overwrite — BEFORE the gates below, every one of which can `break`
@@ -38276,13 +38333,15 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         # Safe before validation: `_validate_conformance_result` inspects
         # `rules_files_read`, `rule_violations_*` and the update paths, never
         # the axes, so nothing here can launder a schema defect past it.
-        last_res = _apply_measured_axes(last_res, pre)
+        if last_res is not None:
+            last_res = _apply_measured_axes(last_res, pre)
 
         # I1 (DESIGN §8 *A worker leaves its tree clean*): before anything
-        # of leerie's runs here again. Still dirty after the re-asks, the
-        # round is rolled back to its start — its commits and its untracked
-        # files, ignored ones kept — and recorded; its repair records then
-        # describe nothing on the branch.
+        # of leerie's runs here again, and after a crashed or timed-out
+        # worker too — it may have edited the tree before it stopped. Still
+        # dirty after the re-asks, the round is rolled back to its start —
+        # its commits and its untracked files, ignored ones kept — and
+        # recorded; its repair records then describe nothing on the branch.
         unclean = await _clean_tree_gate(
             worktree, caps=caps, label=f"{sid} conformer round {c_round}",
             reask=_clean_tree_reasker(
@@ -38299,7 +38358,10 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                             + _unclean_reason("the conformer", unclean))
             _record_unclean_tree(st, "conformer", f"{sid} round {c_round}",
                                  unclean)
-            last_res["conformer_repair_rolled_back"] = True
+            if last_res is not None:
+                last_res["conformer_repair_rolled_back"] = True
+            break
+        if crashed:
             break
 
         err = _validate_conformance_result(last_res, worktree)
@@ -43320,9 +43382,17 @@ async def _delivery_judge_unmet(
         routing: dict | None = None,
         typed_evidence: list[str] | None = None,
         item_details: dict | None = None,
+        only: Iterable[int] | None = None,
         ) -> tuple[list[dict], int, dict | None]:
     """Run the delivery_judge over the staging tree; return
     (confirmed_unmet, samples_used, contract_result).
+
+    `items` is always the run's whole `required_items`, so every
+    `item_index` this pass reads, returns or writes — the verdicts, the
+    details, the worker-only "Needs human verification" entries — is the
+    item's index in the run (review round 14 M4: a re-check handed a
+    subset, and the gap it wrote was keyed by positions in the subset).
+    `only`, when given, restricts the pass to those indices.
 
     Every sample is screened by code before the vote
     (`_delivery_screen_sample`, DESIGN §8 *Delivery detection*): a `met`
@@ -43393,7 +43463,10 @@ async def _delivery_judge_unmet(
     judge_idx: list[int] = []
     tid = (_test_outcome_verdict(st, await _committed_tree_sha(str(staging)))
            if any(_test_id_diff_item(it) for it in normalized) else None)
+    wanted = None if only is None else set(only)
     for i, it in enumerate(normalized):
+        if wanted is not None and i not in wanted:
+            continue
         if it.get("verifiability") == "external":
             external.append(i)
             continue
@@ -49533,6 +49606,7 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
         st, leerie_dir, refresh_tokens=False)
     details: dict = {}
     judged_sha = await _branch_head_sha(str(staging))
+    judged_tree = await _committed_tree_sha(str(staging))
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
@@ -49550,7 +49624,7 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
                   # judges is still this commit (DESIGN §8 *Delivery
                   # detection*).
                   "judged_before": _delivery_judged_record(
-                      judged_sha, unmet, details)}
+                      judged_sha, unmet, details, judged_tree)}
     if routing:
         gate["routed_before"] = routing
         _log_delivery_routing(routing)
@@ -49633,6 +49707,7 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
         st, leerie_dir, refresh_tokens=True)
     details: dict = {}
     judged_sha = await _branch_head_sha(str(staging))
+    judged_tree = await _committed_tree_sha(str(staging))
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
@@ -49648,7 +49723,7 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
     gate["samples_after"] = n
     gate["evidence_after"] = ev_counts
     gate["judged_after"] = _delivery_judged_record(judged_sha, unmet,
-                                                   details)
+                                                   details, judged_tree)
     if routing:
         gate["routed_after"] = routing
     if contract is not None:
@@ -50343,10 +50418,13 @@ def _format_pr_review_section(st: "State") -> str | None:
         + (f" ({more} more not shown.)" if more > 0 else "") + "\n"
         + json.dumps(shown, indent=2, ensure_ascii=False))
 def _delivery_judged_record(sha: str, unmet: list[dict],
-                            details: dict) -> dict:
+                            details: dict, tree: str | None = None) -> dict:
     """One delivery-judge pass as final detection reads it: the commit it
-    judged, its confirmed-unmet list and its per-item details."""
-    return {"sha": sha or "", "unmet": [dict(u) for u in unmet],
+    judged and that commit's tree (DESIGN §6 *The run outcome is decided
+    once*: a verdict counts only on the tree it was measured on), its
+    confirmed-unmet list and its per-item details."""
+    return {"sha": sha or "", "tree": tree or "",
+            "unmet": [dict(u) for u in unmet],
             "details": [details[i] for i in sorted(details)]}
 
 
@@ -51138,8 +51216,8 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
             f"{str(gate.get('final_sha') or '(unknown)')[:12]}, not "
             f"staging's HEAD {(sha or '(unreadable)')[:12]}; dropped, "
             "detection runs again")
-        for k_ in ("unmet_final", "items", "final_sha", "final_judge",
-                   "falsifier"):
+        for k_ in ("unmet_final", "items", "final_sha", "final_tree",
+                   "final_judge", "falsifier"):
             gate.pop(k_, None)
         st.data["delivery_gate"] = gate
         st.save()
@@ -51188,8 +51266,11 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
                 judged = {**_delivery_judged_record(sha, unmet, details),
                           "source": "final", "samples": n}
                 break
-            except (WorkerError, subprocess.TimeoutExpired) as e:
-                # A crash reads nothing: its items are never `met` on it
+            except Exception as e:
+                # A judge that fails reads nothing, whatever failed — a
+                # worker crash or timeout, or the checkout it reads
+                # (review round 14 M2: a RuntimeError left detection with no
+                # verdict of this tree): its items are never `met` on it
                 # (review round 13 claims M1). Retried within the cap,
                 # then they are `unknown` and go to a human.
                 log(f"  delivery_judge (final) crashed "
@@ -51325,6 +51406,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     gate = dict(st.data.get("delivery_gate") or {})
     gate.pop("final_progress", None)
     gate.update(items=rows, unmet_final=unmet_final, final_sha=sha,
+                final_tree=await _committed_tree_sha(str(staging)) or "",
                 final_judge={k_: judged.get(k_) for k_ in
                              ("source", "samples", "error", "attempts")
                              if k_ in judged},
@@ -52613,8 +52695,9 @@ async def _delivery_ratchet(st: "State", caps: dict, models: dict,
     intermittent regressions `exec_result` typed reach that judge as
     evidence. `regressed` lists every item flagged; `new_failures` the
     confirmed new test failures — either one rolls the repair back;
-    `unverified` the items no route read on `post_sha` (a failed
-    classifier or judge pack), which the caller marks unknown
+    `unverified` the prior met items no route read on `post_sha` (a
+    failed classifier or judge pack, or an execution item its ID diff did
+    not measure — `exec_unchecked`), which the caller marks unknown
     (`_ratchet_mark_unverified`), never keeps met."""
     ex = exec_result or {}
     out: dict = {"pre_sha": pre_sha, "post_sha": post_sha, "prior_met": [],
@@ -52681,8 +52764,20 @@ async def _delivery_ratchet(st: "State", caps: dict, models: dict,
                 prior, judged, typed_evidence=[sec] if sec else [],
                 label=label)
             regressed |= set(out["judge"]["confirmed"])
-            out["unverified"] = sorted(
-                set(out["judge"].get("unverified") or []) - regressed)
+    # Unverified is what no route read on `post_sha`, derived from what
+    # each route did read rather than listed per failure: a failed
+    # classifier reads none of `rest`, a failed judge pack none of its
+    # items, and an execution item whose ID diff measured nothing or left
+    # candidates unsettled (`exec_unchecked`) was not read either — the
+    # route review round 14 M3 drove, which had kept such an item `met`
+    # and re-keyed to the repair's commit.
+    read = {u["item_index"] for u in out["untouched"]}
+    if kinds is not None:
+        read |= set(out["execution"]) - set(out["exec_unchecked"])
+        judge = out["judge"] if isinstance(out["judge"], dict) else {}
+        read |= ({i for i in rest if kinds.get(i) != "execution"}
+                 - set(judge.get("unverified") or []))
+    out["unverified"] = sorted(set(prior) - read - regressed)
     out["regressed"] = sorted(regressed)
     if out["regressed"] or out["new_failures"]:
         log(f"  delivery ratchet {label}: "
@@ -52757,9 +52852,9 @@ def _settle_redrive_unsettled_by_diff(st: "State",
 
 def _ratchet_unverified(st: "State", rat: dict) -> list[int]:
     """The previously met items a kept repair's ratchet did not read on its
-    commit: every prior met item when the ratchet raised, else those of a
-    failed judge pack or a failed verifiability classifier
-    (`rat["unverified"]`)."""
+    commit: every prior met item when the ratchet raised, else
+    `rat["unverified"]` (a failed judge pack or verifiability classifier,
+    or an unmeasured execution route)."""
     if rat.get("error"):
         return sorted(_ratchet_prior_met(st))
     return sorted(i for i in rat.get("unverified") or [] if isinstance(i, int))
@@ -53384,12 +53479,11 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                                                 refresh_tokens=True)
         try:
             unmet, _n, _x = await _delivery_judge_unmet(
-                st.data.get("task", ""), [items[i] for i in judge_idx],
-                staging, st, caps, models, efforts, phase_label="redrive",
-                exec_digest=record, typed_evidence=evidence)
-            hit = {judge_idx[u["item_index"]]: u for u in unmet
-                   if isinstance(u.get("item_index"), int)
-                   and 0 <= u["item_index"] < len(judge_idx)}
+                st.data.get("task", ""), items, staging, st, caps, models,
+                efforts, phase_label="redrive", exec_digest=record,
+                typed_evidence=evidence, only=judge_idx)
+            hit = {u["item_index"]: u for u in unmet
+                   if u.get("item_index") in judge_idx}
             for i in judge_idx:
                 u = hit.get(i)
                 out[i] = {"unmet": u is not None,
@@ -54358,7 +54452,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         if (isinstance(dg, dict) and "unmet_final" in dg and det_sha
                 and det_sha == head
                 and not _ratchet_record(st).get("unverified")):
-            st.data["delivery_gate"] = {**dg, "final_sha": final}
+            st.data["delivery_gate"] = {**dg, "final_sha": final,
+                                        "final_tree": final_tree or ""}
             st.save()
     rec["final_sha"] = final
     rec["done"] = True
@@ -57177,6 +57272,25 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             note = f"Previous attempt failed: {reason}"
         return None
 
+    async def _implementer_gate(previous_status: str) -> dict | None:
+        """I1 for this subtask's implementer (DESIGN §8 *A worker leaves its
+        tree clean*): the same worker re-asked; still dirty, the subtask
+        settles `unconverged` and is not integrated — leerie never commits
+        for it. None when the tree is clean."""
+        left = await _clean_tree_gate(
+            worktree, caps=caps, label=sid,
+            reask=_clean_tree_reasker(
+                st, caps, log_sid=sid, cwd=worktree,
+                schema_key="implementer",
+                system_prompt=_load_prompt("implementer"),
+                model=models.get("implementer", MODEL_DEFAULT),
+                effort=efforts.get("implementer"), max_turns=120))
+        if not left:
+            return None
+        return _settle_unconverged(
+            st, sid, _unclean_reason("its implementer", left),
+            previous_status=previous_status, kind="unclean_tree")
+
     # DESIGN §8 *Probing a flagged subtask before it spends*. A subtask the
     # plan-time provider-subset advisory flagged has no file surface of its
     # own — every file it expects to touch belongs to an ordered predecessor,
@@ -57246,6 +57360,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     st, sid, str(e), environment_limit_hits)
                 if env_res is not None:
                     return env_res
+                unclean = await _implementer_gate("in_progress")
+                if unclean is not None:
+                    return unclean
                 continue
             # The worker's cgroup ran out of PID table (fork denials
             # climbing / at pids.max). Tagged as its own retryable kind
@@ -57256,6 +57373,11 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             fail_res = await fail("pid_exhausted", str(e))
             if fail_res is not None:
                 return fail_res
+            # Retried in place, so the killed attempt's tree is handed to
+            # a fresh worker with no checkpoint describing it: I1 first.
+            unclean = await _implementer_gate("in_progress")
+            if unclean is not None:
+                return unclean
             continue
         except OomKilledError as e:
             if _at_measured_ceiling(st):
@@ -57264,6 +57386,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     st, sid, str(e), environment_limit_hits)
                 if env_res is not None:
                     return env_res
+                unclean = await _implementer_gate("in_progress")
+                if unclean is not None:
+                    return unclean
                 continue
             # The worker's tool subtree overshot memory.max and was
             # kernel-killed mid-turn. Tagged as its own retryable kind
@@ -57273,6 +57398,11 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             fail_res = await fail("oom_killed", str(e))
             if fail_res is not None:
                 return fail_res
+            # Retried in place, so the killed attempt's tree is handed to
+            # a fresh worker with no checkpoint describing it: I1 first.
+            unclean = await _implementer_gate("in_progress")
+            if unclean is not None:
+                return unclean
             continue
         except WorkerError as e:
             # Per-subtask infrastructure failure (e.g. `new-worktree.sh`
@@ -57348,6 +57478,24 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 continue
 
         status = res.get("status")
+
+        # I1 (DESIGN §8 *A worker leaves its tree clean*): every attempt
+        # that ends on a status leerie acts on — `complete`, `blocked`,
+        # `failed` — leaves its worktree clean before anything of leerie's
+        # reads it (the declared-command and mechanical checks, settle by
+        # execution, the conformer). A result rescued from `empty_handoff`
+        # came from a reaped worker with no session to ask: its
+        # uncommitted debris is discarded, the deliverable being the
+        # already-committed diff. A checkpointed handoff passes its
+        # in-progress tree to its own continuation, which is held to it.
+        if rescued_from_empty_handoff:
+            if await _tree_dirt(worktree) != []:
+                await run_proc(["git", "checkout", "--", "."], cwd=worktree)
+                await run_proc(["git", "clean", "-fdq"], cwd=worktree)
+        elif status in ("complete", "blocked", "failed"):
+            unclean = await _implementer_gate(str(status))
+            if unclean is not None:
+                return unclean
 
         # Settle-time declared-command check (DESIGN §"A declared command
         # must also have been executed"): a `complete` claim on a subtask
@@ -57460,12 +57608,6 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 + "; ".join(declared_unrun))
             if _verification_only(subtask) or await _branch_has_commits_ahead(
                     worktree, _compute_run_branch(st.run_id)):
-                if rescued_from_empty_handoff:
-                    # A reaped worker's uncommitted debris; the deliverable
-                    # is the committed diff (discarded below on this path
-                    # anyway), and execution refuses to run over it.
-                    await run_proc(["git", "checkout", "--", "."],
-                                   cwd=worktree)
                 ex = await _settle_by_execution(subtask, worktree, st, caps,
                                                 sid=sid)
                 if ex["verdict"] == "environment_limit":
@@ -57584,31 +57726,6 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 return _block_unbacked_claim(
                     st, sid, f"{message} — not verification-only, and "
                     f"{why}; finish and commit the subtask's work")
-            # I1 (DESIGN §8 *A worker leaves its tree clean*): nothing left
-            # uncommitted, untracked files included. A result rescued from
-            # `empty_handoff` came from a reaped worker with no session to
-            # ask: its uncommitted debris is discarded, the deliverable being
-            # the already-committed diff. Otherwise the same worker is
-            # re-asked; still dirty, the subtask settles `unconverged` and is
-            # not integrated — leerie never commits for it.
-            if rescued_from_empty_handoff:
-                if await _tree_dirt(worktree) != []:
-                    await run_proc(["git", "checkout", "--", "."],
-                                   cwd=worktree)
-                    await run_proc(["git", "clean", "-fdq"], cwd=worktree)
-            else:
-                left = await _clean_tree_gate(
-                    worktree, caps=caps, label=sid,
-                    reask=_clean_tree_reasker(
-                        st, caps, log_sid=sid, cwd=worktree,
-                        schema_key="implementer",
-                        system_prompt=_load_prompt("implementer"),
-                        model=models.get("implementer", MODEL_DEFAULT),
-                        effort=efforts.get("implementer"), max_turns=120))
-                if left:
-                    return _settle_unconverged(
-                        st, sid, _unclean_reason("its implementer", left),
-                        previous_status="complete", kind="unclean_tree")
             # protected-path violation — the worker wrote to .git/ etc.: it is
             # broken, not merely careless. Non-retryable by `_retryable_failure`.
             scope_err = await check_diff_scope(sid, worktree, subtask, st)

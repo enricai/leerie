@@ -1340,13 +1340,20 @@ def test_next_run_residual_reads_unmet_final(leerie, tmp_path):
                                  "evidence": "probe fails"}]
 
 
-def test_outcome_prefers_unmet_final_over_unmet_after(leerie, tmp_path):
+def test_outcome_prefers_unmet_final_over_unmet_after(leerie, tmp_path,
+                                                      monkeypatch):
+    # Every verdict here is of the tree that ships; which tree a verdict
+    # must be of is pinned in tests/test_round14_delivery_verdicts.py.
+    monkeypatch.setattr(leerie, "_shipping_tree", lambda st: "T")
     st = leerie.State(tmp_path / "s", "r")
     st.data = {"delivery_gate": {"unmet_after": [{"item": "x"}],
-                                 "unmet_final": []}}
+                                 "judged_after": {"tree": "T"},
+                                 "unmet_final": [], "final_tree": "T"}}
     assert leerie._decide_outcome(st, any_commits=True) == "done"
-    st.data = {"delivery_gate": {"unmet_after": [], "unmet_final": [
-        {"item": "x", "by": ["falsifier"]}]}}
+    st.data = {"delivery_gate": {"unmet_after": [],
+                                 "judged_after": {"tree": "T"},
+                                 "unmet_final": [
+        {"item": "x", "by": ["falsifier"]}], "final_tree": "T"}}
     assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
 
 

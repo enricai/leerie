@@ -2841,6 +2841,22 @@ present only when it has an entry:
   findings, the contract-literal flags and the site-token hits (§8, §9),
   labelled advisory because nothing waited on them.
 
+*Every entry the run records for a human renders.* The invariant: an
+entry in `needs_human_verification` is a check the run handed to a human,
+so the PR shows every one of them — a group per source where the source
+has one, and an "Other checks the run could not make" group for any
+source that does not. Review round 14 H1 drove the root cause: the
+renderer was a hand-kept chain of one branch per source, unconnected to
+the writers, so the two sources that round added — a final delivery
+judge that crashed on every attempt (`delivery_judge_unknown`) and a
+ratchet that could not re-verify a met item (`ratchet_unverified`) —
+were written to state and rendered nowhere: a non-draft PR with nothing
+for the reviewer to check. Both now render under "Task requirements";
+and a guard derives every source the code writes (each `*_GAP_SOURCE`
+constant and each literal `source` in a writer of that list) and fails
+on one the group table does not name, so the next source is placed
+deliberately rather than falling to the catch-all.
+
 It replaces a generic dump of every worker's self-reported risk, verbatim,
 under one "Residual risks" heading — which mixed in-container gaps,
 process notes and external checks, and filed integration content loss
@@ -3077,6 +3093,26 @@ cannot be mistaken for finished work — and the body says why: the end-state
 section (§6 *Finalization*) opens with `## Unconverged`, the decider's
 reasons followed by each unconverged subtask's own. Before this, no-work was decided in
 five scattered places and a run with unfinished work shipped an ordinary PR.
+
+*A delivery verdict counts only on the tree it was measured on.* Each
+delivery pass records the committed tree it read beside its verdict
+(final detection's `final_tree`, the recheck's and the pre-pass's
+`judged_*.tree`), and the decider takes the latest one only when that tree
+is the tree that ships — staging's `HEAD^{tree}` when the outcome is
+decided. Any other verdict, or none of the shipping tree at all, makes the
+run `unconverged` with the reason "the required items were not read on
+the tree that ships". The root cause this removes (review round 14 M2):
+the decider read whichever unmet list existed — final detection's, else
+the recheck's, else the pre-pass's — with no check of which tree it
+described, so a final judge that failed in a way its retry did not catch
+(a checkout `RuntimeError`) left detection with no verdict, the recheck's
+"nothing unmet" of an earlier commit decided the outcome, and the run
+ended `done` on a tree nothing had read. A delivery re-drive that moves
+HEAD re-keys detection's verdict to its final commit and tree only when
+every routed and every unverified item was read there; otherwise the
+verdict stays of its own tree and the run says so. And a final judge that
+fails in any way, not only a worker crash or timeout, is a judge that read
+nothing: its items are `unknown`, never `met`.
 
 ### Credential strategy
 
@@ -6873,6 +6909,16 @@ commands the worker ran, never to a re-drive (review round 12 L3: an
 implementer cannot make a worker's past run count either, so a re-drive
 of it could only end `unconverged`).
 
+An entry names its item by the item's index in the run's required
+items, and every pass keys it that way — the invariant is that an item
+index means one item everywhere it is written. Review round 14 M4 drove
+the root cause: the judge numbered the items it was handed, and the
+re-drive's re-check handed it only the items it re-checks, so a re-check
+of item 1 judged it as item 0 and replaced item 0's entry — erasing the
+human check of an item it never read — and an entry it wrote carried the
+same wrong index. The judge is now always given the whole list and told
+which indices to read.
+
 Leerie does not re-run the worker's command to settle it. That was built
 (review round 12 L3) and withdrawn (round 14), for two measured reasons.
 It never ran: of the 252 distinct worker commands the two bench replays'
@@ -7331,8 +7377,14 @@ round 13 claims M1 found three paths where it had):
   still unmet, and an "unchanged paths" item is still settled by its
   `git diff`. It had been `met` with no read at all;
 - a delivery ratchet whose judge pack fails, whose verifiability
-  classifier fails, or which raises leaves each item it did not read
-  *unverified* on the repair's commit: its row is `unknown`, it is no
+  classifier fails, whose execution route measured nothing (no
+  failing-test-ID diff on either side, or candidates the confirm budget
+  left unsettled), or which raises leaves each item it did not read
+  *unverified* on the repair's commit — derived as the prior met items no
+  route read, never listed failure by failure, which is how the
+  execution route was left out (review round 14 M3: a kept repair whose ID
+  diff measured nothing kept its execution-shaped items `met`, re-keyed to
+  the repair's commit and listed nowhere): its row is `unknown`, it is no
   longer prior met for the next ratchet, and it is listed. The re-drive
   reads those items once more on the commit it ends on, and only when
   none is left unverified does it re-key the verdict to that commit
@@ -7487,15 +7539,40 @@ uncommitted path — a clean tree has no uncommitted path to cite. The records o
 own commands produced went with I2 (§6½): those commands now leave
 nothing behind to attribute.
 
-A worker in staging that crashes or times out is held to the same rule
-as one that returns: its round may already have edited the tree, so the
-gate runs after a raised `claude -p` too (the re-ask resumes whatever
-session it recorded, and with none recorded spends its attempt), and only
-then does the round end — the acceptance-repair round always did, the
-re-drive's `_redrive_drive` returns its error rather than raising, and
-the final conformer's round now does: it used to break on a worker error
-before its gate, leaving the crashed worker's edits in staging for every
-later reader (§8 *The final diff describes the tree that ships*).
+A worker that crashes or times out is held to the same rule as one that
+returns, in either tree: it may already have edited the tree, so the gate
+runs after a raised `claude -p` too (the re-ask resumes whatever session
+it recorded, and with none recorded spends its attempt), and only then
+does the round end. The root cause of the gap this closes is one shape
+in two workers: a crash arm that `break`s out of the round before the
+gate is reached, leaving the dead worker's edits for every later reader.
+Each of the six, audited:
+
+- *The final conformer* and *the per-subtask conformer* broke on a worker
+  error or a timeout (the per-subtask one also on PID exhaustion) before
+  their gate; both now run it first and break after.
+- *The implementer.* An attempt killed by its cgroup (PID or memory
+  exhaustion) is retried in place, in the same worktree, by a fresh worker
+  that no checkpoint tells about the dead one's edits — the gate runs
+  before that retry. An attempt that returns `complete`, `blocked` or
+  `failed` is gated before leerie reads its tree at all (the
+  declared-command and mechanical checks, settle by execution, the
+  conformer), not only on the `complete` path's last step: a `complete`
+  with no commits and a `blocked` routed to settle by execution used to be
+  measured with the worker's uncommitted edits in the tree. A checkpointed
+  handoff (`incomplete-handoff`, `needs-clarification`) passes its tree to
+  its own continuation, which is gated in turn; a session that died with no
+  result is the `empty_handoff` case below, and one with no commits is
+  reset.
+- *The acceptance-repair conformer* runs its gate after a raise and after a
+  return alike, before its round is measured.
+- *The re-drive implementer:* `_redrive_drive` returns a crash as a result,
+  never raises, so the gate after unstaging always runs.
+- *The integrator.* A crash restarts the merge from `pre_sha`, and a
+  `design-conflict`, `failed`, uncommitted merge or crashed repair round is
+  backed out or reset; each of those rollbacks removes untracked files too,
+  so the round's tree is gone exactly, which is what the gate would demand
+  of a round that cannot be kept.
 
 **No line of a staged set's source reaches history.** The invariant this
 barrier serves is exactly one: *the held-out test's source never reaches

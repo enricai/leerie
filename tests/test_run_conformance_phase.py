@@ -1443,3 +1443,34 @@ def test_noncanonical_spelling_of_a_committed_repair_counts(env):
             env["caps"], env["st"], env["models"], env["efforts"]))
         assert res.get("conformer_repair_rolled_back") is None, \
             (claimed, warnings)
+
+
+@pytest.mark.parametrize("crash", ["none", "pid"])
+def test_a_crashed_conformer_is_gated_before_the_round_ends(env, monkeypatch,
+                                                            crash):
+    """Lane B's audit: the round broke on a crash (a None result, or
+    `PidExhaustedError`) before its I1 gate, leaving the dead worker's edits
+    in the subtask worktree. The gate now runs first: re-asked, still
+    dirty, the round is rolled back and recorded."""
+    c = env["leerie"]
+    wt = env["worktree"]
+    before = _run(["git", "rev-parse", "HEAD"], cwd=wt).stdout.strip()
+
+    async def _stub(sid, leerie_dir, worktree, *a, **k):
+        (Path(worktree) / "half.py").write_text("x = 1\n")
+        if crash == "pid":
+            raise c.PidExhaustedError("pids.max reached")
+        return None
+    c._run_conformer = _stub
+    _stub_measure_axes(c, {})
+    calls = _reask_stub(c, monkeypatch)
+    res, warnings, _ = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(wt), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert len(calls) == 2
+    assert res is None
+    assert not (wt / "half.py").exists()
+    assert _run(["git", "rev-parse", "HEAD"], cwd=wt).stdout.strip() == before
+    assert env["st"].data["unclean_trees"]["conformer:t1 round 0"][
+        "lines"] == ["?? half.py"]
+    assert any("left its tree unclean" in w for w in warnings), warnings

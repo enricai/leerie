@@ -560,3 +560,145 @@ def test_implementer_left_dirty_settles_unconverged(env, monkeypatch):  # noqa: 
     assert (env["worktree"] / "helpers.py").exists()
     assert _git("ls-files", "helpers.py",
                 cwd=env["worktree"]).stdout.strip() == ""
+
+
+# --- I1 before anything reads the tree, on every terminal status, and before
+# an in-place retry (DESIGN §8 *A worker leaves its tree clean*: the six
+# workers audited). ----------------------------------------------------------
+
+def _reask_commits(leerie_mod, env, monkeypatch, reasks):  # noqa: F811
+    async def fake_claude_p(**kw):
+        reasks.append(kw)
+        _git("add", "-A", cwd=env["worktree"])
+        _git("commit", "-q", "-m", "reask", cwd=env["worktree"])
+        return {}
+    monkeypatch.setattr(leerie_mod, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie_mod, "_log_session_id", lambda p: "sess-impl")
+
+
+def test_a_complete_with_only_uncommitted_work_is_reasked_first(
+        env, monkeypatch):  # noqa: F811
+    """A `complete` whose work is all uncommitted used to reach the
+    no-commits arm (settle by execution over the dirty tree) before any
+    clean-tree check. The worker is re-asked first; once it commits, the
+    commit check sees its work."""
+    leerie_mod = env["leerie"]
+    calls: list = []
+    reasks: list[dict] = []
+
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        calls.append(note)
+        (env["worktree"] / "feature.py").write_text("def g():\n    pass\n")
+        return {"subtask_id": sid_, "status": "complete",
+                "summary": "done", "criteria_results": [],
+                "production_evidence": {"exercised": True, "how": "n/a",
+                                         "observed": "n/a"}}
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+
+    async def _no_conformance(*a, **k):
+        return None, [], None
+    monkeypatch.setattr(leerie_mod, "_run_conformance_phase",
+                        _no_conformance)
+
+    async def _never(*a, **k):
+        raise AssertionError("measured a tree the worker left dirty")
+    monkeypatch.setattr(leerie_mod, "_settle_by_execution", _never)
+    monkeypatch.setattr(leerie_mod, "_settle_nothing_to_change", _never)
+    _reask_commits(leerie_mod, env, monkeypatch, reasks)
+
+    res = _settle(leerie_mod, env, caps_overrides={"failed_retries": 3})
+
+    assert len(calls) == 1 and len(reasks) == 1
+    assert "?? feature.py" in reasks[0]["user_prompt"]
+    assert res["status"] not in ("unconverged", "blocked"), res
+    assert _git("ls-files", "feature.py",
+                cwd=env["worktree"]).stdout.strip() == "feature.py"
+
+
+def test_a_blocked_attempt_left_dirty_settles_unconverged(env, monkeypatch):  # noqa: F811
+    leerie_mod = env["leerie"]
+
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        (env["worktree"] / "half.py").write_text("x = 1\n")
+        return {"subtask_id": sid_, "status": "blocked",
+                "blocker": "cannot reproduce", "summary": "blocked",
+                "blocker_kind": "cannot_reproduce"}
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+
+    async def _never(*a, **k):
+        raise AssertionError("routed a blocked attempt over a dirty tree")
+    monkeypatch.setattr(leerie_mod, "_route_blocker_kind", _never)
+    reasks: list[dict] = []
+
+    async def fake_claude_p(**kw):
+        reasks.append(kw)
+        return {}
+    monkeypatch.setattr(leerie_mod, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie_mod, "_log_session_id", lambda p: "sess-impl")
+
+    res = _settle(leerie_mod, env)
+
+    assert len(reasks) == 2
+    assert res["status"] == "unconverged"
+    rec = env["st"].data["unconverged_subtasks"]["t1"]
+    assert rec["kind"] == "unclean_tree"
+    assert rec["previous_status"] == "blocked"
+    assert "?? half.py" in rec["reason"]
+
+
+def test_a_killed_attempt_is_gated_before_its_in_place_retry(env,
+                                                            monkeypatch):  # noqa: F811
+    """An OOM-killed attempt is retried in place by a fresh worker no
+    checkpoint tells about its edits: the killed session is re-asked first,
+    and, still dirty, the subtask settles unconverged without a retry."""
+    leerie_mod = env["leerie"]
+    calls: list = []
+
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        calls.append(1)
+        (env["worktree"] / "half.py").write_text("x = 1\n")
+        raise leerie_mod.OomKilledError(f"worker {sid_} was OOM-killed")
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+    reasks: list[dict] = []
+
+    async def fake_claude_p(**kw):
+        reasks.append(kw)
+        return {}
+    monkeypatch.setattr(leerie_mod, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie_mod, "_log_session_id", lambda p: "sess-impl")
+    monkeypatch.setattr(leerie_mod, "_at_measured_ceiling", lambda st: False)
+
+    res = _settle(leerie_mod, env, caps_overrides={"failed_retries": 3})
+
+    assert len(calls) == 1 and len(reasks) == 2
+    assert res["status"] == "unconverged"
+    rec = env["st"].data["unconverged_subtasks"]["t1"]
+    assert rec["previous_status"] == "in_progress"
+    assert "?? half.py" in rec["reason"]
+
+
+def test_a_killed_attempt_that_cleans_up_is_retried(env, monkeypatch):  # noqa: F811
+    leerie_mod = env["leerie"]
+    calls: list = []
+
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        calls.append(1)
+        (env["worktree"] / "half.py").write_text("x = 1\n")
+        raise leerie_mod.OomKilledError(f"worker {sid_} was OOM-killed")
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+
+    async def fake_claude_p(**kw):
+        (env["worktree"] / "half.py").unlink()
+        return {}
+    monkeypatch.setattr(leerie_mod, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie_mod, "_log_session_id", lambda p: "sess-impl")
+    monkeypatch.setattr(leerie_mod, "_at_measured_ceiling", lambda st: False)
+
+    res = _settle(leerie_mod, env, caps_overrides={"failed_retries": 1})
+
+    assert len(calls) == 2                        # retried after cleanup
+    assert res["status"] == "failed"
