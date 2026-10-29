@@ -6910,7 +6910,10 @@ any_commits: bool) -> str` is the only writer of `state.data["outcome"]`
 (`done` / `no_work` / `unconverged`, `OUTCOMES`) and of
 `state.data["outcome_reasons"]`, and mirrors `outcome` into `run.json`.
 `unconverged` when any of: a `subtask_status` value is `unconverged`;
-`test_id_diff.new` is non-empty; `acceptance.gate.final` holds a failing
+`test_id_diff.new` is non-empty (reason `"<N> test(s) newly failing on
+the final tree, confirmed against the base"`, or, when the diff carries
+`stale_for_tree`, `"… on an earlier tree (the tree that ships could not be
+measured), …"`); `acceptance.gate.final` holds a failing
 measured set that still has work (`_acceptance_result_has_work`: not typed
 broken, and — when the scope judge bounded the set — one of its
 `failing_files` holds a counted case), or, when none does,

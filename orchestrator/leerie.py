@@ -34373,10 +34373,14 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
     if isinstance(diff, dict) and diff.get("new"):
         short = [x for x in diff.get("budget_short") or []
                  if x in diff["new"]]
-        reasons.append(f"{len(diff['new'])} test(s) newly failing on the "
-                       + ("an earlier tree (the delivery re-drive's final "
-                          "tree could not be measured), "
-                          if diff.get("stale_for_tree") else "final tree, ")
+        # `stale_for_tree` is written by every refresh that could not
+        # measure the tree that ships — the re-drive's tail and phase 5's
+        # own — so the reason names that tree, not one stage.
+        reasons.append(f"{len(diff['new'])} test(s) newly failing on "
+                       + ("an earlier tree (the tree that ships could not "
+                          "be measured), "
+                          if diff.get("stale_for_tree")
+                          else "the final tree, ")
                        + "confirmed against the base"
                        + (f" ({len(short)} on fewer than every base/final "
                           "pair: the confirm budget cut the rest)"
