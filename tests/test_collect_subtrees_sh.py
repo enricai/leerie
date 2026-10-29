@@ -551,3 +551,42 @@ def test_a_skipped_branch_leaves_staging_as_it_found_it(tmp_path, status):
     assert subprocess.run(
         ["git", "status", "--porcelain", "--untracked-files=all"],
         cwd=staging, capture_output=True, text=True).stdout == ""
+
+
+def test_a_reset_that_fails_stops_the_collection(tmp_path):
+    """A back-out that cannot restore staging (here an `index.lock` the
+    integrator left, which every git write then refuses) stops the
+    collection: the remaining branch is skipped, not merged onto a tree the
+    reset could not restore, and no second integrator is spawned on it.
+    Before, the `|| true` back-out let the loop go on."""
+    repo = _make_fixture_repo(tmp_path)
+    run_id = "test-stuck-abc"
+    state_dir = tmp_path / "state"
+    _make_run_branch(repo, run_id)
+    _make_state_json(state_dir, run_id, waves=[["s1", "s2", "s3"]],
+                     completed_waves=0)
+    _make_subtask_branch(repo, run_id, "s1", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version A\n"})
+    _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version B\n"})
+    _make_subtask_branch(repo, run_id, "s3", f"leerie/runs/{run_id}",
+                         {"other.txt": "s3\n"})
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
+    calls = tmp_path / "integrator-calls"
+    claude = tmp_path / "bin" / "claude"
+    claude.write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo x >> "{calls}"\n'
+        'touch "$(git rev-parse --git-dir)/index.lock"\n'
+        'echo \'{"type":"result","structured_output":'
+        '{"incoming_subtask":"t","status":"failed","diagnosis":"d"}}\'\n')
+    claude.chmod(0o755)
+    env = {"LEERIE_REPO": str(REPO_ROOT),
+           "PATH": f"{stub.parent}:{os.environ['PATH']}"}
+    result = run_bash(
+        f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
+        env=env)
+    assert result.returncode == 0, f"stderr={result.stderr}"
+    assert "integrated 1" in result.stderr.lower(), result.stderr
+    assert "skipped 2" in result.stderr.lower(), result.stderr
+    assert calls.read_text().count("x") == 1

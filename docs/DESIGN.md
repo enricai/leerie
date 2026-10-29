@@ -2727,7 +2727,10 @@ skipped branch — no integrator, a crash, a verdict other than `resolved`,
 or a `resolved` whose merge is not committed or whose tree is not clean
 (I1, §8 *A worker leaves its tree clean*, with no re-ask: the script has
 no session to resume) — is reset to the commit before its merge (`git
-reset --hard`, then `git clean -fd`, ignored files kept). A `git merge
+reset --hard`, then `git clean -fd`, ignored files kept, through the same
+reset `setup-run.sh` uses). A reset that fails stops the collection: the
+remaining branches are reported skipped, never merged onto a tree the
+reset could not restore. A `git merge
 --abort` did not do that: it keeps an edit the integrator made to a file
 outside the merge, which the next branch's merge then refused or the
 next integrator swept in. This runs after the `finished_at` patch and before
@@ -5241,6 +5244,26 @@ worker commits from; the setup hook and
 the advisory whole-PR review, a worker, has what it leaves undone by the
 same two acts.
 
+Ownership and permissions do not stand in the bracket's way on any
+runtime, and the reason is one property: every file the bracketed command
+can create in a worker's tree is owned by the orchestrator's own uid. The
+command is a child of the orchestrator; the cgroup broker, which runs as
+root, only enrolls the pid and never spawns; the image ships no `sudo`.
+Rootful's `runuser -u leerie` is a real uid switch, rootless's `unshare
+--map-user` maps the host user to that same inner uid (the
+bind-mounted state root is the host user's), and Fly runs the
+orchestrator as `leerie` too, so the tree's files are the orchestrator's
+in all three. What can still stop a removal is a permission *bit*: a test
+that makes a directory read-only (testing an `EACCES` path) and dies
+before restoring it. `git clean` and `unlink` then fail with "Permission
+denied" on every runtime alike. Since the directory is the orchestrator's
+own, the bracket restores the write bit on the directories between the
+tree and a path it removes or puts back, and only then acts. A path it
+still cannot remove or restore — so not the orchestrator's own, which no
+code path produces — stops the run there, naming the path and the
+error, rather than leaving dirt that `_assert_staging_clean` would later
+report with no cause.
+
 Three details keep the snapshot itself sound. Only the snapshot taken
 before a command writes its blobs to the object store, since only those
 bytes are ever written back; every other snapshot is only compared
@@ -7278,7 +7301,12 @@ Ctrl-C's cleanup, which removes the worktree and keeps the branch, leaves
 the resume. This runs once per process; within a process the per-attempt
 rules govern a subtask's worktree (I1 on a `complete` result; a handoff
 commits its partial work and leaves its checkpoint in the run
-directory). A killed
+directory). The reset first restores the write bit on the worktree's
+tracked directories and on every untracked, not-ignored path, for the
+reason §6½ gives (a killed test's read-only directory made `git clean`
+and `git reset --hard` fail with "Permission denied", and `setup-run.sh`,
+under `set -e`, then stopped every resume); a failure that remains stops
+setup with git's own error. A killed
 integrator's half resolution goes with it, as it already did under a
 Ctrl-C's cleanup. Continuing would mean
 measuring, judging or shipping a tree leerie cannot name — the very guess

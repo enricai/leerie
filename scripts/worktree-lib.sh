@@ -136,3 +136,27 @@ leerie_worktree_name() {
   local name="${2:?usage: leerie_worktree_name <run-id> <name>}"
   printf '%s-%s' "${run_id:0:12}" "$name"
 }
+
+# leerie_reset_worktree <worktree> [<rev>]
+#
+# Put <worktree> at <rev> (default HEAD) with nothing uncommitted: `reset
+# --hard` (which also ends a merge in progress), then `clean -fdq` (ignored
+# files kept). A test a SIGKILL interrupted can leave a read-only directory,
+# and git then fails with "Permission denied" on every runtime; the
+# directories are the orchestrator's own, so the owner's write and search
+# bits go back first on every tracked directory and on every untracked,
+# not-ignored path (DESIGN §6½, §8). Returns git's status: a failure that
+# remains is the caller's to stop on.
+leerie_reset_worktree() {
+  local wt="${1:?usage: leerie_reset_worktree <worktree> [<rev>]}"
+  local rev="${2:-HEAD}"
+  chmod u+wx "$wt" 2>/dev/null || true
+  (
+    cd "$wt" || exit 0
+    git ls-tree -r -d -z --name-only HEAD 2>/dev/null \
+      | xargs -0 -r chmod u+wx -- 2>/dev/null || true
+    git ls-files -z --others --exclude-standard --directory 2>/dev/null \
+      | xargs -0 -r chmod -R u+w -- 2>/dev/null || true
+  )
+  git -C "$wt" reset -q --hard "$rev" && git -C "$wt" clean -fdq
+}

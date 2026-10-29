@@ -219,8 +219,18 @@ integrated_so_far=""
 # ones kept). `git merge --abort` kept an edit the integrator made outside
 # the merge, which the next branch's merge then refused or the next
 # integrator swept in (DESIGN §6 *Subtree collection*).
+# The reset is setup-run.sh's (`leerie_reset_worktree`, which first restores
+# the write bit a killed test's read-only directory took away). One that
+# still fails stops the collection: every remaining branch is skipped, never
+# merged onto a tree the reset could not restore.
+# shellcheck source=scripts/worktree-lib.sh
+. "$SCRIPTS/worktree-lib.sh"
+backout_failed=false
 _back_out() {
-  (cd "$staging" && git reset -q --hard "$1" && git clean -fdq) || true
+  if ! leerie_reset_worktree "$staging" "$1" >&2; then
+    backout_failed=true
+    echo "collect-subtrees: staging could not be reset to ${1}; the remaining branches are skipped" >&2
+  fi
 }
 
 _skip() {
@@ -233,6 +243,10 @@ _skip() {
 }
 
 for sid in "${integrate_order[@]}"; do
+  if [ "$backout_failed" = true ]; then
+    _skip "$sid"
+    continue
+  fi
   pre=$(cd "$staging" && git rev-parse HEAD)
   rc=0
   bash "$SCRIPTS/integrate.sh" "$sid" "$run_id" >/dev/null 2>&1 || rc=$?

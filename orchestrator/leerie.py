@@ -39230,6 +39230,33 @@ def _changed_paths(before: dict[str, str | None],
                   if before.get(p, head) != after.get(p, head))
 
 
+def _writable_dirs_to(tree: str | Path, rel: str) -> None:
+    """Give every directory from `tree` down to `rel`'s parent the owner's
+    write and search bits when it lacks them, so `rel` can be removed or
+    written back (DESIGN §6½: a test that made a directory read-only and
+    died before restoring it). The directories are the orchestrator's own on
+    every runtime; a chmod refused (not ours) is left to the caller's
+    postcondition."""
+    root = Path(tree)
+    parts = Path(rel).parts[:-1]
+    for i in range(len(parts) + 1):
+        d = root.joinpath(*parts[:i])
+        with contextlib.suppress(OSError):
+            mode = d.lstat().st_mode
+            if stat.S_ISDIR(mode) and (mode & 0o300) != 0o300:
+                os.chmod(d, stat.S_IMODE(mode) | 0o300)
+
+
+def _rmtree_owned(path: Path) -> None:
+    """`shutil.rmtree` after giving every directory under `path` the owner's
+    write and search bits (its read-only subdirectories would otherwise
+    keep their contents)."""
+    for d, _dirs, _files in os.walk(path):
+        with contextlib.suppress(OSError):
+            os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) | 0o700)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def _restore_tracked_content(tree: str | Path,
                              before: dict[str, str | None]) -> list[str]:
     """Put every tracked file a command changed back as it was in `before`
@@ -39250,11 +39277,12 @@ def _restore_tracked_content(tree: str | Path,
                    (_GITLINK, _UNHASHED)) for snap in (before, after))]
     for p in changed:
         dst = Path(tree) / p
+        _writable_dirs_to(tree, p)
         if (before.get(p, "") is not None and dst.is_dir()
                 and not dst.is_symlink()):
             # The command replaced the tracked file with a directory
             # (`_tracked_content` lists it as gone); it was a file before.
-            shutil.rmtree(dst, ignore_errors=True)
+            _rmtree_owned(dst)
         if p not in before:
             subprocess.run(["git", "--literal-pathspecs", "-C", str(tree),
                             "checkout", "HEAD", "--", p],
@@ -39286,6 +39314,7 @@ def _remove_new_untracked(tree: str | Path, before: set[str]) -> list[str]:
         return []
     made = sorted(now - before)
     for rel in made:
+        _writable_dirs_to(tree, rel)
         with contextlib.suppress(OSError):
             (Path(tree) / rel).unlink()
     for d in sorted({os.path.dirname(r) for r in made if "/" in r},
@@ -39293,6 +39322,27 @@ def _remove_new_untracked(tree: str | Path, before: set[str]) -> list[str]:
         with contextlib.suppress(OSError):
             os.removedirs(Path(tree) / d)
     return made
+
+
+def _not_as_found(tree: str | Path, before: dict[str, str | None] | None,
+                  untracked_before: set[str] | None) -> list[str]:
+    """The bracket's postcondition: the tracked paths still changed since
+    `before` (submodules and unhashed paths aside, as
+    `_restore_tracked_content` leaves them) and the untracked, not-ignored
+    paths not in `untracked_before`. [] when either snapshot is missing or
+    git cannot say — then nothing was promised."""
+    out: list[str] = []
+    if before is not None:
+        after = _tracked_content(tree)
+        if after is not None:
+            out += [p for p in _changed_paths(before, after)
+                    if not any(str(snap.get(p) or "").startswith(
+                        (_GITLINK, _UNHASHED)) for snap in (before, after))]
+    if untracked_before is not None:
+        now = _untracked_files(tree)
+        if now is not None:
+            out += sorted(now - untracked_before)
+    return out
 
 
 def _log_undone(log_prefix: str, did: str, what: str,
@@ -39348,6 +39398,16 @@ async def _leaves_tree_as_found(tree: str | Path, what: str,
                     f"tracked file(s) its own {what} rewrote", put_back)
         _log_undone(log_prefix, "removed",
                     f"untracked file(s) its own {what} created", removed)
+        left = await asyncio.to_thread(_not_as_found, tree, before,
+                                       untracked_before)
+        if left:
+            die(f"{log_prefix}: leerie's own {what} left {len(left)} "
+                f"path(s) in {tree} it cannot remove or put back: "
+                + ", ".join(left[:5])
+                + (f" (+{len(left) - 5} more)" if len(left) > 5 else "")
+                + " — the tree is not as it found it (I2, DESIGN §6½). Not "
+                "the orchestrator's own files, so check who wrote them; "
+                "`leerie resume` continues once they are gone.")
 
 
 def _blt_memo_key(axis: str, cmd: str, tree_sha: str) -> str:

@@ -565,3 +565,46 @@ def test_i2_a_coverage_command_leaves_the_tree_as_found(leerie, tmp_path,
         caps=dict(leerie.DEFAULT_CAPS), sid="s", tag="t"))
     assert out["rc"] == 0
     _assert_as_found(t, before, sub)
+
+
+# --------------------------------------------------------------------------
+# Permission bits (DESIGN §6½): a test that makes a directory read-only and
+# dies before restoring it. The files are the orchestrator's own on every
+# runtime, so the bracket restores the write bit and still leaves the tree
+# as it found it; what it truly cannot remove stops the run, named.
+
+def test_i2_a_read_only_directory_does_not_keep_the_commands_output(
+        leerie, tmp_path, monkeypatch):
+    t, before = _family_tree(tmp_path)
+    (t / "pkg").mkdir()
+    (t / "pkg" / "mod.txt").write_text("orig\n")
+    _git(t, "add", "pkg")
+    _git(t, "commit", "-qm", "pkg")
+    _tool(tmp_path, monkeypatch, "fakeinst",
+          "mkdir -p out/locked && printf r > out/locked/f && "
+          "chmod 0555 out/locked out && "
+          "printf changed > pkg/mod.txt && chmod 0555 pkg")
+    try:
+        assert _deps(leerie, t, [{"kind": "install",
+                                  "command": ["fakeinst"]}]) is True
+        assert _status(t) == before
+        assert not (t / "out").exists()
+        assert (t / "pkg" / "mod.txt").read_text() == "orig\n"
+    finally:
+        subprocess.run(["chmod", "-R", "u+w", str(t)], check=False)
+
+
+def test_i2_what_the_bracket_cannot_undo_stops_the_run_named(
+        leerie, tmp_path, monkeypatch, capsys):
+    t, _ = _family_tree(tmp_path)
+    monkeypatch.setattr(leerie, "_remove_new_untracked",
+                        lambda tree, before: [])
+
+    async def cmd():
+        async with leerie._leaves_tree_as_found(t, "test run", "t"):
+            (t / "stuck.txt").write_text("x")
+    with pytest.raises(SystemExit):
+        asyncio.run(cmd())
+    err = capsys.readouterr().err
+    assert "leerie's own test run left 1 path(s)" in err
+    assert "stuck.txt" in err

@@ -155,8 +155,7 @@ else
   # with nothing uncommitted (DESIGN §8 *The final diff describes the tree
   # that ships*): reset ends any merge, clean keeps ignored files (installed
   # dependencies). The run branch itself is untouched.
-  git -C "${STAGING_WT}" reset -q --hard HEAD
-  git -C "${STAGING_WT}" clean -fdq
+  leerie_reset_worktree "${STAGING_WT}"
 fi
 
 # The same for every subtask worktree of this run that survived its process
@@ -166,8 +165,7 @@ fi
 # by branch, so other runs' worktrees and detached helpers are untouched.
 while IFS= read -r subtask_wt; do
   [ -n "$subtask_wt" ] && [ -d "$subtask_wt" ] || continue
-  git -C "$subtask_wt" reset -q --hard HEAD
-  git -C "$subtask_wt" clean -fdq
+  leerie_reset_worktree "$subtask_wt"
 done < <(git worktree list --porcelain | awk -v pre="branch refs/heads/leerie/subtasks/${RUN_ID}/" '
   /^worktree / { wt = substr($0, 10) }
   index($0, pre) == 1 { print wt }')

@@ -138,3 +138,29 @@ def test_subtask_worktrees_a_sigkill_left_dirty_are_reset_on_resume(
     # new-worktree.sh then reattaches to the clean worktree.
     assert _subtask_worktree(repo, "feat-001") == wt
     assert _git(wt, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+def test_a_read_only_directory_a_killed_test_left_does_not_stop_the_resume(
+        tmp_path, monkeypatch):
+    """`git clean` and `git reset --hard` fail with "Permission denied" in a
+    read-only directory on every runtime, and setup-run.sh runs under
+    `set -e`: every resume stopped. The directories are the orchestrator's
+    own, so `leerie_reset_worktree` restores the write bit first."""
+    repo, _staging = _repo(tmp_path, monkeypatch)
+    wt = _subtask_worktree(repo, "feat-001")
+    (wt / "pkg").mkdir()
+    (wt / "pkg" / "a.txt").write_text("a\n")
+    _git(wt, "add", "pkg")
+    _git(wt, "commit", "-q", "-m", "pkg")
+    (wt / "pkg" / "a.txt").write_text("half\n")
+    (wt / "pkg" / "tmp").mkdir()
+    (wt / "pkg" / "tmp" / "f").write_text("x\n")
+    for d in (wt / "pkg" / "tmp", wt / "pkg"):
+        d.chmod(0o555)
+    try:
+        _setup(repo)
+        assert _git(wt, "status", "--porcelain",
+                    "--untracked-files=all") == ""
+        assert (wt / "pkg" / "a.txt").read_text() == "a\n"
+    finally:
+        subprocess.run(["chmod", "-R", "u+w", str(wt)], check=False)
