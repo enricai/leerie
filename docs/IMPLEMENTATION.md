@@ -6357,7 +6357,20 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     leerie's own commands put back what they rewrite
     (`_leaves_tracked_files`, below).
   - Post-execution readers (DESIGN §8 *Every post-execution verdict is of
-    the committed tree*): `_verify_delivery_cite` reads
+    the committed tree*): the delivery judges' `cwd` — `_delivery_judge_unmet`'s
+    items and contract (`"delivery-judge"`) and `_ratchet_judge`'s packs
+    (`"delivery-ratchet"`, through `_ratchet_judge_packs(..., cwd, ...)`) —
+    is `async with _committed_checkout(st, staging, name) as cwd`: staging
+    itself when `_worktree_tree_sha(staging)` is its `_committed_tree_sha`,
+    else a detached checkout of staging's HEAD at `_helper_worktree_path(st,
+    name)` (`_worktree_add_detached_async(st, wt, head, repo=staging)` —
+    `_worktree_add_detached` takes an optional `repo`, default
+    `st.repo_root`), removed afterwards (`git -C <staging> worktree remove
+    --force` + `rmtree`); RuntimeError when it cannot be added (review round
+    12 claims M1, `tests/test_judges_read_the_committed_tree.py`). Each
+    judge verdict's citation paths are made relative to that `cwd`
+    (`_relative_cites(v, cwd)`, `_delivery_cite_rel`; `RECORD`/`ABSENT`
+    left alone) before screening against staging's HEAD. `_verify_delivery_cite` reads
     `git show HEAD:<rel>` / `git grep … HEAD`, `_d1_untouched_verdict`
     `git diff <own_start>..HEAD`, `_evaluate_acceptance_sets` a detached
     worktree at `rev`, and a `RECORD` cite verifies only against

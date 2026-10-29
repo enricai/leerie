@@ -7200,13 +7200,23 @@ never calling a worker's file an artifact.
 
 **Every post-execution verdict is of the committed tree.** The invariant:
 *a verdict becomes `met` only on a read of a commit, or on a measurement
-the orchestrator itself made of the committed tree.* The delivery
-judges run with staging as their working directory, and staging can hold
+the orchestrator itself made of the committed tree.* Staging can hold
 what does not ship: an edit a worker left, an untracked file. Review
-round 9 asked whether they, and the held-out re-measure, therefore judge
-the wrong tree. They do not, and they were left where they are, because
-every check that can make a verdict *met* reads a commit — no exception:
+round 9 asked whether the delivery judges, and the held-out re-measure,
+therefore judge the wrong tree. Every check that can make a verdict *met*
+reads a commit:
 
+- the delivery judges — every item verdict, the DEFECT CONTRACT verdict,
+  and the delivery ratchet's re-verification of the items a re-drive group
+  did not route — read a clean checkout of staging's HEAD (staging itself
+  only when nothing at all is uncommitted there), so content only the
+  working tree holds is not in front of them; a checkout that cannot be
+  made fails the judge, never falls back to staging. Review round 12
+  drove why the cite rule below was not enough on its own: the contract
+  verdict carries no citation and resolved `met` on a single sample, and
+  the ratchet re-verified kept items with no citation check — both judged
+  staging's working tree, so an untracked helper could hold the contract
+  up;
 - a judge's `met` counts only when each part cites a quote found in
   `git show HEAD:<path>` (`_verify_delivery_cite`), and an `ABSENT` cite
   is `git grep` over `HEAD`, so content only the working tree holds buys
@@ -7248,9 +7258,8 @@ A text tag is forgeable by whoever writes the text; the store the cite
 check reads is now built only from the orchestrator's typed state, and a
 worker's command is joined onto one line besides.
 
-What staging-only content can still do is make a judge vote *unmet* on
-something that ships correctly — a cost (a re-drive spent), not a false
-`met`. The one staging read that is a measurement, the re-drive ratchet's
+The judges no longer see staging-only content at all. The one staging
+read that is a measurement, the re-drive ratchet's
 test IDs, compares staging before and after a group with the same
 leftover dirt on both sides — every not-ignored file the group made is
 committed by its leftovers commit (below) unless that commit withholds
