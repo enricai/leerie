@@ -7256,11 +7256,13 @@ the orchestrator itself made of the committed tree.* Staging can hold
 what does not ship: an edit a worker left, an untracked file. Review
 round 9 asked whether the delivery judges, and the held-out re-measure,
 therefore judge the wrong tree. Every check that can make a verdict *met*
-reads a commit:
+reads a commit, and a check that fails to read one makes nothing *met*:
 
 - the delivery judges — every item verdict, the DEFECT CONTRACT verdict,
-  and the delivery ratchet's re-verification of the items a re-drive group
-  did not route — read a clean checkout of staging's HEAD (staging itself
+  and the delivery ratchet's judged re-verification of the items a
+  re-drive group did not route (its execution-typed items are read from
+  the failing-test-ID diff of the commit, below) — read a clean checkout
+  of staging's HEAD (staging itself
   only when its working tree is byte-identical to HEAD, not even an
   ignored file differing: review round 13 L2 drove a worker's uncommitted
   `dist/` build, ignored and so invisible to a plain status, in front of
@@ -7317,14 +7319,35 @@ check reads is now built only from the orchestrator's typed state and its
 own captured re-run output, and a worker's command is joined onto one
 line besides.
 
-The judges no longer see staging-only content at all. The one staging
-read that is a measurement, the re-drive ratchet's
-test IDs, compares staging before and after a group with the same
-leftover dirt on both sides — every not-ignored file the group made is
-committed by its leftovers commit (below) unless that commit withholds
-it and lists it, so what stays uncommitted after it is what was there
-before, leerie's own artifacts, files the repository ignores and the
-withheld files the PR lists — and the final diff measures the committed
+A check that fails reads nothing, so it settles nothing *met* (review
+round 13 claims M1 found three paths where it had):
+
+- a final delivery judge that crashes (a worker error or a timeout) is
+  asked again, up to `delivery_judge_crash_retries` more times; if every
+  attempt crashes, each item nothing else read is `unknown` and listed
+  under "Needs human verification" — an item the falsifier confirmed is
+  still unmet, and an "unchanged paths" item is still settled by its
+  `git diff`. It had been `met` with no read at all;
+- a delivery ratchet whose judge pack fails, whose verifiability
+  classifier fails, or which raises leaves each item it did not read
+  *unverified* on the repair's commit: its row is `unknown`, it is no
+  longer prior met for the next ratchet, and it is listed. The re-drive
+  reads those items once more on the commit it ends on, and only when
+  none is left unverified does it re-key the verdict to that commit
+  (below); detection, which reads every item, clears the marks. They had
+  kept their `met` with no read of the new commit, and the re-key then
+  stamped it with that commit;
+- the ratchet's execution route — the failing-test-ID measurement, its
+  intermittent-discovery repeats and B\*'s rerun of the repaired side —
+  runs where only the commit is: staging when nothing but ignored files
+  differs from HEAD (those are the repository's installed dependencies,
+  which every measurement runs with), else a clean checkout of HEAD with
+  its dependencies installed; when that cannot be made the measurement is
+  missing, never one of staging's working tree. It had measured staging
+  as it stood, beside a withheld leftover.
+
+The judges no longer see staging-only content at all, and the ratchet's
+test IDs are measured on the commit. The final diff measures the committed
 tree again before the outcome is decided.
 
 When the `tests` axis cannot be measured on that tree — the command did not
@@ -7579,9 +7602,11 @@ the last measured verdict, as at the end of the re-drive); the merge
 checks re-run. The re-drive's own verdict is re-keyed rather than
 re-measured: when the detection it routed from was of the commit it
 started on, and it has re-checked its routed items on the commit it ends
-on, `final_sha` becomes that commit — every kept group's ratchet already
-re-verified the items it did not route — so a resume after it keeps the
-verdict `_decide_outcome` reads instead of running detection over it.
+on, and no item a failed ratchet left unverified remains, `final_sha`
+becomes that commit — every kept group's ratchet re-verified the items
+it did not route — so a resume after it keeps the verdict
+`_decide_outcome` reads instead of running detection over it. With an
+item still unverified the key stays, and a resume runs detection.
 Until this rule, detection's skip read only the presence of `unmet_final`
 and the acceptance gate's only the presence of `final`: a resume after a
 re-drive group had moved the tree reused verdicts of a tree that no longer

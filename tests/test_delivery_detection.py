@@ -1524,3 +1524,62 @@ def test_a_compound_items_unknown_test_part_is_never_read_met(
     row = st.data["delivery_gate"]["items"][0]
     assert row["verdict"] == "met" and "test_outcome_part" not in row
     assert "reason" not in row
+
+
+class TestAJudgeCrashIsNeverMet:
+    """Review round 13 claims M1: a crashed final judge set `unmet = []`,
+    and every item the falsifier did not confirm became a `met` row with no
+    read of the commit. Now it is retried within
+    `delivery_judge_crash_retries`, then its items are `unknown` and go to
+    "Needs human verification"; an untouched-paths item is still settled by
+    its git-diff read."""
+
+    def _run(self, leerie, tmp_path, monkeypatch, *, fail_times):
+        repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                              judged=False, k=1)
+        st.data["repo_state_before_planning"] = {"head": head}
+        st.save()
+        judge_calls: list[str] = []
+
+        async def fake_claude_p(**kw):
+            if kw["schema_key"] == "delivery_judge":
+                judge_calls.append(kw["sid"])
+                if len(judge_calls) <= fail_times:
+                    raise leerie.WorkerError("boom")
+                return {"verdicts": [_judge_verdict(i, True)
+                                     for i in (0, 2, 3)]}
+            return _demonstrate(kw, 0) if "i0" in kw["sid"] else {
+                "status": "no_probe"}
+        monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+        asyncio.run(leerie._run_delivery_detection(
+            st.run_dir, st, caps, MODELS, EFFORTS))
+        return st, judge_calls
+
+    def test_every_attempt_crashing_leaves_items_unknown(
+            self, leerie, tmp_path, monkeypatch):
+        st, calls = self._run(leerie, tmp_path, monkeypatch, fail_times=99)
+        assert len(calls) == 2              # 1 + delivery_judge_crash_retries
+        gate = st.data["delivery_gate"]
+        rows = {r["item_index"]: r for r in gate["items"]}
+        assert rows[0]["verdict"] == "unmet"          # the falsifier read it
+        assert rows[1]["verdict"] == "external"
+        assert rows[2]["verdict"] == "met"            # git diff own..HEAD
+        assert rows[3]["verdict"] == "unknown"
+        assert not [r for r in gate["items"] if r["verdict"] == "met"
+                    and r["item_index"] not in (2,)]
+        assert gate["final_judge"]["error"] and gate["final_judge"][
+            "attempts"] == 2
+        (e,) = [e for e in st.data["needs_human_verification"]
+                if e["source"] == "delivery_judge_unknown"]
+        assert "the module keeps its name" in e["detail"]
+        assert ITEM not in e["detail"]          # unmet, not unknown
+
+    def test_a_retry_that_succeeds_reads_the_items(self, leerie, tmp_path,
+                                                   monkeypatch):
+        st, calls = self._run(leerie, tmp_path, monkeypatch, fail_times=1)
+        assert len(calls) >= 2
+        rows = {r["item_index"]: r["verdict"]
+                for r in st.data["delivery_gate"]["items"]}
+        assert "unknown" not in rows.values()
+        assert not [e for e in st.data.get("needs_human_verification") or []
+                    if e["source"] == "delivery_judge_unknown"]

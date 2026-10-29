@@ -476,3 +476,185 @@ def test_an_unmeasured_id_diff_leaves_execution_items_unchecked_not_held(
     assert rat["exec_unchecked"] == ([2] if unmeasured else [])
     assert rat["regressed"] == [] and 2 not in rat["judge"]["judged"]
     assert leerie._ratchet_rollback_reason(rat) is None
+
+
+# --- review round 13 claims M1: a failed ratchet never keeps an item met ----
+
+def _kept_group_world(leerie, tmp_path, monkeypatch, *, fail, recheck_ok):
+    """A re-drive World with one met item and a kept group whose ratchet
+    `fail`s at the `judge` or the `classifier`; the end-of-re-drive re-read
+    of the unverified item crashes too unless `recheck_ok`."""
+    items = [{"item": "a keeps its guard", "span": "S1",
+              "verifiability": "tree"}]
+    w = World(leerie, tmp_path, items=items)
+    head = _git(w.staging, "rev-parse", "HEAD")
+    w.st.data["delivery_gate"]["items"] = [
+        {"item_index": 0, "item": items[0]["item"], "verdict": "met",
+         "by": [], "judge": {"met_evidence": "src/a.ts guards"}}]
+    w.st.data["delivery_gate"]["final_sha"] = head
+    w.st.save()
+    w.install(monkeypatch)
+    implementer = leerie.claude_p
+
+    async def workers(**kw):
+        key = kw["schema_key"]
+        if key == "implementer":
+            return await implementer(**kw)
+        if key == "verifiability_classifier":
+            if fail == "classifier":
+                raise leerie.WorkerError("classifier down")
+            return {"items": [{"item_index": 0, "verifiability": "in_tree",
+                               "reason": "r"}]}
+        if key == "delivery_ratchet":
+            raise leerie.WorkerError("ratchet judge down")
+        assert key == "delivery_judge"
+        if not recheck_ok:
+            raise leerie.WorkerError("judge down")
+        return {"verdicts": [{"item_index": 0, "met": True,
+                              "parts": [{"requirement": "r",
+                                         "kind": "behavioral",
+                                         "status": "met", "cites": [{
+                                             "path": "src/a.ts",
+                                             "line_start": 1, "line_end": 1,
+                                             "quote": "export const a = 1"}]}],
+                              "evidence": "src/a.ts"}]}
+    monkeypatch.setattr(leerie, "claude_p", workers)
+    w.edits = [lambda w: w.write("export const a = 1; // FIXED\n")]
+    w.run()
+    return w, head
+
+
+@pytest.mark.parametrize("fail", ["judge", "classifier"])
+def test_a_failed_ratchet_leaves_the_item_unknown_and_unkeyed(
+        leerie, tmp_path, monkeypatch, fail):
+    w, head = _kept_group_world(leerie, tmp_path, monkeypatch, fail=fail,
+                                recheck_ok=False)
+    g = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
+    assert not g.get("rolled_back")
+    assert g["ratchet"]["unverified"] == [0]
+    gate = w.st.data["delivery_gate"]
+    (row,) = gate["items"]
+    assert row["verdict"] == "unknown"        # never `met` with no read
+    assert "0" in w.st.data["delivery_ratchet"]["unverified"]
+    assert leerie._ratchet_prior_met(w.st) == {}
+    # Not re-keyed to the commit it was never read on.
+    final = _git(w.staging, "rev-parse", "HEAD")
+    assert final != head and gate["final_sha"] == head
+    (e,) = [e for e in w.st.data["needs_human_verification"]
+            if e["source"] == "ratchet_unverified"]
+    assert "a keeps its guard" in e["detail"]
+
+
+def test_a_failed_ratchet_item_is_read_again_at_the_end(leerie, tmp_path,
+                                                        monkeypatch):
+    """The retry: the re-drive's end re-reads the unverified item on the
+    final commit; a read that succeeds settles it and the verdict is
+    re-keyed."""
+    w, head = _kept_group_world(leerie, tmp_path, monkeypatch, fail="judge",
+                                recheck_ok=True)
+    gate = w.st.data["delivery_gate"]
+    (row,) = gate["items"]
+    final = _git(w.staging, "rev-parse", "HEAD")
+    assert row["verdict"] == "met" and row["redrive_recheck"]["sha"] == final
+    assert "unverified" not in w.st.data["delivery_ratchet"]
+    assert gate["final_sha"] == final
+    assert not [e for e in w.st.data.get("needs_human_verification") or []
+                if e["source"] == "ratchet_unverified"]
+
+
+def test_a_failed_acceptance_round_ratchet_drops_the_item_from_prior_met(
+        leerie, tmp_path, monkeypatch):
+    """The acceptance path: the kept round's ratchet judge fails, so the
+    in-tree items it was to re-read are unverified on the round's commit —
+    no longer prior met for the next round, listed until detection reads
+    them."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main",
+             required_items=ITEMS)
+    staging = _staging(st, repo)
+    start = _git(staging, "rev-parse", "HEAD")
+    st.data["delivery_gate"] = {"judged_before": _judged_before(start, [])}
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    w = Workers([_fix])
+
+    async def workers(**kw):
+        if kw["schema_key"] == "delivery_ratchet":
+            raise leerie.WorkerError("ratchet judge down")
+        return await w(**kw)
+    monkeypatch.setattr(leerie, "claude_p", workers)
+    asyncio.run(leerie._run_acceptance_gate(
+        st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    (r1,) = st.data["acceptance"]["gate"]["rounds"]
+    assert not r1.get("rollback_reason")
+    assert r1["ratchet"]["unverified"] == [0, 1]
+    assert sorted(st.data["delivery_ratchet"]["unverified"]) == ["0", "1"]
+    assert sorted(leerie._ratchet_prior_met(st)) == [2, 4]
+
+
+def test_the_execution_route_measures_the_commit_not_staging(
+        leerie, tmp_path, monkeypatch):
+    """The failing-test-ID measurement the ratchet's execution route reads
+    runs where only the commit is: a withheld leftover in staging is not
+    in its tree."""
+    w = World(leerie, tmp_path)
+    (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
+    seen: list[tuple[str, bool]] = []
+
+    async def ids(st, caps, tree, *, label, log_path):
+        seen.append((tree, (Path(tree) / "src" / "leftover.ts").exists()))
+        return {"ids": [], "files": {}, "command": "t"}
+
+    async def deps(*a, **k):
+        return True
+    monkeypatch.setattr(leerie, "_ratchet_test_ids", ids)
+    monkeypatch.setattr(leerie, "_ensure_worktree_deps", deps)
+    asyncio.run(leerie._redrive_test_ids(w.st, w.caps, w.staging, "x"))
+    ((tree, saw),) = seen
+    assert tree != str(w.staging) and not saw
+    assert not Path(tree).exists()            # removed afterwards
+    # A clean staging is measured in place.
+    (w.staging / "src" / "leftover.ts").unlink()
+    seen.clear()
+    asyncio.run(leerie._redrive_test_ids(w.st, w.caps, w.staging, "x"))
+    assert seen == [(str(w.staging), False)]
+    # No checkout with its dependencies: no measurement, never staging's.
+    (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
+
+    async def no_deps(*a, **k):
+        return False
+    monkeypatch.setattr(leerie, "_ensure_worktree_deps", no_deps)
+    seen.clear()
+    assert asyncio.run(leerie._redrive_test_ids(
+        w.st, w.caps, w.staging, "x")) is None and seen == []
+
+
+def test_the_ratchet_exec_discovery_and_bstar_run_on_the_commit(
+        leerie, tmp_path, monkeypatch):
+    """`_ratchet_exec`'s discovery repeats and B*'s final side run in the
+    same commit-only tree as the IDs: never beside a withheld leftover."""
+    w = World(leerie, tmp_path)
+    (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
+    seen: list[tuple[str, str, bool]] = []
+
+    async def deps(*a, **k):
+        return True
+
+    async def disc(st, caps, tree, cmd, base, **k):
+        seen.append(("discovery", tree,
+                     (Path(tree) / "src" / "leftover.ts").exists()))
+        return {"failed_ids": [], "fail_counts": {}, "id_files": {},
+                "_runs": []}
+
+    async def newf(st, caps, tree, pre, before, after, label, **k):
+        seen.append(("bstar", str(tree),
+                     (Path(tree) / "src" / "leftover.ts").exists()))
+        return {"new": [], "resource_affected": [], "unmeasured": False}
+    monkeypatch.setattr(leerie, "_ensure_worktree_deps", deps)
+    monkeypatch.setattr(leerie, "_intermittent_discovery", disc)
+    monkeypatch.setattr(leerie, "_redrive_new_failures", newf)
+    ids = {"ids": [], "files": {}, "command": "t"}
+    asyncio.run(leerie._ratchet_exec(
+        w.st, w.caps, w.staging, "HEAD", ids, ids, label="x",
+        log_path=w.st.run_dir / "x.log"))
+    assert [k for k, _t, _s in seen] == ["discovery", "bstar"]
+    assert all(t != str(w.staging) and not saw for _k, t, saw in seen)
