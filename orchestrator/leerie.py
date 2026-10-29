@@ -42559,8 +42559,12 @@ def _executed_commands_digest(leerie_dir: Path, repo_root: Path,
             if not hit:
                 continue
             tail = (result or "").strip()[-tail_chars:]
+            # One line, like the tail: a heredoc's body never starts a
+            # line of the record (review round 12 claims H1).
+            line = " | ".join(x.strip() for x in cmd.splitlines()
+                              if x.strip())
             entries.append(
-                f"[{sid}] $ {cmd[:200]}\n    result tail: "
+                f"[{sid}] $ {line[:200]}\n    result tail: "
                 + (tail.replace("\n", " | ") if tail
                    else "(no result recorded)"))
             if len(entries) >= max_entries:
@@ -42580,26 +42584,22 @@ _DELIVERY_CITE_MIN_QUOTE = 8
 _DELIVERY_CITE_OK = frozenset({"ok", "drift", "record_ok", "absent_ok"})
 
 
-# The tag every one of the orchestrator's own record entries starts with
-# (`_orchestrator_results_digest`); a worker entry starts `[<sid>] $ `.
-_RECORD_OWN_TAG = "[orchestrator "
+class _ExecutedRecord(str):
+    """The executed-commands record a delivery judge reads, as text, with
+    the orchestrator's own entries carried apart in `own` (DESIGN §8 *Every
+    post-execution verdict is of the committed tree*). A `RECORD` cite
+    verifies only against `own`, which `_delivery_record` builds from typed
+    state alone; nothing a worker's command or output contains can enter
+    it (review round 12 claims H1: a column-0 `[orchestrator ` tag was
+    forgeable through a heredoc). A `str` so every reader of the record's
+    text is unchanged; a plain `str` record has no `own`, so it verifies
+    nothing (the fail-closed side)."""
+    own: str
 
-
-def _record_own_entries(record: str) -> str:
-    """The orchestrator's own entries of an executed-commands record
-    (`_delivery_record`): each entry starts at column 0 and continues on
-    indented lines, and only those whose first line carries
-    `_RECORD_OWN_TAG` are kept. A mechanical split of leerie's own fixed
-    format — a worker's result tail is joined onto one indented line, so
-    it can never start an entry."""
-    out: list[str] = []
-    keep = False
-    for line in record.splitlines():
-        if line and not line[0].isspace():
-            keep = line.startswith(_RECORD_OWN_TAG)
-        if keep:
-            out.append(line)
-    return "\n".join(out)
+    def __new__(cls, text: str, own: str = "") -> "_ExecutedRecord":
+        obj = super().__new__(cls, text)
+        obj.own = own
+        return obj
 
 
 def _delivery_cite_rel(path: str, tree: str | Path) -> str:
@@ -42619,9 +42619,9 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
     """One citation's status against `tree`'s HEAD: `ok` (the quote is in
     the cited lines, 3 lines of slack), `drift` (elsewhere in that file),
     `absent` (not in the file), `no_file`, `short`; for `path: "RECORD"`
-    (the executed-commands record) `record_ok` when the quote is in one of
-    the orchestrator's own entries (`_record_own_entries`: each is on the
-    record only while it describes HEAD's committed tree), `record_worker`
+    (the executed-commands record) `record_ok` when the quote is in the
+    orchestrator's own entries (`record.own`, `_ExecutedRecord`: each is on
+    the record only while it describes HEAD's committed tree), `record_worker`
     when it is only in a worker's entry — supporting evidence that never
     verifies on its own, since a worker's run in staging can rest on a
     file HEAD lacks (review round 11 claims M1) — else `record_absent`;
@@ -42647,7 +42647,7 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
     if len(q) < _DELIVERY_CITE_MIN_QUOTE:
         return "short"
     if head == "RECORD":
-        if q in _scope_norm(_record_own_entries(record)):
+        if q in _scope_norm(getattr(record, "own", "") or ""):
             return "record_ok"
         return ("record_worker" if q in _scope_norm(record)
                 else "record_absent")
@@ -42825,11 +42825,12 @@ def _orchestrator_results_digest(st: "State",
 
 
 def _delivery_record(leerie_dir: Path, st: "State",
-                     repro_command: str | None) -> str:
+                     repro_command: str | None) -> "_ExecutedRecord":
     """The executed-commands record a delivery pass hands its judge (and
     the falsifier): the workers' runs from their logs, then the
-    orchestrator's own results. A torn log degrades to the orchestrator's
-    half, never takes the pass down."""
+    orchestrator's own results, which also ride apart as `own` — the only
+    part a `RECORD` cite verifies against. A torn log degrades to the
+    orchestrator's half, never takes the pass down."""
     try:
         workers = _executed_commands_digest(
             leerie_dir, Path(getattr(st, "repo_root", os.getcwd())),
@@ -42840,7 +42841,7 @@ def _delivery_record(leerie_dir: Path, st: "State",
         workers = ""
     own = _orchestrator_results_digest(st,
                                        leerie_dir / "worktrees" / "staging")
-    return "\n".join(x for x in (workers, own) if x)
+    return _ExecutedRecord("\n".join(x for x in (workers, own) if x), own)
 
 
 def _test_id_diff_item(it: object) -> bool:

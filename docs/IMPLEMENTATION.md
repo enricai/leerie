@@ -6361,8 +6361,9 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `git show HEAD:<rel>` / `git grep … HEAD`, `_d1_untouched_verdict`
     `git diff <own_start>..HEAD`, `_evaluate_acceptance_sets` a detached
     worktree at `rev`, and a `RECORD` cite verifies only against
-    `_orchestrator_results_digest(st, staging)`'s entries
-    (`_record_own_entries`), whose lines are each present only while they
+    `_orchestrator_results_digest(st, staging)`, carried apart from the
+    record's text as `_ExecutedRecord.own` (a `str` subclass `_delivery_record`
+    returns), whose lines are each present only while they
     describe staging's HEAD (below) — a worker's entry is supporting
     evidence only (`record_worker`,
     `tests/test_delivery_detection.py::TestVerifyDeliveryCite::test_a_workers_record_entry_never_verifies_on_its_own`); pinned by
@@ -7042,10 +7043,13 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   verifies — the whitespace/NFC-normalised quote (at least
   `_DELIVERY_CITE_MIN_QUOTE` = 8 characters) is in `git show HEAD:<path>`
   (`ok` within the cited lines ±3, else `drift`), in one of the record's
-  orchestrator entries (`RECORD` → `record_ok`; `_record_own_entries(record)`
-  keeps each entry — a column-0 line plus its indented continuation lines
-  — whose first line starts `_RECORD_OWN_TAG = "[orchestrator "`; a quote
-  found only in a worker's entry is `record_worker`, not in
+  orchestrator entries (`RECORD` → `record_ok` when the quote is in
+  `record.own` — `_ExecutedRecord(text, own)`, `own` built by
+  `_delivery_record` from `_orchestrator_results_digest` alone, so no
+  worker text can enter it; a plain `str` record has no `own` and verifies
+  nothing; review round 12 claims H1. `_executed_commands_digest` joins a
+  worker's command onto one line (`" | "`), as it does the tail; a quote
+  found only in the record's text is `record_worker`, not in
   `_DELIVERY_CITE_OK`, though `_delivery_unmet_parts` keeps it as a
   falsifier lead), or an `ABSENT[:<pathspec>]` regex that `git grep -q -E -e
   <quote> HEAD -- <pathspec>` finds nowhere (exit 1; exit 0 is

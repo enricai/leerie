@@ -7198,7 +7198,9 @@ that does not ignore `__pycache__/` leaves `.pyc` files of unknown
 origin, and that run pays the second measurement; that is the price of
 never calling a worker's file an artifact.
 
-**Every post-execution verdict is of the committed tree.** The delivery
+**Every post-execution verdict is of the committed tree.** The invariant:
+*a verdict becomes `met` only on a read of a commit, or on a measurement
+the orchestrator itself made of the committed tree.* The delivery
 judges run with staging as their working directory, and staging can hold
 what does not ship: an edit a worker left, an untracked file. Review
 round 9 asked whether they, and the held-out re-measure, therefore judge
@@ -7220,6 +7222,9 @@ every check that can make a verdict *met* reads a commit — no exception:
   only while they describe staging's HEAD: the axes and the B\* diff
   carry the committed tree they measured (none when the measurement saw
   a worker's uncommitted file, §8 above), the held-out sets their commit.
+  The orchestrator's entries are kept apart from the text the judge reads,
+  and a cite is checked against that separate store, never against a
+  tag in the text: a worker's entry cannot become one by its contents.
   A quote found only in a worker's entry is `record_worker`: supporting
   evidence the judge sees, never a verified citation.
 
@@ -7232,7 +7237,16 @@ yet a cite of it verified like any other; the final conformer runs in
 staging, so its `pytest` passed on an untracked `helper.py` HEAD lacks,
 and a RECORD cite of that result bought `met`. That half is a record of
 what was executed in a worker's own tree, not a read of the tree that
-ships, so it informs the judge and verifies nothing.
+ships, so it informs the judge and verifies nothing. Round 12 drove the
+way round 11's fix still let it through: an orchestrator entry was told
+apart by its text — a column-0 line starting `[orchestrator ` — and a
+worker's command was copied into the record with its newlines, so a
+heredoc whose first segment was a test command (`pytest -q; cat <<'EOF'`
+followed by a forged `[orchestrator final-tree tests] … passed` line)
+started an entry of its own, and a cite of the forged line bought `met`.
+A text tag is forgeable by whoever writes the text; the store the cite
+check reads is now built only from the orchestrator's typed state, and a
+worker's command is joined onto one line besides.
 
 What staging-only content can still do is make a judge vote *unmet* on
 something that ships correctly — a cost (a re-drive spent), not a false
