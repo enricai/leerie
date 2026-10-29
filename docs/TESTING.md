@@ -5473,6 +5473,12 @@ marked `stale_for_tree` — its `new` still counts, named as of an earlier
 tree, and with none the row reads unknown, never met. A third test pins
 that the re-drive's end-of-pass block refreshes before re-checking items.
 
+`tests/test_acceptance_held_case_intermittent.py::test_a_vote_file_seen_failing_only_by_a_timeout_is_unsettled_not_failing`
+(review round 6, driven and fixed): a held-out vote file whose first run
+timed out and whose every rerun the budget cut is unsettled and the set
+unmeasured, not failing; the assertion-failing control beside it stays
+failing under the same cut.
+
 `tests/test_redrive_budget.py` drives `phase_execute` (DESIGN §13 *One
 re-drive budget per subtask*): a blocked subtask is re-driven with its
 blocker as the note and at most `subtask_redrive_rounds` times, then settled

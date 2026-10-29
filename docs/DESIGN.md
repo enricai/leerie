@@ -7756,7 +7756,14 @@ inside `confirm_budget_sec`, and it stays failing only if it failed on
 every rerun that produced a verdict. A rerun the budget cuts short is not
 a run (§9 *Which failures are new*, step 4): when the budget alone stopped
 the vote short and every rerun that finished failed the file, it stays
-failing — a budget cut is never evidence that a failure went away.
+failing — a budget cut is never evidence that a failure went away. The
+exception is a file whose first run failed only by timing out or dying of
+a signal: that is a resource signature, not the assertion the file was
+written to make, so with no finished rerun it is unsettled
+(`budget_short_unsettled_files`) — the set is unmeasured unless another
+file fails, never failing on the timeout alone. Measured (review round 6):
+such a file, every rerun cut, was confirmed failing and the run
+`unconverged`.
 Anything else is `resource_affected`,
 and a set whose only failures were resource-affected and touched no held
 case is no evidence either way — so a load flake never forces a repair
@@ -10109,7 +10116,11 @@ failure new / does this set still fail" verdict uses:
      fail at the run's own start, and its first run failed on an
      assertion: a budget-cut rerun is not evidence it passes. A candidate
      every finished rerun failed is **`confirmed`** (`budget_short`), even
-     with none finished. The integration gate's head confirm with no home parent has
+     with none finished. The exception is a vote file whose first run was
+     a timeout or a signal death — a resource signature, not an assertion:
+     with no finished rerun it is `budget_short_unsettled`, and the set is
+     unmeasured unless another of its files fails (§8 *Held-out acceptance
+     tests*). The integration gate's head confirm with no home parent has
      no base side either, but it is base-paired in kind (a merged-tree
      failure seen once) and needs a finished rerun the same way.
    - The one confirm whose "confirmed" exonerates

@@ -612,3 +612,37 @@ def test_a_cut_reruns_finished_file_that_passed_refutes_it(leerie):
     assert v["budget_exhausted"] is True and v["reruns_run"] == 0
     assert v["confirmed"] == ["b", "c"] and v["budget_short"] == ["b", "c"]
     assert v["resource_affected"] == ["a"] and v["no_verdict"] == []
+
+
+def test_a_vote_file_seen_failing_only_by_a_timeout_is_unsettled_not_failing(
+        leerie, tmp_path, monkeypatch):
+    """Review round 6, unproven suspicion, driven: a vote file whose first
+    run timed out (a resource signature, not an assertion) and whose every
+    rerun the budget cut was confirmed failing on that timeout alone
+    (`budget_short_files`), and the run `unconverged`. With no finished
+    rerun it is `budget_short_unsettled`: the set is unmeasured, the run is
+    not stopped by it (DESIGN §9 *Which failures are new*, step 4). Paired
+    with the control above, whose first run failed on an assertion and
+    stays failing under the same cut."""
+    st = leerie.State(tmp_path / "state", "r")
+    st.data = {"task": "t", "categories": ["bug-fixing"]}
+    s_, wt = _vote_set(tmp_path)
+
+    async def run(st_, caps_, tree, rel, log_path, label, *, cases_out=None,
+                  **_kw):
+        if rel == CONTROL:
+            return True
+        if "-confirm" in label:
+            await asyncio.sleep(caps_["worker_timeout_sec"] + 0.05)
+        cases_out["resource"] = True     # timed out, first run and reruns
+        return False
+    monkeypatch.setattr(leerie, "_run_acceptance_file", run)
+    (res,) = asyncio.run(leerie._acceptance_run_placed(
+        st, _caps(leerie, confirm_pairs=1, confirm_pairs_escalated=1,
+                  confirm_budget_sec=0.3, acceptance_intermittent_repeats=0),
+        wt, [s_], "t"))
+    assert res["failing_files"] == [] and "budget_short_files" not in res
+    assert res["unmeasured"] is True and res["passed"] is False
+    assert res["budget_short_unsettled_files"] == [REL]
+    assert leerie._acceptance_any_fails([res]) is False
+    assert _outcome(leerie, st, [s_], res) == "done"

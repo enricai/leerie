@@ -45436,6 +45436,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         failing, copied, ran = [], [], []
         resource_affected: list[str] = []
         budget_short: list[str] = []
+        unsettled_files: list[str] = []
         unmeasured = False
         case_ids: dict[str, list[str]] = {}
         # Every failing run of each file, the first and each vote rerun:
@@ -45524,16 +45525,23 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                             _runs.setdefault(rel, []).append(o)
                             _nt(rel, o)
                     return still
-                # Every file of the vote failed its first run.
+                # Every file of the vote failed its first run — one whose
+                # first run timed out or died of a signal (a resource
+                # signature) only by that: it needs a finished rerun.
                 verdict_ = await _confirm_still_failing(
                     vote, _rerun, caps, seen_failing=True,
+                    needs_rerun=[r for r in vote
+                                 if (runs.get(r) or [{}])[0].get("resource")],
                     label=f"acceptance {label} set {s_['index']}")
                 budget_short = list(verdict_.get("budget_short") or [])
+                unsettled_files = list(
+                    verdict_.get("budget_short_unsettled") or [])
                 # No verdict is no evidence either way, like mixed
                 # evidence: the set is unmeasured unless it also fails.
                 resource_affected = list(
                     verdict_["resource_affected"]
-                    + (verdict_.get("no_verdict") or []))
+                    + (verdict_.get("no_verdict") or [])
+                    + unsettled_files)
                 failing = [r for r in failing
                            if r in asserted or r in verdict_["confirmed"]]
             if confirm:
@@ -45590,6 +45598,11 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
             # dropped (DESIGN §8 *Held-out acceptance tests*).
             res_["budget_short_files"] = [r for r in failing
                                           if r in budget_short]
+        if any(r not in failing for r in unsettled_files):
+            # Seen failing only as a timeout, every rerun cut: unsettled,
+            # neither failing nor passing.
+            res_["budget_short_unsettled_files"] = [
+                r for r in unsettled_files if r not in failing]
         if no_case_evidence:
             # Failing, but no run gave case evidence: never read as a
             # whole-file collapse (DESIGN §8 *Delivery re-drive* rule 4).
