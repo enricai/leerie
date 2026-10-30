@@ -5695,6 +5695,11 @@ git with a made-up commit use `tests.conftest.judge_checkout_in_place`.
 `_compose_pr_via_llm` through the real `claude_p` (`_invoke` stubbed) and
 reads the argv and cwd: an empty `<run_dir>/payload-only/`, `--allowedTools
 Read`, never the repo root, with and without `dangerously_skip_permissions`.
+It covers the post-run skills too: `_judge_capture` and `_request_patch`
+run payload-only the same way, and `_replay_capture` reads a ref-less
+`--shared` clone of its repository at HEAD (`_ref_less_clone`) — HEAD's
+files only, removed with the replay's temporary directory — never the
+checkout, whose uncommitted file stays untouched.
 
 ## The rev 9 redesign's other new and rewritten test files
 
@@ -5702,11 +5707,14 @@ Read`, never the repo root, with and without `dangerously_skip_permissions`.
   diff describes the tree that ships*): the real `setup-run.sh` resets a
   staging worktree a SIGKILL left registered — tracked edits, untracked
   files and a merge in progress go; ignored files and the run branch stay.
-- `tests/test_one_restore.py` (5 tests, DESIGN §8 *One restore*, review
+- `tests/test_one_restore.py` (8 tests, DESIGN §8 *One restore*, review
   round 15 M2): `_restore_tree` and `leerie_reset_worktree` are the one
   restore — write bits restored, a nested repository removed, and I1's
   checker reading nothing afterwards — so I1's exhaustion path rolls the
-  round back instead of `die()`ing; the reviewer's proofs, inverted.
+  round back instead of `die()`ing; the reviewer's proofs, inverted. Also:
+  a derived guard that no `reset --hard` runs outside the primitive, a
+  back-out whose reset does not land never reports the work as gone, and
+  the shell reset never `chmod`s through a symlink.
 - `tests/test_merge_leaves_staging_as_found.py` (2 tests, DESIGN §6½,
   review round 15 M3): on the real setup-run.sh, new-worktree.sh and
   integrate.sh, a merged `.gitignore` change that un-ignores a build's
@@ -5716,12 +5724,39 @@ Read`, never the repo root, with and without `dangerously_skip_permissions`.
   worker leaves its tree on the branch leerie gave it, at a descendant of
   where it started (I1's branch and base lines); the tree that ships is
   `refs/heads/leerie/runs/<id>^{tree}`, read after finalize's cleanup.
-- `tests/test_leerie_git_runs_no_hooks.py` (DESIGN §6½): every git command
-  of leerie's own that can fire a repository hook runs with hooks off — a
-  derived source guard over leerie.py and the scripts that act on a tree
-  leerie measures, with a behavioural check that the flag disables a
-  hook; workers' own git commands keep the repository's hooks. (Its count
-  is left to the final corrections pass: lane B is changing the file.)
+- `tests/test_leerie_git_runs_no_hooks.py` (7 tests, DESIGN §6½ *Hooks
+  off*): every git process leerie starts runs with hooks off through the
+  environment entry `main()` installs before anything spawns
+  (`_git_hooks_off`; it round-trips and keeps the operator's own
+  `GIT_CONFIG_*` entries), and only a worker's spawn takes it back out
+  (`_git_hooks_on` in `_invoke`). Real git with every hook installed: the
+  I2 bracket's put-back and every git form leerie uses fire none, and every
+  script leerie runs turns hooks off itself (`leerie_git_hooks_off`), also
+  when run outside the orchestrator.
+- `tests/test_run_repo.py` (21 tests, DESIGN §6 *The run's own
+  repository*, RC4/I4): every tree a worker gets hangs off `<run-dir>/repo`,
+  a bare repository of the run's own, so no worker's git verb reaches the
+  user's refs, stash, config, `info/exclude`, hooks or worktree registry;
+  review round 16 H2's drivers inverted — the user's stash survives a
+  worker's `stash`/`pop`, and a worker cannot move the user's branches.
+  Real git, real scripts and helpers.
+- `tests/test_run_repo_bring_back.py` (11 tests): `host_bring_back_run_branch`
+  brings the run branch back from the run's repository into the user's as
+  leerie's own git (hooks off, no `FETCH_HEAD`) and as a compare-and-swap
+  against `run.json` `brought_back_sha`, so a finalize rebase or the user's
+  own change to the ref is never undone. Real git, real bash, `jq`.
+- `tests/test_run_repo_missing_dies.py` (4 tests, review round 17 H1/L4): a
+  helper worktree added with no run repository dies naming it — the add
+  itself, CI parity's `_ci_worktree` and `_evaluate_acceptance_sets`, which
+  had read `no_base_worktree` and "no evidence" — and the conftest tripwire
+  fails a test that would make a real run repository under this checkout.
+- `tests/test_hidden_dirt.py` (17 tests, review round 16 H1/M2, DESIGN §8
+  *A worker leaves its tree clean*, *One restore*): dirt a worker hides from
+  `git status` — `skip-worktree`/`assume-unchanged` index flags, a pattern
+  in the shared `info/exclude` or `core.excludesFile` — is read by I1's
+  checker (untracked files against the tree's own `.gitignore` files only)
+  and cleared by the restore; the implementer's base is where its subtask
+  branch forked from the run branch.
 - `tests/test_needs_human_sources_render.py` (14 tests, DESIGN §6 *The
   PR's end-state section*, review round 14 H1): every "Needs human
   verification" source the code can write renders in the PR; the sources
@@ -5748,8 +5783,3 @@ Read`, never the repo root, with and without `dangerously_skip_permissions`.
 - `tests/test_clean_tree_gate.py` (17 tests, DESIGN §8 *A worker leaves its
   tree clean*): the I1 checker, the bounded re-ask of the same session,
   exhaustion rolling the round back, and every staging site.
-The same file covers the post-run skills: `_judge_capture` and
-`_request_patch` run payload-only (an empty `<run_dir>/payload-only/`,
-`--allowedTools Read`), and `_replay_capture` reads a disposable checkout of
-its repository's HEAD — HEAD's files only, removed with its registration
-afterwards — never the checkout, whose uncommitted file stays untouched.

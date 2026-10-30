@@ -67,3 +67,19 @@ def test_acceptance_evaluation_dies_instead_of_no_evidence(leerie, tmp_path,
         st, dict(leerie.DEFAULT_CAPS), str(st.repo_root), sets, "gate")),
         capsys)
     assert "missing" in err and "no evidence" not in err
+
+
+def test_a_real_run_repository_under_this_checkout_fails_the_test(leerie):
+    """The conftest tripwire (`_no_run_repo_without_a_git_repo`, review
+    round 17 L4): a real run repository is a full bare copy of the branch,
+    and under this checkout's `.leerie` it would outlive the session
+    unseen. A test that would make one there fails by name, before
+    anything is written."""
+    import types
+    from tests.conftest import REPO_ROOT
+    run_dir = REPO_ROOT / ".leerie" / "runs" / "tripwire-never-made"
+    st = types.SimpleNamespace(repo_root=REPO_ROOT, run_dir=run_dir,
+                               run_id="tripwire-never-made", data={})
+    with pytest.raises(pytest.fail.Exception, match="pin the state root"):
+        asyncio.run(leerie._ensure_run_repo_or_die(st))
+    assert not run_dir.exists()

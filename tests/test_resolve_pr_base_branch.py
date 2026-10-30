@@ -6,7 +6,7 @@ Covers:
   test_pr_template_discovery.py's test_resolve_pr_template_* structure.
 - The run-start call-site fallback to `working_branch` when unset
   (`resolve_pr_base_branch(...) or working_branch`) — this field is
-  distinct from `working_branch`, which must remain the diff fork-point.
+  distinct from `working_branch` and from the diff fork-point (`base_sha`).
 - `_write_run_json` round-trips a `pr_base_branch` key, mirroring
   test_write_run_json.py's pattern.
 - STATE_FIELDS carries `pr_base_branch`.
@@ -111,7 +111,7 @@ def test_write_run_json_round_trips_pr_base_branch(leerie, tmp_path):
 
 def test_write_run_json_pr_base_branch_can_differ_from_working_branch(leerie, tmp_path):
     """The whole point of the field: it can diverge from working_branch
-    while working_branch remains untouched (the diff fork-point)."""
+    while working_branch (the user's branch at run start) stays untouched."""
     leerie._write_run_json(
         tmp_path,
         run_id="feat-foo-abc123",

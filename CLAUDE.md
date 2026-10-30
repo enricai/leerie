@@ -427,6 +427,11 @@ inventory itself.
   creating a full checkout of this repo inside itself — invisible because
   `.leerie/*` is gitignored and the dirs outlive the session (measured: 2
   worktrees, 25 MB, one CI-only red test with no visible link to the change).
+  Since per-run repositories it is registered in that run's `<run-dir>/repo`,
+  and a real `_run_phases` over a real git `repo_root` also makes that
+  repository — a full bare copy of the branch (31 MB, ~11 s here).
+  `_no_run_repo_without_a_git_repo` fails any test that would make it under
+  this checkout, naming the fix: pin the state root to `tmp_path`.
   Assume the state root is inside the repo unless a test pins it elsewhere.
 - `leerie resume <run-id>` (the documented positional form) is pinned by
   `tests/test_resume_positional_run_id.py`. It silently ignored the run-id on

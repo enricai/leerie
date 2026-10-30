@@ -1862,8 +1862,12 @@ leerie's own enumerated git:
   - staging, subtask and planning worktrees;
   - every `_worktree_add_detached` and `_judge_checkout`;
   - the acceptance writer's, surrogate's and falsifier's ref-less clones
-    (which now clone the run's repository);
-  - the post-run replay's checkout.
+    (which now clone the run's repository).
+
+  The post-run replay is not a run's tree: it re-runs a captured call
+  against the user's checkout as it is now, through a ref-less `--shared`
+  clone of the *user's* repository (`_ref_less_clone`), which shares no
+  ref, stash, config or hook with it.
 
   A helper worktree is only ever added there, after `_run_phases` has
   made the repository, so its absence at an add is leerie's own bug, not
@@ -2007,13 +2011,16 @@ r16 H2's two scenarios):
 - *H1's hidden dirt.* The run repository's `info/exclude` is still shared
   by the run's own checkouts, and a worker can still write it or set
   `skip-worktree`. I1's checker must still define clean against the
-  committed `.gitignore` and the index flags, as H1's fix states.
+  tree's own `.gitignore` files — never the shared `info/exclude` or
+  `core.excludesFile` — and the index flags, as H1's fix states (§8 *A
+  worker leaves its tree clean*).
   `_checkout_ignore` stays, because one checkout's ignore must not reach
   staging.
 - *M1.* The run repository carries the user's hooks on purpose, so
-  leerie's own git there must still run with the hooks off. `GIT_NO_HOOKS`
-  and its guard stay, and M1's fix (every leerie git argv, with no
-  per-subcommand exemption) still applies.
+  leerie's own git there must still run with the hooks off. It does,
+  through the environment every git process leerie starts inherits (§6½
+  *Hooks off*, `_git_hooks_off`); the per-call `GIT_NO_HOOKS` flag M1 was
+  first fixed with is gone (a344b0c).
 - *The explicit channel.* `/work` is still the user's checkout, bind-mounted
   read-write. A worker's Bash can still `cd /work` or run `git -C /work`. §12
   records 146 `Edit`/`Write` calls into the user's checkout before the path
@@ -2050,9 +2057,10 @@ r16 H2's two scenarios):
   user's HEAD commit, so the scripts' existing "fall back to HEAD" keeps its
   meaning.
 
-**Resume of a run made before this change: refused.** That run's state has
-no `run_repo` field, and its worktrees and subtask branches live in the
-user's repository. `resume` dies, saying:
+**Resume of a run made before this change: refused once its run branch
+was cut.** That run's state has no `run_repo` field, and once its run
+branch exists (`run.json` has `branch`), its staging, subtask worktrees
+and branches live in the user's repository. `resume` dies, saying:
 
 - the run predates per-run repositories;
 - its integrated work is on `leerie/runs/<id>` in the user's repository,
@@ -2065,7 +2073,11 @@ cross-run lock, subtask-branch deletion in the user's repository and
 `_redrive_exclude_clear`. Those runs would also run without I4 while
 nothing said so. A one-time re-run is cheaper than a permanent second
 layout. Host-side tools (`list`, `finalize`, `prune`, `accept-*`) keep
-working on such runs.
+working on such runs. A run from before the change that is still in
+planning (no `branch` in `run.json`) is resumed: the only tree it has in
+the user's repository is the planning worktree, which the resume makes
+afresh in the run's own repository (its old registration in the user's
+`.git/worktrees/` stays until `leerie prune`).
 
 **Runtimes.** No mount changes and no chown is added.
 
@@ -2106,7 +2118,7 @@ working on such runs.
 - The user-ref half of `_restore_tree`'s blast radius. A reset can now move
   only the run's own refs.
 
-It keeps the sentinel, `_repo_write_denials`, `GIT_NO_HOOKS`,
+It keeps the sentinel, `_repo_write_denials`,
 `_checkout_ignore` and `_helper_worktree_path`'s run-id prefix (harmless
 once the registry is private). The launcher's `prune` keeps the
 user-registry deregistration and subtask-branch deletion for runs made
@@ -2124,6 +2136,12 @@ before the change.
 - §12 L4: the run branch, staging and subtask worktrees are refs of the
   run's repository.
 - IMPLEMENTATION §7: the script rows; the lock is per run repository.
+- §6 *Branch cleanup at finalize*: finalize deletes no branch; the subtask
+  branches are refs of the run's repository.
+- §6 *Finalization* (the PR base override): the diff starts at `base_sha`,
+  not at `working_branch`.
+- §8 *A worker that does not commit never runs in a tree leerie measures*:
+  the post-run replay reads a ref-less clone of the user's repository.
 
 ### The run identifier
 
@@ -3140,10 +3158,10 @@ The run branch is pushed to `origin` and a pull request opened via `gh pr
 create` against the working branch (HEAD-at-run-start) by default. **This
 PR base is overridable** — `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` /
 `pr_base_branch` in `leerie.toml` — without changing where the diff is
-computed from: `working_branch` always remains the diff fork-point
-(`rev_range = working_branch..run_branch`) regardless of the override, so
-the diff base never corrupts if the override branch isn't the actual fork
-point.
+computed from: the diff always starts at the commit the run branch was cut
+from, `base_sha` (`rev_range = base_sha..run_branch`, *The run's own
+repository*), regardless of the override, so the diff base never corrupts
+if the override branch isn't the actual fork point.
 
 The PR title and body are written by an LLM worker (`pr_writer`, defaults
 to Sonnet) that runs inside the container right before it exits, where
@@ -3419,13 +3437,13 @@ signals it needs review. Defaulting to push + PR turns every run into a
 reviewable artifact. `--no-push` exists for offline use or repos without a
 GitHub remote.
 
-**Branch cleanup at finalize.** After the push + PR (or after the run
-completes under `--no-push`), the orchestrator deletes the per-subtask
-branches `leerie/subtasks/<run-id>/*` automatically. They were the
-mechanism by which parallel implementers committed in isolation; once
-their work has been merged into the run branch their individual commit
-histories are still reachable from the run branch's `--no-ff` merges, so
-the named refs are pure clutter. The **run branch** itself
+**Branch cleanup at finalize.** Finalize deletes no branch. The
+per-subtask branches `leerie/subtasks/<run-id>/*` are refs of the run's
+own repository (*The run's own repository*): only the run branch is
+brought back into the user's repository, so the subtask branches never
+reach it, and they go with the run directory when `leerie prune` reclaims
+it. Finalize's `cleanup.sh` removes the run's worktrees only. The **run
+branch** itself
 (`leerie/runs/<run-id>`) is *kept* — it is the PR head, and deleting it
 locally before the PR is merged would dangle the PR base reference. The
 per-run state directory (`state.json`, `run.json`, logs, criteria,
@@ -7967,9 +7985,10 @@ the inputs the record itself carries, and the heal loop's
 `patch_generator` edits the prompt text it is handed, so both run the
 same way, payload-only. A replay re-runs one captured call, which may
 have read the repository when it first ran, so it gets a read of the
-repository — a disposable detached checkout of the current checkout's
-HEAD (`_judge_checkout`), removed with whatever it made — never the
-checkout itself.
+repository — a ref-less `--shared` clone of the user's repository at its
+HEAD (`_ref_less_clone`, §6 *The run's own repository*), made in the
+replay's temporary directory and removed with whatever it made — never
+the checkout itself.
 
 **A worker leaves its tree clean.** The invariant (I1): *after every
 worker that runs in a tree leerie measures, integrates or ships, `git

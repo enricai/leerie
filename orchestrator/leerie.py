@@ -926,8 +926,8 @@ STATE_FIELDS = (
     # pr_base_branch: the final branch this run's PR merges into. Defaults
     # to working_branch when the user does not override it via
     # --pr-base-branch / LEERIE_PR_BASE_BRANCH / leerie.toml. This is the
-    # PR base ONLY — never the diff fork-point, which stays working_branch
-    # (rev_range = working_branch..run_branch; final-conformance DIFF_BASE).
+    # PR base ONLY — never the diff fork-point, which is base_sha
+    # (rev_range = base_sha..run_branch; final-conformance DIFF_BASE).
     # Overloading working_branch for both roles would corrupt the diff
     # base if the override branch isn't the actual fork point.
     "pr_base_branch",
@@ -1743,9 +1743,9 @@ PR_TEMPLATE_ENV = "LEERIE_PR_TEMPLATE"
 PR_TEMPLATE_FILE = SOURCE_OF_TRUTH_FILE
 
 # --pr-base-branch override — the final branch the run's PR merges into.
-# Distinct from `working_branch` (the user's branch at run start), which
-# stays the diff fork-point (`working_branch..run_branch`) and must never
-# be overloaded to also mean "PR base" — see STATE_FIELDS comment near
+# Distinct from `working_branch` (the user's branch at run start) and from
+# the diff fork-point, `base_sha` (`base_sha..run_branch`, `_diff_base`);
+# neither may be overloaded to also mean "PR base" — see STATE_FIELDS comment near
 # working_branch. Resolution order: --pr-base-branch CLI flag →
 # LEERIE_PR_BASE_BRANCH env → pr_base_branch in leerie.toml → (defaults to
 # working_branch at the run-start call site, once working_branch is known).
@@ -7825,8 +7825,8 @@ def resolve_pr_base_branch(repo_root: Path,
     `working_branch` once that value is known (git HEAD isn't read until
     then). No validation against an enum since the branch name is
     free-form (depends on the target repo). Distinct from
-    `working_branch`, which stays the diff fork-point — do not conflate
-    the two."""
+    `working_branch` and from the diff fork-point (`base_sha`,
+    `_diff_base`) — do not conflate them."""
     return _resolve_str_pref(
         repo_root, cli_value,
         env_var=PR_BASE_BRANCH_ENV, file_key="pr_base_branch",
@@ -35002,13 +35002,14 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
     and renders the run as `done` in `leerie list`.
 
     Does NOT invoke `finalize.sh` / `cleanup.sh` itself — `finalize.sh`
-    would fail its non-empty-branch check, and for the PLANNING-time callers
-    `cleanup.sh` has no subtask branches to drop.
+    would fail its non-empty-branch check, and the PLANNING-time callers
+    have no run worktree to remove.
 
-    That second premise does NOT hold for the post-execution caller, whose
-    waves did run: `phase_finalize` therefore runs `cleanup.sh --run-id <id>
-    --subtask-branches` ITSELF before calling this, and a future caller that
-    reaches here after any worktree was created must do the same."""
+    The post-execution caller, whose waves did run, does: `phase_finalize`
+    runs `cleanup.sh --run-id <id>` (worktrees only; no branch is deleted —
+    DESIGN §6 *Branch cleanup at finalize*) ITSELF before calling this, and
+    a future caller that reaches here after any worktree was created must
+    do the same."""
     log(headline or ("phase 3: nothing to _schedule — every planner returned "
                      "status=ready with zero subtasks"))
     for domain, basis in no_work_map.items():
@@ -61495,7 +61496,8 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     The push + PR step has moved to the host launcher (DESIGN §6
     *Finalization*); this phase no longer makes network calls. It runs
     `finalize.sh` to verify the run branch is non-empty, runs
-    `cleanup.sh` to drop subtask branches, writes `finished_at` to
+    `cleanup.sh` to remove the run's worktrees (no branch is deleted:
+    DESIGN §6 *Branch cleanup at finalize*), writes `finished_at` to
     state.json + run.json, and exits. The launcher polls run.json's
     `finished_at` sentinel and does `git push` + `gh pr create` on the
     host using the host's own auth state.
@@ -62264,8 +62266,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                                   if head_proc.returncode == 0 else "")
                 st.data["working_branch"] = working_branch
                 # pr_base_branch defaults to working_branch when unset —
-                # the PR base only, never the diff fork-point (which stays
-                # working_branch; see STATE_FIELDS comment).
+                # the PR base only, never the diff fork-point (base_sha;
+                # see STATE_FIELDS comment).
                 pr_base_branch = getattr(args, "pr_base_branch", None) or working_branch
                 st.data["pr_base_branch"] = pr_base_branch
                 st.save()
@@ -63028,7 +63030,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "working_branch (the branch checked out when the "
                          "run started) — the diff fork-point used to "
                          "compute the PR diff is unaffected by this flag "
-                         "and always stays working_branch. Also "
+                         "and always stays the commit the run branch was "
+                         "cut from. Also "
                          f"{PR_BASE_BRANCH_ENV} env var or pr_base_branch "
                          "in leerie.toml.")
     ap.add_argument("--dangerously-skip-permissions", action="store_true",

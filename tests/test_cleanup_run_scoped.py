@@ -5,9 +5,9 @@ cleanup.sh supports:
 - `--all-runs [--branches | --subtask-branches]` — every per-run dir
 - no flag — most-recently-failed run, with y/N prompt
 
-`--subtask-branches` is the post-finalize default (invoked by
-phase_finalize): it deletes only the per-subtask branches and keeps
-leerie/runs/<id> (the PR head). `--branches` is broader and deletes
+`--subtask-branches` deletes only the per-subtask branches and keeps
+leerie/runs/<id> (the PR head); phase_finalize passes no branch flag (the
+subtask branches are refs of the run's own repository). `--branches` is broader and deletes
 both the run branch and the subtask branches; they are mutually
 exclusive.
 

@@ -133,10 +133,11 @@ Phase 6 verifies `leerie/runs/<run-id>` is non-empty, pushes it to
 `origin`, and opens a PR via `gh pr create --base <working-branch>
 --head leerie/runs/<run-id>`. Your working branch is **not** modified
 locally — review and merge the PR on GitHub when you're satisfied. The
-per-subtask branches `leerie/subtasks/<run-id>/*` are **deleted
-automatically** at finalize — they were the mechanism for parallel
-implementer isolation and carry no information that isn't already in the
-run branch's merge graph (each subtask is merged with `--no-ff`, so its
+per-subtask branches `leerie/subtasks/<run-id>/*` never reach your
+repository: they live in the run's own repository, only the run branch is
+brought back, and they go with the run directory at `leerie prune` — they
+were the mechanism for parallel implementer isolation and carry no
+information that isn't already in the run branch's merge graph (each subtask is merged with `--no-ff`, so its
 commits still appear as a named merge bubble in `git log leerie/runs/<run-id>
 --graph`).
 

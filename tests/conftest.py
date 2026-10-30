@@ -332,8 +332,10 @@ def _no_real_planning_worktree(request, monkeypatch):
     `git worktree add` rooted at `resolve_leerie_root()`. With
     `LEERIE_STATE_DIR` unset -- the default for a direct Python caller -- that
     resolves to `<repo>/.leerie`, so any test driving the real `_run_phases`
-    created a FULL CHECKOUT OF THIS REPO inside this repo and left it
-    registered in `.git/worktrees/`.
+    created a FULL CHECKOUT OF THIS REPO inside this repo (registered, since
+    per-run repositories, in that run's `<run-dir>/repo`; before them, in
+    this repo's own `.git/worktrees/`). The run's repository itself is
+    `_no_run_repo_without_a_git_repo`'s concern, below.
 
     The failure mode is silent in three ways at once, which is why this is a
     conftest-level guard rather than a stub in each driving test: `.leerie/*`
@@ -451,6 +453,18 @@ def _no_run_repo_without_a_git_repo(request, monkeypatch):
 
     async def ensure(st):
         if _has_repo(st):
+            # A real run repository is a full copy of the user's branch
+            # (measured on this repository: 31 MB, ~11 s). Under this
+            # checkout — the default state root `<repo>/.leerie` when
+            # LEERIE_STATE_DIR is unset — it would outlive the session,
+            # gitignored and unseen, the planning worktree's old leak
+            # (above). Fail the test that would make it, by name.
+            run_dir = Path(str(st.run_dir)).resolve()
+            if run_dir.is_relative_to(REPO_ROOT):
+                pytest.fail(
+                    f"this test drives the real run repository under this "
+                    f"checkout ({run_dir}): pin the state root to tmp_path "
+                    "(State(tmp_path / ..., ...) or LEERIE_STATE_DIR)")
             return await real_ensure(st)
         return Path(str(getattr(st, "run_dir", "."))) / "repo"
 

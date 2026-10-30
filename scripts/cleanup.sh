@@ -14,8 +14,8 @@
 #     With --branches also delete leerie/runs/<id> and
 #     leerie/subtasks/<id>/* branches.
 #     With --subtask-branches delete only the subtask branches and keep
-#     leerie/runs/<id> (the post-finalize default — the run branch is
-#     the PR head and must outlive the orchestrator).
+#     leerie/runs/<id> (operator use; finalize passes no branch flag — the
+#     subtask branches are refs of the run's own repository).
 #
 #   cleanup.sh --all-runs [--branches | --subtask-branches]
 #     Same as above, applied to every directory under <state-root>/runs/.
@@ -48,8 +48,8 @@ clean_one_run() {
   #       $2 = branch-scope: "0" = keep all branches (audit trail),
   #                          "1" = delete run branch + subtask branches (--branches),
   #                          "2" = delete subtask branches only, keep the run
-  #                                branch (--subtask-branches; the post-finalize
-  #                                default, since the run branch is the PR head).
+  #                                branch (--subtask-branches; operator use —
+  #                                finalize passes no branch flag).
   #
   # Removes ${run_dir}/worktrees/* (the worktree directories), prunes git
   # worktree metadata, and optionally deletes branches. The state dir
