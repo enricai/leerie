@@ -5750,7 +5750,16 @@ def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
     not yet) drops the registration. Waits at most
     `_WORKTREE_ADD_LOCK_WAIT_SEC`, then adds unlocked, logged — these
     helpers fail open. `repo` (default the run's repository) is the
-    checkout git is run in — any worktree of the same repository."""
+    checkout git is run in — any worktree of the same repository. With no
+    `repo`, the run's repository must exist: `_run_phases` makes it before
+    any helper worktree, so its absence is leerie's own bug, and the run
+    stops naming it rather than letting a gate read "no evidence" (DESIGN
+    §6 *The run's own repository*; review round 17 H1)."""
+    if repo is None and _run_repo_of(Path(st.run_dir)) is None:
+        die(f"the run's own repository {_operator_path(_run_repo(st))} is "
+            f"missing at `git worktree add {wt.name}` — leerie's own "
+            "invariant is broken (DESIGN §6 *The run's own repository*: "
+            "every run makes it before any helper worktree). Report this.")
     root = str(repo if repo is not None else _run_repo(st))
     argv = ["git", "-C", root, "worktree", "add", "--detach", str(wt), rev]
     lock_fd = None
@@ -49718,15 +49727,16 @@ async def _restore_tree(tree: str | Path, rev: str, *, where: str,
     # place, and either flag hides an edit from the checker's status
     # (review round 16 H1). One flag per call: `update-index` applies only
     # the last of two such options to `--stdin` paths.
-    ls_v = subprocess.run(["git", "-C", str(tree), "ls-files", "-v", "-z"],
-                          capture_output=True, text=True, check=False)
+    # Bytes, file-system decoded (`_git_z_output`): a non-UTF-8 path is
+    # still named, and handed back to git as the same bytes.
+    ls_v = _git_z_output(["git", "-C", str(tree), "ls-files", "-v", "-z"])
     flagged = [p for p, _f in _flagged_entries(ls_v.stdout)]
     if flagged:
-        paths = "".join(p + "\0" for p in flagged)
+        paths = b"".join(os.fsencode(p) + b"\0" for p in flagged)
         for opt in ("--no-skip-worktree", "--no-assume-unchanged"):
             subprocess.run(["git", "-C", str(tree), "update-index", opt,
                             "-z", "--stdin"], input=paths,
-                           capture_output=True, text=True, check=False)
+                           capture_output=True, check=False)
     landed = False
     # Up to three attempts, a second apart: a spawn failure (EAGAIN) on the
     # reset or an unreadable HEAD afterwards is not yet a failed reset.

@@ -11,6 +11,8 @@ import asyncio
 import subprocess
 from pathlib import Path
 
+from tests.conftest import relocate_into_run_repo
+
 PYTEST = "python3 -m pytest -q -p no:cacheprovider"
 
 
@@ -45,6 +47,10 @@ def _st(leerie, tmp_path: Path, repo: Path, **data):
     st = leerie.State(tmp_path / "state", "run-red", repo_root=repo)
     st.data = {"verbosity": "quiet", "worker_count": 0, **data}
     (st.run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    st.save()
+    # The run's own repository (DESIGN §6 *The run's own repository*): the
+    # confirm's base worktree is added there.
+    relocate_into_run_repo(leerie, st)
     return st
 
 

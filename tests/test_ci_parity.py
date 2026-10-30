@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _run
+from tests.conftest import _run, relocate_into_run_repo
 
 WORKFLOW = """\
 name: ci
@@ -126,7 +126,11 @@ def env(leerie, tmp_path, monkeypatch):
           str(staging), "main"], cwd=repo)
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "x"}
+    st.repo_root = repo
     st.save()
+    # The run's own repository (DESIGN §6 *The run's own repository*): the
+    # CI base and final worktrees are added there.
+    relocate_into_run_repo(leerie, st)
     caps = dict(leerie.DEFAULT_CAPS)
     caps.update({"confirm_pairs": 2, "confirm_pairs_escalated": 2,
                  "confirm_budget_sec": 120, "worker_timeout_sec": 60})

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import relocate_into_run_repo
 from tests.conftest import run_git_cwd_first_stdout as _git
 
 REL = "acc/test_defect_1.py"
@@ -78,6 +79,9 @@ def _st(leerie, tmp_path, repo, head):
                "repo_state_before_planning": {"head": head},
                "worker_count": 0}
     st.save()
+    # The run's own repository (DESIGN §6 *The run's own repository*): the
+    # evaluation worktree is added there.
+    relocate_into_run_repo(leerie, st)
     return st
 
 

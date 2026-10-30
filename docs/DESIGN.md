@@ -1865,6 +1865,12 @@ leerie's own enumerated git:
     (which now clone the run's repository);
   - the post-run replay's checkout.
 
+  A helper worktree is only ever added there, after `_run_phases` has
+  made the repository, so its absence at an add is leerie's own bug, not
+  an external condition: `_worktree_add_detached` dies naming it, rather
+  than letting the CI-parity gate record `no_base_worktree` or the
+  acceptance evaluation "no evidence either way" (review round 17 H1:
+  both hid it).
   `leerie_repo_lock`'s lock file follows `--git-common-dir` into the run's
   repository. It still serialises the run's own parallel `worktree add`s,
   and no longer serialises against other runs.

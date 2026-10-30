@@ -8521,7 +8521,7 @@ of a run lives in `<run-dir>/repo`; the user's repository receives only
 - `_reset_subtask_worktree`, `_prune_subtask_worktree`;
 - `_create_empty_subtask_branch`'s caller, `_undo_interrupted_redrives`' `update-ref`, `_settle_subtask`'s `_ref_sha`;
 - `_shipping_tree`, `_falsify_items`' `diff --stat`;
-- `_worktree_add_detached` (default `repo`);
+- `_worktree_add_detached` (default `repo`; with no `repo` given and `_run_repo_of(st.run_dir)` None it `die()`s — the run's repository is missing only through a leerie bug, never degraded into a gate's "no evidence");
 - `_cleanup_on_abnormal_exit`'s removals;
 - `_prune_leerie_worktrees(root)` (the registry of `_run_repo_of(root)`, else the cwd's).
 - reads of a commit's objects:
