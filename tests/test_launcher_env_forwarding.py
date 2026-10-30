@@ -294,7 +294,7 @@ def test_empty_var_not_forwarded():
 
 # ── coupling guard: no orchestrator override is silently deny-listed ─────────
 
-# The five orchestrator-read LEERIE_* vars that are legitimately deny-listed
+# The six orchestrator-read LEERIE_* vars that are legitimately deny-listed
 # (see the launcher's `_leerie_env_denylist` comment):
 #   LEERIE_STATE_DIR / LEERIE_INSPECT_DIRS / LEERIE_HOST_DIR — remapped
 #     separately to container-internal values (the host value of
@@ -303,12 +303,18 @@ def test_empty_var_not_forwarded():
 #     host does the push.
 #   LEERIE_RUNTIME — the runtime is decided launcher-side before the container
 #     launches; the orchestrator's read is informational.
+#   LEERIE_RUN_ID_FILE — launcher-computed per invocation (below).
 _JUSTIFIED_DENYLISTED = {
     "LEERIE_STATE_DIR",
     "LEERIE_INSPECT_DIRS",
     "LEERIE_HOST_DIR",
     "LEERIE_NO_PUSH",
     "LEERIE_RUNTIME",
+    # Launcher-computed per invocation: the container path of the file the
+    # orchestrator names its run in (DESIGN §6 *Which run the container
+    # ran*). A host value would point the launcher's bring-back at a file
+    # it never reads.
+    "LEERIE_RUN_ID_FILE",
 }
 
 

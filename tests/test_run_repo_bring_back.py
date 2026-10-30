@@ -203,3 +203,74 @@ def test_prune_keeps_a_run_whose_branch_cannot_come_back(run, tmp_path):
     assert r.returncode == 0, r.stderr
     assert not run_dir.exists()
     assert _git(user, "rev-parse", "--verify", "-q", BRANCH)
+
+
+# --- which run the container ran (DESIGN §6 *Which run the container ran*)
+
+def _bring_back_block() -> str:
+    """The launcher's post-run bring-back block, verbatim."""
+    src = LAUNCHER.read_text()
+    start = src.index('_bb_run_id=""\n')
+    end = src.index("unset _bb_run_id\n", start) + len("unset _bb_run_id\n")
+    return src[start:end]
+
+
+def _post_run(user: Path, state_root: Path, run_id_file: Path,
+              *, leerie_run_id: str = "", cid: str = ""):
+    cidfile = state_root / ".cidfile-test"
+    if cid:
+        cidfile.write_text(cid)
+    script = (f'set -euo pipefail\nRUNTIME=local\n'
+              f'LEERIE_RUN_ID="{leerie_run_id}"\n'
+              f'_cidfile="{cidfile}"\n_run_id_file="{run_id_file}"\n'
+              + _bring_back_block())
+    return subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(state_root),
+             "USER_REPO": str(user), "LEERIE_REPO": str(REPO_ROOT),
+             "LEERIE_STATE_HOST_DIR": str(state_root)},
+        capture_output=True, text=True)
+
+
+def test_a_bare_resumes_own_pick_is_brought_back(run):
+    """The gap this closes: a bare `resume` auto-picked the run, so the
+    launcher had no `--run-id`, and its cidfile names the NEW container,
+    no run at all. The orchestrator's run-id file names the run it ran, and
+    that run's branch comes back."""
+    user, run_dir, repo, _wt = run
+    state_root = run_dir.parent.parent
+    rid = state_root / ".runid-test"
+    rid.write_text(RUN_ID + "\n")
+    r = _post_run(user, state_root, rid, cid="f00dcafe" * 8)
+    assert r.returncode == 0, r.stderr
+    assert _git(user, "rev-parse", BRANCH) == _git(repo, "rev-parse", BRANCH)
+
+
+def test_the_file_is_the_one_source_not_the_launchers_guesses(run):
+    """`--run-id` / the cidfile name a run; the file names another (the one
+    the container ran). Only the file's run is brought back; with no file,
+    nothing is — there is no guess and no scan."""
+    user, run_dir, repo, _wt = run
+    state_root = run_dir.parent.parent
+    rid = state_root / ".runid-test"
+    r = _post_run(user, state_root, rid, leerie_run_id=RUN_ID, cid=RUN_ID)
+    assert r.returncode == 0, r.stderr
+    assert _git(user, "rev-parse", "--verify", "-q", BRANCH,
+                check=False) == ""
+    rid.write_text("../../etc\n")             # not a run id: ignored
+    assert _post_run(user, state_root, rid).returncode == 0
+    assert _git(user, "rev-parse", "--verify", "-q", BRANCH,
+                check=False) == ""
+
+
+def test_the_launcher_names_the_file_and_the_container_gets_it():
+    """The path the launcher reads is the one it hands the container, under
+    the state root mount, and a host value of the variable never reaches
+    the container in its place."""
+    src = LAUNCHER.read_text()
+    assert '_run_id_file="$LEERIE_STATE_HOST_DIR/.runid-$$"' in src
+    assert '-e "LEERIE_RUN_ID_FILE=/leerie-state/.runid-$$"' in src
+    assert '-v "$LEERIE_STATE_HOST_DIR:/leerie-state"' in src
+    deny = src[src.index('_leerie_env_denylist=" \\'):]
+    deny = deny[:deny.index('"\n')]
+    assert " LEERIE_RUN_ID_FILE " in deny.replace("\\\n", " ")

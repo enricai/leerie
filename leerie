@@ -8931,6 +8931,12 @@ else
 
   _cidfile="$LEERIE_STATE_HOST_DIR/.cidfile-$$"
   rm -f "$_cidfile"
+  # Where the orchestrator names the run this container runs (DESIGN §6
+  # *Which run the container ran*): its own resolution, a bare `resume`'s
+  # pick included, is the one source the bring-back below reads. In the
+  # state root, which the container already writes at /leerie-state.
+  _run_id_file="$LEERIE_STATE_HOST_DIR/.runid-$$"
+  rm -f "$_run_id_file"
 
   # Fix D (DESIGN §6 *container boundary's hidden precondition*): kill the
   # container if the launcher is interrupted, so a Ctrl-C / SIGTERM to this
@@ -9020,7 +9026,7 @@ else
       _run_log=""
     fi
   }
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null; _reap_tail; _kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null; _reap_tail; _kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null' EXIT
   trap '_reap_tail; _kill_container_from_cidfile; exit 130' INT
   trap '_reap_tail; _kill_container_from_cidfile; exit 143' TERM
 
@@ -9055,7 +9061,7 @@ else
     LEERIE_SKIP_PREPUSH_PREFLIGHT \
     LEERIE_STATE_DIR LEERIE_INSPECT_DIRS LEERIE_HOME LEERIE_REPO \
     LEERIE_STATE_HOST_DIR LEERIE_HOST_DIR LEERIE_SELF_CMD LEERIE_VERSION \
-    LEERIE_TASK_ARG \
+    LEERIE_TASK_ARG LEERIE_RUN_ID_FILE \
     LEERIE_NO_PUSH LEERIE_GENERATED_SENTINEL LEERIE_RECAPTURE_WROTE \
     LEERIE_NO_AUTO_PUBLISH LEERIE_LOCAL_BUILD LEERIE_FORCE_KILL \
     LEERIE_NO_RUNTIME_INSTALL LEERIE_INSPECT_HOST_TARGETS \
@@ -9089,6 +9095,7 @@ else
     -v "$_cidfile:/run/leerie-cidfile:ro"
     -e LEERIE_INSPECT_DIRS=
     -e LEERIE_STATE_DIR=/leerie-state
+    -e "LEERIE_RUN_ID_FILE=/leerie-state/.runid-$$"
     # Basename only: the host path doesn't exist in the container (the repo
     # is at /work), and log() takes Path(USER_REPO).name. Without this the
     # orchestrator's cwd=/work falls back to basename "work" and every line
@@ -9238,21 +9245,25 @@ fi
 # Bring the run branch back from the run's own repository into yours
 # (DESIGN §6 *The run's own repository*) after every local run, whatever its
 # exit code and with or without --no-push: the branch is the run's record
-# for you. The run is known here by --run-id / `resume <id>`, or by the
-# cidfile for a fresh run; a bare `resume` that auto-picked is brought back
-# by its finalize (`host_finalize`), `leerie finalize <id>`, or `prune`.
-if [ "$RUNTIME" = "local" ]; then
-  _bb_run_id="${LEERIE_RUN_ID:-}"
-  if [ -z "$_bb_run_id" ] && [ -f "${_cidfile:-}" ]; then
-    _bb_run_id="$(cat "$_cidfile" 2>/dev/null || true)"
-  fi
-  if [ -n "$_bb_run_id" ] && [ -f "$LEERIE_STATE_HOST_DIR/runs/$_bb_run_id/repo/HEAD" ]; then
+# for you. The run is the one the orchestrator named in the run-id file
+# (*Which run the container ran*) — a fresh run, `resume <id>` and a bare
+# `resume`'s own pick alike. No file: the container ran no run, and nothing
+# is brought back.
+_bb_run_id=""
+if [ "$RUNTIME" = "local" ] && [ -f "${_run_id_file:-}" ]; then
+  _bb_run_id="$(head -n 1 "$_run_id_file" 2>/dev/null || true)"
+  case "$_bb_run_id" in
+    ''|*[!A-Za-z0-9._-]*|.*) _bb_run_id="" ;;
+  esac
+fi
+if [ -n "$_bb_run_id" ]; then
+  if [ -f "$LEERIE_STATE_HOST_DIR/runs/$_bb_run_id/repo/HEAD" ]; then
     # shellcheck source=scripts/host-finalize.sh
     . "$LEERIE_REPO/scripts/host-finalize.sh"
     host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_bb_run_id" || true
   fi
-  unset _bb_run_id
 fi
+unset _bb_run_id
 if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
   if [ "$container_rc" -ne 0 ]; then
     # Prefer the explicit/positional run id (--run-id / `resume <id>`)

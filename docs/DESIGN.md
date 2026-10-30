@@ -1906,15 +1906,37 @@ leerie's own enumerated git:
 
   It runs:
   - after the container exits, whatever its exit code and with or without
-    `--no-push`, before the auto-finalize, for the run the launcher knows
-    (`--run-id`, `resume <id>`, or the fresh run's container id);
-  - at the start of every `host_finalize`, so the run a bare `resume`
-    auto-picked comes back when it is finalized;
+    `--no-push`, before the auto-finalize, for the run that container ran
+    (*Which run the container ran* below);
+  - at the start of every `host_finalize`;
   - in `leerie finalize <id>`;
   - in `prune`, before a run directory is deleted. A refused swap while the
     run's tip is not what was last brought back (its newest commits are in
     no ref of the user's) keeps the directory, so a run whose launcher died
     is never lost.
+
+  *Which run the container ran.* Only the orchestrator knows which run it
+  ran: a bare `resume` picks one itself (`resolve_run_id`), and the
+  launcher's own guesses (`--run-id`, the container id of a fresh run) miss
+  that case. Until this was closed, an auto-picked resume that exited
+  without pushing left its branch in the run's repository until a later
+  finalize or prune. So the orchestrator says which run it ran.
+  - The launcher names a file of its own invocation in the state root
+    (`.runid-<launcher pid>`) and passes its container path in
+    `LEERIE_RUN_ID_FILE`.
+  - The orchestrator writes the run id there as soon as it holds that
+    run's directory. That is the moment the run is its, after
+    `resolve_run_id` and the `State` flock.
+  - After the container exits, the launcher reads that file, and nothing
+    else, to choose the run it brings back.
+
+  The orchestrator's own resolution is the one source of "which run". The
+  launcher does no resolution of its own, so the two cannot disagree. No
+  file means the container ran no run, for example a preflight refusal,
+  and nothing is brought back: there is no scan for a run to guess. The
+  file lives in the state root the container already writes, so no mount
+  or ownership change is needed on any runtime. Fly and EC2 never set the
+  variable: their branch comes back through `fetch_branch`.
 
   On Fly and EC2, `fetch_branch` bundles from the run's repository instead
   of `/work`, and leaves `repo/` out of the state directory it copies to the

@@ -9774,7 +9774,7 @@ async def _ensure_run_repo_or_die(st: "State") -> Path:
         return await asyncio.to_thread(_ensure_run_repo, st)
     except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
         die(f"could not create the run's own repository under "
-            f"{Path(st.run_dir) / RUN_REPO_NAME}: {e}\n"
+            f"{_operator_path(Path(st.run_dir) / RUN_REPO_NAME)}: {e}\n"
             "leerie runs every worker in a repository of the run's own, "
             "never in yours (DESIGN §6 *The run's own repository*).")
         raise  # unreachable: die() exits
@@ -9786,6 +9786,34 @@ async def _refresh_run_repo_base_or_die(st: "State", where: str) -> str:
     except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
         die(f"{where}: could not refresh the run's repository from yours: {e}")
         raise  # unreachable: die() exits
+
+
+# The launcher's per-invocation file the orchestrator names its run in
+# (DESIGN §6 *Which run the container ran*); set by the local launcher only.
+RUN_ID_FILE_ENV = "LEERIE_RUN_ID_FILE"
+
+
+def _record_run_id_for_launcher(run_id: str) -> None:
+    """Write `run_id` to the file `LEERIE_RUN_ID_FILE` names, atomically:
+    the orchestrator's own resolution (`resolve_run_id`, a bare `resume`'s
+    pick included) is the one source of which run the container ran, and
+    the launcher reads it after exit to bring that run's branch back. A
+    no-op when the variable is unset (Fly/EC2, tests, a direct invocation).
+    Never raises: a failed write is logged, and the branch then comes back
+    at the run's finalize or `prune`."""
+    path = os.environ.get(RUN_ID_FILE_ENV, "")
+    if not path:
+        return
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            f.write(run_id + "\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        log(f"WARNING: could not tell the launcher this is run {run_id} "
+            f"({e}); its branch comes back at finalize or `leerie prune`")
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
 
 
 def _refuse_pre_run_repo_resume(st: "State") -> None:
@@ -63525,6 +63553,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             f"`leerie resume {run_id}`. "
             f"If the holder is wedged, kill it and retry.")
         sys.exit(EXIT_LOCKED)
+    # The run is this process's from here (its flock is held): tell the
+    # launcher which one, for the bring-back after the container exits
+    # (DESIGN §6 *Which run the container ran*).
+    _record_run_id_for_launcher(st.run_id)
     for sub in ("", "subtasks", "criteria", "checkpoints", "logs"):
         (st.run_dir / sub).mkdir(parents=True, exist_ok=True)
 

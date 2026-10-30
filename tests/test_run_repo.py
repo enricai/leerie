@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -422,3 +423,61 @@ def test_finalize_cleanup_deletes_no_branch(leerie):
     assert "disappeared" not in src
     assert src.count('_run_script("cleanup.sh", "--run-id", st.run_id, '
                      'st=st)') == 2
+
+
+# ------------------------------- which run the container ran (launcher file)
+
+def test_the_run_id_file_is_written_atomically_and_only_when_asked(
+        leerie, tmp_path, monkeypatch):
+    target = tmp_path / ".runid-1"
+    monkeypatch.delenv("LEERIE_RUN_ID_FILE", raising=False)
+    leerie._record_run_id_for_launcher("r1")
+    assert not target.exists()
+    monkeypatch.setenv("LEERIE_RUN_ID_FILE", str(target))
+    leerie._record_run_id_for_launcher("r1")
+    assert target.read_text() == "r1\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".runid-1"]
+    monkeypatch.setenv("LEERIE_RUN_ID_FILE", str(tmp_path / "no" / "x"))
+    leerie._record_run_id_for_launcher("r1")        # logged, never raised
+
+
+def test_main_names_the_run_a_bare_resume_picked(leerie, tmp_path,
+                                                  monkeypatch):
+    """Substance: the real `main()`, a bare `resume` with two runs on disk.
+    The orchestrator's own pick — not anything the launcher could know — is
+    what reaches the launcher's file, before the run is driven."""
+    from tests.conftest import fake_claude_on_path
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-q", "--allow-empty", "-m", "init"],
+                   cwd=repo, check=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("LEERIE_STATE_DIR", raising=False)
+    fake_claude_on_path(tmp_path, monkeypatch)
+    monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
+    runs = repo / ".leerie" / "runs"
+    for rid, started in (("older-run", "2026-01-01T00:00:00+00:00"),
+                         ("newer-run", "2026-02-01T00:00:00+00:00")):
+        (runs / rid).mkdir(parents=True)
+        (runs / rid / "state.json").write_text(json.dumps(
+            {"task": "t", "started_at": started}))
+        (runs / rid / "run.json").write_text(json.dumps(
+            {"run_id": rid, "started_at": started}))
+    target = tmp_path / ".runid-launcher"
+    monkeypatch.setenv("LEERIE_RUN_ID_FILE", str(target))
+    seen: dict = {}
+
+    async def orchestrate(args, caps, leerie_dir, st, *a, **k):
+        seen["run_id"] = st.run_id
+        seen["file_before_drive"] = target.read_text()
+    monkeypatch.setattr(leerie, "_orchestrate", orchestrate)
+    monkeypatch.setattr(sys, "argv", ["leerie", "resume"])
+    try:
+        leerie.main()
+    except SystemExit:
+        pass
+    assert seen["run_id"] == "newer-run", seen
+    assert seen["file_before_drive"] == "newer-run\n"
+    assert target.read_text() == "newer-run\n"
