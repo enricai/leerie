@@ -12,7 +12,9 @@ Two worker shapes, both on the real `setup-run.sh` / `new-worktree.sh` /
   head made a resumed wave skip the merge, and the branch's commits never
   reached the run branch.
 - replay (barnacle 45fa4253): the worker detaches at the fork point and
-  commits there; the branch is moved forward to the work, as before.
+  commits there. Since review round 15 H2 the clean-tree gate catches it
+  before settle (tests/test_settled_head_integration.py); it is no longer
+  a settle shape.
 
 Each is driven through a real `phase_execute` that dies between settle and
 integration, then a resumed `phase_execute` on a State read back from
@@ -27,7 +29,7 @@ import pytest
 
 from tests.conftest import REPO_ROOT
 from tests.test_settled_head_integration import (RUN_ID, _branch_tip,
-                                                 _detached_commits, _git,
+                                                 _git,
                                                  _in_staging, _integrate,
                                                  _world)
 
@@ -56,8 +58,6 @@ def test_base_checkout_records_the_branch_tip(leerie, tmp_path, monkeypatch,
     assert got == work, (got, fork, work)
     assert st.data["settled_heads"] == {"t1": work}
     assert _branch_tip(repo) == work                 # never moved back
-    cap = capsys.readouterr()
-    assert "the branch tip is the settled head" in cap.out + cap.err
     heads = st.data["settled_heads"]
     assert asyncio.run(leerie._wave_sids_not_integrated(
         staging, RUN_ID, ["t1"], heads)) == ["t1"]
@@ -137,7 +137,11 @@ def _phase_execute(leerie, st, crash: bool) -> None:
         leerie.integrate_wave = real
 
 
-@pytest.mark.parametrize("shape", ["base_checkout", "replay"])
+# The "replay" shape (commits on a detached HEAD) is no longer settled at
+# all: the clean-tree gate holds the worker to its branch first (review
+# round 15 H2; tests/test_settled_head_integration.py,
+# tests/test_clean_tree_gate.py).
+@pytest.mark.parametrize("shape", ["base_checkout"])
 def test_crash_after_settle_then_resume_merges_the_work(
         leerie, tmp_path, monkeypatch, shape):
     repo, st, staging, wt0 = _world(leerie, tmp_path, monkeypatch)
@@ -147,11 +151,7 @@ def test_crash_after_settle_then_resume_merges_the_work(
     made: dict[str, str] = {}
 
     def worker(wt: Path) -> None:
-        if shape == "base_checkout":
-            made["fork"], made["work"] = _base_checkout(wt)
-        else:
-            made["fork"] = _git(wt, "rev-parse", "HEAD")
-            made["work"] = _detached_commits(wt)
+        made["fork"], made["work"] = _base_checkout(wt)
     _patch(leerie, monkeypatch, repo, worker)
     with pytest.raises(_Crash):
         _phase_execute(leerie, st, crash=True)

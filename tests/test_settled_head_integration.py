@@ -84,23 +84,24 @@ def _integrate(leerie, st):
         {"integrator": None})), results
 
 
-def test_settle_puts_the_branch_where_the_work_is(leerie, tmp_path,
-                                                  monkeypatch):
+def test_the_settled_head_is_the_branch_tip_and_a_detached_worker_is_caught(
+        leerie, tmp_path, monkeypatch):
+    """Rewritten for review round 15 H2. The replay's detached commits used
+    to be repaired at settle — the branch moved to the worker's HEAD. The
+    clean-tree gate now catches the shape first (a HEAD line: the worker is
+    re-asked to put its commits on the branch, and never settles `complete`
+    otherwise), so the settled head is simply the branch tip and leerie
+    never moves the branch for the worker."""
     repo, st, staging, wt = _world(leerie, tmp_path, monkeypatch)
     fork = _branch_tip(repo)
-    head = _detached_commits(wt)
-    assert _branch_tip(repo) == fork          # the replay's state
+    _detached_commits(wt)
+    branch = f"leerie/subtasks/{RUN_ID}/t1"
+    lines = asyncio.run(leerie._tree_dirt(wt, branch=branch, base=fork))
+    assert lines == [f"HEAD is not on {branch} (detached)"]
     got = asyncio.run(leerie._record_settled_head(st, st.run_dir, "t1"))
-    assert got == head
-    assert st.data["settled_heads"] == {"t1": head}
-    assert _branch_tip(repo) == head
-    assert _git(wt, "symbolic-ref", "HEAD") == \
-        f"refs/heads/leerie/subtasks/{RUN_ID}/t1"
-    # The merge that follows carries the work.
-    out, _ = _integrate(leerie, st)
-    assert out == ["t1"]
-    assert _in_staging(staging, head)
-    assert (staging / "search.test.ts").read_text() == "case 2\n" * 3
+    assert got == fork
+    assert st.data["settled_heads"] == {"t1": fork}
+    assert _branch_tip(repo) == fork                 # never moved for it
 
 
 def test_a_no_op_merge_is_re_integrated_from_the_settled_head(

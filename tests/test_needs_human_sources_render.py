@@ -55,8 +55,10 @@ SOURCES = sorted(_written_sources())
 
 def test_the_derivation_finds_the_sources():
     # A derivation that silently finds nothing would pass everything below.
+    # Not a count of today's sources (I3 removed one): the special shapes
+    # and the constants, both found.
     assert SPECIAL <= set(SOURCES)
-    assert len(SOURCES) >= 10, SOURCES
+    assert len(set(SOURCES) - SPECIAL) >= 5, SOURCES
 
 
 def test_every_written_source_has_a_deliberate_group(leerie):

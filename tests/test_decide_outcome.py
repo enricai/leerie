@@ -18,22 +18,23 @@ def st(leerie, tmp_path):
     s = leerie.State(tmp_path / ".leerie", "fix-001-abcdef")
     s.data = {"task": "x", "subtask_status": {"a": "complete"}}
     s.save()
-    # A staging worktree whose tree ships: a delivery verdict counts only
-    # on it (DESIGN §6 *A delivery verdict counts only on the tree it was
+    # The run branch whose tree ships: a delivery verdict counts only on it
+    # (DESIGN §6 *A delivery verdict counts only on the tree it was
     # measured on*); the params below write SHIP for that tree.
-    staging = s.run_dir / "worktrees" / "staging"
-    staging.mkdir(parents=True)
-    for args in (["init", "-q"], ["config", "user.email", "t@t"],
+    repo = s.repo_root
+    for args in (["init", "-q", "-b", "leerie/runs/fix-001-abcdef"],
+                 ["config", "user.email", "t@t"],
                  ["config", "user.name", "t"],
                  ["commit", "-q", "--allow-empty", "-m", "base"]):
-        subprocess.run(["git", *args], cwd=staging, check=True,
+        subprocess.run(["git", *args], cwd=repo, check=True,
                        capture_output=True)
     return s
 
 
 def _ship(st, extra: dict) -> dict:
-    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"],
-                          cwd=st.run_dir / "worktrees" / "staging",
+    tree = subprocess.run(["git", "rev-parse",
+                           "leerie/runs/fix-001-abcdef^{tree}"],
+                          cwd=st.repo_root,
                           check=True, capture_output=True,
                           text=True).stdout.strip()
     return json.loads(json.dumps(extra).replace("SHIP", tree))

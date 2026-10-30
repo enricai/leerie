@@ -104,7 +104,10 @@ def _st(leerie, tmp_path: Path, repo: Path, head: str, **data):
 def _staging(st, repo: Path, sha: str) -> Path:
     staging = st.run_dir / "worktrees" / "staging"
     staging.parent.mkdir(parents=True, exist_ok=True)
-    _git(repo, "worktree", "add", "-q", "--detach", str(staging), sha)
+    # On the run's own branch, as setup-run.sh leaves it: its tree is the
+    # tree that ships (`_shipping_tree`).
+    _git(repo, "worktree", "add", "-q", "-B", f"leerie/runs/{st.run_id}",
+         str(staging), sha)
     return staging
 
 

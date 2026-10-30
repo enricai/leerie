@@ -84,7 +84,8 @@ def test_a_clean_tree_is_never_reasked(leerie, tmp_path):
     async def reask(note):
         asked.append(note)
     assert asyncio.run(leerie._clean_tree_gate(
-        r, caps=_caps(leerie), label="t", reask=reask)) == []
+        r, caps=_caps(leerie), label="t", reask=reask,
+        branch="main", base=None)) == []
     assert asked == []
 
 
@@ -98,7 +99,8 @@ def test_a_worker_that_commits_on_the_reask_passes(leerie, tmp_path):
         _git(r, "add", "helpers.py")
         _git(r, "commit", "-qm", "add helpers")
     assert asyncio.run(leerie._clean_tree_gate(
-        r, caps=_caps(leerie), label="t", reask=reask)) == []
+        r, caps=_caps(leerie), label="t", reask=reask,
+        branch="main", base=None)) == []
     assert len(asked) == 1
     # The note carries the exact porcelain line and only the two acts.
     assert "    ?? helpers.py" in asked[0]
@@ -119,7 +121,8 @@ def test_exhaustion_returns_the_lines_and_touches_nothing(leerie, tmp_path):
         if len(asked) == 1:
             raise leerie.WorkerError("session died")
     got = asyncio.run(leerie._clean_tree_gate(
-        r, caps=_caps(leerie), label="t", reask=reask))
+        r, caps=_caps(leerie), label="t", reask=reask,
+        branch="main", base=None))
     assert got == ["?? helpers.py"]
     assert len(asked) == 2
     assert _git(r, "rev-parse", "HEAD") == head
@@ -134,7 +137,8 @@ def test_the_bound_is_the_cap(leerie, tmp_path):
     async def reask(note):
         asked.append(note)
     asyncio.run(leerie._clean_tree_gate(
-        r, caps=_caps(leerie, 0), label="t", reask=reask))
+        r, caps=_caps(leerie, 0), label="t", reask=reask,
+        branch="main", base=None))
     assert asked == []
     assert leerie.DEFAULT_CAPS["clean_tree_reasks"] == 2
 

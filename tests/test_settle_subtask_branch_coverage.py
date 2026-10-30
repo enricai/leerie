@@ -702,3 +702,43 @@ def test_a_killed_attempt_that_cleans_up_is_retried(env, monkeypatch):  # noqa: 
 
     assert len(calls) == 2                        # retried after cleanup
     assert res["status"] == "failed"
+
+
+def test_an_implementer_that_commits_detached_settles_unconverged(
+        env, monkeypatch):  # noqa: F811
+    """Review round 15 H2 (barnacle 45fa4253's shape): the implementer
+    checks out the fork point detached and commits there. `git status` is
+    empty; the branch line catches it, the worker is re-asked to put its
+    commits on its branch, and, never back on it, the subtask settles
+    `unconverged` — never `complete` with its branch empty."""
+    leerie_mod = env["leerie"]
+    wt = env["worktree"]
+    branch = f"leerie/subtasks/{env['st'].run_id}/t1"
+
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        _git("checkout", "-q", "--detach", cwd=wt)
+        (wt / "feature.py").write_text("def g():\n    pass\n")
+        _git("add", "feature.py", cwd=wt)
+        _git("commit", "-q", "-m", "work on a detached HEAD", cwd=wt)
+        return {"subtask_id": sid_, "status": "complete",
+                "summary": "done", "criteria_results": [],
+                "production_evidence": {"exercised": True, "how": "n/a",
+                                         "observed": "n/a"}}
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+    reasks: list[dict] = []
+
+    async def fake_claude_p(**kw):
+        reasks.append(kw)
+        return {}
+    monkeypatch.setattr(leerie_mod, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie_mod, "_log_session_id", lambda p: "sess-impl")
+
+    res = _settle(leerie_mod, env)
+
+    assert len(reasks) == 2
+    assert f"HEAD is not on {branch} (detached)" in reasks[0]["user_prompt"]
+    assert f"git checkout {branch}" in reasks[0]["user_prompt"]
+    assert res["status"] == "unconverged"
+    rec = env["st"].data["unconverged_subtasks"]["t1"]
+    assert rec["kind"] == "unclean_tree" and "(detached)" in rec["reason"]

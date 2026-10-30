@@ -81,7 +81,8 @@ def test_falsifier_leads_leave_the_users_checkout_alone(leerie, tmp_path):
     assert _git(wt, "status", "--porcelain", "--untracked-files=all") == ""
     # ...and survive the per-sample `clean -fd`.
     asyncio.run(leerie._restore_tree(
-        wt, _git(wt, "rev-parse", "HEAD").strip(), where="t"))
+        wt, _git(wt, "rev-parse", "HEAD").strip(), where="t",
+        branch=None))
     assert (wt / "docs" / "bug-report.md").is_file()
     # A second placement (the next sample) is idempotent.
     leerie._falsifier_place_leads(st, wt, [], "see docs/bug-report.md")

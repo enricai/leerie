@@ -692,8 +692,11 @@ class World:
         (self.dir / "logs").mkdir(parents=True, exist_ok=True)
         self.staging = self.dir / "worktrees" / "staging"
         self.staging.parent.mkdir(parents=True, exist_ok=True)
-        _git(repo, "worktree", "add", "-q", "--detach", str(self.staging),
-             head)
+        # On the run branch, as setup-run.sh leaves it: the clean-tree gate
+        # holds every worker there, and the run branch's tree is the tree
+        # that ships (DESIGN §8 *A worker leaves its tree clean*).
+        _git(repo, "worktree", "add", "-q", "-b", "leerie/runs/run-r",
+             str(self.staging), head)
         sets = []
         for i in range(1, n_sets + 1):
             sdir = tmp_path / f"set{i}"

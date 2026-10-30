@@ -5877,14 +5877,12 @@ wave-end re-drives.
 
 Settled heads (DESIGN §6 *Integrated means the settled commit is on the
 run branch*). `phase_execute`'s `settle_one` calls `_record_settled_head
-(st, leerie_dir, sid)` whenever `_settle_subtask` returns `complete`: with
-the subtask worktree present it reads `HEAD`; when `git symbolic-ref -q
-HEAD` is not `refs/heads/leerie/subtasks/<run-id>/<sid>` and that branch
-is HEAD or an ancestor of it, it `git update-ref`s the branch to HEAD
-(old value checked) and `git checkout -q`s it (logged), and HEAD is the
-settled head; otherwise (the branch is not an ancestor of HEAD) it logs
-the divergence, leaves the ref, and the **branch tip** is the settled head
-— nothing is recorded when the branch is missing. The settled head is
+(st, leerie_dir, sid)` whenever `_settle_subtask` returns `complete`: the
+settled head is the subtask branch's tip (`_ref_sha(st.repo_root,
+_compute_subtask_branch(run_id, sid))`), since the clean-tree gate holds
+the worker's HEAD on that branch — nothing is recorded when the branch is
+missing. (The repair that moved the branch to a detached HEAD went with
+review round 15 H2.) The settled head is
 saved to `state.data["settled_heads"][sid]`. `_undo_interrupted_redrives` sets it
 to the round's `pre_sha` when it rolls a round back (and drops it when the
 rollback failed). In `integrate_wave`, after a merge reports success —
@@ -6091,15 +6089,26 @@ branch — the second `git worktree add -b` fails with
 DESIGN §8 *A worker leaves its tree clean*. One checker, one re-ask, one
 gate, shared by every site:
 
-- `async _tree_dirt(tree) -> list[str] | None` — every non-empty line of
-  `git status --porcelain --untracked-files=all` in `tree`, verbatim
-  (`run_proc`); `[]` is clean; None when git exits non-zero or cannot be
-  spawned (not clean). No `--ignored`: an ignored file never appears.
+- `async _tree_dirt(tree, *, branch=None, base=None) -> list[str] | None`
+  — every non-empty line of `git status --porcelain --untracked-files=all`
+  in `tree`, verbatim (`run_proc`); with `branch`, the line `"HEAD is not
+  on <branch> (detached)"` / `"(on <other>)"` (`_BRANCH_LINE_HEAD`) when
+  `git symbolic-ref -q HEAD` is not `refs/heads/<branch>`; with `base`,
+  the line `"HEAD does not descend from <base12>, where this worker
+  started"` (`_BRANCH_LINE_BASE`) when `git merge-base --is-ancestor
+  <base> HEAD` exits 1. `[]` is clean; None when git exits otherwise or
+  cannot be spawned (not clean). No `--ignored`: an ignored file never
+  appears (review round 15 H2 added the branch lines).
+- `async _ref_sha(repo, branch) -> str` — `git rev-parse --verify -q
+  refs/heads/<branch>` in `repo`, "" when absent.
 - `CLEAN_TREE_REASK_NOTE` — the re-ask's user prompt, `{lines}` filled
   with the porcelain lines (each indented four spaces): commit each line
   that is part of the change, delete each that is not (`git checkout --
   <path>` for a modified tracked file), do no other work, re-run the same
-  `git status`, return the JSON object per the schema.
+  `git status`, return the JSON object per the schema. When a line is a
+  branch line, `CLEAN_TREE_BRANCH_NOTE.format(branch=...)` is appended:
+  `git checkout <branch>` and put the commits that belong in the change
+  on it.
 - `_clean_tree_reasker(st, caps, *, log_sid, cwd, schema_key,
   system_prompt, model, effort, max_turns) -> Callable[[str],
   Awaitable[None]]` — the re-ask of the SAME worker: `_log_session_id(
@@ -6109,8 +6118,9 @@ gate, shared by every site:
   autonomous=True, model, effort, sid=f"{log_sid}-clean<n>",
   resume_session=<session>)`; the structured result is not read. No
   recorded session → `WorkerError`, no worker spent.
-- `async _clean_tree_gate(tree, *, caps, label, reask) -> list[str]` —
-  `_tree_dirt`; while not `[]` and fewer than `caps["clean_tree_reasks"]`
+- `async _clean_tree_gate(tree, *, caps, label, reask, branch, base) ->
+  list[str]` — `_tree_dirt(tree, branch=branch, base=base)` (`branch` the
+  one leerie gave the worker, required; `base` the commit it started at); while not `[]` and fewer than `caps["clean_tree_reasks"]`
   (`DEFAULT_CAPS` 2) re-asks spent, `reask(CLEAN_TREE_REASK_NOTE.format(
   lines=...))`; a re-ask that raises is logged and spends its attempt.
   Returns `[]`, or the lines still there (None from `_tree_dirt` becomes
@@ -6130,7 +6140,13 @@ a fresh worker): that kind is gone from `_WORKER_RETRYABLE_KINDS`.
   "Unconverged" section names the lines.
 
 The sites — each calls the gate right after the worker's `claude_p`
-returned, before leerie runs anything of its own in that tree:
+returned, before leerie runs anything of its own in that tree. `branch`
+is `_compute_subtask_branch(run_id, sid)` in a subtask worktree and
+`_compute_run_branch(run_id)` in staging; `base` is the implementer
+attempt's `attempt_base` (the subtask branch's tip before the attempt,
+else the run branch's), a conformer round's `before_sha`, an
+acceptance-repair round's `round_pre`, a re-drive group's `pre_sha`, the
+integrator's `pre_sha` and a repair round's `pre`:
 
 | Worker | Tree | `log_sid` | On exhaustion |
 |---|---|---|---|
@@ -6147,15 +6163,19 @@ returned, before leerie runs anything of its own in that tree:
 DESIGN §8 *One restore*. Every rollback and reset of a tree to a commit is
 one primitive:
 
-- `async _restore_tree(tree, rev, *, where) -> bool`:
+- `async _restore_tree(tree, rev, *, where, branch) -> bool`:
   `_restore_write_bits(tree)` (owner `u+wx` on `tree`, on every `git ls-tree
   -r -d -z --name-only HEAD` directory and, through `_writable_dirs_to` and
   an `os.walk`, on every `git ls-files --others --exclude-standard
-  --directory -z` path); `git reset -q --hard <rev>` (up to three attempts,
+  --directory -z` path); with `branch` (required; None only for the
+  falsifier's disposable detached checkout), `git -c
+  core.hooksPath=/dev/null checkout -q -f <branch>` first (review round 15
+  H2: a reset alone moved a worker's detached HEAD and left the branch
+  where it was); `git reset -q --hard <rev>` (up to three attempts,
   a second apart, until `_branch_head_sha` reads; False when HEAD is then
-  not `rev`, the callers' existing failure path); `git clean -ffdq`
+  not `rev`, or not on `branch`, the callers' existing failure path); `git clean -ffdq`
   (nested repositories too, ignored files kept); then the postcondition
-  `_tree_dirt(tree) == []`, else `die("<where>: <tree> could not be
+  `_tree_dirt(tree, branch=branch) == []`, else `die("<where>: <tree> could not be
   restored to <rev[:12]> — still there after the write bits, `reset
   --hard` and `clean -ffd`: <lines> … Not the orchestrator's own files
   (DESIGN §8 *One restore*); remove them, then `leerie resume`.")`. True
@@ -6164,7 +6184,7 @@ one primitive:
   and `_undo_round`, every re-drive rollback (group, interrupted round,
   `_undo_interrupted_redrives`), `_back_out_unmerged`,
   `_restart_integration_merge`, `_integration_repair_round`'s `_reset`, a
-  reaped implementer's debris (to its HEAD), and the falsifier's checkout
+  reaped implementer's debris (to its subtask branch's tip), and the falsifier's checkout
   between samples. (`_redrive_rollback`, `_acceptance_rollback`,
   `_rollback_conformer_commits` and `_falsifier_reset` are gone.)
 - `leerie_reset_worktree <wt> <branch> [<rev>]` (`scripts/worktree-lib.sh`):
@@ -7076,8 +7096,10 @@ broken, and — when the scope judge bounded the set — one of its
 -> (unmet, tree, which) | None`: `unmet_final` with `final_tree`, else
 `unmet_after` with `judged_after.tree`, else `unmet_before` with
 `judged_before.tree`) is of a tree other than `_shipping_tree(st)`
-(`git -C <run>/worktrees/staging rev-parse --verify -q HEAD^{tree}`, ""
-when unreadable) — reason `"the required items were not read on the tree
+(`git -C <repo_root> rev-parse --verify -q
+refs/heads/leerie/runs/<id>^{tree}` — the run branch finalize pushes, which
+outlives staging's removal by `cleanup.sh`; "" when unreadable; review
+round 15 H1) — reason `"the required items were not read on the tree
 that ships: the last delivery verdict (<which>) is of tree <12> …"` —
 or, on that tree, its unmet list is non-empty (DESIGN §6 *A delivery
 verdict counts only on the tree it was measured on*); `_ci_parity_unmet(st)` (`ci_parity.final.unmet`) is non-empty; `delivery_redrive.conflict` is set (its `reason` sentence is the outcome reason, verbatim); `conformance._final.residual_defects` is non-empty (`_residual_defects_reason`: the count, whether the delivery re-drive drove them, and up to three `[kind] where: case`). Otherwise `no_work` when `any_commits` is
@@ -7271,10 +7293,11 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `_decide_outcome` and `_prior_delivery_residual` read `unmet_final` first.
   The final judge's retry loop treats any `Exception` as a crash (its items
   `unknown` when every attempt fails), not only `WorkerError` / timeout.
-  The verdict records `final_tree` (`_committed_tree_sha(staging)`), and
+  The verdict records `final_tree` (`_shipping_tree(st)`), and
   `_delivery_judged_record(sha, unmet, details, tree)` records the pre-pass's
-  and the recheck's `tree`; the delivery re-drive's re-key sets
-  `final_tree` with `final_sha`.
+  and the recheck's `tree` (`_shipping_tree(st)` too); the delivery
+  re-drive's re-key sets `final_tree` (`_shipping_tree(st)`) with
+  `final_sha`.
 
 ### CI parity — `ci_checks`
 
@@ -10243,7 +10266,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
 | `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier typed `unverified_external`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` (or `simulated_interleaving`) to the PR's "Needs human verification"; `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
-| `settled_heads` | dict[str, str] | per-sid worktree HEAD sha at the moment the subtask settled `complete` — or the branch tip when that HEAD does not descend from it (`_record_settled_head`, DESIGN §6 *Integrated means the settled commit is on the run branch*); `integrate_wave` requires it to be an ancestor of staging after the merge; reset to the round's `pre_sha` by `_undo_interrupted_redrives`. |
+| `settled_heads` | dict[str, str] | per-sid subtask branch tip at the moment the subtask settled `complete` (`_record_settled_head`, DESIGN §6 *Integrated means the settled commit is on the run branch*); `integrate_wave` requires it to be an ancestor of staging after the merge; reset to the round's `pre_sha` by `_undo_interrupted_redrives`. |
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `integration_unjudged` | dict[str, str] | per-sid write-ahead marker of an integrator merge not yet judged (`_mark_integration_unjudged`, DESIGN §6 *A committed resolution is not a judged one*): the merge's first parent, saved before the integrator is spawned and dropped once the integration is decided (`_clear_integration_unjudged`); a resume that finds it with no `integration_gate[sid]` and the sid merged runs the integration gate on the committed merge. |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[], unverified?{item_index: {sha, label}}}` (`unverified`: items a failed ratchet did not read on the commit it kept, `_ratchet_mark_unverified`) — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |

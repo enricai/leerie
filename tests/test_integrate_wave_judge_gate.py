@@ -16,6 +16,10 @@ import pytest
 
 from tests.conftest import judge_checkout_in_place
 
+# Staging is on the run branch (`_compute_run_branch`): the clean-tree gate
+# holds every worker there (DESIGN §8 *A worker leaves its tree clean*).
+STAGING_BRANCH = "leerie/runs/test-int-gate-aaa"
+
 
 def _state(leerie, tmp_path, run_id="test-int-gate-aaa"):
     leerie_root = tmp_path / ".leerie"
@@ -129,8 +133,8 @@ def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
 
     # Create a minimal git repo in staging
     import subprocess
-    subprocess.run(["git", "init"], cwd=str(staging), check=True,
-                   capture_output=True)
+    subprocess.run(["git", "init", "-b", STAGING_BRANCH], cwd=str(staging),
+                   check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"],
                    cwd=str(staging), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test"],
@@ -171,7 +175,10 @@ def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
         # Simulate successful git commands
         mock = AsyncMock()
         mock.returncode = 0
-        if "rev-parse" in cmd:
+        if "symbolic-ref" in cmd:
+            # on the run branch, as the clean-tree gate requires
+            mock.stdout = f"refs/heads/{STAGING_BRANCH}\n"
+        elif "rev-parse" in cmd:
             mock.stdout = "abc123\n"
         elif "show" in cmd:
             mock.stdout = "Merge commit\n\ndiff content\n"
@@ -221,7 +228,7 @@ def _real_merge_staging(leerie_dir):
                               capture_output=True, text=True).stdout
     staging = leerie_dir / "worktrees" / "staging"
     staging.mkdir(parents=True)
-    g("init", "-q", "-b", "main")
+    g("init", "-q", "-b", STAGING_BRANCH)
     g("config", "user.email", "t@x")
     g("config", "user.name", "t")
     (staging / "app.py").write_text(SRC_BASE)
@@ -230,7 +237,7 @@ def _real_merge_staging(leerie_dir):
     g("checkout", "-q", "-b", "incoming")
     (staging / "app.py").write_text(SRC_THEIRS)
     g("commit", "-q", "-am", "incoming")
-    g("checkout", "-q", "main")
+    g("checkout", "-q", STAGING_BRANCH)
     (staging / "app.py").write_text(SRC_OURS)
     g("commit", "-q", "-am", "integrated")
     p1 = g("rev-parse", "HEAD").strip()
@@ -313,8 +320,8 @@ def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypatch):
     staging.mkdir(parents=True)
 
     import subprocess
-    subprocess.run(["git", "init"], cwd=str(staging), check=True,
-                   capture_output=True)
+    subprocess.run(["git", "init", "-b", STAGING_BRANCH], cwd=str(staging),
+                   check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"],
                    cwd=str(staging), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test"],
@@ -350,7 +357,10 @@ def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypatch):
     async def fake_run_proc(cmd, cwd=None):
         mock = AsyncMock()
         mock.returncode = 0
-        if "rev-parse" in cmd:
+        if "symbolic-ref" in cmd:
+            # on the run branch, as the clean-tree gate requires
+            mock.stdout = f"refs/heads/{STAGING_BRANCH}\n"
+        elif "rev-parse" in cmd:
             mock.stdout = "abc123\n"
         elif "show" in cmd:
             mock.stdout = "Merge\n\ndiff\n"
@@ -394,8 +404,8 @@ def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
     staging.mkdir(parents=True)
 
     import subprocess
-    subprocess.run(["git", "init"], cwd=str(staging), check=True,
-                   capture_output=True)
+    subprocess.run(["git", "init", "-b", STAGING_BRANCH], cwd=str(staging),
+                   check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"],
                    cwd=str(staging), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test"],
@@ -433,7 +443,10 @@ def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
     async def fake_run_proc(cmd, cwd=None):
         mock = AsyncMock()
         mock.returncode = 0
-        if "rev-parse" in cmd:
+        if "symbolic-ref" in cmd:
+            # on the run branch, as the clean-tree gate requires
+            mock.stdout = f"refs/heads/{STAGING_BRANCH}\n"
+        elif "rev-parse" in cmd:
             mock.stdout = "abc123\n"
         elif "show" in cmd:
             mock.stdout = "Merge\n\ndiff\n"
@@ -473,8 +486,8 @@ def _staging_repo(leerie_dir):
     import subprocess
     staging = leerie_dir / "worktrees" / "staging"
     staging.mkdir(parents=True)
-    subprocess.run(["git", "init"], cwd=str(staging), check=True,
-                   capture_output=True)
+    subprocess.run(["git", "init", "-b", STAGING_BRANCH], cwd=str(staging),
+                   check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"],
                    cwd=str(staging), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test"],
@@ -762,7 +775,7 @@ def _conflicting_staging(leerie_dir):
                               capture_output=True, text=True).stdout
     staging = leerie_dir / "worktrees" / "staging"
     staging.mkdir(parents=True)
-    g("init", "-q", "-b", "main")
+    g("init", "-q", "-b", STAGING_BRANCH)
     g("config", "user.email", "t@x")
     g("config", "user.name", "t")
     (staging / "app.py").write_text("x = 0\n")
@@ -771,7 +784,7 @@ def _conflicting_staging(leerie_dir):
     g("checkout", "-q", "-b", "incoming")
     (staging / "app.py").write_text("x = 2\n")
     g("commit", "-q", "-am", "incoming")
-    g("checkout", "-q", "main")
+    g("checkout", "-q", STAGING_BRANCH)
     (staging / "app.py").write_text("x = 1\n")
     g("commit", "-q", "-am", "integrated")
     return staging, g("rev-parse", "HEAD").strip()
@@ -1011,7 +1024,7 @@ def test_restart_merge_refuses_a_head_the_reset_did_not_move(
         script_calls.append(script)
         return await real_script(script, sid, run_id)
 
-    async def no_reset(tree, rev, *, where):
+    async def no_reset(tree, rev, *, where, branch):
         # The one restore primitive's own failure: the reset did not land.
         return False
 
@@ -1171,7 +1184,10 @@ def test_integrator_commit_warning_is_non_fatal_and_recorded(leerie, tmp_path, m
     async def fake_run_proc(cmd, cwd=None):
         mock = AsyncMock()
         mock.returncode = 0
-        if "rev-parse" in cmd:
+        if "symbolic-ref" in cmd:
+            # on the run branch, as the clean-tree gate requires
+            mock.stdout = f"refs/heads/{STAGING_BRANCH}\n"
+        elif "rev-parse" in cmd:
             mock.stdout = "abc123\n"
         elif "show" in cmd:
             mock.stdout = "Merge commit\n\ndiff\n"
@@ -1272,7 +1288,7 @@ def test_first_resolution_back_out_dies_only_when_the_reset_fails(
     leerie_dir = tmp_path / ".leerie"
     staging, pre = _conflicting_staging(leerie_dir)
     results = {"feat-001": {"status": "complete"}}
-    async def broken_reset(tree, rev, *, where):
+    async def broken_reset(tree, rev, *, where, branch):
         # The one restore primitive's reset does not land (a broken
         # repository): HEAD stays where the integrator left it.
         return False
@@ -1372,7 +1388,10 @@ def test_integrator_crash_then_recovery_logs_warning_and_still_integrates(
     async def fake_run_proc(cmd, cwd=None):
         mock = AsyncMock()
         mock.returncode = 0
-        if "rev-parse" in cmd:
+        if "symbolic-ref" in cmd:
+            # on the run branch, as the clean-tree gate requires
+            mock.stdout = f"refs/heads/{STAGING_BRANCH}\n"
+        elif "rev-parse" in cmd:
             mock.stdout = "abc123\n"
         elif "show" in cmd:
             mock.stdout = "Merge commit\n\ndiff\n"
@@ -1481,7 +1500,10 @@ def test_advisory_defect_logs_but_does_not_gate(leerie, tmp_path, monkeypatch):
     async def fake_run_proc(cmd, cwd=None):
         mock = AsyncMock()
         mock.returncode = 0
-        if "rev-parse" in cmd:
+        if "symbolic-ref" in cmd:
+            # on the run branch, as the clean-tree gate requires
+            mock.stdout = f"refs/heads/{STAGING_BRANCH}\n"
+        elif "rev-parse" in cmd:
             mock.stdout = "abc123\n"
         elif "show" in cmd:
             mock.stdout = "Merge commit\n\ndiff\n"

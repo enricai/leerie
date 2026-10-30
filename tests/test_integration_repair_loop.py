@@ -15,6 +15,10 @@ import pytest
 
 SID = "feat-002"
 
+# Staging is on the run branch (`_compute_run_branch`): the clean-tree gate
+# holds every worker there (DESIGN §8 *A worker leaves its tree clean*).
+STAGING_BRANCH = "leerie/runs/run-int-repair"
+
 
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=str(cwd), check=True,
@@ -39,7 +43,7 @@ def _setup(leerie, tmp_path: Path):
     leerie_dir = st.run_dir
     staging = leerie_dir / "worktrees" / "staging"
     staging.mkdir(parents=True)
-    _git(staging, "init", "-q", "-b", "main")
+    _git(staging, "init", "-q", "-b", STAGING_BRANCH)
     _git(staging, "config", "user.email", "t@x")
     _git(staging, "config", "user.name", "t")
     (staging / "app.py").write_text(BASE)
@@ -48,7 +52,7 @@ def _setup(leerie, tmp_path: Path):
     _git(staging, "checkout", "-q", "-b", "incoming")
     (staging / "app.py").write_text(THEIRS)
     _git(staging, "commit", "-q", "-am", "incoming")
-    _git(staging, "checkout", "-q", "main")
+    _git(staging, "checkout", "-q", STAGING_BRANCH)
     (staging / "app.py").write_text(OURS)
     _git(staging, "commit", "-q", "-am", "integrated")
     p1 = _git(staging, "rev-parse", "HEAD").strip()
@@ -358,7 +362,7 @@ class TestDroppedLines:
                                                      tmp_path):
         repo = tmp_path / "r"
         repo.mkdir()
-        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "init", "-q", "-b", STAGING_BRANCH)
         _git(repo, "config", "user.email", "t@x")
         _git(repo, "config", "user.name", "t")
         (repo / "f.py").write_text("value = compute_total(items)\nkeep()\n")
@@ -369,7 +373,7 @@ class TestDroppedLines:
         (repo / "f.py").write_text("value = compute_total(items, tax)\n"
                                    "keep()\n")
         _git(repo, "commit", "-q", "-am", "inc")
-        _git(repo, "checkout", "-q", "main")
+        _git(repo, "checkout", "-q", STAGING_BRANCH)
         # ... and integrated deletes that same base line and adds another.
         (repo / "f.py").write_text("keep()\nextra_integrated_line()\n")
         _git(repo, "commit", "-q", "-am", "int")
@@ -393,7 +397,7 @@ class TestDroppedLines:
                                                      tmp_path):
         repo = tmp_path / "r2"
         repo.mkdir()
-        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "init", "-q", "-b", STAGING_BRANCH)
         _git(repo, "config", "user.email", "t@x")
         _git(repo, "config", "user.name", "t")
         (repo / "f.py").write_text("start()\n")
@@ -402,7 +406,7 @@ class TestDroppedLines:
         _git(repo, "checkout", "-q", "-b", "inc")
         (repo / "f.py").write_text("start()\nshared_new_line_here()\n")
         _git(repo, "commit", "-q", "-am", "inc")
-        _git(repo, "checkout", "-q", "main")
+        _git(repo, "checkout", "-q", STAGING_BRANCH)
         (repo / "f.py").write_text("start()\nother_side_added_line()\n")
         _git(repo, "commit", "-q", "-am", "int")
         p1 = _git(repo, "rev-parse", "HEAD").strip()
@@ -422,7 +426,7 @@ def test_line_the_other_side_deleted_is_excluded(leerie, tmp_path):
     place, integrated deletes that line) is not put back on the list."""
     repo = tmp_path / "r3"
     repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "init", "-q", "-b", STAGING_BRANCH)
     _git(repo, "config", "user.email", "t@x")
     _git(repo, "config", "user.name", "t")
     (repo / "f.py").write_text("legacy_setting = load()\nmain()\n")
@@ -433,7 +437,7 @@ def test_line_the_other_side_deleted_is_excluded(leerie, tmp_path):
                                "def later():\n"
                                "    legacy_setting = load()\n")
     _git(repo, "commit", "-q", "-am", "inc")
-    _git(repo, "checkout", "-q", "main")
+    _git(repo, "checkout", "-q", STAGING_BRANCH)
     (repo / "f.py").write_text("main()\nintegrated_only_line()\n")
     _git(repo, "commit", "-q", "-am", "int")
     p1 = _git(repo, "rev-parse", "HEAD").strip()
@@ -466,7 +470,7 @@ def test_wave_sids_integrated_before(leerie, tmp_path):
     _git(staging, "add", "-A")
     _git(staging, "commit", "-q", "-m", "later")
     _git(staging, "branch", "leerie/subtasks/R/feat-004", "later")
-    _git(staging, "checkout", "-q", "main")
+    _git(staging, "checkout", "-q", STAGING_BRANCH)
     got = asyncio.run(leerie._wave_sids_integrated_before(
         staging, "R", ["feat-001", "feat-003", "feat-004", "feat-009"],
         "HEAD"))
@@ -601,7 +605,7 @@ class TestConflictedAreaTests:
     def test_scope_includes_one_hop_importers(self, leerie, tmp_path):
         repo = tmp_path / "s"
         repo.mkdir()
-        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "init", "-q", "-b", STAGING_BRANCH)
         (repo / "src").mkdir()
         (repo / "tests").mkdir()
         (repo / "src" / "pricing.py").write_text("x = 1\n")

@@ -1474,3 +1474,33 @@ def test_a_crashed_conformer_is_gated_before_the_round_ends(env, monkeypatch,
     assert env["st"].data["unclean_trees"]["conformer:t1 round 0"][
         "lines"] == ["?? half.py"]
     assert any("left its tree unclean" in w for w in warnings), warnings
+
+
+def test_a_conformer_that_commits_detached_is_rolled_back_onto_its_branch(
+        env, monkeypatch):
+    """Review round 15 H2: a conformer that commits on a detached HEAD
+    leaves `git status` empty. The branch line re-asks it; never back on
+    its branch, the round is rolled back — onto the branch, at its start —
+    and recorded."""
+    c = env["leerie"]
+    wt = env["worktree"]
+    branch = f"leerie/subtasks/{env['st'].run_id}/t1"
+    before = _run(["git", "rev-parse", "HEAD"], cwd=wt).stdout.strip()
+
+    def detach_and_commit(w: Path):
+        _run(["git", "checkout", "-q", "--detach"], cwd=w)
+        (w / "src.py").write_text("def f():\n    return 1\n")
+        _run(["git", "commit", "-q", "-am", "conformer: fix"], cwd=w)
+    _stub_run_conformer(c, [_clean_result()], commits={0: detach_and_commit})
+    _stub_measure_axes(c, {})
+    calls = _reask_stub(c, monkeypatch)
+    res, warnings, _ = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(wt), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert len(calls) == 2
+    assert res["conformer_repair_rolled_back"] is True
+    assert _run(["git", "symbolic-ref", "HEAD"], cwd=wt).stdout.strip() == \
+        f"refs/heads/{branch}"
+    assert _run(["git", "rev-parse", "HEAD"], cwd=wt).stdout.strip() == before
+    assert env["st"].data["unclean_trees"]["conformer:t1 round 0"][
+        "lines"] == [f"HEAD is not on {branch} (detached)"]

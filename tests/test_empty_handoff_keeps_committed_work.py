@@ -171,5 +171,8 @@ class TestSettleWiring:
         would _reset_subtask_worktree and destroy the kept commits. The dirty
         check must discard the debris for rescued results instead of failing."""
         src = inspect.getsource(leerie._settle_subtask)
-        assert 'git", "checkout", "--", "."' in src
+        # Put back on its branch's tip through the one restore (I1: a
+        # reaped worker's detached commits are debris too, review round 15
+        # H2).
+        assert "reaped implementer's debris\", branch=sub)" in src
         assert "rescued_from_empty_handoff" in src

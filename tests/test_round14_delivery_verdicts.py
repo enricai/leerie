@@ -63,17 +63,19 @@ def test_a_final_judge_that_fails_any_way_reads_nothing(leerie, tmp_path,
 
 
 def _ship(leerie, tmp_path):
-    st = leerie.State(tmp_path / ".leerie", "fix-001-abcdef")
-    staging = st.run_dir / "worktrees" / "staging"
-    staging.mkdir(parents=True)
-    _git(staging, "init", "-q", "-b", "main")
-    _git(staging, "config", "user.email", "t@t")
-    _git(staging, "config", "user.name", "t")
-    (staging / "a.py").write_text("x = 1\n")
-    _git(staging, "add", "-A")
-    _git(staging, "commit", "-qm", "base")
+    """A repository whose checkout is on the run branch: its tree is the
+    tree that ships (`_shipping_tree`, the run branch's tree)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "leerie/runs/fix-001-abcdef")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.py").write_text("x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    st = leerie.State(tmp_path / ".leerie", "fix-001-abcdef", repo_root=repo)
     st.data = {"task": "x", "subtask_status": {"a": "complete"}}
-    return st, staging
+    return st, repo
 
 
 def test_a_verdict_of_an_earlier_tree_never_decides_done(leerie, tmp_path):

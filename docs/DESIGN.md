@@ -1882,17 +1882,14 @@ its branch still pointed at the run branch, the merge was a no-op, the
 wave reported "integrated 1 of 1", and the 232-line test file never
 reached the PR; the delivery judges found it absent. Two rules close it:
 
-- *At settle, the branch is put where the work is.* When a subtask settles
-  `complete`, the orchestrator reads its worktree's HEAD. A HEAD that is
-  detached, or on another branch, while the subtask branch is an ancestor
-  of it, is a worker that left the branch — the subtask branch is moved to
-  that HEAD and checked out again (no file changes: same commit). That
-  HEAD is recorded as the subtask's **settled head**. A HEAD the branch is
-  *not* an ancestor of is a worker that checked out some other commit (the
-  base, to compare behaviour) without committing there: the branch tip is
-  the settled head, and the divergence is logged. A settled head is always
-  the branch tip or a descendant of it — never a commit that would make an
-  unmerged branch look integrated.
+- *At settle, the work is on the branch.* The clean-tree gate (§8 *A
+  worker leaves its tree clean*) holds every implementer and conformer to
+  its subtask branch: a worker that left it is re-asked to put its commits
+  back on it, and one that does not is never settled `complete`. So the
+  subtask's **settled head** is its branch tip, read when it settles. (A
+  repair used to move the branch to a detached HEAD at settle — leerie
+  choosing the worker's commits for it, for subtasks only; the gate
+  replaced it, review round 15 H2.)
 - *After its merge, the settled head must be an ancestor of the run
   branch.* When it is not, the subtask branch is pointed at the settled
   head and the subtask is integrated once more (a conflict goes to the
@@ -3102,8 +3099,13 @@ five scattered places and a run with unfinished work shipped an ordinary PR.
 delivery pass records the committed tree it read beside its verdict
 (final detection's `final_tree`, the recheck's and the pre-pass's
 `judged_*.tree`), and the decider takes the latest one only when that tree
-is the tree that ships — staging's `HEAD^{tree}` when the outcome is
-decided. Any other verdict, or none of the shipping tree at all, makes the
+is the tree that ships — the run branch's tree,
+`refs/heads/leerie/runs/<id>^{tree}`, read from the repository, which is
+the ref finalize pushes (review round 15 H1: read from staging's HEAD, it
+was "" once finalize's `cleanup.sh` had removed staging, so every run with
+a delivery verdict ended `unconverged`; and staging's HEAD is not what
+ships unless I1 holds staging on the branch). Every pass stamps its verdict
+with that same ref's tree. Any other verdict, or none of the shipping tree at all, makes the
 run `unconverged` with the reason "the required items were not read on
 the tree that ships". The root cause this removes (review round 14 M2):
 the decider read whichever unmet list existed — final detection's, else
@@ -7563,9 +7565,13 @@ directory with only `Read`, which reaches nothing there.
 
 **A worker leaves its tree clean.** The invariant (I1): *after every
 worker that runs in a tree leerie measures, integrates or ships, `git
-status --porcelain --untracked-files=all` in that tree prints nothing* —
-everything the worker means to keep is committed, and nothing untracked
-exists outside `.gitignore`. The workers it binds are the six that run in
+status --porcelain --untracked-files=all` in that tree prints nothing, and
+the tree is on the branch leerie gave the worker, at a commit that
+descends from where the worker started* — everything the worker means to
+keep is committed, on that branch, and nothing untracked exists outside
+`.gitignore`. The branch is staging's run branch (`leerie/runs/<id>`) or
+the subtask's (`leerie/subtasks/<id>/<sid>`), the refs leerie merges and
+pushes. The workers it binds are the six that run in
 such a tree: the implementer and the per-subtask conformer in a subtask's
 worktree, and the final conformer, the acceptance-repair conformer, the
 delivery re-drive implementer and the integrator (conflict resolution and
@@ -7615,7 +7621,11 @@ The gate:
   untracked file `.gitignore` does not cover. An ignored file — installed
   dependencies, build output a repository ignores — never appears, so it
   can never trigger a re-ask; a git failure is not clean (nothing was
-  read).
+  read). Two more lines can come with it, each from git's own answer, not
+  from the files: HEAD is not the worker's branch (`git symbolic-ref`:
+  detached, or another branch), and HEAD does not descend from the commit
+  the worker started at (`git merge-base --is-ancestor`: its branch moved
+  back or sideways).
 - *Only when nothing else writes the tree.* It runs right after the
   worker's `claude -p` has returned and its process subtree is reaped
   (§6 *Worker subtree termination*), before leerie runs anything of its
@@ -7628,21 +7638,38 @@ The gate:
   session resumed (`--resume`) with one note that carries the porcelain
   lines verbatim and allows exactly two acts per line: commit it (it is
   part of the change) or delete it (it is not; a tracked file is restored
-  with `git checkout`). At most `clean_tree_reasks` (2) re-asks; each is a
+  with `git checkout`). A branch line allows one: check the branch out and
+  put the commits that belong in the change on it. At most `clean_tree_reasks` (2) re-asks; each is a
   worker and counts against `max_total_workers`. A re-ask that crashes,
   or a worker with no session to resume, spends its attempt.
 - *Exhaustion is unfinished work, never a guess.* When the tree is still
   dirty after the last re-ask, the worker's round is rolled back by the
   rule that already undoes that round — a subtask is settled `unconverged`
   and not integrated; a conformer round, an acceptance-repair round or a
-  re-drive group is reset to its start (*One restore*, below: ignored
-  files kept); an integrator's merge is backed
+  re-drive group is reset to its start on its branch (*One restore*, below: the branch
+  checked out again, ignored files kept); an integrator's merge is backed
   out — and the porcelain lines are recorded with it. A conformer,
   acceptance-repair or re-drive round's record makes the run
   `unconverged`, its lines named under "Unconverged" in the PR; an
   implementer's or an integrator's is its subtask's `unconverged` reason
   (an integration repair round's is the round's mechanical failure). Nothing a worker left
   is committed for it, and nothing is dropped without a line saying so.
+
+Why the branch is part of "clean" (review round 15 H2). A worker that
+commits on a detached HEAD, or on a branch of its own, leaves `git status`
+empty, so an I1 that read only the porcelain passed it — and every reader
+after it read the tree's HEAD while finalize pushed and the next merge
+moved the branch: the final conformer's fix was measured, stamped and
+judged on a commit the PR did not carry, and in staging every later merge
+landed off the run branch. The root cause is that the checker left out
+the state leerie actually relies on: the tree on its branch. It had
+already happened in a subtask (barnacle 45fa4253: an implementer ran `git
+checkout <base>~0` to compare behaviour and committed three times on the
+detached HEAD), where a repair at settle moved the subtask branch to the
+worker's HEAD — leerie deciding which of a worker's commits were the
+change, for one of the six workers only. The branch lines replace that
+repair: the worker that left its branch is asked to put its commits back
+on it, and the settled head is simply the branch tip.
 
 The rollbacks this rests on are made exact for the same reason: a back-out
 of an integrator's merge and the reset before an integrator is retried

@@ -387,7 +387,8 @@ def test_the_gate_never_says_pass_with_a_set_unmeasured(leerie, tmp_path,
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
     staging = st.run_dir / "worktrees" / "staging"
-    _git(repo, "worktree", "add", "-q", "-b", "leerie/runs/x", str(staging))
+    _git(repo, "worktree", "add", "-q", "-b", f"leerie/runs/{st.run_id}",
+         str(staging))
     st.data["acceptance"] = {"sets": [{"index": 1}, {"index": 2}]}
 
     async def fake_eval(st_, caps, tree, sets, label, **kw):

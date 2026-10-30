@@ -34451,14 +34451,18 @@ def _delivery_latest_verdict(delivery: object
 
 
 def _shipping_tree(st: "State") -> str:
-    """The tree the run ships: staging's `HEAD^{tree}`, read now; "" when
-    staging or its HEAD cannot be read."""
-    staging = Path(st.run_dir) / "worktrees" / "staging"
-    if not staging.is_dir():
+    """The tree the run ships: the run branch's,
+    `refs/heads/leerie/runs/<id>^{tree}` in the repository — the ref
+    finalize pushes, which outlives staging (review round 15 H1: read from
+    staging's HEAD, it was "" once finalize's `cleanup.sh` had removed
+    staging). Every delivery pass stamps its verdict with it and the outcome
+    compares against it. "" when the ref cannot be read."""
+    if not getattr(st, "repo_root", None):
         return ""
-    r = subprocess.run(["git", "-C", str(staging), "rev-parse", "--verify",
-                        "-q", "HEAD^{tree}"], capture_output=True, text=True,
-                       check=False)
+    ref = f"refs/heads/{_compute_run_branch(st.run_id)}^{{tree}}"
+    r = subprocess.run(["git", "-C", str(st.repo_root), "rev-parse",
+                        "--verify", "-q", ref],
+                       capture_output=True, text=True, check=False)
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
@@ -37157,15 +37161,31 @@ CLEAN_TREE_REASK_NOTE = (
     "with `git checkout -- <path>`). Do no other work. Then run that same "
     "`git status` command, confirm it prints nothing, and return the JSON "
     "object per your schema.")
+# Added to the note when a line is about the branch, not a file: the one
+# act it allows.
+CLEAN_TREE_BRANCH_NOTE = (
+    "\nA line that says HEAD is not on `{branch}`, or does not descend from "
+    "where you started, is about your branch, not a file: run `git "
+    "checkout {branch}` and put the commits that belong in your change on "
+    "it (cherry-pick them, or fast-forward it to them). Leerie merges and "
+    "ships `{branch}` only; commits anywhere else are not your work.")
+# The prefixes of `_tree_dirt`'s branch lines (never a porcelain line,
+# which starts with a two-character status).
+_BRANCH_LINE_HEAD = "HEAD is not on "
+_BRANCH_LINE_BASE = "HEAD does not descend from "
 # The most porcelain lines one record or reason carries.
 _UNCLEAN_LINES_MAX = 20
 
 
-async def _tree_dirt(tree: str | Path) -> list[str] | None:
+async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
+                     base: str | None = None) -> list[str] | None:
     """I1's checker: every line `git status --porcelain
     --untracked-files=all` prints in `tree`, verbatim — a tracked edit, a
     staged change, or an untracked file `.gitignore` does not cover. An
-    ignored file never appears, so it can never make a tree dirty. [] is
+    ignored file never appears, so it can never make a tree dirty. With
+    `branch`, a line when HEAD is not `refs/heads/<branch>` (detached, or
+    another branch — review round 15 H2); with `base`, a line when HEAD
+    does not descend from it (the branch moved back or sideways). [] is
     clean; None when git could not answer (nothing was read, so not
     clean)."""
     try:
@@ -37175,7 +37195,43 @@ async def _tree_dirt(tree: str | Path) -> list[str] | None:
         return None
     if r.returncode != 0:
         return None
-    return [line for line in r.stdout.splitlines() if line]
+    lines = [line for line in r.stdout.splitlines() if line]
+    if branch:
+        try:
+            cur = await run_proc(["git", "symbolic-ref", "-q", "HEAD"],
+                                 cwd=str(tree))
+        except OSError:
+            return None
+        on = cur.stdout.strip() if cur.returncode == 0 else ""
+        if on != f"refs/heads/{branch}":
+            lines.append(f"{_BRANCH_LINE_HEAD}{branch} ("
+                         + (f"on {on.removeprefix('refs/heads/')}" if on
+                            else "detached") + ")")
+    if base:
+        try:
+            anc = await run_proc(["git", "merge-base", "--is-ancestor",
+                                  base, "HEAD"], cwd=str(tree))
+        except OSError:
+            return None
+        if anc.returncode == 1:
+            lines.append(f"{_BRANCH_LINE_BASE}{base[:12]}, where this "
+                         "worker started")
+        elif anc.returncode != 0:
+            return None
+    return lines
+
+
+async def _ref_sha(repo: str | Path | None, branch: str) -> str:
+    """The commit `refs/heads/<branch>` names in `repo`, or "" when it does
+    not exist or cannot be read."""
+    if not repo:
+        return ""
+    try:
+        r = await run_proc(["git", "rev-parse", "--verify", "-q",
+                            f"refs/heads/{branch}"], cwd=str(repo))
+    except OSError:
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def _clean_tree_reasker(st: "State", caps: dict, *, log_sid: str, cwd: str,
@@ -37208,12 +37264,14 @@ def _clean_tree_reasker(st: "State", caps: dict, *, log_sid: str, cwd: str,
 
 
 async def _clean_tree_gate(tree: str | Path, *, caps: dict, label: str,
-                           reask: Callable[[str], Awaitable[None]]
-                           ) -> list[str]:
+                           reask: Callable[[str], Awaitable[None]],
+                           branch: str, base: str | None) -> list[str]:
     """I1 (DESIGN §8 *A worker leaves its tree clean*), shared by every
     worker that runs in a tree leerie measures, integrates or ships. Called
     right after the worker returned, before leerie runs anything of its own
-    in `tree`. While `_tree_dirt` is not empty, `reask` (the same worker,
+    in `tree`. While `_tree_dirt(tree, branch=, base=)` — `branch` the one
+    leerie gave the worker, `base` the commit it started at — is not
+    empty, `reask` (the same worker,
     `_clean_tree_reasker`) is called with `CLEAN_TREE_REASK_NOTE` carrying
     the lines, at most `clean_tree_reasks` times; a re-ask that raises
     spends its attempt. Returns [] when the tree is clean, else the lines
@@ -37223,7 +37281,7 @@ async def _clean_tree_gate(tree: str | Path, *, caps: dict, label: str,
                           DEFAULT_CAPS["clean_tree_reasks"]))
     attempt = 0
     while True:
-        lines = await _tree_dirt(tree)
+        lines = await _tree_dirt(tree, branch=branch, base=base)
         if lines == []:
             return []
         if lines is None:
@@ -37236,9 +37294,13 @@ async def _clean_tree_gate(tree: str | Path, *, caps: dict, label: str,
         attempt += 1
         log(f"  {label}: left its tree unclean ({len(lines)} line(s)) — "
             f"re-asking it to commit or delete each ({attempt}/{reasks})")
+        note = CLEAN_TREE_REASK_NOTE.format(lines="\n".join(
+            f"    {line}" for line in lines))
+        if any(line.startswith((_BRANCH_LINE_HEAD, _BRANCH_LINE_BASE))
+               for line in lines):
+            note += CLEAN_TREE_BRANCH_NOTE.format(branch=branch)
         try:
-            await reask(CLEAN_TREE_REASK_NOTE.format(lines="\n".join(
-                f"    {line}" for line in lines)))
+            await reask(note)
         except Exception as e:
             log(f"  {label}: the re-ask failed ({_brief_worker_exc(e)})")
 
@@ -38241,6 +38303,8 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     rules_files = _discover_rules_files(repo_root)
     blt = resolve_blt(repo_root)
     run_branch = _compute_run_branch(st.run_id)
+    # The branch this conformer must leave its tree on (I1).
+    sub_branch = _compute_subtask_branch(st.run_id, sid)
     last_res: dict | None = None
     blt_feedback: str | None = None
     # Read once, not per-round: the baseline is captured before the first
@@ -38362,10 +38426,12 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                 system_prompt=_load_prompt("conformer"),
                 model=models.get("conformer", MODEL_DEFAULT),
                 effort=efforts.get("conformer"),
-                max_turns=60))
+                max_turns=60),
+            branch=sub_branch, base=before_sha)
         if unclean:
             await _restore_tree(worktree, before_sha,
-                                where=f"{sid} conformer rollback")
+                                where=f"{sid} conformer rollback",
+                                branch=sub_branch)
             warnings.append(f"conformer round {c_round}: "
                             + _unclean_reason("the conformer", unclean))
             _record_unclean_tree(st, "conformer", f"{sid} round {c_round}",
@@ -38399,7 +38465,8 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         scope_err = await check_diff_scope(sid, worktree, subtask, st)
         if scope_err:
             await _restore_tree(worktree, before_sha,
-                                where=f"{sid} conformer rollback")
+                                where=f"{sid} conformer rollback",
+                                branch=sub_branch)
             warnings.append(f"conformer round {c_round}: protected-path "
                             f"violation reverted ({scope_err})")
             # The rollback just reverted every commit this round made, so
@@ -38504,7 +38571,8 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                 f"{len(clobbered)} implementer-owned file(s): {clobbered}")
             if caps.get("strict_conformer"):
                 await _restore_tree(worktree, impl_head_sha,
-                                    where=f"{sid} conformer rollback")
+                                    where=f"{sid} conformer rollback",
+                                    branch=sub_branch)
                 warnings.append(
                     f"conformer round {c_round}: strict mode — rolled "
                     "conformer commits back to implementer HEAD to restore "
@@ -48669,7 +48737,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
 
         async def _undo_round(entry: dict) -> None:
             ok = await _restore_tree(staging, entry["pre_sha"],
-                                     where="acceptance repair rollback")
+                                     where="acceptance repair rollback",
+                                     branch=_compute_run_branch(st.run_id))
             entry["rolled_back"] = ok
             if ok:
                 log(f"  acceptance repair round {entry['round']} "
@@ -48696,7 +48765,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                     cwd=str(staging), schema_key="conformer",
                     system_prompt=_load_prompt("conformer"),
                     model=models.get("conformer", MODEL_DEFAULT),
-                    effort=EFFORT_ACCEPTANCE_REPAIR, max_turns=120))
+                    effort=EFFORT_ACCEPTANCE_REPAIR, max_turns=120),
+                branch=_compute_run_branch(st.run_id), base=round_pre)
             if not unclean:
                 return False
             _record_unclean_tree(st, "acceptance repair", f"round {rnd}",
@@ -48898,7 +48968,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
             # Also the path a resume after the decision takes: the reset is
             # idempotent. Its result is checked, never assumed.
             if await _restore_tree(staging, before_sha,
-                                   where="acceptance gate rollback"):
+                                   where="acceptance gate rollback",
+                                   branch=_compute_run_branch(st.run_id)):
                 log(f"  acceptance repair {gate.get('rollback_reason') or ''}"
                     " — its commits were reset away; residual recorded")
                 final = initial
@@ -49141,16 +49212,21 @@ def _restore_write_bits(tree: str | Path) -> None:
                     os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) | 0o700)
 
 
-async def _restore_tree(tree: str | Path, rev: str, *, where: str) -> bool:
+async def _restore_tree(tree: str | Path, rev: str, *, where: str,
+                        branch: str | None) -> bool:
     """THE restore primitive (DESIGN §8 *One restore*): `tree` back to `rev`
     with nothing uncommitted — the owner's write bits restored
-    (`_restore_write_bits`), `git reset --hard <rev>` (ending any merge),
-    `git clean -ffdq` (nested repositories too; ignored files kept). True
-    when HEAD is then `rev`; False when the reset did not land (a stale
-    index.lock: the caller's own failure path). Its postcondition is I1's
-    checker: dirt `_tree_dirt` still reads after a reset that landed is not
-    the orchestrator's own, and stops the run there with the lines (`where`
-    names the step)."""
+    (`_restore_write_bits`), `branch` checked out (a worker that left it,
+    detached or on its own, would otherwise have only its HEAD reset while
+    the branch leerie merges and ships stays where it left it — review
+    round 15 H2; None only for a disposable detached checkout), `git reset
+    --hard <rev>` (ending any merge), `git clean -ffdq` (nested
+    repositories too; ignored files kept). True when HEAD is then `rev`, on
+    `branch`; False when the reset did not land (a stale index.lock: the
+    caller's own failure path). Its postcondition is I1's checker, the
+    branch line included: dirt `_tree_dirt` still reads after a reset that
+    landed is not the orchestrator's own, and stops the run there with the
+    lines (`where` names the step)."""
     if not rev:
         return False
     await asyncio.to_thread(_restore_write_bits, tree)
@@ -49161,19 +49237,27 @@ async def _restore_tree(tree: str | Path, rev: str, *, where: str) -> bool:
         if attempt:
             await asyncio.sleep(1)
         try:
+            if branch:
+                subprocess.run(["git", "-C", str(tree), *GIT_NO_HOOKS,
+                                "checkout", "-q", "-f", branch],
+                               capture_output=True, check=False)
             subprocess.run(["git", "-C", str(tree), "reset", "-q", "--hard",
                             rev], capture_output=True, check=False)
+            on = subprocess.run(["git", "-C", str(tree), "symbolic-ref",
+                                 "-q", "HEAD"], capture_output=True,
+                                text=True, check=False).stdout.strip()
         except OSError:
             continue
         head = await _branch_head_sha(str(tree))
         if head:
-            landed = head == rev
+            landed = head == rev and (not branch
+                                      or on == f"refs/heads/{branch}")
             break
     if not landed:
         return False
     subprocess.run(["git", "-C", str(tree), "clean", "-ffdq"],
                    capture_output=True, check=False)
-    left = await _tree_dirt(tree)
+    left = await _tree_dirt(tree, branch=branch)
     if left != []:
         lines = (["(git status failed — the tree could not be read)"]
                  if left is None else left)
@@ -49764,7 +49848,7 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
         st, leerie_dir, refresh_tokens=False)
     details: dict = {}
     judged_sha = await _branch_head_sha(str(staging))
-    judged_tree = await _committed_tree_sha(str(staging))
+    judged_tree = _shipping_tree(st)
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
@@ -49865,7 +49949,7 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
         st, leerie_dir, refresh_tokens=True)
     details: dict = {}
     judged_sha = await _branch_head_sha(str(staging))
-    judged_tree = await _committed_tree_sha(str(staging))
+    judged_tree = _shipping_tree(st)
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
@@ -51182,7 +51266,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         async def _sample(i: int, n: int, lane: Path) -> dict:
             item = normalized[i]
             # Back to the pristine final commit between samples.
-            await _restore_tree(lane, sha, where="falsifier checkout reset")
+            await _restore_tree(lane, sha, where="falsifier checkout reset",
+                                branch=None)
             # Reset with the tree: a fresh database per sample, so one
             # sample's rows never reach the next.
             db_url = await _create_test_db(st, lane, "falsifier-lane")
@@ -51517,7 +51602,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     gate = dict(st.data.get("delivery_gate") or {})
     gate.pop("final_progress", None)
     gate.update(items=rows, unmet_final=unmet_final, final_sha=sha,
-                final_tree=await _committed_tree_sha(str(staging)) or "",
+                final_tree=_shipping_tree(st),
                 final_judge={k_: judged.get(k_) for k_ in
                              ("source", "samples", "error", "attempts")
                              if k_ in judged},
@@ -54052,7 +54137,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         _redrive_exclude_clear(staging, run_id)
         if flight.get("pre_sha"):
             ok = await _restore_tree(staging, flight["pre_sha"],
-                                     where="re-drive rollback")
+                                     where="re-drive rollback",
+                                     branch=_compute_run_branch(st.run_id))
             log(f"  delivery re-drive: resumed — the interrupted group was "
                 f"{'rolled back' if ok else 'NOT rolled back (reset failed)'}")
         rec.pop("in_flight", None)
@@ -54344,13 +54430,15 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     cwd=str(staging), schema_key="implementer",
                     system_prompt=_load_prompt("implementer"),
                     model=models.get("implementer", MODEL_DEFAULT),
-                    effort=effort, max_turns=120))
+                    effort=effort, max_turns=120),
+                branch=_compute_run_branch(st.run_id), base=pre_sha)
             if unclean:
                 ge["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
                 _record_unclean_tree(st, "delivery re-drive implementer",
                                      f"r{rnd} g{gi}", unclean)
                 ok = await _restore_tree(staging, pre_sha,
-                                         where="re-drive rollback")
+                                         where="re-drive rollback",
+                                         branch=_compute_run_branch(st.run_id))
                 ge["rolled_back"] = ok
                 drove = True
                 prior_members += [m for m in members
@@ -54468,8 +54556,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         ge["ratchet_regressed"] = list(rat["regressed"])
                         void = True
                 if v["worse"] or void:
-                    ok = await _restore_tree(staging, pre_sha,
-                                             where="re-drive rollback")
+                    ok = await _restore_tree(
+                        staging, pre_sha, where="re-drive rollback",
+                        branch=_compute_run_branch(st.run_id))
                     ge["rolled_back"] = ok
                     if not ok:
                         ge["rollback_failed"] = True
@@ -54631,7 +54720,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 and det_sha == head
                 and not _ratchet_record(st).get("unverified")):
             st.data["delivery_gate"] = {**dg, "final_sha": final,
-                                        "final_tree": final_tree or ""}
+                                        "final_tree": _shipping_tree(st)}
             st.save()
     rec["final_sha"] = final
     rec["done"] = True
@@ -54850,10 +54939,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                 cwd=str(staging), schema_key="conformer",
                 system_prompt=sys_prompt,
                 model=models.get("conformer", MODEL_DEFAULT),
-                effort=efforts.get("conformer"), max_turns=60))
+                effort=efforts.get("conformer"), max_turns=60),
+            branch=_compute_run_branch(st.run_id), base=before_sha)
         if unclean:
             await _restore_tree(staging, before_sha,
-                                where="final conformer rollback")
+                                where="final conformer rollback",
+                                branch=_compute_run_branch(st.run_id))
             warnings.append(f"final conformer round {c_round}: "
                             + _unclean_reason("the final conformer",
                                               unclean))
@@ -54908,7 +54999,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         protected = await _protected_paths_since(str(staging), before_sha)
         if protected:
             await _restore_tree(staging, before_sha,
-                                where="final conformer rollback")
+                                where="final conformer rollback",
+                                branch=_compute_run_branch(st.run_id))
             warnings.append(f"final conformer round {c_round}: "
                             f"protected-path violation reverted "
                             f"(touched {protected})")
@@ -54929,7 +55021,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                 f"{len(clobbered)} integrated file(s): {clobbered}")
             if caps.get("strict_conformer"):
                 await _restore_tree(staging, staging_before_sha,
-                                    where="final conformer rollback")
+                                    where="final conformer rollback",
+                                    branch=_compute_run_branch(st.run_id))
                 warnings.append(
                     f"final conformer round {c_round}: strict mode — "
                     "rolled conformer commits back to restore clobbered work")
@@ -55267,7 +55360,9 @@ async def _undo_interrupted_redrives(st: "State", leerie_dir: Path,
         tree = _subtask_worktree_path(leerie_dir, sid)
         ok = False
         if pre and tree.is_dir():
-            ok = await _restore_tree(tree, pre, where="re-drive rollback")
+            ok = await _restore_tree(
+                tree, pre, where="re-drive rollback",
+                branch=_compute_subtask_branch(st.run_id, sid))
         elif pre and st.repo_root:
             ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
             ok = (await run_proc(["git", "update-ref", ref, pre],
@@ -57453,6 +57548,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             note = f"Previous attempt failed: {reason}"
         return None
 
+    attempt_base = ""
+
     async def _implementer_gate(previous_status: str) -> dict | None:
         """I1 for this subtask's implementer (DESIGN §8 *A worker leaves its
         tree clean*): the same worker re-asked; still dirty, the subtask
@@ -57465,7 +57562,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 schema_key="implementer",
                 system_prompt=_load_prompt("implementer"),
                 model=models.get("implementer", MODEL_DEFAULT),
-                effort=efforts.get("implementer"), max_turns=120))
+                effort=efforts.get("implementer"), max_turns=120),
+            branch=_compute_subtask_branch(st.run_id, sid),
+            base=attempt_base or None)
         if not left:
             return None
         return _settle_unconverged(
@@ -57519,6 +57618,11 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     "cannot merge.")
 
     while True:
+        # Where this attempt starts (I1's `base`): the subtask branch's tip,
+        # or the run branch's when this is the attempt that creates it.
+        attempt_base = await _ref_sha(
+            st.repo_root, _compute_subtask_branch(st.run_id, sid)
+        ) or await _ref_sha(st.repo_root, _compute_run_branch(st.run_id))
         try:
             res = await _run_implementer(sid, leerie_dir, caps, st, models,
                                         efforts, continuation=continuation,
@@ -57667,13 +57771,15 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # execution, the conformer). A result rescued from `empty_handoff`
         # came from a reaped worker with no session to ask: its
         # uncommitted debris is discarded, the deliverable being the
-        # already-committed diff. A checkpointed handoff passes its
+        # already-committed diff on its branch (a reaped worker's detached
+        # commits are debris too). A checkpointed handoff passes its
         # in-progress tree to its own continuation, which is held to it.
         if rescued_from_empty_handoff:
-            if await _tree_dirt(worktree) != []:
+            sub = _compute_subtask_branch(st.run_id, sid)
+            if await _tree_dirt(worktree, branch=sub) != []:
                 await _restore_tree(
-                    worktree, await _branch_head_sha(worktree),
-                    where=f"{sid} reaped implementer's debris")
+                    worktree, await _ref_sha(st.repo_root, sub),
+                    where=f"{sid} reaped implementer's debris", branch=sub)
         elif status in ("complete", "blocked", "failed"):
             unclean = await _implementer_gate(str(status))
             if unclean is not None:
@@ -58711,59 +58817,20 @@ def _incoming_subtask_view(leerie_dir: Path, sid: str,
 
 async def _record_settled_head(st: "State", leerie_dir: Path,
                                sid: str) -> str | None:
-    """Record the commit `sid` settled `complete` on — its worktree's HEAD —
-    as `settled_heads[sid]`, putting the subtask branch there first when a
-    worker left it (DESIGN §6 *Integrated means the settled commit is on the
-    run branch*). A detached HEAD, or one on another branch, that descends
-    from the subtask branch is a worker that checked something else out and
-    committed there: the branch is moved to it and checked out again, the
-    same commit, so no file changes. In the replayed run (barnacle 45fa4253)
-    an implementer ran `git checkout <base>~0` to compare behaviour and
-    committed three times on the detached HEAD; the branch never moved, and
-    its merge was a no-op. A HEAD the branch is NOT an ancestor of (a
-    worker that checked out the base and never committed there) is not
-    recorded: the branch tip is the settled head, so a resumed wave never
-    reads the unmerged branch as integrated through a base-commit head.
-    None when there is no worktree, no HEAD, or no branch to fall back to."""
-    wt = _subtask_worktree_path(leerie_dir, sid)
-    if not wt.is_dir():
+    """Record the commit `sid` settled `complete` on as `settled_heads[sid]`:
+    its subtask branch's tip (DESIGN §6 *Integrated means the settled commit
+    is on the run branch*). The clean-tree gate holds every implementer and
+    conformer to that branch (I1, DESIGN §8 *A worker leaves its tree
+    clean*), so the work is on it; a repair that moved the branch to a
+    worker's detached HEAD here was superseded by that gate (review round 15
+    H2). None when the branch does not exist."""
+    tip = await _ref_sha(st.repo_root, _compute_subtask_branch(st.run_id,
+                                                                sid))
+    if not tip:
         return None
-    head = (await _git_text(wt, "rev-parse", "HEAD") or "").strip()
-    if not head:
-        return None
-    ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
-    cur = (await _git_text(wt, "symbolic-ref", "-q", "HEAD") or "").strip()
-    if cur != ref:
-        tip = (await _git_text(wt, "rev-parse", "--verify", "-q", ref)
-               or "").strip()
-        follows = bool(tip) and (tip == head or (await run_proc(
-            ["git", "merge-base", "--is-ancestor", tip, head],
-            cwd=str(wt))).returncode == 0)
-        where = f"on {cur}" if cur else "detached"
-        if follows:
-            moved = await run_proc(["git", "update-ref", ref, head, tip],
-                                   cwd=str(wt))
-            back = (await run_proc(
-                ["git", *GIT_NO_HOOKS, "checkout", "-q",
-                 ref.removeprefix("refs/heads/")],
-                cwd=str(wt)) if moved.returncode == 0 else moved)
-            log(f"  {sid}: worktree HEAD {head[:12]} was {where}, ahead of "
-                f"its branch at {tip[:12]} — "
-                + ("branch moved to it and checked out"
-                   if moved.returncode == 0 and back.returncode == 0 else
-                   "could not move the branch "
-                   f"({(back.stderr or moved.stderr or '').strip()[:160]})"))
-        else:
-            log(f"  {sid}: worktree HEAD {head[:12]} is {where} and does not "
-                f"descend from its branch ({tip[:12] or 'missing'}); "
-                + ("the branch tip is the settled head" if tip else
-                   "no settled head recorded"))
-            if not tip:
-                return None
-            head = tip
-    st.data.setdefault("settled_heads", {})[sid] = head
+    st.data.setdefault("settled_heads", {})[sid] = tip
     st.save()
-    return head
+    return tip
 
 
 async def _settled_head_integrated(staging: Path, st: "State",
@@ -59035,7 +59102,8 @@ async def _back_out_unmerged(st: State, staging: Path, sid: str,
     # Untracked files too (ignored ones kept): the next worker in staging
     # starts from the tree I1 held (DESIGN §8 *A worker leaves its tree
     # clean*), never one with this merge's leftovers in it.
-    await _restore_tree(staging, pre_sha, where=f"back-out of {sid}")
+    await _restore_tree(staging, pre_sha, where=f"back-out of {sid}",
+                        branch=_compute_run_branch(st.run_id))
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
     if not pre_sha or head != pre_sha:
         st.data.setdefault("blocked", {})[sid] = (
@@ -59324,7 +59392,8 @@ async def _integration_repair_round(
 
     async def _reset(verdict: str) -> dict:
         await _restore_tree(staging, pre,
-                            where=f"integration repair round of {sid}")
+                            where=f"integration repair round of {sid}",
+                            branch=_compute_run_branch(st.run_id))
         entry["verdict"] = verdict
         return {"verdict": verdict}
 
@@ -59349,7 +59418,8 @@ async def _integration_repair_round(
             schema_key="integrator", system_prompt=sys_prompt,
             model=models.get("integrator", MODEL_DEFAULT),
             effort=efforts.get("integrator"),
-            max_turns=60))
+            max_turns=60),
+        branch=_compute_run_branch(st.run_id), base=pre or None)
     if unclean:
         entry["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
@@ -59653,7 +59723,8 @@ async def _restart_integration_merge(staging: Path, st: "State", sid: str,
     run `integrate.sh` again. None when staging is mid-merge with the
     conflict again; otherwise why the retry cannot proceed."""
     await _restore_tree(staging, pre_sha,
-                        where=f"restart of {sid}'s integration merge")
+                        where=f"restart of {sid}'s integration merge",
+                        branch=_compute_run_branch(st.run_id))
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
     if not pre_sha or head != pre_sha:
         return (f"the reset before a retry left staging at "
@@ -59969,7 +60040,8 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                     st, caps, log_sid=f"integrator-{sid}", cwd=str(staging),
                     schema_key="integrator", system_prompt=sys_prompt,
                     model=models.get("integrator", MODEL_DEFAULT),
-                    effort=efforts.get("integrator"), max_turns=60))
+                    effort=efforts.get("integrator"), max_turns=60),
+                branch=_compute_run_branch(st.run_id), base=pre_sha or None)
             if unclean:
                 await _back_out_unmerged(
                     st, staging, sid, pre_sha,

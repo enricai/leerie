@@ -128,10 +128,11 @@ def test_what_the_restore_cannot_remove_stops_the_run_named(
     head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
 
-    async def stuck(tree):
+    async def stuck(tree, **kw):
         return ["?? root-owned/x"]
     monkeypatch.setattr(leerie, "_tree_dirt", stuck)
     with pytest.raises(SystemExit):
-        asyncio.run(leerie._restore_tree(repo, head, where="a rollback"))
+        asyncio.run(leerie._restore_tree(repo, head, where="a rollback",
+                                         branch="main"))
     err = capsys.readouterr().err
     assert "a rollback:" in err and "?? root-owned/x" in err

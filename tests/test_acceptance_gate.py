@@ -300,7 +300,10 @@ def _make_sets(leerie, st, n):
 
 def _staging(st, repo):
     staging = st.run_dir / "worktrees" / "staging"
-    _git(repo, "worktree", "add", "-q", "-b", "leerie/runs/x", str(staging))
+    # On the run's own branch (`_compute_run_branch`), as setup-run.sh leaves
+    # it: the clean-tree gate holds every worker there.
+    _git(repo, "worktree", "add", "-q", "-b", f"leerie/runs/{st.run_id}",
+         str(staging))
     return staging
 
 
@@ -3170,7 +3173,8 @@ def test_a_reset_that_cannot_spawn_is_tried_again(leerie, tmp_path,
         return real(argv, *a, **k)
     monkeypatch.setattr(leerie.subprocess, "run", eagain_once)
     monkeypatch.setattr(leerie.asyncio, "sleep", _no_sleep)
-    assert asyncio.run(leerie._restore_tree(repo, before, where="t"))
+    assert asyncio.run(leerie._restore_tree(repo, before, where="t",
+                                           branch="main"))
     assert _git(repo, "rev-parse", "HEAD") == before
 
 
@@ -3188,7 +3192,8 @@ def test_an_unreadable_head_after_a_reset_is_read_again(leerie, tmp_path,
         return "" if len(n) == 1 else await real(wt)
     monkeypatch.setattr(leerie, "_branch_head_sha", blip)
     monkeypatch.setattr(leerie.asyncio, "sleep", _no_sleep)
-    assert asyncio.run(leerie._restore_tree(staging, before, where="t"))
+    assert asyncio.run(leerie._restore_tree(staging, before, where="t",
+                                           branch="main"))
     assert _git(repo, "rev-parse", "HEAD") == before
 
 
