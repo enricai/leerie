@@ -7298,8 +7298,18 @@ another tree than the one that ships; on the tree it already describes
 this costs nothing. Every row's test-outcome part is then re-read from it,
 as after a re-drive.
 
-The tree that ships is the *committed* one, staging's `HEAD^{tree}`:
-finalize pushes the branch, and nothing uncommitted reaches it. With I1
+The tree that ships has one definition: the run branch's tree,
+`refs/heads/leerie/runs/<id>^{tree}` (§6 *A delivery verdict counts only
+on the tree it was measured on*) — finalize pushes that ref, and nothing
+uncommitted reaches it. While staging is live, its `HEAD^{tree}` is that
+same tree by construction, not by coincidence: every worker that runs
+there passes I1's branch line (`_clean_tree_gate` requires `branch=`, and
+every staging gate gives it the run branch, so a worker that leaves HEAD
+detached or on another branch is re-asked or rolled back), and leerie's
+own merges, rollbacks and resume resets all act on that branch. So the
+measurements below, stamped from staging's `HEAD^{tree}`, carry the run
+ref's tree, and the decider, which reads the ref once staging is gone,
+compares like with like. With I1
 (§8 *A worker leaves its tree clean*) and I2 (§6½ *Leerie's own commands
 leave a worker's tree as they found it*) holding, staging at every point
 leerie measures in it — the final conformance, the refresh, the

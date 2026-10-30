@@ -5667,10 +5667,11 @@ name and a `-t` filter run, a set path the tree already has is refused
 (exit 3), and no set file or byte is left in the worker's tree. A whole
 `_run_delivery_redrive`, its implementer stubbed to put a copy of the shown
 set in its tree and run the command, leaves no byte of a shown or held-back
-set in `git cat-file --batch-all-objects`. Twelve tests in all: the
+set in `git cat-file --batch-all-objects`. Thirteen tests in all: the
 real-command test, nine argument cases (path, file name, unique path
 suffix, an ambiguous name, pass-through), a SIGTERM mid-run that still
-deletes the copy, and the object-store test. Live-falsified six ways, each
+deletes the copy, the object-store test, and a dash-led file name the
+copy's `tar` reads as a file, never an option. Live-falsified six ways, each
 failing a test: sharing a set file's ignored parent, dropping
 `GIT_CEILING_DIRECTORIES`, snapshotting through a temporary index (`add
 -A`), removing the signal handlers, selecting by file name only (no
@@ -5690,17 +5691,37 @@ real `_run_final_conformance`, which now runs its conformer instead of
 `_judge_checkout(share_ignored=True)`; `_ci_discover` and
 `_integration_judge_verdict` run in their own checkouts. Tests that fake
 git with a made-up commit use `tests.conftest.judge_checkout_in_place`.
-`tests/test_payload_only_workers.py` drives `capture_repo_deps` and
+`tests/test_payload_only_workers.py` (7 tests) drives `capture_repo_deps` and
 `_compose_pr_via_llm` through the real `claude_p` (`_invoke` stubbed) and
 reads the argv and cwd: an empty `<run_dir>/payload-only/`, `--allowedTools
 Read`, never the repo root, with and without `dangerously_skip_permissions`.
 
 ## The rev 9 redesign's other new and rewritten test files
 
-- `tests/test_resume_staging_is_reset.py` (5 tests, DESIGN §8 *The final
+- `tests/test_resume_staging_is_reset.py` (7 tests, DESIGN §8 *The final
   diff describes the tree that ships*): the real `setup-run.sh` resets a
   staging worktree a SIGKILL left registered — tracked edits, untracked
   files and a merge in progress go; ignored files and the run branch stay.
+- `tests/test_one_restore.py` (5 tests, DESIGN §8 *One restore*, review
+  round 15 M2): `_restore_tree` and `leerie_reset_worktree` are the one
+  restore — write bits restored, a nested repository removed, and I1's
+  checker reading nothing afterwards — so I1's exhaustion path rolls the
+  round back instead of `die()`ing; the reviewer's proofs, inverted.
+- `tests/test_merge_leaves_staging_as_found.py` (2 tests, DESIGN §6½,
+  review round 15 M3): on the real setup-run.sh, new-worktree.sh and
+  integrate.sh, a merged `.gitignore` change that un-ignores a build's
+  output has that output removed by the merge's bracket, and a
+  repository `post-merge` hook does not run on leerie's merge.
+- `tests/test_tree_on_its_branch.py` (11 tests, review round 15 H1/H2): a
+  worker leaves its tree on the branch leerie gave it, at a descendant of
+  where it started (I1's branch and base lines); the tree that ships is
+  `refs/heads/leerie/runs/<id>^{tree}`, read after finalize's cleanup.
+- `tests/test_leerie_git_runs_no_hooks.py` (DESIGN §6½): every git command
+  of leerie's own that can fire a repository hook runs with hooks off — a
+  derived source guard over leerie.py and the scripts that act on a tree
+  leerie measures, with a behavioural check that the flag disables a
+  hook; workers' own git commands keep the repository's hooks. (Its count
+  is left to the final corrections pass: lane B is changing the file.)
 - `tests/test_needs_human_sources_render.py` (14 tests, DESIGN §6 *The
   PR's end-state section*, review round 14 H1): every "Needs human
   verification" source the code can write renders in the PR; the sources
