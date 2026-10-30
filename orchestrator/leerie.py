@@ -5702,6 +5702,17 @@ def _git_hooks_off(env: MutableMapping[str, str]) -> None:
     env[_GIT_HOOKS_OFF_MARK] = str(n)
 
 
+def _repo_command_env(env: Mapping[str, str] | None = None
+                      ) -> dict[str, str]:
+    """The environment of a command of the repository's that leerie runs
+    (install, build, lint, tests, verify, acceptance, self-check): `env`
+    (default `os.environ`) without leerie's hooks-off entry. That entry is
+    git's command scope, so inherited it turned hooks off in repositories
+    the code under test makes for itself (DESIGN §6½ *Hooks off*; review
+    round 17 M4)."""
+    return _git_hooks_on(env if env is not None else os.environ)
+
+
 def _git_hooks_on(env: Mapping[str, str]) -> dict[str, str]:
     """A copy of `env` without leerie's hooks-off entry: a worker's own git
     commands keep the repository's hooks. Entries the operator set stay."""
@@ -9432,6 +9443,8 @@ async def _run_streaming(
     starts held behind the spawn gate until its pid is enrolled there, so
     every process it forks is inside (DESIGN §6 *Enrollment holds the
     spawn*). The caller owns the cgroup's lifetime (`_run_contained`).
+    Every command run here is the repository's, so it runs in
+    `_repo_command_env` — without leerie's hooks-off git entry.
     """
     spawn_cmd = list(cmd)
     gate_r: int | None = None
@@ -9443,7 +9456,7 @@ async def _run_streaming(
             *spawn_cmd,
             pass_fds=(gate_r,) if gate_r is not None else (),
             cwd=cwd,
-            env=env,
+            env=_repo_command_env(env),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
@@ -52757,7 +52770,7 @@ def selfcheck_main(argv: list[str]) -> int:
             _selfcheck_say(f"SELF-CHECK ERROR: {e}")
             rc = 2
             return rc
-        env = {**os.environ, **(cfg.get("env") or {}),
+        env = {**_repo_command_env(), **(cfg.get("env") or {}),
                "GIT_CEILING_DIRECTORIES": str(root)}
         _selfcheck_say(f"SELF-CHECK: {cmd}")
         t1 = time.monotonic()

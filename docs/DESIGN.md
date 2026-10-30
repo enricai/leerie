@@ -5651,14 +5651,26 @@ as "a leerie bug").
   `core.hooksPath=/dev/null` to its own environment through git's
   `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` (appended to
   any the operator set, which config files cannot override), so every git
-  it runs — directly, through a helper or through a script — and every
-  command it runs inherits it. The one spawn that removes it is a
-  worker's: a worker's own git commands are the worker's and keep the
-  repository's hooks. The scripts leerie runs add the same entry
-  themselves, so they hold it when run outside the orchestrator (the
-  subtree collection over `flyctl ssh`). The commands leerie runs to
-  install, build and test inherit it too: their side effects through a
-  hook are leerie's own, and I2 would remove them anyway.
+  it runs — directly, through a helper or through a script — inherits it.
+  Two kinds of spawn take it back out, because neither is leerie's own
+  git. A worker's: its git commands are the worker's and keep the
+  repository's hooks. And every command of the repository's that leerie
+  runs — the recipe's install and build, a measured build/lint/test axis,
+  a test-ID run, the held-out sets' parse probe and runs, a settle by
+  execution's verify commands, CI parity's and the coverage settle's
+  checks, the setup hook, the self-check: the repository's commands run in
+  the environment the repository expects. The entry is git's command
+  scope, which no repository config overrides, so inherited it also
+  turned hooks off inside repositories the code under test creates for
+  itself; a suite that tests hook behaviour was green outside leerie and
+  red in every leerie measurement, a false regression a repair round then
+  tried to fix (review round 17 M4). Every such command is launched
+  through `_run_streaming` (`_run_contained` included) or the self-check's
+  own spawn, and both build its environment with `_repo_command_env`.
+  A hook such a command's own git fires in the measured tree is still
+  removed by I2. The scripts leerie runs add the same entry themselves,
+  so they hold it when run outside the orchestrator (the subtree
+  collection over `flyctl ssh`).
 - *The untracked half only.* The merge's tracked changes are its product
   — a committed merge, or a conflict left for the integrator — so the
   bracket does not put tracked files back around it; it removes only the
