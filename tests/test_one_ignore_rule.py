@@ -3,7 +3,7 @@
 I1 read "ignored" as the tree's own `.gitignore` files and I2 as git's
 standard rules, so a `__pycache__/` only the developer's global ignore
 covered — written by leerie's own test run — was kept by I2 and dirt to I1,
-and `_assert_staging_clean` stopped the run. The round's driver
+and the staging-clean assertion (since removed) stopped the run. The round's driver
 (review-r17-proofs/exec/test_zz_r17e_i1_i2_ignore_rules_disagree), rewritten
 to assert the fix; and a guard derived from the source that no listing of
 untracked files exists outside the one rule, in Python or in the shell
@@ -84,7 +84,6 @@ def test_i1_and_i2_agree_on_leeries_own_test_output(leerie, staging):
     assert (staging / "pkg" / "__pycache__").is_dir()
     assert rec["removed"] == ["junit.xml"]           # not ignored: removed
     assert asyncio.run(leerie._tree_dirt(staging)) == []
-    asyncio.run(leerie._assert_staging_clean(staging, "r17e probe"))
 
 
 def test_the_shell_listing_is_the_python_one(leerie, staging):

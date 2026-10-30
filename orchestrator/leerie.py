@@ -40056,34 +40056,6 @@ async def _committed_tree_sha(tree: str) -> str | None:
     return r.stdout.strip() or None
 
 
-async def _assert_staging_clean(staging: str | Path,
-                                where: str) -> str | None:
-    """Staging's committed tree (`_committed_tree_sha`), after asserting
-    that staging holds nothing but it and ignored files (DESIGN §8 *The
-    final diff describes the tree that ships*): I1 holds every worker in
-    staging to a clean tree and I2 every command of leerie's own, so at a
-    reader that measures there — the final conformance, the refresh, the
-    ratchet's and the re-drive's test IDs —
-    `_tree_dirt` is []. Anything else is leerie's own invariant broken, not
-    unfinished work of the task's: the run stops (`die`) naming the lines,
-    rather than measuring, judging or shipping a tree it cannot name. A
-    git failure stops it too — nothing about the tree was read."""
-    dirt = await _tree_dirt(staging)
-    if dirt != []:
-        lines = (["(git status failed — the tree could not be read)"]
-                 if dirt is None else dirt)
-        die(f"staging is not clean at {where}, so what would be measured "
-            "or judged there is not the committed tree — leerie's own "
-            "invariant is broken (DESIGN §8 *The final diff describes the "
-            "tree that ships*: every worker leaves it clean, I1, and so "
-            "does every command of leerie's, I2). Left there: "
-            + "; ".join(lines[:20])
-            + (f" (+{len(lines) - 20} more)" if len(lines) > 20 else "")
-            + ". State is saved and the worktrees are cleaned up: report "
-            "this, then `leerie resume` continues on a fresh staging.")
-    return await _committed_tree_sha(str(staging))
-
-
 _GITLINK = "gitlink:"
 # A tracked path `_tracked_content` could not hash: listed, never restored.
 _UNHASHED = "unhashed"
@@ -40402,6 +40374,126 @@ def _blt_memo_key(axis: str, cmd: str, tree_sha: str) -> str:
         f"{axis}\x00{cmd}\x00{tree_sha}".encode()).hexdigest()[:32]
 
 
+# The committed view of each worker tree measured in this process:
+# realpath(tree) → (the commit it shows, its path). One per tree, replaced
+# when the branch tip moves (DESIGN §8 *Every measurement reads the
+# committed view*).
+_VIEWS: dict[str, tuple[str, Path]] = {}
+
+
+async def _view_ref(st: "State", tree: str | Path) -> str | None:
+    """The branch a worker tree ships through: the run branch for staging,
+    `leerie/subtasks/<run-id>/<sid>` for a subtask's worktree (found by its
+    path, as `setup-run.sh` finds it — never by the branch checked out
+    there, which a worker can move). None for any other tree: a helper
+    checkout, a baseline, a test's repository."""
+    run_dir = getattr(st, "run_dir", None)
+    run_id = getattr(st, "run_id", None)
+    if not run_dir or not run_id:
+        return None
+    t = Path(os.path.realpath(tree))
+    wts = Path(os.path.realpath(Path(run_dir) / "worktrees"))
+    if t == wts / "staging":
+        return _compute_run_branch(run_id)
+    if t.parent != wts:
+        return None
+    prefix = _worktree_dirname(Path(run_dir).name, "")
+    sid = t.name[len(prefix):] if t.name.startswith(prefix) else t.name
+    branch = _compute_subtask_branch(run_id, sid)
+    return branch if sid and await _ref_sha(str(t), branch) else None
+
+
+def _share_environment(tree: str | Path, view: Path) -> list[str]:
+    """Symlink into `view` every ignored path of `tree` that `view`'s own
+    ignore rules also ignore — committed `.gitignore` files and leerie's
+    settings copies — and return them: the installed environment
+    (`node_modules`, a generated client, build output). A path only an
+    uncommitted `.gitignore` ignores is not shared, so it is not measured
+    (review round 17: a self-ignoring `.gitignore` hid a `helper.py` the
+    measurements ran with and the commit lacked). Paths already in `view`
+    are left alone. A directory keeps its trailing `/` into `check-ignore`:
+    the view does not have it, and a `build/` rule matches only a path git
+    is told is a directory."""
+    cand = [r for r in (_untracked_listing(tree, which="ignored",
+                                           directory=True) or [])
+            if r.rstrip("/") and not os.path.lexists(view / r.rstrip("/"))]
+    if not cand:
+        return []
+    prefix, env = _git_view(view)
+    r = subprocess.run(["git", *prefix, "check-ignore", "--no-index",
+                        "--stdin", "-z"],
+                       input=b"".join(os.fsencode(c) + b"\0" for c in cand),
+                       capture_output=True, check=False, env=env)
+    keep = {x for x in os.fsdecode(r.stdout).split("\0") if x}
+    linked: list[str] = []
+    for raw in cand:
+        if raw not in keep:
+            continue
+        rel = raw.rstrip("/")
+        dst = view / rel
+        with contextlib.suppress(OSError):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(Path(tree) / rel, dst)
+            linked.append(rel)
+    return linked
+
+
+async def _view_tree_sha(st: "State", tree: str | Path) -> str | None:
+    """The tree a measurement of `tree` measured: its branch tip's tree for
+    a worker tree (`_view_ref`, what its committed view shows), else
+    `tree`'s own `HEAD^{tree}`. None when git cannot say."""
+    ref = await _view_ref(st, tree)
+    if ref is None:
+        return await _committed_tree_sha(str(tree))
+    got = await _git_text(tree, "rev-parse", "--verify", "-q",
+                          f"refs/heads/{ref}^{{tree}}")
+    return (got or "").strip() or None
+
+
+async def _committed_view(st: "State", tree: str | Path) -> Path | None:
+    """Where a measurement of the worker tree `tree` runs (DESIGN §8 *Every
+    measurement reads the committed view*): a detached checkout of its
+    branch tip (`_view_ref`) at `_helper_worktree_path(st, "view-<name>")`,
+    with the tree's environment shared in (`_share_environment`, again on
+    every call, so an install since is seen). Kept while the tip stands,
+    replaced when it moves. None when `tree` is no worker tree: the
+    caller measures it as it is. A worker tree whose branch or checkout
+    cannot be had stops the run (`die`): measuring the tree itself would be
+    measuring what may not ship, the guess this removes."""
+    ref = await _view_ref(st, tree)
+    if ref is None:
+        return None
+    tip = await _ref_sha(str(tree), ref)
+    if not tip:
+        die(f"the committed view of {tree} cannot be made: its branch {ref} "
+            "cannot be read (DESIGN §8 *Every measurement reads the "
+            "committed view*)")
+    key = os.path.realpath(tree)
+    have = _VIEWS.get(key)
+    if have and have[0] == tip and have[1].is_dir():
+        await asyncio.to_thread(_share_environment, tree, have[1])
+        return have[1]
+    wt = _helper_worktree_path(st, f"view-{Path(key).name}")
+
+    def _remove() -> None:
+        subprocess.run(["git", "-C", str(tree), "worktree", "remove",
+                        "--force", str(wt)], capture_output=True,
+                       check=False)
+        if wt.exists():
+            _rmtree_owned(wt)
+    await asyncio.to_thread(_remove)
+    _VIEWS.pop(key, None)
+    add = await _worktree_add_detached_async(st, wt, tip, repo=Path(tree))
+    if add.returncode != 0:
+        die(f"the committed view of {tree} cannot be made: `git worktree "
+            f"add {wt}` failed ({(add.stderr or '').strip()[:300]}); "
+            "`leerie resume` once the cause is fixed (DESIGN §8 *Every "
+            "measurement reads the committed view*)")
+    await asyncio.to_thread(_share_environment, tree, wt)
+    _VIEWS[key] = (tip, wt)
+    return wt
+
+
 async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                         caps: dict, *, log_path: Path, verbosity: str,
                         label_prefix: str = "baseline",
@@ -40440,6 +40532,13 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
     `measure_peak` runs each command in an uncapped measurement cgroup and
     records its `peak` (the base-health baseline)."""
     results: dict[str, dict] = {}
+    # A worker tree is measured in its committed view, its environment
+    # shared in; the install still runs in the tree itself, which owns it
+    # (DESIGN §8 *Every measurement reads the committed view*).
+    real = tree
+    view = await _committed_view(st, real)
+    if view is not None:
+        tree = str(view)
     tree_sha = await _worktree_tree_sha(tree) if memo else None
     store = st.data.setdefault("blt_results", {}) if memo else {}
     installed = False
@@ -40498,9 +40597,12 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
 
         if not installed:
             deps_ok = await _ensure_worktree_deps(
-                tree, st, caps, log_path=log_path, verbosity=verbosity,
+                real, st, caps, log_path=log_path, verbosity=verbosity,
                 label_prefix=label_prefix, log_prefix=log_prefix)
             installed = True
+            if view is not None:
+                # What the install made is shared into the view too.
+                await _committed_view(st, real)
             # Installing can write into the worktree (lockfile churn,
             # generated clients), so a sha taken before it may no longer
             # describe the tree. Re-derive once, after the only step that
@@ -41416,7 +41518,11 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     1 s floor: no retry) — so a B* rerun given the budget left never runs
     past it twice (DESIGN §9 *Which failures are new*, step 2). `env_extra`
     (a throwaway test database's URL) is laid over the run's
-    environment."""
+    environment. A worker tree is run in its committed view (DESIGN §8
+    *Every measurement reads the committed view*)."""
+    view = await _committed_view(st, tree)
+    if view is not None:
+        tree = str(view)
     run_files = list(files or [])
     if run_files:
         scoped = _acceptance_cmd(st, run_files, tree)
@@ -41527,10 +41633,10 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     introduced is evidence*), and B*'s base reruns alone decide whether
     the base failed what it finds. Records `final_failing_ids` and the
     verdict (`test_id_diff`), stamped with `tree_sha` when the caller
-    passes it, else with `_assert_staging_clean(staging)`: staging is its
-    commit plus ignored files (I1 + I2), so the measurement is of the
-    committed tree and the shipping-tree refresh reuses it instead of
-    measuring the same tree again (review round 9 L1). A baseline whose install failed is measured
+    passes it, else with `_view_tree_sha(st, staging)`: the measurement ran
+    in staging's committed view, so it is of the run branch's tree and the
+    shipping-tree refresh reuses it instead of measuring the same tree
+    again (review round 9 L1). A baseline whose install failed is measured
     again first (`_retry_failed_baseline`), and a prior verdict whose base
     install failed is never reused."""
     await _retry_failed_baseline(st, caps, log_path=log_path)
@@ -41561,9 +41667,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     # The same candidates on the same tree were already confirmed (a round
     # that committed nothing): a second confirm would only re-measure noise.
     if tree_sha is None:
-        tree_sha = await _assert_staging_clean(staging,
-                                               f"{label}'s failing-test-ID "
-                                               "diff")
+        tree_sha = await _view_tree_sha(st, staging)
     prior = st.data.get("test_id_diff") or {}
     if (tree_sha and prior.get("tree_sha") == tree_sha
             and not prior.get("base_install_failed")
@@ -49555,8 +49659,6 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 # Staging moved past it (an interrupted attempt committed
                 # before a resume): that commit's tree is not measurable here.
                 return None
-            await _assert_staging_clean(staging,
-                                        "the acceptance gate's test IDs")
             got = await _ratchet_test_ids(st, caps, str(staging),
                                           label=label, log_path=repair_log)
             if sha:
@@ -53433,7 +53535,6 @@ async def _redrive_test_ids(st: "State", caps: dict, staging: Path,
     does not run what the task forbids (DESIGN §9 *A command the task
     forbids*)."""
     log_path = st.run_dir / "logs" / _REDRIVE_LOG
-    await _assert_staging_clean(staging, "the re-drive's test IDs")
     return await _ratchet_test_ids(st, caps, str(staging), label=label,
                                    log_path=log_path)
 
@@ -53850,7 +53951,6 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
         return {"new": [], "pre_existing": [], "no_verdict": [],
                 "resource_affected": [], "unmeasured": True,
                 "intermittent_regression": []}
-    await _assert_staging_clean(staging, "the delivery ratchet's test IDs")
     return await _ratchet_exec_in(st, caps, staging, pre_sha, before, after,
                                   label=label, log_path=log_path)
 
@@ -54898,9 +54998,9 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
     """Measure the failing-test-ID diff again on the tree that ships when it
     is missing or of another tree (DESIGN §8 *Delivery re-drive*, *The final
     diff describes the tree that ships*), and return that tree's sha:
-    staging's committed `HEAD^{tree}` (`_assert_staging_clean`: staging is
-    that commit plus ignored files, I1 + I2, so it is measured in place;
-    None only when git fails). Nothing to do when the diff is already of
+    the run branch's tree (`_view_tree_sha`; it is measured in staging's
+    committed view, DESIGN §8 *Every measurement reads the committed
+    view*; None only when git fails). Nothing to do when the diff is already of
     this tree, or when no test command resolves and no diff was ever
     recorded (no regression check to miss). When the `tests` axis cannot be
     measured — no command, an unmeasured run — the old diff is kept,
@@ -54910,9 +55010,7 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
     diff = diff if isinstance(diff, dict) else None
     cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"])
            or "").strip()
-    tree_sha = await _assert_staging_clean(staging,
-                                           f"{log_prefix}'s shipping-tree "
-                                           "refresh")
+    tree_sha = await _view_tree_sha(st, staging)
     if diff is None and not cmd:
         _set_final_diff_gap(st, None)
         return tree_sha
@@ -55768,8 +55866,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         before_sha = await _branch_head_sha(str(staging))
         post_taken = False
         pre = await _measure_final(c_round, "pre")
-        pre_tree = await _assert_staging_clean(
-            staging, f"final conformance round {c_round}'s pre-measurement")
+        pre_tree = await _view_tree_sha(st, staging)
 
         # Build the per-round user prompt. Mirrors _run_conformer's shape
         # but the spec / criteria lines are replaced with one sentence
@@ -55956,8 +56053,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # worker's self-reported axes stop being load-bearing here too.
         post = await _measure_final(c_round, "post")
         post_taken = True
-        post_stamp = await _assert_staging_clean(
-            staging, f"final conformance round {c_round}'s post-measurement")
+        post_stamp = await _view_tree_sha(st, staging)
         res = _apply_measured_axes(res, post)
         last_res = res
         regressions = _round_axis_regressions(pre, post)
@@ -56007,9 +56103,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                            if open_defects else None)
 
     if (pre is not None and not post_taken and pre_tree
-            and await _assert_staging_clean(
-                staging, "the final conformance's after-loop confirm")
-            == pre_tree):
+            and await _view_tree_sha(st, staging) == pre_tree):
         broke = await _confirm_final_test_failures(
             st, caps, str(staging), pre,
             log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
@@ -56536,7 +56630,12 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
     """One vitest run of `tests`: `({test: passed}, {file: {line: hits}})`.
     Pass status comes from vitest's JSON reporter, hits from the v8
     `coverage-final.json` restricted to `include` (a statement's start line
-    carries its count; the line's count is the max over its statements)."""
+    carries its count; the line's count is the max over its statements).
+    Run in the subtask's committed view (DESIGN §8 *Every measurement reads
+    the committed view*)."""
+    view = await _committed_view(st, tree)
+    if view is not None:
+        tree = view
     work = st.run_dir / "coverage" / _CGROUP_NAME_UNSAFE_RE.sub("-", sid)
     covdir = work / f"cov-{tag}"
     report = work / f"res-{tag}.json"
@@ -56708,6 +56807,9 @@ async def _tsc_lists_paths(tree: Path, paths: list[str], *, st: "State",
     when it passes AND its own file list holds every path (bench Q7/G v5:
     an axis passing says nothing about a file it never compiled). `tsc
     --noEmit --listFiles` gives both in one run."""
+    view = await _committed_view(st, tree)
+    if view is not None:
+        tree = view
     exe = tree / "node_modules" / ".bin" / "tsc"
     if not paths or not exe.exists() or not (tree / "tsconfig.json").is_file():
         return False
@@ -57112,6 +57214,12 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
                                 verbosity="quiet",
                                 label_prefix=f"settle-exec-{sid}",
                                 log_prefix=f"settle-exec {sid}")
+    # The verify commands run in the subtask's committed view: they settle
+    # the claim on what is committed, the environment shared in (DESIGN §8
+    # *Every measurement reads the committed view*).
+    view = await _committed_view(st, worktree)
+    if view is not None:
+        worktree = str(view)
     try:
         blt = resolve_blt(st.repo_root)
     except Exception:

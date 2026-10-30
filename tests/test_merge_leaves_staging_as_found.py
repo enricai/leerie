@@ -85,8 +85,7 @@ def test_output_a_merged_gitignore_exposes_is_removed(leerie, tmp_path,
         assert (staging / "gen" / "index.ts").is_file()       # the product
         assert (staging / "node_modules" / "dep.js").is_file()  # ignored
         assert os.path.realpath(staging) not in leerie._DEPS_INSTALLED
-        assert asyncio.run(leerie._assert_staging_clean(staging, "x")) == \
-            _git(staging, "rev-parse", "HEAD^{tree}")
+        assert asyncio.run(leerie._tree_dirt(staging)) == []
     finally:
         leerie._DEPS_INSTALLED.discard(os.path.realpath(staging))
 

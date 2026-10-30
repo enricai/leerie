@@ -1162,8 +1162,8 @@ def test_final_id_diff_uses_an_empty_base_for_a_scoped_replacement(
                 list(cand), "per_id": {}}
 
     monkeypatch.setattr(leerie, "_confirm_new_failures", fake_confirm)
-    # Staging is a clean checkout (I1 + I2): the diff is stamped with its
-    # committed tree (`_assert_staging_clean`).
+    # The diff is stamped with the run branch's committed tree
+    # (`_view_tree_sha`).
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "-c", "user.email=t@t",
                     "-c", "user.name=t", "commit", "-q", "--allow-empty",

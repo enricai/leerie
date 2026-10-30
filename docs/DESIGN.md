@@ -5726,8 +5726,8 @@ denied" on every runtime alike. Since the directory is the orchestrator's
 own, the bracket restores the write bit on the directories between the
 tree and a path it removes or puts back, and only then acts. A path it
 still cannot remove or restore — so not the orchestrator's own — stops
-the run there, naming the path and the error, rather than leaving dirt that `_assert_staging_clean` would later
-report with no cause. An untracked entry that is a directory — a nested
+the run there, naming the path and the error, rather than leaving dirt
+the next worker's I1 gate would hold it to with no cause. An untracked entry that is a directory — a nested
 repository a test `git init`s, which `git ls-files --others` lists as one
 `fx-repo/` entry — is removed whole (review round 15 M2).
 
@@ -7797,47 +7797,72 @@ there passes I1's branch line (`_clean_tree_gate` requires `branch=`, and
 every staging gate gives it the run branch, so a worker that leaves HEAD
 detached or on another branch is re-asked or rolled back), and leerie's
 own merges, rollbacks and resume resets all act on that branch. So the
-measurements below, stamped from staging's `HEAD^{tree}`, carry the run
-ref's tree, and the decider, which reads the ref once staging is gone,
-compares like with like. With I1
-(§8 *A worker leaves its tree clean*) and I2 (§6½ *Leerie's own commands
-leave a worker's tree as they found it*) holding, staging at every point
-leerie measures in it — the final conformance, the refresh, the
-ratchet's and the re-drive's test IDs — is its HEAD plus ignored files: no worker leaves anything
-uncommitted there, and no command of leerie's own leaves anything
-behind. So a measurement taken in staging *is* a measurement of the
-committed tree, and is stamped with `HEAD^{tree}`; nothing uncommitted is
-ever listed, because nothing uncommitted can be there.
+measurements below carry the run ref's tree, and the decider, which
+reads the ref once staging is gone, compares like with like.
 
-Review rounds 8 to 14 had built the opposite: staging was allowed to
-hold leerie's test output and a worker's leftovers, and every reader had
-to work out which tree a measurement in it described. A clean run whose
-tests left `__pycache__/` read as "the tree that ships could not be
-identified" (round 8); the answer became a clean detached checkout of
-HEAD whenever staging held anything, a list of tracked edits "that do not
-ship" for the reviewer, and a stamp that called a staging measurement the
-committed tree only when every untracked file was one leerie's commands
-last wrote — and each of those answers was driven wrong by the next
-round: a `helper.py` a conformer made through a heredoc made the suite
-pass in staging under a committed-tree stamp (round 10), a conformer's
-own test re-run made `coverage/` of unknown origin (round 11), a worker's
-rewrite of a generated file was stamped as the committed tree (round 12).
-The root cause was never in the readers: it was the dirt. With I1 and I2
-there is none to classify, and the readers have one rule.
+**Every measurement reads the committed view.** The invariant: *what
+leerie measures is exactly what ships, plus the environment* — the
+dependencies installed into the tree. Staging is where workers work, and
+I1 is what keeps their uncommitted files out of it; measured in staging,
+a measurement is only as exact as I1's reading of it. Review round 17
+drove the hole that cannot close from inside I1: a worker writes an
+untracked `.gitignore` that ignores itself and a `helper.py` beside it.
+I1 honours that `.gitignore` (git's standard rule, which every tool's own
+cache relies on), so the tree reads clean; the build, lint, tests and
+held-out sets run with `helper.py` present; the shipped commit lacks it.
+The stricter rule — only committed `.gitignore` files count — breaks every
+tool that writes a self-ignoring cache. Two ways were measured:
 
-That rule is checked, not trusted. Each reader first asserts that staging
-is clean (I1's checker, `_tree_dirt`, reads nothing; ignored files are
-not dirt), and a violation **stops the run** (`die`)
-naming the porcelain lines. It is not routed to `unconverged`, for three
-reasons. A violation has no outside cause: every worker's dirt is caught
-by I1's gate at the worker (re-asked, then rolled back), every command of
-leerie's own is bracketed by I2, and every orchestrator process starts
-on a staging at its branch tip with nothing uncommitted — dirty staging
-at a reader means leerie's own code broke an invariant. That last
-property is the resume's own invariant, not a convenience of cleanup:
-an interrupted run's cleanup removes staging, but a SIGKILL (Fly's
-`machine stop`, an OOM kill of the container) skips cleanup and leaves
-staging as the killed worker left it — partial edits, a merge half
+- *(b) I1 honours only committed ignore files.* Across the bench corpus
+  under `~/.cache/leerie-bench-b3/` (every worker stream log), 537 of the
+  3,735 sessions that ran Bash (14.4%) ran a package install. Both target
+  repositories install husky v9 through `prepare`, which writes
+  `.husky/_/.gitignore` containing `*`, and neither commits a rule for
+  `.husky/_`; it was the only self-ignoring `.gitignore` found anywhere in
+  the bench trees (157 copies). Under (b) every one of those sessions would
+  leave I1 dirt and be re-asked, the only answer being to delete husky's
+  hook shims or commit them; leerie's own installs would have I2 delete
+  `.husky/_` after each one. 19 sessions ran pytest, mypy or ruff, whose
+  caches are the same shape.
+- *(a) Measurements run in a checkout of the commit.* A detached `git
+  worktree add` of the branch tip costs a median 0.20 s on barnacle
+  (1,369 files) and 0.44 s on funeralworks (2,845 files), seven runs each,
+  once per commit measured; barnacle's test axis alone took 906 s and
+  1,116 s in the two e2e runs that recorded it.
+
+So (a): every command leerie runs to measure a worker's tree — the
+measured build/lint/test axes, every test-ID run (B\*'s final side, the
+intermittent-discovery repeats, the ratchet's and the re-drive's test
+IDs, the integration gate's), settle by execution's verify commands and
+the coverage settle's — runs in that tree's *committed view*
+(`_committed_view`): a detached checkout of its branch tip (the run branch
+for staging, the subtask branch for a subtask's worktree; never the
+tree's HEAD, which a worker can move), kept while the tip stands and
+replaced when it moves. The environment is shared into it: every path of
+the worker's tree that the view's own ignore rules — committed
+`.gitignore` files and leerie's settings copies (§8 *The settings are
+leerie's*) — also ignore is symlinked in (`node_modules`, nested ones, a
+generated client, build output), so nothing is installed twice; a path
+only an uncommitted `.gitignore` ignores is not, and is not measured. The
+install itself still runs in the worker's tree (I2-bracketed), which owns
+the environment. The view is bracketed by I2 like any tree, so one
+measurement's reports never reach the next.
+
+What this removes: the measurement no longer depends on I1's reading of
+staging, so the assertion every staging reader made — that staging was
+clean, or the run stopped — is gone; each reader stamps the branch's tree
+(`_view_tree_sha`: the run branch's tree, for staging), which is what
+its view measured. I1 still
+holds every worker to a clean tree: it is what keeps uncommitted work out
+of the commits that ship and out of the next worker's way. What stays
+outside: the shared environment is the worker tree's, so a worker that
+edits an installed dependency in place is measured with that edit; and a
+symlinked build output can be stale, as it always could in staging.
+
+Staging is restored at every resume all the same: an interrupted run's
+cleanup removes it, but a SIGKILL (Fly's `machine stop`, an OOM kill of
+the container) skips cleanup and leaves staging as the killed worker left
+it — partial edits, a merge half
 resolved, or a HEAD a worker detached or moved to another branch. So
 `setup-run.sh`, which every process runs once before it reads staging,
 restores a staging that survived with the one restore primitive (*One
@@ -7866,15 +7891,7 @@ rules govern a subtask's worktree (I1 after every attempt — `complete`,
 commits its partial work and leaves its checkpoint in the run
 directory). A restore that still leaves dirt stops setup, naming it. A killed
 integrator's half resolution goes with it, as it already did under a
-Ctrl-C's cleanup. Continuing would mean
-measuring, judging or shipping a tree leerie cannot name — the very guess
-this design removed — and a run that ends `unconverged` because of it
-would present a defect of leerie as unfinished work of the task's, in the
-PR the user reads. And the stop costs no work: state is saved, the
-worktrees are cleaned up as on any `die`, and `leerie resume` continues
-from the same step on a clean staging. A git failure while reading the
-status stops the run the same way: nothing was read, so nothing is known
-about the tree.
+Ctrl-C's cleanup.
 
 **Every post-execution verdict is of the committed tree.** The invariant:
 *a verdict becomes `met` only on a read of a commit, or on a measurement
@@ -7925,8 +7942,8 @@ one makes nothing *met*:
   the executed-commands record — the final-tree build/lint/test axes,
   the B\* diff, the held-out sets' final verdicts — and those are in it
   only while they describe staging's HEAD: the axes and the B\* diff
-  carry the committed tree they measured (staging asserted clean, §8
-  above), the held-out sets their commit.
+  carry the committed tree they measured (the branch's, measured in its
+  committed view, §8 above), the held-out sets their commit.
   The orchestrator's entries are kept apart from the text the judge reads,
   and a cite is checked against that separate store, never against a
   tag in the text: a worker's entry cannot become one by its contents.
@@ -7979,10 +7996,10 @@ round 13 claims M1 found three paths where it had):
   stamped it with that commit;
 - the ratchet's execution route — the failing-test-ID measurement, its
   intermittent-discovery repeats and B\*'s rerun of the repaired side —
-  runs where only the commit is: staging, asserted clean (HEAD plus the
-  ignored files every measurement runs with). It had measured staging as
-  it stood, beside a withheld leftover; the leftover no longer exists
-  (I1), and neither does the clean checkout that replaced it.
+  runs where only the commit is: staging's committed view (§8 *Every
+  measurement reads the committed view*: the run branch's tip plus the
+  environment). It had measured staging as it stood, beside a withheld
+  leftover.
 
 The judges no longer see staging-only content at all, and the ratchet's
 test IDs are measured on the commit. The final diff measures the committed

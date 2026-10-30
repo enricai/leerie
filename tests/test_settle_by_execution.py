@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -316,9 +318,11 @@ def test_an_unrelated_forbidden_command_does_not_stop_execution(harness):
 def test_untracked_output_of_a_verify_command_is_removed(harness):
     """Review r1 suspicion, proven: the clean-tree check reads tracked files
     only (`--untracked-files=no`), so a verify command's build output stayed
-    in the worktree, untracked, for a later worker's `git add -A`. What the
-    commands create is removed; what was there before, and ignored files,
-    stay."""
+    in the worktree, untracked, for a later worker's `git add -A`. The
+    commands run in the subtask branch's committed view (DESIGN §8 *Every
+    measurement reads the committed view*), which they leave as found: what
+    they create is removed, ignored files stay. The worktree is not
+    touched."""
     wt = harness["worktree"]
     (wt / "mine.txt").write_text("the worker's\n")
     (wt / ".gitignore").write_text("deps/\n")
@@ -332,8 +336,11 @@ def test_untracked_output_of_a_verify_command_is_removed(harness):
         "exist_ok=True); open('deps/lib.js','w').write('x')")))
     assert res["verdict"] == "pass", res
     assert res["removed_untracked"] == ["out/sub/build.txt", "report.xml"]
-    assert not (wt / "out").exists() and not (wt / "report.xml").exists()
-    assert (wt / "mine.txt").is_file() and (wt / "deps" / "lib.js").is_file()
+    view = harness["leerie"]._VIEWS[os.path.realpath(wt)][1]
+    assert not (view / "out").exists() and not (view / "report.xml").exists()
+    assert (view / "deps" / "lib.js").is_file()             # ignored: kept
+    assert not (view / "mine.txt").exists()                # not committed
+    assert (wt / "mine.txt").is_file() and not (wt / "deps").exists()
     status = subprocess.run(["git", "status", "--porcelain"], cwd=str(wt),
                             capture_output=True, text=True).stdout
     assert status == "?? mine.txt\n"
@@ -390,9 +397,12 @@ def test_an_environment_limit_leaves_the_tree_as_found(harness, monkeypatch):
     wt = harness["worktree"]
     readme = (wt / "README.md").read_text()
 
+    ran: list[Path] = []
+
     async def _contained(argv, **kw):
-        (wt / "README.md").write_text("changed")
-        (wt / "made.txt").write_text("x")
+        ran.append(Path(kw["cwd"]))
+        (ran[-1] / "README.md").write_text("changed")
+        (ran[-1] / "made.txt").write_text("x")
         return {"rc": 137, "tail": "Killed", "timed_out": False,
                 "contained": True, "oom_kill": 1, "pids_denied": 0,
                 "peak": None}
@@ -402,6 +412,7 @@ def test_an_environment_limit_leaves_the_tree_as_found(harness, monkeypatch):
                   worker_memory_max_bytes=5 << 30, worker_pids_max=4096)
     assert res["verdict"] == "environment_limit"
     _assert_as_found(wt, readme)
+    _assert_as_found(ran[0], readme)                        # the view
 
 
 def test_a_forbidden_argv_stopping_the_loop_leaves_the_tree_as_found(
@@ -427,11 +438,15 @@ def test_an_exception_leaves_the_tree_as_found(harness, monkeypatch):
     wt = harness["worktree"]
     readme = (wt / "README.md").read_text()
 
+    ran: list[Path] = []
+
     async def _contained(argv, **kw):
-        (wt / "README.md").write_text("changed")
-        (wt / "made.txt").write_text("x")
+        ran.append(Path(kw["cwd"]))
+        (ran[-1] / "README.md").write_text("changed")
+        (ran[-1] / "made.txt").write_text("x")
         raise RuntimeError("broker gone")
     monkeypatch.setattr(harness["leerie"], "_run_contained", _contained)
     with pytest.raises(RuntimeError):
         _settle(harness, _sub(_py("pass")))
     _assert_as_found(wt, readme)
+    _assert_as_found(ran[0], readme)                        # the view

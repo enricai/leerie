@@ -3,7 +3,7 @@ nothing uncommitted (DESIGN §8 *The final diff describes the tree that
 ships*). An interrupted run's cleanup removes staging, but a SIGKILL skips
 cleanup: the resume's `setup-run.sh` found the staging worktree still
 registered and reused it as the killed worker left it, and the first
-reader's `_assert_staging_clean` stopped the run. `setup-run.sh` now resets
+reader's staging-clean assertion (since removed) stopped the run. `setup-run.sh` now resets
 a surviving staging — tracked edits, untracked files and a merge in
 progress go; ignored files (installed dependencies) and the run branch
 stay. Driven on the real script."""
@@ -63,7 +63,8 @@ def test_a_staging_a_sigkill_left_dirty_is_reset_on_resume(
     assert _git(staging, "rev-parse", "HEAD") == tip   # branch untouched
     assert (staging / "node_modules" / "dep.js").is_file()  # ignored: kept
     # The first reader no longer stops the run.
-    assert asyncio.run(leerie._assert_staging_clean(staging, "x")) == _git(
+    assert asyncio.run(leerie._tree_dirt(staging)) == []
+    assert asyncio.run(leerie._committed_tree_sha(str(staging))) == _git(
         staging, "rev-parse", "HEAD^{tree}")
 
 

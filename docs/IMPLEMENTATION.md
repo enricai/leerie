@@ -6536,26 +6536,40 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     fails), with no cleanliness check. `_worktree_tree_sha` (None on any
     porcelain output, untracked files included) stays the `_measure_axes`
     memo key.
-  - Staging is clean at every reader (I1 + I2):
-    `async _assert_staging_clean(staging, where) -> str | None` reads
-    `_tree_dirt(staging)`; when that is None (git failed) or not `[]` it
-    `die()`s — `"staging is not clean at <where>, so what would be
-    measured or judged there is not the committed tree — leerie's own
-    invariant is broken (DESIGN §8 *The final diff describes the tree that
-    ships*: every worker leaves it clean, I1, and so does every command of
-    leerie's, I2). Left there: <first 20 porcelain lines joined '; '>[ (+N
-    more)]. State is saved and the worktrees are cleaned up: report this,
-    then `leerie resume` continues on a fresh staging."` (the run id
-    appended by `die`) — and
-    otherwise returns `_committed_tree_sha(staging)`. Called by: the
-    `tree_sha` `_confirm_final_test_failures` stamps when its caller
-    passes none; `_run_final_conformance`, right after each round's `pre`
-    measurement (`pre_tree`, which is also the stamp when the round takes
-    no `post`), right after its `post` measurement (`post_stamp`), and
-    before the after-loop confirm below; `_refresh_test_id_diff`;
-    `_ratchet_exec`;
-    `_redrive_test_ids`; the acceptance gate's `_ids_at`. Every read of
-    "the tree that ships" uses `_committed_tree_sha`: the refresh below,
+  - Every measurement reads the committed view (DESIGN §8 *Every
+    measurement reads the committed view*). `async _view_ref(st, tree) ->
+    str | None`: the run branch for `<run-dir>/worktrees/staging`, the
+    subtask branch for a worktree directly in `<run-dir>/worktrees` whose
+    name minus `_worktree_dirname(<run-id>, "")` is a `<sid>` with an
+    existing `leerie/subtasks/<run-id>/<sid>` (`_ref_sha`), else None.
+    `async _committed_view(st, tree) -> Path | None`: None when `_view_ref`
+    is; else, keyed by `realpath(tree)` in the process-level `_VIEWS`
+    (`(tip, path)`), the existing view while the branch tip is unchanged,
+    otherwise the old one removed (`git worktree remove --force`,
+    `_rmtree_owned`) and `_worktree_add_detached_async(st,
+    _helper_worktree_path(st, "view-<basename>"), <tip>, repo=tree)`;
+    either way `_share_environment(tree, view)` runs (again each call): every
+    `_untracked_listing(tree, which="ignored", directory=True)` path not
+    already in the view that `git <_git_view(view)> check-ignore --no-index
+    --stdin -z` also ignores is symlinked into it. An unreadable branch or
+    a failed add `die()`s ("the committed view of <tree> cannot be made: …").
+    `async _view_tree_sha(st, tree) -> str | None`: `refs/heads/<ref>^{tree}`
+    for a worker tree, else `_committed_tree_sha(tree)`. Used by:
+    `_measure_axes` (the view is made first, the memo keyed on it; the
+    install runs in `tree` itself, then `_committed_view` again to share
+    what it made; every axis, its I2 bracket and `_attach_failing_ids` run
+    in the view), `_capture_failing_test_ids` (first statement: every
+    test-ID run, B\*'s final side, discovery, the ratchet's, re-drive's,
+    acceptance gate's and integration gate's IDs), `_settle_by_execution`
+    (after its install), and the coverage settle's `_vitest_run` and
+    `_tsc_lists_paths` (`_install_settles` runs in the worktree: it is an
+    install). Stamps: `_confirm_final_test_failures` (when its caller
+    passes no `tree_sha`), `_refresh_test_id_diff`'s return,
+    `_run_final_conformance`'s `pre_tree`/`post_stamp` and its after-loop
+    check use `_view_tree_sha(st, staging)`. `_assert_staging_clean` is
+    gone.
+    Every read of "the tree that ships" uses `_committed_tree_sha` or
+    `_shipping_tree`: the refresh below,
     the test-outcome verdicts of `_delivery_judge_unmet`,
     `_run_delivery_detection` and the re-drive's item re-checks and tail
     (`_test_outcome_verdict`, `_redrive_apply_item_verdicts`,
@@ -6565,7 +6579,7 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   - `_run_final_conformance` keeps each round's `pre` measurement and
     `pre_tree`; when the last round broke before its `post` (WorkerError,
     timeout, malformed result, protected-path or strict clobber rollback)
-    and `_assert_staging_clean(staging, …)` is still `pre_tree`,
+    and `_view_tree_sha(st, staging)` is still `pre_tree`,
     `_confirm_final_test_failures(st, caps, staging, pre, …,
     label="final-r<N>-pre")` is called on it, and a non-empty `new` is
     added to the warnings (`_format_new_failing_ids`).
@@ -6582,15 +6596,15 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `_final_diff_base_gap(st, <diff>)` on both its reuse and its measured
     paths.
   - `async _refresh_test_id_diff(st, caps, staging, *, log_path, label,
-    log_prefix) -> str | None` — returns `_assert_staging_clean(staging,
-    "the shipping-tree refresh")`, staging's committed tree. Nothing when
+    log_prefix) -> str | None` — returns `_view_tree_sha(st, staging)`,
+    the run branch's tree. Nothing when
     no `tests` command resolves and no `test_id_diff` was recorded, or the
     recorded diff's `tree_sha` is that tree (both set the gap to
     `_final_diff_base_gap`, or clear it), or its `stale_for_tree` is
     (already tried; the gap stays). Otherwise, with a command, measures
     `_measure_axes(staging, {"tests": cmd}, …, failing_ids_axes={"tests"})`
-    and `_confirm_final_test_failures(…, tree_sha=<committed tree>)` in
-    staging itself. When that gives None (or there is no command) an
+    and `_confirm_final_test_failures(…, tree_sha=<committed tree>)`, in
+    staging's committed view. When that gives None (or there is no command) an
     existing diff is kept with `stale_for_tree: <tree sha>` — the log line
     says "marked stale" only when it was — and `_set_final_diff_gap`
     records why.
@@ -7575,8 +7589,7 @@ else `"broke an existing test"`) becomes the round's `rollback_reason` and
 A ratchet that raises is recorded as `{error}`, the round is kept, and
 every prior met item is unverified on its commit (below). The test IDs
 come from `_ids_at(sha, label)`: one `_ratchet_test_ids` run per commit,
-in staging after `_assert_staging_clean(staging, "the acceptance
-gate's test IDs")`, kept in `gate.test_ids[sha]` (`{ids, files, kind,
+in staging's committed view (`_capture_failing_test_ids`), kept in `gate.test_ids[sha]` (`{ids, files, kind,
 messages, command}` or `{unmeasured: true}`). It measures only while
 staging's HEAD is that commit. Each round's start is measured before
 its worker runs.
@@ -7628,8 +7641,8 @@ nor void.
   confirmed, samples, met_evidence, errors, unverified?}`.
 - **Execution** (`_ratchet_exec(st, caps, staging, pre_sha, before, after,
   *, label, log_path)`): with either side unmeasured, `{unmeasured: true}`.
-  Otherwise `_assert_staging_clean(staging, "the delivery ratchet's
-  test IDs")`, then `_ratchet_exec_in` on staging: `_intermittent_discovery` from `pre_sha` (the tests that
+  Otherwise `_ratchet_exec_in` on staging (its test runs read staging's
+  committed view): `_intermittent_discovery` from `pre_sha` (the tests that
   directly import a file the repair changed, rerun
   `confirm_intermittent_repeats` times); IDs it fails that `before` did not
   join `after`'s IDs; `_redrive_new_failures` confirms the candidates under
@@ -7654,8 +7667,8 @@ nor void.
 - **Staging is the committed test tree** (review round 13 claims M1;
   DESIGN §8 *The final diff describes the tree that ships*): the ratchet's
   execution route, `_redrive_test_ids` and the acceptance gate's `_ids_at`
-  measure in staging itself after `_assert_staging_clean`. I1 and I2 leave
-  it at HEAD plus ignored files; no checkout of HEAD is made.
+  measure in staging's committed view (`_committed_view`): the run
+  branch's tree plus the environment its committed ignore rules share in.
 - **Unverified** (review round 13 claims M1). `unverified[]` is the
   `rest` items (all but `untouched_paths` ones) when the classifier
   failed, else the judge's `unverified` less `regressed`.
@@ -7836,8 +7849,7 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   left dirty past its re-asks is rolled back), and, when HEAD moved, the shown sets (and, in a
   held-back round, the held-back ones) are re-measured and the repo's test
   command re-run for failing IDs (`_redrive_test_ids`, which is
-  `_ratchet_test_ids` on staging after `_assert_staging_clean(staging,
-  "the re-drive's test IDs")`, with the re-drive log: a command the task
+  `_ratchet_test_ids` on staging, measured in its committed view, with the re-drive log: a command the task
   forbids is replaced by its `_scoped_test_replacement`, or no verdict when
   there is nothing to run — never run raw), new ones confirmed
   against a `redrive-base` worktree at `pre_sha` by `_confirm_new_failures`

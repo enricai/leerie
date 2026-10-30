@@ -4,7 +4,7 @@
 reach: one restored no write bits, none removed a nested repository (`git
 clean -fd` skips them; `-ffd` does not), and none checked that I1's
 checker then read nothing. So I1's designed exhaustion path — roll the
-round back and record it — ended in `_assert_staging_clean`'s `die()`,
+round back and record it — ended in the staging-clean assertion's `die()` (since removed),
 and the nested-repo case died again on every resume. `_restore_tree` and
 `leerie_reset_worktree` are the one primitive; the drivers are the
 reviewer's proofs, turned to assert the designed outcome."""
@@ -92,7 +92,8 @@ def test_a_nested_repo_does_not_survive_the_resume(leerie, tmp_path,
     (staging / "upstream" / "lib.py").write_text("x = 1\n")
     setup()                                       # the resume
     assert not (staging / "upstream").exists()
-    assert asyncio.run(leerie._assert_staging_clean(staging, "x")) == _git(
+    assert asyncio.run(leerie._tree_dirt(staging)) == []
+    assert asyncio.run(leerie._committed_tree_sha(str(staging))) == _git(
         staging, "rev-parse", "HEAD^{tree}")
 
 

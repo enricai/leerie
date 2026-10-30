@@ -599,10 +599,10 @@ def test_a_failed_acceptance_round_ratchet_drops_the_item_from_prior_met(
 def test_the_execution_route_measures_staging_at_its_commit(
         leerie, tmp_path, monkeypatch, capsys):
     """The failing-test-ID measurement the ratchet's execution route reads
-    runs where only the commit is: staging itself, asserted clean (I1 +
-    I2; DESIGN §8 *The final diff describes the tree that ships*). Round
-    13's withheld leftover in staging no longer exists; a file there now
-    stops the run before anything is measured."""
+    is handed staging, and `_capture_failing_test_ids` runs it in the run
+    branch's committed view (DESIGN §8 *Every measurement reads the
+    committed view*; `tests/test_committed_view.py`). A leftover file in
+    staging is not measured and no longer stops the run."""
     w = World(leerie, tmp_path)
     seen: list[tuple[str, bool]] = []
 
@@ -614,17 +614,15 @@ def test_the_execution_route_measures_staging_at_its_commit(
     assert seen == [(str(w.staging), False)]
     (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
     seen.clear()
-    with pytest.raises(SystemExit):
-        asyncio.run(leerie._redrive_test_ids(w.st, w.caps, w.staging, "x"))
-    assert seen == []
-    assert "?? src/leftover.ts" in capsys.readouterr().err
+    asyncio.run(leerie._redrive_test_ids(w.st, w.caps, w.staging, "x"))
+    assert seen == [(str(w.staging), True)]
 
 
 def test_the_ratchet_exec_discovery_and_bstar_run_on_the_commit(
         leerie, tmp_path, monkeypatch):
     """`_ratchet_exec`'s discovery repeats and B*'s final side run in the
-    same tree as the IDs: staging, asserted clean; never beside a file
-    that does not ship."""
+    same tree as the IDs: staging, read through its committed view by the
+    one capture they share, so never beside a file that does not ship."""
     w = World(leerie, tmp_path)
     seen: list[tuple[str, str]] = []
 
@@ -648,6 +646,5 @@ def test_the_ratchet_exec_discovery_and_bstar_run_on_the_commit(
     assert seen == [("discovery", str(w.staging)), ("bstar", str(w.staging))]
     (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
     seen.clear()
-    with pytest.raises(SystemExit):
-        run()
-    assert seen == []
+    run()
+    assert seen == [("discovery", str(w.staging)), ("bstar", str(w.staging))]
