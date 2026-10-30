@@ -256,13 +256,15 @@ def test_worktree_add_failure_skips_rebase_and_still_pushes(tmp_path):
     p.write_text("#!/usr/bin/env bash\necho UNEXPECTED_PYTHON3_CALL >&2\nexit 1\n")
     p.chmod(0o755)
     # Shadow `git worktree add` to fail while leaving every other git
-    # subcommand to the real binary.
+    # subcommand to the real binary. Matched by its words, not argv
+    # positions: host-finalize's add carries `-C <repo> -c
+    # core.hooksPath=/dev/null` ahead of them (DESIGN §6½ *Hooks off*).
     real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
     git_shim = bin_dir / "git"
     git_shim.write_text(f"""#!/usr/bin/env bash
-if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
-  exit 1
-fi
+case " $* " in
+  *" worktree add "*) exit 1 ;;
+esac
 exec {real_git} "$@"
 """)
     git_shim.chmod(0o755)

@@ -92,6 +92,9 @@ def _state(leerie, tmp_path):
     # must be set explicitly or both that and the §12 cwd guard
     # silently no-op.
     st.repo_root = "/leerie-test-user-repo"
+    # A real State always carries its run id (`State.__init__`); the gate
+    # names the run branch from it (`_compute_run_branch`).
+    st.run_id = "test-skip-gate"
     st.data = {}
     st.run_dir = tmp_path
     st.save = lambda: None
@@ -138,13 +141,24 @@ def test_skip_flag_off_still_invokes_the_gate(leerie, tmp_path, monkeypatch):
 
     async def fake_run_proc(argv, cwd=None):
         class _R:
-            stdout = "deadbeef\n"
+            # A clean staging on the run branch: `git status` and the
+            # checker's `ls-files` reads print nothing, `symbolic-ref`
+            # names the branch, the rest a sha.
+            stdout = ("" if "status" in argv or "ls-files" in argv else
+                      f"refs/heads/{leerie._compute_run_branch(st.run_id)}\n"
+                      if "symbolic-ref" in argv else "deadbeef\n")
             stderr = ""
             returncode = 0
         return _R()
+    restores: list = []
+
+    async def no_restore(*a, **k):
+        restores.append(a)
+        return True
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_restore_tree", no_restore)
     judge_checkout_in_place(leerie, monkeypatch)
 
     asyncio.run(leerie._run_integration_judge_gate(
@@ -153,3 +167,4 @@ def test_skip_flag_off_still_invokes_the_gate(leerie, tmp_path, monkeypatch):
 
     assert called["n"] == 1
     assert st.data["integration_gate"]["feat-001"]["accepted"] is True
+    assert restores == []          # a clean staging is never restored
