@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import relocate_into_run_repo
+
 
 @pytest.fixture(autouse=True)
 def _restore_claude_p(leerie):
@@ -85,6 +87,10 @@ def env(leerie, tmp_path):
         "working_branch": "main",
     }
     st.save()
+    # The run's own repository (DESIGN §6 *The run's own repository*):
+    # the run branch and staging move there, and `base_sha` (the
+    # conformer's DIFF_BASE) is recorded as the cut point.
+    relocate_into_run_repo(leerie, st)
 
     caps = dict(leerie.DEFAULT_CAPS)
     models = {w: "sonnet" for w in leerie.WORKER_TYPES}
@@ -173,7 +179,8 @@ def test_skipped_when_staging_worktree_absent(env):
     c = env["leerie"]
     # Remove the staging worktree to trigger the skip branch.
     subprocess.run(["git", "worktree", "remove", "-f", str(env["staging"])],
-                   cwd=env["repo"], capture_output=True, text=True)
+                   cwd=env["st"].run_repo, capture_output=True, text=True,
+                   check=True)
     asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
@@ -181,9 +188,9 @@ def test_skipped_when_staging_worktree_absent(env):
     assert "_final" not in (env["st"].data.get("conformance") or {})
 
 
-def test_skipped_when_working_branch_absent(env):
+def test_skipped_when_base_sha_absent(env):
     c = env["leerie"]
-    env["st"].data["working_branch"] = ""
+    env["st"].data["base_sha"] = ""
     env["st"].save()
     asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],

@@ -910,10 +910,19 @@ STATE_FIELDS = (
     # working_branch: the user's branch at the moment phase_classify
     # runs (`git rev-parse --abbrev-ref HEAD`). Mirrored to run.json
     # and to `<state-root>/runs/<id>/working-branch` (setup-run.sh writes
-    # the on-disk copy later). Persisted into st.data so downstream
-    # readers (pr_writer payload, _run_final_conformance's DIFF_BASE)
-    # do not have to re-query git or re-read run.json.
+    # the on-disk copy later). The PR-facing name; leerie's own diffs
+    # against the base read `base_sha` (below).
     "working_branch",
+    # run_repo: "repo" once the run's own repository `<run-dir>/repo`
+    # exists (DESIGN §6 *The run's own repository*). Its absence on a run
+    # whose run.json has a branch marks a run made before per-run
+    # repositories, which `resume` refuses.
+    "run_repo",
+    # base_sha: the commit setup-run.sh cut the run branch from, recorded
+    # once by phase_execute. Every comparison leerie makes against the base
+    # reads it, never the working branch's name, which in the run's
+    # repository is a ref a worker can move.
+    "base_sha",
     # pr_base_branch: the final branch this run's PR merges into. Defaults
     # to working_branch when the user does not override it via
     # --pr-base-branch / LEERIE_PR_BASE_BRANCH / leerie.toml. This is the
@@ -5536,10 +5545,10 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     failures are caught — one bad worktree shouldn't block the others.
 
     If `full_purge` is True (the user's explicit Ctrl-C gesture):
-    additionally delete the run branch (`leerie/runs/<run-id>`) and
-    every subtask branch (`leerie/subtasks/<run-id>/*`), and
-    recursively remove `st.run_dir`. The run is gone; `resume` can't
-    recover it.
+    additionally remove `st.run_dir` recursively, the run's own repository
+    (`<run-dir>/repo`) with it — the run and subtask branches live there,
+    never in the user's repository (DESIGN §6 *The run's own repository*).
+    The run is gone; `resume` can't recover it.
 
     If `full_purge` is False (SIGTERM/SIGHUP/exception): state.json and
     the run branch are left intact so `resume <id>` can
@@ -5576,6 +5585,10 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     cleanup_deadline = time.monotonic() + worktree_remove_timeout
     failed_removals = 0
     worktrees_dir_resolved = worktrees_dir.resolve() if worktrees_dir.is_dir() else None
+    # The registry the worktrees are in: the run's own repository, or the
+    # process cwd's for a run made before per-run repositories.
+    own_repo = _run_repo_of(st.run_dir)
+    at = ["-C", str(own_repo)] if own_repo is not None else []
     if worktrees_dir.is_dir():
         for entry in worktrees_dir.iterdir():
             if not entry.is_dir():
@@ -5584,7 +5597,8 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
             if remaining > 0:
                 try:
                     subprocess.run(
-                        ["git", "worktree", "remove", "--force", str(entry)],
+                        ["git", *at, "worktree", "remove", "--force",
+                         str(entry)],
                         capture_output=True, check=False,
                         timeout=remaining,
                     )
@@ -5635,29 +5649,9 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     _prune_leerie_worktrees(st.run_dir)
     if not full_purge:
         return
-    # Full purge: delete branches and the run dir. The run branch lives
-    # at leerie/runs/<run-id> and subtask branches under
-    # leerie/subtasks/<run-id>/<sid> — see _compute_run_branch for the
-    # namespace-disjointness rationale.
-    branch_globs = [
-        f"refs/heads/leerie/runs/{st.run_id}",
-        f"refs/heads/leerie/subtasks/{st.run_id}/",
-    ]
-    for glob in branch_globs:
-        r = subprocess.run(
-            ["git", "for-each-ref", "--format=%(refname:short)", glob],
-            capture_output=True, text=True, check=False, timeout=10,
-        )
-        if r.returncode != 0:
-            continue
-        for ref in r.stdout.splitlines():
-            ref = ref.strip()
-            if not ref:
-                continue
-            subprocess.run(
-                ["git", "branch", "-D", ref],
-                capture_output=True, check=False, timeout=10,
-            )
+    # Full purge: the run dir, and with it the run's own repository, which
+    # holds every branch of the run. Nothing of the run is in the user's
+    # repository to delete.
     if st.run_dir.exists():
         shutil.rmtree(st.run_dir, ignore_errors=True)
 
@@ -5746,7 +5740,7 @@ def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
     `_WORKTREE_ADD_LOCK_WAIT_SEC`, then adds unlocked, logged — these
     helpers fail open. `repo` (default the run's repository) is the
     checkout git is run in — any worktree of the same repository."""
-    root = str(repo if repo is not None else st.repo_root)
+    root = str(repo if repo is not None else _run_repo(st))
     argv = ["git", "-C", root, "worktree", "add", "--detach", str(wt), rev]
     lock_fd = None
     try:
@@ -5811,8 +5805,17 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
     only registrations under `leerie_root`. An entry that cannot be attributed
     is left strictly alone — deleting a registration we cannot identify is the
     accident this exists to prevent. Best-effort throughout: pruning is
-    housekeeping, and a failure here must never take down the caller."""
+    housekeeping, and a failure here must never take down the caller.
+
+    The registry pruned is the one `leerie_root`'s worktrees are registered
+    in: a run directory's own repository (`<run-dir>/repo`, DESIGN §6 *The
+    run's own repository*) when it has one, else the process cwd's — the
+    user's repository, where a run made before per-run repositories
+    registered them. The attribution stays in both: in the run's repository
+    it is merely conservative."""
     root = str(Path(leerie_root).resolve())
+    own = _run_repo_of(Path(leerie_root))
+    at = ["-C", str(own)] if own is not None else []
     try:
         # LC_ALL=C / LANGUAGE=: git wraps this output in gettext
         # (`fprintf_ln(stderr, _("Removing %s/%s: %s"), ...)` in
@@ -5822,8 +5825,8 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
         # exactly the "looks like nothing was stale" failure the bare prune it
         # replaced could not have.
         _env = {**os.environ, "LC_ALL": "C", "LANGUAGE": ""}
-        gd = subprocess.run(["git", "rev-parse", "--path-format=absolute",
-                             "--git-common-dir"],
+        gd = subprocess.run(["git", *at, "rev-parse",
+                             "--path-format=absolute", "--git-common-dir"],
                             capture_output=True, text=True, check=False,
                             timeout=10, env=_env)
         if gd.returncode != 0 or not gd.stdout.strip():
@@ -5864,9 +5867,11 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
 def _prune_leerie_worktrees_locked(git_dir: Path, root: str,
                                    env: dict[str, str]) -> None:
     try:
+        # Run inside the common dir: git finds the repository the
+        # registrations belong to there, whatever the process cwd.
         r = subprocess.run(["git", "worktree", "prune", "-n", "-v"],
                            capture_output=True, text=True, check=False,
-                           timeout=10, env=env)
+                           timeout=10, env=env, cwd=str(git_dir))
     except (OSError, subprocess.TimeoutExpired):
         return
     for line in (r.stdout + "\n" + r.stderr).splitlines():
@@ -5940,11 +5945,15 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     administratively succeeded but left the directory behind."""
     worktree = _subtask_worktree_path(leerie_dir, sid)
     branch = f"leerie/subtasks/{run_id}/{sid}"
+    # `-C`, not `cwd=`: a repository that is gone is a git error here (the
+    # idempotent case), never an exception.
+    repo = str(Path(leerie_dir) / RUN_REPO_NAME)
     try:
-        await run_proc(["git", "worktree", "remove", "--force", str(worktree)], timeout=240)
+        await run_proc(["git", "-C", repo, "worktree", "remove", "--force",
+                        str(worktree)], timeout=240)
     except subprocess.TimeoutExpired:
         log(f"[{sid}] git worktree remove timed out; falling back to rmtree")
-    await run_proc(["git", "branch", "-D", branch])
+    await run_proc(["git", "-C", repo, "branch", "-D", branch])
     await _rmtree_fallback_and_prune(worktree, leerie_dir)
 
 
@@ -5962,7 +5971,9 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     pressure deferred to run-end cleanup, not a reason to fail the wave."""
     worktree = _subtask_worktree_path(leerie_dir, sid)
     try:
-        await run_proc(["git", "worktree", "remove", "--force", str(worktree)], timeout=240)
+        await run_proc(["git", "-C", str(Path(leerie_dir) / RUN_REPO_NAME),
+                        "worktree", "remove", "--force", str(worktree)],
+                       timeout=240)
     except subprocess.TimeoutExpired:
         log(f"[{sid}] git worktree remove timed out; falling back to rmtree")
     await _rmtree_fallback_and_prune(worktree, leerie_dir)
@@ -9557,10 +9568,242 @@ async def _gather_or_cancel(*aws):
 RUN_SCRIPT_TIMEOUT = 600
 
 
-async def _run_script(name: str, *args: str) -> subprocess.CompletedProcess:
-    """Run one of the bundled git worktree scripts in the target repo."""
-    return await run_proc(["bash", str(SCRIPTS / name), *args], cwd=os.getcwd(),
+async def _run_script(name: str, *args: str,
+                      st: "State") -> subprocess.CompletedProcess:
+    """Run one of the bundled git worktree scripts in the run's own
+    repository (DESIGN §6 *The run's own repository*): every script acts on
+    the repository at its working directory. The state root is passed
+    absolute, since a relative `.leerie` would resolve inside that
+    repository."""
+    env = {**os.environ,
+           "LEERIE_STATE_DIR": str(Path(st.run_dir).resolve().parent.parent)}
+    return await run_proc(["bash", str(SCRIPTS / name), *args],
+                          cwd=str(_run_repo(st)), env=env,
                           timeout=RUN_SCRIPT_TIMEOUT)
+
+
+# The run's own repository (DESIGN §6 *The run's own repository*, RC4/I4):
+# `<run-dir>/repo`, a bare, self-contained repository every tree a worker
+# gets hangs off, so no worker's git verb reaches the user's refs, stash,
+# config, `info/exclude`, hooks or worktree registry.
+RUN_REPO_NAME = "repo"
+
+# Repository-local config keys that describe where and what kind of
+# repository a config file belongs to, not how git behaves in it: copied,
+# they would make the run's bare repository read as the user's (measured:
+# the user's `core.bare = false` made `worktree add` of the run branch
+# refuse). Every other repository-local key is carried.
+_RUN_REPO_UNCARRIED_KEYS = frozenset({
+    "core.bare", "core.worktree", "core.repositoryformatversion"})
+_RUN_REPO_UNCARRIED_PREFIXES = ("extensions.", "include.", "includeif.")
+
+
+def _run_repo(st: "State") -> Path:
+    """`<run-dir>/repo`: the one spelling of the run's own repository's
+    path (also `State.run_repo`)."""
+    return Path(st.run_dir) / RUN_REPO_NAME
+
+
+class RunRepoError(RuntimeError):
+    """The run's own repository could not be created or refreshed."""
+
+
+def _git_sync(args: list[str], *, env: Mapping[str, str] | None = None,
+             timeout: float = 300) -> subprocess.CompletedProcess:
+    """One synchronous git call, output captured, never raising on a
+    non-zero exit."""
+    return subprocess.run(["git", *args], capture_output=True, text=True,
+                          check=False, timeout=timeout,
+                          env=None if env is None else dict(env))
+
+
+def _run_repo_of(run_dir: Path) -> Path | None:
+    """`<run_dir>/repo` when it is a bare git repository, else None (a run
+    made before per-run repositories, or one not yet started)."""
+    repo = Path(run_dir) / RUN_REPO_NAME
+    if not (repo / "HEAD").is_file():
+        return None
+    r = _git_sync(["-C", str(repo), "rev-parse", "--is-bare-repository"],
+                 timeout=30)
+    return repo if r.returncode == 0 and r.stdout.strip() == "true" else None
+
+
+def _carry_repo_config(user: Path, repo: Path) -> None:
+    """Copy the user's repository-local config into the run's repository
+    (`repo/config`), key by key, except the keys that describe the
+    repository itself and any key `git init` already wrote. Then, when the
+    user sets no hooks path anywhere, point `core.hooksPath` at the user's
+    hooks directory, so a worker's own commit runs the repository's hooks as
+    it does in the user's checkout (DESIGN §6 *Finalization*). Read with
+    leerie's hooks-off entry removed: it would otherwise be what `git
+    config core.hooksPath` answers. Mechanical: key names only."""
+    cfg = str(Path(repo) / "config")
+    env = _git_hooks_on(os.environ)
+    own = _git_sync(["config", "-f", cfg, "--list", "--name-only"])
+    already = {k.strip().lower() for k in own.stdout.splitlines() if k.strip()}
+    r = _git_sync(["-C", str(user), "config", "--local", "--list", "-z"],
+                 env=env, timeout=30)
+    if r.returncode != 0:
+        raise RunRepoError(f"git config --local --list in {user}: "
+                           f"{r.stderr.strip()[:300]}")
+    for entry in r.stdout.split("\0"):
+        if not entry:
+            continue
+        key, sep, value = entry.partition("\n")
+        low = key.lower()
+        if (low in _RUN_REPO_UNCARRIED_KEYS or low in already
+                or low.startswith(_RUN_REPO_UNCARRIED_PREFIXES)):
+            continue
+        # A key with no `=` is boolean true in git's config syntax.
+        w = _git_sync(["config", "-f", cfg, "--add", key,
+                      value if sep else "true"])
+        if w.returncode != 0:
+            raise RunRepoError(f"git config --add {key}: "
+                               f"{w.stderr.strip()[:300]}")
+    hp = _git_sync(["-C", str(user), "config", "core.hooksPath"], env=env,
+                  timeout=30)
+    if hp.returncode != 0 or not hp.stdout.strip():
+        hooks = _git_sync(["-C", str(user), "rev-parse",
+                          "--path-format=absolute", "--git-path", "hooks"],
+                         env=env, timeout=30)
+        if hooks.returncode == 0 and hooks.stdout.strip():
+            _git_sync(["config", "-f", cfg, "core.hooksPath",
+                      hooks.stdout.strip()])
+
+
+def _refresh_run_repo_base(st: "State") -> str:
+    """Fetch the user's HEAD commit, and the working branch's tip under its
+    own name, from the user's repository into the run's repository, and
+    set the run repository's detached HEAD to that commit. Called wherever
+    leerie reads the working branch's tip to (re)base something: the
+    planning worktree's reset and `setup-run.sh`'s cut (DESIGN §12 L4), so
+    the run still follows that tip, and a worker's commit onto the run
+    repository's copy is put back. Tags pointing into the fetched history
+    come along (git's tag auto-follow). Returns the HEAD commit."""
+    repo = Path(st.run_dir) / RUN_REPO_NAME
+    user = str(Path(st.repo_root).resolve())
+    refspecs = ["+HEAD:refs/leerie/user-head"]
+    ref = _working_branch_ref(user, st)
+    if ref is not None:
+        refspecs.append(f"+{ref}:{ref}")
+    # `--update-head-ok`: a worker that checked out the copy of the working
+    # branch in one of the run's worktrees must not stop the refresh.
+    f = _git_sync(["-C", str(repo), "fetch", "--quiet", "--no-write-fetch-head",
+                  "--no-recurse-submodules", "--update-head-ok", user,
+                  *refspecs])
+    if f.returncode != 0:
+        raise RunRepoError(f"fetch from {user}: {f.stderr.strip()[:300]}")
+    head = _git_sync(["-C", str(repo), "rev-parse", "--verify", "-q",
+                     "refs/leerie/user-head^{commit}"], timeout=30)
+    sha = head.stdout.strip()
+    if head.returncode != 0 or not sha:
+        raise RunRepoError("the user's HEAD did not arrive in the run's "
+                           "repository")
+    u = _git_sync(["-C", str(repo), "update-ref", "--no-deref", "HEAD", sha],
+                 timeout=30)
+    if u.returncode != 0:
+        raise RunRepoError(f"update-ref HEAD: {u.stderr.strip()[:300]}")
+    return sha
+
+
+def _run_repo_commit(st: "State", sha: str, ref: str) -> bool:
+    """True when commit `sha` is in the run's own repository, fetching it
+    by SHA from the user's repository (kept under `ref`) when it is not —
+    a commit leerie read in the user's checkout (the run's own start, a
+    sibling run's start) is measured in the run's repository. Never
+    raises."""
+    repo = str(Path(st.run_dir) / RUN_REPO_NAME)
+
+    def _has() -> bool:
+        return _git_sync(["-C", repo, "cat-file", "-e", f"{sha}^{{commit}}"],
+                        timeout=30).returncode == 0
+    try:
+        if _has():
+            return True
+        _git_sync(["-C", repo, "fetch", "--quiet", "--no-write-fetch-head",
+                  "--no-recurse-submodules",
+                  str(Path(st.repo_root).resolve()), f"+{sha}:{ref}"])
+        return _has()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _ensure_run_repo(st: "State") -> Path:
+    """Create the run's own repository once (DESIGN §6 *The run's own
+    repository*) and return it; a no-op when it exists. Built in a sibling
+    temporary directory and renamed into place, so a crash mid-way never
+    leaves a half-made repository that a later call would accept. Raises
+    RunRepoError; the callers die() — a run without I4 is never silent."""
+    repo = Path(st.run_dir) / RUN_REPO_NAME
+    if _run_repo_of(st.run_dir) is not None:
+        if st.data.get("run_repo") != RUN_REPO_NAME:
+            st.data["run_repo"] = RUN_REPO_NAME
+            st.save()
+        return repo
+    user = str(Path(st.repo_root).resolve())
+    tmp = Path(st.run_dir) / f".{RUN_REPO_NAME}.tmp-{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(repo, ignore_errors=True)
+    fmt = _git_sync(["-C", user, "rev-parse", "--show-object-format"],
+                   timeout=30)
+    if fmt.returncode != 0:
+        raise RunRepoError(f"{user} is not a git repository: "
+                           f"{fmt.stderr.strip()[:300]}")
+    init = _git_sync(["init", "--quiet", "--bare",
+                     f"--object-format={fmt.stdout.strip() or 'sha1'}",
+                     str(tmp)], timeout=60)
+    if init.returncode != 0:
+        raise RunRepoError(f"git init --bare: {init.stderr.strip()[:300]}")
+    try:
+        _carry_repo_config(Path(user), tmp)
+        os.rename(tmp, repo)
+        _refresh_run_repo_base(st)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(repo, ignore_errors=True)
+        raise
+    st.data["run_repo"] = RUN_REPO_NAME
+    st.save()
+    return repo
+
+
+async def _ensure_run_repo_or_die(st: "State") -> Path:
+    """`_ensure_run_repo` off the event loop (the first fetch copies the
+    working branch's history), dying on failure."""
+    try:
+        return await asyncio.to_thread(_ensure_run_repo, st)
+    except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
+        die(f"could not create the run's own repository under "
+            f"{Path(st.run_dir) / RUN_REPO_NAME}: {e}\n"
+            "leerie runs every worker in a repository of the run's own, "
+            "never in yours (DESIGN §6 *The run's own repository*).")
+        raise  # unreachable: die() exits
+
+
+async def _refresh_run_repo_base_or_die(st: "State", where: str) -> str:
+    try:
+        return await asyncio.to_thread(_refresh_run_repo_base, st)
+    except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
+        die(f"{where}: could not refresh the run's repository from yours: {e}")
+        raise  # unreachable: die() exits
+
+
+def _refuse_pre_run_repo_resume(st: "State") -> None:
+    """Refuse to resume a run made before per-run repositories (DESIGN §6
+    *The run's own repository*): its worktrees and branches live in the
+    user's repository. New runs record `run_repo` before `run.json` gets
+    `branch`, so only such a run has `branch` without it."""
+    if st.data.get("run_repo"):
+        return
+    sidecar = _read_run_json_sidecar(Path(st.run_dir) / "run.json") or {}
+    if not sidecar.get("branch"):
+        return
+    die(f"run {st.run_id} was started by a leerie from before per-run "
+        "repositories: its worktrees and branches are in your repository, "
+        "and this version no longer runs workers there (DESIGN §6 *The run's "
+        "own repository*). It cannot be resumed. What it integrated is on "
+        f"{sidecar.get('branch')} in your repository; ship it with "
+        f"`leerie finalize {st.run_id}`, or start the task again.")
 
 
 def _stage_worktree_extras(st: "State", worktree: str) -> None:
@@ -9800,8 +10043,10 @@ async def _ensure_planning_worktree(st: "State") -> str:
     still die() despite real spend already sunk by then; the "cheapest
     possible moment to refuse" argument applies only to the first,
     pre-phase-1 call (DESIGN §13)."""
+    await _ensure_run_repo_or_die(st)
+    await _refresh_run_repo_base_or_die(st, "planning worktree")
     proc = await _run_script("planning-worktree.sh", st.run_id,
-                             *_working_branch_arg(st))
+                             *_working_branch_arg(st), st=st)
     if proc.returncode != 0:
         die("could not create the judgment-worker worktree "
             f"(planning-worktree.sh exited {proc.returncode}).\n"
@@ -16861,7 +17106,8 @@ def run_rebaser(
     the `python3 -` heredoc pattern used by `./leerie config --recapture`
     (leerie:1121-1163) — see that call site for the exact bash side.
 
-    `worktree` is a disposable `git worktree add` copy of `run_branch`,
+    `worktree` is a worktree of the rebaser's own repository (DESIGN §6
+    *The run's own repository*) checked out on `run_branch`,
     created by the caller (`host-finalize.sh`) BEFORE this runs and removed
     by the caller AFTER — this function only operates inside it via the
     `rebaser` worker's own `cwd`.
@@ -16944,6 +17190,23 @@ def run_rebaser(
             "confidence": {"resolution": 0.0},
         }
     pre_rebase_sha = pre_rebase_sha_r.stdout.strip()
+
+    # The rebaser's own repository (`host-finalize.sh`'s
+    # `_host_finalize_rebase_repo`, DESIGN §6 *The run's own repository*)
+    # takes the user's repository-local config — its `origin`, which the
+    # rebaser fetches, and the hooks its commits run. Never written into the
+    # user's own repository: skipped when the worktree belongs to it.
+    def _common(path: str | Path) -> str:
+        r = _git_sync(["-C", str(path), "rev-parse", "--path-format=absolute",
+                       "--git-common-dir"], timeout=30)
+        return os.path.realpath(r.stdout.strip()) if r.returncode == 0 else ""
+    own_common, user_common = _common(worktree), _common(repo_root)
+    if own_common and user_common and own_common != user_common:
+        try:
+            _carry_repo_config(Path(repo_root), Path(own_common))
+        except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
+            log(f"rebaser: the user's repository config was not carried "
+                f"({e}); the rebase runs without it")
 
     sys_prompt = _load_prompt("rebaser")
     user_prompt = (
@@ -25162,9 +25425,11 @@ async def _replay_capture(record: dict, *,
 
     `cwd` is the repository the replayed call reads, default the current
     working directory (the user's checkout). The call never runs there: it
-    runs, non-autonomous with read-only tools, in a disposable detached
-    checkout of that repository's HEAD (`_judge_checkout`), removed
-    afterwards (DESIGN §8 *A worker that does not commit never runs in a
+    runs, non-autonomous with read-only tools, in a ref-less clone of that
+    repository's HEAD (`_ref_less_clone`) in the replay's temporary
+    directory, removed afterwards — never a linked worktree, whose refs,
+    stash and config are the repository's (DESIGN §6 *The run's own
+    repository*) (DESIGN §8 *A worker that does not commit never runs in a
     tree leerie measures*). Raises WorkerError when no checkout can be made
     (a `cwd` that is no git repository).
 
@@ -25211,22 +25476,34 @@ async def _replay_capture(record: dict, *,
         # would have to guess. Falling through to claude_p's None
         # default keeps replays shaped like every other
         # "no-effort-pinned" call.
-        async with _judge_checkout(replay_st, _replay_root,
-                                   "replay") as checkout:
-            structured = await claude_p(
-                user_prompt=user_prompt,
-                system_prompt=system_prompt,
-                schema_key=call_type,
-                cwd=str(checkout),
-                allowed_tools=INSPECT_TOOLS,
-                max_turns=40,
-                autonomous=False,
-                caps=caps,
-                st=replay_st,
-                model=model,
-                sid=f"replay-{call_type}",
-                _suppress_capture=True,
-            )
+        # A ref-less clone of that repository's HEAD, never a worktree of
+        # it: a linked worktree would share its refs, stash, config and
+        # hooks with the replayed worker (DESIGN §6 *The run's own
+        # repository*).
+        checkout = tmp_run_dir / "replay-checkout"
+        head = subprocess.run(["git", "-C", str(_replay_root), "rev-parse",
+                               "--verify", "-q", "HEAD^{commit}"],
+                              capture_output=True, text=True, check=False)
+        why = (_ref_less_clone(_replay_root, checkout, head.stdout.strip())
+               if head.returncode == 0 and head.stdout.strip()
+               else "no HEAD commit")
+        if why:
+            raise WorkerError(f"replay: no checkout of {_replay_root} could "
+                              f"be made ({why})")
+        structured = await claude_p(
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            schema_key=call_type,
+            cwd=str(checkout),
+            allowed_tools=INSPECT_TOOLS,
+            max_turns=40,
+            autonomous=False,
+            caps=caps,
+            st=replay_st,
+            model=model,
+            sid=f"replay-{call_type}",
+            _suppress_capture=True,
+        )
     envelope = replay_st.last_envelope
     return (envelope, structured)
 
@@ -25372,6 +25649,14 @@ class State:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._lock_fd: int | None = None
         self._acquire_lock()
+
+    @property
+    def run_repo(self) -> Path:
+        """The run's own repository, `<run-dir>/repo` (DESIGN §6 *The run's
+        own repository*): every worktree and branch of the run lives there,
+        never in `repo_root`, the user's checkout. Made by
+        `_ensure_run_repo` at run start."""
+        return _run_repo(self)
 
     def _acquire_lock(self) -> None:
         """Open run_dir for flock and acquire EX|NB. Raises
@@ -34507,18 +34792,29 @@ def _delivery_latest_verdict(delivery: object
 
 def _shipping_tree(st: "State") -> str:
     """The tree the run ships: the run branch's,
-    `refs/heads/leerie/runs/<id>^{tree}` in the repository — the ref
-    finalize pushes, which outlives staging (review round 15 H1: read from
-    staging's HEAD, it was "" once finalize's `cleanup.sh` had removed
-    staging). Every delivery pass stamps its verdict with it and the outcome
-    compares against it. "" when the ref cannot be read."""
-    if not getattr(st, "repo_root", None):
+    `refs/heads/leerie/runs/<id>^{tree}` in the run's own repository
+    (DESIGN §6 *The run's own repository*) — the ref the user receives,
+    which outlives staging (review round 15 H1: read from staging's HEAD, it
+    was "" once finalize's `cleanup.sh` had removed staging). Every delivery
+    pass stamps its verdict with it and the outcome compares against it. ""
+    when the ref cannot be read."""
+    if not getattr(st, "run_dir", None):
         return ""
     ref = f"refs/heads/{_compute_run_branch(st.run_id)}^{{tree}}"
-    r = subprocess.run(["git", "-C", str(st.repo_root), "rev-parse",
+    r = subprocess.run(["git", "-C", str(Path(st.run_dir) / RUN_REPO_NAME),
+                        "rev-parse",
                         "--verify", "-q", ref],
                        capture_output=True, text=True, check=False)
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _diff_base(st: "State") -> str | None:
+    """The commit the run branch was cut from (`base_sha`, recorded by
+    `phase_execute`): every comparison leerie makes against the base reads
+    it, never the working branch's name, which in the run's repository is a
+    ref a worker can move (DESIGN §6 *The run's own repository*). None
+    before the cut."""
+    return st.data.get("base_sha") or None
 
 
 def _decide_outcome(st: State, *, any_commits: bool) -> str:
@@ -34692,7 +34988,8 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
     _wt = st.data.get("planning_worktree")
     if _wt and os.path.isdir(_wt):
         try:
-            subprocess.run(["git", "worktree", "remove", "--force", str(_wt)],
+            subprocess.run(["git", "-C", str(_run_repo(st)), "worktree",
+                            "remove", "--force", str(_wt)],
                            capture_output=True, check=False, timeout=120)
             if os.path.isdir(_wt):
                 shutil.rmtree(_wt, ignore_errors=True)
@@ -35556,7 +35853,7 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     cap: context-exhaustion handoffs and DESIGN §11 mid-execution
     clarifications."""
     sys_prompt = _load_prompt("implementer")
-    proc = await _run_script("new-worktree.sh", sid, st.run_id)
+    proc = await _run_script("new-worktree.sh", sid, st.run_id, st=st)
     if proc.returncode != 0:
         raise WorktreeSetupError(
             f"worktree creation failed for {sid}: {proc.stderr.strip()}")
@@ -37338,11 +37635,11 @@ async def _fork_point(st: "State", sid: str) -> str:
     subtask branch does not exist yet; "" when neither reads."""
     run = _compute_run_branch(st.run_id)
     sub = _compute_subtask_branch(st.run_id, sid)
-    if not await _ref_sha(st.repo_root, sub):
-        return await _ref_sha(st.repo_root, run)
+    if not await _ref_sha(_run_repo(st), sub):
+        return await _ref_sha(_run_repo(st), run)
     try:
         r = await run_proc(["git", "merge-base", f"refs/heads/{sub}",
-                            f"refs/heads/{run}"], cwd=str(st.repo_root))
+                            f"refs/heads/{run}"], cwd=str(_run_repo(st)))
     except OSError:
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""
@@ -39914,7 +40211,9 @@ async def _scoped_test_replacement(tree: str, st: "State", canonical: str,
     head = await _branch_head_sha(tree)
     changed = await _changed_files(tree, base)
     globs = resolve_test_file_globs(st.repo_root)
-    coupled = (_coupled_test_files(st.repo_root, head, changed, globs)
+    # Read at `head` in the tree's own repository — the run's (DESIGN §6
+    # *The run's own repository*), never the user's.
+    coupled = (_coupled_test_files(tree, head, changed, globs)
                if head else {})
     tests = [t for t in coupled if (Path(tree) / t).is_file()]
     if not tests:
@@ -40803,7 +41102,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                 or {}).get("sha") or ""
     if not base_sha:
         base_sha = await _merge_base_sha(
-            staging, st.data.get("working_branch") or "",
+            staging, _diff_base(st) or "",
             await _branch_head_sha(staging))
     disc = await _intermittent_discovery(st, caps, staging, cmd, base_sha,
                                          log_path=log_path, label=label)
@@ -40842,7 +41141,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     wt = _helper_worktree_path(st, "confirm-base")
 
     def _teardown() -> None:
-        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+        subprocess.run(["git", "-C", str(_run_repo(st)), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
         shutil.rmtree(wt, ignore_errors=True)
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
@@ -41034,7 +41333,7 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
         head = await _branch_head_sha(staging)
         changed = await _changed_files(staging, base_sha)
         globs = resolve_test_file_globs(st.repo_root)
-        coupled = (_coupled_test_files(st.repo_root, head, changed, globs,
+        coupled = (_coupled_test_files(staging, head, changed, globs,
                                        direct=True) if head else {})
         files = [t for t in coupled if (Path(staging) / t).is_file()]
         out["coupled"] = {t: coupled[t] for t in files}
@@ -41890,7 +42189,7 @@ def _ci_db_session(st: "State", recs: list[dict]
 
 
 def _ci_teardown(st: "State", wt: Path) -> None:
-    subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+    subprocess.run(["git", "-C", str(_run_repo(st)), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
     shutil.rmtree(wt, ignore_errors=True)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
@@ -44937,11 +45236,9 @@ def _acceptance_report_base(st: "State") -> str | None:
         if head and (best is None or started < best[0]):
             best = (started, head)
     if best is not None:
-        ok = subprocess.run(
-            ["git", "-C", str(st.repo_root), "cat-file", "-e",
-             f"{best[1]}^{{commit}}"],
-            capture_output=True, check=False).returncode == 0
-        if ok:
+        # A sibling's start is a commit of the user's repository; it is
+        # measured in the run's own (DESIGN §6 *The run's own repository*).
+        if _run_repo_commit(st, best[1], "refs/leerie/report-base"):
             return best[1]
     return own
 
@@ -46508,7 +46805,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         ]
         db_ctx = None
         if db_url:
-            db_ctx = _prisma_db_context(st.repo_root, base)
+            db_ctx = _prisma_db_context(_run_repo(st), base)
             lines += ["", _prisma_real_db_section(
                 db_ctx, resolve_test_files_scoped(st.repo_root) or "")]
         user = "\n".join(lines)
@@ -46539,7 +46836,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 sid=sid + suffix, **kw)
         res = await _call(user)
         if db_ctx is not None:
-            hits = _prisma_mock_hits(st.repo_root, base, wt,
+            hits = _prisma_mock_hits(_run_repo(st), base, wt,
                                      _acceptance_new_files(wt, pre_untracked,
                                                            refs),
                                      db_ctx["client"])
@@ -46800,13 +47097,11 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     return out
 
 
-def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
-    """Create the writer's checkout of `base` at `wt` — "clone", "worktree",
-    or "failed: <why>". A clone sharing the repo's objects with every ref
-    deleted, so the only commit the writer can reach is the own start and its
-    history: no branch, tag or earlier run's branch (DESIGN §8 *The validity
-    tree is the run's own start*). Mechanical git plumbing; fails open to a
-    detached worktree (today's checkout, every ref visible), logged."""
+def _ref_less_clone(src: Path, wt: Path, rev: str) -> str:
+    """A checkout of `rev` at `wt` in a clone sharing `src`'s objects with
+    every ref and the remote deleted, so the only commits reachable are
+    `rev` and its history. "" on success, else why not (`wt` is then
+    removed). Mechanical git plumbing."""
     def _git(*args: str, cwd: Path | None = None
              ) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -46814,10 +47109,10 @@ def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
             capture_output=True, text=True, check=False)
 
     clone = _git("clone", "--quiet", "--shared", "--no-checkout",
-                 "--no-tags", str(st.repo_root), str(wt))
+                 "--no-tags", str(src), str(wt))
     ok = clone.returncode == 0
     if ok:
-        ok = _git("checkout", "--quiet", "--detach", base,
+        ok = _git("checkout", "--quiet", "--detach", rev,
                   cwd=wt).returncode == 0
     if ok:
         refs = _git("for-each-ref", "--format=%(refname)", cwd=wt)
@@ -46831,11 +47126,27 @@ def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
         left = _git("for-each-ref", "--format=%(refname)", cwd=wt)
         ok = ok and left.returncode == 0 and not left.stdout.strip()
     if ok:
-        return "clone"
-    why = (clone.stderr.strip() or "a ref could not be removed")[:200]
-    log(f"  acceptance: no ref-less writer clone ({why}) — using a "
-        "detached worktree, where every ref is visible")
+        return ""
     shutil.rmtree(wt, ignore_errors=True)
+    return (clone.stderr.strip() or "a ref could not be removed")[:200]
+
+
+def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
+    """Create the writer's checkout of `base` at `wt` — "clone", "worktree",
+    or "failed: <why>". A ref-less clone of the run's own repository
+    (`_ref_less_clone`), so the only commit the writer can reach is the own
+    start and its history: no branch, tag or earlier run's branch (DESIGN §8
+    *The validity tree is the run's own start*). Fails open to a detached
+    worktree of the run's repository (its refs visible), logged."""
+    # The own start was read in the user's checkout; the run's repository
+    # (DESIGN §6 *The run's own repository*) fetches it if it lacks it.
+    _run_repo_commit(st, base, "refs/leerie/own-start")
+    why = _ref_less_clone(_run_repo(st), wt, base)
+    if not why:
+        return "clone"
+    log(f"  acceptance: no ref-less writer clone ({why}) — using a "
+        "detached worktree of the run's repository, where its refs are "
+        "visible")
     add = _worktree_add_detached(st, wt, base)
     if add.returncode != 0:
         return f"failed: worktree add failed: {add.stderr.strip()[:200]}"
@@ -46844,7 +47155,7 @@ def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
 
 def _remove_acceptance_checkout(st: "State", wt: Path) -> None:
     """Remove a writer checkout, whichever kind it is."""
-    subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+    subprocess.run(["git", "-C", str(_run_repo(st)), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
     shutil.rmtree(wt, ignore_errors=True)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
@@ -46928,7 +47239,7 @@ async def _record_report_reproduced(st: "State", caps: dict,
         return
     try:
         res = await _evaluate_acceptance_sets(
-            st, caps, str(st.repo_root), sets, "report-base",
+            st, caps, str(_run_repo(st)), sets, "report-base",
             rev=report_base, confirm=False)
     except Exception as e:
         log(f"  acceptance: report_reproduced not measured "
@@ -46985,7 +47296,7 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
     wt = _helper_worktree_path(st, "acceptance-eval")
 
     def _teardown() -> None:
-        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+        subprocess.run(["git", "-C", str(_run_repo(st)), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
         shutil.rmtree(wt, ignore_errors=True)
         # A later evaluation recreates the same path: its install memo must
@@ -48174,8 +48485,8 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
                 shutil.copy2(f, dst)
                 refs_copied.append(dst)
             refs.append(rel)
-        g = _js_source_graph(st.repo_root, harness_rev)
-        harness = _repo_test_harness(st.repo_root, harness_rev,
+        g = _js_source_graph(_run_repo(st), harness_rev)
+        harness = _repo_test_harness(_run_repo(st), harness_rev,
                                      _set_production_imports(g, set_))
         shape = (st.data.get("defect_scope") or {}).get("defect_shape")
         user = "\n\n".join([
@@ -48275,7 +48586,7 @@ async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
 
     def _teardown() -> None:
-        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+        subprocess.run(["git", "-C", str(_run_repo(st)), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
         shutil.rmtree(wt, ignore_errors=True)
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
@@ -48492,7 +48803,7 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
             s_ = by_index[idx]
             audit = audits[idx]
             triggers: list[dict] = []
-            mech = (_acceptance_mechanical_findings(st.repo_root, own, s_)
+            mech = (_acceptance_mechanical_findings(_run_repo(st), own, s_)
                     if own else [])
             if mech:
                 triggers.append({"kind": "mechanical", "findings": mech})
@@ -48931,8 +49242,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 "Your current working directory IS the integrated staging "
                 "worktree. Make and commit any fixes here. Every commit "
                 "subject must start with `conformer:`.",
-                f"DIFF_BASE: {st.data.get('working_branch')} (compare with "
-                f"`git diff {st.data.get('working_branch')}..HEAD`)",
+                f"DIFF_BASE: {_diff_base(st)} (compare with "
+                f"`git diff {_diff_base(st)}..HEAD`)",
                 _format_acceptance_task_section(
                     st.data.get("task", ""),
                     st.data.get("required_items") or []),
@@ -49839,7 +50150,7 @@ def _warn_site_token_leaks(st: "State", leerie_dir: Path) -> list[dict]:
     hit alone."""
     ds = st.data.get("defect_scope")
     tokens = _site_tokens_from_scope(ds)
-    base = st.data.get("working_branch")
+    base = _diff_base(st)
     staging = leerie_dir / "worktrees" / "staging"
     if not tokens or not base or not staging.is_dir():
         return []
@@ -49955,8 +50266,8 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
     # Sits ABOVE the resume early-returns — a resume that recorded
     # unmet_before and then lost working_branch must not hand the
     # caller a truthy list that triggers the recheck (round 2).
-    if not st.data.get("working_branch"):
-        log("phase 5: delivery gate skipped — working_branch not in "
+    if not _diff_base(st):
+        log("phase 5: delivery gate skipped — base_sha not in "
             "state (the final-conformer pass it routes into would skip "
             "for the same reason)")
         return []
@@ -50074,8 +50385,8 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
     # Own copy of the working_branch guard (round 2): this function
     # consults gate state directly, so it must not rely on the prejudge
     # having filtered the resume path in the same invocation.
-    if not st.data.get("working_branch"):
-        log("  delivery gate recheck skipped — working_branch not in "
+    if not _diff_base(st):
+        log("  delivery gate recheck skipped — base_sha not in "
             "state (no final-conformer pass ran to re-verify against)")
         return
     items = st.data.get("required_items") or []
@@ -50663,7 +50974,7 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
                          efforts: dict[str, str | None]) -> dict | None:
     """One advisory review of the whole PR (DESIGN §9 *An advisory whole-PR
     review feeds the final conformer*): the pr_reviewer reads the task, its
-    reports, the required items and the full diff from `working_branch`,
+    reports, the required items and the full diff from `base_sha`,
     and may run the repo's build verbs to confirm a suspicion — in its own
     checkout of staging's HEAD with staging's ignored paths shared
     (`_judge_checkout(share_ignored=True)`), never in staging: it does not
@@ -50680,7 +50991,7 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
         return st.data["pr_review"]
     if (st.data.get("conformance") or {}).get("_final") is not None:
         return None
-    base = st.data.get("working_branch")
+    base = _diff_base(st)
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     if not base or not staging.is_dir():
         return None
@@ -51287,7 +51598,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         aq = _scope_norm(str(res.get("assertion_quote") or ""))
         g["assertion_in_case"] = len(aq) >= 6 and aq in reach
         cp = await asyncio.to_thread(_falsifier_coupling, facts, rel,
-                                     st.repo_root, sha, item_text)
+                                     _run_repo(st), sha, item_text)
         out["coupling"] = cp
         g["not_coupled"] = cp.get("coupled") is False
     finally:
@@ -51409,7 +51720,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         stat = ""
         if own:
             stat = subprocess.run(
-                ["git", "-C", str(st.repo_root), "diff", "--stat=160",
+                ["git", "-C", str(_run_repo(st)), "diff", "--stat=160",
                  f"{own}..{sha}"], capture_output=True, text=True,
                 check=False).stdout
         confirm_lock = asyncio.Lock()
@@ -51534,7 +51845,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     if st.data.get("skip_coverage_check"):
         return
     items = st.data.get("required_items") or []
-    if not items or not st.data.get("working_branch"):
+    if not items or not _diff_base(st):
         return
     gate = dict(st.data.get("delivery_gate") or {})
     staging = (leerie_dir / "worktrees" / "staging").resolve()
@@ -51785,7 +52096,6 @@ _REDRIVE_TEST_RE = re.compile(
 # Production files gates (c) and (d) read: JS/TS, as benched.
 _REDRIVE_PROD_RE = re.compile(r"\.(ts|tsx|js|mjs|cjs)$")
 _REDRIVE_LOG = "delivery-redrive.log"
-_REDRIVE_EXCLUDE_TAG = "# leerie delivery re-drive staged set"
 # What a note shows of an item's evidence and a set file's case names.
 _REDRIVE_EVIDENCE_MAX = 1200
 _REDRIVE_CASES_MAX = 12
@@ -52093,41 +52403,6 @@ def _redrive_verdict(F: dict, F1: dict, new_ids: list[str], *,
             "held_broke": hbroke, "held_broke_cases": hbroke_cases,
             "worse": worse, "trade": trade,
             "pairs": [list(p) for p in pairs]}
-
-
-def _redrive_exclude_path(staging: Path) -> Path | None:
-    r = subprocess.run(["git", "-C", str(staging), "rev-parse", "--git-path",
-                        "info/exclude"], capture_output=True, text=True,
-                       check=False)
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
-    ex = Path(r.stdout.strip())
-    return ex if ex.is_absolute() else staging / ex
-
-
-def _redrive_exclude_clear(staging: Path, run_id: str) -> None:
-    """Remove a marked block an earlier leerie wrote into the shared
-    `info/exclude` (it now ignores per checkout, `_checkout_ignore`): only
-    a resumed run that crashed mid-group under that version has one."""
-    ex = _redrive_exclude_path(staging)
-    if ex is None or not ex.is_file():
-        return
-    begin, end = (f"{_REDRIVE_EXCLUDE_TAG} {run_id} begin",
-                  f"{_REDRIVE_EXCLUDE_TAG} {run_id} end")
-    text = ex.read_text()
-    if begin not in text.splitlines():
-        return          # never rewrite the user's file when nothing is ours
-    out, skip = [], False
-    for line in text.splitlines():
-        if line == begin:
-            skip = True
-            continue
-        if line == end:
-            skip = False
-            continue
-        if not skip:
-            out.append(line)
-    ex.write_text("\n".join(out) + ("\n" if out else ""))
 
 
 # A shown set file is fingerprinted by its spans of this many consecutive
@@ -52712,7 +52987,7 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     wt = _helper_worktree_path(st, "redrive-base")
 
     def _teardown() -> None:
-        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+        subprocess.run(["git", "-C", str(_run_repo(st)), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
         shutil.rmtree(wt, ignore_errors=True)
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
@@ -54274,7 +54549,6 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     if not staging.is_dir():
         return
-    run_id = str(st.run_id)
 
     def _save() -> None:
         st.data["delivery_redrive"] = rec
@@ -54285,7 +54559,6 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         # A crash mid-group: what it left is unknown, so it is undone; its
         # self-check directory (never in staging) goes too.
         _rmtree_owned(st.run_dir / "selfcheck")
-        _redrive_exclude_clear(staging, run_id)
         if flight.get("pre_sha"):
             ok = await _restore_tree(staging, flight["pre_sha"],
                                      where="re-drive rollback",
@@ -54419,7 +54692,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                        DEFAULT_CAPS["subtask_redrive_rounds"]))
     budget = float(caps.get("redrive_budget_sec",
                             DEFAULT_CAPS["redrive_budget_sec"]))
-    graph = _js_source_graph(st.repo_root, head) if sets else {}
+    graph = _js_source_graph(_run_repo(st), head) if sets else {}
     shape = (st.data.get("defect_scope") or {}).get("defect_shape") or ""
     ast_ok = _redrive_ast_available(staging)
     trade_pairs = {tuple(p) for p in rec["trade_pairs"]}
@@ -54892,7 +55165,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     Runs once after every wave has integrated, before phase_finalize.
     Same conformer worker, same prompt, same `conformance_rounds` cap,
     same protected-path rollback as the per-subtask phase — the only
-    differences are cwd (staging worktree), DIFF_BASE (working_branch
+    differences are cwd (staging worktree), DIFF_BASE (`base_sha`
     rather than the run branch), and the absence of a subtask spec /
     criteria file. Advisory: any failure mode (missing staging
     worktree, WorkerError, malformed result, exhausted rounds) is
@@ -54902,9 +55175,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     if not staging.is_dir():
         log("phase 5: final conformance skipped — staging worktree absent")
         return
-    working_branch = st.data.get("working_branch")
+    # The commit the run branch was cut from, not the working branch's
+    # name: in the run's own repository that name is a ref a worker can move
+    # (DESIGN §6 *The run's own repository*).
+    working_branch = _diff_base(st)
     if not working_branch:
-        log("phase 5: final conformance skipped — working_branch not in state")
+        log("phase 5: final conformance skipped — base_sha not in state")
         return
     # Resume idempotence: phase_execute is gated on `completed_waves`
     # but the final pass leaves no per-round sentinel of its own. On
@@ -55517,7 +55793,7 @@ async def _undo_interrupted_redrives(st: "State", leerie_dir: Path,
         elif pre and st.repo_root:
             ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
             ok = (await run_proc(["git", "update-ref", ref, pre],
-                                 cwd=str(st.repo_root))).returncode == 0
+                                 cwd=str(_run_repo(st)))).returncode == 0
         statuses = st.data.setdefault("subtask_status", {})
         if ok and m.get("status"):
             statuses[sid] = m["status"]
@@ -57758,7 +58034,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 # through to the implementer rather than settling: a settle we
                 # cannot make integrable is strictly worse than the spend.
                 if await _create_empty_subtask_branch(
-                        str(st.repo_root), st.run_id, sid):
+                        str(_run_repo(st)), st.run_id, sid):
                     log(f"  {sid}: flagged at plan time as provider-subset, and "
                         "its success criteria are already met on the run "
                         "branch — settling complete without spawning an "
@@ -57931,7 +58207,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             sub = _compute_subtask_branch(st.run_id, sid)
             if await _tree_dirt(worktree, branch=sub) != []:
                 await _restore_tree(
-                    worktree, await _ref_sha(st.repo_root, sub),
+                    worktree, await _ref_sha(_run_repo(st), sub),
                     where=f"{sid} reaped implementer's debris", branch=sub)
         elif status in ("complete", "blocked", "failed"):
             unclean = await _implementer_gate(str(status))
@@ -58708,7 +58984,7 @@ async def _integration_tree(st: "State", sid: str, name: str, rev: str,
 
 
 def _integration_tree_remove(st: "State", wt: Path) -> None:
-    subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+    subprocess.run(["git", "-C", str(_run_repo(st)), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
     shutil.rmtree(wt, ignore_errors=True)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
@@ -58977,7 +59253,7 @@ async def _record_settled_head(st: "State", leerie_dir: Path,
     clean*), so the work is on it; a repair that moved the branch to a
     worker's detached HEAD here was superseded by that gate (review round 15
     H2). None when the branch does not exist."""
-    tip = await _ref_sha(st.repo_root, _compute_subtask_branch(st.run_id,
+    tip = await _ref_sha(_run_repo(st), _compute_subtask_branch(st.run_id,
                                                                 sid))
     if not tip:
         return None
@@ -59837,7 +60113,7 @@ async def _integrate_merge(staging: Path, st: "State",
     and regenerates afresh."""
     async with _leaves_tree_as_found(staging, f"merge of {sid}",
                                      "integrate", tracked=False) as rec:
-        proc = await _run_script("integrate.sh", sid, st.run_id)
+        proc = await _run_script("integrate.sh", sid, st.run_id, st=st)
     if rec["removed"]:
         _DEPS_INSTALLED.discard(os.path.realpath(staging))
         _DEPS_FAILED.pop(os.path.realpath(staging), None)
@@ -60253,11 +60529,26 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     log("phase 4: creating run-branch worktree")
     st.data["current_phase"] = "phase 4-5: implementing"
     st.save()
+    await _ensure_run_repo_or_die(st)
+    await _refresh_run_repo_base_or_die(st, "phase 4")
     proc = await _run_script("setup-run.sh", st.run_id,
-                             *_working_branch_arg(st))
+                             *_working_branch_arg(st), st=st)
     if proc.returncode != 0:
         die(f"run setup failed: {proc.stderr.strip()}")
     _log_working_branch_fallback(proc, "phase 4")
+    # The commit the run branch was cut from (DESIGN §6 *The run's own
+    # repository*): leerie's own comparisons against the base read this,
+    # never a branch name a worker can move. Recorded once, at the cut —
+    # nothing is integrated before this save.
+    if not st.data.get("base_sha"):
+        cut = await run_proc(["git", "rev-parse", "--verify", "-q",
+                              f"refs/heads/{_compute_run_branch(st.run_id)}"
+                              "^{commit}"], cwd=str(_run_repo(st)))
+        if cut.returncode != 0 or not cut.stdout.strip():
+            die("phase 4: the run branch is missing from the run's "
+                f"repository after setup-run.sh: {cut.stderr.strip()}")
+        st.data["base_sha"] = cut.stdout.strip()
+        st.save()
 
     # On Fly, machine stop SIGKILLs the orchestrator (PID 1 is sleep
     # infinity; SIGTERM reaps it, kernel SIGKILLs children) — the
@@ -60974,7 +61265,9 @@ async def _compose_pr_via_llm(st: "State",
         # 2. Collect git context. Commits are the spine; diff is sampled.
         working_branch = st.data.get("working_branch") or "HEAD"
         run_branch = _compute_run_branch(st.run_id)
-        rev_range = f"{working_branch}..{run_branch}"
+        # The range is read in the run's own repository, from the commit the
+        # run branch was cut from (DESIGN §6 *The run's own repository*).
+        rev_range = f"{_diff_base(st) or 'HEAD'}..{run_branch}"
 
         async def _git(args: list[str]) -> str:
             # start_new_session=True per DESIGN §6 "Worker subtree
@@ -60983,7 +61276,7 @@ async def _compose_pr_via_llm(st: "State",
             # signalling the orchestrator's own group. Static-enforced
             # by tests/test_signal_cleanup.py.
             proc = await asyncio.create_subprocess_exec(
-                "git", "-C", str(repo_root), *args,
+                "git", "-C", str(_run_repo(st)), *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -61205,18 +61498,17 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # rejected — it identifies neither run, because `05f65221` recorded no
     # `dropped_subtasks` at all (its subtasks completed on a prior attempt).
     working_branch = st.data.get("working_branch")
-    if working_branch:
-        # `st.repo_root`, NOT `leerie_dir`: the latter is the STATE root,
-        # which under `LEERIE_STATE_DIR` (and the `$HOME/.leerie/<basename>/`
-        # default) is not a git repo at all. Running the count there fails,
-        # the `returncode == 0` guard below fails open, and the check silently
-        # never fires — except when the state root happens to sit inside the
-        # repo, which would make the behavior depend on where state lives.
-        # `_run_script` reaches the same repo via `os.getcwd()`.
+    base = _diff_base(st)
+    if base:
+        # In the run's own repository, from the commit the run branch was
+        # cut from (DESIGN §6 *The run's own repository*) — not
+        # `leerie_dir`, the STATE root, which is no git repository: the
+        # count would fail there, the `returncode == 0` guard below would
+        # fail open, and the check would silently never fire.
         ahead = await run_proc(
             ["git", "rev-list", "--count",
-             f"{working_branch}..{_compute_run_branch(st.run_id)}"],
-            cwd=str(st.repo_root))
+             f"{base}..{_compute_run_branch(st.run_id)}"],
+            cwd=str(_run_repo(st)))
         if ahead.returncode == 0 and ahead.stdout.strip() == "0":
             # Clean up BEFORE recording the terminal state, exactly as the
             # normal finalize path below does. `_finish_no_work_run`'s own
@@ -61230,15 +61522,13 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             # REGRESSION against the old behavior, where the `die()` this
             # replaces at least reached `_cleanup_on_abnormal_exit`.
             #
-            # `--subtask-branches` (not `--branches`) mirrors the successful
-            # path: the empty run branch is kept and reaped by `leerie prune`
-            # like any other, rather than inventing a second disposal rule.
-            # Best-effort: a hung cleanup.sh must not block the no-work
-            # terminal state from being recorded (same swallow-and-continue
-            # pattern as `_record_run_health` below).
+            # Worktrees only, as on the successful path: every branch of the
+            # run lives in its own repository and goes with it (DESIGN §6
+            # *The run's own repository*). Best-effort: a hung cleanup.sh
+            # must not block the no-work terminal state from being recorded
+            # (same swallow-and-continue pattern as `_record_run_health`).
             try:
-                await _run_script("cleanup.sh", "--run-id", st.run_id,
-                                  "--subtask-branches")
+                await _run_script("cleanup.sh", "--run-id", st.run_id, st=st)
             except subprocess.TimeoutExpired as _cleanup_exc:
                 log(f"cleanup: cleanup.sh timed out ({_cleanup_exc}); "
                     "continuing")
@@ -61246,14 +61536,15 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
                 st,
                 {"<finalize>": (
                     f"every subtask completed, but the run branch carries no "
-                    f"commits beyond {working_branch} — the deliverables were "
+                    f"commits beyond {working_branch or base} — the deliverables were "
                     "already present on the base tree or landed by an earlier "
                     "attempt")},
                 headline=("phase 6: run branch is empty — nothing to push; "
                           "recording the no-work terminal state"),
                 reset_plan_state=False)
             return
-    proc = await _run_script("finalize.sh", st.run_id)
+    proc = await _run_script("finalize.sh", st.run_id,
+                             *([base] if base else []), st=st)
     if proc.returncode != 0:
         die(f"finalize failed (run branch is intact): {proc.stderr.strip()}")
     # Stamp the finalize phase ONLY after finalize.sh confirms the run
@@ -61273,22 +61564,13 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # Best-effort: a hung cleanup.sh must not crash a finalize that already
     # confirmed the run branch is non-empty and pushable (same
     # swallow-and-continue pattern as `_record_run_health` below).
+    # Worktrees only: cleanup deletes no branch — the subtask branches stay
+    # in the run's own repository and go with it (DESIGN §6 *The run's own
+    # repository*), so nothing here can take the run branch with it.
     try:
-        await _run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")
+        await _run_script("cleanup.sh", "--run-id", st.run_id, st=st)
     except subprocess.TimeoutExpired as _cleanup_exc:
         log(f"cleanup: cleanup.sh timed out ({_cleanup_exc}); continuing")
-    # Post-cleanup verification: the run branch must survive cleanup.
-    # finalize.sh verified it existed moments ago; if it's gone after
-    # cleanup.sh, something deleted it (a concurrent process, a git
-    # corruption, or a cleanup.sh bug). die() here routes to the pause
-    # branch via decide_teardown, preserving the machine for recovery.
-    branch_ref = f"refs/heads/leerie/runs/{st.run_id}"
-    verify = await run_proc(
-        ["git", "show-ref", "--verify", "--quiet", branch_ref])
-    if verify.returncode != 0:
-        die(f"CRITICAL: run branch leerie/runs/{st.run_id} disappeared "
-            f"after cleanup — branch existed before cleanup (finalize.sh "
-            f"passed) but is gone after")
 
     wc = st.data.get("worker_count", 0)
     nsub = len(st.data.get("subtask_status", {}))
@@ -61629,6 +61911,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 f"{st.data.get('finished_at', '<unknown>')} — nothing to "
                 "resume")
             return
+        # A run made before per-run repositories cannot be resumed (DESIGN
+        # §6 *The run's own repository*). After the two completed-run
+        # returns above, so `resume` of such a finished run still says
+        # "nothing to resume" rather than refusing.
+        _refuse_pre_run_repo_resume(st)
         # Resumable-planning re-entry (DESIGN §6 "Resumable planning — a
         # per-phase checkpoint cursor, not a `waves` gate"). `waves` absent
         # no longer means "cannot resume" — the shared pipeline below
@@ -61873,6 +62160,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # cursor, not a `waves` gate"), so a fresh run (nothing persisted)
     # executes every step exactly as before, and a resumed run skips
     # whatever a prior invocation already completed and checkpointed.
+    # The run's own repository (DESIGN §6 *The run's own repository*),
+    # before any tree a worker gets: every one hangs off it. Idempotent, so
+    # a resume re-establishes it at whichever phase it re-enters.
+    await _ensure_run_repo_or_die(st)
     if "waves" not in st.data:
         # DESIGN §12 *Judgment-worker isolation*. Deliberately here — inside
         # the `waves` guard (a run resumed into execution spawns no judgment

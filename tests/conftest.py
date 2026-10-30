@@ -365,6 +365,103 @@ def _no_real_planning_worktree(request, monkeypatch):
     monkeypatch.setattr(leerie, "_ensure_planning_worktree", _stub)
 
 
+def relocate_into_run_repo(leerie, st) -> Path:
+    """Turn a hand-built pre-change layout into the run's own repository
+    (DESIGN §6 *The run's own repository*): for a test that committed the
+    run's branches in its "user" repository (`st.repo_root`) and checked
+    staging out there, make `<run-dir>/repo` (`_ensure_run_repo`), move
+    every `leerie/*` branch into it (deleted from the user's repository),
+    re-create every worktree of the user's repository that lies under the
+    run directory as a worktree of the run's repository on the same branch
+    or commit, and record `base_sha` — the cut point, the merge-base of the
+    run branch and the working branch — when the state names a working
+    branch and has none. Afterwards the user's repository holds no leerie
+    ref or worktree, as in a real run. Returns the run's repository."""
+    user = Path(st.repo_root)
+    run_dir = Path(st.run_dir).resolve()
+
+    def git(cwd, *a, check=True):
+        return subprocess.run(["git", "-C", str(cwd), *a], check=check,
+                              capture_output=True, text=True).stdout.strip()
+    trees = []
+    cur: dict = {}
+    for line in git(user, "worktree", "list", "--porcelain").splitlines() + [""]:
+        if not line:
+            if cur.get("path") and Path(cur["path"]).resolve().is_relative_to(
+                    run_dir):
+                trees.append(cur)
+            cur = {}
+        elif line.startswith("worktree "):
+            cur["path"] = line[len("worktree "):]
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            cur["branch"] = line[len("branch "):]
+    for t in trees:
+        git(user, "worktree", "remove", "--force", t["path"])
+    repo = leerie._ensure_run_repo(st)
+    refs = git(user, "for-each-ref", "--format=%(refname)",
+               "refs/heads/leerie").split()
+    if refs:
+        git(repo, "fetch", "-q", str(user), *[f"+{r}:{r}" for r in refs])
+        for r in refs:
+            git(user, "update-ref", "-d", r)
+    for t in trees:
+        if t.get("branch"):
+            git(repo, "worktree", "add", "-q", t["path"],
+                t["branch"][len("refs/heads/"):])
+        else:
+            git(repo, "worktree", "add", "-q", "--detach", t["path"],
+                t["head"])
+    wb = st.data.get("working_branch")
+    run_branch = f"refs/heads/leerie/runs/{st.run_id}"
+    if wb and not st.data.get("base_sha") and git(
+            repo, "rev-parse", "-q", "--verify", run_branch, check=False):
+        st.data["base_sha"] = git(repo, "merge-base", run_branch,
+                                  f"refs/heads/{wb}")
+        st.save()
+    return repo
+
+
+@pytest.fixture(autouse=True)
+def _no_run_repo_without_a_git_repo(request, monkeypatch):
+    """Let a test drive `_run_phases` / `phase_execute` / the planning
+    worktree over a state whose `repo_root` is no git repository.
+
+    Every run makes its own repository from the user's at start
+    (`_ensure_run_repo`, DESIGN §6 *The run's own repository*), and dies
+    when it cannot — `_preflight_repo` guarantees a repository in
+    production. Many tests drive those phases with the scripts and git
+    stubbed, over a temporary directory or a `Mock` state; for them the
+    creation and the refresh are no-ops here. A test whose `repo_root` is a
+    real repository gets the real thing, unstubbed."""
+    leerie = request.getfixturevalue("leerie")
+    real_ensure = leerie._ensure_run_repo_or_die
+    real_refresh = leerie._refresh_run_repo_base_or_die
+
+    def _has_repo(st) -> bool:
+        root = getattr(st, "repo_root", None)
+        run_dir = getattr(st, "run_dir", None)
+        if not isinstance(root, (str, os.PathLike)) or not isinstance(
+                run_dir, (str, os.PathLike)):
+            return False
+        return subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--git-dir"],
+            capture_output=True).returncode == 0
+
+    async def ensure(st):
+        if _has_repo(st):
+            return await real_ensure(st)
+        return Path(str(getattr(st, "run_dir", "."))) / "repo"
+
+    async def refresh(st, where):
+        if _has_repo(st):
+            return await real_refresh(st, where)
+        return ""
+    monkeypatch.setattr(leerie, "_ensure_run_repo_or_die", ensure)
+    monkeypatch.setattr(leerie, "_refresh_run_repo_base_or_die", refresh)
+
+
 @pytest.fixture(autouse=True)
 def _restore_git_hooks_env():
     """Put the git config environment back after every test.

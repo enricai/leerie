@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# finalize.sh <run-id> — verify the run branch is ready to push.
+# finalize.sh <run-id> [<base>] — verify the run branch is ready to push.
 #
 # Run from the repo root after every wave is integrated and the run branch
 # is green. The working branch is NOT modified locally — leerie does not
@@ -9,6 +9,12 @@
 # This script's job is narrow: confirm `leerie/runs/<run-id>` exists and
 # has at least one commit beyond the working branch. If it doesn't, the
 # orchestrator dies before attempting the push.
+#
+# `<base>`, when given, is the commit the run branch was cut from
+# (`base_sha`): the orchestrator passes it, and the count is taken from it
+# rather than from the working branch's name, which in the run's own
+# repository is a ref a worker can move (DESIGN §6 *The run's own
+# repository*).
 set -euo pipefail
 
 # shellcheck source=scripts/worktree-lib.sh
@@ -16,7 +22,8 @@ set -euo pipefail
 # No git command of leerie's own runs a repository hook (DESIGN §6½).
 leerie_git_hooks_off
 
-RUN_ID="${1:?usage: finalize.sh <run-id>}"
+RUN_ID="${1:?usage: finalize.sh <run-id> [<base>]}"
+BASE="${2:-}"
 # Honor LEERIE_STATE_DIR — matches setup-run.sh:25. Without this,
 # in-container invocations (LEERIE_STATE_DIR=/leerie-state) look at
 # /work/.leerie/runs/<id>/working-branch (does not exist) instead of
@@ -40,7 +47,13 @@ fi
 # The PR base must exist locally for the rev-list comparison below; if the
 # user renamed or deleted it after the run started, surface that distinctly
 # rather than letting it look like an "already caught up" state.
-if ! git show-ref --verify --quiet "refs/heads/${WORKING_BRANCH}"; then
+if [ -n "$BASE" ]; then
+  if ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
+    echo "error: base ${BASE} is not a commit in this repository" >&2
+    exit 2
+  fi
+  WORKING_BRANCH="$BASE"
+elif ! git show-ref --verify --quiet "refs/heads/${WORKING_BRANCH}"; then
   echo "error: working branch ${WORKING_BRANCH} (recorded at run start) no longer exists — " >&2
   echo "       recreate it (e.g. \`git branch ${WORKING_BRANCH} <commit>\`) before retrying" >&2
   exit 2

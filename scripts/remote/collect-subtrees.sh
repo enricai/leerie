@@ -63,7 +63,10 @@ collect_subtrees_remote() {
 set -eu -o pipefail
 
 SCRIPTS="/opt/leerie-image/scripts"
-LEERIE_STATE_DIR="${LEERIE_STATE_DIR:-/leerie-state}"
+# The remote orchestrator's state root is /work/.leerie (no LEERIE_STATE_DIR
+# there), so the scripts below must use the same one: they find the run's
+# staging and its own repository under it.
+LEERIE_STATE_DIR="/work/.leerie"
 export LEERIE_STATE_DIR
 
 RUNS_DIR="/work/.leerie/runs"
@@ -92,7 +95,14 @@ run_dir="${candidates[0]%/}"
 run_id="$(basename "$run_dir")"
 run_branch="leerie/runs/${run_id}"
 
-cd /work
+# Every branch and worktree of the run lives in the run's own repository
+# (DESIGN §6 *The run's own repository*); the scripts act on the
+# repository at their working directory.
+if [ ! -f "$run_dir/repo/HEAD" ]; then
+  echo "COLLECT-ERROR:no run repository at $run_dir/repo"
+  exit 0
+fi
+cd "$run_dir/repo" || { echo "COLLECT-ERROR:cannot enter $run_dir/repo"; exit 0; }
 
 # Ensure the run branch + staging worktree exist.  setup-run.sh is
 # idempotent — it never resets an existing branch.

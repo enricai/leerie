@@ -27,6 +27,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 from test_redrive_test_id_diff_refresh import CMD, SUITE, _git  # noqa: E402
 
+from tests.conftest import relocate_into_run_repo  # noqa: E402
+
 MOD_TEST = ("import sys, os\n"
             "sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))\n"
             "import mod\n\ndef test_m():\n    assert mod.X\n")
@@ -69,6 +71,8 @@ def _repo(leerie, tmp_path, monkeypatch, *, ignore: str = "",
                "required_items": [{"item": "set X to 2"}]}
     st.repo_root = repo
     st.save()
+    # The run's own repository (DESIGN §6 *The run's own repository*).
+    relocate_into_run_repo(leerie, st)
     monkeypatch.setattr(leerie, "resolve_blt", lambda root: {"test": CMD})
     caps = {**leerie.DEFAULT_CAPS, "confirm_intermittent_repeats": 0}
     return {"st": st, "staging": staging, "run_dir": run_dir, "caps": caps,

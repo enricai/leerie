@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import relocate_into_run_repo
+
 
 # === Tier 1: _settle_subtask source-coupling ================================
 
@@ -147,6 +149,8 @@ def env(leerie, tmp_path):
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "x", "working_branch": "main"}
     st.save()
+    # The run's own repository (DESIGN §6 *The run's own repository*).
+    relocate_into_run_repo(leerie, st)
     caps = dict(leerie.DEFAULT_CAPS)
     models = {w: "sonnet" for w in leerie.WORKER_TYPES}
     efforts = {w: None for w in leerie.WORKER_TYPES}

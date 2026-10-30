@@ -54,7 +54,11 @@ def _setup(leerie, tmp_path: Path, monkeypatch):
                "skip_base_baseline": True, "subtask_status": {},
                "working_branch": "main"}
     st.save()
-    return repo, root, st
+    # `repo` below is the run's own repository (DESIGN §6 *The run's own
+    # repository*): the run's branches, the scripts' working directory.
+    # The user's repository is `root.parent`.
+    leerie._ensure_run_repo(st)
+    return st.run_repo, root, st
 
 
 def _patch(leerie, monkeypatch, repo: Path, run_dir: Path):
@@ -195,7 +199,7 @@ def test_crash_after_each_save_then_resume_integrates_everything(
     st.release_lock()
     # The resume: a fresh State read back from disk, a fresh phase_execute.
     st2 = leerie.State(root, RUN_ID)
-    st2.repo_root = repo
+    st2.repo_root = root.parent
     assert st2.load()
     assert st2.data["completed_waves"] == 0
     _run_wave(leerie, st2, None, [])

@@ -103,7 +103,7 @@ class TestEnsurePlanningWorktree:
         exactly the exposure this exists to remove."""
         repo, state, st = env
 
-        async def failing(_name, *_a):
+        async def failing(_name, *_a, **_kw):
             return subprocess.CompletedProcess(
                 args=[], returncode=1, stdout="", stderr="boom")
 
@@ -120,7 +120,7 @@ class TestEnsurePlanningWorktree:
         repo, state, st = env
         seen = {}
 
-        async def failing(_name, *_a):
+        async def failing(_name, *_a, **_kw):
             return subprocess.CompletedProcess(
                 args=[], returncode=1, stdout="", stderr="boom")
 
@@ -141,7 +141,7 @@ class TestEnsurePlanningWorktree:
         orchestrator's own directory."""
         repo, state, st = env
 
-        async def chatty(_name, *_a):
+        async def chatty(_name, *_a, **_kw):
             return subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="something unexpected\n",
                 stderr="")

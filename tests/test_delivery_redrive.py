@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import relocate_into_run_repo
+
 TS_DIR_ENV = "LEERIE_TEST_TYPESCRIPT_DIR"
 
 
@@ -636,6 +638,9 @@ def test_new_failures_confirmed_under_bstar(leerie, tmp_path):
     st = leerie.State(tmp_path / "state", "run-b", repo_root=repo)
     st.data = {"verbosity": "quiet", "worker_count": 0}
     (st.run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    # The run's own repository, holding `pre`: the re-drive's base checkout
+    # is made there (DESIGN §6 *The run's own repository*).
+    leerie._ensure_run_repo(st)
     caps = {**leerie.DEFAULT_CAPS, "confirm_pairs": 2}
 
     async def go():
@@ -733,8 +738,12 @@ class World:
                                      "final_sha": head,
                                      "final_tree": head_tree},
                    "acceptance": {"validity_base": base, "sets": sets,
-                                  "gate": {}}}
+                                  "gate": {}},
+                   "base_sha": base}
         st.save()
+        # The run's own repository (DESIGN §6 *The run's own repository*):
+        # the run branch and staging move there.
+        relocate_into_run_repo(leerie, st)
         self.calls: list[dict] = []
         self.edits: list = []          # one callable per expected drive
         self.caps = {**leerie.DEFAULT_CAPS}

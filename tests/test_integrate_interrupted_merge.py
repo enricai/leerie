@@ -51,15 +51,18 @@ def _midmerge(leerie, tmp_path, monkeypatch):
     root = repo / ".leerie"
     monkeypatch.setenv("LEERIE_STATE_DIR", str(root))
     monkeypatch.chdir(repo)
-    subprocess.run(["bash", str(REPO_ROOT / "scripts" / "setup-run.sh"),
-                    RUN_ID, "main"], cwd=repo, check=True,
-                   capture_output=True)
     st = leerie.State(root, RUN_ID)
     st.repo_root = repo
     st.data = {"task": "t", "waves": [["a", "b"]], "completed_waves": 0,
                "subtask_status": {"a": "complete", "b": "complete"},
                "working_branch": "main"}
     st.save()
+    # The scripts run in the run's own repository (DESIGN §6 *The run's own
+    # repository*); `repo` below is that repository, where the branches are.
+    repo = leerie._ensure_run_repo(st)
+    subprocess.run(["bash", str(REPO_ROOT / "scripts" / "setup-run.sh"),
+                    RUN_ID, "main"], cwd=repo, check=True,
+                   capture_output=True)
     staging = st.run_dir / "worktrees" / "staging"
     # b conflicts with the run branch (a commit integrated earlier).
     _branch(repo, "b", "f.txt", "b\n")

@@ -234,6 +234,9 @@ def _eval_st(leerie, tmp_path, repo):
     st = leerie.State(root, "run-a", repo_root=repo)
     st.data = {"task": "t", "categories": ["bug-fixing"],
                "verbosity": "quiet"}
+    # The run's own repository, where every evaluation checkout is made
+    # (DESIGN §6 *The run's own repository*).
+    leerie._ensure_run_repo(st)
     return st
 
 

@@ -73,7 +73,11 @@ def _setup(leerie, tmp_path: Path, monkeypatch):
         (st.run_dir / "subtasks" / f"{sid}.json").write_text(json.dumps(
             {"id": sid, "intent": f"add {sid}'s helper",
              "criteria": [f"{sid}'s helper exists"]}))
-    return repo, root, st
+    # `repo` below is the run's own repository (DESIGN §6 *The run's own
+    # repository*): the run's branches, the scripts' working directory.
+    # The user's repository is `root.parent`.
+    leerie._ensure_run_repo(st)
+    return st.run_repo, root, st
 
 
 def _staging(st) -> Path:
@@ -97,7 +101,7 @@ class _World:
                      redrive_note=None):
         out = subprocess.run(
             ["bash", str(REPO_ROOT / "scripts" / "new-worktree.sh"), sid,
-             RUN_ID], cwd=st.repo_root, capture_output=True, text=True,
+             RUN_ID], cwd=st.run_repo, capture_output=True, text=True,
             check=True)
         wt = Path(out.stdout.strip().splitlines()[-1])
         (wt / "app.py").write_text(A_SIDE if sid == "a" else B_SIDE)
@@ -253,7 +257,7 @@ def test_the_window_holds_saves(leerie, tmp_path, monkeypatch):
 
 def _resume(leerie, root: Path, repo: Path, monkeypatch):
     st2 = leerie.State(root, RUN_ID)
-    st2.repo_root = repo
+    st2.repo_root = root.parent
     assert st2.load()
     assert st2.data["completed_waves"] == 0
     judged_before = bool(((st2.data.get("integration_gate") or {})

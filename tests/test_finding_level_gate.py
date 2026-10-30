@@ -371,9 +371,15 @@ def test_digest_failure_degrades_to_items_only_judging(
     run_id = "digest-degrade"
     run_dir = leerie_root / "runs" / run_id
     from tests.stub_helpers import _delivery_tree, _judge_verdict
-    _delivery_tree(run_dir / "worktrees" / "staging")
+    staging = _delivery_tree(run_dir / "worktrees" / "staging")
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "t", "worker_count": 0, "working_branch": "main",
+               # The base the run branch was cut from (DESIGN §6 *The
+               # run's own repository*): the prejudge runs only with it.
+               "base_sha": __import__("subprocess").run(
+                   ["git", "-C", str(staging), "rev-parse", "HEAD"],
+                   capture_output=True, text=True,
+                   check=True).stdout.strip(),
                "required_items": [{"item": "a required thing",
                                    "source_ref": "task"}]}
     st.save()

@@ -160,8 +160,8 @@ def test_crash_after_settle_then_resume_merges_the_work(
     assert _branch_tip(repo) == made["work"]
     assert not _in_staging(staging, made["work"])
     st.release_lock()
-    st2 = leerie.State(repo / ".leerie", RUN_ID)
-    st2.repo_root = repo
+    st2 = leerie.State(st.run_dir.parent.parent, RUN_ID)
+    st2.repo_root = st.repo_root
     assert st2.load()
     _phase_execute(leerie, st2, crash=False)
     assert st2.data["completed_waves"] == 1

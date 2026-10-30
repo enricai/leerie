@@ -138,7 +138,9 @@ def test_an_amend_of_its_own_earlier_attempt_is_clean(leerie, tmp_path):
     taken from the previous attempt's tip, the base line fired and correct
     work settled `unconverged`; the base is now where the subtask branch
     forked from the run branch."""
-    r = tmp_path / "r"
+    # The run's own repository, `<run-dir>/repo` (DESIGN §6 *The run's own
+    # repository*), where the run's branches are.
+    r = tmp_path / "repo"
     r.mkdir()
     _git(r, "init", "-q", "-b", "main")
     _git(r, "config", "user.email", "t@x")
@@ -153,6 +155,7 @@ def test_an_amend_of_its_own_earlier_attempt_is_clean(leerie, tmp_path):
     class St:
         run_id = "x"
         repo_root = r
+        run_dir = tmp_path
     # No subtask branch yet: the run branch's tip.
     assert asyncio.run(leerie._fork_point(St, "bugfix-001")) == run_tip
     _git(r, "branch", sub, "leerie/runs/x")

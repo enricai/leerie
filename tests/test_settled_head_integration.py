@@ -39,22 +39,26 @@ def _world(leerie, tmp_path, monkeypatch):
     root = repo / ".leerie"
     monkeypatch.setenv("LEERIE_STATE_DIR", str(root))
     monkeypatch.chdir(repo)
-    subprocess.run(["bash", str(REPO_ROOT / "scripts" / "setup-run.sh"),
-                    RUN_ID, "main"], cwd=repo, check=True,
-                   capture_output=True)
     st = leerie.State(root, RUN_ID)
     st.repo_root = repo
     st.data = {"task": "t", "waves": [["t1"]], "completed_waves": 0,
                "subtask_status": {"t1": "complete"},
                "working_branch": "main"}
     st.save()
+    # The scripts run in the run's own repository (DESIGN §6 *The run's own
+    # repository*); `repo` below is that repository, where the run's
+    # branches are. The user's is `st.repo_root`.
+    run_repo = leerie._ensure_run_repo(st)
+    subprocess.run(["bash", str(REPO_ROOT / "scripts" / "setup-run.sh"),
+                    RUN_ID, "main"], cwd=run_repo, check=True,
+                   capture_output=True)
     out = subprocess.run(
         ["bash", str(REPO_ROOT / "scripts" / "new-worktree.sh"), "t1",
-         RUN_ID], cwd=repo, capture_output=True, text=True, check=True)
+         RUN_ID], cwd=run_repo, capture_output=True, text=True, check=True)
     wt = Path(out.stdout.strip().splitlines()[-1])
     assert wt == leerie._subtask_worktree_path(st.run_dir, "t1").resolve()
     staging = st.run_dir / "worktrees" / "staging"
-    return repo, st, staging, wt
+    return run_repo, st, staging, wt
 
 
 def _detached_commits(wt: Path) -> str:
@@ -136,12 +140,12 @@ def test_settled_head_still_missing_is_unconverged_not_dropped(
     # The re-point is undone before integrate.sh reads the branch.
     calls = []
 
-    async def run_script(name, *args):
+    async def run_script(name, *args, **_kw):
         if name == "integrate.sh":
             calls.append(args)
             _git(repo, "update-ref",
                  f"refs/heads/leerie/subtasks/{RUN_ID}/t1", fork)
-        return await orig_run_script(name, *args)
+        return await orig_run_script(name, *args, **_kw)
     orig_run_script = leerie._run_script
     monkeypatch.setattr(leerie, "_run_script", run_script)
     out, results = _integrate(leerie, st)

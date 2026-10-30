@@ -120,19 +120,20 @@ def test_names_are_literal_patterns(leerie, tmp_path):
 
 
 def test_no_code_writes_the_shared_exclude_file(leerie):
-    """Structural guard paired with the behavioural tests above: the only
-    function that resolves `info/exclude` is the legacy path the resume
-    uses to REMOVE an earlier version's block, and nothing appends to it."""
+    """Structural guard paired with the behavioural tests above: no function
+    resolves `info/exclude`. The last one removed an earlier version's block
+    on resume; it went with resuming runs made before per-run repositories
+    (DESIGN §6 *The run's own repository*), the only runs that had one."""
     tree = ast.parse(inspect.getsource(leerie))
     owners = sorted({
         f.name for f in ast.walk(tree)
         if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
         for n in ast.walk(f)
         if isinstance(n, ast.Constant) and n.value == "info/exclude"})
-    assert owners == ["_redrive_exclude_path"]
+    assert owners == []
     assert not hasattr(leerie, "_git_exclude")
-    clear = inspect.getsource(leerie._redrive_exclude_clear)
-    assert '.open("a")' not in clear and "if not skip" in clear
+    assert not hasattr(leerie, "_redrive_exclude_clear")
+    assert not hasattr(leerie, "_redrive_exclude_path")
 
 
 @pytest.mark.parametrize("name", ["a b ", "x*y", "q?.ts", "back\\slash"])

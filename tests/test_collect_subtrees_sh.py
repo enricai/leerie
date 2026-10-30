@@ -78,8 +78,12 @@ def _flyctl_stub(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
         # Rewrite in-machine paths to fixture paths.
         '    REWRITTEN="${SCRIPT//\\/opt\\/leerie-image\\/scripts/$SCRIPTS}"\n'
         '    REWRITTEN="${REWRITTEN//\\/opt\\/leerie-image\\/prompts/$PROMPTS}"\n'
-        '    REWRITTEN="${REWRITTEN//\\/work\\/.leerie\\/runs/$STATE_DIR/runs}"\n'
-        '    REWRITTEN="${REWRITTEN//cd \\/work/cd $REPO}"\n'
+        '    REWRITTEN="${REWRITTEN//\\/work\\/.leerie/$STATE_DIR}"\n'
+        # The run's own repository (DESIGN §6 *The run's own repository*)
+        # is `<run-dir>/repo`; the fixture repository's git dir stands in.
+        '    for d in "$STATE_DIR"/runs/*/; do\n'
+        '      [ -d "$d" ] && ln -sfn "$REPO/.git" "${d}repo"\n'
+        '    done\n'
         # Override LEERIE_STATE_DIR for the payload.
         f'    export LEERIE_STATE_DIR="{state_dir}"\n'
         '    printf "%s" "$REWRITTEN" | bash -s\n'

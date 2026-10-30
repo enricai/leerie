@@ -75,7 +75,16 @@ def _ship(leerie, tmp_path):
     _git(repo, "commit", "-qm", "base")
     st = leerie.State(tmp_path / ".leerie", "fix-001-abcdef", repo_root=repo)
     st.data = {"task": "x", "subtask_status": {"a": "complete"}}
-    return st, repo
+    # The run branch lives in the run's own repository (DESIGN §6 *The
+    # run's own repository*), where `_shipping_tree` reads it; the tests
+    # commit on it through `repo`, a worktree of that repository.
+    run_repo = leerie._ensure_run_repo(st)
+    _git(repo, "checkout", "-q", "--detach")
+    _git(repo, "update-ref", "-d", "refs/heads/leerie/runs/fix-001-abcdef")
+    wt = tmp_path / "staging"
+    _git(run_repo, "worktree", "add", "-q", "-b",
+         "leerie/runs/fix-001-abcdef", str(wt), "refs/leerie/user-head")
+    return st, wt
 
 
 def test_a_verdict_of_an_earlier_tree_never_decides_done(leerie, tmp_path):

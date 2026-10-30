@@ -193,7 +193,7 @@ class TestWiring:
             self, leerie, monkeypatch, tmp_path):
         calls = []
 
-        async def fake(name: str, *args: str) -> subprocess.CompletedProcess:
+        async def fake(name: str, *args: str, **_kw) -> subprocess.CompletedProcess:
             calls.append((name, args))
             return subprocess.CompletedProcess(
                 [], 0, stdout=f"planning-worktree: {tmp_path}\n", stderr="")
@@ -360,7 +360,7 @@ class TestFallbackWarningSurfaced:
     @pytest.mark.real_planning_worktree
     def test_ensure_planning_worktree_logs_it(
             self, leerie, monkeypatch, tmp_path):
-        async def fake(name: str, *args: str) -> subprocess.CompletedProcess:
+        async def fake(name: str, *args: str, **_kw) -> subprocess.CompletedProcess:
             return subprocess.CompletedProcess(
                 [], 0, stdout=f"planning-worktree: {tmp_path}\n",
                 stderr="warning: working branch 'gone' not found; "

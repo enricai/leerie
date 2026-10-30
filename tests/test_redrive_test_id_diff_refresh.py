@@ -13,6 +13,8 @@ import subprocess
 
 import pytest
 
+from tests.conftest import relocate_into_run_repo
+
 CMD = "python3 -m pytest -q -p no:cacheprovider tests"
 SUITE = "def test_x():\n    assert {ok}\n"
 ITEM = "fix y; no existing test breaks"
@@ -60,6 +62,8 @@ def redriven(leerie, tmp_path, monkeypatch):
                                     "verifiability": "execution"}]}]}
     st.repo_root = repo
     st.save()
+    # The run's own repository (DESIGN §6 *The run's own repository*).
+    relocate_into_run_repo(leerie, st)
     caps = {**leerie.DEFAULT_CAPS, "confirm_intermittent_repeats": 0}
     post = {"tests": {"ran": True, "measured": True, "passed": False,
                       "command": CMD, "summary": ""}}

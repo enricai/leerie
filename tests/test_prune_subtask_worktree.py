@@ -33,6 +33,16 @@ def _make_repo(path: Path) -> Path:
     return path
 
 
+def _run_repo(repo: Path, leerie_dir: Path) -> Path:
+    """The run's own repository (DESIGN §6 *The run's own repository*): a
+    bare repository at `<run-dir>/repo` holding the run's branches, where
+    every worktree of the run is registered."""
+    run_repo = leerie_dir / "repo"
+    run_repo.parent.mkdir(parents=True, exist_ok=True)
+    _git("clone", "-q", "--bare", str(repo), str(run_repo), cwd=repo)
+    return run_repo
+
+
 def test_noop_when_worktree_absent(leerie, tmp_path, monkeypatch):
     """Idempotent: no worktree to prune is not an error."""
     repo = _make_repo(tmp_path / "repo")
@@ -53,10 +63,12 @@ def test_removes_worktree_dir_but_keeps_branch(leerie, tmp_path, monkeypatch):
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.parent.mkdir(parents=True)
+    run_repo = _run_repo(repo, leerie_dir)
 
-    _git("branch", "leerie/runs/run-id", "main", cwd=repo)
+    _git("branch", "leerie/runs/run-id", "main", cwd=run_repo)
     r = _git("worktree", "add", str(wt_dir), "-b",
-             "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=repo)
+             "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id",
+             cwd=run_repo)
     assert r.returncode == 0, r.stderr
     # Simulate a bulky dependency directory left in the worktree.
     (wt_dir / "node_modules").mkdir()
@@ -67,8 +79,10 @@ def test_removes_worktree_dir_but_keeps_branch(leerie, tmp_path, monkeypatch):
 
     assert not wt_dir.exists()
     show = _git("show-ref", "--verify", "--quiet",
-                "refs/heads/leerie/subtasks/run-id/sid-x", cwd=repo)
+                "refs/heads/leerie/subtasks/run-id/sid-x", cwd=run_repo)
     assert show.returncode == 0, "branch must survive pruning"
+    assert _git("worktree", "list", "--porcelain", cwd=repo).stdout.count(
+        "worktree ") == 1, "nothing of the run is in the user's repository"
 
 
 def test_prune_does_not_touch_other_sids_worktree(leerie, tmp_path, monkeypatch):
@@ -78,13 +92,15 @@ def test_prune_does_not_touch_other_sids_worktree(leerie, tmp_path, monkeypatch)
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     leerie_dir.joinpath("worktrees").mkdir(parents=True)
-    _git("branch", "leerie/runs/run-id", "main", cwd=repo)
+    run_repo = _run_repo(repo, leerie_dir)
+    _git("branch", "leerie/runs/run-id", "main", cwd=run_repo)
 
     wt_a = leerie_dir / "worktrees" / "run-id-sid-a"
     wt_b = leerie_dir / "worktrees" / "run-id-sid-b"
     for sid, wt in (("sid-a", wt_a), ("sid-b", wt_b)):
         r = _git("worktree", "add", str(wt), "-b",
-                 f"leerie/subtasks/run-id/{sid}", "leerie/runs/run-id", cwd=repo)
+                 f"leerie/subtasks/run-id/{sid}", "leerie/runs/run-id",
+                 cwd=run_repo)
         assert r.returncode == 0, r.stderr
 
     asyncio.run(leerie._prune_subtask_worktree("sid-a", leerie_dir))
@@ -177,13 +193,15 @@ def test_prune_then_reset_of_sibling_still_works(leerie, tmp_path, monkeypatch):
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     leerie_dir.joinpath("worktrees").mkdir(parents=True)
-    _git("branch", "leerie/runs/run-id", "main", cwd=repo)
+    run_repo = _run_repo(repo, leerie_dir)
+    _git("branch", "leerie/runs/run-id", "main", cwd=run_repo)
 
     wt_ok = leerie_dir / "worktrees" / "run-id-sid-ok"
     wt_blocked = leerie_dir / "worktrees" / "run-id-sid-blocked"
     for sid, wt in (("sid-ok", wt_ok), ("sid-blocked", wt_blocked)):
         r = _git("worktree", "add", str(wt), "-b",
-                 f"leerie/subtasks/run-id/{sid}", "leerie/runs/run-id", cwd=repo)
+                 f"leerie/subtasks/run-id/{sid}", "leerie/runs/run-id",
+                 cwd=run_repo)
         assert r.returncode == 0, r.stderr
 
     asyncio.run(leerie._prune_subtask_worktree("sid-ok", leerie_dir))
@@ -193,5 +211,5 @@ def test_prune_then_reset_of_sibling_still_works(leerie, tmp_path, monkeypatch):
     asyncio.run(leerie._reset_subtask_worktree("sid-blocked", leerie_dir, "run-id"))
     assert not wt_blocked.exists()
     show = _git_noraise("show-ref", "--verify", "--quiet",
-                "refs/heads/leerie/subtasks/run-id/sid-blocked", cwd=repo)
+                "refs/heads/leerie/subtasks/run-id/sid-blocked", cwd=run_repo)
     assert show.returncode != 0

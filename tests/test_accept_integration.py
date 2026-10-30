@@ -341,7 +341,7 @@ def test_accept_then_resume_skips_the_judge(leerie, tmp_path, monkeypatch):
             calls["judge"] += 1
         return {}
 
-    async def fake_run_script(script, s, rid):
+    async def fake_run_script(script, s, rid, **_kw):
         calls["integrate_sh"] += 1
         mock = AsyncMock()
         mock.returncode = 0

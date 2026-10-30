@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from test_redrive_test_id_diff_refresh import (CMD, ITEM, SUITE, _git,  # noqa: F401
                                                redriven)
 
+from tests.conftest import relocate_into_run_repo  # noqa: E402
+
 
 @pytest.fixture
 def broken_run(leerie, tmp_path, monkeypatch):
@@ -55,6 +57,8 @@ def broken_run(leerie, tmp_path, monkeypatch):
                "required_items": [{"item": "fix y"}]}
     st.repo_root = repo
     st.save()
+    # The run's own repository (DESIGN §6 *The run's own repository*).
+    relocate_into_run_repo(leerie, st)
     monkeypatch.setattr(leerie, "resolve_blt", lambda root: {"test": CMD})
     caps = {**leerie.DEFAULT_CAPS, "confirm_intermittent_repeats": 0}
     return {"st": st, "staging": staging, "run_dir": run_dir, "caps": caps,

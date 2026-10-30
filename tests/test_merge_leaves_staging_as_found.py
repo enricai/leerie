@@ -46,13 +46,17 @@ def _world(leerie, tmp_path, monkeypatch):
     root = repo / ".leerie"
     monkeypatch.setenv("LEERIE_STATE_DIR", str(root))
     monkeypatch.chdir(repo)
-    _sh(repo, "setup-run.sh", RUN_ID, "main")
-    staging = root / "runs" / RUN_ID / "worktrees" / "staging"
-    wt = Path(_sh(repo, "new-worktree.sh", "feat-001",
-                  RUN_ID).stdout.strip().splitlines()[-1])
     st = leerie.State(root, RUN_ID)
     st.repo_root = repo
-    return repo, staging, wt, st
+    st.data["working_branch"] = "main"
+    # The scripts run in the run's own repository (DESIGN §6 *The run's own
+    # repository*); `repo` below is that repository.
+    run_repo = leerie._ensure_run_repo(st)
+    _sh(run_repo, "setup-run.sh", RUN_ID, "main")
+    staging = root / "runs" / RUN_ID / "worktrees" / "staging"
+    wt = Path(_sh(run_repo, "new-worktree.sh", "feat-001",
+                  RUN_ID).stdout.strip().splitlines()[-1])
+    return run_repo, staging, wt, st
 
 
 def test_output_a_merged_gitignore_exposes_is_removed(leerie, tmp_path,
@@ -101,10 +105,10 @@ def test_a_post_merge_hook_does_not_run_on_leeries_merge(leerie, tmp_path,
                 "--untracked-files=all") == ""
     # The control: the hook is real and fires on a merge that is not
     # leerie's.
-    _git(repo, "checkout", "-q", "-b", "other")
-    (repo / "g.txt").write_text("g\n")
-    _git(repo, "add", "g.txt")
-    _git(repo, "commit", "-qm", "g")
+    _git(wt, "checkout", "-q", "-b", "other")
+    (wt / "g.txt").write_text("g\n")
+    _git(wt, "add", "g.txt")
+    _git(wt, "commit", "-qm", "g")
     subprocess.run(["git", "merge", "-q", "--no-ff", "-m", "m", "other"],
                    cwd=staging, check=True, capture_output=True,
                    env=leerie._git_hooks_on(os.environ))

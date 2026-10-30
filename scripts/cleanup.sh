@@ -59,6 +59,22 @@ clean_one_run() {
   local run_id="$1"
   local branch_scope="$2"
   local run_dir="${LEERIE_ROOT}/runs/${run_id}"
+  # The registry and branches of a run live in its own repository
+  # (`<run-dir>/repo`, DESIGN §6 *The run's own repository*), whatever the
+  # caller's cwd; a run from before per-run repositories has them in the
+  # repository at the cwd.
+  if [ -f "${run_dir}/repo/HEAD" ]; then
+    run_dir="$(cd "$run_dir" && pwd -P)"
+    ( cd "${run_dir}/repo" || exit 1; _clean_one_run_here "$run_id" "$branch_scope" "$run_dir" )
+    return
+  fi
+  _clean_one_run_here "$run_id" "$branch_scope" "$run_dir"
+}
+
+_clean_one_run_here() {
+  local run_id="$1"
+  local branch_scope="$2"
+  local run_dir="$3"
 
   if [ -d "${run_dir}/worktrees" ]; then
     for d in "${run_dir}/worktrees"/*/; do

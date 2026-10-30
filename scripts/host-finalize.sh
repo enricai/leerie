@@ -6,7 +6,7 @@
 # push/PR mechanics — the discovery of *which* run to finalize differs.
 #
 # Exports: host_finalize <run-dir>, host_prepush_preflight <repo> <branch>,
-#          host_base_freshness_check <repo>
+#          host_base_freshness_check <repo>, host_bring_back_run_branch <run-dir>
 #
 # Inputs (env or args):
 #   $1                — absolute path to .leerie/runs/<run-id>/
@@ -404,12 +404,102 @@ host_base_freshness_check() {
   return 0
 }
 
+# host_bring_back_run_branch <run-dir> — bring `leerie/runs/<id>` back from
+# the run's own repository (`<run-dir>/repo`, DESIGN §6 *The run's own
+# repository*) into $USER_REPO: the one ref of the run the user receives.
+# leerie's own git, so hooks off, no FETCH_HEAD and no auto-maintenance in
+# the user's repository. A compare-and-swap: the user's ref is moved only
+# when it is absent and nothing was ever brought back, or when it is still
+# at the commit leerie last brought back (`run.json` `brought_back_sha`) —
+# so a finalize rebase, or the user's own change to the ref, is never
+# undone. The run's tip is recorded as `brought_back_sha`. A run with no
+# repository of its own (made before per-run repositories, or a remote run
+# whose branch `fetch_branch` brings) is a no-op. Returns 1 when the fetch
+# or the update fails, 2 when the compare-and-swap refused while the run's
+# tip is not what was last brought back (its newest commits are then in no
+# ref of the user's), else 0.
+host_bring_back_run_branch() {
+  local run_dir="$1"
+  local repo="$run_dir/repo"
+  local run_json="$run_dir/run.json"
+  [ -f "$repo/HEAD" ] || return 0
+  local run_id branch tip recorded current
+  run_id="$(basename "$run_dir")"
+  branch="leerie/runs/$run_id"
+  tip="$(git -C "$repo" rev-parse --verify -q "refs/heads/$branch^{commit}" 2>/dev/null || true)"
+  [ -n "$tip" ] || return 0
+  recorded=""
+  if [ -f "$run_json" ]; then
+    recorded="$(jq -r '.brought_back_sha // ""' "$run_json")"
+  fi
+  current="$(git -C "$USER_REPO" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null || true)"
+  if [ "$current" = "$tip" ]; then
+    [ -f "$run_json" ] && [ "$recorded" != "$tip" ] \
+      && _host_finalize_update_run_json "$run_json" "brought_back_sha=$tip"
+    return 0
+  fi
+  if [ "$current" != "$recorded" ]; then
+    echo "[leerie] bring-back: $branch in your repository is at ${current:-(absent)}, not the commit leerie last brought back (${recorded:-none}) — leaving it as it is; the run's branch is at $tip in $repo" >&2
+    # 2: the run has commits that are in no ref of yours — a caller about
+    # to delete the run's repository must keep it.
+    [ "$tip" = "$recorded" ] && return 0
+    return 2
+  fi
+  local incoming="refs/leerie/incoming/$run_id"
+  if ! git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch --quiet --no-tags \
+      --no-write-fetch-head --no-auto-maintenance --no-recurse-submodules \
+      "$repo" "+refs/heads/$branch:$incoming"; then
+    echo "[leerie] bring-back: could not fetch $branch from $repo" >&2
+    return 1
+  fi
+  # `$current` is empty when the ref is absent: update-ref then insists it
+  # still is.
+  if ! git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref \
+      -m "leerie: bring back $branch" "refs/heads/$branch" "$tip" "$current"; then
+    git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref -d "$incoming" 2>/dev/null || true
+    echo "[leerie] bring-back: $branch moved while it was brought back — leaving it" >&2
+    return 1
+  fi
+  git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref -d "$incoming" 2>/dev/null || true
+  [ -f "$run_json" ] && _host_finalize_update_run_json "$run_json" "brought_back_sha=$tip"
+  echo "[leerie] bring-back: $branch is at $tip in your repository" >&2
+  return 0
+}
+
+# _host_finalize_rebase_repo <dir> <run-branch> <pr-base-branch> — the
+# rebaser's own bare repository at <dir>: a `--shared` single-branch clone
+# of $USER_REPO holding the run branch, with no remote (the clone's would be
+# $USER_REPO), and the user's local and remote-tracking PR base. The user's
+# repository-local config — its `origin`, the user's real remote, among it —
+# is carried in by `run_rebaser` (`_carry_repo_config`), in the one python
+# seam this step already runs. Returns non-zero when it cannot be made; the
+# caller then skips the rebase, as it always has for a worktree it could not
+# create.
+_host_finalize_rebase_repo() {
+  local dir="$1" branch="$2" base="$3"
+  git clone --quiet --bare --shared --no-tags --single-branch \
+    --branch "$branch" "$USER_REPO" "$dir" >/dev/null 2>&1 || return 1
+  git -C "$dir" remote remove origin >/dev/null 2>&1 || return 1
+  local ref
+  for ref in "refs/heads/$base" "refs/remotes/origin/$base"; do
+    if git -C "$USER_REPO" rev-parse --verify -q "$ref" >/dev/null 2>&1; then
+      git -C "$dir" -c core.hooksPath=/dev/null fetch --quiet --no-tags \
+        --no-write-fetch-head "$USER_REPO" "+$ref:$ref" >/dev/null 2>&1 \
+        || return 1
+    fi
+  done
+  return 0
+}
+
 host_finalize() {
   local run_dir="$1"
   if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
     echo "host_finalize: missing or invalid <run-dir>: $run_dir" >&2
     return 1
   fi
+  # The run branch lives in the run's own repository until it is brought
+  # back; every finalize path reads it from the user's repository below.
+  host_bring_back_run_branch "$run_dir" || true
 
   local run_json="$run_dir/run.json"
   local state_json="$run_dir/state.json"
@@ -587,10 +677,19 @@ host_finalize() {
        >/dev/null 2>&1 || \
      git -C "$USER_REPO" ls-remote --exit-code --heads origin \
        "$pr_base_branch" >/dev/null 2>&1; then
-    local _rebase_scratch _rebase_worktree
+    local _rebase_scratch _rebase_worktree _rebase_repo
     _rebase_scratch="$(mktemp -d)"
     _rebase_worktree="$_rebase_scratch/rebase-${run_id}"
-    if git -C "$USER_REPO" -c core.hooksPath=/dev/null worktree add \
+    # The rebaser's own repository (DESIGN §6 *The run's own repository*):
+    # a worker never gets a linked worktree of the user's repository, whose
+    # refs, stash and config it would share. Host-side and gone with this
+    # function, so it may borrow the user's objects (`--shared`). Its `origin`
+    # is the user's, carried by the same config rule as the run's repository;
+    # the user's last-fetched view of the PR base comes along.
+    _rebase_repo="$_rebase_scratch/rebase-${run_id}.git"
+    if _host_finalize_rebase_repo "$_rebase_repo" "$run_branch" \
+         "$pr_base_branch" && \
+       git -C "$_rebase_repo" -c core.hooksPath=/dev/null worktree add \
          "$_rebase_worktree" "$run_branch" \
          >/dev/null 2>&1; then
       echo "[leerie] finalize: attempting rebase of $run_branch onto $pr_base_branch" >&2
@@ -674,10 +773,21 @@ PY
       # "rebased" claim always has a scratch-ref snapshot available; unused
       # scratch refs are deleted below.
       local _rebase_scratch_ref="refs/leerie-rebase-scratch/${run_id}"
-      git -C "$USER_REPO" fetch "$_rebase_worktree" \
+      git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch \
+        --no-write-fetch-head --no-auto-maintenance "$_rebase_worktree" \
         "HEAD:$_rebase_scratch_ref" --force >/dev/null 2>&1 || true
-      git -C "$USER_REPO" worktree remove --force "$_rebase_worktree" \
-        >/dev/null 2>&1 || true
+      # The PR base as the rebaser fetched it: the one remote-tracking ref
+      # finalize reads afterwards (`working_branch=origin/<base>` below).
+      # It used to reach the user's repository through the shared worktree.
+      if [ "$_rebaser_status" = "rebased" ] && git -C "$_rebase_repo" \
+           rev-parse --verify -q "refs/remotes/origin/$pr_base_branch" \
+           >/dev/null 2>&1; then
+        git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch --quiet \
+          --no-tags --no-write-fetch-head --no-auto-maintenance \
+          "$_rebase_repo" \
+          "+refs/remotes/origin/$pr_base_branch:refs/remotes/origin/$pr_base_branch" \
+          >/dev/null 2>&1 || true
+      fi
       rm -rf "$_rebase_scratch" 2>/dev/null || true
 
       case "$_rebaser_status" in

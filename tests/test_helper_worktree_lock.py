@@ -39,6 +39,9 @@ def _st(tmp_path: Path):
     run_id = "20261028-abcdef-0123"
     run_dir = tmp_path / "state" / "runs" / run_id
     (run_dir / "worktrees").mkdir(parents=True)
+    # The run's own repository (DESIGN §6 *The run's own repository*):
+    # every helper worktree is added there, under its lock.
+    _git(tmp_path, "clone", "-q", "--bare", str(repo), str(run_dir / "repo"))
     return types.SimpleNamespace(repo_root=repo, run_dir=run_dir,
                                  run_id=run_id)
 
@@ -56,8 +59,8 @@ def test_the_add_waits_for_the_repository_lock(leerie, tmp_path):
     """Hold the lock the scripts take; the add must not happen until it is
     released, then succeed."""
     st = _st(tmp_path)
-    common = Path(_git(st.repo_root, "rev-parse", "--path-format=absolute",
-                       "--git-common-dir").strip())
+    common = Path(_git(st.run_dir / "repo", "rev-parse",
+                       "--path-format=absolute", "--git-common-dir").strip())
     fd = os.open(str(common / "leerie-worktree.lock"),
                  os.O_WRONLY | os.O_CREAT, 0o644)
     fcntl.flock(fd, fcntl.LOCK_EX)
@@ -74,7 +77,7 @@ def test_the_add_waits_for_the_repository_lock(leerie, tmp_path):
     t.join(30)
     assert out["r"].returncode == 0, out["r"].stderr
     assert (wt / "a.txt").is_file()
-    listed = _git(st.repo_root, "worktree", "list", "--porcelain")
+    listed = _git(st.run_dir / "repo", "worktree", "list", "--porcelain")
     assert f"worktree {wt.resolve()}" in listed
 
 
@@ -110,8 +113,8 @@ def test_the_add_does_not_block_the_event_loop(leerie, tmp_path):
     and the add still waits for the lock."""
     import asyncio
     st = _st(tmp_path)
-    common = Path(_git(st.repo_root, "rev-parse", "--path-format=absolute",
-                       "--git-common-dir").strip())
+    common = Path(_git(st.run_dir / "repo", "rev-parse",
+                       "--path-format=absolute", "--git-common-dir").strip())
     fd = os.open(str(common / "leerie-worktree.lock"),
                  os.O_WRONLY | os.O_CREAT, 0o644)
     fcntl.flock(fd, fcntl.LOCK_EX)

@@ -11,6 +11,7 @@ net, the `blocked` die() path, and the integration-integrity shortfall gate
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -20,10 +21,16 @@ def _mock_st(waves, **extra_data):
     st = mock.Mock()
     st.data = {"waves": waves, "completed_waves": 0,
                "subtask_status": {}, "integration_gate": {},
-               "skip_base_baseline": True, **extra_data}
+               "skip_base_baseline": True,
+               # Recorded at the run-branch cut (DESIGN §6 *The run's own
+               # repository*); a Mock state has no repository to read it from.
+               "base_sha": "0" * 40, **extra_data}
     st.save = mock.Mock()
     st.repo_root = "/tmp/repo"
     st.path = "/tmp/state.json"
+    # A run directory with no run repository in it (DESIGN §6 *The run's
+    # own repository*): a branch read there answers "" like a missing ref.
+    st.run_dir = Path("/nonexistent-leerie-run-dir")
     return st
 
 

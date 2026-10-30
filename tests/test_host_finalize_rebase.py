@@ -360,3 +360,50 @@ def test_pr_diff_base_correct_after_successful_rebase(tmp_path):
     # depends on. A worktree-mutation-level proof is covered by the two
     # live trials in the plan file, not re-derived here.
     assert "rebased leerie/runs/test-run onto main" in r.stderr
+
+
+def test_the_rebaser_works_in_a_repository_of_its_own(tmp_path):
+    """DESIGN §6 *The run's own repository*: the rebaser's worktree belongs
+    to a host-side repository of its own, never to the user's — while it
+    runs, the user's repository registers no worktree but its own checkout
+    and holds no stash or branch of the rebaser's; afterwards nothing of it
+    is left there. Recorded from inside the seam, where the worker would
+    run."""
+    repo = _make_diverged_repo(tmp_path)
+    run_git_repo_first(repo, "stash", "list")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    seen = tmp_path / "seen"
+    p = bin_dir / "python3"
+    p.write_text(f"""#!/usr/bin/env bash
+script="$1"
+if [ -f "$script" ] && grep -q run_rebaser "$script"; then
+  wt="$5"
+  for _out; do :; done
+  git -C "$wt" rev-parse --path-format=absolute --git-common-dir > {seen}.common
+  git -C "{repo}" worktree list --porcelain > {seen}.userlist
+  printf '%s' '{_rebaser_result("failed", diagnosis="x")}' > "$_out"
+  exit 0
+fi
+exec /usr/bin/python3 "$@"
+""")
+    p.chmod(0o755)
+    run_dir = _make_run(tmp_path, repo, "test-run", run_json={
+        "branch": "leerie/runs/test-run",
+        "working_branch": "main",
+        "pr_base_branch": "main",
+        "finished_at": "2026-07-31T00:00:00+00:00",
+    })
+    r = _run_host_finalize(tmp_path, repo, run_dir, bin_dir)
+    assert r.returncode == 0, r.stderr
+    common = Path((tmp_path / "seen.common").read_text().strip())
+    assert common.resolve() != (repo / ".git").resolve()
+    assert common.name == "rebase-test-run.git"
+    userlist = (tmp_path / "seen.userlist").read_text()
+    assert userlist.count("worktree ") == 1
+    after = run_git_repo_first(repo, "worktree", "list", "--porcelain").stdout
+    assert after.count("worktree ") == 1
+    refs = run_git_repo_first(repo, "for-each-ref", "--format=%(refname)",
+                              "refs/leerie-rebase-scratch").stdout
+    assert refs.strip() == ""
+    assert not common.exists()          # gone with finalize's scratch dir

@@ -44,8 +44,12 @@ def _setup(leerie, tmp_path, monkeypatch):
         (wt / "tests" / "conftest.py").write_text(CONFTEST)
         _git(wt, "add", "tests/conftest.py")
         _git(wt, "commit", "-qm", "deps-backed suite")
-    run["st"].data["conformance"]["_baseline"]["sha"] = _git(
-        repo, "rev-parse", "HEAD")
+    base = _git(repo, "rev-parse", "HEAD")
+    run["st"].data["conformance"]["_baseline"]["sha"] = base
+    # Measured in the run's own repository (DESIGN §6 *The run's own
+    # repository*): the base commit made in the user's repository above is
+    # fetched there, as leerie fetches a commit it read in the checkout.
+    assert leerie._run_repo_commit(run["st"], base, "refs/leerie/test-base")
     flag = tmp_path / "registry-down"
     bindir = tmp_path / "bin"
     bindir.mkdir()

@@ -84,7 +84,7 @@ def env(leerie, tmp_path):
 
 
 def _stub_run_script_ok(leerie_mod, monkeypatch, worktree_path):
-    async def _fake(name, *args):
+    async def _fake(name, *args, **_kw):
         assert name == "new-worktree.sh"
         return subprocess.CompletedProcess(
             args=["bash"], returncode=0, stdout=f"{worktree_path}\n", stderr="")
@@ -94,7 +94,7 @@ def _stub_run_script_ok(leerie_mod, monkeypatch, worktree_path):
 def _stub_claude_p_capture(leerie_mod, monkeypatch, calls):
     async def _fake(user_prompt, system_prompt, *, schema_key, cwd,
                     allowed_tools, max_turns, autonomous, caps, st, model,
-                    sid, add_dirs=None, effort=None, _suppress_capture=False):
+                    sid, add_dirs=None, effort=None, _suppress_capture=False, **_kw):
         calls.append({"user_prompt": user_prompt, "schema_key": schema_key,
                      "cwd": cwd, "model": model, "sid": sid})
         return {"subtask_id": sid, "status": "complete", "branch": "b"}
@@ -287,7 +287,7 @@ def test_worktree_setup_error_on_nonzero_returncode(env, monkeypatch):
     through the real function body rather than a stub of it."""
     leerie_mod = env["leerie"]
 
-    async def _fake(name, *args):
+    async def _fake(name, *args, **_kw):
         return subprocess.CompletedProcess(
             args=["bash"], returncode=1, stdout="", stderr="fatal: exists")
     monkeypatch.setattr(leerie_mod, "_run_script", _fake)

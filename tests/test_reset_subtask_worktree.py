@@ -35,12 +35,23 @@ def _make_repo(path: Path) -> Path:
     return path
 
 
+def _run_repo(repo: Path, leerie_dir: Path) -> Path:
+    """The run's own repository (DESIGN §6 *The run's own repository*): a
+    bare repository at `<run-dir>/repo` holding the run's branches, where
+    every worktree of the run is registered."""
+    run_repo = leerie_dir / "repo"
+    run_repo.parent.mkdir(parents=True, exist_ok=True)
+    _git("clone", "-q", "--bare", str(repo), str(run_repo), cwd=repo)
+    return run_repo
+
+
 def test_noop_when_neither_worktree_nor_branch_exists(leerie, tmp_path, monkeypatch):
     """Idempotent: when the worktree and branch are already absent the helper
     returns cleanly. This is the steady-state on a fresh subtask."""
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
+    run_repo = _run_repo(repo, leerie_dir)
     (leerie_dir / "worktrees").mkdir(parents=True)
 
     # Should not raise.
@@ -48,7 +59,7 @@ def test_noop_when_neither_worktree_nor_branch_exists(leerie, tmp_path, monkeypa
 
     # No worktree dir was created; no branch was created.
     assert not (leerie_dir / "worktrees" / "run-id-sid-x").exists()
-    branches = _git("branch", "--list", "leerie/subtasks/run-id/sid-x", cwd=repo)
+    branches = _git("branch", "--list", "leerie/subtasks/run-id/sid-x", cwd=run_repo)
     assert branches.stdout.strip() == ""
 
 
@@ -58,25 +69,26 @@ def test_removes_existing_worktree_and_branch(leerie, tmp_path, monkeypatch):
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
+    run_repo = _run_repo(repo, leerie_dir)
     wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.parent.mkdir(parents=True)
 
     # Set up the run branch (parent of the subtask branch) and the subtask
     # worktree the way scripts/new-worktree.sh would.
-    _git("branch", "leerie/runs/run-id", "main", cwd=repo)
+    _git("branch", "leerie/runs/run-id", "main", cwd=run_repo)
     r = _git("worktree", "add", str(wt_dir), "-b",
-             "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=repo)
+             "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=run_repo)
     assert r.returncode == 0, r.stderr
     assert wt_dir.exists()
     show = _git("show-ref", "--verify", "--quiet",
-                "refs/heads/leerie/subtasks/run-id/sid-x", cwd=repo)
+                "refs/heads/leerie/subtasks/run-id/sid-x", cwd=run_repo)
     assert show.returncode == 0
 
     asyncio.run(leerie._reset_subtask_worktree("sid-x", leerie_dir, "run-id"))
 
     assert not wt_dir.exists()
     show = _git_noraise("show-ref", "--verify", "--quiet",
-                "refs/heads/leerie/subtasks/run-id/sid-x", cwd=repo)
+                "refs/heads/leerie/subtasks/run-id/sid-x", cwd=run_repo)
     assert show.returncode != 0
 
 
@@ -89,10 +101,11 @@ def test_reset_falls_back_to_rmtree_when_git_leaves_dir_behind(
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
+    run_repo = _run_repo(repo, leerie_dir)
     wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.mkdir(parents=True)
     (wt_dir / "leftover.txt").write_text("stray\n")
-    r = _git_noraise("worktree", "remove", "--force", str(wt_dir), cwd=repo)
+    r = _git_noraise("worktree", "remove", "--force", str(wt_dir), cwd=run_repo)
     assert r.returncode != 0
     assert wt_dir.exists()
 
@@ -113,7 +126,7 @@ def test_reset_passes_a_bounded_timeout_to_run_proc_for_worktree_remove(
     captured = {}
 
     async def fake_run_proc(cmd, **kwargs):
-        if cmd[:3] == ["git", "worktree", "remove"]:
+        if cmd[0] == "git" and "worktree" in cmd and "remove" in cmd:
             captured.update(kwargs)
         return subprocess.CompletedProcess(cmd, 0, "", "")
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
@@ -134,7 +147,7 @@ def test_reset_survives_a_worktree_remove_timeout(leerie, monkeypatch):
     `subprocess.TimeoutExpired` propagate uncaught — falling through to
     the existing rmtree fallback rather than crashing the wave."""
     async def fake_run_proc(cmd, **kwargs):
-        if cmd[:3] == ["git", "worktree", "remove"]:
+        if cmd[0] == "git" and "worktree" in cmd and "remove" in cmd:
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 240)
         return subprocess.CompletedProcess(cmd, 0, "", "")
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
@@ -152,23 +165,24 @@ def test_resets_so_worktree_add_b_succeeds_on_retry(leerie, tmp_path, monkeypatc
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
+    run_repo = _run_repo(repo, leerie_dir)
     wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.parent.mkdir(parents=True)
-    _git("branch", "leerie/runs/run-id", "main", cwd=repo)
+    _git("branch", "leerie/runs/run-id", "main", cwd=run_repo)
 
     # Attempt #1: succeeds.
     r1 = _git("worktree", "add", str(wt_dir), "-b",
-              "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=repo)
+              "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=run_repo)
     assert r1.returncode == 0
 
     # Attempt #2 without reset: fails because branch already exists.
     r2 = _git_noraise("worktree", "add", str(wt_dir) + "-again", "-b",
-              "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=repo)
+              "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=run_repo)
     assert r2.returncode != 0
     assert "already exists" in r2.stderr
 
     # Reset → attempt #3 succeeds (a fresh "new-worktree.sh" pass).
     asyncio.run(leerie._reset_subtask_worktree("sid-x", leerie_dir, "run-id"))
     r3 = _git("worktree", "add", str(wt_dir), "-b",
-              "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=repo)
+              "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=run_repo)
     assert r3.returncode == 0, r3.stderr

@@ -28,6 +28,12 @@ def st(leerie, tmp_path):
                  ["commit", "-q", "--allow-empty", "-m", "base"]):
         subprocess.run(["git", *args], cwd=repo, check=True,
                        capture_output=True)
+    # The run branch lives in the run's own repository (DESIGN §6 *The
+    # run's own repository*), where `_shipping_tree` reads it.
+    run_repo = leerie._ensure_run_repo(s)
+    subprocess.run(["git", "-C", str(run_repo), "branch",
+                    "leerie/runs/fix-001-abcdef", "refs/leerie/user-head"],
+                   check=True, capture_output=True)
     return s
 
 
@@ -155,7 +161,7 @@ def test_phase_finalize_records_the_outcome_in_run_json(
     import asyncio
     import subprocess
 
-    async def _fake_run_script(name, *args):
+    async def _fake_run_script(name, *args, **_kw):
         return subprocess.CompletedProcess(["bash", name, *args], 0, "", "")
 
     async def _fake_run_proc(cmd, **kwargs):

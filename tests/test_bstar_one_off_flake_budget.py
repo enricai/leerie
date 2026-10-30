@@ -14,6 +14,8 @@ import subprocess
 
 import pytest
 
+from tests.conftest import relocate_into_run_repo
+
 CMD = "python3 -m pytest -q -p no:cacheprovider tests"
 SUITE = '''\
 import os, time
@@ -68,6 +70,8 @@ def repo(leerie, tmp_path):
                "baseline_failing_ids": []}
     st.repo_root = repo
     st.save()
+    # The run's own repository (DESIGN §6 *The run's own repository*).
+    relocate_into_run_repo(leerie, st)
     return {"st": st, "staging": staging}
 
 

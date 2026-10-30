@@ -331,7 +331,7 @@ def _stub_finalize_subprocesses(leerie, monkeypatch):
     run branch via `git show-ref`. None of that is this subtask's concern —
     stub the process boundary so the surrounding Python logic runs for
     real."""
-    async def _fake_run_script(name, *args):
+    async def _fake_run_script(name, *args, **_kw):
         return subprocess.CompletedProcess(["bash", name, *args], 0, "", "")
 
     async def _fake_run_proc(cmd, **kwargs):
@@ -352,6 +352,9 @@ def _finalize_ready_state(st):
     st.data["worker_count"] = 2
     st.data["subtask_status"] = {"feat-001": "complete"}
     st.data["working_branch"] = "main"
+    # The commit the run branch was cut from (DESIGN §6 *The run's own
+    # repository*): finalize counts from it.
+    st.data.setdefault("base_sha", "0" * 40)
 
 
 @pytest.fixture(scope="session")
@@ -381,16 +384,22 @@ class TestEmptyRunBranchAgainstRealGit:
     """
 
     @staticmethod
-    def _make_run_branch(repo, ahead: int):
-        """Create `leerie/runs/r1` either equal to main or `ahead` commits
-        past it, using real git."""
-        _run(["git", "branch", "-f", "leerie/runs/r1", "main"], repo)
+    def _make_run_branch(leerie, st, ahead: int):
+        """Create `leerie/runs/r1` in the run's own repository (DESIGN §6
+        *The run's own repository*), cut from main (`base_sha`) and either
+        equal to it or `ahead` commits past it, using real git."""
+        st.data["working_branch"] = "main"
+        run_repo = leerie._ensure_run_repo(st)
+        wt = st.run_dir / "worktrees" / "staging"
+        _run(["git", "worktree", "add", "-q", "-b", "leerie/runs/r1",
+              str(wt), "main"], run_repo)
+        st.data["base_sha"] = subprocess.run(
+            ["git", "rev-parse", "main"], cwd=run_repo, check=True,
+            capture_output=True, text=True).stdout.strip()
         for i in range(ahead):
-            _run(["git", "checkout", "-q", "leerie/runs/r1"], repo)
-            (repo / f"landed{i}.txt").write_text(f"work {i}\n")
-            _run(["git", "add", "-A"], repo)
-            _run(["git", "commit", "-qm", f"work {i}"], repo)
-            _run(["git", "checkout", "-q", "main"], repo)
+            (wt / f"landed{i}.txt").write_text(f"work {i}\n")
+            _run(["git", "add", "-A"], wt)
+            _run(["git", "commit", "-qm", f"work {i}"], wt)
 
     @staticmethod
     def _install_real_git(monkeypatch, leerie, pristine_run_proc, scripts,
@@ -398,15 +407,13 @@ class TestEmptyRunBranchAgainstRealGit:
         """Real `run_proc`; only the shell scripts stay stubbed.
 
         `chdir(repo)` mirrors production: leerie runs with the process cwd
-        set to the target repo, which is what `_run_script` relies on
-        (`cwd=os.getcwd()`) and what phase_finalize's post-cleanup
-        `git show-ref` — which passes no explicit cwd — resolves against.
-        Without it the real git calls would resolve against pytest's own
-        cwd and fail for reasons that have nothing to do with the guard.
+        set to the user's checkout. The guard's count runs in the run's own
+        repository (`<run-dir>/repo`, DESIGN §6 *The run's own
+        repository*), never in the cwd or the state root.
         """
         monkeypatch.chdir(repo)
 
-        async def _fake_run_script(name, *args):
+        async def _fake_run_script(name, *args, **_kw):
             scripts.append(name)
             return subprocess.CompletedProcess(["bash", name], 0, "", "")
 
@@ -419,7 +426,7 @@ class TestEmptyRunBranchAgainstRealGit:
 
     def test_real_empty_branch_routes_to_no_work(
             self, leerie, monkeypatch, st, repo, pristine_run_proc):
-        self._make_run_branch(repo, ahead=0)
+        self._make_run_branch(leerie, st, ahead=0)
         scripts = []
         self._install_real_git(monkeypatch, leerie, pristine_run_proc,
                                scripts, repo)
@@ -438,7 +445,7 @@ class TestEmptyRunBranchAgainstRealGit:
             self, leerie, monkeypatch, st, repo, pristine_run_proc):
         """The dangerous direction: a false positive here would discard a
         completed run as 'no work required'."""
-        self._make_run_branch(repo, ahead=2)
+        self._make_run_branch(leerie, st, ahead=2)
         scripts = []
         self._install_real_git(monkeypatch, leerie, pristine_run_proc,
                                scripts, repo)
@@ -460,7 +467,7 @@ class TestEmptyRunBranchAgainstRealGit:
         the branch is genuinely empty. Asserting the no-work disposition on
         an empty branch therefore proves the count was taken in the repo.
         """
-        self._make_run_branch(repo, ahead=0)
+        self._make_run_branch(leerie, st, ahead=0)
         assert not (st.leerie_root / ".git").exists(), (
             "precondition: the state root must NOT be a git repo, or this "
             "test cannot distinguish the two directories")
@@ -475,7 +482,7 @@ class TestEmptyRunBranchAgainstRealGit:
 
         assert st.data["no_work_required"] is True, (
             "guard did not see the empty branch — it likely ran outside "
-            "st.repo_root and failed open")
+            "the run's own repository and failed open")
 
 
 class TestEmptyRunBranchIsNoWorkNotAnError:
@@ -491,7 +498,7 @@ class TestEmptyRunBranchIsNoWorkNotAnError:
                 return subprocess.CompletedProcess(cmd, 0, count, "")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        async def _fake_run_script(name, *args):
+        async def _fake_run_script(name, *args, **_kw):
             if script_calls is not None:
                 script_calls.append(name)
             return subprocess.CompletedProcess(["bash", name], 0, "", "")
@@ -693,7 +700,7 @@ def test_phase_finalize_host_no_push_overrides_intent_on_fly(
 def test_phase_finalize_dies_when_finalize_sh_fails(leerie, monkeypatch, st):
     _finalize_ready_state(st)
 
-    async def _failing_run_script(name, *args):
+    async def _failing_run_script(name, *args, **_kw):
         if name == "finalize.sh":
             return subprocess.CompletedProcess(
                 ["bash", name, *args], 1, "", "run branch is empty")
@@ -706,19 +713,29 @@ def test_phase_finalize_dies_when_finalize_sh_fails(leerie, monkeypatch, st):
             st.leerie_root, st, no_push=True, no_verify=False))
 
 
-def test_phase_finalize_dies_when_branch_disappears_after_cleanup(
+def test_phase_finalize_cleanup_deletes_no_branch_so_nothing_rechecks_it(
         leerie, monkeypatch, st):
+    """Finalize's cleanup removes worktrees only — every branch of the run
+    lives in its own repository and goes with it (DESIGN §6 *The run's own
+    repository*) — so there is no "run branch disappeared after cleanup"
+    re-check to die on, even when every git call would fail. Replaces the
+    test of that removed check."""
     _finalize_ready_state(st)
+    scripts: list[tuple] = []
 
     async def _failing_run_proc(cmd, **kwargs):
-        # The `git show-ref --verify` post-cleanup check fails.
         return subprocess.CompletedProcess(cmd, 1, "", "")
 
+    async def _run_script(name, *args, **_kw):
+        scripts.append((name, *args))
+        return subprocess.CompletedProcess(["bash", name], 0, "", "")
     monkeypatch.setattr(leerie, "run_proc", _failing_run_proc)
+    monkeypatch.setattr(leerie, "_run_script", _run_script)
 
-    with pytest.raises(SystemExit):
-        asyncio.run(leerie.phase_finalize(
-            st.leerie_root, st, no_push=True, no_verify=False))
+    asyncio.run(leerie.phase_finalize(
+        st.leerie_root, st, no_push=True, no_verify=False))
+    assert st.data["finished_at"]
+    assert ("cleanup.sh", "--run-id", st.run_id) in scripts
 
 
 def test_phase_finalize_refuses_when_waves_incomplete(leerie, st):

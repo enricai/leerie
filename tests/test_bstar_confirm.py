@@ -552,22 +552,24 @@ def e3_repo(leerie, tmp_path):
     _git(repo, "commit", "-q", "-m", "base")
     base = _git(repo, "rev-parse", "HEAD")
     run_id = "fix-001-abcdef"
-    _git(repo, "checkout", "-q", "-b", f"leerie/runs/{run_id}")
-    (repo / "tests" / "test_suite.py").write_text(
-        _SUITE.format(stable="False", flaky="n % 2 == 1"))
-    _git(repo, "commit", "-q", "-am", "final")
-    _git(repo, "checkout", "-q", "main")
     leerie_root = repo / ".leerie"
     run_dir = leerie_root / "runs" / run_id
     (run_dir / "logs").mkdir(parents=True)
     (run_dir / "worktrees").mkdir(parents=True)
-    staging = run_dir / "worktrees" / "staging"
-    _git(repo, "worktree", "add", "-q", str(staging), f"leerie/runs/{run_id}")
     st = leerie.State(leerie_root, run_id)
-    st.data = {"task": "x", "working_branch": "main",
+    st.data = {"task": "x", "working_branch": "main", "base_sha": base,
                "conformance": {"_baseline": {"sha": base}}}
     st.repo_root = repo
     st.save()
+    # Staging on the run branch in the run's own repository (DESIGN §6
+    # *The run's own repository*), as setup-run.sh leaves it.
+    leerie._ensure_run_repo(st)
+    staging = run_dir / "worktrees" / "staging"
+    _git(st.run_repo, "worktree", "add", "-q", "-b", f"leerie/runs/{run_id}",
+         str(staging), base)
+    (staging / "tests" / "test_suite.py").write_text(
+        _SUITE.format(stable="False", flaky="n % 2 == 1"))
+    _git(staging, "commit", "-q", "-am", "final")
     return {"repo": repo, "staging": staging, "st": st, "base": base}
 
 
@@ -816,22 +818,24 @@ def coupled_repo(leerie, tmp_path):
     _git(repo, "commit", "-q", "-m", "base")
     base = _git(repo, "rev-parse", "HEAD")
     run_id = "fix-002-abcdef"
-    _git(repo, "checkout", "-q", "-b", f"leerie/runs/{run_id}")
-    (repo / "app" / "core.py").write_text("VALUE = 2\n")
-    _git(repo, "commit", "-q", "-am", "final")
-    _git(repo, "checkout", "-q", "main")
     leerie_root = repo / ".leerie"
     run_dir = leerie_root / "runs" / run_id
     (run_dir / "logs").mkdir(parents=True)
     (run_dir / "worktrees").mkdir(parents=True)
-    staging = run_dir / "worktrees" / "staging"
-    _git(repo, "worktree", "add", "-q", str(staging), f"leerie/runs/{run_id}")
     st = leerie.State(leerie_root, run_id)
-    st.data = {"task": "x", "working_branch": "main",
+    st.data = {"task": "x", "working_branch": "main", "base_sha": base,
                "conformance": {"_baseline": {"sha": base}},
                "baseline_failing_ids": []}
     st.repo_root = repo
     st.save()
+    # Staging on the run branch in the run's own repository (DESIGN §6
+    # *The run's own repository*), as setup-run.sh leaves it.
+    leerie._ensure_run_repo(st)
+    staging = run_dir / "worktrees" / "staging"
+    _git(st.run_repo, "worktree", "add", "-q", "-b", f"leerie/runs/{run_id}",
+         str(staging), base)
+    (staging / "app" / "core.py").write_text("VALUE = 2\n")
+    _git(staging, "commit", "-q", "-am", "final")
     return {"repo": repo, "staging": staging, "st": st, "base": base}
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import subprocess
 
 import pytest
 
@@ -47,13 +48,18 @@ def _state(leerie, tmp_path, **overrides):
     leerie_root = tmp_path / ".leerie"
     run_id = "test-delivery-gate"
     run_dir = leerie_root / "runs" / run_id
-    _delivery_tree(run_dir / "worktrees" / "staging")
+    staging = _delivery_tree(run_dir / "worktrees" / "staging")
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "test task", "worker_count": 0,
-               # The gate mirrors _run_final_conformance's own guard: no
-               # working_branch → the conformer pass it routes into
-               # would skip, so the gate skips too.
                "working_branch": "main",
+               # The gate mirrors _run_final_conformance's own guard: no
+               # base_sha (the commit the run branch was cut from) → the
+               # conformer pass it routes into would skip, so the gate
+               # skips too.
+               "base_sha": subprocess.run(
+                   ["git", "-C", str(staging), "rev-parse", "HEAD"],
+                   capture_output=True, text=True,
+                   check=True).stdout.strip(),
                "required_items": [dict(i) for i in ITEMS]}
     st.data.update(overrides)
     st.save()
@@ -285,14 +291,14 @@ def test_nested_item_value_serializes_with_sorted_keys(
         "fixture starts with zebra")
 
 
-def test_missing_working_branch_skips(leerie, tmp_path, monkeypatch):
-    """Review round 1: with working_branch absent the final-conformer
+def test_missing_base_sha_skips(leerie, tmp_path, monkeypatch):
+    """Review round 1: with the base (`base_sha`) absent the final-conformer
     pass skips, so the gate must not spend judge samples on a routing
     target that will not run (and a recheck that would then report
     'still unmet after the final-conformer pass' for a pass that never
     ran)."""
     st, run_dir = _state(leerie, tmp_path)
-    del st.data["working_branch"]
+    del st.data["base_sha"]
     st.save()
     calls = _patch_judge(leerie, monkeypatch, [])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
@@ -359,17 +365,17 @@ def test_non_string_item_value_survives_the_recheck_residual_log(
     assert any("delivery gate residual" in ln for ln in lines)
 
 
-def test_recheck_skips_without_working_branch(
+def test_recheck_skips_without_base_sha(
         leerie, tmp_path, monkeypatch):
-    """Review round 2: the prejudge's working_branch guard sat below its
+    """Review round 2: the prejudge's base guard sat below its
     resume early-return, so a resume carrying unmet_before with
-    working_branch since lost spent 3 samples and logged a residual for
+    the base since lost spent 3 samples and logged a residual for
     a conformer pass that skipped. Both halves must refuse
     independently."""
     st, run_dir = _state(leerie, tmp_path, delivery_gate={
         "unmet_before": [{"item_index": 0, "item": "x", "evidence": "e"}],
         "samples_before": 3})
-    del st.data["working_branch"]
+    del st.data["base_sha"]
     st.save()
     calls = _patch_judge(leerie, monkeypatch, [])
     # The prejudge resume path must not hand back a truthy list either.

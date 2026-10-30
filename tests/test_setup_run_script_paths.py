@@ -232,7 +232,7 @@ def test_integrate_branch_uses_subtasks_namespace():
 
 def test_finalize_takes_run_id_arg():
     src = _script("finalize.sh")
-    assert 'RUN_ID="${1:?usage: finalize.sh <run-id>}"' in src
+    assert 'RUN_ID="${1:?usage: finalize.sh <run-id> [<base>]}"' in src
 
 
 def test_finalize_references_per_run_branch():

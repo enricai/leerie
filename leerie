@@ -1531,6 +1531,7 @@ PY
       ''|*[!0-9]*) echo "leerie prune: --older-than needs a whole number of days" >&2; exit 1 ;;
     esac
     LEERIE_PRUNE_DAYS="$_prune_days" LEERIE_PRUNE_APPLY="$_prune_apply" \
+      LEERIE_PRUNE_HOST_FINALIZE="$LEERIE_REPO/scripts/host-finalize.sh" \
       python3 - "$LEERIE_STATE_HOST_DIR" "$USER_REPO" <<'PY'
 import fcntl, json, os, pathlib, shutil, subprocess, sys, time
 
@@ -1728,6 +1729,24 @@ def _last_activity(d) -> float:
     return max(ts)
 
 
+def _bring_back(d) -> bool:
+    """`host_bring_back_run_branch` (scripts/host-finalize.sh) for run dir
+    `d`: the one implementation of the bring-back and its compare-and-swap.
+    True when it returned 0."""
+    lib = os.environ.get("LEERIE_PRUNE_HOST_FINALIZE", "")
+    if not lib:
+        return False
+    try:
+        r = subprocess.run(
+            ["bash", "-c", '. "$1" && host_bring_back_run_branch "$2"', "_",
+             lib, str(d)],
+            env={**os.environ, "USER_REPO": str(repo)}, check=False,
+            timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
 def _reap_worktrees(d) -> int:
     """Delete an idle, non-live run's `worktrees/` only (its state, logs and
     branches stay, so it can still resume -- its scripts rebuild every
@@ -1792,6 +1811,15 @@ if runs.is_dir():
         # Terminal AND old AND not live. The first two are timestamps and a
         # timestamp cannot see a running orchestrator -- see `_is_live`.
         if terminal and mtime < cutoff and not _is_live(d, d.name):
+            # The run's branch lives in its own repository until it is
+            # brought back (DESIGN §6 *The run's own repository*): bring it
+            # back before the directory goes, or keep the directory.
+            if apply and (d / "repo" / "HEAD").is_file() \
+                    and not _bring_back(d):
+                print(f"  kept run dir {d.name}: its run branch could not be "
+                      "brought back into your repository")
+                live.add(d.name)
+                continue
             freed += size_of(d)
             runs_removed.append(d.name)
             try:
@@ -3604,6 +3632,11 @@ except Exception:
       # was deleted — where host_finalize would otherwise fail further in
       # with a message about run.json rather than about the missing branch.
       _fin_local_branch="$(_json_get "$_fin_run_dir/run.json" "branch")"
+      # The run branch lives in the run's own repository until it is brought
+      # back into yours (DESIGN §6 *The run's own repository*).
+      # shellcheck source=scripts/host-finalize.sh
+      . "$LEERIE_REPO/scripts/host-finalize.sh"
+      host_bring_back_run_branch "$_fin_run_dir" || true
       _fin_local_no_push="$(python3 -c '
 import json, sys
 try:
@@ -3618,7 +3651,7 @@ except Exception:
         remote_log "finalize: local run $_fin_run_id has no run branch in $USER_REPO"
         remote_log "  Expected branch: ${_fin_local_branch:-<none recorded in run.json>}"
         remote_log "  Nothing to push. The per-subtask work (if any) is on the"
-        remote_log "  leerie/subtasks/$_fin_run_id/* branches."
+        remote_log "  leerie/subtasks/$_fin_run_id/* branches of $_fin_run_dir/repo."
         exit 1
       fi
       remote_log "finalize: local run $_fin_run_id; state and branch already on this host, skipping fetch"
@@ -9202,6 +9235,24 @@ fi
 #   - --no-push set (the user explicitly opted out)
 #   - the structured-exit code (EXIT_NEEDS_ANSWERS=10) — the launcher's
 #     plugin re-runs leerie with --answers after the user responds.
+# Bring the run branch back from the run's own repository into yours
+# (DESIGN §6 *The run's own repository*) after every local run, whatever its
+# exit code and with or without --no-push: the branch is the run's record
+# for you. The run is known here by --run-id / `resume <id>`, or by the
+# cidfile for a fresh run; a bare `resume` that auto-picked is brought back
+# by its finalize (`host_finalize`), `leerie finalize <id>`, or `prune`.
+if [ "$RUNTIME" = "local" ]; then
+  _bb_run_id="${LEERIE_RUN_ID:-}"
+  if [ -z "$_bb_run_id" ] && [ -f "${_cidfile:-}" ]; then
+    _bb_run_id="$(cat "$_cidfile" 2>/dev/null || true)"
+  fi
+  if [ -n "$_bb_run_id" ] && [ -f "$LEERIE_STATE_HOST_DIR/runs/$_bb_run_id/repo/HEAD" ]; then
+    # shellcheck source=scripts/host-finalize.sh
+    . "$LEERIE_REPO/scripts/host-finalize.sh"
+    host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_bb_run_id" || true
+  fi
+  unset _bb_run_id
+fi
 if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
   if [ "$container_rc" -ne 0 ]; then
     # Prefer the explicit/positional run id (--run-id / `resume <id>`)

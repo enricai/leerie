@@ -306,6 +306,11 @@ def test_prejudge_sends_the_sections_and_records_counts(
     st = _risk_state(leerie, tmp_path, "assumes feat-002 emits mode 'auto'")
     st.data.update({
         "task": "t", "required_items": [{"item": "never name the site"}],
+        # The prejudge runs only with the base the run branch was cut from
+        # (DESIGN §6 *The run's own repository*).
+        "base_sha": subprocess.run(
+            ["git", "-C", str(staging), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip(),
         "contract_literal_checks": {"feat-001#1": {
             "owner_sid": "feat-001", "risk_index": 1,
             "detail": "assumes feat-002 emits mode 'auto'", "where": "",

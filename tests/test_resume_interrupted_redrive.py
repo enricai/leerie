@@ -129,7 +129,7 @@ def _run_branch_file(repo: Path, name: str) -> str | None:
 
 def _resume(leerie, root: Path, repo: Path):
     st2 = leerie.State(root, RUN_ID)
-    st2.repo_root = repo
+    st2.repo_root = root.parent
     assert st2.load()
     return st2
 

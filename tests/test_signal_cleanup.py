@@ -328,40 +328,28 @@ def test_cleanup_no_purge_preserves_run_dir(leerie, tmp_path, monkeypatch):
     assert (run_dir / "state.json").exists(), "state.json must survive non-purge cleanup"
 
 
-def test_cleanup_full_purge_deletes_branches(leerie, tmp_path, monkeypatch):
-    """full_purge=True invokes `git for-each-ref` to enumerate branches
-    and `git branch -D` to delete each one."""
+def test_cleanup_full_purge_deletes_no_branch(leerie, tmp_path, monkeypatch):
+    """full_purge=True removes the run directory — the run's own repository
+    (`<run-dir>/repo`) with it, which holds every branch of the run (DESIGN
+    §6 *The run's own repository*) — and runs no `git for-each-ref` or
+    `git branch -D`: nothing of the run is in the user's repository to
+    delete. It replaces the branch enumeration this test used to pin."""
     run_id = "feat-x-aaa111"
     run_dir = tmp_path / "runs" / run_id
-    run_dir.mkdir(parents=True)
+    (run_dir / "repo").mkdir(parents=True)
     st = _FakeState(run_id, run_dir)
-
-    branches_to_delete = [
-        f"leerie/runs/{run_id}",
-        f"leerie/subtasks/{run_id}/feat-001",
-    ]
     calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
-        if cmd[:2] == ["git", "for-each-ref"]:
-            # The cleanup walks two globs: refs/heads/leerie/runs/<id>
-            # (the run branch, exact match) and refs/heads/leerie/subtasks/<id>/
-            # (the subtask-branch prefix). Distinguish by the runs/ vs subtasks/
-            # segment so each glob returns the matching branch.
-            glob = cmd[3]
-            if glob == f"refs/heads/leerie/runs/{run_id}":
-                return subprocess.CompletedProcess(cmd, 0, f"leerie/runs/{run_id}\n", "")
-            if glob == f"refs/heads/leerie/subtasks/{run_id}/":
-                return subprocess.CompletedProcess(cmd, 0, f"leerie/subtasks/{run_id}/feat-001\n", "")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
     monkeypatch.setattr(leerie.subprocess, "run", fake_run)
 
     leerie._cleanup_on_abnormal_exit(st, full_purge=True)
 
-    delete_calls = [c for c in calls if c[:3] == ["git", "branch", "-D"]]
-    assert len(delete_calls) == 2, f"expected 2 branch deletes, got {delete_calls}"
+    assert not run_dir.exists()
+    assert [c for c in calls
+            if c[:2] == ["git", "for-each-ref"] or "-D" in c] == []
 
 
 # --- main() try/except/finally pinning -----------------------------------
@@ -797,49 +785,6 @@ def test_cleanup_skips_non_directory_entries_in_worktrees_dir(leerie, tmp_path,
     # The file itself is untouched — the loop's `continue` skips it
     # entirely rather than attempting any removal.
     assert (worktrees_dir / "stray.lock").exists()
-
-
-def test_cleanup_full_purge_skips_failed_for_each_ref_and_blank_lines(
-        leerie, tmp_path, monkeypatch):
-    """Full-purge branch deletion must tolerate a `git for-each-ref` that
-    fails for one glob (nonzero exit — e.g. a corrupt or missing ref
-    namespace) by moving on to the next glob, and must skip blank lines
-    in a successful glob's stdout rather than passing an empty string to
-    `git branch -D`."""
-    run_id = "feat-x-aaa111"
-    run_dir = tmp_path / "runs" / run_id
-    run_dir.mkdir(parents=True)
-    st = _FakeState(run_id, run_dir)
-
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        if cmd[:2] == ["git", "for-each-ref"]:
-            glob = cmd[3]
-            if glob == f"refs/heads/leerie/runs/{run_id}":
-                # This glob fails outright (nonzero exit).
-                return subprocess.CompletedProcess(cmd, 1, "", "error")
-            if glob == f"refs/heads/leerie/subtasks/{run_id}/":
-                # Blank lines interleaved with one real ref must be
-                # skipped rather than turned into a `git branch -D ""`
-                # call.
-                return subprocess.CompletedProcess(
-                    cmd, 0,
-                    f"\nleerie/subtasks/{run_id}/feat-001\n\n", "")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
-
-    leerie._cleanup_on_abnormal_exit(st, full_purge=True)
-
-    delete_calls = [c for c in calls if c[:3] == ["git", "branch", "-D"]]
-    assert delete_calls == [
-        ["git", "branch", "-D", f"leerie/subtasks/{run_id}/feat-001"]
-    ], (
-        f"expected exactly one delete for the real ref, with the failed "
-        f"glob and blank lines both skipped: {delete_calls}"
-    )
 
 
 def test_prune_leerie_worktrees_removes_matching_stale_entry(leerie, tmp_path,

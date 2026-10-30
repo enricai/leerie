@@ -80,6 +80,9 @@ def _st(leerie, tmp_path, repo, head, **data):
                "worker_count": 0}
     st.data.update(data)
     st.save()
+    # The run's own repository, as `_run_phases` makes it before any tree a
+    # worker gets (DESIGN §6 *The run's own repository*).
+    leerie._ensure_run_repo(st)
     return st
 
 

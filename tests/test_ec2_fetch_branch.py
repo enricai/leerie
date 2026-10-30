@@ -132,6 +132,10 @@ def _init_instance_repo_with_run(
 
     runs_dir = instance_work / ".leerie" / "runs" / run_id
     runs_dir.mkdir(parents=True)
+    # The run's own repository (DESIGN §6 *The run's own repository*):
+    # every branch of the run lives there; the instance repo's git dir
+    # stands in.
+    (runs_dir / "repo").symlink_to(instance_work / ".git")
     (runs_dir / "run.json").write_text(json.dumps({
         "finished_at": "2026-01-01T00:00:00Z",
         "branch": run_branch,
@@ -344,6 +348,10 @@ def test_fetch_state_ec2_skips_bundle_and_preserves_no_push_when_branch_missing(
     run_branch = f"leerie/runs/{run_id}"
     runs_dir = instance_work / ".leerie" / "runs" / run_id
     runs_dir.mkdir(parents=True)
+    # The run's own repository (DESIGN §6 *The run's own repository*):
+    # every branch of the run lives there; the instance repo's git dir
+    # stands in.
+    (runs_dir / "repo").symlink_to(instance_work / ".git")
     (runs_dir / "run.json").write_text(json.dumps({
         "finished_at": "2026-05-31T20:00:00Z",
         "no_push": True,

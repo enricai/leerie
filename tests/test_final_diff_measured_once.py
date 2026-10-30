@@ -151,7 +151,7 @@ def test_an_untracked_module_that_made_the_suite_pass_is_never_reused(
     assert leerie._format_pr_end_state_section(st.data) != ""
     # What ships really fails test_m.
     co = tmp_path / "co"
-    _git(run["repo"], "worktree", "add", "-q", "--detach", str(co),
+    _git(st.run_repo, "worktree", "add", "-q", "--detach", str(co),
          _git(staging, "rev-parse", "HEAD"))
     r = subprocess.run(["python3", "-m", "pytest", "-q", "-p",
                         "no:cacheprovider", "tests"], cwd=co,

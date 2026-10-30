@@ -122,6 +122,9 @@ def _st(leerie, tmp_path, repo, head, **data):
                "worker_count": 0}
     st.data.update(data)
     st.save()
+    # The run's own repository, as `_run_phases` makes it before any tree a
+    # worker gets (DESIGN §6 *The run's own repository*).
+    leerie._ensure_run_repo(st)
     return st
 
 
@@ -302,8 +305,8 @@ def _staging(st, repo):
     staging = st.run_dir / "worktrees" / "staging"
     # On the run's own branch (`_compute_run_branch`), as setup-run.sh leaves
     # it: the clean-tree gate holds every worker there.
-    _git(repo, "worktree", "add", "-q", "-b", f"leerie/runs/{st.run_id}",
-         str(staging))
+    _git(st.run_repo, "worktree", "add", "-q", "-b",
+         f"leerie/runs/{st.run_id}", str(staging))
     return staging
 
 
@@ -378,7 +381,7 @@ def test_a_crashed_evaluations_worktree_is_replaced(leerie, tmp_path):
     st = _st(leerie, tmp_path, repo, head)
     staging = _staging(st, repo)
     stale = leerie._helper_worktree_path(st, "acceptance-eval")
-    _git(repo, "worktree", "add", "-q", "--detach", str(stale), head)
+    _git(st.run_repo, "worktree", "add", "-q", "--detach", str(stale), head)
     (stale / "acc").mkdir()
     (stale / "acc" / "test_defect_1.py").write_text("# left by a crash\n")
     _commit_fix(staging)

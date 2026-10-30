@@ -203,7 +203,8 @@ def test_a_correct_run_ends_done_after_cleanup_removed_staging(
     tree; cleanup then removes staging; the outcome is `done`."""
     leerie = env["leerie"]
     st, staging = env["st"], env["staging"]
-    tree = _git(env["repo"], "rev-parse", f"{env['run_branch']}^{{tree}}")
+    tree = _git(env["st"].run_repo, "rev-parse",
+                f"{env['run_branch']}^{{tree}}")
     st.data.update({
         "waves": [["feat-001"]], "completed_waves": 1,
         "subtask_status": {"feat-001": "complete"},
@@ -230,7 +231,8 @@ def test_a_verdict_of_another_tree_is_still_unconverged_after_cleanup(
     _finalize(leerie, env, monkeypatch)
     assert st.data["outcome"] == "unconverged"
     (reason,) = st.data["outcome_reasons"]
-    tree = _git(env["repo"], "rev-parse", f"{env['run_branch']}^{{tree}}")
+    tree = _git(env["st"].run_repo, "rev-parse",
+                f"{env['run_branch']}^{{tree}}")
     assert "not read on the tree that ships" in reason
     assert tree[:12] in reason
 
@@ -256,6 +258,12 @@ def test_a_no_work_run_with_a_verdict_is_no_work_after_cleanup(
                "delivery_gate": {"unmet_before": [],
                                  "judged_before": {"tree": tree}}}
     st.save()
+    # The run branch lives in the run's own repository (DESIGN §6 *The
+    # run's own repository*), where `_shipping_tree` reads it.
+    leerie._ensure_run_repo(st)
+    _git(repo, "update-ref", "-d", "refs/heads/leerie/runs/nowork-001")
+    _git(st.run_repo, "branch", "leerie/runs/nowork-001",
+         "refs/leerie/user-head")
     assert not (st.run_dir / "worktrees" / "staging").exists()
     leerie._finish_no_work_run(st, {"<finalize>": "empty"},
                                reset_plan_state=False)

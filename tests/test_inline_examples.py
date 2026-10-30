@@ -111,7 +111,7 @@ def _scope(*examples):
 def test_site_token_added_by_the_run_is_reported(leerie, tmp_path, capsys):
     leerie_dir = _staged_run(tmp_path, "generic words only\n",
                              {"src/x.ts": "// e.g. an AcmeShop-style list\n"})
-    st = _state(leerie, tmp_path, working_branch="main",
+    st = _state(leerie, tmp_path, working_branch="main", base_sha="main",
                 defect_scope=_scope(_SITE_EXAMPLE))
     hits = leerie._warn_site_token_leaks(st, leerie_dir)
     assert hits == [{"token": "acmeshop", "file": "src/x.ts",
@@ -130,7 +130,7 @@ def test_site_token_already_in_the_base_tree_is_still_reported(leerie,
     read)."""
     leerie_dir = _staged_run(tmp_path, "an acmewidget was here before\n",
                              {"src/y.ts": "const acmewidget = 1;\n"})
-    st = _state(leerie, tmp_path, working_branch="main",
+    st = _state(leerie, tmp_path, working_branch="main", base_sha="main",
                 defect_scope=_scope({**_SITE_EXAMPLE,
                                      "site_tokens": ["acmewidget"]}))
     hits = leerie._warn_site_token_leaks(st, leerie_dir)
@@ -145,7 +145,7 @@ def test_identifier_segments_are_boundaries(leerie, tmp_path):
         "src/a.ts": "const cls = 'AcmeShop_Forms_Field';\n"
                     "const longer = 'acmeshopping';\n"
                     "const host = 'api.acmewidget-fixture.example';\n"})
-    st = _state(leerie, tmp_path, working_branch="main",
+    st = _state(leerie, tmp_path, working_branch="main", base_sha="main",
                 defect_scope=_scope(_SITE_EXAMPLE))
     hits = leerie._warn_site_token_leaks(st, leerie_dir)
     assert [h["added_line"] for h in hits] == [
@@ -179,7 +179,7 @@ def test_a_guard_list_line_is_not_a_hit(leerie, tmp_path):
         "src/site-agnostic.test.ts":
             "const FORBIDDEN = [\n  \"acmeshop\",\n];\n"
             "it('uses the acmeshop host', () => {});\n"})
-    st = _state(leerie, tmp_path, working_branch="main",
+    st = _state(leerie, tmp_path, working_branch="main", base_sha="main",
                 defect_scope=_scope(_SITE_EXAMPLE))
     hits = leerie._warn_site_token_leaks(st, leerie_dir)
     assert [h["added_line"] for h in hits] == [
@@ -211,13 +211,13 @@ def test_evidence_section_caps_and_states_the_total(leerie):
 def test_partial_word_does_not_match(leerie, tmp_path):
     leerie_dir = _staged_run(tmp_path, "x\n",
                              {"src/z.ts": "const acmeshopping = 1;\n"})
-    st = _state(leerie, tmp_path, working_branch="main",
+    st = _state(leerie, tmp_path, working_branch="main", base_sha="main",
                 defect_scope=_scope(_SITE_EXAMPLE))
     assert leerie._warn_site_token_leaks(st, leerie_dir) == []
 
 
 def test_no_examples_means_no_check(leerie, tmp_path):
-    st = _state(leerie, tmp_path, working_branch="main",
+    st = _state(leerie, tmp_path, working_branch="main", base_sha="main",
                 defect_scope=_scope(_EXAMPLE))
     assert leerie._warn_site_token_leaks(st, tmp_path / "nowhere") == []
     assert "site_token_warnings" not in st.data

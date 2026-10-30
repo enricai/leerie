@@ -93,11 +93,14 @@ def _st(leerie, tmp_path: Path, repo: Path, head: str, **data):
     (run_dir / "logs").mkdir(parents=True)
     st = leerie.State(root, "run-d", repo_root=repo)
     st.data = {"task": "make add return the sum", "verbosity": "quiet",
-               "working_branch": "main",
+               "working_branch": "main", "base_sha": head,
                "repo_state_before_planning": {"head": head},
                "worker_count": 0}
     st.data.update(data)
     st.save()
+    # The run's own repository, as `_run_phases` makes it before any tree a
+    # worker gets (DESIGN §6 *The run's own repository*).
+    leerie._ensure_run_repo(st)
     return st
 
 
@@ -106,8 +109,14 @@ def _staging(st, repo: Path, sha: str) -> Path:
     staging.parent.mkdir(parents=True, exist_ok=True)
     # On the run's own branch, as setup-run.sh leaves it: its tree is the
     # tree that ships (`_shipping_tree`).
-    _git(repo, "worktree", "add", "-q", "-B", f"leerie/runs/{st.run_id}",
-         str(staging), sha)
+    run_repo = st.run_dir / "repo"
+    # The commit may have been made in the user's repository after the run's
+    # repository was created; it is fetched there as leerie fetches one.
+    subprocess.run(["git", "-C", str(run_repo), "fetch", "-q", str(repo),
+                    f"+{sha}:refs/leerie/test-base"], check=True,
+                   capture_output=True)
+    _git(run_repo, "worktree", "add", "-q", "-B",
+         f"leerie/runs/{st.run_id}", str(staging), sha)
     return staging
 
 
@@ -428,6 +437,7 @@ def test_the_judge_payload_carries_the_orchestrator_results(
     _delivery_tree(run_dir / "worktrees" / "staging")
     st = leerie.State(tmp_path / ".leerie", "r")
     st.data = {"task": "t", "worker_count": 0, "working_branch": "main",
+               "base_sha": _head(run_dir / "worktrees" / "staging")[0],
                "required_items": [{"item": "the suite passes"}],
                "conformance": {"_final": {
                    "tree_sha": _head(run_dir / "worktrees" / "staging")[1],

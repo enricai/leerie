@@ -169,7 +169,7 @@ def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
                     "rationale": "behavioral integrity preserved"}
         return {}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         # Simulate conflict (returncode=1) to trigger integrator
         mock = AsyncMock()
         mock.returncode = 1
@@ -291,7 +291,7 @@ def test_concrete_defect_backs_out_and_the_wave_continues(leerie, tmp_path, monk
                     "status": "design-conflict", "diagnosis": "both cannot hold"}
         return {"status": "resolved", "resolution_summary": "merged"}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.returncode = 1 if sid == "feat-001" else 0
         mock.stderr = mock.stdout = ""
@@ -353,7 +353,7 @@ def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypatch):
             raise leerie.WorkerError("PID exhaustion")
         return {}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.returncode = 1
         mock.stderr = ""
@@ -439,7 +439,7 @@ def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
             ], "rationale": "vague"}
         return {}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.returncode = 1
         mock.stderr = ""
@@ -527,7 +527,7 @@ def test_defect_persisted_to_state_before_the_repair(leerie, tmp_path, monkeypat
                     "diagnosis": "x"}
         return {"status": "resolved", "resolution_summary": "merged"}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.returncode = 1
         mock.stderr = mock.stdout = ""
@@ -585,7 +585,7 @@ def test_resume_reinvokes_the_judge_without_redriving_integrate_sh(
                     "rationale": "clean on re-review"}
         return {}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         nonlocal integrate_sh_called
         integrate_sh_called = True
         mock = AsyncMock()
@@ -659,7 +659,7 @@ def test_resume_reenters_the_repair_loop(
                        cwd=str(staging), check=True)
         return {"incoming_subtask": "feat-001", "status": "resolved"}
 
-    async def no_script(*a):
+    async def no_script(*a, **_kw):
         raise AssertionError("resume must not re-drive integrate.sh")
 
     # A sibling a PRIOR invocation already merged (complete, not in this
@@ -718,7 +718,7 @@ def test_accepted_finding_skips_the_judge_entirely(leerie, tmp_path, monkeypatch
             calls["judge"] = True
         return {}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         calls["integrate_sh"] = True
         mock = AsyncMock()
         mock.returncode = 0
@@ -756,7 +756,7 @@ def test_precondition_failure_dies_and_records_blocked(leerie, tmp_path, monkeyp
 
     results = {"feat-001": {"status": "complete"}}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.returncode = 2
         mock.stderr = "subtask branch missing"
@@ -808,7 +808,7 @@ def _real_conflict_script(staging):
     (rc 1); any other sid merges clean (rc 0)."""
     import subprocess
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.stderr = mock.stdout = ""
         if sid == "feat-001":
@@ -1033,7 +1033,7 @@ def test_restart_merge_refuses_a_head_the_reset_did_not_move(
     script_calls: list[str] = []
     real_script = _real_conflict_script(staging)
 
-    async def spy_script(script, sid, run_id):
+    async def spy_script(script, sid, run_id, **_kw):
         script_calls.append(script)
         return await real_script(script, sid, run_id)
 
@@ -1172,7 +1172,7 @@ def test_integrator_commit_warning_is_non_fatal_and_recorded(leerie, tmp_path, m
     results = {"feat-001": {"status": "complete", "intent": "x",
                             "criteria_results": []}}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.returncode = 1
         mock.stderr = ""
@@ -1282,7 +1282,7 @@ def test_first_resolution_verdict_backs_out_and_the_wave_continues(
     calls.clear()
     scripts: list[str] = []
 
-    async def no_script(script, sid, run_id):
+    async def no_script(script, sid, run_id, **_kw):
         scripts.append(sid)
         raise AssertionError("a backed-out sid must not be re-integrated")
     monkeypatch.setattr(leerie, "_run_script", no_script)
@@ -1334,7 +1334,7 @@ def test_clean_merge_no_conflict_appends_without_integrator(leerie, tmp_path, mo
 
     results = {"feat-001": {"status": "complete"}}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.returncode = 0
         mock.stderr = ""
@@ -1372,7 +1372,7 @@ def test_integrator_crash_then_recovery_logs_warning_and_still_integrates(
     results = {"feat-001": {"status": "complete", "intent": "x",
                             "criteria_results": []}}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.returncode = 1
         mock.stderr = ""
@@ -1446,7 +1446,7 @@ def test_wave_skips_non_complete_sids(leerie, tmp_path, monkeypatch):
 
     called = []
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         called.append(sid)
         mock = AsyncMock()
         mock.returncode = 0
@@ -1482,7 +1482,7 @@ def test_advisory_defect_logs_but_does_not_gate(leerie, tmp_path, monkeypatch):
     results = {"feat-001": {"status": "complete", "intent": "x",
                             "criteria_results": []}}
 
-    async def fake_run_script(script, sid, run_id):
+    async def fake_run_script(script, sid, run_id, **_kw):
         mock = AsyncMock()
         mock.returncode = 1
         mock.stderr = ""
