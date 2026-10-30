@@ -172,12 +172,140 @@ leerie_git_hooks_off() {
   export LEERIE_GIT_HOOKS_OFF="$n"
 }
 
+# leerie_run_settings <worktree>
+#
+# Prints `<run-dir>/repo-settings` — leerie's copy of the settings git reads
+# to report a tree of the run (DESIGN §8 *The settings are leerie's*) — when
+# <worktree> belongs to a run's own repository (its common directory is a
+# bare `<run-dir>/repo`); prints nothing otherwise. `_run_settings_of` in
+# Python.
+leerie_run_settings() {
+  local common
+  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  [ -n "$common" ] && [ "${common##*/}" = repo ] || return 0
+  # Named explicitly (`safe.bareRepository=explicit` refuses discovery),
+  # never through `core.bare`, a setting a worker can change: the same
+  # test as `_run_repo_of`.
+  git --git-dir="$common" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  printf '%s\n' "${common%/*}/repo-settings"
+}
+
+# leerie_vgit <worktree> <git args...>
+#
+# git in <worktree> through the run's settings: outside the run repository,
+# leerie's copies (system and global config, attributes, the global ignore
+# file); `core.fsmonitor` and `core.untrackedCache` off. A tree of no run
+# repository keeps its own settings, the two optimisations off. `_git_view`
+# in Python.
+leerie_vgit() {
+  local wt="$1" s
+  shift
+  s="$(leerie_run_settings "$wt")"
+  if [ -n "$s" ]; then
+    GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL="$s/host.config" \
+      GIT_ATTR_NOSYSTEM=1 git -C "$wt" \
+      -c core.attributesFile="$s/host.attributes" \
+      -c core.excludesFile="$s/host.exclude" \
+      -c core.fsmonitor=false -c core.untrackedCache=false "$@"
+  else
+    git -C "$wt" -c core.fsmonitor=false -c core.untrackedCache=false "$@"
+  fi
+}
+
+# leerie_untracked <worktree> [--directory]
+#
+# THE listing of untracked, not-ignored files (DESIGN §8 *One ignore rule*),
+# NUL-separated: git's standard ignore rules, read through the run's
+# settings. `_untracked_cmd` in Python; no other `ls-files --others` exists
+# in leerie's scripts (`tests/test_one_ignore_rule.py`).
+leerie_untracked() {
+  local wt="$1"
+  if [ "${2-}" = --directory ]; then
+    leerie_vgit "$wt" --literal-pathspecs ls-files -z --others --exclude-standard --directory --no-empty-directory
+  else
+    leerie_vgit "$wt" --literal-pathspecs ls-files -z --others --exclude-standard
+  fi
+}
+
+# leerie_settings_dirt <worktree>
+#
+# I1's settings lines: one per run-repository settings path (`config`,
+# `info`) that differs from leerie's copy, or one when the copy is missing.
+# `_settings_dirt` in Python, line for line.
+leerie_settings_dirt() {
+  local s common n
+  s="$(leerie_run_settings "$1")"
+  [ -n "$s" ] || return 0
+  common="${s%/repo-settings}/repo"
+  if [ ! -f "$s/config" ]; then
+    printf "git settings unknown: leerie's copy %s of the run repository's settings is missing\n" "$s"
+    return 0
+  fi
+  for n in config info; do
+    if [ -e "$s/$n" ] || [ -L "$s/$n" ] || [ -e "$common/$n" ] || [ -L "$common/$n" ]; then
+      diff -r --no-dereference -q -- "$s/$n" "$common/$n" >/dev/null 2>&1 \
+        || printf "git settings changed: %s differs from leerie's copy %s\n" "$common/$n" "$s/$n"
+    fi
+  done
+}
+
+# leerie_restore_settings <worktree>
+#
+# Copies leerie's settings back over the run repository's `config` and
+# `info/` where they differ. `_restore_settings` in Python.
+leerie_restore_settings() {
+  local s common
+  s="$(leerie_run_settings "$1")"
+  [ -n "$s" ] && [ -f "$s/config" ] || return 0
+  common="${s%/repo-settings}/repo"
+  if ! diff -q -- "$s/config" "$common/config" >/dev/null 2>&1; then
+    cp -- "$s/config" "$common/.config.leerie-$$" \
+      && mv -f -- "$common/.config.leerie-$$" "$common/config" || return 1
+  fi
+  if ! diff -r --no-dereference -q -- "$s/info" "$common/info" >/dev/null 2>&1; then
+    rm -rf -- "$common/info" || return 1
+    if [ -d "$s/info" ]; then cp -a -- "$s/info" "$common/info" || return 1; fi
+  fi
+  return 0
+}
+
+# leerie_fresh_status <worktree>
+#
+# `git status --porcelain --untracked-files=no` through a fresh index of
+# HEAD, which records no file's stat, so git hashes every tracked file
+# again. `_fresh_status` in Python.
+leerie_fresh_status() {
+  local wt="$1" d rc=0
+  d="$(mktemp -d)" || return 1
+  GIT_INDEX_FILE="$d/index" leerie_vgit "$wt" read-tree HEAD >/dev/null 2>&1 \
+    && GIT_INDEX_FILE="$d/index" GIT_OPTIONAL_LOCKS=0 \
+       leerie_vgit "$wt" status --porcelain --untracked-files=no || rc=$?
+  [ -f "$d/index" ] || rc=1
+  rm -rf -- "$d"
+  return "$rc"
+}
+
+# leerie_fresh_only <real lines> <fresh lines>
+#
+# The fresh read's lines whose path (from the fourth character) no real
+# line names. `_fresh_only` in Python.
+leerie_fresh_only() {
+  local real="$1" line
+  [ -n "$2" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if [ -z "$real" ] || ! printf '%s\n' "$real" | cut -c4- | grep -Fxq -- "${line:3}"; then
+      printf '%s\n' "$line"
+    fi
+  done <<< "$2"
+}
+
 # The index entries `git ls-files -v` tags as hidden from status — a
 # lowercase tag is assume-unchanged, `S`/`s` skip-worktree (git's fixed
 # one-letter tags) — as NUL-separated paths. `_flagged_entries` in Python.
 leerie_flagged_paths() {
   git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || return 1
-  git -C "$1" ls-files -v -z | while IFS= read -r -d '' rec; do
+  leerie_vgit "$1" ls-files -v -z | while IFS= read -r -d '' rec; do
     case "${rec:0:2}" in
       [abcdefghijklmnopqrstuvwxyzS]" ") printf '%s\0' "${rec:2}" ;;
     esac
@@ -185,25 +313,27 @@ leerie_flagged_paths() {
 }
 
 # I1's checker, the shell half of `_tree_dirt` (DESIGN §8 *A worker leaves
-# its tree clean*): tracked and staged changes, every flagged index entry,
-# and every untracked file the tree's own `.gitignore` files do not ignore
-# — never the shared `info/exclude` or `core.excludesFile`. Prints one line
-# per finding; empty is clean; status 1 when git cannot answer.
+# its tree clean*), read through the run's settings (`leerie_vgit`), line
+# for line in the same order: the settings lines, tracked and staged
+# changes, what a fresh index of HEAD shows that the tree's index hid,
+# every flagged index entry, and every untracked, not-ignored file (the one
+# listing, `leerie_untracked`). Prints one line per finding; empty is
+# clean; status 1 when git cannot answer.
 leerie_tree_dirt() {
-  local wt="$1" st
-  st="$(git -C "$wt" status --porcelain --untracked-files=no)" || return 1
-  git -C "$wt" ls-files --others --exclude-per-directory=.gitignore \
-    >/dev/null || return 1
+  local wt="$1" st fresh
+  st="$(leerie_vgit "$wt" status --porcelain --untracked-files=no)" || return 1
+  fresh="$(leerie_fresh_status "$wt")" || return 1
+  leerie_untracked "$wt" >/dev/null || return 1
+  leerie_settings_dirt "$wt"
   [ -z "$st" ] || printf '%s\n' "$st"
-  # The same lines, in the same order, as `_tree_dirt`.
-  git -C "$wt" ls-files -v -z | while IFS= read -r -d '' rec; do
+  leerie_fresh_only "$st" "$fresh"
+  leerie_vgit "$wt" ls-files -v -z | while IFS= read -r -d '' rec; do
     case "${rec:0:2}" in
       [Ss]" ") printf '%s is marked skip-worktree (an edit git status does not show)\n' "${rec:2}" ;;
       [abcdefghijklmnopqrtuvwxyz]" ") printf '%s is marked assume-unchanged (an edit git status does not show)\n' "${rec:2}" ;;
     esac
   done
-  git -C "$wt" ls-files --others --exclude-per-directory=.gitignore -z \
-    | while IFS= read -r -d '' p; do printf '?? %s\n' "$p"; done
+  leerie_untracked "$wt" | while IFS= read -r -d '' p; do printf '?? %s\n' "$p"; done
   return 0
 }
 
@@ -212,23 +342,26 @@ leerie_tree_dirt() {
 # THE restore primitive's shell half (DESIGN §8 *One restore*; Python's is
 # `_restore_tree`): <worktree> on <branch> (empty: a detached checkout stays
 # detached) at <rev> (default the branch tip, or HEAD), with nothing
-# uncommitted. A worker may have left HEAD detached or on another branch,
-# which `reset --hard HEAD` kept (review round 15 H2), so the branch is
-# checked out (`checkout -f`, hooks off), then `reset --hard <rev>` (ending
-# any merge) and `clean -ffdq`: nested repositories go too, ignored files
-# stay (review round 15 M2). The owner's write and search bits go back first
-# on every tracked directory and every untracked, not-ignored path (DESIGN
-# §6½: a killed test's read-only directory). Every assume-unchanged and
-# skip-worktree flag is cleared before the reset, and what `clean` keeps
-# because only the shared `info/exclude` or `core.excludesFile` hides it is
-# removed (review round 16 H1). Postcondition, I1's own checker
-# (`leerie_tree_dirt`, the same rule as Python's `_tree_dirt`): it prints
-# nothing and HEAD is <branch>; otherwise the lines go to stderr and it
-# returns 1.
+# uncommitted. Leerie's settings are copied back over the run repository's
+# first (DESIGN §8 *The settings are leerie's*), and every git step after
+# runs through them (`leerie_vgit`). A worker may have left HEAD detached or
+# on another branch, which `reset --hard HEAD` kept (review round 15 H2), so
+# the branch is checked out (`checkout -f`, hooks off), then `reset --hard
+# <rev>` (ending any merge) and `clean -ffdq`: nested repositories go too,
+# ignored files stay (review round 15 M2). The owner's write and search bits
+# go back first on every tracked directory and every untracked, not-ignored
+# path (DESIGN §6½: a killed test's read-only directory). Every
+# assume-unchanged and skip-worktree flag is cleared before the reset (review
+# round 16 H1), and the index is dropped when its stat cache vouches for a
+# file the fresh read says differs (the reset would trust it). Postcondition,
+# I1's own checker (`leerie_tree_dirt`, the same rule as Python's
+# `_tree_dirt`): it prints nothing and HEAD is <branch>; otherwise the lines
+# go to stderr and it returns 1.
 leerie_reset_worktree() {
   local wt="${1:?usage: leerie_reset_worktree <worktree> <branch> [<rev>]}"
   local branch="${2-}"
   local rev="${3:-}"
+  leerie_restore_settings "$wt" || return 1
   chmod u+wx "$wt" 2>/dev/null || true
   # Never through a symlink: a link named on chmod's command line is
   # followed, and an untracked link to /work would chmod the user's checkout
@@ -240,7 +373,7 @@ leerie_reset_worktree() {
       | while IFS= read -r -d '' p; do
           [ -L "$p" ] || chmod u+wx -- "$p" 2>/dev/null || true
         done
-    git ls-files -z --others --exclude-per-directory=.gitignore --directory 2>/dev/null \
+    leerie_untracked . --directory 2>/dev/null \
       | while IFS= read -r -d '' p; do
           p="${p%/}"
           [ -L "$p" ] || chmod -R u+w -- "$p" 2>/dev/null || true
@@ -251,24 +384,21 @@ leerie_reset_worktree() {
   # One option per `--stdin` call: git applies only the last of two.
   # (Piped, never captured: a command substitution drops the NULs.)
   leerie_flagged_paths "$wt" \
-    | git -C "$wt" update-index --no-skip-worktree -z --stdin || return 1
+    | leerie_vgit "$wt" update-index --no-skip-worktree -z --stdin || return 1
   leerie_flagged_paths "$wt" \
-    | git -C "$wt" update-index --no-assume-unchanged -z --stdin || return 1
-  if [ -n "$branch" ]; then
-    git -C "$wt" checkout -q -f "$branch" || return 1
+    | leerie_vgit "$wt" update-index --no-assume-unchanged -z --stdin || return 1
+  local real fresh idx
+  real="$(leerie_vgit "$wt" status --porcelain --untracked-files=no)" || return 1
+  fresh="$(leerie_fresh_status "$wt")" || return 1
+  if [ -n "$(leerie_fresh_only "$real" "$fresh")" ]; then
+    idx="$(git -C "$wt" rev-parse --path-format=absolute --git-path index)" || return 1
+    rm -f -- "$idx"
   fi
-  git -C "$wt" reset -q --hard "${rev:-HEAD}" || return 1
-  git -C "$wt" clean -ffdq || return 1
-  # What `clean` keeps because only the shared `info/exclude` or
-  # `core.excludesFile` hides it: removed by the checker's own listing
-  # (never following a symlink: `rm -rf` on a link removes the link).
-  (
-    cd "$wt" || exit 0
-    git ls-files -z --others --exclude-per-directory=.gitignore 2>/dev/null \
-      | while IFS= read -r -d '' p; do
-          rm -rf -- "${p%/}" 2>/dev/null || true
-        done
-  )
+  if [ -n "$branch" ]; then
+    leerie_vgit "$wt" checkout -q -f "$branch" || return 1
+  fi
+  leerie_vgit "$wt" reset -q --hard "${rev:-HEAD}" || return 1
+  leerie_vgit "$wt" clean -ffdq || return 1
   local dirt
   dirt="$(leerie_tree_dirt "$wt")" || return 1
   if [ -n "$dirt" ]; then

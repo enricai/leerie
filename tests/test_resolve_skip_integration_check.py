@@ -139,7 +139,7 @@ def test_skip_flag_off_still_invokes_the_gate(leerie, tmp_path, monkeypatch):
         called["n"] += 1
         return {"defects": [], "advisories": []}
 
-    async def fake_run_proc(argv, cwd=None):
+    async def fake_run_proc(argv, cwd=None, env=None):
         class _R:
             # A clean staging on the run branch: `git status` and the
             # checker's `ls-files` reads print nothing, `symbolic-ref`

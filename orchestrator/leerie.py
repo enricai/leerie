@@ -9715,6 +9715,236 @@ def _carry_repo_config(user: Path, repo: Path) -> None:
                       hooks.stdout.strip()])
 
 
+# `<run-dir>/repo-settings/`: leerie's copy of the settings git reads to
+# report a tree of the run (DESIGN §8 *The settings are leerie's*). `config`
+# and `info/` are the run repository's own, copied once when it is made and
+# compared on every read; `host.*` are the settings outside it, copied once
+# per orchestrator process and read instead of the originals.
+RUN_REPO_SETTINGS_NAME = "repo-settings"
+_HOST_SETTINGS = ("host.config", "host.attributes", "host.exclude")
+# Run directories whose host settings this process has copied.
+_HOST_SETTINGS_TAKEN: set[str] = set()
+# Optimisations that never change a correct answer and can each give a
+# wrong one: off for every read through the run's settings.
+_GIT_VIEW_PINS = ("-c", "core.fsmonitor=false",
+                  "-c", "core.untrackedCache=false")
+
+
+def _take_run_settings(repo: Path) -> None:
+    """Copy the run repository's `config` and `info/` to its settings
+    directory, once: a copy that exists is never retaken (a resume must
+    not adopt a worker's change as leerie's)."""
+    s = Path(repo).parent / RUN_REPO_SETTINGS_NAME
+    if (s / "config").is_file():
+        return
+    s.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(s / "info", ignore_errors=True)
+    if (Path(repo) / "info").is_dir():
+        shutil.copytree(Path(repo) / "info", s / "info", symlinks=True)
+    tmp = s / f".config.tmp-{os.getpid()}"
+    shutil.copyfile(Path(repo) / "config", tmp)
+    os.replace(tmp, s / "config")
+
+
+def _take_host_settings(repo: Path) -> None:
+    """Copy the settings outside the run repository, as git resolves them
+    from it, to its settings directory, once per process: the system and
+    global config flattened with their includes into `host.config`, the
+    system and global attributes files concatenated into `host.attributes`
+    (system first, as git reads them), and the global ignore file into
+    `host.exclude`. Mechanical: config keys and file paths only."""
+    s = Path(repo).parent / RUN_REPO_SETTINGS_NAME
+    if str(s) in _HOST_SETTINGS_TAKEN:
+        return
+    s.mkdir(parents=True, exist_ok=True)
+    tmp = s / f".host.config.tmp-{os.getpid()}"
+    tmp.write_bytes(b"")
+    for scope in ("--system", "--global"):
+        r = _git_sync([*_git_at(repo), "config", scope, "--includes",
+                       "--list", "-z"], timeout=30)
+        if r.returncode != 0:
+            continue                      # no such file
+        for entry in r.stdout.split("\0"):
+            if not entry:
+                continue
+            key, sep, value = entry.partition("\n")
+            w = _git_sync(["config", "-f", str(tmp), "--add", key,
+                           value if sep else "true"])
+            if w.returncode != 0:
+                raise RunRepoError(f"git config --add {key}: "
+                                   f"{w.stderr.strip()[:300]}")
+    os.replace(tmp, s / "host.config")
+
+    def _read(path: str) -> bytes:
+        try:
+            return Path(os.path.expanduser(path)).read_bytes() if path else b""
+        except OSError:
+            return b""
+    attrs = b""
+    if not os.environ.get("GIT_ATTR_NOSYSTEM"):
+        attrs += _read(_git_sync([*_git_at(repo), "var", "GIT_ATTR_SYSTEM"],
+                                 timeout=30).stdout.strip())
+    glob_attrs = _read(_git_sync([*_git_at(repo), "var", "GIT_ATTR_GLOBAL"],
+                                 timeout=30).stdout.strip())
+    if attrs and glob_attrs and not attrs.endswith(b"\n"):
+        attrs += b"\n"
+    excl = _git_sync([*_git_at(repo), "config", "--path", "--get",
+                      "core.excludesFile"], timeout=30).stdout.strip()
+    if not excl:
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+            os.path.expanduser("~"), ".config")
+        excl = os.path.join(xdg, "git", "ignore")
+    for name, data in (("host.attributes", attrs + glob_attrs),
+                       ("host.exclude", _read(excl))):
+        t = s / f".{name}.tmp-{os.getpid()}"
+        t.write_bytes(data)
+        os.replace(t, s / name)
+    _HOST_SETTINGS_TAKEN.add(str(s))
+
+
+def _seal_run_repo_config(repo: Path) -> None:
+    """`repack.updateServerInfo=false` in a repository being made, before
+    leerie copies its settings: `git gc --auto`, which any commit or fetch
+    can start, writes `info/refs` otherwise, which would read as a
+    worker's change to `info/`."""
+    sv = _git_sync(["config", "-f", str(Path(repo) / "config"),
+                    "repack.updateServerInfo", "false"])
+    if sv.returncode != 0:
+        raise RunRepoError("git config repack.updateServerInfo: "
+                           f"{sv.stderr.strip()[:300]}")
+
+
+def _take_settings(repo: Path, *, fresh: bool) -> None:
+    """Leerie's copy of the run repository's settings (DESIGN §8 *The
+    settings are leerie's*), the one hook `_ensure_run_repo` calls on each
+    of its paths. `fresh` (a repository it just renamed into place): any
+    copy a crash left is dropped first. Otherwise (a recorded or adopted
+    repository) the copy is taken only when missing — a run made before
+    leerie kept one, or a crash between the rename and the copy."""
+    s = Path(repo).parent / RUN_REPO_SETTINGS_NAME
+    if fresh:
+        shutil.rmtree(s, ignore_errors=True)
+        _HOST_SETTINGS_TAKEN.discard(str(s))
+    _take_run_settings(repo)
+    _take_host_settings(repo)
+
+
+def _run_settings_of(tree: str | Path) -> tuple[Path, Path] | None:
+    """`(common dir, settings dir)` when `tree` is a worktree of a run's
+    own repository (its common directory is a bare `<run-dir>/repo`), else
+    None: a tree of any other repository is read with its own settings."""
+    try:
+        r = subprocess.run(["git", "-C", str(tree), "rev-parse",
+                            "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, check=False,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout.strip()
+    if r.returncode != 0 or not out:
+        return None
+    common = Path(out)
+    if common.name != RUN_REPO_NAME or _run_repo_of(common.parent) is None:
+        return None
+    return common, common.parent / RUN_REPO_SETTINGS_NAME
+
+
+def _git_view(tree: str | Path) -> tuple[list[str], dict[str, str] | None]:
+    """The arguments after `git` (`-C <tree> -c …`) and the environment of
+    a git command that reads `tree` through the run's settings (DESIGN §8 *The
+    settings are leerie's*): outside the run repository, leerie's copies
+    (`GIT_CONFIG_SYSTEM`, `GIT_CONFIG_GLOBAL`, `GIT_ATTR_NOSYSTEM`,
+    `core.attributesFile`, `core.excludesFile`); `core.fsmonitor` and
+    `core.untrackedCache` off. A tree of no run repository keeps its own
+    settings (env None: the orchestrator's), the two optimisations off.
+    The shell half is `leerie_vgit`."""
+    loc = _run_settings_of(tree)
+    if loc is None:
+        return ["-C", str(tree), *_GIT_VIEW_PINS], None
+    s = loc[1]
+    env = dict(os.environ)
+    env.update(GIT_CONFIG_SYSTEM=os.devnull,
+               GIT_CONFIG_GLOBAL=str(s / "host.config"),
+               GIT_ATTR_NOSYSTEM="1")
+    return (["-C", str(tree),
+             "-c", f"core.attributesFile={s / 'host.attributes'}",
+             "-c", f"core.excludesFile={s / 'host.exclude'}",
+             *_GIT_VIEW_PINS], env)
+
+
+def _same_settings_path(a: Path, b: Path) -> bool:
+    """True when `a` and `b` hold the same thing: both absent, the same
+    bytes, the same symlink target, or directories of the same entries,
+    recursively. Never follows a symlink."""
+    try:
+        sa, sb = os.lstat(a), os.lstat(b)
+    except FileNotFoundError:
+        return not os.path.lexists(a) and not os.path.lexists(b)
+    except OSError:
+        return False
+    if stat.S_IFMT(sa.st_mode) != stat.S_IFMT(sb.st_mode):
+        return False
+    if stat.S_ISLNK(sa.st_mode):
+        return os.readlink(a) == os.readlink(b)
+    if stat.S_ISDIR(sa.st_mode):
+        try:
+            na, nb = sorted(os.listdir(a)), sorted(os.listdir(b))
+        except OSError:
+            return False
+        return na == nb and all(_same_settings_path(a / n, b / n)
+                                for n in na)
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
+
+
+def _settings_dirt(tree: str | Path) -> list[str]:
+    """I1's settings lines for `tree`: one per run-repository settings path
+    (`config`, `info`) that differs from leerie's copy, or one when the copy
+    is missing; [] for a tree of no run repository. The shell half prints
+    the same lines (`leerie_settings_dirt`)."""
+    loc = _run_settings_of(tree)
+    if loc is None:
+        return []
+    common, s = loc
+    if not (s / "config").is_file():
+        return [f"{_SETTINGS_LINE}unknown: leerie's copy {s} of the run "
+                "repository's settings is missing"]
+    return [f"{_SETTINGS_LINE}changed: {common / n} differs from leerie's "
+            f"copy {s / n}" for n in ("config", "info")
+            if not _same_settings_path(s / n, common / n)]
+
+
+def _restore_settings(tree: str | Path) -> list[str]:
+    """Copy leerie's settings back over the run repository's `config` and
+    `info/` where they differ (DESIGN §8 *The settings are leerie's*), and
+    return the names restored; [] for a tree of no run repository, or
+    when leerie's copy is missing (the checker's postcondition names
+    it)."""
+    loc = _run_settings_of(tree)
+    if loc is None:
+        return []
+    common, s = loc
+    if not (s / "config").is_file():
+        return []
+    done: list[str] = []
+    if not _same_settings_path(s / "config", common / "config"):
+        tmp = common / f".config.leerie-{os.getpid()}"
+        shutil.copyfile(s / "config", tmp)
+        os.replace(tmp, common / "config")
+        done.append("config")
+    if not _same_settings_path(s / "info", common / "info"):
+        if (common / "info").is_dir() and not (common / "info").is_symlink():
+            shutil.rmtree(common / "info")
+        elif os.path.lexists(common / "info"):
+            os.unlink(common / "info")
+        if (s / "info").is_dir():
+            shutil.copytree(s / "info", common / "info", symlinks=True)
+        done.append("info")
+    return done
+
+
 _USER_HEAD_REF = "refs/leerie/user-head"
 
 
@@ -9823,6 +10053,7 @@ def _ensure_run_repo(st: "State") -> Path:
                 f"but unusable: {why}. It is the only copy of this run's "
                 "commits, so leerie will not delete or rebuild it — inspect "
                 f"it with `git --git-dir {_operator_path(repo)} log --all`")
+        _take_settings(repo, fresh=False)
         return repo
     for stale in Path(st.run_dir).glob(f".{RUN_REPO_NAME}.tmp-*"):
         shutil.rmtree(stale, ignore_errors=True)
@@ -9833,6 +10064,7 @@ def _ensure_run_repo(st: "State") -> Path:
                 f"{_operator_path(repo)} exists but is not this run's "
                 f"recorded repository ({why}); leerie will not delete it — "
                 "move it aside to start the run's repository afresh")
+        _take_settings(repo, fresh=False)
         st.data["run_repo"] = RUN_REPO_NAME
         st.save()
         return repo
@@ -9850,8 +10082,10 @@ def _ensure_run_repo(st: "State") -> Path:
         raise RunRepoError(f"git init --bare: {init.stderr.strip()[:300]}")
     try:
         _carry_repo_config(Path(user), tmp)
+        _seal_run_repo_config(tmp)
         _refresh_run_repo_base(st, tmp)
         os.rename(tmp, repo)
+        _take_settings(repo, fresh=True)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -10219,8 +10453,19 @@ async def _snapshot_repo_state(repo_root: str) -> dict:
             return ""
         return r.stdout
 
+    # Untracked entries from the one listing (DESIGN §8 *One ignore rule*),
+    # a wholly untracked directory as `dir/`, as status would show it.
+    u_args, u_env = await asyncio.to_thread(
+        functools.partial(_untracked_cmd, repo_root, directory=True))
+    u = await run_proc(["git", *u_args], env=u_env)
+    if u.returncode != 0:
+        ok = False
+    lines = (await _out("git", "status", "--porcelain",
+                        "--untracked-files=no")).splitlines()
+    lines += [f"?? {p}" for p in (u.stdout.split("\0")
+                                  if u.returncode == 0 else []) if p]
     porcelain = [
-        ln for ln in (await _out("git", "status", "--porcelain")).splitlines()
+        ln for ln in lines
         if not any(ln[3:].startswith(p) for p in _SENTINEL_EXEMPT_PREFIXES)
     ]
     head = (await _out("git", "rev-parse", "HEAD")).strip()
@@ -10320,7 +10565,7 @@ def _delta_fingerprint(repo_root: Path, delta: str) -> str:
     `lstat`, and symlinks are not followed: a file is its `lstat`
     (size, mtime_ns, inode); a directory (porcelain collapses an untracked
     one to `dir/`) is the sorted `lstat`s of the untracked, NOT gitignored
-    entries `git ls-files -o --exclude-standard` lists under it (so ignored
+    entries the one listing (`_untracked_cmd`) gives under it (so ignored
     build output or a nested repo's churn inside it does not re-warn; an
     embedded repo is one entry), capped at 5000; a missing path is
     `absent`; an unreadable one `unreadable`. HEAD/ref deltas already carry
@@ -10350,11 +10595,10 @@ def _delta_fingerprint_unguarded(repo_root: Path, delta: str) -> str:
         return "unreadable"
     if not stat.S_ISDIR(st_.st_mode):
         return f"{st_.st_size}:{st_.st_mtime_ns}:{st_.st_ino}"
+    args, env = _untracked_cmd(repo_root, pathspec=rel + "/")
     try:
-        r = subprocess.run(
-            ["git", "-C", str(repo_root), "--literal-pathspecs", "ls-files",
-             "-o", "--exclude-standard", "-z", "--", rel + "/"],
-            capture_output=True, check=False, timeout=30)
+        r = subprocess.run(["git", *args], capture_output=True, check=False,
+                           env=env, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return "unreadable"
     if r.returncode != 0:
@@ -10643,7 +10887,8 @@ async def _preflight_repo() -> None:
                 f"Run: git config --global {key} \"<value>\"")
 
     # 2. working tree must be clean — a dirty tree produces ambiguous diffs
-    r = await run_proc(["git", "status", "--porcelain"])
+    r = await run_proc(["git", "status", "--porcelain",
+                        "--untracked-files=no"])
     dirty = [l for l in r.stdout.splitlines() if not l.startswith("??")]
     if dirty:
         # Name them. "2 modified/staged file(s)" sends the operator to
@@ -16056,14 +16301,18 @@ _NODE_LOCKFILE_INSTALL = {
 _NESTED_NODE_ROOTS_MAX = 16
 
 
-def _git_z_output(argv: list[str], *, timeout: float | None = None
+def _git_z_output(argv: list[str], *, timeout: float | None = None,
+                  env: Mapping[str, str] | None = None
                   ) -> subprocess.CompletedProcess:
     """`argv` (a git command with `-z` path output) run in bytes, `stdout`
     decoded as the filesystem does (`os.fsdecode`, surrogateescape) so a
     non-UTF-8 file name neither raises nor stops naming its file; `text=True`
-    decoded strictly and raised `UnicodeDecodeError` (review r2 L2)."""
+    decoded strictly and raised `UnicodeDecodeError` (review r2 L2). `env`
+    None inherits the orchestrator's environment (`_git_view`'s, for a read
+    through the run's settings)."""
     r = subprocess.run(argv, capture_output=True, check=False,
-                       timeout=timeout)
+                       timeout=timeout,
+                       env=None if env is None else dict(env))
     err = r.stderr or b""
     return subprocess.CompletedProcess(
         r.args, r.returncode, os.fsdecode(r.stdout or b""),
@@ -37655,6 +37904,15 @@ CLEAN_TREE_BASE_NOTE = (
     "branch no longer contains that commit, which your work must sit on: "
     "rebase or cherry-pick the commits that belong in your change onto it "
     "(`git rebase {base}`), never reset your branch behind it.")
+# Added when a settings line is present: its one act.
+CLEAN_TREE_SETTINGS_NOTE = (
+    "\nA line that says git settings changed is about the repository every "
+    "tree of this run shares, not a file of yours: undo the change you "
+    "made there (`diff` the two paths it names; `git config --unset <key>` "
+    "for a key you set, or remove what you added). Leerie reads every tree "
+    "through its own copy of those settings, so a setting never makes a "
+    "file clean.")
+_SETTINGS_LINE = "git settings "
 # The prefixes of `_tree_dirt`'s branch lines (never a porcelain line,
 # which starts with a two-character status).
 _BRANCH_LINE_HEAD = "HEAD is not on "
@@ -37663,13 +37921,53 @@ _BRANCH_LINE_BASE = "HEAD does not descend from "
 _UNCLEAN_LINES_MAX = 20
 
 
-# The untracked files of a tree as its `.gitignore` files see them: `ls-files
-# --others` with only the per-directory `.gitignore`, never
-# `--exclude-standard`, which adds the shared `info/exclude` and
-# `core.excludesFile` (DESIGN §8 *A worker leaves its tree clean*, review
-# round 16 H1).
-_UNTRACKED_ARGV = ("ls-files", "--others",
-                   "--exclude-per-directory=.gitignore", "-z")
+def _untracked_cmd(tree: str | Path, *, which: str = "unignored",
+                   cached: bool = False, directory: bool = False,
+                   pathspec: str | None = None
+                   ) -> tuple[list[str], dict[str, str] | None]:
+    """THE listing of `tree`'s untracked files (DESIGN §8 *One ignore
+    rule*): `git ls-files -z --others` through the run's settings
+    (`_git_view`), "ignored" being git's standard rules (`--exclude-standard`:
+    the tree's `.gitignore` files, the repository's `info/exclude`, the
+    global ignore file). `which` is `unignored` (the untracked files that
+    are not ignored), `ignored` (only the ignored ones) or `all` (every
+    untracked file, ignored ones included). `cached` adds the tracked
+    files, `directory` collapses a wholly untracked directory to `dir/`,
+    `pathspec` limits the listing (literally). Returns `(args, env)`, the
+    arguments after `git`; every
+    other listing of untracked files in leerie goes through this one
+    (`tests/test_one_ignore_rule.py`). The shell half is
+    `leerie_untracked`."""
+    prefix, env = _git_view(tree)
+    argv = [*prefix, "--literal-pathspecs", "ls-files", "-z"]
+    if cached:
+        argv.append("--cached")
+    argv.append("--others")
+    if which == "ignored":
+        argv.append("--ignored")
+    if which in ("unignored", "ignored"):
+        argv.append("--exclude-standard")
+    elif which != "all":
+        raise ValueError(f"which={which!r}")
+    if directory:
+        argv += ["--directory", "--no-empty-directory"]
+    if pathspec is not None:
+        argv += ["--", pathspec]
+    return argv, env
+
+
+def _untracked_listing(tree: str | Path, **kw) -> list[str] | None:
+    """`_untracked_cmd`'s paths, run synchronously and decoded as the
+    filesystem does; None when git cannot say."""
+    args, env = _untracked_cmd(tree, **kw)
+    try:
+        r = subprocess.run(["git", *args], capture_output=True, check=False,
+                           env=env, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return [p for p in os.fsdecode(r.stdout).split("\0") if p]
 
 
 def _flagged_entries(ls_v_z: str) -> list[tuple[str, str]]:
@@ -37688,34 +37986,70 @@ def _flagged_entries(ls_v_z: str) -> list[tuple[str, str]]:
     return out
 
 
+async def _fresh_status(prefix: list[str], env: dict[str, str] | None
+                        ) -> subprocess.CompletedProcess:
+    """`git status --porcelain --untracked-files=no` through a fresh index
+    of HEAD (`read-tree` into a temporary file): no entry has a stat, so
+    git hashes every tracked file again, and nothing the tree's own index
+    records — a stat that vouches for an edited file — can hide one (DESIGN
+    §8 *The settings are leerie's*). Its lines are all unstaged."""
+    with tempfile.TemporaryDirectory(prefix="leerie-index-") as d:
+        e = dict(os.environ if env is None else env)
+        e.update(GIT_INDEX_FILE=os.path.join(d, "index"),
+                 GIT_OPTIONAL_LOCKS="0")
+        rt = await run_proc(["git", *prefix, "read-tree", "HEAD"], env=e)
+        if rt.returncode != 0:
+            return rt
+        return await run_proc(["git", *prefix, "status", "--porcelain",
+                               "--untracked-files=no"], env=e)
+
+
+def _fresh_only(real: list[str], fresh: list[str]) -> list[str]:
+    """The fresh read's lines whose path no line of the real read names:
+    what the index's stat cache hid."""
+    seen = {line[3:] for line in real}
+    return [line for line in fresh if line[3:] not in seen]
+
+
 async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
                      base: str | None = None) -> list[str] | None:
     """I1's checker (DESIGN §8 *A worker leaves its tree clean*): what
-    stands between the working tree and HEAD's tree plus what the committed
-    `.gitignore` files ignore, read so that no setting a worker can make
-    hides it. Every line `git status --porcelain --untracked-files=no`
-    prints (a tracked edit, a staged change), verbatim; a line per index
-    entry flagged `assume-unchanged` or `skip-worktree` (`git ls-files
-    -v`), which status does not show; `?? <path>` per untracked file the
-    tree's `.gitignore` files do not ignore (`_UNTRACKED_ARGV`: never the
-    shared `info/exclude` or `core.excludesFile` — review round 16 H1).
-    With
-    `branch`, a line when HEAD is not `refs/heads/<branch>` (detached, or
-    another branch — review round 15 H2); with `base`, a line when HEAD
-    does not descend from it (the branch moved back or sideways). [] is
-    clean; None when git could not answer (nothing was read, so not
-    clean)."""
+    stands between the working tree and HEAD's tree plus what the ignore
+    rules ignore, read through the run's settings (`_git_view`, DESIGN §8
+    *The settings are leerie's*), so no setting a worker makes changes
+    what it reads. In order: a line per run-repository settings path that
+    differs from leerie's copy (`_settings_dirt`); every line `git status
+    --porcelain --untracked-files=no` prints (a tracked edit, a staged
+    change), verbatim; the lines the same status prints through a fresh
+    index of HEAD that the first did not (`_fresh_status`: an edit the
+    index's stat cache vouched for); a line per index entry flagged
+    `assume-unchanged` or `skip-worktree` (`git ls-files -v`), which
+    status does not show; `?? <path>` per untracked, not-ignored file (the
+    one listing, `_untracked_cmd`). With `branch`, a line when HEAD is not
+    `refs/heads/<branch>` (detached, or another branch — review round 15
+    H2); with `base`, a line when HEAD does not descend from it (the branch
+    moved back or sideways). [] is clean; None when git could not answer
+    (nothing was read, so not clean). The shell half is
+    `leerie_tree_dirt`, line for line."""
     try:
-        r = await run_proc(["git", "status", "--porcelain",
-                            "--untracked-files=no"], cwd=str(tree))
-        flags = await run_proc(["git", "ls-files", "-v", "-z"],
-                               cwd=str(tree))
-        others = await run_proc(["git", *_UNTRACKED_ARGV], cwd=str(tree))
+        prefix, env = await asyncio.to_thread(_git_view, tree)
+        settings = await asyncio.to_thread(_settings_dirt, tree)
+        r = await run_proc(["git", *prefix, "status", "--porcelain",
+                            "--untracked-files=no"], env=env)
+        fresh = await _fresh_status(prefix, env)
+        flags = await run_proc(["git", *prefix, "ls-files", "-v", "-z"],
+                               env=env)
+        others_args, others_env = _untracked_cmd(tree)
+        others = await run_proc(["git", *others_args], env=others_env)
     except OSError:
         return None
-    if any(x.returncode != 0 for x in (r, flags, others)):
+    if any(x.returncode != 0 for x in (r, fresh, flags, others)):
         return None
-    lines = [line for line in r.stdout.splitlines() if line]
+    lines = list(settings)
+    real = [line for line in r.stdout.splitlines() if line]
+    lines += real
+    lines += _fresh_only(real, [line for line in fresh.stdout.splitlines()
+                                if line])
     lines += [f"{path} is marked {flag} (an edit git status does not show)"
               for path, flag in _flagged_entries(flags.stdout)]
     lines += [f"?? {p}" for p in others.stdout.split("\0") if p]
@@ -37836,6 +38170,8 @@ async def _clean_tree_gate(tree: str | Path, *, caps: dict, label: str,
             f"re-asking it to commit or delete each ({attempt}/{reasks})")
         note = CLEAN_TREE_REASK_NOTE.format(lines="\n".join(
             f"    {line}" for line in lines))
+        if any(line.startswith(_SETTINGS_LINE) for line in lines):
+            note += CLEAN_TREE_SETTINGS_NOTE
         if any(line.startswith(_BRANCH_LINE_HEAD) for line in lines):
             note += CLEAN_TREE_BRANCH_NOTE.format(branch=branch)
         if base and any(line.startswith(_BRANCH_LINE_BASE) for line in lines):
@@ -39697,9 +40033,9 @@ async def _worktree_tree_sha(tree: str) -> str | None:
     worktree is dirty or git fails. `HEAD^{tree}` cannot see uncommitted
     changes, and `_run_conformance_phase` explicitly tolerates a conformer
     that left some behind, so a memo keyed on a dirty tree would describe
-    something other than what was measured."""
-    r = await run_proc(["git", "status", "--porcelain"], cwd=tree)
-    if r.returncode != 0 or r.stdout.strip():
+    something other than what was measured. Dirty is I1's own reading
+    (`_tree_dirt`)."""
+    if await _tree_dirt(tree) != []:
         return None
     r = await run_proc(["git", "rev-parse", "HEAD^{tree}"], cwd=tree)
     if r.returncode != 0:
@@ -40029,6 +40365,15 @@ async def _leaves_tree_as_found(tree: str | Path, what: str,
             except Exception:
                 removed = []
         rec["removed"] = removed
+        try:
+            # The run repository's settings are leerie's (DESIGN §8 *The
+            # settings are leerie's*): a command that changed them (husky's
+            # install sets `core.hooksPath`) does not keep the change.
+            settings = await asyncio.to_thread(_restore_settings, tree)
+        except Exception:
+            settings = []
+        _log_undone(log_prefix, "put back",
+                    f"git setting(s) its own {what} changed", settings)
         _log_undone(log_prefix, "put back",
                     f"tracked file(s) its own {what} rewrote", put_back)
         _log_undone(log_prefix, "removed",
@@ -46940,12 +47285,11 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         user = "\n".join(lines)
         # What existed before the writer (the dependency install's
         # output) is never the writer's file.
-        pre = _git_z_output(["git", "-C", str(wt), "ls-files", "--others",
-                             "-z"])
-        if pre.returncode != 0:
+        pre = _untracked_listing(wt, which="all")
+        if pre is None:
             out["reason"] = "could not read the writer's worktree status"
             return out
-        pre_untracked = {p for p in pre.stdout.split("\0") if p}
+        pre_untracked = set(pre)
         if rewrite_of is not None:
             # Back where the writer wrote them — after `pre`, so they are
             # the writer's files again, collected like any it writes now.
@@ -47053,10 +47397,9 @@ def _acceptance_new_files(wt: Path, pre_untracked: set[str],
                           refs: list[str]) -> list[str]:
     """Untracked files the writer left (ignored ones included), minus the
     install's output, the report copies and runner caches."""
-    post = _git_z_output(["git", "-C", str(wt), "ls-files", "--others",
-                          "-z"])
-    return sorted(p for p in post.stdout.split("\0")
-                  if p and p not in refs and p not in pre_untracked
+    post = _untracked_listing(wt, which="all") or []
+    return sorted(p for p in post
+                  if p not in refs and p not in pre_untracked
                   and not _acceptance_is_cache_path(p))
 
 
@@ -47081,14 +47424,11 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     porcelain = _git_z_output(
         ["git", "-C", str(wt), "status", "--porcelain=v1", "-z",
          "--untracked-files=no"])
-    # Untracked files INCLUDING ignored ones (no --exclude-standard): a
-    # helper the repo's .gitignore happens to match is still needed.
-    post = _git_z_output(["git", "-C", str(wt), "ls-files", "--others",
-                          "-z"])
-    visible = _git_z_output(["git", "-C", str(wt), "ls-files",
-                             "--others", "--exclude-standard", "-z"])
-    if (porcelain.returncode != 0 or post.returncode != 0
-            or visible.returncode != 0):
+    # Untracked files INCLUDING ignored ones: a helper the repo's
+    # .gitignore happens to match is still needed.
+    post = _untracked_listing(wt, which="all")
+    visible = _untracked_listing(wt)
+    if porcelain.returncode != 0 or post is None or visible is None:
         out["reason"] = "could not read the writer's worktree status"
         return out
     for entry in porcelain.stdout.split("\0"):
@@ -47096,8 +47436,8 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
             out["reason"] = f"writer modified a tracked file: {entry[3:]}"
             return out
     new_files = sorted(
-        p for p in post.stdout.split("\0")
-        if p and p not in refs and p not in pre_untracked
+        p for p in post
+        if p not in refs and p not in pre_untracked
         and not _acceptance_is_cache_path(p))
     defect, control, cases, modes = [], [], {}, {}
     # Declared defect files that ran and passed: their per-case statuses
@@ -47201,7 +47541,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     # were dropped (a defect file that passes on base) are not carried.
     declared_any = {_acceptance_declared_rel(f) for f in
                     (res.get("files") or [])}
-    not_ignored = {p for p in visible.stdout.split("\0") if p}
+    not_ignored = set(visible)
     test_dirs = {os.path.dirname(f) for f in defect + control}
 
     def _beside_a_test(f: str) -> bool:
@@ -48817,9 +49157,11 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
     # Only the report copies made above go; never a tracked file.
     _unplace(copied)
     changed = subprocess.run(["git", "-C", str(wt), "status",
-                              "--porcelain"], capture_output=True, text=True,
-                             check=False)
-    if changed.returncode != 0 or not changed.stdout.strip():
+                              "--porcelain", "--untracked-files=no"],
+                             capture_output=True, text=True, check=False)
+    made = _untracked_listing(wt)
+    if (changed.returncode != 0 or made is None
+            or not (changed.stdout.strip() or made)):
         return {"dir": wt, "env": env, "url": url,
                 "abstained": "the independent fix changed nothing"}
     return {"dir": wt, "env": env, "url": url}
@@ -49755,11 +50097,7 @@ def _restore_write_bits(tree: str | Path) -> None:
             mode = os.lstat(full).st_mode
             if stat.S_ISDIR(mode) and (mode & 0o300) != 0o300:
                 os.chmod(full, stat.S_IMODE(mode) | 0o300)
-    r = subprocess.run(["git", "-C", str(tree), "ls-files", "--others",
-                        "--exclude-per-directory=.gitignore",
-                        "--directory", "-z"],
-                       capture_output=True, check=False)
-    for rel in (os.fsdecode(x) for x in r.stdout.split(b"\0") if x):
+    for rel in _untracked_listing(tree, directory=True) or []:
         full = Path(tree) / rel
         _writable_dirs_to(tree, rel.rstrip("/"))
         if full.is_dir() and not full.is_symlink():
@@ -49768,39 +50106,63 @@ def _restore_write_bits(tree: str | Path) -> None:
                     os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) | 0o700)
 
 
-def _remove_listed(tree: str | Path, rels: list[str]) -> None:
-    """Remove each `tree`-relative path a checker listing named: a directory
-    (a nested repository) whole, anything else unlinked — never following a
-    symlink."""
-    for rel in rels:
-        full = Path(tree) / rel.rstrip("/")
-        if full.is_dir() and not full.is_symlink():
-            shutil.rmtree(full, ignore_errors=True)
-        else:
-            with contextlib.suppress(OSError):
-                full.unlink()
+def _drop_lying_index(tree: str | Path, prefix: list[str],
+                      env: dict[str, str] | None) -> bool:
+    """Remove `tree`'s index when its stat cache vouches for a file a fresh
+    index of HEAD says differs (`_fresh_status`), so the reset after it
+    writes every file instead of trusting that stat (DESIGN §8 *The
+    settings are leerie's*). True when it removed one."""
+    real = subprocess.run(["git", *prefix, "status", "--porcelain",
+                           "--untracked-files=no"], capture_output=True,
+                          text=True, check=False, env=env)
+    with tempfile.TemporaryDirectory(prefix="leerie-index-") as d:
+        e = dict(os.environ if env is None else env)
+        e.update(GIT_INDEX_FILE=os.path.join(d, "index"),
+                 GIT_OPTIONAL_LOCKS="0")
+        rt = subprocess.run(["git", *prefix, "read-tree", "HEAD"],
+                            capture_output=True, check=False, env=e)
+        fresh = subprocess.run(["git", *prefix, "status", "--porcelain",
+                                "--untracked-files=no"], capture_output=True,
+                               text=True, check=False, env=e)
+    if real.returncode != 0 or rt.returncode != 0 or fresh.returncode != 0:
+        return False
+    if not _fresh_only(real.stdout.splitlines(), fresh.stdout.splitlines()):
+        return False
+    idx = subprocess.run(["git", *prefix, "rev-parse",
+                          "--path-format=absolute", "--git-path", "index"],
+                         capture_output=True, text=True, check=False,
+                         env=env).stdout.strip()
+    if not idx:
+        return False
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(idx)
+    return True
 
 
 async def _restore_tree(tree: str | Path, rev: str, *, where: str,
                         branch: str | None) -> bool:
     """THE restore primitive (DESIGN §8 *One restore*): `tree` back to `rev`
-    with nothing uncommitted — the owner's write bits restored
-    (`_restore_write_bits`), `branch` checked out (a worker that left it,
+    with nothing uncommitted — leerie's settings copied back over the run
+    repository's (`_restore_settings`), the owner's write bits restored
+    (`_restore_write_bits`), every `assume-unchanged`/`skip-worktree` flag
+    cleared, the index dropped when its stat cache hides an edit
+    (`_drop_lying_index`), `branch` checked out (a worker that left it,
     detached or on its own, would otherwise have only its HEAD reset while
     the branch leerie merges and ships stays where it left it — review
     round 15 H2; None only for a disposable detached checkout), `git reset
     --hard <rev>` (ending any merge), `git clean -ffdq` (nested
-    repositories too; ignored files kept). True when HEAD is then `rev`, on
-    `branch`; False when the reset did not land (a stale index.lock: the
-    caller's own failure path). Its postcondition is I1's checker, the
-    branch line included, and before it the index flags are cleared and
-    whatever only the shared excludes hid is removed (`_remove_listed`,
-    review round 16 H1): dirt
+    repositories too; ignored files kept) — every git step through the
+    run's settings (`_git_view`), so the reset and `clean` see what the
+    checker sees. True when HEAD is then `rev`, on `branch`; False when the
+    reset did not land (a stale index.lock: the caller's own failure path).
+    Its postcondition is I1's checker, the branch line included: dirt
     `_tree_dirt` still reads after a reset that landed is not the
-    orchestrator's own, and stops the run there with the
-    lines (`where` names the step)."""
+    orchestrator's own, and stops the run there with the lines (`where`
+    names the step)."""
     if not rev:
         return False
+    await asyncio.to_thread(_restore_settings, tree)
+    prefix, env = await asyncio.to_thread(_git_view, tree)
     await asyncio.to_thread(_restore_write_bits, tree)
     # Index flags off first: `reset --hard` leaves a skip-worktree edit in
     # place, and either flag hides an edit from the checker's status
@@ -49808,14 +50170,15 @@ async def _restore_tree(tree: str | Path, rev: str, *, where: str,
     # the last of two such options to `--stdin` paths.
     # Bytes, file-system decoded (`_git_z_output`): a non-UTF-8 path is
     # still named, and handed back to git as the same bytes.
-    ls_v = _git_z_output(["git", "-C", str(tree), "ls-files", "-v", "-z"])
+    ls_v = _git_z_output(["git", *prefix, "ls-files", "-v", "-z"], env=env)
     flagged = [p for p, _f in _flagged_entries(ls_v.stdout)]
     if flagged:
         paths = b"".join(os.fsencode(p) + b"\0" for p in flagged)
         for opt in ("--no-skip-worktree", "--no-assume-unchanged"):
-            subprocess.run(["git", "-C", str(tree), "update-index", opt,
-                            "-z", "--stdin"], input=paths,
-                           capture_output=True, check=False)
+            subprocess.run(["git", *prefix, "update-index", opt, "-z",
+                            "--stdin"], input=paths, capture_output=True,
+                           check=False, env=env)
+    await asyncio.to_thread(_drop_lying_index, tree, prefix, env)
     landed = False
     # Up to three attempts, a second apart: a spawn failure (EAGAIN) on the
     # reset or an unreadable HEAD afterwards is not yet a failed reset.
@@ -49824,14 +50187,14 @@ async def _restore_tree(tree: str | Path, rev: str, *, where: str,
             await asyncio.sleep(1)
         try:
             if branch:
-                subprocess.run(["git", "-C", str(tree), "checkout", "-q",
-                                "-f", branch],
-                               capture_output=True, check=False)
-            subprocess.run(["git", "-C", str(tree), "reset", "-q", "--hard",
-                            rev], capture_output=True, check=False)
-            on = subprocess.run(["git", "-C", str(tree), "symbolic-ref",
-                                 "-q", "HEAD"], capture_output=True,
-                                text=True, check=False).stdout.strip()
+                subprocess.run(["git", *prefix, "checkout", "-q", "-f",
+                                branch],
+                               capture_output=True, check=False, env=env)
+            subprocess.run(["git", *prefix, "reset", "-q", "--hard", rev],
+                           capture_output=True, check=False, env=env)
+            on = subprocess.run(["git", *prefix, "symbolic-ref", "-q", "HEAD"],
+                                capture_output=True, text=True, check=False,
+                                env=env).stdout.strip()
         except OSError:
             continue
         head = await _branch_head_sha(str(tree))
@@ -49841,14 +50204,8 @@ async def _restore_tree(tree: str | Path, rev: str, *, where: str,
             break
     if not landed:
         return False
-    subprocess.run(["git", "-C", str(tree), "clean", "-ffdq"],
-                   capture_output=True, check=False)
-    # What `clean` keeps because only the shared `info/exclude` or
-    # `core.excludesFile` hides it: removed by the checker's own listing
-    # (review round 16 H1).
-    rest = subprocess.run(["git", "-C", str(tree), *_UNTRACKED_ARGV],
-                          capture_output=True, text=True, check=False)
-    _remove_listed(tree, [p for p in rest.stdout.split("\0") if p])
+    subprocess.run(["git", *prefix, "clean", "-ffdq"], capture_output=True,
+                   check=False, env=env)
     left = await _tree_dirt(tree, branch=branch)
     if left != []:
         lines = (["(git status failed — the tree could not be read)"]
@@ -52694,21 +53051,19 @@ def _selfcheck_args(args: list[str], run_files: list[str]
 
 
 def _selfcheck_snapshot(tree: str, snap: Path) -> int:
-    """Copy `tree`'s working files — what `git ls-files --cached --others
-    --exclude-standard` lists and exists: HEAD, its edits, its untracked,
-    not-ignored files — into `snap`. No temporary index: an `add -A`
+    """Copy `tree`'s working files — what the one listing
+    (`_untracked_listing(cached=True)`, DESIGN §8 *One ignore rule*) gives
+    and exists: HEAD, its edits, its untracked, not-ignored files — into
+    `snap`. No temporary index: an `add -A`
     through one would hash every one of them into the object store, a
     worker's copy of a set included (DESIGN §8 *No set byte enters the
     repository's object store*); this writes no git object. Returns the
     number of files copied."""
-    r = subprocess.run(["git", "-C", tree, "ls-files", "-z", "--cached",
-                        "--others", "--exclude-standard"],
-                       capture_output=True, check=False)
-    if r.returncode != 0:
-        raise RuntimeError("git ls-files failed: "
-                           + r.stderr.decode(errors="replace")[-300:])
+    listed = _untracked_listing(tree, cached=True)
+    if listed is None:
+        raise RuntimeError("git ls-files failed")
     files = []
-    for rel in sorted({x for x in os.fsdecode(r.stdout).split("\0") if x}):
+    for rel in sorted(set(listed)):
         src = Path(tree) / rel
         if src.is_dir() and not src.is_symlink():
             continue                      # a gitlink
@@ -52744,11 +53099,9 @@ def _share_ignored_paths(tree: str | Path, snap: Path,
     one (the self-check's sets: a set file placed through such a link would
     be written into `tree`)."""
     set_files = list(set_files)
-    r = subprocess.run(["git", "-C", tree, "ls-files", "-z", "--others",
-                        "--ignored", "--exclude-standard", "--directory"],
-                       capture_output=True, check=False)
     linked: list[str] = []
-    for rel in os.fsdecode(r.stdout).split("\0"):
+    for rel in _untracked_listing(tree, which="ignored",
+                                  directory=True) or []:
         rel = rel.rstrip("/")
         if not rel or any(f == rel or f.startswith(rel + "/")
                           for f in set_files):
@@ -56879,17 +57232,10 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
 
 
 def _untracked_files(worktree: str | Path) -> set[str] | None:
-    """The worktree's untracked, not-ignored files (`git ls-files --others
-    --exclude-standard -z`, mechanical output), or None when git cannot
-    say."""
-    try:
-        r = _git_z_output(["git", "-C", str(worktree), "ls-files",
-                           "--others", "--exclude-standard", "-z"])
-    except OSError:
-        return None
-    if r.returncode != 0:
-        return None
-    return {p for p in r.stdout.split("\0") if p}
+    """The worktree's untracked, not-ignored files (the one listing,
+    `_untracked_listing`), or None when git cannot say."""
+    found = _untracked_listing(worktree)
+    return None if found is None else set(found)
 
 
 def _execution_blocker(record: dict) -> str:

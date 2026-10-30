@@ -33,12 +33,18 @@ def _sh(repo, name, *args):
                           check=True)
 
 
-def _world(leerie, tmp_path, monkeypatch):
+def _world(leerie, tmp_path, monkeypatch, hooks_path=None):
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "config", "user.email", "t@t")
     _git(repo, "config", "user.name", "t")
+    if hooks_path is not None:
+        # The user's own setting, carried into the run's repository and so
+        # part of leerie's copy of its settings (DESIGN §8 *The settings
+        # are leerie's*): set on the run repository afterwards, I2's
+        # bracket around the merge would put it back.
+        _git(repo, "config", "core.hooksPath", str(hooks_path))
     (repo / "f.txt").write_text("base\n")
     (repo / ".gitignore").write_text(".leerie/\nnode_modules/\ngen/\n")
     _git(repo, "add", "-A")
@@ -87,14 +93,15 @@ def test_output_a_merged_gitignore_exposes_is_removed(leerie, tmp_path,
 
 def test_a_post_merge_hook_does_not_run_on_leeries_merge(leerie, tmp_path,
                                                          monkeypatch):
-    repo, staging, wt, st = _world(leerie, tmp_path, monkeypatch)
     hooks = tmp_path / "hooks"
     hooks.mkdir()
     ran = tmp_path / "hook.ran"          # outside the tree: no bracket
     (hooks / "post-merge").write_text(   # can hide that the hook ran
         f"#!/bin/sh\necho synced > .last-sync\necho x >> {ran}\n")
     (hooks / "post-merge").chmod(0o755)
-    _git(repo, "config", "core.hooksPath", str(hooks))
+    repo, staging, wt, st = _world(leerie, tmp_path, monkeypatch,
+                                   hooks_path=hooks)
+    assert _git(repo, "config", "core.hooksPath") == str(hooks)
     (wt / "f.txt").write_text("feature\n")
     _git(wt, "commit", "-qam", "feature")
     proc = asyncio.run(leerie._integrate_merge(staging, st, "feat-001"))

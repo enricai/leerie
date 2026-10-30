@@ -348,7 +348,7 @@ except Exception:
       (cd "$staging" && git rev-parse --verify --quiet MERGE_HEAD 2>/dev/null) || merge_head_rc=$?
       staged_files=""
       staged_files=$(cd "$staging" && git diff --cached --name-only 2>/dev/null || true)
-      dirt=$(cd "$staging" && git status --porcelain --untracked-files=all 2>/dev/null || echo "status failed")
+      dirt=$(leerie_tree_dirt "$staging" 2>/dev/null || echo "status failed")
       now=$(cd "$staging" && git rev-parse HEAD)
       if [ "$merge_head_rc" -ne 0 ] && [ -z "$staged_files" ] \
           && [ -z "$dirt" ] && [ "$now" != "$pre" ]; then

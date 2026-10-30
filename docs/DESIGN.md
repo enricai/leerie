@@ -1946,6 +1946,12 @@ leerie's own enumerated git:
   user's `core.bare = false` then overrides the bare repository's. git reads
   the run repository as non-bare and refuses `worktree add` of the run
   branch as "already used by worktree at <repo>".
+- *Its settings are leerie's.* Once carried, the run repository's `config`
+  and `info/` are copied to `<run-dir>/repo-settings/`, and leerie reads
+  every tree of the run through that copy and through a per-process copy
+  of the settings outside the repository (§8 *The settings are leerie's*):
+  a worker's `git config` in its tree is visible as a change, never a
+  change in what git reports.
 - *Bringing the run branch back* is host-side, after the run, as it already
   is on Fly (`fetch_branch`). The launcher fetches
   `refs/heads/leerie/runs/<id>` from `<state-root>/runs/<id>/repo` into the
@@ -5683,14 +5689,16 @@ A repository that does not ignore its dependency directory (`.venv/`,
 workers to the same rule, and real repositories ignore it.
 
 The bracket: a snapshot of the tracked files' content (path → blob of the
-working bytes) and the list of untracked, not-ignored files (`git
-ls-files --others --exclude-standard`) are taken before the command.
+working bytes) and the list of untracked, not-ignored files (the one
+listing, §8 *One ignore rule*) are taken before the command.
 Afterwards every tracked file whose content changed is put back as it was
 just before — from HEAD when it matched HEAD, from its saved bytes when it
 was already edited, so nothing anyone left is lost — and then every
 untracked, not-ignored file not in the earlier list is deleted. A file
 that existed before the command is never deleted, whatever the command
-did to it. The other commands leerie runs do not need it: CI parity and
+did to it. The run repository's settings, which a command can change too
+(husky's install sets `core.hooksPath`), are copied back from leerie's
+copy (§8 *The settings are leerie's*). The other commands leerie runs do not need it: CI parity and
 the held-out sets' parse probe and runs work in disposable checkouts no
 worker commits from; the setup hook and
 `mise install` run at the repository root before any worktree exists; and
@@ -7818,8 +7826,8 @@ The root cause was never in the readers: it was the dirt. With I1 and I2
 there is none to classify, and the readers have one rule.
 
 That rule is checked, not trusted. Each reader first asserts that staging
-is clean (`git status --porcelain --untracked-files=all` prints nothing;
-ignored files are not dirt), and a violation **stops the run** (`die`)
+is clean (I1's checker, `_tree_dirt`, reads nothing; ignored files are
+not dirt), and a violation **stops the run** (`die`)
 naming the porcelain lines. It is not routed to `unconverged`, for three
 reasons. A violation has no outside cause: every worker's dirt is caught
 by I1's gate at the worker (re-asked, then rolled back), every command of
@@ -8065,8 +8073,8 @@ replay's temporary directory and removed with whatever it made — never
 the checkout itself.
 
 **A worker leaves its tree clean.** The invariant (I1): *after every
-worker that runs in a tree leerie measures, integrates or ships, `git
-status --porcelain --untracked-files=all` in that tree prints nothing, and
+worker that runs in a tree leerie measures, integrates or ships, I1's
+checker (*Exact*, below) reads nothing in that tree, and
 the tree is on the branch leerie gave the worker, at a commit that
 descends from where the worker started* — everything the worker means to
 keep is committed, on that branch, and nothing untracked exists outside
@@ -8118,27 +8126,29 @@ checking while something else still writes the tree.
 The gate:
 
 - *Exact.* The checker reads what leerie relies on — the working tree is
-  HEAD's tree plus what the tree's own `.gitignore` files ignore — never a
-  view of it a setting outside the tree can change (`_tree_dirt`): a
-  tracked edit or a staged change (`git status --porcelain
-  --untracked-files=no`); every index entry flagged `assume-unchanged` or
-  `skip-worktree` (`git ls-files -v`: such a flag hides an edit from
-  status, and `reset --hard` leaves a skip-worktree edit in place); and
-  every untracked file not ignored by a `.gitignore` in the tree (`git
-  ls-files --others --exclude-per-directory=.gitignore`, which, unlike
-  status, reads neither the shared `info/exclude` nor `core.excludesFile`
-  — a pattern there hides a file from status in every checkout of the
-  repository, the user's own included). A change to a tracked `.gitignore`
-  is a tracked edit, and an uncommitted one is an untracked file like any
-  other — unless it ignores itself, which is how tools mark the caches
-  they write (pytest's `.pytest_cache/`, mypy's and ruff's caches carry a
-  `.gitignore` of `*`). Those are honoured: reporting them made every
-  Python run's staging "dirty" at its first measurement (measured while
-  building this). The residual is a worker that writes such a file to
-  hide its own: not closed by the checker, and raised as a design
-  question rather than met with a list of cache names. An ignored file — installed dependencies, build output a
-  repository ignores — never appears, so it can never trigger a re-ask; a
-  git failure is not clean (nothing was read). Two more lines can come
+  HEAD's tree plus what the repository's ignore rules ignore — through
+  settings no worker can change (`_tree_dirt`; *The settings are leerie's*,
+  below): a line when the run repository's own settings differ from
+  leerie's copy of them; a tracked edit or a staged change (`git status
+  --porcelain --untracked-files=no`), read twice, through the tree's index
+  and through a fresh index of HEAD that records no file's stat, so git
+  hashes every tracked file again (a stat cache that vouches for an edited
+  file hides it from the first read, not from the second); every index
+  entry flagged `assume-unchanged` or `skip-worktree` (`git ls-files -v`:
+  such a flag hides an edit from status, and `reset --hard` leaves a
+  skip-worktree edit in place); and every untracked file the ignore rules
+  do not ignore (*One ignore rule*, below). A change to a tracked
+  `.gitignore` is a tracked edit, and an uncommitted one is an untracked
+  file like any other — unless it ignores itself, which is how tools mark
+  the caches they write (pytest's `.pytest_cache/`, mypy's and ruff's
+  caches carry a `.gitignore` of `*`). Those are honoured: reporting them
+  made every Python run's staging "dirty" at its first measurement
+  (measured while building this). The residual is a worker that writes
+  such a file to hide its own: not closed by the checker, and raised as a
+  design question rather than met with a list of cache names. An ignored
+  file — installed dependencies, build output a repository ignores — never
+  appears, so it can never trigger a re-ask; a git failure is not clean
+  (nothing was read). Two more lines can come
   with it, each from git's own answer, not from the files: HEAD is not the
   worker's branch (`git symbolic-ref`: detached, or another branch), and
   HEAD does not descend from the commit leerie relies on the worker's work
@@ -8150,13 +8160,13 @@ The gate:
   its own earlier attempt's commit, which it may amend or rebase (review
   round 16 M2: a continuation that amended its previous attempt read as
   having left its start, and correct work settled `unconverged`).
-  Review round 16 H1 drove the root cause of the view: a checker that is
-  `git status`, which honours index flags and every exclude source, was
-  passed by a worker that ran `git update-index --skip-worktree` on its
-  edited file, or wrote an untracked `conftest.py` patching the code under
-  test and listed it in `info/exclude` — the textbook ways to make a
-  status line go away without committing — and the tree leerie measured
-  green was not the commit it shipped.
+  Review round 16 H1 drove the index flags: a checker that is `git
+  status`, which honours them, was passed by a worker that ran `git
+  update-index --skip-worktree` on its edited file — the textbook way to
+  make a status line go away without committing — and the tree leerie
+  measured green was not the commit it shipped. The same round's other
+  example, an untracked `conftest.py` patching the code under test and
+  listed in `info/exclude`, is a settings change (below).
 - *Only when nothing else writes the tree.* It runs right after the
   worker's `claude -p` has returned and its process subtree is reaped
   (§6 *Worker subtree termination*), before leerie runs anything of its
@@ -8202,6 +8212,106 @@ change, for one of the six workers only. The branch lines replace that
 repair: the worker that left its branch is asked to put its commits back
 on it, and the settled head is simply the branch tip.
 
+**The settings are leerie's (review round 17 H2).** What git reports for a
+tree depends on more than the tree. Config changes it: `core.fileMode`
+(`false` hides an executable-bit change), `core.autocrlf`, `core.eol`,
+`core.safecrlf`, `core.ignoreCase`, `core.precomposeUnicode`,
+`core.symlinks`, `core.checkStat`, `core.trustctime`,
+`diff.ignoreSubmodules`, `submodule.<name>.ignore`, `filter.<driver>.*`,
+`core.attributesFile`, `core.excludesFile`, `core.sparseCheckout`,
+`core.fsmonitor`, `core.untrackedCache`, `status.showUntrackedFiles`, and
+`extensions.worktreeConfig` or `include.path`, which bring in another
+file of keys. Attributes change it (a clean filter makes an edited file
+hash to HEAD's blob). The ignore rules change it. And the index's stat
+cache changes it: an entry whose recorded stat matches the file is not
+read again. Every worktree of the run shares the run repository's `config`
+and `info/` (`attributes`, `exclude`, `sparse-checkout`), and a worker
+writes them from its own tree with a plain `git config` — the textbook
+answer to "status shows my chmod"; its container's system and global
+config, attributes and ignore files are writable too. Round 17 drove two
+through both checker halves and the one restore, each of which reported
+clean and restored "successfully" with the change still on disk:
+`core.fileMode=false` hid an executable bit the tree ran and the commit
+lacked, and a clean filter declared in `info/attributes` hid a tracked
+edit outright. Pinning the keys that matter on the checker's command line
+closes those two and not the class: the list is git's and grows, a filter
+driver is named by whoever writes it, and `info/attributes` has no switch.
+The root cause is that the checker read the tree through settings it did
+not own. The invariant: *the settings git reads to report a tree of the
+run are fixed by leerie; a worker cannot change what git reports.* Three
+parts, each by mechanism rather than by key:
+
+- *The run repository's own settings are compared.* When leerie creates
+  the run's repository it copies its `config` and its `info/` directory to
+  `<run-dir>/repo-settings/`, and never writes either afterwards (it sets
+  `repack.updateServerInfo=false` first: an automatic `git gc` otherwise
+  writes `info/refs`, measured). Every
+  key, filter, include or per-worktree config file can take effect only
+  through one of those two, so a difference in either is an I1 line
+  naming both paths, and the one restore copies leerie's back. git's own
+  writes of the same value leave the file byte-identical (husky's `git
+  config core.hooksPath .husky/_` over the carried `.husky/_`, measured).
+- *Everything outside the run's repository is read from a copy.* The
+  system and global config with the files they include, the system and
+  global attributes files and the global ignore file are copied once per
+  orchestrator process — config flattened, includes resolved — to
+  `repo-settings/host.config`, `host.attributes` and `host.exclude`, and
+  every checker and restore git reads those copies (`GIT_CONFIG_SYSTEM`,
+  `GIT_CONFIG_GLOBAL`, `GIT_ATTR_NOSYSTEM`, `core.attributesFile`,
+  `core.excludesFile`). Copied, not compared: they are the user's (the
+  launcher stages them into the container), so the checker is made immune
+  to them rather than restoring them; and per process, not per run, so a
+  user who changes them between a run and its resume gets the new ones.
+- *Optimisations are off, the stat cache is not trusted.* `core.fsmonitor`
+  (a program that tells git which files changed) and `core.untrackedCache`
+  (a directory's mtime vouching for its listing) never change a correct
+  answer, and each is a channel to a wrong one, so the checker turns both
+  off. The stat cache is the third such optimisation, and the one a
+  setting leaves behind: a worker that declares a filter, stages through
+  it and removes the filter again leaves settings equal to leerie's and
+  an index whose stat vouches for the edited file. The fresh-index read
+  above does not consult it. The one restore drops the index before
+  `reset --hard` when the two reads disagree, since the reset trusts the
+  same stat and otherwise keeps the edit (measured).
+
+A tree that belongs to no run repository (the user's own checkout, a
+ref-less clone) is read with its own settings, the two optimisations off.
+Leerie's own commands keep the run repository's settings as they found
+them too: I2's bracket (§6½) copies them back after each command, the
+same copy the restore makes. The residuals: replace refs (`refs/replace/`)
+change which tree a commit names to every reader alike, the shipping read
+included, so they are not a view of the tree; a worker can still edit the
+copy under `<run-dir>/repo-settings/`, which is leerie's own state, like
+`state.json`; and the user's own repository-local settings are carried
+(*The run's own repository*), so a user who sets `core.fileMode=false`
+in their checkout has the checker read the run's trees that way, as their
+own `git status` does. A worker that sets `extensions.worktreeConfig`
+makes git unable to read any worktree of the run (the bare repository's
+`core.bare` then applies to each); the checker reports the tree
+unreadable, which is not clean, and the restore copies the config back.
+
+**One ignore rule (review round 17 H3).** "Ignored" means one thing in
+every tree leerie reads: what git's standard ignore rules say — the tree's
+`.gitignore` files, the run repository's `info/exclude` and the global
+ignore file — read through the run's settings (above). One function
+builds every listing of untracked files (`_untracked_cmd`; in shell
+`leerie_untracked`): I1's checker, I2's bracket, the one restore and its
+write bits, the self-check's copy and the ignored paths it shares, the
+acceptance writer's collection, the surrogate's change check and the
+checkout sentinel. No other `ls-files --others` exists in leerie, and no
+`git status` that lists untracked files (`tests/test_one_ignore_rule.py`,
+derived from the source). The root cause: two definitions. Round 16
+narrowed I1 to the tree's own `.gitignore` files, because `info/exclude`
+and the global ignore were writable by any worker, and left I2 on
+`--exclude-standard`. The launcher mounts the developer's global ignore
+into the container, so a `__pycache__/` that only it covers, written by
+leerie's own test run, was "ignored, so environment" to I2 and dirt to
+I1, and `_assert_staging_clean` stopped the run blaming leerie's own
+invariant. Making the ignore sources leerie's (*The settings are
+leerie's*) removes the reason round 16 narrowed the rule, so the one rule
+is git's own: a developer's globally ignored caches stay ignored, and an
+`info/exclude` a worker edits is a settings line, not a hidden file.
+
 The rollbacks this rests on are made exact for the same reason: a back-out
 of an integrator's merge and the reset before an integrator is retried
 also remove untracked files, so the next worker in staging starts from a
@@ -8225,13 +8335,14 @@ init`, a clone into the tree: `git clean -fd` skips them, `-ffd` does
 not), and none checked that the dirt I1 reports was gone — so I1's
 designed exhaustion path, roll back and record, became a `die()` at the
 next reader, and the nested-repo case one that recurred on every resume.
-The primitive restores the owner's write bit on the tracked directories
-and the untracked paths (§6½), clears every `assume-unchanged` and
-`skip-worktree` flag (`reset --hard` keeps a skip-worktree edit), resets,
-runs `git clean -ffd` (ignored files kept), removes what the checker still
-lists as untracked — a file only the shared `info/exclude` or
-`core.excludesFile` hid, which `clean` keeps (review round 16 H1) — and
-reads the checker — in shell the same steps and the same checker, line
+The primitive copies leerie's settings back over the run repository's
+(*The settings are leerie's*, above), restores the owner's write bit on
+the tracked directories and the untracked paths (§6½), clears every
+`assume-unchanged` and `skip-worktree` flag (`reset --hard` keeps a
+skip-worktree edit), drops the index when its stat cache vouches for a
+file the fresh read says differs, resets, runs `git clean -ffd` (ignored
+files kept) — every step through the run's settings, so the reset and
+`clean` see what the checker sees — and reads the checker — in shell the same steps and the same checker, line
 for line (`leerie_tree_dirt`), so the two halves are one behaviour. Dirt it
 cannot remove is not the
 orchestrator's own (Fly's root-run subtree collection, §6½, is the one
@@ -8300,8 +8411,8 @@ implementer's `PATH` (`scripts/selfcheck.py`, its logic in the
 orchestrator); one call:
 
 1. copies the worker's current working tree — HEAD, its uncommitted
-   edits and its untracked, not-ignored files, as `git ls-files --cached
-   --others --exclude-standard` lists them — into a run-private
+   edits and its untracked, not-ignored files, as the one listing (§8
+   *One ignore rule*) gives them — into a run-private
    directory with no `.git`, with `GIT_CEILING_DIRECTORIES` at that
    directory's parent so a test that shells out to git resolves no
    enclosing repository;

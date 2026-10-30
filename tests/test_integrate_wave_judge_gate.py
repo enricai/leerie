@@ -177,7 +177,7 @@ def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
         mock.stdout = ""
         return mock
 
-    async def fake_run_proc(cmd, cwd=None):
+    async def fake_run_proc(cmd, cwd=None, env=None):
         # Simulate successful git commands
         mock = AsyncMock()
         mock.returncode = 0
@@ -360,7 +360,7 @@ def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypatch):
         mock.stdout = ""
         return mock
 
-    async def fake_run_proc(cmd, cwd=None):
+    async def fake_run_proc(cmd, cwd=None, env=None):
         mock = AsyncMock()
         mock.returncode = 0
         if "symbolic-ref" in cmd:
@@ -446,7 +446,7 @@ def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
         mock.stdout = ""
         return mock
 
-    async def fake_run_proc(cmd, cwd=None):
+    async def fake_run_proc(cmd, cwd=None, env=None):
         mock = AsyncMock()
         mock.returncode = 0
         if "symbolic-ref" in cmd:
@@ -594,7 +594,7 @@ def test_resume_reinvokes_the_judge_without_redriving_integrate_sh(
         mock.stdout = ""
         return mock
 
-    async def fake_run_proc(cmd, cwd=None):
+    async def fake_run_proc(cmd, cwd=None, env=None):
         mock = AsyncMock()
         mock.returncode = 0
         # The resumed staging is clean and on the run branch (setup-run.sh
@@ -1194,7 +1194,7 @@ def test_integrator_commit_warning_is_non_fatal_and_recorded(leerie, tmp_path, m
     async def fake_check_integrator_commit(staging_path):
         return "commit message doesn't mention the resolved conflict"
 
-    async def fake_run_proc(cmd, cwd=None):
+    async def fake_run_proc(cmd, cwd=None, env=None):
         mock = AsyncMock()
         mock.returncode = 0
         if "symbolic-ref" in cmd:
@@ -1398,7 +1398,7 @@ def test_integrator_crash_then_recovery_logs_warning_and_still_integrates(
     async def fake_check_integrator_commit(staging_path):
         return None
 
-    async def fake_run_proc(cmd, cwd=None):
+    async def fake_run_proc(cmd, cwd=None, env=None):
         mock = AsyncMock()
         mock.returncode = 0
         if "symbolic-ref" in cmd:
@@ -1510,7 +1510,7 @@ def test_advisory_defect_logs_but_does_not_gate(leerie, tmp_path, monkeypatch):
     async def fake_check_integrator_commit(staging_path):
         return None
 
-    async def fake_run_proc(cmd, cwd=None):
+    async def fake_run_proc(cmd, cwd=None, env=None):
         mock = AsyncMock()
         mock.returncode = 0
         if "symbolic-ref" in cmd:
