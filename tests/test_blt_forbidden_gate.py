@@ -87,6 +87,9 @@ LEERIE_OWNED_HEADS = {
             "and a require.resolve probe",
     "bash": "leerie's scripts/ and the operator's .leerie-setup.sh — "
             "never `-c`, which the shell-list test refuses",
+    "tar": "the re-drive self-check's copy of a working tree: fixed "
+           "flags, its file list NUL-separated on stdin (`--null`, so a "
+           "name is never read as an option)",
 }
 
 # Launches whose argv is computed but is not a repository command. Each

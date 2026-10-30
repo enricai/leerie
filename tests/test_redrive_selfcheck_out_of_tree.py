@@ -252,3 +252,23 @@ def test_no_set_byte_enters_the_object_store_after_a_redrive(
     blob = _all_objects(w.repo)
     assert MARK.encode() not in blob
     assert held_mark.encode() not in blob
+
+
+def test_the_copy_reads_a_dash_led_name_as_a_file(leerie, tmp_path):
+    """The copy's `tar` takes the tree's file names on stdin, NUL-separated
+    (`--null`): a name that looks like a `tar` option is copied as a file
+    and runs nothing — the property tests/test_blt_forbidden_gate.py
+    relies on in counting `tar` among the programs leerie itself chose."""
+    tree = tmp_path / "t"
+    tree.mkdir()
+    _git(tree, "init", "-q")
+    names = ["--checkpoint=1", "--checkpoint-action=exec=touch PWNED",
+             "ok.txt"]
+    for n in names:
+        (tree / n).write_text("x\n")
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    assert leerie._selfcheck_snapshot(str(tree), snap) == 3
+    assert sorted(os.listdir(snap)) == sorted(names)
+    assert not (tree / "PWNED").exists() and not (snap / "PWNED").exists()
+
