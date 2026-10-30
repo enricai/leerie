@@ -5733,18 +5733,28 @@ checkout, whose uncommitted file stays untouched.
   I2 bracket's put-back and every git form leerie uses fire none, and every
   script leerie runs turns hooks off itself (`leerie_git_hooks_off`), also
   when run outside the orchestrator.
-- `tests/test_run_repo.py` (21 tests, DESIGN §6 *The run's own
+- `tests/test_run_repo.py` (27 tests, DESIGN §6 *The run's own
   repository*, RC4/I4): every tree a worker gets hangs off `<run-dir>/repo`,
   a bare repository of the run's own, so no worker's git verb reaches the
   user's refs, stash, config, `info/exclude`, hooks or worktree registry;
   review round 16 H2's drivers inverted — the user's stash survives a
   worker's `stash`/`pop`, and a worker cannot move the user's branches.
-  Real git, real scripts and helpers.
-- `tests/test_run_repo_bring_back.py` (11 tests): `host_bring_back_run_branch`
+  Review round 17: a worker's `git init` in staging (`core.bare` rewritten)
+  costs the run nothing, and a recorded repository failing its check is
+  never deleted (H1); every tree kind works under
+  `safe.bareRepository=explicit` (M3); the rebaser's prompt range resolves
+  in its own repository (M1); a mid-run branch switch brings no other
+  commit in (L1); a crash-left scratch directory is removed (L2). Real git,
+  real scripts and helpers.
+- `tests/test_run_repo_bring_back.py` (19 tests): `host_bring_back_run_branch`
   brings the run branch back from the run's repository into the user's as
-  leerie's own git (hooks off, no `FETCH_HEAD`) and as a compare-and-swap
+  leerie's own git (hooks off, no `FETCH_HEAD`), as a compare-and-swap
   against `run.json` `brought_back_sha`, so a finalize rebase or the user's
-  own change to the ref is never undone. Real git, real bash, `jq`.
+  own change to the ref is never undone, and only as a fast-forward (round
+  17 H1). The launcher's post-exit steps read only the run the container
+  named (two runs: the older one, which it ran, is finalized), and its own
+  traps bring the branch back under SIGINT (round 17 M2). Real git, real
+  bash, `jq`.
 - `tests/test_run_repo_missing_dies.py` (4 tests, review round 17 H1/L4): a
   helper worktree added with no run repository dies naming it — the add
   itself, CI parity's `_ci_worktree` and `_evaluate_acceptance_sets`, which

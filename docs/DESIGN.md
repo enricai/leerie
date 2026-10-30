@@ -1830,6 +1830,41 @@ leerie's own enumerated git:
   - a `fetch` from the user's repository of the working branch, kept under
     the same name, and the user's HEAD commit as the bare repository's
     detached HEAD. leerie's own git, hooks off.
+
+  It is built in a scratch directory and renamed into place. A scratch
+  directory a crash left behind is removed at the next creation (review
+  round 17 L2). Creation runs only while holding the run's flock, so any
+  scratch directory found then is dead.
+- *Recorded, never rebuilt* (review round 17 H1). Once `run_repo` is in
+  state, the repository holds every commit of the run and is its only
+  store. leerie never deletes it and never builds it again. At each entry,
+  leerie checks it by something no worker's git command can change:
+  - it names the repository explicitly (`--git-dir`, below);
+  - it checks that the commit the run started from is there: `base_sha`
+    once the run branch is cut, `refs/leerie/user-head` before.
+
+  A repository that fails the check stops the run with a `die()` naming
+  its path, never with a rebuild. Before, the probe read `core.bare`, and
+  a worker's `git init` in its own tree rewrites that in the shared config
+  ("Reinitialized existing Git repository"). The next resume then read the
+  repository as absent, deleted it with every run, subtask and integration
+  commit, and rebuilt it from the user's. The bring-back then moved the
+  user's branch onto the rebuilt, unrelated tip.
+- *Named, never discovered* (review round 17 M3). git's
+  `safe.bareRepository=explicit`, a hardening setting the launcher mounts
+  with the user's global config, refuses to find a bare repository from the
+  working directory (`git -C <repo>` or a cwd inside it). So leerie names
+  the run's repository explicitly everywhere it addresses it:
+  - `--git-dir` in the orchestrator, the host bring-back, the rebaser's
+    repository and Fly's `fetch_branch`;
+  - `LEERIE_GIT_DIR` in the scripts, which pass it to every
+    repository-level git command through `leerie_repo_git`.
+
+  Workers need nothing: a linked worktree is found through its `.git`
+  file, which the setting allows. Measured on git 2.53.0 under the
+  setting: `-C <bare>` is refused, while `--git-dir` fetch, `worktree add`,
+  `bundle`, a commit in a linked worktree, `clone --shared <bare path>` and
+  `fetch <bare path>` all work.
 - *What the fetch brings.* The fetch copies objects, so the run's repository
   is self-contained: it has no alternates and no `origin` remote of the user
   repository. What it brings:
@@ -1846,6 +1881,12 @@ leerie's own enumerated git:
   branch's moving tip, as §12 L4 describes. A worker that commits onto the
   repository's copy of the working branch moves only that copy, and the next
   refresh puts it back.
+
+  A refresh fetches the working branch alone. The user's HEAD is fetched
+  only at creation (the run's own start) and for a run started on a
+  detached HEAD, which has no branch to follow. So an operator switching
+  branches mid-run brings no other branch's history into the run's
+  repository (review round 17 L1).
 - *leerie reads the base by commit.* When the run branch is cut, leerie
   records `base_sha`. Its own comparisons against the base use that commit,
   never a branch name a worker can move:
@@ -1912,12 +1953,27 @@ leerie's own enumerated git:
   - hooks off, no `FETCH_HEAD`, no auto-maintenance;
   - only when the user's ref is absent or still at the commit leerie last
     brought back (`run.json` `brought_back_sha`), so a finalize rebase is
-    never undone.
+    never undone;
+  - and only as a fast-forward of what was brought back: the run's new tip
+    must descend from the user's current ref (review round 17 H1).
+
+  Why the fast-forward, and not "descends from `base_sha`": a branch leerie
+  brought back is the run's record, and the user may have pushed it or
+  built on it. A later bring-back must only add to it. A tip cut afresh
+  from an unmoved working branch descends from `base_sha`, so that rule
+  would still have let H1's rebuilt, unrelated tip replace the brought-back
+  work. A run whose branch moved back or sideways since, for example a
+  back-out after a crash, is refused with rc 2. Its tip stays in the run's
+  repository, `prune` keeps the run, and the operator decides.
 
   It runs:
-  - after the container exits, whatever its exit code and with or without
-    `--no-push`, before the auto-finalize, for the run that container ran
-    (*Which run the container ran* below);
+  - on the launcher's exit path, for the run that container ran (*Which run
+    the container ran* below): its EXIT trap, so it runs whatever the exit
+    is (a clean exit, a failed run, `--no-push`, Ctrl-C or TERM; review
+    round 17 M2). The INT and TERM traps used to exit before the
+    bring-back. Every step of that trap tolerates failure: under `set -e`
+    a failing step ends the trap, and a keepalive that had already exited
+    (`kill` returning 1) skipped the bring-back after it;
   - at the start of every `host_finalize`;
   - in `leerie finalize <id>`;
   - in `prune`, before a run directory is deleted. A refused swap while the
@@ -1968,7 +2024,11 @@ leerie's own enumerated git:
 - *The finalize rebaser* gets a host-side repository of its own: a
   `--shared` single-branch clone, which is valid there because it lives only
   for finalize on the host. `run_rebaser` carries in the user's config by
-  the rule above, `origin` among it. Its result already
+  the rule above, `origin` among it. The rebaser is told the run's own
+  commits as `<base_sha>..<run branch>`: that commit is an ancestor of the
+  run branch, so it is in the clone, while the working branch's name is not
+  (review round 17 M1). A run made before `base_sha` existed keeps the
+  name, and its rebase is best-effort as before. Its result already
   comes back by a fetch (`refs/leerie-rebase-scratch/<id>`). After a
   rebase, leerie also fetches the `origin/<pr_base_branch>` the rebaser
   fetched into the user's repository, the one remote-tracking ref finalize

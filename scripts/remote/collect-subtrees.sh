@@ -103,6 +103,10 @@ if [ ! -f "$run_dir/repo/HEAD" ]; then
   exit 0
 fi
 cd "$run_dir/repo" || { echo "COLLECT-ERROR:cannot enter $run_dir/repo"; exit 0; }
+# Named, never discovered (safe.bareRepository=explicit): the scripts' and
+# this payload's repository-level git.
+LEERIE_GIT_DIR="$run_dir/repo"
+export LEERIE_GIT_DIR
 
 # Ensure the run branch + staging worktree exist.  setup-run.sh is
 # idempotent — it never resets an existing branch.
@@ -117,7 +121,7 @@ branches=()
 while IFS= read -r ref; do
   [ -n "$ref" ] || continue
   branches+=("$ref")
-done < <(git for-each-ref --format='%(refname:short)' "refs/heads/${subtask_prefix}")
+done < <(git --git-dir="$LEERIE_GIT_DIR" for-each-ref --format='%(refname:short)' "refs/heads/${subtask_prefix}")
 
 if [ "${#branches[@]}" -eq 0 ]; then
   echo "COLLECTED-NONE:${run_id}"
@@ -127,7 +131,7 @@ fi
 # Filter out already-integrated branches.
 unintegrated=()
 for br in "${branches[@]}"; do
-  if git merge-base --is-ancestor "$br" "$run_branch" 2>/dev/null; then
+  if git --git-dir="$LEERIE_GIT_DIR" merge-base --is-ancestor "$br" "$run_branch" 2>/dev/null; then
     continue
   fi
   unintegrated+=("$br")

@@ -8938,6 +8938,36 @@ else
   _run_id_file="$LEERIE_STATE_HOST_DIR/.runid-$$"
   rm -f "$_run_id_file"
 
+  # _read_ran_run_id — which run this container ran (DESIGN §6 *Which run
+  # the container ran*): the one the orchestrator named in the run-id file,
+  # a fresh run, `resume <id>` and a bare `resume`'s own pick alike. Every
+  # post-exit step reads `_ran_run_id` and nothing else names the run (not
+  # `--run-id`, not the cidfile, not the newest run on disk). No file, or a
+  # first line that is no run id: the container ran no run.
+  _read_ran_run_id() {
+    _ran_run_id=""
+    if [ "$RUNTIME" = "local" ] && [ -f "${_run_id_file:-}" ]; then
+      _ran_run_id="$(head -n 1 "$_run_id_file" 2>/dev/null || true)"
+      case "$_ran_run_id" in
+        ''|*[!A-Za-z0-9._-]*|.*) _ran_run_id="" ;;
+      esac
+    fi
+  }
+
+  # _bring_back_ran_run — bring that run's branch back from its own
+  # repository into yours (DESIGN §6 *The run's own repository*). Run from
+  # the EXIT trap, so it runs whatever the exit is: a clean exit, a failed
+  # run, --no-push, Ctrl-C or TERM (whose traps exit through EXIT; review
+  # round 17 M2). Never fails the exit.
+  _bring_back_ran_run() {
+    _read_ran_run_id
+    [ -n "$_ran_run_id" ] || return 0
+    [ -f "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id/repo/HEAD" ] || return 0
+    # shellcheck source=scripts/host-finalize.sh
+    . "$LEERIE_REPO/scripts/host-finalize.sh" || return 0
+    host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
+  }
+
   # Fix D (DESIGN §6 *container boundary's hidden precondition*): kill the
   # container if the launcher is interrupted, so a Ctrl-C / SIGTERM to this
   # process tears the container down instead of orphaning it (an orphaned,
@@ -9026,7 +9056,10 @@ else
       _run_log=""
     fi
   }
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null; _reap_tail; _kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null' EXIT
+  # Every step tolerates failure (`|| true`): under `set -e` a failing
+  # command ends the trap, so a keepalive that had already exited — `kill`
+  # returning 1 — skipped the bring-back and the clean-up after it.
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
   trap '_reap_tail; _kill_container_from_cidfile; exit 130' INT
   trap '_reap_tail; _kill_container_from_cidfile; exit 143' TERM
 
@@ -9241,29 +9274,13 @@ fi
 #   - the structured-exit code (EXIT_NEEDS_ANSWERS=10) — the launcher's
 #     plugin re-runs leerie with --answers after the user responds.
 # Which run this container ran (DESIGN §6 *Which run the container ran*):
-# the one the orchestrator named in the run-id file — a fresh run,
-# `resume <id>` and a bare `resume`'s own pick alike. Read once, here; every
-# post-exit step below reads `_ran_run_id` and nothing else names the run
-# (not `--run-id`, not the cidfile, not the newest run on disk). No file, or
-# a first line that is no run id: the container ran no run.
+# `_read_ran_run_id`, the run the orchestrator named in the run-id file.
+# Every post-exit step below reads `_ran_run_id` and nothing else names the
+# run (not `--run-id`, not the cidfile, not the newest run on disk). Its
+# branch is brought back by the EXIT trap (`_bring_back_ran_run`), whatever
+# the exit; a push below brings it back first itself (`host_finalize`).
 _ran_run_id=""
-if [ "$RUNTIME" = "local" ] && [ -f "${_run_id_file:-}" ]; then
-  _ran_run_id="$(head -n 1 "$_run_id_file" 2>/dev/null || true)"
-  case "$_ran_run_id" in
-    ''|*[!A-Za-z0-9._-]*|.*) _ran_run_id="" ;;
-  esac
-fi
-# Bring the run branch back from the run's own repository into yours
-# (DESIGN §6 *The run's own repository*) after every local run, whatever its
-# exit code and with or without --no-push: the branch is the run's record
-# for you.
-if [ -n "$_ran_run_id" ]; then
-  if [ -f "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id/repo/HEAD" ]; then
-    # shellcheck source=scripts/host-finalize.sh
-    . "$LEERIE_REPO/scripts/host-finalize.sh"
-    host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
-  fi
-fi
+[ "$RUNTIME" != "local" ] || _read_ran_run_id
 if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
   if [ "$container_rc" -ne 0 ]; then
     if [ -n "$_ran_run_id" ]; then

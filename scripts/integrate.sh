@@ -24,7 +24,7 @@ if [ ! -d "$STAGING" ]; then
   echo "error: run-branch worktree missing — run setup-run.sh ${RUN_ID} first" >&2
   exit 2
 fi
-if ! git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+if ! leerie_repo_git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
   echo "error: branch ${BRANCH} does not exist" >&2
   exit 2
 fi

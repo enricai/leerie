@@ -103,17 +103,18 @@ def _flyctl_stub(
         f'    exec python3 {discover_py}\n'
         '    ;;\n'
         '  git*rev-parse*--verify*)\n'
-        # rewrite "git -C /work/.leerie/runs/<id>/repo rev-parse --verify
-        # refs/heads/<branch>" (the run's own repository, DESIGN §6) →
-        # "git -C $REPO ..." so the probe consults the fixture's refs.
-        '    NEWCMD="$(printf %s "$CMD" | sed -E "s#/work/\\.leerie/runs/[^ ]+/repo#$REPO#g")"\n'
+        # rewrite "git --git-dir=/work/.leerie/runs/<id>/repo rev-parse
+        # --verify refs/heads/<branch>" (the run's own repository, named
+        # explicitly, DESIGN §6) → "git -C $REPO ..." so the probe consults
+        # the fixture's refs.
+        '    NEWCMD="$(printf %s "$CMD" | sed -E "s#--git-dir=/work/\\.leerie/runs/[^ ]+/repo#-C $REPO#g")"\n'
         '    eval "$NEWCMD"\n'
         '    exit $?\n'
         '    ;;\n'
         '  git*bundle*create*)\n'
-        # rewrite "git -C /work/.leerie/runs/<id>/repo bundle create - <branch>"
+        # rewrite "git --git-dir=/work/.leerie/runs/<id>/repo bundle create - <branch>"
         # → "git -C $REPO bundle create - <branch>"
-        '    NEWCMD="$(printf %s "$CMD" | sed -E "s#/work/\\.leerie/runs/[^ ]+/repo#$REPO#g")"\n'
+        '    NEWCMD="$(printf %s "$CMD" | sed -E "s#--git-dir=/work/\\.leerie/runs/[^ ]+/repo#-C $REPO#g")"\n'
         '    eval "$NEWCMD"\n'
         '    exit $?\n'
         '    ;;\n'

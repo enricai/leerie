@@ -412,12 +412,13 @@ host_base_freshness_check() {
 # when it is absent and nothing was ever brought back, or when it is still
 # at the commit leerie last brought back (`run.json` `brought_back_sha`) —
 # so a finalize rebase, or the user's own change to the ref, is never
-# undone. The run's tip is recorded as `brought_back_sha`. A run with no
-# repository of its own (made before per-run repositories, or a remote run
-# whose branch `fetch_branch` brings) is a no-op. Returns 1 when the fetch
-# or the update fails, 2 when the compare-and-swap refused while the run's
-# tip is not what was last brought back (its newest commits are then in no
-# ref of the user's), else 0.
+# undone — and only as a fast-forward: the run's tip must descend from the
+# user's current ref (review round 17 H1). The run's tip is recorded as
+# `brought_back_sha`. A run with no repository of its own (made before
+# per-run repositories, or a remote run whose branch `fetch_branch` brings)
+# is a no-op. Returns 1 when the fetch or the update fails, 2 when the swap
+# was refused while the run's tip is not what was last brought back (its
+# newest commits are then in no ref of the user's), else 0.
 host_bring_back_run_branch() {
   local run_dir="$1"
   local repo="$run_dir/repo"
@@ -426,7 +427,9 @@ host_bring_back_run_branch() {
   local run_id branch tip recorded current
   run_id="$(basename "$run_dir")"
   branch="leerie/runs/$run_id"
-  tip="$(git -C "$repo" rev-parse --verify -q "refs/heads/$branch^{commit}" 2>/dev/null || true)"
+  # Named, never discovered: git refuses to find a bare repository from a
+  # path under safe.bareRepository=explicit (review round 17 M3).
+  tip="$(git --git-dir="$repo" rev-parse --verify -q "refs/heads/$branch^{commit}" 2>/dev/null || true)"
   [ -n "$tip" ] || return 0
   recorded=""
   if [ -f "$run_json" ]; then
@@ -451,6 +454,17 @@ host_bring_back_run_branch() {
       "$repo" "+refs/heads/$branch:$incoming"; then
     echo "[leerie] bring-back: could not fetch $branch from $repo" >&2
     return 1
+  fi
+  # Only a fast-forward of what was brought back (review round 17 H1): the
+  # user may have pushed or built on it, and a tip that does not descend
+  # from it — a rebuilt run repository, a run rewound after a crash — must
+  # not replace it. Its commits stay in the run's repository (rc 2: prune
+  # keeps the run).
+  if [ -n "$current" ] && ! git -C "$USER_REPO" merge-base --is-ancestor \
+       "$current" "$tip" 2>/dev/null; then
+    git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref -d "$incoming" 2>/dev/null || true
+    echo "[leerie] bring-back: the run's branch at $tip does not descend from $branch in your repository ($current) — leaving it; the run's branch is in $repo" >&2
+    return 2
   fi
   # `$current` is empty when the ref is absent: update-ref then insists it
   # still is.
@@ -479,11 +493,11 @@ _host_finalize_rebase_repo() {
   local dir="$1" branch="$2" base="$3"
   git clone --quiet --bare --shared --no-tags --single-branch \
     --branch "$branch" "$USER_REPO" "$dir" >/dev/null 2>&1 || return 1
-  git -C "$dir" remote remove origin >/dev/null 2>&1 || return 1
+  git --git-dir="$dir" remote remove origin >/dev/null 2>&1 || return 1
   local ref
   for ref in "refs/heads/$base" "refs/remotes/origin/$base"; do
     if git -C "$USER_REPO" rev-parse --verify -q "$ref" >/dev/null 2>&1; then
-      git -C "$dir" -c core.hooksPath=/dev/null fetch --quiet --no-tags \
+      git --git-dir="$dir" -c core.hooksPath=/dev/null fetch --quiet --no-tags \
         --no-write-fetch-head "$USER_REPO" "+$ref:$ref" >/dev/null 2>&1 \
         || return 1
     fi
@@ -689,7 +703,7 @@ host_finalize() {
     _rebase_repo="$_rebase_scratch/rebase-${run_id}.git"
     if _host_finalize_rebase_repo "$_rebase_repo" "$run_branch" \
          "$pr_base_branch" && \
-       git -C "$_rebase_repo" -c core.hooksPath=/dev/null worktree add \
+       git --git-dir="$_rebase_repo" -c core.hooksPath=/dev/null worktree add \
          "$_rebase_worktree" "$run_branch" \
          >/dev/null 2>&1; then
       echo "[leerie] finalize: attempting rebase of $run_branch onto $pr_base_branch" >&2
@@ -779,7 +793,7 @@ PY
       # The PR base as the rebaser fetched it: the one remote-tracking ref
       # finalize reads afterwards (`working_branch=origin/<base>` below).
       # It used to reach the user's repository through the shared worktree.
-      if [ "$_rebaser_status" = "rebased" ] && git -C "$_rebase_repo" \
+      if [ "$_rebaser_status" = "rebased" ] && git --git-dir="$_rebase_repo" \
            rev-parse --verify -q "refs/remotes/origin/$pr_base_branch" \
            >/dev/null 2>&1; then
         git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch --quiet \

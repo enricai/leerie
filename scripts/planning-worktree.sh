@@ -66,7 +66,7 @@ case "$WT" in
   *)  WT="$(pwd -P)/$WT" ;;
 esac
 
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if ! leerie_repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "error: not inside a git repository" >&2
   exit 1
 fi
@@ -80,19 +80,19 @@ fi
 # branch's name.
 TARGET_REF="HEAD"
 if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
-  if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
+  if leerie_repo_git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
     TARGET_REF="refs/heads/${REQUESTED_BRANCH}"
   elif [ "${REQUESTED_BRANCH#heads/}" != "$REQUESTED_BRANCH" ] \
-     && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
+     && leerie_repo_git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
     TARGET_REF="refs/heads/${REQUESTED_BRANCH#heads/}"
   elif [ "${REQUESTED_BRANCH#refs/heads/}" != "$REQUESTED_BRANCH" ] \
-     && git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
+     && leerie_repo_git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
     TARGET_REF="$REQUESTED_BRANCH"
   else
     echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
   fi
 fi
-TARGET_SHA="$(git rev-parse "$TARGET_REF")"
+TARGET_SHA="$(leerie_repo_git rev-parse "$TARGET_REF")"
 
 mkdir -p "${RUN_DIR}/worktrees"
 
@@ -117,18 +117,18 @@ prune_leerie_worktrees "${RUN_DIR}"
 # `git worktree list` is captured before grep reads it: piped into `grep -q`
 # under `pipefail` it SIGPIPEs past 4 KiB and reads as "not registered"
 # (new-worktree.sh).
-if ! grep -qxF "worktree $WT" <<<"$(git worktree list --porcelain)" \
+if ! grep -qxF "worktree $WT" <<<"$(leerie_repo_git worktree list --porcelain)" \
     && [ -d "$WT" ]; then
   rm -rf "$WT"
 fi
 
-if grep -qxF "worktree $WT" <<<"$(git worktree list --porcelain)"; then
+if grep -qxF "worktree $WT" <<<"$(leerie_repo_git worktree list --porcelain)"; then
   # Reuse: force the tree back to the target and drop anything a
   # previous judgment worker left behind. --force because the checkout is
   # detached and may carry commits; that is expected and discarded.
   leerie_reset_worktree "$WT" "" "$TARGET_SHA" >/dev/null
 else
-  git worktree add --detach "$WT" "$TARGET_SHA" >/dev/null
+  leerie_repo_git worktree add --detach "$WT" "$TARGET_SHA" >/dev/null
 fi
 
 echo "planning-worktree: $(cd "$WT" && pwd)"

@@ -205,7 +205,7 @@ print(best[3])
   # Every branch of the run lives in the run's own repository on the
   # machine (DESIGN §6 *The run's own repository*), never in /work's.
   local _run_repo="/work/.leerie/runs/$run_id/repo"
-  if _fetch_machine_exec git -C "$_run_repo" rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
+  if _fetch_machine_exec git --git-dir="$_run_repo" rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
     _branch_present="true"
   fi
 
@@ -216,7 +216,7 @@ print(best[3])
   local _subtask_refs=""
   local _subtask_prefix="leerie/subtasks/${run_id}/"
   _subtask_refs="$(_fetch_machine_exec \
-    git -C "$_run_repo" for-each-ref --format='%(refname:short)' \
+    git --git-dir="$_run_repo" for-each-ref --format='%(refname:short)' \
     "refs/heads/${_subtask_prefix}" 2>/dev/null || true)"
 
   if [ "$_branch_present" = "false" ] && [ -z "$_subtask_refs" ]; then
@@ -259,7 +259,7 @@ print(best[3])
     # the file. flyctl machine exec streams that stdout back to the host.
     # shellcheck disable=SC2086
     if ! _fetch_machine_exec \
-         git -C "$_run_repo" bundle create - $_bundle_refs \
+         git --git-dir="$_run_repo" bundle create - $_bundle_refs \
          > "$host_bundle" 2>/dev/null; then
       # Fallback: if bundling all refs failed (race with concurrent
       # cleanup deleting a subtask branch between discovery and bundle),
@@ -267,7 +267,7 @@ print(best[3])
       if [ "$_branch_present" = "true" ] && [ "$_subtask_count" -gt 0 ]; then
         remote_log "fetch_branch: full bundle failed; retrying with run branch only"
         if ! _fetch_machine_exec \
-             git -C "$_run_repo" bundle create - "$run_branch" \
+             git --git-dir="$_run_repo" bundle create - "$run_branch" \
              > "$host_bundle" 2>/dev/null; then
           remote_log "fetch_branch: failed to create git bundle on machine $machine_id"
           rm -f "$host_bundle"

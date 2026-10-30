@@ -149,13 +149,17 @@ def test_a_run_without_its_own_repository_is_a_no_op(run, tmp_path):
 
 
 def test_every_launcher_path_calls_the_bring_back():
-    """The three call sites the design names: after the container exits
-    (before the skip on a non-zero exit or --no-push), `finalize` (local),
-    and `prune` before it deletes a run dir; plus `host_finalize` itself."""
+    """The call sites the design names: the launcher's EXIT trap (every
+    exit of a local run, Ctrl-C and TERM included), `finalize` (local), and
+    `prune` before it deletes a run dir; plus `host_finalize` itself."""
     src = LAUNCHER.read_text()
-    post = src.index('host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id"')
-    skip = src.index('if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then')
-    assert post < skip
+    assert 'host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id"' in _functions_block()
+    exit_trap = [ln for ln in src.splitlines()
+                 if ln.strip().startswith("trap '") and ln.endswith("' EXIT")
+                 and "_kill_container_from_cidfile" in ln]
+    assert len(exit_trap) == 1
+    assert exit_trap[0].index("_bring_back_ran_run") < exit_trap[0].index(
+        'rm -f "${_cidfile:-}" "${_run_id_file:-}"')
     assert 'host_bring_back_run_branch "$_fin_run_dir"' in src
     assert "host_bring_back_run_branch \"$2\"" in src          # prune
     hf = HOST_FINALIZE_SH.read_text()
@@ -210,20 +214,28 @@ def test_prune_keeps_a_run_whose_branch_cannot_come_back(run, tmp_path):
 SKIP_LINE = 'if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then\n'
 
 
-def _bring_back_block() -> str:
-    """The launcher's post-run run-id read and bring-back, verbatim: from
-    the read of the run-id file up to the skip on a failed exit."""
+def _functions_block() -> str:
+    """The launcher's `_read_ran_run_id` and `_bring_back_ran_run`,
+    verbatim."""
     src = LAUNCHER.read_text()
-    start = src.index('_ran_run_id=""\n')
-    return src[start:src.index(SKIP_LINE, start)]
+    start = src.index("  _read_ran_run_id() {\n")
+    fn = src.index("  _bring_back_ran_run() {\n", start)
+    return src[start:src.index("\n  }\n", fn) + len("\n  }\n")]
+
+
+def _bring_back_block() -> str:
+    """What the launcher's EXIT trap runs for the bring-back."""
+    return _functions_block() + "_bring_back_ran_run\n"
 
 
 def _post_exit_block() -> str:
-    """Every post-exit step, verbatim: the read, the bring-back, the skip
-    line and the auto-finalize, up to the Fly comment that follows them."""
+    """Every post-exit step after the container returns, verbatim: the
+    read, the skip line and the auto-finalize, up to the Fly comment that
+    follows them; with the functions they call."""
     src = LAUNCHER.read_text()
-    start = src.index('_ran_run_id=""\n')
-    return src[start:src.index("# Fly path: decide_teardown", start)]
+    start = src.index('_ran_run_id=""\n[ "$RUNTIME" != "local" ]')
+    return _functions_block() + src[
+        start:src.index("# Fly path: decide_teardown", start)]
 
 
 def _post_run(user: Path, state_root: Path, run_id_file: Path,
@@ -410,3 +422,68 @@ def test_no_post_exit_step_names_the_run_another_way():
     assert "LEERIE_RUN_ID" not in block
     assert "_cidfile" not in block
     assert "runs/*/" not in block and "mtime" not in block
+
+
+def test_ctrl_c_still_brings_the_branch_back(run, tmp_path):
+    """Review round 17 M2: the launcher's own trap lines, verbatim, around a
+    foreground child standing in for `nerdctl run`. SIGINT to the process
+    group, as a terminal's Ctrl-C sends it: the script exits 130 through its
+    INT trap, and the EXIT trap still brings the run's branch back."""
+    import os
+    import signal
+    import time
+    user, run_dir, repo, _wt = run
+    state_root = run_dir.parent.parent
+    rid = state_root / ".runid-test"
+    rid.write_text(RUN_ID + "\n")
+    src = LAUNCHER.read_text()
+    traps = [ln.strip() for ln in src.splitlines()
+             if ln.strip().startswith("trap '")
+             and "_kill_container_from_cidfile" in ln]
+    assert [t.rsplit(" ", 1)[-1] for t in traps] == ["EXIT", "INT", "TERM"]
+    ready = tmp_path / "ready"
+    script = ("set -euo pipefail\nRUNTIME=local\n"
+              f'_run_id_file="{rid}"\n_cidfile=""\nSTAGE="{tmp_path}/stage"\n'
+              # A keepalive that already exited: `kill` fails, and under
+              # `set -e` that must not end the trap before the bring-back.
+              "_stage_keepalive_pid=999999\n"
+              "_reap_tail() { :; }\n_kill_container_from_cidfile() { :; }\n"
+              + _functions_block() + "\n".join(traps) + "\n"
+              f'touch "{ready}"\nsleep 30\necho NOT-INTERRUPTED\n')
+    proc = subprocess.Popen(
+        ["bash", "-c", script], start_new_session=True,
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(tmp_path),
+             "USER_REPO": str(user), "LEERIE_REPO": str(REPO_ROOT),
+             "LEERIE_STATE_HOST_DIR": str(state_root)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 20
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.2)
+    os.killpg(proc.pid, signal.SIGINT)
+    out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 130, (out, err)
+    assert "NOT-INTERRUPTED" not in out
+    assert _git(user, "rev-parse", BRANCH) == _git(repo, "rev-parse", BRANCH)
+    assert not rid.exists()            # the EXIT trap's clean-up ran after
+
+
+def test_a_tip_that_is_not_a_fast_forward_is_refused(run):
+    """Review round 17 H1: after a bring-back, the run's branch is replaced
+    by an unrelated tip (a rebuilt run repository). The compare-and-swap
+    alone would move the user's ref; the fast-forward rule refuses (rc 2),
+    and the brought-back work stays on the user's branch."""
+    user, run_dir, repo, wt = run
+    assert _bring_back(user, run_dir).returncode == 0
+    brought = _git(user, "rev-parse", BRANCH)
+    _git(wt, "checkout", "-q", "--orphan", "fresh")
+    (wt / "z.txt").write_text("unrelated\n")
+    _git(wt, "add", "-A")
+    _git(wt, "-c", "user.email=t@x", "-c", "user.name=t", "commit", "-qm",
+         "unrelated")
+    _git(repo, "update-ref", f"refs/heads/{BRANCH}", "refs/heads/fresh")
+    r = _bring_back(user, run_dir)
+    assert r.returncode == 2, r.stderr
+    assert "does not descend" in r.stderr
+    assert _git(user, "rev-parse", BRANCH) == brought
+    assert _git(user, "for-each-ref", "refs/leerie") == ""

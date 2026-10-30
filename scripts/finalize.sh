@@ -39,7 +39,7 @@ if [ ! -f "${WORKING_BRANCH_FILE}" ]; then
 fi
 WORKING_BRANCH="$(cat "${WORKING_BRANCH_FILE}")"
 
-if ! git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+if ! leerie_repo_git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
   echo "error: ${BRANCH} does not exist — nothing to finalize" >&2
   exit 2
 fi
@@ -48,12 +48,12 @@ fi
 # user renamed or deleted it after the run started, surface that distinctly
 # rather than letting it look like an "already caught up" state.
 if [ -n "$BASE" ]; then
-  if ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
+  if ! leerie_repo_git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
     echo "error: base ${BASE} is not a commit in this repository" >&2
     exit 2
   fi
   WORKING_BRANCH="$BASE"
-elif ! git show-ref --verify --quiet "refs/heads/${WORKING_BRANCH}"; then
+elif ! leerie_repo_git show-ref --verify --quiet "refs/heads/${WORKING_BRANCH}"; then
   echo "error: working branch ${WORKING_BRANCH} (recorded at run start) no longer exists — " >&2
   echo "       recreate it (e.g. \`git branch ${WORKING_BRANCH} <commit>\`) before retrying" >&2
   exit 2
@@ -63,7 +63,7 @@ fi
 # `git rev-list --count <working>..<run>` counts commits reachable from the
 # run branch but not from the working branch. Zero means the run produced
 # no work — likely a misconfiguration the user should see.
-AHEAD="$(git rev-list --count "${WORKING_BRANCH}..${BRANCH}")"
+AHEAD="$(leerie_repo_git rev-list --count "${WORKING_BRANCH}..${BRANCH}")"
 if [ "${AHEAD}" = "0" ]; then
   echo "error: ${BRANCH} has no commits beyond ${WORKING_BRANCH} — nothing to push" >&2
   exit 1

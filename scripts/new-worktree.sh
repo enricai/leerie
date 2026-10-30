@@ -78,8 +78,8 @@ prune_leerie_worktrees "${RUN_DIR}"
 # it (uncommitted work included) instead.
 LEGACY_WT="$(dirname "$WT")/${ID}"
 if [ "$LEGACY_WT" != "$WT" ] && [ -d "$LEGACY_WT" ] && [ ! -e "$WT" ] \
-    && grep -qxF "worktree $LEGACY_WT" <<<"$(git worktree list --porcelain)"; then
-  git worktree move "$LEGACY_WT" "$WT" >/dev/null 2>&1 || true
+    && grep -qxF "worktree $LEGACY_WT" <<<"$(leerie_repo_git worktree list --porcelain)"; then
+  leerie_repo_git worktree move "$LEGACY_WT" "$WT" >/dev/null 2>&1 || true
 fi
 
 # Drop an orphaned worktree directory that git no longer knows about.
@@ -105,7 +105,7 @@ fi
 # worktree: 300/300 false negatives for an entry in the first 4 KiB of a
 # 9 KiB list; on a live repo, 19 of 35 registered worktrees read as absent
 # at least once in 10 checks.
-if ! grep -qxF "worktree $WT" <<<"$(git worktree list --porcelain)" \
+if ! grep -qxF "worktree $WT" <<<"$(leerie_repo_git worktree list --porcelain)" \
     && [ -d "$WT" ]; then
   rm -rf "$WT"
 fi
@@ -140,12 +140,12 @@ fi
 # "a branch named '<branch>' already exists". Measured, not theorised — the
 # race test caught exactly this.
 _create_worktree() {
-  if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+  if leerie_repo_git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
     # branch exists (pre-existing, or created by a failed first attempt) —
     # attach to it, preserving any commits already on it
-    git worktree add "$WT" "$BRANCH"
+    leerie_repo_git worktree add "$WT" "$BRANCH"
   else
-    git worktree add "$WT" -b "$BRANCH" "$PARENT_BRANCH"
+    leerie_repo_git worktree add "$WT" -b "$BRANCH" "$PARENT_BRANCH"
   fi
 }
 
@@ -180,7 +180,7 @@ _add_with_repair() {
   if err="$(_create_worktree 2>&1)"; then
     return 0
   fi
-  if ! grep -qxF "worktree $WT" <<<"$(git worktree list --porcelain)" \
+  if ! grep -qxF "worktree $WT" <<<"$(leerie_repo_git worktree list --porcelain)" \
       && [ -d "$WT" ]; then
     rm -rf "$WT"
   fi
@@ -193,7 +193,7 @@ _add_with_repair() {
   return 1
 }
 
-if grep -qxF "worktree $WT" <<<"$(git worktree list --porcelain)"; then
+if grep -qxF "worktree $WT" <<<"$(leerie_repo_git worktree list --porcelain)"; then
   : # already present — reuse it
 else
   _add_with_repair >/dev/null

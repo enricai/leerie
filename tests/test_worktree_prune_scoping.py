@@ -559,8 +559,10 @@ def test_the_orchestrator_has_a_scoped_helper():
     # SC1007 — behaviourally identical, and the guard failed a correct tree.
     # Same lesson as the `$_rebaser_py` name pin.
     ("orchestrator/leerie.py", r'"LC_ALL":\s*"C"'),
+    # `leerie_repo_git`: git on the repository LEERIE_GIT_DIR names (review
+    # round 17 M3); the locale prefix reaches it as a temporary assignment.
     ("scripts/worktree-lib.sh",
-     r"LC_ALL=C\s+LANGUAGE=(?:''|\"\")?\s+git\s+worktree\s+prune"),
+     r"LC_ALL=C\s+LANGUAGE=(?:''|\"\")?\s+leerie_repo_git\s+worktree\s+prune"),
 ])
 def test_the_prune_probe_pins_the_locale(path, pattern):
     """git wraps `Removing %s/%s: %s` in gettext (builtin/worktree.c) and only

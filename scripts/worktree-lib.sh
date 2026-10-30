@@ -36,6 +36,23 @@
 # container using this `.git`; and the prune re-checks each entry immediately
 # before deleting it.
 
+# leerie_repo_git <git args...>
+#
+# A script's repository-level git (refs, branches, the worktree registry):
+# the repository named explicitly as LEERIE_GIT_DIR when the caller gives
+# it — the run's own bare repository (DESIGN §6 *The run's own
+# repository*), which git refuses to find from a working directory under
+# safe.bareRepository=explicit — else the repository at the cwd, as for a
+# script run by hand. Worktree-level git (`cd "$wt"`, `git -C "$wt"`) never
+# goes through it: a linked worktree is found through its `.git` file.
+leerie_repo_git() {
+  if [ -n "${LEERIE_GIT_DIR:-}" ]; then
+    git --git-dir="$LEERIE_GIT_DIR" "$@"
+  else
+    git "$@"
+  fi
+}
+
 # prune_leerie_worktrees <leerie-root>
 #
 # Drop stale worktree admin entries whose path lies under <leerie-root>.
@@ -48,7 +65,7 @@
 prune_leerie_worktrees() {
   local root="${1:?usage: prune_leerie_worktrees <leerie-root>}"
   local git_dir abs_root name gitdir_file wt
-  git_dir="$(git rev-parse --git-common-dir 2>/dev/null)" || return 0
+  git_dir="$(leerie_repo_git rev-parse --git-common-dir 2>/dev/null)" || return 0
   [ -n "$git_dir" ] || return 0
   # Absolute and symlink-resolved, so the prefix test below compares like
   # with like.
@@ -101,7 +118,7 @@ prune_leerie_worktrees() {
   # FORMAT string is translated -- so under any non-English locale the
   # `Removing worktrees/` case above never matches and this becomes a
   # total silent no-op.
-  done < <(LC_ALL=C LANGUAGE='' git worktree prune -n -v 2>&1 || true)
+  done < <(LC_ALL=C LANGUAGE='' leerie_repo_git worktree prune -n -v 2>&1 || true)
   return 0
 }
 
@@ -119,7 +136,7 @@ prune_leerie_worktrees() {
 # iterations of 2400.
 leerie_repo_lock() {
   local common
-  common="$(git rev-parse --git-common-dir)"
+  common="$(leerie_repo_git rev-parse --git-common-dir)"
   exec 201>"$common/leerie-worktree.lock"
   flock 201
 }

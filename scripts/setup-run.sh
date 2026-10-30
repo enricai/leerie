@@ -52,7 +52,7 @@ case "$STAGING_WT" in
 esac
 WORKING_BRANCH_FILE="${RUN_DIR}/working-branch"
 
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if ! leerie_repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "error: not inside a git repository" >&2
   exit 1
 fi
@@ -61,7 +61,7 @@ fi
 # leerie/subtasks/* (git's loose ref store cannot hold a file and a
 # directory at the same path). Defense-in-depth: preflight() checks
 # this too, but resume skips preflight.
-if git show-ref --verify --quiet refs/heads/leerie; then
+if leerie_repo_git show-ref --verify --quiet refs/heads/leerie; then
   echo "error: branch 'leerie' conflicts with leerie's internal namespace (leerie/runs/*, leerie/subtasks/*)." >&2
   echo "Rename it: git branch -m leerie leerie-old" >&2
   exit 1
@@ -81,13 +81,13 @@ mkdir -p "${RUN_DIR}/worktrees" "${RUN_DIR}/subtasks" "${RUN_DIR}/criteria" "${R
 # orchestrator's `_working_branch_ref`.
 BASE_REF="HEAD"
 if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
-  if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
+  if leerie_repo_git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
     BASE_REF="refs/heads/${REQUESTED_BRANCH}"
   elif [ "${REQUESTED_BRANCH#heads/}" != "$REQUESTED_BRANCH" ] \
-     && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
+     && leerie_repo_git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
     BASE_REF="refs/heads/${REQUESTED_BRANCH#heads/}"
   elif [ "${REQUESTED_BRANCH#refs/heads/}" != "$REQUESTED_BRANCH" ] \
-     && git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
+     && leerie_repo_git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
     BASE_REF="$REQUESTED_BRANCH"
   else
     echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
@@ -97,17 +97,17 @@ if [ ! -f "${WORKING_BRANCH_FILE}" ]; then
   if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
     printf '%s\n' "$REQUESTED_BRANCH" > "${WORKING_BRANCH_FILE}"
   else
-    git rev-parse --abbrev-ref HEAD > "${WORKING_BRANCH_FILE}"
+    leerie_repo_git rev-parse --abbrev-ref HEAD > "${WORKING_BRANCH_FILE}"
   fi
 fi
 WORKING_BRANCH="$(cat "${WORKING_BRANCH_FILE}")"
 
 # Create the run branch ONLY if it does not already exist. An existing
 # leerie/runs/<run-id> carries the integrated work of completed waves — never reset it.
-if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+if leerie_repo_git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
   echo "run-branch: ${BRANCH} (existing — preserved, not reset)"
 else
-  git branch "${BRANCH}" "${BASE_REF}"
+  leerie_repo_git branch "${BRANCH}" "${BASE_REF}"
   echo "run-branch: ${BRANCH} (created at ${BASE_REF})"
 fi
 
@@ -130,7 +130,7 @@ fi
 # grep reads it: piped into `grep -q` under `pipefail`, git takes SIGPIPE
 # past 4 KiB and the check reads "not registered" (new-worktree.sh).
 leerie_repo_lock
-if ! grep -qxF "worktree $STAGING_WT" <<<"$(git worktree list --porcelain)" \
+if ! grep -qxF "worktree $STAGING_WT" <<<"$(leerie_repo_git worktree list --porcelain)" \
     && [ -d "$STAGING_WT" ]; then
   rm -rf "$STAGING_WT"
 fi
@@ -148,8 +148,8 @@ prune_leerie_worktrees "${RUN_DIR}"
 # -xF (fixed-string, whole-line): the old `grep -q "worktree .*/${STAGING_WT}$"`
 # expanded to a double slash for an absolute $STAGING_WT (`/leerie-state` in the
 # container), so it never matched and this add ran unconditionally.
-if ! grep -qxF "worktree $STAGING_WT" <<<"$(git worktree list --porcelain)"; then
-  git worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
+if ! grep -qxF "worktree $STAGING_WT" <<<"$(leerie_repo_git worktree list --porcelain)"; then
+  leerie_repo_git worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
 else
   # A staging that survived its process: a SIGKILL skipped the cleanup that
   # removes it, so it holds whatever the killed worker left — partial edits,
@@ -178,9 +178,9 @@ while IFS= read -r subtask_wt; do
   name="$(basename "$subtask_wt")"
   sid="${name#"$WT_PREFIX"}"
   sub_branch="leerie/subtasks/${RUN_ID}/${sid}"
-  git show-ref --verify --quiet "refs/heads/${sub_branch}" || continue
+  leerie_repo_git show-ref --verify --quiet "refs/heads/${sub_branch}" || continue
   leerie_reset_worktree "$subtask_wt" "$sub_branch"
-done < <(git worktree list --porcelain | awk -v dir="${WT_DIR}/" '
+done < <(leerie_repo_git worktree list --porcelain | awk -v dir="${WT_DIR}/" '
   /^worktree / { wt = substr($0, 10); if (index(wt, dir) == 1 && index(substr(wt, length(dir) + 1), "/") == 0) print wt }')
 
 echo "working-branch: ${WORKING_BRANCH}"

@@ -201,14 +201,14 @@ print(best[3])
   # instance (DESIGN §6 *The run's own repository*), never in /work's.
   local _run_repo="/work/.leerie/runs/$run_id/repo"
   if ec2_remote_exec "$instance_id" \
-       "git -C $_run_repo rev-parse --verify refs/heads/$run_branch" >/dev/null 2>&1; then
+       "git --git-dir=$_run_repo rev-parse --verify refs/heads/$run_branch" >/dev/null 2>&1; then
     _branch_present="true"
   fi
 
   local _subtask_refs=""
   local _subtask_prefix="leerie/subtasks/${run_id}/"
   _subtask_refs="$(ec2_remote_exec "$instance_id" \
-    "git -C $_run_repo for-each-ref --format='%(refname:short)' refs/heads/${_subtask_prefix}" \
+    "git --git-dir=$_run_repo for-each-ref --format='%(refname:short)' refs/heads/${_subtask_prefix}" \
     2>/dev/null || true)"
 
   if [ "$_branch_present" = "false" ] && [ -z "$_subtask_refs" ]; then
@@ -243,11 +243,11 @@ print(best[3])
       remote_log "remote: streaming git bundle for $_subtask_count subtask branch(es) (run branch absent) ..."
     fi
 
-    if ! _ec2_fetch_ssh "git -C $_run_repo bundle create - $_bundle_refs" \
+    if ! _ec2_fetch_ssh "git --git-dir=$_run_repo bundle create - $_bundle_refs" \
          > "$host_bundle" 2>/dev/null; then
       if [ "$_branch_present" = "true" ] && [ "$_subtask_count" -gt 0 ]; then
         remote_log "fetch_state_ec2: full bundle failed; retrying with run branch only"
-        if ! _ec2_fetch_ssh "git -C $_run_repo bundle create - $run_branch" \
+        if ! _ec2_fetch_ssh "git --git-dir=$_run_repo bundle create - $run_branch" \
              > "$host_bundle" 2>/dev/null; then
           remote_log "fetch_state_ec2: failed to create git bundle on instance $instance_id"
           rm -f "$host_bundle"

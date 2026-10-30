@@ -65,10 +65,12 @@ clean_one_run() {
   # repository at the cwd.
   if [ -f "${run_dir}/repo/HEAD" ]; then
     run_dir="$(cd "$run_dir" && pwd -P)"
-    ( cd "${run_dir}/repo" || exit 1; _clean_one_run_here "$run_id" "$branch_scope" "$run_dir" )
+    # Named, never discovered (safe.bareRepository=explicit).
+    ( LEERIE_GIT_DIR="${run_dir}/repo"; export LEERIE_GIT_DIR
+      _clean_one_run_here "$run_id" "$branch_scope" "$run_dir" )
     return
   fi
-  _clean_one_run_here "$run_id" "$branch_scope" "$run_dir"
+  ( unset LEERIE_GIT_DIR; _clean_one_run_here "$run_id" "$branch_scope" "$run_dir" )
 }
 
 _clean_one_run_here() {
@@ -85,7 +87,7 @@ _clean_one_run_here() {
       # more under N-way concurrent wave cleanup, but a genuinely hung
       # `git worktree remove` (stale mount, held index.lock, disk
       # contention) must not block the whole orchestrator forever.
-      timeout "$WORKTREE_REMOVE_TIMEOUT" git worktree remove --force "$d" 2>/dev/null || true
+      timeout "$WORKTREE_REMOVE_TIMEOUT" git ${LEERIE_GIT_DIR:+--git-dir="$LEERIE_GIT_DIR"} worktree remove --force "$d" 2>/dev/null || true
       # Fall back to rm -rf when `git worktree remove` administratively
       # succeeded but left the directory behind (timeout mid-rmtree) or
       # when git no longer tracks the worktree (already pruned) and so
@@ -117,17 +119,17 @@ _clean_one_run_here() {
   # See DESIGN.md §3 for why the namespaces are split.
   case "$branch_scope" in
     1)  # --branches: delete both
-      for b in $(git for-each-ref --format='%(refname:short)' \
+      for b in $(leerie_repo_git for-each-ref --format='%(refname:short)' \
                  "refs/heads/leerie/runs/${run_id}" \
                  "refs/heads/leerie/subtasks/${run_id}/"); do
-        git branch -D "$b" 2>/dev/null || true
+        leerie_repo_git branch -D "$b" 2>/dev/null || true
       done
       echo "cleanup: removed worktrees + branches for run ${run_id} (state dir kept as audit trail at ${run_dir}; rm -rf manually if no longer needed)"
       ;;
     2)  # --subtask-branches: delete subtask branches only
-      for b in $(git for-each-ref --format='%(refname:short)' \
+      for b in $(leerie_repo_git for-each-ref --format='%(refname:short)' \
                  "refs/heads/leerie/subtasks/${run_id}/"); do
-        git branch -D "$b" 2>/dev/null || true
+        leerie_repo_git branch -D "$b" 2>/dev/null || true
       done
       echo "cleanup: removed worktrees + subtask branches for run ${run_id} (run branch leerie/runs/${run_id} and state dir kept; pass --branches to delete the run branch too)"
       ;;

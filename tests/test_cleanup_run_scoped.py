@@ -270,7 +270,9 @@ def test_cleanup_wraps_worktree_remove_in_timeout():
     # inside the run's own repository (DESIGN §6 *The run's own
     # repository*).
     clean_one_run = src.split("_clean_one_run_here() {")[1].split("\n}")[0]
-    assert 'timeout "$WORKTREE_REMOVE_TIMEOUT" git worktree remove --force' in clean_one_run
+    assert ('timeout "$WORKTREE_REMOVE_TIMEOUT" git '
+            '${LEERIE_GIT_DIR:+--git-dir="$LEERIE_GIT_DIR"} worktree remove '
+            '--force') in clean_one_run
     assert 'WORKTREE_REMOVE_TIMEOUT="${CLEANUP_SH_TEST_WORKTREE_REMOVE_TIMEOUT:-240}"' in src
 
 
