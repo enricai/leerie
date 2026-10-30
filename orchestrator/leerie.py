@@ -52221,7 +52221,7 @@ def _selfcheck_say(msg: str) -> None:
     sys.stdout.flush()
 
 
-def _selfcheck_main(argv: list[str]) -> int:
+def selfcheck_main(argv: list[str]) -> int:
     """`scripts/selfcheck.py <config.json> [args…]`: run the shown sets
     against a copy of the worker's current working tree, outside it (DESIGN
     §8 *A held-out set never enters a tree a worker commits from*). Exit:

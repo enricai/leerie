@@ -7,7 +7,7 @@ Usage: selfcheck.py <config.json> [set file…] [-t PATTERN] [runner args…]
 
 The orchestrator writes the config and a `leerie-selfcheck` wrapper that
 calls this with it (`_selfcheck_prepare`). The logic is the orchestrator's
-own (`_selfcheck_main`), imported from the sibling `orchestrator/`
+own (`selfcheck_main`), imported from the sibling `orchestrator/`
 directory as `forbidden-command-hook.py` does, so the self-check places and
 runs the sets exactly as the evaluation does (`_place_set`,
 `_acceptance_cmd`)."""
@@ -20,7 +20,7 @@ def main() -> int:
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "orchestrator"))
     import leerie
-    return leerie._selfcheck_main(sys.argv)
+    return leerie.selfcheck_main(sys.argv)
 
 
 if __name__ == "__main__":

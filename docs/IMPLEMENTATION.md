@@ -7643,7 +7643,7 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   other runner) read off `_acceptance_cmd(st, run_files, staging)`; the
   bin directory is put first on the implementer's `PATH` (`env_extra`).
   `scripts/selfcheck.py` imports the orchestrator and calls
-  `_selfcheck_main(argv) -> int`: `_selfcheck_args(args, run_files)`
+  `selfcheck_main(argv) -> int` (public: its caller is `scripts/selfcheck.py`, a separate process, like `run_rebaser`'s `host-finalize.sh`): `_selfcheck_args(args, run_files)`
   splits the arguments into a subset (each argument naming exactly one
   set test file: its path, its file name or a unique path suffix; one
   naming several is a usage error, exit 2), a name filter

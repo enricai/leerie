@@ -5658,7 +5658,7 @@ Dockerfile's extraction path to the constant.
 `tests/test_redrive_selfcheck_out_of_tree.py` (DESIGN §8 *A held-out set
 never enters a tree a worker commits from*) runs the real self-check
 command (`bin/leerie-selfcheck` → `scripts/selfcheck.py` →
-`_selfcheck_main`) with real pytest on a repository whose state root sits
+`selfcheck_main`) with real pytest on a repository whose state root sits
 inside it: the verdict follows the worker's uncommitted edit, the ignored
 helper package is shared, a set file under an ignored directory is placed
 in a real directory of the copy (never through the link into the worker's
