@@ -22,6 +22,7 @@ binary is required (matching test_invoke_streaming.py's pattern).
 """
 from __future__ import annotations
 
+import os
 import asyncio
 import json
 from pathlib import Path
@@ -393,10 +394,10 @@ def test_leerie_worker_debug_injects_env(leerie, leerie_dir, monkeypatch):
 
 def test_no_env_override_when_leerie_worker_debug_unset(leerie, leerie_dir,
                                                        monkeypatch):
-    """When LEERIE_WORKER_DEBUG is NOT set, env= must be None so the
-    worker simply inherits the parent environment (preserving the
-    OAuth token, mise PATH, etc.). Passing a partial env dict would
-    break the worker by stripping required variables."""
+    """When LEERIE_WORKER_DEBUG is NOT set, the worker inherits the
+    parent environment whole (the OAuth token, mise PATH, etc.) — less
+    only leerie's hooks-off git entry (DESIGN §6½ *Hooks off*) — and no
+    debug variables."""
     captured: dict = {}
 
     async def fake(*cmd, **kwargs):
@@ -412,11 +413,11 @@ def test_no_env_override_when_leerie_worker_debug_unset(leerie, leerie_dir,
         timeout=60, sid="t-no-debug", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
-    assert captured.get("env") is None, (
-        "without LEERIE_WORKER_DEBUG, env= must be None so the worker "
-        "inherits the orchestrator's full environment (token, PATH, "
-        "etc.). Passing a partial dict would strip required vars."
-    )
+    env = captured.get("env")
+    assert env == leerie._git_hooks_on(os.environ), (
+        "without LEERIE_WORKER_DEBUG the worker inherits the orchestrator's "
+        "full environment (token, PATH, etc.), less leerie's hooks entry")
+    assert "DEBUG" not in env or env["DEBUG"] == os.environ.get("DEBUG")
 
 
 # ---- DEFAULT_CAPS cap registration --------------------------------------

@@ -136,3 +136,104 @@ def test_what_the_restore_cannot_remove_stops_the_run_named(
                                          branch="main"))
     err = capsys.readouterr().err
     assert "a rollback:" in err and "?? root-owned/x" in err
+
+
+def test_no_reset_hard_outside_the_primitive():
+    """Derived (review round 16 claims H2: five raw `git reset --hard` calls
+    in staging bypassed the primitive and its postcondition): the only
+    `reset --hard` in leerie.py is inside `_restore_tree`, and the only one
+    in the scripts is inside `leerie_reset_worktree`."""
+    import ast
+    tree = ast.parse((REPO_ROOT / "orchestrator" / "leerie.py").read_text())
+    owner: dict[int, str] = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for n in ast.walk(fn):
+                owner.setdefault(id(n), fn.name)
+    hits = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.List):
+            vals = [e.value for e in n.elts if isinstance(e, ast.Constant)]
+            if "reset" in vals and "--hard" in vals:
+                hits.append(owner.get(id(n)))
+    assert hits == ["_restore_tree"]
+    shell = []
+    for p in sorted((REPO_ROOT / "scripts").rglob("*.sh")):
+        fn = None
+        for line in p.read_text().splitlines():
+            m = __import__("re").match(r"^(\w+)\(\)\s*\{", line)
+            if m:
+                fn = m.group(1)
+            code = line.split("#", 1)[0]
+            if "reset" in code and "--hard" in code and "git" in code:
+                shell.append((p.name, fn))
+    assert shell == [("worktree-lib.sh", "leerie_reset_worktree")]
+
+
+def test_a_back_out_whose_reset_does_not_land_never_says_the_work_left(
+        leerie, tmp_path, monkeypatch):
+    """`_run_integration_judge_gate`'s `_back_out` recorded "none of
+    <sid>'s work is in this PR" without checking its reset landed. The
+    primitive's False now stops the run with the sid `blocked`, and the
+    loss is never recorded."""
+    from tests.test_integrate_wave_judge_gate import (
+        _conflicting_staging, _state)
+    st = _state(leerie, tmp_path)
+    staging, pre = _conflicting_staging(tmp_path / ".leerie")
+    subprocess.run(["git", "merge", "-q", "--no-ff", "-X", "theirs", "-m",
+                    "merge", "incoming"], cwd=str(staging), check=True,
+                   capture_output=True)
+
+    async def no_reset(tree, rev, *, where, branch):
+        return False
+
+    monkeypatch.setattr(leerie, "_restore_tree", no_reset)
+    # A back-out the gate already decided (the write-ahead marker): the
+    # resumed gate finishes it.
+    st.data["integration_gate"] = {"feat-001": {
+        "backing_out": "the judge found a defect",
+        "merge_commit_sha": subprocess.run(
+            ["git", "-C", str(staging), "rev-parse", "HEAD"],
+            capture_output=True, text=True).stdout.strip()}}
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie._run_integration_judge_gate(
+            "feat-001", staging, {"status": "complete"}, [],
+            dict(leerie.DEFAULT_CAPS), st, {}, {}))
+    assert "back-out failed" in st.data["blocked"]["feat-001"]
+    assert not [e for e in (st.data.get("risk_register") or {}).get(
+        "feat-001") or [] if e.get("kind") == "integration_content_loss"]
+
+
+def test_the_shell_reset_never_chmods_through_a_symlink(leerie, tmp_path):
+    """Review round 16 exec L1, the reviewer's proof turned: `chmod -R`
+    follows a link named on its command line, so an untracked link to the
+    user's checkout had its target's modes rewritten. The Python half
+    already skipped links; now both do."""
+    import stat
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    f = outside / "sub" / "ro.txt"
+    f.write_text("x")
+    f.chmod(0o444)
+    (outside / "sub").chmod(0o555)
+    r = tmp_path / "r"
+    r.mkdir()
+    for a in (["init", "-q", "-b", "main"], ["config", "user.email", "t@x"],
+              ["config", "user.name", "t"]):
+        subprocess.run(["git", *a], cwd=r, check=True)
+    (r / "a").write_text("1")
+    subprocess.run(["git", "add", "-A"], cwd=r, check=True)
+    subprocess.run(["git", "commit", "-qm", "b"], cwd=r, check=True)
+    (r / "ref").symlink_to(outside)
+    try:
+        lib = REPO_ROOT / "scripts" / "worktree-lib.sh"
+        p = subprocess.run(["bash", "-c", f'source "{lib}"; '
+                            f'leerie_reset_worktree "{r}" main'],
+                           capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        assert not (r / "ref").is_symlink()
+        assert not stat.S_IMODE(f.stat().st_mode) & 0o200
+        assert not stat.S_IMODE((outside / "sub").stat().st_mode) & 0o200
+        leerie._restore_write_bits(r)          # the Python half, same rule
+    finally:
+        (outside / "sub").chmod(0o755)

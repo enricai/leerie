@@ -65,7 +65,7 @@ import weakref
 import xml.etree.ElementTree as ElementTree
 from collections import deque
 from collections.abc import (AsyncIterator, Awaitable, Callable, Iterable,
-                             Iterator)
+                             Iterator, Mapping, MutableMapping)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple, TextIO
@@ -5684,12 +5684,55 @@ def _helper_worktree_path(st: "State", name: str) -> Path:
                                                         name)
 
 
-# Every git command of leerie's own that can fire a repository hook — a
-# merge, a commit, a branch checkout, a `worktree add` — runs with the hooks
-# off for that invocation only (DESIGN §6½: a `post-merge` hook husky enabled
-# wrote into staging). Workers' own git commands keep the repository's hooks.
-# Pinned for every such argv by tests/test_leerie_git_runs_no_hooks.py.
-GIT_NO_HOOKS = ("-c", "core.hooksPath=/dev/null")
+# No git command of leerie's own runs a repository hook (DESIGN §6½ *Hooks
+# off*): even `git status` fires `post-index-change` and a path checkout
+# `post-checkout`, so it cannot be a per-subcommand flag. The entry rides in
+# the environment every git child inherits (git's GIT_CONFIG_COUNT/KEY/VALUE,
+# which no config file overrides); `_invoke` takes it back out for a worker.
+# `_GIT_HOOKS_OFF_MARK` holds the index of leerie's entry.
+_GIT_HOOKS_OFF_MARK = "LEERIE_GIT_HOOKS_OFF"
+
+
+def _git_hooks_off(env: MutableMapping[str, str]) -> None:
+    """Append `core.hooksPath=/dev/null` to `env`'s git config entries,
+    once (idempotent), keeping any the operator set."""
+    if _GIT_HOOKS_OFF_MARK in env:
+        return
+    try:
+        n = int(env.get("GIT_CONFIG_COUNT") or 0)
+    except ValueError:
+        n = 0
+    env[f"GIT_CONFIG_KEY_{n}"] = "core.hooksPath"
+    env[f"GIT_CONFIG_VALUE_{n}"] = "/dev/null"
+    env["GIT_CONFIG_COUNT"] = str(n + 1)
+    env[_GIT_HOOKS_OFF_MARK] = str(n)
+
+
+def _git_hooks_on(env: Mapping[str, str]) -> dict[str, str]:
+    """A copy of `env` without leerie's hooks-off entry: a worker's own git
+    commands keep the repository's hooks. Entries the operator set stay."""
+    out = dict(env)
+    mark = out.pop(_GIT_HOOKS_OFF_MARK, None)
+    if mark is None or not mark.isdigit():
+        return out
+    i = int(mark)
+    try:
+        n = int(out.get("GIT_CONFIG_COUNT") or 0)
+    except ValueError:
+        return out
+    if i >= n:
+        return out
+    for j in range(i, n - 1):          # keep the list contiguous
+        out[f"GIT_CONFIG_KEY_{j}"] = out.get(f"GIT_CONFIG_KEY_{j + 1}", "")
+        out[f"GIT_CONFIG_VALUE_{j}"] = out.get(f"GIT_CONFIG_VALUE_{j + 1}",
+                                               "")
+    out.pop(f"GIT_CONFIG_KEY_{n - 1}", None)
+    out.pop(f"GIT_CONFIG_VALUE_{n - 1}", None)
+    if n - 1:
+        out["GIT_CONFIG_COUNT"] = str(n - 1)
+    else:
+        out.pop("GIT_CONFIG_COUNT", None)
+    return out
 
 
 def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
@@ -5704,8 +5747,7 @@ def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
     helpers fail open. `repo` (default the run's repository) is the
     checkout git is run in — any worktree of the same repository."""
     root = str(repo if repo is not None else st.repo_root)
-    argv = ["git", "-C", root, *GIT_NO_HOOKS, "worktree", "add", "--detach",
-            str(wt), rev]
+    argv = ["git", "-C", root, "worktree", "add", "--detach", str(wt), rev]
     lock_fd = None
     try:
         gd = subprocess.run(["git", "-C", root, "rev-parse",
@@ -20671,6 +20713,11 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         reserve_mb = _NODE_HEAP_HEADROOM_BYTES // (1024 * 1024)
         cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - reserve_mb, 256)
         worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
+    # A worker's own git commands are the worker's: they keep the
+    # repository's hooks, which leerie's own are run without (DESIGN §6½
+    # *Hooks off*).
+    worker_env = _git_hooks_on(worker_env if worker_env is not None
+                               else os.environ)
 
     # The prompt is staged to a temp file BEFORE the spawn, and that file —
     # already positioned at byte 0 with the whole payload on disk — becomes
@@ -46710,7 +46757,7 @@ def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
                  "--no-tags", str(st.repo_root), str(wt))
     ok = clone.returncode == 0
     if ok:
-        ok = _git(*GIT_NO_HOOKS, "checkout", "--quiet", "--detach", base,
+        ok = _git("checkout", "--quiet", "--detach", base,
                   cwd=wt).returncode == 0
     if ok:
         refs = _git("for-each-ref", "--format=%(refname)", cwd=wt)
@@ -49246,8 +49293,8 @@ async def _restore_tree(tree: str | Path, rev: str, *, where: str,
             await asyncio.sleep(1)
         try:
             if branch:
-                subprocess.run(["git", "-C", str(tree), *GIT_NO_HOOKS,
-                                "checkout", "-q", "-f", branch],
+                subprocess.run(["git", "-C", str(tree), "checkout", "-q",
+                                "-f", branch],
                                capture_output=True, check=False)
             subprocess.run(["git", "-C", str(tree), "reset", "-q", "--hard",
                             rev], capture_output=True, check=False)
@@ -56079,8 +56126,9 @@ async def _redrive_uncovered_subtasks(
             # commit the subtask completed at, and its earlier result.
             tree = _subtask_worktree_path(leerie_dir, s)
             if pre[s]:
-                await run_proc(["git", "reset", "-q", "--hard", pre[s]],
-                               cwd=str(tree))
+                await _restore_tree(
+                    tree, pre[s], where=f"{s} coverage re-drive rollback",
+                    branch=_compute_subtask_branch(st.run_id, s))
             st.data.setdefault("subtask_status", {})[s] = "complete"
             (st.data.get("unconverged_subtasks") or {}).pop(s, None)
             reg = st.data.get("blocked")
@@ -59175,10 +59223,13 @@ async def _run_integration_judge_gate(
     rec = dict(gates.get(sid) or {})
     # A resumed gate can find a round's uncommitted edits: staging is
     # orchestrator-owned, so they are discarded.
-    dirty = await _git_text(staging, "status", "--porcelain",
-                            "--untracked-files=no")
-    if dirty and dirty.strip():
-        await run_proc(["git", "reset", "--hard", "HEAD"], cwd=str(staging))
+    run_branch = _compute_run_branch(st.run_id)
+    if await _tree_dirt(staging, branch=run_branch) != []:
+        tip = (await _git_text(staging, "rev-parse", "--verify", "-q",
+                               f"refs/heads/{run_branch}") or "").strip()
+        await _restore_tree(staging, tip,
+                            where=f"integration gate for {sid} (resume)",
+                            branch=run_branch)
     flight = rec.get("in_round")
     if isinstance(flight, dict) and flight.get("pre") \
             and not rec.get("backing_out"):
@@ -59194,8 +59245,9 @@ async def _run_integration_judge_gate(
         log(f"  integration gate for {sid}: repair round {n} was "
             f"interrupted{' again — counted as spent' if again else ''} "
             f"(reset to {str(flight['pre'])[:12]})")
-        await run_proc(["git", "reset", "--hard", str(flight["pre"])],
-                       cwd=str(staging))
+        await _restore_tree(staging, str(flight["pre"]),
+                            where=f"integration gate for {sid} (resume)",
+                            branch=run_branch)
         if again:
             rec["repair_rounds"] = max(int(rec.get("repair_rounds") or 0), n)
         else:
@@ -59217,8 +59269,9 @@ async def _run_integration_judge_gate(
         if anc.returncode == 1:
             log(f"  integration gate for {sid}: the recorded merge "
                 f"{rec_merge[:12]} is not on staging; restoring it")
-            await run_proc(["git", "reset", "--hard", rec_merge],
-                           cwd=str(staging))
+            await _restore_tree(staging, rec_merge,
+                                where=f"integration gate for {sid} (resume)",
+                                branch=run_branch)
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
     merge_sha = rec.get("merge_commit_sha") or head
     parents = (await _git_text(staging, "rev-list", "--parents", "-n", "1",
@@ -59244,8 +59297,23 @@ async def _run_integration_judge_gate(
         # longer on the branch. The marker makes the resume finish this.
         rec["backing_out"] = reason
         _persist()
-        await run_proc(["git", "reset", "--hard", f"{merge_sha}^1"],
-                       cwd=str(staging))
+        target = (await _git_text(staging, "rev-parse", "--verify", "-q",
+                                  f"{merge_sha}^1") or "").strip()
+        if not await _restore_tree(staging, target,
+                                   where=f"back-out of {sid}",
+                                   branch=run_branch):
+            # The record must never say the work left the PR when the
+            # reset did not land (review round 16 claims H2).
+            head_now = (await _git_text(staging, "rev-parse", "HEAD")
+                        or "").strip()
+            st.data.setdefault("blocked", {})[sid] = (
+                f"integration back-out failed: staging is at "
+                f"{head_now or '?'}, not {target or '?'}")
+            st.save()
+            die(f"could not back {sid} out of the run branch: the reset to "
+                f"{target[:12] or '<unknown>'} left staging at "
+                f"{head_now[:12] or 'no HEAD'} ({reason}). The staging "
+                "worktree needs a manual look before `resume`.")
         rec.pop("backing_out", None)
         rec.update({"accepted": False, "outcome": "backed_out",
                     "fallback_reason": reason,
@@ -59618,7 +59686,7 @@ async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
         (staging / f).write_text(text)
     add = await run_proc(["git", "--literal-pathspecs", "add", "--", *files],
                          cwd=str(staging))
-    commit = (await run_proc(["git", *GIT_NO_HOOKS, "commit", "--no-edit"],
+    commit = (await run_proc(["git", "commit", "--no-edit"],
                              cwd=str(staging))
               if add.returncode == 0 else add)
     if commit.returncode != 0 or await check_merge_committed(staging):
@@ -59651,7 +59719,7 @@ async def _set_integration_subject(staging: Path, sid: str,
         log(f"  {sid}: HEAD is not this integration's merge; its subject "
             "is left as it is")
         return False
-    r = await run_proc(["git", *GIT_NO_HOOKS, "commit", "--amend",
+    r = await run_proc(["git", "commit", "--amend",
                         "--no-verify", "--allow-empty", "-m", want, "-m",
                         body.strip() or subject], cwd=str(staging))
     if r.returncode != 0:
@@ -59690,7 +59758,9 @@ async def _reintegrate_settled_head(staging: Path, st: "State", sid: str,
     head = (st.data.get("settled_heads") or {}).get(sid) or ""
     log(f"  {sid}: the merge left its settled head {head[:12]} off the run "
         "branch — integrating once more from that head")
-    await run_proc(["git", "reset", "--hard", pre_sha], cwd=str(staging))
+    await _restore_tree(staging, pre_sha,
+                        where=f"re-integration of {sid}",
+                        branch=_compute_run_branch(st.run_id))
     ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
     tip = (await _git_text(staging, "rev-parse", "--verify", "-q", ref)
            or "").strip()
@@ -62415,6 +62485,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
 def main() -> None:
     # Must precede every spawn — including _become_subreaper's descendants.
     _restore_sigchld_default()
+    # Before any git runs: no git command of leerie's own fires a repository
+    # hook (DESIGN §6½ *Hooks off*); `_invoke` gives a worker them back.
+    _git_hooks_off(os.environ)
 
     # Install the child-subreaper role first thing, before any worker (or any
     # subprocess this process spawns) exists, so every descendant inherits the

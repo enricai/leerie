@@ -15,6 +15,8 @@ set -euo pipefail
 
 # shellcheck source=scripts/worktree-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
 
 ID="${1:?usage: new-worktree.sh <subtask-id> <run-id>}"
 RUN_ID="${2:?usage: new-worktree.sh <subtask-id> <run-id>}"
@@ -141,9 +143,9 @@ _create_worktree() {
   if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
     # branch exists (pre-existing, or created by a failed first attempt) —
     # attach to it, preserving any commits already on it
-    git "${LEERIE_GIT_NO_HOOKS[@]}" worktree add "$WT" "$BRANCH"
+    git worktree add "$WT" "$BRANCH"
   else
-    git "${LEERIE_GIT_NO_HOOKS[@]}" worktree add "$WT" -b "$BRANCH" "$PARENT_BRANCH"
+    git worktree add "$WT" -b "$BRANCH" "$PARENT_BRANCH"
   fi
 }
 

@@ -724,7 +724,7 @@ def test_echild_retry_window_value_is_pinned(leerie):
 # ----- the autouse restore fixture (tests/conftest.py) ---------------------
 #
 # `_become_subreaper()` mutates the CALLING process, so any test that drives
-# the real `main()` -- whose second statement it is, before argparse -- leaves
+# the real `main()` -- among whose first statements it is, before argparse -- leaves
 # the pytest process a child-subreaper for the rest of the session. That
 # silently changes what process liveness means: an orphan that would reparent
 # to PID 1 and be reaped instead reparents to pytest, which never wait()s it,

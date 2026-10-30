@@ -27,6 +27,8 @@ set -euo pipefail
 
 # shellcheck source=scripts/worktree-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
 
 # Honor LEERIE_STATE_DIR — matches setup-run.sh:25 and finalize.sh.
 # Without this, in-container invocations (LEERIE_STATE_DIR=/leerie-state)

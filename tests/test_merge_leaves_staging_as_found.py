@@ -105,5 +105,7 @@ def test_a_post_merge_hook_does_not_run_on_leeries_merge(leerie, tmp_path,
     (repo / "g.txt").write_text("g\n")
     _git(repo, "add", "g.txt")
     _git(repo, "commit", "-qm", "g")
-    _git(staging, "merge", "-q", "--no-ff", "-m", "m", "other")
+    subprocess.run(["git", "merge", "-q", "--no-ff", "-m", "m", "other"],
+                   cwd=staging, check=True, capture_output=True,
+                   env=leerie._git_hooks_on(os.environ))
     assert (staging / ".last-sync").is_file() and ran.exists()

@@ -366,10 +366,29 @@ def _no_real_planning_worktree(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _restore_git_hooks_env():
+    """Put the git config environment back after every test.
+
+    `main()` turns leerie's hooks off by appending `core.hooksPath` to
+    `os.environ`'s `GIT_CONFIG_*` entries (`_git_hooks_off`, DESIGN §6½
+    *Hooks off*). A test that drives the real `main()` would leave that on
+    the pytest process, and every later test's git would then run no hook
+    — silently, depending on collection order (the same shape as the
+    subreaper flag below)."""
+    keys = lambda: {k for k in os.environ  # noqa: E731
+                    if k.startswith(("GIT_CONFIG_", "LEERIE_GIT_HOOKS"))}
+    before = {k: os.environ[k] for k in keys()}
+    yield
+    for k in keys() - set(before):
+        os.environ.pop(k, None)
+    os.environ.update(before)
+
+
+@pytest.fixture(autouse=True)
 def _restore_child_subreaper():
     """Put `PR_SET_CHILD_SUBREAPER` back after every test.
 
-    `main()` calls `_become_subreaper()` as its SECOND statement, before
+    `main()` calls `_become_subreaper()` among its first statements, before
     argparse -- so every test that drives the real `main()` sets
     `prctl(PR_SET_CHILD_SUBREAPER, 1)` on the *pytest* process, and nothing
     ever cleared it. The flag then silently changes the meaning of process

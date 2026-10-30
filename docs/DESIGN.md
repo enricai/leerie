@@ -2724,9 +2724,9 @@ and reported. Each branch starts on a clean staging and leaves one: a
 skipped branch — no integrator, a crash, a verdict other than `resolved`,
 or a `resolved` whose merge is not committed or whose tree is not clean
 (I1, §8 *A worker leaves its tree clean*, with no re-ask: the script has
-no session to resume) — is reset to the commit before its merge (`git
-reset --hard`, then `git clean -fd`, ignored files kept, through the same
-reset `setup-run.sh` uses). A reset that fails stops the collection: the
+no session to resume) — is restored to the commit before its merge on
+the run branch by the one restore (§8 *One restore*: write bits, `reset
+--hard`, `clean -ffd`, ignored files kept, the postcondition checked). A reset that fails stops the collection: the
 remaining branches are reported skipped, never merged onto a tree the
 reset could not restore. A `git merge
 --abort` did not do that: it keeps an edit the integrator made to a file
@@ -5278,15 +5278,35 @@ in staging, and is bracketed like the rest, with two refinements (review
 round 15 M3, where a merge's own output reached `_assert_staging_clean`
 as "a leerie bug").
 
-- *Hooks off.* Every git command leerie itself runs that can fire a
-  repository hook — a merge, a commit, a branch checkout, a `worktree
-  add` — runs with `core.hooksPath` pointed at an empty location (`-c
-  core.hooksPath=/dev/null`), for that invocation only. Those commits and
-  checkouts are leerie's, not the user's; a `post-merge` or
-  `post-checkout` hook (husky turns them on during leerie's own install)
-  writes files into the tree leerie then measures, and a `pre-commit`
-  hook can rewrite what leerie commits. Workers' own git commands are
-  theirs and keep the repository's hooks.
+- *Hooks off.* No git command of leerie's own runs a repository hook.
+  Those commits, checkouts and resets are leerie's, not the user's; a
+  `post-merge` or `post-checkout` hook (husky turns them on during
+  leerie's own install) writes files into the tree leerie then measures,
+  and a `pre-commit` hook can rewrite what leerie commits. Which commands
+  fire a hook cannot be listed by subcommand: measured on git 2.53.0
+  with every hook installed, `git checkout -- <path>` and `git checkout
+  HEAD -- <path>` fire `post-checkout`; `git status`, `git add`, `git reset
+  --hard` and a path checkout fire `post-index-change`; `git reset
+  --hard`, `git update-ref`, `git commit` and `git worktree add` fire
+  `reference-transaction`; only pure readers (`rev-parse`, `ls-files`,
+  `diff`, `merge-base`) and `clean` fired none. Review round 16 (claims H1)
+  drove the cost of a list: the round-15 version turned hooks off per
+  "hook-firing" subcommand, assumed a path checkout fires none, and left
+  the I2 bracket's own tracked put-back and the key-level JSON merge's
+  `checkout -m --` running `post-checkout` in staging. So the invariant
+  is held for every git process at once, through the one channel they all
+  share: the environment. Before it spawns anything, the orchestrator adds
+  `core.hooksPath=/dev/null` to its own environment through git's
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` (appended to
+  any the operator set, which config files cannot override), so every git
+  it runs — directly, through a helper or through a script — and every
+  command it runs inherits it. The one spawn that removes it is a
+  worker's: a worker's own git commands are the worker's and keep the
+  repository's hooks. The scripts leerie runs add the same entry
+  themselves, so they hold it when run outside the orchestrator (the
+  subtree collection over `flyctl ssh`). The commands leerie runs to
+  install, build and test inherit it too: their side effects through a
+  hook are leerie's own, and I2 would remove them anyway.
 - *The untracked half only.* The merge's tracked changes are its product
   — a committed merge, or a conflict left for the integrator — so the
   bracket does not put tracked files back around it; it removes only the
@@ -7162,8 +7182,8 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    group the orchestrator re-runs the sets and the repository's tests — a
    test command the task forbids replaced by the scoped run of the coupled
    tests, as at final and in the ratchet, never run raw; a
-   result that is worse is rolled back (`reset --hard` to the group's
-   start, `clean -fd`). Worse is counted in cases, the same unit as
+   result that is worse is rolled back to the group's start by the one
+   restore (§8 *One restore*). Worse is counted in cases, the same unit as
    progress: any set case that passed before the group and fails after it
    — a newly failing case in a file that was already failing, or any case
    of a set file that passed before — or a control newly failing, or a

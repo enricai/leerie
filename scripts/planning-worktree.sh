@@ -48,6 +48,8 @@ set -euo pipefail
 
 # shellcheck source=scripts/worktree-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
 
 RUN_ID="${1:?usage: planning-worktree.sh <run-id> [<working-branch>]}"
 REQUESTED_BRANCH="${2:-}"
@@ -126,7 +128,7 @@ if grep -qxF "worktree $WT" <<<"$(git worktree list --porcelain)"; then
   # detached and may carry commits; that is expected and discarded.
   leerie_reset_worktree "$WT" "" "$TARGET_SHA" >/dev/null
 else
-  git "${LEERIE_GIT_NO_HOOKS[@]}" worktree add --detach "$WT" "$TARGET_SHA" >/dev/null
+  git worktree add --detach "$WT" "$TARGET_SHA" >/dev/null
 fi
 
 echo "planning-worktree: $(cd "$WT" && pwd)"

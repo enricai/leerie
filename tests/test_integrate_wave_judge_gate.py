@@ -86,11 +86,17 @@ class TestWiring:
 
     def test_backs_out_on_an_unrepaired_defect(self, leerie):
         """Rewritten for N3: an unrepaired defect no longer die()s — the
-        merge is reset to its first parent and the subtask settles
-        unconverged. Executed in tests/test_integration_repair_loop.py."""
+        merge is restored to its first parent through the one restore
+        primitive and the subtask settles unconverged. Executed in
+        tests/test_integration_repair_loop.py. The one `die(` left is a
+        back-out whose reset did not land (review round 16 claims H2,
+        executed in tests/test_one_restore.py), never a verdict."""
         gate_src = inspect.getsource(leerie._run_integration_judge_gate)
-        assert "die(" not in gate_src
-        assert '"reset", "--hard", f"{merge_sha}^1"' in gate_src
+        assert gate_src.count("die(") == 1
+        i_die = gate_src.index("die(")
+        assert gate_src.rindex("if not await _restore_tree(staging, target,",
+                               0, i_die) < i_die
+        assert 'f"{merge_sha}^1"' in gate_src
         assert "_settle_unconverged(" in gate_src
 
     def test_degrades_on_worker_error(self, leerie):
@@ -591,7 +597,12 @@ def test_resume_reinvokes_the_judge_without_redriving_integrate_sh(
     async def fake_run_proc(cmd, cwd=None):
         mock = AsyncMock()
         mock.returncode = 0
-        mock.stdout = "abc123\n" if "rev-parse" in cmd else "Merge\n\ndiff\n"
+        # The resumed staging is clean and on the run branch (setup-run.sh
+        # restored it): no restore runs before the judge.
+        mock.stdout = ("abc123\n" if "rev-parse" in cmd else
+                       "" if "status" in cmd else
+                       f"refs/heads/{leerie._compute_run_branch(st.run_id)}\n"
+                       if "symbolic-ref" in cmd else "Merge\n\ndiff\n")
         mock.stderr = ""
         return mock
 

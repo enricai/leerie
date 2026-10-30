@@ -225,6 +225,8 @@ integrated_so_far=""
 # merged onto a tree the reset could not restore.
 # shellcheck source=scripts/worktree-lib.sh
 . "$SCRIPTS/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
 backout_failed=false
 _back_out() {
   if ! leerie_reset_worktree "$staging" "$run_branch" "$1" >&2; then

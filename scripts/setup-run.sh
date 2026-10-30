@@ -33,6 +33,8 @@ set -euo pipefail
 
 # shellcheck source=scripts/worktree-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
 
 RUN_ID="${1:?usage: setup-run.sh <run-id> [<working-branch>]}"
 REQUESTED_BRANCH="${2:-}"
@@ -147,7 +149,7 @@ prune_leerie_worktrees "${RUN_DIR}"
 # expanded to a double slash for an absolute $STAGING_WT (`/leerie-state` in the
 # container), so it never matched and this add ran unconditionally.
 if ! grep -qxF "worktree $STAGING_WT" <<<"$(git worktree list --porcelain)"; then
-  git "${LEERIE_GIT_NO_HOOKS[@]}" worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
+  git worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
 else
   # A staging that survived its process: a SIGKILL skipped the cleanup that
   # removes it, so it holds whatever the killed worker left — partial edits,

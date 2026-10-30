@@ -648,12 +648,12 @@ def test_a_crash_between_the_back_out_reset_and_its_save_finishes_it(
     conflict = dict(DEFECT, kind="intent_conflict")
     real_save = st.save
     reset_seen = {"n": 0}
-    real_run_proc = leerie.run_proc
+    real_restore = leerie._restore_tree
 
-    async def spy_run_proc(argv, *a, **kw):
-        if argv[:3] == ["git", "reset", "--hard"]:
+    async def spy_restore(tree, rev, *, where, branch):
+        if where.startswith("back-out of"):
             reset_seen["n"] += 1
-        return await real_run_proc(argv, *a, **kw)
+        return await real_restore(tree, rev, where=where, branch=branch)
 
     class Crash(BaseException):
         pass
@@ -662,7 +662,7 @@ def test_a_crash_between_the_back_out_reset_and_its_save_finishes_it(
         if reset_seen["n"]:
             raise Crash()
         real_save()
-    monkeypatch.setattr(leerie, "run_proc", spy_run_proc)
+    monkeypatch.setattr(leerie, "_restore_tree", spy_restore)
     monkeypatch.setattr(st, "save", crashing_save)
     w = _Workers(staging, [[conflict]])
     with pytest.raises(Crash):

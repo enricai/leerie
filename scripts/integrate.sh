@@ -9,6 +9,11 @@
 # the leerie-integrator to resolve.
 set -euo pipefail
 
+# shellcheck source=scripts/worktree-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
+
 ID="${1:?usage: integrate.sh <subtask-id> <run-id>}"
 RUN_ID="${2:?usage: integrate.sh <subtask-id> <run-id>}"
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
@@ -26,9 +31,7 @@ fi
 
 cd "$STAGING"
 
-# Hooks off: this merge is leerie's, not the user's, and a hook such as
-# husky's post-merge would write into staging (DESIGN §6½).
-if git -c core.hooksPath=/dev/null merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
+if git merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
   echo "integrated: ${ID}"
   exit 0
 else

@@ -6,6 +6,7 @@ is set fresh on every subprocess spawn).
 """
 from __future__ import annotations
 
+import os
 import asyncio
 
 import pytest
@@ -79,9 +80,16 @@ class TestActiveTokenEnvThreading:
         assert env is not None
         assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "fresh-token"
 
-    def test_no_active_token_leaves_env_none(self, leerie, monkeypatch, tmp_path):
-        """Byte-identical to pre-feature behavior when active_token is not
-        passed — env=None, full os.environ inheritance."""
+    def test_no_active_token_inherits_the_full_environment(
+            self, leerie, monkeypatch, tmp_path):
+        """No token: the worker inherits the orchestrator's whole
+        environment — except leerie's hooks-off git entry, which a worker
+        never gets (DESIGN §6½ *Hooks off*)."""
+        env0 = dict(os.environ)
+        leerie._git_hooks_off(env0)             # what main() does
+        for k, v in env0.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("LEERIE_PROBE_MARK", "inherited")
         captured = []
         _patch_invoke_internals(leerie, monkeypatch, captured)
         monkeypatch.delenv("LEERIE_WORKER_DEBUG", raising=False)
@@ -96,7 +104,10 @@ class TestActiveTokenEnvThreading:
                 pass
 
         asyncio.run(run())
-        assert captured[0] is None
+        env = captured[0]
+        assert env == leerie._git_hooks_on(os.environ)
+        assert env["LEERIE_PROBE_MARK"] == "inherited"
+        assert "LEERIE_GIT_HOOKS_OFF" not in env
 
     def test_active_token_composes_with_worker_debug(
             self, leerie, monkeypatch, tmp_path):

@@ -137,11 +137,23 @@ leerie_worktree_name() {
   printf '%s-%s' "${run_id:0:12}" "$name"
 }
 
-# The hooks-off flags every git command of leerie's own that can fire a
-# repository hook carries (a merge, a branch checkout, a `worktree add`):
-# those are leerie's, not the user's, and a hook such as husky's post-merge
-# writes into the tree leerie then measures (DESIGN §6½).
-LEERIE_GIT_NO_HOOKS=(-c core.hooksPath=/dev/null)
+# leerie_git_hooks_off
+#
+# No git command of leerie's own runs a repository hook (DESIGN §6½ *Hooks
+# off*): even `git status` fires post-index-change, so it is not a
+# per-command flag. Appends `core.hooksPath=/dev/null` to the environment's
+# git config entries (GIT_CONFIG_COUNT/KEY/VALUE), once, keeping any already
+# set — the same entry `_git_hooks_off` puts in the orchestrator's
+# environment, so a script run outside it (the subtree collection over
+# `flyctl ssh`) holds the rule too.
+leerie_git_hooks_off() {
+  [ -n "${LEERIE_GIT_HOOKS_OFF:-}" ] && return 0
+  local n="${GIT_CONFIG_COUNT:-0}"
+  export "GIT_CONFIG_KEY_${n}=core.hooksPath"
+  export "GIT_CONFIG_VALUE_${n}=/dev/null"
+  export GIT_CONFIG_COUNT=$((n + 1))
+  export LEERIE_GIT_HOOKS_OFF="$n"
+}
 
 # leerie_reset_worktree <worktree> <branch> [<rev>]
 #
@@ -162,16 +174,24 @@ leerie_reset_worktree() {
   local branch="${2-}"
   local rev="${3:-}"
   chmod u+wx "$wt" 2>/dev/null || true
+  # Never through a symlink: a link named on chmod's command line is
+  # followed, and an untracked link to /work would chmod the user's checkout
+  # (review round 16 exec L1). `_restore_write_bits` skips links the same
+  # way; recursion itself never follows one (GNU chmod -R).
   (
     cd "$wt" || exit 0
     git ls-tree -r -d -z --name-only HEAD 2>/dev/null \
-      | xargs -0 -r chmod u+wx -- 2>/dev/null || true
+      | while IFS= read -r -d '' p; do
+          [ -L "$p" ] || chmod u+wx -- "$p" 2>/dev/null || true
+        done
     git ls-files -z --others --exclude-standard --directory 2>/dev/null \
-      | xargs -0 -r chmod -R u+w -- 2>/dev/null || true
+      | while IFS= read -r -d '' p; do
+          p="${p%/}"
+          [ -L "$p" ] || chmod -R u+w -- "$p" 2>/dev/null || true
+        done
   )
   if [ -n "$branch" ]; then
-    git -C "$wt" "${LEERIE_GIT_NO_HOOKS[@]}" checkout -q -f "$branch" \
-      || return 1
+    git -C "$wt" checkout -q -f "$branch" || return 1
   fi
   git -C "$wt" reset -q --hard "${rev:-HEAD}" || return 1
   git -C "$wt" clean -ffdq || return 1
