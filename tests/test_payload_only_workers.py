@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from test_dep_capture_worker import (_CAPS, _DEP_CAPTURE_ENVELOPE,  # noqa: E402
                                      _make_fake_state)
 from test_source_of_truth_delivery import _state  # noqa: E402
 
+_JUDGE_ENVELOPE_FOR_REPLAY = {**_DEP_CAPTURE_ENVELOPE, "structured_output": {
+    "categories": ["bug-fixing"]}}
 _PR_ENVELOPE = {**_DEP_CAPTURE_ENVELOPE,
                 "structured_output": {"title": "t", "body": "b",
                                       "used_template": None}}
@@ -95,3 +98,82 @@ def test_pr_writer_runs_outside_the_checkout(leerie, tmp_path, monkeypatch,
     assert Path(call["cwd"]) != repo and call["listing"] == []
     assert _tools(call["cmd"]) == "Read"
     assert "--dangerously-skip-permissions" not in call["cmd"]
+
+
+# --- the post-run skills ---------------------------------------------------
+#
+# `judge`, `patch_generator` and the replay call ran with `cwd=os.getcwd()`
+# — the user's checkout — holding INSPECT_TOOLS. The judge scores a record
+# against the inputs the record carries and the patch generator edits the
+# prompt text it is handed: payload-only. A replay re-runs a captured call
+# that may have read the repository, so it reads a disposable checkout of
+# HEAD, never the checkout itself.
+
+def _judge_state(leerie, run_dir: Path):
+    from test_phase_judge import _make_state as make
+    return make(leerie, run_dir)
+
+
+def test_judge_runs_payload_only(leerie, tmp_path, monkeypatch):
+    from test_phase_judge import _JUDGE_ENVELOPE, _make_records
+    monkeypatch.chdir(tmp_path)                   # a cwd it must not use
+    seen = _capture_invokes(leerie, monkeypatch, _JUDGE_ENVELOPE)
+    st = _judge_state(leerie, tmp_path / "run")
+    asyncio.run(leerie._judge_capture(
+        _make_records(1)[0], {"judge": "sonnet"}, {"judge": None},
+        dict(leerie.DEFAULT_CAPS), st))
+    assert seen, "the judge never ran"
+    assert Path(seen[0]["cwd"]) == Path(st.run_dir) / "payload-only"
+    assert seen[0]["listing"] == []
+    assert _tools(seen[0]["cmd"]) == "Read"
+
+
+def test_patch_generator_runs_payload_only(leerie, tmp_path, monkeypatch):
+    _, body, _ = leerie.resolve_prompt("classifier")
+    anchor = body.split("\n")[0].strip()[:50]
+    env = {**_DEP_CAPTURE_ENVELOPE, "structured_output": {
+        "anchor": anchor, "replacement": anchor + " (clarified)",
+        "strategy": "clarify", "pivot_reason": None}}
+    monkeypatch.chdir(tmp_path)
+    seen = _capture_invokes(leerie, monkeypatch, env)
+    st = _judge_state(leerie, tmp_path / "run")
+    hs = leerie.HealState(tmp_path / "heal", "classifier")
+    hs.failing_samples = [{"call_id": "c1", "call_type": "classifier",
+                           "response_content": "x"}]
+    hs.history = []
+    asyncio.run(leerie._request_patch(hs, 1, st, dict(leerie.DEFAULT_CAPS),
+                                      {"heal": "sonnet"}, {}))
+    assert seen, "the patch generator never ran"
+    assert Path(seen[0]["cwd"]) == Path(st.run_dir) / "payload-only"
+    assert seen[0]["listing"] == []
+    assert _tools(seen[0]["cmd"]) == "Read"
+
+
+def test_a_replay_reads_a_checkout_of_head_never_the_checkout(
+        leerie, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (["init", "-q"],):
+        subprocess.run(["git", "-C", str(repo), *args], check=True)
+    (repo / "committed.txt").write_text("in HEAD\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                    "user.name=t", "commit", "-qm", "base"], check=True)
+    (repo / "uncommitted.txt").write_text("the user's own work\n")
+    seen = _capture_invokes(leerie, monkeypatch, _JUDGE_ENVELOPE_FOR_REPLAY)
+    record = {"call_type": "classifier", "system_prompt": "s",
+              "user_content": "u", "model": "sonnet"}
+    asyncio.run(leerie._replay_capture(record, cwd=str(repo)))
+    assert seen, "the replay never ran"
+    cwd = Path(seen[0]["cwd"])
+    assert cwd != repo and repo not in cwd.parents
+    assert seen[0]["listing"] == [".git", "committed.txt"]
+    assert _tools(seen[0]["cmd"]) == leerie.INSPECT_TOOLS
+    assert "--dangerously-skip-permissions" not in seen[0]["cmd"]
+    # The checkout is gone, its registration with it; the user's tree is
+    # as it was.
+    assert not cwd.exists()
+    assert subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list"], capture_output=True,
+        text=True, check=True).stdout.count("\n") == 1
+    assert (repo / "uncommitted.txt").read_text() == "the user's own work\n"

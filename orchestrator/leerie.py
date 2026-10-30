@@ -25113,9 +25113,13 @@ async def _replay_capture(record: dict, *,
     they never pollute the original run's calls.ndjson — the capture stream is
     the ground truth; replay is ephemeral analysis.
 
-    `cwd` defaults to the current working directory. The replay worker runs
-    non-autonomous (read-only tools) by default, matching the behaviour most
-    call types actually use; callers may not need write access for scoring.
+    `cwd` is the repository the replayed call reads, default the current
+    working directory (the user's checkout). The call never runs there: it
+    runs, non-autonomous with read-only tools, in a disposable detached
+    checkout of that repository's HEAD (`_judge_checkout`), removed
+    afterwards (DESIGN §8 *A worker that does not commit never runs in a
+    tree leerie measures*). Raises WorkerError when no checkout can be made
+    (a `cwd` that is no git repository).
 
     The returned structured_output is the parsed object from the new envelope.
     A WorkerError is raised if the replay call fails schema validation twice,
@@ -25160,20 +25164,22 @@ async def _replay_capture(record: dict, *,
         # would have to guess. Falling through to claude_p's None
         # default keeps replays shaped like every other
         # "no-effort-pinned" call.
-        structured = await claude_p(
-            user_prompt=user_prompt,
-            system_prompt=system_prompt,
-            schema_key=call_type,
-            cwd=cwd or os.getcwd(),
-            allowed_tools=INSPECT_TOOLS,
-            max_turns=40,
-            autonomous=False,
-            caps=caps,
-            st=replay_st,
-            model=model,
-            sid=f"replay-{call_type}",
-            _suppress_capture=True,
-        )
+        async with _judge_checkout(replay_st, _replay_root,
+                                   "replay") as checkout:
+            structured = await claude_p(
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                schema_key=call_type,
+                cwd=str(checkout),
+                allowed_tools=INSPECT_TOOLS,
+                max_turns=40,
+                autonomous=False,
+                caps=caps,
+                st=replay_st,
+                model=model,
+                sid=f"replay-{call_type}",
+                _suppress_capture=True,
+            )
     envelope = replay_st.last_envelope
     return (envelope, structured)
 
@@ -25461,7 +25467,9 @@ async def _judge_capture(record: dict, models: dict[str, str],
         f"success: {record.get('success', False)}\n\n"
         "Judge this call on the three dimensions and return your verdict."
     )
-    # Judge workers are stateless observers — read-only tools only.
+    # The record is the judge's whole input: payload-only, never the user's
+    # checkout (DESIGN §8 *A worker that does not commit never runs in a
+    # tree leerie measures*).
     model = models.get("judge", MODEL_DEFAULT)
     effort = efforts.get("judge")
     st.bump_workers(caps)
@@ -25469,8 +25477,8 @@ async def _judge_capture(record: dict, models: dict[str, str],
         user_prompt=user_prompt,
         system_prompt=sys_prompt,
         schema_key="judge",
-        cwd=os.getcwd(),
-        allowed_tools=INSPECT_TOOLS,
+        cwd=_payload_only_cwd(st),
+        allowed_tools=PAYLOAD_ONLY_TOOLS,
         max_turns=40,
         autonomous=False,
         caps=caps,
@@ -25995,8 +26003,8 @@ async def _request_patch(state: HealState, iter_n: int,
         user_prompt=user_prompt,
         system_prompt=sys_prompt,
         schema_key="patch_generator",
-        cwd=os.getcwd(),
-        allowed_tools=INSPECT_TOOLS,
+        cwd=_payload_only_cwd(st),
+        allowed_tools=PAYLOAD_ONLY_TOOLS,
         max_turns=40,
         autonomous=False,
         caps=caps,

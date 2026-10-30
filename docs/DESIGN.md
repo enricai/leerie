@@ -7561,7 +7561,15 @@ the install-command hint likewise) — ran in the user's real checkout
 (the container's `/work`, bind-mounted) with INSPECT_TOOLS, whose
 prefix-matched verbs include `find` (`-delete`) and `git branch`
 (`-D`); neither needs any of them. They run in an empty run-private
-directory with only `Read`, which reaches nothing there.
+directory with only `Read`, which reaches nothing there. The post-run
+skills had the same shape: the `judge` scores a captured call against
+the inputs the record itself carries, and the heal loop's
+`patch_generator` edits the prompt text it is handed, so both run the
+same way, payload-only. A replay re-runs one captured call, which may
+have read the repository when it first ran, so it gets a read of the
+repository — a disposable detached checkout of the current checkout's
+HEAD (`_judge_checkout`), removed with whatever it made — never the
+checkout itself.
 
 **A worker leaves its tree clean.** The invariant (I1): *after every
 worker that runs in a tree leerie measures, integrates or ships, `git

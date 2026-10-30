@@ -5727,3 +5727,8 @@ Read`, never the repo root, with and without `dangerously_skip_permissions`.
 - `tests/test_clean_tree_gate.py` (17 tests, DESIGN §8 *A worker leaves its
   tree clean*): the I1 checker, the bounded re-ask of the same session,
   exhaustion rolling the round back, and every staging site.
+The same file covers the post-run skills: `_judge_capture` and
+`_request_patch` run payload-only (an empty `<run_dir>/payload-only/`,
+`--allowedTools Read`), and `_replay_capture` reads a disposable checkout of
+its repository's HEAD — HEAD's files only, removed with its registration
+afterwards — never the checkout, whose uncommitted file stays untouched.

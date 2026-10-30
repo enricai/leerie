@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -48,6 +49,21 @@ _CAPTURE_RECORD = {
     "success": True,
     "ts": "2026-01-01T00:00:00.000Z",
 }
+
+
+def _repo(tmp_path: Path) -> Path:
+    """A git repository with one commit: a replay reads the repository at
+    its `cwd` through a disposable checkout of HEAD (DESIGN §8 *A worker
+    that does not commit never runs in a tree leerie measures*), so its
+    `cwd` must be one."""
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    for args in (["init", "-q"], ["-c", "user.email=t@t", "-c",
+                                  "user.name=t", "commit", "-q",
+                                  "--allow-empty", "-m", "base"]):
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True)
+    return repo
 
 
 def _stub_invoke(leerie, monkeypatch, envelope=_GOOD_ENVELOPE):
@@ -90,7 +106,8 @@ def test_args_match_capture_fields(leerie, tmp_path, monkeypatch):
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
 
-    asyncio.run(leerie._replay_capture(_CAPTURE_RECORD))
+    asyncio.run(leerie._replay_capture(
+        _CAPTURE_RECORD, cwd=str(_repo(tmp_path))))
 
     assert collected_cmd, "fake_invoke was never called"
     cmd = collected_cmd[0]
@@ -154,7 +171,7 @@ def test_override_system_prompt(leerie, tmp_path, monkeypatch):
     override = "PATCHED: use a different classifier strategy."
     asyncio.run(leerie._replay_capture(
         _CAPTURE_RECORD,
-        override_system_prompt=override,
+        override_system_prompt=override, cwd=str(_repo(tmp_path)),
     ))
 
     assert collected_cmd, "fake_invoke was never called"
@@ -187,7 +204,7 @@ def test_replay_does_not_pollute_captures(leerie, tmp_path, monkeypatch):
     # land there where we can detect them.
     asyncio.run(leerie._replay_capture(
         _CAPTURE_RECORD,
-        cwd=str(tmp_path),
+        cwd=str(_repo(tmp_path)),
     ))
 
     # No calls.ndjson anywhere under tmp_path
@@ -212,7 +229,7 @@ def test_replay_does_not_modify_existing_capture_file(leerie, tmp_path,
 
     asyncio.run(leerie._replay_capture(
         _CAPTURE_RECORD,
-        cwd=str(tmp_path),
+        cwd=str(_repo(tmp_path)),
     ))
 
     assert existing.read_text() == original_content, (
@@ -232,7 +249,8 @@ def test_return_value_shape(leerie, tmp_path, monkeypatch):
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
 
-    result = asyncio.run(leerie._replay_capture(_CAPTURE_RECORD))
+    result = asyncio.run(leerie._replay_capture(
+        _CAPTURE_RECORD, cwd=str(_repo(tmp_path))))
 
     assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
     assert len(result) == 2, f"Expected 2-tuple, got {len(result)}-tuple"
