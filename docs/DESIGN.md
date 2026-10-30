@@ -7551,7 +7551,14 @@ build verbs, they still run where nothing is measured; their checkouts
 get no install, as the judges' do not. Workers that commit (implementer,
 conformer, integrator, the acceptance repair, the re-drive) stay where
 they commit, under I1; the satisfied-probe reads a subtask worktree with
-a fixed read-only tool set that no flag widens.
+a fixed read-only tool set that no flag widens. The two finalize workers
+whose whole input is their payload — `pr_writer` (the template, commit
+log and diff are gathered by code) and `dep_capture` (the manifests and
+the install-command hint likewise) — ran in the user's real checkout
+(the container's `/work`, bind-mounted) with INSPECT_TOOLS, whose
+prefix-matched verbs include `find` (`-delete`) and `git branch`
+(`-D`); neither needs any of them. They run in an empty run-private
+directory with only `Read`, which reaches nothing there.
 
 **A worker leaves its tree clean.** The invariant (I1): *after every
 worker that runs in a tree leerie measures, integrates or ships, `git

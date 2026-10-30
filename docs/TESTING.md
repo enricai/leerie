@@ -5685,3 +5685,7 @@ real `_run_final_conformance`, which now runs its conformer instead of
 `_judge_checkout(share_ignored=True)`; `_ci_discover` and
 `_integration_judge_verdict` run in their own checkouts. Tests that fake
 git with a made-up commit use `tests.conftest.judge_checkout_in_place`.
+`tests/test_payload_only_workers.py` drives `capture_repo_deps` and
+`_compose_pr_via_llm` through the real `claude_p` (`_invoke` stubbed) and
+reads the argv and cwd: an empty `<run_dir>/payload-only/`, `--allowedTools
+Read`, never the repo root, with and without `dangerously_skip_permissions`.

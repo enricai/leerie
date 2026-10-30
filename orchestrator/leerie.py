@@ -1119,6 +1119,13 @@ INSPECT_TOOLS = (
 # TaskStop: an acting worker stops its OWN `run_in_background` command with it
 # (session-scoped; see DISALLOWED_TOOLS) instead of a pattern kill.
 ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit,NotebookEdit,TaskStop"
+# For a worker whose whole input is its payload (`pr_writer`,
+# `dep_capture`): run in `_payload_only_cwd`, an empty directory, `Read`
+# reaches nothing. Never INSPECT_TOOLS in the user's checkout, whose
+# prefix-matched verbs include `find … -delete` and `git branch -D`
+# (DESIGN §8 *A worker that does not commit never runs in a tree leerie
+# measures*).
+PAYLOAD_ONLY_TOOLS = "Read"
 
 # SATISFIED_PROBE_TOOLS — a deliberately narrow, BASE-TREE-ONLY subset of
 # INSPECT_TOOLS for the phase-3 satisfied-probe (DESIGN §8 *Already-
@@ -10115,6 +10122,14 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
           "on), and they are logged as a warning instead.")
 
 
+def _payload_only_cwd(st: object) -> str:
+    """An empty run-private directory for a worker whose whole input is its
+    payload (`PAYLOAD_ONLY_TOOLS`): never the user's checkout."""
+    d = Path(getattr(st, "run_dir")) / "payload-only"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
 def _judgment_cwd(st: "State") -> str:
     """The cwd every judgment worker runs in.
 
@@ -16488,8 +16503,8 @@ async def capture_repo_deps(
         user_prompt=user_prompt,
         system_prompt=sys_prompt,
         schema_key="dep_capture",
-        cwd=str(repo_root),
-        allowed_tools=INSPECT_TOOLS,
+        cwd=_payload_only_cwd(st),
+        allowed_tools=PAYLOAD_ONLY_TOOLS,
         max_turns=10,
         autonomous=False,
         caps=caps,
@@ -60820,8 +60835,8 @@ async def _compose_pr_via_llm(st: "State",
             user_prompt=json.dumps(payload, separators=(",", ":")),
             system_prompt=sys_prompt,
             schema_key="pr_writer",
-            cwd=str(repo_root),
-            allowed_tools=INSPECT_TOOLS,
+            cwd=_payload_only_cwd(st),
+            allowed_tools=PAYLOAD_ONLY_TOOLS,
             max_turns=20,
             autonomous=False,
             caps=caps,
