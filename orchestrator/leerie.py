@@ -52073,8 +52073,10 @@ def _selfcheck_snapshot(tree: str, snap: Path) -> int:
             continue                      # a gitlink
         if src.is_symlink() or src.exists():
             files.append(rel)             # else deleted in the working tree
-    # One tar pipe, not a copy per file: measured on a 2,778-file tree,
-    # 0.2 s against 1.2 s. Symlinks stay symlinks (no `-h`).
+    # One tar pipe, not a copy per file: measured on a 2,778-file
+    # funeralworks clone, this function takes a median 0.43 s (seven runs,
+    # 0.37-0.49 s) against 1.2 s for a copy per file. Symlinks stay
+    # symlinks (no `-h`).
     pack = subprocess.Popen(
         ["tar", "-C", tree, "--null", "--no-recursion", "-T", "-", "-cf",
          "-"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -52156,7 +52158,7 @@ def _selfcheck_main(argv: list[str]) -> int:
     def _exit_on(signum: int, _frame: object) -> None:
         # A shell timeout or a cancelled tool call signals the command; as
         # an exception it unwinds through the `finally` that deletes the
-        # copy (and `subprocess.run` kills the runner on its way out).
+        # copy (the runner's process group is killed in its own `finally`).
         raise SystemExit(128 + signum)
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, _exit_on)
@@ -53600,10 +53602,11 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
                 f"{str(m.get('intent') or '')[:600]}" for m in merged))
     if held_names:
         parts.append(
-            "HELD-BACK ACCEPTANCE FAILURES: the staged tests below now pass, "
-            "but further independent tests of the same contract, written "
-            "from the defect report alone by workers that never saw this "
-            "run's code, FAIL on this tree. You cannot see these tests or "
+            "HELD-BACK ACCEPTANCE FAILURES: the shown acceptance tests now "
+            "pass, but further independent tests of the same contract, "
+            "written from the defect report alone by workers that never "
+            "saw this run's code, FAIL on this tree. You cannot see these "
+            "tests or "
             "their output; the failing cases are named below. They encode "
             "the REPORT'S contract — fix the defect at its root so the "
             "contract holds in general. Fitting these names will fail the "

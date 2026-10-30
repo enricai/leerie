@@ -5667,9 +5667,14 @@ name and a `-t` filter run, a set path the tree already has is refused
 (exit 3), and no set file or byte is left in the worker's tree. A whole
 `_run_delivery_redrive`, its implementer stubbed to put a copy of the shown
 set in its tree and run the command, leaves no byte of a shown or held-back
-set in `git cat-file --batch-all-objects`. Live-falsified three ways:
-sharing a set file's ignored parent, dropping `GIT_CEILING_DIRECTORIES`,
-and snapshotting through a temporary index (`add -A`) each fail a test.
+set in `git cat-file --batch-all-objects`. Twelve tests in all: the
+real-command test, nine argument cases (path, file name, unique path
+suffix, an ambiguous name, pass-through), a SIGTERM mid-run that still
+deletes the copy, and the object-store test. Live-falsified six ways, each
+failing a test: sharing a set file's ignored parent, dropping
+`GIT_CEILING_DIRECTORIES`, snapshotting through a temporary index (`add
+-A`), removing the signal handlers, selecting by file name only (no
+suffix), and killing only the runner instead of its process group.
 `tests/test_heldout_bytes_never_reach_history.py` keeps the anti-cheat
 history check (spans of the shown sets' source in any commit void a
 group); its staging and unstage tests went with the staging.
@@ -5689,3 +5694,36 @@ git with a made-up commit use `tests.conftest.judge_checkout_in_place`.
 `_compose_pr_via_llm` through the real `claude_p` (`_invoke` stubbed) and
 reads the argv and cwd: an empty `<run_dir>/payload-only/`, `--allowedTools
 Read`, never the repo root, with and without `dangerously_skip_permissions`.
+
+## The rev 9 redesign's other new and rewritten test files
+
+- `tests/test_resume_staging_is_reset.py` (5 tests, DESIGN §8 *The final
+  diff describes the tree that ships*): the real `setup-run.sh` resets a
+  staging worktree a SIGKILL left registered — tracked edits, untracked
+  files and a merge in progress go; ignored files and the run branch stay.
+- `tests/test_needs_human_sources_render.py` (14 tests, DESIGN §6 *The
+  PR's end-state section*, review round 14 H1): every "Needs human
+  verification" source the code can write renders in the PR; the sources
+  are derived from the code (`*_GAP_SOURCE` constants and literal `source`
+  keys of dicts written to `needs_human_verification`), never listed by
+  hand.
+- `tests/test_round14_delivery_verdicts.py` (7 tests): review round 14's
+  kept delivery items end to end — M2, a verdict counts only on the tree
+  it was measured on and a final judge that fails in any way reads
+  nothing; M3, a ratchet's unverified items derive from what its routes
+  read; M4, an item index means one item everywhere.
+- `tests/test_judges_read_the_committed_tree.py` (7 tests, rewritten, DESIGN
+  §8 *Every post-execution verdict is of the committed tree*): the
+  delivery judges read a detached checkout of staging's HEAD, no install,
+  removed afterwards — never staging, whose ignored files (an untracked
+  helper, a stale `dist/` build) held a verdict up in review rounds 12-13.
+- `tests/test_test_files_template.py` (35 tests, DESIGN §9 *Operands that
+  are already test files take the runner's direct form*): the direct
+  (`vitest run`, `jest --runTestsByPath`) and affected (`related`,
+  `--findRelatedTests`) templates, the direct form derived from a declared
+  `test_scoped` (wrapper and environment kept), vitest's substring-filter
+  collisions excluded by escaped absolute path or no command at all, and
+  the executed call sites.
+- `tests/test_clean_tree_gate.py` (17 tests, DESIGN §8 *A worker leaves its
+  tree clean*): the I1 checker, the bounded re-ask of the same session,
+  exhaustion rolling the round back, and every staging site.

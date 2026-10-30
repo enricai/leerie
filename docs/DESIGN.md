@@ -7359,7 +7359,8 @@ reports as checked out there: a worktree a worker detached reports none,
 and was skipped (review round 15 H2). That is exactly what a
 Ctrl-C's cleanup, which removes the worktree and keeps the branch, leaves
 the resume. This runs once per process; within a process the per-attempt
-rules govern a subtask's worktree (I1 on a `complete` result; a handoff
+rules govern a subtask's worktree (I1 after every attempt — `complete`,
+`blocked` or `failed` — and before an in-place retry; a handoff
 commits its partial work and leaves its checkpoint in the run
 directory). A restore that still leaves dirt stops setup, naming it. A killed
 integrator's half resolution goes with it, as it already did under a
@@ -7710,7 +7711,7 @@ Each of the six, audited:
 - *The acceptance-repair conformer* runs its gate after a raise and after a
   return alike, before its round is measured.
 - *The re-drive implementer:* `_redrive_drive` returns a crash as a result,
-  never raises, so the gate after unstaging always runs.
+  never raises, so the gate after the drive always runs.
 - *The integrator.* A crash restarts the merge from `pre_sha`, and a
   `design-conflict`, `failed`, uncommitted merge or crashed repair round is
   backed out or reset; each of those rollbacks removes untracked files too,
@@ -7765,12 +7766,17 @@ placed, and `-t`/`--testNamePattern <pattern>` (or
 command (a shell timeout, a cancelled call) unwinds through the same
 clean-up as any other exit, so the copy is deleted on every exit.
 
-**The pre-registered latency bar failed, twice.** Each bench round ran
-the in-tree staging (IN) against the out-of-tree command over four
-re-drive cases, three samples each, with a bar frozen in advance: closure
-not lower, invocations at least 0.8 of IN's, median per-call latency
-within IN + 2 s, zero leaks.
+**The pre-registered latency bar failed, three times.** Each bench round
+ran the in-tree staging (IN) against the out-of-tree command over four
+re-drive cases (two samples each in the first round, three after), with
+a bar frozen in advance: closure not lower, invocations at least 0.8 of
+IN's, median per-call latency within IN + 2 s, zero leaks.
 
+- I3-1 (FROZEN, the first out-of-tree command): closure 6 of 8 against
+  6 of 8, 28 calls against 35 (floor 28), zero leaks, median call
+  67.6 s against 30.1 s — **not met**, on latency. An extra arm added
+  in that round and not frozen (OUTR, the direct-run form found after the
+  fact) also missed invocations, 27 against the floor of 28.
 - I3-2 (FROZEN2, the whole-set command): closure 9 of 12 against 9 of
   12, 58 calls against 49, zero leaks, median call 32.6 s against
   21.8 s — **not met**, on latency. In-tree implementers ran a subset in
@@ -7791,15 +7797,17 @@ the same command on the same tree, is +0.8 to +2.3 s per call with the
 bench's temporary-index script (b2e's tree exceeds the 2 s bar by itself),
 and +1.2 s for this command on a funeralworks clone (one set file, five
 interleaved runs each: the in-tree run a median 2.09 s, the self-check
-3.31 s, its copy of the 2,778-file tree 0.4 s of that — one `tar` pipe of
-the listed files, where a copy per file took 1.2 s). That copy is the
+3.31 s, its copy of the 2,778-file tree a median 0.43 s of that,
+measured alone seven times (0.37–0.49 s) — one `tar` pipe of the listed
+files, where a copy per file took 1.2 s). That copy is the
 next lever if the bar must hold on a heavy tree.
 
 The design takes I3 anyway, because the bar measured the wrong risk for
 this decision: RC3 is the root cause behind review rounds 11 to 14, I3
 removes it rather than patching another exit, and across the three rounds
-the out-of-tree self-check showed no harm on what the bar exists to
-protect — closure, invocations, leaks. Latency is a cost the run pays,
+the frozen out-of-tree arm showed no harm on what the bar exists to
+protect — closure, invocations, leaks (the unfrozen OUTR arm of the first
+round missed invocations by one call). Latency is a cost the run pays,
 not a defect it ships. No unmeasured prompt line ("run the self-check as
 its own Bash call") is added to chase the gap: it would be a behavioural
 nudge no bench has measured.
@@ -9999,12 +10007,10 @@ ratchet's measurements where they run a forbidden suite's replacement. One templ
 `vitest related --run <test files>`, and `related` first resolves the
 module graph of the whole suite to find what imports its operands — work
 that is pure overhead when the operands are the tests themselves. The I3
-bench's paired check on barnacle trees put `related` at 1.9–5× the time of
-`vitest run <files>` over the same acceptance files, about 13–15 s of fixed
-overhead per invocation; re-measured on a barnacle clone (vitest 4.1.11,
-one acceptance file, the two forms interleaved five times each, host load
-42–78): median 42.4 s against 22.2 s, 1.9–3.2× per adjacent pair, the same
-verdict every run (1 failed, 2 passed). That cost is paid on every
+bench's paired check (`i3bench/latcheck3.out`, same tree and command, five
+runs each) put `related` at 1.8–2.2× the time of `vitest run <files>` on
+the two barnacle trees (8.7–10.4 s more per invocation) and 3.3–4.5× on
+the two funeralworks trees (15.3–15.8 s more). That cost is paid on every
 acceptance run, rerun and self-check; the implementers given the `related` command in the I3 bench
 mostly bypassed it for `vitest run` themselves. The invariant restored:
 **a command over named test files runs those files directly; a command
