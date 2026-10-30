@@ -155,6 +155,41 @@ leerie_git_hooks_off() {
   export LEERIE_GIT_HOOKS_OFF="$n"
 }
 
+# The index entries `git ls-files -v` tags as hidden from status — a
+# lowercase tag is assume-unchanged, `S`/`s` skip-worktree (git's fixed
+# one-letter tags) — as NUL-separated paths. `_flagged_entries` in Python.
+leerie_flagged_paths() {
+  git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || return 1
+  git -C "$1" ls-files -v -z | while IFS= read -r -d '' rec; do
+    case "${rec:0:2}" in
+      [abcdefghijklmnopqrstuvwxyzS]" ") printf '%s\0' "${rec:2}" ;;
+    esac
+  done
+}
+
+# I1's checker, the shell half of `_tree_dirt` (DESIGN §8 *A worker leaves
+# its tree clean*): tracked and staged changes, every flagged index entry,
+# and every untracked file the tree's own `.gitignore` files do not ignore
+# — never the shared `info/exclude` or `core.excludesFile`. Prints one line
+# per finding; empty is clean; status 1 when git cannot answer.
+leerie_tree_dirt() {
+  local wt="$1" st
+  st="$(git -C "$wt" status --porcelain --untracked-files=no)" || return 1
+  git -C "$wt" ls-files --others --exclude-per-directory=.gitignore \
+    >/dev/null || return 1
+  [ -z "$st" ] || printf '%s\n' "$st"
+  # The same lines, in the same order, as `_tree_dirt`.
+  git -C "$wt" ls-files -v -z | while IFS= read -r -d '' rec; do
+    case "${rec:0:2}" in
+      [Ss]" ") printf '%s is marked skip-worktree (an edit git status does not show)\n' "${rec:2}" ;;
+      [abcdefghijklmnopqrtuvwxyz]" ") printf '%s is marked assume-unchanged (an edit git status does not show)\n' "${rec:2}" ;;
+    esac
+  done
+  git -C "$wt" ls-files --others --exclude-per-directory=.gitignore -z \
+    | while IFS= read -r -d '' p; do printf '?? %s\n' "$p"; done
+  return 0
+}
+
 # leerie_reset_worktree <worktree> <branch> [<rev>]
 #
 # THE restore primitive's shell half (DESIGN §8 *One restore*; Python's is
@@ -166,9 +201,13 @@ leerie_git_hooks_off() {
 # any merge) and `clean -ffdq`: nested repositories go too, ignored files
 # stay (review round 15 M2). The owner's write and search bits go back first
 # on every tracked directory and every untracked, not-ignored path (DESIGN
-# §6½: a killed test's read-only directory). Postcondition, I1's own
-# checker: `git status --porcelain --untracked-files=all` prints nothing and
-# HEAD is <branch>; otherwise the porcelain goes to stderr and it returns 1.
+# §6½: a killed test's read-only directory). Every assume-unchanged and
+# skip-worktree flag is cleared before the reset, and what `clean` keeps
+# because only the shared `info/exclude` or `core.excludesFile` hides it is
+# removed (review round 16 H1). Postcondition, I1's own checker
+# (`leerie_tree_dirt`, the same rule as Python's `_tree_dirt`): it prints
+# nothing and HEAD is <branch>; otherwise the lines go to stderr and it
+# returns 1.
 leerie_reset_worktree() {
   local wt="${1:?usage: leerie_reset_worktree <worktree> <branch> [<rev>]}"
   local branch="${2-}"
@@ -184,19 +223,37 @@ leerie_reset_worktree() {
       | while IFS= read -r -d '' p; do
           [ -L "$p" ] || chmod u+wx -- "$p" 2>/dev/null || true
         done
-    git ls-files -z --others --exclude-standard --directory 2>/dev/null \
+    git ls-files -z --others --exclude-per-directory=.gitignore --directory 2>/dev/null \
       | while IFS= read -r -d '' p; do
           p="${p%/}"
           [ -L "$p" ] || chmod -R u+w -- "$p" 2>/dev/null || true
         done
   )
+  # Index flags off first: `reset --hard` leaves a skip-worktree edit in
+  # place, and either flag hides an edit from status (review round 16 H1).
+  # One option per `--stdin` call: git applies only the last of two.
+  # (Piped, never captured: a command substitution drops the NULs.)
+  leerie_flagged_paths "$wt" \
+    | git -C "$wt" update-index --no-skip-worktree -z --stdin || return 1
+  leerie_flagged_paths "$wt" \
+    | git -C "$wt" update-index --no-assume-unchanged -z --stdin || return 1
   if [ -n "$branch" ]; then
     git -C "$wt" checkout -q -f "$branch" || return 1
   fi
   git -C "$wt" reset -q --hard "${rev:-HEAD}" || return 1
   git -C "$wt" clean -ffdq || return 1
+  # What `clean` keeps because only the shared `info/exclude` or
+  # `core.excludesFile` hides it: removed by the checker's own listing
+  # (never following a symlink: `rm -rf` on a link removes the link).
+  (
+    cd "$wt" || exit 0
+    git ls-files -z --others --exclude-per-directory=.gitignore 2>/dev/null \
+      | while IFS= read -r -d '' p; do
+          rm -rf -- "${p%/}" 2>/dev/null || true
+        done
+  )
   local dirt
-  dirt="$(git -C "$wt" status --porcelain --untracked-files=all)" || return 1
+  dirt="$(leerie_tree_dirt "$wt")" || return 1
   if [ -n "$dirt" ]; then
     printf 'leerie_reset_worktree: %s is not clean after the reset:\n%s\n' \
       "$wt" "$dirt" >&2

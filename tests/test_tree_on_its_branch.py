@@ -68,7 +68,8 @@ def test_a_branch_moved_off_its_start_is_not_clean(leerie, tmp_path):
     start = _git(r, "rev-parse", "HEAD")
     _git(r, "reset", "-q", "--hard", "HEAD~1")
     assert asyncio.run(leerie._tree_dirt(r, branch="main", base=start)) == [
-        f"HEAD does not descend from {start[:12]}, where this worker started"]
+        f"HEAD does not descend from {start[:12]}, which this worker's work "
+        "must sit on"]
 
 
 def test_on_the_branch_and_ahead_of_its_start_is_clean(leerie, tmp_path):

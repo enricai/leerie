@@ -6091,15 +6091,27 @@ DESIGN §8 *A worker leaves its tree clean*. One checker, one re-ask, one
 gate, shared by every site:
 
 - `async _tree_dirt(tree, *, branch=None, base=None) -> list[str] | None`
-  — every non-empty line of `git status --porcelain --untracked-files=all`
-  in `tree`, verbatim (`run_proc`); with `branch`, the line `"HEAD is not
-  on <branch> (detached)"` / `"(on <other>)"` (`_BRANCH_LINE_HEAD`) when
-  `git symbolic-ref -q HEAD` is not `refs/heads/<branch>`; with `base`,
-  the line `"HEAD does not descend from <base12>, where this worker
-  started"` (`_BRANCH_LINE_BASE`) when `git merge-base --is-ancestor
-  <base> HEAD` exits 1. `[]` is clean; None when git exits otherwise or
-  cannot be spawned (not clean). No `--ignored`: an ignored file never
-  appears (review round 15 H2 added the branch lines).
+  — in `tree` (`run_proc`), in this order: every non-empty line of `git
+  status --porcelain --untracked-files=no`, verbatim; `"<path> is marked
+  assume-unchanged|skip-worktree (an edit git status does not show)"` per
+  entry `_flagged_entries(git ls-files -v -z)` returns (a lowercase tag is
+  assume-unchanged, `S`/`s` skip-worktree); `"?? <path>"` per path of `git
+  ls-files --others --exclude-per-directory=.gitignore -z`
+  (`_UNTRACKED_ARGV`: the tree's per-directory `.gitignore` rules only,
+  never `--exclude-standard`'s shared `info/exclude` or
+  `core.excludesFile`); with `branch`, the line `"HEAD is not on <branch>
+  (detached)"` / `"(on <other>)"` (`_BRANCH_LINE_HEAD`) when `git
+  symbolic-ref -q HEAD` is not `refs/heads/<branch>`; with `base`, the line
+  `"HEAD does not descend from <base12>, which this worker's work must sit
+  on"` (`_BRANCH_LINE_BASE`) when `git merge-base --is-ancestor <base>
+  HEAD` exits 1. `[]` is clean; None when any git call exits otherwise or
+  cannot be spawned (not clean). An ignored file never appears (review
+  round 15 H2 added the branch lines, round 16 H1 the flags and the
+  per-directory-rules
+  listing).
+- `async _fork_point(st, sid) -> str` — `git merge-base
+  refs/heads/<subtask branch> refs/heads/<run branch>` in `st.repo_root`,
+  or the run branch's tip when the subtask branch does not exist yet.
 - `async _ref_sha(repo, branch) -> str` — `git rev-parse --verify -q
   refs/heads/<branch>` in `repo`, "" when absent.
 - `CLEAN_TREE_REASK_NOTE` — the re-ask's user prompt, `{lines}` filled
@@ -6107,9 +6119,11 @@ gate, shared by every site:
   that is part of the change, delete each that is not (`git checkout --
   <path>` for a modified tracked file), do no other work, re-run the same
   `git status`, return the JSON object per the schema. When a line is a
-  branch line, `CLEAN_TREE_BRANCH_NOTE.format(branch=...)` is appended:
-  `git checkout <branch>` and put the commits that belong in the change
-  on it.
+  `HEAD is not on` line, `CLEAN_TREE_BRANCH_NOTE.format(branch=...)` is
+  appended (`git checkout <branch>` and put the commits that belong in
+  the change on it); when one is the base line,
+  `CLEAN_TREE_BASE_NOTE.format(base=<base12>)` (rebase or cherry-pick the
+  commits onto it, never reset the branch behind it).
 - `_clean_tree_reasker(st, caps, *, log_sid, cwd, schema_key,
   system_prompt, model, effort, max_turns) -> Callable[[str],
   Awaitable[None]]` — the re-ask of the SAME worker: `_log_session_id(
@@ -6143,11 +6157,14 @@ a fresh worker): that kind is gone from `_WORKER_RETRYABLE_KINDS`.
 The sites — each calls the gate right after the worker's `claude_p`
 returned, before leerie runs anything of its own in that tree. `branch`
 is `_compute_subtask_branch(run_id, sid)` in a subtask worktree and
-`_compute_run_branch(run_id)` in staging; `base` is the implementer
-attempt's `attempt_base` (the subtask branch's tip before the attempt,
-else the run branch's), a conformer round's `before_sha`, an
+`_compute_run_branch(run_id)` in staging; `base` is the commit a leerie
+record points at, the one leerie relies on the work sitting on: for the
+implementer `fork_base = _fork_point(st, sid)`, read before each attempt
+(never an earlier attempt's commit, which a continuation may amend or
+rebase — review round 16 M2), a conformer round's `before_sha`, an
 acceptance-repair round's `round_pre`, a re-drive group's `pre_sha`, the
-integrator's `pre_sha` and a repair round's `pre`:
+integrator's `pre_sha` and a repair round's `merge_sha` (the merge its
+mechanical check already requires it to descend from):
 
 | Worker | Tree | `log_sid` | On exhaustion |
 |---|---|---|---|
@@ -6168,13 +6185,20 @@ one primitive:
   `_restore_write_bits(tree)` (owner `u+wx` on `tree`, on every `git ls-tree
   -r -d -z --name-only HEAD` directory and, through `_writable_dirs_to` and
   an `os.walk`, on every `git ls-files --others --exclude-standard
-  --directory -z` path; a symlink is never chmodded); with `branch`
+  --directory -z` path; a symlink is never chmodded); every
+  `_flagged_entries` path cleared with `git update-index
+  --no-skip-worktree -z --stdin` and `git update-index
+  --no-assume-unchanged -z --stdin` (two calls: one option per `--stdin`
+  call takes effect; review round 16 H1); with `branch`
   (required; None only for the falsifier's disposable detached checkout),
   `git checkout -q -f <branch>` first (review round 15
   H2: a reset alone moved a worker's detached HEAD and left the branch
   where it was); `git reset -q --hard <rev>` (up to three attempts,
   a second apart, until `_branch_head_sha` reads; False when HEAD is then
-  not `rev`, or not on `branch`, the callers' existing failure path); `git clean -ffdq`
+  not `rev`, or not on `branch`, the callers' existing failure path);
+  `git clean -ffdq`;
+  `_remove_listed` of every `_UNTRACKED_ARGV` path left (what only the
+  shared excludes hid; review round 16 H1)
   (nested repositories too, ignored files kept); then the postcondition
   `_tree_dirt(tree, branch=branch) == []`, else `die("<where>: <tree> could not be
   restored to <rev[:12]> — still there after the write bits, `reset
@@ -6198,12 +6222,23 @@ one primitive:
 - `leerie_reset_worktree <wt> <branch> [<rev>]` (`scripts/worktree-lib.sh`):
   the same write-bit pass, entry by entry, skipping a symlink (`chmod`
   follows one named on its command line: an untracked link to /work would
-  chmod the user's checkout, review round 16 exec L1); with a `<branch>`,
+  chmod the user's checkout, review round 16 exec L1), over the untracked
+  paths `git ls-files --others --exclude-per-directory=.gitignore` lists;
+  every path `leerie_flagged_paths` returns (the `git ls-files -v -z`
+  tags `_flagged_entries` reads) cleared with `update-index
+  --no-skip-worktree -z --stdin`, then `--no-assume-unchanged` (piped,
+  never captured: a command substitution drops the NULs); with a `<branch>`,
   `git checkout -q -f <branch>`; `git reset -q --hard
-  <rev, default HEAD>`; `git clean -ffdq`; postcondition `git status
-  --porcelain --untracked-files=all` empty and, with a branch, `git
-  symbolic-ref -q HEAD` = `refs/heads/<branch>` — otherwise the porcelain
-  to stderr and status 1. Callers: `setup-run.sh` (staging on
+  <rev, default HEAD>`; `git clean -ffdq`; `rm -rf` of every path `git
+  ls-files --others --exclude-per-directory=.gitignore -z` still lists
+  (what only the shared excludes hid); postcondition `leerie_tree_dirt
+  <wt>` empty — the shell half of `_tree_dirt`, the same lines in the same
+  order (status `--untracked-files=no`, then one flag line per flagged
+  entry, then `?? <path>` per untracked path by the tree's own
+  `.gitignore` rules), pinned against it by
+  `tests/test_hidden_dirt.py` — and, with a branch, `git symbolic-ref -q
+  HEAD` = `refs/heads/<branch>`; otherwise the lines to stderr and status
+  1. Callers: `setup-run.sh` (staging on
   `leerie/runs/<run-id>`, every subtask worktree on its subtask branch),
   `planning-worktree.sh` (detached: `<branch>` empty, `<rev>` the target)
   and `collect-subtrees.sh`'s back-out (`$run_branch`, the pre-merge

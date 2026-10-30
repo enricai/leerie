@@ -7654,16 +7654,46 @@ checking while something else still writes the tree.
 
 The gate:
 
-- *Exact.* The checker is `git status --porcelain --untracked-files=all`,
-  read line for line (`_tree_dirt`): a tracked edit, a staged change or an
-  untracked file `.gitignore` does not cover. An ignored file — installed
-  dependencies, build output a repository ignores — never appears, so it
-  can never trigger a re-ask; a git failure is not clean (nothing was
-  read). Two more lines can come with it, each from git's own answer, not
-  from the files: HEAD is not the worker's branch (`git symbolic-ref`:
-  detached, or another branch), and HEAD does not descend from the commit
-  the worker started at (`git merge-base --is-ancestor`: its branch moved
-  back or sideways).
+- *Exact.* The checker reads what leerie relies on — the working tree is
+  HEAD's tree plus what the tree's own `.gitignore` files ignore — never a
+  view of it a setting outside the tree can change (`_tree_dirt`): a
+  tracked edit or a staged change (`git status --porcelain
+  --untracked-files=no`); every index entry flagged `assume-unchanged` or
+  `skip-worktree` (`git ls-files -v`: such a flag hides an edit from
+  status, and `reset --hard` leaves a skip-worktree edit in place); and
+  every untracked file not ignored by a `.gitignore` in the tree (`git
+  ls-files --others --exclude-per-directory=.gitignore`, which, unlike
+  status, reads neither the shared `info/exclude` nor `core.excludesFile`
+  — a pattern there hides a file from status in every checkout of the
+  repository, the user's own included). A change to a tracked `.gitignore`
+  is a tracked edit, and an uncommitted one is an untracked file like any
+  other — unless it ignores itself, which is how tools mark the caches
+  they write (pytest's `.pytest_cache/`, mypy's and ruff's caches carry a
+  `.gitignore` of `*`). Those are honoured: reporting them made every
+  Python run's staging "dirty" at its first measurement (measured while
+  building this). The residual is a worker that writes such a file to
+  hide its own: not closed by the checker, and raised as a design
+  question rather than met with a list of cache names. An ignored file — installed dependencies, build output a
+  repository ignores — never appears, so it can never trigger a re-ask; a
+  git failure is not clean (nothing was read). Two more lines can come
+  with it, each from git's own answer, not from the files: HEAD is not the
+  worker's branch (`git symbolic-ref`: detached, or another branch), and
+  HEAD does not descend from the commit leerie relies on the worker's work
+  sitting on (`git merge-base --is-ancestor`: its branch moved back or
+  sideways). That commit is the one a leerie record points at: a
+  conformer round's, an acceptance-repair round's or a re-drive group's
+  start, the integrator's `pre_sha`, a repair round's merge — and, for the
+  implementer, where its subtask branch forked from the run branch, never
+  its own earlier attempt's commit, which it may amend or rebase (review
+  round 16 M2: a continuation that amended its previous attempt read as
+  having left its start, and correct work settled `unconverged`).
+  Review round 16 H1 drove the root cause of the view: a checker that is
+  `git status`, which honours index flags and every exclude source, was
+  passed by a worker that ran `git update-index --skip-worktree` on its
+  edited file, or wrote an untracked `conftest.py` patching the code under
+  test and listed it in `info/exclude` — the textbook ways to make a
+  status line go away without committing — and the tree leerie measured
+  green was not the commit it shipped.
 - *Only when nothing else writes the tree.* It runs right after the
   worker's `claude -p` has returned and its process subtree is reaped
   (§6 *Worker subtree termination*), before leerie runs anything of its
@@ -7725,8 +7755,7 @@ reaped implementer's debris, the falsifier's checkout between samples,
 and `setup-run.sh`'s and the subtree collection's resets — is one
 primitive, in Python (`_restore_tree`) and in shell
 (`leerie_reset_worktree`), with one postcondition: the tree is at the
-commit, and I1's own checker reads nothing (`git status --porcelain
---untracked-files=all` empty). Review round 15 M2 drove why: "back to the
+commit, and I1's own checker (`_tree_dirt`, above) reads nothing. Review round 15 M2 drove why: "back to the
 committed state" had three implementations of different reach — one
 restored no write bits, none removed a nested repository (a fixture `git
 init`, a clone into the tree: `git clean -fd` skips them, `-ffd` does
@@ -7734,8 +7763,14 @@ not), and none checked that the dirt I1 reports was gone — so I1's
 designed exhaustion path, roll back and record, became a `die()` at the
 next reader, and the nested-repo case one that recurred on every resume.
 The primitive restores the owner's write bit on the tracked directories
-and the untracked paths (§6½), resets, runs `git clean -ffd` (ignored
-files kept), and reads the checker. Dirt it cannot remove is not the
+and the untracked paths (§6½), clears every `assume-unchanged` and
+`skip-worktree` flag (`reset --hard` keeps a skip-worktree edit), resets,
+runs `git clean -ffd` (ignored files kept), removes what the checker still
+lists as untracked — a file only the shared `info/exclude` or
+`core.excludesFile` hid, which `clean` keeps (review round 16 H1) — and
+reads the checker — in shell the same steps and the same checker, line
+for line (`leerie_tree_dirt`), so the two halves are one behaviour. Dirt it
+cannot remove is not the
 orchestrator's own (Fly's root-run subtree collection, §6½, is the one
 known producer) and stops the run there, with the lines. In shell it also checks out the expected branch
 (§8 *The final diff describes the tree that ships*, the resume).

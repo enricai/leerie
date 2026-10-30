@@ -37219,11 +37219,17 @@ CLEAN_TREE_REASK_NOTE = (
 # Added to the note when a line is about the branch, not a file: the one
 # act it allows.
 CLEAN_TREE_BRANCH_NOTE = (
-    "\nA line that says HEAD is not on `{branch}`, or does not descend from "
-    "where you started, is about your branch, not a file: run `git "
-    "checkout {branch}` and put the commits that belong in your change on "
-    "it (cherry-pick them, or fast-forward it to them). Leerie merges and "
-    "ships `{branch}` only; commits anywhere else are not your work.")
+    "\nA line that says HEAD is not on `{branch}` is about your branch, not "
+    "a file: run `git checkout {branch}` and put the commits that belong in "
+    "your change on it (cherry-pick them, or fast-forward it to them). "
+    "Leerie merges and ships `{branch}` only; commits anywhere else are not "
+    "your work.")
+# Added when the base line is present: its one act.
+CLEAN_TREE_BASE_NOTE = (
+    "\nA line that says HEAD does not descend from `{base}` means your "
+    "branch no longer contains that commit, which your work must sit on: "
+    "rebase or cherry-pick the commits that belong in your change onto it "
+    "(`git rebase {base}`), never reset your branch behind it.")
 # The prefixes of `_tree_dirt`'s branch lines (never a porcelain line,
 # which starts with a two-character status).
 _BRANCH_LINE_HEAD = "HEAD is not on "
@@ -37232,12 +37238,43 @@ _BRANCH_LINE_BASE = "HEAD does not descend from "
 _UNCLEAN_LINES_MAX = 20
 
 
+# The untracked files of a tree as its `.gitignore` files see them: `ls-files
+# --others` with only the per-directory `.gitignore`, never
+# `--exclude-standard`, which adds the shared `info/exclude` and
+# `core.excludesFile` (DESIGN §8 *A worker leaves its tree clean*, review
+# round 16 H1).
+_UNTRACKED_ARGV = ("ls-files", "--others",
+                   "--exclude-per-directory=.gitignore", "-z")
+
+
+def _flagged_entries(ls_v_z: str) -> list[tuple[str, str]]:
+    """`(path, flag)` for every index entry `git ls-files -v -z` tags as
+    hidden from status: a lowercase tag is `assume-unchanged`, `S`/`s`
+    `skip-worktree` (git's fixed one-letter tags, a mechanical string)."""
+    out: list[tuple[str, str]] = []
+    for rec in ls_v_z.split("\0"):
+        if len(rec) < 3 or rec[1] != " ":
+            continue
+        tag, path = rec[0], rec[2:]
+        if tag in "Ss":
+            out.append((path, "skip-worktree"))
+        elif tag.islower():
+            out.append((path, "assume-unchanged"))
+    return out
+
+
 async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
                      base: str | None = None) -> list[str] | None:
-    """I1's checker: every line `git status --porcelain
-    --untracked-files=all` prints in `tree`, verbatim — a tracked edit, a
-    staged change, or an untracked file `.gitignore` does not cover. An
-    ignored file never appears, so it can never make a tree dirty. With
+    """I1's checker (DESIGN §8 *A worker leaves its tree clean*): what
+    stands between the working tree and HEAD's tree plus what the committed
+    `.gitignore` files ignore, read so that no setting a worker can make
+    hides it. Every line `git status --porcelain --untracked-files=no`
+    prints (a tracked edit, a staged change), verbatim; a line per index
+    entry flagged `assume-unchanged` or `skip-worktree` (`git ls-files
+    -v`), which status does not show; `?? <path>` per untracked file the
+    tree's `.gitignore` files do not ignore (`_UNTRACKED_ARGV`: never the
+    shared `info/exclude` or `core.excludesFile` — review round 16 H1).
+    With
     `branch`, a line when HEAD is not `refs/heads/<branch>` (detached, or
     another branch — review round 15 H2); with `base`, a line when HEAD
     does not descend from it (the branch moved back or sideways). [] is
@@ -37245,12 +37282,18 @@ async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
     clean)."""
     try:
         r = await run_proc(["git", "status", "--porcelain",
-                            "--untracked-files=all"], cwd=str(tree))
+                            "--untracked-files=no"], cwd=str(tree))
+        flags = await run_proc(["git", "ls-files", "-v", "-z"],
+                               cwd=str(tree))
+        others = await run_proc(["git", *_UNTRACKED_ARGV], cwd=str(tree))
     except OSError:
         return None
-    if r.returncode != 0:
+    if any(x.returncode != 0 for x in (r, flags, others)):
         return None
     lines = [line for line in r.stdout.splitlines() if line]
+    lines += [f"{path} is marked {flag} (an edit git status does not show)"
+              for path, flag in _flagged_entries(flags.stdout)]
+    lines += [f"?? {p}" for p in others.stdout.split("\0") if p]
     if branch:
         try:
             cur = await run_proc(["git", "symbolic-ref", "-q", "HEAD"],
@@ -37269,8 +37312,8 @@ async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
         except OSError:
             return None
         if anc.returncode == 1:
-            lines.append(f"{_BRANCH_LINE_BASE}{base[:12]}, where this "
-                         "worker started")
+            lines.append(f"{_BRANCH_LINE_BASE}{base[:12]}, which this "
+                         "worker's work must sit on")
         elif anc.returncode != 0:
             return None
     return lines
@@ -37284,6 +37327,22 @@ async def _ref_sha(repo: str | Path | None, branch: str) -> str:
     try:
         r = await run_proc(["git", "rev-parse", "--verify", "-q",
                             f"refs/heads/{branch}"], cwd=str(repo))
+    except OSError:
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+async def _fork_point(st: "State", sid: str) -> str:
+    """The run-branch commit `sid`'s subtask branch forked from (`git
+    merge-base` of the two branches), or the run branch's tip when the
+    subtask branch does not exist yet; "" when neither reads."""
+    run = _compute_run_branch(st.run_id)
+    sub = _compute_subtask_branch(st.run_id, sid)
+    if not await _ref_sha(st.repo_root, sub):
+        return await _ref_sha(st.repo_root, run)
+    try:
+        r = await run_proc(["git", "merge-base", f"refs/heads/{sub}",
+                            f"refs/heads/{run}"], cwd=str(st.repo_root))
     except OSError:
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""
@@ -37351,9 +37410,10 @@ async def _clean_tree_gate(tree: str | Path, *, caps: dict, label: str,
             f"re-asking it to commit or delete each ({attempt}/{reasks})")
         note = CLEAN_TREE_REASK_NOTE.format(lines="\n".join(
             f"    {line}" for line in lines))
-        if any(line.startswith((_BRANCH_LINE_HEAD, _BRANCH_LINE_BASE))
-               for line in lines):
+        if any(line.startswith(_BRANCH_LINE_HEAD) for line in lines):
             note += CLEAN_TREE_BRANCH_NOTE.format(branch=branch)
+        if base and any(line.startswith(_BRANCH_LINE_BASE) for line in lines):
+            note += CLEAN_TREE_BASE_NOTE.format(base=base[:12])
         try:
             await reask(note)
         except Exception as e:
@@ -49256,7 +49316,8 @@ def _restore_write_bits(tree: str | Path) -> None:
             if stat.S_ISDIR(mode) and (mode & 0o300) != 0o300:
                 os.chmod(full, stat.S_IMODE(mode) | 0o300)
     r = subprocess.run(["git", "-C", str(tree), "ls-files", "--others",
-                        "--exclude-standard", "--directory", "-z"],
+                        "--exclude-per-directory=.gitignore",
+                        "--directory", "-z"],
                        capture_output=True, check=False)
     for rel in (os.fsdecode(x) for x in r.stdout.split(b"\0") if x):
         full = Path(tree) / rel
@@ -49265,6 +49326,19 @@ def _restore_write_bits(tree: str | Path) -> None:
             for d, _dirs, _files in os.walk(full):
                 with contextlib.suppress(OSError):
                     os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) | 0o700)
+
+
+def _remove_listed(tree: str | Path, rels: list[str]) -> None:
+    """Remove each `tree`-relative path a checker listing named: a directory
+    (a nested repository) whole, anything else unlinked — never following a
+    symlink."""
+    for rel in rels:
+        full = Path(tree) / rel.rstrip("/")
+        if full.is_dir() and not full.is_symlink():
+            shutil.rmtree(full, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                full.unlink()
 
 
 async def _restore_tree(tree: str | Path, rev: str, *, where: str,
@@ -49279,12 +49353,28 @@ async def _restore_tree(tree: str | Path, rev: str, *, where: str,
     repositories too; ignored files kept). True when HEAD is then `rev`, on
     `branch`; False when the reset did not land (a stale index.lock: the
     caller's own failure path). Its postcondition is I1's checker, the
-    branch line included: dirt `_tree_dirt` still reads after a reset that
-    landed is not the orchestrator's own, and stops the run there with the
+    branch line included, and before it the index flags are cleared and
+    whatever only the shared excludes hid is removed (`_remove_listed`,
+    review round 16 H1): dirt
+    `_tree_dirt` still reads after a reset that landed is not the
+    orchestrator's own, and stops the run there with the
     lines (`where` names the step)."""
     if not rev:
         return False
     await asyncio.to_thread(_restore_write_bits, tree)
+    # Index flags off first: `reset --hard` leaves a skip-worktree edit in
+    # place, and either flag hides an edit from the checker's status
+    # (review round 16 H1). One flag per call: `update-index` applies only
+    # the last of two such options to `--stdin` paths.
+    ls_v = subprocess.run(["git", "-C", str(tree), "ls-files", "-v", "-z"],
+                          capture_output=True, text=True, check=False)
+    flagged = [p for p, _f in _flagged_entries(ls_v.stdout)]
+    if flagged:
+        paths = "".join(p + "\0" for p in flagged)
+        for opt in ("--no-skip-worktree", "--no-assume-unchanged"):
+            subprocess.run(["git", "-C", str(tree), "update-index", opt,
+                            "-z", "--stdin"], input=paths,
+                           capture_output=True, text=True, check=False)
     landed = False
     # Up to three attempts, a second apart: a spawn failure (EAGAIN) on the
     # reset or an unreadable HEAD afterwards is not yet a failed reset.
@@ -49312,6 +49402,12 @@ async def _restore_tree(tree: str | Path, rev: str, *, where: str,
         return False
     subprocess.run(["git", "-C", str(tree), "clean", "-ffdq"],
                    capture_output=True, check=False)
+    # What `clean` keeps because only the shared `info/exclude` or
+    # `core.excludesFile` hides it: removed by the checker's own listing
+    # (review round 16 H1).
+    rest = subprocess.run(["git", "-C", str(tree), *_UNTRACKED_ARGV],
+                          capture_output=True, text=True, check=False)
+    _remove_listed(tree, [p for p in rest.stdout.split("\0") if p])
     left = await _tree_dirt(tree, branch=branch)
     if left != []:
         lines = (["(git status failed — the tree could not be read)"]
@@ -57604,7 +57700,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             note = f"Previous attempt failed: {reason}"
         return None
 
-    attempt_base = ""
+    fork_base = ""
 
     async def _implementer_gate(previous_status: str) -> dict | None:
         """I1 for this subtask's implementer (DESIGN §8 *A worker leaves its
@@ -57620,7 +57716,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 model=models.get("implementer", MODEL_DEFAULT),
                 effort=efforts.get("implementer"), max_turns=120),
             branch=_compute_subtask_branch(st.run_id, sid),
-            base=attempt_base or None)
+            base=fork_base or None)
         if not left:
             return None
         return _settle_unconverged(
@@ -57674,11 +57770,12 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     "cannot merge.")
 
     while True:
-        # Where this attempt starts (I1's `base`): the subtask branch's tip,
-        # or the run branch's when this is the attempt that creates it.
-        attempt_base = await _ref_sha(
-            st.repo_root, _compute_subtask_branch(st.run_id, sid)
-        ) or await _ref_sha(st.repo_root, _compute_run_branch(st.run_id))
+        # I1's `base`: the run-branch commit the subtask branch forked from
+        # (the run branch's tip when this attempt creates the branch) — what
+        # leerie relies on the work sitting on. Never an earlier attempt's
+        # commit: a continuation may amend or rebase its own work (review
+        # round 16 M2).
+        fork_base = await _fork_point(st, sid)
         try:
             res = await _run_implementer(sid, leerie_dir, caps, st, models,
                                         efforts, continuation=continuation,
@@ -59495,7 +59592,7 @@ async def _integration_repair_round(
             model=models.get("integrator", MODEL_DEFAULT),
             effort=efforts.get("integrator"),
             max_turns=60),
-        branch=_compute_run_branch(st.run_id), base=pre or None)
+        branch=_compute_run_branch(st.run_id), base=merge_sha or None)
     if unclean:
         entry["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()

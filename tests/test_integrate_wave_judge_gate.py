@@ -600,7 +600,9 @@ def test_resume_reinvokes_the_judge_without_redriving_integrate_sh(
         # The resumed staging is clean and on the run branch (setup-run.sh
         # restored it): no restore runs before the judge.
         mock.stdout = ("abc123\n" if "rev-parse" in cmd else
-                       "" if "status" in cmd else
+                       # I1's checker: status, the index flags and the
+                       # untracked listing all read nothing.
+                       "" if "status" in cmd or "ls-files" in cmd else
                        f"refs/heads/{leerie._compute_run_branch(st.run_id)}\n"
                        if "symbolic-ref" in cmd else "Merge\n\ndiff\n")
         mock.stderr = ""

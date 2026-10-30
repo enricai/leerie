@@ -742,3 +742,51 @@ def test_an_implementer_that_commits_detached_settles_unconverged(
     assert res["status"] == "unconverged"
     rec = env["st"].data["unconverged_subtasks"]["t1"]
     assert rec["kind"] == "unclean_tree" and "(detached)" in rec["reason"]
+
+
+def test_a_continuation_that_amends_its_earlier_attempt_is_not_unclean(
+        env, monkeypatch):  # noqa: F811
+    """Review round 16 M2, through `_settle_subtask`: attempt 1 commits and
+    hands off; the continuation amends that commit and completes. The base
+    is where the subtask branch forked from the run branch, so the amend is
+    clean — no re-ask, never `unconverged` for correct work."""
+    leerie_mod = env["leerie"]
+    wt = env["worktree"]
+    ckpt = env["run_dir"] / "checkpoints" / f"{env['sid']}.md"
+    ckpt.parent.mkdir(parents=True, exist_ok=True)
+    ckpt.write_text(_VALID_CHECKPOINT_TEXT)
+    calls: list = []
+
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        calls.append(continuation)
+        (wt / "feature.py").write_text(f"V = {len(calls)}\n")
+        _git("add", "feature.py", cwd=wt)
+        if len(calls) == 1:
+            _git("commit", "-q", "-m", "attempt 1", cwd=wt)
+            return {"subtask_id": sid_, "status": "incomplete-handoff",
+                    "checkpoint_path": str(ckpt)}
+        _git("commit", "-q", "--amend", "-m", "the fix", cwd=wt)
+        return {"subtask_id": sid_, "status": "complete",
+                "summary": "done", "criteria_results": [],
+                "production_evidence": {"exercised": True, "how": "n/a",
+                                         "observed": "n/a"}}
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+
+    async def _no_conformance(*a, **k):
+        return None, [], None
+    monkeypatch.setattr(leerie_mod, "_run_conformance_phase",
+                        _no_conformance)
+    reasks: list[dict] = []
+
+    async def fake_claude_p(**kw):
+        reasks.append(kw)
+        return {}
+    monkeypatch.setattr(leerie_mod, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie_mod, "_log_session_id", lambda p: "sess-impl")
+
+    res = _settle(leerie_mod, env, caps_overrides={"failed_retries": 3})
+
+    assert calls == [False, True]
+    assert reasks == []
+    assert res["status"] != "unconverged", res
