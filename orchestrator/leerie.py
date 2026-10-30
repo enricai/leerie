@@ -41795,19 +41795,24 @@ async def _ci_discover(staging: Path, st: "State", caps: dict,
         return {"skipped": "no CI configuration or blocking hook file"}
     st.bump_workers(caps)
     try:
-        res = await claude_p(
-            user_prompt=(
-                "Repository root: the current working directory. CI and "
-                "hook files found there:\n"
-                + "\n".join(f"- {f}" for f in files)
-                + "\n\nList every merge-gating check this repository's CI "
-                "and blocking git hooks run, per the system prompt, and "
-                "return the JSON object per your schema."),
-            system_prompt=_load_prompt("ci_checks"),
-            schema_key="ci_checks", cwd=str(staging),
-            allowed_tools=INSPECT_TOOLS, max_turns=40, autonomous=False,
-            caps=caps, st=st, model=models.get("ci_checks", MODEL_DEFAULT),
-            effort=efforts.get("ci_checks"), sid="ci-checks")
+        # Its own checkout of the base, never staging (DESIGN §8 *A worker
+        # that does not commit never runs in a tree leerie measures*):
+        # widened by --dangerously-skip-permissions, its tools run builds.
+        async with _judge_checkout(st, staging, "ci-checks") as cwd:
+            res = await claude_p(
+                user_prompt=(
+                    "Repository root: the current working directory. CI "
+                    "and hook files found there:\n"
+                    + "\n".join(f"- {f}" for f in files)
+                    + "\n\nList every merge-gating check this repository's "
+                    "CI and blocking git hooks run, per the system prompt, "
+                    "and return the JSON object per your schema."),
+                system_prompt=_load_prompt("ci_checks"),
+                schema_key="ci_checks", cwd=str(cwd),
+                allowed_tools=INSPECT_TOOLS, max_turns=40,
+                autonomous=False, caps=caps, st=st,
+                model=models.get("ci_checks", MODEL_DEFAULT),
+                effort=efforts.get("ci_checks"), sid="ci-checks")
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  ci parity: ci_checks failed ({_brief_worker_exc(e)}) — "
             "skipped (advisory)")
@@ -43084,32 +43089,42 @@ def _head_identity(tree: str | Path | None) -> tuple[str, str]:
 
 
 @contextlib.asynccontextmanager
-async def _judge_checkout(st: "State", staging: Path,
-                          name: str) -> AsyncIterator[Path]:
-    """Where a delivery judge reads: exactly the commit (DESIGN §8 *Every
-    post-execution verdict is of the committed tree*) — a detached checkout
-    of staging's HEAD at `_helper_worktree_path(st, name)`, removed
-    afterwards. Never staging: its ignored files (a build made before HEAD
-    last moved, installed dependencies) are readable by the judge's
-    `grep -r`/`cat`, and its contract and ratchet verdicts carry no
-    citation to check against HEAD. No install: a judge runs nothing.
-    Raises WorkerError when the checkout cannot be made — the judge read
-    nothing, so it takes the crash path and settles nothing met."""
-    head = await _branch_head_sha(str(staging))
+async def _judge_checkout(st: "State", staging: Path, name: str, *,
+                          rev: str | None = None,
+                          share_ignored: bool = False
+                          ) -> AsyncIterator[Path]:
+    """Where a worker that does not commit reads and runs (DESIGN §8 *Every
+    post-execution verdict is of the committed tree*, *A worker that does
+    not commit never runs in a tree leerie measures*): exactly the commit —
+    a detached checkout of `rev` (default staging's HEAD) at
+    `_helper_worktree_path(st, name)`, removed afterwards with whatever was
+    made in it. Never staging: its ignored files are readable by a judge's
+    `grep -r`/`cat`, and anything a worker runs there is left in a tree
+    leerie measures. No install unless `share_ignored` (the pr_reviewer,
+    which runs the repo's build and test verbs): then staging's ignored
+    paths are symlinked in (`_share_ignored_paths`). Raises WorkerError
+    when the checkout cannot be made — the worker read nothing, so it takes
+    its crash path."""
+    head = rev or await _branch_head_sha(str(staging))
     wt = _helper_worktree_path(st, name)
 
     def _remove() -> None:
+        # The directory first, write bits restored (a read-only directory,
+        # a nested repository a test made), then the registration, which
+        # `worktree remove --force` drops for a removed directory too.
+        _rmtree_owned(wt)
         subprocess.run(["git", "-C", str(staging), "worktree", "remove",
                         "--force", str(wt)], capture_output=True,
                        check=False)
-        shutil.rmtree(wt, ignore_errors=True)
     _remove()
     try:
         add = (await _worktree_add_detached_async(st, wt, head, repo=staging)
                if head else None)
         if add is None or add.returncode != 0:
             raise WorkerError(f"{name}: no checkout of the committed tree "
-                              "could be made to judge it")
+                              "could be made")
+        if share_ignored:
+            await asyncio.to_thread(_share_ignored_paths, staging, wt)
         yield wt
     finally:
         _remove()
@@ -50335,14 +50350,18 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
     """One advisory review of the whole PR (DESIGN §9 *An advisory whole-PR
     review feeds the final conformer*): the pr_reviewer reads the task, its
     reports, the required items and the full diff from `working_branch`,
-    in the staging tree, read-only, and may run the repo's build verbs to
-    confirm a suspicion. Each finding is checked by `_verify_pr_finding`.
-    Persists `pr_review` and returns it. Never gates: nothing reads it
-    except the final conformer's prompt and the PR; a crash is recorded.
+    and may run the repo's build verbs to confirm a suspicion — in its own
+    checkout of staging's HEAD with staging's ignored paths shared
+    (`_judge_checkout(share_ignored=True)`), never in staging: it does not
+    commit, so nothing it runs may land in a tree leerie measures (DESIGN
+    §8 *A worker that does not commit never runs in a tree leerie
+    measures*), and whatever it made goes with the checkout. Each finding
+    is checked by `_verify_pr_finding` against that checkout. Persists
+    `pr_review` and returns it. Never gates: nothing reads it except the
+    final conformer's prompt and the PR; a crash is recorded.
 
     Runs once: skipped when `pr_review` exists or the final conformance
-    already ran (resume). Anything the reviewer changed in the tree is
-    reverted (`tree_restored`)."""
+    already ran (resume)."""
     if "pr_review" in st.data:
         return st.data["pr_review"]
     if (st.data.get("conformance") or {}).get("_final") is not None:
@@ -50393,58 +50412,28 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
               "No test runner is granted to you: do not try to run tests. "
               "Confirm a suspicion by reading the code instead.", "",
               "Review this PR and return your findings per your schema."]
-    # Read through `_git_z_output` (`os.fsdecode`): `run_proc` decodes with
-    # replacement, so a non-UTF-8 leftover came back under a name that
-    # opens nothing and was never removed.
-    untracked0 = await asyncio.to_thread(_untracked_files, staging)
-    dirty0 = bool((await _git_out(
-        staging, "status", "--porcelain", "--untracked-files=no")).strip())
     record: dict = {"base": base, "head": head,
                     "model": models.get("pr_reviewer", MODEL_DEFAULT),
                     "effort": efforts.get("pr_reviewer"),
                     "diff_cut": cut, "findings": []}
     try:
-        st.bump_workers(caps)
-        out = await claude_p(
-            user_prompt="\n".join(parts),
-            system_prompt=_load_prompt("pr_reviewer"),
-            schema_key="pr_reviewer", cwd=str(staging),
-            allowed_tools=tools,
-            max_turns=PR_REVIEW_MAX_TURNS, autonomous=False, caps=caps,
-            st=st, model=record["model"], effort=record["effort"],
-            sid="pr_reviewer")
+        async with _judge_checkout(st, staging, "pr-review", rev=head,
+                                   share_ignored=True) as cwd:
+            st.bump_workers(caps)
+            out = await claude_p(
+                user_prompt="\n".join(parts),
+                system_prompt=_load_prompt("pr_reviewer"),
+                schema_key="pr_reviewer", cwd=str(cwd),
+                allowed_tools=tools,
+                max_turns=PR_REVIEW_MAX_TURNS, autonomous=False, caps=caps,
+                st=st, model=record["model"], effort=record["effort"],
+                sid="pr_reviewer")
+            for f in (out or {}).get("findings") or []:
+                if isinstance(f, dict):
+                    record["findings"].append(
+                        {**f, **_verify_pr_finding(f, cwd, items)})
     except (WorkerError, subprocess.TimeoutExpired) as e:
         record["error"] = _brief_worker_exc(e)
-        out = None
-    # Read-only means read-only: whatever a test run or formatter left is
-    # undone, so the final conformer starts from the integrated tree.
-    restored = False
-    if (await _git_out(staging, "rev-parse", "HEAD")).strip() != head:
-        await run_proc(["git", "reset", "-q", "--hard", head],
-                       cwd=str(staging))
-        restored = True
-    elif not dirty0 and (await _git_out(
-            staging, "status", "--porcelain",
-            "--untracked-files=no")).strip():
-        await run_proc(["git", "checkout", "--", "."], cwd=str(staging))
-        restored = True
-    untracked1 = await asyncio.to_thread(_untracked_files, staging)
-    # Without both listings nothing tells a leftover from a file that was
-    # already there, so nothing is removed.
-    leftovers = (untracked1 - untracked0
-                 if untracked0 is not None and untracked1 is not None
-                 else set())
-    for rel in leftovers:
-        if (staging / rel).is_file():
-            with contextlib.suppress(OSError):
-                (staging / rel).unlink()
-                restored = True
-    record["tree_restored"] = restored
-    if out is not None:
-        for f in out.get("findings") or []:
-            if isinstance(f, dict):
-                record["findings"].append(
-                    {**f, **_verify_pr_finding(f, staging, items)})
     record["n_findings"] = len(record["findings"])
     record["n_verified"] = sum(1 for f in record["findings"]
                                if f["verified"])
@@ -52034,12 +52023,14 @@ def _selfcheck_snapshot(tree: str, snap: Path) -> int:
     return len(files)
 
 
-def _selfcheck_share_ignored(tree: str, snap: Path,
-                             set_files: list[str]) -> list[str]:
+def _share_ignored_paths(tree: str | Path, snap: Path,
+                         set_files: Iterable[str] = ()) -> list[str]:
     """Symlink every ignored path of `tree` (`node_modules`, nested ones, a
     generated client, build output) into `snap`, so nothing is installed
-    or generated per call — except a path that is a set file or holds one:
-    a set file placed through such a link would be written into `tree`."""
+    or generated there — except a path that is one of `set_files` or holds
+    one (the self-check's sets: a set file placed through such a link would
+    be written into `tree`)."""
+    set_files = list(set_files)
     r = subprocess.run(["git", "-C", tree, "ls-files", "-z", "--others",
                         "--ignored", "--exclude-standard", "--directory"],
                        capture_output=True, check=False)
@@ -52103,7 +52094,7 @@ def _selfcheck_main(argv: list[str]) -> int:
     rc = 99
     try:
         rec["files"] = _selfcheck_snapshot(tree, snap)
-        rec["shared"] = len(_selfcheck_share_ignored(tree, snap, set_files))
+        rec["shared"] = len(_share_ignored_paths(tree, snap, set_files))
         rec["secs_snapshot"] = round(time.monotonic() - t0, 2)
         collide = [f for f in set_files
                    if (snap / f).exists() or (snap / f).is_symlink()]
@@ -58852,6 +58843,8 @@ async def _integration_judge_verdict(
                                  cwd=str(staging))).stdout
     intent = incoming.get("intent", "")
 
+    judge_cwd: list[Path] = []
+
     async def _invoke_integration_judge() -> dict:
         st.bump_workers(caps)
         user_prompt = (
@@ -58868,7 +58861,7 @@ async def _integration_judge_verdict(
         )
         return await claude_p(
             user_prompt=user_prompt, system_prompt=sys_prompt_judge,
-            schema_key="integration_judge", cwd=str(staging),
+            schema_key="integration_judge", cwd=str(judge_cwd[0]),
             allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
             caps=caps, st=st,
             model=models.get("integration_judge", MODEL_DEFAULT),
@@ -58882,12 +58875,22 @@ async def _integration_judge_verdict(
         # caller partitions again after; advisories are logged once there.
         return _partition_integration_defects(judge_result, repo_root)[0]
 
-    judge_result, judge_warnings = await _run_checked_loop(
-        invoke=_invoke_integration_judge,
-        check=_check_integration,
-        name=f"integration_judge-{sid}",
-        max_rounds=caps["judgment_check_rounds"],
-    )
+    # Its own checkout of the merge it judges, never staging (DESIGN §8 *A
+    # worker that does not commit never runs in a tree leerie measures*):
+    # widened by --dangerously-skip-permissions, its tools run builds.
+    try:
+        async with _judge_checkout(st, staging, f"integration-judge-{sid}",
+                                   rev=rev) as cwd:
+            judge_cwd.append(cwd)
+            judge_result, judge_warnings = await _run_checked_loop(
+                invoke=_invoke_integration_judge,
+                check=_check_integration,
+                name=f"integration_judge-{sid}",
+                max_rounds=caps["judgment_check_rounds"],
+            )
+    except WorkerError as e:
+        log(f"  integration-judge-{sid}: {_brief_worker_exc(e)}")
+        return None
     for w in judge_warnings:
         log(f"  integration-judge-{sid}: {w}")
     if judge_result is None:

@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock
 
 from functools import partial
 
+from tests.conftest import judge_checkout_in_place
 from tests.test_accept_blocked import (
     _expected_remote_state,
     _flyctl_stub,
@@ -399,6 +400,7 @@ def test_without_accept_resume_reinvokes_the_judge(
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    judge_checkout_in_place(leerie, monkeypatch)
 
     async def _run():
         return await leerie.integrate_wave(

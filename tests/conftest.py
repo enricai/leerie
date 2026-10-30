@@ -389,3 +389,17 @@ def _restore_child_subreaper():
     """
     with child_subreaper_restored():
         yield
+
+
+def judge_checkout_in_place(leerie, monkeypatch) -> None:
+    """For a test that fakes git itself (`run_proc` stubbed, a made-up
+    commit): `_judge_checkout` yields the given tree instead of adding a
+    real checkout of a commit that does not exist. Where the judge reads is
+    not such a test's subject; tests/test_pr_review_runs_outside_staging.py
+    drives the real one."""
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def in_place(st, staging, name, *, rev=None, share_ignored=False):
+        yield staging
+    monkeypatch.setattr(leerie, "_judge_checkout", in_place)

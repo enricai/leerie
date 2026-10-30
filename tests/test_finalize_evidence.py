@@ -427,55 +427,38 @@ def test_no_verified_finding_means_no_section(env, monkeypatch):  # noqa: F811
     assert leerie._format_pr_review_section(env["st"]) is None
 
 
-def test_reviewer_changes_are_reverted(env, monkeypatch):  # noqa: F811
+def test_reviewer_changes_never_reach_staging(env, monkeypatch):  # noqa: F811
+    """Rewritten from `test_reviewer_changes_are_reverted` and the
+    non-UTF-8 leftover test: the reviewer runs in its own checkout of HEAD
+    (DESIGN §8 *A worker that does not commit never runs in a tree leerie
+    measures*), so nothing it writes, deletes or commits is ever in
+    staging to restore. tests/test_pr_review_runs_outside_staging.py has
+    review round 15 M1's shapes."""
     leerie = env["leerie"]
     _review_env(env)
-    head = _git(env["staging"], "rev-parse", "HEAD").strip()
+    st_ = env["staging"]
+    head = _git(st_, "rev-parse", "HEAD").strip()
+    with open(bytes(st_) + b"/before\xe9.txt", "wb") as f:
+        f.write(b"there before the review\n")
+    seen: list[Path] = []
 
     def mutate(cwd: Path):
+        seen.append(cwd)
         (cwd / "src.py").write_text("changed\n")
         (cwd / "coverage.out").write_text("x\n")
-    _stub_reviewer(leerie, monkeypatch, [], mutate=mutate)
-    rec = asyncio.run(leerie._run_pr_review(
-        env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
-    assert rec["tree_restored"] is True
-    st_ = env["staging"]
-    assert (st_ / "src.py").read_text() == "def f():\n    pass\n"
-    assert not (st_ / "coverage.out").exists()
-    assert _git(st_, "rev-parse", "HEAD").strip() == head
-
-    # A commit the reviewer should never have made is reset away.
-    env["st"].data.pop("pr_review")
-
-    def commit(cwd: Path):
-        (cwd / "src.py").write_text("committed\n")
-        _git(cwd, "commit", "-qam", "reviewer")
-    _stub_reviewer(leerie, monkeypatch, [], mutate=commit)
-    asyncio.run(leerie._run_pr_review(
-        env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
-    assert _git(st_, "rev-parse", "HEAD").strip() == head
-
-
-def test_a_non_utf8_leftover_is_removed_and_an_earlier_one_kept(
-        env, monkeypatch):  # noqa: F811
-    # The untracked listing is read through `_git_z_output`: `run_proc`'s
-    # replacement decoding named a non-UTF-8 leftover "caf\ufffd.out",
-    # which opens nothing, so the file survived the cleanup.
-    leerie = env["leerie"]
-    _review_env(env)
-    st_ = bytes(env["staging"])
-    with open(st_ + b"/before\xe9.txt", "wb") as f:
-        f.write(b"there before the review\n")
-
-    def mutate(cwd: Path):
         with open(bytes(cwd) + b"/caf\xe9.out", "wb") as f:
             f.write(b"x\n")
+        _git(cwd, "commit", "-qam", "reviewer")
     _stub_reviewer(leerie, monkeypatch, [], mutate=mutate)
     rec = asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
-    assert not os.path.exists(st_ + b"/caf\xe9.out")
-    assert os.path.exists(st_ + b"/before\xe9.txt")
-    assert rec["tree_restored"] is True
+    assert seen and seen[0] != st_ and not seen[0].exists()
+    assert "tree_restored" not in rec and "error" not in rec
+    assert (st_ / "src.py").read_text() == "def f():\n    pass\n"
+    assert not (st_ / "coverage.out").exists()
+    assert not os.path.exists(bytes(st_) + b"/caf\xe9.out")
+    assert os.path.exists(bytes(st_) + b"/before\xe9.txt")
+    assert _git(st_, "rev-parse", "HEAD").strip() == head
 
 
 def test_review_runs_once_and_a_crash_is_recorded(env, monkeypatch):  # noqa: F811

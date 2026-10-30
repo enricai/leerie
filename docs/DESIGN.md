@@ -7484,6 +7484,37 @@ recorded for the tenth); of the 10 broken sets, 3 were stopped by gates
 (b), (c) and (d), 3 did not close, and 4 closed, each hand-reviewed in the
 bench.
 
+**A worker that does not commit never runs in a tree leerie measures.**
+I1 holds a committing worker to a clean tree, and I2 brackets leerie's own
+commands. A worker that must not commit — the advisory `pr_reviewer`, the
+`ci_checks` discoverer, the `integration_judge` — fits neither: it cannot
+commit what it made, and what it runs is not leerie's own command. Review
+round 15 M1 drove the result. The `pr_reviewer`, allowed the repo's build
+and test verbs in staging, was followed by a restore of its own that
+unlinked only regular files: a file left in a directory a test had made
+read-only, a dangling symlink and a nested fixture repository all
+survived it, and the final conformance then stopped the run as a broken
+leerie invariant. That restore was a third tree-restore mechanism with its
+own gaps; mending it would have been a fourth. The root fix removes the
+need: each such worker reads, and runs anything it is allowed to run, in
+its own disposable detached checkout of the commit it reviews
+(`_judge_checkout`, as the delivery judges already do), removed with
+whatever is in it — write bits restored first, so a read-only directory or
+a nested repository goes too. Nothing is restored anywhere, because
+nothing of it was ever in a measured tree. The `pr_reviewer` runs the
+repo's build and test verbs, so its checkout shares staging's ignored
+paths (installed dependencies, nested `node_modules`, a generated client)
+as symlinks, the way the re-drive's self-check does; a write through one
+lands only in an ignored path, which no measured tree's cleanliness
+counts. The `ci_checks` and `integration_judge` workers run nothing by
+default (their tools read files and git), and under
+`--dangerously-skip-permissions`, which widens their tools with the
+build verbs, they still run where nothing is measured; their checkouts
+get no install, as the judges' do not. Workers that commit (implementer,
+conformer, integrator, the acceptance repair, the re-drive) stay where
+they commit, under I1; the satisfied-probe reads a subtask worktree with
+a fixed read-only tool set that no flag widens.
+
 **A worker leaves its tree clean.** The invariant (I1): *after every
 worker that runs in a tree leerie measures, integrates or ships, `git
 status --porcelain --untracked-files=all` in that tree prints nothing* —
@@ -10840,8 +10871,10 @@ once per run, after the delivery gate's first half and before this final
 pass, a `pr_reviewer` worker reviews the whole PR the way that reviewer
 would: the task, its referenced reports, the required items (numbered,
 plus the audited defect contract), and the full diff from the working
-branch, in the staging tree, read-only, allowed to run the repo's build
-and test verbs to confirm a suspicion. Those are the verbs the repo's
+branch, in its own disposable checkout of staging's HEAD with staging's
+ignored paths shared (§8 *A worker that does not commit never runs in a
+tree leerie measures*), allowed to run the repo's build and test verbs to
+confirm a suspicion. Those are the verbs the repo's
 build, lint and test commands invoke, plus every spelling of the
 canonical test runner (`python -m pytest` as well as `pytest`), and the
 whole-suite deny (§9 *The whole suite is orchestrator-owned*) still
@@ -10855,8 +10888,8 @@ quotes the file at HEAD; code checks the quote verbatim against the
 file, and an item's quoted span against that item's text, and only a
 finding whose quote checks out reaches the final conformer, as an
 advisory section it verifies against the code before acting. The review
-never gates and never changes the run's outcome; anything it changed in
-the tree is reverted; its record (`pr_review`) is for the PR. It runs on
+never gates and never changes the run's outcome; whatever it made goes
+with its checkout; its record (`pr_review`) is for the PR. It runs on
 `opus` at effort `high` — the one model-tier exception (§12): measured
 (bench N2f, 66 calls per arm on 33 PRs), opus high returned 38 verified
 findings that name no required item against 8 for sonnet high and 7

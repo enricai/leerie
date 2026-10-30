@@ -18,6 +18,8 @@ import asyncio
 
 import pytest
 
+from tests.conftest import judge_checkout_in_place
+
 
 @pytest.fixture
 def repo_root(tmp_path, monkeypatch):
@@ -143,6 +145,7 @@ def test_skip_flag_off_still_invokes_the_gate(leerie, tmp_path, monkeypatch):
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    judge_checkout_in_place(leerie, monkeypatch)
 
     asyncio.run(leerie._run_integration_judge_gate(
         "feat-001", tmp_path, {"intent": "i", "criteria_results": []}, [],

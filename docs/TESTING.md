@@ -5673,3 +5673,15 @@ and snapshotting through a temporary index (`add -A`) each fail a test.
 `tests/test_heldout_bytes_never_reach_history.py` keeps the anti-cheat
 history check (spans of the shown sets' source in any commit void a
 group); its staging and unstage tests went with the staging.
+
+## A worker that does not commit never runs in a tree leerie measures
+
+`tests/test_pr_review_runs_outside_staging.py` (DESIGN §8, review round 15
+M1): the reviewer's driver (`test_zz_r15e_pr_review_leftover_dies.py`)
+inverted — the real `_run_pr_review` with a worker that leaves a file in a
+read-only directory, a dangling symlink or a nested repository, then the
+real `_run_final_conformance`, which now runs its conformer instead of
+`die()`ing; the reviewer reads staging's installed dependency through
+`_judge_checkout(share_ignored=True)`; `_ci_discover` and
+`_integration_judge_verdict` run in their own checkouts. Tests that fake
+git with a made-up commit use `tests.conftest.judge_checkout_in_place`.

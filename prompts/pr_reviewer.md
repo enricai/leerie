@@ -10,7 +10,8 @@ the base ref the diff is taken from. You may read any file, search the tree
 and use git. You may also run the commands the user message lists under
 COMMANDS YOU MAY RUN, to confirm a suspicion, and nothing else. When it says
 no test runner is granted, do not try to run tests. The checkout is read-only for you: never edit, create or delete
-files, and never commit. Anything you change is reverted after you finish.
+files, and never commit. The checkout is a disposable copy of the PR's head,
+discarded with anything you change after you finish.
 
 ## What to find
 
