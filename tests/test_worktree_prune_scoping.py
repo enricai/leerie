@@ -585,61 +585,57 @@ def test_the_prune_probe_pins_the_locale(path, pattern):
 # parse path) — so the git-dir resolution, path attribution, and scope
 # check in the Python port had no direct test at all.
 
+def _run_repository(repo: Path, run_dir: Path) -> Path:
+    """The run's own bare repository, `<run-dir>/repo`: the registry the
+    Python port prunes (DESIGN §6 *The run's own repository*). Without one
+    it prunes nothing — it never falls back to the cwd's, which in the
+    container is the user's read-only checkout (§6 *The explicit channel*)."""
+    run_repo = run_dir / "repo"
+    run_repo.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(run_repo)],
+                   check=True, capture_output=True)
+    return run_repo
+
+
 def test_python_port_prunes_a_stale_leerie_worktree(leerie, tmp_path):
-    repo = _repo(tmp_path)
-    root = tmp_path / "state"
-    wt = root / "runs" / "r1" / "worktrees" / "feat-001"
-    _make_stale(repo, wt, "leerie/subtasks/r1/feat-001")
-    assert str(wt.resolve()) in _registered(repo)
+    run_dir = tmp_path / "state" / "runs" / "r1"
+    run_repo = _run_repository(_repo(tmp_path), run_dir)
+    wt = run_dir / "worktrees" / "feat-001"
+    _make_stale(run_repo, wt, "leerie/subtasks/r1/feat-001")
+    assert str(wt.resolve()) in _registered(run_repo)
 
-    cwd = os.getcwd()
-    os.chdir(repo)
-    try:
-        leerie._prune_leerie_worktrees(root)
-    finally:
-        os.chdir(cwd)
+    leerie._prune_leerie_worktrees(run_dir)
 
-    assert str(wt.resolve()) not in _registered(repo), (
+    assert str(wt.resolve()) not in _registered(run_repo), (
         "the Python port must drop a stale registration under its own root, "
         "same as the shell implementation it mirrors")
 
 
 def test_python_port_leaves_a_registration_outside_the_root_alone(leerie, tmp_path):
-    repo = _repo(tmp_path)
-    root = tmp_path / "state"
-    root.mkdir()
+    run_dir = tmp_path / "state" / "runs" / "r1"
+    run_repo = _run_repository(_repo(tmp_path), run_dir)
     host_wt = tmp_path / "tmp.HOSTXYZ" / "rebase-abc123"
-    _make_stale(repo, host_wt, "leerie/runs/abc123")
-    assert str(host_wt.resolve()) in _registered(repo)
+    _make_stale(run_repo, host_wt, "leerie/runs/abc123")
+    assert str(host_wt.resolve()) in _registered(run_repo)
 
-    cwd = os.getcwd()
-    os.chdir(repo)
-    try:
-        leerie._prune_leerie_worktrees(root)
-    finally:
-        os.chdir(cwd)
+    leerie._prune_leerie_worktrees(run_dir)
 
-    assert str(host_wt.resolve()) in _registered(repo), (
+    assert str(host_wt.resolve()) in _registered(run_repo), (
         "a registration outside leerie's own state root must survive the "
         "Python port exactly as it does the shell implementation")
 
 
 def test_python_port_leaves_a_live_worktree_registered(leerie, tmp_path):
-    repo = _repo(tmp_path)
-    root = tmp_path / "state"
-    wt = root / "runs" / "r1" / "worktrees" / "feat-002"
+    run_dir = tmp_path / "state" / "runs" / "r1"
+    run_repo = _run_repository(_repo(tmp_path), run_dir)
+    wt = run_dir / "worktrees" / "feat-002"
     wt.parent.mkdir(parents=True)
-    _git(repo, "worktree", "add", "-q", "-b", "leerie/subtasks/r1/feat-002",
-         str(wt))
+    _git(run_repo, "worktree", "add", "-q", "-b",
+         "leerie/subtasks/r1/feat-002", str(wt))
 
-    cwd = os.getcwd()
-    os.chdir(repo)
-    try:
-        leerie._prune_leerie_worktrees(root)
-    finally:
-        os.chdir(cwd)
+    leerie._prune_leerie_worktrees(run_dir)
 
-    assert str(wt.resolve()) in _registered(repo)
+    assert str(wt.resolve()) in _registered(run_repo)
     assert wt.is_dir()
 
 

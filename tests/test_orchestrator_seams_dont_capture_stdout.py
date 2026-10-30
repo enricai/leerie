@@ -512,9 +512,13 @@ def test_the_rebaser_invocation_is_the_one_that_runs_the_script_file() -> None:
     the marker rather than above it. Pinned by name because this file's whole
     purpose is that seam, and resolving it to anything else disables the guard.
     """
+    # Two seams: the rebaser's and the captured-deps apply
+    # (`host_apply_captured_deps`, DESIGN §6½), which redirects its stdout.
     match = [(ln, line) for p, ln, line in _seam_invocations()
              if p.name == "host-finalize.sh"]
-    assert len(match) == 1, match
+    assert len(match) == 2, match
+    assert sum("captured-deps" in line for _ln, line in match) == 1, match
+    match = [(ln, line) for ln, line in match if "captured-deps" not in line]
     _lineno, line = match[0]
     assert "rebaser" in line, (
         "expected the line invoking the seam script (matched by basename, so a "

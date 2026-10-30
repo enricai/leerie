@@ -1105,6 +1105,7 @@ class TestBackstopCapturePriorRuns:
             asyncio.run(leerie._backstop_capture_prior_runs(
                 leerie_root, repo,
                 caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                record_in=tmp_path / "current-run",
             ))
 
         assert called == [], "run with sentinel must not trigger capture"
@@ -1126,15 +1127,19 @@ class TestBackstopCapturePriorRuns:
         called = []
 
         async def _fake_capture(repo_root, st, **kwargs):
-            called.append(getattr(st, "run_dir", None))
+            called.append((getattr(st, "run_dir", None),
+                           kwargs.get("record_in")))
 
         with patch.object(leerie, "capture_repo_deps", new=_fake_capture):
             asyncio.run(leerie._backstop_capture_prior_runs(
                 leerie_root, repo,
                 caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                record_in=tmp_path / "current-run",
             ))
 
-        assert len(called) == 1 and called[0] == run_dir
+        # The prior run's logs, recorded in the current run's directory for
+        # the host to apply (DESIGN §6½ *The host applies a capture*).
+        assert called == [(run_dir, tmp_path / "current-run")]
 
     def test_skips_run_with_an_empty_logs_dir(self, leerie, tmp_path,
                                                monkeypatch):
@@ -1166,6 +1171,7 @@ class TestBackstopCapturePriorRuns:
             asyncio.run(leerie._backstop_capture_prior_runs(
                 leerie_root, repo,
                 caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                record_in=tmp_path / "current-run",
             ))
 
         assert called == [], (
@@ -1192,6 +1198,7 @@ class TestBackstopCapturePriorRuns:
             asyncio.run(leerie._backstop_capture_prior_runs(
                 leerie_root, repo,
                 caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                record_in=tmp_path / "current-run",
             ))
 
         assert called == [], "run without logs/ must not trigger capture"

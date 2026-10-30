@@ -338,7 +338,7 @@ PY
     fi
   fi
 
-  # --- Step 4: stream .leerie/config.toml + Dockerfile back (best-effort) ----
+  # --- Step 4: apply the captured deps; stream .leerie/Dockerfile back (best-effort) ----
   # Same existence-guarded, non-fatal, never-clobber contract as
   # fetch-branch.sh's Step 4.
   local host_leerie_root
@@ -348,16 +348,23 @@ PY
     host_leerie_root="$USER_REPO/.leerie"
   fi
 
-  local _cap_file
-  for _cap_file in config.toml Dockerfile; do
-    local _remote_path="/work/.leerie/$_cap_file"
-    local _host_path="$host_leerie_root/$_cap_file"
-    if [ -e "$_host_path" ]; then
-      continue
-    fi
-    if ! ec2_remote_exec "$instance_id" "test -f '$_remote_path'" >/dev/null 2>&1; then
-      continue
-    fi
+  # The dependency captures the run recorded came home with its state
+  # directory above; write them into $USER_REPO/.leerie/config.toml as the
+  # local launcher does (DESIGN §6½ *The host applies a capture*). The
+  # machine's /work/.leerie/config.toml is no longer written.
+  if ! declare -F host_apply_captured_deps >/dev/null 2>&1; then
+    # shellcheck source=scripts/host-finalize.sh
+    . "$_EC2_FETCH_BRANCH_DIR/../host-finalize.sh" 2>/dev/null || true
+  fi
+  if declare -F host_apply_captured_deps >/dev/null 2>&1; then
+    host_apply_captured_deps "$host_leerie_root/runs/$run_id" || true
+  fi
+
+  local _cap_file=Dockerfile
+  local _remote_path="/work/.leerie/$_cap_file"
+  local _host_path="$host_leerie_root/$_cap_file"
+  if [ ! -e "$_host_path" ] \
+     && ec2_remote_exec "$instance_id" "test -f '$_remote_path'" >/dev/null 2>&1; then
     remote_log "remote: streaming .leerie/$_cap_file to host ..."
     mkdir -p "$host_leerie_root" 2>/dev/null || true
     if _ec2_fetch_ssh "cat '$_remote_path'" > "$_host_path" 2>/dev/null; then
@@ -366,7 +373,7 @@ PY
       rm -f "$_host_path" 2>/dev/null || true
       remote_log "fetch_state_ec2: warning: failed to stream .leerie/$_cap_file (non-fatal)"
     fi
-  done
+  fi
 
   remote_log "remote: fetch complete — run $run_id ready for host-side finalize"
   return 0

@@ -5585,26 +5585,31 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     cleanup_deadline = time.monotonic() + worktree_remove_timeout
     failed_removals = 0
     worktrees_dir_resolved = worktrees_dir.resolve() if worktrees_dir.is_dir() else None
-    # The registry the worktrees are in: the run's own repository, or the
-    # process cwd's for a run made before per-run repositories.
-    own_repo = _run_repo_of(st.run_dir)
-    at = ["--git-dir", str(own_repo)] if own_repo is not None else []
+    # The registry the worktrees are in: the run's own repository. Without
+    # one (a run made before per-run repositories) the directories are
+    # removed and the registrations, in the user's repository, are left to
+    # the host's `leerie prune`: the container never writes the user's
+    # checkout (DESIGN §6 *The explicit channel*).
+    try:
+        own_repo = _run_repo_of(st.run_dir)
+    except (OSError, subprocess.TimeoutExpired):
+        own_repo = None
     if worktrees_dir.is_dir():
         for entry in worktrees_dir.iterdir():
             if not entry.is_dir():
                 continue
             remaining = cleanup_deadline - time.monotonic()
-            if remaining > 0:
+            if own_repo is not None and remaining > 0:
                 try:
                     subprocess.run(
-                        ["git", *at, "worktree", "remove", "--force",
-                         str(entry)],
+                        ["git", "--git-dir", str(own_repo), "worktree",
+                         "remove", "--force", str(entry)],
                         capture_output=True, check=False,
                         timeout=remaining,
                     )
                 except (OSError, subprocess.TimeoutExpired) as e:
                     log(f"  cleanup: git worktree remove failed for {entry}: {e}")
-            else:
+            elif own_repo is not None:
                 log(f"  cleanup: worktree-removal budget ({worktree_remove_timeout}s) "
                     f"exhausted; skipping git worktree remove for {entry}, "
                     "falling back to rm -rf")
@@ -5828,15 +5833,22 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
     accident this exists to prevent. Best-effort throughout: pruning is
     housekeeping, and a failure here must never take down the caller.
 
-    The registry pruned is the one `leerie_root`'s worktrees are registered
-    in: a run directory's own repository (`<run-dir>/repo`, DESIGN §6 *The
-    run's own repository*) when it has one, else the process cwd's — the
-    user's repository, where a run made before per-run repositories
-    registered them. The attribution stays in both: in the run's repository
-    it is merely conservative."""
+    The registry pruned is the run directory's own repository
+    (`<run-dir>/repo`, DESIGN §6 *The run's own repository*). Without one —
+    a run made before per-run repositories, or one that died before making
+    it — nothing is pruned: the fallback was the process cwd's registry,
+    the user's `.git`, which the container never writes (DESIGN §6 *The
+    explicit channel*); the prune created `leerie-worktree.lock` there. A
+    pre-change run's registrations are the host `leerie prune`'s. The
+    attribution stays: in the run's repository it is merely conservative."""
     root = str(Path(leerie_root).resolve())
-    own = _run_repo_of(Path(leerie_root))
-    at = ["--git-dir", str(own)] if own is not None else []
+    try:
+        own = _run_repo_of(Path(leerie_root))
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if own is None:
+        return
+    at = ["--git-dir", str(own)]
     try:
         # LC_ALL=C / LANGUAGE=: git wraps this output in gettext
         # (`fprintf_ln(stderr, _("Removing %s/%s: %s"), ...)` in
@@ -10460,7 +10472,10 @@ async def _snapshot_repo_state(repo_root: str) -> dict:
     u = await run_proc(["git", *u_args], env=u_env)
     if u.returncode != 0:
         ok = False
-    lines = (await _out("git", "status", "--porcelain",
+    # `--no-optional-locks`: status would otherwise refresh the user's
+    # index, taking `index.lock` in a checkout leerie only reads (read-only
+    # in the local container; DESIGN §6 *The explicit channel*).
+    lines = (await _out("git", "--no-optional-locks", "status", "--porcelain",
                         "--untracked-files=no")).splitlines()
     lines += [f"?? {p}" for p in (u.stdout.split("\0")
                                   if u.returncode == 0 else []) if p]
@@ -10887,7 +10902,7 @@ async def _preflight_repo() -> None:
                 f"Run: git config --global {key} \"<value>\"")
 
     # 2. working tree must be clean — a dirty tree produces ambiguous diffs
-    r = await run_proc(["git", "status", "--porcelain",
+    r = await run_proc(["git", "--no-optional-locks", "status", "--porcelain",
                         "--untracked-files=no"])
     dirty = [l for l in r.stdout.splitlines() if not l.startswith("??")]
     if dirty:
@@ -17089,6 +17104,130 @@ def _filter_residual_deps(language_installs: list[dict]) -> list[dict]:
     return residual
 
 
+CAPTURED_DEPS_FILE = "captured-deps.json"
+CAPTURED_DEPS_APPLIED_FILE = "captured-deps.applied.json"
+
+
+def _merge_capture_into_config(cfg_path: Path, setup_packages: list[str],
+                               language_installs: list[dict],
+                               replace: bool) -> dict[str, str]:
+    """Merge one capture into `cfg_path` as it is now (DESIGN §6½): union /
+    never-clobber, or wholesale replace for `--recapture --force`. Returns
+    the keys written."""
+    updates: dict[str, str] = {}
+    if setup_packages:
+        if replace:
+            # Wholesale replace: drop packages no longer captured. Gate on the
+            # *rendered* value, not list truthiness — a schema-valid empty-item
+            # capture ([""]) is a truthy list but renders to "", which would
+            # blank a good config. Only write a non-empty value.
+            norm = _normalize_setup_packages(setup_packages)
+            if norm:
+                updates["setup_packages"] = norm
+        else:
+            existing = _read_toml_key(cfg_path, "setup_packages") or ""
+            merged = _merge_setup_packages(existing, setup_packages)
+            if merged is not None:
+                updates["setup_packages"] = merged
+    if language_installs:
+        # JSON-in-TOML because TOML has no inline array type compatible with
+        # the flat _read_toml_key/_write_config_toml_keys surface.
+        if replace:
+            # Wholesale replace: the fresh capture is authoritative — drop
+            # managers no longer present. Filter empty-manager junk (mirrors the
+            # union path below) and gate on the filtered list being non-empty so
+            # an empty-item capture never blanks a good config.
+            kept = [e for e in language_installs if e.get("manager")]
+            if kept:
+                updates["language_installs"] = _dump_language_installs(kept)
+        else:
+            existing_raw = _read_toml_key(cfg_path, "language_installs") or ""
+            try:
+                existing_list: list[dict] = json.loads(existing_raw) if existing_raw else []
+            except (json.JSONDecodeError, ValueError):
+                existing_list = []
+            existing_managers = {e.get("manager") for e in existing_list if e.get("manager")}
+            new_entries = [e for e in language_installs
+                           if e.get("manager") and e["manager"] not in existing_managers]
+            if new_entries:
+                merged_list = existing_list + new_entries
+                updates["language_installs"] = _dump_language_installs(merged_list)
+    if updates:
+        _write_config_toml_keys(cfg_path, updates)
+        pkg_note = f" setup_packages={updates['setup_packages']!r}" if "setup_packages" in updates else ""
+        li_note = f" language_installs({len(language_installs)} entries)" if "language_installs" in updates else ""
+        log(f"capture: dep_capture wrote{pkg_note}{li_note} to {cfg_path}; "
+            "run `git add .leerie/ && git commit` to bake next run")
+        return updates
+    elif replace:
+        # Under --force, an empty capture must not blank a good config.
+        log("capture: dep_capture captured no deps — leaving existing config unchanged")
+    else:
+        log("capture: dep_capture found no new deps to write")
+    return updates
+
+
+def _record_capture(record_in: Path, from_run: str, setup_packages: list[str],
+                    language_installs: list[dict], replace: bool) -> None:
+    """Append one capture to `<record_in>/captured-deps.json` for the host to
+    apply (`apply_captured_deps`). Nothing is recorded for an empty one."""
+    if not setup_packages and not language_installs:
+        log("capture: dep_capture found no deps to record")
+        return
+    path = record_in / CAPTURED_DEPS_FILE
+    try:
+        entries = json.loads(path.read_text()) if path.is_file() else []
+    except (OSError, ValueError):
+        entries = []
+    if not isinstance(entries, list):
+        entries = []
+    entries.append({"from_run": from_run,
+                    "setup_packages": list(setup_packages),
+                    "language_installs": list(language_installs),
+                    "replace": bool(replace)})
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(entries, indent=1) + "\n")
+    os.replace(tmp, path)
+    log(f"capture: recorded {len(setup_packages)} setup_packages and "
+        f"{len(language_installs)} language installs in {path.name}; the "
+        "host writes .leerie/config.toml after the run")
+
+
+def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
+    """Host-side: apply the captures a run recorded (`_record_capture`) to
+    `repo_root/.leerie/config.toml`, each merged against the file as it is
+    now, so a key the user edited during the run is merged with rather than
+    overwritten. The applied entries move to `captured-deps.applied.json`,
+    so a second call is a no-op. Returns how many were applied; a file that
+    cannot be read is logged and kept."""
+    path = Path(run_dir) / CAPTURED_DEPS_FILE
+    if not path.is_file():
+        return 0
+    try:
+        entries = json.loads(path.read_text())
+        if not isinstance(entries, list):
+            raise ValueError("not a list")
+    except (OSError, ValueError) as e:
+        log(f"capture: could not read {path} ({e}); kept for a later apply")
+        return 0
+    cfg = Path(repo_root) / ".leerie" / "config.toml"
+    for e in entries:
+        _merge_capture_into_config(
+            cfg, list(e.get("setup_packages") or []),
+            list(e.get("language_installs") or []), bool(e.get("replace")))
+    done = path.with_name(CAPTURED_DEPS_APPLIED_FILE)
+    try:
+        prior = json.loads(done.read_text()) if done.is_file() else []
+    except (OSError, ValueError):
+        prior = []
+    tmp = done.with_name(f"{done.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps((prior if isinstance(prior, list) else [])
+                              + entries, indent=1) + "\n")
+    os.replace(tmp, done)
+    path.unlink()
+    return len(entries)
+
+
 async def capture_repo_deps(
         repo_root: Path,
         st: object,
@@ -17096,8 +17235,17 @@ async def capture_repo_deps(
         models: dict[str, str] | None = None,
         efforts: dict[str, str | None] | None = None,
         replace: bool = False,
+        record_in: Path | None = None,
 ) -> None:
     """Invoke the dep_capture LLM worker and write deps to .leerie/config.toml (non-fatal).
+
+    record_in (every in-container seam, the current run's directory): the
+    capture is recorded in `<record_in>/captured-deps.json` instead, and the
+    host writes `.leerie/config.toml` after the container exits
+    (`apply_captured_deps`). The container never writes the user's checkout,
+    which is mounted read-only (DESIGN §6 *The explicit channel*, §6½ *The
+    host applies a capture*). None: the host's own `run_recapture_deps`,
+    which writes it now.
 
     replace=False (default, every automatic seam): union / never-clobber —
     only new packages/managers are added, existing entries are preserved.
@@ -17190,56 +17338,12 @@ async def capture_repo_deps(
     if setup_packages:
         log(f"capture: captured {len(setup_packages)} setup_packages")
 
-    cfg_path = repo_root / ".leerie" / "config.toml"
-    updates: dict[str, str] = {}
-    if setup_packages:
-        if replace:
-            # Wholesale replace: drop packages no longer captured. Gate on the
-            # *rendered* value, not list truthiness — a schema-valid empty-item
-            # capture ([""]) is a truthy list but renders to "", which would
-            # blank a good config. Only write a non-empty value.
-            norm = _normalize_setup_packages(setup_packages)
-            if norm:
-                updates["setup_packages"] = norm
-        else:
-            existing = _read_toml_key(cfg_path, "setup_packages") or ""
-            merged = _merge_setup_packages(existing, setup_packages)
-            if merged is not None:
-                updates["setup_packages"] = merged
-    if language_installs:
-        # JSON-in-TOML because TOML has no inline array type compatible with
-        # the flat _read_toml_key/_write_config_toml_keys surface.
-        if replace:
-            # Wholesale replace: the fresh capture is authoritative — drop
-            # managers no longer present. Filter empty-manager junk (mirrors the
-            # union path below) and gate on the filtered list being non-empty so
-            # an empty-item capture never blanks a good config.
-            kept = [e for e in language_installs if e.get("manager")]
-            if kept:
-                updates["language_installs"] = _dump_language_installs(kept)
-        else:
-            existing_raw = _read_toml_key(cfg_path, "language_installs") or ""
-            try:
-                existing_list: list[dict] = json.loads(existing_raw) if existing_raw else []
-            except (json.JSONDecodeError, ValueError):
-                existing_list = []
-            existing_managers = {e.get("manager") for e in existing_list if e.get("manager")}
-            new_entries = [e for e in language_installs
-                           if e.get("manager") and e["manager"] not in existing_managers]
-            if new_entries:
-                merged_list = existing_list + new_entries
-                updates["language_installs"] = _dump_language_installs(merged_list)
-    if updates:
-        _write_config_toml_keys(cfg_path, updates)
-        pkg_note = f" setup_packages={updates['setup_packages']!r}" if "setup_packages" in updates else ""
-        li_note = f" language_installs({len(language_installs)} entries)" if "language_installs" in updates else ""
-        log(f"capture: dep_capture wrote{pkg_note}{li_note} to {cfg_path}; "
-            "run `git add .leerie/ && git commit` to bake next run")
-    elif replace:
-        # Under --force, an empty capture must not blank a good config.
-        log("capture: dep_capture captured no deps — leaving existing config unchanged")
+    if record_in is not None:
+        _record_capture(Path(record_in), Path(str(log_dir)).parent.name,
+                        setup_packages, language_installs, replace)
     else:
-        log("capture: dep_capture found no new deps to write")
+        _merge_capture_into_config(repo_root / ".leerie" / "config.toml",
+                                   setup_packages, language_installs, replace)
     # Write idempotency sentinel. Both a state field (for in-run readers)
     # and a lightweight file (for the next-run backstop, which reads past
     # run dirs without constructing a full State).
@@ -17262,8 +17366,11 @@ async def _backstop_capture_prior_runs(
         caps: dict,
         models: dict[str, str],
         efforts: dict[str, str | None],
+        record_in: Path,
 ) -> None:
-    """Cover SIGKILL/crash: run dep_capture over prior runs with logs/ but no sentinel."""
+    """Cover SIGKILL/crash: run dep_capture over prior runs with logs/ but no
+    sentinel, recording each capture in `record_in` (the current run's
+    directory) for the host to apply after this run's container exits."""
     runs_dir = leerie_root / "runs"
     if not runs_dir.is_dir():
         return
@@ -17308,6 +17415,7 @@ async def _backstop_capture_prior_runs(
             await capture_repo_deps(
                 repo_root, bst,
                 caps=caps, models=models, efforts=efforts,
+                record_in=record_in,
             )
         # TerminalAuthFailure / RateLimitedExit subclass BaseException (so they
         # propagate through asyncio.gather and worker `except Exception` blocks);
@@ -18779,6 +18887,7 @@ async def _best_effort_capture_deps(
         await capture_repo_deps(
             repo_root, st,
             caps=caps, models=models, efforts=efforts,
+            record_in=st.run_dir,
         )
     except (Exception, KeyboardInterrupt, TerminalAuthFailure,
             RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
@@ -28626,6 +28735,41 @@ def _format_provision_user_prompt(fixtures: dict, task: str) -> str:
     return "\n".join(parts)
 
 
+async def _provision_hook_and_toolchain(tree: Path, log_dir: Path,
+                                        st: State) -> None:
+    """Phase 1½ steps 2–4 (`phase_provision`) in `tree`, a throwaway
+    checkout of the planning tree's commit: the setup hook, the go override
+    and `mise install`. Never the user's checkout (DESIGN §6 *The explicit
+    channel*)."""
+    prov = st.data.setdefault("provision", {})
+    # 2. Setup hook.
+    await _run_setup_hook(tree, log_dir, st)
+
+    # 3. Synthesize a mise go override if go.mod lacks a sibling pin.
+    override = _synth_mise_go_override(tree, st.run_dir)
+    if override is not None:
+        log(f"  synthesized mise override at {override.name} "
+            f"(go.mod → .go-version equivalent)")
+    # Persist so a `resume` after this point can re-export the env
+    # var (_orchestrate() re-reads provision state on resume).
+    prov["override_file"] = str(override) if override is not None else None
+    st.save()
+    # Export MISE_OVERRIDE_CONFIG_FILENAMES into the orchestrator's
+    # os.environ now so every downstream subprocess — `mise install`
+    # below, the implementer/conformer `claude -p` workers (which
+    # inherit os.environ via _invoke), and any `mise exec --` they
+    # invoke from their worktrees — sees the synthesized go pin.
+    # Without this, mise's discovery in the worktree wouldn't find the
+    # synth (the override file lives under .leerie/, which isn't in the
+    # worktree's tracked-file set) and `mise exec -- go ...` would
+    # fall through to system PATH where Go isn't installed.
+    if override is not None:
+        os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
+
+    # 4. mise install + version capture.
+    await _run_mise_install(tree, log_dir, st, override_file=override)
+
+
 async def phase_provision(repo_root: Path, st: State, caps: dict,
                            models: dict[str, str],
                            efforts: dict[str, str | None]) -> None:
@@ -28638,11 +28782,14 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
          documentation categories, persist `kind: none` and return.
       2. `.leerie-setup.sh` hook if present.
       3. Synthesize a mise go-override from `go.mod` if needed.
-      4. `mise install` at the repo root (reads .tool-versions natively
+      4. `mise install` (reads .tool-versions natively
          and .nvmrc / .python-version / .ruby-version /
          rust-toolchain.toml via the image-set
          MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS env). Capture
          resolved versions via `mise ls --current --json`.
+         Steps 2–4 run in a throwaway checkout of the planning tree's
+         commit (`_provision_hook_and_toolchain`), never the user's
+         checkout.
       5. Detect install commands: deterministic lockfile table first
          (emits all matches for polyglot repos), LLM fallback if the
          table abstains. Validate the recipe and persist it to
@@ -28678,32 +28825,19 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
         st.save()
         return
 
-    # 2. Setup hook.
-    await _run_setup_hook(repo_root, log_dir, st)
-
-    # 3. Synthesize a mise go override if go.mod lacks a sibling pin.
-    override = _synth_mise_go_override(repo_root, st.run_dir)
-    if override is not None:
-        log(f"  synthesized mise override at {override.name} "
-            f"(go.mod → .go-version equivalent)")
-    # Persist so a `resume` after this point can re-export the env
-    # var (_orchestrate() re-reads provision state on resume).
-    prov["override_file"] = str(override) if override is not None else None
-    st.save()
-    # Export MISE_OVERRIDE_CONFIG_FILENAMES into the orchestrator's
-    # os.environ now so every downstream subprocess — `mise install`
-    # below, the implementer/conformer `claude -p` workers (which
-    # inherit os.environ via _invoke), and any `mise exec --` they
-    # invoke from their worktrees — sees the synthesized go pin.
-    # Without this, mise's discovery in the worktree wouldn't find the
-    # synth (the override file lives under .leerie/, which isn't in the
-    # worktree's tracked-file set) and `mise exec -- go ...` would
-    # fall through to system PATH where Go isn't installed.
-    if override is not None:
-        os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
-
-    # 4. mise install + version capture.
-    await _run_mise_install(repo_root, log_dir, st, override_file=override)
+    # 2–4 run in a throwaway checkout of the planning tree's commit, never in
+    # the user's checkout: the hook and `mise` (`mise.lock`, a configured
+    # `.venv`) may write their working directory, and the container never
+    # writes the user's checkout (DESIGN §6 *The explicit channel*, §6½).
+    planning = st.data.get("planning_worktree")
+    if not planning:
+        die("phase 1½: no planning worktree to provision from (it is made "
+            "before phase 1)")
+    try:
+        async with _judge_checkout(st, Path(planning), "provision") as tree:
+            await _provision_hook_and_toolchain(tree, log_dir, st)
+    except WorkerError as e:
+        die(f"phase 1½: could not make the provisioning checkout ({e})")
     versions = prov.get("mise_versions") or {}
     if versions:
         version_summary = ", ".join(
@@ -28716,6 +28850,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
 
     # 5a. Detect install commands — table first.
     recipe = _detect_recipe_from_lockfiles(repo_root)
+
     if recipe:
         prov["source"] = "table"
         log(f"  table emitted {len(recipe)} install command(s)")
@@ -62174,6 +62309,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
         await capture_repo_deps(
             Path(os.getcwd()), st,
             caps=caps, models=models, efforts=efforts,
+            record_in=st.run_dir,
         )
     # TerminalAuthFailure / RateLimitedExit / ContextOverflow are BaseException
     # subclasses that a
@@ -62759,7 +62895,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # cancel-arm capture couldn't run. Non-fatal: any error is
             # logged and ignored.
             await _backstop_capture_prior_runs(
-                leerie_dir, Path(os.getcwd()), caps, models, efforts)
+                leerie_dir, Path(os.getcwd()), caps, models, efforts,
+                st.run_dir)
             if not args.resume:
                 # Initialize run.json with the immutable run-identity
                 # fields (run_id, branch, working_branch, pr_base_branch,

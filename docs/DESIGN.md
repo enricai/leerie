@@ -2101,22 +2101,85 @@ r16 H2's two scenarios):
   through the environment every git process leerie starts inherits (§6½
   *Hooks off*, `_git_hooks_off`); the per-call `GIT_NO_HOOKS` flag M1 was
   first fixed with is gone (a344b0c).
-- *The explicit channel.* `/work` is still the user's checkout, bind-mounted
-  read-write. A worker's Bash can still `cd /work` or run `git -C /work`. §12
-  records 146 `Edit`/`Write` calls into the user's checkout before the path
-  deny, and Bash writes there that the deny does not cover. I4 removes the implicit reach, where every git verb landed in the
-  user's repository. It does not remove the explicit one. So the sentinel
-  (§12 L4) and `_repo_write_denials` stay. The sentinel's `refs/heads/leerie/`
-  exemption stays too, because another run's bring-back can land during
-  this one.
+- *The explicit channel: the user's checkout is mounted read-only.* I4
+  removed the implicit reach, where every git verb landed in the user's
+  repository. The explicit one was left: `/work` was the user's checkout
+  bind-mounted read-write, so a worker's Bash could `cd /work`, run
+  `git -C /work`, or write `/work/.git`. §12 records 146 `Edit`/`Write`
+  calls into the user's checkout before the path deny, and Bash writes there
+  that the deny does not cover. Locally the launcher now mounts it
+  `/work:ro`. Invariant: nothing in the local container writes the user's
+  checkout; what the run gives the user reaches it through the host, after
+  the container exits (the run branch's bring-back, the captured
+  dependencies below).
 
-  Closing the explicit channel means mounting the user's checkout
-  read-only. Three things write it today:
-  - dependency capture's documented `.leerie/config.toml` write (§6½);
-  - `resolve_leerie_root`'s in-checkout state fallback (the Fly layout);
-  - the rootful entry's `chown leerie: /work`.
+  Measured with the real `container-entry.sh` and a stand-in for the
+  orchestrator, as `leerie` after the privilege drop, on rootless and on
+  rootful (`sudo nerdctl`, an existing image; no new image needed): every
+  write fails with `EROFS` — a file in the tree, a file in `.git`,
+  `mkdir .leerie`, `git commit`, `git branch` — and every read leerie does
+  works: `rev-parse`, `status`, `worktree list`, a `fetch` from it into
+  another repository, a `clone --shared` from it.
 
-  That is a separate decision, recorded here and not taken by this design.
+  What wrote it, and where each write went:
+  - *Dependency capture's `.leerie/config.toml`.* The container records the
+    capture in the run directory; the host applies it to the checkout after
+    the container exits (§6½ *The host applies a capture*).
+  - *The in-checkout state root.* `resolve_leerie_root` falls back to
+    `<repo>/.leerie` only when `LEERIE_STATE_DIR` is unset. The local
+    launcher always passes `LEERIE_STATE_DIR=/leerie-state`, so the
+    fallback is unreachable in the local container. It stays for Fly/EC2,
+    where `/work` is the machine's own clone (below), and for direct
+    invocation.
+  - *The rootful entry's `chown leerie: /work`.* It exists for Fly, where a
+    volume mounted at `/work` has a root-owned root on first attach. Locally
+    it was a no-op at best: the image's `leerie` has the host user's uid.
+    At worst, on rootful with a checkout whose owner is not that uid, it
+    re-owned the user's checkout directory (measured: 1234 became 1000).
+    Nothing needs it for reading: git's `safe.directory '*'` is baked in,
+    and a checkout's modes let `leerie` read it (measured rootful, checkout
+    owned by 1234, read-only: every read above works). It now runs only on a
+    writable `/work`, which locally `/work` never is. Rootless never ran it.
+  - *The setup hook and `mise install`* ran with the checkout as their
+    working directory. A hook or `mise` (`mise.lock`, a configured `.venv`)
+    could write there. They now run in a throwaway checkout of the planning
+    tree's commit (§6½ *Phase 1½*).
+  - *`git status` on the checkout* (the preflight's clean check and the
+    sentinel's snapshot) refreshed the user's index opportunistically,
+    taking `index.lock`. leerie's status reads there run with
+    `GIT_OPTIONAL_LOCKS=0`, so they never try.
+  - *The prune and the abnormal-exit clean-up of a run with no repository
+    of its own* fell back to the working directory's registry, the user's
+    `.git`: the prune created `leerie-worktree.lock` there. They now leave
+    the user's repository alone. A run made before per-run repositories has
+    its registrations in the user's repository; the host's `leerie prune`
+    deregisters those, as it already did.
+
+  Hooks are unchanged: the run's repository carries `core.hooksPath` at the
+  user's `.git/hooks`, which the workers' commits run from the read-only
+  mount. A hook that writes beside itself fails, and so does the commit
+  that ran it.
+
+  *Fly and EC2 stay read-write.* There `/work` is a clone the machine made
+  of the user's repository, on the machine's own disk, and it also holds
+  the state root (`/work/.leerie`). The user's checkout is never on the
+  machine. It receives only what `fetch_branch` brings back. Mounting
+  `/work` read-only there would first need the state root moved off the
+  volume. That protects nothing of the user's.
+
+  *The sentinel and `_repo_write_denials`, by reachability.* Both stay.
+  - `_repo_write_denials` is reachable where workers run against the
+    user's real checkout with acting tools: the host-side `run_rebaser` and
+    `run_recapture_deps`. In the local container the read-only mount stops
+    the write first. On Fly/EC2 the denial is already skipped, because the
+    state root is inside `/work`.
+  - The sentinel (`_assert_repo_unchanged`) can still catch a worker on
+    Fly/EC2, where a worker can write the machine's clone. Locally no
+    process in the container can write the checkout, so a delta there is
+    the operator's own edit on the host; its hint already names operator
+    signatures. Its baseline, `repo_state_before_planning`, is also the
+    acceptance own start's and report base's (`_acceptance_own_start`,
+    `_acceptance_report_base`).
 - *The network remote.* `remote.*` is carried, so a worker can still push
   to the user's `origin` from the container, as it can today.
 
@@ -2198,7 +2261,8 @@ afresh in the run's own repository (its old registration in the user's
 - The user-ref half of `_restore_tree`'s blast radius. A reset can now move
   only the run's own refs.
 
-It keeps the sentinel, `_repo_write_denials`,
+It keeps the sentinel, `_repo_write_denials` (both by reachability, under
+*The explicit channel* above),
 `_checkout_ignore` and `_helper_worktree_path`'s run-id prefix (harmless
 once the registry is private). The launcher's `prune` keeps the
 user-registry deregistration and subtask-branch deletion for runs made
@@ -5701,7 +5765,7 @@ did to it. The run repository's settings, which a command can change too
 copy (§8 *The settings are leerie's*). The other commands leerie runs do not need it: CI parity and
 the held-out sets' parse probe and runs work in disposable checkouts no
 worker commits from; the setup hook and
-`mise install` run at the repository root before any worktree exists; and
+`mise install` run in a throwaway checkout no worker commits from; and
 the advisory whole-PR review, a worker, has what it leaves undone by the
 same two acts.
 
@@ -5844,7 +5908,11 @@ classification and planning, layered top-to-bottom by determinism:
    orchestrator execs it inside the container as the non-root `leerie`
    user (the image deliberately does not ship `sudo`). Repo author
    controls trust; the script runs in the same container that runs the
-   workers.
+   workers. Its working directory is a throwaway checkout of the planning
+   tree's commit (`_judge_checkout`), removed afterwards with whatever the
+   hook made in it; never the user's checkout, which is read-only (§6 *The
+   explicit channel*). Step 2's `mise install` and `mise ls` run in the same
+   checkout.
 
    System packages requiring root (apt-get-installable libraries,
    anything writing to `/usr/*` or `/etc/*`) are out of scope for the
@@ -6174,7 +6242,8 @@ languages and frameworks" goal. Which files and commands the worker sees is
 deterministic corpus selection in code; the model still decides content (§12
 *Prompts are advisory, code enforces*). Structured output (`setup_packages`
 and `language_installs`) is validated against a JSON schema and written to
-`.leerie/config.toml` deterministically. The `dep_capture` worker defaults to
+`.leerie/config.toml` deterministically, by the host (*The host applies a
+capture* below). The `dep_capture` worker defaults to
 `sonnet`/`medium`, overridable via `LEERIE_MODEL_DEP_CAPTURE`.
 
 **System packages → `setup_packages` → warm apt layer.** `dep_capture`'s
@@ -6221,10 +6290,11 @@ differs, the decision-maker does not:
   runs there — same post-loop pattern as the `RateLimitedExit` arm. Non-fatal;
   covers `nerdctl stop` / Ctrl-C. `SIGKILL` gives no window.
 - **SIGKILL / crash / host-side → backstop + `--recapture`.** Covered two
-  ways, both host-side, modeled on the `--phase judge` scaffolding: a
+  ways, modeled on the `--phase judge` scaffolding: a
   *run-start backstop* scans prior run dirs at start, before `phase_classify`,
   for any with `logs/` but no `dep_capture.done` sentinel and runs capture
-  over them automatically; and *on-demand `--recapture`* — `leerie config
+  over them automatically, recording each capture in the current run's
+  directory; and *on-demand `--recapture`* — `leerie config
   --recapture` resolves the target run, constructs and flocks its `State`
   (refusing to race a live orchestrator via `StateLockedError`), and runs the
   worker via `asyncio.run`.
@@ -6239,11 +6309,28 @@ no longer captured) — an explicit "rebuild the dep set from current history"
 gesture. Even under `--force`, an empty capture leaves the existing config
 untouched, so a bad run can never blank a good config.
 
-**Idempotency.** After a successful write, `capture_repo_deps` writes a
-lightweight `<run_dir>/dep_capture.done` sentinel and sets
-`dep_capture_done = True` in `state.json`. The run-start backstop skips any
-run whose sentinel is already present. When the union merge finds nothing
-new, the function returns immediately without touching `.leerie/config.toml`.
+**The host applies a capture.** The container never writes the user's
+checkout (§6 *The explicit channel*; locally it is mounted read-only), so a
+capture inside the container is recorded, not written:
+`capture_repo_deps(..., record_in=<the current run's directory>)` appends
+`{setup_packages, language_installs, replace, from_run}` to
+`<run-dir>/captured-deps.json`. The host applies the file to
+`$USER_REPO/.leerie/config.toml` with the same union (or replace) merge,
+against the file as it is at that moment, then renames it
+`captured-deps.applied.json`, so a second apply is a no-op:
+- locally, in the launcher's EXIT trap, for the run that container ran,
+  whatever the exit (as the bring-back);
+- on Fly/EC2, in `fetch_branch`, from the run directory it streamed back.
+
+The merge reads the host's config at apply time, so a key the user edited
+during the run is merged with, never overwritten by, a value read before.
+`leerie config --recapture` runs on the host and writes directly.
+
+**Idempotency.** After the capture is recorded (or, on the host, written),
+`capture_repo_deps` writes a lightweight `<run_dir>/dep_capture.done`
+sentinel and sets `dep_capture_done = True` in `state.json`. The run-start
+backstop skips any run whose sentinel is already present. When the union
+merge finds nothing new, `.leerie/config.toml` is not touched.
 
 **No auto-commit.** Capture writes `.leerie/config.toml` (and, if generated,
 `.leerie/Dockerfile`) as uncommitted files. Leerie logs one line: *"captured N
@@ -6269,14 +6356,15 @@ Dockerfile speaks for itself. This mirrors the existing rule: `setup_packages`
 is ignored when a committed Dockerfile is present (see *Per-repo container
 image* above).
 
-**Fly parity.** Capture writes the same files regardless of runtime. On
+**Fly parity.** Capture records the same file regardless of runtime. On
 `--runtime fly` the workflow splits across two directions:
-- **Machine → host (stream-back).** After the run-state tar, `fetch-branch.sh`
-  best-effort streams `/work/.leerie/config.toml` and `/work/.leerie/Dockerfile`
-  from the Fly Machine back to `$USER_REPO/.leerie/` (or `$LEERIE_STATE_HOST_DIR`).
-  Each file is existence-guarded on the remote side and never clobbers a
-  host-edited file; failure is non-fatal and doesn't affect `fetch_branch`'s
-  return code. This fires only on a clean finish (same condition gate that
+- **Machine → host (stream-back).** The run-state tar brings
+  `captured-deps.json` home with the run directory, and `fetch-branch.sh`
+  applies it as the local launcher does. It then best-effort streams
+  `/work/.leerie/Dockerfile` from the Fly Machine back to `$USER_REPO/.leerie/`
+  (or `$LEERIE_STATE_HOST_DIR`), existence-guarded on the remote side and
+  never clobbering a host-edited file; failure is non-fatal and doesn't
+  affect `fetch_branch`'s return code. This fires only on a clean finish (same condition gate that
   runs `fetch_branch` at all — rc `0|10|11|75`). Cancel/kill recovery uses the
   host-side `--recapture` / next-run backstop instead.
 - **Host → machine (seed-repo whitelist).** Pre-existing committed `.leerie/`
@@ -12705,10 +12793,13 @@ warning classifies each newly-warned batch, so a later batch of only new
 untracked files reads as the operator's even after an earlier batch
 carried a tracked edit — that earlier warning already pointed at it.
 
-This does **not** achieve kernel-level confinement: `/work` is a read-write
-bind mount in the same container for the whole run, and nothing short of a
-read-only mount or a separate uid stops a determined worker. L1–L3 make the
-escape unlikely; L4 makes it loud.
+Locally that kernel-level confinement now exists: the launcher mounts the
+user's checkout `/work:ro` (§6 *The explicit channel*), so no process in the
+container can write it, determined or not, and a delta L4 sees there is the
+operator's own edit on the host. On Fly/EC2 `/work` is the machine's own
+clone, read-write, and nothing short of a read-only mount or a separate uid
+stops a determined worker there. L1–L3 make that escape unlikely; L4 makes
+it loud.
 
 A further layer sits underneath all four and holds even for `autonomous`
 workers, which still carry the permission bypass: `DISALLOWED_TOOLS` via

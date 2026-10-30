@@ -365,11 +365,13 @@ def _run_terminal_auth_handler(leerie, raw_message="OAuth session expired "
     def fake_cleanup(st, full_purge=False):
         cleanup_calls.append(full_purge)
 
-    async def fake_capture_repo_deps(repo_root, st, caps, models, efforts):
-        capture_calls.append((repo_root, caps, models, efforts))
+    async def fake_capture_repo_deps(repo_root, st, caps, models, efforts,
+                                     record_in=None):
+        capture_calls.append((repo_root, caps, models, efforts, record_in))
 
     class _FakeSt:
         run_id = "r-terminal-auth"
+        run_dir = "/state/runs/r-terminal-auth"
 
     ns = {
         "e": leerie.TerminalAuthFailure(raw_message),
@@ -423,7 +425,10 @@ def test_handler_execution_sets_locals_and_calls_cleanup_and_capture(leerie):
     assert cleanup_calls == [False], (
         "the worktree-only cleanup (full_purge=False) must actually run — "
         "state and the run branch must survive so resume can pick it up")
-    assert capture_calls == [("/repo", {"c": 1}, {"m": 1}, {"e": 1})]
+    # Recorded in the run's directory: the container never writes the
+    # user's checkout (DESIGN §6½ *The host applies a capture*).
+    assert capture_calls == [("/repo", {"c": 1}, {"m": 1}, {"e": 1},
+                              "/state/runs/r-terminal-auth")]
 
     joined = "\n".join(logs)
     assert "auth session locked" in joined
@@ -447,11 +452,13 @@ def test_handler_execution_survives_a_cleanup_that_raises(leerie):
     def raising_cleanup(st, full_purge=False):
         raise RuntimeError("cleanup blew up")
 
-    async def fake_capture_repo_deps(repo_root, st, caps, models, efforts):
+    async def fake_capture_repo_deps(repo_root, st, caps, models, efforts,
+                                     record_in=None):
         pass
 
     class _FakeSt:
         run_id = "r-cleanup-raises"
+        run_dir = "/state/runs/r-cleanup-raises"
 
     ns = {
         "e": leerie.TerminalAuthFailure("session expired and could not be "
@@ -501,12 +508,14 @@ def test_handler_execution_survives_a_capture_repo_deps_that_raises(leerie):
     def fake_cleanup(st, full_purge=False):
         pass
 
-    async def raising_capture_repo_deps(repo_root, st, caps, models, efforts):
+    async def raising_capture_repo_deps(repo_root, st, caps, models, efforts,
+                                        record_in=None):
         raise leerie.TerminalAuthFailure("session expired and could not be "
                                           "refreshed")
 
     class _FakeSt:
         run_id = "r-capture-reraises"
+        run_dir = "/state/runs/r-capture-reraises"
 
     ns = {
         "e": leerie.TerminalAuthFailure("session expired and could not be "

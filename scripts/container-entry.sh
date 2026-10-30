@@ -191,11 +191,24 @@ fi
 # skipped when the base image already has a group at that GID (so no
 # group literally named "leerie" exists). On the no-volume and local
 # nerdctl paths the chown is a no-op against an already-correct /work
-# (rootfs /work is leerie-owned from image build; local bind-mount
-# preserves host ownership).
+# (rootfs /work is leerie-owned from image build).
 # (DESIGN §6 *Remote disk policy*; IMPLEMENTATION §0.5 *Container shape*.)
+#
+# Never on a read-only /work: locally /work is the user's checkout, mounted
+# read-only (DESIGN §6 *The explicit channel*). There the chown could only
+# fail — and on a read-write mount, rootful, it re-owned the user's checkout
+# directory to the image's leerie uid (measured: 1234 became 1000). Reading
+# it needs no ownership: the image sets git's safe.directory '*'.
+_work_is_read_only() {
+  # `/proc/self/mounts`: device, mount point, type, options (comma-separated).
+  awk '$2 == "/work" { n = split($4, o, ","); for (i = 1; i <= n; i++)
+         if (o[i] == "ro") ro = 1 } END { exit ro ? 0 : 1 }' \
+    /proc/self/mounts 2>/dev/null
+}
 if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
-  chown leerie: /work 2>/dev/null || true
+  if ! _work_is_read_only; then
+    chown leerie: /work 2>/dev/null || true
+  fi
   # The Dockerfile leaves /home/leerie/.local, .cache, and .gnupg
   # root-owned (rootless needs that; see the Dockerfile comment there).
   # The rootful `runuser -u leerie` drop is a real uid switch, so it

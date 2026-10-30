@@ -480,6 +480,31 @@ host_bring_back_run_branch() {
   return 0
 }
 
+# host_apply_captured_deps <run-dir> — write the dependency captures a run
+# recorded (`<run-dir>/captured-deps.json`) into $USER_REPO/.leerie/config.toml
+# (DESIGN §6½ *The host applies a capture*). The container never writes the
+# user's checkout, which it mounts read-only (§6 *The explicit channel*), so
+# this is where a capture reaches it: the orchestrator's own merge
+# (`apply_captured_deps`), loaded by path in host python3 like the rebaser's
+# seam, against the config as it is now. A no-op without the file; applied
+# entries move to captured-deps.applied.json, so a second call is a no-op.
+# Never fails its caller.
+host_apply_captured_deps() {
+  local run_dir="$1"
+  [ -f "$run_dir/captured-deps.json" ] || return 0
+  python3 - "$run_dir" "$USER_REPO" "$LEERIE_REPO/orchestrator/leerie.py" \
+      <<'PY' >&2 || echo "[leerie] capture: could not apply $run_dir/captured-deps.json; it is kept" >&2
+import importlib.util, pathlib, sys
+
+run_dir, user_repo, orch_path = (pathlib.Path(a) for a in sys.argv[1:4])
+spec = importlib.util.spec_from_file_location("leerie_orch", orch_path)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.apply_captured_deps(run_dir, user_repo)
+PY
+  return 0
+}
+
 # _host_finalize_rebase_repo <dir> <run-branch> <pr-base-branch> — the
 # rebaser's own bare repository at <dir>: a `--shared` single-branch clone
 # of $USER_REPO holding the run branch, with no remote (the clone's would be

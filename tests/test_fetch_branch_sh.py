@@ -585,8 +585,11 @@ def _make_run_fixture(
 
 
 def test_step4_streams_config_and_dockerfile_to_host(tmp_path):
-    """Step 4 copies config.toml and Dockerfile from the machine to the
-    host .leerie/ dir when neither exists on the host yet."""
+    """Step 4 copies the Dockerfile from the machine to the host .leerie/
+    dir when the host has none. A config.toml on the machine is not streamed:
+    the container records captures in the run directory and the host applies
+    them (DESIGN §6½ *The host applies a capture*;
+    tests/test_fetch_branch_leerie_streamback.py)."""
     run_id = "feat-streamback-001"
     repo, machine_runs, _ = _make_run_fixture(tmp_path, run_id)
 
@@ -610,9 +613,8 @@ def test_step4_streams_config_and_dockerfile_to_host(tmp_path):
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
 
     host_leerie = repo / ".leerie"
-    assert (host_leerie / "config.toml").exists(), "config.toml not streamed to host"
+    assert not (host_leerie / "config.toml").exists(), "config.toml was streamed"
     assert (host_leerie / "Dockerfile").exists(), "Dockerfile not streamed to host"
-    assert (host_leerie / "config.toml").read_text() == "[config]\nsetup_packages = []\n"
     assert (host_leerie / "Dockerfile").read_text() == "FROM debian:13\n"
 
 
@@ -684,7 +686,7 @@ def test_step4_uses_leerie_state_host_dir(tmp_path):
 
     machine_leerie = tmp_path / "machine_leerie"
     machine_leerie.mkdir()
-    (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = ['curl']\n")
+    (machine_leerie / "Dockerfile").write_text("FROM debian:13\n")
 
     _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
@@ -703,10 +705,10 @@ def test_step4_uses_leerie_state_host_dir(tmp_path):
     )
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
     # File must land in custom_host_dir, not repo/.leerie/.
-    assert (custom_host_dir / "config.toml").exists(), (
-        "config.toml must be written to LEERIE_STATE_HOST_DIR when set"
+    assert (custom_host_dir / "Dockerfile").exists(), (
+        "Dockerfile must be written to LEERIE_STATE_HOST_DIR when set"
     )
-    assert not (repo / ".leerie" / "config.toml").exists(), (
-        "config.toml must NOT be written to USER_REPO/.leerie when "
+    assert not (repo / ".leerie" / "Dockerfile").exists(), (
+        "Dockerfile must NOT be written to USER_REPO/.leerie when "
         "LEERIE_STATE_HOST_DIR is set"
     )

@@ -8968,6 +8968,19 @@ else
     host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
   }
 
+  # _apply_ran_run_captures — write the dependency captures that run
+  # recorded into your `.leerie/config.toml` (DESIGN §6½ *The host applies a
+  # capture*); the container cannot, since it mounts your checkout
+  # read-only. From the EXIT trap, whatever the exit. Never fails the exit.
+  _apply_ran_run_captures() {
+    _read_ran_run_id
+    [ -n "$_ran_run_id" ] || return 0
+    [ -f "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id/captured-deps.json" ] || return 0
+    # shellcheck source=scripts/host-finalize.sh
+    . "$LEERIE_REPO/scripts/host-finalize.sh" || return 0
+    host_apply_captured_deps "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
+  }
+
   # Fix D (DESIGN §6 *container boundary's hidden precondition*): kill the
   # container if the launcher is interrupted, so a Ctrl-C / SIGTERM to this
   # process tears the container down instead of orphaning it (an orphaned,
@@ -9059,7 +9072,7 @@ else
   # Every step tolerates failure (`|| true`): under `set -e` a failing
   # command ends the trap, so a keepalive that had already exited — `kill`
   # returning 1 — skipped the bring-back and the clean-up after it.
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _apply_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
   trap '_reap_tail; _kill_container_from_cidfile; exit 130' INT
   trap '_reap_tail; _kill_container_from_cidfile; exit 143' TERM
 
@@ -9161,7 +9174,10 @@ else
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
     --cgroupns=host
     ${ROOTLESS_SECOPT[@]+"${ROOTLESS_SECOPT[@]}"}
-    -v "$USER_REPO:/work"
+    # Read-only: nothing in the container writes the user's checkout; what
+    # the run gives it reaches it through the host after the container exits
+    # (the bring-back, the captured deps). DESIGN §6 *The explicit channel*.
+    -v "$USER_REPO:/work:ro"
     -v "$LEERIE_REPO:/opt/leerie-image:ro"
     -v "$LEERIE_STATE_HOST_DIR:/leerie-state"
     ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"}

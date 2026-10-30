@@ -47,10 +47,14 @@ def _run(runs: Path, repo: Path, rid: str, *, old: bool) -> Path:
     (d / "logs").mkdir(parents=True)
     (d / "state.json").write_text("{}")
     (d / "logs" / "w.log").write_text("log\n")
+    # The run's own repository, where its worktrees are registered (DESIGN
+    # §6 *The run's own repository*): the reap prunes that registry, never
+    # the user's (§6 *The explicit channel*).
+    _git("clone", "-q", "--bare", str(repo), str(d / "repo"), cwd=repo)
     wt = d / "worktrees" / f"{rid}-feat-001"
     wt.parent.mkdir()
     _git("worktree", "add", "-q", "-b", f"leerie/subtasks/{rid}/feat-001",
-         str(wt), "main", cwd=repo)
+         str(wt), "main", cwd=d / "repo")
     (wt / "node_modules").mkdir()
     (wt / "node_modules" / "big.js").write_text("y" * 10000)
     if old:
@@ -74,7 +78,10 @@ def _snapshot_outside_worktrees(d: Path) -> dict:
                        and not n.startswith(".worktrees.reap-")]
         for f in filenames:
             p = Path(dirpath, f)
-            out[str(p.relative_to(d))] = p.read_bytes()
+            rel = str(p.relative_to(d))
+            # The prune's own lock in the run's repository is housekeeping.
+            if rel != "repo/leerie-worktree.lock":
+                out[rel] = p.read_bytes()
     return out
 
 
@@ -89,11 +96,12 @@ def test_idle_dead_runs_lose_worktrees_only(leerie, env):
     assert _snapshot_outside_worktrees(idle) == before
     assert rep["bytes"] >= 10000
     assert rep["errors"] == 0
-    # Its registration in the shared `.git` went with it; its branch stays.
-    assert "idle1-feat-001" not in os.listdir(repo / ".git" / "worktrees")
+    # Its registration in the run's repository went with it; its branch
+    # stays.
+    assert "idle1-feat-001" not in os.listdir(idle / "repo" / "worktrees")
     assert _git("show-ref", "--verify", "-q",
                 "refs/heads/leerie/subtasks/idle1/feat-001",
-                cwd=repo).returncode == 0
+                cwd=idle / "repo").returncode == 0
 
 
 def test_live_recent_and_self_runs_are_untouched(leerie, env):

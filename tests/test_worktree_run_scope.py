@@ -197,44 +197,58 @@ def test_the_shell_prune_rechecks_before_deleting(tmp_path):
         "a live worktree's registration was deleted on a stale verdict")
 
 
+def _run_repository(repo: Path, state: Path, rid: str) -> Path:
+    """The run's own bare repository, `<run-dir>/repo` (DESIGN §6 *The run's
+    own repository*), with its run branch: the registry the Python prune
+    reads. Without one it prunes nothing (§6 *The explicit channel*)."""
+    run_repo = state / "runs" / rid / "repo"
+    run_repo.parent.mkdir(parents=True)
+    _git("clone", "-q", "--bare", str(repo), str(run_repo), cwd=repo)
+    _git("branch", f"leerie/runs/{rid}", "main", cwd=run_repo)
+    return run_repo
+
+
+def _bare_admin_names(run_repo: Path) -> set[str]:
+    d = run_repo / "worktrees"
+    return {p.name for p in d.iterdir()} if d.is_dir() else set()
+
+
 def test_the_python_prune_rechecks_before_deleting(tmp_path, leerie,
                                                    monkeypatch):
     repo, state = _repo(tmp_path), tmp_path / "state"
-    _git("branch", "leerie/runs/rpy", "main", cwd=repo)
-    r = _script("new-worktree.sh", repo, state, "live-001", "rpy")
+    run_repo = _run_repository(repo, state, "rpy")
+    r = _script("new-worktree.sh", run_repo, state, "live-001", "rpy")
     assert r.returncode == 0, r.stderr
     fake = _fake_git_reporting_live_entry(tmp_path, "rpy-live-001")
-    monkeypatch.chdir(repo)
     monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
     leerie._prune_leerie_worktrees(state / "runs" / "rpy")
-    assert "rpy-live-001" in _admin_names(repo)
+    assert "rpy-live-001" in _bare_admin_names(run_repo)
     # Control: once the worktree is really gone, the same prune removes it.
     shutil.rmtree(state / "runs" / "rpy" / "worktrees" / "rpy-live-001")
     leerie._prune_leerie_worktrees(state / "runs" / "rpy")
-    assert "rpy-live-001" not in _admin_names(repo)
+    assert "rpy-live-001" not in _bare_admin_names(run_repo)
 
 
 def test_the_python_prune_skips_when_the_repo_lock_is_held(tmp_path, leerie,
                                                            monkeypatch):
     import fcntl
     repo, state = _repo(tmp_path), tmp_path / "state"
-    _git("branch", "leerie/runs/rlk", "main", cwd=repo)
-    r = _script("new-worktree.sh", repo, state, "gone-001", "rlk")
+    run_repo = _run_repository(repo, state, "rlk")
+    r = _script("new-worktree.sh", run_repo, state, "gone-001", "rlk")
     assert r.returncode == 0, r.stderr
     shutil.rmtree(Path(r.stdout.strip().splitlines()[-1]))
-    monkeypatch.chdir(repo)
     monkeypatch.setattr(leerie, "_WORKTREE_LOCK_WAIT_SEC", 0.3)
-    fd = os.open(str(repo / ".git" / "leerie-worktree.lock"),
+    fd = os.open(str(run_repo / "leerie-worktree.lock"),
                  os.O_WRONLY | os.O_CREAT)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         leerie._prune_leerie_worktrees(state / "runs" / "rlk")
-        assert "rlk-gone-001" in _admin_names(repo), (
+        assert "rlk-gone-001" in _bare_admin_names(run_repo), (
             "pruned without the repository lock")
     finally:
         os.close(fd)
     leerie._prune_leerie_worktrees(state / "runs" / "rlk")
-    assert "rlk-gone-001" not in _admin_names(repo)
+    assert "rlk-gone-001" not in _bare_admin_names(run_repo)
 
 
 def test_a_pre_prefix_worktree_is_moved_with_its_uncommitted_work(tmp_path):

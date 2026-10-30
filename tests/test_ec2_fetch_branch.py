@@ -394,8 +394,11 @@ def test_fetch_state_ec2_skips_bundle_and_preserves_no_push_when_branch_missing(
 
 
 def test_fetch_state_ec2_streams_config_and_dockerfile_to_host(tmp_path):
-    """Step 4: .leerie/config.toml and .leerie/Dockerfile stream back
-    when the host has neither."""
+    """Step 4: the run's recorded capture (its run directory came home with
+    the state stream-back) is applied to the user's .leerie/config.toml, and
+    .leerie/Dockerfile streams back when the host has none. The instance's
+    own config.toml is not streamed (DESIGN §6½ *The host applies a
+    capture*)."""
     repo = _make_git_repo(tmp_path)
     instance_root, instance_work = _setup_instance(tmp_path)
 
@@ -403,8 +406,11 @@ def test_fetch_state_ec2_streams_config_and_dockerfile_to_host(tmp_path):
     run_branch = f"leerie/runs/{run_id}"
     _init_instance_repo_with_run(instance_work, run_id, run_branch)
 
-    (instance_work / ".leerie" / "config.toml").write_text("[config]\nsetup_packages = ['curl']\n")
+    (instance_work / ".leerie" / "config.toml").write_text('setup_packages = "stale"\n')
     (instance_work / ".leerie" / "Dockerfile").write_text("FROM debian:13\n")
+    (instance_work / ".leerie" / "runs" / run_id / "captured-deps.json").write_text(
+        json.dumps([{"from_run": run_id, "setup_packages": ["curl"],
+                     "language_installs": [], "replace": False}]))
 
     exec_log = tmp_path / "exec_log.txt"
     _make_stub_aws(tmp_path / "aws", exec_log, instance_work)
@@ -413,14 +419,14 @@ def test_fetch_state_ec2_streams_config_and_dockerfile_to_host(tmp_path):
 
     result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
-        env=_base_env(tmp_path, repo),
+        env={**_base_env(tmp_path, repo),
+             "LEERIE_REPO": str(Path(__file__).resolve().parent.parent)},
     )
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
 
     host_leerie = repo / ".leerie"
-    assert (host_leerie / "config.toml").exists()
-    assert (host_leerie / "Dockerfile").exists()
-    assert (host_leerie / "config.toml").read_text() == "[config]\nsetup_packages = ['curl']\n"
+    assert (host_leerie / "config.toml").read_text().endswith(
+        'setup_packages = "curl"\n')
     assert (host_leerie / "Dockerfile").read_text() == "FROM debian:13\n"
 
 

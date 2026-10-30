@@ -519,17 +519,19 @@ see `scripts/remote/lib.sh`'s comment.
 The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
 discovery, bundle fetch, run-state tar, `no_push` strip, and baseline Step
-4 stream-back (both files streamed when host has neither, never clobbers
-an existing host file, non-fatal on absent machine files, respects
-`LEERIE_STATE_HOST_DIR`) via bash-harness subprocess tests with a stubbed
-`flyctl`. The expanded Step 4 best-effort `.leerie/` stream-back contracts
-are covered by `tests/test_fetch_branch_leerie_streamback.py` (imports
-stub helpers from `test_fetch_branch_sh` to avoid duplication): streams
-both files when host has neither, never clobbers an existing
-`config.toml`, never clobbers an existing `Dockerfile`, non-fatal when
-machine files are absent, streams only the present machine file when only
-one exists, skips both when both host files exist, and respects
-`LEERIE_STATE_HOST_DIR` for the destination root.
+4 stream-back (the Dockerfile streamed when the host has none, a machine
+`config.toml` not streamed, never clobbers an existing host file, non-fatal
+on absent machine files, respects `LEERIE_STATE_HOST_DIR`) via bash-harness
+subprocess tests with a stubbed `flyctl`. The expanded Step 4 contracts are
+covered by `tests/test_fetch_branch_leerie_streamback.py` (imports stub
+helpers from `test_fetch_branch_sh` to avoid duplication): the run's
+recorded capture (`captured-deps.json`, home with the run directory) is
+merged into the user's `.leerie/config.toml` and the Dockerfile streamed;
+a hand-edited config is merged with, not clobbered; an existing Dockerfile
+is never clobbered; non-fatal when nothing is there; a machine
+`config.toml` is not streamed; `LEERIE_STATE_HOST_DIR` takes the run
+directory and the Dockerfile while the capture still goes to the user's
+checkout (DESIGN §6½ *The host applies a capture*).
 
 The `leerie config` verb (all four sub-modes: `--init`, bare, `--chat`,
 `--recapture`) is tested in `tests/test_config_verb.py` via a
@@ -5746,6 +5748,22 @@ checkout, whose uncommitted file stays untouched.
   in its own repository (M1); a mid-run branch switch brings no other
   commit in (L1); a crash-left scratch directory is removed (L2). Real git,
   real scripts and helpers.
+- `tests/test_work_read_only.py` (17 tests, DESIGN §6 *The explicit
+  channel: the user's checkout is mounted read-only*): the launcher mounts
+  `$USER_REPO:/work:ro` and keeps the state root out of it; a worker-style
+  write to a read-only bind mount fails while the run's reads work (skipped
+  where unprivileged user namespaces are refused) and, with
+  `LEERIE_TEST_CONTAINER_IMAGE` set, the same through the real
+  `container-entry.sh` in a real container; the entry's `chown` runs only on
+  a writable `/work` (its mount-table read, four shapes); capture inside the
+  container records into the run directory and leaves the checkout alone,
+  every in-container seam passes `record_in`, the host apply merges against
+  the user's current config once and keeps an unreadable file, and both
+  `host_apply_captured_deps` and the launcher's EXIT-trap function apply the
+  ran run's capture only; phase 1½'s hook and `mise` run in a removed
+  throwaway checkout; the checkout snapshot never rewrites the user's index;
+  with no run repository the prune and the abnormal-exit clean-up write
+  nothing in the cwd's `.git`.
 - `tests/test_run_repo_bring_back.py` (19 tests): `host_bring_back_run_branch`
   brings the run branch back from the run's repository into the user's as
   leerie's own git (hooks off, no `FETCH_HEAD`), as a compare-and-swap

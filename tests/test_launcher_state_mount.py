@@ -125,14 +125,16 @@ def test_state_dir_env_in_nerdctl_argv(tmp_path):
 
 
 def test_work_mount_still_present(tmp_path):
-    """-v <user-repo>:/work is present alongside the state mount."""
+    """-v <user-repo>:/work:ro is present alongside the state mount: the
+    user's checkout is read-only in the container (DESIGN §6 *The explicit
+    channel*)."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     user_repo = tmp_path / "myproject"
     user_repo.mkdir()
 
     tokens, _ = _run(user_repo, fake_home, {}, [])
-    expected_work = f"{user_repo}:/work"
+    expected_work = f"{user_repo}:/work:ro"
     assert expected_work in tokens, (
         f"Expected -v token '{expected_work}' not found in nerdctl argv.\n"
         f"Got tokens: {tokens}"

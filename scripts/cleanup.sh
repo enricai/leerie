@@ -65,12 +65,14 @@ clean_one_run() {
   # repository at the cwd.
   if [ -f "${run_dir}/repo/HEAD" ]; then
     run_dir="$(cd "$run_dir" && pwd -P)"
-    # Named, never discovered (safe.bareRepository=explicit).
-    ( LEERIE_GIT_DIR="${run_dir}/repo"; export LEERIE_GIT_DIR
-      _clean_one_run_here "$run_id" "$branch_scope" "$run_dir" )
+    # Named, never discovered (safe.bareRepository=explicit). A temporary
+    # assignment: in effect for the function and every command it runs,
+    # gone after it, so no subshell is needed.
+    LEERIE_GIT_DIR="${run_dir}/repo" \
+      _clean_one_run_here "$run_id" "$branch_scope" "$run_dir"
     return
   fi
-  ( unset LEERIE_GIT_DIR; _clean_one_run_here "$run_id" "$branch_scope" "$run_dir" )
+  LEERIE_GIT_DIR="" _clean_one_run_here "$run_id" "$branch_scope" "$run_dir"
 }
 
 _clean_one_run_here() {
