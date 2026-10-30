@@ -8555,7 +8555,12 @@ Unchanged, on `st.repo_root` (the user's checkout, read-only git): `_preflight_r
 
     The rebase worktree is added there, and nothing is registered in `$USER_REPO`. The scratch-ref fetch-back runs with hooks off. After `rebased`, `refs/remotes/origin/<pr-base>` is fetched from it into `$USER_REPO`. `rm -rf` of the scratch directory removes the repository with the worktree.
 - `leerie` launcher:
-  - after `nerdctl run` returns, before the skip on a non-zero exit or `--no-push` (local runtime only), `host_bring_back_run_branch` for the run named in the run-id file, and for no other. The file is `$LEERIE_STATE_HOST_DIR/.runid-$$`. It is removed before `nerdctl run` and by the EXIT traps, and passed as `-e LEERIE_RUN_ID_FILE=/leerie-state/.runid-$$`;
+  - after `nerdctl run` returns, the launcher reads the run-id file once (local runtime only) into `_ran_run_id`. A first line that is not a run id (`[A-Za-z0-9._-]`, no leading dot) counts as no file. Every post-exit step reads that variable, and nothing else names the run:
+    - `host_bring_back_run_branch` for that run, before the skip on a non-zero exit or `--no-push`;
+    - the "finalize: skipped … (run <id>)" line, which carries no run when there is no file;
+    - the auto-finalize, which calls `host_finalize` on `runs/<_ran_run_id>` when its `run.json` has `finished_at`, `branch` and `working_branch` and no `pushed_at`, and otherwise says why and exits 0. It replaced the scan for the newest unpushed finished `run.json` under the state root, which with two runs could push the other one.
+
+    The run is the one named in the run-id file, and no other. The file is `$LEERIE_STATE_HOST_DIR/.runid-$$`. It is removed before `nerdctl run` and by the EXIT traps, and passed as `-e LEERIE_RUN_ID_FILE=/leerie-state/.runid-$$`;
   - `finalize` (local), before its branch-exists check;
   - `prune --apply` (`_bring_back`, the same bash function through `LEERIE_PRUNE_HOST_FINALIZE`), before deleting a terminal run directory that has `repo/`. On a non-zero return the directory is kept and reported. `prune` keeps its user-registry deregistration and `leerie/subtasks/*` deletion for runs made before the change.
 - `scripts/remote/fetch-branch.sh` and `ec2-fetch-branch.sh` read the run branch and subtask refs, and bundle, from `/work/.leerie/runs/<id>/repo`. Their state tar has `--exclude=<id>/repo`.

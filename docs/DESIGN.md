@@ -1937,13 +1937,27 @@ leerie's own enumerated git:
   - The orchestrator writes the run id there as soon as it holds that
     run's directory. That is the moment the run is its, after
     `resolve_run_id` and the `State` flock.
-  - After the container exits, the launcher reads that file, and nothing
-    else, to choose the run it brings back.
+  - After the container exits, every post-exit step of the launcher reads
+    that file, and nothing else, to know its run:
+    - the bring-back;
+    - the "finalize: skipped … (run <id>)" line;
+    - the auto-finalize (push and PR).
+
+    The last two used to guess. The skip line read `--run-id`, or the
+    cidfile, which names the container rather than a run. The auto-finalize
+    pushed the *newest* unpushed finished run under the state root. With
+    two runs in one repository, that was whichever had written its run.json
+    last, so it could push another run, finished or still running, instead
+    of the one this container ran. Now the auto-finalize finalizes the run
+    the file names, and only when it is finished and unpushed. The same
+    checks as before apply: `finished_at` and the run identity are set, and
+    `pushed_at` is not.
 
   The orchestrator's own resolution is the one source of "which run". The
   launcher does no resolution of its own, so the two cannot disagree. No
-  file means the container ran no run, for example a preflight refusal,
-  and nothing is brought back: there is no scan for a run to guess. The
+  file means the container ran no run, for example a preflight refusal:
+  nothing is brought back or finalized, and the skip line names no run.
+  There is no scan for a run to guess. The
   file lives in the state root the container already writes, so no mount
   or ownership change is needed on any runtime. Fly and EC2 never set the
   variable: their branch comes back through `fetch_branch`.
@@ -13776,8 +13790,8 @@ The group launcher runs on the laptop (the same node as chain fan-out, §19):
 it mints a `group_id`, fans out one leerie invocation per member (each
 `cd`'d into the member's repo), waits, then tags each member's `run.json`
 with the shared `group_id` — discovered from each member's basename-keyed
-state dir via the same newest-`finished_at` scan local finalize already
-uses. No coordinator machine, no in-container group state, no cross-machine
+state dir via a newest-`finished_at` scan of that state dir (the member's
+own orchestrator also writes `group_id` into its run.json at run start). No coordinator machine, no in-container group state, no cross-machine
 protocol; GitHub is touched only host-side, per member, by that member's own
 `host_finalize`.
 

@@ -153,7 +153,7 @@ def test_every_launcher_path_calls_the_bring_back():
     (before the skip on a non-zero exit or --no-push), `finalize` (local),
     and `prune` before it deletes a run dir; plus `host_finalize` itself."""
     src = LAUNCHER.read_text()
-    post = src.index('host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_bb_run_id"')
+    post = src.index('host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id"')
     skip = src.index('if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then')
     assert post < skip
     assert 'host_bring_back_run_branch "$_fin_run_dir"' in src
@@ -207,12 +207,23 @@ def test_prune_keeps_a_run_whose_branch_cannot_come_back(run, tmp_path):
 
 # --- which run the container ran (DESIGN §6 *Which run the container ran*)
 
+SKIP_LINE = 'if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then\n'
+
+
 def _bring_back_block() -> str:
-    """The launcher's post-run bring-back block, verbatim."""
+    """The launcher's post-run run-id read and bring-back, verbatim: from
+    the read of the run-id file up to the skip on a failed exit."""
     src = LAUNCHER.read_text()
-    start = src.index('_bb_run_id=""\n')
-    end = src.index("unset _bb_run_id\n", start) + len("unset _bb_run_id\n")
-    return src[start:end]
+    start = src.index('_ran_run_id=""\n')
+    return src[start:src.index(SKIP_LINE, start)]
+
+
+def _post_exit_block() -> str:
+    """Every post-exit step, verbatim: the read, the bring-back, the skip
+    line and the auto-finalize, up to the Fly comment that follows them."""
+    src = LAUNCHER.read_text()
+    start = src.index('_ran_run_id=""\n')
+    return src[start:src.index("# Fly path: decide_teardown", start)]
 
 
 def _post_run(user: Path, state_root: Path, run_id_file: Path,
@@ -274,3 +285,128 @@ def test_the_launcher_names_the_file_and_the_container_gets_it():
     deny = src[src.index('_leerie_env_denylist=" \\'):]
     deny = deny[:deny.index('"\n')]
     assert " LEERIE_RUN_ID_FILE " in deny.replace("\\\n", " ")
+
+
+# --- auto-finalize: the run this container ran, never another -------------
+
+def _finalize_env(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A state root and a stand-in `scripts/host-finalize.sh` that records
+    which run directory `host_finalize` was handed (the push itself is
+    host-finalize's own, tested elsewhere)."""
+    state = tmp_path / "state"
+    (state / "runs").mkdir(parents=True)
+    fake = tmp_path / "fake-leerie"
+    (fake / "scripts").mkdir(parents=True)
+    log = tmp_path / "finalized.log"
+    (fake / "scripts" / "host-finalize.sh").write_text(
+        f'host_finalize() {{ echo "$1" >> "{log}"; }}\n'
+        "host_bring_back_run_branch() { :; }\n")
+    return state, fake, log
+
+
+def _a_run(state: Path, run_id: str, **fields) -> Path:
+    d = state / "runs" / run_id
+    d.mkdir()
+    (d / "run.json").write_text(json.dumps(
+        {"run_id": run_id, "branch": f"leerie/runs/{run_id}",
+         "working_branch": "main", **fields}))
+    return d
+
+
+def _post_exit(tmp_path, state, fake, *, ran: str | None, rc: int = 0,
+               leerie_run_id: str = "", cid: str = ""):
+    rid = state / ".runid-test"
+    if ran is not None:
+        rid.write_text(ran + "\n")
+    cidfile = state / ".cidfile-test"
+    if cid:
+        cidfile.write_text(cid)
+    script = (f"set -euo pipefail\n. {REPO_ROOT / 'scripts/remote/_log.sh'}\n"
+              f"RUNTIME=local\ncontainer_rc={rc}\nNO_PUSH=false\n"
+              f'LEERIE_RUN_ID="{leerie_run_id}"\n_cidfile="{cidfile}"\n'
+              f'_run_id_file="{rid}"\n' + _post_exit_block())
+    return subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(tmp_path),
+             "USER_REPO": str(tmp_path), "LEERIE_REPO": str(fake),
+             "LEERIE_STATE_HOST_DIR": str(state)},
+        capture_output=True, text=True)
+
+
+def _finalized(log: Path) -> list[str]:
+    return log.read_text().split() if log.exists() else []
+
+
+def test_two_runs_auto_finalize_takes_the_one_this_container_ran(tmp_path):
+    """Two finished, unpushed runs of one repository; the NEWER run.json is
+    the other run's. This container ran the older one — that is the one
+    finalized. The newest-unpushed rule this replaced pushed the other."""
+    import os
+    state, fake, log = _finalize_env(tmp_path)
+    mine = _a_run(state, "older-run", finished_at="2026-10-30T01:00:00Z")
+    other = _a_run(state, "newer-run", finished_at="2026-10-30T02:00:00Z")
+    os.utime(mine / "run.json", (1_000_000, 1_000_000))
+    os.utime(other / "run.json", (2_000_000, 2_000_000))
+    r = _post_exit(tmp_path, state, fake, ran="older-run",
+                   leerie_run_id="newer-run", cid="newer-run")
+    assert r.returncode == 0, r.stderr
+    assert _finalized(log) == [str(mine)]
+
+
+def test_another_run_still_running_is_never_finalized(tmp_path):
+    """This container's run is not finished; a second run is finished and
+    unpushed. Nothing is finalized — not the other run."""
+    state, fake, log = _finalize_env(tmp_path)
+    _a_run(state, "mine")
+    _a_run(state, "theirs", finished_at="2026-10-30T02:00:00Z")
+    r = _post_exit(tmp_path, state, fake, ran="mine")
+    assert r.returncode == 0, r.stderr
+    assert _finalized(log) == []
+    assert "run mine is not finished" in r.stderr
+
+
+def test_no_run_named_finalizes_nothing(tmp_path):
+    """No run-id file (the container ran no run): no finalize, whatever is
+    on disk and whatever `--run-id` or the cidfile say."""
+    state, fake, log = _finalize_env(tmp_path)
+    _a_run(state, "some-run", finished_at="2026-10-30T02:00:00Z")
+    r = _post_exit(tmp_path, state, fake, ran=None,
+                   leerie_run_id="some-run", cid="some-run")
+    assert r.returncode == 0, r.stderr
+    assert _finalized(log) == []
+    assert "named no run" in r.stderr
+
+
+def test_an_already_pushed_run_is_not_finalized_again(tmp_path):
+    state, fake, log = _finalize_env(tmp_path)
+    _a_run(state, "mine", finished_at="2026-10-30T02:00:00Z",
+           pushed_at="2026-10-30T03:00:00Z")
+    r = _post_exit(tmp_path, state, fake, ran="mine")
+    assert r.returncode == 0
+    assert _finalized(log) == []
+
+
+def test_the_skip_line_names_the_run_from_the_file_only(tmp_path):
+    """A failed exit: the line names the run the file names, never the
+    `--run-id` or the cidfile; with no file it names none."""
+    state, fake, _log = _finalize_env(tmp_path)
+    r = _post_exit(tmp_path, state, fake, ran="mine", rc=1,
+                   leerie_run_id="other", cid="containerid")
+    assert r.returncode == 1
+    assert r.stderr.rstrip().endswith(
+        "finalize: skipped — container exited with code 1 (run mine)")
+    (state / ".runid-test").unlink()
+    r = _post_exit(tmp_path, state, fake, ran=None, rc=1,
+                   leerie_run_id="other", cid="containerid")
+    assert r.stderr.rstrip().endswith(
+        "finalize: skipped — container exited with code 1")
+
+
+def test_no_post_exit_step_names_the_run_another_way():
+    """Structural, paired with the behavioural tests above: after the
+    container exits, nothing in the launcher reads `--run-id`, the cidfile
+    or a scan of runs to know its run."""
+    block = _post_exit_block()
+    assert "LEERIE_RUN_ID" not in block
+    assert "_cidfile" not in block
+    assert "runs/*/" not in block and "mtime" not in block

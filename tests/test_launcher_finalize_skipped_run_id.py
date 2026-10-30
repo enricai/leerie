@@ -65,27 +65,44 @@ def test_block_uses_remote_log_not_bare_echo():
     assert 'echo "[leerie] finalize: skipped' not in BLOCK
 
 
-def test_block_reads_run_id_from_leerie_run_id_or_cidfile():
-    assert "LEERIE_RUN_ID" in BLOCK
-    assert "$_cidfile" in BLOCK
+def test_block_reads_the_run_the_container_named():
+    """The run is the one the orchestrator named in the launcher's run-id
+    file (DESIGN §6 *Which run the container ran*), read once before this
+    block into `_ran_run_id`. `--run-id` and the cidfile (which names the
+    container, not a run) are never read here."""
+    assert "$_ran_run_id" in BLOCK
+    assert "LEERIE_RUN_ID" not in BLOCK
+    assert "_cidfile" not in BLOCK
+
+
+def _read_block() -> str:
+    """The launcher's read of the run-id file, verbatim."""
+    src = LAUNCHER.read_text()
+    start = src.index('_ran_run_id=""\n')
+    end = src.index("fi\n", src.index("_run_id_file:-", start)) + 3
+    return src[start:end]
 
 
 def _run(container_rc: str, no_push: str = "false", leerie_run_id: str = "",
-          cidfile_content: str | None = None, tmp_path: Path | None = None) -> str:
+         cidfile_content: str | None = None, run_id_file: str | None = None,
+         tmp_path: Path | None = None) -> str:
     env = {"PATH": "/usr/bin:/bin"}
-    cidfile_path = ""
+    assert tmp_path is not None
+    cidfile = tmp_path / "cidfile"
     if cidfile_content is not None:
-        assert tmp_path is not None
-        cidfile = tmp_path / "cidfile"
         cidfile.write_text(cidfile_content)
-        cidfile_path = str(cidfile)
-
+    rid = tmp_path / "runid"
+    if run_id_file is not None:
+        rid.write_text(run_id_file + "\n")
     script = (
         f"source {LOG_SH}; "
+        f'RUNTIME=local; '
         f'container_rc="{container_rc}"; '
         f'NO_PUSH="{no_push}"; '
         f'LEERIE_RUN_ID="{leerie_run_id}"; '
-        f'_cidfile="{cidfile_path}"; '
+        f'_cidfile="{cidfile}"; '
+        f'_run_id_file="{rid}"\n'
+        f"{_read_block()}\n"
         f"{BLOCK}"
     )
     r = subprocess.run(
@@ -97,34 +114,32 @@ def _run(container_rc: str, no_push: str = "false", leerie_run_id: str = "",
     return r.stderr.rstrip("\n")
 
 
-def test_includes_run_id_from_leerie_run_id_when_set(tmp_path):
-    out = _run(container_rc="1", leerie_run_id="run-explicit-123", tmp_path=tmp_path)
+def test_includes_the_run_the_container_named(tmp_path):
+    out = _run(container_rc="1", run_id_file="run-ran-123", tmp_path=tmp_path)
     m = PREFIX_RE.match(out)
     assert m, f"no prefix match: {out!r}"
-    assert "run-explicit-123" in m.group("body")
+    assert "run-ran-123" in m.group("body")
     assert "finalize: skipped" in m.group("body")
 
 
-def test_falls_back_to_cidfile_when_leerie_run_id_unset(tmp_path):
-    out = _run(container_rc="1", leerie_run_id="", cidfile_content="abc123containerid",
+def test_the_named_run_wins_over_run_id_and_cidfile(tmp_path):
+    """A bare `resume` that auto-picked: `--run-id` is unset or another
+    run, the cidfile names the new container. Only the named run appears."""
+    out = _run(container_rc="1", leerie_run_id="run-explicit-123",
+               cidfile_content="abc123containerid", run_id_file="run-ran-123",
                tmp_path=tmp_path)
     m = PREFIX_RE.match(out)
-    assert m, f"no prefix match: {out!r}"
-    assert "abc123containerid" in m.group("body")
-
-
-def test_leerie_run_id_wins_over_cidfile(tmp_path):
-    out = _run(container_rc="1", leerie_run_id="run-explicit-123",
-               cidfile_content="abc123containerid", tmp_path=tmp_path)
-    m = PREFIX_RE.match(out)
     assert m
-    assert "run-explicit-123" in m.group("body")
+    assert "run-ran-123" in m.group("body")
+    assert "run-explicit-123" not in m.group("body")
     assert "abc123containerid" not in m.group("body")
 
 
-def test_no_run_id_available_still_emits_plain_message(tmp_path):
-    out = _run(container_rc="1", leerie_run_id="", cidfile_content=None,
-               tmp_path=tmp_path)
+def test_no_named_run_emits_the_plain_message(tmp_path):
+    """No run-id file (the container ran no run): no run in the line, even
+    with `--run-id` and a cidfile present."""
+    out = _run(container_rc="1", leerie_run_id="run-explicit-123",
+               cidfile_content="abc123containerid", tmp_path=tmp_path)
     m = PREFIX_RE.match(out)
     assert m, f"no prefix match: {out!r}"
     assert m.group("body") == "finalize: skipped — container exited with code 1"

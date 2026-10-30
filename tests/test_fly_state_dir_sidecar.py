@@ -67,12 +67,13 @@ def test_launcher_sidecar_writes_use_state_host_dir():
 
 
 def test_launcher_local_finalize_uses_state_host_dir():
-    """The local-runtime post-run finalize block must scan
-    LEERIE_STATE_HOST_DIR/runs/, not USER_REPO/.leerie/runs/."""
+    """The local-runtime post-run finalize reads the run the container ran
+    under LEERIE_STATE_HOST_DIR/runs/, not USER_REPO/.leerie/runs/ (it no
+    longer scans for run.json files: DESIGN §6 *Which run the container
+    ran*)."""
     launcher = LEERIE.read_text()
-    # The local-runtime finalize scans for run.json files.
     assert (
-        'if [ -d "$LEERIE_STATE_HOST_DIR/runs" ]'
+        '_ran_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id"'
         in launcher
     ), (
         "Local-runtime finalize must check LEERIE_STATE_HOST_DIR/runs/, "

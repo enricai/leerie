@@ -9227,101 +9227,77 @@ fi
 # the HOST so the host's working auth state (gh token, ssh-agent,
 # Keychain) is what authenticates — no in-container forwarding required.
 #
-# **Local runtime only.** On the Fly path the run dir is NOT yet on the
-# host when we reach this block — the stream-back happens inside
-# `decide_teardown` (an EXIT trap in scripts/remote/provision.sh) that
-# fires *after* this code returns. If we let this block run on Fly it
-# always finds nothing (LATEST_RUN_DIR is empty, exits 0), then the
-# trap syncs and destroys the machine without ever pushing. So: on
-# Fly, finalize happens inside `decide_teardown` (it sources the same
-# scripts/host-finalize.sh and calls host_finalize directly). On
-# local, finalize happens here.
+# **Local runtime only.** On the Fly and EC2 paths the run dir is NOT yet
+# on the host when we reach this block — the stream-back happens inside
+# `decide_teardown` / `decide_ec2_teardown` (EXIT traps in
+# scripts/remote/provision.sh and ec2-provision.sh) that fire *after* this
+# code returns, and finalize happens there (they source the same
+# scripts/host-finalize.sh and call host_finalize directly). On local,
+# finalize happens here, for the run the container named.
 #
 # Skip if:
 #   - container exited non-zero (run failed; nothing to push)
 #   - --no-push set (the user explicitly opted out)
 #   - the structured-exit code (EXIT_NEEDS_ANSWERS=10) — the launcher's
 #     plugin re-runs leerie with --answers after the user responds.
+# Which run this container ran (DESIGN §6 *Which run the container ran*):
+# the one the orchestrator named in the run-id file — a fresh run,
+# `resume <id>` and a bare `resume`'s own pick alike. Read once, here; every
+# post-exit step below reads `_ran_run_id` and nothing else names the run
+# (not `--run-id`, not the cidfile, not the newest run on disk). No file, or
+# a first line that is no run id: the container ran no run.
+_ran_run_id=""
+if [ "$RUNTIME" = "local" ] && [ -f "${_run_id_file:-}" ]; then
+  _ran_run_id="$(head -n 1 "$_run_id_file" 2>/dev/null || true)"
+  case "$_ran_run_id" in
+    ''|*[!A-Za-z0-9._-]*|.*) _ran_run_id="" ;;
+  esac
+fi
 # Bring the run branch back from the run's own repository into yours
 # (DESIGN §6 *The run's own repository*) after every local run, whatever its
 # exit code and with or without --no-push: the branch is the run's record
-# for you. The run is the one the orchestrator named in the run-id file
-# (*Which run the container ran*) — a fresh run, `resume <id>` and a bare
-# `resume`'s own pick alike. No file: the container ran no run, and nothing
-# is brought back.
-_bb_run_id=""
-if [ "$RUNTIME" = "local" ] && [ -f "${_run_id_file:-}" ]; then
-  _bb_run_id="$(head -n 1 "$_run_id_file" 2>/dev/null || true)"
-  case "$_bb_run_id" in
-    ''|*[!A-Za-z0-9._-]*|.*) _bb_run_id="" ;;
-  esac
-fi
-if [ -n "$_bb_run_id" ]; then
-  if [ -f "$LEERIE_STATE_HOST_DIR/runs/$_bb_run_id/repo/HEAD" ]; then
+# for you.
+if [ -n "$_ran_run_id" ]; then
+  if [ -f "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id/repo/HEAD" ]; then
     # shellcheck source=scripts/host-finalize.sh
     . "$LEERIE_REPO/scripts/host-finalize.sh"
-    host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_bb_run_id" || true
+    host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
   fi
 fi
-unset _bb_run_id
 if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
   if [ "$container_rc" -ne 0 ]; then
-    # Prefer the explicit/positional run id (--run-id / `resume <id>`)
-    # when known; fall back to the local container id (the run id for a
-    # fresh local run — DESIGN §6) read from the cidfile this launcher
-    # invocation wrote. Neither is set on the Fly/EC2 paths, where this
-    # message is unreachable in practice (see the comment above).
-    _finalize_skip_run_id="${LEERIE_RUN_ID:-}"
-    if [ -z "$_finalize_skip_run_id" ] && [ -f "${_cidfile:-}" ]; then
-      _finalize_skip_run_id="$(cat "$_cidfile" 2>/dev/null)"
-    fi
-    if [ -n "$_finalize_skip_run_id" ]; then
-      remote_log "finalize: skipped — container exited with code $container_rc (run $_finalize_skip_run_id)"
+    if [ -n "$_ran_run_id" ]; then
+      remote_log "finalize: skipped — container exited with code $container_rc (run $_ran_run_id)"
     else
       remote_log "finalize: skipped — container exited with code $container_rc"
     fi
-    unset _finalize_skip_run_id
   fi
   exit "$container_rc"
 fi
 
-if [ "$RUNTIME" != "fly" ]; then
-  # Locate the most-recent run dir under .leerie/runs/ that has a run.json
-  # with finished_at set. The orchestrator writes run.json at finalize.
-  # `find` + sort isn't portable with -printf; iterate and pick newest.
-  LATEST_RUN_DIR=""
-  LATEST_RUN_MTIME=0
-  if [ -d "$LEERIE_STATE_HOST_DIR/runs" ]; then
-    for run_json in "$LEERIE_STATE_HOST_DIR"/runs/*/run.json; do
-      [ -f "$run_json" ] || continue
-      # finished_at must be present and non-null.
-      if [ "$(jq -r '.finished_at // ""' "$run_json")" = "" ]; then
-        continue
-      fi
-      # pushed_at must be absent or null — otherwise this run was already
-      # pushed (e.g. on a previous launcher invocation).
-      if [ "$(jq -r '.pushed_at // ""' "$run_json")" != "" ]; then
-        continue
-      fi
-      # branch and working_branch must both be present — a run.json
-      # without them was created by the die() handler before
-      # phase_classify completed (orchestrator/leerie.py:15116); it
-      # cannot be finalized.
-      if [ "$(jq -r '.branch // ""' "$run_json")" = "" ] || \
-         [ "$(jq -r '.working_branch // ""' "$run_json")" = "" ]; then
-        continue
-      fi
-      # Use mtime of run.json as the recency proxy.
-      mtime="$(stat -c %Y "$run_json" 2>/dev/null || stat -f %m "$run_json" 2>/dev/null || echo 0)"
-      if [ "$mtime" -gt "$LATEST_RUN_MTIME" ]; then
-        LATEST_RUN_MTIME=$mtime
-        LATEST_RUN_DIR="$(dirname "$run_json")"
-      fi
-    done
+if [ "$RUNTIME" = "local" ]; then
+  # Finalize the run this container ran — never another. The newest
+  # unpushed finished run under the state root, which this used to pick,
+  # could be a second run of the same repository, finished or still
+  # running (DESIGN §6 *Which run the container ran*). It must be finished
+  # (`finished_at`), not yet pushed (`pushed_at`), and carry its identity
+  # (`branch`, `working_branch`: a run.json without them was written by the
+  # die() handler before phase_classify completed and cannot be finalized).
+  if [ -z "$_ran_run_id" ]; then
+    echo "[leerie] finalize: the container named no run; nothing to push" >&2
+    exit 0
   fi
-
-  if [ -z "$LATEST_RUN_DIR" ]; then
-    echo "[leerie] finalize: no unpushed finished run found under $LEERIE_STATE_HOST_DIR/runs/" >&2
+  _ran_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id"
+  _ran_run_json="$_ran_run_dir/run.json"
+  if [ ! -f "$_ran_run_json" ] \
+     || [ "$(jq -r '.finished_at // ""' "$_ran_run_json")" = "" ] \
+     || [ "$(jq -r '.branch // ""' "$_ran_run_json")" = "" ] \
+     || [ "$(jq -r '.working_branch // ""' "$_ran_run_json")" = "" ]; then
+    echo "[leerie] finalize: run $_ran_run_id is not finished; nothing to push" >&2
+    exit 0
+  fi
+  if [ "$(jq -r '.pushed_at // ""' "$_ran_run_json")" != "" ]; then
+    echo "[leerie] finalize: run $_ran_run_id is already pushed" >&2
     exit 0
   fi
 
@@ -9334,7 +9310,7 @@ if [ "$RUNTIME" != "fly" ]; then
   # fast-path; both source scripts/host-finalize.sh and call host_finalize.
   # shellcheck disable=SC1091
   . "$LEERIE_REPO/scripts/host-finalize.sh"
-  host_finalize "$LATEST_RUN_DIR" || exit $?
+  host_finalize "$_ran_run_dir" || exit $?
 fi
 # Fly path: decide_teardown's EXIT trap will source host-finalize.sh and
 # call host_finalize after fetch_branch. Nothing else to do here.
