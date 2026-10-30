@@ -140,7 +140,12 @@ def test_shape3_an_install_that_rewrites_the_lockfile(
     out, sec = _final_and_phase5(leerie, run)
     status = _status(run["staging"])
     assert "pnpm-lock.yaml" not in status
-    assert (run["staging"] / "node_modules").is_dir()   # deps stay
+    # The install ran in staging's committed view (DESIGN §8 *Every
+    # measurement reads the committed view*): its lockfile is put back
+    # there and its dependencies stay there.
+    view = leerie._VIEWS[os.path.realpath(run["staging"])][1]
+    assert "pnpm-lock.yaml" not in _status(view)
+    assert (view / "node_modules").is_dir()             # deps stay
     assert (out, sec) == ("done", "")
     warnings = run["st"].data["conformance"]["_final"].get("warnings") or []
     assert not any("uncommitted change" in w for w in warnings), warnings

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -130,8 +131,23 @@ def env(leerie, tmp_path, monkeypatch):
     assert tree == leerie._subtask_worktree_path(run_dir, "feat-001")
     assert tree != run_dir / "worktrees" / "feat-001"
     _install_fake(tree)
+    # Measurements run in the subtask's committed view, which leerie
+    # installs from the recipe (DESIGN §8 *Every measurement reads the
+    # committed view*): the recipe's install puts the same stand-in there.
+    fake = tmp_path / "fake-vitest"
+    fake.write_text(FAKE_VITEST)
+    install = [sys.executable, "-c",
+               "import os, shutil, sys; "
+               "os.makedirs('node_modules/.bin', exist_ok=True); "
+               "shutil.copy(sys.argv[1], 'node_modules/.bin/vitest'); "
+               "os.chmod('node_modules/.bin/vitest', 0o755); "
+               "os.makedirs('node_modules/@vitest/coverage-v8', "
+               "exist_ok=True)", str(fake)]
     st = leerie.State(leerie_root, run_id)
-    st.data = {"task": "x", "subtask_status": {"feat-001": "complete"}}
+    st.data = {"task": "x", "subtask_status": {"feat-001": "complete"},
+               "provision": {"recipe": [{"kind": "install",
+                                         "command": install,
+                                         "working_dir": "."}]}}
     st.save()
     caps = dict(leerie.DEFAULT_CAPS)
     caps["worker_timeout_sec"] = 60
@@ -219,8 +235,10 @@ def test_importing_test_settles_lines_but_a_mocking_one_does_not(leerie,
 
 
 def test_no_vitest_is_unmeasured(leerie, env):
-    import shutil
-    shutil.rmtree(env["tree"] / "node_modules" / "@vitest")
+    # The recipe installs no vitest into the view. The worker's own install
+    # (the stand-in in its tree) is never measured through.
+    env["st"].data["provision"] = {}
+    assert (env["tree"] / "node_modules" / "@vitest").is_dir()
     _commit(env["tree"], {"src/a.ts": A_NEW})
     rec = _measure(env)
     assert rec["measured"] is False

@@ -40403,41 +40403,6 @@ async def _view_ref(st: "State", tree: str | Path) -> str | None:
     return branch if sid and await _ref_sha(str(t), branch) else None
 
 
-def _share_environment(tree: str | Path, view: Path) -> list[str]:
-    """Symlink into `view` every ignored path of `tree` that `view`'s own
-    ignore rules also ignore — committed `.gitignore` files and leerie's
-    settings copies — and return them: the installed environment
-    (`node_modules`, a generated client, build output). A path only an
-    uncommitted `.gitignore` ignores is not shared, so it is not measured
-    (review round 17: a self-ignoring `.gitignore` hid a `helper.py` the
-    measurements ran with and the commit lacked). Paths already in `view`
-    are left alone. A directory keeps its trailing `/` into `check-ignore`:
-    the view does not have it, and a `build/` rule matches only a path git
-    is told is a directory."""
-    cand = [r for r in (_untracked_listing(tree, which="ignored",
-                                           directory=True) or [])
-            if r.rstrip("/") and not os.path.lexists(view / r.rstrip("/"))]
-    if not cand:
-        return []
-    prefix, env = _git_view(view)
-    r = subprocess.run(["git", *prefix, "check-ignore", "--no-index",
-                        "--stdin", "-z"],
-                       input=b"".join(os.fsencode(c) + b"\0" for c in cand),
-                       capture_output=True, check=False, env=env)
-    keep = {x for x in os.fsdecode(r.stdout).split("\0") if x}
-    linked: list[str] = []
-    for raw in cand:
-        if raw not in keep:
-            continue
-        rel = raw.rstrip("/")
-        dst = view / rel
-        with contextlib.suppress(OSError):
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(Path(tree) / rel, dst)
-            linked.append(rel)
-    return linked
-
-
 async def _view_tree_sha(st: "State", tree: str | Path) -> str | None:
     """The tree a measurement of `tree` measured: its branch tip's tree for
     a worker tree (`_view_ref`, what its committed view shows), else
@@ -40453,10 +40418,11 @@ async def _view_tree_sha(st: "State", tree: str | Path) -> str | None:
 async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     """Where a measurement of the worker tree `tree` runs (DESIGN §8 *Every
     measurement reads the committed view*): a detached checkout of its
-    branch tip (`_view_ref`) at `_helper_worktree_path(st, "view-<name>")`,
-    with the tree's environment shared in (`_share_environment`, again on
-    every call, so an install since is seen). Kept while the tip stands,
-    replaced when it moves. None when `tree` is no worker tree: the
+    branch tip (`_view_ref`) at `_helper_worktree_path(st, "view-<name>")`.
+    Nothing is shared in from `tree`: the view's environment and build
+    outputs are leerie's, made in it from the commit (`_measured_tree`).
+    Kept while the tip stands, replaced when it moves, and a replaced
+    view's install memo is dropped with it. None when `tree` is no worker tree: the
     caller measures it as it is. A worker tree whose branch or checkout
     cannot be had stops the run (`die`): measuring the tree itself would be
     measuring what may not ship, the guess this removes."""
@@ -40471,7 +40437,6 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     key = os.path.realpath(tree)
     have = _VIEWS.get(key)
     if have and have[0] == tip and have[1].is_dir():
-        await asyncio.to_thread(_share_environment, tree, have[1])
         return have[1]
     wt = _helper_worktree_path(st, f"view-{Path(key).name}")
 
@@ -40483,15 +40448,34 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
             _rmtree_owned(wt)
     await asyncio.to_thread(_remove)
     _VIEWS.pop(key, None)
+    _DEPS_INSTALLED.discard(os.path.realpath(wt))
+    _DEPS_FAILED.pop(os.path.realpath(wt), None)
     add = await _worktree_add_detached_async(st, wt, tip, repo=Path(tree))
     if add.returncode != 0:
         die(f"the committed view of {tree} cannot be made: `git worktree "
             f"add {wt}` failed ({(add.stderr or '').strip()[:300]}); "
             "`leerie resume` once the cause is fixed (DESIGN §8 *Every "
             "measurement reads the committed view*)")
-    await asyncio.to_thread(_share_environment, tree, wt)
     _VIEWS[key] = (tip, wt)
     return wt
+
+
+async def _measured_tree(st: "State", tree: str | Path, caps: dict, *,
+                         log_path: Path, label: str) -> str:
+    """Where a measurement of `tree` runs: its committed view
+    (`_committed_view`) with the provision recipe's install and build
+    entries applied in it (`_ensure_worktree_deps`, once per view), so the
+    dependencies come from the committed lockfile and the build outputs from
+    the committed sources, never from a tree a worker can write (DESIGN §8
+    *Every measurement reads the committed view*); `tree` itself when it is
+    no worker tree."""
+    view = await _committed_view(st, tree)
+    if view is None:
+        return str(tree)
+    await _ensure_worktree_deps(str(view), st, caps, log_path=log_path,
+                                verbosity="quiet", label_prefix=label,
+                                log_prefix=label)
+    return str(view)
 
 
 async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
@@ -40532,11 +40516,9 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
     `measure_peak` runs each command in an uncapped measurement cgroup and
     records its `peak` (the base-health baseline)."""
     results: dict[str, dict] = {}
-    # A worker tree is measured in its committed view, its environment
-    # shared in; the install still runs in the tree itself, which owns it
+    # A worker tree is measured in its committed view, installed there below
     # (DESIGN §8 *Every measurement reads the committed view*).
-    real = tree
-    view = await _committed_view(st, real)
+    view = await _committed_view(st, tree)
     if view is not None:
         tree = str(view)
     tree_sha = await _worktree_tree_sha(tree) if memo else None
@@ -40597,12 +40579,9 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
 
         if not installed:
             deps_ok = await _ensure_worktree_deps(
-                real, st, caps, log_path=log_path, verbosity=verbosity,
+                tree, st, caps, log_path=log_path, verbosity=verbosity,
                 label_prefix=label_prefix, log_prefix=log_prefix)
             installed = True
-            if view is not None:
-                # What the install made is shared into the view too.
-                await _committed_view(st, real)
             # Installing can write into the worktree (lockfile churn,
             # generated clients), so a sha taken before it may no longer
             # describe the tree. Re-derive once, after the only step that
@@ -41518,11 +41497,11 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     1 s floor: no retry) — so a B* rerun given the budget left never runs
     past it twice (DESIGN §9 *Which failures are new*, step 2). `env_extra`
     (a throwaway test database's URL) is laid over the run's
-    environment. A worker tree is run in its committed view (DESIGN §8
-    *Every measurement reads the committed view*)."""
-    view = await _committed_view(st, tree)
-    if view is not None:
-        tree = str(view)
+    environment. A worker tree is run in its committed view, installed
+    there (`_measured_tree`; DESIGN §8 *Every measurement reads the
+    committed view*)."""
+    tree = await _measured_tree(st, tree, caps, log_path=log_path,
+                                label=label)
     run_files = list(files or [])
     if run_files:
         scoped = _acceptance_cmd(st, run_files, tree)
@@ -56623,6 +56602,12 @@ async def _cov_contained(argv: list[str], *, tree: Path, st: "State",
     return out
 
 
+def _coverage_install_log(st: "State", sid: str) -> Path:
+    """The log of the coverage detector's install in a subtask's view."""
+    safe = _CGROUP_NAME_UNSAFE_RE.sub("-", sid)
+    return st.run_dir / "logs" / f"coverage-{safe}-install.log"
+
+
 async def _vitest_run(exe: Path, tree: Path, tests: list[str],
                       include: list[str], *, st: "State", caps: dict,
                       sid: str, tag: str, coverage: bool = True
@@ -56631,11 +56616,7 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
     Pass status comes from vitest's JSON reporter, hits from the v8
     `coverage-final.json` restricted to `include` (a statement's start line
     carries its count; the line's count is the max over its statements).
-    Run in the subtask's committed view (DESIGN §8 *Every measurement reads
-    the committed view*)."""
-    view = await _committed_view(st, tree)
-    if view is not None:
-        tree = view
+    `tree` is the subtask's measured tree (`_measure_subtask_coverage`)."""
     work = st.run_dir / "coverage" / _CGROUP_NAME_UNSAFE_RE.sub("-", sid)
     covdir = work / f"cov-{tag}"
     report = work / f"res-{tag}.json"
@@ -56734,8 +56715,13 @@ async def _measure_subtask_coverage(sid: str, tree: Path, base_ref: str,
     executes. Returns `{measured, why?, prods, own_tests, own_failed_twice,
     exec_changed{file: n}, uncovered{file: [line]}, settled{file: [test]},
     settle_failed_twice, share}`; `share` is unexecuted / executable over
-    the subtask's changed files. Never raises."""
+    the subtask's changed files. Never raises. Measured in the subtask's
+    committed view, installed there (`_measured_tree`; DESIGN §8 *Every
+    measurement reads the committed view*)."""
     rec: dict = {"measured": False}
+    tree = Path(await _measured_tree(
+        st, tree, caps, label=f"coverage-{sid}",
+        log_path=_coverage_install_log(st, sid)))
     exe = _vitest_coverage_bin(tree)
     if exe is None:
         rec["why"] = ("no vitest with @vitest/coverage-v8 in the worktree "
@@ -56807,9 +56793,6 @@ async def _tsc_lists_paths(tree: Path, paths: list[str], *, st: "State",
     when it passes AND its own file list holds every path (bench Q7/G v5:
     an axis passing says nothing about a file it never compiled). `tsc
     --noEmit --listFiles` gives both in one run."""
-    view = await _committed_view(st, tree)
-    if view is not None:
-        tree = view
     exe = tree / "node_modules" / ".bin" / "tsc"
     if not paths or not exe.exists() or not (tree / "tsconfig.json").is_file():
         return False
@@ -56834,7 +56817,8 @@ async def _tsc_lists_paths(tree: Path, paths: list[str], *, st: "State",
 async def _install_settles(tree: Path, *, st: "State", caps: dict,
                            sid: str) -> bool:
     """A `settle_by: install` gap clears when every `install` entry of the
-    run's provision recipe exits 0 in the subtask's worktree."""
+    run's provision recipe exits 0 in the subtask's committed view (the
+    measured tree `_settle_typed_gaps` passes)."""
     entries = [e for e in ((st.data.get("provision") or {}).get("recipe")
                            or [])
                if isinstance(e, dict) and e.get("kind") == "install"
@@ -56864,6 +56848,11 @@ async def _settle_typed_gaps(sid: str, tree: Path, st: "State", caps: dict,
             and e.get("where_paths")]
     if not gaps:
         return []
+    # Settled in the subtask's committed view, installed there (DESIGN §8
+    # *Every measurement reads the committed view*).
+    tree = Path(await _measured_tree(
+        st, tree, caps, label=f"coverage-{sid}",
+        log_path=_coverage_install_log(st, sid)))
     exe = _vitest_coverage_bin(tree)
     globs = resolve_test_file_globs(st.repo_root)
     head = await _branch_head_sha(str(tree))
@@ -57210,16 +57199,11 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
         return _done()
 
     log_path = st.run_dir / "logs" / f"settle-exec-{sid}.log"
-    await _ensure_worktree_deps(worktree, st, caps, log_path=log_path,
-                                verbosity="quiet",
-                                label_prefix=f"settle-exec-{sid}",
-                                log_prefix=f"settle-exec {sid}")
-    # The verify commands run in the subtask's committed view: they settle
-    # the claim on what is committed, the environment shared in (DESIGN §8
-    # *Every measurement reads the committed view*).
-    view = await _committed_view(st, worktree)
-    if view is not None:
-        worktree = str(view)
+    # The verify commands run in the subtask's committed view, installed
+    # there: they settle the claim on what is committed (DESIGN §8 *Every
+    # measurement reads the committed view*).
+    worktree = await _measured_tree(st, worktree, caps, log_path=log_path,
+                                    label=f"settle-exec-{sid}")
     try:
         blt = resolve_blt(st.repo_root)
     except Exception:

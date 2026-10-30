@@ -103,10 +103,11 @@ def test_a_failed_base_install_gives_no_candidate_a_verdict(
     st, staging = run["st"], run["staging"]
     (staging / "tests" / "test_s.py").write_text(SUITE.format(ok="False"))
     _git(staging, "commit", "-qam", "break")
-    # Staging installs first, then the registry goes down.
-    asyncio.run(leerie._ensure_worktree_deps(
-        str(staging), st, run["caps"], log_path=tmp_path / "i.log",
-        verbosity="quiet"))
+    # Staging is measured in its committed view, which installs first;
+    # then the registry goes down.
+    asyncio.run(leerie._measured_tree(
+        st, str(staging), run["caps"], log_path=tmp_path / "i.log",
+        label="t"))
     flag.write_text("")
     post = asyncio.run(leerie._measure_axes(
         str(staging), {"tests": "python3 -m pytest -q -p no:cacheprovider "

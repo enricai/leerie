@@ -3244,7 +3244,9 @@ def test_a_one_off_install_failure_mid_loop_keeps_the_next_round(
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
-    _counted_recipe(st, tmp_path, 2, 2)       # round 1's evaluation fails
+    # Call 2 is staging's committed view (the gate's test IDs); call 3 is
+    # round 1's evaluation.
+    _counted_recipe(st, tmp_path, 3, 3)       # round 1's evaluation fails
     calls = _run_gate(leerie, monkeypatch, st, lambda _p: None,
                       measured=[{"passed": True, "measured": True}])
     gate = st.data["acceptance"]["gate"]

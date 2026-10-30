@@ -6546,24 +6546,28 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     is; else, keyed by `realpath(tree)` in the process-level `_VIEWS`
     (`(tip, path)`), the existing view while the branch tip is unchanged,
     otherwise the old one removed (`git worktree remove --force`,
-    `_rmtree_owned`) and `_worktree_add_detached_async(st,
-    _helper_worktree_path(st, "view-<basename>"), <tip>, repo=tree)`;
-    either way `_share_environment(tree, view)` runs (again each call): every
-    `_untracked_listing(tree, which="ignored", directory=True)` path not
-    already in the view that `git <_git_view(view)> check-ignore --no-index
-    --stdin -z` also ignores is symlinked into it. An unreadable branch or
-    a failed add `die()`s ("the committed view of <tree> cannot be made: …").
+    `_rmtree_owned`), its `_DEPS_INSTALLED`/`_DEPS_FAILED` entries
+    dropped, and `_worktree_add_detached_async(st,
+    _helper_worktree_path(st, "view-<basename>"), <tip>, repo=tree)`.
+    Nothing is shared in from `tree`. An unreadable branch or a failed add
+    `die()`s ("the committed view of <tree> cannot be made: …").
+    `async _measured_tree(st, tree, caps, *, log_path, label) -> str`: the
+    view with `_ensure_worktree_deps(<view>, …, label_prefix=label,
+    log_prefix=label)` applied (the recipe's `install` and `build` entries,
+    once per view), or `tree` when `_committed_view` is None.
     `async _view_tree_sha(st, tree) -> str | None`: `refs/heads/<ref>^{tree}`
     for a worker tree, else `_committed_tree_sha(tree)`. Used by:
-    `_measure_axes` (the view is made first, the memo keyed on it; the
-    install runs in `tree` itself, then `_committed_view` again to share
-    what it made; every axis, its I2 bracket and `_attach_failing_ids` run
-    in the view), `_capture_failing_test_ids` (first statement: every
-    test-ID run, B\*'s final side, discovery, the ratchet's, re-drive's,
-    acceptance gate's and integration gate's IDs), `_settle_by_execution`
-    (after its install), and the coverage settle's `_vitest_run` and
-    `_tsc_lists_paths` (`_install_settles` runs in the worktree: it is an
-    install). Stamps: `_confirm_final_test_failures` (when its caller
+    `_measure_axes` (`_committed_view` first, the memo keyed on it, and its
+    lazy `_ensure_worktree_deps` on the view; every axis, its I2 bracket
+    and `_attach_failing_ids` run in the view), and `_measured_tree` as the
+    first step of `_capture_failing_test_ids` (every test-ID run, B\*'s
+    final side, discovery, the ratchet's, re-drive's, acceptance gate's
+    and integration gate's IDs), `_settle_by_execution` (after its
+    tracked-dirt check), `_measure_subtask_coverage` and
+    `_settle_typed_gaps` (log `_coverage_install_log(st, sid)`:
+    `logs/coverage-<sid>-install.log`), so `_vitest_coverage_bin`,
+    `_vitest_run`, `_tsc_lists_paths` and `_install_settles` all read the
+    view. Stamps: `_confirm_final_test_failures` (when its caller
     passes no `tree_sha`), `_refresh_test_id_diff`'s return,
     `_run_final_conformance`'s `pre_tree`/`post_stamp` and its after-loop
     check use `_view_tree_sha(st, staging)`. `_assert_staging_clean` is

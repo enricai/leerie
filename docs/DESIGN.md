@@ -7838,15 +7838,31 @@ the coverage settle's — runs in that tree's *committed view*
 (`_committed_view`): a detached checkout of its branch tip (the run branch
 for staging, the subtask branch for a subtask's worktree; never the
 tree's HEAD, which a worker can move), kept while the tip stands and
-replaced when it moves. The environment is shared into it: every path of
-the worker's tree that the view's own ignore rules — committed
-`.gitignore` files and leerie's settings copies (§8 *The settings are
-leerie's*) — also ignore is symlinked in (`node_modules`, nested ones, a
-generated client, build output), so nothing is installed twice; a path
-only an uncommitted `.gitignore` ignores is not, and is not measured. The
-install itself still runs in the worker's tree (I2-bracketed), which owns
-the environment. The view is bracketed by I2 like any tree, so one
+replaced when it moves. The view is bracketed by I2 like any tree, so one
 measurement's reports never reach the next.
+
+Nothing a measurement reads comes from a tree a worker can write. Its
+environment is installed by leerie into the view, from the view's own
+committed manifests and lockfile: the provision recipe's `install` entries
+(`_ensure_worktree_deps` on the view), so a `postinstall` generator (a
+Prisma client) runs from the committed schema too; and its build outputs
+are produced there by the recipe's `build` entries and the build axis,
+from the committed sources. The first version shared the worker tree's
+ignored paths into the view by symlink instead, and that carried two
+holes: a worker that patched `node_modules/<lib>` in place had the patch
+measured (green on code that fails in CI), and a symlinked build output
+described whatever the worker last built, not the commit. The install
+cost was measured before choosing (pnpm 10.4.1 with a store on the same
+filesystem, as the state mount's store is, `--frozen-lockfile`, three
+runs each): barnacle 9.0 s cold (empty store, 501 packages fetched),
+4.3–4.5 s warm, plus 1.7 s for its second recipe entry
+(`examples/plugins/hello-site`); funeralworks 23.2 s cold, 10.6–10.7 s
+warm, its `prisma generate` included. A view is made once per branch tip
+measured: the measurement memo of the four barnacle e2e runs held at most
+7 distinct trees for any one command, so even 20 views (122 s warm) is 4%
+of the shortest of those runs (3,051 s), against a test axis of 906 s and
+more. The worker's own install stays where it was: a worker installs into
+its own tree for its own runs, and leerie never measures through it.
 
 What this removes: the measurement no longer depends on I1's reading of
 staging, so the assertion every staging reader made — that staging was
@@ -7855,9 +7871,10 @@ clean, or the run stopped — is gone; each reader stamps the branch's tree
 its view measured. I1 still
 holds every worker to a clean tree: it is what keeps uncommitted work out
 of the commits that ship and out of the next worker's way. What stays
-outside: the shared environment is the worker tree's, so a worker that
-edits an installed dependency in place is measured with that edit; and a
-symlinked build output can be stale, as it always could in staging.
+outside: a view lies under the run directory, which a worker's shell can
+reach as it can reach staging (the same-user boundary `Edit` denials and
+`_assert_repo_unchanged` already bound); nothing names a view to a
+worker, and each tip gets a fresh one.
 
 Staging is restored at every resume all the same: an interrupted run's
 cleanup removes it, but a SIGKILL (Fly's `machine stop`, an OOM kill of
