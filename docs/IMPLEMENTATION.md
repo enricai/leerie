@@ -8477,6 +8477,110 @@ Every script takes a `RUN_ID` as its first positional argument (after any flags)
 
 A run branch `leerie/runs/<run-id>` is never reset once created — this is the invariant `resume` depends on. See `DESIGN.md` §6 ("the run branch is the resume contract").
 
+### The run's own repository (RC4, I4): code surface
+
+*Status: specified 2026-10-30. The code lands in a later change. Until it
+does, the table above describes the code. DESIGN §6 *The run's own
+repository* is canonical.*
+
+**New functions (`orchestrator/leerie.py`).**
+
+| Function | Contract |
+|---|---|
+| `_run_repo(st) -> Path` | Returns `st.run_dir / "repo"`. It is the one spelling of the path, and it is exposed as `st.run_repo` on `State`. |
+| `_ensure_run_repo(st) -> None` | Called in `_run_phases` before `_ensure_planning_worktree`, inside the same `waves` guard. A no-op when `st.run_repo` is already a bare repository. Otherwise it runs, as leerie's own git with `GIT_NO_HOOKS`:<br>• `git init --bare --object-format=<git -C st.repo_root rev-parse --show-object-format> <repo>`;<br>• `_carry_repo_config(st.repo_root, repo)`;<br>• `_refresh_run_repo_base(st)`.<br>When it creates the repository it sets `st.data["run_repo"] = "repo"`. Any failure calls `die()` naming the git error. There is no fallback to the user's repository, because a run without I4 is never silent. |
+| `_carry_repo_config(user: Path, repo: Path) -> None` | Reads `git -C user config --local --list -z`. It copies each key into `repo/config` with `git config -f … --add`, except:<br>• `core.bare`, `core.worktree`, `core.repositoryformatversion`;<br>• `extensions.*`, `include.*`, `includeif.*`;<br>• any key `git init` already wrote.<br>Then, if `git -C user config core.hooksPath` is empty, it sets `core.hooksPath` to `git -C user rev-parse --path-format=absolute --git-path hooks`. It is mechanical: key names, no values interpreted. It also runs host-side, for the rebaser's repository. |
+| `_refresh_run_repo_base(st) -> str` | Fetches, with `git -C <repo> -c core.hooksPath=/dev/null fetch --no-write-fetch-head --no-recurse-submodules <st.repo_root>`:<br>• `+refs/heads/<wb>:refs/heads/<wb>` when `_working_branch_ref` resolves;<br>• the user's `HEAD` commit, set as the bare repository's detached `HEAD` (`update-ref --no-deref HEAD <sha>`).<br>Tag auto-follow is left on. Returns the fetched base commit. `_ensure_planning_worktree` and `phase_execute` call it, before `planning-worktree.sh` and `setup-run.sh`, which then resolve the same names inside the run's repository. |
+| `_refuse_pre_run_repo_resume(st) -> None` | Runs on `resume`, before `_ensure_run_repo`. When `"run_repo" not in st.data` and `run.json` already has `branch`, it calls `die()`. New code sets `run_repo` before `run.json` gets `branch`, so only a run made before the change matches. It with the DESIGN wording: the run predates per-run repositories; finalize it with `leerie finalize <id>`, or start again. |
+| `_bring_back_run_branch` (launcher bash, `host_bring_back_run_branch <run-dir>` in `scripts/host-finalize.sh`) | Host-side. Works only when `<run-dir>/repo` has `refs/heads/leerie/runs/<id>`:<br>• `git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch --no-tags --no-write-fetch-head --no-auto-maintenance "<run-dir>/repo" "refs/heads/leerie/runs/<id>:refs/leerie/incoming/<id>"`;<br>• then `git update-ref refs/heads/leerie/runs/<id> <incoming> <old>`, where `<old>` is `run.json.brought_back_sha`, or the zero OID when that is absent. This compare-and-swap never undoes a finalize rebase. On a mismatch it logs and leaves the ref;<br>• deletes the incoming ref and records `brought_back_sha` in `run.json`.<br>It is called:<br>• after `nerdctl run` returns (every exit code, `--no-push` too), before auto-finalize;<br>• in `finalize` (local path), before its branch-exists check;<br>• in `prune`, before deleting a run directory. |
+
+**State and `run.json` fields.**
+- `run_repo`: string, the relative name `"repo"`. Set on the fresh-run branch only, so `tests/test_state_fields.py::test_no_resume_only_state_keys` holds.
+- `base_sha`: the commit `setup-run.sh` cut the run branch from. Recorded by `phase_execute` from `git -C <repo> rev-parse leerie/runs/<id>` when the branch is first cut, never re-recorded on resume.
+- `run.json` `brought_back_sha`: written by the launcher only.
+
+**Changed call sites (git on the repository moves from `st.repo_root` / process cwd `/work` to `st.run_repo`).**
+- `_run_script` passes `cwd=st.run_repo` and `LEERIE_STATE_DIR=<resolve_leerie_root()>` (absolute, set on every runtime, Fly included). It does this for:
+  - `setup-run.sh`, `new-worktree.sh`, `planning-worktree.sh`;
+  - `integrate.sh` (its `show-ref` already runs at cwd);
+  - `finalize.sh`, `cleanup.sh`.
+
+  The scripts are unchanged except that `finalize.sh` and setup's working-branch record use the names the refresh created.
+- `_worktree_add_detached(…, repo=None)` defaults to `st.run_repo`. The other git-on-repository calls that move with it:
+  - `_remove_acceptance_checkout` and every `git -C st.repo_root worktree remove`;
+  - `_reset_subtask_worktree`, `_prune_subtask_worktree`;
+  - `_create_empty_subtask_branch`, `_undo_interrupted_redrives`;
+  - `_shipping_tree`, `phase_finalize`'s `rev-list --count` and `show-ref`;
+  - `_compose_pr_via_llm`'s `log`/`diff`;
+  - `_finish_no_work_run`'s `worktree remove`;
+  - `_cleanup_on_abnormal_exit`;
+  - `_prune_leerie_worktrees` (unscoped `git worktree prune` on the run's repository);
+  - `_reap_idle_worktrees` (each idle run's own repository).
+- `_acceptance_writer_checkout`, `_falsifier_checkout` and the surrogate clone `--shared` from `st.run_repo`. These are in-container and short-lived, and the run's repository is never `gc`'d under them. `_acceptance_report_base` fetches a sibling's starting HEAD from `st.repo_root` into the run's repository (`refs/leerie/report-base`) before `cat-file -e`. Measured: a by-SHA fetch of a reachable non-tip commit from a local repository works.
+- These sites read the base through `base_sha`, not the `working_branch` name:
+  - `_merge_base_sha(staging, working_branch, …)` in `_confirm_final_test_failures`;
+  - `_warn_site_token_leaks`, `_run_pr_review`;
+  - `_run_final_conformance`, both the merge-base and the DIFF_BASE prompt line;
+  - the acceptance-repair conformer's DIFF_BASE line (`_run_acceptance_gate_inner`);
+  - `_compose_pr_via_llm`'s `rev_range`;
+  - `phase_finalize`'s count.
+
+  `working_branch` stays the PR-facing name in `run.json`.
+- `_replay_capture` checks out from a ref-less clone of its `cwd` repository, made the way `_acceptance_writer_checkout` makes one, instead of `_judge_checkout` on that repository.
+- Unchanged, still on `st.repo_root` (the user's checkout, read-only git):
+  - `_preflight_repo` (identity, tracked dirt, the bare `leerie` branch, which would block the bring-back);
+  - the `working_branch` read in `_run_phases`;
+  - `_snapshot_repo_state` / `_assert_repo_unchanged`;
+  - `_stage_worktree_extras`, `_switched_branch_only_paths`, `_working_branch_ref`.
+
+**Shell.**
+- `scripts/host-finalize.sh`: the rebase step makes `"$tmp/rebase-<id>.git"` with `git clone --bare --shared --single-branch -b "$run_branch" "$USER_REPO"`, plus `_carry_repo_config` (through the python seam), plus `worktree add`, instead of `git -C "$USER_REPO" worktree add`. That clone is host-side and lives only for finalize, so alternates are valid for its life. It is removed with `rm -rf`, and nothing is registered in the user's repository. After a `rebased` verdict it also fetches `refs/remotes/origin/<pr_base_branch>` from it into the user's repository.
+- `scripts/remote/fetch-branch.sh`, `scripts/remote/ec2-fetch-branch.sh`: `git -C /work` becomes `git -C /work/.leerie/runs/<id>/repo` for the run-branch check, the subtask `for-each-ref` and the bundle.
+- `scripts/remote/collect-subtrees.sh`: `cd` into the run's repository before `setup-run.sh`/`integrate.sh`, with `LEERIE_STATE_DIR=/work/.leerie`.
+- `leerie` launcher: the three `host_bring_back_run_branch` call sites above. `prune` keeps its `.git/worktrees` deregistration and `leerie/subtasks/*` deletion for runs made before the change (their state has no `run_repo`). For other runs it deletes `<run-dir>/repo` with the run directory, after the bring-back.
+
+**Deleted.**
+- `_redrive_exclude_clear` and `_redrive_exclude_path`.
+- `phase_finalize`'s `cleanup.sh --subtask-branches` calls (at two sites) and the run-branch-survived `show-ref` check after them.
+- `_cleanup_on_abnormal_exit`'s `full_purge` `branch -D` loop. It becomes `rm -rf <run-dir>/repo`, and there is still no call site.
+- The per-entry attribution in `_prune_leerie_worktrees` / `prune_leerie_worktrees`, for the run's repository.
+
+**Tests to add.**
+- `tests/test_run_repo.py`:
+  - `_ensure_run_repo` on a real repository makes a bare, self-contained repository: no `objects/info/alternates`, no remote;
+  - it holds the working branch and its reachable tags, and nothing else (no other branch, no `refs/stash`);
+  - it is in the same object format;
+  - it is idempotent.
+- `_carry_repo_config`:
+  - copies a repository-local identity and `core.hooksPath`, and drops `core.bare` and `include.path`;
+  - with no hooks path, sets the absolute hooks dir;
+  - substance: a commit in a run-repository worktree runs the user's `pre-commit`.
+- r16 H2's two drivers rewritten as I4 tests, with the real `_clean_tree_gate`, on worktrees from the run's repository:
+  - the user's stash survives a worker's `stash`/`pop`;
+  - `git checkout develop` fails, and the user's `develop` and `main` are unchanged.
+- `_refresh_run_repo_base`:
+  - follows the user's branch tip;
+  - restores a worker-moved copy;
+  - gives a detached start a detached bare HEAD.
+- `base_sha`: a worker moving the run repository's `main` does not change the diff-scope check's or the PR writer's range. Substance: execute the consumer, and make the moved name and `base_sha` disagree.
+- Bring-back (bash, `HAS_JQ`-gated like the other host-finalize tests):
+  - fetches into the user's repository with hooks off and no `FETCH_HEAD`;
+  - leaves a ref whose tip is not `brought_back_sha`;
+  - runs on a non-zero container exit and under `--no-push`;
+  - `prune` brings back before it deletes.
+- Resume of a state without `run_repo` dies with the finalize hint.
+- Live-falsify each one by reverting its line, for example a `--shared` clone, `include.path`, or a bring-back without the compare-and-swap.
+
+**Tests to rewrite.** The files that pin the user-repository layout. They were found by grep on 2026-10-30, so each is a file that names the surface; a test that only drives a script against its own temporary repository keeps passing, because the scripts act on their cwd:
+- the orchestrator-side pins of `_run_script`'s cwd and of `st.repo_root` worktree removal;
+- the 12 files naming `_prune_leerie_worktrees`/`prune_leerie_worktrees` (scope attribution);
+- the 3 naming `leerie_repo_lock` or its lock file;
+- the 9 naming `_cleanup_on_abnormal_exit`;
+- the `_redrive_exclude` test (deleted with it);
+- the host-finalize rebase-worktree tests among the 10 naming `run_rebaser`;
+- the Fly `fetch_branch`/`collect-subtrees` tests that assert `git -C /work`;
+- `tests/test_leerie_git_runs_no_hooks.py`'s script list, which gains the fetches.
+
 ### Host-side finalize (bash + jq in the `leerie` launcher)
 
 The push + PR step runs on the **host** in the launcher, after `nerdctl

@@ -1773,6 +1773,320 @@ repository. Parallel writes land in separate working directories and never
 collide. This is what makes "a wave of parallel implementers" safe even when
 two of them touch the same file.
 
+### The run's own repository (RC4, I4)
+
+*Status: designed 2026-10-30 (review round 16, H2); the code lands in a
+later change. Until it does, the code works as the rest of §6 describes
+it, with every worktree a linked worktree of the user's repository. The statements this design replaces are listed at the end.*
+
+**Root cause (RC4): a worker's tree is isolated, but its repository is the
+user's.** Almost every tree leerie hands a worker is a *linked* worktree of
+the user's repository: planning, staging, a subtask, each helper and judge
+checkout, the post-run replay's checkout and the host-side rebase tree.
+Only the acceptance writer, the surrogate and the falsifier get a ref-less
+`--shared` clone. A linked worktree shares the common
+directory with the user's own checkout: every branch and tag, `refs/stash`,
+the repository config, `info/exclude`, the hooks, the worktree registry and
+the object store. So every git verb a worker runs in its own tree acts on
+the user's repository, without the worker ever naming it. Review round 16
+drove both harms on the real `_clean_tree_gate`:
+
+- a worker on a clean subtask tree runs `git stash` ("No local changes to
+  save"), then `git stash pop`, which pops the *user's* `stash@{0}`; the
+  re-ask has it commit, I1 passes, the user's stash is gone and their WIP is
+  on the subtask branch, headed for the PR. §12 records a measured worker
+  doing exactly a `git stash`/`pop` pair;
+- a worker in staging runs `git checkout develop` (a user branch) and
+  commits; the re-ask has it cherry-pick back, I1 passes, and `develop`
+  keeps the worker's commit. `_restore_tree` cannot put it back either.
+
+The sharing also leaves residue the user never asked for. A read-only look
+at one user repository on 2026-10-30 found 34 leerie admin entries in its
+`.git/worktrees` (30 `acceptance-*`, 4 `planning*`) and 8 leerie branches (6 run
+branches, 2 subtask branches).
+
+Every guard written so far bounds one verb at a time: the clean-tree gate
+checks HEAD and its ancestry, the sentinel compares `refs/heads`, the
+falsifier stopped writing `info/exclude`. None of them can bound "any git
+verb, in any tree, on any ref". That is the shape of a design gap, not of a
+missing check.
+
+**Invariant (I4): no worker's repository is the user's.** Every tree a
+worker gets belongs to a repository leerie created for the run. The
+worker's refs, stash, config, `info/exclude`, worktree registry and object
+store are that repository's. The user's repository is touched only by
+leerie's own enumerated git:
+
+- reads at the start (the working branch, HEAD, the tree's state);
+- `fetch`es *from* it into the run's repository;
+- one write, after the run, of the one ref the user receives:
+  `leerie/runs/<run-id>`, plus the host finalize's existing push and PR.
+
+**The mechanism.**
+
+- *The run's repository* is `<run-dir>/repo`, a bare repository leerie
+  makes once per run, at run start, before the planning worktree (on Fly and
+  EC2, `/work/.leerie/runs/<id>/repo` on the volume):
+  - `git init --bare` in the user's object format;
+  - a `fetch` from the user's repository of the working branch, kept under
+    the same name, and the user's HEAD commit as the bare repository's
+    detached HEAD. leerie's own git, hooks off.
+- *What the fetch brings.* The fetch copies objects, so the run's repository
+  is self-contained: it has no alternates and no `origin` remote of the user
+  repository. What it brings:
+  - only the working branch's history;
+  - the tags that point into that history, because git's tag auto-follow
+    applies (`git describe` reads as it does in the user's checkout).
+
+  What it leaves behind: no other branch, no `refs/stash`, no remote-tracking
+  ref, no earlier run's branch.
+- *Refreshing the base.* Wherever leerie reads the working branch's tip to
+  (re)base something, the run's repository fetches that tip first. Today
+  that is the planning worktree's reset on every entry, and `setup-run.sh`
+  cutting the run branch at phase 4. So the run still follows the working
+  branch's moving tip, as §12 L4 describes. A worker that commits onto the
+  repository's copy of the working branch moves only that copy, and the next
+  refresh puts it back.
+- *leerie reads the base by commit.* When the run branch is cut, leerie
+  records `base_sha`. Its own comparisons against the base use that commit,
+  never a branch name a worker can move:
+  - the diff-scope check;
+  - the final conformer's and PR reviewer's diff base;
+  - the PR writer's log and diff;
+  - the finalize commit count;
+  - the merge-base for the final test-failure check.
+
+  The DIFF_BASE line in prompts names the same commit.
+- *Every worktree hangs off the run's repository.* The scripts already act
+  on the repository at their working directory, so the orchestrator runs
+  them there, with the state root passed explicitly. That covers:
+  - staging, subtask and planning worktrees;
+  - every `_worktree_add_detached` and `_judge_checkout`;
+  - the acceptance writer's, surrogate's and falsifier's ref-less clones
+    (which now clone the run's repository);
+  - the post-run replay's checkout.
+
+  `leerie_repo_lock`'s lock file follows `--git-common-dir` into the run's
+  repository. It still serialises the run's own parallel `worktree add`s,
+  and no longer serialises against other runs.
+- *What is carried from the user's configuration.* The run's repository
+  takes the user's repository-local config keys, except those that describe
+  where and what kind of repository a config file belongs to: `core.bare`,
+  `core.worktree`, `core.repositoryformatversion`, `extensions.*`,
+  `include.*`, `includeIf.*`. It also skips any key the new repository
+  already set.
+
+  When the user sets no `core.hooksPath` anywhere, it is set to the user's
+  hooks directory (`git rev-parse --path-format=absolute --git-path hooks`).
+
+  So workers' commits still run the repository's hooks, as §6
+  *Finalization* promises ("worker commits inside worktrees still run all
+  hooks normally"), and a repository-local identity still signs them. All
+  four user repositories looked at carry `core.hooksPath=.husky/_` in local
+  config, which is copied as written and resolves per worktree, as it does
+  today.
+
+  Measured on git 2.53.0 with a synthetic repository:
+  - a commit in a run-repository worktree ran the user's `.git/hooks`
+    `pre-commit` and carried the repository-local identity;
+  - a husky-style `git config core.hooksPath .husky/_` run from that
+    worktree wrote the run repository's config, and the user's stayed unset.
+
+  Why not a blanket `include.path` of the user's config: measured, the
+  user's `core.bare = false` then overrides the bare repository's. git reads
+  the run repository as non-bare and refuses `worktree add` of the run
+  branch as "already used by worktree at <repo>".
+- *Bringing the run branch back* is host-side, after the run, as it already
+  is on Fly (`fetch_branch`). The launcher fetches
+  `refs/heads/leerie/runs/<id>` from `<state-root>/runs/<id>/repo` into the
+  user's repository:
+  - hooks off, no `FETCH_HEAD`, no auto-maintenance;
+  - only when the user's ref is absent or still at the commit leerie last
+    brought back (`run.json` `brought_back_sha`), so a finalize rebase is
+    never undone.
+
+  It runs:
+  - after the container exits, whatever its exit code and with or without
+    `--no-push`, before the auto-finalize;
+  - in `leerie finalize <id>`;
+  - in `prune`, before a run directory is deleted, so a run whose launcher
+    died is never lost.
+
+  On Fly and EC2, `fetch_branch` bundles from the run's repository instead
+  of `/work`.
+- *The finalize rebaser* gets a host-side repository of its own the same
+  way, with `origin` carried by the config rule above. Its result already
+  comes back by a fetch (`refs/leerie-rebase-scratch/<id>`). After a
+  rebase, leerie also fetches the `origin/<pr_base_branch>` the rebaser
+  fetched into the user's repository, the one remote-tracking ref finalize
+  then reads. Today that update happens implicitly through the shared
+  worktree.
+
+**Why a self-contained repository, not `--shared`.** A `git clone --shared`
+borrows the user's object store through `objects/info/alternates`. It is
+fast:
+
+| | `--shared` clone | self-contained (`init --bare` + `fetch`) |
+|---|---|---|
+| funeralworks copy | 0.068 s, 172 KB | 1.19 s / 1.21 s, 9.7 MB |
+| barnacle copy | 0.10 s, 184 KB | 2.68 s / 2.76 s, 8.4–8.9 MB |
+| leerie copy | not measured | 11.5 s / 11.3 s, 31–32 MB |
+
+A refresh that brings nothing new takes 0.04 s to 0.06 s.
+
+The `--shared` clone fails in two ways:
+
+- **The host cannot read it.** The alternates path is written inside the
+  container (`/work/.git/objects`). On the host, git prints "error: unable
+  to normalize alternate object path" on every command, so the post-run
+  bring-back, a finalize after a crash, and `prune` could not use it.
+- **It depends on the user's object store.** Measured: with a `--shared`
+  clone in use, the user deletes a branch and runs `git reflog expire
+  --expire=now --all; git gc --prune=now`. The clone's copy of that branch
+  then dangles: `git log --all` fails with "bad object", and `git gc` exits
+  128. A single-branch clone avoids the dangling copy. But the base commit
+  itself would then need a pin ref in the user's repository for the run's
+  life, which is a new ref in the user's repository that leerie must clean
+  up.
+
+The self-contained repository pays its cost once per run, against runs
+that take hours. It also stops the run's intermediate objects (re-drive
+attempts, rescue commits, test fixtures leerie snapshots) from accumulating
+in the user's object store. Only the brought-back branch's objects land
+there.
+
+**What it settles, measured on the new layout** (synthetic repository,
+r16 H2's two scenarios):
+
+- `git stash pop` in a subtask tree reports "No stash entries found", and
+  the user's stash list is unchanged.
+- `git checkout develop` fails ("pathspec 'develop' did not match").
+- A commit on the run repository's copy of `main` leaves the user's `main`
+  and `develop` where they were.
+- `git rev-parse --git-path info/exclude` in a run worktree resolves to
+  `<run-dir>/repo/info/exclude`, so round 16 H1's leak is settled: a
+  pattern a worker adds there can no longer hide the user's own files.
+
+**What it does not settle.**
+
+- *H1's hidden dirt.* The run repository's `info/exclude` is still shared
+  by the run's own checkouts, and a worker can still write it or set
+  `skip-worktree`. I1's checker must still define clean against the
+  committed `.gitignore` and the index flags, as H1's fix states.
+  `_checkout_ignore` stays, because one checkout's ignore must not reach
+  staging.
+- *M1.* The run repository carries the user's hooks on purpose, so
+  leerie's own git there must still run with the hooks off. `GIT_NO_HOOKS`
+  and its guard stay, and M1's fix (every leerie git argv, with no
+  per-subcommand exemption) still applies.
+- *The explicit channel.* `/work` is still the user's checkout, bind-mounted
+  read-write. A worker's Bash can still `cd /work` or run `git -C /work`. §12
+  records 146 `Edit`/`Write` calls into the user's checkout before the path
+  deny, and Bash writes there that the deny does not cover. I4 removes the implicit reach, where every git verb landed in the
+  user's repository. It does not remove the explicit one. So the sentinel
+  (§12 L4) and `_repo_write_denials` stay. The sentinel's `refs/heads/leerie/`
+  exemption stays too, because another run's bring-back can land during
+  this one.
+
+  Closing the explicit channel means mounting the user's checkout
+  read-only. Three things write it today:
+  - dependency capture's documented `.leerie/config.toml` write (§6½);
+  - `resolve_leerie_root`'s in-checkout state fallback (the Fly layout);
+  - the rootful entry's `chown leerie: /work`.
+
+  That is a separate decision, recorded here and not taken by this design.
+- *The network remote.* `remote.*` is carried, so a worker can still push
+  to the user's `origin` from the container, as it can today.
+
+**Edge cases, measured or stated.**
+
+- *Submodules.* In both layouts, `git submodule update --init` in a worktree
+  clones from the `.gitmodules` URL into that worktree's own admin
+  directory. Measured: today's layout did not reuse the user's
+  `.git/modules`, so nothing changes.
+- *A shallow user repository* (Fly's shallow seed) yields a shallow run
+  repository. Measured with a `--no-local` clone of a depth-3 copy.
+- *Partial clones (promisor remotes) and Git LFS* are not measured. None of
+  the four user repositories looked at uses LFS. For a partial repository,
+  whether the fetch can obtain objects the user's repository lacks is
+  untested. The run's repository has no LFS store, so LFS content would come
+  from the LFS remote. Both are stated, not solved.
+- *A detached HEAD start.* The bare repository's HEAD is detached at the
+  user's HEAD commit, so the scripts' existing "fall back to HEAD" keeps its
+  meaning.
+
+**Resume of a run made before this change: refused.** That run's state has
+no `run_repo` field, and its worktrees and subtask branches live in the
+user's repository. `resume` dies, saying:
+
+- the run predates per-run repositories;
+- its integrated work is on `leerie/runs/<id>` in the user's repository,
+  where `leerie finalize <id>` (host-side, unchanged) still ships it;
+- otherwise, start the task again.
+
+Resuming the old way would keep every user-repository code path alive only
+for runs in flight at upgrade: the scoped prune of the shared registry, the
+cross-run lock, subtask-branch deletion in the user's repository and
+`_redrive_exclude_clear`. Those runs would also run without I4 while
+nothing said so. A one-time re-run is cheaper than a permanent second
+layout. Host-side tools (`list`, `finalize`, `prune`, `accept-*`) keep
+working on such runs.
+
+**Runtimes.** No mount changes and no chown is added.
+
+- *Local rootless.* The run's repository is created by the inner `leerie`
+  in the bind-mounted state root (outer UID 0 is the host user), so its
+  files are the host user's. That is the same as today's worktrees there,
+  and host git's ownership check (`safe.directory`) passes when the
+  bring-back reads them.
+- *Local rootful.* The image's `leerie` is built with `HOST_UID=$(id -u)`,
+  so its files are again the host user's.
+- *Fly and EC2.* The repository lives under `/work/.leerie/runs/<id>`,
+  which the launch wrapper already chowns to `leerie`, on the only
+  persistent volume. Fly's `collect-subtrees.sh` still runs as root, so its
+  merges leave root-owned files. Those now land in the run's repository
+  instead of `/work/.git`. That is the known follow-up §6½ records, not a
+  new one.
+- *Reading `/work`.* The in-container fetch reads `/work` exactly as
+  today's in-container git does, and needs nothing more.
+
+**What this deletes or simplifies.**
+
+- The orchestrator's scoped prune: `_prune_leerie_worktrees` and its shell
+  twin's per-entry attribution exist because the registry was shared with
+  the host and other runs. In the run's repository it holds only this run's
+  worktrees, so a plain `git worktree prune` there is correct. The
+  *Never a repository-global git operation* rule keeps its premise only for
+  the user's repository.
+- Finalize's `cleanup.sh --subtask-branches` step and the check that the run
+  branch survived it. Subtask branches never reach the user's repository;
+  they go with the run's repository.
+- `_cleanup_on_abnormal_exit`'s `branch -D` of user refs under `full_purge`.
+- `_redrive_exclude_clear`, needed only by a resumed pre-change run.
+- The cross-run reach of `leerie_repo_lock`.
+- The user-ref half of `_restore_tree`'s blast radius. A reset can now move
+  only the run's own refs.
+
+It keeps the sentinel, `_repo_write_denials`, `GIT_NO_HOOKS`,
+`_checkout_ignore` and `_helper_worktree_path`'s run-id prefix (harmless
+once the registry is private). The launcher's `prune` keeps the
+user-registry deregistration and subtask-branch deletion for runs made
+before the change.
+
+**Statements this replaces when the code lands.**
+
+- §6 *Isolation* "backed by the same repository": by the run's repository.
+- §6 *Never a repository-global git operation*: scoped to the user's
+  repository.
+- §6 *Ignores are per checkout*: its reason becomes the run's checkouts
+  sharing one `info/exclude`.
+- §6 *Finalization*: the rebase worktree becomes the rebaser's own
+  repository.
+- §12 L4: "the run branch, staging and subtask worktrees are all git refs"
+  becomes refs of the run's repository.
+- IMPLEMENTATION §7: the script rows; the lock's "shared by every run and
+  container on the repository".
+
 ### The run identifier
 
 Every run has a unique identifier `run_id` that is the container/machine ID
