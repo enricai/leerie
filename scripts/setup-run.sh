@@ -147,28 +147,39 @@ prune_leerie_worktrees "${RUN_DIR}"
 # expanded to a double slash for an absolute $STAGING_WT (`/leerie-state` in the
 # container), so it never matched and this add ran unconditionally.
 if ! grep -qxF "worktree $STAGING_WT" <<<"$(git worktree list --porcelain)"; then
-  git worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
+  git "${LEERIE_GIT_NO_HOOKS[@]}" worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
 else
   # A staging that survived its process: a SIGKILL skipped the cleanup that
   # removes it, so it holds whatever the killed worker left — partial edits,
-  # a merge half resolved. Every process starts on staging at its branch tip
-  # with nothing uncommitted (DESIGN §8 *The final diff describes the tree
-  # that ships*): reset ends any merge, clean keeps ignored files (installed
-  # dependencies). The run branch itself is untouched.
-  leerie_reset_worktree "${STAGING_WT}"
+  # a merge half resolved, a HEAD a worker detached. Every process starts on
+  # staging checked out on the run branch at its tip, with nothing
+  # uncommitted (DESIGN §8 *The final diff describes the tree that ships*):
+  # the one restore primitive, ignored files (installed dependencies) kept.
+  # The run branch itself is untouched.
+  leerie_reset_worktree "${STAGING_WT}" "${BRANCH}"
 fi
 
 # The same for every subtask worktree of this run that survived its process
-# (new-worktree.sh reattaches to a registered worktree as it is): back to its
-# branch tip, commits kept, ignored files kept — what a Ctrl-C's cleanup,
-# which removes the worktree and keeps the branch, leaves the resume. Matched
-# by branch, so other runs' worktrees and detached helpers are untouched.
+# (new-worktree.sh reattaches to a registered worktree as it is): checked out
+# on its own subtask branch at its tip, commits kept, ignored files kept —
+# what a Ctrl-C's cleanup, which removes the worktree and keeps the branch,
+# leaves the resume. Found by path — a registered worktree in this run's
+# worktree directory whose name (`leerie_worktree_name`, or a legacy bare
+# sid) names an existing subtask branch — never by the branch git reports
+# there: a worktree a worker detached reports none (review round 15 H2).
+# Helper checkouts there name no subtask branch and are left alone.
+WT_DIR="$(dirname "$STAGING_WT")"
+WT_PREFIX="$(leerie_worktree_name "$RUN_ID" x)"
+WT_PREFIX="${WT_PREFIX%x}"
 while IFS= read -r subtask_wt; do
-  [ -n "$subtask_wt" ] && [ -d "$subtask_wt" ] || continue
-  leerie_reset_worktree "$subtask_wt"
-done < <(git worktree list --porcelain | awk -v pre="branch refs/heads/leerie/subtasks/${RUN_ID}/" '
-  /^worktree / { wt = substr($0, 10) }
-  index($0, pre) == 1 { print wt }')
+  [ -d "$subtask_wt" ] && [ "$subtask_wt" != "$STAGING_WT" ] || continue
+  name="$(basename "$subtask_wt")"
+  sid="${name#"$WT_PREFIX"}"
+  sub_branch="leerie/subtasks/${RUN_ID}/${sid}"
+  git show-ref --verify --quiet "refs/heads/${sub_branch}" || continue
+  leerie_reset_worktree "$subtask_wt" "$sub_branch"
+done < <(git worktree list --porcelain | awk -v dir="${WT_DIR}/" '
+  /^worktree / { wt = substr($0, 10); if (index(wt, dir) == 1 && index(substr(wt, length(dir) + 1), "/") == 0) print wt }')
 
 echo "working-branch: ${WORKING_BRANCH}"
 echo "staging-worktree: $(cd "${STAGING_WT}" && pwd)"

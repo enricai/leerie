@@ -162,7 +162,7 @@ class TestRollbackRestoresClobber:
         assert asyncio.run(
             leerie._clobbered_owned_files(str(d), "run", impl)) \
             == ["a.py (reverted-to-base)"]
-        asyncio.run(leerie._rollback_conformer_commits(str(d), impl))
+        asyncio.run(leerie._restore_tree(d, impl, where="t"))
         # implementer content restored, and no clobber remains detectable
 
     def test_empty_before_sha_is_a_noop(self, leerie, tmp_path):
@@ -172,7 +172,7 @@ class TestRollbackRestoresClobber:
         # worktree rather than resetting to a garbage ref.
         d, impl = _impl_repo(tmp_path)
         before_head = _rev(d)
-        asyncio.run(leerie._rollback_conformer_commits(str(d), ""))
+        assert asyncio.run(leerie._restore_tree(d, "", where="t")) is False
         assert _rev(d) == before_head
         assert (d / "a.py").read_text() == "IMPL a\n"
         assert _rev(d) == impl
@@ -397,13 +397,13 @@ class TestBranchHeadSha:
         assert r == ""
 
 
-class TestRollbackConformerCommits:
+class TestRestoreTreeOnAnEmptyRev:
     def test_empty_before_sha_is_a_noop(self, leerie, tmp_path):
         """An empty before_sha must not attempt a reset at all — the
         early-return guard, distinct from a no-op reset to the same sha."""
         d, impl = _impl_repo(tmp_path)
         head_before = _rev(d)
-        asyncio.run(leerie._rollback_conformer_commits(str(d), ""))
+        assert asyncio.run(leerie._restore_tree(d, "", where="t")) is False
         assert _rev(d) == head_before
 
 

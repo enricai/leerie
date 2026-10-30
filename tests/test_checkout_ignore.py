@@ -13,6 +13,7 @@ tests/test_redrive_selfcheck_out_of_tree.py.)
 """
 from __future__ import annotations
 
+import asyncio
 import ast
 import inspect
 import subprocess
@@ -79,7 +80,8 @@ def test_falsifier_leads_leave_the_users_checkout_alone(leerie, tmp_path):
     # Inside the checkout both are ignored...
     assert _git(wt, "status", "--porcelain", "--untracked-files=all") == ""
     # ...and survive the per-sample `clean -fd`.
-    leerie._falsifier_reset(wt, _git(wt, "rev-parse", "HEAD").strip())
+    asyncio.run(leerie._restore_tree(
+        wt, _git(wt, "rev-parse", "HEAD").strip(), where="t"))
     assert (wt / "docs" / "bug-report.md").is_file()
     # A second placement (the next sample) is idempotent.
     leerie._falsifier_place_leads(st, wt, [], "see docs/bug-report.md")

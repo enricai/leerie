@@ -356,3 +356,82 @@ def test_a_non_utf8_file_name_is_removed_not_raised(harness):
     assert b"caf\xe9.txt" not in os.listdir(bytes(wt))
     assert os.path.exists(mine)
     json.dumps(harness["st"].data)      # the record persisted cleanly
+
+
+# ---- review round 15 claims H1: the I2 bracket on every exit ---------------
+# Only a `pass` used to put tracked files back, so a failing verify
+# command's tracked edit stayed for the next worker's I1 gate.
+
+_DIRTY = ("import pathlib; pathlib.Path('README.md').write_text('changed'); "
+          "pathlib.Path('made.txt').write_text('x')")
+
+
+def _porcelain(wt) -> str:
+    return subprocess.run(["git", "status", "--porcelain",
+                           "--untracked-files=all"], cwd=str(wt),
+                          capture_output=True, text=True).stdout
+
+
+def _assert_as_found(wt, readme: str) -> None:
+    assert (wt / "README.md").read_text() == readme
+    assert not (wt / "made.txt").exists()
+    assert _porcelain(wt) == ""
+
+
+def test_a_failing_command_leaves_the_tree_as_found(harness):
+    wt = harness["worktree"]
+    readme = (wt / "README.md").read_text()
+    res = _settle(harness, _sub(_py(_DIRTY + "; import sys; sys.exit(1)")))
+    assert res["verdict"] == "fail"
+    _assert_as_found(wt, readme)
+
+
+def test_an_environment_limit_leaves_the_tree_as_found(harness, monkeypatch):
+    wt = harness["worktree"]
+    readme = (wt / "README.md").read_text()
+
+    async def _contained(argv, **kw):
+        (wt / "README.md").write_text("changed")
+        (wt / "made.txt").write_text("x")
+        return {"rc": 137, "tail": "Killed", "timed_out": False,
+                "contained": True, "oom_kill": 1, "pids_denied": 0,
+                "peak": None}
+    monkeypatch.setattr(harness["leerie"], "_run_contained", _contained)
+    harness["st"].data["blt_peak"] = {"memory_bytes": 1 << 30, "pids": 10}
+    res = _settle(harness, _sub(["pnpm", "run", "build"]),
+                  worker_memory_max_bytes=5 << 30, worker_pids_max=4096)
+    assert res["verdict"] == "environment_limit"
+    _assert_as_found(wt, readme)
+
+
+def test_a_forbidden_argv_stopping_the_loop_leaves_the_tree_as_found(
+        harness, monkeypatch):
+    leerie = harness["leerie"]
+    wt = harness["worktree"]
+    readme = (wt / "README.md").read_text()
+    real = leerie._blt_shell_argv
+    seen = {"n": 0}
+
+    def gate(argv, forbidden, **k):
+        seen["n"] += 1
+        if seen["n"] == 2:
+            raise leerie.ForbiddenByTask("refused mid-loop")
+        return real(argv, forbidden, **k)
+    monkeypatch.setattr(leerie, "_blt_shell_argv", gate)
+    res = _settle(harness, _sub(_py(_DIRTY), _py("pass")))
+    assert res["verdict"] == "none" and "refused mid-loop" in res["why"]
+    _assert_as_found(wt, readme)
+
+
+def test_an_exception_leaves_the_tree_as_found(harness, monkeypatch):
+    wt = harness["worktree"]
+    readme = (wt / "README.md").read_text()
+
+    async def _contained(argv, **kw):
+        (wt / "README.md").write_text("changed")
+        (wt / "made.txt").write_text("x")
+        raise RuntimeError("broker gone")
+    monkeypatch.setattr(harness["leerie"], "_run_contained", _contained)
+    with pytest.raises(RuntimeError):
+        _settle(harness, _sub(_py("pass")))
+    _assert_as_found(wt, readme)

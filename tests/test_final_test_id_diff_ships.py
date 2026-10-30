@@ -99,10 +99,10 @@ def _break_protected(leerie, monkeypatch, caps):
     async def touched(wt, before):
         return [".github/workflows/ci.yml"]
 
-    async def rollback(wt, before):
-        return None
+    async def rollback(wt, before, *, where):
+        return True
     monkeypatch.setattr(leerie, "_protected_paths_since", touched)
-    monkeypatch.setattr(leerie, "_rollback_conformer_commits", rollback)
+    monkeypatch.setattr(leerie, "_restore_tree", rollback)
     return caps
 
 
@@ -112,10 +112,10 @@ def _break_clobber(leerie, monkeypatch, caps):
     async def clobbered(wt, base, head):
         return ["tests/test_s.py"]
 
-    async def rollback(wt, before):
-        return None
+    async def rollback(wt, before, *, where):
+        return True
     monkeypatch.setattr(leerie, "_clobbered_owned_files", clobbered)
-    monkeypatch.setattr(leerie, "_rollback_conformer_commits", rollback)
+    monkeypatch.setattr(leerie, "_restore_tree", rollback)
     return {**caps, "strict_conformer": True}
 
 

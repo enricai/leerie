@@ -3170,7 +3170,7 @@ def test_a_reset_that_cannot_spawn_is_tried_again(leerie, tmp_path,
         return real(argv, *a, **k)
     monkeypatch.setattr(leerie.subprocess, "run", eagain_once)
     monkeypatch.setattr(leerie.asyncio, "sleep", _no_sleep)
-    assert asyncio.run(leerie._acceptance_rollback(str(repo), before))
+    assert asyncio.run(leerie._restore_tree(repo, before, where="t"))
     assert _git(repo, "rev-parse", "HEAD") == before
 
 
@@ -3188,7 +3188,7 @@ def test_an_unreadable_head_after_a_reset_is_read_again(leerie, tmp_path,
         return "" if len(n) == 1 else await real(wt)
     monkeypatch.setattr(leerie, "_branch_head_sha", blip)
     monkeypatch.setattr(leerie.asyncio, "sleep", _no_sleep)
-    assert asyncio.run(leerie._acceptance_rollback(str(staging), before))
+    assert asyncio.run(leerie._restore_tree(staging, before, where="t"))
     assert _git(repo, "rev-parse", "HEAD") == before
 
 

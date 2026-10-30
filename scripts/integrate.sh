@@ -26,7 +26,9 @@ fi
 
 cd "$STAGING"
 
-if git merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
+# Hooks off: this merge is leerie's, not the user's, and a hook such as
+# husky's post-merge would write into staging (DESIGN §6½).
+if git -c core.hooksPath=/dev/null merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
   echo "integrated: ${ID}"
   exit 0
 else

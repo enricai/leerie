@@ -590,7 +590,8 @@ host_finalize() {
     local _rebase_scratch _rebase_worktree
     _rebase_scratch="$(mktemp -d)"
     _rebase_worktree="$_rebase_scratch/rebase-${run_id}"
-    if git -C "$USER_REPO" worktree add "$_rebase_worktree" "$run_branch" \
+    if git -C "$USER_REPO" -c core.hooksPath=/dev/null worktree add \
+         "$_rebase_worktree" "$run_branch" \
          >/dev/null 2>&1; then
       echo "[leerie] finalize: attempting rebase of $run_branch onto $pr_base_branch" >&2
       # Write the python3 seam to a script file rather than a heredoc so the

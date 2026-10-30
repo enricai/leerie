@@ -1590,7 +1590,7 @@ flagged; the load-bearing round-0 snapshot test — a per-round HEAD misses
 a round-0 clobber while the pre-loop `impl_head_sha` catches it;
 empty-ref no-op), `_blob_sha`'s present/absent contract (missing-path
 returns None, guarding the bare `git rev-parse <ref>:<path>` footgun),
-`_rollback_conformer_commits` restoring clobbered content and dropping
+`_restore_tree` restoring clobbered content and dropping
 the conformer commit (`TestRollbackRestoresClobber`), and source-coupling
 guards that both `_run_conformance_phase` and `_run_final_conformance`
 snapshot before the round loop and call the guard under

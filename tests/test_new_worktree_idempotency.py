@@ -232,7 +232,7 @@ def test_prune_precedes_the_orphan_guard_in_source(tmp_path: Path) -> None:
     assert code.index("prune_leerie_worktrees") < code.index('rm -rf "$WT"'), (
         "the prune must precede the orphan-directory removal — "
         "prune is what creates the orphan the removal repairs")
-    assert code.index('rm -rf "$WT"') < code.index("git worktree add"), (
+    assert code.index('rm -rf "$WT"') < code.index("worktree add"), (
         "the orphan removal must precede `worktree add`")
 
 
@@ -359,12 +359,14 @@ def test_race_between_check_and_add_is_repaired(tmp_path: Path) -> None:
     sentinel = tmp_path / "raced"
     (shim_dir / "git").write_text(
         "#!/bin/sh\n"
-        'if [ "$1" = "worktree" ] && [ "$2" = "add" ] && '
+        # leerie's `worktree add` runs hooks off: `git -c
+        # core.hooksPath=/dev/null worktree add <path> …`, so the
+        # destination is $5.
+        'if [ "$3" = "worktree" ] && [ "$4" = "add" ] && '
         f'[ ! -e "{sentinel}" ]; then\n'
         f'  : > "{sentinel}"\n'
-        # $3 is the destination path for `worktree add <path> …`
-        '  mkdir -p "$3" 2>/dev/null || true\n'
-        '  : > "$3/.racer" 2>/dev/null || true\n'
+        '  mkdir -p "$5" 2>/dev/null || true\n'
+        '  : > "$5/.racer" 2>/dev/null || true\n'
         "fi\n"
         f'exec {real_git} "$@"\n')
     (shim_dir / "git").chmod(0o755)

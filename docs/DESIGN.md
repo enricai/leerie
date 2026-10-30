@@ -5254,16 +5254,52 @@ Rootful's `runuser -u leerie` is a real uid switch, rootless's `unshare
 --map-user` maps the host user to that same inner uid (the
 bind-mounted state root is the host user's), and Fly runs the
 orchestrator as `leerie` too, so the tree's files are the orchestrator's
-in all three. What can still stop a removal is a permission *bit*: a test
+in all three. One exception, on Fly only: subtree collection after a
+dead run (`collect-subtrees.sh`, over `flyctl ssh console`) runs git as
+root, so a merge it makes leaves root-owned files in staging, and a later
+resume's restore there stops with the paths instead of removing them. It
+is a known follow-up, not something the bracket can absorb. What can
+still stop a removal is a permission *bit*: a test
 that makes a directory read-only (testing an `EACCES` path) and dies
 before restoring it. `git clean` and `unlink` then fail with "Permission
 denied" on every runtime alike. Since the directory is the orchestrator's
 own, the bracket restores the write bit on the directories between the
 tree and a path it removes or puts back, and only then acts. A path it
-still cannot remove or restore — so not the orchestrator's own, which no
-code path produces — stops the run there, naming the path and the
-error, rather than leaving dirt that `_assert_staging_clean` would later
-report with no cause.
+still cannot remove or restore — so not the orchestrator's own — stops
+the run there, naming the path and the error, rather than leaving dirt that `_assert_staging_clean` would later
+report with no cause. An untracked entry that is a directory — a nested
+repository a test `git init`s, which `git ls-files --others` lists as one
+`fx-repo/` entry — is removed whole (review round 15 M2).
+
+The integration merge (`integrate.sh`) is one of leerie's own commands
+in staging, and is bracketed like the rest, with two refinements (review
+round 15 M3, where a merge's own output reached `_assert_staging_clean`
+as "a leerie bug").
+
+- *Hooks off.* Every git command leerie itself runs that can fire a
+  repository hook — a merge, a commit, a branch checkout, a `worktree
+  add` — runs with `core.hooksPath` pointed at an empty location (`-c
+  core.hooksPath=/dev/null`), for that invocation only. Those commits and
+  checkouts are leerie's, not the user's; a `post-merge` or
+  `post-checkout` hook (husky turns them on during leerie's own install)
+  writes files into the tree leerie then measures, and a `pre-commit`
+  hook can rewrite what leerie commits. Workers' own git commands are
+  theirs and keep the repository's hooks.
+- *The untracked half only.* The merge's tracked changes are its product
+  — a committed merge, or a conflict left for the integrator — so the
+  bracket does not put tracked files back around it; it removes only the
+  untracked, not-ignored paths the merge created. The case that matters:
+  a merged commit changes `.gitignore`, and output a build or install
+  left — ignored until then, kept by I2 as environment — becomes
+  untracked. Removing it loses nothing: ignore status is a property of
+  the commit staging is at, and under the merged commit that file is
+  neither part of what ships (it is not committed) nor ignored
+  environment; left, it would put a file that does not ship in front of
+  every later measurement, which is exactly the guess §8 removed. Whatever
+  produced it is the build or install, which the next measurement runs
+  again — so when the merge's bracket removes anything, staging's
+  dependency-install memo is dropped and the next measurement installs
+  afresh.
 
 Three details keep the snapshot itself sound. Only the snapshot taken
 before a command writes its blobs to the object store, since only those
@@ -7300,10 +7336,13 @@ property is the resume's own invariant, not a convenience of cleanup:
 an interrupted run's cleanup removes staging, but a SIGKILL (Fly's
 `machine stop`, an OOM kill of the container) skips cleanup and leaves
 staging as the killed worker left it — partial edits, a merge half
-resolved. So `setup-run.sh`, which every process runs once before it
-reads staging, resets a staging that survived (`git reset --hard HEAD`,
-which also ends a merge in progress, then `git clean -fd`, which keeps
-ignored files and so the installed dependencies). Nothing uncommitted in
+resolved, or a HEAD a worker detached or moved to another branch. So
+`setup-run.sh`, which every process runs once before it reads staging,
+restores a staging that survived with the one restore primitive (*One
+restore*, §8 below): it checks out the run branch itself — `git reset
+--hard HEAD` alone kept a detached HEAD, review round 15 H2 — ends any
+merge, and removes what is untracked, ignored files and so the installed
+dependencies kept. Nothing uncommitted in
 it is anything leerie may keep: I1 never commits a worker's leftovers,
 and the run branch — every integrated commit — is untouched. The same
 holds for every subtask worktree the process will reuse: a SIGKILL leaves
@@ -7311,19 +7350,18 @@ each as its implementer or conformer stopped, and `new-worktree.sh`
 reattaches to a registered worktree as it is, so a resumed subtask's
 first measurement, or its next worker, would start on the killed
 worker's half-made edits (a measurement through I2 leaves them; the next
-worker's I1 gate holds it to files it never made). `setup-run.sh` resets
-each worktree of this run on a `leerie/subtasks/<run-id>/` branch the
-same way, before any wave runs, and keeps its commits — exactly what a
+worker's I1 gate holds it to files it never made). `setup-run.sh` restores
+every subtask worktree of this run the same way onto its own
+`leerie/subtasks/<run-id>/<sid>` branch, before any wave runs, and keeps
+the branch's commits. It finds them by path — the run's worktree
+directory, a name whose subtask branch exists — never by the branch git
+reports as checked out there: a worktree a worker detached reports none,
+and was skipped (review round 15 H2). That is exactly what a
 Ctrl-C's cleanup, which removes the worktree and keeps the branch, leaves
 the resume. This runs once per process; within a process the per-attempt
 rules govern a subtask's worktree (I1 on a `complete` result; a handoff
 commits its partial work and leaves its checkpoint in the run
-directory). The reset first restores the write bit on the worktree's
-tracked directories and on every untracked, not-ignored path, for the
-reason §6½ gives (a killed test's read-only directory made `git clean`
-and `git reset --hard` fail with "Permission denied", and `setup-run.sh`,
-under `set -e`, then stopped every resume); a failure that remains stops
-setup with git's own error. A killed
+directory). A restore that still leaves dirt stops setup, naming it. A killed
 integrator's half resolution goes with it, as it already did under a
 Ctrl-C's cleanup. Continuing would mean
 measuring, judging or shipping a tree leerie cannot name — the very guess
@@ -7589,8 +7627,8 @@ The gate:
   dirty after the last re-ask, the worker's round is rolled back by the
   rule that already undoes that round — a subtask is settled `unconverged`
   and not integrated; a conformer round, an acceptance-repair round or a
-  re-drive group is reset to its start (`git reset --hard`, then `git
-  clean -fd`, which keeps ignored files); an integrator's merge is backed
+  re-drive group is reset to its start (*One restore*, below: ignored
+  files kept); an integrator's merge is backed
   out — and the porcelain lines are recorded with it. A conformer,
   acceptance-repair or re-drive round's record makes the run
   `unconverged`, its lines named under "Unconverged" in the PR; an
@@ -7600,12 +7638,34 @@ The gate:
 
 The rollbacks this rests on are made exact for the same reason: a back-out
 of an integrator's merge and the reset before an integrator is retried
-also remove untracked files (`git clean -fd`), so the next worker in
-staging starts from a tree I1 already held, and is never asked about
-files it did not make. A worker that was reaped mid-turn (an
-`empty_handoff` rescued on its commits) has no session to ask; its
-uncommitted debris, tracked and untracked, is discarded, as its tracked
-debris always was — the deliverable is the committed diff.
+also remove untracked files, so the next worker in staging starts from a
+tree I1 already held, and is never asked about files it did not make. A
+worker that was reaped mid-turn (an `empty_handoff` rescued on its
+commits) has no session to ask; its uncommitted debris, tracked and
+untracked, is discarded, as its tracked debris always was — the
+deliverable is the committed diff.
+
+**One restore.** Every rollback and reset of a tree to a commit — a
+conformer, acceptance-repair or re-drive round rolled back, an
+integrator's merge backed out or restarted, a repair round reset, a
+reaped implementer's debris, the falsifier's checkout between samples,
+and `setup-run.sh`'s and the subtree collection's resets — is one
+primitive, in Python (`_restore_tree`) and in shell
+(`leerie_reset_worktree`), with one postcondition: the tree is at the
+commit, and I1's own checker reads nothing (`git status --porcelain
+--untracked-files=all` empty). Review round 15 M2 drove why: "back to the
+committed state" had three implementations of different reach — one
+restored no write bits, none removed a nested repository (a fixture `git
+init`, a clone into the tree: `git clean -fd` skips them, `-ffd` does
+not), and none checked that the dirt I1 reports was gone — so I1's
+designed exhaustion path, roll back and record, became a `die()` at the
+next reader, and the nested-repo case one that recurred on every resume.
+The primitive restores the owner's write bit on the tracked directories
+and the untracked paths (§6½), resets, runs `git clean -ffd` (ignored
+files kept), and reads the checker. Dirt it cannot remove is not the
+orchestrator's own (Fly's root-run subtree collection, §6½, is the one
+known producer) and stops the run there, with the lines. In shell it also checks out the expected branch
+(§8 *The final diff describes the tree that ships*, the resume).
 
 Superseded by this: the leftovers commit with its artifact-name list, its
 caps and its saved archive, the "Files a re-drive left uncommitted" PR
@@ -8034,11 +8094,15 @@ command passes on exit 0; a command that fails is re-checked under B\*
 `confirm_pairs` reruns, any exit 0 passing it as `resource_affected`).
 The settle needs every command to pass and the worktree's tracked files
 to be unchanged afterwards (a command that rewrites tracked files has not
-verified the tree it ran on; the change is reverted). Untracked files the
-commands create — build output, reports — are removed afterwards, whatever
-the verdict, so none waits in the worktree for a later worker's `git add
--A`; files that were already there and ignored files (installed
-dependencies) stay. Command output is
+verified the tree it ran on). The verify commands are leerie's own
+commands in a worker's tree, so they run inside the I2 bracket (§6½) on
+every exit — a pass, a fail, an environment limit, a forbidden argv that
+stops the loop, an exception: a tracked file they changed is put back and
+an untracked file they created is removed, files that were already there
+and ignored files (installed dependencies) staying. Review round 15
+(claims H1) drove why it is the bracket and not a step of the verdict: the
+put-back used to run only on a pass, so a failing command's tracked edit
+stayed for the next worker's I1 gate to hold it to. Command output is
 data — it is logged, and only a tail ever reaches a worker, fenced as
 untrusted output in a re-drive note, never as instructions. A no-commit
 claim on a subtask whose planned surface a sibling already changed this

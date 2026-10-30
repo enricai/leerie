@@ -227,7 +227,7 @@ integrated_so_far=""
 . "$SCRIPTS/worktree-lib.sh"
 backout_failed=false
 _back_out() {
-  if ! leerie_reset_worktree "$staging" "$1" >&2; then
+  if ! leerie_reset_worktree "$staging" "$run_branch" "$1" >&2; then
     backout_failed=true
     echo "collect-subtrees: staging could not be reset to ${1}; the remaining branches are skipped" >&2
   fi

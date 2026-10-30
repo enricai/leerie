@@ -1011,15 +1011,13 @@ def test_restart_merge_refuses_a_head_the_reset_did_not_move(
         script_calls.append(script)
         return await real_script(script, sid, run_id)
 
-    real_run_proc = leerie.run_proc
-
-    async def run_proc(cmd, **kw):
-        if not reset_runs and cmd[:2] == ["git", "reset"]:
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        return await real_run_proc(cmd, **kw)
+    async def no_reset(tree, rev, *, where):
+        # The one restore primitive's own failure: the reset did not land.
+        return False
 
     monkeypatch.setattr(leerie, "_run_script", spy_script)
-    monkeypatch.setattr(leerie, "run_proc", run_proc)
+    if not reset_runs:
+        monkeypatch.setattr(leerie, "_restore_tree", no_reset)
     end = asyncio.run(leerie._restart_integration_merge(
         staging, st, "feat-001", pre))
     if reset_runs:
@@ -1274,14 +1272,10 @@ def test_first_resolution_back_out_dies_only_when_the_reset_fails(
     leerie_dir = tmp_path / ".leerie"
     staging, pre = _conflicting_staging(leerie_dir)
     results = {"feat-001": {"status": "complete"}}
-    real_run_proc = leerie.run_proc
-
-    async def broken_reset(cmd, cwd=None, **kw):
-        if cmd[:3] == ["git", "reset", "--hard"]:
-            mock = AsyncMock()
-            mock.returncode, mock.stdout, mock.stderr = 128, "", "corrupt"
-            return mock
-        return await real_run_proc(cmd, cwd=cwd, **kw)
+    async def broken_reset(tree, rev, *, where):
+        # The one restore primitive's reset does not land (a broken
+        # repository): HEAD stays where the integrator left it.
+        return False
 
     async def fake_claude_p(**kwargs):
         import subprocess
@@ -1292,7 +1286,7 @@ def test_first_resolution_back_out_dies_only_when_the_reset_fails(
 
     monkeypatch.setattr(leerie, "_run_script", _real_conflict_script(staging))
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "run_proc", broken_reset)
+    monkeypatch.setattr(leerie, "_restore_tree", broken_reset)
     with pytest.raises(SystemExit):
         asyncio.run(leerie.integrate_wave(
             ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS,

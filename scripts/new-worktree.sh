@@ -141,9 +141,9 @@ _create_worktree() {
   if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
     # branch exists (pre-existing, or created by a failed first attempt) —
     # attach to it, preserving any commits already on it
-    git worktree add "$WT" "$BRANCH"
+    git "${LEERIE_GIT_NO_HOOKS[@]}" worktree add "$WT" "$BRANCH"
   else
-    git worktree add "$WT" -b "$BRANCH" "$PARENT_BRANCH"
+    git "${LEERIE_GIT_NO_HOOKS[@]}" worktree add "$WT" -b "$BRANCH" "$PARENT_BRANCH"
   fi
 }
 

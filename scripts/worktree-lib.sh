@@ -137,19 +137,30 @@ leerie_worktree_name() {
   printf '%s-%s' "${run_id:0:12}" "$name"
 }
 
-# leerie_reset_worktree <worktree> [<rev>]
+# The hooks-off flags every git command of leerie's own that can fire a
+# repository hook carries (a merge, a branch checkout, a `worktree add`):
+# those are leerie's, not the user's, and a hook such as husky's post-merge
+# writes into the tree leerie then measures (DESIGN §6½).
+LEERIE_GIT_NO_HOOKS=(-c core.hooksPath=/dev/null)
+
+# leerie_reset_worktree <worktree> <branch> [<rev>]
 #
-# Put <worktree> at <rev> (default HEAD) with nothing uncommitted: `reset
-# --hard` (which also ends a merge in progress), then `clean -fdq` (ignored
-# files kept). A test a SIGKILL interrupted can leave a read-only directory,
-# and git then fails with "Permission denied" on every runtime; the
-# directories are the orchestrator's own, so the owner's write and search
-# bits go back first on every tracked directory and on every untracked,
-# not-ignored path (DESIGN §6½, §8). Returns git's status: a failure that
-# remains is the caller's to stop on.
+# THE restore primitive's shell half (DESIGN §8 *One restore*; Python's is
+# `_restore_tree`): <worktree> on <branch> (empty: a detached checkout stays
+# detached) at <rev> (default the branch tip, or HEAD), with nothing
+# uncommitted. A worker may have left HEAD detached or on another branch,
+# which `reset --hard HEAD` kept (review round 15 H2), so the branch is
+# checked out (`checkout -f`, hooks off), then `reset --hard <rev>` (ending
+# any merge) and `clean -ffdq`: nested repositories go too, ignored files
+# stay (review round 15 M2). The owner's write and search bits go back first
+# on every tracked directory and every untracked, not-ignored path (DESIGN
+# §6½: a killed test's read-only directory). Postcondition, I1's own
+# checker: `git status --porcelain --untracked-files=all` prints nothing and
+# HEAD is <branch>; otherwise the porcelain goes to stderr and it returns 1.
 leerie_reset_worktree() {
-  local wt="${1:?usage: leerie_reset_worktree <worktree> [<rev>]}"
-  local rev="${2:-HEAD}"
+  local wt="${1:?usage: leerie_reset_worktree <worktree> <branch> [<rev>]}"
+  local branch="${2-}"
+  local rev="${3:-}"
   chmod u+wx "$wt" 2>/dev/null || true
   (
     cd "$wt" || exit 0
@@ -158,5 +169,22 @@ leerie_reset_worktree() {
     git ls-files -z --others --exclude-standard --directory 2>/dev/null \
       | xargs -0 -r chmod -R u+w -- 2>/dev/null || true
   )
-  git -C "$wt" reset -q --hard "$rev" && git -C "$wt" clean -fdq
+  if [ -n "$branch" ]; then
+    git -C "$wt" "${LEERIE_GIT_NO_HOOKS[@]}" checkout -q -f "$branch" \
+      || return 1
+  fi
+  git -C "$wt" reset -q --hard "${rev:-HEAD}" || return 1
+  git -C "$wt" clean -ffdq || return 1
+  local dirt
+  dirt="$(git -C "$wt" status --porcelain --untracked-files=all)" || return 1
+  if [ -n "$dirt" ]; then
+    printf 'leerie_reset_worktree: %s is not clean after the reset:\n%s\n' \
+      "$wt" "$dirt" >&2
+    return 1
+  fi
+  if [ -n "$branch" ] && [ "$(git -C "$wt" symbolic-ref -q HEAD)" != "refs/heads/$branch" ]; then
+    printf 'leerie_reset_worktree: %s is not on %s after the reset\n' \
+      "$wt" "$branch" >&2
+    return 1
+  fi
 }

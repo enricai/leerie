@@ -5677,6 +5677,14 @@ def _helper_worktree_path(st: "State", name: str) -> Path:
                                                         name)
 
 
+# Every git command of leerie's own that can fire a repository hook — a
+# merge, a commit, a branch checkout, a `worktree add` — runs with the hooks
+# off for that invocation only (DESIGN §6½: a `post-merge` hook husky enabled
+# wrote into staging). Workers' own git commands keep the repository's hooks.
+# Pinned for every such argv by tests/test_leerie_git_runs_no_hooks.py.
+GIT_NO_HOOKS = ("-c", "core.hooksPath=/dev/null")
+
+
 def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
                            repo: Path | None = None
                            ) -> subprocess.CompletedProcess:
@@ -5689,7 +5697,8 @@ def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
     helpers fail open. `repo` (default the run's repository) is the
     checkout git is run in — any worktree of the same repository."""
     root = str(repo if repo is not None else st.repo_root)
-    argv = ["git", "-C", root, "worktree", "add", "--detach", str(wt), rev]
+    argv = ["git", "-C", root, *GIT_NO_HOOKS, "worktree", "add", "--detach",
+            str(wt), rev]
     lock_fd = None
     try:
         gd = subprocess.run(["git", "-C", root, "rev-parse",
@@ -37118,17 +37127,6 @@ async def _clobbered_owned_files(worktree: str, base_ref: str,
     return clobbered
 
 
-async def _rollback_conformer_commits(worktree: str, before_sha: str) -> None:
-    """Hard-reset the subtask branch back to `before_sha`. Used when the
-    conformer wrote to a protected path — the implementer's commits
-    are preserved, the conformer's are dropped. Safe to call when no
-    new commits were made: it's a no-op reset. The tree is clean by then
-    (I1, `_clean_tree_gate`), so the reset discards nothing uncommitted."""
-    if not before_sha:
-        return
-    await run_proc(["git", "reset", "--hard", before_sha], cwd=worktree)
-
-
 # I1 (DESIGN §8 *A worker leaves its tree clean*): the one message a worker
 # that left its tree dirty is re-asked with. It carries the porcelain lines
 # verbatim and allows exactly two acts per line; anything else would be
@@ -38351,8 +38349,8 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                 effort=efforts.get("conformer"),
                 max_turns=60))
         if unclean:
-            await _rollback_conformer_commits(worktree, before_sha)
-            await run_proc(["git", "clean", "-fdq"], cwd=worktree)
+            await _restore_tree(worktree, before_sha,
+                                where=f"{sid} conformer rollback")
             warnings.append(f"conformer round {c_round}: "
                             + _unclean_reason("the conformer", unclean))
             _record_unclean_tree(st, "conformer", f"{sid} round {c_round}",
@@ -38385,7 +38383,8 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         # side-channel and does not surface here.
         scope_err = await check_diff_scope(sid, worktree, subtask, st)
         if scope_err:
-            await _rollback_conformer_commits(worktree, before_sha)
+            await _restore_tree(worktree, before_sha,
+                                where=f"{sid} conformer rollback")
             warnings.append(f"conformer round {c_round}: protected-path "
                             f"violation reverted ({scope_err})")
             # The rollback just reverted every commit this round made, so
@@ -38489,7 +38488,8 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                 f"conformer round {c_round}: reverted/deleted "
                 f"{len(clobbered)} implementer-owned file(s): {clobbered}")
             if caps.get("strict_conformer"):
-                await _rollback_conformer_commits(worktree, impl_head_sha)
+                await _restore_tree(worktree, impl_head_sha,
+                                    where=f"{sid} conformer rollback")
                 warnings.append(
                     f"conformer round {c_round}: strict mode — rolled "
                     "conformer commits back to implementer HEAD to restore "
@@ -39313,11 +39313,17 @@ def _remove_new_untracked(tree: str | Path, before: set[str]) -> list[str]:
         return []
     made = sorted(now - before)
     for rel in made:
-        _writable_dirs_to(tree, rel)
+        _writable_dirs_to(tree, rel.rstrip("/"))
+        full = Path(tree) / rel
+        if full.is_dir() and not full.is_symlink():
+            # A nested repository (a test's `git init` fixture): git lists
+            # it as one `dir/` entry, removed whole (review round 15 M2).
+            _rmtree_owned(full)
+            continue
         with contextlib.suppress(OSError):
-            (Path(tree) / rel).unlink()
-    for d in sorted({os.path.dirname(r) for r in made if "/" in r},
-                    key=lambda x: -len(x)):
+            full.unlink()
+    for d in sorted({os.path.dirname(r.rstrip("/")) for r in made
+                     if "/" in r.rstrip("/")}, key=lambda x: -len(x)):
         with contextlib.suppress(OSError):
             os.removedirs(Path(tree) / d)
     return made
@@ -39354,7 +39360,7 @@ def _log_undone(log_prefix: str, did: str, what: str,
 
 @contextlib.asynccontextmanager
 async def _leaves_tree_as_found(tree: str | Path, what: str,
-                                log_prefix: str):
+                                log_prefix: str, *, tracked: bool = True):
     """Around one of leerie's own commands in a tree a worker works in — a
     recipe install or build, a measured build/lint/test axis, a test-ID
     report run, a coverage settle's command: afterwards the tree is as it
@@ -39364,10 +39370,15 @@ async def _leaves_tree_as_found(tree: str | Path, what: str,
     every untracked, not-ignored file it created is deleted
     (`_remove_new_untracked`); dependencies and other ignored output stay,
     so the tree stays runnable. Never raises from the snapshots, the
-    restore or the removal."""
+    restore or the removal. With `tracked=False` (leerie's own merge, whose
+    tracked changes are its product: a committed merge or a conflict for
+    the integrator) only the untracked half applies. Yields a dict whose
+    `removed` is filled with what was deleted."""
+    rec: dict = {"removed": []}
     try:
-        before = await asyncio.to_thread(
+        before = (await asyncio.to_thread(
             functools.partial(_tracked_content, tree, write=True))
+            if tracked else None)
     except Exception:
         before = None
     try:
@@ -39375,7 +39386,7 @@ async def _leaves_tree_as_found(tree: str | Path, what: str,
     except Exception:
         untracked_before = None
     try:
-        yield
+        yield rec
     finally:
         put_back: list[str] = []
         if before is not None:
@@ -39393,6 +39404,7 @@ async def _leaves_tree_as_found(tree: str | Path, what: str,
                     _remove_new_untracked, tree, untracked_before)
             except Exception:
                 removed = []
+        rec["removed"] = removed
         _log_undone(log_prefix, "put back",
                     f"tracked file(s) its own {what} rewrote", put_back)
         _log_undone(log_prefix, "removed",
@@ -46607,7 +46619,7 @@ def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
                  "--no-tags", str(st.repo_root), str(wt))
     ok = clone.returncode == 0
     if ok:
-        ok = _git("checkout", "--quiet", "--detach", base,
+        ok = _git(*GIT_NO_HOOKS, "checkout", "--quiet", "--detach", base,
                   cwd=wt).returncode == 0
     if ok:
         refs = _git("for-each-ref", "--format=%(refname)", cwd=wt)
@@ -48641,7 +48653,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 final, final_sha = prev, prev_sha
 
         async def _undo_round(entry: dict) -> None:
-            ok = await _redrive_rollback(staging, entry["pre_sha"])
+            ok = await _restore_tree(staging, entry["pre_sha"],
+                                     where="acceptance repair rollback")
             entry["rolled_back"] = ok
             if ok:
                 log(f"  acceptance repair round {entry['round']} "
@@ -48869,7 +48882,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
         if gate.get("rolled_back"):
             # Also the path a resume after the decision takes: the reset is
             # idempotent. Its result is checked, never assumed.
-            if await _acceptance_rollback(str(staging), before_sha):
+            if await _restore_tree(staging, before_sha,
+                                   where="acceptance gate rollback"):
                 log(f"  acceptance repair {gate.get('rollback_reason') or ''}"
                     " — its commits were reset away; residual recorded")
                 final = initial
@@ -49085,26 +49099,76 @@ def _acceptance_can_check(st: "State") -> bool:
             and bool(resolve_test_files_scoped(st.repo_root)))
 
 
-async def _acceptance_rollback(staging: str, before_sha: str) -> bool:
-    """Reset staging to `before_sha` and confirm HEAD is there — the same
-    don't-trust-the-report discipline applied to leerie's own git step (a
-    stale index.lock makes `reset --hard` fail)."""
-    if not before_sha:
+def _restore_write_bits(tree: str | Path) -> None:
+    """The owner's write and search bits back on every tracked directory of
+    `tree` and every untracked, not-ignored path in it (DESIGN §6½: a killed
+    test's read-only directory). The paths are the orchestrator's own; a
+    chmod refused is left to the caller's postcondition."""
+    r = subprocess.run(["git", "-C", str(tree), "ls-tree", "-r", "-d", "-z",
+                        "--name-only", "HEAD"], capture_output=True,
+                       check=False)
+    dirs = [""] + [os.fsdecode(d) for d in r.stdout.split(b"\0") if d]
+    for d in dirs:
+        with contextlib.suppress(OSError):
+            full = os.path.join(str(tree), d)
+            mode = os.lstat(full).st_mode
+            if stat.S_ISDIR(mode) and (mode & 0o300) != 0o300:
+                os.chmod(full, stat.S_IMODE(mode) | 0o300)
+    r = subprocess.run(["git", "-C", str(tree), "ls-files", "--others",
+                        "--exclude-standard", "--directory", "-z"],
+                       capture_output=True, check=False)
+    for rel in (os.fsdecode(x) for x in r.stdout.split(b"\0") if x):
+        full = Path(tree) / rel
+        _writable_dirs_to(tree, rel.rstrip("/"))
+        if full.is_dir() and not full.is_symlink():
+            for d, _dirs, _files in os.walk(full):
+                with contextlib.suppress(OSError):
+                    os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) | 0o700)
+
+
+async def _restore_tree(tree: str | Path, rev: str, *, where: str) -> bool:
+    """THE restore primitive (DESIGN §8 *One restore*): `tree` back to `rev`
+    with nothing uncommitted — the owner's write bits restored
+    (`_restore_write_bits`), `git reset --hard <rev>` (ending any merge),
+    `git clean -ffdq` (nested repositories too; ignored files kept). True
+    when HEAD is then `rev`; False when the reset did not land (a stale
+    index.lock: the caller's own failure path). Its postcondition is I1's
+    checker: dirt `_tree_dirt` still reads after a reset that landed is not
+    the orchestrator's own, and stops the run there with the lines (`where`
+    names the step)."""
+    if not rev:
         return False
+    await asyncio.to_thread(_restore_write_bits, tree)
+    landed = False
     # Up to three attempts, a second apart: a spawn failure (EAGAIN) on the
     # reset or an unreadable HEAD afterwards is not yet a failed reset.
     for attempt in range(3):
         if attempt:
             await asyncio.sleep(1)
         try:
-            subprocess.run(["git", "-C", staging, "reset", "--hard",
-                            before_sha], capture_output=True, check=False)
+            subprocess.run(["git", "-C", str(tree), "reset", "-q", "--hard",
+                            rev], capture_output=True, check=False)
         except OSError:
             continue
-        head = await _branch_head_sha(staging)
+        head = await _branch_head_sha(str(tree))
         if head:
-            return head == before_sha
-    return False
+            landed = head == rev
+            break
+    if not landed:
+        return False
+    subprocess.run(["git", "-C", str(tree), "clean", "-ffdq"],
+                   capture_output=True, check=False)
+    left = await _tree_dirt(tree)
+    if left != []:
+        lines = (["(git status failed — the tree could not be read)"]
+                 if left is None else left)
+        die(f"{where}: {tree} could not be restored to {rev[:12]} — "
+            "still there after the write bits, `reset --hard` and `clean "
+            "-ffd`: " + "; ".join(lines[:20])
+            + (f" (+{len(lines) - 20} more)" if len(lines) > 20 else "")
+            + ". Not the orchestrator's own files (DESIGN §8 *One "
+            "restore*); remove them, then `leerie resume`.")
+    return True
 
 
 async def _acceptance_write_or_skip(task: str, st: "State", caps: dict,
@@ -50850,16 +50914,6 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
     return ctx, refs
 
 
-def _falsifier_reset(wt: Path, sha: str) -> None:
-    """Back to the pristine final commit between samples: tracked files
-    reset, untracked ones removed (ignored ones — installed dependencies —
-    kept)."""
-    subprocess.run(["git", "-C", str(wt), "reset", "-q", "--hard", sha],
-                   capture_output=True, check=False)
-    subprocess.run(["git", "-C", str(wt), "clean", "-fdq"],
-                   capture_output=True, check=False)
-
-
 def _falsifier_user_prompt(task: str, item: dict, own: str | None,
                            stat: str, ctx: list[str], refs: list[str],
                            parts: list[dict]) -> str:
@@ -51112,7 +51166,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
 
         async def _sample(i: int, n: int, lane: Path) -> dict:
             item = normalized[i]
-            _falsifier_reset(lane, sha)
+            # Back to the pristine final commit between samples.
+            await _restore_tree(lane, sha, where="falsifier checkout reset")
             # Reset with the tree: a fresh database per sample, so one
             # sample's rows never reach the next.
             db_url = await _create_test_db(st, lane, "falsifier-lane")
@@ -52355,15 +52410,6 @@ def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
             if _holds_heldout_span(_bytes_pieces(body), prints):
                 hits |= blobs[sha]
     return sorted(hits)
-
-
-async def _redrive_rollback(staging: Path, pre_sha: str) -> bool:
-    """`reset --hard pre_sha` (confirmed) then `clean -fd` (ignored files —
-    installed dependencies — kept)."""
-    ok = await _acceptance_rollback(str(staging), pre_sha)
-    subprocess.run(["git", "-C", str(staging), "clean", "-fdq"],
-                   capture_output=True, check=False)
-    return ok
 
 
 async def _redrive_test_ids(st: "State", caps: dict, staging: Path,
@@ -53987,7 +54033,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         _rmtree_owned(st.run_dir / "selfcheck")
         _redrive_exclude_clear(staging, run_id)
         if flight.get("pre_sha"):
-            ok = await _redrive_rollback(staging, flight["pre_sha"])
+            ok = await _restore_tree(staging, flight["pre_sha"],
+                                     where="re-drive rollback")
             log(f"  delivery re-drive: resumed — the interrupted group was "
                 f"{'rolled back' if ok else 'NOT rolled back (reset failed)'}")
         rec.pop("in_flight", None)
@@ -54284,7 +54331,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 ge["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
                 _record_unclean_tree(st, "delivery re-drive implementer",
                                      f"r{rnd} g{gi}", unclean)
-                ok = await _redrive_rollback(staging, pre_sha)
+                ok = await _restore_tree(staging, pre_sha,
+                                         where="re-drive rollback")
                 ge["rolled_back"] = ok
                 drove = True
                 prior_members += [m for m in members
@@ -54402,7 +54450,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         ge["ratchet_regressed"] = list(rat["regressed"])
                         void = True
                 if v["worse"] or void:
-                    ok = await _redrive_rollback(staging, pre_sha)
+                    ok = await _restore_tree(staging, pre_sha,
+                                             where="re-drive rollback")
                     ge["rolled_back"] = ok
                     if not ok:
                         ge["rollback_failed"] = True
@@ -54655,7 +54704,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # commit and none of those files was reverted; the two runs whose final
     # conformer committed nothing reported nothing, which is the control. Under
     # `--strict-conformer` the same false positive drives
-    # `_rollback_conformer_commits`, i.e. it would `git reset --hard` away every
+    # `_restore_tree`, i.e. it would `git reset --hard` away every
     # legitimate final-conformer fix (docs/POSTMORTEM-2026-08-14.md, F2).
     #
     # `fork_point..staging_before` is what the owned-set docstring actually
@@ -54773,7 +54822,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # round's post-measurement or any later stage reads staging, and
         # after a crashed or timed-out worker too — it may have edited the
         # tree before it stopped. Still dirty after the re-asks, the round
-        # is rolled back to its start (`_redrive_rollback`: its commits, and
+        # is rolled back to its start (`_restore_tree`: its commits, and
         # untracked files with ignored ones kept) and recorded, which makes
         # the run unconverged.
         unclean = await _clean_tree_gate(
@@ -54785,7 +54834,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                 model=models.get("conformer", MODEL_DEFAULT),
                 effort=efforts.get("conformer"), max_turns=60))
         if unclean:
-            await _redrive_rollback(staging, before_sha)
+            await _restore_tree(staging, before_sha,
+                                where="final conformer rollback")
             warnings.append(f"final conformer round {c_round}: "
                             + _unclean_reason("the final conformer",
                                               unclean))
@@ -54839,7 +54889,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # (those were caught by the per-subtask gates).
         protected = await _protected_paths_since(str(staging), before_sha)
         if protected:
-            await _rollback_conformer_commits(str(staging), before_sha)
+            await _restore_tree(staging, before_sha,
+                                where="final conformer rollback")
             warnings.append(f"final conformer round {c_round}: "
                             f"protected-path violation reverted "
                             f"(touched {protected})")
@@ -54859,8 +54910,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                 f"final conformer round {c_round}: reverted/deleted "
                 f"{len(clobbered)} integrated file(s): {clobbered}")
             if caps.get("strict_conformer"):
-                await _rollback_conformer_commits(
-                    str(staging), staging_before_sha)
+                await _restore_tree(staging, staging_before_sha,
+                                    where="final conformer rollback")
                 warnings.append(
                     f"final conformer round {c_round}: strict mode — "
                     "rolled conformer commits back to restore clobbered work")
@@ -55198,7 +55249,7 @@ async def _undo_interrupted_redrives(st: "State", leerie_dir: Path,
         tree = _subtask_worktree_path(leerie_dir, sid)
         ok = False
         if pre and tree.is_dir():
-            ok = await _redrive_rollback(tree, pre)
+            ok = await _restore_tree(tree, pre, where="re-drive rollback")
         elif pre and st.repo_root:
             ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
             ok = (await run_proc(["git", "update-ref", ref, pre],
@@ -56037,11 +56088,6 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
                                 verbosity="quiet",
                                 label_prefix=f"settle-exec-{sid}",
                                 log_prefix=f"settle-exec {sid}")
-    # Untracked files the commands create (build output a verify command
-    # leaves) are removed afterwards, so nothing of this execution waits in
-    # the worktree for a later worker's `git add -A`. Ignored files are not
-    # listed, so installed dependencies stay.
-    untracked_before = _untracked_files(worktree)
     try:
         blt = resolve_blt(st.repo_root)
     except Exception:
@@ -56088,59 +56134,66 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
         elif run["rc"] == 0:
             cmd["passed"] = True
 
-    verdict = "pass"
-    try:
-        for argv in argvs:
-            cmd: dict = {"argv": argv, "rc": None, "attempts": 0,
-                         "passed": False, "resource_affected": False,
-                         "environment_limit": False, "tail": ""}
-            record["commands"].append(cmd)
-            _take(cmd, await _once(argv, timeout))
-            if not cmd["passed"] and not cmd["environment_limit"]:
-                # B*: a failure is re-checked under the host-pressure gate.
-                async with _confirm_lock():
-                    budget = float(caps.get("confirm_budget_sec",
-                                            DEFAULT_CAPS["confirm_budget_sec"]))
-                    gate = (_CONFIRM_NO_BUDGET_GATE if budget <= 0
-                            else await _confirm_gate(caps))
-                    k = int(caps.get("confirm_pairs_escalated",
-                                     DEFAULT_CAPS["confirm_pairs_escalated"])
-                            if gate["timed_out"] else
-                            caps.get("confirm_pairs",
-                                     DEFAULT_CAPS["confirm_pairs"]))
-                    t0 = time.monotonic()
-                    for _ in range(k):
-                        left = budget - (time.monotonic() - t0)
-                        if left <= 0:
-                            break
-                        _take(cmd, await _once(argv, min(timeout, left)))
-                        if cmd["passed"] or cmd["environment_limit"]:
-                            break
-                cmd["resource_affected"] = cmd["passed"]
-            if cmd["environment_limit"]:
-                verdict = "environment_limit"
-                break
-            if not cmd["passed"]:
+    # The verify commands are leerie's own commands in a worker's tree, so
+    # they sit in the I2 bracket on every exit — pass, fail, environment
+    # limit, a forbidden argv stopping the loop, an exception: what they
+    # changed is put back, what they created is removed (review round 15
+    # claims H1: only a `pass` used to restore tracked files). A pass whose
+    # commands changed tracked files did not verify the committed tree.
+    async with _leaves_tree_as_found(worktree, "verify commands",
+                                     f"settle-exec {sid}") as undone:
+        verdict = "pass"
+        try:
+            for argv in argvs:
+                cmd: dict = {"argv": argv, "rc": None, "attempts": 0,
+                             "passed": False, "resource_affected": False,
+                             "environment_limit": False, "tail": ""}
+                record["commands"].append(cmd)
+                _take(cmd, await _once(argv, timeout))
+                if not cmd["passed"] and not cmd["environment_limit"]:
+                    # B*: a failure is re-checked under the host-pressure gate.
+                    async with _confirm_lock():
+                        budget = float(caps.get(
+                            "confirm_budget_sec",
+                            DEFAULT_CAPS["confirm_budget_sec"]))
+                        gate = (_CONFIRM_NO_BUDGET_GATE if budget <= 0
+                                else await _confirm_gate(caps))
+                        k = int(caps.get(
+                                "confirm_pairs_escalated",
+                                DEFAULT_CAPS["confirm_pairs_escalated"])
+                                if gate["timed_out"] else
+                                caps.get("confirm_pairs",
+                                         DEFAULT_CAPS["confirm_pairs"]))
+                        t0 = time.monotonic()
+                        for _ in range(k):
+                            left = budget - (time.monotonic() - t0)
+                            if left <= 0:
+                                break
+                            _take(cmd, await _once(argv, min(timeout, left)))
+                            if cmd["passed"] or cmd["environment_limit"]:
+                                break
+                    cmd["resource_affected"] = cmd["passed"]
+                if cmd["environment_limit"]:
+                    verdict = "environment_limit"
+                    break
+                if not cmd["passed"]:
+                    verdict = "fail"
+                    break
+        except ForbiddenByTask as e:
+            verdict = "none"
+            record["why"] = f"a verify command was not run — {e}"
+        if verdict == "pass":
+            post = await run_proc(["git", "status", "--porcelain",
+                                   "--untracked-files=no"], cwd=worktree)
+            changed = (post.stdout.splitlines() if post.returncode == 0
+                       else [])
+            if post.returncode != 0 or changed:
                 verdict = "fail"
-                break
-    except ForbiddenByTask as e:
-        verdict = "none"
-        record["why"] = f"a verify command was not run — {e}"
-
-    if verdict == "pass":
-        post = await run_proc(["git", "status", "--porcelain",
-                               "--untracked-files=no"], cwd=worktree)
-        changed = post.stdout.splitlines() if post.returncode == 0 else []
-        if post.returncode != 0 or changed:
-            verdict = "fail"
-            record["dirty"] = changed[:20]
-            record["why"] = ("the commands changed tracked files, so they "
-                             "did not verify the committed tree")
-            await run_proc(["git", "checkout", "--", "."], cwd=worktree)
-    if untracked_before is not None:
-        made = _remove_new_untracked(worktree, untracked_before)
-        if made:
-            record["removed_untracked"] = made[:20]
+                record["dirty"] = changed[:20]
+                record["why"] = ("the commands changed tracked files, so "
+                                 "they did not verify the committed tree")
+    if undone["removed"]:
+        record["removed_untracked"] = undone["removed"][:20]
     record["verdict"] = verdict
     if not record["why"]:
         last = record["commands"][-1]
@@ -57600,8 +57653,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # in-progress tree to its own continuation, which is held to it.
         if rescued_from_empty_handoff:
             if await _tree_dirt(worktree) != []:
-                await run_proc(["git", "checkout", "--", "."], cwd=worktree)
-                await run_proc(["git", "clean", "-fdq"], cwd=worktree)
+                await _restore_tree(
+                    worktree, await _branch_head_sha(worktree),
+                    where=f"{sid} reaped implementer's debris")
         elif status in ("complete", "blocked", "failed"):
             unclean = await _implementer_gate(str(status))
             if unclean is not None:
@@ -58672,7 +58726,8 @@ async def _record_settled_head(st: "State", leerie_dir: Path,
             moved = await run_proc(["git", "update-ref", ref, head, tip],
                                    cwd=str(wt))
             back = (await run_proc(
-                ["git", "checkout", "-q", ref.removeprefix("refs/heads/")],
+                ["git", *GIT_NO_HOOKS, "checkout", "-q",
+                 ref.removeprefix("refs/heads/")],
                 cwd=str(wt)) if moved.returncode == 0 else moved)
             log(f"  {sid}: worktree HEAD {head[:12]} was {where}, ahead of "
                 f"its branch at {tip[:12]} — "
@@ -58959,12 +59014,10 @@ async def _back_out_unmerged(st: State, staging: Path, sid: str,
     continues. The record carries `outcome: "backed_out"`, which a resume
     skips. A reset that does not land is the one state left to `die()` on:
     the repository, not the merge, is then broken."""
-    await run_proc(["git", "merge", "--abort"], cwd=str(staging))
-    await run_proc(["git", "reset", "--hard", pre_sha], cwd=str(staging))
     # Untracked files too (ignored ones kept): the next worker in staging
     # starts from the tree I1 held (DESIGN §8 *A worker leaves its tree
     # clean*), never one with this merge's leftovers in it.
-    await run_proc(["git", "clean", "-fdq"], cwd=str(staging))
+    await _restore_tree(staging, pre_sha, where=f"back-out of {sid}")
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
     if not pre_sha or head != pre_sha:
         st.data.setdefault("blocked", {})[sid] = (
@@ -59252,8 +59305,8 @@ async def _integration_repair_round(
         log(f"  integrator-repair-{sid}: {w}")
 
     async def _reset(verdict: str) -> dict:
-        await run_proc(["git", "reset", "--hard", pre], cwd=str(staging))
-        await run_proc(["git", "clean", "-fdq"], cwd=str(staging))
+        await _restore_tree(staging, pre,
+                            where=f"integration repair round of {sid}")
         entry["verdict"] = verdict
         return {"verdict": verdict}
 
@@ -59469,7 +59522,7 @@ async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
         (staging / f).write_text(text)
     add = await run_proc(["git", "--literal-pathspecs", "add", "--", *files],
                          cwd=str(staging))
-    commit = (await run_proc(["git", "commit", "--no-edit"],
+    commit = (await run_proc(["git", *GIT_NO_HOOKS, "commit", "--no-edit"],
                              cwd=str(staging))
               if add.returncode == 0 else add)
     if commit.returncode != 0 or await check_merge_committed(staging):
@@ -59502,8 +59555,8 @@ async def _set_integration_subject(staging: Path, sid: str,
         log(f"  {sid}: HEAD is not this integration's merge; its subject "
             "is left as it is")
         return False
-    r = await run_proc(["git", "commit", "--amend", "--no-verify",
-                        "--allow-empty", "-m", want, "-m",
+    r = await run_proc(["git", *GIT_NO_HOOKS, "commit", "--amend",
+                        "--no-verify", "--allow-empty", "-m", want, "-m",
                         body.strip() or subject], cwd=str(staging))
     if r.returncode != 0:
         log(f"  {sid}: could not set the merge's subject "
@@ -59511,6 +59564,23 @@ async def _set_integration_subject(staging: Path, sid: str,
         return False
     log(f"  {sid}: integrator merge re-worded to {want!r}")
     return True
+
+
+async def _integrate_merge(staging: Path, st: "State",
+                           sid: str) -> subprocess.CompletedProcess:
+    """`integrate.sh` for `sid` — leerie's own merge, hooks off in the script
+    — inside the untracked half of the I2 bracket (DESIGN §6½): a path the
+    merge newly exposes (a merged `.gitignore` change un-ignoring kept build
+    output) or creates is removed. When it removed anything, staging's
+    dependency-install memo is dropped, so the next measurement installs
+    and regenerates afresh."""
+    async with _leaves_tree_as_found(staging, f"merge of {sid}",
+                                     "integrate", tracked=False) as rec:
+        proc = await _run_script("integrate.sh", sid, st.run_id)
+    if rec["removed"]:
+        _DEPS_INSTALLED.discard(os.path.realpath(staging))
+        _DEPS_FAILED.pop(os.path.realpath(staging), None)
+    return proc
 
 
 async def _reintegrate_settled_head(staging: Path, st: "State", sid: str,
@@ -59538,7 +59608,7 @@ async def _reintegrate_settled_head(staging: Path, st: "State", sid: str,
     else:
         log(f"  {sid}: settled head {head[:12] or '?'} does not descend from "
             f"its branch ({tip[:12] or 'missing'}) — branch left where it is")
-    return await _run_script("integrate.sh", sid, st.run_id)
+    return await _integrate_merge(staging, st, sid)
 
 
 def _settled_head_missing_reason(st: "State", sid: str) -> str:
@@ -59564,14 +59634,13 @@ async def _restart_integration_merge(staging: Path, st: "State", sid: str,
     parent (dropping a merge a dying integrator may have committed), and
     run `integrate.sh` again. None when staging is mid-merge with the
     conflict again; otherwise why the retry cannot proceed."""
-    await run_proc(["git", "merge", "--abort"], cwd=str(staging))
-    await run_proc(["git", "reset", "--hard", pre_sha], cwd=str(staging))
-    await run_proc(["git", "clean", "-fdq"], cwd=str(staging))
+    await _restore_tree(staging, pre_sha,
+                        where=f"restart of {sid}'s integration merge")
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
     if not pre_sha or head != pre_sha:
         return (f"the reset before a retry left staging at "
                 f"{head[:12] or 'no HEAD'}, not {pre_sha[:12] or '?'}")
-    proc = await _run_script("integrate.sh", sid, st.run_id)
+    proc = await _integrate_merge(staging, st, sid)
     if proc.returncode != 1:
         msg = (proc.stderr or proc.stdout or "").strip()[:200]
         return (f"integrate.sh exited {proc.returncode} restarting the merge"
@@ -59714,7 +59783,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
         # The merge's first parent, for the fallback: a failing integrator
         # may still have committed something.
         pre_sha = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
-        proc = await _run_script("integrate.sh", sid, st.run_id)
+        proc = await _integrate_merge(staging, st, sid)
         if (proc.returncode == 0
                 and not await _settled_head_integrated(staging, st, sid)):
             # Exit 0 is not integration (DESIGN §6 *Integrated means the

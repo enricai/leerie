@@ -164,3 +164,42 @@ def test_a_read_only_directory_a_killed_test_left_does_not_stop_the_resume(
         assert (wt / "pkg" / "a.txt").read_text() == "a\n"
     finally:
         subprocess.run(["chmod", "-R", "u+w", str(wt)], check=False)
+
+
+def test_a_staging_a_worker_detached_is_back_on_the_run_branch(
+        tmp_path, monkeypatch):
+    """Review round 15 H2: `reset --hard HEAD` kept a detached HEAD, so the
+    resume started on the worker's detached commit, not the run branch."""
+    repo, staging = _repo(tmp_path, monkeypatch)
+    branch = _git(staging, "symbolic-ref", "--short", "HEAD")
+    tip = _git(staging, "rev-parse", "HEAD")
+    _git(staging, "checkout", "-q", "--detach")
+    (staging / "f.txt").write_text("worker fix\n")
+    _git(staging, "commit", "-qam", "fix on detached head")
+    _setup(repo)
+    assert _git(staging, "symbolic-ref", "--short", "HEAD") == branch
+    assert _git(staging, "rev-parse", "HEAD") == tip
+    assert _git(staging, "status", "--porcelain",
+                "--untracked-files=all") == ""
+
+
+def test_a_detached_subtask_worktree_is_found_by_path_and_restored(
+        tmp_path, monkeypatch):
+    """Review round 15 H2: the reset loop picked subtask worktrees by the
+    `branch` line of `git worktree list --porcelain`, which a detached one
+    lacks, so its dirt survived the resume."""
+    repo, _staging = _repo(tmp_path, monkeypatch)
+    wt = _subtask_worktree(repo, "feat-001")
+    (wt / "done.py").write_text("x = 1\n")
+    _git(wt, "add", "done.py")
+    _git(wt, "commit", "-q", "-m", "committed half")
+    tip = _git(wt, "rev-parse", "HEAD")
+    _git(wt, "checkout", "-q", "--detach", "HEAD~1")
+    (wt / "f.txt").write_text("killed mid-edit\n")
+    (wt / "scratch.py").write_text("y = 2\n")
+    _setup(repo)
+    assert _git(wt, "symbolic-ref", "--short", "HEAD") == \
+        f"leerie/subtasks/{RUN_ID}/feat-001"
+    assert _git(wt, "rev-parse", "HEAD") == tip
+    assert (wt / "done.py").is_file()
+    assert _git(wt, "status", "--porcelain", "--untracked-files=all") == ""

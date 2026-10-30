@@ -124,10 +124,9 @@ if grep -qxF "worktree $WT" <<<"$(git worktree list --porcelain)"; then
   # Reuse: force the tree back to the target and drop anything a
   # previous judgment worker left behind. --force because the checkout is
   # detached and may carry commits; that is expected and discarded.
-  git -C "$WT" reset --hard "$TARGET_SHA" >/dev/null
-  git -C "$WT" clean -fd >/dev/null
+  leerie_reset_worktree "$WT" "" "$TARGET_SHA" >/dev/null
 else
-  git worktree add --detach "$WT" "$TARGET_SHA" >/dev/null
+  git "${LEERIE_GIT_NO_HOOKS[@]}" worktree add --detach "$WT" "$TARGET_SHA" >/dev/null
 fi
 
 echo "planning-worktree: $(cd "$WT" && pwd)"
