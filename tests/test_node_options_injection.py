@@ -83,7 +83,7 @@ async def _capture_env_and_run(monkeypatch, leerie, cwd, worker_memory_max_bytes
                 ["echo", "hi"], cwd=cwd, timeout=5, sid="test-sid",
                 leerie_dir=leerie_dir, verbosity="quiet",
                 worker_memory_max_bytes=worker_memory_max_bytes,
-            )
+            grants=leerie.WorkerGrants(("/",), ()))
         except Exception:
             pass
     return captured.get("env")

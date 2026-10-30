@@ -666,7 +666,7 @@ class TestInvokeStdinStagingDiskLowSpace:
             return await leerie._invoke(
                 ["claude", "-p"], cwd=str(tmp_path), timeout=60,
                 sid="t-stage", leerie_dir=tmp_path, verbosity="quiet",
-                stdin_data=stdin_data)
+                stdin_data=stdin_data, grants=leerie.WorkerGrants(("/",), ()))
 
     def test_mkstemp_enospc_becomes_disklowspace(self, tmp_path):
         import errno as _errno

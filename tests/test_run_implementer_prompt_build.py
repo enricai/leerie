@@ -48,7 +48,7 @@ def env(leerie, tmp_path):
     leerie_root = repo / ".leerie"
     run_dir = leerie_root / "runs" / run_id
     (run_dir / "subtasks").mkdir(parents=True)
-    (run_dir / "checkpoints").mkdir()
+    (run_dir / "notes").mkdir()
     (run_dir / "artifacts").mkdir()
 
     spec = {
@@ -198,7 +198,8 @@ def test_continuation_with_checkpoint_present(env, monkeypatch):
     _stub_run_script_ok(leerie_mod, monkeypatch, env["repo"] / "wt")
     calls: list = []
     _stub_claude_p_capture(leerie_mod, monkeypatch, calls)
-    ckpt = env["run_dir"] / "checkpoints" / f"{env['sid']}.md"
+    ckpt = env["run_dir"] / "notes" / env["sid"] / "checkpoint.md"
+    ckpt.parent.mkdir(parents=True)
     ckpt.write_text("# Checkpoint\n")
 
     asyncio.run(leerie_mod._run_implementer(
@@ -255,7 +256,7 @@ def test_worker_error_becomes_incomplete_handoff(env, monkeypatch):
 
     assert res["status"] == "incomplete-handoff"
     assert res["checkpoint_path"] == str(
-        env["run_dir"] / "checkpoints" / f"{env['sid']}.md")
+        env["run_dir"] / "notes" / env["sid"] / "checkpoint.md")
     assert "hit --max-turns mid-task" in res["summary"]
 
 

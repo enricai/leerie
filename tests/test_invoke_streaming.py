@@ -114,7 +114,7 @@ def test_invoke_returns_final_result_event(leerie, leerie_dir, monkeypatch):
     result = asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t1", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     assert result["type"] == "result"
     assert result["subtype"] == "success"
     assert result["structured_output"] == {"ok": True}
@@ -149,7 +149,7 @@ def test_invoke_ignores_task_notification_result_event(leerie, leerie_dir,
     result = asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-tn", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     assert result["num_turns"] == 21
     assert result["structured_output"] == {"status": "complete"}
     assert "origin" not in result
@@ -177,7 +177,7 @@ def test_invoke_returns_synthetic_envelope_when_no_result_event(
     envelope = asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t2", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     assert envelope["is_error"] is True
     assert envelope["structured_output"] is None
     assert envelope["_leerie_synthetic"] == "no_result_event"
@@ -244,7 +244,7 @@ def test_invoke_overage_block_plus_truncation_raises_ratelimited(
         asyncio.run(leerie._invoke(
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="reconciler", leerie_dir=leerie_dir,
-            verbosity="stream"))
+            verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     assert ei.value.reset_at is None
     assert ei.value.out_of_credits is True
     assert "out of credits" in ei.value.raw_message
@@ -273,7 +273,7 @@ def test_invoke_org_level_disabled_truncation_raises_workererror(
         asyncio.run(leerie._invoke(
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="final-conformer-r0", leerie_dir=leerie_dir,
-            verbosity="stream"))
+            verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
 
 
 _EXCEEDED_STATUS_EVENT = {
@@ -306,7 +306,7 @@ def test_invoke_exceeded_status_raises_ratelimitedexit_not_out_of_credits(
         asyncio.run(leerie._invoke(
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="fit-judge-r0", leerie_dir=leerie_dir,
-            verbosity="stream"))
+            verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     assert ei.value.out_of_credits is False
     assert ei.value.reset_at is not None
     assert ei.value.reset_at.timestamp() == 1783446600
@@ -331,7 +331,7 @@ def test_invoke_overage_block_with_result_returns_envelope(
     result = asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="pr-writer", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     assert result["type"] == "result"
     assert result["structured_output"] == {"ok": True}
 
@@ -361,7 +361,7 @@ def test_invoke_returns_envelope_despite_nonzero_returncode(
     result = asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="classifier", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     assert result["subtype"] == "success"
     assert result["structured_output"] == {"categories": ["documentation"]}
 
@@ -384,7 +384,7 @@ def test_invoke_result_then_tasknotification_plus_nonzero_rc(
     result = asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="classifier", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     assert result["structured_output"] == {"ok": True}
 
 
@@ -403,7 +403,7 @@ def test_log_file_written_at_stream(leerie, leerie_dir, monkeypatch):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t3", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     log_text = (leerie_dir / "logs" / "t3.log").read_text()
     # All 3 events appear in the file.
     assert "system/init" in log_text
@@ -425,7 +425,7 @@ def test_log_file_written_at_quiet(leerie, leerie_dir, monkeypatch):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t4", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     log_text = (leerie_dir / "logs" / "t4.log").read_text()
     assert "system/init" in log_text
     assert "result/success" in log_text
@@ -445,7 +445,7 @@ def test_log_file_records_non_json_lines(leerie, leerie_dir, monkeypatch):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t5", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     log_text = (leerie_dir / "logs" / "t5.log").read_text()
     assert "non-json-line" in log_text
     assert "not valid json at all" in log_text
@@ -467,7 +467,7 @@ def test_inline_summaries_emitted_at_stream(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t6", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     out = capsys.readouterr().out
     # Two summary lines: starting + done.
     assert "[t6] starting" in out
@@ -490,7 +490,7 @@ def test_no_inline_summaries_at_quiet_for_success(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t7", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     out = capsys.readouterr().out
     # None of the individual events should produce a [t7] line.
     assert "[t7]" not in out
@@ -520,7 +520,7 @@ def test_multi_line_summary_each_line_has_timestamp(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-multi", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
     out = capsys.readouterr().out
     # Each text line is on its own output line, each prefixed with
     # the ISO-8601 second-precision local-tz [leerie] timestamp.
@@ -552,7 +552,7 @@ def test_worker_failure_surfaces_even_at_quiet(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t8", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     out = capsys.readouterr().out
     assert "[t8] worker failed" in out
 
@@ -587,7 +587,7 @@ def test_log_file_opened_line_buffered(leerie, leerie_dir, monkeypatch):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-flush", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     # The log file open call must have buffering=1.
     log_opens = [c for c in open_calls if c["path"].endswith("t-flush.log")]
     assert log_opens, ("expected at least one t-flush.log open "
@@ -661,7 +661,7 @@ def test_value_error_from_line_limit_becomes_worker_error(leerie,
         asyncio.run(leerie._invoke(
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="t-overlimit", leerie_dir=leerie_dir,
-            verbosity="quiet"))
+            verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     msg = str(exc_info.value)
     # The error message must name the limit so a user diagnosing
     # the failure can act on it (not a generic "worker failed").
@@ -695,7 +695,7 @@ def test_progress_prefix_shows_wave_and_activity(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-prog", leerie_dir=leerie_dir,
-        verbosity="stream", progress=lambda: (9, 0, 3, 2, 3)))
+        verbosity="stream", progress=lambda: (9, 0, 3, 2, 3), grants=leerie.WorkerGrants(("/",), ())))
     out = capsys.readouterr().out
     assert "[wave 2 of 3 · running 9 subtasks · 3 subtasks done]" in out
     assert "[t-prog] starting" in out
@@ -727,7 +727,7 @@ def test_progress_prefix_recomputes_per_event(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-fresh", leerie_dir=leerie_dir,
-        verbosity="stream", progress=get_progress))
+        verbosity="stream", progress=get_progress, grants=leerie.WorkerGrants(("/",), ())))
     out = capsys.readouterr().out
     assert "1 subtask done" in out
     assert "2 subtasks done" in out
@@ -760,7 +760,7 @@ def test_create_subprocess_exec_uses_high_limit(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-limit", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     limit = captured_kwargs.get("limit")
     assert limit is not None, (
@@ -834,7 +834,7 @@ def test_invoke_pid_exhaustion_realistic_interleaved_stream(
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="cfg-003", leerie_dir=leerie_dir,
             verbosity="stream",
-            worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+            worker_memory_max_bytes=1 << 30, worker_pids_max=256, grants=leerie.WorkerGrants(("/",), ())))
     assert "exhausted its PID cgroup" in str(ei.value)
 
 
@@ -858,7 +858,7 @@ def test_invoke_pid_exhaustion_raises_early(leerie, leerie_dir, monkeypatch):
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
             verbosity="stream",
-            worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+            worker_memory_max_bytes=1 << 30, worker_pids_max=256, grants=leerie.WorkerGrants(("/",), ())))
     assert "exhausted its PID cgroup" in str(ei.value)
 
 
@@ -904,7 +904,7 @@ def test_invoke_pid_exhaustion_via_climbing_denials(leerie, leerie_dir,
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
             verbosity="stream",
-            worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+            worker_memory_max_bytes=1 << 30, worker_pids_max=256, grants=leerie.WorkerGrants(("/",), ())))
 
 
 def test_invoke_ordinary_failures_do_not_trigger(leerie, leerie_dir,
@@ -929,7 +929,7 @@ def test_invoke_ordinary_failures_do_not_trigger(leerie, leerie_dir,
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
         verbosity="stream",
-        worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+        worker_memory_max_bytes=1 << 30, worker_pids_max=256, grants=leerie.WorkerGrants(("/",), ())))
     assert result["structured_output"] == {"ok": True}
 
 
@@ -957,7 +957,7 @@ def test_invoke_sparse_errors_below_window_threshold_do_not_trigger(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
         verbosity="stream",
-        worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+        worker_memory_max_bytes=1 << 30, worker_pids_max=256, grants=leerie.WorkerGrants(("/",), ())))
     assert result["structured_output"] == {"ok": True}
 
 
@@ -978,7 +978,7 @@ def test_invoke_stat_none_never_false_detects(leerie, leerie_dir, monkeypatch):
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
         verbosity="stream",
-        worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+        worker_memory_max_bytes=1 << 30, worker_pids_max=256, grants=leerie.WorkerGrants(("/",), ())))
     assert result["structured_output"] == {"ok": True}
 
 
@@ -1007,7 +1007,7 @@ def test_invoke_names_memory_oom_on_no_envelope(leerie, leerie_dir,
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
             verbosity="stream",
-            worker_memory_max_bytes=8 * 1024**3, worker_pids_max=256))
+            worker_memory_max_bytes=8 * 1024**3, worker_pids_max=256, grants=leerie.WorkerGrants(("/",), ())))
     msg = str(ei.value)
     assert "OOM-killed" in msg
     assert "pnpm run build" in msg
@@ -1032,7 +1032,7 @@ def test_invoke_no_oom_when_oom_kill_zero(leerie, leerie_dir, monkeypatch):
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
             verbosity="stream",
-            worker_memory_max_bytes=8 * 1024**3, worker_pids_max=256))
+            worker_memory_max_bytes=8 * 1024**3, worker_pids_max=256, grants=leerie.WorkerGrants(("/",), ())))
     assert "OOM-killed" not in str(ei.value)
 
 
@@ -1055,7 +1055,7 @@ def test_unexpected_tool_name_in_init_event_warns(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="tools-1", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     out = capsys.readouterr().out
     assert "unexpected tool" in out
     assert "SomeFutureTool" in out
@@ -1077,7 +1077,7 @@ def test_mcp_tool_name_in_init_event_warns(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="tools-2", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     out = capsys.readouterr().out
     assert "unexpected tool" in out
     assert "mcp__claude_ai_Gmail__search_threads" in out
@@ -1098,6 +1098,6 @@ def test_known_tools_only_init_event_stays_silent(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="tools-3", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     out = capsys.readouterr().out
     assert "unexpected tool" not in out

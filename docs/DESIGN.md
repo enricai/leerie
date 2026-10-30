@@ -2377,6 +2377,150 @@ before the change.
 - §8 *A worker that does not commit never runs in a tree leerie measures*:
   the post-run replay reads a ref-less clone of the user's repository.
 
+### A worker writes only where it is granted (I5)
+
+*Designed 2026-10-30 (the user's decision: close every hostile-worker
+trick). Lanes A, B, C and D build to the layout below.*
+
+**Root cause.** Every check so far reads what a worker left and asks
+whether it is honest: I1's checker, the settings copy, the fresh-index
+read, the sentinel. Each round found a place a worker could write that a
+reader then trusted — the run repository's config, `info/`, the index's
+stat cache, another branch's ref, `state.json` itself — or read what it
+must not: the held-out acceptance sets were kept from the fixers by the
+CLI's `Read` deny rules, which a `cat` in Bash bypasses. A worker runs as
+the same user as the orchestrator, so every path the orchestrator can
+write or read, the worker can too. Checking after the fact closes one path
+per round; the class is "a worker reaches outside what is its own".
+
+**Invariant (I5): a worker's processes write only beneath their grants,
+and read nothing of the state root but their grants.** The kernel enforces
+it (Landlock, a Linux LSM an unprivileged process applies to itself):
+`_invoke` starts `claude` through an exec shim (`scripts/landlock_exec.py`)
+that handles every write-class filesystem right — write, truncate, create,
+remove, rename and link (`REFER`) — and the read rights (read a file, list
+a directory), allows each only beneath a grant, then execs `claude`. The
+restriction is inherited by every process the worker starts and cannot be
+lifted, so it binds `claude`'s own Write, Edit and Read tools as well as
+Bash, and a symlink, hardlink or rename out of a grant is refused
+(measured by lane B, rootless and rootful, ABI 8, and by
+`tests/test_worker_confinement.py`). Reads outside the state root stay
+open: every entry at each directory from `/` down to the state root's
+parent is granted for reading except the one on the way to it (a symlink
+that resolves into the state root or onto its path is skipped — pytest's
+`pytest-current` would otherwise have granted the whole root, measured).
+`/` itself cannot be granted without granting everything beneath it, so a
+worker cannot list `/`. Lane B measured no overhead on a warm install and
+about 83 ms per spawn.
+
+**Fail closed, on every runtime.** The shim needs Landlock ABI 3 or later
+(ABI 2 lets a rename or link between two directories inside a grant happen
+at all, ABI 3 confines `truncate`): Linux 6.2+ with `landlock` among
+the active LSMs. Preflight checks it before any worker (`_require_landlock`)
+and the shim checks it again (exit 126); below that, or with Landlock
+absent, the run stops with a message naming the kernel. Local, Fly and EC2
+alike — never an unconfined worker (docs/INSTALL.md).
+
+**The grants, one function (`_worker_grants`), by worker kind.** Every
+worker gets the first block, then its kind's.
+
+| Grant | Path | Access | Who makes it |
+|---|---|---|---|
+| devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, `/dev/pts`, `/dev/shm` (POSIX semaphores: Python's multiprocessing locks and Chromium need it, measured) | write | — |
+| own temp dir | what `TMPDIR`, `TMP` and `TEMP` name: `<run-dir>/workers/<wid>/tmp/` | write | `_worker_dirs` |
+| own CLI config | what `CLAUDE_CONFIG_DIR` names: `<run-dir>/workers/<wid>/config/` (sessions live there, so `--resume` finds them) | write | `_worker_dirs` |
+| the CLI configuration template | `<run-dir>/claude-config/`, whose directories each worker's configuration links | read | `_claude_config_template` |
+| the run's download caches | `<run-dir>/workers/cache/`, one set per run shared by its workers (every store variable, the pnpm store, `XDG_CACHE_HOME`) | write | `_worker_cache_env` |
+| outside the state root | everything (above) | read | — |
+| the run's system prompts | `<run-dir>/sysprompt/` | read | — |
+
+`<wid>` is the worker's id, its first call's log sid; a re-ask or resume
+reuses the same worker's directories. A temp or config variable's
+directory is granted only when it lies beneath `<run-dir>/workers/`
+(`_worker_own_dirs`): one left at a shared default — `/tmp`, `~/.claude` —
+grants nothing. The caches are granted as the one directory they share, and
+nothing a worker's caches name outside it is: `/tmp/.cache`, the image's
+`MISE_DATA_DIR`, `/opt/venv`, `/opt/bundle`, `/opt/cargo-target`,
+`/opt/go-cache` and leerie's own stores `<state-root>/.stores/leerie/` are
+never granted, so no store leerie's own commands install from can be
+written by a worker. The grants are computed after `claude_p` has named
+the worker's own directories, and follow them.
+
+**`/tmp` is not a worker's.** It is shared by every process of the
+container, and leerie's own commands read it (the image's
+`XDG_CACHE_HOME=/tmp/.cache`, a repository's tests that use a fixed
+`/tmp/<name>`), so a worker's write there is a write into what leerie
+measures. A private mount was the alternative: it needs a user namespace,
+which the default seccomp profile refuses on rootful (§6 *Worker subtree
+termination*), so it would hold on one runtime only. Instead a worker's
+temp directory is its own `TMPDIR` (the CLI honours it: measured, with
+`TMPDIR` unset the confined CLI refused to start on `/tmp/claude-<uid>`,
+with it set it made `$TMPDIR/claude-<uid>/` and ran), and a fixed
+`/tmp/<name>` path is refused. That is common — 155 of
+the 310 corpus sessions that wrote an absolute path wrote under `/tmp`
+(lane B, e.g. `/tmp/fr_fixed.ts`) — so every worker with a shell is told
+(`CONFINED_WRITES_NOTICE`, a notice: the kernel is the guarantee). The
+prompt a worker reads on stdin is staged in `<run-dir>/stdin/`, never in
+`/tmp`, where another worker's processes could read or rewrite it.
+
+| Kind | Workers | Tree | Run repository | Run files |
+|---|---|---|---|---|
+| committing, run worktree | implementer, per-subtask conformer (subtask worktree); final conformer, acceptance-repair conformer, delivery re-drive implementer, integrator (staging) | write | read; the tree's git metadata write (below) | read `subtasks/`, `task.md`, `notes/`; the implementer writes its own `notes/<id>/` (`criteria.md`, `checkpoint.md`) |
+| committing, disposable clone | acceptance writer, surrogate fixer, falsifier | write (its `.git` is inside it) | read (the clone's objects borrow it) | — |
+| non-committing, own checkout | delivery judge, integration judge, CI checks, PR reviewer, set auditor, verifiability classifier, delivery ratchet, replay capture, satisfied probe on a subtask tree | write with bare `Bash`, else read | read | — |
+| judgment, shared planning worktree | classifier, planners, reconciler, the judges, splitter, fit judge, satisfied probe, provision | read | read | — |
+| payload-only | judge, patch generator, PR writer, dep capture, scope judge, contract extractor | read its empty directory | read | — |
+
+A committing worker's git metadata is its tree's own repository,
+`<run-dir>/tree-repos/<tree>/` (`<tree>`: `staging` or
+`<run-id[:12]>-<sid>`; lane D, *A repository per committing tree*),
+written whole, and `<run-dir>/repo/objects/` read for the alternates —
+nothing else of `<run-dir>/repo/`. The repository belongs to the tree, not
+the worker: the workers of one tree take turns in it. Until lane D's tree
+repositories land, a tree is a worktree of the run repository, and the
+grant is its admin directory `<run-dir>/repo/worktrees/<name>/` and the
+shared `objects/`, `refs/` and `logs/` written, the repository read —
+never `config`, `info/`, `HEAD` or `packed-refs` (`_tree_git_dirs`). The
+settings check (§8 *The settings are leerie's*) recognises
+`<run-dir>/repo`; lane D maps each tree repository onto the same copy. The delivery re-drive also
+reads its self-check directory `<run-dir>/selfcheck/<group>/` (the shown
+sets, the config) and writes its `run/` (the self-check's copies and call
+log).
+
+An implementer's notes are `notes/<id>/criteria.md` and
+`notes/<id>/checkpoint.md`, one directory per subtask, because a grant can
+name a directory before either file exists; the earlier
+`criteria/<id>.md` and `checkpoints/<id>.md` could not be granted one
+subtask at a time.
+
+Nothing else is granted: not `state.json`, `acceptance/`, `logs/` or
+anything else in the run directory, not `repo-settings/`, not staging or a
+view (unless it is the worker's own tree), not a sibling's worktree, not
+`/work`, `$HOME` or `/tmp` for writing. A tool that writes beneath `$HOME`
+or `/tmp` by a fixed path is redirected by environment to the worker's own
+directories, or fails — then that is a finding, not a grant to widen.
+
+**Outside the container.** The host-side workers — the rebaser
+(`host-finalize.sh` → `run_rebaser`), the host recapture
+(`run_recapture_deps`) and `leerie config --chat` — are not confined. They
+run on the user's host, they are not run workers (no run is in flight;
+each is started by the user or by the launcher after the container exits),
+and macOS has no Landlock. They keep their existing scoped rules (§12
+*Scoped exception — finalize-time rebase*). The one place that marks a call
+as this seam is `_resolve_host_seam_settings`, on that call's own caps
+(`HOST_SEAM_CAP`), never on process state another call could inherit;
+`_invoke` takes `grants` as a required keyword, and `None` (unconfined)
+comes only from `claude_p` on those caps. The Fly recovery
+integrator (`collect-subtrees.sh`) is a run worker: it takes its grants from
+`worker-guard.py` and is skipped, never run, without them.
+
+**Residuals.** Until lane D's tree repositories land, a committing worker's
+refs and objects are the run repository's shared ones, so it can still move
+another branch (lane B measured it); I1's branch lines and the settled heads
+read refs by name and commit. `/dev/shm` is shared; leerie never reads it. A worker can signal any process of its user
+(Landlock's signal scoping needs ABI 6), the orchestrator included; the
+process-kill deny rules (§9) and `TaskStop` are the guard there.
+
 ### The run identifier
 
 Every run has a unique identifier `run_id` that is the container/machine ID
@@ -4145,7 +4289,7 @@ SIGTERM, SIGHUP, WorkerError, or any other exception:
   on `resume` from the deterministic branch names.
 - State.json, the run branch (`leerie/runs/<run-id>`), and per-subtask
   branches (`leerie/subtasks/<run-id>/*`) all survive. Implementer
-  checkpoints under `<state-root>/runs/<run-id>/checkpoints/` survive too,
+  checkpoints under `<state-root>/runs/<run-id>/notes/<id>/` survive too,
   so in-flight subtasks resume from where they left off.
 
 **Worker subtree termination — kernel-enforced via the container

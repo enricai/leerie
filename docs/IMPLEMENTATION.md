@@ -3048,7 +3048,7 @@ Each worker is one `claude -p` headless process. Flags used:
 | `--append-system-prompt` / `--append-system-prompt-file <path>` | the file form (gated on `_append_system_prompt_file_supported()`) stages the text with `_write_system_prompt_file(st.run_dir, text)` under `<run_dir>/sysprompt/` — never /tmp, which a host cleanup can clear under a live call (DESIGN §7) — and deletes it when the call ends. `_sysprompt_read_denial(run_dir, allowed_tools, autonomous)` adds `Read(/<run_dir>/sysprompt/**)` to the deny list only when `_reads_beyond_cwd(allowed_tools, autonomous)` holds: the worker is autonomous, or its tools include a bare `Read`, `Grep` or `Glob`. A judgment worker on `INSPECT_TOOLS` or `SATISFIED_PROBE_TOOLS` carries no `Read()` rule, because any `Read()` deny makes the CLI refuse `cd <dir>; <read> <relative path>` compounds it cannot resolve statically. Injects the worker's role prompt — read from `prompts/*.md` for every `WORKER_TYPES` worker (classifier/planner/reconciler/plan_overlap_judge/satisfied_probe/provision/implementer/integrator/conformer/fit_judge/splitter/adherence_judge/classification_judge/wiring_judge/provision_judge/task_coverage_judge/artifact_registry/integration_judge/no_work_judge/delivery_judge/defect_scope_auditor/rebaser/acceptance_writer/set_auditor/surrogate_fixer/ci_checks/scope_judge/pr_reviewer/contract_extractor/falsifier/verifiability_classifier/delivery_ratchet/forbidden_command_extractor), plus the post-run / finalize workers pr_writer, judge, dep_capture, and patch_generator |
 | `--allowedTools` | tool allowlist (soft — permission-tier pre-approval only); four profiles. The judgment profiles' read set is `_JUDGE_READ_BASE` (`WebSearch,WebFetch`). They have no bare `Read`/`Grep`/`Glob` grant: the CLI allows those tools inside the working directories and refuses them outside, so the run directory stays unreadable to a judgment worker (DESIGN §7 *The system prompt is staged in the run directory*). The acting profile's read set is `_READ_BASE` (`Read,Grep,Glob,WebSearch,WebFetch`). **inspect** (`INSPECT_TOOLS`: judgment read set + allowlisted `Bash(ls:*)` / `Bash(find:*)` / `Bash(cat:*)` / … for cross-cwd read-only inspection, **no Write/Edit**) for classifier, planner, reconciler, plan_overlap_judge, and provision; **acting** (`ACT_TOOLS`: read set + Bash/Write/Edit/NotebookEdit/TaskStop — `TaskStop` so a worker stops its own `run_in_background` command instead of a pattern kill (DESIGN §9 *A worker never kills a process by name*); the notebook writer sits here rather than on the deny list, which is global and would strip it from every acting worker in every user repo) for implementer, integrator, conformer, **acceptance_writer** (DESIGN §8 *Held-out acceptance tests*; its `cwd` is a disposable ref-less `git clone --shared` (`_acceptance_writer_checkout`) at the validity base, `git worktree add --detach` only when the clone fails, created and removed per set), and **rebaser** (DESIGN §6 *Finalization* "Rebase-onto-base before push" — a scoped, fully-agentic §12 exception; unlike the other three, its `cwd` is a disposable `git worktree add` copy created and destroyed per finalize call, not a persistent per-subtask/staging worktree); **base-tree-only** (`SATISFIED_PROBE_TOOLS`: judgment read set + read-only Bash verbs + HEAD-scoped git only — `Bash(git show HEAD:*)`/`Bash(git diff:*)`/`Bash(git status:*)`, deliberately **no** history-spanning git) for the satisfied_probe (DESIGN §8 *Already-satisfied subtask elimination*). The acting bucket keeps Bash unrestricted because its workers run with `--dangerously-skip-permissions`; the inspect and satisfied-probe profiles use `Bash(<verb>:*)` prefix patterns to pre-approve specific read-only verbs at the CLI level — no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12. **Note:** `--allowedTools` is bypassed entirely by `--dangerously-skip-permissions` (it is a permission pre-approval, not a visibility restriction). The hard-deny layer below compensates. A fourth, **smoke** (`SMOKE_TOOLS` = `Read`), is used by `preflight`'s smoke test; it calls no tool, and `Read` is simply the narrowest profile that keeps the argv shape identical to every other invocation. |
 | Per-worker configuration and temporary directories | DESIGN §6 *Each worker's own configuration and temporary directories*. `claude_p` (every worker call; not the preflight smoke test or `_append_system_prompt_file_supported`'s probe, leerie's own calls that start no session) calls `_worker_dirs(st.run_dir, sid, resume_session) -> (config, tmp)` and passes `CLAUDE_CONFIG_DIR=<config>`, `TMPDIR`/`TMP`/`TEMP=<tmp>` through `env_extra`; in its `finally` it removes `tmp` (`_rmtree_owned`). `_worker_dirs`: `<wid>` is `_resumed_wid(run_dir, resume_session)` — the `workers/<wid>` whose `config/projects/*/<session>.jsonl` exists — else `sid`; `config` is made, when absent, from `_claude_config_template(run_dir)` (built in a sibling temporary directory and renamed into place): a writable copy (mode `| 0o600`) of each top-level file, a symlink to each top-level directory, a symlink copied as a symlink, the marker left out; `tmp` is made empty. `_claude_config_template(run_dir) -> Path`: `<run_dir>/claude-config/`, made once per run (the marker `.leerie-template` says it is complete) from `$CLAUDE_CONFIG_DIR`, else `~/.claude`, without the top-level names in `_CLAUDE_CONFIG_SKIP` (per-session state: `projects`, `sessions`, `session-env`, `shell-snapshots`, `history.jsonl`, `todos`, `tasks`, `plans`, `file-history`, `paste-cache`, `telemetry`, `statsig`, `debug`, `downloads`, `backups`, `ide`, `local`, `stats-cache.json`, `.last-cleanup`), plus `~/.claude.json` as `.claude.json` when the source has none; symlinks are copied as links; every file and directory in it is then made read-only (write bits cleared). A state with no `run_dir` (a test double) gets no per-worker directories. Finalize removes `<run_dir>/workers/` and `<run_dir>/claude-config/` (`_remove_worker_dirs`) before each `cleanup.sh` call (`phase_finalize` and the no-work path). `<run_dir>/workers/<wid>/cache/` is the cache separation's, not made here. |
-| `--disallowedTools` | hard-deny list (`DISALLOWED_TOOLS`); removes tools from the model's context entirely — the model cannot see or call them regardless of permission mode.  Survives `--dangerously-skip-permissions`.  Denies: `Agent`, `SendMessage`, `ScheduleWakeup`, `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger`, `PushNotification`, `Workflow`, `ReportFindings`, `Skill`, `Monitor`, `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`, `TaskOutput`, `ListAgents`, `EnterWorktree`, `ExitWorktree`, `DesignSync`, `ToolSearch` — tools that spawn untracked parallel work, set timers, load skills, or manipulate git worktrees outside the orchestrator's own scripts. `TaskStop` is deliberately absent (it stops only the calling session's own background tasks — a foreign task ID gets "No task found" — and is granted in `ACT_TOOLS`; DESIGN §2). Passed on every `claude -p` argv leerie builds, smoke test and remote integrator included (both were missing it until 2026-08-18). Also denies `Task` (the live CLI's subagent-spawning tool; `Agent` is the retired name, so the no-subagent constraint was enforced against a name current builds no longer ship — measured in the preflight smoke test's own then-uncontained surface, never a contained worker's, so this entry is defense-in-depth rather than a fix for an observed leak), `ListMcpResourcesTool`/`ReadMcpResourceTool`/`ReadMcpResourceDirTool` (inert once `--strict-mcp-config` leaves zero servers; denied so the surface stays enumerable).  Per call, `claude_p` appends `deny_extra` = the comma-join of the non-empty results of `_repo_write_denials(st.repo_root, st.run_dir)`, `_acceptance_read_denials(schema_key, st.run_dir)`, `_sysprompt_read_denial(st.run_dir)` (`Read(/<run_dir>/sysprompt/**)`, every worker — DESIGN §7 *The system prompt is staged in the run directory*), `_full_suite_denials(repo_root, prescribed_procedure)`, `_db_reset_denials(repo_root)`, `_forbidden_command_denials(forbidden)` and, for a worker whose tools include bare `Bash`, `_process_kill_denials()` (each described in its own row below or in §5½). `_acceptance_read_denials`, for `implementer`, `conformer` and `surrogate_fixer` only, is `Read(/<run_dir>/acceptance/**)`, `Read(/<run_dir>/worktrees/acceptance-eval/**)`, `Read(/<run_dir>/logs/**)`, `Read(/<run_dir>/orchestrator.log)`, `Read(/<run_dir>/calls.ndjson)`, `Read(/<run_dir>/state.json)`, `Read(/<run_dir>/workers/*/config/**)` (every worker's own CLI configuration directory, its session transcripts included) (absolute paths, so `//…`) and `Read(~/.claude/projects/**)`, keeping the held-out acceptance sets and every file that records them (writers' stream transcripts, evaluation logs, echoed output, captured responses, case names in state, the CLI's session transcripts) out of the fixers' Read tool; their prompts read only `subtasks/`, `criteria/` and `checkpoints/` under the run directory (DESIGN §8 *Held-out acceptance tests*; a shell `cat` is not covered). `_repo_write_denials` is — the path-scoped rule `Edit(//<repo_root>/**)` (`//` is the CLI's anchor for an absolute path; `Edit(...)` subsumes `Write`/`NotebookEdit`/`MultiEdit`, and also covers `sed -i`). Two rules are emitted when `repo_root` and its realpath differ, because the CLI matches against the path the worker was handed, not its realpath — reachable via the host-side `run_rebaser`/`run_recapture_deps` entrypoints, which take `repo_root` as a parameter rather than from `os.getcwd()`. This is DESIGN §12 L1 for **acting** workers, which cannot have the flag removed: a deny rule is the only permission control that survives `--dangerously-skip-permissions`. Probed live (claude 2.1.237, ground truth from the filesystem): without it an outside-cwd write succeeded, with it it was rejected, and an inside-worktree write succeeded in both arms. Derived from `repo_root`, never hard-coded `/work`, so it cannot silently guard nothing if the mount path moves. The smoke test passes no `deny_extra` — it has no run and no checkout to guard. Returns `""` (no denial, one `log()` warning) when `run_dir` is inside `repo_root` — the `LEERIE_STATE_DIR`-unset layout, where worktrees live in the checkout and a blanket deny would deny each worker its own worktree. `scripts/remote/collect-subtrees.sh` does not carry the rule: it builds its own argv on the flyctl path, where `/work` is a seeded copy rather than the developer's checkout. |
+| `--disallowedTools` | hard-deny list (`DISALLOWED_TOOLS`); removes tools from the model's context entirely — the model cannot see or call them regardless of permission mode.  Survives `--dangerously-skip-permissions`.  Denies: `Agent`, `SendMessage`, `ScheduleWakeup`, `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger`, `PushNotification`, `Workflow`, `ReportFindings`, `Skill`, `Monitor`, `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`, `TaskOutput`, `ListAgents`, `EnterWorktree`, `ExitWorktree`, `DesignSync`, `ToolSearch` — tools that spawn untracked parallel work, set timers, load skills, or manipulate git worktrees outside the orchestrator's own scripts. `TaskStop` is deliberately absent (it stops only the calling session's own background tasks — a foreign task ID gets "No task found" — and is granted in `ACT_TOOLS`; DESIGN §2). Passed on every `claude -p` argv leerie builds, smoke test and remote integrator included (both were missing it until 2026-08-18). Also denies `Task` (the live CLI's subagent-spawning tool; `Agent` is the retired name, so the no-subagent constraint was enforced against a name current builds no longer ship — measured in the preflight smoke test's own then-uncontained surface, never a contained worker's, so this entry is defense-in-depth rather than a fix for an observed leak), `ListMcpResourcesTool`/`ReadMcpResourceTool`/`ReadMcpResourceDirTool` (inert once `--strict-mcp-config` leaves zero servers; denied so the surface stays enumerable).  Per call, `claude_p` appends `deny_extra` = the comma-join of the non-empty results of `_repo_write_denials(st.repo_root, st.run_dir)`, `_acceptance_read_denials(schema_key, st.run_dir)`, `_sysprompt_read_denial(st.run_dir)` (`Read(/<run_dir>/sysprompt/**)`, every worker — DESIGN §7 *The system prompt is staged in the run directory*), `_full_suite_denials(repo_root, prescribed_procedure)`, `_db_reset_denials(repo_root)`, `_forbidden_command_denials(forbidden)` and, for a worker whose tools include bare `Bash`, `_process_kill_denials()` (each described in its own row below or in §5½). `_acceptance_read_denials`, for `implementer`, `conformer` and `surrogate_fixer` only, is `Read(/<run_dir>/acceptance/**)`, `Read(/<run_dir>/worktrees/acceptance-eval/**)`, `Read(/<run_dir>/logs/**)`, `Read(/<run_dir>/orchestrator.log)`, `Read(/<run_dir>/calls.ndjson)`, `Read(/<run_dir>/state.json)` (absolute paths, so `//…`) and `Read(~/.claude/projects/**)`, keeping the held-out acceptance sets and every file that records them (writers' stream transcripts, evaluation logs, echoed output, captured responses, case names in state, the CLI's session transcripts) out of the fixers' Read tool; their prompts read only `subtasks/`, `task.md` and `notes/` under the run directory (DESIGN §8 *Held-out acceptance tests*). A shell `cat` is not covered by these rules; Landlock is what keeps every read of the run directory to the worker's grants (§3 *Confinement (I5)*). `_repo_write_denials` is — the path-scoped rule `Edit(//<repo_root>/**)` (`//` is the CLI's anchor for an absolute path; `Edit(...)` subsumes `Write`/`NotebookEdit`/`MultiEdit`, and also covers `sed -i`). Two rules are emitted when `repo_root` and its realpath differ, because the CLI matches against the path the worker was handed, not its realpath — reachable via the host-side `run_rebaser`/`run_recapture_deps` entrypoints, which take `repo_root` as a parameter rather than from `os.getcwd()`. This is DESIGN §12 L1 for **acting** workers, which cannot have the flag removed: a deny rule is the only permission control that survives `--dangerously-skip-permissions`. Probed live (claude 2.1.237, ground truth from the filesystem): without it an outside-cwd write succeeded, with it it was rejected, and an inside-worktree write succeeded in both arms. Derived from `repo_root`, never hard-coded `/work`, so it cannot silently guard nothing if the mount path moves. The smoke test passes no `deny_extra` — it has no run and no checkout to guard. Returns `""` (no denial, one `log()` warning) when `run_dir` is inside `repo_root` — the `LEERIE_STATE_DIR`-unset layout, where worktrees live in the checkout and a blanket deny would deny each worker its own worktree. `scripts/remote/collect-subtrees.sh` does not carry the rule: it builds its own argv on the flyctl path, where `/work` is a seeded copy rather than the developer's checkout. |
 | `--max-turns` | per-worker turn cap (values in §6) |
 | `--model` | model alias for this worker — `sonnet` / `opus` / `haiku`. Value comes from per-worker resolution (see §2 *Model selection*) |
 | `--add-dir` | repeated per entry in `state.json["inspect_dirs"]` (forwarded by `claude_p`'s `add_dirs` param). Used only by inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) so their sandboxed Read/Grep/Glob and allowlisted Bash verbs can reach sibling repos referenced in the task. See §2 *Inspect directories* |
@@ -3778,6 +3778,98 @@ dead/expired credential is never rotated.
 Maps to `DESIGN.md`: §6 *Multi-token rotation*.
 
 ---
+
+### Confinement (I5) — `_worker_grants`, `scripts/landlock_exec.py`
+
+DESIGN §6 *A worker writes only where it is granted (I5)*.
+
+- `scripts/landlock_exec.py [--rw PATH]... [--ro PATH]... -- CMD`: stdlib
+  only. Handles `READ_FILE`, `READ_DIR` and every write-class right
+  (`WRITE_FILE`, `REMOVE_*`, `MAKE_*`, `REFER`, `TRUNCATE`); a `--rw` path
+  gets read and write, a `--ro` path read (a non-directory gets the file
+  rights only); a path that does not exist is skipped; then
+  `PR_SET_NO_NEW_PRIVS`, `landlock_restrict_self`, `execvp`. `abi()`
+  (`landlock_create_ruleset(NULL, 0, VERSION)`, 0 when absent) and
+  `MIN_ABI = 3`. Exits 126 ("cannot confine the worker") without running
+  CMD when the ABI is below that or any step fails. The orchestrator loads
+  it as a module (`_landlock()`).
+- `_require_landlock()` — `die()` unless `abi() >= MIN_ABI`; `preflight`
+  step 0.3, before any worker, on every runtime.
+- `WorkerGrants(rw, ro)` (NamedTuple of absolute paths).
+- `_worker_grants(*, run_dir, state, schema_key, cwd, allowed_tools, env,
+  notes_id=None, selfcheck_dir=None) -> WorkerGrants` — the state root is
+  `run_dir.parent.parent`. Every worker: `rw` `_WORKER_DEVICES`,
+  `_worker_own_dirs(env, run_dir)` (each `_WORKER_ENV_DIRS` variable —
+  `TMPDIR`, `TMP`, `TEMP`, `CLAUDE_CODE_TMPDIR`, `CLAUDE_CONFIG_DIR`, as
+  `claude_p` sets them from `_worker_dirs` — whose realpath lies beneath
+  `<run>/workers/` (`WORKERS_DIR`); any other value grants nothing) and
+  the run's shared caches `<run>/workers/cache/` (`WORKER_CACHE_DIR`,
+  `_worker_cache_env`); `ro` `_reads_outside(state_root)`,
+  `<run>/sysprompt` and the CLI configuration template
+  `<run>/claude-config/` (`CLAUDE_CONFIG_TEMPLATE`, linked from each
+  worker's configuration). `<state-root>/.stores/leerie/` is never
+  granted. The cwd, for a
+  committing worker (`schema_key` in
+  `_COMMITTING_WORKERS`: implementer, conformer, integrator,
+  acceptance_writer, surrogate_fixer, falsifier, rebaser): `rw` it and
+  `_tree_git_dirs(cwd, run_dir)`'s write list, `ro` its read list or, for
+  a clone (both empty), `<run>/repo/objects`. `_tree_git_dirs` (`git
+  rev-parse --path-format=absolute --git-dir --git-common-dir`): a common
+  dir in `<run>/tree-repos/` (`TREE_REPOS_DIRNAME`) → write it whole, read
+  `<run>/repo/objects`; the run repository itself → write the worktree's
+  admin dir and `objects/`, `refs/`, `logs/`, read the repository; a git
+  dir inside the tree (a clone) → nothing. For any other worker: `rw` the
+  cwd when `_bash_unrestricted(allowed_tools)` (bare `Bash` in the list),
+  else `ro` (the shared planning worktree and the payload-only directory
+  included: no worker there has a shell); `ro` `<run>/repo`. `_RUN_NOTES_READERS`
+  (implementer, conformer, integrator): `ro` `<run>/subtasks`,
+  `<run>/task.md`, `<run>/notes`. `notes_id`: `rw` `<run>/notes/<id>/`
+  (created). `selfcheck_dir`: `ro` it, `rw` its `run/` (created). Last,
+  `_around(paths, state_root)` replaces any path that contains the state
+  root by `_beside(path, state_root)` — no grant covers the root whole.
+- `_beside(top, root)` — at each directory from `top` down to `root`'s
+  parent, every entry except the one on the way to `root` and except a
+  symlink resolving onto that path or beneath `root`. `_reads_outside(root)`
+  is `_beside(Path("/"), root)`.
+- `_confined_argv(grants, cmd)` — `[sys.executable, "-I",
+  LANDLOCK_SCRIPT, --rw…, --ro…, "--", *cmd]`.
+- `claude_p(…, notes_id=None, selfcheck_dir=None)` computes `grants` once
+  per call, after `_worker_dirs` has put the worker's own
+  `CLAUDE_CONFIG_DIR`/`TMPDIR`/`TMP`/`TEMP` in its environment (None only
+  when `caps[HOST_SEAM_CAP]`), passes it to
+  `_invoke_admitted` → `_invoke(…, *, grants)` (keyword-only, no default);
+  `_invoke` spawns `_confined_argv(grants, cmd)` (inside the spawn gate
+  when there is one), or `cmd` itself for `None`. The staged stdin prompt
+  is written under `<run>/stdin/` (`mkstemp(dir=…)`), not the system temp
+  directory. `_worker_guard` adds `CONFINED_WRITES_NOTICE` for every worker
+  with bare `Bash` (`/tmp` and every path but its cwd and `$TMPDIR` are
+  not writable). `preflight`'s smoke test passes
+  `_worker_grants(…, schema_key="smoke", cwd=<smoke dir>, …)`.
+  `_run_implementer` passes `notes_id=sid`; `_redrive_drive`
+  `notes_id=members[0]` and `selfcheck_dir` (its `bin/`'s parent).
+- `HOST_SEAM_CAP = "_host_seam"` — a key set True only on the caps
+  `_resolve_host_seam_settings` returns (`run_rebaser`,
+  `run_recapture_deps`), read only by `claude_p`.
+- Notes: `NOTES_DIRNAME = "notes"`; `_notes_dir(leerie_dir, sid)`,
+  `_criteria_path` (`notes/<id>/criteria.md`), `_checkpoint_path`
+  (`notes/<id>/checkpoint.md`), replacing `criteria/<id>.md` and
+  `checkpoints/<id>.md` (the run directory and `setup-run.sh` make
+  `notes/`). The self-check's copies and call log are under
+  `<run>/selfcheck/<group>/run/` (`snap_root`, `log`).
+- Fly: `scripts/worker-guard.py <tools> <repo> <state.json> <wid>` also
+  makes the worker's `_worker_dirs(run_dir, <wid>)` and names them, with
+  `_worker_cache_env`'s caches, in `guard_env`, and prints `guard_confine`
+  (the shim argv for `_worker_grants(run_dir=<state.json's dir>, state,
+  "integrator", staging, …)` over that environment), exiting 1 when the ABI
+  is too low; `collect-subtrees.sh` passes `integrator-<sid>`, prefixes
+  `claude -p` with it and skips the branch without it.
+- Tests: `tests/test_worker_confinement.py` (a real confined child per
+  worker kind; fail closed in preflight, the shim and `_invoke`; derived
+  guards: every `claude -p` argv from `_contained_claude_argv` or the probe,
+  every `_invoke` call with `grants`, the shim before the spawn, the host
+  seam's one setter and one reader, the Fly integrator's prefix; the
+  environment-named grants beneath `workers/` only; a tree repository's
+  grant).
 
 ## 4. Phase walkthrough (`leerie.py`)
 
@@ -10399,9 +10491,9 @@ Two concurrent runs in the same repository share no coordination state.
         ├── plan.json                merged planner output
         ├── task.md                  the task document verbatim, as plain markdown
         ├── subtasks/<id>.json       per-subtask spec handed to each implementer
-        ├── criteria/<id>.md         informational success-criteria notes (DESIGN §9)
+        ├── notes/<id>/criteria.md   informational success-criteria notes (DESIGN §9); the implementer's own directory (DESIGN §6 *A worker writes only where it is granted*)
         ├── artifacts/<id>.json      structured deliverables from an implementer's `artifacts` field (DESIGN §5); absent for code-implementation subtasks
-        ├── checkpoints/<id>.md      handoff checkpoints (7-section schema)
+        ├── notes/<id>/checkpoint.md handoff checkpoints (7-section schema)
         ├── logs/<sid>.log           per-worker raw stream-json event log, one file per claude_p invocation by sid
         ├── worktrees/staging        the run-branch worktree
         ├── worktrees/<run-id[:12]>-<id>  per-subtask worktrees

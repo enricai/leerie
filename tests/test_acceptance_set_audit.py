@@ -910,7 +910,7 @@ def test_a_worker_environment_never_carries_the_consent(leerie, monkeypatch,
     with pytest.raises(Stop):
         asyncio.run(leerie._invoke(
             ["true"], str(tmp_path), 10, "t", tmp_path, "quiet",
-            env_extra={"DATABASE_URL": "postgresql://x"}))
+            env_extra={"DATABASE_URL": "postgresql://x"}, grants=leerie.WorkerGrants(("/",), ())))
     assert seen["env"]["DATABASE_URL"] == "postgresql://x"
     assert not any(k.startswith("PRISMA_USER_CONSENT") for k in seen["env"])
 

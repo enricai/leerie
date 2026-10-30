@@ -39,6 +39,7 @@ import fnmatch
 import functools
 import glob
 import hashlib
+import importlib.util
 import io
 import ipaddress
 import json
@@ -11249,6 +11250,11 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             "Every subprocess would report a bogus failure. This is an "
             "environment problem, not a leerie configuration problem.")
 
+    # 0.3. every worker is confined (DESIGN §6 *A worker writes only where
+    # it is granted*): a kernel that cannot confine one stops the run here,
+    # before any is spawned — every runtime, Fly and EC2 included.
+    _require_landlock()
+
     # 0.4. reap idle runs' worktrees (DESIGN §6 *Idle runs' worktrees are
     # reaped at preflight*), before the headroom check reads free space.
     # Nothing else reaps them: a paused or died run keeps a full checkout
@@ -11365,7 +11371,12 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             envelope = await _invoke(cmd, cwd=smoke_cwd, timeout=90,
                                      sid="smoke",
                                      leerie_dir=leerie_dir,
-                                     verbosity=verbosity)
+                                     verbosity=verbosity,
+                                     grants=_worker_grants(
+                                         run_dir=leerie_dir, state={},
+                                         schema_key="smoke", cwd=smoke_cwd,
+                                         allowed_tools=SMOKE_TOOLS,
+                                         env=os.environ))
         except subprocess.TimeoutExpired:
             die("claude -p smoke test timed out — auth issue or network problem")
         except WorkerError as e:
@@ -17622,8 +17633,12 @@ def _resolve_host_seam_settings(
     vars and `leerie.toml` are still honoured even though there is no CLI —
     without this the per-worker table pins these entrypoints at their
     hardcoded timeouts (rebaser 1371s, dep_capture 600s) with no way to
-    raise it."""
+    raise it. Marks the caps as the host-side seam (`HOST_SEAM_CAP`): its
+    workers run on the user's host, are not run workers, and macOS has no
+    Landlock, so they are not confined (DESIGN §6 *Outside the
+    container*)."""
     caps = dict(DEFAULT_CAPS)
+    caps[HOST_SEAM_CAP] = True
 
     # Minimal args namespace so resolve_models/efforts can read env vars and
     # TOML but have no CLI overrides (this is a host-side non-interactive call).
@@ -21445,6 +21460,253 @@ async def _select_active_oauth_token(st: "State", caps: dict) -> None:
     st.save()
 
 
+# --- I5: a worker writes only where it is granted ---------------------------
+# DESIGN §6 *A worker writes only where it is granted (I5)*. The kernel
+# (Landlock) enforces it: `_invoke` starts every worker through
+# `scripts/landlock_exec.py` with the grants `_worker_grants` derives.
+LANDLOCK_SCRIPT = ROOT / "scripts" / "landlock_exec.py"
+
+
+@functools.lru_cache(maxsize=1)
+def _landlock() -> types.ModuleType:
+    """`scripts/landlock_exec.py` as a module: its `abi()` and `MIN_ABI`
+    are the one spelling of the requirement."""
+    spec = importlib.util.spec_from_file_location("leerie_landlock",
+                                                  LANDLOCK_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _require_landlock() -> None:
+    """Fail closed (DESIGN §6 *A worker writes only where it is granted*):
+    no worker runs when the kernel cannot confine it."""
+    lk = _landlock()
+    v = lk.abi()
+    if v < lk.MIN_ABI:
+        die(f"this kernel cannot confine leerie's workers: its Landlock ABI "
+            f"is {v or 'absent'}, and leerie needs {lk.MIN_ABI} or later "
+            "(Linux 6.2+ with `landlock` in the active LSMs, "
+            "/sys/kernel/security/lsm). Leerie never runs a worker "
+            "unconfined (DESIGN §6 *A worker writes only where it is "
+            "granted*; docs/INSTALL.md).")
+
+
+class WorkerGrants(NamedTuple):
+    """What a worker's processes may write (`rw`, read too) and read
+    (`ro`), as absolute paths."""
+    rw: tuple[str, ...]
+    ro: tuple[str, ...]
+
+
+# The caps key that marks the host-side seam, set only by
+# `_resolve_host_seam_settings` (`run_rebaser`, `run_recapture_deps`): its
+# workers run on the user's host, are not run workers, and macOS has no
+# Landlock (DESIGN §6 *Outside the container*). A key of the call's own caps,
+# never process state, so nothing else ever inherits it.
+HOST_SEAM_CAP = "_host_seam"
+
+# The device nodes a worker's tools write: not all of /dev. `/dev/shm`
+# holds POSIX semaphores and shared memory (Python's multiprocessing locks
+# and Chromium need it, measured); leerie never reads it.
+_WORKER_DEVICES = ("/dev/null", "/dev/zero", "/dev/full", "/dev/random",
+                   "/dev/urandom", "/dev/tty", "/dev/ptmx", "/dev/pts",
+                   "/dev/shm")
+
+# The variables that name a worker's own directories, its temp dir and CLI
+# config (`_worker_dirs`). Each is granted only when it names a path beneath
+# `<run-dir>/workers/` (`WORKERS_DIR`), where the run makes a worker's own
+# (DESIGN §6): a variable left at a shared default (`/tmp`, `~/.claude`)
+# grants nothing. The run's shared download caches are granted as the one
+# directory they live in (`WORKER_CACHE_DIR`, `_worker_cache_env`).
+_WORKER_ENV_DIRS = ("TMPDIR", "TMP", "TEMP", "CLAUDE_CODE_TMPDIR",
+                    "CLAUDE_CONFIG_DIR")
+WORKER_CACHE_DIR = "cache"
+
+# Workers that commit, and so write their tree's git metadata.
+_COMMITTING_WORKERS = frozenset({
+    "implementer", "conformer", "integrator", "acceptance_writer",
+    "surrogate_fixer", "falsifier", "rebaser"})
+# Workers whose prompt reads the run's subtask specs and notes.
+_RUN_NOTES_READERS = frozenset({"implementer", "conformer", "integrator"})
+# Where an implementer keeps its success-criteria notes and checkpoint:
+# `<run-dir>/notes/<subtask-id>/`, its own directory, so a grant can name
+# it before either file exists.
+NOTES_DIRNAME = "notes"
+
+
+def _notes_dir(leerie_dir: str | Path, sid: str) -> Path:
+    return Path(leerie_dir) / NOTES_DIRNAME / sid
+
+
+def _criteria_path(leerie_dir: str | Path, sid: str) -> Path:
+    return _notes_dir(leerie_dir, sid) / "criteria.md"
+
+
+def _checkpoint_path(leerie_dir: str | Path, sid: str) -> Path:
+    return _notes_dir(leerie_dir, sid) / "checkpoint.md"
+
+
+def _beside(top: Path, root: Path) -> list[str]:
+    """Every path a grant must name so that everything beneath `top` but
+    outside `root` (which is beneath `top`) is granted and nothing beneath
+    `root` is: at each directory from `top` down to `root`'s parent, every
+    entry but the one on the way to `root`. Landlock grants beneath a path,
+    so `top` itself cannot be granted."""
+    out: list[str] = []
+    cur = top
+    for part in root.parts[len(top.parts):]:
+        try:
+            with os.scandir(cur) as it:
+                entries = sorted((e.name, e.is_symlink()) for e in it)
+        except OSError:
+            entries = []
+        for e, link in entries:
+            if e == part:
+                continue
+            # A grant follows a symlink: one that resolves to `root`, an
+            # ancestor of it or a path beneath it (pytest's
+            # `pytest-current`, measured) would grant `root` itself. Only a
+            # symlink can: any other entry here is beside `root`'s path.
+            if link:
+                real = Path(os.path.realpath(cur / e))
+                if root.is_relative_to(real) or real.is_relative_to(root):
+                    continue
+            out.append(str(cur / e))
+        cur = cur / part
+    return out
+
+
+def _reads_outside(root: Path) -> list[str]:
+    """Read grants for everything outside the state root `root`."""
+    return _beside(Path("/"), root)
+
+
+def _around(paths: list[str], root: Path) -> list[str]:
+    """`paths`, each one that contains `root` (a `TMPDIR` of `/tmp` with
+    the state root beneath it) replaced by its entries beside `root`: no
+    grant ever covers the state root whole."""
+    out: list[str] = []
+    for p in paths:
+        real = Path(os.path.realpath(p))
+        out += (_beside(real, root) if root.is_relative_to(real)
+                else [p])
+    return out
+
+
+def _worker_own_dirs(env: Mapping[str, str], run_dir: Path) -> list[str]:
+    """The directories `_WORKER_ENV_DIRS` names in `env` that lie beneath
+    `<run_dir>/workers/`; any other value is shared, and granted nothing."""
+    workers = (run_dir / WORKERS_DIR).resolve()
+    out = []
+    for var in _WORKER_ENV_DIRS:
+        p = env.get(var)
+        if p and Path(os.path.realpath(p)).is_relative_to(workers):
+            out.append(os.path.realpath(p))
+    return out
+
+
+TREE_REPOS_DIRNAME = "tree-repos"
+
+
+def _tree_git_dirs(tree: Path, run_dir: Path) -> tuple[list[str], list[str]]:
+    """`(write, read)`: the git metadata a commit in `tree` writes, and what
+    it reads besides, when that lives in the run directory outside `tree`.
+    A worktree of its tree's own repository (`<run>/tree-repos/<tree>/`,
+    DESIGN §6 *A repository per committing tree*): that repository whole,
+    and `<run>/repo/objects/` read (its alternates). A worktree of the run
+    repository itself (until every tree has its own): the worktree's admin
+    directory and the shared `objects/`, `refs/`, `logs/` written, the
+    repository read — never `config`, `info/`, `HEAD` or `packed-refs`
+    written. `([], [])` for a clone, whose `.git` is inside it."""
+    r = subprocess.run(["git", "-C", str(tree), "rev-parse",
+                        "--path-format=absolute", "--git-dir",
+                        "--git-common-dir"], capture_output=True, text=True,
+                       check=False, timeout=30)
+    lines = r.stdout.split("\n")
+    if r.returncode != 0 or len(lines) < 2:
+        return [], []
+    git_dir, common = Path(lines[0]).resolve(), Path(lines[1]).resolve()
+    run_repo = (run_dir / RUN_REPO_NAME).resolve()
+    if git_dir.is_relative_to(tree):
+        return [], []
+    if common.parent == (run_dir / TREE_REPOS_DIRNAME).resolve():
+        return [str(common)], [str(run_repo / "objects")]
+    if common == run_repo:
+        return ([str(git_dir)] + [str(common / d) for d in
+                                  ("objects", "refs", "logs")],
+                [str(run_repo)])
+    return [], []
+
+
+def _bash_unrestricted(allowed_tools: str) -> bool:
+    """True when the tool list grants bare `Bash` (an acting worker), not
+    only `Bash(<verb>:*)` patterns."""
+    return "Bash" in [t.strip() for t in allowed_tools.split(",")]
+
+
+def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
+                   cwd: str | Path, allowed_tools: str,
+                   env: Mapping[str, str], notes_id: str | None = None,
+                   selfcheck_dir: str | Path | None = None) -> WorkerGrants:
+    """THE grant list (DESIGN §6 *A worker writes only where it is granted
+    (I5)*), derived from the worker's kind. Every worker: the device nodes,
+    its own directories (`_worker_own_dirs`), reads of everything outside
+    the state root and of the run's staged system prompts. Then its cwd:
+    written by a committing worker, with its tree's git metadata
+    (`_tree_git_dirs`); otherwise written only with bare `Bash` (whose cwd
+    is its own checkout) and read without — the shared planning worktree
+    and the payload-only directory included —, with the run's repository
+    readable. A worker whose prompt
+    reads the run's specs and notes reads `subtasks/`, `task.md` and
+    `notes/`; `notes_id` names its own notes directory, written. The re-drive's
+    self-check directory (`selfcheck_dir`) is read, its `run/` written."""
+    run_dir = Path(run_dir).resolve()
+    state_root = run_dir.parent.parent
+    cwd_r = Path(cwd).resolve()
+    rw: list[str] = (list(_WORKER_DEVICES) + _worker_own_dirs(env, run_dir)
+                     + [str(run_dir / WORKERS_DIR / WORKER_CACHE_DIR)])
+    # The run's CLI configuration template: each worker's configuration
+    # links its directories (`_worker_dirs`), read, never written.
+    ro: list[str] = _reads_outside(state_root) + [
+        str(run_dir / SYSPROMPT_DIRNAME),
+        str(run_dir / CLAUDE_CONFIG_TEMPLATE)]
+    if schema_key in _COMMITTING_WORKERS:
+        rw.append(str(cwd_r))
+        git_rw, git_ro = _tree_git_dirs(cwd_r, run_dir)
+        rw += git_rw
+        # A clone borrows the run repository's objects (`--shared`).
+        ro += git_ro or [str(run_dir / RUN_REPO_NAME / "objects")]
+    else:
+        (rw if _bash_unrestricted(allowed_tools) else ro).append(str(cwd_r))
+        ro.append(str(run_dir / RUN_REPO_NAME))
+    if schema_key in _RUN_NOTES_READERS:
+        ro += [str(run_dir / "subtasks"), str(run_dir / "task.md"),
+               str(run_dir / NOTES_DIRNAME)]
+    if notes_id:
+        own = _notes_dir(run_dir, notes_id)
+        own.mkdir(parents=True, exist_ok=True)
+        rw.append(str(own))
+    if selfcheck_dir is not None:
+        sc = Path(selfcheck_dir).resolve()
+        (sc / "run").mkdir(parents=True, exist_ok=True)
+        ro.append(str(sc))
+        rw.append(str(sc / "run"))
+    # No grant ever covers the state root whole, whatever a variable names.
+    return WorkerGrants(tuple(dict.fromkeys(_around(rw, state_root))),
+                        tuple(dict.fromkeys(_around(ro, state_root))))
+
+
+def _confined_argv(grants: WorkerGrants, cmd: list[str]) -> list[str]:
+    """`cmd` started through the Landlock shim with `grants`."""
+    argv = [sys.executable, "-I", str(LANDLOCK_SCRIPT)]
+    for p in grants.rw:
+        argv += ["--rw", p]
+    for p in grants.ro:
+        argv += ["--ro", p]
+    return argv + ["--", *cmd]
+
+
 async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
                            sid: str, leerie_dir: Path, verbosity: str,
                            progress: Callable[[],
@@ -21458,7 +21720,8 @@ async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
                            active_token: str | None = None,
                            max_parallel: int | None = None,
                            worker_demand_estimate_bytes: int | None = None,
-                           env_extra: dict[str, str] | None = None) -> dict:
+                           env_extra: dict[str, str] | None = None,
+                           *, grants: WorkerGrants | None) -> dict:
     """Admission-gated wrapper around `_invoke`.
 
     This exists as a separate function purely so the memory reservation is
@@ -21489,7 +21752,7 @@ async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
             progress=progress, idle_warn_sec=idle_warn_sec,
             worker_memory_max_bytes=worker_memory_max_bytes,
             worker_pids_max=worker_pids_max, stdin_data=stdin_data,
-            run_id=run_id, active_token=active_token,
+            run_id=run_id, active_token=active_token, grants=grants,
             **({"env_extra": env_extra} if env_extra else {}))
     finally:
         _release_worker_memory_admission(admission_token)
@@ -21505,8 +21768,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   stdin_data: str | None = None,
                   run_id: str | None = None,
                   active_token: str | None = None,
-                  env_extra: dict[str, str] | None = None) -> dict:
+                  env_extra: dict[str, str] | None = None,
+                  *, grants: WorkerGrants | None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
+
+    `grants` (required, keyword-only: no call can forget it) is where the
+    worker's processes may write and read (`_worker_grants`, DESIGN §6 *A
+    worker writes only where it is granted (I5)*): `cmd` is started through
+    the Landlock shim with them, every descendant inheriting the
+    restriction. None runs `cmd` unconfined: only `claude_p` on the
+    host-side seam passes it (`HOST_SEAM_CAP`).
 
     `stdin_data`, when given, is written to a temp file that becomes the
     child's stdin — this is how `claude_p` hands the worker its
@@ -21694,7 +21965,13 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # just-returned mkstemp fd, i.e. a programming error rather than a
         # runtime condition.
         try:
-            stdin_fd, stdin_path = tempfile.mkstemp(prefix="leerie-prompt-")
+            # In the run directory, never the shared `/tmp`: another
+            # worker's processes must not read or rewrite this one's prompt
+            # (DESIGN §6 *A worker writes only where it is granted*).
+            stage_dir = Path(leerie_dir) / "stdin"
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            stdin_fd, stdin_path = tempfile.mkstemp(prefix="leerie-prompt-",
+                                                    dir=stage_dir)
             # fdopen rather than a bare os.write: os.write returns a count and
             # is permitted to short-write, so writing a 150KB prompt with it
             # would deliver a TRUNCATED payload on the day it ever did — the
@@ -21725,9 +22002,10 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                 # inode-exhaustion case the call was moved inside this guard
                 # to cover — so name the directory instead of interpolating
                 # None. The location is the actionable half: staging goes to
-                # $TMPDIR, which is not necessarily the state-dir filesystem
+                # the run directory's `stdin/`, on the state-dir filesystem
                 # the resume hint tells the operator to free.
-                _where = stdin_path or f"a new file under {tempfile.gettempdir()}"
+                _where = stdin_path or (
+                    f"a new file under {Path(leerie_dir) / 'stdin'}")
                 raise DiskLowSpace(
                     f"staging the worker prompt failed: "
                     f"{os.strerror(exc.errno)} writing {_where}"
@@ -21764,11 +22042,12 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         cgroup_sid = await asyncio.to_thread(
             _cgroup_create, _cgroup_worker_sid(run_id, sid),
             worker_memory_max_bytes, worker_pids_max)
-    spawn_cmd = list(cmd)
+    spawn_cmd = (list(cmd) if grants is None
+                 else _confined_argv(grants, list(cmd)))
     gate_r: int | None = None
     gate_w: int | None = None
     if cgroup_sid is not None:
-        spawn_cmd, gate_r, gate_w = _spawn_held_argv(list(cmd))
+        spawn_cmd, gate_r, gate_w = _spawn_held_argv(spawn_cmd)
     try:
         proc = await asyncio.create_subprocess_exec(
             *spawn_cmd,
@@ -22890,8 +23169,8 @@ def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
     transcripts carry the test source), `orchestrator.log` (where streamed
     output is echoed), `calls.ndjson` (the writers' responses) and
     `state.json` (case names and paths) — and on the CLI's own session
-    transcripts. The fixers' prompts read only `subtasks/`, `criteria/` and
-    `checkpoints/` there. Joined with `_repo_write_denials`' rules at the
+    transcripts. The fixers' prompts read only `subtasks/`, `task.md` and
+    `notes/` there. Joined with `_repo_write_denials`' rules at the
     call site. A shell `cat` is not covered; hiding reduces the
     special-casing incentive, it does not guarantee it. The delivery
     `falsifier` is denied the same run state (bench Q2 F+ hid it): it gets
@@ -23448,6 +23727,14 @@ FORBIDDEN_COMMANDS_NOTICE = (
 # ORCHESTRATOR:` is appended to their prompt, so none can come back as a
 # constraint of the task (DESIGN §9 *A command the task forbids*).
 NOTICE_FREE_WORKERS = frozenset({"classifier", "forbidden_command_extractor"})
+
+# DESIGN §6 *A worker writes only where it is granted (I5)*: told to every
+# worker with a shell, since a fixed `/tmp/<name>` path — measured in 155 of
+# 310 corpus sessions that wrote an absolute path — is refused.
+CONFINED_WRITES_NOTICE = (
+    "your processes can write only your working directory and $TMPDIR. "
+    "`/tmp` and every path outside those two are not writable; put scratch "
+    "files in $TMPDIR.")
 
 FORBIDDEN_WHOLE_SUITE_NOTICE = (
     "this task forbids running the whole test suite ({cmds}). A whole-suite "
@@ -25471,7 +25758,9 @@ def _worker_guard(allowed_tools: str, repo_root: str | Path,
     notices = [] if worker in NOTICE_FREE_WORKERS else [
         n for n in (suite_notice, forbidden_notice,
                     PROCESS_KILL_NOTICE if deny_kills else None,
-                    db_notice) if n]
+                    db_notice,
+                    CONFINED_WRITES_NOTICE if _bash_unrestricted(
+                        allowed_tools) else None) if n]
     return {
         "deny": ",".join(d for d in (suite_deny, db_deny, forbidden_deny,
                                      kill_deny) if d),
@@ -25539,6 +25828,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                    effort: str | None = None,
                    env_extra: dict[str, str] | None = None,
                    resume_session: str | None = None,
+                   notes_id: str | None = None,
+                   selfcheck_dir: str | None = None,
                    _suppress_capture: bool = False) -> dict:
     """Run one headless Claude Code worker and return its validated
     structured output.
@@ -25688,6 +25979,15 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                      "TMPDIR": str(worker_tmp), "TMP": str(worker_tmp),
                      "TEMP": str(worker_tmp)}
 
+    # I5: where this worker's processes may write and read (DESIGN §6 *A
+    # worker writes only where it is granted*); `_invoke` applies it. None
+    # only on the host-side seam, which is not a run worker. After the
+    # worker's own directories are named: the grants follow them.
+    grants = None if caps.get(HOST_SEAM_CAP) else _worker_grants(
+        run_dir=leerie_dir, state=st.data, schema_key=schema_key, cwd=cwd,
+        allowed_tools=allowed_tools, env={**os.environ, **(env_extra or {})},
+        notes_id=notes_id, selfcheck_dir=selfcheck_dir)
+
     use_file_flag = _append_system_prompt_file_supported()
     system_prompt_file: str | None = None
     if use_file_flag:
@@ -25791,6 +26091,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                                      max_parallel=caps.get("max_parallel"),
                                      worker_demand_estimate_bytes=caps.get(
                                          "worker_demand_estimate_bytes"),
+                                     grants=grants,
                                      **({"env_extra": env_extra}
                                         if env_extra else {}))
             _latency_ms = int((time.monotonic() - _t0) * 1000)
@@ -36321,7 +36622,7 @@ def _write_plan(leerie_dir: Path, task: str, st: State,
     # the cap versus comfortably under it. A plain `.md` sidecar is also
     # greppable and `sed -n`-able, which a JSON-escaped string is not.
     # Sits alongside the existing plain sidecars (`working-branch`,
-    # `criteria/<id>.md`, `checkpoints/<id>.md`).
+    # `notes/<id>/criteria.md`, `notes/<id>/checkpoint.md`).
     task_path = leerie_dir / "task.md"
     # Explicit utf-8 on both: `_task_ref_bytes` is consumed by the worker
     # to decide whether to page the file, so the count and the write must
@@ -36596,7 +36897,7 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
         # completeness gate's mandatory criteria
         # (docs/POSTMORTEM-2026-08-14.md, F23). Opening a prompt with an
         # instruction that fails teaches the worker to discount what follows.
-        _ckpt = Path(leerie_dir) / "checkpoints" / f"{sid}.md"
+        _ckpt = _checkpoint_path(leerie_dir, sid)
         if _ckpt.is_file():
             up.append(f"This is a CONTINUATION. Read the checkpoint at "
                       f"{_ckpt}, validate it against the actual repo state, "
@@ -36613,7 +36914,8 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
                               allowed_tools=ACT_TOOLS, max_turns=120,
                               autonomous=True, caps=caps, st=st,
                               model=models["implementer"],
-                              effort=efforts["implementer"], sid=sid)
+                              effort=efforts["implementer"], sid=sid,
+                              notes_id=sid)
     except WorkerError as e:
         # worker could not return schema-valid output even after a retry
         # (e.g. it hit --max-turns mid-task) -> treat as a handoff so a fresh
@@ -36622,7 +36924,7 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
         # `failure_kind="empty_handoff"` (retryable); see the TimeoutExpired
         # arm below for the full retry-classification rationale.
         return {"subtask_id": sid, "status": "incomplete-handoff",
-                "checkpoint_path": str(leerie_dir / "checkpoints" / f"{sid}.md"),
+                "checkpoint_path": str(_checkpoint_path(leerie_dir, sid)),
                 "summary": f"worker produced no schema-valid result: {e}"}
     except subprocess.TimeoutExpired:
         # worker hit the per-process wall-clock cap (`worker_timeout_sec`,
@@ -36650,7 +36952,7 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
         # and reporting the global would name a number that never applied.
         timeout = resolve_worker_timeout("implementer", caps)
         return {"subtask_id": sid, "status": "incomplete-handoff",
-                "checkpoint_path": str(leerie_dir / "checkpoints" / f"{sid}.md"),
+                "checkpoint_path": str(_checkpoint_path(leerie_dir, sid)),
                 "summary": (f"worker timed out after {timeout}s "
                             "(worker_timeout_sec cap) — fresh implementer "
                             "can continue from any partial checkpoint")}
@@ -38605,7 +38907,7 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
     up = [f"Run the post-work conformance phase for subtask `{sid}`.",
           f"LEERIE_DIR is {leerie_dir} (absolute). Your subtask spec "
           f"is at {leerie_dir}/subtasks/{sid}.json and the implementer's "
-          f"success-criteria notes are at {leerie_dir}/criteria/{sid}.md "
+          f"success-criteria notes are at {_criteria_path(leerie_dir, sid)} "
           "— both read-only inputs.",
           "Your current working directory IS the subtask's worktree. Make "
           "and commit any fixes here. Every commit subject must start "
@@ -53400,12 +53702,12 @@ def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
     bin_dir.mkdir(parents=True, exist_ok=True)
     cfg = {"tree": str(staging), "repo_root": str(st.repo_root),
            "sets": sets, "run_files": run_files,
-           "snap_root": str(root / "snap"),
+           "snap_root": str(root / "run"),
            "env": _test_db_env(db_url) if db_url else {},
            "forbidden": _forbidden_specs(getattr(st, "data", None)),
            "timeout": float(caps.get("worker_timeout_sec",
                                      DEFAULT_CAPS["worker_timeout_sec"])),
-           "log": str(root / "calls.ndjson")}
+           "log": str(root / "run" / "calls.ndjson")}
     (root / "config.json").write_text(json.dumps(cfg))
     wrapper = bin_dir / "leerie-selfcheck"
     wrapper.write_text(
@@ -53424,7 +53726,7 @@ def _selfcheck_calls(sc: dict) -> list[dict]:
     `_SELFCHECK_CALLS_MAX`)."""
     out: list[dict] = []
     with contextlib.suppress(OSError):
-        for line in (Path(sc["dir"]) / "calls.ndjson").read_text(
+        for line in (Path(sc["dir"]) / "run" / "calls.ndjson").read_text(
                 ).splitlines()[:_SELFCHECK_CALLS_MAX]:
             with contextlib.suppress(ValueError):
                 r = json.loads(line)
@@ -55093,9 +55395,10 @@ async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
             allowed_tools=ACT_TOOLS, max_turns=120, autonomous=True,
             caps=caps, st=st,
             model=models.get("implementer", MODEL_DEFAULT),
-            effort=effort, sid=label,
+            effort=effort, sid=label, notes_id=members[0],
             **({"env_extra": {"PATH": bin_dir + os.pathsep
-                              + os.environ.get("PATH", "")}}
+                              + os.environ.get("PATH", "")},
+                "selfcheck_dir": str(Path(bin_dir).parent)}
                if bin_dir else {}))
         return {"status": res.get("status"),
                 "summary": str(res.get("summary") or "")[:500]}
@@ -60296,8 +60599,8 @@ def _integration_repair_prompt(leerie_dir: Path, sid: str,
         "Your job, in this worktree:\n"
         "1. Read the incoming subtask's and each named already-integrated "
         "subtask's spec and criteria (LEERIE_DIR/subtasks/<id>.json, "
-        "LEERIE_DIR/criteria/<id>.md) so the fix preserves every side's "
-        "intent.\n"
+        "LEERIE_DIR/notes/<id>/criteria.md) so the fix preserves every "
+        "side's intent.\n"
         "2. Fix the findings, restore the dropped lines above, and update "
         "the stale tests as instructed, on the merged tree. Do not revert "
         "either side's change wholesale, and do not touch unrelated files.\n"
@@ -64459,7 +64762,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # launcher which one, for the bring-back after the container exits
     # (DESIGN §6 *Which run the container ran*).
     _record_run_id_for_launcher(st.run_id)
-    for sub in ("", "subtasks", "criteria", "checkpoints", "logs"):
+    for sub in ("", "subtasks", NOTES_DIRNAME, "logs"):
         (st.run_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # Persist the orchestrator's own stdout/stderr to

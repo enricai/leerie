@@ -118,7 +118,7 @@ def _stub_named_oom_handoff(leerie_mod, sid, run_dir, monkeypatch,
         return {
             "subtask_id": sid_,
             "status": "incomplete-handoff",
-            "checkpoint_path": str(run_dir / "checkpoints" / f"{sid_}.md"),
+            "checkpoint_path": str(run_dir / "notes" / sid_ / "checkpoint.md"),
             "summary": summary,
         }
     monkeypatch.setattr(leerie_mod, "_run_implementer", _stub)

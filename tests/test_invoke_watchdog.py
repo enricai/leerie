@@ -164,7 +164,7 @@ def test_create_subprocess_exec_passes_stdin_devnull(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stdin", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     assert captured.get("stdin") == asyncio.subprocess.DEVNULL, (
         "_invoke must pass stdin=asyncio.subprocess.DEVNULL so workers "
@@ -197,7 +197,7 @@ def test_spawn_heartbeat_logged_at_normal_verbosity(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-spawn", leerie_dir=leerie_dir,
-        verbosity="normal"))
+        verbosity="normal", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert f"[t-spawn] spawned (pid={_MOCK_PID_SENTINEL})" in out, (
@@ -221,7 +221,7 @@ def test_spawn_heartbeat_suppressed_at_quiet(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-spawn-q", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "spawned (pid=" not in out, (
@@ -252,7 +252,7 @@ def test_idle_watchdog_warns_on_silent_worker(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=10, sid="t-idle", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "[t-idle] no stdout events in" in out, (
@@ -287,7 +287,7 @@ def test_idle_watchdog_does_not_fire_on_active_worker(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=30, sid="t-active", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "no stdout events in" not in out, (
@@ -318,7 +318,7 @@ def test_idle_watchdog_cancels_cleanly_on_success(leerie, leerie_dir,
         return await asyncio.wait_for(leerie._invoke(
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=10, sid="t-cancel", leerie_dir=leerie_dir,
-            verbosity="quiet"), timeout=5.0)
+            verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())), timeout=5.0)
 
     result = asyncio.run(runner())
     assert result["subtype"] == "success"
@@ -344,7 +344,7 @@ def test_idle_watchdog_includes_stderr_tail(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=10, sid="t-tail", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "[t-tail] no stdout events in" in out
@@ -377,7 +377,7 @@ def test_leerie_worker_debug_injects_env(leerie, leerie_dir, monkeypatch):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-debug", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     env = captured.get("env")
     assert env is not None, (
@@ -412,7 +412,7 @@ def test_no_env_override_when_leerie_worker_debug_unset(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-no-debug", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     env = captured.get("env")
     assert env == leerie._worker_cache_env(
@@ -600,7 +600,7 @@ def test_stderr_written_to_log_file_live(leerie, leerie_dir, monkeypatch):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stderr-file", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     log_text = (leerie_dir / "logs" / "t-stderr-file.log").read_text()
     assert "stderr" in log_text, (
@@ -628,7 +628,7 @@ def test_stderr_echoed_to_orchestrator_at_stream(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stderr-stream", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "[t-stderr-stream] stderr: " in out, (
@@ -654,7 +654,7 @@ def test_stderr_not_echoed_at_quiet(leerie, leerie_dir, monkeypatch, capsys):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stderr-quiet", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "stderr:" not in out, (
@@ -699,7 +699,7 @@ def test_stderr_activity_resets_idle_watchdog(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=10, sid="t-stderr-liveness", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "no stdout events in" not in out, (
@@ -726,7 +726,7 @@ def test_stderr_chunks_preserved_for_no_result_envelope(leerie, leerie_dir,
     envelope = asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stderr-exiterr", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     msg = str(envelope.get("result"))
     assert "authentication failed for tenant Z" in msg, (
         "the no-result envelope must still surface the full stderr "

@@ -103,7 +103,7 @@ def test_enroll_failure_named_in_crash_message_when_worker_also_crashes(
             timeout=60, sid="planner-documentation-s0", leerie_dir=leerie_dir,
             verbosity="stream",
             worker_memory_max_bytes=1 << 30, worker_pids_max=64,
-            run_id="deadbeef1234"))
+            run_id="deadbeef1234", grants=leerie.WorkerGrants(("/",), ())))
 
     msg = str(exc_info.value)
     assert "ProcessLookupError" in msg, (
@@ -125,7 +125,7 @@ def test_no_enroll_note_when_enroll_succeeded(leerie, leerie_dir, monkeypatch):
             timeout=60, sid="planner-documentation-s0", leerie_dir=leerie_dir,
             verbosity="stream",
             worker_memory_max_bytes=1 << 30, worker_pids_max=64,
-            run_id="deadbeef1234"))
+            run_id="deadbeef1234", grants=leerie.WorkerGrants(("/",), ())))
 
     msg = str(exc_info.value)
     assert "possibly related" not in msg
@@ -146,7 +146,7 @@ def test_no_enroll_note_when_containment_disabled(leerie, leerie_dir, monkeypatc
         asyncio.run(leerie._invoke(
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="planner-documentation-s0", leerie_dir=leerie_dir,
-            verbosity="stream"))
+            verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
 
     assert enroll_calls == []
     assert "possibly related" not in str(exc_info.value)

@@ -385,10 +385,19 @@ def test_setup_run_creates_missing_worktree(tmp_path):
 
 # --- the integrator carries the same worker guard as every other worker ------
 
-def _recording_claude(tmp_path: Path) -> tuple[Path, Path]:
+def _worker_dir(state_dir: Path, run_id: str) -> Path:
+    """A worker directory of the run (`<run-dir>/workers/`), the one place
+    outside its tree a confined stub may write (DESIGN §6 *A worker writes
+    only where it is granted*): the payload's `TMPDIR`."""
+    d = state_dir / "runs" / run_id / "workers" / "cache" / "stub"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _recording_claude(tmp_path: Path, rec_dir: Path) -> tuple[Path, Path]:
     """A stub claude that records its argv (NUL-separated) and two env
     values, then resolves the conflict by accepting theirs."""
-    rec = tmp_path / "claude-argv"
+    rec = rec_dir / "claude-argv"
     stub = tmp_path / "bin" / "claude"
     stub.parent.mkdir(parents=True, exist_ok=True)
     stub.write_text(
@@ -426,10 +435,11 @@ def test_the_integrator_gets_the_shared_kill_deny_notice_and_hook(
     repo, state_dir = _conflicting_run(tmp_path, run_id, {
         "process_constraints": {"forbidden_commands": ["npm run deploy"]}})
     stub = _flyctl_stub(tmp_path, repo, state_dir)
-    _claude, rec = _recording_claude(tmp_path)
+    wdir = _worker_dir(state_dir, run_id)
+    _claude, rec = _recording_claude(tmp_path, wdir)
     result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
-        env={"LEERIE_REPO": str(REPO_ROOT),
+        env={"LEERIE_REPO": str(REPO_ROOT), "TMPDIR": str(wdir),
              "PATH": f"{stub.parent}:{os.environ['PATH']}"})
     assert result.returncode == 0, f"stderr={result.stderr}"
     assert "integrated 2" in result.stderr.lower()
@@ -462,13 +472,15 @@ def test_the_integrator_gets_the_shared_kill_deny_notice_and_hook(
     assert (rec.parent / "claude-argv.env").read_text() == "deploy"
 
 
-def test_the_integrator_falls_back_to_the_base_deny_list(tmp_path, leerie):
-    """Without a loadable guard the call still runs, with the embedded base
-    list — the pre-guard behaviour."""
+def test_the_integrator_never_runs_without_its_guard(tmp_path, leerie):
+    """Without a loadable guard there are no grants, so the branch is
+    skipped and no integrator runs (DESIGN §6 *A worker writes only where
+    it is granted*) — before, it ran with the embedded deny list alone."""
     run_id = "test-guard-fallback"
     repo, state_dir = _conflicting_run(tmp_path, run_id, {})
     stub = _flyctl_stub(tmp_path, repo, state_dir)
-    _claude, rec = _recording_claude(tmp_path)
+    wdir = _worker_dir(state_dir, run_id)
+    _claude, rec = _recording_claude(tmp_path, wdir)
     shadow = tmp_path / "py"
     shadow.mkdir()
     # A python3 that fails only the guard script, so the payload's other
@@ -482,14 +494,11 @@ def test_the_integrator_falls_back_to_the_base_deny_list(tmp_path, leerie):
     (shadow / "python3").chmod(0o755)
     result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
-        env={"LEERIE_REPO": str(REPO_ROOT),
+        env={"LEERIE_REPO": str(REPO_ROOT), "TMPDIR": str(wdir),
              "PATH": f"{shadow}:{stub.parent}:{os.environ['PATH']}"})
     assert result.returncode == 0, f"stderr={result.stderr}"
-    assert "integrated 2" in result.stderr.lower()
-    argv = rec.read_text().split("\0")[:-1]
-    assert argv[argv.index("--disallowedTools") + 1] == \
-        leerie.DISALLOWED_TOOLS
-    assert "--settings" not in argv
+    assert "integrated 1, skipped 1" in result.stderr.lower()
+    assert not rec.exists()
 
 
 def _make_messy_claude(tmp_path: Path, *, status: str) -> Path:
@@ -576,7 +585,8 @@ def test_a_reset_that_fails_stops_the_collection(tmp_path):
     _make_subtask_branch(repo, run_id, "s3", f"leerie/runs/{run_id}",
                          {"other.txt": "s3\n"})
     stub = _flyctl_stub(tmp_path, repo, state_dir)
-    calls = tmp_path / "integrator-calls"
+    wdir = _worker_dir(state_dir, run_id)
+    calls = wdir / "integrator-calls"
     claude = tmp_path / "bin" / "claude"
     claude.write_text(
         '#!/usr/bin/env bash\n'
@@ -585,7 +595,7 @@ def test_a_reset_that_fails_stops_the_collection(tmp_path):
         'echo \'{"type":"result","structured_output":'
         '{"incoming_subtask":"t","status":"failed","diagnosis":"d"}}\'\n')
     claude.chmod(0o755)
-    env = {"LEERIE_REPO": str(REPO_ROOT),
+    env = {"LEERIE_REPO": str(REPO_ROOT), "TMPDIR": str(wdir),
            "PATH": f"{stub.parent}:{os.environ['PATH']}"}
     result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",

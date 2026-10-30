@@ -5,6 +5,20 @@ comes from the kernel tearing down the container's PID namespace, not
 Python heuristics (`DESIGN.md` §6, `IMPLEMENTATION.md` §0.5). Below:
 one-time container-runtime setup per OS, then installing leerie itself.
 
+## Kernel requirement: Landlock
+
+Leerie confines every worker with Landlock (DESIGN §6 *A worker writes only
+where it is granted (I5)*) and never runs one unconfined. The kernel that
+runs the container — the Colima VM on macOS, the host on Linux, the Fly or
+EC2 machine — needs Landlock ABI 3 or later: Linux 6.2+ with `landlock`
+among the active LSMs. Check with:
+
+```bash
+cat /sys/kernel/security/lsm     # must list landlock
+```
+
+Without it the run stops at preflight, naming the kernel's ABI.
+
 ## macOS
 
 ```bash

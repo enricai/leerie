@@ -198,7 +198,7 @@ def test_invoke_creates_the_cgroup_before_spawning_held(leerie, tmp_path,
             ["claude", "-p", "x"], cwd=str(tmp_path), timeout=60,
             sid="planner-s0", leerie_dir=leerie_dir, verbosity="quiet",
             worker_memory_max_bytes=1 << 30, worker_pids_max=64,
-            run_id="deadbeef1234"))
+            run_id="deadbeef1234", grants=leerie.WorkerGrants(("/",), ())))
 
     assert order[:4] == ["create", "spawn", ("enroll", 4321),
                          ("release", True)]
@@ -220,11 +220,16 @@ def test_invoke_without_caps_spawns_the_worker_directly(leerie, tmp_path,
     monkeypatch.setattr("asyncio.create_subprocess_exec", _spawn)
     leerie_dir = tmp_path / ".leerie"
     (leerie_dir / "logs").mkdir(parents=True)
+    grants = leerie.WorkerGrants(("/",), ())
     with __import__("contextlib").suppress(Exception):
         _run(leerie._invoke(
             ["claude", "-p", "x"], cwd=str(tmp_path), timeout=60,
-            sid="planner-s0", leerie_dir=leerie_dir, verbosity="quiet"))
-    assert list(spawned["cmd"]) == ["claude", "-p", "x"]
+            sid="planner-s0", leerie_dir=leerie_dir, verbosity="quiet",
+            grants=grants))
+    # No spawn gate; the Landlock shim is the one wrapper (DESIGN §6 *A
+    # worker writes only where it is granted*).
+    assert list(spawned["cmd"]) == leerie._confined_argv(
+        grants, ["claude", "-p", "x"])
 
 
 def test_invoke_spawn_failure_destroys_the_precreated_cgroup(
@@ -245,7 +250,7 @@ def test_invoke_spawn_failure_destroys_the_precreated_cgroup(
             ["claude", "-p", "x"], cwd=str(tmp_path), timeout=60,
             sid="planner-s0", leerie_dir=leerie_dir, verbosity="quiet",
             worker_memory_max_bytes=1 << 30, worker_pids_max=64,
-            run_id="deadbeef1234"))
+            run_id="deadbeef1234", grants=leerie.WorkerGrants(("/",), ())))
     except OSError:
         raised = True
     assert raised

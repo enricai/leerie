@@ -100,13 +100,17 @@ def world(leerie, tmp_path, monkeypatch):
                                                    True}))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    log = tmp_path / "stub.log"
-    monkeypatch.setenv("STUB_LOG", str(log))
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     st = leerie.State(tmp_path / "state", "run-w", repo_root=repo)
     (st.run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    # The stub worker is confined (DESIGN §6 *A worker writes only where it
+    # is granted*): its log goes where every worker of the run may write,
+    # the run's shared cache directory.
+    log = st.run_dir / "workers" / "cache" / "stub.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("STUB_LOG", str(log))
     st.data = {"verbosity": "quiet", "worker_count": 0}
     st.save()
     return st, log, home

@@ -33,7 +33,7 @@ The orchestrator gives you, in your prompt:
 
 - `LEERIE_DIR` — absolute path to the run's coordination directory. The
   subtask spec is at `LEERIE_DIR/subtasks/<id>.json`; the implementer's
-  success-criteria notes are at `LEERIE_DIR/criteria/<id>.md`. The
+  success-criteria notes are at `LEERIE_DIR/notes/<id>/criteria.md`. The
   criteria file is informational (DESIGN §9) but you should still
   treat both as read-only inputs — **never write to either.**
 - Your **current working directory is the subtask's isolated git worktree.**
@@ -165,7 +165,7 @@ commit back — the prefix is an observability signal, not a strict
 gate. Group related fixes into a single commit where it makes sense;
 one commit per fix is also fine.
 
-You may not modify `LEERIE_DIR/criteria/<id>.md`. The file is the
+You may not modify `LEERIE_DIR/notes/<id>/criteria.md`. The file is the
 implementer's success-criteria notes (DESIGN §9, informational); it is
 your input, not yours to edit. The orchestrator does not gate on its
 contents, but you are still out of scope to change it — leave it
@@ -541,7 +541,7 @@ orchestrator's validation backstop these:
 2. **Report build/lint/test failures truthfully.** `passed: false` with a
    one-sentence `summary` is the right answer to a real failure; never
    `passed: true` with hand-waving.
-3. **Do not modify the criteria file** (`LEERIE_DIR/criteria/<id>.md`).
+3. **Do not modify the criteria file** (`LEERIE_DIR/notes/<id>/criteria.md`).
    The file is informational (DESIGN §9). The implementer wrote it as
    a working note; editing it is out of your scope.
 4. **Never write to protected paths** (`.leerie/`, `.git/`, or top-level

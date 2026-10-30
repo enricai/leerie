@@ -67,7 +67,7 @@ class TestActiveTokenEnvThreading:
                     ["claude", "-p"], cwd="/work", timeout=60,
                     sid="test-sid", leerie_dir=tmp_path, verbosity="quiet",
                     active_token="fresh-token",
-                )
+                grants=leerie.WorkerGrants(("/",), ()))
             except Exception:
                 # _invoke's streaming loop may raise once the fake stream
                 # dries up with no result event — irrelevant to this test,
@@ -100,7 +100,7 @@ class TestActiveTokenEnvThreading:
                 await leerie._invoke(
                     ["claude", "-p"], cwd="/work", timeout=60,
                     sid="test-sid", leerie_dir=tmp_path, verbosity="quiet",
-                )
+                grants=leerie.WorkerGrants(("/",), ()))
             except Exception:
                 pass
 
@@ -125,7 +125,7 @@ class TestActiveTokenEnvThreading:
                     ["claude", "-p"], cwd="/work", timeout=60,
                     sid="test-sid", leerie_dir=tmp_path, verbosity="quiet",
                     active_token="fresh-token",
-                )
+                grants=leerie.WorkerGrants(("/",), ()))
             except Exception:
                 pass
 
@@ -149,7 +149,7 @@ class TestActiveTokenEnvThreading:
                         ["claude", "-p"], cwd="/work", timeout=60,
                         sid="test-sid", leerie_dir=tmp_path, verbosity="quiet",
                         active_token=tok,
-                    )
+                    grants=leerie.WorkerGrants(("/",), ()))
                 except Exception:
                     pass
 

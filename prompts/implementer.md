@@ -121,7 +121,7 @@ that directory is protected and any commit touching it is rejected.
 Turn `success_criteria_seed` into a brief criteria file describing what
 success looks like for this subtask — the explicit success condition plus
 any regression guards (adjacent behavior that must not change) worth
-naming. Write it to `LEERIE_DIR/criteria/<id>.md`.
+naming. Write it to `LEERIE_DIR/notes/<id>/criteria.md`.
 
 The criteria file is **informational**, not a gate. The orchestrator does
 not check whether each criterion is satisfied; the §8 confidence
@@ -495,7 +495,7 @@ You cannot read your exact context usage, but you can notice the proxies: a very
 long transcript, many files read, dozens of tool calls. If you sense you will
 not finish cleanly before your context degrades, **stop early and hand off**:
 
-- Write a checkpoint to `LEERIE_DIR/checkpoints/<id>.md` using the schema below.
+- Write a checkpoint to `LEERIE_DIR/notes/<id>/checkpoint.md` using the schema below.
 - Commit any partial, coherent code to the branch.
 - Return status `incomplete-handoff` with the checkpoint path.
 
@@ -514,7 +514,7 @@ When this exit is available, the filter that decides whether a question
 qualifies is the shared one (see the top of this prompt). To take the
 exit:
 
-- Write a checkpoint to `LEERIE_DIR/checkpoints/<id>.md` using the schema below.
+- Write a checkpoint to `LEERIE_DIR/notes/<id>/checkpoint.md` using the schema below.
   Capture the work-in-progress so the re-spawned worker can pick it up.
 - Commit any partial, coherent code to the branch.
 - Return status `needs-clarification` with `checkpoint_path` set AND
@@ -537,7 +537,7 @@ will be answered, but it costs you one of your `subtask_continuations`
 re-spawns; burn the budget and the orchestrator treats the subtask as
 mis-scoped.
 
-Checkpoint schema (`LEERIE_DIR/checkpoints/<id>.md`):
+Checkpoint schema (`LEERIE_DIR/notes/<id>/checkpoint.md`):
 
 ```markdown
 # Checkpoint: <subtask-id>

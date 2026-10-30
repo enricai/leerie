@@ -308,7 +308,7 @@ def test_invoke_passes_a_readable_file_when_stdin_data_given(
     asyncio.run(leerie._invoke(
         ["claude", "-p"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-file", leerie_dir=leerie_dir,
-        verbosity="quiet", stdin_data=payload))
+        verbosity="quiet", stdin_data=payload, grants=leerie.WorkerGrants(("/",), ())))
 
     assert not captured["is_pipe"], (
         "_invoke must NOT hand the child a pipe — that reintroduces the "
@@ -333,7 +333,7 @@ def test_invoke_still_uses_devnull_when_no_stdin_data(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "respond ok"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-devnull", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     assert captured.get("stdin") == asyncio.subprocess.DEVNULL
 
@@ -363,7 +363,7 @@ def test_full_payload_is_on_disk_before_the_child_exists(
     asyncio.run(leerie._invoke(
         ["claude", "-p"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-feed", leerie_dir=leerie_dir,
-        verbosity="quiet", stdin_data=payload))
+        verbosity="quiet", stdin_data=payload, grants=leerie.WorkerGrants(("/",), ())))
 
     assert seen["at_spawn"] == payload.encode()
 
@@ -383,7 +383,7 @@ def test_prompt_file_is_cleaned_up(leerie, leerie_dir, monkeypatch):
     asyncio.run(leerie._invoke(
         ["claude", "-p"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-clean", leerie_dir=leerie_dir,
-        verbosity="quiet", stdin_data="hello"))
+        verbosity="quiet", stdin_data="hello", grants=leerie.WorkerGrants(("/",), ())))
 
     assert paths and not os.path.exists(paths[0]), (
         f"staged prompt file {paths[0]} survived the call")
@@ -450,7 +450,7 @@ def test_staged_file_is_reaped_when_staging_itself_fails(leerie, leerie_dir,
         asyncio.run(leerie._invoke(
             ["claude", "-p"], cwd=str(leerie_dir.parent),
             timeout=60, sid="t-enospc", leerie_dir=leerie_dir,
-            verbosity="quiet", stdin_data="hello"))
+            verbosity="quiet", stdin_data="hello", grants=leerie.WorkerGrants(("/",), ())))
 
     cause = excinfo.value.__cause__
     assert isinstance(cause, OSError) and cause.errno == errno.ENOSPC, (
@@ -504,7 +504,7 @@ def test_mkstemp_itself_failing_is_converted(leerie, leerie_dir, monkeypatch,
         asyncio.run(leerie._invoke(
             ["claude", "-p"], cwd=str(leerie_dir.parent),
             timeout=60, sid="t-mkstemp", leerie_dir=leerie_dir,
-            verbosity="quiet", stdin_data="hello"))
+            verbosity="quiet", stdin_data="hello", grants=leerie.WorkerGrants(("/",), ())))
 
     assert calls, "mkstemp was never reached; the test proves nothing"
     cause = excinfo.value.__cause__
@@ -557,7 +557,7 @@ def test_staging_failure_that_is_not_enospc_propagates_unchanged(
         asyncio.run(leerie._invoke(
             ["claude", "-p"], cwd=str(leerie_dir.parent),
             timeout=60, sid="t-eacces", leerie_dir=leerie_dir,
-            verbosity="quiet", stdin_data="hello"))
+            verbosity="quiet", stdin_data="hello", grants=leerie.WorkerGrants(("/",), ())))
 
     assert not isinstance(excinfo.value, leerie.DiskLowSpace), (
         "a non-ENOSPC OSError was converted to DiskLowSpace — the "
@@ -602,7 +602,7 @@ def test_real_subprocess_150kb_stdin_no_deadlock(leerie, leerie_dir):
     cmd = [sys.executable, "-c", _ECHO_CHILD]
     envelope = asyncio.run(leerie._invoke(
         cmd, cwd=str(leerie_dir.parent), timeout=30, sid="t-e2e",
-        leerie_dir=leerie_dir, verbosity="quiet", stdin_data=payload))
+        leerie_dir=leerie_dir, verbosity="quiet", stdin_data=payload, grants=leerie.WorkerGrants(("/",), ())))
 
     assert envelope["type"] == "result"
     assert envelope["is_error"] is False
@@ -634,7 +634,7 @@ def test_no_staged_file_leaks_when_the_spawn_fails(leerie, leerie_dir,
         asyncio.run(leerie._invoke(
             ["claude", "-p"], cwd=str(leerie_dir.parent),
             timeout=60, sid="t-leak", leerie_dir=leerie_dir,
-            verbosity="quiet", stdin_data="x" * 150_000))
+            verbosity="quiet", stdin_data="x" * 150_000, grants=leerie.WorkerGrants(("/",), ())))
 
     assert not (set(glob.glob(pattern)) - before), (
         "a failed spawn stranded its staged prompt file")

@@ -67,7 +67,7 @@ if leerie_repo_git show-ref --verify --quiet refs/heads/leerie; then
   exit 1
 fi
 
-mkdir -p "${RUN_DIR}/worktrees" "${RUN_DIR}/subtasks" "${RUN_DIR}/criteria" "${RUN_DIR}/checkpoints" "${RUN_DIR}/artifacts"
+mkdir -p "${RUN_DIR}/worktrees" "${RUN_DIR}/subtasks" "${RUN_DIR}/notes" "${RUN_DIR}/artifacts"
 
 # Record the working branch only on first setup. On a resume the file already
 # exists and the live HEAD may be anything; the original value must be kept.

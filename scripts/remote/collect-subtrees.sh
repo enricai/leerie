@@ -288,19 +288,27 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
     # The per-worker guard (deny rules + notices + PreToolUse hook + script
     # shell env) from the orchestrator module baked into this image — the
     # same `_worker_guard` every orchestrator-spawned worker gets (DESIGN §9
-    # *A worker never kills a process by name*). Falls back to the embedded
-    # base deny list alone when it cannot be loaded.
+    # *A worker never kills a process by name*), and its Landlock grants.
+    # Without them the branch is skipped, never integrated unconfined.
     guard_disallowed="$integrator_disallowed_tools"
     guard_notice=""
     guard_settings=""
     guard_env=()
+    guard_confine=()
     guard_sh=""
     if guard_sh=$(python3 -I "$SCRIPTS/worker-guard.py" \
         "$integrator_allowed_tools" "$staging" "$leerie_dir/state.json" \
+        "integrator-${sid}" \
         2>/dev/null) && [ -n "$guard_sh" ]; then
       eval "$guard_sh"
-    else
-      echo "collect-subtrees: worker guard unavailable for ${sid}; using the embedded deny list" >&2
+    fi
+    # Never unconfined (DESIGN §6 *A worker writes only where it is
+    # granted*): without the guard's Landlock grants the branch is skipped.
+    if [ "${#guard_confine[@]}" -eq 0 ]; then
+      echo "collect-subtrees: cannot confine the integrator for ${sid}; skipped" >&2
+      _back_out "$pre"
+      _skip "$sid"
+      continue
     fi
     guard_settings_args=()
     if [ -n "$guard_settings" ]; then
@@ -310,7 +318,7 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
     claude_out=""
     claude_rc=0
     claude_out=$(cd "$staging" && env ${guard_env[@]+"${guard_env[@]}"} \
-      claude -p "${user_prompt}${guard_notice}" \
+      "${guard_confine[@]}" claude -p "${user_prompt}${guard_notice}" \
       --append-system-prompt "$(cat "$integrator_prompt")" \
       --output-format json \
       --json-schema "$integrator_schema" \

@@ -199,7 +199,7 @@ def test_a_worker_spawn_gets_the_hooks_back(leerie, tmp_path, monkeypatch,
     (tmp_path / "logs").mkdir()
     with pytest.raises(Exception):
         asyncio.run(leerie._invoke(["claude", "-p"], str(tmp_path), 10,
-                                   "w", tmp_path, "quiet"))
+                                   "w", tmp_path, "quiet", grants=leerie.WorkerGrants(("/",), ())))
     env = seen["env"]
     assert env["GIT_CONFIG_COUNT"] == "1"
     assert env["GIT_CONFIG_KEY_0"] == "color.ui"

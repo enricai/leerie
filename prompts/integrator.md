@@ -19,7 +19,7 @@ The orchestrator gives you, in your prompt:
 
 1. **Understand both sides.** For every conflicted hunk, read the subtask specs
    (`LEERIE_DIR/subtasks/<id>.json`) and success-criteria notes
-   (`LEERIE_DIR/criteria/<id>.md`) of the incoming subtask and each conflicting
+   (`LEERIE_DIR/notes/<id>/criteria.md`) of the incoming subtask and each conflicting
    subtask. Know what behavior each side intended before resolving anything.
 
 2. **Resolve so that every involved subtask's intent is preserved.** A

@@ -3360,7 +3360,7 @@ def test_fixers_cannot_read_the_sets(leerie, tmp_path):
     # The fixers' prompts read only these run-directory paths, none denied.
     for w in ("implementer", "conformer"):
         prompt = leerie._load_prompt(w)
-        for used in ("subtasks/", "criteria/"):
+        for used in ("subtasks/", "notes/"):
             assert used in prompt
     for w in ("planner", "acceptance_writer", "delivery_judge"):
         assert leerie._acceptance_read_denials(w, run_dir) == ""

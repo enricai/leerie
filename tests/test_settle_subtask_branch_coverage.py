@@ -185,7 +185,7 @@ def test_incomplete_handoff_exceeding_continuation_cap_is_blocked(
     time) past `subtask_continuations` terminates as blocked rather than
     looping forever."""
     leerie_mod = env["leerie"]
-    ckpt = env["run_dir"] / "checkpoints" / f"{env['sid']}.md"
+    ckpt = env["run_dir"] / "notes" / env["sid"] / "checkpoint.md"
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     ckpt.write_text(_VALID_CHECKPOINT_TEXT)
     calls: list = []
@@ -210,7 +210,7 @@ def test_needs_clarification_exceeding_continuation_cap_is_blocked(
     needs-clarification shares the same subtask_continuations budget
     (DESIGN Sec.11: no extra "ask the user" allowance)."""
     leerie_mod = env["leerie"]
-    ckpt = env["run_dir"] / "checkpoints" / f"{env['sid']}.md"
+    ckpt = env["run_dir"] / "notes" / env["sid"] / "checkpoint.md"
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     ckpt.write_text(_VALID_CHECKPOINT_TEXT)
     calls: list = []
@@ -752,7 +752,7 @@ def test_a_continuation_that_amends_its_earlier_attempt_is_not_unclean(
     clean — no re-ask, never `unconverged` for correct work."""
     leerie_mod = env["leerie"]
     wt = env["worktree"]
-    ckpt = env["run_dir"] / "checkpoints" / f"{env['sid']}.md"
+    ckpt = env["run_dir"] / "notes" / env["sid"] / "checkpoint.md"
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     ckpt.write_text(_VALID_CHECKPOINT_TEXT)
     calls: list = []

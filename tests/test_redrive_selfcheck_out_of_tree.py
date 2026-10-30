@@ -132,7 +132,9 @@ def test_the_real_command_checks_the_working_tree_from_outside_it(
     assert not (repo / "gen" / "test_gen.py").exists()
     assert not (repo / "tests").exists()
     assert sorted(os.listdir(repo / "gen")) == ["built.txt"]
-    assert list(Path(sc["dir"], "snap").iterdir()) == []
+    # The copies are gone; the call log stays.
+    assert [p.name for p in Path(sc["dir"], "run").iterdir()] \
+        == ["calls.ndjson"]
 
     # A set path the tree already has is refused, never overwritten.
     (repo / "tests").mkdir()
@@ -184,7 +186,7 @@ def test_a_signal_still_deletes_the_copy(leerie, tmp_path):
         'test_files_scoped = "bash slow.sh {test_files}"\n')
     sc = leerie._selfcheck_prepare(st, dict(leerie.DEFAULT_CAPS), repo, sets,
                                    "g", None)
-    snap_root = Path(sc["dir"], "snap")
+    snap_root = Path(sc["dir"], "run")
     p = subprocess.Popen([sc["command"]], cwd=repo, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True)
     deadline = time.monotonic() + 60
@@ -198,7 +200,8 @@ def test_a_signal_still_deletes_the_copy(leerie, tmp_path):
     p.send_signal(signal.SIGTERM)
     out, _ = p.communicate(timeout=30)
     assert p.returncode == 128 + signal.SIGTERM, out
-    assert list(snap_root.iterdir()) == []
+    # The copy is gone; the call log stays.
+    assert [p.name for p in snap_root.iterdir()] == ["calls.ndjson"]
     assert [c["rc"] for c in leerie._selfcheck_calls(sc)] == [99]
 
 

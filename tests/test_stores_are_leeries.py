@@ -179,7 +179,8 @@ def test_invoke_gives_the_worker_its_own_stores(leerie, tmp_path,
             await leerie._invoke(["claude", "-p"], cwd=str(tmp_path),
                                  timeout=60, sid="feat-001",
                                  leerie_dir=tmp_path / "run",
-                                 verbosity="quiet")
+                                 verbosity="quiet",
+                                 grants=leerie.WorkerGrants(("/",), ()))
         except Exception:
             pass
     asyncio.run(run())

@@ -391,7 +391,7 @@ def test_without_accept_resume_reinvokes_the_judge(
                     "rationale": "clean on re-review"}
         return {}
 
-    async def fake_run_proc(cmd, cwd=None):
+    async def fake_run_proc(cmd, cwd=None, env=None):
         mock = AsyncMock()
         mock.returncode = 0
         mock.stdout = "abc123\n" if "rev-parse" in cmd else "Merge\n\ndiff\n"
