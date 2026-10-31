@@ -2655,7 +2655,7 @@ if entry is None:
     sys.exit(1)
 if entry.get("outcome") == "backed_out":
     # Nothing is integrated: the subtask was reset off the run branch and
-    # settled unconverged, so flipping `accepted` would claim a merge that
+    # settled unconverged, so flipping "accepted" would claim a merge that
     # is not there. Changes nothing.
     _why = entry.get("fallback_reason") or "no reason recorded"
     print(f"NOOP: subtask {sid!r} was backed out of the run branch ({_why}); "
@@ -7645,7 +7645,7 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE"; rm -f "${_cidfi
 _leerie_host_dir="${LEERIE_HOST_DIR:-$HOME/.leerie/.host}"
 case "$_leerie_host_dir" in
   "~")   _leerie_host_dir="$HOME" ;;
-  "~/"*) _leerie_host_dir="$HOME/${_leerie_host_dir#"~/"}" ;;
+  \~/*)  _leerie_host_dir="$HOME/${_leerie_host_dir#"~/"}" ;;
 esac
 case "$_leerie_host_dir" in
   /*) ;;

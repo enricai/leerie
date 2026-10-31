@@ -19,8 +19,10 @@ esac
 # replacing it with /bin/sh broke a repo's bash-syntax scripts. The package
 # manager that ran this script (`npm_config_user_agent`) is asked for its
 # setting with leerie's override removed; the answer is cached in the
-# environment for the scripts this one runs.
-pm=${npm_config_user_agent%%/*}
+# environment for the scripts this one runs. The agent is unset when no
+# package manager ran this script.
+agent=${npm_config_user_agent:-}
+pm=${agent%%/*}
 case "$pm" in npm|pnpm|yarn) ;; *) pm= ;; esac
 cache=LEERIE_REPO_SCRIPT_SHELL_$pm
 eval "shell=\${$cache-}"
