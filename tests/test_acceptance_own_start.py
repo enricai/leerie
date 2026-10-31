@@ -588,9 +588,11 @@ def test_a_flaky_set_failure_is_resource_affected_not_a_failure(
     never a repair."""
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "ran-once"
-    flaky = ("import pathlib\n\ndef test_flaky():\n"
-             f"    m = pathlib.Path({str(marker)!r})\n"
+    # In the run's own temp directory: a confined run writes nothing beside
+    # its tree (DESIGN §6 *Leerie's runs of the repository's commands are
+    # confined too*).
+    flaky = ("import os, pathlib\n\ndef test_flaky():\n"
+             "    m = pathlib.Path(os.environ['TMPDIR'], 'ran-once')\n"
              "    first = not m.exists()\n    m.write_text('x')\n"
              "    assert not first\n")
     sets = _one_set(st, flaky)

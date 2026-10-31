@@ -16,13 +16,17 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import measured_tmp_files
 from tests.test_run_repo import _git, _setup_run, _St, _user_repo
 
 pytestmark = pytest.mark.real_planning_worktree
 
+# Its run count is kept in its own temp directory: the install is confined
+# to the view and its measurement directory (DESIGN §6 *Leerie's runs of
+# the repository's commands are confined too*), which a moved view keeps.
 INSTALL = (
     "import os, pathlib, sys\n"
-    "c = pathlib.Path(sys.argv[1])\n"
+    "c = pathlib.Path(os.environ['TMPDIR'], sys.argv[1])\n"
     "c.write_text(str(int(c.read_text()) + 1 if c.exists() else 1))\n"
     "want = open('package.json').read()\n"
     "p = pathlib.Path('node_modules/dep/index.js')\n"
@@ -43,6 +47,17 @@ BUILD = (
     "    open('node_modules/.gen/out', 'w').write(src)\n")
 
 
+class _Count:
+    """The install's run count, read from the view's measurement
+    directory."""
+    def __init__(self, run_dir: Path, name: str):
+        self.run_dir, self.name = run_dir, name
+
+    def read_text(self) -> str:
+        (f,) = measured_tmp_files(self.run_dir, self.name)
+        return f.read_text()
+
+
 @pytest.fixture()
 def env(leerie, tmp_path, monkeypatch):
     repo = _user_repo(tmp_path)
@@ -58,10 +73,10 @@ def env(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_cgroup_create", lambda *a, **k: None)
     monkeypatch.delenv("FAIL_INSTALL", raising=False)
     st = _St(repo, state)
-    count = tmp_path / "install.count"
+    count = _Count(st.run_dir, "install.count")
     st.data["provision"] = {"recipe": [
         {"kind": "install", "command": [sys.executable, "-c", INSTALL,
-                                        str(count)], "working_dir": "."},
+                                        count.name], "working_dir": "."},
         {"kind": "build", "command": [sys.executable, "-c", BUILD],
          "working_dir": "."}]}
     staging = _setup_run(leerie, st)

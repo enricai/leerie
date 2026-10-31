@@ -67,7 +67,12 @@ def _repo(tmp_path: Path) -> Path:
 
 
 class _St:
-    def __init__(self):
+    """A run with a run directory: every repository command is confined to
+    its measurement grant (DESIGN §6 *Leerie's runs of the repository's
+    commands are confined too*), which lives there."""
+    def __init__(self, run_dir: Path):
+        self.run_dir = run_dir
+        self.run_id = run_dir.name
         self.data = {"provision": {"recipe": []}, "blt_results": {}}
 
     def save(self):
@@ -82,7 +87,8 @@ def test_the_suite_passes_through_a_measured_axis(leerie, tmp_path,
     bad = subprocess.run(CMD.split(), cwd=r, capture_output=True)
     assert bad.returncode != 0
     res = asyncio.run(leerie._measure_axes(
-        str(r), {"tests": CMD}, _St(), {}, log_path=tmp_path / "m.log",
+        str(r), {"tests": CMD}, _St(tmp_path / "state" / "runs" / "r1"),
+        {}, log_path=tmp_path / "m.log",
         verbosity="quiet", memo=False))
     assert res["tests"]["passed"] is True, res["tests"]
 
@@ -118,7 +124,13 @@ def test_every_repo_command_launch_goes_through_the_repo_env():
     `_blt_shell_argv` launches it only through `_run_streaming` or
     `_run_contained` (which spawns through `_run_streaming`), or with an
     environment built by `_repo_command_env`; and `_run_streaming` builds
-    its spawn's environment with it."""
+    its spawn's environment with it. And every such spawn is confined
+    (DESIGN §6 *Leerie's runs of the repository's commands are confined
+    too*): `_run_streaming` takes `grants` keyword-only with no default and
+    starts only `_confined_argv(grants, …)`; every call of `_run_streaming`,
+    `_run_contained` and `_measure_blt` passes `grants=`; the one raw spawn
+    left is the self-check's, which a confined worker's shell starts and
+    so runs inside that worker's grants."""
     tree = ast.parse((REPO_ROOT / "orchestrator" / "leerie.py").read_text())
     funcs = {f.name: f for f in ast.walk(tree)
              if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
@@ -132,11 +144,29 @@ def test_every_repo_command_launch_goes_through_the_repo_env():
                         getattr(f, "id", None))
         return out
     stream_src = ast.unparse(funcs["_run_streaming"])
-    assert "env=_repo_command_env(env)" in stream_src
+    assert "env={**_repo_command_env(env), **dict(grants.env)}" in stream_src
     assert "_run_streaming" in names(funcs["_run_contained"])
+    for prim in ("_run_streaming", "_run_contained", "_measure_blt"):
+        a = funcs[prim].args
+        kw = dict(zip([x.arg for x in a.kwonlyargs], a.kw_defaults))
+        assert "grants" in kw and kw["grants"] is None, prim
+    # The spawn is the confined argv, and only it.
+    spawns = [n for n in ast.walk(funcs["_run_streaming"])
+              if isinstance(n, ast.Call)
+              and getattr(n.func, "attr", None) == "create_subprocess_exec"]
+    assert len(spawns) == 1
+    assert "spawn_cmd = _confined_argv(grants, list(cmd))" in stream_src
+    assert ast.unparse(spawns[0].args[0]) == "*spawn_cmd"
+    unpassed = [(name, n.lineno) for name, fn in funcs.items()
+                for n in ast.walk(fn) if isinstance(n, ast.Call)
+                and getattr(n.func, "id", None) in (
+                    "_run_streaming", "_run_contained", "_measure_blt")
+                and not any(k.arg == "grants" for k in n.keywords)]
+    assert unpassed == []
     raw = {"Popen", "run", "create_subprocess_exec", "check_output",
            "call", "check_call"}
     bad = []
+    raw_ok: set[str] = set()
     for name, fn in funcs.items():
         if "_blt_shell_argv" not in names(fn) or name == "_blt_shell_argv":
             continue
@@ -157,7 +187,10 @@ def test_every_repo_command_launch_goes_through_the_repo_env():
                 funcs[name]) and isinstance(env, ast.Name)
             if not literal_git and not env_ok:
                 bad.append((name, n.lineno))
+            elif env_ok and not literal_git:
+                raw_ok.add(name)
     assert bad == []
+    assert raw_ok == {"selfcheck_main"}
 
 
 def test_the_guard_flags_a_bypass():
@@ -169,3 +202,31 @@ def test_the_guard_flags_a_bypass():
              and isinstance(n.func, ast.Attribute)
              and n.func.attr == "Popen"]
     assert calls and not any(k.arg == "env" for k in calls[0].keywords)
+
+
+def test_leeries_scripts_that_load_tree_code_are_confined():
+    """Derived: `node` (the AST scripts load the tree's own `typescript`)
+    and `mise` (it reads the repository's configuration) are never spawned
+    directly — only through `_ts_script_run`, `_run_streaming` or
+    `_confined_argv` (DESIGN §6 *Leerie's runs of the repository's commands
+    are confined too*)."""
+    tree = ast.parse((REPO_ROOT / "orchestrator" / "leerie.py").read_text())
+    spawners = {"Popen", "run", "create_subprocess_exec", "check_output",
+                "call", "check_call", "run_proc"}
+    bad = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call) or not n.args:
+            continue
+        f = n.func
+        name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id",
+                                                                    None)
+        argv = n.args[0]
+        if (name in spawners and isinstance(argv, ast.List) and argv.elts
+                and isinstance(argv.elts[0], ast.Constant)
+                and argv.elts[0].value in ("node", "mise")):
+            bad.append(n.lineno)
+    assert bad == []
+    funcs = {f.name: f for f in ast.walk(tree)
+             if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert "_confined_argv(grants, argv)" in ast.unparse(
+        funcs["_ts_script_run"])

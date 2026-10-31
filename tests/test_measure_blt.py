@@ -20,7 +20,8 @@ from tests.conftest import _run
 
 def _call(leerie, cmd="pytest", tree="/tmp/x", timeout=60.0, **kw):
     return _run(leerie._measure_blt(
-        "tests", cmd, tree, timeout=timeout,
+        "tests", cmd, tree,
+        grants=kw.pop("grants", leerie.WorkerGrants((), ())), timeout=timeout,
         log_path=kw.pop("log_path", None), verbosity="quiet",
         forbidden=kw.pop("forbidden", []), **kw))
 
@@ -46,8 +47,12 @@ def streaming(leerie, monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_exit_zero_is_measured_and_passed(leerie, streaming):
-    streaming((0, "42 passed"))
-    ax = _call(leerie)
+    calls = streaming((0, "42 passed"))
+    g = leerie.WorkerGrants(("/x",), ("/y",), (("TMPDIR", "/x/tmp"),))
+    ax = _call(leerie, grants=g)
+    # The command runs confined to the grant its caller derived (DESIGN §6
+    # *Leerie's runs of the repository's commands are confined too*).
+    assert calls[0][1]["grants"] is g
     assert (ax["ran"], ax["measured"], ax["passed"]) == (True, True, True)
     assert ax["command"] == "pytest"
     assert ax["summary"] == "42 passed"
@@ -93,7 +98,9 @@ def test_absent_command_is_not_applicable(leerie, streaming, cmd):
     """A repo with no command for an axis. `ran=False` means 'not
     applicable', and no subprocess is spawned at all."""
     calls = streaming((0, "unreachable"))
-    ax = _run(leerie._measure_blt("lint", cmd, "/tmp/x", timeout=1.0,
+    ax = _run(leerie._measure_blt("lint", cmd, "/tmp/x",
+                                  grants=leerie.WorkerGrants((), ()),
+                                  timeout=1.0,
                                   log_path=None, verbosity="quiet",
                                   forbidden=[]))
     assert (ax["ran"], ax["measured"], ax["passed"]) == (False, False, None)

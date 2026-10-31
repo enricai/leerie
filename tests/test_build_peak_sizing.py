@@ -235,8 +235,12 @@ def test_only_build_and_test_axes_take_a_slot(leerie, tmp_path, monkeypatch):
         return True
     monkeypatch.setattr(leerie, "_ensure_worktree_deps", _deps)
     st = _St(tmp_path)
+    # A tree beside the run directory, never holding it (DESIGN §6
+    # *Leerie's runs of the repository's commands are confined too*).
+    tree = tmp_path / "wt"
+    tree.mkdir()
     _run(leerie._measure_axes(
-        str(tmp_path), {"build": "b", "lint": "l", "tests": "t"}, st,
+        str(tree), {"build": "b", "lint": "l", "tests": "t"}, st,
         dict(leerie.DEFAULT_CAPS), log_path=tmp_path / "log",
         verbosity="quiet", memo=False))
     assert taken == ["baseline-build", "baseline-tests"]
@@ -252,7 +256,8 @@ def test_measure_peak_reaches_the_contained_run(leerie, tmp_path, monkeypatch):
                 "peak": {"memory_bytes": 5 * GIB, "pids": 321}}
     monkeypatch.setattr(leerie, "_run_contained", _contained)
     res = _run(leerie._measure_blt(
-        "build", "pnpm run build", str(tmp_path), timeout=10,
+        "build", "pnpm run build", str(tmp_path),
+        grants=leerie.WorkerGrants((), ()), timeout=10,
         log_path=tmp_path / "log", verbosity="quiet", measure_peak=True,
         run_id="abc", forbidden=[]))
     assert res["passed"] is True

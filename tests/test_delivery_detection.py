@@ -684,7 +684,7 @@ class TestCouplingPolicy:
             "  it('other', () => { unused(); });\n"
             "});\n")
         facts = leerie._probe_case_facts(tree, probe,
-                                         "math add returns the sum")
+                                         "math add returns the sum", grants=leerie.WorkerGrants(("/",), ()))
         assert facts["title"] == "add returns the sum"
         reach = " ".join(facts["reach_src"])
         assert "expect(helper()).toContain('x');" in reach
@@ -695,15 +695,15 @@ class TestCouplingPolicy:
         assert [r["lits"] for r in facts["reads"]] == [["src/lib.ts"]]
         assert {i["imported"] for i in facts["imports"]} == {"readFileSync",
                                                             "publicFn"}
-        assert leerie._ts_resolvable(tree) is True
+        assert leerie._ts_resolvable(tree, grants=leerie.WorkerGrants(("/",), ())) is True
         (tmp_path / "probe-less").mkdir()
         monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT",
                             tmp_path / "no-bundle")
-        assert leerie._ts_resolvable(tmp_path / "probe-less") is False
+        assert leerie._ts_resolvable(tmp_path / "probe-less", grants=leerie.WorkerGrants(("/",), ())) is False
 
     def test_facts_failure_is_an_error_not_a_crash(self, leerie, tmp_path):
         assert "error" in leerie._probe_case_facts(
-            tmp_path, tmp_path / "missing.test.ts", "x")
+            tmp_path, tmp_path / "missing.test.ts", "x", grants=leerie.WorkerGrants(("/",), ()))
 
 
 # === the bundled typescript fallback =======================================
@@ -737,9 +737,9 @@ def test_ts7_tree_without_a_bundle_is_unavailable(leerie, tmp_path,
     monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", tmp_path / "none")
     assert subprocess.run(["node", "-e", "require.resolve('typescript')"],
                           cwd=tree, check=False).returncode == 0
-    assert leerie._ts_resolvable(tree) is False
+    assert leerie._ts_resolvable(tree, grants=leerie.WorkerGrants(("/",), ())) is False
     facts = leerie._probe_case_facts(tree, tree / "probe" / "x.test.ts",
-                                     "m keeps the sum")
+                                     "m keeps the sum", grants=leerie.WorkerGrants(("/",), ()))
     assert facts["error"] == "facts_failed"
 
 
@@ -751,13 +751,13 @@ def test_ts7_tree_falls_back_to_the_bundled_typescript(leerie, tmp_path,
     the bundled copy and the facts come out as from any JS-API tree."""
     tree = _ts7_tree(tmp_path / "tree")
     monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", Path(_ts_dir()))
-    assert leerie._ts_resolvable(tree) is True
+    assert leerie._ts_resolvable(tree, grants=leerie.WorkerGrants(("/",), ())) is True
     r = subprocess.run(["node", str(leerie.TS_LOADER)], cwd=tree,
                        env=leerie._ts_script_env(), capture_output=True,
                        text=True, check=False)
     assert r.stdout.strip() == "bundled", r.stderr
     facts = leerie._probe_case_facts(tree, tree / "probe" / "x.test.ts",
-                                     "m keeps the sum")
+                                     "m keeps the sum", grants=leerie.WorkerGrants(("/",), ()))
     assert "error" not in facts, facts
     assert facts["title"] == "keeps the sum"
     assert "expect(add(2, 3)).toBe(5);" in " ".join(facts["reach_src"])
@@ -806,7 +806,7 @@ def gate_env(leerie, tmp_path, monkeypatch):
     confirm = leerie._falsifier_checkout(st, "falsifier-confirm", head)
     seen_facts = []
 
-    def fake_facts(tree, probe, case):
+    def fake_facts(tree, probe, case, **_kw):
         seen_facts.append((str(tree), str(probe), case))
         return _facts_for(Path(probe).read_text())
     monkeypatch.setattr(leerie, "_probe_case_facts", fake_facts)
@@ -861,11 +861,12 @@ class TestFalsifierGates:
         must never confirm. Its marker lives outside the checkout: one
         inside it is an untracked file leerie's run created, which I2
         deletes after every run (DESIGN §6½), so each rerun would fail
-        alike."""
-        flaky = ("import pathlib\n\n\n"
+        alike. It is in the run's own temp directory, the one place outside
+        its tree a confined run writes (DESIGN §6 *Leerie's runs of the
+        repository's commands are confined too*)."""
+        flaky = ("import os, pathlib\n\n\n"
                  "def test_add_returns_the_sum():\n"
-                 "    m = pathlib.Path(__file__).resolve().parent.parent"
-                 ".parent / '.flaky_marker'\n"
+                 "    m = pathlib.Path(os.environ['TMPDIR'], '.flaky_marker')\n"
                  "    seen = m.exists()\n"
                  "    m.write_text('x')\n"
                  "    assert seen\n")
@@ -895,7 +896,7 @@ class TestFalsifierGates:
                                         monkeypatch):
         monkeypatch.setattr(
             leerie, "_probe_case_facts",
-            lambda tree, probe, case: {**_facts_for(Path(probe).read_text()),
+            lambda tree, probe, case, **_kw: {**_facts_for(Path(probe).read_text()),
                                        "evals": ["eval"]})
         out = _gates(leerie, gate_env, _claim())
         assert out["gates"]["not_coupled"] is False
@@ -928,7 +929,7 @@ class TestFalsifierGates:
         the falsifier could be blamed for."""
         monkeypatch.setattr(
             leerie, "_probe_case_facts",
-            lambda tree, probe, case: {"error": "facts_failed",
+            lambda tree, probe, case, **_kw: {"error": "facts_failed",
                                        "stderr": "TypeError: Latest"})
         out = _gates(leerie, gate_env, _claim())
         assert out["confirmed"] is False
@@ -948,7 +949,7 @@ class TestFalsifierGates:
         failure: the facts were read, and the case's gates fail."""
         monkeypatch.setattr(
             leerie, "_probe_case_facts",
-            lambda tree, probe, case: {"error": "case_not_found",
+            lambda tree, probe, case, **_kw: {"error": "case_not_found",
                                        "titles": []})
         out = _gates(leerie, gate_env, _claim())
         assert out["gates"]["facts_read"] is True
@@ -1001,10 +1002,10 @@ def _detection_env(leerie, tmp_path, monkeypatch, *, judged=True,
                                  "requirement": "add of two positives",
                                  "kind": "behavioral", "cites": []}]}]}}
         st.save()
-    monkeypatch.setattr(leerie, "_ts_resolvable", lambda tree: ts)
+    monkeypatch.setattr(leerie, "_ts_resolvable", lambda tree, **_kw: ts)
     monkeypatch.setattr(
         leerie, "_probe_case_facts",
-        lambda tree, probe, case: _facts_for(Path(probe).read_text()))
+        lambda tree, probe, case, **_kw: _facts_for(Path(probe).read_text()))
     caps = dict(leerie.DEFAULT_CAPS)
     caps["max_parallel"] = 1
     if k is not None:

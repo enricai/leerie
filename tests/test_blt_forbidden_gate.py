@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import measured_tmp_files
+
 PYTEST = "python3 -m pytest -q -p no:cacheprovider"
 SRC = Path(__file__).resolve().parents[1] / "orchestrator" / "leerie.py"
 SHELLS = {"bash", "sh", "/bin/bash", "/bin/sh", "dash", "zsh"}
@@ -110,6 +112,10 @@ EXEMPT = {
     "_drop_test_db": "postgres binaries for leerie's test database",
     "_sleep_then_reexec": "re-execs the orchestrator itself",
     "_git_z_output": "git commands with `-z` path output, read as bytes",
+    "_ts_script_run": "leerie's own AST scripts (`node` + a scripts/ path), "
+                      "confined: the argv its callers build is literal",
+    "_run_mise_install": "`mise ls --current --json`, a literal argv, "
+                         "confined through `_confined_argv`",
 }
 
 
@@ -283,11 +289,16 @@ def repo(tmp_path: Path) -> Path:
     _git(repo, "config", "user.email", "t@x")
     _git(repo, "config", "user.name", "t")
     (repo / "calc.py").write_text("def one():\n    return 1\n")
-    mark = tmp_path / "pytest-started"
+    # The marker goes to the run's own temp directory: a confined command
+    # writes nothing outside its tree and its measurement directory (DESIGN
+    # §6 *Leerie's runs of the repository's commands are confined too*), so
+    # a marker beside the tree would never appear, and every "never started"
+    # assertion below would pass whether or not pytest started.
     (repo / "conftest.py").write_text(
-        "import sys, pathlib\n"
+        "import os, sys, pathlib\n"
         "sys.path.insert(0, str(pathlib.Path(__file__).parent))\n"
-        f"pathlib.Path({str(mark)!r}).write_text('x')\n")
+        "pathlib.Path(os.environ['TMPDIR'], 'pytest-started')"
+        ".write_text('x')\n")
     (repo / "test_calc.py").write_text(
         "from calc import one\n\n\ndef test_one():\n    assert one() == 1\n")
     (repo / ".leerie").mkdir()
@@ -300,8 +311,21 @@ def repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _mark(repo: Path) -> Path:
-    return repo.parent / "pytest-started"
+class _Mark:
+    """Whether pytest started in any measurement of the run `_st` makes."""
+    def __init__(self, run_dir: Path):
+        self.run_dir = run_dir
+
+    def exists(self) -> bool:
+        return bool(measured_tmp_files(self.run_dir, "pytest-started"))
+
+    def unlink(self) -> None:
+        for f in measured_tmp_files(self.run_dir, "pytest-started"):
+            f.unlink()
+
+
+def _mark(repo: Path) -> _Mark:
+    return _Mark(repo.parent / "state" / "runs" / "run-gate")
 
 
 def _st(leerie, repo: Path, forbidden: list | None = None):

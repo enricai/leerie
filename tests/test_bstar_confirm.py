@@ -578,9 +578,15 @@ CMD = "python3 -m pytest -q -p no:cacheprovider tests"
 
 def test_capture_failing_ids_runs_the_real_suite(leerie, e3_repo):
     st = e3_repo["st"]
-    _git(e3_repo["repo"], "checkout", "-q", "--detach", e3_repo["base"])
+    # A checkout of the base beside the user's: the user's holds this run's
+    # state root (`<repo>/.leerie`), and a measured tree that holds the run
+    # directory is refused (DESIGN §6 *Leerie's runs of the repository's
+    # commands are confined too*).
+    base_wt = e3_repo["repo"].parent / "base-wt"
+    _git(e3_repo["repo"], "worktree", "add", "-q", "--detach", str(base_wt),
+         e3_repo["base"])
     got = asyncio.run(leerie._capture_failing_test_ids(
-        str(e3_repo["repo"]), CMD, st, _caps(leerie), label="t",
+        str(base_wt), CMD, st, _caps(leerie), label="t",
         log_path=st.run_dir / "logs" / "t.log", timeout=120, serial=True))
     assert got is not None and got["kind"] == "junit"
     assert got["ids"] == [

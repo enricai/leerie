@@ -55,6 +55,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unicodedata
@@ -1016,6 +1017,12 @@ STATE_FIELDS = (
     # NEVER written to calls.ndjson, run.json, or any log line — only its
     # fingerprint (_token_fingerprint) is ever surfaced outside state.json.
     "active_oauth_token",
+    # committing_worker_started: True once `claude_p` has started a worker
+    # that commits (`_COMMITTING_WORKERS`). `_run_setup_hook` refuses to run
+    # the hook after it (DESIGN §6 *Leerie's runs of the repository's
+    # commands are confined too*: the hook is the user's code, run once
+    # before any worker).
+    "committing_worker_started",
 )
 
 CATEGORIES = [
@@ -5956,18 +5963,10 @@ def _worker_cache_env(env: Mapping[str, str],
     funeralworks: Playwright's chromium 20 s and 656 MB). None of them is a
     leerie store, and pnpm never links one store's file into another
     (DESIGN §6 *The stores a view installs from are leerie's*)."""
-    out = dict(env)
-    cache = Path(run_dir) / "workers" / "cache"
-    for var, name in _STORE_VARS.items():
-        if not (env.get(var) or "").startswith(_BAKED_ROOT):
-            out[var] = str(cache / name)
-    out["XDG_CACHE_HOME"] = str(cache / "xdg")
+    out = {**env, **_cache_vars(env, Path(run_dir) / "workers" / "cache")}
     for k in _COPY_IMPORT_ENV:
         out.pop(k, None)
     _with_pnpm_spellings(out)
-    for d in (cache / "xdg", cache / "pnpm-store"):
-        with contextlib.suppress(OSError):
-            d.mkdir(parents=True, exist_ok=True)
     return out
 
 
@@ -9660,6 +9659,7 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
 async def _run_streaming(
     cmd: list[str],
     *,
+    grants: WorkerGrants,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     timeout: float | None = None,
@@ -9708,21 +9708,28 @@ async def _run_streaming(
     spawn*). The caller owns the cgroup's lifetime (`_run_contained`).
     Every command run here is the repository's, so it runs in
     `_repo_command_env` — without leerie's hooks-off git entry.
+
+    `grants` (required, keyword-only: no call can forget it) is the
+    command's measurement grant (`_measurement_grants`, DESIGN §6 *Leerie's
+    runs of the repository's commands are confined too*): `cmd` is started
+    through the Landlock shim with it, every descendant inheriting the
+    restriction, and the grant's own variables are laid over `env` last.
+    There is no unconfined path.
     """
-    spawn_cmd = list(cmd)
+    spawn_cmd = _confined_argv(grants, list(cmd))
     # A command in a run's tree reads that tree's own stores
     # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may share*).
     env = _tree_stores_for(env if env is not None else os.environ, cwd)
     gate_r: int | None = None
     gate_w: int | None = None
     if cgroup_sid is not None:
-        spawn_cmd, gate_r, gate_w = _spawn_held_argv(list(cmd))
+        spawn_cmd, gate_r, gate_w = _spawn_held_argv(spawn_cmd)
     try:
         proc = await asyncio.create_subprocess_exec(
             *spawn_cmd,
             pass_fds=(gate_r,) if gate_r is not None else (),
             cwd=cwd,
-            env=_repo_command_env(env),
+            env={**_repo_command_env(env), **dict(grants.env)},
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
@@ -21894,9 +21901,13 @@ def _require_landlock() -> None:
 
 class WorkerGrants(NamedTuple):
     """What a worker's processes may write (`rw`, read too) and read
-    (`ro`), as absolute paths."""
+    (`ro`), as absolute paths. `env`: the `(name, value)` pairs that point
+    the command's temp and caches at its grants, laid over its environment
+    last (a measurement's, `_measurement_grants`); a worker's is empty,
+    `claude_p` names its directories itself."""
     rw: tuple[str, ...]
     ro: tuple[str, ...]
+    env: tuple[tuple[str, str], ...] = ()
 
 
 # The caps key that marks the host-side seam, set only by
@@ -22071,7 +22082,10 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     # The run's CLI configuration template: each worker's configuration
     # links its directories (`_worker_dirs`), read, never written.
     ro: list[str] = [str(run_dir / SYSPROMPT_DIRNAME),
-                     str(run_dir / CLAUDE_CONFIG_TEMPLATE)]
+                     str(run_dir / CLAUDE_CONFIG_TEMPLATE),
+                     # What `MISE_OVERRIDE_CONFIG_FILENAMES` names in a Go
+                     # repository's run: mise reads it on every call.
+                     str(run_dir / MISE_OVERRIDES_NAME)]
     if schema_key in _COMMITTING_WORKERS:
         rw.append(str(cwd_r))
         git_rw, git_ro = _tree_git_dirs(cwd_r, run_dir)
@@ -22112,6 +22126,286 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str]) -> list[str]:
     for p in grants.ro:
         argv += ["--ro", p]
     return argv + ["--", *cmd]
+
+
+# --- I5 for leerie's runs of the repository's commands ----------------------
+# DESIGN §6 *Leerie's runs of the repository's commands are confined too*.
+# Whatever leerie runs on a repository's code (its build, lint, test,
+# install and verify commands, a held-out set's run, CI parity, coverage,
+# the AST scripts, which load the tree's own `typescript`) is the worker's
+# code, and is confined like the worker: `_run_streaming` takes the grant
+# as a required keyword.
+MEASURE_KIND = "measure"
+# The setup hook: also writes what DESIGN §6½ says a hook may install into.
+SETUP_HOOK_KIND = "setup_hook"
+# `mise install` / `mise ls`: also writes `MISE_DATA_DIR`, trusting nothing.
+TOOLCHAIN_KIND = "toolchain"
+# Leerie's own scripts-free store fetch (`_populate_leerie_store`): also
+# writes leerie's store, the one writer it has, and keeps its store
+# variables pointing there.
+STORE_FETCH_KIND = "store_fetch"
+MEASURE_DIRNAME = "measure"
+# Where `_tree_store_env` puts a run tree's own installer stores.
+TREE_STORES_DIRNAME = "tree-stores"
+_MEASURE_ID_FILE = "leerie-measure-id"
+_MEASURE_ID_RE = re.compile(r"[0-9a-f]{16}")
+_MEASURE_SUBDIRS = ("tmp", "cache", "mise-state", "reports", "coverage")
+# The run directory's entries no measured tree may hold or lie beneath:
+# granting such a tree would grant them.
+_MEASURE_PRIVATE = ("state.json", "acceptance", "logs", WORKERS_DIR,
+                    TREE_STORES_DIRNAME,
+                    RUN_REPO_SETTINGS_NAME, TREE_REPOS_DIRNAME,
+                    RUN_REPO_NAME, MEASURE_DIRNAME)
+
+
+def _cache_vars(env: Mapping[str, str], cache: Path) -> dict[str, str]:
+    """Every `_STORE_VARS` variable at `cache/<name>` (one beneath the
+    image's bake root `_BAKED_ROOT` in `env` is left out: leerie built it
+    into the image) and `XDG_CACHE_HOME` at `cache/xdg`; the pnpm store and
+    `xdg` are made."""
+    out = {var: str(cache / name) for var, name in _STORE_VARS.items()
+           if not (env.get(var) or "").startswith(_BAKED_ROOT)}
+    out["XDG_CACHE_HOME"] = str(cache / "xdg")
+    _with_pnpm_spellings(out)
+    for d in (cache / "xdg", cache / "pnpm-store"):
+        with contextlib.suppress(OSError):
+            d.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _git_dirs_of(tree: Path) -> tuple[Path, Path, Path] | None:
+    """`(git_dir, common_dir, toplevel)` of the checkout at `tree`, resolved,
+    or None when `tree` is no git checkout."""
+    r = subprocess.run(["git", "-C", str(tree), "rev-parse",
+                        "--path-format=absolute", "--git-dir",
+                        "--git-common-dir", "--show-toplevel"],
+                       capture_output=True, text=True, check=False,
+                       timeout=30)
+    lines = r.stdout.split("\n")
+    if r.returncode != 0 or len(lines) < 3 or not lines[2]:
+        return None
+    return (Path(lines[0]).resolve(), Path(lines[1]).resolve(),
+            Path(lines[2]).resolve())
+
+
+def _measured_tree_root(tree: Path, run_dir: Path,
+                        dirs: tuple[Path, Path, Path] | None) -> Path:
+    """The tree a grant names for a command run at `tree`: its git toplevel
+    when that is one of the run's checkouts (a recipe entry's
+    `working_dir`, a CI check's `cwd`), else `tree` as given."""
+    if dirs is not None and dirs[2].is_relative_to(run_dir / "worktrees"):
+        return dirs[2]
+    return tree
+
+
+def _sweep_measure_dirs(root: Path) -> None:
+    """Move aside every measurement directory whose tree is gone or whose
+    tree's id has changed (a tree made again at its path), then remove what
+    was moved aside off the event loop: none of it is ever granted again."""
+    gone = root / ".gone"
+    try:
+        sidecars = list(root.glob("*.tree"))
+    except OSError:
+        return
+    moved = False
+    for side in sidecars:
+        own = root / side.name[:-len(".tree")]
+        try:
+            rec = json.loads(side.read_text())
+            tree = Path(rec["tree"])
+            id_file = rec.get("id_file")
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        stale = not tree.is_dir()
+        if not stale and id_file:
+            try:
+                stale = Path(id_file).read_text().strip() != \
+                    own.name.rsplit("-", 1)[-1]
+            except OSError:
+                stale = True
+        if not stale:
+            continue
+        with contextlib.suppress(OSError):
+            gone.mkdir(parents=True, exist_ok=True)
+            if own.exists():
+                os.rename(own, gone / f"{own.name}-{uuid.uuid4().hex[:8]}")
+            side.unlink()
+            moved = True
+    if moved:
+        threading.Thread(target=_rmtree_owned, args=(gone,),
+                         daemon=True).start()
+
+
+def _measure_dir_at(run_dir: Path, tree: Path,
+                    dirs: tuple[Path, Path, Path] | None) -> Path:
+    root = run_dir / MEASURE_DIRNAME
+    id_file: Path | None = None
+    tid = ""
+    if dirs is not None and dirs[0].is_relative_to(run_dir):
+        # The tree's own git directory is made with the tree and removed
+        # with it: an id kept there names this tree, not an earlier one at
+        # the same path.
+        id_file = dirs[0] / _MEASURE_ID_FILE
+        with contextlib.suppress(OSError):
+            tid = id_file.read_text().strip()
+        if not _MEASURE_ID_RE.fullmatch(tid):
+            tid = uuid.uuid4().hex[:16]
+            id_file.write_text(tid + "\n")
+            # A new tree at this path: its own stores (`_tree_store_env`)
+            # start empty too, never with what an earlier tree's commands
+            # left there.
+            stale = run_dir / TREE_STORES_DIRNAME / tree.name
+            if stale.exists():
+                gone = root / ".gone"
+                gone.mkdir(parents=True, exist_ok=True)
+                os.rename(stale, gone / f"stores-{tree.name}-{tid}")
+                threading.Thread(target=_rmtree_owned, args=(gone,),
+                                 daemon=True).start()
+    else:
+        tid = hashlib.sha256(str(tree).encode()).hexdigest()[:16]
+    own = root / f"{tree.name}-{tid}"
+    _sweep_measure_dirs(root)
+    for sub in _MEASURE_SUBDIRS:
+        (own / sub).mkdir(parents=True, exist_ok=True)
+    side = root / f"{own.name}.tree"
+    if not side.is_file():
+        side.write_text(json.dumps({"tree": str(tree), "id_file": (
+            str(id_file) if id_file is not None else None)}))
+    return own
+
+
+def _run_dir_of(st: object) -> Path:
+    run_dir = getattr(st, "run_dir", None)
+    if not isinstance(run_dir, (str, os.PathLike)):
+        die("a repository command has no run directory to be confined in "
+            "— leerie's own invariant is broken (DESIGN §6 *Leerie's runs "
+            "of the repository's commands are confined too*). Report this.")
+    return Path(run_dir).resolve()
+
+
+def _measure_dir(st: "State", tree: str | Path) -> Path:
+    """The measurement directory of `tree` (DESIGN §6 *Leerie's runs of the
+    repository's commands are confined too*): `<run>/measure/<tree>-<id>/`,
+    fresh for each tree and gone with it, holding the command's `tmp/`,
+    `cache/`, `mise-state/`, `reports/` and `coverage/`. The one place a
+    measured command's output may be written outside its tree."""
+    run_dir = _run_dir_of(st)
+    t = Path(tree).resolve()
+    dirs = _git_dirs_of(t)
+    t = _measured_tree_root(t, run_dir, dirs)
+    if dirs is not None and t != Path(tree).resolve():
+        dirs = _git_dirs_of(t)
+    return _measure_dir_at(run_dir, t, dirs)
+
+
+def _measured_git_reads(tree: Path, run_dir: Path,
+                        dirs: tuple[Path, Path, Path] | None) -> list[str]:
+    """The git metadata a command in `tree` reads, read-only: a worktree of
+    the run repository reads it whole; one of a tree repository reads that
+    and the run repository's objects (its alternates); a clone, whose git
+    directory is inside it, the run repository's objects. A repository
+    elsewhere outside the run directory is its own. No measurement writes
+    git metadata (measured: status, log, diff, rev-parse, ls-files and
+    describe all succeed read-only)."""
+    if dirs is None:
+        return []
+    git_dir, common, _top = dirs
+    run_repo = (run_dir / RUN_REPO_NAME).resolve()
+    if git_dir.is_relative_to(tree):
+        return [str(run_repo / "objects")]
+    if common == run_repo:
+        return [str(run_repo)]
+    if common.parent == (run_dir / TREE_REPOS_DIRNAME).resolve():
+        return [str(common), str(run_repo / "objects")]
+    if not common.is_relative_to(run_dir):
+        return [str(git_dir), str(common)]
+    return []
+
+
+def _measurement_grants(st: "State", tree: str | Path,
+                        kind: str = MEASURE_KIND) -> WorkerGrants:
+    """THE grant of a command leerie runs on a repository's code (DESIGN §6
+    *Leerie's runs of the repository's commands are confined too*): write
+    the tree and its measurement directory (`_measure_dir`), read its git
+    metadata (`_measured_git_reads`), leerie's stores, the run's mise
+    overrides and everything outside the state root. The installer stores
+    by class (DESIGN §6 *Which stores an install may share*): the fetched
+    stores read only, the verified ones (`_VERIFIED_STORE_VARS`) and the
+    tree's own (`<run>/tree-stores/<tree>/`, `_tree_store_env`) written.
+    `SETUP_HOOK_KIND` also writes `MISE_DATA_DIR` and `~/.local/bin`,
+    `TOOLCHAIN_KIND` `MISE_DATA_DIR` with its trust records
+    (`MISE_STATE_DIR`) emptied first; `STORE_FETCH_KIND` leerie's stores
+    whole, the fetched stores' one writer. `env` points the command's temp,
+    `XDG_CACHE_HOME` and mise state at the measurement directory; the store
+    variables stay as leerie's environment and `_tree_store_env` set
+    them."""
+    if kind not in (MEASURE_KIND, SETUP_HOOK_KIND, TOOLCHAIN_KIND,
+                    STORE_FETCH_KIND):
+        raise ValueError(f"no measurement kind {kind!r}")
+    run_dir = _run_dir_of(st)
+    state_root = run_dir.parent.parent
+    t = Path(tree).resolve()
+    dirs = _git_dirs_of(t)
+    root = _measured_tree_root(t, run_dir, dirs)
+    if root != t:
+        t, dirs = root, _git_dirs_of(root)
+    for name in _MEASURE_PRIVATE:
+        p = run_dir / name
+        if p.is_relative_to(t) or t.is_relative_to(p):
+            die(f"leerie was about to run a repository command in {t}, "
+                f"which holds or lies in the run's {name}: its grant would "
+                "grant that — leerie's own invariant is broken (DESIGN §6 "
+                "*Leerie's runs of the repository's commands are confined "
+                "too*). Report this.")
+    own = _measure_dir_at(run_dir, t, dirs)
+    stores = state_root / ".stores" / "leerie"
+    rw: list[str] = list(_WORKER_DEVICES) + [str(t), str(own)]
+    if kind == STORE_FETCH_KIND:
+        # The fetch runs no committed code: the fetched stores' one writer.
+        rw.append(str(stores))
+    else:
+        # The verified stores: shared and written by an install, because
+        # the manager refuses an edited entry on reuse.
+        rw += [os.environ[v] for v in sorted(_VERIFIED_STORE_VARS)
+               if os.environ.get(v)
+               and not os.environ[v].startswith(_BAKED_ROOT)]
+    if t.parent == (run_dir / "worktrees").resolve():
+        # The tree's own stores (`_tree_store_env`), which no other tree
+        # reads.
+        tree_stores = run_dir / TREE_STORES_DIRNAME / t.name
+        tree_stores.mkdir(parents=True, exist_ok=True)
+        rw.append(str(tree_stores))
+    ro: list[str] = [str(stores),
+                     str(run_dir / MISE_OVERRIDES_NAME),
+                     *_measured_git_reads(t, run_dir, dirs)]
+    if kind in (SETUP_HOOK_KIND, TOOLCHAIN_KIND):
+        tools = [Path(os.environ.get("MISE_DATA_DIR")
+                      or Path.home() / ".local" / "share" / "mise")]
+        if kind == SETUP_HOOK_KIND:
+            tools.append(Path.home() / ".local" / "bin")
+        for d in tools:
+            d = d.resolve()
+            if d.is_relative_to(state_root):
+                continue
+            with contextlib.suppress(OSError):
+                d.mkdir(parents=True, exist_ok=True)
+            rw.append(str(d))
+    mise_state = own / "mise-state"
+    if kind == TOOLCHAIN_KIND:
+        # mise keeps its trust records here: emptied, it trusts no
+        # configuration, whatever the hook before it trusted.
+        _rmtree_owned(mise_state)
+        mise_state.mkdir(parents=True, exist_ok=True)
+    tmp = str(own / "tmp")
+    xdg = own / "cache" / "xdg"
+    xdg.mkdir(parents=True, exist_ok=True)
+    env = {"TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
+           "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": str(xdg)}
+    return WorkerGrants(
+        tuple(dict.fromkeys(_around(rw, state_root))),
+        tuple(dict.fromkeys(_reads_outside(state_root)
+                            + _around(ro, state_root))),
+        tuple(env.items()))
 
 
 async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
@@ -26420,6 +26714,15 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         user_prompt = (f"{user_prompt.rstrip()}\n"
                        "NOTE FROM ORCHESTRATOR: "
                        + _confined_writes_notice(grants, cwd=cwd, env=_genv))
+    # From here on the run's code is no longer only the user's: the setup
+    # hook, which runs before any worker, refuses to run after this.
+    _sdata = getattr(st, "data", None)
+    if (grants is not None and schema_key in _COMMITTING_WORKERS
+            and isinstance(_sdata, dict)
+            and not _sdata.get("committing_worker_started")):
+        _sdata["committing_worker_started"] = True
+        if callable(getattr(st, "save", None)):
+            st.save()
 
     use_file_flag = _append_system_prompt_file_supported()
     system_prompt_file: str | None = None
@@ -27933,6 +28236,16 @@ async def _run_setup_hook(repo_root: Path, log_dir: Path,
             "misnamed entry or replace it with an executable script."
         )
 
+    # The hook's grant rests on its running before any worker that commits
+    # (DESIGN §6 *Leerie's runs of the repository's commands are confined
+    # too*): after one, the checkout's code is no longer only the user's.
+    if st.data.get("committing_worker_started"):
+        die(".leerie-setup.sh has not run yet, and a worker that commits "
+            "has already started in this run: the hook runs only once, "
+            "before any worker (DESIGN §6 *Leerie's runs of the "
+            "repository's commands are confined too*), so leerie does not "
+            "run it now. Start a new run.")
+
     log("phase 1½: running .leerie-setup.sh")
     st.data["current_phase"] = "phase 1½: setup-hook"
     st.save()
@@ -27942,6 +28255,7 @@ async def _run_setup_hook(repo_root: Path, log_dir: Path,
     try:
         rc, tail = await _run_streaming(
             ["bash", str(hook)],
+            grants=_measurement_grants(st, repo_root, SETUP_HOOK_KIND),
             cwd=str(repo_root),
             timeout=600,  # 10 minutes
             log_path=log_path,
@@ -28134,6 +28448,11 @@ def _read_idiomatic_pins(repo_root: Path,
     return pins
 
 
+# The run's synthesized mise configuration (`_synth_mise_go_override`):
+# every confined worker and measurement reads it (DESIGN §6 I5).
+MISE_OVERRIDES_NAME = "mise-overrides.toml"
+
+
 def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     """If `go.mod` exists and no other Go pin is in place, write a mise
     override file that pins the Go version mise should install. Returns
@@ -28195,7 +28514,7 @@ def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     version = m.group(1)
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    override_path = run_dir / "mise-overrides.toml"
+    override_path = run_dir / MISE_OVERRIDES_NAME
 
     header_comment = (
         "# Synthesized by leerie from go.mod (DESIGN §6½).\n"
@@ -28347,9 +28666,14 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     # `mise install` line and nothing else until it finishes (or hits
     # whatever container-level wall-clock the user gives up at).
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
+    # Confined, trusting no configuration (DESIGN §6 *Leerie's runs of the
+    # repository's commands are confined too*): one grant for the install
+    # and the version read after it.
+    grants = _measurement_grants(st, repo_root, TOOLCHAIN_KIND)
     try:
         rc, tail = await _run_streaming(
             ["mise", "install"],
+            grants=grants,
             cwd=str(repo_root),
             env=env,
             log_path=log_path,
@@ -28369,9 +28693,9 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     # communicate() shape fixed for `mise install` above).
     try:
         result = await run_proc(
-            ["mise", "ls", "--current", "--json"],
+            _confined_argv(grants, ["mise", "ls", "--current", "--json"]),
             cwd=str(repo_root),
-            env=env,
+            env={**_repo_command_env(env), **dict(grants.env)},
             timeout=MISE_LS_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
@@ -40667,8 +40991,12 @@ async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
             await asyncio.to_thread(_rmtree_owned, stage)
             continue
         try:
+            # Confined to its stage directory and leerie's store, the one
+            # writer the store has (DESIGN §6 *Leerie's runs of the
+            # repository's commands are confined too*).
             rc, _tail = await _run_streaming(
-                argv, cwd=str(stage),
+                argv, grants=_measurement_grants(st, stage, STORE_FETCH_KIND),
+                cwd=str(stage),
                 env={**os.environ, **dict(spec.env)} if spec.env else None,
                 timeout=caps.get("worker_timeout_sec"), log_path=log_path,
                 label=f"{label_prefix}-store-fetch: {' '.join(spec.argv)}",
@@ -40762,6 +41090,10 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     # DESIGN §6½ *Leerie's own commands leave a worker's tree as they found
     # it*): a relocked lockfile is put back, an unignored generated file
     # goes; installed dependencies, being ignored, stay.
+    # Confined to the tree and its own temp and caches (DESIGN §6 *Leerie's
+    # runs of the repository's commands are confined too*), derived at the
+    # first entry that runs.
+    grants: WorkerGrants | None = None
     async with _leaves_tree_as_found(tree, "install/build", log_prefix):
         for e in recipe:
             if (e.get("kind") not in ("install", "build")
@@ -40803,8 +41135,10 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                     f"{' '.join(e['command'])}")
                 continue
             try:
+                if grants is None:
+                    grants = _measurement_grants(st, tree)
                 rc, _tail = await _run_streaming(
-                    argv, cwd=str(wd), env=entry_env,
+                    argv, grants=grants, cwd=str(wd), env=entry_env,
                     timeout=_recipe_timeout_s(
                         e, caps.get("worker_timeout_sec")),
                     log_path=log_path,
@@ -40896,7 +41230,8 @@ _HOST_DIR_ENV = "LEERIE_HOST_DIR"
 _BUILD_CLASS_AXES = frozenset({"build", "tests"})
 
 
-async def _run_contained(argv: list[str], *, cwd: str, name: str,
+async def _run_contained(argv: list[str], *, grants: WorkerGrants,
+                         cwd: str, name: str,
                          run_id: str | None, memory_max_bytes: int,
                          pids_max: int, timeout: float, log_path: Path,
                          label: str, verbosity: str = "quiet",
@@ -40910,7 +41245,8 @@ async def _run_contained(argv: list[str], *, cwd: str, name: str,
     `pids_denied` are the cgroup's kill counters (0 when uncontained);
     `peak` is `{memory_bytes, pids}` when `measure` and the broker could
     read one, else None. Runs uncontained when containment is off — the
-    run-level gate already decided that was acceptable."""
+    run-level gate already decided that was acceptable. Always confined
+    (`grants`, `_run_streaming`)."""
     cg = await asyncio.to_thread(
         _cgroup_create, _cgroup_worker_sid(run_id, name),
         int(memory_max_bytes or 0), int(pids_max or 0))
@@ -40934,8 +41270,9 @@ async def _run_contained(argv: list[str], *, cwd: str, name: str,
     try:
         try:
             rc, tail = await _run_streaming(
-                argv, cwd=cwd, env=env, timeout=timeout, log_path=log_path,
-                label=label, verbosity=verbosity, cgroup_sid=cg)
+                argv, grants=grants, cwd=cwd, env=env, timeout=timeout,
+                log_path=log_path, label=label, verbosity=verbosity,
+                cgroup_sid=cg)
             out["rc"], out["tail"] = rc, tail
         except subprocess.TimeoutExpired as e:
             out["timed_out"] = True
@@ -41130,7 +41467,8 @@ def _record_blt_peak(st: "State", axes: dict[str, dict], caps: dict) -> None:
     _apply_blt_peak(st, caps)
 
 
-async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
+async def _measure_blt(axis: str, cmd: str, tree: str, *,
+                       grants: WorkerGrants, timeout: float,
                        log_path: Path, verbosity: str,
                        label_prefix: str = "baseline",
                        measure_peak: bool = False,
@@ -41160,7 +41498,10 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
 
     `forbidden` (the task's forbidden commands, `_forbidden_specs`): a
     command it matches is not run (`_blt_shell_argv`) — the unmeasured
-    record with `skip_kind: "forbidden_by_task"`."""
+    record with `skip_kind: "forbidden_by_task"`.
+
+    `grants`: the tree's measurement grant (`_measurement_grants`), which
+    the command runs confined to."""
     if not (cmd or "").strip():
         # Every axis dict carries `measured` so no consumer needs a
         # default; a not-applicable axis is unmeasured (and, being
@@ -41172,7 +41513,7 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
         argv = _blt_shell_argv(cmd, forbidden)
         if measure_peak:
             ran = await _run_contained(
-                argv, cwd=str(tree), name=f"measure-{axis}",
+                argv, grants=grants, cwd=str(tree), name=f"measure-{axis}",
                 run_id=run_id, memory_max_bytes=0, pids_max=0,
                 timeout=timeout, log_path=log_path,
                 label=f"{label_prefix}-{axis}: {cmd}", verbosity=verbosity,
@@ -41183,7 +41524,7 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
             rc, tail = int(ran["rc"]), ran["tail"]
         else:
             rc, tail = await _run_streaming(
-                argv, cwd=str(tree), timeout=timeout,
+                argv, grants=grants, cwd=str(tree), timeout=timeout,
                 log_path=log_path, label=f"{label_prefix}-{axis}: {cmd}",
                 verbosity=verbosity)
         full = (tail or "").strip()
@@ -42025,7 +42366,8 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         cmd = (cmd or "").strip()
         if not cmd:
             results[axis] = await _measure_blt(
-                axis, "", tree, timeout=0.0, log_path=log_path,
+                axis, "", tree, grants=WorkerGrants((), ()), timeout=0.0,
+                log_path=log_path,
                 verbosity=verbosity, label_prefix=label_prefix,
                 forbidden=forbidden)
             continue
@@ -42093,7 +42435,7 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                         if axis in _BUILD_CLASS_AXES
                         else contextlib.nullcontext()):
                 res = await _measure_blt(
-                    axis, cmd, tree,
+                    axis, cmd, tree, grants=_measurement_grants(st, tree),
                     timeout=float(caps.get("worker_timeout_sec")
                                   or DEFAULT_CAPS["worker_timeout_sec"]),
                     log_path=log_path, verbosity=verbosity,
@@ -43017,7 +43359,11 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         if flagged is not None:
             attempts.append(flagged)
     attempts.append(cmd)
-    reports = st.run_dir / "confirm" / "reports"
+    # The report is the command's output: beside its tree, in the tree's own
+    # measurement directory (DESIGN §6 *Leerie's runs of the repository's
+    # commands are confined too*).
+    grants = _measurement_grants(st, tree)
+    reports = _measure_dir(st, tree) / "reports"
     forbidden = _forbidden_specs(getattr(st, "data", None))
     # Run time spent by earlier attempts: charged to the retry's timeout.
     spent = 0.0
@@ -43057,7 +43403,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                 t_run = time.monotonic()
                 try:
                     await _run_streaming(
-                        argv, cwd=str(tree), env=env,
+                        argv, grants=grants, cwd=str(tree), env=env,
                         timeout=max(1.0, left), log_path=log_path,
                         label=f"{label}-ids: {run_cmd}", verbosity="quiet")
                 finally:
@@ -44288,7 +44634,7 @@ async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
     try:
         async with _build_class_slot(st, label=f"ci {label}"):
             run = await _run_contained(
-                argv, cwd=str(cwd),
+                argv, grants=_measurement_grants(st, tree), cwd=str(cwd),
                 name=f"ci-{label}"[:60], run_id=st.run_id,
                 memory_max_bytes=int(caps.get("worker_memory_max_bytes") or 0),
                 pids_max=int(caps.get("worker_pids_max") or 0),
@@ -48426,7 +48772,11 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     except ForbiddenByTask as e:
         return None, f"the parse check was not run: {e}"
     path = Path(tree) / probe
-    marker = st.run_dir / "acceptance" / "reports" / (
+    # In the tree's own measurement directory: the probe writes it from
+    # inside the confined run (DESIGN §6 *Leerie's runs of the repository's
+    # commands are confined too*).
+    grants = _measurement_grants(st, tree)
+    marker = _measure_dir(st, tree) / "reports" / (
         f"{label}-probe-{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}")
     try:
         # The probe writes this marker as the same user, so proving the
@@ -48445,7 +48795,7 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
             marker=str(marker)))
         async with _blt_semaphore(caps):
             rc, out = await _run_streaming(
-                argv, cwd=str(tree),
+                argv, grants=grants, cwd=str(tree),
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
                 log_path=log_path, label=f"{label}-parse-probe: {cmd}",
@@ -48708,7 +49058,11 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     run_cmd, env, spec = cmd, None, None
     # `env_extra` carries a throwaway test database's URL (DESIGN §8
     # *Prisma repositories get a real database*).
-    report = st.run_dir / "acceptance" / "reports" / (
+    # The tree's own measurement directory, never `acceptance/`, which no
+    # confined command is granted (DESIGN §6 *Leerie's runs of the
+    # repository's commands are confined too*); read after the run exits.
+    grants = _measurement_grants(st, tree)
+    report = _measure_dir(st, tree) / "reports" / (
         f"{label}-{hashlib.sha256(rel.encode()).hexdigest()[:12]}")
     if validating or cases_out is not None:
         spec = _acceptance_report_spec(cmd, report, [rel])
@@ -48732,7 +49086,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     async with _blt_semaphore(caps):
         try:
             rc, tail = await _run_streaming(
-                argv, cwd=str(tree), env=env,
+                argv, grants=grants, cwd=str(tree), env=env,
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
                 log_path=log_path, label=f"{label}-tests: {run_cmd}",
@@ -53212,6 +53566,18 @@ def _ts_script_env() -> dict[str, str]:
     """The environment of a node run of an AST script: the caller's, plus
     where the bundled `typescript` lives."""
     return {**os.environ, "LEERIE_BUNDLED_TYPESCRIPT": str(BUNDLED_TYPESCRIPT)}
+
+
+def _ts_script_run(argv: list[str], *, tree: str | Path,
+                   grants: WorkerGrants, timeout: float,
+                   text: bool = False) -> subprocess.CompletedProcess:
+    """A node run of an AST script in `tree`, confined to `grants`: it loads
+    the tree's own `typescript` first, which is the tree's code (DESIGN §6
+    *Leerie's runs of the repository's commands are confined too*)."""
+    return subprocess.run(_confined_argv(grants, argv), cwd=str(tree),
+                          capture_output=True, text=text, timeout=timeout,
+                          check=False,
+                          env={**_ts_script_env(), **dict(grants.env)})
 # Coupling policy over those facts (bench n2d coupling.py, frozen). Every
 # pattern reads code tokens, paths or shell commands — mechanical strings
 # (DESIGN §12), never prose.
@@ -53254,15 +53620,14 @@ def _git_paths_at(repo: str | Path, sha: str) -> set[str]:
 
 
 def _probe_case_facts(tree: str | Path, probe: str | Path,
-                      case: str) -> dict:
+                      case: str, *, grants: WorkerGrants) -> dict:
     """The AST facts of one test case (`scripts/test-case-facts.cjs`, run
     in the installed `tree` so its own `typescript` is tried first), or
     `{"error": ...}` — one starting `facts_failed` when the script itself
     could not run (an infrastructure miss, not a fact about the probe)."""
     try:
-        r = subprocess.run(["node", str(TEST_CASE_FACTS), str(probe), case],
-                           cwd=str(tree), capture_output=True, text=True,
-                           timeout=120, check=False, env=_ts_script_env())
+        r = _ts_script_run(["node", str(TEST_CASE_FACTS), str(probe), case],
+                           tree=tree, grants=grants, timeout=120, text=True)
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"error": f"facts_failed: {type(e).__name__}"}
     try:
@@ -53655,8 +54020,9 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         if not g["fails_under_bstar"]:
             return out
         title = cid.split(" :: ", 1)[1] if " :: " in cid else cid
-        facts = await asyncio.to_thread(_probe_case_facts, confirm_tree,
-                                        dst, title)
+        facts = await asyncio.to_thread(
+            functools.partial(_probe_case_facts, confirm_tree, dst, title,
+                              grants=_measurement_grants(st, confirm_tree)))
         err = str(facts.get("error") or "")
         g["facts_read"] = not err.startswith("facts_failed")
         if not g["facts_read"]:
@@ -53706,15 +54072,14 @@ def _falsifier_save_probe(st: "State", lane: Path, i: int,
     return {"dir": str(dst_dir), "file": rel}
 
 
-def _ts_resolvable(tree: str | Path) -> bool:
+def _ts_resolvable(tree: str | Path, *, grants: WorkerGrants) -> bool:
     """True when the AST scripts can load a `typescript` with the compiler
     API in `tree` — its own, or the bundled copy (`scripts/load-typescript.cjs`
     run as the probe). A package that merely resolves is not enough: the
     TypeScript 7 native port resolves and has no `createSourceFile`."""
     try:
-        r = subprocess.run(["node", str(TS_LOADER)], cwd=str(tree),
-                           capture_output=True, timeout=60, check=False,
-                           env=_ts_script_env())
+        r = _ts_script_run(["node", str(TS_LOADER)], tree=tree,
+                           grants=grants, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0
@@ -53755,7 +54120,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                 verbosity=verbosity, label_prefix="falsifier-confirm",
                 log_prefix="delivery detection"):
             return {"enabled": False, "skipped": "dependency install failed"}
-        if not _ts_resolvable(confirm_tree):
+        if not _ts_resolvable(confirm_tree,
+                              grants=_measurement_grants(st, confirm_tree)):
             # The AST coupling check is JS/TS-only, as benched: without it
             # no sample could ever be confirmed, so none is spawned.
             return {"enabled": False, "skipped": "AST coupling check "
@@ -55745,12 +56111,12 @@ def _redrive_audit_blocks(set_: dict) -> bool | None:
     return hits * 2 > n
 
 
-def _redrive_ast_available(staging: Path) -> bool:
+def _redrive_ast_available(staging: Path, *, grants: WorkerGrants) -> bool:
     """Gate (d+) can run: `node`, the script and a `typescript` compiler API
     from the tree or the bundled copy (`_ts_resolvable`). Without it there is
     no escalation."""
     return (shutil.which("node") is not None and REDRIVE_AST_GATE.is_file()
-            and _ts_resolvable(staging))
+            and _ts_resolvable(staging, grants=grants))
 
 
 _TG_EXPECT_RE = re.compile(r"\bexpect\s*\(|\bassert(?:\.\w+)?\s*\(")
@@ -56048,8 +56414,8 @@ def _redrive_schema_hits(repo: str | Path, base: str, head: str
     return hits
 
 
-def _redrive_ast_hits(staging: Path, base: str, head: str
-                      ) -> list[dict] | None:
+def _redrive_ast_hits(staging: Path, base: str, head: str, *,
+                      grants: WorkerGrants) -> list[dict] | None:
     """Gate (d+): `scripts/redrive-ast-gate.cjs` per changed JS/TS
     production file of the working tree (D1, D2), then D3 across files: a
     newly swallowing catch whose class some changed file throws under a null
@@ -56071,11 +56437,9 @@ def _redrive_ast_hits(staging: Path, base: str, head: str
                 bf = str(Path(td) / "base.ts")
                 Path(bf).write_text(b.stdout)
             try:
-                q = subprocess.run(["node", str(REDRIVE_AST_GATE), bf,
-                                    str(staging / f), f], cwd=str(staging),
-                                   capture_output=True, text=True,
-                                   timeout=120, check=False,
-                                   env=_ts_script_env())
+                q = _ts_script_run(["node", str(REDRIVE_AST_GATE), bf,
+                                    str(staging / f), f], tree=staging,
+                                   grants=grants, timeout=120, text=True)
                 got = json.loads(q.stdout)
             except (OSError, subprocess.TimeoutExpired, ValueError):
                 return None
@@ -56091,12 +56455,13 @@ def _redrive_ast_hits(staging: Path, base: str, head: str
     return hits
 
 
-def _redrive_escalation_gate(staging: Path, base: str, head: str) -> dict:
+def _redrive_escalation_gate(staging: Path, base: str, head: str, *,
+                             grants: WorkerGrants) -> dict:
     """Gates (b), (c), (d+) on an escalated round's diff: `void` on any
     hit, or when the AST check could not run."""
     weakened = _redrive_weakened_tests(staging, base, head)
     schema = _redrive_schema_hits(staging, base, head)
-    ast = _redrive_ast_hits(staging, base, head)
+    ast = _redrive_ast_hits(staging, base, head, grants=grants)
     return {"void": bool(weakened or schema or ast is None or ast),
             "weakened": weakened, "schema": schema, "ast": ast}
 
@@ -56761,7 +57126,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                             DEFAULT_CAPS["redrive_budget_sec"]))
     graph = _js_source_graph(_run_repo(st), head) if sets else {}
     shape = (st.data.get("defect_scope") or {}).get("defect_shape") or ""
-    ast_ok = _redrive_ast_available(staging)
+    ast_ok = _redrive_ast_available(
+        staging, grants=_measurement_grants(st, staging))
     trade_pairs = {tuple(p) for p in rec["trade_pairs"]}
     prior_members: list[str] = []
     ids_before = await _redrive_test_ids(st, caps, staging, "redrive-ids0")
@@ -57024,7 +57390,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     and not v["held_fixed_cases"])
                 void = void or ge["zero_progress"]
                 if escalate:
-                    eg = _redrive_escalation_gate(staging, pre_sha, post_sha)
+                    eg = _redrive_escalation_gate(
+                        staging, pre_sha, post_sha,
+                        grants=_measurement_grants(st, staging))
                     ge["gate"] = eg
                     void = void or eg["void"]
                 rat: dict = {}
@@ -58103,7 +58471,8 @@ async def _cov_contained(argv: list[str], *, tree: Path, st: "State",
                                          f"coverage {sid}"), \
                 _build_class_slot(st, label=f"coverage {sid} {tag}"):
             run = await _run_contained(
-                argv, cwd=str(tree), name=name, run_id=st.run_id,
+                argv, grants=_measurement_grants(st, root), cwd=str(tree),
+                name=name, run_id=st.run_id,
                 memory_max_bytes=int(caps.get("worker_memory_max_bytes") or 0),
                 pids_max=int(caps.get("worker_pids_max") or 0),
                 timeout=max(1.0, timeout), log_path=log_path,
@@ -58130,7 +58499,9 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
     `coverage-final.json` restricted to `include` (a statement's start line
     carries its count; the line's count is the max over its statements).
     `tree` is the subtask's measured tree (`_measure_subtask_coverage`)."""
-    work = st.run_dir / "coverage" / _CGROUP_NAME_UNSAFE_RE.sub("-", sid)
+    # The coverage output is the run's: in the tree's measurement directory.
+    work = (_measure_dir(st, tree) / "coverage"
+            / _CGROUP_NAME_UNSAFE_RE.sub("-", sid))
     covdir = work / f"cov-{tag}"
     report = work / f"res-{tag}.json"
     shutil.rmtree(covdir, ignore_errors=True)
@@ -58717,6 +59088,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
     # measurement reads the committed view*).
     worktree = await _measured_tree(st, worktree, caps, log_path=log_path,
                                     label=f"settle-exec-{sid}")
+    grants = _measurement_grants(st, worktree)
     try:
         blt = resolve_blt(st.repo_root)
     except Exception:
@@ -58742,7 +59114,8 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
                         if _is_blt_build_test_argv(argv, blt)
                         else contextlib.nullcontext()):
                 return await _run_contained(
-                    argv, cwd=worktree, name=f"exec-{name_sid}-{seq}",
+                    argv, grants=grants, cwd=worktree,
+                    name=f"exec-{name_sid}-{seq}",
                     run_id=st.run_id, memory_max_bytes=mem, pids_max=pids,
                     timeout=max(1.0, limit), log_path=log_path, label=label)
         except OSError as e:

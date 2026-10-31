@@ -20,6 +20,8 @@ import subprocess
 import sys
 import types
 
+from tests.conftest import measure_run_dir
+
 
 # --- source-coupling: the call site itself -------------------------------
 
@@ -115,7 +117,11 @@ def test_login_shell_loses_the_mise_path_a_plain_shell_keeps(tmp_path):
 # --- end-to-end: _capture_conformance_baseline resolves the runner -------
 
 def _st(tmp_path, repo_root):
-    run_dir = tmp_path / "run"
+    # A state root of its own (`<tmp_path>/state`): the measured command is
+    # confined to its grant and reads nothing of the state root, so the
+    # runner fixture beside it must lie outside it (DESIGN §6 *Leerie's runs
+    # of the repository's commands are confined too*).
+    run_dir = measure_run_dir(tmp_path)
     (run_dir / "logs").mkdir(parents=True)
     st = types.SimpleNamespace(
         run_dir=run_dir,

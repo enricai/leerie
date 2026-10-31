@@ -20,6 +20,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 from test_shipping_tree_is_committed import _git, _repo  # noqa: E402
 
+from tests.conftest import measured_tmp_files  # noqa: E402
+
 
 def test_every_store_variable_has_exactly_one_class(leerie):
     classes = (leerie._TREE_STORE_VARS, leerie._VERIFIED_STORE_VARS,
@@ -59,9 +61,11 @@ def test_run_streaming_runs_a_repo_command_with_its_trees_stores(
     run, t = _tree(tmp_path)
     log = tmp_path / "l.log"
     out = tmp_path / "env.json"
+    # Granted everything: this pins the store routing, not the grant.
     rc, _ = asyncio.run(leerie._run_streaming(
         [sys.executable, "-c",
          f"import json,os; json.dump(dict(os.environ), open({str(out)!r},'w'))"],
+        grants=leerie.WorkerGrants(("/",), ()),
         cwd=str(t), env=None, timeout=60, log_path=log, label="t",
         verbosity="quiet"))
     assert rc == 0
@@ -75,14 +79,27 @@ COMMITTED_CODE = frozenset({".pnpmfile.cjs", ".npmrc", ".yarnrc.yml",
 
 
 def _fake(bindir: Path, name: str, rec: Path) -> None:
+    """A stand-in manager that records its argv, cwd listing and script
+    settings as `rec.name` in its own temp directory: it runs confined, and
+    writes nothing beside its tree (DESIGN §6 *Leerie's runs of the
+    repository's commands are confined too*)."""
     f = bindir / name
     f.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
         f"json.dump({{'argv': sys.argv[1:], 'cwd': sorted(os.listdir('.')),"
         f" 'env': {{k: v for k, v in os.environ.items()"
-        f" if 'SCRIPT' in k.upper()}}}}, open({str(rec)!r}, 'w'))\n")
+        f" if 'SCRIPT' in k.upper()}}}},"
+        f" open(os.path.join(os.environ['TMPDIR'], {rec.name!r}), 'w'))\n")
     f.chmod(0o755)
+
+
+def _recorded(st, rec: Path) -> dict:
+    """The newest record `_fake` left in one of the run's measurements."""
+    got = sorted(measured_tmp_files(st.run_dir, rec.name),
+                 key=lambda f: f.stat().st_mtime_ns)
+    assert got, rec.name
+    return json.loads(got[-1].read_text())
 
 
 @pytest.mark.parametrize("mgr", ["pnpm", "npm", "yarn", "bun", "go",
@@ -114,7 +131,7 @@ def test_each_fetch_runs_its_no_code_argv_on_data_files_only(
         str(staging), w["st"], w["caps"],
         log_path=w["run_dir"] / "logs" / "f.log",
         label_prefix="t", log_prefix="t"))
-    got = json.loads(rec.read_text())
+    got = _recorded(w["st"], rec)
     assert got["argv"] == list(spec.argv[1:])
     # Independent of the table: a file that configures or runs code is never
     # staged, whatever `_STORE_FETCH` lists.
@@ -141,7 +158,7 @@ def test_a_bun_install_copies_from_its_cache(leerie, tmp_path, monkeypatch):
         asyncio.run(leerie._ensure_worktree_deps(
             str(w["staging"]), w["st"], w["caps"],
             log_path=w["run_dir"] / "logs" / "b.log", verbosity="quiet"))
-        assert json.loads(rec.read_text())["argv"] == want
+        assert _recorded(w["st"], rec)["argv"] == want
 
 
 def test_a_replaced_view_takes_its_tree_stores_with_it(leerie, tmp_path,

@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import measure_run_dir
+
 VITEST_RUN = "npx vitest run {test_files} --passWithNoTests"
 VITEST_RELATED = "npx vitest related --run {files} --passWithNoTests"
 JEST_RUN = "npx jest --runTestsByPath {test_files} --passWithNoTests"
@@ -38,7 +40,11 @@ def _repo(tmp_path: Path, config: str, toml: str | None = None) -> Path:
 
 def _st(root: Path, data: dict | None = None):
     return types.SimpleNamespace(
-        repo_root=root, run_dir=root / ".run", run_id="r1",
+        # Beside the tree: a measured tree holding the run directory is
+        # refused (DESIGN §6 *Leerie's runs of the repository's commands are
+        # confined too*).
+        repo_root=root, run_dir=measure_run_dir(root, beside=True),
+        run_id="r1",
         data={"verbosity": "quiet", **(data or {})}, save=lambda: None)
 
 

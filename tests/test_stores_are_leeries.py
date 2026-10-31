@@ -11,6 +11,11 @@ pnpm 10.4.1 on barnacle). Leerie's commands now read only
 worker pnpm store, and a tree leerie installs into gets links into leerie's
 store only when it is a committed view.
 
+Every install leerie runs is confined (DESIGN §6 *Leerie's runs of the
+repository's commands are confined too*): leerie's fetched store is
+read-only to it, filled by the no-code fetch alone, so each world here
+fills it first, as the fetch would.
+
 The installer here is a stand-in that behaves like pnpm where it matters:
 a content store at `npm_config_store_dir`, filled from a registry when a
 package is missing, and files hard-linked from it into `node_modules`
@@ -30,6 +35,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 from test_invoke_token_env import _patch_invoke_internals  # noqa: E402
 from test_shipping_tree_is_committed import _git, _repo  # noqa: E402
+
+from tests.conftest import measured_tmp_files  # noqa: E402
 
 GOOD = "export const ok = true;\n"
 # A stand-in for pnpm's install: fill the store from a registry, link each
@@ -81,6 +88,10 @@ def _world(leerie, tmp_path, monkeypatch, *, run: str = "") -> dict:
     leerie._leerie_stores(env, state_root)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
+    # The fetch's part: the store holds every package before an install.
+    store = Path(env["npm_config_store_dir"])
+    for f in reg.iterdir():
+        shutil.copy(f, store / f.name)
     w["st"].data["provision"] = {"recipe": [{
         "kind": "install", "working_dir": ".",
         "command": [sys.executable, str(script), str(reg)]}]}
@@ -231,21 +242,31 @@ def test_the_store_fetch_runs_a_no_code_fetch_without_the_pnpmfile(
     runs (review round 18 H1; DESIGN §6 *A view's install never writes
     leerie's store*)."""
     w = _repo(leerie, tmp_path, monkeypatch, ignore="node_modules/\n")
+    # Leerie's stores under the run's own state root, as `main()` sets them.
+    env: dict[str, str] = {}
+    leerie._leerie_stores(env, w["st"].run_dir.parent.parent)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
     staging = w["staging"]
     (staging / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
     (staging / ".pnpmfile.cjs").write_text("throw new Error('ran')\n")
     _git(staging, "add", "-A")
     _git(staging, "commit", "-qm", "lock")
-    # A fake pnpm that records its argv and cwd listing.
+    # A fake pnpm that records its argv, cwd listing and store, in its own
+    # temp directory (the fetch is confined: DESIGN §6 *Leerie's runs of
+    # the repository's commands are confined too*), and writes the store,
+    # whose one writer it is.
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    rec = tmp_path / "fetch.json"
     fake = bindir / "pnpm"
     fake.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, os, sys\n"
-        f"json.dump({{'argv': sys.argv[1:], 'cwd': sorted(os.listdir('.'))}},"
-        f" open({str(rec)!r}, 'w'))\n")
+        "import json, os, pathlib, sys\n"
+        "store = os.environ['npm_config_store_dir']\n"
+        "pathlib.Path(store, 'fetched').write_text('x')\n"
+        "json.dump({'argv': sys.argv[1:], 'cwd': sorted(os.listdir('.')),"
+        " 'store': store},"
+        " open(os.path.join(os.environ['TMPDIR'], 'fetch.json'), 'w'))\n")
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     w["st"].data["provision"] = {"recipe": [{
@@ -255,7 +276,10 @@ def test_the_store_fetch_runs_a_no_code_fetch_without_the_pnpmfile(
         str(staging), w["st"], w["caps"],
         log_path=w["run_dir"] / "logs" / "f.log",
         label_prefix="t", log_prefix="t"))
+    (rec,) = measured_tmp_files(w["st"].run_dir, "fetch.json")
     got = json.loads(rec.read_text())
+    assert got["store"] == os.environ["npm_config_store_dir"]
+    assert (Path(got["store"]) / "fetched").is_file()
     assert got["argv"] == ["fetch", "--ignore-scripts"]
     assert "pnpm-lock.yaml" in got["cwd"]
     assert ".pnpmfile.cjs" not in got["cwd"]

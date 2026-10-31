@@ -60,7 +60,11 @@ def _repo(leerie, tmp_path, monkeypatch, *, ignore: str = "",
         SUITE.format(ok=branch_suite_ok))
     _git(repo, "commit", "-qam", "feature")
     _git(repo, "checkout", "-q", "main")
-    root = repo / ".leerie"
+    # The state root beside the checkout, not in it: a test here measures
+    # the checkout itself, and a measured tree holding the run directory is
+    # refused (DESIGN §6 *Leerie's runs of the repository's commands are
+    # confined too*).
+    root = tmp_path / "state"
     run_dir = root / "runs" / run_id
     (run_dir / "logs").mkdir(parents=True)
     staging = run_dir / "worktrees" / "staging"

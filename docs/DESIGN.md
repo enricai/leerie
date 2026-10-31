@@ -2460,6 +2460,7 @@ worker gets the first block, then its kind's.
 | the run's download caches | `<run-dir>/workers/cache/`, one set per run shared by its workers (every store variable, the pnpm store, `XDG_CACHE_HOME`) | write | `_worker_cache_env` |
 | outside the state root | everything (above) | read | — |
 | the run's system prompts | `<run-dir>/sysprompt/` | read | — |
+| the run's mise overrides | `<run-dir>/mise-overrides.toml`, which `MISE_OVERRIDE_CONFIG_FILENAMES` names to every process of a Go repository's run (§6½ step 3): without it a worker's `mise` cannot load its configuration | read | `_synth_mise_go_override` |
 
 `<wid>` is the worker's id, its first call's log sid; a re-ask or resume
 reuses the same worker's directories. A temp or config variable's
@@ -2551,6 +2552,124 @@ reads every other branch in the run repository, which the worker cannot
 write (I6). `/dev/shm` is shared; leerie never reads it. A worker can signal any process of its user
 (Landlock's signal scoping needs ABI 6), the orchestrator included; the
 process-kill deny rules (§9) and `TaskStop` are the guard there.
+
+### Leerie's runs of the repository's commands are confined too (I5, measurements)
+
+*Designed 2026-10-31 (review round 18, H1).*
+
+**Root cause.** I5 confined the worker's session, but a worker's output
+is code, and leerie runs that code whenever it measures or installs: the
+repository's build, lint and test commands, its install recipe, the
+held-out acceptance runs, CI parity, coverage, the settle-by-execution
+`verify` commands, and leerie's own AST scripts, which load the tree's
+`typescript`. Each ran as the orchestrator, with the orchestrator's
+access to the run directory. So the confinement boundary stopped one step
+short of the code the worker wrote: the project's `conftest.py`, a
+`postinstall`, a `Makefile` target. A worker could get through leerie's
+commands what I5 refuses its session.
+
+**Invariant (I5, measurement kind): a command leerie runs on a
+repository's code writes only beneath its measurement grant, and reads
+nothing of the state root but that grant.** The kernel enforces it the
+way it enforces a worker's: the command is started through the same shim
+(`scripts/landlock_exec.py`) with the grants `_measurement_grants(st,
+tree, kind)` derives. `_run_streaming`, through which every repository
+command leerie runs is spawned (`_run_contained` included), takes
+`grants` as a required keyword and has no unconfined path; the AST scripts
+and `mise ls` are started through `_confined_argv` with the same grants.
+Fail closed as for a worker: preflight has already required Landlock
+(`_require_landlock`), and the shim refuses (exit 126) where it cannot
+enforce, which a measurement reads as "could not measure", never a pass.
+
+**The grant, by kind.** Every kind gets the first block.
+
+| Grant | Path | Access |
+|---|---|---|
+| devices | as a worker's | write |
+| the measured tree | the checkout the command runs in (a committed view, an evaluation tree, a helper checkout, a worker tree an install runs in) | write |
+| its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `tmp/` (what `TMPDIR`, `TMP` and `TEMP` name), `cache/xdg/` (`XDG_CACHE_HOME`), `mise-state/` (`MISE_STATE_DIR`), `reports/` (every runner report, the parse probe's marker, the failing-ID capture's report), `coverage/` (the coverage detector's output) | write |
+| the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
+| leerie's stores | `<state-root>/.stores/leerie/`: the fetched stores (*Which stores an install may share*) | read |
+| the verified stores | what `PIP_CACHE_DIR`, `POETRY_CACHE_DIR` and `YARN_GLOBAL_FOLDER` name (`_VERIFIED_STORE_VARS`): the manager refuses an edited entry on reuse | write |
+| the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache), for a tree under `<run-dir>/worktrees/` | write |
+| the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
+| outside the state root | everything, as a worker's | read |
+| *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
+| *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR`; `mise-state/` emptied first | write |
+| *store-fetch kind* (`_populate_leerie_store`, in its staging directory) | also leerie's store, its store variables left pointing there | write |
+
+Nothing else is granted: not `state.json`, `acceptance/`, `logs/`,
+`workers/`, `repo-settings/`, another tree's repository in `tree-repos/`,
+the run repository's refs for writing, a sibling tree, or another tree's
+measurement directory. The git metadata is read-only because no
+measurement needs more: in a confined view `git status`, `log`, `diff`,
+`rev-parse`, `ls-files`, `stash list` and `describe` all succeed with the
+run repository read-only, and `git status` skips its opportunistic index
+refresh (measured 2026-10-31). A tree whose path holds or lies beneath one
+of the run directory's private entries is no measured tree: the run stops
+naming it (`die`), since granting it would grant them.
+
+**The measurement directory belongs to one tree, for that tree's
+lifetime.** It is named for the tree and for an id leerie writes into the
+tree's git directory on first use (`leerie-measure-id`): a tree removed and
+made again at the same path gets a new git directory, so a new id and a
+fresh directory, and nothing a measurement left behind reaches the next
+tree. A directory whose tree is gone, or whose tree's id has changed, is
+removed by the next measurement's sweep (moved aside at once, deleted in
+the background). It is never shared between trees: one held-out
+evaluation's tree is not another's, and no worker is granted any of them.
+It lives under `<run-dir>/measure/`, outside `<run-dir>/repo/`, which
+every non-committing worker reads. Leerie reads a report there after the
+command exits.
+
+**The variables follow the grant.** The grant names its own environment:
+`TMPDIR`, `TMP`, `TEMP`, `MISE_STATE_DIR` and `XDG_CACHE_HOME` point at the
+measurement directory, laid over the caller's environment last. The store
+variables stay as leerie's environment (`_leerie_stores`) and
+`_tree_store_env` set them, each in the class the grant writes or reads.
+A recipe entry's or a CI check's own variables still apply; a temp or cache
+path they name outside the grant is refused, which is a finding, not a
+grant to widen.
+
+**Leerie's stores, by class.** The fetched stores under
+`<state-root>/.stores/leerie/` (`_FETCHED_STORE_VARS`) are written by
+leerie's own scripts-free fetch alone (`_populate_leerie_store`, the
+store-fetch kind: no repository code runs there) and read only by every
+other measurement; a confined install copies from them
+(`_COPY_IMPORT_ENV`). The verified stores are written by installs, which a
+manager that refuses an edited entry makes safe to share. The tree's own
+stores are written by that tree's commands and read by no other tree; they
+follow the measurement directory's lifetime: a tree made again at the same
+path starts with them empty (`_measure_dir`). No worker is granted any of
+them.
+
+**The setup hook is the user's code, run once before any worker.**
+`.leerie-setup.sh` runs in phase 1½, in a throwaway checkout of the
+planning commit (§6½ step 1), before any worker that commits exists: it is
+the repository's own code as the user committed it, not a worker's. It is
+confined with the setup-hook kind, whose extra writes are exactly what §6½
+says a hook may do — install a language runtime with `mise`
+(`MISE_DATA_DIR`) and a user-space tool into `~/.local/bin` — and nothing
+of the state root but its checkout and its measurement directory. The
+premise is checked, not assumed: `claude_p` records the first committing
+worker's start (`committing_worker_started`), and a hook that has not run
+yet when that is set stops the run instead of running.
+
+**`mise install` runs the repository's code only from a configuration it
+trusts.** Measured on the image (mise v2026.5.4): a trusted `mise.toml`
+runs its `exec()` templates, its `_.source` scripts and a tool's
+`postinstall`; an untrusted one makes mise refuse to run; `.tool-versions`
+and the idiomatic version files run nothing. So it is confined with the
+toolchain kind — it must write `MISE_DATA_DIR`, outside the state root —
+and its `MISE_STATE_DIR`, where mise keeps its trust records, is emptied
+first: whatever the hook trusted is gone, and mise trusts nothing by code,
+not by what a shared `/tmp/.mise-state` happens to hold. `mise ls
+--current --json` runs under the same grant.
+
+**The re-drive's self-check** (`scripts/selfcheck.py`) is started by a
+confined worker's shell and spawns the runner itself, so it runs inside
+that worker's grants (*A worker writes only where it is granted*): no
+second grant applies.
 
 ### A repository per committing tree (I6)
 
@@ -4407,6 +4526,11 @@ only from stores that leerie alone writes.* So there are two sets:
   temporary directory stay its own: they carry hooks and sessions, a
   cache carries neither. The set goes with the run directory.
 
+Since leerie's installs are confined (*Leerie's runs of the repository's
+commands are confined too*), the kernel holds each store class to its
+access: a fetched store read-only to an install, written by the fetch
+below alone.
+
 Two stores never share a file: each fetches its own copy (measured: 0
 inodes in common after the same lockfile was installed from both). A
 variable pointing beneath the image's bake root (`/opt/`, the *persistent
@@ -4436,8 +4560,11 @@ the store's file from 3,284 to 3,305 bytes. Two measures close it:
   a crafted lockfile whose own `package.json` allow-lists a git-hosted
   dependency and a tarball dependency ran their `prepare` and `postinstall`
   during a plain `pnpm fetch`, and none of them with `--ignore-scripts`. The
-  fetch runs unconfined, since it runs no repository code; its cost on
-  barnacle is 6.8 s cold and 3.1 s warm, on funeralworks 14.7 s cold.
+  fetch is confined like every command leerie runs (*Leerie's runs of the
+  repository's commands are confined too*), with the store-fetch grant:
+  its staging directory and leerie's store, of which it is the one writer;
+  its cost on barnacle is 6.8 s cold and 3.1 s warm, on funeralworks
+  14.7 s cold.
 - *Every install copies from the store* (`_COPY_IMPORT_ENV`, now for every
   tree, a view included): pnpm's `package-import-method=copy` and
   `UV_LINK_MODE=copy`. No file the install or its scripts write shares an
@@ -6454,7 +6581,12 @@ classification and planning, layered top-to-bottom by determinism:
    tree's commit (`_judge_checkout`), removed afterwards with whatever the
    hook made in it; never the user's checkout, which is read-only (§6 *The
    explicit channel*). Step 2's `mise install` and `mise ls` run in the same
-   checkout.
+   checkout. Both are confined (§6 *Leerie's runs of the repository's
+   commands are confined too*): the hook may write its checkout, its own
+   temp and cache, `MISE_DATA_DIR` and `~/.local/bin`; `mise` its
+   checkout, its own temp and cache and `MISE_DATA_DIR`, trusting no
+   configuration. The hook runs once, before any worker that commits: one
+   that would run after one has started stops the run instead.
 
    System packages requiring root (apt-get-installable libraries,
    anything writing to `/usr/*` or `/etc/*`) are out of scope for the

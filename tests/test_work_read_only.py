@@ -375,12 +375,13 @@ def test_the_setup_hook_and_mise_run_outside_the_checkout(
     nothing, and the checkout is gone afterwards."""
     user = _user_repo(tmp_path, {
         "app.py": "x = 1\n",
-        ".leerie-setup.sh": 'pwd > "$OUT"; echo made > hook-made.txt\n'})
+        # The hook records where it ran in the checkout it runs in: it is
+        # confined to it (DESIGN §6 *Leerie's runs of the repository's
+        # commands are confined too*).
+        ".leerie-setup.sh": 'pwd > hook-made.txt\n'})
     state = tmp_path / "state"
     monkeypatch.chdir(user)
     monkeypatch.setenv("LEERIE_STATE_DIR", str(state))
-    out = tmp_path / "hook-cwd"
-    monkeypatch.setenv("OUT", str(out))
     st = _St(user, state)
     st.data["categories"] = ["bug-fixing"]
     asyncio.run(leerie._ensure_planning_worktree(st))
@@ -388,7 +389,9 @@ def test_the_setup_hook_and_mise_run_outside_the_checkout(
 
     async def mise(tree, log_dir, st_, override_file=None):
         seen["mise"] = Path(tree)
-        seen["made"] = (Path(tree) / "hook-made.txt").is_file()
+        made = Path(tree) / "hook-made.txt"
+        seen["made"] = made.is_file()
+        seen["cwd"] = made.read_text().strip() if seen["made"] else ""
 
     class Stop(Exception):
         pass
@@ -399,7 +402,7 @@ def test_the_setup_hook_and_mise_run_outside_the_checkout(
     monkeypatch.setattr(leerie, "_detect_recipe_from_lockfiles", stop)
     with pytest.raises(Stop):
         asyncio.run(leerie.phase_provision(user, st, {}, {}, {}))
-    hook_cwd = Path(out.read_text().strip())
+    hook_cwd = Path(seen["cwd"])
     assert hook_cwd == seen["mise"] and seen["made"]
     assert st.run_dir.resolve() in hook_cwd.resolve().parents
     assert not hook_cwd.exists()

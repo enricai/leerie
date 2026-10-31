@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _run
+from tests.conftest import _run, measured_tmp_files
 from tests.test_oom_naming import env  # noqa: F401  (pytest fixture)
 
 
@@ -154,27 +154,46 @@ def test_a_gate_timeout_escalates_the_rechecks(harness, monkeypatch):
 
 
 def test_a_flaky_failure_passes_as_resource_affected(harness, tmp_path):
-    counter = tmp_path / "count"
+    # The counter is in the command's own temp directory: a confined command
+    # writes nothing outside its tree and its measurement directory (DESIGN
+    # §6 *Leerie's runs of the repository's commands are confined too*).
     res = _settle(harness, _sub(_py(
-        "import sys, pathlib; p = pathlib.Path(sys.argv[1]); "
+        "import os, sys, pathlib; "
+        "p = pathlib.Path(os.environ['TMPDIR']) / 'count'; "
         "n = int(p.read_text()) if p.exists() else 0; "
-        "p.write_text(str(n + 1)); sys.exit(1 if n == 0 else 0)",
-        str(counter))))
+        "p.write_text(str(n + 1)); sys.exit(1 if n == 0 else 0)")))
     assert res["verdict"] == "pass"
     cmd = res["commands"][0]
     assert cmd["passed"] and cmd["resource_affected"]
     assert cmd["attempts"] == 2
 
 
+_TOUCH_IN_TMP = ("import os, pathlib, sys; "
+                 "pathlib.Path(os.environ['TMPDIR'], sys.argv[1]).touch()")
+
+
+def _ran(harness, name: str) -> bool:
+    """Whether a verify command touched `name` in its own temp directory
+    (a confined command writes nothing beside its tree: DESIGN §6 *Leerie's
+    runs of the repository's commands are confined too*)."""
+    return bool(measured_tmp_files(harness["st"].run_dir, name))
+
+
+def test_a_verify_command_that_runs_is_seen_running(harness):
+    """The partner of the two "never ran" tests below: the marker they
+    read is one a verify command that does run leaves."""
+    res = _settle(harness, _sub(_py(_TOUCH_IN_TMP, "did-run")))
+    assert res["verdict"] == "pass"
+    assert _ran(harness, "did-run")
+
+
 def test_stops_at_the_first_failing_command(harness, tmp_path):
-    marker = tmp_path / "second-ran"
     res = _settle(harness, _sub(
         _py("import sys; sys.exit(2)"),
-        _py("import pathlib, sys; pathlib.Path(sys.argv[1]).touch()",
-            str(marker))))
+        _py(_TOUCH_IN_TMP, "second-ran")))
     assert res["verdict"] == "fail"
     assert len(res["commands"]) == 1
-    assert not marker.exists()
+    assert not _ran(harness, "second-ran")
 
 
 def test_a_command_that_rewrites_tracked_files_fails_and_is_reverted(harness):
@@ -191,12 +210,9 @@ def test_a_command_that_rewrites_tracked_files_fails_and_is_reverted(harness):
 def test_never_runs_over_uncommitted_tracked_work(harness, tmp_path):
     readme = harness["worktree"] / "README.md"
     readme.write_text("worker edit\n")
-    marker = tmp_path / "ran"
-    res = _settle(harness, _sub(_py(
-        "import pathlib, sys; pathlib.Path(sys.argv[1]).touch()",
-        str(marker))))
+    res = _settle(harness, _sub(_py(_TOUCH_IN_TMP, "ran")))
     assert res["verdict"] == "none"
-    assert not marker.exists()
+    assert not _ran(harness, "ran")
     assert readme.read_text() == "worker edit\n"  # never reverted
 
 

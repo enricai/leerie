@@ -42,9 +42,6 @@ for a in args:
         covon = True
     elif not a.startswith("-"):
         tests.append(a)
-log = pathlib.Path(os.environ.get("FAKE_VITEST_LOG", "/dev/null"))
-with open(log, "a") as fh:
-    fh.write(json.dumps(tests) + "\n")
 hits = {}
 for f in inc:
     p = pathlib.Path(f)
@@ -161,11 +158,25 @@ def env(leerie, tmp_path, monkeypatch):
     caps = dict(leerie.DEFAULT_CAPS)
     caps["worker_timeout_sec"] = 60
     monkeypatch.setattr(leerie, "_cgroup_create", lambda *a, **k: None)
-    monkeypatch.setenv("FAKE_VITEST_LOG", str(tmp_path / "vitest.log"))
+    # Each vitest run's test files, recorded at leerie's own launch: the
+    # confined runs keep nothing outside their trees, and each view is a
+    # new tree (DESIGN §6 *Leerie's runs of the repository's commands are
+    # confined too*).
+    runs: list[list[str]] = []
+    real = leerie._run_contained
+
+    async def recorded(argv, **kw):
+        if argv and str(argv[0]).endswith("vitest"):
+            args = [str(a) for a in argv[1:]]
+            if args and args[0] == "run":
+                args = args[1:]
+            runs.append([a for a in args if not a.startswith("-")])
+        return await real(argv, **kw)
+    monkeypatch.setattr(leerie, "_run_contained", recorded)
     return {"leerie": leerie, "repo": repo, "run_repo": run_repo,
             "run_dir": run_dir,
             "tree": tree, "st": st, "caps": caps,
-            "base": f"leerie/runs/{run_id}", "log": tmp_path / "vitest.log"}
+            "base": f"leerie/runs/{run_id}", "runs": runs}
 
 
 def _commit(tree: Path, files: dict[str, str], msg="work") -> None:
@@ -182,7 +193,7 @@ def _measure(env):
 
 
 def _runs(env) -> list[list[str]]:
-    return [json.loads(x) for x in env["log"].read_text().splitlines()]
+    return env["runs"]
 
 
 # ---- the detector -----------------------------------------------------------
@@ -374,7 +385,7 @@ def test_settled_record_is_skipped_on_resume(leerie, env):
         raise AssertionError("resume must not re-measure a settled sid")
 
     _redrive(env, settle)
-    assert not env["log"].exists()
+    assert env["runs"] == []
 
 
 # ---- typed gaps ---------------------------------------------------------------

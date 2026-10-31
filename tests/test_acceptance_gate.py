@@ -1415,8 +1415,9 @@ def test_an_unwritable_marker_directory_is_named_as_such(leerie, tmp_path):
     st = _st(leerie, tmp_path, repo, head)
     (repo / "acc").mkdir()
     (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
-    reports = st.run_dir / "acceptance" / "reports"
-    reports.mkdir(parents=True)
+    # The marker's directory is the tree's own measurement directory (DESIGN
+    # §6 *Leerie's runs of the repository's commands are confined too*).
+    reports = leerie._measure_dir(st, repo) / "reports"
     reports.chmod(0o555)
     try:
         got, why = asyncio.run(leerie._acceptance_parse_probe(
@@ -3050,14 +3051,23 @@ def test_a_repair_that_breaks_the_install_is_rolled_back(
     assert gate["residual"]["failing_sets"] == 5
 
 
-def _counted_recipe(st, tmp_path, fail_from: int, fail_to: int):
-    """An install that fails on calls fail_from..fail_to (1-based)."""
-    counter = tmp_path / "install-calls"
-    st.data["provision"] = {"recipe": [{"kind": "install", "command": [
-        "bash", "-c",
-        f'n=$(( $(cat {counter} 2>/dev/null || echo 0) + 1 )); '
-        f'echo $n > {counter}; '
-        f'[ $n -lt {fail_from} ] || [ $n -gt {fail_to} ]']}]}
+def _counted_recipe(leerie, monkeypatch, st, fail_from: int, fail_to: int):
+    """An install that fails on calls fail_from..fail_to (1-based), counted
+    at leerie's own launch: every evaluation installs in a fresh tree, and a
+    confined install keeps nothing across trees (DESIGN §6 *Leerie's runs of
+    the repository's commands are confined too*)."""
+    st.data["provision"] = {"recipe": [{"kind": "install",
+                                        "command": ["true"]}]}
+    real = leerie._run_streaming
+    calls = {"n": 0}
+
+    async def counted(argv, **kw):
+        if (kw.get("label") or "").endswith("-install: true"):
+            calls["n"] += 1
+            if fail_from <= calls["n"] <= fail_to:
+                return 1, "install failed"
+        return await real(argv, **kw)
+    monkeypatch.setattr(leerie, "_run_streaming", counted)
 
 
 def test_a_one_off_install_failure_keeps_a_correct_repair(
@@ -3068,7 +3078,7 @@ def test_a_one_off_install_failure_keeps_a_correct_repair(
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
-    _counted_recipe(st, tmp_path, 2, 2)       # the round-1 evaluation fails
+    _counted_recipe(leerie, monkeypatch, st, 2, 2)       # the round-1 evaluation fails
     _run_gate(leerie, monkeypatch, st, _commit_fix,
               measured=[{"passed": True, "measured": True},
                         {"passed": True, "measured": True}])
@@ -3086,7 +3096,7 @@ def test_a_lasting_environment_failure_keeps_the_repair(
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
-    _counted_recipe(st, tmp_path, 2, 99)      # every later install fails
+    _counted_recipe(leerie, monkeypatch, st, 2, 99)      # every later install fails
     _run_gate(leerie, monkeypatch, st, _commit_fix,
               measured=[{"passed": True, "measured": True},
                         {"passed": True, "measured": True}])
@@ -3246,7 +3256,7 @@ def test_a_one_off_install_failure_mid_loop_keeps_the_next_round(
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
     # Call 2 is staging's committed view (the gate's test IDs); call 3 is
     # round 1's evaluation.
-    _counted_recipe(st, tmp_path, 3, 3)       # round 1's evaluation fails
+    _counted_recipe(leerie, monkeypatch, st, 3, 3)       # round 1's evaluation fails
     calls = _run_gate(leerie, monkeypatch, st, lambda _p: None,
                       measured=[{"passed": True, "measured": True}])
     gate = st.data["acceptance"]["gate"]
@@ -3263,7 +3273,7 @@ def test_a_commit_already_retried_in_the_loop_is_not_retried_again(
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
-    _counted_recipe(st, tmp_path, 2, 99)      # every later install fails
+    _counted_recipe(leerie, monkeypatch, st, 2, 99)      # every later install fails
     labels = []
     real = leerie._evaluate_acceptance_sets_inner
 

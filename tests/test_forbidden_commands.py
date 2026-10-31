@@ -25,7 +25,7 @@ import sys
 import types
 
 import pytest
-from tests.conftest import fake_run_dir
+from tests.conftest import fake_run_dir, measure_run_dir
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 FORBID = ["pnpm run test"]
@@ -541,7 +541,8 @@ def test_measure_axes_does_not_run_a_forbidden_command(leerie, tmp_path,
     monkeypatch.setattr(leerie, "_measure_blt", fake_measure_blt)
     monkeypatch.setattr(leerie, "_ensure_worktree_deps", no_deps)
     st = types.SimpleNamespace(data={**_pc("pnpm test", "pnpm run lint")},
-                               save=lambda: None, run_id="r1")
+                               save=lambda: None, run_id="r1",
+                               run_dir=measure_run_dir(tmp_path, beside=True))
     res = asyncio.run(leerie._measure_axes(
         str(tmp_path), {"build": "pnpm run build",
                         "lint": "timeout 600 pnpm run lint",
@@ -1066,7 +1067,10 @@ def _measure_st(leerie, root, base, data=None):
               "conformance": {"_baseline": {"sha": base}} if base else {},
               **(data or {})},
         save=lambda: saved.append(1), run_id="r1", repo_root=root,
-        run_dir=root / ".run")
+        # Beside the tree, never in it: a measured tree holding the run
+        # directory is refused (DESIGN §6 *Leerie's runs of the repository's
+        # commands are confined too*).
+        run_dir=measure_run_dir(root, beside=True))
     return st
 
 

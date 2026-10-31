@@ -41,7 +41,7 @@ def test_command_cannot_run_before_it_is_enrolled(leerie, tmp_path,
     monkeypatch.setattr(leerie, "_cgroup_enroll", _enroll)
 
     rc, _tail = _run(leerie._run_streaming(
-        _writer(marker), cwd=str(tmp_path), verbosity="quiet",
+        _writer(marker), grants=leerie.WorkerGrants(("/",), ()), cwd=str(tmp_path), verbosity="quiet",
         cgroup_sid="run-cmd"))
 
     assert rc == 0
@@ -62,7 +62,7 @@ def test_exec_keeps_the_enrolled_pid(leerie, tmp_path, monkeypatch):
     rc, _ = _run(leerie._run_streaming(
         [sys.executable, "-c",
          "import os, pathlib, sys; "
-         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))", str(out)],
+         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))", str(out)], grants=leerie.WorkerGrants(("/",), ()),
         cwd=str(tmp_path), verbosity="quiet", cgroup_sid="run-cmd"))
     assert rc == 0
     assert pids == [int(out.read_text())]
@@ -80,7 +80,7 @@ def test_a_cancelled_release_never_runs_the_command(leerie, tmp_path,
 
     raised = False
     try:
-        _run(leerie._run_streaming(_writer(marker), cwd=str(tmp_path),
+        _run(leerie._run_streaming(_writer(marker), grants=leerie.WorkerGrants(("/",), ()), cwd=str(tmp_path),
                                    verbosity="quiet", cgroup_sid="run-cmd"))
     except KeyboardInterrupt:
         raised = True
@@ -116,7 +116,7 @@ def test_without_a_cgroup_nothing_is_gated(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_cgroup_enroll",
                         lambda *a: calls.append(a) or None)
     marker = tmp_path / "marker"
-    rc, _ = _run(leerie._run_streaming(_writer(marker), cwd=str(tmp_path),
+    rc, _ = _run(leerie._run_streaming(_writer(marker), grants=leerie.WorkerGrants(("/",), ()), cwd=str(tmp_path),
                                        verbosity="quiet"))
     assert rc == 0 and marker.exists() and calls == []
 
@@ -294,7 +294,7 @@ def test_run_contained_measures_and_destroys(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_cgroup_destroy",
                         lambda sid: calls.append(("destroy", sid)))
     out = _run(leerie._run_contained(
-        [sys.executable, "-c", "import time; time.sleep(1.3)"],
+        [sys.executable, "-c", "import time; time.sleep(1.3)"], grants=leerie.WorkerGrants(("/",), ()),
         cwd=str(tmp_path), name="measure-build", run_id="abcdef123456zz",
         memory_max_bytes=0, pids_max=0, timeout=30,
         log_path=tmp_path / "log", label="m", measure=True))
@@ -311,7 +311,7 @@ def test_run_contained_reports_cgroup_kills(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_cgroup_stat", lambda sid: (0, 64, 5, 1))
     monkeypatch.setattr(leerie, "_cgroup_destroy", lambda sid: None)
     out = _run(leerie._run_contained(
-        [sys.executable, "-c", "import sys; sys.exit(137)"],
+        [sys.executable, "-c", "import sys; sys.exit(137)"], grants=leerie.WorkerGrants(("/",), ()),
         cwd=str(tmp_path), name="exec-t1-1", run_id=None,
         memory_max_bytes=1 << 30, pids_max=64, timeout=30,
         log_path=tmp_path / "log", label="x"))
@@ -327,7 +327,7 @@ def test_run_contained_runs_uncontained_when_containment_is_off(
     monkeypatch.setattr(leerie, "_cgroup_enroll",
                         lambda *a: enrolled.append(a) or None)
     out = _run(leerie._run_contained(
-        [sys.executable, "-c", "print('hi')"], cwd=str(tmp_path),
+        [sys.executable, "-c", "print('hi')"], grants=leerie.WorkerGrants(("/",), ()), cwd=str(tmp_path),
         name="exec-t1-1", run_id=None, memory_max_bytes=1, pids_max=1,
         timeout=30, log_path=tmp_path / "log", label="x"))
     assert out["rc"] == 0 and not out["contained"] and enrolled == []

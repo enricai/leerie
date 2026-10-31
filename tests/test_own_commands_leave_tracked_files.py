@@ -18,8 +18,11 @@ import os
 import stat
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
+
+from tests.conftest import measure_run_dir
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_redrive_test_id_diff_refresh import _git  # noqa: E402
@@ -234,8 +237,12 @@ def _tree(tmp_path, files: dict[str, str]):
 
 
 class _St:
-    def __init__(self, recipe):
+    def __init__(self, recipe, base: Path):
         self.data = {"provision": {"recipe": recipe}}
+        # Every repository command is confined to its measurement grant, in
+        # the run directory (DESIGN §6 *Leerie's runs of the repository's
+        # commands are confined too*).
+        self.run_dir = measure_run_dir(base)
 
     def save(self):
         pass
@@ -243,7 +250,8 @@ class _St:
 
 def _deps(leerie, tree, recipe):
     return asyncio.run(leerie._ensure_worktree_deps(
-        str(tree), _St(recipe), {}, log_path=tree.parent / "i.log",
+        str(tree), _St(recipe, tree.parent), {},
+        log_path=tree.parent / "i.log",
         verbosity="quiet"))
 
 
@@ -313,7 +321,7 @@ def test_a_command_that_deletes_or_restores_a_file_is_undone(
 def test_a_measured_build_axis_puts_back_what_it_rewrote(leerie, tmp_path,
                                                          monkeypatch):
     t = _tree(tmp_path, {"tsconfig.json": '{"a": 1}\n'})
-    st = _St([])
+    st = _St([], tmp_path)
     st.data["blt_results"] = {}
     res = asyncio.run(leerie._measure_axes(
         str(t), {"build": "printf '{}\\n' > tsconfig.json"}, st, {},
@@ -508,7 +516,7 @@ def test_i2_an_install_leaves_the_tree_as_found(leerie, tmp_path,
 def test_i2_a_measured_axis_leaves_the_tree_as_found(leerie, tmp_path,
                                                     axis):
     t, before = _family_tree(tmp_path)
-    st = _St([])
+    st = _St([], tmp_path)
     st.data["blt_results"] = {}
     res = asyncio.run(leerie._measure_axes(
         str(t), {axis: BODY}, st, {}, log_path=tmp_path / "m.log",

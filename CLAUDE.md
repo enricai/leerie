@@ -25,9 +25,10 @@ Runtime: containerd + nerdctl. On Linux, native. On macOS, via
 `docs/INSTALL.md` for per-OS install steps.
 
 The kernel must offer Landlock ABI 3 or later (Linux 6.2+): every worker
-runs confined, and preflight stops a run without it rather than run a
-worker unconfined (DESIGN §6 *A worker writes only where it is granted
-(I5)*). The user's checkout is mounted at `/work` read-only (DESIGN §6
+and every repository command leerie runs is confined, and preflight stops a
+run without it rather than run either unconfined (DESIGN §6 *A worker
+writes only where it is granted (I5)*, *Leerie's runs of the repository's
+commands are confined too*). The user's checkout is mounted at `/work` read-only (DESIGN §6
 *The run's own repository*, *The explicit channel*).
 
 Python is provisioned *inside the container* by the image (Python 3
@@ -155,9 +156,15 @@ the rest of the family stay denied.
 
 ## Mandatory requirements
 
-- **Every worker runs confined (I5).** Its processes write only what its
-  grant names (`_worker_grants`, Landlock); no worker runs unconfined.
-  DESIGN §6 *A worker writes only where it is granted (I5)*.
+- **Every worker and every repository command leerie runs is confined
+  (I5).** A worker's processes write only what its grant names
+  (`_worker_grants`, Landlock); a repository command leerie runs — build,
+  lint, tests, install, the held-out sets, CI parity, coverage, `verify`,
+  the setup hook, `mise`, the AST scripts — only its tree and measurement
+  directory (`_measurement_grants`, through `_run_streaming`, whose
+  `grants` has no default). Nothing of either runs unconfined. DESIGN §6
+  *A worker writes only where it is granted (I5)*, *Leerie's runs of the
+  repository's commands are confined too*.
 - **Each run has its own repository, and each committing tree its own
   (I4, I6).** The user's repository is only fetched from, and receives the
   run branch by the host-side bring-back; only leerie moves the run

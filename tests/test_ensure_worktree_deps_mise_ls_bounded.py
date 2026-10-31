@@ -55,7 +55,12 @@ def _stub_mise_install(leerie, monkeypatch):
 
 
 def test_mise_ls_hang_does_not_block_forever(leerie, tmp_path, monkeypatch):
-    (tmp_path / "mise.toml").write_text('[tools]\nnode = "20.11.0"\n')
+    # The checkout beside the state root, not holding it: `mise` is
+    # confined to it (DESIGN §6 *Leerie's runs of the repository's commands
+    # are confined too*).
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mise.toml").write_text('[tools]\nnode = "20.11.0"\n')
     st = _make_state(leerie, tmp_path)
     log_dir = st.run_dir / "logs"
 
@@ -71,7 +76,7 @@ def test_mise_ls_hang_does_not_block_forever(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "log", lambda msg: logged.append(msg))
 
     start = time.monotonic()
-    asyncio.run(leerie._run_mise_install(tmp_path, log_dir, st, None))
+    asyncio.run(leerie._run_mise_install(repo, log_dir, st, None))
     elapsed = time.monotonic() - start
 
     assert elapsed < 5, f"provisioning blocked for {elapsed}s on a hung mise ls"

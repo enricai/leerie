@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _run, relocate_into_run_repo
+from tests.conftest import _run, measured_tmp_files, relocate_into_run_repo
 
 WORKFLOW = """\
 name: ci
@@ -523,17 +523,21 @@ def test_a_db_reset_check_or_prerequisite_never_runs(leerie, env, tmp_path):
     assert recs["push"]["reason"] == "db_reset"
     st = env["st"]
     st.repo_root = repo
-    marker = tmp_path / "RAN"
+    # The marker is in the check's own temp directory: a confined command
+    # writes nothing beside its tree (DESIGN §6 *Leerie's runs of the
+    # repository's commands are confined too*).
+    def ran() -> bool:
+        return bool(measured_tmp_files(st.run_dir, "RAN"))
     out = _run(leerie._ci_run(
-        ["sh", "-c", f"touch {marker}; prisma db push"], tree=repo,
+        ["sh", "-c", 'touch "$TMPDIR/RAN"; prisma db push'], tree=repo,
         rec={"cwd": "."}, st=st, caps=env["caps"], label="t"))
     assert out["skipped"] == "db_reset" and out["rc"] is None
-    assert not marker.exists()
+    assert not ran()
     # An ordinary command in the same repo still runs.
-    out = _run(leerie._ci_run(["touch", str(marker)], tree=repo,
+    out = _run(leerie._ci_run(["sh", "-c", 'touch "$TMPDIR/RAN"'], tree=repo,
                               rec={"cwd": "."}, st=st, caps=env["caps"],
                               label="t2"))
-    assert out["rc"] == 0 and marker.exists()
+    assert out["rc"] == 0 and ran()
 
 
 # ---- B* reruns stay inside confirm_budget_sec -----------------------------

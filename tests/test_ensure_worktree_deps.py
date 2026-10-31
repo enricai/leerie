@@ -18,6 +18,8 @@ import types
 
 import pytest
 
+from tests.conftest import measure_run_dir
+
 
 @pytest.fixture(autouse=True)
 def _clear_deps_memo(leerie):
@@ -29,8 +31,9 @@ def _clear_deps_memo(leerie):
 
 
 @pytest.fixture
-def st():
+def st(tmp_path):
     return types.SimpleNamespace(
+        run_dir=measure_run_dir(tmp_path, beside=True),
         data={"provision": {"recipe": [
             {"kind": "install", "command": ["pnpm", "install"]},
         ]}},
@@ -66,6 +69,14 @@ def test_installs_on_first_call(leerie, st, streaming, tmp_path):
     calls = streaming()
     _go(leerie, tmp_path, st)
     assert [c[0] for c in calls] == [["pnpm", "install"]]
+    # Confined to the tree it installs into, with its temp in the tree's own
+    # measurement directory (DESIGN §6 *Leerie's runs of the repository's
+    # commands are confined too*).
+    g = calls[0][1]["grants"]
+    assert str(tmp_path.resolve()) in g.rw
+    own = leerie._measure_dir(st, tmp_path)
+    assert str(own) in g.rw
+    assert dict(g.env)["TMPDIR"] == str(own / "tmp")
 
 
 def test_second_call_on_the_same_tree_installs_nothing(leerie, st, streaming,
@@ -109,14 +120,16 @@ def test_only_install_and_build_kinds_run(leerie, streaming, tmp_path):
         {"kind": "build", "command": ["pnpm", "build"]},
         {"kind": "verify", "command": ["pnpm", "test"]},
         {"kind": "install"},                       # no command
-    ]}}, save=lambda: None)
+    ]}}, save=lambda: None,
+        run_dir=measure_run_dir(tmp_path, beside=True))
     _go(leerie, tmp_path, st)
     assert [c[0] for c in calls] == [["pnpm", "install"], ["pnpm", "build"]]
 
 
 def test_empty_or_absent_recipe_is_a_no_op(leerie, streaming, tmp_path):
     calls = streaming()
-    _go(leerie, tmp_path, types.SimpleNamespace(data={}, save=lambda: None))
+    _go(leerie, tmp_path, types.SimpleNamespace(data={}, save=lambda: None,
+        run_dir=measure_run_dir(tmp_path, beside=True)))
     assert calls == []
 
 
@@ -124,7 +137,8 @@ def test_working_dir_is_resolved_under_the_tree(leerie, streaming, tmp_path):
     calls = streaming()
     st = types.SimpleNamespace(data={"provision": {"recipe": [
         {"kind": "install", "command": ["pnpm", "i"], "working_dir": "web"},
-    ]}}, save=lambda: None)
+    ]}}, save=lambda: None,
+        run_dir=measure_run_dir(tmp_path, beside=True))
     _go(leerie, tmp_path, st)
     assert calls[0][1]["cwd"] == str(tmp_path / "web")
 
@@ -137,7 +151,8 @@ def test_entry_env_layers_over_the_process_env(leerie, streaming, tmp_path):
     st = types.SimpleNamespace(data={"provision": {"recipe": [
         {"kind": "install", "command": ["pnpm", "i"],
          "env": {"UV_THREADPOOL_SIZE": "4"}},
-    ]}}, save=lambda: None)
+    ]}}, save=lambda: None,
+        run_dir=measure_run_dir(tmp_path, beside=True))
     _go(leerie, tmp_path, st)
     env = calls[0][1]["env"]
     assert env["UV_THREADPOOL_SIZE"] == "4"

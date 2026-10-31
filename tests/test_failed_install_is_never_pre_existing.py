@@ -54,8 +54,7 @@ def _setup(leerie, tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     tool = bindir / "fakeinst"
-    calls = tmp_path / "install-calls"
-    tool.write_text(f"#!/bin/sh\necho x >> '{calls}'\n"
+    tool.write_text("#!/bin/sh\n"
                     f"[ -e '{flag}' ] && exit 1\n"
                     "mkdir -p deps && touch deps/ok\n")
     tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
@@ -63,7 +62,28 @@ def _setup(leerie, tmp_path, monkeypatch):
     run["st"].data["provision"] = {"recipe": [
         {"kind": "install", "command": ["fakeinst"]}]}
     run["st"].save()
+    run["installs"] = _count_installs(leerie, monkeypatch)
     return run, flag
+
+
+def _count_installs(leerie, monkeypatch, *, fail_first: bool = False
+                    ) -> dict:
+    """Count the recipe's install launches at leerie's own launch: the
+    installs run in different trees, and a confined install keeps nothing
+    across trees (DESIGN §6 *Leerie's runs of the repository's commands are
+    confined too*). `fail_first`: the first one fails without running (a
+    registry 503)."""
+    real = leerie._run_streaming
+    n = {"calls": 0}
+
+    async def counted(argv, **kw):
+        if "-install: " in (kw.get("label") or ""):
+            n["calls"] += 1
+            if fail_first and n["calls"] == 1:
+                return 1, "503 from the registry"
+        return await real(argv, **kw)
+    monkeypatch.setattr(leerie, "_run_streaming", counted)
+    return n
 
 
 def test_a_regression_behind_a_failed_install_is_not_done(
@@ -155,9 +175,8 @@ def test_a_baseline_measured_without_its_deps_has_no_failing_ids(
     assert not st.data.get("blt_results")
 
 
-def _installs(tmp_path) -> int:
-    p = tmp_path / "install-calls"
-    return len(p.read_text().splitlines()) if p.exists() else 0
+def _installs(run) -> int:
+    return run["installs"]["calls"]
 
 
 def test_a_memo_hit_on_a_failed_install_installs_again_bounded(
@@ -174,15 +193,15 @@ def test_a_memo_hit_on_a_failed_install_installs_again_bounded(
         str(run["repo"]), run["st"], run["caps"],
         log_path=tmp_path / "i.log", verbosity="quiet"))
     flag.write_text("")
-    assert go() is False and _installs(tmp_path) == 1
+    assert go() is False and _installs(run) == 1
     flag.unlink()
-    assert go() is True and _installs(tmp_path) == 2    # retried, cleared
-    assert go() is True and _installs(tmp_path) == 2    # a memo hit
+    assert go() is True and _installs(run) == 2    # retried, cleared
+    assert go() is True and _installs(run) == 2    # a memo hit
     # Down for good: the first install and two retries, then the memo.
     leerie._DEPS_INSTALLED.discard(os.path.realpath(run["repo"]))
     flag.write_text("")
     got = [go() for _ in range(5)]
-    assert got == [False] * 5 and _installs(tmp_path) == 2 + 3
+    assert got == [False] * 5 and _installs(run) == 2 + 3
 
 
 def test_a_flaky_first_install_does_not_unmeasure_a_clean_run(
@@ -194,19 +213,16 @@ def test_a_flaky_first_install_does_not_unmeasure_a_clean_run(
     `done` with an empty section."""
     run = _repo(leerie, tmp_path, monkeypatch, ignore="__pycache__/\n")
     st = run["st"]
-    flag = tmp_path / "registry-was-down-once"
-    calls = tmp_path / "calls"
-    sh = (f"echo x >> {calls}; if [ -f {flag} ]; then exit 0; fi; "
-          f"touch {flag}; exit 1")
     st.data["provision"] = {"recipe": [
-        {"kind": "install", "command": ["sh", "-c", sh]}]}
+        {"kind": "install", "command": ["true"]}]}
     st.save()
+    installs = _count_installs(leerie, monkeypatch, fail_first=True)
     _quiet_conformer(leerie, monkeypatch)
     asyncio.run(leerie._run_final_conformance(
         run["run_dir"], st, run["caps"], {"conformer": "sonnet"},
         {"conformer": "low"}))
     _phase5(leerie, run)
-    assert len(calls.read_text().splitlines()) == 2
+    assert installs["calls"] == 2
     assert not st.data["test_id_diff"].get("ids_unknown")
     assert leerie._decide_outcome(st, any_commits=True) == "done"
     assert leerie._format_pr_end_state_section(st.data) == ""
@@ -257,11 +273,11 @@ def test_baseline_retries_are_bounded_per_process(leerie, tmp_path,
     st = run["st"]
     flag.write_text("")
     _failed_baseline(leerie, run, tmp_path)
-    n0 = _installs(tmp_path)
+    n0 = _installs(run)
     for _ in range(4):
         asyncio.run(leerie._retry_failed_baseline(
             st, run["caps"], log_path=tmp_path / "b.log"))
-    assert _installs(tmp_path) - n0 == 2
+    assert _installs(run) - n0 == 2
     # A resume is a new process: it tries again.
     monkeypatch.setattr(leerie, "_BASELINE_RETRIES", {})
     flag.unlink()

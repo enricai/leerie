@@ -11,7 +11,7 @@ import asyncio
 import subprocess
 from pathlib import Path
 
-from tests.conftest import relocate_into_run_repo
+from tests.conftest import measured_tmp_files, relocate_into_run_repo
 
 PYTEST = "python3 -m pytest -q -p no:cacheprovider"
 
@@ -73,14 +73,16 @@ def test_a_real_regression_is_confirmed(leerie, tmp_path):
 
 
 def test_a_flaky_failure_is_not_confirmed(leerie, tmp_path):
-    """Fails on its first run only (a counter outside the tree): the red run
-    is real, but B* reruns pass, so the repair is kept."""
+    """Fails on its first run only (a counter outside the tree, in the run's
+    own temp directory: a confined run writes nothing beside its tree,
+    DESIGN §6 *Leerie's runs of the repository's commands are confined
+    too*): the red run is real, but B* reruns pass, so the repair is
+    kept."""
     repo = _repo(tmp_path)
     pre = _git(repo, "rev-parse", "HEAD")
-    counter = tmp_path / "runs.txt"
     (repo / "test_flaky.py").write_text(
-        "import pathlib\n\n\ndef test_flaky():\n"
-        f"    p = pathlib.Path({str(counter)!r})\n"
+        "import os, pathlib\n\n\ndef test_flaky():\n"
+        "    p = pathlib.Path(os.environ['TMPDIR'], 'runs.txt')\n"
         "    n = int(p.read_text()) if p.exists() else 0\n"
         "    p.write_text(str(n + 1))\n"
         "    assert n > 0\n")
@@ -88,7 +90,9 @@ def test_a_flaky_failure_is_not_confirmed(leerie, tmp_path):
     _git(repo, "commit", "-qm", "repair adds a test")
     st = _st(leerie, tmp_path, repo)
     reason, rec = _confirm(leerie, st, repo, pre)
-    assert int(counter.read_text()) >= 2      # it did fail, then reran
+    runs = sum(int(f.read_text())
+               for f in measured_tmp_files(st.run_dir, "runs.txt"))
+    assert runs >= 2      # it did fail, then reran
     assert reason == ""
     assert rec["new"] == []
 

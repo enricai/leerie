@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import relocate_into_run_repo
+from tests.conftest import measured_tmp_files, relocate_into_run_repo
 from tests.conftest import run_git_cwd_first_stdout as _git
 
 REL = "acc/test_defect_1.py"
@@ -41,12 +41,28 @@ def _base_for(pattern: str) -> int:
     raise AssertionError(pattern)
 
 
-def _flaky(marker: Path, base: int, raise_with: str = "") -> str:
+class _Counter:
+    """A run counter the flaky test keeps in its own temp directory: a
+    confined run writes nothing beside its tree (DESIGN §6 *Leerie's runs of
+    the repository's commands are confined too*). Read back from the run's
+    measurement directories."""
+    def __init__(self, run_dir: Path, name: str):
+        self.run_dir, self.name = run_dir, name
+
+    def with_suffix(self, suffix: str) -> "_Counter":
+        return _Counter(self.run_dir, self.name + suffix)
+
+    def read_text(self) -> str:
+        (f,) = measured_tmp_files(self.run_dir, self.name)
+        return f.read_text()
+
+
+def _flaky(marker: _Counter, base: int, raise_with: str = "") -> str:
     fail = (f"raise RuntimeError({raise_with!r})" if raise_with else
             "assert False, 'sample BqHxC4-H-k2MnOl_yriqMPDl has only - or _'")
-    return ("import pathlib, random\n\n"
+    return ("import os, pathlib, random\n\n"
             "def test_every_sample_has_a_conventional_special():\n"
-            f"    m = pathlib.Path({str(marker)!r})\n"
+            f"    m = pathlib.Path(os.environ['TMPDIR'], {marker.name!r})\n"
             "    n = int(m.read_text()) if m.exists() else 0\n"
             "    m.write_text(str(n + 1))\n"
             f"    if random.Random({base} + n).random() < 0.5:\n"
@@ -161,7 +177,7 @@ def test_the_replay_shape_is_a_failure_not_unmeasured(leerie, tmp_path,
     run is `unconverged`."""
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     base = _base_for("FFPP")
     s_, cid = _set(leerie, st, repo, marker, base)
     res = _evaluate(leerie, st, repo, [s_], _caps(leerie))
@@ -183,7 +199,7 @@ def test_a_first_run_that_passes_is_found_by_discovery(leerie, tmp_path,
     reruns find the first assertion failure and stop there."""
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     s_, cid = _set(leerie, st, repo, marker, _base_for(pattern))
     res = _evaluate(leerie, st, repo, [s_], _caps(leerie))
     assert res["failing_files"] == [REL] and res["passed"] is False
@@ -200,7 +216,7 @@ def test_a_seeded_random_half_failing_case_never_passes(leerie, tmp_path,
                                                         seed_pattern):
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     s_, _cid = _set(leerie, st, repo, marker, _base_for(seed_pattern))
     res = _evaluate(leerie, st, repo, [s_], _caps(leerie))
     assert res["passed"] is False and res["unmeasured"] is False
@@ -210,7 +226,7 @@ def test_a_seeded_random_half_failing_case_never_passes(leerie, tmp_path,
 def test_discovery_is_capped_at_ten(leerie, tmp_path):
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     s_, _cid = _set(leerie, st, repo, marker, _base_for("P" * 11))
     res = _evaluate(leerie, st, repo, [s_],
                     _caps(leerie, acceptance_intermittent_repeats=50))
@@ -232,7 +248,7 @@ def test_discovery_off_keeps_a_passing_first_run(leerie, tmp_path, capsys):
     round 5 L4)."""
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     s_, _cid = _set(leerie, st, repo, marker, _base_for("PF"))
     res = _evaluate(leerie, st, repo, [s_],
                     _caps(leerie, acceptance_intermittent_repeats=0))
@@ -286,7 +302,7 @@ def test_starved_discovery_is_recorded_and_reaches_the_pr(leerie, tmp_path,
     complete here would be false."""
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     s_, _cid = _set(leerie, st, repo, marker, _base_for("PF"))
     res = _evaluate(leerie, st, repo, [s_],
                     _caps(leerie, confirm_budget_sec=0))
@@ -315,7 +331,7 @@ def test_a_held_case_failing_only_on_timeouts_is_intermittent(leerie,
     failing set typed intermittent, never unmeasured, and a typed residual."""
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     s_, cid = _set(leerie, st, repo, marker, _base_for("FFPP"),
                    raise_with="Test timed out in 5000ms")
     res = _evaluate(leerie, st, repo, [s_],
@@ -333,7 +349,7 @@ def test_a_held_case_failing_on_every_timeout_rerun_is_confirmed(leerie,
                                                                  tmp_path):
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     s_, _cid = _set(leerie, st, repo, marker, _base_for("FFFF"),
                     raise_with="Test timed out in 5000ms")
     res = _evaluate(leerie, st, repo, [s_], _caps(leerie))
@@ -346,7 +362,7 @@ def test_a_variant_case_keeps_the_symmetric_vote(leerie, tmp_path):
     old vote stands — fails once, passes the reruns, no evidence."""
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     s_, _cid = _set(leerie, st, repo, marker, _base_for("FPPP"),
                     bounded=False)
     res = _evaluate(leerie, st, repo, [s_], _caps(leerie))
@@ -359,7 +375,7 @@ def test_unconfirmed_measurement_runs_no_vote_and_no_discovery(leerie,
                                                                tmp_path):
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
-    marker = tmp_path / "runs"
+    marker = _Counter(st.run_dir, "runs")
     s_, _cid = _set(leerie, st, repo, marker, _base_for("PF"))
     (res,) = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie), str(repo), [s_], "report-base", confirm=False))

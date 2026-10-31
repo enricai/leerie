@@ -337,6 +337,27 @@ def _no_iam_propagation_wait(monkeypatch):
     monkeypatch.setenv("LEERIE_EC2_IAM_PROPAGATION_S", "0")
 
 
+def measure_run_dir(tmp_path: Path, *, beside: bool = False) -> Path:
+    """A run directory for a test double of the state whose repository
+    commands leerie runs. Every such command is confined to its measurement
+    grant (DESIGN §6 *Leerie's runs of the repository's commands are
+    confined too*), which lives in the run directory; its state root,
+    `<tmp_path>/state`, holds nothing else, so the test's own files beside
+    it (a tree, a fake binary) stay readable and the tree stays outside.
+    `beside`: for a test whose tree is `tmp_path` itself, the run directory
+    goes beside it rather than inside it."""
+    base = (tmp_path.parent / f"{tmp_path.name}-run") if beside else tmp_path
+    d = base / "state" / "runs" / "r1"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def measured_tmp_files(run_dir: Path, name: str) -> list[Path]:
+    """Every `<measurement dir>/tmp/<name>`: where a confined command's
+    `$TMPDIR` put a file a test reads back (a run counter, a marker)."""
+    return sorted((Path(run_dir) / "measure").glob(f"*/tmp/{name}"))
+
+
 _FAKE_RUN_DIR: Path | None = None
 
 
