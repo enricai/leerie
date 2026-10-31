@@ -3299,9 +3299,9 @@ run deaths across 4 chains. Four rules close it:
 - **Run-id-prefixed worktree names.** git names a worktree's admin entry
   after the directory's basename, so every run's `bugfix-001` competed for
   one admin name; subtask and planning worktrees are now
-  `worktrees/<run-id[:12]>-<sid>`. A run started before the change has its
-  subtask worktree moved (`git worktree move`, uncommitted work included) on
-  resume, since its branch is checked out at the old path.
+  `worktrees/<run-id[:12]>-<sid>`. A run started before the change
+  predates per-run repositories too, and its resume is refused (§6 *The
+  run's own repository*), so no worktree is ever moved from the old path.
 - **The orchestrator's own helper worktrees follow the same two rules.**
   `confirm-base`, `acceptance-eval`, `redrive-base`, the CI and
   integration trees and the writer/falsifier checkouts' worktree fallback
@@ -4475,13 +4475,16 @@ behind the 51 GB, and the mid-run prune bounds coexistence to one wave's
 worth of trees.
 
 **The pnpm store shares the worktrees' mount.** Every package store lives
-in the state mount, beside the worktrees, so installs hard-link instead of
-copying (a hard link cannot cross mounts). There are two sets, both set by
-the orchestrator through environment variables, with no mount or `-e` of
-their own (*The stores a view installs from are leerie's*, below):
-leerie's own, `<state-root>/.stores/leerie/<name>`, kept across runs; and
-each run's workers', `<run-dir>/workers/cache/<name>`, which goes with the
-run. The state root is `/leerie-state` locally and `/work/.leerie` on Fly.
+in the state mount, beside the worktrees, so a worker's install can
+hard-link from its run's cache (a hard link cannot cross mounts); leerie's
+own installs copy from leerie's store instead (*A view's install never
+writes leerie's store*, below). There are three sets, all set by the
+orchestrator through environment variables, with no mount or `-e` of their
+own (*The stores a view installs from are leerie's*, *Which stores an
+install may share*, below): leerie's own, `<state-root>/.stores/leerie/
+<name>`, kept across runs; each run's workers', `<run-dir>/workers/cache/
+<name>`, which goes with the run; and each run tree's own,
+`<run-dir>/tree-stores/<tree>/<name>`. The state root is `/leerie-state` locally and `/work/.leerie` on Fly.
 The host cache mounts that used to hold them (pnpm, pip, Go, Cargo,
 corepack) are gone. Copying was not only a disk cost: concurrent installs
 copying whole trees ran past their timeouts, and three chains lost work to
@@ -4503,7 +4506,7 @@ and the next install anywhere links the edit. pnpm's own check does not see
 it when the size is kept and the mtime put back: measured with pnpm 10.4.1
 on barnacle, such an edit in one checkout's `node_modules` was in a fresh
 install of another. The invariant: *a committed view's environment comes
-only from stores that leerie alone writes.* So there are two sets:
+only from stores that leerie alone writes.* So there are three sets:
 
 - *Leerie's*, `<state-root>/.stores/leerie/<name>`, set on the
   orchestrator's own environment before anything installs
@@ -4525,6 +4528,9 @@ only from stores that leerie alone writes.* So there are two sets:
   pnpm 23 MB, Prisma's engines 22 MB). A worker's configuration and
   temporary directory stay its own: they carry hooks and sessions, a
   cache carries neither. The set goes with the run directory.
+- *Each run tree's own*, `<run-dir>/tree-stores/<tree>/<name>`
+  (`_tree_store_env`): the stores of the managers no other tree may share
+  (*Which stores an install may share*, below).
 
 Since leerie's installs are confined (*Leerie's runs of the repository's
 commands are confined too*), the kernel holds each store class to its
@@ -4577,7 +4583,8 @@ the store's file from 3,284 to 3,305 bytes. Two measures close it:
   view hard-link is gone.
 
 The install still runs the repository's scripts, as it must to measure
-them; the worker's write boundary confines it, and with the store already
+them; the measurement grant confines it (*Leerie's runs of the
+repository's commands are confined too*), and with the store already
 filled it can run against a store it may only read (measured: a
 Landlock-confined `pnpm install` with the store read-only succeeds,
 barnacle 13–15 s, funeralworks 29–43 s with `prisma generate`). Copying is
@@ -4642,9 +4649,10 @@ in exactly one):
   project build fails on a read-only cache). Nothing one tree's code leaves
   there reaches another tree or a later commit.
 
-The worker's write boundary needs, for a confined install: the fetched
+The measurement grant gives a confined install exactly this: the fetched
 stores read-only, the verified ones writable, and its own tree's
-`tree-stores` writable.
+`tree-stores` writable (*Leerie's runs of the repository's commands are
+confined too*).
 
 What this does not cover: a worker writing leerie's store, a view, `/opt`
 or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside
@@ -8679,11 +8687,11 @@ clean, or the run stopped — is gone; each reader stamps the branch's tree
 (`_view_tree_sha`: the run branch's tree, for staging), which is what
 its view measured. I1 still
 holds every worker to a clean tree: it is what keeps uncommitted work out
-of the commits that ship and out of the next worker's way. What stays
-outside: a view lies under the run directory, which a worker's shell can
-reach as it can reach staging (the same-user boundary `Edit` denials and
-`_assert_repo_unchanged` already bound); nothing names a view to a
-worker, and each tip gets a fresh one.
+of the commits that ship and out of the next worker's way. No worker
+reaches a view: it lies under the run directory, of which a worker's
+processes may read and write only their own grant, and no grant names a
+view (§6 *A worker writes only where it is granted (I5)*); nothing names a
+view to a worker either.
 
 Staging is restored at every resume all the same: an interrupted run's
 cleanup removes it, but a SIGKILL (Fly's `machine stop`, an OOM kill of

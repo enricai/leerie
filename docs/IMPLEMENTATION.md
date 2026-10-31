@@ -635,7 +635,7 @@ The launcher passes the following mounts to `nerdctl run`:
 The four host-auth mounts (`~/.config/gh`, `~/.git-credentials`, `~/.ssh`, `$SSH_AUTH_SOCK`) that earlier leerie versions bind-mounted **no longer exist** — finalize moved to the host (DESIGN §6 *Finalization*), so `git push`/`gh pr create` run with the host's own auth state.
 
 | `~/.cache/leerie/mise-data` | `/home/leerie/.local/share/mise` | rw | Mise's `MISE_DATA_DIR` (per-repo runtime installs, plugins, cache). Lives in the user dir so the resolver checks it first then falls through to the image-baked `MISE_SYSTEM_DATA_DIR=/usr/local/share/mise` for the LTS fallback (DESIGN §6½). Its `shims` subdir is on the image's `ENV PATH` (see §0.5 "Image build") so a worker's own ad-hoc Bash commands can reach a repo-pinned runtime (e.g. Ruby via `.ruby-version`) without an explicit `mise exec --`. |
-| (state mount) `$LEERIE_STATE_HOST_DIR/.stores/leerie/<name>`, `$LEERIE_STATE_HOST_DIR/runs/<run-id>/workers/cache/` | `/leerie-state/.stores/leerie/<name>`, `/leerie-state/runs/<run-id>/workers/cache/` | rw | Package stores and caches, **inside the state mount** next to the worktrees, so pnpm hard-links instead of copying (a hard link cannot cross mounts; DESIGN §6 *The pnpm store shares the worktrees' mount*). No mount and no `-e` of their own: the orchestrator sets them (`_leerie_stores`, `_worker_cache_env`; DESIGN §6 *The stores a view installs from are leerie's*), the same on Fly (state root `/work/.leerie`). Leerie's are kept across runs; a run's worker caches go with its run directory. The former `~/.cache/leerie/{pip,go-mod,cargo,corepack}` mounts, their `PIP_CACHE_DIR`/`GOMODCACHE`/`CARGO_HOME`/`COREPACK_HOME` `-e`s, the `npm_config_store_dir=/leerie-state/.pnpm-store` `-e` and Fly's `child_env["npm_config_store_dir"]` are gone: every worker of every earlier run wrote them. `COREPACK_HOME` is set explicitly on both sides, so corepack never falls back to `XDG_CACHE_HOME=/tmp/.cache` (the rootless mkdir failure the old mount fixed). |
+| (state mount) `$LEERIE_STATE_HOST_DIR/.stores/leerie/<name>`, `$LEERIE_STATE_HOST_DIR/runs/<run-id>/workers/cache/` | `/leerie-state/.stores/leerie/<name>`, `/leerie-state/runs/<run-id>/workers/cache/` | rw | Package stores and caches, **inside the state mount** next to the worktrees, so a worker's install can hard-link from its run's cache (a hard link cannot cross mounts); leerie's own installs copy from its store (`_COPY_IMPORT_ENV`; DESIGN §6 *The pnpm store shares the worktrees' mount*, *A view's install never writes leerie's store*). No mount and no `-e` of their own: the orchestrator sets them (`_leerie_stores`, `_worker_cache_env`; DESIGN §6 *The stores a view installs from are leerie's*), the same on Fly (state root `/work/.leerie`). Leerie's are kept across runs; a run's worker caches go with its run directory. The former `~/.cache/leerie/{pip,go-mod,cargo,corepack}` mounts, their `PIP_CACHE_DIR`/`GOMODCACHE`/`CARGO_HOME`/`COREPACK_HOME` `-e`s, the `npm_config_store_dir=/leerie-state/.pnpm-store` `-e` and Fly's `child_env["npm_config_store_dir"]` are gone: every worker of every earlier run wrote them. `COREPACK_HOME` is set explicitly on both sides, so corepack never falls back to `XDG_CACHE_HOME=/tmp/.cache` (the rootless mkdir failure the old mount fixed). |
 | `~/.cache/leerie/bundle` | `/home/leerie/.cache/leerie/bundle` | rw | `BUNDLE_PATH` for Bundler (Ruby gems). `BUNDLE_CACHE_ALL=1` instructs Bundler to cache all gems (including git-sourced ones) so each `bundle install` reuses downloaded gems across worktrees and runs. |
 | `~/.leerie/.host` (or `$LEERIE_HOST_DIR`, §2½) | `/leerie-host` | rw | Host-wide directory shared by every run on the host, whatever the repo; the launcher creates it with the cache dirs and passes `-e LEERIE_HOST_DIR=/leerie-host` after the `LEERIE_*` forward, so a host variable of that name cannot repoint it. Holds `build-slots/slot-<i>`, the lock files of the host build semaphore (DESIGN §6 *A host-wide build semaphore*; `_build_class_slot`). Ownership: rootless sees the host user's directory as its own (outer UID 0 → inner leerie); rootful's entry guard `chown`s the directory (not `-R`) to leerie; slot files are opened read-only, so one another identity created still locks. No such mount on Fly/EC2: `_build_sem_dir` falls back to `<state-root>/.host/build-slots`, host-wide there. Pinned by `tests/test_host_dir_ownership.py`. |
 | Each `--inspect-dir` path (translated) | `/inspect/<basename>` | ro | See below. |
@@ -3880,12 +3880,13 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `_measurement_grants(st, tree, kind=MEASURE_KIND) -> WorkerGrants`,
   kinds `MEASURE_KIND = "measure"`, `SETUP_HOOK_KIND = "setup_hook"`,
   `TOOLCHAIN_KIND = "toolchain"`, `STORE_FETCH_KIND = "store_fetch"`
-  (`_populate_leerie_store`'s fetch: also `rw` `<state-root>/.stores/leerie`,
-  and its `env` drops every `_STORE_VARS` and `pnpm_config_*` key, so the
-  store variables stay leerie's). `die()`s when `st` has no `run_dir`, or
+  (`_populate_leerie_store`'s fetch: also `rw` `<state-root>/.stores/leerie`;
+  its store variables are leerie's, as every kind's are: no grant's `env`
+  holds one). `die()`s when `st` has no `run_dir`, or
   when the tree holds or lies beneath one of `_MEASURE_PRIVATE`
-  (`state.json`, `acceptance`, `logs`, `workers`, `repo-settings`,
-  `tree-repos`, `repo`, `measure` under the run directory). A tree beneath
+  (`state.json`, `acceptance`, `logs`, `workers`, `tree-stores`,
+  `repo-settings`, `tree-repos`, `repo`, `measure` under the run
+  directory). A tree beneath
   `<run>/worktrees/` is taken at its git toplevel. `rw`:
   `_WORKER_DEVICES`, the tree, `_measure_dir(st, tree)`; setup-hook kind
   adds `MISE_DATA_DIR` (default `~/.local/share/mise`) and `~/.local/bin`
@@ -3949,13 +3950,18 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   spawning the first worker whose `schema_key` is in
   `_COMMITTING_WORKERS`; `_run_setup_hook` `die()`s, without running the
   hook, when it is set and `provision.sh_hook_ran` is not.
-- Tests: `tests/test_measurement_confinement.py` (a real confined
-  measurement whose committed test tries the round-18 proofs — reading
-  `acceptance/` and a held-back set, writing the worker cache, moving the
-  run branch, rewriting `state.json` — each refused while the legitimate
-  test passes; the grant table; the measurement directory's lifetime; the
-  hook's premise; derived: every repository-command spawn confined; a
-  confined worker's `mise` reading the run's overrides).
+- Tests: `tests/test_measurement_confinement.py` (a real child confined
+  with `_measurement_grants`, probed by shell lines: it writes its view and
+  measurement directory, reads its tree, `git status` and leerie's store,
+  and is refused `acceptance/`, `state.json`, the worker cache, leerie's
+  store, the run repository's refs, a tree repository, sibling trees, the
+  user's checkout and another tree's measurement directory; its temp and
+  caches point at its own directory). `tests/test_measurement_grant_lifetime.py`
+  (the measurement directory's lifetime, the kinds, the toolchain's
+  emptied trust records, a tree holding the run directory refused,
+  `committing_worker_started`, a confined worker reading the run's mise
+  overrides). The derived spawn guards are in
+  `tests/test_repo_commands_keep_their_hooks.py`.
 - Tests: `tests/test_worker_confinement.py` (a real confined child per
   worker kind; fail closed in preflight, the shim and `_invoke`; derived
   guards: every `claude -p` argv from `_contained_claude_argv` or the probe,

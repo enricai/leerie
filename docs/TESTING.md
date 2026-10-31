@@ -5923,10 +5923,12 @@ template kept at finalize.
   install from the committed lockfile, build outputs leerie's build.
 - `tests/test_stores_are_leeries.py` (9 tests, DESIGN §6 *The stores a view
   installs from are leerie's*): leerie's commands read only
-  `<state-root>/.stores/leerie/`, a worker only its run's caches, and only
-  a committed view gets links into leerie's store, so an in-place edit of
-  a hard-linked file in a worker's `node_modules` never reaches a view.
-  Driven with a pnpm-like stand-in installer.
+  `<state-root>/.stores/leerie/`, a worker only its run's caches, and no
+  tree leerie installs into, a view included, links into leerie's store:
+  every leerie install copies from it, so neither an in-place edit of a
+  hard-linked file in a worker's `node_modules` nor a committed
+  `postinstall` reaches the store or a view. Driven with a pnpm-like
+  stand-in installer.
 - `tests/test_worker_confinement.py` (20 tests, DESIGN §6 *A worker writes
   only where it is granted (I5)*): a real child confined by
   `scripts/landlock_exec.py` with the grants `_worker_grants` derives, on
@@ -5944,8 +5946,31 @@ template kept at finalize.
   *One ignore rule*): I1 and I2 read untracked files by the same rule, and
   a guard derived from the source finds no listing of untracked files
   outside it, in Python or the shell.
-- `tests/test_repo_commands_keep_their_hooks.py` (5 tests, review round 17
-  M4, DESIGN §6½ *Hooks off*): the repository's own commands, launched
+- `tests/test_repo_commands_keep_their_hooks.py` (6 tests, review round 17
+  M4, DESIGN §6½ *Hooks off*, §6 *Leerie's runs of the repository's
+  commands are confined too*): the repository's own commands, launched
   through `_run_streaming` or the self-check's spawn with
   `_repo_command_env`, run with hooks as the repository expects, while
-  leerie's own git keeps them off.
+  leerie's own git keeps them off. Derived guards: every call of
+  `_run_streaming`, `_run_contained` and `_measure_blt` passes `grants`,
+  which has no default; `_run_streaming`'s one spawn is the confined argv;
+  the self-check is the one raw spawn; `node` and `mise` are never spawned
+  directly.
+- `tests/test_measurement_confinement.py` (4 tests, DESIGN §6 *Leerie's
+  runs of the repository's commands are confined too*): a real child
+  confined with `_measurement_grants` writes its view and measurement
+  directory and is refused the run's state (the held-out sets,
+  `state.json`, the worker cache, leerie's store, the run repository's
+  refs, sibling trees, another tree's measurement directory); its temp and
+  caches point at its own directory.
+- `tests/test_measurement_grant_lifetime.py` (8 tests, same section): a
+  tree made again at a path gets a fresh measurement directory and a
+  removed tree's is swept; the grant kinds differ only where designed; the
+  toolchain kind empties the hook's trust records; a tree holding the run
+  directory is refused; `claude_p` records the first committing worker; a
+  confined worker reads the run's mise overrides.
+- `tests/test_store_classes.py` (11 tests, DESIGN §6 *Which stores an
+  install may share*): every store variable has exactly one class; a run
+  tree's commands get that tree's own stores; each manager's no-code fetch
+  runs its argv on data files only (6 cases); a bun install copies; a
+  replaced view takes its tree stores with it.

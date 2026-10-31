@@ -125,8 +125,9 @@ prune_leerie_worktrees() {
 # leerie_repo_lock
 #
 # Take the repository-wide worktree lock on fd 201 for the rest of the calling
-# script: `<git-common-dir>/leerie-worktree.lock`, shared by every run and
-# every container that bind-mounts this `.git`. The per-run lock it replaced
+# script: `<git-common-dir>/leerie-worktree.lock`. The repository is the
+# run's own (DESIGN §6 *The run's own repository*), so the lock is shared by
+# that run's scripts alone, never by another run. The per-run lock it replaced
 # serialised siblings of one run but not two runs (or a run and its own
 # planning worktree) against each other. The file sits where git already
 # writes its own worktree admin entries, so it is writable wherever a

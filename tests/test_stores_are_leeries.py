@@ -8,8 +8,8 @@ which pnpm's integrity check does not look past — changed the store's own
 copy, and the next committed view installed the edit (measured with real
 pnpm 10.4.1 on barnacle). Leerie's commands now read only
 `<state-root>/.stores/leerie/`, a worker only its own caches and its run's
-worker pnpm store, and a tree leerie installs into gets links into leerie's
-store only when it is a committed view.
+worker pnpm store, and no tree leerie installs into, a view included, links
+into leerie's store: every leerie install copies from it.
 
 Every install leerie runs is confined (DESIGN §6 *Leerie's runs of the
 repository's commands are confined too*): leerie's fetched store is

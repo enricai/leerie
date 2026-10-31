@@ -7692,8 +7692,10 @@ CACHE_MOUNTS=(
   # orchestrator points its own commands at `<state-root>/.stores/leerie/`
   # and each worker at `<run-dir>/workers/` (DESIGN §6 *The stores a view
   # installs from are leerie's*). Both are in the state mount, beside the
-  # worktrees, so pnpm hard-links (DESIGN §6 *The pnpm store shares the
-  # worktrees' mount*).
+  # worktrees, so a worker's install can hard-link from its run's cache;
+  # leerie's own installs copy from its store (DESIGN §6 *The pnpm store
+  # shares the worktrees' mount*, *A view's install never writes leerie's
+  # store*).
   -v "$HOME/.cache/leerie/bundle:/home/leerie/.cache/leerie/bundle"
   -e "BUNDLE_CACHE_ALL=1"
 )

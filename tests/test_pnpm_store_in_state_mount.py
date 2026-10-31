@@ -43,7 +43,8 @@ def test_no_separate_store_mount_remains():
 def test_both_sets_of_stores_are_in_the_state_root(leerie, tmp_path):
     """In the state root, so in the state mount locally (`/leerie-state`)
     and on the state volume on Fly (`/work/.leerie`), beside the worktrees:
-    pnpm hard-links on both sides."""
+    a worker's install can hard-link from its cache, and leerie's own
+    installs copy from its store."""
     root = tmp_path / "state-root"
     env: dict[str, str] = {}
     leerie._leerie_stores(env, root)

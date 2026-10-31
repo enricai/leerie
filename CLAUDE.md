@@ -156,15 +156,18 @@ the rest of the family stay denied.
 
 ## Mandatory requirements
 
-- **Every worker and every repository command leerie runs is confined
+- **Every run worker and every repository command leerie runs is confined
   (I5).** A worker's processes write only what its grant names
-  (`_worker_grants`, Landlock); a repository command leerie runs — build,
+  (`_worker_grants`, Landlock). A repository command leerie runs — build,
   lint, tests, install, the held-out sets, CI parity, coverage, `verify`,
-  the setup hook, `mise`, the AST scripts — only its tree and measurement
-  directory (`_measurement_grants`, through `_run_streaming`, whose
-  `grants` has no default). Nothing of either runs unconfined. DESIGN §6
-  *A worker writes only where it is granted (I5)*, *Leerie's runs of the
-  repository's commands are confined too*.
+  the setup hook, `mise`, the AST scripts — writes its tree, its
+  measurement directory, the verified caches and its tree's own stores,
+  and by kind `MISE_DATA_DIR`, `~/.local/bin` or (the store fetch alone)
+  leerie's stores (`_measurement_grants`, through `_run_streaming`, whose
+  `grants` has no default). The host-side workers (rebaser, host
+  recapture, `config --chat`) are the one exception. DESIGN §6 *A worker
+  writes only where it is granted (I5)*, *Outside the container*,
+  *Leerie's runs of the repository's commands are confined too*.
 - **Each run has its own repository, and each committing tree its own
   (I4, I6).** The user's repository is only fetched from, and receives the
   run branch by the host-side bring-back; only leerie moves the run
