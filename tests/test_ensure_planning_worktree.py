@@ -220,6 +220,11 @@ class TestStageWorktreeExtras:
         """Degraded context must not take down a run that would otherwise
         proceed — the worktree itself is already established by this point."""
         repo, state, st = env
+        # The run's repository first, unfaulted: making it copies leerie's
+        # settings (`_take_run_settings`, `shutil.copytree`), and a failure
+        # there rightly stops the run (DESIGN §8 *The settings are
+        # leerie's*). The fault below is for the extras' copies alone.
+        leerie._ensure_run_repo(st)
 
         def boom(*_a, **_k):
             raise OSError("disk on fire")
