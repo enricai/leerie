@@ -4372,24 +4372,68 @@ only from stores that leerie alone writes.* So there are two sets:
   cache carries neither. The set goes with the run directory.
 
 Two stores never share a file: each fetches its own copy (measured: 0
-inodes in common after the same lockfile was installed from both). What
-can still link into leerie's store is a tree leerie installs into, so only
-a committed view, which no worker runs in, is installed with hard links;
-every other tree leerie installs into — a held-out set's evaluation tree,
-a falsifier's lane, the acceptance writer's tree — gets copies
-(`npm_config_package_import_method=copy`, `UV_LINK_MODE=copy`). Copying
-costs, on disk (ext4, warm store): barnacle 4.7–5.0 s hard-linked against
-11.8–12.2 s copied, funeralworks 11.4–12.0 s against 25.2–26.2 s, and the
-full `node_modules` size per tree (0.6 and 1.4 GB), which is why views keep
-links. A variable pointing beneath the image's bake root (`/opt/`, the
-*persistent out-of-repo dependency bake*) is left alone on both sides: those are dependencies
-leerie built into the image, which the recipe no longer installs.
+inodes in common after the same lockfile was installed from both). A
+variable pointing beneath the image's bake root (`/opt/`, the *persistent
+out-of-repo dependency bake*) is left alone on both sides: those are
+dependencies leerie built into the image, which the recipe no longer
+installs.
+
+**A view's install never writes leerie's store.** The invariant: *leerie's
+store is written only by a process that runs no committed code.* Review
+round 18 H1 found the gap the split above left. A committed view's install
+is the repository's own install — its `package.json` `postinstall` and
+every dependency's lifecycle script run — and it ran against leerie's
+store with hard links, so a committed `postinstall` that edits a file in
+`node_modules` edited the store's own copy, for every later view and every
+later run. Measured on barnacle's real store: a hard-linked install shares
+the store's inode (`nlink` 3), and an in-place edit through the view grew
+the store's file from 3,284 to 3,305 bytes. Two measures close it:
+
+- *The store is filled with no committed code* (`_populate_leerie_store`).
+  Before an install, each install entry's lockfile is fetched into leerie's
+  store by `pnpm fetch --ignore-scripts`, run in a staging directory that
+  holds only the data files the fetch reads — the lockfile, `package.json`
+  (for `patchedDependencies`), `pnpm-workspace.yaml` and `patches/` — and
+  never the committed `.pnpmfile.cjs`, `.npmrc` or a script. `pnpm fetch`
+  reads no manifest scripts; `--ignore-scripts` keeps dependency lifecycle
+  scripts from running, and it is load-bearing: measured with pnpm 10.4.1,
+  a crafted lockfile whose own `package.json` allow-lists a git-hosted
+  dependency and a tarball dependency ran their `prepare` and `postinstall`
+  during a plain `pnpm fetch`, and none of them with `--ignore-scripts`. The
+  fetch runs unconfined, since it runs no repository code; its cost on
+  barnacle is 6.8 s cold and 3.1 s warm, on funeralworks 14.7 s cold.
+- *Every install copies from the store* (`_COPY_IMPORT_ENV`, now for every
+  tree, a view included): pnpm's `package-import-method=copy` and
+  `UV_LINK_MODE=copy`. No file the install or its scripts write shares an
+  inode with the store, so a `postinstall` edits only the view's own copy.
+  Measured: a copied install leaves the view's file at `nlink` 1, sharing no
+  inode with the store. `copy`, not `clone-or-copy`, which would reflink on
+  a copy-on-write filesystem: pnpm 11 silently drops `clone-or-copy`
+  (`pnpm config get package-import-method` reads `undefined`) and falls
+  back to its default, which hard-links. The earlier exception that let a
+  view hard-link is gone.
+
+The install still runs the repository's scripts, as it must to measure
+them; the worker's write boundary confines it, and with the store already
+filled it can run against a store it may only read (measured: a
+Landlock-confined `pnpm install` with the store read-only succeeds,
+barnacle 13–15 s, funeralworks 29–43 s with `prisma generate`). Copying is
+not the cost it looked: with the store read-only, a copied install of
+barnacle took 13.4 s against 12.9–14.6 s hard-linked, because the
+repository's own scripts dominate either way. The fetch step is built for pnpm, the manager the attack was
+measured on and the one both bench repositories use (`_STORE_FETCH`); a
+manager with no entry there falls through to its install filling the store
+as before, kept off the store's inodes by the copy import. Whether npm,
+yarn, pip, uv, cargo, go and bundler each need their own no-code fetch, or
+already refuse an edited cache entry by checking it against the lockfile's
+hash, is not yet measured and is the next step.
 
 What this does not cover: a worker writing leerie's store, a view, `/opt`
 or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside
 the worker's own tree, which the worker's write boundary forbids; this
 removes the ones a worker made legitimately, through its own installs and
-the links they share.
+the links they share, and the ones leerie's own install made through a
+committed `postinstall`.
 
 This explains *why* worktrees are expensive; it deliberately does not
 drive a gate. A per-worktree measured bound was attempted and withdrawn

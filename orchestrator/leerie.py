@@ -5787,11 +5787,55 @@ _STORE_VARS: dict[str, str] = {
 # the image, which the recipe no longer installs, so neither side moves it.
 # Keeping a worker from writing there is the worker's write boundary.
 _BAKED_ROOT = "/opt/"
+# pnpm 10 reads its settings only as `npm_config_<key>`, pnpm 11 only as
+# `pnpm_config_<key>` (measured: each ignores the other's spelling for
+# `store-dir` and `package-import-method`). Every pnpm setting leerie relies
+# on is set under both (`_with_pnpm_spellings`), or pnpm 11 reads none of
+# them: under the worker's write boundary it then falls back to a store
+# inside the worker's tree, which a worker commits (review round 18 exec
+# H2), and leerie's installs link from a store leerie does not own.
+_PNPM_SETTINGS = frozenset({"store_dir", "cache_dir",
+                            "package_import_method"})
+
+
+def _with_pnpm_spellings(env: MutableMapping[str, str]) -> None:
+    """Set `pnpm_config_<k>` to `npm_config_<k>`'s value for every
+    `_PNPM_SETTINGS` key `env` sets, and drop a `pnpm_config_<k>` whose
+    `npm_config_<k>` is absent, so both pnpm generations read the same
+    value."""
+    for k in _PNPM_SETTINGS:
+        v = env.get(f"npm_config_{k}")
+        if v is None:
+            env.pop(f"pnpm_config_{k}", None)
+        else:
+            env[f"pnpm_config_{k}"] = v
+
+
 # Import modes that never expose a store's own inode in the tree installed
-# into (`_ensure_worktree_deps`, for every tree but a committed view).
+# into, so no install — not even a committed `postinstall` editing
+# `node_modules` — can reach leerie's store (`_ensure_worktree_deps`, every
+# tree; DESIGN §6 *A view's install never writes leerie's store*). `copy`,
+# not `clone-or-copy`: pnpm 11 silently drops `clone-or-copy` (measured:
+# `pnpm config get package-import-method` reads `undefined`) and falls back
+# to its default, which hard-links; both generations read `copy`. uv's
+# `copy` is the same for its cache.
 _COPY_IMPORT_ENV: dict[str, str] = {
     "npm_config_package_import_method": "copy",
+    "pnpm_config_package_import_method": "copy",
     "UV_LINK_MODE": "copy",
+}
+# Populating leerie's store from a lockfile with no project or dependency
+# code (DESIGN §6 *A view's install never writes leerie's store*): manager
+# -> (argv, lockfile, files to stage). The fetch runs in a staging directory
+# holding only these data files — never the worker's `.pnpmfile.cjs`,
+# `.npmrc` or scripts — so leerie's store is written only by a process that
+# runs no committed code. Built for pnpm, the manager the attack was
+# measured on; a manager without an entry falls through to its install
+# filling the store, kept off the store's inodes by `_COPY_IMPORT_ENV`.
+_STORE_FETCH: dict[str, tuple[list[str], str, tuple[str, ...]]] = {
+    "pnpm": (["pnpm", "fetch", "--ignore-scripts"], "pnpm-lock.yaml",
+             ("pnpm-lock.yaml", "package.json", "pnpm-workspace.yaml",
+              "patches")),
 }
 
 
@@ -5808,6 +5852,7 @@ def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
         d = root / name
         d.mkdir(parents=True, exist_ok=True)
         env[var] = str(d)
+    _with_pnpm_spellings(env)
 
 
 def _worker_cache_env(env: Mapping[str, str],
@@ -5829,6 +5874,7 @@ def _worker_cache_env(env: Mapping[str, str],
     out["XDG_CACHE_HOME"] = str(cache / "xdg")
     for k in _COPY_IMPORT_ENV:
         out.pop(k, None)
+    _with_pnpm_spellings(out)
     for d in (cache / "xdg", cache / "pnpm-store"):
         with contextlib.suppress(OSError):
             d.mkdir(parents=True, exist_ok=True)
@@ -40435,6 +40481,76 @@ _DEPS_INSTALLED: set[str] = set()
 _DEPS_FAILED: dict[str, int] = {}
 
 
+def _recipe_manager(command: list[str] | None) -> str | None:
+    """The package manager a recipe entry's command runs, or None. The first
+    token, bare or after an env/`cd`/`timeout` prefix a recipe never carries
+    in a list argv — so the first token is enough."""
+    return (command[0] if command and command[0] in _STORE_FETCH else None)
+
+
+async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
+                                 log_path: Path, label_prefix: str,
+                                 log_prefix: str) -> None:
+    """Fill leerie's store from each install entry's lockfile, running no
+    committed code (DESIGN §6 *A view's install never writes leerie's
+    store*). For each distinct (manager, working_dir) in the recipe whose
+    manager has a `_STORE_FETCH` entry, copy that entry's data files (the
+    lockfile and manifest — never `.pnpmfile.cjs`, `.npmrc` or a script)
+    into a run-private staging directory and run the fetch there, with
+    leerie's own store on the environment. Best-effort: a fetch that fails
+    leaves the install to populate what it can, and the install's
+    copy-import still keeps it off the store's inodes."""
+    recipe = (st.data.get("provision") or {}).get("recipe") or []
+    seen: set[tuple[str, str]] = set()
+    for e in recipe:
+        if e.get("kind") != "install":
+            continue
+        mgr = _recipe_manager(e.get("command"))
+        if mgr is None:
+            continue
+        wd_rel = e.get("working_dir") or "."
+        if (mgr, wd_rel) in seen:
+            continue
+        seen.add((mgr, wd_rel))
+        argv_tmpl, lockfile, files = _STORE_FETCH[mgr]
+        src = Path(tree) / wd_rel
+        if not (src / lockfile).is_file():
+            continue
+        stage = (st.run_dir / ".store-fetch"
+                 / _CGROUP_NAME_UNSAFE_RE.sub("-", f"{mgr}-{wd_rel}"))
+        await asyncio.to_thread(_rmtree_owned, stage)
+        stage.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            s = src / name
+            if s.is_dir():
+                shutil.copytree(s, stage / name, symlinks=True)
+            elif s.is_file():
+                shutil.copy2(s, stage / name)
+        try:
+            # A fetch is leerie's own, but the task's forbid binds it too
+            # (DESIGN §9): a forbidden fetch is skipped, and the install that
+            # follows still copies.
+            argv = _blt_shell_argv(list(argv_tmpl), _forbidden_specs(st.data))
+        except ForbiddenByTask as ex:
+            log(f"  {log_prefix}: store fetch not run — {ex}")
+            await asyncio.to_thread(_rmtree_owned, stage)
+            continue
+        try:
+            rc, _tail = await _run_streaming(
+                argv, cwd=str(stage), env=None,
+                timeout=caps.get("worker_timeout_sec"), log_path=log_path,
+                label=f"{label_prefix}-store-fetch: {' '.join(argv_tmpl)}",
+                verbosity="quiet")
+            if rc != 0:
+                log(f"  {log_prefix}: store fetch exited {rc} "
+                    f"({mgr} in {wd_rel}) — the install will populate it")
+        except Exception as ex:  # best-effort: the install still copies
+            log(f"  {log_prefix}: store fetch error "
+                f"({type(ex).__name__}): {mgr} in {wd_rel}")
+        finally:
+            await asyncio.to_thread(_rmtree_owned, stage)
+
+
 async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                                 log_path: Path, verbosity: str,
                                 label_prefix: str = "baseline",
@@ -40484,12 +40600,16 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     # DESIGN §6½ *Leerie's own commands leave a worker's tree as they found
     # it*): a relocked lockfile is put back, an unignored generated file
     # goes; installed dependencies, being ignored, stay.
-    # Only a committed view, which no worker ever runs in, may hold links into
-    # leerie's store; every other tree gets copies, so no file a worker can
-    # write is one of the store's (DESIGN §6 *The stores a view installs
-    # from are leerie's*).
-    linkable = os.path.realpath(tree) in {
-        os.path.realpath(v) for _tip, v in _VIEWS.values()}
+    # The store is filled first, from the lockfile, running no committed code
+    # (`_populate_leerie_store`); the install below then runs the repository's
+    # own install — including its `postinstall` — but copies every package
+    # from the store (`_COPY_IMPORT_ENV`), so no file it writes shares an
+    # inode with the store and no `postinstall` can poison it, in this tree,
+    # a later view or a later run (DESIGN §6 *A view's install never writes
+    # leerie's store*; review round 18 H1).
+    await _populate_leerie_store(tree, st, caps, log_path=log_path,
+                                 label_prefix=label_prefix,
+                                 log_prefix=log_prefix)
     async with _leaves_tree_as_found(tree, "install/build", log_prefix):
         for e in recipe:
             if (e.get("kind") not in ("install", "build")
@@ -40503,8 +40623,7 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
             # PATH etc.
             entry_env = ({**os.environ, **e["env"]} if e.get("env")
                          else None)
-            if not linkable:
-                entry_env = {**(entry_env or os.environ), **_COPY_IMPORT_ENV}
+            entry_env = {**(entry_env or os.environ), **_COPY_IMPORT_ENV}
             try:
                 # A recipe entry is a repo command: the task's forbid binds it
                 # too (DESIGN §9 *Recipe install steps fall under the forbid
