@@ -146,7 +146,8 @@ def test_every_worker_exit_takes_its_trees_branch(leerie, env, monkeypatch):
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
     with pytest.raises(leerie.WorkerError):
         asyncio.run(leerie._invoke_admitted(["claude"], str(wt), 30, "s1",
-                                            st.run_dir, "quiet"))
+                                            st.run_dir, "quiet",
+                                            grants=None))
     assert _git(st.run_dir / "repo", "rev-parse", SUB) == made["sha"]
 
 

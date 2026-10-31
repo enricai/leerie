@@ -70,7 +70,15 @@ def run(leerie, tmp_path, monkeypatch):
     for name in ("staging", "wt-a", "wt-b", f"{RUN_ID}-view-staging"):
         _git(repo, "branch", f"b-{name}", "main")
         wts[name] = run_dir / "worktrees" / name
-        _git(repo, "worktree", "add", "-q", str(wts[name]), f"b-{name}")
+        if "view" in name:
+            # A committed view is the run repository's.
+            _git(repo, "worktree", "add", "-q", str(wts[name]), f"b-{name}")
+            continue
+        # A committing tree is a worktree of its own repository, made as
+        # the scripts make it (DESIGN §6 *A repository per committing tree
+        # (I6)*).
+        _make_tree(repo, run_dir / "tree-repos" / name, f"b-{name}",
+                   wts[name])
     (wts["wt-b"] / "secret.py").write_text("sibling\n")
     (run_dir / "state.json").write_text("{}\n")
     (run_dir / "acceptance" / "set-1").mkdir(parents=True)
@@ -87,6 +95,15 @@ def run(leerie, tmp_path, monkeypatch):
         Path(p).mkdir(parents=True, exist_ok=True)
     return {"user": user, "state_root": state_root, "run_dir": run_dir,
             "repo": repo, "wts": wts, "env": env}
+
+
+def _make_tree(repo: Path, tr: Path, branch: str, wt: Path) -> None:
+    subprocess.run(
+        ["bash", "-c", '. "$1"; leerie_tree "$2" "$3" "$4"', "_",
+         str(REPO_ROOT / "scripts" / "worktree-lib.sh"), str(tr), branch,
+         str(wt)],
+        env={**os.environ, "LEERIE_GIT_DIR": str(repo)}, check=True,
+        capture_output=True, text=True)
 
 
 def _grants(leerie, run, *, schema_key="implementer", cwd=None,
@@ -287,29 +304,43 @@ def test_only_a_worker_dir_is_granted_from_the_environment(leerie, run):
 
 def test_a_tree_repository_is_granted_whole_and_the_run_repository_read(
         leerie, run):
-    """With lane D's repository per committing tree (DESIGN §6 *A
-    repository per committing tree*): the tree's own repository written,
-    the run repository's objects read, nothing else of it."""
-    rd = run["run_dir"]
-    tr = rd / "tree-repos" / "t1"
-    _git(rd.parent, "init", "-q", "--bare", str(tr))
-    (tr / "objects" / "info" / "alternates").write_text(
-        str(run["repo"] / "objects") + "\n")
-    _git(tr, "fetch", "-q", str(run["repo"]), "+main:refs/heads/t1")
-    wt = rd / "worktrees" / "t1"
-    _git(tr, "worktree", "add", "-q", str(wt), "t1")
+    """The grant I6 makes possible (DESIGN §6 *A repository per committing
+    tree (I6)*): the tree's own repository written whole, the run
+    repository's objects read, nothing else of it. A real confined child
+    commits on its own branch, and is refused moving the run branch, another
+    tree's branch, or anything in the run repository's `refs/`."""
+    rd, wt = run["run_dir"], run["wts"]["wt-a"]
+    tr = rd / "tree-repos" / "wt-a"
+    other = rd / "tree-repos" / "wt-b"
     g = _grants(leerie, run, cwd=wt)
-    assert str(tr) in g.rw
-    assert str(run["repo"] / "objects") in g.ro
-    assert str(run["repo"]) not in g.ro + g.rw
+    assert str(tr.resolve()) in g.rw
+    assert str((run["repo"] / "objects").resolve()) in g.ro
+    assert not [p for p in g.rw + g.ro
+                if Path(p) == run["repo"].resolve()
+                or Path(p).is_relative_to(run["repo"].resolve() / "refs")]
     got = _probe(leerie, g, f"""
 commit|cd {wt} && echo y > n.txt && git add n.txt && git -c user.email=t@x -c user.name=t commit -qm n
-own branch|git -C {wt} rev-parse HEAD
-run repo ref|git --git-dir={run['repo']} update-ref refs/heads/b-wt-b HEAD
+own branch moved|git -C {wt} update-ref refs/heads/b-wt-a HEAD
+run branch|git --git-dir={run['repo']} update-ref refs/heads/b-staging HEAD
+another tree branch|git --git-dir={other} update-ref refs/heads/b-wt-b $(git -C {wt} rev-parse HEAD)
+run repo refs write|echo x > {run['repo']}/refs/heads/new-ref
+run repo packed-refs|echo x >> {run['repo']}/packed-refs
 run repo config|echo x >> {run['repo']}/config
 """, run["env"])
-    assert got == {"commit": True, "own branch": True, "run repo ref": False,
+    assert got == {"commit": True, "own branch moved": True,
+                   "run branch": False, "another tree branch": False,
+                   "run repo refs write": False,
+                   "run repo packed-refs": False,
                    "run repo config": False}
+
+
+def test_a_committing_worker_in_a_run_repository_worktree_is_not_spawned(
+        leerie, run):
+    """A committing tree that is a worktree of the run repository itself
+    would need the run repository's `refs/` written — every branch — so no
+    such grant exists: the run stops naming the tree."""
+    with pytest.raises(SystemExit):
+        _grants(leerie, run, cwd=run["wts"][f"{RUN_ID}-view-staging"])
 
 
 # --- derived guards: every worker goes through the confined path -------------

@@ -21840,12 +21840,12 @@ def _tree_git_dirs(tree: Path, run_dir: Path) -> tuple[list[str], list[str]]:
     """`(write, read)`: the git metadata a commit in `tree` writes, and what
     it reads besides, when that lives in the run directory outside `tree`.
     A worktree of its tree's own repository (`<run>/tree-repos/<tree>/`,
-    DESIGN §6 *A repository per committing tree*): that repository whole,
-    and `<run>/repo/objects/` read (its alternates). A worktree of the run
-    repository itself (until every tree has its own): the worktree's admin
-    directory and the shared `objects/`, `refs/`, `logs/` written, the
-    repository read — never `config`, `info/`, `HEAD` or `packed-refs`
-    written. `([], [])` for a clone, whose `.git` is inside it."""
+    DESIGN §6 *A repository per committing tree (I6)*): that repository
+    whole, and `<run>/repo/objects/` read (its alternates). A worktree of
+    the run repository itself is no committing tree's (I6: the scripts
+    remake one from a tree repository); writing it would grant the run
+    repository's `refs/`, every branch, so the run stops instead.
+    `([], [])` for a clone, whose `.git` is inside it."""
     r = subprocess.run(["git", "-C", str(tree), "rev-parse",
                         "--path-format=absolute", "--git-dir",
                         "--git-common-dir"], capture_output=True, text=True,
@@ -21860,9 +21860,11 @@ def _tree_git_dirs(tree: Path, run_dir: Path) -> tuple[list[str], list[str]]:
     if common.parent == (run_dir / TREE_REPOS_DIRNAME).resolve():
         return [str(common)], [str(run_repo / "objects")]
     if common == run_repo:
-        return ([str(git_dir)] + [str(common / d) for d in
-                                  ("objects", "refs", "logs")],
-                [str(run_repo)])
+        die(f"{tree} is a worktree of the run's repository, not of its own: "
+            "a committing worker there could move every branch of the run "
+            "(DESIGN §6 *A repository per committing tree (I6)*). Report "
+            "this; `leerie resume` remakes the tree from its own "
+            "repository.")
     return [], []
 
 

@@ -2476,13 +2476,13 @@ A committing worker's git metadata is its tree's own repository,
 `<run-id[:12]>-<sid>`; lane D, *A repository per committing tree*),
 written whole, and `<run-dir>/repo/objects/` read for the alternates —
 nothing else of `<run-dir>/repo/`. The repository belongs to the tree, not
-the worker: the workers of one tree take turns in it. Until lane D's tree
-repositories land, a tree is a worktree of the run repository, and the
-grant is its admin directory `<run-dir>/repo/worktrees/<name>/` and the
-shared `objects/`, `refs/` and `logs/` written, the repository read —
-never `config`, `info/`, `HEAD` or `packed-refs` (`_tree_git_dirs`). The
-settings check (§8 *The settings are leerie's*) recognises
-`<run-dir>/repo`; lane D maps each tree repository onto the same copy. The delivery re-drive also
+the worker: the workers of one tree take turns in it. A committing worker
+whose tree is a worktree of the run repository itself (a layout I6 never
+makes: the scripts remake such a tree from a tree repository) is not
+spawned at all: no grant to the run repository's `refs/` or `objects/`
+exists, and the run stops naming the tree (`_tree_git_dirs`). The settings
+check (§8 *The settings are leerie's*) reads each tree repository against
+the run's one copy. The delivery re-drive also
 reads its self-check directory `<run-dir>/selfcheck/<group>/` (the shown
 sets, the config) and writes its `run/` (the self-check's copies and call
 log).
@@ -2514,10 +2514,10 @@ comes only from `claude_p` on those caps. The Fly recovery
 integrator (`collect-subtrees.sh`) is a run worker: it takes its grants from
 `worker-guard.py` and is skipped, never run, without them.
 
-**Residuals.** Until lane D's tree repositories land, a committing worker's
-refs and objects are the run repository's shared ones, so it can still move
-another branch (lane B measured it); I1's branch lines and the settled heads
-read refs by name and commit. `/dev/shm` is shared; leerie never reads it. A worker can signal any process of its user
+**Residuals.** A committing worker can move any ref of its own tree
+repository, its tree's branch included; leerie takes only that branch, and
+reads every other branch in the run repository, which the worker cannot
+write (I6). `/dev/shm` is shared; leerie never reads it. A worker can signal any process of its user
 (Landlock's signal scoping needs ABI 6), the orchestrator included; the
 process-kill deny rules (§9) and `TaskStop` are the guard there.
 

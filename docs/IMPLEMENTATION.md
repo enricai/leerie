@@ -3816,9 +3816,10 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   a clone (both empty), `<run>/repo/objects`. `_tree_git_dirs` (`git
   rev-parse --path-format=absolute --git-dir --git-common-dir`): a common
   dir in `<run>/tree-repos/` (`TREE_REPOS_DIRNAME`) → write it whole, read
-  `<run>/repo/objects`; the run repository itself → write the worktree's
-  admin dir and `objects/`, `refs/`, `logs/`, read the repository; a git
-  dir inside the tree (a clone) → nothing. For any other worker: `rw` the
+  `<run>/repo/objects`; the run repository itself (a committing tree I6
+  never makes) → `die()` naming the tree, before any spawn, so no grant to
+  the run repository's `refs/`, `objects/` or `logs/` exists; a git dir
+  inside the tree (a clone) → nothing. For any other worker: `rw` the
   cwd when `_bash_unrestricted(allowed_tools)` (bare `Bash` in the list),
   else `ro` (the shared planning worktree and the payload-only directory
   included: no worker there has a shell); `ro` `<run>/repo`. `_RUN_NOTES_READERS`
