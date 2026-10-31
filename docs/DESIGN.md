@@ -8424,6 +8424,53 @@ of the shortest of those runs (3,051 s), against a test axis of 906 s and
 more. The worker's own install stays where it was: a worker installs into
 its own tree for its own runs, and leerie never measures through it.
 
+*A view moves to the next tip when the install's inputs are unchanged*
+(review round 18 L1). Making a view per tip measured 7.3 s (barnacle) and
+15.8 s (funeralworks) per new tip with a warm store — a fresh checkout, the
+removal of the old view's 0.6–1.4 GB of dependencies, and a full install —
+and a run makes several views per subtask. So a view is kept per tree and,
+when the tree's tip moves, moved rather than made again, if the install it
+holds is one leerie made from the same inputs and is as that install left
+it:
+- the *install key* is the recipe's `install` entries (command, working
+  directory, environment) and the git blob of every install input at the
+  tip: every tracked file named as a manifest, lockfile or package-manager
+  configuration (`_INSTALL_INPUT_NAMES`), everything under a `patches/`
+  directory, and every path the dependency capture's `copy_inputs` names.
+  The blobs are read from the run repository at the tip, never from a tree.
+  The key is recorded with the view's install only when that install
+  succeeded;
+- the install's *outputs* are the ignored paths that appeared while leerie
+  ran the recipe's `install` entries in the view. When the last of them is
+  done, before any build runs, leerie records every entry under those paths
+  with its state: a file's or link's inode, size, mode and change time — a
+  time its owner cannot set back, moved by every write, rename, chmod or
+  link — and a directory's inode and mode;
+- when the key at the new tip is the key recorded, the view's `.git` is
+  pointed back at its own administrative directory, found from the run
+  repository's side; it is checked out at the new tip (`checkout --detach
+  --force`); everything untracked but the outputs is removed (`clean -x`);
+  under the outputs, every entry the install did not make (a tool's cache, a
+  report a measurement wrote) is removed; and every entry it made must be
+  there in the state recorded, with no tracked path changed. Any failure,
+  or a different key, and the view is removed and made afresh, as before;
+- either way the recipe then runs again in the view in full — the store
+  fetch, every `install` entry and every `build` entry. A moved view's
+  install finds its own output in place, so the package manager does only
+  what the tip needs, and the repository's own lifecycle scripts (a
+  `prepare`, a `postinstall` generating from the sources) run against the
+  new tip's files as they would in a fresh view. Builds are never reused.
+
+So what a moved view holds is what a fresh view would: the install's output
+reused is one leerie produced, under the same confinement as any repository
+command it runs, from inputs identical at both tips, and verified untouched
+since; no worker can write a view (I5), and whatever a measurement changed
+under it sends the view back to a fresh one. A file the install reads that
+the key does not name leaves no stale install either: the install runs
+again on the new tip and reads it, over its own earlier output — the package
+manager's incremental install, which is the residual difference from a fresh
+view.
+
 What this removes: the measurement no longer depends on I1's reading of
 staging, so the assertion every staging reader made — that staging was
 clean, or the run stopped — is gone; each reader stamps the branch's tree

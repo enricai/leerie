@@ -64,6 +64,7 @@ import urllib.request
 import uuid
 import weakref
 import xml.etree.ElementTree as ElementTree
+import zlib
 from collections import deque
 from collections.abc import (AsyncIterator, Awaitable, Callable, Iterable,
                              Iterator, Mapping, MutableMapping)
@@ -40619,10 +40620,6 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     _DEPS_INSTALLED.add(key)
     ok = True
     recipe = (st.data.get("provision") or {}).get("recipe") or []
-    # Leerie's own install/build leaves the tree as it found it (I2,
-    # DESIGN §6½ *Leerie's own commands leave a worker's tree as they found
-    # it*): a relocked lockfile is put back, an unignored generated file
-    # goes; installed dependencies, being ignored, stay.
     # The store is filled first, from the lockfile, running no committed code
     # (`_populate_leerie_store`); the install below then runs the repository's
     # own install — including its `postinstall` — but copies every package
@@ -40633,11 +40630,43 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     await _populate_leerie_store(tree, st, caps, log_path=log_path,
                                  label_prefix=label_prefix,
                                  log_prefix=log_prefix)
+    # In a committed view, the install's own outputs: the ignored paths its
+    # `install` entries make — in a view moved with its install kept, the
+    # ones that install made, still there (`_DEPS_KEPT`) — and their state
+    # when the last of them is done, before any build can touch them
+    # (`_install_snapshot`; DESIGN §8 *A view moves to the next tip when the
+    # install's inputs are unchanged*). None in any other tree, and once
+    # they cannot be told.
+    is_view = key in {os.path.realpath(v) for _tip, v in _VIEWS.values()}
+    kept = _DEPS_KEPT.pop(key, ())
+    made: set[str] | None = set(kept) if is_view else None
+    _INSTALL_OUTPUTS.pop(key, None)
+    _VIEW_INSTALLS.pop(key, None)
+    snap_due = False
+
+    async def _snap() -> None:
+        _INSTALL_OUTPUTS.pop(key, None)
+        got = (await asyncio.to_thread(_install_snapshot, tree, made)
+               if made is not None and ok else None)
+        if got is not None:
+            _INSTALL_OUTPUTS[key] = got
+    # Leerie's own install/build leaves the tree as it found it (I2,
+    # DESIGN §6½ *Leerie's own commands leave a worker's tree as they found
+    # it*): a relocked lockfile is put back, an unignored generated file
+    # goes; installed dependencies, being ignored, stay.
     async with _leaves_tree_as_found(tree, "install/build", log_prefix):
         for e in recipe:
             if (e.get("kind") not in ("install", "build")
                     or not e.get("command")):
                 continue
+            if snap_due and e.get("kind") == "build":
+                await _snap()
+                snap_due = False
+            pre = (await asyncio.to_thread(_ignored_paths, tree)
+                   if e.get("kind") == "install" and made is not None
+                   else None)
+            if pre is None and e.get("kind") == "install":
+                made = None
             wd = Path(tree) / (e.get("working_dir") or ".")
             # entry env (e.g. _normalize_node_threadpool's thread-pool caps)
             # layers on top of the orchestrator's own environment rather than
@@ -40668,6 +40697,12 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                     verbosity=verbosity)
                 if rc != 0 and e.get("kind") == "install":
                     ok = False
+                if e.get("kind") == "install" and made is not None:
+                    post = await asyncio.to_thread(_ignored_paths, tree)
+                    made = (made | (post - pre)
+                            if post is not None and pre is not None
+                            else None)
+                    snap_due = True
             except subprocess.TimeoutExpired:
                 ok = ok and e.get("kind") != "install"
                 log(f"  {log_prefix}: install timed out: "
@@ -40676,6 +40711,12 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                 ok = ok and e.get("kind") != "install"
                 log(f"  {log_prefix}: install error "
                     f"({type(ex).__name__}): {' '.join(e['command'])}")
+        if snap_due:
+            await _snap()
+    # What a view's next tip may reuse: this install's key and what it
+    # made, recorded only for an install that succeeded here.
+    if ok and key in _INSTALL_OUTPUTS:
+        await _record_view_install(st, key)
     if ok:
         _DEPS_FAILED.pop(key, None)
     else:
@@ -41448,6 +41489,242 @@ def _blt_memo_key(axis: str, cmd: str, tree_sha: str) -> str:
 # when the branch tip moves (DESIGN §8 *Every measurement reads the
 # committed view*).
 _VIEWS: dict[str, tuple[str, Path]] = {}
+# An install's own outputs as `_install_snapshot` records them: the ignored
+# paths its `install` entries made, the listing of every entry under them
+# (zlib, NUL-separated) and a digest of each entry's state.
+InstallSnapshot = tuple[tuple[str, ...], bytes, str]
+# view realpath -> (install key, its install's snapshot): what the view's
+# install was made from and what it made (DESIGN §8 *A view moves to the
+# next tip when the install's inputs are unchanged*).
+_VIEW_INSTALLS: dict[str, tuple[str, InstallSnapshot]] = {}
+# view realpath -> the outputs of the install it was moved with, to a new
+# tip: the recipe runs there again in full, and the install finds them in
+# place.
+_DEPS_KEPT: dict[str, tuple[str, ...]] = {}
+# tree realpath -> the snapshot of what its `install` entries made, the last
+# time leerie ran them there and they succeeded (a build's outputs are not
+# among them).
+_INSTALL_OUTPUTS: dict[str, InstallSnapshot] = {}
+# The install inputs by name: manifests, lockfiles and package-manager
+# configuration, wherever they are in the tree.
+_INSTALL_INPUT_NAMES = frozenset({
+    "package.json", "package-lock.json", "npm-shrinkwrap.json",
+    "pnpm-lock.yaml", "pnpm-workspace.yaml", "yarn.lock", ".yarnrc",
+    ".yarnrc.yml", ".npmrc", ".pnpmfile.cjs", "bun.lockb", "bun.lock",
+    ".nvmrc", ".node-version", "requirements.txt", "requirements-dev.txt",
+    "pyproject.toml", "poetry.lock", "uv.lock", "Pipfile", "Pipfile.lock",
+    "setup.py", "setup.cfg", ".python-version", "Gemfile", "Gemfile.lock",
+    ".ruby-version", "Cargo.toml", "Cargo.lock", "rust-toolchain",
+    "rust-toolchain.toml", "go.mod", "go.sum", "composer.json",
+    "composer.lock", ".tool-versions", "mise.toml"})
+_INSTALL_INPUT_DIRS = frozenset({"patches"})
+
+
+def _install_key(repo: Path, tip: str, recipe: list, copy_inputs:
+                 list[str]) -> str | None:
+    """The install key of `tip` (DESIGN §8 *A view moves to the next tip
+    when the install's inputs are unchanged*): the recipe's `install`
+    entries (command, working directory, environment) and the git blob of
+    every install input at `tip` — a tracked file named in
+    `_INSTALL_INPUT_NAMES`, under a `_INSTALL_INPUT_DIRS` directory, or at
+    or under a `copy_inputs` path — read from the run repository. None when
+    git cannot list the tip."""
+    r = subprocess.run(["git", *_git_at(repo), "ls-tree", "-r", "-z",
+                        "--full-tree", tip], capture_output=True,
+                       check=False, timeout=60)
+    if r.returncode != 0:
+        return None
+    named = {c.strip("/") for c in copy_inputs if c}
+    h = hashlib.sha256()
+    for e in recipe:
+        if e.get("kind") == "install" and e.get("command"):
+            h.update(json.dumps([e["command"], e.get("working_dir") or ".",
+                                 e.get("env") or {}], sort_keys=True
+                                ).encode() + b"\0")
+    for rec in sorted(r.stdout.split(b"\0")):
+        if not rec:
+            continue
+        meta, _tab, raw = rec.partition(b"\t")
+        path = os.fsdecode(raw)
+        parts = path.split("/")
+        if (parts[-1] in _INSTALL_INPUT_NAMES
+                or any(d in _INSTALL_INPUT_DIRS for d in parts[:-1])
+                or any(path == n or path.startswith(n + "/") for n in named)):
+            h.update(raw + b" " + meta + b"\0")
+    return h.hexdigest()
+
+
+def _copy_inputs_of(repo_root: Path) -> list[str]:
+    """The dependency capture's `copy_inputs` (`.leerie/config.toml`
+    `language_installs`), every entry's."""
+    raw = _read_toml_key(Path(repo_root) / CAPTURE_DEPS_CONFIG,
+                         "language_installs") or ""
+    try:
+        entries = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    return [c for e in entries if isinstance(e, dict)
+            for c in (e.get("copy_inputs") or []) if isinstance(c, str)]
+
+
+def _ignored_paths(tree: str | Path) -> set[str] | None:
+    """`tree`'s ignored untracked paths, a wholly ignored directory as one
+    `dir/` (the one listing, `_untracked_cmd`); None when git fails."""
+    args, env = _untracked_cmd(tree, which="ignored", directory=True)
+    r = subprocess.run(["git", *args], capture_output=True, check=False,
+                       env=env, timeout=120)
+    if r.returncode != 0:
+        return None
+    return {os.fsdecode(p) for p in r.stdout.split(b"\0") if p}
+
+
+def _output_state(s: os.stat_result) -> str:
+    """One entry's state for `_install_snapshot`. A file's or a link's
+    change time moves on every write, rename, chmod or link of it and cannot
+    be set back by its owner; with the inode it tells a rewrite or a
+    replacement. A directory's moves whenever an entry is added under it, so
+    a directory keeps only its inode and mode: an entry added is told by the
+    listing, one removed by the digest."""
+    if stat.S_ISDIR(s.st_mode):
+        return f"d{s.st_mode:o}:{s.st_ino}"
+    return f"{s.st_mode:o}:{s.st_ino}:{s.st_size}:{s.st_ctime_ns}"
+
+
+def _output_entries(tree: str | Path, outputs: Iterable[str],
+                    known: set[str] | None = None
+                    ) -> list[tuple[str, str]] | None:
+    """(path, `_output_state`) of every entry at or under each of `outputs`
+    in `tree`, links never followed, sorted. With `known`, an entry not in
+    it is removed (`_rmtree_owned`) and left out. None when an entry cannot
+    be read or removed."""
+    root = Path(tree)
+    out: list[tuple[str, str]] = []
+    todo = [o.rstrip("/") for o in outputs]
+    while todo:
+        rel = todo.pop()
+        p = root / rel
+        if known is not None and rel not in known:
+            if not _rmtree_owned(p):
+                return None
+            continue
+        try:
+            s = os.lstat(p)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        out.append((rel, _output_state(s)))
+        if stat.S_ISDIR(s.st_mode):
+            try:
+                todo.extend(f"{rel}/{n}" for n in os.listdir(p))
+            except OSError:
+                return None
+    return sorted(out)
+
+
+def _entries_digest(entries: list[tuple[str, str]]) -> str:
+    h = hashlib.sha256()
+    for rel, state in entries:
+        h.update(os.fsencode(rel) + b"\0" + state.encode() + b"\0")
+    return h.hexdigest()
+
+
+def _install_snapshot(tree: str | Path, outputs: Iterable[str]
+                      ) -> InstallSnapshot | None:
+    """What an install made in `tree` (DESIGN §8 *A view moves to the next
+    tip when the install's inputs are unchanged*): its `outputs`, every
+    entry under them and a digest of their states. None when they cannot be
+    read."""
+    outs = tuple(sorted(outputs))
+    entries = _output_entries(tree, outs)
+    if entries is None:
+        return None
+    listing = zlib.compress(b"\0".join(os.fsencode(r) for r, _ in entries))
+    return outs, listing, _entries_digest(entries)
+
+
+def _install_intact(tree: str | Path, snap: InstallSnapshot) -> bool:
+    """Remove every entry under the install's outputs it did not make (a
+    tool's cache, a report), then True when every entry it made is there in
+    the state it left it in."""
+    outs, listing, digest = snap
+    known = {os.fsdecode(r) for r in zlib.decompress(listing).split(b"\0")
+             if r}
+    entries = _output_entries(tree, outs, known)
+    return entries is not None and _entries_digest(entries) == digest
+
+
+def _view_admin_dir(repo: Path, wt: Path) -> Path | None:
+    """The run repository's administrative directory for its worktree
+    `wt` — found from the repository's side, never from `wt/.git`, which a
+    command run in the view can rewrite."""
+    want = os.path.realpath(wt)
+    base = Path(repo) / "worktrees"
+    try:
+        dirs = sorted(base.iterdir())
+    except OSError:
+        return None
+    for d in dirs:
+        try:
+            got = (d / "gitdir").read_text().strip()
+        except OSError:
+            continue
+        if os.path.realpath(os.path.dirname(got)) == want:
+            return d
+    return None
+
+
+def _move_view(repo: Path, wt: Path, tip: str,
+               snap: InstallSnapshot) -> bool:
+    """Move the view `wt` to `tip`, its install kept (DESIGN §8 *A view
+    moves to the next tip when the install's inputs are unchanged*): point
+    its `.git` back at its own administrative directory in `repo`, check it
+    out at `tip`, remove everything untracked but the install's outputs and,
+    under them, everything the install did not make. True when the view is
+    `tip` exactly, with the install as it made it."""
+    admin = _view_admin_dir(repo, wt)
+    if admin is None or not _rmtree_owned(wt / ".git"):
+        return False
+    (wt / ".git").write_text(f"gitdir: {admin}\n")
+    co = subprocess.run(["git", "-C", str(wt), "checkout", "-q", "--detach",
+                         "--force", tip], capture_output=True, check=False,
+                        timeout=300)
+    if co.returncode != 0:
+        return False
+    keep = [x for o in snap[0] for x in ("-e", "/" + o.lstrip("/"))]
+    cl = subprocess.run(["git", "-C", str(wt), "clean", "-ffdqx", *keep],
+                        capture_output=True, check=False, timeout=300)
+    if cl.returncode != 0 or not _install_intact(wt, snap):
+        return False
+    head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=False)
+    # A tracked path under an output (removed above as not the install's)
+    # shows here.
+    changed = subprocess.run(["git", "-C", str(wt), "status", "--porcelain",
+                              "-z", "--untracked-files=no"],
+                             capture_output=True, check=False)
+    return (head.stdout.strip() == tip and changed.returncode == 0
+            and not changed.stdout)
+
+
+async def _record_view_install(st: "State", view_key: str) -> None:
+    """Record, for the committed view at `view_key`, the install key of its
+    tip with the snapshot of the install just made there (`_VIEW_INSTALLS`;
+    DESIGN §8 *A view moves to the next tip when the install's inputs are
+    unchanged*). Nothing for a tree that is no view. The run repository is
+    found from the worker tree the view shows, never from the view."""
+    for tree_key, (tip, path) in list(_VIEWS.items()):
+        if os.path.realpath(path) != view_key:
+            continue
+        recipe = (st.data.get("provision") or {}).get("recipe") or []
+        reg = await asyncio.to_thread(_run_repo_for_tree, tree_key)
+        ikey = (await asyncio.to_thread(
+            _install_key, reg, tip, recipe, _copy_inputs_of(st.repo_root))
+                if reg is not None else None)
+        snap = _INSTALL_OUTPUTS.get(view_key)
+        if ikey is not None and snap is not None:
+            _VIEW_INSTALLS[view_key] = (ikey, snap)
+        return
 
 
 async def _view_ref(st: "State", tree: str | Path) -> str | None:
@@ -41494,11 +41771,14 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     branch tip (`_view_ref`) at `_helper_worktree_path(st, "view-<name>")`.
     Nothing is shared in from `tree`: the view's environment and build
     outputs are leerie's, made in it from the commit (`_measured_tree`).
-    Kept while the tip stands, replaced when it moves, and a replaced
-    view's install memo is dropped with it. None when `tree` is no worker tree: the
-    caller measures it as it is. A worker tree whose branch or checkout
-    cannot be had stops the run (`die`): measuring the tree itself would be
-    measuring what may not ship, the guess this removes."""
+    Kept while the tip stands. When it moves, the view is moved to the new
+    tip with its install kept if the install's inputs are the same there
+    (`_install_key`, `_move_view`), else replaced; either way its install
+    memo is dropped, so the recipe runs there again in full. None when
+    `tree` is no worker tree: the caller measures it as it is. A worker
+    tree whose branch or checkout cannot be had stops the run (`die`):
+    measuring the tree itself would be measuring what may not ship, the
+    guess this removes."""
     ref = await _view_ref(st, tree)
     if ref is None:
         return None
@@ -41516,6 +41796,24 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     if have and have[0] == tip and have[1].is_dir():
         return have[1]
     wt = _helper_worktree_path(st, f"view-{Path(key).name}")
+    # The view moves to the new tip, its install kept, when the install's
+    # inputs are the same there and the install is as leerie's last install
+    # left it (DESIGN §8 *A view moves to the next tip when the install's
+    # inputs are unchanged*).
+    made = _VIEW_INSTALLS.get(os.path.realpath(wt))
+    if have and have[1].is_dir() and made is not None:
+        recipe = (st.data.get("provision") or {}).get("recipe") or []
+        now_key = await asyncio.to_thread(
+            _install_key, reg, tip, recipe,
+            _copy_inputs_of(st.repo_root))
+        if now_key is not None and now_key == made[0] and \
+                await asyncio.to_thread(_move_view, reg, wt, tip, made[1]):
+            _VIEWS[key] = (tip, wt)
+            _DEPS_INSTALLED.discard(os.path.realpath(wt))
+            _DEPS_FAILED.pop(os.path.realpath(wt), None)
+            _DEPS_KEPT[os.path.realpath(wt)] = made[1][0]
+            return wt
+    _VIEW_INSTALLS.pop(os.path.realpath(wt), None)
 
     def _remove() -> None:
         subprocess.run(["git", *_git_at(reg), "worktree", "remove",

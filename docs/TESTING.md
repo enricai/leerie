@@ -5814,6 +5814,20 @@ template kept at finalize.
   launcher `prune --apply` removes a run that died mid-run, its read-only
   template with it; prune counts a run removed only when it is gone; the
   shell removal; no run-directory deleter ignores its errors.
+- `tests/test_view_moves.py` (6 tests, DESIGN §8 *A view moves to the next
+  tip when the install's inputs are unchanged*; review round 18 L1), real
+  git, the real scripts and `_measured_tree` with an incremental stand-in
+  install: a new tip with the same inputs moves the view — the install's
+  file keeps its inode, the install runs again over it, the build runs
+  again, and a measurement's report, a cache under `node_modules`, a stale
+  build output and a build's file under the install's output are all gone;
+  a changed `package.json` makes a fresh view; an in-place edit of an
+  installed file that keeps its size and resets its mtime makes a fresh
+  view; a rewritten `.git` is pointed back at the view's own repository and
+  the other repository is untouched; a failed install is not recorded; the
+  install key changes with an input, a `patches/` file, a nested manifest,
+  the install entries, their environment and a named copy input, and with
+  nothing else.
 - `tests/test_tree_repos.py` (11 tests, DESIGN §6 *A repository per
   committing tree (I6)*): staging and a subtask tree are worktrees of their
   own bare repositories (the run repository's objects through the

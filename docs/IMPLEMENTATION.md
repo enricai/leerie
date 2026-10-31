@@ -6636,16 +6636,59 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `async _committed_view(st, tree) -> Path | None`: None when `_view_ref`
     is; else, keyed by `realpath(tree)` in the process-level `_VIEWS`
     (`(tip, path)`), the existing view while the branch tip is unchanged,
-    otherwise the old one removed (`git worktree remove --force`,
-    `_rmtree_owned`), its `_DEPS_INSTALLED`/`_DEPS_FAILED` entries
-    dropped, and `_worktree_add_detached_async(st,
-    _helper_worktree_path(st, "view-<basename>"), <tip>, repo=tree)`.
+    otherwise, when the tip moved, the view moved there with its install
+    kept (DESIGN §8 *A view moves to the next tip when the install's inputs
+    are unchanged*) if `_VIEW_INSTALLS[<view>]` holds an install key equal
+    to `_install_key(<run repo>, <new tip>, <recipe>,
+    _copy_inputs_of(st.repo_root))` and `_move_view` succeeds — its
+    `_DEPS_INSTALLED`/`_DEPS_FAILED` entries dropped and
+    `_DEPS_KEPT[<view>]` set to the install's outputs — else the old one
+    removed (`git worktree remove --force`, `_rmtree_owned`), its
+    `_VIEW_INSTALLS`/`_DEPS_INSTALLED`/`_DEPS_FAILED` entries dropped, and
+    `_worktree_add_detached_async(st, _helper_worktree_path(st,
+    "view-<basename>"), <tip>, repo=<run repo>)`.
     Nothing is shared in from `tree`. An unreadable branch or a failed add
     `die()`s ("the committed view of <tree> cannot be made: …").
     `async _measured_tree(st, tree, caps, *, log_path, label) -> str`: the
     view with `_ensure_worktree_deps(<view>, …, label_prefix=label,
     log_prefix=label)` applied (the recipe's `install` and `build` entries,
-    once per view), or `tree` when `_committed_view` is None.
+    once per view and tip), or `tree` when `_committed_view` is None.
+    The move, all process-level and keyed by the view's realpath:
+    `_install_key(repo, tip, recipe, copy_inputs) -> str | None` is a
+    sha256 over each `install` entry's `[command, working_dir, env]`
+    (JSON, sorted keys) and, from `git ls-tree -r -z --full-tree <tip>` in
+    the run repository, the path and `<mode> <type> <sha>` of every tracked
+    file whose basename is in `_INSTALL_INPUT_NAMES` (manifests, lockfiles,
+    package-manager configuration), that lies under a directory in
+    `_INSTALL_INPUT_DIRS` (`patches`), or that is at or under a
+    `copy_inputs` path; None when git fails. `_copy_inputs_of(repo_root)`:
+    every `copy_inputs` of `.leerie/config.toml`'s `language_installs`.
+    In a view (`realpath(tree)` among `_VIEWS`' paths),
+    `_ensure_worktree_deps` collects the install's outputs — `set(
+    _DEPS_KEPT.pop(<view>))` plus, around each `install` entry, the paths
+    `_ignored_paths(tree)` (`_untracked_cmd(which="ignored",
+    directory=True)`, None when git fails) lists after it and not before —
+    and, before the first `build` entry after an install and after the
+    loop, stores `_install_snapshot(tree, outputs) -> InstallSnapshot |
+    None` (`(outputs, zlib(NUL-joined listing), digest)`) in
+    `_INSTALL_OUTPUTS[<view>]` while every install so far succeeded; on a
+    successful run `_record_view_install(st, view_key)` stores
+    `(_install_key(<run repo of the tree the view shows>, <its tip>, …),
+    snapshot)` in `_VIEW_INSTALLS[<view>]`. A run of the recipe drops both
+    entries first. `_output_entries(tree, outputs, known=None)`: every
+    entry at or under the outputs, links never followed, as `(path,
+    _output_state(lstat))` — a file's or link's `mode:ino:size:ctime_ns`,
+    a directory's `d<mode>:ino` — sorted; with `known`, an entry not in it
+    is `_rmtree_owned` and left out; None on an unreadable or unremovable
+    entry. `_install_intact(tree, snap) -> bool`: `_output_entries` with
+    the snapshot's listing as `known`, its `_entries_digest` equal to the
+    snapshot's. `_view_admin_dir(repo, wt) -> Path | None`: the
+    `<repo>/worktrees/<id>` whose `gitdir` names `wt`. `_move_view(repo,
+    wt, tip, snap) -> bool`: `wt/.git` replaced by `gitdir:
+    <_view_admin_dir>`, `checkout -q --detach --force <tip>`, `clean -ffdqx`
+    with `-e /<output>` per output, `_install_intact`, then True only when
+    `HEAD` is `tip` and `status --porcelain --untracked-files=no` is empty.
+    Pinned by `tests/test_view_moves.py`.
     `async _view_tree_sha(st, tree) -> str | None`: `refs/heads/<ref>^{tree}`
     for a worker tree, else `_committed_tree_sha(tree)`. Used by:
     `_measure_axes` (`_committed_view` first, the memo keyed on it, and its
