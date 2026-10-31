@@ -21895,9 +21895,8 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
                      + [str(run_dir / WORKERS_DIR / WORKER_CACHE_DIR)])
     # The run's CLI configuration template: each worker's configuration
     # links its directories (`_worker_dirs`), read, never written.
-    ro: list[str] = _reads_outside(state_root) + [
-        str(run_dir / SYSPROMPT_DIRNAME),
-        str(run_dir / CLAUDE_CONFIG_TEMPLATE)]
+    ro: list[str] = [str(run_dir / SYSPROMPT_DIRNAME),
+                     str(run_dir / CLAUDE_CONFIG_TEMPLATE)]
     if schema_key in _COMMITTING_WORKERS:
         rw.append(str(cwd_r))
         git_rw, git_ro = _tree_git_dirs(cwd_r, run_dir)
@@ -21919,14 +21918,20 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         (sc / "run").mkdir(parents=True, exist_ok=True)
         ro.append(str(sc))
         rw.append(str(sc / "run"))
-    # No grant ever covers the state root whole, whatever a variable names.
-    return WorkerGrants(tuple(dict.fromkeys(_around(rw, state_root))),
-                        tuple(dict.fromkeys(_around(ro, state_root))))
+    # No grant ever covers the state root whole, whatever a variable names
+    # (`_reads_outside` never does, by construction: it is not re-checked,
+    # which cost 0.3 s a call against a 2,000-entry `/tmp`, measured).
+    return WorkerGrants(
+        tuple(dict.fromkeys(_around(rw, state_root))),
+        tuple(dict.fromkeys(_reads_outside(state_root)
+                            + _around(ro, state_root))))
 
 
 def _confined_argv(grants: WorkerGrants, cmd: list[str]) -> list[str]:
     """`cmd` started through the Landlock shim with `grants`."""
-    argv = [sys.executable, "-I", str(LANDLOCK_SCRIPT)]
+    # `-S`: the shim imports only the standard library, and `site` cost
+    # ~15 ms of every worker's start (measured).
+    argv = [sys.executable, "-I", "-S", str(LANDLOCK_SCRIPT)]
     for p in grants.rw:
         argv += ["--rw", p]
     for p in grants.ro:

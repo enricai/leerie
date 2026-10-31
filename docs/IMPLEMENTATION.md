@@ -3826,12 +3826,13 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `<run>/task.md`, `<run>/notes`. `notes_id`: `rw` `<run>/notes/<id>/`
   (created). `selfcheck_dir`: `ro` it, `rw` its `run/` (created). Last,
   `_around(paths, state_root)` replaces any path that contains the state
-  root by `_beside(path, state_root)` — no grant covers the root whole.
+  root by `_beside(path, state_root)` — no grant covers the root whole;
+  `_reads_outside`'s paths, which never do, are not passed through it.
 - `_beside(top, root)` — at each directory from `top` down to `root`'s
   parent, every entry except the one on the way to `root` and except a
   symlink resolving onto that path or beneath `root`. `_reads_outside(root)`
   is `_beside(Path("/"), root)`.
-- `_confined_argv(grants, cmd)` — `[sys.executable, "-I",
+- `_confined_argv(grants, cmd)` — `[sys.executable, "-I", "-S",
   LANDLOCK_SCRIPT, --rw…, --ro…, "--", *cmd]`.
 - `claude_p(…, notes_id=None, selfcheck_dir=None)` computes `grants` once
   per call, after `_worker_dirs` has put the worker's own
