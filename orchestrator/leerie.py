@@ -5748,9 +5748,8 @@ def _git_hooks_on(env: Mapping[str, str]) -> dict[str, str]:
 # The package stores and caches an install reads (DESIGN §6 *The stores a
 # view installs from are leerie's*): variable -> directory name. Leerie's own
 # commands get `<state-root>/.stores/leerie/<name>` (`_leerie_stores`, set on
-# the orchestrator's environment in `main()`); a worker gets
-# `<run-dir>/workers/<wid>/cache/<name>` (`_worker_cache_env`), the pnpm store
-# once per run. Every installer the provision recipe can name is covered:
+# the orchestrator's environment in `main()`); the run's workers share
+# `<run-dir>/workers/cache/<name>` (`_worker_cache_env`). Every installer the provision recipe can name is covered:
 # pnpm, npm, yarn (classic and berry), bun, corepack, pip, uv, poetry,
 # pipenv, go, cargo, bundler, composer, dotnet.
 _STORE_VARS: dict[str, str] = {
@@ -5800,33 +5799,26 @@ def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
         env[var] = str(d)
 
 
-def _worker_id(sid: str) -> str:
-    """The directory name of a worker's own area, from the sid of its first
-    call."""
-    wid = _CGROUP_NAME_UNSAFE_RE.sub("-", sid)
-    return wid if wid.strip(".") else "worker"
-
-
-def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
-                      sid: str) -> dict[str, str]:
-    """A copy of `env` whose every store and cache is the worker's own:
-    `<run-dir>/workers/<wid>/cache/<name>` (a baked value is kept, as
-    `_leerie_stores` keeps it) and `XDG_CACHE_HOME` there, and
-    the run's worker pnpm store `<run-dir>/workers/pnpm-store` (one cold
-    install per run, not per worker). None of them is a leerie store, and
-    pnpm never links one store's file into another (DESIGN §6 *The stores
-    a view installs from are leerie's*)."""
+def _worker_cache_env(env: Mapping[str, str],
+                      run_dir: Path) -> dict[str, str]:
+    """A copy of `env` whose every store and cache is the run's workers':
+    `<run-dir>/workers/cache/<name>` (a baked value is kept, as
+    `_leerie_stores` keeps it) and `XDG_CACHE_HOME` at
+    `<run-dir>/workers/cache/xdg`. One set per run, not per worker: what a
+    worker leaves in a cache can mislead only another worker, never a
+    measurement, and a cold set costs every worker a download (measured on
+    funeralworks: Playwright's chromium 20 s and 656 MB). None of them is a
+    leerie store, and pnpm never links one store's file into another
+    (DESIGN §6 *The stores a view installs from are leerie's*)."""
     out = dict(env)
-    workers = Path(run_dir) / "workers"
-    cache = workers / _worker_id(sid) / "cache"
+    cache = Path(run_dir) / "workers" / "cache"
     for var, name in _STORE_VARS.items():
         if not (env.get(var) or "").startswith(_BAKED_ROOT):
             out[var] = str(cache / name)
-    out["npm_config_store_dir"] = str(workers / "pnpm-store")
     out["XDG_CACHE_HOME"] = str(cache / "xdg")
     for k in _COPY_IMPORT_ENV:
         out.pop(k, None)
-    for d in (cache / "xdg", workers / "pnpm-store"):
+    for d in (cache / "xdg", cache / "pnpm-store"):
         with contextlib.suppress(OSError):
             d.mkdir(parents=True, exist_ok=True)
     return out
@@ -21660,7 +21652,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                                else os.environ)
     # Its stores and caches are its own, never leerie's (DESIGN §6 *The
     # stores a view installs from are leerie's*).
-    worker_env = _worker_cache_env(worker_env, leerie_dir, sid)
+    worker_env = _worker_cache_env(worker_env, leerie_dir)
 
     # The prompt is staged to a temp file BEFORE the spawn, and that file —
     # already positioned at byte 0 with the whole payload on disk — becomes

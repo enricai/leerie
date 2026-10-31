@@ -4083,13 +4083,18 @@ only from stores that leerie alone writes.* So there are two sets:
   bundler, composer, NuGet (`_STORE_VARS`). Only leerie's commands use
   them, so they are kept across runs: one cold install per repository
   (measured: barnacle 9.0 s, funeralworks 23.2 s), warm after.
-- *A worker's*, `<run-dir>/workers/<wid>/cache/<name>` with
-  `XDG_CACHE_HOME` there, `<wid>` the sid of its first call, and one pnpm
-  store per run, `<run-dir>/workers/pnpm-store` (`_worker_cache_env`, in
-  the worker's spawn). One pnpm store per run rather than per worker,
-  because what a worker leaves in it can mislead only another worker of
-  the run, never a measurement, and a cold pnpm store costs 9–23 s and
-  0.5–1.3 GB per copy. They go with the run directory.
+- *The run's workers'*, `<run-dir>/workers/cache/<name>` with
+  `XDG_CACHE_HOME` at `<run-dir>/workers/cache/xdg`
+  (`_worker_cache_env`, in the worker's spawn), one set per run, shared by
+  its workers. Per run rather than per worker, because what a worker
+  leaves in a cache can mislead only another worker of the run, never a
+  measurement, while every cold copy is paid again: a cold pnpm store
+  costs 9–23 s and 0.5–1.3 GB; on funeralworks, Playwright's chromium
+  costs 20.1 s and 656 MB cold against 2.1 s warm, and a warm-store
+  install with a cold `XDG_CACHE_HOME` 14.8 s against 11.8 s (corepack's
+  pnpm 23 MB, Prisma's engines 22 MB). A worker's configuration and
+  temporary directory stay its own: they carry hooks and sessions, a
+  cache carries neither. The set goes with the run directory.
 
 Two stores never share a file: each fetches its own copy (measured: 0
 inodes in common after the same lockfile was installed from both). What

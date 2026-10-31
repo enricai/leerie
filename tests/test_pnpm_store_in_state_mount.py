@@ -47,7 +47,7 @@ def test_both_sets_of_stores_are_in_the_state_root(leerie, tmp_path):
     root = tmp_path / "state-root"
     env: dict[str, str] = {}
     leerie._leerie_stores(env, root)
-    wenv = leerie._worker_cache_env(env, root / "runs" / "r1", "feat-001")
+    wenv = leerie._worker_cache_env(env, root / "runs" / "r1")
     for v in (env["npm_config_store_dir"], wenv["npm_config_store_dir"]):
         assert Path(v).is_relative_to(root), v
     # Leerie's is not in a run tree, which `leerie prune` and the reaper

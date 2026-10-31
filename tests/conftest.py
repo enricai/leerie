@@ -7,6 +7,7 @@ fixture.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import ctypes
 import importlib.util
@@ -14,11 +15,43 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# No test reaches the user's real `~/.leerie` (or anything else under their
+# home). The launcher resolves its state dir to `$HOME/.leerie/<repo>` and
+# makes `logs/` there before any verb, so a test that ran it without
+# `LEERIE_STATE_DIR` wrote into the user's run state (`test_re_seed`,
+# `test_version_flag`: `~/.leerie/_self/logs`, `.owner`). The session gets
+# its own HOME before any test module is imported, with the git identity CI
+# sets globally (.github/workflows/test.yml); `REAL_HOME` is the user's, for
+# a test that must read a cache there on purpose.
+# Idempotent: a second import of this module (under another name) keeps the
+# first one's HOME and its record of the user's.
+if os.environ.get("PYTEST_LEERIE_TEST_HOME") and \
+        os.environ.get("PYTEST_LEERIE_TEST_HOME") == os.environ.get("HOME"):
+    REAL_HOME = os.environ.get("PYTEST_LEERIE_REAL_HOME", "")
+else:
+    REAL_HOME = os.environ.get("HOME", "")
+    _TEST_HOME = Path(tempfile.mkdtemp(prefix="leerie-test-home-"))
+    (_TEST_HOME / ".gitconfig").write_text(
+        "[user]\n\temail = ci@leerie.invalid\n\tname = Leerie CI\n")
+    os.environ["HOME"] = str(_TEST_HOME)
+    os.environ["PYTEST_LEERIE_TEST_HOME"] = str(_TEST_HOME)
+    os.environ["PYTEST_LEERIE_REAL_HOME"] = REAL_HOME
+    atexit.register(shutil.rmtree, _TEST_HOME, True)
+
+
+@pytest.fixture(autouse=True)
+def _home_is_never_the_users():
+    """A test that points HOME back at the user's fails, before and after."""
+    assert os.environ.get("HOME") != REAL_HOME or not REAL_HOME
+    yield
+    assert os.environ.get("HOME") != REAL_HOME or not REAL_HOME
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 

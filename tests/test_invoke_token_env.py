@@ -107,7 +107,7 @@ class TestActiveTokenEnvThreading:
         asyncio.run(run())
         env = captured[0]
         assert env == leerie._worker_cache_env(
-            leerie._git_hooks_on(os.environ), tmp_path, "test-sid")
+            leerie._git_hooks_on(os.environ), tmp_path)
         assert env["LEERIE_PROBE_MARK"] == "inherited"
         assert "LEERIE_GIT_HOOKS_OFF" not in env
 

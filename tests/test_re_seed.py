@@ -379,10 +379,13 @@ def test_launcher_consumes_re_seed_flags():
     assert "RE_SEED_FORCE=true" in text
 
 
-def test_launcher_re_seed_requires_run_id_arg():
-    """`leerie re-seed` without <run-id> errors with usage."""
+def test_launcher_re_seed_requires_run_id_arg(tmp_path):
+    """`leerie re-seed` without <run-id> errors with usage. The launcher
+    makes its state dir's `logs/` (and the `.owner` sidecar) before any
+    verb: pinned to tmp_path, never `~/.leerie/<repo>`."""
     result = run_bash(
         f"{LAUNCHER} re-seed",
+        env={"LEERIE_STATE_DIR": str(tmp_path / "state")},
     )
     assert result.returncode != 0
     assert "requires a <run-id>" in result.stderr

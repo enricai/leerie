@@ -416,7 +416,7 @@ def test_no_env_override_when_leerie_worker_debug_unset(leerie, leerie_dir,
 
     env = captured.get("env")
     assert env == leerie._worker_cache_env(
-        leerie._git_hooks_on(os.environ), leerie_dir, "t-no-debug"), (
+        leerie._git_hooks_on(os.environ), leerie_dir), (
         "without LEERIE_WORKER_DEBUG the worker inherits the orchestrator's "
         "full environment (token, PATH, etc.), less leerie's hooks entry, "
         "with its own stores")

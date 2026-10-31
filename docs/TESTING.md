@@ -23,6 +23,17 @@ enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
 `resolve_blt`), including a coupling test that the retry-policy markers
 match the live check-function strings.
 
+**The suite runs in its own HOME.** `tests/conftest.py` points `HOME` at a
+fresh temporary directory before any test module is imported, with the git
+identity CI sets globally, and an autouse fixture fails any test that
+points it back at the user's (`REAL_HOME` holds that path, for a test that
+reads a cache there on purpose: the pnpm fallback check uses the user's
+corepack cache, without which corepack fetches the newest pnpm). The
+launcher resolves its state dir to `$HOME/.leerie/<repo>` and makes `logs/`
+there before any verb, so `test_re_seed` and `test_version_flag` wrote
+`~/.leerie/_self/logs` and `.owner` into the user's run state; both now
+pin `LEERIE_STATE_DIR` to `tmp_path` as well.
+
 ## Launcher AWS / EC2 knobs
 
 The `--aws-region`/`--aws-profile` knobs (which region/profile leerie

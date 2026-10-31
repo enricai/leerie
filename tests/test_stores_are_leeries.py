@@ -80,7 +80,7 @@ def _worker_installs_and_poisons(leerie, w, sid: str) -> Path:
     """The worker's own install in its tree, then the attack: the
     hard-linked file edited in place, same size, mtime restored."""
     staging = w["staging"]
-    env = leerie._worker_cache_env(os.environ, w["run_dir"], sid)
+    env = leerie._worker_cache_env(os.environ, w["run_dir"])
     subprocess.run([sys.executable, str(w["script"]), str(w["reg"])],
                    cwd=staging, env=env, check=True)
     f = staging / "node_modules" / "dep" / "index.js"
@@ -148,7 +148,7 @@ def test_every_store_variable_is_split(leerie, tmp_path):
     root, run_dir = tmp_path / "root", tmp_path / "root" / "runs" / "r"
     lenv: dict[str, str] = {"GOCACHE": "/opt/go-cache"}
     leerie._leerie_stores(lenv, root)
-    wenv = leerie._worker_cache_env(lenv, run_dir, "feat/001")
+    wenv = leerie._worker_cache_env(lenv, run_dir)
     leerie_side = root / ".stores" / "leerie"
     for var in leerie._STORE_VARS:
         if var == "GOCACHE":                    # baked into the image
@@ -156,11 +156,13 @@ def test_every_store_variable_is_split(leerie, tmp_path):
             continue
         assert Path(lenv[var]).is_relative_to(leerie_side), var
         assert Path(wenv[var]).is_relative_to(run_dir / "workers"), var
-    assert Path(wenv["XDG_CACHE_HOME"]).is_relative_to(
-        run_dir / "workers" / "feat-001" / "cache")
-    assert wenv["npm_config_store_dir"] == str(
-        run_dir / "workers" / "pnpm-store")
-    assert leerie._worker_id("..") == "worker"
+    # One set per run, every worker's: the grant is that one directory.
+    cache = run_dir / "workers" / "cache"
+    assert Path(wenv["XDG_CACHE_HOME"]).is_relative_to(cache)
+    for var in leerie._STORE_VARS:
+        if var != "GOCACHE":
+            assert Path(wenv[var]).is_relative_to(cache), var
+    assert wenv["npm_config_store_dir"] == str(cache / "pnpm-store")
 
 
 def test_invoke_gives_the_worker_its_own_stores(leerie, tmp_path,

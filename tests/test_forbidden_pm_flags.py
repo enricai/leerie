@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import REAL_HOME
+
 FORBIDDEN = ["pnpm test"]
 
 # (command, the test script runs) — from pnpm 11 / npm 11 / yarn 1 `--help`.
@@ -239,6 +241,12 @@ def test_pinned_pnpm_fallback_still_matches_the_real_pnpm(tmp_path):
     env = {**os.environ, "ARGV_LOG": str(log), "WS_ROOT": str(root),
            "npm_config_update_notifier": "false", "CI": "1",
            "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+    # The pnpm the fixture pins is the one corepack resolves with the user's
+    # cache; the session's own HOME has none, and corepack would fetch the
+    # newest pnpm instead (12.16.1 reads `pnpm --dir . vitest` otherwise).
+    corepack = Path(REAL_HOME) / ".cache" / "node" / "corepack"
+    if corepack.is_dir():
+        env["COREPACK_HOME"] = str(corepack)
     drift = []
     for case in PNPM_FIXTURE["cases"]:
         ran = _pnpm_ran(root, case["command"], log, env)
