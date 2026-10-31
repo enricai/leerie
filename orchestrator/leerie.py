@@ -5831,19 +5831,102 @@ _COPY_IMPORT_ENV: dict[str, str] = {
     "pnpm_config_package_import_method": "copy",
     "UV_LINK_MODE": "copy",
 }
-# Populating leerie's store from a lockfile with no project or dependency
-# code (DESIGN §6 *A view's install never writes leerie's store*): manager
-# -> (argv, lockfile, files to stage). The fetch runs in a staging directory
-# holding only these data files — never the worker's `.pnpmfile.cjs`,
-# `.npmrc` or scripts — so leerie's store is written only by a process that
-# runs no committed code. Built for pnpm, the manager the attack was
-# measured on; a manager without an entry falls through to its install
-# filling the store, kept off the store's inodes by `_COPY_IMPORT_ENV`.
-_STORE_FETCH: dict[str, tuple[list[str], str, tuple[str, ...]]] = {
-    "pnpm": (["pnpm", "fetch", "--ignore-scripts"], "pnpm-lock.yaml",
-             ("pnpm-lock.yaml", "package.json", "pnpm-workspace.yaml",
-              "patches")),
+class _StoreFetch(NamedTuple):
+    """How to fill leerie's store for one manager with no committed code."""
+    argv: tuple[str, ...]
+    lockfiles: tuple[str, ...]      # any one present means "fetchable"
+    stage: tuple[str, ...]          # data files copied into the staging dir
+    env: tuple[tuple[str, str], ...] = ()
+
+
+# Filling leerie's store from a lockfile with no project or dependency code
+# (DESIGN §6 *Which stores an install may share*). The fetch runs in a
+# staging directory holding only the data files it reads — never a committed
+# `.pnpmfile.cjs`, `.npmrc`, `.yarnrc.yml`, plugin or script — so the store
+# is written only by a process that runs no committed code. Each was
+# measured: the fetch ran no hook, and the real install then succeeded
+# against the store made read-only.
+_STORE_FETCH: dict[str, _StoreFetch] = {
+    "pnpm": _StoreFetch(("pnpm", "fetch", "--ignore-scripts"),
+                        ("pnpm-lock.yaml",),
+                        ("pnpm-lock.yaml", "package.json",
+                         "pnpm-workspace.yaml", "patches")),
+    "npm": _StoreFetch(("npm", "ci", "--ignore-scripts", "--no-audit",
+                        "--no-fund"),
+                       ("package-lock.json", "npm-shrinkwrap.json"),
+                       ("package.json", "package-lock.json",
+                        "npm-shrinkwrap.json")),
+    # Classic and berry alike, by environment (their flags differ). Measured:
+    # `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=0` each let
+    # the root `postinstall` run; these two values stop it in both.
+    "yarn": _StoreFetch(("yarn", "install"), ("yarn.lock",),
+                        ("package.json", "yarn.lock"),
+                        (("YARN_IGNORE_SCRIPTS", "true"),
+                         ("YARN_ENABLE_SCRIPTS", "false"))),
+    "bun": _StoreFetch(("bun", "install", "--ignore-scripts"),
+                       ("bun.lock", "bun.lockb"),
+                       ("package.json", "bun.lock", "bun.lockb")),
+    "go": _StoreFetch(("go", "mod", "download"), ("go.sum",),
+                      ("go.mod", "go.sum")),
+    "composer": _StoreFetch(("composer", "install", "--no-scripts",
+                             "--no-plugins", "--no-autoloader",
+                             "--no-interaction"),
+                            ("composer.lock",),
+                            ("composer.json", "composer.lock")),
 }
+# Stores no other tree may read, one set per tree (DESIGN §6 *Which stores
+# an install may share*): bundler and NuGet run committed code on every
+# command (the Gemfile; MSBuild targets on restore), so no fetch is free of
+# it; uv's install of the project, cargo's lock and Go's build cache write
+# the store as they build. Each also served an edited entry on reuse. Set,
+# for every command leerie runs in a tree under `<run-dir>/worktrees/`, to
+# `<run-dir>/tree-stores/<tree>/<name>` (`_tree_store_env`).
+_TREE_STORE_VARS: frozenset[str] = frozenset({
+    "UV_CACHE_DIR", "CARGO_HOME", "BUNDLE_PATH", "NUGET_PACKAGES",
+    "GOCACHE", "WORKON_HOME", "npm_config_cache_dir"})
+# Shared and writable by an install, because the manager refuses an edited
+# entry on reuse (measured): pip and poetry against the lockfile's or the
+# index's hash, berry against `yarn.lock`'s checksum.
+_VERIFIED_STORE_VARS: frozenset[str] = frozenset({
+    "PIP_CACHE_DIR", "POETRY_CACHE_DIR", "YARN_GLOBAL_FOLDER"})
+# Shared, filled only by `_STORE_FETCH`, read-only to every install.
+_FETCHED_STORE_VARS: frozenset[str] = frozenset({
+    "npm_config_store_dir", "npm_config_cache", "YARN_CACHE_FOLDER",
+    "BUN_INSTALL_CACHE_DIR", "COREPACK_HOME", "GOMODCACHE",
+    "COMPOSER_CACHE_DIR"})
+
+
+def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
+                    ) -> None:
+    """Point `env`'s `_TREE_STORE_VARS` at the tree `cwd` lies in, when that
+    tree is one of a run's (`<run-dir>/worktrees/<tree>`): `<run-dir>/
+    tree-stores/<tree>/<name>`, made here. A baked value is kept. A `cwd`
+    outside every run tree leaves `env` as it is."""
+    if cwd is None:
+        return
+    p = Path(os.path.abspath(cwd))
+    for d in (p, *p.parents):
+        if d.parent.name == "worktrees" and (d / ".git").exists():
+            root = d.parent.parent / "tree-stores" / d.name
+            break
+    else:
+        return
+    for var in _TREE_STORE_VARS:
+        if (env.get(var) or "").startswith(_BAKED_ROOT):
+            continue
+        dst = root / _STORE_VARS[var]
+        with contextlib.suppress(OSError):
+            dst.mkdir(parents=True, exist_ok=True)
+        env[var] = str(dst)
+    _with_pnpm_spellings(env)
+
+
+def _tree_stores_for(env: Mapping[str, str], cwd: str | Path | None
+                     ) -> dict[str, str]:
+    """A copy of `env` with `_tree_store_env` applied for `cwd`."""
+    out = dict(env)
+    _tree_store_env(out, cwd)
+    return out
 
 
 def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
@@ -9627,6 +9710,9 @@ async def _run_streaming(
     `_repo_command_env` — without leerie's hooks-off git entry.
     """
     spawn_cmd = list(cmd)
+    # A command in a run's tree reads that tree's own stores
+    # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may share*).
+    env = _tree_stores_for(env if env is not None else os.environ, cwd)
     gate_r: int | None = None
     gate_w: int | None = None
     if cgroup_sid is not None:
@@ -40506,9 +40592,8 @@ _DEPS_FAILED: dict[str, int] = {}
 
 
 def _recipe_manager(command: list[str] | None) -> str | None:
-    """The package manager a recipe entry's command runs, or None. The first
-    token, bare or after an env/`cd`/`timeout` prefix a recipe never carries
-    in a list argv — so the first token is enough."""
+    """The package manager a recipe entry's command runs, when it has a
+    `_STORE_FETCH` entry, else None: the first token of the list argv."""
     return (command[0] if command and command[0] in _STORE_FETCH else None)
 
 
@@ -40536,15 +40621,15 @@ async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
         if (mgr, wd_rel) in seen:
             continue
         seen.add((mgr, wd_rel))
-        argv_tmpl, lockfile, files = _STORE_FETCH[mgr]
+        spec = _STORE_FETCH[mgr]
         src = Path(tree) / wd_rel
-        if not (src / lockfile).is_file():
+        if not any((src / lf).is_file() for lf in spec.lockfiles):
             continue
         stage = (st.run_dir / ".store-fetch"
                  / _CGROUP_NAME_UNSAFE_RE.sub("-", f"{mgr}-{wd_rel}"))
         await asyncio.to_thread(_rmtree_owned, stage)
         stage.mkdir(parents=True, exist_ok=True)
-        for name in files:
+        for name in spec.stage:
             s = src / name
             if s.is_dir():
                 shutil.copytree(s, stage / name, symlinks=True)
@@ -40554,16 +40639,17 @@ async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
             # A fetch is leerie's own, but the task's forbid binds it too
             # (DESIGN §9): a forbidden fetch is skipped, and the install that
             # follows still copies.
-            argv = _blt_shell_argv(list(argv_tmpl), _forbidden_specs(st.data))
+            argv = _blt_shell_argv(list(spec.argv), _forbidden_specs(st.data))
         except ForbiddenByTask as ex:
             log(f"  {log_prefix}: store fetch not run — {ex}")
             await asyncio.to_thread(_rmtree_owned, stage)
             continue
         try:
             rc, _tail = await _run_streaming(
-                argv, cwd=str(stage), env=None,
+                argv, cwd=str(stage),
+                env={**os.environ, **dict(spec.env)} if spec.env else None,
                 timeout=caps.get("worker_timeout_sec"), log_path=log_path,
-                label=f"{label_prefix}-store-fetch: {' '.join(argv_tmpl)}",
+                label=f"{label_prefix}-store-fetch: {' '.join(spec.argv)}",
                 verbosity="quiet")
             if rc != 0:
                 log(f"  {log_prefix}: store fetch exited {rc} "
@@ -40676,12 +40762,19 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
             entry_env = ({**os.environ, **e["env"]} if e.get("env")
                          else None)
             entry_env = {**(entry_env or os.environ), **_COPY_IMPORT_ENV}
+            command = list(e["command"])
+            # bun hard-links from its cache by default and reads its backend
+            # only from the command line (measured: no environment variable
+            # moves it), so a bun install copies through the flag.
+            if (command[:1] == ["bun"] and command[1:2] in (["install"],
+                                                            ["i"])
+                    and not any(a.startswith("--backend") for a in command)):
+                command.append("--backend=copyfile")
             try:
                 # A recipe entry is a repo command: the task's forbid binds it
                 # too (DESIGN §9 *Recipe install steps fall under the forbid
                 # too*). A refused install is a failed install.
-                argv = _blt_shell_argv(e["command"],
-                                       _forbidden_specs(st.data))
+                argv = _blt_shell_argv(command, _forbidden_specs(st.data))
             except ForbiddenByTask as ex:
                 ok = ok and e.get("kind") != "install"
                 log(f"  {log_prefix}: {e.get('kind')} not run — {ex}: "
@@ -41821,6 +41914,9 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
                        check=False)
         if wt.exists():
             _rmtree_owned(wt)
+        # Its own stores go with it: what one commit's code left there must
+        # not reach the next commit's measurement (`_TREE_STORE_VARS`).
+        _rmtree_owned(wt.parent.parent / "tree-stores" / wt.name)
     await asyncio.to_thread(_remove)
     _VIEWS.pop(key, None)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))

@@ -4441,13 +4441,68 @@ Landlock-confined `pnpm install` with the store read-only succeeds,
 barnacle 13–15 s, funeralworks 29–43 s with `prisma generate`). Copying is
 not the cost it looked: with the store read-only, a copied install of
 barnacle took 13.4 s against 12.9–14.6 s hard-linked, because the
-repository's own scripts dominate either way. The fetch step is built for pnpm, the manager the attack was
-measured on and the one both bench repositories use (`_STORE_FETCH`); a
-manager with no entry there falls through to its install filling the store
-as before, kept off the store's inodes by the copy import. Whether npm,
-yarn, pip, uv, cargo, go and bundler each need their own no-code fetch, or
-already refuse an edited cache entry by checking it against the lockfile's
-hash, is not yet measured and is the next step.
+repository's own scripts dominate either way.
+
+**Which stores an install may share.** The same question, asked of every
+installer the recipe can name, measured in a container (Debian 13; npm
+11.19, yarn 1.22 and 4.9, bun 1.4, pip 25.1, uv 0.13, poetry 2.1, pipenv
+2024.0, cargo 1.85, go 1.24, bundler 2.6, composer 2.8, .NET SDK 8.0):
+does any command that writes the manager's store run committed code, and
+does the store refuse an entry edited in place when it is used again? A
+project carried a committed hook that wrote a marker (a `postinstall`, a
+`setup.py`, a `build.rs`, a `Gemfile` line, a `post-install-cmd`, an MSBuild
+target); an edit was a same-size, mtime-restored change to a cached file,
+or for an archive cache a valid rebuilt archive carrying a marker.
+
+| manager | a fetch that runs no committed code | edited entry on reuse |
+|---|---|---|
+| pnpm | `fetch --ignore-scripts` | served (mtime only) |
+| npm | `ci --ignore-scripts` | refused: content is looked up by its integrity, so an edited entry is a miss |
+| yarn classic | `install` with `YARN_IGNORE_SCRIPTS=true` | served |
+| yarn berry | `install` with `YARN_ENABLE_SCRIPTS=false` | refused: `yarn.lock` checksum |
+| bun | `install --ignore-scripts` | served, and hard-linked into the tree |
+| pip | `download --only-binary` | refused, with and without `--require-hashes` (the edited wheel was reported "Using cached" and not installed) |
+| uv | `sync --no-install-project` | served |
+| poetry | `install --no-root` | refused: `poetry.lock` hash |
+| pipenv | — | refused: `Pipfile.lock` hashes |
+| cargo | `cargo fetch` | served (`registry/src` reused unchecked) |
+| go | `go mod download` | served (`go mod verify` sees it; a build does not) |
+| composer | `install --no-scripts --no-plugins` | served |
+| bundler | none: the `Gemfile` is Ruby and runs on every command | served |
+| NuGet | none: `restore` runs the project's MSBuild targets | served |
+
+That puts each store in one class (`_FETCHED_STORE_VARS`,
+`_VERIFIED_STORE_VARS`, `_TREE_STORE_VARS`; every `_STORE_VARS` variable
+in exactly one):
+
+- *Fetched* — pnpm, npm, yarn classic, bun, corepack, go modules, composer:
+  shared, written only by the manager's `_STORE_FETCH` entry in a staging
+  directory of data files (never a committed `.npmrc`, `.yarnrc.yml`,
+  `.pnpmfile.cjs`, plugin or script), and read-only to every install.
+  Measured: each fetch ran no hook, and the real install then succeeded
+  against the store made read-only. For yarn the spelling matters:
+  `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=0` each let a
+  root `postinstall` run, while `YARN_IGNORE_SCRIPTS=true` with
+  `YARN_ENABLE_SCRIPTS=false` stopped it in both generations. bun hard-links from its cache and reads
+  its import backend only from the command line, so a recipe's bun install
+  gets `--backend=copyfile`.
+- *Verified* — pip, poetry, yarn berry's global cache: shared, and an
+  install may write them, because what it writes is checked against a hash
+  the commit pins before it is used.
+- *Per tree* — uv, cargo, bundler, NuGet, Go's build cache, pipenv's
+  environments, pnpm's metadata cache: one set per tree, at
+  `<run-dir>/tree-stores/<tree>/<name>`, set for every command leerie runs
+  in a tree under `<run-dir>/worktrees/` (`_tree_store_env`, applied by
+  `_run_streaming`), and removed with a view when its tip moves. bundler and
+  NuGet have no fetch free of committed code; uv's install of the project,
+  cargo's package lock and Go's build cache write the store as they build,
+  so an install could not run against it read-only (measured for uv: the
+  project build fails on a read-only cache). Nothing one tree's code leaves
+  there reaches another tree or a later commit.
+
+The worker's write boundary needs, for a confined install: the fetched
+stores read-only, the verified ones writable, and its own tree's
+`tree-stores` writable.
 
 What this does not cover: a worker writing leerie's store, a view, `/opt`
 or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside
