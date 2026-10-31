@@ -9920,7 +9920,24 @@ async def _take_tree_branch_async(tree: str | Path) -> str | None:
 async def _take_after_worker(cwd: str | Path) -> None:
     """A worker that ran in a committing tree has its branch taken as soon
     as it exits, before anything reads what it did; a take that fails stops
-    the run (the run repository would not hold the worker's work)."""
+    the run (the run repository would not hold the worker's work). Before
+    the take, leerie's settings go back over its tree's repository (DESIGN
+    §8 *The settings are leerie's*): a worker's `git config` — husky's
+    install sets `core.hooksPath` — is its environment, put back and never
+    counted against it. Settings that still differ stop the run: leerie
+    could not then read the tree through its own."""
+    try:
+        done = await asyncio.to_thread(_restore_settings, cwd)
+    except OSError as e:
+        done = []
+        log(f"  could not put leerie's git settings back in {cwd}: {e}")
+    if done:
+        log(f"  put leerie's git settings back in {cwd} "
+            f"({', '.join(done)}): the worker changed its tree's repository")
+    left = await asyncio.to_thread(_settings_dirt, cwd)
+    if left:
+        die(f"leerie cannot read {cwd} through its own git settings: "
+            f"{'; '.join(left)} (DESIGN §8 *The settings are leerie's*)")
     try:
         await _take_tree_branch_async(cwd)
     except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
@@ -38783,14 +38800,6 @@ CLEAN_TREE_BASE_NOTE = (
     "branch no longer contains that commit, which your work must sit on: "
     "rebase or cherry-pick the commits that belong in your change onto it "
     "(`git rebase {base}`), never reset your branch behind it.")
-# Added when a settings line is present: its one act.
-CLEAN_TREE_SETTINGS_NOTE = (
-    "\nA line that says git settings changed is about this tree's "
-    "repository, not a file of yours: undo the change you "
-    "made there (`diff` the two paths it names; `git config --unset <key>` "
-    "for a key you set, or remove what you added). Leerie reads every tree "
-    "through its own copy of those settings, so a setting never makes a "
-    "file clean.")
 _SETTINGS_LINE = "git settings "
 # The prefixes of `_tree_dirt`'s branch lines (never a porcelain line,
 # which starts with a two-character status).
@@ -38908,9 +38917,13 @@ async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
     `refs/heads/<branch>` (detached, or another branch — review round 15
     H2); with `base`, a line when HEAD does not descend from it (the branch
     moved back or sideways). [] is clean; None when git could not answer
-    (nothing was read, so not clean). The shell half is
+    (nothing was read, so not clean). Leerie's settings are put back over
+    the tree's repository first (`_restore_settings`), so a settings line
+    means only that they could not be. The shell half is
     `leerie_tree_dirt`, line for line."""
     try:
+        with contextlib.suppress(OSError):
+            await asyncio.to_thread(_restore_settings, tree)
         prefix, env = await asyncio.to_thread(_git_view, tree)
         settings = await asyncio.to_thread(_settings_dirt, tree)
         r = await run_proc(["git", *prefix, "status", "--porcelain",
@@ -39039,6 +39052,13 @@ async def _clean_tree_gate(tree: str | Path, *, caps: dict, label: str,
             return []
         if lines is None:
             lines = ["(git status failed — the tree could not be read)"]
+        settings = [ln for ln in lines if ln.startswith(_SETTINGS_LINE)]
+        if settings:
+            # `_tree_dirt` put leerie's settings back first; a settings line
+            # is leerie's own copy failing, nothing the worker can undo.
+            die(f"{label}: leerie cannot read {tree} through its own git "
+                f"settings: {'; '.join(settings)} (DESIGN §8 *The settings "
+                "are leerie's*)")
         if attempt >= reasks:
             log(f"  {label}: tree still not clean after {reasks} re-ask(s): "
                 + "; ".join(lines[:5])
@@ -39049,8 +39069,6 @@ async def _clean_tree_gate(tree: str | Path, *, caps: dict, label: str,
             f"re-asking it to commit or delete each ({attempt}/{reasks})")
         note = CLEAN_TREE_REASK_NOTE.format(lines="\n".join(
             f"    {line}" for line in lines))
-        if any(line.startswith(_SETTINGS_LINE) for line in lines):
-            note += CLEAN_TREE_SETTINGS_NOTE
         if any(line.startswith(_BRANCH_LINE_HEAD) for line in lines):
             note += CLEAN_TREE_BRANCH_NOTE.format(branch=branch)
         if base and any(line.startswith(_BRANCH_LINE_BASE) for line in lines):

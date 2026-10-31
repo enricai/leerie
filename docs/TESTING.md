@@ -5841,6 +5841,28 @@ template kept at finalize.
   checker (untracked files against the tree's own `.gitignore` files only)
   and cleared by the restore; the implementer's base is where its subtask
   branch forked from the run branch.
+- `tests/test_worker_settings_are_put_back.py` (5 tests, review round 18
+  H1, DESIGN §8 *The settings are leerie's*). A worker's change to its
+  tree repository's settings is put back by leerie and never counted
+  against it. Real run repository, real `setup-run.sh` and
+  `new-worktree.sh`, real git, and the gate:
+  - The real husky 9 `prepare` (node, `LEERIE_TEST_HUSKY_DIR`, binding when
+    set; skipped unset) runs in a worker tree, with the user's checkout
+    holding `hooksPath = .husky/_` and holding no hooks path. The worker
+    commits, `_take_after_worker` puts the config back and takes, and the
+    gate finds the tree clean with no re-ask, the commit in the run
+    repository.
+  - `core.fileMode=false` hides a mode change from the worker's own git,
+    but each checker half alone shows ` M run.sh`, and the re-ask names it
+    and says nothing about settings.
+  - A missing copy stops the run at the gate and at the worker's exit.
+
+  Falsified, each turning a test red: the tip's code; no put-back at the
+  worker's exit; none in the Python checker; none in the shell checker;
+  and a gate that re-asks a settings line. `tests/test_run_settings.py`
+  and `tests/test_hidden_dirt.py` assert the same contract: what a setting
+  hid is the file's own line, and every key DESIGN §8 lists is put back by
+  either checker half alone.
 - `tests/test_needs_human_sources_render.py` (14 tests, DESIGN §6 *The
   PR's end-state section*, review round 14 H1): every "Needs human
   verification" source the code can write renders in the PR; the sources

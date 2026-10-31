@@ -2030,8 +2030,8 @@ leerie's own enumerated git:
   and `info/` are copied to `<run-dir>/repo-settings/`, and leerie reads
   every tree of the run through that copy and through a per-process copy
   of the settings outside the repository (§8 *The settings are leerie's*):
-  a worker's `git config` in its tree is visible as a change, never a
-  change in what git reports.
+  a worker's `git config` in its tree is put back before leerie reads the
+  tree, so it never changes what git reports to leerie.
 - *Bringing the run branch back* is host-side, after the run, as it already
   is on Fly (`fetch_branch`). The launcher fetches
   `refs/heads/leerie/runs/<id>` from `<state-root>/runs/<id>/repo` into the
@@ -8770,16 +8770,48 @@ not own. The invariant: *the settings git reads to report a tree of the
 run are fixed by leerie; a worker cannot change what git reports.* Three
 parts, each by mechanism rather than by key:
 
-- *The run repository's own settings are compared.* When leerie creates
-  the run's repository it copies its `config` and its `info/` directory to
-  `<run-dir>/repo-settings/`, and never writes either afterwards (it sets
-  `repack.updateServerInfo=false` first: an automatic `git gc` otherwise
-  writes `info/refs`, measured). Every
-  key, filter, include or per-worktree config file can take effect only
-  through one of those two, so a difference in either is an I1 line
-  naming both paths, and the one restore copies leerie's back. git's own
-  writes of the same value leave the file byte-identical (husky's `git
-  config core.hooksPath .husky/_` over the carried `.husky/_`, measured).
+- *The run repository's own settings are put back before leerie reads.*
+  When leerie creates the run's repository it copies its `config` and its
+  `info/` directory to `<run-dir>/repo-settings/`, and never writes either
+  afterwards (it sets `repack.updateServerInfo=false` first: an automatic
+  `git gc` otherwise writes `info/refs`, measured). Every key, filter,
+  include or per-worktree config file can take effect only through one of
+  those two, and git reads both live: `_git_view` replaces only the
+  settings outside the repository. Measured (review round 18), a tree
+  repository's `core.fileMode=false` hid a mode change from the checker,
+  and an `info/exclude` line hid a new file. So leerie copies its two back
+  wherever they differ before it reads a tree: at every worker's exit,
+  before the take (`_take_after_worker`), at the start of both checker
+  halves (`_tree_dirt`, `leerie_tree_dirt`), and first in the one restore.
+  What a setting hid then shows as the file's own line (` M run.sh`,
+  `?? new.txt`).
+
+  A worker's settings change is its environment, not its product. Leerie
+  puts it back and logs it, and the worker is never re-asked about it or
+  rolled back for it. The commit is what ships, and nothing a setting did
+  can hide in a tree leerie reads through its own settings. A settings
+  line remains only when leerie cannot put its copy back (the copy is
+  missing, or the copy-back fails). That is leerie's own fault, so the run
+  stops there (`_take_after_worker`, `_clean_tree_gate`) instead of
+  holding a worker to it.
+
+  husky's install, which every `pnpm install` in a husky repository runs
+  through `prepare`, is the ordinary case. It does
+  `git config core.hooksPath .husky/_` in the worker's tree, and that is a
+  change either way (review round 18 H1, measured):
+  - The carry copies keys through `git config --list`, which prints names
+    lowercased, so leerie's copy says `hookspath`. husky's write of the
+    same value rewrites the line as `hooksPath`, so the bytes differ.
+  - When the user's checkout has no hooks path, leerie carries
+    `core.hooksPath` set to the user's hooks directory. husky's
+    `.husky/_` is then a different value.
+
+  Before this, the checker counted that as the worker's dirt, which no
+  `git config --unset` could clear. In every husky repository each
+  subtask's work was rolled back. Carrying the user's spelling would
+  close only the first case. Putting the settings back closes both, and
+  any other setting an install writes. The worker's next install sets it
+  again, for that session's own commits.
 - *Everything outside the run's repository is read from a copy.* The
   system and global config with the files they include, the system and
   global attributes files and the global ignore file are copied once per
@@ -8839,7 +8871,8 @@ I1, and `_assert_staging_clean` stopped the run blaming leerie's own
 invariant. Making the ignore sources leerie's (*The settings are
 leerie's*) removes the reason round 16 narrowed the rule, so the one rule
 is git's own: a developer's globally ignored caches stay ignored, and an
-`info/exclude` a worker edits is a settings line, not a hidden file.
+`info/exclude` a worker edits is put back before the read, so the file it
+hid is untracked dirt.
 
 The rollbacks this rests on are made exact for the same reason: a back-out
 of an integrator's merge and the reset before an integrator is retried

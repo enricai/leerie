@@ -4,7 +4,9 @@ I1's checker reads (DESIGN §8 *The settings are leerie's*).
 The round's driver (review-r17-proofs/exec/test_zz_r17e_config_hides_dirt)
 rewritten to assert the fix, for both checker halves and both restore
 halves: `core.fileMode=false` and a clean filter in the shared
-`info/attributes` are settings lines and are restored; a filter set, staged
+`info/attributes` are put back before the checker reads (round 18 H1: a
+worker's settings are its environment, never its dirt), so what they hid
+is the file's own line; a filter set, staged
 through and removed again leaves only the index's stat cache, which the
 fresh read does not trust; a change to the global config made after leerie
 copied it changes nothing; and leerie's own command does not keep a
@@ -69,15 +71,19 @@ def trees(tmp_path, monkeypatch, leerie):
     return repo, staging, sub, gcfg
 
 
-def _changed(repo: Path, name: str) -> str:
-    return (f"git settings changed: {repo / name} differs from leerie's "
-            f"copy {repo.parent / 'repo-settings' / name}")
-
-
 def _sh(fn: str, tree: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", "-c", 'set -uo pipefail; . "$1"; shift; "$@"', "_",
          str(LIB), fn, str(tree), *args], capture_output=True, text=True)
+
+
+def _one(leerie, tree: Path, branch: str, half: str) -> list[str]:
+    """One checker half alone: each puts leerie's settings back itself."""
+    if half == "python":
+        return asyncio.run(leerie._tree_dirt(tree, branch=branch))
+    sh = _sh("leerie_tree_dirt", tree)
+    assert sh.returncode == 0, sh.stderr
+    return sh.stdout.splitlines()
 
 
 def _both(leerie, tree: Path, branch: str) -> list[str]:
@@ -97,16 +103,20 @@ def _age(path: Path) -> None:
 
 
 @pytest.mark.parametrize("half", ["python", "shell"])
-def test_filemode_false_is_a_settings_line_and_restored(leerie, trees, half):
+def test_filemode_false_is_put_back_and_the_mode_shows(leerie, trees, half):
     repo, staging, sub, _g = trees
     os.chmod(sub / "run.sh", 0o755)
     _git(sub, "config", "core.fileMode", "false")    # writes the run's config
     assert _git(sub, "status", "--porcelain") == ""  # the worker's view
-    # The run repository's own config is read where git reads it, so the
-    # mode line itself stays hidden; the settings line names the cause.
-    assert _both(leerie, sub, SUB) == [_changed(repo, "config")]
+    # The checker puts leerie's config back before it reads, so the mode
+    # change it hid is the tree's own line.
+    assert _one(leerie, sub, SUB, half) == [" M run.sh"]
+    assert _git(repo, "config", "--get", "core.fileMode") == "true"
+    assert _both(leerie, sub, SUB) == [" M run.sh"]
+    _git(sub, "config", "core.fileMode", "false")
     os.chmod(staging / "run.sh", 0o755)              # every tree shares it
-    assert _both(leerie, staging, BRANCH) == [_changed(repo, "config")]
+    assert _one(leerie, staging, BRANCH, half) == [" M run.sh"]
+    _git(sub, "config", "core.fileMode", "false")
     head = _git(sub, "rev-parse", "HEAD")
     if half == "python":
         assert asyncio.run(leerie._restore_tree(
@@ -132,8 +142,13 @@ def test_a_clean_filter_in_the_shared_attributes_is_restored(
          "sh -c 'cat >/dev/null; git show HEAD:\"$1\"' -- %f")
     _git(sub, "add", "app.py")
     assert _git(sub, "status", "--porcelain") == ""
-    assert _both(leerie, sub, SUB) == [_changed(repo, "config"),
-                                       _changed(repo, "info")]
+    # Put back first: the edit the filter hid is the file's own line, and
+    # the shared attributes file is gone.
+    assert _one(leerie, sub, SUB, half) == [" M app.py"]
+    assert not (common / "info" / "attributes").exists()
+    (common / "info" / "attributes").write_text("app.py filter=keep\n")
+    _git(sub, "config", "filter.keep.clean",
+         "sh -c 'cat >/dev/null; git show HEAD:\"$1\"' -- %f")
     head = _git(sub, "rev-parse", "HEAD")
     if half == "python":
         assert asyncio.run(leerie._restore_tree(
@@ -254,6 +269,7 @@ def test_a_global_ignore_copied_with_the_run_is_honoured(leerie, tmp_path,
 
 
 def test_a_missing_copy_is_named(leerie, trees):
+    """Nothing to put back from: the one settings line that remains."""
     repo, staging, sub, _g = trees
     (repo.parent / "repo-settings" / "config").unlink()
     line = (f"git settings unknown: leerie's copy "
@@ -276,8 +292,9 @@ def test_an_automatic_gc_does_not_change_the_settings(leerie, trees):
 
 
 # Every key DESIGN §8 names as changing what git reports: written from a
-# worker's tree, each is a settings line in both halves, and the restore
-# leaves the config byte-identical to leerie's copy.
+# worker's tree, each is put back by either checker half before it reads —
+# no settings line, the config byte-identical to leerie's copy — and by the
+# one restore.
 KEYS = [
     ("core.fileMode", "false"), ("core.autocrlf", "true"),
     ("core.eol", "crlf"), ("core.safecrlf", "false"),
@@ -293,18 +310,15 @@ KEYS = [
 
 
 @pytest.mark.parametrize("key,value", KEYS, ids=[k for k, _v in KEYS])
-def test_every_key_is_a_settings_line_and_restored(leerie, trees, key,
-                                                   value):
+@pytest.mark.parametrize("half", ["python", "shell"])
+def test_every_key_is_put_back_and_restored(leerie, trees, key, value, half):
     repo, staging, sub, _g = trees
     copy = (repo.parent / "repo-settings" / "config").read_bytes()
     _git(sub, "config", key, value)
-    if key == "extensions.worktreeConfig":
-        # The bare repository's `core.bare` then applies to every worktree:
-        # git cannot read the tree at all, which is not clean either.
-        assert asyncio.run(leerie._tree_dirt(sub, branch=SUB)) is None
-        assert _sh("leerie_tree_dirt", sub).returncode != 0
-    else:
-        assert _both(leerie, sub, SUB)[0] == _changed(repo, "config")
+    lines = _one(leerie, sub, SUB, half)
+    assert not any(ln.startswith("git settings") for ln in lines), lines
+    assert (repo / "config").read_bytes() == copy
+    _git(sub, "config", key, value)
     head = _git(sub, "rev-parse", "HEAD")
     assert asyncio.run(leerie._restore_tree(
         sub, head, where="t", branch=SUB)) is True
@@ -326,9 +340,12 @@ def test_leeries_own_command_does_not_keep_a_settings_change(leerie, trees):
     assert _both(leerie, staging, BRANCH) == []
 
 
-def test_a_settings_line_brings_its_act_into_the_reask(leerie, trees):
+def test_a_settings_change_alone_is_never_reasked(leerie, trees):
+    """Round 18 H1: husky's install sets `core.hooksPath`. The gate puts it
+    back and finds the tree clean; the worker is never asked."""
     repo, staging, sub, _g = trees
-    _git(sub, "config", "core.fileMode", "false")
+    copy = (repo / "config").read_bytes()
+    _git(sub, "config", "core.hooksPath", ".husky/_")
     notes: list[str] = []
 
     async def reask(note: str) -> None:
@@ -336,8 +353,5 @@ def test_a_settings_line_brings_its_act_into_the_reask(leerie, trees):
     left = asyncio.run(leerie._clean_tree_gate(
         sub, caps=dict(leerie.DEFAULT_CAPS), label="t", reask=reask,
         branch=SUB, base=None))
-    assert left == [_changed(repo, "config")]
-    assert len(notes) == leerie.DEFAULT_CAPS["clean_tree_reasks"]
-    assert leerie.CLEAN_TREE_SETTINGS_NOTE in notes[0]
-    assert notes[0].index(_changed(repo, "config")) \
-        < notes[0].index(leerie.CLEAN_TREE_SETTINGS_NOTE)
+    assert left == [] and notes == []
+    assert (repo / "config").read_bytes() == copy

@@ -245,7 +245,9 @@ leerie_settings_dirt() {
   local s common n
   s="$(leerie_run_settings "$1")"
   [ -n "$s" ] || return 0
-  common="${s%/repo-settings}/repo"
+  # The tree's own repository: the run repository, or its tree repository
+  # (`_run_settings_of`'s first element).
+  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
   if [ ! -f "$s/config" ]; then
     printf "git settings unknown: leerie's copy %s of the run repository's settings is missing\n" "$s"
     return 0
@@ -266,7 +268,7 @@ leerie_restore_settings() {
   local s common
   s="$(leerie_run_settings "$1")"
   [ -n "$s" ] && [ -f "$s/config" ] || return 0
-  common="${s%/repo-settings}/repo"
+  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
   if ! diff -q -- "$s/config" "$common/config" >/dev/null 2>&1; then
     cp -- "$s/config" "$common/.config.leerie-$$" \
       && mv -f -- "$common/.config.leerie-$$" "$common/config" || return 1
@@ -326,10 +328,13 @@ leerie_flagged_paths() {
 # for line in the same order: the settings lines, tracked and staged
 # changes, what a fresh index of HEAD shows that the tree's index hid,
 # every flagged index entry, and every untracked, not-ignored file (the one
-# listing, `leerie_untracked`). Prints one line per finding; empty is
-# clean; status 1 when git cannot answer.
+# listing, `leerie_untracked`). Leerie's settings are put back first
+# (`leerie_restore_settings`), so a settings line means only that they could
+# not be. Prints one line per finding; empty is clean; status 1 when git
+# cannot answer.
 leerie_tree_dirt() {
   local wt="$1" st fresh
+  leerie_restore_settings "$wt" || true
   st="$(leerie_vgit "$wt" status --porcelain --untracked-files=no)" || return 1
   fresh="$(leerie_fresh_status "$wt")" || return 1
   leerie_untracked "$wt" >/dev/null || return 1

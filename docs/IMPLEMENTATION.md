@@ -6180,8 +6180,8 @@ gate, shared by every site:
 
 - `async _tree_dirt(tree, *, branch=None, base=None) -> list[str] | None`
   — in `tree`, every git call through the run's settings (`_git_view`,
-  *The run's settings and the one ignore rule* below), in this order:
-  `_settings_dirt(tree)`; every non-empty line of `git status --porcelain
+  *The run's settings and the one ignore rule* below), after
+  `_restore_settings(tree)`, in this order: `_settings_dirt(tree)`; every non-empty line of `git status --porcelain
   --untracked-files=no`, verbatim; the lines `_fresh_status` prints whose
   path (from the fourth character) no line of the first status names
   (`_fresh_only`: an edit the index's stat cache vouched for); `"<path> is
@@ -6217,11 +6217,10 @@ gate, shared by every site:
   appended (`git checkout <branch>` and put the commits that belong in
   the change on it); when one is the base line,
   `CLEAN_TREE_BASE_NOTE.format(base=<base12>)` (rebase or cherry-pick the
-  commits onto it, never reset the branch behind it). When a line starts
-  `_SETTINGS_LINE` (`"git settings "`), `CLEAN_TREE_SETTINGS_NOTE` is
-  appended first (the settings are the repository every tree of the run
-  shares: undo the change, `diff` the two paths the line names, `git
-  config --unset <key>`; leerie reads every tree through its own copy).
+  commits onto it, never reset the branch behind it). A line that starts
+  `_SETTINGS_LINE` (`"git settings "`) is never re-asked: `_tree_dirt` put
+  leerie's settings back first, so it means leerie's copy could not be
+  restored, and `_clean_tree_gate` `die()`s naming it.
 - `_clean_tree_reasker(st, caps, *, log_sid, cwd, schema_key,
   system_prompt, model, effort, max_turns) -> Callable[[str],
   Awaitable[None]]` — the re-ask of the SAME worker: `_log_session_id(
@@ -6322,8 +6321,12 @@ DESIGN §8 *The settings are leerie's* and *One ignore rule*.
 - `_restore_settings(tree) -> list[str]` — copies `<s>/config` (through a
   temporary file and `os.replace`) and `<s>/info` (`copytree`, links kept,
   after removing the repository's) back where they differ; returns the
-  names. Called first by `_restore_tree` and in `_leaves_tree_as_found`'s
-  `finally` (logged "put back N git setting(s) its own <what> changed").
+  names. Called first by `_restore_tree`, in `_leaves_tree_as_found`'s
+  `finally` (logged "put back N git setting(s) its own <what> changed"),
+  at the start of `_tree_dirt` (and `leerie_restore_settings` at the start
+  of `leerie_tree_dirt`), and by `_take_after_worker` before the take
+  (logged "put leerie's git settings back in <cwd> (<names>)"). An
+  `OSError` there is not raised; `_settings_dirt` then names what is left.
 - `_untracked_cmd(tree, *, which="unignored", cached=False,
   directory=False, pathspec=None) -> (args, env)` — THE listing, the
   arguments after `git`: `[*_git_view args, "--literal-pathspecs", "ls-files", "-z", ("--cached"), "--others",
@@ -8856,7 +8859,7 @@ run branch, a subtask tree's its subtask branch.
 | `_tree_repo_of(tree) -> Path \| None` | The common directory of `tree` when it is `<run-dir>/tree-repos/<name>` of a run with a repository (`_run_repo_of`), else None (a tree of the run repository itself, or of no run). |
 | `_run_repo_for_tree(tree) -> Path \| None` | The run repository a tree belongs to, by the layout alone (`<run-dir>/repo` for a tree repository's tree, the common directory when that is a run repository), never by the tree repository's alternates file, which its worker can write. |
 | `_tree_branch_of(tree_repo) -> str` | The branch leerie takes from it, by its name alone (never the tree's HEAD, which the worker sets): `staging` → `leerie/runs/<run-id>`, `<run-id[:12]>-<sid>` → `leerie/subtasks/<run-id>/<sid>`; `<run-id>` is the run directory's name. |
-| `_take_tree_branch(tree) -> str \| None` | For a tree of a tree repository: `_take_tree_repo` of it; None for any other tree. `_take_tree_branch_async` runs it off the event loop; `_take_after_worker(cwd)` `die()`s when it raises. |
+| `_take_tree_branch(tree) -> str \| None` | For a tree of a tree repository: `_take_tree_repo` of it; None for any other tree. `_take_tree_branch_async` runs it off the event loop; `_take_after_worker(cwd)` first puts leerie's settings back (`_restore_settings`, logged) and `die()`s when `_settings_dirt(cwd)` is still non-empty, then takes, and `die()`s when the take raises. |
 | `_take_tree_repo(tree_repo) -> str \| None` | The fetch above into `<run-dir>/repo`, then the run repository's commit of that branch. Raises `RunRepoError` when the fetch fails. |
 | `_drop_tree_repo(run_dir, name, *, take) -> bool` | Removes `<run_dir>/tree-repos/<name>` (a no-op when absent), after `_take_tree_repo` when `take`; False, with everything kept, when that take fails. |
 | `_branch_commit_for_tree(tree, name) -> str` | `name` (the run branch) as the run repository's commit when `tree` is a tree of a tree repository, else `name`. `_branch_commit_for_tree_async` off the event loop. |
@@ -8904,7 +8907,6 @@ Reads:
   `_restore_settings` check and restore its `config` and `info/` against
   the run's copy.
 
-`CLEAN_TREE_SETTINGS_NOTE` names "this tree's repository".
 `_seal_run_repo_config` also sets `gc.auto=0`, `gc.pruneExpire=never`,
 `gc.worktreePruneExpire=never` and `maintenance.auto=false`. leerie's
 fetches into the run repository pass `--no-auto-maintenance`.

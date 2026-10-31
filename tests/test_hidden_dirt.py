@@ -6,9 +6,10 @@ H1: `git update-index --skip-worktree/--assume-unchanged` hides a tracked
 edit from status; a pattern in the shared `info/exclude` (or
 `core.excludesFile`) hides an untracked file. The checker reads the index
 flags, and the restore clears them. Round 17 H2 made the ignore sources
-leerie's (DESIGN §8 *The settings are leerie's*): an `info/exclude` or
-`core.excludesFile` a worker writes is a settings line, and the restore
-puts the settings back, after which `clean` removes the file they hid.
+leerie's (DESIGN §8 *The settings are leerie's*), and round 18 H1 has the
+checker put them back before it reads: an `info/exclude` or
+`core.excludesFile` a worker writes hides nothing, the file it hid is
+untracked dirt, and the restore's `clean` removes it.
 
 M2: the implementer's base is where its subtask branch forked from the run
 branch, so a continuation that amends its own earlier attempt is clean.
@@ -67,11 +68,6 @@ def _staging(tmp_path: Path, leerie) -> tuple[Path, Path, str]:
     return r, stg, _git(stg, "rev-parse", "HEAD")
 
 
-def _changed(repo: Path, name: str) -> str:
-    return (f"git settings changed: {repo / name} differs from leerie's "
-            f"copy {repo.parent / 'repo-settings' / name}")
-
-
 def _dirt(leerie, stg, base):
     return asyncio.run(leerie._tree_dirt(stg, branch=BR, base=base))
 
@@ -120,7 +116,8 @@ def test_a_file_hidden_by_the_shared_info_exclude_is_dirt_and_removed(
     ex.write_text("conftest.py\n")
     assert ex.is_relative_to(r)                  # the run's shared file
     assert _git(stg, "status", "--porcelain") == ""
-    assert _dirt(leerie, stg, base) == [_changed(r, "info")]
+    assert _dirt(leerie, stg, base) == ["?? conftest.py"]
+    ex.write_text("conftest.py\n")              # again, for the restore
     assert _restore(leerie, stg, base) is True
     assert not (stg / "conftest.py").exists()
     assert _dirt(leerie, stg, base) == []
@@ -133,10 +130,9 @@ def test_a_file_hidden_by_core_excludes_file_is_dirt(leerie, tmp_path):
     _git(stg, "config", "core.excludesFile", str(gx))
     (stg / "helper.py").write_text("H = 1\n")
     assert _git(stg, "status", "--porcelain") == ""
-    # The worker's own tree wrote the run repository's config, and the
-    # checker reads leerie's ignore file, not the one the key names.
-    assert _dirt(leerie, stg, base) == [_changed(r, "config"),
-                                        "?? helper.py"]
+    # The worker's own tree wrote the run repository's config; the checker
+    # puts leerie's back and reads leerie's ignore file.
+    assert _dirt(leerie, stg, base) == ["?? helper.py"]
 
 
 def test_a_tools_self_ignoring_cache_is_not_dirt(leerie, tmp_path):
@@ -259,12 +255,12 @@ def _hide(shape: str, r: Path, stg: Path, tmp_path: Path) -> list[str]:
                        "--git-path", "info/exclude"))
         ex.parent.mkdir(parents=True, exist_ok=True)
         ex.write_text("conftest.py\n")
-        return [_changed(r, "info")]
+        return ["?? conftest.py"]
     gx = tmp_path / "global-ignore"
     gx.write_text("helper.py\n")
     _git(stg, "config", "core.excludesFile", str(gx))
     (stg / "helper.py").write_text("H = 1\n")
-    return [_changed(r, "config"), "?? helper.py"]
+    return ["?? helper.py"]
 
 
 SHAPES = ["skip-worktree", "assume-unchanged", "info-exclude",
