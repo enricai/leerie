@@ -3984,6 +3984,53 @@ five worktrees installed into one store with 0 EACCES, the worker owning
 every new store file, one package file carrying 6 links (the store's and
 one per worktree), and no chown. EC2 keeps its image-default store.
 
+**The stores a view installs from are leerie's.** One store, shared by
+leerie's installs and every worker's across runs, was a path from a worker
+to a committed view (§8 *Every measurement reads the committed view*):
+pnpm hard-links a package's files from its store, so a worker that edits
+`node_modules/<lib>/<file>` in its own tree in place edits the store's copy,
+and the next install anywhere links the edit. pnpm's own check does not see
+it when the size is kept and the mtime put back: measured with pnpm 10.4.1
+on barnacle, such an edit in one checkout's `node_modules` was in a fresh
+install of another. The invariant: *a committed view's environment comes
+only from stores that leerie alone writes.* So there are two sets:
+
+- *Leerie's*, `<state-root>/.stores/leerie/<name>`, set on the
+  orchestrator's own environment before anything installs
+  (`_leerie_stores`): the pnpm store and every other cache an installer the
+  provision recipe can name reads — npm, yarn (classic and berry), bun,
+  corepack, pip, uv, poetry, pipenv, go (modules and build), cargo,
+  bundler, composer, NuGet (`_STORE_VARS`). Only leerie's commands use
+  them, so they are kept across runs: one cold install per repository
+  (measured: barnacle 9.0 s, funeralworks 23.2 s), warm after.
+- *A worker's*, `<run-dir>/workers/<wid>/cache/<name>` with
+  `XDG_CACHE_HOME` there, `<wid>` the sid of its first call, and one pnpm
+  store per run, `<run-dir>/workers/pnpm-store` (`_worker_cache_env`, in
+  the worker's spawn). One pnpm store per run rather than per worker,
+  because what a worker leaves in it can mislead only another worker of
+  the run, never a measurement, and a cold pnpm store costs 9–23 s and
+  0.5–1.3 GB per copy. They go with the run directory.
+
+Two stores never share a file: each fetches its own copy (measured: 0
+inodes in common after the same lockfile was installed from both). What
+can still link into leerie's store is a tree leerie installs into, so only
+a committed view, which no worker runs in, is installed with hard links;
+every other tree leerie installs into — a held-out set's evaluation tree,
+a falsifier's lane, the acceptance writer's tree — gets copies
+(`npm_config_package_import_method=copy`, `UV_LINK_MODE=copy`). Copying
+costs, on disk (ext4, warm store): barnacle 4.7–5.0 s hard-linked against
+11.8–12.2 s copied, funeralworks 11.4–12.0 s against 25.2–26.2 s, and the
+full `node_modules` size per tree (0.6 and 1.4 GB), which is why views keep
+links. A variable pointing beneath the image's bake root (`/opt/`, the
+*persistent out-of-repo dependency bake*) is left alone on both sides: those are dependencies
+leerie built into the image, which the recipe no longer installs.
+
+What this does not cover: a worker writing leerie's store, a view, `/opt`
+or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside
+the worker's own tree, which the worker's write boundary forbids; this
+removes the ones a worker made legitimately, through its own installs and
+the links they share.
+
 This explains *why* worktrees are expensive; it deliberately does not
 drive a gate. A per-worktree measured bound was attempted and withdrawn
 after repeated defects, because the marginal cost of a not-yet-created

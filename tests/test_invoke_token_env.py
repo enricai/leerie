@@ -84,7 +84,8 @@ class TestActiveTokenEnvThreading:
             self, leerie, monkeypatch, tmp_path):
         """No token: the worker inherits the orchestrator's whole
         environment — except leerie's hooks-off git entry, which a worker
-        never gets (DESIGN §6½ *Hooks off*)."""
+        never gets (DESIGN §6½ *Hooks off*), and with its own stores and
+        caches (DESIGN §6 *The stores a view installs from are leerie's*)."""
         env0 = dict(os.environ)
         leerie._git_hooks_off(env0)             # what main() does
         for k, v in env0.items():
@@ -105,7 +106,8 @@ class TestActiveTokenEnvThreading:
 
         asyncio.run(run())
         env = captured[0]
-        assert env == leerie._git_hooks_on(os.environ)
+        assert env == leerie._worker_cache_env(
+            leerie._git_hooks_on(os.environ), tmp_path, "test-sid")
         assert env["LEERIE_PROBE_MARK"] == "inherited"
         assert "LEERIE_GIT_HOOKS_OFF" not in env
 

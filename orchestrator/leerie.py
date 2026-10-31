@@ -5745,6 +5745,93 @@ def _git_hooks_on(env: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
+# The package stores and caches an install reads (DESIGN §6 *The stores a
+# view installs from are leerie's*): variable -> directory name. Leerie's own
+# commands get `<state-root>/.stores/leerie/<name>` (`_leerie_stores`, set on
+# the orchestrator's environment in `main()`); a worker gets
+# `<run-dir>/workers/<wid>/cache/<name>` (`_worker_cache_env`), the pnpm store
+# once per run. Every installer the provision recipe can name is covered:
+# pnpm, npm, yarn (classic and berry), bun, corepack, pip, uv, poetry,
+# pipenv, go, cargo, bundler, composer, dotnet.
+_STORE_VARS: dict[str, str] = {
+    "npm_config_store_dir": "pnpm-store",
+    "npm_config_cache_dir": "pnpm-cache",
+    "npm_config_cache": "npm",
+    "YARN_CACHE_FOLDER": "yarn",
+    "YARN_GLOBAL_FOLDER": "yarn-berry",
+    "BUN_INSTALL_CACHE_DIR": "bun",
+    "COREPACK_HOME": "corepack",
+    "PIP_CACHE_DIR": "pip",
+    "UV_CACHE_DIR": "uv",
+    "POETRY_CACHE_DIR": "poetry",
+    "WORKON_HOME": "virtualenvs",
+    "GOMODCACHE": "go-mod",
+    "GOCACHE": "go-build",
+    "CARGO_HOME": "cargo",
+    "BUNDLE_PATH": "bundle",
+    "COMPOSER_CACHE_DIR": "composer",
+    "NUGET_PACKAGES": "nuget",
+}
+# The repository image's bake target (DESIGN *Persistent out-of-repo dependency bake*): a
+# variable already pointing beneath it names dependencies leerie built into
+# the image, which the recipe no longer installs, so neither side moves it.
+# Keeping a worker from writing there is the worker's write boundary.
+_BAKED_ROOT = "/opt/"
+# Import modes that never expose a store's own inode in the tree installed
+# into (`_ensure_worktree_deps`, for every tree but a committed view).
+_COPY_IMPORT_ENV: dict[str, str] = {
+    "npm_config_package_import_method": "copy",
+    "UV_LINK_MODE": "copy",
+}
+
+
+def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
+    """Point every `_STORE_VARS` variable of `env` at leerie's own store,
+    `<state-root>/.stores/leerie/<name>`, made here (a value beneath the
+    image's bake root `_BAKED_ROOT` is kept). Only leerie's commands
+    read or write them; a worker's environment replaces every one
+    (`_worker_cache_env`), so nothing a worker can write reaches them."""
+    root = Path(state_root) / ".stores" / "leerie"
+    for var, name in _STORE_VARS.items():
+        if (env.get(var) or "").startswith(_BAKED_ROOT):
+            continue
+        d = root / name
+        d.mkdir(parents=True, exist_ok=True)
+        env[var] = str(d)
+
+
+def _worker_id(sid: str) -> str:
+    """The directory name of a worker's own area, from the sid of its first
+    call."""
+    wid = _CGROUP_NAME_UNSAFE_RE.sub("-", sid)
+    return wid if wid.strip(".") else "worker"
+
+
+def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
+                      sid: str) -> dict[str, str]:
+    """A copy of `env` whose every store and cache is the worker's own:
+    `<run-dir>/workers/<wid>/cache/<name>` (a baked value is kept, as
+    `_leerie_stores` keeps it) and `XDG_CACHE_HOME` there, and
+    the run's worker pnpm store `<run-dir>/workers/pnpm-store` (one cold
+    install per run, not per worker). None of them is a leerie store, and
+    pnpm never links one store's file into another (DESIGN §6 *The stores
+    a view installs from are leerie's*)."""
+    out = dict(env)
+    workers = Path(run_dir) / "workers"
+    cache = workers / _worker_id(sid) / "cache"
+    for var, name in _STORE_VARS.items():
+        if not (env.get(var) or "").startswith(_BAKED_ROOT):
+            out[var] = str(cache / name)
+    out["npm_config_store_dir"] = str(workers / "pnpm-store")
+    out["XDG_CACHE_HOME"] = str(cache / "xdg")
+    for k in _COPY_IMPORT_ENV:
+        out.pop(k, None)
+    for d in (cache / "xdg", workers / "pnpm-store"):
+        with contextlib.suppress(OSError):
+            d.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 def _worktree_add_detached(st: "State", wt: Path, rev: str, *,
                            repo: Path | None = None
                            ) -> subprocess.CompletedProcess:
@@ -21466,6 +21553,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # *Hooks off*).
     worker_env = _git_hooks_on(worker_env if worker_env is not None
                                else os.environ)
+    # Its stores and caches are its own, never leerie's (DESIGN §6 *The
+    # stores a view installs from are leerie's*).
+    worker_env = _worker_cache_env(worker_env, leerie_dir, sid)
 
     # The prompt is staged to a temp file BEFORE the spawn, and that file —
     # already positioned at byte 0 with the whole payload on disk — becomes
@@ -39718,6 +39808,12 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     # DESIGN §6½ *Leerie's own commands leave a worker's tree as they found
     # it*): a relocked lockfile is put back, an unignored generated file
     # goes; installed dependencies, being ignored, stay.
+    # Only a committed view, which no worker ever runs in, may hold links into
+    # leerie's store; every other tree gets copies, so no file a worker can
+    # write is one of the store's (DESIGN §6 *The stores a view installs
+    # from are leerie's*).
+    linkable = os.path.realpath(tree) in {
+        os.path.realpath(v) for _tip, v in _VIEWS.values()}
     async with _leaves_tree_as_found(tree, "install/build", log_prefix):
         for e in recipe:
             if (e.get("kind") not in ("install", "build")
@@ -39731,6 +39827,8 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
             # PATH etc.
             entry_env = ({**os.environ, **e["env"]} if e.get("env")
                          else None)
+            if not linkable:
+                entry_env = {**(entry_env or os.environ), **_COPY_IMPORT_ENV}
             try:
                 # A recipe entry is a repo command: the task's forbid binds it
                 # too (DESIGN §9 *Recipe install steps fall under the forbid
@@ -64199,6 +64297,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     leerie_root = resolve_leerie_root(repo_root)
     leerie_root.mkdir(parents=True, exist_ok=True)
     (leerie_root / "runs").mkdir(parents=True, exist_ok=True)
+    # Before any install: leerie's commands read only leerie's stores
+    # (DESIGN §6 *The stores a view installs from are leerie's*).
+    _leerie_stores(os.environ, leerie_root)
     if args.resume:
         run_id = resolve_run_id(leerie_root, args.run_id, resumable_only=True)
     elif args.run_id:

@@ -7655,38 +7655,18 @@ case "$_leerie_host_dir" in
     ;;
 esac
 mkdir -p "$HOME/.cache/leerie/mise-data" \
-         "$HOME/.cache/leerie/pip" \
-         "$HOME/.cache/leerie/go-mod" \
-         "$HOME/.cache/leerie/cargo" \
-         "$HOME/.cache/leerie/corepack" \
          "$HOME/.cache/leerie/bundle" \
          "$LEERIE_STATE_HOST_DIR" \
          "$_leerie_host_dir"
 
 CACHE_MOUNTS=(
   -v "$HOME/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
-  -v "$HOME/.cache/leerie/pip:/home/leerie/.cache/leerie/pip"
-  -v "$HOME/.cache/leerie/go-mod:/home/leerie/.cache/leerie/go-mod"
-  -v "$HOME/.cache/leerie/cargo:/home/leerie/.cache/leerie/cargo"
-  -v "$HOME/.cache/leerie/corepack:/home/leerie/.cache/leerie/corepack"
-  # pnpm reads its store path from `npm_config_store_dir` (or `store-dir`
-  # in .npmrc, or `--store-dir` CLI). There is no `PNPM_STORE_PATH`; a
-  # prior version of this file set that and pnpm silently ignored it,
-  # falling back to ~/.local/share/pnpm/store inside the container —
-  # which is NOT bind-mounted, so every run paid full registry cost.
-  #
-  # The store lives IN THE STATE MOUNT, next to the worktrees (DESIGN §6
-  # *The pnpm store shares the worktrees' mount*). pnpm hard-links packages
-  # from the store into node_modules, and a hard link cannot cross a mount:
-  # with the store on its own cache mount every install fell back to
-  # copying, and concurrent installs ran past their timeouts (3 chains).
-  # Same mount, so the same ownership as the worktrees on every runtime:
-  # measured rootful, store and worktrees share inodes with no chown.
-  -e "npm_config_store_dir=/leerie-state/.pnpm-store"
-  -e "PIP_CACHE_DIR=/home/leerie/.cache/leerie/pip"
-  -e "GOMODCACHE=/home/leerie/.cache/leerie/go-mod"
-  -e "CARGO_HOME=/home/leerie/.cache/leerie/cargo"
-  -e "COREPACK_HOME=/home/leerie/.cache/leerie/corepack"
+  # Package stores and caches are not mounted from the host: the
+  # orchestrator points its own commands at `<state-root>/.stores/leerie/`
+  # and each worker at `<run-dir>/workers/` (DESIGN §6 *The stores a view
+  # installs from are leerie's*). Both are in the state mount, beside the
+  # worktrees, so pnpm hard-links (DESIGN §6 *The pnpm store shares the
+  # worktrees' mount*).
   -v "$HOME/.cache/leerie/bundle:/home/leerie/.cache/leerie/bundle"
   -e "BUNDLE_CACHE_ALL=1"
 )
@@ -8373,10 +8353,6 @@ child_env["LOGNAME"] = "leerie"
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 child_env["TZ"] = ${_host_tz_json}
 child_env["LEERIE_COMMIT"] = ${_leerie_commit_json}
-# The pnpm store shares the state volume with the worktrees, so installs
-# hard-link instead of copying (DESIGN §6, the pnpm store shares the
-# worktrees mount): the state root here is /work/.leerie.
-child_env["npm_config_store_dir"] = "/work/.leerie/.pnpm-store"
 if "${_BEDROCK_BEARER_ACTIVE}" == "true":
     child_env["AWS_BEARER_TOKEN_BEDROCK"] = ${_bedrock_bearer_token_json}
     child_env["CLAUDE_CODE_USE_BEDROCK"] = ${_bedrock_use_bedrock_json}
