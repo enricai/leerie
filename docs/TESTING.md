@@ -5803,6 +5803,17 @@ template kept at finalize.
   throwaway checkout; the checkout snapshot never rewrites the user's index;
   with no run repository the prune and the abnormal-exit clean-up write
   nothing in the cwd's `.git`.
+- `tests/test_credentials_never_outlive_the_run.py` (9 tests, DESIGN §6 *No
+  copy of the credentials outlives its run's process*, *Every deleter of a
+  run's directories deletes them*; review round 18 M1): the owner-aware
+  removal takes read-only and unreadable directories, never follows a link,
+  and reports a survivor; an abnormal exit removes the template and
+  `workers/` (no copy of the credentials left) and keeps the run's state; a
+  full purge removes a run whose template is read-only; the preflight reap
+  removes an idle run's copies; the reviewer's driver inverted — the real
+  launcher `prune --apply` removes a run that died mid-run, its read-only
+  template with it; prune counts a run removed only when it is gone; the
+  shell removal; no run-directory deleter ignores its errors.
 - `tests/test_tree_repos.py` (11 tests, DESIGN §6 *A repository per
   committing tree (I6)*): staging and a subtask tree are worktrees of their
   own bare repositories (the run repository's objects through the

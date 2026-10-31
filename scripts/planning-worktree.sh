@@ -119,7 +119,7 @@ prune_leerie_worktrees "${RUN_DIR}"
 # (new-worktree.sh).
 if ! grep -qxF "worktree $WT" <<<"$(leerie_repo_git worktree list --porcelain)" \
     && [ -d "$WT" ]; then
-  rm -rf "$WT"
+  leerie_rm_owned "$WT"
 fi
 
 if grep -qxF "worktree $WT" <<<"$(leerie_repo_git worktree list --porcelain)"; then

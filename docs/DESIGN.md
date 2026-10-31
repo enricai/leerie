@@ -1801,8 +1801,29 @@ session (`--resume`: the clean-tree re-ask, the falsifier's re-ask) runs
 in the directories that hold that session, found by its transcript under
 `config/projects/`, so the CLI finds what it resumes. A worker's `tmp/`
 is removed when each of its calls returns; its `config/` lives as long as
-a resume of it can follow. `workers/` and the template below go when the
-run finalizes.
+a resume of it can follow within the process.
+
+*No copy of the credentials outlives its run's process.* `workers/` and the
+template below hold copies of the operator's credentials. They go on every
+terminal exit of the orchestrator's process: finalize, and every abnormal
+exit — a `die()`, an exception, a signal, a pause before an auto-resume
+(`_cleanup_on_abnormal_exit`) — and when the preflight reap or `leerie
+prune` reaps an idle run. A resume makes the template again at its first
+worker. Only finalize removing them left a run that died with its
+credentials on disk (review round 18 M1). A worker session the process
+recorded is then not resumable across processes (its transcript was in
+`workers/`); the re-ask that would resume it takes its no-session path.
+
+*Every deleter of a run's directories deletes them.* The template is
+read-only, and so is a killed test's directory in a tree. A plain
+`rmtree(..., ignore_errors=True)` cannot unlink the entries of a read-only
+directory and says nothing: `leerie prune --apply` reported a run removed,
+left its credentials, and deleted its `run.json`, so later prunes read what
+was left as a live run and never removed it. Every removal of a run
+directory or of anything in it goes through the one owner-aware removal
+(`_rmtree_owned`: each directory's owner write and search bits restored
+top-down, then the removal) and checks that the path is gone. A run
+counts as removed only when its directory is.
 
 *What a config directory holds.* It is made from the run's configuration
 template, `<run-dir>/claude-config/`: a read-only snapshot, taken once

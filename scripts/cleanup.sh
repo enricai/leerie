@@ -114,8 +114,8 @@ _clean_one_run_here() {
       # the same path. Path is sandboxed under
       # .leerie/runs/<run-id>/worktrees/<run-id[:12]>-<sid>; the leading `[ -d ]` plus
       # the glob restricts scope to that directory's children.
-      if [ -d "$d" ]; then
-        rm -rf "$d"
+      if [ -d "$d" ] && ! leerie_rm_owned "$d"; then
+        echo "cleanup: could not remove ${d}" >&2
       fi
     done
     # Remove the now-empty worktrees dir if everything went; harmless if

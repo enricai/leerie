@@ -473,8 +473,25 @@ leerie_tree_branch_of() {
 leerie_drop_tree() {
   local tr="${1:?usage: leerie_drop_tree <tree-repo> <worktree>}"
   local wt="${2:?usage: leerie_drop_tree <tree-repo> <worktree>}"
-  chmod -R u+w "$wt" 2>/dev/null || true
-  rm -rf "$wt" "$tr"
+  leerie_rm_owned "$wt" && leerie_rm_owned "$tr"
+}
+
+# leerie_rm_owned <path>
+#
+# Remove <path> after giving every directory under it the owner's read,
+# write and search bits, top down (`-exec … \;`, so a directory is opened
+# before find reads it), never following a link; succeeds only when nothing
+# is left there (DESIGN §6 *Every deleter of a run's directories deletes
+# them*). `_rmtree_owned` in Python: a plain `rm -rf` fails on a read-only
+# directory's entries.
+leerie_rm_owned() {
+  local p="${1:?usage: leerie_rm_owned <path>}"
+  [ -e "$p" ] || [ -L "$p" ] || return 0
+  if [ -d "$p" ] && [ ! -L "$p" ]; then
+    find "$p" -type d -exec chmod u+rwx {} \; 2>/dev/null || true
+  fi
+  rm -rf -- "$p" 2>/dev/null || true
+  [ ! -e "$p" ] && [ ! -L "$p" ]
 }
 
 # leerie_tree <tree-repo> <branch> <worktree>

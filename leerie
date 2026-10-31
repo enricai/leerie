@@ -1544,6 +1544,39 @@ freed = 0
 runs_removed = []
 reaped_dirs = set()
 
+def _rm_owned(path) -> bool:
+    """Remove `path` after giving every directory under it the owner's read,
+    write and search bits, top down, never following a link; True when
+    nothing is left (DESIGN §6 *Every deleter of a run's directories deletes
+    them*). The orchestrator's `_rmtree_owned`, here because this host
+    process does not load the orchestrator. A plain `rmtree(...,
+    ignore_errors=True)` left a run's read-only configuration template —
+    a copy of the credentials — and reported the run removed (review round
+    18 M1)."""
+    p = pathlib.Path(path)
+    if not os.path.lexists(p):
+        return True
+    if p.is_symlink() or not p.is_dir():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return not os.path.lexists(p)
+    stack = [str(p)]
+    while stack:
+        d = stack.pop()
+        try:
+            os.chmod(d, (os.lstat(d).st_mode & 0o7777) | 0o700)
+        except OSError:
+            pass
+        try:
+            with os.scandir(d) as it:
+                stack += [e.path for e in it if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            pass
+    shutil.rmtree(p, ignore_errors=True)
+    return not os.path.lexists(p)
+
 def size_of(p: "os.PathLike[str] | str") -> int:
     total = 0
     for dirpath, _dirnames, filenames in os.walk(p):
@@ -1756,6 +1789,12 @@ def _reap_worktrees(d) -> int:
     (each inode once); 0 when it did nothing."""
     wt = d / "worktrees"
     if not wt.is_dir() or wt.is_symlink() or not any(wt.iterdir()):
+        # No worktrees, but the copies of the credentials still go.
+        if apply:
+            for name in ("workers", "claude-config"):
+                if os.path.lexists(d / name) and not _rm_owned(d / name):
+                    print(f"  could not remove {d / name}; it may hold a "
+                          "copy of your credentials")
         return 0
     seen = set()
     nbytes = 0
@@ -1782,11 +1821,18 @@ def _reap_worktrees(d) -> int:
             return 0
         trash = d / (".worktrees.reap-%d" % os.getpid())
         os.rename(wt, trash)
+        # The workers' directories and configuration template hold copies of
+        # the credentials: an idle run's go with its worktrees (DESIGN §6 *No
+        # copy of the credentials outlives its run's process*).
+        for name in ("workers", "claude-config"):
+            if not _rm_owned(d / name):
+                print(f"  could not remove {d / name}; it may hold a copy of "
+                      "your credentials")
     except OSError:
         return 0
     finally:
         os.close(fd)
-    shutil.rmtree(trash, ignore_errors=True)
+    _rm_owned(trash)
     return nbytes
 
 
@@ -1820,14 +1866,23 @@ if runs.is_dir():
                       "brought back into your repository")
                 live.add(d.name)
                 continue
-            freed += size_of(d)
-            runs_removed.append(d.name)
+            size = size_of(d)
             try:
-                reaped_dirs.add(str(d.resolve()))
+                resolved = str(d.resolve())
             except OSError:
-                pass
-            if apply:
-                shutil.rmtree(d, ignore_errors=True)
+                resolved = None
+            # Counted removed only when it is gone: an owner-aware removal,
+            # then the check (DESIGN §6 *Every deleter of a run's
+            # directories deletes them*).
+            if apply and not _rm_owned(d):
+                print(f"  kept run dir {d.name}: it could not be removed "
+                      "whole (remove it by hand)")
+                live.add(d.name)
+                continue
+            freed += size
+            runs_removed.append(d.name)
+            if resolved is not None:
+                reaped_dirs.add(resolved)
         else:
             live.add(d.name)
             # A resumable run keeps its directory, but not an old idle

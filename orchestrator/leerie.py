@@ -5565,6 +5565,11 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     if full_purge or has_worktrees:
         log(f"cleanup: {'full purge' if full_purge else 'worktrees only'} "
             f"for run {st.run_id}")
+    # Every abnormal exit is a terminal exit of this process: the copies of
+    # the credentials in the template and the workers' configurations go
+    # (DESIGN §6 *No copy of the credentials outlives its run's process*);
+    # a resume makes the template again.
+    _remove_worker_dirs(st.run_dir)
     # Remove worktrees. 240s is calibrated for realistic worker workloads:
     # a 868 MB / 41k-file worktree (npm install + Next.js build) takes
     # ~45-90s uncontested; under N-way concurrent cleanup (e.g. 6 worktrees
@@ -5647,7 +5652,7 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
                     resolved = entry.resolve()
                     if (worktrees_dir_resolved is not None
                             and resolved.parent == worktrees_dir_resolved):
-                        shutil.rmtree(entry, ignore_errors=True)
+                        _rmtree_owned(entry)
                 except OSError as e:
                     log(f"  cleanup: fallback rm failed for {entry}: {e}")
             if entry.exists():
@@ -5668,8 +5673,9 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     # Full purge: the run dir, and with it the run's own repository, which
     # holds every branch of the run. Nothing of the run is in the user's
     # repository to delete.
-    if st.run_dir.exists():
-        shutil.rmtree(st.run_dir, ignore_errors=True)
+    if not _rmtree_owned(st.run_dir):
+        log(f"cleanup: {_operator_path(st.run_dir)} could not be removed "
+            "whole; remove it by hand")
 
 
 # How long the Python prune waits for the repository-wide worktree lock
@@ -11238,12 +11244,20 @@ def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
     return config, tmp
 
 
-def _remove_worker_dirs(run_dir: Path) -> None:
+def _remove_worker_dirs(run_dir: Path) -> bool:
     """Remove every worker's directories, and the template they were made
-    from (it holds the credentials), once the run has no worker left to
-    resume (finalize)."""
-    _rmtree_owned(Path(run_dir) / WORKERS_DIR)
-    _rmtree_owned(Path(run_dir) / CLAUDE_CONFIG_TEMPLATE)
+    from (they hold copies of the credentials), on every terminal exit of
+    the run's process (DESIGN §6 *No copy of the credentials outlives its
+    run's process*): finalize, `_cleanup_on_abnormal_exit`, and the reap of
+    an idle run. True when both are gone; a survivor is logged by name."""
+    gone = True
+    for name in (WORKERS_DIR, CLAUDE_CONFIG_TEMPLATE):
+        path = Path(run_dir) / name
+        if not _rmtree_owned(path):
+            gone = False
+            log(f"cleanup: could not remove {_operator_path(path)}; it may "
+                "hold a copy of your credentials — remove it by hand")
+    return gone
 
 
 def _payload_only_cwd(st: object) -> str:
@@ -11449,17 +11463,20 @@ def _reap_idle_worktrees(runs_dir: Path, self_id: str,
                          idle_days: float = WORKTREE_REAP_IDLE_DAYS,
                          now: float | None = None) -> dict:
     """Delete `<run>/worktrees/` of every run that is neither this one, nor
-    live, nor touched within `idle_days`. Only `worktrees/` is touched —
-    state, logs and branches stay, so the run can still resume (its scripts
-    rebuild every worktree from its branches; uncommitted edits are lost, as
-    on any abnormal exit).
+    live, nor touched within `idle_days`, and its workers' directories and
+    configuration template (copies of the credentials: DESIGN §6 *No copy
+    of the credentials outlives its run's process*). State, logs and
+    branches stay, so the run can still resume (its scripts rebuild every
+    worktree from its branches, and its first worker makes the template
+    again; uncommitted edits are lost, as on any abnormal exit).
 
     The directory is renamed to `<run>/.worktrees.reap-<pid>` while holding
     the run's flock, then deleted after releasing it: a resume taking the
     lock a moment later never sees a half-deleted tree. A run whose flock
     cannot be taken is live and skipped (fail closed). Leftover
-    `.worktrees.reap-*` from an interrupted reap are deleted too. Never
-    raises; errors are counted in the report."""
+    `.worktrees.reap-*` from an interrupted reap are deleted too. Every
+    removal is owner-aware and checked (`_rmtree_owned`). Never raises;
+    errors are counted in the report."""
     cutoff = (time.time() if now is None else now) - idle_days * 86400
     report: dict = {"reaped": [], "skipped_live": [], "skipped_recent": [],
                     "bytes": 0, "errors": 0}
@@ -11474,15 +11491,21 @@ def _reap_idle_worktrees(runs_dir: Path, self_id: str,
             for trash in d.glob(_REAP_TRASH_PREFIX + "*"):
                 if trash.is_dir() and not trash.is_symlink():
                     report["bytes"] += _tree_bytes(trash)
-                    shutil.rmtree(trash, ignore_errors=True)
+                    if not _rmtree_owned(trash):
+                        report["errors"] += 1
             wt = d / "worktrees"
-            if (not wt.is_dir() or wt.is_symlink()
-                    or not any(wt.iterdir())):
+            has_wt = (wt.is_dir() and not wt.is_symlink()
+                      and any(wt.iterdir()))
+            has_creds = any(os.path.lexists(d / n) for n in
+                            (WORKERS_DIR, CLAUDE_CONFIG_TEMPLATE))
+            if not has_wt and not has_creds:
                 continue
             if _run_last_activity(d) >= cutoff:
                 report["skipped_recent"].append(d.name)
                 continue
             fd = os.open(str(d), os.O_RDONLY)
+            trs: list[Path] = []
+            trash = None
             try:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -11501,17 +11524,17 @@ def _reap_idle_worktrees(runs_dir: Path, self_id: str,
                 except (RunRepoError, subprocess.TimeoutExpired):
                     report["errors"] += 1
                     continue
-                trash = d / f"{_REAP_TRASH_PREFIX}{os.getpid()}"
-                os.rename(wt, trash)
+                if has_wt:
+                    trash = d / f"{_REAP_TRASH_PREFIX}{os.getpid()}"
+                    os.rename(wt, trash)
+                if not _remove_worker_dirs(d):
+                    report["errors"] += 1
             finally:
                 os.close(fd)
-            report["bytes"] += _tree_bytes(trash)
-            errs: list[str] = []
-            shutil.rmtree(trash, onerror=lambda *a: errs.append(str(a[1])))
-            for tr in trs:
-                report["bytes"] += _tree_bytes(tr)
-                shutil.rmtree(tr, onerror=lambda *a: errs.append(str(a[1])))
-            report["errors"] += len(errs)
+            for gone in ([trash] if trash is not None else []) + trs:
+                report["bytes"] += _tree_bytes(gone)
+                if not _rmtree_owned(gone):
+                    report["errors"] += 1
             # The deleted worktrees' admin entries in the shared `.git`,
             # scoped to this run directory.
             _prune_leerie_worktrees(d)
@@ -41206,14 +41229,32 @@ def _writable_dirs_to(tree: str | Path, rel: str) -> None:
                 os.chmod(d, stat.S_IMODE(mode) | 0o300)
 
 
-def _rmtree_owned(path: Path) -> None:
-    """`shutil.rmtree` after giving every directory under `path` the owner's
-    write and search bits (its read-only subdirectories would otherwise
-    keep their contents)."""
-    for d, _dirs, _files in os.walk(path):
+def _rmtree_owned(path: Path) -> bool:
+    """Remove `path` — a directory tree, a file or a link — after giving
+    every directory under it the owner's read, write and search bits, top
+    down, so a read-only directory (the run's configuration template, a
+    killed test's directory) and one with no read bit give up their
+    contents; never following a link. True when nothing is left at `path`
+    (DESIGN §6 *Every deleter of a run's directories deletes them*)."""
+    p = Path(path)
+    if not os.path.lexists(p):
+        return True
+    if p.is_symlink() or not p.is_dir():
+        with contextlib.suppress(OSError):
+            p.unlink()
+        return not os.path.lexists(p)
+    stack = [str(p)]
+    while stack:
+        d = stack.pop()
         with contextlib.suppress(OSError):
             os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) | 0o700)
-    shutil.rmtree(path, ignore_errors=True)
+        try:
+            with os.scandir(d) as it:
+                stack += [e.path for e in it if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            pass
+    shutil.rmtree(p, ignore_errors=True)
+    return not os.path.lexists(p)
 
 
 def _restore_tracked_content(tree: str | Path,
