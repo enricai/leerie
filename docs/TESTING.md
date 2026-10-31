@@ -5820,7 +5820,8 @@ template kept at finalize.
   install: a new tip with the same inputs moves the view — the install's
   file keeps its inode, the install runs again over it, the build runs
   again, and a measurement's report, a cache under `node_modules`, a stale
-  build output and a build's file under the install's output are all gone;
+  build output, a build's file under the install's output, the view's own
+  stores and its measurement directory are all gone;
   a changed `package.json` makes a fresh view; an in-place edit of an
   installed file that keeps its size and resets its mtime makes a fresh
   view; a rewritten `.git` is pointed back at the view's own repository and

@@ -4739,7 +4739,10 @@ in exactly one):
   environments, pnpm's metadata cache: one set per tree, at
   `<run-dir>/tree-stores/<tree>/<name>`, set for every command leerie runs
   in a tree under `<run-dir>/worktrees/` (`_tree_store_env`, applied by
-  `_run_streaming`), and removed with a view when its tip moves. bundler and
+  `_run_streaming`), and emptied whenever a view's tip moves: a replaced
+  view's go with it, and a moved view is a new tree to every measurement
+  (§8 *A view moves to the next tip when the install's inputs are
+  unchanged*). bundler and
   NuGet have no fetch free of committed code; uv's install of the project,
   cargo's package lock and Go's build cache write the store as they build,
   so an install could not run against it read-only (measured for uv: the
@@ -8793,8 +8796,12 @@ it:
   link — and a directory's inode and mode;
 - when the key at the new tip is the key recorded, the view's `.git` is
   pointed back at its own administrative directory, found from the run
-  repository's side; it is checked out at the new tip (`checkout --detach
-  --force`); everything untracked but the outputs is removed (`clean -x`);
+  repository's side; its measurement id there is removed, so to every
+  measurement it is a new tree — a fresh measurement directory and empty
+  stores of its own (DESIGN §6 *Leerie's runs of the repository's commands
+  are confined too*), as a replaced view gets; it is checked out at the new
+  tip (`checkout --detach --force`); everything untracked but the outputs
+  is removed (`clean -x`);
   under the outputs, every entry the install did not make (a tool's cache, a
   report a measurement wrote) is removed; and every entry it made must be
   there in the state recorded, with no tracked path changed. Any failure,
@@ -8816,6 +8823,13 @@ again on the new tip and reads it, over its own earlier output — the package
 manager's incremental install, which is the residual difference from a fresh
 view.
 
+Measured with the confined install, copy import, the store fetch and the
+stores emptied on a move (review round 19), a new tip with unchanged install
+inputs: barnacle 14.6–16.1 s moved against 28.8–34.6 s remade (three of
+each, idle host), funeralworks 24.4–25.6 s against 47.0–47.2 s (two of
+each, load under 9). What a move still pays is the store fetch, the install
+run again in place and the two walks of the install's output.
+
 What this removes: the measurement no longer depends on I1's reading of
 staging, so the assertion every staging reader made — that staging was
 clean, or the run stopped — is gone; each reader stamps the branch's tree
@@ -8826,7 +8840,9 @@ of the commits that ship and out of the next worker's way. No worker
 reaches a view: it lies under the run directory, of which a worker's
 processes may read and write only their own grant, and no grant names a
 view (§6 *A worker writes only where it is granted (I5)*); nothing names a
-view to a worker either.
+view to a worker either. Each tip's view is a fresh checkout, or one
+moved there whose install is verified as leerie made it (*A view moves to
+the next tip when the install's inputs are unchanged*, above).
 
 Staging is restored at every resume all the same: an interrupted run's
 cleanup removes it, but a SIGKILL (Fly's `machine stop`, an OOM kill of

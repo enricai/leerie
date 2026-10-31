@@ -42370,12 +42370,22 @@ def _move_view(repo: Path, wt: Path, tip: str,
                snap: InstallSnapshot) -> bool:
     """Move the view `wt` to `tip`, its install kept (DESIGN §8 *A view
     moves to the next tip when the install's inputs are unchanged*): point
-    its `.git` back at its own administrative directory in `repo`, check it
-    out at `tip`, remove everything untracked but the install's outputs and,
-    under them, everything the install did not make. True when the view is
-    `tip` exactly, with the install as it made it."""
+    its `.git` back at its own administrative directory in `repo`, give it
+    a new measurement id, check it out at `tip`, remove everything untracked
+    but the install's outputs and, under them, everything the install did
+    not make. True when the view is `tip` exactly, with the install as it
+    made it."""
     admin = _admin_dir_of(repo, wt)
     if admin is None or not _rmtree_owned(wt / ".git"):
+        return False
+    # A moved view is a new tree to every measurement: with its id gone,
+    # `_measure_dir_at` gives it a fresh measurement directory and empty
+    # stores of its own (`_TREE_STORE_VARS`), as a replaced view gets, so
+    # nothing one commit's code left there reaches the next commit's
+    # measurement; the install, run again, fills the stores anew.
+    try:
+        (admin / _MEASURE_ID_FILE).unlink(missing_ok=True)
+    except OSError:
         return False
     (wt / ".git").write_text(f"gitdir: {admin}\n")
     co = subprocess.run(["git", *_tree_git_args(wt), "checkout", "-q", "--detach",

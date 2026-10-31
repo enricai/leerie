@@ -6810,7 +6810,10 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     snapshot's. `_move_view(repo,
     wt, tip, snap) -> bool`: `wt/.git` replaced by `gitdir:
     <_admin_dir_of(repo, wt)>`, every git command through
-    `_tree_git_args`, `checkout -q --detach --force <tip>`, `clean -ffdqx`
+    `_tree_git_args`, `<admin>/_MEASURE_ID_FILE` removed (so
+    `_measure_dir_at` gives the view a new measurement directory and moves
+    its `tree-stores/<view>` aside), `checkout -q --detach --force <tip>`,
+    `clean -ffdqx`
     with `-e /<output>` per output, `_install_intact`, then True only when
     `HEAD` is `tip` and `status --porcelain --untracked-files=no` is empty.
     Pinned by `tests/test_view_moves.py`.

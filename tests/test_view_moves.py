@@ -16,17 +16,19 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import measured_tmp_files
 from tests.test_run_repo import _git, _setup_run, _St, _user_repo
 
 pytestmark = pytest.mark.real_planning_worktree
 
-# Its run count is kept in its own temp directory: the install is confined
-# to the view and its measurement directory (DESIGN §6 *Leerie's runs of
-# the repository's commands are confined too*), which a moved view keeps.
+# Its run count is kept under its own output, `node_modules/.count`: the
+# install is confined to the view and its measurement directory (DESIGN §6
+# *Leerie's runs of the repository's commands are confined too*), and a
+# moved view gets a fresh measurement directory, keeping only the install's
+# output.
 INSTALL = (
     "import os, pathlib, sys\n"
-    "c = pathlib.Path(os.environ['TMPDIR'], sys.argv[1])\n"
+    "c = pathlib.Path('node_modules/.count')\n"
+    "c.parent.mkdir(exist_ok=True)\n"
     "c.write_text(str(int(c.read_text()) + 1 if c.exists() else 1))\n"
     "want = open('package.json').read()\n"
     "p = pathlib.Path('node_modules/dep/index.js')\n"
@@ -47,15 +49,9 @@ BUILD = (
     "    open('node_modules/.gen/out', 'w').write(src)\n")
 
 
-class _Count:
-    """The install's run count, read from the view's measurement
-    directory."""
-    def __init__(self, run_dir: Path, name: str):
-        self.run_dir, self.name = run_dir, name
-
-    def read_text(self) -> str:
-        (f,) = measured_tmp_files(self.run_dir, self.name)
-        return f.read_text()
+def _count(view: Path) -> int:
+    """How often the install ran in `view` over its own output."""
+    return int((view / "node_modules" / ".count").read_text())
 
 
 @pytest.fixture()
@@ -73,16 +69,15 @@ def env(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_cgroup_create", lambda *a, **k: None)
     monkeypatch.delenv("FAIL_INSTALL", raising=False)
     st = _St(repo, state)
-    count = _Count(st.run_dir, "install.count")
     st.data["provision"] = {"recipe": [
-        {"kind": "install", "command": [sys.executable, "-c", INSTALL,
-                                        count.name], "working_dir": "."},
+        {"kind": "install", "command": [sys.executable, "-c", INSTALL],
+         "working_dir": "."},
         {"kind": "build", "command": [sys.executable, "-c", BUILD],
          "working_dir": "."}]}
     staging = _setup_run(leerie, st)
     caps = dict(leerie.DEFAULT_CAPS)
     caps["worker_timeout_sec"] = 60
-    yield st, staging, caps, count
+    yield st, staging, caps, _count
     for d in (leerie._VIEWS, leerie._VIEW_INSTALLS, leerie._DEPS_KEPT,
               leerie._INSTALL_OUTPUTS):
         d.clear()
@@ -112,7 +107,8 @@ def test_a_new_tip_with_the_same_inputs_keeps_the_install(leerie, env):
     """The view moves: the install's own output stays (same inode), the
     install runs again over it, the builds run again, and nothing else of
     the old tip — a measurement's report, a tool's cache under
-    `node_modules`, a build's output — is left."""
+    `node_modules`, a build's output, its own stores, its measurement
+    directory — is left."""
     st, staging, caps, count = env
     a = _commit(leerie, staging, {"src/a.txt": "2"})
     v1 = _measure(leerie, st, staging, caps)
@@ -125,16 +121,24 @@ def test_a_new_tip_with_the_same_inputs_keeps_the_install(leerie, env):
     (v1 / "dist" / "stale.txt").write_text("old")
     (v1 / "node_modules" / ".cache").mkdir()
     (v1 / "node_modules" / ".cache" / "x").write_text("old")
+    poison = v1.parent.parent / "tree-stores" / v1.name / "uv" / "old"
+    poison.parent.mkdir(parents=True, exist_ok=True)
+    poison.write_text("old")
+    measured = leerie._measure_dir(st, v1)
+    (measured / "reports" / "old").write_text("old")
     b = _commit(leerie, staging, {"src/a.txt": "3"})
     v2 = _measure(leerie, st, staging, caps)
     assert v2 == v1
     assert _git(v2, "rev-parse", "HEAD") == b
     assert _ino(dep) == ino                        # the install kept
-    assert int(count.read_text()) == 2             # and run again over it
+    assert count(v2) == 2                          # and run again over it
     assert (v2 / "dist" / "out.txt").read_text() == "3"
     for gone in ("report.txt", "dist/stale.txt", "node_modules/.cache",
                  "node_modules/.gen"):             # a build's is not kept
         assert not os.path.lexists(v2 / gone), gone
+    assert not poison.exists()                     # its own stores go too
+    assert leerie._measure_dir(st, v2) != measured  # and its measurement dir
+    assert not (leerie._measure_dir(st, v2) / "reports" / "old").exists()
     assert _git(v2, "status", "--porcelain") == ""
 
 
