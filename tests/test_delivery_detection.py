@@ -34,6 +34,7 @@ import pytest
 
 from tests.stub_helpers import (DELIVERY_CITED_FILE, DELIVERY_CITED_LINE,
                                 _delivery_tree, _judge_verdict)
+from tests.conftest import fake_run_dir
 
 MODELS = {"delivery_judge": "sonnet", "falsifier": "sonnet"}
 EFFORTS = {"delivery_judge": "medium", "falsifier": "medium"}
@@ -549,8 +550,8 @@ class TestReask:
                         "item_span_quote": "", "entry_point": "",
                         "reason": "r"}}
         st = types.SimpleNamespace(
-            path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-            run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+            path=fake_run_dir() / "state.json",
+            run_dir=fake_run_dir(),
             repo_root=pathlib.Path("/leerie-test-user-repo"),
             data={"verbosity": "quiet"}, run_id="r1",
             bump_workers=lambda *a, **k: None,

@@ -1773,6 +1773,86 @@ own repository (*The run's own repository* below), never the user's. Parallel wr
 collide. This is what makes "a wave of parallel implementers" safe even when
 two of them touch the same file.
 
+### Each worker's own configuration and temporary directories
+
+**Root cause: every worker shared one CLI configuration and one `/tmp`.**
+Every `claude -p` read and wrote `~/.claude` (in the container, the staged
+copy of the operator's) and `/tmp`. The configuration directory is not
+inert data: its `settings.json` carries hooks the CLI runs. Measured on the
+host (CLI 2.1.312, haiku, a scratch `CLAUDE_CONFIG_DIR` holding only
+`.credentials.json`): a `settings.json` with `SessionStart`,
+`UserPromptSubmit` and `Stop` hooks written into it before a session ran
+all three hooks in that session. So one worker that wrote a hook there —
+with Bash, or the Write tool — ran code in every later worker's session;
+and one worker could leave or read files in another's `/tmp`.
+
+**Invariant: no worker can change the environment of another worker or
+of leerie.** Each worker gets its own directories, at the layout the
+write grant (§6 *A worker writes only where it is granted (I5)*) grants
+and nothing else:
+
+- `<run-dir>/workers/<wid>/config/` — the worker's `CLAUDE_CONFIG_DIR`;
+- `<run-dir>/workers/<wid>/tmp/` — its `TMPDIR` (and `TMP`, `TEMP`);
+- `<run-dir>/workers/<wid>/cache/` — its caches (owned by the cache
+  separation; not made here).
+
+`<wid>` is the `sid` of the worker's first call. A call that resumes a
+session (`--resume`: the clean-tree re-ask, the falsifier's re-ask) runs
+in the directories that hold that session, found by its transcript under
+`config/projects/`, so the CLI finds what it resumes. A worker's `tmp/`
+is removed when each of its calls returns; its `config/` lives as long as
+a resume of it can follow. `workers/` and the template below go when the
+run finalizes.
+
+*What a config directory holds.* It is made from the run's configuration
+template, `<run-dir>/claude-config/`: a read-only snapshot, taken once
+when the run's first worker starts and kept for the run, of the
+operator's CLI configuration (`$CLAUDE_CONFIG_DIR`, else `~/.claude`)
+without its per-session state (transcripts, sessions, shell snapshots,
+history, caches, backups), plus `~/.claude.json`, which the CLI reads
+from the configuration directory when one is set. A worker's
+configuration directory holds a writable copy of each of the template's
+top-level files (settings, credentials, account state: what the CLI and a
+worker may rewrite) and a link to each of its directories (plugins,
+skills and the like). Copying those directories per worker would cost
+about 26 MB a worker on this host's staged configuration, mostly
+`skills/`, times the hundreds of worker sessions a run makes. Measured
+(haiku, one Bash call, with the linked directories read-only), the CLI
+authenticated, ran the call and wrote only into the worker's own
+`projects/`, `sessions/`, `session-env/`, `shell-snapshots/`, `backups/`
+and `.claude.json`, never into a linked directory. So a worker still
+authenticates the way it did — `.credentials.json` in its copy, or
+`CLAUDE_CODE_OAUTH_TOKEN` in its environment, which the token rotation
+sets per call and which wins over the file — and still sees the
+operator's own settings, plugins and skills, but every write it can make
+lands in its own directory. The template's read-only mode stops the CLI
+and an ordinary write. A worker running as the template's owner could
+change the mode back; the write grant (I5), which grants no part of the
+template, is what stops that.
+Leerie's own controls do not live there at all: the PreToolUse hook and
+its deny rules travel on the argv (`--settings`, `--disallowedTools`) and
+the system prompt as a file in the run directory, so they apply to every
+worker whatever its configuration directory holds.
+
+*`HOME` is not written.* With `CLAUDE_CONFIG_DIR`, `TMPDIR` and
+`--strict-mcp-config` set — which every worker carries — a measured
+session (haiku, one Bash call) wrote nothing under a scratch `HOME`, and
+ran with `HOME` read-only. (Without `--strict-mcp-config` it wrote MCP
+logs to `~/.cache/claude-cli-nodejs/`.) So `HOME` needs no grant.
+
+*Not covered here.* A repository's own project settings
+(`.claude/settings.json`, and an ignored `.claude/settings.local.json`)
+in a worker's tree are read by every later worker in that tree; a worker
+that writes the local one in staging reaches later staging workers. That
+is a tree, not a configuration directory, and is the write grant's to
+close.
+
+*Runtimes.* The directories are made by the orchestrator, under the run
+directory it owns, as the uid the workers run as: the `unshare`-mapped
+leerie on rootless, `runuser` leerie on rootful, leerie on Fly. The
+template is copied from the mounted or seeded `~/.claude`, which that uid
+already reads on each runtime; no chown is added.
+
 ### The run's own repository (RC4, I4)
 
 *Designed and built 2026-10-30 (review round 16, H2). The statements

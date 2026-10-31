@@ -3354,6 +3354,8 @@ def test_fixers_cannot_read_the_sets(leerie, tmp_path):
             f"Read(/{run_dir}/orchestrator.log)",
             f"Read(/{run_dir}/calls.ndjson)",
             f"Read(/{run_dir}/state.json)",
+            # each worker's own CLI configuration, its transcripts included
+            f"Read(/{run_dir}/workers/*/config/**)",
             "Read(~/.claude/projects/**)"]
     # The fixers' prompts read only these run-directory paths, none denied.
     for w in ("implementer", "conformer"):

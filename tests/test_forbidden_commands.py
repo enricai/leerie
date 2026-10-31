@@ -25,6 +25,7 @@ import sys
 import types
 
 import pytest
+from tests.conftest import fake_run_dir
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 FORBID = ["pnpm run test"]
@@ -388,8 +389,8 @@ def _spawn(leerie, monkeypatch, repo_root, *, data=None,
                 "result": "{}", "structured_output": {"categories": []}}
 
     st = types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         repo_root=repo_root, data={"verbosity": "quiet", **(data or {})},
         run_id="r1", bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None)
@@ -714,7 +715,10 @@ def test_no_forbidden_script_means_no_guard_env(leerie, monkeypatch,
                                                 tmp_path):
     _spawn(leerie, monkeypatch, _repo(tmp_path, test=""),
            data=_pc("prisma db push"))
-    assert "env_extra" not in _SPAWN_KW
+    # Only the worker's own directories (DESIGN §6 *Each worker's own
+    # configuration and temporary directories*); no guard variable.
+    assert set(_SPAWN_KW["env_extra"]) == {
+        "CLAUDE_CONFIG_DIR", "TMPDIR", "TMP", "TEMP"}
 
 
 def _guard(event, *, scripts="test lint-x"):

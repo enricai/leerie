@@ -40,6 +40,7 @@ import sys
 import tempfile
 
 import pytest
+from tests.conftest import fake_run_dir
 
 # Linux's per-argument ceiling (PAGE_SIZE * 32 on a 4KB-page kernel).
 # Not a leerie constant — this is the external fact the fix routes
@@ -69,8 +70,8 @@ def _build_cmd(leerie, user_prompt: str, extra_user: str = "") -> list[str]:
     import pathlib
     import types
     st = types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         # claude_p derives the checkout write-denial from this
         # (_repo_write_denials) and the §12 cwd guard compares against it;
         # a stub without it silently disables both.
@@ -196,8 +197,8 @@ def test_retry_note_reaches_stdin_not_argv(leerie):
     import types
     import pathlib
     st = types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         # claude_p derives the checkout write-denial from this
         # (_repo_write_denials) and the §12 cwd guard compares against it;
         # a stub without it silently disables both.

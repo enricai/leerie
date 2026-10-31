@@ -5703,6 +5703,27 @@ run payload-only the same way, and `_replay_capture` reads a ref-less
 files only, removed with the replay's temporary directory — never the
 checkout, whose uncommitted file stays untouched.
 
+## A worker cannot change another worker's environment
+
+`tests/test_worker_config_isolation.py` (6 tests, DESIGN §6 *Each worker's
+own configuration and temporary directories*) drives the real `claude_p`
+and `_invoke` against a stub `claude` that acts as the CLI does where it
+matters: no credentials in its configuration directory means no session,
+it runs the `SessionStart` hooks that directory's `settings.json` names,
+it writes its transcript under `projects/`, and it resolves its temporary
+directory as Node's `os.tmpdir()` does (`TMPDIR`, else `/tmp`). A hook one
+worker plants never runs in the next; both read the operator's credentials
+and settings from their own copies of the run's template, which leaves out
+per-session state; the template's directories reach each worker as links
+to one read-only copy, which a worker cannot write; each worker has its
+own `TMPDIR`, gone once the call returns; a `--resume` runs in the
+directories that hold its session; and finalize's `_remove_worker_dirs`
+removes them all and the template. Falsified, each turning a test red: one
+shared `<wid>`, `CLAUDE_CONFIG_DIR` or `TMPDIR` left unset, the resume
+lookup bypassed, the `tmp` removal dropped, an empty `_CLAUDE_CONFIG_SKIP`,
+directories copied instead of linked, the template left writable, and the
+template kept at finalize.
+
 ## The rev 9 redesign's other new and rewritten test files
 
 - `tests/test_resume_staging_is_reset.py` (7 tests, DESIGN §8 *The final

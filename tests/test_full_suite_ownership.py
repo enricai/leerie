@@ -330,8 +330,8 @@ def _spawn(leerie, monkeypatch, repo_root, *, schema_key="implementer",
                 "result": "{}", "structured_output": {"categories": []}}
 
     st = types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         repo_root=repo_root, data={"verbosity": "quiet", **(data or {})},
         run_id="r1", bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None)
@@ -611,6 +611,7 @@ from tests.test_declared_commands_executed import (  # noqa: E402
     _COMPLETE_RES_EXTRA, _declare, _settle, _verification_only_harness,
     _write_worker_log)
 from tests.test_oom_naming import env  # noqa: E402,F401  (pytest fixture)
+from tests.conftest import fake_run_dir
 
 
 def _settle_env(env, monkeypatch, *, declared, prescribed=None,

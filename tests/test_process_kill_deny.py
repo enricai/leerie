@@ -20,6 +20,7 @@ import sys
 import types
 
 import pytest
+from tests.conftest import fake_run_dir
 
 # The 48 recorded pattern kills, verbatim from the run corpus (bench N8,
 # `pkill/instances.tsv`'s kill_cmd column), in record order.
@@ -255,8 +256,8 @@ def _spawn(leerie, monkeypatch, tmp_path, *, allowed_tools, schema_key):
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
     st = types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         repo_root=repo, data={"verbosity": "quiet"},
         run_id="r1", bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None)

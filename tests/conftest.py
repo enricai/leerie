@@ -304,6 +304,40 @@ def _no_iam_propagation_wait(monkeypatch):
     monkeypatch.setenv("LEERIE_EC2_IAM_PROPAGATION_S", "0")
 
 
+_FAKE_RUN_DIR: Path | None = None
+
+
+def fake_run_dir() -> Path:
+    """This test's own run directory, for a test double of the state that
+    has no real one. `claude_p` makes per-worker directories and a
+    configuration template in the run directory (DESIGN §6 *Each worker's
+    own configuration and temporary directories*), so one fixed path shared
+    by every test (and every suite on the host) would carry one test's
+    template and workers into the next."""
+    assert _FAKE_RUN_DIR is not None
+    return _FAKE_RUN_DIR
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fake_run_dir(tmp_path_factory):
+    global _FAKE_RUN_DIR
+    _FAKE_RUN_DIR = tmp_path_factory.mktemp("fake-run")
+    yield
+    _FAKE_RUN_DIR = None
+
+
+@pytest.fixture(autouse=True)
+def _no_operator_claude_config(tmp_path_factory, monkeypatch):
+    """Point the operator's CLI configuration at an empty directory: every
+    `claude_p` snapshots it into the run's template (DESIGN §6 *Each
+    worker's own configuration and temporary directories*), and the real
+    `~/.claude` holds the developer's credentials and tens of MB of skills
+    and plugins, which would otherwise land in every test's run directory
+    under /tmp. A test of that snapshot sets its own."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR",
+                       str(tmp_path_factory.mktemp("operator-claude")))
+
+
 @pytest.fixture(autouse=True)
 def _fresh_head_acceptance_results(leerie, monkeypatch):
     """Give every test an empty `_HEAD_ACCEPTANCE_RESULTS`: the `leerie`

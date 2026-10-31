@@ -53,6 +53,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.conftest import fake_run_dir
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
@@ -253,8 +254,8 @@ def _worker_argv(leerie, monkeypatch) -> list[str]:
                 "result": "{}", "structured_output": {"categories": []}}
 
     st = SimpleNamespace(
-        path=Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         # `repo_root` is real, not decorative: claude_p derives the
         # path-scoped write denial from it (`_repo_write_denials`). An
         # under-specified stub here hides that producer-side contract.
@@ -332,7 +333,7 @@ def test_both_sites_share_the_builder(leerie, monkeypatch, tmp_path):
         leerie.DISALLOWED_TOOLS
     assert worker[worker.index("--disallowedTools") + 1] == \
         leerie.DISALLOWED_TOOLS + ",Edit(//work/**)" \
-        + ",Read(//tmp/leerie-test-nonexistent/sysprompt/**)"
+        + f",Read(/{fake_run_dir()}/sysprompt/**)"
 
     # (b) break the single owner — BOTH must lose it. A site that rebuilt its
     #     own argv would keep the flag here and fail.

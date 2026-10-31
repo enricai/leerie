@@ -25,6 +25,7 @@ from tests.conftest import run_git_cwd_first_stdout as _git
 from tests.test_acceptance_gate import (BUGGY, CONTROL_TEST, DEFECT_TEST,
                                         FIXED, NONDISCRIMINATING, _caps,
                                         _commit_fix, _repo, _st, _staging)
+from tests.conftest import fake_run_dir
 
 MODELS = {"acceptance_writer": "sonnet", "conformer": "sonnet",
           "set_auditor": "sonnet", "surrogate_fixer": "sonnet"}
@@ -848,8 +849,8 @@ def _spawn(leerie, monkeypatch, repo_root, allowed_tools, env_extra=None):
         return {"type": "result", "subtype": "success", "is_error": False,
                 "result": "{}", "structured_output": {"categories": []}}
     st = types.SimpleNamespace(
-        path=Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=Path("/tmp/leerie-test-nonexistent"), repo_root=repo_root,
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(), repo_root=repo_root,
         data={"verbosity": "quiet"}, run_id="r1",
         bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None)
@@ -885,9 +886,13 @@ def test_env_extra_reaches_the_worker_only_when_set(leerie, monkeypatch,
                                                     tmp_path):
     _d, cap = _spawn(leerie, monkeypatch, tmp_path, leerie.ACT_TOOLS,
                      env_extra={"DATABASE_URL": "u"})
-    assert cap["kw"]["env_extra"] == {"DATABASE_URL": "u"}
+    # Beside the worker's own directories (DESIGN §6 *Each worker's own
+    # configuration and temporary directories*), which every worker gets.
+    own = {"CLAUDE_CONFIG_DIR", "TMPDIR", "TMP", "TEMP"}
+    env = cap["kw"]["env_extra"]
+    assert env["DATABASE_URL"] == "u" and set(env) == own | {"DATABASE_URL"}
     _d, cap = _spawn(leerie, monkeypatch, tmp_path, leerie.ACT_TOOLS)
-    assert "env_extra" not in cap["kw"]
+    assert set(cap["kw"]["env_extra"]) == own
 
 
 def test_a_worker_environment_never_carries_the_consent(leerie, monkeypatch,

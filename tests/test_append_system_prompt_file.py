@@ -33,6 +33,7 @@ import types
 import unittest.mock as mock
 
 import pytest
+from tests.conftest import fake_run_dir
 
 
 @pytest.fixture(autouse=True)
@@ -133,8 +134,8 @@ def test_probe_writes_and_cleans_up_temp_file(leerie, monkeypatch, tmp_path):
 
 def _make_state():
     return types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         # claude_p derives the checkout write-denial from this
         # (_repo_write_denials) and the §12 cwd guard compares against it;
         # a stub without it silently disables both.

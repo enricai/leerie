@@ -10876,6 +10876,111 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
           "on), and they are logged as a warning instead.")
 
 
+# Each worker's own CLI configuration and temporary directories (DESIGN §6
+# *Each worker's own configuration and temporary directories*): a worker
+# writes hooks or settings only into its own copy, and its own `TMPDIR`.
+WORKERS_DIR = "workers"
+CLAUDE_CONFIG_TEMPLATE = "claude-config"
+_CLAUDE_CONFIG_TEMPLATE_MARK = ".leerie-template"
+# Per-session state of the operator's CLI configuration, never copied into a
+# worker's: transcripts, session metadata, history, caches and backups.
+_CLAUDE_CONFIG_SKIP = frozenset({
+    "projects", "sessions", "session-env", "shell-snapshots", "history.jsonl",
+    "todos", "tasks", "plans", "file-history", "paste-cache", "telemetry",
+    "statsig", "debug", "downloads", "backups", "ide", "local",
+    "stats-cache.json", ".last-cleanup"})
+
+
+def _claude_config_template(run_dir: Path) -> Path:
+    """`<run_dir>/claude-config/`: the run's snapshot of the operator's CLI
+    configuration (`$CLAUDE_CONFIG_DIR`, else `~/.claude`, without its
+    per-session state, plus `~/.claude.json`), made once — at the run's
+    first worker — and kept for the run, so nothing a worker writes later
+    reaches another worker's copy."""
+    t = Path(run_dir) / CLAUDE_CONFIG_TEMPLATE
+    if (t / _CLAUDE_CONFIG_TEMPLATE_MARK).is_file():
+        return t
+    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    src = Path(env_dir) if env_dir else Path.home() / ".claude"
+    tmp = Path(run_dir) / f".{CLAUDE_CONFIG_TEMPLATE}.tmp-{os.getpid()}"
+    _rmtree_owned(tmp)
+    if src.is_dir():
+        shutil.copytree(src, tmp, symlinks=True,
+                        ignore=lambda d, names: (
+                            [n for n in names if n in _CLAUDE_CONFIG_SKIP]
+                            if Path(d) == src else []))
+    else:
+        tmp.mkdir(parents=True)
+    claude_json = (src / ".claude.json" if env_dir
+                   else Path.home() / ".claude.json")
+    if not (tmp / ".claude.json").exists() and claude_json.is_file():
+        shutil.copy2(claude_json, tmp / ".claude.json")
+    (tmp / _CLAUDE_CONFIG_TEMPLATE_MARK).write_text("")
+    # Read-only: its directories are shared by every worker's
+    # configuration (`_worker_dirs`), so nothing may write into them.
+    for d, _dirs, files in os.walk(tmp):
+        for f in [d, *(os.path.join(d, n) for n in files)]:
+            if not os.path.islink(f):
+                os.chmod(f, stat.S_IMODE(os.lstat(f).st_mode) & ~0o222)
+    _rmtree_owned(t)
+    os.rename(tmp, t)
+    return t
+
+
+def _resumed_wid(run_dir: Path, session: str | None) -> str | None:
+    """The `workers/<wid>` whose configuration holds `session`'s transcript,
+    so a `--resume` runs where the CLI finds it; None when none does."""
+    if not session:
+        return None
+    for hit in sorted((Path(run_dir) / WORKERS_DIR).glob(
+            f"*/config/projects/*/{session}.jsonl")):
+        return hit.parents[3].name
+    return None
+
+
+def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
+                 ) -> tuple[Path, Path]:
+    """`(config, tmp)` of the worker: `<run_dir>/workers/<wid>/`, `<wid>`
+    the directories that hold the resumed session, else `sid`. `config` is
+    made when absent (in a sibling and renamed, so a crash never leaves
+    half of one): a writable copy of each of the run template's top-level
+    files (the settings, credentials and account state a worker may
+    rewrite) and a link to each of its directories (plugins, skills and the
+    like, read-only and shared rather than copied per worker). `tmp` is
+    made empty."""
+    wid = _resumed_wid(run_dir, resume_session) or sid
+    base = Path(run_dir) / WORKERS_DIR / wid
+    config, tmp = base / "config", base / "tmp"
+    if not config.is_dir():
+        template = _claude_config_template(run_dir)
+        part = base / f".config.tmp-{os.getpid()}"
+        _rmtree_owned(part)
+        part.mkdir(parents=True)
+        for entry in template.iterdir():
+            dst = part / entry.name
+            if entry.name == _CLAUDE_CONFIG_TEMPLATE_MARK:
+                continue
+            if entry.is_symlink():
+                os.symlink(os.readlink(entry), dst)
+            elif entry.is_dir():
+                os.symlink(entry, dst)
+            else:
+                shutil.copy2(entry, dst)
+                os.chmod(dst, stat.S_IMODE(os.lstat(dst).st_mode) | 0o600)
+        os.rename(part, config)
+    _rmtree_owned(tmp)
+    tmp.mkdir(parents=True)
+    return config, tmp
+
+
+def _remove_worker_dirs(run_dir: Path) -> None:
+    """Remove every worker's directories, and the template they were made
+    from (it holds the credentials), once the run has no worker left to
+    resume (finalize)."""
+    _rmtree_owned(Path(run_dir) / WORKERS_DIR)
+    _rmtree_owned(Path(run_dir) / CLAUDE_CONFIG_TEMPLATE)
+
+
 def _payload_only_cwd(st: object) -> str:
     """An empty run-private directory for a worker whose whole input is its
     payload (`PAYLOAD_ONLY_TOOLS`): never the user's checkout."""
@@ -22814,6 +22919,7 @@ def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
                      f"Read(/{rd / 'orchestrator.log'})",
                      f"Read(/{rd / 'calls.ndjson'})",
                      f"Read(/{rd / 'state.json'})",
+                     f"Read(/{rd / WORKERS_DIR}/*/config/**)",
                      "Read(~/.claude/projects/**)"])
 
 
@@ -25576,6 +25682,20 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # how this function exits. `--append-system-prompt-file` is undocumented,
     # so its use is gated behind the memoized probe with an unconditional
     # fallback to the inline flag.
+    # The worker's own CLI configuration and TMPDIR (DESIGN §6 *Each
+    # worker's own configuration and temporary directories*): nothing it
+    # writes there reaches another worker or leerie. A state with no run
+    # directory is a test double; production states always have one.
+    worker_tmp: Path | None = None
+    _wrun = getattr(st, "run_dir", None)
+    if isinstance(_wrun, (str, os.PathLike)):
+        worker_config, worker_tmp = _worker_dirs(Path(_wrun), sid,
+                                                 resume_session)
+        env_extra = {**(env_extra or {}),
+                     "CLAUDE_CONFIG_DIR": str(worker_config),
+                     "TMPDIR": str(worker_tmp), "TMP": str(worker_tmp),
+                     "TEMP": str(worker_tmp)}
+
     use_file_flag = _append_system_prompt_file_supported()
     system_prompt_file: str | None = None
     if use_file_flag:
@@ -25979,6 +26099,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         if system_prompt_file is not None:
             with contextlib.suppress(OSError):
                 os.unlink(system_prompt_file)
+        if worker_tmp is not None:
+            _rmtree_owned(worker_tmp)
 
 
 async def _replay_capture(record: dict, *,
@@ -62329,6 +62451,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             # *The run's own repository*). Best-effort: a hung cleanup.sh
             # must not block the no-work terminal state from being recorded
             # (same swallow-and-continue pattern as `_record_run_health`).
+            # No worker of the run is left to resume: their own
+            # directories go (DESIGN §6 *Each worker's own configuration
+            # and temporary directories*).
+            _remove_worker_dirs(st.run_dir)
             try:
                 await _run_script("cleanup.sh", "--run-id", st.run_id, st=st)
             except subprocess.TimeoutExpired as _cleanup_exc:
@@ -62369,6 +62495,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # Worktrees only: cleanup deletes no branch — the subtask branches stay
     # in the run's own repository and go with it (DESIGN §6 *The run's own
     # repository*), so nothing here can take the run branch with it.
+    # No worker of the run is left to resume: their own directories go
+    # (DESIGN §6 *Each worker's own configuration and temporary
+    # directories*).
+    _remove_worker_dirs(st.run_dir)
     try:
         await _run_script("cleanup.sh", "--run-id", st.run_id, st=st)
     except subprocess.TimeoutExpired as _cleanup_exc:
