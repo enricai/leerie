@@ -2502,13 +2502,13 @@ single `$LEERIE_STATE_HOST_DIR` and cannot be reused directly.
 
 #### `group_id` in `run.json`
 
-`group_id` is an optional string field in `run.json`. It is written
-at two points: (1) by the orchestrator at run-start when `--group-id`
-is supplied as a CLI arg (`orchestrator/leerie.py:15061`), so the
-field appears in `run.json` immediately when the run begins; and (2)
-by the `group` launcher arm after all members complete, via
-`update_run_json … group_id "$_group_id"` (the tag-back step in
-`leerie`). The `chain_id` field follows the same pattern.
+`group_id` is an optional string field in `run.json`. The orchestrator
+writes it at run start when `--group-id` is supplied (`_write_run_json` in
+`_run_phases`' fresh-run branch), into the run it resolved, so the field
+appears in `run.json` when the run begins and only in a run of that group
+(DESIGN §6 *Which run the container ran*). On Fly and EC2 the `group`
+launcher arm also writes it into the host-side `run.json` after the members
+exit (the pointer tag-back below).
 `_validate_run_json`
 (`orchestrator/leerie.py:1994`) does not add any invariant check on
 `group_id` — it is informational and orthogonal to the push/pause/kill
@@ -2546,7 +2546,7 @@ its own `USER_REPO` and basename-keyed state directory independently. The
 self-command **must** be absolutized *before* the `cd`: a relative `$0`
 (e.g. `./leerie`) would not resolve once the subshell has `cd`'d into the
 member repo — unlike chains, which never `cd`. Finally, waits for all
-members (`wait`) and runs group tag-back (below).
+members (`wait`) and runs the Fly/EC2 pointer tag-back (below).
 
 **State-dir guard (mandatory).** The arm rejects or per-member-namespaces
 any `--state-dir` / `LEERIE_STATE_DIR` override in the calling environment,
@@ -2560,32 +2560,26 @@ Per-member flags are forwarded like `_ch_passthrough` for chains.
 takes precedence in `_grp_self_cmd`, so tests substitute a stub binary
 via `LEERIE_SELF_CMD`.
 
-#### Group tag-back across state directories (both runtimes)
+#### Group tag-back (Fly and EC2 only)
 
-After `wait`, the launcher writes `group_id` into each member's
-`run.json`. Because each member runs in its own `$HOME/.leerie/<basename>/`
-state directory, the launcher must discover each member's run directory
-from its per-member state dir, not from `$LEERIE_STATE_HOST_DIR`.
+A local member is not tagged by the launcher: its orchestrator wrote
+`group_id` into its run's `run.json` at run start. The `group` arm reads no
+run id and scans no state directory for runs.
 
-The launcher knows each child's PID (`$!`) and repo path (→ basename →
-state dir), so the discovery is:
-
-| Runtime | Discovery mechanism |
-|---------|---------------------|
-| **Local** | After `wait` on a member, scan `~/.leerie/<member-basename>/runs/*/run.json` for the newest file with `finished_at` set (the `group` arm's tag-back loop in `leerie`). No cidfile read, no `--rm` race — the `run.json` is durably on disk by the time `wait` returns. |
-| **Fly** | The existing `remote/<child-pid>.json` / `fly-machine.json` pointer path (`leerie:2263-2289`), applied per-member using the member's own state dir. The child's PID is `$!`; the member's state dir is resolved from its basename. |
-
-After discovering each member's `run.json`, the launcher calls
-`update_run_json … group_id "$_group_id"` (the same runtime-agnostic
-atomic merge used by the chain wave loop, `scripts/remote/lib.sh:70`). No
-new per-child pointer file is required: the durable `run.json`-on-disk is
-the coordination artifact, consistent with how chains discover members.
+On Fly and EC2, after `wait`, the arm writes `group_id` into the host-side
+`run.json` of each member's own run, through `update_run_json … group_id
+"$_grp_id"`. That covers the time before the machine's copy, which carries
+the orchestrator's `group_id`, is synced back. The run is found from the
+member's basename-keyed state dir by that member launcher's own pid (`$!`):
+first its `remote/<pid>.json` pointer, then the `fly-machine.json` whose
+`launcher_pid` is that pid. When neither exists (a local member), nothing
+is written.
 
 #### Group-scoped verbs
 
 | Verb | Behavior |
 |------|----------|
-| `leerie group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher. Mints a fresh `group_id` unless `--group-id <prior-uuid>` is supplied. Fans out one backgrounded member invocation per `--repo`, waits, then runs group tag-back. |
+| `leerie group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher. Mints a fresh `group_id` unless `--group-id <prior-uuid>` is supplied. Fans out one backgrounded member invocation per `--repo` and waits; on Fly and EC2, then runs the pointer tag-back. |
 | `leerie status <group-id>` | Iterates member state dirs (derived from the group's member repos or a group-manifest the launcher drops), filters `run.json` by `group_id`, renders one row per matched run (run_id, status, branch, notes). Same field-derived status as chain `status`. |
 | `leerie stop <group-id>` | Discovers running Fly members across all member state dirs; invokes `leerie stop <run-id>` per discovered run. Fly-runtime only (pauses machines). |
 | `leerie resume <group-id>` | Discovers paused members across all member state dirs; invokes `leerie resume <run-id>` per discovered paused run. |

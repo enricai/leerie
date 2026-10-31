@@ -54,8 +54,9 @@ def _nested_heredoc_bodies() -> list[tuple[int, str, list[tuple[int, str]]]]:
 
 def test_scan_finds_the_nested_heredocs():
     """Anti-vacuity: a scan that matches nothing passes forever. The launcher
-    holds five heredocs nested in `$(` today."""
-    assert len(_nested_heredoc_bodies()) >= 4
+    holds three heredocs nested in `$(` today (two EARLY_PROBE_PY, one PY;
+    the group arm's run scan, a fourth, is gone)."""
+    assert len(_nested_heredoc_bodies()) >= 3
 
 
 def test_no_apostrophe_in_a_heredoc_nested_in_command_substitution():

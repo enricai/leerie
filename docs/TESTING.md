@@ -558,7 +558,14 @@ in `tests/test_group_launcher.py` via the same bash-harness pattern
 across two state dirs (combined paused/unpushed + pushed fixture, plus
 `stop` dispatch) is covered by `tests/test_group_launcher_verbs.py`.
 Fan-out core contract (cwd per member, `--inspect-dir` for siblings, brief
-prepend) is in `tests/test_group_launcher_fanout.py`. Python-layer
+prepend) is in `tests/test_group_launcher_fanout.py`.
+`TestGroupFanOut::test_only_this_groups_runs_are_tagged` puts another
+group's runs and standalone runs, all finished and newer, beside each
+member's own run, and asserts that only the runs the members started carry
+the group's id and appear in its `status` (DESIGN §6 *Which run the
+container ran*). Its stub writes `group_id` at run start, as a member's
+orchestrator does. With the old newest-finished scan put back, the
+standalone runs get the group's id and the test fails. Python-layer
 `group_id` in `run.json` (`_validate_run_json`, `_write_run_json`,
 `_derive_run_status`) is in `tests/test_group_run_json.py`. State-dir
 isolation (distinct basename-keyed dirs per member, guard rejects

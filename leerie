@@ -4800,50 +4800,29 @@ ${_grp_member_prompt}"
     # Clear signal trap; fan-out complete.
     trap - INT TERM
 
-    # Group tag-back: write group_id into each member's run.json.
-    # Discovery: scan <member-state-dir>/runs/*/run.json for the newest
-    # run.json with finished_at set — same mechanism as the local
-    # finalize discovery (leerie:4967-4992). The member's state dir is
-    # derived from its repo basename (same as _state_dir_default does
-    # for USER_REPO).
+    # No tag-back of local runs: each member's orchestrator wrote group_id
+    # into the run.json of the run it resolved, at run start — the one
+    # source of which run a container ran (DESIGN §6 *Which run the
+    # container ran*). Nothing here scans a state dir for runs: the newest
+    # finished run there can be another group's.
+    #
+    # Fly/EC2: the host-side run.json of the member's own run gets
+    # group_id too, for the time before the machine's copy is synced back.
+    # The run is the one that member launcher's pointer names (its pid is
+    # $!): remote/<pid>.json, else the fly-machine.json with that
+    # launcher_pid. A local member has neither, and nothing is written.
     for _gi in $(seq 0 $((_grp_n - 1))); do
       _grp_member_repo="${_grp_repos[$_gi]}"
       _grp_member_basename="$(python3 -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$_grp_member_repo")"
       _grp_member_state_dir="$HOME/.leerie/$_grp_member_basename"
-
-      # Discover the member's run.json: newest run dir with finished_at.
-      _grp_run_json="$(python3 - "$_grp_member_state_dir" <<'PY'
-import json, os, sys
-from pathlib import Path
-state_dir = Path(sys.argv[1])
-runs_dir = state_dir / "runs"
-best_mtime = 0
-best_path = ""
-for rj in runs_dir.glob("*/run.json") if runs_dir.is_dir() else []:
-    try:
-        data = json.loads(rj.read_text())
-    except (OSError, ValueError):
-        continue
-    if not data.get("finished_at"):
-        continue
-    mtime = rj.stat().st_mtime
-    if mtime > best_mtime:
-        best_mtime = mtime
-        best_path = str(rj)
-print(best_path)
-PY
-)"
-      if [ -z "$_grp_run_json" ] || [ ! -f "$_grp_run_json" ]; then
-        # Fly runtime: try remote/<child-pid>.json pointer, then
-        # fly-machine.json scan — same as chain tag-back (leerie:2263-2289).
-        _grp_cp="${_grp_child_pids[$_gi]}"
-        _grp_remote_ptr="$_grp_member_state_dir/remote/$_grp_cp.json"
-        _grp_mid=""
-        if [ -f "$_grp_remote_ptr" ]; then
-          _grp_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_grp_remote_ptr" 2>/dev/null)"
-        fi
-        if [ -z "$_grp_mid" ]; then
-          _grp_mid="$(python3 -c '
+      _grp_cp="${_grp_child_pids[$_gi]}"
+      _grp_remote_ptr="$_grp_member_state_dir/remote/$_grp_cp.json"
+      _grp_mid=""
+      if [ -f "$_grp_remote_ptr" ]; then
+        _grp_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_grp_remote_ptr" 2>/dev/null)"
+      fi
+      if [ -z "$_grp_mid" ]; then
+        _grp_mid="$(python3 -c '
 import json, sys
 from pathlib import Path
 state_dir, pid = Path(sys.argv[1]), int(sys.argv[2])
@@ -4856,16 +4835,10 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
         print(fmj.parent.name)
         break
 ' "$_grp_member_state_dir" "$_grp_cp" 2>/dev/null)"
-        fi
-        if [ -n "$_grp_mid" ]; then
-          _grp_run_json="$_grp_member_state_dir/runs/$_grp_mid/run.json"
-        fi
       fi
-
-      if [ -n "$_grp_run_json" ] && [ -f "$_grp_run_json" ]; then
+      _grp_run_json="$_grp_member_state_dir/runs/$_grp_mid/run.json"
+      if [ -n "$_grp_mid" ] && [ -f "$_grp_run_json" ]; then
         update_run_json "$_grp_run_json" group_id "$_grp_id" || true
-      else
-        remote_log "group: could not locate run.json for member $_grp_member_repo (tag-back skipped)"
       fi
     done
 

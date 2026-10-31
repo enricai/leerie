@@ -2104,6 +2104,16 @@ leerie's own enumerated git:
   or ownership change is needed on any runtime. Fly and EC2 never set the
   variable: their branch comes back through `fetch_branch`.
 
+  A container runs one run, so the file names one. A run group (§20) is no
+  exception: the `group` arm starts one launcher per member, and each runs
+  its own container and its own run. The group arm reads no run id at all.
+  Each member's orchestrator writes `group_id` into the `run.json` of the
+  run it resolved, when it starts that run, so it tags exactly that run.
+  The group arm used to tag runs itself, after the members exited. It
+  picked the newest finished run in each member's state directory, which
+  could be another group's run or a standalone run of the same repository,
+  and it missed a member that had not finished.
+
   On Fly and EC2, `fetch_branch` bundles from the run's repository instead
   of `/work`, and leaves `repo/` out of the state directory it copies to the
   host: the branch is already in the bundle.
@@ -14216,10 +14226,14 @@ directory.
 
 The group launcher runs on the laptop (the same node as chain fan-out, §19):
 it mints a `group_id`, fans out one leerie invocation per member (each
-`cd`'d into the member's repo), waits, then tags each member's `run.json`
-with the shared `group_id` — discovered from each member's basename-keyed
-state dir via a newest-`finished_at` scan of that state dir (the member's
-own orchestrator also writes `group_id` into its run.json at run start). No coordinator machine, no in-container group state, no cross-machine
+`cd`'d into the member's repo, with `--group-id`), and waits. Each member's
+own orchestrator writes `group_id` into the `run.json` of the run it
+resolved, when that run starts: the one source of which run a container
+ran (§6 *Which run the container ran*), so only the group's own runs are
+tagged. On Fly and EC2 the launcher also writes it into the host-side
+`run.json` of the member's own run, found by that member launcher's pointer,
+for the time before the machine's copy is synced back. No coordinator
+machine, no in-container group state, no cross-machine
 protocol; GitHub is touched only host-side, per member, by that member's own
 `host_finalize`.
 
