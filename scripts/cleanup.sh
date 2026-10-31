@@ -83,6 +83,21 @@ _clean_one_run_here() {
   if [ -d "${run_dir}/worktrees" ]; then
     for d in "${run_dir}/worktrees"/*/; do
       [ -d "$d" ] || continue
+      # A committing tree of its own repository (DESIGN §6 *A repository
+      # per committing tree (I6)*): its branch is taken into the run
+      # repository, then the tree and its repository go.
+      d="${d%/}"
+      tr="${run_dir}/tree-repos/${d##*/}"
+      if [ -n "${LEERIE_GIT_DIR:-}" ] && [ -f "$tr/HEAD" ]; then
+        if leerie_take_tree_branch "$tr" \
+            "$(leerie_tree_branch_of "$run_id" "${d##*/}")"; then
+          leerie_drop_tree "$tr" "$d"
+        else
+          # Kept: its commits are not in the run repository yet.
+          echo "cleanup: could not take ${tr}; kept it and ${d}" >&2
+        fi
+        continue
+      fi
       # 240s timeout mirrors the calibrated bound on the abnormal-exit
       # Python path (_cleanup_on_abnormal_exit, leerie.py:3896-3920): a
       # 868MB/41k-file worktree takes ~45-90s uncontested and several-fold

@@ -180,14 +180,23 @@ leerie_git_hooks_off() {
 # bare `<run-dir>/repo`); prints nothing otherwise. `_run_settings_of` in
 # Python.
 leerie_run_settings() {
-  local common
+  local common run_dir
   common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
-  [ -n "$common" ] && [ "${common##*/}" = repo ] || return 0
+  [ -n "$common" ] || return 0
+  if [ "${common##*/}" = repo ]; then
+    run_dir="${common%/*}"
+  else
+    # A tree of a tree repository, `<run-dir>/tree-repos/<tree>` (DESIGN §6
+    # *A repository per committing tree*): read with the run's settings.
+    run_dir="${common%/*}"
+    [ "${run_dir##*/}" = tree-repos ] || return 0
+    run_dir="${run_dir%/*}"
+  fi
   # Named explicitly (`safe.bareRepository=explicit` refuses discovery),
   # never through `core.bare`, a setting a worker can change: the same
   # test as `_run_repo_of`.
-  git --git-dir="$common" rev-parse --git-dir >/dev/null 2>&1 || return 0
-  printf '%s\n' "${common%/*}/repo-settings"
+  git --git-dir="$run_dir/repo" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  printf '%s\n' "$run_dir/repo-settings"
 }
 
 # leerie_vgit <worktree> <git args...>
@@ -411,4 +420,112 @@ leerie_reset_worktree() {
       "$wt" "$branch" >&2
     return 1
   fi
+}
+
+# --- A repository per committing tree (DESIGN §6 *A repository per
+# committing tree (I6)*) -----------------------------------------------------
+#
+# Each committing tree (staging, each subtask tree) is a worktree of its own
+# bare repository `<run-dir>/tree-repos/<tree>`, which borrows the run
+# repository's objects (alternates) and holds one ref, the tree's branch. A
+# worker writes only that repository; leerie alone moves the run
+# repository's refs, by taking a tree's branch back. These run with
+# LEERIE_GIT_DIR naming the run repository.
+
+# leerie_take_tree_branch <tree-repo> <branch>
+#
+# Take a tree's branch into the run repository: its new objects are copied
+# and exactly that branch moves. Nothing else of the tree repository's refs
+# is read.
+leerie_take_tree_branch() {
+  local tr="${1:?usage: leerie_take_tree_branch <tree-repo> <branch>}"
+  local branch="${2:?usage: leerie_take_tree_branch <tree-repo> <branch>}"
+  leerie_repo_git fetch --quiet --no-tags --no-write-fetch-head \
+    --no-auto-maintenance "$tr" "+refs/heads/$branch:refs/heads/$branch"
+}
+
+# leerie_tree_branch_of <run-id> <tree-name>
+#
+# The branch leerie takes from a tree repository, by its name alone (never
+# the tree's HEAD, which a worker sets): `staging` holds the run branch,
+# `<run-id[:12]>-<sid>` the subtask branch. `_tree_branch_of` in Python.
+leerie_tree_branch_of() {
+  local run_id="${1:?usage: leerie_tree_branch_of <run-id> <tree-name>}"
+  local name="${2:?usage: leerie_tree_branch_of <run-id> <tree-name>}"
+  local prefix
+  if [ "$name" = staging ]; then
+    printf 'leerie/runs/%s' "$run_id"
+    return
+  fi
+  prefix="$(leerie_worktree_name "$run_id" x)"
+  printf 'leerie/subtasks/%s/%s' "$run_id" "${name#"${prefix%x}"}"
+}
+
+# leerie_drop_tree <tree-repo> <worktree>
+#
+# Remove a tree and its repository. The caller takes the branch first when
+# it keeps the work.
+leerie_drop_tree() {
+  local tr="${1:?usage: leerie_drop_tree <tree-repo> <worktree>}"
+  local wt="${2:?usage: leerie_drop_tree <tree-repo> <worktree>}"
+  chmod -R u+w "$wt" 2>/dev/null || true
+  rm -rf "$wt" "$tr"
+}
+
+# leerie_tree <tree-repo> <branch> <worktree>
+#
+# The committing tree at <worktree> on <branch>, a worktree of its own
+# repository <tree-repo>. Present and a worktree of <tree-repo>: its branch
+# is taken (a crash may have left a worker's commits untaken) and it is
+# reused. Otherwise it is made afresh from the run repository's <branch>: a
+# tree of the run repository itself at that path (a run made before tree
+# repositories) is deregistered and removed; a stale <tree-repo> has its
+# branch taken first (work a crash left there survives the remake) and is
+# removed; then the tree repository is made — `init --bare`, the run
+# repository's objects through `objects/info/alternates`, `config` and
+# `info/` from the run's settings copy (`<run-dir>/repo-settings`, the run
+# directory being the tree repository's grandparent, as
+# `leerie_run_settings` reads it), the one branch fetched — and the tree
+# added from it. The caller holds `leerie_repo_lock`.
+leerie_tree() {
+  local tr="${1:?usage: leerie_tree <tree-repo> <branch> <worktree>}"
+  local branch="${2:?usage: leerie_tree <tree-repo> <branch> <worktree>}"
+  local wt="${3:?usage: leerie_tree <tree-repo> <branch> <worktree>}"
+  local run_repo settings fmt
+  run_repo="$(leerie_repo_git rev-parse --path-format=absolute --git-common-dir)" || return 1
+  if [ -f "$tr/HEAD" ] && [ -d "$wt" ] \
+      && [ "$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" = "$tr" ]; then
+    leerie_take_tree_branch "$tr" "$branch"
+    return
+  fi
+  if grep -qxF "worktree $wt" <<<"$(leerie_repo_git worktree list --porcelain)"; then
+    leerie_repo_git worktree remove --force "$wt" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$tr/HEAD" ] \
+      && git --git-dir="$tr" rev-parse --verify -q "refs/heads/$branch" >/dev/null; then
+    leerie_take_tree_branch "$tr" "$branch" || return 1
+  fi
+  leerie_drop_tree "$tr" "$wt"
+  mkdir -p "${tr%/*}"
+  fmt="$(leerie_repo_git rev-parse --show-object-format)" || return 1
+  git init --quiet --bare --template= --object-format="$fmt" "$tr" || return 1
+  mkdir -p "$tr/objects/info"
+  printf '%s\n' "$run_repo/objects" > "$tr/objects/info/alternates"
+  settings="${tr%/*}"
+  settings="${settings%/*}/repo-settings"
+  cp "$settings/config" "$tr/config" 2>/dev/null || {
+    # No settings copy (a repository leerie did not make, as in a test):
+    # the repository's own config, as a bare repository's.
+    settings="$run_repo"
+    cp "$settings/config" "$tr/config"
+    git config -f "$tr/config" core.bare true
+  }
+  rm -rf "$tr/info"
+  if [ -d "$settings/info" ]; then
+    cp -R "$settings/info" "$tr/info"
+  fi
+  git --git-dir="$tr" fetch --quiet --no-tags --no-write-fetch-head \
+    --no-auto-maintenance "$run_repo" "+refs/heads/$branch:refs/heads/$branch" \
+    || return 1
+  git --git-dir="$tr" worktree add --quiet "$wt" "$branch"
 }

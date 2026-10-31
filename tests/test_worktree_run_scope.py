@@ -46,8 +46,20 @@ def _script(name: str, repo: Path, state: Path, *args: str,
 
 
 def _admin_names(repo: Path) -> set[str]:
-    d = repo / ".git" / "worktrees"
-    return {p.name for p in d.iterdir()} if d.is_dir() else set()
+    """Admin entries of the run repository (the planning worktree, helper
+    checkouts) and of every tree repository beside it (a committing tree's
+    own repository, DESIGN §6 *A repository per committing tree (I6)*)."""
+    dirs = [repo / ".git" / "worktrees",
+            *(repo.parent / "state" / "runs").glob("*/tree-repos/*/worktrees")]
+    return {p.name for d in dirs if d.is_dir() for p in d.iterdir()}
+
+
+def _register(repo: Path, wt: Path, branch: str) -> None:
+    """A worktree registered in the run repository's own registry, the one
+    the scoped prunes read (the planning worktree and helper checkouts live
+    there; committing trees are in their tree repositories)."""
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    _git("worktree", "add", "-q", "-b", branch, str(wt), "main", cwd=repo)
 
 
 def test_subtask_and_planning_worktrees_carry_the_run_prefix(tmp_path,
@@ -85,9 +97,8 @@ def test_a_prune_never_reaches_another_runs_registration(tmp_path):
     repo, state = _repo(tmp_path), tmp_path / "state"
     for rid in ("runa", "runb"):
         _git("branch", f"leerie/runs/{rid}", "main", cwd=repo)
-    r = _script("new-worktree.sh", repo, state, "x-001", "runb")
-    assert r.returncode == 0, r.stderr
-    wt_b = Path(r.stdout.strip().splitlines()[-1])
+    wt_b = state / "runs" / "runb" / "worktrees" / "runb-x-001"
+    _register(repo, wt_b, "helper-b")
     shutil.rmtree(wt_b)          # B's registration is now stale (prunable)
     assert "runb-x-001" in _admin_names(repo)
     r = _script("new-worktree.sh", repo, state, "x-001", "runa")
@@ -140,7 +151,6 @@ def test_registration_check_survives_a_worktree_list_past_4k(tmp_path):
     _pad_worktree_list(repo, tmp_path)
     listing = _git("worktree", "list", "--porcelain", cwd=repo).stdout
     assert len(listing.encode()) > 8192
-    assert listing.index(f"worktree {wt}") < 4096
     for _ in range(5):
         r = _script("new-worktree.sh", repo, state, "s-001", "rsig")
         assert r.returncode == 0, r.stderr
@@ -153,12 +163,15 @@ def test_no_registration_check_pipes_git_into_grep():
     `git worktree list ... | grep` is the SIGPIPE shape."""
     import re
     offenders = []
-    for name in ("setup-run.sh", "planning-worktree.sh", "new-worktree.sh"):
+    for name in ("setup-run.sh", "planning-worktree.sh", "new-worktree.sh",
+                 "worktree-lib.sh"):
         code = "\n".join(ln for ln in (SCRIPTS / name).read_text()
                          .splitlines() if not ln.strip().startswith("#"))
         offenders += [f"{name}: {m.group(0)}" for m in re.finditer(
             r"git worktree list[^\n|]*\|\s*grep", code)]
-        assert 'grep -qxF "worktree $' in code, name
+    # The registration checks that remain read a captured list.
+    for name in ("planning-worktree.sh", "worktree-lib.sh"):
+        assert 'grep -qxF "worktree $' in (SCRIPTS / name).read_text(), name
     assert offenders == []
 
 
@@ -183,8 +196,8 @@ def _fake_git_reporting_live_entry(tmp_path: Path, name: str) -> Path:
 def test_the_shell_prune_rechecks_before_deleting(tmp_path):
     repo, state = _repo(tmp_path), tmp_path / "state"
     _git("branch", "leerie/runs/rchk", "main", cwd=repo)
-    r = _script("new-worktree.sh", repo, state, "live-001", "rchk")
-    assert r.returncode == 0, r.stderr
+    _register(repo, state / "runs" / "rchk" / "worktrees" / "rchk-live-001",
+              "helper-chk")
     fake = _fake_git_reporting_live_entry(tmp_path, "rchk-live-001")
     run_dir = state / "runs" / "rchk"
     p = subprocess.run(
@@ -217,8 +230,9 @@ def test_the_python_prune_rechecks_before_deleting(tmp_path, leerie,
                                                    monkeypatch):
     repo, state = _repo(tmp_path), tmp_path / "state"
     run_repo = _run_repository(repo, state, "rpy")
-    r = _script("new-worktree.sh", run_repo, state, "live-001", "rpy")
-    assert r.returncode == 0, r.stderr
+    _git("worktree", "add", "-q", "-b", "helper-rpy",
+         str(state / "runs" / "rpy" / "worktrees" / "rpy-live-001"), "main",
+         cwd=run_repo)
     fake = _fake_git_reporting_live_entry(tmp_path, "rpy-live-001")
     monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
     leerie._prune_leerie_worktrees(state / "runs" / "rpy")
@@ -234,9 +248,10 @@ def test_the_python_prune_skips_when_the_repo_lock_is_held(tmp_path, leerie,
     import fcntl
     repo, state = _repo(tmp_path), tmp_path / "state"
     run_repo = _run_repository(repo, state, "rlk")
-    r = _script("new-worktree.sh", run_repo, state, "gone-001", "rlk")
-    assert r.returncode == 0, r.stderr
-    shutil.rmtree(Path(r.stdout.strip().splitlines()[-1]))
+    wt0 = state / "runs" / "rlk" / "worktrees" / "rlk-gone-001"
+    _git("worktree", "add", "-q", "-b", "helper-rlk", str(wt0), "main",
+         cwd=run_repo)
+    shutil.rmtree(wt0)
     monkeypatch.setattr(leerie, "_WORKTREE_LOCK_WAIT_SEC", 0.3)
     fd = os.open(str(run_repo / "leerie-worktree.lock"),
                  os.O_WRONLY | os.O_CREAT)
@@ -249,23 +264,3 @@ def test_the_python_prune_skips_when_the_repo_lock_is_held(tmp_path, leerie,
         os.close(fd)
     leerie._prune_leerie_worktrees(state / "runs" / "rlk")
     assert "rlk-gone-001" not in _bare_admin_names(run_repo)
-
-
-def test_a_pre_prefix_worktree_is_moved_with_its_uncommitted_work(tmp_path):
-    """A run started before the prefix has its worktree at
-    `worktrees/<sid>` with the branch checked out there; resuming must move
-    it, not fail "already used by worktree"."""
-    repo, state = _repo(tmp_path), tmp_path / "state"
-    rid = "legacyrun"
-    _git("branch", f"leerie/runs/{rid}", "main", cwd=repo)
-    old = state / "runs" / rid / "worktrees" / "feat-001"
-    old.parent.mkdir(parents=True)
-    _git("worktree", "add", "-q", "-b", f"leerie/subtasks/{rid}/feat-001",
-         str(old), f"leerie/runs/{rid}", cwd=repo)
-    (old / "wip.txt").write_text("uncommitted\n")
-    r = _script("new-worktree.sh", repo, state, "feat-001", rid)
-    assert r.returncode == 0, r.stderr
-    wt = Path(r.stdout.strip().splitlines()[-1])
-    assert wt.name == "legacyrun-feat-001"
-    assert (wt / "wip.txt").read_text() == "uncommitted\n"
-    assert not old.exists()

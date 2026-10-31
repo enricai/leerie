@@ -18,6 +18,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "new-worktree.sh"
 
 
+def _tree_repo(repo: Path, run_id: str, name: str) -> Path:
+    """The subtask tree's own repository (DESIGN §6 *A repository per
+    committing tree (I6)*): its registration lives there, not in the run
+    repository's `.git/worktrees`."""
+    return repo / ".leerie" / "runs" / run_id / "tree-repos" / name
+
+
 def _run_new_worktree(cwd: Path, sid: str, run_id: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.pop("LEERIE_STATE_DIR", None)
@@ -87,15 +94,17 @@ def test_orphaned_dir_without_registration_is_reclaimed(tmp_path: Path) -> None:
     _git("add", "work.txt", cwd=wt)
     _git("commit", "-q", "-m", "subtask work", cwd=wt)
     branch = "leerie/subtasks/run-42/sub-001"
-    tip = _git("rev-parse", branch, cwd=repo).stdout.strip()
+    tip = _git("rev-parse", "HEAD", cwd=wt).stdout.strip()
     assert tip, "precondition: the subtask branch should carry a commit"
 
-    # Partial cleanup: git's admin entry is gone, the directory survives.
-    admin = repo / ".git" / "worktrees" / "run-42-sub-001"
+    # Partial cleanup: git's admin entry is gone, the directory survives —
+    # before leerie took the commit into the run repository.
+    tree_repo = _tree_repo(repo, "run-42", "run-42-sub-001")
+    admin = tree_repo / "worktrees" / "run-42-sub-001"
     assert admin.is_dir(), "precondition: worktree admin entry should exist"
     shutil.rmtree(admin)
     assert wt.is_dir(), "precondition: the orphaned dir must still be present"
-    listing = _git("worktree", "list", "--porcelain", cwd=repo).stdout
+    listing = _git("worktree", "list", "--porcelain", cwd=tree_repo).stdout
     assert f"worktree {wt}" not in listing, "precondition: must be unregistered"
 
     # The continuation retry must recover rather than crash.
@@ -194,13 +203,14 @@ def test_prune_must_not_orphan_the_dir_it_then_fails_on(tmp_path: Path) -> None:
     # the script starts is handled by either ordering (the pre-existing
     # `test_orphaned_dir_without_registration_is_reclaimed` covers it). Only
     # an orphan that prune CREATES mid-script escapes a guard that ran first.
-    admin = repo / ".git" / "worktrees" / "run-42-sub-001"
+    tree_repo = _tree_repo(repo, "run-42", "run-42-sub-001")
+    admin = tree_repo / "worktrees" / "run-42-sub-001"
     assert admin.is_dir(), "expected a registration"
     (wt / ".git").unlink()
     assert wt.is_dir(), "the directory must remain — that is the orphan state"
     still_registered = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"], cwd=repo,
-        capture_output=True, text=True).stdout
+        ["git", "--git-dir", str(tree_repo), "worktree", "list",
+         "--porcelain"], capture_output=True, text=True).stdout
     assert str(wt) in still_registered, (
         "precondition: git must still consider it registered, so an "
         "orphan-check-first ordering skips the removal")
@@ -217,30 +227,12 @@ def test_prune_must_not_orphan_the_dir_it_then_fails_on(tmp_path: Path) -> None:
     assert (wt2 / "work.txt").exists()
 
 
-def test_prune_precedes_the_orphan_guard_in_source(tmp_path: Path) -> None:
-    """Source-order guard. The behavioural test above can pass for the wrong
-    reason if a future edit adds a second cleanup; this pins the ordering the
-    fix actually depends on, ignoring comments (which discuss both)."""
-    src = (Path(__file__).resolve().parent.parent
-           / "scripts" / "new-worktree.sh").read_text()
-    code = "\n".join(l for l in src.splitlines()
-                     if not l.strip().startswith("#"))
-    # The prune is now scoped to leerie's own registrations
-    # (prune_leerie_worktrees), because a repository-global prune destroys
-    # host-side worktrees the container cannot see. The ORDERING invariant this
-    # test pins is unchanged.
-    assert code.index("prune_leerie_worktrees") < code.index('rm -rf "$WT"'), (
-        "the prune must precede the orphan-directory removal — "
-        "prune is what creates the orphan the removal repairs")
-    assert code.index('rm -rf "$WT"') < code.index("worktree add"), (
-        "the orphan removal must precede `worktree add`")
-
-
-# --- repair-and-retry: one test per measured `worktree add` failure mode --- #
+# --- the measured `worktree add` failure modes, against a tree's own repository
 #
-# The pre-checks are CHECK-THEN-ACT against a repo a dozen sibling subtasks
-# mutate concurrently, so the add must verify its own outcome. These drive the
-# REAL script against a REAL repo, one per mode enumerated against git 2.53.
+# Each subtask tree's registration is private to its tree repository (DESIGN
+# §6 *A repository per committing tree (I6)*), so siblings no longer race on
+# one registry; these drive the REAL script against a REAL repo, one per mode
+# enumerated against git 2.53.
 
 def _repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
@@ -271,7 +263,8 @@ def test_mode_M1_path_exists_unregistered_is_repaired(tmp_path: Path) -> None:
 
     # Deregister but leave the populated directory: the M1 state, however it
     # arises (prune, partial cleanup, or a race the evidence cannot name).
-    shutil.rmtree(repo / ".git" / "worktrees" / "run-42-sub-001")
+    shutil.rmtree(_tree_repo(repo, "run-42", "run-42-sub-001") / "worktrees"
+                  / "run-42-sub-001")
     assert wt.is_dir()
 
     r2 = _run_new_worktree(repo, "sub-001", "run-42")
@@ -289,20 +282,20 @@ def test_mode_M3_registered_but_directory_gone_is_repaired(
     r1 = _run_new_worktree(repo, "sub-001", "run-42")
     wt = Path(r1.stdout.strip().splitlines()[-1])
     shutil.rmtree(wt)          # directory gone, admin entry left behind
-    assert (repo / ".git" / "worktrees" / "run-42-sub-001").is_dir()
+    assert (_tree_repo(repo, "run-42", "run-42-sub-001") / "worktrees"
+            / "run-42-sub-001").is_dir()
 
     r2 = _run_new_worktree(repo, "sub-001", "run-42")
     assert r2.returncode == 0, f"M3 not repaired: {r2.stderr.strip()}"
     assert Path(r2.stdout.strip().splitlines()[-1]).is_dir()
 
 
-def test_mode_M2_branch_held_elsewhere_is_surfaced_not_forced(
+def test_mode_M2_branch_held_elsewhere_is_left_alone(
         tmp_path: Path) -> None:
-    """M2: the branch is checked out at ANOTHER path.
-
-    Forcing would steal a live sibling's branch, so the script must fail
-    loudly instead. Safe to fail: `worktree_setup` is retryable, so the
-    subtask retries rather than dying."""
+    """M2: the branch is checked out at ANOTHER path, in the run repository.
+    The subtask tree is a worktree of its own repository (DESIGN §6 *A
+    repository per committing tree (I6)*), so it takes nothing from the
+    other worktree: that one stays on its branch, untouched."""
     repo = _repo(tmp_path)
     branch = "leerie/subtasks/run-42/sub-001"
     _git("branch", branch, "leerie/runs/run-42", cwd=repo)
@@ -311,8 +304,8 @@ def test_mode_M2_branch_held_elsewhere_is_surfaced_not_forced(
 
     r = _run_new_worktree(repo, "sub-001", "run-42")
 
-    assert r.returncode != 0, "must not silently steal a live branch"
-    assert other.is_dir(), "the sibling's worktree must be untouched"
+    assert r.returncode == 0, r.stderr
+    assert other.is_dir(), "the other worktree must be untouched"
     assert _git("rev-parse", "--abbrev-ref", "HEAD",
                 cwd=other).stdout.strip() == branch
 
@@ -332,53 +325,3 @@ def test_mode_M4_healthy_worktree_is_reused_with_no_add(
     assert r2.returncode == 0
     assert (wt / "uncommitted.txt").exists(), (
         "the healthy reuse path removed the worktree — uncommitted work lost")
-
-
-def test_race_between_check_and_add_is_repaired(tmp_path: Path) -> None:
-    """THE TEST FOR THE REPAIR ITSELF.
-
-    M1/M3 above are handled by the PRE-CHECKS (the orphan guard and the
-    prune), so they pass even with the repair removed — verified by mutation.
-    The repair only earns its place when the state changes BETWEEN the check
-    and the `add` it selected, which is precisely the window a dozen sibling
-    subtasks create and precisely what a sequential test cannot produce
-    naturally.
-
-    So inject it: a `git` shim that creates the destination directory on the
-    FIRST `worktree add` (a sibling landing in the window) and then gets out
-    of the way. Without repair the script dies on `already exists`; with it,
-    the failure is re-derived, the orphan removed, and the retry succeeds.
-    """
-    repo = _repo(tmp_path)
-    real_git = subprocess.run(["bash", "-lc", "command -v git"],
-                              capture_output=True, text=True).stdout.strip()
-    assert real_git, "need a real git on PATH"
-
-    shim_dir = tmp_path / "shim"
-    shim_dir.mkdir()
-    sentinel = tmp_path / "raced"
-    (shim_dir / "git").write_text(
-        "#!/bin/sh\n"
-        'if [ "$1" = "worktree" ] && [ "$2" = "add" ] && '
-        f'[ ! -e "{sentinel}" ]; then\n'
-        f'  : > "{sentinel}"\n'
-        # $3 is the destination path for `worktree add <path> …`
-        '  mkdir -p "$3" 2>/dev/null || true\n'
-        '  : > "$3/.racer" 2>/dev/null || true\n'
-        "fi\n"
-        f'exec {real_git} "$@"\n')
-    (shim_dir / "git").chmod(0o755)
-
-    env = dict(os.environ, PATH=f"{shim_dir}:{os.environ['PATH']}")
-    r = subprocess.run(
-        ["bash", str(Path(__file__).resolve().parent.parent
-                     / "scripts" / "new-worktree.sh"), "sub-001", "run-42"],
-        cwd=repo, capture_output=True, text=True, env=env)
-
-    assert sentinel.exists(), (
-        "the shim never fired — the race was not injected and this test "
-        "would pass vacuously")
-    assert r.returncode == 0, (
-        f"the check-then-act race was not repaired: {r.stderr.strip()}")
-    assert Path(r.stdout.strip().splitlines()[-1]).is_dir()
-

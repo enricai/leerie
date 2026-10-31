@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
 from tests.test_settled_head_integration import (RUN_ID, _branch_tip,
                                                  _git,
@@ -44,6 +45,7 @@ def _base_checkout(wt: Path) -> tuple[str, str]:
     (wt / "work.txt").write_text("the subtask's work\n")
     _git(wt, "add", "-A")
     _git(wt, "commit", "-q", "-m", "t1 work")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
     work = _git(wt, "rev-parse", "HEAD")
     _git(wt, "checkout", "-q", f"{fork}~0")
     return fork, work

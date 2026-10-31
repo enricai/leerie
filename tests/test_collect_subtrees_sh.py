@@ -83,6 +83,14 @@ def _flyctl_stub(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
         # is `<run-dir>/repo`; the fixture repository's git dir stands in.
         '    for d in "$STATE_DIR"/runs/*/; do\n'
         '      [ -d "$d" ] && ln -sfn "$REPO/.git" "${d}repo"\n'
+        # leerie's copy of its settings, which a real run takes with the
+        # repository (DESIGN §8 *The settings are leerie's*); a tree
+        # repository's config is copied from it.
+        '      if [ -d "$d" ] && [ ! -d "${d}repo-settings" ]; then\n'
+        '        mkdir -p "${d}repo-settings"\n'
+        '        cp "$REPO/.git/config" "${d}repo-settings/config"\n'
+        '        [ -d "$REPO/.git/info" ] && cp -R "$REPO/.git/info" "${d}repo-settings/info"\n'
+        '      fi\n'
         '    done\n'
         # Override LEERIE_STATE_DIR for the payload.
         f'    export LEERIE_STATE_DIR="{state_dir}"\n'

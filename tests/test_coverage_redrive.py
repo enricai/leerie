@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT, _run
 
 FAKE_VITEST = r'''#!/usr/bin/env python3
@@ -119,14 +120,21 @@ def env(leerie, tmp_path, monkeypatch):
     leerie_root = repo / ".leerie"
     run_dir = leerie_root / "runs" / run_id
     (run_dir / "logs").mkdir(parents=True)
-    _git(repo, "branch", f"leerie/runs/{run_id}", "main")
+    # The run's own repository and its run branch, as a real run makes them
+    # (DESIGN §6 *The run's own repository*): the subtask tree's own
+    # repository borrows from it, and leerie takes the tree's branch into it.
+    st0 = leerie.State(leerie_root, run_id, repo_root=repo)
+    st0.data = {"working_branch": "main"}
+    run_repo = leerie._ensure_run_repo(st0)
+    _git(run_repo, "branch", f"leerie/runs/{run_id}", "main")
     # Created by the real script, so the fixture lives where a real run puts
     # it: a hand-built `worktrees/<sid>` (the pre-prefix layout) hid that
     # the re-drive looked there and never measured anything on a real run.
     made = subprocess.run(
         ["bash", str(REPO_ROOT / "scripts" / "new-worktree.sh"), "feat-001",
-         run_id], cwd=repo, capture_output=True, text=True, check=True,
-        env={**os.environ, "LEERIE_STATE_DIR": str(leerie_root)})
+         run_id], cwd=run_repo, capture_output=True, text=True, check=True,
+        env={**os.environ, "LEERIE_STATE_DIR": str(leerie_root),
+             "LEERIE_GIT_DIR": str(run_repo)})
     tree = Path(made.stdout.strip().splitlines()[-1])
     assert tree == leerie._subtask_worktree_path(run_dir, "feat-001")
     assert tree != run_dir / "worktrees" / "feat-001"
@@ -143,8 +151,9 @@ def env(leerie, tmp_path, monkeypatch):
                "os.chmod('node_modules/.bin/vitest', 0o755); "
                "os.makedirs('node_modules/@vitest/coverage-v8', "
                "exist_ok=True)", str(fake)]
-    st = leerie.State(leerie_root, run_id)
-    st.data = {"task": "x", "subtask_status": {"feat-001": "complete"},
+    st = st0
+    st.data = {"task": "x", "run_repo": "repo",
+               "subtask_status": {"feat-001": "complete"},
                "provision": {"recipe": [{"kind": "install",
                                          "command": install,
                                          "working_dir": "."}]}}
@@ -153,7 +162,8 @@ def env(leerie, tmp_path, monkeypatch):
     caps["worker_timeout_sec"] = 60
     monkeypatch.setattr(leerie, "_cgroup_create", lambda *a, **k: None)
     monkeypatch.setenv("FAKE_VITEST_LOG", str(tmp_path / "vitest.log"))
-    return {"leerie": leerie, "repo": repo, "run_dir": run_dir,
+    return {"leerie": leerie, "repo": repo, "run_repo": run_repo,
+            "run_dir": run_dir,
             "tree": tree, "st": st, "caps": caps,
             "base": f"leerie/runs/{run_id}", "log": tmp_path / "vitest.log"}
 
@@ -162,6 +172,7 @@ def _commit(tree: Path, files: dict[str, str], msg="work") -> None:
     _write(tree, files)
     _git(tree, "add", "-A")
     _git(tree, "commit", "-q", "-m", msg)
+    worker_exit(tree)   # a worker's exit takes its tree's branch
 
 
 def _measure(env):
@@ -222,7 +233,9 @@ def test_importing_test_settles_lines_but_a_mocking_one_does_not(leerie,
         "src/mocked.test.ts": ('import { g } from "./a";\n'
                                'vi.mock("./a");\n// covers src/a.ts:8\n')},
         msg="pre-existing tests")
-    _git(env["repo"], "branch", "-f", env["base"],
+    # The run branch moves in the run repository, where leerie keeps it
+    # (DESIGN §6 *A repository per committing tree (I6)*).
+    _git(env["run_repo"], "branch", "-f", env["base"],
          _git(env["tree"], "rev-parse", "HEAD"))
     _commit(env["tree"], {
         "src/a.ts": A_NEW,
@@ -247,8 +260,11 @@ def test_no_vitest_is_unmeasured(leerie, env):
 
 def test_changed_line_numbers_read_the_hunk_headers(leerie, env):
     _commit(env["tree"], {"src/a.ts": A_NEW})
-    got = _run(leerie._changed_line_numbers(env["tree"], env["base"],
-                                            "src/a.ts"))
+    # The base by commit, as leerie reads a subtask tree: its own
+    # repository holds no run branch (DESIGN §6 *A repository per
+    # committing tree (I6)*).
+    base = leerie._branch_commit_for_tree(env["tree"], env["base"])
+    got = _run(leerie._changed_line_numbers(env["tree"], base, "src/a.ts"))
     assert got == [4, 5, 6, 7, 8, 9]
 
 

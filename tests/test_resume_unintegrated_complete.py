@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
 
 RUN_ID = "20261028-resume-h2"
@@ -82,6 +83,7 @@ def _patch(leerie, monkeypatch, repo: Path, run_dir: Path):
             f.write(text)
         _git(wt, "add", "-A")
         _git(wt, "commit", "-q", "-m", f"{sid}: {text.strip()}")
+        worker_exit(wt)   # a worker's exit takes its tree's branch
 
     async def settle(sid, leerie_dir, caps, st, models, efforts,
                      redrive_note=None):
@@ -230,6 +232,7 @@ def test_not_integrated_is_exit_one_only(leerie, tmp_path, monkeypatch):
     (wt / "x.txt").write_text("x\n")
     _git(wt, "add", "-A")
     _git(wt, "commit", "-q", "-m", "x")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
     got = asyncio.run(leerie._wave_sids_not_integrated(
         staging, RUN_ID, ["merged", "ahead", "missing"]))
     assert got == ["ahead"]

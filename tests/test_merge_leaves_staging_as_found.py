@@ -17,6 +17,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
 
 RUN_ID = "20261030-gitignore"
@@ -78,6 +79,7 @@ def test_output_a_merged_gitignore_exposes_is_removed(leerie, tmp_path,
     (wt / "gen" / "index.ts").write_text("export {}\n")
     _git(wt, "add", "-A")
     _git(wt, "commit", "-qm", "track gen/")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
     try:
         proc = asyncio.run(leerie._integrate_merge(staging, st, "feat-001"))
         assert proc.returncode == 0
@@ -103,6 +105,7 @@ def test_a_post_merge_hook_does_not_run_on_leeries_merge(leerie, tmp_path,
     assert _git(repo, "config", "core.hooksPath") == str(hooks)
     (wt / "f.txt").write_text("feature\n")
     _git(wt, "commit", "-qam", "feature")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
     proc = asyncio.run(leerie._integrate_merge(staging, st, "feat-001"))
     assert proc.returncode == 0
     assert not ran.exists()
@@ -111,11 +114,14 @@ def test_a_post_merge_hook_does_not_run_on_leeries_merge(leerie, tmp_path,
                 "--untracked-files=all") == ""
     # The control: the hook is real and fires on a merge that is not
     # leerie's.
-    _git(wt, "checkout", "-q", "-b", "other")
     (wt / "g.txt").write_text("g\n")
     _git(wt, "add", "g.txt")
     _git(wt, "commit", "-qm", "g")
-    subprocess.run(["git", "merge", "-q", "--no-ff", "-m", "m", "other"],
+    worker_exit(wt)   # a worker's exit takes its tree's branch
+    # By commit: staging's own repository holds only the run branch (DESIGN
+    # §6 *A repository per committing tree (I6)*).
+    subprocess.run(["git", "merge", "-q", "--no-ff", "-m", "m",
+                    _git(wt, "rev-parse", "HEAD")],
                    cwd=staging, check=True, capture_output=True,
                    env=leerie._git_hooks_on(os.environ))
     assert (staging / ".last-sync").is_file() and ran.exists()

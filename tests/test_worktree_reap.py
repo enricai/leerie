@@ -149,13 +149,20 @@ def test_a_resumed_run_rebuilds_its_worktree(leerie, env, tmp_path):
     branch tip with committed work intact."""
     repo, runs = env
     rid = "resume1"
-    _git("branch", f"leerie/runs/{rid}", "main", cwd=repo)
     d = runs / rid
+    # The run's own repository (DESIGN §6 *The run's own repository*): the
+    # reap takes the tree's branch into it before the tree goes (§6 *A
+    # repository per committing tree (I6)*), and the resume's tree is made
+    # from it.
+    run_repo = d / "repo"
+    _git("clone", "-q", "--bare", str(repo), str(run_repo), cwd=repo)
+    _git("branch", f"leerie/runs/{rid}", "main", cwd=run_repo)
     import subprocess
     script = Path(__file__).resolve().parents[1] / "scripts" / "new-worktree.sh"
     envv = {"PATH": "/usr/bin:/bin", "HOME": str(repo),
-            "LEERIE_STATE_DIR": str(runs.parent)}
-    r = subprocess.run(["bash", str(script), "feat-001", rid], cwd=repo,
+            "LEERIE_STATE_DIR": str(runs.parent),
+            "LEERIE_GIT_DIR": str(run_repo)}
+    r = subprocess.run(["bash", str(script), "feat-001", rid], cwd=run_repo,
                        capture_output=True, text=True, env=envv)
     assert r.returncode == 0, r.stderr
     wt = Path(r.stdout.strip().splitlines()[-1])
@@ -165,7 +172,9 @@ def test_a_resumed_run_rebuilds_its_worktree(leerie, env, tmp_path):
     tip = _git("rev-parse", "HEAD", cwd=wt).stdout.strip()
     _age(d)
     assert leerie._reap_idle_worktrees(runs, "self")["reaped"] == [rid]
-    r = subprocess.run(["bash", str(script), "feat-001", rid], cwd=repo,
+    assert not (d / "tree-repos").exists() or not any(
+        (d / "tree-repos").iterdir())
+    r = subprocess.run(["bash", str(script), "feat-001", rid], cwd=run_repo,
                        capture_output=True, text=True, env=envv)
     assert r.returncode == 0, r.stderr
     assert _git("rev-parse", "HEAD", cwd=wt).stdout.strip() == tip

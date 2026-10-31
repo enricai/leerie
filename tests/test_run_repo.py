@@ -271,14 +271,19 @@ def test_a_worker_cannot_move_the_users_branches(leerie, env):
     co = subprocess.run(["git", "checkout", "-q", "develop"], cwd=staging,
                         capture_output=True, text=True)
     assert co.returncode != 0 and "did not match" in co.stderr
-    # A commit on the run repository's copy of main, and a forced branch.
-    _git(staging, "checkout", "-q", "main")
+    # Staging's own repository holds only the run branch (DESIGN §6 *A
+    # repository per committing tree (I6)*): a worker's `main` and forced
+    # `develop` there reach neither the user's repository nor the run's.
+    run_main = _git(st.run_dir / "repo", "rev-parse", "main")
+    _git(staging, "checkout", "-qb", "main")
     (staging / "app.py").write_text("x = 2\n")
     _git(staging, "commit", "-qam", "worker on main")
     _git(staging, "branch", "-f", "develop", "HEAD")
     _git(staging, "checkout", "-q", f"leerie/runs/{RUN_ID}")
+    leerie._take_tree_branch(staging)
     assert {r: _git(repo, "rev-parse", r)
             for r in ("main", "develop")} == before
+    assert _git(st.run_dir / "repo", "rev-parse", "main") == run_main
 
 
 # --------------------------------------- every tree hangs off the run repo
@@ -297,6 +302,7 @@ def test_every_tree_of_a_run_hangs_off_the_run_repository(leerie, env):
         (wt / f"{sid}.txt").write_text(sid)
         _git(wt, "add", "-A")
         _git(wt, "commit", "-qm", sid)
+        leerie._take_tree_branch(wt)   # as a worker's exit does
         merged = asyncio.run(leerie._integrate_merge(staging, st, sid))
         assert merged.returncode == 0, merged.stderr
 
@@ -320,12 +326,20 @@ def test_every_tree_of_a_run_hangs_off_the_run_repository(leerie, env):
     assert [r for r in _refs(repo)
             if r.startswith(("refs/heads/leerie", "refs/leerie"))] == []
     run_list = _git(run_repo, "worktree", "list", "--porcelain")
-    for tree in (planning, staging, helper):
+    for tree in (planning, helper):
         assert f"worktree {Path(tree).resolve()}" in run_list
     assert Path(judge_common).resolve() == run_repo
-    for tree in (planning, staging, helper):
+    for tree in (planning, helper):
         assert (Path(_git(Path(tree), "rev-parse", "--path-format=absolute",
                           "--git-common-dir")).resolve() == run_repo)
+    # Staging, a committing tree, is a worktree of its own repository,
+    # which borrows the run repository's objects (DESIGN §6 *A repository
+    # per committing tree (I6)*).
+    staging_repo = st.run_dir / "tree-repos" / "staging"
+    assert (Path(_git(staging, "rev-parse", "--path-format=absolute",
+                      "--git-common-dir")).resolve() == staging_repo.resolve())
+    assert (staging_repo / "objects" / "info" / "alternates").read_text(
+        ).strip() == str(run_repo / "objects")
     assert _git(run_repo, "rev-parse", f"leerie/runs/{RUN_ID}:s2.txt")
 
 
@@ -352,6 +366,7 @@ def test_site_token_check_reads_the_base_not_the_moved_name(leerie, env):
     st.data["base_sha"] = _git(staging, "rev-parse", "HEAD")
     (staging / "app.py").write_text("x = 1\nfixture = 'acme-widget'\n")
     _git(staging, "commit", "-qam", "fix")
+    leerie._take_tree_branch(staging)   # as a worker's exit does
     _git(st.run_dir / "repo", "update-ref", "refs/heads/main",
          _git(staging, "rev-parse", "HEAD"))
     st.data["defect_scope"] = {"ground_truth": {"inline_examples": [
@@ -366,6 +381,7 @@ def test_finalize_sh_counts_from_the_base_it_is_given(leerie, env):
     base = _git(staging, "rev-parse", "HEAD")
     (staging / "app.py").write_text("x = 3\n")
     _git(staging, "commit", "-qam", "work")
+    leerie._take_tree_branch(staging)   # as a worker's exit does
     _git(st.run_dir / "repo", "update-ref", "refs/heads/main",
          _git(staging, "rev-parse", "HEAD"))
     by_name = asyncio.run(leerie._run_script("finalize.sh", st.run_id,
@@ -498,19 +514,24 @@ def test_main_names_the_run_a_bare_resume_picked(leerie, tmp_path,
 # ------------------------------------------------------- review round 17
 
 def test_a_workers_git_init_never_costs_the_run_its_repository(leerie, env):
-    """H1: `git init` in a worker's tree rewrites `core.bare` in the shared
-    config. The run's repository is recorded, so the next ensure (every
-    resume) checks it by naming it and finding the run's start — and keeps
-    it: the run branch and its integrated commit survive."""
+    """H1: `git init` in a worker's tree rewrites `core.bare` in that tree's
+    repository's config — staging's own (DESIGN §6 *A repository per
+    committing tree (I6)*), no longer the run repository's. The run's
+    repository is recorded, so the next ensure (every resume) checks it by
+    naming it and finding the run's start — and keeps it: the run branch
+    and its integrated commit survive."""
     _repo, _state, st = env
     staging = _setup_run(leerie, st)
     (staging / "w.txt").write_text("integrated\n")
     _git(staging, "add", "-A")
     _git(staging, "commit", "-qm", "integrated work")
+    leerie._take_tree_branch(staging)   # as a worker's exit does
     work = _git(staging, "rev-parse", "HEAD")
     subprocess.run(["git", "init", "-q"], cwd=staging, check=True)
     run_repo = st.run_dir / "repo"
-    assert _git(run_repo, "config", "core.bare") == "false"
+    assert _git(st.run_dir / "tree-repos" / "staging", "config",
+                "core.bare") == "false"
+    assert _git(run_repo, "config", "core.bare") == "true"
     assert leerie._ensure_run_repo(st) == run_repo
     assert _git(run_repo, "rev-parse", f"leerie/runs/{RUN_ID}") == work
     assert _git(staging, "status", "--porcelain") == ""
@@ -591,6 +612,7 @@ def test_every_tree_works_under_safe_bare_repository_explicit(
     (wt / "s1.txt").write_text("s1")
     _git(wt, "add", "-A")
     _git(wt, "commit", "-qm", "s1")
+    leerie._take_tree_branch(wt)   # as a worker's exit does
     merged = asyncio.run(leerie._integrate_merge(staging, st, "s1"))
     assert merged.returncode == 0, merged.stderr
 

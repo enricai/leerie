@@ -13,6 +13,7 @@ import asyncio
 import subprocess
 from pathlib import Path
 
+from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
 
 RUN_ID = "20261029-sigkill-staging"
@@ -50,6 +51,7 @@ def test_a_staging_a_sigkill_left_dirty_is_reset_on_resume(
         leerie, tmp_path, monkeypatch, capsys):
     repo, staging = _repo(tmp_path, monkeypatch)
     _git(staging, "commit", "-q", "--allow-empty", "-m", "integrated wave")
+    worker_exit(staging)   # a worker's exit takes its tree's branch
     tip = _git(staging, "rev-parse", "HEAD")
     (staging / "node_modules").mkdir()
     (staging / "node_modules" / "dep.js").write_text("dep\n")
@@ -77,8 +79,12 @@ def test_a_merge_a_sigkill_left_in_progress_is_ended(leerie, tmp_path,
     _git(repo, "checkout", "-q", "main")
     (staging / "f.txt").write_text("earlier\n")
     _git(staging, "commit", "-qam", "earlier integration")
+    worker_exit(staging)   # a worker's exit takes its tree's branch
     tip = _git(staging, "rev-parse", "HEAD")
-    _git(staging, "merge", "side", check=False)
+    # By commit: staging's own repository holds only the run branch (DESIGN
+    # §6 *A repository per committing tree (I6)*); the object is there
+    # through its alternates.
+    _git(staging, "merge", _git(repo, "rev-parse", "side"), check=False)
     (staging / "f.txt").write_text("half-resolved\n")
     assert _git(staging, "rev-parse", "-q", "--verify", "MERGE_HEAD",
                 check=False)
@@ -94,6 +100,7 @@ def test_a_fresh_run_and_a_clean_resume_are_untouched(tmp_path,
                                                       monkeypatch):
     repo, staging = _repo(tmp_path, monkeypatch)
     _git(staging, "commit", "-q", "--allow-empty", "-m", "wave")
+    worker_exit(staging)   # a worker's exit takes its tree's branch
     tip = _git(staging, "rev-parse", "HEAD")
     _setup(repo)
     assert _git(staging, "rev-parse", "HEAD") == tip
@@ -119,6 +126,7 @@ def test_subtask_worktrees_a_sigkill_left_dirty_are_reset_on_resume(
     (wt / "done.py").write_text("x = 1\n")
     _git(wt, "add", "done.py")
     _git(wt, "commit", "-q", "-m", "committed half")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
     tip = _git(wt, "rev-parse", "HEAD")
     (wt / "node_modules").mkdir()
     (wt / "node_modules" / "dep.js").write_text("dep\n")
@@ -153,6 +161,7 @@ def test_a_read_only_directory_a_killed_test_left_does_not_stop_the_resume(
     (wt / "pkg" / "a.txt").write_text("a\n")
     _git(wt, "add", "pkg")
     _git(wt, "commit", "-q", "-m", "pkg")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
     (wt / "pkg" / "a.txt").write_text("half\n")
     (wt / "pkg" / "tmp").mkdir()
     (wt / "pkg" / "tmp" / "f").write_text("x\n")
@@ -177,6 +186,7 @@ def test_a_staging_a_worker_detached_is_back_on_the_run_branch(
     _git(staging, "checkout", "-q", "--detach")
     (staging / "f.txt").write_text("worker fix\n")
     _git(staging, "commit", "-qam", "fix on detached head")
+    worker_exit(staging)   # a worker's exit takes its tree's branch
     _setup(repo)
     assert _git(staging, "symbolic-ref", "--short", "HEAD") == branch
     assert _git(staging, "rev-parse", "HEAD") == tip
@@ -194,6 +204,7 @@ def test_a_detached_subtask_worktree_is_found_by_path_and_restored(
     (wt / "done.py").write_text("x = 1\n")
     _git(wt, "add", "done.py")
     _git(wt, "commit", "-q", "-m", "committed half")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
     tip = _git(wt, "rev-parse", "HEAD")
     _git(wt, "checkout", "-q", "--detach", "HEAD~1")
     (wt / "f.txt").write_text("killed mid-edit\n")

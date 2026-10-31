@@ -334,7 +334,7 @@ print(best[3])
 
   remote_log "remote: streaming .leerie/runs/$run_id state directory ..."
   if ! _fetch_machine_exec \
-       tar -cC /work/.leerie/runs --exclude="$run_id/repo" "$run_id" \
+       tar -cC /work/.leerie/runs --exclude="$run_id/repo" --exclude="$run_id/tree-repos" "$run_id" \
        | tar -xC "$host_leerie_runs" 2>/dev/null; then
     remote_log "fetch_branch: failed to stream run state directory from machine $machine_id"
     return 1

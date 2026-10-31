@@ -18,6 +18,7 @@ import asyncio
 import subprocess
 from pathlib import Path
 
+from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
 
 RUN_ID = "20261028-l4-midmerge"
@@ -36,6 +37,7 @@ def _branch(repo: Path, sid: str, fname: str, text: str) -> None:
     (wt / fname).write_text(text)
     _git(wt, "add", "-A")
     _git(wt, "commit", "-q", "-m", f"{sid} work")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
 
 
 def _midmerge(leerie, tmp_path, monkeypatch):
@@ -69,6 +71,7 @@ def _midmerge(leerie, tmp_path, monkeypatch):
     _branch(repo, "a", "a.txt", "a\n")
     (staging / "f.txt").write_text("earlier\n")
     _git(staging, "commit", "-qam", "earlier integration")
+    worker_exit(staging)   # a worker's exit takes its tree's branch
     # Invocation 1: integrate.sh b conflicts; the integrator is hard-killed
     # mid-resolution — staging stays mid-merge.
     r = subprocess.run(["bash", str(REPO_ROOT / "scripts" / "integrate.sh"),
@@ -97,6 +100,7 @@ def test_the_resume_ends_the_interrupted_merge(leerie, tmp_path,
         # Resolve whatever is in progress and commit it.
         _git(staging, "add", "-A")
         _git(staging, "commit", "-q", "--no-edit")
+        worker_exit(staging)   # a worker's exit takes its tree's branch
         return {"status": "resolved", "summary": "ok"}
 
     async def gate(*a, **k):

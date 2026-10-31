@@ -5803,6 +5803,23 @@ template kept at finalize.
   throwaway checkout; the checkout snapshot never rewrites the user's index;
   with no run repository the prune and the abnormal-exit clean-up write
   nothing in the cwd's `.git`.
+- `tests/test_tree_repos.py` (11 tests, DESIGN §6 *A repository per
+  committing tree (I6)*): staging and a subtask tree are worktrees of their
+  own bare repositories (the run repository's objects through the
+  alternates, the run's settings copied, one ref, no object copied), and the
+  run repository never prunes; with the run repository read-only, as I5
+  grants it, a worker commits and cannot move the run branch or a sibling's;
+  a take moves exactly the tree's own branch (a ref the worker made, a
+  run-branch copy it moved, the branch its HEAD is on stay out); every
+  worker exit takes, a failed one included; integration merges from the run
+  repository and takes staging, and a rollback through `_restore_tree`
+  reaches the run repository; a resume takes what a killed worker committed;
+  a judge checks out a synthetic merge, and a commit a worker left on a
+  detached HEAD, from the run repository; a tree made
+  in the run repository is made again; a tree repository's settings are
+  checked and restored; pruning a tree takes it and removes its repository.
+  `tests/conftest.py::worker_exit` is what a worker's exit does, for tests
+  that stand in for a worker by committing in its tree.
 - `tests/test_run_repo_bring_back.py` (19 tests): `host_bring_back_run_branch`
   brings the run branch back from the run's repository into the user's as
   leerie's own git (hooks off, no `FETCH_HEAD`), as a compare-and-swap

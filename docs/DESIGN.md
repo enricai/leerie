@@ -2521,6 +2521,127 @@ read refs by name and commit. `/dev/shm` is shared; leerie never reads it. A wor
 (Landlock's signal scoping needs ABI 6), the orchestrator included; the
 process-kill deny rules (§9) and `TaskStop` are the guard there.
 
+### A repository per committing tree (I6)
+
+*Designed 2026-10-30. It is the prerequisite of I5's git grant (*A worker
+writes only where it is granted*, being built alongside it).*
+
+**Root cause.** Every committing worker's tree was a worktree of the run's
+repository, `<run-dir>/repo`. A commit writes that repository's `objects/`,
+`refs/` and `logs/`, so I5 had to grant them, and a ref store is one
+directory: a worker that may write its own branch may write every branch.
+Lane B measured it under Landlock: `update-ref` on another subtask's branch
+succeeds, and the run branch is no different. Detect-and-roll-back would
+read refs a worker could have moved; the user chose prevention.
+
+**Invariant (I6): a worker writes only its own tree's repository; leerie
+alone moves the run repository's refs.** The run repository is leerie's
+record of every branch. A worker's work enters it only when leerie *takes*
+it, and only onto that tree's own branch.
+
+**The tree repository.** Each committing tree — staging, and each subtask
+tree — has its own bare repository at `<run-dir>/tree-repos/<tree>/`
+(`<tree>`: the worktree's directory name, `staging` or
+`<run-id[:12]>-<sid>`), and the tree is a `git worktree` of it, never of the
+run repository. It is per tree, not per worker: the workers of one tree
+take turns in it (implementer, clean-tree re-asks, per-subtask conformer
+rounds and re-drives in a subtask tree; the integrators, the
+acceptance-repair and final conformers and the delivery re-drive implementer
+in staging), as they take turns in the tree. The scripts make it with the
+tree (`leerie_tree_repo`, worktree-lib.sh):
+- `git init --bare`, the run repository's object format;
+- `objects/info/alternates` naming `<run-dir>/repo/objects`: every object
+  of the run is readable through it, none is copied (measured on this
+  repository, 21 MB and 1053 commits: 0.03 s and 88 KB; the `worktree add`
+  0.2 s);
+- its `config` and `info/` copied from leerie's settings copy
+  (`<run-dir>/repo-settings`, DESIGN §8 *The settings are leerie's*), so
+  I1's settings check and restore read a tree repository against the same
+  copy as the run repository (`_run_settings_of` maps both to it);
+- one ref: the tree's branch, fetched from the run repository (a subtask
+  branch; for staging, the run branch).
+
+A commit's new objects land in the tree repository's own `objects/`.
+Nothing else of the run repository's refs is there, and whatever other
+refs a worker makes in its own repository never leave it.
+
+**Taking a tree's branch (`_take_tree_branch`).** `git --git-dir
+<run-dir>/repo fetch --no-tags --no-write-fetch-head --no-auto-maintenance
+<tree-repo> +refs/heads/<branch>:refs/heads/<branch>`: it copies the new
+objects into the run repository and moves exactly that tree's branch.
+leerie takes it:
+- when a worker call whose cwd is a committing tree returns (`claude_p`,
+  before anything reads the result), which also covers the clean-tree
+  re-asks;
+- after each of leerie's own writes in a tree: `_restore_tree`, the
+  integration merge (`_integrate_merge`, with its JSON-key merge and
+  subject amend), `_reintegrate_settled_head`, `_restart_integration_merge`,
+  and collect-subtrees' integrator and back-out on Fly;
+- before a tree is removed (the subtask prune, the reset, cleanup), so
+  nothing committed is lost with it.
+
+**leerie's own writes to a branch** go to the run repository and reach a
+tree repository only when its tree is made: a tree is made only with a fresh
+tree repository, cloned from the run repository's branch. Removing a tree
+removes its tree repository after taking its branch. So a branch leerie
+creates, deletes or resets while its tree is absent (`_create_empty_subtask_
+branch`, the reset's `branch -D`, `_undo_interrupted_redrives`) is what the
+next tree starts from. A resume takes every existing tree's branch first,
+then resets the tree to it, as it does today. A tree found registered in
+the run repository itself (a run made before this change) is removed and
+made again from a tree repository.
+
+**Reads go to the run repository, by commit.** leerie never reads a branch
+by name inside a worker tree: the worker owns every ref there.
+- A tree's own branch is read in the run repository after it is taken
+  (`_record_settled_head`, `_fork_point`, the settled heads, the views).
+- The run branch, wherever a subtask tree's diff or log is measured against
+  it (`check_diff_scope`, `_branch_has_commits_ahead`,
+  `check_branch_has_commits`, `_changed_files` and `_clobbered_owned_files`
+  in conformance, the settle's diff, coverage, the external-claim checks,
+  the per-subtask conformer's `DIFF_BASE`), is its commit in the run
+  repository; the tree reaches its objects through the alternates.
+- A sibling branch merged into staging is fetched into staging's tree
+  repository by leerie right before the merge (leerie may write any tree
+  repository), and the ancestor checks of integration (`_ancestor_codes`,
+  `_integration_refs`) read the run repository.
+- Committed views (`_committed_view`) and judge checkouts
+  (`_judge_checkout`) are worktrees of the run repository at the taken
+  commit, never of a tree repository a worker can write.
+
+**gc.** A tree repository borrows the run repository's objects and never
+lends: its own `gc` drops only its own objects, and taken objects are
+copies. The other direction is the hazard: the run repository pruning an
+object a tree repository still reaches through the alternates — a commit a
+back-out made unreachable while staging's tree repository still has it. So
+the run repository never prunes while the run lives: `_seal_run_repo_config`
+sets `gc.auto=0`, `gc.pruneExpire=never`, `gc.worktreePruneExpire=never` and
+`maintenance.auto=false` there, after the carried user config, and leerie's
+own fetches into it pass `--no-auto-maintenance`. A worker cannot run `gc`
+on the run repository: it has no write grant there. Everything goes with the
+run directory.
+
+**Cost.** Per committing tree, one `git init` and one local fetch of a ref
+whose objects are already readable (milliseconds, under 100 KB). Per take,
+one local fetch (0.08 s measured) that copies the tree's new objects once,
+so those objects are on disk twice until the run directory goes.
+
+**I5's grant.** A committing worker's git metadata grant is its tree
+repository, whole (`<run-dir>/tree-repos/<tree>/`, write), and a read grant
+on `<run-dir>/repo/objects/` for the alternates. Nothing else of
+`<run-dir>/repo/` is granted.
+
+**Runtimes.** Local rootless and rootful: everything is under the state
+root, made and used by the same identity. Fly and EC2: the same layout under
+`/work/.leerie/runs/<id>/`; `collect-subtrees.sh` and `fetch_branch` read
+the run repository, which holds every taken branch; the state tar excludes
+`<id>/tree-repos` as it excludes `<id>/repo`.
+
+**Unchanged.** The planning worktree and every helper checkout (none
+commits) stay worktrees of the run repository. The disposable clones of the
+acceptance writer, the surrogate fixer and the falsifier
+(`_ref_less_clone`) are already their own repositories.
+
 ### The run identifier
 
 Every run has a unique identifier `run_id` that is the container/machine ID

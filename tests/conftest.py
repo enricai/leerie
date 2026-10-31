@@ -434,6 +434,26 @@ def _no_real_planning_worktree(request, monkeypatch):
     monkeypatch.setattr(leerie, "_ensure_planning_worktree", _stub)
 
 
+_WORKER_EXIT_MODULE = None
+
+
+def worker_exit(tree) -> None:
+    """What a worker's exit does in production, for a test that stands in
+    for a worker by committing in its tree itself: leerie takes the tree's
+    branch from its tree repository into the run repository
+    (`_invoke_admitted` → `_take_after_worker`; DESIGN §6 *A repository per
+    committing tree (I6)*). A no-op for a tree of no tree repository. The
+    real function, from the module loaded once for helpers."""
+    global _WORKER_EXIT_MODULE
+    if _WORKER_EXIT_MODULE is None:
+        spec = importlib.util.spec_from_file_location("_leerie_worker_exit",
+                                                      LEERIE_PY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WORKER_EXIT_MODULE = mod
+    _WORKER_EXIT_MODULE._take_tree_branch(tree)
+
+
 def relocate_into_run_repo(leerie, st) -> Path:
     """Turn a hand-built pre-change layout into the run's own repository
     (DESIGN §6 *The run's own repository*): for a test that committed the

@@ -307,7 +307,7 @@ print(best[3])
   mkdir -p "$host_leerie_runs"
 
   remote_log "remote: streaming .leerie/runs/$run_id state directory ..."
-  if ! _ec2_fetch_ssh "tar -cC /work/.leerie/runs --exclude=$run_id/repo $run_id" \
+  if ! _ec2_fetch_ssh "tar -cC /work/.leerie/runs --exclude=$run_id/repo --exclude=$run_id/tree-repos $run_id" \
        | tar -xC "$host_leerie_runs" 2>/dev/null; then
     remote_log "fetch_state_ec2: failed to stream run state directory from instance $instance_id"
     return 1

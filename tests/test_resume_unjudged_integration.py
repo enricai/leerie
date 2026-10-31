@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
 
 RUN_ID = "20261028-unjudged-merge"
@@ -106,6 +107,7 @@ class _World:
         wt = Path(out.stdout.strip().splitlines()[-1])
         (wt / "app.py").write_text(A_SIDE if sid == "a" else B_SIDE)
         _git(wt, "commit", "-q", "-am", f"{sid}: helper")
+        worker_exit(wt)   # a worker's exit takes its tree's branch
         st.data["subtask_status"][sid] = "complete"
         st.save()
         return {"subtask_id": sid, "status": "complete", "summary": "ok"}
@@ -122,6 +124,7 @@ class _World:
         if kw["sid"].startswith("integrator-repair-"):
             (staging / "app.py").write_text(REPAIRED)
             _git(staging, "commit", "-q", "-am", "restore incoming_helper")
+            worker_exit(staging)   # a worker's exit takes its tree's branch
             return {"incoming_subtask": "b", "status": "resolved",
                     "superseded": []}
         # The first resolution, committed under the integrator's own
@@ -131,6 +134,7 @@ class _World:
             raise _Crash("killed inside the integrator, mid-resolution")
         _git(staging, "add", "app.py")
         _git(staging, "commit", "-q", "-m", "resolve the app.py conflict")
+        worker_exit(staging)   # a worker's exit takes its tree's branch
         self.merge_committed = True
         if self.kill_in_integrator == "after":
             raise _Crash("killed inside the integrator, after its commit")

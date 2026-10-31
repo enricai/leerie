@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
 from tests.test_resume_unintegrated_complete import (RUN_ID, _Crash, _git,
                                                      _merged, _setup)
@@ -34,6 +35,7 @@ def _commit(repo: Path, sid: str, name: str, text: str) -> None:
         f.write(text)
     _git(wt, "add", "-A")
     _git(wt, "commit", "-q", "-m", f"{sid}: {name} {text.strip()}")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
 
 
 def _patch(leerie, monkeypatch, repo: Path, run_dir: Path, *,

@@ -242,8 +242,18 @@ integrated_so_far=""
 # No git command of leerie's own runs a repository hook (DESIGN §6½).
 leerie_git_hooks_off
 backout_failed=false
+# Staging is a worktree of its own repository (DESIGN §6 *A repository per
+# committing tree (I6)*): what the integrator commits there, and every
+# back-out, reaches the run repository only when leerie takes the run branch.
+_take_staging() {
+  local tr
+  tr="$(git -C "$staging" rev-parse --path-format=absolute --git-common-dir)" || return 1
+  [ "$tr" != "$(leerie_repo_git rev-parse --path-format=absolute --git-common-dir)" ] || return 0
+  leerie_take_tree_branch "$tr" "$run_branch"
+}
 _back_out() {
-  if ! leerie_reset_worktree "$staging" "$run_branch" "$1" >&2; then
+  if ! leerie_reset_worktree "$staging" "$run_branch" "$1" >&2 \
+      || ! _take_staging >&2; then
     backout_failed=true
     echo "collect-subtrees: staging could not be reset to ${1}; the remaining branches are skipped" >&2
   fi
@@ -359,7 +369,7 @@ except Exception:
       dirt=$(leerie_tree_dirt "$staging" 2>/dev/null || echo "status failed")
       now=$(cd "$staging" && git rev-parse HEAD)
       if [ "$merge_head_rc" -ne 0 ] && [ -z "$staged_files" ] \
-          && [ -z "$dirt" ] && [ "$now" != "$pre" ]; then
+          && [ -z "$dirt" ] && [ "$now" != "$pre" ] && _take_staging >&2; then
         resolved_count=$((resolved_count + 1))
         if [ -n "$integrated_so_far" ]; then
           integrated_so_far="${integrated_so_far}, ${sid}"

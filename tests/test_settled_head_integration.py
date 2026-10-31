@@ -16,6 +16,7 @@ import asyncio
 import subprocess
 from pathlib import Path
 
+from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
 
 RUN_ID = "20261028-settled-head"
@@ -69,6 +70,7 @@ def _detached_commits(wt: Path) -> str:
         (wt / "search.test.ts").write_text(f"case {i}\n" * (i + 1))
         _git(wt, "add", "-A")
         _git(wt, "commit", "-q", "-m", f"t1 test {i}")
+        worker_exit(wt)   # a worker's exit takes its tree's branch
     return _git(wt, "rev-parse", "HEAD")
 
 
@@ -115,6 +117,9 @@ def test_a_no_op_merge_is_re_integrated_from_the_settled_head(
     re-integrates once from the settled head."""
     repo, st, staging, wt = _world(leerie, tmp_path, monkeypatch)
     head = _detached_commits(wt)
+    # A recorded settled head is a commit of the run repository (leerie
+    # records it there, DESIGN §6 *A repository per committing tree (I6)*).
+    leerie._bring_commit(wt, head)
     st.data["settled_heads"] = {"t1": head}
     st.save()
     out, results = _integrate(leerie, st)
@@ -134,6 +139,9 @@ def test_settled_head_still_missing_is_unconverged_not_dropped(
     repo, st, staging, wt = _world(leerie, tmp_path, monkeypatch)
     fork = _branch_tip(repo)
     head = _detached_commits(wt)
+    # A recorded settled head is a commit of the run repository (leerie
+    # records it there, DESIGN §6 *A repository per committing tree (I6)*).
+    leerie._bring_commit(wt, head)
     st.data["settled_heads"] = {"t1": head}
     st.save()
     before = _git(staging, "rev-parse", "HEAD")
@@ -164,6 +172,9 @@ def test_resumed_wave_finds_unintegrated_work_by_settled_head(
         leerie, tmp_path, monkeypatch):
     repo, st, staging, wt = _world(leerie, tmp_path, monkeypatch)
     head = _detached_commits(wt)
+    # A recorded settled head is a commit of the run repository (leerie
+    # records it there, DESIGN §6 *A repository per committing tree (I6)*).
+    leerie._bring_commit(wt, head)
     heads = {"t1": head}
     # By branch the work reads as merged (the branch is the fork point);
     # by settled head it is not.
@@ -182,6 +193,7 @@ def test_interrupted_redrive_rollback_resets_the_settled_head(
     (wt / "g.txt").write_text("half\n")
     _git(wt, "add", "-A")
     _git(wt, "commit", "-q", "-m", "half-done round")
+    worker_exit(wt)   # a worker's exit takes its tree's branch
     st.data["settled_heads"] = {"t1": _git(wt, "rev-parse", "HEAD")}
     st.data["redrive_in_flight"] = {"t1": {
         "kind": "coverage", "pre_sha": pre, "round": 1,

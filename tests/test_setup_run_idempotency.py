@@ -109,16 +109,19 @@ def test_orphaned_staging_dir_is_reclaimed(tmp_path: Path) -> None:
     _git("add", "wave.txt", cwd=wt)
     _git("commit", "-q", "-m", "leerie: integrate wave 1", cwd=wt)
     branch = "leerie/runs/run-42"
-    tip = _git("rev-parse", branch, cwd=repo).stdout.strip()
+    tip = _git("rev-parse", "HEAD", cwd=wt).stdout.strip()
     assert tip, "precondition: the run branch should carry a commit"
 
-    # The SIGKILL survivor: admin entry gone, directory still on disk.
-    git_dir = Path(_git("rev-parse", "--absolute-git-dir", cwd=repo).stdout.strip())
-    admin = git_dir / "worktrees" / "staging"
+    # The SIGKILL survivor: admin entry gone, directory still on disk. The
+    # entry is staging's own repository's (DESIGN §6 *A repository per
+    # committing tree (I6)*), and the kill came before leerie took the
+    # commit into the run repository.
+    tree_repo = state / "runs" / "run-42" / "tree-repos" / "staging"
+    admin = tree_repo / "worktrees" / "staging"
     assert admin.is_dir(), "precondition: worktree admin entry should exist"
     shutil.rmtree(admin)
     assert wt.is_dir(), "precondition: the orphaned dir must still be present"
-    listing = _git("worktree", "list", "--porcelain", cwd=repo).stdout
+    listing = _git("worktree", "list", "--porcelain", cwd=tree_repo).stdout
     assert f"worktree {wt}" not in listing, "precondition: must be unregistered"
 
     r2 = _run_setup(repo, "run-42", state)

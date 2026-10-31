@@ -8793,6 +8793,137 @@ Unchanged, on `st.repo_root` (the user's checkout, read-only git): `_preflight_r
   - two argv-shape pins follow `git -C <repo>`.
 - Round 17 (the repository named, never discovered): three pins follow the `--git-dir` spelling — `test_cleanup_run_scoped`'s `worktree remove`, `test_fetch_branch_sh`'s machine stub (it maps `--git-dir=<machine repo>` to the fixture) and `test_worktree_prune_scoping`'s locale probe (`LC_ALL=C LANGUAGE='' leerie_repo_git worktree prune`).
 
+### A repository per committing tree (I6): code surface
+
+DESIGN §6 *A repository per committing tree (I6)* is canonical.
+
+**Layout.** `<run-dir>/tree-repos/<tree>/` (`TREE_REPOS_NAME =
+"tree-repos"`), `<tree>` the worktree's directory name. Staging's holds the
+run branch, a subtask tree's its subtask branch.
+
+**Shell (`scripts/worktree-lib.sh`).**
+- `leerie_take_tree_branch <tree-repo> <branch>`: `leerie_repo_git fetch
+  --quiet --no-tags --no-write-fetch-head --no-auto-maintenance <tree-repo>
+  +refs/heads/<branch>:refs/heads/<branch>`.
+- `leerie_tree_branch_of <run-id> <tree-name>`: the branch by the name
+  alone (`_tree_branch_of` in Python).
+- `leerie_tree <tree-repo> <branch> <worktree>`, under `leerie_repo_lock`:
+  - the worktree present and a worktree of `<tree-repo>` (its
+    `--git-common-dir` is `<tree-repo>`): take its branch, reuse it;
+  - otherwise: a tree of the run repository at that path (a run made before
+    tree repositories) is deregistered there and removed; a stale
+    `<tree-repo>` that holds `<branch>` has it taken first, then is
+    removed; then `git init --bare --quiet --template=
+    --object-format=<the run repository's>`, `objects/info/alternates` =
+    `<run-repo>/objects`, `config` and `info/` copied from
+    `<run-dir>/repo-settings` (`<run-dir>` being `<tree-repo>`'s
+    grandparent; with no copy, the run repository's own `config` with
+    `core.bare=true`), `git --git-dir <tree-repo> fetch --quiet --no-tags
+    --no-write-fetch-head --no-auto-maintenance <run-repo>
+    +refs/heads/<branch>:refs/heads/<branch>`, and `git --git-dir
+    <tree-repo> worktree add <worktree> <branch>`.
+- `leerie_drop_tree <tree-repo> <worktree>`: removes the worktree
+  directory and the tree repository (the caller takes first when it keeps
+  the work).
+- `leerie_run_settings` maps a tree of a tree repository to the run's
+  `repo-settings` too.
+- `new-worktree.sh`: the run-scoped prune of the run repository's own
+  registry, the subtask branch created in the run repository when absent
+  (from the run branch's tip), then `leerie_tree`. The orphan-directory
+  removal and the add's repair-and-retry are gone: a tree's registration is
+  private to its tree repository, made under the lock, so no sibling races
+  it; the pre-prefix worktree move is gone with them (such a run predates
+  per-run repositories, and its resume is refused).
+- `setup-run.sh`: staging through `leerie_tree`; on resume, every tree under
+  `worktrees/` with a tree repository has its branch taken before it is
+  reset.
+- `integrate.sh`: in a staging of a tree repository, fetches the subtask
+  branch from the run repository into it before the merge, and takes
+  staging's branch after the merge (and after `merge --abort`).
+- `cleanup.sh`: a tree with a tree repository is taken, then dropped.
+- `collect-subtrees.sh` (Fly): takes staging after its integrator and after
+  `_back_out`.
+- `fetch-branch.sh`, `ec2-fetch-branch.sh`: the state tar also has
+  `--exclude=<id>/tree-repos`.
+
+**Python (`orchestrator/leerie.py`).**
+
+| Function | Contract |
+|---|---|
+| `_common_dir_of(tree) -> Path \| None` | `git -C tree rev-parse --path-format=absolute --git-common-dir`, None when that fails. |
+| `_tree_repo_of(tree) -> Path \| None` | The common directory of `tree` when it is `<run-dir>/tree-repos/<name>` of a run with a repository (`_run_repo_of`), else None (a tree of the run repository itself, or of no run). |
+| `_run_repo_for_tree(tree) -> Path \| None` | The run repository a tree belongs to, by the layout alone (`<run-dir>/repo` for a tree repository's tree, the common directory when that is a run repository), never by the tree repository's alternates file, which its worker can write. |
+| `_tree_branch_of(tree_repo) -> str` | The branch leerie takes from it, by its name alone (never the tree's HEAD, which the worker sets): `staging` → `leerie/runs/<run-id>`, `<run-id[:12]>-<sid>` → `leerie/subtasks/<run-id>/<sid>`; `<run-id>` is the run directory's name. |
+| `_take_tree_branch(tree) -> str \| None` | For a tree of a tree repository: `_take_tree_repo` of it; None for any other tree. `_take_tree_branch_async` runs it off the event loop; `_take_after_worker(cwd)` `die()`s when it raises. |
+| `_take_tree_repo(tree_repo) -> str \| None` | The fetch above into `<run-dir>/repo`, then the run repository's commit of that branch. Raises `RunRepoError` when the fetch fails. |
+| `_drop_tree_repo(run_dir, name, *, take) -> bool` | Removes `<run_dir>/tree-repos/<name>` (a no-op when absent), after `_take_tree_repo` when `take`; False, with everything kept, when that take fails. |
+| `_branch_commit_for_tree(tree, name) -> str` | `name` (the run branch) as the run repository's commit when `tree` is a tree of a tree repository, else `name`. `_branch_commit_for_tree_async` off the event loop. |
+| `_bring_commit(tree, sha) -> None` | A commit leerie made in a tree repository on no branch (a synthetic merge, a rescue) into the run repository: a no-op when the run repository has it; else `fetch --upload-pack="git -c uploadpack.allowAnySHA1InWant=true upload-pack" <tree-repo> +<sha>:refs/leerie/kept/<sha>`. |
+
+Where leerie takes:
+- `claude_p`, in a `finally` after the worker call, for its `cwd`
+  (`_take_tree_branch_async`); a failed take `die()`s.
+- `_restore_tree`, at its end, for `tree`.
+- `_integrate_merge`, at its end (integrate.sh took after the merge; the
+  JSON-key merge and the subject amend come after it).
+- `_reintegrate_settled_head` moves the subtask branch in the run repository
+  (`update-ref` there, never in staging).
+- `_prune_subtask_worktree`, before it drops the tree; `_reset_subtask_worktree`
+  drops it without taking (it deletes the branch).
+- `_cleanup_on_abnormal_exit`: each tree with a tree repository is taken,
+  then dropped (directory and tree repository).
+- `_reap_idle_worktrees`: each reaped run's trees are taken into that run's
+  repository before its `worktrees/` and `tree-repos/` go.
+
+Reads:
+- `_ancestor_codes`, `_wave_sids_not_integrated`, `_next_rescue_ref` read
+  the run repository (`_git_at(_run_repo_for_tree(staging))`).
+- `_rescue_integrator_work` stores its commit with `_bring_commit` and its
+  ref in the run repository.
+- `_synthetic_merge`'s commit is brought (`_bring_commit`) before the
+  integration judge's checkout.
+- `_judge_checkout` and `_committed_view` add their checkouts in the run
+  repository (`repo` default), at a commit brought or taken there; the view
+  reads its tip from the run repository after taking the tree.
+- The run branch is read by commit, never by name, inside a subtask tree:
+  `_branch_commit_for_tree(tree, <run branch>)` is passed where a subtask
+  tree's diff, log or show was given the name: `check_diff_scope`,
+  `_branch_has_commits_ahead`, `check_branch_has_commits`, the settle's
+  name-only diff, `_run_conformance_phase` (its `_changed_files`,
+  `_clobbered_owned_files` and the conformer's `DIFF_BASE`), and the
+  external-claim checks (`_env_template_local_service`, `_repo_mentions`).
+  Coverage reads its base in the committed view, a worktree of the run
+  repository, where the name resolves.
+- `_undo_interrupted_redrives`, rolling a subtask branch back in the run
+  repository while its tree is gone, drops a surviving tree repository
+  untaken (`leerie_tree` takes a stale one).
+- `_run_settings_of(tree)` returns `(<tree-repo>, <run-dir>/repo-settings)`
+  for a tree of a tree repository, so `_settings_dirt` and
+  `_restore_settings` check and restore its `config` and `info/` against
+  the run's copy.
+
+`CLEAN_TREE_SETTINGS_NOTE` names "this tree's repository".
+`_seal_run_repo_config` also sets `gc.auto=0`, `gc.pruneExpire=never`,
+`gc.worktreePruneExpire=never` and `maintenance.auto=false`. leerie's
+fetches into the run repository pass `--no-auto-maintenance`.
+
+**Tests.** `tests/conftest.py::worker_exit(tree)` runs the real
+`_take_tree_branch`: what a worker's exit does, for a test that stands in
+for a worker by committing in its tree. `tests/test_tree_repos.py`, real git
+through the real scripts:
+the tree repository's shape (alternates, one ref, the run's settings, no
+copied objects); a worker confined to its tree and tree repository (the
+run repository made read-only) commits, and cannot move the run branch or a
+sibling's; leerie takes exactly the tree's own branch (a ref the worker
+made elsewhere in its repository never reaches the run repository); a
+worker that moves its HEAD to another branch does not change what is
+taken; integrate merges a sibling into staging and takes it; a rollback
+through `_restore_tree` reaches the run repository; a resume takes a
+crashed worker's commits before the reset; the run repository's gc
+settings; a judge checkout at a synthetic merge and at a detached HEAD
+staging was left on; a tree made before this
+change is remade from a tree repository.
+
 ### The user's checkout is read-only in the local container: code surface
 
 DESIGN §6 *The explicit channel: the user's checkout is mounted read-only*

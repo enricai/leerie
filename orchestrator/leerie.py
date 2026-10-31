@@ -5599,6 +5599,16 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
         for entry in worktrees_dir.iterdir():
             if not entry.is_dir():
                 continue
+            # A committing tree of its own repository: its branch taken,
+            # then the tree and its repository removed; kept when the take
+            # fails (DESIGN §6 *A repository per committing tree (I6)*).
+            if (st.run_dir / TREE_REPOS_NAME / entry.name / "HEAD").is_file():
+                if _drop_tree_repo(st.run_dir, entry.name, take=True):
+                    _rmtree_owned(entry)
+                if entry.exists():
+                    failed_removals += 1
+                    log(f"  cleanup: worktree {entry} survived removal")
+                continue
             remaining = cleanup_deadline - time.monotonic()
             if own_repo is not None and remaining > 0:
                 try:
@@ -6069,6 +6079,11 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
         log(f"[{sid}] git worktree remove timed out; falling back to rmtree")
     await run_proc(["git", "--git-dir", repo, "branch", "-D", branch])
     await _rmtree_fallback_and_prune(worktree, leerie_dir)
+    # Its tree repository goes too, untaken: the branch is deleted, and the
+    # retry's tree is made afresh from the run repository (DESIGN §6 *A
+    # repository per committing tree (I6)*).
+    await asyncio.to_thread(_drop_tree_repo, Path(leerie_dir),
+                            worktree.name, take=False)
 
 
 async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
@@ -6084,6 +6099,14 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     expected idempotent case. Never raises — a failed prune is disk
     pressure deferred to run-end cleanup, not a reason to fail the wave."""
     worktree = _subtask_worktree_path(leerie_dir, sid)
+    # A tree of its own repository: its branch is taken, then the tree and
+    # its repository go (DESIGN §6 *A repository per committing tree (I6)*).
+    # A take that fails keeps both.
+    if (Path(leerie_dir) / TREE_REPOS_NAME / worktree.name / "HEAD").is_file():
+        if await asyncio.to_thread(_drop_tree_repo, Path(leerie_dir),
+                                   worktree.name, take=True):
+            await asyncio.to_thread(_rmtree_owned, worktree)
+        return
     try:
         await run_proc(["git", "--git-dir",
                         str(Path(leerie_dir) / RUN_REPO_NAME),
@@ -9764,6 +9787,174 @@ def _run_repo_of(run_dir: Path) -> Path | None:
     return repo if r.returncode == 0 else None
 
 
+TREE_REPOS_NAME = "tree-repos"
+
+
+def _common_dir_of(tree: str | Path) -> Path | None:
+    """The git common directory of `tree`, absolute; None when `tree` is no
+    git tree (a payload-only directory, a path that does not exist)."""
+    try:
+        r = subprocess.run(["git", "-C", str(tree), "rev-parse",
+                            "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, check=False,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout.strip()
+    return Path(out) if r.returncode == 0 and out else None
+
+
+def _tree_repo_of(tree: str | Path) -> Path | None:
+    """`tree`'s own repository, `<run-dir>/tree-repos/<name>` (DESIGN §6 *A
+    repository per committing tree (I6)*), when `tree` is a worktree of one
+    and the run has its repository; else None — a tree of the run
+    repository itself, or of no run."""
+    common = _common_dir_of(tree)
+    if common is None or common.parent.name != TREE_REPOS_NAME:
+        return None
+    if _run_repo_of(common.parent.parent) is None:
+        return None
+    return common
+
+
+def _run_repo_for_tree(tree: str | Path) -> Path | None:
+    """The run repository a tree belongs to: the one its tree repository
+    borrows from, or its own common directory when that is a run
+    repository; None otherwise."""
+    common = _common_dir_of(tree)
+    if common is None:
+        return None
+    if common.parent.name == TREE_REPOS_NAME:
+        return _run_repo_of(common.parent.parent)
+    if common.name == RUN_REPO_NAME:
+        return _run_repo_of(common.parent)
+    return None
+
+
+def _tree_branch_of(tree_repo: Path) -> str:
+    """The branch leerie takes from a tree repository, by its name alone —
+    never the tree's HEAD, which a worker sets: `staging` holds the run
+    branch, `<run-id[:12]>-<sid>` the subtask branch. The shell half is
+    `leerie_tree_branch_of`."""
+    run_id = Path(tree_repo).parent.parent.name
+    name = Path(tree_repo).name
+    if name == "staging":
+        return _compute_run_branch(run_id)
+    return _compute_subtask_branch(
+        run_id, name[len(_worktree_dirname(run_id, "")):])
+
+
+def _take_tree_branch(tree: str | Path) -> str | None:
+    """Take `tree`'s branch from its tree repository into the run repository
+    (DESIGN §6 *A repository per committing tree (I6)*): its new objects
+    are copied and exactly that branch moves; no other ref of the tree
+    repository is read. Returns the run repository's commit of the branch;
+    None for a tree of no tree repository. Raises RunRepoError when the
+    fetch fails."""
+    tr = _tree_repo_of(tree)
+    if tr is None:
+        return None
+    return _take_tree_repo(tr)
+
+
+def _take_tree_repo(tr: Path) -> str | None:
+    """`_take_tree_branch` by the tree repository's path (its tree may be
+    gone)."""
+    branch = _tree_branch_of(tr)
+    run_repo = tr.parent.parent / RUN_REPO_NAME
+    f = _git_sync(["--git-dir", str(run_repo), "fetch", "--quiet",
+                   "--no-tags", "--no-write-fetch-head",
+                   "--no-auto-maintenance", str(tr),
+                   f"+refs/heads/{branch}:refs/heads/{branch}"], timeout=300)
+    if f.returncode != 0:
+        raise RunRepoError(f"take {branch} from {tr}: "
+                           f"{f.stderr.strip()[:300]}")
+    r = _git_sync(["--git-dir", str(run_repo), "rev-parse", "--verify",
+                   "-q", f"refs/heads/{branch}^{{commit}}"], timeout=30)
+    return r.stdout.strip() or None
+
+
+def _branch_commit_for_tree(tree: str | Path, name: str) -> str:
+    """`name`, a branch leerie reads a tree against (the run branch), as the
+    run repository's commit when `tree` is a tree of a tree repository —
+    leerie never reads a name there, where the worker owns every ref (DESIGN
+    §6 *A repository per committing tree (I6)*) — else `name` unchanged. The
+    tree reaches the commit's objects through its alternates."""
+    tr = _tree_repo_of(tree)
+    if tr is None:
+        return name
+    r = _git_sync(["--git-dir", str(tr.parent.parent / RUN_REPO_NAME),
+                   "rev-parse", "--verify", "-q",
+                   f"refs/heads/{name}^{{commit}}"], timeout=30)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() \
+        else name
+
+
+async def _branch_commit_for_tree_async(tree: str | Path, name: str) -> str:
+    return await asyncio.to_thread(_branch_commit_for_tree, tree, name)
+
+
+def _drop_tree_repo(run_dir: Path, name: str, *, take: bool) -> bool:
+    """Remove the tree repository of the tree `<run_dir>/worktrees/<name>`
+    (its tree is removed by the caller), after taking its branch when
+    `take` — a subtask tree pruned after integration keeps its work; one
+    reset for a retry does not (its branch is deleted). False, with
+    everything kept, when the take fails."""
+    tr = Path(run_dir) / TREE_REPOS_NAME / name
+    if not (tr / "HEAD").is_file():
+        return True
+    if take:
+        try:
+            _take_tree_repo(tr)
+        except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
+            log(f"  could not take {tr} before removing it ({e}); kept")
+            return False
+    _rmtree_owned(tr)
+    return True
+
+
+async def _take_tree_branch_async(tree: str | Path) -> str | None:
+    return await asyncio.to_thread(_take_tree_branch, tree)
+
+
+async def _take_after_worker(cwd: str | Path) -> None:
+    """A worker that ran in a committing tree has its branch taken as soon
+    as it exits, before anything reads what it did; a take that fails stops
+    the run (the run repository would not hold the worker's work)."""
+    try:
+        await _take_tree_branch_async(cwd)
+    except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
+        die(f"could not take the worker's branch from {cwd} into the run's "
+            f"repository: {e} (DESIGN §6 *A repository per committing tree "
+            "(I6)*)")
+
+
+def _bring_commit(tree: str | Path, sha: str) -> None:
+    """A commit leerie made in a tree repository on no branch (a synthetic
+    merge, a rescue) into the run repository, kept under
+    `refs/leerie/kept/<sha>`. A no-op when the run repository has it (a tree
+    of the run repository itself). Raises RunRepoError when the fetch
+    fails."""
+    run_repo = _run_repo_for_tree(tree)
+    if run_repo is None:
+        return
+    at = ["--git-dir", str(run_repo)]
+    if _git_sync([*at, "cat-file", "-e", f"{sha}^{{commit}}"],
+                 timeout=30).returncode == 0:
+        return
+    tr = _tree_repo_of(tree)
+    if tr is None:
+        raise RunRepoError(f"{sha} is in no repository leerie can take from")
+    f = _git_sync([*at, "fetch", "--quiet", "--no-tags",
+                   "--no-write-fetch-head", "--no-auto-maintenance",
+                   "--upload-pack",
+                   "git -c uploadpack.allowAnySHA1InWant=true upload-pack",
+                   str(tr), f"+{sha}:refs/leerie/kept/{sha}"], timeout=300)
+    if f.returncode != 0:
+        raise RunRepoError(f"bring {sha} from {tr}: "
+                           f"{f.stderr.strip()[:300]}")
+
+
 def _carry_repo_config(user: Path, repo: Path) -> None:
     """Copy the user's repository-local config into the run's repository
     (`repo/config`), key by key, except the keys that describe the
@@ -9898,12 +10089,21 @@ def _seal_run_repo_config(repo: Path) -> None:
     """`repack.updateServerInfo=false` in a repository being made, before
     leerie copies its settings: `git gc --auto`, which any commit or fetch
     can start, writes `info/refs` otherwise, which would read as a
-    worker's change to `info/`."""
-    sv = _git_sync(["config", "-f", str(Path(repo) / "config"),
-                    "repack.updateServerInfo", "false"])
-    if sv.returncode != 0:
-        raise RunRepoError("git config repack.updateServerInfo: "
-                           f"{sv.stderr.strip()[:300]}")
+    worker's change to `info/`. And no pruning while the run lives (DESIGN
+    §6 *A repository per committing tree (I6)*): the tree repositories
+    borrow this repository's objects, so one a back-out made unreachable may
+    still be one a tree reaches. After the carried config, so a user's own
+    `gc.*` cannot undo it."""
+    for key, value in (("repack.updateServerInfo", "false"),
+                       ("gc.auto", "0"),
+                       ("gc.pruneExpire", "never"),
+                       ("gc.worktreePruneExpire", "never"),
+                       ("maintenance.auto", "false")):
+        sv = _git_sync(["config", "-f", str(Path(repo) / "config"), key,
+                        value])
+        if sv.returncode != 0:
+            raise RunRepoError(f"git config {key}: "
+                               f"{sv.stderr.strip()[:300]}")
 
 
 def _take_settings(repo: Path, *, fresh: bool) -> None:
@@ -9936,9 +10136,18 @@ def _run_settings_of(tree: str | Path) -> tuple[Path, Path] | None:
     if r.returncode != 0 or not out:
         return None
     common = Path(out)
-    if common.name != RUN_REPO_NAME or _run_repo_of(common.parent) is None:
+    if common.parent.name == TREE_REPOS_NAME:
+        # A tree of a tree repository (DESIGN §6 *A repository per
+        # committing tree (I6)*): its `config` and `info/` were copied from
+        # the run's settings, and are read and restored against them.
+        run_dir = common.parent.parent
+    elif common.name == RUN_REPO_NAME:
+        run_dir = common.parent
+    else:
         return None
-    return common, common.parent / RUN_REPO_SETTINGS_NAME
+    if _run_repo_of(run_dir) is None:
+        return None
+    return common, run_dir / RUN_REPO_SETTINGS_NAME
 
 
 def _git_view(tree: str | Path) -> tuple[list[str], dict[str, str] | None]:
@@ -11217,6 +11426,18 @@ def _reap_idle_worktrees(runs_dir: Path, self_id: str,
                 except OSError:
                     report["skipped_live"].append(d.name)
                     continue
+                # Each tree repository's branch taken into the run's own
+                # repository first (DESIGN §6 *A repository per committing
+                # tree (I6)*): a run that died mid-worker may hold work only
+                # there. One that cannot be taken keeps the run as it is.
+                trs = sorted(p for p in (d / TREE_REPOS_NAME).glob("*")
+                             if (p / "HEAD").is_file())
+                try:
+                    for tr in trs:
+                        _take_tree_repo(tr)
+                except (RunRepoError, subprocess.TimeoutExpired):
+                    report["errors"] += 1
+                    continue
                 trash = d / f"{_REAP_TRASH_PREFIX}{os.getpid()}"
                 os.rename(wt, trash)
             finally:
@@ -11224,6 +11445,9 @@ def _reap_idle_worktrees(runs_dir: Path, self_id: str,
             report["bytes"] += _tree_bytes(trash)
             errs: list[str] = []
             shutil.rmtree(trash, onerror=lambda *a: errs.append(str(a[1])))
+            for tr in trs:
+                report["bytes"] += _tree_bytes(tr)
+                shutil.rmtree(tr, onerror=lambda *a: errs.append(str(a[1])))
             report["errors"] += len(errs)
             # The deleted worktrees' admin entries in the shared `.git`,
             # scoped to this run directory.
@@ -18618,7 +18842,8 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     — the base every subtask branched off of. Hardcoding `leerie/staging`
     here used to silently disable the check after the per-run refactor
     (the branch doesn't exist), so the protected-path enforcement was off."""
-    run_branch = _compute_run_branch(st.run_id)
+    run_branch = await _branch_commit_for_tree_async(
+        worktree, _compute_run_branch(st.run_id))
     r = await run_proc(
         ["git", "diff", "--name-only", f"{run_branch}..HEAD"],
         cwd=worktree,
@@ -18906,9 +19131,10 @@ async def _branch_has_commits_ahead(worktree: str,
     commit exists, never on a bare `None`/indeterminate result."""
     if not Path(worktree).exists():
         return False  # worktree gone — can't determine, treat as no commits
+    base = await _branch_commit_for_tree_async(worktree, parent_branch)
     try:
         r = await run_proc(
-            ["git", "log", f"{parent_branch}..HEAD", "--oneline"],
+            ["git", "log", f"{base}..HEAD", "--oneline"],
             cwd=worktree,
         )
     except OSError:
@@ -18936,9 +19162,10 @@ async def check_branch_has_commits(sid: str, worktree: str,
     instead, whose safe default is the opposite (don't rescue unless proven)."""
     if not Path(worktree).exists():
         return None  # worktree gone — can't determine, don't block
+    base = await _branch_commit_for_tree_async(worktree, parent_branch)
     try:
         r = await run_proc(
-            ["git", "log", f"{parent_branch}..HEAD", "--oneline"],
+            ["git", "log", f"{base}..HEAD", "--oneline"],
             cwd=worktree,
         )
     except OSError:
@@ -21756,6 +21983,10 @@ async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
             **({"env_extra": env_extra} if env_extra else {}))
     finally:
         _release_worker_memory_admission(admission_token)
+        # A worker in a committing tree wrote only its tree repository;
+        # leerie takes its branch now, whatever the exit (DESIGN §6 *A
+        # repository per committing tree (I6)*).
+        await _take_after_worker(cwd)
 
 
 async def _invoke(cmd: list[str], cwd: str, timeout: int,
@@ -38547,8 +38778,8 @@ CLEAN_TREE_BASE_NOTE = (
     "(`git rebase {base}`), never reset your branch behind it.")
 # Added when a settings line is present: its one act.
 CLEAN_TREE_SETTINGS_NOTE = (
-    "\nA line that says git settings changed is about the repository every "
-    "tree of this run shares, not a file of yours: undo the change you "
+    "\nA line that says git settings changed is about this tree's "
+    "repository, not a file of yours: undo the change you "
     "made there (`diff` the two paths it names; `git config --unset <key>` "
     "for a key you set, or remove what you added). Leerie reads every tree "
     "through its own copy of those settings, so a setting never makes a "
@@ -39820,7 +40051,11 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     repo_root = st.repo_root
     rules_files = _discover_rules_files(repo_root)
     blt = resolve_blt(repo_root)
-    run_branch = _compute_run_branch(st.run_id)
+    # The run branch as the run repository's commit, the base every diff of
+    # this subtask's tree reads (DESIGN §6 *A repository per committing tree
+    # (I6)*): the tree's own repository's refs are the worker's.
+    run_branch = await _branch_commit_for_tree_async(
+        worktree, _compute_run_branch(st.run_id))
     # The branch this conformer must leave its tree on (I1).
     sub_branch = _compute_subtask_branch(st.run_id, sid)
     last_res: dict | None = None
@@ -41049,7 +41284,10 @@ async def _view_ref(st: "State", tree: str | Path) -> str | None:
     prefix = _worktree_dirname(Path(run_dir).name, "")
     sid = t.name[len(prefix):] if t.name.startswith(prefix) else t.name
     branch = _compute_subtask_branch(run_id, sid)
-    return branch if sid and await _ref_sha(str(t), branch) else None
+    # Read in the run repository, where leerie took the branch (DESIGN §6 *A
+    # repository per committing tree (I6)*).
+    reg = await asyncio.to_thread(_run_repo_for_tree, t) or t
+    return branch if sid and await _ref_sha(str(reg), branch) else None
 
 
 async def _view_tree_sha(st: "State", tree: str | Path) -> str | None:
@@ -41059,9 +41297,10 @@ async def _view_tree_sha(st: "State", tree: str | Path) -> str | None:
     ref = await _view_ref(st, tree)
     if ref is None:
         return await _committed_tree_sha(str(tree))
-    got = await _git_text(tree, "rev-parse", "--verify", "-q",
-                          f"refs/heads/{ref}^{{tree}}")
-    return (got or "").strip() or None
+    reg = await asyncio.to_thread(_run_repo_for_tree, tree) or Path(tree)
+    got = await run_proc(["git", *_git_at(reg), "rev-parse", "--verify",
+                          "-q", f"refs/heads/{ref}^{{tree}}"])
+    return got.stdout.strip() if got.returncode == 0 else None
 
 
 async def _committed_view(st: "State", tree: str | Path) -> Path | None:
@@ -41078,7 +41317,11 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     ref = await _view_ref(st, tree)
     if ref is None:
         return None
-    tip = await _ref_sha(str(tree), ref)
+    # The run repository's record of the branch, and a checkout of the run
+    # repository: never the tree's own repository, which its worker can
+    # write (DESIGN §6 *A repository per committing tree (I6)*).
+    reg = await asyncio.to_thread(_run_repo_for_tree, tree) or Path(tree)
+    tip = await _ref_sha(str(reg), ref)
     if not tip:
         die(f"the committed view of {tree} cannot be made: its branch {ref} "
             "cannot be read (DESIGN §8 *Every measurement reads the "
@@ -41090,7 +41333,7 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     wt = _helper_worktree_path(st, f"view-{Path(key).name}")
 
     def _remove() -> None:
-        subprocess.run(["git", "-C", str(tree), "worktree", "remove",
+        subprocess.run(["git", *_git_at(reg), "worktree", "remove",
                         "--force", str(wt)], capture_output=True,
                        check=False)
         if wt.exists():
@@ -41099,7 +41342,7 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     _VIEWS.pop(key, None)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
     _DEPS_FAILED.pop(os.path.realpath(wt), None)
-    add = await _worktree_add_detached_async(st, wt, tip, repo=Path(tree))
+    add = await _worktree_add_detached_async(st, wt, tip, repo=reg)
     if add.returncode != 0:
         die(f"the committed view of {tree} cannot be made: `git worktree "
             f"add {wt}` failed ({(add.stderr or '').strip()[:300]}); "
@@ -44822,18 +45065,27 @@ async def _judge_checkout(st: "State", staging: Path, name: str, *,
     its crash path."""
     head = rev or await _branch_head_sha(str(staging))
     wt = _helper_worktree_path(st, name)
+    # A checkout of the run repository, never of staging's own repository,
+    # which a worker of staging can write (DESIGN §6 *A repository per
+    # committing tree (I6)*); the commit is brought there first.
+    reg = await asyncio.to_thread(_run_repo_for_tree, staging) or staging
 
     def _remove() -> None:
         # The directory first, write bits restored (a read-only directory,
         # a nested repository a test made), then the registration, which
         # `worktree remove --force` drops for a removed directory too.
         _rmtree_owned(wt)
-        subprocess.run(["git", "-C", str(staging), "worktree", "remove",
+        subprocess.run(["git", *_git_at(reg), "worktree", "remove",
                         "--force", str(wt)], capture_output=True,
                        check=False)
     _remove()
     try:
-        add = (await _worktree_add_detached_async(st, wt, head, repo=staging)
+        if head:
+            try:
+                await asyncio.to_thread(_bring_commit, staging, head)
+            except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
+                raise WorkerError(f"{name}: {e}") from e
+        add = (await _worktree_add_detached_async(st, wt, head, repo=reg)
                if head else None)
         if add is None or add.returncode != 0:
             raise WorkerError(f"{name}: no checkout of the committed tree "
@@ -50932,6 +51184,10 @@ async def _restore_tree(tree: str | Path, rev: str, *, where: str,
             landed = head == rev and (not branch
                                       or on == f"refs/heads/{branch}")
             break
+    # The reset moved the branch in the tree's own repository; leerie takes
+    # it into the run repository (DESIGN §6 *A repository per committing
+    # tree (I6)*), whether or not it landed.
+    await _take_after_worker(tree)
     if not landed:
         return False
     subprocess.run(["git", *prefix, "clean", "-ffdq"], capture_output=True,
@@ -57000,6 +57256,12 @@ async def _undo_interrupted_redrives(st: "State", leerie_dir: Path,
             ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
             ok = (await run_proc(["git", "--git-dir", str(_run_repo(st)),
                                   "update-ref", ref, pre])).returncode == 0
+            # A tree repository the tree outlived would hand the round's
+            # commits back at the next take (`leerie_tree` takes a stale
+            # one): it goes, untaken (DESIGN §6 *A repository per
+            # committing tree (I6)*).
+            await asyncio.to_thread(_drop_tree_repo, Path(leerie_dir),
+                                    tree.name, take=False)
         statuses = st.data.setdefault("subtask_status", {})
         if ok and m.get("status"):
             statuses[sid] = m["status"]
@@ -58824,7 +59086,8 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
         # The same local service, claimed as the variable that points at
         # it (round-4 review M5).
         local = await _env_template_local_service(
-            worktree, _compute_run_branch(st.run_id), key)
+            worktree, await _branch_commit_for_tree_async(
+                worktree, _compute_run_branch(st.run_id)), key)
     if local:
         out["reason"] = "local_service"
         return _end("refuted", f"local service: start it in-container — "
@@ -58875,8 +59138,10 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
         if not any(_claim_key_in(h, kind, k) for h in [task, spec, *every]
                    for k in keys):
             hit = await _repo_mentions(worktree,
-                                       _compute_run_branch(st.run_id), kind,
-                                       keys)
+                                       await _branch_commit_for_tree_async(
+                                           worktree,
+                                           _compute_run_branch(st.run_id)),
+                                       kind, keys)
             if hit is None:
                 return _end("unverified", f"could not search the "
                             f"repository for {key}")
@@ -59487,7 +59752,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         if status == "complete" and not rescued_from_empty_handoff and \
                 confidence_retries < caps.get("implementer_confidence_retries", 2):
             # Mechanical checks on the implementer's output.
-            run_branch = _compute_run_branch(st.run_id)
+            run_branch = await _branch_commit_for_tree_async(
+                worktree, _compute_run_branch(st.run_id))
             diff_proc = await run_proc(
                 ["git", "diff", "--name-only", run_branch],
                 cwd=worktree)
@@ -59939,10 +60205,14 @@ def _next_rescue_ref(staging: Path, run_id: str, sid: str) -> str | None:
     `subprocess.run`, like the git-dir probe, outside the pinned `run_proc`
     sequence."""
     base = f"refs/leerie/rescue/{run_id}/{sid}"
+    # The rescue refs are the run repository's (DESIGN §6 *A repository per
+    # committing tree (I6)*), never staging's own repository's.
+    run_repo = _run_repo_for_tree(staging)
     try:
-        r = subprocess.run(["git", "for-each-ref", "--format=%(refname)",
+        r = subprocess.run(["git", *_git_at(run_repo or staging),
+                            "for-each-ref", "--format=%(refname)",
                             f"refs/leerie/rescue/{run_id}/"],
-                           cwd=str(staging), capture_output=True, text=True,
+                           capture_output=True, text=True,
                            check=False, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -60030,15 +60300,20 @@ async def _rescue_integrator_work(staging: Path, sid: str,
         ref = _next_rescue_ref(staging, run_id, sid)
         if ref is None:
             return None
+        # The commit is made in staging's own repository; it is brought into
+        # the run repository, where the rescue ref lives (DESIGN §6 *A
+        # repository per committing tree (I6)*).
+        await asyncio.to_thread(_bring_commit, staging,
+                                commit.stdout.strip())
+        run_repo = await asyncio.to_thread(_run_repo_for_tree, staging)
         # update-ref deliberately runs WITHOUT the throwaway index env: refs
         # live in the repo, not the index, and the temp file is about to go.
         # The empty old value makes it create-only: a rescue ref is never
         # overwritten (round-3 review L3).
         stored = await run_proc(
-            ["git", "update-ref", "-m",
+            ["git", *_git_at(run_repo or staging), "update-ref", "-m",
              f"leerie: rescued {sid} integrator resolution", ref,
-             commit.stdout.strip(), ""],
-            cwd=str(staging))
+             commit.stdout.strip(), ""])
         if stored.returncode != 0:
             return None
         return ref
@@ -60509,12 +60784,22 @@ def _integration_refs(run_id: str, sid: str,
 async def _ancestor_codes(staging: Path, refs: list[str],
                           rev: str) -> list[int] | None:
     """`merge-base --is-ancestor` exit codes of each ref against `rev`;
-    None when git could not be run."""
+    None when git could not be run. Read in the run repository, which holds
+    the subtask branches and staging's taken commits (DESIGN §6 *A
+    repository per committing tree (I6)*): staging's own repository holds
+    only the run branch and whatever a worker put there. `rev` "HEAD" is
+    staging's HEAD."""
+    run_repo = await asyncio.to_thread(_run_repo_for_tree, staging)
+    if rev == "HEAD" and run_repo is not None:
+        rev = await _branch_head_sha(str(staging))
+        if not rev:
+            return None
+    at = _git_at(run_repo if run_repo is not None else staging)
     codes: list[int] = []
     for ref in refs:
         try:
-            r = await run_proc(["git", "merge-base", "--is-ancestor", ref,
-                                rev], cwd=str(staging))
+            r = await run_proc(["git", *at, "merge-base", "--is-ancestor",
+                                ref, rev])
         except OSError:
             return None
         codes.append(r.returncode)
@@ -60698,7 +60983,17 @@ async def _synthetic_merge(staging: Path, head: str, p1: str, p2: str,
                        cwd=str(staging),
                        env={**os.environ, **_SYNTHETIC_GIT_ENV})
     sha = r.stdout.strip()
-    return sha if r.returncode == 0 and sha else None
+    if r.returncode != 0 or not sha:
+        return None
+    # Made in staging's own repository; the judge's checkout is the run
+    # repository's (DESIGN §6 *A repository per committing tree (I6)*).
+    try:
+        await asyncio.to_thread(_bring_commit, staging, sha)
+    except (RunRepoError, OSError, subprocess.TimeoutExpired) as e:
+        log(f"  synthetic merge {sha[:12]} not brought into the run "
+            f"repository: {e}")
+        return None
+    return sha
 
 
 def _record_integration_loss(st: State, sid: str, detail: str,
@@ -61335,6 +61630,11 @@ async def _integrate_merge(staging: Path, st: "State",
     if rec["removed"]:
         _DEPS_INSTALLED.discard(os.path.realpath(staging))
         _DEPS_FAILED.pop(os.path.realpath(staging), None)
+    # integrate.sh took the run branch after a clean merge; a conflict left
+    # it unmoved. Taken again here so the run repository holds staging's
+    # branch whatever the outcome (DESIGN §6 *A repository per committing
+    # tree (I6)*).
+    await _take_after_worker(staging)
     return proc
 
 
@@ -61352,16 +61652,19 @@ async def _reintegrate_settled_head(staging: Path, st: "State", sid: str,
     await _restore_tree(staging, pre_sha,
                         where=f"re-integration of {sid}",
                         branch=_compute_run_branch(st.run_id))
+    # The subtask branch is leerie's, in the run repository (DESIGN §6 *A
+    # repository per committing tree (I6)*); integrate.sh fetches it into
+    # staging's repository for the merge.
     ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
-    tip = (await _git_text(staging, "rev-parse", "--verify", "-q", ref)
-           or "").strip()
+    at = _git_at(_run_repo(st))
+    tip = (await run_proc(["git", *at, "rev-parse", "--verify", "-q",
+                           ref])).stdout.strip()
     # Only ever forward: a head the branch is not under would merge some
     # other commit under this sid and orphan the branch's own work.
     if tip and head and (tip == head or (await run_proc(
-            ["git", "merge-base", "--is-ancestor", tip, head],
-            cwd=str(staging))).returncode == 0):
-        await run_proc(["git", "update-ref", ref, head, tip],
-                       cwd=str(staging))
+            ["git", *at, "merge-base", "--is-ancestor", tip,
+             head])).returncode == 0):
+        await run_proc(["git", *at, "update-ref", ref, head, tip])
     else:
         log(f"  {sid}: settled head {head[:12] or '?'} does not descend from "
             f"its branch ({tip[:12] or 'missing'}) — branch left where it is")
@@ -61468,6 +61771,9 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
         # The subject is code's to set: routing and sibling-delivery
         # settlement find a subtask's merge by it (review r1).
         await _set_integration_subject(staging, sid, pre_sha)
+        # leerie's own amend in staging's repository: taken (DESIGN §6 *A
+        # repository per committing tree (I6)*).
+        await _take_after_worker(staging)
         commit_err = await check_integrator_commit(staging)
         if commit_err:
             # non-fatal: log and record, but don't undo the integration
@@ -61577,6 +61883,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
         # confined to JSON files is merged by key, mechanically (DESIGN §6);
         # anything else goes to an integrator.
         json_files = await _try_json_key_merge(staging, sid)
+        await _take_after_worker(staging)
         if json_files:
             log(f"  conflict integrating {sid} confined to JSON; merged by "
                 f"key ({', '.join(json_files)})")
