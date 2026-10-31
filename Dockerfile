@@ -249,8 +249,10 @@ ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
 #   (falls back to ~/.cache/rubocop_cache without it).
 # MISE_STATE_DIR: mise reads this for tracked-configs and other state
 #   (falls back to ~/.local/state/mise without it).
-# The explicitly bind-mounted caches (pip, pnpm, go, cargo, mise-data) all
-# have their own env vars and are unaffected by XDG_CACHE_HOME.
+# mise-data, the one bind-mounted cache besides Bundler's, and the package
+# stores the orchestrator sets in the state mount (pip, pnpm, Go, Cargo,
+# corepack) all have their own env vars and are unaffected by
+# XDG_CACHE_HOME.
 ENV XDG_CACHE_HOME=/tmp/.cache
 ENV MISE_STATE_DIR=/tmp/.mise-state
 

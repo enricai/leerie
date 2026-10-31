@@ -24,6 +24,12 @@ Runtime: containerd + nerdctl. On Linux, native. On macOS, via
 [Colima](https://colima.run) (a Lima-managed Linux VM). See
 `docs/INSTALL.md` for per-OS install steps.
 
+The kernel must offer Landlock ABI 3 or later (Linux 6.2+): every worker
+runs confined, and preflight stops a run without it rather than run a
+worker unconfined (DESIGN §6 *A worker writes only where it is granted
+(I5)*). The user's checkout is mounted at `/work` read-only (DESIGN §6
+*The run's own repository*, *The explicit channel*).
+
 Python is provisioned *inside the container* by the image (Python 3
 from Debian 13). The launcher itself is a portable bash script; it
 no longer needs `uv`, and uses the host's stdlib-only `python3` just for
@@ -149,6 +155,18 @@ the rest of the family stay denied.
 
 ## Mandatory requirements
 
+- **Every worker runs confined (I5).** Its processes write only what its
+  grant names (`_worker_grants`, Landlock); no worker runs unconfined.
+  DESIGN §6 *A worker writes only where it is granted (I5)*.
+- **Each run has its own repository, and each committing tree its own
+  (I4, I6).** The user's repository is only fetched from, and receives the
+  run branch by the host-side bring-back; only leerie moves the run
+  repository's refs. DESIGN §6 *The run's own repository*, *A repository
+  per committing tree (I6)*.
+- **Every measurement runs in a committed view installed from leerie's
+  own stores,** never in a worker's tree. DESIGN §8 *Every measurement
+  reads the committed view*; §6 *The stores a view installs from are
+  leerie's*.
 - **Worker outputs are JSON-schema-validated.** New worker types must
   define a schema in the `SCHEMAS` dict in `orchestrator/leerie.py` and
   pass it via `--json-schema` in `claude_p()`.

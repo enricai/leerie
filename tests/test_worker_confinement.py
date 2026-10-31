@@ -457,15 +457,80 @@ def test_the_fly_integrator_is_confined():
 
 
 
-def test_a_worker_with_a_shell_is_told_where_it_may_write(leerie, tmp_path):
-    """The notice is documentation; the kernel is the guarantee. Told to
-    every worker with bare `Bash`, not to one without a shell."""
-    act = leerie._worker_guard(leerie.ACT_TOOLS, tmp_path, {},
-                               worker="implementer")
-    judge = leerie._worker_guard(leerie.INSPECT_TOOLS, tmp_path, {},
-                                 worker="planner")
-    assert leerie.CONFINED_WRITES_NOTICE in act["notices"]
-    assert leerie.CONFINED_WRITES_NOTICE not in judge["notices"]
+def test_the_writes_notice_says_exactly_what_the_grant_allows(leerie, run):
+    """Round 18 claims M9: the notice said "only your working directory and
+    $TMPDIR" to the implementer, whose grant (and prompt) also has its notes
+    directory. Now it is rendered from the grant: every path it names is
+    writable under the real shim, and every granted path is named."""
+    rd, wt = run["run_dir"], run["wts"]["wt-a"]
+    # Made by `_worker_cache_env` before the shim opens the grants.
+    (rd / "workers" / "cache").mkdir(parents=True, exist_ok=True)
+    g = _grants(leerie, run, notes_id="wt-a")
+    notice = leerie._confined_writes_notice(g, cwd=wt, env=run["env"])
+    assert notice.startswith("your processes can write only these: "
+                             "your working directory; $TMPDIR; "
+                             "$CLAUDE_CONFIG_DIR; ")
+    named = {"your working directory": wt, "$TMPDIR": run["env"]["TMPDIR"],
+             "$CLAUDE_CONFIG_DIR": run["env"]["CLAUDE_CONFIG_DIR"]}
+    listed = notice.split(": ", 1)[1].split(". ", 1)[0].split("; ")
+    paths = [named.get(x) or x.strip("`") for x in listed]
+    assert str(rd / "notes" / "wt-a") in paths       # its handoff notes
+    for p in g.rw:
+        if p not in leerie._WORKER_DEVICES:
+            assert os.path.realpath(p) in {os.path.realpath(q)
+                                           for q in paths}, p
+    script = "\n".join(f"w{i}|mkdir -p {q} && echo x > {q}/.notice-probe"
+                       for i, q in enumerate(paths))
+    got = _probe(leerie, g, script, run["env"])
+    assert all(got.values()), [str(paths[int(k[1:])])
+                               for k, v in got.items() if not v]
+
+
+def test_claude_p_tells_a_shell_worker_its_grant(leerie, run, monkeypatch):
+    """Through the real `claude_p`: the implementer's prompt carries the
+    notice for its own grant, notes directory included; a worker without a
+    shell is told nothing about writes. In a checkout of its own (here the
+    run repository's view), as a non-committing worker with a shell runs."""
+    rd, wt = run["run_dir"], run["wts"][f"{RUN_ID}-view-staging"]
+    seen: dict = {}
+
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
+                          stdin_data=None, *, grants, **_kw):
+        seen.setdefault("stdin", []).append(stdin_data)
+        seen.setdefault("grants", []).append(grants)
+        return {"type": "result", "subtype": "success", "is_error": False,
+                "result": "{}", "structured_output": {"title": "t",
+                                                      "body": "b",
+                                                      "used_template": None}}
+    monkeypatch.setattr(leerie, "_invoke", fake_invoke)
+    monkeypatch.setattr(leerie, "_capture_call", lambda *a, **k: None)
+    monkeypatch.setattr(leerie, "_append_system_prompt_file_supported",
+                        lambda: False)
+    (rd / "logs").mkdir(exist_ok=True)
+    st = _St(run["user"], rd)
+    st.path = rd / "state.json"
+    st.data = {"verbosity": "quiet"}
+    st.bump_workers = lambda *a, **k: None
+    st.add_telemetry = lambda *a, **k: None
+    for tools, notes in ((leerie.ACT_TOOLS, "wt-a"),
+                         (leerie.INSPECT_TOOLS, None)):
+        asyncio.run(leerie.claude_p(
+            user_prompt="u", system_prompt="s", schema_key="pr_writer",
+            cwd=str(wt), allowed_tools=tools, max_turns=1, autonomous=False,
+            caps=dict(leerie.DEFAULT_CAPS), st=st, model="haiku",
+            sid=f"w-{bool(notes)}", notes_id=notes))
+    act, judge = seen["stdin"]
+    line = [ln for ln in act.splitlines() if "can write only" in ln]
+    assert len(line) == 1, act
+    assert line[0] == "NOTE FROM ORCHESTRATOR: " + \
+        leerie._confined_writes_notice(
+            seen["grants"][0], cwd=wt,
+            env={**os.environ, "TMPDIR": str(rd / "workers" / "w-True" /
+                                             "tmp"),
+                 "CLAUDE_CONFIG_DIR": str(rd / "workers" / "w-True" /
+                                          "config")})
+    assert f"`{rd / 'notes' / 'wt-a'}`" in line[0]
+    assert "can write only" not in judge
 
 
 def test_the_staged_prompt_is_in_the_run_directory(leerie, tmp_path,

@@ -1793,8 +1793,9 @@ and nothing else:
 
 - `<run-dir>/workers/<wid>/config/` — the worker's `CLAUDE_CONFIG_DIR`;
 - `<run-dir>/workers/<wid>/tmp/` — its `TMPDIR` (and `TMP`, `TEMP`);
-- `<run-dir>/workers/<wid>/cache/` — its caches (owned by the cache
-  separation; not made here).
+- not its caches: those are one set per run, `<run-dir>/workers/cache/`,
+  shared by every worker of the run and never by leerie's measurements
+  (§6 *The stores a view installs from are leerie's*).
 
 `<wid>` is the `sid` of the worker's first call. A call that resumes a
 session (`--resume`: the clean-tree re-ask, the falsifier's re-ask) runs
@@ -1998,13 +1999,17 @@ leerie's own enumerated git:
   - the merge-base for the final test-failure check.
 
   The DIFF_BASE line in prompts names the same commit.
-- *Every worktree hangs off the run's repository.* The scripts already act
-  on the repository at their working directory, so the orchestrator runs
-  them there, with the state root passed explicitly. That covers:
-  - staging, subtask and planning worktrees;
-  - every `_worktree_add_detached` and `_judge_checkout`;
+- *Every tree is made from the run's repository.* The scripts name the
+  run's repository (`LEERIE_GIT_DIR`, *Named, never discovered* above),
+  with the state root passed explicitly. That covers:
+  - staging and each subtask tree, each a worktree of its own tree
+    repository cut from the run repository's branch and taken back into
+    it (*A repository per committing tree (I6)* below);
+  - the planning worktree, every `_worktree_add_detached` and
+    `_judge_checkout`, which are worktrees or checkouts of the run
+    repository itself;
   - the acceptance writer's, surrogate's and falsifier's ref-less clones
-    (which now clone the run's repository).
+    (which clone the run's repository).
 
   The post-run replay is not a run's tree: it re-runs a captured call
   against the user's checkout as it is now, through a ref-less `--shared`
@@ -2199,11 +2204,12 @@ r16 H2's two scenarios):
 
 **What it does not settle.**
 
-- *H1's hidden dirt.* The run repository's `info/exclude` is still shared
-  by the run's own checkouts, and a worker can still write it or set
-  `skip-worktree`. I1's checker must still define clean against the
-  tree's own `.gitignore` files — never the shared `info/exclude` or
-  `core.excludesFile` — and the index flags, as H1's fix states (§8 *A
+- *H1's hidden dirt.* A worker can still write its tree repository's
+  `info/exclude` or set `skip-worktree`. I1's checker reads untracked
+  files by git's standard rules through leerie's settings (§8 *One ignore
+  rule*): leerie's copy of `info/exclude`, put back before every read, and
+  leerie's copy of the global ignore file (§8 *The settings are
+  leerie's*). It also reads the index flags, as H1's fix states (§8 *A
   worker leaves its tree clean*).
   `_checkout_ignore` stays, because one checkout's ignore must not reach
   staging.
@@ -2480,14 +2486,18 @@ with it set it made `$TMPDIR/claude-<uid>/` and ran), and a fixed
 `/tmp/<name>` path is refused. That is common — 155 of
 the 310 corpus sessions that wrote an absolute path wrote under `/tmp`
 (lane B, e.g. `/tmp/fr_fixed.ts`) — so every worker with a shell is told
-(`CONFINED_WRITES_NOTICE`, a notice: the kernel is the guarantee). The
+where it can write. The notice is rendered from that worker's own grant
+(`_confined_writes_notice`), never a fixed sentence: a fixed one told the
+implementer "only your working directory and $TMPDIR" while its grant, and
+its prompt, also had its notes directory (review round 18). It is a
+notice; the kernel is the guarantee. The
 prompt a worker reads on stdin is staged in `<run-dir>/stdin/`, never in
 `/tmp`, where another worker's processes could read or rewrite it.
 
 | Kind | Workers | Tree | Run repository | Run files |
 |---|---|---|---|---|
-| committing, run worktree | implementer, per-subtask conformer (subtask worktree); final conformer, acceptance-repair conformer, delivery re-drive implementer, integrator (staging) | write | read; the tree's git metadata write (below) | read `subtasks/`, `task.md`, `notes/`; the implementer writes its own `notes/<id>/` (`criteria.md`, `checkpoint.md`) |
-| committing, disposable clone | acceptance writer, surrogate fixer, falsifier | write (its `.git` is inside it) | read (the clone's objects borrow it) | — |
+| committing, run worktree | implementer, per-subtask conformer (subtask worktree); final conformer, acceptance-repair conformer, delivery re-drive implementer, integrator (staging) | write | its `objects/` read, nothing else of it; the tree's git metadata write (below) | read `subtasks/`, `task.md`, `notes/`; the implementer writes its own `notes/<id>/` (`criteria.md`, `checkpoint.md`) |
+| committing, disposable clone | acceptance writer, surrogate fixer, falsifier | write (its `.git` is inside it) | its `objects/` read (the clone's objects borrow them), nothing else of it | — |
 | non-committing, own checkout | delivery judge, integration judge, CI checks, PR reviewer, set auditor, verifiability classifier, delivery ratchet, replay capture, satisfied probe on a subtask tree | write with bare `Bash`, else read | read | — |
 | judgment, shared planning worktree | classifier, planners, reconciler, the judges, splitter, fit judge, satisfied probe, provision | read | read | — |
 | payload-only | judge, patch generator, PR writer, dep capture, scope judge, contract extractor | read its empty directory | read | — |
@@ -4345,20 +4355,25 @@ to copying, and each worktree paid full freight. That is the multiplier
 behind the 51 GB, and the mid-run prune bounds coexistence to one wave's
 worth of trees.
 
-**The pnpm store shares the worktrees' mount.** The store now lives in the
-state mount itself — `/leerie-state/.pnpm-store` locally,
-`/work/.leerie/.pnpm-store` on Fly (the state root there is
-`/work/.leerie`) — through `npm_config_store_dir`, so installs hard-link.
-Copying was not only a disk cost: concurrent installs copying whole trees
-ran past their timeouts, and three chains lost work to it (an install that
-"did not finish within 600 s", held-out sets discarded on install timeouts).
-The store is one per state root, i.e. per repository, shared by its runs;
-pnpm's store is content-addressed with atomic writes, so concurrent
-installs into it are safe. Ownership follows the worktrees on every
-runtime, because it is the same mount: measured rootful (real uid switch),
-five worktrees installed into one store with 0 EACCES, the worker owning
-every new store file, one package file carrying 6 links (the store's and
-one per worktree), and no chown. EC2 keeps its image-default store.
+**The pnpm store shares the worktrees' mount.** Every package store lives
+in the state mount, beside the worktrees, so installs hard-link instead of
+copying (a hard link cannot cross mounts). There are two sets, both set by
+the orchestrator through environment variables, with no mount or `-e` of
+their own (*The stores a view installs from are leerie's*, below):
+leerie's own, `<state-root>/.stores/leerie/<name>`, kept across runs; and
+each run's workers', `<run-dir>/workers/cache/<name>`, which goes with the
+run. The state root is `/leerie-state` locally and `/work/.leerie` on Fly.
+The host cache mounts that used to hold them (pnpm, pip, Go, Cargo,
+corepack) are gone. Copying was not only a disk cost: concurrent installs
+copying whole trees ran past their timeouts, and three chains lost work to
+it (an install that "did not finish within 600 s", held-out sets discarded
+on install timeouts). pnpm's store is content-addressed with atomic
+writes, so concurrent installs into one store are safe. Ownership follows
+the worktrees on every runtime, because it is the same mount: measured
+rootful (real uid switch), five worktrees installed into one store with 0
+EACCES, the worker owning every new store file, one package file carrying
+6 links (the store's and one per worktree), and no chown. EC2 keeps its
+image-default store.
 
 **The stores a view installs from are leerie's.** One store, shared by
 leerie's installs and every worker's across runs, was a path from a worker

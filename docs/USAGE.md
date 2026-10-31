@@ -106,7 +106,9 @@ On stdout you'll see lines like (with a hypothetical `<run-id>` of
 After every implementer commits in its worktree, the integrator merges
 its branch into the run branch, and the post-work conformance phase
 runs your project's detected build/lint/test commands as advisory
-checks against the worktree — surfacing residuals as warnings on the
+checks in a fresh checkout of the committed work (DESIGN §8 *Every
+measurement reads the committed view*), never the worker's own tree —
+surfacing residuals as warnings on the
 subtask result, not gating the wave. The wave boundary itself only
 runs a deterministic conflict-marker scan; whether the work landed is
 the implementer's confidence-gate call. See [`DESIGN.md`](DESIGN.md) §6, §8, §9.

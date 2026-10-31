@@ -5863,8 +5863,9 @@ template kept at finalize.
   *A worker leaves its tree clean*, *One restore*): dirt a worker hides from
   `git status` — `skip-worktree`/`assume-unchanged` index flags, a pattern
   in the shared `info/exclude` or `core.excludesFile` — is read by I1's
-  checker (untracked files against the tree's own `.gitignore` files only)
-  and cleared by the restore; the implementer's base is where its subtask
+  checker (untracked files by git's standard rules through leerie's
+  settings, §8 *One ignore rule*, with `info/exclude` put back first) and
+  cleared by the restore; the implementer's base is where its subtask
   branch forked from the run branch.
 - `tests/test_worker_settings_are_put_back.py` (5 tests, review round 18
   H1, DESIGN §8 *The settings are leerie's*). A worker's change to its
@@ -5914,3 +5915,37 @@ template kept at finalize.
 - `tests/test_clean_tree_gate.py` (17 tests, DESIGN §8 *A worker leaves its
   tree clean*): the I1 checker, the bounded re-ask of the same session,
   exhaustion rolling the round back, and every staging site.
+- `tests/test_committed_view.py` (10 tests, review round 17, DESIGN §8
+  *Every measurement reads the committed view*): a measurement of a worker
+  tree runs in a detached checkout of its branch tip. A self-ignoring
+  untracked `.gitignore` and the `helper.py` it hid are not measured, and
+  nothing is shared in from the worker's tree: dependencies are leerie's
+  install from the committed lockfile, build outputs leerie's build.
+- `tests/test_stores_are_leeries.py` (9 tests, DESIGN §6 *The stores a view
+  installs from are leerie's*): leerie's commands read only
+  `<state-root>/.stores/leerie/`, a worker only its run's caches, and only
+  a committed view gets links into leerie's store, so an in-place edit of
+  a hard-linked file in a worker's `node_modules` never reaches a view.
+  Driven with a pnpm-like stand-in installer.
+- `tests/test_worker_confinement.py` (20 tests, DESIGN §6 *A worker writes
+  only where it is granted (I5)*): a real child confined by
+  `scripts/landlock_exec.py` with the grants `_worker_grants` derives, on
+  leerie's run layout, writes only its grant and reads nothing of the run
+  it is not given; the writes notice is rendered from that grant
+  (`_confined_writes_notice`), every path it names writable under the
+  shim, and `claude_p` appends it to a worker with a shell (review round
+  18 M9).
+- `tests/test_run_settings.py` (54 tests, review rounds 17 H2 and 18 H1,
+  DESIGN §8 *The settings are leerie's*): both checker halves and both
+  restore halves. A setting written from a worker's tree (each key DESIGN
+  §8 lists, in each half) is put back before the read, so what it hid is
+  the file's own line; the global settings are read from leerie's copy.
+- `tests/test_one_ignore_rule.py` (4 tests, review round 17 H3, DESIGN §8
+  *One ignore rule*): I1 and I2 read untracked files by the same rule, and
+  a guard derived from the source finds no listing of untracked files
+  outside it, in Python or the shell.
+- `tests/test_repo_commands_keep_their_hooks.py` (5 tests, review round 17
+  M4, DESIGN §6½ *Hooks off*): the repository's own commands, launched
+  through `_run_streaming` or the self-check's spawn with
+  `_repo_command_env`, run with hooks as the repository expects, while
+  leerie's own git keeps them off.

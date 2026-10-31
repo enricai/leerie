@@ -24139,13 +24139,28 @@ FORBIDDEN_COMMANDS_NOTICE = (
 # constraint of the task (DESIGN §9 *A command the task forbids*).
 NOTICE_FREE_WORKERS = frozenset({"classifier", "forbidden_command_extractor"})
 
-# DESIGN §6 *A worker writes only where it is granted (I5)*: told to every
-# worker with a shell, since a fixed `/tmp/<name>` path — measured in 155 of
-# 310 corpus sessions that wrote an absolute path — is refused.
-CONFINED_WRITES_NOTICE = (
-    "your processes can write only your working directory and $TMPDIR. "
-    "`/tmp` and every path outside those two are not writable; put scratch "
-    "files in $TMPDIR.")
+
+def _confined_writes_notice(grants: WorkerGrants, *, cwd: str | Path,
+                            env: Mapping[str, str]) -> str:
+    """What a worker with a shell is told about where its processes can
+    write (DESIGN §6 *A worker writes only where it is granted (I5)*),
+    rendered from its own grant (`grants.rw`), so the notice and the kernel
+    cannot disagree: every granted path but the device nodes, with the
+    working directory, `$TMPDIR` and `$CLAUDE_CONFIG_DIR` named as such. A
+    fixed `/tmp/<name>` path — measured in 155 of 310 corpus sessions —
+    is refused, so `$TMPDIR` is the place for scratch files."""
+    names = {os.path.realpath(cwd): "your working directory"}
+    for var in ("TMPDIR", "CLAUDE_CONFIG_DIR"):
+        if env.get(var):
+            names.setdefault(os.path.realpath(env[var]), f"${var}")
+    labels = [names.get(os.path.realpath(p), f"`{p}`") for p in grants.rw
+              if p not in _WORKER_DEVICES]
+    first = [n for n in ("your working directory", "$TMPDIR",
+                         "$CLAUDE_CONFIG_DIR") if n in labels]
+    said = list(dict.fromkeys(first + labels))
+    return (f"your processes can write only these: {'; '.join(said)}. "
+            "`/tmp` and every other path are not writable; put scratch "
+            "files in $TMPDIR.")
 
 FORBIDDEN_WHOLE_SUITE_NOTICE = (
     "this task forbids running the whole test suite ({cmds}). A whole-suite "
@@ -26169,9 +26184,7 @@ def _worker_guard(allowed_tools: str, repo_root: str | Path,
     notices = [] if worker in NOTICE_FREE_WORKERS else [
         n for n in (suite_notice, forbidden_notice,
                     PROCESS_KILL_NOTICE if deny_kills else None,
-                    db_notice,
-                    CONFINED_WRITES_NOTICE if _bash_unrestricted(
-                        allowed_tools) else None) if n]
+                    db_notice) if n]
     return {
         "deny": ",".join(d for d in (suite_deny, db_deny, forbidden_deny,
                                      kill_deny) if d),
@@ -26394,10 +26407,19 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # worker writes only where it is granted*); `_invoke` applies it. None
     # only on the host-side seam, which is not a run worker. After the
     # worker's own directories are named: the grants follow them.
+    _genv = {**os.environ, **(env_extra or {})}
     grants = None if caps.get(HOST_SEAM_CAP) else _worker_grants(
         run_dir=leerie_dir, state=st.data, schema_key=schema_key, cwd=cwd,
-        allowed_tools=allowed_tools, env={**os.environ, **(env_extra or {})},
+        allowed_tools=allowed_tools, env=_genv,
         notes_id=notes_id, selfcheck_dir=selfcheck_dir)
+    # Where its processes can write, told to a confined worker with a
+    # shell, from the grant itself (never a fixed sentence the grant can
+    # outgrow: the implementer also writes its notes directory).
+    if (grants is not None and _bash_unrestricted(allowed_tools)
+            and schema_key not in NOTICE_FREE_WORKERS):
+        user_prompt = (f"{user_prompt.rstrip()}\n"
+                       "NOTE FROM ORCHESTRATOR: "
+                       + _confined_writes_notice(grants, cwd=cwd, env=_genv))
 
     use_file_flag = _append_system_prompt_file_supported()
     system_prompt_file: str | None = None

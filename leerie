@@ -6380,9 +6380,9 @@ def _node_ancillary(repo, copy_files):
 # Out-of-repo bake targets (DESIGN §6½, IMPLEMENTATION.md §0.5). Node/pnpm is
 # deliberately absent: node_modules cannot be fully baked (must live in the
 # repo tree for resolution), so the pnpm/yarn/npm install still targets the
-# inherited /work WORKDIR — only the pnpm *store* is warmed (via the existing
-# npm_config_store_dir cache mount, already wired at runtime), unchanged by
-# this feature. Composer/.NET are also left targeting /work: no verified
+# inherited /work WORKDIR. The pnpm store is not baked either: the
+# orchestrator sets its stores in the state mount at runtime (DESIGN §6 *The
+# pnpm store shares the worktrees' mount*). Composer/.NET are also left targeting /work: no verified
 # out-of-repo bake exists for them yet (out of scope — Python/Ruby/Rust/Go
 # are the four ecosystems this feature covers per the plan).
 #
@@ -7654,15 +7654,14 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE"; rm -f "${_cidfi
 # already work. The host preflight above verified gh auth + origin.
 
 # --- per-repo dependency caches (DESIGN §6½, IMPLEMENTATION §0.5) -------
-# Five host-side cache dirs survive across runs so:
-#   - mise doesn't re-install Node 20.11.0 every time the user runs leerie
-#     against a repo with .nvmrc: 20.11.0,
-#   - pnpm / pip / Go / Cargo installs hit warm caches.
-# Created lazily (mkdir -p) on every leerie invocation — cheap on existing
-# dirs, free of failure modes on first run.
-# Concurrency-safety per cache is documented in IMPLEMENTATION §0.5;
-# pip's pattern (warm once serially in phase_provision, hit cached
-# wheels in parallel from worktree replays) is documented in DESIGN §6½.
+# Two host-side cache dirs survive across runs: mise-data, so mise doesn't
+# re-install Node 20.11.0 every time the user runs leerie against a repo
+# with .nvmrc: 20.11.0, and Bundler's. Package stores (pnpm, pip, Go,
+# Cargo, corepack) are not host caches: they live in the state mount
+# (DESIGN §6 *The pnpm store shares the worktrees' mount*). Created lazily
+# (mkdir -p) on every leerie invocation — cheap on existing dirs, free of
+# failure modes on first run. Concurrency-safety per cache is documented
+# in IMPLEMENTATION §0.5.
 #
 # The host-wide dir (build semaphore, DESIGN §6 *A host-wide build
 # semaphore*) defaults to ~/.leerie/.host and must stay shared: the

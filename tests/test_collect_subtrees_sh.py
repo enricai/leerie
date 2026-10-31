@@ -466,11 +466,15 @@ def test_the_integrator_gets_the_shared_kill_deny_notice_and_hook(
         assert rule in after("--disallowedTools").split(","), rule
     assert "TaskStop" in after("--allowedTools").split(",")
     assert "TaskStop" not in after("--disallowedTools").split(",")
-    # Every notice, on the user prompt, as claude_p appends them.
+    # Every notice, on the user prompt, as claude_p appends them; the last
+    # says where its grant lets it write.
     prompt = after("-p")
     assert prompt.startswith("Resolve the in-progress merge conflict")
-    assert prompt.endswith("".join(f"\nNOTE FROM ORCHESTRATOR: {n}"
-                                   for n in expect["notices"]))
+    guard_part, writes = prompt.rsplit("\nNOTE FROM ORCHESTRATOR: ", 1)
+    assert guard_part.endswith("".join(f"\nNOTE FROM ORCHESTRATOR: {n}"
+                                       for n in expect["notices"]))
+    assert writes.startswith("your processes can write only these: "
+                             "your working directory; $TMPDIR")
     assert leerie.PROCESS_KILL_NOTICE in prompt
     # The PreToolUse hook (kills + the forbidden command) and the script
     # shell guard's environment.

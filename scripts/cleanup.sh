@@ -53,7 +53,7 @@ clean_one_run() {
   #
   # Removes ${run_dir}/worktrees/* (the worktree directories), prunes git
   # worktree metadata, and optionally deletes branches. The state dir
-  # itself (state.json, run.json, criteria/, logs/, checkpoints/) is KEPT
+  # itself (state.json, run.json, notes/, logs/) is KEPT
   # as an audit trail. Full nuke-the-run-entirely is the Ctrl-C
   # (full_purge) path inside the orchestrator, not this script.
   local run_id="$1"

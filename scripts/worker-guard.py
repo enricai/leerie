@@ -16,7 +16,8 @@ same construction every orchestrator-spawned worker gets
 the one worker without them (DESIGN §9 *A worker never kills a process by
 name*). Output: shell assignments for `eval` —
   guard_disallowed  DISALLOWED_TOOLS plus the guard's deny rules
-  guard_notice      each notice as a "\\nNOTE FROM ORCHESTRATOR: ..." line
+  guard_notice      each notice as a "\\nNOTE FROM ORCHESTRATOR: ..." line,
+                    the last one where its grant lets it write
   guard_settings    the hook's `--settings` JSON, or empty
   guard_env         a bash array of NAME=value words for `env`
   guard_confine     a bash array: the Landlock shim and the worker's grants
@@ -73,15 +74,20 @@ def main(argv: list[str]) -> int:
         cached = leerie._worker_cache_env(os.environ, Path(run_dir))
         env.update({k: v for k, v in cached.items()
                     if os.environ.get(k) != v})
+    genv = {**os.environ, **env}
     grants = leerie._worker_grants(
         run_dir=run_dir, state=state, schema_key="integrator", cwd=repo_root,
-        allowed_tools=allowed_tools, env={**os.environ, **env})
+        allowed_tools=allowed_tools, env=genv)
+    notices = list(guard["notices"])
+    if leerie._bash_unrestricted(allowed_tools):
+        # Where it can write, from its own grant, as `claude_p` tells it.
+        notices.append(leerie._confined_writes_notice(
+            grants, cwd=repo_root, env=genv))
     confine = " ".join(shlex.quote(w) for w in
                        leerie._confined_argv(grants, [])[:-1])
     disallowed = leerie.DISALLOWED_TOOLS + (
         "," + guard["deny"] if guard["deny"] else "")
-    notice = "".join(f"\nNOTE FROM ORCHESTRATOR: {n}"
-                     for n in guard["notices"])
+    notice = "".join(f"\nNOTE FROM ORCHESTRATOR: {n}" for n in notices)
     env_words = " ".join(shlex.quote(f"{k}={v}")
                          for k, v in sorted(env.items()))
     sys.stdout.write(

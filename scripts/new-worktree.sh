@@ -22,10 +22,9 @@ ID="${1:?usage: new-worktree.sh <subtask-id> <run-id>}"
 RUN_ID="${2:?usage: new-worktree.sh <subtask-id> <run-id>}"
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
 WT="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/$(leerie_worktree_name "$RUN_ID" "$ID")"
-# git worktree list --porcelain outputs absolute, symlink-resolved paths.
-# When LEERIE_STATE_DIR is unset (Fly runtime), $WT is relative and the
-# reuse grep below never matches, crashing continuation retries with
-# "fatal: '...' already exists". pwd -P resolves symlinks to match git.
+# git worktree list --porcelain outputs absolute, symlink-resolved paths,
+# and `leerie_tree` compares $WT against it: when LEERIE_STATE_DIR is unset
+# (Fly runtime) $WT is relative, so it is made absolute here.
 case "$WT" in
   /*) ;;
   *)  WT="$(pwd -P)/$WT" ;;
@@ -33,17 +32,11 @@ esac
 BRANCH="leerie/subtasks/${RUN_ID}/${ID}"
 PARENT_BRANCH="leerie/runs/${RUN_ID}"
 
-# Serialize the prune -> orphan-check -> rm -rf -> add sequence below across
-# every worker of every run on this repository. Each step is individually
-# check-then-act against git's shared worktree admin metadata, and under
-# --max-parallel a dozen siblings run this script concurrently: one worker's
-# `git worktree prune` can deregister a sibling's live worktree mid-add
-# (leaving its directory orphaned, "already exists" on retry), and the
-# orphan-cleanup guard's check-then-act `rm -rf` can delete a directory that
-# IS correctly registered under a concurrent `git worktree add`. Measured in
-# a harness at ~2.5%/~8% rates respectively and eliminated by a lock. The
-# lock is repository-wide (`leerie_repo_lock`), not per run: a per-run lock
-# left two concurrent runs, and a run's planning worktree, racing each other.
+# Serialize this script's changes to the run repository (the scoped prune of
+# its worktree registry, the branch cut) and the tree it makes, across the
+# siblings that run it concurrently under --max-parallel. The lock is in the
+# run repository (`leerie_repo_lock`), which is this run's alone (DESIGN §6
+# *The run's own repository*), so it is per run.
 RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"
 mkdir -p "$RUN_DIR"
 leerie_repo_lock

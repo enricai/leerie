@@ -6,7 +6,7 @@ spawning real workers. They confirm that:
 
 - Two runs' State instances write to disjoint paths.
 - Mutations on one State don't bleed into the other's saved state.json.
-- Per-run subdirectories (worktrees/, criteria/, logs/, etc.) are
+- Per-run subdirectories (worktrees/, notes/, logs/, etc.) are
   scoped under the run dir, so two runs can use the same `sid` without
   colliding.
 
