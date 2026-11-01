@@ -1793,9 +1793,11 @@ and nothing else:
 
 - `<run-dir>/workers/<wid>/config/` — the worker's `CLAUDE_CONFIG_DIR`;
 - `<run-dir>/workers/<wid>/tmp/` — its `TMPDIR` (and `TMP`, `TEMP`);
-- not its caches: those are one set per run, `<run-dir>/workers/cache/`,
-  shared by every worker of the run and never by leerie's measurements
-  (§6 *The stores a view installs from are leerie's*).
+- not its caches: those are one set per side of the run, shared by every
+  worker of that side and never by leerie's measurements (§6 *The stores a
+  view installs from are leerie's*): `<run-dir>/workers/cache/` for the
+  fixers' side, `<run-dir>/workers/cache-held-out/` for the held-out side
+  (§8 *Nothing a held-out evaluation produces reaches a fixer*).
 
 `<wid>` is the `sid` of the worker's first call. A call that resumes a
 session (`--resume`: the clean-tree re-ask, the falsifier's re-ask) runs
@@ -2492,7 +2494,7 @@ worker gets the first block, then its kind's.
 | own CLI config | what `CLAUDE_CONFIG_DIR` names: `<run-dir>/workers/<wid>/config/` (sessions live there, so `--resume` finds them) | write | `_worker_dirs` |
 | the CLI configuration template | `<run-dir>/claude-config/`, whose directories each worker's configuration links | read | `_claude_config_template` |
 | leerie's own code, the CLI, the worker's home | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check), the `claude` its `PATH` finds, and `$HOME` (the git identity, a package manager's config) unless it holds `/tmp`: each named, so that one under `/tmp` on a host is still read | read | — |
-| the run's download caches | `<run-dir>/workers/cache/`, one set per run shared by its workers (every store variable, the pnpm store, `XDG_CACHE_HOME`) | write | `_worker_cache_env` |
+| its side's download caches | one set per side of the run, shared by that side's workers (every store variable, the pnpm store, `XDG_CACHE_HOME`): `<run-dir>/workers/cache-held-out/` for a held-out-side worker (`HELD_OUT_LOG_WORKERS`), `<run-dir>/workers/cache/` for every other; never both (`_worker_cache_dir`) | write | `_worker_cache_env` |
 | outside the state root | everything but `/tmp` (above) | read | — |
 | the run's system prompts | `<run-dir>/sysprompt/` | read | — |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml`, which `MISE_OVERRIDE_CONFIG_FILENAMES` names to every process of a Go repository's run (§6½ step 3): without it a worker's `mise` cannot load its configuration | read | `_synth_mise_go_override` |
@@ -2501,8 +2503,8 @@ worker gets the first block, then its kind's.
 reuses the same worker's directories. A temp or config variable's
 directory is granted only when it lies beneath `<run-dir>/workers/`
 (`_worker_own_dirs`): one left at a shared default — `/tmp`, `~/.claude` —
-grants nothing. The caches are granted as the one directory they share, and
-nothing a worker's caches name outside it is: `/tmp/.cache`, the image's
+grants nothing. The caches are granted as the one directory its side
+shares, and nothing a worker's caches name outside it is: `/tmp/.cache`, the image's
 `MISE_DATA_DIR`, `/opt/venv`, `/opt/bundle`, `/opt/cargo-target`,
 `/opt/go-cache` and leerie's own stores `<state-root>/.stores/leerie/` are
 never granted, so no store leerie's own commands install from can be
@@ -2630,9 +2632,10 @@ command leerie runs is spawned (`_run_contained` included), takes
 and `mise ls` are started through `_confined_argv` with the same grants.
 Every input leerie hands such a command — a path in its argv — lies
 inside its grant: a file leerie writes for the command to read (the
-re-drive AST gate's base copy, a parse probe's marker) is written in the
-tree's private temp directory or its measurement directory, never in
-leerie's own temp directory `<run-dir>/tmp/`, which no grant reads.
+re-drive AST gate's base copy) is written in the tree's private temp
+directory, never in leerie's own temp directory `<run-dir>/tmp/`, which no
+grant reads — and written there without following a link (*Leerie never
+writes through a path confined code shaped*).
 `_run_streaming` and `_ts_script_run` check every absolute argv path that
 exists against the grant before they spawn (`_argv_outside_grant`) and
 stop the run (`die`) on one outside it: a command that cannot read its
@@ -2650,7 +2653,7 @@ enforce, which a measurement reads as "could not measure", never a pass.
 |---|---|---|
 | devices | as a worker's | write |
 | the measured tree | the checkout the command runs in (a committed view, an evaluation tree, a helper checkout, a worker tree an install runs in) | write |
-| its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `mise-state/` (`MISE_STATE_DIR`), `state/` (`XDG_STATE_HOME`), `reports/` (every runner report, the parse probe's marker, the failing-ID capture's report), `coverage/` (the coverage detector's output) | write |
+| its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `mise-state/` (`MISE_STATE_DIR`), `state/` (`XDG_STATE_HOME`), `reports/` (the runner report of every run that is not held-out; a held-out run's report path is there inside its sandbox only), `coverage/` (the coverage detector's output) | write |
 | its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, and its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) (*A confined command's scratch is short and private*), carried into its own `/tmp` | write |
 | `/tmp`, `/dev/shm` | the command's own, made by the shim, every kind, every tree (*Every confined process has its own `/tmp`, `/dev/shm` and IPC*) | read and write |
 | leerie's install, the home | `ROOT` (the AST scripts), `HOME` (unless it holds `/tmp`), named as a worker's are | read |
@@ -2680,13 +2683,22 @@ lifetime.** It is named for the tree and for an id leerie writes into the
 tree's git directory on first use (`leerie-measure-id`): a tree removed and
 made again at the same path gets a new git directory, so a new id and a
 fresh directory, and nothing a measurement left behind reaches the next
-tree. A directory whose tree is gone, or whose tree's id has changed, is
+tree. The git directory is the one leerie's layout names
+(`_run_tree_location`), and for a committing tree it is in the tree
+repository its worker writes, so the id is an untrusted key: read and
+written from the run directory down without following a link (*Leerie
+never writes through a path confined code shaped*), and any value the
+worker could leave names only one of that tree's own measurement
+directories, or a fresh one. Nothing else that tree's id could hold is
+leerie's: no other place keeps the tree's lifetime, since an inode number
+is reused (on ext4 the freed one is the next given in its group). A directory whose tree is gone, or whose tree's id has changed, is
 removed by the next measurement's sweep (moved aside at once, deleted in
 the background). It is never shared between trees: one held-out
 evaluation's tree is not another's, and no worker is granted any of them.
 It lives under `<run-dir>/measure/`, outside `<run-dir>/repo/`, which
 every non-committing worker reads. Leerie reads a report there after the
-command exits.
+command exits, without following a link the command left; a held-out
+run's report never lands there at all.
 
 **The variables follow the grant.** The grant names its own environment:
 `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` point at the tree's private
@@ -2812,6 +2824,86 @@ in what a confined program reports, and it is the same rule every other
 tree follows: the repository is located from leerie's layout. The setup
 commands of `_ref_less_clone` itself name the clone's `.git` explicitly,
 which is still leerie's until a worker runs.
+
+### Leerie never writes through a path confined code shaped
+
+*Designed 2026-11-01 (review round 21, isolation R1 and R5).*
+
+**Root cause.** Confined code writes more than its own files: every
+directory on the way to them inside its grant. A committing worker writes
+its tree and its tree repository whole; a measurement writes the tree and
+its measurement directory. Leerie's housekeeping around them — restoring a
+tree, putting a repository's settings back, keeping a tree's measurement
+id, placing a set or a task's report in a checkout, writing a held-out
+run's report back to disk — runs unconfined, and it addressed those
+directories by path, so the kernel resolved every link confined code had
+left there on leerie's behalf. Round 19 found this for git (*Leerie's git
+never takes a tree's repository from the tree*); round 21 found it for
+leerie's own writes:
+
+- *R1.* A held-out run's report came back through the sandbox's
+  descriptor, and `_run_streaming` then wrote it to the path the runner
+  had used, in the tree's `reports/`. An ordinary measurement of the same
+  view, which runs the worker's code with that directory in its grant, had
+  replaced `reports/` with a link to an implementer's tree; the evaluated
+  code had copied the placed set into its report. Leerie's write put the
+  set's text in the implementer's tree. The descriptor protected the bytes
+  in transit, not the place they landed.
+- *R5.* `_measure_dir_at` rewrote the tree's `leerie-measure-id` with a
+  plain write, and `_restore_settings` copied the settings to a fixed temp
+  name in the tree repository before renaming it. A committing worker
+  planted a link at either name; leerie's next write went through it, over
+  `state.json` and a held-out set, which the worker's own grant refuses.
+
+The class is "leerie, unconfined, resolves a path through a directory
+confined code can write", and a check of each site's target would only
+find the next one.
+
+**Invariant: an unconfined write leerie makes lands at the path it names,
+or nowhere.** It is constructed in three parts.
+
+1. *Leerie's own records live outside every grant.* A held-out run's
+   report is parsed from the descriptor's bytes and never put on disk
+   (`_run_streaming(report_into=)`; the parse probe's marker and the AST
+   facts likewise); the minitest reporter is part of leerie's install
+   (`MINITEST_REPORT_LIB`), read by every confined command and written by
+   none; the integrator rescue's throwaway index is in leerie's temp
+   directory, not the tree's git directory. The one record that must stay
+   with a tree — its measurement id, which has to share the tree's
+   lifetime — is an untrusted key (*Leerie's runs of the repository's
+   commands are confined too*).
+2. *Every write into a directory confined code can write is made from an
+   anchor down, never through a link.* The anchor is a directory no
+   confined process can replace: the run directory, or a grant's own root
+   (its entry lies in a directory no grant names, and Landlock grants what
+   is beneath a path, not the path's entry in its parent). From there each
+   component is opened `O_DIRECTORY|O_NOFOLLOW` (`_open_dir_beneath`); a
+   file is made `O_CREAT|O_EXCL|O_NOFOLLOW` at a fresh name in that
+   directory's descriptor and renamed over the destination
+   (`_write_beneath`), so a link at the destination is replaced, never
+   written through, and a link on the way refuses the write. Reads of what
+   confined code wrote take the same walk and refuse a link or a FIFO
+   (`_read_beneath`); removals and chmods likewise (`_unlink_beneath`,
+   `_remove_beneath`, `_add_dir_bits_beneath`, which reaches each directory
+   through an `O_PATH` descriptor). A directory of leerie's own layout
+   found as a link or a file — a measurement's `reports/`, a tree's stores —
+   is removed and made a directory (`_mkdir_private`).
+3. *A checkout of committed code is confined code's too.* A set's files, a
+   task's report, a falsifier's leads and the planning worktree's extras
+   are copied into checkouts whose content a worker committed, links
+   included: a committed `tests -> ../wt-a/tests` would carry a set into a
+   fixer's tree. Every such copy goes through the same walk, and a path a
+   link stands on is a taken path.
+
+A rule over the module holds the line: every function that still calls a
+raw write primitive is classified, by why its target is out of every
+confined process's reach (leerie's own state, logs and run repository; a
+grant's root itself; the host side; code that runs inside a worker's own
+confinement), and the functions that write where confined code writes use
+none (`tests/test_leerie_writes_never_follow_links.py`). Git's own writes
+into a tree are git's, which refuses a path beyond a link; leerie names
+the repository for it (*Leerie's git never takes a tree's repository from
+the tree*).
 
 ### A confined command's scratch is short and private
 
@@ -3033,7 +3125,9 @@ and leave UDP and pathname sockets open (measured).
 **Invariant (I3).** Nothing a held-out evaluation can change, and nothing
 it can cause, is observable by a worker or by any command that runs a
 worker's code; what leaves it is its output stream, its exit status and
-its runner report, through descriptors leerie holds, and leerie reduces
+its runner report, through descriptors leerie holds — the report parsed
+from the descriptor's bytes, never written to a path (*Leerie never writes
+through a path confined code shaped*) — and leerie reduces
 the report to identifiers it holds itself (set indices, the writer's
 declared case names, file paths from the set's declaration). I3's older
 half (§8 *A held-out set never enters a tree a worker commits from*) keeps
@@ -5237,7 +5331,8 @@ orchestrator through environment variables, with no mount or `-e` of their
 own (*The stores a view installs from are leerie's*, *Which stores an
 install may share*, below): leerie's own, `<state-root>/.stores/leerie/
 <name>`, kept across runs; each run's workers', `<run-dir>/workers/cache/
-<name>`, which goes with the run; and each run tree's own,
+<name>` (the held-out side's at `<run-dir>/workers/cache-held-out/<name>`),
+which goes with the run; and each run tree's own,
 `<run-dir>/tree-stores/<tree>/<name>`. The state root is `/leerie-state` locally and `/work/.leerie` on Fly.
 The host cache mounts that used to hold them (pnpm, pip, Go, Cargo,
 corepack) are gone. Copying was not only a disk cost: concurrent installs
@@ -5272,9 +5367,12 @@ only from stores that leerie alone writes.* So there are three sets:
   (measured: barnacle 9.0 s, funeralworks 23.2 s), warm after.
 - *The run's workers'*, `<run-dir>/workers/cache/<name>` with
   `XDG_CACHE_HOME` at `<run-dir>/workers/cache/xdg`
-  (`_worker_cache_env`, in the worker's spawn), one set per run, shared by
-  its workers. Per run rather than per worker, because what a worker
-  leaves in a cache can mislead only another worker of the run, never a
+  (`_worker_cache_env`, in the worker's spawn), one set per side of the
+  run, shared by that side's workers: the held-out side's workers
+  (`HELD_OUT_LOG_WORKERS`) have their own, `<run-dir>/workers/cache-held-out/`,
+  which no fixer's grant names (§8 *Nothing a held-out evaluation produces
+  reaches a fixer*). Per side rather than per worker, because what a worker
+  leaves in a cache can mislead only another worker of its side, never a
   measurement, while every cold copy is paid again: a cold pnpm store
   costs 9–23 s and 0.5–1.3 GB; on funeralworks, Playwright's chromium
   costs 20.1 s and 656 MB cold against 2.1 s warm, and a warm-store
@@ -11277,6 +11375,19 @@ relays, each closed where it relayed:
   sets. The evidence is now the span of the item the probe tests, which
   code checks is verbatim in the item, and the fact that it fails under
   B\*.
+- *The caches* (review round 21 R2). Every worker's processes wrote one
+  cache set per run, `<run-dir>/workers/cache/` (`XDG_CACHE_HOME`,
+  `GOCACHE`, `CARGO_HOME`, …), the held-out side's included, so whatever
+  a held-out-side worker's processes left there a later fixer read: `go
+  test` alone keeps a run's compiled test package, string constants
+  included, in `GOCACHE`, and the falsifier runs the final commit's own
+  harness — a fixer's code — with the probe on disk. The rule is over
+  every store a held-out-side worker can write, not only what it returns:
+  that side (`HELD_OUT_LOG_WORKERS`) has a cache set of its own,
+  `<run-dir>/workers/cache-held-out/`, granted to it in place of the
+  fixers' and named by no fixer's grant (`_worker_cache_dir`; the
+  environment follows the grant, `_granted_cache_dir`). Its cost is one
+  cold set per run for that side.
 
 Workers on the held-out side — the writer, the set auditor, the scope
 judge, the surrogate fixer's witness run — read set source or runner
