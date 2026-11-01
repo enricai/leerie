@@ -40,8 +40,12 @@ def main(argv: list[str]) -> int:
               f"so it does not run: {e} (DESIGN §6 *A worker's commands "
               "cannot reach its CLI*)", file=sys.stderr)
         return 126
+    # Marks the command as the worker's own for the CLI's `git` on PATH
+    # (`scripts/cli-bin/git`): inside this domain the real git runs as the
+    # worker asked (DESIGN §6 *The CLI's own git runs on leerie's terms*).
+    env = {**os.environ, "LEERIE_WORKER_COMMAND": "1"}
     try:
-        os.execv(SHELL, [SHELL, "-c", *argv[1:]])
+        os.execve(SHELL, [SHELL, "-c", *argv[1:]], env)
     except OSError as e:
         print(f"leerie: cannot run {SHELL}: {e}", file=sys.stderr)
     return 127

@@ -23,7 +23,9 @@ name*). Output: shell assignments for `eval` —
                     checkout's and leerie's own, the shell prefix among
                     them), passed with `--setting-sources ""` (DESIGN §6
                     *A worker's commands cannot reach its CLI*)
-  guard_env         a bash array of NAME=value words for `env`
+  guard_env         a bash array of NAME=value words for `env`, the
+                    CLI's own git put on leerie's terms among them
+                    (`_cli_git_env`)
   guard_confine     a bash array: the Landlock shim and the worker's grants
                     (`_worker_grants`, DESIGN §6 *A worker writes only where
                     it is granted*), to prefix the `claude` command with
@@ -85,6 +87,12 @@ def main(argv: list[str]) -> int:
     grants = leerie._worker_grants(
         run_dir=run_dir, state=state, schema_key="integrator", cwd=repo_root,
         allowed_tools=allowed_tools, env=genv)
+    # The CLI's own git on leerie's terms, as `_invoke` gives every confined
+    # worker (DESIGN §6 *The CLI's own git runs on leerie's terms*): the
+    # tree's settings and `.git` put back, and the CLI's `git` first on its
+    # PATH. After the grants, which read the PATH the CLI is found on.
+    leerie._ready_tree_for_worker(repo_root)
+    env.update(leerie._cli_git_env(repo_root, genv.get("PATH", "")))
     notices = list(guard["notices"])
     if leerie._bash_unrestricted(allowed_tools):
         # Where it can write, from its own grant, as `claude_p` tells it.

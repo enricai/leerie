@@ -22879,6 +22879,82 @@ LANDLOCK_SCRIPT = ROOT / "scripts" / "landlock_exec.py"
 # the worker's, which may not open the CLI's `/proc/<pid>/fd/1`.
 WORKER_SHELL = ROOT / "scripts" / "worker-shell.py"
 SHELL_PREFIX_ENV = "CLAUDE_CODE_SHELL_PREFIX"
+# DESIGN §6 *The CLI's own git runs on leerie's terms*: the directory first on
+# a confined worker's CLI's `PATH`, holding only `git`, which runs the CLI's
+# own git calls nested and on leerie's addressing (`scripts/cli-git.py`) and a
+# worker's own commands' git — marked by `worker-shell.py` — untouched.
+CLI_GIT_BIN = ROOT / "scripts" / "cli-bin"
+WORKER_COMMAND_ENV = "LEERIE_WORKER_COMMAND"
+CLI_GIT_ENV = "LEERIE_CLI_GIT"
+REAL_GIT_ENV = "LEERIE_REAL_GIT"
+
+
+def _cli_git_env(tree: str | Path, path: str) -> dict[str, str]:
+    """The environment that puts a confined worker's CLI's own git on
+    leerie's terms in `tree` (DESIGN §6 *The CLI's own git runs on leerie's
+    terms*): `CLI_GIT_BIN` first on `path`, the real git it stands in front
+    of, and the arguments leerie's own git on `tree` takes
+    (`_tree_git_args`): its repository named from leerie's layout, never the
+    tree's `.git`, and leerie's pins. Not `_git_view`'s copies of the
+    settings: they are outside every worker's grant, and the settings they
+    copy are ones no worker writes (the system and global config) or ones
+    put back before the worker starts (`_ready_tree_for_worker`)."""
+    args = _tree_git_args(tree)
+    path = os.pathsep.join(p for p in path.split(os.pathsep)
+                           if p and os.path.realpath(p)
+                           != os.path.realpath(CLI_GIT_BIN))
+    real = shutil.which("git", path=path) or "/usr/bin/git"
+    return {"PATH": os.pathsep.join([str(CLI_GIT_BIN), path]),
+            REAL_GIT_ENV: os.path.realpath(real),
+            CLI_GIT_ENV: json.dumps({"args": args, "env": {}})}
+
+
+def _restore_git_pointer(tree: str | Path) -> bool:
+    """Put back `tree`'s `.git` file when it no longer names the
+    administrative directory leerie's layout gives it (`_run_tree_location`),
+    so the next worker's own git finds the tree's repository, not one a
+    worker before it made (DESIGN §6 *The CLI's own git runs on leerie's
+    terms*; review round 22 isolation H1). A `.git` directory or link in its
+    place is removed first; nothing is written through a link. True when it
+    was rewritten; False for a tree outside every run, a ref-less clone
+    (its `.git` is its own worker's), one leerie cannot locate, or one
+    already right."""
+    loc = _run_tree_location(tree)
+    if not loc:
+        return False
+    common, admin, _run = loc
+    if os.path.realpath(common) == os.path.realpath(admin):
+        return False                        # a ref-less clone
+    t = Path(os.path.realpath(tree))
+    dot = t / ".git"
+    try:
+        st = os.lstat(dot)
+    except FileNotFoundError:
+        st = None
+    if st is not None and stat.S_ISREG(st.st_mode):
+        try:
+            text = dot.read_text()
+        except OSError:
+            text = ""
+        if (text.startswith("gitdir: ") and os.path.realpath(
+                text[len("gitdir: "):].strip()) == os.path.realpath(admin)):
+            return False
+    if st is not None:
+        _remove_beneath(t, dot)
+    _write_beneath(t, dot, f"gitdir: {admin}\n".encode(), mode=0o644,
+                   make=False)
+    return True
+
+
+def _ready_tree_for_worker(tree: str | Path) -> list[str]:
+    """Before a confined worker starts in `tree`: leerie's settings back over
+    its repository's (`_restore_settings`) and its `.git` naming that
+    repository (`_restore_git_pointer`), so nothing a worker before it chose
+    in either reaches it or its CLI. Returns what was put back."""
+    done = list(_restore_settings(tree))
+    if _restore_git_pointer(tree):
+        done.append(".git")
+    return done
 
 
 @functools.lru_cache(maxsize=1)
@@ -23561,6 +23637,11 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         rw += git_rw
         # A clone borrows the run repository's objects (`--shared`).
         ro += git_ro or [str(run_dir / RUN_REPO_NAME / "objects")]
+        if not git_ro:
+            # And its CLI's own git reads the clone through leerie's git
+            # directory for it (DESIGN §6 *The CLI's own git runs on
+            # leerie's terms*), which only leerie writes.
+            ro.append(str(_clone_git_dir(cwd_r)))
     else:
         (rw if _bash_unrestricted(allowed_tools) else ro).append(str(cwd_r))
         ro.append(str(run_dir / RUN_REPO_NAME))
@@ -24606,6 +24687,15 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # the `--settings` the CLI reads it from first.
     if grants is not None:
         worker_env = {**worker_env, SHELL_PREFIX_ENV: str(WORKER_SHELL)}
+        # And its own git (DESIGN §6 *The CLI's own git runs on leerie's
+        # terms*): nested, on leerie's addressing, on settings leerie put
+        # back, never through a `.git` an earlier worker rewrote.
+        worker_env.pop(WORKER_COMMAND_ENV, None)
+        restored = await asyncio.to_thread(_ready_tree_for_worker, cwd)
+        if restored:
+            log(f"  [{sid}] put back {', '.join(restored)} of "
+                f"{_operator_path(Path(cwd))} before the worker started")
+        worker_env.update(_cli_git_env(cwd, worker_env.get("PATH", "")))
 
     # The prompt is staged to a temp file BEFORE the spawn, and that file —
     # already positioned at byte 0 with the whole payload on disk — becomes

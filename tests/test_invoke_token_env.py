@@ -106,11 +106,15 @@ class TestActiveTokenEnvThreading:
 
         asyncio.run(run())
         env = captured[0]
-        assert env == {**leerie._worker_cache_env(
-            leerie._git_hooks_on(os.environ), tmp_path),
+        base = leerie._worker_cache_env(
+            leerie._git_hooks_on(os.environ), tmp_path)
+        assert env == {**base,
             # Confined: its commands run nested in its CLI's domain (DESIGN
-            # §6 *A worker's commands cannot reach its CLI*).
-            leerie.SHELL_PREFIX_ENV: str(leerie.WORKER_SHELL)}
+            # §6 *A worker's commands cannot reach its CLI*), and its CLI's
+            # own git on leerie's terms (*The CLI's own git runs on leerie's
+            # terms*).
+            leerie.SHELL_PREFIX_ENV: str(leerie.WORKER_SHELL),
+            **leerie._cli_git_env("/work", base.get("PATH", ""))}
         assert env["LEERIE_PROBE_MARK"] == "inherited"
         assert "LEERIE_GIT_HOOKS_OFF" not in env
 
