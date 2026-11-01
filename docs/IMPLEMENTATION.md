@@ -3916,7 +3916,9 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   adds `MISE_DATA_DIR` (default `~/.local/share/mise`) and `~/.local/bin`
   (both made first), toolchain kind `MISE_DATA_DIR` — a toolchain path
   beneath the state root is never granted. `ro`:
-  `_reads_outside(state_root)`, `<state-root>/.stores/leerie`,
+  `_reads_outside(state_root, tmp=False)` (`/tmp` is only ever in
+  `shared_tmp`), leerie's install `ROOT`, `os.environ["HOME"]` (realpath;
+  left out when it holds `SHARED_TMP`), `<state-root>/.stores/leerie`,
   `<run>/mise-overrides.toml` and `_measured_git_reads(tree, run_dir)`
   (`git rev-parse --path-format=absolute --git-dir --git-common-dir`:
   common dir the run repository → it whole; a tree repository → it and
@@ -3935,7 +3937,28 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   (emptied first for the toolchain kind); no store variable (leerie's environment and
   `_tree_store_env` set them). `shared_tmp`: `_around([SHARED_TMP],
   state_root)`, every kind (DESIGN §6 *A measurement may write `/tmp`; a
-  held-out evaluation has it alone*). New directories (the tree's stores,
+  held-out evaluation has it alone*) — `()` for a worker's tree
+  (`_is_worker_tree`, DESIGN §6 *A command in a worker's tree is kept from
+  `/tmp` as the worker is*); a tree granted it is recorded in
+  `_TMP_GRANTED_TREES` (realpaths, this process).
+- Worker trees: `_is_worker_tree(run_dir, tree, dirs) -> bool` — True when
+  `dirs` (`_git_dirs_of`) names a common dir whose parent is
+  `<run>/tree-repos/`, or the tree's realpath is in `_WORKER_TREES`.
+  `_declare_worker_tree(tree)` adds the realpath to `_WORKER_TREES` and
+  `die()`s when it is in `_TMP_GRANTED_TREES`. `_worker_grants` calls it
+  for the cwd of every `_COMMITTING_WORKERS` worker; `_write_acceptance_set`
+  (the writer's clone), `_acceptance_surrogate` and `_falsify_items` (each
+  `falsifier-lane<n>`) call it right after making the checkout, before its
+  install.
+- `_argv_outside_grant(argv, grants, *, shared_tmp=False) -> str | None` —
+  the first element of `argv` that is an absolute path that exists and
+  whose realpath lies beneath no realpath of `grants.rw`, `grants.ro` or
+  (with `shared_tmp`) `grants.shared_tmp`; None when every one does.
+  `_run_streaming` (with `shared_tmp=True`) and `_ts_script_run` `die()`
+  on one before spawning (DESIGN §6 *Leerie's runs of the repository's
+  commands are confined too*). `_redrive_ast_hits` writes each base copy
+  under the grant's `TMPDIR` (`tempfile.TemporaryDirectory(dir=…)`), the
+  tree's private temp directory, never `<run>/tmp/`. New directories (the tree's stores,
   `mise-state/`) are made by `_mkdir_private`. `_cache_vars(env, cache)` (every
   `_STORE_VARS` variable not beneath `_BAKED_ROOT` → `cache/<name>`,
   `XDG_CACHE_HOME` → `cache/xdg`, then `_with_pnpm_spellings`) serves
@@ -3981,7 +4004,10 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   no reader, sets `_TMP_EXCLUSIVE` in the holder's context, yields True),
   `_tmp_lock()` (one per running loop, `_TMP_LOCKS`, a weak-key
   dictionary). `_run_streaming` holds `_tmp_lock().shared()` around its
-  whole spawn and spawns `_confined_argv(grants, cmd, shared_tmp=True)`.
+  whole spawn and spawns `_confined_argv(grants, cmd, shared_tmp=True)`;
+  it is the one caller passing `shared_tmp=True`, so a command started
+  any other way (`_ts_script_run`, `mise ls`) has no `/tmp` at all
+  (`tests/test_measurement_tmp.py` pins both by rule).
   `_held_out_section(st)` — an async context manager: `exclusive()`; for
   the outermost holder with `os.environ[PRIVATE_TMP_ENV] == "1"`
   (`PRIVATE_TMP_ENV = "LEERIE_PRIVATE_TMP"`, set by the image's `ENV`),

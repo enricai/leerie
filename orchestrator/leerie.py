@@ -9956,6 +9956,12 @@ async def _run_streaming(
     # has `/tmp` alone (`_held_out_section`), whose own commands pass
     # through. The shim ends every process the command leaves before this
     # returns (DESIGN §6 *A confined command's processes end with it*).
+    outside = _argv_outside_grant(list(cmd), grants, shared_tmp=True)
+    if outside is not None:
+        die(f"leerie was about to hand {outside} to a confined command whose "
+            "grant does not reach it — leerie's own invariant is broken "
+            "(DESIGN §6 *Leerie's runs of the repository's commands are "
+            "confined too*). Report this.")
     async with _tmp_lock().shared():
         spawn_cmd = _confined_argv(grants, list(cmd), shared_tmp=True)
         # A command in a run's tree reads that tree's own stores
@@ -22565,6 +22571,7 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
                      # repository's run: mise reads it on every call.
                      str(run_dir / MISE_OVERRIDES_NAME)]
     if schema_key in _COMMITTING_WORKERS:
+        _declare_worker_tree(cwd_r)
         rw.append(str(cwd_r))
         git_rw, git_ro = _tree_git_dirs(cwd_r, run_dir)
         rw += git_rw
@@ -22944,10 +22951,13 @@ def _measurement_grants(st: "State", tree: str | Path,
     and `XDG_CACHE_HOME` at the tree's private temp directory
     (`/tmp/l/<id>/`, `_private_tmp`) and its mise state at the measurement
     directory; the store variables stay as leerie's environment and
-    `_tree_store_env` set them. Every kind may also write `/tmp` itself
-    (`shared_tmp`), which `_run_streaming` grants under the run's `/tmp`
-    lock (DESIGN §6 *A measurement may write `/tmp`; a held-out evaluation
-    has it alone*)."""
+    `_tree_store_env` set them. Every kind may also read and write `/tmp`
+    itself (`shared_tmp`), which `_run_streaming` grants under the run's
+    `/tmp` lock (DESIGN §6 *A measurement may write `/tmp`; a held-out
+    evaluation has it alone*) — except in a committing worker's tree
+    (`_is_worker_tree`), where the command is kept from `/tmp` as the
+    worker is (DESIGN §6 *A command in a worker's tree is kept from `/tmp`
+    as the worker is*)."""
     if kind not in (MEASURE_KIND, SETUP_HOOK_KIND, TOOLCHAIN_KIND,
                     STORE_FETCH_KIND):
         raise ValueError(f"no measurement kind {kind!r}")
@@ -22978,15 +22988,22 @@ def _measurement_grants(st: "State", tree: str | Path,
         rw += [os.environ[v] for v in sorted(_VERIFIED_STORE_VARS)
                if os.environ.get(v)
                and not os.environ[v].startswith(_BAKED_ROOT)]
+    worker_tree = _is_worker_tree(run_dir, t, dirs)
     if t.parent == (run_dir / "worktrees").resolve():
         # The tree's own stores (`_tree_store_env`), which no other tree
         # reads.
         tree_stores = run_dir / TREE_STORES_DIRNAME / t.name
         _mkdir_private(tree_stores, run_dir)
         rw.append(str(tree_stores))
-    ro: list[str] = [str(stores),
+    # Leerie's install (the AST scripts) and the home, named as a worker's
+    # are: `/tmp` is not in the reads outside the state root, and either
+    # may lie beneath it.
+    home = os.path.realpath(os.environ.get("HOME") or Path.home())
+    ro: list[str] = [str(ROOT), str(stores),
                      str(run_dir / MISE_OVERRIDES_NAME),
                      *_measured_git_reads(t, run_dir, dirs)]
+    if not Path(os.path.realpath(SHARED_TMP)).is_relative_to(home):
+        ro.append(home)
     if kind in (SETUP_HOOK_KIND, TOOLCHAIN_KIND):
         tools = [Path(os.environ.get("MISE_DATA_DIR")
                       or Path.home() / ".local" / "share" / "mise")]
@@ -23036,12 +23053,71 @@ def _measurement_grants(st: "State", tree: str | Path,
                      ("verify_deps_before_run", "false")):
             env[f"npm_config_{k}"] = v
             env[f"pnpm_config_{k}"] = v
+    # `/tmp` is read and written only through `shared_tmp`, which only
+    # `_run_streaming` grants, under the run's `/tmp` lock; and never in a
+    # committing worker's tree, whose worker reads what the command writes
+    # there (review round 20, isolation H2).
+    shared: tuple[str, ...] = ()
+    if not worker_tree:
+        shared = tuple(dict.fromkeys(_around([str(SHARED_TMP)], state_root)))
+        _TMP_GRANTED_TREES.add(str(t))
     return WorkerGrants(
         tuple(dict.fromkeys(_around(rw, state_root))),
-        tuple(dict.fromkeys(_reads_outside(state_root)
+        tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _around(ro, state_root))),
         tuple(env.items()),
-        tuple(dict.fromkeys(_around([str(SHARED_TMP)], state_root))))
+        shared)
+
+
+# DESIGN §6 *A command in a worker's tree is kept from `/tmp` as the worker
+# is*: the realpaths of the trees declared a committing worker's, and of
+# the trees a grant gave `/tmp` to, in this process.
+_WORKER_TREES: set[str] = set()
+_TMP_GRANTED_TREES: set[str] = set()
+
+
+def _is_worker_tree(run_dir: Path, tree: Path,
+                    dirs: tuple[Path, Path, Path] | None) -> bool:
+    """True when a committing worker writes `tree`: a worktree of a tree
+    repository (staging, a subtask tree; I6 makes no other kind for one),
+    or a tree declared one (`_declare_worker_tree`)."""
+    if (dirs is not None
+            and dirs[1].parent == (run_dir / TREE_REPOS_DIRNAME).resolve()):
+        return True
+    return os.path.realpath(tree) in _WORKER_TREES
+
+
+def _declare_worker_tree(tree: str | Path) -> None:
+    """Record `tree` as a committing worker's, so no command leerie runs
+    there reads or writes `/tmp`; stop the run when one already has — what
+    it read there may be in the tree the worker is about to read."""
+    real = os.path.realpath(tree)
+    if real in _TMP_GRANTED_TREES:
+        die(f"leerie ran a repository command with /tmp in {real} before "
+            "declaring it a committing worker's tree: what it read there "
+            "may be in the tree — leerie's own invariant is broken (DESIGN "
+            "§6 *A command in a worker's tree is kept from `/tmp` as the "
+            "worker is*). Report this.")
+    _WORKER_TREES.add(real)
+
+
+def _argv_outside_grant(argv: list[str], grants: WorkerGrants, *,
+                        shared_tmp: bool = False) -> str | None:
+    """The first absolute path in `argv` that exists and that `grants`
+    does not reach (realpaths compared), or None: every input leerie hands
+    a confined command must be inside its grant (DESIGN §6 *Leerie's runs
+    of the repository's commands are confined too*)."""
+    roots = [Path(os.path.realpath(g)) for g in
+             grants.rw + grants.ro + (grants.shared_tmp if shared_tmp
+                                      else ())]
+    for a in argv:
+        if not isinstance(a, str) or not a.startswith("/") \
+                or not os.path.exists(a):
+            continue
+        real = Path(os.path.realpath(a))
+        if not any(real.is_relative_to(r) for r in roots):
+            return a
+    return None
 
 
 async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
@@ -49898,6 +49974,8 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     if made.startswith("failed"):
         out["reason"] = made
         return out
+    # The writer commits here: nothing leerie runs here reads `/tmp`.
+    _declare_worker_tree(wt)
     db_url = None
     try:
         # The report is usually an untracked file in the user's checkout,
@@ -51810,6 +51888,8 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
     if (await asyncio.to_thread(_acceptance_writer_checkout, st, wt, own)
             ).startswith("failed"):
         return None
+    # The surrogate fixer writes here: nothing leerie runs here reads `/tmp`.
+    _declare_worker_tree(wt)
     task = st.data.get("task") or ""
     copied: list[Path] = []
     refs = []
@@ -54336,7 +54416,14 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
                    text: bool = False) -> subprocess.CompletedProcess:
     """A node run of an AST script in `tree`, confined to `grants`: it loads
     the tree's own `typescript` first, which is the tree's code (DESIGN §6
-    *Leerie's runs of the repository's commands are confined too*)."""
+    *Leerie's runs of the repository's commands are confined too*). No
+    `/tmp` beyond its private temp directory: it holds no `/tmp` lock."""
+    outside = _argv_outside_grant(argv, grants)
+    if outside is not None:
+        die(f"leerie was about to hand {outside} to a confined AST script "
+            "whose grant does not reach it — leerie's own invariant is "
+            "broken (DESIGN §6 *Leerie's runs of the repository's commands "
+            "are confined too*). Report this.")
     return subprocess.run(_confined_argv(grants, argv), cwd=str(tree),
                           capture_output=True, text=text, timeout=timeout,
                           check=False,
@@ -54910,6 +54997,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                 _falsifier_checkout, st, f"falsifier-lane{n}", sha)
             if lane is None:
                 continue
+            # A falsifier writes here: nothing leerie runs here reads `/tmp`.
+            _declare_worker_tree(lane)
             trees.append(lane)
             if not await _ensure_worktree_deps(
                     str(lane), st, caps, log_path=log_path,
@@ -57190,8 +57279,12 @@ def _redrive_ast_hits(staging: Path, base: str, head: str, *,
                                      head).split()
              if _REDRIVE_PROD_RE.search(f) and not _REDRIVE_TEST_RE.search(f)
              and (staging / f).is_file()]
+    # The base copy is the script's input: in the tree's private temp
+    # directory, which its grant writes, never leerie's own `<run>/tmp/`,
+    # which no grant reads (review round 20, execution H1).
+    scratch = dict(grants.env).get("TMPDIR")
     for f in files:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=scratch) as td:
             bf = ""
             b = subprocess.run(["git", *_tree_git_args(staging), "show",
                                 f"{base}:{f}"], capture_output=True,

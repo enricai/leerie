@@ -2629,6 +2629,18 @@ tree, kind)` derives. `_run_streaming`, through which every repository
 command leerie runs is spawned (`_run_contained` included), takes
 `grants` as a required keyword and has no unconfined path; the AST scripts
 and `mise ls` are started through `_confined_argv` with the same grants.
+Every input leerie hands such a command — a path in its argv — lies
+inside its grant: a file leerie writes for the command to read (the
+re-drive AST gate's base copy, a parse probe's marker) is written in the
+tree's private temp directory or its measurement directory, never in
+leerie's own temp directory `<run-dir>/tmp/`, which no grant reads.
+`_run_streaming` and `_ts_script_run` check every absolute argv path that
+exists against the grant before they spawn (`_argv_outside_grant`) and
+stop the run (`die`) on one outside it: a command that cannot read its
+own input fails as "could not measure", which the re-drive's gate (d+)
+read as a void round — every escalated round on a JS/TS repository was
+rolled back that way once leerie's temp files moved to `<run-dir>/tmp/`
+(review round 20, execution H1).
 Fail closed as for a worker: preflight has already required Landlock
 (`_require_landlock`), and the shim refuses (exit 126) where it cannot
 enforce, which a measurement reads as "could not measure", never a pass.
@@ -2641,13 +2653,14 @@ enforce, which a measurement reads as "could not measure", never a pass.
 | the measured tree | the checkout the command runs in (a committed view, an evaluation tree, a helper checkout, a worker tree an install runs in) | write |
 | its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `mise-state/` (`MISE_STATE_DIR`), `state/` (`XDG_STATE_HOME`), `reports/` (every runner report, the parse probe's marker, the failing-ID capture's report), `coverage/` (the coverage detector's output) | write |
 | its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, and its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) (*A confined command's scratch is short and private*) | write |
-| `/tmp` | itself, for a command `_run_streaming` runs, under the run's `/tmp` lock (*A measurement may write `/tmp`; a held-out evaluation has it alone*) | write |
+| `/tmp` | itself, for a command `_run_streaming` runs, under the run's `/tmp` lock, in a tree no committing worker writes (*A measurement may write `/tmp`; a held-out evaluation has it alone*, *A command in a worker's tree is kept from `/tmp` as the worker is*) | read and write |
+| leerie's install, the home | `ROOT` (the AST scripts), `HOME` (unless it holds `/tmp`), named as a worker's are | read |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
 | leerie's stores | `<state-root>/.stores/leerie/`: the fetched stores (*Which stores an install may share*) | read |
 | the verified stores | what `PIP_CACHE_DIR`, `POETRY_CACHE_DIR` and `YARN_GLOBAL_FOLDER` name (`_VERIFIED_STORE_VARS`): the manager refuses an edited entry on reuse | write |
 | the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
-| outside the state root | everything, as a worker's | read |
+| outside the state root | everything but `/tmp`, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
 | *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR`; `mise-state/` emptied first | write |
 | *store-fetch kind* (`_populate_leerie_store`, in its staging directory) | also leerie's store, its store variables left pointing there | write |
@@ -2877,14 +2890,19 @@ outside leerie, and nothing a held-out set's run leaves there reaches any
 later command.** `/tmp` is the container's, and a container runs one run,
 so within the run four rules keep runs apart:
 
-1. **Every measurement kind may write `/tmp`** — but only through
-   `_run_streaming`, which holds the run's `/tmp` lock shared for the whole
-   command (`_TmpLock`, `_tmp_lock()`; one per event loop, and one run per
-   orchestrator process). The grant carries it apart from its other rules
-   (`WorkerGrants.shared_tmp`), and `_confined_argv` adds it only when
-   `_run_streaming` asks: a confined command started any other way — the
-   AST scripts, `mise ls` — writes its private temp directory and not
-   `/tmp`, so no command writes `/tmp` without holding the lock.
+1. **Every measurement kind may read and write `/tmp`** — but only
+   through `_run_streaming`, which holds the run's `/tmp` lock shared for
+   the whole command (`_TmpLock`, `_tmp_lock()`; one per event loop, and
+   one run per orchestrator process). The grant carries `/tmp` apart from
+   its other rules (`WorkerGrants.shared_tmp`), read and write alike: its
+   reads outside the state root leave `/tmp` out, as a worker's do
+   (`_reads_outside(root, tmp=False)`), and `_confined_argv` adds
+   `shared_tmp` only when `_run_streaming` asks. A confined command started
+   any other way — the AST scripts, `mise ls` — neither reads nor writes
+   `/tmp` beyond its private temp directory, so no command touches `/tmp`
+   without holding the lock. Until round 20 only the write was held back:
+   the grant's reads covered `/tmp` whole, so an AST script read it while a
+   held-out evaluation held `/tmp` alone.
 2. **A held-out evaluation holds the lock exclusive** (`_held_out_section`),
    from the first copy of a set's files into its tree to the last removal
    (`_acceptance_run_placed`), and around every other run of a held-out
@@ -2909,6 +2927,9 @@ so within the run four rules keep runs apart:
 4. **No worker reads or writes `/tmp`** (§6 *`/tmp` is not a worker's*): a
    worker can neither plant what a measurement will read nor read what one
    left.
+5. **No command leerie runs in a committing worker's tree reads or writes
+   `/tmp`** (below): it would carry what it read there into the tree the
+   worker reads.
 
 **Nothing of leerie's own is in `/tmp`.** With measurements writing `/tmp`,
 a file leerie keeps there could be read or rewritten by the code it
@@ -2929,9 +2950,66 @@ every repository (the run directory is inside one when the state root is
 test database cluster, a fixed `/tmp/<name>` cache — and a held-out
 evaluation's writes into a `/tmp` entry that existed before it stay (the
 section removes what the evaluation created, not what it changed). Every
-such command runs the run's own code, under the same grant, and no worker
-can read `/tmp`; what is excluded is held-out content reaching a later
-command through a path the evaluation made.
+such command runs the run's own code under the same grant, in a tree no
+committing worker writes. What keeps it from a worker is not only that
+no worker reads `/tmp` — leerie runs the worker's code, so that alone was
+never enough (round 20, below) — but that no command which reads `/tmp`
+writes a tree a committing worker reads (rule 5). What is excluded is
+held-out content reaching a later command through a path the evaluation
+made.
+
+### A command in a worker's tree is kept from `/tmp` as the worker is
+
+*Designed 2026-11-01 (review round 20, isolation H2).*
+
+**Root cause.** The measurement grant was derived as if every tree it
+measures were a committed view, which no worker reads. But leerie also
+runs the worker's own code in a committing worker's tree: the re-drive
+escalation gate's AST scripts load staging's `typescript`
+(`_redrive_ast_available`, `_redrive_ast_hits`), and the dependency
+install runs in the writer's, the surrogate fixer's and each falsifier
+lane's clone before the worker starts, with the writer's held-out
+validation after it. That grant read all of `/tmp` and wrote the tree, so
+the worker's code read `/tmp` *for* the worker and left what it read
+where the worker reads next: measured, a planted `typescript` copied a
+held-out file's leftover in `/tmp` into staging, where the implementer,
+refused `/tmp` itself, read it.
+
+**Invariant: a command leerie runs reads or writes `/tmp` only in a tree
+no committing worker writes.** `_measurement_grants` derives it from the
+tree: a *worker's tree* gets no `shared_tmp`, so — with rule 1 — no `/tmp`
+at all, exactly a committing worker's own access. A worker's tree is
+(`_is_worker_tree`):
+- a worktree of a tree repository (`<run-dir>/tree-repos/`: staging and
+  every subtask tree), read from its git common directory — a committing
+  worker's run worktree is never anything else (I6);
+- any tree declared one (`_declare_worker_tree`): `_worker_grants`
+  declares the cwd of every committing worker, and the clones made for
+  one — the writer's, the surrogate fixer's, each falsifier lane — are
+  declared by the code that makes them, before anything runs there.
+
+The declaration is checked from the other side too: `_worker_grants`
+stops the run (`die`) when a committing worker's tree was granted `/tmp`
+earlier in this process (`_TMP_GRANTED_TREES`), so a new tree made for a
+committing worker that is measured before it is declared stops the run
+rather than relaying. The default is the safe one for the worker: a tree
+neither kind names is a measured tree, and only a tree some committing
+worker then writes is the error the check catches.
+
+**What it costs.** A repository's tests that need a fixed `/tmp/<name>`
+fail where they run in a worker's tree — the writer's validation of its
+own held-out files, the surrogate set audit's runs in the surrogate tree —
+as they already failed in the worker's own session there. Every other
+measurement, held-out evaluations included, runs in a committed view or a
+helper checkout no committing worker writes, and keeps `/tmp`. Running the
+writer's validation in a copy of its files placed into a measured tree
+would give it `/tmp` back; that is not done here.
+
+**Rejected.** Keeping the AST gate's read of `/tmp` and moving only the
+gate into staging's committed view: the installs and the writer's
+validation have the same shape in other trees, and a per-call-site move
+leaves the next caller to repeat it. The grant now derives the answer
+from the tree.
 
 ### A confined command's processes end with it
 
