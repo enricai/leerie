@@ -54754,28 +54754,11 @@ def _git_paths_at(repo: str | Path, sha: str) -> set[str]:
     return _PATHS_AT[key]
 
 
-def _probe_case_facts(tree: str | Path, probe: str | Path,
-                      case: str, *, grants: WorkerGrants) -> dict:
-    """The AST facts of one test case (`scripts/test-case-facts.cjs`, run
-    in the installed `tree` so its own `typescript` is tried first), or
-    `{"error": ...}` — one starting `facts_failed` when the script itself
-    could not run (an infrastructure miss, not a fact about the probe)."""
-    try:
-        r = _ts_script_run(["node", str(TEST_CASE_FACTS), str(probe), case],
-                           tree=tree, grants=grants, timeout=120, text=True)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return {"error": f"facts_failed: {type(e).__name__}"}
-    try:
-        out = json.loads(r.stdout)
-    except ValueError:
-        return {"error": "facts_failed", "stderr": r.stderr[-500:]}
-    return out if isinstance(out, dict) else {"error": "facts_failed"}
-
-
 async def _probe_case_facts_placed(st: "State", tree: str | Path, src: str,
                                    rel: str, case: str) -> dict:
-    """`_probe_case_facts` of a probe that is never on disk in `tree`: the
-    facts script runs in a held-out sandbox over `tree`, alone, the probe
+    """The AST facts of one test case (`scripts/test-case-facts.cjs`, run in
+    the installed `tree` so its own `typescript` is tried first), of a probe
+    that is never on disk in `tree`: the facts script runs in a held-out sandbox over `tree`, alone, the probe
     (`src`) placed at `rel`, its JSON written to the sandbox's report
     (DESIGN §6 *A held-out evaluation runs alone*; a falsifier's probe is
     held-out content). `{"error": "facts_failed…"}` when the script could

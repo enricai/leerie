@@ -63,6 +63,17 @@ def _held(leerie, fn, *args, **kw):
     return asyncio.run(go())
 
 
+def _placed_facts(leerie, tmp_path: Path, tree: Path, src: Path, rel: str,
+                  case: str) -> dict:
+    """The facts of `case` in the probe `src`, placed at `rel` in a held-out
+    sandbox over `tree` (`_probe_case_facts_placed`), as the falsifier reads
+    them: the probe is never on disk in `tree`."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    return asyncio.run(leerie._probe_case_facts_placed(st, tree, str(src),
+                                                       rel, case))
+
+
 @pytest.fixture(autouse=True)
 def _quiet_host(leerie, monkeypatch):
     # B*'s gate reads the host's PSI; pin it quiet so a loaded host cannot
@@ -680,8 +691,7 @@ class TestCouplingPolicy:
         tree = tmp_path / "tree"
         (tree / "node_modules").mkdir(parents=True)
         os.symlink(_ts_dir(), tree / "node_modules" / "typescript")
-        probe = tree / "probe" / "x.test.ts"
-        probe.parent.mkdir()
+        probe = tmp_path / "probe-src.test.ts"
         probe.write_text(
             "import { readFileSync } from 'fs';\n"
             "import { publicFn } from '../src/lib';\n"
@@ -694,8 +704,9 @@ class TestCouplingPolicy:
             "  });\n"
             "  it('other', () => { unused(); });\n"
             "});\n")
-        facts = _held(leerie, leerie._probe_case_facts, tree, probe,
-                                         "math add returns the sum", grants=leerie.WorkerGrants(("/",), ()))
+        facts = _placed_facts(leerie, tmp_path, tree, probe, "probe/x.test.ts",
+                              "math add returns the sum")
+        assert not (tree / "probe").exists()
         assert facts["title"] == "add returns the sum"
         reach = " ".join(facts["reach_src"])
         assert "expect(helper()).toContain('x');" in reach
@@ -713,8 +724,11 @@ class TestCouplingPolicy:
         assert _held(leerie, leerie._ts_resolvable, tmp_path / "probe-less", grants=leerie.WorkerGrants(("/",), ())) is False
 
     def test_facts_failure_is_an_error_not_a_crash(self, leerie, tmp_path):
-        assert "error" in _held(leerie, leerie._probe_case_facts, 
-            tmp_path, tmp_path / "missing.test.ts", "x", grants=leerie.WorkerGrants(("/",), ()))
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        assert "error" in _placed_facts(leerie, tmp_path, tree,
+                                        tmp_path / "missing.test.ts",
+                                        "probe/missing.test.ts", "x")
 
 
 # === the bundled typescript fallback =======================================
@@ -731,8 +745,8 @@ def _ts7_tree(root: Path) -> Path:
                     "./package.json": "./package.json"}}))
     (pkg / "lib" / "version.cjs").write_text(
         "module.exports = { version: '7.0.2' };\n")
-    probe = root / "probe" / "x.test.ts"
-    probe.parent.mkdir()
+    # The probe's source, outside the tree: the facts read places it.
+    probe = root.parent / "probe-src.test.ts"
     probe.write_text("describe('m', () => {\n"
                      "  it('keeps the sum', () => {\n"
                      "    expect(add(2, 3)).toBe(5);\n  });\n});\n")
@@ -749,8 +763,8 @@ def test_ts7_tree_without_a_bundle_is_unavailable(leerie, tmp_path,
     assert subprocess.run(["node", "-e", "require.resolve('typescript')"],
                           cwd=tree, check=False).returncode == 0
     assert _held(leerie, leerie._ts_resolvable, tree, grants=leerie.WorkerGrants(("/",), ())) is False
-    facts = _held(leerie, leerie._probe_case_facts, tree, tree / "probe" / "x.test.ts",
-                                     "m keeps the sum", grants=leerie.WorkerGrants(("/",), ()))
+    facts = _placed_facts(leerie, tmp_path, tree, tmp_path / "probe-src.test.ts",
+                          "probe/x.test.ts", "m keeps the sum")
     assert facts["error"] == "facts_failed"
 
 
@@ -767,8 +781,8 @@ def test_ts7_tree_falls_back_to_the_bundled_typescript(leerie, tmp_path,
                        env=leerie._ts_script_env(), capture_output=True,
                        text=True, check=False)
     assert r.stdout.strip() == "bundled", r.stderr
-    facts = _held(leerie, leerie._probe_case_facts, tree, tree / "probe" / "x.test.ts",
-                                     "m keeps the sum", grants=leerie.WorkerGrants(("/",), ()))
+    facts = _placed_facts(leerie, tmp_path, tree, tmp_path / "probe-src.test.ts",
+                          "probe/x.test.ts", "m keeps the sum")
     assert "error" not in facts, facts
     assert facts["title"] == "keeps the sum"
     assert "expect(add(2, 3)).toBe(5);" in " ".join(facts["reach_src"])

@@ -4013,17 +4013,17 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   (`SETUP_HOOK_KIND`), `_run_mise_install` (`TOOLCHAIN_KIND`, one grant for
   `mise install` and `mise ls --current --json`, the latter through
   `run_proc(_confined_argv(…))`). The AST scripts take `grants` too:
-  `_probe_case_facts(tree, probe, case, *, grants)` (a probe on disk;
-  the falsifier's is never, and goes through `_probe_case_facts_placed`),
   `_ts_resolvable(tree, *, grants)`, `_redrive_ast_hits(staging, base,
   head, *, grants)`, via `_redrive_ast_available(staging, *, grants)` and
   `_redrive_escalation_gate(staging, base, head, *, grants)`. They spawn
   synchronously (`_ts_script_run`), so they cannot wait for the execution
   lock: every coroutine that calls one holds `_exec_lock().shared()`
-  around the call (the falsifier's `_ts_resolvable` and
-  `_probe_case_facts`, the re-drive's `_redrive_ast_available` and
+  around the call (the falsifier's `_ts_resolvable`, the re-drive's `_redrive_ast_available` and
   `_redrive_escalation_gate`), and `_ts_script_run` `die()`s, before
   spawning, when its context holds neither level (`_exec_lock_held()`).
+  The falsifier's AST facts (`_probe_case_facts_placed`) are not among
+  them: its probe is never on disk in the tree, so the facts script runs
+  in a held-out sandbox through `_run_streaming`, the probe placed.
 - Reports a measured command writes are under `_measure_dir(st, tree)`:
   `_run_acceptance_file`'s and `_acceptance_parse_probe`'s
   `reports/<label>-…` (written inside the held-out sandbox and copied out

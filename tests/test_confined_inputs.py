@@ -160,8 +160,8 @@ def test_an_ast_script_without_the_execution_lock_stops_the_run(leerie,
 def test_every_ast_script_caller_holds_the_execution_lock():
     """By rule over the module: every call that reaches `_ts_script_run`
     from a coroutine sits inside `async with _exec_lock().shared()`. The
-    synchronous helpers between (`_ts_resolvable`, `_probe_case_facts`,
-    `_redrive_ast_*`) are followed to the coroutine that calls them."""
+    synchronous helpers between (`_ts_resolvable`, `_redrive_ast_*`) are
+    followed to the coroutine that calls them."""
     tree = ast.parse(LEERIE_PY.read_text())
     funcs = _top_level(tree)
 
@@ -180,7 +180,7 @@ def test_every_ast_script_caller_holds_the_execution_lock():
                 reach.add(name)
                 changed = True
     sync_reach = reach - {"_ts_script_run"}
-    assert {"_ts_resolvable", "_probe_case_facts", "_redrive_ast_hits",
+    assert {"_ts_resolvable", "_redrive_ast_hits",
             "_redrive_ast_available", "_redrive_escalation_gate"} <= reach
     bad = []
     for name, fn in funcs.items():

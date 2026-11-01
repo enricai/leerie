@@ -5665,7 +5665,8 @@ a repo read as rejected. `scripts/load-typescript.cjs` loads the tree's own
 copy only when `typeof ts.createSourceFile === 'function'`, else the pinned
 copy at `BUNDLED_TYPESCRIPT`. `tests/test_delivery_detection.py` builds a fake
 TS7-shaped package (`_ts7_tree`): without a bundle `_ts_resolvable` is False
-and `_probe_case_facts` returns `facts_failed`; with `BUNDLED_TYPESCRIPT`
+and `_probe_case_facts_placed` (the probe placed in a held-out sandbox)
+returns `facts_failed`; with `BUNDLED_TYPESCRIPT`
 pointed at the test's typescript the loader reports `bundled` and the facts
 come out; `tests/test_delivery_redrive.py::TestAstGate::test_ts7_tree_runs_on_the_bundled_typescript`
 does the same for gate (d+). `TestFalsifierGates::test_a_facts_script_failure_is_its_own_gate_not_a_rejection`
