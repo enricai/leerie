@@ -6304,6 +6304,18 @@ finding's EROFS without it.
   Live-falsified on the host and in the container (rootless): the install
   entry back on `MEASURE_KIND`, the prerequisite without `INSTALL_KIND`,
   and every kind given egress, each turned its own tests red.
+- `tests/test_user_scripts_on_path.py` (5 test functions; DESIGN §6
+  *Which stores an install may share*, a moved user base's scripts on
+  `PATH`): `_with_user_scripts` appending `<base>/bin` last in place of the
+  replaced base's, never doubled, leaving a baked base and a `PATH`-less
+  env alone; `_leerie_stores`, `_worker_cache_env` and `_tree_stores_for`
+  executed in turn, each `PATH` ending in its own base's `bin`; under real
+  Landlock, a measurement of a run tree running by name a script an
+  install-kind command put in that tree's user base. In a runtime that can
+  isolate: a real `pip install` defaulting to the user base, with no "not
+  on PATH" warning, and its console script then run by a measurement.
+  Live-falsified on the host and in the container: `_tree_store_env`
+  without the call turned 2 host tests and 3 container tests red.
 - `tests/test_heldout_sandbox_preflight.py` (10 test functions, 22 cases):
   `_sandbox_fix` on the shim's measured failure lines (and the specific
   `setgroups` rule winning over the generic `EACCES` one), the gate's die

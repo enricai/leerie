@@ -5930,6 +5930,7 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
             break
     else:
         return
+    user_base = env.get("PYTHONUSERBASE")
     for var in _TREE_STORE_VARS:
         if (env.get(var) or "").startswith(_BAKED_ROOT):
             continue
@@ -5938,6 +5939,7 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
             _mkdir_private(dst, root.parent.parent)
         env[var] = str(dst)
     _with_pnpm_spellings(env)
+    _with_user_scripts(env, user_base)
 
 
 def _tree_stores_for(env: Mapping[str, str], cwd: str | Path | None
@@ -6001,6 +6003,26 @@ async def _seed_pnpm_pin(st: "State", stage: Path, log_path: Path,
             f"({type(ex).__name__}) — corepack will resolve its own")
 
 
+def _with_user_scripts(env: MutableMapping[str, str],
+                       previous: str | None) -> None:
+    """Put the console scripts of the pip user base `env` names on its
+    `PATH`, last, in place of those of the base it replaced (`previous`):
+    pip installs a package's scripts in `<user base>/bin`, which only `PATH`
+    finds, and the image puts the default base's `~/.local/bin` last for
+    that (DESIGN §6 *Which stores an install may share*). Last, so a
+    user-installed script never shadows a tool the image baked. A base
+    leerie did not move, or one beneath the bake root, is left alone."""
+    base = env.get("PYTHONUSERBASE") or ""
+    if (base == (previous or "") or base.startswith(_BAKED_ROOT)
+            or "PATH" not in env):
+        return
+    old = os.path.join(previous, "bin") if previous else None
+    new = os.path.join(base, "bin")
+    parts = [p for p in env["PATH"].split(os.pathsep)
+             if p and p != old and p != new]
+    env["PATH"] = os.pathsep.join([*parts, new])
+
+
 def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
     """Point every `_STORE_VARS` variable of `env` at leerie's own store,
     `<state-root>/.stores/leerie/<name>`, made here (a value beneath the
@@ -6008,6 +6030,7 @@ def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
     read or write them; a worker's environment replaces every one
     (`_worker_cache_env`), so nothing a worker can write reaches them."""
     root = Path(state_root) / ".stores" / "leerie"
+    user_base = env.get("PYTHONUSERBASE")
     for var, name in _STORE_VARS.items():
         if (env.get(var) or "").startswith(_BAKED_ROOT):
             continue
@@ -6015,6 +6038,7 @@ def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
         d.mkdir(parents=True, exist_ok=True)
         env[var] = str(d)
     _with_pnpm_spellings(env)
+    _with_user_scripts(env, user_base)
 
 
 def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
@@ -6037,6 +6061,7 @@ def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
     for k in _COPY_IMPORT_ENV:
         out.pop(k, None)
     _with_pnpm_spellings(out)
+    _with_user_scripts(out, env.get("PYTHONUSERBASE"))
     return out
 
 

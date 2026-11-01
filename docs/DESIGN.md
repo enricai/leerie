@@ -5986,6 +5986,20 @@ in exactly one):
   restore` failed needing `~/.dotnet`; bundler warned and fell back to a
   temporary home. npm, yarn, bun, uv, cargo, go and composer needed no
   `$HOME` write once their store variables were set.
+  A user base carries one more property than its files: pip puts a
+  package's console scripts in `<user base>/bin`, which only `PATH` finds,
+  and the image has the default base's `~/.local/bin` last on `PATH` for
+  that. Relocated, the scripts were on no `PATH`: measured on a real run of
+  a pytest repository once its install reached PyPI (*An install reaches
+  its inputs*), pip installed pytest into the view's user base, warned
+  "installed in '…/pyuser/bin' which is not on PATH", and every test run
+  read `pytest: command not found`, so the base and every test axis went
+  unmeasured. *Wherever leerie points `PYTHONUSERBASE`, `PATH` carries its
+  `bin`, last* (`_with_user_scripts`, in `_leerie_stores`,
+  `_worker_cache_env` and `_tree_store_env`), in place of the value it
+  replaces, and after the image's tools, so a user-installed script never
+  shadows a baked one. A value beneath the bake root is the image's and is
+  left alone.
 
 The measurement grant gives a confined install exactly this: the fetched
 stores read-only, the verified ones writable, and its own tree's
