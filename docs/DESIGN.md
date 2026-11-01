@@ -2845,6 +2845,7 @@ enforce, which a measurement reads as "could not measure", never a pass.
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
 | *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR`; `mise-state/` emptied first | write |
 | *store-fetch kind* (`_populate_leerie_store`, in its staging directory) | also leerie's store, its store variables left pointing there | write |
+| *install kind* (every install leerie runs: a recipe's `install` entries, CI parity's prerequisites, `_install_settles`) | nothing more on disk; the outside network through the egress proxy (*A confined process has its own network*, *An install reaches its inputs*) | — |
 
 Nothing else is granted: not `state.json`, `acceptance/`, `logs/`,
 `workers/`, `repo-settings/`, another tree's repository in `tree-repos/`,
@@ -3326,12 +3327,13 @@ so it is the command's own too. A process that needs the outside network
 gets it from its grant (`WorkerGrants.egress`):
 
 - **Who.** Every worker (the API, WebFetch, the fetches its shell runs),
-  and the kinds that fetch: the setup hook, the toolchain install, the
-  store fetch (`SETUP_HOOK_KIND`, `TOOLCHAIN_KIND`, `STORE_FETCH_KIND`).
-  A measurement (`MEASURE_KIND`: build, lint, tests, a view's offline
-  install from leerie's stores, verify, CI parity, coverage, the AST
-  scripts) and a held-out evaluation reach nothing beyond their own
-  loopback.
+  and the kinds that fetch: every install leerie runs on a repository's
+  code (`INSTALL_KIND`, *An install reaches its inputs*, below), the setup
+  hook, the toolchain install, the store fetch (`SETUP_HOOK_KIND`,
+  `TOOLCHAIN_KIND`, `STORE_FETCH_KIND`). A measurement (`MEASURE_KIND`:
+  build, lint, tests, a recipe's `build` entry, verify, CI parity's
+  checks, coverage, the AST scripts) and a held-out evaluation reach
+  nothing beyond their own loopback.
 - **How.** The orchestrator runs an egress proxy (`_EgressProxy`, on its
   own thread and event loop, so a synchronous spawn never stalls it) on a
   unix socket in a 0700 directory it owns under `/tmp/l/`. The container's
@@ -3366,6 +3368,39 @@ design: inside the namespace there is no route and no resolver. The
 measured list is in IMPLEMENTATION *The egress proxy*. A repository whose
 tests reach the internet fails in a measurement as it would on an offline
 CI runner; a measurement measures the committed view, not the network.
+
+**An install reaches its inputs.** *Found 2026-11-01 (review round 22,
+execution H3); decided the same day.* When the network namespaces above
+landed, every install leerie runs in a tree ran as a measurement, with no
+network, on the assumption that a view installs offline from leerie's
+stores. That holds only where a store fetch filled the store first
+(`_STORE_FETCH`: pnpm, npm, yarn, bun, go, composer); pip, uv, poetry,
+pipenv, cargo, bundler and NuGet have none, and some cannot have one that
+runs no committed code (*Which stores an install may share*). Measured on
+a real run of a pytest repository: the recipe's `pip install` failed
+name resolution in every view — the base baseline, each subtask's
+coverage install, the final conformance and the falsifier's checkout —
+so nothing was measured and the run ended `unconverged` for a reason
+that had nothing to do with its change. **Root cause:** the network rule
+treated an install as a measurement, so whether an install could reach
+its inputs depended on a store contract six managers meet and the rest do
+not. **Invariant: every install leerie runs on a repository's code can
+reach its inputs.** An install is its own grant kind, `INSTALL_KIND`:
+the measurement grant (the tree, its measurement directory, its own
+stores and the verified stores written; leerie's fetched stores read
+only, still filled by the script-free fetch alone) with egress through
+the proxy. It runs repository code a worker already runs with egress —
+a `postinstall`, a `setup.py` — and the proxy refuses every destination
+inside the container, so it reaches nothing a worker cannot. It is every
+install, wherever it runs: a recipe's `install` entries in
+`_ensure_worktree_deps` (a committed view, the baseline, the acceptance
+writer's, the surrogate's and the falsifier's checkouts, CI parity's
+tree, the re-drive's and integration trees), CI parity's prerequisites
+(the setup steps its checks depend on: a code generator, a browser or a
+sub-directory install), and a `settle_by: install` gap's re-install
+(`_install_settles`). What is measured keeps no network: a recipe's
+`build` entry, the build, lint and test commands, CI parity's checks,
+coverage, `verify`, the AST scripts and every held-out run.
 
 **What it replaces.** The socket-only test database (*No database server
 leerie starts is ever unconfined*): it listened on no TCP address because
@@ -3680,8 +3715,8 @@ services for confined processes on purpose, and only the processes they
 serve can name them: every confined process has a `/tmp` of its own, and
 the shim carries the proxy's directory, read-only, into a process only when
 its grant has `egress` (`_confined_argv`'s `--egress`/`--forward`, the
-shim's `isolate(…, sockets=)`) — every worker, and the toolchain, setup-hook
-and store-fetch kinds of a repository command. A measurement
+shim's `isolate(…, sockets=)`) — every worker, and the install, toolchain,
+setup-hook and store-fetch kinds of a repository command. A measurement
 (`MEASURE_KIND`) and a held-out sandbox get no egress, so neither can name
 them. The strict-output proxy listens on the orchestrator's loopback TCP,
 outside every confined process's network namespace; a worker reaches it
@@ -5867,7 +5902,9 @@ the store's file from 3,284 to 3,305 bytes. Two measures close it:
   view hard-link is gone.
 
 The install still runs the repository's scripts, as it must to measure
-them; the measurement grant confines it (*Leerie's runs of the
+them; the install grant confines it — the measurement grant on disk, with
+the network through the egress proxy (§6 *An install reaches its
+inputs*) (*Leerie's runs of the
 repository's commands are confined too*), and with the store already
 filled it can run against a store it may only read (measured: a
 Landlock-confined `pnpm install` with the store read-only succeeds,

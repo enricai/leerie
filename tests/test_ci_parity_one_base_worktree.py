@@ -33,12 +33,17 @@ def _drive(leerie, env, monkeypatch, tmp_path):
     async def no_deps(*a, **k):
         return True
 
-    async def fake_run(argv, *, tree, rec, st, caps, label):
+    async def fake_run(argv, *, tree, rec, st, caps, label,
+                       kind=leerie.MEASURE_KIND):
         # A pass that reads 0.000 s is charged everything left, by design.
         await leerie.asyncio.sleep(0.01)
         if "-pre" in label:
+            # A prerequisite sets the tree up, as an install (DESIGN §6 *An
+            # install reaches its inputs*); a check is measured.
+            assert kind == leerie.INSTALL_KIND
             pre_runs.append(label)
             return {"rc": 0, "passed": True, "timed_out": False}
+        assert kind == leerie.MEASURE_KIND
         bad = "confirm-base" not in label
         return {"rc": 1 if bad else 0, "passed": not bad, "timed_out": False}
 

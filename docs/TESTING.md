@@ -6286,6 +6286,24 @@ finding's EROFS without it.
   worker's tree untouched). Live-falsified in the container, one mechanism
   at a time: no network namespace, the proxy refusing nothing, placement
   following links before the read-only remount.
+- `tests/test_install_reaches_inputs.py` (9 test functions; DESIGN §6 *An
+  install reaches its inputs*; review round 22 execution H3). Anywhere:
+  `INSTALL_KIND` is `MEASURE_KIND`'s grant with `egress` and nothing else
+  (leerie's fetched stores still read-only); the consumers executed — a
+  recipe's `install` entries get egress and its `build` entry none
+  (`_ensure_worktree_deps`), CI parity's recipe install and prerequisites
+  get it and its check none (`_ci_prepare`, `_ci_run`), a `settle_by:
+  install` re-install gets it and a coverage run none (`_install_settles`,
+  `_cov_contained`); a rule over `leerie.py`: every function that reads a
+  recipe's install entries or a check's prerequisites and spawns names
+  `INSTALL_KIND` (leerie's own store fetch aside), and no other function
+  names it, with the rule checked on a synthetic module. In a runtime
+  that can isolate: a pip recipe in a committed view installs from PyPI
+  through leerie's real egress proxy, while its `build` entry and a plain
+  measurement of the same view, running the same download, reach nothing.
+  Live-falsified on the host and in the container (rootless): the install
+  entry back on `MEASURE_KIND`, the prerequisite without `INSTALL_KIND`,
+  and every kind given egress, each turned its own tests red.
 - `tests/test_heldout_sandbox_preflight.py` (10 test functions, 22 cases):
   `_sandbox_fix` on the shim's measured failure lines (and the specific
   `setgroups` rule winning over the generic `EACCES` one), the gate's die

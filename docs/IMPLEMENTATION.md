@@ -3979,7 +3979,11 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `TOOLCHAIN_KIND = "toolchain"`, `STORE_FETCH_KIND = "store_fetch"`
   (`_populate_leerie_store`'s fetch: also `rw` `<state-root>/.stores/leerie`;
   its store variables are leerie's, as every kind's are: no grant's `env`
-  holds one). `die()`s when `st` has no `run_dir`, or
+  holds one), `INSTALL_KIND = "install"` (every install leerie runs on a
+  repository's code: `MEASURE_KIND`'s paths and `env` unchanged — the
+  fetched stores still `ro` — with `egress` True; DESIGN §6 *An install
+  reaches its inputs*); `MEASUREMENT_KINDS` is the five, the only `kind`
+  values `_measurement_grants` accepts (`ValueError` otherwise). `die()`s when `st` has no `run_dir`, or
   when the tree holds or lies beneath one of `_MEASURE_PRIVATE`
   (`state.json`, `acceptance`, `logs`, `workers`, `tree-stores`, `tmp`,
   `repo-settings`, `tree-repos`, `repo`, `measure` under the run
@@ -4085,10 +4089,16 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   transcript (`_is_worker_transcript`; DESIGN §8 *What a worker ran is
   read from its own transcript*).
   `_measure_blt(axis, cmd, tree, *, grants, …)` passes its caller's.
-  Callers derive the grant for the tree they run in: `_ensure_worktree_deps`,
-  `_measure_axes`, `_capture_failing_test_ids`, `_ci_run`,
+  Callers derive the grant for the tree they run in: `_ensure_worktree_deps`
+  (`INSTALL_KIND` for a recipe `install` entry, `MEASURE_KIND` for a
+  `build` entry, each derived at the first entry of its kind),
+  `_measure_axes`, `_capture_failing_test_ids`,
+  `_ci_run(argv, *, tree, rec, st, caps, label, kind=MEASURE_KIND)`
+  (`_ci_prepare` passes `INSTALL_KIND` for a check's prerequisites;
+  every check runs `MEASURE_KIND`),
   `_acceptance_parse_probe`, `_run_acceptance_file`, `_cov_contained`
-  (the tree's git toplevel), `_settle_by_execution`, `_run_setup_hook`
+  (the tree's git toplevel; `kind=MEASURE_KIND`, `INSTALL_KIND` from
+  `_install_settles`), `_settle_by_execution`, `_run_setup_hook`
   (`SETUP_HOOK_KIND`), `_run_mise_install` (`TOOLCHAIN_KIND`, one grant for
   `mise install` and `mise ls --current --json`, the latter through
   `run_proc(_confined_argv(…))`). The AST scripts take `grants` too:
@@ -4492,7 +4502,8 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
 
 - `WorkerGrants.egress: bool = False` (the fourth field): `True` from
   `_worker_grants` (every worker) and from `_measurement_grants` for
-  every kind but `MEASURE_KIND`; `_heldout_grants` keeps
+  every kind but `MEASURE_KIND` (`INSTALL_KIND`, `SETUP_HOOK_KIND`,
+  `TOOLCHAIN_KIND`, `STORE_FETCH_KIND`); `_heldout_grants` keeps
   `_measurement_grants(st, tree)`'s `False`.
 - `ISOLATE_ENV = "LEERIE_ISOLATED"`. `_require_heldout_sandbox(run_dir)` sets
   `os.environ[ISOLATE_ENV] = "1"` after its checks pass, so every later

@@ -23811,6 +23811,14 @@ TOOLCHAIN_KIND = "toolchain"
 # writes leerie's store, the one writer it has, and keeps its store
 # variables pointing there.
 STORE_FETCH_KIND = "store_fetch"
+# Every install leerie runs on a repository's code (a recipe's `install`
+# entries, CI parity's prerequisites, `_install_settles`): a measurement's
+# grant on disk, with the outside network through the egress proxy, so
+# whatever manager the recipe names reaches its inputs (DESIGN §6 *An
+# install reaches its inputs*).
+INSTALL_KIND = "install"
+MEASUREMENT_KINDS = (MEASURE_KIND, INSTALL_KIND, SETUP_HOOK_KIND,
+                     TOOLCHAIN_KIND, STORE_FETCH_KIND)
 MEASURE_DIRNAME = "measure"
 # Where `_tree_store_env` puts a run tree's own installer stores.
 TREE_STORES_DIRNAME = "tree-stores"
@@ -24392,6 +24400,7 @@ def _measurement_grants(st: "State", tree: str | Path,
     by class (DESIGN §6 *Which stores an install may share*): the fetched
     stores read only, the verified ones (`_VERIFIED_STORE_VARS`) and the
     tree's own (`<run>/tree-stores/<tree>/`, `_tree_store_env`) written.
+    `INSTALL_KIND` is `MEASURE_KIND` with egress.
     `SETUP_HOOK_KIND` also writes `MISE_DATA_DIR` and `~/.local/bin`,
     `TOOLCHAIN_KIND` `MISE_DATA_DIR` with its trust records
     (`MISE_STATE_DIR`) emptied first; `STORE_FETCH_KIND` leerie's stores
@@ -24402,8 +24411,7 @@ def _measurement_grants(st: "State", tree: str | Path,
     `_tree_store_env` set them. `/tmp` itself is never granted: an isolated
     command's own is added by the shim (DESIGN §6 *Every confined process
     has its own `/tmp`, `/dev/shm` and IPC*)."""
-    if kind not in (MEASURE_KIND, SETUP_HOOK_KIND, TOOLCHAIN_KIND,
-                    STORE_FETCH_KIND):
+    if kind not in MEASUREMENT_KINDS:
         raise ValueError(f"no measurement kind {kind!r}")
     run_dir = _run_dir_of(st)
     state_root = run_dir.parent.parent
@@ -24496,9 +24504,10 @@ def _measurement_grants(st: "State", tree: str | Path,
             env[f"npm_config_{k}"] = v
             env[f"pnpm_config_{k}"] = v
     # A measurement reaches nothing outside its own loopback; the kinds
-    # that fetch (a toolchain, the setup hook, leerie's store fetch) reach
-    # the outside through the egress proxy (DESIGN §6 *A confined process
-    # has its own network*).
+    # that fetch (an install, a toolchain, the setup hook, leerie's store
+    # fetch) reach the outside through the egress proxy (DESIGN §6 *A
+    # confined process has its own network*, *An install reaches its
+    # inputs*).
     return WorkerGrants(
         tuple(dict.fromkeys(_around(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
@@ -43449,9 +43458,11 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     # it*): a relocked lockfile is put back, an unignored generated file
     # goes; installed dependencies, being ignored, stay.
     # Confined to the tree and its own temp and caches (DESIGN §6 *Leerie's
-    # runs of the repository's commands are confined too*), derived at the
-    # first entry that runs.
-    grants: WorkerGrants | None = None
+    # runs of the repository's commands are confined too*), each kind's
+    # derived at the first entry of that kind: an `install` entry reaches
+    # its inputs through the egress proxy, a `build` entry is measured and
+    # reaches nothing (DESIGN §6 *An install reaches its inputs*).
+    entry_grants: dict[str, WorkerGrants] = {}
     async with _leaves_tree_as_found(tree, "install/build", log_prefix):
         for e in recipe:
             if (e.get("kind") not in ("install", "build")
@@ -43493,10 +43504,13 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                     f"{' '.join(e['command'])}")
                 continue
             try:
-                if grants is None:
-                    grants = _measurement_grants(st, tree)
+                kind = (INSTALL_KIND if e.get("kind") == "install"
+                        else MEASURE_KIND)
+                if kind not in entry_grants:
+                    entry_grants[kind] = _measurement_grants(st, tree, kind)
                 rc, _tail = await _run_streaming(
-                    argv, grants=grants, cwd=str(wd), env=entry_env,
+                    argv, grants=entry_grants[kind], cwd=str(wd),
+                    env=entry_env,
                     timeout=_recipe_timeout_s(
                         e, caps.get("worker_timeout_sec")),
                     log_path=log_path,
@@ -47042,12 +47056,13 @@ def _ci_teardown(st: "State", wt: Path) -> None:
 
 
 async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
-                  caps: dict, label: str) -> dict:
+                  caps: dict, label: str, kind: str = MEASURE_KIND) -> dict:
     """Run one check argv in `tree` — exec'd directly, spawn-held in a broker
     cgroup at the worker caps, holding a host build slot (DESIGN §6). Its
     whole output lands in a log file of its own (read back for the
     diagnostic ratchet). Returns `{rc, passed, timed_out, dirty, log}`; a
-    run that changed tracked files is reset."""
+    run that changed tracked files is reset. `kind`: a check is measured
+    (`MEASURE_KIND`); a prerequisite sets the tree up (`INSTALL_KIND`)."""
     cwd = tree / (rec.get("cwd") or ".")
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("PRISMA_USER_CONSENT")}
@@ -47084,8 +47099,8 @@ async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
     try:
         async with _build_class_slot(st, label=f"ci {label}"):
             run = await _run_contained(
-                argv, grants=_measurement_grants(st, tree), cwd=str(cwd),
-                name=f"ci-{label}"[:60], run_id=st.run_id,
+                argv, grants=_measurement_grants(st, tree, kind),
+                cwd=str(cwd), name=f"ci-{label}"[:60], run_id=st.run_id,
                 memory_max_bytes=int(caps.get("worker_memory_max_bytes") or 0),
                 pids_max=int(caps.get("worker_pids_max") or 0),
                 timeout=max(1.0, timeout), log_path=log_path,
@@ -47126,12 +47141,16 @@ async def _ci_prepare(tree: Path, recs: list[dict], st: "State", caps: dict,
             if key in done or not pre.get("argv"):
                 continue
             done.add(key)
+            # A prerequisite sets the tree up — a code generator, a browser
+            # or a sub-directory install — and reaches its inputs as an
+            # install does (DESIGN §6 *An install reaches its inputs*).
             await _ci_run(pre["argv"], tree=tree,
                           rec={"cwd": pre.get("cwd") or ".",
                                "env": rec.get("env"),
                                "requires": rec.get("requires")},
                           st=st, caps=caps,
-                          label=f"{side}-{rec['id']}-pre{j}")
+                          label=f"{side}-{rec['id']}-pre{j}",
+                          kind=INSTALL_KIND)
 
 
 async def _ci_discover(staging: Path, st: "State", caps: dict,
@@ -60908,13 +60927,15 @@ async def _changed_line_numbers(tree: Path, base_ref: str,
 
 async def _cov_contained(argv: list[str], *, tree: Path, st: "State",
                          caps: dict, sid: str, tag: str,
-                         log_path: Path | None = None) -> dict:
+                         log_path: Path | None = None,
+                         kind: str = MEASURE_KIND) -> dict:
     """Run one coverage/settle command in `tree`, spawn-held in a broker
     cgroup at the worker caps, holding a host build slot (DESIGN §6). The
     subtask's worktree is left as the command found it, apart from ignored
     files (`_leaves_tree_as_found` over its repository root, so an install
     in a `working_dir` is covered too). Output goes to the subtask's
-    coverage log unless `log_path` names another."""
+    coverage log unless `log_path` names another. `kind`: `INSTALL_KIND`
+    for an install (`_install_settles`), else measured."""
     name = _CGROUP_NAME_UNSAFE_RE.sub("-", f"cov-{sid}-{tag}")[:60]
     if log_path is None:
         log_path = st.run_dir / "logs" / f"coverage-{sid}.log"
@@ -60936,7 +60957,8 @@ async def _cov_contained(argv: list[str], *, tree: Path, st: "State",
                                          f"coverage {sid}"), \
                 _build_class_slot(st, label=f"coverage {sid} {tag}"):
             run = await _run_contained(
-                argv, grants=_measurement_grants(st, root), cwd=str(tree),
+                argv, grants=_measurement_grants(st, root, kind),
+                cwd=str(tree),
                 name=name, run_id=st.run_id,
                 memory_max_bytes=int(caps.get("worker_memory_max_bytes") or 0),
                 pids_max=int(caps.get("worker_pids_max") or 0),
@@ -61183,7 +61205,8 @@ async def _install_settles(tree: Path, *, st: "State", caps: dict,
     for e in entries:
         run = await _cov_contained([str(a) for a in e["command"]],
                                    tree=tree / (e.get("working_dir") or "."),
-                                   st=st, caps=caps, sid=sid, tag="install")
+                                   st=st, caps=caps, sid=sid, tag="install",
+                                   kind=INSTALL_KIND)
         if run.get("rc") != 0:
             return False
     return True

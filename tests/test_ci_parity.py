@@ -585,7 +585,8 @@ def _fake_ci(leerie, monkeypatch, tmp_path, durations, fails):
     `fails`. Records the timeout each run was handed."""
     seen: list[tuple[str, str, float]] = []
 
-    async def fake_run(argv, *, tree, rec, st, caps, label):
+    async def fake_run(argv, *, tree, rec, st, caps, label,
+                       kind=leerie.MEASURE_KIND):
         side = "base" if "confirm-base" in label else "final"
         t = float(caps["worker_timeout_sec"])
         seen.append((side, rec["id"], t))

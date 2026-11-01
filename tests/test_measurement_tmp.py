@@ -114,8 +114,7 @@ def test_no_grant_names_tmp_itself(leerie, run):
     process's own is added by the shim. Unisolated, as here, a measured
     command writes its private temp directory and not `/tmp`."""
     st, view = _st(run), _view(run)
-    for kind in (leerie.MEASURE_KIND, leerie.SETUP_HOOK_KIND,
-                 leerie.TOOLCHAIN_KIND, leerie.STORE_FETCH_KIND):
+    for kind in leerie.MEASUREMENT_KINDS:
         g = leerie._measurement_grants(st, view, kind)
         assert "/tmp" not in g.rw + g.ro, kind
         assert "/tmp" not in _rw_of(leerie._confined_argv(g, ["true"]))

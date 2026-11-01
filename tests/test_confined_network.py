@@ -278,9 +278,9 @@ def test_kinds_that_fetch_get_egress_and_a_measurement_does_not(leerie, run):
     st = _St(run["user"], run["run_dir"])
     view = run["wts"][f"{run['run_dir'].name}-view-staging"]
     got = {k: leerie._measurement_grants(st, view, k).egress
-           for k in (leerie.MEASURE_KIND, leerie.SETUP_HOOK_KIND,
-                     leerie.TOOLCHAIN_KIND, leerie.STORE_FETCH_KIND)}
-    assert got == {leerie.MEASURE_KIND: False, leerie.SETUP_HOOK_KIND: True,
+           for k in leerie.MEASUREMENT_KINDS}
+    assert got == {leerie.MEASURE_KIND: False, leerie.INSTALL_KIND: True,
+                   leerie.SETUP_HOOK_KIND: True,
                    leerie.TOOLCHAIN_KIND: True,
                    leerie.STORE_FETCH_KIND: True}
     assert leerie._heldout_grants(st, view).egress is False
