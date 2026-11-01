@@ -144,9 +144,6 @@ def test_bare_resume_picks_this_layouts_run_over_a_newer_old_one(
 def test_phase_on_an_old_layout_is_refused_before_its_workers(
         leerie, repo, monkeypatch, capsys):
     d = _make_run(repo, "old-run", "2026-01-01T00:00:00+00:00")
-    # `--phase` takes the run's lock twice in one process (see
-    # tests/test_main_exception_arms.py::TestPhaseFlagShortCircuit).
-    monkeypatch.setattr(leerie.State, "_acquire_lock", lambda self: None)
     judged: list = []
 
     async def judge(*a, **k):

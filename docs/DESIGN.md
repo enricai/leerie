@@ -3984,6 +3984,13 @@ orchestrator that tries to construct `State` on the same run dir gets
 user to `leerie resume <run-id>` instead, which attaches to the live log
 stream rather than spawning a duplicate.
 
+The lock is held by an open descriptor, not by a process, so a process
+holds one `State` per run: a second `State` on the same run in the same
+process opens a second descriptor and is refused exactly as another
+orchestrator would be. Every verb that works in an existing run — `resume`,
+`--phase judge|heal` — names it before `main()` opens its one `State`, and
+works through that one.
+
 Why the *directory* and not `state.json`: `State.save()`'s atomic
 `tmp + rename` swaps state.json's inode every save, so a lock on
 state.json's fd would be orphaned from the new inode at every save,

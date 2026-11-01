@@ -615,20 +615,6 @@ class TestPhaseFlagShortCircuit:
         (run_dir / "state.json").write_text(json.dumps(
             {"task": "a trivial task",
              "run_layout": leerie.RUN_LAYOUT_VERSION}))
-        # `main()`'s own PRIMARY `State(...)` construction (before the
-        # `if args.phase:` branch) takes an exclusive flock on this same
-        # run_dir for the whole call, because `--phase` reuses one
-        # `args.run_id` for both the primary state and the target run to
-        # inspect — the SECOND `State(...)` inside the `--phase` branch then
-        # self-conflicts with the first, since flock is scoped to the open
-        # file description, not the process (verified live: two `os.open()`s
-        # of the same directory in one process do NOT share a lock). That
-        # conflict is real production behaviour, not a test artifact, and
-        # fixing it is outside this subtask's owned line range (the primary
-        # `State(...)` call sits above :32811). Disabling the lock here
-        # isolates the `--phase` branch itself for coverage purposes without
-        # taking on that fix.
-        monkeypatch.setattr(leerie.State, "_acquire_lock", lambda self: None)
 
         judge_calls = []
 

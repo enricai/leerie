@@ -215,18 +215,6 @@ def _seed_phase_run(leerie, monkeypatch, seen, repo, run_id: str):
     _fresh(leerie, monkeypatch, seen, run_id)
     seen.events.clear()
     monkeypatch.delenv(leerie.ISOLATE_ENV, raising=False)
-    # `main()` holds `State(run_id)` before its `--phase` branch opens a
-    # second `State` on the same run, whose flock then refuses this very
-    # process (exit 75) — a defect of the `--phase` path that predates and
-    # is outside this file's subject. One owner per run per process here,
-    # so the dispatch itself is reached.
-    real, held = leerie.State, {}
-
-    def one_owner(root, rid, **kw):
-        if rid not in held:
-            held[rid] = real(root, rid, **kw)
-        return held[rid]
-    monkeypatch.setattr(leerie, "State", one_owner)
     return repo / ".leerie" / "runs" / run_id
 
 

@@ -67658,6 +67658,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     os.environ.update(_COREPACK_PIN_ENV)
     if args.resume:
         run_id = resolve_run_id(leerie_root, args.run_id, resumable_only=True)
+    elif args.phase:
+        # `--phase judge|heal` works on an existing run: resolved here, so
+        # the one `State` below is the run it judges or heals, and a run-id
+        # naming no run is refused before `State` would mint its directory.
+        run_id = resolve_run_id(leerie_root, args.run_id)
     elif args.run_id:
         run_id = args.run_id
     else:
@@ -67957,22 +67962,14 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # operating on an already-finished run with read-only / patch
         # workers, not the conformer-heavy main run that motivated the
         # gate. Intentional non-coverage — do not "fix" as an oversight.
-        phase_run_id = resolve_run_id(leerie_root, args.run_id)
-        try:
-            phase_st = State(leerie_root, phase_run_id, repo_root=repo_root)
-        except StateLockedError as e:
-            # `--phase judge|heal` mutates state.json (writes
-            # `dangerously_skip_permissions` below, then runs workers
-            # that update telemetry). Running concurrently with the
-            # original orchestrator would race the same way `resume`
-            # would. Refuse here.
-            log(f"cannot run --phase on {phase_run_id!r}: another "
-                f"orchestrator owns the run (holding flock on "
-                f"{e.run_dir}). Wait for it to finish, or kill it "
-                f"first if wedged.")
-            sys.exit(EXIT_LOCKED)
-        if not phase_st.load():
-            die(f"no state.json found for run {phase_run_id!r}; "
+        # The run is `st`, whose flock this process already holds: one
+        # `State` per run per process (DESIGN §6 *Single owner per run dir*).
+        # A second `State` here would open its own descriptor on the run
+        # directory, and flock, scoped to the open file description rather
+        # than the process, refuses it — every `--phase` exited 75 before
+        # reaching a worker.
+        if not st.load():
+            die(f"no state.json found for run {st.run_id!r}; "
                 f"the run may not have reached the execute phase yet")
         # Refresh the escape-hatch preference so a user invoking
         # `--phase judge|heal --dangerously-skip-permissions` gets the
@@ -67980,15 +67977,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # this, claude_p reads the value the original run persisted and
         # the visible startup log would lie about whether the workers
         # actually see the override.
-        phase_st.data["dangerously_skip_permissions"] = bool(
+        st.data["dangerously_skip_permissions"] = bool(
             args.dangerously_skip_permissions)
-        phase_st.save()
-        phase_run_dir = phase_st.run_dir
+        st.save()
+        phase_run_dir = st.run_dir
         judge_out_dir = phase_run_dir / args.judge_dir
         heal_out_dir = phase_run_dir / args.heal_dir
         if args.phase == "judge":
             asyncio.run(phase_judge(phase_run_dir, judge_out_dir, caps,
-                                    phase_st, models, efforts))
+                                    st, models, efforts))
         else:  # heal
             # Read judge INDEX.json to find failing call_types; if no index
             # exists yet, run phase_judge first so heal has verdicts to
@@ -67997,7 +67994,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             if not index_path.exists():
                 log("--phase heal: no judge INDEX.json found; running judge first")
                 asyncio.run(phase_judge(phase_run_dir, judge_out_dir, caps,
-                                        phase_st, models))
+                                        st, models))
             if index_path.exists():
                 try:
                     index = json.loads(index_path.read_text())
@@ -68043,7 +68040,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     async with _strict_output_proxy(caps, "heal"):
                         await phase_heal(
                             call_type, failing_records, heal_out_dir,
-                            caps, phase_st, models, efforts, config=config)
+                            caps, st, models, efforts, config=config)
 
                 asyncio.run(_heal_with_strict_output())
         return

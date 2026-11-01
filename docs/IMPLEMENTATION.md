@@ -1249,13 +1249,15 @@ The lock primitive itself:
   pathlib looks it up dynamically) — `os.replace()` keeps the behavior
   version-independent.
 
-Two checked construction sites that catch `StateLockedError`:
-
-- `main()` at the `State(leerie_root, run_id, repo_root=repo_root)` call:
-  logs the message + `sys.exit(EXIT_LOCKED)`.
-- `--phase judge|heal` at the `phase_st = State(...)` call: same
-  pattern, since `--phase` mutates state and would race the same
-  way `resume` would.
+One checked construction site catches `StateLockedError`: `main()` at the
+`State(leerie_root, run_id, repo_root=repo_root)` call, which logs the
+message + `sys.exit(EXIT_LOCKED)`. It is the only `State` `main()` opens,
+for every verb: `resume` and `--phase judge|heal` resolve their run with
+`resolve_run_id` before it (so a `--run-id` naming no run is refused before
+`State` mints a directory), and the `--phase` branch works on that `st`
+(DESIGN §6 *Single owner per run dir*). A second `State` on the same run in
+the same process is refused by the first one's flock, as `--phase` was
+until it stopped opening one: it exited 75 before reaching a worker.
 
 The launcher heredoc (`leerie:2679-2696`) takes a fast-path flock
 probe on `run_dir` before invoking the orchestrator subprocess. On
