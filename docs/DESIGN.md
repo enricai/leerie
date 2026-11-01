@@ -1810,9 +1810,16 @@ process that made or used them exits, whatever the exit: a return, a
 `sys.exit`, a `die()`, an unhandled exception, an interrupt or a signal.
 The owner is the process's exit itself (`_release_owned_run_dirs`, an
 `atexit` handler), not each way out of it: a run directory is registered
-when the process takes the run's `State` lock, and when it makes the
-template without one (the host-side rebaser opens the `State`). At exit,
-every run directory the process still owns is released. Removing them at
+when the process takes the run's `State` lock — the orchestrator, and the
+host-side rebaser, which opens the `State` — and at exit every run
+directory the process registered is released, under the run's lock. Only
+the run's owner registers. A process that makes copies for another to use
+leaves them to that one: the collection's guard helper
+(`scripts/worker-guard.py`) makes each integrator's configuration from the
+template and exits before the integrator starts, and the collection
+payload, which runs the integrators, removes `workers/integrator-*` and the
+template when it exits (an `EXIT` trap). Registering at the template's
+making, as this first did, removed them under the integrator before it ran. Removing them at
 named exits — finalize, the abnormal exit — left them after every normal
 return that was neither: each no-work exit of planning, the template
 dep-capture makes again after finalize removed it, and the rebaser's on

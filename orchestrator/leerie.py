@@ -11433,8 +11433,6 @@ def _claude_config_template(run_dir: Path) -> Path:
     first worker — and kept for the run, so nothing a worker writes later
     reaches another worker's copy."""
     t = Path(run_dir) / CLAUDE_CONFIG_TEMPLATE
-    # The copy goes when the process that makes or uses it exits.
-    _own_run_dir_until_exit(Path(run_dir))
     if (t / _CLAUDE_CONFIG_TEMPLATE_MARK).is_file():
         return t
     env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -11591,7 +11589,9 @@ def _own_run_dir_until_exit(run_dir: Path, state: object = None) -> None:
     """Register `run_dir` for release at this process's exit
     (`_release_owned_run_dirs`), with the `State` that holds its lock when
     there is one. A later registration with a `State` replaces one
-    without."""
+    without. Only the run's owner registers: a process that makes copies
+    for another one to use (`scripts/worker-guard.py`, for the collection's
+    integrator) leaves them to that one."""
     if not _OWNED_RUN_DIRS:
         atexit.unregister(_release_owned_run_dirs)
         atexit.register(_release_owned_run_dirs)

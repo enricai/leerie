@@ -241,6 +241,21 @@ integrated_so_far=""
 . "$SCRIPTS/worktree-lib.sh"
 # No git command of leerie's own runs a repository hook (DESIGN §6½).
 leerie_git_hooks_off
+# Each integrator's copy of the credentials (`worker-guard.py` makes its
+# `workers/integrator-<sid>/` from the run's template, then exits) is this
+# process's: they and the template go when this payload exits, however it
+# exits (DESIGN §6 *No copy of the credentials outlives its run's process*).
+_drop_integrator_copies() {
+  local d
+  for d in "$leerie_dir"/workers/integrator-*; do
+    [ -e "$d" ] || [ -L "$d" ] || continue
+    leerie_rm_owned "$d" \
+      || echo "collect-subtrees: could not remove $d; it may hold a copy of your credentials" >&2
+  done
+  leerie_rm_owned "$leerie_dir/claude-config" \
+    || echo "collect-subtrees: could not remove $leerie_dir/claude-config; it may hold a copy of your credentials" >&2
+}
+trap _drop_integrator_copies EXIT
 backout_failed=false
 # Staging is a worktree of its own repository (DESIGN §6 *A repository per
 # committing tree (I6)*): what the integrator commits there, and every

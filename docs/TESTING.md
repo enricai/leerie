@@ -5822,7 +5822,12 @@ template kept at finalize.
   inverted — the real launcher `prune --apply` removes a run that died
   mid-run, its read-only template with it; prune counts a run removed only
   when it is gone; the shell removal; no run-directory deleter ignores its
-  errors.
+  errors. With it, `tests/test_collect_subtrees_sh.py`'s
+  `test_the_integrator_gets_the_shared_kill_deny_notice_and_hook`: the
+  collection's integrator had its own configuration while it ran, and the
+  payload removed it and the template when it exited, keeping the shared
+  caches (red when the template's making registered for removal at the
+  guard helper's exit, which removed them before the integrator ran).
 - `tests/test_every_removal_is_owner_aware.py` (3 tests, DESIGN §6 *Every
   deleter of a run's directories deletes them*; review round 19 claims M1):
   `rmtree` is called only inside `_rmtree_owned`; the launcher's

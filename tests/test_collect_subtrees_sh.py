@@ -403,8 +403,9 @@ def _worker_dir(state_dir: Path, run_id: str) -> Path:
 
 
 def _recording_claude(tmp_path: Path, rec_dir: Path) -> tuple[Path, Path]:
-    """A stub claude that records its argv (NUL-separated) and two env
-    values, then resolves the conflict by accepting theirs."""
+    """A stub claude that records its argv (NUL-separated), two env values
+    and whether its own configuration directory is there, then resolves
+    the conflict by accepting theirs."""
     rec = rec_dir / "claude-argv"
     stub = tmp_path / "bin" / "claude"
     stub.parent.mkdir(parents=True, exist_ok=True)
@@ -412,6 +413,8 @@ def _recording_claude(tmp_path: Path, rec_dir: Path) -> tuple[Path, Path]:
         '#!/usr/bin/env bash\n'
         f'printf "%s\\0" "$@" > "{rec}"\n'
         f'printf "%s" "${{LEERIE_FORBIDDEN_SCRIPTS:-}}" > "{rec}.env"\n'
+        f'[ -d "${{CLAUDE_CONFIG_DIR:-/nonexistent}}" ] && '
+        f'echo CLAUDE_CONFIG_DIR > "{rec}.cfg"\n'
         'git checkout --theirs . >/dev/null 2>&1\n'
         'git add -A >/dev/null 2>&1\n'
         'git commit --no-edit >/dev/null 2>&1\n'
@@ -451,6 +454,15 @@ def test_the_integrator_gets_the_shared_kill_deny_notice_and_hook(
              "PATH": f"{stub.parent}:{os.environ['PATH']}"})
     assert result.returncode == 0, f"stderr={result.stderr}"
     assert "integrated 2" in result.stderr.lower()
+    # The integrator had its own copy of the credentials while it ran, and
+    # the payload removed it, and the template, when it was done (DESIGN §6
+    # *No copy of the credentials outlives its run's process*); the shared
+    # caches stay.
+    run_dir = state_dir / "runs" / run_id
+    assert "CLAUDE_CONFIG_DIR" in (rec.parent / "claude-argv.cfg").read_text()
+    assert not (run_dir / "claude-config").exists()
+    assert list((run_dir / "workers").glob("integrator-*")) == []
+    assert wdir.is_dir()
     argv = rec.read_text().split("\0")[:-1]
 
     def after(flag: str) -> str:
