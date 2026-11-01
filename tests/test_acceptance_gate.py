@@ -16,6 +16,7 @@ with a real pytest command (`test_scoped` in `.leerie/config.toml`); only
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -664,7 +665,7 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
                                               want):
     p = tmp_path / "report"
     p.write_text(text)
-    got = leerie._parse_runner_report(kind, p)
+    got = leerie._parse_runner_report(kind, p.read_bytes())
     if want is None:
         assert got is None
     else:
@@ -672,7 +673,7 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
         assert {k: got[k] for k in ("executed", "collection_error")} == want
         assert set(got["cases"].values()) <= {"passed", "failed", "skipped",
                                               "load_error"}
-    assert leerie._parse_runner_report(kind, tmp_path / "absent") is None
+    assert leerie._parse_runner_report(kind, None) is None
 
 
 @pytest.mark.parametrize("cmd,placed", [
@@ -765,7 +766,8 @@ def test_an_appended_junit_path_is_the_report_pytest_writes(
         cmd, tmp_path / "r.xml")
     subprocess.run(run_cmd, shell=True, cwd=tmp_path, env=env,
                    capture_output=True, check=False)
-    assert leerie._parse_runner_report(kind, tmp_path / "r.xml") == {
+    assert leerie._parse_runner_report(
+            kind, (tmp_path / "r.xml").read_bytes()) == {
         "executed": 1, "collection_error": False,
         "cases": {"test_a :: test_a.test_a": "passed"}}
 
@@ -1408,27 +1410,30 @@ def test_a_probe_failure_that_is_not_about_parsing_says_what_it_was(
     assert got is None and want_reason in why
 
 
-@pytest.mark.skipif(os.geteuid() == 0,
-                    reason="root ignores directory permissions")
-def test_an_unwritable_marker_directory_is_named_as_such(leerie, tmp_path):
-    """The probe's body could not write its marker, which read as "failed
-    before reaching the parse check (… a conftest …)"."""
+def test_the_parse_probe_never_touches_its_marker_on_disk(leerie, tmp_path):
+    """The marker is the sandbox's report, a path inside the sandbox only:
+    leerie neither writes nor removes it on disk, where its directory is the
+    tree's measurement directory, which confined code writes. Here a
+    measurement left `reports/` a link to a directory holding a file at the
+    marker's name; leerie used to truncate and remove it, "proving" the
+    directory writable (DESIGN §6 *Leerie never writes through a path
+    confined code shaped*)."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     (repo / "acc").mkdir()
     (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
-    # The marker's directory is the tree's own measurement directory (DESIGN
-    # §6 *Leerie's runs of the repository's commands are confined too*).
     reports = leerie._measure_dir(st, repo) / "reports"
-    reports.chmod(0o555)
-    try:
-        got, why = asyncio.run(leerie._acceptance_parse_probe(
-            st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
-            ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
-    finally:
-        reports.chmod(0o755)
-    assert got is None and "could not be prepared" in why
-    assert "conftest" not in why
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    name = ("p-probe-" + hashlib.sha256(
+        b"acc/test_defect_mul.py").hexdigest()[:12])
+    (victim / name).write_text("someone else's\n")
+    reports.rmdir()
+    reports.symlink_to(victim)
+    asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+        ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
+    assert (victim / name).read_text() == "someone else's\n"
 
 
 def test_a_target_that_does_not_compile_is_a_parse_failure(leerie, tmp_path):

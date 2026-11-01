@@ -141,7 +141,7 @@ def test_a_held_out_run_end_to_end_reads_its_report_through_the_descriptor(
         return (cmd, {**os.environ, "LEERIE_REPORT": str(report)}, "probe")
 
     def parse(kind, report):
-        captured["read"] = Path(report).read_text()
+        captured["read"] = report.decode()
         return {"collection_error": False, "executed": 1,
                 "cases": {"held.sh::a": "failed"}, "messages": {}}
     monkeypatch.setattr(leerie, "_acceptance_report_spec", spec)
@@ -154,6 +154,9 @@ def test_a_held_out_run_end_to_end_reads_its_report_through_the_descriptor(
     assert v is False and obs["failing_cases"] == ["held.sh::a"], obs
     assert json.loads(captured["read"]) == {"cases": {"held.sh::a":
                                                       "failed"}}
+    # Parsed from the descriptor's bytes; no copy put back on disk (DESIGN
+    # §6 *Leerie never writes through a path confined code shaped*).
+    assert not Path(captured["report"]).exists()
     assert not (view / "held.sh").exists()
     git = subprocess.run(["git", "-C", str(view), "status", "--porcelain"],
                          capture_output=True, text=True)
@@ -172,7 +175,7 @@ def test_the_parse_probe_is_placed_and_its_marker_is_the_report(
         (src, rel), = sandbox.place
         seen["src_text"] = Path(src).read_text()
         seen["in_tree"] = (view / rel).exists()
-        Path(sandbox.report).write_text("ok")
+        kw["report_into"] += b"ok"
         return 0, ""
     monkeypatch.setattr(leerie, "_run_streaming", fake)
     got, why = asyncio.run(leerie._acceptance_parse_probe(

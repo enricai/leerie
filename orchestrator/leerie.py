@@ -6017,18 +6017,23 @@ def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
     _with_pnpm_spellings(env)
 
 
-def _worker_cache_env(env: Mapping[str, str],
-                      run_dir: Path) -> dict[str, str]:
-    """A copy of `env` whose every store and cache is the run's workers':
-    `<run-dir>/workers/cache/<name>` (a baked value is kept, as
-    `_leerie_stores` keeps it) and `XDG_CACHE_HOME` at
-    `<run-dir>/workers/cache/xdg`. One set per run, not per worker: what a
-    worker leaves in a cache can mislead only another worker, never a
-    measurement, and a cold set costs every worker a download (measured on
+def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
+                      cache: Path | None = None) -> dict[str, str]:
+    """A copy of `env` whose every store and cache is in the worker's
+    cache set `cache` (default the fixers' side's,
+    `<run-dir>/workers/cache/`): `<cache>/<name>` (a baked value is kept, as
+    `_leerie_stores` keeps it) and `XDG_CACHE_HOME` at `<cache>/xdg`. One
+    set per side of the run, not per worker (`_worker_cache_dir`): what a
+    worker leaves in a cache can mislead only another worker of its side,
+    never a measurement, and nothing a held-out-side worker's processes
+    leave reaches a fixer (DESIGN §8 *Nothing a held-out evaluation produces
+    reaches a fixer*); a cold set costs a worker a download (measured on
     funeralworks: Playwright's chromium 20 s and 656 MB). None of them is a
     leerie store, and pnpm never links one store's file into another
     (DESIGN §6 *The stores a view installs from are leerie's*)."""
-    out = {**env, **_cache_vars(env, Path(run_dir) / "workers" / "cache")}
+    if cache is None:
+        cache = Path(run_dir) / "workers" / "cache"
+    out = {**env, **_cache_vars(env, cache)}
     for k in _COPY_IMPORT_ENV:
         out.pop(k, None)
     _with_pnpm_spellings(out)
@@ -9959,6 +9964,7 @@ async def _run_streaming(
     tail_lines: int = 40,
     cgroup_sid: str | None = None,
     sandbox: "HeldOutSandbox | None" = None,
+    report_into: bytearray | None = None,
 ) -> tuple[int, str]:
     """Run a subprocess with stdout+stderr streamed live, persisted to a
     log file, and tailed for error reporting. Use this instead of
@@ -10011,9 +10017,11 @@ async def _run_streaming(
     runs in a sandbox the shim builds over `sandbox.view`, its `place`
     files copied into the overlay, never onto disk. The runner's report
     (`sandbox.report`, a path inside the sandbox) comes back through an
-    unlinked file leerie opened and passed as a descriptor, and is written
-    to the same path outside once the command has exited — so the report
-    leerie reads is one no other process wrote.
+    unlinked file leerie opened and passed as a descriptor, and its bytes
+    are appended to `report_into` once the command has exited: the report
+    leerie parses is one no other process wrote, and it is never put on
+    disk, where the path it named lies in a directory confined code writes
+    (DESIGN §6 *Leerie never writes through a path confined code shaped*).
     """
     # A command's output never lands in a worker's transcript, where a line
     # the code under measurement prints in the shape of a tool call would be
@@ -10035,6 +10043,12 @@ async def _run_streaming(
             "grant does not reach it — leerie's own invariant is broken "
             "(DESIGN §6 *Leerie's runs of the repository's commands are "
             "confined too*). Report this.")
+    if (sandbox is not None and sandbox.report is not None
+            and report_into is None):
+        die("leerie was about to run a held-out file whose report has "
+            "nowhere to go but disk — leerie's own invariant is broken "
+            "(DESIGN §6 *Leerie never writes through a path confined code "
+            "shaped*). Report this.")
     # The report comes back through an unlinked file in the run's own temp
     # directory, never through the sandbox's paths.
     report_fh = (tempfile.TemporaryFile()
@@ -10148,13 +10162,9 @@ async def _run_streaming(
                     pass
 
             rc = proc.returncode if proc.returncode is not None else 0
-            if report_fh is not None:
+            if report_fh is not None and report_into is not None:
                 report_fh.seek(0)
-                got = report_fh.read()
-                if got:
-                    out = Path(sandbox.report)
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    out.write_bytes(got)
+                report_into += report_fh.read()
             return rc, "\n".join(tail)
     finally:
         if report_fh is not None:
@@ -10827,7 +10837,10 @@ def _restore_settings(tree: str | Path) -> list[str]:
     `info/` where they differ (DESIGN §8 *The settings are leerie's*), and
     return the names restored; [] for a tree of no run repository, or
     when leerie's copy is missing (the checker's postcondition names
-    it)."""
+    it). The repository may be a tree repository its committing worker
+    writes whole, so every write is made from its root down without
+    following a link (DESIGN §6 *Leerie never writes through a path
+    confined code shaped*)."""
     loc = _run_settings_of(tree)
     if loc is None:
         return []
@@ -10836,18 +10849,15 @@ def _restore_settings(tree: str | Path) -> list[str]:
         return []
     done: list[str] = []
     if not _same_settings_path(s / "config", common / "config"):
-        tmp = common / f".config.leerie-{os.getpid()}"
-        shutil.copyfile(s / "config", tmp)
-        os.replace(tmp, common / "config")
+        _write_beneath(common, common / "config",
+                       (s / "config").read_bytes(),
+                       mode=stat.S_IMODE(os.stat(s / "config").st_mode))
         done.append("config")
     if not _same_settings_path(s / "info", common / "info"):
-        if (common / "info").is_dir() and not (common / "info").is_symlink():
-            if not _rmtree_owned(common / "info"):
-                raise OSError(f"cannot remove {common / 'info'}")
-        elif os.path.lexists(common / "info"):
-            os.unlink(common / "info")
+        if not _rmtree_owned(common / "info"):
+            raise OSError(f"cannot remove {common / 'info'}")
         if (s / "info").is_dir():
-            shutil.copytree(s / "info", common / "info", symlinks=True)
+            _copytree_beneath(s / "info", common, common / "info")
         done.append("info")
     return done
 
@@ -11118,7 +11128,11 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                 except ValueError:
                     continue          # outside the repo; not ours to stage
                 dst = wt / rel
-                if dst.exists():
+                # The planning worktree is written by the workers that run
+                # in it: never followed through a link one left (DESIGN §6
+                # *Leerie never writes through a path confined code
+                # shaped*).
+                if _lexists_beneath(wt, dst):
                     continue          # tracked — the worktree already has it
                 # Files committed on the branch the operator switched to
                 # mid-run and absent from the run's own branch: staging one
@@ -11133,22 +11147,21 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                         "see it")
                     continue
                 try:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
                     if src.is_dir():
-                        shutil.copytree(
-                            src, dst, dirs_exist_ok=True,
+                        _copytree_beneath(
+                            src, wt, dst,
                             ignore=_ignore_repo_paths(repo_root, skip))
                     else:
-                        shutil.copy2(src, dst)
+                        _copy_beneath(src, wt, dst)
                     staged += 1
                 except Exception:
                     continue
         claude_src, claude_dst = repo_root / ".claude", wt / ".claude"
-        if claude_src.is_dir() and not claude_dst.exists():
+        if claude_src.is_dir() and not _lexists_beneath(wt, claude_dst):
             skip = _switched_branch_only_paths(repo_root, ".claude", wb_ref)
             try:
-                shutil.copytree(claude_src, claude_dst, dirs_exist_ok=True,
-                                ignore=_ignore_repo_paths(repo_root, skip))
+                _copytree_beneath(claude_src, wt, claude_dst,
+                                  ignore=_ignore_repo_paths(repo_root, skip))
                 staged += 1
             except Exception:
                 pass
@@ -22672,11 +22685,16 @@ _WORKER_DEVICES = ("/dev/null", "/dev/zero", "/dev/full", "/dev/random",
 # config (`_worker_dirs`). Each is granted only when it names a path beneath
 # `<run-dir>/workers/` (`WORKERS_DIR`), where the run makes a worker's own
 # (DESIGN §6): a variable left at a shared default (`/tmp`, `~/.claude`)
-# grants nothing. The run's shared download caches are granted as the one
-# directory they live in (`WORKER_CACHE_DIR`, `_worker_cache_env`).
+# grants nothing. The run's download caches are granted as the one
+# directory a worker's set lives in (`_worker_cache_dir`, `_worker_cache_env`):
+# `WORKER_CACHE_DIR` for the fixers' side, `HELD_OUT_CACHE_DIR` for the
+# held-out side (`HELD_OUT_LOG_WORKERS`), never both, so nothing a held-out-side
+# worker's processes leave in a cache reaches a fixer (DESIGN §8 *Nothing a
+# held-out evaluation produces reaches a fixer*).
 _WORKER_ENV_DIRS = ("TMPDIR", "TMP", "TEMP", "CLAUDE_CODE_TMPDIR",
                     "CLAUDE_CONFIG_DIR")
 WORKER_CACHE_DIR = "cache"
+HELD_OUT_CACHE_DIR = "cache-held-out"
 
 # Workers that commit, and so write their tree's git metadata.
 _COMMITTING_WORKERS = frozenset({
@@ -22696,6 +22714,28 @@ NOTES_DIRNAME = "notes"
 HELD_OUT_LOGS_DIRNAME = "held-out"
 HELD_OUT_LOG_WORKERS = frozenset({"acceptance_writer", "set_auditor",
                                   "scope_judge", "falsifier"})
+
+
+def _worker_cache_dir(run_dir: str | Path, schema_key: str) -> Path:
+    """The cache set of a worker of kind `schema_key`: the held-out side's
+    own for a worker that reads a set or runs one (`HELD_OUT_LOG_WORKERS`),
+    else the fixers' side's, both under `<run-dir>/workers/`."""
+    return (Path(run_dir) / WORKERS_DIR
+            / (HELD_OUT_CACHE_DIR if schema_key in HELD_OUT_LOG_WORKERS
+               else WORKER_CACHE_DIR))
+
+
+def _granted_cache_dir(grants: "WorkerGrants | None",
+                       run_dir: str | Path) -> Path:
+    """The cache set `grants` writes: the held-out side's when the grant
+    names it, else the fixers' side's. The worker's environment is pointed
+    at this one (`_invoke`), so the variables follow the grant."""
+    held = Path(run_dir) / WORKERS_DIR / HELD_OUT_CACHE_DIR
+    if grants is not None and any(
+            os.path.realpath(p) == os.path.realpath(held)
+            for p in grants.rw):
+        return held
+    return Path(run_dir) / WORKERS_DIR / WORKER_CACHE_DIR
 
 
 def _held_out_logs(run_dir: str | Path) -> Path:
@@ -22950,8 +22990,11 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     run_dir = Path(run_dir).resolve()
     state_root = run_dir.parent.parent
     cwd_r = Path(cwd).resolve()
+    # Its side's cache set, and only that one (`_worker_cache_dir`).
+    cache = _worker_cache_dir(run_dir, schema_key)
+    _mkdir_private(cache, run_dir)
     rw: list[str] = (list(_WORKER_DEVICES) + _worker_own_dirs(env, run_dir)
-                     + [str(run_dir / WORKERS_DIR / WORKER_CACHE_DIR)])
+                     + [str(cache)])
     # The CLI the worker is, where its `PATH` finds it, and its home (the
     # git identity, a package manager's config): named for the same reason
     # as leerie's install below. A home that holds `/tmp` is not named.
@@ -23097,21 +23140,266 @@ def _system_temp_dir() -> str:
     return _SYSTEM_TEMP_DIR.get("dir") or tempfile.gettempdir()
 
 
+# --- Leerie's own writes where confined code writes --------------------------
+# DESIGN §6 *Leerie never writes through a path confined code shaped*. Every
+# unconfined write leerie makes into a directory some confined process can
+# write — a tree, a tree repository, a measurement directory, a worker's or
+# a tree's stores — goes through these: the path is walked from an anchor no
+# confined process can replace (the run directory, or a grant's own root,
+# whose entry lies in a directory no grant names), one component at a time,
+# never through a link, and the file is made at a fresh name in that
+# directory's descriptor and renamed into place. A link confined code
+# planted on the way refuses the write (`OSError`, ELOOP or ENOTDIR); one at
+# the destination is replaced, never written through.
+_DIR_NOFOLLOW = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _beneath_parts(anchor: Path, path: Path) -> tuple[str, ...]:
+    """The components of `path` below `anchor`, lexically (`OSError`
+    EINVAL when `path` is not beneath it: a write there is refused like one
+    through a link)."""
+    a = os.path.normpath(os.path.abspath(anchor))
+    p = os.path.normpath(os.path.abspath(path))
+    if p != a and not p.startswith(a.rstrip("/") + "/"):
+        raise OSError(errno.EINVAL, f"{path} is not beneath {anchor}")
+    return Path(p).relative_to(a).parts
+
+
+def _open_dir_beneath(anchor: Path, path: Path, *, make: bool = False,
+                      dir_mode: int = 0o777, replace: bool = False) -> int:
+    """A descriptor of the directory `path`, reached from `anchor` without
+    following a link. `make`: a missing component is made (`dir_mode`, less
+    the umask). `replace`: a component that is not a directory — a link, a
+    file — is removed and made a directory (only for leerie's own layout,
+    never a tree's content). The caller closes the descriptor."""
+    fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in _beneath_parts(anchor, path):
+            try:
+                nxt = os.open(part, _DIR_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                if not make:
+                    raise
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, dir_mode, dir_fd=fd)
+                nxt = os.open(part, _DIR_NOFOLLOW, dir_fd=fd)
+            except OSError as e:
+                if not (replace and e.errno in (errno.ELOOP, errno.ENOTDIR)):
+                    raise
+                os.unlink(part, dir_fd=fd)
+                os.mkdir(part, dir_mode, dir_fd=fd)
+                nxt = os.open(part, _DIR_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextlib.contextmanager
+def _dir_beneath(anchor: Path, path: Path, *, make: bool = False
+                 ) -> Iterator[int]:
+    fd = _open_dir_beneath(anchor, path, make=make)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _write_beneath(anchor: Path, path: Path, data: bytes, *,
+                   mode: int | None = None, make: bool = True) -> None:
+    """Write `data` to `path` beneath `anchor` as a new file renamed into
+    place: made `O_EXCL|O_NOFOLLOW` at a fresh name in the directory's
+    descriptor, so no link on the way or at `path` is ever written through.
+    `mode`: the file's mode; by default that of the regular file it
+    replaces, else 0o666 less the umask. `make`: missing directories are
+    made."""
+    path = Path(path)
+    with _dir_beneath(anchor, path.parent, make=make) as dfd:
+        keep = mode
+        if keep is None:
+            with contextlib.suppress(OSError):
+                old = os.stat(path.name, dir_fd=dfd, follow_symlinks=False)
+                if stat.S_ISREG(old.st_mode):
+                    keep = stat.S_IMODE(old.st_mode)
+        tmp = f".leerie-{uuid.uuid4().hex}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     keep if keep is not None else 0o666, dir_fd=dfd)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                if keep is not None:
+                    os.fchmod(f.fileno(), keep)
+            os.rename(tmp, path.name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp, dir_fd=dfd)
+            raise
+
+
+def _read_beneath(anchor: Path, path: Path) -> bytes:
+    """The bytes of the regular file `path` beneath `anchor`, reached
+    without following a link (`OSError` otherwise, a FIFO included: it is
+    opened non-blocking and refused, never waited on)."""
+    path = Path(path)
+    with _dir_beneath(anchor, path.parent) as dfd:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | os.O_CLOEXEC, dir_fd=dfd)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                raise OSError(errno.EINVAL, f"{path} is not a regular file")
+            return f.read()
+
+
+def _lexists_beneath(anchor: Path, path: Path) -> bool:
+    """True when anything is at `path` beneath `anchor`, or a link or a
+    non-directory stands on the way to it: either way the path is taken."""
+    path = Path(path)
+    try:
+        with _dir_beneath(anchor, path.parent) as dfd:
+            os.stat(path.name, dir_fd=dfd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _unlink_beneath(anchor: Path, path: Path) -> None:
+    """Remove the file or link `path` beneath `anchor` (gone already, or a
+    link on the way: nothing is removed)."""
+    path = Path(path)
+    try:
+        with _dir_beneath(anchor, path.parent) as dfd:
+            os.unlink(path.name, dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+
+
+def _copy_out_of_tree(tree: Path, src: Path, names: Iterable[str],
+                      dest: Path) -> None:
+    """Copy each of `names` in `src` (beneath `tree`, which confined code
+    writes) into `dest`, leerie's own: a directory with its links copied
+    as links, a regular file as itself. A name that is a link, or a link on
+    the way to `src`, is never followed, and the name is skipped."""
+    try:
+        sfd = _open_dir_beneath(tree, src)
+    except (OSError, ValueError):
+        return
+    try:
+        for name in names:
+            try:
+                st_ = os.stat(name, dir_fd=sfd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(st_.st_mode):
+                # Through the descriptor's own path: the directory reached,
+                # never one a link on the way names.
+                shutil.copytree(f"/proc/self/fd/{sfd}/{name}", dest / name,
+                                symlinks=True)
+            elif stat.S_ISREG(st_.st_mode):
+                shutil.copy2(f"/proc/self/fd/{sfd}/{name}", dest / name,
+                             follow_symlinks=False)
+    finally:
+        os.close(sfd)
+
+
+def _remove_beneath(anchor: Path, path: Path) -> None:
+    """Remove whatever is at `path` beneath `anchor` — a directory tree
+    (`_rmtree_owned`), a file or a link — reached without following a link
+    on the way (one there: nothing is removed)."""
+    path = Path(path)
+    try:
+        with _dir_beneath(anchor, path.parent) as dfd:
+            st_ = os.stat(path.name, dir_fd=dfd, follow_symlinks=False)
+            if stat.S_ISDIR(st_.st_mode):
+                # Through the descriptor's own path: the directory reached,
+                # never one a link on the way names.
+                _rmtree_owned(Path(f"/proc/self/fd/{dfd}") / path.name)
+            else:
+                os.unlink(path.name, dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        if e.errno not in (errno.ELOOP, errno.ENOTDIR):
+            raise
+
+
+def _rmdirs_beneath(anchor: Path, path: Path) -> None:
+    """`os.removedirs` beneath `anchor`: remove `path` and then each parent
+    up to (not including) `anchor` while each is empty, never through a
+    link."""
+    parts = _beneath_parts(anchor, path)
+    for i in range(len(parts), 0, -1):
+        try:
+            with _dir_beneath(anchor, Path(anchor).joinpath(*parts[:i - 1])
+                              ) as dfd:
+                os.rmdir(parts[i - 1], dir_fd=dfd)
+        except OSError:
+            return
+
+
+def _copy_beneath(src: Path, anchor: Path, dst: Path, *,
+                  src_anchor: Path | None = None) -> None:
+    """Copy the file `src` to `dst` beneath `anchor` (`_write_beneath`),
+    with its mode. `src_anchor`: `src` lies where confined code writes too,
+    and is read without following a link (`_read_beneath`)."""
+    if src_anchor is not None:
+        data = _read_beneath(src_anchor, src)
+        with _dir_beneath(src_anchor, Path(src).parent) as sfd:
+            m = os.stat(Path(src).name, dir_fd=sfd,
+                        follow_symlinks=False).st_mode
+    else:
+        data = Path(src).read_bytes()
+        m = os.stat(src).st_mode
+    _write_beneath(anchor, dst, data, mode=stat.S_IMODE(m))
+
+
+def _copytree_beneath(src: Path, anchor: Path, dst: Path, *,
+                      ignore: Callable[[str, list[str]], Iterable[str]]
+                      | None = None) -> None:
+    """`shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True,
+    ignore=ignore)` with every write beneath `anchor` (`_write_beneath`): a
+    link in `src` is copied as a link, never followed on either side."""
+    src = Path(src)
+    with _dir_beneath(anchor, dst, make=True):
+        pass
+    names = os.listdir(src)
+    skip = set(ignore(str(src), names)) if ignore is not None else set()
+    for name in names:
+        if name in skip:
+            continue
+        s, d = src / name, Path(dst) / name
+        if s.is_symlink():
+            with _dir_beneath(anchor, d.parent) as dfd:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=dfd)
+                os.symlink(os.readlink(s), name, dir_fd=dfd)
+        elif s.is_dir():
+            _copytree_beneath(s, anchor, d, ignore=ignore)
+        else:
+            _copy_beneath(s, anchor, d)
+
+
 def _mkdir_private(path: Path, top: Path) -> None:
     """Make `path` and every directory missing between `top` (which
     is made first when missing, as `mkdir(parents=True)` would) and it,
     each 0700: a directory leerie makes for a measurement or a worker is
     readable by its user alone (DESIGN §6 *A confined command's scratch is
-    short and private*)."""
+    short and private*). Reached from `top` without following a link
+    (`_open_dir_beneath`): every such directory is leerie's layout, so a
+    link or a file confined code left in its place is removed and the
+    directory made (DESIGN §6 *Leerie never writes through a path confined
+    code shaped*). A `path` not beneath `top` is left alone."""
     top.mkdir(parents=True, exist_ok=True)
-    missing: list[Path] = []
-    cur = Path(path)
-    while cur != top and not cur.exists() and cur.is_relative_to(top):
-        missing.append(cur)
-        cur = cur.parent
-    for d in reversed(missing):
-        with contextlib.suppress(FileExistsError):
-            os.mkdir(d, 0o700)
+    try:
+        _beneath_parts(top, path)
+    except OSError:
+        return
+    os.close(_open_dir_beneath(top, path, make=True, dir_mode=0o700,
+                               replace=True))
 
 
 def _own_private_dir(path: Path) -> None:
@@ -23233,9 +23521,10 @@ def _sweep_measure_dirs(root: Path) -> None:
         stale = not tree.is_dir()
         if not stale and id_file:
             try:
-                stale = Path(id_file).read_text().strip() != \
+                stale = _read_beneath(
+                    root.parent, Path(id_file)).decode().strip() != \
                     own.name.rsplit("-", 1)[-1]
-            except OSError:
+            except (OSError, ValueError):
                 stale = True
         if not stale:
             continue
@@ -23255,21 +23544,51 @@ def _sweep_measure_dirs(root: Path) -> None:
                          daemon=True).start()
 
 
+def _measure_id_dir(run_dir: Path, tree: Path,
+                    dirs: tuple[Path, Path, Path]) -> Path | None:
+    """The git directory that holds `tree`'s measurement id, in `run_dir`:
+    for a tree in the run's `worktrees/`, the one leerie's layout names
+    (`_run_tree_location`), never one the tree's `.git` names; for any other
+    checkout, its git directory when that is in the run repository, which
+    no grant writes. None otherwise."""
+    loc = _run_tree_location(tree)
+    if isinstance(loc, tuple):
+        if os.path.realpath(loc[2]) != os.path.realpath(run_dir):
+            return None
+        try:
+            _beneath_parts(loc[2], loc[1])
+        except OSError:
+            return None
+        return Path(run_dir) / Path(loc[1]).relative_to(loc[2])
+    if loc is None and dirs[0].is_relative_to(run_dir / RUN_REPO_NAME):
+        return dirs[0]
+    return None
+
+
 def _measure_dir_at(run_dir: Path, tree: Path,
                     dirs: tuple[Path, Path, Path] | None) -> Path:
     root = run_dir / MEASURE_DIRNAME
     id_file: Path | None = None
     tid = ""
-    if dirs is not None and dirs[0].is_relative_to(run_dir):
+    id_dir = (_measure_id_dir(run_dir, tree, dirs) if dirs is not None
+              else None)
+    if id_dir is not None:
         # The tree's own git directory is made with the tree and removed
         # with it: an id kept there names this tree, not an earlier one at
-        # the same path.
-        id_file = dirs[0] / _MEASURE_ID_FILE
-        with contextlib.suppress(OSError):
-            tid = id_file.read_text().strip()
+        # the same path. For a committing tree it is in the tree repository
+        # its worker writes, so the id is an untrusted key: read and written
+        # from the run directory down without following a link (DESIGN §6
+        # *Leerie never writes through a path confined code shaped*), and
+        # any value names only one of this tree's own measurement
+        # directories, or a fresh one.
+        id_file = id_dir / _MEASURE_ID_FILE
+        with contextlib.suppress(OSError, ValueError):
+            tid = _read_beneath(run_dir, id_file).decode().strip()
         if not _MEASURE_ID_RE.fullmatch(tid):
             tid = uuid.uuid4().hex[:16]
-            id_file.write_text(tid + "\n")
+            with contextlib.suppress(OSError):
+                _write_beneath(run_dir, id_file, (tid + "\n").encode(),
+                               mode=0o644, make=False)
             # A new tree at this path: its own stores (`_tree_store_env`)
             # start empty too, never with what an earlier tree's commands
             # left there.
@@ -23722,7 +24041,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                                else os.environ)
     # Its stores and caches are its own, never leerie's (DESIGN §6 *The
     # stores a view installs from are leerie's*).
-    worker_env = _worker_cache_env(worker_env, leerie_dir)
+    worker_env = _worker_cache_env(
+        worker_env, leerie_dir, _granted_cache_dir(grants, leerie_dir))
 
     # The prompt is staged to a temp file BEFORE the spawn, and that file —
     # already positioned at byte 0 with the whole payload on disk — becomes
@@ -42194,12 +42514,7 @@ async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
         stage = Path(tempfile.mkdtemp(
             prefix=_CGROUP_NAME_UNSAFE_RE.sub("-", f"{mgr}-{wd_rel}-"),
             dir=base))
-        for name in spec.stage:
-            s = src / name
-            if s.is_dir():
-                shutil.copytree(s, stage / name, symlinks=True)
-            elif s.is_file():
-                shutil.copy2(s, stage / name)
+        _copy_out_of_tree(Path(tree), src, spec.stage, stage)
         try:
             # A fetch is leerie's own, but the task's forbid binds it too
             # (DESIGN §9): a forbidden fetch is skipped, and the install that
@@ -42938,14 +43253,47 @@ def _writable_dirs_to(tree: str | Path, rel: str) -> None:
     died before restoring it). The directories are the orchestrator's own on
     every runtime; a chmod refused (not ours) is left to the caller's
     postcondition."""
-    root = Path(tree)
-    parts = Path(rel).parts[:-1]
-    for i in range(len(parts) + 1):
-        d = root.joinpath(*parts[:i])
-        with contextlib.suppress(OSError):
-            mode = d.lstat().st_mode
-            if stat.S_ISDIR(mode) and (mode & 0o300) != 0o300:
-                os.chmod(d, stat.S_IMODE(mode) | 0o300)
+    with contextlib.suppress(OSError):
+        _add_dir_bits_beneath(Path(tree), Path(*Path(rel).parts[:-1]), 0o300)
+
+
+def _add_dir_bits_beneath(anchor: Path, rel: Path, bits: int) -> None:
+    """Give `anchor` and every directory from it down to `anchor/rel` the
+    owner bits `bits` each lacks, reached without following a link: a link
+    or a non-directory on the way ends the walk, so no chmod lands outside
+    (DESIGN §6 *Leerie never writes through a path confined code shaped*).
+    Through `O_PATH` descriptors, so a directory with no read or search bit
+    is reached once its parent's are given."""
+    o_path = getattr(os, "O_PATH", None)
+    parts = [x for x in Path(rel).parts if x not in ("", ".")]
+    if o_path is None:
+        # macOS, where no confined process runs (DESIGN §6 *Outside the
+        # container*): by path, each component checked not to be a link.
+        for i in range(len(parts) + 1):
+            d = Path(anchor).joinpath(*parts[:i])
+            mode = os.lstat(d).st_mode
+            if not stat.S_ISDIR(mode):
+                return
+            if (mode & bits) != bits:
+                os.chmod(d, stat.S_IMODE(mode) | bits)
+        return
+    fd = os.open(anchor, o_path | os.O_CLOEXEC)
+    try:
+        for i in range(len(parts) + 1):
+            st_ = os.fstat(fd)
+            if not stat.S_ISDIR(st_.st_mode):
+                return
+            if (st_.st_mode & bits) != bits:
+                os.chmod(f"/proc/self/fd/{fd}",
+                         stat.S_IMODE(st_.st_mode) | bits)
+            if i == len(parts):
+                return
+            nxt = os.open(parts[i], o_path | os.O_NOFOLLOW | os.O_CLOEXEC,
+                          dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    finally:
+        os.close(fd)
 
 
 def _rmtree_owned(path: Path) -> bool:
@@ -42966,7 +43314,7 @@ def _rmtree_owned(path: Path) -> bool:
     while stack:
         d = stack.pop()
         with contextlib.suppress(OSError):
-            os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) | 0o700)
+            _add_dir_bits_beneath(p, Path(os.path.relpath(d, p)), 0o700)
         try:
             with os.scandir(d) as it:
                 stack += [e.path for e in it if e.is_dir(follow_symlinks=False)]
@@ -42994,29 +43342,36 @@ def _restore_tracked_content(tree: str | Path,
     changed = [p for p in _changed_paths(before, after)
                if not any(str(snap.get(p) or "").startswith(
                    (_GITLINK, _UNHASHED)) for snap in (before, after))]
+    # The command wrote the tree, links included: every removal and write
+    # below is made from the tree's root down without following one (DESIGN
+    # §6 *Leerie never writes through a path confined code shaped*).
+    root = Path(tree)
     for p in changed:
-        dst = Path(tree) / p
+        dst = root / p
         _writable_dirs_to(tree, p)
-        if (before.get(p, "") is not None and dst.is_dir()
-                and not dst.is_symlink()):
+        if before.get(p, "") is not None:
             # The command replaced the tracked file with a directory
             # (`_tracked_content` lists it as gone); it was a file before.
-            _rmtree_owned(dst)
+            with contextlib.suppress(OSError):
+                with _dir_beneath(root, dst.parent) as dfd:
+                    is_dir = stat.S_ISDIR(os.stat(
+                        dst.name, dir_fd=dfd, follow_symlinks=False).st_mode)
+                if is_dir:
+                    _remove_beneath(root, dst)
         if p not in before:
             subprocess.run(["git", "--literal-pathspecs", *_tree_git_args(tree),
                             "checkout", "HEAD", "--", p],
                            capture_output=True, check=False)
         elif before[p] is None:
             with contextlib.suppress(OSError):
-                dst.unlink()
+                _unlink_beneath(root, dst)
         else:
             blob = subprocess.run(["git", *_tree_git_args(tree), "cat-file",
                                    "blob", str(before[p])],
                                   capture_output=True, check=False)
             if blob.returncode == 0:
                 with contextlib.suppress(OSError):
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_bytes(blob.stdout)
+                    _write_beneath(root, dst, blob.stdout)
     return changed
 
 
@@ -43032,20 +43387,18 @@ def _remove_new_untracked(tree: str | Path, before: set[str]) -> list[str]:
     if now is None:
         return []
     made = sorted(now - before)
+    # Never through a link the command left on the way (DESIGN §6 *Leerie
+    # never writes through a path confined code shaped*). A nested
+    # repository (a test's `git init` fixture) is listed as one `dir/`
+    # entry and removed whole (review round 15 M2).
     for rel in made:
         _writable_dirs_to(tree, rel.rstrip("/"))
-        full = Path(tree) / rel
-        if full.is_dir() and not full.is_symlink():
-            # A nested repository (a test's `git init` fixture): git lists
-            # it as one `dir/` entry, removed whole (review round 15 M2).
-            _rmtree_owned(full)
-            continue
         with contextlib.suppress(OSError):
-            full.unlink()
+            _remove_beneath(Path(tree), Path(tree) / rel.rstrip("/"))
     for d in sorted({os.path.dirname(r.rstrip("/")) for r in made
                      if "/" in r.rstrip("/")}, key=lambda x: -len(x)):
-        with contextlib.suppress(OSError):
-            os.removedirs(Path(tree) / d)
+        with contextlib.suppress(OSError, ValueError):
+            _rmdirs_beneath(Path(tree), Path(tree) / d)
     return made
 
 
@@ -43353,7 +43706,11 @@ def _move_view(repo: Path, wt: Path, tip: str,
         (admin / _MEASURE_ID_FILE).unlink(missing_ok=True)
     except OSError:
         return False
-    (wt / ".git").write_text(f"gitdir: {admin}\n")
+    try:
+        _write_beneath(wt, wt / ".git", f"gitdir: {admin}\n".encode(),
+                       mode=0o644)
+    except OSError:
+        return False
     co = subprocess.run(["git", *_tree_git_args(wt), "checkout", "-q", "--detach",
                          "--force", tip], capture_output=True, check=False,
                         timeout=300)
@@ -44419,7 +44776,7 @@ async def _confirm_still_failing(
     return out
 
 
-def _runner_report_file_durations(kind: str, path: Path,
+def _runner_report_file_durations(kind: str, report: bytes | None,
                                   tree: str | None = None
                                   ) -> dict[str, float]:
     """Repo-relative test file -> seconds it took, from a runner's
@@ -44428,6 +44785,9 @@ def _runner_report_file_durations(kind: str, path: Path,
     of its cases' `duration`), the sum of JUnit `time` per file, the sum of
     rspec `run_time` per file. `{}` for a format with no per-file time or
     an unreadable report."""
+
+    if report is None:
+        return {}
 
     def _rel(name: str) -> str:
         if tree is not None and os.path.isabs(name):
@@ -44441,7 +44801,7 @@ def _runner_report_file_durations(kind: str, path: Path,
                 and not isinstance(v, bool) and v >= 0 else None)
     try:
         if kind == "jest-json":
-            data = json.loads(Path(path).read_text())
+            data = json.loads(report.decode())
             for suite in data.get("testResults") or []:
                 name = str(suite.get("name") or "")
                 if not name:
@@ -44458,7 +44818,7 @@ def _runner_report_file_durations(kind: str, path: Path,
                              suite.get("assertionResults") or [])
                 out[_rel(name)] = out.get(_rel(name), 0.0) + ms / 1000.0
         elif kind == "junit":
-            root = ElementTree.parse(path).getroot()
+            root = ElementTree.fromstring(report)
             for case in root.iter("testcase"):
                 f = case.get("file")
                 if not f and tree is not None and case.get("classname"):
@@ -44470,7 +44830,7 @@ def _runner_report_file_durations(kind: str, path: Path,
                 if f:
                     out[_rel(f)] = out.get(_rel(f), 0.0) + max(t, 0.0)
         elif kind == "rspec-json":
-            data = json.loads(Path(path).read_text())
+            data = json.loads(report.decode())
             for ex in data.get("examples") or []:
                 f = str(ex.get("file_path") or "")
                 if f:
@@ -44497,13 +44857,13 @@ def _record_test_durations(st: "State", durations: dict[str, float]) -> None:
         save()
 
 
-def _runner_report_failing_ids(kind: str, path: Path,
+def _runner_report_failing_ids(kind: str, report: bytes | None,
                                tree: str) -> dict[str, str | None] | None:
     """Failing test ID -> repo-relative file (None when the report does not
     say) from a runner's structured report — the cases
     `_runner_report_cases` reads (DESIGN §12). None when there is no
     readable report, or it executed no test and recorded no load failure."""
-    cases = _runner_report_cases(kind, path, str(tree))
+    cases = _runner_report_cases(kind, report, str(tree))
     if cases is None:
         return None
     out = {c["id"]: c["file"] for c in cases
@@ -44582,7 +44942,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     # commands are confined too*).
     grants = (_heldout_grants(st, tree) if place
               else _measurement_grants(st, tree))
-    reports = _measure_dir(st, tree) / "reports"
+    own = _measure_dir(st, tree)
+    reports = own / "reports"
     forbidden = _forbidden_specs(getattr(st, "data", None))
     # Run time spent by earlier attempts: charged to the retry's timeout.
     spent = 0.0
@@ -44615,16 +44976,21 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             # The serial run used what the caller gave: no as-written retry
             # past it.
             return None
+        # A held-out run's report comes back through the sandbox's
+        # descriptor and is never on disk; any other run's is the command's
+        # own file, read and removed without following a link the command
+        # planted (DESIGN §6 *Leerie never writes through a path confined
+        # code shaped*).
+        got = bytearray()
         try:
-            report.parent.mkdir(parents=True, exist_ok=True)
+            _mkdir_private(reports, own)
+            _unlink_beneath(own, report)
             async with _blt_semaphore(caps), \
                     _build_class_slot(st, label=f"{label}-ids"), \
                     _leaves_tree_as_found(tree, "test run", label):
                 t_run = time.monotonic()
                 try:
                     if place:
-                        with contextlib.suppress(OSError):
-                            report.unlink()
                         async with _held_out_section(st):
                             await _run_streaming(
                                 argv, grants=grants, cwd=str(tree), env=env,
@@ -44633,7 +44999,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                 verbosity="quiet",
                                 sandbox=HeldOutSandbox(
                                     view=str(tree), place=tuple(place),
-                                    report=str(report)))
+                                    report=str(report)),
+                                report_into=got)
                     else:
                         await _run_streaming(
                             argv, grants=grants, cwd=str(tree), env=env,
@@ -44645,17 +45012,23 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         except Exception:
             # A timeout or a spawn failure: no verdict from this run.
             with contextlib.suppress(OSError):
-                report.unlink()
+                _unlink_beneath(own, report)
             return None
-        ids = _runner_report_failing_ids(kind, report, str(tree))
-        durations = _runner_report_file_durations(kind, report, str(tree))
+        data: bytes | None = bytes(got) if place else None
+        if not place:
+            with contextlib.suppress(OSError):
+                data = _read_beneath(own, report)
+            with contextlib.suppress(OSError):
+                _unlink_beneath(own, report)
+        ids = _runner_report_failing_ids(kind, data or None, str(tree))
+        durations = _runner_report_file_durations(kind, data or None,
+                                                  str(tree))
         _record_test_durations(st, durations)
         messages = {c["id"]: c.get("message", "")
-                    for c in (_runner_report_cases(kind, report, str(tree))
+                    for c in (_runner_report_cases(kind, data or None,
+                                                   str(tree))
                               or [])
                     if ids and c["id"] in ids}
-        with contextlib.suppress(OSError):
-            report.unlink()
         if ids is not None:
             return {"ids": sorted(ids), "files": ids, "kind": kind,
                     "messages": messages, "durations": durations}
@@ -48928,7 +49301,7 @@ def _acceptance_no_verdict_exits(cmd: str, files: Iterable[str] = ()
 # "env" sets PYTEST_ADDOPTS and so works whatever the command's shape — unless
 # the command names its own JUnit path, which beats it, when the option is
 # appended instead; "rbplugin" puts leerie's minitest reporter on RUBYLIB
-# (`_MINITEST_REPORT_PLUGIN`), also whatever the shape; "stdout:<flags>"
+# (`MINITEST_REPORT_LIB`), also whatever the shape; "stdout:<flags>"
 # appends the flags and sends the runner's stdout — its JSON event stream —
 # to the report path; any other flag string is appended to the command.
 # Appending is only safe where `_flags_reach_runner` holds
@@ -48950,37 +49323,15 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
 _RUNNER_REPORT_ENV: dict[str, dict[str, str]] = {
     "cargo": {"RUSTC_BOOTSTRAP": "1"},
 }
-# leerie's minitest reporter, found by `Minitest.load_plugins` through
-# RUBYLIB: one JSON record per case, written to $LEERIE_MT_REPORT. It
-# requires no minitest itself, so a bundled app's pinned version is the one
-# that loads (benched as C9 with `bin/rails test` and the ruby loader, on
-# the rootless and rootful runtimes).
-_MINITEST_REPORT_PLUGIN = """\
-require "json"
-module Minitest
-  class LeerieReportReporter < AbstractReporter
-    def initialize(path)
-      @path = path
-      @cases = []
-    end
-
-    def record(r)
-      st = r.skipped? ? "skipped" : (r.error? ? "error" : (r.passed? ? "passed" : "failed"))
-      loc = r.respond_to?(:source_location) ? r.source_location : nil
-      @cases << {id: "#{r.klass}##{r.name}", file: loc && loc.first, status: st}
-    end
-
-    def report
-      File.write(@path, JSON.generate({cases: @cases}))
-    end
-  end
-
-  def self.plugin_leeriereport_init(_opts)
-    p = ENV["LEERIE_MT_REPORT"]
-    reporter << LeerieReportReporter.new(p) if p && !p.empty?
-  end
-end
-"""
+# leerie's minitest reporter (`minitest/leeriereport_plugin.rb` beneath
+# this directory), found by `Minitest.load_plugins` through RUBYLIB: one
+# JSON record per case, written to $LEERIE_MT_REPORT. It requires no
+# minitest itself, so a bundled app's pinned version is the one that loads
+# (benched as C9 with `bin/rails test` and the ruby loader, on the rootless
+# and rootful runtimes). Shipped with leerie's install, which every confined
+# command reads: leerie writes nothing for it where a command writes
+# (DESIGN §6 *Leerie never writes through a path confined code shaped*).
+MINITEST_REPORT_LIB = ROOT / "scripts" / "minitest-report"
 
 # Container and remote CLIs, and commands that run their argument as another
 # user (`su`, `sudo`, `runuser`, `doas`, which reset the environment and may
@@ -49038,18 +49389,10 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
             tokens, _runner_positions(tokens, runner, files)):
         return None
     if how == "rbplugin":
-        plugin_dir = Path(path).parent / ".leerie-rbplugin"
-        plugin = plugin_dir / "minitest" / "leeriereport_plugin.rb"
-        try:
-            plugin.parent.mkdir(parents=True, exist_ok=True)
-            if not plugin.is_file():
-                plugin.write_text(_MINITEST_REPORT_PLUGIN)
-        except OSError:
-            return None
         prior = os.environ.get("RUBYLIB", "")
         return cmd, {**os.environ,
-                     "RUBYLIB": (f"{plugin_dir}:{prior}" if prior
-                                 else str(plugin_dir)),
+                     "RUBYLIB": (f"{MINITEST_REPORT_LIB}:{prior}" if prior
+                                 else str(MINITEST_REPORT_LIB)),
                      "LEERIE_MT_REPORT": str(path)}, kind
     if how.startswith("stdout:"):
         placed = _append_runner_flags(cmd, runner, files,
@@ -49594,14 +49937,14 @@ def _command_word(tokens: list[tuple[str, str, int]]) -> str | None:
     return None
 
 
-def _parse_runner_report(kind: str, path: Path) -> dict | None:
+def _parse_runner_report(kind: str, report: bytes | None) -> dict | None:
     """`{executed, collection_error, cases}` from a runner's structured
     report — `cases` maps each case ID to its status (`passed`, `failed`,
     `skipped` or `load_error`), the per-case verdict validation reads
     (DESIGN §8 *Held-out acceptance tests*) — or None when there is none to
     read (the runner ignored the request, or it died before writing). Reads
     fixed machine formats only (DESIGN §12)."""
-    cases = _runner_report_cases(kind, path)
+    cases = _runner_report_cases(kind, report)
     if cases is None:
         return None
     return {"executed": sum(1 for c in cases
@@ -49618,7 +49961,7 @@ def _parse_runner_report(kind: str, path: Path) -> dict | None:
                else {})}
 
 
-def _runner_report_cases(kind: str, path: Path,
+def _runner_report_cases(kind: str, report: bytes | None,
                          tree: str | None = None) -> list[dict] | None:
     """Every case a runner's structured report records, as
     `{id, file, status}` — `status` one of `passed`, `failed` (a setup error
@@ -49628,7 +49971,10 @@ def _runner_report_cases(kind: str, path: Path,
     when there is no readable report of a known kind. Fixed machine formats
     only (DESIGN §12): pytest's JUnit XML, the jest-compatible JSON of jest
     and vitest, rspec's JSON formatter, leerie's minitest reporter
-    (`_MINITEST_REPORT_PLUGIN`), `go test -json` and libtest's JSON events."""
+    (`MINITEST_REPORT_LIB`), `go test -json` and libtest's JSON events."""
+
+    if report is None:
+        return None
 
     def _rel(name: str) -> str:
         if tree is not None and os.path.isabs(name):
@@ -49646,7 +49992,7 @@ def _runner_report_cases(kind: str, path: Path,
 
     def _json_lines() -> list[dict]:
         events = []
-        for line in Path(path).read_text().splitlines():
+        for line in report.decode().splitlines():
             try:
                 ev = json.loads(line)
             except ValueError:
@@ -49657,7 +50003,7 @@ def _runner_report_cases(kind: str, path: Path,
 
     try:
         if kind == "junit":
-            root = ElementTree.parse(path).getroot()
+            root = ElementTree.fromstring(report)
             for case in root.iter("testcase"):
                 tags = {child.tag for child in case}
                 classname = case.get("classname") or ""
@@ -49692,7 +50038,7 @@ def _runner_report_cases(kind: str, path: Path,
                 _add(f"{rel or classname} :: {classname}.{name}", rel, status,
                      msg)
         elif kind == "jest-json":
-            data = json.loads(Path(path).read_text())
+            data = json.loads(report.decode())
             for suite in data.get("testResults") or []:
                 rel = _rel(str(suite.get("name") or ""))
                 results = suite.get("assertionResults") or []
@@ -49708,7 +50054,7 @@ def _runner_report_cases(kind: str, path: Path,
                          "\n".join(str(m) for m in
                                    (r.get("failureMessages") or [])))
         elif kind == "rspec-json":
-            data = json.loads(Path(path).read_text())
+            data = json.loads(report.decode())
             for ex in data.get("examples") or []:
                 rel = _rel(str(ex.get("file_path") or ""))
                 title = (ex.get("full_description") or ex.get("description")
@@ -49721,7 +50067,7 @@ def _runner_report_cases(kind: str, path: Path,
                 # A spec file that raised while loading.
                 _add("(rspec) :: (file failed to load)", None, "load_error")
         elif kind == "minitest-json":
-            data = json.loads(Path(path).read_text())
+            data = json.loads(report.decode())
             for c in data.get("cases") or []:
                 rel = _rel(str(c["file"])) if c.get("file") else None
                 st_ = c.get("status")
@@ -49873,20 +50219,14 @@ async def _acceptance_parse_probe_run(st: "State", caps: dict, tree: str,
     # The marker is the sandbox's report: the probe writes it inside the
     # sandbox, and it comes back through the report descriptor (DESIGN §6
     # *A held-out evaluation runs alone*).
+    # It is a path inside the sandbox only: leerie never writes or reads
+    # it on disk, where its directory is the tree's measurement directory,
+    # which confined code writes (DESIGN §6 *Leerie never writes through a
+    # path confined code shaped*).
     grants = _heldout_grants(st, tree)
     marker = _measure_dir(st, tree) / "reports" / (
         f"{label}-probe-{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}")
-    try:
-        # The probe writes this marker as the same user, so proving the
-        # orchestrator can write it first keeps an unwritable directory from
-        # reading as "failed before reaching the parse check".
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("")
-        marker.unlink()
-    except OSError as e:
-        return None, (f"the parse check could not be prepared "
-                      f"({type(e).__name__}: its marker directory is not "
-                      "writable)")
+    got = bytearray()
     try:
         src.write_text(_PARSE_PROBE_SOURCE.format(
             targets=[str(Path(tree) / t) for t in targets],
@@ -49902,13 +50242,11 @@ async def _acceptance_parse_probe_run(st: "State", caps: dict, tree: str,
                 verbosity="quiet",
                 sandbox=HeldOutSandbox(view=str(tree),
                                        place=((str(src), probe),),
-                                       report=str(marker)))
+                                       report=str(marker)),
+                report_into=got)
     except Exception as e:
         return None, f"the parse check could not run ({type(e).__name__})"
-    try:
-        state = marker.read_text()
-    except OSError:
-        state = ""
+    state = bytes(got).decode(errors="replace")
     if state == "ok":
         if rc == 0:
             return True, ""
@@ -50181,20 +50519,20 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     # and no-verdict exits are known (DESIGN §9 *Which failures are new*).
     cmd, path_env = _runner_command(cmd, tree, _RUNNER_REPORTS, [rel])
     run_cmd, env, spec = cmd, None, None
-    # The tree's own measurement directory, never `acceptance/`, which no
-    # confined command is granted (DESIGN §6 *Leerie's runs of the
-    # repository's commands are confined too*); written there by the
-    # sandbox's report descriptor after the run exits.
+    # A path inside the sandbox, in the tree's own measurement directory
+    # (never `acceptance/`, which no confined command is granted): the
+    # report comes back through the sandbox's descriptor and is parsed from
+    # its bytes, never put on disk, where that directory is one confined
+    # code writes (DESIGN §6 *Leerie never writes through a path confined
+    # code shaped*).
     grants = _heldout_grants(st, tree)
     report = _measure_dir(st, tree) / "reports" / (
         f"{label}-{hashlib.sha256(rel.encode()).hexdigest()[:12]}")
+    got_report = bytearray()
     if validating or cases_out is not None:
         spec = _acceptance_report_spec(cmd, report, [rel])
         if spec is not None:
             run_cmd, env, _kind = spec
-            report.parent.mkdir(parents=True, exist_ok=True)
-            with contextlib.suppress(OSError):
-                report.unlink()
     if path_env:
         env = {**(env if env is not None else os.environ), **path_env}
     try:
@@ -50219,7 +50557,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
                 log_path=log_path, label=f"{label}-tests: {run_cmd}",
-                verbosity="quiet", sandbox=sandbox)
+                verbosity="quiet", sandbox=sandbox, report_into=got_report)
         except subprocess.TimeoutExpired:
             # A timeout is a resource signature: the run is failing but
             # names no case evidence (DESIGN §8 *Delivery re-drive* rule 4).
@@ -50233,7 +50571,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
         return None
     if not validating:
         if cases_out is not None:
-            got = (_parse_runner_report(spec[2], report)
+            got = (_parse_runner_report(spec[2], bytes(got_report) or None)
                    if spec is not None else None)
             if got is None and _rc_is_resource_signal(rc):
                 # Killed (an OOM kill, a signal) before writing a report.
@@ -50251,7 +50589,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                     cid: m for cid, m in (got.get("messages") or {}).items()
                     if cid in cases_out["failing_cases"]}
         return rc == 0
-    parsed = _parse_runner_report(spec[2], report) if spec else None
+    parsed = (_parse_runner_report(spec[2], bytes(got_report) or None)
+              if spec else None)
     if parsed is None:
         if rc in _acceptance_no_verdict_exits(cmd, [rel]):
             return None
@@ -50312,14 +50651,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     try:
         # The report is usually an untracked file in the user's checkout,
         # absent from a fresh worktree: copy what the task names.
-        refs = []
-        for f in _glob_task_references(task, st.repo_root):
-            rel = _repo_rel(f, st.repo_root)
-            dst = wt / rel
-            if not dst.exists():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(f, dst)
-            refs.append(rel)
+        _copied, refs = _copy_task_references(st, wt, task)
         if not await _ensure_worktree_deps(
                 str(wt), st, caps, log_path=log_path,
                 verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
@@ -50620,8 +50952,8 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     dest = st.run_dir / "acceptance" / dest_name
     _rmtree_owned(dest)
     for rel in defect + control + support:
-        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(wt / rel, dest / rel)
+        # Read from the writer's checkout without following a link it left.
+        _copy_beneath(wt / rel, st.run_dir, dest / rel, src_anchor=wt)
     out.update(valid=True, dir=str(dest), defect_files=defect,
                control_files=control, support_files=support, cases=cases,
                modes=modes, base_failing_cases=base_failing,
@@ -51951,6 +52283,27 @@ def _reconcile_audit_verdicts(audits: dict[int, dict]) -> list[dict]:
     return conflicts
 
 
+def _copy_task_references(st: "State", wt: Path, task: str
+                          ) -> tuple[list[Path], list[str]]:
+    """Copy every file the task references that `wt` lacks into it:
+    (copied paths, every referenced path relative to the repository). The
+    checkout holds committed code, links included, so each copy is made
+    beneath `wt` without following one (DESIGN §6 *Leerie never writes
+    through a path confined code shaped*); a path a link stands on is
+    taken, and not copied."""
+    copied: list[Path] = []
+    refs: list[str] = []
+    for f in _glob_task_references(task, st.repo_root):
+        rel = _repo_rel(f, st.repo_root)
+        dst = wt / rel
+        if not _lexists_beneath(wt, dst):
+            with contextlib.suppress(OSError):
+                _copy_beneath(Path(f), wt, dst)
+                copied.append(dst)
+        refs.append(rel)
+    return copied, refs
+
+
 def _place_set(set_: dict, wt: Path) -> tuple[list[Path], bool]:
     """Copy a set's files into `wt`; (copied paths, complete) — a path the
     tree already has is never overwritten, and makes the placement
@@ -51959,19 +52312,25 @@ def _place_set(set_: dict, wt: Path) -> tuple[list[Path], bool]:
     complete = True
     for rel in _set_files(set_):
         dst = wt / rel
-        if dst.exists():
+        # `wt` holds committed code, links included: a path with a link on
+        # the way is taken, and the copy never follows one (DESIGN §6
+        # *Leerie never writes through a path confined code shaped*).
+        if _lexists_beneath(wt, dst):
             complete = False
             continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(Path(set_["dir"]) / rel, dst)
+        try:
+            _copy_beneath(Path(set_["dir"]) / rel, wt, dst)
+        except OSError:
+            complete = False
+            continue
         copied.append(dst)
     return copied, complete
 
 
-def _unplace(copied: Iterable[Path]) -> None:
+def _unplace(copied: Iterable[Path], wt: Path) -> None:
     for dst in copied:
         with contextlib.suppress(OSError):
-            dst.unlink()
+            _unlink_beneath(wt, dst)
 
 
 async def _acceptance_case_failures(st: "State", caps: dict, wt: Path,
@@ -52036,15 +52395,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
     refs_copied: list[Path] = []
     try:
         task = st.data.get("task") or ""
-        refs = []
-        for f in _glob_task_references(task, st.repo_root):
-            rel = _repo_rel(f, st.repo_root)
-            dst = wt / rel
-            if not dst.exists():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(f, dst)
-                refs_copied.append(dst)
-            refs.append(rel)
+        refs_copied, refs = _copy_task_references(st, wt, task)
         g = _js_source_graph(_run_repo(st), harness_rev)
         harness = _repo_test_harness(_run_repo(st), harness_rev,
                                      _set_production_imports(g, set_))
@@ -52132,7 +52483,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
                 if (k := _audit_case_key(set_, c["file"], c["case"], g))}
         return out
     finally:
-        _unplace(copied + refs_copied)
+        _unplace(copied + refs_copied, wt)
 
 
 @contextlib.asynccontextmanager
@@ -52197,16 +52548,7 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
             ).startswith("failed"):
         return None
     task = st.data.get("task") or ""
-    copied: list[Path] = []
-    refs = []
-    for f in _glob_task_references(task, st.repo_root):
-        rel = _repo_rel(f, st.repo_root)
-        dst = wt / rel
-        if not dst.exists():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(f, dst)
-            copied.append(dst)
-        refs.append(rel)
+    copied, refs = _copy_task_references(st, wt, task)
     if not await _ensure_worktree_deps(
             str(wt), st, caps, log_path=log_path,
             verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
@@ -52238,7 +52580,7 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
     except (WorkerError, subprocess.TimeoutExpired) as e:
         return {"dir": wt, "abstained": _brief_worker_exc(e)}
     # Only the report copies made above go; never a tracked file.
-    _unplace(copied)
+    _unplace(copied, wt)
     changed = subprocess.run(["git", *_tree_git_args(wt), "status",
                               "--porcelain", "--untracked-files=no"],
                              capture_output=True, text=True, check=False)
@@ -53179,17 +53521,15 @@ def _restore_write_bits(tree: str | Path) -> None:
     dirs = [""] + [os.fsdecode(d) for d in r.stdout.split(b"\0") if d]
     for d in dirs:
         with contextlib.suppress(OSError):
-            full = os.path.join(str(tree), d)
-            mode = os.lstat(full).st_mode
-            if stat.S_ISDIR(mode) and (mode & 0o300) != 0o300:
-                os.chmod(full, stat.S_IMODE(mode) | 0o300)
+            _add_dir_bits_beneath(Path(tree), Path(d), 0o300)
     for rel in _untracked_listing(tree, directory=True) or []:
         full = Path(tree) / rel
         _writable_dirs_to(tree, rel.rstrip("/"))
         if full.is_dir() and not full.is_symlink():
             for d, _dirs, _files in os.walk(full):
                 with contextlib.suppress(OSError):
-                    os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) | 0o700)
+                    _add_dir_bits_beneath(
+                        Path(tree), Path(os.path.relpath(d, tree)), 0o700)
 
 
 def _drop_lying_index(tree: str | Path, prefix: list[str],
@@ -53220,6 +53560,16 @@ def _drop_lying_index(tree: str | Path, prefix: list[str],
                          env=env).stdout.strip()
     if not idx:
         return False
+    # A tree repository's git directory is its worker's to write: removed
+    # from the run directory down, never through a link (DESIGN §6 *Leerie
+    # never writes through a path confined code shaped*).
+    loc = _run_tree_location(tree)
+    if isinstance(loc, tuple):
+        try:
+            _unlink_beneath(loc[2], Path(idx))
+        except (OSError, ValueError):
+            return False
+        return True
     with contextlib.suppress(FileNotFoundError):
         os.unlink(idx)
     return True
@@ -54791,10 +55141,12 @@ async def _probe_case_facts_placed(st: "State", tree: str | Path, src: str,
     (DESIGN §6 *A held-out evaluation runs alone*; a falsifier's probe is
     held-out content). `{"error": "facts_failed…"}` when the script could
     not run or wrote no JSON."""
+    # A path inside the sandbox only: the JSON comes back through its
+    # descriptor, never on disk (DESIGN §6 *Leerie never writes through a
+    # path confined code shaped*).
     report = _measure_dir(st, tree) / "reports" / (
         f"facts-{uuid.uuid4().hex[:12]}")
-    with contextlib.suppress(OSError):
-        report.unlink()
+    got = bytearray()
     try:
         async with _held_out_section(st):
             await _run_streaming(
@@ -54805,16 +55157,14 @@ async def _probe_case_facts_placed(st: "State", tree: str | Path, src: str,
                 log_path=_held_out_logs(st.run_dir) / "falsifier-facts.log",
                 label="falsifier facts", verbosity="quiet",
                 sandbox=HeldOutSandbox(view=str(tree), place=((src, rel),),
-                                       report=str(report)))
+                                       report=str(report)),
+                report_into=got)
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"error": f"facts_failed: {type(e).__name__}"}
     try:
-        out = json.loads(report.read_text())
-    except (OSError, ValueError):
+        out = json.loads(bytes(got).decode())
+    except ValueError:
         return {"error": "facts_failed"}
-    finally:
-        with contextlib.suppress(OSError):
-            report.unlink()
     return out if isinstance(out, dict) else {"error": "facts_failed"}
 
 
@@ -55004,10 +55354,11 @@ def _checkout_ignorable(wt: Path, rel: str) -> bool:
     gi = wt / os.path.dirname(rel.strip("/")) / ".gitignore"
     if rel.endswith("/"):
         gi = wt / rel.strip("/") / ".gitignore"
-    if not gi.exists():
+    if not _lexists_beneath(wt, gi):
         return True
     try:
-        return gi.read_text().splitlines()[:1] == [_CHECKOUT_IGNORE_TAG]
+        return (_read_beneath(wt, gi).decode().splitlines()[:1]
+                == [_CHECKOUT_IGNORE_TAG])
     except (OSError, UnicodeDecodeError):
         return False
 
@@ -55019,22 +55370,34 @@ def _checkout_ignore(wt: Path, rels: Iterable[str]) -> list[str]:
     its own — tracked, or the user's — is never edited: its rels are
     returned, not ignored."""
     by_dir: dict[str, list[str]] = {}
+    of_dir: dict[str, list[str]] = {}
     refused: list[str] = []
     for rel in rels:
         if not _checkout_ignorable(wt, rel):
             refused.append(rel)
-        elif rel.endswith("/"):
-            by_dir.setdefault(rel.strip("/"), []).append("*")
+            continue
+        if rel.endswith("/"):
+            d, pat = rel.strip("/"), "*"
         else:
             d, name = os.path.split(rel.strip("/"))
-            by_dir.setdefault(d, []).append("/" + _gitignore_escape(name))
+            pat = "/" + _gitignore_escape(name)
+        by_dir.setdefault(d, []).append(pat)
+        of_dir.setdefault(d, []).append(rel)
     for d, pats in by_dir.items():
+        # The checkout is the falsifier's, holding committed code: read and
+        # written beneath it, never through a link (DESIGN §6 *Leerie never
+        # writes through a path confined code shaped*).
         gi = wt / d / ".gitignore"
-        lines = (gi.read_text().splitlines() if gi.is_file()
-                 else [_CHECKOUT_IGNORE_TAG, "/.gitignore"])
+        try:
+            lines = _read_beneath(wt, gi).decode(
+                errors="replace").splitlines()
+        except OSError:
+            lines = [_CHECKOUT_IGNORE_TAG, "/.gitignore"]
         lines += [p_ for p_ in dict.fromkeys(pats) if p_ not in lines]
-        gi.parent.mkdir(parents=True, exist_ok=True)
-        gi.write_text("\n".join(lines) + "\n")
+        try:
+            _write_beneath(wt, gi, ("\n".join(lines) + "\n").encode())
+        except OSError:
+            refused += of_dir[d]
     return refused
 
 
@@ -55045,12 +55408,11 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
     every file the task references that the checkout lacks (a report filed
     for the task). Both git-ignored in this checkout only
     (`_checkout_ignore`). Returns (lead files, referenced files present)."""
+    # The checkout holds committed code, links included: the leads are
+    # removed without following one, and written beneath it (DESIGN §6
+    # *Leerie never writes through a path confined code shaped*).
     leads = wt / FALSIFIER_LEADS_DIR
-    if leads.exists():
-        for p in leads.rglob("*"):
-            with contextlib.suppress(OSError):
-                p.chmod(0o755 if p.is_dir() else 0o644)
-        _rmtree_owned(leads)
+    _remove_beneath(wt, leads)
     excludes = [FALSIFIER_LEADS_DIR + "/"]
     ctx: list[str] = []
     for s_ in sets:
@@ -55063,9 +55425,10 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
             if not src.is_file():
                 continue
             dst = leads / "acceptance" / f"set-{s_.get('index')}" / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            dst.chmod(0o444)
+            try:
+                _write_beneath(wt, dst, src.read_bytes(), mode=0o444)
+            except OSError:
+                continue
             ctx.append(str(dst.relative_to(wt)))
     refs: list[str] = []
     try:
@@ -55075,11 +55438,11 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
     for f in referenced:
         rel = _repo_rel(f, st.repo_root)
         dst = wt / rel
-        if not dst.exists() and Path(f).is_file():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(f, dst)
-            excludes.append(rel)
-        if dst.exists():
+        if not _lexists_beneath(wt, dst) and Path(f).is_file():
+            with contextlib.suppress(OSError):
+                _copy_beneath(Path(f), wt, dst)
+                excludes.append(rel)
+        if _lexists_beneath(wt, dst):
             refs.append(rel)
     # A referenced file whose directory has its own `.gitignore` stays
     # visible: the checkout is disposable and nothing commits from it.
@@ -55161,7 +55524,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
     if not all(g.values()):
         return out
     dst = confirm_tree / rel
-    if dst.exists() or dst.is_symlink():
+    if _lexists_beneath(Path(confirm_tree), dst):
         g["placed"] = False
         return out
     log_path = _held_out_logs(st.run_dir) / f"falsifier-confirm-{label}.log"
@@ -55173,7 +55536,9 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                                suffix=Path(rel).suffix)
     os.close(fd)
     try:
-        shutil.copyfile(lane / rel, src)
+        # Read from the lane, which its falsifier wrote, without following
+        # a link it left there.
+        Path(src).write_bytes(_read_beneath(lane, lane / rel))
         place = ((src, rel),)
 
         async def _run(left: float) -> set[str] | None:
@@ -55235,8 +55600,7 @@ def _falsifier_save_probe(st: "State", lane: Path, i: int,
     dst_dir = st.run_dir / "acceptance" / "probes" / f"i{i}"
     try:
         _rmtree_owned(dst_dir)
-        (dst_dir / rel).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(lane / rel, dst_dir / rel)
+        _copy_beneath(lane / rel, st.run_dir, dst_dir / rel, src_anchor=lane)
     except OSError:
         return None
     return {"dir": str(dst_dir), "file": rel}
@@ -55420,11 +55784,9 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         return {"enabled": True, "lanes": n_lanes}
     finally:
         for wt in trees:
-            leads = wt / FALSIFIER_LEADS_DIR
-            if leads.exists():
-                for p in leads.rglob("*"):
-                    with contextlib.suppress(OSError):
-                        p.chmod(0o755 if p.is_dir() else 0o644)
+            # `_rmtree_owned` gives every directory its bits, never
+            # following a link: no chmod of a lead the lane may have made a
+            # link.
             _remove_acceptance_checkout(st, wt)
 
 
@@ -57604,7 +57966,12 @@ def _redrive_ast_hits(staging: Path, base: str, head: str, *,
                                text=True, check=False)
             if b.returncode == 0:
                 bf = str(Path(td) / "base.ts")
-                Path(bf).write_text(b.stdout)
+                # The private temp directory is the measurement's to write:
+                # reached from its root, never through a link (DESIGN §6
+                # *Leerie never writes through a path confined code
+                # shaped*).
+                _write_beneath(Path(scratch) if scratch else Path(td),
+                               Path(bf), b.stdout.encode())
             try:
                 q = _ts_script_run(["node", str(REDRIVE_AST_GATE), bf,
                                     str(staging / f), f], tree=staging,
@@ -59687,10 +60054,15 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
             / _CGROUP_NAME_UNSAFE_RE.sub("-", sid))
     covdir = work / f"cov-{tag}"
     report = work / f"res-{tag}.json"
-    _rmtree_owned(covdir)
-    work.mkdir(parents=True, exist_ok=True)
+    # The measurement directory is the command's to write: every path in it
+    # is reached from its root without following a link (DESIGN §6 *Leerie
+    # never writes through a path confined code shaped*).
+    own = work.parent.parent
+    _mkdir_private(work, own)
     with contextlib.suppress(OSError):
-        report.unlink()
+        _remove_beneath(own, covdir)
+    with contextlib.suppress(OSError):
+        _unlink_beneath(own, report)
     argv = [str(exe), "run", "--reporter=json", f"--outputFile={report}"]
     if coverage:
         argv += ["--coverage.enabled=true", "--coverage.provider=v8",
@@ -59705,7 +60077,8 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
     real = os.path.realpath(tree)
     status = {t: False for t in tests}
     with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
-        for tr in json.loads(report.read_text()).get("testResults") or []:
+        for tr in json.loads(_read_beneath(own, report)).get(
+                "testResults") or []:
             rel = os.path.relpath(os.path.realpath(tr.get("name") or ""),
                                   real)
             if rel in status:
@@ -59715,7 +60088,7 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
     if coverage:
         with contextlib.suppress(OSError, ValueError, AttributeError,
                                  TypeError, KeyError):
-            for path, d in json.loads(cf.read_text()).items():
+            for path, d in json.loads(_read_beneath(own, cf)).items():
                 rel = os.path.relpath(os.path.realpath(path), real)
                 lh: dict[int, int] = {}
                 for k, loc in (d.get("statementMap") or {}).items():
@@ -59812,13 +60185,13 @@ async def _measure_subtask_coverage(sid: str, tree: Path, base_ref: str,
         return rec
     baseline = tree / _COV_BASELINE_TEST
     try:
-        baseline.write_text(_COV_BASELINE_TEXT)
+        _write_beneath(tree, baseline, _COV_BASELINE_TEXT.encode())
         _, base_hits = await _vitest_run(exe, tree, [_COV_BASELINE_TEST],
                                          prods, st=st, caps=caps, sid=sid,
                                          tag="baseline")
     finally:
         with contextlib.suppress(OSError):
-            baseline.unlink()
+            _unlink_beneath(tree, baseline)
     h1, _passed, ft1 = await _vitest_cover(exe, tree, own, prods, st=st,
                                            caps=caps, sid=sid, tag="own")
     rec["own_failed_twice"] = ft1
@@ -62409,22 +62782,16 @@ async def _rescue_integrator_work(staging: Path, sid: str,
 
     Best-effort by contract: a rescue failure must never mask the underlying
     crash, so every git failure degrades to None."""
-    # The worktree's OWN git dir, never `staging/.git/...`: staging is a
-    # linked worktree, where `.git` is a file, so a path under it cannot be
-    # created and every rescue returned None. `--absolute-git-dir` is the
-    # per-worktree admin dir (`<common>/worktrees/<name>`), private to this
-    # checkout, not the shared repository's own files.
-    # Plain `subprocess.run`, outside the `run_proc` sequence the rescue's
-    # own steps are pinned by, and failure-tolerant like them.
+    # In a directory of leerie's own, never the tree's git directory: for
+    # staging that is in its tree repository, which the integrator writes
+    # whole, so a link it left there would carry git's index writes out
+    # (DESIGN §6 *Leerie never writes through a path confined code
+    # shaped*). (`staging/.git/...` was never possible: `.git` is a file.)
     try:
-        gd = subprocess.run(["git", *_tree_git_args(staging), "rev-parse", "--absolute-git-dir"],
-                            cwd=str(staging), capture_output=True, text=True,
-                            check=False, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
+        rescue_dir = Path(tempfile.mkdtemp(prefix="leerie-rescue-"))
+    except OSError:
         return None
-    if gd.returncode != 0 or not gd.stdout.strip():
-        return None
-    rescue_index = Path(gd.stdout.strip()) / f"leerie-rescue-index-{sid}"
+    rescue_index = rescue_dir / f"leerie-rescue-index-{sid}"
     env = {**os.environ, "GIT_INDEX_FILE": str(rescue_index)}
     try:
         seed = await run_proc(["git", *_tree_git_args(staging), "read-tree", "HEAD"],
@@ -62477,7 +62844,7 @@ async def _rescue_integrator_work(staging: Path, sid: str,
     except Exception:
         return None
     finally:
-        rescue_index.unlink(missing_ok=True)
+        _rmtree_owned(rescue_dir)
 
 
 # --- Integration repair (DESIGN §6 *When integration cannot succeed*) -------
@@ -62654,13 +63021,12 @@ async def _overlay_other_side(tree: Path, other: str, base: str,
             continue
         target = tree / path
         if code.startswith("D"):
-            target.unlink(missing_ok=True)
+            _unlink_beneath(tree, target)
             continue
         content = await run_proc(["git", *_tree_git_args(tree), "show", f"{other}:{path}"],
                                  cwd=str(tree))
         if content.returncode == 0:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content.stdout)
+            _write_beneath(tree, target, content.stdout.encode())
 
 
 async def _integration_test_failures(
@@ -63726,7 +64092,7 @@ async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
             return None
         merged[f] = render(value)
     for f, text in merged.items():
-        (staging / f).write_text(text)
+        _write_beneath(staging, staging / f, text.encode())
     add = await run_proc(["git", *_tree_git_args(staging), "--literal-pathspecs", "add", "--", *files],
                          cwd=str(staging))
     commit = (await run_proc(["git", *_tree_git_args(staging), "commit", "--no-edit"],

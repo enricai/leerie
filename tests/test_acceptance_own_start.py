@@ -288,6 +288,11 @@ def test_rspec_and_minitest_report_requests(leerie, tmp_path):
     assert env["LEERIE_MT_REPORT"] == str(tmp_path / "m.json")
     plugin = plugin_dir / "minitest" / "leeriereport_plugin.rb"
     assert "plugin_leeriereport_init" in plugin.read_text()
+    # Leerie's install, never written beside the report, in a directory the
+    # measured command writes (DESIGN §6 *Leerie never writes through a path
+    # confined code shaped*).
+    assert plugin_dir == leerie.MINITEST_REPORT_LIB
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("kind,fixture,failed,passed", [
@@ -301,7 +306,8 @@ def test_rspec_and_minitest_report_requests(leerie, tmp_path):
 def test_real_runner_reports_give_per_case_statuses(leerie, kind, fixture,
                                                     failed, passed):
     """The C9 bench's real reports (one failing case of four each)."""
-    parsed = leerie._parse_runner_report(kind, FIXTURES / fixture)
+    parsed = leerie._parse_runner_report(kind,
+                                         (FIXTURES / fixture).read_bytes())
     statuses = parsed["cases"]
     got_failed = [c for c, s in statuses.items() if s == "failed"]
     assert len(got_failed) == 1 and failed[0] in got_failed[0]
@@ -315,7 +321,7 @@ def test_a_go_package_that_did_not_build_is_a_load_error(leerie, tmp_path):
         {"Action": "start", "Package": "m/calc"},
         {"Action": "output", "Package": "m/calc", "Output": "build failed\n"},
         {"Action": "fail", "Package": "m/calc", "Elapsed": 0}]) + "\nnoise\n")
-    parsed = leerie._parse_runner_report("go-json", rep)
+    parsed = leerie._parse_runner_report("go-json", rep.read_bytes())
     assert parsed == {"executed": 0, "collection_error": True,
                       "cases": {"m/calc :: (package failed to build)":
                                 "load_error"}}
@@ -323,7 +329,8 @@ def test_a_go_package_that_did_not_build_is_a_load_error(leerie, tmp_path):
 
 def test_failing_ids_are_unchanged_for_junit(leerie, tmp_path):
     """B*'s persisted IDs keep their shape after the per-case refactor."""
-    ids = leerie._runner_report_failing_ids("junit", FIXTURES / "junit.xml",
+    ids = leerie._runner_report_failing_ids("junit",
+                                            (FIXTURES / "junit.xml").read_bytes(),
                                             str(tmp_path))
     assert list(ids) == [
         "tests.test_defect :: tests.test_defect.test_add_small"]

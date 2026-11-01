@@ -472,7 +472,8 @@ def test_jest_json_failing_ids(leerie, tmp_path):
         {"name": str(tree / "src/b.test.ts"), "status": "failed",
          "assertionResults": [], "testExecError": {"message": "boom"}},
     ]}))
-    ids = leerie._runner_report_failing_ids("jest-json", rep, str(tree))
+    ids = leerie._runner_report_failing_ids("jest-json", rep.read_bytes(),
+                                            str(tree))
     assert ids == {"src/a.test.ts :: a breaks": "src/a.test.ts",
                    "src/b.test.ts :: (file failed to load)": "src/b.test.ts"}
 
@@ -492,7 +493,8 @@ def test_junit_failing_ids_and_file_mapping(leerie, tmp_path):
         '<testcase classname="" name="tests.test_broken">'
         '<error message="collection failure"/></testcase>'
         '</testsuite></testsuites>')
-    ids = leerie._runner_report_failing_ids("junit", rep, str(tree))
+    ids = leerie._runner_report_failing_ids("junit", rep.read_bytes(),
+                                            str(tree))
     assert ids == {
         "tests/test_m.py :: tests.test_m.TestC.test_bad": "tests/test_m.py",
         "tests/test_broken.py :: (file failed to load)":
@@ -502,9 +504,9 @@ def test_junit_failing_ids_and_file_mapping(leerie, tmp_path):
 def test_report_with_nothing_executed_is_none(leerie, tmp_path):
     rep = tmp_path / "r.json"
     rep.write_text(json.dumps({"testResults": []}))
-    assert leerie._runner_report_failing_ids("jest-json", rep,
+    assert leerie._runner_report_failing_ids("jest-json", rep.read_bytes(),
                                              str(tmp_path)) is None
-    assert leerie._runner_report_failing_ids("junit", tmp_path / "no.xml",
+    assert leerie._runner_report_failing_ids("junit", None,
                                              str(tmp_path)) is None
 
 

@@ -29,7 +29,7 @@ def test_vitest_json_durations_per_file(leerie, tmp_path):
         # No start/end: the cases' durations are summed.
         {"name": str(tmp_path / "src/b.test.ts"),
          "assertionResults": [{"duration": 250}, {"duration": 750}]}]}))
-    got = leerie._runner_report_file_durations("jest-json", rep,
+    got = leerie._runner_report_file_durations("jest-json", rep.read_bytes(),
                                                str(tmp_path))
     assert got == {"src/a.test.ts": 2.5, "src/b.test.ts": 1.0}
 
@@ -45,10 +45,11 @@ def test_junit_durations_sum_per_file(leerie, tmp_path):
         '<testcase file="tests/test_b.py" classname="tests.test_b" '
         'name="t" time="2"/>'
         '</testsuite></testsuites>')
-    assert leerie._runner_report_file_durations("junit", rep, str(tmp_path)) \
+    assert leerie._runner_report_file_durations(
+        "junit", rep.read_bytes(), str(tmp_path)) \
         == {"tests/test_a.py": 1.75, "tests/test_b.py": 2.0}
     assert leerie._runner_report_file_durations(
-        "junit", tmp_path / "absent.xml", str(tmp_path)) == {}
+        "junit", None, str(tmp_path)) == {}
 
 
 # --- ranking and selection (pure) -------------------------------------------
