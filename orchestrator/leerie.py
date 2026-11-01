@@ -5936,6 +5936,59 @@ def _tree_stores_for(env: Mapping[str, str], cwd: str | Path | None
     return out
 
 
+# corepack resolves pnpm's version from the repo's `packageManager`, else a
+# "last known good" it keeps in `COREPACK_HOME`, else — floating — the
+# newest on the registry. A measurement must never float: a confined install
+# reads leerie's store read-only, and pnpm 11 keeps a SQLite db in the store
+# and pnpm 10.28 writes a project ref into it, both of which a read-only
+# store refuses, while pnpm 10.4.1 installs against it cleanly (measured on
+# barnacle and funeralworks). So corepack is bounded (`_COREPACK_PIN_ENV`),
+# and when a tree pins no version leerie seeds this one as the known good
+# (`_PNPM_DEFAULT_PIN`): it reads the current `lockfileVersion: 9` lockfiles.
+_PNPM_DEFAULT_PIN = "10.4.1"
+_COREPACK_PIN_ENV: dict[str, str] = {
+    "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+    "COREPACK_ENABLE_AUTO_PIN": "0",
+    "COREPACK_DEFAULT_TO_LATEST": "0",
+}
+
+
+def _reads_package_manager(tree: str | Path, wd: str) -> bool:
+    """Whether `<tree>/<wd>/package.json` pins `packageManager` — which
+    corepack honours over the seeded default."""
+    try:
+        pj = json.loads((Path(tree) / wd / "package.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return bool(isinstance(pj, dict) and pj.get("packageManager"))
+
+
+async def _seed_pnpm_pin(st: "State", stage: Path, log_path: Path,
+                         log_prefix: str) -> None:
+    """Seed `_PNPM_DEFAULT_PIN` as corepack's last-known-good pnpm in
+    `COREPACK_HOME`, so a tree that pins no `packageManager` resolves it
+    rather than the floating latest. Run like the store fetch it precedes:
+    through the task's forbid, confined to `stage` and leerie's stores
+    (`STORE_FETCH_KIND`), running no committed code. Best-effort."""
+    try:
+        argv = _blt_shell_argv(
+            ["corepack", "install", "-g", "pnpm@" + _PNPM_DEFAULT_PIN],
+            _forbidden_specs(st.data))
+    except ForbiddenByTask as ex:
+        log(f"  {log_prefix}: pnpm pin not seeded — {ex}")
+        return
+    try:
+        await _run_streaming(
+            argv, grants=_measurement_grants(st, stage, STORE_FETCH_KIND),
+            cwd=str(stage), env={**os.environ, **_COREPACK_PIN_ENV},
+            timeout=300, log_path=log_path,
+            label=f"corepack install -g pnpm@{_PNPM_DEFAULT_PIN}",
+            verbosity="quiet")
+    except Exception as ex:
+        log(f"  {log_prefix}: could not seed pnpm@{_PNPM_DEFAULT_PIN} "
+            f"({type(ex).__name__}) — corepack will resolve its own")
+
+
 def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
     """Point every `_STORE_VARS` variable of `env` at leerie's own store,
     `<state-root>/.stores/leerie/<name>`, made here (a value beneath the
@@ -22485,9 +22538,16 @@ def _measurement_grants(st: "State", tree: str | Path,
         mise_state.mkdir(parents=True, exist_ok=True)
     tmp = str(own / "tmp")
     xdg = own / "cache" / "xdg"
-    xdg.mkdir(parents=True, exist_ok=True)
+    state = own / "state"
+    runtime = own / "run"
+    for d in (xdg, state, runtime):
+        d.mkdir(parents=True, exist_ok=True)
+    # pnpm keeps a lock and (pnpm 11) a SQLite db under its state and runtime
+    # dirs; in the measurement directory they are writable while leerie's
+    # store stays read-only (DESIGN §6 *A measurement pins pnpm's version*).
     env = {"TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
-           "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": str(xdg)}
+           "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": str(xdg),
+           "XDG_STATE_HOME": str(state), "XDG_RUNTIME_DIR": str(runtime)}
     return WorkerGrants(
         tuple(dict.fromkeys(_around(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root)
@@ -41068,6 +41128,8 @@ async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
                 shutil.copytree(s, stage / name, symlinks=True)
             elif s.is_file():
                 shutil.copy2(s, stage / name)
+        if mgr == "pnpm" and not _reads_package_manager(tree, wd_rel):
+            await _seed_pnpm_pin(st, stage, log_path, log_prefix)
         try:
             # A fetch is leerie's own, but the task's forbid binds it too
             # (DESIGN §9): a forbidden fetch is skipped, and the install that
@@ -66070,8 +66132,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     leerie_root.mkdir(parents=True, exist_ok=True)
     (leerie_root / "runs").mkdir(parents=True, exist_ok=True)
     # Before any install: leerie's commands read only leerie's stores
-    # (DESIGN §6 *The stores a view installs from are leerie's*).
+    # (DESIGN §6 *The stores a view installs from are leerie's*), and
+    # corepack never floats pnpm's version (DESIGN §6 *A measurement pins
+    # pnpm's version*).
     _leerie_stores(os.environ, leerie_root)
+    os.environ.update(_COREPACK_PIN_ENV)
     if args.resume:
         run_id = resolve_run_id(leerie_root, args.run_id, resumable_only=True)
     elif args.run_id:

@@ -4706,6 +4706,23 @@ stores read-only, the verified ones writable, and its own tree's
 `tree-stores` writable (*Leerie's runs of the repository's commands are
 confined too*).
 
+**A measurement pins pnpm's version.** A confined install reads leerie's
+fetched store read-only, which only some pnpm versions can do. Measured
+under Landlock on barnacle and funeralworks, with the store read-only and
+`copy` import: pnpm 10.4.1 installs cleanly (barnacle 14.5 s with its
+scripts skipped; funeralworks 107.6 s with its scripts); pnpm 10.28.2 fails
+writing a project ref into the store (`<store>/v10/projects/`); pnpm 11
+fails writing its SQLite index. corepack picks the version from the
+repository's `packageManager`, else a last-known-good it keeps in
+`COREPACK_HOME`, else the newest on the registry, which was pnpm 11.1.2. So
+corepack never floats (`_COREPACK_PIN_ENV`: `COREPACK_DEFAULT_TO_LATEST=0`,
+no auto-pin, no prompt, set in `main()`), and when a tree pins no
+`packageManager` the fetch phase first seeds `_PNPM_DEFAULT_PIN` (10.4.1)
+as the known-good version (`_seed_pnpm_pin`); a tree that pins one keeps
+it. pnpm also writes a lock and state under `XDG_STATE_HOME` and
+`XDG_RUNTIME_DIR`, which `_measurement_grants` points at the measurement
+directory.
+
 What this does not cover: a worker writing leerie's store, a view, `/opt`
 or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside
 the worker's own tree, which the worker's write boundary forbids; this
