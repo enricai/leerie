@@ -8,9 +8,10 @@ Usage: selfcheck.py <config.json> [set file…] [-t PATTERN] [runner args…]
 The orchestrator writes the config and a `leerie-selfcheck` wrapper that
 calls this with it (`_selfcheck_prepare`). The logic is the orchestrator's
 own (`selfcheck_main`), imported from the sibling `orchestrator/`
-directory as `forbidden-command-hook.py` does, so the self-check places and
-runs the sets exactly as the evaluation does (`_place_set`,
-`_acceptance_cmd`)."""
+directory as `forbidden-command-hook.py` does, so the self-check renders
+the sets' command as the evaluation does (`_acceptance_cmd`), on a copy of
+the tree with the sets placed by `_place_set` (the evaluation places them
+in its sandbox instead)."""
 import os
 import sys
 

@@ -6144,6 +6144,37 @@ template kept at finalize.
   gate runs with leerie's temp files in the run directory, an AST script
   without the execution lock stops the run, and every caller holds it (a
   rule over the module).
+- `tests/test_held_out_relays.py` (6 tests; DESIGN §8 *Nothing a held-out
+  evaluation produces reaches a fixer but its verdict and leerie's own
+  identifiers*): a synthetic held-back set whose declared names, file path
+  and runner output carry a sentinel, driven through the real consumers —
+  the residual names shown sets only; the next run's planner
+  (`_prior_delivery_residual`) gets no held-back name; a residual recorded
+  before the rule is re-derived at read time; the judge record gives a
+  held-back set its verdict only; held-out transcripts never reach the
+  record (through the real `claude_p` → `_invoke_admitted` → `_invoke`);
+  leerie's runs of set files log on the held-out side. Each absence is
+  paired with a shown set's names still arriving.
+- `tests/test_worker_transcript_record.py` (13 tests; DESIGN §8 *What a
+  worker ran is read from its own transcript, never from a command's
+  output*): a measured command prints a forged `tool_use`/`tool_result`
+  line, and each reader — the delivery record, the dependency-capture
+  hint, the session a re-ask resumes, the malformed-envelope retry, run
+  health — is shown not to read it, beside a real worker event it must
+  read; a registry entry names a file of its own directory only; the
+  CLI's stderr in a transcript is never an event; the conformer's axes are
+  not measured into its transcript; `_run_streaming` refuses a worker's
+  transcript as a command's log; a reader's named path is no transcript
+  until registered; one reader (`_iter_transcript_events`) parses events
+  out of line text, and a rule over the module catches a second
+  transcript reader (with its own falsifier).
+- `tests/test_commands_keep_default_signals.py` (4 tests; DESIGN §6 *A
+  command leerie runs starts with the signal dispositions it would have
+  outside leerie*; review round 20 L1): the reset list is every signal
+  Python ignores at startup; a real `yes | head` started through the shim,
+  through a measurement (`_run_streaming`) and through the spawn gate
+  has the dispositions it has outside leerie (its own `SigIgn` read
+  against the same probe run directly).
 - `tests/test_landlock_isolation.py` (17 tests; DESIGN §6 *Every confined
   process has its own `/tmp`, `/dev/shm` and IPC*, *A held-out evaluation
   runs alone, in a world that dies with it (I3)*). The shim's `--sandbox`

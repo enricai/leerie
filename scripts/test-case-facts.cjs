@@ -1,6 +1,7 @@
 // Mechanical coupling facts for ONE test case, from the TypeScript AST of its
 // file (DESIGN §8 *Delivery detection*; bench n2d/Q2 facts.cjs, unchanged
-// except where `typescript` is loaded from).
+// except where `typescript` is loaded from and where its JSON is written
+// (`[out]`)).
 // Usage: node test-case-facts.cjs <file> <case fullName or title> [out]
 //   -> JSON on stdout, or written to <out> (a held-out sandbox's report:
 //   the probe it reads is placed in the sandbox, never on disk).

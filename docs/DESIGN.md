@@ -2664,7 +2664,7 @@ enforce, which a measurement reads as "could not measure", never a pass.
 | leerie's install, the home | `ROOT` (the AST scripts), `HOME` (unless it holds `/tmp`), named as a worker's are | read |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
 | leerie's stores | `<state-root>/.stores/leerie/`: the fetched stores (*Which stores an install may share*) | read |
-| the verified stores | what `PIP_CACHE_DIR`, `POETRY_CACHE_DIR` and `YARN_GLOBAL_FOLDER` name (`_VERIFIED_STORE_VARS`): the manager refuses an edited entry on reuse | write |
+| the verified stores | what `PIP_CACHE_DIR`, `POETRY_CACHE_DIR` and `YARN_GLOBAL_FOLDER` name (`_VERIFIED_STORE_VARS`): the manager refuses an edited entry on reuse | write (read only in a held-out run's grant, `_heldout_grants`: an evaluation installs nothing) |
 | the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
 | outside the state root | everything but `/tmp`, as a worker's | read |
@@ -2885,7 +2885,7 @@ close it.
 *Designed 2026-11-01 (the held-out isolation design, its §3.6; adopted in
 full). It replaces "A measurement may write `/tmp`; a held-out evaluation
 has it alone" (round 19) and "A command in a worker's tree is kept from
-`/tmp` as the worker is" (round 20, lane B's d34c7d88).*
+`/tmp` as the worker is" (round 20, 7bd42ed7).*
 
 **Root cause.** `/tmp`, `/dev/shm`, the System V and POSIX IPC objects and
 the metadata of every file of leerie's user were stores every process of
@@ -3050,13 +3050,18 @@ everything else.
 
 It is constructed, not checked, in two halves.
 
-1. **Space.** Every run of a held-out file — the evaluation, its parse
-   probe, the writer's validation, the case-failure capture, the discovery
-   reruns, the set audit's witness runs, and a delivery falsifier's probe
-   (its confirm runs, the AST facts read of it, and every later re-run of
-   a saved probe, the re-drive's included) — starts in a sandbox the shim
-   builds before it runs anything (`--sandbox`): the isolation every
-   confined process gets (*Every confined process has its own `/tmp`*),
+1. **Space.** Every run leerie makes of a held-out file — the
+   evaluation, its parse probe, the writer's validation, the case-failure
+   capture, the discovery reruns, the set audit's witness runs, and a
+   delivery falsifier's probe (its confirm runs, the AST facts read of it,
+   and every later re-run of a saved probe, the re-drive's included) —
+   starts in a sandbox the shim builds before it runs anything
+   (`--sandbox`). The one run of set files outside a sandbox is the
+   delivery re-drive's self-check, and it runs only the shown sets — files
+   the re-drive's worker is already shown — in a snapshot of its own,
+   inside that worker's own isolation; no hidden or held-back file ever
+   runs outside a sandbox. The sandbox is the isolation every confined
+   process gets (*Every confined process has its own `/tmp`*),
    plus new network, UTS and PID namespaces; its tree as an overlay whose
    upper layer is on its private `/tmp`, every other write grant overlaid
    the same way (a grant beneath `/tmp` is a fresh, empty copy of its
@@ -3083,9 +3088,11 @@ It is constructed, not checked, in two halves.
 - *The run's* is the reader/writer lock the run's `/tmp` used
   (`_ExecLock`, `_exec_lock()`; one per event loop, writer preference, so
   a stream of measurements cannot starve an evaluation). New shared
-  holders: `_invoke` and `_invoke_admitted` from a worker's spawn until its
-  process exits, `_ts_script_run` (which took no lock at all — round 20
-  H2's lock bypass) and the `mise ls` spawn, besides `_run_streaming`. An
+  holders: `_invoke`, from before a worker's spawn until its process has
+  exited (`_invoke_admitted` delegates to it after memory admission),
+  every caller of `_ts_script_run` (which took no lock at all — round 20
+  H2's lock bypass — and now stops the run when called without it), and
+  the `mise ls` spawn, besides `_run_streaming`. An
   evaluation (`_held_out_section`) holds it exclusive around the sandboxed
   command only; its own commands pass through, nested sections are one.
   A worker spawned while a section is held stops the run with an
@@ -3119,18 +3126,21 @@ mounts above; the container's policy decides both.
   used: it works on Ubuntu only because runc then runs under Ubuntu's
   `runc` profile, which attaches by runc's path; elsewhere the process is
   plain `unconfined`, the host's user-namespace restriction applies, and
-  the namespace is useless (measured). The profile is loaded once, by
-  root, by the runtime install step (`apparmor_parser -r -W`, persisted
-  under `/etc/apparmor.d/`; on Colima through `colima ssh`), and the
-  launcher stops, naming that command, when it is not loaded.
+  the namespace is useless (measured). The profile is loaded by root
+  (`apparmor_parser -r -W`, persisted under `/etc/apparmor.d/`; on Colima
+  through `colima ssh`): when it is missing or stale the launcher loads it
+  itself when it has a terminal (and no `--no-runtime-install`), and
+  otherwise stops naming the two commands.
 - *Preflight fails closed* (`_require_heldout_sandbox`, after
   `_require_landlock`): it builds a sandbox over a probe and checks that
   its IPC namespace differs from the orchestrator's, `lo` is its only
   interface, `/tmp` and `/dev/shm` are its own, a write to a file in an
   inherited mount gives EROFS, `add_key` gives EPERM, and a placed file is
   in the overlay and not on disk. Any failure stops the run naming the
-  flag or profile it lacks. No held-out file ever runs outside a sandbox,
-  and no confined process outside its isolation.
+  flag or profile it lacks. No hidden or held-back file ever runs outside
+  a sandbox (the re-drive's self-check runs only the shown sets, which its
+  worker already sees, in its own snapshot inside that worker's
+  isolation), and no confined process runs outside its isolation.
 - *Measured:* rootless and rootful Linux (Ubuntu 26.04, kernel 7.0). Not
   measured: Colima (aarch64: the seccomp table, the VM's AppArmor and
   user-namespace settings), EC2 (Debian 13, no container: Debian allows
@@ -3171,11 +3181,12 @@ evaluation, about 14 at the default caps, the same order as the verdict.
 Both carry what the evaluated code chooses, never the set's text unless
 that code encodes it. Side channels below the kernel's abstractions
 (caches, speculation) and kernel bugs are out of scope; the seccomp filter
-narrows the user-namespace attack surface `seccomp=unconfined` opens. Two
-relays of leerie's own are outside this design and stay as they are: the
+narrows the user-namespace attack surface `seccomp=unconfined` opens. One
+relay of leerie's own is outside this design and stays as it is: the
 runner's failure text (`failing_messages`), used mechanically to classify
-resource failures, and the hidden sets' declared case names that
-`_acceptance_residual_of` hands the next same-task run's planner.
+resource failures. The hidden sets' declared case names no longer reach
+the next run's planner (§8 *Nothing a held-out evaluation produces
+reaches a fixer*).
 
 **Nothing of leerie's own is in `/tmp`.** A file leerie keeps there — a
 staged git index, a copy of a set — is outside every confined process's
@@ -3226,8 +3237,10 @@ grant; the shim ends the server with the command. A worker that needs a
 database for its session (the acceptance writer, the re-drive implementer
 for its self-check) is started the same way: its cluster lives in its own
 `/tmp`, inside its own Landlock domain, for its process's lifetime. The
-URL check before a push (`_test_db_url_refusal`) is kept, on the URL the
-wrapper is handed. No server leerie starts runs outside a confined
+URL check (`_test_db_url_refusal`) is kept: leerie runs it on the URL the
+wrapper will compose for the name it is handed (`_test_db_url`), before
+the command starts, and the wrapper refuses any name outside
+`leerie_<16 hex>_test`. No server leerie starts runs outside a confined
 process's tree, and leerie never runs `prisma` itself.
 
 ### A confined command's processes end with it
@@ -10090,9 +10103,10 @@ orchestrator); one call:
    never placed over the tree's own file;
 4. runs the repository's scoped runner over the sets' test files
    (`_acceptance_cmd`, the same command the evaluation runs, exact file
-   selection included), with the group's throwaway `_test` database in
-   `DATABASE_URL` and `DIRECT_URL` when the repository has one, else the
-   caller's own;
+   selection included), with its worker's own throwaway database
+   (`claude_p(db=True)`: `DATABASE_URL` and `DIRECT_URL` name the socket in
+   that worker's `/tmp`) when the repository has one, else the caller's
+   own;
 5. prints the runner's output and a one-line verdict, and deletes the
    copy.
 
@@ -11488,12 +11502,12 @@ lane is reset between samples, and its database is a new one per
 command, so one sample's rows never reach the next; the confirm checkout
 the probe is re-run in has its own. A CI check's prerequisites that would
 themselves push to or reset a database (matched by the same rule list the
-worker deny reads) are not run: the orchestrator's guarded push is the
-only push. The set runs still
+worker deny reads) are not run: the push `scripts/sandbox-db.sh` makes
+inside the command's own confinement is the only push. The set runs still
 go through the repository's own test command; a test-database wrapper
 script there (one that starts its own cluster when DATABASE_URL is unset)
-defers to the database it is handed. **Before every push, code checks the
-target**: a postgres URL whose host is the command's own socket directory
+defers to the database it is handed. **Before every command that pushes,
+code checks the target the wrapper will push to**: a postgres URL whose host is the command's own socket directory
 in its `/tmp`, a database name starting `leerie_` and ending `_test`, and
 DIRECT_URL equal to DATABASE_URL (Prisma configs commonly push to
 `DIRECT_URL ?? DATABASE_URL`); anything else is refused. Prisma's AI-agent

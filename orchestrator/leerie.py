@@ -9985,8 +9985,8 @@ async def _run_streaming(
     `grants` (required, keyword-only: no call can forget it) is the
     command's measurement grant (`_measurement_grants`, DESIGN §6 *Leerie's
     runs of the repository's commands are confined too*): `cmd` is started
-    through the Landlock shim with it and its `/tmp` grant, every
-    descendant inheriting the restriction, and the grant's own variables
+    through the Landlock shim with it (no grant names `/tmp`; an isolated
+    command's own is the shim's), every descendant inheriting the restriction, and the grant's own variables
     are laid over `env` last. There is no unconfined path.
 
     `sandbox` (every run of a held-out file, DESIGN §6 *A held-out
@@ -22512,9 +22512,9 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
         except OSError:
             pass
     rel = "probe/placed.txt"
-    # The probe reads what any program needs (its interpreter, leerie's
-    # script) and writes only its view; nothing in the run directory but the
-    # probe's own directory is named.
+    # The probe reads everything (`/`) and writes only its view and
+    # /dev/null; nothing in the run directory but the probe's own directory
+    # is named for writing.
     grants = WorkerGrants(rw=("/dev/null", str(view)), ro=("/",))
     r: subprocess.CompletedProcess | None = None
     raw = b""
@@ -45767,8 +45767,9 @@ async def _ci_worktree(st: "State", name: str, sha: str) -> Path | None:
 
 def _ci_runs_db_reset(argv: Iterable | None, patterns: list[str]) -> bool:
     """True when `argv`, joined, matches one of the workers' database
-    push/reset deny rules (`_db_reset_rule_patterns`): the orchestrator's
-    own guarded push is the only one a run makes. Shell-command match on a
+    push/reset deny rules (`_db_reset_rule_patterns`): the push
+    `scripts/sandbox-db.sh` makes inside the command's own confinement is
+    the only one a run makes. Shell-command match on a
     mechanical string."""
     joined = " ".join(" ".join(str(a) for a in (argv or [])).split())
     return bool(joined) and any(_rule_matches(joined, p) for p in patterns)
