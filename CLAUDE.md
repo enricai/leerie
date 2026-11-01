@@ -170,7 +170,8 @@ the rest of the family stay denied.
   holding the run's `/tmp` lock shared; a held-out evaluation holds it
   exclusive and removes what it created there (`_held_out_section`). A
   worker neither reads nor writes `/tmp`, and leerie keeps nothing of its
-  own there (`_use_run_tmp`). Every confined command's processes end with
+  own there but the preflight smoke test's empty working directory
+  (`_use_run_tmp`, `_system_temp_dir`). Every confined command's processes end with
   it: the Landlock shim is their subreaper. The host-side workers
   (rebaser, host recapture, `config --chat`) are the one exception.
   DESIGN §6 *A worker writes only where it is granted (I5)*, *Outside the

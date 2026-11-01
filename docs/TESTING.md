@@ -5990,9 +5990,10 @@ template kept at finalize.
   toolchain kind empties the hook's trust records; a tree holding the run
   directory is refused; `claude_p` records the first committing worker; a
   confined worker reads the run's mise overrides.
-- `tests/test_store_classes.py` (11 tests, DESIGN §6 *Which stores an
+- `tests/test_store_classes.py` (12 tests, DESIGN §6 *Which stores an
   install may share*): every store variable has exactly one class; a run
-  tree's commands get that tree's own stores; each manager's no-code fetch
+  tree's commands get that tree's own stores, each made 0700 (review round
+  20 claims L3: under umask 0 a plain `mkdir` left them 0777); each manager's no-code fetch
   runs its argv on data files only (6 cases); a bun install copies; a
   replaced view takes its tree stores with it.
 - `tests/test_tree_git_is_addressed.py` (9 tests, review round 19
@@ -6051,3 +6052,48 @@ template kept at finalize.
   The gate records its result. Against the code before the fix, 3 of the
   4 fail. The fourth, finished provisioning not being redone, holds there
   too, because nothing was ever redone.
+- `tests/test_confined_store_install.py` (8 test functions, 9 cases;
+  DESIGN §6 *A measurement pins pnpm's version*, *Which stores an install
+  may share*; review round 19 exec H2, H3 and M2). Under real Landlock with
+  `_measurement_grants`: a measured command reads a fetched store and
+  cannot write it, and writes a verified store, its tree's own stores and
+  the measurement's state and runtime directories (where pnpm keeps its
+  lock and db); a measured Python's user base is its tree's store, not
+  `$HOME`; measurements open pnpm's store frozen and the fetch does not.
+  corepack is bounded and never floats; `_reads_package_manager`; the pin
+  is seeded only for a tree that pins no version (2 cases); two concurrent
+  fetches into one store each get their own staging directory and take
+  turns under the store's lock.
+- `tests/test_measurement_tmp.py` (29 test functions, 30 cases; DESIGN §6
+  *A confined command's scratch is short and private*, *A measurement may
+  write `/tmp`; a held-out evaluation has it alone*, *A confined command's
+  processes end with it*, *`/tmp` is not a worker's*; review round 19 exec
+  H1). Review round 19's execution driver turned round, on the real shim
+  and `_measurement_grants`:
+  - The private temp directory fits a socket path whatever the run
+    directory's length, a measured command binds a socket in it, and its
+    chain up to `/tmp` is one SWC accepts. Every directory leerie makes for
+    a command or a worker is 0700; a private temp directory that is not
+    this user's stops the run, and one made open before is closed.
+  - A measured command writes a fixed `/tmp` path; the container's grant is
+    `/tmp` whole, and only `_run_streaming` grants it. A worker neither
+    reads nor writes `/tmp`, and its read grant names nothing in it.
+  - The private temp directories go with their tree, with the run's
+    scratch, and at the process's exit.
+  - A background process (2 cases: one that ignores SIGTERM) and a timed-out
+    command's processes are gone when the command returns, the shim keeps
+    the command's exit status, and a worker session's background processes
+    end with it.
+  - A held-out evaluation leaves nothing in `/tmp` (nothing is removed on a
+    shared host `/tmp`), runs with no measurement beside it, waits for the
+    running ones without starving, nests, and survives a cancelled waiter;
+    every held-out run is in a section, a guard derived from the source.
+  - Leerie's own temp directory is in the run directory, `_run_phases`
+    moves it first, and the image marks its `/tmp` the run's.
+- `tests/test_ref_less_clone_git_is_leeries.py` (5 tests, DESIGN §6
+  *Leerie's git never takes a tree's repository from the tree*): a ref-less
+  clone is located at leerie's git directory (`<run>/clone-gits/<name>`);
+  leerie's reads of the clone, in Python and in the shell, run nothing
+  planted in the clone's own `.git`; a clone without leerie's git directory
+  is refused, with no fallback to its own `.git`; removing the checkout
+  removes leerie's git directory.

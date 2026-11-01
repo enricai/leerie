@@ -1825,9 +1825,10 @@ return that was neither: each no-work exit of planning, the template
 dep-capture makes again after finalize removed it, and the rebaser's on
 the host (review round 19 claims H1, exec M1). The same exit removes the
 run's other per-process scratch: the measurement directories
-(`measure/`), the trees' own stores (`tree-stores/`) and the store
-fetch's staging (`.store-fetch/`), which nothing reads once the process
-is gone (review round 19 exec L2). The auto-resume after a rate limit
+(`measure/`), the trees' own stores (`tree-stores/`), the store
+fetch's staging (`.store-fetch/`) and the ref-less clones' git directories
+(`clone-gits/`), which nothing reads once the process is gone (review
+round 19 exec L2). The auto-resume after a rate limit
 replaces the process image (`os.execv`), which runs no exit handlers, so
 `_sleep_then_reexec` releases first. A SIGKILL runs no exit; the preflight
 reap and `leerie prune` remove what such a run left. A resume makes the
@@ -1835,8 +1836,9 @@ template again at its first worker; a worker session the process recorded
 is then not resumable across processes (its transcript was in
 `workers/`), and the re-ask that would resume it takes its no-session
 path. A forked child that exits is not the run's process: the handler
-releases only what its own pid registered, and only while the `State`
-lock it was registered with is still held.
+releases only what its own pid registered, under the run's lock — the one
+its `State` still holds, else one it can take now; a run directory another
+process has locked is left.
 
 *Every deleter of a run's directories deletes them.* The template is
 read-only, and so is a killed test's directory in a tree. A plain
@@ -2637,13 +2639,13 @@ enforce, which a measurement reads as "could not measure", never a pass.
 |---|---|---|
 | devices | as a worker's | write |
 | the measured tree | the checkout the command runs in (a committed view, an evaluation tree, a helper checkout, a worker tree an install runs in) | write |
-| its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `mise-state/` (`MISE_STATE_DIR`), `reports/` (every runner report, the parse probe's marker, the failing-ID capture's report), `coverage/` (the coverage detector's output) | write |
-| its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name (*A confined command's scratch is short and private*) | write |
+| its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `mise-state/` (`MISE_STATE_DIR`), `state/` (`XDG_STATE_HOME`), `reports/` (every runner report, the parse probe's marker, the failing-ID capture's report), `coverage/` (the coverage detector's output) | write |
+| its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, and its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) (*A confined command's scratch is short and private*) | write |
 | `/tmp` | itself, for a command `_run_streaming` runs, under the run's `/tmp` lock (*A measurement may write `/tmp`; a held-out evaluation has it alone*) | write |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
 | leerie's stores | `<state-root>/.stores/leerie/`: the fetched stores (*Which stores an install may share*) | read |
 | the verified stores | what `PIP_CACHE_DIR`, `POETRY_CACHE_DIR` and `YARN_GLOBAL_FOLDER` name (`_VERIFIED_STORE_VARS`): the manager refuses an edited entry on reuse | write |
-| the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache), for a tree under `<run-dir>/worktrees/` | write |
+| the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
 | outside the state root | everything, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
@@ -2819,8 +2821,8 @@ died in 6 s.
 **Invariant: a confined command's temp directory is short, and readable
 and writable by its user alone on its whole path.** Each measured tree has
 one, `/tmp/l/<id>/` (`PRIVATE_TMP_ROOT`, `_private_tmp`; `<id>` is 16 hex
-digits of the hash of its measurement directory's path, so the path never
-depends on the run's id or the tree's name): 23 characters, so tsx's
+digits of the hash of its measurement directory's path, so its length
+never depends on the run's id or the tree's name): 23 characters, so tsx's
 `<dir>/tsx-<uid>/<pid>.pipe` fits with room to spare. `/tmp/l` and each
 directory in it are made 0700 and must be this user's directories, not
 links — anything else stops the run, since a command whose scratch it is

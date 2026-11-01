@@ -56,6 +56,26 @@ def test_a_command_in_a_run_tree_gets_that_trees_own_stores(leerie,
     assert other == {"UV_CACHE_DIR": "/shared/uv"}
 
 
+def test_a_trees_own_stores_are_made_private(leerie, tmp_path):
+    """Every directory leerie makes for a measurement is 0700 (DESIGN §6 *A
+    confined command's scratch is short and private*), each store under
+    `tree-stores/<tree>/` too — not only that directory. Under umask 0 a
+    plain `mkdir` would leave them 0777."""
+    run, t = _tree(tmp_path)
+    old = os.umask(0)
+    try:
+        env: dict[str, str] = {}
+        leerie._tree_store_env(env, t)
+    finally:
+        os.umask(old)
+    root = run / "tree-stores" / t.name
+    made = [root.parent, root,
+            *(Path(env[v]) for v in leerie._TREE_STORE_VARS)]
+    for d in made:
+        assert d.is_dir(), d
+        assert (d.stat().st_mode & 0o777) == 0o700, (d, oct(d.stat().st_mode))
+
+
 def test_run_streaming_runs_a_repo_command_with_its_trees_stores(
         leerie, tmp_path):
     run, t = _tree(tmp_path)

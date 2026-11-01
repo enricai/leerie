@@ -5916,8 +5916,9 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
                     ) -> None:
     """Point `env`'s `_TREE_STORE_VARS` at the tree `cwd` lies in, when that
     tree is one of a run's (`<run-dir>/worktrees/<tree>`): `<run-dir>/
-    tree-stores/<tree>/<name>`, made here. A baked value is kept. A `cwd`
-    outside every run tree leaves `env` as it is."""
+    tree-stores/<tree>/<name>`, made here 0700 (`_mkdir_private`), like
+    every directory leerie makes for a measurement. A baked value is kept.
+    A `cwd` outside every run tree leaves `env` as it is."""
     if cwd is None:
         return
     p = Path(os.path.abspath(cwd))
@@ -5932,7 +5933,7 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
             continue
         dst = root / _STORE_VARS[var]
         with contextlib.suppress(OSError):
-            dst.mkdir(parents=True, exist_ok=True)
+            _mkdir_private(dst, root.parent.parent)
         env[var] = str(dst)
     _with_pnpm_spellings(env)
 
@@ -11699,8 +11700,8 @@ def _remove_worker_dirs(run_dir: Path) -> bool:
 
 
 # What a run's process makes in the run directory for its own use and no
-# later process reads: the measurement directories, the trees' own stores
-# and the store fetch's staging (DESIGN §6 *No copy of the credentials
+# later process reads: the measurement directories, the trees' own stores,
+# the store fetch's staging and the ref-less clones' git directories (DESIGN §6 *No copy of the credentials
 # outlives its run's process*).
 STORE_FETCH_DIRNAME = ".store-fetch"
 # realpath(run_dir) -> (the `State` that holds its lock, by weak reference,
