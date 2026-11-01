@@ -3806,12 +3806,17 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   raised on itself with core files off (`_die_of`). `abi()`
   (`landlock_create_ruleset(NULL, 0, VERSION)`, 0 when absent) and
   `MIN_ABI = 3`. Exits 126 ("cannot confine the worker") without running
-  CMD when the ABI is below that or any step fails. The orchestrator loads
-  it as a module (`_landlock()`).
+  CMD when the ABI is below that or any step fails. Every confined process
+  also installs the seccomp filter (`install_seccomp`) and, from ABI 6, the
+  Landlock scopes; `--isolate` and `--sandbox` build its namespaces and
+  mounts first (§ *Isolation and the held-out sandbox (I3)* below). The
+  orchestrator loads it as a module (`_landlock()`).
 - `_require_landlock()` — `die()` unless `abi() >= MIN_ABI`; `preflight`
-  step 0.3, before any worker, on every runtime.
-- `WorkerGrants(rw, ro, env=(), shared_tmp=())` (NamedTuple of absolute
-  paths; `shared_tmp` below).
+  step 0.3, before any worker, on every runtime. Step 0.35 is
+  `_require_heldout_sandbox` (below).
+- `WorkerGrants(rw, ro, env=())` (NamedTuple of absolute paths; the
+  `shared_tmp` field is deleted — every confined process has its own
+  `/tmp`).
 - `_worker_grants(*, run_dir, state, schema_key, cwd, allowed_tools, env,
   notes_id=None, selfcheck_dir=None) -> WorkerGrants` — the state root is
   `run_dir.parent.parent`. Every worker: `rw` `_WORKER_DEVICES`,
@@ -3854,10 +3859,10 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   worker) `SHARED_TMP` is left out too: `_beside(Path("/"), SHARED_TMP)`
   when the root lies beneath it, else every path whose realpath is
   neither beneath nor above it.
-- `_confined_argv(grants, cmd, *, shared_tmp=False)` — `[sys.executable,
-  "-I", "-S", LANDLOCK_SCRIPT, --rw…, --ro…, "--", *cmd]`, the `--rw`
-  paths `grants.rw` plus, with `shared_tmp`, `grants.shared_tmp` (only
-  `_run_streaming` passes it).
+- `_confined_argv(grants, cmd, *, sandbox=None, report_fd=None)` —
+  `[sys.executable, "-I", "-S", LANDLOCK_SCRIPT, <--isolate | --sandbox
+  …>, --rw…, --ro…, "--", *cmd]` (§ *Isolation and the held-out sandbox
+  (I3)* below).
 - `claude_p(…, notes_id=None, selfcheck_dir=None)` computes `grants` once
   per call, after `_worker_dirs` has put the worker's own
   `CLAUDE_CONFIG_DIR`/`TMPDIR`/`TMP`/`TEMP` in its environment (None only
@@ -3935,26 +3940,15 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `XDG_RUNTIME_DIR` → `<private-tmp>/run`, `XDG_STATE_HOME` →
   `<measure-dir>/state`, `MISE_STATE_DIR` → `<measure-dir>/mise-state`
   (emptied first for the toolchain kind); no store variable (leerie's environment and
-  `_tree_store_env` set them). `shared_tmp`: `_around([SHARED_TMP],
-  state_root)`, every kind (DESIGN §6 *A measurement may write `/tmp`; a
-  held-out evaluation has it alone*) — `()` for a worker's tree
-  (`_is_worker_tree`, DESIGN §6 *A command in a worker's tree is kept from
-  `/tmp` as the worker is*); a tree granted it is recorded in
-  `_TMP_GRANTED_TREES` (realpaths, this process).
-- Worker trees: `_is_worker_tree(run_dir, tree, dirs) -> bool` — True when
-  `dirs` (`_git_dirs_of`) names a common dir whose parent is
-  `<run>/tree-repos/`, or the tree's realpath is in `_WORKER_TREES`.
-  `_declare_worker_tree(tree)` adds the realpath to `_WORKER_TREES` and
-  `die()`s when it is in `_TMP_GRANTED_TREES`. `_worker_grants` calls it
-  for the cwd of every `_COMMITTING_WORKERS` worker; `_write_acceptance_set`
-  (the writer's clone), `_acceptance_surrogate` and `_falsify_items` (each
-  `falsifier-lane<n>`) call it right after making the checkout, before its
-  install.
-- `_argv_outside_grant(argv, grants, *, shared_tmp=False) -> str | None` —
+  `_tree_store_env` set them). No grant names `/tmp` (the shim gives the
+  command its own, DESIGN §6 *Every confined process has its own `/tmp`,
+  `/dev/shm` and IPC*); the worker-tree distinction (`_is_worker_tree`,
+  `_declare_worker_tree`, `_WORKER_TREES`, `_TMP_GRANTED_TREES`) is
+  deleted.
+- `_argv_outside_grant(argv, grants) -> str | None` —
   the first element of `argv` that is an absolute path that exists and
-  whose realpath lies beneath no realpath of `grants.rw`, `grants.ro` or
-  (with `shared_tmp`) `grants.shared_tmp`; None when every one does.
-  `_run_streaming` (with `shared_tmp=True`) and `_ts_script_run` `die()`
+  whose realpath lies beneath no realpath of `grants.rw` or `grants.ro`;
+  None when every one does. `_run_streaming` and `_ts_script_run` `die()`
   on one before spawning (DESIGN §6 *Leerie's runs of the repository's
   commands are confined too*). `_redrive_ast_hits` writes each base copy
   under the grant's `TMPDIR` (`tempfile.TemporaryDirectory(dir=…)`), the
@@ -3996,38 +3990,17 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `tmp`, `_cache_vars`' `xdg`/`pnpm-store` (bounded at the run
   directory), a worker's notes directory; the self-check's `run/` is made
   0700.
-- The run's `/tmp` (DESIGN §6 *A measurement may write `/tmp`; a held-out
-  evaluation has it alone*): `_TmpLock` (`readers`, `writer`,
-  `writers_waiting`, waiter futures; `shared()` — passes through when
-  `_TMP_EXCLUSIVE` is set, else waits while a writer holds or waits;
-  `exclusive()` — yields False when nested, else waits for no writer and
-  no reader, sets `_TMP_EXCLUSIVE` in the holder's context, yields True),
-  `_tmp_lock()` (one per running loop, `_TMP_LOCKS`, a weak-key
-  dictionary). `_run_streaming` holds `_tmp_lock().shared()` around its
-  whole spawn and spawns `_confined_argv(grants, cmd, shared_tmp=True)`;
-  it is the one caller passing `shared_tmp=True`, so a command started
-  any other way (`_ts_script_run`, `mise ls`) has no `/tmp` at all
-  (`tests/test_measurement_tmp.py` pins both by rule).
-  `_held_out_section(st)` — an async context manager: `exclusive()`; for
-  the outermost holder with `os.environ[PRIVATE_TMP_ENV] == "1"`
-  (`PRIVATE_TMP_ENV = "LEERIE_PRIVATE_TMP"`, set by the image's `ENV`),
-  `_tmp_inventory(SHARED_TMP)` (every path, never following a link, →
-  inode) before, and on exit, on the loop, `_remove_created(SHARED_TMP,
-  before)` (every path absent before or at another inode, the topmost of
-  each subtree removed with `_rmtree_owned`, logged by count); unset, a
-  one-time log line and nothing removed. Held by `_acceptance_run_placed`
-  (around its whole per-set loop), `_run_acceptance_file` (around its
-  spawn, replacing `_blt_semaphore`) and `_acceptance_parse_probe` (the
-  same).
+- The run's execution lock and `_held_out_section` (formerly the run's
+  `/tmp` lock): § *Isolation and the held-out sandbox (I3)* below.
 - `_use_run_tmp(st) -> Path` — `<run>/tmp/` made 0700, set as
   `tempfile.tempdir` and `os.environ["TMPDIR"]`, the temp directory before
   it kept once in `_SYSTEM_TEMP_DIR` (`_system_temp_dir()`, where
   preflight's smoke test makes its working directory); `_run_phases`'
   second statement, after the run-id log line.
 - `_run_streaming(cmd, *, grants, …)` and `_run_contained(argv, *,
-  grants, …)`: `grants` keyword-only, no default. The spawn is
-  `_confined_argv(grants, cmd, shared_tmp=True)` (inside the spawn gate
-  when there is one), under `_tmp_lock().shared()`,
+  grants, sandbox=None, …)`: `grants` keyword-only, no default. The spawn
+  is `_confined_argv(grants, cmd, sandbox=…)` (inside the spawn gate
+  when there is one), under `_exec_lock().shared()` and the host's lock,
   with environment `{**_repo_command_env(env), **dict(grants.env)}`.
   `_measure_blt(axis, cmd, tree, *, grants, …)` passes its caller's.
   Callers derive the grant for the tree they run in: `_ensure_worktree_deps`,
@@ -4063,15 +4036,12 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   overrides). The derived spawn guards are in
   `tests/test_repo_commands_keep_their_hooks.py`.
   `tests/test_measurement_tmp.py` (review round 19's H1 driver turned
-  round: a socket in the private temp directory, a fixed `/tmp` path and
-  `exec 9>/tmp/….lock` through `_run_streaming`, `/tmp` refused outside
-  it; the 0700 chain SWC accepts and every directory made 0700; a worker
-  refused `/tmp`; background, SIGTERM-ignoring and timed-out commands'
-  processes gone, the shim keeping the exit code and signal; a held-out
-  section removing what it created and nothing else, nothing on a shared
-  host, a measurement waiting for it and it for running ones; every
-  held-out run inside a section; leerie's own temp directory in the run
-  directory).
+  round: a socket in the private temp directory; the 0700 chain SWC
+  accepts and every directory made 0700; background, SIGTERM-ignoring and
+  timed-out commands' processes gone, the shim keeping the exit code and
+  signal; leerie's own temp directory in the run directory; its `/tmp`
+  section-and-inventory cases are replaced by the execution lock's and by
+  `tests/test_landlock_isolation.py`).
 - Tests: `tests/test_worker_confinement.py` (a real confined child per
   worker kind; fail closed in preflight, the shim and `_invoke`; derived
   guards: every `claude -p` argv from `_contained_claude_argv` or the probe,
@@ -4090,7 +4060,7 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
 |   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ *Persistent out-of-repo dependency bake*). Always runs; runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.leerie-setup.sh` hook if present → `_synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` in a throwaway checkout of the planning commit (steps 2–4; reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `_detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — for baked ecosystems (Python/Ruby/Rust/Go), the block is informational only; for Node, it carries the residual offline-relink command (not run by the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `_run_streaming` so their output is visible live. Skipped on `resume` when `st.data["provision"]["recipe"]` is already present (key-presence, not truthiness — an empty recipe is a valid completed state; DESIGN §6 "Resumable planning"); the env var is re-exported from persisted state on resume. |
 |   • Provision gate | `phase_provision_gate` | independent adversarial verifier of the detected install recipe (DESIGN §8, §6½). One `provision_judge` worker attacks `st.data["provision"]["recipe"]` against the image/runtime — catching the semantic gaps the deterministic `_normalize_pip_installs` / `_validate_provision_recipe` miss (a `pip install` missing `--break-system-packages` on the externally-managed Debian image, a package manager that doesn't match the lockfiles present). A non-empty `recipe_failures` array `die()`s immediately with the judge's concrete `fix` named — **detect-and-die, single pass** (no re-drive: a table recipe re-emits identically and an LLM recipe would re-produce the same defect, so re-driving only burns rounds before dying anyway; a broken recipe is fatal, matching `phase_provision`'s own recipe-validation die). A `provision_judge` `WorkerError` degrades (the deterministic checks already ran). Skipped when no recipe was detected (`kind: none`); runs inside the `plans_after_classify` checkpoint block so a resume past classify skips it. Persists to `state.data["provision_recipe_gate"]`. |
 |   • Clarify *(optional)* | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`), **unconditionally** — never gated on the classifier's `needs_source_of_truth`, which records only whether the question was relevant. Every consumer **that holds a `State`** reads the value through `_effective_source_of_truth(st)` — `phase_plan`, `phase_reconcile` (inside the `_check_unresolvable` closure, sourcing the phase-2½ abort message), `_write_plan` and `_compose_pr_via_llm` — and none may fall back to a hardcoded tier. That list is **derived, not maintained**: `tests/test_effective_sot_consumers.py` resolves every `_effective_source_of_truth(...)` call site to its enclosing module-level function and fails if this sentence omits one. It exists because the hand-written list drifted inside the very commit that introduced it — the `phase_reconcile` reader was added as a deliberate design step and the prose still said three, which is the enumeration-vs-derivation failure recorded four times over in CLAUDE.md. The two readers that cannot are `compose_pr_body` (takes a plain `state: dict`, the deterministic PR-body fallback) and `scripts/host-finalize.sh`'s `jq`; both read the recorded answer directly and render `n/a` when absent. Intent questions from the classifier are dropped by default; pass `--clarify` to surface them. With `--clarify` + interactive: collect; with `--clarify` + non-interactive: write `pending-questions.json`, exit code 10 (DESIGN §11) |
-| 2 Plan | `phase_artifact_registry`, `phase_defect_scope_audit`, `phase_acceptance_write`, `phase_plan` | **First: `phase_artifact_registry`** runs a single read-only `artifact_registry` worker (after classify, before any planner) that emits a small canonical `{description, tag, path}` vocabulary for the artifacts the task will plainly create (DESIGN §5 *Artifact-registry worker*). Persisted to `state.data["artifact_registry"]` (own resume checkpoint, keyed on presence — `[]` is a valid completed state); best-effort/non-fatal — never die()s, returns `[]` when the worker crashes every round or genuinely finds nothing to register, and `--skip-repo-map` only suppresses the repo-map context handed to it (mirroring `phase_plan`'s own degrade; the worker still runs and can still return a non-empty list). `phase_plan` injects the result into every planner's `ctx_dict` so blind parallel planners prefer the same tag/path. (`phase_plan`'s ctx also carries `no_work_dispute` when the converged-gate `no_work_judge` disputed an already-satisfied claim — the planner is steered at the disputed residual; see the §8 field table and DESIGN §8 *A dispute's evidence is planning input, not log noise*.) **Then `phase_defect_scope_audit`** (only when categories include `bug-fixing`; own presence-keyed checkpoint `state.data["defect_scope"]`, mirroring the registry, additionally gated on `plans_after_plan` being ABSENT — a resume of a pre-feature state with planning already checkpointed must not spawn a worker whose planner-side consumer has run; the downstream `_warn_defect_sites_uncovered` floor then reads `{}` and degrades to a no-op on that resume shape, an accepted trade of an advisory warning against a spawn on a must-be-free re-entry): a read-only `defect_scope_auditor` enumerates every site implementing the task's defective decision idiom — or, for an unconfirmed-cause report, the candidate mechanisms — plus a chokepoint verdict and the report's `ground_truth` evidence basis, whose named input paths the phase existence-checks mechanically (`_check_ground_truth_inputs`, loud `--inspect-dir` remediation log on absence); an `applicable: true` answer with empty `sites` is re-asked once with a corrective message before being accepted (DESIGN §5 *Defect-scope audit*, *Report-named ground truth*, *An applicable audit with zero sites is re-asked once*); `phase_plan` injects the result into every planner's ctx as `defect_scope` when applicable with non-empty sites. Best-effort/non-fatal — never die()s, returns `{"applicable": False}` (never `[]`) when the worker crashes every round or the audit is not applicable (not a defect fix at all, or a single obvious location with no competing candidate mechanisms); it takes no repo-map context, so `--skip-repo-map` does not affect it. **Then `phase_acceptance_write`** (DESIGN §8 *Held-out acceptance tests*; own presence-keyed checkpoint `state.data["acceptance"]`, same `plans_after_plan` gate as the audit; called through `_acceptance_write_or_skip`, which records any exception as `{"skipped": "error: <type>"}` except `WorkerError` — budget exhaustion — which it re-raises so it stops the run): skipped unless categories include `bug-fixing` (the defect-scope audit ran — its `applicable` no longer gates, DESIGN §8 *Written whenever the defect-scope audit ran*), a scoped test template resolves (`resolve_blt_scoped()["test"]`; none → a WARNING naming the canonical command and `{"skipped": "no scoped test command", "skip_kind": "no_scoped_runner", "reason": <_infer_scoped_test_template's reason>, "test_command"}`) and `skip_acceptance_check` is off. The validity base is `_acceptance_own_start(st)` — this run's `repo_state_before_planning.head`; `_acceptance_report_base(st)` (the earliest — by `started_at`; a sibling without one is skipped — same-task sibling run's `repo_state_before_planning.head`, still reachable, else this run's) is informational only: `_record_report_reproduced` evaluates the valid sets there once (`confirm=False`) and records each set's `report_reproduced` (True outright when it is the own start; None when unmeasured) — nothing filters on it. Sets from earlier runs are never carried forward; `caps["acceptance_sets"]` (default 5) `acceptance_writer` workers run concurrently under a `max_parallel` semaphore (each `bump_workers` outside every try, so budget exhaustion propagates out of `phase_acceptance_write` — whose `_gather_or_cancel` cancels the other writers — and out of `_acceptance_write_or_skip`; any other per-writer exception only discards that set), each `_write_acceptance_set` in its own checkout at `<run_dir>/worktrees/acceptance-<k>` made by `_acceptance_writer_checkout(st, wt, base)`: `git clone --shared --no-checkout --no-tags <repo> <wt>`, `checkout --detach <base>`, every ref deleted (`for-each-ref` + `update-ref -d`), the `origin` remote removed and reflogs expired, so the writer reaches only the own start and its history — returns `"clone"`, or, when any step fails, logs and falls back to `git worktree add --detach` (`"worktree"`; `"failed: …"` discards the set); the task's referenced files are copied in and deps installed (`_ensure_worktree_deps`; a failed install discards the set — `dependency install failed in the writer worktree`), and `_remove_acceptance_checkout` removes it afterwards (either kind, and its install memo). Declared paths must be relative, free of `..`, inside the worktree, not a referenced task file, and NEW at the validity base (`git cat-file -e <base>:<path>` fails) — an edited existing file is dropped in code, not left to the prompt. The worktree's untracked files, ignored ones included, are snapshotted (`_untracked_listing(wt, which="all")`) after the dependency install and before the writer runs; afterwards (mechanical CLI output) `git status --porcelain=v1 -z --untracked-files=no` lists tracked changes — any one discards the set (`writer modified a tracked file`) — and a second `_untracked_listing(wt, which="all")` lists new files: every one that was not in the snapshot, not a referenced task file, not declared by the writer (declared paths compared after `_acceptance_declared_rel` applies `os.path.normpath` — `./a`, `a/./b`, `a//b`), and not a cache or environment path (`_acceptance_is_cache_path`: a `_ACCEPTANCE_BYPRODUCT_PARTS` component — `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.hypothesis` — or `.pyc`/`.pyo`, or a `_ACCEPTANCE_PROVISION_PARTS` component — `node_modules`, `.venv`, …) is kept as a `support_files` entry copied with the set — test-shaped or not, since a conftest or helper beside the tests is still needed — so a correct fix is not failed for its absence; a file the repo's ignore rules match (`_untracked_listing(wt)` omits it) is kept only in or beneath the directory of a kept defect/control file (for a root-level test file, only other root-level files), since elsewhere it is likely build output from the unfixed tree that would shadow a correct fix. Each remaining declared file is validated with `_run_acceptance_file(..., validating=True, failure_mode=)` (`_acceptance_cmd(st, files, tree)`: the named-test-files template `resolve_test_files_scoped` rendered over that one file, every file test-shaped — over `{test_targets}` every file a cargo integration test (`_is_cargo_integration_test`), over `{test_packages}` every file a `_test.go` file and the command followed by `-run '^(<names>)$'` naming the test functions `_go_test_func_names` reads from the tree's copy (`_GO_TEST_FUNC_RE`, `TestMain` excluded; none → no command); `failure_mode` is the writer's declaration for a defect file, always `"assertion"` for a control): validation is PER CASE — with a readable report the verdict is False when any case's status is `failed` (its IDs recorded as the defect file's `base_failing_cases`) and True when none is, whatever the exit code; a defect file is kept only if it fails, a control only if it passes (a failing control, or any file that yields `None` — not test-shaped, runner missing, ran no test, could not load — discards the set); a kept defect file's mode is recorded in the set's `modes` — `"import"` only when `_run_acceptance_file(..., observed=)` reported the file failing to load on the base (`observed["load_failure"]`), else `"assertion"`, so a declared import defect that loaded and failed an assertion is recorded as an ordinary failure; a set with no discriminating defect file, or with no passing control file, is discarded; valid sets are copied to `<run_dir>/acceptance/set-<k>/`. When every declared defect file ran and passed (no defect case fails at the own start), the writer is asked once more in the same checkout (`acceptance_rewrite_rounds` ≥ 1; sid `acceptance-<k>-r1`) with its original payload plus `_NO_DEFECT_FAILS_NOTE` — the runner's per-case statuses for its defect files — and the set is collected again (`_collect_acceptance_set`), recorded `own_start_rewrite: true` when valid. **In a Prisma repo** (`_prisma_project`: a tracked `schema.prisma` whose nearest `package.json` lists `prisma`/`@prisma/client`; its datasource `provider` read from the schema) with a PostgreSQL datasource, `_test_db_session(st)` (re-entrant; entered by `phase_acceptance_write`, `_run_acceptance_gate`, `_evaluate_acceptance_sets`, `_falsify_items`, `_capture_ci_parity_baseline` and `_run_ci_parity_final`) holds a private cluster (`_start_test_db_cluster`: `initdb` + `pg_ctl` from `_pg_server_bin()` — the newest complete `/usr/lib/postgresql/<major>/bin`, else PATH — into `<tmp>/leerie-pg-<run_id>`, on a free `127.0.0.1` port, TCP only; None and logged once with no binaries, as root, or on a failed step), and `_create_test_db(st, tree, key)` gives a writer checkout (and every evaluation, audit and surrogate tree) a database `leerie_<sha256[:16]>_test` with that tree's schema pushed by `<pkg>/node_modules/.bin/prisma db push --accept-data-loss` — `_test_db_url_refusal(url, direct_url, port)` checked before the push (postgres scheme, host `localhost`/`127.0.0.1`, the cluster's own port, `leerie_` prefix and `_test` suffix, DIRECT_URL == DATABASE_URL), `PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION` set on that subprocess's environment only; the writer gets `DATABASE_URL`/`DIRECT_URL` (`_test_db_env`, through `claude_p(env_extra=)`, never the consent — `_invoke` scrubs any `PRISMA_USER_CONSENT*` from every worker environment) and the REAL DATABASE section (`_prisma_real_db_section(_prisma_db_context(repo, base), template)`: client modules — non-test files containing `new PrismaClient` —, the five newest tests importing one unmocked, their support helpers); a set file that `vi.mock`/`jest.mock`s a client module or the client package (`_prisma_mock_hits`) earns one fix-up call (sid suffix `-fix`). Databases are dropped with their tree (`_drop_test_db`, which re-checks the URL); the cluster stops when the last session exits. **Then, when `no_work_pending` is set,** `_settle_pending_no_work_failing_open(st, caps)` calls `_settle_pending_no_work(st, caps)`, which runs the valid sets on HEAD (`_acceptance_results_on_head`: the planning worktree, deps via `_ensure_worktree_deps`, evaluated at the worktree's HEAD sha — except when that sha is `acceptance.validity_base`, where the verdict is known from validation and returned without running anything, every set failing on its `defect_files`; a measured result is kept in `_HEAD_ACCEPTANCE_RESULTS` keyed by run dir and sha and reused by the later pre-sweep and already-fixed checks on the same commit — in memory only, so a resume measures afresh, and never a result that measured nothing): no valid sets, no measured set (`not measurable`), or every measured set passing → `_finish_no_work_run` and `return`; an exception while settling also finishes on the judge's confirmation (fail-open, `verdict: error: …`); any failing set with `_prior_acceptance_dispute(st)` → `_finish_no_work_run` with a WARNING, re-recording `acceptance_dispute` with `accepted: true` so the NEXT run also sees a prior dispute (the dispute bound — without the carry-forward the newest-run lookup would alternate dispute/accept); otherwise `acceptance_dispute` and `no_work_dispute` (the failing case names as `judge_evidence` — from `_acceptance_shown_indices` sets only, so held-back names never reach a planner; with no names left, the counts alone, saying "held back" only when no shown set fails and otherwise that the failing cases were not named; when names exist but another failing shown file declared none, `; other failing tests named no cases` follows them) are recorded and planning proceeds. The recorded `cases` in `acceptance_dispute`/`no_work_acceptance` follow the same rule. **Then `phase_plan`:** one planner worker per category, awaited concurrently via `_gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `leerie.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()`. After all `plan_one` results are collected, P1 Layer C runs: each first-pass subtask in each plan is expanded through `_recursive_decompose(subtask, depth=0, …)`, and `plan["subtasks"]` is replaced with the union of all returned leaves (DESIGN §5½ *Wire-in to phase_plan*). Within a plan, the top-level subtasks' `_recursive_decompose` calls run under **bounded concurrency** — a single `asyncio.Semaphore(caps["max_parallel"])` created once before the loop over `plans` and shared across every plan's expansion, awaited via `_gather_or_cancel` — mirroring `_filter_satisfied_subtasks`'s accumulate-as-they-complete shape (M2 perf fix: replaces a strictly-sequential `for` loop). `st.data["decompose_snapshot"]` is written and `st.save()`d as each top-level subtask's expansion completes, same as before, but completion (and therefore write) order across subtasks is now nondeterministic — nothing depends on that order, only on every finished subtask's leaves being captured before a later crash. A plan with no subtasks is left untouched. Expansion vanishes each split parent's id, so the loop records `{parent_id: [leaf_ids]}` for every parent absent from its own leaves and then calls `_remap_vanished_deps(all_leaves, expansion)` **once over every plan's leaves after every plan has expanded** — a dependent may live in a different category's plan than the parent it names (DESIGN §5 *Id-vanishing operations*). The downstream path (reconcile → overlap_judge → schedule → _validate_plan → _write_plan) receives this expanded flat leaf set unchanged. |
+| 2 Plan | `phase_artifact_registry`, `phase_defect_scope_audit`, `phase_acceptance_write`, `phase_plan` | **First: `phase_artifact_registry`** runs a single read-only `artifact_registry` worker (after classify, before any planner) that emits a small canonical `{description, tag, path}` vocabulary for the artifacts the task will plainly create (DESIGN §5 *Artifact-registry worker*). Persisted to `state.data["artifact_registry"]` (own resume checkpoint, keyed on presence — `[]` is a valid completed state); best-effort/non-fatal — never die()s, returns `[]` when the worker crashes every round or genuinely finds nothing to register, and `--skip-repo-map` only suppresses the repo-map context handed to it (mirroring `phase_plan`'s own degrade; the worker still runs and can still return a non-empty list). `phase_plan` injects the result into every planner's `ctx_dict` so blind parallel planners prefer the same tag/path. (`phase_plan`'s ctx also carries `no_work_dispute` when the converged-gate `no_work_judge` disputed an already-satisfied claim — the planner is steered at the disputed residual; see the §8 field table and DESIGN §8 *A dispute's evidence is planning input, not log noise*.) **Then `phase_defect_scope_audit`** (only when categories include `bug-fixing`; own presence-keyed checkpoint `state.data["defect_scope"]`, mirroring the registry, additionally gated on `plans_after_plan` being ABSENT — a resume of a pre-feature state with planning already checkpointed must not spawn a worker whose planner-side consumer has run; the downstream `_warn_defect_sites_uncovered` floor then reads `{}` and degrades to a no-op on that resume shape, an accepted trade of an advisory warning against a spawn on a must-be-free re-entry): a read-only `defect_scope_auditor` enumerates every site implementing the task's defective decision idiom — or, for an unconfirmed-cause report, the candidate mechanisms — plus a chokepoint verdict and the report's `ground_truth` evidence basis, whose named input paths the phase existence-checks mechanically (`_check_ground_truth_inputs`, loud `--inspect-dir` remediation log on absence); an `applicable: true` answer with empty `sites` is re-asked once with a corrective message before being accepted (DESIGN §5 *Defect-scope audit*, *Report-named ground truth*, *An applicable audit with zero sites is re-asked once*); `phase_plan` injects the result into every planner's ctx as `defect_scope` when applicable with non-empty sites. Best-effort/non-fatal — never die()s, returns `{"applicable": False}` (never `[]`) when the worker crashes every round or the audit is not applicable (not a defect fix at all, or a single obvious location with no competing candidate mechanisms); it takes no repo-map context, so `--skip-repo-map` does not affect it. **Then `phase_acceptance_write`** (DESIGN §8 *Held-out acceptance tests*; own presence-keyed checkpoint `state.data["acceptance"]`, same `plans_after_plan` gate as the audit; called through `_acceptance_write_or_skip`, which records any exception as `{"skipped": "error: <type>"}` except `WorkerError` — budget exhaustion — which it re-raises so it stops the run): skipped unless categories include `bug-fixing` (the defect-scope audit ran — its `applicable` no longer gates, DESIGN §8 *Written whenever the defect-scope audit ran*), a scoped test template resolves (`resolve_blt_scoped()["test"]`; none → a WARNING naming the canonical command and `{"skipped": "no scoped test command", "skip_kind": "no_scoped_runner", "reason": <_infer_scoped_test_template's reason>, "test_command"}`) and `skip_acceptance_check` is off. The validity base is `_acceptance_own_start(st)` — this run's `repo_state_before_planning.head`; `_acceptance_report_base(st)` (the earliest — by `started_at`; a sibling without one is skipped — same-task sibling run's `repo_state_before_planning.head`, still reachable, else this run's) is informational only: `_record_report_reproduced` evaluates the valid sets there once (`confirm=False`) and records each set's `report_reproduced` (True outright when it is the own start; None when unmeasured) — nothing filters on it. Sets from earlier runs are never carried forward; `caps["acceptance_sets"]` (default 5) `acceptance_writer` workers run concurrently under a `max_parallel` semaphore (each `bump_workers` outside every try, so budget exhaustion propagates out of `phase_acceptance_write` — whose `_gather_or_cancel` cancels the other writers — and out of `_acceptance_write_or_skip`; any other per-writer exception only discards that set), each `_write_acceptance_set` in its own checkout at `<run_dir>/worktrees/acceptance-<k>` made by `_acceptance_writer_checkout(st, wt, base)`: `git clone --shared --no-checkout --no-tags <repo> <wt>`, `checkout --detach <base>`, every ref deleted (`for-each-ref` + `update-ref -d`), the `origin` remote removed and reflogs expired, so the writer reaches only the own start and its history — returns `"clone"`, or, when any step fails, logs and falls back to `git worktree add --detach` (`"worktree"`; `"failed: …"` discards the set); the task's referenced files are copied in and deps installed (`_ensure_worktree_deps`; a failed install discards the set — `dependency install failed in the writer worktree`), and `_remove_acceptance_checkout` removes it afterwards (either kind, and its install memo). Declared paths must be relative, free of `..`, inside the worktree, not a referenced task file, and NEW at the validity base (`git cat-file -e <base>:<path>` fails) — an edited existing file is dropped in code, not left to the prompt. The worktree's untracked files, ignored ones included, are snapshotted (`_untracked_listing(wt, which="all")`) after the dependency install and before the writer runs; afterwards (mechanical CLI output) `git status --porcelain=v1 -z --untracked-files=no` lists tracked changes — any one discards the set (`writer modified a tracked file`) — and a second `_untracked_listing(wt, which="all")` lists new files: every one that was not in the snapshot, not a referenced task file, not declared by the writer (declared paths compared after `_acceptance_declared_rel` applies `os.path.normpath` — `./a`, `a/./b`, `a//b`), and not a cache or environment path (`_acceptance_is_cache_path`: a `_ACCEPTANCE_BYPRODUCT_PARTS` component — `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.hypothesis` — or `.pyc`/`.pyo`, or a `_ACCEPTANCE_PROVISION_PARTS` component — `node_modules`, `.venv`, …) is kept as a `support_files` entry copied with the set — test-shaped or not, since a conftest or helper beside the tests is still needed — so a correct fix is not failed for its absence; a file the repo's ignore rules match (`_untracked_listing(wt)` omits it) is kept only in or beneath the directory of a kept defect/control file (for a root-level test file, only other root-level files), since elsewhere it is likely build output from the unfixed tree that would shadow a correct fix. Each remaining declared file is validated with `_run_acceptance_file(..., validating=True, failure_mode=)` (`_acceptance_cmd(st, files, tree)`: the named-test-files template `resolve_test_files_scoped` rendered over that one file, every file test-shaped — over `{test_targets}` every file a cargo integration test (`_is_cargo_integration_test`), over `{test_packages}` every file a `_test.go` file and the command followed by `-run '^(<names>)$'` naming the test functions `_go_test_func_names` reads from the tree's copy (`_GO_TEST_FUNC_RE`, `TestMain` excluded; none → no command); `failure_mode` is the writer's declaration for a defect file, always `"assertion"` for a control): validation is PER CASE — with a readable report the verdict is False when any case's status is `failed` (its IDs recorded as the defect file's `base_failing_cases`) and True when none is, whatever the exit code; a defect file is kept only if it fails, a control only if it passes (a failing control, or any file that yields `None` — not test-shaped, runner missing, ran no test, could not load — discards the set); a kept defect file's mode is recorded in the set's `modes` — `"import"` only when `_run_acceptance_file(..., observed=)` reported the file failing to load on the base (`observed["load_failure"]`), else `"assertion"`, so a declared import defect that loaded and failed an assertion is recorded as an ordinary failure; a set with no discriminating defect file, or with no passing control file, is discarded; valid sets are copied to `<run_dir>/acceptance/set-<k>/`. When every declared defect file ran and passed (no defect case fails at the own start), the writer is asked once more in the same checkout (`acceptance_rewrite_rounds` ≥ 1; sid `acceptance-<k>-r1`) with its original payload plus `_NO_DEFECT_FAILS_NOTE` — the runner's per-case statuses for its defect files — and the set is collected again (`_collect_acceptance_set`), recorded `own_start_rewrite: true` when valid. **In a Prisma repo** (`_prisma_project`: a tracked `schema.prisma` whose nearest `package.json` lists `prisma`/`@prisma/client`; its datasource `provider` read from the schema) with a PostgreSQL datasource, every command that needs a database is wrapped by `scripts/sandbox-db.sh` inside its own confinement and isolation (§ *Isolation and the held-out sandbox (I3)*, *The per-command database*; DESIGN §6 *No database server leerie starts is ever unconfined*) — a writer checkout's session (the writer spawned as `sandbox-db.sh <pkg> leerie_<sha256[:16]>_test -- claude …`, so its `DATABASE_URL`/`DIRECT_URL` name its own cluster's socket; `_invoke` still scrubs any `PRISMA_USER_CONSENT*` from every worker environment) and every evaluation, audit and surrogate command — with `_test_db_url_refusal(url, direct_url)` checked on the composed URL; the writer gets the REAL DATABASE section (`_prisma_real_db_section(_prisma_db_context(repo, base), template)`: client modules — non-test files containing `new PrismaClient` —, the five newest tests importing one unmocked, their support helpers); a set file that `vi.mock`/`jest.mock`s a client module or the client package (`_prisma_mock_hits`) earns one fix-up call (sid suffix `-fix`). Each database and its cluster die with their command; nothing is dropped or stopped by leerie. **Then, when `no_work_pending` is set,** `_settle_pending_no_work_failing_open(st, caps)` calls `_settle_pending_no_work(st, caps)`, which runs the valid sets on HEAD (`_acceptance_results_on_head`: the planning worktree, deps via `_ensure_worktree_deps`, evaluated at the worktree's HEAD sha — except when that sha is `acceptance.validity_base`, where the verdict is known from validation and returned without running anything, every set failing on its `defect_files`; a measured result is kept in `_HEAD_ACCEPTANCE_RESULTS` keyed by run dir and sha and reused by the later pre-sweep and already-fixed checks on the same commit — in memory only, so a resume measures afresh, and never a result that measured nothing): no valid sets, no measured set (`not measurable`), or every measured set passing → `_finish_no_work_run` and `return`; an exception while settling also finishes on the judge's confirmation (fail-open, `verdict: error: …`); any failing set with `_prior_acceptance_dispute(st)` → `_finish_no_work_run` with a WARNING, re-recording `acceptance_dispute` with `accepted: true` so the NEXT run also sees a prior dispute (the dispute bound — without the carry-forward the newest-run lookup would alternate dispute/accept); otherwise `acceptance_dispute` and `no_work_dispute` (the failing case names as `judge_evidence` — from `_acceptance_shown_indices` sets only, so held-back names never reach a planner; with no names left, the counts alone, saying "held back" only when no shown set fails and otherwise that the failing cases were not named; when names exist but another failing shown file declared none, `; other failing tests named no cases` follows them) are recorded and planning proceeds. The recorded `cases` in `acceptance_dispute`/`no_work_acceptance` follow the same rule. **Then `phase_plan`:** one planner worker per category, awaited concurrently via `_gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `leerie.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()`. After all `plan_one` results are collected, P1 Layer C runs: each first-pass subtask in each plan is expanded through `_recursive_decompose(subtask, depth=0, …)`, and `plan["subtasks"]` is replaced with the union of all returned leaves (DESIGN §5½ *Wire-in to phase_plan*). Within a plan, the top-level subtasks' `_recursive_decompose` calls run under **bounded concurrency** — a single `asyncio.Semaphore(caps["max_parallel"])` created once before the loop over `plans` and shared across every plan's expansion, awaited via `_gather_or_cancel` — mirroring `_filter_satisfied_subtasks`'s accumulate-as-they-complete shape (M2 perf fix: replaces a strictly-sequential `for` loop). `st.data["decompose_snapshot"]` is written and `st.save()`d as each top-level subtask's expansion completes, same as before, but completion (and therefore write) order across subtasks is now nondeterministic — nothing depends on that order, only on every finished subtask's leaves being captured before a later crash. A plan with no subtasks is left untouched. Expansion vanishes each split parent's id, so the loop records `{parent_id: [leaf_ids]}` for every parent absent from its own leaves and then calls `_remap_vanished_deps(all_leaves, expansion)` **once over every plan's leaves after every plan has expanded** — a dependent may live in a different category's plan than the parent it names (DESIGN §5 *Id-vanishing operations*). The downstream path (reconcile → overlap_judge → schedule → _validate_plan → _write_plan) receives this expanded flat leaf set unchanged. |
 |   • Reconcile *(when needed)* | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. **Before matching, two mechanical passes run: (a) `_promote_external_collisions(plans)` rewrites any `extent: external` entry whose tag is in some plan's `provides` to `extent: in_plan` (the in-plan producer wins); (b) `_collect_external_preconditions(plans)` extracts every remaining `extent: external` entry into a deduped list `{tag, reasons[], originating_subtasks[]}` that bypasses the reconciler and is persisted by `_write_plan`. Both passes are re-run after `_apply_reconciler_output` so any `extent: external` entries on reconciler-added connector subtasks also flow through the same machinery (collision-promoted if a provider now exists; otherwise added to the persisted preconditions list). The second collection idempotently replaces `st.data["external_preconditions"]` — the helper returns the full deduped set so a re-run is a refresh, not an append.** Only `extent: in_plan` entries with no matching `provides` enter the unresolved set. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker. Its per-subtask input view (`subtask_views`) carries `id`, `title`, `intent`, **`scope_note`**, `depends_on`, `files_likely_touched`, `provides` and the `in_plan` `requires` tags — `scope_note` because `prompts/reconciler.md` scopes `conditional_drop` to signals in the consumer's `intent`/`scope_note` and shipping only half of that surface disables the rule for whichever half the planner used. `tests/test_reconciler_payload_fields.py` derives the required field set from the prompt text so a newly-named signal cannot drift. Including `scope_note` grows `subtask_views` meaningfully, but the payload is deliberately **uncapped** — it travels over stdin, so `MAX_ARG_STRLEN` no longer bounds it (see "User prompt transport") and nothing truncates it. The nearest real ceiling is the ~224K-token client-side refusal that applies under `--dangerously-force-strict-output` (`ContextOverflow`), so a future field added here should be sized against that, not assumed free. The worker emits eight actions — five *resolution* (renames / add_provide / added_subtasks / conditional_drop / drop_require), two *cycle-breaking-only* (dependency_edges / merged_subtasks; `drop_require` also plays a cycle-breaking role), and one *escape hatch* (unresolvable). **Wire shape vs internal shape:** the four `{sid, tag, reason}` ops travel as one `op`-discriminated `tag_ops` array and a new subtask's `requires` travels in a sibling `added_requires` keyed by sid — both forced by grammar compilation (see §7). `_expand_reconciler_output` fans that into the eight arrays named here before any consumer runs, so every apply step and state field below uses the action names, not the wire names. If `unresolvable` is non-empty, dead-subtask elimination (`_prune_dead_subtasks`) first removes fully-speculative subtasks whose every `in_plan` requires is unresolvable when ≥1 domain has 0 subtasks (see "Phase 2½ checks" below); if entries remain after pruning, `die()` with the reconciler's diagnosis (DESIGN §5). Otherwise, the orchestrator applies the seven action arrays mechanically. After applying, runs an **acyclicity gate** (Tarjan's SCC over the post-mutation graph); on cycle, deep-copies the pre-mutation plans, computes a recommended cycle-resolution per SCC from structural signals, respawns the reconciler once with a structured retry prompt + bounded "must-include" set of acceptable operations, and re-runs the gate. If still cyclic, `die()` with the SCC + offending mutations enumerated. See "Phase 2½ checks" and "Cycle-resolution retry loop" below. |
 |   • Overlap judge *(when 2+ planners)* | `phase_overlap_judge` | spawn one `plan_overlap_judge` worker against the reconciled plan to detect cross-planner **surface collisions** — two subtasks producing the same exported artifact (same component / function / primitive) with incompatible APIs. Schema in `SCHEMAS["plan_overlap_judge"]`. Output: zero or more `collisions`, each with `resolution ∈ {merge, drop_a, drop_b, unresolvable}` and (when `resolution=merge`) a non-empty `merge_feasibility` statement that becomes the merged subtask's unified intent. Orchestrator applies actions mechanically through `_apply_overlap_collisions` with the **anchor-survivor rule**: when one sid appears in 2+ non-`unresolvable` collisions (computed by `_compute_overlap_anchors`), it is the structural anchor of the cluster and survives every merge it participates in — overriding `_apply_overlap_merge`'s default lex-smaller rule (the default is a determinism device with no semantic content). Rationale: membership is bare appearance count and carries no semantic claim — a sid the judge dropped twice is an anchor too, it just never survives to use the hint — but a sid the judge kept returning to is a better merge tie-break than alphabetical order. Do **not** read it as "the broader subtask that absorbs each partner": that is false on 20 of the 64 two-collision combinations (DESIGN §5). Pairs that lack a shared endpoint use the lex-smaller default unchanged. Per-pair: `merge` → `_apply_overlap_merge` (with optional `survivor_hint=anchor_sid` when applicable; union of fields, intent concatenation, downstream `depends_on` rewrites); `drop_*` → `_apply_overlap_drop` (mirrors `conditional_drops` apply step); `unresolvable` → `die()` at plan time with both sids + artifact + judge's reason. The validator also die()s on the keep-and-delete contradiction (`_contradictory_drop_sids`: a `drop_*` whose dropped sid *survives* another collision — kept as a merge endpoint or as the non-dropped side of another `drop_*`. One claim deletes it, another keeps it; no apply order satisfies both. Deliberately **not** anchor membership — a sid dropped by several collisions is an anchor by appearance but is coherent multi-drop output, applied as a cluster by `_apply_multidrop`). **Per-resolution cycle avoidance:** before applying each `merge` / `drop_*`, `_apply_overlap_collisions` tentatively applies it to a copy (`_would_cycle_after`) and, if it would introduce a dependency cycle, skips it (`skipped_would_cycle`) — keeping both subtasks separate for the integrator instead of `die()`ing the run; the final post-merge Tarjan gate is retained only as a never-fires backstop. **Cheap-skip** when fewer than 2 planners produced subtasks, or total subtask count < 2 (no possible cross-planner collision). **Python backstop** asserts every `merge` carries non-empty `merge_feasibility` — caught at `_validate_overlap_judge_output` before any apply. Opt-out via `--skip-overlap-judge` (mirrors `--skip-smoke`; env `LEERIE_SKIP_OVERLAP_JUDGE`; `leerie.toml` `skip_overlap_judge`). Persists full judge output to `state.data["plan_overlap_judge"]` and post-apply mutations to `state.data["plan_overlap_applied"]` for audit. See "Phase 2¾ checks" below. |
 |   • Adherence gate *(when prescribed)* | `phase_adherence_gate` | whole-plan instruction-adherence gate (DESIGN §12 sibling — see "Instruction-adherence gate" above for the full mechanism). Cheap-skip when `st.data["skip_adherence_check"]` or `st.data["prescribed_procedure"].is_prescribed` is falsy — the ~90% goal-only common case pays nothing. Otherwise: deterministic `check_prescribed_command_coverage` floor + `adherence_judge` worker, fed through the existing `_run_checked_loop` (bounded by `judgment_check_rounds`); a violation's feedback callback re-invokes `phase_plan` in full to actually re-plan, then re-invokes `phase_reconcile` **and `phase_overlap_judge`** on the re-planned output (a re-plan runs one planner per category in parallel with no cross-category tag visibility, and can reintroduce cross-domain `provides`/`requires` drift `phase_reconcile` already resolved on the first pass **and the cross-planner surface collisions `phase_overlap_judge` already merged** — DESIGN §5 *A re-plan invalidates every phase that already ran*. It does NOT re-run `phase_planning_coverage_gate`, which sits downstream and has not run yet; `phase_reconcile` short-circuits to a no-op when the re-plan introduced no new unresolved requires). `die()`s on exhaustion; `adherence_judge` `WorkerError` degrades to the floor's own verdict rather than discarding the plan. Persists to `state.data["adherence_gate"]` for audit. |
@@ -4203,6 +4173,285 @@ must be true in the environment before the change is safe to ship.
 
 Maps to `DESIGN.md`: §3.
 
+
+### Isolation and the held-out sandbox (I3) — `scripts/landlock_exec.py --isolate` / `--sandbox`
+
+DESIGN §6 *Every confined process has its own `/tmp`, `/dev/shm` and IPC,
+and sees every other mount read-only*, *A held-out evaluation runs alone,
+in a world that dies with it (I3)*, *No database server leerie starts is
+ever unconfined*.
+
+**The shim** (`scripts/landlock_exec.py`, stdlib only, single-threaded
+until it execs):
+
+```
+landlock_exec.py [--isolate] [--rw PATH]... [--ro PATH]... -- CMD
+landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
+                 [--report PATH --report-fd N] [--rw PATH]... [--ro PATH]... -- CMD
+```
+
+Without either flag it behaves as before (Landlock, seccomp, `run`).
+`--isolate` and `--sandbox` exit 126, naming the step and its errno,
+without running CMD when any step fails (`leerie: cannot isolate the
+command, so it does not run: <step>: <errno>`). Functions, in call order:
+
+- `enter_namespaces(*, sandbox: bool) -> None` — `unshare(CLONE_NEWUSER)`;
+  `/proc/self/setgroups` ← `deny`; `uid_map` and `gid_map` ← `"<id> <id>
+  1"` (the caller's own ids); then `unshare(CLONE_NEWNS | CLONE_NEWIPC)`,
+  plus `CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWPID` with `sandbox`.
+- `pivot_to_owned_root(carry: list[str]) -> None` — `/` made `rprivate`;
+  a tmpfs (mode 0755, `nosuid,nodev`) mounted on `STAGE = "/tmp"` as the
+  new root, holding, for each entry of the old root, a directory with the
+  entry `rbind`-mounted (a directory), an empty file with it bound (a
+  file), the same symlink (a symlink), or an empty directory (`tmp`);
+  `pivot_root(".", ".oldroot")` style into it (`pivot_root(new,
+  new/.oldroot)`, the old root at `/.oldroot`); then `private_mounts()`;
+  then each `carry` path (a grant beneath `/tmp`) bound from
+  `/.oldroot<path>` onto the same path in the new `/tmp` (directories
+  made); then `/.oldroot` detached (`umount2(MNT_DETACH)`) and removed;
+  then `chdir` back to the caller's cwd.
+- `private_mounts() -> None` — tmpfs on `/tmp` and on `/dev/shm`
+  (`mode=1777`, `nosuid,nodev`); `devpts` on `/dev/pts`
+  (`newinstance,ptmxmode=0666,mode=620`, `nosuid,noexec`), and
+  `/dev/pts/ptmx` bound on `/dev/ptmx` when that is not already a
+  symlink (it is one in leerie's images).
+- `bind_grants(rw: list[str]) -> list[str]` (`--isolate`) — each `rw`
+  path that exists, is not a character device and is not `/tmp`,
+  `/dev/shm` or beneath them, bound onto itself (`MS_BIND | MS_REC`);
+  returns the kept mount points.
+  `overlay_grants(rw, view) -> list[str]` (`--sandbox`) — `view` first,
+  then each other `rw` directory outside `/tmp` and `/dev`: an overlay on
+  it, `lowerdir=<it>,upperdir=/tmp/.leerie-overlay/<n>/u,
+  workdir=/tmp/.leerie-overlay/<n>/w,userxattr` (made 0700); a failed
+  overlay is a failed step (exit 126, naming the path), never a fallback.
+  A `rw` directory beneath `/tmp` is not carried: an empty copy of its
+  subdirectories is made at its path in the new `/tmp`.
+- `readonly_mounts(keep: list[str]) -> int` — every `/proc/self/mountinfo`
+  entry not already `ro`, not in `keep` or beneath one, and not `/tmp`,
+  `/dev/shm` or `/dev/pts`, remounted `MS_REMOUNT | MS_BIND | MS_RDONLY`
+  with its locked flags (`nosuid`, `nodev`, `noexec`, `noatime`,
+  `nodiratime`, `relatime`) kept; a refused remount is a failed step.
+  A carried read-only grant beneath `/tmp` is remounted read-only too.
+- `place(pairs: list[tuple[str, str]], view: str) -> None` (`--sandbox`)
+  — each `SRC` (read by the shim, still unconfined) copied to
+  `<view>/<REL>` in the overlay, parents made, mode `0444`; refused (exit
+  126, listing the paths) when `REL` is absolute, holds `..`, or the view
+  already has a file there — a set is never placed over the tree's own
+  file (the rule `_place_set` held).
+- `loopback_up() -> None` (`--sandbox`) — `SIOCGIFFLAGS` and
+  `SIOCSIFFLAGS` (`IFF_UP`) on `lo`.
+- `join_session_keyring() -> None` — `keyctl(KEYCTL_JOIN_SESSION_KEYRING,
+  NULL)`: an anonymous session keyring of its own.
+- `install_seccomp() -> None` — after `PR_SET_NO_NEW_PRIVS`, a BPF filter
+  (`seccomp_program(arch)`, `SECCOMP_TABLES = {"x86_64": …, "aarch64":
+  …}`, the arch from `os.uname().machine`): an `AUDIT_ARCH_*` other than
+  the table's → `SECCOMP_RET_KILL_PROCESS`; on x86_64 a syscall number at
+  or above `0x40000000` (x32) → `EPERM`; `unshare`, `setns`, `mount`,
+  `umount2`, `pivot_root`, `open_tree`, `move_mount`, `fsopen`,
+  `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `add_key`,
+  `request_key`, `keyctl` → `EPERM`; `clone3` → `ENOSYS`; `clone` with
+  `args[0] & CLONE_NEW_MASK` (`0x7E020000`) → `EPERM`. Numbers: x86_64
+  272, 308, 165, 166, 155, 428–433, 442, 248–250, `clone` 56, `clone3`
+  435; aarch64 97, 268, 40, 39, 41, 428–433, 442, 217–219, `clone` 220,
+  `clone3` 435. Installed by every confined process, with or without
+  isolation (it needs no namespace); an architecture with no table is a
+  failed step (exit 126).
+- `confine(rw, ro)` — unchanged, plus from `abi() >= 6` the ruleset's
+  `scoped` field `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET |
+  LANDLOCK_SCOPE_SIGNAL` (the attribute grows to `handled_access_fs`,
+  `handled_access_net` = 0, `scoped`, with its size passed). With
+  isolation the shim adds `/tmp`, `/dev/shm` and `/dev/pts` to `rw`; a
+  grant of `/tmp` or `/dev/shm` itself names the private one.
+- `run(cmd)` (`--isolate`, and no flag) — unchanged: subreaper, `/proc`
+  walk, `end_descendants`.
+- `--sandbox` forks after the mounts: the child is PID 1 of the new PID
+  namespace and runs `run_as_init(cmd, report, report_fd, status_w)` —
+  stop-signal handlers installed (an init receives only handled signals),
+  `join_session_keyring`, every fd but 0–2, `report_fd` and the status
+  pipe closed, `install_seccomp`, `confine`, then fork + exec CMD (signal
+  mask and `PYTHON_IGNORED_SIGNALS` restored; the report fd and the
+  status pipe `O_CLOEXEC`); wait for CMD or a stop signal;
+  `kill(-1, SIGTERM)`, `END_GRACE_SEC` (`STOP_GRACE_SEC` when stopped),
+  `kill(-1, SIGKILL)`, reap until `ChildProcessError`; copy `report`
+  (when it exists, at most `REPORT_MAX_BYTES = 64 << 20`) to `report_fd`
+  from offset 0 and truncate it there; write `E<code>` or `S<signal>` to
+  the status pipe; `_exit(0)`. The outer shim waits for it, forwards a
+  stop signal to it (SIGTERM), reads the status and exits as CMD did
+  (`_die_of` for a signal); no status (PID 1 was killed) → exit 1.
+  `report_fd` is a regular file leerie opened, never a pipe: a runner
+  report can exceed a pipe's buffer, and nothing reads it until the
+  command exits.
+- `isolation_error() -> str | None` — forks a child that runs
+  `enter_namespaces(sandbox=True)` and mounts a tmpfs on `/tmp`; None when
+  it succeeds, else the step and errno. Tests use it to skip on a host
+  that cannot build one (the host's user-namespace restriction).
+
+**The orchestrator side.**
+
+- `ISOLATE_ENV = "LEERIE_ISOLATED"`. `_require_heldout_sandbox()` sets
+  `os.environ[ISOLATE_ENV] = "1"` after its checks pass, so every later
+  confined spawn in this process and its children (`worker-guard.py`)
+  isolates; `_isolated() -> bool` reads it.
+- `HeldOutSandbox(view: str, place: tuple[tuple[str, str], ...] = (),
+  report: str | None = None)` (NamedTuple; `place` pairs are `(absolute
+  source, path relative to view)`).
+- `_confined_argv(grants, cmd, *, sandbox: HeldOutSandbox | None = None,
+  report_fd: int | None = None) -> list[str]` — `[sys.executable, "-I",
+  "-S", LANDLOCK_SCRIPT]`, then `--sandbox --view <view>`, one `--place
+  SRC=REL` per pair and `--report <report> --report-fd <report_fd>` (both
+  or neither) when `sandbox` is given, else `--isolate` when `_isolated()`;
+  then `--rw`/`--ro` from `grants` and `-- cmd`. A `sandbox` with
+  `_isolated()` False is still emitted: a held-out file never runs outside
+  a sandbox, and the shim refuses (126) where it cannot build one. (The
+  `shared_tmp` keyword is gone.)
+- `_run_streaming(cmd, *, grants, sandbox: HeldOutSandbox | None = None,
+  …)` — with `sandbox`, opens an unlinked report file in `<run>/tmp/`
+  (`tempfile.TemporaryFile`), passes it in `pass_fds`, spawns
+  `_confined_argv(grants, cmd, sandbox=…, report_fd=…)`, and after the
+  command exits copies the file's content to `sandbox.report`'s path
+  outside (the caller's report path, which no other process wrote). The
+  evaluation's grant is `_measurement_grants(st, tree)` with the
+  `_VERIFIED_STORE_VARS` paths left out (read-only in the sandbox).
+  Callers passing it: `_run_acceptance_file`, `_acceptance_run_placed` (no
+  longer `_place_set` into its tree, and no removal afterwards),
+  `_acceptance_parse_probe`, the writer's validation, the case-failure
+  capture, the discovery reruns and the set audit's witness runs.
+- `_require_heldout_sandbox(st_root: Path) -> None` — `preflight` step
+  0.35, after `_require_landlock`, on every runtime: makes a probe
+  directory beneath the state root (a view with one file, a set file
+  outside it) and runs the shim with `--sandbox --view <probe>/view
+  --place <probe>/set.txt=placed.txt --report /tmp/r.json --report-fd N`
+  over `python3 -I -S <ROOT>/scripts/sandbox_probe.py` (stdlib), which
+  writes a JSON report of: `ipc_ns` (its `/proc/self/ns/ipc` link),
+  `interfaces` (`socket.if_nameindex()`), `tmp_private` (a marker the
+  orchestrator made in `/tmp` absent), `shm_private` (the same for
+  `/dev/shm`), `erofs` (`os.utime` on `<probe>/ro.txt`, granted read-only,
+  raises `EROFS`), `add_key` (`EPERM`), `placed` (the placed file readable
+  in the view). After it: the placed file absent from `<probe>/view` on
+  disk. `die()` on the first failed property, or on exit 126, with
+  `_sandbox_fix(stderr) -> str` naming the fix: EPERM at
+  `unshare(NEWUSER)` → `--security-opt seccomp=unconfined` (the launcher
+  passes it on every local run); EACCES at a mount → the
+  `leerie-container` AppArmor profile is not applied (the two commands of
+  `runtime_install_apparmor`, after which the launcher passes
+  `--security-opt apparmor=leerie-container`); EACCES at `setgroups` → the host's
+  user-namespace restriction (the process is not under that profile); no
+  seccomp table → the architecture; on Fly (`LEERIE_RUNTIME=fly`) the
+  message says the guest kernel cannot build it and the run does not
+  start. The probe directory is removed. `tests/conftest.py` stubs it
+  autouse (`_no_real_heldout_sandbox`, opt-out
+  `@pytest.mark.real_heldout_sandbox`): hosts and CI restrict user
+  namespaces, and a stub leaves `ISOLATE_ENV` unset.
+- **The execution lock** (replaces the run's `/tmp` lock): `_TmpLock` →
+  `_ExecLock`, `_tmp_lock()` → `_exec_lock()`, `_TMP_LOCKS` →
+  `_EXEC_LOCKS`, `_TMP_EXCLUSIVE` → `_EXEC_EXCLUSIVE`; the same semantics
+  (`readers`, `writer`, `writers_waiting`, waiter futures; `shared()` —
+  passes through when `_EXEC_EXCLUSIVE` is set, else waits while a writer
+  holds or waits; `exclusive()` — yields False when nested, else waits for
+  no writer and no reader, sets `_EXEC_EXCLUSIVE` in the holder's context,
+  yields True; one per running loop, a weak-key dictionary). Shared
+  holders: `_run_streaming` (its whole spawn), `_ts_script_run`, the `mise
+  ls` spawn, and `_invoke`/`_invoke_admitted` from before the worker's
+  spawn until its process has exited. `_held_out_section(st)` —
+  `exclusive()` around the sandboxed command only (held by
+  `_run_acceptance_file` and `_acceptance_parse_probe` around their spawn,
+  replacing `_blt_semaphore`; `_acceptance_run_placed` no longer holds it
+  across its loop, since nothing is placed on disk), no `/tmp` inventory;
+  `_exec_lock().shared()` called for a worker while `_EXEC_EXCLUSIVE` is
+  set `die()`s (`invariant: a worker spawned inside a held-out
+  evaluation`); a command passes through as before.
+- **The host's lock**: `_host_exec_lock(exclusive: bool)` — an async
+  context manager over `<LEERIE_HOST_DIR>/exec.lock` and
+  `<LEERIE_HOST_DIR>/exec.intent` (`HOST_EXEC_LOCK`,
+  `HOST_EXEC_INTENT`), taken inside the run's lock by every holder of it
+  (the outermost only): shared — `flock(intent, LOCK_SH)`,
+  `flock(lock, LOCK_SH)`, `flock(intent, LOCK_UN)`; exclusive —
+  `flock(intent, LOCK_EX)`, `flock(lock, LOCK_EX)`, both held to the end.
+  Each holder opens its own descriptors (`O_CLOEXEC`); a blocking `flock`
+  runs in `asyncio.to_thread`. No-op when `LEERIE_HOST_DIR` is unset.
+- **Deleted**: `WorkerGrants.shared_tmp`, `_confined_argv(…,
+  shared_tmp=)`, `_argv_outside_grant(…, shared_tmp=)`,
+  `_measurement_grants`' `shared_tmp`, `_TMP_GRANTED_TREES`,
+  `_is_worker_tree`, `_declare_worker_tree`, `_WORKER_TREES`,
+  `_tmp_inventory`, `_remove_created`, `PRIVATE_TMP_ENV` and the
+  Dockerfile's `ENV LEERIE_PRIVATE_TMP=1`, `_place_set` on the evaluation
+  path (the self-check keeps it for shown sets in its own copy), and the
+  unconfined cluster: `_start_test_db_cluster`, `_pg_server_bin`'s
+  unconfined use, `_test_db_session`'s cluster, `_create_test_db`'s
+  unconfined `prisma db push` and `_drop_test_db`. `_reads_outside(root,
+  tmp=False)` keeps leaving the container's `/tmp` out of every grant
+  (the shim grants the private one). `_WORKER_DEVICES` keeps `/dev/shm`
+  (the shim maps it to the private one).
+- `_confined_writes_notice` names `/tmp` as the worker's private scratch,
+  gone when its session ends, and no longer says `/tmp` is not writable.
+
+**The per-command database** (`scripts/sandbox-db.sh`): `sandbox-db.sh
+<pkg-dir> <db-name> -- CMD...`, run as the confined command itself (inside
+its isolation or sandbox, under its grant). It refuses (exit 125) a name
+not matching `^leerie_[0-9a-f]{16}_test$`; `initdb -D /tmp/leerie-pg/data
+--auth-local=trust -U <user>` from the newest complete
+`/usr/lib/postgresql/<major>/bin` (else `PATH`); `pg_ctl start` with `-c
+listen_addresses='' -c unix_socket_directories=/tmp/leerie-pg -c
+fsync=off`; `createdb`; `DATABASE_URL` = `DIRECT_URL` =
+`postgresql://<user>@localhost/<db-name>?host=/tmp/leerie-pg`;
+`<pkg-dir>/node_modules/.bin/prisma db push --accept-data-loss
+--skip-generate` with `PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION` on
+that one command; then `exec CMD` with both URLs exported. Without server
+binaries, or as root, it execs CMD unchanged, printing one line. The
+shim ends the server with the command. Leerie composes the name
+(`leerie_<sha256(key)[:16]>_test`) and checks the URL the script will
+compose (`_test_db_url_refusal(url, direct_url)`: postgres scheme, host
+`localhost` with `host=/tmp/leerie-pg`, the name rule, DIRECT_URL ==
+DATABASE_URL). Callers wrap the command instead of entering
+`_test_db_session`: every set run and evaluation, CI parity's checks, the
+falsifier's commands; a worker that needs one for its session (the
+writer, the re-drive implementer) is spawned as `sandbox-db.sh <pkg> <name>
+-- claude …` inside its own confinement, so its `DATABASE_URL` names its
+own cluster.
+
+**The launcher and the runtime** (`leerie`, `scripts/runtime-install.sh`,
+`scripts/apparmor/leerie-container`):
+
+- `SECOPT=(--security-opt seccomp=unconfined)` on every local `nerdctl
+  run` (rootless, rootful, Colima), replacing `ROOTLESS_SECOPT`.
+- `APPARMOR_OPT=(--security-opt apparmor=leerie-container)` when the
+  runtime's kernel lists `apparmor` in `/sys/kernel/security/lsm` (on
+  macOS, read through `colima ssh`); the profile must then be loaded —
+  `_leerie_apparmor_loaded` reads the names under
+  `/sys/kernel/security/apparmor/policy/profiles/*/name` (readable without
+  root; `…/apparmor/profiles` is not) and compares the installed file
+  `/etc/apparmor.d/leerie-container` with the repo's (`cmp`). Missing or
+  stale: with a terminal and without `--no-runtime-install`, run
+  `runtime_install_apparmor`; else exit 1 printing its commands.
+- `runtime_install_apparmor` (`scripts/runtime-install.sh`) — Linux: `sudo
+  install -m 0644 "$LEERIE_REPO/scripts/apparmor/leerie-container"
+  /etc/apparmor.d/leerie-container && sudo apparmor_parser -r -W
+  /etc/apparmor.d/leerie-container`; Colima: the same through `colima ssh
+  -- sudo tee /etc/apparmor.d/leerie-container` (the file on stdin) and
+  `colima ssh -- sudo apparmor_parser -r -W …`. Also run by
+  `runtime_install_linux` and `runtime_install_macos` after their
+  installs.
+- `scripts/apparmor/leerie-container` — `abi <abi/4.0>`, profile
+  `leerie-container flags=(attach_disconnected,mediate_deleted)`:
+  `nerdctl-default`'s rules (network, capability, file, umount, the signal
+  and ptrace peers renamed to itself, every `/proc` and `/sys` deny) plus
+  `userns,`, `mqueue,`, `io_uring,`, `pivot_root,`, `remount /,`,
+  `remount /**,`, `mount options=(rw, rprivate) -> /,`, `mount
+  fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /tmp/,` and `->
+  /dev/shm/,`, `mount fstype=devpts options=(rw, nosuid, noexec) devpts
+  -> /dev/pts/,`, `mount options=(rw, bind) /dev/pts/ptmx -> /dev/ptmx,`,
+  `mount fstype=overlay overlay -> /leerie-state/**,`, `mount options=(rw,
+  bind) -> /**,` and `mount options=(rw, rbind) -> /**,` (the staged root
+  under `/tmp`, the carried grants, the grants bound onto themselves).
+- `container-entry.sh` and the image: no change but the removed `ENV`.
+- Tests: `tests/test_landlock_isolation.py` (every channel of the
+  measured design's §1.2 closed, in a real sandbox; skipped where
+  `isolation_error()` is not None), `tests/test_heldout_sandbox_preflight.py`
+  (the die messages, `_sandbox_fix`), `tests/test_seccomp_filter.py` (the
+  tables, the program, a real filter on the host), `tests/test_apparmor_profile.py`
+  and `tests/test_launcher_secopt.py` (the launcher's flags and install
+  step).
+
 ---
 
 ## 5. Deterministic enforcement points
@@ -4221,6 +4470,8 @@ All in `leerie.py`, in execution order. This is the concrete catalogue behind
 | `claude --version` ≥ `MIN_CLAUDE_CLI` (currently `(2, 1, 22)`) | CLI too old for `--json-schema` (introduced for `claude -p` in v2.1.22) — replaces the cryptic "unknown option" message a stale CLI used to produce |
 | `claude --version` ≥ `MIN_CLAUDE_CLI_STRICT_OUTPUT` (currently `(2, 1, 289)`), only when `--dangerously-force-strict-output` is on | a CLI on which strict decoding turns leaked tool-call markup into a schema-valid payload with its fields emptied (DESIGN §7) |
 | `gh auth status` + `origin` remote (launcher bash, before container) | finalize would fail at push/PR after the full run already ran. Short-circuited when `--no-push` is passed (env / TOML mirrors). |
+| `_require_landlock()` (step 0.3) | a kernel that cannot confine a worker (Landlock ABI below `MIN_ABI`) |
+| `_require_heldout_sandbox()` (step 0.35) | a runtime that cannot build the held-out sandbox or the isolation every confined process gets — seccomp refusing a user namespace, the `leerie-container` AppArmor profile not applied, the host's user-namespace restriction, no seccomp table for the architecture, Fly's guest kernel — named in the `die()` (§ *Isolation and the held-out sandbox (I3)*) |
 | live `claude -p` smoke test | auth failure or network problem |
 | live `claude -p` smoke test — client-side context refusal | `ContextOverflow` -> resumable `EXIT_LOCKED` pause naming the remedy, not a bare `Prompt is too long` |
 
@@ -7772,12 +8023,11 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   the tree's `typescript` when it has `createSourceFile`, else the
   bundled copy — always present in the image). Up to `max_parallel`
   lane checkouts `falsifier-lane<n>`, each installed once.
-  `_run_delivery_detection` calls it inside `_test_db_session(st)`: in a Prisma/PostgreSQL repo
-  `falsifier-confirm` gets one `_create_test_db` database at setup, and each
-  sample re-creates its lane's (`_create_test_db` drops and re-pushes it,
-  dropped by `_drop_test_db` after the sample), passed as `env_extra` —
-  `_test_db_env(url)`, never the consent — to the sample's `claude_p` calls
-  and the confirm checkout's `_capture_failing_test_ids(env_extra=...)`.
+  In a Prisma/PostgreSQL repo each sample's falsifier worker and each
+  confirm-checkout command (`_capture_failing_test_ids`) is wrapped by
+  `scripts/sandbox-db.sh` (§ *Isolation and the held-out sandbox (I3)*,
+  *The per-command database*): a fresh database per process, so no reset
+  is needed between samples.
   Per sample: `_restore_tree(<lane>, sha)` (*One restore*), `_falsifier_place_leads`
   (each valid set's files read-only under
   `FALSIFIER_LEADS_DIR/acceptance/set-<k>/`, every task-referenced file the
@@ -7919,13 +8169,11 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   changed file.
 
 **Database-backed checks** (DESIGN §8 *Prisma repositories get a real
-database*). The baseline and the final pass each run inside
-`_test_db_session(st)`. `_ci_prepare` — after the deps install, when any of
-its checks `requires` `database` — gives the tree a database
-(`_create_test_db(st, tree, "ci-<side>")`, recorded per tree in `_CI_DB_URLS`
-and dropped by `_ci_teardown`); `_ci_run` lays `_test_db_env(url)` over the
-check's own `env` for a check (and its prerequisites) that `requires`
-`database`. In a Prisma repo a prerequisite or check argv that
+database*). `_ci_run` wraps a check (and its prerequisites) that
+`requires` `database` in `scripts/sandbox-db.sh <pkg> leerie_<…>_test`
+(§ *Isolation and the held-out sandbox (I3)*, *The per-command
+database*), so each such command has its own cluster; `_CI_DB_URLS` and
+`_ci_teardown`'s drop are deleted. In a Prisma repo a prerequisite or check argv that
 `_ci_runs_db_reset` matches (its joined argv against
 `_db_reset_rule_patterns` — the workers' deny list) is never run
 (`{rc: None, skipped: "db_reset"}`; a check so matched is unselected,
@@ -8165,9 +8413,10 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   skipped (`skipped: nothing_left`); members whose `_redrive_allowed` is
   false are dropped (`skipped: budget` when none is left); each member's
   counter is consumed (`_consume_redrive`); `in_flight {pre_sha, round,
-  group}` is saved; inside `_test_db_session(st)`, the group's throwaway
-  database is made (`_create_test_db(st, staging, "redrive-r<round>g<group>")`,
-  None without a Prisma project or cluster) and the self-check prepared
+  group}` is saved; in a Prisma/PostgreSQL repo the implementer is
+  spawned through `scripts/sandbox-db.sh` (its own cluster for its
+  session, `db_url` its socket URL; None without a Prisma project) and the
+  self-check prepared
   (DESIGN §8 *A held-out set never enters a tree a worker commits from*):
   `_selfcheck_prepare(st, caps, staging, shown, label, db_url) -> dict`
   writes `<run>/selfcheck/<label>/` holding `sets/set-<index>/<rel>` (a

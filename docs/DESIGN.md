@@ -2472,7 +2472,11 @@ Bash, and a symlink, hardlink or rename out of a grant is refused
 root's parent is granted for reading except the one on the way to it and
 `/tmp` (a symlink that resolves into the state root or onto its path is
 skipped — pytest's `pytest-current` would otherwise have granted the whole
-root, measured — and so is one that resolves into `/tmp`).
+root, measured — and so is one that resolves into `/tmp`). Leerie's
+grants never name the container's `/tmp`: the shim gives every confined
+process a `/tmp` and a `/dev/shm` of its own and makes every other mount
+read-only to it (§6 *Every confined process has its own `/tmp`,
+`/dev/shm` and IPC*).
 `/` itself cannot be granted without granting everything beneath it, so a
 worker cannot list `/`. Lane B measured no overhead on a warm install and
 about 83 ms per spawn.
@@ -2490,7 +2494,8 @@ worker gets the first block, then its kind's.
 
 | Grant | Path | Access | Who makes it |
 |---|---|---|---|
-| devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, `/dev/pts`, `/dev/shm` (POSIX semaphores: Python's multiprocessing locks and Chromium need it, measured) | write | — |
+| devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, `/dev/pts`, `/dev/shm` (POSIX semaphores: Python's multiprocessing locks and Chromium need it, measured); `/dev/pts` and `/dev/shm` are the process's own | write | — |
+| its own `/tmp` | a fresh tmpfs per process tree, made by the shim, gone when it ends | write | the shim |
 | own temp dir | what `TMPDIR`, `TMP` and `TEMP` name: `<run-dir>/workers/<wid>/tmp/` | write | `_worker_dirs` |
 | own CLI config | what `CLAUDE_CONFIG_DIR` names: `<run-dir>/workers/<wid>/config/` (sessions live there, so `--resume` finds them) | write | `_worker_dirs` |
 | the CLI configuration template | `<run-dir>/claude-config/`, whose directories each worker's configuration links | read | `_claude_config_template` |
@@ -2512,39 +2517,29 @@ never granted, so no store leerie's own commands install from can be
 written by a worker. The grants are computed after `claude_p` has named
 the worker's own directories, and follow them.
 
-**`/tmp` is not a worker's: a worker neither reads nor writes it.** It is
-shared by every process of the container, and leerie's runs of the
-repository's commands write it (§6 *A measurement may write `/tmp`; a
-held-out evaluation has it alone*: a repository's tests that use a fixed
-`/tmp/<name>`), so a worker's write there would be a write into what leerie
-measures, and a worker's read there a read of what a measurement left —
-a held-out set's run included. `_worker_grants` therefore leaves `/tmp` out
-of the reads outside the state root (`_reads_outside(root, tmp=False)`). A
-private mount was the alternative: it needs a user namespace, which the
-default seccomp profile refuses on rootful (§6 *Worker subtree
-termination*), so it would hold on one runtime only. Instead a worker's
-temp directory is its own `TMPDIR` (the CLI honours it: measured, with
-`TMPDIR` unset the confined CLI refused to start on `/tmp/claude-<uid>`,
-with it set it made `$TMPDIR/claude-<uid>/` and ran), and a fixed
-`/tmp/<name>` path is refused, for reading too. Measured 2026-11-01 (CLI
-2.1.312, haiku, one real `claude -p` through `claude_p` as a committing
-worker with bare `Bash`): `ls /tmp`, `cat` and a write of a `/tmp` file and
-the Read tool on one were all refused (EACCES), while `$TMPDIR`, `node`,
-`python3`, `git commit`, `pnpm` (corepack downloading into the workers'
-cache) and the Write tool in its tree all worked. Nothing the CLI or those
-tools needed was in `/tmp`; leerie's own hook script was, on a host whose
-leerie checkout lies under `/tmp`, so a worker reads leerie's install, its
-CLI and its home by name (the suite's `claude` stubs and its test `$HOME`
-are under `/tmp` too). That is common — 155 of
+**A worker's `/tmp` is its own.** Until 2026-11-01 `/tmp` was shared by
+every process of the container and leerie's runs of the repository's
+commands wrote it, so a worker was refused `/tmp` whole, for reading too
+(`_reads_outside(root, tmp=False)`): a write there would have been a write
+into what leerie measures, a read there a read of what a measurement left.
+A private mount was believed to hold on one runtime only; that premise was
+wrong (§6 *Every confined process has its own `/tmp`, `/dev/shm` and
+IPC*). Now the shim mounts a fresh `/tmp` for each worker's process tree:
+nothing in it is shared, and the worker reads and writes it freely — 155 of
 the 310 corpus sessions that wrote an absolute path wrote under `/tmp`
-(lane B, e.g. `/tmp/fr_fixed.ts`) — so every worker with a shell is told
-where it can write. The notice is rendered from that worker's own grant
-(`_confined_writes_notice`), never a fixed sentence: a fixed one told the
-implementer "only your working directory and $TMPDIR" while its grant, and
-its prompt, also had its notes directory (review round 18). It is a
-notice; the kernel is the guarantee. The
+(lane B, e.g. `/tmp/fr_fixed.ts`). It does not outlive the process: a
+re-ask or resume starts with an empty one. A worker's temp directory is
+still its own `TMPDIR` (`<run-dir>/workers/<wid>/tmp/`; the CLI honours
+it: measured 2026-11-01, with `TMPDIR` unset the confined CLI refused to
+start on `/tmp/claude-<uid>`, with it set it made `$TMPDIR/claude-<uid>/`
+and ran). Every worker with a shell is told where it can write. The notice
+is rendered from that worker's own grant (`_confined_writes_notice`), never
+a fixed sentence: a fixed one told the implementer "only your working
+directory and $TMPDIR" while its grant, and its prompt, also had its notes
+directory (review round 18). It names its `/tmp` as private scratch that
+ends with the session. It is a notice; the kernel is the guarantee. The
 prompt a worker reads on stdin is staged in `<run-dir>/stdin/`, never in
-`/tmp`, where another worker's processes could read or rewrite it.
+the container's `/tmp`.
 
 | Kind | Workers | Tree | Run repository | Run files |
 |---|---|---|---|---|
@@ -2579,10 +2574,10 @@ subtask at a time.
 Nothing else is granted: not `state.json`, `acceptance/`, `logs/` or
 anything else in the run directory, not `repo-settings/`, not staging or a
 view (unless it is the worker's own tree), not a sibling's worktree, not
-`/work`, `$HOME` for writing, `/tmp` for reading or writing. A tool that
-writes beneath `$HOME` or `/tmp` by a fixed path is redirected by
-environment to the worker's own directories, or fails — then that is a
-finding, not a grant to widen.
+`/work`, `$HOME` for writing, the container's `/tmp`. A tool that writes
+beneath `$HOME` by a fixed path is redirected by environment to the
+worker's own directories, or fails — then that is a finding, not a grant
+to widen.
 
 **Outside the container.** The host-side workers — the rebaser
 (`host-finalize.sh` → `run_rebaser`), the host recapture
@@ -2601,9 +2596,21 @@ integrator (`collect-subtrees.sh`) is a run worker: it takes its grants from
 **Residuals.** A committing worker can move any ref of its own tree
 repository, its tree's branch included; leerie takes only that branch, and
 reads every other branch in the run repository, which the worker cannot
-write (I6). `/dev/shm` is shared; leerie never reads it. A worker can signal any process of its user
-(Landlock's signal scoping needs ABI 6), the orchestrator included; the
-process-kill deny rules (§9) and `TaskStop` are the guard there.
+write (I6). Below Landlock ABI 6 a worker can signal any process of its
+user, the orchestrator included; from ABI 6 the shim scopes signals and
+abstract unix sockets to the worker's own Landlock domain. The
+process-kill deny rules (§9) and `TaskStop` stay the guard where the ABI
+is lower.
+
+**Landlock does not mediate inode metadata or path walk.** A process can
+`chmod`, `utime` and `setxattr` any file of its user that it can name,
+outside every write grant — `state.json` included — and `readlink` and
+`lstat` names in a directory it may not list (measured, ABI 8). A
+read-only mount, or a distinct uid, is the only fix; the shim makes every
+mount but the grants read-only to every confined process (§6 *Every
+confined process has its own `/tmp`, `/dev/shm` and IPC*), which closes
+the metadata writes. Names read by path walk outside a grant stay
+readable; they are names, not contents.
 
 ### Leerie's runs of the repository's commands are confined too (I5, measurements)
 
@@ -2652,8 +2659,8 @@ enforce, which a measurement reads as "could not measure", never a pass.
 | devices | as a worker's | write |
 | the measured tree | the checkout the command runs in (a committed view, an evaluation tree, a helper checkout, a worker tree an install runs in) | write |
 | its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `mise-state/` (`MISE_STATE_DIR`), `state/` (`XDG_STATE_HOME`), `reports/` (every runner report, the parse probe's marker, the failing-ID capture's report), `coverage/` (the coverage detector's output) | write |
-| its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, and its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) (*A confined command's scratch is short and private*) | write |
-| `/tmp` | itself, for a command `_run_streaming` runs, under the run's `/tmp` lock, in a tree no committing worker writes (*A measurement may write `/tmp`; a held-out evaluation has it alone*, *A command in a worker's tree is kept from `/tmp` as the worker is*) | read and write |
+| its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, and its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) (*A confined command's scratch is short and private*), carried into its own `/tmp` | write |
+| `/tmp`, `/dev/shm` | the command's own, made by the shim, every kind, every tree (*Every confined process has its own `/tmp`, `/dev/shm` and IPC*) | read and write |
 | leerie's install, the home | `ROOT` (the AST scripts), `HOME` (unless it holds `/tmp`), named as a worker's are | read |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
 | leerie's stores | `<state-root>/.stores/leerie/`: the fetched stores (*Which stores an install may share*) | read |
@@ -2697,8 +2704,8 @@ variables stay as leerie's environment (`_leerie_stores`) and
 `_tree_store_env` set them, each in the class the grant writes or reads.
 A recipe entry's or a CI check's own variables still apply; a temp or cache
 path they name outside the grant is refused, which is a finding, not a
-grant to widen. A fixed `/tmp/<name>` path is not: a command
-`_run_streaming` runs writes `/tmp` as it would outside leerie.
+grant to widen. A fixed `/tmp/<name>` path is not: every command writes
+its own `/tmp` as it would outside leerie.
 
 **Leerie's stores, by class.** The fetched stores under
 `<state-root>/.stores/leerie/` (`_FETCHED_STORE_VARS`) are written by
@@ -2839,8 +2846,9 @@ never depends on the run's id or the tree's name): 23 characters, so tsx's
 `<dir>/tsx-<uid>/<pid>.pipe` fits with room to spare. `/tmp/l` and each
 directory in it are made 0700 and must be this user's directories, not
 links — anything else stops the run, since a command whose scratch it is
-could be read or planted (`_own_private_dir`). Above them is `/tmp` itself,
-root-owned and sticky, which SWC's check accepts. `TMPDIR`, `TMP`, `TEMP`
+could be read or planted (`_own_private_dir`). The shim carries it into
+the command's own `/tmp`, sticky, under a root the caller owns (§6 *Every
+confined process has its own `/tmp`*), which SWC's check accepts. `TMPDIR`, `TMP`, `TEMP`
 and `XDG_CACHE_HOME` all name it; `MISE_STATE_DIR` stays in the
 measurement directory, which no tool inspects for ownership. It lives as
 long as its tree: the sidecar of the tree's measurement directory names it,
@@ -2868,148 +2876,343 @@ ways with no SWC cache refusal.
 A worker's own temp directory is still `<run-dir>/workers/<wid>/tmp/`
 (§6 *Each worker's own configuration and temporary directories*), at the
 run directory's depth: a socket in it can exceed `sun_path` too. That is
-this design's open edge on the worker side, not closed here.
+this design's open edge on the worker side, not closed here; a worker's
+own `/tmp` is now private and short, so pointing its `TMPDIR` there would
+close it.
 
-### A measurement may write `/tmp`; a held-out evaluation has it alone
+### Every confined process has its own `/tmp`, `/dev/shm` and IPC, and sees every other mount read-only
 
-*Designed 2026-11-01 (review round 19, execution H1).*
+*Designed 2026-11-01 (the held-out isolation design, its §3.6; adopted in
+full). It replaces "A measurement may write `/tmp`; a held-out evaluation
+has it alone" (round 19) and "A command in a worker's tree is kept from
+`/tmp` as the worker is" (round 20, lane B's d34c7d88).*
 
-**Root cause.** The round-19 grant gave a confined command no `/tmp` at
-all, and DESIGN called a fixed `/tmp/<name>` "a finding, not a grant to
-widen". But a repository's test suite is entitled to the `/tmp` it has
-everywhere else: barnacle's tests default their run directory to
-`/tmp/recon/<id>`, and funeralworks' configured test command opens
-`/tmp/leerie-test-pgdata.lock` first and starts its database with
-`-k /tmp`. Refusing them measured the sandbox, not the code. A private
-`/tmp` per command (its own mount namespace) is not available: `unshare -m`
-is refused in both the rootless and the rootful container, and the host's
-AppArmor user-namespace restriction applies (measured).
+**Root cause.** `/tmp`, `/dev/shm`, the System V and POSIX IPC objects and
+the metadata of every file of leerie's user were stores every process of
+the container shared, and Landlock mediates none of them but `/tmp`'s
+contents: it handles opening, creating, removing and renaming files, not
+a file's mode, times or extended attributes (`chmod`, `utime`, `setxattr`
+on a file outside every write grant succeed), not path walk (`readlink`
+and `lstat` work in a directory a process may not list), not IPC objects
+and not the kernel keyrings (measured, ABI 8). So each round confined one
+of them by rule — workers refused `/tmp` (round 19), measurements given it
+under a lock with leftovers removed by inventory (round 19), commands in a
+worker's tree refused it again (round 20) — and each rule had a cost the
+next found: a repository's tests that need a fixed `/tmp/<name>`
+(barnacle's `/tmp/recon`) failed in a worker's tree, and a set auditor
+with a shell read a tree whose command had run with `/tmp`. The rules
+existed because the store was shared; a store that is not shared needs
+none of them.
 
-**Invariant: a repository command leerie runs sees `/tmp` as it would
-outside leerie, and nothing a held-out set's run leaves there reaches any
-later command.** `/tmp` is the container's, and a container runs one run,
-so within the run four rules keep runs apart:
+**The premise was wrong.** DESIGN said a private `/tmp` per command was
+not available: "`unshare -m` is refused in both the rootless and the
+rootful container", and a private mount "needs a user namespace, which the
+default seccomp profile refuses on rootful". The first holds only for
+`unshare` without a user namespace — container root lacks `CAP_SYS_ADMIN`
+in the container's own namespace (EPERM, rootless and rootful, measured).
+An unprivileged process that first creates a user namespace, mapping its
+own uid and gid onto themselves, holds the namespace capabilities inside
+it, and can then make mount, IPC, network, UTS and PID namespaces and
+mount `tmpfs`, `devpts`, an overlay (`userxattr`) and bind and read-only
+remounts in them. What stood in the way was the container's policy, not a
+missing privilege:
 
-1. **Every measurement kind may read and write `/tmp`** — but only
-   through `_run_streaming`, which holds the run's `/tmp` lock shared for
-   the whole command (`_TmpLock`, `_tmp_lock()`; one per event loop, and
-   one run per orchestrator process). The grant carries `/tmp` apart from
-   its other rules (`WorkerGrants.shared_tmp`), read and write alike: its
-   reads outside the state root leave `/tmp` out, as a worker's do
-   (`_reads_outside(root, tmp=False)`), and `_confined_argv` adds
-   `shared_tmp` only when `_run_streaming` asks. A confined command started
-   any other way — the AST scripts, `mise ls` — neither reads nor writes
-   `/tmp` beyond its private temp directory, so no command touches `/tmp`
-   without holding the lock. Until round 20 only the write was held back:
-   the grant's reads covered `/tmp` whole, so an AST script read it while a
-   held-out evaluation held `/tmp` alone.
-2. **A held-out evaluation holds the lock exclusive** (`_held_out_section`),
-   from the first copy of a set's files into its tree to the last removal
-   (`_acceptance_run_placed`), and around every other run of a held-out
-   file (`_run_acceptance_file`, which every caller of
-   `_evaluate_acceptance_sets` reaches through `_acceptance_run_placed`,
-   and the writer's validation, the case-failure capture and the discovery
-   reruns reach directly) and of its parse probe (`_acceptance_parse_probe`).
-   Its own commands, and the tasks it starts, pass through
-   (`_TMP_EXCLUSIVE`); nested sections are one. A waiting exclusive holder
-   stops new shared ones, so a stream of measurements cannot starve it, and
-   nothing that holds the lock shared waits on anything else, so it cannot
-   deadlock. Inside a section the BLT semaphore is not taken: nothing else
-   runs.
-3. **Before it lets go, the section removes every path the evaluation
-   created in `/tmp`**, at any depth (an inventory of every path and inode
-   before, the topmost of each new subtree removed after; `_tmp_inventory`,
-   `_remove_created`), and the evaluation's processes have already ended
-   (*A confined command's processes end with it*). This is done only where
-   `/tmp` is the run's alone: the image sets `LEERIE_PRIVATE_TMP=1`
-   (`PRIVATE_TMP_ENV`). On a host — a test, a harness — `/tmp` is every
-   program's, so nothing is removed there, logged once.
-4. **No worker reads or writes `/tmp`** (§6 *`/tmp` is not a worker's*): a
-   worker can neither plant what a measurement will read nor read what one
-   left.
-5. **No command leerie runs in a committing worker's tree reads or writes
-   `/tmp`** (below): it would carry what it read there into the tree the
-   worker reads.
+| runtime and flags | user namespace | other namespaces after it | mounts |
+|---|---|---|---|
+| rootless, the launcher's flags before this (`seccomp=unconfined`, AppArmor `nerdctl-default`) | yes | yes | EACCES (AppArmor `deny mount`) |
+| rootful, the launcher's flags before this (default seccomp, `nerdctl-default`) | EPERM (seccomp) | — | — |
+| either, `seccomp=unconfined` and the `leerie-container` profile (below) | yes | yes | yes, each allowed by type and target |
+| the host's own shell (Ubuntu, `kernel.apparmor_restrict_unprivileged_userns=1`) | restricted: `setgroups` EACCES, no capability | — | — |
 
-**Nothing of leerie's own is in `/tmp`.** With measurements writing `/tmp`,
-a file leerie keeps there could be read or rewritten by the code it
-measures: a staged git index, a held-out file's copy, and the throwaway
-test database's data directory, which an unconfined postgres would load
-its configuration from. `_run_phases` makes `<run-dir>/tmp/` (0700) the
-orchestrator's temp directory before anything else (`_use_run_tmp`:
-`tempfile.tempdir` and `TMPDIR` for the commands it runs unconfined); it
-is one of the run directory's entries no measured tree may hold
-(`_MEASURE_PRIVATE`). The one thing left in the system temp directory is the
-preflight smoke test's empty working directory, which must lie outside
+Measured 2026-11-01, kernel 7.0, nerdctl 2.3.5, containerd 2.2.2, runc
+1.4.0, images `leerie:0.41.0` and the barnacle and funeralworks repository
+images.
+
+**Invariant: no state a confined process can change outside its write
+grants outlives it or is seen by another confined process — except what
+its grants hold.** The shim (`scripts/landlock_exec.py`), which starts
+every worker and every repository command, builds it before it confines
+and runs anything (`--isolate`):
+
+1. a new user namespace, the caller's uid and gid mapped onto themselves
+   (no privilege outside it), then new mount and IPC namespaces;
+2. a new root that the caller owns: a tmpfs holding a bind of each entry
+   of the old root, the root pivoted into it. On rootful the user
+   namespace maps only the caller, so the real root shows as `nobody`, and
+   a tool that checks the ownership of every ancestor of its cache refuses
+   one under `/` owned by another user (measured: Next's SWC refused
+   `/tmp` as a cache root, failing 1 of funeralworks' 13,036 tests). After
+   the pivot `/` is the caller's on both runtimes. This is the shape
+   `bwrap` uses;
+3. a fresh `tmpfs` on `/tmp` and on `/dev/shm` (mode 1777, `nosuid`,
+   `nodev`), and a new `devpts` instance; a grant beneath `/tmp` (the
+   command's private temp directory `/tmp/l/<id>/`, a host's state root)
+   is carried into the new `/tmp` at its own path;
+4. every write grant bound onto itself, then every other mount remounted
+   read-only, its locked flags kept. A file outside the grants can then
+   not have its mode, times or extended attributes changed (EROFS), and a
+   device node on a read-only mount still writes;
+5. its own session keyring, then a seccomp filter that refuses every
+   namespace, mount and keyring call (below), then Landlock with the
+   process's grants plus its own `/tmp`, `/dev/shm` and `/dev/pts`, and
+   from Landlock ABI 6 the abstract-socket and signal scopes;
+6. the command, run and ended as before (*A confined command's processes
+   end with it*).
+
+So `/tmp` and `/dev/shm` are a confined process's own: every worker and
+every repository command reads and writes them as it would outside leerie,
+including a fixed `/tmp/<name>`, and what it leaves there is gone when its
+process tree ends. Two concurrent measurements' fixed paths (funeralworks'
+`/tmp/leerie-test-pgdata`) no longer collide. A worker keeps the network
+(it needs the API) and so does every install kind (it fetches); only a
+held-out evaluation's network is its own loopback (*A held-out evaluation
+runs alone*). Leerie's grants never name `/tmp` or `/dev/shm` themselves:
+a grant of either names the process's own.
+
+What this replaces:
+- *A measurement may write `/tmp`* — its rules 1 to 3: the run's `/tmp`
+  lock in its shared mode for commands (`_TmpLock`, `_tmp_lock()`), the
+  grant's `shared_tmp`, the inventory of `/tmp` before a held-out
+  evaluation and the removal of what it created (`_tmp_inventory`,
+  `_remove_created`, `LEERIE_PRIVATE_TMP`), and their residual (a
+  measurement's `/tmp` state read by a later one; an evaluation's writes
+  into a pre-existing `/tmp` entry). None is needed: no `/tmp` is shared.
+  The lock's mechanism becomes the run's execution lock (*A held-out
+  evaluation runs alone*, the time half).
+- *A command in a worker's tree is kept from `/tmp`* — `_is_worker_tree`,
+  `_declare_worker_tree`, `_TMP_GRANTED_TREES` and the cost it accepted:
+  the acceptance writer's validation and the surrogate set audit failing on
+  a repository whose tests need `/tmp/recon`. A command in a worker's tree
+  has a `/tmp` again, its own, with nothing in it to relay. The read side
+  round 20 left open (a set auditor with a shell reading a tree whose
+  command ran with `/tmp`) has nothing to read either.
+- *`/tmp` is not a worker's* (§6 *A worker writes only where it is
+  granted*): a worker reads and writes its own `/tmp`.
+- The I5 residual "`/dev/shm` is shared; leerie never reads it".
+
+**The seccomp filter.** Rootful now runs with `seccomp=unconfined`, which
+the container's default profile used to refuse for every process. The
+shim takes it back per process, tighter: after `no_new_privs` it installs
+a filter that answers `EPERM` to `unshare`, `setns`, `mount`, `umount2`,
+`pivot_root`, the new mount API (`open_tree`, `move_mount`, `fsopen`,
+`fsconfig`, `fsmount`, `fspick`, `mount_setattr`) and the keyring calls
+(`add_key`, `request_key`, `keyctl`); `EPERM` to `clone` with any
+`CLONE_NEW*` flag; `ENOSYS` to `clone3`, whose flags a filter cannot read,
+so libc falls back to `clone`; and refuses the x32 ABI. A different
+architecture than the filter's kills the process. The tables are x86_64's
+and aarch64's (Colima on Apple Silicon). Python threads, `subprocess`,
+Node's `worker_threads`, pnpm, vitest, Prisma and postgres all ran under
+it. A confined process cannot make a namespace or a mount, and Landlock
+refuses a mount once a process is restricted anyway, so a worker cannot
+build or undo any of this.
+
+**Fail closed.** Preflight builds a held-out sandbox, which includes all
+of this (`_require_heldout_sandbox`, *A held-out evaluation runs alone*);
+only after it succeeds does leerie start a confined process with
+`--isolate`, and from then on every one is started so, the shim refusing
+to run the command (exit 126) when it cannot build it. Where preflight
+did not run — a test, a host harness — nothing is isolated.
+
+### A held-out evaluation runs alone, in a world that dies with it (I3)
+
+*Designed 2026-11-01 (review rounds 19 and 20, H1; the measured
+held-out isolation design, adopted in full).*
+
+**Root cause.** I3 was enforced on one store at a time — the tree (RC3,
+§8), then `/tmp` (round 19) — by cleaning up after an evaluation that
+shared the container with everything else: its `/dev/shm`, its IPC
+namespace, its network (the throwaway database, loopback, the internet),
+its keyrings, the metadata of every file its user owns, and its time with
+the workers running beside it. Each review found the next shared store.
+The class is "an evaluation shares state with the run", and cleanup by
+inventory cannot close it: it misses what an evaluation *changed*, what is
+not a path, and what is read while it runs. Measured open on 2026-11-01,
+from a Landlock-confined evaluation to a later, separately confined
+reader: a file in `/dev/shm` and in `/tmp`; three System V IPC objects
+and a POSIX message queue; a key in the user keyring and one in the
+session keyring (the session keyring leaks even across a nested user
+namespace); TCP to a listener on 127.0.0.1 and an abstract unix socket,
+both delivering the set's text; TCP and UDP to the internet; `kill(pid,
+0)` on an outer process; `utime`, `chmod` and `setxattr` on a file outside
+every write grant, read back with `stat` and `getxattr`. Landlock's network
+rules and scopes close TCP, abstract sockets and signals from ABI 4 and 6,
+and leave UDP and pathname sockets open (measured).
+
+**Invariant (I3).** Nothing a held-out evaluation can change, and nothing
+it can cause, is observable by a worker or by any command that runs a
+worker's code; what leaves it is its output stream, its exit status and
+its runner report, through descriptors leerie holds, and leerie reduces
+the report to identifiers it holds itself (set indices, the writer's
+declared case names, file paths from the set's declaration). I3's older
+half (§8 *A held-out set never enters a tree a worker commits from*) keeps
+the set out of every tree a worker commits from; this keeps it out of
+everything else.
+
+It is constructed, not checked, in two halves.
+
+1. **Space.** Every run of a held-out file — the evaluation, its parse
+   probe, the writer's validation, the case-failure capture, the discovery
+   reruns, the set audit's witness runs — starts in a sandbox the shim
+   builds before it runs anything (`--sandbox`): the isolation every
+   confined process gets (*Every confined process has its own `/tmp`*),
+   plus new network, UTS and PID namespaces; its tree as an overlay whose
+   upper layer is on its private `/tmp`, every other write grant overlaid
+   the same way (a grant beneath `/tmp` is a fresh, empty copy of its
+   directories); the set's files placed into the overlay by the shim,
+   never into a tree on disk (it refuses when the tree already has a file
+   at a set's path); loopback as its only network. The shim is the
+   namespace's PID 1: when the command exits it sends every process in the
+   namespace SIGTERM, then SIGKILL, copies the runner's report to a
+   descriptor leerie holds, and exits as the command did; the kernel frees
+   the namespaces and everything in them — IPC objects, sockets, keyrings,
+   the tmpfs and the overlay's writes. A database the set needs is started
+   inside the sandbox, on its `/tmp` and loopback, and dies with it (*No
+   database server leerie starts is ever unconfined*).
+2. **Time.** While an evaluation runs, no worker process and no other
+   command leerie runs on the repository's code exists — in the run, and
+   on the host. Every worker holds the execution lock shared for its
+   process's lifetime, as every confined command does, and an evaluation
+   holds it exclusive. What a namespace cannot hide — the evaluation's
+   `/proc/<pid>/cmdline`, its cgroup's counters, CPU, memory, page-cache
+   and disk contention, a socket a worker holds open — has no observer
+   while it exists.
+
+**The execution lock.** Two levels, one rule.
+- *The run's* is the reader/writer lock the run's `/tmp` used
+  (`_ExecLock`, `_exec_lock()`; one per event loop, writer preference, so
+  a stream of measurements cannot starve an evaluation). New shared
+  holders: `_invoke` and `_invoke_admitted` from a worker's spawn until its
+  process exits, `_ts_script_run` (which took no lock at all — round 20
+  H2's lock bypass) and the `mise ls` spawn, besides `_run_streaming`. An
+  evaluation (`_held_out_section`) holds it exclusive around the sandboxed
+  command only; its own commands pass through, nested sections are one.
+  A worker spawned while a section is held stops the run with an
+  invariant error — no worker ever passes through — so a call site that
+  would deadlock is a loud failure, never a wait. Nothing that holds the
+  lock shared waits on an evaluation, so the lock cannot deadlock.
+- *The host's* is an `flock` on `exec.lock` in the host-wide directory
+  (`/leerie-host`, next to the build semaphore), taken after the run's:
+  shared by every worker and confined command of every run, exclusive by
+  an evaluation, with writer preference by a second file (`exec.intent`,
+  held exclusive by a waiting evaluation and briefly shared by every
+  shared taker first), since `flock` gives none and the host's workers
+  overlap continuously. Without the host directory (Fly and EC2, one run
+  per machine; a test) the run's lock is the whole lock.
+  *Cost:* an evaluation waits for every worker running on the host, and
+  while it waits no new worker starts on the host. Accepted: the user's
+  rule is "however obscure", and other runs' workers share the host's
+  cgroup tree (`--cgroupns=host`), CPU and memory with it.
+
+**What the runtime must allow.** The shim needs a user namespace and the
+mounts above; the container's policy decides both.
+- *Seccomp.* Every local run passes `--security-opt seccomp=unconfined`
+  (rootless already did, for the entry's `unshare --user`; rootful and
+  Colima now too). The per-process filter above restores what the default
+  profile refused, and refuses more.
+- *AppArmor.* Where the host (or Colima's VM) runs AppArmor, the launcher
+  passes `--security-opt apparmor=leerie-container`:
+  `scripts/apparmor/leerie-container` is `nerdctl-default` plus exactly
+  the sandbox's mounts, each by type and target, and `userns`, `mqueue`
+  and `io_uring` (ABI 4.0 mediates them). `apparmor=unconfined` is not
+  used: it works on Ubuntu only because runc then runs under Ubuntu's
+  `runc` profile, which attaches by runc's path; elsewhere the process is
+  plain `unconfined`, the host's user-namespace restriction applies, and
+  the namespace is useless (measured). The profile is loaded once, by
+  root, by the runtime install step (`apparmor_parser -r -W`, persisted
+  under `/etc/apparmor.d/`; on Colima through `colima ssh`), and the
+  launcher stops, naming that command, when it is not loaded.
+- *Preflight fails closed* (`_require_heldout_sandbox`, after
+  `_require_landlock`): it builds a sandbox over a probe and checks that
+  its IPC namespace differs from the orchestrator's, `lo` is its only
+  interface, `/tmp` and `/dev/shm` are its own, a write to a file in an
+  inherited mount gives EROFS, `add_key` gives EPERM, and a placed file is
+  in the overlay and not on disk. Any failure stops the run naming the
+  flag or profile it lacks. No held-out file ever runs outside a sandbox,
+  and no confined process outside its isolation.
+- *Measured:* rootless and rootful Linux (Ubuntu 26.04, kernel 7.0). Not
+  measured: Colima (aarch64: the seccomp table, the VM's AppArmor and
+  user-namespace settings), EC2 (Debian 13, no container: Debian allows
+  unprivileged user namespaces and does not restrict them, so it should
+  build unchanged), Fly (needs user namespaces, and tmpfs and overlay in
+  one, in its guest kernel). Each fails closed at preflight, naming the
+  fix; Fly may then refuse to start, which is the documented cost of never
+  running a held-out file outside a sandbox.
+
+**Why not a privileged broker.** Container root cannot make the
+namespaces without a user namespace (EPERM, rootless and rootful). A
+broker would need `--cap-add SYS_ADMIN`, which on rootful is real
+`CAP_SYS_ADMIN` in the host's initial user namespace, and with it Docker's
+seccomp profile allows `unshare` and `mount` to every process in the
+container, plus a relay of output, report and exit status over a socket.
+The unprivileged route holds namespace capabilities only inside a child
+user namespace, which the evaluated code never holds after `exec`, and
+needs no privileged code.
+
+**Residual.** The verdict itself (which files of which set failed), which
+is the evaluation's purpose; and its duration, which a later worker can
+estimate from the clock: at most log2(timeout ÷ clock resolution) bits per
+evaluation, about 14 at the default caps, the same order as the verdict.
+Both carry what the evaluated code chooses, never the set's text unless
+that code encodes it. Side channels below the kernel's abstractions
+(caches, speculation) and kernel bugs are out of scope; the seccomp filter
+narrows the user-namespace attack surface `seccomp=unconfined` opens. Two
+relays of leerie's own are outside this design and stay as they are: the
+runner's failure text (`failing_messages`), used mechanically to classify
+resource failures, and the hidden sets' declared case names that
+`_acceptance_residual_of` hands the next same-task run's planner.
+
+**Nothing of leerie's own is in `/tmp`.** A file leerie keeps there — a
+staged git index, a copy of a set — is outside every confined process's
+`/tmp` now, but `<run-dir>/tmp/` (0700) stays the orchestrator's temp
+directory (`_use_run_tmp`: `tempfile.tempdir` and `TMPDIR` for the commands
+it runs unconfined), one of the run directory's entries no measured tree
+may hold (`_MEASURE_PRIVATE`), so nothing of leerie's depends on which
+`/tmp` a process sees. The one thing left in the system temp directory is
+the preflight smoke test's empty working directory, which must lie outside
 every repository (the run directory is inside one when the state root is
 `<repo>/.leerie`); it is made before any measurement runs
 (`_system_temp_dir`).
 
-**Residual.** A measurement that is not a held-out evaluation can leave
-`/tmp` state that a later measurement of the same run reads — one tree's
-test database cluster, a fixed `/tmp/<name>` cache — and a held-out
-evaluation's writes into a `/tmp` entry that existed before it stay (the
-section removes what the evaluation created, not what it changed). Every
-such command runs the run's own code under the same grant, in a tree no
-committing worker writes. What keeps it from a worker is not only that
-no worker reads `/tmp` — leerie runs the worker's code, so that alone was
-never enough (round 20, below) — but that no command which reads `/tmp`
-writes a tree a committing worker reads (rule 5). What is excluded is
-held-out content reaching a later command through a path the evaluation
-made.
+### No database server leerie starts is ever unconfined
 
-### A command in a worker's tree is kept from `/tmp` as the worker is
+*Found 2026-11-01 (the held-out isolation design, F1 and F2).*
 
-*Designed 2026-11-01 (review round 20, isolation H2).*
+**Root cause.** Leerie started the throwaway PostgreSQL cluster itself,
+unconfined (`_start_test_db_cluster`, a plain `subprocess.run`), with
+`--auth-host=trust`, reachable over TCP on 127.0.0.1 for as long as any
+`_test_db_session` was open — the acceptance writers, the gate's repair
+rounds, the falsifier and the re-drive, all with workers alive. A server
+is a program that runs what it is asked: a Landlock-confined process that
+was refused a read of `acceptance/` found the port in postgres's
+`/proc/<pid>/cmdline` and asked `COPY (SELECT 1) TO PROGRAM 'cat
+…/acceptance/set1/heldout.test.ts > <its own directory>'`, and read the
+held-out file back (F1, measured); the command ran as leerie's user
+outside every grant, so it could equally have read the credentials or
+rewritten `state.json`. And `_create_test_db` ran `prisma db push`
+unconfined, which loads the tree's `prisma.config.ts` — a worker's file:
+it ran (`NoNewPrivs: 0`, no Landlock) and executed `id` as leerie (F2,
+measured). The confinement boundary stopped at leerie's process, and
+leerie started a server and a tool that run the worker's code or anyone's
+query.
 
-**Root cause.** The measurement grant was derived as if every tree it
-measures were a committed view, which no worker reads. But leerie also
-runs the worker's own code in a committing worker's tree: the re-drive
-escalation gate's AST scripts load staging's `typescript`
-(`_redrive_ast_available`, `_redrive_ast_hits`), and the dependency
-install runs in the writer's, the surrogate fixer's and each falsifier
-lane's clone before the worker starts, with the writer's held-out
-validation after it. That grant read all of `/tmp` and wrote the tree, so
-the worker's code read `/tmp` *for* the worker and left what it read
-where the worker reads next: measured, a planted `typescript` copied a
-held-out file's leftover in `/tmp` into staging, where the implementer,
-refused `/tmp` itself, read it.
-
-**Invariant: a command leerie runs reads or writes `/tmp` only in a tree
-no committing worker writes.** `_measurement_grants` derives it from the
-tree: a *worker's tree* gets no `shared_tmp`, so — with rule 1 — no `/tmp`
-at all, exactly a committing worker's own access. A worker's tree is
-(`_is_worker_tree`):
-- a worktree of a tree repository (`<run-dir>/tree-repos/`: staging and
-  every subtask tree), read from its git common directory — a committing
-  worker's run worktree is never anything else (I6);
-- any tree declared one (`_declare_worker_tree`): `_worker_grants`
-  declares the cwd of every committing worker, and the clones made for
-  one — the writer's, the surrogate fixer's, each falsifier lane — are
-  declared by the code that makes them, before anything runs there.
-
-The declaration is checked from the other side too: `_worker_grants`
-stops the run (`die`) when a committing worker's tree was granted `/tmp`
-earlier in this process (`_TMP_GRANTED_TREES`), so a new tree made for a
-committing worker that is measured before it is declared stops the run
-rather than relaying. The default is the safe one for the worker: a tree
-neither kind names is a measured tree, and only a tree some committing
-worker then writes is the error the check catches.
-
-**What it costs.** A repository's tests that need a fixed `/tmp/<name>`
-fail where they run in a worker's tree — the writer's validation of its
-own held-out files, the surrogate set audit's runs in the surrogate tree —
-as they already failed in the worker's own session there. Every other
-measurement, held-out evaluations included, runs in a committed view or a
-helper checkout no committing worker writes, and keeps `/tmp`. Running the
-writer's validation in a copy of its files placed into a measured tree
-would give it `/tmp` back; that is not done here.
-
-**Rejected.** Keeping the AST gate's read of `/tmp` and moving only the
-gate into staging's committed view: the installs and the writer's
-validation have the same shape in other trees, and a per-call-site move
-leaves the next caller to repeat it. The grant now derives the answer
-from the tree.
+**Invariant: every database server leerie starts, and every command that
+pushes a schema, runs inside the confinement and the isolation of the one
+command that needs it, and dies with it.** A command that needs a
+database is wrapped by `scripts/sandbox-db.sh`, inside its own isolation
+(a sandbox for a held-out run): it runs `initdb` in the command's private
+`/tmp`, starts postgres listening on no TCP address with its socket in
+that `/tmp` (so nothing outside the command's mount namespace can reach
+it, and concurrent commands never collide on a port), creates
+`leerie_<hash>_test`, runs `prisma db push` with the consent variable on
+that one process, and execs the command with `DATABASE_URL` and
+`DIRECT_URL` naming the socket. All of it is confined by the command's
+grant; the shim ends the server with the command. A worker that needs a
+database for its session (the acceptance writer, the re-drive implementer
+for its self-check) is started the same way: its cluster lives in its own
+`/tmp`, inside its own Landlock domain, for its process's lifetime. The
+URL check before a push (`_test_db_url_refusal`) is kept, on the URL the
+wrapper is handed. No server leerie starts runs outside a confined
+process's tree, and leerie never runs `prisma` itself.
 
 ### A confined command's processes end with it
 
@@ -3052,6 +3255,22 @@ The one escape is the shim's own death by SIGKILL before it has ended
 its descendants (the orchestrator's last-resort kill after its grace):
 they are then the orchestrator's (its subreaper) or init's, and the
 container boundary (§6 *Worker subtree termination*) is what remains.
+
+**In a held-out sandbox the shim is the namespace's PID 1** (§6 *A
+held-out evaluation runs alone*). It cannot mount a `/proc` of its own
+namespace (EPERM, and EACCES under the profile: the container masks
+`/proc` paths), so it does not walk `/proc`: when the command exits it
+sends `kill(-1, SIGTERM)`, which reaches exactly the processes of its
+namespace, waits the grace, sends `kill(-1, SIGKILL)` and reaps, copies the
+report, and exits; the kernel kills whatever is left when a PID
+namespace's init exits, so the shim's own death by SIGKILL leaves nothing
+either. A PID namespace's init receives only the signals it handles, so it
+installs handlers for the stop signals, and the shim outside the namespace
+forwards a stop to it. It reports how the command ended over a pipe to
+that outer shim, which exits the same way (an init cannot die of a signal
+it raises on itself). The first prototype walked the outer `/proc` from
+inside the namespace and hung; with `kill(-1)` the namespace ended in
+under a second after the command.
 
 ### A command leerie runs starts with the signal dispositions it would have outside leerie
 
@@ -5730,9 +5949,13 @@ image dirs at `/opt/leerie-image/` (outer UID leerie) traverse via their
 mode-755 bits, and Claude Code sees `getuid() == leerie` and accepts the
 flag with no escape-hatch check. The OCI default seccomp profile blocks
 `unshare(CLONE_NEWUSER)` inside containers, so the launcher passes
-`--security-opt seccomp=unconfined` for rootless runs (gated on the
-`containerd-rootless/child_pid` sentinel, not `id -u`, so macOS/Colima
-runs are unaffected).
+`--security-opt seccomp=unconfined` — for rootless runs first (gated on the
+`containerd-rootless/child_pid` sentinel, not `id -u`), and since
+2026-11-01 for every local run, rootful and Colima included: the
+confinement shim makes a user namespace for every confined process (§6
+*Every confined process has its own `/tmp`, `/dev/shm` and IPC*), and its
+per-process seccomp filter takes back, tighter, what the default profile
+refused.
 
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
@@ -11199,21 +11422,25 @@ the persistence layer, and a hand-rolled fake that does not answer a query
 a correct fix makes fails that fix (the `coupling` kind above; 10 of Q6's
 broken sets were on such a repository). So the writer, the rewrite and
 every set run use the repository's real Prisma client against a throwaway
-database. The orchestrator starts a private PostgreSQL cluster of its own
-on a free localhost port, TCP only, from the server binaries the image
-provides (the repository's own provisioning installs them), and gives
-each worktree that needs one — a writer checkout, an evaluation worktree,
-the audit worktree, the surrogate's clone, a delivery-detection falsifier
-checkout (§8 *Delivery detection*), a CI-parity worktree whose checks
-`require` a database (§9 *The repository's own merge checks run too*) — a
-database of its own named `leerie_<hash>_test`, with that tree's schema
-pushed. A falsifier and a CI check are the same case as a set run: a
+database. Each command that needs one — a set run, the writer's session
+in its checkout, an evaluation, the audit, the surrogate's clone, a
+delivery-detection falsifier's (§8 *Delivery detection*), a CI-parity
+check that `require`s a database (§9 *The repository's own merge checks
+run too*) — gets a private PostgreSQL cluster of its own, from the server
+binaries the image provides (the repository's own provisioning installs
+them), started inside that command's own confinement and isolation and
+gone with it, listening only on a socket in that command's own `/tmp`,
+with a database named `leerie_<hash>_test` and the tree's schema pushed by
+`prisma db push` inside the same confinement: the push loads the tree's
+`prisma.config.ts`, which a worker wrote, and the cluster the orchestrator
+used to start unconfined ran any query's `COPY … TO PROGRAM` outside every
+grant (§6 *No database server leerie starts is ever unconfined*). A falsifier and a CI check are the same case as a set run: a
 probe or a database-backed check that runs against no database fails for
 the missing database, not the defect, so without one the falsifier could
 not demonstrate a persistence-layer item and every database-backed CI
 check went red at the baseline and dropped out of the gate. A falsifier
-lane is reset between samples, and so is its database (dropped and pushed
-again), so one sample's rows never reach the next; the confirm checkout
+lane is reset between samples, and its database is a new one per
+command, so one sample's rows never reach the next; the confirm checkout
 the probe is re-run in has its own. A CI check's prerequisites that would
 themselves push to or reset a database (matched by the same rule list the
 worker deny reads) are not run: the orchestrator's guarded push is the
@@ -11221,8 +11448,8 @@ only push. The set runs still
 go through the repository's own test command; a test-database wrapper
 script there (one that starts its own cluster when DATABASE_URL is unset)
 defers to the database it is handed. **Before every push, code checks the
-target**: a postgres URL on `localhost`/`127.0.0.1`, at the cluster's own
-port, a database name starting `leerie_` and ending `_test`, and
+target**: a postgres URL whose host is the command's own socket directory
+in its `/tmp`, a database name starting `leerie_` and ending `_test`, and
 DIRECT_URL equal to DATABASE_URL (Prisma configs commonly push to
 `DIRECT_URL ?? DATABASE_URL`); anything else is refused. Prisma's AI-agent
 consent variable is set on that push subprocess alone — never in a
@@ -12961,8 +13188,12 @@ ships. The arm with `TaskStop` still denied made no kill attempt at all, so
 the replay did not reproduce the motive; that the deny stops the harm rests
 on the matcher covering the 48 recorded commands, not on the replay. A
 per-worker PID namespace, which would make the kill harmless rather than
-denied, needs seccomp, AppArmor and systempaths unconfined on both rootless
-and rootful containerd and is deferred.
+denied, is deferred: a worker keeps the container's `/proc`, where a pid it
+reads from `getpid()` would name another process. Since 2026-11-01 the
+shim's Landlock signal scope (ABI 6 and later) keeps a worker's processes
+from signalling any process outside their own domain, and a held-out
+evaluation gets a PID namespace of its own (§6 *A held-out evaluation runs
+alone*).
 
 **The round signal is a regression, not a verdict.** Because a scoped
 result and a full baseline are not comparable, the base-health baseline
