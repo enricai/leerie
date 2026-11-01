@@ -3050,11 +3050,11 @@ So `/tmp` and `/dev/shm` are a confined process's own: every worker and
 every repository command reads and writes them as it would outside leerie,
 including a fixed `/tmp/<name>`, and what it leaves there is gone when its
 process tree ends. Two concurrent measurements' fixed paths (funeralworks'
-`/tmp/leerie-test-pgdata`) no longer collide. A worker keeps the network
-(it needs the API) and so does every install kind (it fetches); only a
-held-out evaluation's network is its own loopback (*A held-out evaluation
-runs alone*). Leerie's grants never name `/tmp` or `/dev/shm` themselves:
-a grant of either names the process's own.
+`/tmp/leerie-test-pgdata`) no longer collide. The network namespace is the
+process's own too, loopback only (*A confined process has its own
+network*): a worker and every kind that fetches reach the outside through
+leerie's egress proxy alone. Leerie's grants never name `/tmp` or
+`/dev/shm` themselves: a grant of either names the process's own.
 
 What this replaces:
 - *A measurement may write `/tmp`* — its rules 1 to 3: the run's `/tmp`
@@ -3115,6 +3115,108 @@ build a sandbox was no longer stopped (review round 21, execution H1). The
 invariant restored: an invocation spawns no confined process before its
 entry has proved the runtime confines and isolates it; a test enumerates
 `main()`'s dispatch paths against it.
+
+### A confined process has its own network; the outside is reached only through leerie's proxy
+
+*Found 2026-11-01 (review round 21, execution H2 and M2); decided the same
+day.*
+
+**Root cause.** `--isolate` gave a confined process its own mount and IPC
+namespaces but left the network namespace shared, and Landlock mediates
+no network. A loopback listener is state one confined process creates and
+every other sees — the class the invariant above says cannot exist — and
+it is also a program that acts with its creator's grant. Measured
+(rootless, the funeralworks image): a measurement of tree `fw` ran the
+repository's own test-database script, which started postgres on
+`localhost:55432` with `--auth-host=trust`; a "worker" whose grant was
+only its own tree could not `touch` a file in `fw` (`Read-only file
+system`) but asked that server `COPY (SELECT 1) TO PROGRAM 'id >
+…/fw/PWNED'`, and the file appeared — written with the measurement's
+grant. A second concurrent measurement found the first one's server on
+the shared port, never started its own, pushed its schema into it, and
+lost it when the first ended. I5 ("a worker's processes write only what
+its grant names") and the invariant above were both broken, by every
+server any repository starts: a test database, a dev server, a mock.
+
+**Invariant: a confined process's network namespace is its own; it
+reaches the outside only through a proxy leerie holds, which reaches
+nothing inside the container.** The shim makes a network namespace for
+every confined process (`--isolate` and `--sandbox`) and brings up its
+loopback; a listener there is reachable by the processes of that one
+command and by no other, worker or measurement. Two concurrent
+measurements each have the whole port space; a fixed port (`55432`,
+`5432`) never collides. An abstract unix socket is per network namespace,
+so it is the command's own too. A process that needs the outside network
+gets it from its grant (`WorkerGrants.egress`):
+
+- **Who.** Every worker (the API, WebFetch, the fetches its shell runs),
+  and the kinds that fetch: the setup hook, the toolchain install, the
+  store fetch (`SETUP_HOOK_KIND`, `TOOLCHAIN_KIND`, `STORE_FETCH_KIND`).
+  A measurement (`MEASURE_KIND`: build, lint, tests, a view's offline
+  install from leerie's stores, verify, CI parity, coverage, the AST
+  scripts) and a held-out evaluation reach nothing beyond their own
+  loopback.
+- **How.** The orchestrator runs an egress proxy (`_EgressProxy`, on its
+  own thread and event loop, so a synchronous spawn never stalls it) on a
+  unix socket in a 0700 directory it owns under `/tmp/l/`. The container's
+  `/tmp` is no confined process's, so the socket exists in a namespace
+  only when the shim carries its directory in (`--egress SOCK`): a
+  measurement never sees it. Inside, the shim forks a relay — a child of
+  the shim, ended with the command (*A confined command's processes end
+  with it*) — listening on the namespace's `127.0.0.1:<port>` and
+  forwarding each connection to the socket, and sets `HTTPS_PROXY`,
+  `HTTP_PROXY`, `ALL_PROXY` (both cases) to it,
+  `NO_PROXY=localhost,127.0.0.1,::1`, and `NODE_USE_ENV_PROXY=1` (Node's
+  own `http` and `fetch` read the variables only with it).
+- **What it allows.** HTTP `CONNECT` and absolute `http://` requests. It
+  resolves names itself, drops every address that is loopback,
+  link-local, unspecified, multicast or one of the container's own
+  (`_egress_refusal`, from the kernel's tables), and connects to an
+  address it checked, never to a name resolved again; a destination with
+  no allowed address is refused (403) and logged by host and port. It
+  never logs a payload. So the proxy is no way back to a listener in the
+  container. When the container has the operator's own proxy variables,
+  the egress proxy tunnels through that proxy (`_egress_proxy`, §13), as
+  the tools did before.
+- **Leerie's own listener a worker must reach.** The strict-output proxy
+  (`--dangerously-force-strict-output`) listens on the orchestrator's
+  loopback and `ANTHROPIC_BASE_URL` names its port. The egress proxy adds
+  a socket that pipes to that port (`_EgressProxy.forward`), and the shim
+  relays the same port inside the namespace to it (`--forward
+  PORT=SOCK`), so the variable is unchanged.
+
+**What a tool that ignores the proxy variables loses.** Direct egress, by
+design: inside the namespace there is no route and no resolver. The
+measured list is in IMPLEMENTATION *The egress proxy*. A repository whose
+tests reach the internet fails in a measurement as it would on an offline
+CI runner; a measurement measures the committed view, not the network.
+
+**What it replaces.** The socket-only test database (*No database server
+leerie starts is ever unconfined*): it listened on no TCP address because
+a TCP listener would have been every confined process's. Now it listens
+on `127.0.0.1:5432` of the command's own namespace and hands out a plain
+TCP URL, from which a repository's own tooling reads host and port
+(funeralworks' `pretest` runs `psql -h localhost -p 5432`; with the
+socket URL its configured `test` failed, rc 1, review round 21 M2).
+
+**Residual.** A pathname unix socket is not in the network namespace:
+one a confined process binds inside its write grant can be connected to
+by another confined process that knows its path (Landlock, at the ABIs
+this kernel offers, does not mediate `connect`). The servers a repository
+starts for its tests bind theirs in the process's private `/tmp`
+(postgres, the test database), which no other process sees; a socket
+bound in a tree stays reachable. Closing it needs pathname-socket scoping
+in Landlock.
+
+**Fail closed.** A namespace that cannot be made, a loopback that cannot
+be brought up, or a relay that cannot listen is a failed isolation step:
+the shim exits 126 and the command does not run. Preflight's sandbox
+probe builds a network namespace (the held-out sandbox always had one),
+then runs an isolated process with `--egress` that must reach the egress
+proxy through its relay and be refused a loopback destination
+(`_require_egress_relay`); a runtime that cannot do either stops the run
+naming the fix. Fly, EC2 and Colima are unmeasured: they fail closed
+rather than run a confined process on the shared network.
 
 ### A held-out evaluation runs alone, in a world that dies with it (I3)
 
@@ -3357,12 +3459,12 @@ pushes a schema, runs inside the confinement and the isolation of the one
 command that needs it, and dies with it.** A command that needs a
 database is wrapped by `scripts/sandbox-db.sh`, inside its own isolation
 (a sandbox for a held-out run): it runs `initdb` in the command's private
-`/tmp`, starts postgres listening on no TCP address with its socket in
-that `/tmp` (so nothing outside the command's mount namespace can reach
-it, and concurrent commands never collide on a port), creates
+`/tmp`, starts postgres on `127.0.0.1:5432` of the command's own network
+namespace (so no other process reaches it, and concurrent commands never
+collide on the port; *A confined process has its own network*), creates
 `leerie_<hash>_test`, runs `prisma db push` with the consent variable on
 that one process, and execs the command with `DATABASE_URL` and
-`DIRECT_URL` naming the socket. All of it is confined by the command's
+`DIRECT_URL` the plain TCP URL `postgresql://<user>@127.0.0.1:5432/<name>`. All of it is confined by the command's
 grant; the shim ends the server with the command. A worker that needs a
 database for its session (the acceptance writer, the re-drive implementer
 for its self-check) is started the same way: its cluster lives in its own

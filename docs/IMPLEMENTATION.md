@@ -4281,15 +4281,17 @@ Maps to `DESIGN.md`: §3.
 ### Isolation and the held-out sandbox (I3) — `scripts/landlock_exec.py --isolate` / `--sandbox`
 
 DESIGN §6 *Every confined process has its own `/tmp`, `/dev/shm` and IPC,
-and sees every other mount read-only*, *A held-out evaluation runs alone,
-in a world that dies with it (I3)*, *No database server leerie starts is
-ever unconfined*.
+and sees every other mount read-only*, *A confined process has its own
+network; the outside is reached only through leerie's proxy*, *A held-out
+evaluation runs alone, in a world that dies with it (I3)*, *No database
+server leerie starts is ever unconfined*.
 
 **The shim** (`scripts/landlock_exec.py`, stdlib only, single-threaded
 until it execs):
 
 ```
-landlock_exec.py [--isolate] [--rw PATH]... [--ro PATH]... -- CMD
+landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...]
+                 [--rw PATH]... [--ro PATH]... -- CMD
 landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
                  [--report PATH --report-fd N] [--rw PATH]... [--ro PATH]... -- CMD
 ```
@@ -4301,8 +4303,10 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
 
 - `enter_namespaces(*, sandbox: bool) -> None` — `unshare(CLONE_NEWUSER)`;
   `/proc/self/setgroups` ← `deny`; `uid_map` and `gid_map` ← `"<id> <id>
-  1"` (the caller's own ids); then `unshare(CLONE_NEWNS | CLONE_NEWIPC)`,
-  plus `CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWPID` with `sandbox`.
+  1"` (the caller's own ids); then `unshare(CLONE_NEWNS | CLONE_NEWIPC |
+  CLONE_NEWNET)` (step `unshare(mount/IPC/net)`), plus `CLONE_NEWUTS |
+  CLONE_NEWPID` with `sandbox` (`unshare(mount/IPC/net/UTS/PID)`). Then
+  `loopback_up()`, for both.
 - `pivot_to_owned_root(carry_ro, carry_rw, *, sandbox) -> list[str]` —
   `/` made `rprivate`; a tmpfs (mode 0755, `nosuid,nodev`) mounted on
   `/tmp` as the new root, holding, for each entry of the old root, a
@@ -4336,14 +4340,22 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   with its locked flags (`nosuid`, `nodev`, `noexec`, `noatime`,
   `nodiratime`, `relatime`) kept; a refused remount is a failed step.
   A carried read-only grant beneath `/tmp` is remounted read-only too.
-- `place(pairs: list[tuple[str, str]], view: str) -> None` (`--sandbox`)
-  — each `SRC` (read by the shim, still unconfined) copied to
-  `<view>/<REL>` in the overlay, parents made, mode `0444`; refused (exit
-  126, listing the paths) when `REL` is absolute, holds `..`, or the view
-  already has a file there — a set is never placed over the tree's own
-  file (the rule `_place_set` held).
-- `loopback_up() -> None` (`--sandbox`) — `SIOCGIFFLAGS` and
-  `SIOCSIFFLAGS` (`IFF_UP`) on `lo`.
+- `place(pairs: list[tuple[str, str]], view: str) -> None` (`--sandbox`,
+  after `readonly_mounts`) — each `SRC` (read by the shim, still
+  unconfined) written at `<REL>` beneath an `O_DIRECTORY` descriptor of
+  the view by `_place_one(view_fd, src, rel)`: every directory of `REL`
+  made with `mkdirat` when absent and opened `O_NOFOLLOW | O_DIRECTORY`
+  from its parent's descriptor, the file created `O_CREAT | O_EXCL |
+  O_NOFOLLOW`, mode `0444`. Refused (exit 126, step `place …`) when `REL`
+  is absolute, empty or holds `.`, `..` or an empty component, when the
+  view already has a file there (a set is never placed over the tree's own
+  file, the rule `_place_set` held), or when a directory on its path is a
+  link (review round 21, isolation R6: a committed `tests -> <worker
+  tree>` link sent the file onto disk in the worker's tree, because the
+  placement followed it, with every mount still writable).
+  `tests/heldout_sandbox_emulator.py` refuses the same paths.
+- `loopback_up() -> None` (both) — `SIOCGIFFLAGS` and `SIOCSIFFLAGS`
+  (`IFF_UP`) on `lo`; a failure is step `bring up lo`.
 - `join_session_keyring() -> None` — `keyctl(KEYCTL_JOIN_SESSION_KEYRING,
   NULL)`: an anonymous session keyring of its own.
 - `install_seccomp() -> None` — after `PR_SET_NO_NEW_PRIVS`, a BPF filter
@@ -4390,8 +4402,11 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   --ro / -- true`, in a child process; None when it exits 0, else the last
   line of its stderr (the step and errno). Tests use it to skip on a host
   that cannot build one (the host's user-namespace restriction).
-- `isolate(rw, ro, *, sandbox=False, view=None, place_pairs=())` — the
-  steps above in order, then `chdir` to the caller's cwd again (it was
+- `isolate(rw, ro, *, sandbox=False, view=None, place_pairs=(),
+  sockets=())` — the steps above in order (`sockets`: the relays' unix
+  sockets, each one's directory, when beneath `/tmp`, carried in
+  read-only as a `--ro` grant beneath `/tmp` is), then `chdir` to the
+  caller's cwd again (it was
   resolved before the binds and overlays, so it named the directory
   beneath them); `run_sandbox(cmd, rw, ro, view, place_pairs, report,
   report_fd)` — `isolate`, the status pipe, the fork of PID 1 with the
@@ -4399,10 +4414,33 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   handlers waits, pending), and the outer wait. `_parse(argv)` — the
   options, or a usage error (exit 2): `--isolate` and `--sandbox`
   exclusive, `--sandbox` needs `--view`, `--view`/`--place`/`--report`
-  need `--sandbox`, `--report` and `--report-fd` together.
+  need `--sandbox`, `--report` and `--report-fd` together, `--egress
+  SOCK` (absolute) and `--forward PORT=SOCK` (1–65535, absolute) need
+  `--isolate`.
+- **The relay** (`--isolate` with `--egress` or `--forward`): after
+  `isolate` and `join_session_keyring`, one `relay_listener(port) ->
+  socket` per target on the namespace's `127.0.0.1:<port>`
+  (`SO_REUSEADDR`, backlog 128; a refused bind is step `relay listen
+  127.0.0.1:<port>`) — each `--forward` port first, then `--egress` on
+  port 0 (the kernel's pick). With `--egress`, `os.environ` gains
+  `proxy_env(port)`: `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
+  `https_proxy`, `http_proxy`, `all_proxy` = `http://127.0.0.1:<port>`
+  (`PROXY_VARS`), `NO_PROXY` = `no_proxy` = `localhost,127.0.0.1,::1`
+  (`NO_PROXY_VALUE`), `NODE_USE_ENV_PROXY=1`. Then `confine`, then
+  `start_relays(relays)`: one `fork` (so the relay is confined like the
+  command, a child of the shim, ended by `end_descendants` with it);
+  the child (`serve_relays`) closes stdin and runs a thread per listener
+  accepting connections, a thread per connection (`_relay_one`) that
+  connects an `AF_UNIX` stream to the target and pumps both ways
+  (`_pump`, 64 KiB reads, `shutdown(SHUT_WR)` on EOF); the shim closes
+  the listeners and runs the command (`run`).
 
 **The orchestrator side.**
 
+- `WorkerGrants.egress: bool = False` (the fourth field): `True` from
+  `_worker_grants` (every worker) and from `_measurement_grants` for
+  every kind but `MEASURE_KIND`; `_heldout_grants` keeps
+  `_measurement_grants(st, tree)`'s `False`.
 - `ISOLATE_ENV = "LEERIE_ISOLATED"`. `_require_heldout_sandbox(run_dir)` sets
   `os.environ[ISOLATE_ENV] = "1"` after its checks pass, so every later
   confined spawn in this process and its children (`worker-guard.py`)
@@ -4414,8 +4452,11 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   report_fd: int | None = None) -> list[str]` — `[sys.executable, "-I",
   "-S", LANDLOCK_SCRIPT]`, then `--sandbox --view <view>`, one `--place
   SRC=REL` per pair and `--report <report> --report-fd <report_fd>` (both
-  or neither) when `sandbox` is given, else `--isolate` when `_isolated()`;
-  then `--rw`/`--ro` from `grants` and `-- cmd`. A `sandbox` with
+  or neither) when `sandbox` is given, else `--isolate` when `_isolated()`
+  — followed, when `grants.egress`, by `--egress
+  <_egress_server().socket_path>` and, while `_STRICT_PROXY` is live,
+  `--forward <its port>=<_egress_server().forward(its port)>`; then
+  `--rw`/`--ro` from `grants` and `-- cmd`. A `sandbox` with
   `_isolated()` False is still emitted: a held-out file never runs outside
   a sandbox, and the shim refuses (126) where it cannot build one.
 - `_run_streaming(cmd, *, grants, sandbox: HeldOutSandbox | None = None,
@@ -4488,8 +4529,22 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   commands. `LEERIE_RUNTIME=fly` adds that Fly runs do not start. A report
   missing a property → `die()` naming each (`_sandbox_probe_failures(got,
   placed_on_disk)`, which also fails a placed file found on disk). The
-  probe directory and the markers are removed either way; on success
-  `os.environ[ISOLATE_ENV] = "1"`. `tests/conftest.py`'s autouse
+  probe directory and the markers are removed either way; then
+  `_require_egress_relay()`; on success `os.environ[ISOLATE_ENV] = "1"`.
+  `_SANDBOX_FIXES` maps `unshare(mount/IPC/net…): EPERM|EINVAL|ENOSPC`,
+  `bring up lo` and `relay listen` to the runtime's network-namespace
+  fix (ahead of the overlay and `EACCES` entries).
+- `_require_egress_relay() -> None` — binds a listener on the
+  orchestrator's `127.0.0.1:0`, then runs `[python, -I, -S,
+  LANDLOCK_SCRIPT, --isolate, --egress, <socket>, --rw, /dev/null, --ro,
+  /, --, python, -I, -S, -c, _EGRESS_RELAY_PROBE, <port>]` (60 s): the
+  probe sends `CONNECT 127.0.0.1:<port>` to `HTTPS_PROXY` and connects to
+  `127.0.0.1:<port>` directly, printing `{"proxy": <status line>,
+  "outer_loopback": <errno name or "reached">}`. `die()`s (naming each
+  failure and `_sandbox_fix(stderr)`) unless the exit is 0, the status
+  line starts `HTTP/1.1 403` and the direct connection is
+  `ECONNREFUSED`. That refusal is pre-marked as logged
+  (`_EgressProxy._refused`). `tests/conftest.py`'s autouse
   `_no_real_heldout_sandbox` stubs it (opt-out
   `@pytest.mark.real_heldout_sandbox`, registered in `pytest.ini`) and
   clears `ISOLATE_ENV` before and after every test.
@@ -4574,15 +4629,67 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
 - `_run_contained(argv, *, grants, sandbox=None, …)` passes `sandbox` to
   `_run_streaming`.
 
+**The egress proxy** (DESIGN §6 *A confined process has its own
+network*):
+
+- `_EgressProxy(directory: Path)` — `socket_path` = `directory /
+  EGRESS_SOCKET_NAME` (`"egress.sock"`); `start()` runs
+  `asyncio.start_unix_server(_handle, path=…, limit=_EGRESS_HEAD_MAX
+  (64 KiB), backlog=256)` on a new event loop in a daemon thread
+  (`leerie-egress`), waiting `_EGRESS_START_TIMEOUT_SEC` (30) for it and
+  raising `OSError` on failure. `_handle` reads the request head
+  (`readuntil(b"\r\n\r\n")`): `CONNECT host:port` (`_egress_target`, an
+  IPv6 literal bracketed) → `_connect`, then `HTTP/1.1 200 Connection
+  Established` and a two-way splice; an absolute `http://` request →
+  `_connect(host, port or 80)`, the request line rewritten to origin form,
+  `Proxy-Connection`, `Proxy-Authorization`, `Connection` and
+  `Keep-Alive` dropped (`_EGRESS_HOP_HEADERS`), `Connection: close`
+  added, then the splice; anything else → 400. `_connect(host, port)` —
+  `loop.getaddrinfo`; each address checked by `_egress_refusal(addr,
+  _own_addresses())` (loopback, link-local, unspecified, multicast — an
+  IPv4-mapped IPv6 address unwrapped — or the container's own); none left
+  → 403 `refused host:port (<why>)`, logged once per destination
+  (`egress: refused …`); else connect (`_EGRESS_CONNECT_TIMEOUT_SEC`, 30)
+  to each allowed address in turn → 502 when none answers. When
+  `_egress_proxy(host)` (DESIGN §13, the container's proxy variables)
+  names an upstream proxy, `_via_upstream` tunnels through it with
+  `CONNECT` (and `Proxy-Authorization: Basic`) — a plain request too,
+  over a `CONNECT` to its port — and a name only that proxy can resolve
+  is allowed. Counters `connections`, `refusals`. No
+  payload is logged. `forward(port) -> str` — a further unix server,
+  `fwd-<port>.sock` in the same directory, piping each connection to the
+  orchestrator's `127.0.0.1:<port>`; made once per port.
+- `_own_addresses() -> set[str]` — the `/32 host LOCAL` entries of
+  `/proc/net/fib_trie` and every address in `/proc/net/if_inet6`.
+- `_egress_server() -> _EgressProxy` — this process's proxy (module
+  `_EGRESS`, under `_EGRESS_LOCK`), started on first use in
+  `_private_tmp(Path(f"egress:{pid}"))` (`/tmp/l/<16 hex>/`, 0700,
+  removed at exit); a forked child starts its own; a start failure
+  `die()`s.
+- What honours the proxy variables in the image (measured 2026-11-01,
+  rootless and rootful): the table below. A tool that does not loses
+  direct egress.
+
+| tool | through the proxy |
+|---|---|
+| `claude -p` (CLI 2.1.311): the API, `WebFetch`, its Bash tool's commands | yes (a haiku worker: 4 turns, `is_error: false`, 15 proxy connections) |
+| `curl`, `git` over https, `pip`, Python's `urllib` | yes |
+| `npm`, `pnpm` (its own self-download and `dlx` included), `yarn`, `corepack` | yes |
+| Node's `fetch` and `https` | yes, with `NODE_USE_ENV_PROXY=1` (without it: `EAI_AGAIN`) |
+| `mise` (`ls-remote`, a tool's download), `uv` through `mise exec` | yes |
+| `git` over ssh, any raw socket or UDP | no: no route, no resolver |
+| `wget`, `cargo`, `go`, `bun`, `deno` | not in leerie's image; unmeasured |
+
 **The per-command database** (`scripts/sandbox-db.sh`): `sandbox-db.sh
 <pkg-dir> <db-name> -- CMD...`, run as the confined command itself (inside
 its isolation or sandbox, under its grant). It refuses (exit 125) a name
 not matching `^leerie_[0-9a-f]{16}_test$`; `initdb -D /tmp/leerie-pg/data
---auth-local=trust -U <user>` from the newest complete
+--auth-local=trust --auth-host=trust -U <user>` from the newest complete
 `/usr/lib/postgresql/<major>/bin` (else `PATH`); `pg_ctl start` with `-c
-listen_addresses='' -c unix_socket_directories=/tmp/leerie-pg -c
-fsync=off`; `createdb`; `DATABASE_URL` = `DIRECT_URL` =
-`postgresql://<user>@localhost/<db-name>?host=/tmp/leerie-pg`;
+listen_addresses=127.0.0.1 -c port=5432 -c
+unix_socket_directories=/tmp/leerie-pg -c fsync=off` (the loopback of the
+command's own network namespace); `createdb`; `DATABASE_URL` =
+`DIRECT_URL` = `postgresql://<user>@127.0.0.1:5432/<db-name>`;
 `<pkg-dir>/node_modules/.bin/prisma db push --accept-data-loss` (in
 `<pkg-dir>`; the push the orchestrator used to make, generate included)
 with `PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION` on that one command;
@@ -4597,8 +4704,8 @@ leerie_<sha256(f"{run_id}:{key}:{tree}")[:16]>_test, "--"]`, `[]` outside
 a Prisma repo whose datasource is PostgreSQL or when the URL is refused
 (logged) — after checking the URL the script will compose
 (`_test_db_url(name)`; `_test_db_url_refusal(url, direct_url)`: postgres
-scheme, host `localhost` with no port and `host=` exactly
-`TEST_DB_SOCKET_DIR = "/tmp/leerie-pg"`, the name rule
+scheme, host and port exactly `TEST_DB_HOST, TEST_DB_PORT = "127.0.0.1",
+5432` and no query, parameters or fragment, the name rule
 (`_TEST_DB_NAME_RE`), DIRECT_URL == DATABASE_URL). Callers put it in front
 of the command instead of entering `_test_db_session`: every held-out run
 (`_run_acceptance_file`, key `<label>:<rel>`), CI parity's checks that

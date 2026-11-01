@@ -6174,12 +6174,16 @@ template kept at finalize.
   source and the sample's prose is in neither `unmet_final` nor the
   re-drive's re-check, the saved probe is outside every implementer grant,
   and the re-drive's re-run of it is placed in a sandbox.
-- `tests/test_heldout_isolation.py` (4 tests, all `real_heldout_sandbox`,
+- `tests/test_heldout_isolation.py` (5 tests, all `real_heldout_sandbox`,
   skipped where the shim has no `isolation_error()` or the host cannot
   build a sandbox): review round 20's H1 (`/dev/shm`, System V) and H2 (the
   AST gate's relay of `/tmp`) and the measured F1 (`COPY … TO PROGRAM`
-  from the command's own database; no TCP listener), each asserted closed;
-  an isolated command has a fixed `/tmp/<name>` of its own.
+  from the command's own database; its one listener `127.0.0.1:5432` in a
+  namespace not the orchestrator's), each asserted closed; an isolated
+  command has a fixed `/tmp/<name>` of its own; and review round 21's M2
+  turned round (tooling that reads host and port from `DATABASE_URL`
+  reaches the database, as `localhost` and as the URL's host, in two
+  concurrent commands on the one port).
 - `tests/test_confined_inputs.py` (4 tests; formerly
   `tests/test_worker_tree_tmp.py`, whose worker-tree cases went with
   `_is_worker_tree`): an input outside the grant stops the run, the AST
@@ -6238,6 +6242,30 @@ template kept at finalize.
   a time (no read-only remount, no private tmpfs, no IPC namespace, no
   seccomp, no overlay): each turned its own tests red. The keyring join is
   not separately observable: seccomp refuses `add_key` first.
+- `tests/test_confined_network.py` (21 test functions, 33 cases; DESIGN
+  §6 *A confined process has its own network; the outside is reached only
+  through leerie's proxy*; review round 21 execution H2 and isolation
+  R6). Anywhere: `_egress_refusal` over
+  loopback, link-local, unspecified, multicast, IPv4-mapped and the
+  container's own addresses; the real `_EgressProxy` on its unix socket
+  refusing `CONNECT` and absolute-`http://` requests to loopback (by IP and
+  by name), tunnelling to an allowed destination, rewriting a plain request
+  to origin form without the hop-by-hop headers, answering 400 to anything
+  else, and `forward` piping to the orchestrator's port; its 0700
+  directory; `_confined_argv` naming the proxy only for an `egress` grant
+  when isolated, and relaying the strict-output proxy's port; which kinds
+  and workers carry `egress`; the shim's `--egress`/`--forward` parsing
+  and `proxy_env`; `_require_egress_relay` naming each failure. In a
+  runtime that can isolate: H2 turned round (a measurement's loopback
+  server, which writes with its grant, unreachable from a worker directly
+  and through the proxy); two concurrent commands binding one fixed port;
+  a command without egress has `lo` only, no proxy variables, no route and
+  no resolver; the relay tunnels, forwards, and ends with the command; the
+  real preflight probe passes and fails closed on a shared network; and
+  R6 turned round (a placement through a linked directory refused, the
+  worker's tree untouched). Live-falsified in the container, one mechanism
+  at a time: no network namespace, the proxy refusing nothing, placement
+  following links before the read-only remount.
 - `tests/test_heldout_sandbox_preflight.py` (10 test functions, 22 cases):
   `_sandbox_fix` on the shim's measured failure lines (and the specific
   `setgroups` rule winning over the generic `EACCES` one), the gate's die
