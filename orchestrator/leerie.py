@@ -22495,7 +22495,7 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
     (`ISOLATE_ENV`)."""
     probe = Path(run_dir) / _SANDBOX_PROBE_DIRNAME
     if probe.exists():
-        shutil.rmtree(probe, ignore_errors=True)
+        _rmtree_owned(probe)
     view = probe / "view"
     view.mkdir(parents=True)
     (view / "tree.txt").write_text("tree\n")
@@ -22536,7 +22536,7 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
             raw = rep.read()
         placed_on_disk = (view / rel).exists()
     except (OSError, subprocess.SubprocessError) as e:
-        shutil.rmtree(probe, ignore_errors=True)
+        _rmtree_owned(probe)
         die(f"preflight could not run the held-out sandbox probe "
             f"({type(e).__name__}: {e}); leerie never runs a held-out file "
             "outside a sandbox (DESIGN §6 *A held-out evaluation runs "
@@ -22547,7 +22547,7 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
                 m.unlink()
             except OSError:
                 pass
-    shutil.rmtree(probe, ignore_errors=True)
+    _rmtree_owned(probe)
     runtime = os.environ.get("LEERIE_RUNTIME", "local")
     fly = (" On Fly the guest kernel must offer this; until it does, Fly "
            "runs do not start." if runtime == "fly" else "")
