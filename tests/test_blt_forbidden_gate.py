@@ -109,6 +109,8 @@ EXEMPT = {
     "_network_reach": "leerie's own probe script under sys.executable",
     "_repo_mentions": "a `git grep` argv",
     "_sleep_then_reexec": "re-execs the orchestrator itself",
+    "_require_heldout_sandbox": "preflight's probe: leerie's own "
+                                "scripts/sandbox_probe.py under the shim",
     "_git_z_output": "git commands with `-z` path output, read as bytes",
     "_ts_script_run": "leerie's own AST scripts (`node` + a scripts/ path), "
                       "confined: the argv its callers build is literal",

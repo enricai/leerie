@@ -483,3 +483,81 @@ runtime_install_linux() {
   fi
   return 0
 }
+
+# --- public: the leerie-container AppArmor profile -----------------------
+#
+# DESIGN §6 *A held-out evaluation runs alone, in a world that dies with it
+# (I3)*, *What the runtime must allow*. Every local container runs under
+# `--security-opt apparmor=leerie-container` where the runtime's kernel runs
+# AppArmor: nerdctl-default plus exactly the mounts the confinement shim
+# makes in its own unprivileged user namespace. Loaded once by root; the file
+# under /etc/apparmor.d/ makes it persist across reboots. On macOS the
+# kernel is Colima's VM, reached through `colima ssh`.
+LEERIE_APPARMOR_PROFILE=leerie-container
+LEERIE_APPARMOR_DEST=/etc/apparmor.d/leerie-container
+
+# Run a command on the kernel the containers run on: the host, or Colima's VM.
+_runtime_on_kernel() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    colima ssh -- "$@"
+  else
+    "$@"
+  fi
+}
+
+# 0 when the containers' kernel runs AppArmor.
+runtime_has_apparmor() {
+  _runtime_on_kernel cat /sys/kernel/security/lsm 2>/dev/null \
+    | tr ',' '\n' | grep -qx apparmor
+}
+
+# 0 when the profile is loaded AND the installed file is this checkout's
+# (a stale one lacks a rule a newer shim needs). The policy directory's
+# `name` files are readable without root; `apparmor/profiles` is not.
+runtime_apparmor_current() {
+  local src="$1"
+  _runtime_on_kernel sh -c \
+    'cat /sys/kernel/security/apparmor/policy/profiles/*/name 2>/dev/null' \
+    | grep -qx "$LEERIE_APPARMOR_PROFILE" || return 1
+  _runtime_on_kernel cat "$LEERIE_APPARMOR_DEST" 2>/dev/null \
+    | cmp -s - "$src"
+}
+
+# The two commands that load it, for a message when we cannot run them.
+runtime_apparmor_hint() {
+  local src="$1"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    printf '    colima ssh -- sudo tee %s < %s > /dev/null\n' \
+      "$LEERIE_APPARMOR_DEST" "$src"
+    printf '    colima ssh -- sudo apparmor_parser -r -W %s\n' \
+      "$LEERIE_APPARMOR_DEST"
+  else
+    printf '    sudo install -m 0644 %s %s\n' "$src" "$LEERIE_APPARMOR_DEST"
+    printf '    sudo apparmor_parser -r -W %s\n' "$LEERIE_APPARMOR_DEST"
+  fi
+}
+
+# Install and load it (may prompt for sudo). Returns 1 with a printed error.
+runtime_install_apparmor() {
+  local src="$1"
+  if [ ! -f "$src" ]; then
+    _runtime_err "the AppArmor profile $src is missing from this install"
+    return 1
+  fi
+  _runtime_log "loading the $LEERIE_APPARMOR_PROFILE AppArmor profile"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    printf '  $ colima ssh -- sudo tee %s < %s\n' "$LEERIE_APPARMOR_DEST" "$src"
+    if [ "$DRY_RUN" = "false" ]; then
+      colima ssh -- sudo tee "$LEERIE_APPARMOR_DEST" < "$src" > /dev/null \
+        || return 1
+    fi
+    _runtime_run colima ssh -- sudo apparmor_parser -r -W \
+      "$LEERIE_APPARMOR_DEST" || return 1
+  else
+    _runtime_run sudo install -m 0644 "$src" "$LEERIE_APPARMOR_DEST" \
+      || return 1
+    _runtime_run sudo apparmor_parser -r -W "$LEERIE_APPARMOR_DEST" \
+      || return 1
+  fi
+  return 0
+}

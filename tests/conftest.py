@@ -581,6 +581,36 @@ def _emulated_heldout_sandbox(request, monkeypatch):
     monkeypatch.setattr(leerie, "_confined_argv", _argv)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_heldout_sandbox(request, monkeypatch):
+    """Keep preflight's `_require_heldout_sandbox` from building a real
+    sandbox. It needs an unprivileged user namespace with mounts, which a
+    developer host and CI restrict (Ubuntu's
+    `kernel.apparmor_restrict_unprivileged_userns`): every test driving real
+    `preflight()` would die there. The stub also leaves `ISOLATE_ENV` unset,
+    so nothing a test spawns is isolated. A test whose subject is the gate
+    opts out with `@pytest.mark.real_heldout_sandbox` (and skips where
+    `isolation_error()` reports the host cannot build one)."""
+    # The real gate sets the variable in `os.environ` itself, which
+    # monkeypatch would not undo: cleared before and after every test.
+    os.environ.pop("LEERIE_ISOLATED", None)
+    if not request.node.get_closest_marker("real_heldout_sandbox"):
+        # Every loaded copy of the orchestrator: the session fixture's, and
+        # one a test imports itself (`import leerie` off sys.path, or its own
+        # spec), so a test driving `preflight()` through any of them is
+        # covered.
+        mods = [request.getfixturevalue("leerie")] + [
+            m for m in list(sys.modules.values())
+            if getattr(m, "__file__", None)
+            and os.path.realpath(m.__file__) == os.path.realpath(LEERIE_PY)]
+        for mod in {id(m): m for m in mods}.values():
+            if hasattr(mod, "_require_heldout_sandbox"):
+                monkeypatch.setattr(mod, "_require_heldout_sandbox",
+                                    lambda run_dir: None)
+    yield
+    os.environ.pop("LEERIE_ISOLATED", None)
+
+
 _WORKER_EXIT_MODULE = None
 
 

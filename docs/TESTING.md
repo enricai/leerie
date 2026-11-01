@@ -3422,7 +3422,7 @@ to appear exactly once and never at the start of a line in any test file.
 Converting N13's five named files fixed those instances but not the rule:
 three more reproductions were found afterwards, two already drifted —
 `tests/test_launcher_state_mount.py` reproduced the `nerdctl run` argv
-missing `--cidfile`, `--cgroupns=host`, `ROOTLESS_SECOPT`, the `LEERIE_*`
+missing `--cidfile`, `--cgroupns=host`, `SECOPT`, the `LEERIE_*`
 auto-forward and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`;
 `tests/test_launcher_runtime_knob.py` omitted `_RUNTIME_EXPLICIT` entirely —
 a flag set at six sites and read by the resume auto-detect (`leerie:4127`,
@@ -6133,6 +6133,49 @@ template kept at finalize.
   gate runs with leerie's temp files in the run directory, an AST script
   without the execution lock stops the run, and every caller holds it (a
   rule over the module).
+- `tests/test_landlock_isolation.py` (17 tests; DESIGN §6 *Every confined
+  process has its own `/tmp`, `/dev/shm` and IPC*, *A held-out evaluation
+  runs alone, in a world that dies with it (I3)*). The shim's `--sandbox`
+  and `--isolate`, run for real; each channel the held-out isolation design
+  measured open is attempted by the evaluated code and checked from the
+  orchestrator's own namespace: `/dev/shm` and `/tmp` files, System V and
+  POSIX IPC, the user and session keyrings, loopback TCP, an abstract
+  socket and the internet, signals to outer processes, `utime`/`chmod`/
+  `setxattr` outside the grants (EROFS), writes in the tree (overlay),
+  leftover and SIGTERM-ignoring processes, a namespace or mount from the
+  evaluated code; placement (overlay only, never over the tree's file),
+  the report through its descriptor, the exit code and signal, a stop
+  signal ending the namespace; `--isolate`'s private `/tmp` per command, a
+  carried grant beneath `/tmp`, read-only metadata, the caller-owned root
+  and IPC namespace; and review round 20's H1 proof turned around. Skipped
+  where `isolation_error()` reports the host cannot build one (a developer
+  host, CI): run in the container under the `leerie-container` profile
+  with `--basetemp` outside `/tmp`. Live-falsified there, one mechanism at
+  a time (no read-only remount, no private tmpfs, no IPC namespace, no
+  seccomp, no overlay): each turned its own tests red. The keyring join is
+  not separately observable: seccomp refuses `add_key` first.
+- `tests/test_heldout_sandbox_preflight.py` (10 test functions, 22 cases):
+  `_sandbox_fix` on the shim's measured failure lines (and the specific
+  `setgroups` rule winning over the generic `EACCES` one), the gate's die
+  messages and its per-property failures with the probe's subprocess
+  faked, isolation switched on only by a passing gate, `_confined_argv`
+  (no `--isolate` before preflight; a held-out run always `--sandbox`),
+  preflight running the gate right after `_require_landlock`, and the real
+  gate where the runtime allows it.
+- `tests/test_seccomp_filter.py` (5 test functions, 6 cases): the x86_64
+  and aarch64 programs executed by a classic-BPF interpreter (every listed
+  call EPERM, `clone3` ENOSYS, `clone` with each `CLONE_NEW*` flag EPERM,
+  every other call below 460 allowed, a foreign architecture killed, x32
+  refused), aarch64's numbers, the real filter on the host, Node's worker
+  threads under it, and no table being a refusal.
+- `tests/test_launcher_secopt.py` (12 tests; replaces
+  `tests/test_rootless_seccomp.py`): the launcher's `SECOPT`/`APPARMOR_OPT`
+  block executed with the runtime stubbed (seccomp unconfined on every
+  runtime; the profile applied when loaded; a missing one stopping the
+  launcher without a terminal or with `--no-runtime-install`), both
+  expanded in the run argv, `scripts/runtime-install.sh`'s AppArmor
+  helpers with the kernel stubbed, and the profile compiled
+  (`apparmor_parser -Q`) with its mount rules.
 - `tests/test_ref_less_clone_git_is_leeries.py` (5 tests, DESIGN §6
   *Leerie's git never takes a tree's repository from the tree*): a ref-less
   clone is located at leerie's git directory (`<run>/clone-gits/<name>`);

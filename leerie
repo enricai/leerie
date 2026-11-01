@@ -8922,16 +8922,44 @@ else
     CGROUP_MOUNT_ARG=(--mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared")
   fi
 
-  # Rootless nerdctl: container-entry.sh uses `unshare --user` to remap
-  # UID 0 to leerie so claude accepts --dangerously-skip-permissions.
-  # The OCI default seccomp profile blocks unshare(CLONE_NEWUSER), so we
-  # lift it for rootless runs. Gate on the same containerd-rootless
-  # sentinel the cgroup probe uses — the file only exists when
-  # containerd-rootless-setuptool.sh was used on Linux; on macOS (Colima)
-  # containerd is rootful inside the VM and no seccomp lift is needed.
-  ROOTLESS_SECOPT=()
-  if [ -f "/run/user/$(id -u)/containerd-rootless/child_pid" ]; then
-    ROOTLESS_SECOPT=(--security-opt seccomp=unconfined)
+  # Every local run, rootless, rootful and Colima: seccomp unconfined. The
+  # rootless entry needs it for its `unshare --user` (container-entry.sh
+  # remaps UID 0 to leerie so claude accepts --dangerously-skip-permissions),
+  # and the confinement shim makes an unprivileged user namespace for every
+  # confined process on every runtime (DESIGN §6 *Every confined process has
+  # its own `/tmp`, `/dev/shm` and IPC*), which the OCI default profile
+  # refuses (`unshare(CLONE_NEWUSER)`: EPERM, measured rootful). The shim's
+  # own per-process filter takes back, tighter, what the profile refused.
+  SECOPT=(--security-opt seccomp=unconfined)
+
+  # Where the containers' kernel runs AppArmor, the container runs under the
+  # leerie-container profile: nerdctl-default plus the shim's mounts, each by
+  # type and target (DESIGN §6 *A held-out evaluation runs alone*, *What the
+  # runtime must allow*). Not `apparmor=unconfined`: that works on Ubuntu only
+  # because runc's own profile then attaches; elsewhere the host's
+  # user-namespace restriction applies and the shim cannot build anything.
+  # Loaded once by root; a missing or stale profile is installed here (with a
+  # terminal) or named with its commands. Preflight still checks the result
+  # (`_require_heldout_sandbox`) and stops the run without it.
+  APPARMOR_OPT=()
+  _aa_src="$LEERIE_REPO/scripts/apparmor/leerie-container"
+  if declare -F runtime_has_apparmor >/dev/null && runtime_has_apparmor; then
+    if ! runtime_apparmor_current "$_aa_src"; then
+      if [ "$NO_RUNTIME_INSTALL" != "true" ] && [ -t 0 ]; then
+        remote_log "loading the leerie-container AppArmor profile (one-time; may prompt for sudo)..."
+        if ! runtime_install_apparmor "$_aa_src"; then
+          remote_log "could not load the leerie-container AppArmor profile; run:"
+          runtime_apparmor_hint "$_aa_src" >&2
+          exit 1
+        fi
+      else
+        remote_log "the leerie-container AppArmor profile is not loaded (or is stale)."
+        echo "  Load it once (as root), then re-run leerie:" >&2
+        runtime_apparmor_hint "$_aa_src" >&2
+        exit 1
+      fi
+    fi
+    APPARMOR_OPT=(--security-opt apparmor=leerie-container)
   fi
 
   _cidfile="$LEERIE_STATE_HOST_DIR/.cidfile-$$"
@@ -9178,7 +9206,8 @@ else
     -e LEERIE_HOST_DIR=/leerie-host
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
     --cgroupns=host
-    ${ROOTLESS_SECOPT[@]+"${ROOTLESS_SECOPT[@]}"}
+    ${SECOPT[@]+"${SECOPT[@]}"}
+    ${APPARMOR_OPT[@]+"${APPARMOR_OPT[@]}"}
     # Read-only: nothing in the container writes the user's checkout; what
     # the run gives it reaches it through the host after the container exits
     # (the bring-back, the captured deps). DESIGN §6 *The explicit channel*.

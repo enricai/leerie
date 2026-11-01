@@ -19,7 +19,7 @@ import subprocess
 # it inlined one of three `CGROUP_MOUNT_ARG` branches as a literal and was
 # missing `--cidfile` and its bind, `--label`, `-e USER_REPO=`,
 # `-e LEERIE_COMMIT=`, the `LEERIE_*` auto-forward, `--cgroupns=host`,
-# `ROOTLESS_SECOPT`, `REWRITTEN_ARGS`, and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`.
+# `SECOPT`, `APPARMOR_OPT`, `REWRITTEN_ARGS`, and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`.
 # None of that flipped an assertion, which is the point: the tests were
 # blind, not wrong. They would pass identically if the launcher dropped the
 # state mount tomorrow — the exact regression this file exists to catch.
@@ -50,7 +50,8 @@ AUTH_MOUNTS=()
 CACHE_MOUNTS=()
 INSPECT_MOUNTS=()
 CGROUP_MOUNT_ARG=()
-ROOTLESS_SECOPT=()
+SECOPT=(--security-opt seccomp=unconfined)
+APPARMOR_OPT=(--security-opt apparmor=leerie-container)
 REWRITTEN_ARGS=()
 _leerie_env_args=()
 _leerie_host_dir="$HOME/.leerie/.host"

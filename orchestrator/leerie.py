@@ -12168,6 +12168,11 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     # before any is spawned — every runtime, Fly and EC2 included.
     _require_landlock()
 
+    # 0.35. every held-out run is sandboxed and every confined process
+    # isolated (DESIGN §6 *A held-out evaluation runs alone, in a world that
+    # dies with it (I3)*): a runtime that cannot build one stops here.
+    _require_heldout_sandbox(leerie_dir)
+
     # 0.4. reap idle runs' worktrees (DESIGN §6 *Idle runs' worktrees are
     # reaped at preflight*), before the headroom check reads free space.
     # Nothing else reaps them: a paused or died run keeps a full checkout
@@ -22435,10 +22440,164 @@ def _require_landlock() -> None:
 # process has its own `/tmp`, `/dev/shm` and IPC*). Unset where preflight did
 # not run (a test, a host harness): nothing is isolated there.
 ISOLATE_ENV = "LEERIE_ISOLATED"
+SANDBOX_PROBE_SCRIPT = ROOT / "scripts" / "sandbox_probe.py"
+_SANDBOX_PROBE_DIRNAME = "sandbox-probe"
 
 
 def _isolated() -> bool:
     return os.environ.get(ISOLATE_ENV) == "1"
+
+
+# The shim's failure lines (mechanical: its own `IsolationError` steps and
+# errno names), each mapped to the runtime fix that removes it.
+_SANDBOX_FIXES: tuple[tuple[str, str], ...] = (
+    (r"no seccomp table|no pivot_root number",
+     "this machine's architecture has no seccomp table in "
+     "scripts/landlock_exec.py (x86_64 and aarch64 have one)"),
+    (r"unshare\(CLONE_NEWUSER\): EPERM",
+     "the container's seccomp profile refuses a user namespace: run it with "
+     "`--security-opt seccomp=unconfined` (the launcher passes it on every "
+     "local run; the shim's own filter takes back what the profile refused)"),
+    (r"unshare\(CLONE_NEWUSER\): (EINVAL|ENOSPC|EUSERS|ENOSYS)",
+     "the kernel offers no unprivileged user namespaces "
+     "(CONFIG_USER_NS, user.max_user_namespaces)"),
+    (r"write setgroups: EACCES|write [ug]id_map: EPERM",
+     "the host restricts unprivileged user namespaces "
+     "(kernel.apparmor_restrict_unprivileged_userns) and this process is "
+     "not under the `leerie-container` AppArmor profile, which allows them"),
+    (r"overlay .*: EINVAL",
+     "the state root's filesystem cannot be an overlay's lower layer in a "
+     "user namespace"),
+    (r": EACCES",
+     "AppArmor refuses the sandbox's mounts: the container must run under "
+     "the `leerie-container` profile — load it once (`sudo install -m 0644 "
+     "scripts/apparmor/leerie-container /etc/apparmor.d/leerie-container && "
+     "sudo apparmor_parser -r -W /etc/apparmor.d/leerie-container`; on "
+     "Colima through `colima ssh`), and the launcher passes "
+     "`--security-opt apparmor=leerie-container`"),
+)
+
+
+def _sandbox_fix(stderr: str) -> str:
+    """The runtime fix for the shim's isolation failure in `stderr`."""
+    for pattern, fix in _SANDBOX_FIXES:
+        if re.search(pattern, stderr):
+            return fix
+    return ("see the shim's message above; DESIGN §6 *A held-out evaluation "
+            "runs alone* lists what the runtime must allow")
+
+
+def _require_heldout_sandbox(run_dir: Path) -> None:
+    """Fail closed (DESIGN §6 *A held-out evaluation runs alone, in a world
+    that dies with it (I3)*): build a held-out sandbox over a probe beneath
+    the run directory and check each property; stop the run naming the fix
+    when one fails. On success every later confined spawn is isolated
+    (`ISOLATE_ENV`)."""
+    probe = Path(run_dir) / _SANDBOX_PROBE_DIRNAME
+    if probe.exists():
+        shutil.rmtree(probe, ignore_errors=True)
+    view = probe / "view"
+    view.mkdir(parents=True)
+    (view / "tree.txt").write_text("tree\n")
+    held = probe / "set.txt"
+    held.write_text("held-out\n")
+    ro_file = probe / "ro.txt"
+    ro_file.write_text("ro\n")
+    nonce = uuid.uuid4().hex[:12]
+    marks = [Path("/tmp") / f".leerie-probe-{nonce}",
+             Path("/dev/shm") / f".leerie-probe-{nonce}"]
+    for m in marks:
+        try:
+            m.write_text("outside\n")
+        except OSError:
+            pass
+    rel = "probe/placed.txt"
+    # The probe reads what any program needs (its interpreter, leerie's
+    # script) and writes only its view; nothing in the run directory but the
+    # probe's own directory is named.
+    grants = WorkerGrants(rw=("/dev/null", str(view)), ro=("/",))
+    r: subprocess.CompletedProcess | None = None
+    raw = b""
+    placed_on_disk = False
+    try:
+        with tempfile.TemporaryFile(dir=str(probe)) as rep:
+            argv = _confined_argv(
+                grants,
+                [sys.executable, "-I", "-S", str(SANDBOX_PROBE_SCRIPT),
+                 str(ro_file), rel, *[str(m) for m in marks]],
+                sandbox=HeldOutSandbox(view=str(view),
+                                       place=((str(held), rel),),
+                                       report=str(view / "report.json")),
+                report_fd=rep.fileno())
+            r = subprocess.run(argv, cwd=str(view), capture_output=True,
+                               text=True, timeout=60,
+                               pass_fds=(rep.fileno(),))
+            rep.seek(0)
+            raw = rep.read()
+        placed_on_disk = (view / rel).exists()
+    except (OSError, subprocess.SubprocessError) as e:
+        shutil.rmtree(probe, ignore_errors=True)
+        die(f"preflight could not run the held-out sandbox probe "
+            f"({type(e).__name__}: {e}); leerie never runs a held-out file "
+            "outside a sandbox (DESIGN §6 *A held-out evaluation runs "
+            "alone*).")
+    finally:
+        for m in marks:
+            try:
+                m.unlink()
+            except OSError:
+                pass
+    shutil.rmtree(probe, ignore_errors=True)
+    runtime = os.environ.get("LEERIE_RUNTIME", "local")
+    fly = (" On Fly the guest kernel must offer this; until it does, Fly "
+           "runs do not start." if runtime == "fly" else "")
+    if r.returncode != 0 or not raw:
+        err = (r.stderr or "").strip()[-600:]
+        die(f"this runtime cannot build the held-out sandbox (exit "
+            f"{r.returncode}): {err or 'no report'}. Fix: "
+            f"{_sandbox_fix(err)}.{fly} Leerie never runs a held-out file "
+            "outside a sandbox, nor a confined process outside its "
+            "isolation (DESIGN §6 *A held-out evaluation runs alone, in a "
+            "world that dies with it (I3)*; docs/INSTALL.md).")
+    try:
+        got = json.loads(raw)
+    except ValueError:
+        got = {}
+    failed = _sandbox_probe_failures(got, placed_on_disk)
+    if failed:
+        die("the held-out sandbox this runtime built is not isolated: "
+            + "; ".join(failed) + f".{fly} Leerie never runs a held-out "
+            "file outside a sandbox (DESIGN §6 *A held-out evaluation runs "
+            "alone*).")
+    os.environ[ISOLATE_ENV] = "1"
+
+
+def _sandbox_probe_failures(got: dict, placed_on_disk: bool) -> list[str]:
+    """The properties `scripts/sandbox_probe.py` reported that a sandbox
+    must have and did not, each named."""
+    out = []
+    try:
+        own_ipc = os.readlink("/proc/self/ns/ipc")
+    except OSError:
+        own_ipc = None
+    if not got.get("ipc_ns") or got.get("ipc_ns") == own_ipc:
+        out.append("its IPC namespace is the orchestrator's")
+    if got.get("interfaces") != ["lo"]:
+        out.append(f"its interfaces are {got.get('interfaces')!r}, not only lo")
+    if got.get("tmp_private") is not True:
+        out.append("its /tmp is not its own")
+    if got.get("shm_private") is not True:
+        out.append("its /dev/shm is not its own")
+    if got.get("erofs") is not True:
+        out.append("a file in an inherited mount is writable "
+                   f"({got.get('erofs')!r}, not EROFS)")
+    if got.get("add_key") is not True:
+        out.append(f"add_key is allowed ({got.get('add_key')!r}, not EPERM)")
+    if got.get("placed") is not True:
+        out.append("the placed file is not in the view")
+    if placed_on_disk:
+        out.append("the placed file reached the tree on disk")
+    return out
 
 
 class HeldOutSandbox(NamedTuple):

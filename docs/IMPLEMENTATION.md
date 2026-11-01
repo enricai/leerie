@@ -4209,17 +4209,19 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `/proc/self/setgroups` ← `deny`; `uid_map` and `gid_map` ← `"<id> <id>
   1"` (the caller's own ids); then `unshare(CLONE_NEWNS | CLONE_NEWIPC)`,
   plus `CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWPID` with `sandbox`.
-- `pivot_to_owned_root(carry: list[str]) -> None` — `/` made `rprivate`;
-  a tmpfs (mode 0755, `nosuid,nodev`) mounted on `STAGE = "/tmp"` as the
-  new root, holding, for each entry of the old root, a directory with the
-  entry `rbind`-mounted (a directory), an empty file with it bound (a
-  file), the same symlink (a symlink), or an empty directory (`tmp`);
-  `pivot_root(".", ".oldroot")` style into it (`pivot_root(new,
-  new/.oldroot)`, the old root at `/.oldroot`); then `private_mounts()`;
-  then each `carry` path (a grant beneath `/tmp`) bound from
-  `/.oldroot<path>` onto the same path in the new `/tmp` (directories
-  made); then `/.oldroot` detached (`umount2(MNT_DETACH)`) and removed;
-  then `chdir` back to the caller's cwd.
+- `pivot_to_owned_root(carry_ro, carry_rw, *, sandbox) -> list[str]` —
+  `/` made `rprivate`; a tmpfs (mode 0755, `nosuid,nodev`) mounted on
+  `/tmp` as the new root, holding, for each entry of the old root, a
+  directory with the entry `rbind`-mounted (a directory), an empty file
+  with it bound (a file), the same symlink (a symlink), or an empty
+  directory (`tmp`); `pivot_root(new, new/.oldroot)`; then
+  `private_mounts()`; then each grant beneath `/tmp` (not `/tmp` itself)
+  bound from `/.oldroot<path>` onto the same path in the new `/tmp` —
+  except, in a sandbox, a write grant, which becomes an empty copy of its
+  subdirectories (`_skeleton`: a held-out run gets a fresh private temp
+  directory, `run/` included); then `/.oldroot` detached
+  (`umount2(MNT_DETACH)`) and removed, and `chdir` back. Returns the
+  carried write grants' mount points.
 - `private_mounts() -> None` — tmpfs on `/tmp` and on `/dev/shm`
   (`mode=1777`, `nosuid,nodev`); `devpts` on `/dev/pts`
   (`newinstance,ptmxmode=0666,mode=620`, `nosuid,noexec`), and
@@ -4234,8 +4236,6 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   it, `lowerdir=<it>,upperdir=/tmp/.leerie-overlay/<n>/u,
   workdir=/tmp/.leerie-overlay/<n>/w,userxattr` (made 0700); a failed
   overlay is a failed step (exit 126, naming the path), never a fallback.
-  A `rw` directory beneath `/tmp` is not carried: an empty copy of its
-  subdirectories is made at its path in the new `/tmp`.
 - `readonly_mounts(keep: list[str]) -> int` — every `/proc/self/mountinfo`
   entry not already `ro`, not in `keep` or beneath one, and not `/tmp`,
   `/dev/shm` or `/dev/pts`, remounted `MS_REMOUNT | MS_BIND | MS_RDONLY`
@@ -4291,14 +4291,24 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `report_fd` is a regular file leerie opened, never a pipe: a runner
   report can exceed a pipe's buffer, and nothing reads it until the
   command exits.
-- `isolation_error() -> str | None` — forks a child that runs
-  `enter_namespaces(sandbox=True)` and mounts a tmpfs on `/tmp`; None when
-  it succeeds, else the step and errno. Tests use it to skip on a host
+- `isolation_error() -> str | None` — runs the shim itself, `--isolate
+  --ro / -- true`, in a child process; None when it exits 0, else the last
+  line of its stderr (the step and errno). Tests use it to skip on a host
   that cannot build one (the host's user-namespace restriction).
+- `isolate(rw, ro, *, sandbox=False, view=None, place_pairs=())` — the
+  steps above in order, then `chdir` to the caller's cwd again (it was
+  resolved before the binds and overlays, so it named the directory
+  beneath them); `run_sandbox(cmd, rw, ro, view, place_pairs, report,
+  report_fd)` — `isolate`, the status pipe, the fork of PID 1 with the
+  watched signals still blocked (a stop forwarded before PID 1 has its
+  handlers waits, pending), and the outer wait. `_parse(argv)` — the
+  options, or a usage error (exit 2): `--isolate` and `--sandbox`
+  exclusive, `--sandbox` needs `--view`, `--view`/`--place`/`--report`
+  need `--sandbox`, `--report` and `--report-fd` together.
 
 **The orchestrator side.**
 
-- `ISOLATE_ENV = "LEERIE_ISOLATED"`. `_require_heldout_sandbox()` sets
+- `ISOLATE_ENV = "LEERIE_ISOLATED"`. `_require_heldout_sandbox(run_dir)` sets
   `os.environ[ISOLATE_ENV] = "1"` after its checks pass, so every later
   confined spawn in this process and its children (`worker-guard.py`)
   isolates; `_isolated() -> bool` reads it.
@@ -4312,8 +4322,7 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   or neither) when `sandbox` is given, else `--isolate` when `_isolated()`;
   then `--rw`/`--ro` from `grants` and `-- cmd`. A `sandbox` with
   `_isolated()` False is still emitted: a held-out file never runs outside
-  a sandbox, and the shim refuses (126) where it cannot build one. (The
-  `shared_tmp` keyword is gone.)
+  a sandbox, and the shim refuses (126) where it cannot build one.
 - `_run_streaming(cmd, *, grants, sandbox: HeldOutSandbox | None = None,
   …)` — with `sandbox`, opens an unlinked report file in `<run>/tmp/`
   (`tempfile.TemporaryFile`), passes it in `pass_fds`, spawns
@@ -4356,32 +4365,37 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
     `_vitest_exact_selection(cmd, files, tree, extra=())` /
     `_vitest_filter_colliders(tree, files, extra=())` count the placed
     paths as the tree's files.
-- `_require_heldout_sandbox(st_root: Path) -> None` — `preflight` step
-  0.35, after `_require_landlock`, on every runtime: makes a probe
-  directory beneath the state root (a view with one file, a set file
-  outside it) and runs the shim with `--sandbox --view <probe>/view
-  --place <probe>/set.txt=placed.txt --report /tmp/r.json --report-fd N`
-  over `python3 -I -S <ROOT>/scripts/sandbox_probe.py` (stdlib), which
-  writes a JSON report of: `ipc_ns` (its `/proc/self/ns/ipc` link),
-  `interfaces` (`socket.if_nameindex()`), `tmp_private` (a marker the
-  orchestrator made in `/tmp` absent), `shm_private` (the same for
-  `/dev/shm`), `erofs` (`os.utime` on `<probe>/ro.txt`, granted read-only,
-  raises `EROFS`), `add_key` (`EPERM`), `placed` (the placed file readable
-  in the view). After it: the placed file absent from `<probe>/view` on
-  disk. `die()` on the first failed property, or on exit 126, with
-  `_sandbox_fix(stderr) -> str` naming the fix: EPERM at
-  `unshare(NEWUSER)` → `--security-opt seccomp=unconfined` (the launcher
-  passes it on every local run); EACCES at a mount → the
-  `leerie-container` AppArmor profile is not applied (the two commands of
-  `runtime_install_apparmor`, after which the launcher passes
-  `--security-opt apparmor=leerie-container`); EACCES at `setgroups` → the host's
-  user-namespace restriction (the process is not under that profile); no
-  seccomp table → the architecture; on Fly (`LEERIE_RUNTIME=fly`) the
-  message says the guest kernel cannot build it and the run does not
-  start. The probe directory is removed. `tests/conftest.py` stubs it
-  autouse (`_no_real_heldout_sandbox`, opt-out
-  `@pytest.mark.real_heldout_sandbox`): hosts and CI restrict user
-  namespaces, and a stub leaves `ISOLATE_ENV` unset.
+- `_require_heldout_sandbox(run_dir: Path) -> None` — `preflight` step
+  0.35, right after `_require_landlock`, on every runtime: makes
+  `<run-dir>/sandbox-probe/` (`_SANDBOX_PROBE_DIRNAME`) with `view/`, a set
+  file outside it and `ro.txt`, and a marker file in the container's
+  `/tmp` and `/dev/shm`; runs `_confined_argv(WorkerGrants(rw=("/dev/null",
+  view), ro=("/",)), [python, -I, -S, SANDBOX_PROBE_SCRIPT, ro.txt,
+  probe/placed.txt, <markers>], sandbox=HeldOutSandbox(view, place=((set,
+  "probe/placed.txt"),), report=<view>/report.json), report_fd=<an unlinked
+  temp file in the probe directory>)` (`subprocess.run`, `pass_fds`, 60 s).
+  `scripts/sandbox_probe.py` (stdlib) writes `report.json` in its cwd:
+  `ipc_ns` (`/proc/self/ns/ipc`), `interfaces` (`socket.if_nameindex()`),
+  `tmp_private` and `shm_private` (the markers absent), `erofs`
+  (`os.utime(ro.txt)` → True on EROFS, else the errno name), `add_key`
+  (True on EPERM), `placed` (the placed file read in the view). A non-zero
+  exit or no report → `die()` with the shim's stderr and
+  `_sandbox_fix(stderr) -> str`, the first of `_SANDBOX_FIXES` (regexes
+  over the shim's own step and errno names, most specific first) that
+  matches: no seccomp table → the architecture; `unshare(CLONE_NEWUSER):
+  EPERM` → `--security-opt seccomp=unconfined`; `unshare(CLONE_NEWUSER):
+  EINVAL|ENOSPC|EUSERS|ENOSYS` → no unprivileged user namespaces; `write
+  setgroups: EACCES` → the host's restriction, the process not under the
+  profile; `overlay …: EINVAL` → the state root's filesystem; any other
+  `: EACCES` → the `leerie-container` profile, with its two load
+  commands. `LEERIE_RUNTIME=fly` adds that Fly runs do not start. A report
+  missing a property → `die()` naming each (`_sandbox_probe_failures(got,
+  placed_on_disk)`, which also fails a placed file found on disk). The
+  probe directory and the markers are removed either way; on success
+  `os.environ[ISOLATE_ENV] = "1"`. `tests/conftest.py`'s autouse
+  `_no_real_heldout_sandbox` stubs it (opt-out
+  `@pytest.mark.real_heldout_sandbox`, registered in `pytest.ini`) and
+  clears `ISOLATE_ENV` before and after every test.
 - **The execution lock** (replaces the run's `/tmp` lock): `_TmpLock` →
   `_ExecLock`, `_tmp_lock()` → `_exec_lock()`, `_TMP_LOCKS` →
   `_EXEC_LOCKS`, `_TMP_EXCLUSIVE` → `_EXEC_EXCLUSIVE`; the same semantics
@@ -4488,21 +4502,26 @@ shown, label)`, `db_url` gone, `config.json`'s `env` empty).
   run` (rootless, rootful, Colima), replacing `ROOTLESS_SECOPT`.
 - `APPARMOR_OPT=(--security-opt apparmor=leerie-container)` when the
   runtime's kernel lists `apparmor` in `/sys/kernel/security/lsm` (on
-  macOS, read through `colima ssh`); the profile must then be loaded —
-  `_leerie_apparmor_loaded` reads the names under
+  macOS, read through `colima ssh`; `runtime_has_apparmor`); the profile
+  must then be loaded — `runtime_apparmor_current` reads the names under
   `/sys/kernel/security/apparmor/policy/profiles/*/name` (readable without
   root; `…/apparmor/profiles` is not) and compares the installed file
   `/etc/apparmor.d/leerie-container` with the repo's (`cmp`). Missing or
   stale: with a terminal and without `--no-runtime-install`, run
-  `runtime_install_apparmor`; else exit 1 printing its commands.
+  `runtime_install_apparmor`; else exit 1 printing
+  `runtime_apparmor_hint`'s two commands. The block is guarded by
+  `declare -F runtime_has_apparmor` (an install without
+  `scripts/runtime-install.sh` passes no profile and fails at preflight).
 - `runtime_install_apparmor` (`scripts/runtime-install.sh`) — Linux: `sudo
   install -m 0644 "$LEERIE_REPO/scripts/apparmor/leerie-container"
   /etc/apparmor.d/leerie-container && sudo apparmor_parser -r -W
   /etc/apparmor.d/leerie-container`; Colima: the same through `colima ssh
   -- sudo tee /etc/apparmor.d/leerie-container` (the file on stdin) and
-  `colima ssh -- sudo apparmor_parser -r -W …`. Also run by
-  `runtime_install_linux` and `runtime_install_macos` after their
-  installs.
+  `colima ssh -- sudo apparmor_parser -r -W …`; run by the launcher
+  whenever the profile is missing or stale (scripts/runtime-install.sh:
+  `runtime_has_apparmor`,
+  `runtime_apparmor_current <src>`, `runtime_apparmor_hint <src>`,
+  `runtime_install_apparmor <src>`, all through `_runtime_on_kernel`).
 - `scripts/apparmor/leerie-container` — `abi <abi/4.0>`, profile
   `leerie-container flags=(attach_disconnected,mediate_deleted)`:
   `nerdctl-default`'s rules (network, capability, file, umount, the signal
@@ -4519,10 +4538,14 @@ shown, label)`, `db_url` gone, `config.json`'s `env` empty).
 - Tests: `tests/test_landlock_isolation.py` (every channel of the
   measured design's §1.2 closed, in a real sandbox; skipped where
   `isolation_error()` is not None), `tests/test_heldout_sandbox_preflight.py`
-  (the die messages, `_sandbox_fix`), `tests/test_seccomp_filter.py` (the
-  tables, the program, a real filter on the host), `tests/test_apparmor_profile.py`
-  and `tests/test_launcher_secopt.py` (the launcher's flags and install
-  step); `tests/test_exec_lock.py` (the execution lock: evaluations,
+  (the die messages from the shim's measured failure lines, `_sandbox_fix`,
+  the argv, preflight's order, and the real gate where it can run),
+  `tests/test_seccomp_filter.py` (both tables executed by a BPF
+  interpreter, the real filter on the host, Node's worker threads under
+  it), and `tests/test_launcher_secopt.py` (replacing
+  `tests/test_rootless_seccomp.py`: the launcher's block executed with the
+  runtime stubbed, the runtime-install helpers, the profile compiled with
+  `apparmor_parser -Q` and its rules); `tests/test_exec_lock.py` (the execution lock: evaluations,
   measurements and real `_invoke` workers ordered, the worker guard, the
   host level across processes, and deadlock-freedom by rule over the
   module), `tests/test_heldout_sandbox_callers.py` (every held-out runner
