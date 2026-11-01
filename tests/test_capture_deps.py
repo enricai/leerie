@@ -17,6 +17,16 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tests.conftest import register_worker_transcript
+
+
+def _registered(log_dir: Path) -> Path:
+    """Register every fixture log in `log_dir` as a worker transcript —
+    `_extract_depcap_commands` reads registered transcripts only."""
+    for p in sorted(log_dir.glob("*.log")):
+        register_worker_transcript(p)
+    return log_dir
+
 
 # ---------------------------------------------------------------------------
 # Absence pins — regex path must not exist
@@ -147,6 +157,7 @@ def _make_jsonl_log(tmp_path: Path, commands: list[str], fname: str = "worker-00
         }
         lines.append(json.dumps(event))
     log_path.write_text("\n".join(lines) + "\n")
+    register_worker_transcript(log_path)
     return log_dir
 
 
@@ -158,7 +169,7 @@ class TestExtractDepcapCommands:
             "sudo -n apt-get install -y postgresql libpq-dev",
             "pip install -r requirements.txt",
         ])
-        text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+        text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
         assert "apt-get install" in text
         assert "pip install" in text
         assert not hit_ceiling
@@ -166,7 +177,7 @@ class TestExtractDepcapCommands:
     def test_empty_log_dir(self, leerie, tmp_path):
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
-        text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+        text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
         assert text == ""
         assert not hit_ceiling
 
@@ -187,7 +198,7 @@ class TestExtractDepcapCommands:
                 }
             }
             log_path.write_text(json.dumps(event) + "\n")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         # Command should appear only once (deduped).
         assert text.count("apt-get install -y postgresql") == 1
 
@@ -209,12 +220,12 @@ class TestExtractDepcapCommands:
             }
         }
         log_path.write_text(json.dumps(event) + "\n")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "should-not-appear" not in text
 
     def test_returns_tuple_str_bool(self, leerie, tmp_path):
         log_dir = _make_jsonl_log(tmp_path, ["apt-get install -y curl"])
-        result = leerie._extract_depcap_commands(log_dir)
+        result = leerie._extract_depcap_commands(_registered(log_dir))
         assert isinstance(result, tuple)
         assert len(result) == 2
         text, hit_ceiling = result
@@ -231,7 +242,7 @@ class TestExtractDepcapCommands:
         orig_budget = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = 2000
-            text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+            text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
             assert hit_ceiling
         finally:
             leerie._DEPCAP_TOTAL_BUDGET = orig_budget
@@ -246,7 +257,7 @@ class TestExtractDepcapCommands:
             "ls /work/subtasks",                 # dropped
             "python3 -m pytest tests/ -x",       # dropped
         ])
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "pip install -r requirements.txt" in text
         assert "apt-get install -y libvips-dev" in text
         assert "pnpm add sharp" in text
@@ -264,7 +275,7 @@ class TestExtractDepcapCommands:
             "git commit -m 'wire pip install seam'",
             'echo "run pnpm install to build"',
         ])
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert text == ""
 
 
@@ -412,6 +423,7 @@ def _make_jsonl_log_in(log_dir: Path, commands: list[str]) -> None:
         }
         lines.append(json.dumps(event))
     log_path.write_text("\n".join(lines) + "\n")
+    register_worker_transcript(log_path)
 
 
 def _git_init(repo: Path) -> None:

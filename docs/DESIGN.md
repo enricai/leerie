@@ -7629,10 +7629,11 @@ the repo genuinely needs across all languages and frameworks:
   in total). These are the unambiguous ground truth for a repo's language
   dependencies.
 - **Secondary — install-filtered commands.** A hint list of package-manager
-  *install* commands observed during the run (extracted from `logs/*.log` via
-  `_iter_log_tool_use`, then narrowed by `_extract_depcap_commands` to commands
-  that invoke an install verb at a command boundary, excluding text-scanning
-  tools; deduped, newest-first, byte-bounded). Purpose: surface **system/native**
+  *install* commands observed during the run (extracted from the run's
+  registered worker transcripts — never a command's output, §8 *What a
+  worker ran is read from its own transcript* — via `_iter_log_tool_use`,
+  then narrowed by `_extract_depcap_commands` to commands that invoke an
+  install verb at a command boundary, excluding text-scanning tools; deduped, newest-first, byte-bounded). Purpose: surface **system/native**
   (apt) deps a worker had to install that no language manifest records (e.g.
   `libvips-dev`, `pkg-config`).
 
@@ -8940,6 +8941,29 @@ implementer's in staging, beside files that may not ship — so a cite of
 one is shown to the judge and kept as a falsifier lead, but verifies
 nothing on its own (§8 *Every post-execution verdict is of the committed
 tree*).
+
+**What a worker ran is read from its own transcript, never from a
+command's output.** Leerie's record of what a worker executed — the
+worker half of this record, the dependency capture's install-command
+hint (§6½), the settle-time declared-command check (§9), the conformer's
+axis-run warnings, the falsifier's probe activity — is the structured
+`tool_use` events of that worker's own `claude -p` session, keyed by the
+worker it was spawned as. A build, a test run, CI parity or any other
+measurement prints whatever the code under measurement prints, and a line
+it prints in the shape of a tool call is not one. Measured: the record
+took every `logs/*.log`, which also holds leerie's runs of the
+repository's commands (the base baseline, CI parity, coverage, the
+settle-time execution check), and the per-subtask and final conformers'
+axes were measured into the conformer's own transcript file — so a test
+printing a `tool_use` line for `pnpm test` and a `tool_result` line
+saying it passed entered the record as a passing run, in the conformer's
+name. So: leerie registers each transcript as it spawns the worker
+(`transcripts.ndjson` beside it), and a reader that enumerates
+transcripts takes only registered ones; no command's output is written
+to a transcript (a measurement refuses a registered transcript's path);
+and within a transcript only the stream's own events count — a line of
+the CLI's stderr, which leerie writes into the same file under its own
+header, is never parsed as an event.
 
 That rule leaves an item whose only evidence is a command the
 orchestrator never runs itself — the audit's repro, `npm run e2e`,

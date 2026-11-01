@@ -13,9 +13,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import register_worker_transcript
+
+
+def _registered(log_dir: Path) -> Path:
+    """Register every fixture log in `log_dir` as a worker transcript —
+    `_extract_depcap_commands` reads registered transcripts only."""
+    for p in sorted(log_dir.glob("*.log")):
+        register_worker_transcript(p)
+    return log_dir
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +52,7 @@ def _write_log(log_dir: Path, commands: list[str], fname: str) -> None:
         }
         lines.append(json.dumps(event))
     (log_dir / fname).write_text("\n".join(lines) + "\n")
+    register_worker_transcript(log_dir / fname)
 
 
 def _write_non_bash_log(log_dir: Path, fname: str) -> None:
@@ -59,6 +71,7 @@ def _write_non_bash_log(log_dir: Path, fname: str) -> None:
         }
     }
     (log_dir / fname).write_text(json.dumps(event) + "\n")
+    register_worker_transcript(log_dir / fname)
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +84,7 @@ class TestExtractDepcapCommandsBasic:
     def test_single_command_extracted(self, leerie, tmp_path):
         log_dir = tmp_path / "logs"
         _write_log(log_dir, ["pip install -r requirements.txt"], "w-001.log")
-        text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+        text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
         assert "pip install -r requirements.txt" in text
         assert not hit_ceiling
 
@@ -83,7 +96,7 @@ class TestExtractDepcapCommandsBasic:
             "npm install",
         ]
         _write_log(log_dir, cmds, "w-001.log")
-        text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+        text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
         for cmd in cmds:
             assert cmd in text
         assert not hit_ceiling
@@ -91,7 +104,7 @@ class TestExtractDepcapCommandsBasic:
     def test_return_type_is_tuple_str_bool(self, leerie, tmp_path):
         log_dir = tmp_path / "logs"
         _write_log(log_dir, ["echo hello"], "w-001.log")
-        result = leerie._extract_depcap_commands(log_dir)
+        result = leerie._extract_depcap_commands(_registered(log_dir))
         assert isinstance(result, tuple) and len(result) == 2
         text, hit_ceiling = result
         assert isinstance(text, str)
@@ -100,13 +113,13 @@ class TestExtractDepcapCommandsBasic:
     def test_empty_log_dir_returns_empty_string(self, leerie, tmp_path):
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
-        text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+        text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
         assert text == ""
         assert not hit_ceiling
 
     def test_missing_log_dir_returns_empty_string(self, leerie, tmp_path):
         log_dir = tmp_path / "nonexistent-logs"
-        text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+        text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
         assert text == ""
         assert not hit_ceiling
 
@@ -122,7 +135,7 @@ class TestExtractDepcapCommandsDedup:
         log_dir = tmp_path / "logs"
         cmd = "apt-get install -y curl"
         _write_log(log_dir, [cmd, cmd], "w-001.log")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert text.count(cmd) == 1
 
     def test_duplicate_commands_across_multiple_files(self, leerie, tmp_path):
@@ -131,7 +144,7 @@ class TestExtractDepcapCommandsDedup:
         cmd = "pip install -r requirements.txt"
         for i in range(3):
             _write_log(log_dir, [cmd], f"worker-00{i}.log")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert text.count(cmd) == 1
 
     def test_distinct_commands_both_appear(self, leerie, tmp_path):
@@ -139,7 +152,7 @@ class TestExtractDepcapCommandsDedup:
         log_dir.mkdir()
         _write_log(log_dir, ["apt-get install -y git"], "w-001.log")
         _write_log(log_dir, ["pip install -r requirements.txt"], "w-002.log")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "apt-get install -y git" in text
         assert "pip install -r requirements.txt" in text
 
@@ -154,7 +167,7 @@ class TestExtractDepcapCommandsFiltering:
     def test_read_tool_use_ignored(self, leerie, tmp_path):
         log_dir = tmp_path / "logs"
         _write_non_bash_log(log_dir, "w-001.log")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "/should/not/appear" not in text
         assert text == ""
 
@@ -185,7 +198,7 @@ class TestExtractDepcapCommandsFiltering:
             }
         }))
         (log_dir / "w-001.log").write_text("\n".join(lines) + "\n")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "pip install flask" in text
         assert "/some/file" not in text
 
@@ -203,7 +216,7 @@ class TestExtractDepcapCommandsFiltering:
             }
         })
         (log_dir / "w-001.log").write_text("THIS IS NOT JSON\n" + valid + "\n")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "pip install valid-pkg" in text
 
     def test_empty_command_string_excluded(self, leerie, tmp_path):
@@ -221,7 +234,7 @@ class TestExtractDepcapCommandsFiltering:
             }
         })
         (log_dir / "w-001.log").write_text(event + "\n")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert text == ""
 
     def test_non_dict_message_skipped(self, leerie, tmp_path):
@@ -231,7 +244,7 @@ class TestExtractDepcapCommandsFiltering:
         (log_dir / "w-001.log").write_text(
             json.dumps({"message": "not a dict"}) + "\n"
         )
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert text == ""
 
     def test_consecutive_separator_empty_segment_does_not_crash_and_is_skipped(
@@ -243,7 +256,7 @@ class TestExtractDepcapCommandsFiltering:
         find the real install verb in the non-empty segment that follows."""
         log_dir = tmp_path / "logs"
         _write_log(log_dir, ["echo hi;;pip install flask"], "w-001.log")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "echo hi;;pip install flask" in text
 
     def test_trailing_separator_empty_segment_is_skipped(self, leerie, tmp_path):
@@ -251,7 +264,7 @@ class TestExtractDepcapCommandsFiltering:
         command is still kept because an earlier segment is install-shaped."""
         log_dir = tmp_path / "logs"
         _write_log(log_dir, ["npm install &&"], "w-001.log")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "npm install &&" in text
 
 
@@ -265,7 +278,7 @@ class TestExtractDepcapCommandsBudget:
     def test_ceiling_not_hit_when_commands_fit(self, leerie, tmp_path):
         log_dir = tmp_path / "logs"
         _write_log(log_dir, ["apt-get install -y curl"], "w-001.log")
-        _, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+        _, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
         assert not hit_ceiling
 
     def test_ceiling_hit_when_budget_exceeded(self, leerie, tmp_path):
@@ -279,7 +292,7 @@ class TestExtractDepcapCommandsBudget:
         orig = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = 1500
-            text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+            text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
             assert hit_ceiling
             # Not all 100 commands can fit in 1500 bytes
             for i in range(100):
@@ -298,7 +311,7 @@ class TestExtractDepcapCommandsBudget:
         orig = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = 10_000_000  # 10 MB
-            text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+            text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
             for cmd in cmds:
                 assert cmd in text
             assert not hit_ceiling
@@ -319,7 +332,7 @@ class TestExtractDepcapCommandsBudget:
         orig = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = tight_budget
-            text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+            text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
             assert hit_ceiling
             assert cmd_a in text
             assert cmd_b not in text
@@ -336,7 +349,7 @@ class TestExtractDepcapCommandsBudget:
         orig = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = total_needed
-            text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+            text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
             assert not hit_ceiling
             for cmd in cmds:
                 assert cmd in text
@@ -350,7 +363,7 @@ class TestExtractDepcapCommandsBudget:
         orig = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = 0
-            text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+            text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
             assert hit_ceiling
             assert text == ""
         finally:
@@ -369,7 +382,7 @@ class TestExtractDepcapCommandsBudget:
         orig = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = cost  # exactly enough for one copy
-            text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+            text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
             # After dedup there is only one copy; it should fit exactly
             assert not hit_ceiling
             assert cmd in text
@@ -385,12 +398,15 @@ class TestExtractDepcapCommandsOrdering:
     """Newest-first: log files are iterated in reverse-name order."""
 
     def test_files_processed_newest_first(self, leerie, tmp_path):
-        """With a tight budget, the newest file's commands are preferred."""
+        """With a tight budget, the newest file's commands are preferred —
+        newest by mtime, registered first or not."""
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
-        # "newer" file (lexicographically last) has a distinct command
-        _write_log(log_dir, ["apt-get install -y git"], "w-001.log")
+        # The newer file is registered LAST: order must come from mtime.
         _write_log(log_dir, ["apt-get install -y curl"], "w-002.log")
+        _write_log(log_dir, ["apt-get install -y git"], "w-001.log")
+        os.utime(log_dir / "w-002.log", (2_000_000_000, 2_000_000_000))
+        os.utime(log_dir / "w-001.log", (1_000_000_000, 1_000_000_000))
         cmd_001 = "apt-get install -y git"
         cmd_002 = "apt-get install -y curl"
         # Budget for only one command
@@ -398,8 +414,8 @@ class TestExtractDepcapCommandsOrdering:
         orig = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = cost_002
-            text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
-            # w-002.log is processed first (lexicographically newest)
+            text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
+            # w-002.log is processed first (newest mtime)
             assert cmd_002 in text
             assert cmd_001 not in text
             assert hit_ceiling

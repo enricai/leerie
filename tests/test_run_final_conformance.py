@@ -911,3 +911,25 @@ def test_cleared_record_with_blocked_false_still_skips(env):
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
     assert state["i"] == 0
+
+
+def test_axes_are_measured_beside_the_rounds_transcript_never_in_it(env):
+    """DESIGN §8 *What a worker ran is read from its own transcript*."""
+    c = env["leerie"]
+    env["caps"] = dict(env["caps"])
+    env["caps"]["conformance_rounds"] = 1
+    _stub_claude_p(c, [_clean_result()])
+    paths = []
+
+    async def _rec(tree, axes_map, st, caps, **kw):
+        paths.append(kw.get("log_path"))
+        return dict(_passing_axis("build"))
+    c._measure_axes = _rec
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+    assert paths, "the phase measured nothing"
+    assert set(paths) == {env["run_dir"] / "logs"
+                          / "final-conformer-r0-axes.log"}
+    assert c._worker_log_path(env["run_dir"], "final-conformer-r0",
+                              "conformer") not in paths

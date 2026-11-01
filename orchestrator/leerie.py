@@ -9951,6 +9951,15 @@ async def _run_streaming(
     descendant inheriting the restriction, and the grant's own variables
     are laid over `env` last. There is no unconfined path.
     """
+    # A command's output never lands in a worker's transcript, where a line
+    # the code under measurement prints in the shape of a tool call would be
+    # read as one the worker made (DESIGN §8 *What a worker ran is read from
+    # its own transcript*).
+    if log_path is not None and _is_worker_transcript(log_path):
+        die(f"leerie was about to write a command's output into {log_path}, "
+            "a worker's transcript — leerie's own invariant is broken "
+            "(DESIGN §8 *What a worker ran is read from its own "
+            "transcript*). Report this.")
     # The command may write `/tmp` (`grants.shared_tmp`) only while it holds
     # the run's `/tmp` lock shared, so none runs while a held-out evaluation
     # has `/tmp` alone (`_held_out_section`), whose own commands pass
@@ -18018,7 +18027,10 @@ def _extract_depcap_commands(log_dir: Path) -> tuple[str, bool]:
     degenerate into echoing prose as packages. This is the SECONDARY hint —
     manifests (`_gather_dep_manifests`) are the primary corpus (DESIGN §6½)."""
     seen: dict[str, None] = {}  # ordered set, dedup
-    for log_path in sorted(log_dir.glob("*.log"), reverse=True):
+    # Registered transcripts only, never a command's output (DESIGN §8 *What
+    # a worker ran is read from its own transcript*): an install line the
+    # code under measurement prints would otherwise become a package.
+    for _sid, log_path in _worker_transcripts(log_dir):
         for kind, inp, _result in _iter_log_tool_use(log_path):
             if kind != "Bash":
                 continue
@@ -22420,6 +22432,65 @@ def _worker_log_path(run_dir: str | Path, sid: str, schema_key: str) -> Path:
              else Path(run_dir) / "logs") / f"{sid}.log")
 
 
+# Beside a directory's transcripts, one line per spawn: which of its `*.log`
+# files a worker's `claude -p` session wrote, and as which worker (DESIGN §8
+# *What a worker ran is read from its own transcript*). The same directory
+# holds leerie's runs of the repository's commands, whose output the code
+# under measurement writes; a file is a transcript only if `_invoke`
+# registered it.
+TRANSCRIPTS_REGISTRY = "transcripts.ndjson"
+
+
+def _register_worker_transcript(log_path: Path, sid: str) -> None:
+    """Record `log_path` as worker `sid`'s transcript, before `_invoke`
+    writes it. A retry or a resume appends the same line again;
+    `_worker_transcripts` reads each file once."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with (log_path.parent / TRANSCRIPTS_REGISTRY).open("a") as f:
+        f.write(json.dumps({"sid": sid, "log": log_path.name},
+                           separators=(",", ":")) + "\n")
+
+
+def _registered_transcripts(log_dir: Path) -> dict[str, str]:
+    """`{log file name: sid}` of the transcripts registered in `log_dir`."""
+    try:
+        lines = (log_dir / TRANSCRIPTS_REGISTRY).read_text().splitlines()
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        name, sid = rec.get("log"), rec.get("sid")
+        # A bare file name of this directory, never a path out of it.
+        if (isinstance(name, str) and isinstance(sid, str)
+                and name.endswith(".log") and name == Path(name).name):
+            out.setdefault(name, sid)
+    return out
+
+
+def _worker_transcripts(log_dir: Path) -> list[tuple[str, Path]]:
+    """`(sid, path)` of every worker transcript in `log_dir` — the files
+    `_invoke` registered, never any other `*.log` there — newest first."""
+    found = []
+    for name, sid in _registered_transcripts(log_dir).items():
+        path = log_dir / name
+        try:
+            found.append((path.stat().st_mtime, sid, path))
+        except OSError:
+            continue
+    found.sort(key=lambda x: x[0], reverse=True)
+    return [(sid, path) for _m, sid, path in found]
+
+
+def _is_worker_transcript(log_path: Path) -> bool:
+    return log_path.name in _registered_transcripts(log_path.parent)
+
+
 def _notes_dir(leerie_dir: str | Path, sid: str) -> Path:
     return Path(leerie_dir) / NOTES_DIRNAME / sid
 
@@ -23273,7 +23344,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     `max_parallel` context to gate against."""
     log_path = (log_dir if log_dir is not None
                 else leerie_dir / "logs") / f"{sid}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _register_worker_transcript(log_path, sid)
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
     # implementer's `structured_output` tool_use carries the full
@@ -41073,6 +41144,11 @@ _BG_ID_RE = re.compile(r"Command running in background with ID:\s*(\w+)")
 _LOG_TOOL_KINDS = ("Bash", "BashOutput", "KillBash", "Read")
 
 
+# The header `_invoke` writes above a transcript line that is not a stream
+# event (a mechanical string leerie itself writes).
+_LOG_TEXT_HEADER_RE = re.compile(r"^\[[^\]\n]*\] (?:stderr|non-json-line)$")
+
+
 def _iter_log_tool_use(
         log_path: Path,
         kinds: tuple[str, ...] = _LOG_TOOL_KINDS,
@@ -41096,8 +41172,16 @@ def _iter_log_tool_use(
     # keys tool_result texts by tool_use_id and yields the joined pairs.
     uses: list[tuple[str, str, dict]] = []  # (tool_use_id, name, input)
     results: dict[str, str] = {}
+    prev = ""
     for line in lines:
+        after, prev = prev, line
         if not line.startswith("{"):
+            continue
+        # `_invoke` writes the CLI's stderr into the same file, one line under
+        # each `[ts] stderr` header (and a non-JSON stdout line under
+        # `[ts] non-json-line`): such a line is text, never a stream event
+        # (DESIGN §8 *What a worker ran is read from its own transcript*).
+        if _LOG_TEXT_HEADER_RE.match(after):
             continue
         try:
             body = json.loads(line)
@@ -41423,7 +41507,10 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     if deferred:
         log(f"  {sid}: {', '.join(deferred)} deferred to the whole-tree pass "
             f"(no delta proxy for this diff)")
-    conf_log = leerie_dir / "logs" / f"{sid}-conformer.log"
+    # Not the conformer's transcript (`{sid}-conformer.log`): the axes'
+    # output is the repository's (DESIGN §8 *What a worker ran is read from
+    # its own transcript*).
+    conf_log = leerie_dir / "logs" / f"{sid}-conformer-axes.log"
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
 
     async def _measure(label: str) -> dict[str, dict]:
@@ -46459,8 +46546,8 @@ def _executed_command_entries(leerie_dir: Path, repo_root: Path,
                               tail_chars: int = 300,
                               repro_command: str | None = None
                               ) -> list[tuple[str, str]]:
-    """The run's build/lint/test executions, extracted from per-worker
-    logs for the delivery judge (DESIGN §8 *Execution-shaped items are
+    """The run's build/lint/test executions, extracted from the workers'
+    registered transcripts (`_worker_transcripts`) for the delivery judge (DESIGN §8 *Execution-shaped items are
     judged from the run's own records*). Mechanical extraction only
     (Language-to-JSON): a command is included when its first token per
     shell segment matches a BLT verb (`_blt_verbs` — command strings
@@ -46477,14 +46564,11 @@ def _executed_command_entries(leerie_dir: Path, repo_root: Path,
     verbs = set(_blt_verbs(repo_root)) | _repro_verbs(repro_command)
     if not verbs:
         return []
-    logs_dir = leerie_dir / "logs"
-    if not logs_dir.is_dir():
-        return []
     entries: list[tuple[str, str]] = []
-    log_files = sorted(logs_dir.glob("*.log"),
-                       key=lambda f: f.stat().st_mtime, reverse=True)
-    for lf in log_files:
-        sid = lf.stem
+    # Registered transcripts only: `logs/` also holds leerie's runs of the
+    # repository's commands, whose output the code under measurement prints
+    # (DESIGN §8 *What a worker ran is read from its own transcript*).
+    for sid, lf in _worker_transcripts(leerie_dir / "logs"):
         for kind, inp, result in _iter_log_tool_use(lf):
             if kind != "Bash":
                 continue
@@ -58521,6 +58605,13 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
            if rec.get("conflict") else ""))
 
 
+def _final_axes_log(leerie_dir: Path, rnd: int) -> Path:
+    """Where final-conformance round `rnd`'s axes are measured — never
+    `final-conformer-r{rnd}.log`, that round's worker's transcript (DESIGN
+    §8 *What a worker ran is read from its own transcript*)."""
+    return leerie_dir / "logs" / f"final-conformer-r{rnd}-axes.log"
+
+
 async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                                 models: dict[str, str],
                                 efforts: dict[str, str | None],
@@ -58628,7 +58719,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     async def _measure_final(rnd: int, label: str) -> dict[str, dict]:
         return await _measure_axes(
             str(staging), final_axes, st, caps,
-            log_path=leerie_dir / "logs" / f"final-conformer-r{rnd}.log",
+            log_path=_final_axes_log(leerie_dir, rnd),
             verbosity=verbosity, label_prefix=f"final-{label}",
             log_prefix="final-conformer", failing_ids_axes={"tests"})
 
@@ -58845,7 +58936,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         regressions = _round_axis_regressions(pre, post)
         id_diff = await _confirm_final_test_failures(
             st, caps, str(staging), post,
-            log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
+            log_path=_final_axes_log(leerie_dir, c_round),
             label=f"final-r{c_round}")
         # The diff may have measured the base again (`_retry_failed_baseline`:
         # its install had failed), replacing `_baseline` in state; the old
@@ -58892,7 +58983,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             and await _view_tree_sha(st, staging) == pre_tree):
         broke = await _confirm_final_test_failures(
             st, caps, str(staging), pre,
-            log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
+            log_path=_final_axes_log(leerie_dir, c_round),
             label=f"final-r{c_round}-pre")
         fresh = (st.data.get("conformance") or {}).get("_baseline")
         if fresh is not baseline:

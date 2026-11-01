@@ -1504,3 +1504,26 @@ def test_a_conformer_that_commits_detached_is_rolled_back_onto_its_branch(
     assert _run(["git", "rev-parse", "HEAD"], cwd=wt).stdout.strip() == before
     assert env["st"].data["unclean_trees"]["conformer:t1 round 0"][
         "lines"] == [f"HEAD is not on {branch} (detached)"]
+
+
+def test_axes_are_measured_beside_the_conformers_transcript_never_in_it(env):
+    """DESIGN §8 *What a worker ran is read from its own transcript*: the
+    repository's output, printed by the code under measurement, never lands
+    in the file the record reads as the conformer's runs."""
+    c = env["leerie"]
+    _stub_run_conformer(c, [_clean_result()])
+    paths = []
+
+    async def _rec(tree, axes_map, st, caps, **kw):
+        paths.append(kw.get("log_path"))
+        return dict(_failing_axis())
+    c._measure_axes = _rec
+    asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    transcript = c._worker_log_path(env["run_dir"], f"{env['sid']}-conformer",
+                                    "conformer")
+    assert paths, "the phase measured nothing"
+    assert set(paths) == {env["run_dir"] / "logs"
+                          / f"{env['sid']}-conformer-axes.log"}
+    assert transcript not in paths

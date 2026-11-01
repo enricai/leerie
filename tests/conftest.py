@@ -184,6 +184,17 @@ def validate_or_fallback_required(schema: dict, instance: dict) -> bool:
     return False
 
 
+def register_worker_transcript(log_path: Path) -> Path:
+    """Register a hand-written fixture log as a worker's transcript, the
+    line `_invoke` appends when it spawns one (`TRANSCRIPTS_REGISTRY`): the
+    readers of what a worker ran take registered transcripts only (DESIGN §8
+    *What a worker ran is read from its own transcript*)."""
+    with (log_path.parent / "transcripts.ndjson").open("a") as f:
+        f.write(json.dumps({"sid": log_path.stem, "log": log_path.name})
+                + "\n")
+    return log_path
+
+
 @pytest.fixture(scope="session")
 def leerie():
     """The leerie module loaded from orchestrator/leerie.py."""

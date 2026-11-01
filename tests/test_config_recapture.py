@@ -31,6 +31,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from tests.config_arm_extract import extract_config_arm as _extract_config_arm
+from tests.conftest import register_worker_transcript
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # The directory of the running interpreter, so the real seam can import
@@ -245,6 +246,7 @@ def _make_finished_run(state_dir: Path, run_name: str,
             }
             lines.append(json.dumps(event))
         (log_dir / "worker-001.log").write_text("\n".join(lines) + "\n")
+        register_worker_transcript(log_dir / "worker-001.log")
     if with_sentinel:
         (run_dir / "dep_capture.done").write_text("1\n")
     return run_dir
@@ -773,6 +775,7 @@ def _make_finished_run_with_apt_log(state_dir: Path, run_name: str,
         }
     }
     (log_dir / "worker-001.log").write_text(json.dumps(event) + "\n")
+    register_worker_transcript(log_dir / "worker-001.log")
 
 
 def _make_claude_stub(stub_dir: Path, structured_output: dict) -> None:

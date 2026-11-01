@@ -34,7 +34,7 @@ import pytest
 
 from tests.stub_helpers import (DELIVERY_CITED_FILE, DELIVERY_CITED_LINE,
                                 _delivery_tree, _judge_verdict)
-from tests.conftest import fake_run_dir
+from tests.conftest import fake_run_dir, register_worker_transcript
 from tests.conftest import run_git_out  # noqa: E402
 
 MODELS = {"delivery_judge": "sonnet", "falsifier": "sonnet"}
@@ -245,6 +245,7 @@ class TestVerifyDeliveryCite:
                 {"message": {"content": [{"type": "tool_result",
                                           "tool_use_id": "t1",
                                           "content": "1 passed"}]}}]) + "\n")
+        register_worker_transcript(run / "logs" / "final-conformer-r0.log")
         digest = leerie._executed_commands_digest(leerie._executed_command_entries(run, tmp_path))
         assert "required behaviours pass" in digest
         assert not any(line.startswith("[orchestrator ")
