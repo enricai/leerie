@@ -3344,11 +3344,15 @@ def test_residual_reaches_the_next_runs_planner_ctx(leerie, tmp_path):
     (d / "orchestrator.exit_code").write_text("0")
     (d / "state.json").write_text(json.dumps({
         "task": st.data["task"],
-        "acceptance": {"gate": {"residual": {
-            "failing_sets": 3, "total_sets": 5,
-            "cases": ["add sums two ints"]}}}}))
+        "acceptance": {
+            "sets": [{"index": i} for i in (1, 2, 3)],
+            "gate": {"residual": {
+                "failing_sets": 1, "total_sets": 3,
+                "cases": ["add sums two ints"], "sets": [1],
+                "cases_by_set": {"1": ["add sums two ints"]}}}}}))
     res = leerie._prior_delivery_residual(st)
     assert res["acceptance_unmet"]["cases"] == ["add sums two ints"]
+    assert res["acceptance_unmet"]["held_back_failing_sets"] == 0
     assert res["acceptance_unmet"]["unmeasured_final"] is False
     assert "acceptance_unmet" in leerie._load_prompt("planner")
 

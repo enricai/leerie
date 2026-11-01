@@ -706,6 +706,10 @@ def test_a_set_typed_broken_is_not_handed_on(leerie, tmp_path, broken, want):
 
 
 def test_a_legacy_residual_without_set_indices_is_kept(leerie):
+    """Kept, counts and all — but with no names: without per-set indices a
+    held-back set's names cannot be told from a shown set's (DESIGN §8
+    *Nothing a held-out evaluation produces reaches a fixer*)."""
     legacy = {"failing_sets": 1, "total_sets": 2, "cases": ["x"]}
     assert leerie._acceptance_residual_unbroken(
-        legacy, [{"index": 1, "broken": True}]) is legacy
+        legacy, [{"index": 1, "broken": True}]) == {
+            "failing_sets": 1, "total_sets": 2, "cases": []}

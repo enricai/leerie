@@ -366,7 +366,8 @@ def _digest_state(leerie, tmp_path, commit, tree):
                       "passed": False, "summary": "1 failed"}}}},
         "test_id_diff": {"candidates": ["a"], "new": ["t.py :: test_a"],
                          "tree_sha": tree},
-        "acceptance": {"gate": {
+        "acceptance": {"sets": [{"index": 1}, {"index": 2}, {"index": 3}],
+                       "gate": {
             "final_sha": commit,
             "final": [{"index": 1, "passed": True},
                       {"index": 2, "passed": False,
@@ -1102,6 +1103,34 @@ class TestRunDeliveryDetection:
         assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
         assert "1 required item(s) still unmet" in st.data["outcome_reasons"]
 
+    def test_a_confirmed_samples_evidence_carries_no_falsifier_text(
+            self, leerie, tmp_path, monkeypatch):
+        """DESIGN §8 *Nothing a held-out evaluation produces reaches a
+        fixer*: the falsifier reads every valid set as a lead, and
+        `unmet_final`'s evidence is what the re-drive's implementers read —
+        so it names the item's own words the probe tests, never the probe's
+        case title, path or the sample's prose."""
+        repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                              k=1)
+        st.data["required_items"] = [ITEMS[0]]
+        st.save()
+        sentinel = "ZQX_FALSIFIER_SENTINEL expects 42 per the lead"
+
+        def behave(kw, n):
+            _demonstrate(kw, n)
+            return _claim(reason=sentinel)
+        _falsifier_stub(leerie, monkeypatch, st, behave)
+        asyncio.run(leerie._run_delivery_detection(
+            st.run_dir, st, caps, MODELS, EFFORTS))
+        gate = st.data["delivery_gate"]
+        assert gate["items"][0]["falsifier"]["samples"][0]["confirmed"]
+        ev = gate["unmet_final"][0]["evidence"]
+        assert ev == ("a falsifier probe of the item's words "
+                      "\"add(2, 3) returns 5\" fails under B* on the final "
+                      "tree")
+        for leaked in (sentinel, "test_add_returns_the_sum", PROBE_REL):
+            assert leaked not in ev
+
     def test_nothing_confirmed_means_met(self, leerie, tmp_path,
                                          monkeypatch):
         repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
@@ -1158,7 +1187,8 @@ class TestRunDeliveryDetection:
             sid = kw["sid"]
             if not kw.get("resume_session"):
                 # The first answer: gave up without writing or running.
-                _write_log(st.run_dir / "logs" / f"{sid}.log",
+                _write_log(leerie._worker_log_path(st.run_dir, sid,
+                                                   "falsifier"),
                            [_tool("Bash", {"command": "ls"},
                                   session="sess-77")])
                 return _claim(verdict="could_not_demonstrate",

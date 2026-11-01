@@ -22400,6 +22400,24 @@ _RUN_NOTES_READERS = frozenset({"implementer", "conformer", "integrator"})
 # `<run-dir>/notes/<subtask-id>/`, its own directory, so a grant can name
 # it before either file exists.
 NOTES_DIRNAME = "notes"
+# Every log of the held-out side, under `<run-dir>/logs/held-out/` (DESIGN §8
+# *Nothing a held-out evaluation produces reaches a fixer*): leerie's runs of
+# set files, whose output the evaluated code writes, and the transcripts of
+# the workers that read a set or run its files. Nothing that builds a
+# worker's input reads this directory.
+HELD_OUT_LOGS_DIRNAME = "held-out"
+HELD_OUT_LOG_WORKERS = frozenset({"acceptance_writer", "set_auditor",
+                                  "scope_judge", "falsifier"})
+
+
+def _held_out_logs(run_dir: str | Path) -> Path:
+    return Path(run_dir) / "logs" / HELD_OUT_LOGS_DIRNAME
+
+
+def _worker_log_path(run_dir: str | Path, sid: str, schema_key: str) -> Path:
+    """Where `claude_p` writes worker `sid`'s transcript."""
+    return ((_held_out_logs(run_dir) if schema_key in HELD_OUT_LOG_WORKERS
+             else Path(run_dir) / "logs") / f"{sid}.log")
 
 
 def _notes_dir(leerie_dir: str | Path, sid: str) -> Path:
@@ -23134,7 +23152,8 @@ async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
                            max_parallel: int | None = None,
                            worker_demand_estimate_bytes: int | None = None,
                            env_extra: dict[str, str] | None = None,
-                           *, grants: WorkerGrants | None) -> dict:
+                           *, grants: WorkerGrants | None,
+                           log_dir: Path | None = None) -> dict:
     """Admission-gated wrapper around `_invoke`.
 
     This exists as a separate function purely so the memory reservation is
@@ -23166,7 +23185,8 @@ async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
             worker_memory_max_bytes=worker_memory_max_bytes,
             worker_pids_max=worker_pids_max, stdin_data=stdin_data,
             run_id=run_id, active_token=active_token, grants=grants,
-            **({"env_extra": env_extra} if env_extra else {}))
+            **({"env_extra": env_extra} if env_extra else {}),
+            **({"log_dir": log_dir} if log_dir is not None else {}))
     finally:
         _release_worker_memory_admission(admission_token)
         # A worker in a committing tree wrote only its tree repository;
@@ -23186,7 +23206,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   run_id: str | None = None,
                   active_token: str | None = None,
                   env_extra: dict[str, str] | None = None,
-                  *, grants: WorkerGrants | None) -> dict:
+                  *, grants: WorkerGrants | None,
+                  log_dir: Path | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
     `grants` (required, keyword-only: no call can forget it) is where the
@@ -23221,7 +23242,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     line of stdout is one JSON event. The final `type: "result"` event
     is the envelope (same shape as the non-streaming `--output-format
     json` path produces). All events are appended to
-    `<state-root>/logs/<sid>.log` regardless of verbosity. Inline summaries
+    `<state-root>/logs/<sid>.log` (under `log_dir` instead when given: a
+    held-out-side worker's, `_worker_log_path`) regardless of verbosity.
+    Inline summaries
     surface to the orchestrator log according to `verbosity` (see
     `_summarize_stream_event`).
 
@@ -23248,7 +23271,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     the only symptom is memory pressure attributable to nothing. The one
     legitimate caller is `preflight`'s smoke test, which has no run-level
     `max_parallel` context to gate against."""
-    log_path = leerie_dir / "logs" / f"{sid}.log"
+    log_path = (log_dir if log_dir is not None
+                else leerie_dir / "logs") / f"{sid}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
     # implementer's `structured_output` tool_use carries the full
@@ -27541,7 +27566,10 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                                          "worker_demand_estimate_bytes"),
                                      grants=grants,
                                      **({"env_extra": env_extra}
-                                        if env_extra else {}))
+                                        if env_extra else {}),
+                                     **({"log_dir": _held_out_logs(leerie_dir)}
+                                        if schema_key in HELD_OUT_LOG_WORKERS
+                                        else {}))
             _latency_ms = int((time.monotonic() - _t0) * 1000)
 
             # record run-weight telemetry
@@ -46214,11 +46242,17 @@ def _acceptance_residual_unbroken(residual: dict | None,
     — one whose recorded failing files hold no counted case (DESIGN §8 *A
     task that points at a report is bounded by the report's own scenarios*)
     — applied when the residual is READ, so a set typed after its run
-    finished is excluded too. None when nothing is left to hand on; a
-    residual recorded before per-set indices existed (no `sets`) is
-    returned unchanged."""
-    if not residual or not isinstance(residual.get("sets"), list):
+    finished is excluded too. None when nothing is left to hand on.
+
+    Its `cases` are re-derived here, at the read, from the shown sets alone
+    (DESIGN §8 *Nothing a held-out evaluation produces reaches a fixer*): a
+    residual recorded before that rule named held-back sets' cases too. One
+    recorded before per-set indices existed (no `sets`) cannot tell them
+    apart, so it hands on no names."""
+    if not residual:
         return residual
+    if not isinstance(residual.get("sets"), list):
+        return {**residual, "cases": []}
     by_index = {s_.get("index"): s_ for s_ in sets if isinstance(s_, dict)}
     files_by_set = residual.get("files_by_set") or {}
     ids_by_set = residual.get("failing_cases_by_set") or {}
@@ -46233,15 +46267,18 @@ def _acceptance_residual_unbroken(residual: dict | None,
         return _acceptance_result_has_work(set_, files,
                                            ids_by_set.get(str(i)))
     keep = [i for i in residual["sets"] if _work(i)]
-    if len(keep) == len(residual["sets"]):
-        return residual
-    if not keep and not residual.get("rollback_failed"):
+    if (not keep and len(keep) != len(residual["sets"])
+            and not residual.get("rollback_failed")):
         return None
+    shown = _acceptance_shown_indices(
+        [s_ for s_ in sets if isinstance(s_, dict) and "index" in s_])
     by_set = residual.get("cases_by_set") or {}
     out = dict(residual)
     out["sets"] = keep
     out["failing_sets"] = len(keep)
-    out["cases"] = [c for i in keep for c in by_set.get(str(i), [])][:20]
+    out["held_back_failing_sets"] = sum(1 for i in keep if i not in shown)
+    out["cases"] = [c for i in keep if i in shown
+                    for c in by_set.get(str(i), [])][:20]
     return out
 
 
@@ -46322,7 +46359,12 @@ def _prior_delivery_residual(st: "State") -> dict | None:
                 "unmeasured_final": bool(acc_residual.get("unmeasured_final")),
                 # A repair the gate decided to revert is still on the branch.
                 "rollback_failed": bool(acc_residual.get("rollback_failed")),
-                "cases": [str(c)[:200] for c in
+                # Failing sets whose names are held back: counted, never
+                # named (DESIGN §8 *Nothing a held-out evaluation produces
+                # reaches a fixer*).
+                "held_back_failing_sets": int(
+                    acc_residual.get("held_back_failing_sets") or 0),
+                "cases":[str(c)[:200] for c in
                           (acc_residual.get("cases") or [])][:10]}
         if unmet_after:
             residual["unmet_after"] = [
@@ -46839,7 +46881,10 @@ def _orchestrator_results_digest(st: "State",
     (DESIGN §8 *Execution-shaped items are judged from the run's own
     records*): the final-tree build/lint/test axes it measured, the test IDs
     B* confirmed newly failing, and each held-out acceptance set's final
-    verdict. Read from typed state only; "" when none of it exists yet.
+    verdict — a held-back set's verdict alone, never its files or case
+    names: the judge's evidence reaches the fixers (DESIGN §8 *Nothing a
+    held-out evaluation produces reaches a fixer*). Read from typed state
+    only; "" when none of it exists yet.
 
     Each result is in the record only while it describes `tree`'s HEAD
     (DESIGN §8 *Every post-execution verdict is of the committed tree*): a
@@ -46885,6 +46930,9 @@ def _orchestrator_results_digest(st: "State",
     if isinstance(final_sets, list):
         cases = ((gate.get("residual") or {}).get("cases_by_set") or {}
                  if isinstance(gate.get("residual"), dict) else {})
+        shown = _acceptance_shown_indices(
+            [s_ for s_ in (acc.get("sets") or [])
+             if isinstance(s_, dict) and "index" in s_])
         for r in final_sets:
             if not isinstance(r, dict):
                 continue
@@ -46893,6 +46941,8 @@ def _orchestrator_results_digest(st: "State",
                 verdict = "not measured"
             elif r.get("passed"):
                 verdict = "passed"
+            elif k not in shown:
+                verdict = "failed (a held-back set: its tests are not named)"
             else:
                 names = [str(c)[:160] for c in
                          (cases.get(str(k)) or cases.get(k) or [])][:5]
@@ -49964,7 +50014,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             else f"acceptance-rewrite-{k}")
     sid = name if attempt == 1 else f"{name}-a{attempt}"
     wt = _helper_worktree_path(st, name)
-    log_path = leerie_dir / "logs" / f"{name}.log"
+    log_path = _held_out_logs(leerie_dir) / f"{name}.log"
     out = {"index": k, "valid": False, "declared_defect": False}
     # Outside every try: budget exhaustion must propagate, not read as an
     # invalid set (the same discipline as the no_work_judge call).
@@ -50536,7 +50586,7 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
     file that failed every rerun stays failing (`failing_files`); the rest
     are `resource_affected_files`, and a set whose failures were all
     resource-affected is no evidence either way (DESIGN §8)."""
-    log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+    log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
     wt = _helper_worktree_path(st, "acceptance-eval")
 
     def _teardown() -> None:
@@ -50602,7 +50652,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
     not end failing is rerun by `_acceptance_discover`; and a file whose
     held case was seen failing, but only with resource signatures, is
     failing and typed `intermittent_cases` — never unmeasured."""
-    log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+    log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
     results: list[dict] = []
     # The sets' files are in `wt` from here until each is removed: `/tmp`
     # is the evaluation's alone meanwhile, and what it creates there goes
@@ -51711,7 +51761,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
     propagates; a sample that fails otherwise is no finding."""
     out: dict = {"failing_cases": [], "findings": [], "kinds": [],
                  "sample_kinds": [], "samples": 0}
-    log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+    log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
     copied, complete = _place_set(set_, wt)
     refs_copied: list[Path] = []
     try:
@@ -51832,7 +51882,7 @@ async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
     installed and, in a Prisma repo, its own throwaway database: yields
     `(wt, env_extra)` or None when it cannot be set up (no evidence)."""
     wt = _helper_worktree_path(st, name)
-    log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+    log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
 
     def _teardown() -> None:
         subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
@@ -52821,14 +52871,22 @@ def _acceptance_round_kept(entry: dict) -> bool:
 def _acceptance_residual_of(basis: list[dict], sets: list[dict]) -> dict:
     """The residual record of a measured verdict with at least one failing
     set (`acceptance.gate.residual`): what the next same-task run's planner
-    is handed. Written by the gate and, after it, the delivery re-drive."""
+    is handed. Written by the gate and, after it, the delivery re-drive.
+
+    Case names only of the sets a repair round is shown: the planner's words
+    reach the implementers, and the next run's writer writes its own sets
+    from the same report, so a held-back set's names describe that run's
+    held-back tests (DESIGN §8 *Nothing a held-out evaluation produces
+    reaches a fixer*). A failing held-back set is counted
+    (`held_back_failing_sets`), never named."""
     by_index = {s_["index"]: s_ for s_ in sets}
+    shown = _acceptance_shown_indices(sets)
     measured = _acceptance_measured(basis)
     cases_by_set = {
         str(r["index"]): [c for rel in r["failing_files"]
                           for c in (by_index.get(r["index"]) or {}).get(
                               "cases", {}).get(rel, [])][:20]
-        for r in measured if not r["passed"]}
+        for r in measured if not r["passed"] and r["index"] in shown}
     names = [c for v in cases_by_set.values() for c in v]
     # A failing set whose held case failed only with resource signatures
     # (DESIGN §8 *A held case that fails again*, rule 3), typed as such.
@@ -52837,6 +52895,9 @@ def _acceptance_residual_of(basis: list[dict], sets: list[dict]) -> dict:
     return {
         **({"intermittent": intermittent} if intermittent else {}),
         "failing_sets": sum(1 for r in measured if not r["passed"]),
+        "held_back_failing_sets": sum(1 for r in measured
+                                      if not r["passed"]
+                                      and r["index"] not in shown),
         "total_sets": len(measured), "cases": names[:20],
         # Which sets, so a set typed broken later can be left out of the
         # next run's residual (`_acceptance_residual_unbroken`).
@@ -54844,7 +54905,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
     while not parent.exists():
         made.append(parent)
         parent = parent.parent
-    log_path = st.run_dir / "logs" / f"falsifier-confirm-{label}.log"
+    log_path = _held_out_logs(st.run_dir) / f"falsifier-confirm-{label}.log"
     timeout = float(caps.get("worker_timeout_sec")
                     or DEFAULT_CAPS["worker_timeout_sec"])
     try:
@@ -55049,10 +55110,12 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             res = await claude_p(user_prompt=user, sid=sid, **common)
             rec: dict = {"sample": n, "reasked": False}
             activity = _falsifier_probe_activity(
-                st.run_dir / "logs" / f"{sid}.log", lane, st.repo_root)
+                _worker_log_path(st.run_dir, sid, "falsifier"), lane,
+                st.repo_root)
             rec["probe_activity"] = activity
             if _falsifier_needs_reask(res, activity):
-                session = _log_session_id(st.run_dir / "logs" / f"{sid}.log")
+                session = _log_session_id(
+                    _worker_log_path(st.run_dir, sid, "falsifier"))
                 if session:
                     st.bump_workers(caps)
                     res = await claude_p(user_prompt=FALSIFIER_REASK_NOTE,
@@ -55297,10 +55360,15 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
             by.append("falsifier")
             s_ = next((x for x in fi.get("samples") or []
                        if x.get("confirmed")), {})
+            # The item's own words the probe tests (code found them verbatim
+            # in the item), never the probe's case title or the sample's
+            # prose: its leads are every valid set, held-back ones included,
+            # and this evidence reaches the re-drive's implementers (DESIGN
+            # §8 *Nothing a held-out evaluation produces reaches a fixer*).
             evidence.append(
-                f"falsifier probe {s_.get('probe_path')} — case "
-                f"{s_.get('case_id')} fails under B* on the final tree: "
-                f"{s_.get('reason') or ''}".strip())
+                "a falsifier probe of the item's words "
+                f"\"{_scope_norm(str(s_.get('item_span_quote') or ''))}\" "
+                "fails under B* on the final tree")
         paths = it.get("untouched_paths")
         settled = (_d1_untouched_verdict(staging, own, paths)
                    if crashed and not by and isinstance(paths, list)
@@ -64480,7 +64548,9 @@ def _record_run_health(st: "State") -> None:
     best_sid: str | None = None
     best_ms = 0.0
     truncated = 0
-    for lg in sorted(logs_dir.glob("*.log")):
+    # The held-out side's transcripts too: telemetry, read by no worker.
+    for lg in sorted([*logs_dir.glob("*.log"),
+                      *_held_out_logs(st.run_dir).glob("*.log")]):
         total_ms = 0.0
         hit_cap = False
         try:

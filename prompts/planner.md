@@ -620,7 +620,10 @@ The orchestrator gives you, in your prompt:
    tests written from the report alone, which that run's fix still
    failed after its repair rounds: plan the root-cause change that makes
    the report's contract hold for those cases in general, not a change
-   shaped to the case names. `unmeasured_final: true` means the shipped
+   shaped to the case names. `held_back_failing_sets` counts failing sets
+   whose cases are deliberately not named to you: they check the same
+   contract, so plan from the report, not from the names you do see.
+   `unmeasured_final: true` means the shipped
    tree could not be measured at all — usually an environment failure —
    so the verdict is the last one that could be, possibly from before
    that run's last repair; check the tree before trusting it.

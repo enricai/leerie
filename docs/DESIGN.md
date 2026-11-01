@@ -10891,6 +10891,57 @@ pinned conformer fixed the contract from HEAD 1/2 times, medium 2/3,
 high every time it finished (6/6) — effort, not turn budget, was the
 lever, and only failing runs pay for it.
 
+**Nothing a held-out evaluation produces reaches a fixer but its verdict
+and leerie's own identifiers.** (I3, its relay half: the rule above keeps
+a set out of a fixer's tree, this one keeps what the set yields out of a
+fixer's input.) What may leave an evaluation of a held-out set for any
+worker's input — a prompt, a file a worker reads, a record a judge cites
+and a fixer then reads in the judge's evidence — is the set's index, its
+verdict (passed, failed, unmeasured), and, for a set a repair round is
+shown, the paths and case names its writer declared. Never runner output:
+the code under evaluation is a worker's, so whatever the runner prints is
+chosen by it, and an assertion diff prints the test's expected values.
+Runner output is read in code only, for its resource signature
+(`_RESOURCE_FAILURE_RE`, a fixed runner string). Never a held-back set's
+paths or names either, except in the delivery re-drive's one held-back
+round (*Delivery re-drive* rule 6). The audit for this rule found four
+relays, each closed where it relayed:
+
+- *The next run's planner.* The residual handed to the next same-task
+  run named the failing cases of every set, held-back ones included. The
+  previous run's sets never run again, but the next run's writer writes
+  its own from the same report and the same prompt, so those names
+  describe its held-back tests, and the planner's words reach its
+  implementers — the reason the no-work dispute already took names from
+  shown sets only (*No work is declared on executed evidence*). The residual names the shown sets' cases and
+  counts the failing held-back sets apart (`held_back_failing_sets`), and
+  a residual recorded before this rule is re-derived when it is read.
+- *The delivery judge's record.* `_orchestrator_results_digest` named
+  every failing set's files and cases. The judge's evidence reaches the
+  final conformer, the re-drive's implementers and the next run's
+  planner, so a held-back set's line gives its verdict only.
+- *The logs the record reads.* The record took every `logs/*.log` for a
+  worker's transcript: the acceptance writer's included, whose runs of
+  its own tests carry their output, and leerie's runs of set files, whose
+  output the evaluated code writes — a printed line shaped like a tool
+  call is read as one. Every log of the held-out side is now written under
+  `logs/held-out/` (`HELD_OUT_LOGS_DIRNAME`): leerie's runs of set files
+  and of falsifier probes, and the transcripts of the workers that read a
+  set or run one (`HELD_OUT_LOG_WORKERS`: the acceptance writer, the set
+  auditor, the scope judge and the falsifier, whose leads are every valid
+  set). Nothing that builds a worker's input reads that directory.
+- *The falsifier's evidence.* A confirmed sample put its probe's case
+  title and its own prose into `unmet_final`, which the re-drive's
+  implementers read; both come from a worker that read the held-back
+  sets. The evidence is now the span of the item the probe tests, which
+  code checks is verbatim in the item, and the fact that it fails under
+  B\*.
+
+Workers on the held-out side — the writer, the set auditor, the scope
+judge, the surrogate fixer's witness run — read set source or runner
+output by design; what they return feeds only the held-out side (a
+rewrite of the set, which cases count) or a typed verdict code reads.
+
 **Non-blocking, with a mechanical safety net.** Held-out tests can be
 wrong: on a report that states no expected behaviour (a diagnostic
 report) or needs a heavily mocked harness, all three sets failed a task
