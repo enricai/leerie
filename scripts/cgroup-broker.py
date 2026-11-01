@@ -24,8 +24,9 @@ the rootlesskit-mapped host UID in the rootless case — and the
 orchestrator drives it over a descriptor it inherits, one end of a socket
 pair made here (`spawn`), regardless of which identity that is. No
 pathname exists to connect to, so only the orchestrator can reach it
-(DESIGN §6 *No service of leerie's is reachable by a path*). It is the
-single most-privileged surface in the worker path, so it is deliberately
+(DESIGN §6 *No leerie service is reachable by a path from a process it
+does not serve*). It is the single most-privileged surface in the worker
+path, so it is deliberately
 tiny and validates every input.
 
 Rootless: rootlesskit maps the container's "root" to the real host UID,
@@ -725,9 +726,10 @@ def serve(ctrl: socket.socket) -> None:
     is closed. Each request is one message: the request line, carrying one
     descriptor (the client's reply socket) on which the response goes back.
 
-    There is no pathname to connect to (DESIGN §6 *No service of leerie's is
-    reachable by a path*): a process that does not hold the orchestrator's
-    descriptor cannot send the broker anything. A world-connectable
+    There is no pathname to connect to (DESIGN §6 *No leerie service is
+    reachable by a path from a process it does not serve*): a process that
+    does not hold the orchestrator's descriptor cannot send the broker
+    anything. A world-connectable
     `/run/leerie-cgroup.sock` let a held-out evaluation create cgroups that
     outlived its sandbox, and let any worker `destroy` another's (review
     round 21, isolation R3)."""

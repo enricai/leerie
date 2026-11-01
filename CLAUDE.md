@@ -25,8 +25,9 @@ Runtime: containerd + nerdctl. On Linux, native. On macOS, via
 `docs/INSTALL.md` for per-OS install steps.
 
 The kernel must offer Landlock ABI 3 or later (Linux 6.2+): every worker
-and every repository command leerie runs is confined, and preflight stops a
-run without it rather than run either unconfined (DESIGN §6 *A worker
+and every repository command leerie runs is confined, and the confinement
+check every entry runs (`_require_confinement`: a fresh run, `resume` and
+`--phase`) stops a run without it rather than run either unconfined (DESIGN §6 *A worker
 writes only where it is granted (I5)*, *Leerie's runs of the repository's
 commands are confined too*). The user's checkout is mounted at `/work` read-only (DESIGN §6
 *The run's own repository*, *The explicit channel*).
@@ -166,14 +167,16 @@ the rest of the family stay denied.
   caches and its tree's own stores, and by kind `MISE_DATA_DIR`,
   `~/.local/bin` or (the store fetch alone) leerie's stores
   (`_measurement_grants`, through `_run_streaming`, whose `grants` has no
-  default). No grant names `/tmp`: once preflight has built a sandbox,
+  default). No grant names `/tmp`: once the confinement check every entry
+  runs (`_require_confinement`) has built a sandbox,
   every confined process has its own `/tmp`, `/dev/shm` and IPC
   (`--isolate`), and a held-out file runs only in a sandbox
   (`HeldOutSandbox`, `_run_streaming(sandbox=)`), alone: every worker and
   every confined command holds the execution lock shared, an evaluation
   exclusive (`_exec_lock()`, `_held_out_section`). Leerie keeps nothing of
   its own in `/tmp` but the preflight smoke test's empty working directory
-  (`_use_run_tmp`, `_system_temp_dir`). No database server leerie starts
+  (`_use_run_tmp`, `_system_temp_dir`) and its egress proxy's 0700 socket
+  directory `/tmp/l/<hex>/` (`_egress_server`). No database server leerie starts
   is unconfined (`scripts/sandbox-db.sh`). Every confined command's
   processes end with it: the Landlock shim is their subreaper. The host-side workers
   (rebaser, host recapture, `config --chat`) are the one exception.

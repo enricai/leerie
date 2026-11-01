@@ -22068,8 +22068,9 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
 # container-entry.sh at PID 1 before the privilege drop, and performs
 # create/enroll/destroy on the orchestrator's behalf over a descriptor this
 # process inherits — one end of a socket pair, never a pathname (DESIGN §6
-# *No service of leerie's is reachable by a path*). It handles cgroup v1
-# (Fly Firecracker VMs are v1/hybrid) vs v2 (Colima) transparently. The
+# *No leerie service is reachable by a path from a process it does not
+# serve*). It handles cgroup v1 (Fly Firecracker VMs are v1/hybrid) vs v2
+# (Colima) transparently. The
 # functions below are thin socket clients; the public names/signatures are
 # unchanged so `_invoke`'s call sites are untouched, except `_cgroup_create`
 # now returns the sid (str) rather than a filesystem Path.
@@ -22108,8 +22109,9 @@ def _adopt_cgroup_broker() -> None:
     """Take the broker descriptor this process was handed, before it starts
     anything: made non-inheritable and its variable removed, so no worker
     or command leerie starts holds it or is told its number (DESIGN §6 *No
-    service of leerie's is reachable by a path*). A descriptor that is not
-    a unix `SOCK_SEQPACKET` socket is left alone and not used."""
+    leerie service is reachable by a path from a process it does not
+    serve*). A descriptor that is not a unix `SOCK_SEQPACKET` socket is left
+    alone and not used."""
     global _CGROUP_BROKER
     raw = os.environ.pop(_CGROUP_BROKER_FD_ENV, None)
     if raw is None or _CGROUP_BROKER is not None:
@@ -23027,7 +23029,8 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
         placed_on_disk = (view / rel).exists()
     except (OSError, subprocess.SubprocessError) as e:
         _rmtree_owned(probe)
-        die(f"preflight could not run the held-out sandbox probe "
+        die("the confinement check every entry runs (`_require_confinement`) "
+            f"could not run the held-out sandbox probe "
             f"({type(e).__name__}: {e}); leerie never runs a held-out file "
             "outside a sandbox (DESIGN §6 *A held-out evaluation runs "
             "alone*).")
@@ -23140,7 +23143,8 @@ def _require_egress_relay() -> None:
             r = subprocess.run(argv, cwd="/", capture_output=True, text=True,
                                timeout=60)
         except (OSError, subprocess.SubprocessError) as e:
-            die(f"preflight could not run the network probe "
+            die("the confinement check every entry runs "
+                "(`_require_confinement`) could not run the network probe "
                 f"({type(e).__name__}: {e}); leerie never starts a confined "
                 "process on the container's network (DESIGN §6 *A confined "
                 "process has its own network*).")
@@ -23592,8 +23596,9 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
     """`cmd` started through the Landlock shim with `grants`. With
     `sandbox`, in a held-out sandbox (always: a held-out file never runs
     outside one, and the shim refuses where it cannot build one), its
-    report copied to `report_fd`; else isolated once preflight has built a
-    sandbox (`_isolated()`, DESIGN §6 *Every confined process has its own
+    report copied to `report_fd`; else isolated once the confinement check
+    every entry runs (`_require_confinement`) has built a sandbox
+    (`_isolated()`, DESIGN §6 *Every confined process has its own
     `/tmp`, `/dev/shm` and IPC*), in a network namespace of its own: with
     an `egress` grant, the outside reached through the run's egress proxy
     (`_egress_server`), and the strict-output proxy's port relayed when it
@@ -67665,7 +67670,8 @@ def main() -> None:
     # hook (DESIGN §6½ *Hooks off*); `_invoke` gives a worker them back.
     _git_hooks_off(os.environ)
     # The cgroup broker's descriptor, before anything is started that could
-    # inherit it (DESIGN §6 *No service of leerie's is reachable by a path*).
+    # inherit it (DESIGN §6 *No leerie service is reachable by a path from a
+    # process it does not serve*).
     _adopt_cgroup_broker()
 
     # Install the child-subreaper role first thing, before any worker (or any

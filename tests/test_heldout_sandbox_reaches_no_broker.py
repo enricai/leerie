@@ -1,5 +1,6 @@
 """A held-out evaluation cannot reach the cgroup broker (DESIGN §6 *No
-service of leerie's is reachable by a path*; review round 21, isolation R3).
+leerie service is reachable by a path from a process it does not serve*;
+review round 21, isolation R3).
 
 The broker runs as the container's root, outside every namespace the
 sandbox makes. It listened on `/run/leerie-cgroup.sock`, mode 0666, which

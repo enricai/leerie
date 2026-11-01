@@ -212,7 +212,8 @@ if extra_path not in child_env.get("PATH", ""):
 # The cgroup broker, started here as root (this wrapper's identity) and
 # reached by the orchestrator only through the descriptor handed to it
 # below: no pathname exists for any confined process to connect to
-# (DESIGN section 6, No service of leerie's is reachable by a path). PID 1
+# (DESIGN section 6, No leerie service is reachable by a path from a
+# process it does not serve). PID 1
 # starts none on this runtime. Best-effort, as at PID 1: without it the
 # orchestrator's probe fails and its fail-closed gate decides.
 import importlib.util

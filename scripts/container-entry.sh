@@ -145,8 +145,9 @@ fi
 # (`cgroup-broker.py --spawn`): it makes a socket pair, forks the broker
 # with one end, and execs the drop with the other end inherited — the
 # orchestrator's only way to reach it. No pathname exists, so no confined
-# process can connect to it (DESIGN §6 *No service of leerie's is reachable
-# by a path*). Best-effort as before: a broker that cannot start leaves the
+# process can connect to it (DESIGN §6 *No leerie service is reachable
+# by a path from a process it does not serve*). Best-effort as before: a
+# broker that cannot start leaves the
 # orchestrator's probe failing, and its fail-closed gate fires (or
 # --dangerously-allow-uncapped downgrades to a warning). On Fly/EC2 the
 # orchestrator is launched out-of-band, so its launch wrapper starts the

@@ -17,7 +17,9 @@ among the active LSMs. Check with:
 cat /sys/kernel/security/lsm     # must list landlock
 ```
 
-Without it the run stops at preflight, naming the kernel's ABI.
+Without it the run stops at the confinement check every entry runs
+(`_require_confinement`: a fresh run, `resume` and `--phase`), naming the
+kernel's ABI.
 
 ## Runtime requirement: user namespaces and the `leerie-container` profile
 
@@ -42,8 +44,10 @@ sudo apparmor_parser -r -W /etc/apparmor.d/leerie-container
 #         colima ssh -- sudo apparmor_parser -r -W /etc/apparmor.d/leerie-container
 ```
 
-Preflight builds a sandbox before any worker runs and stops the run, naming
-the missing flag or profile, when it cannot. Measured on rootless and
+The confinement check every entry runs (`_require_confinement`: a fresh
+run, `resume` and `--phase`) builds a sandbox before any worker or
+repository command runs and stops the run, naming the missing flag or
+profile, when it cannot. Measured on rootless and
 rootful containerd on Linux; Colima, EC2 and Fly are not yet measured and
 fail closed the same way (a Fly machine whose kernel offers no user
 namespaces does not start a run).

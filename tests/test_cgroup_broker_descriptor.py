@@ -1,6 +1,6 @@
 """The cgroup broker is reachable only through the orchestrator's descriptor
-(DESIGN §6 *No service of leerie's is reachable by a path*; review round 21,
-isolation R3).
+(DESIGN §6 *No leerie service is reachable by a path from a process it does
+not serve*; review round 21, isolation R3).
 
 The broker used to listen on `/run/leerie-cgroup.sock`, mode 0666: any
 confined process — a held-out evaluation in its sandbox included — could

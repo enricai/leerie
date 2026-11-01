@@ -6233,7 +6233,7 @@ if [ "$_leerie_do_gen" = "true" ]; then
       # and launch the cgroup broker before dropping to leerie via `runuser` (see
       # DESIGN §6; the base Dockerfile omits `USER leerie` for the same reason).
       # A trailing `USER leerie` makes PID 1 run as leerie → cgroup writes, the
-      # broker socket bind, and `runuser` all fail EACCES and the container exits 1.
+      # broker's cgroup setup, and `runuser` all fail EACCES and the container exits 1.
       printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp"
     fi
 

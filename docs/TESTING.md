@@ -6261,7 +6261,8 @@ template kept at finalize.
   and through the proxy); two concurrent commands binding one fixed port;
   a command without egress has `lo` only, no proxy variables, no route and
   no resolver; the relay tunnels, forwards, and ends with the command; the
-  real preflight probe passes and fails closed on a shared network; and
+  real probe of the confinement check every entry runs
+  (`_require_confinement`) passes and fails closed on a shared network; and
   R6 turned round (a placement through a linked directory refused, the
   worker's tree untouched). Live-falsified in the container, one mechanism
   at a time: no network namespace, the proxy refusing nothing, placement
@@ -6271,7 +6272,8 @@ template kept at finalize.
   `setgroups` rule winning over the generic `EACCES` one), the gate's die
   messages and its per-property failures with the probe's subprocess
   faked, isolation switched on only by a passing gate, `_confined_argv`
-  (no `--isolate` before preflight; a held-out run always `--sandbox`),
+  (no `--isolate` before the confinement check every entry runs; a
+  held-out run always `--sandbox`),
   the entry (`_require_confinement`) running the gate right after
   `_require_landlock`, and the real
   gate where the runtime allows it.
@@ -6296,3 +6298,74 @@ template kept at finalize.
   planted in the clone's own `.git`; a clone without leerie's git directory
   is refused, with no fallback to its own `.git`; removing the checkout
   removes leerie's git directory.
+- `tests/test_run_layout.py` (9 tests; DESIGN §6 *A run directory is
+  continued only by a leerie of its layout*, review round 21 L1): over a
+  fixture shaped like a run directory main's code made (`branch` in
+  `run.json`, no `run_layout` or `run_repo` in `state.json`, a transcript
+  with no `transcripts.ndjson`), `resume` of an old layout and of a newer
+  one is refused before anything writes in the directory, which is left
+  untouched; `resume` of this layout is driven; a bare `resume` picks this
+  layout's run over a later old one; `--phase` on an old layout is refused
+  before its workers; a fresh run records `run_layout` and a resume never
+  rewrites it; `leerie list` shows an old run with work left as
+  `other-leerie`, and the overlay leaves orphans and finished runs alone.
+  Replaces `tests/test_run_repo.py`'s pins of the old refusal, which keyed
+  on `run_repo`-absent-and-`branch`-present and refused only after the run
+  directory was loaded.
+- `tests/test_phase_single_state.py` (3 tests): `--phase judge|heal`
+  reaches its workers with one `State` per run per process. The real
+  `main()`, with the real run-directory lock, is driven to each phase's
+  first worker spawn (`claude_p`, stubbed), which must receive the `State`
+  `main()` opened — the defect, on `main` since 60fca170, opened a second
+  `State` whose flock the first refused, exiting 75 before any worker;
+  heal with a failing verdict already indexed skips the judge and reaches
+  its baseline worker; a `--phase` run-id naming no run is refused with no
+  directory left behind.
+- `tests/test_leerie_writes_never_follow_links.py` (17 tests; DESIGN §6
+  *Leerie never writes through a path confined code shaped*, review round
+  21 isolation R1, R2, R5): the primitives (`_write_beneath`,
+  `_read_beneath`, `_mkdir_private`, `_remove_beneath`,
+  `_add_dir_bits_beneath`) never follow a link at the destination or on
+  the way, keep a replaced file's mode, and refuse a link or a FIFO to
+  read; restoring a tree and placing a set write nothing through a link a
+  command left or a commit carried; R1 — a held-out report is parsed from
+  the sandbox's descriptor and never written back through a planted
+  `reports/` link (behind the emulator, and in a real sandbox the set
+  never reaches the worker's tree); R5 — a planted measurement-id link
+  and a planted settings-restore temp link redirect nothing; R2 — each
+  worker kind is granted its side's cache set only, and a held-out-side
+  worker's `GOCACHE` is unreadable by a later implementer; a rule over the
+  module classifies every function that uses a raw write primitive
+  (primitives, leerie-only, confined), and the converted sites use none.
+  The real-sandbox cases skip where the host cannot build a sandbox.
+- `tests/test_cgroup_broker_descriptor.py` (7 tests; DESIGN §6 *No leerie
+  service is reachable by a path from a process it does not serve*, review
+  round 21 isolation R3): the real `scripts/cgroup-broker.py --spawn`
+  chain, `serve()` loop and orchestrator client (`_adopt_cgroup_broker`,
+  `_cgroup_request`, `_hand_cgroup_broker_to_exec`) over a throwaway
+  v2-shaped directory: the orchestrator reaches the broker through its
+  descriptor alone; the broker stops when the orchestrator is gone; an
+  exec of the orchestrator (`_sleep_then_reexec`) keeps it; concurrent
+  requests each get their own answer; a timed-out request leaves nothing
+  for the next; no descriptor is an unreachable broker; and a descriptor
+  that is not the broker's is not used.
+- `tests/test_heldout_sandbox_reaches_no_broker.py` (2 tests,
+  `real_heldout_sandbox`; same section): held-out code in a real sandbox
+  cannot reach a real broker, and an isolated worker started through the
+  shim holds no socket of the orchestrator's. Needs a real sandbox and a
+  broker started by `cgroup-broker.py --spawn` with its v2 root at
+  `$R21_CG_SLICE` (a container harness run as root, dropping to leerie as
+  `container-entry.sh` does); skips otherwise.
+- `tests/test_worker_commands_cannot_reach_the_cli.py` (8 test functions,
+  9 cases; DESIGN §6 *A worker's commands cannot reach its CLI*, review
+  round 21 isolation R4): with a stand-in CLI that runs
+  `CLAUDE_CODE_SHELL_PREFIX` as the real one does (the shim, grants,
+  `_invoke`, transcript registry and readers real), code a worker runs
+  cannot write a forged event into its transcript through
+  `/proc/<cli>/fd/1` (2 cases: unisolated and isolated, the latter skipped
+  where the host cannot build a sandbox); a settings prefix below
+  leerie's `--settings` cannot unset leerie's shell; settings layers merge
+  in the CLI's order; a malformed settings file is logged and left out; a
+  confined worker reads no settings file; the host seam is untouched;
+  `scripts/worker-shell.py` fails closed (126) where it cannot nest, and
+  runs a command as `bash` would.

@@ -2683,8 +2683,18 @@ its links to the template's `plugins/` with its own; a plugin is loaded only
 when the operator's settings enable it, and then at the next start of that
 configuration — the worker's own re-ask. Closing that needs the
 configuration's code-bearing directories out of the worker's reach, which
-this design does not do. Below Landlock ABI 6 a nested command can still
-signal the CLI (as any process of the worker could): a stop, not a forgery.
+this design does not do. A nested command can still signal the CLI, at
+every Landlock ABI: `nest()` sets no scope, deliberately, so a later
+command can still stop or reach what an earlier command of the same worker
+left running (sibling nested domains would otherwise refuse each other),
+and the worker's own signal scope (ABI 6 and later) admits every process of
+its own domain, the CLI included. That is a stop, not a forgery, and it
+breaks no isolation invariant: the CLI is the worker's own process, which
+any process of the worker could already signal, and the missing nested
+scope adds no reach beyond the worker's domain — what a worker can signal
+outside it is the worker's scope alone (*A worker writes only where it is
+granted (I5)*, Residuals), so no worker reaches another worker or leerie
+through it.
 
 ### Leerie's runs of the repository's commands are confined too (I5, measurements)
 
@@ -3287,8 +3297,9 @@ in Landlock.
 
 **Fail closed.** A namespace that cannot be made, a loopback that cannot
 be brought up, or a relay that cannot listen is a failed isolation step:
-the shim exits 126 and the command does not run. Preflight's sandbox
-probe builds a network namespace (the held-out sandbox always had one),
+the shim exits 126 and the command does not run. The sandbox probe of
+the confinement check every entry runs (`_require_heldout_sandbox`, in
+`_require_confinement`) builds a network namespace (the held-out sandbox always had one),
 then runs an isolated process with `--egress` that must reach the egress
 proxy through its relay and be refused a loopback destination
 (`_require_egress_relay`); a runtime that cannot do either stops the run
@@ -3509,7 +3520,7 @@ every repository (the run directory is inside one when the state root is
 `<repo>/.leerie`); it is made before any measurement runs
 (`_system_temp_dir`).
 
-### No service of leerie's is reachable by a path (I3, I5)
+### No leerie service is reachable by a path from a process it does not serve (I3, I5)
 
 *Designed 2026-11-01 (review round 21, isolation R3).*
 
@@ -3531,11 +3542,13 @@ limits of `create` were further encodings; the same socket let any worker
 broker's docstring accepted that only because "there is no adversarial
 process model inside" the container, which I3 and I5 replaced.
 
-**Invariant.** No control service of leerie's is reachable by a path from
-any confined process: a service leerie runs for itself is reached only
-through a descriptor the orchestrator holds, which no worker or command
-inherits. What cannot be named cannot be connected to, whatever the
-namespaces, mounts or Landlock rules of the process that tries.
+**Invariant.** No leerie service is reachable by a path from a process it
+does not serve. A service leerie runs for itself (a control service: the
+broker) is reached only through a descriptor the orchestrator holds, which
+no worker or command inherits; a service leerie runs for confined processes
+is named only inside the processes it serves. What cannot be named cannot
+be connected to, whatever the namespaces, mounts or Landlock rules of the
+process that tries.
 
 **Mechanism.** The broker serves one end of a `socketpair(AF_UNIX,
 SOCK_SEQPACKET)` (`scripts/cgroup-broker.py`'s `spawn`), and the
@@ -3569,14 +3582,25 @@ orchestrator either: `/proc/<pid>/fd` of either is a ptrace-mode access
 Landlock refuses to a process in a domain to one outside it, and a socket
 cannot be reopened through `/proc` at all (ENXIO).
 
-**Other services.** The broker was the one pathname socket of leerie's in
-the container. The `ssh-agent` socket the launcher makes for Fly is on the
-user's host. The strict-output proxy is a service for workers on purpose
-(it carries their API traffic) and listens on loopback TCP, which the
-held-out sandbox's own network namespace does not reach. A service leerie
-offers to confined processes on purpose follows the same rule toward the
-sandbox: reached through something carried into the process that may use
-it, never a path the sandbox can name.
+**Other services.** The broker was leerie's one control socket. Leerie's
+pathname sockets in the container are the egress proxy's (§6 *A confined
+process has its own network*): `egress.sock`, and one `fwd-<port>.sock` per
+forwarded port, in the proxy's 0700 directory `/tmp/l/<hex>/`
+(`_EgressProxy`, made by `_egress_server` under `_private_tmp`). They are
+services for confined processes on purpose, and only the processes they
+serve can name them: every confined process has a `/tmp` of its own, and
+the shim carries the proxy's directory, read-only, into a process only when
+its grant has `egress` (`_confined_argv`'s `--egress`/`--forward`, the
+shim's `isolate(…, sockets=)`) — every worker, and the toolchain, setup-hook
+and store-fetch kinds of a repository command. A measurement
+(`MEASURE_KIND`) and a held-out sandbox get no egress, so neither can name
+them. The strict-output proxy listens on the orchestrator's loopback TCP,
+outside every confined process's network namespace; a worker reaches it
+only through its `fwd-<port>.sock`, relayed onto the same port inside the
+worker's namespace. The `ssh-agent` socket the launcher makes for Fly is on
+the user's host. A service leerie offers to confined processes follows this
+rule: reached through something carried into the process that may use it,
+never a path a process it does not serve can name.
 
 ### No database server leerie starts is ever unconfined
 
@@ -6350,8 +6374,8 @@ the rootful case (Colima, Fly), the rootlesskit-mapped host UID in the
 rootless case (which owns the systemd-delegated user slice; see
 *Rootless exception* below). The orchestrator reaches it only through a
 descriptor it inherits — one end of a socket pair, never a pathname (§6
-*No service of leerie's is reachable by a path*), and every request is
-validated. It performs `create` / `enroll` / `destroy` at that owning
+*No leerie service is reachable by a path from a process it does not
+serve*), and every request is validated. It performs `create` / `enroll` / `destroy` at that owning
 identity — the only identities where enrollment and limit-setting work
 — and detects the cgroup hierarchy: **v2** (Colima) uses the unified
 `leerie.slice/leerie-w-<sid>/{pids,memory}.max`; **v1/hybrid** (observed
