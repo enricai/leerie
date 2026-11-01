@@ -5735,7 +5735,7 @@ and settings from their own copies of the run's template, which leaves out
 per-session state; the template's directories reach each worker as links
 to one read-only copy, which a worker cannot write; each worker has its
 own `TMPDIR`, gone once the call returns; a `--resume` runs in the
-directories that hold its session; and finalize's `_remove_worker_dirs`
+directories that hold its session; and `_remove_worker_dirs`
 removes them all and the template. Falsified, each turning a test red: one
 shared `<wid>`, `CLAUDE_CONFIG_DIR` or `TMPDIR` left unset, the resume
 lookup bypassed, the `tmp` removal dropped, an empty `_CLAUDE_CONFIG_SKIP`,
@@ -5803,17 +5803,26 @@ template kept at finalize.
   throwaway checkout; the checkout snapshot never rewrites the user's index;
   with no run repository the prune and the abnormal-exit clean-up write
   nothing in the cwd's `.git`.
-- `tests/test_credentials_never_outlive_the_run.py` (9 tests, DESIGN §6 *No
-  copy of the credentials outlives its run's process*, *Every deleter of a
-  run's directories deletes them*; review round 18 M1): the owner-aware
-  removal takes read-only and unreadable directories, never follows a link,
-  and reports a survivor; an abnormal exit removes the template and
-  `workers/` (no copy of the credentials left) and keeps the run's state; a
-  full purge removes a run whose template is read-only; the preflight reap
-  removes an idle run's copies; the reviewer's driver inverted — the real
-  launcher `prune --apply` removes a run that died mid-run, its read-only
-  template with it; prune counts a run removed only when it is gone; the
-  shell removal; no run-directory deleter ignores its errors.
+- `tests/test_credentials_never_outlive_the_run.py` (10 test functions, 24
+  cases; DESIGN §6 *No copy of the credentials outlives its run's process*,
+  *Every deleter of a run's directories deletes them*; review round 18 M1,
+  round 19 claims H1, exec M1 and L2): the owner-aware removal takes
+  read-only and unreadable directories, never follows a link, and reports a
+  survivor; the real `main()`, run in its own process with `_orchestrate`
+  making a worker's configuration (so the template), `measure/`,
+  `tree-stores/` and `.store-fetch/`, leaves none of them, nor the secret,
+  however it ends — a return, a return with no copy of the credentials, a
+  real `phase_finalize` whose dependency capture makes the template again
+  (it is there after finalize, gone after the exit), a forked child's own
+  exit (which leaves the parent's), the rate limit's exec (released before
+  it), and each exit `main()`'s top-level `try` handles; the set of those
+  handlers is read from `main()`'s source and must equal the set the test
+  drives; a full purge removes a run whose template is read-only; the
+  preflight reap removes an idle run's copies; the reviewer's driver
+  inverted — the real launcher `prune --apply` removes a run that died
+  mid-run, its read-only template with it; prune counts a run removed only
+  when it is gone; the shell removal; no run-directory deleter ignores its
+  errors.
 - `tests/test_view_moves.py` (6 tests, DESIGN §8 *A view moves to the next
   tip when the install's inputs are unchanged*; review round 18 L1), real
   git, the real scripts and `_measured_tree` with an incremental stand-in

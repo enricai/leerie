@@ -1805,15 +1805,31 @@ is removed when each of its calls returns; its `config/` lives as long as
 a resume of it can follow within the process.
 
 *No copy of the credentials outlives its run's process.* `workers/` and the
-template below hold copies of the operator's credentials. They go on every
-terminal exit of the orchestrator's process: finalize, and every abnormal
-exit — a `die()`, an exception, a signal, a pause before an auto-resume
-(`_cleanup_on_abnormal_exit`) — and when the preflight reap or `leerie
-prune` reaps an idle run. A resume makes the template again at its first
-worker. Only finalize removing them left a run that died with its
-credentials on disk (review round 18 M1). A worker session the process
-recorded is then not resumable across processes (its transcript was in
-`workers/`); the re-ask that would resume it takes its no-session path.
+template below hold copies of the operator's credentials. They go when the
+process that made or used them exits, whatever the exit: a return, a
+`sys.exit`, a `die()`, an unhandled exception, an interrupt or a signal.
+The owner is the process's exit itself (`_release_owned_run_dirs`, an
+`atexit` handler), not each way out of it: a run directory is registered
+when the process takes the run's `State` lock, and when it makes the
+template without one (the host-side rebaser opens the `State`). At exit,
+every run directory the process still owns is released. Removing them at
+named exits — finalize, the abnormal exit — left them after every normal
+return that was neither: each no-work exit of planning, the template
+dep-capture makes again after finalize removed it, and the rebaser's on
+the host (review round 19 claims H1, exec M1). The same exit removes the
+run's other per-process scratch: the measurement directories
+(`measure/`), the trees' own stores (`tree-stores/`) and the store
+fetch's staging (`.store-fetch/`), which nothing reads once the process
+is gone (review round 19 exec L2). The auto-resume after a rate limit
+replaces the process image (`os.execv`), which runs no exit handlers, so
+`_sleep_then_reexec` releases first. A SIGKILL runs no exit; the preflight
+reap and `leerie prune` remove what such a run left. A resume makes the
+template again at its first worker; a worker session the process recorded
+is then not resumable across processes (its transcript was in
+`workers/`), and the re-ask that would resume it takes its no-session
+path. A forked child that exits is not the run's process: the handler
+releases only what its own pid registered, and only while the `State`
+lock it was registered with is still held.
 
 *Every deleter of a run's directories deletes them.* The template is
 read-only, and so is a killed test's directory in a tree. A plain

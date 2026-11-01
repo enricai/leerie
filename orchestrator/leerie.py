@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import atexit
 import base64
 import codecs
 import concurrent.futures
@@ -5577,11 +5578,6 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     if full_purge or has_worktrees:
         log(f"cleanup: {'full purge' if full_purge else 'worktrees only'} "
             f"for run {st.run_id}")
-    # Every abnormal exit is a terminal exit of this process: the copies of
-    # the credentials in the template and the workers' configurations go
-    # (DESIGN §6 *No copy of the credentials outlives its run's process*);
-    # a resume makes the template again.
-    _remove_worker_dirs(st.run_dir)
     # Remove worktrees. 240s is calibrated for realistic worker workloads:
     # a 868 MB / 41k-file worktree (npm install + Next.js build) takes
     # ~45-90s uncontested; under N-way concurrent cleanup (e.g. 6 worktrees
@@ -6376,6 +6372,11 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
         signum = getattr(signal, str(e), None)
         return (128 + int(signum)) if signum else 1
     log(f"  auto-resuming: exec orchestrator resume {st.run_id}")
+    # An exec ends this process image without its exit handlers: release
+    # what it owns first, as its exit would (DESIGN §6 *No copy of the
+    # credentials outlives its run's process*). The resumed image makes its
+    # own.
+    _release_owned_run_dirs()
     try:
         os.execv(sys.executable,
                  [sys.executable, __file__, "resume", "--run-id", st.run_id])
@@ -11415,6 +11416,8 @@ def _claude_config_template(run_dir: Path) -> Path:
     first worker — and kept for the run, so nothing a worker writes later
     reaches another worker's copy."""
     t = Path(run_dir) / CLAUDE_CONFIG_TEMPLATE
+    # The copy goes when the process that makes or uses it exits.
+    _own_run_dir_until_exit(Path(run_dir))
     if (t / _CLAUDE_CONFIG_TEMPLATE_MARK).is_file():
         return t
     env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -11491,11 +11494,11 @@ def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
 
 
 def _remove_worker_dirs(run_dir: Path) -> bool:
-    """Remove every worker's directories, and the template they were made
-    from (they hold copies of the credentials), on every terminal exit of
-    the run's process (DESIGN §6 *No copy of the credentials outlives its
-    run's process*): finalize, `_cleanup_on_abnormal_exit`, and the reap of
-    an idle run. True when both are gone; a survivor is logged by name."""
+    """Remove every worker's directories and the template they were made
+    from (they hold copies of the credentials). True when both are gone; a
+    survivor is logged by name. Called by `_release_run_dir` at the exit of
+    the process that owns the run, and by the reap and prune of a run no
+    process owns."""
     gone = True
     for name in (WORKERS_DIR, CLAUDE_CONFIG_TEMPLATE):
         path = Path(run_dir) / name
@@ -11504,6 +11507,79 @@ def _remove_worker_dirs(run_dir: Path) -> bool:
             log(f"cleanup: could not remove {_operator_path(path)}; it may "
                 "hold a copy of your credentials — remove it by hand")
     return gone
+
+
+# What a run's process makes in the run directory for its own use and no
+# later process reads: the measurement directories, the trees' own stores
+# and the store fetch's staging (DESIGN §6 *No copy of the credentials
+# outlives its run's process*).
+STORE_FETCH_DIRNAME = ".store-fetch"
+# realpath(run_dir) -> (the `State` that holds its lock, by weak reference,
+# or None; the pid that registered it: a forked child that exits is not the
+# run's process).
+_OWNED_RUN_DIRS: dict[str, tuple[Callable[[], object] | None, int]] = {}
+
+
+def _run_scratch_names() -> tuple[str, ...]:
+    return (MEASURE_DIRNAME, TREE_STORES_DIRNAME, STORE_FETCH_DIRNAME)
+
+
+def _release_run_dir(run_dir: Path) -> bool:
+    """Remove what the run's process made in `run_dir` for its own use: the
+    workers' directories and the template (`_remove_worker_dirs`) and the
+    run's scratch (`_run_scratch_names`). True when all are gone."""
+    gone = _remove_worker_dirs(run_dir)
+    for name in _run_scratch_names():
+        path = Path(run_dir) / name
+        if not _rmtree_owned(path):
+            gone = False
+            log(f"cleanup: could not remove {_operator_path(path)}")
+    return gone
+
+
+def _release_owned_run_dirs() -> None:
+    """At this process's exit, whatever the exit — a return, `sys.exit`,
+    `die`, an unhandled exception, an interrupt — release every run
+    directory it registered (DESIGN §6 *No copy of the credentials outlives
+    its run's process*), under the run's lock: the lock its `State` still
+    holds, else the lock taken now. A run directory whose lock another
+    process holds is that process's, and is left. Never raises: it runs at
+    interpreter exit."""
+    for d, (state, pid) in list(_OWNED_RUN_DIRS.items()):
+        _OWNED_RUN_DIRS.pop(d, None)
+        if pid != os.getpid():
+            continue
+        fd: int | None = None
+        try:
+            st = state() if state is not None else None
+            if getattr(st, "_lock_fd", None) is None:
+                fd = os.open(d, os.O_RDONLY)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _release_run_dir(Path(d))
+        except (BlockingIOError, FileNotFoundError):
+            pass
+        except BaseException as e:  # at exit: report, never raise
+            with contextlib.suppress(BaseException):
+                log(f"cleanup: releasing {d} failed: {type(e).__name__}")
+        finally:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+
+def _own_run_dir_until_exit(run_dir: Path, state: object = None) -> None:
+    """Register `run_dir` for release at this process's exit
+    (`_release_owned_run_dirs`), with the `State` that holds its lock when
+    there is one. A later registration with a `State` replaces one
+    without."""
+    if not _OWNED_RUN_DIRS:
+        atexit.unregister(_release_owned_run_dirs)
+        atexit.register(_release_owned_run_dirs)
+    key = os.path.realpath(run_dir)
+    have = _OWNED_RUN_DIRS.get(key)
+    if have is None or (state is not None and have[0] is None):
+        _OWNED_RUN_DIRS[key] = (
+            weakref.ref(state) if state is not None else None, os.getpid())
 
 
 def _payload_only_cwd(st: object) -> str:
@@ -27547,6 +27623,9 @@ class State:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._lock_fd: int | None = None
         self._acquire_lock()
+        # This process owns the run directory now: whatever it leaves there
+        # for its own use goes when it exits (`_release_run_dir`).
+        _own_run_dir_until_exit(self.run_dir, self)
 
     @property
     def run_repo(self) -> Path:
@@ -41224,7 +41303,7 @@ async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
         # Each fetch its own staging directory: a name shared by manager and
         # working dir let concurrent fetches remove each other's (review
         # round 19 exec M2).
-        base = st.run_dir / ".store-fetch"
+        base = st.run_dir / STORE_FETCH_DIRNAME
         base.mkdir(parents=True, exist_ok=True)
         stage = Path(tempfile.mkdtemp(
             prefix=_CGROUP_NAME_UNSAFE_RE.sub("-", f"{mgr}-{wd_rel}-"),
@@ -64281,10 +64360,6 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             # *The run's own repository*). Best-effort: a hung cleanup.sh
             # must not block the no-work terminal state from being recorded
             # (same swallow-and-continue pattern as `_record_run_health`).
-            # No worker of the run is left to resume: their own
-            # directories go (DESIGN §6 *Each worker's own configuration
-            # and temporary directories*).
-            _remove_worker_dirs(st.run_dir)
             try:
                 await _run_script("cleanup.sh", "--run-id", st.run_id, st=st)
             except subprocess.TimeoutExpired as _cleanup_exc:
@@ -64325,10 +64400,6 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # Worktrees only: cleanup deletes no branch — the subtask branches stay
     # in the run's own repository and go with it (DESIGN §6 *The run's own
     # repository*), so nothing here can take the run branch with it.
-    # No worker of the run is left to resume: their own directories go
-    # (DESIGN §6 *Each worker's own configuration and temporary
-    # directories*).
-    _remove_worker_dirs(st.run_dir)
     try:
         await _run_script("cleanup.sh", "--run-id", st.run_id, st=st)
     except subprocess.TimeoutExpired as _cleanup_exc:
