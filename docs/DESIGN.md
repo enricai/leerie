@@ -2975,6 +2975,32 @@ its descendants (the orchestrator's last-resort kill after its grace):
 they are then the orchestrator's (its subreaper) or init's, and the
 container boundary (§6 *Worker subtree termination*) is what remains.
 
+### A command leerie runs starts with the signal dispositions it would have outside leerie
+
+*Found 2026-11-01 (review r20, L1); present since the shim was added.*
+
+**Root cause.** Every worker and every repository command is `exec`ed by a
+Python process — the Landlock shim's forked child and, under a cgroup, the
+spawn gate (*Enrollment holds the spawn*). CPython sets SIGPIPE and SIGXFSZ
+(and SIGXFZ where it exists) to `SIG_IGN` at startup, and `exec` keeps an
+ignored signal ignored. The shim's child restored only the signal mask, so
+every confined command started with both ignored. Measured: `yes | head`
+through the shim gave `PIPESTATUS` `1 0` and `yes: standard output: Broken
+pipe` on stderr; run directly, `141 0` and nothing — `SigIgn` in
+`/proc/self/status` was `0x1001000` (bits 13 and 25) against `0`. A
+non-interactive shell cannot un-ignore a signal it inherited ignored, so a
+repository's own script could not repair it either.
+
+**Invariant: a command leerie runs sees the process environment it would see
+outside leerie,** apart from what confinement itself grants and denies —
+leerie measures the code, not its sandbox. So every place leerie `exec`s a
+command from a Python process without `subprocess` (whose `restore_signals`
+does this) gives each signal Python ignored at startup its default action
+back first: the shim's child (`restore_default_signals`) and the spawn gate,
+both from the one list the shim names (`PYTHON_IGNORED_SIGNALS`). The
+orchestrator's own re-exec (`_sleep_then_reexec`) starts Python again, which
+ignores them anew, so it needs nothing.
+
 ### A repository per committing tree (I6)
 
 *Designed 2026-10-30. It is the prerequisite of I5's git grant (*A worker

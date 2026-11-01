@@ -224,6 +224,25 @@ def end_descendants(grace: float) -> None:
         time.sleep(0.02)
 
 
+# The signals CPython sets to SIG_IGN at startup (SIGXFZ exists on some
+# platforms only). `exec` keeps an ignored signal ignored, so a command a
+# Python process `exec`s without resetting them starts with them ignored:
+# `yes | head` then ends `yes` with EPIPE and "Broken pipe" (status 1), not
+# SIGPIPE (141), and a non-interactive shell cannot un-ignore them. The same
+# set `subprocess`'s `restore_signals` resets (DESIGN §6 *A command leerie
+# runs starts with the signal dispositions it would have outside leerie*).
+PYTHON_IGNORED_SIGNALS = ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
+
+
+def restore_default_signals() -> None:
+    """Give every signal Python ignored at startup its default action again.
+    Called in a forked child just before it `exec`s a command."""
+    for name in PYTHON_IGNORED_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, signal.SIG_DFL)
+
+
 def _die_of(sig: int) -> int:
     """Raise `sig` on the shim itself with its default action, so the caller
     sees the return code it would have seen without the shim (negative for
@@ -244,7 +263,8 @@ def run(cmd: list[str]) -> int:
     """Run `cmd` as a child of this subreaper, then end what it left.
     SIGCHLD and the stop signals are blocked and taken with `sigwaitinfo`,
     so none is lost between a check and the wait; the child gets the mask
-    it was started with."""
+    it was started with, and the dispositions it would have outside a
+    Python parent (`restore_default_signals`)."""
     libc = _libc()
     if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
         print(f"leerie: cannot make the shim a subreaper (errno "
@@ -257,6 +277,7 @@ def run(cmd: list[str]) -> int:
     child = os.fork()
     if child == 0:
         signal.pthread_sigmask(signal.SIG_SETMASK, old)
+        restore_default_signals()
         try:
             os.execvp(cmd[0], cmd)
         except OSError as e:

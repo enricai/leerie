@@ -207,7 +207,7 @@ def test_invoke_creates_the_cgroup_before_spawning_held(leerie, tmp_path,
     cmd = list(spawned["cmd"])
     # The worker argv rides behind the gate, unchanged.
     assert cmd[-3:] == ["claude", "-p", "x"]
-    assert cmd[cmd.index("-c") + 1] == leerie._SPAWN_GATE_SRC
+    assert cmd[cmd.index("-c") + 1] == leerie._spawn_gate_src()
     gate_fd = int(cmd[cmd.index("-c") + 2])
     assert spawned["pass_fds"] == (gate_fd,)
 

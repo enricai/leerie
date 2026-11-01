@@ -21833,19 +21833,37 @@ def _cgroup_peak(sid: str | None) -> tuple[int, int] | None:
 # session and every inherited fd), and nothing forked before it. Any other
 # byte, or EOF (the parent closed the pipe without releasing — it was
 # cancelled), exits without running the command. `-I -S`: no site, no user
-# environment, nothing imported that could fork first.
-_SPAWN_GATE_SRC = (
-    "import os,sys\n"
+# environment, nothing imported that could fork first. Before the `exec` it
+# gives back the default action of every signal Python ignored at startup,
+# the shim's `PYTHON_IGNORED_SIGNALS`, as the shim's own child does (DESIGN
+# §6 *A command leerie runs starts with the signal dispositions it would
+# have outside leerie*): an unconfined command behind the gate would
+# otherwise start with SIGPIPE ignored.
+_SPAWN_GATE_TEMPLATE = (
+    "import os,signal,sys\n"
     "fd=int(sys.argv[1])\n"
     "b=os.read(fd,1)\n"
     "os.close(fd)\n"
     "if b!=b'1':\n"
     "    os._exit(97)\n"
+    "for n in {signals!r}:\n"
+    "    if hasattr(signal,n):\n"
+    "        signal.signal(getattr(signal,n),signal.SIG_DFL)\n"
     "try:\n"
     "    os.execvp(sys.argv[2],sys.argv[2:])\n"
     "except OSError as e:\n"
     "    sys.stderr.write('leerie spawn gate: %s: %s\\n'%(sys.argv[2],e))\n"
     "    os._exit(127)\n")
+
+
+@functools.lru_cache(maxsize=1)
+def _spawn_gate_src() -> str:
+    """The spawn gate's program, resetting the shim's
+    `PYTHON_IGNORED_SIGNALS` (one spelling of the set)."""
+    return _SPAWN_GATE_TEMPLATE.format(
+        signals=tuple(_landlock().PYTHON_IGNORED_SIGNALS))
+
+
 # Exit status of a gate that was never released.
 _SPAWN_GATE_REFUSED_RC = 97
 
@@ -21855,7 +21873,7 @@ def _spawn_held_argv(cmd: list[str]) -> tuple[list[str], int, int]:
     pass `read_fd` to the child (`pass_fds`), close it in the parent once
     spawned, enroll the child's pid, then `_release_spawn_gate(write_fd)`."""
     read_fd, write_fd = os.pipe()
-    return ([sys.executable, "-I", "-S", "-c", _SPAWN_GATE_SRC,
+    return ([sys.executable, "-I", "-S", "-c", _spawn_gate_src(),
              str(read_fd), *cmd], read_fd, write_fd)
 
 
