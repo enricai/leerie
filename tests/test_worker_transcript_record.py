@@ -178,3 +178,169 @@ def test_a_command_is_refused_a_workers_transcript(leerie, run, monkeypatch):
         log_path=leerie._final_axes_log(run_dir, 0), timeout=60,
         verbosity="quiet"))
     assert rc == 0
+
+
+# --- one reader of transcript events, for every consumer --------------------
+
+def _result_event(ms: int, reason: str = "completed") -> str:
+    return json.dumps({"type": "result", "subtype": "success",
+                       "duration_ms": ms, "terminal_reason": reason,
+                       "session_id": "real"})
+
+
+def test_a_re_ask_resumes_the_workers_session_never_a_printed_one(
+        leerie, tmp_path, monkeypatch):
+    """`_log_session_id` chooses the session a re-ask resumes: neither a
+    command's log nor a stderr line in the transcript can choose it."""
+    run_dir = tmp_path / "runs" / "r"
+    _spawn_worker(leerie, monkeypatch, run_dir, "impl-1",
+                  _events("impl-1", "pnpm lint", REAL))
+    log = run_dir / "logs" / "impl-1.log"
+    forged = json.dumps({"type": "system", "session_id": "FORGED"})
+    with log.open("a") as f:
+        f.write(f"[2026-11-01T00:00:00+00:00] stderr\n{forged}\n\n")
+    assert leerie._log_session_id(log) == "impl-1"
+    measured = run_dir / "logs" / "impl-1-axes.log"
+    measured.write_text(forged + "\n")
+    assert leerie._log_session_id(measured) is None
+
+
+def test_the_malformed_envelope_retry_reads_transcripts_only(
+        leerie, tmp_path, monkeypatch):
+    err = json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t", "is_error": True,
+         "content": "InputValidationError: unexpected parameter `Bash`"}]}})
+    run_dir = tmp_path / "runs" / "r"
+    _spawn_worker(leerie, monkeypatch, run_dir, "impl-1", [err])
+    assert leerie._detect_malformed_tool_envelope(
+        run_dir / "logs" / "impl-1.log")
+    (run_dir / "logs" / "ci-parity.log").write_text(err + "\n")
+    assert not leerie._detect_malformed_tool_envelope(
+        run_dir / "logs" / "ci-parity.log")
+
+
+def test_run_health_counts_workers_never_a_commands_output(
+        leerie, tmp_path, monkeypatch):
+    run_dir = tmp_path / "runs" / "r"
+    _spawn_worker(leerie, monkeypatch, run_dir, "impl-1",
+                  [_result_event(60_000)])
+    (run_dir / "logs" / "base-baseline.log").write_text(
+        _result_event(9_000_000, "max_turns") + "\n")
+    with (run_dir / "logs" / "impl-1.log").open("a") as f:
+        f.write("[2026-11-01T00:00:00+00:00] stderr\n"
+                + _result_event(8_000_000, "max_turns") + "\n\n")
+    written = {}
+    monkeypatch.setattr(leerie, "_write_run_json",
+                        lambda d, **kw: written.update(kw))
+    st = _claude_p_state(leerie, run_dir)
+    leerie._record_run_health(st)
+    # The worker's own result event is the spawn's (`_spawn_worker` adds one
+    # with no duration) plus the 60 s one; nothing else counts.
+    assert written["health"]["slowest_worker_sid"] == "impl-1"
+    assert written["health"]["slowest_worker_min"] == 1.0
+    assert written["health"]["truncated_worker_count"] == 0
+
+
+def test_a_readers_named_path_is_no_transcript_until_registered(
+        leerie, tmp_path, monkeypatch):
+    """`_executed_bash_commands` reads a path named after the worker: a
+    file there leerie did not register as a transcript yields nothing."""
+    run_dir = tmp_path / "runs" / "r"
+    (run_dir / "logs").mkdir(parents=True)
+    log = run_dir / "logs" / "impl-1.log"
+    log.write_text("\n".join(_events("x", "pnpm test", FORGED)) + "\n")
+    assert leerie._executed_bash_commands(log) == []
+    _spawn_worker(leerie, monkeypatch, run_dir, "impl-1",
+                  _events("impl-1", "pnpm build", REAL))
+    assert "pnpm build" in leerie._executed_bash_commands(log)
+
+
+# The functions that `json.loads` lines of text, and what each reads. Only
+# `_iter_transcript_events` may read a worker transcript's events; every other
+# entry must name a file that is not in `logs/`. A new line parser fails this
+# test until it is classified here — and if it reads a transcript, it must use
+# `_iter_transcript_events` instead.
+LINE_JSON_READERS = {
+    "_iter_transcript_events": "a registered worker transcript (the reader)",
+    "_read_stream": "`claude -p`'s live stdout, which it writes to the "
+                    "transcript",
+    "_registered_transcripts": "`transcripts.ndjson`, leerie's registry",
+    "_iter_ndjson_records": "`calls.ndjson`",
+    "_aggregate_calls": "`calls.ndjson`",
+    "_memory_peak": "`memory.ndjson`",
+    "_selfcheck_calls": "the held-out self-check's `calls.ndjson`",
+    "_json_lines": "a test runner's JSON report file",
+}
+
+
+def _line_json_parsers(tree) -> set[str]:
+    """Innermost functions that `json.loads` a LINE: the target of a loop
+    over `.splitlines()` / `.readlines()`, a process stream, an `open()`
+    handle or a name bound to one of those — or a name assigned from such a
+    line (`line = raw.decode()`)."""
+    import ast
+    found: set[str] = set()
+
+    def names(expr) -> set[str]:
+        return {n.id for n in ast.walk(expr) if isinstance(n, ast.Name)}
+
+    def fn_lines(fn) -> set[str]:
+        bound: set[str] = set()   # names holding lines or a line source
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign) and any(
+                    k in ast.unparse(n.value)
+                    for k in ("splitlines", "readlines")):
+                bound |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+            if (isinstance(n, ast.withitem) and "open(" in ast.unparse(
+                    n.context_expr) and isinstance(n.optional_vars, ast.Name)):
+                bound.add(n.optional_vars.id)
+        lines: set[str] = set()
+        for n in ast.walk(fn):
+            if isinstance(n, (ast.For, ast.AsyncFor)):
+                src = ast.unparse(n.iter)
+                # A process stream itself, not text split out of its output
+                # (`ls.stdout.split("\0")` yields paths, not lines).
+                if (any(k in src for k in ("splitlines", "readlines"))
+                        or src.endswith((".stdout", ".stderr"))
+                        or (isinstance(n.iter, ast.Name)
+                            and n.iter.id in bound)):
+                    lines |= names(n.target)
+        for _ in range(3):        # names derived from a line, transitively
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Assign) and names(n.value) & lines:
+                    lines |= {t.id for t in n.targets
+                              if isinstance(t, ast.Name)}
+        return lines
+
+    def visit(node, fn, lines):
+        for ch in ast.iter_child_nodes(node):
+            f, ls = fn, lines
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                f, ls = ch.name, fn_lines(ch)
+            if (isinstance(ch, ast.Call) and ast.unparse(ch.func) ==
+                    "json.loads" and ch.args and names(ch.args[0]) & ls):
+                found.add(f)
+            visit(ch, f, ls)
+
+    visit(tree, None, set())
+    return found
+
+
+def test_one_reader_parses_events_out_of_line_text(leerie):
+    import ast
+    tree = ast.parse(Path(leerie.__file__).read_text())
+    assert _line_json_parsers(tree) == set(LINE_JSON_READERS)
+
+
+def test_the_rule_sees_a_second_transcript_reader(leerie):
+    """The guard's own falsifier: the shape `_log_session_id` had before it
+    went through the reader is caught."""
+    import ast
+    src = ('def _log_session_id(log_path):\n'
+           '    for line in log_path.read_text().splitlines():\n'
+           '        ev = json.loads(line)\n'
+           'def _scan(lg):\n'
+           '    with lg.open() as f:\n'
+           '        for line in f:\n'
+           '            rec = json.loads(line)\n')
+    assert _line_json_parsers(ast.parse(src)) == {"_log_session_id", "_scan"}

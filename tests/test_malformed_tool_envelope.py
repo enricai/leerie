@@ -12,6 +12,8 @@ import json
 
 import pytest
 
+from tests.conftest import register_worker_transcript
+
 
 def _run(coro):
     loop = asyncio.new_event_loop()
@@ -43,6 +45,7 @@ def test_detects_malformed_envelope_text(leerie, tmp_path):
         _user_event(
             "InputValidationError: An unexpected parameter `Bash` was "
             "provided") + "\n")
+    register_worker_transcript(log_path)
     assert leerie._detect_malformed_tool_envelope(log_path) is True
 
 
@@ -54,6 +57,7 @@ def test_benign_tool_fail_does_not_trigger(leerie, tmp_path):
     log_path.write_text(
         _user_event("ls: cannot access 'maybe/missing/path': No such "
                      "file or directory") + "\n")
+    register_worker_transcript(log_path)
     assert leerie._detect_malformed_tool_envelope(log_path) is False
 
 
@@ -70,6 +74,7 @@ def test_successful_tool_result_is_not_scanned(leerie, tmp_path):
     log_path.write_text(
         _user_event("found: 'An unexpected parameter' in docs/CHANGELOG.md",
                      is_error=False) + "\n")
+    register_worker_transcript(log_path)
     assert leerie._detect_malformed_tool_envelope(log_path) is False
 
 
@@ -79,6 +84,7 @@ def test_malformed_lines_are_skipped_not_fatal(leerie, tmp_path):
         "not json at all\n"
         + _user_event(
             "An unexpected parameter `Edit` was provided") + "\n")
+    register_worker_transcript(log_path)
     assert leerie._detect_malformed_tool_envelope(log_path) is True
 
 
@@ -91,6 +97,7 @@ def test_non_user_event_is_skipped(leerie, tmp_path):
             {"type": "tool_result", "is_error": True,
              "content": "An unexpected parameter `Bash` was provided"},
         ]}}) + "\n")
+    register_worker_transcript(log_path)
     assert leerie._detect_malformed_tool_envelope(log_path) is False
 
 
@@ -100,6 +107,7 @@ def test_non_dict_top_level_event_is_skipped(leerie, tmp_path):
     log_path = tmp_path / "worker.log"
     log_path.write_text('["not", "a", "dict"]\n' + _user_event(
         "An unexpected parameter `Bash` was provided") + "\n")
+    register_worker_transcript(log_path)
     assert leerie._detect_malformed_tool_envelope(log_path) is True
 
 
@@ -115,6 +123,7 @@ def test_non_dict_content_block_is_skipped(leerie, tmp_path):
              "content": "An unexpected parameter `Bash` was provided"},
         ]},
     }) + "\n")
+    register_worker_transcript(log_path)
     assert leerie._detect_malformed_tool_envelope(log_path) is True
 
 
@@ -134,11 +143,13 @@ def test_checked_loop_retries_once_when_envelope_detected(leerie, tmp_path):
             log_path.write_text(
                 _user_event(
                     "An unexpected parameter `Bash` was provided") + "\n")
+            register_worker_transcript(log_path)
         else:
             # Second round recovers: no further malformed envelope, and
             # the loop must not force a third round.
             log_path.write_text(_user_event("ls: fine", is_error=False)
                                  + "\n")
+            register_worker_transcript(log_path)
         return {"status": "ready"}
 
     async def on_feedback(fb):
@@ -169,6 +180,7 @@ def test_checked_loop_no_retry_when_envelope_absent(leerie, tmp_path):
     log_path.write_text(
         _user_event("ls: cannot access 'x': No such file or directory")
         + "\n")
+    register_worker_transcript(log_path)
     calls = []
 
     async def invoke():

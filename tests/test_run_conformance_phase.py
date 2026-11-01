@@ -47,6 +47,7 @@ def _failing_axis(axis="build", command="make", summary="oops"):
 
 def _write_log(path, events):
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    register_worker_transcript(path)
 
 
 def _bash_event(tid, cmd):
@@ -60,6 +61,8 @@ def _result_event(tid, text):
         {"type": "tool_result", "tool_use_id": tid, "content": text}]}}
 
 import pytest
+
+from tests.conftest import register_worker_transcript
 
 
 # --- shared fixtures -------------------------------------------------------

@@ -18,6 +18,8 @@ import os
 import stat
 import types
 
+from tests.conftest import register_worker_transcript
+
 
 def _st(tmp_path, conformance=None):
     run_dir = tmp_path / "run"
@@ -224,6 +226,7 @@ def _write_result_log(logs_dir, sid, duration_ms, terminal="completed"):
     rec = {"type": "result", "subtype": "success",
            "duration_ms": duration_ms, "terminal_reason": terminal}
     (logs_dir / f"{sid}.log").write_text(json.dumps(rec) + "\n")
+    register_worker_transcript(logs_dir / f"{sid}.log")
 
 
 def test_record_run_health_picks_slowest_and_counts_truncation(

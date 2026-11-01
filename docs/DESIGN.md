@@ -8946,9 +8946,10 @@ tree*).
 command's output.** Leerie's record of what a worker executed — the
 worker half of this record, the dependency capture's install-command
 hint (§6½), the settle-time declared-command check (§9), the conformer's
-axis-run warnings, the falsifier's probe activity — is the structured
-`tool_use` events of that worker's own `claude -p` session, keyed by the
-worker it was spawned as. A build, a test run, CI parity or any other
+axis-run warnings, the falsifier's probe activity, the malformed-envelope
+retry, the session a re-ask resumes, the run-health telemetry — is the
+structured events of that worker's own `claude -p` session, keyed by the
+worker it was spawned as, and one reader yields them to every consumer. A build, a test run, CI parity or any other
 measurement prints whatever the code under measurement prints, and a line
 it prints in the shape of a tool call is not one. Measured: the record
 took every `logs/*.log`, which also holds leerie's runs of the
@@ -8963,7 +8964,10 @@ transcripts takes only registered ones; no command's output is written
 to a transcript (a measurement refuses a registered transcript's path);
 and within a transcript only the stream's own events count — a line of
 the CLI's stderr, which leerie writes into the same file under its own
-header, is never parsed as an event.
+header, is never parsed as an event. A second reader was the gap: with
+the record closed, the re-ask's session choice and the health scan still
+parsed `logs/` text on their own, so a printed `session_id` could steer
+which session a re-ask resumed.
 
 That rule leaves an item whose only evidence is a command the
 orchestrator never runs itself — the audit's repro, `npm run e2e`,

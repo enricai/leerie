@@ -22581,6 +22581,43 @@ def _is_worker_transcript(log_path: Path) -> bool:
     return log_path.name in _registered_transcripts(log_path.parent)
 
 
+# The header `_invoke` writes above a transcript line that is not a stream
+# event: the CLI's stderr, and a stdout line that is not JSON (a mechanical
+# string leerie itself writes).
+_LOG_TEXT_HEADER_RE = re.compile(r"^\[[^\]\n]*\] (?:stderr|non-json-line)$")
+
+
+def _iter_transcript_events(log_path: Path) -> Iterator[dict]:
+    """The stream-json events of a worker's `claude -p` session — the ONE
+    reader of a transcript's events, which every consumer of them uses
+    (DESIGN §8 *What a worker ran is read from its own transcript*).
+
+    Nothing unless `log_path` is a registered transcript
+    (`_is_worker_transcript`): every other file in `logs/` is leerie's run
+    of a repository command, whose output the code under measurement
+    prints. Within a transcript, a line under a `[ts] stderr` or
+    `[ts] non-json-line` header (`_LOG_TEXT_HEADER_RE`) is text `_invoke`
+    wrote beside the stream, never an event. Malformed lines are skipped:
+    the format is the CLI's, and one bad line must not hide the rest."""
+    if not _is_worker_transcript(log_path):
+        return
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return
+    prev = ""
+    for line in lines:
+        after, prev = prev, line
+        if not line.startswith("{") or _LOG_TEXT_HEADER_RE.match(after):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
 def _notes_dir(leerie_dir: str | Path, sid: str) -> Path:
     return Path(leerie_dir) / NOTES_DIRNAME / sid
 
@@ -41254,11 +41291,6 @@ _BG_ID_RE = re.compile(r"Command running in background with ID:\s*(\w+)")
 _LOG_TOOL_KINDS = ("Bash", "BashOutput", "KillBash", "Read")
 
 
-# The header `_invoke` writes above a transcript line that is not a stream
-# event (a mechanical string leerie itself writes).
-_LOG_TEXT_HEADER_RE = re.compile(r"^\[[^\]\n]*\] (?:stderr|non-json-line)$")
-
-
 def _iter_log_tool_use(
         log_path: Path,
         kinds: tuple[str, ...] = _LOG_TOOL_KINDS,
@@ -41273,30 +41305,15 @@ def _iter_log_tool_use(
     JSON event that doesn't carry the expected message/content shape,
     is skipped silently. The JSONL log format is produced by the Claude
     Code SDK, not by leerie itself; a parsing failure on a single line
-    must not break the advisory warning emission for the whole round."""
-    if not log_path.is_file():
-        return
-    lines = log_path.read_text().splitlines()
+    must not break the advisory warning emission for the whole round.
+    Events come from `_iter_transcript_events` alone: an unregistered file
+    yields nothing."""
     # Two passes keep the API simple — log files are at most a few MB.
     # First collects tool_use blocks (id, kind, input) in order; second
     # keys tool_result texts by tool_use_id and yields the joined pairs.
     uses: list[tuple[str, str, dict]] = []  # (tool_use_id, name, input)
     results: dict[str, str] = {}
-    prev = ""
-    for line in lines:
-        after, prev = prev, line
-        if not line.startswith("{"):
-            continue
-        # `_invoke` writes the CLI's stderr into the same file, one line under
-        # each `[ts] stderr` header (and a non-JSON stdout line under
-        # `[ts] non-json-line`): such a line is text, never a stream event
-        # (DESIGN §8 *What a worker ran is read from its own transcript*).
-        if _LOG_TEXT_HEADER_RE.match(after):
-            continue
-        try:
-            body = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for body in _iter_transcript_events(log_path):
         msg = body.get("message") or {}
         # A non-dict `message` value (e.g. a top-level event with
         # `{"message": "string"}`) would crash `msg.get("content")` —
@@ -41478,15 +41495,9 @@ def _detect_malformed_tool_envelope(log_path: Path) -> bool:
     isn't valid JSON, or any event that doesn't carry the expected
     message/content shape, is skipped silently rather than raising — a
     single malformed log line must not break detection for the whole
-    worker."""
-    if not log_path.is_file():
-        return False
-    for line in log_path.read_text().splitlines():
-        try:
-            event = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(event, dict) or event.get("type") != "user":
+    worker. Events from `_iter_transcript_events` alone."""
+    for event in _iter_transcript_events(log_path):
+        if event.get("type") != "user":
             continue
         for b in (event.get("message") or {}).get("content") or []:
             if not isinstance(b, dict):
@@ -54678,20 +54689,12 @@ def _falsifier_case_id(ids: Iterable[str], case_name: str) -> str | None:
 
 def _log_session_id(log_path: Path) -> str | None:
     """The CLI session a worker's stream log records (the last
-    `session_id` field of its JSON events) — what `--resume` takes."""
+    `session_id` field of its JSON events) — what `--resume` takes. From
+    `_iter_transcript_events` alone: a printed line must not choose the
+    session a re-ask resumes."""
     sid = None
-    try:
-        lines = log_path.read_text(errors="replace").splitlines()
-    except OSError:
-        return None
-    for line in lines:
-        if not line.startswith("{"):
-            continue
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(ev, dict) and isinstance(ev.get("session_id"), str):
+    for ev in _iter_transcript_events(log_path):
+        if isinstance(ev.get("session_id"), str):
             sid = ev["session_id"]
     return sid
 
@@ -64561,8 +64564,8 @@ def _record_run_health(st: "State") -> None:
     per-worker JSONL logs — no new instrumentation:
 
       - `slowest_worker_sid` / `slowest_worker_min`: the worker whose
-        summed result `duration_ms` was largest, keyed by log basename
-        (the sid). `calls.ndjson` carries `latency_ms` but no sid, so the
+        summed result `duration_ms` was largest, keyed by the sid its
+        transcript was registered as (`_worker_transcripts`). `calls.ndjson` carries `latency_ms` but no sid, so the
         per-worker log is the authoritative source for both.
       - `truncated_worker_count`: worker logs that ended a result with
         `terminal_reason":"max_turns"` — a worker cut off at the turn cap
@@ -64578,34 +64581,24 @@ def _record_run_health(st: "State") -> None:
     best_ms = 0.0
     truncated = 0
     # The held-out side's transcripts too: telemetry, read by no worker.
-    for lg in sorted([*logs_dir.glob("*.log"),
-                      *_held_out_logs(st.run_dir).glob("*.log")]):
+    # Registered transcripts only, keyed by the worker they were spawned as
+    # (DESIGN §8 *What a worker ran is read from its own transcript*).
+    for sid, lg in sorted([*_worker_transcripts(logs_dir),
+                           *_worker_transcripts(_held_out_logs(st.run_dir))],
+                          key=lambda x: str(x[1])):
         total_ms = 0.0
         hit_cap = False
-        try:
-            with lg.open() as f:
-                for line in f:
-                    # Cheap pre-filter: skip lines that can't be a result
-                    # record. Tolerant of both compact (`"type":"result"`,
-                    # the live claude -p shape) and spaced JSON.
-                    if '"result"' not in line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    if rec.get("type") != "result":
-                        continue
-                    total_ms += rec.get("duration_ms") or 0
-                    if rec.get("terminal_reason") == "max_turns":
-                        hit_cap = True
-        except OSError:
-            continue
+        for rec in _iter_transcript_events(lg):
+            if rec.get("type") != "result":
+                continue
+            total_ms += rec.get("duration_ms") or 0
+            if rec.get("terminal_reason") == "max_turns":
+                hit_cap = True
         if hit_cap:
             truncated += 1
         if total_ms > best_ms:
             best_ms = total_ms
-            best_sid = lg.stem
+            best_sid = sid
     health = {
         "slowest_worker_sid": best_sid,
         "slowest_worker_min": round(best_ms / 60000.0, 1) if best_ms else 0.0,

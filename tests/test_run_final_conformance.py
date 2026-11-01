@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import relocate_into_run_repo
+from tests.conftest import register_worker_transcript, relocate_into_run_repo
 
 
 @pytest.fixture(autouse=True)
@@ -417,6 +417,7 @@ def _result_event(tid, text):
 
 def _write_log(path, events):
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    register_worker_transcript(path)
 
 
 def _stub_measure_axes(leerie_mod, seq):

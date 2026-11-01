@@ -501,6 +501,7 @@ def test_case_id_matching(leerie):
 def _write_log(path: Path, events: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    register_worker_transcript(path)
 
 
 def _tool(name: str, inp: dict, session: str = "sess-1") -> dict:

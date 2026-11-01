@@ -26,7 +26,7 @@ import json
 
 import pytest
 
-from tests.conftest import _run
+from tests.conftest import _run, register_worker_transcript
 from tests.test_oom_naming import env  # noqa: F401  (pytest fixture)
 
 
@@ -207,6 +207,7 @@ def _write_worker_log(path, commands):
          "input": {"file_path": "x"}}]}}))
     lines.append("not json {")
     path.write_text("\n".join(lines) + "\n")
+    register_worker_transcript(path)
 
 
 def test_extracts_bash_commands_in_order(leerie, tmp_path):

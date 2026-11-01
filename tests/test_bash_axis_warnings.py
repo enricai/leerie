@@ -21,6 +21,8 @@ import re
 
 import pytest
 
+from tests.conftest import register_worker_transcript
+
 
 def _write_log(path, events):
     """Write `events` as one-per-line JSONL. Each `event` is a dict that
@@ -28,6 +30,7 @@ def _write_log(path, events):
     helpers ignore the timestamp prefix lines the orchestrator writes
     above each body, so the test fixtures can be body-only."""
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    register_worker_transcript(path)
 
 
 def _bash_event(tid, cmd, timeout=None):
@@ -177,6 +180,7 @@ def test_count_tolerates_malformed_lines(leerie, tmp_path):
         + json.dumps({"type": "system", "no": "message"}) + "\n"
         + json.dumps(_result_event("a", "ok")) + "\n"
     )
+    register_worker_transcript(log)
     assert leerie._count_bash_axis_invocations(
         log, leerie._BLT_AXIS_RES["test"]) == 1
 
@@ -210,6 +214,7 @@ def test_iter_log_tool_use_skips_non_dict_message(leerie, tmp_path):
     log.write_text(
         json.dumps({"message": "not a dict"}) + "\n"
         + json.dumps(_bash_event("a", "npm test")) + "\n")
+    register_worker_transcript(log)
     assert leerie._count_bash_axis_invocations(
         log, leerie._BLT_AXIS_RES["test"]) == 1
 
@@ -221,6 +226,7 @@ def test_iter_log_tool_use_skips_non_list_content(leerie, tmp_path):
     log.write_text(
         json.dumps({"message": {"content": "not a list"}}) + "\n"
         + json.dumps(_bash_event("a", "npm test")) + "\n")
+    register_worker_transcript(log)
     assert leerie._count_bash_axis_invocations(
         log, leerie._BLT_AXIS_RES["test"]) == 1
 
@@ -234,6 +240,7 @@ def test_iter_log_tool_use_skips_non_dict_content_block(leerie, tmp_path):
         {"type": "tool_use", "id": "a", "name": "Bash",
          "input": {"command": "npm test"}},
     ]}}) + "\n")
+    register_worker_transcript(log)
     assert leerie._count_bash_axis_invocations(
         log, leerie._BLT_AXIS_RES["test"]) == 1
 
@@ -265,6 +272,7 @@ def test_iter_log_tool_use_joins_list_shaped_tool_result_content(leerie, tmp_pat
             ],
         }]}}) + "\n"
         + json.dumps(_bash_event("b", "npm test")) + "\n")
+    register_worker_transcript(log)
     orphans = leerie._count_orphaned_bg_axis(log, leerie._BLT_AXIS_RES["test"])
     assert orphans == ["b44wb370b"]
 
@@ -531,6 +539,7 @@ def test_tolerates_non_dict_message_field(leerie, tmp_path):
         + json.dumps(_bash_event("a", "npm test")) + "\n"
         + json.dumps(_result_event("a", "ok")) + "\n"
     )
+    register_worker_transcript(log)
     assert leerie._count_bash_axis_invocations(
         log, leerie._BLT_AXIS_RES["test"]) == 1
 
