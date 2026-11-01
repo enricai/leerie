@@ -2609,6 +2609,83 @@ confined process has its own `/tmp`, `/dev/shm` and IPC*), which closes
 the metadata writes. Names read by path walk outside a grant stay
 readable; they are names, not contents.
 
+### A worker's commands cannot reach its CLI
+
+*Designed 2026-11-01 (review round 21, isolation R4).*
+
+**Root cause.** What a worker ran is read from its own transcript (§8),
+and the transcript is the CLI's stdout: a pipe to the orchestrator. The
+CLI and every process it starts shared one uid and one Landlock domain, and
+`/proc` is readable to every grant, so any command the worker runs — a
+test file, a build script, code under measurement — could open
+`/proc/<cli pid>/fd/1` (a ptrace-mode read: allowed within one domain, and
+Yama does not restrict reads) and write stream-json into the pipe. The
+round-12 and round-14 fixes attribute events by *file* (the registry); the
+stream itself was reachable by the code the worker runs. Measured (review
+round 21; again 2026-11-01 with the real CLI 2.1.312 in both local
+runtimes, isolated): a Bash-tool command wrote a forged `tool_use` into
+the stream, and it reached the transcript. The same route injects a
+`result` event or a `session_id`, which steers the re-ask's resume.
+
+**Invariant.** Nothing the worker's CLI starts on the worker's behalf runs
+in the CLI's own Landlock domain: each command and hook runs in a domain
+nested inside it, so no process the worker's code can be may open, attach
+to or read the memory of the CLI, and the CLI's stream carries only the
+CLI's events.
+
+**Mechanism.** The CLI runs every Bash-tool command and every hook as
+`$CLAUDE_CODE_SHELL_PREFIX <command>` (measured, CLI 2.1.312: the prefix is
+the CLI's direct child for a Bash command, and run under `/bin/sh -c` for a
+hook; it gets the command as one argument). Every confined worker's CLI is
+given `scripts/worker-shell.py` there (`_invoke`; and in its settings,
+below). It enters a Landlock domain nested in the worker's
+(`landlock_exec.nest`) and `exec`s `bash -c <command>`. The nested ruleset
+handles every right the worker's does and allows all of it beneath `/`, so
+the command reaches exactly what the worker's grants allow — an access
+passes only when every layer of the domain allows it. But Landlock refuses
+a process ptrace-class access to any process outside its domain and its
+nested ones: `/proc/<cli>/fd`, `/proc/<cli>/mem`, `ptrace`, `pidfd_getfd`.
+No scope is set in the nested domain, so a command may still signal, or
+connect to an abstract socket of, what an earlier command of the same
+worker left running. It fails closed: when the domain cannot be made, the
+command does not run (126). The shell is named absolutely with `-I -S`: it
+runs in the CLI's domain until it nests, so nothing a worker can write (a
+`python3` earlier on `PATH`, a `site` directory) runs there. Measured
+2026-11-01, real CLI, rootless and rootful, isolated: without the prefix a
+command opened the CLI's `fd/1` and a forged line reached the stream; with
+it both were refused, and `git`, `node` and `pnpm` ran unchanged; about
+40 ms more per command on the host.
+
+*The CLI reads no settings file.* A settings file runs code in the CLI's
+own domain: `apiKeyHelper` runs under `/bin/sh -c` without the prefix
+(measured), and a settings `env` can unset the prefix. Every file the CLI
+would read is one a worker can write — its own configuration directory's
+`settings.json`, and its tree's `.claude/settings.json` and
+`.claude/settings.local.json`, which reach every later worker in that tree
+(the gap §6 *Each worker's own configuration and temporary directories*
+left to the write grant). So a confined worker's CLI gets
+`--setting-sources ""` and its whole settings in `--settings`
+(`_confined_cli_settings`): the operator's settings from the run's
+read-only configuration template, the repository's project and local
+settings from the user's checkout (which no worker writes), then leerie's
+own — the PreToolUse hook and the shell prefix, which nothing below them
+overrides (settings given on the command line win over every file scope,
+measured). Merged as the CLI merges scopes: objects key by key, arrays
+concatenated. The Fly recovery integrator gets the same from
+`worker-guard.py`.
+
+**Residuals.** The CLI's own spawns that are not commands — its `git`
+calls (it passes `core.fsmonitor=` and `core.hooksPath=/dev/null` itself,
+read from its bundle), `rg` for Grep and Glob — run in its domain and run
+no code a worker chose through settings, which it no longer reads. A
+worker's configuration directory is writable whole, so a worker can replace
+its links to the template's `plugins/` with its own; a plugin is loaded only
+when the operator's settings enable it, and then at the next start of that
+configuration — the worker's own re-ask. Closing that needs the
+configuration's code-bearing directories out of the worker's reach, which
+this design does not do. Below Landlock ABI 6 a nested command can still
+signal the CLI (as any process of the worker could): a stop, not a forgery.
+
 ### Leerie's runs of the repository's commands are confined too (I5, measurements)
 
 *Designed 2026-10-31 (review round 18, H1).*
@@ -3431,6 +3508,75 @@ the preflight smoke test's empty working directory, which must lie outside
 every repository (the run directory is inside one when the state root is
 `<repo>/.leerie`); it is made before any measurement runs
 (`_system_temp_dir`).
+
+### No service of leerie's is reachable by a path (I3, I5)
+
+*Designed 2026-11-01 (review round 21, isolation R3).*
+
+**Root cause.** The sandbox's "world that dies with it" is built from
+namespaces, and the enumeration of what it shares — network, IPC, mounts,
+keyrings — left out the services the container already runs. One of them,
+the cgroup broker (§6 *Memory containment*), ran as the container's root
+outside every namespace the shim makes and listened on
+`/run/leerie-cgroup.sock`, mode 0666. A pathname socket is reached through
+the filesystem: the sandbox's own network namespace does not stop it, the
+read-only remount of `/run` does not (a connect is not a write), and
+Landlock does not mediate connecting to one (its ABI 6 scopes cover
+abstract sockets only). Measured (review round 21, rootless and rootful):
+the evaluated code sent `create <the set's text, hex> 0 0`, the cgroup
+`leerie-w-<hex>` outlived the sandbox, and a confined implementer listed
+`/sys/fs/cgroup` and decoded it. `stat` and `peak` of named cgroups and the
+limits of `create` were further encodings; the same socket let any worker
+`destroy` another's cgroup (`cgroup.kill`) or `enroll` any pid. The
+broker's docstring accepted that only because "there is no adversarial
+process model inside" the container, which I3 and I5 replaced.
+
+**Invariant.** No control service of leerie's is reachable by a path from
+any confined process: a service leerie runs for itself is reached only
+through a descriptor the orchestrator holds, which no worker or command
+inherits. What cannot be named cannot be connected to, whatever the
+namespaces, mounts or Landlock rules of the process that tries.
+
+**Mechanism.** The broker serves one end of a `socketpair(AF_UNIX,
+SOCK_SEQPACKET)` (`scripts/cgroup-broker.py`'s `spawn`), and the
+orchestrator holds the other; no socket is bound to a name. A request is
+one message carrying the client's reply socket (`SCM_RIGHTS`), so
+concurrent requests never share a reply and one that times out leaves
+nothing behind. The orchestrator takes its end before it starts anything
+(`_adopt_cgroup_broker`, first in `main`): non-inheritable, and the variable
+that named it (`LEERIE_CGROUP_BROKER_FD`) removed, so no worker, command or
+shim holds it. The rate-limit auto-resume, which `exec`s the orchestrator
+again, hands it to the new image the same way (`_sleep_then_reexec`). When
+every holder of the orchestrator's end has closed it, the broker stops.
+
+The descriptor reaches the orchestrator through each runtime's privilege
+drop (measured 2026-11-01 for the local two):
+
+- *Local rootless.* PID 1 (the rootlesskit-mapped host UID, the slice's
+  delegate) execs `cgroup-broker.py --spawn -- unshare --user … python3
+  leerie.py`: the broker is forked with one end, and `unshare` (which
+  `exec`s, no fork) passes the other to the orchestrator.
+- *Local rootful.* The same, with `runuser -u leerie --`, which keeps the
+  descriptor open across its fork and `exec` (measured). Its waiting parent
+  holds a copy as root, out of every confined process's reach.
+- *Fly and EC2.* PID 1 starts no broker: the orchestrator is launched
+  out-of-band by the launch wrapper, which runs as root, so the wrapper
+  starts the broker (`spawn`) and hands its end to the orchestrator in
+  `Popen(user="leerie", pass_fds=…)` (`scripts/remote/seed-common.sh`).
+
+A confined process cannot take the descriptor from the broker or the
+orchestrator either: `/proc/<pid>/fd` of either is a ptrace-mode access
+Landlock refuses to a process in a domain to one outside it, and a socket
+cannot be reopened through `/proc` at all (ENXIO).
+
+**Other services.** The broker was the one pathname socket of leerie's in
+the container. The `ssh-agent` socket the launcher makes for Fly is on the
+user's host. The strict-output proxy is a service for workers on purpose
+(it carries their API traffic) and listens on loopback TCP, which the
+held-out sandbox's own network namespace does not reach. A service leerie
+offers to confined processes on purpose follows the same rule toward the
+sandbox: reached through something carried into the process that may use
+it, never a path the sandbox can name.
 
 ### No database server leerie starts is ever unconfined
 
@@ -6202,9 +6348,10 @@ omits `USER leerie`); *before the privilege drop* it launches the broker
 at the identity that owns (or was delegated) the slice — real root in
 the rootful case (Colima, Fly), the rootlesskit-mapped host UID in the
 rootless case (which owns the systemd-delegated user slice; see
-*Rootless exception* below). The broker listens on a Unix socket at
-`/run/leerie-cgroup.sock` (world-connectable; every request is
-validated). It performs `create` / `enroll` / `destroy` at that owning
+*Rootless exception* below). The orchestrator reaches it only through a
+descriptor it inherits — one end of a socket pair, never a pathname (§6
+*No service of leerie's is reachable by a path*), and every request is
+validated. It performs `create` / `enroll` / `destroy` at that owning
 identity — the only identities where enrollment and limit-setting work
 — and detects the cgroup hierarchy: **v2** (Colima) uses the unified
 `leerie.slice/leerie-w-<sid>/{pids,memory}.max`; **v1/hybrid** (observed
@@ -6214,11 +6361,12 @@ the split hierarchies (`/sys/fs/cgroup/pids/leerie.slice/...`,
 templates is the run-scoped composed sid (`<run-id-prefix>-<worker-sid>`,
 above); the broker treats it as an opaque validated string. The
 entrypoint then drops to the leerie user via `runuser -u leerie --`
-before exec'ing the orchestrator (local nerdctl) or sleeping as PID 1
-(Fly, where the orchestrator is started out-of-band by the launcher's
-ssh-console wrapper that drops via `Popen(user="leerie")`). The
-orchestrator's `_cgroup_*` helpers are thin socket clients of the
-broker; it never writes cgroupfs directly. (Rootless containerd has no
+before exec'ing the orchestrator (local nerdctl; the broker is started by
+that same exec), or sleeps as PID 1 (Fly, where the orchestrator is started
+out-of-band by the launcher's ssh-console wrapper, which starts the broker
+and drops via `Popen(user="leerie")`). The
+orchestrator's `_cgroup_*` helpers are thin clients of the
+broker over that descriptor; it never writes cgroupfs directly. (Rootless containerd has no
 real root to drop from or broker as — see *Rootless exception* below.)
 
 **Fail-closed gate.** Because a silently-uncapped run is what caused the
@@ -9300,7 +9448,11 @@ transcripts takes only registered ones; no command's output is written
 to a transcript (a measurement refuses a registered transcript's path);
 and within a transcript only the stream's own events count — a line of
 the CLI's stderr, which leerie writes into the same file under its own
-header, is never parsed as an event. A second reader was the gap: with
+header, is never parsed as an event. The stream is the CLI's alone: no
+command the worker runs can write into it, because each runs in a Landlock
+domain nested inside the CLI's (§6 *A worker's commands cannot reach its
+CLI*; review round 21 R4 wrote a forged `tool_use` into it through
+`/proc/<cli>/fd/1`). A second reader was the gap: with
 the record closed, the re-ask's session choice and the health scan still
 parsed `logs/` text on their own, so a printed `session_id` could steer
 which session a re-ask resumed. A run directory made before the registry
