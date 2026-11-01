@@ -30364,6 +30364,17 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
         f"source={prov['source']}) — workers will run installs in their worktrees")
 
 
+def _record_provision_gate(st: State, result: str) -> None:
+    """The provision gate's result (`skipped`, `degraded`, `passed`) on the
+    run's provision record, so a resume does not run it again (review round
+    19 M3); a failing gate `die()`s and records nothing."""
+    prov = st.data.get("provision")
+    prov = dict(prov) if isinstance(prov, dict) else {}
+    prov["gate"] = result
+    st.data["provision"] = prov
+    st.save()
+
+
 async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
                                models: dict[str, str],
                                efforts: dict[str, str | None]) -> None:
@@ -30394,6 +30405,7 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
     kinds = {(e.get("kind") if isinstance(e, dict) else None) for e in recipe}
     if not recipe or kinds <= {"none"}:
         log("phase 1½: provision gate skipped (no install recipe)")
+        _record_provision_gate(st, "skipped")
         return
 
     sys_prompt = _load_prompt("provision_judge")
@@ -30467,7 +30479,7 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
     if judge_result is None:
         log("  provision-gate: provision_judge crashed every round; degrading "
             "(deterministic recipe checks already ran) — recipe preserved")
-        st.save()
+        _record_provision_gate(st, "degraded")
         return
 
     remaining = _check(judge_result)
@@ -30485,7 +30497,7 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
         )
 
     st.data["provision_recipe_gate"] = judge_result
-    st.save()
+    _record_provision_gate(st, "passed")
     log("phase 1½: provision recipe gate clean")
 
 
@@ -65030,43 +65042,6 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             st.data["plans_after_classify"] = []
             st.save()
             await _assert_repo_unchanged(st, "phase 1 (classify)")
-            # Provision per-repo deps (DESIGN §6½). Runs after classify (so
-            # a docs-only run can short-circuit). Guarded on presence of
-            # the "recipe" key rather than unconditional: `mise install`
-            # (inside phase_provision) is real subprocess work, not
-            # idempotent, and a resume that already has a recipe persisted
-            # must not redo it. Key-presence, not truthiness — a repo with
-            # no recognized lockfile and no install commands needed is a
-            # legitimate `recipe: []` completed state (mirrors
-            # plans_after_classify's `[]` marker above), and truthiness
-            # would re-run phase_provision (including mise install) on
-            # every resume for that repo.
-            if "recipe" not in (st.data.get("provision") or {}):
-                await phase_provision(
-                    Path(os.getcwd()), st, caps, models, efforts)
-            # Independent adversarial verification of the detected install
-            # recipe (DESIGN §8) — gates before plan spend, detect-and-die.
-            # Cheap-skips when no recipe was detected (docs-only / kind:none).
-            # Inside the plans_after_classify block, so a resume past this
-            # phase skips it.
-            await phase_provision_gate(
-                Path(os.getcwd()), st, caps, models, efforts)
-            # Make the judgment worktree runnable, but only when the operator
-            # asked for tooling. With the escape hatch off, INSPECT_TOOLS
-            # contains no build verb at all — no pnpm, no tsc, no pytest — so
-            # installed deps would be unreachable and the install pure cost.
-            # With it on, `_widen_inspect_tools` has just granted those verbs,
-            # and a build verb in a tree with no node_modules fails in a way
-            # the planner reads as a real repo defect and plans phantom work
-            # around. Placed here because the recipe does not exist until
-            # phase_provision has run. Reuses the same helper the conformance
-            # baseline uses: once per tree per process, and never raises.
-            if st.data.get("dangerously_skip_permissions", False):
-                await _ensure_worktree_deps(
-                    _judgment_cwd(st), st, caps,
-                    log_path=st.run_dir / "logs" / "planning-install.log",
-                    verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                    label_prefix="planning", log_prefix="planning-install")
             # gather_answers blocks on input(). That's fine here: no
             # concurrent tasks are scheduled yet, so blocking the loop
             # blocks nothing. Kept on the event loop deliberately — every
@@ -65074,6 +65049,51 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # State works.
             gather_answers(st, supplied)
 
+        # Provisioning is outside the `plans_after_classify` block it used to
+        # sit in (review round 19 M3): that block's checkpoint is saved
+        # right after classify, so a kill anywhere in provisioning left a
+        # run that resumed past the block and never provisioned. Each step
+        # here is keyed on its own result instead — the recipe, the gate's
+        # verdict — so a resume redoes exactly what did not finish (DESIGN
+        # §6 *Resumable planning*).
+        # Provision per-repo deps (DESIGN §6½). Runs after classify (so
+        # a docs-only run can short-circuit). Guarded on presence of
+        # the "recipe" key rather than unconditional: `mise install`
+        # (inside phase_provision) is real subprocess work, not
+        # idempotent, and a resume that already has a recipe persisted
+        # must not redo it. Key-presence, not truthiness — a repo with
+        # no recognized lockfile and no install commands needed is a
+        # legitimate `recipe: []` completed state (mirrors
+        # plans_after_classify's `[]` marker above), and truthiness
+        # would re-run phase_provision (including mise install) on
+        # every resume for that repo.
+        if "recipe" not in (st.data.get("provision") or {}):
+            await phase_provision(
+                Path(os.getcwd()), st, caps, models, efforts)
+        # Independent adversarial verification of the detected install
+        # recipe (DESIGN §8) — gates before plan spend, detect-and-die.
+        # Cheap-skips when no recipe was detected (docs-only / kind:none),
+        # and once it has a result (`provision.gate`), so a resume does not
+        # pay for it twice.
+        if "gate" not in (st.data.get("provision") or {}):
+            await phase_provision_gate(
+                Path(os.getcwd()), st, caps, models, efforts)
+        # Make the judgment worktree runnable, but only when the operator
+        # asked for tooling. With the escape hatch off, INSPECT_TOOLS
+        # contains no build verb at all — no pnpm, no tsc, no pytest — so
+        # installed deps would be unreachable and the install pure cost.
+        # With it on, `_widen_inspect_tools` has just granted those verbs,
+        # and a build verb in a tree with no node_modules fails in a way
+        # the planner reads as a real repo defect and plans phantom work
+        # around. Placed here because the recipe does not exist until
+        # phase_provision has run. Reuses the same helper the conformance
+        # baseline uses: once per tree per process, and never raises.
+        if st.data.get("dangerously_skip_permissions", False):
+            await _ensure_worktree_deps(
+                _judgment_cwd(st), st, caps,
+                log_path=st.run_dir / "logs" / "planning-install.log",
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix="planning", log_prefix="planning-install")
         # Shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*).
         # Runs after classify (so it has the task) and before phase_plan (so
         # every planner sees it). Its own checkpoint key mirrors the

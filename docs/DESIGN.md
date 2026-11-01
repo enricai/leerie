@@ -3142,6 +3142,22 @@ re-deriving it. A phase that already ran is never billed again; only the
 phases still needed to reach `_schedule()`/`_write_plan()` spend further
 budget.
 
+*A checkpoint covers only what ran before it is saved.* A step inside the
+block a checkpoint guards, but after the checkpoint's save, is skipped by
+every resume past that save, whether it finished or not. Provisioning
+(phase 1½: the setup hook, the recipe and `mise install`, then the
+provision gate) once sat inside the `plans_after_classify` block, after
+its save. A kill anywhere in it resumed with no hook run and no recipe,
+and the run ended `done` having installed nothing (review round 19 M3).
+Provisioning now runs after that block, each step keyed on its own
+result: `phase_provision` on the presence of `provision.recipe`, the gate
+on `provision.gate`, which records `skipped`, `degraded` or `passed`. So a
+resume redoes exactly the step that did not finish. The setup hook is
+idempotent on its own (`provision.sh_hook_ran`). The clarification
+answers stay in the block, so on a fresh run they are gathered before
+provisioning. A deferred-answers exit then comes before it, and the
+resume that carries the answers provisions.
+
 **Why the resume cursor is the *presence of an output key*, and not
 `current_phase` — the load-bearing distinction.** Every planning phase
 stamps `current_phase` at phase *entry*, before it spends anything, so the

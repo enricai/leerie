@@ -6018,3 +6018,15 @@ template kept at finalize.
   - `test_delivery_detection` (2);
   - `test_acceptance_held_case_intermittent` (2);
   - `test_decide_outcome`'s unmeasured case (1), now its own test.
+- `tests/test_provision_survives_resume.py` (4 tests, review round 19 M3,
+  DESIGN §6 *Resumable planning*, "A checkpoint covers only what ran
+  before it is saved"). Through the real `_run_phases` on the resume
+  harness of `test_resume_planning_reentry.py`, a resume past the
+  `plans_after_classify` checkpoint:
+  - with no recipe runs `phase_provision` and the gate;
+  - with a recipe and no gate result runs only the gate;
+  - with both runs neither.
+
+  The gate records its result. Against the code before the fix, 3 of the
+  4 fail. The fourth, finished provisioning not being redone, holds there
+  too, because nothing was ever redone.
