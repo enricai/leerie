@@ -201,8 +201,14 @@ git log|git -C {w['wt-a']} log --oneline -1
 user checkout|cat {run['user']}/app.py
 proc root escape|cat /proc/$$/root{rd}/state.json
 """, run["env"])
+    # Reads outside the state root and `/tmp`: the user's checkout is
+    # readable unless it lies beneath `/tmp` (a test's `tmp_path`, never
+    # the container's `/work`; DESIGN §6 *`/tmp` is not a worker's*).
+    under_tmp = Path(os.path.realpath(run["user"])).is_relative_to(
+        os.path.realpath(leerie.SHARED_TMP))
     assert {k for k, v in got.items() if v} == {
-        "own spec", "the task", "own tree", "git log", "user checkout"}, got
+        "own spec", "the task", "own tree", "git log"} | (
+            set() if under_tmp else {"user checkout"}), got
 
 
 def test_a_judge_in_the_planning_worktree_writes_nothing_of_the_run(

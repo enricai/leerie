@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Confine a worker with Landlock, then exec it (DESIGN §6 *A worker writes
-only where it is granted (I5)*).
+"""Confine a command with Landlock, run it, and end every process it leaves
+(DESIGN §6 *A worker writes only where it is granted (I5)*, *A confined
+command's processes end with it*).
 
 Usage: landlock_exec.py [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
 
@@ -12,6 +13,16 @@ Exits 126, naming the reason, when the kernel cannot enforce it — never
 runs CMD unconfined. A grant that does not exist is skipped (nothing there
 to grant).
 
+The shim stays as CMD's parent: it makes itself a child subreaper
+(`PR_SET_CHILD_SUBREAPER`), so every process CMD starts that loses its
+parent — a daemon under `setsid`, a backgrounded tool — is reparented to the
+shim rather than escaping to the orchestrator or init. When CMD exits, or the
+shim is told to stop (SIGTERM, SIGINT, SIGHUP), it ends every descendant
+(`end_descendants`: SIGTERM, a grace period, then SIGKILL) and exits only once
+`waitpid` reports it has no child left, which the kernel guarantees means no
+descendant is left either. It then exits as CMD did: CMD's exit code, or
+CMD's terminating signal raised on itself.
+
 Stdlib only and imported by nothing heavier: it starts every worker. The
 orchestrator imports `abi()` and `MIN_ABI` from here for its preflight, so
 the requirement has one spelling."""
@@ -19,8 +30,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import signal
 import stat
 import sys
+import time
 
 # Landlock's syscalls share one number on every architecture (they were
 # added after the syscall tables were unified).
@@ -28,6 +41,16 @@ _SYS_CREATE, _SYS_ADD_RULE, _SYS_RESTRICT = 444, 445, 446
 _CREATE_RULESET_VERSION = 1
 _RULE_PATH_BENEATH = 1
 _PR_SET_NO_NEW_PRIVS = 38
+_PR_SET_CHILD_SUBREAPER = 36
+
+# How long the descendants of a command that exited get between SIGTERM and
+# SIGKILL: long enough for a test database to shut down cleanly (and remove
+# its PID file, which a SIGKILL leaves behind). A shim told to stop gets the
+# shorter one, inside the orchestrator's own grace before it SIGKILLs the
+# shim's group (`_PROC_TREE_GRACE_SEC`, 2 s).
+END_GRACE_SEC = 2.0
+STOP_GRACE_SEC = 1.0
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 EXECUTE = 1 << 0
 WRITE_FILE = 1 << 1
@@ -134,6 +157,139 @@ def confine(rw: list[str], ro: list[str]) -> None:
         os.close(fd)
 
 
+def descendants(root: int) -> set[int]:
+    """Every live process beneath `root` by parent links, read from
+    `/proc/<pid>/stat` (the field after the command name's closing
+    parenthesis is the state, the next the parent pid)."""
+    children: dict[int, list[int]] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return set()
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                rest = f.read().rsplit(b")", 1)[1].split()
+            children.setdefault(int(rest[1]), []).append(int(name))
+        except (OSError, IndexError, ValueError):
+            continue
+    out: set[int] = set()
+    todo = [root]
+    while todo:
+        for c in children.get(todo.pop(), ()):
+            if c not in out:
+                out.add(c)
+                todo.append(c)
+    return out
+
+
+def _signal_all(pids: set[int], sig: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+def _reap_nohang() -> bool:
+    """Reap every exited child; False once the shim has no child at all."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return False
+        except InterruptedError:
+            continue
+        if pid == 0:
+            return True
+
+
+def end_descendants(grace: float) -> None:
+    """End every descendant: SIGTERM, then SIGKILL after `grace` seconds,
+    until `waitpid` says no child is left. A subreaper's descendants are all
+    reparented to it as their parents die, so no child left means no
+    descendant left: the confirmation is the kernel's."""
+    me = os.getpid()
+    deadline: float | None = None
+    while _reap_nohang():
+        live = descendants(me)
+        now = time.monotonic()
+        if deadline is None:
+            _signal_all(live, signal.SIGTERM)
+            deadline = now + grace
+        elif now >= deadline:
+            _signal_all(live, signal.SIGKILL)
+        time.sleep(0.02)
+
+
+def _die_of(sig: int) -> int:
+    """Raise `sig` on the shim itself with its default action, so the caller
+    sees the return code it would have seen without the shim (negative for
+    a signal). No core file: the command's own was already written."""
+    try:
+        import resource  # noqa: PLC0415
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, OSError, ValueError):
+        pass
+    if sig not in (signal.SIGKILL, signal.SIGSTOP):
+        signal.signal(sig, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {sig})
+    os.kill(os.getpid(), sig)
+    return 128 + sig
+
+
+def run(cmd: list[str]) -> int:
+    """Run `cmd` as a child of this subreaper, then end what it left.
+    SIGCHLD and the stop signals are blocked and taken with `sigwaitinfo`,
+    so none is lost between a check and the wait; the child gets the mask
+    it was started with."""
+    libc = _libc()
+    if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        print(f"leerie: cannot make the shim a subreaper (errno "
+              f"{ctypes.get_errno()}), so the command does not run "
+              "(DESIGN §6 *A confined command's processes end with it*)",
+              file=sys.stderr)
+        return 126
+    watched = {signal.SIGCHLD, *_STOP_SIGNALS}
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    child = os.fork()
+    if child == 0:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError as e:
+            print(f"landlock_exec.py: exec {cmd[0]}: {e}", file=sys.stderr)
+        os._exit(127)
+    status: int | None = None
+    stopped: int | None = None
+    while status is None and stopped is None:
+        try:
+            while True:
+                pid, st = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                if pid == child:
+                    status = st
+                    break
+        except ChildProcessError:
+            break
+        if status is None:
+            info = signal.sigwaitinfo(watched)
+            if info.si_signo in _STOP_SIGNALS:
+                stopped = info.si_signo
+    end_descendants(STOP_GRACE_SEC if stopped is not None
+                    else END_GRACE_SEC)
+    if stopped is not None:
+        return _die_of(stopped)
+    if status is None:
+        return 1
+    if os.WIFSIGNALED(status):
+        return _die_of(os.WTERMSIG(status))
+    return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+
+
 def main(argv: list[str]) -> int:
     if "--" not in argv:
         print("usage: landlock_exec.py [--rw PATH]... [--ro PATH]... -- CMD",
@@ -153,18 +309,16 @@ def main(argv: list[str]) -> int:
         print("landlock_exec.py: no command", file=sys.stderr)
         return 2
     try:
-        confine(rw, ro)
+        # `/proc`, read: the shim's own need — `descendants` reads it to find
+        # what the command left. Every grant leerie derives reads it anyway
+        # (it is outside the state root).
+        confine(rw, ro + ["/proc"])
     except OSError as e:
         print(f"leerie: cannot confine the worker, so it does not run: {e} "
               "(DESIGN §6 *A worker writes only where it is granted*)",
               file=sys.stderr)
         return 126
-    try:
-        os.execvp(cmd[0], cmd)
-    except OSError as e:
-        print(f"landlock_exec.py: exec {cmd[0]}: {e}", file=sys.stderr)
-        return 127
-    return 127  # unreachable: execvp replaces this process
+    return run(cmd)
 
 
 if __name__ == "__main__":

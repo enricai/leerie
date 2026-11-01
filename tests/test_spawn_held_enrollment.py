@@ -53,8 +53,10 @@ def test_command_cannot_run_before_it_is_enrolled(leerie, tmp_path,
 
 
 def test_exec_keeps_the_enrolled_pid(leerie, tmp_path, monkeypatch):
-    """The pid the broker enrolled is the command's own pid — `exec`, not a
-    fork — so the cgroup it was enrolled into is the command's."""
+    """The pid the broker enrolled is the gate's, which `exec`s the shim in
+    place, and the command is the shim's child (DESIGN §6 *A confined
+    command's processes end with it*): forked after the enrollment, so born
+    in the cgroup it was enrolled into."""
     out = tmp_path / "pid"
     pids: list = []
     monkeypatch.setattr(leerie, "_cgroup_enroll",
@@ -62,7 +64,7 @@ def test_exec_keeps_the_enrolled_pid(leerie, tmp_path, monkeypatch):
     rc, _ = _run(leerie._run_streaming(
         [sys.executable, "-c",
          "import os, pathlib, sys; "
-         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))", str(out)], grants=leerie.WorkerGrants(("/",), ()),
+         "pathlib.Path(sys.argv[1]).write_text(str(os.getppid()))", str(out)], grants=leerie.WorkerGrants(("/",), ()),
         cwd=str(tmp_path), verbosity="quiet", cgroup_sid="run-cmd"))
     assert rc == 0
     assert pids == [int(out.read_text())]

@@ -32,12 +32,14 @@ def test_the_measure_env_gives_pnpm_writable_state_and_runtime(leerie, run):
     own = leerie._measure_dir(_state(run), view)
     env = dict(g.env)
     assert Path(env["XDG_STATE_HOME"]) == own / "state"
-    assert Path(env["XDG_RUNTIME_DIR"]) == own / "run"
-    # Both lie in the measurement dir, which the grant writes.
+    # The runtime directory holds sockets, so it is in the short private
+    # temp directory (DESIGN §6 *A confined command's scratch is short and
+    # private*), not the measurement directory.
+    assert Path(env["XDG_RUNTIME_DIR"]) == leerie._private_tmp(own) / "run"
+    # Both lie where the grant writes.
     for v in ("XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
-        assert Path(env[v]).is_relative_to(own)
-        assert str(own) in g.rw or any(
-            Path(env[v]).is_relative_to(p) for p in g.rw)
+        assert Path(env[v]).is_dir()
+        assert any(Path(env[v]).is_relative_to(p) for p in g.rw), v
 
 
 def test_a_confined_install_reads_the_store_but_cannot_write_it(

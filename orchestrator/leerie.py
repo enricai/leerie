@@ -32,6 +32,7 @@ import codecs
 import concurrent.futures
 import configparser
 import contextlib
+import contextvars
 import copy
 import ctypes
 import errno
@@ -9722,6 +9723,173 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     )
 
 
+# --- the run's `/tmp` (DESIGN §6 *A measurement may write `/tmp`; a held-out
+# evaluation has it alone*) ---------------------------------------------------
+# Set in the context of a held-out evaluation that holds `/tmp` alone: its
+# own commands, and the tasks it starts, pass through the shared lock.
+_TMP_EXCLUSIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_TMP_EXCLUSIVE", default=False)
+
+
+class _TmpLock:
+    """Shared/exclusive lock on the run's `/tmp`, on one event loop: every
+    confined repository command holds it shared while it runs
+    (`_run_streaming`), a held-out evaluation exclusive
+    (`_held_out_section`). A waiting exclusive holder stops new shared
+    ones, so a stream of measurements cannot starve it. Nothing that holds
+    it shared waits on anything else, so it cannot deadlock."""
+
+    def __init__(self) -> None:
+        self.readers = 0
+        self.writer = False
+        self.writers_waiting = 0
+        self._waiters: list[asyncio.Future] = []
+
+    def _wake(self) -> None:
+        waiters, self._waiters = self._waiters, []
+        for f in waiters:
+            if not f.done():
+                f.set_result(None)
+
+    async def _wait(self) -> None:
+        f = asyncio.get_running_loop().create_future()
+        self._waiters.append(f)
+        try:
+            await f
+        finally:
+            with contextlib.suppress(ValueError):
+                self._waiters.remove(f)
+
+    @contextlib.asynccontextmanager
+    async def shared(self) -> AsyncIterator[None]:
+        if _TMP_EXCLUSIVE.get():
+            yield
+            return
+        while self.writer or self.writers_waiting:
+            await self._wait()
+        self.readers += 1
+        try:
+            yield
+        finally:
+            self.readers -= 1
+            if not self.readers:
+                self._wake()
+
+    @contextlib.asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[bool]:
+        """Yields True to the outermost holder, False to a nested one."""
+        if _TMP_EXCLUSIVE.get():
+            yield False
+            return
+        self.writers_waiting += 1
+        try:
+            while self.writer or self.readers:
+                await self._wait()
+        finally:
+            self.writers_waiting -= 1
+            self._wake()
+        self.writer = True
+        token = _TMP_EXCLUSIVE.set(True)
+        try:
+            yield True
+        finally:
+            _TMP_EXCLUSIVE.reset(token)
+            self.writer = False
+            self._wake()
+
+
+# One per event loop, as `_BLT_SEMS` (a loop's futures cannot serve another).
+_TMP_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _TmpLock]" = (
+    weakref.WeakKeyDictionary())
+
+
+def _tmp_lock() -> _TmpLock:
+    """The `/tmp` lock of the running loop (one run per orchestrator
+    process, and `/tmp` is the process's). Call from a coroutine."""
+    loop = asyncio.get_running_loop()
+    lock = _TMP_LOCKS.get(loop)
+    if lock is None:
+        lock = _TMP_LOCKS[loop] = _TmpLock()
+    return lock
+
+
+def _tmp_inventory(root: Path) -> dict[str, int]:
+    """Every path beneath `root`, never following a link, with its inode: a
+    path absent before, or at another inode, was created since."""
+    out: dict[str, int] = {}
+    stack = [str(root)]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        out[e.path] = e.inode()
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return out
+
+
+def _remove_created(root: Path, before: dict[str, int]) -> list[str]:
+    """Remove every path beneath `root` that is not in `before` (or is at
+    another inode), the topmost of each created subtree whole; return
+    them."""
+    after = _tmp_inventory(root)
+    made = sorted(p for p, ino in after.items() if before.get(p) != ino)
+    removed: list[str] = []
+    gone: set[str] = set()
+    for p in made:
+        if any(str(a) in gone for a in Path(p).parents):
+            continue
+        _rmtree_owned(Path(p))
+        _PRIVATE_TMPS.pop(p, None)
+        gone.add(p)
+        removed.append(p)
+    return removed
+
+
+_SHARED_TMP_WARNED = {"done": False}
+
+
+@contextlib.asynccontextmanager
+async def _held_out_section(st: object) -> AsyncIterator[None]:
+    """Hold the run's `/tmp` alone for a held-out evaluation (DESIGN §6 *A
+    measurement may write `/tmp`; a held-out evaluation has it alone*): no
+    other repository command runs meanwhile, and before it lets go, every
+    path the evaluation created in `/tmp` is removed — so no later
+    measurement, which runs a worker's code, reads what a held-out set's run
+    left there. Its commands' processes have ended already: the shim ends
+    each command's before `_run_streaming` returns. Nested sections are one.
+    Where `/tmp` is not the run's alone (`PRIVATE_TMP_ENV` unset: a host,
+    which other programs share), nothing is removed, logged once."""
+    async with _tmp_lock().exclusive() as outer:
+        if not outer:
+            yield
+            return
+        own = os.environ.get(PRIVATE_TMP_ENV) == "1"
+        if not own and not _SHARED_TMP_WARNED["done"]:
+            _SHARED_TMP_WARNED["done"] = True
+            log(f"  {SHARED_TMP} is shared with this host's other programs "
+                f"({PRIVATE_TMP_ENV} unset): what a held-out evaluation "
+                "creates there is not removed")
+        before = (await asyncio.to_thread(_tmp_inventory, SHARED_TMP)
+                  if own else None)
+        try:
+            yield
+        finally:
+            if before is not None:
+                # On the loop, not in a thread: the lock is released only
+                # once this is done, whatever cancels the evaluation.
+                removed = _remove_created(SHARED_TMP, before)
+                if removed:
+                    log(f"  held-out evaluation: removed {len(removed)} "
+                        f"path(s) it created in {SHARED_TMP}")
+
+
 async def _run_streaming(
     cmd: list[str],
     *,
@@ -9778,113 +9946,119 @@ async def _run_streaming(
     `grants` (required, keyword-only: no call can forget it) is the
     command's measurement grant (`_measurement_grants`, DESIGN §6 *Leerie's
     runs of the repository's commands are confined too*): `cmd` is started
-    through the Landlock shim with it, every descendant inheriting the
-    restriction, and the grant's own variables are laid over `env` last.
-    There is no unconfined path.
+    through the Landlock shim with it and its `/tmp` grant, every
+    descendant inheriting the restriction, and the grant's own variables
+    are laid over `env` last. There is no unconfined path.
     """
-    spawn_cmd = _confined_argv(grants, list(cmd))
-    # A command in a run's tree reads that tree's own stores
-    # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may share*).
-    env = _tree_stores_for(env if env is not None else os.environ, cwd)
-    gate_r: int | None = None
-    gate_w: int | None = None
-    if cgroup_sid is not None:
-        spawn_cmd, gate_r, gate_w = _spawn_held_argv(spawn_cmd)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *spawn_cmd,
-            pass_fds=(gate_r,) if gate_r is not None else (),
-            cwd=cwd,
-            env={**_repo_command_env(env), **dict(grants.env)},
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except BaseException:
-        _close_fd(gate_r)
-        _close_fd(gate_w)
-        raise
-    _close_fd(gate_r)
-    if cgroup_sid is not None:
+    # The command may write `/tmp` (`grants.shared_tmp`) only while it holds
+    # the run's `/tmp` lock shared, so none runs while a held-out evaluation
+    # has `/tmp` alone (`_held_out_section`), whose own commands pass
+    # through. The shim ends every process the command leaves before this
+    # returns (DESIGN §6 *A confined command's processes end with it*).
+    async with _tmp_lock().shared():
+        spawn_cmd = _confined_argv(grants, list(cmd), shared_tmp=True)
+        # A command in a run's tree reads that tree's own stores
+        # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may share*).
+        env = _tree_stores_for(env if env is not None else os.environ, cwd)
+        gate_r: int | None = None
+        gate_w: int | None = None
+        if cgroup_sid is not None:
+            spawn_cmd, gate_r, gate_w = _spawn_held_argv(spawn_cmd)
         try:
-            await asyncio.to_thread(_cgroup_enroll, cgroup_sid, proc.pid)
+            proc = await asyncio.create_subprocess_exec(
+                *spawn_cmd,
+                pass_fds=(gate_r,) if gate_r is not None else (),
+                cwd=cwd,
+                env={**_repo_command_env(env), **dict(grants.env)},
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
         except BaseException:
-            _release_spawn_gate(gate_w, run=False)
-            await _terminate_proc_tree(proc)
+            _close_fd(gate_r)
+            _close_fd(gate_w)
             raise
-        _release_spawn_gate(gate_w)
+        _close_fd(gate_r)
+        if cgroup_sid is not None:
+            try:
+                await asyncio.to_thread(_cgroup_enroll, cgroup_sid, proc.pid)
+            except BaseException:
+                _release_spawn_gate(gate_w, run=False)
+                await _terminate_proc_tree(proc)
+                raise
+            _release_spawn_gate(gate_w)
 
-    tail: deque[str] = deque(maxlen=tail_lines)
-    log_fh = None
-    if log_path is not None:
+        tail: deque[str] = deque(maxlen=tail_lines)
+        log_fh = None
+        if log_path is not None:
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = log_path.open("a", buffering=1)  # line-buffered
+                header = f"=== {label or ' '.join(cmd)} (cwd={cwd or '.'}) ==="
+                log_fh.write(header + "\n")
+            except OSError:
+                log_fh = None
+
+        echo = verbosity != "quiet"
+
+        async def read_loop() -> None:
+            # proc.stdout is guaranteed non-None because we passed
+            # stdout=asyncio.subprocess.PIPE above; no runtime check needed.
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip("\r\n")
+                tail.append(line)
+                if log_fh is not None:
+                    try:
+                        log_fh.write(line + "\n")
+                    except OSError:
+                        pass
+                if echo:
+                    log(f"{line_prefix}{line}")
+
         try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_fh = log_path.open("a", buffering=1)  # line-buffered
-            header = f"=== {label or ' '.join(cmd)} (cwd={cwd or '.'}) ==="
-            log_fh.write(header + "\n")
-        except OSError:
-            log_fh = None
-
-    echo = verbosity != "quiet"
-
-    async def read_loop() -> None:
-        # proc.stdout is guaranteed non-None because we passed
-        # stdout=asyncio.subprocess.PIPE above; no runtime check needed.
-        async for raw in proc.stdout:
-            line = raw.decode(errors="replace").rstrip("\r\n")
-            tail.append(line)
+            if timeout is None:
+                await asyncio.gather(read_loop(), proc.wait())
+            else:
+                await asyncio.wait_for(
+                    asyncio.gather(read_loop(), proc.wait()),
+                    timeout=timeout,
+                )
+        except asyncio.TimeoutError:
             if log_fh is not None:
                 try:
-                    log_fh.write(line + "\n")
+                    log_fh.write(f"=== TIMEOUT after {timeout}s ===\n")
                 except OSError:
                     pass
-            if echo:
-                log(f"{line_prefix}{line}")
+            await _terminate_proc_tree(proc)
+            captured = "\n".join(tail)
+            exc = subprocess.TimeoutExpired(cmd, timeout)
+            # Standard TimeoutExpired exposes `output` and `stderr`; populate
+            # `output` with the merged tail so callers can include it in
+            # their die() message without re-reading the log file.
+            exc.output = captured
+            if log_fh is not None:
+                try:
+                    log_fh.close()
+                except OSError:
+                    pass
+            raise exc
+        except BaseException:
+            await _terminate_proc_tree(proc)
+            if log_fh is not None:
+                try:
+                    log_fh.close()
+                except OSError:
+                    pass
+            raise
 
-    try:
-        if timeout is None:
-            await asyncio.gather(read_loop(), proc.wait())
-        else:
-            await asyncio.wait_for(
-                asyncio.gather(read_loop(), proc.wait()),
-                timeout=timeout,
-            )
-    except asyncio.TimeoutError:
-        if log_fh is not None:
-            try:
-                log_fh.write(f"=== TIMEOUT after {timeout}s ===\n")
-            except OSError:
-                pass
-        await _terminate_proc_tree(proc)
-        captured = "\n".join(tail)
-        exc = subprocess.TimeoutExpired(cmd, timeout)
-        # Standard TimeoutExpired exposes `output` and `stderr`; populate
-        # `output` with the merged tail so callers can include it in
-        # their die() message without re-reading the log file.
-        exc.output = captured
-        if log_fh is not None:
-            try:
-                log_fh.close()
-            except OSError:
-                pass
-        raise exc
-    except BaseException:
-        await _terminate_proc_tree(proc)
         if log_fh is not None:
             try:
                 log_fh.close()
             except OSError:
                 pass
-        raise
 
-    if log_fh is not None:
-        try:
-            log_fh.close()
-        except OSError:
-            pass
-
-    rc = proc.returncode if proc.returncode is not None else 0
-    return rc, "\n".join(tail)
+        rc = proc.returncode if proc.returncode is not None else 0
+        return rc, "\n".join(tail)
 
 
 async def _gather_or_cancel(*aws):
@@ -11490,7 +11664,7 @@ def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
         template = _claude_config_template(run_dir)
         part = base / f".config.tmp-{os.getpid()}"
         _rmtree_owned(part)
-        part.mkdir(parents=True)
+        _mkdir_private(part, Path(run_dir))
         for entry in template.iterdir():
             dst = part / entry.name
             if entry.name == _CLAUDE_CONFIG_TEMPLATE_MARK:
@@ -11504,7 +11678,7 @@ def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
                 os.chmod(dst, stat.S_IMODE(os.lstat(dst).st_mode) | 0o600)
         os.rename(part, config)
     _rmtree_owned(tmp)
-    tmp.mkdir(parents=True)
+    _mkdir_private(tmp, Path(run_dir))
     return config, tmp
 
 
@@ -11547,6 +11721,10 @@ def _release_run_dir(run_dir: Path) -> bool:
     workers' directories and the template (`_remove_worker_dirs`) and the
     run's scratch (`_run_scratch_names`). True when all are gone."""
     gone = _remove_worker_dirs(run_dir)
+    # The measured trees' private temp directories go with their
+    # measurement directories (DESIGN §6 *A confined command's scratch is
+    # short and private*), whose sidecars name them.
+    _remove_trees_private_tmps(Path(run_dir) / MEASURE_DIRNAME)
     for name in _run_scratch_names():
         path = Path(run_dir) / name
         if not _rmtree_owned(path):
@@ -12000,7 +12178,7 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         # test suite, on separate paths.
         import tempfile  # noqa: PLC0415
         smoke_cwd = str(
-            Path(tempfile.gettempdir())
+            Path(_system_temp_dir())
             / ("leerie-smoke-" + hashlib.sha256(
                 str(leerie_dir.parent.parent).encode()).hexdigest()[:12]))
         try:
@@ -22152,10 +22330,15 @@ class WorkerGrants(NamedTuple):
     (`ro`), as absolute paths. `env`: the `(name, value)` pairs that point
     the command's temp and caches at its grants, laid over its environment
     last (a measurement's, `_measurement_grants`); a worker's is empty,
-    `claude_p` names its directories itself."""
+    `claude_p` names its directories itself. `shared_tmp`: a measurement's
+    write grant of `/tmp` itself (`SHARED_TMP`), added to the command's
+    rules only by `_run_streaming`, which holds the run's `/tmp` lock for it
+    (DESIGN §6 *A measurement may write `/tmp`; a held-out evaluation has it
+    alone*); empty for a worker."""
     rw: tuple[str, ...]
     ro: tuple[str, ...]
     env: tuple[tuple[str, str], ...] = ()
+    shared_tmp: tuple[str, ...] = ()
 
 
 # The caps key that marks the host-side seam, set only by
@@ -22236,9 +22419,22 @@ def _beside(top: Path, root: Path) -> list[str]:
     return out
 
 
-def _reads_outside(root: Path) -> list[str]:
-    """Read grants for everything outside the state root `root`."""
-    return _beside(Path("/"), root)
+def _reads_outside(root: Path, *, tmp: bool = True) -> list[str]:
+    """Read grants for everything outside the state root `root`; with `tmp`
+    False, for everything outside `root` and `/tmp` (`SHARED_TMP`), which
+    is a measurement's and never a worker's (DESIGN §6 *`/tmp` is not a
+    worker's*). An entry that resolves into `/tmp` is left out with it."""
+    if tmp:
+        return _beside(Path("/"), root)
+    shared = Path(os.path.realpath(SHARED_TMP))
+    if root.is_relative_to(shared):
+        return _beside(Path("/"), shared)
+    out = []
+    for p in _beside(Path("/"), root):
+        real = Path(os.path.realpath(p))
+        if not (real.is_relative_to(shared) or shared.is_relative_to(real)):
+            out.append(p)
+    return out
 
 
 def _around(paths: list[str], root: Path) -> list[str]:
@@ -22327,9 +22523,24 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     cwd_r = Path(cwd).resolve()
     rw: list[str] = (list(_WORKER_DEVICES) + _worker_own_dirs(env, run_dir)
                      + [str(run_dir / WORKERS_DIR / WORKER_CACHE_DIR)])
+    # The CLI the worker is, where its `PATH` finds it, and its home (the
+    # git identity, a package manager's config): named for the same reason
+    # as leerie's install below. A home that holds `/tmp` is not named.
+    cli = shutil.which("claude", path=env.get("PATH"))
+    home = os.path.realpath(env.get("HOME") or Path.home())
+    if Path(os.path.realpath(SHARED_TMP)).is_relative_to(home):
+        home = ""
     # The run's CLI configuration template: each worker's configuration
     # links its directories (`_worker_dirs`), read, never written.
     ro: list[str] = [str(run_dir / SYSPROMPT_DIRNAME),
+                     # Leerie's own code: the CLI runs its hook and script
+                     # shell (`_worker_guard`), a re-drive its self-check.
+                     # Named, not left to the reads outside the state root:
+                     # a checkout under `/tmp`, which no worker reads, is
+                     # one leerie still runs from.
+                     str(ROOT),
+                     *([os.path.realpath(cli)] if cli else []),
+                     *([home] if home else []),
                      str(run_dir / CLAUDE_CONFIG_TEMPLATE),
                      # What `MISE_OVERRIDE_CONFIG_FILENAMES` names in a Go
                      # repository's run: mise reads it on every call.
@@ -22348,28 +22559,32 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
                str(run_dir / NOTES_DIRNAME)]
     if notes_id:
         own = _notes_dir(run_dir, notes_id)
-        own.mkdir(parents=True, exist_ok=True)
+        _mkdir_private(own, run_dir)
         rw.append(str(own))
     if selfcheck_dir is not None:
         sc = Path(selfcheck_dir).resolve()
-        (sc / "run").mkdir(parents=True, exist_ok=True)
+        (sc / "run").mkdir(mode=0o700, parents=True, exist_ok=True)
         ro.append(str(sc))
         rw.append(str(sc / "run"))
     # No grant ever covers the state root whole, whatever a variable names
     # (`_reads_outside` never does, by construction: it is not re-checked,
-    # which cost 0.3 s a call against a 2,000-entry `/tmp`, measured).
+    # which cost 0.3 s a call against a 2,000-entry `/tmp`, measured). Nor
+    # `/tmp`: a worker neither reads nor writes it.
     return WorkerGrants(
         tuple(dict.fromkeys(_around(rw, state_root))),
-        tuple(dict.fromkeys(_reads_outside(state_root)
+        tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _around(ro, state_root))))
 
 
-def _confined_argv(grants: WorkerGrants, cmd: list[str]) -> list[str]:
-    """`cmd` started through the Landlock shim with `grants`."""
+def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
+                   shared_tmp: bool = False) -> list[str]:
+    """`cmd` started through the Landlock shim with `grants`; with
+    `shared_tmp`, also `grants.shared_tmp` written (only `_run_streaming`,
+    under the run's `/tmp` lock)."""
     # `-S`: the shim imports only the standard library, and `site` cost
     # ~15 ms of every worker's start (measured).
     argv = [sys.executable, "-I", "-S", str(LANDLOCK_SCRIPT)]
-    for p in grants.rw:
+    for p in grants.rw + (grants.shared_tmp if shared_tmp else ()):
         argv += ["--rw", p]
     for p in grants.ro:
         argv += ["--ro", p]
@@ -22397,13 +22612,124 @@ MEASURE_DIRNAME = "measure"
 TREE_STORES_DIRNAME = "tree-stores"
 _MEASURE_ID_FILE = "leerie-measure-id"
 _MEASURE_ID_RE = re.compile(r"[0-9a-f]{16}")
-_MEASURE_SUBDIRS = ("tmp", "cache", "mise-state", "reports", "coverage")
+_MEASURE_SUBDIRS = ("mise-state", "reports", "coverage")
+# DESIGN §6 *A confined command's scratch is short and private*. `/tmp` is
+# the container's, one run's alone; every measured tree's temp directory is
+# `/tmp/l/<16 hex>/`, short enough that a socket in it fits `sun_path` (107
+# bytes), and 0700 under `/tmp`'s root-owned sticky bit, so no ancestor is
+# writable by another user (SWC, among others, refuses one that is).
+SHARED_TMP = Path("/tmp")
+PRIVATE_TMP_ROOT = SHARED_TMP / "l"
+# Set by the image (`Dockerfile`): this process's `/tmp` is its run's alone,
+# so what a held-out evaluation created in it can be removed by path. Unset
+# on a host, whose `/tmp` other programs share: nothing there is removed.
+PRIVATE_TMP_ENV = "LEERIE_PRIVATE_TMP"
+# The private temp directories this process made, removed at its exit.
+_PRIVATE_TMPS: dict[str, int] = {}
 # The run directory's entries no measured tree may hold or lie beneath:
 # granting such a tree would grant them.
 _MEASURE_PRIVATE = ("state.json", "acceptance", "logs", WORKERS_DIR,
-                    TREE_STORES_DIRNAME,
+                    TREE_STORES_DIRNAME, "tmp",
                     RUN_REPO_SETTINGS_NAME, TREE_REPOS_DIRNAME,
                     RUN_REPO_NAME, MEASURE_DIRNAME)
+
+
+def _use_run_tmp(st: "State") -> Path:
+    """Make `<run-dir>/tmp/` (0700) the orchestrator's own temp directory:
+    `tempfile`'s, and `TMPDIR` for the commands it runs unconfined. A
+    measurement may write `/tmp` (`SHARED_TMP`), so nothing of leerie's —
+    a staged index, a held-out file's copy, the throwaway test database's
+    data directory, which an unconfined postgres would load its
+    configuration from — may live there (DESIGN §6 *A measurement may write
+    `/tmp`; a held-out evaluation has it alone*)."""
+    d = Path(st.run_dir) / "tmp"
+    _mkdir_private(d, Path(st.run_dir))
+    _SYSTEM_TEMP_DIR.setdefault("dir", tempfile.gettempdir())
+    os.environ["TMPDIR"] = str(d)
+    tempfile.tempdir = str(d)
+    return d
+
+
+# The system temp directory as it was before `_use_run_tmp`: the smoke
+# test's working directory must be outside every repository, which the run
+# directory is not when the state root is `<repo>/.leerie`.
+_SYSTEM_TEMP_DIR: dict[str, str] = {}
+
+
+def _system_temp_dir() -> str:
+    return _SYSTEM_TEMP_DIR.get("dir") or tempfile.gettempdir()
+
+
+def _mkdir_private(path: Path, top: Path) -> None:
+    """Make `path` and every directory missing between `top` (which
+    is made first when missing, as `mkdir(parents=True)` would) and it,
+    each 0700: a directory leerie makes for a measurement or a worker is
+    readable by its user alone (DESIGN §6 *A confined command's scratch is
+    short and private*)."""
+    top.mkdir(parents=True, exist_ok=True)
+    missing: list[Path] = []
+    cur = Path(path)
+    while cur != top and not cur.exists() and cur.is_relative_to(top):
+        missing.append(cur)
+        cur = cur.parent
+    for d in reversed(missing):
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(d, 0o700)
+
+
+def _own_private_dir(path: Path) -> None:
+    """Make `path` a 0700 directory of this user's, or stop the run: one
+    that is a link, not a directory, or another user's is not private, and
+    a command whose scratch it is could be read or planted."""
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(path, 0o700)
+    st_ = os.lstat(path)
+    if (not stat.S_ISDIR(st_.st_mode) or st_.st_uid != os.geteuid()):
+        die(f"{path} is not a directory of this user's, so leerie cannot "
+            "give its commands a private temp directory there (DESIGN §6 "
+            "*A confined command's scratch is short and private*). Remove "
+            "it, or run leerie where /tmp is its own.")
+    if stat.S_IMODE(st_.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def _remove_private_tmps() -> None:
+    """At this process's exit: remove every private temp directory it made
+    (a forked child that exits through Python leaves its parent's alone)."""
+    for d, pid in list(_PRIVATE_TMPS.items()):
+        if pid == os.getpid():
+            _rmtree_owned(Path(d))
+            _PRIVATE_TMPS.pop(d, None)
+
+
+def _remove_trees_private_tmps(root: Path) -> None:
+    """Remove the private temp directory every sidecar under `root` (a run's
+    `measure/`) names, with the owner-aware removal."""
+    try:
+        sides = list(Path(root).glob("*.tree"))
+    except OSError:
+        return
+    for side in sides:
+        try:
+            tmp = json.loads(side.read_text()).get("tmp")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(tmp, str) and Path(tmp).parent == PRIVATE_TMP_ROOT:
+            _rmtree_owned(Path(tmp))
+            _PRIVATE_TMPS.pop(tmp, None)
+
+
+def _private_tmp(key: Path) -> Path:
+    """`/tmp/l/<id>/` for `key` (a measurement directory): made 0700 under
+    a 0700 `/tmp/l`, the same path for the same key, removed with the key's
+    tree (`_sweep_measure_dirs`) and at this process's exit."""
+    _own_private_dir(PRIVATE_TMP_ROOT)
+    d = PRIVATE_TMP_ROOT / hashlib.sha256(str(key).encode()).hexdigest()[:16]
+    _own_private_dir(d)
+    if not _PRIVATE_TMPS:
+        atexit.register(_remove_private_tmps)
+    _PRIVATE_TMPS.setdefault(str(d), os.getpid())
+    return d
 
 
 def _cache_vars(env: Mapping[str, str], cache: Path) -> dict[str, str]:
@@ -22417,7 +22743,9 @@ def _cache_vars(env: Mapping[str, str], cache: Path) -> dict[str, str]:
     _with_pnpm_spellings(out)
     for d in (cache / "xdg", cache / "pnpm-store"):
         with contextlib.suppress(OSError):
-            d.mkdir(parents=True, exist_ok=True)
+            # `cache` is `<run-dir>/workers/cache`: everything below the run
+            # directory is the workers'.
+            _mkdir_private(d, cache.parent.parent)
     return out
 
 
@@ -22462,6 +22790,7 @@ def _sweep_measure_dirs(root: Path) -> None:
             rec = json.loads(side.read_text())
             tree = Path(rec["tree"])
             id_file = rec.get("id_file")
+            tmp = rec.get("tmp")
         except (OSError, ValueError, KeyError, TypeError):
             continue
         stale = not tree.is_dir()
@@ -22474,9 +22803,14 @@ def _sweep_measure_dirs(root: Path) -> None:
         if not stale:
             continue
         with contextlib.suppress(OSError):
-            gone.mkdir(parents=True, exist_ok=True)
+            gone.mkdir(mode=0o700, parents=True, exist_ok=True)
             if own.exists():
                 os.rename(own, gone / f"{own.name}-{uuid.uuid4().hex[:8]}")
+            # The tree's private temp directory goes with it.
+            if (isinstance(tmp, str)
+                    and Path(tmp).parent == PRIVATE_TMP_ROOT):
+                _rmtree_owned(Path(tmp))
+                _PRIVATE_TMPS.pop(tmp, None)
             side.unlink()
             moved = True
     if moved:
@@ -22505,7 +22839,7 @@ def _measure_dir_at(run_dir: Path, tree: Path,
             stale = run_dir / TREE_STORES_DIRNAME / tree.name
             if stale.exists():
                 gone = root / ".gone"
-                gone.mkdir(parents=True, exist_ok=True)
+                _mkdir_private(gone, run_dir)
                 os.rename(stale, gone / f"stores-{tree.name}-{tid}")
                 threading.Thread(target=_rmtree_owned, args=(gone,),
                                  daemon=True).start()
@@ -22514,11 +22848,13 @@ def _measure_dir_at(run_dir: Path, tree: Path,
     own = root / f"{tree.name}-{tid}"
     _sweep_measure_dirs(root)
     for sub in _MEASURE_SUBDIRS:
-        (own / sub).mkdir(parents=True, exist_ok=True)
+        _mkdir_private(own / sub, run_dir)
     side = root / f"{own.name}.tree"
     if not side.is_file():
-        side.write_text(json.dumps({"tree": str(tree), "id_file": (
-            str(id_file) if id_file is not None else None)}))
+        side.write_text(json.dumps({
+            "tree": str(tree),
+            "id_file": str(id_file) if id_file is not None else None,
+            "tmp": str(_private_tmp(own))}))
     return own
 
 
@@ -22534,9 +22870,11 @@ def _run_dir_of(st: object) -> Path:
 def _measure_dir(st: "State", tree: str | Path) -> Path:
     """The measurement directory of `tree` (DESIGN §6 *Leerie's runs of the
     repository's commands are confined too*): `<run>/measure/<tree>-<id>/`,
-    fresh for each tree and gone with it, holding the command's `tmp/`,
-    `cache/`, `mise-state/`, `reports/` and `coverage/`. The one place a
-    measured command's output may be written outside its tree."""
+    fresh for each tree and gone with it, holding the command's
+    `mise-state/`, `reports/` and `coverage/`; its temp directory is the
+    tree's private one under `/tmp/l/` (`_private_tmp`). With it, the one
+    place a measured command's output may be written outside its tree and
+    `/tmp`."""
     run_dir = _run_dir_of(st)
     t = Path(tree).resolve()
     dirs = _git_dirs_of(t)
@@ -22583,10 +22921,14 @@ def _measurement_grants(st: "State", tree: str | Path,
     `SETUP_HOOK_KIND` also writes `MISE_DATA_DIR` and `~/.local/bin`,
     `TOOLCHAIN_KIND` `MISE_DATA_DIR` with its trust records
     (`MISE_STATE_DIR`) emptied first; `STORE_FETCH_KIND` leerie's stores
-    whole, the fetched stores' one writer. `env` points the command's temp,
-    `XDG_CACHE_HOME` and mise state at the measurement directory; the store
-    variables stay as leerie's environment and `_tree_store_env` set
-    them."""
+    whole, the fetched stores' one writer. `env` points the command's temp
+    and `XDG_CACHE_HOME` at the tree's private temp directory
+    (`/tmp/l/<id>/`, `_private_tmp`) and its mise state at the measurement
+    directory; the store variables stay as leerie's environment and
+    `_tree_store_env` set them. Every kind may also write `/tmp` itself
+    (`shared_tmp`), which `_run_streaming` grants under the run's `/tmp`
+    lock (DESIGN §6 *A measurement may write `/tmp`; a held-out evaluation
+    has it alone*)."""
     if kind not in (MEASURE_KIND, SETUP_HOOK_KIND, TOOLCHAIN_KIND,
                     STORE_FETCH_KIND):
         raise ValueError(f"no measurement kind {kind!r}")
@@ -22621,7 +22963,7 @@ def _measurement_grants(st: "State", tree: str | Path,
         # The tree's own stores (`_tree_store_env`), which no other tree
         # reads.
         tree_stores = run_dir / TREE_STORES_DIRNAME / t.name
-        tree_stores.mkdir(parents=True, exist_ok=True)
+        _mkdir_private(tree_stores, run_dir)
         rw.append(str(tree_stores))
     ro: list[str] = [str(stores),
                      str(run_dir / MISE_OVERRIDES_NAME),
@@ -22643,18 +22985,24 @@ def _measurement_grants(st: "State", tree: str | Path,
         # mise keeps its trust records here: emptied, it trusts no
         # configuration, whatever the hook before it trusted.
         _rmtree_owned(mise_state)
-        mise_state.mkdir(parents=True, exist_ok=True)
-    tmp = str(own / "tmp")
-    xdg = own / "cache" / "xdg"
+        _mkdir_private(mise_state, run_dir)
+    # Remade on every grant: a held-out evaluation removes what it created,
+    # this directory included when it made it (`_held_out_section`).
+    tmp = str(_private_tmp(own))
+    rw.append(tmp)
     state = own / "state"
-    runtime = own / "run"
-    for d in (xdg, state, runtime):
-        d.mkdir(parents=True, exist_ok=True)
+    # A runtime directory holds sockets: in the short private one, like
+    # the temp directory (DESIGN §6 *A confined command's scratch is short
+    # and private*).
+    runtime = Path(tmp) / "run"
+    _mkdir_private(state, run_dir)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(runtime, 0o700)
     # pnpm keeps a lock and (pnpm 11) a SQLite db under its state and runtime
-    # dirs; in the measurement directory they are writable while leerie's
-    # store stays read-only (DESIGN §6 *A measurement pins pnpm's version*).
+    # dirs; there they are writable while leerie's store stays read-only
+    # (DESIGN §6 *A measurement pins pnpm's version*).
     env = {"TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
-           "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": str(xdg),
+           "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": tmp,
            "XDG_STATE_HOME": str(state), "XDG_RUNTIME_DIR": str(runtime)}
     if kind != STORE_FETCH_KIND:
         # pnpm 11 opens its store's SQLite index read-write for every install
@@ -22673,7 +23021,8 @@ def _measurement_grants(st: "State", tree: str | Path,
         tuple(dict.fromkeys(_around(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root)
                             + _around(ro, state_root))),
-        tuple(env.items()))
+        tuple(env.items()),
+        tuple(dict.fromkeys(_around([str(SHARED_TMP)], state_root))))
 
 
 async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
@@ -49138,7 +49487,9 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
         path.write_text(_PARSE_PROBE_SOURCE.format(
             targets=[str(Path(tree) / t) for t in targets],
             marker=str(marker)))
-        async with _blt_semaphore(caps):
+        # It runs beside a held-out file: as that file's run does
+        # (`_run_acceptance_file`), it has `/tmp` alone.
+        async with _held_out_section(st):
             rc, out = await _run_streaming(
                 argv, grants=grants, cwd=str(tree),
                 timeout=float(caps.get("worker_timeout_sec",
@@ -49428,7 +49779,10 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     except ForbiddenByTask as e:
         log(f"  {label}: `{rel}` not run — {e}")
         return None
-    async with _blt_semaphore(caps):
+    # A held-out file's run has `/tmp` alone, which bounds it more tightly
+    # than the BLT semaphore would (DESIGN §6 *A measurement may write
+    # `/tmp`; a held-out evaluation has it alone*).
+    async with _held_out_section(st):
         try:
             rc, tail = await _run_streaming(
                 argv, grants=grants, cwd=str(tree), env=env,
@@ -50153,226 +50507,231 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
     failing and typed `intermittent_cases` — never unmeasured."""
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
     results: list[dict] = []
-    for s_ in sets:
-        failing, copied, ran = [], [], []
-        resource_affected: list[str] = []
-        budget_short: list[str] = []
-        unsettled_files: list[str] = []
-        no_verdict_files: list[str] = []
-        unmeasured = False
-        # Why each file gave no verdict, and a whole-set cause: what the PR
-        # names for an unmeasured set (DESIGN §8 *A held-out set the final
-        # tree leaves unmeasured is never silent*).
-        why_files: dict[str, str] = {}
-        why_set: str | None = None
-        case_ids: dict[str, list[str]] = {}
-        # Every failing run of each file, the first and each vote rerun:
-        # its cases come from all of them (`_acceptance_vote_cases`).
-        runs: dict[str, list[dict]] = {}
-        no_case_evidence: list[str] = []
-        # Held cases seen failing per file (any signature), the files a held
-        # case failing with no resource signature settled as failing, and
-        # the cases of the run that settled each.
-        seen: dict[str, set[str]] = {}
-        asserted: set[str] = set()
-        asserted_ids: dict[str, list[str]] = {}
-        intermittent: dict[str, list[str]] = {}
-        discovery: dict | None = None
+    # The sets' files are in `wt` from here until each is removed: `/tmp`
+    # is the evaluation's alone meanwhile, and what it creates there goes
+    # with it (DESIGN §6 *A measurement may write `/tmp`; a held-out
+    # evaluation has it alone*).
+    async with _held_out_section(st):
+        for s_ in sets:
+            failing, copied, ran = [], [], []
+            resource_affected: list[str] = []
+            budget_short: list[str] = []
+            unsettled_files: list[str] = []
+            no_verdict_files: list[str] = []
+            unmeasured = False
+            # Why each file gave no verdict, and a whole-set cause: what the PR
+            # names for an unmeasured set (DESIGN §8 *A held-out set the final
+            # tree leaves unmeasured is never silent*).
+            why_files: dict[str, str] = {}
+            why_set: str | None = None
+            case_ids: dict[str, list[str]] = {}
+            # Every failing run of each file, the first and each vote rerun:
+            # its cases come from all of them (`_acceptance_vote_cases`).
+            runs: dict[str, list[dict]] = {}
+            no_case_evidence: list[str] = []
+            # Held cases seen failing per file (any signature), the files a held
+            # case failing with no resource signature settled as failing, and
+            # the cases of the run that settled each.
+            seen: dict[str, set[str]] = {}
+            asserted: set[str] = set()
+            asserted_ids: dict[str, list[str]] = {}
+            intermittent: dict[str, list[str]] = {}
+            discovery: dict | None = None
 
-        def _note(rel: str, obs: dict, _s=s_, _seen=seen,
-                  _asserted=asserted, _ids=asserted_ids) -> bool:
-            hit, saw = _acceptance_held_signals(_s, rel, obs)
-            if saw:
-                _seen.setdefault(rel, set()).update(saw)
-            if hit:
-                _asserted.add(rel)
-                _ids.setdefault(rel, list(obs.get("failing_cases") or []))
-            return bool(hit)
-        try:
-            for rel in ((s_.get("support_files") or [])
-                        + s_["defect_files"] + s_["control_files"]):
-                dst = wt / rel
-                if dst.exists():
-                    # Never overwrite (or run in its place) a file the
-                    # tree already has — and never count the set as
-                    # passing on a file it could not run.
-                    unmeasured = True
-                    why_files[rel] = "path_in_use"
-                    continue
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(Path(s_["dir"]) / rel, dst)
-                copied.append(dst)
-                if rel not in (s_.get("support_files") or []):
-                    ran.append(rel)
-            for rel in ran:
-                obs: dict = {}
-                verdict = await _run_acceptance_file(
-                    st, caps, str(wt), rel, log_path,
-                    f"acceptance-{label}", cases_out=obs,
-                    **_env_kw(env_extra))
-                if verdict is None:
-                    unmeasured = True
-                    why_files[rel] = "no_runner_verdict"
-                elif verdict is False:
-                    failing.append(rel)
-                    runs.setdefault(rel, []).append(obs)
-                    _note(rel, obs)
-            vote = [r for r in failing if r not in asserted]
-            if vote and confirm:
-                n_rerun = {"i": 0}
-
-                async def _rerun(_left: float, _files=tuple(vote),
-                                 _n=n_rerun, _nt=_note, _runs=runs
-                                 ) -> set[str] | None:
-                    _n["i"] += 1
-                    still: set[str] = set()
-                    done: set[str] = set()
-                    # Every file of one rerun shares the budget left.
-                    end = time.monotonic() + _left
-                    for rel in _files:
-                        left = end - time.monotonic()
-                        if left <= 0:
-                            return _RerunCut(frozenset(still),
-                                             frozenset(done))
-                        o: dict = {}
-                        v = await _run_acceptance_file(
-                            st, _budget_caps(caps, left), str(wt), rel,
-                            log_path,
-                            f"acceptance-{label}-confirm{_n['i']}",
-                            cases_out=o, **_env_kw(env_extra))
-                        if v is None:
-                            return None
-                        if o.get("resource") and time.monotonic() >= end:
-                            # Cut short by the budget: not a run, and
-                            # never a pass (DESIGN §9 *Which failures are
-                            # new*, step 4).
-                            return _RerunCut(frozenset(still),
-                                             frozenset(done))
-                        done.add(rel)
-                        if v is False:
-                            still.add(rel)
-                            _runs.setdefault(rel, []).append(o)
-                            _nt(rel, o)
-                    return still
-                # Every file of the vote failed its first run — one whose
-                # first run timed out or died of a signal (a resource
-                # signature) only by that: it needs a finished rerun.
-                verdict_ = await _confirm_still_failing(
-                    vote, _rerun, caps, seen_failing=True,
-                    needs_rerun=[r for r in vote
-                                 if (runs.get(r) or [{}])[0].get("resource")],
-                    label=f"acceptance {label} set {s_['index']}")
-                budget_short = list(verdict_.get("budget_short") or [])
-                unsettled_files = list(
-                    verdict_.get("budget_short_unsettled") or [])
-                no_verdict_files = list(verdict_.get("no_verdict") or [])
-                # No verdict is no evidence either way, like mixed
-                # evidence: the set is unmeasured unless it also fails.
-                resource_affected = list(
-                    verdict_["resource_affected"]
-                    + (verdict_.get("no_verdict") or [])
-                    + unsettled_files)
-                failing = [r for r in failing
-                           if r in asserted or r in verdict_["confirmed"]]
-            if confirm:
-                pending = [r for r in ran if r not in failing
-                           and _acceptance_held_cases(s_, r)]
-                if pending:
-                    discovery = await _acceptance_discover(
-                        st, caps, wt, pending, log_path, label,
-                        env_extra, _note, index=s_["index"])
-                    failing += [r for r in pending if r in asserted]
+            def _note(rel: str, obs: dict, _s=s_, _seen=seen,
+                      _asserted=asserted, _ids=asserted_ids) -> bool:
+                hit, saw = _acceptance_held_signals(_s, rel, obs)
+                if saw:
+                    _seen.setdefault(rel, set()).update(saw)
+                if hit:
+                    _asserted.add(rel)
+                    _ids.setdefault(rel, list(obs.get("failing_cases") or []))
+                return bool(hit)
+            try:
+                for rel in ((s_.get("support_files") or [])
+                            + s_["defect_files"] + s_["control_files"]):
+                    dst = wt / rel
+                    if dst.exists():
+                        # Never overwrite (or run in its place) a file the
+                        # tree already has — and never count the set as
+                        # passing on a file it could not run.
+                        unmeasured = True
+                        why_files[rel] = "path_in_use"
+                        continue
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(Path(s_["dir"]) / rel, dst)
+                    copied.append(dst)
+                    if rel not in (s_.get("support_files") or []):
+                        ran.append(rel)
                 for rel in ran:
-                    if rel not in failing and seen.get(rel):
-                        # Rule 3: a held case that failed is never
-                        # unmeasured, whatever its signature said.
-                        intermittent[rel] = sorted(seen[rel])
-                        case_ids[rel] = sorted(seen[rel])
+                    obs: dict = {}
+                    verdict = await _run_acceptance_file(
+                        st, caps, str(wt), rel, log_path,
+                        f"acceptance-{label}", cases_out=obs,
+                        **_env_kw(env_extra))
+                    if verdict is None:
+                        unmeasured = True
+                        why_files[rel] = "no_runner_verdict"
+                    elif verdict is False:
                         failing.append(rel)
-                failing = [r for r in ran if r in failing]
-                resource_affected = [r for r in resource_affected
-                                     if r not in failing]
-                if resource_affected and not failing:
-                    unmeasured = True
-            for rel in failing:
-                if rel in intermittent:
-                    continue
-                if rel in asserted_ids:
-                    case_ids[rel] = asserted_ids[rel]
-                    continue
-                got = _acceptance_vote_cases(runs.get(rel) or [])
-                if got is None:
-                    no_case_evidence.append(rel)
-                elif got:
-                    case_ids[rel] = got
-        except Exception as e:
-            # A copy that fails (a full disk) is no verdict on this set —
-            # and must not escape: a repair's rollback check runs after.
-            log(f"  acceptance: set {s_['index']} could not be placed "
-                f"({type(e).__name__}) — no evidence from it")
-            unmeasured = True
-            why_set = "placement_failed"
-        finally:
-            # Sets are isolated from one another: one set's files are
-            # gone before the next set's go in.
-            for dst in copied:
-                with contextlib.suppress(OSError):
-                    dst.unlink()
-        res_ = {"index": s_["index"],
-                "passed": not failing and not unmeasured,
-                "unmeasured": unmeasured and not failing,
-                "failing_files": failing}
-        if resource_affected:
-            res_["resource_affected_files"] = resource_affected
-        if res_["unmeasured"]:
-            for rel in resource_affected:
-                first = (runs.get(rel) or [{}])[0]
-                why_files.setdefault(rel, (
-                    ("timed_out" if first.get("timed_out") else
-                     "killed" if first.get("killed") else
-                     "resource_first_run") if rel in unsettled_files
-                    else "no_verdict" if rel in no_verdict_files
-                    else "resource_affected"))
-            if why_set:
-                res_["unmeasured_reason"] = why_set
-            if why_files:
-                res_["unmeasured_files"] = {r: why_files[r] for r in sorted(
-                    why_files)}
-        if any(r in failing for r in budget_short):
-            # Failing on the reruns the budget allowed: said so, never
-            # dropped (DESIGN §8 *Held-out acceptance tests*).
-            res_["budget_short_files"] = [r for r in failing
-                                          if r in budget_short]
-        if any(r not in failing for r in unsettled_files):
-            # Seen failing only as a timeout, every rerun cut: unsettled,
-            # neither failing nor passing.
-            res_["budget_short_unsettled_files"] = [
-                r for r in unsettled_files if r not in failing]
-        if no_case_evidence:
-            # Failing, but no run gave case evidence: never read as a
-            # whole-file collapse (DESIGN §8 *Delivery re-drive* rule 4).
-            res_["no_case_evidence_files"] = no_case_evidence
-        # Per-case verdict where the runner's report gave one, for every
-        # confirmed failing file; a file without one counts as a whole.
-        if any(rel in case_ids for rel in failing):
-            res_["failing_cases"] = {rel: case_ids[rel] for rel in failing
-                                     if rel in case_ids}
-        if intermittent:
-            res_["intermittent_cases"] = intermittent
-            log(f"  acceptance {label} set {s_['index']}: held case(s) "
-                "failed only with resource signatures — typed intermittent, "
-                "a failing set (never unmeasured)")
-        if discovery is not None:
-            # Found or not: a set whose held cases were never rerun must not
-            # read like one rerun clean (DESIGN §8 *A held case that fails
-            # again*, rule 2).
-            res_["discovery"] = discovery
-            if discovery.get("incomplete"):
-                log(f"  acceptance {label} set {s_['index']}: "
-                    f"discovery_incomplete — {discovery['repeats_run']} of "
-                    f"{discovery['repeats_required']} rerun round(s) "
-                    f"({discovery.get('reason') or 'unknown'})")
-        results.append(res_)
+                        runs.setdefault(rel, []).append(obs)
+                        _note(rel, obs)
+                vote = [r for r in failing if r not in asserted]
+                if vote and confirm:
+                    n_rerun = {"i": 0}
+
+                    async def _rerun(_left: float, _files=tuple(vote),
+                                     _n=n_rerun, _nt=_note, _runs=runs
+                                     ) -> set[str] | None:
+                        _n["i"] += 1
+                        still: set[str] = set()
+                        done: set[str] = set()
+                        # Every file of one rerun shares the budget left.
+                        end = time.monotonic() + _left
+                        for rel in _files:
+                            left = end - time.monotonic()
+                            if left <= 0:
+                                return _RerunCut(frozenset(still),
+                                                 frozenset(done))
+                            o: dict = {}
+                            v = await _run_acceptance_file(
+                                st, _budget_caps(caps, left), str(wt), rel,
+                                log_path,
+                                f"acceptance-{label}-confirm{_n['i']}",
+                                cases_out=o, **_env_kw(env_extra))
+                            if v is None:
+                                return None
+                            if o.get("resource") and time.monotonic() >= end:
+                                # Cut short by the budget: not a run, and
+                                # never a pass (DESIGN §9 *Which failures are
+                                # new*, step 4).
+                                return _RerunCut(frozenset(still),
+                                                 frozenset(done))
+                            done.add(rel)
+                            if v is False:
+                                still.add(rel)
+                                _runs.setdefault(rel, []).append(o)
+                                _nt(rel, o)
+                        return still
+                    # Every file of the vote failed its first run — one whose
+                    # first run timed out or died of a signal (a resource
+                    # signature) only by that: it needs a finished rerun.
+                    verdict_ = await _confirm_still_failing(
+                        vote, _rerun, caps, seen_failing=True,
+                        needs_rerun=[r for r in vote
+                                     if (runs.get(r) or [{}])[0].get("resource")],
+                        label=f"acceptance {label} set {s_['index']}")
+                    budget_short = list(verdict_.get("budget_short") or [])
+                    unsettled_files = list(
+                        verdict_.get("budget_short_unsettled") or [])
+                    no_verdict_files = list(verdict_.get("no_verdict") or [])
+                    # No verdict is no evidence either way, like mixed
+                    # evidence: the set is unmeasured unless it also fails.
+                    resource_affected = list(
+                        verdict_["resource_affected"]
+                        + (verdict_.get("no_verdict") or [])
+                        + unsettled_files)
+                    failing = [r for r in failing
+                               if r in asserted or r in verdict_["confirmed"]]
+                if confirm:
+                    pending = [r for r in ran if r not in failing
+                               and _acceptance_held_cases(s_, r)]
+                    if pending:
+                        discovery = await _acceptance_discover(
+                            st, caps, wt, pending, log_path, label,
+                            env_extra, _note, index=s_["index"])
+                        failing += [r for r in pending if r in asserted]
+                    for rel in ran:
+                        if rel not in failing and seen.get(rel):
+                            # Rule 3: a held case that failed is never
+                            # unmeasured, whatever its signature said.
+                            intermittent[rel] = sorted(seen[rel])
+                            case_ids[rel] = sorted(seen[rel])
+                            failing.append(rel)
+                    failing = [r for r in ran if r in failing]
+                    resource_affected = [r for r in resource_affected
+                                         if r not in failing]
+                    if resource_affected and not failing:
+                        unmeasured = True
+                for rel in failing:
+                    if rel in intermittent:
+                        continue
+                    if rel in asserted_ids:
+                        case_ids[rel] = asserted_ids[rel]
+                        continue
+                    got = _acceptance_vote_cases(runs.get(rel) or [])
+                    if got is None:
+                        no_case_evidence.append(rel)
+                    elif got:
+                        case_ids[rel] = got
+            except Exception as e:
+                # A copy that fails (a full disk) is no verdict on this set —
+                # and must not escape: a repair's rollback check runs after.
+                log(f"  acceptance: set {s_['index']} could not be placed "
+                    f"({type(e).__name__}) — no evidence from it")
+                unmeasured = True
+                why_set = "placement_failed"
+            finally:
+                # Sets are isolated from one another: one set's files are
+                # gone before the next set's go in.
+                for dst in copied:
+                    with contextlib.suppress(OSError):
+                        dst.unlink()
+            res_ = {"index": s_["index"],
+                    "passed": not failing and not unmeasured,
+                    "unmeasured": unmeasured and not failing,
+                    "failing_files": failing}
+            if resource_affected:
+                res_["resource_affected_files"] = resource_affected
+            if res_["unmeasured"]:
+                for rel in resource_affected:
+                    first = (runs.get(rel) or [{}])[0]
+                    why_files.setdefault(rel, (
+                        ("timed_out" if first.get("timed_out") else
+                         "killed" if first.get("killed") else
+                         "resource_first_run") if rel in unsettled_files
+                        else "no_verdict" if rel in no_verdict_files
+                        else "resource_affected"))
+                if why_set:
+                    res_["unmeasured_reason"] = why_set
+                if why_files:
+                    res_["unmeasured_files"] = {r: why_files[r] for r in sorted(
+                        why_files)}
+            if any(r in failing for r in budget_short):
+                # Failing on the reruns the budget allowed: said so, never
+                # dropped (DESIGN §8 *Held-out acceptance tests*).
+                res_["budget_short_files"] = [r for r in failing
+                                              if r in budget_short]
+            if any(r not in failing for r in unsettled_files):
+                # Seen failing only as a timeout, every rerun cut: unsettled,
+                # neither failing nor passing.
+                res_["budget_short_unsettled_files"] = [
+                    r for r in unsettled_files if r not in failing]
+            if no_case_evidence:
+                # Failing, but no run gave case evidence: never read as a
+                # whole-file collapse (DESIGN §8 *Delivery re-drive* rule 4).
+                res_["no_case_evidence_files"] = no_case_evidence
+            # Per-case verdict where the runner's report gave one, for every
+            # confirmed failing file; a file without one counts as a whole.
+            if any(rel in case_ids for rel in failing):
+                res_["failing_cases"] = {rel: case_ids[rel] for rel in failing
+                                         if rel in case_ids}
+            if intermittent:
+                res_["intermittent_cases"] = intermittent
+                log(f"  acceptance {label} set {s_['index']}: held case(s) "
+                    "failed only with resource signatures — typed intermittent, "
+                    "a failing set (never unmeasured)")
+            if discovery is not None:
+                # Found or not: a set whose held cases were never rerun must not
+                # read like one rerun clean (DESIGN §8 *A held case that fails
+                # again*, rule 2).
+                res_["discovery"] = discovery
+                if discovery.get("incomplete"):
+                    log(f"  acceptance {label} set {s_['index']}: "
+                        f"discovery_incomplete — {discovery['repeats_run']} of "
+                        f"{discovery['repeats_required']} rerun round(s) "
+                        f"({discovery.get('reason') or 'unknown'})")
+            results.append(res_)
     return results
 
 
@@ -64704,6 +65063,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # `st` is a parameter, already constructed by `main()`, so `st.run_id`
     # is valid before `st.load()`.
     log(f"run id: {st.run_id}")
+    # Before anything makes a temp file: leerie's own are never in `/tmp`.
+    _use_run_tmp(st)
     # A `resume` of a run that never reached phase_classify is a START, not a
     # resume, and it is demoted HERE — above the dispatch — so the fresh-run
     # branch below does its normal state seeding. Flipping the flag inside the

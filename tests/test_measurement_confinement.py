@@ -83,21 +83,34 @@ write other measurement|echo x > {other}/planted
     assert not any(got.values()), {k: v for k, v in got.items() if v}
 
 
-def test_its_temp_and_caches_point_at_its_own_dir(leerie, run):
+def test_its_temp_and_cache_are_its_trees_private_dir(leerie, run):
+    """`TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name the tree's private
+    temp directory under `/tmp/l/` (DESIGN §6 *A confined command's scratch
+    is short and private*), recorded in its measurement directory's
+    sidecar; mise's state stays in the measurement directory."""
+    import json
     view = run["wts"][f"{run['run_dir'].name}-view-staging"]
     g = _measure(leerie, run, view)
     own = leerie._measure_dir(_state(run), view).resolve()
     env = dict(g.env)
-    assert Path(env["TMPDIR"]).resolve().is_relative_to(own)
-    # Every directory it names; pnpm's read-only-store settings are
-    # booleans, not places (DESIGN §6 *A measurement pins pnpm's version*).
-    flags = {f"{p}{k}" for p in ("npm_config_", "pnpm_config_")
-             for k in ("frozen_store", "verify_deps_before_run")}
-    caches = [v for k, v in env.items()
-              if k not in ("TMPDIR", "TMP", "TEMP", "MISE_STATE_DIR")
-              and k not in flags]
-    assert caches and all(Path(v).resolve().is_relative_to(own)
-                          for v in caches)
+    tmp = Path(env["TMPDIR"])
+    assert tmp.parent == leerie.PRIVATE_TMP_ROOT
+    assert env["TMP"] == env["TEMP"] == env["XDG_CACHE_HOME"] == str(tmp)
+    side = json.loads((own.parent / f"{own.name}.tree").read_text())
+    assert side["tmp"] == str(tmp)
+    # Every place it names — a value that is an absolute path; the rest
+    # (pnpm's read-only-store booleans) are settings, not places — is the
+    # private temp directory, beneath it, or beneath the measurement
+    # directory.
+    places = {k: Path(v) for k, v in env.items() if v.startswith("/")}
+    assert set(places) >= {"TMPDIR", "MISE_STATE_DIR", "XDG_STATE_HOME",
+                           "XDG_RUNTIME_DIR"}
+    assert all(p.is_relative_to(tmp) or p.resolve().is_relative_to(own)
+               for p in places.values()), places
+    assert places["XDG_RUNTIME_DIR"].is_relative_to(tmp)
+    assert all(not v.startswith(("/", ".")) for k, v in env.items()
+               if k not in places)
     got = _probe(leerie, g, 'temp write|echo x > "$TMPDIR/t"', env)
     assert got == {"temp write": True}
-    assert os.listdir(env["TMPDIR"]) == ["t"]
+    # Its runtime directory is in it too, made with it.
+    assert sorted(os.listdir(tmp)) == ["run", "t"]

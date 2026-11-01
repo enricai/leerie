@@ -75,16 +75,22 @@ def test_a_tree_made_again_gets_a_fresh_measurement_dir(leerie, layout):
     view = layout.run_dir / "worktrees" / "lifetime0001-view-x"
     _add(layout.repo, view)
     first = leerie._measure_dir(layout.st, view)
-    (first / "tmp" / "left-behind").write_text("from the first tree\n")
+    first_tmp = leerie._private_tmp(first)
+    (first / "reports" / "left-behind").write_text("from the first tree\n")
+    (first_tmp / "left-behind").write_text("from the first tree\n")
     assert leerie._measure_dir(layout.st, view) == first   # stable
     _remove(layout.repo, view)
     _add(layout.repo, view)
     second = leerie._measure_dir(layout.st, view)
     assert second != first
     assert second.parent == first.parent == layout.run_dir / "measure"
-    assert list((second / "tmp").iterdir()) == []
-    # The first tree's directory was swept when the second was made.
+    assert list((second / "reports").iterdir()) == []
+    second_tmp = leerie._private_tmp(second)
+    assert second_tmp != first_tmp and list(second_tmp.iterdir()) == []
+    # The first tree's directory, and its private temp directory, were
+    # swept when the second was made.
     assert not first.exists()
+    assert not first_tmp.exists()
 
 
 def test_a_removed_trees_dir_is_swept_by_the_next_measurement(leerie,
@@ -121,10 +127,19 @@ def test_the_kinds_differ_only_where_designed(leerie, layout, tmp_path,
     assert bin_ not in m.rw and data not in m.rw
     assert bin_ in h.rw and data in h.rw
     assert data in t.rw and bin_ not in t.rw
-    # Every other grant is the same for all three.
+    # Every other grant is the same for all three — compared without the
+    # reads `_beside` lists outside the state root: those are the live
+    # entries of the directories on the root's path (`/tmp`, pytest's
+    # basetemp), which other processes — `-n 4`'s other workers among
+    # them — add to and remove from between the three calls.
+    root = layout.run_dir.parent.parent.resolve()
+    above = {str(a) for a in root.parents}
+
+    def own(paths):
+        return {p for p in paths if str(Path(p).parent) not in above}
     for g in (h, t):
-        assert set(g.rw) - {bin_, data} == set(m.rw)
-        assert g.ro == m.ro
+        assert own(g.rw) - {bin_, data} == own(m.rw)
+        assert own(g.ro) == own(m.ro)
     with pytest.raises(ValueError):
         leerie._measurement_grants(layout.st, tree, "anything")
 

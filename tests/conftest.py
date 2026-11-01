@@ -11,6 +11,7 @@ import atexit
 import contextlib
 import ctypes
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -384,9 +385,19 @@ def measure_run_dir(tmp_path: Path, *, beside: bool = False) -> Path:
 
 
 def measured_tmp_files(run_dir: Path, name: str) -> list[Path]:
-    """Every `<measurement dir>/tmp/<name>`: where a confined command's
-    `$TMPDIR` put a file a test reads back (a run counter, a marker)."""
-    return sorted((Path(run_dir) / "measure").glob(f"*/tmp/{name}"))
+    """Every `<private temp dir>/<name>` of the run's measured trees: where
+    a confined command's `$TMPDIR` put a file a test reads back (a run
+    counter, a marker). Each tree's private temp directory (`/tmp/l/<id>/`)
+    is named in its measurement directory's sidecar."""
+    out: list[Path] = []
+    for side in (Path(run_dir) / "measure").glob("*.tree"):
+        try:
+            tmp = json.loads(side.read_text()).get("tmp")
+        except (OSError, ValueError):
+            continue
+        if tmp:
+            out += Path(tmp).glob(name)
+    return sorted(out)
 
 
 _FAKE_RUN_DIR: Path | None = None
@@ -401,6 +412,20 @@ def fake_run_dir() -> Path:
     template and workers into the next."""
     assert _FAKE_RUN_DIR is not None
     return _FAKE_RUN_DIR
+
+
+@pytest.fixture(autouse=True)
+def _own_temp_dir_restored():
+    """Put the process's temp directory back after a test that ran
+    `_run_phases`, which makes the run directory's `tmp/` leerie's own
+    (`_use_run_tmp`: `tempfile.tempdir` and `TMPDIR`)."""
+    saved, env = tempfile.tempdir, os.environ.get("TMPDIR")
+    yield
+    tempfile.tempdir = saved
+    if env is None:
+        os.environ.pop("TMPDIR", None)
+    else:
+        os.environ["TMPDIR"] = env
 
 
 @pytest.fixture(autouse=True)

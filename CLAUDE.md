@@ -161,13 +161,23 @@ the rest of the family stay denied.
   (`_worker_grants`, Landlock). A repository command leerie runs — build,
   lint, tests, install, the held-out sets, CI parity, coverage, `verify`,
   the setup hook, `mise`, the AST scripts — writes its tree, its
-  measurement directory, the verified caches and its tree's own stores,
-  and by kind `MISE_DATA_DIR`, `~/.local/bin` or (the store fetch alone)
-  leerie's stores (`_measurement_grants`, through `_run_streaming`, whose
-  `grants` has no default). The host-side workers (rebaser, host
-  recapture, `config --chat`) are the one exception. DESIGN §6 *A worker
-  writes only where it is granted (I5)*, *Outside the container*,
-  *Leerie's runs of the repository's commands are confined too*.
+  measurement directory, its tree's private temp directory
+  (`/tmp/l/<id>/`, 0700, its `TMPDIR` and `XDG_CACHE_HOME`), the verified
+  caches and its tree's own stores, and by kind `MISE_DATA_DIR`,
+  `~/.local/bin` or (the store fetch alone) leerie's stores
+  (`_measurement_grants`, through `_run_streaming`, whose `grants` has no
+  default). Through `_run_streaming` alone it may also write `/tmp`,
+  holding the run's `/tmp` lock shared; a held-out evaluation holds it
+  exclusive and removes what it created there (`_held_out_section`). A
+  worker neither reads nor writes `/tmp`, and leerie keeps nothing of its
+  own there (`_use_run_tmp`). Every confined command's processes end with
+  it: the Landlock shim is their subreaper. The host-side workers
+  (rebaser, host recapture, `config --chat`) are the one exception.
+  DESIGN §6 *A worker writes only where it is granted (I5)*, *Outside the
+  container*, *Leerie's runs of the repository's commands are confined
+  too*, *A confined command's scratch is short and private*, *A
+  measurement may write `/tmp`; a held-out evaluation has it alone*, *A
+  confined command's processes end with it*.
 - **Each run has its own repository, and each committing tree its own
   (I4, I6).** The user's repository is only fetched from, and receives the
   run branch by the host-side bring-back; only leerie moves the run

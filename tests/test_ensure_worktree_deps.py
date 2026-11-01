@@ -69,14 +69,16 @@ def test_installs_on_first_call(leerie, st, streaming, tmp_path):
     calls = streaming()
     _go(leerie, tmp_path, st)
     assert [c[0] for c in calls] == [["pnpm", "install"]]
-    # Confined to the tree it installs into, with its temp in the tree's own
-    # measurement directory (DESIGN §6 *Leerie's runs of the repository's
-    # commands are confined too*).
+    # Confined to the tree it installs into, with its temp the tree's own
+    # private temp directory (DESIGN §6 *Leerie's runs of the repository's
+    # commands are confined too*, *A confined command's scratch is short
+    # and private*).
     g = calls[0][1]["grants"]
     assert str(tmp_path.resolve()) in g.rw
     own = leerie._measure_dir(st, tmp_path)
     assert str(own) in g.rw
-    assert dict(g.env)["TMPDIR"] == str(own / "tmp")
+    assert dict(g.env)["TMPDIR"] == str(leerie._private_tmp(own))
+    assert dict(g.env)["TMPDIR"] in g.rw
 
 
 def test_second_call_on_the_same_tree_installs_nothing(leerie, st, streaming,
