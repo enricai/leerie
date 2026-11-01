@@ -592,6 +592,9 @@ def _emulated_heldout_sandbox(request, monkeypatch):
     monkeypatch.setattr(leerie, "_confined_argv", _argv)
 
 
+NO_REAL_HELDOUT_SANDBOX_SITE = REPO_ROOT / "tests" / "no_real_heldout_sandbox_site"
+
+
 @pytest.fixture(autouse=True)
 def _no_real_heldout_sandbox(request, monkeypatch):
     """Keep the entry's `_require_heldout_sandbox` (`_require_confinement`)
@@ -599,8 +602,12 @@ def _no_real_heldout_sandbox(request, monkeypatch):
     with mounts, which a developer host and CI restrict (Ubuntu's
     `kernel.apparmor_restrict_unprivileged_userns`): every test driving real
     `main()` would die there. The stub also leaves `ISOLATE_ENV` unset,
-    so nothing a test spawns is isolated. A test whose subject is the gate
-    opts out with `@pytest.mark.real_heldout_sandbox` (and skips where
+    so nothing a test spawns is isolated. A Python child a test starts gets
+    the same stub through `tests/no_real_heldout_sandbox_site/` put first on
+    `PYTHONPATH` (its `sitecustomize`): a test that drives the real `main()`
+    in a process of its own would otherwise die at `_require_confinement`
+    on that host before reaching its subject. A test whose subject is the
+    gate opts out with `@pytest.mark.real_heldout_sandbox` (and skips where
     `isolation_error()` reports the host cannot build one)."""
     # The real gate sets the variable in `os.environ` itself, which
     # monkeypatch would not undo: cleared before and after every test.
@@ -618,6 +625,9 @@ def _no_real_heldout_sandbox(request, monkeypatch):
             if hasattr(mod, "_require_heldout_sandbox"):
                 monkeypatch.setattr(mod, "_require_heldout_sandbox",
                                     lambda run_dir: None)
+        prior = os.environ.get("PYTHONPATH")
+        monkeypatch.setenv("PYTHONPATH", os.pathsep.join(
+            [str(NO_REAL_HELDOUT_SANDBOX_SITE)] + ([prior] if prior else [])))
     yield
     os.environ.pop("LEERIE_ISOLATED", None)
 

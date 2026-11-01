@@ -5722,6 +5722,20 @@ run payload-only the same way, and `_replay_capture` reads a ref-less
 files only, removed with the replay's temporary directory — never the
 checkout, whose uncommitted file stays untouched.
 
+## A host that cannot build the sandbox runs the suite green
+
+`main()` runs `_require_confinement` on every entry, and a host that
+restricts unprivileged user namespaces (a developer host, CI's
+ubuntu-latest) cannot build the sandbox it requires. `tests/conftest.py`'s
+autouse `_no_real_heldout_sandbox` stubs `_require_heldout_sandbox` in the
+pytest process and, through `tests/no_real_heldout_sandbox_site/sitecustomize.py`
+first on `PYTHONPATH`, in every Python child a test starts (the 15
+real-`main()` children of `tests/test_credentials_never_outlive_the_run.py`
+were red without it). `tests/test_no_real_heldout_sandbox_site.py` (2
+tests): a child's entry (`_require_confinement`) passes on such a host, and a
+`real_heldout_sandbox` test's child keeps the real gate. Falsified: with the
+`PYTHONPATH` entry dropped, those 15 and the first test are red.
+
 ## A worker cannot change another worker's environment
 
 `tests/test_worker_config_isolation.py` (6 tests, DESIGN §6 *Each worker's

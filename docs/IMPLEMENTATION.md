@@ -4611,7 +4611,11 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   (`_EgressProxy._refused`). `tests/conftest.py`'s autouse
   `_no_real_heldout_sandbox` stubs it (opt-out
   `@pytest.mark.real_heldout_sandbox`, registered in `pytest.ini`) and
-  clears `ISOLATE_ENV` before and after every test.
+  clears `ISOLATE_ENV` before and after every test; in every Python child
+  a test starts too, by putting `tests/no_real_heldout_sandbox_site/`
+  (whose `sitecustomize` stubs it in each `orchestrator/leerie.py` the
+  child executes) first on `PYTHONPATH` (pinned by
+  `tests/test_no_real_heldout_sandbox_site.py`).
 - **The execution lock** (replaces the run's `/tmp` lock): `_TmpLock` →
   `_ExecLock`, `_tmp_lock()` → `_exec_lock()`, `_TMP_LOCKS` →
   `_EXEC_LOCKS`, `_TMP_EXCLUSIVE` → `_EXEC_EXCLUSIVE`; the same semantics
