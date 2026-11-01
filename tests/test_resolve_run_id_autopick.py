@@ -26,11 +26,22 @@ import json
 import pytest
 
 
+# The runs these helpers make stand for runs of the leerie under test, so
+# they carry its run layout; a run of another layout lists as `other-leerie`
+# (tests/test_run_layout.py).
+_LAYOUT: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _this_leeries_layout(leerie):
+    _LAYOUT["run_layout"] = leerie.RUN_LAYOUT_VERSION
+
+
 def _mk_run(root, run_id, *, started=None, run_json=None, state=None):
     """Create a run dir _discover_runs() will find."""
     d = root / "runs" / run_id
     d.mkdir(parents=True, exist_ok=True)
-    st = {"task": "t", "worker_count": 0}
+    st = {"task": "t", "worker_count": 0, **_LAYOUT}
     if started is not None:
         st["started_at"] = started
     if state:

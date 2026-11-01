@@ -388,37 +388,8 @@ def test_finalize_sh_counts_from_the_base_it_is_given(leerie, env):
 
 # --------------------------------------------------------- resume refusal
 
-def test_resume_of_a_pre_run_repo_run_is_refused(leerie, env, capsys):
-    _repo, _state, st = env
-    (st.run_dir / "run.json").write_text(json.dumps(
-        {"run_id": RUN_ID, "branch": f"leerie/runs/{RUN_ID}"}))
-    with pytest.raises(SystemExit):
-        leerie._refuse_pre_run_repo_resume(st)
-    err = capsys.readouterr().err
-    assert f"leerie finalize {RUN_ID}" in err
-    assert not (st.run_dir / "repo").exists()
-
-
-def test_resume_of_a_new_run_is_not_refused(leerie, env):
-    _repo, _state, st = env
-    (st.run_dir / "run.json").write_text(json.dumps(
-        {"run_id": RUN_ID, "branch": f"leerie/runs/{RUN_ID}"}))
-    st.data["run_repo"] = "repo"
-    leerie._refuse_pre_run_repo_resume(st)          # no exit
-    st.data.pop("run_repo")
-    (st.run_dir / "run.json").write_text(json.dumps({"run_id": RUN_ID}))
-    leerie._refuse_pre_run_repo_resume(st)          # never got a branch
-
-
-def test_refusal_sits_on_the_resume_path_before_the_run_repo(leerie):
-    """Order, not presence: the refusal must run before `_run_phases`
-    creates a run repository, or a pre-change run would get one and pass."""
-    import inspect
-    src = inspect.getsource(leerie._run_phases)
-    refuse = src.index("_refuse_pre_run_repo_resume(st)")
-    ensure = src.index("await _ensure_run_repo_or_die(st)")
-    assert refuse < ensure
-    assert src.index("if args.resume:") < refuse
+# A run made before per-run repositories is refused by its run layout, not by
+# a check of its own: tests/test_run_layout.py.
 
 
 # ------------------------------------------------------ deletions' guards
@@ -483,7 +454,8 @@ def test_main_names_the_run_a_bare_resume_picked(leerie, tmp_path,
                          ("newer-run", "2026-02-01T00:00:00+00:00")):
         (runs / rid).mkdir(parents=True)
         (runs / rid / "state.json").write_text(json.dumps(
-            {"task": "t", "started_at": started}))
+            {"task": "t", "started_at": started,
+             "run_layout": leerie.RUN_LAYOUT_VERSION}))
         (runs / rid / "run.json").write_text(json.dumps(
             {"run_id": rid, "started_at": started}))
     target = tmp_path / ".runid-launcher"

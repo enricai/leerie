@@ -612,8 +612,9 @@ class TestPhaseFlagShortCircuit:
         run_dir = repo / ".leerie" / "runs" / run_id
         run_dir.mkdir(parents=True)
         (run_dir / "subtasks").mkdir()
-        (run_dir / "state.json").write_text(
-            json.dumps({"task": "a trivial task"}))
+        (run_dir / "state.json").write_text(json.dumps(
+            {"task": "a trivial task",
+             "run_layout": leerie.RUN_LAYOUT_VERSION}))
         # `main()`'s own PRIMARY `State(...)` construction (before the
         # `if args.phase:` branch) takes an exclusive flock on this same
         # run_dir for the whole call, because `--phase` reuses one

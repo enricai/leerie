@@ -2351,27 +2351,19 @@ r16 H2's two scenarios):
   user's HEAD commit, so the scripts' existing "fall back to HEAD" keeps its
   meaning.
 
-**Resume of a run made before this change: refused once its run branch
-was cut.** That run's state has no `run_repo` field, and once its run
-branch exists (`run.json` has `branch`), its staging, subtask worktrees
-and branches live in the user's repository. `resume` dies, saying:
-
-- the run predates per-run repositories;
-- its integrated work is on `leerie/runs/<id>` in the user's repository,
-  where `leerie finalize <id>` (host-side, unchanged) still ships it;
-- otherwise, start the task again.
-
-Resuming the old way would keep every user-repository code path alive only
-for runs in flight at upgrade: the scoped prune of the shared registry, the
-cross-run lock, subtask-branch deletion in the user's repository and
+**Resume of a run made before this change: refused.** Its staging, subtask
+worktrees and branches live in the user's repository, and its run directory
+records no `run_layout`, so `resume` refuses it under *A run directory is
+continued only by a leerie of its layout* (below), whatever phase it reached;
+its integrated work is on `leerie/runs/<id>` in the user's repository, where
+the leerie that started it can finish it. Resuming the old way would keep
+every user-repository code path alive only for runs in flight at upgrade:
+the scoped prune of the shared registry, the cross-run lock,
+subtask-branch deletion in the user's repository and
 `_redrive_exclude_clear`. Those runs would also run without I4 while
 nothing said so. A one-time re-run is cheaper than a permanent second
 layout. Host-side tools (`list`, `finalize`, `prune`, `accept-*`) keep
-working on such runs. A run from before the change that is still in
-planning (no `branch` in `run.json`) is resumed: the only tree it has in
-the user's repository is the planning worktree, which the resume makes
-afresh in the run's own repository (its old registration in the user's
-`.git/worktrees/` stays until `leerie prune`).
+working on such runs.
 
 **Runtimes.** No mount changes and no chown is added.
 
@@ -3687,7 +3679,9 @@ only the runs that are actually resumable — those whose derived status is
 `in-progress`, `paused`, or `incomplete` — and picks the most recent. A
 run that has finished (`done`, `done-pushed-pr`) has nothing to resume, and
 one that needs operator attention first (`seed-failed`, `sync-failed`) is
-never auto-picked: both are listed, not chosen. When no run is resumable,
+never auto-picked: both are listed, not chosen. Nor is a run another
+leerie's layout made (`other-leerie`, *A run directory is continued only by
+a leerie of its layout*): this leerie refuses to resume it. When no run is resumable,
 or the newest cannot be identified, `resume` lists the candidates and
 requires an explicit id.
 
@@ -3895,6 +3889,68 @@ cross-check via a `/proc` scan for any process whose argv contains
 orchestrator is sufficient to declare "alive," making the pid file
 advisory: even a future race produces at worst a false-positive REFUSE,
 never silent corruption.
+
+### A run directory is continued only by a leerie of its layout
+
+A run directory's layout is whatever the leerie that made it writes there:
+where the worktrees and branches live (the user's repository, or the run's
+own `repo`), the per-tree repositories, the measurement directories, the
+transcript registry (`transcripts.ndjson`), `logs/held-out/`, the ref-less
+clones' git directories. A later process of the same run reads those
+records back, and it reads them with its own idea of the layout. Run with a
+different one, a record's *absence* is misread: a directory made before the
+transcript registry has no `transcripts.ndjson`, so every transcript it
+holds reads as "not a transcript", and the delivery judge's executed-
+commands record, the dependency-capture backstop and run health silently
+drop every worker run from before the resume (review round 21, L1).
+Measured on a run directory made by main's code (run branch cut, staging
+worktree in the user's repository), `resume` on this layout did refuse, by
+the per-feature check `run_repo`-absent-and-`branch`-present, but only
+after it had loaded the run, so the refusal's own exit path then ran this
+layout's abnormal-exit clean-up on the old directory: it stamped
+`finished_at` into `state.json` and `run.json`, removed the staging
+worktree's directory (leaving its registration in the user's repository
+prunable) and added `notes/`, `tmp/` and `orchestrator.log`. A run from
+earlier on this branch, which has `run_repo` but no registry, passed that
+check and resumed with its transcripts unread.
+
+The root cause is that nothing recorded which layout a directory has, so
+each layout change was guarded, if at all, by a check inferring "old" from
+the absence of its own new record — one check per change, each blind to
+the others. The invariant: **only a leerie whose layout made a run
+directory spawns workers in it or writes its records.** No migration: a
+migration is one more code path per layout change, run only for directories
+in flight at an upgrade, and a missed record is exactly the L1 failure.
+
+The mechanism:
+
+- A fresh run records `run_layout` in `state.json`, set once from
+  `RUN_LAYOUT_VERSION` and never rewritten by a resume. A directory with no
+  `run_layout` is an older layout: every directory made before the field
+  existed. Any change to what a run directory holds that a later process of
+  the run reads back bumps `RUN_LAYOUT_VERSION`.
+- `resume` and `--phase judge|heal`, the two verbs that spawn workers in an
+  existing run directory, compare it as soon as `State` holds the
+  directory's lock and its `state.json` is read — before anything else
+  writes there — and stop with a message naming the run's layout, the
+  leerie version that made it, and the fix: finish it with that leerie, or
+  start the task again as a fresh run. The refusal happens before the
+  orchestrator's exit arms are armed, so it stamps nothing and cleans up
+  nothing: the directory stays exactly as the other leerie left it, for
+  that leerie to resume. A run that never reached its first phase is
+  refused too; its recorded task is the whole of it, and a fresh run with
+  the same task is the restart.
+- `leerie list` shows a run of another layout that still has work left
+  (`in-progress`, `paused`, `incomplete`) as `other-leerie`, and a bare
+  `resume` does not auto-pick it. Finished runs keep their status.
+- The other verbs need no particular layout, because they read or write
+  only records every layout has: `list` and `--report` read `state.json`,
+  `run.json`, `calls.ndjson` and `memory.ndjson`; `accept-blocked` and `accept-integration`
+  edit `state.json` fields that layout never moved (so the leerie that made
+  the run then resumes past them); the host's `finalize` and `prune`
+  already handle both the run's own repository and its absence
+  (`host_bring_back_run_branch` is a no-op without one, and `prune`
+  deregisters an old run's worktrees from the user's repository).
 
 ### Never a repository-global git operation
 
@@ -8996,7 +9052,10 @@ the CLI's stderr, which leerie writes into the same file under its own
 header, is never parsed as an event. A second reader was the gap: with
 the record closed, the re-ask's session choice and the health scan still
 parsed `logs/` text on their own, so a printed `session_id` could steer
-which session a re-ask resumed.
+which session a re-ask resumed. A run directory made before the registry
+is never resumed by this leerie (§6 *A run directory is continued only by
+a leerie of its layout*), so a missing registry line always means "not a
+transcript", never "written before records existed".
 
 That rule leaves an item whose only evidence is a command the
 orchestrator never runs itself — the audit's repro, `npm run e2e`,

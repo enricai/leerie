@@ -212,6 +212,9 @@ def test_status_table_lists_every_value_used(leerie):
         "push-failed", "pr-failed",
         "paused", "killed",
         "sync-failed",
+        # Not returned by `_derive_run_status` itself: `_with_run_layout`
+        # overlays it (tests/test_run_layout.py).
+        "other-leerie",
     }
     assert set(leerie.RUN_STATUSES) == expected
 

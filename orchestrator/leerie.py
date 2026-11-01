@@ -923,10 +923,12 @@ STATE_FIELDS = (
     # against the base read `base_sha` (below).
     "working_branch",
     # run_repo: "repo" once the run's own repository `<run-dir>/repo`
-    # exists (DESIGN §6 *The run's own repository*). Its absence on a run
-    # whose run.json has a branch marks a run made before per-run
-    # repositories, which `resume` refuses.
+    # exists (DESIGN §6 *The run's own repository*).
     "run_repo",
+    # run_layout: RUN_LAYOUT_VERSION at the run's fresh start, never
+    # rewritten. Absent = a layout from before the field. `resume` and
+    # `--phase` refuse any other value (`_refuse_other_run_layout`).
+    "run_layout",
     # base_sha: the commit setup-run.sh cut the run branch from, recorded
     # once by phase_execute. Every comparison leerie makes against the base
     # reads it, never the working branch's name, which in the run's
@@ -7363,7 +7365,20 @@ def _run_status_for(run: dict, leerie_root: Path) -> str:
     a correctness boundary."""
     sidecar = leerie_root / "runs" / run["run_id"] / "run.json"
     run_json = _read_run_json_sidecar(sidecar)
-    return _derive_run_status(run_json, run)
+    return _with_run_layout(_derive_run_status(run_json, run), run)
+
+
+def _with_run_layout(status: str, state: dict | None) -> str:
+    """`other-leerie` for a run with work left whose run directory another
+    leerie's layout made, which this one refuses to resume (DESIGN §6 *A run
+    directory is continued only by a leerie of its layout*); else `status`.
+    `state` is the run's `state.json`; an orphan or unread one says nothing
+    about a layout."""
+    if (status in _AUTO_RESUMABLE_STATUSES and state
+            and not state.get("_orphan")
+            and state.get("run_layout") != RUN_LAYOUT_VERSION):
+        return "other-leerie"
+    return status
 
 
 def _run_recency_key(run: dict, leerie_root: Path) -> tuple[int, str]:
@@ -7551,6 +7566,7 @@ RUN_STATUSES = (
     "paused",
     "killed",
     "sync-failed",
+    "other-leerie",
 )
 
 
@@ -7666,7 +7682,7 @@ def _collect_run_rows(
         run_dir = leerie_root / "runs" / run_id
         sidecar = run_dir / "run.json"
         run_json = _read_run_json_sidecar(sidecar)
-        status = _derive_run_status(run_json, state)
+        status = _with_run_layout(_derive_run_status(run_json, state), state)
         started_at = state.get("started_at") or "—"
         branch = (run_json or {}).get("branch") or _compute_run_branch(run_id)
         is_fly = bool((run_json or {}).get("fly_machine_id")
@@ -7855,7 +7871,8 @@ def _report_run(leerie_root: Path, cli_run_id: str | None) -> None:
     except (OSError, ValueError):
         run_json = None
 
-    status = _derive_run_status(run_json, state or None)
+    status = _with_run_layout(_derive_run_status(run_json, state or None),
+                              state)
     started = state.get("started_at")
     finished = state.get("finished_at")
     duration = _format_run_duration(started, finished) or "n/a"
@@ -11034,22 +11051,32 @@ def _record_run_id_for_launcher(run_id: str) -> None:
             os.unlink(tmp)
 
 
-def _refuse_pre_run_repo_resume(st: "State") -> None:
-    """Refuse to resume a run made before per-run repositories (DESIGN §6
-    *The run's own repository*): its worktrees and branches live in the
-    user's repository. New runs record `run_repo` before `run.json` gets
-    `branch`, so only such a run has `branch` without it."""
-    if st.data.get("run_repo"):
+# The run-directory layout this leerie writes and reads (DESIGN §6 *A run
+# directory is continued only by a leerie of its layout*). Bump it with any
+# change to what a run directory holds that a later process of the run reads
+# back. The layout before the field, which recorded nothing, counts as 1.
+RUN_LAYOUT_VERSION = 2
+
+
+def _refuse_other_run_layout(st: "State", verb: str) -> None:
+    """Stop `verb` on a run directory another leerie's layout made (DESIGN §6
+    *A run directory is continued only by a leerie of its layout*). `st.data`
+    is the run's loaded `state.json`. Called by `main()` before anything
+    writes in the directory and before the exit arms that would stamp and
+    clean it, so a refused directory stays as its own leerie left it."""
+    layout = st.data.get("run_layout")
+    if layout == RUN_LAYOUT_VERSION:
         return
-    sidecar = _read_run_json_sidecar(Path(st.run_dir) / "run.json") or {}
-    if not sidecar.get("branch"):
-        return
-    die(f"run {st.run_id} was started by a leerie from before per-run "
-        "repositories: its worktrees and branches are in your repository, "
-        "and this version no longer runs workers there (DESIGN §6 *The run's "
-        "own repository*). It cannot be resumed. What it integrated is on "
-        f"{sidecar.get('branch')} in your repository; ship it with "
-        f"`leerie finalize {st.run_id}`, or start the task again.")
+    newer = isinstance(layout, int) and layout > RUN_LAYOUT_VERSION
+    made_by = st.data.get("leerie_version")
+    die(f"run {st.run_id} was made by {'a newer' if newer else 'an older'} "
+        f"leerie{f' (recorded as {made_by})' if made_by else ''}: its run "
+        "directory has run layout "
+        f"{layout if layout is not None else 'none recorded'}, and this "
+        f"leerie reads only layout {RUN_LAYOUT_VERSION}, so it cannot "
+        f"`{verb}` it. Finish it with the leerie that made it, or start the "
+        "task again as a fresh run. `leerie list`, `leerie finalize` and "
+        "`leerie prune` still work on it.")
 
 
 def _stage_worktree_extras(st: "State", worktree: str) -> None:
@@ -65562,11 +65589,6 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 f"{st.data.get('finished_at', '<unknown>')} — nothing to "
                 "resume")
             return
-        # A run made before per-run repositories cannot be resumed (DESIGN
-        # §6 *The run's own repository*). After the two completed-run
-        # returns above, so `resume` of such a finished run still says
-        # "nothing to resume" rather than refusing.
-        _refuse_pre_run_repo_resume(st)
         # Resumable-planning re-entry (DESIGN §6 "Resumable planning — a
         # per-phase checkpoint cursor, not a `waves` gate"). `waves` absent
         # no longer means "cannot resume" — the shared pipeline below
@@ -65763,6 +65785,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "skip_acceptance_check": bool(
                        getattr(args, "skip_acceptance_check", False)),
                    "skip_repo_map": bool(args.skip_repo_map),
+                   # The layout this leerie writes the run directory in. Fresh
+                   # runs only, deliberately: a resume never rewrites it, or a
+                   # directory of another layout would pass for this one
+                   # (`_refuse_other_run_layout`).
+                   "run_layout": RUN_LAYOUT_VERSION,
                    "leerie_version": _read_version(),
                    # Must stay beside leerie_version in BOTH branches: the
                    # resume path above sets these as subscript assignments,
@@ -67192,6 +67219,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             f"`leerie resume {run_id}`. "
             f"If the holder is wedged, kill it and retry.")
         sys.exit(EXIT_LOCKED)
+    # A run directory of another layout is refused here, under its lock and
+    # before anything below writes in it or arms the exit handlers that stamp
+    # `finished_at` and clean up worktrees (DESIGN §6 *A run directory is
+    # continued only by a leerie of its layout*). `resume` and `--phase` are
+    # the verbs that spawn workers in an existing run directory (`--phase`
+    # names its run with `--run-id`, so `st` is that run). No state.json:
+    # each says so itself further on.
+    if (args.resume or args.phase) and st.load():
+        _refuse_other_run_layout(
+            st, "resume" if args.resume else f"--phase {args.phase}")
     # The run is this process's from here (its flock is held): tell the
     # launcher which one, for the bring-back after the container exits
     # (DESIGN §6 *Which run the container ran*).

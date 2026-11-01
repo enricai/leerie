@@ -2757,7 +2757,7 @@ table.
 | `--heal-dir DIR` | `heal-out` | Subdirectory name under the run dir for LLM self-heal output. Also `LEERIE_HEAL_DIR` or `heal_dir` in `leerie.toml`. |
 | `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
 | `--report [RUN_ID]` | — | Print a read-only telemetry report for a run: per-call-type token/cost/latency/failure breakdown plus memory peak. Pass a run id, or omit to auto-pick when exactly one run exists. Exits without running orchestrate. |
-| `--status STATE` | — | With `list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`. |
+| `--status STATE` | — | With `list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`, `incomplete`, `other-leerie`. |
 | `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` or `skip_overlap_judge` in `leerie.toml`. |
 | `--skip-budget-check` | off | Skip the post-schedule budget-feasibility preflight (DESIGN §13). The runtime backstop in `State.bump_workers()` still fires. Also `LEERIE_SKIP_BUDGET_CHECK` or `skip_budget_check` in `leerie.toml`. |
 | `--skip-repo-map` | off | Skip the P6 repo-map structural context (DESIGN §5½ (P6)): suppresses `_build_repo_map()` and the ranked subgraph injection into planner/splitter context; the planner degrades gracefully to the prior grep/glob-only path. Use on repos where tree-sitter cannot parse the primary language. Also `LEERIE_SKIP_REPO_MAP` or `skip_repo_map` in `leerie.toml`. |
@@ -9393,7 +9393,7 @@ repository receives only `leerie/runs/<id>`, by the host-side bring-back.
 | `_ref_less_clone(src, wt, rev) -> str` | A `--shared --no-checkout --no-tags` clone of `src` at `wt`, detached at `rev`, with every ref, the remote and the reflog deleted. Returns "" on success, else why not, removing `wt`. Used by `_acceptance_writer_checkout` (`src` = the run's repository) and `_replay_capture` (`src` = the replayed repository, in the replay's temporary directory; no linked worktree of it). |
 | `_diff_base(st) -> str \| None` | `st.data["base_sha"]`, else None. |
 | `_record_run_id_for_launcher(run_id) -> None` | Writes `run_id` to the path in `LEERIE_RUN_ID_FILE` (a temporary file in the same directory, then `os.replace`), so the launcher knows which run its container ran (DESIGN §6 *Which run the container ran*). `main()` calls it right after `State(...)` takes the run directory's flock: a fresh run, a `resume <id>` and an auto-picked `resume` alike. It is a no-op when the variable is unset (Fly/EC2, tests, direct invocation). A failed write is logged and the run goes on; the branch then comes back at the run's finalize or `prune`. |
-| `_refuse_pre_run_repo_resume(st) -> None` | Runs in `_run_phases`' `resume` arm, after the two completed-run returns and before `_ensure_run_repo_or_die`. When `run_repo` is not in state and `run.json` has `branch`, it calls `die()` naming `leerie finalize <id>`. New code records `run_repo` before `run.json` gets `branch`, so only a run made before the change matches. |
+| `_refuse_other_run_layout(st, verb) -> None` | `RUN_LAYOUT_VERSION = 2` (the layout before the field, which recorded none, counts as 1). Returns when `st.data.get("run_layout") == RUN_LAYOUT_VERSION`; otherwise calls `die()` naming the run, its layout (`run_layout`, or "none recorded"), whether it is older or newer, the `leerie_version` that made it, and the fix: finish it with that leerie, or start the task again as a fresh run. `main()` calls it for `resume` and for `--phase judge|heal` (whose `--run-id` names the run `State` opened) right after `State(...)` takes the run's flock and `st.load()` reads its `state.json`, before `_record_run_id_for_launcher`, the run-directory `mkdir`s, the log tee and the `try:` whose exit arms stamp `finished_at` and run `_cleanup_on_abnormal_exit` — so a refused run directory is left exactly as it was (DESIGN §6 *A run directory is continued only by a leerie of its layout*). A `resume` whose run has no `state.json` passes, for `_run_phases`' "nothing to resume". |
 | `_run_script(name, *args, st)` | `cwd=_run_repo(st)`, with `LEERIE_STATE_DIR` set to the run directory's state root (`run_dir/../..`, resolved) and `LEERIE_GIT_DIR` set to `_run_repo(st)`, on every runtime. |
 
 **State and `run.json`.**
@@ -11085,6 +11085,7 @@ remote runs alongside local runs in a single table. Status and runtime
 are **orthogonal axes**: status describes lifecycle (`paused`,
 `killed`, `done`, `sync-failed`, `in-progress`, `done-pushed-pr`,
 `done-pushed-no-pr`, `push-failed`, `pr-failed`, `corrupt-sidecar`,
+`other-leerie`,
 `seed-failed`); runtime describes where the run executed (`local` or
 `fly`). `seed-failed` covers run dirs with a `fly-machine.json`
 (launcher wrote it the moment Fly provision succeeded) but no
@@ -11421,8 +11422,9 @@ A corrupt sidecar is flagged but does not block the rest of the system; `leerie 
 | `paused` | `paused_at` is set | inspect/attach to the Fly Machine, then `leerie resume <id> --runtime fly` (DESIGN §6 *Remote pause-on-failure*) |
 | `killed` | `killed_at` is set | terminal state — the machine was destroyed by `leerie kill`. Not resumable; start a new run instead. |
 | `in-progress` | none of the above | the run is still active (or died very early); resume with `leerie resume <id>` |
+| `other-leerie` | the status above is `in-progress`, `paused` or `incomplete`, and `state.json`'s `run_layout` is not `RUN_LAYOUT_VERSION` (absent included). Applied by `_with_run_layout(status, state)` in `_run_status_for` (and so in `list` and `resolve_run_id`) and `_report_run`; `_derive_run_status` itself does not read the layout | a leerie with another run-directory layout made this run, and this one refuses to resume it: finish it with that leerie, or start the task again (DESIGN §6 *A run directory is continued only by a leerie of its layout*). Not auto-picked by a bare `resume`. |
 
-`RUN_STATUSES` in `leerie.py` declares the ten values; a test coupling check asserts the tuple matches every value `_derive_run_status` can return.
+`RUN_STATUSES` in `leerie.py` declares every value above plus `seed-failed` and `incomplete`; a test coupling check asserts the tuple matches every value `_derive_run_status` can return.
 
 `leerie list status <state>` filters the table to runs whose derived status matches. `<state>` accepts any value in `RUN_STATUSES`; invalid values produce an argparse error listing the allowed set. `list` short-circuits before any git/CLI preflight.
 
@@ -11557,7 +11559,8 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. |
 | `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). |
 | `pr_base_branch` | str | the final branch this run's PR merges into — overridable via `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` (resolved by `resolve_pr_base_branch`, CLI > env > file precedence, mirroring `resolve_pr_template`). |
-| `run_repo` | str | `"repo"` once the run's own repository `<run-dir>/repo` exists (`_ensure_run_repo`; DESIGN §6 *The run's own repository*). Absent on a run whose `run.json` has `branch` marks a run made before per-run repositories, which `resume` refuses (`_refuse_pre_run_repo_resume`). |
+| `run_repo` | str | `"repo"` once the run's own repository `<run-dir>/repo` exists (`_ensure_run_repo`; DESIGN §6 *The run's own repository*). |
+| `run_layout` | int | `RUN_LAYOUT_VERSION` at the run's fresh start, never rewritten by a resume. Absent on every run directory made before the field (an older layout). `resume` and `--phase` refuse a run whose value differs (`_refuse_other_run_layout`), and `leerie list` shows such a run with work left as `other-leerie` (DESIGN §6 *A run directory is continued only by a leerie of its layout*). |
 | `base_sha` | str | the commit `setup-run.sh` cut the run branch from, recorded once by `phase_execute`; every comparison leerie makes against the base reads it (`_diff_base`), never the working branch's name. |
 | `leerie_version` | str | the leerie version string from `.claude-plugin/plugin.json`, seeded once at the run's original start and **immutable across resumes** (N38) — a resume no longer overwrites it with whatever is installed at resume time, since doing so made a resumed run's failures read as attributable to the wrong release. |
 | `leerie_commit` | str \| null | short sha of `$LEERIE_REPO`'s HEAD, forwarded by the launcher as `LEERIE_COMMIT`, seeded once at the run's original start and **immutable across resumes** (N38), same rationale as `leerie_version`. |
