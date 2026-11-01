@@ -8,13 +8,16 @@
 # Run as the confined command itself (under the Landlock shim, inside its
 # isolation or held-out sandbox, with its grant). It:
 #   1. initdb's a cluster in /tmp/leerie-pg/data — the command's own /tmp;
-#   2. starts postgres listening on no TCP address, its socket in
-#      /tmp/leerie-pg, so nothing outside the command's mount namespace can
-#      reach it and concurrent commands never collide on a port;
+#   2. starts postgres on 127.0.0.1:5432 — the loopback of the command's
+#      own network namespace, which no other process reaches, so concurrent
+#      commands never collide on the port; a port already taken there is a
+#      failed start, never another server's — its socket in /tmp/leerie-pg;
 #   3. creates <db-name>;
 #   4. runs <pkg-dir>/node_modules/.bin/prisma db push, with Prisma's
 #      AI-agent consent on that one process;
-#   5. execs CMD with DATABASE_URL and DIRECT_URL naming the socket.
+#   5. execs CMD with DATABASE_URL and DIRECT_URL, a plain TCP URL
+#      (postgresql://<user>@127.0.0.1:5432/<db-name>): a repository's own
+#      tooling that reads host and port from the URL reaches it.
 # Every process it starts is the command's: the shim ends the server with
 # it. Without server binaries, or as root (postgres refuses), or when a step
 # fails, it execs CMD unchanged, saying so on stderr. Everything it prints
@@ -66,19 +69,20 @@ fi
 
 user=$(id -un)
 dir=/tmp/leerie-pg
-url="postgresql://${user}@localhost/${name}?host=${dir}"
+url="postgresql://${user}@127.0.0.1:5432/${name}"
 
 if ! mkdir -p "$dir" 2>/dev/null || ! chmod 0700 "$dir" 2>/dev/null; then
   say "cannot make $dir — running the command without a database"
   exec "$@"
 fi
 if ! "$pgbin/initdb" -D "$dir/data" -U "$user" --auth-local=trust \
+    --auth-host=trust \
     >"$dir/initdb.log" 2>&1; then
   say "initdb failed: $(tail -c 300 "$dir/initdb.log" 2>/dev/null) — running the command without a database"
   exec "$@"
 fi
 if ! "$pgbin/pg_ctl" -D "$dir/data" -l "$dir/server.log" -w \
-    -o "-c listen_addresses='' -c unix_socket_directories=$dir -c fsync=off" \
+    -o "-c listen_addresses=127.0.0.1 -c port=5432 -c unix_socket_directories=$dir -c fsync=off" \
     start >&2; then
   say "postgres did not start: $(tail -c 300 "$dir/server.log" 2>/dev/null) — running the command without a database"
   exec "$@"

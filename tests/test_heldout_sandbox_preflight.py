@@ -127,7 +127,13 @@ def test_a_good_sandbox_turns_isolation_on_and_cleans_up(
         leerie, monkeypatch, tmp_path):
     seen: list = []
     _fake_run(leerie, monkeypatch, report=_good(leerie), seen=seen)
+    # The network probe runs after the sandbox's, before isolation is on
+    # (tests/test_confined_network.py runs it for real).
+    relay: list = []
+    monkeypatch.setattr(leerie, "_require_egress_relay", lambda: relay.append(
+        (len(seen), os.environ.get(leerie.ISOLATE_ENV))))
     leerie._require_heldout_sandbox(tmp_path)
+    assert relay == [(1, None)]
     assert os.environ[leerie.ISOLATE_ENV] == "1"
     assert not (tmp_path / leerie._SANDBOX_PROBE_DIRNAME).exists()
     (argv,) = seen

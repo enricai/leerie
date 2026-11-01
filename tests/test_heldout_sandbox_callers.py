@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -235,29 +236,30 @@ def _prisma_repo(root: Path, provider: str = "postgresql") -> None:
                     "user.name=t", "commit", "-qm", "prisma"], check=True)
 
 
-def test_the_url_refusal_accepts_only_the_commands_own_socket(leerie):
-    good = leerie._test_db_url(leerie._test_db_name("k"))
-    assert leerie._test_db_url_refusal(good, good) is None
+def test_the_url_refusal_accepts_only_the_commands_own_loopback(leerie):
+    """M2 (review round 21): the URL is plain TCP on the command's own
+    loopback, `127.0.0.1:5432` — a repository's tooling that reads host and
+    port from it reaches the server — and nothing else is accepted."""
     name = leerie._test_db_name("k")
+    good = leerie._test_db_url(name)
     user = good.split("://", 1)[1].split("@", 1)[0]
+    assert good == f"postgresql://{user}@127.0.0.1:5432/{name}"
+    assert leerie._test_db_url_refusal(good, good) is None
     for bad, why in (
-            (f"mysql://{user}@localhost/{name}?host=/tmp/leerie-pg",
-             "scheme"),
-            (f"postgresql://{user}@127.0.0.1:5432/{name}", "host"),
-            (f"postgresql://{user}@localhost:5432/{name}?host=/tmp/leerie-pg",
+            (f"mysql://{user}@127.0.0.1:5432/{name}", "scheme"),
+            (f"postgresql://{user}@localhost/{name}?host=/tmp/leerie-pg",
              "host"),
-            (f"postgresql://{user}@db.example/{name}?host=/tmp/leerie-pg",
-             "host"),
-            (f"postgresql://{user}@localhost/{name}?host=/tmp/other",
-             "socket"),
-            (f"postgresql://{user}@localhost/prod?host=/tmp/leerie-pg",
-             "database"),
-            (f"postgresql://{user}@localhost/leerie_xyz_test"
-             "?host=/tmp/leerie-pg", "database")):
+            (f"postgresql://{user}@127.0.0.1:5433/{name}", "host"),
+            (f"postgresql://{user}@127.0.0.1/{name}", "host"),
+            (f"postgresql://{user}@db.example:5432/{name}", "host"),
+            (f"postgresql://{user}@127.0.0.1:5432/{name}?host=/tmp/x",
+             "parameters"),
+            (f"postgresql://{user}@127.0.0.1:5432/prod", "database"),
+            (f"postgresql://{user}@127.0.0.1:5432/leerie_xyz_test",
+             "database")):
         got = leerie._test_db_url_refusal(bad, bad)
         assert got and why in got, (bad, got)
-    assert "DIRECT_URL" in leerie._test_db_url_refusal(
-        good, good.replace("?", "x?"))
+    assert "DIRECT_URL" in leerie._test_db_url_refusal(good, good + "x")
 
 
 def test_test_db_argv_wraps_only_a_prisma_postgres_repo(leerie, run):
@@ -439,6 +441,13 @@ def _alive(pid: int) -> bool:
 
 
 def _wrapped(leerie, run, pg_bin, own_pg_dir, name, script):
+    # Unisolated here, the server's 127.0.0.1:5432 is the host's: a host
+    # with its own PostgreSQL there gives the script a failed start.
+    try:
+        socket.create_connection(("127.0.0.1", 5432), 1).close()
+        pytest.skip("127.0.0.1:5432 is taken on this unisolated host")
+    except OSError:
+        pass
     view = _view(run)
     g = leerie._measurement_grants(_st(run), view)
     g = g._replace(rw=g.rw + (str(own_pg_dir),), ro=g.ro + (str(pg_bin),))
@@ -489,7 +498,7 @@ def test_f1_the_commands_own_server_runs_nothing_outside_its_grant(
         leerie, run, pg_bin, own_pg_dir):
     """F1, turned round (the measured design's §1.4), with a real server:
     started by the wrapper inside the command's confinement, it answers the
-    command over its socket, listens on no TCP address, runs `COPY … TO
+    command over the plain TCP URL (`127.0.0.1:5432`, M2), runs `COPY … TO
     PROGRAM` only inside the same Landlock domain — so it cannot read
     `acceptance/` any more than the command can — and is gone when the
     command is."""
@@ -513,8 +522,9 @@ def test_f1_the_commands_own_server_runs_nothing_outside_its_grant(
     assert not leak.exists() or "held" not in leak.read_text(), r.stdout
     pid = int(r.stdout.split("PIDFILE=")[1].split()[0])
     assert not _alive(pid), pid
-    # Its socket is in its own `/tmp/leerie-pg`; no TCP listener was its.
-    assert "listen_addresses" not in r.stderr
+    # The "42" above came over the plain TCP URL (M2): the server
+    # listened on the command's 127.0.0.1:5432.
+    assert "@127.0.0.1:5432/" in leerie._test_db_url(name)
 
 
 def test_the_script_refuses_a_name_that_is_not_a_test_database():
@@ -574,8 +584,8 @@ def test_db_present_is_the_wrappers_outcome(leerie, run, monkeypatch,
     st, view = _st(run), _view(run)
     _prisma_repo(run["user"])
     user = leerie._test_db_url("x").split("://", 1)[1].split("@", 1)[0]
-    expr = {"composed": (f"postgresql://{user}@localhost/$2"
-                         f"?host={leerie.TEST_DB_SOCKET_DIR}"),
+    expr = {"composed": (f"postgresql://{user}@{leerie.TEST_DB_HOST}:"
+                         f"{leerie.TEST_DB_PORT}/$2"),
             "other": "postgresql://u@db.example/prod", "none": ""}[handed]
     monkeypatch.setattr(leerie, "SANDBOX_DB_SCRIPT",
                         _fake_wrapper(tmp_path, expr))

@@ -7,11 +7,12 @@ with it (I3)*; `tests/conftest.py::_emulated_heldout_sandbox`).
 
 It keeps the sandbox's contract with leerie, not its isolation: each placed
 file is copied to `V/REL` for the run (refused, exit 126, when the view
-already has one), INNER (the real shim, without `--sandbox`) runs, the
-report is copied to descriptor N from offset 0 and the copy truncated, and
-then the placed files, the directories made for them and the report are
-removed — so what leerie reads comes back only through the descriptor, as
-it does from a real sandbox. Product code never runs this."""
+already has one or a directory on its path is a link), INNER (the real
+shim, without `--sandbox`) runs, the report is copied to descriptor N from
+offset 0 and the copy truncated, and then the placed files, the directories
+made for them and the report are removed — so what leerie reads comes back
+only through the descriptor, as it does from a real sandbox. Product code
+never runs this."""
 from __future__ import annotations
 
 import os
@@ -45,9 +46,19 @@ def main(argv: list[str]) -> int:
             return 126
         i += 2
     assert view is not None
+    def _linked(rel: str) -> bool:
+        # The shim resolves each directory with O_NOFOLLOW: a link on the
+        # path refuses the placement (it would leave the view).
+        d = view
+        for part in Path(rel).parts[:-1]:
+            d = d / part
+            if d.is_symlink():
+                return True
+        return False
+
     taken = [rel for _src, rel in place
              if os.path.lexists(view / rel) or rel.startswith("/")
-             or ".." in Path(rel).parts]
+             or ".." in Path(rel).parts or _linked(rel)]
     if taken:
         print("leerie: cannot isolate the command, so it does not run: "
               f"place: a set path is taken: {', '.join(taken)}",

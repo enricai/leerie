@@ -3,7 +3,8 @@
 (DESIGN §6 *A worker writes only where it is granted (I5)*, *A confined
 command's processes end with it*).
 
-Usage: landlock_exec.py [--isolate] [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
+Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...]
+                        [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
        landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
                         [--report PATH --report-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
@@ -32,16 +33,20 @@ ABI 6 the abstract-socket and signal scopes.
 
 `--isolate` first builds the isolation every confined process gets in a run
 (DESIGN §6 *Every confined process has its own `/tmp`, `/dev/shm` and IPC,
-and sees every other mount read-only*): a user namespace mapping the
-caller onto itself, mount and IPC namespaces, a root the caller owns,
-private `/tmp` and `/dev/shm`, a new `devpts`, the write grants bound onto
-themselves and every other mount read-only. `--sandbox` builds a held-out
-evaluation's (DESIGN §6 *A held-out evaluation runs alone, in a world that
-dies with it (I3)*): the same plus network, UTS and PID namespaces, every
-write grant overlaid (its writes vanish), the set's files placed into the
-overlay, loopback only, and the shim as the namespace's PID 1, which copies
-the runner's report to `--report-fd`. Both exit 126 without running CMD
-when any step fails.
+and sees every other mount read-only*; *A confined process has its own
+network*): a user namespace mapping the caller onto itself, mount, IPC and
+network namespaces (loopback only), a root the caller owns, private `/tmp`
+and `/dev/shm`, a new `devpts`, the write grants bound onto themselves and
+every other mount read-only. `--egress SOCK` gives the command the outside network
+through leerie's egress proxy, listening on the unix socket SOCK: a relay
+in the namespace forwards `127.0.0.1:<port>` to it and the proxy variables
+name it; `--forward PORT=SOCK` relays a fixed loopback port to a socket the
+same way. `--sandbox` builds a held-out evaluation's (DESIGN §6 *A held-out
+evaluation runs alone, in a world that dies with it (I3)*): the same, never
+with egress, plus UTS and PID namespaces, every write grant overlaid (its
+writes vanish), the set's files placed into the overlay, and the shim as the
+namespace's PID 1, which copies the runner's report to `--report-fd`. Both
+exit 126 without running CMD when any step fails.
 
 Stdlib only and imported by nothing heavier: it starts every worker. The
 orchestrator imports `abi()` and `MIN_ABI` from here for its preflight, so
@@ -299,8 +304,10 @@ def _die_of(sig: int) -> int:
     return 128 + sig
 
 
-def run(cmd: list[str]) -> int:
+def run(cmd: list[str], relay: int | None = None) -> int:
     """Run `cmd` as a child of this subreaper, then end what it left.
+    `relay`, the relay process, holds no state of its own: it is killed
+    outright once `cmd` has ended, before the grace the rest gets.
     SIGCHLD and the stop signals are blocked and taken with `sigwaitinfo`,
     so none is lost between a check and the wait; the child gets the mask
     it was started with, and the dispositions it would have outside a
@@ -331,6 +338,8 @@ def run(cmd: list[str]) -> int:
                 pid, st = os.waitpid(-1, os.WNOHANG)
                 if pid == 0:
                     break
+                if pid == relay:
+                    relay = None
                 if pid == child:
                     status = st
                     break
@@ -340,6 +349,12 @@ def run(cmd: list[str]) -> int:
             info = signal.sigwaitinfo(watched)
             if info.si_signo in _STOP_SIGNALS:
                 stopped = info.si_signo
+    if relay is not None:
+        try:
+            os.kill(relay, signal.SIGKILL)
+            os.waitpid(relay, 0)
+        except (OSError, ChildProcessError):
+            pass
     end_descendants(STOP_GRACE_SEC if stopped is not None
                     else END_GRACE_SEC)
     if stopped is not None:
@@ -551,8 +566,8 @@ def _write_proc(path: str, text: str, step: str) -> None:
 
 def enter_namespaces(*, sandbox: bool) -> None:
     """A new user namespace with the caller's uid and gid mapped onto
-    themselves, then new mount and IPC namespaces (and network, UTS and
-    PID ones for a sandbox; the PID namespace takes effect for the next
+    themselves, then new mount, IPC and network namespaces (and UTS and PID
+    ones for a sandbox; the PID namespace takes effect for the next
     child)."""
     uid, gid = os.geteuid(), os.getegid()
     libc = _libc()
@@ -560,10 +575,10 @@ def enter_namespaces(*, sandbox: bool) -> None:
     _write_proc("/proc/self/setgroups", "deny", "write setgroups")
     _write_proc("/proc/self/uid_map", f"{uid} {uid} 1", "write uid_map")
     _write_proc("/proc/self/gid_map", f"{gid} {gid} 1", "write gid_map")
-    flags = CLONE_NEWNS | CLONE_NEWIPC
+    flags = CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWNET
     if sandbox:
-        flags |= CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWPID
-    _must("unshare(mount/IPC" + ("/net/UTS/PID)" if sandbox else ")"),
+        flags |= CLONE_NEWUTS | CLONE_NEWPID
+    _must("unshare(mount/IPC/net" + ("/UTS/PID)" if sandbox else ")"),
           libc.unshare(flags))
 
 
@@ -749,34 +764,72 @@ def readonly_mounts(keep: list[str]) -> int:
     return n
 
 
+def _place_one(view_fd: int, src: str, rel: str) -> None:
+    """Write `src` at `rel` beneath the directory `view_fd`, resolving every
+    component from that descriptor and following no link: each directory
+    opened `O_NOFOLLOW | O_DIRECTORY` (made with `mkdirat` when absent), the
+    file created `O_EXCL | O_NOFOLLOW`. A link anywhere on the path — the
+    tree's own code, which a worker wrote — refuses the placement instead of
+    sending the file through it."""
+    parts = rel.split("/")
+    fds: list[int] = []
+    cur = view_fd
+    try:
+        for name in parts[:-1]:
+            try:
+                os.mkdir(name, 0o755, dir_fd=cur)
+            except FileExistsError:
+                pass
+            cur = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                          | os.O_CLOEXEC, dir_fd=cur)
+            fds.append(cur)
+        with open(src, "rb") as f:
+            data = f.read()
+        fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW | os.O_CLOEXEC, 0o444, dir_fd=cur)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    finally:
+        for d in fds:
+            os.close(d)
+
+
 def place(pairs: list[tuple[str, str]], view: str) -> None:
     """Copy each held-out file into the overlaid view, read-only. Refused
-    when a destination is not a plain relative path or the view already has
-    a file there: a set is never placed over the tree's own file."""
+    when a destination is not a plain relative path, the view already has a
+    file there, or a directory on its path is a link (`_place_one`): a set
+    is never placed over the tree's own file, nor anywhere but beneath the
+    overlay. Runs after every other mount is read-only."""
     bad = []
     for src, rel in pairs:
         parts = rel.split("/")
-        if (not rel or rel.startswith("/") or ".." in parts
-                or os.path.lexists(os.path.join(view, rel))):
+        if (not rel or rel.startswith("/") or ".." in parts or "." in parts
+                or "" in parts):
             bad.append(rel)
     if bad:
-        raise IsolationError("place: the view already has, or cannot hold, "
+        raise IsolationError("place: the view cannot hold "
                              + ", ".join(sorted(bad)))
-    for src, rel in pairs:
-        dst = os.path.join(view, rel)
-        try:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            with open(src, "rb") as f:
-                data = f.read()
-            with open(dst, "wb") as f:
-                f.write(data)
-            os.chmod(dst, 0o444)
-        except OSError as e:
-            raise IsolationError(f"place {rel}: {e}", e.errno or 0) from None
+    try:
+        view_fd = os.open(view, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as e:
+        raise IsolationError(f"place: open {view}: {e}", e.errno or 0) \
+            from None
+    try:
+        for src, rel in pairs:
+            try:
+                _place_one(view_fd, src, rel)
+            except OSError as e:
+                raise IsolationError(
+                    f"place {rel}: the view already has it, or a directory "
+                    f"on its path is a link ({e})", e.errno or 0) from None
+    finally:
+        os.close(view_fd)
 
 
 def loopback_up() -> None:
-    """Bring up `lo`, the sandbox's only interface."""
+    """Bring up `lo`, the namespace's only interface."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         req = struct.pack("16sh", b"lo", 0)
@@ -802,23 +855,33 @@ def join_session_keyring() -> None:
 
 def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
             view: str | None = None,
-            place_pairs: list[tuple[str, str]] = ()) -> int:
+            place_pairs: list[tuple[str, str]] = (),
+            sockets: list[str] = ()) -> int:
     """Build the namespaces and mounts for `--isolate` (or `--sandbox`,
-    with `view`); returns how many mounts were made read-only. The caller
-    then joins a keyring, installs seccomp and confines."""
+    with `view`); returns how many mounts were made read-only. `sockets`:
+    the relays' unix sockets, whose directories are carried in read-only
+    (one beneath `/tmp` is otherwise not there). The caller then joins a
+    keyring, installs seccomp and confines."""
     cwd = os.getcwd()
     enter_namespaces(sandbox=sandbox)
+    loopback_up()
     carry_ro = [p for p in ro if _beneath(p, TMP) and p != TMP]
+    carry_ro += [os.path.dirname(p) for p in sockets
+                 if _beneath(os.path.dirname(p), TMP)
+                 and os.path.dirname(p) != TMP]
     carry_rw = [p for p in rw if _beneath(p, TMP) and p != TMP]
     kept = pivot_to_owned_root(carry_ro, carry_rw, sandbox=sandbox)
     if sandbox:
         assert view is not None
         kept += overlay_grants(rw, view)
-        place(list(place_pairs), view)
-        loopback_up()
     else:
         kept += bind_grants(rw)
     n = readonly_mounts(kept)
+    if sandbox:
+        assert view is not None
+        # After the read-only remount: the view's overlay is the one
+        # writable place left on the path the placement resolves.
+        place(list(place_pairs), view)
     # The working directory was resolved before the binds and overlays: it
     # still names the directory beneath them (read-only now, or the
     # overlay's lower layer), so it is resolved again.
@@ -842,6 +905,125 @@ def isolation_error() -> str | None:
         return None
     lines = r.stderr.strip().splitlines()
     return lines[-1] if lines else f"exit {r.returncode}"
+
+
+# --- the network a confined process reaches: its own loopback, and leerie's
+# egress proxy through a relay ------------------------------------------------
+# DESIGN §6 *A confined process has its own network; the outside is reached
+# only through leerie's proxy*. A loopback listener one confined process starts is in its own
+# network namespace: no other confined process reaches it. A process that
+# needs the outside network (a worker, an install) reaches it only through
+# the proxy leerie holds, on a unix socket: the relay below listens on the
+# namespace's loopback and forwards each connection to that socket.
+
+PROXY_VARS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+              "https_proxy", "http_proxy", "all_proxy")
+NO_PROXY_VALUE = "localhost,127.0.0.1,::1"
+_RELAY_CHUNK = 1 << 16
+
+
+def relay_listener(port: int) -> socket.socket:
+    """A TCP listener on the namespace's `127.0.0.1:port` (0: the kernel
+    picks one)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(128)
+    except OSError as e:
+        s.close()
+        raise IsolationError(f"relay listen 127.0.0.1:{port}",
+                             e.errno or 0) from None
+    return s
+
+
+def proxy_env(port: int) -> dict[str, str]:
+    """The variables that send a command's outside connections to the
+    relay on `port`: the usual proxy variables in both cases, the loopback
+    left direct, and Node's built-in `http`/`fetch` told to read them
+    (`NODE_USE_ENV_PROXY`, Node 24)."""
+    url = f"http://127.0.0.1:{port}"
+    env = {v: url for v in PROXY_VARS}
+    env.update(NO_PROXY=NO_PROXY_VALUE, no_proxy=NO_PROXY_VALUE,
+               NODE_USE_ENV_PROXY="1")
+    return env
+
+
+def _pump(src: socket.socket, dst: socket.socket) -> None:
+    try:
+        while True:
+            data = src.recv(_RELAY_CHUNK)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    try:
+        dst.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+
+
+def _relay_one(conn: socket.socket, target: str) -> None:
+    up = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        up.connect(target)
+    except OSError:
+        up.close()
+        conn.close()
+        return
+    import threading  # noqa: PLC0415 - only the relay process needs it
+    back = threading.Thread(target=_pump, args=(up, conn), daemon=True)
+    back.start()
+    _pump(conn, up)
+    back.join()
+    up.close()
+    conn.close()
+
+
+def _relay_accept(listener: socket.socket, target: str) -> None:
+    while True:
+        try:
+            conn, _ = listener.accept()
+        except InterruptedError:
+            continue
+        except OSError:
+            return
+        import threading  # noqa: PLC0415 - only the relay process needs it
+        threading.Thread(target=_relay_one, args=(conn, target),
+                         daemon=True).start()
+
+
+def serve_relays(relays: list[tuple[socket.socket, str]]) -> None:
+    """The relay process: forward every connection to each listener to its
+    unix socket, until the shim ends it with the command. Stdin is closed:
+    the relay reads only its sockets."""
+    import threading  # noqa: PLC0415 - only the relay process needs it
+    os.close(0)
+    threads = [threading.Thread(target=_relay_accept, args=pair, daemon=True)
+               for pair in relays]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    os._exit(0)
+
+
+def start_relays(relays: list[tuple[socket.socket, str]]) -> int | None:
+    """Fork the relay process (a child of the shim, so it ends with the
+    command, *A confined command's processes end with it*), close the
+    listeners here and return its pid."""
+    if not relays:
+        return None
+    pid = os.fork()
+    if pid == 0:
+        try:
+            serve_relays(relays)
+        finally:
+            os._exit(0)
+    for s, _target in relays:
+        s.close()
+    return pid
 
 
 # --- PID 1 of a held-out sandbox --------------------------------------------
@@ -1038,13 +1220,15 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
 def _parse(argv: list[str]) -> dict | str:
     """The shim's options, or a usage error."""
     if "--" not in argv:
-        return ("usage: landlock_exec.py [--isolate | --sandbox --view TREE "
+        return ("usage: landlock_exec.py [--isolate [--egress SOCK] "
+                "[--forward PORT=SOCK]... | --sandbox --view TREE "
                 "[--place SRC=REL]... [--report PATH --report-fd N]] "
                 "[--rw PATH]... [--ro PATH]... -- CMD")
     sep = argv.index("--")
     o: dict = {"rw": [], "ro": [], "isolate": False, "sandbox": False,
                "view": None, "place": [], "report": None,
-               "report_fd": None, "cmd": argv[sep + 1:]}
+               "report_fd": None, "egress": None, "forward": [],
+               "cmd": argv[sep + 1:]}
     opts = argv[:sep]
     i = 0
     while i < len(opts):
@@ -1054,7 +1238,8 @@ def _parse(argv: list[str]) -> dict | str:
             i += 1
             continue
         if k not in ("--rw", "--ro", "--view", "--place", "--report",
-                     "--report-fd") or i + 1 >= len(opts):
+                     "--report-fd", "--egress", "--forward") \
+                or i + 1 >= len(opts):
             return f"landlock_exec.py: bad option {k!r}"
         v = opts[i + 1]
         if k in ("--rw", "--ro"):
@@ -1064,6 +1249,16 @@ def _parse(argv: list[str]) -> dict | str:
             if not eq or not src or not rel:
                 return f"landlock_exec.py: bad --place {v!r}"
             o["place"].append((src, rel))
+        elif k == "--egress":
+            if not os.path.isabs(v):
+                return f"landlock_exec.py: bad --egress {v!r}"
+            o["egress"] = v
+        elif k == "--forward":
+            port, eq, sock = v.partition("=")
+            if (not eq or not port.isdigit() or not 0 < int(port) < 65536
+                    or not os.path.isabs(sock)):
+                return f"landlock_exec.py: bad --forward {v!r}"
+            o["forward"].append((int(port), sock))
         elif k == "--report-fd":
             if not v.isdigit():
                 return f"landlock_exec.py: bad --report-fd {v!r}"
@@ -1080,6 +1275,8 @@ def _parse(argv: list[str]) -> dict | str:
     if not o["sandbox"] and (o["view"] or o["place"] or o["report"]
                              or o["report_fd"] is not None):
         return "landlock_exec.py: --view, --place and --report need --sandbox"
+    if not o["isolate"] and (o["egress"] or o["forward"]):
+        return "landlock_exec.py: --egress and --forward need --isolate"
     if (o["report"] is None) != (o["report_fd"] is None):
         return "landlock_exec.py: --report and --report-fd go together"
     return o
@@ -1094,17 +1291,27 @@ def main(argv: list[str]) -> int:
     if o["sandbox"]:
         return run_sandbox(cmd, rw, ro, o["view"], o["place"], o["report"],
                            o["report_fd"])
+    relays: list[tuple[socket.socket, str]] = []
     if o["isolate"]:
+        targets = list(o["forward"]) + ([(0, o["egress"])] if o["egress"]
+                                        else [])
         try:
-            isolate(rw, ro)
+            isolate(rw, ro, sockets=[t for _p, t in targets])
             join_session_keyring()
+            # Fixed ports first, so the kernel's pick cannot take one.
+            relays = [(relay_listener(port), target)
+                      for port, target in targets]
         except (IsolationError, OSError) as e:
+            for s, _t in relays:
+                s.close()
             return _isolation_failed(e)
+        if o["egress"]:
+            os.environ.update(proxy_env(relays[-1][0].getsockname()[1]))
         rw = rw + list(PRIVATE)
     rc = _confine_or_126(rw, ro)
     if rc is not None:
         return rc
-    return run(cmd)
+    return run(cmd, start_relays(relays))
 
 
 if __name__ == "__main__":

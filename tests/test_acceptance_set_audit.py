@@ -918,26 +918,26 @@ def test_a_worker_environment_never_carries_the_consent(leerie, monkeypatch,
     assert not any(k.startswith("PRISMA_USER_CONSENT") for k in seen["env"])
 
 
-_SOCK = "?host=/tmp/leerie-pg"
+_OWN = "u@127.0.0.1:5432"
 _NAME = "leerie_0123456789abcdef_test"
 
 
 @pytest.mark.parametrize("url,direct,why", [
-    (f"postgresql://u@localhost/{_NAME}{_SOCK}", None, None),
-    (f"postgres://u@localhost/{_NAME}{_SOCK}", None, None),
-    (f"postgresql://u@db.example.com/{_NAME}{_SOCK}", None, "host"),
-    (f"postgresql://u@127.0.0.1:5432/{_NAME}", None, "host"),
-    (f"postgresql://u@localhost:5432/{_NAME}{_SOCK}", None, "host"),
-    (f"postgresql://u@localhost/{_NAME}?host=/var/run/postgresql", None,
-     "socket"),
-    (f"postgresql://u@localhost/{_NAME}", None, "socket"),
-    (f"postgresql://u@localhost/app_test{_SOCK}", None, "not named"),
-    (f"postgresql://u@localhost/leerie_ab_test{_SOCK}", None, "not named"),
-    (f"mysql://u@localhost/{_NAME}{_SOCK}", None, "scheme"),
-    (f"postgresql://u@localhost/{_NAME}{_SOCK}",
-     f"postgresql://u@localhost/prod{_SOCK}", "DIRECT_URL"),
+    (f"postgresql://{_OWN}/{_NAME}", None, None),
+    (f"postgres://{_OWN}/{_NAME}", None, None),
+    (f"postgresql://u@db.example.com:5432/{_NAME}", None, "host"),
+    (f"postgresql://u@localhost/{_NAME}?host=/tmp/leerie-pg", None, "host"),
+    (f"postgresql://u@127.0.0.1/{_NAME}", None, "host"),
+    (f"postgresql://u@127.0.0.1:5433/{_NAME}", None, "host"),
+    (f"postgresql://{_OWN}/{_NAME}?host=/var/run/postgresql", None,
+     "parameters"),
+    (f"postgresql://{_OWN}/app_test", None, "not named"),
+    (f"postgresql://{_OWN}/leerie_ab_test", None, "not named"),
+    (f"mysql://{_OWN}/{_NAME}", None, "scheme"),
+    (f"postgresql://{_OWN}/{_NAME}", f"postgresql://{_OWN}/prod",
+     "DIRECT_URL"),
 ])
-def test_only_a_throwaway_database_on_the_commands_own_socket_passes(
+def test_only_a_throwaway_database_on_the_commands_own_loopback_passes(
         leerie, url, direct, why):
     got = leerie._test_db_url_refusal(url, direct or url)
     assert (got is None) if why is None else (why in got)

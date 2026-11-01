@@ -21306,6 +21306,364 @@ async def _strict_output_proxy(caps: dict, label: str) -> AsyncIterator[None]:
                 _STRICT_PROXY = None
 
 
+# --- The egress proxy: the one way a confined process reaches outside --------
+# DESIGN §6 *A confined process has its own network; the outside is reached
+# only through leerie's proxy*. Every confined process runs in a network
+# namespace of its own, loopback only, so a listener one starts is no
+# other's. A process whose grant
+# carries `egress` (a worker: the API, WebFetch, the fetches its shell runs;
+# an install kind: its registry) reaches the outside through this proxy only:
+# an HTTP CONNECT (and plain-HTTP) proxy on a unix socket in a 0700 directory
+# leerie owns under `/tmp/l/`, which the shim carries into the namespace and
+# relays from the namespace's own `127.0.0.1:<port>`. It runs on its own
+# thread and event loop, so a synchronous spawn on the orchestrator's loop
+# never stalls it. It resolves names itself and refuses every destination
+# that is inside the container — loopback, link-local, unspecified,
+# multicast, the container's own addresses — so the proxy is no way back to
+# a listener outside the namespace. It logs refused destinations, never
+# payloads.
+EGRESS_SOCKET_NAME = "egress.sock"
+_EGRESS_HEAD_MAX = 64 << 10
+_EGRESS_CONNECT_TIMEOUT_SEC = 30.0
+_EGRESS_START_TIMEOUT_SEC = 30.0
+_EGRESS_HOP_HEADERS = frozenset({"proxy-connection", "proxy-authorization",
+                                 "connection", "keep-alive"})
+
+
+def _own_addresses() -> set[str]:
+    """The container's own addresses, from the kernel's tables: every local
+    IPv4 address (`/proc/net/fib_trie`'s `/32 host LOCAL` entries) and every
+    IPv6 address of an interface (`/proc/net/if_inet6`)."""
+    out: set[str] = set()
+    try:
+        last = None
+        with open("/proc/net/fib_trie", encoding="ascii",
+                  errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("|-- "):
+                    last = s[4:]
+                elif s == "/32 host LOCAL" and last:
+                    out.add(last)
+    except OSError:
+        pass
+    try:
+        with open("/proc/net/if_inet6", encoding="ascii",
+                  errors="replace") as f:
+            for line in f:
+                h = line.split()[0] if line.split() else ""
+                if len(h) == 32:
+                    out.add(str(ipaddress.IPv6Address(bytes.fromhex(h))))
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def _egress_refusal(addr: str, own: set[str]) -> str | None:
+    """Why the proxy refuses to connect to `addr` (an IP literal), or None:
+    every address that reaches into the container rather than out of it."""
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return "not an address"
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_link_local:
+        return "link-local"
+    if ip.is_unspecified:
+        return "unspecified"
+    if ip.is_multicast:
+        return "multicast"
+    if str(ip) in own:
+        return "the container's own address"
+    return None
+
+
+def _egress_target(text: str) -> tuple[str, int] | None:
+    """`host:port` (an IPv6 literal bracketed) as `(host, port)`."""
+    host, sep, port = text.rpartition(":")
+    if not sep or not port.isdigit() or not 0 < int(port) < 65536:
+        return None
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return (host, int(port)) if host else None
+
+
+async def _egress_pipe(reader: asyncio.StreamReader,
+                       writer: asyncio.StreamWriter) -> None:
+    try:
+        while True:
+            data = await reader.read(1 << 16)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionError, OSError, asyncio.IncompleteReadError):
+        pass
+    with contextlib.suppress(Exception):
+        if writer.can_write_eof():
+            writer.write_eof()
+
+
+class _EgressProxy:
+    """The run's egress proxy (above): a unix-socket server on its own
+    thread. `forward(port)` adds a socket that pipes to this container's
+    `127.0.0.1:port`, for a listener of leerie's own a confined worker must
+    reach (the strict-output proxy's `ANTHROPIC_BASE_URL`)."""
+
+    def __init__(self, directory: Path) -> None:
+        self.dir = Path(directory)
+        self.socket_path = self.dir / EGRESS_SOCKET_NAME
+        self.pid = os.getpid()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._servers: list[asyncio.base_events.Server] = []
+        self._forwards: dict[int, str] = {}
+        self._refused: set[tuple[str, int]] = set()
+        self.connections = 0
+        self.refusals = 0
+
+    def start(self) -> None:
+        ready = threading.Event()
+        failed: list[BaseException] = []
+
+        def serve() -> None:
+            loop = asyncio.new_event_loop()
+            # A connection still open when the process exits is not an
+            # error of the proxy's: its task is dropped silently.
+            loop.set_exception_handler(
+                lambda lp, ctx: None if "destroyed but it is pending"
+                in str(ctx.get("message", ""))
+                else lp.default_exception_handler(ctx))
+            self._loop = loop
+            try:
+                srv = loop.run_until_complete(asyncio.start_unix_server(
+                    self._handle, path=str(self.socket_path),
+                    limit=_EGRESS_HEAD_MAX, backlog=256))
+                self._servers.append(srv)
+            except BaseException as e:  # noqa: BLE001 - reported to start()
+                failed.append(e)
+                ready.set()
+                loop.close()
+                return
+            ready.set()
+            loop.run_forever()
+
+        threading.Thread(target=serve, name="leerie-egress",
+                         daemon=True).start()
+        if not ready.wait(_EGRESS_START_TIMEOUT_SEC):
+            raise OSError("the egress proxy did not start")
+        if failed:
+            raise OSError(f"the egress proxy could not listen on "
+                          f"{self.socket_path}: {failed[0]}")
+
+    def forward(self, port: int) -> str:
+        """The unix socket that pipes to `127.0.0.1:port`, made once."""
+        if port in self._forwards:
+            return self._forwards[port]
+        path = self.dir / f"fwd-{port}.sock"
+
+        async def make() -> None:
+            async def handle(reader: asyncio.StreamReader,
+                             writer: asyncio.StreamWriter) -> None:
+                try:
+                    ur, uw = await asyncio.wait_for(
+                        asyncio.open_connection("127.0.0.1", port),
+                        _EGRESS_CONNECT_TIMEOUT_SEC)
+                except (OSError, asyncio.TimeoutError):
+                    writer.close()
+                    return
+                await self._splice(reader, writer, ur, uw)
+            self._servers.append(await asyncio.start_unix_server(
+                handle, path=str(path), backlog=256))
+
+        assert self._loop is not None
+        asyncio.run_coroutine_threadsafe(make(), self._loop).result(
+            _EGRESS_START_TIMEOUT_SEC)
+        self._forwards[port] = str(path)
+        return str(path)
+
+    @staticmethod
+    async def _splice(r1: asyncio.StreamReader, w1: asyncio.StreamWriter,
+                      r2: asyncio.StreamReader,
+                      w2: asyncio.StreamWriter) -> None:
+        await asyncio.gather(_egress_pipe(r1, w2), _egress_pipe(r2, w1))
+        for w in (w1, w2):
+            with contextlib.suppress(Exception):
+                w.close()
+
+    async def _refuse(self, writer: asyncio.StreamWriter, code: int,
+                      reason: str, why: str) -> None:
+        body = f"leerie egress proxy: {why}\n".encode()
+        with contextlib.suppress(Exception):
+            writer.write(f"HTTP/1.1 {code} {reason}\r\nContent-Type: "
+                         f"text/plain\r\nContent-Length: {len(body)}\r\n"
+                         "Connection: close\r\n\r\n".encode() + body)
+            await writer.drain()
+            writer.close()
+
+    async def _connect(self, host: str, port: int
+                       ) -> tuple[asyncio.StreamReader,
+                                  asyncio.StreamWriter] | str:
+        """A connection to `host:port` on an address the proxy allows, or
+        why there is none. Names are resolved here, and the connection is
+        made to the address checked, never to a name resolved again."""
+        loop = asyncio.get_running_loop()
+        upstream = _egress_proxy(host)
+        try:
+            infos = await loop.getaddrinfo(host, port,
+                                           type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError) as e:
+            if upstream is None:
+                return f"cannot resolve {host}: {e}"
+            # Only the operator's proxy resolves it: that proxy is outside
+            # the container, and no loopback of the container is its.
+            infos = []
+        own = _own_addresses()
+        allowed, why = [], None
+        for fam, _t, _p, _c, sa in infos:
+            refusal = _egress_refusal(sa[0], own)
+            if refusal is None:
+                allowed.append(sa[0])
+            else:
+                why = why or refusal
+        if not allowed and (infos or upstream is None):
+            self.refusals += 1
+            if (host, port) not in self._refused:
+                self._refused.add((host, port))
+                log(f"egress: refused {host}:{port} ({why}): a confined "
+                    "process reaches only outside the container (DESIGN §6 "
+                    "*A confined process has its own network*)")
+            return f"refused {host}:{port} ({why})"
+        if upstream is not None:
+            return await self._via_upstream(upstream, host, port)
+        last: str = "no address"
+        for addr in dict.fromkeys(allowed):
+            try:
+                return await asyncio.wait_for(
+                    asyncio.open_connection(addr, port),
+                    _EGRESS_CONNECT_TIMEOUT_SEC)
+            except (OSError, asyncio.TimeoutError) as e:
+                last = f"{type(e).__name__}: {e}"
+        return f"cannot connect to {host}:{port}: {last}"
+
+    @staticmethod
+    async def _via_upstream(upstream: tuple[str, int, str], host: str,
+                            port: int
+                            ) -> tuple[asyncio.StreamReader,
+                                       asyncio.StreamWriter] | str:
+        """A tunnel to `host:port` through the operator's own proxy (the
+        container's proxy variables, `_egress_proxy`), as the worker's
+        tools reached it before they had a namespace of their own."""
+        phost, pport, auth = upstream
+        try:
+            ur, uw = await asyncio.wait_for(
+                asyncio.open_connection(phost, pport),
+                _EGRESS_CONNECT_TIMEOUT_SEC)
+            target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+            uw.write((f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                      + (f"Proxy-Authorization: Basic {auth}\r\n"
+                         if auth else "") + "\r\n").encode("latin-1"))
+            await uw.drain()
+            head = await asyncio.wait_for(ur.readuntil(b"\r\n\r\n"),
+                                          _EGRESS_CONNECT_TIMEOUT_SEC)
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError,
+                asyncio.LimitOverrunError) as e:
+            return f"cannot reach the proxy {phost}:{pport}: {e}"
+        first = head.split(b"\r\n", 1)[0]
+        status = first.split(b" ")
+        if len(status) < 2 or status[1] != b"200":
+            uw.close()
+            return (f"the proxy {phost}:{pport} answered "
+                    f"{first.decode('latin-1')!r}")
+        return ur, uw
+
+    async def _handle(self, reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter) -> None:
+        self.connections += 1
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError,
+                ConnectionError, OSError):
+            with contextlib.suppress(Exception):
+                writer.close()
+            return
+        lines = head.decode("latin-1").split("\r\n")
+        parts = lines[0].split(" ")
+        if len(parts) != 3 or not parts[2].startswith("HTTP/"):
+            await self._refuse(writer, 400, "Bad Request", "bad request line")
+            return
+        method, target, version = parts
+        if method == "CONNECT":
+            dest = _egress_target(target)
+            if dest is None:
+                await self._refuse(writer, 400, "Bad Request",
+                                   f"bad CONNECT target {target!r}")
+                return
+            up = await self._connect(*dest)
+            if isinstance(up, str):
+                await self._refuse(writer, 403 if up.startswith("refused")
+                                   else 502, "Forbidden"
+                                   if up.startswith("refused")
+                                   else "Bad Gateway", up)
+                return
+            ur, uw = up
+            with contextlib.suppress(Exception):
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await writer.drain()
+            await self._splice(reader, writer, ur, uw)
+            return
+        u = urllib.parse.urlsplit(target)
+        try:
+            port = u.port or 80
+        except ValueError:
+            port = None
+        if u.scheme != "http" or not u.hostname or port is None:
+            await self._refuse(writer, 400, "Bad Request",
+                               "only CONNECT and absolute http:// requests")
+            return
+        up = await self._connect(u.hostname, port)
+        if isinstance(up, str):
+            await self._refuse(writer, 403 if up.startswith("refused")
+                               else 502, "Forbidden"
+                               if up.startswith("refused")
+                               else "Bad Gateway", up)
+            return
+        ur, uw = up
+        path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+        headers = [h for h in lines[1:] if h
+                   and h.split(":", 1)[0].strip().lower()
+                   not in _EGRESS_HOP_HEADERS]
+        # One request per connection: the next may name another host.
+        out = "\r\n".join([f"{method} {path} {version}", *headers,
+                           "Connection: close", "", ""])
+        with contextlib.suppress(Exception):
+            uw.write(out.encode("latin-1"))
+        await self._splice(reader, writer, ur, uw)
+
+
+_EGRESS: _EgressProxy | None = None
+_EGRESS_LOCK = threading.Lock()
+
+
+def _egress_server() -> _EgressProxy:
+    """This process's egress proxy, started on first use (a forked child
+    starts its own): every spawn with an `egress` grant names its socket."""
+    global _EGRESS
+    with _EGRESS_LOCK:
+        if _EGRESS is None or _EGRESS.pid != os.getpid():
+            proxy = _EgressProxy(_private_tmp(Path(f"egress:{os.getpid()}")))
+            try:
+                proxy.start()
+            except OSError as e:
+                die(f"{e}. Leerie gives a confined process the outside "
+                    "network only through its egress proxy (DESIGN §6 "
+                    "*A confined process has its own network*).")
+            _EGRESS = proxy
+        return _EGRESS
+
+
 # Substrings that identify a *schema* rejection of a structured submission, as
 # opposed to any other errored tool result. Measured against real worker
 # streams: the CLI emits "Output does not match required schema: …" for a
@@ -22513,6 +22871,13 @@ _SANDBOX_FIXES: tuple[tuple[str, str], ...] = (
      "the host restricts unprivileged user namespaces "
      "(kernel.apparmor_restrict_unprivileged_userns) and this process is "
      "not under the `leerie-container` AppArmor profile, which allows them"),
+    (r"unshare\(mount/IPC/net[^)]*\): (EPERM|EINVAL|ENOSPC)|bring up lo|"
+     r"relay listen",
+     "the runtime refuses a network namespace (or its loopback) inside the "
+     "shim's user namespace: every confined process needs one (DESIGN §6 "
+     "*A confined process has its own network*); on Fly, EC2 or Colima the "
+     "guest kernel must offer `CONFIG_NET_NS` to unprivileged user "
+     "namespaces"),
     (r"overlay .*: EINVAL",
      "the state root's filesystem cannot be an overlay's lower layer in a "
      "user namespace"),
@@ -22617,6 +22982,7 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
             + "; ".join(failed) + f".{fly} Leerie never runs a held-out "
             "file outside a sandbox (DESIGN §6 *A held-out evaluation runs "
             "alone*).")
+    _require_egress_relay()
     os.environ[ISOLATE_ENV] = "1"
 
 
@@ -22648,6 +23014,85 @@ def _sandbox_probe_failures(got: dict, placed_on_disk: bool) -> list[str]:
     return out
 
 
+# What `_require_egress_relay` runs inside an isolated namespace with
+# `--egress`: ask the egress proxy (through the relay the shim set
+# `HTTPS_PROXY` to) to CONNECT to a loopback address, then try the
+# orchestrator's own loopback listener directly. One line of JSON.
+_EGRESS_RELAY_PROBE = r"""
+import errno, json, os, socket, sys
+out = {}
+try:
+    u = os.environ["HTTPS_PROXY"].rsplit("/", 1)[-1].rsplit("@", 1)[-1]
+    host, port = u.rsplit(":", 1)
+    s = socket.create_connection((host, int(port)), timeout=20)
+    s.sendall(b"CONNECT 127.0.0.1:" + sys.argv[1].encode()
+              + b" HTTP/1.1\r\nHost: x\r\n\r\n")
+    out["proxy"] = s.recv(4096).split(b"\r\n", 1)[0].decode("latin-1")
+    s.close()
+except Exception as e:
+    out["proxy"] = "error: " + type(e).__name__ + ": " + str(e)
+try:
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])),
+                             timeout=5).close()
+    out["outer_loopback"] = "reached"
+except OSError as e:
+    out["outer_loopback"] = errno.errorcode.get(e.errno, str(e.errno))
+print(json.dumps(out))
+"""
+
+
+def _require_egress_relay() -> None:
+    """Fail closed (DESIGN §6 *A confined process has its own network*):
+    run an isolated process with `--egress` and check that it reaches the
+    egress proxy through its relay, that the proxy refuses a loopback
+    destination, and that a listener on the orchestrator's own loopback is
+    not reachable from its namespace; stop the run naming what failed."""
+    proxy = _egress_server()
+    lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lst.bind(("127.0.0.1", 0))
+        lst.listen(1)
+        port = lst.getsockname()[1]
+        # The refusal the probe asks for is expected: not logged.
+        proxy._refused.add(("127.0.0.1", port))
+        argv = [sys.executable, "-I", "-S", str(LANDLOCK_SCRIPT), "--isolate",
+                "--egress", str(proxy.socket_path), "--rw", "/dev/null",
+                "--ro", "/", "--", sys.executable, "-I", "-S", "-c",
+                _EGRESS_RELAY_PROBE, str(port)]
+        try:
+            r = subprocess.run(argv, cwd="/", capture_output=True, text=True,
+                               timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            die(f"preflight could not run the network probe "
+                f"({type(e).__name__}: {e}); leerie never starts a confined "
+                "process on the container's network (DESIGN §6 *A confined "
+                "process has its own network*).")
+    finally:
+        lst.close()
+    try:
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        got = {}
+    failed = []
+    if not str(got.get("proxy", "")).startswith("HTTP/1.1 403"):
+        failed.append("the egress proxy was not reached through the relay, "
+                      f"or did not refuse a loopback destination "
+                      f"({got.get('proxy')!r})")
+    if got.get("outer_loopback") != "ECONNREFUSED":
+        failed.append("the orchestrator's loopback was "
+                      f"{got.get('outer_loopback')!r} from a confined "
+                      "process's namespace, not refused")
+    if r.returncode != 0 or failed:
+        err = (r.stderr or "").strip()[-600:]
+        die(f"this runtime cannot give a confined process a network of its "
+            f"own (exit {r.returncode}): "
+            + ("; ".join(failed) or "no report") + (f" — {err}" if err
+                                                    else "")
+            + f". Fix: {_sandbox_fix(err)}. Leerie never starts a confined "
+            "process on the container's network (DESIGN §6 *A confined "
+            "process has its own network*).")
+
+
 class HeldOutSandbox(NamedTuple):
     """A held-out run's sandbox (DESIGN §6 *A held-out evaluation runs
     alone*): `view` is overlaid, each `place` pair (absolute source, path
@@ -22667,10 +23112,14 @@ class WorkerGrants(NamedTuple):
     `claude_p` names its directories itself. `/tmp` and `/dev/shm` are
     never named here but as devices: an isolated process's own are added by
     the shim (DESIGN §6 *Every confined process has its own `/tmp`,
-    `/dev/shm` and IPC*)."""
+    `/dev/shm` and IPC*). `egress`: the process reaches the outside network,
+    through leerie's egress proxy only (a worker, an install kind); without
+    it an isolated process has its own loopback and nothing else (DESIGN §6
+    *A confined process has its own network*)."""
     rw: tuple[str, ...]
     ro: tuple[str, ...]
     env: tuple[tuple[str, str], ...] = ()
+    egress: bool = False
 
 
 # The caps key that marks the host-side seam, set only by
@@ -23051,10 +23500,13 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     # which cost 0.3 s a call against a 2,000-entry `/tmp`, measured). Nor
     # the container's `/tmp`: an isolated worker's is its own, added by the
     # shim.
+    # Every worker reaches the API (and WebFetch, and what its shell
+    # fetches) through the egress proxy.
     return WorkerGrants(
         tuple(dict.fromkeys(_around(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
-                            + _around(ro, state_root))))
+                            + _around(ro, state_root))),
+        egress=True)
 
 
 def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
@@ -23065,7 +23517,10 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
     outside one, and the shim refuses where it cannot build one), its
     report copied to `report_fd`; else isolated once preflight has built a
     sandbox (`_isolated()`, DESIGN §6 *Every confined process has its own
-    `/tmp`, `/dev/shm` and IPC*)."""
+    `/tmp`, `/dev/shm` and IPC*), in a network namespace of its own: with
+    an `egress` grant, the outside reached through the run's egress proxy
+    (`_egress_server`), and the strict-output proxy's port relayed when it
+    is live (DESIGN §6 *A confined process has its own network*)."""
     # `-S`: the shim imports only the standard library, and `site` cost
     # ~15 ms of every worker's start (measured).
     argv = [sys.executable, "-I", "-S", str(LANDLOCK_SCRIPT)]
@@ -23078,6 +23533,14 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                      str(report_fd)]
     elif _isolated():
         argv.append("--isolate")
+        if grants.egress:
+            proxy = _egress_server()
+            argv += ["--egress", str(proxy.socket_path)]
+            if _STRICT_PROXY is not None and _STRICT_PROXY.port:
+                # `ANTHROPIC_BASE_URL` names it on the orchestrator's
+                # loopback: the same port in the namespace, relayed.
+                argv += ["--forward", f"{_STRICT_PROXY.port}="
+                         f"{proxy.forward(_STRICT_PROXY.port)}"]
     for p in grants.rw:
         argv += ["--rw", p]
     for p in grants.ro:
@@ -23785,11 +24248,15 @@ def _measurement_grants(st: "State", tree: str | Path,
                      ("verify_deps_before_run", "false")):
             env[f"npm_config_{k}"] = v
             env[f"pnpm_config_{k}"] = v
+    # A measurement reaches nothing outside its own loopback; the kinds
+    # that fetch (a toolchain, the setup hook, leerie's store fetch) reach
+    # the outside through the egress proxy (DESIGN §6 *A confined process
+    # has its own network*).
     return WorkerGrants(
         tuple(dict.fromkeys(_around(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _around(ro, state_root))),
-        tuple(env.items()))
+        tuple(env.items()), egress=kind != MEASURE_KIND)
 
 
 def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:
@@ -48971,16 +49438,18 @@ def _db_reset_denials(repo_root: str | Path) -> str:
 
 # DESIGN §6 *No database server leerie starts is ever unconfined*: a command
 # that needs a database is wrapped by this script, inside its own
-# confinement and isolation; the cluster lives in that command's own `/tmp`.
+# confinement and isolation; the cluster lives in that command's own `/tmp`
+# and listens on the loopback of its own network namespace (DESIGN §6 *A
+# confined process has its own network*).
 SANDBOX_DB_SCRIPT = ROOT / "scripts" / "sandbox-db.sh"
-TEST_DB_SOCKET_DIR = "/tmp/leerie-pg"
+TEST_DB_HOST, TEST_DB_PORT = "127.0.0.1", 5432
 _TEST_DB_NAME_RE = re.compile(r"leerie_[0-9a-f]{16}_test")
 
 
 def _test_db_url_refusal(url: str, direct_url: str) -> str | None:
     """Why `url` is NOT a database leerie may push to, or None when it is:
-    a postgres URL on `localhost` whose socket is the command's own
-    (`host=` `TEST_DB_SOCKET_DIR`), whose database name is
+    a postgres URL on the command's own loopback (`TEST_DB_HOST`,
+    `TEST_DB_PORT`, no other parameter), whose database name is
     `leerie_<16 hex>_test`, with DIRECT_URL equal to it (prisma.config.ts
     commonly resolves `DIRECT_URL ?? DATABASE_URL`, so a different
     DIRECT_URL would be the push's real target). Checked on the URL
@@ -48993,12 +49462,11 @@ def _test_db_url_refusal(url: str, direct_url: str) -> str | None:
     name = u.path.lstrip("/")
     if u.scheme not in ("postgres", "postgresql"):
         return f"scheme {u.scheme!r} is not postgres"
-    if u.hostname != "localhost" or port is not None:
-        return f"host {u.netloc!r} is not localhost through a socket"
-    hosts = urllib.parse.parse_qs(u.query).get("host") or []
-    if hosts != [TEST_DB_SOCKET_DIR]:
-        return (f"socket {hosts!r} is not the command's own "
-                f"{TEST_DB_SOCKET_DIR}")
+    if u.hostname != TEST_DB_HOST or port != TEST_DB_PORT:
+        return (f"host {u.netloc!r} is not the command's own "
+                f"{TEST_DB_HOST}:{TEST_DB_PORT}")
+    if u.query or u.params or u.fragment:
+        return f"the URL carries parameters ({u.query or u.params!r})"
     if not _TEST_DB_NAME_RE.fullmatch(name):
         return (f"database {name!r} is not named "
                 f"{_TEST_DB_PREFIX}<16 hex>{_TEST_DB_SUFFIX}")
@@ -49015,7 +49483,7 @@ def _test_db_name(key: str) -> str:
 def _test_db_url(name: str) -> str:
     """The URL `scripts/sandbox-db.sh` composes for `name`."""
     user = pwd.getpwuid(os.getuid()).pw_name
-    return f"postgresql://{user}@localhost/{name}?host={TEST_DB_SOCKET_DIR}"
+    return f"postgresql://{user}@{TEST_DB_HOST}:{TEST_DB_PORT}/{name}"
 
 
 # The wrapper runs its command without a database whenever a step fails; a

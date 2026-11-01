@@ -184,7 +184,9 @@ def test_f1_a_commands_database_runs_nothing_outside_its_grant(
         leerie, run, isolated):
     """The measured F1, turned round: the command's own server runs inside
     its confinement, so `COPY … TO PROGRAM` cannot read `acceptance/` any
-    more than the command can, and it listens on no TCP address."""
+    more than the command can, and it listens only on the loopback of the
+    command's own network namespace (DESIGN §6 *A confined process has its
+    own network*): `127.0.0.1:5432` there, nothing on the orchestrator's."""
     st, view = _st(run), _view(run)
     held = run["run_dir"] / "acceptance" / "set-1" / "test_held.py"
     pkg = view / "node_modules" / ".bin"
@@ -197,12 +199,60 @@ def test_f1_a_commands_database_runs_nothing_outside_its_grant(
     script = (
         f"{psql} \"$DATABASE_URL\" -c \"COPY (SELECT 1) TO PROGRAM "
         f"'cat {held} > {leak}'\"; "
-        "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '$4==\"0A\"' "
-        "| wc -l")
+        "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '$4==\"0A\" "
+        "{print \"LISTEN\", $2}'; echo NETNS $(readlink /proc/self/ns/net)")
     g = leerie._measurement_grants(st, view)
     rc, tail = asyncio.run(leerie._run_streaming(
         ["bash", str(leerie.SANDBOX_DB_SCRIPT), str(view), name, "--",
          "bash", "-c", script], grants=g, cwd=str(view), timeout=120,
         verbosity="quiet"))
     assert not leak.exists() or "held" not in leak.read_text(), tail
-    assert tail.strip().splitlines()[-1].strip() == "0", tail
+    inside = sorted(ln.split()[1] for ln in tail.splitlines()
+                    if ln.startswith("LISTEN "))
+    assert inside == ["0100007F:1538"], tail
+    # Listeners of a namespace that is not the orchestrator's.
+    netns = tail.split("NETNS ")[1].split()[0]
+    assert netns.startswith("net:[") and netns != os.readlink(
+        "/proc/self/ns/net"), tail
+
+
+@pytest.mark.skipif(
+    not (any(Path("/usr/lib/postgresql").glob("*/bin/initdb"))
+         or shutil.which("initdb")),
+    reason="no PostgreSQL server binaries on this host")
+def test_m2_tooling_that_reads_host_and_port_reaches_the_database(
+        leerie, run, isolated):
+    """Review round 21's M2, turned round: a repository's own tooling that
+    takes host and port from `DATABASE_URL` (funeralworks' `pretest` runs
+    `psql -h localhost -p 5432`) reaches the command's database, as `-h
+    localhost` and as the URL's own host — and two concurrent commands each
+    get their own server on that one port."""
+    st, view = _st(run), _view(run)
+    pkg = view / "node_modules" / ".bin"
+    pkg.mkdir(parents=True)
+    (pkg / "prisma").write_text("#!/bin/sh\nexit 0\n")
+    (pkg / "prisma").chmod(0o755)
+    psql = shutil.which("psql") or sorted(
+        Path("/usr/lib/postgresql").glob("*/bin/psql"))[-1]
+    script = (
+        "python3 - <<'PY'\n"
+        "import os, subprocess, urllib.parse\n"
+        "u = urllib.parse.urlparse(os.environ['DATABASE_URL'])\n"
+        "for host in ('localhost', u.hostname):\n"
+        f"    r = subprocess.run(['{psql}', '-h', host, '-p', str(u.port),\n"
+        "        '-U', u.username, '-d', u.path[1:], '-tAc', 'select 40+2'],\n"
+        "        capture_output=True, text=True)\n"
+        "    print('VIA', host, r.stdout.strip() or r.stderr.strip()[:200])\n"
+        "PY\nsleep 2\n")
+    g = leerie._measurement_grants(st, view)
+
+    async def both():
+        return await asyncio.gather(*(leerie._run_streaming(
+            ["bash", str(leerie.SANDBOX_DB_SCRIPT), str(view),
+             leerie._test_db_name(f"m2-{i}"), "--", "bash", "-c", script],
+            grants=g, cwd=str(view), timeout=120, verbosity="quiet")
+            for i in range(2)))
+    for rc, tail in asyncio.run(both()):
+        assert rc == 0, tail
+        assert "VIA localhost 42" in tail and "VIA 127.0.0.1 42" in tail, \
+            tail
