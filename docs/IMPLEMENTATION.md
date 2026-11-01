@@ -6413,8 +6413,20 @@ DESIGN §8 *The settings are leerie's* and *One ignore rule*.
   `<run>/repo`; the git dir is `_admin_dir_of(common, tree)` (the
   `<common>/worktrees/<id>` whose `gitdir` names `tree`) whose `commondir`
   resolves to `common`; with no such record and `common` the run
-  repository, a `.git` directory (not a link) in the tree is a clone,
-  returned as both; otherwise False. None for a tree outside every run.
+  repository, a ref-less clone: `_clone_git_dir(tree)`
+  (`<run>/clone-gits/<name>`, `CLONE_GITS_NAME`) when it is a git
+  directory, returned as both, and never the tree's own `.git`; otherwise
+  False. None for a tree outside every run. `_ref_less_clone(src, wt, rev)`
+  runs its own setup with the clone's `.git` named explicitly (`-C wt
+  --git-dir wt/.git --work-tree wt` and the pins) and then, for a `wt`
+  whose parent is `worktrees`, `_make_clone_git_dir(src, wt, rev) -> bool`:
+  `git --git-dir <shadow> --work-tree wt init -q`, an
+  `objects/info/alternates` line naming `src`'s objects, HEAD written as
+  `rev`, `read-tree rev`, `update-index -q --refresh`; a failure removes
+  both. `_remove_acceptance_checkout` removes the shadow with the
+  checkout. Shell: `leerie_tree_location` prints
+  `<run>/clone-gits/<name>` twice for such a clone, and refuses one
+  without it. Pinned by `tests/test_ref_less_clone_git_is_leeries.py`.
   `_common_dir_of` and `_run_settings_of` use it for a run tree (a clone
   has no run settings). Shell: `leerie_tree_location` (prints the common
   and git directories; status 2 outside every run, 1 unlocatable) and

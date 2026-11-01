@@ -10017,8 +10017,9 @@ def _run_tree_location(tree: str | Path
     code may rewrite: `(common dir, git dir, run dir)`. A worktree of its
     tree repository (`<run>/tree-repos/<name>`) or else of the run
     repository, its git dir the administrative directory that names it, and
-    whose `commondir` names that repository; a ref-less clone, its own
-    `.git` directory. None for a tree outside every run (the user's
+    whose `commondir` names that repository; a ref-less clone, the git
+    directory leerie made for it (`_clone_git_dir`), never the `.git` inside
+    it. None for a tree outside every run (the user's
     checkout, a test's repository); False for one inside a run that matches
     none of these (no git command may then read it)."""
     t = Path(os.path.realpath(tree))
@@ -10036,10 +10037,11 @@ def _run_tree_location(tree: str | Path
     # names it, so a `.git` directory put in its place makes it no clone.
     admin = _admin_dir_of(common, t)
     if admin is None:
-        dot = t / ".git"
-        if (common == run_dir / RUN_REPO_NAME and dot.is_dir()
-                and not dot.is_symlink()):
-            return dot, dot, run_dir
+        # A ref-less clone: its leerie-owned git directory, never the `.git`
+        # inside it, which its confined worker writes.
+        shadow = run_dir / CLONE_GITS_NAME / t.name
+        if common == run_dir / RUN_REPO_NAME and _is_git_dir(shadow):
+            return shadow, shadow, run_dir
         return False
     try:
         named = (admin / "commondir").read_text().strip()
@@ -10086,6 +10088,20 @@ def _run_repo_of(run_dir: Path) -> Path | None:
 
 
 TREE_REPOS_NAME = "tree-repos"
+# A ref-less clone's leerie-owned git directory (DESIGN §6 *Leerie's git never
+# takes a tree's repository from the tree*): `<run>/clone-gits/<tree name>`.
+# The clone keeps its own `.git` inside the tree, where its confined worker
+# writes — config, hooks, attributes and all — so leerie never reads it: its
+# reads go through this one, which borrows the run repository's objects, holds
+# an index of the commit the clone was made at, and was written by leerie
+# alone, in a directory no worker's grant names.
+CLONE_GITS_NAME = "clone-gits"
+
+
+def _clone_git_dir(tree: str | Path) -> Path:
+    """Where `_ref_less_clone` keeps `tree`'s leerie-owned git directory."""
+    t = Path(os.path.realpath(tree))
+    return t.parent.parent / CLONE_GITS_NAME / t.name
 
 
 def _common_dir_of(tree: str | Path) -> Path | None:
@@ -11522,7 +11538,10 @@ _OWNED_RUN_DIRS: dict[str, tuple[Callable[[], object] | None, int]] = {}
 
 
 def _run_scratch_names() -> tuple[str, ...]:
-    return (MEASURE_DIRNAME, TREE_STORES_DIRNAME, STORE_FETCH_DIRNAME)
+    # The ref-less clones' git directories (`CLONE_GITS_NAME`) too: each
+    # belongs to a disposable checkout a later process makes again.
+    return (MEASURE_DIRNAME, TREE_STORES_DIRNAME, STORE_FETCH_DIRNAME,
+            CLONE_GITS_NAME)
 
 
 def _release_run_dir(run_dir: Path) -> bool:
@@ -49838,9 +49857,13 @@ def _ref_less_clone(src: Path, wt: Path, rev: str) -> str:
     removed). Mechanical git plumbing."""
     def _git(*args: str, cwd: Path | None = None
              ) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", *(_tree_git_args(cwd) if cwd else []), *args],
-            capture_output=True, text=True, check=False)
+        # The clone's own `.git` is named explicitly while leerie makes it:
+        # no worker has run there yet, so it is still leerie's. Every later
+        # read goes through `_clone_git_dir` (`_run_tree_location`).
+        at = (["-C", str(cwd), "--git-dir", str(Path(cwd) / ".git"),
+               "--work-tree", str(cwd), *_GIT_VIEW_PINS] if cwd else [])
+        return subprocess.run(["git", *at, *args],
+                              capture_output=True, text=True, check=False)
 
     clone = _git("clone", "--quiet", "--shared", "--no-checkout",
                  "--no-tags", str(src), str(wt))
@@ -49859,10 +49882,44 @@ def _ref_less_clone(src: Path, wt: Path, rev: str) -> str:
         _git("reflog", "expire", "--expire=now", "--all", cwd=wt)
         left = _git("for-each-ref", "--format=%(refname)", cwd=wt)
         ok = ok and left.returncode == 0 and not left.stdout.strip()
+    if ok and Path(os.path.realpath(wt)).parent.name == "worktrees":
+        # The run's own clone: leerie's reads of it go through a git
+        # directory leerie alone writes (`CLONE_GITS_NAME`), made before
+        # any worker runs there.
+        ok = _make_clone_git_dir(src, wt, rev)
     if ok:
         return ""
     _rmtree_owned(wt)
+    _rmtree_owned(_clone_git_dir(wt))
     return (clone.stderr.strip() or "a ref could not be removed")[:200]
+
+
+def _make_clone_git_dir(src: Path, wt: Path, rev: str) -> bool:
+    """Make `_clone_git_dir(wt)`: a git directory whose objects are `src`'s
+    (an `alternates` entry), whose HEAD is `rev` detached and whose index is
+    `rev`'s tree, refreshed against `wt`. Every command names it and `wt`
+    explicitly; nothing of `wt`'s own `.git` is read."""
+    gd = _clone_git_dir(wt)
+    _rmtree_owned(gd)
+    gd.parent.mkdir(parents=True, exist_ok=True)
+    at = ["--git-dir", str(gd), "--work-tree", str(wt), *_GIT_VIEW_PINS]
+
+    def _g(*args: str) -> bool:
+        return subprocess.run(["git", *at, *args], capture_output=True,
+                              text=True, check=False).returncode == 0
+    if not _g("init", "-q"):
+        return False
+    common = Path(src)
+    objs = (common / "objects" if _is_git_dir(common)
+            else common / ".git" / "objects")
+    (gd / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (gd / "objects" / "info" / "alternates").write_text(
+        str(objs.resolve()) + "\n")
+    (gd / "HEAD").write_text(rev + "\n")
+    if not _g("read-tree", rev):
+        return False
+    _g("update-index", "-q", "--refresh")      # stat info; dirt is fine
+    return True
 
 
 def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
@@ -49888,10 +49945,12 @@ def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
 
 
 def _remove_acceptance_checkout(st: "State", wt: Path) -> None:
-    """Remove a writer checkout, whichever kind it is."""
+    """Remove a writer checkout, whichever kind it is, and a ref-less
+    clone's leerie-owned git directory with it."""
     subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
     _rmtree_owned(wt)
+    _rmtree_owned(_clone_git_dir(wt))
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
 

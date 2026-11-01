@@ -205,10 +205,14 @@ leerie_tree_location() {
     if [ "$gp" = "$t" ]; then admin="$d"; break; fi
   done
   if [ -z "$admin" ]; then
-    # No record names it: a ref-less clone of the run repository, its own
-    # `.git` directory. A worktree stays one whatever its `.git` now is.
-    if [ "$common" = "$run_dir/repo" ] && [ -d "$t/.git" ] && [ ! -L "$t/.git" ]; then
-      printf '%s\n%s\n' "$t/.git" "$t/.git"
+    # No record names it: a ref-less clone of the run repository, read
+    # through the git directory leerie made for it (`_clone_git_dir`),
+    # never the `.git` inside it, which its confined worker writes. A
+    # worktree stays one whatever its `.git` now is.
+    local shadow
+    shadow="$run_dir/clone-gits/$(basename "$t")"
+    if [ "$common" = "$run_dir/repo" ] && [ -f "$shadow/HEAD" ] && [ -d "$shadow/objects" ]; then
+      printf '%s\n%s\n' "$shadow" "$shadow"
       return 0
     fi
     return 1

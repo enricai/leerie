@@ -2724,7 +2724,8 @@ layout:
   that same repository, since a committing worker can write its own tree
   repository. A tree that the record names stays a worktree whatever its
   `.git` now is, a directory included. One no record names is a ref-less
-  clone of the run repository, read through its own `.git` directory.
+  clone of the run repository, read through the git directory leerie made
+  for it (below), never its own `.git`.
 - The command is `git -C <tree> --git-dir <git dir> --work-tree <tree>`,
   so the tree's `.git` is never followed. It always carries leerie's
   pins: `core.fsmonitor` and `core.untrackedCache` off. The readers that
@@ -2742,11 +2743,32 @@ carries `-C` except in the helper, every git command run with a working
 directory names its repository, and the scripts that source
 `worktree-lib.sh` run git on a tree only through `leerie_tgit`.
 
-*Not covered.* A ref-less clone's repository is inside the clone, so the
-confined writer of the clone also writes its configuration. Leerie reads
-such a clone (the acceptance writer's, the surrogate's, the falsifier's)
-with the pins only. Closing that needs leerie's reads of a clone to come
-from the run repository after a fetch, or to run confined.
+*A ref-less clone is read through leerie's own git directory.* The
+acceptance writer's, the surrogate fixer's and the falsifier's checkouts
+are ref-less clones of the run repository, and a clone keeps its
+repository in its own `.git`, inside the tree its confined worker writes —
+config, hooks and attributes included. So when `_ref_less_clone` makes a
+clone in a run's `worktrees/`, it also makes `<run>/clone-gits/<name>`
+(`_make_clone_git_dir`): a git directory whose objects are the run
+repository's (an `alternates` entry), whose HEAD is the clone's commit
+detached, and whose index is that commit's tree. It is written by leerie
+alone, before any worker runs there, in a directory no worker's grant
+names. `_run_tree_location` and `leerie_tree_location` locate a ref-less
+clone at it and never at the clone's `.git`; a clone without it is
+refused. The worker's result — files it edited or added — is read as
+before, as working-tree data against the clone's commit, and a commit the
+worker makes in its own `.git` is not followed: what it changed is still
+in the tree. Measured with a planted config in the clone's `.git` (an
+fsmonitor, a clean and smudge filter, a filter process, a textconv, a hooks
+path) and `* filter=x diff=x` attributes: reading the clone's own `.git`,
+leerie's `git status` ran the planted filter program; through leerie's git
+directory it saw the worker's edit and ran nothing. Of the two candidates —
+fetching the clone's result into the run repository, or running leerie's
+reads confined — this one needs neither a commit from the worker nor trust
+in what a confined program reports, and it is the same rule every other
+tree follows: the repository is located from leerie's layout. The setup
+commands of `_ref_less_clone` itself name the clone's `.git` explicitly,
+which is still leerie's until a worker runs.
 
 ### A repository per committing tree (I6)
 
