@@ -601,7 +601,7 @@ _leerie_fly_agent_ensure() {
 require_fly_ssh() {
   local fly_org="${LEERIE_FLY_ORG:-personal}"
   _leerie_fly_agent_ensure
-  if ssh-add -l 2>/dev/null | grep -qE 'CERT\)'; then
+  if grep -qE 'CERT\)' < <(ssh-add -l 2>/dev/null); then
     return 0
   fi
   remote_log "remote: issuing Fly SSH certificate (24h) for org=$fly_org"

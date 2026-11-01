@@ -93,7 +93,7 @@ for im in d.get('Images', []):
     reason=""
     if [ "$keep" = all ] || { [ "$keep" = true ] && [ "$ver" = "$cur_ver" ] && [ "$hash" = "$cur_hash" ]; }; then reason="current version+hash AMI kept"
     elif [ "$age" = young ]; then reason="newer than --older-than"
-    elif printf '%s\n' "$live_imgs" | grep -qFx "$id"; then reason="in use by an instance"; fi
+    elif grep -qFx -- "$id" < <(printf '%s\n' "$live_imgs"); then reason="in use by an instance"; fi
     if [ -n "$reason" ]; then echo "  skip AMI $id ($reason)"; continue; fi
     echo "  $verb AMI $id (snapshots: ${snaps:-none})"
     $apply || continue
@@ -113,7 +113,7 @@ for k in d.get('KeyPairs', []):
     if tagged(k.get('Tags')): print(k['KeyName'])")"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    if printf '%s\n' "$live_keys" | grep -qFx "$id"; then echo "  skip key pair $id (in use by an instance)"; continue; fi
+    if grep -qFx -- "$id" < <(printf '%s\n' "$live_keys"); then echo "  skip key pair $id (in use by an instance)"; continue; fi
     echo "  $verb key pair $id"
     $apply || continue
     _ec2_aws ec2 delete-key-pair --key-name "$id" >/dev/null && rm -f "$(_ec2_state_dir)/$id.pem"
@@ -137,7 +137,7 @@ for g in d.get('SecurityGroups', []):
 
   # --- IAM role + instance profile created by ensure_instance_profile ---
   local role="$EC2_ROLE_NAME"
-  if printf '%s\n' "$live_profiles" | grep -q "/$role\$"; then
+  if grep -q "/$role\$" < <(printf '%s\n' "$live_profiles"); then
     echo "  skip IAM role/instance profile $role (in use by an instance)"
   elif _ec2_aws iam get-role --role-name "$role" --output json 2>/dev/null \
       | _ec2_cleanup_py "sys.exit(0 if tagged(d.get('Role', {}).get('Tags')) else 1)"; then

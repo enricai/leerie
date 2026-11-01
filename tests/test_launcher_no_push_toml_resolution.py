@@ -57,7 +57,7 @@ if [ "$NO_PUSH" = "false" ] && [ -f "$USER_REPO/leerie.toml" ]; then
   _toml_no_push="$( { grep -E '^[[:space:]]*no_push[[:space:]]*=' \
                           "$USER_REPO/leerie.toml" 2>/dev/null \
                       || true; } \
-                    | head -1 \
+                    | sed -n 1p \
                     | sed -E 's/^[[:space:]]*no_push[[:space:]]*=[[:space:]]*//;
                               s/[[:space:]]*$//;
                               s/^"(.*)"$/\1/;

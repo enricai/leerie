@@ -393,7 +393,7 @@ leerie_fresh_only() {
   [ -n "$2" ] || return 0
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    if [ -z "$real" ] || ! printf '%s\n' "$real" | cut -c4- | grep -Fxq -- "${line:3}"; then
+    if [ -z "$real" ] || ! grep -Fxq -- "${line:3}" < <(printf '%s\n' "$real" | cut -c4-); then
       printf '%s\n' "$line"
     fi
   done <<< "$2"

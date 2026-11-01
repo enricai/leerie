@@ -21747,7 +21747,11 @@ def _egress_server() -> _EgressProxy:
     global _EGRESS
     with _EGRESS_LOCK:
         if _EGRESS is None or _EGRESS.pid != os.getpid():
-            proxy = _EgressProxy(_private_tmp(Path(f"egress:{os.getpid()}")))
+            # A directory this proxy made itself, never a path derived from
+            # the pid: a second proxy in the same process (or one of an
+            # earlier process with the same pid) would bind the same
+            # `egress.sock`, unlinking the first one's while it serves.
+            proxy = _EgressProxy(_new_private_tmp("egress-"))
             try:
                 proxy.start()
             except OSError as e:
@@ -24205,6 +24209,19 @@ def _private_tmp(key: Path) -> Path:
     if not _PRIVATE_TMPS:
         atexit.register(_remove_private_tmps)
     _PRIVATE_TMPS.setdefault(str(d), os.getpid())
+    return d
+
+
+def _new_private_tmp(prefix: str) -> Path:
+    """A new `/tmp/l/<prefix><random>/` that only this call can hold: made by
+    `mkdtemp` (an exclusive `mkdir`, 0700, so an existing path of anyone's
+    is never taken over) under the 0700 `/tmp/l` `_own_private_dir` checks,
+    and removed at this process's exit like `_private_tmp`'s."""
+    _own_private_dir(PRIVATE_TMP_ROOT)
+    d = Path(tempfile.mkdtemp(prefix=prefix, dir=PRIVATE_TMP_ROOT))
+    if not _PRIVATE_TMPS:
+        atexit.register(_remove_private_tmps)
+    _PRIVATE_TMPS[str(d)] = os.getpid()
     return d
 
 

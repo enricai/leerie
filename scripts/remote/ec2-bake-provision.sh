@@ -37,8 +37,8 @@ dockerfile_apt_packages() {
   ' "$DOCKERFILE" | tr -s ' \t' '\n' | grep -v '^$'
 }
 
-MISE_VERSION="$(sed -n 's/^ARG MISE_VERSION=//p' "$DOCKERFILE" | head -n1)"
-CLAUDE_SPEC="$(sed -n "s/.*npm install -g '\\(@anthropic-ai\\/claude-code@[^']*\\)'.*/\\1/p" "$DOCKERFILE" | head -n1)"
+MISE_VERSION="$(sed -n 's/^ARG MISE_VERSION=//p' "$DOCKERFILE" | sed -n 1p)"
+CLAUDE_SPEC="$(sed -n "s/.*npm install -g '\\(@anthropic-ai\\/claude-code@[^']*\\)'.*/\\1/p" "$DOCKERFILE" | sed -n 1p)"
 if [ -z "$MISE_VERSION" ] || [ -z "$CLAUDE_SPEC" ]; then log "could not derive pins from Dockerfile"; exit 1; fi
 
 # --- apt base packages (base + gh prerequisites + chromium blocks) ---
@@ -80,7 +80,7 @@ export XDG_CACHE_HOME=/tmp/.cache
 export MISE_STATE_DIR=/tmp/.mise-state
 mise install --system node@lts python@3.12
 
-node_dir="$(find /usr/local/share/mise/installs/node -mindepth 1 -maxdepth 1 -type d | head -n1)/"
+node_dir="$(find /usr/local/share/mise/installs/node -mindepth 1 -maxdepth 1 -type d | sed -n 1p)/"
 ln -sfn "${node_dir%/}" /usr/local/share/mise/installs/node/lts-current
 
 # Login-shell environment mirroring the Dockerfile ENV lines.

@@ -6261,7 +6261,7 @@ finding's EROFS without it.
   a time (no read-only remount, no private tmpfs, no IPC namespace, no
   seccomp, no overlay): each turned its own tests red. The keyring join is
   not separately observable: seccomp refuses `add_key` first.
-- `tests/test_confined_network.py` (21 test functions, 33 cases; DESIGN
+- `tests/test_confined_network.py` (22 test functions, 34 cases; DESIGN
   §6 *A confined process has its own network; the outside is reached only
   through leerie's proxy*; review round 21 execution H2 and isolation
   R6). Anywhere: `_egress_refusal` over
@@ -6271,7 +6271,8 @@ finding's EROFS without it.
   by name), tunnelling to an allowed destination, rewriting a plain request
   to origin form without the hop-by-hop headers, answering 400 to anything
   else, and `forward` piping to the orchestrator's port; its 0700
-  directory; `_confined_argv` naming the proxy only for an `egress` grant
+  directory, a new one per proxy, so a second proxy in one process leaves
+  the first one's socket serving (review r22 L1); `_confined_argv` naming the proxy only for an `egress` grant
   when isolated, and relaying the strict-output proxy's port; which kinds
   and workers carry `egress`; the shim's `--egress`/`--forward` parsing
   and `proxy_env`; `_require_egress_relay` naming each failure. In a
@@ -6340,6 +6341,21 @@ finding's EROFS without it.
   expanded in the run argv, `scripts/runtime-install.sh`'s AppArmor
   helpers with the kernel stubbed, and the profile compiled
   (`apparmor_parser -Q`) with its mount rules.
+- `tests/test_runtime_probes_pipefail.py` (11 test functions, 39 cases;
+  DESIGN §6 *The launcher's detection gives the kernel's answer*, review
+  r22 H1): the REAL `runtime_has_apparmor`/`runtime_apparmor_current` (and
+  the launcher's `APPARMOR_OPT` block over them) under `set -euo pipefail`
+  against a fixture securityfs (Ubuntu's LSM list with `apparmor` not last,
+  300 profiles with `leerie-container` fourth), through the injectable
+  `_RUNTIME_LSM_FILE`/`_RUNTIME_AA_PROFILES_DIR`/`LEERIE_APPARMOR_DEST`;
+  and the rule — the pipefail files derived from the scripts' own `set`
+  lines and `.` sourcing, none piping into an early-exit consumer (`grep
+  -q/-m/-l`, `head`, `awk … exit`, `sed … q`, `cmp`, `read`), with the
+  detector's positives and negatives pinned. Live-falsified: the old
+  pipelines turn 15 cases red; one restored `| grep -Fxq` in
+  `worktree-lib.sh` turns the rule red. The stubbed tests in
+  `test_launcher_secopt.py` could not see it: a single `echo` gives the
+  producer no second write to die on.
 - `tests/test_ref_less_clone_git_is_leeries.py` (5 tests, DESIGN §6
   *Leerie's git never takes a tree's repository from the tree*): a ref-less
   clone is located at leerie's git directory (`<run>/clone-gits/<name>`);

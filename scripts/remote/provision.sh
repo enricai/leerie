@@ -561,7 +561,7 @@ wait_for_started() {
     state="$(flyctl machine status "$mid" \
                --app "$FLY_APP" 2>/dev/null \
              | sed 's/\x1b\[[0-9;]*m//g' \
-             | awk -F': *' '/^State: / { print $2; exit }' \
+             | awk -F': *' '/^State: / && !f { print $2; f = 1 }' \
              | tr -d '[:space:]' || true)"
     case "$state" in
       started)
@@ -629,7 +629,7 @@ provision_machine() {
     # like "ID: vol_abc123..." (with possible ANSI color codes).
     LEERIE_VOLUME_ID="$(printf '%s' "$vol_create_output" \
                        | sed 's/\x1b\[[0-9;]*m//g' \
-                       | awk '/^[[:space:]]*ID[[:space:]]*[:=]/ { print $2; exit }')"
+                       | awk '/^[[:space:]]*ID[[:space:]]*[:=]/ && !f { print $2; f = 1 }')"
     if [ -z "$LEERIE_VOLUME_ID" ]; then
       remote_log "failed to extract volume ID from flyctl output:"
       printf '  %s\n' "$vol_create_output" >&2
@@ -679,7 +679,7 @@ provision_machine() {
     # Tolerant of ANSI color codes by stripping ESC[<...>m sequences first.
     machine_id="$(printf '%s' "$create_output" \
                   | sed 's/\x1b\[[0-9;]*m//g' \
-                  | awk '/Machine ID:/ { for (i=1; i<=NF; i++) if ($i == "ID:") { print $(i+1); exit } }')"
+                  | awk '/Machine ID:/ && !f { for (i=1; i<=NF; i++) if ($i == "ID:" && !f) { print $(i+1); f = 1 } }')"
   fi
 
   if [ -z "$machine_id" ]; then

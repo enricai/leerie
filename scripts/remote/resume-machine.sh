@@ -87,7 +87,7 @@ except Exception:
     # flyctl machine status does NOT support --json — parse text output.
     state="$(flyctl machine status "$mid" --app "$fly_app" 2>/dev/null \
              | sed 's/\x1b\[[0-9;]*m//g' \
-             | awk -F': *' '/^State: / { print $2; exit }' \
+             | awk -F': *' '/^State: / && !f { print $2; f = 1 }' \
              | tr -d '[:space:]' || true)"
     case "$state" in
       started|starting)

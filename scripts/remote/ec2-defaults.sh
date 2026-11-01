@@ -93,7 +93,7 @@ ec2_egress_cidr() {
     ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')"
     cidr="${ip:+$ip/32}"
   fi
-  if ! printf '%s' "$cidr" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'; then
+  if ! grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' < <(printf '%s\n' "$cidr"); then
     remote_log "error: could not determine the launcher's egress IP for the SSH security-group rule."
     echo "  Set LEERIE_EC2_SSH_CIDR=<your-ip>/32 and re-run." >&2
     return 1
@@ -140,7 +140,7 @@ for p in d["SecurityGroups"][0].get("IpPermissions",[]):
     if p.get("FromPort")==22:
         for r in p.get("IpRanges",[]): print(r.get("CidrIp",""))' 2>/dev/null)"
   fi
-  if ! printf '%s\n' "$have" | grep -qxF "$cidr"; then
+  if ! grep -qxF -- "$cidr" < <(printf '%s\n' "$have"); then
     local old
     while IFS= read -r old; do
       [ -n "$old" ] && _ec2_aws ec2 revoke-security-group-ingress --group-id "$gid" --protocol tcp --port 22 --cidr "$old" >/dev/null 2>&1
@@ -227,7 +227,7 @@ ensure_instance_profile() {
 # _ec2_iam_denied <stderr> — AWS CLI v2 error shape is "An error occurred
 # (AccessDenied) when calling ..."; match the code field, not the prose.
 _ec2_iam_denied() {
-  printf '%s' "$1" | grep -Eq 'An error occurred \((AccessDenied|AccessDeniedException|UnauthorizedOperation)\)'
+  grep -Eq 'An error occurred \((AccessDenied|AccessDeniedException|UnauthorizedOperation)\)' < <(printf '%s\n' "$1")
 }
 
 _ec2_iam_warn() {

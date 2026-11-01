@@ -1053,7 +1053,7 @@ $(printf '%s' "$push_all" | tail -c 4000)"
       # `push_stderr` in the guard above, which is what keeps the corpus
       # score intact. It reads `push_hook_out` rather than `push_all` so the
       # section marker's own "pre-push hook" text cannot be matched first.
-      _hook_name="$(printf '%s\n%s' "$push_stderr" "$push_hook_out" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | head -1 || true)"
+      _hook_name="$(printf '%s\n%s' "$push_stderr" "$push_hook_out" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | sed -n 1p || true)"
       echo "  This looks like a failing git hook (${_hook_name:-pre-push} failed) rather than a push/auth/network problem." >&2
       # WHICH TREE the hook measured is the fact that ends the confusion,
       # and nothing used to say it. git runs pre-push in the repo root

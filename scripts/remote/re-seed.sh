@@ -68,7 +68,7 @@ re_seed() {
   # flyctl machine status does NOT support --json — parse text output.
   state="$(flyctl machine status "$mid" --app "$fly_app" 2>/dev/null \
            | sed 's/\x1b\[[0-9;]*m//g' \
-           | awk -F': *' '/^State: / { print $2; exit }' \
+           | awk -F': *' '/^State: / && !f { print $2; f = 1 }' \
            | tr -d '[:space:]' || true)"
   case "$state" in
     started|starting) : ;;
@@ -117,7 +117,7 @@ re_seed() {
                              { print }')"
     if [ -n "$remote_dirty" ]; then
       remote_log "re_seed: machine /work has uncommitted edits to tracked files:"
-      printf '%s\n' "$remote_dirty" | head -10 >&2
+      printf '%s\n' "$remote_dirty" | sed -n 1,10p >&2
       echo "" >&2
       echo "  These edits would be clobbered by re-seed." >&2
       echo "  Inspect via: leerie resume $LEERIE_RUN_ID --shell" >&2

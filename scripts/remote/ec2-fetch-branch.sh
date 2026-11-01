@@ -167,7 +167,7 @@ print(best[3])
     return 1
   }
 
-  if printf '%s' "$discover_output" | grep -q "^ERROR:"; then
+  if grep -q "^ERROR:" < <(printf '%s\n' "$discover_output"); then
     remote_log "fetch_state_ec2: $discover_output"
     return 1
   fi

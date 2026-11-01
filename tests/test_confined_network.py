@@ -56,12 +56,17 @@ DEV = ["--rw", "/dev/null", "--rw", "/dev/urandom"]
 
 @pytest.fixture
 def proxy(leerie, monkeypatch):
-    """A fresh egress proxy of this process's, in its own 0700 directory."""
+    """A fresh egress proxy of this process's, in its own 0700 directory
+    (not the one a proxy started earlier in this process serves: the
+    monkeypatch puts that one back, still listening). Stopped, and its
+    directory removed, at teardown."""
     monkeypatch.setattr(leerie, "_EGRESS", None)
     p = leerie._egress_server()
     yield p
     if p._loop is not None:
         p._loop.call_soon_threadsafe(p._loop.stop)
+    leerie._rmtree_owned(p.dir)
+    leerie._PRIVATE_TMPS.pop(str(p.dir), None)
 
 
 def _ask(sock_path: str, request: bytes, *, read_all: bool = False) -> bytes:
@@ -244,6 +249,35 @@ def test_the_proxy_lives_in_a_private_directory_outside_every_grant(
 
 def _opts(argv: list[str]) -> list[str]:
     return argv[:argv.index("--")]
+
+
+def test_a_second_proxy_never_takes_the_first_ones_socket(leerie,
+                                                          monkeypatch):
+    """Review r22 L1: the proxy's directory was keyed on the pid alone, so a
+    second proxy in the same process bound the same `egress.sock` and
+    unlinked the first one's while `_EGRESS` still named it — an
+    order-dependent `ConnectionResetError` in a later test. Each proxy makes
+    its own directory now; the first keeps serving."""
+    made = []
+    try:
+        for _ in range(2):
+            monkeypatch.setattr(leerie, "_EGRESS", None)
+            made.append(leerie._egress_server())
+        first, second = made
+        assert first.dir != second.dir
+        for p in made:
+            st_ = os.lstat(p.dir)
+            assert st_.st_uid == os.geteuid()
+            assert st_.st_mode & 0o777 == 0o700
+        got = _ask(str(first.socket_path), b"GET / HTTP/1.1\r\n\r\n",
+                   read_all=True)
+        assert got.startswith(b"HTTP/1.1 400 "), got
+    finally:
+        for p in made:
+            if p._loop is not None:
+                p._loop.call_soon_threadsafe(p._loop.stop)
+            leerie._rmtree_owned(p.dir)
+            leerie._PRIVATE_TMPS.pop(str(p.dir), None)
 
 
 def test_only_grants_with_egress_name_the_proxy(leerie, proxy, monkeypatch):

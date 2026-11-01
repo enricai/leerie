@@ -165,7 +165,7 @@ print(best[3])
   rm -f "$_discover_err"
 
   # Check for ERROR prefix from the Python script
-  if printf '%s' "$discover_output" | grep -q "^ERROR:"; then
+  if grep -q "^ERROR:" < <(printf '%s\n' "$discover_output"); then
     remote_log "fetch_branch: $discover_output"
     return 1
   fi

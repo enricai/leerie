@@ -3336,7 +3336,13 @@ gets it from its grant (`WorkerGrants.egress`):
   nothing beyond their own loopback.
 - **How.** The orchestrator runs an egress proxy (`_EgressProxy`, on its
   own thread and event loop, so a synchronous spawn never stalls it) on a
-  unix socket in a 0700 directory it owns under `/tmp/l/`. The container's
+  unix socket in a 0700 directory it owns under `/tmp/l/`. The directory is
+  the proxy's own: each proxy makes a new one (an exclusive `mkdir`), never
+  a path derived from its pid, since a second proxy at the same path binds
+  the same socket name and unlinks the first one's while it serves (review
+  r22 L1: a second proxy in one test process left the first's clients
+  `ConnectionResetError`). The invariant: no proxy can take another's
+  socket. The container's
   `/tmp` is no confined process's, so the socket exists in a namespace
   only when the shim carries its directory in (`--egress SOCK`): a
   measurement never sees it. Inside, the shim forks a relay — a child of
@@ -3574,6 +3580,24 @@ mounts above; the container's policy decides both.
   through `colima ssh`): when it is missing or stale the launcher loads it
   itself when it has a terminal (and no `--no-runtime-install`), and
   otherwise stops naming the two commands.
+- *The launcher's detection gives the kernel's answer.* Whether the kernel
+  runs AppArmor and whether the profile is loaded are read into a variable
+  and tested with no pipe. They were pipelines into `grep -q`; under the
+  launcher's `set -euo pipefail` a pipeline's status is its worst member's,
+  and a consumer that stops at its first match leaves the producer to die
+  of SIGPIPE on its next write, so the pipe read "no" when the kernel said
+  yes. Ubuntu lists modules after `apparmor` and loads ~160 profiles, so
+  both probes were false on every run: the launcher never passed the
+  profile, and every local run on Ubuntu stopped at the entry with a fix
+  the launcher believed it had applied (review r22 H1). The rule is
+  general, not this probe's: **no shell leerie runs under `pipefail` — the
+  launcher, `scripts/`, and every library they source — pipes into a
+  consumer that can exit before EOF** (`grep -q`/`-m`/`-l`, `head`, `awk`
+  with `exit`, `sed` with `q`, `cmp`). A value is tested with `case`, or fed
+  to `grep -q` by process substitution, whose writer's death no status
+  sees; a first line is `sed -n 1p`; an awk program stops with a flag.
+  Every such site was rewritten, and a test derives the pipefail files and
+  rejects the shape in any of them.
 - *The entry fails closed* (`_require_heldout_sandbox`, after
   `_require_landlock`, in `_require_confinement` on every invocation that
   runs workers or commands): it builds a sandbox over a probe and checks that
@@ -3710,7 +3734,7 @@ cannot be reopened through `/proc` at all (ENXIO).
 pathname sockets in the container are the egress proxy's (§6 *A confined
 process has its own network*): `egress.sock`, and one `fwd-<port>.sock` per
 forwarded port, in the proxy's 0700 directory `/tmp/l/<hex>/`
-(`_EgressProxy`, made by `_egress_server` under `_private_tmp`). They are
+(`_EgressProxy`, made by `_egress_server` in a new `_new_private_tmp`). They are
 services for confined processes on purpose, and only the processes they
 serve can name them: every confined process has a `/tmp` of its own, and
 the shim carries the proxy's directory, read-only, into a process only when

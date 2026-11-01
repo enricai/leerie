@@ -811,7 +811,7 @@ if [ -f "$USER_REPO/leerie.toml" ]; then
   _toml_state_dir="$( { grep -E '^[[:space:]]*state_dir[[:space:]]*=' \
                             "$USER_REPO/leerie.toml" 2>/dev/null \
                         || true; } \
-                      | head -1 \
+                      | sed -n 1p \
                       | sed -E 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*//;
                                 s/[[:space:]]*$//;
                                 s/^"(.*)"$/\1/;
@@ -903,7 +903,7 @@ else
   _toml_log_file="$( { grep -E '^[[:space:]]*log_file[[:space:]]*=' \
                             "$USER_REPO/leerie.toml" 2>/dev/null \
                         || true; } \
-                      | head -1 \
+                      | sed -n 1p \
                       | sed -E 's/^[[:space:]]*log_file[[:space:]]*=[[:space:]]*//;
                                 s/[[:space:]]*$//;
                                 s/^"(.*)"$/\1/;
@@ -944,7 +944,7 @@ export LEERIE_LOG_FILE_RESOLVED
 # top-level body: this wrapper's own text no longer re-implements the
 # grep/sed lookup inline, it delegates to the nested helper.
 _resolve_ec2_knob() {
-  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
+  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | sed -n 1p | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
   _resolve_cli_env_toml_knob "$1" "$2" "$3"
 }
 
@@ -1210,7 +1210,7 @@ case "${1:-}" in
       local key="$1" file="${USER_REPO:-$(pwd)}/.leerie/config.toml"
       [ -f "$file" ] || return 0
       { grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null \
-        | head -1 \
+        | sed -n 1p \
         | sed -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//;
                   s/[[:space:]]*$//;
                   s/^\"(.*)\"$/\1/;
@@ -1460,7 +1460,7 @@ PY
             # the empty string this loop treats as "not declared".
             val="$(grep -E "^[[:space:]]*${axis}[[:space:]]*=" \
                      "$_user_repo/.leerie/config.toml" 2>/dev/null \
-                   | head -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/^"//; s/"$//' \
+                   | sed -n 1p | sed -E 's/^[^=]*=[[:space:]]*//; s/^"//; s/"$//' \
                    || true)"
           fi
           if [ -n "$val" ]; then
@@ -2541,7 +2541,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       _ab_started_machine=false
       _ab_mstate="$(flyctl machine status "$LEERIE_MACHINE_ID" --app "$FLY_APP" 2>/dev/null \
                     | sed 's/\x1b\[[0-9;]*m//g' \
-                    | awk -F': *' '/^State: / { print $2; exit }' \
+                    | awk -F': *' '/^State: / && !f { print $2; f = 1 }' \
                     | tr -d '[:space:]' || true)"
       case "$_ab_mstate" in
         started|starting) : ;;
@@ -2838,7 +2838,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       _ai_started_machine=false
       _ai_mstate="$(flyctl machine status "$LEERIE_MACHINE_ID" --app "$FLY_APP" 2>/dev/null \
                     | sed 's/\x1b\[[0-9;]*m//g' \
-                    | awk -F': *' '/^State: / { print $2; exit }' \
+                    | awk -F': *' '/^State: / && !f { print $2; f = 1 }' \
                     | tr -d '[:space:]' || true)"
       case "$_ai_mstate" in
         started|starting) : ;;
@@ -2967,7 +2967,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     # Peek at the first positional arg for UUID dispatch.
     # Chain-id stop: iterate runs with matching chain_id, stop each.
     # Group-id stop: if no chain runs found, try group_id across all state dirs.
-    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
+    if [ "$#" -gt 0 ] && grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$1"); then
       _sp_chain="$1"; shift
       _sp_pass_args=("$@")
       _sp_run_ids="$(_chain_runs_filter "$_sp_chain" stop)"
@@ -3134,7 +3134,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     # Chain-id kill: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # find runs with matching chain_id, invoke single-run kill on each.
     # Group-id kill: if no chain runs found, try group_id across all state dirs.
-    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
+    if [ "$#" -gt 0 ] && grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$1"); then
       _kc_chain="$1"; shift
       # Pass through --force / --runtime / etc. flags to per-run kill.
       _kc_pass_args=("$@")
@@ -3430,7 +3430,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     export USER_REPO
     # Chain-id / group-id dispatch: `finalize <uuid>` finalizes every
     # run-id belonging to a chain/group that hasn't already been pushed.
-    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
+    if [ "$#" -gt 0 ] && grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$1"); then
       _fc_chain="$1"; shift
       _fc_pass_args=("$@")
       _fc_run_ids="$(_chain_runs_filter "$_fc_chain" finalize)"
@@ -3975,7 +3975,7 @@ PY
     if [ -z "$_st_id" ]; then
       remote_log "status: <id> is required (--chain-id, group-id, or run-id)"; exit 1
     fi
-    if echo "$_st_id" | grep -qiE "$UUID_PATTERN"; then
+    if grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$_st_id"); then
       # Try chain_id first (runs in current state dir).
       _st_chain_rc=0
       python3 - "$LEERIE_STATE_HOST_DIR" "$_st_id" <<'PY' || _st_chain_rc=$?
@@ -4113,7 +4113,7 @@ PY
     if [ -z "$_at_id" ]; then
       remote_log "attach: <id> is required (--chain-id or run-id)"; exit 1
     fi
-    if echo "$_at_id" | grep -qiE "$UUID_PATTERN"; then
+    if grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$_at_id"); then
       remote_log "attach: polling $LEERIE_STATE_HOST_DIR for chain $_at_id (Ctrl-C to detach)"
       while :; do
         _at_done="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_at_id" <<'PY'
@@ -4160,7 +4160,7 @@ PY
     # user to reattach to. If the UUID is a group_id (no chain runs found),
     # dispatch group-scoped resume instead. Non-UUID args fall through to
     # the existing run-id resume path below.
-    if [ "$#" -ge 2 ] && echo "$2" | grep -qiE "$UUID_PATTERN"; then
+    if [ "$#" -ge 2 ] && grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$2"); then
       _rs_chain="$2"
       shift 2
       _rs_pass_args=("$@")
@@ -4317,7 +4317,7 @@ except Exception:
       # chain's lowercase tag — without this, --chain-id with any
       # uppercase letter silently bypasses idempotency and forks the
       # chain into a second chain_id (v8 audit finding S1).
-      if ! echo "$_ch_id_override" | grep -qiE "$UUID_PATTERN"; then
+      if ! grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$_ch_id_override"); then
         remote_log "chain: --chain-id value '$_ch_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
         exit 1
       fi
@@ -4745,7 +4745,7 @@ except SynthMergeConflict as exc:
         _grp_id_override="$_grp_id_stripped"
       fi
       unset _grp_id_stripped
-      if ! echo "$_grp_id_override" | grep -qiE "$UUID_PATTERN"; then
+      if ! grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$_grp_id_override"); then
         remote_log "group: --group-id value '$_grp_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
         exit 1
       fi
@@ -5353,7 +5353,7 @@ elif [ -z "${FLY_VM_DISK_GB:-}" ] && [ -f "$USER_REPO/leerie.toml" ]; then
   # mirroring orchestrator/leerie.py:_read_toml_key.
   _toml_fly_disk_gb="$( { grep -E '^[[:space:]]*fly_disk_gb[[:space:]]*=' \
                               "$USER_REPO/leerie.toml" 2>/dev/null \
-                            | head -1 \
+                            | sed -n 1p \
                             | sed -E 's/^[[:space:]]*fly_disk_gb[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//' ; } || true)"
   if [ -n "$_toml_fly_disk_gb" ]; then
     FLY_VM_DISK_GB="$_toml_fly_disk_gb"
@@ -5411,7 +5411,7 @@ fi
 # adds over the shared ladder is the trailing default-value fallback.
 _resolve_seed_knob() {
   local _cli="$1" _envname="$2" _tomlkey="$3" _default="$4" _r
-  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
+  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | sed -n 1p | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
   _r="$(_resolve_cli_env_toml_knob "$_cli" "$_envname" "$_tomlkey")"
   if [ -n "$_r" ]; then printf '%s' "$_r"; else printf '%s' "$_default"; fi
 }
@@ -5712,7 +5712,7 @@ _warn_if_leerie_stale() {
   local _up_v
   _up_v="$(git -C "$LEERIE_REPO" show \
              '@{upstream}:.claude-plugin/plugin.json' 2>/dev/null \
-           | awk -F'"' '/"version"/ {print $4; exit}')"
+           | awk -F'"' '/"version"/ && !f {print $4; f = 1}')"
   remote_log "warning: the installed leerie is $_behind commit(s) behind" \
              "origin (v$LEERIE_VERSION -> v${_up_v:-unknown})."
   echo "  Runs use the INSTALLED copy at $LEERIE_REPO, not any other" >&2
@@ -5784,7 +5784,7 @@ if [ "$NO_PUSH" = "false" ] && [ -f "$USER_REPO/leerie.toml" ]; then
   _toml_no_push="$( { grep -E '^[[:space:]]*no_push[[:space:]]*=' \
                           "$USER_REPO/leerie.toml" 2>/dev/null \
                       || true; } \
-                    | head -1 \
+                    | sed -n 1p \
                     | sed -E 's/^[[:space:]]*no_push[[:space:]]*=[[:space:]]*//;
                               s/[[:space:]]*$//;
                               s/^"(.*)"$/\1/;
@@ -6013,7 +6013,7 @@ _leerie_should_generate_dockerfile() {
     _li="$( { grep -E '^[[:space:]]*language_installs[[:space:]]*=' \
                   "$_li_cfg" 2>/dev/null \
               || true; } \
-            | head -1 \
+            | sed -n 1p \
             | sed -E 's/^[[:space:]]*language_installs[[:space:]]*=[[:space:]]*//;
                       s/[[:space:]]*$//')"
     # language_installs is a JSON array string in config.toml; "[]" (or
@@ -6036,7 +6036,7 @@ resolve_repo_image_tag() {
     sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
                 "$USER_REPO/.leerie/config.toml" 2>/dev/null \
             || true; } \
-          | head -1 \
+          | sed -n 1p \
           | sed -E 's/^[[:space:]]*setup_packages[[:space:]]*=[[:space:]]*//;
                     s/[[:space:]]*$//;
                     s/^"(.*)"$/\1/;
@@ -6119,7 +6119,7 @@ if [ -n "${LEERIE_BAKE_LANGUAGE_DEPS:-}" ]; then
 elif [ -f "$USER_REPO/leerie.toml" ]; then
   _bld_toml="$( { grep -E '^[[:space:]]*bake_language_deps[[:space:]]*=' \
                       "$USER_REPO/leerie.toml" 2>/dev/null \
-                  | head -1 \
+                  | sed -n 1p \
                   | sed -E 's/^[[:space:]]*bake_language_deps[[:space:]]*=[[:space:]]*//;
                             s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
   case "${_bld_toml:-}" in
@@ -6130,7 +6130,7 @@ elif [ -f "$USER_REPO/leerie.toml" ]; then
 elif [ -f "$_leerie_config_toml" ]; then
   _bld_cfg="$( { grep -E '^[[:space:]]*bake_language_deps[[:space:]]*=' \
                      "$_leerie_config_toml" 2>/dev/null \
-                 | head -1 \
+                 | sed -n 1p \
                  | sed -E 's/^[[:space:]]*bake_language_deps[[:space:]]*=[[:space:]]*//;
                            s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
   case "${_bld_cfg:-}" in
@@ -6156,7 +6156,7 @@ if [ -n "${LEERIE_SKIP_REPO_MAP:-}" ]; then
 elif [ -f "$USER_REPO/leerie.toml" ]; then
   _srm_toml="$( { grep -E '^[[:space:]]*skip_repo_map[[:space:]]*=' \
                       "$USER_REPO/leerie.toml" 2>/dev/null \
-                  | head -1 \
+                  | sed -n 1p \
                   | sed -E 's/^[[:space:]]*skip_repo_map[[:space:]]*=[[:space:]]*//;
                             s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
   case "${_srm_toml:-}" in
@@ -6200,7 +6200,7 @@ if [ "$_leerie_do_gen" = "true" ]; then
   _sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
                 "$_leerie_config_toml" 2>/dev/null \
             || true; } \
-          | head -1 \
+          | sed -n 1p \
           | sed -E 's/^[[:space:]]*setup_packages[[:space:]]*=[[:space:]]*//;
                     s/[[:space:]]*$//;
                     s/^"(.*)"$/\1/;
@@ -9091,7 +9091,7 @@ else
       # pipe's first bytes reaching our stdout, which is exactly what
       # the sleep above exists to avoid.
       _tail_writer_pid="$(jobs -l %% 2>/dev/null \
-        | awk '/tail -n/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) {print $i; exit} }')"
+        | awk '/tail -n/ && !f { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/ && !f) {print $i; f = 1} }')"
       kill "$_tail_pid" ${_tail_writer_pid:+"$_tail_writer_pid"} 2>/dev/null || true
       _tail_pid=""
       _tail_writer_pid=""

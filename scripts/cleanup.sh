@@ -175,7 +175,7 @@ most_recent_failed_run() {
       continue
     fi
     local started
-    started="$(grep '"started_at":' "$state" | head -1 \
+    started="$(grep '"started_at":' "$state" | sed -n 1p \
                | sed 's/.*"started_at": *"\([^"]*\)".*/\1/')"
     if [ -z "$newest" ] || [ "$started" \> "$newest_started" ]; then
       newest="$base"

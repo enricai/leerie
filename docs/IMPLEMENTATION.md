@@ -4727,9 +4727,14 @@ network*):
   `/proc/net/fib_trie` and every address in `/proc/net/if_inet6`.
 - `_egress_server() -> _EgressProxy` — this process's proxy (module
   `_EGRESS`, under `_EGRESS_LOCK`), started on first use in
-  `_private_tmp(Path(f"egress:{pid}"))` (`/tmp/l/<16 hex>/`, 0700,
-  removed at exit); a forked child starts its own; a start failure
-  `die()`s.
+  `_new_private_tmp("egress-")`; a forked child starts its own; a start
+  failure `die()`s.
+- `_new_private_tmp(prefix: str) -> Path` — `_own_private_dir(PRIVATE_TMP_ROOT)`
+  then `tempfile.mkdtemp(prefix=prefix, dir=PRIVATE_TMP_ROOT)`
+  (`/tmp/l/<prefix><random>/`, 0700, made by this call so no existing path
+  is ever reused), registered in `_PRIVATE_TMPS` and removed at exit like
+  `_private_tmp`'s. Every proxy instance has its own directory, so none
+  binds another's `egress.sock`.
 - What honours the proxy variables in the image (measured 2026-11-01,
   rootless and rootful): the table below. A tool that does not loses
   direct egress.
@@ -4808,12 +4813,21 @@ a database it lacks. The set's validation runs keep `require=False`.
 - `SECOPT=(--security-opt seccomp=unconfined)` on every local `nerdctl
   run` (rootless, rootful, Colima), replacing `ROOTLESS_SECOPT`.
 - `APPARMOR_OPT=(--security-opt apparmor=leerie-container)` when the
-  runtime's kernel lists `apparmor` in `/sys/kernel/security/lsm` (on
-  macOS, read through `colima ssh`; `runtime_has_apparmor`); the profile
-  must then be loaded — `runtime_apparmor_current` reads the names under
-  `/sys/kernel/security/apparmor/policy/profiles/*/name` (readable without
-  root; `…/apparmor/profiles` is not) and compares the installed file
-  `/etc/apparmor.d/leerie-container` with the repo's (`cmp`). Missing or
+  runtime's kernel lists `apparmor` in `/sys/kernel/security/lsm`
+  (`_RUNTIME_LSM_FILE`; on macOS, read through `colima ssh`;
+  `runtime_has_apparmor`: the file read into a variable, then `case
+  ",$lsm," in *,apparmor,*`); the profile must then be loaded —
+  `runtime_apparmor_current` reads the names under
+  `/sys/kernel/security/apparmor/policy/profiles/*/name`
+  (`_RUNTIME_AA_PROFILES_DIR`; readable without root; `…/apparmor/profiles`
+  is not) into a variable, matches a whole line with `case`, and compares
+  the installed file `$LEERIE_APPARMOR_DEST`
+  (`/etc/apparmor.d/leerie-container`) with the repo's by value. Neither
+  probe is a pipeline (DESIGN §6 *The launcher's detection gives the
+  kernel's answer*); the three path variables are set when the file is
+  sourced so a test can point the real probes at a fixture
+  (`tests/test_runtime_probes_pipefail.py`, which also rejects a pipe into
+  an early-exit consumer in every shell file run under `pipefail`). Missing or
   stale: with a terminal and without `--no-runtime-install`, run
   `runtime_install_apparmor`; else exit 1 printing
   `runtime_apparmor_hint`'s two commands. The block is guarded by
