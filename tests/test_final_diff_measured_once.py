@@ -21,6 +21,8 @@ import sys
 
 import pytest
 
+from tests.conftest import register_worker_transcript, transcript_path
+
 sys.path.insert(0, os.path.dirname(__file__))
 from test_redrive_test_id_diff_refresh import _git  # noqa: E402
 from test_shipping_tree_is_committed import (  # noqa: E402
@@ -37,7 +39,8 @@ def _drive(leerie, tmp_path, monkeypatch, ignore, *, worker_file=None,
         # The final conformer leaves its work uncommitted.
         if worker_file:
             (staging / worker_file).write_text("def test_w():\n    pass\n")
-            log = run["run_dir"] / "logs" / f"{k['sid']}.log"
+            log = register_worker_transcript(transcript_path(
+                run["run_dir"] / "logs", f"{k['sid']}.log"))
             log.write_text(json.dumps({"message": {"content": [
                 {"type": "tool_use", "id": "1", "name": "Write",
                  "input": {"file_path": str(staging / worker_file)}}]}})
@@ -127,7 +130,9 @@ def test_an_untracked_module_that_made_the_suite_pass_is_never_reused(
             f.write("X = 2\n")
         inp = ({"command": "cat > helper.py <<'E'\nX = 2\nE"}
                if tool == "Bash" else {"file_path": p, "content": "X = 2\n"})
-        with open(run["run_dir"] / "logs" / f"{k['sid']}.log", "a") as f:
+        log = register_worker_transcript(transcript_path(
+            run["run_dir"] / "logs", f"{k['sid']}.log"))
+        with open(log, "a") as f:
             f.write(json.dumps({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t1", "name": tool,
                  "input": inp}]}}) + "\n")

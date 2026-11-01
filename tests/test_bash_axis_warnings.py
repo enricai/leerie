@@ -3,7 +3,7 @@
 `_count_orphaned_bg_axis`.
 
 These helpers parse the per-worker JSONL log (the same one the
-orchestrator already writes to `.leerie/runs/<id>/logs/<sid>.log`) and
+orchestrator already writes to `<run-dir>/logs/transcripts/<sid>.log`) and
 surface advisory warnings when the conformer worker (a) invoked a
 single BLT axis more than once in one round, or (b) fired a fresh
 test/build command in response to a Bash-tool auto-backgrounded prior

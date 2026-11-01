@@ -594,7 +594,7 @@ def test_idle_warn_sec_falls_back_to_default_when_cap_absent(
 def test_stderr_written_to_log_file_live(leerie, leerie_dir, monkeypatch):
     """Each stderr line must be written to the per-sid log file with a
     `[ts] stderr` header, regardless of verbosity. This is the property
-    that lets `tail -f .leerie/logs/<sid>.log` show stderr as it arrives,
+    that lets `tail -f <run-dir>/logs/transcripts/<sid>.log` show stderr as it arrives,
     instead of (today) buffering silently until the worker exits or the
     watchdog fires."""
     events = [json.dumps({"type": "result", "subtype": "success",

@@ -5776,6 +5776,55 @@ finding), `claude_p`'s old hand-built four variables, and the old
 rootless, `apparmor=leerie-container`) passed with the fix and died with the
 finding's EROFS without it.
 
+## The CLI's own git, transcripts apart, and a run that died (review round 22)
+
+`tests/test_clis_own_git_is_leeries.py` (7 tests, DESIGN §6 *The CLI's own
+git runs on leerie's terms*; review round 22 isolation H1). A stand-in CLI
+runs `git` by name from its `PATH` at session start, as the real one does;
+the shim, grants, `worker-shell.py`, `scripts/cli-git.py`, `_invoke`, the
+settings and `.git` pointer restore (`_ready_tree_for_worker`), `_tree_dirt`
+and the transcript readers are real. A clean filter the last worker planted
+never runs for the next worker's CLI; a filter a worker defines for its own
+CLI runs nested, so it cannot reach the CLI's stream; `_cli_git_env` names
+leerie's repository; the shim passes a worker's own git through and fails
+closed; a `.git` rewritten mid-session is not followed; and the Fly
+integrator's CLI (`collect-subtrees.sh` → `worker-guard.py`) gets the same.
+
+`tests/test_transcripts_apart_from_command_logs.py` (5 tests, DESIGN §8
+*What a worker ran is read from its own transcript*; review round 22 H4).
+The acceptance writer's transcript and its set's validation log were one
+file. Now every worker's transcript is in its log directory's
+`transcripts/` (`_worker_log_path`, `_transcripts_dir`), and a command log
+of the same name is another file; nothing but the transcript functions names
+that directory; `_run_streaming` refuses any path in it, registered or not;
+and `_write_acceptance_set`, through the real `claude_p` → `_invoke`,
+validates its set beside its writer's transcript. Fixtures that hand-write a
+transcript use `tests.conftest.transcript_path` and
+`register_worker_transcript` — `tests/test_final_diff_measured_once.py`'s
+two among them since review round 23 C6, which made its Bash-versus-Write
+parametrization able to tell the two apart (falsified: a clean-tree check
+that counts only files a `Write` named fails the `Bash` case alone; with
+the old unregistered `logs/<sid>.log` both cases failed alike).
+
+`tests/test_main_exception_arms.py::TestListShowsADeath` (4 tests, DESIGN
+§6 *A run that died says so*) drives the real `main()` and reads `leerie
+list`'s status and `run.json`'s `failed_at`: a `die()` lists `failed` with
+`finished_at` and `failed_at` both set; a worker error and an unhandled
+exception list `failed`; a pause, an interrupt, a clarification exit and a
+clean exit record nothing; and a resume that ends cleanly clears the last
+invocation's `failed_at`.
+`TestEveryExitOfTheRunIsSeen` (4 tests, review round 23 C1): by rule,
+`_record_run_died` has one caller, `_records_the_run_death`, which
+decorates `main()`; the arm (`_own_the_run_death_record`) follows the
+`State`'s acquisition with only the layout refusal between, disarmed only
+for `--phase`; and no `sys.exit`/`os._exit` follows the arm, so a pause is
+returned rather than raised. By execution, the reviewer's proof inverted: a
+resume that `die()`s at the confinement entry, or in a resolver before the
+`try:` around `_orchestrate`, lists `failed` and is not auto-picked, and an
+interrupt at the entry records nothing. Falsified: the arm moved below
+`_require_confinement` turns the rule and the entry case red; a pause
+`sys.exit`ed again turns the rule and the pause case red.
+
 ## The rev 9 redesign's other new and rewritten test files
 
 - `tests/test_resume_staging_is_reset.py` (7 tests, DESIGN §8 *The final

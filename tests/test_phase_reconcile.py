@@ -317,7 +317,7 @@ def test_phase_reconcile_bumps_workers(leerie):
 
 
 def test_phase_reconcile_uses_sid_reconciler(leerie):
-    """The worker's sid (used for logs and .leerie/logs/<sid>.log) is
+    """The worker's sid (used for logs and <run-dir>/logs/transcripts/<sid>.log) is
     'reconciler'. Pin so the log file lookup is stable."""
     src = inspect.getsource(leerie.phase_reconcile)
     assert 'sid="reconciler"' in src

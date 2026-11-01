@@ -7117,7 +7117,7 @@ gate, shared by every site:
 - `_clean_tree_reasker(st, caps, *, log_sid, cwd, schema_key,
   system_prompt, model, effort, max_turns) -> Callable[[str],
   Awaitable[None]]` — the re-ask of the SAME worker: `_log_session_id(
-  <run>/logs/<log_sid>.log)` (on the second call, the first re-ask's
+  _worker_log_path(<run>, <log_sid>, schema_key))` (`logs/transcripts/<log_sid>.log`) (on the second call, the first re-ask's
   log), then `st.bump_workers(caps)` and `claude_p(user_prompt=note,
   system_prompt, schema_key, cwd, allowed_tools=ACT_TOOLS, max_turns,
   autonomous=True, model, effort, sid=f"{log_sid}-clean<n>",
@@ -11698,7 +11698,7 @@ discovery without parsing the full `state.json`):
 | `brought_back_sha` | str | written by the host only (`host_bring_back_run_branch`): the run-branch commit leerie last brought back from `<run-dir>/repo` into the user's repository — the compare-and-swap's expected value. |
 | `started_at` | ISO-8601 str | wall-clock start time (also mirrored in `state.json`) |
 | `finished_at` | ISO-8601 str \| null | wall-clock end time. Set at finalize success, or by the `except SystemExit` handler in `main()` for `die()` exits after the run directory exists (on Fly, the tail wrapper propagates the exit code). Idempotent on `resume`. |
-| `failed_at` | ISO-8601 str \| null | when the run's last invocation died (DESIGN §6 *A run that died says so*). Written by `_record_run_died(run_dir)` from `main()`'s `except SystemExit` arm (exit code other than 0 and `EXIT_NEEDS_ANSWERS`), `except WorkerError` arm and `except BaseException` arm; never by a pause, an interrupt or a clarification exit. `_clear_run_died(run_dir)` sets it to null as each invocation starts, before `_orchestrate`. `_derive_run_status` reads it (`failed`, and `incomplete` mid-wave). |
+| `failed_at` | ISO-8601 str \| null | when the run's last invocation died (DESIGN §6 *A run that died says so*). Written by `_record_run_died(run_dir)`, whose one caller is `_records_the_run_death`, the decorator wrapping `main()`: it records when an exception leaves `main()` after `_own_the_run_death_record(st.run_dir)` armed it — right after the `State` is acquired and the layout refusal, for every verb but `--phase` — and `_is_a_death` holds (a `SystemExit` with a code other than 0 and `EXIT_NEEDS_ANSWERS`, or any exception but `KeyboardInterrupt` / `InterruptedBySignal`). `main()` returns its exit code for a pause, an interrupt and a completion, and the decorator exits with it, so none of those is recorded. `_own_the_run_death_record` first calls `_clear_run_died(run_dir)`, which sets it to null. Pinned by `tests/test_main_exception_arms.py::TestEveryExitOfTheRunIsSeen`. `_derive_run_status` reads it (`failed`, and `incomplete` mid-wave). |
 | `task` | str | the task description (mirrored from `state.json`) |
 | `task_sha256` | str | sha256 of the resolved task text, written at run start. Two launches of byte-identical task text are otherwise invisible to each other and can produce incompatible branches; `_live_duplicate_runs` refuses a duplicate unless `LEERIE_ALLOW_DUPLICATE_TASK=1`. |
 | `pushed_at` | ISO-8601 str \| null | when the run branch was pushed to `origin`; null until push runs |

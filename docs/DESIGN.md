@@ -3733,7 +3733,7 @@ cannot be reopened through `/proc` at all (ENXIO).
 **Other services.** The broker was leerie's one control socket. Leerie's
 pathname sockets in the container are the egress proxy's (§6 *A confined
 process has its own network*): `egress.sock`, and one `fwd-<port>.sock` per
-forwarded port, in the proxy's 0700 directory `/tmp/l/<hex>/`
+forwarded port, in the proxy's 0700 directory `/tmp/l/egress-<random>/`
 (`_EgressProxy`, made by `_egress_server` in a new `_new_private_tmp`). They are
 services for confined processes on purpose, and only the processes they
 serve can name them: every confined process has a `/tmp` of its own, and
@@ -5025,13 +5025,23 @@ same as a completion (review round 22, a preflight death and a held-out
 set's death both listed `done`). A run that died of a worker error or an
 unhandled exception stamped nothing and listed `in-progress`. The root
 cause is that nothing recorded the death itself; the invariant is that
-**a run whose last invocation died is listed as died**. The exit arm
-that sees the death records it, in `run.json`'s `failed_at`: the `die()`
-arm (every exit code but 0 and the deferred clarification's), the
-worker-error arm and the unhandled-exception arm. A pause, an interrupt
-and a clarification wait record nothing — they are not deaths. Each
-invocation clears the previous one's `failed_at` as it starts, so a run
-resumed to completion is not listed `failed`. `leerie list` shows such a
+**a run whose last invocation died is listed as died**. The record,
+`run.json`'s `failed_at`, has one owner, and it sees every exit of the
+invocation: it wraps the whole of `main()` and is armed where the run's
+`State` is acquired and its layout accepted, so a death from any
+statement after that — the confinement entry, a resolver or
+`_orchestrate` itself — is recorded. A
+first version gave the record to the exit arms around `_orchestrate`;
+a `die()` before their `try:`, the confinement entry's included, then
+recorded nothing and the run listed `in-progress`, which a bare `resume`
+auto-picks (review round 23). A death is a `die()` at any exit code but
+0 and the deferred clarification's, or any other exception but the
+operator's interrupt; `main()` returns a pause's, an interrupt's or a
+completion's exit code rather than raising it, so a pause, an interrupt
+and a clarification wait record nothing — they are not deaths. A
+`--phase` verb analyses a run and never continues it, so it is not
+armed. Each invocation clears the previous one's `failed_at` as it is
+armed, so a run resumed to completion is not listed `failed`. `leerie list` shows such a
 run `failed`, or `incomplete` when it died mid-wave (the more specific
 status, which a bare `resume` still picks); a `failed` run is resumed by
 id, not auto-picked, because a death's message names a fix the operator

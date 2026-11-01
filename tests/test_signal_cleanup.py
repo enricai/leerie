@@ -368,7 +368,7 @@ def _main_body() -> str:
     """Extract main()'s body from leerie.py source."""
     src = LEERIE_PY.read_text()
     m = re.search(
-        r"^def main\(\) -> None:\n(.*?)(?=^(?:def |class |if __name__))",
+        r"^def main\(\) -> int \| None:\n(.*?)(?=^(?:def |class |@|if __name__))",
         src, re.DOTALL | re.MULTILINE,
     )
     assert m

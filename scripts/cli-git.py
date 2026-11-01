@@ -14,9 +14,10 @@ This (1) enters a Landlock domain nested in the CLI's (`landlock_exec.nest`),
 so nothing git runs — a filter, a textconv — can open the CLI's
 `/proc/<pid>/fd/1`; then (2) runs the real git (`LEERIE_REAL_GIT`) with the
 tree's repository named from leerie's layout and leerie's settings
-(`LEERIE_CLI_GIT`: the arguments and environment `_git_view` gives leerie's
-own reads of the tree), so the tree's `.git` file is never followed. Exits
-126 without running git when the domain cannot be made."""
+(`LEERIE_CLI_GIT`: `_tree_git_args(tree)`, the arguments leerie's own git
+on the tree takes, and an empty environment), so the tree's `.git` file is
+never followed. Exits 126 without running git when the domain cannot be
+made."""
 import importlib.util
 import json
 import os

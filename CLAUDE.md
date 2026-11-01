@@ -176,7 +176,7 @@ the rest of the family stay denied.
   exclusive (`_exec_lock()`, `_held_out_section`). Leerie keeps nothing of
   its own in `/tmp` but the preflight smoke test's empty working directory
   (`_use_run_tmp`, `_system_temp_dir`) and its egress proxy's 0700 socket
-  directory `/tmp/l/<hex>/` (`_egress_server`). No database server leerie starts
+  directory `/tmp/l/egress-<random>/` (`_egress_server`). No database server leerie starts
   is unconfined (`scripts/sandbox-db.sh`). Every confined command's
   processes end with it: the Landlock shim is their subreaper. The host-side workers
   (rebaser, host recapture, `config --chat`) are the one exception.

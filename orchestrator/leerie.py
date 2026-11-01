@@ -7270,6 +7270,60 @@ def _clear_run_died(run_dir: Path) -> None:
             log(f"warning: could not clear run.json's failed_at: {e}")
 
 
+# The run directory whose invocation the running `main()` owns: set where its
+# `State` is acquired and its layout accepted, None before that, after
+# `main()` ends, and for a `--phase` verb (which analyses a run, never
+# continues it).
+_RUN_DEATH_OWNER: Path | None = None
+
+
+def _own_the_run_death_record(run_dir: Path) -> None:
+    """This process owns the run's invocation from here: clear the last
+    invocation's `failed_at` and arm `_records_the_run_death` to record this
+    one's death, whichever statement of `main()` it comes from."""
+    global _RUN_DEATH_OWNER
+    _clear_run_died(run_dir)
+    _RUN_DEATH_OWNER = run_dir
+
+
+def _is_a_death(exc: BaseException) -> bool:
+    """Whether an exception leaving `main()` is the invocation's death. A
+    `die()` is, at every code but 0 and the deferred clarification's; so is
+    any other exception, except the operator's interrupt. A pause is not an
+    exception here at all: `main()` returns its code."""
+    if isinstance(exc, SystemExit):
+        code = exc.code if exc.code is not None else 1
+        return code not in (0, EXIT_NEEDS_ANSWERS)
+    return not isinstance(exc, (KeyboardInterrupt, InterruptedBySignal))
+
+
+def _records_the_run_death(
+        main_fn: Callable[[], int | None]) -> Callable[[], None]:
+    """The one owner of the run's death record (DESIGN §6 *A run that died
+    says so*). It wraps the whole of `main()`, so no statement after the run
+    is armed (`_own_the_run_death_record`) can exit unseen — the death the
+    exit arms around `_orchestrate` missed when the record was theirs, a
+    `die()` at the confinement entry or in a resolver before the `try:`.
+    `main()` returns a pause's, an interrupt's or a completion's exit code
+    and raises only for a death or an interrupt, so the code it returns is
+    exited with here."""
+    @functools.wraps(main_fn)
+    def owner() -> None:
+        global _RUN_DEATH_OWNER
+        _RUN_DEATH_OWNER = None
+        try:
+            code = main_fn()
+        except BaseException as e:
+            if _RUN_DEATH_OWNER is not None and _is_a_death(e):
+                _record_run_died(_RUN_DEATH_OWNER)
+            raise
+        finally:
+            _RUN_DEATH_OWNER = None
+        if code:
+            sys.exit(code)
+    return owner
+
+
 def _write_run_json(run_dir: Path, **fields) -> None:
     """Merge fields into the run.json sidecar at `run_dir/run.json`,
     validate the result, and write atomically.
@@ -25143,7 +25197,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         nonlocal last_structured_payload, unexpected_tools_warned
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
-        # connected to a TTY, so `tail -f <state-root>/logs/<sid>.log` would
+        # connected to a TTY, so `tail -f <run-dir>/logs/transcripts/<sid>.log` would
         # show nothing until the file closed at worker end — defeating
         # the entire live-progress property of the streaming feature.
         with log_path.open("a", buffering=1) as log_file:
@@ -28889,8 +28943,9 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
 
     Worker activity streams as one JSON event per stdout line
     (`--output-format stream-json --verbose`). `_invoke` writes the raw
-    events to `<state-root>/logs/<sid>.log` and emits per-event inline
-    summaries gated by `st.data["verbosity"]`. The final `result` event
+    events to `<run-dir>/logs/transcripts/<sid>.log`
+    (`logs/held-out/transcripts/` for `HELD_OUT_LOG_WORKERS`) and emits
+    per-event inline summaries gated by `st.data["verbosity"]`. The final `result` event
     is returned as the envelope — same shape as the pre-streaming
     single-result mode (`structured_output` present on schema success).
 
@@ -67907,7 +67962,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                         host_no_push=getattr(args, "host_no_push", None))
 
 
-def main() -> None:
+@_records_the_run_death
+def main() -> int | None:
     # Must precede every spawn — including _become_subreaper's descendants.
     _restore_sigchld_default()
     # Before any git runs: no git command of leerie's own fires a repository
@@ -68588,6 +68644,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     if (args.resume or args.phase) and st.load():
         _refuse_other_run_layout(
             st, "resume" if args.resume else f"--phase {args.phase}")
+    # The run's invocation is this process's from here: every exit of
+    # `main()` below, whichever statement it comes from, is seen by the one
+    # owner of the death record (DESIGN §6 *A run that died says so*). Not a
+    # `--phase` verb's: it analyses a run and never continues it, so it
+    # neither clears a death nor records one.
+    if not args.phase:
+        _own_the_run_death_record(st.run_dir)
     # The run is this process's from here (its flock is held): tell the
     # launcher which one, for the bring-back after the container exits
     # (DESIGN §6 *Which run the container ran*).
@@ -68947,7 +69010,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     full_purge = False
     exit_code = 0
     exit_message: str | None = None
-    _clear_run_died(st.run_dir)
     try:
         asyncio.run(_orchestrate(args, caps, st.run_dir, st,
                                 sot_pref, verbosity, models, efforts))
@@ -68955,7 +69017,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         abnormal = True
         full_purge = False
         _save_state_best_effort(st, "WorkerError exit")
-        _record_run_died(st.run_dir)
         exit_message = str(e)
         exit_code = 1
     except ContextOverflow as e:
@@ -69235,9 +69296,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     _save_state_best_effort(st, "SystemExit exit")
                 _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
                 _ec = e.code if e.code is not None else 1
-                # A deferred clarification is the one non-error exit here.
-                if _ec not in (0, EXIT_NEEDS_ANSWERS):
-                    _record_run_died(st.run_dir)
                 (st.run_dir / "orchestrator.exit_code").write_text(
                     str(_ec) + "\n")
             except Exception:
@@ -69251,8 +69309,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         abnormal = True
         full_purge = False
         _save_state_best_effort(st, "BaseException exit")
-        if st is not None and st.run_dir is not None:
-            _record_run_died(st.run_dir)
         # `_brief_worker_exc` rather than `{e}`: str() on a
         # subprocess.TimeoutExpired renders `cmd`, i.e. the entire `claude -p`
         # argv including an inlined system prompt — the 50 KB terminal dump
@@ -69284,8 +69340,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             pass
     if exit_message is not None:
         die(exit_message, code=exit_code)
-    if exit_code != 0:
-        sys.exit(exit_code)
+    # Returned, not raised: a pause, an interrupt or a completion is not a
+    # death, and `_records_the_run_death` reads every raise but an interrupt
+    # and a clarification exit as one. It exits with this code.
+    return exit_code
 
 
 if __name__ == "__main__":

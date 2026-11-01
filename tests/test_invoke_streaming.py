@@ -561,7 +561,7 @@ def test_worker_failure_surfaces_even_at_quiet(leerie, leerie_dir,
 
 def test_log_file_opened_line_buffered(leerie, leerie_dir, monkeypatch):
     """The per-worker log file MUST be opened line-buffered (buffering=1)
-    so a user running `tail -f .leerie/logs/<sid>.log` sees events as
+    so a user running `tail -f <run-dir>/logs/transcripts/<sid>.log` sees events as
     they happen, not when the file closes at worker end. Default Python
     text-mode buffering would batch writes into ~8KB chunks and only
     flush on close — silently defeating the live-progress property the
