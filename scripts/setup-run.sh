@@ -128,7 +128,7 @@ TREE_REPOS="$(cd "$RUN_DIR" && pwd -P)/tree-repos"
 # repository (the test `leerie_tree` reuses by).
 _survived() {
   [ -f "$1/HEAD" ] && [ -d "$2" ] \
-    && [ "$(git -C "$2" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" = "$1" ]
+    && [ "$(leerie_tree_location "$2" | sed -n 1p)" = "$1" ]
 }
 staging_survived=false
 _survived "${TREE_REPOS}/staging" "$STAGING_WT" && staging_survived=true

@@ -5974,3 +5974,26 @@ template kept at finalize.
   tree's commands get that tree's own stores; each manager's no-code fetch
   runs its argv on data files only (6 cases); a bun install copies; a
   replaced view takes its tree stores with it.
+- `tests/test_tree_git_is_addressed.py` (9 tests, review round 19
+  isolation H1, DESIGN §6 *Leerie's git never takes a tree's repository
+  from the tree*):
+  - A view and a subtask tree have their `.git` rewritten, as a file
+    naming a planted repository and as a `.git` directory in its place.
+    The planted repository names programs through `core.fsmonitor`,
+    filters, textconv and hooks. Every leerie read and restore of the tree,
+    in Python and in the shell, reads the real repository, and none of the
+    programs runs.
+  - A tree repository whose worktree's `commondir` names another
+    repository is refused.
+  - The round's measurement proof, inverted: the confined command's
+    planted fsmonitor never runs, and the held-back set, the run branch
+    and `state.json` stay as they were.
+  - Three guards derived from the source: no `-C` in a leerie git argv
+    outside `_tree_git_args`; every git command run with a working
+    directory names its repository; and every script that sources
+    `worktree-lib.sh` runs git on a tree only through `leerie_tgit`.
+
+  Falsified, each turning tests red: the helper following `.git`, in
+  Python and in the shell; no `commondir` check; a `.git` directory read
+  as a clone before the repository's record; and one site of each kind
+  put back for each guard.

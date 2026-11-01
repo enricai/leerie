@@ -317,7 +317,10 @@ def test_unresolvable_rebase_state_fails_closed(leerie, tmp_path,
     real_run_proc = leerie.run_proc
 
     async def failing_git_path(cmd, **kw):
-        if cmd[:3] == ["git", "rev-parse", "--git-path"]:
+        # Wherever the subcommand sits: leerie names the tree's repository
+        # before it (`_tree_git_args`).
+        if (cmd[:1] == ["git"] and "rev-parse" in cmd
+                and "--git-path" in cmd):
             return subprocess.CompletedProcess(cmd, 128, "", "fatal")
         return await real_run_proc(cmd, **kw)
 

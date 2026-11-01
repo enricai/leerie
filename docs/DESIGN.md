@@ -2671,6 +2671,58 @@ confined worker's shell and spawns the runner itself, so it runs inside
 that worker's grants (*A worker writes only where it is granted*): no
 second grant applies.
 
+### Leerie's git never takes a tree's repository from the tree
+
+**Root cause (review round 19 isolation H1).** Confined code writes its
+whole tree: a measurement's install in a committed view, a worker in its
+own tree, which for a committing worker includes its tree repository. The
+tree's `.git` file is in the tree. Leerie's own git commands on the tree
+run unconfined, and every one of them found its repository from the tree
+(`git -C <tree>`, or a working directory), so they followed whatever that
+`.git` file named and read that repository's configuration. The
+configuration names programs git runs on its own, `core.fsmonitor` on every
+index refresh among them, so leerie's own git would run what confined code
+wrote, outside every grant. The command was confined; leerie's housekeeping
+around it was its proxy.
+
+**Invariant: leerie's own git commands never take a repository's location
+or configuration from a path confined code can write.** Every leerie git
+command on a tree goes through one helper (`_tree_git_args`, and
+`leerie_tgit` in the scripts), which names the repository from leerie's
+layout:
+
+- A tree is in a run's `worktrees/`. It is a worktree of its tree
+  repository, `<run-dir>/tree-repos/<name>` when that exists, and else of
+  the run repository. Its git directory is the administrative directory
+  of that repository whose `gitdir` record names the tree, found from the
+  repository's side. The administrative directory's `commondir` must name
+  that same repository, since a committing worker can write its own tree
+  repository. A tree that the record names stays a worktree whatever its
+  `.git` now is, a directory included. One no record names is a ref-less
+  clone of the run repository, read through its own `.git` directory.
+- The command is `git -C <tree> --git-dir <git dir> --work-tree <tree>`,
+  so the tree's `.git` is never followed. It always carries leerie's
+  pins: `core.fsmonitor` and `core.untrackedCache` off. The readers that
+  need leerie's settings (`_git_view`, `leerie_vgit`) add them as before
+  (§8 *The settings are leerie's*). The repository's own `config` and
+  `info/` are put back before a read, which covers what a committing
+  worker can write.
+- A run tree that matches none of this is refused. git then fails, and
+  the caller reads that as git unable to answer, never as clean.
+- A tree outside every run (the user's checkout, a test's repository) is
+  addressed `-C <tree>` with the pins: no confined code writes it.
+
+Guards derived from the source hold every site to it: no leerie git argv
+carries `-C` except in the helper, every git command run with a working
+directory names its repository, and the scripts that source
+`worktree-lib.sh` run git on a tree only through `leerie_tgit`.
+
+*Not covered.* A ref-less clone's repository is inside the clone, so the
+confined writer of the clone also writes its configuration. Leerie reads
+such a clone (the acceptance writer's, the surrogate's, the falsifier's)
+with the pins only. Closing that needs leerie's reads of a clone to come
+from the run repository after a fetch, or to run confined.
+
 ### A repository per committing tree (I6)
 
 *Designed 2026-10-30. It is the prerequisite of I5's git grant (*A worker

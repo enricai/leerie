@@ -201,11 +201,13 @@ def test_new_worktree_idempotency_check_uses_fixed_string():
     script falls through to `git worktree add` on an existing directory, and
     every continuation retry dies with "fatal: '...' already exists"."""
     src = _script("new-worktree.sh")
-    # Reuse is `leerie_tree`'s, by the tree's common directory (DESIGN §6 *A
-    # repository per committing tree (I6)*), and needs the absolute $WT.
+    # Reuse is `leerie_tree`'s, by the tree's common directory from leerie's
+    # layout (DESIGN §6 *A repository per committing tree (I6)*, *Leerie's
+    # git never takes a tree's repository from the tree*), and needs the
+    # absolute $WT.
     assert 'leerie_tree "${RUN_DIR_ABS}/tree-repos/$(basename "$WT")"' in src
     lib = _script("worktree-lib.sh")
-    assert '--git-common-dir 2>/dev/null)" = "$tr" ]' in lib
+    assert '[ "$(leerie_tree_location "$wt" | sed -n 1p)" = "$tr" ]' in lib
     assert 'grep -q "worktree .*/' not in src
 
 

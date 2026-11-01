@@ -2956,7 +2956,10 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
     repaired, failed = [], []
 
     async def eagain_once(argv, *a, **k):
-        if repaired and not failed and argv[:2] == ["git", "rev-parse"]:
+        # Wherever the subcommand sits: leerie names the tree's
+        # repository before it (`_tree_git_args`).
+        if (repaired and not failed and argv[:1] == ["git"]
+                and "rev-parse" in argv):
             failed.append(1)
             raise BlockingIOError(11, "Resource temporarily unavailable")
         return await real(argv, *a, **k)

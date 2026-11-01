@@ -187,7 +187,7 @@ def test_a_rewritten_dot_git_is_pointed_back(leerie, env, tmp_path):
     assert (v2 / "src" / "a.txt").read_text() == "3"
     assert _git(other, "rev-parse", "--verify", "-q", "HEAD",
                 check=False) == ""
-    admin = leerie._view_admin_dir(st.run_dir / "repo", v2)
+    admin = leerie._admin_dir_of(st.run_dir / "repo", v2)
     assert admin is not None
     assert (v2 / ".git").read_text() == f"gitdir: {admin}\n"
 

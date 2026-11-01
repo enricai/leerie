@@ -6399,13 +6399,41 @@ DESIGN §8 *The settings are leerie's* and *One ignore rule*.
   when its name is `RUN_REPO_NAME` and `_run_repo_of(common.parent)` is it
   (named with `--git-dir`, never through `core.bare`; the shell's
   `leerie_run_settings` makes the same test).
+- `_tree_git_args(tree) -> list[str]` — THE arguments after `git` of
+  every leerie git command on a tree (DESIGN §6 *Leerie's git never takes a
+  tree's repository from the tree*): `["-C", tree, "--git-dir", <git dir>,
+  "--work-tree", tree, *_GIT_VIEW_PINS]` for a located run tree;
+  `--git-dir <run-dir>/.no-git-dir` (git fails) for a run tree that cannot
+  be located; `["-C", tree, *_GIT_VIEW_PINS]` for a tree outside every
+  run. `_git_at` returns it for a non-git-directory path.
+  `_run_tree_location(tree) -> (common, git dir, run dir) | None | False`:
+  for `realpath(tree)` whose parent is named `worktrees` under a run
+  directory holding a run repository: `common` is
+  `<run>/tree-repos/<name>` when that is a git directory, else
+  `<run>/repo`; the git dir is `_admin_dir_of(common, tree)` (the
+  `<common>/worktrees/<id>` whose `gitdir` names `tree`) whose `commondir`
+  resolves to `common`; with no such record and `common` the run
+  repository, a `.git` directory (not a link) in the tree is a clone,
+  returned as both; otherwise False. None for a tree outside every run.
+  `_common_dir_of` and `_run_settings_of` use it for a run tree (a clone
+  has no run settings). Shell: `leerie_tree_location` (prints the common
+  and git directories; status 2 outside every run, 1 unlocatable) and
+  `leerie_tgit <wt> <args…>` (status 128 for an unlocatable run tree),
+  which `leerie_vgit`, `leerie_run_settings`, `leerie_settings_dirt`,
+  `leerie_restore_settings`, `leerie_reset_worktree`, `leerie_tree`,
+  `integrate.sh`, `setup-run.sh` and `collect-subtrees.sh` use;
+  `leerie_tree_common` (layout, or git for a tree outside every run) for
+  the scripts that need a common directory. `leerie_tree`, reusing a tree
+  its tree repository records, writes the tree's `.git` back as `gitdir:
+  <the located administrative directory>`. Guards:
+  `tests/test_tree_git_is_addressed.py`.
 - `_git_view(tree) -> (args, env | None)` — the arguments after `git`
-  (every launch spells `["git", *args, …]`): `["-C", tree,
-  "-c", "core.attributesFile=<s>/host.attributes", "-c",
-  "core.excludesFile=<s>/host.exclude", *_GIT_VIEW_PINS]` with
-  `os.environ` plus `GIT_CONFIG_SYSTEM=/dev/null`,
-  `GIT_CONFIG_GLOBAL=<s>/host.config`, `GIT_ATTR_NOSYSTEM=1`; for a tree
-  of no run repository `["-C", tree, *_GIT_VIEW_PINS]`, env None.
+  (every launch spells `["git", *args, …]`): `_tree_git_args(tree)` plus,
+  for a tree of the run or tree repository, `"-c",
+  "core.attributesFile=<s>/host.attributes", "-c",
+  "core.excludesFile=<s>/host.exclude"` with `os.environ` plus
+  `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_GLOBAL=<s>/host.config`,
+  `GIT_ATTR_NOSYSTEM=1`; otherwise `_tree_git_args(tree)`, env None.
   `_GIT_VIEW_PINS = ("-c", "core.fsmonitor=false", "-c",
   "core.untrackedCache=false")`.
 - `_settings_dirt(tree) -> list[str]` — for a run repository's tree, one
@@ -6779,10 +6807,10 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     is `_rmtree_owned` and left out; None on an unreadable or unremovable
     entry. `_install_intact(tree, snap) -> bool`: `_output_entries` with
     the snapshot's listing as `known`, its `_entries_digest` equal to the
-    snapshot's. `_view_admin_dir(repo, wt) -> Path | None`: the
-    `<repo>/worktrees/<id>` whose `gitdir` names `wt`. `_move_view(repo,
+    snapshot's. `_move_view(repo,
     wt, tip, snap) -> bool`: `wt/.git` replaced by `gitdir:
-    <_view_admin_dir>`, `checkout -q --detach --force <tip>`, `clean -ffdqx`
+    <_admin_dir_of(repo, wt)>`, every git command through
+    `_tree_git_args`, `checkout -q --detach --force <tip>`, `clean -ffdqx`
     with `-e /<output>` per output, `_install_intact`, then True only when
     `HEAD` is `tip` and `status --porcelain --untracked-files=no` is empty.
     Pinned by `tests/test_view_moves.py`.

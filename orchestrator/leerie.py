@@ -9917,7 +9917,93 @@ def _git_at(path: str | Path) -> list[str]:
     p = Path(path)
     if (p / "HEAD").is_file() and (p / "objects").is_dir():
         return ["--git-dir", str(p)]
-    return ["-C", str(p)]
+    return _tree_git_args(p)
+
+
+def _is_git_dir(p: Path) -> bool:
+    return (p / "HEAD").is_file() and (p / "objects").is_dir()
+
+
+def _admin_dir_of(common: Path, tree: Path) -> Path | None:
+    """`common`'s administrative directory for its worktree `tree`, found
+    from the repository's side (each `worktrees/*/gitdir`), never from
+    `tree/.git`."""
+    want = os.path.realpath(tree)
+    try:
+        dirs = sorted((Path(common) / "worktrees").iterdir())
+    except OSError:
+        return None
+    for d in dirs:
+        try:
+            got = (d / "gitdir").read_text().strip()
+        except OSError:
+            continue
+        if os.path.realpath(os.path.dirname(got)) == want:
+            return d
+    return None
+
+
+def _run_tree_location(tree: str | Path
+                       ) -> tuple[Path, Path, Path] | None | bool:
+    """Where a tree in a run's `worktrees/` keeps its repository (DESIGN §6
+    *Leerie's git never takes a tree's repository from the tree*), from
+    leerie's own layout and never from the tree, whose `.git` file confined
+    code may rewrite: `(common dir, git dir, run dir)`. A worktree of its
+    tree repository (`<run>/tree-repos/<name>`) or else of the run
+    repository, its git dir the administrative directory that names it, and
+    whose `commondir` names that repository; a ref-less clone, its own
+    `.git` directory. None for a tree outside every run (the user's
+    checkout, a test's repository); False for one inside a run that matches
+    none of these (no git command may then read it)."""
+    t = Path(os.path.realpath(tree))
+    if t.parent.name != "worktrees":
+        return None
+    run_dir = t.parent.parent
+    tr = run_dir / TREE_REPOS_NAME / t.name
+    if _is_git_dir(tr):
+        common = tr
+    elif _is_git_dir(run_dir / RUN_REPO_NAME):
+        common = run_dir / RUN_REPO_NAME
+    else:
+        return None
+    # A worktree whatever its `.git` now is: the repository's own record
+    # names it, so a `.git` directory put in its place makes it no clone.
+    admin = _admin_dir_of(common, t)
+    if admin is None:
+        dot = t / ".git"
+        if (common == run_dir / RUN_REPO_NAME and dot.is_dir()
+                and not dot.is_symlink()):
+            return dot, dot, run_dir
+        return False
+    try:
+        named = (admin / "commondir").read_text().strip()
+    except OSError:
+        return False
+    if os.path.realpath(admin / named) != os.path.realpath(common):
+        return False
+    return common, admin, run_dir
+
+
+def _tree_git_args(tree: str | Path) -> list[str]:
+    """THE arguments after `git` of every leerie git command on a tree
+    (DESIGN §6 *Leerie's git never takes a tree's repository from the
+    tree*): `-C <tree>` for its paths, and for a tree in a run's
+    `worktrees/` its repository named explicitly (`--git-dir <git dir>
+    --work-tree <tree>`, `_run_tree_location`), so a `.git` file confined
+    code rewrote is never followed; leerie's pins (`_GIT_VIEW_PINS`)
+    always. A run tree that cannot be located gets a git directory that
+    does not exist: git then fails, and the caller reads that as git
+    unable to answer."""
+    t = str(tree)
+    loc = _run_tree_location(tree)
+    if loc is None:
+        return ["-C", t, *_GIT_VIEW_PINS]
+    if loc is False:
+        gd = Path(os.path.realpath(tree)).parent.parent / ".no-git-dir"
+    else:
+        gd = loc[1]
+    return ["-C", t, "--git-dir", str(gd), "--work-tree", t,
+            *_GIT_VIEW_PINS]
 
 
 def _run_repo_of(run_dir: Path) -> Path | None:
@@ -9938,9 +10024,15 @@ TREE_REPOS_NAME = "tree-repos"
 
 def _common_dir_of(tree: str | Path) -> Path | None:
     """The git common directory of `tree`, absolute; None when `tree` is no
-    git tree (a payload-only directory, a path that does not exist)."""
+    git tree (a payload-only directory, a path that does not exist). A run
+    tree's from leerie's layout (`_run_tree_location`)."""
+    loc = _run_tree_location(tree)
+    if loc is False:
+        return None
+    if loc is not None:
+        return loc[0]
     try:
-        r = subprocess.run(["git", "-C", str(tree), "rev-parse",
+        r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse",
                             "--path-format=absolute", "--git-common-dir"],
                            capture_output=True, text=True, check=False,
                            timeout=30)
@@ -10131,7 +10223,7 @@ def _carry_repo_config(user: Path, repo: Path) -> None:
     env = _git_hooks_on(os.environ)
     own = _git_sync(["config", "-f", cfg, "--list", "--name-only"])
     already = {k.strip().lower() for k in own.stdout.splitlines() if k.strip()}
-    r = _git_sync(["-C", str(user), "config", "--local", "--list", "-z"],
+    r = _git_sync([*_tree_git_args(user), "config", "--local", "--list", "-z"],
                  env=env, timeout=30)
     if r.returncode != 0:
         raise RunRepoError(f"git config --local --list in {user}: "
@@ -10150,10 +10242,10 @@ def _carry_repo_config(user: Path, repo: Path) -> None:
         if w.returncode != 0:
             raise RunRepoError(f"git config --add {key}: "
                                f"{w.stderr.strip()[:300]}")
-    hp = _git_sync(["-C", str(user), "config", "core.hooksPath"], env=env,
+    hp = _git_sync([*_tree_git_args(user), "config", "core.hooksPath"], env=env,
                   timeout=30)
     if hp.returncode != 0 or not hp.stdout.strip():
-        hooks = _git_sync(["-C", str(user), "rev-parse",
+        hooks = _git_sync([*_tree_git_args(user), "rev-parse",
                           "--path-format=absolute", "--git-path", "hooks"],
                          env=env, timeout=30)
         if hooks.returncode == 0 and hooks.stdout.strip():
@@ -10286,19 +10378,13 @@ def _take_settings(repo: Path, *, fresh: bool) -> None:
 
 def _run_settings_of(tree: str | Path) -> tuple[Path, Path] | None:
     """`(common dir, settings dir)` when `tree` is a worktree of a run's
-    own repository (its common directory is a bare `<run-dir>/repo`), else
-    None: a tree of any other repository is read with its own settings."""
-    try:
-        r = subprocess.run(["git", "-C", str(tree), "rev-parse",
-                            "--path-format=absolute", "--git-common-dir"],
-                           capture_output=True, text=True, check=False,
-                           timeout=30)
-    except (OSError, subprocess.SubprocessError):
+    own repository or of one of its tree repositories, found from leerie's
+    layout (`_run_tree_location`), else None: a tree of any other
+    repository, a clone included, is read with its own settings."""
+    loc = _run_tree_location(tree)
+    if not loc:
         return None
-    out = r.stdout.strip()
-    if r.returncode != 0 or not out:
-        return None
-    common = Path(out)
+    common = loc[0]
     if common.parent.name == TREE_REPOS_NAME:
         # A tree of a tree repository (DESIGN §6 *A repository per
         # committing tree (I6)*): its `config` and `info/` were copied from
@@ -10322,18 +10408,18 @@ def _git_view(tree: str | Path) -> tuple[list[str], dict[str, str] | None]:
     `core.untrackedCache` off. A tree of no run repository keeps its own
     settings (env None: the orchestrator's), the two optimisations off.
     The shell half is `leerie_vgit`."""
+    args = _tree_git_args(tree)
     loc = _run_settings_of(tree)
     if loc is None:
-        return ["-C", str(tree), *_GIT_VIEW_PINS], None
+        return args, None
     s = loc[1]
     env = dict(os.environ)
     env.update(GIT_CONFIG_SYSTEM=os.devnull,
                GIT_CONFIG_GLOBAL=str(s / "host.config"),
                GIT_ATTR_NOSYSTEM="1")
-    return (["-C", str(tree),
+    return ([*args,
              "-c", f"core.attributesFile={s / 'host.attributes'}",
-             "-c", f"core.excludesFile={s / 'host.exclude'}",
-             *_GIT_VIEW_PINS], env)
+             "-c", f"core.excludesFile={s / 'host.exclude'}"], env)
 
 
 def _same_settings_path(a: Path, b: Path) -> bool:
@@ -10534,7 +10620,8 @@ def _ensure_run_repo(st: "State") -> Path:
         return repo
     user = str(Path(st.repo_root).resolve())
     tmp = Path(st.run_dir) / f".{RUN_REPO_NAME}.tmp-{os.getpid()}"
-    fmt = _git_sync(["-C", user, "rev-parse", "--show-object-format"],
+    fmt = _git_sync([*_tree_git_args(user), "rev-parse",
+                     "--show-object-format"],
                    timeout=30)
     if fmt.returncode != 0:
         raise RunRepoError(f"{user} is not a git repository: "
@@ -10728,7 +10815,7 @@ def _working_branch_ref(repo_root: str | Path, st: "State") -> str | None:
     for ref in candidates:
         try:
             r = subprocess.run(
-                ["git", "-C", str(repo_root), "show-ref", "--verify",
+                ["git", *_tree_git_args(repo_root), "show-ref", "--verify",
                  "--quiet", ref],
                 capture_output=True, text=True, check=False, timeout=30)
         except (OSError, subprocess.SubprocessError):
@@ -10759,7 +10846,7 @@ def _switched_branch_only_paths(repo_root: Path, rel: str,
         # and abandon every later task reference, the spec included.
         try:
             r = subprocess.run(
-                ["git", "--literal-pathspecs", "-C", str(repo_root),
+                ["git", "--literal-pathspecs", *_tree_git_args(repo_root),
                  "ls-tree", "-r", "-z", "--name-only", rev, "--", rel],
                 capture_output=True, check=False, timeout=30)
             if r.returncode != 0:
@@ -10821,7 +10908,7 @@ async def _base_tree_sha(repo_root: str, st: "State") -> str:
     ref = await asyncio.to_thread(_working_branch_ref, repo_root, st)
     if ref is not None:
         try:
-            r = await run_proc(["git", "rev-parse", "--verify", "--quiet",
+            r = await run_proc(["git", *_tree_git_args(repo_root), "rev-parse", "--verify", "--quiet",
                                 ref], cwd=repo_root)
         except OSError:
             r = None
@@ -16940,7 +17027,7 @@ def _node_lockfile_paths(repo_root: Path) -> list[str]:
     `node_modules` and dot-directories."""
     try:
         r = _git_z_output(
-            ["git", "-C", str(repo_root), "ls-files", "-z", "--",
+            ["git", *_tree_git_args(repo_root), "ls-files", "-z", "--",
              *[f":(glob)**/{lf}" for lf in _NODE_LOCKFILES]], timeout=30)
         if r.returncode == 0:
             return sorted(p for p in r.stdout.split("\0") if p)
@@ -18261,7 +18348,7 @@ def run_rebaser(
         }
 
     pre_rebase_sha_r = asyncio.run(
-        run_proc(["git", "rev-parse", "HEAD"], cwd=str(worktree)))
+        run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd=str(worktree)))
     if pre_rebase_sha_r.returncode != 0:
         return {
             "status": "failed",
@@ -18278,7 +18365,7 @@ def run_rebaser(
     # rebaser fetches, and the hooks its commits run. Never written into the
     # user's own repository: skipped when the worktree belongs to it.
     def _common(path: str | Path) -> str:
-        r = _git_sync(["-C", str(path), "rev-parse", "--path-format=absolute",
+        r = _git_sync([*_tree_git_args(path), "rev-parse", "--path-format=absolute",
                        "--git-common-dir"], timeout=30)
         return os.path.realpath(r.stdout.strip()) if r.returncode == 0 else ""
     own_common, user_common = _common(worktree), _common(repo_root)
@@ -19025,7 +19112,7 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     run_branch = await _branch_commit_for_tree_async(
         worktree, _compute_run_branch(st.run_id))
     r = await run_proc(
-        ["git", "diff", "--name-only", f"{run_branch}..HEAD"],
+        ["git", *_tree_git_args(worktree), "diff", "--name-only", f"{run_branch}..HEAD"],
         cwd=worktree,
     )
     if r.returncode != 0:
@@ -19103,7 +19190,7 @@ async def check_merge_committed(staging: Path) -> str | None:
     state. This is the integrator-side analogue of `check_branch_has_commits`:
     it catches a worker lying about having finished."""
     r = await run_proc(
-        ["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        ["git", *_tree_git_args(staging), "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
         cwd=str(staging),
     )
     if r.returncode == 0:
@@ -19111,7 +19198,7 @@ async def check_merge_committed(staging: Path) -> str | None:
                 "the integrator did not complete the merge commit")
     # also reject a worktree left with staged-but-uncommitted conflict edits
     s = await run_proc(
-        ["git", "diff", "--cached", "--name-only"],
+        ["git", *_tree_git_args(staging), "diff", "--cached", "--name-only"],
         cwd=str(staging),
     )
     if s.returncode == 0 and s.stdout.strip():
@@ -19124,7 +19211,7 @@ async def check_integrator_commit(staging: Path) -> str | None:
     """Return an error if the integrator's merge commit touched .leerie/ files.
     The integrator should only touch project files, never coordination artifacts."""
     r = await run_proc(
-        ["git", "show", "--name-only", "--format=", "HEAD"],
+        ["git", *_tree_git_args(staging), "show", "--name-only", "--format=", "HEAD"],
         cwd=str(staging),
     )
     if r.returncode != 0:
@@ -19144,7 +19231,7 @@ async def _rebase_state_dirs(worktree: Path) -> list[str] | None:
     `<worktree>/.git/`."""
     present = []
     for name in ("rebase-merge", "rebase-apply"):
-        r = await run_proc(["git", "rev-parse", "--git-path", name],
+        r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "--git-path", name],
                            cwd=str(worktree))
         if r.returncode != 0:
             return None
@@ -19163,7 +19250,7 @@ def _is_conflict_marker(line: str, size: int) -> bool:
 
 async def _conflict_marker_size(worktree: Path, path: str) -> int:
     r = await run_proc(
-        ["git", "--literal-pathspecs", "check-attr", "-z",
+        ["git", *_tree_git_args(worktree), "--literal-pathspecs", "check-attr", "-z",
          "conflict-marker-size", "--", path],
         cwd=str(worktree))
     fields = r.stdout.split("\0") if r.returncode == 0 else []
@@ -19186,7 +19273,7 @@ async def _introduced_conflict_markers(
     in the first 8000 bytes, merge's own test), which merge never writes
     markers into."""
     check = await run_proc(
-        ["git", "-c", "core.quotePath=off", "diff", "--no-color",
+        ["git", *_tree_git_args(worktree), "-c", "core.quotePath=off", "diff", "--no-color",
          "--no-renames", "--check", since, "--"],
         cwd=str(worktree))
     # 0 clean, 2 markers or whitespace errors; anything else is git failing
@@ -19197,7 +19284,7 @@ async def _introduced_conflict_markers(
         re.MULTILINE)}
 
     numstat = await run_proc(
-        ["git", "diff", "--numstat", "-z", "--no-renames", since, "--"],
+        ["git", *_tree_git_args(worktree), "diff", "--numstat", "-z", "--no-renames", since, "--"],
         cwd=str(worktree))
     if numstat.returncode != 0:
         return None
@@ -19212,7 +19299,7 @@ async def _introduced_conflict_markers(
             continue
         size = await _conflict_marker_size(worktree, path)
         diff = await run_proc(
-            ["git", "--literal-pathspecs", "diff", "--text", "--no-textconv",
+            ["git", *_tree_git_args(worktree), "--literal-pathspecs", "diff", "--text", "--no-textconv",
              "--no-ext-diff", "--no-color", "--no-renames", "-U0", since,
              "--", path],
             cwd=str(worktree))
@@ -19284,7 +19371,7 @@ async def check_rebaser_worktree_state(
         return (f"rebaser claimed {status!r} but worktree is still "
                 f"mid-rebase ({in_progress[0]} present) — abort did not "
                 f"complete")
-    r = await run_proc(["git", "rev-parse", "HEAD"], cwd=str(worktree))
+    r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd=str(worktree))
     if r.returncode != 0:
         return f"could not verify worktree HEAD after rebaser claimed {status!r}"
     current_sha = r.stdout.strip()
@@ -19314,7 +19401,7 @@ async def _branch_has_commits_ahead(worktree: str,
     base = await _branch_commit_for_tree_async(worktree, parent_branch)
     try:
         r = await run_proc(
-            ["git", "log", f"{base}..HEAD", "--oneline"],
+            ["git", *_tree_git_args(worktree), "log", f"{base}..HEAD", "--oneline"],
             cwd=worktree,
         )
     except OSError:
@@ -19345,7 +19432,7 @@ async def check_branch_has_commits(sid: str, worktree: str,
     base = await _branch_commit_for_tree_async(worktree, parent_branch)
     try:
         r = await run_proc(
-            ["git", "log", f"{base}..HEAD", "--oneline"],
+            ["git", *_tree_git_args(worktree), "log", f"{base}..HEAD", "--oneline"],
             cwd=worktree,
         )
     except OSError:
@@ -19369,7 +19456,7 @@ async def _scan_conflict_markers(staging: Path) -> str | None:
         return None
     try:
         r = await run_proc(
-            ["git", "grep", "-l", "^<<<<<<< ", "HEAD"],
+            ["git", *_tree_git_args(staging), "grep", "-l", "^<<<<<<< ", "HEAD"],
             cwd=str(staging),
         )
     except OSError:
@@ -22030,7 +22117,7 @@ def _tree_git_dirs(tree: Path, run_dir: Path) -> tuple[list[str], list[str]]:
     remake one from a tree repository); writing it would grant the run
     repository's `refs/`, every branch, so the run stops instead.
     `([], [])` for a clone, whose `.git` is inside it."""
-    r = subprocess.run(["git", "-C", str(tree), "rev-parse",
+    r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse",
                         "--path-format=absolute", "--git-dir",
                         "--git-common-dir"], capture_output=True, text=True,
                        check=False, timeout=30)
@@ -22176,7 +22263,7 @@ def _cache_vars(env: Mapping[str, str], cache: Path) -> dict[str, str]:
 def _git_dirs_of(tree: Path) -> tuple[Path, Path, Path] | None:
     """`(git_dir, common_dir, toplevel)` of the checkout at `tree`, resolved,
     or None when `tree` is no git checkout."""
-    r = subprocess.run(["git", "-C", str(tree), "rev-parse",
+    r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse",
                         "--path-format=absolute", "--git-dir",
                         "--git-common-dir", "--show-toplevel"],
                        capture_output=True, text=True, check=False,
@@ -27207,7 +27294,7 @@ async def _replay_capture(record: dict, *,
         # hooks with the replayed worker (DESIGN §6 *The run's own
         # repository*).
         checkout = tmp_run_dir / "replay-checkout"
-        head = subprocess.run(["git", "-C", str(_replay_root), "rev-parse",
+        head = subprocess.run(["git", *_tree_git_args(_replay_root), "rev-parse",
                                "--verify", "-q", "HEAD^{commit}"],
                               capture_output=True, text=True, check=False)
         why = (_ref_less_clone(_replay_root, checkout, head.stdout.strip())
@@ -28842,7 +28929,7 @@ def _d1_report_sources(task: str, repo_root: Path) -> dict[str, str]:
             continue
         rel = _repo_rel(f, repo_root)
         tracked = subprocess.run(
-            ["git", "--literal-pathspecs", "-C", str(repo_root), "ls-files",
+            ["git", "--literal-pathspecs", *_tree_git_args(repo_root), "ls-files",
              "--error-unmatch", "--", rel], capture_output=True,
             check=False).returncode == 0
         if tracked:
@@ -29138,7 +29225,7 @@ def _d1_untouched_verdict(cwd: str | Path, own_start: str | None,
             return None
         specs.append(f":(glob){p}" if any(c in p for c in "*?[") else p)
     r = subprocess.run(
-        ["git", "-C", str(cwd), "diff", "--name-only", f"{own_start}..HEAD",
+        ["git", *_tree_git_args(cwd), "diff", "--name-only", f"{own_start}..HEAD",
          "--", *specs], capture_output=True, text=True, check=False)
     if r.returncode != 0:
         return None
@@ -37992,7 +38079,7 @@ async def _changed_files(tree: str, base_ref: str) -> list[str]:
     the current run-branch tip (`scripts/new-worktree.sh`) and integration
     happens only at a wave boundary, so `<run_branch>..HEAD` is the subtask's
     own diff in every wave."""
-    r = await run_proc(["git", "diff", "-z", "--name-only",
+    r = await run_proc(["git", *_tree_git_args(tree), "diff", "-z", "--name-only",
                         f"{base_ref}..HEAD"], cwd=tree)
     if r.returncode != 0:
         return []
@@ -39128,7 +39215,7 @@ async def _branch_head_sha(worktree: str) -> str:
     caller about to decide a rollback must not see as an exception. Used as
     the rollback target before the conformer adds commits."""
     try:
-        r = await run_proc(["git", "rev-parse", "HEAD"], cwd=worktree)
+        r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd=worktree)
     except OSError:
         return ""
     if r.returncode != 0:
@@ -39186,7 +39273,7 @@ async def _merge_base_sha(worktree: str, a: str, b: str) -> str:
     clobber report on every run whose final conformer committed anything)."""
     if not a or not b:
         return ""
-    r = await run_proc(["git", "merge-base", a, b], cwd=worktree)
+    r = await run_proc(["git", *_tree_git_args(worktree), "merge-base", a, b], cwd=worktree)
     if r.returncode != 0:
         return ""
     return r.stdout.strip()
@@ -39207,7 +39294,7 @@ async def _protected_paths_since(worktree: str,
     if not before_sha:
         return []
     r = await run_proc(
-        ["git", "diff", "--name-only", f"{before_sha}..HEAD"],
+        ["git", *_tree_git_args(worktree), "diff", "--name-only", f"{before_sha}..HEAD"],
         cwd=worktree,
     )
     if r.returncode != 0:
@@ -39226,7 +39313,7 @@ async def _blob_sha(worktree: str, ref: str, path: str) -> str | None:
     callers capture a bogus value; `--verify -q` exits cleanly with empty
     stdout instead."""
     r = await run_proc(
-        ["git", "rev-parse", "--verify", "-q", f"{ref}:{path}"],
+        ["git", *_tree_git_args(worktree), "rev-parse", "--verify", "-q", f"{ref}:{path}"],
         cwd=worktree,
     )
     out = r.stdout.strip()
@@ -39253,7 +39340,7 @@ async def _clobbered_owned_files(worktree: str, base_ref: str,
     if not base_ref or not impl_head:
         return []
     r = await run_proc(
-        ["git", "diff", "--name-only", f"{base_ref}..{impl_head}"],
+        ["git", *_tree_git_args(worktree), "diff", "--name-only", f"{base_ref}..{impl_head}"],
         cwd=worktree,
     )
     if r.returncode != 0:
@@ -39449,7 +39536,7 @@ async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
     lines += [f"?? {p}" for p in others.stdout.split("\0") if p]
     if branch:
         try:
-            cur = await run_proc(["git", "symbolic-ref", "-q", "HEAD"],
+            cur = await run_proc(["git", *_tree_git_args(tree), "symbolic-ref", "-q", "HEAD"],
                                  cwd=str(tree))
         except OSError:
             return None
@@ -39460,7 +39547,7 @@ async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
                             else "detached") + ")")
     if base:
         try:
-            anc = await run_proc(["git", "merge-base", "--is-ancestor",
+            anc = await run_proc(["git", *_tree_git_args(tree), "merge-base", "--is-ancestor",
                                   base, "HEAD"], cwd=str(tree))
         except OSError:
             return None
@@ -39616,7 +39703,7 @@ async def _unprefixed_conformer_commits(worktree: str, before_sha: str,
     if not before_sha:
         return []
     r = await run_proc(
-        ["git", "log", "--format=%s", f"{before_sha}..HEAD"],
+        ["git", *_tree_git_args(worktree), "log", "--format=%s", f"{before_sha}..HEAD"],
         cwd=worktree,
     )
     if r.returncode != 0:
@@ -40809,7 +40896,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                 phase_files: set[str] = set()
                 try:
                     _pd = await run_proc(
-                        ["git", "diff", "--name-only", "-z",
+                        ["git", *_tree_git_args(worktree), "diff", "--name-only", "-z",
                          f"{impl_head_sha}..HEAD"], cwd=worktree)
                     if _pd.returncode == 0:
                         phase_files = {f for f in _pd.stdout.split("\0")
@@ -41585,7 +41672,7 @@ async def _worktree_tree_sha(tree: str) -> str | None:
     (`_tree_dirt`)."""
     if await _tree_dirt(tree) != []:
         return None
-    r = await run_proc(["git", "rev-parse", "HEAD^{tree}"], cwd=tree)
+    r = await run_proc(["git", *_tree_git_args(tree), "rev-parse", "HEAD^{tree}"], cwd=tree)
     if r.returncode != 0:
         return None
     return r.stdout.strip() or None
@@ -41598,7 +41685,7 @@ async def _committed_tree_sha(tree: str) -> str | None:
     all a test run's own `__pycache__/` or report file — is part of it.
     None only when git fails. `_worktree_tree_sha` stays the identity of a
     *measurement*, where an untracked file can change what a run collects."""
-    r = await run_proc(["git", "rev-parse", "HEAD^{tree}"], cwd=tree)
+    r = await run_proc(["git", *_tree_git_args(tree), "rev-parse", "HEAD^{tree}"], cwd=tree)
     if r.returncode != 0:
         return None
     return r.stdout.strip() or None
@@ -41630,7 +41717,7 @@ def _tracked_content(tree: str | Path, *, write: bool = False
     `unhashed` rather than failing the snapshot — one such path turned off
     the put-back for the whole tree (review round 10 L2)."""
     try:
-        r = _git_z_output(["git", "-C", str(tree), "diff", "--name-only",
+        r = _git_z_output(["git", *_tree_git_args(tree), "diff", "--name-only",
                            "--no-renames", "--ignore-submodules=dirty", "-z",
                            "HEAD"])
     except OSError:
@@ -41655,7 +41742,7 @@ def _tracked_content(tree: str | Path, *, write: bool = False
             # never put back (review round 11 suspicion 1).
             out[p] = None
         elif p in dirs:
-            sub = subprocess.run(["git", "-C", full, "rev-parse", "HEAD"],
+            sub = subprocess.run(["git", *_tree_git_args(full), "rev-parse", "HEAD"],
                                  capture_output=True, text=True, check=False)
             out[p] = (_GITLINK + sub.stdout.strip()
                       if sub.returncode == 0 and sub.stdout.strip()
@@ -41665,7 +41752,7 @@ def _tracked_content(tree: str | Path, *, write: bool = False
     w = ["-w"] if write else []
     for i in range(0, len(files), 200):
         chunk = files[i:i + 200]
-        h = subprocess.run(["git", "--literal-pathspecs", "-C", str(tree),
+        h = subprocess.run(["git", "--literal-pathspecs", *_tree_git_args(tree),
                             "hash-object", *w, "--no-filters", "--", *chunk],
                            capture_output=True, text=True, check=False)
         hashes = h.stdout.split()
@@ -41673,8 +41760,7 @@ def _tracked_content(tree: str | Path, *, write: bool = False
             out.update(zip(chunk, hashes))
             continue
         for p in chunk:
-            one = subprocess.run(["git", "--literal-pathspecs", "-C",
-                                  str(tree), "hash-object", *w,
+            one = subprocess.run(["git", "--literal-pathspecs", *_tree_git_args(tree), "hash-object", *w,
                                   "--no-filters", "--", p],
                                  capture_output=True, text=True, check=False)
             out[p] = (one.stdout.strip()
@@ -41686,7 +41772,7 @@ def _tracked_content(tree: str | Path, *, write: bool = False
 def _index_gitlinks(tree: str | Path, paths: list[str]) -> set[str]:
     """The `paths` the index records as submodules (mode 160000)."""
     try:
-        r = _git_z_output(["git", "--literal-pathspecs", "-C", str(tree),
+        r = _git_z_output(["git", "--literal-pathspecs", *_tree_git_args(tree),
                            "ls-files", "-s", "-z", "--", *paths])
     except OSError:
         return set(paths)        # unknown: the old, never-touch reading
@@ -41781,14 +41867,14 @@ def _restore_tracked_content(tree: str | Path,
             # (`_tracked_content` lists it as gone); it was a file before.
             _rmtree_owned(dst)
         if p not in before:
-            subprocess.run(["git", "--literal-pathspecs", "-C", str(tree),
+            subprocess.run(["git", "--literal-pathspecs", *_tree_git_args(tree),
                             "checkout", "HEAD", "--", p],
                            capture_output=True, check=False)
         elif before[p] is None:
             with contextlib.suppress(OSError):
                 dst.unlink()
         else:
-            blob = subprocess.run(["git", "-C", str(tree), "cat-file",
+            blob = subprocess.run(["git", *_tree_git_args(tree), "cat-file",
                                    "blob", str(before[p])],
                                   capture_output=True, check=False)
             if blob.returncode == 0:
@@ -42110,26 +42196,6 @@ def _install_intact(tree: str | Path, snap: InstallSnapshot) -> bool:
     return entries is not None and _entries_digest(entries) == digest
 
 
-def _view_admin_dir(repo: Path, wt: Path) -> Path | None:
-    """The run repository's administrative directory for its worktree
-    `wt` — found from the repository's side, never from `wt/.git`, which a
-    command run in the view can rewrite."""
-    want = os.path.realpath(wt)
-    base = Path(repo) / "worktrees"
-    try:
-        dirs = sorted(base.iterdir())
-    except OSError:
-        return None
-    for d in dirs:
-        try:
-            got = (d / "gitdir").read_text().strip()
-        except OSError:
-            continue
-        if os.path.realpath(os.path.dirname(got)) == want:
-            return d
-    return None
-
-
 def _move_view(repo: Path, wt: Path, tip: str,
                snap: InstallSnapshot) -> bool:
     """Move the view `wt` to `tip`, its install kept (DESIGN §8 *A view
@@ -42138,25 +42204,25 @@ def _move_view(repo: Path, wt: Path, tip: str,
     out at `tip`, remove everything untracked but the install's outputs and,
     under them, everything the install did not make. True when the view is
     `tip` exactly, with the install as it made it."""
-    admin = _view_admin_dir(repo, wt)
+    admin = _admin_dir_of(repo, wt)
     if admin is None or not _rmtree_owned(wt / ".git"):
         return False
     (wt / ".git").write_text(f"gitdir: {admin}\n")
-    co = subprocess.run(["git", "-C", str(wt), "checkout", "-q", "--detach",
+    co = subprocess.run(["git", *_tree_git_args(wt), "checkout", "-q", "--detach",
                          "--force", tip], capture_output=True, check=False,
                         timeout=300)
     if co.returncode != 0:
         return False
     keep = [x for o in snap[0] for x in ("-e", "/" + o.lstrip("/"))]
-    cl = subprocess.run(["git", "-C", str(wt), "clean", "-ffdqx", *keep],
+    cl = subprocess.run(["git", *_tree_git_args(wt), "clean", "-ffdqx", *keep],
                         capture_output=True, check=False, timeout=300)
     if cl.returncode != 0 or not _install_intact(wt, snap):
         return False
-    head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+    head = subprocess.run(["git", *_tree_git_args(wt), "rev-parse", "HEAD"],
                           capture_output=True, text=True, check=False)
     # A tracked path under an output (removed above as not the install's)
     # shows here.
-    changed = subprocess.run(["git", "-C", str(wt), "status", "--porcelain",
+    changed = subprocess.run(["git", *_tree_git_args(wt), "status", "--porcelain",
                               "-z", "--untracked-files=no"],
                              capture_output=True, check=False)
     return (head.stdout.strip() == tip and changed.returncode == 0
@@ -44644,11 +44710,11 @@ async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
     except OSError as e:
         out["error"] = f"{type(e).__name__}: {e}"
     out["passed"] = out["rc"] == 0
-    st_ = await run_proc(["git", "status", "--porcelain",
+    st_ = await run_proc(["git", *_tree_git_args(tree), "status", "--porcelain",
                           "--untracked-files=no"], cwd=str(tree))
     if st_.returncode != 0 or st_.stdout.strip():
         out["dirty"] = True
-        await run_proc(["git", "checkout", "--", "."], cwd=str(tree))
+        await run_proc(["git", *_tree_git_args(tree), "checkout", "--", "."], cwd=str(tree))
     return out
 
 
@@ -44852,7 +44918,7 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
     base_sha = ci.get("base_sha") or ""
     touched: list[str] = []
     if base_sha and sha:
-        d = await run_proc(["git", "diff", "--name-only",
+        d = await run_proc(["git", *_tree_git_args(staging), "diff", "--name-only",
                             f"{base_sha}..{sha}"], cwd=str(staging))
         touched = [x for x in d.stdout.splitlines() if x.strip()]
     eps = float(caps.get("ci_coverage_epsilon_pct",
@@ -45764,7 +45830,7 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
             return "bad_regex"
         spec = path.split(":", 1)[1].strip() if ":" in path else ""
         r = subprocess.run(
-            ["git", "-C", str(tree), "grep", "-q", "-E", "-e", raw, "HEAD",
+            ["git", *_tree_git_args(tree), "grep", "-q", "-E", "-e", raw, "HEAD",
              "--", *([spec] if spec else [])],
             capture_output=True, check=False)
         return {0: "absent_found", 1: "absent_ok"}.get(r.returncode,
@@ -45782,7 +45848,7 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
         return "no_file"
     memo = cache if cache is not None else {}
     if rel not in memo:
-        got = subprocess.run(["git", "-C", str(tree), "show", f"HEAD:{rel}"],
+        got = subprocess.run(["git", *_tree_git_args(tree), "show", f"HEAD:{rel}"],
                              capture_output=True, check=False)
         memo[rel] = (None if got.returncode != 0
                      else got.stdout.decode("utf-8", "replace"))
@@ -45984,7 +46050,7 @@ def _head_identity(tree: str | Path | None) -> tuple[str, str]:
     empty strings when there is no tree or git fails."""
     if tree is None:
         return "", ""
-    r = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD",
+    r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse", "HEAD",
                         "HEAD^{tree}"], capture_output=True, text=True,
                        check=False)
     got = r.stdout.split()
@@ -46866,7 +46932,7 @@ def _ts_path_aliases(repo: str | Path, rev: str) -> dict[str, str]:
     gives `"@/" -> "src/"`). Config text, read mechanically; `{}` when there
     is none or it does not parse once comments and trailing commas are
     removed."""
-    got = subprocess.run(["git", "-C", str(repo), "show",
+    got = subprocess.run(["git", *_tree_git_args(repo), "show",
                           f"{rev}:tsconfig.json"],
                          capture_output=True, text=True, check=False)
     if got.returncode != 0:
@@ -47074,7 +47140,7 @@ def _git_recency(repo: str | Path, rev: str,
     order: dict[str, int] = {}
     if not want:
         return order
-    got = subprocess.run(["git", "-C", str(repo), "log", "--format=",
+    got = subprocess.run(["git", *_tree_git_args(repo), "log", "--format=",
                           "--name-only", rev], capture_output=True,
                          text=True, check=False)
     for line in got.stdout.splitlines():
@@ -47238,7 +47304,7 @@ def _prisma_project(repo_root: str | Path) -> dict | None:
     or `@prisma/client` (dependencies or devDependencies). Mechanical: git's
     file list and two config files."""
     root = Path(str(repo_root))
-    ls = _git_z_output(["git", "-C", str(root), "ls-files", "-z", "--",
+    ls = _git_z_output(["git", *_tree_git_args(root), "ls-files", "-z", "--",
                         ":(glob)**/schema.prisma"])
     if ls.returncode != 0:
         return None
@@ -49361,7 +49427,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     # a support file copied with the set — without it a correct fix
     # fails the set elsewhere.
     porcelain = _git_z_output(
-        ["git", "-C", str(wt), "status", "--porcelain=v1", "-z",
+        ["git", *_tree_git_args(wt), "status", "--porcelain=v1", "-z",
          "--untracked-files=no"])
     # Untracked files INCLUDING ignored ones: a helper the repo's
     # .gitignore happens to match is still needed.
@@ -49398,7 +49464,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
         # New files only (code, not the prompt, enforces it): an edited
         # existing test would collide with the target tree's own copy at
         # evaluation and could never be run there.
-        if subprocess.run(["git", "-C", str(wt), "cat-file", "-e",
+        if subprocess.run(["git", *_tree_git_args(wt), "cat-file", "-e",
                            f"{base}:{rel}"], capture_output=True,
                           check=False).returncode == 0:
             continue
@@ -49513,7 +49579,7 @@ def _ref_less_clone(src: Path, wt: Path, rev: str) -> str:
     def _git(*args: str, cwd: Path | None = None
              ) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["git", *(["-C", str(cwd)] if cwd else []), *args],
+            ["git", *(_tree_git_args(cwd) if cwd else []), *args],
             capture_output=True, text=True, check=False)
 
     clone = _git("clone", "--quiet", "--shared", "--no-checkout",
@@ -51095,7 +51161,7 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
                 "abstained": _brief_worker_exc(e)}
     # Only the report copies made above go; never a tracked file.
     _unplace(copied)
-    changed = subprocess.run(["git", "-C", str(wt), "status",
+    changed = subprocess.run(["git", *_tree_git_args(wt), "status",
                               "--porcelain", "--untracked-files=no"],
                              capture_output=True, text=True, check=False)
     made = _untracked_listing(wt)
@@ -52024,7 +52090,7 @@ def _restore_write_bits(tree: str | Path) -> None:
     `tree` and every untracked, not-ignored path in it (DESIGN §6½: a killed
     test's read-only directory). The paths are the orchestrator's own; a
     chmod refused is left to the caller's postcondition."""
-    r = subprocess.run(["git", "-C", str(tree), "ls-tree", "-r", "-d", "-z",
+    r = subprocess.run(["git", *_tree_git_args(tree), "ls-tree", "-r", "-d", "-z",
                         "--name-only", "HEAD"], capture_output=True,
                        check=False)
     dirs = [""] + [os.fsdecode(d) for d in r.stdout.split(b"\0") if d]
@@ -52548,7 +52614,7 @@ def _site_token_guard_line(path: str, text: str) -> bool:
 def _diff_added_lines(cwd: Path, rev_range: list[str]) -> list[tuple[str, str]]:
     """`(file, line)` for every line `git diff --unified=0 <range>` adds."""
     diff = subprocess.run(
-        ["git", "-C", str(cwd), "diff", "--unified=0", *rev_range],
+        ["git", *_tree_git_args(cwd), "diff", "--unified=0", *rev_range],
         capture_output=True, text=True, errors="replace",
         check=False).stdout
     added: list[tuple[str, str]] = []
@@ -53020,7 +53086,7 @@ def _contract_literal_verdict(ext: dict, *, tree_files: list[str],
 def _integration_commit(staging: Path, sid: str) -> str | None:
     """The newest first-parent `leerie: integrate <sid>` merge at HEAD."""
     out = subprocess.run(
-        ["git", "-C", str(staging), "log", "--first-parent",
+        ["git", *_tree_git_args(staging), "log", "--first-parent",
          "--format=%H%x09%s", "HEAD"],
         capture_output=True, text=True, check=False).stdout
     for line in out.splitlines():
@@ -53123,7 +53189,7 @@ def _check_contract_literals(st: "State", leerie_dir: Path) -> list[dict]:
         return []
     try:
         tree = subprocess.run(
-            ["git", "-C", str(staging), "ls-tree", "-r", "--name-only",
+            ["git", *_tree_git_args(staging), "ls-tree", "-r", "--name-only",
              "HEAD"], capture_output=True, text=True,
             check=False).stdout.splitlines()
         added: dict[str, list[tuple[str, str]] | None] = {}
@@ -53138,7 +53204,7 @@ def _check_contract_literals(st: "State", leerie_dir: Path) -> list[dict]:
                 return
             added[sid] = _diff_added_lines(staging, [f"{sha}^1", sha])
             files[sid] = set(subprocess.run(
-                ["git", "-C", str(staging), "diff", "--name-only",
+                ["git", *_tree_git_args(staging), "diff", "--name-only",
                  f"{sha}^1", sha], capture_output=True, text=True,
                 check=False).stdout.split())
 
@@ -53152,7 +53218,7 @@ def _check_contract_literals(st: "State", leerie_dir: Path) -> list[dict]:
             grep: list[tuple[str, str]] = []
             if lit:
                 out = subprocess.run(
-                    ["git", "-C", str(staging), "grep", "-n", "-F", "-e",
+                    ["git", *_tree_git_args(staging), "grep", "-n", "-F", "-e",
                      lit, "HEAD", "--"], capture_output=True, text=True,
                     errors="replace", check=False).stdout
                 for line in out.splitlines():
@@ -53319,7 +53385,7 @@ def _verify_pr_finding(f: dict, staging: Path, items: list[dict]) -> dict:
     path = str(f.get("path") or "").strip()
     if path.startswith("./"):
         path = path[2:]
-    blob = subprocess.run(["git", "-C", str(staging), "show", f"HEAD:{path}"],
+    blob = subprocess.run(["git", *_tree_git_args(staging), "show", f"HEAD:{path}"],
                           capture_output=True, text=True, errors="replace",
                           check=False)
     content = blob.stdout if blob.returncode == 0 else None
@@ -53366,7 +53432,7 @@ def _verify_pr_finding(f: dict, staging: Path, items: list[dict]) -> dict:
 
 
 async def _git_out(cwd: Path, *args: str) -> str:
-    p = await run_proc(["git", *args], cwd=str(cwd))
+    p = await run_proc(["git", *_tree_git_args(cwd), *args], cwd=str(cwd))
     return p.stdout if p.returncode == 0 else ""
 
 
@@ -53612,7 +53678,7 @@ _PATHS_AT: dict[tuple[str, str], set[str]] = {}
 def _git_paths_at(repo: str | Path, sha: str) -> set[str]:
     key = (str(repo), sha)
     if key not in _PATHS_AT:
-        r = _git_z_output(["git", "-C", str(repo), "ls-tree", "-r",
+        r = _git_z_output(["git", *_tree_git_args(repo), "ls-tree", "-r",
                            "--name-only", "-z", sha])
         _PATHS_AT[key] = ({p for p in r.stdout.split("\0") if p}
                           if r.returncode == 0 else set())
@@ -53641,7 +53707,7 @@ def _coupling_referenced_elsewhere(name: str, module: str, repo: str | Path,
                                    sha: str) -> bool:
     """True when a tracked non-harness file other than `module` names the
     identifier `name` at `sha` (`git grep -w -F`)."""
-    r = subprocess.run(["git", "-C", str(repo), "grep", "-l", "-w", "-F",
+    r = subprocess.run(["git", *_tree_git_args(repo), "grep", "-l", "-w", "-F",
                         "-e", name, sha, "--"],
                        capture_output=True, text=True, check=False)
     files = [o.split(":", 1)[1] for o in r.stdout.split() if ":" in o]
@@ -53971,7 +54037,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         rel).parts
     g["new_file"] = bool(
         safe and (lane / rel).is_file()
-        and subprocess.run(["git", "-C", str(lane), "cat-file", "-e",
+        and subprocess.run(["git", *_tree_git_args(lane), "cat-file", "-e",
                             f"{sha}:{rel}"], capture_output=True,
                            check=False).returncode != 0)
     g["not_a_lead"] = bool(
@@ -54575,7 +54641,7 @@ def _redrive_subtask_files(staging: Path, sid: str, spec: dict) -> list[str]:
     files: list[str] = []
     merge = _integration_commit(staging, sid)
     if merge:
-        r = subprocess.run(["git", "-C", str(staging), "diff", "--name-only",
+        r = subprocess.run(["git", *_tree_git_args(staging), "diff", "--name-only",
                             f"{merge}^1", merge], capture_output=True,
                            text=True, check=False)
         if r.returncode == 0:
@@ -55286,7 +55352,7 @@ def _heldout_fingerprints(staging: Path, staged: list[dict],
             pat.write(b"\n".join(sorted(lines_all)) + b"\n")
             pat.flush()
             r = subprocess.run(
-                ["git", "-C", str(staging), "grep", "-l", "-z", "-I", "-F",
+                ["git", *_tree_git_args(staging), "grep", "-l", "-z", "-I", "-F",
                  "-f", pat.name, base_rev, "--"],
                 capture_output=True, check=False)
         names = [n for n in r.stdout.split(b"\0") if n]
@@ -55295,7 +55361,7 @@ def _heldout_fingerprints(staging: Path, staged: list[dict],
                 "spans — every span kept")
         elif names:
             cat = subprocess.run(
-                ["git", "-C", str(staging), "cat-file", "--batch"],
+                ["git", *_tree_git_args(staging), "cat-file", "--batch"],
                 input=b"".join(n + b"\n" for n in names),
                 capture_output=True, check=False)
             out, pos, read = cat.stdout, 0, 0
@@ -55330,7 +55396,7 @@ def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
     # `-m`: a merge commit's own blobs (an evil merge's resolution) are
     # shown against each parent; without it `--raw` lists nothing for a
     # merge, and a copy made only there would ship.
-    r = _git_z_output(["git", "-C", str(staging), "log", "--format=",
+    r = _git_z_output(["git", *_tree_git_args(staging), "log", "--format=",
                        "--raw", "-m", "--no-abbrev", "--no-renames", "-z",
                        f"{pre_sha}..{post_sha}"])
     if r.returncode != 0:
@@ -55353,7 +55419,7 @@ def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
         if new and set(new) != {"0"} and prints:
             blobs.setdefault(new, set()).add(path)
     if blobs:
-        cat = subprocess.run(["git", "-C", str(staging), "cat-file",
+        cat = subprocess.run(["git", *_tree_git_args(staging), "cat-file",
                               "--batch"],
                              input=b"".join(b.encode() + b"\n"
                                             for b in blobs),
@@ -56126,12 +56192,12 @@ _TG_SKIP_RE = re.compile(
 
 
 def _redrive_git(repo: str | Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), *args],
+    return subprocess.run(["git", *_tree_git_args(repo), *args],
                           capture_output=True, text=True, check=False).stdout
 
 
 def _redrive_exists_at(repo: str | Path, rev: str, path: str) -> bool:
-    return subprocess.run(["git", "-C", str(repo), "cat-file", "-e",
+    return subprocess.run(["git", *_tree_git_args(repo), "cat-file", "-e",
                            f"{rev}:{path}"], capture_output=True,
                           check=False).returncode == 0
 
@@ -56430,7 +56496,7 @@ def _redrive_ast_hits(staging: Path, base: str, head: str, *,
     for f in files:
         with tempfile.TemporaryDirectory() as td:
             bf = ""
-            b = subprocess.run(["git", "-C", str(staging), "show",
+            b = subprocess.run(["git", *_tree_git_args(staging), "show",
                                 f"{base}:{f}"], capture_output=True,
                                text=True, check=False)
             if b.returncode == 0:
@@ -58429,7 +58495,7 @@ async def _changed_line_numbers(tree: Path, base_ref: str,
                                 path: str) -> list[int]:
     """New-side line numbers `base_ref..HEAD` changed in `path`, from the
     `-U0` hunk headers."""
-    r = await run_proc(["git", "--literal-pathspecs", "diff", "-U0",
+    r = await run_proc(["git", *_tree_git_args(tree), "--literal-pathspecs", "diff", "-U0",
                         f"{base_ref}..HEAD", "--", path], cwd=str(tree))
     out: set[int] = set()
     for line in r.stdout.splitlines() if r.returncode == 0 else []:
@@ -58946,7 +59012,7 @@ async def _redrive_uncovered_subtasks(
                 results[s] = r
                 tree = _subtask_worktree_path(leerie_dir, s)
                 if pre[s]:
-                    diff = await run_proc(["git", "diff", "--name-only",
+                    diff = await run_proc(["git", *_tree_git_args(tree), "diff", "--name-only",
                                            f"{pre[s]}..HEAD"], cwd=str(tree))
                     redrive_changed.setdefault(s, set()).update(
                         diff.stdout.split())
@@ -59070,7 +59136,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
             + "; ".join(f"`{shlex.join(a)}` runs `{f}`" for a, f in refused))
         log(f"  {sid}: settle by execution — none: {record['why']}")
         return _done()
-    pre = await run_proc(["git", "status", "--porcelain",
+    pre = await run_proc(["git", *_tree_git_args(worktree), "status", "--porcelain",
                           "--untracked-files=no"], cwd=worktree)
     if pre.returncode != 0 or pre.stdout.strip():
         # Never run over uncommitted work: the clean-tree check below could
@@ -59185,7 +59251,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
             verdict = "none"
             record["why"] = f"a verify command was not run — {e}"
         if verdict == "pass":
-            post = await run_proc(["git", "status", "--porcelain",
+            post = await run_proc(["git", *_tree_git_args(worktree), "status", "--porcelain",
                                    "--untracked-files=no"], cwd=worktree)
             changed = (post.stdout.splitlines() if post.returncode == 0
                        else [])
@@ -59285,7 +59351,7 @@ async def _sibling_deliveries(worktree: str, sid: str,
     `integrate.sh` wrote and `git diff --name-only` output."""
     if not planned or not Path(worktree).exists():
         return []
-    log_p = await run_proc(["git", "log", "--first-parent", "--merges",
+    log_p = await run_proc(["git", *_tree_git_args(worktree), "log", "--first-parent", "--merges",
                             "--format=%H%x09%P%x09%s", "HEAD"], cwd=worktree)
     if log_p.returncode != 0:
         return []
@@ -59299,7 +59365,7 @@ async def _sibling_deliveries(worktree: str, sid: str,
         first_parent = parents.split()[0] if parents.split() else ""
         if not other or other == sid or not first_parent:
             continue
-        diff = await run_proc(["git", "diff", "--name-only", first_parent,
+        diff = await run_proc(["git", *_tree_git_args(worktree), "diff", "--name-only", first_parent,
                                sha], cwd=worktree)
         if diff.returncode != 0:
             continue
@@ -59884,7 +59950,7 @@ async def _repo_mentions(worktree: str, ref: str, kind: str,
     """Whether any of `keys` occurs as a whole token of `kind` in the tree at
     `ref` (`git grep -F` finds the candidate lines, `_claim_key_in` decides
     each), None when git cannot say."""
-    cmd = ["git", "-C", worktree, "grep", "-I", "-h", "-F"]
+    cmd = ["git", *_tree_git_args(worktree), "grep", "-I", "-h", "-F"]
     if kind == "network":
         cmd.append("-i")
     for k in keys:
@@ -59977,7 +60043,7 @@ async def _env_template_local_service(worktree: str, ref: str,
     not external*): a local host (`_network_local_host`), a service the
     repository's compose file defines, or a sqlite Prisma datasource."""
     try:
-        ls = await run_proc(["git", "-C", worktree, "ls-tree", "-r",
+        ls = await run_proc(["git", *_tree_git_args(worktree), "ls-tree", "-r",
                              "--name-only", ref], timeout=60)
     except (subprocess.TimeoutExpired, OSError):
         return ""
@@ -59990,7 +60056,7 @@ async def _env_template_local_service(worktree: str, ref: str,
     texts: dict[str, str] = {}
     for p in paths:
         try:
-            r = await run_proc(["git", "-C", worktree, "show",
+            r = await run_proc(["git", *_tree_git_args(worktree), "show",
                                 f"{ref}:{p}"], timeout=60)
         except (subprocess.TimeoutExpired, OSError):
             continue
@@ -60729,7 +60795,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             run_branch = await _branch_commit_for_tree_async(
                 worktree, _compute_run_branch(st.run_id))
             diff_proc = await run_proc(
-                ["git", "diff", "--name-only", run_branch],
+                ["git", *_tree_git_args(worktree), "diff", "--name-only", run_branch],
                 cwd=worktree)
             actual_files = set(diff_proc.stdout.strip().splitlines()
                                ) if diff_proc.returncode == 0 else set()
@@ -61234,7 +61300,7 @@ async def _rescue_integrator_work(staging: Path, sid: str,
     # Plain `subprocess.run`, outside the `run_proc` sequence the rescue's
     # own steps are pinned by, and failure-tolerant like them.
     try:
-        gd = subprocess.run(["git", "rev-parse", "--absolute-git-dir"],
+        gd = subprocess.run(["git", *_tree_git_args(staging), "rev-parse", "--absolute-git-dir"],
                             cwd=str(staging), capture_output=True, text=True,
                             check=False, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
@@ -61244,15 +61310,15 @@ async def _rescue_integrator_work(staging: Path, sid: str,
     rescue_index = Path(gd.stdout.strip()) / f"leerie-rescue-index-{sid}"
     env = {**os.environ, "GIT_INDEX_FILE": str(rescue_index)}
     try:
-        seed = await run_proc(["git", "read-tree", "HEAD"],
+        seed = await run_proc(["git", *_tree_git_args(staging), "read-tree", "HEAD"],
                               cwd=str(staging), env=env)
         if seed.returncode != 0:
             return None
-        staged = await run_proc(["git", "add", "-A"],
+        staged = await run_proc(["git", *_tree_git_args(staging), "add", "-A"],
                                 cwd=str(staging), env=env)
         if staged.returncode != 0:
             return None
-        tree = await run_proc(["git", "write-tree"], cwd=str(staging), env=env)
+        tree = await run_proc(["git", *_tree_git_args(staging), "write-tree"], cwd=str(staging), env=env)
         if tree.returncode != 0 or not tree.stdout.strip():
             return None
         tree_sha = tree.stdout.strip()
@@ -61260,13 +61326,13 @@ async def _rescue_integrator_work(staging: Path, sid: str,
         # integrator crashed before changing anything. Returning a ref here
         # would be a lie the caller repeats to the operator ("resolution
         # rescued to ...") while pointing at an empty diff.
-        head_tree = await run_proc(["git", "rev-parse", "HEAD^{tree}"],
+        head_tree = await run_proc(["git", *_tree_git_args(staging), "rev-parse", "HEAD^{tree}"],
                                    cwd=str(staging))
         if (head_tree.returncode == 0
                 and head_tree.stdout.strip() == tree_sha):
             return None
         commit = await run_proc(
-            ["git", "commit-tree", tree_sha, "-p", "HEAD",
+            ["git", *_tree_git_args(staging), "commit-tree", tree_sha, "-p", "HEAD",
              "-m", f"leerie: rescued {sid} integrator resolution"],
             cwd=str(staging), env=env)
         if commit.returncode != 0 or not commit.stdout.strip():
@@ -61319,7 +61385,7 @@ _SYNTHETIC_GIT_ENV = {"GIT_AUTHOR_NAME": "leerie",
 async def _git_text(cwd: str | Path, *args: str) -> str | None:
     """stdout of `git <args>` in `cwd`, or None when it exits non-zero."""
     try:
-        r = await run_proc(["git", *args], cwd=str(cwd))
+        r = await run_proc(["git", *_tree_git_args(cwd), *args], cwd=str(cwd))
     except OSError:
         return None
     return r.stdout if r.returncode == 0 else None
@@ -61473,7 +61539,7 @@ async def _overlay_other_side(tree: Path, other: str, base: str,
         if code.startswith("D"):
             target.unlink(missing_ok=True)
             continue
-        content = await run_proc(["git", "show", f"{other}:{path}"],
+        content = await run_proc(["git", *_tree_git_args(tree), "show", f"{other}:{path}"],
                                  cwd=str(tree))
         if content.returncode == 0:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -61737,7 +61803,7 @@ async def _settled_head_integrated(staging: Path, st: "State",
     head = (st.data.get("settled_heads") or {}).get(sid)
     if not head:
         return True
-    r = await run_proc(["git", "merge-base", "--is-ancestor", head, "HEAD"],
+    r = await run_proc(["git", *_tree_git_args(staging), "merge-base", "--is-ancestor", head, "HEAD"],
                        cwd=str(staging))
     return r.returncode == 0
 
@@ -61885,7 +61951,7 @@ async def _integration_judge_verdict(
     crashed every round."""
     repo_root = Path(os.getcwd())
     sys_prompt_judge = _load_prompt("integration_judge")
-    merge_diff = (await run_proc(["git", "show", "--format=%B", rev],
+    merge_diff = (await run_proc(["git", *_tree_git_args(staging), "show", "--format=%B", rev],
                                  cwd=str(staging))).stdout
     intent = incoming.get("intent", "")
 
@@ -61952,7 +62018,7 @@ async def _synthetic_merge(staging: Path, head: str, p1: str, p2: str,
     """A merge object of `head`'s tree over both parents, on no ref, so the
     repaired result is judged as one whole merge."""
     msg = await _git_text(staging, "log", "-1", "--format=%B", message_of)
-    r = await run_proc(["git", "commit-tree", f"{head}^{{tree}}", "-p", p1,
+    r = await run_proc(["git", *_tree_git_args(staging), "commit-tree", f"{head}^{{tree}}", "-p", p1,
                         "-p", p2, "-m", (msg or "").strip() or "merge"],
                        cwd=str(staging),
                        env={**os.environ, **_SYNTHETIC_GIT_ENV})
@@ -62124,7 +62190,7 @@ async def _run_integration_judge_gate(
         # read as a back-out (an amended merge looks the same, review round
         # 2 M1). Restored, the tree matches the record and is judged again.
         rec_merge = str(rec["merge_commit_sha"])
-        anc = await run_proc(["git", "merge-base", "--is-ancestor",
+        anc = await run_proc(["git", *_tree_git_args(staging), "merge-base", "--is-ancestor",
                               rec_merge, "HEAD"], cwd=str(staging))
         if anc.returncode == 1:
             log(f"  integration gate for {sid}: the recorded merge "
@@ -62359,7 +62425,7 @@ async def _integration_repair_round(
     if unclean:
         entry["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
-    descends = (await run_proc(["git", "merge-base", "--is-ancestor",
+    descends = (await run_proc(["git", *_tree_git_args(staging), "merge-base", "--is-ancestor",
                                 merge_sha, head], cwd=str(staging))
                 ).returncode == 0
     clean = not unclean
@@ -62544,14 +62610,14 @@ async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
         merged[f] = render(value)
     for f, text in merged.items():
         (staging / f).write_text(text)
-    add = await run_proc(["git", "--literal-pathspecs", "add", "--", *files],
+    add = await run_proc(["git", *_tree_git_args(staging), "--literal-pathspecs", "add", "--", *files],
                          cwd=str(staging))
-    commit = (await run_proc(["git", "commit", "--no-edit"],
+    commit = (await run_proc(["git", *_tree_git_args(staging), "commit", "--no-edit"],
                              cwd=str(staging))
               if add.returncode == 0 else add)
     if commit.returncode != 0 or await check_merge_committed(staging):
         # Put the conflict back exactly as git left it for the integrator.
-        await run_proc(["git", "--literal-pathspecs", "checkout", "-m", "--",
+        await run_proc(["git", *_tree_git_args(staging), "--literal-pathspecs", "checkout", "-m", "--",
                         *files], cwd=str(staging))
         log(f"  {sid}: JSON key merge could not commit "
             f"({commit.stderr.strip()[:200]}); leaving it to the integrator")
@@ -62568,7 +62634,7 @@ async def _set_integration_subject(staging: Path, sid: str,
     message: tree and parents are kept, and the integrator's own message
     becomes the body. True when HEAD carries the subject afterwards."""
     want = f"{_INTEGRATE_SUBJECT_PREFIX}{sid}"
-    info = await run_proc(["git", "log", "-1", "--format=%P%x00%s%x00%B",
+    info = await run_proc(["git", *_tree_git_args(staging), "log", "-1", "--format=%P%x00%s%x00%B",
                            "HEAD"], cwd=str(staging))
     if info.returncode != 0:
         return False
@@ -62579,7 +62645,7 @@ async def _set_integration_subject(staging: Path, sid: str,
         log(f"  {sid}: HEAD is not this integration's merge; its subject "
             "is left as it is")
         return False
-    r = await run_proc(["git", "commit", "--amend",
+    r = await run_proc(["git", *_tree_git_args(staging), "commit", "--amend",
                         "--no-verify", "--allow-empty", "-m", want, "-m",
                         body.strip() or subject], cwd=str(staging))
     if r.returncode != 0:

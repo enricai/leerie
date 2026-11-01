@@ -173,6 +173,87 @@ leerie_git_hooks_off() {
   export LEERIE_GIT_HOOKS_OFF="$n"
 }
 
+# leerie_tree_location <worktree>
+#
+# Where a tree in a run's `worktrees/` keeps its repository (DESIGN §6
+# *Leerie's git never takes a tree's repository from the tree*), from
+# leerie's own layout, never from the tree's `.git` file, which confined code
+# may rewrite: prints the common directory and the git directory, one per
+# line, and returns 0. A worktree of its tree repository
+# (`<run>/tree-repos/<name>`) or else of the run repository — its git
+# directory the administrative directory that names it, whose `commondir`
+# names that repository — or a ref-less clone, its own `.git` directory.
+# Returns 2 for a tree outside every run, 1 for one inside a run that matches
+# none of these. `_run_tree_location` in Python.
+leerie_tree_location() {
+  local t run_dir tr common d g gp admin="" named
+  t="$(cd "$1" 2>/dev/null && pwd -P)" || return 2
+  [ "$(basename "$(dirname "$t")")" = worktrees ] || return 2
+  run_dir="$(dirname "$(dirname "$t")")"
+  tr="$run_dir/tree-repos/$(basename "$t")"
+  if [ -f "$tr/HEAD" ] && [ -d "$tr/objects" ]; then
+    common="$tr"
+  elif [ -f "$run_dir/repo/HEAD" ] && [ -d "$run_dir/repo/objects" ]; then
+    common="$run_dir/repo"
+  else
+    return 2
+  fi
+  for d in "$common"/worktrees/*; do
+    [ -f "$d/gitdir" ] || continue
+    g="$(cat -- "$d/gitdir")"
+    gp="$(cd "$(dirname -- "$g")" 2>/dev/null && pwd -P)" || continue
+    if [ "$gp" = "$t" ]; then admin="$d"; break; fi
+  done
+  if [ -z "$admin" ]; then
+    # No record names it: a ref-less clone of the run repository, its own
+    # `.git` directory. A worktree stays one whatever its `.git` now is.
+    if [ "$common" = "$run_dir/repo" ] && [ -d "$t/.git" ] && [ ! -L "$t/.git" ]; then
+      printf '%s\n%s\n' "$t/.git" "$t/.git"
+      return 0
+    fi
+    return 1
+  fi
+  named="$(cat -- "$admin/commondir" 2>/dev/null)" || return 1
+  [ "$(cd "$admin/$named" 2>/dev/null && pwd -P)" = "$(cd "$common" && pwd -P)" ] || return 1
+  printf '%s\n%s\n' "$common" "$admin"
+}
+
+# leerie_tree_common <worktree>
+#
+# The common directory of <worktree>: from leerie's layout for a run's tree
+# (`leerie_tree_location`), from git for a tree outside every run; nothing,
+# status 1, for a run tree that cannot be located. `_common_dir_of` in
+# Python.
+leerie_tree_common() {
+  local loc rc
+  loc="$(leerie_tree_location "$1")" && rc=0 || rc=$?
+  case "$rc" in
+    0) printf '%s\n' "$loc" | sed -n 1p ;;
+    2) leerie_tgit "$1" rev-parse --path-format=absolute --git-common-dir ;;
+    *) return 1 ;;
+  esac
+}
+
+# leerie_tgit <worktree> <git args...>
+#
+# THE way the scripts run git on a tree: its repository named explicitly
+# (`--git-dir <git dir> --work-tree <tree>`, `leerie_tree_location`) for a
+# run's tree, so a rewritten `.git` file is never followed; leerie's pins
+# always. A run tree that cannot be located is refused (status 128, as git
+# itself fails). `_tree_git_args` in Python.
+leerie_tgit() {
+  local wt="$1" loc rc
+  shift
+  loc="$(leerie_tree_location "$wt")" && rc=0 || rc=$?
+  case "$rc" in
+    0) git -C "$wt" --git-dir="$(printf '%s\n' "$loc" | sed -n 2p)" \
+         --work-tree="$wt" -c core.fsmonitor=false -c core.untrackedCache=false "$@" ;;
+    2) git -C "$wt" -c core.fsmonitor=false -c core.untrackedCache=false "$@" ;;
+    *) printf 'leerie: the repository of %s cannot be located from leerie'"'"'s layout\n' "$wt" >&2
+       return 128 ;;
+  esac
+}
+
 # leerie_run_settings <worktree>
 #
 # Prints `<run-dir>/repo-settings` — leerie's copy of the settings git reads
@@ -182,7 +263,7 @@ leerie_git_hooks_off() {
 # Python.
 leerie_run_settings() {
   local common run_dir
-  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  common="$(leerie_tree_location "$1" | sed -n 1p)"
   [ -n "$common" ] || return 0
   if [ "${common##*/}" = repo ]; then
     run_dir="${common%/*}"
@@ -213,12 +294,12 @@ leerie_vgit() {
   s="$(leerie_run_settings "$wt")"
   if [ -n "$s" ]; then
     GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL="$s/host.config" \
-      GIT_ATTR_NOSYSTEM=1 git -C "$wt" \
+      GIT_ATTR_NOSYSTEM=1 leerie_tgit "$wt" \
       -c core.attributesFile="$s/host.attributes" \
       -c core.excludesFile="$s/host.exclude" \
       -c core.fsmonitor=false -c core.untrackedCache=false "$@"
   else
-    git -C "$wt" -c core.fsmonitor=false -c core.untrackedCache=false "$@"
+    leerie_tgit "$wt" "$@"
   fi
 }
 
@@ -247,8 +328,9 @@ leerie_settings_dirt() {
   s="$(leerie_run_settings "$1")"
   [ -n "$s" ] || return 0
   # The tree's own repository: the run repository, or its tree repository
-  # (`_run_settings_of`'s first element).
-  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  # (`_run_settings_of`'s first element), from leerie's layout.
+  common="$(leerie_tree_location "$1" | sed -n 1p)"
+  [ -n "$common" ] || return 0
   if [ ! -f "$s/config" ]; then
     printf "git settings unknown: leerie's copy %s of the run repository's settings is missing\n" "$s"
     return 0
@@ -269,7 +351,8 @@ leerie_restore_settings() {
   local s common
   s="$(leerie_run_settings "$1")"
   [ -n "$s" ] && [ -f "$s/config" ] || return 0
-  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  common="$(leerie_tree_location "$1" | sed -n 1p)"
+  [ -n "$common" ] || return 1
   if ! diff -q -- "$s/config" "$common/config" >/dev/null 2>&1; then
     cp -- "$s/config" "$common/.config.leerie-$$" \
       && mv -f -- "$common/.config.leerie-$$" "$common/config" || return 1
@@ -316,7 +399,7 @@ leerie_fresh_only() {
 # lowercase tag is assume-unchanged, `S`/`s` skip-worktree (git's fixed
 # one-letter tags) — as NUL-separated paths. `_flagged_entries` in Python.
 leerie_flagged_paths() {
-  git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || return 1
+  leerie_tgit "$1" rev-parse --git-dir >/dev/null 2>&1 || return 1
   leerie_vgit "$1" ls-files -v -z | while IFS= read -r -d '' rec; do
     case "${rec:0:2}" in
       [abcdefghijklmnopqrstuvwxyzS]" ") printf '%s\0' "${rec:2}" ;;
@@ -384,7 +467,7 @@ leerie_reset_worktree() {
   # way; recursion itself never follows one (GNU chmod -R).
   (
     cd "$wt" || exit 0
-    git ls-tree -r -d -z --name-only HEAD 2>/dev/null \
+    leerie_tgit . ls-tree -r -d -z --name-only HEAD 2>/dev/null \
       | while IFS= read -r -d '' p; do
           [ -L "$p" ] || chmod u+wx -- "$p" 2>/dev/null || true
         done
@@ -406,7 +489,7 @@ leerie_reset_worktree() {
   real="$(leerie_vgit "$wt" status --porcelain --untracked-files=no)" || return 1
   fresh="$(leerie_fresh_status "$wt")" || return 1
   if [ -n "$(leerie_fresh_only "$real" "$fresh")" ]; then
-    idx="$(git -C "$wt" rev-parse --path-format=absolute --git-path index)" || return 1
+    idx="$(leerie_tgit "$wt" rev-parse --path-format=absolute --git-path index)" || return 1
     rm -f -- "$idx"
   fi
   if [ -n "$branch" ]; then
@@ -421,7 +504,7 @@ leerie_reset_worktree() {
       "$wt" "$dirt" >&2
     return 1
   fi
-  if [ -n "$branch" ] && [ "$(git -C "$wt" symbolic-ref -q HEAD)" != "refs/heads/$branch" ]; then
+  if [ -n "$branch" ] && [ "$(leerie_tgit "$wt" symbolic-ref -q HEAD)" != "refs/heads/$branch" ]; then
     printf 'leerie_reset_worktree: %s is not on %s after the reset\n' \
       "$wt" "$branch" >&2
     return 1
@@ -517,8 +600,13 @@ leerie_tree() {
   local run_repo settings fmt
   run_repo="$(leerie_repo_git rev-parse --path-format=absolute --git-common-dir)" || return 1
   if [ -f "$tr/HEAD" ] && [ -d "$wt" ] \
-      && [ "$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" = "$tr" ]; then
+      && [ "$(leerie_tree_location "$wt" | sed -n 1p)" = "$tr" ]; then
     leerie_take_tree_branch "$tr" "$branch"
+    # Its `.git` names its administrative directory again, whatever was
+    # left there: the worker's own git finds its repository through it.
+    local admin
+    admin="$(leerie_tree_location "$wt" | sed -n 2p)"
+    rm -rf -- "$wt/.git" && printf 'gitdir: %s\n' "$admin" > "$wt/.git"
     return
   fi
   if grep -qxF "worktree $wt" <<<"$(leerie_repo_git worktree list --porcelain)"; then

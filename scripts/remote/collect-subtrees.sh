@@ -247,7 +247,8 @@ backout_failed=false
 # back-out, reaches the run repository only when leerie takes the run branch.
 _take_staging() {
   local tr
-  tr="$(git -C "$staging" rev-parse --path-format=absolute --git-common-dir)" || return 1
+  tr="$(leerie_tree_common "$staging" || true)"
+  [ -n "$tr" ] || return 1
   [ "$tr" != "$(leerie_repo_git rev-parse --path-format=absolute --git-common-dir)" ] || return 0
   leerie_take_tree_branch "$tr" "$run_branch"
 }
@@ -273,7 +274,7 @@ for sid in "${integrate_order[@]}"; do
     _skip "$sid"
     continue
   fi
-  pre=$(cd "$staging" && git rev-parse HEAD)
+  pre=$(leerie_tgit "$staging" rev-parse HEAD)
   rc=0
   bash "$SCRIPTS/integrate.sh" "$sid" "$run_id" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -363,11 +364,11 @@ except Exception:
       # left its tree clean (I1, DESIGN §8 *A worker leaves its tree
       # clean* — no re-ask here: there is no session to resume).
       merge_head_rc=0
-      (cd "$staging" && git rev-parse --verify --quiet MERGE_HEAD 2>/dev/null) || merge_head_rc=$?
+      leerie_tgit "$staging" rev-parse --verify --quiet MERGE_HEAD >/dev/null 2>&1 || merge_head_rc=$?
       staged_files=""
-      staged_files=$(cd "$staging" && git diff --cached --name-only 2>/dev/null || true)
+      staged_files=$(leerie_tgit "$staging" diff --cached --name-only 2>/dev/null || true)
       dirt=$(leerie_tree_dirt "$staging" 2>/dev/null || echo "status failed")
-      now=$(cd "$staging" && git rev-parse HEAD)
+      now=$(leerie_tgit "$staging" rev-parse HEAD)
       if [ "$merge_head_rc" -ne 0 ] && [ -z "$staged_files" ] \
           && [ -z "$dirt" ] && [ "$now" != "$pre" ] && _take_staging >&2; then
         resolved_count=$((resolved_count + 1))

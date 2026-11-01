@@ -35,9 +35,12 @@ fi
 # and takes the run branch back after it. A staging of the run repository
 # itself (a run made before tree repositories) has both already.
 RUN_REPO="$(leerie_repo_git rev-parse --path-format=absolute --git-common-dir)"
-STAGING_REPO="$(git -C "$STAGING" rev-parse --path-format=absolute --git-common-dir)"
+# Named from leerie's layout, never from staging's `.git` file (DESIGN §6
+# *Leerie's git never takes a tree's repository from the tree*).
+STAGING_REPO="$(leerie_tree_common "$STAGING" || true)"
+[ -n "$STAGING_REPO" ] || { echo "integrate: cannot locate staging's repository" >&2; exit 2; }
 if [ "$STAGING_REPO" != "$RUN_REPO" ]; then
-  git -C "$STAGING" fetch --quiet --no-tags --no-write-fetch-head \
+  leerie_tgit "$STAGING" fetch --quiet --no-tags --no-write-fetch-head \
     --no-auto-maintenance "$RUN_REPO" "+refs/heads/${BRANCH}:refs/heads/${BRANCH}"
 fi
 _take_staging() {
@@ -46,7 +49,7 @@ _take_staging() {
   fi
 }
 
-if git -C "$STAGING" merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
+if leerie_tgit "$STAGING" merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
   _take_staging
   echo "integrated: ${ID}"
   exit 0
