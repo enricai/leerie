@@ -666,7 +666,7 @@ def test_a_vote_file_seen_failing_only_by_a_timeout_is_unsettled_not_failing(
     assert res["unmeasured"] is True and res["passed"] is False
     assert res["budget_short_unsettled_files"] == [REL]
     assert leerie._acceptance_any_fails([res]) is False
-    assert _outcome(leerie, st, [s_], res) == "done"
+    assert _outcome(leerie, st, [s_], res) == "unconverged"
 
 
 def test_a_timeout_only_vote_file_is_named_in_the_pr(leerie, tmp_path,
@@ -698,7 +698,7 @@ def test_a_timeout_only_vote_file_is_named_in_the_pr(leerie, tmp_path,
         wt, [s_], "t"))
     assert res["unmeasured"] is True
     assert res["unmeasured_files"] == {REL: "timed_out"}
-    assert _outcome(leerie, st, [s_], res) == "done"
+    assert _outcome(leerie, st, [s_], res) == "unconverged"
     body = leerie._format_pr_end_state_section(st.data)
     nhv = body.split("## Needs human verification", 1)[1]
     line = next(x for x in nhv.splitlines() if "held-out set 1" in x)

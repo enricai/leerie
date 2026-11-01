@@ -93,14 +93,24 @@ def test_unfinished_work_is_unconverged_before_the_empty_branch_check(
 @pytest.mark.parametrize("extra", [
     {"delivery_gate": {"unmet_before": [{"item": "i"}], "unmet_after": [],
                        "judged_after": {"tree": "SHIP"}}},
-    {"acceptance": {"gate": {"final": [{"index": 0, "passed": False,
-                                        "unmeasured": True}]}}},
-    {"test_id_diff": {"new": [], "resource_affected": ["t :: flaky"]}},
+    {"test_id_diff": {"new": [], "resource_affected": ["t :: flaky"],
+                      "tree_sha": "SHIP"}},
     {"subtask_status": {"a": "accepted_external"}},
 ])
-def test_resolved_or_unmeasured_signals_do_not_unconverge(leerie, st, extra):
+def test_resolved_signals_do_not_unconverge(leerie, st, extra):
     st.data.update(_ship(st, extra))
     assert leerie._decide_outcome(st, any_commits=True) == "done"
+
+
+def test_an_unmeasured_held_out_set_is_not_done(leerie, st):
+    """No verdict is not a pass (DESIGN §6 *The run outcome is decided
+    once*, "`done` rests on measurements that ran"; it was `done` before
+    review round 19)."""
+    st.data.update(_ship(st, {"acceptance": {"gate": {"final": [
+        {"index": 0, "passed": False, "unmeasured": True}]}}}))
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert any("gave no verdict on the tree that ships" in r
+               for r in st.data["outcome_reasons"])
 
 
 def test_decide_outcome_is_the_only_writer_of_outcome():

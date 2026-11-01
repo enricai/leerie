@@ -874,6 +874,10 @@ STATE_FIELDS = (
     # The failing-test-ID diff (DESIGN §9 *Which failures are new*): base and
     # final failing IDs, and the latest B* verdict on their difference.
     "baseline_failing_ids", "final_failing_ids", "test_id_diff",
+    # Why the tree that ships has no failing-test-ID diff (DESIGN §6 *The
+    # run outcome is decided once*, "`done` rests on measurements that
+    # ran"); None once it has one.
+    "shipping_tests_gap",
     # Measured per-file test durations, from every structured report read,
     # that size intermittent discovery to its budget (DESIGN §9 *An
     # intermittent failure the run introduced is evidence*).
@@ -36758,6 +36762,50 @@ def _diff_base(st: "State") -> str | None:
     return st.data.get("base_sha") or None
 
 
+def _unmeasured_on_shipping_tree(st: State) -> list[str]:
+    """What `done` rests on that was not measured on the tree that ships
+    (DESIGN §6 *The run outcome is decided once*, "`done` rests on
+    measurements that ran"), one reason each, from what the measurements
+    recorded: the tests, when the repository has a test command, unless
+    the failing-test-ID diff is of that tree (and every failing test it
+    names was rerun on the base); the held-out sets the final tree left
+    unmeasured (`_acceptance_unmeasured_lines`). A test command the task
+    forbids is the task's own constraint, not a gap here."""
+    out: list[str] = []
+    data = st.data
+    diff = data.get("test_id_diff")
+    diff = diff if isinstance(diff, dict) else {}
+    try:
+        cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"])
+               or "").strip()
+    except Exception:
+        cmd = ""
+    if cmd or diff:
+        shipping = _shipping_tree(st)
+        gap = data.get("shipping_tests_gap")
+        gap = gap if isinstance(gap, dict) else {}
+        if shipping and diff.get("tree_sha") == shipping:
+            nv = [str(x) for x in diff.get("no_verdict") or []]
+            if nv:
+                out.append(f"{len(nv)} test(s) failing on the tree that ships "
+                           "could not be rerun on the base, so whether the "
+                           "run made them fail is unknown")
+        elif not (gap.get("tree_sha") == shipping and str(
+                gap.get("skip_kind") or "").startswith("forbidden_")):
+            why = (gap.get("why") if shipping and gap.get("tree_sha")
+                   == shipping else None)
+            out.append("the tests were not measured on the tree that ships"
+                       + (f" ({why})" if why else
+                          " (no failing-test-ID diff was taken of it)"
+                          if shipping else
+                          " (the tree that ships could not be read)"))
+    sets = _acceptance_unmeasured_lines(data)
+    if sets:
+        out.append(f"{len(sets)} held-out acceptance check(s) gave no "
+                   "verdict on the tree that ships")
+    return out
+
+
 def _decide_outcome(st: State, *, any_commits: bool) -> str:
     """The run's single verdict — `done`, `no_work` or `unconverged` —
     written to `st.data["outcome"]` (and run.json) here and nowhere else
@@ -36848,6 +36896,10 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
             reasons.append(_unclean_reason(
                 f"the {rec.get('worker')} at {rec.get('where')}",
                 [str(x) for x in rec.get("lines") or []]))
+    # `done` only on what was measured on the tree that ships; a run with
+    # no commits has nothing that ships to measure.
+    if any_commits:
+        reasons += _unmeasured_on_shipping_tree(st)
     if reasons:
         outcome = "unconverged"
     elif not any_commits:
@@ -57074,6 +57126,15 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
                        .get("summary") or "").strip()
             why = ("the test command did not produce a measurement"
                    + (f" ({summ[:200]})" if summ else ""))
+    # Why the tree that ships has no diff, for the outcome (DESIGN §6 *The
+    # run outcome is decided once*, "`done` rests on measurements that
+    # ran"); cleared once it has one.
+    skip = str(((post or {}).get("tests") or {}).get("skip_kind") or "")
+    st.data["shipping_tests_gap"] = (
+        None if got is not None else
+        {"tree_sha": tree_sha, "why": why or "no measurement",
+         "skip_kind": skip})
+    st.save()
     if got is None:
         stale = diff is not None and bool(tree_sha)
         log(f"  {log_prefix}: the failing-test-ID diff could not be measured "
@@ -57083,7 +57144,6 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
         if stale:
             st.data["test_id_diff"] = {**diff, "stale_for_tree": tree_sha}
             st.save()
-        skip = str(((post or {}).get("tests") or {}).get("skip_kind") or "")
         if skip.startswith("forbidden_") and any(
                 isinstance(e, dict) and e.get("source") == REGRESSION_GAP_SOURCE
                 for e in st.data.get("needs_human_verification") or []):

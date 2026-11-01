@@ -721,9 +721,12 @@ def test_the_gate_audits_a_set_still_failing_after_repair(
     assert all(r["passed"] for r in gate["final"]) and "residual" not in gate
 
 
-def test_a_broken_set_is_not_unfinished_work(leerie, tmp_path):
+def test_a_broken_set_is_not_unfinished_work(leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
+    # The tests were measured on the tree that ships: only the sets decide.
+    monkeypatch.setattr(leerie, "_shipping_tree", lambda _st: "f" * 40)
+    st.data["test_id_diff"] = {"new": [], "tree_sha": "f" * 40}
     fail = {"index": 1, "passed": False, "unmeasured": False,
             "failing_files": ["a"]}
     st.data["acceptance"] = {

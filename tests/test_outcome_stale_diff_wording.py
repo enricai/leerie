@@ -10,6 +10,8 @@ class _St:
     def __init__(self, diff: dict, run_dir) -> None:
         self.data = {"test_id_diff": diff, "subtask_status": {}}
         self.run_dir = run_dir
+        self.run_id = "r1"
+        self.repo_root = run_dir
 
     def save(self) -> None:
         pass

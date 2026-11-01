@@ -5997,3 +5997,24 @@ template kept at finalize.
   Python and in the shell; no `commondir` check; a `.git` directory read
   as a clone before the repository's record; and one site of each kind
   put back for each guard.
+- `tests/test_unmeasured_is_not_done.py` (9 tests, review round 19
+  execution, DESIGN §6 *The run outcome is decided once*, "`done` rests on
+  measurements that ran"). Driven through the real `_decide_outcome`, and
+  the real `_refresh_test_id_diff` for the install case, on a run
+  repository whose run branch is the tree that ships:
+  - `done` needs a failing-test-ID diff of exactly that tree when the
+    repository has a test command. No diff, a diff of another tree, a
+    failed install on that tree (named in the reason), or failing tests
+    the base could not be rerun against each make the run `unconverged`.
+  - An unmeasured held-out set makes the run `unconverged`.
+  - A test command the task forbids, a repository with no test command,
+    and a run with no commits are not gaps.
+
+  Falsified, each turning tests red: the decider not consulting the rule
+  (5), the held-out part dropped (1), the refresh not recording why (1),
+  and the base-rerun check dropped (1). Eight assertions in four files
+  that expected `done` with no verdict now expect `unconverged`:
+  - `test_acceptance_unmeasured_pr` (3);
+  - `test_delivery_detection` (2);
+  - `test_acceptance_held_case_intermittent` (2);
+  - `test_decide_outcome`'s unmeasured case (1), now its own test.

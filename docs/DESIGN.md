@@ -4197,6 +4197,32 @@ verdict stays of its own tree and the run says so. And a final judge that
 fails in any way, not only a worker crash or timeout, is a judge that read
 nothing: its items are `unknown`, never `met`.
 
+*`done` rests on measurements that ran (review round 19).* Root cause:
+every regression check stepped aside when it could not measure. The
+failing-test-ID diff returned "nothing to diff" when the test axis gave no
+verdict or its install failed, and the decider read an absent diff as no
+new failure. An unmeasured held-out set was "no evidence". So in two
+measured runs every install failed, nothing was measured, and the run
+ended `done`; one shipped a broken test. Invariant: `done` is a claim
+about the tree that ships, and it holds only when the measurements it
+rests on ran on that tree. Each one the run could not take makes the run
+`unconverged`, with the reason naming what was not measured and why, and
+the PR's "Needs human verification" listing it as before:
+
+- *The tests,* when the repository has a test command: a failing-test-ID
+  diff of exactly the tree that ships. No diff, or a diff of another tree,
+  is not measured. `_refresh_test_id_diff` records why it could not take
+  one (`shipping_tests_gap`), and the decider names it. Failing tests that
+  the base could not be rerun against (`no_verdict`) leave the diff's
+  answer unknown for them, so they count too. A test command the task
+  forbids is the task's own constraint, listed by its own gap, and does
+  not count.
+- *The held-out sets:* every set the final tree left unmeasured, the same
+  sets `_acceptance_unmeasured_lines` lists for the PR.
+
+The rule is in the decider, read from what the measurements recorded, so
+any future cause of an unmeasured tree ends the same way, whatever it is.
+
 ### Credential strategy
 
 **A containerized headless run must prefer the long-lived token.** The
@@ -10296,10 +10322,10 @@ round, nor a residual.
 
 **A held-out set the final tree leaves unmeasured is never silent.** The
 sets exist to show the task's own scenario works; one that ends with no
-verdict on the tree that ships is verification the run did not finish.
-It does not make the run `unconverged` — no evidence is not a failure,
-and the last measured failing verdict, when there is one, already counts
-as the residual — but it is always listed under the PR's "Needs human
+verdict on the tree that ships is verification the run did not finish, so it makes the run `unconverged`
+(§6 *The run outcome is decided once*, "`done` rests on measurements that
+ran"; before review round 19 it did not: no evidence was taken as no
+failure). It is always listed under the PR's "Needs human
 verification", one line per set naming its files and why each could not
 be measured, from a fixed vocabulary the evaluation records on the set's
 result (`unmeasured_reason` for the whole set, `unmeasured_files` per
@@ -10381,9 +10407,10 @@ non-resource reason is the reported defect showing, however rarely. So:
    set — the repair rounds and the delivery re-drive take it like any
    failing set, the gate's residual names it (`residual.intermittent`),
    and left unresolved it makes the run `unconverged`. A set unmeasured
-   with no held-case failure stays no evidence either way, but the gate
-   never logs that the held-out sets pass while any set is unmeasured: it
-   logs how many were.
+   with no held-case failure is not a failing set, but it is not a passing
+   one either: it makes the run `unconverged` as unmeasured (§6 *The run
+   outcome is decided once*), and the gate never logs that the held-out
+   sets pass while any set is unmeasured: it logs how many were.
 
 Measured (barnacle 7cc87f9a, early replay, pass 1): the shipped generator
 drew its one guaranteed special from an alphabet that included `-` and

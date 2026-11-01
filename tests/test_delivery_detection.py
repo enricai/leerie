@@ -1453,7 +1453,7 @@ def test_an_unsettled_candidate_is_unknown_and_reaches_the_pr(
            if e["source"] == "test_outcome"]
     assert len(gap) == 1
     assert cand in gap[0]["detail"] and item["item"] in gap[0]["detail"]
-    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
     pr = leerie._format_pr_end_state_section(st.data)
     section = pr.split("## Needs human verification", 1)[1]
     assert cand in section and "no rerun produced a verdict" in section
@@ -1516,7 +1516,7 @@ def test_a_compound_items_unknown_test_part_is_never_read_met(
     gap = [e for e in st.data["needs_human_verification"]
            if e["source"] == "test_outcome"]
     assert len(gap) == 1 and item["item"] in gap[0]["detail"]
-    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
     # Its met part is still protected by the delivery ratchet.
     assert 0 in leerie._ratchet_prior_met(st)
     # A re-drive recheck that holds the other part met keeps the part's

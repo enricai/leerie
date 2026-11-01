@@ -123,7 +123,7 @@ def test_a_first_run_resource_signature_every_rerun_cut(
     assert res["unmeasured"] is True and res["failing_files"] == []
     assert res["unmeasured_files"] == {REL: code}
     outcome, body = _finish(leerie, st, [s_], [res])
-    assert outcome == "done"
+    assert outcome == "unconverged"
     line = _nhv_line(body, "held-out set 1")
     assert f"`{REL}` {words}" in line
 
@@ -282,7 +282,7 @@ def test_a_whole_set_cause_reaches_the_pr(leerie, tmp_path, code):
     res = {"index": 1, "passed": False, "unmeasured": True,
            "failing_files": [], "unmeasured_reason": code}
     outcome, body = _finish(leerie, st, [s_], [res])
-    assert outcome == "done"
+    assert outcome == "unconverged"
     line = _nhv_line(body, "held-out set 1")
     assert leerie.ACCEPTANCE_UNMEASURED_WHY[code] in line
     assert f"`{REL}`" in line and f"`{CONTROL}`" in line
@@ -333,7 +333,7 @@ def test_a_remeasure_that_measured_nothing_is_marked_and_listed(
                                           "label": "redrive-final"}
     outcome, body = (leerie._decide_outcome(st, any_commits=True),
                      leerie._format_pr_end_state_section(st.data))
-    assert outcome == "done"
+    assert outcome == "unconverged"
     line = _nhv_line(body, "re-measuring them on the final commit")
     assert "`bbbbbbbbbbbb`" in line and "`aaaaaaaaaaaa`" in line
     # A later re-measure that measures clears it.
