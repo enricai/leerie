@@ -18,7 +18,11 @@ name*). Output: shell assignments for `eval` —
   guard_disallowed  DISALLOWED_TOOLS plus the guard's deny rules
   guard_notice      each notice as a "\\nNOTE FROM ORCHESTRATOR: ..." line,
                     the last one where its grant lets it write
-  guard_settings    the hook's `--settings` JSON, or empty
+  guard_settings    the worker's whole `--settings` JSON
+                    (`_confined_cli_settings`: the operator's, the user's
+                    checkout's and leerie's own, the shell prefix among
+                    them), passed with `--setting-sources ""` (DESIGN §6
+                    *A worker's commands cannot reach its CLI*)
   guard_env         a bash array of NAME=value words for `env`
   guard_confine     a bash array: the Landlock shim and the worker's grants
                     (`_worker_grants`, DESIGN §6 *A worker writes only where
@@ -63,6 +67,9 @@ def main(argv: list[str]) -> int:
         sys.stderr.write("worker-guard: no run directory to confine in\n")
         return 1
     env = dict(guard["env"])
+    # Every command and hook of the CLI in a Landlock domain nested in its
+    # own (DESIGN §6 *A worker's commands cannot reach its CLI*).
+    env[leerie.SHELL_PREFIX_ENV] = str(leerie.WORKER_SHELL)
     if len(argv) == 5:
         # The worker's own CLI configuration and temp directory, and the
         # run's shared caches, as `claude_p` gives every worker (DESIGN §6
@@ -83,6 +90,13 @@ def main(argv: list[str]) -> int:
         # Where it can write, from its own grant, as `claude_p` tells it.
         notices.append(leerie._confined_writes_notice(
             grants, cwd=repo_root, env=genv))
+    # After `_worker_dirs`, which makes the template the operator's settings
+    # are read from. The project settings from the user's checkout, as
+    # `State` derives it from the state root (the run directory's
+    # grandparent's parent); never the staging tree, which a worker writes.
+    settings = leerie._confined_cli_settings(
+        guard["settings"], run_dir=run_dir,
+        repo_root=os.path.dirname(os.path.dirname(os.path.dirname(run_dir))))
     confine = " ".join(shlex.quote(w) for w in
                        leerie._confined_argv(grants, [])[:-1])
     disallowed = leerie.DISALLOWED_TOOLS + (
@@ -93,7 +107,7 @@ def main(argv: list[str]) -> int:
     sys.stdout.write(
         f"guard_disallowed={shlex.quote(disallowed)}\n"
         f"guard_notice={shlex.quote(notice)}\n"
-        f"guard_settings={shlex.quote(guard['settings'] or '')}\n"
+        f"guard_settings={shlex.quote(settings)}\n"
         f"guard_env=({env_words})\n"
         f"guard_confine=({confine} --)\n")
     return 0

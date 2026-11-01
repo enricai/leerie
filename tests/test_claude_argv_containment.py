@@ -392,8 +392,14 @@ def test_smoke_argv_equals_the_derived_builder_output(leerie, monkeypatch,
     expected = leerie._contained_claude_argv(
         schema=leerie.SMOKE_SCHEMA, allowed_tools=leerie.SMOKE_TOOLS,
         max_turns=leerie.SMOKE_MAX_TURNS, model="sonnet",
-        prompt=leerie.SMOKE_PROMPT)
+        prompt=leerie.SMOKE_PROMPT,
+        # Confined like a worker, so its settings are a confined worker's
+        # (DESIGN §6 *A worker's commands cannot reach its CLI*).
+        settings=leerie._confined_cli_settings(None, run_dir=None,
+                                               repo_root=None),
+        settings_only=True)
     assert cap["cmd"] == expected
+    assert cap["cmd"][cap["cmd"].index("--setting-sources") + 1] == ""
 
 
 def test_smoke_runs_in_an_empty_directory(leerie, monkeypatch, tmp_path):

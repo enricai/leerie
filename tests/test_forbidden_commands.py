@@ -464,9 +464,11 @@ def test_nothing_forbidden_means_no_forbidden_rule_or_notice(
                               list(leerie.PROCESS_KILL_DENY_COMMANDS))]
     assert _forbid_lines(prompt) == []
     # A shell-less worker on a task that forbids nothing: no hook at all.
+    # (Its settings still carry the shell prefix every confined worker
+    # gets — DESIGN §6 *A worker's commands cannot reach its CLI*.)
     argv, prompt = _spawn(leerie, monkeypatch, repo, schema_key="classifier",
                           allowed_tools=leerie.INSPECT_TOOLS)
-    assert "--settings" not in argv
+    assert "hooks" not in json.loads(argv[argv.index("--settings") + 1])
     assert not [r for r in argv[argv.index("--disallowedTools") + 1]
                 .split(",") if r.startswith("Bash(")]
     assert _forbid_lines(prompt) == []

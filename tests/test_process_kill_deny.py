@@ -310,5 +310,7 @@ def test_a_shell_less_worker_gets_none_of_it(leerie, monkeypatch, tmp_path):
                           schema_key="classifier")
     deny = argv[argv.index("--disallowedTools") + 1]
     assert "Bash(pkill" not in deny
-    assert "--settings" not in argv
+    # Its settings carry the shell prefix every confined worker gets, and
+    # no hook.
+    assert "hooks" not in json.loads(argv[argv.index("--settings") + 1])
     assert _kill_lines(prompt) == []

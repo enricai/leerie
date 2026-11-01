@@ -202,6 +202,46 @@ def confine(rw: list[str], ro: list[str]) -> None:
         os.close(fd)
 
 
+
+def nest() -> None:
+    """Enter a Landlock domain nested inside this process's own, ruled to
+    allow everything it handles beneath `/`. What the process may reach is
+    unchanged (an access passes only when every layer of its domain allows
+    it, so the parent's grants still bind), but Landlock refuses it — and
+    everything it starts — ptrace-class access to any process outside its
+    domain: `/proc/<pid>/fd`, `/proc/<pid>/mem`, `ptrace`, `pidfd_getfd`
+    of the worker's CLI (DESIGN §6 *A worker's commands cannot reach its
+    CLI*). No scope: a command may still signal, or connect to an abstract
+    socket of, what an earlier command of the same worker left running,
+    which a sibling nested domain would otherwise refuse. Raises OSError
+    naming the step that failed."""
+    libc = _libc()
+    attr = _Attr(HANDLED)
+    fd = libc.syscall(_SYS_CREATE, ctypes.byref(attr),
+                      ctypes.c_size_t(ctypes.sizeof(attr)), ctypes.c_uint32(0))
+    if fd < 0:
+        raise OSError(f"landlock_create_ruleset: errno {ctypes.get_errno()}")
+    try:
+        pfd = os.open("/", os.O_PATH | os.O_CLOEXEC)
+        try:
+            rule = _PathBeneath(HANDLED, pfd)
+            if libc.syscall(_SYS_ADD_RULE, ctypes.c_int(fd),
+                            ctypes.c_int(_RULE_PATH_BENEATH),
+                            ctypes.byref(rule), ctypes.c_uint32(0)) != 0:
+                raise OSError(f"landlock_add_rule /: errno "
+                              f"{ctypes.get_errno()}")
+        finally:
+            os.close(pfd)
+        if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            raise OSError(f"prctl(PR_SET_NO_NEW_PRIVS): errno "
+                          f"{ctypes.get_errno()}")
+        if libc.syscall(_SYS_RESTRICT, ctypes.c_int(fd),
+                        ctypes.c_uint32(0)) != 0:
+            raise OSError(f"landlock_restrict_self: errno "
+                          f"{ctypes.get_errno()}")
+    finally:
+        os.close(fd)
+
 def descendants(root: int) -> set[int]:
     """Every live process beneath `root` by parent links, read from
     `/proc/<pid>/stat` (the field after the command name's closing

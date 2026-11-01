@@ -415,11 +415,14 @@ def test_no_env_override_when_leerie_worker_debug_unset(leerie, leerie_dir,
         verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     env = captured.get("env")
-    assert env == leerie._worker_cache_env(
-        leerie._git_hooks_on(os.environ), leerie_dir), (
+    assert env == {**leerie._worker_cache_env(
+        leerie._git_hooks_on(os.environ), leerie_dir),
+        # A confined worker's commands run nested in its CLI's domain
+        # (DESIGN §6 *A worker's commands cannot reach its CLI*).
+        leerie.SHELL_PREFIX_ENV: str(leerie.WORKER_SHELL)}, (
         "without LEERIE_WORKER_DEBUG the worker inherits the orchestrator's "
         "full environment (token, PATH, etc.), less leerie's hooks entry, "
-        "with its own stores")
+        "with its own stores and its shell prefix")
     assert "DEBUG" not in env or env["DEBUG"] == os.environ.get("DEBUG")
 
 

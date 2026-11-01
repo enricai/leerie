@@ -336,9 +336,11 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
       _skip "$sid"
       continue
     fi
+    # The worker's whole settings, and no settings file read (DESIGN §6 *A
+    # worker's commands cannot reach its CLI*).
     guard_settings_args=()
     if [ -n "$guard_settings" ]; then
-      guard_settings_args=(--settings "$guard_settings")
+      guard_settings_args=(--setting-sources "" --settings "$guard_settings")
     fi
 
     claude_out=""

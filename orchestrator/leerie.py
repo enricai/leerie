@@ -12264,7 +12264,11 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         log("preflight: smoke-testing claude -p…")
         cmd = _contained_claude_argv(
             schema=SMOKE_SCHEMA, allowed_tools=SMOKE_TOOLS,
-            max_turns=SMOKE_MAX_TURNS, model=model, prompt=SMOKE_PROMPT)
+            max_turns=SMOKE_MAX_TURNS, model=model, prompt=SMOKE_PROMPT,
+            # Confined below, so its settings are a confined worker's.
+            settings=_confined_cli_settings(None, run_dir=None,
+                                            repo_root=None),
+            settings_only=True)
         # An EMPTY cwd, not the repo. This validates the CLI, not the
         # repository, and a single-exchange `claude -p` conversation is the
         # one shape the CLI's own recovery path cannot rescue: when its
@@ -22867,6 +22871,12 @@ async def _select_active_oauth_token(st: "State", caps: dict) -> None:
 # (Landlock) enforces it: `_invoke` starts every worker through
 # `scripts/landlock_exec.py` with the grants `_worker_grants` derives.
 LANDLOCK_SCRIPT = ROOT / "scripts" / "landlock_exec.py"
+# DESIGN §6 *A worker's commands cannot reach its CLI*: the shell a confined
+# worker's CLI runs each Bash-tool command and hook through, named to the
+# CLI in this variable. It runs the command in a Landlock domain nested in
+# the worker's, which may not open the CLI's `/proc/<pid>/fd/1`.
+WORKER_SHELL = ROOT / "scripts" / "worker-shell.py"
+SHELL_PREFIX_ENV = "CLAUDE_CODE_SHELL_PREFIX"
 
 
 @functools.lru_cache(maxsize=1)
@@ -24585,6 +24595,12 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # stores a view installs from are leerie's*).
     worker_env = _worker_cache_env(
         worker_env, leerie_dir, _granted_cache_dir(grants, leerie_dir))
+    # Every command and hook of a confined worker runs in a domain nested in
+    # its CLI's, so none can write into the stream this reads (DESIGN §6 *A
+    # worker's commands cannot reach its CLI*). `claude_p` also puts it in
+    # the `--settings` the CLI reads it from first.
+    if grants is not None:
+        worker_env = {**worker_env, SHELL_PREFIX_ENV: str(WORKER_SHELL)}
 
     # The prompt is staged to a temp file BEFORE the spawn, and that file —
     # already positioned at byte 0 with the whole payload on disk — becomes
@@ -28223,6 +28239,72 @@ def _forbidden_command_hook_settings(forbidden: list[str | dict],
     }]}}, separators=(",", ":"))
 
 
+
+def _merge_settings(low: dict, high: dict) -> dict:
+    """`high` laid over `low` the way the CLI merges its settings scopes:
+    objects key by key, arrays concatenated without repeats, any other value
+    `high`'s."""
+    out = dict(low)
+    for k, v in high.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge_settings(out[k], v)
+        elif isinstance(v, list) and isinstance(out.get(k), list):
+            out[k] = out[k] + [x for x in v if x not in out[k]]
+        else:
+            out[k] = v
+    return out
+
+
+def _settings_file(path: Path) -> dict:
+    """A settings file's object; {} when absent, and when unreadable or not
+    an object (logged: the CLI would have read it)."""
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log(f"  settings {path} not applied to workers: {e}")
+        return {}
+    if not isinstance(data, dict):
+        log(f"  settings {path} not applied to workers: not a JSON object")
+        return {}
+    return data
+
+
+def _confined_cli_settings(hook_settings: str | None, *,
+                           run_dir: str | Path | None,
+                           repo_root: str | Path | None) -> str:
+    """The whole of a confined worker's settings, for `--settings` with
+    `--setting-sources ""` (DESIGN §6 *A worker's commands cannot reach its
+    CLI*): the CLI then reads no settings file, because every one it would
+    read is one the worker can write — its own configuration directory's
+    `settings.json`, its tree's `.claude/settings*.json` — and a settings
+    file runs code in the CLI's own domain (`apiKeyHelper` and its kind run
+    without the shell prefix, measured) or unsets the prefix. In their place,
+    lowest first: the operator's settings from the run's read-only
+    configuration template (`run_dir`; with none, the operator's own
+    configuration directory), the repository's project and local settings
+    from the user's checkout (`repo_root`, which no worker writes), then
+    leerie's own — the PreToolUse hook (`hook_settings`) and the shell
+    prefix, which nothing below can override."""
+    if run_dir is not None:
+        user = Path(run_dir) / CLAUDE_CONFIG_TEMPLATE / "settings.json"
+    else:
+        env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        user = (Path(env_dir) if env_dir
+                else Path.home() / ".claude") / "settings.json"
+    layers = [_settings_file(user)]
+    if repo_root is not None:
+        layers += [_settings_file(Path(repo_root) / ".claude" / name)
+                   for name in ("settings.json", "settings.local.json")]
+    if hook_settings:
+        layers.append(json.loads(hook_settings))
+    layers.append({"env": {SHELL_PREFIX_ENV: str(WORKER_SHELL)}})
+    merged: dict = {}
+    for layer in layers:
+        merged = _merge_settings(merged, layer)
+    return json.dumps(merged, separators=(",", ":"))
+
 def _hook_payload(raw: object) -> tuple[list[str | dict], bool]:
     """(forbidden entries, deny kills) from the hook's decoded payload. A
     bare list is the forbidden-commands-only shape; an entry is a command
@@ -28485,7 +28567,8 @@ def _worker_guard(allowed_tools: str, repo_root: str | Path,
 def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
                            model: str, prompt: str | None = None,
                            deny_extra: str = "",
-                           settings: str | None = None) -> list[str]:
+                           settings: str | None = None,
+                           settings_only: bool = False) -> list[str]:
     """The `claude -p` argv every live invocation shares, containment included.
 
     Single owner by design. #216 widened `DISALLOWED_TOOLS` and added
@@ -28523,10 +28606,16 @@ def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
         "--model", _model_arg(model),
         "--strict-mcp-config",
     ])
+    if settings_only:
+        # A confined worker's CLI reads no settings file: its settings are
+        # all in `--settings` (`_confined_cli_settings`; DESIGN §6 *A
+        # worker's commands cannot reach its CLI*).
+        cmd.extend(["--setting-sources", ""])
     if settings is not None:
         # The PreToolUse hook (DESIGN §9): forbidden commands, and process
         # kills by name for every worker whose tools reach a shell. Absent
-        # for a shell-less worker on a task that forbids nothing.
+        # for a shell-less worker on a task that forbids nothing. For a
+        # confined worker, its whole settings, the shell prefix among them.
         cmd.extend(["--settings", settings])
     return cmd
 
@@ -28692,6 +28781,9 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # directory is a test double; production states always have one.
     worker_tmp: Path | None = None
     _wrun = getattr(st, "run_dir", None)
+    # Whose configuration template a confined worker's settings come from
+    # (`_confined_cli_settings`): the one `_worker_dirs` makes below.
+    _wrun_dir = _wrun if isinstance(_wrun, (str, os.PathLike)) else None
     if isinstance(_wrun, (str, os.PathLike)):
         worker_config, worker_tmp = _worker_dirs(Path(_wrun), sid,
                                                  resume_session)
@@ -28761,7 +28853,11 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                     _sysprompt_read_denial(getattr(st, "run_dir", None),
                                            allowed_tools, autonomous),
                     guard["deny"]) if d),
-                settings=hook_settings)
+                settings=(hook_settings if grants is None
+                          else _confined_cli_settings(
+                              hook_settings, run_dir=_wrun_dir,
+                              repo_root=getattr(st, "repo_root", None))),
+                settings_only=grants is not None)
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
             else:
