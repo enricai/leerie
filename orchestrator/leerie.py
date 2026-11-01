@@ -5795,6 +5795,13 @@ _STORE_VARS: dict[str, str] = {
     "BUNDLE_PATH": "bundle",
     "COMPOSER_CACHE_DIR": "composer",
     "NUGET_PACKAGES": "nuget",
+    # Where a user-level install lands when the system location is not
+    # writable: pip's user site, the .NET CLI's home, bundler's home. Without
+    # them each falls back to `$HOME`, which no measurement grant writes
+    # (review round 19 exec H2: every pip recipe failed in every view).
+    "PYTHONUSERBASE": "pyuser",
+    "DOTNET_CLI_HOME": "dotnet-home",
+    "BUNDLE_USER_HOME": "bundle-home",
 }
 # The repository image's bake target (DESIGN *Persistent out-of-repo dependency bake*): a
 # variable already pointing beneath it names dependencies leerie built into
@@ -5890,7 +5897,8 @@ _STORE_FETCH: dict[str, _StoreFetch] = {
 # `<run-dir>/tree-stores/<tree>/<name>` (`_tree_store_env`).
 _TREE_STORE_VARS: frozenset[str] = frozenset({
     "UV_CACHE_DIR", "CARGO_HOME", "BUNDLE_PATH", "NUGET_PACKAGES",
-    "GOCACHE", "WORKON_HOME", "npm_config_cache_dir"})
+    "GOCACHE", "WORKON_HOME", "npm_config_cache_dir", "PYTHONUSERBASE",
+    "DOTNET_CLI_HOME", "BUNDLE_USER_HOME"})
 # Shared and writable by an install, because the manager refuses an edited
 # entry on reuse (measured): pip and poetry against the lockfile's or the
 # index's hash, berry against `yarn.lock`'s checksum.
@@ -22548,6 +22556,19 @@ def _measurement_grants(st: "State", tree: str | Path,
     env = {"TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
            "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": str(xdg),
            "XDG_STATE_HOME": str(state), "XDG_RUNTIME_DIR": str(runtime)}
+    if kind != STORE_FETCH_KIND:
+        # pnpm 11 opens its store's SQLite index read-write for every install
+        # and before every `pnpm <script>`, so against the read-only fetched
+        # store each failed (review round 19 exec H3). `frozen-store` is
+        # pnpm's own read-only mode for an immutable store: measured, a
+        # pnpm 11 install then succeeds against it and shares no inode with
+        # it, and pnpm 10.4.1 accepts both settings unchanged. Both
+        # spellings (`_PNPM_SETTINGS`): pnpm 10 reads `npm_config_*`, pnpm 11
+        # `pnpm_config_*`.
+        for k, v in (("frozen_store", "true"),
+                     ("verify_deps_before_run", "false")):
+            env[f"npm_config_{k}"] = v
+            env[f"pnpm_config_{k}"] = v
     return WorkerGrants(
         tuple(dict.fromkeys(_around(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root)
@@ -41090,6 +41111,24 @@ def _recipe_manager(command: list[str] | None) -> str | None:
     return (command[0] if command and command[0] in _STORE_FETCH else None)
 
 
+@contextlib.asynccontextmanager
+async def _store_fetch_lock(st: "State"):
+    """Serialise every fetch into leerie's stores, across this process's
+    coroutines and across runs of the same repository (review round 19 exec
+    M2): an exclusive `flock` on `<state-root>/.stores/leerie/.fetch.lock`,
+    taken in a thread so the event loop keeps running."""
+    lock = _run_dir_of(st).parent.parent / ".stores" / "leerie" / ".fetch.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
                                  log_path: Path, label_prefix: str,
                                  log_prefix: str) -> None:
@@ -41118,18 +41157,20 @@ async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
         src = Path(tree) / wd_rel
         if not any((src / lf).is_file() for lf in spec.lockfiles):
             continue
-        stage = (st.run_dir / ".store-fetch"
-                 / _CGROUP_NAME_UNSAFE_RE.sub("-", f"{mgr}-{wd_rel}"))
-        await asyncio.to_thread(_rmtree_owned, stage)
-        stage.mkdir(parents=True, exist_ok=True)
+        # Each fetch its own staging directory: a name shared by manager and
+        # working dir let concurrent fetches remove each other's (review
+        # round 19 exec M2).
+        base = st.run_dir / ".store-fetch"
+        base.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(
+            prefix=_CGROUP_NAME_UNSAFE_RE.sub("-", f"{mgr}-{wd_rel}-"),
+            dir=base))
         for name in spec.stage:
             s = src / name
             if s.is_dir():
                 shutil.copytree(s, stage / name, symlinks=True)
             elif s.is_file():
                 shutil.copy2(s, stage / name)
-        if mgr == "pnpm" and not _reads_package_manager(tree, wd_rel):
-            await _seed_pnpm_pin(st, stage, log_path, log_prefix)
         try:
             # A fetch is leerie's own, but the task's forbid binds it too
             # (DESIGN §9): a forbidden fetch is skipped, and the install that
@@ -41140,19 +41181,22 @@ async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
             await asyncio.to_thread(_rmtree_owned, stage)
             continue
         try:
-            # Confined to its stage directory and leerie's store, the one
-            # writer the store has (DESIGN §6 *Leerie's runs of the
-            # repository's commands are confined too*).
-            rc, _tail = await _run_streaming(
-                argv, grants=_measurement_grants(st, stage, STORE_FETCH_KIND),
-                cwd=str(stage),
-                env={**os.environ, **dict(spec.env)} if spec.env else None,
-                timeout=caps.get("worker_timeout_sec"), log_path=log_path,
-                label=f"{label_prefix}-store-fetch: {' '.join(spec.argv)}",
-                verbosity="quiet")
-            if rc != 0:
-                log(f"  {log_prefix}: store fetch exited {rc} "
-                    f"({mgr} in {wd_rel}) — the install will populate it")
+            async with _store_fetch_lock(st):
+                if mgr == "pnpm" and not _reads_package_manager(tree, wd_rel):
+                    await _seed_pnpm_pin(st, stage, log_path, log_prefix)
+                # Confined to its stage directory and leerie's store, the one
+                # writer the store has (DESIGN §6 *Leerie's runs of the
+                # repository's commands are confined too*).
+                rc, _tail = await _run_streaming(
+                    argv, grants=_measurement_grants(st, stage, STORE_FETCH_KIND),
+                    cwd=str(stage),
+                    env={**os.environ, **dict(spec.env)} if spec.env else None,
+                    timeout=caps.get("worker_timeout_sec"), log_path=log_path,
+                    label=f"{label_prefix}-store-fetch: {' '.join(spec.argv)}",
+                    verbosity="quiet")
+                if rc != 0:
+                    log(f"  {log_prefix}: store fetch exited {rc} "
+                        f"({mgr} in {wd_rel}) — the install will populate it")
         except Exception as ex:  # best-effort: the install still copies
             log(f"  {log_prefix}: store fetch error "
                 f"({type(ex).__name__}): {mgr} in {wd_rel}")

@@ -122,3 +122,65 @@ def test_the_pin_is_seeded_only_when_the_tree_pins_none(
         log_path=w["run_dir"] / "logs" / "f.log",
         label_prefix="t", log_prefix="t"))
     assert bool(calls) is seeds
+
+
+def test_a_measured_pythons_user_base_is_its_trees_and_writable(leerie, run):
+    """pip falls back to the user site when the system one is not writable;
+    under the grant that must be the tree's own store, not `$HOME` (review
+    round 19 exec H2). Real Landlock: Python's user base, where that install
+    lands, resolves inside the tree's stores and can be written."""
+    view = run["wts"][f"{run['run_dir'].name}-view-staging"]
+    g = leerie._measurement_grants(_state(run), view)
+    env = dict(os.environ)
+    leerie._tree_store_env(env, view)
+    env.update(dict(g.env))
+    base = run["run_dir"] / "tree-stores" / view.name / "pyuser"
+    assert env["PYTHONUSERBASE"] == str(base)
+    got = _probe(leerie, g, f"""
+user base is the trees|test "$(python3 -c 'import site; print(site.getuserbase())')" = {base}
+write user site|mkdir -p {base}/lib && echo x > {base}/lib/planted
+write HOME|echo x > $HOME/planted-by-measurement
+""", env)
+    assert got["user base is the trees"] and got["write user site"]
+    assert not got["write HOME"]
+
+
+def test_measurements_open_pnpms_store_frozen_but_the_fetch_does_not(
+        leerie, run):
+    view = run["wts"][f"{run['run_dir'].name}-view-staging"]
+    measure = dict(leerie._measurement_grants(_state(run), view).env)
+    fetch = dict(leerie._measurement_grants(
+        _state(run), view, leerie.STORE_FETCH_KIND).env)
+    for spelling in ("npm_config_", "pnpm_config_"):
+        assert measure[spelling + "frozen_store"] == "true"
+        assert measure[spelling + "verify_deps_before_run"] == "false"
+        assert spelling + "frozen_store" not in fetch      # the one writer
+
+
+def test_concurrent_fetches_get_their_own_stage_and_take_turns(
+        leerie, tmp_path, monkeypatch):
+    """Review round 19 exec M2: two fetches into one store used one staging
+    directory and removed each other's. Each now has its own, and they run
+    one at a time under the store's lock."""
+    w = _repo_with_recipe(leerie, tmp_path, monkeypatch, package_manager=True)
+    spans: list[tuple[str, float, float, bool]] = []
+
+    async def fake_stream(argv, *, cwd, **k):
+        t0 = asyncio.get_running_loop().time()
+        await asyncio.sleep(0.3)
+        spans.append((cwd, t0, asyncio.get_running_loop().time(),
+                      Path(cwd).is_dir()))
+        return (0, "")
+    monkeypatch.setattr(leerie, "_run_streaming", fake_stream)
+
+    async def both():
+        await asyncio.gather(*(leerie._populate_leerie_store(
+            str(w["staging"]), w["st"], w["caps"],
+            log_path=w["run_dir"] / "logs" / f"f{i}.log",
+            label_prefix="t", log_prefix="t") for i in range(2)))
+    asyncio.run(both())
+    assert len(spans) == 2
+    (c1, s1, e1, alive1), (c2, s2, e2, alive2) = sorted(spans,
+                                                         key=lambda x: x[1])
+    assert c1 != c2 and alive1 and alive2
+    assert s2 >= e1                       # serialised: no overlap

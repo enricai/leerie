@@ -89,8 +89,13 @@ def test_its_temp_and_caches_point_at_its_own_dir(leerie, run):
     own = leerie._measure_dir(_state(run), view).resolve()
     env = dict(g.env)
     assert Path(env["TMPDIR"]).resolve().is_relative_to(own)
+    # Every directory it names; pnpm's read-only-store settings are
+    # booleans, not places (DESIGN §6 *A measurement pins pnpm's version*).
+    flags = {f"{p}{k}" for p in ("npm_config_", "pnpm_config_")
+             for k in ("frozen_store", "verify_deps_before_run")}
     caches = [v for k, v in env.items()
-              if k not in ("TMPDIR", "TMP", "TEMP", "MISE_STATE_DIR")]
+              if k not in ("TMPDIR", "TMP", "TEMP", "MISE_STATE_DIR")
+              and k not in flags]
     assert caches and all(Path(v).resolve().is_relative_to(own)
                           for v in caches)
     got = _probe(leerie, g, 'temp write|echo x > "$TMPDIR/t"', env)

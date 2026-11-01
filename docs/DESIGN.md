@@ -4677,8 +4677,11 @@ That puts each store in one class (`_FETCHED_STORE_VARS`,
 in exactly one):
 
 - *Fetched* — pnpm, npm, yarn classic, bun, corepack, go modules, composer:
-  shared, written only by the manager's `_STORE_FETCH` entry in a staging
-  directory of data files (never a committed `.npmrc`, `.yarnrc.yml`,
+  shared, written only by the manager's `_STORE_FETCH` entry, one fetch at a
+  time under an exclusive lock on the store (`_store_fetch_lock`; review
+  round 19 exec M2 found concurrent fetches sharing one staging directory
+  and removing each other's), each in a staging directory of its own
+  (`tempfile.mkdtemp`) holding data files (never a committed `.npmrc`, `.yarnrc.yml`,
   `.pnpmfile.cjs`, plugin or script), and read-only to every install.
   Measured: each fetch ran no hook, and the real install then succeeded
   against the store made read-only. For yarn the spelling matters:
@@ -4699,7 +4702,18 @@ in exactly one):
   cargo's package lock and Go's build cache write the store as they build,
   so an install could not run against it read-only (measured for uv: the
   project build fails on a read-only cache). Nothing one tree's code leaves
-  there reaches another tree or a later commit.
+  there reaches another tree or a later commit. The class also holds where
+  a user-level install lands when the system location is not writable —
+  pip's user base (`PYTHONUSERBASE`), the .NET CLI's home
+  (`DOTNET_CLI_HOME`) and bundler's home (`BUNDLE_USER_HOME`) — because each
+  otherwise falls back to `$HOME`, which no measurement grant writes. Review
+  round 19 exec H2 found every pip recipe failing in every view that way.
+  Measured as the leerie user with `$HOME` read-only: `pip install`
+  answered "Defaulting to user installation" and failed, and succeeded
+  with `PYTHONUSERBASE` set, the package importable from it; `dotnet
+  restore` failed needing `~/.dotnet`; bundler warned and fell back to a
+  temporary home. npm, yarn, bun, uv, cargo, go and composer needed no
+  `$HOME` write once their store variables were set.
 
 The measurement grant gives a confined install exactly this: the fetched
 stores read-only, the verified ones writable, and its own tree's
@@ -4712,7 +4726,17 @@ under Landlock on barnacle and funeralworks, with the store read-only and
 `copy` import: pnpm 10.4.1 installs cleanly (barnacle 14.5 s with its
 scripts skipped; funeralworks 107.6 s with its scripts); pnpm 10.28.2 fails
 writing a project ref into the store (`<store>/v10/projects/`); pnpm 11
-fails writing its SQLite index. corepack picks the version from the
+fails writing its SQLite index (`v11/index.db`), which it opens read-write
+for every install and before every `pnpm <script>` (review round 19 exec
+H3). pnpm 11 has a mode for exactly this, `frozen-store` ("open the package
+store read-only and skip all store writes"): measured on a pnpm 11 project
+under Landlock, the install against the read-only store failed with
+`ERR_SQLITE_ERROR` without it and succeeded with it (2.2 s, no inode
+shared), and `pnpm run` succeeded too. So every measurement except the
+store fetch sets `frozen_store=true` and `verify_deps_before_run=false`
+under both spellings (`_measurement_grants`); pnpm 10.4.1 accepts both
+unchanged (install and `pnpm run` succeed). The fetched class can then hold
+pnpm 11's store as well as pnpm 10's. corepack picks the version from the
 repository's `packageManager`, else a last-known-good it keeps in
 `COREPACK_HOME`, else the newest on the registry, which was pnpm 11.1.2. So
 corepack never floats (`_COREPACK_PIN_ENV`: `COREPACK_DEFAULT_TO_LATEST=0`,
