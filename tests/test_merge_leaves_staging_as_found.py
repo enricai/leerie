@@ -19,13 +19,12 @@ from pathlib import Path
 
 from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
+from tests.conftest import run_git_out  # noqa: E402
 
 RUN_ID = "20261030-gitignore"
 
 
-def _git(cwd, *a, check=True):
-    return subprocess.run(["git", *a], cwd=cwd, check=check,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _sh(repo, name, *args):

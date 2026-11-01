@@ -32,13 +32,12 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import relocate_into_run_repo
+from tests.conftest import run_git_out  # noqa: E402
 
 TS_DIR_ENV = "LEERIE_TEST_TYPESCRIPT_DIR"
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _ts_dir() -> str | None:

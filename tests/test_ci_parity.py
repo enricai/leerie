@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import _run, measured_tmp_files, relocate_into_run_repo
+from tests.conftest import run_git_out  # noqa: E402
 
 WORKFLOW = """\
 name: ci
@@ -94,9 +95,7 @@ def _sh(argv, cwd):
     subprocess.run(argv, cwd=str(cwd), capture_output=True, check=True)
 
 
-def _git(cwd, *a):
-    return subprocess.run(["git", *a], cwd=str(cwd), capture_output=True,
-                          text=True, check=True).stdout.strip()
+_git = run_git_out
 
 
 @pytest.fixture

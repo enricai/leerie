@@ -12,13 +12,12 @@ import subprocess
 from pathlib import Path
 
 from tests.conftest import measured_tmp_files, relocate_into_run_repo
+from tests.conftest import run_git_out  # noqa: E402
 
 PYTEST = "python3 -m pytest -q -p no:cacheprovider"
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=cwd, check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _repo(tmp_path: Path, test_cmd: str = PYTEST) -> Path:

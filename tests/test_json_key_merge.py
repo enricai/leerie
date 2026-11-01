@@ -7,11 +7,11 @@ import asyncio
 import json
 import subprocess
 from pathlib import Path
+import functools
+from tests.conftest import run_git_out  # noqa: E402
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                          capture_output=True, text=True).stdout
+_git = functools.partial(run_git_out, strip=False)
 
 
 def _repo(tmp_path: Path, base: dict[str, str]) -> Path:

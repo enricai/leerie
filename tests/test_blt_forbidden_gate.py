@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import measured_tmp_files
+from tests.conftest import run_git_out  # noqa: E402
 
 PYTEST = "python3 -m pytest -q -p no:cacheprovider"
 SRC = Path(__file__).resolve().parents[1] / "orchestrator" / "leerie.py"
@@ -276,9 +277,7 @@ def test_the_gate_refuses_a_hit_and_builds_a_plain_shell(leerie):
 
 # --- substance: a real pytest repo ------------------------------------------
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=cwd, check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 @pytest.fixture

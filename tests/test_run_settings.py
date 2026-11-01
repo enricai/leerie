@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_out  # noqa: E402
 
 RUN_ID = "r17settings0"
 BRANCH = f"leerie/runs/{RUN_ID}"
@@ -27,9 +28,7 @@ SUB = f"leerie/subtasks/{RUN_ID}/feat-001"
 LIB = Path(__file__).resolve().parents[1] / "scripts" / "worktree-lib.sh"
 
 
-def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=check,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 class _St:

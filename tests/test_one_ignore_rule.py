@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_out  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 LEERIE_PY = ROOT / "orchestrator" / "leerie.py"
@@ -26,9 +27,7 @@ RUN_ID = "r17ignore000"
 BRANCH = f"leerie/runs/{RUN_ID}"
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 class _St:

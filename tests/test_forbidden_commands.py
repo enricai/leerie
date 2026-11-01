@@ -26,6 +26,7 @@ import types
 
 import pytest
 from tests.conftest import fake_run_dir, measure_run_dir
+from tests.conftest import run_git_out  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 FORBID = ["pnpm run test"]
@@ -1002,9 +1003,7 @@ def test_legacy_state_reads_as_scope_any(leerie):
 
 # === the coupled tests, and the scoped replacement of a forbidden suite =====
 
-def _git(cwd, *args):
-    subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                   capture_output=True, text=True)
+_git = run_git_out
 
 
 def _coupled_repo(tmp_path):

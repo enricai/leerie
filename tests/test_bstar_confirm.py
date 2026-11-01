@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_out  # noqa: E402
 
 
 class _Clock:
@@ -509,10 +510,7 @@ def test_report_with_nothing_executed_is_none(leerie, tmp_path):
 
 # --- end to end against a real pytest suite --------------------------------
 
-def _git(cwd, *a):
-    r = subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    return r.stdout.strip()
+_git = run_git_out
 
 
 _SUITE = """\

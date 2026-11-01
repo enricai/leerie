@@ -23,11 +23,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_out  # noqa: E402
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _repo(tmp_path: Path) -> Path:

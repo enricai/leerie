@@ -29,13 +29,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_delivery_redrive import World  # noqa: E402
+import functools
+from tests.conftest import run_git_out  # noqa: E402
 
 MARK = "SETBYTES_7f3c_UNIQUE_MARKER"
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                          capture_output=True, text=True).stdout
+_git = functools.partial(run_git_out, strip=False)
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, types.SimpleNamespace, list]:

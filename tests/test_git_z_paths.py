@@ -13,15 +13,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import functools
+from tests.conftest import run_git_out  # noqa: E402
 
 SRC = Path(__file__).resolve().parents[1] / "orchestrator" / "leerie.py"
 BAD = b"caf\xe9"
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=cwd, check=True,
-                          capture_output=True).stdout.decode(
-                              errors="replace").strip()
+_git = functools.partial(run_git_out, errors="replace")
 
 
 @pytest.fixture

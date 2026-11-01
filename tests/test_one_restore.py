@@ -19,6 +19,7 @@ import pytest
 
 from tests.conftest import REPO_ROOT
 from tests.test_run_final_conformance import _clean_result, env  # noqa: F401
+from tests.conftest import run_git_out  # noqa: E402
 
 
 def _porcelain(tree) -> str:
@@ -64,9 +65,7 @@ def test_an_unclean_final_conformer_is_rolled_back_not_died_on(
 
 def test_a_nested_repo_does_not_survive_the_resume(leerie, tmp_path,
                                                    monkeypatch):
-    def _git(cwd, *a):
-        return subprocess.run(["git", *a], cwd=cwd, check=True,
-                              capture_output=True, text=True).stdout.strip()
+    _git = run_git_out
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")

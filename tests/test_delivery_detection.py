@@ -35,6 +35,7 @@ import pytest
 from tests.stub_helpers import (DELIVERY_CITED_FILE, DELIVERY_CITED_LINE,
                                 _delivery_tree, _judge_verdict)
 from tests.conftest import fake_run_dir
+from tests.conftest import run_git_out  # noqa: E402
 
 MODELS = {"delivery_judge": "sonnet", "falsifier": "sonnet"}
 EFFORTS = {"delivery_judge": "medium", "falsifier": "medium"}
@@ -50,9 +51,7 @@ PASSING_PROBE_SRC = ("from calc import add\n\n\n"
                      "    assert add(3, 3) == 0\n")
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 @pytest.fixture(autouse=True)

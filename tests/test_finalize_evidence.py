@@ -20,6 +20,8 @@ from pathlib import Path
 import pytest
 
 from tests.test_run_final_conformance import _clean_result, env  # noqa: F401
+import functools
+from tests.conftest import run_git_out  # noqa: E402
 
 MODELS = {"pr_reviewer": "opus", "contract_extractor": "sonnet",
           "delivery_judge": "sonnet", "conformer": "sonnet"}
@@ -27,11 +29,7 @@ EFFORTS = {"pr_reviewer": "high", "contract_extractor": "medium",
            "delivery_judge": "medium", "conformer": "low"}
 
 
-def _git(cwd, *args):
-    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                       text=True)
-    assert r.returncode == 0, (args, r.stderr)
-    return r.stdout
+_git = functools.partial(run_git_out, strip=False)
 
 
 # === contract literals: the pure verdict (bench q10 check7e) ==============

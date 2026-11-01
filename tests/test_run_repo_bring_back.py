@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import HAS_JQ
+from tests.conftest import run_git_out  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not HAS_JQ,
@@ -28,9 +29,7 @@ RUN_ID = "c0ffee123456"
 BRANCH = f"leerie/runs/{RUN_ID}"
 
 
-def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=check,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 @pytest.fixture()

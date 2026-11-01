@@ -12,6 +12,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import functools
+from tests.conftest import run_git_out  # noqa: E402
 
 SID = "feat-002"
 
@@ -20,9 +22,7 @@ SID = "feat-002"
 STAGING_BRANCH = "leerie/runs/run-int-repair"
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                          capture_output=True, text=True).stdout
+_git = functools.partial(run_git_out, strip=False)
 
 
 BASE = "def compute():\n    return 1\n\ndef other():\n    return 2\n"

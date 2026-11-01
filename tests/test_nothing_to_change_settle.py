@@ -22,6 +22,7 @@ import json
 import subprocess
 
 import pytest
+from tests.conftest import run_git_out  # noqa: E402
 
 RUN_ID = "synth-002-abcdef"
 SID = "bugfix-002"
@@ -29,11 +30,7 @@ SIBLING = "bugfix-001"
 TEST_FILE = "tests/test_textutil.py"
 
 
-def _git(cwd, *args):
-    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                       text=True)
-    assert r.returncode == 0, f"git {args} failed: {r.stderr}"
-    return r.stdout.strip()
+_git = run_git_out
 
 
 def _commit_on_branch(repo, branch, base, files: dict[str, str], msg):

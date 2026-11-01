@@ -74,6 +74,37 @@ def run_git_cwd_first_stdout(cwd: Path, *args: str) -> str:
     return out.stdout.strip()
 
 
+def run_git_out(cwd: Path, *args: str, check: bool = True,
+                env: dict[str, str] | None = None, strip: bool = True,
+                errors: str | None = None,
+                config: tuple[str, ...] = ()) -> str:
+    """`git [-c <k=v> ...] <args>` run in `cwd`, returning its stdout
+    (stripped unless `strip=False`). `check=False` returns the stdout of a
+    failing command instead of raising; `env` replaces the environment;
+    `errors` decodes the output as UTF-8 with that error handler (for git's
+    raw byte paths); `config` is `-c` settings laid before `args`. The one
+    git runner every test with a local `_git` aliases, so its variants live
+    here once (`tests/test_no_duplicate_git_test_helpers.py`)."""
+    cfg = [x for kv in config for x in ("-c", kv)]
+    kw: dict = ({"encoding": "utf-8", "errors": errors} if errors
+                else {"text": True})
+    out = subprocess.run(["git", *cfg, *args], cwd=str(cwd), check=check,
+                         env=env, capture_output=True, **kw).stdout
+    return out.strip() if strip else out
+
+
+def run_git_at(path: Path, *args: str, check: bool = True) -> str:
+    """`git <args>` at `path`, as leerie names a repository: a bare one (the
+    run's own) with `--git-dir`, a work tree with `-C`. Returns stripped
+    stdout."""
+    path = Path(path)
+    at = (["--git-dir", str(path)]
+          if (path / "HEAD").is_file() and (path / "objects").is_dir()
+          else ["-C", str(path)])
+    return subprocess.run(["git", *at, *args], check=check,
+                          capture_output=True, text=True).stdout.strip()
+
+
 def run_git_cwd_first_unchecked(
     cwd: Path, *args: str, env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:

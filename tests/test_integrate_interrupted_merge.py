@@ -20,13 +20,12 @@ from pathlib import Path
 
 from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
+from tests.conftest import run_git_out  # noqa: E402
 
 RUN_ID = "20261028-l4-midmerge"
 
 
-def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    return subprocess.run(["git", *args], cwd=cwd, check=check,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _branch(repo: Path, sid: str, fname: str, text: str) -> None:

@@ -22,6 +22,7 @@ import pytest
 
 from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT
+from tests.conftest import run_git_out  # noqa: E402
 
 RUN_ID = "20261028-resume-h2"
 
@@ -31,9 +32,7 @@ class _Crash(BaseException):
     way (the coverage measurement catches `Exception`) can swallow it."""
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=cwd, check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _setup(leerie, tmp_path: Path, monkeypatch):

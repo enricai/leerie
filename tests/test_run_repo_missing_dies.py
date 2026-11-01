@@ -16,11 +16,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_out  # noqa: E402
 
 
-def _git(cwd: Path, *a: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *a], check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _state_without_run_repo(leerie, tmp_path):

@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from tests.stub_helpers import _d1_covered, _delivery_tree, _judge_verdict
+from tests.conftest import run_git_out  # noqa: E402
 
 MODELS = {"classifier": "sonnet", "delivery_judge": "sonnet",
           "task_coverage_judge": "sonnet"}
@@ -45,9 +46,7 @@ The export drops rows.
 """
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _repo(tmp_path: Path) -> tuple[Path, str]:

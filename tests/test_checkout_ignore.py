@@ -21,11 +21,11 @@ import types
 from pathlib import Path
 
 import pytest
+import functools
+from tests.conftest import run_git_out  # noqa: E402
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                          capture_output=True, text=True).stdout
+_git = functools.partial(run_git_out, strip=False)
 
 
 def _user_repo(tmp_path: Path) -> Path:

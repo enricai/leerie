@@ -15,15 +15,14 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import REPO_ROOT
+from tests.conftest import run_git_out  # noqa: E402
 
 RUN_ID = "i5confine000"
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 SHIM = REPO_ROOT / "scripts" / "landlock_exec.py"
 
 
-def _git(cwd: Path, *a: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *a], check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 class _St:

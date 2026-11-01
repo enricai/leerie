@@ -25,14 +25,13 @@ import pytest
 from tests.conftest import fake_run_dir
 from tests.test_worker_confinement import (  # noqa: F401  (fixture)
     _abi, _grants, _probe, run)
+from tests.conftest import run_git_out  # noqa: E402
 
 needs_landlock = pytest.mark.skipif(
     _abi() < 3, reason="the host kernel has no Landlock ABI 3")
 
 
-def _git(cwd: Path, *a: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *a], check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 class _St:

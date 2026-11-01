@@ -23,6 +23,7 @@ import pytest
 
 from tests.conftest import worker_exit
 from tests.conftest import REPO_ROOT, _run
+from tests.conftest import run_git_out  # noqa: E402
 
 FAKE_VITEST = r'''#!/usr/bin/env python3
 import json, os, pathlib, re, sys
@@ -82,9 +83,7 @@ A_NEW = ("export function f(x) {\n  return x; // STMT\n}\n"
 # Changed executable lines of A_NEW: 5, 6, 8.
 
 
-def _git(cwd, *a):
-    return subprocess.run(["git", *a], cwd=str(cwd), capture_output=True,
-                          text=True, check=True).stdout.strip()
+_git = run_git_out
 
 
 def _write(root: Path, files: dict[str, str]) -> None:

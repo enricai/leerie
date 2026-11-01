@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import REPO_ROOT
+from tests.conftest import run_git_out  # noqa: E402
 
 LEERIE = REPO_ROOT / "orchestrator" / "leerie.py"
 # Every client-side hook git documents (githooks(5)) that a local command
@@ -33,9 +34,7 @@ HOOKS = ["applypatch-msg", "pre-applypatch", "post-applypatch",
          "post-rewrite", "post-index-change"]
 
 
-def _git(cwd, *a, env=None):
-    return subprocess.run(["git", *a], cwd=cwd, check=True, env=env,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _hooked_repo(tmp_path: Path) -> tuple[Path, Path]:

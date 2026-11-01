@@ -23,11 +23,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_out  # noqa: E402
 
 
-def _git(cwd, *a, check=True):
-    return subprocess.run(["git", *a], cwd=cwd, check=check,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 BR = "leerie/runs/x"

@@ -14,16 +14,14 @@ import subprocess
 import pytest
 
 from tests.conftest import relocate_into_run_repo
+from tests.conftest import run_git_out  # noqa: E402
 
 CMD = "python3 -m pytest -q -p no:cacheprovider tests"
 SUITE = "def test_x():\n    assert {ok}\n"
 ITEM = "fix y; no existing test breaks"
 
 
-def _git(cwd, *a):
-    r = subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    return r.stdout.strip()
+_git = run_git_out
 
 
 @pytest.fixture

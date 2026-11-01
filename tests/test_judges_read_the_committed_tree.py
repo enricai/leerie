@@ -21,12 +21,11 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 from stub_helpers import (DELIVERY_CITED_FILE, DELIVERY_CITED_LINE,  # noqa: E402
                           _delivery_tree, _judge_verdict)
+import functools
+from tests.conftest import run_git_out  # noqa: E402
 
 
-def _git(tree, *args) -> str:
-    return subprocess.run(["git", "-C", str(tree), "-c", "user.email=t@t",
-                           "-c", "user.name=t", *args], check=True,
-                          capture_output=True, text=True).stdout.strip()
+_git = functools.partial(run_git_out, config=("user.email=t@t", "user.name=t"))
 
 
 def _staging(leerie, tmp_path):

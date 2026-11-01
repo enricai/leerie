@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_at  # noqa: E402
 
 pytestmark = pytest.mark.real_planning_worktree
 
@@ -34,13 +35,7 @@ HOST_FINALIZE = REPO_ROOT / "scripts" / "host-finalize.sh"
 RUN_ID = "r0work0ro001"
 
 
-def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    cwd = Path(cwd)
-    at = (["--git-dir", str(cwd)]
-          if (cwd / "HEAD").is_file() and (cwd / "objects").is_dir()
-          else ["-C", str(cwd)])
-    return subprocess.run(["git", *at, *args], check=check,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_at
 
 
 def _user_repo(tmp_path: Path, files: dict[str, str] | None = None) -> Path:

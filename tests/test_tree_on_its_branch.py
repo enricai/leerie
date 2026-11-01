@@ -21,11 +21,10 @@ import subprocess
 from pathlib import Path
 
 from tests.test_run_final_conformance import _clean_result, env  # noqa: F401
+from tests.conftest import run_git_out  # noqa: E402
 
 
-def _git(cwd, *a, check=True):
-    return subprocess.run(["git", *a], cwd=cwd, check=check,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_out
 
 
 def _repo(tmp_path: Path) -> Path:

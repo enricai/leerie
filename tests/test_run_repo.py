@@ -19,21 +19,14 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_at  # noqa: E402
 
 pytestmark = pytest.mark.real_planning_worktree
 
 RUN_ID = "r1abcdef0123"
 
 
-def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    """git at `cwd`: a bare repository (the run's own) named with
-    `--git-dir`, as leerie names it, a work tree with `-C`."""
-    cwd = Path(cwd)
-    at = (["--git-dir", str(cwd)]
-          if (cwd / "HEAD").is_file() and (cwd / "objects").is_dir()
-          else ["-C", str(cwd)])
-    return subprocess.run(["git", *at, *args], check=check,
-                          capture_output=True, text=True).stdout.strip()
+_git = run_git_at
 
 
 def _user_repo(tmp_path: Path) -> Path:
