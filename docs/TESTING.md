@@ -6121,6 +6121,16 @@ template kept at finalize.
   `acceptance/`, and the server is gone with the command; a name that is
   not a test database is refused (125); confined but unisolated, the
   script runs the command unchanged without a database, its stdout clean.
+- `tests/test_delivery_detection.py`, a falsifier's probe as held-out
+  content (DESIGN §6 *A held-out evaluation runs alone*; 3 tests): the
+  confirm runs, through the real gates and `_capture_failing_test_ids`,
+  each run alone in a sandbox over the pristine checkout with the probe
+  placed and never on disk there; the AST facts read places the probe too
+  and returns its JSON through the report (needs node and a `typescript`
+  copy, `LEERIE_TEST_TYPESCRIPT_DIR`); a sentinel in a confirmed probe's
+  source and the sample's prose is in neither `unmet_final` nor the
+  re-drive's re-check, the saved probe is outside every implementer grant,
+  and the re-drive's re-run of it is placed in a sandbox.
 - `tests/test_heldout_isolation.py` (4 tests, all `real_heldout_sandbox`,
   skipped where the shim has no `isolation_error()` or the host cannot
   build a sandbox): review round 20's H1 (`/dev/shm`, System V) and H2 (the

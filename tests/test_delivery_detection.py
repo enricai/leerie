@@ -809,6 +809,14 @@ def _facts_for(path_text: str) -> dict:
             "imports": [], "vm_import": False, "title": "t"}
 
 
+def _placed(fn):
+    """A stand-in for `_probe_case_facts_placed` from one for the facts of a
+    probe at a path: the placed probe's source is the path it reads."""
+    async def facts(st, tree, src, rel, case):
+        return fn(tree, src, case)
+    return facts
+
+
 @pytest.fixture
 def gate_env(leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
@@ -820,7 +828,7 @@ def gate_env(leerie, tmp_path, monkeypatch):
     def fake_facts(tree, probe, case, **_kw):
         seen_facts.append((str(tree), str(probe), case))
         return _facts_for(Path(probe).read_text())
-    monkeypatch.setattr(leerie, "_probe_case_facts", fake_facts)
+    monkeypatch.setattr(leerie, "_probe_case_facts_placed", _placed(fake_facts))
     return types.SimpleNamespace(repo=repo, head=head, st=st, lane=lane,
                                  confirm=confirm, facts=seen_facts)
 
@@ -906,9 +914,9 @@ class TestFalsifierGates:
     def test_a_coupled_probe_is_refused(self, leerie, gate_env,
                                         monkeypatch):
         monkeypatch.setattr(
-            leerie, "_probe_case_facts",
-            lambda tree, probe, case, **_kw: {**_facts_for(Path(probe).read_text()),
-                                       "evals": ["eval"]})
+            leerie, "_probe_case_facts_placed",
+            _placed(lambda tree, probe, case, **_kw: {**_facts_for(Path(probe).read_text()),
+                                       "evals": ["eval"]}))
         out = _gates(leerie, gate_env, _claim())
         assert out["gates"]["not_coupled"] is False
         assert out["coupling"]["reasons"] == ["R2 eval"]
@@ -939,9 +947,9 @@ class TestFalsifierGates:
         `facts_read: false` — never as a failed assertion or coupling gate
         the falsifier could be blamed for."""
         monkeypatch.setattr(
-            leerie, "_probe_case_facts",
-            lambda tree, probe, case, **_kw: {"error": "facts_failed",
-                                       "stderr": "TypeError: Latest"})
+            leerie, "_probe_case_facts_placed",
+            _placed(lambda tree, probe, case, **_kw: {"error": "facts_failed",
+                                       "stderr": "TypeError: Latest"}))
         out = _gates(leerie, gate_env, _claim())
         assert out["confirmed"] is False
         assert out["gates"] == {
@@ -959,9 +967,9 @@ class TestFalsifierGates:
         """`case_not_found` is a fact about the probe, not a script
         failure: the facts were read, and the case's gates fail."""
         monkeypatch.setattr(
-            leerie, "_probe_case_facts",
-            lambda tree, probe, case, **_kw: {"error": "case_not_found",
-                                       "titles": []})
+            leerie, "_probe_case_facts_placed",
+            _placed(lambda tree, probe, case, **_kw: {"error": "case_not_found",
+                                       "titles": []}))
         out = _gates(leerie, gate_env, _claim())
         assert out["gates"]["facts_read"] is True
         assert out["gates"]["assertion_in_case"] is False
@@ -1015,8 +1023,9 @@ def _detection_env(leerie, tmp_path, monkeypatch, *, judged=True,
         st.save()
     monkeypatch.setattr(leerie, "_ts_resolvable", lambda tree, **_kw: ts)
     monkeypatch.setattr(
-        leerie, "_probe_case_facts",
-        lambda tree, probe, case, **_kw: _facts_for(Path(probe).read_text()))
+        leerie, "_probe_case_facts_placed",
+        _placed(lambda tree, probe, case, **_kw:
+                _facts_for(Path(probe).read_text())))
     caps = dict(leerie.DEFAULT_CAPS)
     caps["max_parallel"] = 1
     if k is not None:
@@ -1663,3 +1672,121 @@ def test_a_worker_only_item_is_an_unknown_row_not_met(leerie, tmp_path,
     assert 3 not in {u["item_index"] for u in gate["unmet_final"]}
     assert 3 not in leerie._ratchet_prior_met(st)
     assert 0 in leerie._ratchet_prior_met(st)
+
+
+# === a falsifier's probe is held-out content ===============================
+# (DESIGN §6 *A held-out evaluation runs alone*: the falsifier reads every
+# valid set, so its probe runs only in a held-out sandbox, placed, and
+# nothing of it reaches a fixer.)
+
+def _spy_streaming(leerie, monkeypatch, tree: Path, rel: str) -> list[dict]:
+    """Record, for every confined spawn, its sandbox, whether the run held
+    the evaluation's lock exclusive, and whether `tree/rel` was on disk."""
+    real = leerie._run_streaming
+    seen: list[dict] = []
+
+    async def spy(cmd, *, grants, sandbox=None, **kw):
+        seen.append({"cmd": " ".join(map(str, cmd)), "sandbox": sandbox,
+                     "alone": leerie._exec_lock().writer,
+                     "on_disk": (tree / rel).exists()})
+        return await real(cmd, grants=grants, sandbox=sandbox, **kw)
+    monkeypatch.setattr(leerie, "_run_streaming", spy)
+    return seen
+
+
+def test_the_confirm_runs_place_the_probe_and_never_write_the_checkout(
+        leerie, gate_env, monkeypatch):
+    """Executed through the real gates and `_capture_failing_test_ids`
+    (behind the test sandbox): every run that names the probe is alone, in
+    a sandbox over the pristine checkout with the probe placed, and the
+    probe is on disk there at no spawn and after."""
+    seen = _spy_streaming(leerie, monkeypatch, gate_env.confirm, PROBE_REL)
+    out = _gates(leerie, gate_env, _claim())
+    assert out["confirmed"] is True, out
+    runs = [s for s in seen if "test_add_probe" in s["cmd"]
+            or (s["sandbox"] and s["sandbox"].place)]
+    assert len(runs) >= 2, seen
+    for s in runs:
+        sb = s["sandbox"]
+        assert sb is not None and sb.view == str(gate_env.confirm), s
+        assert [r for _src, r in sb.place] == [PROBE_REL]
+        assert not Path(sb.place[0][0]).is_relative_to(gate_env.confirm)
+        assert s["alone"] is True and s["on_disk"] is False, s
+    assert not (gate_env.confirm / "falsify_probe").exists()
+    # leerie's own copy of the source is gone too.
+    assert not any(Path(s["sandbox"].place[0][0]).exists() for s in runs)
+
+
+def test_the_facts_read_places_the_probe(leerie, tmp_path, monkeypatch):
+    """The AST facts script reads the probe in the sandbox too: its JSON
+    comes back through the report, the checkout untouched."""
+    if shutil.which("node") is None or _ts_dir() is None:
+        pytest.skip("node or the typescript package unavailable")
+    monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", Path(_ts_dir()))
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    gate_env = types.SimpleNamespace(
+        st=st, confirm=leerie._falsifier_checkout(st, "falsifier-confirm",
+                                                  head))
+    src = gate_env.st.run_dir / "probe-src.test.ts"
+    src.write_text("describe('m', () => {\n  it('keeps the sum', () => {\n"
+                   "    expect(add(2, 3)).toBe(5);\n  });\n});\n")
+    seen = _spy_streaming(leerie, monkeypatch, gate_env.confirm,
+                          "probe/x.test.ts")
+    facts = asyncio.run(leerie._probe_case_facts_placed(
+        gate_env.st, gate_env.confirm, str(src), "probe/x.test.ts",
+        "m keeps the sum"))
+    assert facts.get("title") == "keeps the sum", facts
+    assert "expect(add(2, 3)).toBe(5);" in " ".join(facts["reach_src"])
+    (s,) = seen
+    assert s["sandbox"].place == ((str(src), "probe/x.test.ts"),)
+    assert s["alone"] is True and s["on_disk"] is False
+    assert not (gate_env.confirm / "probe").exists()
+
+
+def test_a_probe_sentinel_never_reaches_a_fixer_and_its_rerun_is_placed(
+        leerie, tmp_path, monkeypatch):
+    """A confirmed sample whose probe and prose carry a sentinel (as a
+    held-back set's text could): the sentinel is in no record a fixer's
+    input is built from (`unmet_final`, the re-drive's re-check), the saved
+    probe is outside every implementer grant, and the re-drive's re-run of
+    it is placed in a sandbox over staging, never written there."""
+    repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                          k=1)
+    sentinel = "HELD_BACK_SENTINEL_7f3a"
+    src = PROBE_SRC + f"\n# {sentinel}\n"
+
+    def behave(kw, n):
+        if "add(2, 3)" in kw["user_prompt"]:
+            _demonstrate(kw, n, src=src)
+            return _claim(reason=f"because {sentinel}",
+                          entry_point=f"add {sentinel}")
+        return _claim(verdict="could_not_demonstrate", probe_path="")
+    _falsifier_stub(leerie, monkeypatch, st, behave)
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    gate = st.data["delivery_gate"]
+    assert [u["item_index"] for u in gate["unmet_final"]] == [0]
+    assert sentinel not in json.dumps(gate["unmet_final"])
+    saved = gate["items"][0]["falsifier"]["samples"][0]["probe_saved"]
+    probe = Path(saved["dir"], saved["file"])
+    assert sentinel in probe.read_text()
+    staging = st.run_dir / "worktrees" / "staging"
+    fixer_cwd = tmp_path / "fixer-tree"
+    fixer_cwd.mkdir()
+    g = leerie._worker_grants(
+        run_dir=st.run_dir, state=st.data, schema_key="implementer",
+        cwd=fixer_cwd, allowed_tools=leerie.ACT_TOOLS, env=dict(os.environ),
+        notes_id="s1")
+    real_probe = Path(os.path.realpath(probe))
+    assert not any(real_probe.is_relative_to(os.path.realpath(p))
+                   for p in g.rw + g.ro), "a fixer's grant reaches the probe"
+    seen = _spy_streaming(leerie, monkeypatch, staging, saved["file"])
+    out = asyncio.run(leerie._redrive_recheck_items(
+        st.run_dir, st, caps, MODELS, EFFORTS, staging, [0]))
+    assert out[0]["unmet"] is True and "falsifier" in out[0]["by"]
+    assert sentinel not in json.dumps(out)
+    runs = [s for s in seen if s["sandbox"] is not None
+            and any(r == saved["file"] for _s, r in s["sandbox"].place)]
+    assert runs and all(s["alone"] and not s["on_disk"] for s in runs)
+    assert not (staging / saved["file"]).exists()

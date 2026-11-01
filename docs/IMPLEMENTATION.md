@@ -4013,7 +4013,8 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   (`SETUP_HOOK_KIND`), `_run_mise_install` (`TOOLCHAIN_KIND`, one grant for
   `mise install` and `mise ls --current --json`, the latter through
   `run_proc(_confined_argv(…))`). The AST scripts take `grants` too:
-  `_probe_case_facts(tree, probe, case, *, grants)`,
+  `_probe_case_facts(tree, probe, case, *, grants)` (a probe on disk;
+  the falsifier's is never, and goes through `_probe_case_facts_placed`),
   `_ts_resolvable(tree, *, grants)`, `_redrive_ast_hits(staging, base,
   head, *, grants)`, via `_redrive_ast_available(staging, *, grants)` and
   `_redrive_escalation_gate(staging, base, head, *, grants)`. They spawn
@@ -8162,12 +8163,23 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `not_a_lead` (not under the leads, not an acceptance path), `runnable`
   (`_acceptance_cmd` renders it), `item_quote` (normalised
   `item_span_quote`, ≥ 8 non-space characters, inside the normalised item);
-  then the probe is copied into `falsifier-confirm` and run with
-  `_capture_failing_test_ids(serial=True, files=[probe])`: `case_fails`
+  then the probe — held-out content, its writer read every valid set
+  (DESIGN §6 *A held-out evaluation runs alone*) — is copied to a
+  `tempfile.mkstemp` file of leerie's own (removed after) and, never
+  written into `falsifier-confirm` (refused, `placed: false`, when that
+  path exists there), placed in a held-out sandbox over it:
+  `_capture_failing_test_ids(serial=True, files=[probe], db=True,
+  place=((<copy>, <probe>),))`, which with `place` runs each attempt in
+  `_held_out_section` with `HeldOutSandbox(view=tree, place=…,
+  report=<its report path>)`, `_heldout_grants` and
+  `_acceptance_cmd(…, placed=)`: `case_fails`
   (`_falsifier_case_id` finds the named case among the failing IDs, never a
   load failure), `fails_under_bstar` (`_confirm_still_failing` on that ID);
-  then `_probe_case_facts` (node `scripts/test-case-facts.cjs <probe>
-  <case>` run in the confirm checkout with `_ts_script_env()`). When it
+  then `_probe_case_facts_placed(st, tree, src, rel, case)` (node
+  `scripts/test-case-facts.cjs <tree>/<rel> <case> <report>` through
+  `_run_streaming` in the same kind of sandbox, alone, the probe placed,
+  env `_ts_script_env()`; the script writes its JSON to its optional
+  third argument, the sandbox's report, and the facts are read from it). When it
   returns an error starting `facts_failed` (the script crashed, timed out
   or printed no JSON — an infrastructure miss) the sample records
   `facts_read: false` and `facts_error` and stops there:
@@ -8180,8 +8192,13 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   transpile / non-literal import (R2), no import of an in-repo symbol that
   no tracked non-harness file besides its module references and the item
   does not name, resolved with `_ts_path_aliases` / `_js_resolve`, nor a
-  deep package path (R3)). The probe is removed afterwards. A sample is
-  confirmed only when every gate is true.
+  deep package path (R3)). Nothing of the probe is ever in the checkout.
+  A sample is confirmed only when every gate is true. A confirmed sample's
+  probe is saved under `acceptance/probes/` (no fixer's grant reaches
+  `acceptance/`), re-run only through `_evaluate_acceptance_sets` (placed,
+  sandboxed), and what reaches a fixer from it is only the evidence line
+  below — the item's own words — never the probe's text, case title or
+  the sample's prose.
 - **Verdict.** Per item, unmet when the judge record lists it (`by`:
   `judge`, or `untouched_paths`) or a sample is confirmed (`falsifier`).
   A confirmed sample's evidence is `a falsifier probe of the item's words

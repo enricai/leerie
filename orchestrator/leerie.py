@@ -44503,7 +44503,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                     log_path: Path, timeout: float,
                                     serial: bool = False,
                                     files: list[str] | None = None,
-                                    db: bool = False
+                                    db: bool = False,
+                                    place: tuple[tuple[str, str], ...] = ()
                                     ) -> dict | None:
     """Run `cmd` (its scoped form over `files` when given and renderable)
     once in `tree` with a structured report requested, and return
@@ -44517,14 +44518,19 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     1 s floor: no retry) — so a B* rerun given the budget left never runs
     past it twice (DESIGN §9 *Which failures are new*, step 2). With `db`,
     in a Prisma/PostgreSQL repo, each run has a throwaway database of its
-    own (`_test_db_argv`). A worker tree is run in its committed view,
+    own (`_test_db_argv`). With `place` (a falsifier's probe, held-out
+    content: DESIGN §6 *A held-out evaluation runs alone*), each run is in a
+    held-out sandbox over `tree`, alone, the `(source, relative path)`
+    pairs placed in it and never on disk, its report back through the
+    sandbox's descriptor. A worker tree is run in its committed view,
     installed there (`_measured_tree`; DESIGN §8 *Every measurement reads the
     committed view*)."""
     tree = await _measured_tree(st, tree, caps, log_path=log_path,
                                 label=label)
     run_files = list(files or [])
+    placed = {rel: src for src, rel in place}
     if run_files:
-        scoped = _acceptance_cmd(st, run_files, tree)
+        scoped = _acceptance_cmd(st, run_files, tree, placed)
         if scoped:
             cmd = scoped
         else:
@@ -44547,7 +44553,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     # The report is the command's output: beside its tree, in the tree's own
     # measurement directory (DESIGN §6 *Leerie's runs of the repository's
     # commands are confined too*).
-    grants = _measurement_grants(st, tree)
+    grants = (_heldout_grants(st, tree) if place
+              else _measurement_grants(st, tree))
     reports = _measure_dir(st, tree) / "reports"
     forbidden = _forbidden_specs(getattr(st, "data", None))
     # Run time spent by earlier attempts: charged to the retry's timeout.
@@ -44588,10 +44595,24 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                     _leaves_tree_as_found(tree, "test run", label):
                 t_run = time.monotonic()
                 try:
-                    await _run_streaming(
-                        argv, grants=grants, cwd=str(tree), env=env,
-                        timeout=max(1.0, left), log_path=log_path,
-                        label=f"{label}-ids: {run_cmd}", verbosity="quiet")
+                    if place:
+                        with contextlib.suppress(OSError):
+                            report.unlink()
+                        async with _held_out_section(st):
+                            await _run_streaming(
+                                argv, grants=grants, cwd=str(tree), env=env,
+                                timeout=max(1.0, left), log_path=log_path,
+                                label=f"{label}-ids: {run_cmd}",
+                                verbosity="quiet",
+                                sandbox=HeldOutSandbox(
+                                    view=str(tree), place=tuple(place),
+                                    report=str(report)))
+                    else:
+                        await _run_streaming(
+                            argv, grants=grants, cwd=str(tree), env=env,
+                            timeout=max(1.0, left), log_path=log_path,
+                            label=f"{label}-ids: {run_cmd}",
+                            verbosity="quiet")
                 finally:
                     spent += time.monotonic() - t_run
         except Exception:
@@ -54751,6 +54772,41 @@ def _probe_case_facts(tree: str | Path, probe: str | Path,
     return out if isinstance(out, dict) else {"error": "facts_failed"}
 
 
+async def _probe_case_facts_placed(st: "State", tree: str | Path, src: str,
+                                   rel: str, case: str) -> dict:
+    """`_probe_case_facts` of a probe that is never on disk in `tree`: the
+    facts script runs in a held-out sandbox over `tree`, alone, the probe
+    (`src`) placed at `rel`, its JSON written to the sandbox's report
+    (DESIGN §6 *A held-out evaluation runs alone*; a falsifier's probe is
+    held-out content). `{"error": "facts_failed…"}` when the script could
+    not run or wrote no JSON."""
+    report = _measure_dir(st, tree) / "reports" / (
+        f"facts-{uuid.uuid4().hex[:12]}")
+    with contextlib.suppress(OSError):
+        report.unlink()
+    try:
+        async with _held_out_section(st):
+            await _run_streaming(
+                ["node", str(TEST_CASE_FACTS), str(Path(tree) / rel), case,
+                 str(report)],
+                grants=_heldout_grants(st, tree), cwd=str(tree),
+                env=_ts_script_env(), timeout=120,
+                log_path=_held_out_logs(st.run_dir) / "falsifier-facts.log",
+                label="falsifier facts", verbosity="quiet",
+                sandbox=HeldOutSandbox(view=str(tree), place=((src, rel),),
+                                       report=str(report)))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"error": f"facts_failed: {type(e).__name__}"}
+    try:
+        out = json.loads(report.read_text())
+    except (OSError, ValueError):
+        return {"error": "facts_failed"}
+    finally:
+        with contextlib.suppress(OSError):
+            report.unlink()
+    return out if isinstance(out, dict) else {"error": "facts_failed"}
+
+
 def _coupling_referenced_elsewhere(name: str, module: str, repo: str | Path,
                                    sha: str) -> bool:
     """True when a tracked non-harness file other than `module` names the
@@ -55063,9 +55119,11 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                            label: str) -> dict:
     """Code decides whether a sample demonstrated anything (bench Q2 F+
     G1–G5): `{gates{...}, confirmed, case_id?, coupling?}`. The probe is
-    copied into the pristine installed checkout of the final commit, run
-    there with the runner's serial flags, confirmed under B*
-    (`_confirm_still_failing`), read by the AST facts script, and removed.
+    held-out content (its writer read every valid set): it is placed in a
+    held-out sandbox over the pristine installed checkout of the final
+    commit, never copied into it, run there with the runner's serial flags,
+    confirmed under B* (`_confirm_still_failing`) and read by the AST facts
+    script the same way (DESIGN §6 *A held-out evaluation runs alone*).
     In a Prisma/PostgreSQL repo each run has a database of its own
     (`_capture_failing_test_ids(db=True)`)."""
     g: dict = {}
@@ -55092,26 +55150,26 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
     if not all(g.values()):
         return out
     dst = confirm_tree / rel
-    if dst.exists():
+    if dst.exists() or dst.is_symlink():
         g["placed"] = False
         return out
-    made: list[Path] = []
-    parent = dst.parent
-    while not parent.exists():
-        made.append(parent)
-        parent = parent.parent
     log_path = _held_out_logs(st.run_dir) / f"falsifier-confirm-{label}.log"
     timeout = float(caps.get("worker_timeout_sec")
                     or DEFAULT_CAPS["worker_timeout_sec"])
+    # The probe's source: a copy of leerie's own, outside every grant, so
+    # nothing the lane does later changes what was confirmed.
+    fd, src = tempfile.mkstemp(prefix="leerie-probe-",
+                               suffix=Path(rel).suffix)
+    os.close(fd)
     try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(lane / rel, dst)
+        shutil.copyfile(lane / rel, src)
+        place = ((src, rel),)
 
         async def _run(left: float) -> set[str] | None:
             got = await _capture_failing_test_ids(
                 str(confirm_tree), cmd, st, caps, label=f"falsifier-{label}",
                 log_path=log_path, timeout=min(left, timeout), serial=True,
-                files=[rel], db=True)
+                files=[rel], db=True, place=place)
             return set(got["ids"]) if got is not None else None
         first = await _run(timeout)
         cid = _falsifier_case_id(first or (), str(res.get("case_name") or ""))
@@ -55126,13 +55184,8 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         if not g["fails_under_bstar"]:
             return out
         title = cid.split(" :: ", 1)[1] if " :: " in cid else cid
-        # The AST script loads the tree's own `typescript`: a confined
-        # command, under the execution lock (`_ts_script_run`).
-        async with _exec_lock().shared():
-            facts = await asyncio.to_thread(
-                functools.partial(_probe_case_facts, confirm_tree, dst, title,
-                                  grants=_measurement_grants(st,
-                                                             confirm_tree)))
+        facts = await _probe_case_facts_placed(st, confirm_tree, src, rel,
+                                               title)
         err = str(facts.get("error") or "")
         g["facts_read"] = not err.startswith("facts_failed")
         if not g["facts_read"]:
@@ -55153,11 +55206,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         g["not_coupled"] = cp.get("coupled") is False
     finally:
         with contextlib.suppress(OSError):
-            dst.unlink()
-        if made:
-            # Directories this placement created, with whatever the run left
-            # in them (a bytecode cache): none existed before.
-            _rmtree_owned(made[-1])
+            os.unlink(src)
     out["confirmed"] = all(g.values())
     return out
 

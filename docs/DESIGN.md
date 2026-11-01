@@ -3052,7 +3052,9 @@ It is constructed, not checked, in two halves.
 
 1. **Space.** Every run of a held-out file — the evaluation, its parse
    probe, the writer's validation, the case-failure capture, the discovery
-   reruns, the set audit's witness runs — starts in a sandbox the shim
+   reruns, the set audit's witness runs, and a delivery falsifier's probe
+   (its confirm runs, the AST facts read of it, and every later re-run of
+   a saved probe, the re-drive's included) — starts in a sandbox the shim
    builds before it runs anything (`--sandbox`): the isolation every
    confined process gets (*Every confined process has its own `/tmp`*),
    plus new network, UTS and PID namespaces; its tree as an overlay whose
@@ -3147,6 +3149,20 @@ container, plus a relay of output, report and exit status over a socket.
 The unprivileged route holds namespace capabilities only inside a child
 user namespace, which the evaluated code never holds after `exec`, and
 needs no privileged code.
+
+**A falsifier's probe is held-out content.** The falsifier reads every
+valid set, held-back ones included (its leads), so what it writes — the
+probe's source, its case title, its quoted assertion, its prose — can carry
+a held-back set's text. Its probe is therefore run as a set file is: placed
+in a sandbox over the pristine checkout of the final commit, never copied
+into a checkout (it was, for its confirm runs and its facts read, and the
+checkout outlives the sample); a saved probe (`acceptance/probes/`) is
+re-run only through the evaluation (`_evaluate_acceptance_sets`). What
+reaches a fixer from a confirmed sample is the span of the item's own
+words the probe tests (checked verbatim in the item) and the fact that it
+fails under B\* — never the probe's text, its case title, or the sample's
+prose — and no fixer's grant reaches `acceptance/`, where saved probes are
+kept.
 
 **Residual.** The verdict itself (which files of which set failed), which
 is the evaluation's purpose; and its duration, which a later worker can
@@ -9089,7 +9105,8 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   test is verbatim in the item (after NFC/whitespace normalisation);
   its named case fails under B* on a pristine installed copy of the
   final commit (`_confirm_still_failing`, serial runner, so a load
-  flake never confirms); the failing assertion it quotes lies inside
+  flake never confirms), the probe placed in a held-out sandbox over that
+  copy, never written into it (§6 *A held-out evaluation runs alone*); the failing assertion it quotes lies inside
   that case's reachable code; and the AST coupling check is clean —
   the case reads no source or document text, evaluates no code text,
   and imports no symbol only tests use (`_falsifier_coupling`, over

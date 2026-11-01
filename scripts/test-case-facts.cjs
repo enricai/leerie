@@ -1,7 +1,9 @@
 // Mechanical coupling facts for ONE test case, from the TypeScript AST of its
 // file (DESIGN §8 *Delivery detection*; bench n2d/Q2 facts.cjs, unchanged
 // except where `typescript` is loaded from).
-// Usage: node test-case-facts.cjs <file> <case fullName or title> -> JSON on stdout
+// Usage: node test-case-facts.cjs <file> <case fullName or title> [out]
+//   -> JSON on stdout, or written to <out> (a held-out sandbox's report:
+//   the probe it reads is placed in the sandbox, never on disk).
 // Reachable code = the case callback + enclosing describe hooks + every
 // file-level/describe-level declaration transitively referenced from those.
 // Facts are syntactic only; the policy lives in leerie.py
@@ -10,7 +12,9 @@
 // it has the compiler API, else the image's pinned copy.
 const ts = require('./load-typescript.cjs').loadTypescript().ts;
 const fs = require('fs');
-const [file, want] = process.argv.slice(2);
+const [file, want, out] = process.argv.slice(2);
+const emit = (o) => (out ? fs.writeFileSync(out, JSON.stringify(o))
+                         : console.log(JSON.stringify(o)));
 const text = fs.readFileSync(file, 'utf8');
 const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true,
   file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
@@ -55,7 +59,7 @@ function titleMatches(t, full) {
 }
 let best = null, bl = 0;
 for (const c of cases) { const l = titleMatches(c.title, want); if (l > bl) { bl = l; best = c; } }
-if (!best) { console.log(JSON.stringify({ error: 'case_not_found', titles: cases.map(c => c.title).slice(0, 50) })); process.exit(0); }
+if (!best) { emit({ error: 'case_not_found', titles: cases.map(c => c.title).slice(0, 50) }); process.exit(0); }
 
 // declarations available: top-level statements + each enclosing suite body statements
 const scopes = [sf.statements, ...best.suites.map(s => s.body.statements || [])];
@@ -126,5 +130,5 @@ const usedImports = [];
 for (const [local, b] of importBind) if (usedNames.has(local)) usedImports.push({ local, ...b });
 for (const s of dyn) usedImports.push({ local: null, spec: s, imported: '*dynamic', typeOnly: false });
 const reach_src = [...reach].map(n => n.getText(sf));
-console.log(JSON.stringify({ title: best.title, reach_src, case_src: best.node.getText(sf), reads, execs, evals, imports: usedImports,
-  vm_import: imports.some(s => s === 'vm' || s === 'node:vm'), all_imports: imports }));
+emit({ title: best.title, reach_src, case_src: best.node.getText(sf), reads, execs, evals, imports: usedImports,
+  vm_import: imports.some(s => s === 'vm' || s === 'node:vm'), all_imports: imports });
