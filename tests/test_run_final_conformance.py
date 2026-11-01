@@ -416,6 +416,7 @@ def _result_event(tid, text):
 
 
 def _write_log(path, events):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
     register_worker_transcript(path)
 
@@ -466,7 +467,8 @@ def test_within_round_repetition_injects_feedback_into_next_round(env):
             # Round 0's own transcript, discovered by
             # _emit_bash_axis_warnings after this round completes.
             _write_log(
-                env["run_dir"] / "logs" / "final-conformer-r0.log",
+                env["leerie"]._worker_log_path(
+                    env["run_dir"], "final-conformer-r0", "conformer"),
                 [_bash_event("a1", "npm test"),
                  _result_event("a1", "1 test passed"),
                  _bash_event("a2", "npm test"),

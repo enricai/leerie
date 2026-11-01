@@ -95,7 +95,7 @@ def test_code_the_worker_runs_cannot_write_into_its_transcript(
         str(tree), 60, sid, run["run_dir"], "quiet", grants=g,
         env_extra=run["env"]))
     assert isinstance(res, dict)
-    log = run["run_dir"] / "logs" / f"{sid}.log"
+    log = leerie._worker_log_path(run["run_dir"], sid, "implementer")
     assert leerie._is_worker_transcript(log)
     pairs = list(leerie._iter_log_tool_use(log))
     ran = [inp.get("command") for kind, inp, _result in pairs

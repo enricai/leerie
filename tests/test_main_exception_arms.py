@@ -636,3 +636,105 @@ class TestPhaseFlagShortCircuit:
         leerie.main()
 
         assert judge_calls == [1], "phase_judge should run once (no index)"
+
+
+
+class TestListShowsADeath:
+    """DESIGN §6 *A run that died says so*: `leerie list` derives each run's
+    status from what the real `main()` left behind. A `die()` used to list
+    `done` (its discovery stamp of `finished_at` was the only record) and a
+    worker error `in-progress`; a pause or an interrupt is not a death.
+
+    Each stub first records what a real run has by the time it can die —
+    its task and its layout — so `state.json` exists for `list` to find."""
+
+    @staticmethod
+    def _status(leerie, repo, run_id):
+        rows = {r[0]: r[2]
+                for r in leerie._collect_run_rows(repo / ".leerie")}
+        return rows[run_id]
+
+    @staticmethod
+    def _seeded(leerie, then, held=None):
+        async def stub(args, caps, run_dir, st, *a):
+            st.data.update(task="a trivial task",
+                           run_layout=leerie.RUN_LAYOUT_VERSION)
+            st.save()
+            if held is not None:
+                held.append(st)
+            then()
+        return stub
+
+    def _run_json(self, repo, run_id):
+        p = repo / ".leerie" / "runs" / run_id / "run.json"
+        return json.loads(p.read_text()) if p.is_file() else {}
+
+    def test_a_die_lists_failed(self, leerie, monkeypatch, repo):
+        def die():
+            leerie.die("synthetic mid-run failure")
+        exit_code, _ = _run_main(leerie, monkeypatch, repo, "list-die",
+                                 orchestrate_stub=self._seeded(leerie, die))
+        assert exit_code == 1
+        rj = self._run_json(repo, "list-die")
+        assert rj["finished_at"] and rj["failed_at"]
+        assert self._status(leerie, repo, "list-die") == "failed"
+
+    def test_a_worker_error_and_a_crash_list_failed(self, leerie,
+                                                    monkeypatch, repo):
+        def worker():
+            raise leerie.WorkerError("worker died")
+        _run_main(leerie, monkeypatch, repo, "list-worker",
+                  orchestrate_stub=self._seeded(leerie, worker))
+        assert self._status(leerie, repo, "list-worker") == "failed"
+
+        def crash():
+            raise RuntimeError("genuinely unexpected")
+        monkeypatch.setattr(
+            sys, "argv", ["leerie", "a trivial task", "--run-id", "list-crash"])
+        monkeypatch.setattr(leerie, "_orchestrate",
+                            self._seeded(leerie, crash))
+        with pytest.raises(RuntimeError):
+            leerie.main()
+        assert self._status(leerie, repo, "list-crash") == "failed"
+
+    def test_a_pause_an_interrupt_and_a_clean_exit_do_not(
+            self, leerie, monkeypatch, repo):
+        def ctx():
+            raise leerie.ContextOverflow("Prompt is too long",
+                                         from_worker=True)
+
+        def ctrl_c():
+            raise KeyboardInterrupt()
+
+        def answers():
+            sys.exit(leerie.EXIT_NEEDS_ANSWERS)
+
+        def ok():
+            return None
+        for run_id, then in (("list-pause", ctx), ("list-ctrl-c", ctrl_c),
+                             ("list-answers", answers), ("list-ok", ok)):
+            _run_main(leerie, monkeypatch, repo, run_id,
+                      orchestrate_stub=self._seeded(leerie, then))
+            assert not self._run_json(repo, run_id).get("failed_at"), run_id
+            assert self._status(leerie, repo, run_id) in (
+                "in-progress", "done"), run_id
+
+    def test_a_resume_that_ends_cleanly_is_no_longer_failed(
+            self, leerie, monkeypatch, repo):
+        held: list = []
+
+        def die():
+            leerie.die("synthetic failure")
+        _run_main(leerie, monkeypatch, repo, "list-resumed",
+                  orchestrate_stub=self._seeded(leerie, die, held))
+        assert self._status(leerie, repo, "list-resumed") == "failed"
+        # The first invocation's process would have exited by now.
+        held[0].release_lock()
+
+        async def _ok(*a, **kw):
+            return None
+        monkeypatch.setattr(sys, "argv", ["leerie", "resume", "list-resumed"])
+        monkeypatch.setattr(leerie, "_orchestrate", _ok)
+        leerie.main()
+        assert self._run_json(repo, "list-resumed")["failed_at"] is None
+        assert self._status(leerie, repo, "list-resumed") != "failed"

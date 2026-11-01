@@ -184,11 +184,22 @@ def validate_or_fallback_required(schema: dict, instance: dict) -> bool:
     return False
 
 
+def transcript_path(log_dir: Path, name: str) -> Path:
+    """Where `_invoke` writes worker transcript `name` of log directory
+    `log_dir` (`logs/` or `logs/held-out/`): its transcripts directory,
+    apart from leerie's command logs (DESIGN §8 *What a worker ran is read
+    from its own transcript*). The directory is made."""
+    d = Path(log_dir) / "transcripts"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / name
+
+
 def register_worker_transcript(log_path: Path) -> Path:
     """Register a hand-written fixture log as a worker's transcript, the
     line `_invoke` appends when it spawns one (`TRANSCRIPTS_REGISTRY`): the
     readers of what a worker ran take registered transcripts only (DESIGN §8
-    *What a worker ran is read from its own transcript*)."""
+    *What a worker ran is read from its own transcript*). A fixture meant
+    to be found by a reader is written at `transcript_path`."""
     with (log_path.parent / "transcripts.ndjson").open("a") as f:
         f.write(json.dumps({"sid": log_path.stem, "log": log_path.name})
                 + "\n")

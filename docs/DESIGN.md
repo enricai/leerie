@@ -4177,8 +4177,8 @@ guess when the user named a run). Without one, the orchestrator considers
 only the runs that are actually resumable — those whose derived status is
 `in-progress`, `paused`, or `incomplete` — and picks the most recent. A
 run that has finished (`done`, `done-pushed-pr`) has nothing to resume, and
-one that needs operator attention first (`seed-failed`, `sync-failed`) is
-never auto-picked: both are listed, not chosen. Nor is a run another
+one that needs operator attention first (`seed-failed`, `sync-failed`,
+`failed`) is never auto-picked: both are listed, not chosen. Nor is a run another
 leerie's layout made (`other-leerie`, *A run directory is continued only by
 a leerie of its layout*): this leerie refuses to resume it. When no run is resumable,
 or the newest cannot be identified, `resume` lists the candidates and
@@ -4401,7 +4401,8 @@ never silent corruption.
 A run directory's layout is whatever the leerie that made it writes there:
 where the worktrees and branches live (the user's repository, or the run's
 own `repo`), the per-tree repositories, the measurement directories, the
-transcript registry (`transcripts.ndjson`), `logs/held-out/`, the ref-less
+transcript registry (`transcripts.ndjson`), `logs/held-out/`, the
+transcripts directories (`logs/transcripts/`), the ref-less
 clones' git directories. A later process of the same run reads those
 records back, and it reads them with its own idea of the layout. Run with a
 different one, a record's *absence* is misread: a directory made before the
@@ -4957,6 +4958,25 @@ completion against `state.json`. Three gates enforce this:
 
 A genuine completion is unaffected: by the time `phase_finalize` and
 `host_finalize` run, `completed_waves == len(waves)`.
+
+**A run that died says so.** `leerie list` showed a run that `die()`d
+before its waves existed or after they all integrated as `done`: the
+die-path stamp of `finished_at` was the only record, and it reads the
+same as a completion (review round 22, a preflight death and a held-out
+set's death both listed `done`). A run that died of a worker error or an
+unhandled exception stamped nothing and listed `in-progress`. The root
+cause is that nothing recorded the death itself; the invariant is that
+**a run whose last invocation died is listed as died**. The exit arm
+that sees the death records it, in `run.json`'s `failed_at`: the `die()`
+arm (every exit code but 0 and the deferred clarification's), the
+worker-error arm and the unhandled-exception arm. A pause, an interrupt
+and a clarification wait record nothing — they are not deaths. Each
+invocation clears the previous one's `failed_at` as it starts, so a run
+resumed to completion is not listed `failed`. `leerie list` shows such a
+run `failed`, or `incomplete` when it died mid-wave (the more specific
+status, which a bare `resume` still picks); a `failed` run is resumed by
+id, not auto-picked, because a death's message names a fix the operator
+owes first.
 
 **Recovery when the orchestrator dies before `finished_at`.** An
 uncontrolled exit (SIGKILL, OOM, power loss, or any crash bypassing the
@@ -9555,11 +9575,24 @@ settle-time execution check), and the per-subtask and final conformers'
 axes were measured into the conformer's own transcript file — so a test
 printing a `tool_use` line for `pnpm test` and a `tool_result` line
 saying it passed entered the record as a passing run, in the conformer's
-name. So: leerie registers each transcript as it spawns the worker
-(`transcripts.ndjson` beside it), and a reader that enumerates
-transcripts takes only registered ones; no command's output is written
-to a transcript (a measurement refuses a registered transcript's path);
-and within a transcript only the stream's own events count — a line of
+name. So: a worker's transcript is written in its log directory's own
+`transcripts/` directory (`logs/transcripts/`, `logs/held-out/transcripts/`),
+which only leerie's spawn of a worker writes, and every log of a command
+leerie runs is written beside it, never in it. The two are separate
+namespaces, so no command's output path can name a transcript, whatever
+names the two sides pick. Measured (review round 22 H4): while both were
+`<logs>/<name>.log`, a command log and a transcript met whenever the
+names did — the acceptance writer's transcript and its set's validation
+run were both `logs/held-out/acceptance-<k>.log`, the refusal below fired
+on leerie's own path, and every run that wrote held-out sets died at the
+first set's validation; earlier, per-site suffixes (`-axes.log`) had kept
+the conformers' axes out of their transcripts one name at a time. The
+root cause was the shared namespace, and the invariant is that no
+command's output path can name a transcript. Leerie also registers each
+transcript as it spawns the worker (`transcripts.ndjson` beside it), and
+a reader that enumerates transcripts takes only registered ones; a
+measurement refuses any path in a transcripts directory, or a registered
+transcript's; and within a transcript only the stream's own events count — a line of
 the CLI's stderr, which leerie writes into the same file under its own
 header, is never parsed as an event. The stream is the CLI's alone: no
 command the worker runs can write into it, because each runs in a Landlock
@@ -11783,10 +11816,11 @@ relays, each closed where it relayed:
   output the evaluated code writes — a printed line shaped like a tool
   call is read as one. Every log of the held-out side is now written under
   `logs/held-out/` (`HELD_OUT_LOGS_DIRNAME`): leerie's runs of set files
-  and of falsifier probes, and the transcripts of the workers that read a
-  set or run one (`HELD_OUT_LOG_WORKERS`: the acceptance writer, the set
-  auditor, the scope judge and the falsifier, whose leads are every valid
-  set). Nothing that builds a worker's input reads that directory.
+  and of falsifier probes, and, in its `transcripts/`, the transcripts of
+  the workers that read a set or run one (`HELD_OUT_LOG_WORKERS`: the
+  acceptance writer, the set auditor, the scope judge and the falsifier,
+  whose leads are every valid set). Nothing that builds a worker's input
+  reads that directory.
 - *The falsifier's evidence.* A confirmed sample put its probe's case
   title and its own prose into `unmet_final`, which the re-drive's
   implementers read; both come from a worker that read the held-back

@@ -404,7 +404,7 @@ def test_log_file_written_at_stream(leerie, leerie_dir, monkeypatch):
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t3", leerie_dir=leerie_dir,
         verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
-    log_text = (leerie_dir / "logs" / "t3.log").read_text()
+    log_text = (leerie._transcripts_dir(leerie_dir / "logs") / "t3.log").read_text()
     # All 3 events appear in the file.
     assert "system/init" in log_text
     assert "assistant" in log_text
@@ -426,7 +426,7 @@ def test_log_file_written_at_quiet(leerie, leerie_dir, monkeypatch):
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t4", leerie_dir=leerie_dir,
         verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
-    log_text = (leerie_dir / "logs" / "t4.log").read_text()
+    log_text = (leerie._transcripts_dir(leerie_dir / "logs") / "t4.log").read_text()
     assert "system/init" in log_text
     assert "result/success" in log_text
 
@@ -446,7 +446,7 @@ def test_log_file_records_non_json_lines(leerie, leerie_dir, monkeypatch):
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t5", leerie_dir=leerie_dir,
         verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
-    log_text = (leerie_dir / "logs" / "t5.log").read_text()
+    log_text = (leerie._transcripts_dir(leerie_dir / "logs") / "t5.log").read_text()
     assert "non-json-line" in log_text
     assert "not valid json at all" in log_text
 

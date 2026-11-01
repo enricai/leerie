@@ -610,7 +610,7 @@ def test_stderr_written_to_log_file_live(leerie, leerie_dir, monkeypatch):
         timeout=60, sid="t-stderr-file", leerie_dir=leerie_dir,
         verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
-    log_text = (leerie_dir / "logs" / "t-stderr-file.log").read_text()
+    log_text = (leerie._transcripts_dir(leerie_dir / "logs") / "t-stderr-file.log").read_text()
     assert "stderr" in log_text, (
         "per-sid log file must contain a `stderr` header for each "
         "stderr line; got log text:\n" + log_text)
@@ -669,7 +669,7 @@ def test_stderr_not_echoed_at_quiet(leerie, leerie_dir, monkeypatch, capsys):
         "stderr must not echo to the orchestrator at `quiet` verbosity; "
         f"got:\n{out}")
     # File still gets it.
-    log_text = (leerie_dir / "logs" / "t-stderr-quiet.log").read_text()
+    log_text = (leerie._transcripts_dir(leerie_dir / "logs") / "t-stderr-quiet.log").read_text()
     assert "chatty progress message" in log_text, (
         "per-sid log file must still capture stderr even at quiet; got "
         f"log text:\n{log_text}")

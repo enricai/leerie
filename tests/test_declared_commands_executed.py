@@ -206,6 +206,7 @@ def _write_worker_log(path, commands):
         {"type": "tool_use", "id": "tu_r", "name": "Read",
          "input": {"file_path": "x"}}]}}))
     lines.append("not json {")
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n")
     register_worker_transcript(path)
 
@@ -391,7 +392,8 @@ def test_clean_later_attempt_clears_the_stale_warning(env, monkeypatch):  # noqa
     blocked-dict clear guard against."""
     leerie_mod = env["leerie"]
     _declare(env, ["pnpm build"])
-    _write_worker_log(env["run_dir"] / "logs" / f"{env['sid']}.log",
+    _write_worker_log(env["leerie"]._worker_log_path(
+        env["run_dir"], env["sid"], "implementer"),
                       ["pnpm run build"])
     # Stale warning from a (simulated) earlier rescued attempt.
     env["st"].data["declared_unrun_warnings"] = {
@@ -417,7 +419,8 @@ def test_executed_declared_command_settles_complete_without_redrive(
         env, monkeypatch):  # noqa: F811
     leerie_mod = env["leerie"]
     _declare(env, ["pnpm build"])
-    _write_worker_log(env["run_dir"] / "logs" / f"{env['sid']}.log",
+    _write_worker_log(env["leerie"]._worker_log_path(
+        env["run_dir"], env["sid"], "implementer"),
                       ["cd /work && pnpm run build | tail -3"])
     calls: list = []
 

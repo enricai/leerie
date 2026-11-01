@@ -1740,8 +1740,9 @@ def _deregister_orphaned_worktrees(reaped: set) -> None:
 
 def _last_activity(d) -> float:
     """Newest mtime among the run dir, the files a live run keeps writing,
-    and the entries of `logs/` and `worktrees/` -- the same signal the
-    orchestrator's preflight reap reads (`_run_last_activity`)."""
+    and the entries of `logs/`, `logs/transcripts/` and `worktrees/` -- the
+    same signal the orchestrator's preflight reap reads
+    (`_run_last_activity`)."""
     ts = [d.stat().st_mtime]
     for f in ("state.json", "run.json", "orchestrator.log", "calls.ndjson",
               "memory.ndjson", "orchestrator.exit_code"):
@@ -1749,7 +1750,7 @@ def _last_activity(d) -> float:
             ts.append((d / f).stat().st_mtime)
         except OSError:
             pass
-    for sub in ("logs", "worktrees"):
+    for sub in ("logs", "logs/transcripts", "worktrees"):
         try:
             ts.append((d / sub).stat().st_mtime)
             for e in os.scandir(d / sub):

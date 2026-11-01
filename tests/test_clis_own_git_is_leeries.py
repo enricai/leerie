@@ -146,7 +146,7 @@ def _invoke(leerie, run, cli, tree, sid, schema_key, cmd, env):
         [str(cli), "-p", "--output-format", "stream-json", "--verbose", cmd],
         str(tree), 60, sid, run["run_dir"], "quiet", grants=g,
         env_extra=env))
-    return run["run_dir"] / "logs" / f"{sid}.log"
+    return leerie._worker_log_path(run["run_dir"], sid, schema_key)
 
 
 def _ran(leerie, log: Path) -> list[str]:

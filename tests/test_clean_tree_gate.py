@@ -23,7 +23,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from tests.conftest import register_worker_transcript, run_git_out  # noqa: E402
+from tests.conftest import register_worker_transcript, run_git_out, transcript_path  # noqa: E402
 
 
 _git = run_git_out
@@ -150,17 +150,17 @@ def test_the_reask_resumes_the_workers_own_session(leerie, tmp_path,
     st.data = {"worker_count": 0}
     logs = st.run_dir / "logs"
     logs.mkdir(parents=True)
-    (logs / "w1.log").write_text(
+    transcript_path(logs, "w1.log").write_text(
         json.dumps({"type": "system", "session_id": "S-old"}) + "\n"
         + json.dumps({"type": "result", "session_id": "S-1"}) + "\n")
-    register_worker_transcript(logs / "w1.log")
+    register_worker_transcript(transcript_path(logs, "w1.log"))
     calls: list[dict] = []
 
     async def fake_claude_p(**kw):
         calls.append(kw)
-        (logs / f"{kw['sid']}.log").write_text(
+        transcript_path(logs, f"{kw['sid']}.log").write_text(
             json.dumps({"session_id": f"S-{len(calls) + 1}"}) + "\n")
-        register_worker_transcript(logs / f"{kw['sid']}.log")
+        register_worker_transcript(transcript_path(logs, f"{kw['sid']}.log"))
         return {}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     reask = leerie._clean_tree_reasker(

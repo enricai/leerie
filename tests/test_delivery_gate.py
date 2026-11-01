@@ -26,7 +26,7 @@ import subprocess
 import pytest
 
 from tests.stub_helpers import _delivery_tree, _judge_verdict
-from tests.conftest import register_worker_transcript
+from tests.conftest import register_worker_transcript, transcript_path
 
 MODELS = {"delivery_judge": "sonnet", "conformer": "sonnet"}
 EFFORTS = {"delivery_judge": "medium", "conformer": "low"}
@@ -720,11 +720,11 @@ def test_exec_digest_section_reaches_the_judge(
     monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
     logs = run_dir / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    (logs / "conformer-x.log").write_text(json.dumps({
+    transcript_path(logs, "conformer-x.log").write_text(json.dumps({
         "message": {"content": [
             {"type": "tool_use", "id": "u1", "name": "Bash",
              "input": {"command": "pnpm test src/a.test.ts"}}]}}) + "\n")
-    register_worker_transcript(logs / "conformer-x.log")
+    register_worker_transcript(transcript_path(logs, "conformer-x.log"))
     calls = _patch_judge(leerie, monkeypatch, [_verdicts(True, True)])
     asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))

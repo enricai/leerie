@@ -82,6 +82,18 @@ def test_seed_failed_is_never_auto_picked(leerie, tmp_path):
     assert leerie.resolve_run_id(tmp_path, None, resumable_only=True) == "a" * 64
 
 
+def test_a_failed_run_is_never_auto_picked(leerie, tmp_path):
+    """A death's message names a fix the operator owes first (DESIGN §6 *A
+    run that died says so*): listed, resumable by id, never chosen."""
+    _mk_run(tmp_path, "a" * 64, started="2026-01-01T00:00:00+00:00")
+    _mk_run(tmp_path, "b" * 64, started="2026-06-01T00:00:00+00:00",
+            run_json={"finished_at": "2026-06-01T01:00:00+00:00",
+                      "failed_at": "2026-06-01T01:00:00+00:00"})
+    assert leerie.resolve_run_id(tmp_path, None, resumable_only=True) == "a" * 64
+    assert leerie.resolve_run_id(tmp_path, "b" * 64,
+                                 resumable_only=True) == "b" * 64
+
+
 def test_missing_started_at_never_outranks_a_real_timestamp(leerie, tmp_path):
     """A run with no started_at must sort BELOW one that has it, however
     the string comparison would otherwise fall."""

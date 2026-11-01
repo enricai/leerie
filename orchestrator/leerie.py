@@ -7223,6 +7223,28 @@ def _live_duplicate_runs(leerie_root: Path, run_id: str,
     return out
 
 
+def _record_run_died(run_dir: Path) -> None:
+    """Record in `run.json` that this invocation of the run died
+    (`failed_at`): a `die()`, a worker error or an unhandled exception —
+    never a pause, an interrupt or a deferred clarification (DESIGN §6 *A
+    run that died says so*). Best-effort, like every exit-arm write."""
+    try:
+        _write_run_json(run_dir, failed_at=now())
+    except Exception as e:  # noqa: BLE001 — an exit arm must not raise
+        log(f"warning: could not record the run's failure in run.json: {e}")
+
+
+def _clear_run_died(run_dir: Path) -> None:
+    """A new invocation of the run has not died: clear the last one's
+    `failed_at`, so a run resumed to completion is not listed `failed`."""
+    rj = _read_run_json_sidecar(run_dir / "run.json")
+    if rj and rj.get("failed_at"):
+        try:
+            _write_run_json(run_dir, failed_at=None)
+        except Exception as e:  # noqa: BLE001 — best-effort, as above
+            log(f"warning: could not clear run.json's failed_at: {e}")
+
+
 def _write_run_json(run_dir: Path, **fields) -> None:
     """Merge fields into the run.json sidecar at `run_dir/run.json`,
     validate the result, and write atomically.
@@ -7568,6 +7590,7 @@ RUN_STATUSES = (
     "in-progress",
     "incomplete",
     "done",
+    "failed",
     "done-pushed-no-pr",
     "done-pushed-pr",
     "push-failed",
@@ -7600,7 +7623,8 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
       6. sync_failed_at set        → `sync-failed` (machine still up, work
                                      not on host yet — recover via
                                      `leerie finalize` then `kill`).
-      6½. finished_at set but
+      6½. finished_at or
+          failed_at set but
           completed_waves <
           len(waves), and no
           killed_at/paused_at      → `incomplete` (run died mid-wave; the
@@ -7609,6 +7633,11 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
                                      all integrated — resumable). See
                                      DESIGN §6 *finished_at is a discovery
                                      sentinel, not a completion signal*.
+      6¾. failed_at set, and no
+          killed_at/paused_at      → `failed` (the run's last invocation
+                                     died: `die()`, a worker error or an
+                                     unhandled exception — DESIGN §6 *A
+                                     run that died says so*).
       7. finished_at set           → `done` (run completed, --no-push).
       8. killed_at set             → `killed` (explicit kill).
       9. paused_at set             → `paused` (pause-on-failure or stop).
@@ -7653,13 +7682,20 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
     # so list doesn't mislabel it and finalize doesn't push a partial
     # branch. killed_at/paused_at take precedence (an explicitly
     # stopped/killed run is not "incomplete" in the resumable sense).
-    if rj.get("finished_at") and not rj.get("killed_at") and not rj.get("paused_at"):
+    stopped = rj.get("killed_at") or rj.get("paused_at")
+    if (rj.get("finished_at") or rj.get("failed_at")) and not stopped:
         sj = state_json or {}
         waves = sj.get("waves")
         if (isinstance(waves, list)
                 and not sj.get("no_work_required")
                 and sj.get("completed_waves", 0) < len(waves)):
             return "incomplete"
+    # 6¾. `finished_at` is stamped for discovery by every `die()`, so it
+    # cannot tell a death from a completion; `failed_at` is the death's own
+    # record, written by the arm that saw it (DESIGN §6 *A run that died
+    # says so*).
+    if rj.get("failed_at") and not stopped:
+        return "failed"
     if rj.get("finished_at"):
         return "done"
     if rj.get("killed_at"):
@@ -10031,7 +10067,8 @@ async def _run_streaming(
     # the code under measurement prints in the shape of a tool call would be
     # read as one the worker made (DESIGN §8 *What a worker ran is read from
     # its own transcript*).
-    if log_path is not None and _is_worker_transcript(log_path):
+    if log_path is not None and (_in_transcripts_dir(log_path)
+                                 or _is_worker_transcript(log_path)):
         die(f"leerie was about to write a command's output into {log_path}, "
             "a worker's transcript — leerie's own invariant is broken "
             "(DESIGN §8 *What a worker ran is read from its own "
@@ -11069,7 +11106,7 @@ def _record_run_id_for_launcher(run_id: str) -> None:
 # directory is continued only by a leerie of its layout*). Bump it with any
 # change to what a run directory holds that a later process of the run reads
 # back. The layout before the field, which recorded nothing, counts as 1.
-RUN_LAYOUT_VERSION = 2
+RUN_LAYOUT_VERSION = 3
 
 
 def _refuse_other_run_layout(st: "State", verb: str) -> None:
@@ -12090,8 +12127,8 @@ def _run_last_activity(run_dir: Path) -> float:
     for f in _RUN_ACTIVITY_FILES:
         with contextlib.suppress(OSError):
             ts.append((run_dir / f).stat().st_mtime)
-    for sub in ("logs", "worktrees"):
-        p = run_dir / sub
+    for p in (run_dir / "logs", _transcripts_dir(run_dir / "logs"),
+              run_dir / "worktrees"):
         with contextlib.suppress(OSError):
             ts.append(p.stat().st_mtime)
             with os.scandir(p) as it:
@@ -23380,18 +23417,38 @@ def _held_out_logs(run_dir: str | Path) -> Path:
     return Path(run_dir) / "logs" / HELD_OUT_LOGS_DIRNAME
 
 
+# Worker transcripts live in their own directory under a log directory,
+# `<logs>/transcripts/<sid>.log`, where only `_invoke` writes; leerie's runs
+# of the repository's commands write beside it, in `<logs>/` itself, never
+# in it. So no command's output path can name a transcript, whatever the
+# two names are (DESIGN §8 *What a worker ran is read from its own
+# transcript*). When the two shared `<logs>/<name>.log`, the acceptance
+# writer's transcript and its set's validation run were one file.
+TRANSCRIPTS_DIRNAME = "transcripts"
+
+
+def _transcripts_dir(log_dir: str | Path) -> Path:
+    """The transcripts directory of log directory `log_dir`: `logs/` or
+    `logs/held-out/`. The one place it is named."""
+    return Path(log_dir) / TRANSCRIPTS_DIRNAME
+
+
 def _worker_log_path(run_dir: str | Path, sid: str, schema_key: str) -> Path:
     """Where `claude_p` writes worker `sid`'s transcript."""
-    return ((_held_out_logs(run_dir) if schema_key in HELD_OUT_LOG_WORKERS
-             else Path(run_dir) / "logs") / f"{sid}.log")
+    return _transcripts_dir(
+        _held_out_logs(run_dir) if schema_key in HELD_OUT_LOG_WORKERS
+        else Path(run_dir) / "logs") / f"{sid}.log"
+
+
+def _in_transcripts_dir(path: Path) -> bool:
+    """Whether `path` lies in a transcripts directory — where no command's
+    output may go."""
+    return path.parent.name == TRANSCRIPTS_DIRNAME
 
 
 # Beside a directory's transcripts, one line per spawn: which of its `*.log`
 # files a worker's `claude -p` session wrote, and as which worker (DESIGN §8
-# *What a worker ran is read from its own transcript*). The same directory
-# holds leerie's runs of the repository's commands, whose output the code
-# under measurement writes; a file is a transcript only if `_invoke`
-# registered it.
+# *What a worker ran is read from its own transcript*).
 TRANSCRIPTS_REGISTRY = "transcripts.ndjson"
 
 
@@ -23406,7 +23463,8 @@ def _register_worker_transcript(log_path: Path, sid: str) -> None:
 
 
 def _registered_transcripts(log_dir: Path) -> dict[str, str]:
-    """`{log file name: sid}` of the transcripts registered in `log_dir`."""
+    """`{log file name: sid}` of the transcripts registered in `log_dir`, a
+    transcripts directory (`_transcripts_dir`)."""
     try:
         lines = (log_dir / TRANSCRIPTS_REGISTRY).read_text().splitlines()
     except OSError:
@@ -23428,11 +23486,13 @@ def _registered_transcripts(log_dir: Path) -> dict[str, str]:
 
 
 def _worker_transcripts(log_dir: Path) -> list[tuple[str, Path]]:
-    """`(sid, path)` of every worker transcript in `log_dir` — the files
-    `_invoke` registered, never any other `*.log` there — newest first."""
+    """`(sid, path)` of every worker transcript of log directory `log_dir`
+    (`logs/` or `logs/held-out/`) — the files `_invoke` registered in its
+    transcripts directory, never a command's log — newest first."""
     found = []
-    for name, sid in _registered_transcripts(log_dir).items():
-        path = log_dir / name
+    tdir = _transcripts_dir(log_dir)
+    for name, sid in _registered_transcripts(tdir).items():
+        path = tdir / name
         try:
             found.append((path.stat().st_mtime, sid, path))
         except OSError:
@@ -24580,8 +24640,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     line of stdout is one JSON event. The final `type: "result"` event
     is the envelope (same shape as the non-streaming `--output-format
     json` path produces). All events are appended to
-    `<state-root>/logs/<sid>.log` (under `log_dir` instead when given: a
-    held-out-side worker's, `_worker_log_path`) regardless of verbosity.
+    `<run-dir>/logs/transcripts/<sid>.log` (under `log_dir` instead when
+    given: a held-out-side worker's, `_worker_log_path`) regardless of
+    verbosity.
     Inline summaries
     surface to the orchestrator log according to `verbosity` (see
     `_summarize_stream_event`).
@@ -24609,8 +24670,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     the only symptom is memory pressure attributable to nothing. The one
     legitimate caller is `preflight`'s smoke test, which has no run-level
     `max_parallel` context to gate against."""
-    log_path = (log_dir if log_dir is not None
-                else leerie_dir / "logs") / f"{sid}.log"
+    log_path = _transcripts_dir(log_dir if log_dir is not None
+                                else leerie_dir / "logs") / f"{sid}.log"
     _register_worker_transcript(log_path, sid)
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
@@ -41793,7 +41854,7 @@ def _clean_tree_reasker(st: "State", caps: dict, *, log_sid: str, cwd: str,
                         effort: str | None, max_turns: int
                         ) -> Callable[[str], Awaitable[None]]:
     """The re-ask of the SAME worker for `_clean_tree_gate`: its CLI session
-    (the last `session_id` in `<run>/logs/<log_sid>.log`, then in the
+    (the last `session_id` in its transcript, `_worker_log_path`, then in the
     previous re-ask's log) resumed in `cwd` with the note as the next turn,
     under the worker's own system prompt, schema and model. Its structured
     result is not read — only the tree is. Raises WorkerError when no
@@ -41802,7 +41863,8 @@ def _clean_tree_reasker(st: "State", caps: dict, *, log_sid: str, cwd: str,
     last = [log_sid]
 
     async def reask(note: str) -> None:
-        session = _log_session_id(st.run_dir / "logs" / f"{last[-1]}.log")
+        session = _log_session_id(
+            _worker_log_path(st.run_dir, last[-1], schema_key))
         if not session:
             raise WorkerError(f"no session recorded in {last[-1]}.log to "
                               "re-ask")
@@ -42893,9 +42955,9 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     if deferred:
         log(f"  {sid}: {', '.join(deferred)} deferred to the whole-tree pass "
             f"(no delta proxy for this diff)")
-    # Not the conformer's transcript (`{sid}-conformer.log`): the axes'
-    # output is the repository's (DESIGN §8 *What a worker ran is read from
-    # its own transcript*).
+    # A command log, in `logs/`: the axes' output is the repository's, never
+    # the conformer's transcript, which is under `logs/transcripts/` (DESIGN
+    # §8 *What a worker ran is read from its own transcript*).
     conf_log = leerie_dir / "logs" / f"{sid}-conformer-axes.log"
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
 
@@ -43153,7 +43215,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         # one. The conformer's sid is f"{sid}-conformer" — see
         # `_run_conformer` where claude_p is called.
         _emit_bash_axis_warnings(
-            leerie_dir / "logs" / f"{sid}-conformer.log",
+            _worker_log_path(leerie_dir, f"{sid}-conformer", "conformer"),
             f"conformer round {c_round}", warnings)
 
         # Measure AFTER the round and overwrite the worker's self-report
@@ -59984,9 +60046,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
 
 
 def _final_axes_log(leerie_dir: Path, rnd: int) -> Path:
-    """Where final-conformance round `rnd`'s axes are measured — never
-    `final-conformer-r{rnd}.log`, that round's worker's transcript (DESIGN
-    §8 *What a worker ran is read from its own transcript*)."""
+    """Where final-conformance round `rnd`'s axes are measured: a command
+    log in `logs/`, never that round's worker's transcript, which is under
+    `logs/transcripts/` (DESIGN §8 *What a worker ran is read from its own
+    transcript*)."""
     return leerie_dir / "logs" / f"final-conformer-r{rnd}-axes.log"
 
 
@@ -60301,7 +60364,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # per-subtask conformance phase. Final-conformer's sid is
         # f"final-conformer-r{c_round}" — see the claude_p call above.
         _emit_bash_axis_warnings(
-            leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
+            _worker_log_path(leerie_dir, f"final-conformer-r{c_round}",
+                             "conformer"),
             f"final conformer round {c_round}", warnings)
 
         # Same measure-after-and-overwrite as the per-subtask phase: the
@@ -63108,7 +63172,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 or not _denied_by_full_suite_rules(c, _suite_pats)]}
             declared_unrun = check_declared_commands_executed(
                 _declared,
-                _executed_bash_commands(leerie_dir / "logs" / f"{sid}.log"))
+                _executed_bash_commands(
+                    _worker_log_path(leerie_dir, sid, "implementer")))
             if not declared_unrun:
                 # A clean later attempt clears a stale warning from an
                 # earlier rescued attempt of the same sid — same
@@ -64722,7 +64787,9 @@ async def _integration_repair_round(
     ires, warnings = await _run_checked_loop(
         invoke=_invoke_repair, check=lambda r: check_integrator_output(r),
         name=f"integrator-repair-{sid}",
-        max_rounds=caps["judgment_check_rounds"], log_path=log_path)
+        max_rounds=caps["judgment_check_rounds"],
+        log_path=_worker_log_path(leerie_dir, f"integrator-repair-{sid}",
+                                  "integrator"))
     for w in warnings:
         log(f"  integrator-repair-{sid}: {w}")
 
@@ -65321,7 +65388,8 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 name=f"integrator-{sid}",
                 max_rounds=caps["judgment_check_rounds"],
                 make_feedback_prompt=_on_integrator_fb,
-                log_path=leerie_dir / "logs" / f"integrator-{sid}.log",
+                log_path=_worker_log_path(leerie_dir, f"integrator-{sid}",
+                                          "integrator"),
             )
             for w in int_warnings:
                 log(f"  integrator-{sid}: {w}")
@@ -68814,6 +68882,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     full_purge = False
     exit_code = 0
     exit_message: str | None = None
+    _clear_run_died(st.run_dir)
     try:
         asyncio.run(_orchestrate(args, caps, st.run_dir, st,
                                 sot_pref, verbosity, models, efforts))
@@ -68821,6 +68890,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         abnormal = True
         full_purge = False
         _save_state_best_effort(st, "WorkerError exit")
+        _record_run_died(st.run_dir)
         exit_message = str(e)
         exit_code = 1
     except ContextOverflow as e:
@@ -69100,6 +69170,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     _save_state_best_effort(st, "SystemExit exit")
                 _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
                 _ec = e.code if e.code is not None else 1
+                # A deferred clarification is the one non-error exit here.
+                if _ec not in (0, EXIT_NEEDS_ANSWERS):
+                    _record_run_died(st.run_dir)
                 (st.run_dir / "orchestrator.exit_code").write_text(
                     str(_ec) + "\n")
             except Exception:
@@ -69113,6 +69186,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         abnormal = True
         full_purge = False
         _save_state_best_effort(st, "BaseException exit")
+        if st is not None and st.run_dir is not None:
+            _record_run_died(st.run_dir)
         # `_brief_worker_exc` rather than `{e}`: str() on a
         # subprocess.TimeoutExpired renders `cmd`, i.e. the entire `claude -p`
         # argv including an inlined system prompt — the 50 KB terminal dump

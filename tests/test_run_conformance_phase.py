@@ -46,6 +46,7 @@ def _failing_axis(axis="build", command="make", summary="oops"):
 
 
 def _write_log(path, events):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
     register_worker_transcript(path)
 
@@ -763,8 +764,8 @@ def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
 
     # Write a log that triggers the Pattern B warning: a Bash command
     # auto-backgrounded, then immediately retried with a fresh Bash.
-    log_dir = env["run_dir"] / "logs"
-    _write_log(log_dir / f"{env['sid']}-conformer.log", [
+    _write_log(env["leerie"]._worker_log_path(
+        env["run_dir"], f"{env['sid']}-conformer", "conformer"), [
         _bash_event("a1", "npm run build"),
         _result_event("a1",
                       "Command running in background with ID: bg42. "
@@ -811,8 +812,8 @@ def test_pattern_a_multi_invocation_now_injects_feedback(env):
 
     # Write a log that triggers Pattern A only (multiple invocations,
     # no auto-backgrounding).
-    log_dir = env["run_dir"] / "logs"
-    _write_log(log_dir / f"{env['sid']}-conformer.log", [
+    _write_log(env["leerie"]._worker_log_path(
+        env["run_dir"], f"{env['sid']}-conformer", "conformer"), [
         _bash_event("a1", "npm test -- --testPathPattern=foo"),
         _result_event("a1", "1 test passed"),
         _bash_event("a2", "npm test"),

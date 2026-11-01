@@ -22,7 +22,7 @@ import types
 
 import pytest
 
-from tests.conftest import register_worker_transcript
+from tests.conftest import register_worker_transcript, transcript_path
 
 
 def _run(cmd, cwd, check=True):
@@ -264,11 +264,11 @@ def test_record_run_health_skips_malformed_log_lines(leerie, tmp_path):
     run_dir = tmp_path / "run"
     logs = run_dir / "logs"
     logs.mkdir(parents=True)
-    (logs / "feat-001.log").write_text(
+    transcript_path(logs, "feat-001.log").write_text(
         'not json but contains "result"\n'
         '{"type": "other", "result": "x"}\n'
         '{"type": "result", "duration_ms": 5000}\n')
-    register_worker_transcript(logs / "feat-001.log")
+    register_worker_transcript(transcript_path(logs, "feat-001.log"))
     st_stub = types.SimpleNamespace(run_dir=run_dir, data={})
     leerie._record_run_health(st_stub)
     health = json.loads((run_dir / "run.json").read_text())["health"]
@@ -283,10 +283,10 @@ def test_record_run_health_skips_lines_with_no_result_marker(leerie, tmp_path):
     run_dir = tmp_path / "run"
     logs = run_dir / "logs"
     logs.mkdir(parents=True)
-    (logs / "feat-001.log").write_text(
+    transcript_path(logs, "feat-001.log").write_text(
         "an unrelated stream-json event line\n"
         + json.dumps({"type": "result", "duration_ms": 2000}) + "\n")
-    register_worker_transcript(logs / "feat-001.log")
+    register_worker_transcript(transcript_path(logs, "feat-001.log"))
     st_stub = types.SimpleNamespace(run_dir=run_dir, data={})
     leerie._record_run_health(st_stub)
     health = json.loads((run_dir / "run.json").read_text())["health"]
@@ -300,11 +300,11 @@ def test_record_run_health_tolerates_unreadable_log_file(leerie, tmp_path):
     run_dir = tmp_path / "run"
     logs = run_dir / "logs"
     logs.mkdir(parents=True)
-    (logs / "bad.log").mkdir()  # a directory, not a file -> IsADirectoryError
-    register_worker_transcript(logs / "bad.log")  # read, so the error is met
-    (logs / "feat-001.log").write_text(
+    transcript_path(logs, "bad.log").mkdir()  # a directory, not a file -> IsADirectoryError
+    register_worker_transcript(transcript_path(logs, "bad.log"))  # read, so the error is met
+    transcript_path(logs, "feat-001.log").write_text(
         json.dumps({"type": "result", "duration_ms": 3000}) + "\n")
-    register_worker_transcript(logs / "feat-001.log")
+    register_worker_transcript(transcript_path(logs, "feat-001.log"))
     st_stub = types.SimpleNamespace(run_dir=run_dir, data={})
     leerie._record_run_health(st_stub)  # must not raise
     health = json.loads((run_dir / "run.json").read_text())["health"]
@@ -317,9 +317,9 @@ def test_record_run_health_tolerates_unreadable_sidecar(leerie, tmp_path):
     run_dir = tmp_path / "run"
     logs = run_dir / "logs"
     logs.mkdir(parents=True)
-    (logs / "feat-001.log").write_text(
+    transcript_path(logs, "feat-001.log").write_text(
         json.dumps({"type": "result", "duration_ms": 1000}) + "\n")
-    register_worker_transcript(logs / "feat-001.log")
+    register_worker_transcript(transcript_path(logs, "feat-001.log"))
     (run_dir / "run.json").write_text("not json")
     st_stub = types.SimpleNamespace(run_dir=run_dir, data={})
     leerie._record_run_health(st_stub)  # must not raise
@@ -607,9 +607,9 @@ def test_phase_finalize_no_push_skips_pr_and_records_health(
         leerie, monkeypatch, st):
     _finalize_ready_state(st)
     (st.run_dir / "logs").mkdir(parents=True, exist_ok=True)
-    (st.run_dir / "logs" / "feat-001.log").write_text(
+    transcript_path(st.run_dir / "logs", "feat-001.log").write_text(
         json.dumps({"type": "result", "duration_ms": 1000}) + "\n")
-    register_worker_transcript(st.run_dir / "logs" / "feat-001.log")
+    register_worker_transcript(transcript_path(st.run_dir / "logs", "feat-001.log"))
 
     compose_called = False
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from tests.conftest import register_worker_transcript
+from tests.conftest import register_worker_transcript, transcript_path
 
 MODELS = {"planner": "sonnet", "fit_judge": "sonnet", "splitter": "sonnet"}
 EFFORTS = {"planner": "medium", "fit_judge": "medium", "splitter": "medium"}
@@ -44,8 +44,8 @@ def _write_log(logs_dir, sid, pairs):
         lines.append(_log_line_use(uid, cmd))
         if result is not None:
             lines.append(_log_line_result(uid, result))
-    (logs_dir / f"{sid}.log").write_text("\n".join(lines) + "\n")
-    register_worker_transcript(logs_dir / f"{sid}.log")
+    register_worker_transcript(transcript_path(logs_dir, f"{sid}.log")).write_text(
+        "\n".join(lines) + "\n")
 
 
 # === _executed_commands_digest =============================================

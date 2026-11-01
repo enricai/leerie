@@ -18,7 +18,7 @@ import os
 import stat
 import types
 
-from tests.conftest import register_worker_transcript
+from tests.conftest import register_worker_transcript, transcript_path
 
 
 def _st(tmp_path, conformance=None):
@@ -225,8 +225,8 @@ def test_base_health_payload_unmeasurable_axis_not_red(leerie, tmp_path):
 def _write_result_log(logs_dir, sid, duration_ms, terminal="completed"):
     rec = {"type": "result", "subtype": "success",
            "duration_ms": duration_ms, "terminal_reason": terminal}
-    (logs_dir / f"{sid}.log").write_text(json.dumps(rec) + "\n")
-    register_worker_transcript(logs_dir / f"{sid}.log")
+    register_worker_transcript(transcript_path(logs_dir, f"{sid}.log")).write_text(
+        json.dumps(rec) + "\n")
 
 
 def test_record_run_health_picks_slowest_and_counts_truncation(

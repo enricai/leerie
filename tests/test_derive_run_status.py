@@ -207,7 +207,7 @@ def test_status_table_lists_every_value_used(leerie):
     can return — drift guard."""
     expected = {
         "seed-failed",
-        "corrupt-sidecar", "in-progress", "incomplete", "done",
+        "corrupt-sidecar", "in-progress", "incomplete", "done", "failed",
         "done-pushed-no-pr", "done-pushed-pr",
         "push-failed", "pr-failed",
         "paused", "killed",
@@ -360,3 +360,41 @@ def test_sync_failed_and_pushed_are_mutex(leerie):
         "fly_machine_id": "abc123",
     }
     assert leerie._derive_run_status(rj, {}) == "corrupt-sidecar"
+
+
+# --- a run that died says so (DESIGN §6 *A run that died says so*) --------
+
+T0 = "2026-11-01T00:00:00+00:00"
+
+
+def test_status_a_die_is_failed_not_done(leerie):
+    """The die path stamps `finished_at` for discovery and `failed_at` for
+    the death: the inputs disagree, and the death wins over `done`."""
+    rj = {"finished_at": T0, "failed_at": T0}
+    assert leerie._derive_run_status(rj, {}) == "failed"
+    assert leerie._derive_run_status({"finished_at": T0}, {}) == "done"
+
+
+def test_status_a_worker_error_without_finished_at_is_failed(leerie):
+    assert leerie._derive_run_status({"failed_at": T0}, {}) == "failed"
+    assert leerie._derive_run_status({}, {}) == "in-progress"
+
+
+def test_status_a_death_mid_wave_stays_incomplete(leerie):
+    sj = {"completed_waves": 1, "waves": [["a"], ["b"]]}
+    assert leerie._derive_run_status({"failed_at": T0}, sj) == "incomplete"
+    assert leerie._derive_run_status(
+        {"finished_at": T0, "failed_at": T0}, sj) == "incomplete"
+    done = {"completed_waves": 2, "waves": [["a"], ["b"]]}
+    assert leerie._derive_run_status(
+        {"finished_at": T0, "failed_at": T0}, done) == "failed"
+
+
+def test_status_failed_yields_to_push_kill_and_pause(leerie):
+    assert leerie._derive_run_status(
+        {"failed_at": T0, "pushed_at": T0}, {}) == "done-pushed-no-pr"
+    assert leerie._derive_run_status(
+        {"failed_at": T0, "killed_at": T0}, {}) == "killed"
+    assert leerie._derive_run_status(
+        {"failed_at": T0, "paused_at": T0, "fly_machine_id": "m"},
+        {}) == "paused"

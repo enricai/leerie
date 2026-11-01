@@ -17,14 +17,16 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.conftest import register_worker_transcript
+from tests.conftest import register_worker_transcript, transcript_path
 
 
 def _registered(log_dir: Path) -> Path:
     """Register every fixture log in `log_dir` as a worker transcript —
     `_extract_depcap_commands` reads registered transcripts only."""
     for p in sorted(log_dir.glob("*.log")):
-        register_worker_transcript(p)
+        dest = transcript_path(log_dir, p.name)
+        p.rename(dest)
+        register_worker_transcript(dest)
     return log_dir
 
 
@@ -140,7 +142,7 @@ def _make_jsonl_log(tmp_path: Path, commands: list[str], fname: str = "worker-00
     """Write a synthetic JSONL log file in the _iter_log_tool_use shape."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir(exist_ok=True)
-    log_path = log_dir / fname
+    log_path = transcript_path(log_dir, fname)
     lines: list[str] = []
     for i, cmd in enumerate(commands):
         event = {
@@ -206,7 +208,7 @@ class TestExtractDepcapCommands:
         """Only Bash tool_use blocks are extracted; Read blocks are skipped."""
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
-        log_path = log_dir / "worker-001.log"
+        log_path = transcript_path(log_dir, "worker-001.log")
         event = {
             "message": {
                 "content": [
@@ -408,7 +410,7 @@ def _make_fake_state(tmp_path: Path, commands: list[str]):
 
 def _make_jsonl_log_in(log_dir: Path, commands: list[str]) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "worker-001.log"
+    log_path = transcript_path(log_dir, "worker-001.log")
     lines: list[str] = []
     for i, cmd in enumerate(commands):
         event = {

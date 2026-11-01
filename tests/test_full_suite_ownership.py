@@ -625,7 +625,8 @@ def _settle_env(env, monkeypatch, *, declared, prescribed=None,
     if prescribed is not None:
         env["st"].data["prescribed_procedure"] = prescribed
     _declare(env, declared)
-    _write_worker_log(env["run_dir"] / "logs" / f"{env['sid']}.log",
+    _write_worker_log(env["leerie"]._worker_log_path(
+        env["run_dir"], env["sid"], "implementer"),
                       ["python3 -m pytest tests/test_x.py -q"])
     calls: list = []
 

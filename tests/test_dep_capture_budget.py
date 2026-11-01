@@ -18,14 +18,17 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import register_worker_transcript
+from tests.conftest import register_worker_transcript, transcript_path
 
 
 def _registered(log_dir: Path) -> Path:
-    """Register every fixture log in `log_dir` as a worker transcript —
-    `_extract_depcap_commands` reads registered transcripts only."""
+    """Put every fixture log written straight into `log_dir` where `_invoke`
+    writes a transcript, and register it — `_extract_depcap_commands` reads
+    registered transcripts only. A rename keeps each file's mtime."""
     for p in sorted(log_dir.glob("*.log")):
-        register_worker_transcript(p)
+        dest = transcript_path(log_dir, p.name)
+        p.rename(dest)
+        register_worker_transcript(dest)
     return log_dir
 
 
@@ -51,8 +54,8 @@ def _write_log(log_dir: Path, commands: list[str], fname: str) -> None:
             }
         }
         lines.append(json.dumps(event))
-    (log_dir / fname).write_text("\n".join(lines) + "\n")
-    register_worker_transcript(log_dir / fname)
+    register_worker_transcript(transcript_path(log_dir, fname)).write_text(
+        "\n".join(lines) + "\n")
 
 
 def _write_non_bash_log(log_dir: Path, fname: str) -> None:
@@ -70,8 +73,8 @@ def _write_non_bash_log(log_dir: Path, fname: str) -> None:
             ]
         }
     }
-    (log_dir / fname).write_text(json.dumps(event) + "\n")
-    register_worker_transcript(log_dir / fname)
+    register_worker_transcript(transcript_path(log_dir, fname)).write_text(
+        json.dumps(event) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -405,8 +408,10 @@ class TestExtractDepcapCommandsOrdering:
         # The newer file is registered LAST: order must come from mtime.
         _write_log(log_dir, ["apt-get install -y curl"], "w-002.log")
         _write_log(log_dir, ["apt-get install -y git"], "w-001.log")
-        os.utime(log_dir / "w-002.log", (2_000_000_000, 2_000_000_000))
-        os.utime(log_dir / "w-001.log", (1_000_000_000, 1_000_000_000))
+        os.utime(transcript_path(log_dir, "w-002.log"),
+                 (2_000_000_000, 2_000_000_000))
+        os.utime(transcript_path(log_dir, "w-001.log"),
+                 (1_000_000_000, 1_000_000_000))
         cmd_001 = "apt-get install -y git"
         cmd_002 = "apt-get install -y curl"
         # Budget for only one command
