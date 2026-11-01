@@ -1,11 +1,10 @@
-"""bugfix-004: the cgroup broker launch line must not inherit PID 1's stdio.
+"""bugfix-004: the cgroup broker must not inherit PID 1's stdio.
 
-container-entry.sh launches the cgroup broker with `python3 ... &`. A bare
-background launch inherits PID 1's stdout/stderr, which can hold the
+A background child that inherits PID 1's stdout/stderr can hold the
 container's output pipe open past PID 1's own exit, delaying EOF on the
 launcher's read side and contributing to the reported hang-on-exit. The
-launch line must explicitly redirect stdin/stdout/stderr away from those
-inherited fds.
+broker is forked by `cgroup-broker.py --spawn` (container-entry.sh's final
+exec), which points its stdin at /dev/null and its stdout/stderr at its log.
 """
 from __future__ import annotations
 
@@ -73,26 +72,40 @@ def test_redirected_background_child_lets_reader_see_eof_promptly():
     )
 
 
-def _extract_broker_launch_line() -> str:
-    src = ENTRY.read_text()
-    m = re.search(
-        r"^\s*LEERIE_CGROUP_V2_ROOT=.*?cgroup-broker\.py.*?&\s*$",
-        src, re.MULTILINE | re.DOTALL,
-    )
-    assert m, ("could not find the cgroup broker launch line in "
-               "container-entry.sh — did it get restructured?")
-    return m.group(0)
+def _broker_stdio(tmp_path: Path) -> dict:
+    """Run the real `cgroup-broker.py --spawn` with its stdout a pipe (PID
+    1's output, standing in for the container's), and report what the
+    forked broker's fds 0-2 are."""
+    import json
+    import subprocess
+    import sys
+    broker = REPO_ROOT / "scripts" / "cgroup-broker.py"
+    log = tmp_path / "broker.log"
+    probe = (
+        "import json, os\n"
+        "kid = open(f'/proc/self/task/{os.getpid()}/children').read().split()[0]\n"
+        "print(json.dumps({n: os.readlink(f'/proc/{kid}/fd/{n}') "
+        "for n in ('0', '1', '2')}))\n")
+    root = tmp_path / "cg"
+    root.mkdir()
+    r = subprocess.run(
+        [sys.executable, str(broker), "--spawn", "--log", str(log), "--",
+         sys.executable, "-c", probe],
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ, "LEERIE_CGROUP_V2_ROOT": str(root)})
+    assert r.returncode == 0, r.stderr
+    return {"fds": json.loads(r.stdout), "log": str(log)}
 
 
-def test_broker_launch_redirects_stdin_away_from_inherited_fd():
-    line = _extract_broker_launch_line()
-    assert re.search(r"<\s*/dev/null", line), (
-        "broker launch must redirect stdin away from PID 1's inherited fd")
+def test_broker_stdin_is_not_pid1s(tmp_path):
+    got = _broker_stdio(tmp_path)
+    assert got["fds"]["0"] == "/dev/null"
 
 
-def test_broker_launch_redirects_stdout_and_stderr_away_from_inherited_fds():
-    line = _extract_broker_launch_line()
-    assert re.search(r">>?\s*\S+", line), (
-        "broker launch must redirect stdout away from PID 1's inherited fd")
-    assert "2>&1" in line, (
-        "broker launch must redirect stderr away from PID 1's inherited fd")
+def test_broker_stdout_and_stderr_are_its_log_not_pid1s(tmp_path):
+    """PID 1's stdout here is the `subprocess.run` pipe; the broker, which
+    outlives the exec, must not hold it open."""
+    got = _broker_stdio(tmp_path)
+    assert got["fds"]["1"] == got["log"]
+    assert got["fds"]["2"] == got["log"]
+    assert not got["fds"]["1"].startswith("pipe:")

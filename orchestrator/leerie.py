@@ -6386,10 +6386,14 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
     # credentials outlives its run's process*). The resumed image makes its
     # own.
     _release_owned_run_dirs()
+    # The broker is reachable only through the descriptor this process
+    # holds; the new image adopts it as the first one did.
+    undo_broker = _hand_cgroup_broker_to_exec()
     try:
         os.execv(sys.executable,
                  [sys.executable, __file__, "resume", "--run-id", st.run_id])
     except OSError as ex:
+        undo_broker()
         # execv essentially never fails (the interpreter that's running us
         # exists), but if it does the exception would otherwise escape past the
         # sibling except arms as a bare traceback. Cleanup already ran, so fall
@@ -22058,14 +22062,20 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
 # rootful, the rootlesskit-mapped host UID rootless (which owns the
 # systemd-delegated user slice; DESIGN §6 *Rootless exception*) — launched by
 # container-entry.sh at PID 1 before the privilege drop, and performs
-# create/enroll/destroy on the orchestrator's behalf over a Unix socket. It
-# handles cgroup v1
+# create/enroll/destroy on the orchestrator's behalf over a descriptor this
+# process inherits — one end of a socket pair, never a pathname (DESIGN §6
+# *No service of leerie's is reachable by a path*). It handles cgroup v1
 # (Fly Firecracker VMs are v1/hybrid) vs v2 (Colima) transparently. The
 # functions below are thin socket clients; the public names/signatures are
 # unchanged so `_invoke`'s call sites are untouched, except `_cgroup_create`
 # now returns the sid (str) rather than a filesystem Path.
 
-_CGROUP_BROKER_SOCK = "/run/leerie-cgroup.sock"
+# The variable naming the broker's descriptor in the environment this process
+# was started with (`scripts/cgroup-broker.py`'s `FD_ENV`), and the socket
+# `_adopt_cgroup_broker` makes of it. None: no broker was handed to this
+# process (a host, a test), and every request fails as an unreachable broker.
+_CGROUP_BROKER_FD_ENV = "LEERIE_CGROUP_BROKER_FD"
+_CGROUP_BROKER: socket.socket | None = None
 _CGROUP_PROBE_RESULT: bool | None = None
 _CGROUP_HIERARCHY: str | None = None  # "v2" / "v1" — set by a passing probe
 # N18: must stay >= scripts/cgroup-broker.py's own `_DESTROY_DRAIN_TIMEOUT_SEC`
@@ -22090,15 +22100,71 @@ _CGROUP_HIERARCHY: str | None = None  # "v2" / "v1" — set by a passing probe
 _CGROUP_DESTROY_TIMEOUT_SEC = 15.0
 
 
+def _adopt_cgroup_broker() -> None:
+    """Take the broker descriptor this process was handed, before it starts
+    anything: made non-inheritable and its variable removed, so no worker
+    or command leerie starts holds it or is told its number (DESIGN §6 *No
+    service of leerie's is reachable by a path*). A descriptor that is not
+    a unix `SOCK_SEQPACKET` socket is left alone and not used."""
+    global _CGROUP_BROKER
+    raw = os.environ.pop(_CGROUP_BROKER_FD_ENV, None)
+    if raw is None or _CGROUP_BROKER is not None:
+        return
+    try:
+        fd = int(raw)
+        os.set_inheritable(fd, False)
+        sock = socket.socket(fileno=fd)
+    except (ValueError, OSError) as e:
+        log(f"  the cgroup broker descriptor {raw!r} is unusable ({e}); "
+            "worker containment will be OFF")
+        return
+    if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_SEQPACKET:
+        sock.detach()
+        log(f"  descriptor {raw} is not the cgroup broker's; worker "
+            "containment will be OFF")
+        return
+    # Bounds a send to a broker whose queue is full (it serves one request
+    # at a time, and a `destroy` can take its whole drain budget).
+    sock.settimeout(_CGROUP_DESTROY_TIMEOUT_SEC)
+    _CGROUP_BROKER = sock
+
+
+def _hand_cgroup_broker_to_exec() -> Callable[[], None]:
+    """Make the broker descriptor survive an `os.execv` of this process
+    (`_sleep_then_reexec`): inheritable, and named in the environment the
+    new image adopts it from. Returns the undo, for an exec that failed."""
+    sock = _CGROUP_BROKER
+    if sock is None:
+        return lambda: None
+    os.set_inheritable(sock.fileno(), True)
+    os.environ[_CGROUP_BROKER_FD_ENV] = str(sock.fileno())
+
+    def undo() -> None:
+        os.environ.pop(_CGROUP_BROKER_FD_ENV, None)
+        os.set_inheritable(sock.fileno(), False)
+    return undo
+
+
 def _cgroup_request(payload: str, timeout: float = 5.0) -> str:
     """Send one request to the cgroup broker and return its response line
-    (without trailing newline). Raises OSError if the broker is
-    unreachable or the round-trip fails."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout)
-        s.connect(_CGROUP_BROKER_SOCK)
-        s.sendall((payload + "\n").encode())
-        return s.recv(4096).decode(errors="replace").strip()
+    (without trailing newline). The request is one message on the broker's
+    descriptor, carrying a fresh socket the response comes back on, so
+    concurrent requests (from `asyncio.to_thread`) never share a reply and
+    one that times out leaves nothing behind for the next. Raises OSError
+    if the broker is unreachable or the round-trip fails."""
+    ctrl = _CGROUP_BROKER
+    if ctrl is None:
+        raise OSError(errno.ENOTCONN,
+                      "no cgroup broker descriptor was handed to this process")
+    mine, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with mine:
+        try:
+            socket.send_fds(ctrl, [(payload + "\n").encode()],
+                            [theirs.fileno()])
+        finally:
+            theirs.close()
+        mine.settimeout(timeout)
+        return mine.recv(4096).decode(errors="replace").strip()
 
 
 def _cgroup_probe() -> bool:
@@ -22114,10 +22180,11 @@ def _cgroup_probe() -> bool:
     try:
         resp = _cgroup_request("probe")
     except OSError as e:
-        log(f"  cgroup broker unreachable at {_CGROUP_BROKER_SOCK} "
-            f"({e.strerror or e}); worker containment is OFF for this "
-            f"run. Check that scripts/container-entry.sh launched "
-            f"scripts/cgroup-broker.py at PID 1.")
+        log(f"  cgroup broker unreachable ({e.strerror or e}); worker "
+            f"containment is OFF for this run. Check that "
+            f"scripts/container-entry.sh (or the remote launch wrapper) "
+            f"started scripts/cgroup-broker.py and handed its descriptor "
+            f"to the orchestrator ({_CGROUP_BROKER_FD_ENV}).")
         _CGROUP_PROBE_RESULT = False
         return False
     if resp.startswith("OK"):
@@ -67501,6 +67568,9 @@ def main() -> None:
     # Before any git runs: no git command of leerie's own fires a repository
     # hook (DESIGN §6½ *Hooks off*); `_invoke` gives a worker them back.
     _git_hooks_off(os.environ)
+    # The cgroup broker's descriptor, before anything is started that could
+    # inherit it (DESIGN §6 *No service of leerie's is reachable by a path*).
+    _adopt_cgroup_broker()
 
     # Install the child-subreaper role first thing, before any worker (or any
     # subprocess this process spawns) exists, so every descendant inherits the

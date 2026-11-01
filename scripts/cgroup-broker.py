@@ -21,9 +21,12 @@ cgroup subtree:
 This broker is launched by `scripts/container-entry.sh` at PID 1
 *before* the privilege drop to `leerie` — real root in the rootful case,
 the rootlesskit-mapped host UID in the rootless case — and the
-orchestrator drives it over a Unix socket regardless of which identity
-that is. It is the single most-privileged surface in the worker path, so
-it is deliberately tiny and validates every input.
+orchestrator drives it over a descriptor it inherits, one end of a socket
+pair made here (`spawn`), regardless of which identity that is. No
+pathname exists to connect to, so only the orchestrator can reach it
+(DESIGN §6 *No service of leerie's is reachable by a path*). It is the
+single most-privileged surface in the worker path, so it is deliberately
+tiny and validates every input.
 
 Rootless: rootlesskit maps the container's "root" to the real host UID,
 which has no privilege over the top-level `/sys/fs/cgroup` — but systemd
@@ -38,7 +41,8 @@ common-ancestor requirement for migration is satisfied because
 `user@<uid>.service` — the ancestor of both the worker's native container
 scope and our `leerie.slice` — is exactly what's delegated.
 
-Protocol (newline-terminated, one request per connection):
+Protocol (one request per message on the descriptor, carrying the
+client's reply socket; one newline-terminated response on that socket):
   ping                          -> OK
   probe                         -> OK <hierarchy>   (round-trips create+enroll+destroy of a throwaway cgroup)
   create <sid> <mem_bytes> <pids_max>  -> OK | ERR <msg>
@@ -90,7 +94,6 @@ import socket
 import sys
 import time
 
-SOCK_PATH = "/run/leerie-cgroup.sock"
 SLICE = "leerie.slice"
 # v1/hybrid (Fly Firecracker VMs) is always the literal cgroupfs root — it's
 # never observed rootless, so this one is not overridable.
@@ -499,11 +502,11 @@ def _live_sibling_count() -> int:
 # spanned 14 days while every live worker's directory was minutes old.
 _ORPHAN_MIN_AGE_SEC = 3600.0
 
-# Hard ceiling on the whole sweep. It runs before the socket binds, so any
-# time spent here is time the orchestrator's first broker request races —
-# and that request fails open, degrading worker sizing silently. A partial
-# sweep is strictly better than a delayed bind: whatever is missed is
-# reclaimed on the next start.
+# Hard ceiling on the whole sweep. It runs before the first request is
+# read, so any time spent here is time the orchestrator's first broker
+# request waits on — and a request that times out fails open, degrading
+# worker sizing silently. A partial sweep is strictly better than a delayed
+# answer: whatever is missed is reclaimed on the next start.
 _SWEEP_TOTAL_BUDGET_SEC = 5.0
 
 
@@ -533,8 +536,8 @@ def _sweep_orphaned_worker_cgroups() -> int:
     every resumed run — checked against the live host, where it would have
     deleted both running runs' cgroups.
 
-    Runs before the socket exists (see `main`), so no client of THIS broker
-    can be mid-create while it walks."""
+    Runs before the first request is read (see `_start`), so no client of
+    THIS broker can be mid-create while it walks."""
     _started = time.monotonic()
     if _HIER not in ("v1", "v2"):
         # No usable hierarchy: `_slice_dir()` would fall back to the v1
@@ -593,9 +596,9 @@ def _sweep_orphaned_worker_cgroups() -> int:
             # CHILD cgroups, so the parent's own `cgroup.procs` is empty
             # while `rmdir` returns ENOTEMPTY forever. With a per-dir retry
             # window each such orphan would tax every future broker start,
-            # and this runs before the socket binds, so the orchestrator's
-            # first `slice` request races that delay and silently degrades
-            # to /proc/meminfo sizing.
+            # and this runs before the first request is read, so the
+            # orchestrator's first `slice` request waits out that delay and,
+            # past its timeout, silently degrades to /proc/meminfo sizing.
             if _drain_then_rmdir(d, 0.0) is None:
                 reclaimed.add(name)
             else:
@@ -716,7 +719,47 @@ def _handle(line: str) -> str:
         return f"ERR {type(e).__name__}: {e}"
 
 
-def main() -> int:
+def serve(ctrl: socket.socket) -> None:
+    """Answer requests on `ctrl`, the broker's end of the descriptor pair
+    the orchestrator holds the other end of, until the orchestrator's end
+    is closed. Each request is one message: the request line, carrying one
+    descriptor (the client's reply socket) on which the response goes back.
+
+    There is no pathname to connect to (DESIGN §6 *No service of leerie's is
+    reachable by a path*): a process that does not hold the orchestrator's
+    descriptor cannot send the broker anything. A world-connectable
+    `/run/leerie-cgroup.sock` let a held-out evaluation create cgroups that
+    outlived its sandbox, and let any worker `destroy` another's (review
+    round 21, isolation R3)."""
+    while True:
+        try:
+            data, fds, _flags, _addr = socket.recv_fds(ctrl, 4096, 1)
+        except InterruptedError:
+            continue
+        except OSError as e:
+            _log(f"control socket error, stopping: {e}")
+            return
+        if not data and not fds:
+            # Every holder of the orchestrator's end has closed it.
+            return
+        if not fds:
+            continue
+        with socket.socket(fileno=fds[0]) as reply:
+            for extra in fds[1:]:
+                os.close(extra)
+            try:
+                # A reply is a few bytes into an empty socket; the timeout
+                # only bounds a client that is already gone.
+                reply.settimeout(5.0)
+                resp = _handle(data.decode(errors="replace"))
+                reply.sendall((resp + "\n").encode())
+            except OSError as e:
+                _log(f"reply error: {e}")
+
+
+def _start() -> None:
+    """What the broker does before it answers anything: detect the
+    hierarchy and sweep what earlier runs left."""
     global _HIER
     _HIER = _detect()
     # Emit V2_ROOT so a rootless bug report can distinguish "v2 at the
@@ -725,9 +768,10 @@ def main() -> int:
     # signal of which root the broker actually operated under.
     _log(f"hierarchy={_HIER} v2_root={V2_ROOT}")
 
-    # Before the socket exists, so no client of this broker can be mid-create
-    # while the walk runs. Best-effort: a sweep failure must never stop the
-    # broker from starting, since nothing else can enforce containment.
+    # Before the first request is read, so no client of this broker can be
+    # mid-create while the walk runs. Best-effort: a sweep failure must
+    # never stop the broker from starting, since nothing else can enforce
+    # containment.
     try:
         _reclaimed = _sweep_orphaned_worker_cgroups()
         if _reclaimed:
@@ -735,49 +779,89 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001 - startup must not be fatal
         _log(f"orphan sweep failed (non-fatal): {e}")
 
-    if os.path.exists(SOCK_PATH):
-        os.unlink(SOCK_PATH)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(SOCK_PATH)
-    # World-connectable so the post-privilege-drop leerie orchestrator can
-    # reach it on every runtime — including the rootless path where the
-    # orchestrator runs in a nested user namespace (`unshare --user`), so
-    # its uid as seen here is not leerie's image uid and a chown+0o660
-    # lockdown could lock the real client out. Every request is validated
-    # (fixed verb set; `_valid_sid` regex; integer pid/limits), so a
-    # crafted request cannot escape `leerie-w-<sid>` under the slice.
-    # Residual: `enroll` trusts the caller-supplied pid without verifying
-    # it belongs to leerie, so a hostile in-container process could enroll
-    # an arbitrary pid into a capped cgroup (a local DoS). Accepted: the
-    # container runs only leerie's own workers — there is no adversarial
-    # process model inside it — and a peer-uid check (SO_PEERCRED) is
-    # unreliable across the rootless userns boundary.
-    os.chmod(SOCK_PATH, 0o666)
-    srv.listen(16)
-    _log(f"listening on {SOCK_PATH}")
 
-    # Reap nothing else; ignore SIGCHLD from the probe fork via waitpid above.
-    while True:
+# The variable that names the orchestrator's descriptor to the process it
+# is handed to. The orchestrator reads it once and removes it
+# (`_adopt_cgroup_broker`), so nothing it starts is told the number.
+FD_ENV = "LEERIE_CGROUP_BROKER_FD"
+
+
+def spawn(log_path: str | None = None) -> int:
+    """Start a broker in a child process (its own session, so it outlives
+    the caller's terminal) and return the caller's end of a fresh
+    `SOCK_SEQPACKET` pair, inheritable, for the orchestrator to be handed.
+    The child keeps the other end and nothing else: no pathname exists.
+    Called at the slice-owning identity, before the privilege drop:
+    `container-entry.sh` (through `--spawn`) on the local runtimes, the
+    launch wrapper (`scripts/remote/seed-common.sh`) on Fly and EC2."""
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    pid = os.fork()
+    if pid == 0:
         try:
-            conn, _ = srv.accept()
-        except OSError:
-            continue
-        try:
-            # Bound the per-connection recv so a client that connects but
-            # never sends can't wedge this single-threaded accept loop and
-            # starve every other worker's cgroup op. The orchestrator's
-            # `_cgroup_request` always sends immediately, so a well-behaved
-            # run never hits this; it guards against a buggy in-container
-            # process holding a connection open.
-            conn.settimeout(5.0)
-            data = conn.recv(4096).decode(errors="replace")
-            resp = _handle(data)
-            conn.sendall((resp + "\n").encode())
-        except OSError as e:
-            _log(f"conn error: {e}")
+            ours.close()
+            os.setsid()
+            # Never PID 1's (or the wrapper's) stdio: a broker holding the
+            # container's output pipe delays its EOF past PID 1's exit.
+            null = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(null, 0)
+            os.close(null)
+            if log_path:
+                out = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                              0o600)
+            else:
+                out = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(out, 1)
+            os.dup2(out, 2)
+            os.close(out)
+            _start()
+            serve(theirs)
+        except BaseException as e:  # noqa: BLE001 - a child never returns
+            with contextlib.suppress(Exception):
+                _log(f"broker stopped: {e!r}")
         finally:
-            conn.close()
+            os._exit(0)
+    theirs.close()
+    fd = ours.detach()
+    os.set_inheritable(fd, True)
+    return fd
+
+
+def main(argv: list[str]) -> int:
+    """`cgroup-broker.py --spawn [--log PATH] -- CMD [ARGS...]`: start the
+    broker (`spawn`), then exec CMD with the orchestrator's descriptor
+    inherited and named in `LEERIE_CGROUP_BROKER_FD`. `container-entry.sh`
+    execs this as PID 1, with CMD the privilege drop and the orchestrator,
+    so PID 1 is still the orchestrator's chain and the broker is its child,
+    as the background launch it replaces was."""
+    log_path = None
+    args = list(argv)
+    if not args or args[0] != "--spawn":
+        print("usage: cgroup-broker.py --spawn [--log PATH] -- CMD [ARGS...]",
+              file=sys.stderr)
+        return 2
+    args.pop(0)
+    if args[:1] == ["--log"] and len(args) >= 2:
+        log_path = args[1]
+        del args[:2]
+    if args[:1] != ["--"] or len(args) < 2:
+        print("usage: cgroup-broker.py --spawn [--log PATH] -- CMD [ARGS...]",
+              file=sys.stderr)
+        return 2
+    cmd = args[1:]
+    # Best-effort, as the background launch it replaces was: without a
+    # broker the orchestrator's probe fails and its fail-closed gate decides.
+    try:
+        os.environ[FD_ENV] = str(spawn(log_path))
+    except OSError as e:
+        print(f"cgroup-broker: cannot start: {e}", file=sys.stderr)
+    # The broker's own root, not the orchestrator's business.
+    os.environ.pop("LEERIE_CGROUP_V2_ROOT", None)
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        print(f"cgroup-broker: cannot exec {cmd[0]}: {e}", file=sys.stderr)
+        return 127
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

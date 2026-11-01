@@ -110,7 +110,7 @@ def test_container_entry_chowns_claude_json_in_the_shared_rootful_guard():
 def test_container_entry_claude_json_copy_precedes_privilege_drop():
     text = _entry_sh_text()
     copy_idx = text.index("cp /opt/leerie-claude-json-src/.claude.json")
-    unshare_idx = text.index("exec unshare --user --map-user=")
+    unshare_idx = text.index("unshare --user --map-user=")
     orchestrator_idx = text.rindex(
         "python3 /opt/leerie-image/orchestrator/leerie.py"
     )

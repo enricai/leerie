@@ -209,6 +209,23 @@ _render_launch_suffix() {
 extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
 if extra_path not in child_env.get("PATH", ""):
     child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
+# The cgroup broker, started here as root (this wrapper's identity) and
+# reached by the orchestrator only through the descriptor handed to it
+# below: no pathname exists for any confined process to connect to
+# (DESIGN section 6, No service of leerie's is reachable by a path). PID 1
+# starts none on this runtime. Best-effort, as at PID 1: without it the
+# orchestrator's probe fails and its fail-closed gate decides.
+import importlib.util
+broker_fd = None
+try:
+    _bspec = importlib.util.spec_from_file_location(
+        "cgroup_broker", "/opt/leerie-image/scripts/cgroup-broker.py")
+    _broker = importlib.util.module_from_spec(_bspec)
+    _bspec.loader.exec_module(_broker)
+    broker_fd = _broker.spawn("/tmp/cgroup-broker.log")
+    child_env[_broker.FD_ENV] = str(broker_fd)
+except Exception as e:
+    sys.stderr.write("cgroup broker did not start: " + repr(e) + "\\n")
 with open(log_path, "ab") as log_f:
     p = subprocess.Popen(
         ["python3", "/opt/leerie-image/orchestrator/leerie.py", "--no-push", *orch_args],
@@ -228,7 +245,12 @@ with open(log_path, "ab") as log_f:
         user="leerie",
         group=leerie_pw.pw_gid,
         env=child_env,
+        pass_fds=(broker_fd,) if broker_fd is not None else (),
     )
+# The orchestrator holds the broker's other end now; the broker stops when
+# every holder has closed it.
+if broker_fd is not None:
+    os.close(broker_fd)
 # Poll briefly before recording the pid. If this Popen lost the
 # State.__init__ flock race against an already-running orchestrator
 # for this run (the concurrent-spawn race described in DESIGN §6

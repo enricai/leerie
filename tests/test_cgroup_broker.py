@@ -848,35 +848,35 @@ def test_sweep_is_selective_across_a_mixed_slice(broker, monkeypatch):
     assert str(young) not in attempted
 
 
-def test_sweep_runs_before_the_socket_is_bound(broker):
-    """Source-coupled: ordering IS the safety argument. Sweeping after
-    `listen()` would race a client of this very broker through its
-    create/enroll window, which no age floor is meant to cover."""
-    src = inspect.getsource(broker.main)
-    i_sweep = src.index("_sweep_orphaned_worker_cgroups")
-    i_bind = src.index("srv.bind(")
-    assert i_sweep < i_bind, (
-        "the orphan sweep must run before the socket is bound")
+def test_sweep_runs_before_the_first_request_is_read(broker, monkeypatch):
+    """Ordering IS the safety argument: sweeping while serving would race a
+    client of this very broker through its create/enroll window, which no
+    age floor is meant to cover. Executed, not read: the broker's child
+    runs `_start` and then `serve`, in that order."""
+    order: list[str] = []
+    monkeypatch.setattr(broker, "_detect", lambda: "v2")
+    monkeypatch.setattr(broker, "_sweep_orphaned_worker_cgroups",
+                        lambda: order.append("sweep") or 0)
+    broker._start()
+    src = inspect.getsource(broker.spawn)
+    assert src.index("_start()") < src.index("serve(theirs)")
+    assert order == ["sweep"]
 
 
-def test_sweep_failure_does_not_stop_the_broker(broker, monkeypatch):
+def test_sweep_failure_does_not_stop_the_broker(broker, monkeypatch,
+                                                capsys):
     """The broker is the only thing that can enforce containment; a sweep
     is housekeeping. If housekeeping can abort startup, a cosmetic bug
-    becomes a fail-closed die() for the whole run."""
-    src = inspect.getsource(broker.main)
-    i_sweep = src.index("_sweep_orphaned_worker_cgroups")
-    assert "try:" in src[:i_sweep], "the sweep call is not wrapped in try/"
-    assert "non-fatal" in src, (
-        "the sweep's failure arm should say plainly that it is non-fatal")
-    # ...and must not re-raise. Without this, adding `raise` to the except
-    # arm — the exact behaviour this test forbids — keeps both assertions
-    # above green, since the log line still says "non-fatal".
-    except_arm = src[src.index("except Exception"):]
-    except_arm = except_arm[:except_arm.index("\n    if ")]
-    assert "raise" not in except_arm, (
-        "the sweep's failure arm re-raises; a housekeeping failure would "
-        "then stop the broker, and the broker is the only thing that can "
-        "enforce containment")
+    becomes a fail-closed die() for the whole run. Executed: a sweep that
+    raises leaves `_start` returning normally, logged as non-fatal."""
+    monkeypatch.setattr(broker, "_detect", lambda: "v2")
+
+    def boom():
+        raise RuntimeError("sweep bug")
+    monkeypatch.setattr(broker, "_sweep_orphaned_worker_cgroups", boom)
+    broker._start()
+    err = capsys.readouterr().err
+    assert "orphan sweep failed (non-fatal)" in err and "sweep bug" in err
 
 
 def test_sweep_on_v1_walks_both_controller_dirs(broker, monkeypatch):

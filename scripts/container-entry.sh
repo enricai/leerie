@@ -138,22 +138,20 @@ fi
 # identity: cross-scope task migration needs write on the common-ancestor
 # cgroup leerie doesn't own, and (in the rootful case) the kernel keeps
 # controller limit files root-owned in a subtree that was merely chowned
-# rather than created by the delegatee (both reproduced). So we launch a
-# tiny broker HERE, at PID 1 before the privilege drop, and the
-# orchestrator drives it over a Unix socket. In the rootful case PID 1 is
-# real root; in the rootless case PID 1 is the rootlesskit-mapped host
-# UID, which is exactly the identity CGROUP_ROOT above is delegated to —
-# no separate privilege level is needed or available. LEERIE_CGROUP_V2_ROOT
-# tells the broker which root to operate under (default /sys/fs/cgroup
-# when unset, i.e. every case except rootless). Best-effort: if it can't
-# start, the orchestrator's probe round-trip fails and its fail-closed gate
-# fires (or --dangerously-allow-uncapped downgrades to a warning). It runs on
-# both runtimes; the idle-PID-1 Fly path below still needs it because the
-# orchestrator is launched out-of-band via ssh and connects to this socket.
-if command -v python3 >/dev/null 2>&1; then
-  LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py \
-    </dev/null >>/tmp/cgroup-broker.log 2>&1 &
-fi
+# rather than created by the delegatee (both reproduced). So a tiny broker
+# runs at THIS identity — real root rootful, the rootlesskit-mapped host UID
+# rootless, which is exactly the identity CGROUP_ROOT above is delegated to.
+# It is started at the very end, by the exec that drops privilege
+# (`cgroup-broker.py --spawn`): it makes a socket pair, forks the broker
+# with one end, and execs the drop with the other end inherited — the
+# orchestrator's only way to reach it. No pathname exists, so no confined
+# process can connect to it (DESIGN §6 *No service of leerie's is reachable
+# by a path*). Best-effort as before: a broker that cannot start leaves the
+# orchestrator's probe failing, and its fail-closed gate fires (or
+# --dangerously-allow-uncapped downgrades to a warning). On Fly/EC2 the
+# orchestrator is launched out-of-band, so its launch wrapper starts the
+# broker the same way (scripts/remote/seed-common.sh) and PID 1 starts none.
+BROKER="/opt/leerie-image/scripts/cgroup-broker.py"
 
 cd /work
 
@@ -309,10 +307,14 @@ unset _is_resume _a
 if [ "$ROOTLESS" = "true" ]; then
   _leerie_uid="$(id -u leerie)"
   _leerie_gid="$(id -g leerie)"
-  exec unshare --user --map-user="$_leerie_uid" --map-group="$_leerie_gid" \
+  LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" exec python3 "$BROKER" --spawn \
+    --log /tmp/cgroup-broker.log -- \
+    unshare --user --map-user="$_leerie_uid" --map-group="$_leerie_gid" \
     env HOME=/home/leerie USER=leerie LOGNAME=leerie \
     python3 /opt/leerie-image/orchestrator/leerie.py "$@"
 fi
-exec runuser -u leerie -- \
+LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" exec python3 "$BROKER" --spawn \
+  --log /tmp/cgroup-broker.log -- \
+  runuser -u leerie -- \
   env HOME=/home/leerie USER=leerie LOGNAME=leerie \
   python3 /opt/leerie-image/orchestrator/leerie.py "$@"
