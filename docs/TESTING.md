@@ -5823,6 +5823,12 @@ template kept at finalize.
   mid-run, its read-only template with it; prune counts a run removed only
   when it is gone; the shell removal; no run-directory deleter ignores its
   errors.
+- `tests/test_every_removal_is_owner_aware.py` (3 tests, DESIGN §6 *Every
+  deleter of a run's directories deletes them*; review round 19 claims M1):
+  `rmtree` is called only inside `_rmtree_owned`; the launcher's
+  `shutil.rmtree` only inside `_rm_owned`; every `rm -rf` in
+  `scripts/*.sh` is inside `leerie_rm_owned` or of a `mktemp` directory the
+  same script made.
 - `tests/test_view_moves.py` (6 tests, DESIGN §8 *A view moves to the next
   tip when the install's inputs are unchanged*; review round 18 L1), real
   git, the real scripts and `_measured_tree` with an incremental stand-in

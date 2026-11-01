@@ -6228,7 +6228,7 @@ def _prune_leerie_worktrees_locked(git_dir: Path, root: str,
         # entry whose worktree `.git` link is really gone is stale.
         if os.path.lexists(os.path.join(resolved, ".git")):
             continue
-        shutil.rmtree(entry, ignore_errors=True)
+        _rmtree_owned(entry)
 
 
 async def _rmtree_fallback_and_prune(worktree: Path, leerie_dir: Path) -> None:
@@ -6243,7 +6243,7 @@ async def _rmtree_fallback_and_prune(worktree: Path, leerie_dir: Path) -> None:
     stall the whole loop for it."""
     if worktree.exists():
         try:
-            shutil.rmtree(worktree, ignore_errors=True)
+            _rmtree_owned(worktree)
         except OSError:
             pass
     await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
@@ -10342,7 +10342,7 @@ def _take_run_settings(repo: Path) -> None:
     if (s / "config").is_file():
         return
     s.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(s / "info", ignore_errors=True)
+    _rmtree_owned(s / "info")
     if (Path(repo) / "info").is_dir():
         shutil.copytree(Path(repo) / "info", s / "info", symlinks=True)
     tmp = s / f".config.tmp-{os.getpid()}"
@@ -10436,7 +10436,7 @@ def _take_settings(repo: Path, *, fresh: bool) -> None:
     leerie kept one, or a crash between the rename and the copy."""
     s = Path(repo).parent / RUN_REPO_SETTINGS_NAME
     if fresh:
-        shutil.rmtree(s, ignore_errors=True)
+        _rmtree_owned(s)
         _HOST_SETTINGS_TAKEN.discard(str(s))
     _take_run_settings(repo)
     _take_host_settings(repo)
@@ -10552,7 +10552,8 @@ def _restore_settings(tree: str | Path) -> list[str]:
         done.append("config")
     if not _same_settings_path(s / "info", common / "info"):
         if (common / "info").is_dir() and not (common / "info").is_symlink():
-            shutil.rmtree(common / "info")
+            if not _rmtree_owned(common / "info"):
+                raise OSError(f"cannot remove {common / 'info'}")
         elif os.path.lexists(common / "info"):
             os.unlink(common / "info")
         if (s / "info").is_dir():
@@ -10672,7 +10673,7 @@ def _ensure_run_repo(st: "State") -> Path:
         _take_settings(repo, fresh=False)
         return repo
     for stale in Path(st.run_dir).glob(f".{RUN_REPO_NAME}.tmp-*"):
-        shutil.rmtree(stale, ignore_errors=True)
+        _rmtree_owned(stale)
     if repo.exists():
         why = _run_repo_unusable(st, repo)
         if why:
@@ -10704,7 +10705,7 @@ def _ensure_run_repo(st: "State") -> Path:
         os.rename(tmp, repo)
         _take_settings(repo, fresh=True)
     except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _rmtree_owned(tmp)
         raise
     st.data["run_repo"] = RUN_REPO_NAME
     st.save()
@@ -37077,7 +37078,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
                             "remove", "--force", str(_wt)],
                            capture_output=True, check=False, timeout=120)
             if os.path.isdir(_wt):
-                shutil.rmtree(_wt, ignore_errors=True)
+                _rmtree_owned(_wt)
         except Exception as e:                     # never block the exit
             log(f"could not remove the judgment worktree (non-fatal): {e}")
     _write_run_json(
@@ -43864,7 +43865,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     def _teardown() -> None:
         subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
-        shutil.rmtree(wt, ignore_errors=True)
+        _rmtree_owned(wt)
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
     _teardown()
@@ -44912,7 +44913,7 @@ def _ci_db_session(st: "State", recs: list[dict]
 def _ci_teardown(st: "State", wt: Path) -> None:
     subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
-    shutil.rmtree(wt, ignore_errors=True)
+    _rmtree_owned(wt)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
     _drop_test_db(_CI_DB_URLS.pop(os.path.realpath(wt), None))
 
@@ -47724,14 +47725,14 @@ def _start_test_db_cluster(st: "State") -> dict | None:
         return None
     user = pwd.getpwuid(os.getuid()).pw_name
     data = Path(tempfile.gettempdir()) / f"leerie-pg-{st.run_id}"
-    shutil.rmtree(data, ignore_errors=True)
+    _rmtree_owned(data)
     init = subprocess.run([os.path.join(pgbin, "initdb"), "-D", str(data),
                            "-U", user, "--auth-local=trust",
                            "--auth-host=trust"],
                           capture_output=True, text=True, check=False)
     if init.returncode != 0:
         _skip(f"initdb failed: {init.stderr.strip()[-200:]}")
-        shutil.rmtree(data, ignore_errors=True)
+        _rmtree_owned(data)
         return None
     port = _free_local_port()
     start = subprocess.run(
@@ -47743,7 +47744,7 @@ def _start_test_db_cluster(st: "State") -> dict | None:
         start_new_session=True)
     if start.returncode != 0:
         _skip(f"postgres did not start: {start.stderr.strip()[-200:]}")
-        shutil.rmtree(data, ignore_errors=True)
+        _rmtree_owned(data)
         return None
     log(f"  acceptance: throwaway test database cluster on 127.0.0.1:{port}")
     return {"bin": pgbin, "port": port, "data": str(data), "user": user}
@@ -47753,7 +47754,7 @@ def _stop_test_db_cluster(cluster: dict) -> None:
     subprocess.run([os.path.join(cluster["bin"], "pg_ctl"), "-D",
                     cluster["data"], "-m", "fast", "-w", "stop"],
                    capture_output=True, check=False)
-    shutil.rmtree(cluster["data"], ignore_errors=True)
+    _rmtree_owned(cluster["data"])
     with contextlib.suppress(OSError):
         os.unlink(cluster["data"] + ".log")
 
@@ -49818,7 +49819,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     support = sorted(f for f in new_files if f not in declared_any
                      and (f in not_ignored or _beside_a_test(f)))
     dest = st.run_dir / "acceptance" / dest_name
-    shutil.rmtree(dest, ignore_errors=True)
+    _rmtree_owned(dest)
     for rel in defect + control + support:
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(wt / rel, dest / rel)
@@ -49860,7 +49861,7 @@ def _ref_less_clone(src: Path, wt: Path, rev: str) -> str:
         ok = ok and left.returncode == 0 and not left.stdout.strip()
     if ok:
         return ""
-    shutil.rmtree(wt, ignore_errors=True)
+    _rmtree_owned(wt)
     return (clone.stderr.strip() or "a ref could not be removed")[:200]
 
 
@@ -49890,7 +49891,7 @@ def _remove_acceptance_checkout(st: "State", wt: Path) -> None:
     """Remove a writer checkout, whichever kind it is."""
     subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
-    shutil.rmtree(wt, ignore_errors=True)
+    _rmtree_owned(wt)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
 
@@ -50031,7 +50032,7 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
     def _teardown() -> None:
         subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
-        shutil.rmtree(wt, ignore_errors=True)
+        _rmtree_owned(wt)
         # A later evaluation recreates the same path: its install memo must
         # not survive the tree it describes.
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
@@ -51321,7 +51322,7 @@ async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
     def _teardown() -> None:
         subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
-        shutil.rmtree(wt, ignore_errors=True)
+        _rmtree_owned(wt)
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
     _teardown()
     url = None
@@ -54202,7 +54203,7 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
         for p in leads.rglob("*"):
             with contextlib.suppress(OSError):
                 p.chmod(0o755 if p.is_dir() else 0o644)
-        shutil.rmtree(leads, ignore_errors=True)
+        _rmtree_owned(leads)
     excludes = [FALSIFIER_LEADS_DIR + "/"]
     ctx: list[str] = []
     for s_ in sets:
@@ -54372,7 +54373,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         if made:
             # Directories this placement created, with whatever the run left
             # in them (a bytecode cache): none existed before.
-            shutil.rmtree(made[-1], ignore_errors=True)
+            _rmtree_owned(made[-1])
     out["confirmed"] = all(g.values())
     return out
 
@@ -54389,7 +54390,7 @@ def _falsifier_save_probe(st: "State", lane: Path, i: int,
         return None
     dst_dir = st.run_dir / "acceptance" / "probes" / f"i{i}"
     try:
-        shutil.rmtree(dst_dir, ignore_errors=True)
+        _rmtree_owned(dst_dir)
         (dst_dir / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(lane / rel, dst_dir / rel)
     except OSError:
@@ -55749,7 +55750,7 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     def _teardown() -> None:
         subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
-        shutil.rmtree(wt, ignore_errors=True)
+        _rmtree_owned(wt)
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
     _teardown()
@@ -58837,7 +58838,7 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
             / _CGROUP_NAME_UNSAFE_RE.sub("-", sid))
     covdir = work / f"cov-{tag}"
     report = work / f"res-{tag}.json"
-    shutil.rmtree(covdir, ignore_errors=True)
+    _rmtree_owned(covdir)
     work.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         report.unlink()
@@ -61786,7 +61787,7 @@ async def _integration_tree(st: "State", sid: str, name: str, rev: str,
 def _integration_tree_remove(st: "State", wt: Path) -> None:
     subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
-    shutil.rmtree(wt, ignore_errors=True)
+    _rmtree_owned(wt)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
 

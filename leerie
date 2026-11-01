@@ -1735,7 +1735,7 @@ def _deregister_orphaned_worktrees(reaped: set) -> None:
         orphaned = not os.path.exists(target) or any(
             target == d or target.startswith(d + os.sep) for d in reaped)
         if orphaned and apply:
-            shutil.rmtree(entry, ignore_errors=True)
+            _rm_owned(entry)
 
 
 def _last_activity(d) -> float:

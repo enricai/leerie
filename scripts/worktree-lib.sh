@@ -109,7 +109,7 @@ prune_leerie_worktrees() {
     # link is really gone is stale. git's verdict above was read before this
     # loop reached the entry.
     [ -e "$wt/.git" ] && continue
-    rm -rf "$git_dir/worktrees/$name" 2>/dev/null || true
+    leerie_rm_owned "$git_dir/worktrees/$name" || true
   # `2>&1`, not `2>/dev/null`: `git worktree prune -n -v` reports on STDERR,
   # so discarding stderr reads an empty list and silently prunes nothing --
   # a no-op that looks exactly like "there was nothing stale". Verified
@@ -358,7 +358,7 @@ leerie_restore_settings() {
       && mv -f -- "$common/.config.leerie-$$" "$common/config" || return 1
   fi
   if ! diff -r --no-dereference -q -- "$s/info" "$common/info" >/dev/null 2>&1; then
-    rm -rf -- "$common/info" || return 1
+    leerie_rm_owned "$common/info" || return 1
     if [ -d "$s/info" ]; then cp -a -- "$s/info" "$common/info" || return 1; fi
   fi
   return 0
@@ -606,7 +606,7 @@ leerie_tree() {
     # left there: the worker's own git finds its repository through it.
     local admin
     admin="$(leerie_tree_location "$wt" | sed -n 2p)"
-    rm -rf -- "$wt/.git" && printf 'gitdir: %s\n' "$admin" > "$wt/.git"
+    leerie_rm_owned "$wt/.git" && printf 'gitdir: %s\n' "$admin" > "$wt/.git"
     return
   fi
   if grep -qxF "worktree $wt" <<<"$(leerie_repo_git worktree list --porcelain)"; then
@@ -631,7 +631,7 @@ leerie_tree() {
     cp "$settings/config" "$tr/config"
     git config -f "$tr/config" core.bare true
   }
-  rm -rf "$tr/info"
+  leerie_rm_owned "$tr/info" || return 1
   if [ -d "$settings/info" ]; then
     cp -R "$settings/info" "$tr/info"
   fi

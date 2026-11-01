@@ -1836,11 +1836,20 @@ read-only, and so is a killed test's directory in a tree. A plain
 `rmtree(..., ignore_errors=True)` cannot unlink the entries of a read-only
 directory and says nothing: `leerie prune --apply` reported a run removed,
 left its credentials, and deleted its `run.json`, so later prunes read what
-was left as a live run and never removed it. Every removal of a run
-directory or of anything in it goes through the one owner-aware removal
-(`_rmtree_owned`: each directory's owner write and search bits restored
-top-down, then the removal) and checks that the path is gone. A run
-counts as removed only when its directory is.
+was left as a live run and never removed it. Every removal leerie makes
+goes through the one owner-aware removal — `_rmtree_owned` in the
+orchestrator, its copy `_rm_owned` in the launcher's host Python,
+`leerie_rm_owned` in the scripts (each directory's owner write and search
+bits restored top-down, then the removal) — which reports whether the path
+is gone; a deleter whose survivor matters (a run directory, the
+credentials, prune's count) acts on that. The only other removal is of a
+`mktemp` directory the same script made. Removing only the run
+directories' deleters this way left 25 plain removals in the orchestrator,
+many under the run directory — helper checkouts, `repo-settings/`, the
+measured coverage directory that repository code writes (review round 19
+claims M1) — so the rule has no exceptions by path: a new plain removal
+fails a guard whatever it removes. A run counts as removed only when its
+directory is.
 
 *What a config directory holds.* It is made from the run's configuration
 template, `<run-dir>/claude-config/`: a read-only snapshot, taken once
