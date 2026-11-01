@@ -3824,8 +3824,10 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `TMPDIR`, `TMP`, `TEMP`, `CLAUDE_CODE_TMPDIR`, `CLAUDE_CONFIG_DIR`, as
   `claude_p` sets them from `_worker_dirs` — whose realpath lies beneath
   `<run>/workers/` (`WORKERS_DIR`); any other value grants nothing) and
-  the run's shared caches `<run>/workers/cache/` (`WORKER_CACHE_DIR`,
-  `_worker_cache_env`); `ro` `_reads_outside(state_root, tmp=False)`,
+  its side's cache set `_worker_cache_dir(run_dir, schema_key)` (made by
+  `_mkdir_private`): `<run>/workers/cache-held-out/` (`HELD_OUT_CACHE_DIR`)
+  for a `HELD_OUT_LOG_WORKERS` kind, else `<run>/workers/cache/`
+  (`WORKER_CACHE_DIR`), never both; `ro` `_reads_outside(state_root, tmp=False)`,
   `<run>/sysprompt`, leerie's install `ROOT`, the realpath of the
   `claude` that `env["PATH"]` finds, `env["HOME"]` (realpath; left out
   when it holds `SHARED_TMP`) and the CLI configuration template
@@ -3956,20 +3958,30 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `mise-state/`) are made by `_mkdir_private`. `_cache_vars(env, cache)` (every
   `_STORE_VARS` variable not beneath `_BAKED_ROOT` → `cache/<name>`,
   `XDG_CACHE_HOME` → `cache/xdg`, then `_with_pnpm_spellings`) serves
-  `_worker_cache_env` only, which also drops `_COPY_IMPORT_ENV`. Paths
-  through `_around`, as a worker's.
+  `_worker_cache_env(env, run_dir, cache=None)` only (`cache` default
+  `<run>/workers/cache/`), which also drops `_COPY_IMPORT_ENV`. `_invoke`
+  passes `_granted_cache_dir(grants, leerie_dir)` — the held-out set when
+  the grant's `rw` names it, else the fixers' — so the variables follow the
+  grant. Paths through `_around`, as a worker's.
 - `_measure_dir(st, tree) -> Path` — `<run>/measure/<tree-name>-<id>/`
   (`MEASURE_DIRNAME`) with `_MEASURE_SUBDIRS` (`mise-state/`, `reports/`,
-  `coverage/`) made 0700. `<id>`: 16 hex digits read from, or first written
-  to, `<git-dir>/leerie-measure-id` (`_MEASURE_ID_FILE`) when the git dir
-  is inside the run directory; else `sha256(<tree realpath>)[:16]`. When
+  `coverage/`) made 0700 by `_mkdir_private` (a link or file in their
+  place is removed). `<id>`: 16 hex digits read from, or first written to,
+  `<id-dir>/leerie-measure-id` (`_MEASURE_ID_FILE`), `<id-dir>` from
+  `_measure_id_dir(run_dir, tree, dirs)`: the administrative directory
+  `_run_tree_location` names for a tree in the run's `worktrees/` (never
+  the tree's own `.git`), or the git dir when it is in `<run>/repo/`; read
+  (`_read_beneath`) and written (`_write_beneath`, mode 0644; a write that
+  fails leaves a fresh id per call) from the run directory down; else
+  `sha256(<tree realpath>)[:16]`. When
   a new id is written (a new tree at that path), `<run>/tree-stores/<tree>/`
   is moved aside to `.gone/` too. A
   sidecar `<run>/measure/<tree-name>-<id>.tree` (JSON `{tree, id_file,
   tmp}`) records the owner and its private temp directory;
   `_sweep_measure_dirs(root)` (every call) moves aside to
   `<run>/measure/.gone/` each directory whose tree is gone or whose id
-  file is missing or names another id, removes its sidecar's `tmp` (when
+  file is missing, unreadable through `_read_beneath`, or names another
+  id, removes its sidecar's `tmp` (when
   directly beneath `PRIVATE_TMP_ROOT`), and removes `.gone/` in a daemon
   thread (`_rmtree_owned`).
 - Private temp directories (DESIGN §6 *A confined command's scratch is
@@ -4025,11 +4037,24 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   them: its probe is never on disk in the tree, so the facts script runs
   in a held-out sandbox through `_run_streaming`, the probe placed.
 - Reports a measured command writes are under `_measure_dir(st, tree)`:
-  `_run_acceptance_file`'s and `_acceptance_parse_probe`'s
-  `reports/<label>-…` (written inside the held-out sandbox and copied out
-  through its report descriptor by `_run_streaming`), `_capture_failing_test_ids`' `reports/<label>-<i>-…`,
-  `_vitest_run`'s `coverage/<sid>/`. Nothing is written under
-  `<run>/acceptance/reports/`, `<run>/confirm/` or `<run>/coverage/`.
+  `_capture_failing_test_ids`' `reports/<label>-<i>-…` (read with
+  `_read_beneath(own, …)` and removed with `_unlink_beneath`), and
+  `_vitest_run`'s `coverage/<sid>/` (likewise). A held-out run's report path
+  — `_run_acceptance_file`'s and `_acceptance_parse_probe`'s
+  `reports/<label>-…`, `_probe_case_facts_placed`'s `reports/facts-…`, a
+  placed `_capture_failing_test_ids` run's — exists inside its sandbox
+  only: `_run_streaming(…, sandbox=, report_into=bytearray)` appends the
+  bytes the shim copied to the descriptor and writes nothing to disk
+  (`die()` when a sandbox names a report and `report_into` is None). The
+  readers take the bytes: `_runner_report_cases(kind, report: bytes |
+  None, tree=None)`, `_runner_report_failing_ids(kind, report, tree)`,
+  `_runner_report_file_durations(kind, report, tree=None)`,
+  `_parse_runner_report(kind, report)` (JUnit through
+  `ElementTree.fromstring`). The minitest reporter is a file of leerie's
+  install, `scripts/minitest-report/minitest/leeriereport_plugin.rb`, put
+  on `RUBYLIB` as `MINITEST_REPORT_LIB`; `_acceptance_report_spec` writes
+  nothing. Nothing is written under `<run>/acceptance/reports/`,
+  `<run>/confirm/` or `<run>/coverage/`.
 - `committing_worker_started`: `claude_p` sets it (and saves) before
   spawning the first worker whose `schema_key` is in
   `_COMMITTING_WORKERS`; `_run_setup_hook` `die()`s, without running the
@@ -4060,6 +4085,60 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   seam's one setter and one reader, the Fly integrator's prefix; the
   environment-named grants beneath `workers/` only; a tree repository's
   grant).
+
+### Leerie's writes where confined code writes
+
+DESIGN §6 *Leerie never writes through a path confined code shaped*. One
+family in `leerie.py`, each walking from an anchor no confined process can
+replace (the run directory, or a grant's own root) without following a
+link:
+
+- `_open_dir_beneath(anchor, path, *, make=False, dir_mode=0o777,
+  replace=False) -> int` — each component `O_DIRECTORY|O_NOFOLLOW`
+  (`_DIR_NOFOLLOW`) at the previous descriptor; `make` makes a missing one,
+  `replace` removes a link or file in a directory's place (leerie's layout
+  only). `OSError` (ELOOP/ENOTDIR) on a link otherwise, and (EINVAL) when
+  `path` is not lexically beneath `anchor` (`_beneath_parts`). `_dir_beneath` is its
+  context manager.
+- `_write_beneath(anchor, path, data, *, mode=None, make=True)` — a fresh
+  `.leerie-<hex>` made `O_CREAT|O_EXCL|O_NOFOLLOW` in the directory's
+  descriptor, written, `fchmod` to `mode` (default the replaced regular
+  file's mode, else 0o666 less the umask), renamed over `path.name`.
+- `_read_beneath(anchor, path) -> bytes` (`O_NOFOLLOW|O_NONBLOCK`; a
+  non-regular file raises), `_lexists_beneath(anchor, path) -> bool` (a
+  link or non-directory on the way counts as taken), `_unlink_beneath`,
+  `_remove_beneath` (a directory through `_rmtree_owned` of
+  `/proc/self/fd/<dirfd>/<name>`), `_rmdirs_beneath` (`os.removedirs` up to
+  the anchor), `_copy_beneath(src, anchor, dst, *, src_anchor=None)` (with
+  `src`'s mode; `src_anchor` reads `src` through `_read_beneath`),
+  `_copytree_beneath(src, anchor, dst, *, ignore=None)` (links copied as
+  links), `_copy_out_of_tree(tree, src, names, dest)` (copies out of a
+  tree, a link never followed: `_populate_leerie_store`'s staging).
+- `_add_dir_bits_beneath(anchor, rel, bits)` — the owner bits on `anchor`
+  and each directory down to `rel` through `O_PATH|O_NOFOLLOW` descriptors
+  and `chmod("/proc/self/fd/N")`; a link ends the walk (by path, each
+  component `lstat`ed, where `os.O_PATH` is absent). Used by
+  `_writable_dirs_to`, `_restore_write_bits` and `_rmtree_owned`.
+- `_mkdir_private(path, top)` — `_open_dir_beneath(top, path, make=True,
+  dir_mode=0o700, replace=True)`; a `path` not beneath `top` is left alone.
+
+Callers: `_restore_tracked_content`, `_remove_new_untracked`,
+`_restore_settings`, `_measure_dir_at`, `_sweep_measure_dirs`,
+`_capture_failing_test_ids`, `_vitest_run`, `_measure_subtask_coverage`,
+`_overlay_other_side`, `_try_json_key_merge`, `_move_view`,
+`_drop_lying_index`, `_redrive_ast_hits`, `_stage_worktree_extras`,
+`_place_set`/`_unplace(copied, wt)`, `_copy_task_references(st, wt, task)
+-> (copied, refs)` (the writer's, the set auditor's and the surrogate's
+checkouts), `_checkout_ignorable`/`_checkout_ignore`,
+`_falsifier_place_leads` (leads written mode 0444; the `rglob` chmods
+before removal are gone, `_rmtree_owned` gives the bits),
+`_falsifier_gates`, `_falsifier_save_probe`, `_collect_acceptance_set`,
+`_populate_leerie_store`. `_rescue_integrator_work`'s throwaway index is in
+a `tempfile.mkdtemp(prefix="leerie-rescue-")` directory, not the tree's
+git directory. Tests: `tests/test_leerie_writes_never_follow_links.py`
+(the primitives; review round 21's R1, R2 and R5 proofs inverted; the rule
+that every function calling a raw write primitive is classified, and the
+converted functions call none).
 
 ## 4. Phase walkthrough (`leerie.py`)
 
@@ -6930,9 +7009,10 @@ DESIGN §8 *The settings are leerie's* and *One ignore rule*.
   entries recursively; never following a link) is False; the one line
   `"git settings unknown: leerie's copy <s> of the run repository's
   settings is missing"` when `<s>/config` is not a file.
-- `_restore_settings(tree) -> list[str]` — copies `<s>/config` (through a
-  temporary file and `os.replace`) and `<s>/info` (`copytree`, links kept,
-  after removing the repository's) back where they differ; returns the
+- `_restore_settings(tree) -> list[str]` — copies `<s>/config`
+  (`_write_beneath(common, …)`: a fresh `O_EXCL|O_NOFOLLOW` name renamed
+  over it) and `<s>/info` (`_copytree_beneath`, links kept, after
+  `_rmtree_owned` of the repository's) back where they differ; returns the
   names. Called first by `_restore_tree`, in `_leaves_tree_as_found`'s
   `finally` (logged "put back N git setting(s) its own <what> changed"),
   at the start of `_tree_dirt` (and `leerie_restore_settings` at the start
@@ -9070,7 +9150,8 @@ Two host caches are mounted into the container, both `rw`: mise-data and
 Bundler's (§0.5 "Bind-mount table"). Package stores and caches (pnpm, pip,
 Go, Cargo, corepack) are not mounted from the host: they live in the state
 mount, leerie's at `<state-root>/.stores/leerie/` and each run's workers'
-at `<run-dir>/workers/cache/` (DESIGN §6 *The pnpm store shares the
+at `<run-dir>/workers/cache/` (the held-out side's at
+`<run-dir>/workers/cache-held-out/`; DESIGN §6 *The pnpm store shares the
 worktrees' mount*). Concurrency-safety verdicts, for whichever directory
 each tool writes:
 
