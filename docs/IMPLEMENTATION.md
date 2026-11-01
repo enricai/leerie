@@ -3922,6 +3922,35 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `_confined_cli_settings(<the hook>, run_dir=<state.json's dir>,
   repo_root=<the run directory's third parent>)`, which `collect-subtrees.sh`
   passes with `--setting-sources ""`.
+- **The CLI's own git** (DESIGN §6 *The CLI's own git runs on leerie's
+  terms*). `CLI_GIT_BIN = ROOT / "scripts" / "cli-bin"` (only `git`, a
+  `/bin/sh` script), `WORKER_COMMAND_ENV = "LEERIE_WORKER_COMMAND"`,
+  `CLI_GIT_ENV = "LEERIE_CLI_GIT"`, `REAL_GIT_ENV = "LEERIE_REAL_GIT"`.
+  `_cli_git_env(tree, path) -> dict`: `PATH` = `CLI_GIT_BIN` then `path`
+  without it, `LEERIE_REAL_GIT` = realpath of the `git` that `path` finds
+  (else `/usr/bin/git`), `LEERIE_CLI_GIT` = `{"args": _tree_git_args(tree),
+  "env": {}}` as JSON. `_invoke`, for every spawn with a grant: drops
+  `LEERIE_WORKER_COMMAND` from the worker's environment, calls
+  `_ready_tree_for_worker(cwd)` (logged when it put anything back), and lays
+  `_cli_git_env(cwd, <its PATH>)` over the environment.
+  `_ready_tree_for_worker(tree) -> list[str]`: `_restore_settings(tree)`,
+  then `".git"` when `_restore_git_pointer(tree)` rewrote it.
+  `_restore_git_pointer(tree) -> bool`: for a worktree located by
+  `_run_tree_location` (not a ref-less clone, whose git dir is its common
+  dir), leaves a regular `.git` whose `gitdir:` resolves to the
+  administrative directory; else removes what is there (`_remove_beneath`)
+  and writes `gitdir: <admin>\n`
+  with `_write_beneath(tree, tree/".git", …, mode=0o644, make=False)`.
+  `scripts/cli-bin/git`: `exec "$LEERIE_REAL_GIT" "$@"` when
+  `LEERIE_WORKER_COMMAND=1`, else `exec /usr/bin/python3 -IS
+  <scripts>/cli-git.py "$@"`. `scripts/cli-git.py`: `nest()` (126 and no
+  git on failure), then `execve(LEERIE_REAL_GIT, [real, *spec["args"],
+  *argv[1:]], env | spec["env"])` with `LEERIE_CLI_GIT` removed; 126 on an
+  unreadable spec, 127 when the exec fails. `worker-shell.py` sets
+  `LEERIE_WORKER_COMMAND=1` in the command's environment. A ref-less
+  clone's committing worker reads `_clone_git_dir(cwd)` (`_worker_grants`).
+  `worker-guard.py` calls `_ready_tree_for_worker(<staging>)` and adds
+  `_cli_git_env(<staging>, <PATH>)` to `guard_env`.
 - **A worker's commands in a nested domain** (DESIGN §6 *A worker's
   commands cannot reach its CLI*). `WORKER_SHELL = ROOT / "scripts" /
   "worker-shell.py"` (executable, `#!/usr/bin/python3 -IS`),

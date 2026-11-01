@@ -2674,11 +2674,12 @@ measured). Merged as the CLI merges scopes: objects key by key, arrays
 concatenated. The Fly recovery integrator gets the same from
 `worker-guard.py`.
 
-**Residuals.** The CLI's own spawns that are not commands — its `git`
-calls (it passes `core.fsmonitor=` and `core.hooksPath=/dev/null` itself,
-read from its bundle), `rg` for Grep and Glob — run in its domain and run
-no code a worker chose through settings, which it no longer reads. A
-worker's configuration directory is writable whole, so a worker can replace
+**Residuals.** The CLI's own spawns that are not commands: its `git`
+calls are on leerie's terms (§6 *The CLI's own git runs on leerie's
+terms*; the earlier claim here that they "run no code a worker chose" was
+false — review round 22 isolation H1); `rg` for Grep and Glob runs in its
+domain and runs no code a worker chose through settings, which it no
+longer reads. A worker's configuration directory is writable whole, so a worker can replace
 its links to the template's `plugins/` with its own; a plugin is loaded only
 when the operator's settings enable it, and then at the next start of that
 configuration — the worker's own re-ask. Closing that needs the
@@ -2695,6 +2696,75 @@ scope adds no reach beyond the worker's domain — what a worker can signal
 outside it is the worker's scope alone (*A worker writes only where it is
 granted (I5)*, Residuals), so no worker reaches another worker or leerie
 through it.
+
+### The CLI's own git runs on leerie's terms
+
+*Designed 2026-11-01 (review round 22, isolation H1).*
+
+**Root cause.** The nest (§6 *A worker's commands cannot reach its CLI*)
+was aimed at the commands the CLI runs for the worker; the CLI also runs git
+for itself, in its own domain. At the start of every session it runs
+`status`, `log`, `ls-files`, `config` and `remote` in its working directory
+(measured, CLI 2.1.312; it passes `core.hooksPath=/dev/null` and
+`core.fsmonitor=` but not `filter.*`). git found the repository through the
+tree's `.git` file, and a committing worker writes that file and its whole
+tree repository. So an implementer pointed `.git` at a git dir of its own
+with a clean filter and `info/attributes`, the next worker's CLI ran the
+filter in its session-start `git status`, and the filter wrote a forged
+`tool_use` into `/proc/<cli>/fd/1`: the transcript. Leerie's clean-tree
+checker never follows that `.git` (§6 *Leerie's git never takes a tree's
+repository from the tree*), so it read the tree clean. The same holds for
+the Fly recovery integrator. The CLI strips `GIT_DIR` and `GIT_WORK_TREE`
+and sets its own `GIT_CONFIG_*` for these calls (measured), so no
+environment pin reaches them.
+
+**Invariant.** Every git process that runs on a worker's tree outside that
+worker's own nested command domain addresses the repository from leerie's
+layout, never the tree's `.git`, and runs in a domain nested away from the
+CLI; and every worker starts on its tree's repository with leerie's
+settings and a `.git` that names it, so nothing a worker before it chose
+there reaches it or its CLI.
+
+**Mechanism.**
+
+- *The CLI's `git`.* A confined worker's CLI finds git on its `PATH`, and
+  `scripts/cli-bin/` (holding only `git`) is first there (`_cli_git_env`,
+  set by `_invoke` for every spawn with a grant, and by `worker-guard.py`
+  for the Fly integrator). A call from one of the worker's own commands —
+  marked by `worker-shell.py`, so inside the nested domain — gets the real
+  git untouched. Any other call is the CLI's own: `scripts/cli-git.py`
+  enters a nested Landlock domain (`landlock_exec.nest`) and runs the real
+  git with the arguments leerie's own git on that tree takes
+  (`_tree_git_args`: `--git-dir` of the tree's administrative directory,
+  found from the repository's side, `--work-tree` the tree, leerie's pins).
+  The tree's `.git` is never followed, and a driver it does run (one the
+  same worker defined in its own repository's settings during its session)
+  cannot open the CLI's `/proc` entries. It fails closed (126). A ref-less
+  clone's CLI reads the clone through leerie's git directory for it, which
+  its grant now reads. Not `_git_view`'s copies of the outside settings:
+  they are outside every worker's grant, and the settings they copy (system,
+  global) are ones no worker writes.
+- *Every start.* Before each confined worker starts, leerie puts back its
+  settings over the tree's repository (`_restore_settings`) and the tree's
+  `.git` file naming the administrative directory leerie's layout gives it
+  (`_restore_git_pointer`; a `.git` directory or link in its place is
+  removed first, nothing is written through a link) —
+  `_ready_tree_for_worker`. A rewritten pointer is not a violation to type:
+  it is made irrelevant. Leerie's own git never reads it, the CLI's own git
+  never reads it, and the next worker starts with it put back. A worker's
+  own git — in its commands, nested — follows its tree's `.git` as git
+  does, so what it chooses there reaches only itself.
+
+Measured 2026-11-01, real CLI 2.1.312 (haiku), confined like a worker, in
+both local runtimes (rootless and rootful): with the tree's `.git` pointed at
+a planted git dir with a clean filter, without the shim the filter ran in
+the session-start `git status` and a forged line reached the stream (the
+round's finding reproduced); with the shim and the pointer put back the
+filter never ran, nothing was forged, the CLI's git answered from the
+tree's repository, and the worker's own `git add`/`commit` landed on the
+tree's branch. On the host, the shim alone with no addressing let the
+filter run but refused its write to the CLI's `fd/1` (the nest), and the
+shim with addressing ran nothing.
 
 ### Leerie's runs of the repository's commands are confined too (I5, measurements)
 
