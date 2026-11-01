@@ -3,9 +3,11 @@
 
 Usage: worker-guard.py <allowed_tools> <repo_root> [<state.json> [<wid>]]
 
-With `<wid>`, the worker's own CLI configuration and temp directory
-(`<run-dir>/workers/<wid>/`, `_worker_dirs`) and the run's shared caches are
-made and named in `guard_env`, as `claude_p` does for every worker.
+The worker's own CLI configuration and temp directory
+(`<run-dir>/workers/<wid>/`, `_confined_cli_env`, the builder every confined
+CLI spawn uses) and the run's shared caches are made and named in
+`guard_env`; without `<wid>` (or `<state.json>`) it exits 1, since no
+confined CLI runs without its own directories.
 
 The Fly recovery integrator (`scripts/remote/collect-subtrees.sh`) builds its
 own `claude` argv in bash, after the orchestrator has exited. It takes the
@@ -72,17 +74,21 @@ def main(argv: list[str]) -> int:
     # Every command and hook of the CLI in a Landlock domain nested in its
     # own (DESIGN §6 *A worker's commands cannot reach its CLI*).
     env[leerie.SHELL_PREFIX_ENV] = str(leerie.WORKER_SHELL)
-    if len(argv) == 5:
-        # The worker's own CLI configuration and temp directory, and the
-        # run's shared caches, as `claude_p` gives every worker (DESIGN §6
-        # *Each worker's own configuration and temporary directories*).
-        from pathlib import Path
-        config, tmp = leerie._worker_dirs(Path(run_dir), argv[4], None)
-        env.update(CLAUDE_CONFIG_DIR=str(config), TMPDIR=str(tmp),
-                   TMP=str(tmp), TEMP=str(tmp))
-        cached = leerie._worker_cache_env(os.environ, Path(run_dir))
-        env.update({k: v for k, v in cached.items()
-                    if os.environ.get(k) != v})
+    if len(argv) != 5:
+        # A confined CLI runs only with its own directories (DESIGN §6
+        # *Every confined CLI is given its own directories, by one
+        # builder*): an inherited `TMPDIR` outside its grant stops it at
+        # start.
+        sys.stderr.write("worker-guard: no worker id to make the worker's "
+                         "own directories for\n")
+        return 1
+    from pathlib import Path
+    # The worker's own CLI configuration and temp directories, from the
+    # builder every confined spawn uses, and the run's shared caches.
+    env.update(leerie._confined_cli_env(Path(run_dir), argv[4]))
+    cached = leerie._worker_cache_env(os.environ, Path(run_dir))
+    env.update({k: v for k, v in cached.items()
+                if os.environ.get(k) != v})
     genv = {**os.environ, **env}
     grants = leerie._worker_grants(
         run_dir=run_dir, state=state, schema_key="integrator", cwd=repo_root,

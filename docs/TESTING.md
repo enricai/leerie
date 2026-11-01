@@ -5743,6 +5743,25 @@ lookup bypassed, the `tmp` removal dropped, an empty `_CLAUDE_CONFIG_SKIP`,
 directories copied instead of linked, the template left writable, and the
 template kept at finalize.
 
+`tests/test_confined_cli_env.py` (7 tests, DESIGN §6 *Every confined CLI is
+given its own directories, by one builder*; review round 22 exec H2). The
+rule: every function that derives a CLI's grant or builds its argv
+(`_worker_grants`, `_contained_claude_argv`, in `leerie.py` and
+`scripts/*.py`) calls `_confined_cli_env`, and `_worker_dirs` has no other
+caller. The behaviour, after `_use_run_tmp` and with `CLAUDE_CODE_TMPDIR`
+inherited from the orchestrator: preflight's smoke test and a `claude_p`
+worker, each through the real `_invoke` and the Landlock shim against a stub
+`claude` that makes `$TMPDIR/claude-<uid>` first as the CLI does, and the
+Fly integrator's environment and shim argv as `worker-guard.py` prints them,
+each give their CLI no path in the state root outside its grant and every
+`_WORKER_ENV_DIRS` variable inside what it writes; `worker-guard.py`
+without a `<wid>` refuses to confine. Falsified, each turning tests red: the
+smoke test's environment dropped (the stub's `mkdir` fails as in the
+finding), `claude_p`'s old hand-built four variables, and the old
+`worker-guard.py`. A real smoke test (`claude` 2.1.316 in `leerie:r22`,
+rootless, `apparmor=leerie-container`) passed with the fix and died with the
+finding's EROFS without it.
+
 ## The rev 9 redesign's other new and rewritten test files
 
 - `tests/test_resume_staging_is_reset.py` (7 tests, DESIGN §8 *The final

@@ -891,7 +891,7 @@ def test_env_extra_reaches_the_worker_only_when_set(leerie, monkeypatch,
                      env_extra={"DATABASE_URL": "u"})
     # Beside the worker's own directories (DESIGN §6 *Each worker's own
     # configuration and temporary directories*), which every worker gets.
-    own = {"CLAUDE_CONFIG_DIR", "TMPDIR", "TMP", "TEMP"}
+    own = set(leerie._WORKER_ENV_DIRS)
     env = cap["kw"]["env_extra"]
     assert env["DATABASE_URL"] == "u" and set(env) == own | {"DATABASE_URL"}
     _d, cap = _spawn(leerie, monkeypatch, tmp_path, leerie.ACT_TOOLS)

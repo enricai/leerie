@@ -1806,6 +1806,25 @@ in the directories that hold that session, found by its transcript under
 is removed when each of its calls returns; its `config/` lives as long as
 a resume of it can follow within the process.
 
+*Every confined CLI is given its own directories, by one builder.* The
+CLI's first act, whatever its flags, is to make `$TMPDIR/claude-<uid>`
+(measured on the host and in the image with a read-only `TMPDIR`: it stops
+with EROFS/EACCES before reading its settings). So a confined CLI given a
+path variable its grant does not cover cannot start. Root cause of review
+round 22 exec H2: the directories a confined CLI's environment names were
+made at each spawn site — `claude_p` made them, the Fly integrator's guard
+helper made them, and `preflight`'s smoke test made none, inheriting the
+orchestrator's own `TMPDIR` (`<run-dir>/tmp/`, `_use_run_tmp`), which no
+worker's grant names; every fresh run without `--skip-smoke` died in
+preflight. **Invariant: every path variable a confined CLI is given lies
+inside its grant** — its own `TMPDIR`/`TMP`/`TEMP`/`CLAUDE_CODE_TMPDIR`
+and `CLAUDE_CONFIG_DIR` written, and nothing it is given names a path in
+the state root that its grant does not cover. One builder makes the CLI's
+own directories and names them for every confined spawn — `claude_p`, the
+smoke test (`sid` `smoke`) and the Fly integrator — before its grant is
+derived from that environment, so no spawn site can hand a CLI an
+environment built another way.
+
 *No copy of the credentials outlives its run's process.* `workers/` and the
 template below hold copies of the operator's credentials. They go when the
 process that made or used them exits, whatever the exit: a return, a

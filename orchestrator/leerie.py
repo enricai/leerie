@@ -11809,6 +11809,20 @@ def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
     return config, tmp
 
 
+def _confined_cli_env(run_dir: Path, sid: str,
+                      resume_session: str | None = None) -> dict[str, str]:
+    """The one builder of a confined CLI's own directories (DESIGN §6
+    *Every confined CLI is given its own directories, by one builder*):
+    `_worker_dirs`' pair, named by every `_WORKER_ENV_DIRS` variable, to
+    lay over the spawn's environment before its grant is derived from it.
+    Every one is named, not only those the caller happens to have set: an
+    inherited value (the orchestrator's `<run-dir>/tmp/`) lies outside the
+    grant, and the CLI's first act is to make `$TMPDIR/claude-<uid>`."""
+    config, tmp = _worker_dirs(Path(run_dir), sid, resume_session)
+    return {var: str(config if var == "CLAUDE_CONFIG_DIR" else tmp)
+            for var in _WORKER_ENV_DIRS}
+
+
 def _remove_worker_dirs(run_dir: Path) -> bool:
     """Remove every worker's directories and the template they were made
     from (they hold copies of the credentials). True when both are gone; a
@@ -12262,11 +12276,18 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     #    failure was invisible in the non-streaming mode until exit.
     if not skip_smoke:
         log("preflight: smoke-testing claude -p…")
+        # Its own configuration and temp directories, as every confined
+        # CLI's (DESIGN §6 *Every confined CLI is given its own
+        # directories, by one builder*): the orchestrator's own `TMPDIR`
+        # (`_use_run_tmp`) is outside its grant, and the CLI stops at
+        # start when it cannot make `$TMPDIR/claude-<uid>`.
+        smoke_env = _confined_cli_env(leerie_dir, "smoke")
         cmd = _contained_claude_argv(
             schema=SMOKE_SCHEMA, allowed_tools=SMOKE_TOOLS,
             max_turns=SMOKE_MAX_TURNS, model=model, prompt=SMOKE_PROMPT,
-            # Confined below, so its settings are a confined worker's.
-            settings=_confined_cli_settings(None, run_dir=None,
+            # Confined below, so its settings are a confined worker's,
+            # from the run's template its configuration was made from.
+            settings=_confined_cli_settings(None, run_dir=leerie_dir,
                                             repo_root=None),
             settings_only=True)
         # An EMPTY cwd, not the repo. This validates the CLI, not the
@@ -12333,15 +12354,18 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                                      sid="smoke",
                                      leerie_dir=leerie_dir,
                                      verbosity=verbosity,
+                                     env_extra=smoke_env,
                                      grants=_worker_grants(
                                          run_dir=leerie_dir, state={},
                                          schema_key="smoke", cwd=smoke_cwd,
                                          allowed_tools=SMOKE_TOOLS,
-                                         env=os.environ))
+                                         env={**os.environ, **smoke_env}))
         except subprocess.TimeoutExpired:
             die("claude -p smoke test timed out — auth issue or network problem")
         except WorkerError as e:
             die(f"claude -p smoke test failed: {e}")
+        finally:
+            _rmtree_owned(Path(smoke_env["TMPDIR"]))
         # No cleanup: the directory is empty by construction (SMOKE_TOOLS
         # allows only Read, and four real probe runs left theirs empty), and
         # two runs sharing one state root share this path — an rmtree here
@@ -28880,12 +28904,9 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # (`_confined_cli_settings`): the one `_worker_dirs` makes below.
     _wrun_dir = _wrun if isinstance(_wrun, (str, os.PathLike)) else None
     if isinstance(_wrun, (str, os.PathLike)):
-        worker_config, worker_tmp = _worker_dirs(Path(_wrun), sid,
-                                                 resume_session)
-        env_extra = {**(env_extra or {}),
-                     "CLAUDE_CONFIG_DIR": str(worker_config),
-                     "TMPDIR": str(worker_tmp), "TMP": str(worker_tmp),
-                     "TEMP": str(worker_tmp)}
+        own = _confined_cli_env(Path(_wrun), sid, resume_session)
+        worker_tmp = Path(own["TMPDIR"])
+        env_extra = {**(env_extra or {}), **own}
 
     # I5: where this worker's processes may write and read (DESIGN §6 *A
     # worker writes only where it is granted*); `_invoke` applies it. None

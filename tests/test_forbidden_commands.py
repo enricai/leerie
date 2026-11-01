@@ -721,8 +721,7 @@ def test_no_forbidden_script_means_no_guard_env(leerie, monkeypatch,
            data=_pc("prisma db push"))
     # Only the worker's own directories (DESIGN §6 *Each worker's own
     # configuration and temporary directories*); no guard variable.
-    assert set(_SPAWN_KW["env_extra"]) == {
-        "CLAUDE_CONFIG_DIR", "TMPDIR", "TMP", "TEMP"}
+    assert set(_SPAWN_KW["env_extra"]) == set(leerie._WORKER_ENV_DIRS)
 
 
 def _guard(event, *, scripts="test lint-x"):
@@ -1300,7 +1299,7 @@ def test_the_fly_guard_script_reads_the_typed_scope(leerie, tmp_path):
     state.write_text(json.dumps(_SUITE_STATE))
     p = subprocess.run(
         [sys.executable, "-I", str(REPO / "scripts" / "worker-guard.py"),
-         leerie.ACT_TOOLS, str(repo), str(state)],
+         leerie.ACT_TOOLS, str(repo), str(state), "integrator-x"],
         capture_output=True, text=True, timeout=120)
     assert p.returncode == 0, p.stderr
     got = subprocess.run(

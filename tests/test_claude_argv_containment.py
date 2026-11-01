@@ -395,7 +395,8 @@ def test_smoke_argv_equals_the_derived_builder_output(leerie, monkeypatch,
         prompt=leerie.SMOKE_PROMPT,
         # Confined like a worker, so its settings are a confined worker's
         # (DESIGN §6 *A worker's commands cannot reach its CLI*).
-        settings=leerie._confined_cli_settings(None, run_dir=None,
+        # from the run's template its own configuration was made from.
+        settings=leerie._confined_cli_settings(None, run_dir=tmp_path,
                                                repo_root=None),
         settings_only=True)
     assert cap["cmd"] == expected
