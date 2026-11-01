@@ -155,11 +155,11 @@ def test_every_repo_command_launch_goes_through_the_repo_env():
               if isinstance(n, ast.Call)
               and getattr(n.func, "attr", None) == "create_subprocess_exec"]
     assert len(spawns) == 1
-    # With `/tmp` written (DESIGN §6 *A measurement may write `/tmp`; a
-    # held-out evaluation has it alone*), under the lock held shared.
-    assert ("spawn_cmd = _confined_argv(grants, list(cmd), shared_tmp=True)"
+    # Under the execution lock held shared (DESIGN §6 *A held-out
+    # evaluation runs alone*), in the caller's sandbox when it gives one.
+    assert ("spawn_cmd = _confined_argv(grants, list(cmd), sandbox=sandbox,"
             in stream_src)
-    assert "async with _tmp_lock().shared():" in stream_src
+    assert "async with _exec_lock().shared():" in stream_src
     assert ast.unparse(spawns[0].args[0]) == "*spawn_cmd"
     unpassed = [(name, n.lineno) for name, fn in funcs.items()
                 for n in ast.walk(fn) if isinstance(n, ast.Call)

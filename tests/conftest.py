@@ -522,6 +522,65 @@ def _no_real_planning_worktree(request, monkeypatch):
     monkeypatch.setattr(leerie, "_ensure_planning_worktree", _stub)
 
 
+@pytest.fixture(autouse=True)
+def _test_tmp_readable_by_measurements(request, monkeypatch):
+    """Let a measured command read the test's own `tmp_path`, outside its
+    state root. pytest's `tmp_path` is under the host's `/tmp`, which no
+    grant names — an isolated command's `/tmp` is its own (DESIGN §6 *Every
+    confined process has its own `/tmp`, `/dev/shm` and IPC*) — so a fake
+    runner or installer a test puts there could not even be executed. In
+    production no tool lives in `/tmp`. Never the state root
+    (`_around`), never the rest of `/tmp`."""
+    if "tmp_path" not in request.fixturenames:
+        return
+    leerie = request.getfixturevalue("leerie")
+    tmp = request.getfixturevalue("tmp_path")
+    real = leerie._measurement_grants
+
+    def grants(st, tree, kind=leerie.MEASURE_KIND):
+        g = real(st, tree, kind)
+        root = leerie._run_dir_of(st).parent.parent
+        extra = tuple(p for p in leerie._around([str(tmp)], root)
+                      if p not in g.rw + g.ro)
+        return g._replace(ro=g.ro + extra)
+    monkeypatch.setattr(leerie, "_measurement_grants", grants)
+
+
+HELDOUT_SANDBOX_EMULATOR = REPO_ROOT / "tests" / "heldout_sandbox_emulator.py"
+
+
+@pytest.fixture(autouse=True)
+def _emulated_heldout_sandbox(request, monkeypatch):
+    """Run every held-out sandbox a test asks for through
+    `tests/heldout_sandbox_emulator.py`. Leerie runs a held-out file only in
+    a sandbox (`_confined_argv(…, sandbox=)` always emits `--sandbox`), which
+    needs an unprivileged user namespace with mounts — refused on a
+    developer host and CI (Ubuntu's
+    `kernel.apparmor_restrict_unprivileged_userns`), where every real
+    held-out run would exit 126. The emulator keeps the sandbox's contract
+    with leerie (files placed for the run and gone after it, the report
+    back through its descriptor) without its isolation; a test whose
+    subject is the isolation opts out with `@pytest.mark.real_heldout_sandbox`
+    and skips where `isolation_error()` reports the host cannot build one."""
+    if request.node.get_closest_marker("real_heldout_sandbox"):
+        return
+    leerie = request.getfixturevalue("leerie")
+    real = leerie._confined_argv
+
+    def _argv(grants, cmd, *, sandbox=None, report_fd=None):
+        if sandbox is None:
+            return real(grants, cmd)
+        out = [sys.executable, "-I", str(HELDOUT_SANDBOX_EMULATOR),
+               "--view", sandbox.view]
+        for src, rel in sandbox.place:
+            out += ["--place", f"{src}={rel}"]
+        if sandbox.report is not None and report_fd is not None:
+            out += ["--report", sandbox.report, "--report-fd",
+                    str(report_fd)]
+        return out + ["--", *real(grants, cmd)]
+    monkeypatch.setattr(leerie, "_confined_argv", _argv)
+
+
 _WORKER_EXIT_MODULE = None
 
 

@@ -918,99 +918,47 @@ def test_a_worker_environment_never_carries_the_consent(leerie, monkeypatch,
     assert not any(k.startswith("PRISMA_USER_CONSENT") for k in seen["env"])
 
 
-@pytest.mark.parametrize("url,direct,port,why", [
-    ("postgresql://u@127.0.0.1:5000/leerie_ab_test", None, 5000, None),
-    ("postgres://u@localhost:5000/leerie_ab_test", None, 5000, None),
-    ("postgresql://u@db.example.com:5000/leerie_ab_test", None, 5000, "host"),
-    ("postgresql://u@127.0.0.1:5432/leerie_ab_test", None, 5000, "port"),
-    ("postgresql://u@127.0.0.1:5000/app_test", None, 5000, "not named"),
-    ("postgresql://u@127.0.0.1:5000/leerie_ab", None, 5000, "not named"),
-    ("mysql://u@127.0.0.1:5000/leerie_ab_test", None, 5000, "scheme"),
-    ("postgresql://u@127.0.0.1:5000/leerie_ab_test",
-     "postgresql://u@127.0.0.1:5000/prod", 5000, "DIRECT_URL"),
+_SOCK = "?host=/tmp/leerie-pg"
+_NAME = "leerie_0123456789abcdef_test"
+
+
+@pytest.mark.parametrize("url,direct,why", [
+    (f"postgresql://u@localhost/{_NAME}{_SOCK}", None, None),
+    (f"postgres://u@localhost/{_NAME}{_SOCK}", None, None),
+    (f"postgresql://u@db.example.com/{_NAME}{_SOCK}", None, "host"),
+    (f"postgresql://u@127.0.0.1:5432/{_NAME}", None, "host"),
+    (f"postgresql://u@localhost:5432/{_NAME}{_SOCK}", None, "host"),
+    (f"postgresql://u@localhost/{_NAME}?host=/var/run/postgresql", None,
+     "socket"),
+    (f"postgresql://u@localhost/{_NAME}", None, "socket"),
+    (f"postgresql://u@localhost/app_test{_SOCK}", None, "not named"),
+    (f"postgresql://u@localhost/leerie_ab_test{_SOCK}", None, "not named"),
+    (f"mysql://u@localhost/{_NAME}{_SOCK}", None, "scheme"),
+    (f"postgresql://u@localhost/{_NAME}{_SOCK}",
+     f"postgresql://u@localhost/prod{_SOCK}", "DIRECT_URL"),
 ])
-def test_only_a_throwaway_database_on_our_own_port_passes(
-        leerie, url, direct, port, why):
-    got = leerie._test_db_url_refusal(url, direct or url, port)
+def test_only_a_throwaway_database_on_the_commands_own_socket_passes(
+        leerie, url, direct, why):
+    got = leerie._test_db_url_refusal(url, direct or url)
     assert (got is None) if why is None else (why in got)
 
 
-def _fake_cluster(leerie, monkeypatch, tree, *, name=None):
-    calls = []
-    monkeypatch.setitem(leerie._TEST_DB, "cluster", {
-        "bin": "/pg/bin", "port": 5999, "data": "/nonexistent", "user": "u"})
-    if name:
-        monkeypatch.setattr(leerie, "_test_db_name", lambda key: name)
-    real = subprocess.run
-
-    def fake_run(argv, *a, **kw):
-        if isinstance(argv, list) and (argv[0].startswith("/pg/bin")
-                                       or argv[0].endswith("prisma")):
-            calls.append((list(argv), kw.get("env")))
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        return real(argv, *a, **kw)
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    bin_ = tree / "node_modules" / ".bin"
-    bin_.mkdir(parents=True)
-    (bin_ / "prisma").write_text("")
-    return calls
-
-
-def test_the_push_carries_the_consent_and_only_the_push(leerie, tmp_path,
-                                                        monkeypatch):
+def test_a_target_failing_the_check_is_never_wrapped(leerie, tmp_path,
+                                                     monkeypatch):
+    """The URL `scripts/sandbox-db.sh` would compose is checked before the
+    command is wrapped: a name failing it gives no database at all."""
     repo = _prisma_repo(tmp_path)
     st = types.SimpleNamespace(repo_root=repo, run_id="r1")
     tree = tmp_path / "tree"
-    calls = _fake_cluster(leerie, monkeypatch, tree)
-    url = asyncio.run(leerie._create_test_db(st, tree, "w"))
-    assert re.fullmatch(
-        r"postgresql://u@127\.0\.0\.1:5999/leerie_[0-9a-f]{16}_test", url)
-    tools = [os.path.basename(a[0]) for a, _e in calls]
-    assert tools == ["dropdb", "createdb", "prisma"]
-    (argv, env), = [(a, e) for a, e in calls if a[0].endswith("prisma")]
-    assert argv[1:] == ["db", "push", "--accept-data-loss"]
-    assert env["DATABASE_URL"] == env["DIRECT_URL"] == url
-    assert env["PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION"]
-    assert leerie._test_db_env(url) == {"DATABASE_URL": url,
-                                       "DIRECT_URL": url}
+    assert leerie._test_db_argv(st, tree, "w")[-1] == "--"
+    monkeypatch.setattr(leerie, "_test_db_name", lambda key: "production")
+    assert leerie._test_db_argv(st, tree, "w") == []
 
 
-def test_a_target_failing_the_check_is_never_pushed(leerie, tmp_path,
-                                                    monkeypatch):
-    repo = _prisma_repo(tmp_path)
-    st = types.SimpleNamespace(repo_root=repo, run_id="r1")
-    tree = tmp_path / "tree"
-    calls = _fake_cluster(leerie, monkeypatch, tree, name="production")
-    assert asyncio.run(leerie._create_test_db(st, tree, "w")) is None
-    assert calls == []
-
-
-def test_no_cluster_outside_a_postgres_prisma_repo(leerie, tmp_path):
+def test_no_database_outside_a_postgres_prisma_repo(leerie, tmp_path):
     for repo in (tmp_path, _prisma_repo(tmp_path, provider="sqlite")):
         st = types.SimpleNamespace(repo_root=repo, run_id="r1")
-
-        async def go():
-            async with leerie._test_db_session(st) as c:
-                return c
-        assert asyncio.run(go()) is None
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="postgres refuses root")
-def test_a_real_cluster_starts_on_its_own_port_and_is_removed(leerie,
-                                                              tmp_path):
-    if leerie._pg_server_bin() is None:
-        pytest.skip("no PostgreSQL server binaries on this host")
-    st = types.SimpleNamespace(repo_root=tmp_path, run_id=f"t{os.getpid()}")
-    c = leerie._start_test_db_cluster(st)
-    assert c is not None
-    try:
-        ready = subprocess.run([os.path.join(c["bin"], "pg_isready"), "-h",
-                                "127.0.0.1", "-p", str(c["port"])],
-                               capture_output=True)
-        assert ready.returncode == 0
-    finally:
-        leerie._stop_test_db_cluster(c)
-    assert not Path(c["data"]).exists()
+        assert leerie._test_db_argv(st, tmp_path / "tree", "w") == []
 
 
 def test_a_no_work_decided_by_execution_is_recorded_as_executed(

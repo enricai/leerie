@@ -4016,10 +4016,17 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `_probe_case_facts(tree, probe, case, *, grants)`,
   `_ts_resolvable(tree, *, grants)`, `_redrive_ast_hits(staging, base,
   head, *, grants)`, via `_redrive_ast_available(staging, *, grants)` and
-  `_redrive_escalation_gate(staging, base, head, *, grants)`.
+  `_redrive_escalation_gate(staging, base, head, *, grants)`. They spawn
+  synchronously (`_ts_script_run`), so they cannot wait for the execution
+  lock: every coroutine that calls one holds `_exec_lock().shared()`
+  around the call (the falsifier's `_ts_resolvable` and
+  `_probe_case_facts`, the re-drive's `_redrive_ast_available` and
+  `_redrive_escalation_gate`), and `_ts_script_run` `die()`s, before
+  spawning, when its context holds neither level (`_exec_lock_held()`).
 - Reports a measured command writes are under `_measure_dir(st, tree)`:
   `_run_acceptance_file`'s and `_acceptance_parse_probe`'s
-  `reports/<label>-…`, `_capture_failing_test_ids`' `reports/<label>-<i>-…`,
+  `reports/<label>-…` (written inside the held-out sandbox and copied out
+  through its report descriptor by `_run_streaming`), `_capture_failing_test_ids`' `reports/<label>-<i>-…`,
   `_vitest_run`'s `coverage/<sid>/`. Nothing is written under
   `<run>/acceptance/reports/`, `<run>/confirm/` or `<run>/coverage/`.
 - `committing_worker_started`: `claude_p` sets it (and saves) before
@@ -4042,9 +4049,9 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   round: a socket in the private temp directory; the 0700 chain SWC
   accepts and every directory made 0700; background, SIGTERM-ignoring and
   timed-out commands' processes gone, the shim keeping the exit code and
-  signal; leerie's own temp directory in the run directory; its `/tmp`
-  section-and-inventory cases are replaced by the execution lock's and by
-  `tests/test_landlock_isolation.py`).
+  signal; leerie's own temp directory in the run directory; no grant names
+  `/tmp` itself; its `/tmp` section-and-inventory cases are replaced by
+  `tests/test_exec_lock.py` and `tests/test_heldout_isolation.py`).
 - Tests: `tests/test_worker_confinement.py` (a real confined child per
   worker kind; fail closed in preflight, the shim and `_invoke`; derived
   guards: every `claude -p` argv from `_contained_claude_argv` or the probe,
@@ -4312,13 +4319,43 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   (`tempfile.TemporaryFile`), passes it in `pass_fds`, spawns
   `_confined_argv(grants, cmd, sandbox=…, report_fd=…)`, and after the
   command exits copies the file's content to `sandbox.report`'s path
-  outside (the caller's report path, which no other process wrote). The
-  evaluation's grant is `_measurement_grants(st, tree)` with the
-  `_VERIFIED_STORE_VARS` paths left out (read-only in the sandbox).
-  Callers passing it: `_run_acceptance_file`, `_acceptance_run_placed` (no
-  longer `_place_set` into its tree, and no removal afterwards),
-  `_acceptance_parse_probe`, the writer's validation, the case-failure
-  capture, the discovery reruns and the set audit's witness runs.
+  outside (the caller's report path, which no other process wrote; an
+  empty file writes nothing). The evaluation's grant is
+  `_heldout_grants(st, tree)`: `_measurement_grants(st, tree)` with the
+  `_VERIFIED_STORE_VARS` paths moved from `rw` to `ro` (read-only in the
+  sandbox). Callers passing it, each through `_run_acceptance_file(…,
+  place=)` or the parse probe:
+  - `_run_acceptance_file(st, caps, tree, rel, log_path, label, *,
+    validating=False, failure_mode="assertion", observed=None,
+    cases_out=None, place: tuple[tuple[str, str], ...] = ())` —
+    `HeldOutSandbox(view=tree, place=place, report=<its report path when
+    the runner has one>)`; `_acceptance_cmd(st, [rel], tree, placed=
+    {rel: src for src, rel in place})`. Its `env_extra` is gone: the
+    database is the wrapper's (*The per-command database*).
+  - `_acceptance_run_placed(st, caps, wt, sets, label, *, confirm=True)`
+    — per set, the `place` pairs of every file whose path `wt` does not
+    already have (`exists()` or a symlink: `path_in_use`, the set
+    unmeasured, as before), handed to every run, confirm rerun and
+    discovery rerun (`_acceptance_discover(…, place, note, …)`, the
+    positional slot `env_extra` had); nothing is copied, no section held
+    across the loop. The writer's validation runs its own files where the
+    writer wrote them (no `place`), in the same sandbox.
+  - `_acceptance_parse_probe` — the probe's source is written to a
+    `tempfile.mkstemp` file of leerie's own (removed after) and placed at
+    the probe's path (`None` with "the parse check's name is taken" when
+    the tree has that path); its marker is the sandbox's `report`, so
+    "ran"/"ok" come back through the descriptor.
+  - `_acceptance_case_failures(st, caps, wt, set_, log_path, label)` —
+    the set's files as `place`; `_acceptance_audit_in` checks no set path
+    is taken in `wt` (else `skipped`), captures the failing cases that way,
+    and only then `_place_set`s the set on disk for the `set_auditor`
+    worker, which reads it (a held-out-side worker in a tree no worker
+    commits from), removing it after.
+  - `_acceptance_cmd(st, files, tree=None, placed: Mapping[str, str] |
+    None = None)` reads a placed file's Go test names from its source, and
+    `_vitest_exact_selection(cmd, files, tree, extra=())` /
+    `_vitest_filter_colliders(tree, files, extra=())` count the placed
+    paths as the tree's files.
 - `_require_heldout_sandbox(st_root: Path) -> None` — `preflight` step
   0.35, after `_require_landlock`, on every runtime: makes a probe
   directory beneath the state root (a view with one file, a set file
@@ -4353,9 +4390,22 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   holds or waits; `exclusive()` — yields False when nested, else waits for
   no writer and no reader, sets `_EXEC_EXCLUSIVE` in the holder's context,
   yields True; one per running loop, a weak-key dictionary). Shared
-  holders: `_run_streaming` (its whole spawn), `_ts_script_run`, the `mise
-  ls` spawn, and `_invoke`/`_invoke_admitted` from before the worker's
-  spawn until its process has exited. `_held_out_section(st)` —
+  holders: `_run_streaming` (its whole spawn), the callers of
+  `_ts_script_run` (synchronous: it checks `_exec_lock_held()` and
+  `die()`s without it), the `mise ls` spawn, and `_invoke` (so
+  `_invoke_admitted`, which delegates to it) from before the worker's
+  spawn until its process has exited and been reaped (an
+  `AsyncExitStack` closed in its `finally`, and on every path that fails
+  before it). A shared holder's own nested `shared()` passes through
+  (`_EXEC_SHARED`, set in the holder's context), so a command run under a
+  hold never waits behind an evaluation that waits for that hold;
+  `exclusive()` called where `_EXEC_SHARED` is set `die()`s (`invariant:
+  a held-out evaluation started while its own caller holds the execution
+  lock shared`). Each level is taken after every semaphore its holder
+  takes (`_build_class_slot`, `_blt_semaphore`, memory admission, the
+  confirm lock), and nothing reachable inside `_held_out_section` takes
+  one or spawns a worker (`tests/test_exec_lock.py`, by rule over the
+  module), so the lock cannot deadlock. `_held_out_section(st)` —
   `exclusive()` around the sandboxed command only (held by
   `_run_acceptance_file` and `_acceptance_parse_probe` around their spawn,
   replacing `_blt_semaphore`; `_acceptance_run_placed` no longer holds it
@@ -4386,7 +4436,11 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   (the shim grants the private one). `_WORKER_DEVICES` keeps `/dev/shm`
   (the shim maps it to the private one).
 - `_confined_writes_notice` names `/tmp` as the worker's private scratch,
-  gone when its session ends, and no longer says `/tmp` is not writable.
+  gone when its session ends, and no longer says `/tmp` is not writable —
+  when `_isolated()`; an unisolated worker (a test, a host harness) has no
+  `/tmp`, and the notice says so as before.
+- `_run_contained(argv, *, grants, sandbox=None, …)` passes `sandbox` to
+  `_run_streaming`.
 
 **The per-command database** (`scripts/sandbox-db.sh`): `sandbox-db.sh
 <pkg-dir> <db-name> -- CMD...`, run as the confined command itself (inside
@@ -4397,20 +4451,35 @@ not matching `^leerie_[0-9a-f]{16}_test$`; `initdb -D /tmp/leerie-pg/data
 listen_addresses='' -c unix_socket_directories=/tmp/leerie-pg -c
 fsync=off`; `createdb`; `DATABASE_URL` = `DIRECT_URL` =
 `postgresql://<user>@localhost/<db-name>?host=/tmp/leerie-pg`;
-`<pkg-dir>/node_modules/.bin/prisma db push --accept-data-loss
---skip-generate` with `PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION` on
-that one command; then `exec CMD` with both URLs exported. Without server
-binaries, or as root, it execs CMD unchanged, printing one line. The
-shim ends the server with the command. Leerie composes the name
-(`leerie_<sha256(key)[:16]>_test`) and checks the URL the script will
-compose (`_test_db_url_refusal(url, direct_url)`: postgres scheme, host
-`localhost` with `host=/tmp/leerie-pg`, the name rule, DIRECT_URL ==
-DATABASE_URL). Callers wrap the command instead of entering
-`_test_db_session`: every set run and evaluation, CI parity's checks, the
-falsifier's commands; a worker that needs one for its session (the
-writer, the re-drive implementer) is spawned as `sandbox-db.sh <pkg> <name>
--- claude …` inside its own confinement, so its `DATABASE_URL` names its
-own cluster.
+`<pkg-dir>/node_modules/.bin/prisma db push --accept-data-loss` (in
+`<pkg-dir>`; the push the orchestrator used to make, generate included)
+with `PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION` on that one command;
+then `exec CMD` with both URLs exported. Without server binaries, as
+root, or when any step fails (the directory, `initdb`, the start,
+`createdb`, no installed `prisma`, the push), it execs CMD unchanged,
+saying so in one line. Everything it prints goes to stderr: CMD's stdout
+is CMD's own (a worker's is its event stream). The shim ends the server
+with the command. Leerie composes the prefix with `_test_db_argv(st, tree,
+key) -> list[str]` — `["bash", SANDBOX_DB_SCRIPT, <tree>/<project dir>,
+leerie_<sha256(f"{run_id}:{key}:{tree}")[:16]>_test, "--"]`, `[]` outside
+a Prisma repo whose datasource is PostgreSQL or when the URL is refused
+(logged) — after checking the URL the script will compose
+(`_test_db_url(name)`; `_test_db_url_refusal(url, direct_url)`: postgres
+scheme, host `localhost` with no port and `host=` exactly
+`TEST_DB_SOCKET_DIR = "/tmp/leerie-pg"`, the name rule
+(`_TEST_DB_NAME_RE`), DIRECT_URL == DATABASE_URL). Callers put it in front
+of the command instead of entering `_test_db_session`: every held-out run
+(`_run_acceptance_file`, key `<label>:<rel>`), CI parity's checks that
+`require` a database (`_ci_run`, key `ci-<label>`), the falsifier's
+confirm runs (`_capture_failing_test_ids(…, db=True)`, which replaces its
+`env_extra`); a worker that needs one for its session — the writer, the
+surrogate fixer, each falsifier sample, the re-drive implementer when it
+has shown sets (`_redrive_drive(…, db=)`) — is spawned through
+`claude_p(…, db=True)`, which puts the prefix (keyed by the worker's sid)
+in front of the `claude` argv, so its `DATABASE_URL` names its own
+cluster, and the re-drive's self-check, which runs inside that worker,
+uses it through its environment (`_selfcheck_prepare(st, caps, staging,
+shown, label)`, `db_url` gone, `config.json`'s `env` empty).
 
 **The launcher and the runtime** (`leerie`, `scripts/runtime-install.sh`,
 `scripts/apparmor/leerie-container`):
@@ -4453,7 +4522,19 @@ own cluster.
   (the die messages, `_sandbox_fix`), `tests/test_seccomp_filter.py` (the
   tables, the program, a real filter on the host), `tests/test_apparmor_profile.py`
   and `tests/test_launcher_secopt.py` (the launcher's flags and install
-  step).
+  step); `tests/test_exec_lock.py` (the execution lock: evaluations,
+  measurements and real `_invoke` workers ordered, the worker guard, the
+  host level across processes, and deadlock-freedom by rule over the
+  module), `tests/test_heldout_sandbox_callers.py` (every held-out runner
+  hands `_run_streaming` a sandbox in a section, the set never on disk,
+  the report back through the descriptor; the per-command database: the
+  URL refusal, `_test_db_argv`, the held-out, CI, worker and falsifier
+  wrappers, no server or `prisma` run by leerie, the push confined),
+  `tests/test_heldout_isolation.py` (review round 20's H1 and H2 proofs, F1
+  and a fixed `/tmp/<name>` per command, each asserted closed in a real
+  sandbox; skipped where the shim lacks `isolation_error()` or it is not
+  None), `tests/test_confined_inputs.py` (an AST script without the lock
+  stops the run; every caller holds it, by rule).
 
 ---
 
@@ -7028,7 +7109,7 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   is `"<file> :: (file failed to load)"`. None when no report is readable
   or it executed no test and recorded no load failure.
 - `async _capture_failing_test_ids(tree, cmd, st, caps, *, label, log_path,
-  timeout, serial=False, files=None, env_extra=None) -> dict | None` — runs `cmd` (or its
+  timeout, serial=False, files=None, db=False) -> dict | None` — runs `cmd` (or its
   scoped form over `files`) once with a report requested via
   `_acceptance_report_spec`, appending `_SERIAL_RUNNER_FLAGS[runner]`
   (`--runInBand`, `--no-file-parallelism --maxWorkers=1`, `-p no:xdist`)
@@ -8417,18 +8498,19 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   skipped (`skipped: nothing_left`); members whose `_redrive_allowed` is
   false are dropped (`skipped: budget` when none is left); each member's
   counter is consumed (`_consume_redrive`); `in_flight {pre_sha, round,
-  group}` is saved; in a Prisma/PostgreSQL repo the implementer is
-  spawned through `scripts/sandbox-db.sh` (its own cluster for its
-  session, `db_url` its socket URL; None without a Prisma project) and the
-  self-check prepared
+  group}` is saved; with shown sets, in a Prisma/PostgreSQL repo the
+  implementer is spawned through `scripts/sandbox-db.sh`
+  (`_redrive_drive(…, db=True)` → `claude_p(…, db=True)`: its own cluster
+  for its session, which its self-check uses through its environment) and
+  the self-check prepared
   (DESIGN §8 *A held-out set never enters a tree a worker commits from*):
-  `_selfcheck_prepare(st, caps, staging, shown, label, db_url) -> dict`
+  `_selfcheck_prepare(st, caps, staging, shown, label) -> dict`
   writes `<run>/selfcheck/<label>/` holding `sets/set-<index>/<rel>` (a
   read-only copy of each shown set's files, the source the note points
   at; never under the read-denied `acceptance/`), `config.json` (`{tree,
   repo_root, sets[{index, dir, defect_files, control_files,
-  support_files}] with `dir` the copy, snap_root, env, forbidden, timeout,
-  log}`) and `bin/leerie-selfcheck` (a bash wrapper: `exec python3
+  support_files}] with `dir` the copy, snap_root, env (empty), forbidden,
+  timeout, log}`) and `bin/leerie-selfcheck` (a bash wrapper: `exec python3
   <leerie>/scripts/selfcheck.py <config.json> "$@"`), and returns `{dir,
   bin, command, src, run_files, name_flag}` — `run_files` the shown sets'
   defect and control files, `name_flag` the runner's own test-name flag

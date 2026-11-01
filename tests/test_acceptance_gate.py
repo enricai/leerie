@@ -496,15 +496,17 @@ def test_a_set_that_cannot_be_placed_is_no_evidence(leerie, tmp_path,
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     staging = _staging(st, repo)
-    real = leerie.shutil.copy2
+    # Nothing is copied onto disk any more (the sandbox places the set): a
+    # set whose run cannot start (a full disk) is the placement failure.
+    real = leerie._run_acceptance_file
     calls = []
 
-    def full(src, dst, *a, **k):
-        calls.append(dst)
+    async def full(*a, **k):
+        calls.append(a)
         if len(calls) == 1:
             raise OSError(28, "No space left on device")
-        return real(src, dst, *a, **k)
-    monkeypatch.setattr(leerie.shutil, "copy2", full)
+        return await real(*a, **k)
+    monkeypatch.setattr(leerie, "_run_acceptance_file", full)
     _commit_fix(staging)
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 2), str(staging), _make_sets(leerie, st, 2), "t"))

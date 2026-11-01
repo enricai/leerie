@@ -40,6 +40,15 @@ TS_DIR_ENV = "LEERIE_TEST_TYPESCRIPT_DIR"
 _git = run_git_out
 
 
+def _held(leerie, fn, *args, **kw):
+    """`fn(*args, **kw)` under the execution lock, held shared, as every
+    caller of a synchronous AST script holds it (`_ts_script_run`)."""
+    async def go():
+        async with leerie._exec_lock().shared():
+            return fn(*args, **kw)
+    return asyncio.run(go())
+
+
 def _ts_dir() -> str | None:
     env = os.environ.get(TS_DIR_ENV)
     if env:
@@ -460,8 +469,8 @@ class TestAstGate:
         head = _commit(repo, {"src/load.ts": after, **(extra or {})}, "h")
         (repo / "node_modules").mkdir(exist_ok=True)
         os.symlink(_ts_dir(), repo / "node_modules" / "typescript")
-        assert leerie._redrive_ast_available(repo, grants=leerie.WorkerGrants(("/",), ()))
-        return leerie._redrive_ast_hits(repo, base, head, grants=leerie.WorkerGrants(("/",), ()))
+        assert _held(leerie, leerie._redrive_ast_available, repo, grants=leerie.WorkerGrants(("/",), ()))
+        return _held(leerie, leerie._redrive_ast_hits, repo, base, head, grants=leerie.WorkerGrants(("/",), ()))
 
     def test_clean_change_passes(self, leerie, tmp_path):
         hits = self._run(leerie, tmp_path,
@@ -501,11 +510,11 @@ class TestAstGate:
             "module.exports = { version: '7.0.2' };\n")
         monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT",
                             tmp_path / "none")
-        assert leerie._redrive_ast_available(repo, grants=leerie.WorkerGrants(("/",), ())) is False
-        assert leerie._redrive_ast_hits(repo, base, head, grants=leerie.WorkerGrants(("/",), ())) is None
+        assert _held(leerie, leerie._redrive_ast_available, repo, grants=leerie.WorkerGrants(("/",), ())) is False
+        assert _held(leerie, leerie._redrive_ast_hits, repo, base, head, grants=leerie.WorkerGrants(("/",), ())) is None
         monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", Path(_ts_dir()))
-        assert leerie._redrive_ast_available(repo, grants=leerie.WorkerGrants(("/",), ())) is True
-        hits = leerie._redrive_ast_hits(repo, base, head, grants=leerie.WorkerGrants(("/",), ()))
+        assert _held(leerie, leerie._redrive_ast_available, repo, grants=leerie.WorkerGrants(("/",), ())) is True
+        hits = _held(leerie, leerie._redrive_ast_hits, repo, base, head, grants=leerie.WorkerGrants(("/",), ()))
         assert [h["rule"] for h in hits] == ["D1_guard_removed"]
 
     def test_d3_swallowed_across_files(self, leerie, tmp_path):
@@ -525,16 +534,16 @@ def test_escalation_gate_voids_on_any_hit(leerie, tmp_path, monkeypatch):
                         lambda *a: [])
     monkeypatch.setattr(leerie, "_redrive_schema_hits", lambda *a: [])
     monkeypatch.setattr(leerie, "_redrive_ast_hits", lambda *a, **k: None)
-    assert leerie._redrive_escalation_gate(tmp_path, "a", "b", grants=leerie.WorkerGrants(("/",), ()))["void"]
+    assert _held(leerie, leerie._redrive_escalation_gate, tmp_path, "a", "b", grants=leerie.WorkerGrants(("/",), ()))["void"]
     monkeypatch.setattr(leerie, "_redrive_ast_hits", lambda *a, **k: [])
-    assert not leerie._redrive_escalation_gate(tmp_path, "a",
+    assert not _held(leerie, leerie._redrive_escalation_gate, tmp_path, "a",
                                                "b", grants=leerie.WorkerGrants(("/",), ()))["void"]
 
 
 def test_ast_unavailable_without_typescript(leerie, tmp_path, monkeypatch):
     repo, _ = _repo(tmp_path)
     monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", tmp_path / "none")
-    assert leerie._redrive_ast_available(repo, grants=leerie.WorkerGrants(("/",), ())) is False
+    assert _held(leerie, leerie._redrive_ast_available, repo, grants=leerie.WorkerGrants(("/",), ())) is False
 
 
 class TestEscalateDecision:
@@ -999,7 +1008,7 @@ def test_resumed_in_flight_group_removes_its_selfcheck_dir(
     w.install(monkeypatch)
     pre = _git(w.staging, "rev-parse", "HEAD")
     sc = leerie._selfcheck_prepare(w.st, w.caps, w.staging, w.sets,
-                                   "delivery-redrive-r1-g0", None)
+                                   "delivery-redrive-r1-g0")
     assert Path(sc["src"]).is_dir()
     w.st.data["delivery_redrive"] = {"in_flight": {
         "pre_sha": pre, "round": 1, "group": 0},

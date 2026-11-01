@@ -6064,32 +6064,75 @@ template kept at finalize.
   is seeded only for a tree that pins no version (2 cases); two concurrent
   fetches into one store each get their own staging directory and take
   turns under the store's lock.
-- `tests/test_measurement_tmp.py` (29 test functions, 30 cases; DESIGN §6
-  *A confined command's scratch is short and private*, *A measurement may
-  write `/tmp`; a held-out evaluation has it alone*, *A confined command's
-  processes end with it*, *`/tmp` is not a worker's*; review round 19 exec
-  H1). Review round 19's execution driver turned round, on the real shim
-  and `_measurement_grants`:
+- `tests/test_measurement_tmp.py` (18 test functions, 19 cases; DESIGN §6
+  *A confined command's scratch is short and private*, *Every confined
+  process has its own `/tmp`, `/dev/shm` and IPC*, *A confined command's
+  processes end with it*; review round 19 exec H1). Review round 19's
+  execution driver turned round, on the real shim and
+  `_measurement_grants`, unisolated:
   - The private temp directory fits a socket path whatever the run
     directory's length, a measured command binds a socket in it, and its
     chain up to `/tmp` is one SWC accepts. Every directory leerie makes for
     a command or a worker is 0700; a private temp directory that is not
     this user's stops the run, and one made open before is closed.
-  - A measured command writes a fixed `/tmp` path; the container's grant is
-    `/tmp` whole, and only `_run_streaming` grants it. A worker neither
-    reads nor writes `/tmp`, and its read grant names nothing in it.
+  - No grant of any kind names `/tmp` itself, and an unisolated measured
+    command writes its private temp directory and not `/tmp`. An
+    unisolated worker neither reads nor writes `/tmp`, and its read grant
+    names nothing in it.
   - The private temp directories go with their tree, with the run's
     scratch, and at the process's exit.
   - A background process (2 cases: one that ignores SIGTERM) and a timed-out
     command's processes are gone when the command returns, the shim keeps
     the command's exit status, and a worker session's background processes
     end with it.
-  - A held-out evaluation leaves nothing in `/tmp` (nothing is removed on a
-    shared host `/tmp`), runs with no measurement beside it, waits for the
-    running ones without starving, nests, and survives a cancelled waiter;
-    every held-out run is in a section, a guard derived from the source.
-  - Leerie's own temp directory is in the run directory, `_run_phases`
-    moves it first, and the image marks its `/tmp` the run's.
+  - Leerie's own temp directory is in the run directory, and `_run_phases`
+    moves it first.
+- `tests/test_exec_lock.py` (14 tests; DESIGN §6 *A held-out evaluation
+  runs alone, in a world that dies with it (I3)*, the time half): an
+  evaluation runs with no measurement beside it and waits for running ones
+  without starving; it waits for a running real `_invoke` worker, and a
+  worker asked for meanwhile starts after it; a worker spawned inside an
+  evaluation stops the run before spawning; a cancelled worker and a
+  cancelled waiter release the lock; sections nest, a shared holder's own
+  commands pass through a waiting evaluation, and an evaluation inside a
+  shared hold stops the run; the host level makes an evaluation wait for
+  another process's shared holder and holds later shared takers behind it,
+  and releases both files; by rule over the module nothing reachable inside
+  `_held_out_section` spawns a worker or waits on a semaphore a shared
+  holder may hold (with the rule's own catch of a planted violation), and
+  every shared holder takes the lock after its semaphores.
+- `tests/test_heldout_sandbox_callers.py` (15 tests; DESIGN §6 *A held-out
+  evaluation runs alone*, *No database server leerie starts is ever
+  unconfined*): every run of a set file carries the whole set as `place`
+  pairs in a section, none of it on disk at any spawn; a path the tree
+  already has is never placed; end to end (through
+  `tests/heldout_sandbox_emulator.py`) the report reaches leerie only
+  through the descriptor and the tree is unchanged; the parse probe is
+  placed and its marker is the report; a rule over the held-out runners.
+  The database: the URL refusal accepts only the command's own socket;
+  `_test_db_argv` wraps only a Prisma/PostgreSQL repo, one name per
+  command; a held-out run, a worker (`claude_p(db=True)`) and a
+  database-requiring CI check are wrapped; by rule leerie never starts a
+  server or runs `prisma`; F2 turned round — the schema push runs under
+  the command's Landlock domain (`NoNewPrivs: 1`, `acceptance/` refused)
+  and the command gets the URL but never the consent; F1 turned round with
+  the host's real PostgreSQL (skipped without one) — the command's own
+  server answers over its socket, `COPY … TO PROGRAM` cannot read
+  `acceptance/`, and the server is gone with the command; a name that is
+  not a test database is refused (125); confined but unisolated, the
+  script runs the command unchanged without a database, its stdout clean.
+- `tests/test_heldout_isolation.py` (4 tests, all `real_heldout_sandbox`,
+  skipped where the shim has no `isolation_error()` or the host cannot
+  build a sandbox): review round 20's H1 (`/dev/shm`, System V) and H2 (the
+  AST gate's relay of `/tmp`) and the measured F1 (`COPY … TO PROGRAM`
+  from the command's own database; no TCP listener), each asserted closed;
+  an isolated command has a fixed `/tmp/<name>` of its own.
+- `tests/test_confined_inputs.py` (4 tests; formerly
+  `tests/test_worker_tree_tmp.py`, whose worker-tree cases went with
+  `_is_worker_tree`): an input outside the grant stops the run, the AST
+  gate runs with leerie's temp files in the run directory, an AST script
+  without the execution lock stops the run, and every caller holds it (a
+  rule over the module).
 - `tests/test_ref_less_clone_git_is_leeries.py` (5 tests, DESIGN §6
   *Leerie's git never takes a tree's repository from the tree*): a ref-less
   clone is located at leerie's git directory (`<run>/clone-gits/<name>`);

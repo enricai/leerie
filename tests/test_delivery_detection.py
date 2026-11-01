@@ -54,6 +54,15 @@ PASSING_PROBE_SRC = ("from calc import add\n\n\n"
 _git = run_git_out
 
 
+def _held(leerie, fn, *args, **kw):
+    """`fn(*args, **kw)` under the execution lock, held shared, as every
+    caller of a synchronous AST script holds it (`_ts_script_run`)."""
+    async def go():
+        async with leerie._exec_lock().shared():
+            return fn(*args, **kw)
+    return asyncio.run(go())
+
+
 @pytest.fixture(autouse=True)
 def _quiet_host(leerie, monkeypatch):
     # B*'s gate reads the host's PSI; pin it quiet so a loaded host cannot
@@ -684,7 +693,7 @@ class TestCouplingPolicy:
             "  });\n"
             "  it('other', () => { unused(); });\n"
             "});\n")
-        facts = leerie._probe_case_facts(tree, probe,
+        facts = _held(leerie, leerie._probe_case_facts, tree, probe,
                                          "math add returns the sum", grants=leerie.WorkerGrants(("/",), ()))
         assert facts["title"] == "add returns the sum"
         reach = " ".join(facts["reach_src"])
@@ -696,14 +705,14 @@ class TestCouplingPolicy:
         assert [r["lits"] for r in facts["reads"]] == [["src/lib.ts"]]
         assert {i["imported"] for i in facts["imports"]} == {"readFileSync",
                                                             "publicFn"}
-        assert leerie._ts_resolvable(tree, grants=leerie.WorkerGrants(("/",), ())) is True
+        assert _held(leerie, leerie._ts_resolvable, tree, grants=leerie.WorkerGrants(("/",), ())) is True
         (tmp_path / "probe-less").mkdir()
         monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT",
                             tmp_path / "no-bundle")
-        assert leerie._ts_resolvable(tmp_path / "probe-less", grants=leerie.WorkerGrants(("/",), ())) is False
+        assert _held(leerie, leerie._ts_resolvable, tmp_path / "probe-less", grants=leerie.WorkerGrants(("/",), ())) is False
 
     def test_facts_failure_is_an_error_not_a_crash(self, leerie, tmp_path):
-        assert "error" in leerie._probe_case_facts(
+        assert "error" in _held(leerie, leerie._probe_case_facts, 
             tmp_path, tmp_path / "missing.test.ts", "x", grants=leerie.WorkerGrants(("/",), ()))
 
 
@@ -738,8 +747,8 @@ def test_ts7_tree_without_a_bundle_is_unavailable(leerie, tmp_path,
     monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", tmp_path / "none")
     assert subprocess.run(["node", "-e", "require.resolve('typescript')"],
                           cwd=tree, check=False).returncode == 0
-    assert leerie._ts_resolvable(tree, grants=leerie.WorkerGrants(("/",), ())) is False
-    facts = leerie._probe_case_facts(tree, tree / "probe" / "x.test.ts",
+    assert _held(leerie, leerie._ts_resolvable, tree, grants=leerie.WorkerGrants(("/",), ())) is False
+    facts = _held(leerie, leerie._probe_case_facts, tree, tree / "probe" / "x.test.ts",
                                      "m keeps the sum", grants=leerie.WorkerGrants(("/",), ()))
     assert facts["error"] == "facts_failed"
 
@@ -752,12 +761,12 @@ def test_ts7_tree_falls_back_to_the_bundled_typescript(leerie, tmp_path,
     the bundled copy and the facts come out as from any JS-API tree."""
     tree = _ts7_tree(tmp_path / "tree")
     monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", Path(_ts_dir()))
-    assert leerie._ts_resolvable(tree, grants=leerie.WorkerGrants(("/",), ())) is True
+    assert _held(leerie, leerie._ts_resolvable, tree, grants=leerie.WorkerGrants(("/",), ())) is True
     r = subprocess.run(["node", str(leerie.TS_LOADER)], cwd=tree,
                        env=leerie._ts_script_env(), capture_output=True,
                        text=True, check=False)
     assert r.stdout.strip() == "bundled", r.stderr
-    facts = leerie._probe_case_facts(tree, tree / "probe" / "x.test.ts",
+    facts = _held(leerie, leerie._probe_case_facts, tree, tree / "probe" / "x.test.ts",
                                      "m keeps the sum", grants=leerie.WorkerGrants(("/",), ()))
     assert "error" not in facts, facts
     assert facts["title"] == "keeps the sum"
@@ -1316,25 +1325,20 @@ DB_PROBE_SRC = ("import os\n\nfrom calc import add\n\n\n"
 
 def test_falsifier_samples_and_confirm_runs_get_a_fresh_test_database(
         leerie, tmp_path, monkeypatch):
+    """Every sample's falsifier worker is started with a database of its
+    own (`claude_p(db=True)`), and each confirm run of a probe is wrapped
+    with its own (DESIGN §6 *No database server leerie starts is ever
+    unconfined*); the wrapper is stood in for by an `env` prefix exporting
+    the URL it would compose."""
     repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
                                           k=2)
     made: list[tuple[str, str]] = []
-    dropped: list[str] = []
-    sessions: list[str] = []
 
-    async def fake_create(st_, tree, key):
-        url = f"postgresql://u@127.0.0.1:5999/leerie_{len(made)}_test"
-        made.append((Path(tree).name, url))
-        return url
-    monkeypatch.setattr(leerie, "_create_test_db", fake_create)
-    monkeypatch.setattr(leerie, "_drop_test_db",
-                        lambda url: url and dropped.append(url))
-    real_session = leerie._test_db_session
-
-    def session(st_):
-        sessions.append("enter")
-        return real_session(st_)
-    monkeypatch.setattr(leerie, "_test_db_session", session)
+    def fake_argv(st_, tree, key):
+        url = f"postgresql://u@localhost/leerie_{len(made)}_test"
+        made.append((Path(tree).name, key))
+        return ["env", f"DATABASE_URL={url}", f"DIRECT_URL={url}"]
+    monkeypatch.setattr(leerie, "_test_db_argv", fake_argv)
 
     def behave(kw, n):
         if "add(2, 3)" in kw["user_prompt"]:
@@ -1343,26 +1347,19 @@ def test_falsifier_samples_and_confirm_runs_get_a_fresh_test_database(
     calls = _falsifier_stub(leerie, monkeypatch, st, behave)
     asyncio.run(leerie._run_delivery_detection(
         st.run_dir, st, caps, MODELS, EFFORTS))
-    assert sessions == ["enter"]
     fc = [c for c in calls if c["schema_key"] == "falsifier"]
-    # Every sample's worker got its lane's database, made fresh for that
-    # sample (item 0 confirmed at s0; item 3 ran two samples).
-    by_url = dict((u, t) for t, u in made)
-    # Checkouts are run-id-prefixed (`_helper_worktree_path`).
-    lane0 = leerie._helper_worktree_path(st, "falsifier-lane0").name
-    assert [by_url[c["env_extra"]["DATABASE_URL"]] for c in fc] == [
-        lane0] * 3
-    assert len({c["env_extra"]["DATABASE_URL"] for c in fc}) == 3
-    assert all(c["env_extra"]["DIRECT_URL"] == c["env_extra"]["DATABASE_URL"]
-               and not any(k.startswith("PRISMA_USER_CONSENT")
-                           for k in c["env_extra"]) for c in fc)
-    assert [t for t, _u in made][0] == leerie._helper_worktree_path(
-        st, "falsifier-confirm").name
+    # Every sample's worker asks for its own database (item 0 confirmed at
+    # s0; item 3 ran two samples).
+    assert len(fc) == 3 and all(c.get("db") is True for c in fc)
+    assert not any(k.startswith("PRISMA_USER_CONSENT")
+                   for c in fc for k in (c.get("env_extra") or {}))
     # The probe only fails against a database: confirmed means the confirm
-    # checkout's re-runs carried one.
+    # checkout's runs carried one, each its own.
+    confirm = leerie._helper_worktree_path(st, "falsifier-confirm").name
+    keys = [k for t, k in made if t == confirm]
+    assert keys and len(set(keys)) == len(keys)
     gate = st.data["delivery_gate"]
     assert [u["item_index"] for u in gate["unmet_final"]] == [0]
-    assert sorted(dropped) == sorted(u for _t, u in made)
 
 
 def test_next_run_residual_reads_unmet_final(leerie, tmp_path):

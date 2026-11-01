@@ -95,7 +95,7 @@ def test_the_real_command_checks_the_working_tree_from_outside_it(
         leerie, tmp_path):
     repo, st, sets = _fixture(tmp_path)
     sc = leerie._selfcheck_prepare(st, dict(leerie.DEFAULT_CAPS), repo, sets,
-                                   "delivery-redrive-r1-g0", None)
+                                   "delivery-redrive-r1-g0")
     # The shown source is readable outside the tree, and nothing is in it.
     assert (Path(sc["src"]) / "set-1" / "tests" / "test_add.py").is_file()
     assert sc["name_flag"] == "-k"
@@ -185,7 +185,7 @@ def test_a_signal_still_deletes_the_copy(leerie, tmp_path):
     (repo / ".leerie" / "config.toml").write_text(
         'test_files_scoped = "bash slow.sh {test_files}"\n')
     sc = leerie._selfcheck_prepare(st, dict(leerie.DEFAULT_CAPS), repo, sets,
-                                   "g", None)
+                                   "g")
     snap_root = Path(sc["dir"], "run")
     p = subprocess.Popen([sc["command"]], cwd=repo, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True)

@@ -9724,21 +9724,95 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     )
 
 
-# --- the run's `/tmp` (DESIGN §6 *A measurement may write `/tmp`; a held-out
-# evaluation has it alone*) ---------------------------------------------------
-# Set in the context of a held-out evaluation that holds `/tmp` alone: its
-# own commands, and the tasks it starts, pass through the shared lock.
-_TMP_EXCLUSIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "_TMP_EXCLUSIVE", default=False)
+# --- the execution lock (DESIGN §6 *A held-out evaluation runs alone, in a
+# world that dies with it (I3)*, the time half) ----------------------------
+# Set in the context of a held-out evaluation that holds the lock exclusive:
+# its own commands pass through; a worker spawned there stops the run.
+_EXEC_EXCLUSIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_EXEC_EXCLUSIVE", default=False)
+# Set in the context of a shared holder: a command it runs inside (`mise ls`
+# around a sync read, an AST script under its caller's hold) is the same
+# holder, never a second reader that would wait behind a waiting evaluation
+# while the first one holds the lock.
+_EXEC_SHARED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_EXEC_SHARED", default=False)
+# The host-wide level, in the directory every local run on the host shares
+# (`_HOST_DIR_ENV`, next to the build semaphore): `flock` gives no writer
+# preference, so a waiting evaluation holds the intent file exclusive and
+# every shared taker passes through it shared first.
+HOST_EXEC_LOCK = "exec.lock"
+HOST_EXEC_INTENT = "exec.intent"
 
 
-class _TmpLock:
-    """Shared/exclusive lock on the run's `/tmp`, on one event loop: every
-    confined repository command holds it shared while it runs
-    (`_run_streaming`), a held-out evaluation exclusive
-    (`_held_out_section`). A waiting exclusive holder stops new shared
-    ones, so a stream of measurements cannot starve it. Nothing that holds
-    it shared waits on anything else, so it cannot deadlock."""
+def _host_flock(path: Path, op: int) -> int:
+    """Open `path` (made when missing) and `flock` it with `op`, blocking;
+    the descriptor, which holds the lock until closed."""
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, op)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextlib.asynccontextmanager
+async def _host_exec_lock(exclusive: bool) -> AsyncIterator[None]:
+    """The host's level of the execution lock: shared by every worker and
+    confined command of every run on the host, exclusive by a held-out
+    evaluation. No-op without the host directory (Fly and EC2 run one run
+    per machine; a test). Each holder opens its own descriptors; a blocking
+    `flock` runs in a thread, so the loop never waits on another run."""
+    host = os.environ.get(_HOST_DIR_ENV, "").strip()
+    if not host or not os.path.isdir(host):
+        yield
+        return
+    lock_p = Path(host) / HOST_EXEC_LOCK
+    intent_p = Path(host) / HOST_EXEC_INTENT
+    held: list[int] = []
+
+    async def _take(path: Path, op: int) -> int:
+        # Shielded: a cancelled wait leaves the thread blocked in `flock`;
+        # the descriptor it returns once it gets the lock is closed then,
+        # never stranded holding it.
+        fut = asyncio.ensure_future(asyncio.to_thread(_host_flock, path, op))
+        try:
+            fd = await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            fut.add_done_callback(
+                lambda f: f.cancelled() or f.exception() is not None
+                or _close_fd(f.result()))
+            raise
+        held.append(fd)
+        return fd
+    try:
+        if exclusive:
+            await _take(intent_p, fcntl.LOCK_EX)
+            await _take(lock_p, fcntl.LOCK_EX)
+        else:
+            intent = await _take(intent_p, fcntl.LOCK_SH)
+            await _take(lock_p, fcntl.LOCK_SH)
+            held.remove(intent)
+            os.close(intent)
+        yield
+    finally:
+        for fd in held:
+            _close_fd(fd)
+
+
+class _ExecLock:
+    """The run's execution lock, on one event loop: every worker
+    (`_invoke`, from its spawn until its process has exited) and every
+    confined command (`_run_streaming`, `_ts_script_run`'s callers, the
+    `mise ls` spawn) holds it shared; a held-out evaluation exclusive
+    (`_held_out_section`), so while one runs no worker process and no other
+    command on the repository's code exists. A waiting exclusive holder stops
+    new shared ones, so a stream of measurements cannot starve it. Nothing
+    that holds it shared waits on an evaluation — it is taken after every
+    semaphore, and a shared holder's commands pass through — so it cannot
+    deadlock; a worker spawned inside an evaluation stops the run instead of
+    waiting. The host's level (`_host_exec_lock`) is taken inside it, by the
+    outermost holder only."""
 
     def __init__(self) -> None:
         self.readers = 0
@@ -9762,16 +9836,29 @@ class _TmpLock:
                 self._waiters.remove(f)
 
     @contextlib.asynccontextmanager
-    async def shared(self) -> AsyncIterator[None]:
-        if _TMP_EXCLUSIVE.get():
+    async def shared(self, *, worker: bool = False) -> AsyncIterator[None]:
+        """Hold the lock shared; `worker` for a worker's process, which may
+        never run inside an evaluation."""
+        if _EXEC_EXCLUSIVE.get():
+            if worker:
+                die("invariant: a worker spawned inside a held-out "
+                    "evaluation — no worker may exist while one runs "
+                    "(DESIGN §6 *A held-out evaluation runs alone, in a "
+                    "world that dies with it (I3)*). Report this.")
+            yield
+            return
+        if _EXEC_SHARED.get():
             yield
             return
         while self.writer or self.writers_waiting:
             await self._wait()
         self.readers += 1
+        token = _EXEC_SHARED.set(True)
         try:
-            yield
+            async with _host_exec_lock(False):
+                yield
         finally:
+            _EXEC_SHARED.reset(token)
             self.readers -= 1
             if not self.readers:
                 self._wake()
@@ -9779,9 +9866,14 @@ class _TmpLock:
     @contextlib.asynccontextmanager
     async def exclusive(self) -> AsyncIterator[bool]:
         """Yields True to the outermost holder, False to a nested one."""
-        if _TMP_EXCLUSIVE.get():
+        if _EXEC_EXCLUSIVE.get():
             yield False
             return
+        if _EXEC_SHARED.get():
+            die("invariant: a held-out evaluation started while its own "
+                "caller holds the execution lock shared — it would wait on "
+                "itself (DESIGN §6 *A held-out evaluation runs alone*). "
+                "Report this.")
         self.writers_waiting += 1
         try:
             while self.writer or self.readers:
@@ -9790,105 +9882,50 @@ class _TmpLock:
             self.writers_waiting -= 1
             self._wake()
         self.writer = True
-        token = _TMP_EXCLUSIVE.set(True)
+        token = _EXEC_EXCLUSIVE.set(True)
         try:
-            yield True
+            async with _host_exec_lock(True):
+                yield True
         finally:
-            _TMP_EXCLUSIVE.reset(token)
+            _EXEC_EXCLUSIVE.reset(token)
             self.writer = False
             self._wake()
 
 
 # One per event loop, as `_BLT_SEMS` (a loop's futures cannot serve another).
-_TMP_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _TmpLock]" = (
-    weakref.WeakKeyDictionary())
+_EXEC_LOCKS: ("weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, "
+              "_ExecLock]") = weakref.WeakKeyDictionary()
 
 
-def _tmp_lock() -> _TmpLock:
-    """The `/tmp` lock of the running loop (one run per orchestrator
-    process, and `/tmp` is the process's). Call from a coroutine."""
+def _exec_lock() -> _ExecLock:
+    """The execution lock of the running loop (one run per orchestrator
+    process). Call from a coroutine."""
     loop = asyncio.get_running_loop()
-    lock = _TMP_LOCKS.get(loop)
+    lock = _EXEC_LOCKS.get(loop)
     if lock is None:
-        lock = _TMP_LOCKS[loop] = _TmpLock()
+        lock = _EXEC_LOCKS[loop] = _ExecLock()
     return lock
 
 
-def _tmp_inventory(root: Path) -> dict[str, int]:
-    """Every path beneath `root`, never following a link, with its inode: a
-    path absent before, or at another inode, was created since."""
-    out: dict[str, int] = {}
-    stack = [str(root)]
-    while stack:
-        d = stack.pop()
-        try:
-            with os.scandir(d) as it:
-                for e in it:
-                    try:
-                        out[e.path] = e.inode()
-                        if e.is_dir(follow_symlinks=False):
-                            stack.append(e.path)
-                    except OSError:
-                        continue
-        except OSError:
-            continue
-    return out
-
-
-def _remove_created(root: Path, before: dict[str, int]) -> list[str]:
-    """Remove every path beneath `root` that is not in `before` (or is at
-    another inode), the topmost of each created subtree whole; return
-    them."""
-    after = _tmp_inventory(root)
-    made = sorted(p for p, ino in after.items() if before.get(p) != ino)
-    removed: list[str] = []
-    gone: set[str] = set()
-    for p in made:
-        if any(str(a) in gone for a in Path(p).parents):
-            continue
-        _rmtree_owned(Path(p))
-        _PRIVATE_TMPS.pop(p, None)
-        gone.add(p)
-        removed.append(p)
-    return removed
-
-
-_SHARED_TMP_WARNED = {"done": False}
+def _exec_lock_held() -> bool:
+    """Whether the calling context holds the execution lock, shared or
+    exclusive: what a synchronous confined spawn (`_ts_script_run`) checks,
+    since it cannot wait for the lock itself."""
+    return _EXEC_SHARED.get() or _EXEC_EXCLUSIVE.get()
 
 
 @contextlib.asynccontextmanager
 async def _held_out_section(st: object) -> AsyncIterator[None]:
-    """Hold the run's `/tmp` alone for a held-out evaluation (DESIGN §6 *A
-    measurement may write `/tmp`; a held-out evaluation has it alone*): no
-    other repository command runs meanwhile, and before it lets go, every
-    path the evaluation created in `/tmp` is removed — so no later
-    measurement, which runs a worker's code, reads what a held-out set's run
-    left there. Its commands' processes have ended already: the shim ends
-    each command's before `_run_streaming` returns. Nested sections are one.
-    Where `/tmp` is not the run's alone (`PRIVATE_TMP_ENV` unset: a host,
-    which other programs share), nothing is removed, logged once."""
-    async with _tmp_lock().exclusive() as outer:
-        if not outer:
-            yield
-            return
-        own = os.environ.get(PRIVATE_TMP_ENV) == "1"
-        if not own and not _SHARED_TMP_WARNED["done"]:
-            _SHARED_TMP_WARNED["done"] = True
-            log(f"  {SHARED_TMP} is shared with this host's other programs "
-                f"({PRIVATE_TMP_ENV} unset): what a held-out evaluation "
-                "creates there is not removed")
-        before = (await asyncio.to_thread(_tmp_inventory, SHARED_TMP)
-                  if own else None)
-        try:
-            yield
-        finally:
-            if before is not None:
-                # On the loop, not in a thread: the lock is released only
-                # once this is done, whatever cancels the evaluation.
-                removed = _remove_created(SHARED_TMP, before)
-                if removed:
-                    log(f"  held-out evaluation: removed {len(removed)} "
-                        f"path(s) it created in {SHARED_TMP}")
+    """Hold the execution lock exclusive around a held-out file's sandboxed
+    run (DESIGN §6 *A held-out evaluation runs alone, in a world that dies
+    with it (I3)*): no worker process and no other command on the
+    repository's code exists meanwhile, in the run or on the host, so
+    nothing observes what a namespace cannot hide — its `/proc` entries,
+    its cgroup's counters, its contention. Its own commands pass through;
+    nested sections are one. What it leaves is the sandbox's, gone with
+    it: nothing is inventoried or removed here."""
+    async with _exec_lock().exclusive():
+        yield
 
 
 async def _run_streaming(
@@ -9904,6 +9941,7 @@ async def _run_streaming(
     line_prefix: str = "  | ",
     tail_lines: int = 40,
     cgroup_sid: str | None = None,
+    sandbox: "HeldOutSandbox | None" = None,
 ) -> tuple[int, str]:
     """Run a subprocess with stdout+stderr streamed live, persisted to a
     log file, and tailed for error reporting. Use this instead of
@@ -9950,6 +9988,15 @@ async def _run_streaming(
     through the Landlock shim with it and its `/tmp` grant, every
     descendant inheriting the restriction, and the grant's own variables
     are laid over `env` last. There is no unconfined path.
+
+    `sandbox` (every run of a held-out file, DESIGN §6 *A held-out
+    evaluation runs alone, in a world that dies with it (I3)*): the command
+    runs in a sandbox the shim builds over `sandbox.view`, its `place`
+    files copied into the overlay, never onto disk. The runner's report
+    (`sandbox.report`, a path inside the sandbox) comes back through an
+    unlinked file leerie opened and passed as a descriptor, and is written
+    to the same path outside once the command has exited — so the report
+    leerie reads is one no other process wrote.
     """
     # A command's output never lands in a worker's transcript, where a line
     # the code under measurement prints in the shape of a tool call would be
@@ -9960,121 +10007,141 @@ async def _run_streaming(
             "a worker's transcript — leerie's own invariant is broken "
             "(DESIGN §8 *What a worker ran is read from its own "
             "transcript*). Report this.")
-    # The command may write `/tmp` (`grants.shared_tmp`) only while it holds
-    # the run's `/tmp` lock shared, so none runs while a held-out evaluation
-    # has `/tmp` alone (`_held_out_section`), whose own commands pass
-    # through. The shim ends every process the command leaves before this
-    # returns (DESIGN §6 *A confined command's processes end with it*).
-    outside = _argv_outside_grant(list(cmd), grants, shared_tmp=True)
+    # Every confined command holds the execution lock shared, so none runs
+    # while a held-out evaluation does (`_held_out_section`), whose own
+    # commands pass through. The shim ends every process the command leaves
+    # before this returns (DESIGN §6 *A confined command's processes end
+    # with it*).
+    outside = _argv_outside_grant(list(cmd), grants)
     if outside is not None:
         die(f"leerie was about to hand {outside} to a confined command whose "
             "grant does not reach it — leerie's own invariant is broken "
             "(DESIGN §6 *Leerie's runs of the repository's commands are "
             "confined too*). Report this.")
-    async with _tmp_lock().shared():
-        spawn_cmd = _confined_argv(grants, list(cmd), shared_tmp=True)
-        # A command in a run's tree reads that tree's own stores
-        # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may share*).
-        env = _tree_stores_for(env if env is not None else os.environ, cwd)
-        gate_r: int | None = None
-        gate_w: int | None = None
-        if cgroup_sid is not None:
-            spawn_cmd, gate_r, gate_w = _spawn_held_argv(spawn_cmd)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *spawn_cmd,
-                pass_fds=(gate_r,) if gate_r is not None else (),
-                cwd=cwd,
-                env={**_repo_command_env(env), **dict(grants.env)},
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
-            )
-        except BaseException:
-            _close_fd(gate_r)
-            _close_fd(gate_w)
-            raise
-        _close_fd(gate_r)
-        if cgroup_sid is not None:
+    # The report comes back through an unlinked file in the run's own temp
+    # directory, never through the sandbox's paths.
+    report_fh = (tempfile.TemporaryFile()
+                 if sandbox is not None and sandbox.report is not None
+                 else None)
+    report_fd = report_fh.fileno() if report_fh is not None else None
+    try:
+        async with _exec_lock().shared():
+            spawn_cmd = _confined_argv(grants, list(cmd), sandbox=sandbox,
+                                       report_fd=report_fd)
+            # A command in a run's tree reads that tree's own stores
+            # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may
+            # share*).
+            env = _tree_stores_for(env if env is not None else os.environ, cwd)
+            gate_r: int | None = None
+            gate_w: int | None = None
+            if cgroup_sid is not None:
+                spawn_cmd, gate_r, gate_w = _spawn_held_argv(spawn_cmd)
             try:
-                await asyncio.to_thread(_cgroup_enroll, cgroup_sid, proc.pid)
+                proc = await asyncio.create_subprocess_exec(
+                    *spawn_cmd,
+                    pass_fds=tuple(fd for fd in (gate_r, report_fd)
+                                   if fd is not None),
+                    cwd=cwd,
+                    env={**_repo_command_env(env), **dict(grants.env)},
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,
+                )
             except BaseException:
-                _release_spawn_gate(gate_w, run=False)
-                await _terminate_proc_tree(proc)
+                _close_fd(gate_r)
+                _close_fd(gate_w)
                 raise
-            _release_spawn_gate(gate_w)
+            _close_fd(gate_r)
+            if cgroup_sid is not None:
+                try:
+                    await asyncio.to_thread(_cgroup_enroll, cgroup_sid, proc.pid)
+                except BaseException:
+                    _release_spawn_gate(gate_w, run=False)
+                    await _terminate_proc_tree(proc)
+                    raise
+                _release_spawn_gate(gate_w)
 
-        tail: deque[str] = deque(maxlen=tail_lines)
-        log_fh = None
-        if log_path is not None:
+            tail: deque[str] = deque(maxlen=tail_lines)
+            log_fh = None
+            if log_path is not None:
+                try:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_fh = log_path.open("a", buffering=1)  # line-buffered
+                    header = f"=== {label or ' '.join(cmd)} (cwd={cwd or '.'}) ==="
+                    log_fh.write(header + "\n")
+                except OSError:
+                    log_fh = None
+
+            echo = verbosity != "quiet"
+
+            async def read_loop() -> None:
+                # proc.stdout is guaranteed non-None because we passed
+                # stdout=asyncio.subprocess.PIPE above; no runtime check needed.
+                async for raw in proc.stdout:
+                    line = raw.decode(errors="replace").rstrip("\r\n")
+                    tail.append(line)
+                    if log_fh is not None:
+                        try:
+                            log_fh.write(line + "\n")
+                        except OSError:
+                            pass
+                    if echo:
+                        log(f"{line_prefix}{line}")
+
             try:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                log_fh = log_path.open("a", buffering=1)  # line-buffered
-                header = f"=== {label or ' '.join(cmd)} (cwd={cwd or '.'}) ==="
-                log_fh.write(header + "\n")
-            except OSError:
-                log_fh = None
-
-        echo = verbosity != "quiet"
-
-        async def read_loop() -> None:
-            # proc.stdout is guaranteed non-None because we passed
-            # stdout=asyncio.subprocess.PIPE above; no runtime check needed.
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip("\r\n")
-                tail.append(line)
+                if timeout is None:
+                    await asyncio.gather(read_loop(), proc.wait())
+                else:
+                    await asyncio.wait_for(
+                        asyncio.gather(read_loop(), proc.wait()),
+                        timeout=timeout,
+                    )
+            except asyncio.TimeoutError:
                 if log_fh is not None:
                     try:
-                        log_fh.write(line + "\n")
+                        log_fh.write(f"=== TIMEOUT after {timeout}s ===\n")
                     except OSError:
                         pass
-                if echo:
-                    log(f"{line_prefix}{line}")
+                await _terminate_proc_tree(proc)
+                captured = "\n".join(tail)
+                exc = subprocess.TimeoutExpired(cmd, timeout)
+                # Standard TimeoutExpired exposes `output` and `stderr`; populate
+                # `output` with the merged tail so callers can include it in
+                # their die() message without re-reading the log file.
+                exc.output = captured
+                if log_fh is not None:
+                    try:
+                        log_fh.close()
+                    except OSError:
+                        pass
+                raise exc
+            except BaseException:
+                await _terminate_proc_tree(proc)
+                if log_fh is not None:
+                    try:
+                        log_fh.close()
+                    except OSError:
+                        pass
+                raise
 
-        try:
-            if timeout is None:
-                await asyncio.gather(read_loop(), proc.wait())
-            else:
-                await asyncio.wait_for(
-                    asyncio.gather(read_loop(), proc.wait()),
-                    timeout=timeout,
-                )
-        except asyncio.TimeoutError:
-            if log_fh is not None:
-                try:
-                    log_fh.write(f"=== TIMEOUT after {timeout}s ===\n")
-                except OSError:
-                    pass
-            await _terminate_proc_tree(proc)
-            captured = "\n".join(tail)
-            exc = subprocess.TimeoutExpired(cmd, timeout)
-            # Standard TimeoutExpired exposes `output` and `stderr`; populate
-            # `output` with the merged tail so callers can include it in
-            # their die() message without re-reading the log file.
-            exc.output = captured
-            if log_fh is not None:
-                try:
-                    log_fh.close()
-                except OSError:
-                    pass
-            raise exc
-        except BaseException:
-            await _terminate_proc_tree(proc)
             if log_fh is not None:
                 try:
                     log_fh.close()
                 except OSError:
                     pass
-            raise
 
-        if log_fh is not None:
-            try:
-                log_fh.close()
-            except OSError:
-                pass
-
-        rc = proc.returncode if proc.returncode is not None else 0
-        return rc, "\n".join(tail)
+            rc = proc.returncode if proc.returncode is not None else 0
+            if report_fh is not None:
+                report_fh.seek(0)
+                got = report_fh.read()
+                if got:
+                    out = Path(sandbox.report)
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_bytes(got)
+            return rc, "\n".join(tail)
+    finally:
+        if report_fh is not None:
+            report_fh.close()
 
 
 async def _gather_or_cancel(*aws):
@@ -22362,20 +22429,41 @@ def _require_landlock() -> None:
             "granted*; docs/INSTALL.md).")
 
 
+# Set by `_require_heldout_sandbox` once preflight has built a sandbox in this
+# process: from then on every confined spawn here, and in the processes it
+# starts (`scripts/worker-guard.py`), is isolated (DESIGN §6 *Every confined
+# process has its own `/tmp`, `/dev/shm` and IPC*). Unset where preflight did
+# not run (a test, a host harness): nothing is isolated there.
+ISOLATE_ENV = "LEERIE_ISOLATED"
+
+
+def _isolated() -> bool:
+    return os.environ.get(ISOLATE_ENV) == "1"
+
+
+class HeldOutSandbox(NamedTuple):
+    """A held-out run's sandbox (DESIGN §6 *A held-out evaluation runs
+    alone*): `view` is overlaid, each `place` pair (absolute source, path
+    relative to `view`) copied into the overlay, and `report` — the path
+    the runner writes its report to, inside the sandbox — copied out to the
+    descriptor `_confined_argv` is given."""
+    view: str
+    place: tuple[tuple[str, str], ...] = ()
+    report: str | None = None
+
+
 class WorkerGrants(NamedTuple):
     """What a worker's processes may write (`rw`, read too) and read
     (`ro`), as absolute paths. `env`: the `(name, value)` pairs that point
     the command's temp and caches at its grants, laid over its environment
     last (a measurement's, `_measurement_grants`); a worker's is empty,
-    `claude_p` names its directories itself. `shared_tmp`: a measurement's
-    write grant of `/tmp` itself (`SHARED_TMP`), added to the command's
-    rules only by `_run_streaming`, which holds the run's `/tmp` lock for it
-    (DESIGN §6 *A measurement may write `/tmp`; a held-out evaluation has it
-    alone*); empty for a worker."""
+    `claude_p` names its directories itself. `/tmp` and `/dev/shm` are
+    never named here but as devices: an isolated process's own are added by
+    the shim (DESIGN §6 *Every confined process has its own `/tmp`,
+    `/dev/shm` and IPC*)."""
     rw: tuple[str, ...]
     ro: tuple[str, ...]
     env: tuple[tuple[str, str], ...] = ()
-    shared_tmp: tuple[str, ...] = ()
 
 
 # The caps key that marks the host-side seam, set only by
@@ -22387,7 +22475,9 @@ HOST_SEAM_CAP = "_host_seam"
 
 # The device nodes a worker's tools write: not all of /dev. `/dev/shm`
 # holds POSIX semaphores and shared memory (Python's multiprocessing locks
-# and Chromium need it, measured); leerie never reads it.
+# and Chromium need it, measured); an isolated process's is its own, which
+# the shim maps it to (DESIGN §6 *Every confined process has its own
+# `/tmp`, `/dev/shm` and IPC*).
 _WORKER_DEVICES = ("/dev/null", "/dev/zero", "/dev/full", "/dev/random",
                    "/dev/urandom", "/dev/tty", "/dev/ptmx", "/dev/pts",
                    "/dev/shm")
@@ -22535,9 +22625,11 @@ def _beside(top: Path, root: Path) -> list[str]:
 
 def _reads_outside(root: Path, *, tmp: bool = True) -> list[str]:
     """Read grants for everything outside the state root `root`; with `tmp`
-    False, for everything outside `root` and `/tmp` (`SHARED_TMP`), which
-    is a measurement's and never a worker's (DESIGN §6 *`/tmp` is not a
-    worker's*). An entry that resolves into `/tmp` is left out with it."""
+    False, for everything outside `root` and the container's `/tmp`
+    (`SHARED_TMP`), which no grant names: an isolated process's `/tmp` is
+    its own, granted by the shim (DESIGN §6 *Every confined process has its
+    own `/tmp`, `/dev/shm` and IPC*). An entry that resolves into `/tmp`
+    is left out with it."""
     if tmp:
         return _beside(Path("/"), root)
     shared = Path(os.path.realpath(SHARED_TMP))
@@ -22660,7 +22752,6 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
                      # repository's run: mise reads it on every call.
                      str(run_dir / MISE_OVERRIDES_NAME)]
     if schema_key in _COMMITTING_WORKERS:
-        _declare_worker_tree(cwd_r)
         rw.append(str(cwd_r))
         git_rw, git_ro = _tree_git_dirs(cwd_r, run_dir)
         rw += git_rw
@@ -22684,7 +22775,8 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     # No grant ever covers the state root whole, whatever a variable names
     # (`_reads_outside` never does, by construction: it is not re-checked,
     # which cost 0.3 s a call against a 2,000-entry `/tmp`, measured). Nor
-    # `/tmp`: a worker neither reads nor writes it.
+    # the container's `/tmp`: an isolated worker's is its own, added by the
+    # shim.
     return WorkerGrants(
         tuple(dict.fromkeys(_around(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
@@ -22692,14 +22784,27 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
 
 
 def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
-                   shared_tmp: bool = False) -> list[str]:
-    """`cmd` started through the Landlock shim with `grants`; with
-    `shared_tmp`, also `grants.shared_tmp` written (only `_run_streaming`,
-    under the run's `/tmp` lock)."""
+                   sandbox: HeldOutSandbox | None = None,
+                   report_fd: int | None = None) -> list[str]:
+    """`cmd` started through the Landlock shim with `grants`. With
+    `sandbox`, in a held-out sandbox (always: a held-out file never runs
+    outside one, and the shim refuses where it cannot build one), its
+    report copied to `report_fd`; else isolated once preflight has built a
+    sandbox (`_isolated()`, DESIGN §6 *Every confined process has its own
+    `/tmp`, `/dev/shm` and IPC*)."""
     # `-S`: the shim imports only the standard library, and `site` cost
     # ~15 ms of every worker's start (measured).
     argv = [sys.executable, "-I", "-S", str(LANDLOCK_SCRIPT)]
-    for p in grants.rw + (grants.shared_tmp if shared_tmp else ()):
+    if sandbox is not None:
+        argv += ["--sandbox", "--view", sandbox.view]
+        for src, rel in sandbox.place:
+            argv += ["--place", f"{src}={rel}"]
+        if sandbox.report is not None and report_fd is not None:
+            argv += ["--report", sandbox.report, "--report-fd",
+                     str(report_fd)]
+    elif _isolated():
+        argv.append("--isolate")
+    for p in grants.rw:
         argv += ["--rw", p]
     for p in grants.ro:
         argv += ["--ro", p]
@@ -22728,17 +22833,13 @@ TREE_STORES_DIRNAME = "tree-stores"
 _MEASURE_ID_FILE = "leerie-measure-id"
 _MEASURE_ID_RE = re.compile(r"[0-9a-f]{16}")
 _MEASURE_SUBDIRS = ("mise-state", "reports", "coverage")
-# DESIGN §6 *A confined command's scratch is short and private*. `/tmp` is
-# the container's, one run's alone; every measured tree's temp directory is
-# `/tmp/l/<16 hex>/`, short enough that a socket in it fits `sun_path` (107
-# bytes), and 0700 under `/tmp`'s root-owned sticky bit, so no ancestor is
+# DESIGN §6 *A confined command's scratch is short and private*. Every
+# measured tree's temp directory is `/tmp/l/<16 hex>/` (carried into an
+# isolated command's own `/tmp` by the shim), short enough that a socket in
+# it fits `sun_path` (107 bytes), and 0700 under `/tmp`'s root-owned sticky bit, so no ancestor is
 # writable by another user (SWC, among others, refuses one that is).
 SHARED_TMP = Path("/tmp")
 PRIVATE_TMP_ROOT = SHARED_TMP / "l"
-# Set by the image (`Dockerfile`): this process's `/tmp` is its run's alone,
-# so what a held-out evaluation created in it can be removed by path. Unset
-# on a host, whose `/tmp` other programs share: nothing there is removed.
-PRIVATE_TMP_ENV = "LEERIE_PRIVATE_TMP"
 # The private temp directories this process made, removed at its exit.
 _PRIVATE_TMPS: dict[str, int] = {}
 # The run directory's entries no measured tree may hold or lie beneath:
@@ -22751,12 +22852,10 @@ _MEASURE_PRIVATE = ("state.json", "acceptance", "logs", WORKERS_DIR,
 
 def _use_run_tmp(st: "State") -> Path:
     """Make `<run-dir>/tmp/` (0700) the orchestrator's own temp directory:
-    `tempfile`'s, and `TMPDIR` for the commands it runs unconfined. A
-    measurement may write `/tmp` (`SHARED_TMP`), so nothing of leerie's —
-    a staged index, a held-out file's copy, the throwaway test database's
-    data directory, which an unconfined postgres would load its
-    configuration from — may live there (DESIGN §6 *A measurement may write
-    `/tmp`; a held-out evaluation has it alone*)."""
+    `tempfile`'s, and `TMPDIR` for the commands it runs unconfined. Nothing
+    of leerie's — a staged index, a held-out run's report — then depends on
+    which `/tmp` a process sees (DESIGN §6 *A held-out evaluation runs
+    alone*, *Nothing of leerie's own is in `/tmp`*)."""
     d = Path(st.run_dir) / "tmp"
     _mkdir_private(d, Path(st.run_dir))
     _SYSTEM_TEMP_DIR.setdefault("dir", tempfile.gettempdir())
@@ -23040,13 +23139,9 @@ def _measurement_grants(st: "State", tree: str | Path,
     and `XDG_CACHE_HOME` at the tree's private temp directory
     (`/tmp/l/<id>/`, `_private_tmp`) and its mise state at the measurement
     directory; the store variables stay as leerie's environment and
-    `_tree_store_env` set them. Every kind may also read and write `/tmp`
-    itself (`shared_tmp`), which `_run_streaming` grants under the run's
-    `/tmp` lock (DESIGN §6 *A measurement may write `/tmp`; a held-out
-    evaluation has it alone*) — except in a committing worker's tree
-    (`_is_worker_tree`), where the command is kept from `/tmp` as the
-    worker is (DESIGN §6 *A command in a worker's tree is kept from `/tmp`
-    as the worker is*)."""
+    `_tree_store_env` set them. `/tmp` itself is never granted: an isolated
+    command's own is added by the shim (DESIGN §6 *Every confined process
+    has its own `/tmp`, `/dev/shm` and IPC*)."""
     if kind not in (MEASURE_KIND, SETUP_HOOK_KIND, TOOLCHAIN_KIND,
                     STORE_FETCH_KIND):
         raise ValueError(f"no measurement kind {kind!r}")
@@ -23077,7 +23172,6 @@ def _measurement_grants(st: "State", tree: str | Path,
         rw += [os.environ[v] for v in sorted(_VERIFIED_STORE_VARS)
                if os.environ.get(v)
                and not os.environ[v].startswith(_BAKED_ROOT)]
-    worker_tree = _is_worker_tree(run_dir, t, dirs)
     if t.parent == (run_dir / "worktrees").resolve():
         # The tree's own stores (`_tree_store_env`), which no other tree
         # reads.
@@ -23111,8 +23205,7 @@ def _measurement_grants(st: "State", tree: str | Path,
         # configuration, whatever the hook before it trusted.
         _rmtree_owned(mise_state)
         _mkdir_private(mise_state, run_dir)
-    # Remade on every grant: a held-out evaluation removes what it created,
-    # this directory included when it made it (`_held_out_section`).
+    # Remade on every grant: the tree's own sweep may have removed it.
     tmp = str(_private_tmp(own))
     rw.append(tmp)
     state = own / "state"
@@ -23142,63 +23235,33 @@ def _measurement_grants(st: "State", tree: str | Path,
                      ("verify_deps_before_run", "false")):
             env[f"npm_config_{k}"] = v
             env[f"pnpm_config_{k}"] = v
-    # `/tmp` is read and written only through `shared_tmp`, which only
-    # `_run_streaming` grants, under the run's `/tmp` lock; and never in a
-    # committing worker's tree, whose worker reads what the command writes
-    # there (review round 20, isolation H2).
-    shared: tuple[str, ...] = ()
-    if not worker_tree:
-        shared = tuple(dict.fromkeys(_around([str(SHARED_TMP)], state_root)))
-        _TMP_GRANTED_TREES.add(str(t))
     return WorkerGrants(
         tuple(dict.fromkeys(_around(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _around(ro, state_root))),
-        tuple(env.items()),
-        shared)
+        tuple(env.items()))
 
 
-# DESIGN §6 *A command in a worker's tree is kept from `/tmp` as the worker
-# is*: the realpaths of the trees declared a committing worker's, and of
-# the trees a grant gave `/tmp` to, in this process.
-_WORKER_TREES: set[str] = set()
-_TMP_GRANTED_TREES: set[str] = set()
+def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:
+    """The grant of a held-out file's run in `tree` (DESIGN §6 *A held-out
+    evaluation runs alone*): `_measurement_grants`, with the verified
+    stores (`_VERIFIED_STORE_VARS`) read, not written — inside the sandbox
+    every mount but its own is read-only, and an evaluation installs
+    nothing."""
+    g = _measurement_grants(st, tree)
+    verified = {os.environ[v] for v in _VERIFIED_STORE_VARS
+                if os.environ.get(v)}
+    return g._replace(rw=tuple(p for p in g.rw if p not in verified),
+                      ro=g.ro + tuple(p for p in g.rw if p in verified))
 
 
-def _is_worker_tree(run_dir: Path, tree: Path,
-                    dirs: tuple[Path, Path, Path] | None) -> bool:
-    """True when a committing worker writes `tree`: a worktree of a tree
-    repository (staging, a subtask tree; I6 makes no other kind for one),
-    or a tree declared one (`_declare_worker_tree`)."""
-    if (dirs is not None
-            and dirs[1].parent == (run_dir / TREE_REPOS_DIRNAME).resolve()):
-        return True
-    return os.path.realpath(tree) in _WORKER_TREES
-
-
-def _declare_worker_tree(tree: str | Path) -> None:
-    """Record `tree` as a committing worker's, so no command leerie runs
-    there reads or writes `/tmp`; stop the run when one already has — what
-    it read there may be in the tree the worker is about to read."""
-    real = os.path.realpath(tree)
-    if real in _TMP_GRANTED_TREES:
-        die(f"leerie ran a repository command with /tmp in {real} before "
-            "declaring it a committing worker's tree: what it read there "
-            "may be in the tree — leerie's own invariant is broken (DESIGN "
-            "§6 *A command in a worker's tree is kept from `/tmp` as the "
-            "worker is*). Report this.")
-    _WORKER_TREES.add(real)
-
-
-def _argv_outside_grant(argv: list[str], grants: WorkerGrants, *,
-                        shared_tmp: bool = False) -> str | None:
+def _argv_outside_grant(argv: list[str],
+                        grants: WorkerGrants) -> str | None:
     """The first absolute path in `argv` that exists and that `grants`
     does not reach (realpaths compared), or None: every input leerie hands
     a confined command must be inside its grant (DESIGN §6 *Leerie's runs
     of the repository's commands are confined too*)."""
-    roots = [Path(os.path.realpath(g)) for g in
-             grants.rw + grants.ro + (grants.shared_tmp if shared_tmp
-                                      else ())]
+    roots = [Path(os.path.realpath(g)) for g in grants.rw + grants.ro]
     for a in argv:
         if not isinstance(a, str) or not a.startswith("/") \
                 or not os.path.exists(a):
@@ -23549,12 +23612,33 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # A per-worker failure returns None and the worker runs without its own
     # sub-cgroup — the cgroup path never aborts the worker; enforcement was
     # gated at run start (_enforce_and_record_cgroup_containment).
+    # The worker is a holder of the execution lock from before its spawn
+    # until its process has exited (the `finally` below), so no held-out
+    # evaluation runs while it exists, and none is running when it starts:
+    # one would stop the run here (DESIGN §6 *A held-out evaluation runs
+    # alone, in a world that dies with it (I3)*).
+    exec_hold = contextlib.AsyncExitStack()
+    try:
+        await exec_hold.enter_async_context(
+            _exec_lock().shared(worker=True))
+    except BaseException:
+        if stdin_file is not None:
+            with contextlib.suppress(OSError):
+                stdin_file.close()
+        if stdin_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(stdin_path)
+        raise
     cgroup_sid: str | None = None
-    if (worker_memory_max_bytes is not None
-            and worker_pids_max is not None):
-        cgroup_sid = await asyncio.to_thread(
-            _cgroup_create, _cgroup_worker_sid(run_id, sid),
-            worker_memory_max_bytes, worker_pids_max)
+    try:
+        if (worker_memory_max_bytes is not None
+                and worker_pids_max is not None):
+            cgroup_sid = await asyncio.to_thread(
+                _cgroup_create, _cgroup_worker_sid(run_id, sid),
+                worker_memory_max_bytes, worker_pids_max)
+    except BaseException:
+        await exec_hold.aclose()
+        raise
     spawn_cmd = (list(cmd) if grants is None
                  else _confined_argv(grants, list(cmd)))
     gate_r: int | None = None
@@ -23602,6 +23686,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         if stdin_path is not None:
             with contextlib.suppress(OSError):
                 os.unlink(stdin_path)
+        await exec_hold.aclose()
         raise
     _close_fd(gate_r)
     # Spawn heartbeat: surfaces *that* the worker was launched before the
@@ -23649,7 +23734,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             cgroup_enroll_failure = await asyncio.to_thread(
                 _cgroup_enroll, cgroup_sid, proc.pid)
         except BaseException:
+            # The closed gate exits without running the worker.
             _release_spawn_gate(gate_w, run=False)
+            await exec_hold.aclose()
             raise
         _release_spawn_gate(gate_w)
     # Track every descendant PID that ever appears under this worker. Claude
@@ -24116,6 +24203,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         if stdin_path is not None:
             with contextlib.suppress(OSError):
                 os.unlink(stdin_path)
+        # Its process tree has ended and been reaped: the worker no longer
+        # exists.
+        await exec_hold.aclose()
 
     if envelope is None:
         stderr_txt = b"".join(stderr_chunks).decode(errors="replace").strip()
@@ -25248,9 +25338,13 @@ def _confined_writes_notice(grants: WorkerGrants, *, cwd: str | Path,
     write (DESIGN §6 *A worker writes only where it is granted (I5)*),
     rendered from its own grant (`grants.rw`), so the notice and the kernel
     cannot disagree: every granted path but the device nodes, with the
-    working directory, `$TMPDIR` and `$CLAUDE_CONFIG_DIR` named as such. A
-    fixed `/tmp/<name>` path — measured in 155 of 310 corpus sessions —
-    is refused, so `$TMPDIR` is the place for scratch files."""
+    working directory, `$TMPDIR` and `$CLAUDE_CONFIG_DIR` named as such.
+    An isolated worker (`_isolated()`) also has `/tmp`, its own, which the
+    shim adds to every grant: the notice names it as private scratch gone
+    when the session ends (DESIGN §6 *Every confined process has its own
+    `/tmp`, `/dev/shm` and IPC*). Otherwise a fixed `/tmp/<name>` path —
+    measured in 155 of 310 corpus sessions — is refused, and the notice
+    says so."""
     names = {os.path.realpath(cwd): "your working directory"}
     for var in ("TMPDIR", "CLAUDE_CONFIG_DIR"):
         if env.get(var):
@@ -25260,6 +25354,11 @@ def _confined_writes_notice(grants: WorkerGrants, *, cwd: str | Path,
     first = [n for n in ("your working directory", "$TMPDIR",
                          "$CLAUDE_CONFIG_DIR") if n in labels]
     said = list(dict.fromkeys(first + labels))
+    if _isolated():
+        return (f"your processes can write only these: {'; '.join(said)}; "
+                "and `/tmp`, which is your own: private scratch no other "
+                "process sees, gone when your session ends. Every other "
+                "path is not writable.")
     return (f"your processes can write only these: {'; '.join(said)}. "
             "`/tmp` and every other path are not writable; put scratch "
             "files in $TMPDIR.")
@@ -27356,9 +27455,16 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                    resume_session: str | None = None,
                    notes_id: str | None = None,
                    selfcheck_dir: str | None = None,
+                   db: bool = False,
                    _suppress_capture: bool = False) -> dict:
     """Run one headless Claude Code worker and return its validated
     structured output.
+
+    `db`: in a Prisma repo whose datasource is PostgreSQL, the worker is
+    started as `scripts/sandbox-db.sh <pkg> <name> -- claude …` inside its
+    own confinement, so its `DATABASE_URL` names a cluster in its own
+    `/tmp`, alive for its process's lifetime (DESIGN §6 *No database server
+    leerie starts is ever unconfined*); elsewhere it is ignored.
 
     `resume_session`, when set, continues that CLI session (`--resume`) with
     `user_prompt` as the next turn instead of starting a fresh one — the
@@ -27605,6 +27711,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         # `classifier` — measured p99 412 s — no longer holds its phase for
         # the same 90 minutes a full `implementer` legitimately needs.
         timeout = resolve_worker_timeout(schema_key, caps)
+        db_argv = _test_db_argv(st, cwd, sid) if db else []
 
         async def _spawn(retry_note: str) -> dict:
             """One `_invoke` + telemetry + NDJSON capture + non-clean-exit
@@ -27617,7 +27724,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # once at claude_p entry) so a mid-run rotation (below) takes
             # effect on the very next _invoke call, including a retry
             # inside this same claude_p invocation.
-            envelope = await _invoke_admitted(build(retry_note), cwd, timeout,
+            envelope = await _invoke_admitted(db_argv + build(retry_note),
+                                     cwd, timeout,
                                      sid, leerie_dir, verbosity,
                                      stdin_data=user_prompt + retry_note,
                                      progress=lambda: _get_progress(st),
@@ -29506,12 +29614,14 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     # if the mise-managed shim ever blocked (the same unguarded-
     # communicate() shape fixed for `mise install` above).
     try:
-        result = await run_proc(
-            _confined_argv(grants, ["mise", "ls", "--current", "--json"]),
-            cwd=str(repo_root),
-            env={**_repo_command_env(env), **dict(grants.env)},
-            timeout=MISE_LS_TIMEOUT,
-        )
+        # A confined command: under the execution lock, as `_run_streaming`.
+        async with _exec_lock().shared():
+            result = await run_proc(
+                _confined_argv(grants, ["mise", "ls", "--current", "--json"]),
+                cwd=str(repo_root),
+                env={**_repo_command_env(env), **dict(grants.env)},
+                timeout=MISE_LS_TIMEOUT,
+            )
     except subprocess.TimeoutExpired:
         # Not fatal — workers run their own install commands via prompt
         # injection (DESIGN §6½ "Worker-driven install"); they don't
@@ -42151,7 +42261,8 @@ async def _run_contained(argv: list[str], *, grants: WorkerGrants,
                          pids_max: int, timeout: float, log_path: Path,
                          label: str, verbosity: str = "quiet",
                          env: dict[str, str] | None = None,
-                         measure: bool = False) -> dict:
+                         measure: bool = False,
+                         sandbox: HeldOutSandbox | None = None) -> dict:
     """Run `argv` (exec'd directly — never through a shell unless `argv`
     itself is one) in its own broker cgroup, spawn-held (DESIGN §6
     *Enrollment holds the spawn*). Limits of 0 leave the cgroup uncapped
@@ -42161,7 +42272,7 @@ async def _run_contained(argv: list[str], *, grants: WorkerGrants,
     `peak` is `{memory_bytes, pids}` when `measure` and the broker could
     read one, else None. Runs uncontained when containment is off — the
     run-level gate already decided that was acceptable. Always confined
-    (`grants`, `_run_streaming`)."""
+    (`grants`, `_run_streaming`), in `sandbox` when given."""
     cg = await asyncio.to_thread(
         _cgroup_create, _cgroup_worker_sid(run_id, name),
         int(memory_max_bytes or 0), int(pids_max or 0))
@@ -42187,7 +42298,7 @@ async def _run_contained(argv: list[str], *, grants: WorkerGrants,
             rc, tail = await _run_streaming(
                 argv, grants=grants, cwd=cwd, env=env, timeout=timeout,
                 log_path=log_path, label=label, verbosity=verbosity,
-                cgroup_sid=cg)
+                cgroup_sid=cg, sandbox=sandbox)
             out["rc"], out["tail"] = rc, tail
         except subprocess.TimeoutExpired as e:
             out["timed_out"] = True
@@ -44222,7 +44333,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                     log_path: Path, timeout: float,
                                     serial: bool = False,
                                     files: list[str] | None = None,
-                                    env_extra: dict[str, str] | None = None
+                                    db: bool = False
                                     ) -> dict | None:
     """Run `cmd` (its scoped form over `files` when given and renderable)
     once in `tree` with a structured report requested, and return
@@ -44234,10 +44345,10 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     flag the serial one contradicts) is retried once as written, inside
     what is left of `timeout` after the serial run (none left, or under the
     1 s floor: no retry) — so a B* rerun given the budget left never runs
-    past it twice (DESIGN §9 *Which failures are new*, step 2). `env_extra`
-    (a throwaway test database's URL) is laid over the run's
-    environment. A worker tree is run in its committed view, installed
-    there (`_measured_tree`; DESIGN §8 *Every measurement reads the
+    past it twice (DESIGN §9 *Which failures are new*, step 2). With `db`,
+    in a Prisma/PostgreSQL repo, each run has a throwaway database of its
+    own (`_test_db_argv`). A worker tree is run in its committed view,
+    installed there (`_measured_tree`; DESIGN §8 *Every measurement reads the
     committed view*)."""
     tree = await _measured_tree(st, tree, caps, log_path=log_path,
                                 label=label)
@@ -44292,8 +44403,9 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             return None
         if path_env:
             env = {**(env if env is not None else os.environ), **path_env}
-        if env_extra:
-            env = {**(env if env is not None else os.environ), **env_extra}
+        if db:
+            # Its own database, as its own report: one per run.
+            argv = _test_db_argv(st, tree, report.name) + argv
         left = float(timeout) - spent
         if spent and left < 1.0:
             # The serial run used what the caller gave: no as-written retry
@@ -45462,12 +45574,6 @@ async def _ci_worktree(st: "State", name: str, sha: str) -> Path | None:
     return wt
 
 
-# The throwaway test database each CI tree's database-backed checks run
-# against (DESIGN §8 *Prisma repositories get a real database*), by the
-# tree's real path; set by `_ci_prepare`, dropped by `_ci_teardown`.
-_CI_DB_URLS: dict[str, str] = {}
-
-
 def _ci_runs_db_reset(argv: Iterable | None, patterns: list[str]) -> bool:
     """True when `argv`, joined, matches one of the workers' database
     push/reset deny rules (`_db_reset_rule_patterns`): the orchestrator's
@@ -45481,19 +45587,11 @@ def _ci_requires_db(rec: dict) -> bool:
     return "database" in (rec.get("requires") or [])
 
 
-def _ci_db_session(st: "State", recs: list[dict]
-                   ) -> contextlib.AbstractAsyncContextManager:
-    """The throwaway cluster, held only when a check needs a database."""
-    return (_test_db_session(st) if any(_ci_requires_db(r) for r in recs)
-            else contextlib.nullcontext())
-
-
 def _ci_teardown(st: "State", wt: Path) -> None:
     subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
     _rmtree_owned(wt)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
-    _drop_test_db(_CI_DB_URLS.pop(os.path.realpath(wt), None))
 
 
 async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
@@ -45509,11 +45607,6 @@ async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
     for e in rec.get("env") or []:
         if e.get("name"):
             env[str(e["name"])] = str(e.get("value") or "")
-    db_url = _CI_DB_URLS.get(os.path.realpath(tree))
-    if db_url and _ci_requires_db(rec):
-        # Over the check's own env: a CI file's DATABASE_URL names the CI
-        # service, not this run's throwaway database.
-        env.update(_test_db_env(db_url))
     log_path = st.run_dir / "logs" / "ci" / f"{label}.log"
     with contextlib.suppress(OSError):
         log_path.unlink()
@@ -45535,6 +45628,12 @@ async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
         log(f"  ci parity: {label} not run — {e}")
         out["skipped"] = "forbidden_by_task"
         return out
+    if _ci_requires_db(rec):
+        # Its own throwaway database, inside its own confinement: the
+        # wrapper exports DATABASE_URL over the check's own env, whose
+        # value names the CI service (DESIGN §6 *No database server leerie
+        # starts is ever unconfined*).
+        argv = _test_db_argv(st, tree, f"ci-{label}") + argv
     try:
         async with _build_class_slot(st, label=f"ci {label}"):
             run = await _run_contained(
@@ -45572,12 +45671,6 @@ async def _ci_prepare(tree: Path, recs: list[dict], st: "State", caps: dict,
     await _ensure_worktree_deps(
         str(tree), st, caps, log_path=st.run_dir / "logs" / "ci-parity.log",
         verbosity="quiet", label_prefix=f"ci-{side}", log_prefix="ci parity")
-    if (any(_ci_requires_db(r) for r in recs)
-            and os.path.realpath(tree) not in _CI_DB_URLS):
-        # After the install: the push runs the tree's own prisma CLI.
-        url = await _create_test_db(st, tree, f"ci-{side}")
-        if url:
-            _CI_DB_URLS[os.path.realpath(tree)] = url
     done = set() if done is None else done
     for rec in recs:
         for j, pre in enumerate(rec.get("prerequisites") or []):
@@ -45669,60 +45762,59 @@ async def _capture_ci_parity_baseline(
             log(f"  ci parity: {r['id']} not run — {r['reason']}"
                 + (f" ({'; '.join(r.get('problems') or [])[:200]})"
                    if r.get("problems") else ""))
-    async with _ci_db_session(st, sel):
-        wt = await _ci_worktree(st, "ci-base", base_sha) if sel else None
-        if sel and wt is None:
-            for r in sel:
-                r.update({"selected": False, "reason": "no_base_worktree"})
-            sel = []
-        try:
-            if wt is not None:
-                await _ci_prepare(wt, sel, st, caps, "base")
-            for r in sel:
-                base: dict = {}
-                run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
-                                    caps=caps, label=f"base-{r['id']}")
-                base.update({"rc": run["rc"], "dirty": run["dirty"]})
-                if r.get("kind") == "coverage":
-                    cov = r.get("coverage") or {}
-                    base["coverage"] = _ci_coverage_pcts(
-                        wt / (r.get("cwd") or ".")
-                        / cov.get("summary_path", ""),
-                        wt, r.get("cwd") or ".", cov.get("thresholds") or [])
-                    if any(v is not None for v in base["coverage"].values()):
-                        r["ratchet"] = "coverage"
-                    else:
-                        r["reason"] = "coverage_unmeasured"
-                elif run["dirty"]:
-                    r.update({"selected": False,
-                              "reason": "writes_tracked_files"})
+    wt = await _ci_worktree(st, "ci-base", base_sha) if sel else None
+    if sel and wt is None:
+        for r in sel:
+            r.update({"selected": False, "reason": "no_base_worktree"})
+        sel = []
+    try:
+        if wt is not None:
+            await _ci_prepare(wt, sel, st, caps, "base")
+        for r in sel:
+            base: dict = {}
+            run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
+                                caps=caps, label=f"base-{r['id']}")
+            base.update({"rc": run["rc"], "dirty": run["dirty"]})
+            if r.get("kind") == "coverage":
+                cov = r.get("coverage") or {}
+                base["coverage"] = _ci_coverage_pcts(
+                    wt / (r.get("cwd") or ".")
+                    / cov.get("summary_path", ""),
+                    wt, r.get("cwd") or ".", cov.get("thresholds") or [])
+                if any(v is not None for v in base["coverage"].values()):
+                    r["ratchet"] = "coverage"
                 else:
-                    if r.get("strict_argv"):
-                        srun = await _ci_run(r["strict_argv"], tree=wt, rec=r,
-                                             st=st, caps=caps,
-                                             label=f"base-{r['id']}-strict")
-                        base["strict_rc"] = srun["rc"]
-                        if srun["passed"] and not srun["dirty"]:
-                            r["gate"] = "strict"
-                        elif not srun["dirty"] and srun["rc"] is not None:
-                            r["ratchet"] = "diagnostic"
-                            keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
-                                                       r.get("cwd") or ".")
-                            base["diagnostics"] = keys
-                    if not r.get("gate") and run["passed"]:
-                        r["gate"] = "plain"
-                    if not r.get("gate") and not r.get("ratchet"):
-                        r["reason"] = "red_at_baseline"
-                r["base"] = base
-                log(f"  ci parity: {r['id']} at the baseline: rc {run['rc']}"
-                    + (f", strict rc {base.get('strict_rc')}"
-                       if "strict_rc" in base else "")
-                    + f" -> gate {r.get('gate') or 'none'}"
-                    + (f", ratchet {r['ratchet']}" if r.get("ratchet")
-                       else ""))
-        finally:
-            if wt is not None:
-                _ci_teardown(st, wt)
+                    r["reason"] = "coverage_unmeasured"
+            elif run["dirty"]:
+                r.update({"selected": False,
+                          "reason": "writes_tracked_files"})
+            else:
+                if r.get("strict_argv"):
+                    srun = await _ci_run(r["strict_argv"], tree=wt, rec=r,
+                                         st=st, caps=caps,
+                                         label=f"base-{r['id']}-strict")
+                    base["strict_rc"] = srun["rc"]
+                    if srun["passed"] and not srun["dirty"]:
+                        r["gate"] = "strict"
+                    elif not srun["dirty"] and srun["rc"] is not None:
+                        r["ratchet"] = "diagnostic"
+                        keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
+                                                   r.get("cwd") or ".")
+                        base["diagnostics"] = keys
+                if not r.get("gate") and run["passed"]:
+                    r["gate"] = "plain"
+                if not r.get("gate") and not r.get("ratchet"):
+                    r["reason"] = "red_at_baseline"
+            r["base"] = base
+            log(f"  ci parity: {r['id']} at the baseline: rc {run['rc']}"
+                + (f", strict rc {base.get('strict_rc')}"
+                   if "strict_rc" in base else "")
+                + f" -> gate {r.get('gate') or 'none'}"
+                + (f", ratchet {r['ratchet']}" if r.get("ratchet")
+                   else ""))
+    finally:
+        if wt is not None:
+            _ci_teardown(st, wt)
     st.data["ci_parity"] = ci
     st.save()
 
@@ -45764,95 +45856,94 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
     final: dict = {"sha": sha, "results": {}, "unmet": [],
                    "resource_affected": [], "pre_existing": [],
                    "no_verdict": []}
-    async with _ci_db_session(st, recs):
-        wt = await _ci_worktree(st, "ci-final", sha)
-        if wt is None:
-            final["skipped"] = "no final worktree"
-            ci["final"] = final
-            st.save()
-            return []
-        red: list[str] = []
-        try:
-            await _ci_prepare(wt, recs, st, caps, "final")
-            for r in recs:
-                res: dict = {}
-                if r.get("gate"):
-                    t_gate = time.monotonic()
-                    run = await _ci_run(_ci_gate_argv(r), tree=wt, rec=r,
-                                        st=st,
-                                        caps=caps, label=f"final-{r['id']}")
-                    res.update({"rc": run["rc"], "dirty": run["dirty"],
-                                "duration_sec": round(
-                                    time.monotonic() - t_gate, 3)})
-                    if not run["passed"]:
-                        red.append(r["id"])
-                if r.get("ratchet") == "diagnostic":
-                    srun = await _ci_run(r["strict_argv"], tree=wt, rec=r,
-                                         st=st,
-                                         caps=caps,
-                                         label=f"final-{r['id']}-strict")
-                    keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
-                                               r.get("cwd") or ".")
-                    base = (r.get("base") or {}).get("diagnostics") or {}
-                    cwd = (r.get("cwd") or ".").strip().rstrip("/")
-                    pre = ("" if cwd in ("", ".")
-                           else cwd.removeprefix("./") + "/")
-                    rel_touched = {t[len(pre):] for t in touched
-                                   if t.startswith(pre)}
-                    new = sorted(k for k, n in keys.items()
-                                 if n > base.get(k, 0)
-                                 and k.split("\t", 1)[0] in rel_touched)
-                    res["strict_rc"] = srun["rc"]
-                    res["new_diagnostics"] = new[:_CI_DIAG_LIMIT]
-                    if new:
-                        final["unmet"].append({
-                            "id": r["id"], "kind": r.get("kind"),
-                            "why": "new_diagnostics",
-                            "argv": r.get("strict_argv"), "cwd": r.get("cwd"),
-                            "diagnostics": new[:_CI_DIAG_LIMIT]})
-                if r.get("ratchet") == "coverage":
-                    run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
-                                        caps=caps, label=f"final-{r['id']}")
-                    cov = r.get("coverage") or {}
-                    pcts = _ci_coverage_pcts(
-                        wt / (r.get("cwd") or ".")
-                        / cov.get("summary_path", ""),
-                        wt, r.get("cwd") or ".", cov.get("thresholds") or [])
-                    fired = _ci_coverage_fired(r, pcts, touched, eps)
-                    res.update({"rc": run["rc"], "coverage": pcts,
-                                "fired": fired})
-                    if fired:
-                        final["unmet"].append({
-                            "id": r["id"], "kind": "coverage",
-                            "why": "coverage_ratchet", "argv": r.get("argv"),
-                            "cwd": r.get("cwd"), "thresholds": fired})
-                final["results"][r["id"]] = res
-            if red:
-                verdict = await _ci_confirm_red(
-                    st, caps, base_sha, wt,
-                    [x for x in recs if x["id"] in red],
-                    durations={i: final["results"][i]["duration_sec"]
-                               for i in red if "duration_sec"
-                               in final["results"].get(i, {})})
-                final["b_star"] = verdict
-                final["budget_short_unsettled"] = list(
-                    verdict.get("budget_short_unsettled") or [])
-                if verdict.get("sized_out"):
-                    final["sized_out"] = list(verdict["sized_out"])
-                final["resource_affected"] = list(
-                    verdict.get("resource_affected") or [])
-                final["pre_existing"] = list(
-                    verdict.get("pre_existing") or [])
-                final["no_verdict"] = list(verdict.get("no_verdict") or [])
-                by_id = {x["id"]: x for x in recs}
-                for cid in verdict.get("new") or []:
-                    rr = by_id[cid]
+    wt = await _ci_worktree(st, "ci-final", sha)
+    if wt is None:
+        final["skipped"] = "no final worktree"
+        ci["final"] = final
+        st.save()
+        return []
+    red: list[str] = []
+    try:
+        await _ci_prepare(wt, recs, st, caps, "final")
+        for r in recs:
+            res: dict = {}
+            if r.get("gate"):
+                t_gate = time.monotonic()
+                run = await _ci_run(_ci_gate_argv(r), tree=wt, rec=r,
+                                    st=st,
+                                    caps=caps, label=f"final-{r['id']}")
+                res.update({"rc": run["rc"], "dirty": run["dirty"],
+                            "duration_sec": round(
+                                time.monotonic() - t_gate, 3)})
+                if not run["passed"]:
+                    red.append(r["id"])
+            if r.get("ratchet") == "diagnostic":
+                srun = await _ci_run(r["strict_argv"], tree=wt, rec=r,
+                                     st=st,
+                                     caps=caps,
+                                     label=f"final-{r['id']}-strict")
+                keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
+                                           r.get("cwd") or ".")
+                base = (r.get("base") or {}).get("diagnostics") or {}
+                cwd = (r.get("cwd") or ".").strip().rstrip("/")
+                pre = ("" if cwd in ("", ".")
+                       else cwd.removeprefix("./") + "/")
+                rel_touched = {t[len(pre):] for t in touched
+                               if t.startswith(pre)}
+                new = sorted(k for k, n in keys.items()
+                             if n > base.get(k, 0)
+                             and k.split("\t", 1)[0] in rel_touched)
+                res["strict_rc"] = srun["rc"]
+                res["new_diagnostics"] = new[:_CI_DIAG_LIMIT]
+                if new:
                     final["unmet"].append({
-                        "id": cid, "kind": rr.get("kind"), "why": "red",
-                        "argv": _ci_gate_argv(rr), "cwd": rr.get("cwd"),
-                        "rc": final["results"][cid].get("rc")})
-        finally:
-            _ci_teardown(st, wt)
+                        "id": r["id"], "kind": r.get("kind"),
+                        "why": "new_diagnostics",
+                        "argv": r.get("strict_argv"), "cwd": r.get("cwd"),
+                        "diagnostics": new[:_CI_DIAG_LIMIT]})
+            if r.get("ratchet") == "coverage":
+                run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
+                                    caps=caps, label=f"final-{r['id']}")
+                cov = r.get("coverage") or {}
+                pcts = _ci_coverage_pcts(
+                    wt / (r.get("cwd") or ".")
+                    / cov.get("summary_path", ""),
+                    wt, r.get("cwd") or ".", cov.get("thresholds") or [])
+                fired = _ci_coverage_fired(r, pcts, touched, eps)
+                res.update({"rc": run["rc"], "coverage": pcts,
+                            "fired": fired})
+                if fired:
+                    final["unmet"].append({
+                        "id": r["id"], "kind": "coverage",
+                        "why": "coverage_ratchet", "argv": r.get("argv"),
+                        "cwd": r.get("cwd"), "thresholds": fired})
+            final["results"][r["id"]] = res
+        if red:
+            verdict = await _ci_confirm_red(
+                st, caps, base_sha, wt,
+                [x for x in recs if x["id"] in red],
+                durations={i: final["results"][i]["duration_sec"]
+                           for i in red if "duration_sec"
+                           in final["results"].get(i, {})})
+            final["b_star"] = verdict
+            final["budget_short_unsettled"] = list(
+                verdict.get("budget_short_unsettled") or [])
+            if verdict.get("sized_out"):
+                final["sized_out"] = list(verdict["sized_out"])
+            final["resource_affected"] = list(
+                verdict.get("resource_affected") or [])
+            final["pre_existing"] = list(
+                verdict.get("pre_existing") or [])
+            final["no_verdict"] = list(verdict.get("no_verdict") or [])
+            by_id = {x["id"]: x for x in recs}
+            for cid in verdict.get("new") or []:
+                rr = by_id[cid]
+                final["unmet"].append({
+                    "id": cid, "kind": rr.get("kind"), "why": "red",
+                    "argv": _ci_gate_argv(rr), "cwd": rr.get("cwd"),
+                    "rc": final["results"][cid].get("rc")})
+    finally:
+        _ci_teardown(st, wt)
     ci["final"] = final
     st.save()
     _ci_sized = list(final.get("sized_out") or [])
@@ -48133,7 +48224,6 @@ def _acceptance_mechanical_findings(repo: str | Path, rev: str,
 # db push` against throwaway test databases only; code checks the target
 # before every push (`_test_db_url_refusal`).
 _PRISMA_CONSENT_ENV = "PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION"
-_PRISMA_CONSENT_TEXT = "yes, allow prisma db push on throwaway test databases"
 _TEST_DB_PREFIX = "leerie_"
 _TEST_DB_SUFFIX = "_test"
 _PRISMA_PACKAGES = ("prisma", "@prisma/client")
@@ -48240,147 +48330,42 @@ def _db_reset_denials(repo_root: str | Path) -> str:
     return ",".join(f"Bash({p})" for p in _db_reset_rule_patterns(repo_root))
 
 
-def _test_db_url_refusal(url: str, direct_url: str, port: int) -> str | None:
+# DESIGN §6 *No database server leerie starts is ever unconfined*: a command
+# that needs a database is wrapped by this script, inside its own
+# confinement and isolation; the cluster lives in that command's own `/tmp`.
+SANDBOX_DB_SCRIPT = ROOT / "scripts" / "sandbox-db.sh"
+TEST_DB_SOCKET_DIR = "/tmp/leerie-pg"
+_TEST_DB_NAME_RE = re.compile(r"leerie_[0-9a-f]{16}_test")
+
+
+def _test_db_url_refusal(url: str, direct_url: str) -> str | None:
     """Why `url` is NOT a database leerie may push to, or None when it is:
-    a postgres URL on localhost, at the port of leerie's own cluster, whose
-    database name starts `leerie_` and ends `_test`, with DIRECT_URL equal
-    to it (prisma.config.ts commonly resolves `DIRECT_URL ?? DATABASE_URL`,
-    so a different DIRECT_URL would be the push's real target). Checked
-    before every push; mechanical URL parsing only."""
+    a postgres URL on `localhost` whose socket is the command's own
+    (`host=` `TEST_DB_SOCKET_DIR`), whose database name is
+    `leerie_<16 hex>_test`, with DIRECT_URL equal to it (prisma.config.ts
+    commonly resolves `DIRECT_URL ?? DATABASE_URL`, so a different
+    DIRECT_URL would be the push's real target). Checked on the URL
+    `scripts/sandbox-db.sh` will compose; mechanical URL parsing only."""
     try:
         u = urllib.parse.urlparse(url)
-        u_port = u.port
+        port = u.port
     except ValueError as e:
         return f"unparseable URL ({e})"
     name = u.path.lstrip("/")
     if u.scheme not in ("postgres", "postgresql"):
         return f"scheme {u.scheme!r} is not postgres"
-    if u.hostname not in ("localhost", "127.0.0.1"):
-        return f"host {u.hostname!r} is not localhost"
-    if u_port != port:
-        return f"port {u_port} is not leerie's own cluster port {port}"
-    if not (name.startswith(_TEST_DB_PREFIX)
-            and name.endswith(_TEST_DB_SUFFIX)):
+    if u.hostname != "localhost" or port is not None:
+        return f"host {u.netloc!r} is not localhost through a socket"
+    hosts = urllib.parse.parse_qs(u.query).get("host") or []
+    if hosts != [TEST_DB_SOCKET_DIR]:
+        return (f"socket {hosts!r} is not the command's own "
+                f"{TEST_DB_SOCKET_DIR}")
+    if not _TEST_DB_NAME_RE.fullmatch(name):
         return (f"database {name!r} is not named "
-                f"{_TEST_DB_PREFIX}*{_TEST_DB_SUFFIX}")
+                f"{_TEST_DB_PREFIX}<16 hex>{_TEST_DB_SUFFIX}")
     if direct_url != url:
         return "DIRECT_URL differs from DATABASE_URL"
     return None
-
-
-def _pg_server_bin() -> str | None:
-    """A directory holding a complete PostgreSQL server install (`initdb`,
-    `pg_ctl`, `pg_isready`, `createdb`, `dropdb`): the newest
-    `/usr/lib/postgresql/<major>/bin`, else the one on PATH."""
-    need = ("initdb", "pg_ctl", "pg_isready", "createdb", "dropdb")
-
-    def _complete(d: str) -> bool:
-        return all(os.access(os.path.join(d, t), os.X_OK) for t in need)
-    best, best_major = None, -1
-    for cand in glob.glob("/usr/lib/postgresql/*/bin"):
-        if not _complete(cand):
-            continue
-        major = os.path.basename(os.path.dirname(cand))
-        rank = int(major) if major.isdigit() else -1
-        if best is None or rank > best_major:
-            best, best_major = cand, rank
-    if best is None and shutil.which("initdb"):
-        d = os.path.dirname(shutil.which("initdb") or "")
-        if _complete(d):
-            best = d
-    return best
-
-
-# The active throwaway cluster, shared by every consumer in this process and
-# stopped when the last `_test_db_session` exits.
-_TEST_DB: dict = {"cluster": None, "refs": 0, "warned": False}
-
-
-def _free_local_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def _start_test_db_cluster(st: "State") -> dict | None:
-    """initdb a private cluster under the temp dir and start it on a free
-    localhost port, TCP only (no unix socket, so no path-length limit).
-    None (logged once) when no server is installed, leerie runs as root
-    (postgres refuses), or a step fails — the sets then run as before,
-    without a database."""
-    def _skip(why: str) -> None:
-        if not _TEST_DB["warned"]:
-            _TEST_DB["warned"] = True
-            log(f"  acceptance: no throwaway test database ({why}) — the "
-                "held-out sets run without one")
-    pgbin = _pg_server_bin()
-    if pgbin is None:
-        _skip("no PostgreSQL server binaries installed")
-        return None
-    if os.geteuid() == 0:
-        _skip("running as root, which postgres refuses")
-        return None
-    user = pwd.getpwuid(os.getuid()).pw_name
-    data = Path(tempfile.gettempdir()) / f"leerie-pg-{st.run_id}"
-    _rmtree_owned(data)
-    init = subprocess.run([os.path.join(pgbin, "initdb"), "-D", str(data),
-                           "-U", user, "--auth-local=trust",
-                           "--auth-host=trust"],
-                          capture_output=True, text=True, check=False)
-    if init.returncode != 0:
-        _skip(f"initdb failed: {init.stderr.strip()[-200:]}")
-        _rmtree_owned(data)
-        return None
-    port = _free_local_port()
-    start = subprocess.run(
-        [os.path.join(pgbin, "pg_ctl"), "-D", str(data), "-l",
-         str(data) + ".log", "-w", "-o",
-         f"-p {port} -c listen_addresses=127.0.0.1 "
-         "-c unix_socket_directories='' -c fsync=off", "start"],
-        capture_output=True, text=True, check=False,
-        start_new_session=True)
-    if start.returncode != 0:
-        _skip(f"postgres did not start: {start.stderr.strip()[-200:]}")
-        _rmtree_owned(data)
-        return None
-    log(f"  acceptance: throwaway test database cluster on 127.0.0.1:{port}")
-    return {"bin": pgbin, "port": port, "data": str(data), "user": user}
-
-
-def _stop_test_db_cluster(cluster: dict) -> None:
-    subprocess.run([os.path.join(cluster["bin"], "pg_ctl"), "-D",
-                    cluster["data"], "-m", "fast", "-w", "stop"],
-                   capture_output=True, check=False)
-    _rmtree_owned(cluster["data"])
-    with contextlib.suppress(OSError):
-        os.unlink(cluster["data"] + ".log")
-
-
-@contextlib.asynccontextmanager
-async def _test_db_session(st: "State") -> AsyncIterator[dict | None]:
-    """Hold the throwaway cluster for a Prisma repo whose datasource is
-    PostgreSQL; yields it, or None (not such a repo, or no cluster could be
-    started). Re-entrant: nested sessions share one cluster, stopped when
-    the outermost exits."""
-    project = _prisma_project(st.repo_root)
-    if (project is None
-            or project.get("provider") not in ("postgresql", "postgres")):
-        yield None
-        return
-    # Counted before the start is awaited, so a session entered while the
-    # cluster is starting never starts a second one (it sees no cluster
-    # until the first start returns, and its sets run without a database).
-    _TEST_DB["refs"] += 1
-    try:
-        if _TEST_DB["refs"] == 1:
-            _TEST_DB["cluster"] = await asyncio.to_thread(
-                _start_test_db_cluster, st)
-        yield _TEST_DB["cluster"]
-    finally:
-        _TEST_DB["refs"] -= 1
-        if _TEST_DB["refs"] == 0 and _TEST_DB["cluster"] is not None:
-            cluster, _TEST_DB["cluster"] = _TEST_DB["cluster"], None
-            await asyncio.to_thread(_stop_test_db_cluster, cluster)
 
 
 def _test_db_name(key: str) -> str:
@@ -48388,83 +48373,33 @@ def _test_db_name(key: str) -> str:
             + _TEST_DB_SUFFIX)
 
 
-def _test_db_env(url: str) -> dict[str, str]:
-    """What a worker or a set run gets: the URL, never the consent."""
-    return {"DATABASE_URL": url, "DIRECT_URL": url}
+def _test_db_url(name: str) -> str:
+    """The URL `scripts/sandbox-db.sh` composes for `name`."""
+    user = pwd.getpwuid(os.getuid()).pw_name
+    return f"postgresql://{user}@localhost/{name}?host={TEST_DB_SOCKET_DIR}"
 
 
-async def _create_test_db(st: "State", tree: str | Path,
-                          key: str) -> str | None:
-    """A fresh database for `tree` on the active cluster with `tree`'s own
-    Prisma schema pushed, its URL, or None (no active cluster, or a step
-    failed — logged). The URL is checked by `_test_db_url_refusal` before
-    the push, and Prisma's AI-agent consent variable is set on the push
-    subprocess alone."""
-    cluster = _TEST_DB.get("cluster")
+def _test_db_argv(st: "State", tree: str | Path, key: str) -> list[str]:
+    """The prefix that gives one command in `tree` a throwaway database of
+    its own (DESIGN §6 *No database server leerie starts is ever
+    unconfined*): `bash scripts/sandbox-db.sh <pkg-dir> <name> --`, run as
+    the confined command itself, so the server, the schema push (which
+    loads the tree's own `prisma.config.ts`) and the command share one
+    grant and one isolation and end together. `[]` outside a Prisma repo
+    whose datasource is PostgreSQL, or when the URL is refused (logged)."""
     project = _prisma_project(st.repo_root)
-    if cluster is None or project is None:
-        return None
+    if (project is None
+            or project.get("provider") not in ("postgresql", "postgres")):
+        return []
     name = _test_db_name(f"{st.run_id}:{key}:{tree}")
-    url = f"postgresql://{cluster['user']}@127.0.0.1:{cluster['port']}/{name}"
-    refused = _test_db_url_refusal(url, url, cluster["port"])
+    url = _test_db_url(name)
+    refused = _test_db_url_refusal(url, url)
     if refused:
-        log(f"  acceptance: REFUSED to push to {url}: {refused}")
-        return None
-    pg = ["-h", "127.0.0.1", "-p", str(cluster["port"]),
-          "-U", cluster["user"]]
-    await asyncio.to_thread(
-        subprocess.run, [os.path.join(cluster["bin"], "dropdb"), *pg,
-                         "--if-exists", name],
-        capture_output=True, check=False)
-    made = await asyncio.to_thread(
-        subprocess.run, [os.path.join(cluster["bin"], "createdb"), *pg, name],
-        capture_output=True, text=True, check=False)
-    if made.returncode != 0:
-        log(f"  acceptance: createdb {name} failed: "
-            f"{made.stderr.strip()[-200:]}")
-        return None
-    pkg_dir = Path(str(tree)) / project["dir"]
-    prisma = pkg_dir / "node_modules" / ".bin" / "prisma"
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("PRISMA_USER_CONSENT")}
-    env.update(_test_db_env(url))
-    # Checked again on the exact environment the push will see.
-    refused = _test_db_url_refusal(env["DATABASE_URL"], env["DIRECT_URL"],
-                                   cluster["port"])
-    if refused or not prisma.exists():
-        log(f"  acceptance: no schema push for {name}: "
-            f"{refused or 'no installed prisma CLI'}")
-        _drop_test_db(url)
-        return None
-    env[_PRISMA_CONSENT_ENV] = _PRISMA_CONSENT_TEXT
-    try:
-        push = await asyncio.to_thread(
-            subprocess.run, [str(prisma), "db", "push", "--accept-data-loss"],
-            cwd=str(pkg_dir), env=env, capture_output=True, text=True,
-            check=False, timeout=600)
-    except subprocess.TimeoutExpired:
-        push = None
-    if push is None or push.returncode != 0:
-        tail = ((push.stdout + push.stderr) if push else "timed out")
-        log(f"  acceptance: prisma db push to {name} failed: "
-            f"{tail.strip()[-300:]}")
-        _drop_test_db(url)
-        return None
-    return url
-
-
-def _drop_test_db(url: str | None) -> None:
-    """Drop a database `_create_test_db` made; never anything else."""
-    cluster = _TEST_DB.get("cluster")
-    if not url or cluster is None:
-        return
-    if _test_db_url_refusal(url, url, cluster["port"]):
-        return
-    name = urllib.parse.urlparse(url).path.lstrip("/")
-    subprocess.run([os.path.join(cluster["bin"], "dropdb"), "-h",
-                    "127.0.0.1", "-p", str(cluster["port"]), "-U",
-                    cluster["user"], "--if-exists", "--force", name],
-                   capture_output=True, check=False)
+        log(f"  test database: REFUSED {url}: {refused}")
+        return []
+    pkg = Path(str(tree)) / project["dir"] if project["dir"] else Path(
+        str(tree))
+    return ["bash", str(SANDBOX_DB_SCRIPT), str(pkg), name, "--"]
 
 
 def _prisma_db_context(repo: str | Path, rev: str) -> dict:
@@ -49687,18 +49622,39 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     Returned with a short reason for the log. Short of True, the
     declaration is not honoured."""
     probe = _acceptance_probe_rel(st, test_rel)
-    cmd = _acceptance_cmd(st, [probe], tree)
+    if (Path(tree) / probe).exists():
+        return None, "the parse check's name is taken in the tree"
+    # The probe is placed in the sandbox, never written into the tree: its
+    # source is a file of leerie's own, outside every grant.
+    fd, src = tempfile.mkstemp(prefix="leerie-parse-probe-",
+                               suffix=Path(probe).suffix)
+    os.close(fd)
+    try:
+        return await _acceptance_parse_probe_run(
+            st, caps, tree, test_rel, targets, log_path, label, probe,
+            Path(src))
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(src)
+
+
+async def _acceptance_parse_probe_run(st: "State", caps: dict, tree: str,
+                                      test_rel: str, targets: list[str],
+                                      log_path: Path, label: str,
+                                      probe: str, src: Path
+                                      ) -> tuple[bool | None, str]:
+    """`_acceptance_parse_probe`'s run, with the probe's source at `src`."""
+    cmd = _acceptance_cmd(st, [probe], tree, {probe: str(src)})
     if cmd is None:
         return None, "no test command here could run the parse check"
     try:
         argv = _blt_shell_argv(cmd, _forbidden_specs(st.data))
     except ForbiddenByTask as e:
         return None, f"the parse check was not run: {e}"
-    path = Path(tree) / probe
-    # In the tree's own measurement directory: the probe writes it from
-    # inside the confined run (DESIGN §6 *Leerie's runs of the repository's
-    # commands are confined too*).
-    grants = _measurement_grants(st, tree)
+    # The marker is the sandbox's report: the probe writes it inside the
+    # sandbox, and it comes back through the report descriptor (DESIGN §6
+    # *A held-out evaluation runs alone*).
+    grants = _heldout_grants(st, tree)
     marker = _measure_dir(st, tree) / "reports" / (
         f"{label}-probe-{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}")
     try:
@@ -49713,23 +49669,23 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
                       f"({type(e).__name__}: its marker directory is not "
                       "writable)")
     try:
-        path.write_text(_PARSE_PROBE_SOURCE.format(
+        src.write_text(_PARSE_PROBE_SOURCE.format(
             targets=[str(Path(tree) / t) for t in targets],
             marker=str(marker)))
-        # It runs beside a held-out file: as that file's run does
-        # (`_run_acceptance_file`), it has `/tmp` alone.
+        # It runs beside a held-out file, as that file's run does
+        # (`_run_acceptance_file`): alone, in a sandbox.
         async with _held_out_section(st):
             rc, out = await _run_streaming(
                 argv, grants=grants, cwd=str(tree),
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
                 log_path=log_path, label=f"{label}-parse-probe: {cmd}",
-                verbosity="quiet")
+                verbosity="quiet",
+                sandbox=HeldOutSandbox(view=str(tree),
+                                       place=((str(src), probe),),
+                                       report=str(marker)))
     except Exception as e:
         return None, f"the parse check could not run ({type(e).__name__})"
-    finally:
-        with contextlib.suppress(OSError):
-            path.unlink()
     try:
         state = marker.read_text()
     except OSError:
@@ -49767,7 +49723,8 @@ def _acceptance_declared_rel(declared: dict) -> str:
 
 
 def _acceptance_cmd(st: "State", files: list[str],
-                    tree: str | None = None) -> str | None:
+                    tree: str | None = None,
+                    placed: Mapping[str, str] | None = None) -> str | None:
     """The repo's scoped test template for named test files
     (`resolve_test_files_scoped`, the runner's direct form — never the
     diff's impact-analysis form) rendered over explicit test files,
@@ -49775,7 +49732,12 @@ def _acceptance_cmd(st: "State", files: list[str],
     the package/target forms, not one the runner can select). Over a
     `{test_packages}` template, which runs whole Go packages, the command
     also selects the files' own test functions (`-run`, read from `tree`'s
-    copies), so a package's existing tests stay out of the verdict."""
+    copies), so a package's existing tests stay out of the verdict.
+    `placed` maps a path relative to `tree` to the file a held-out sandbox
+    will place there (`HeldOutSandbox.place`): it is read in place of the
+    tree's copy, which does not exist on disk, and counts as one of the
+    tree's files."""
+    placed = dict(placed or {})
     template = resolve_test_files_scoped(st.repo_root)
     if not template or not files:
         return None
@@ -49794,11 +49756,14 @@ def _acceptance_cmd(st: "State", files: list[str],
         if tree is None or not all(f.endswith("_test.go") for f in files):
             return None
         names = sorted({n for f in files
-                        for n in _go_test_func_names(Path(tree) / f)})
+                        for n in _go_test_func_names(
+                            Path(placed[f]) if f in placed
+                            else Path(tree) / f)})
         if not names:
             return None
         rendered += " -run " + shlex.quote("^(" + "|".join(names) + ")$")
-    return _vitest_exact_selection(rendered, files, tree or st.repo_root)
+    return _vitest_exact_selection(rendered, files, tree or st.repo_root,
+                                   extra=tuple(placed))
 
 
 # Glob metacharacters picomatch reads in a vitest `--exclude` pattern. A
@@ -49830,7 +49795,8 @@ def _vitest_filter_selects(named: tuple[str, ...],
     return False
 
 
-def _vitest_filter_colliders(tree: str | Path, files: list[str]) -> list[str]:
+def _vitest_filter_colliders(tree: str | Path, files: list[str],
+                            extra: Iterable[str] = ()) -> list[str]:
     """Every file under `tree` that vitest would also run for the named
     `files`, which are never among them: vitest reads each positional as a
     case-insensitive substring of a path, so `src/a.test.ts` also selects
@@ -49838,7 +49804,9 @@ def _vitest_filter_colliders(tree: str | Path, files: list[str]) -> list[str]:
     own default exclude skips (`**/node_modules/**`, `**/.git/**`) and does
     not follow a symlinked directory: walking `node_modules` would cost
     about 1.1 s per render on funeralworks (58k of its 61k files), against
-    0.08 s without it."""
+    0.08 s without it. `extra`: paths relative to `tree` that are not on
+    disk but will be there when the command runs (a held-out set's files,
+    placed in its sandbox)."""
     named = {os.path.normpath(f) for f in files}
     parts = [tuple(Path(f).parts) for f in named]
     # A file vitest selects contains a named file's basename in one of its
@@ -49860,6 +49828,10 @@ def _vitest_filter_colliders(tree: str | Path, files: list[str]) -> list[str]:
             here = tuple(Path(rel).parts)
             if any(_vitest_filter_selects(p, here) for p in parts):
                 out.append(rel)
+    for rel in {os.path.normpath(e) for e in extra} - named - set(out):
+        if any(_vitest_filter_selects(p, tuple(Path(rel).parts))
+               for p in parts):
+            out.append(rel)
     return sorted(out)
 
 
@@ -49885,7 +49857,8 @@ def _vitest_filter_form(cmd: str, files: list[str], tree: str | Path) -> bool:
 
 
 def _vitest_exact_selection(cmd: str, files: list[str],
-                            tree: str | Path) -> str | None:
+                            tree: str | Path,
+                            extra: Iterable[str] = ()) -> str | None:
     """`cmd`, made to run exactly the named `files` when it hands them to
     vitest as filters (DESIGN §9 *Operands that are already test files take
     the runner's direct form*). vitest has no exact file selection: a
@@ -49899,7 +49872,7 @@ def _vitest_exact_selection(cmd: str, files: list[str],
     one that runs more than it names. Any other command is returned as is."""
     if not _vitest_filter_form(cmd, files, tree):
         return cmd
-    colliders = _vitest_filter_colliders(tree, files)
+    colliders = _vitest_filter_colliders(tree, files, extra)
     if not colliders:
         return cmd
     root = os.path.realpath(tree)
@@ -49938,8 +49911,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                                validating: bool = False,
                                failure_mode: str = "assertion",
                                observed: dict | None = None,
-                               env_extra: dict[str, str] | None = None,
-                               cases_out: dict | None = None
+                               cases_out: dict | None = None,
+                               place: tuple[tuple[str, str], ...] = ()
                                ) -> bool | None:
     """Exit-code verdict for one acceptance file in `tree`: True passed,
     False failed, None not measurable (no command, the shell could not run
@@ -49971,8 +49944,16 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     for `No such file or directory`, which is also what a test of a missing-
     file defect prints when it fails — exactly the failure a defect file
     exists to show. And always quiet: a streamed echo would put the hidden
-    test's source and output in `orchestrator.log`."""
-    cmd = _acceptance_cmd(st, [rel], tree)
+    test's source and output in `orchestrator.log`.
+
+    Every run is in a held-out sandbox over `tree` (DESIGN §6 *A held-out
+    evaluation runs alone, in a world that dies with it (I3)*), alone
+    (`_held_out_section`): `place` pairs (absolute source, path relative to
+    `tree`) are the set's files, copied into the sandbox's overlay and never
+    onto disk; the runner's report comes back through a descriptor. In a
+    Prisma repo whose datasource is PostgreSQL it has a database of its own,
+    started inside the sandbox (`_test_db_argv`)."""
+    cmd = _acceptance_cmd(st, [rel], tree, {r: src for src, r in place})
     if cmd is None:
         return None
     written = cmd
@@ -49981,12 +49962,11 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     # and no-verdict exits are known (DESIGN §9 *Which failures are new*).
     cmd, path_env = _runner_command(cmd, tree, _RUNNER_REPORTS, [rel])
     run_cmd, env, spec = cmd, None, None
-    # `env_extra` carries a throwaway test database's URL (DESIGN §8
-    # *Prisma repositories get a real database*).
     # The tree's own measurement directory, never `acceptance/`, which no
     # confined command is granted (DESIGN §6 *Leerie's runs of the
-    # repository's commands are confined too*); read after the run exits.
-    grants = _measurement_grants(st, tree)
+    # repository's commands are confined too*); written there by the
+    # sandbox's report descriptor after the run exits.
+    grants = _heldout_grants(st, tree)
     report = _measure_dir(st, tree) / "reports" / (
         f"{label}-{hashlib.sha256(rel.encode()).hexdigest()[:12]}")
     if validating or cases_out is not None:
@@ -49998,8 +49978,6 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                 report.unlink()
     if path_env:
         env = {**(env if env is not None else os.environ), **path_env}
-    if env_extra:
-        env = {**(env if env is not None else os.environ), **env_extra}
     try:
         if written != cmd:
             _blt_shell_argv(written, _forbidden_specs(st.data))
@@ -50008,9 +49986,13 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     except ForbiddenByTask as e:
         log(f"  {label}: `{rel}` not run — {e}")
         return None
-    # A held-out file's run has `/tmp` alone, which bounds it more tightly
-    # than the BLT semaphore would (DESIGN §6 *A measurement may write
-    # `/tmp`; a held-out evaluation has it alone*).
+    argv = _test_db_argv(st, tree, f"{label}:{rel}") + argv
+    sandbox = HeldOutSandbox(view=str(tree), place=tuple(place),
+                             report=str(report) if spec is not None
+                             else None)
+    # A held-out file's run is alone in the run and on the host, which
+    # bounds it more tightly than the BLT semaphore would (DESIGN §6 *A
+    # held-out evaluation runs alone*).
     async with _held_out_section(st):
         try:
             rc, tail = await _run_streaming(
@@ -50018,7 +50000,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
                 log_path=log_path, label=f"{label}-tests: {run_cmd}",
-                verbosity="quiet")
+                verbosity="quiet", sandbox=sandbox)
         except subprocess.TimeoutExpired:
             # A timeout is a resource signature: the run is failing but
             # names no case evidence (DESIGN §8 *Delivery re-drive* rule 4).
@@ -50108,9 +50090,6 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     if made.startswith("failed"):
         out["reason"] = made
         return out
-    # The writer commits here: nothing leerie runs here reads `/tmp`.
-    _declare_worker_tree(wt)
-    db_url = None
     try:
         # The report is usually an untracked file in the user's checkout,
         # absent from a fresh worktree: copy what the task names.
@@ -50130,8 +50109,9 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             # the base for the wrong reason and could never pass anywhere.
             out["reason"] = "dependency install failed in the writer worktree"
             return out
-        db_url = await _create_test_db(st, wt, name)
-        env_extra = _test_db_env(db_url) if db_url else None
+        # In a Prisma/PostgreSQL repo the writer's session has a database of
+        # its own (`claude_p(db=True)`), and so does every validation run.
+        has_db = bool(_test_db_argv(st, wt, name))
         scope = st.data.get("defect_scope") or {}
         gt = scope.get("ground_truth") or {}
         lines = [
@@ -50147,7 +50127,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             "here, and return the JSON object per your schema.",
         ]
         db_ctx = None
-        if db_url:
+        if has_db:
             db_ctx = _prisma_db_context(_run_repo(st), base)
             lines += ["", _prisma_real_db_section(
                 db_ctx, resolve_test_files_scoped(st.repo_root) or "")]
@@ -50164,7 +50144,6 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             # the writer's files again, collected like any it writes now.
             _place_set(rewrite_of, wt)
             user += "\n\n" + note
-        kw = {"env_extra": env_extra} if env_extra else {}
 
         async def _call(prompt: str, suffix: str = "") -> dict:
             return await claude_p(
@@ -50175,7 +50154,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 caps=caps, st=st,
                 model=models.get("acceptance_writer", MODEL_DEFAULT),
                 effort=efforts.get("acceptance_writer"),
-                sid=sid + suffix, **kw)
+                sid=sid + suffix, db=has_db)
         res = await _call(user)
         if db_ctx is not None:
             hits = _prisma_mock_hits(_run_repo(st), base, wt,
@@ -50201,7 +50180,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         dest_name = f"set-{k}" if rewrite_of is None else f"set-{k}-rw"
         got = await _collect_acceptance_set(k, st, caps, wt, base, res, refs,
                                             pre_untracked, log_path, name,
-                                            env_extra, dest_name)
+                                            dest_name)
         rounds = int(caps.get("acceptance_rewrite_rounds",
                               DEFAULT_CAPS["acceptance_rewrite_rounds"]))
         if (rewrite_of is None and got.get("no_defect_fails")
@@ -50220,7 +50199,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 f.get("kind") == "defect" for f in (res.get("files") or []))
             got = await _collect_acceptance_set(
                 k, st, caps, wt, base, res, refs, pre_untracked, log_path,
-                name, env_extra, dest_name)
+                name, dest_name)
             got["own_start_rewrite"] = True
             if got.get("no_defect_fails"):
                 # The report's defect no longer reproduces here even after
@@ -50240,7 +50219,6 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         out["reason"] = f"{type(e).__name__}: {e}"[:200]
         return out
     finally:
-        _drop_test_db(db_url)
         _remove_acceptance_checkout(st, wt)
 
 
@@ -50275,8 +50253,7 @@ def _acceptance_new_files(wt: Path, pre_untracked: set[str],
 async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
                                   base: str, res: dict, refs: list[str],
                                   pre_untracked: set[str], log_path: Path,
-                                  label: str, env_extra: dict | None,
-                                  dest_name: str) -> dict:
+                                  label: str, dest_name: str) -> dict:
     """Collect and validate, per case at `base`, what a writer left in `wt`
     (DESIGN §8): `{valid, reason?, dir, defect_files, control_files,
     support_files, cases, modes, base_failing_cases}`. Valid only with at
@@ -50361,8 +50338,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
         observed: dict = {}
         verdict = await _run_acceptance_file(
             st, caps, str(wt), rel, log_path, f"{label}-base",
-            validating=True, failure_mode=mode, observed=observed,
-            **_env_kw(env_extra))
+            validating=True, failure_mode=mode, observed=observed)
         if verdict is None:
             # Not measurable (no test command for this file, the runner
             # is missing, or it ran no test) — never mistaken for pass
@@ -50573,9 +50549,7 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
         async with sem:
             return await _write_acceptance_set(k, task, st, caps, models,
                                                efforts, base)
-    async with _test_db_session(st):
-        results = await _gather_or_cancel(*[_one(k)
-                                            for k in range(1, n + 1)])
+    results = await _gather_or_cancel(*[_one(k) for k in range(1, n + 1)])
     for r in results:
         r.pop("declared_defect", None)
     sets = [r for r in results if r.get("valid")]
@@ -50643,9 +50617,8 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
     disk) is no evidence from any set — never an exception that would skip
     a repair's rollback check."""
     try:
-        async with _test_db_session(st):
-            return await _evaluate_acceptance_sets_inner(
-                st, caps, tree, sets, label, rev=rev, confirm=confirm)
+        return await _evaluate_acceptance_sets_inner(
+            st, caps, tree, sets, label, rev=rev, confirm=confirm)
     except Exception as e:
         log(f"  acceptance: evaluation failed ({type(e).__name__}: {e}) — "
             "no evidence either way")
@@ -50706,13 +50679,8 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
             log("  acceptance: dependency install failed in the evaluation "
                 "worktree — no evidence either way")
             return unmeasured_all("deps_failed")
-        url = await _create_test_db(st, wt, f"acceptance-eval-{label}")
-        try:
-            results = await _acceptance_run_placed(
-                st, caps, wt, sets, label, confirm=confirm,
-                env_extra=_test_db_env(url) if url else None)
-        finally:
-            _drop_test_db(url)
+        results = await _acceptance_run_placed(st, caps, wt, sets, label,
+                                               confirm=confirm)
     finally:
         _teardown()
     return results
@@ -50720,14 +50688,14 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
 
 async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                                  sets: list[dict], label: str, *,
-                                 confirm: bool = True,
-                                 env_extra: dict | None = None
-                                 ) -> list[dict]:
-    """Run each set in the prepared tree `wt`, one at a time: place its
-    files (never over a path the tree has — that makes the set
-    unmeasured), run them, confirm a failing file when `confirm`, and
-    remove the copies before the next set. The evaluation worktree and the
-    surrogate witness's tree both go through here (DESIGN §8).
+                                 confirm: bool = True) -> list[dict]:
+    """Run each set in the prepared tree `wt`, one at a time: its files are
+    placed in each run's sandbox (never over a path the tree has — that
+    makes the set unmeasured), never onto disk (DESIGN §6 *A held-out
+    evaluation runs alone*); run them and confirm a failing file when
+    `confirm`. Each set's runs see only that set's files. The evaluation
+    worktree and the surrogate witness's tree both go through here
+    (DESIGN §8).
 
     Confirming is asymmetric for held cases (DESIGN §8 *A held case that
     fails again is a failure, not a flake*): a file whose held case fails
@@ -50738,231 +50706,220 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
     failing and typed `intermittent_cases` — never unmeasured."""
     log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
     results: list[dict] = []
-    # The sets' files are in `wt` from here until each is removed: `/tmp`
-    # is the evaluation's alone meanwhile, and what it creates there goes
-    # with it (DESIGN §6 *A measurement may write `/tmp`; a held-out
-    # evaluation has it alone*).
-    async with _held_out_section(st):
-        for s_ in sets:
-            failing, copied, ran = [], [], []
-            resource_affected: list[str] = []
-            budget_short: list[str] = []
-            unsettled_files: list[str] = []
-            no_verdict_files: list[str] = []
-            unmeasured = False
-            # Why each file gave no verdict, and a whole-set cause: what the PR
-            # names for an unmeasured set (DESIGN §8 *A held-out set the final
-            # tree leaves unmeasured is never silent*).
-            why_files: dict[str, str] = {}
-            why_set: str | None = None
-            case_ids: dict[str, list[str]] = {}
-            # Every failing run of each file, the first and each vote rerun:
-            # its cases come from all of them (`_acceptance_vote_cases`).
-            runs: dict[str, list[dict]] = {}
-            no_case_evidence: list[str] = []
-            # Held cases seen failing per file (any signature), the files a held
-            # case failing with no resource signature settled as failing, and
-            # the cases of the run that settled each.
-            seen: dict[str, set[str]] = {}
-            asserted: set[str] = set()
-            asserted_ids: dict[str, list[str]] = {}
-            intermittent: dict[str, list[str]] = {}
-            discovery: dict | None = None
+    for s_ in sets:
+        failing, ran = [], []
+        placed: list[tuple[str, str]] = []
+        resource_affected: list[str] = []
+        budget_short: list[str] = []
+        unsettled_files: list[str] = []
+        no_verdict_files: list[str] = []
+        unmeasured = False
+        # Why each file gave no verdict, and a whole-set cause: what the PR
+        # names for an unmeasured set (DESIGN §8 *A held-out set the final
+        # tree leaves unmeasured is never silent*).
+        why_files: dict[str, str] = {}
+        why_set: str | None = None
+        case_ids: dict[str, list[str]] = {}
+        # Every failing run of each file, the first and each vote rerun:
+        # its cases come from all of them (`_acceptance_vote_cases`).
+        runs: dict[str, list[dict]] = {}
+        no_case_evidence: list[str] = []
+        # Held cases seen failing per file (any signature), the files a held
+        # case failing with no resource signature settled as failing, and
+        # the cases of the run that settled each.
+        seen: dict[str, set[str]] = {}
+        asserted: set[str] = set()
+        asserted_ids: dict[str, list[str]] = {}
+        intermittent: dict[str, list[str]] = {}
+        discovery: dict | None = None
 
-            def _note(rel: str, obs: dict, _s=s_, _seen=seen,
-                      _asserted=asserted, _ids=asserted_ids) -> bool:
-                hit, saw = _acceptance_held_signals(_s, rel, obs)
-                if saw:
-                    _seen.setdefault(rel, set()).update(saw)
-                if hit:
-                    _asserted.add(rel)
-                    _ids.setdefault(rel, list(obs.get("failing_cases") or []))
-                return bool(hit)
-            try:
-                for rel in ((s_.get("support_files") or [])
-                            + s_["defect_files"] + s_["control_files"]):
-                    dst = wt / rel
-                    if dst.exists():
-                        # Never overwrite (or run in its place) a file the
-                        # tree already has — and never count the set as
-                        # passing on a file it could not run.
-                        unmeasured = True
-                        why_files[rel] = "path_in_use"
-                        continue
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(Path(s_["dir"]) / rel, dst)
-                    copied.append(dst)
-                    if rel not in (s_.get("support_files") or []):
-                        ran.append(rel)
+        def _note(rel: str, obs: dict, _s=s_, _seen=seen,
+                  _asserted=asserted, _ids=asserted_ids) -> bool:
+            hit, saw = _acceptance_held_signals(_s, rel, obs)
+            if saw:
+                _seen.setdefault(rel, set()).update(saw)
+            if hit:
+                _asserted.add(rel)
+                _ids.setdefault(rel, list(obs.get("failing_cases") or []))
+            return bool(hit)
+        try:
+            for rel in ((s_.get("support_files") or [])
+                        + s_["defect_files"] + s_["control_files"]):
+                dst = wt / rel
+                if dst.exists() or dst.is_symlink():
+                    # Never placed over (or run in place of) a file the
+                    # tree already has — and never count the set as
+                    # passing on a file it could not run.
+                    unmeasured = True
+                    why_files[rel] = "path_in_use"
+                    continue
+                placed.append((str(Path(s_["dir"]) / rel), rel))
+                if rel not in (s_.get("support_files") or []):
+                    ran.append(rel)
+            place = tuple(placed)
+            for rel in ran:
+                obs: dict = {}
+                verdict = await _run_acceptance_file(
+                    st, caps, str(wt), rel, log_path,
+                    f"acceptance-{label}", cases_out=obs, place=place)
+                if verdict is None:
+                    unmeasured = True
+                    why_files[rel] = "no_runner_verdict"
+                elif verdict is False:
+                    failing.append(rel)
+                    runs.setdefault(rel, []).append(obs)
+                    _note(rel, obs)
+            vote = [r for r in failing if r not in asserted]
+            if vote and confirm:
+                n_rerun = {"i": 0}
+
+                async def _rerun(_left: float, _files=tuple(vote),
+                                 _n=n_rerun, _nt=_note, _runs=runs
+                                 ) -> set[str] | None:
+                    _n["i"] += 1
+                    still: set[str] = set()
+                    done: set[str] = set()
+                    # Every file of one rerun shares the budget left.
+                    end = time.monotonic() + _left
+                    for rel in _files:
+                        left = end - time.monotonic()
+                        if left <= 0:
+                            return _RerunCut(frozenset(still),
+                                             frozenset(done))
+                        o: dict = {}
+                        v = await _run_acceptance_file(
+                            st, _budget_caps(caps, left), str(wt), rel,
+                            log_path,
+                            f"acceptance-{label}-confirm{_n['i']}",
+                            cases_out=o, place=place)
+                        if v is None:
+                            return None
+                        if o.get("resource") and time.monotonic() >= end:
+                            # Cut short by the budget: not a run, and
+                            # never a pass (DESIGN §9 *Which failures are
+                            # new*, step 4).
+                            return _RerunCut(frozenset(still),
+                                             frozenset(done))
+                        done.add(rel)
+                        if v is False:
+                            still.add(rel)
+                            _runs.setdefault(rel, []).append(o)
+                            _nt(rel, o)
+                    return still
+                # Every file of the vote failed its first run — one whose
+                # first run timed out or died of a signal (a resource
+                # signature) only by that: it needs a finished rerun.
+                verdict_ = await _confirm_still_failing(
+                    vote, _rerun, caps, seen_failing=True,
+                    needs_rerun=[r for r in vote
+                                 if (runs.get(r) or [{}])[0].get("resource")],
+                    label=f"acceptance {label} set {s_['index']}")
+                budget_short = list(verdict_.get("budget_short") or [])
+                unsettled_files = list(
+                    verdict_.get("budget_short_unsettled") or [])
+                no_verdict_files = list(verdict_.get("no_verdict") or [])
+                # No verdict is no evidence either way, like mixed
+                # evidence: the set is unmeasured unless it also fails.
+                resource_affected = list(
+                    verdict_["resource_affected"]
+                    + (verdict_.get("no_verdict") or [])
+                    + unsettled_files)
+                failing = [r for r in failing
+                           if r in asserted or r in verdict_["confirmed"]]
+            if confirm:
+                pending = [r for r in ran if r not in failing
+                           and _acceptance_held_cases(s_, r)]
+                if pending:
+                    discovery = await _acceptance_discover(
+                        st, caps, wt, pending, log_path, label,
+                        place, _note, index=s_["index"])
+                    failing += [r for r in pending if r in asserted]
                 for rel in ran:
-                    obs: dict = {}
-                    verdict = await _run_acceptance_file(
-                        st, caps, str(wt), rel, log_path,
-                        f"acceptance-{label}", cases_out=obs,
-                        **_env_kw(env_extra))
-                    if verdict is None:
-                        unmeasured = True
-                        why_files[rel] = "no_runner_verdict"
-                    elif verdict is False:
+                    if rel not in failing and seen.get(rel):
+                        # Rule 3: a held case that failed is never
+                        # unmeasured, whatever its signature said.
+                        intermittent[rel] = sorted(seen[rel])
+                        case_ids[rel] = sorted(seen[rel])
                         failing.append(rel)
-                        runs.setdefault(rel, []).append(obs)
-                        _note(rel, obs)
-                vote = [r for r in failing if r not in asserted]
-                if vote and confirm:
-                    n_rerun = {"i": 0}
-
-                    async def _rerun(_left: float, _files=tuple(vote),
-                                     _n=n_rerun, _nt=_note, _runs=runs
-                                     ) -> set[str] | None:
-                        _n["i"] += 1
-                        still: set[str] = set()
-                        done: set[str] = set()
-                        # Every file of one rerun shares the budget left.
-                        end = time.monotonic() + _left
-                        for rel in _files:
-                            left = end - time.monotonic()
-                            if left <= 0:
-                                return _RerunCut(frozenset(still),
-                                                 frozenset(done))
-                            o: dict = {}
-                            v = await _run_acceptance_file(
-                                st, _budget_caps(caps, left), str(wt), rel,
-                                log_path,
-                                f"acceptance-{label}-confirm{_n['i']}",
-                                cases_out=o, **_env_kw(env_extra))
-                            if v is None:
-                                return None
-                            if o.get("resource") and time.monotonic() >= end:
-                                # Cut short by the budget: not a run, and
-                                # never a pass (DESIGN §9 *Which failures are
-                                # new*, step 4).
-                                return _RerunCut(frozenset(still),
-                                                 frozenset(done))
-                            done.add(rel)
-                            if v is False:
-                                still.add(rel)
-                                _runs.setdefault(rel, []).append(o)
-                                _nt(rel, o)
-                        return still
-                    # Every file of the vote failed its first run — one whose
-                    # first run timed out or died of a signal (a resource
-                    # signature) only by that: it needs a finished rerun.
-                    verdict_ = await _confirm_still_failing(
-                        vote, _rerun, caps, seen_failing=True,
-                        needs_rerun=[r for r in vote
-                                     if (runs.get(r) or [{}])[0].get("resource")],
-                        label=f"acceptance {label} set {s_['index']}")
-                    budget_short = list(verdict_.get("budget_short") or [])
-                    unsettled_files = list(
-                        verdict_.get("budget_short_unsettled") or [])
-                    no_verdict_files = list(verdict_.get("no_verdict") or [])
-                    # No verdict is no evidence either way, like mixed
-                    # evidence: the set is unmeasured unless it also fails.
-                    resource_affected = list(
-                        verdict_["resource_affected"]
-                        + (verdict_.get("no_verdict") or [])
-                        + unsettled_files)
-                    failing = [r for r in failing
-                               if r in asserted or r in verdict_["confirmed"]]
-                if confirm:
-                    pending = [r for r in ran if r not in failing
-                               and _acceptance_held_cases(s_, r)]
-                    if pending:
-                        discovery = await _acceptance_discover(
-                            st, caps, wt, pending, log_path, label,
-                            env_extra, _note, index=s_["index"])
-                        failing += [r for r in pending if r in asserted]
-                    for rel in ran:
-                        if rel not in failing and seen.get(rel):
-                            # Rule 3: a held case that failed is never
-                            # unmeasured, whatever its signature said.
-                            intermittent[rel] = sorted(seen[rel])
-                            case_ids[rel] = sorted(seen[rel])
-                            failing.append(rel)
-                    failing = [r for r in ran if r in failing]
-                    resource_affected = [r for r in resource_affected
-                                         if r not in failing]
-                    if resource_affected and not failing:
-                        unmeasured = True
-                for rel in failing:
-                    if rel in intermittent:
-                        continue
-                    if rel in asserted_ids:
-                        case_ids[rel] = asserted_ids[rel]
-                        continue
-                    got = _acceptance_vote_cases(runs.get(rel) or [])
-                    if got is None:
-                        no_case_evidence.append(rel)
-                    elif got:
-                        case_ids[rel] = got
-            except Exception as e:
-                # A copy that fails (a full disk) is no verdict on this set —
-                # and must not escape: a repair's rollback check runs after.
-                log(f"  acceptance: set {s_['index']} could not be placed "
-                    f"({type(e).__name__}) — no evidence from it")
-                unmeasured = True
-                why_set = "placement_failed"
-            finally:
-                # Sets are isolated from one another: one set's files are
-                # gone before the next set's go in.
-                for dst in copied:
-                    with contextlib.suppress(OSError):
-                        dst.unlink()
-            res_ = {"index": s_["index"],
-                    "passed": not failing and not unmeasured,
-                    "unmeasured": unmeasured and not failing,
-                    "failing_files": failing}
-            if resource_affected:
-                res_["resource_affected_files"] = resource_affected
-            if res_["unmeasured"]:
-                for rel in resource_affected:
-                    first = (runs.get(rel) or [{}])[0]
-                    why_files.setdefault(rel, (
-                        ("timed_out" if first.get("timed_out") else
-                         "killed" if first.get("killed") else
-                         "resource_first_run") if rel in unsettled_files
-                        else "no_verdict" if rel in no_verdict_files
-                        else "resource_affected"))
-                if why_set:
-                    res_["unmeasured_reason"] = why_set
-                if why_files:
-                    res_["unmeasured_files"] = {r: why_files[r] for r in sorted(
-                        why_files)}
-            if any(r in failing for r in budget_short):
-                # Failing on the reruns the budget allowed: said so, never
-                # dropped (DESIGN §8 *Held-out acceptance tests*).
-                res_["budget_short_files"] = [r for r in failing
-                                              if r in budget_short]
-            if any(r not in failing for r in unsettled_files):
-                # Seen failing only as a timeout, every rerun cut: unsettled,
-                # neither failing nor passing.
-                res_["budget_short_unsettled_files"] = [
-                    r for r in unsettled_files if r not in failing]
-            if no_case_evidence:
-                # Failing, but no run gave case evidence: never read as a
-                # whole-file collapse (DESIGN §8 *Delivery re-drive* rule 4).
-                res_["no_case_evidence_files"] = no_case_evidence
-            # Per-case verdict where the runner's report gave one, for every
-            # confirmed failing file; a file without one counts as a whole.
-            if any(rel in case_ids for rel in failing):
-                res_["failing_cases"] = {rel: case_ids[rel] for rel in failing
-                                         if rel in case_ids}
-            if intermittent:
-                res_["intermittent_cases"] = intermittent
-                log(f"  acceptance {label} set {s_['index']}: held case(s) "
-                    "failed only with resource signatures — typed intermittent, "
-                    "a failing set (never unmeasured)")
-            if discovery is not None:
-                # Found or not: a set whose held cases were never rerun must not
-                # read like one rerun clean (DESIGN §8 *A held case that fails
-                # again*, rule 2).
-                res_["discovery"] = discovery
-                if discovery.get("incomplete"):
-                    log(f"  acceptance {label} set {s_['index']}: "
-                        f"discovery_incomplete — {discovery['repeats_run']} of "
-                        f"{discovery['repeats_required']} rerun round(s) "
-                        f"({discovery.get('reason') or 'unknown'})")
-            results.append(res_)
+                failing = [r for r in ran if r in failing]
+                resource_affected = [r for r in resource_affected
+                                     if r not in failing]
+                if resource_affected and not failing:
+                    unmeasured = True
+            for rel in failing:
+                if rel in intermittent:
+                    continue
+                if rel in asserted_ids:
+                    case_ids[rel] = asserted_ids[rel]
+                    continue
+                got = _acceptance_vote_cases(runs.get(rel) or [])
+                if got is None:
+                    no_case_evidence.append(rel)
+                elif got:
+                    case_ids[rel] = got
+        except Exception as e:
+            # A run that fails to start (a full disk) is no verdict on
+            # this set — and must not escape: a repair's rollback check
+            # runs after.
+            log(f"  acceptance: set {s_['index']} could not be placed "
+                f"({type(e).__name__}) — no evidence from it")
+            unmeasured = True
+            why_set = "placement_failed"
+        res_ = {"index": s_["index"],
+                "passed": not failing and not unmeasured,
+                "unmeasured": unmeasured and not failing,
+                "failing_files": failing}
+        if resource_affected:
+            res_["resource_affected_files"] = resource_affected
+        if res_["unmeasured"]:
+            for rel in resource_affected:
+                first = (runs.get(rel) or [{}])[0]
+                why_files.setdefault(rel, (
+                    ("timed_out" if first.get("timed_out") else
+                     "killed" if first.get("killed") else
+                     "resource_first_run") if rel in unsettled_files
+                    else "no_verdict" if rel in no_verdict_files
+                    else "resource_affected"))
+            if why_set:
+                res_["unmeasured_reason"] = why_set
+            if why_files:
+                res_["unmeasured_files"] = {r: why_files[r] for r in sorted(
+                    why_files)}
+        if any(r in failing for r in budget_short):
+            # Failing on the reruns the budget allowed: said so, never
+            # dropped (DESIGN §8 *Held-out acceptance tests*).
+            res_["budget_short_files"] = [r for r in failing
+                                          if r in budget_short]
+        if any(r not in failing for r in unsettled_files):
+            # Seen failing only as a timeout, every rerun cut: unsettled,
+            # neither failing nor passing.
+            res_["budget_short_unsettled_files"] = [
+                r for r in unsettled_files if r not in failing]
+        if no_case_evidence:
+            # Failing, but no run gave case evidence: never read as a
+            # whole-file collapse (DESIGN §8 *Delivery re-drive* rule 4).
+            res_["no_case_evidence_files"] = no_case_evidence
+        # Per-case verdict where the runner's report gave one, for every
+        # confirmed failing file; a file without one counts as a whole.
+        if any(rel in case_ids for rel in failing):
+            res_["failing_cases"] = {rel: case_ids[rel] for rel in failing
+                                     if rel in case_ids}
+        if intermittent:
+            res_["intermittent_cases"] = intermittent
+            log(f"  acceptance {label} set {s_['index']}: held case(s) "
+                "failed only with resource signatures — typed intermittent, "
+                "a failing set (never unmeasured)")
+        if discovery is not None:
+            # Found or not: a set whose held cases were never rerun must not
+            # read like one rerun clean (DESIGN §8 *A held case that fails
+            # again*, rule 2).
+            res_["discovery"] = discovery
+            if discovery.get("incomplete"):
+                log(f"  acceptance {label} set {s_['index']}: "
+                    f"discovery_incomplete — {discovery['repeats_run']} of "
+                    f"{discovery['repeats_required']} rerun round(s) "
+                    f"({discovery.get('reason') or 'unknown'})")
+        results.append(res_)
     return results
 
 
@@ -51057,7 +51014,7 @@ _ACCEPTANCE_INTERMITTENT_MAX = 10
 
 async def _acceptance_discover(st: "State", caps: dict, wt: Path,
                                rels: list[str], log_path: Path, label: str,
-                               env_extra: dict | None,
+                               place: tuple[tuple[str, str], ...] | None,
                                note: Callable[[str, dict], bool], *,
                                index: object = None,
                                clock: Callable[[], float] | None = None
@@ -51074,7 +51031,8 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
     after fewer than the required rounds (`reason: budget_exhausted`) — so
     a set never rerun is never read as one rerun clean; `disabled` (and
     `reason: disabled`, never incomplete) when the operator set the repeats
-    to 0 (DESIGN §8 *A held case that fails again*, rule 2)."""
+    to 0 (DESIGN §8 *A held case that fails again*, rule 2). `place`: the
+    set's files, placed in each rerun's sandbox (`_run_acceptance_file`)."""
     reps = max(0, min(int(caps.get(
         "acceptance_intermittent_repeats",
         DEFAULT_CAPS["acceptance_intermittent_repeats"])),
@@ -51109,7 +51067,7 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
                 v = await _run_acceptance_file(
                     st, _budget_caps(caps, left), str(wt), rel, log_path,
                     f"acceptance-{label}-discover{i + 1}", cases_out=obs,
-                    **_env_kw(env_extra))
+                    place=tuple(place or ()))
                 if obs.get("resource") and budget - (clock() - t0) <= 0:
                     # The budget, not the run, ended it: no evidence, and
                     # the round is not one run.
@@ -51244,11 +51202,6 @@ def _budget_caps(caps: dict, left: float) -> dict:
     # Callers pass `left > 0`; a non-positive budget is never run.
     return {**caps, "worker_timeout_sec": min(cap, left)}
 
-
-def _env_kw(env_extra: dict | None) -> dict:
-    """`env_extra` as a keyword only when set, so an environment-free call
-    keeps the exact signature it always had."""
-    return {"env_extra": env_extra} if env_extra else {}
 
 def _acceptance_measured(results: list[dict]) -> list[dict]:
     """Sets that produced a verdict: one whose files could not all be run
@@ -51803,11 +51756,13 @@ def _unplace(copied: Iterable[Path]) -> None:
 
 
 async def _acceptance_case_failures(st: "State", caps: dict, wt: Path,
-                                    set_: dict, log_path: Path, label: str,
-                                    env_extra: dict | None
+                                    set_: dict, log_path: Path, label: str
                                     ) -> list[dict]:
-    """Every failing case of a placed set on `wt`, from the runner's report:
-    `{case, file, kind, failure_message}` (the message capped)."""
+    """Every failing case of a set on `wt`, from the runner's report:
+    `{case, file, kind, failure_message}` (the message capped). The set's
+    files are placed in each run's sandbox, never onto disk."""
+    place = tuple((str(Path(set_["dir"]) / rel), rel)
+                  for rel in _set_files(set_))
     out: list[dict] = []
     for kind, files in (("defect", set_.get("defect_files") or []),
                         ("control", set_.get("control_files") or [])):
@@ -51816,7 +51771,7 @@ async def _acceptance_case_failures(st: "State", caps: dict, wt: Path,
             verdict = await _run_acceptance_file(
                 st, caps, str(wt), rel, log_path, label, validating=True,
                 failure_mode=(set_.get("modes") or {}).get(rel, "assertion"),
-                observed=observed, **_env_kw(env_extra))
+                observed=observed, place=place)
             if verdict is not False:
                 continue
             msgs = observed.get("failure_messages") or {}
@@ -51833,8 +51788,7 @@ async def _acceptance_case_failures(st: "State", caps: dict, wt: Path,
 async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
                                efforts: dict, wt: Path, set_: dict, *,
                                label: str, harness_rev: str,
-                               tree_note: str,
-                               env_extra: dict | None) -> dict:
+                               tree_note: str) -> dict:
     """The c+ set audit of one set in a prepared tree `wt` (DESIGN §8):
     place the set, read its failing cases from the runner's report, then
     `set_audit_samples` independent `set_auditor` samples, each told the
@@ -51846,18 +51800,22 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
     out: dict = {"failing_cases": [], "findings": [], "kinds": [],
                  "sample_kinds": [], "samples": 0}
     log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
-    copied, complete = _place_set(set_, wt)
+    if any((wt / rel).exists() or (wt / rel).is_symlink()
+           for rel in _set_files(set_)):
+        out["skipped"] = "a set path already exists in the audited tree"
+        return out
+    # The set's runs place it in their sandboxes; only then is it staged on
+    # disk, for the auditor, which reads it — a held-out-side worker in a
+    # tree no worker commits from.
+    failing = await _acceptance_case_failures(
+        st, caps, wt, set_, log_path, f"acceptance-{label}")
+    out["failing_cases"] = [{k: c[k] for k in ("case", "file", "kind")}
+                            for c in failing]
+    if not failing:
+        return out
+    copied, _complete = _place_set(set_, wt)
     refs_copied: list[Path] = []
     try:
-        if not complete:
-            out["skipped"] = "a set path already exists in the audited tree"
-            return out
-        failing = await _acceptance_case_failures(
-            st, caps, wt, set_, log_path, f"acceptance-{label}", env_extra)
-        out["failing_cases"] = [{k: c[k] for k in ("case", "file", "kind")}
-                                for c in failing]
-        if not failing:
-            return out
         task = st.data.get("task") or ""
         refs = []
         for f in _glob_task_references(task, st.repo_root):
@@ -51961,10 +51919,11 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
 @contextlib.asynccontextmanager
 async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
                            label: str
-                           ) -> AsyncIterator[tuple[Path, dict | None] | None]:
+                           ) -> AsyncIterator[Path | None]:
     """A disposable worktree of `rev` under the run dir with dependencies
-    installed and, in a Prisma repo, its own throwaway database: yields
-    `(wt, env_extra)` or None when it cannot be set up (no evidence)."""
+    installed: yields `wt` or None when it cannot be set up (no evidence).
+    Each command run there that needs a database has its own
+    (`_test_db_argv`)."""
     wt = _helper_worktree_path(st, name)
     log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
 
@@ -51974,7 +51933,6 @@ async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
         _rmtree_owned(wt)
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
     _teardown()
-    url = None
     try:
         add = await _worktree_add_detached_async(st, wt, rev)
         if add.returncode != 0 or not await _ensure_worktree_deps(
@@ -51983,10 +51941,8 @@ async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
                 label_prefix=f"acceptance-{label}", log_prefix="acceptance"):
             yield None
             return
-        url = await _create_test_db(st, wt, name)
-        yield wt, (_test_db_env(url) if url else None)
+        yield wt
     finally:
-        _drop_test_db(url)
         _teardown()
 
 
@@ -51996,17 +51952,15 @@ async def _acceptance_audit_on_rev(st: "State", caps: dict, models: dict,
     """`_acceptance_audit_in` on a fresh worktree of `rev` (the integrated
     tree): none of the set lands in staging."""
     async with _acceptance_tree(st, caps, rev, "acceptance-audit",
-                                label) as tree:
-        if tree is None:
+                                label) as wt:
+        if wt is None:
             return {"failing_cases": [], "findings": [], "kinds": [],
                     "sample_kinds": [], "samples": 0,
                     "skipped": "audit tree not set up"}
-        wt, env = tree
         return await _acceptance_audit_in(
             st, caps, models, efforts, wt, set_, label=label,
             harness_rev=rev,
-            tree_note="after the run's implementation and repair rounds",
-            env_extra=env)
+            tree_note="after the run's implementation and repair rounds")
 
 
 async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
@@ -52015,15 +51969,14 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
     ref-less clone like the writer's, the report copied in, a full fix of
     the report's contract left uncommitted in the tree. It never sees a set
     (its `Read` denies cover them). `{dir, env}` or None when it could not
-    run or changed nothing — then it witnesses nothing."""
+    run or changed nothing — then it witnesses nothing. In a Prisma/PostgreSQL
+    repo its session has a database of its own (`claude_p(db=True)`)."""
     wt = _helper_worktree_path(st, "acceptance-surrogate")
     log_path = st.run_dir / "logs" / "acceptance-surrogate.log"
     _remove_acceptance_checkout(st, wt)
     if (await asyncio.to_thread(_acceptance_writer_checkout, st, wt, own)
             ).startswith("failed"):
         return None
-    # The surrogate fixer writes here: nothing leerie runs here reads `/tmp`.
-    _declare_worker_tree(wt)
     task = st.data.get("task") or ""
     copied: list[Path] = []
     refs = []
@@ -52039,10 +51992,7 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
             str(wt), st, caps, log_path=log_path,
             verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
             label_prefix="acceptance-surrogate", log_prefix="acceptance"):
-        return {"dir": wt, "env": None, "abstained": "dependency install "
-                "failed"}
-    url = await _create_test_db(st, wt, "acceptance-surrogate")
-    env = _test_db_env(url) if url else None
+        return {"dir": wt, "abstained": "dependency install failed"}
     scope = st.data.get("defect_scope") or {}
     gt = scope.get("ground_truth") or {}
     user = "\n".join([
@@ -52057,7 +52007,6 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
         "Fix the report per your rules and return the JSON object per your "
         "schema."])
     st.bump_workers(caps)
-    kw = {"env_extra": env} if env else {}
     try:
         await claude_p(
             user_prompt=user, system_prompt=_load_prompt("surrogate_fixer"),
@@ -52066,10 +52015,9 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
             caps=caps, st=st,
             model=models.get("surrogate_fixer", MODEL_DEFAULT),
             effort=efforts.get("surrogate_fixer"),
-            sid="acceptance-surrogate", **kw)
+            sid="acceptance-surrogate", db=True)
     except (WorkerError, subprocess.TimeoutExpired) as e:
-        return {"dir": wt, "env": env, "url": url,
-                "abstained": _brief_worker_exc(e)}
+        return {"dir": wt, "abstained": _brief_worker_exc(e)}
     # Only the report copies made above go; never a tracked file.
     _unplace(copied)
     changed = subprocess.run(["git", *_tree_git_args(wt), "status",
@@ -52078,9 +52026,8 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
     made = _untracked_listing(wt)
     if (changed.returncode != 0 or made is None
             or not (changed.stdout.strip() or made)):
-        return {"dir": wt, "env": env, "url": url,
-                "abstained": "the independent fix changed nothing"}
-    return {"dir": wt, "env": env, "url": url}
+        return {"dir": wt, "abstained": "the independent fix changed nothing"}
+    return {"dir": wt}
 
 
 async def _acceptance_rewrite_set(k: int, task: str, st: "State", caps: dict,
@@ -52208,15 +52155,13 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
                 if sur.get("dir") and not sur.get("abstained"):
                     witness = await _acceptance_run_placed(
                         st, caps, Path(sur["dir"]), [s_],
-                        f"surrogate-{idx}", confirm=True,
-                        env_extra=sur.get("env"))
+                        f"surrogate-{idx}", confirm=True)
                     if witness and witness[0]["failing_files"]:
                         sur_audit = await _acceptance_audit_in(
                             st, caps, models, efforts, Path(sur["dir"]), s_,
                             label=f"surrogate-audit-{idx}", harness_rev=own,
                             tree_note="an independent fix of the report, "
-                            "made without seeing this set",
-                            env_extra=sur.get("env"))
+                            "made without seeing this set")
                         triggers.append({
                             "kind": "surrogate_witness",
                             "failing_on_an_independent_fix": [
@@ -52277,7 +52222,6 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
             _save()
     finally:
         if sur.get("dir"):
-            _drop_test_db(sur.get("url"))
             _remove_acceptance_checkout(st, Path(sur["dir"]))
     return [results.get(r["index"], r) for r in final]
 
@@ -52287,11 +52231,9 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
     """Post-integration held-out acceptance gate (DESIGN §8 *Held-out
     acceptance tests*): at most two high-effort repair rounds, non-blocking,
     with a mechanical rollback if the repair turns the test axis red; then
-    the set audit and one rewrite of a set still failing. One throwaway
-    test-database session spans it (Prisma repos only)."""
-    async with _test_db_session(st):
-        await _run_acceptance_gate_inner(leerie_dir, st, caps, models,
-                                         efforts)
+    the set audit and one rewrite of a set still failing. Each command that
+    needs a database has its own (`_test_db_argv`)."""
+    await _run_acceptance_gate_inner(leerie_dir, st, caps, models, efforts)
 
 
 async def _acceptance_remeasure_final(st: "State", caps: dict, staging: str,
@@ -54561,8 +54503,15 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
                    text: bool = False) -> subprocess.CompletedProcess:
     """A node run of an AST script in `tree`, confined to `grants`: it loads
     the tree's own `typescript` first, which is the tree's code (DESIGN §6
-    *Leerie's runs of the repository's commands are confined too*). No
-    `/tmp` beyond its private temp directory: it holds no `/tmp` lock."""
+    *Leerie's runs of the repository's commands are confined too*).
+    Synchronous, so it cannot wait for the execution lock: its caller holds
+    it shared, and a call without it stops the run (DESIGN §6 *A held-out
+    evaluation runs alone*, the time half)."""
+    if not _exec_lock_held():
+        die("invariant: an AST script was about to run on a tree's code "
+            "without the execution lock — it could run beside a held-out "
+            "evaluation (DESIGN §6 *A held-out evaluation runs alone, in a "
+            "world that dies with it (I3)*). Report this.")
     outside = _argv_outside_grant(argv, grants)
     if outside is not None:
         die(f"leerie was about to hand {outside} to a confined AST script "
@@ -54949,14 +54898,14 @@ def _falsifier_user_prompt(task: str, item: dict, own: str | None,
 async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                            lane: Path, confirm_tree: Path, sha: str,
                            item_text: str, acc_paths: set[str],
-                           label: str,
-                           env_extra: dict[str, str] | None = None) -> dict:
+                           label: str) -> dict:
     """Code decides whether a sample demonstrated anything (bench Q2 F+
     G1–G5): `{gates{...}, confirmed, case_id?, coupling?}`. The probe is
     copied into the pristine installed checkout of the final commit, run
     there with the runner's serial flags, confirmed under B*
     (`_confirm_still_failing`), read by the AST facts script, and removed.
-    `env_extra` is the confirm checkout's test database, when it has one."""
+    In a Prisma/PostgreSQL repo each run has a database of its own
+    (`_capture_failing_test_ids(db=True)`)."""
     g: dict = {}
     out: dict = {"gates": g, "confirmed": False}
     if res.get("verdict") != "unmet_demonstrated":
@@ -55000,7 +54949,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
             got = await _capture_failing_test_ids(
                 str(confirm_tree), cmd, st, caps, label=f"falsifier-{label}",
                 log_path=log_path, timeout=min(left, timeout), serial=True,
-                files=[rel], env_extra=env_extra)
+                files=[rel], db=True)
             return set(got["ids"]) if got is not None else None
         first = await _run(timeout)
         cid = _falsifier_case_id(first or (), str(res.get("case_name") or ""))
@@ -55015,9 +54964,13 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         if not g["fails_under_bstar"]:
             return out
         title = cid.split(" :: ", 1)[1] if " :: " in cid else cid
-        facts = await asyncio.to_thread(
-            functools.partial(_probe_case_facts, confirm_tree, dst, title,
-                              grants=_measurement_grants(st, confirm_tree)))
+        # The AST script loads the tree's own `typescript`: a confined
+        # command, under the execution lock (`_ts_script_run`).
+        async with _exec_lock().shared():
+            facts = await asyncio.to_thread(
+                functools.partial(_probe_case_facts, confirm_tree, dst, title,
+                                  grants=_measurement_grants(st,
+                                                             confirm_tree)))
         err = str(facts.get("error") or "")
         g["facts_read"] = not err.startswith("facts_failed")
         if not g["facts_read"]:
@@ -55102,7 +55055,6 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
     log_path = st.run_dir / "logs" / "falsifier-setup.log"
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     trees: list[Path] = []
-    confirm_db: str | None = None
     confirm_tree = await asyncio.to_thread(
         _falsifier_checkout, st, "falsifier-confirm", sha)
     try:
@@ -55115,18 +55067,15 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                 verbosity=verbosity, label_prefix="falsifier-confirm",
                 log_prefix="delivery detection"):
             return {"enabled": False, "skipped": "dependency install failed"}
-        if not _ts_resolvable(confirm_tree,
-                              grants=_measurement_grants(st, confirm_tree)):
+        async with _exec_lock().shared():
+            ts_ok = _ts_resolvable(
+                confirm_tree, grants=_measurement_grants(st, confirm_tree))
+        if not ts_ok:
             # The AST coupling check is JS/TS-only, as benched: without it
             # no sample could ever be confirmed, so none is spawned.
             return {"enabled": False, "skipped": "AST coupling check "
                     "unavailable (no typescript compiler API from the tree "
                     "or the bundled copy)"}
-        # A Prisma repo's probe re-runs against a database of its own
-        # (DESIGN §8 *Prisma repositories get a real database*); None
-        # elsewhere, or without a cluster.
-        confirm_db = await _create_test_db(st, confirm_tree,
-                                           "falsifier-confirm")
         sets = [s_ for s_ in ((st.data.get("acceptance") or {}).get("sets")
                               or []) if isinstance(s_, dict)]
         acc_paths = {rel for s_ in sets
@@ -55142,8 +55091,6 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                 _falsifier_checkout, st, f"falsifier-lane{n}", sha)
             if lane is None:
                 continue
-            # A falsifier writes here: nothing leerie runs here reads `/tmp`.
-            _declare_worker_tree(lane)
             trees.append(lane)
             if not await _ensure_worktree_deps(
                     str(lane), st, caps, log_path=log_path,
@@ -55164,21 +55111,16 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
 
         async def _sample(i: int, n: int, lane: Path) -> dict:
             item = normalized[i]
-            # Back to the pristine final commit between samples.
+            # Back to the pristine final commit between samples. Each
+            # sample's worker has a database of its own (`claude_p(db=True)`
+            # in a Prisma/PostgreSQL repo), gone with its process, so one
+            # sample's rows never reach the next.
             await _restore_tree(lane, sha, where="falsifier checkout reset",
                                 branch=None)
-            # Reset with the tree: a fresh database per sample, so one
-            # sample's rows never reach the next.
-            db_url = await _create_test_db(st, lane, "falsifier-lane")
-            try:
-                return await _sample_in(i, n, lane, item,
-                                        _test_db_env(db_url) if db_url
-                                        else None)
-            finally:
-                _drop_test_db(db_url)
+            return await _sample_in(i, n, lane, item)
 
-        async def _sample_in(i: int, n: int, lane: Path, item: dict,
-                             env: dict[str, str] | None) -> dict:
+        async def _sample_in(i: int, n: int, lane: Path,
+                             item: dict) -> dict:
             ctx, refs = _falsifier_place_leads(st, lane, sets, task)
             user = _falsifier_user_prompt(task, item, own, stat, ctx, refs,
                                           parts_by_idx.get(i) or [])
@@ -55189,7 +55131,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                           max_turns=FALSIFIER_MAX_TURNS, autonomous=True,
                           caps=caps, st=st,
                           model=models.get("falsifier", MODEL_DEFAULT),
-                          effort=efforts.get("falsifier"), **_env_kw(env))
+                          effort=efforts.get("falsifier"), db=True)
             st.bump_workers(caps)
             res = await claude_p(user_prompt=user, sid=sid, **common)
             rec: dict = {"sample": n, "reasked": False}
@@ -55213,9 +55155,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                 rec.update(await _falsifier_gates(
                     st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
                     sha=sha, item_text=item.get("item", ""),
-                    acc_paths=acc_paths, label=f"i{i}-s{n}",
-                    env_extra=(_test_db_env(confirm_db) if confirm_db
-                               else None)))
+                    acc_paths=acc_paths, label=f"i{i}-s{n}"))
             if rec.get("confirmed"):
                 saved = _falsifier_save_probe(st, lane, i, res)
                 if saved:
@@ -55257,7 +55197,6 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         await _gather_or_cancel(*[_item(i) for i in todo])
         return {"enabled": True, "lanes": n_lanes}
     finally:
-        _drop_test_db(confirm_db)
         for wt in trees:
             leads = wt / FALSIFIER_LEADS_DIR
             if leads.exists():
@@ -55383,13 +55322,12 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
              and not (isinstance(it.get("untouched_paths"), list)
                       and it["untouched_paths"])]
     try:
-        async with _test_db_session(st):
-            fmeta = await _falsify_items(
-                st, caps, models, efforts, sha=sha, normalized=normalized,
-                indices=f_idx,
-                parts_by_idx={i: (details_by_idx.get(i) or {}).get(
-                    "unmet_parts") or [] for i in f_idx},
-                progress=progress)
+        fmeta = await _falsify_items(
+            st, caps, models, efforts, sha=sha, normalized=normalized,
+            indices=f_idx,
+            parts_by_idx={i: (details_by_idx.get(i) or {}).get(
+                "unmet_parts") or [] for i in f_idx},
+            progress=progress)
     except Exception as e:
         # Advisory: a broken falsifier setup leaves the judge's verdict.
         log(f"  delivery detection: falsifier raised {type(e).__name__}: "
@@ -55897,15 +55835,16 @@ _SELFCHECK_CALLS_MAX = 50
 
 
 def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
-                       shown: list[dict], label: str,
-                       db_url: str | None) -> dict:
+                       shown: list[dict], label: str) -> dict:
     """The delivery re-drive's out-of-tree self-check for one group (DESIGN
     §8 *A held-out set never enters a tree a worker commits from*):
     `<run>/selfcheck/<label>/` holding a read-only copy of the shown sets
     (`sets/set-<index>/<rel>`, the source the note points at, outside the
     read-denied `acceptance/`), the call's `config.json` and
     `bin/leerie-selfcheck`. Returns `{dir, bin, command, src, run_files,
-    name_flag}`. Nothing is written to `staging`."""
+    name_flag}`. Nothing is written to `staging`. It runs inside the
+    implementer's own process tree, so a database the implementer has
+    (`claude_p(db=True)`) is the self-check's through its environment."""
     root = st.run_dir / "selfcheck" / label
     _rmtree_owned(root)
     sets: list[dict] = []
@@ -55930,7 +55869,7 @@ def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
     cfg = {"tree": str(staging), "repo_root": str(st.repo_root),
            "sets": sets, "run_files": run_files,
            "snap_root": str(root / "run"),
-           "env": _test_db_env(db_url) if db_url else {},
+           "env": {},
            "forbidden": _forbidden_specs(getattr(st, "data", None)),
            "timeout": float(caps.get("worker_timeout_sec",
                                      DEFAULT_CAPS["worker_timeout_sec"])),
@@ -57604,12 +57543,14 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
 async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
                          models: dict, staging: Path, members: list[str],
                          note: str, *, effort: str | None,
-                         label: str, bin_dir: str | None = None) -> dict:
+                         label: str, bin_dir: str | None = None,
+                         db: bool = False) -> dict:
     """One implementer session in staging for the group, as its first
     member, with the note; `bin_dir` (the self-check's, DESIGN §8 *A
     held-out set never enters a tree a worker commits from*) goes first on
-    its `PATH`. A failure is recorded, never raised: what the worker
-    committed is measured all the same."""
+    its `PATH`; with `db`, its session has a database of its own, which its
+    self-check uses (`claude_p(db=True)`). A failure is recorded, never
+    raised: what the worker committed is measured all the same."""
     up = _implementer_base_prompt(
         members[0], leerie_dir, caps, st,
         cwd_line="Your current working directory IS the integrated staging "
@@ -57625,7 +57566,7 @@ async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
             allowed_tools=ACT_TOOLS, max_turns=120, autonomous=True,
             caps=caps, st=st,
             model=models.get("implementer", MODEL_DEFAULT),
-            effort=effort, sid=label, notes_id=members[0],
+            effort=effort, sid=label, notes_id=members[0], db=db,
             **({"env_extra": {"PATH": bin_dir + os.pathsep
                               + os.environ.get("PATH", "")},
                 "selfcheck_dir": str(Path(bin_dir).parent)}
@@ -58142,8 +58083,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                             DEFAULT_CAPS["redrive_budget_sec"]))
     graph = _js_source_graph(_run_repo(st), head) if sets else {}
     shape = (st.data.get("defect_scope") or {}).get("defect_shape") or ""
-    ast_ok = _redrive_ast_available(
-        staging, grants=_measurement_grants(st, staging))
+    async with _exec_lock().shared():
+        ast_ok = _redrive_ast_available(
+            staging, grants=_measurement_grants(st, staging))
     trade_pairs = {tuple(p) for p in rec["trade_pairs"]}
     prior_members: list[str] = []
     ids_before = await _redrive_test_ids(st, caps, staging, "redrive-ids0")
@@ -58256,41 +58198,36 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             label = f"delivery-redrive-r{rnd}-g{gi}"
             effort = (EFFORT_REDRIVE_ESCALATION if escalate
                       else efforts.get("implementer"))
-            async with _test_db_session(st):
-                db_url = (await _create_test_db(st, staging,
-                                                f"redrive-r{rnd}g{gi}")
-                          if shown else None)
-                try:
-                    if shown:
-                        sc = _selfcheck_prepare(st, caps, staging, shown,
-                                                label, db_url)
-                    merged = [{"id": m,
-                               "title": (specs.get(m) or {}).get("title"),
-                               "intent": (specs.get(m) or {}).get("intent")}
-                              for m in members[1:]]
-                    held_names = ([{"name": c, "kind": n["kind"][5:]}
-                                   for n in live
-                                   if n["kind"].startswith("held_")
-                                   for c in (n.get("cases")
-                                             or [])[:_REDRIVE_CASES_MAX]]
-                                  if held_mode else [])
-                    note = _redrive_note(
-                        [n for n in gnotes
-                         if not n["kind"].startswith("held_")],
-                        rnd=rnd, rounds=cap, merged=merged,
-                        held_names=held_names, defect_shape=shape,
-                        selfcheck=sc if sc and sc.get("command") else None)
-                    ge["implementer"] = await _redrive_drive(
-                        leerie_dir, st, caps, models, staging, members,
-                        note, effort=effort, label=label,
-                        bin_dir=sc["bin"] if sc else None)
-                finally:
-                    if sc:
-                        calls = _selfcheck_calls(sc)
-                        if calls:
-                            ge["selfcheck_calls"] = calls
-                    _selfcheck_cleanup(sc)
-                    _drop_test_db(db_url)
+            try:
+                if shown:
+                    sc = _selfcheck_prepare(st, caps, staging, shown,
+                                            label)
+                merged = [{"id": m,
+                           "title": (specs.get(m) or {}).get("title"),
+                           "intent": (specs.get(m) or {}).get("intent")}
+                          for m in members[1:]]
+                held_names = ([{"name": c, "kind": n["kind"][5:]}
+                               for n in live
+                               if n["kind"].startswith("held_")
+                               for c in (n.get("cases")
+                                         or [])[:_REDRIVE_CASES_MAX]]
+                              if held_mode else [])
+                note = _redrive_note(
+                    [n for n in gnotes
+                     if not n["kind"].startswith("held_")],
+                    rnd=rnd, rounds=cap, merged=merged,
+                    held_names=held_names, defect_shape=shape,
+                    selfcheck=sc if sc and sc.get("command") else None)
+                ge["implementer"] = await _redrive_drive(
+                    leerie_dir, st, caps, models, staging, members,
+                    note, effort=effort, label=label,
+                    bin_dir=sc["bin"] if sc else None, db=bool(shown))
+            finally:
+                if sc:
+                    calls = _selfcheck_calls(sc)
+                    if calls:
+                        ge["selfcheck_calls"] = calls
+                _selfcheck_cleanup(sc)
             # I1 (DESIGN §8 *A worker leaves its tree clean*): nothing of
             # leerie's is in staging (its self-check runs outside it), so
             # this sees exactly what the implementer left. Still dirty after
@@ -58406,9 +58343,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     and not v["held_fixed_cases"])
                 void = void or ge["zero_progress"]
                 if escalate:
-                    eg = _redrive_escalation_gate(
-                        staging, pre_sha, post_sha,
-                        grants=_measurement_grants(st, staging))
+                    async with _exec_lock().shared():
+                        eg = _redrive_escalation_gate(
+                            staging, pre_sha, post_sha,
+                            grants=_measurement_grants(st, staging))
                     ge["gate"] = eg
                     void = void or eg["void"]
                 rat: dict = {}

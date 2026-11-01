@@ -256,12 +256,6 @@ ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
 ENV XDG_CACHE_HOME=/tmp/.cache
 ENV MISE_STATE_DIR=/tmp/.mise-state
 
-# This container's /tmp is its one run's alone (one run per container): the
-# orchestrator may remove by path what a held-out evaluation created there
-# (DESIGN §6 *A measurement may write `/tmp`; a held-out evaluation has it
-# alone*). Unset on a host, whose /tmp other programs share.
-ENV LEERIE_PRIVATE_TMP=1
-
 # Pre-install LTS Node + Python via `mise install --system`. Lands
 # binaries under /usr/local/share/mise/installs/<tool>/<version>.
 # At runtime mise's resolver falls through to these from the user

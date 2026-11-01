@@ -45,12 +45,6 @@ jobs:
 # Green only against the database this run handed it: the check stands for
 # a database-backed CI step (DESIGN §8 *Prisma repositories get a real
 # database*).
-DBCHECK = (
-    "import os, sys\n"
-    "sys.exit(0 if os.environ.get('DATABASE_URL', '').endswith('_test')"
-    " and os.environ.get('DIRECT_URL') == os.environ['DATABASE_URL']"
-    " else 1)\n")
-
 # A toy linter with fixed output: an error line per `ERROR` marker (exit 1),
 # and, under --strict, a warning line per `WARN` marker (exit 1 when any).
 LINT = r'''
@@ -458,25 +452,32 @@ def test_ci_checks_is_a_registered_judgment_worker(leerie):
         "prompts", "ci_checks.md").is_file()
 
 
-# ---- database-backed checks run against the throwaway test database --------
+# ---- database-backed checks each get a throwaway database of their own ------
+# (DESIGN §6 *No database server leerie starts is ever unconfined*: the
+# wrapper, `scripts/sandbox-db.sh`, runs as the check itself; here it is
+# stood in for by an `env` prefix exporting the URL it would compose.)
+
+DBCHECK = (
+    "import os, sys\n"
+    "sys.exit(0 if os.environ.get('DATABASE_URL', '').endswith('_test')"
+    " and os.environ.get('DIRECT_URL') == os.environ['DATABASE_URL']"
+    " else 1)\n")
+
 
 def _fake_test_db(leerie, monkeypatch):
     made: list[tuple[str, str]] = []
-    dropped: list[str] = []
 
-    async def fake_create(st, tree, key):
-        url = f"postgresql://u@127.0.0.1:5999/leerie_{len(made)}_test"
-        made.append((str(tree), url))
-        return url
-    monkeypatch.setattr(leerie, "_create_test_db", fake_create)
-    monkeypatch.setattr(leerie, "_drop_test_db",
-                        lambda url: url and dropped.append(url))
-    return made, dropped
+    def fake_argv(st, tree, key):
+        url = f"postgresql://u@localhost/leerie_{len(made)}_test"
+        made.append((str(tree), key))
+        return ["env", f"DATABASE_URL={url}", f"DIRECT_URL={url}"]
+    monkeypatch.setattr(leerie, "_test_db_argv", fake_argv)
+    return made
 
 
 def test_a_database_check_runs_against_its_own_test_database(
         leerie, env, monkeypatch):
-    made, dropped = _fake_test_db(leerie, monkeypatch)
+    made = _fake_test_db(leerie, monkeypatch)
     (env["staging"] / "db.py").write_text(DBCHECK)
     _git(env["staging"], "add", "-A")
     _git(env["staging"], "commit", "-qm", "db check")
@@ -485,24 +486,24 @@ def test_a_database_check_runs_against_its_own_test_database(
                env=[("DATABASE_URL", "postgresql://ci@localhost:5432/ci")]),
         _check("build", [PY, "build.py"], kind="build")]
     recs = _baseline(env)
-    # Green only with the run's database laid over the CI file's own URL.
+    # Green only with the command's own database laid over the CI file's
+    # own URL.
     assert recs["db"]["gate"] == "plain", recs["db"]
     assert recs["build"]["gate"] == "plain"
-    # One database for the base tree, dropped with it.
-    assert [t.endswith("ci-base") for t, _u in made] == [True]
-    assert dropped == [made[0][1]]
+    # Only the check that requires one is wrapped, once per run of it.
+    assert [t.endswith("ci-base") for t, _k in made] == [True]
     _commit(env, {"src/new.txt": "fine\n"})
     assert _final(env) == []
-    # Run-id-prefixed helper worktrees (`_helper_worktree_path`).
     prefix = env["st"].run_id[:12] + "-"
-    assert [Path(t).name for t, _u in made] == [prefix + "ci-base",
+    assert [Path(t).name for t, _k in made] == [prefix + "ci-base",
                                                prefix + "ci-final"]
-    assert sorted(dropped) == sorted(u for _t, u in made)
+    # Each run of it is its own command, with its own database.
+    assert len({k for _t, k in made}) == 2
 
 
 def test_no_database_is_made_when_no_check_needs_one(leerie, env,
                                                      monkeypatch):
-    made, _dropped = _fake_test_db(leerie, monkeypatch)
+    made = _fake_test_db(leerie, monkeypatch)
     env["checks"][:] = [_check("build", [PY, "build.py"], kind="build")]
     _baseline(env)
     assert made == []

@@ -1,7 +1,9 @@
 """A repository's own test suite runs inside leerie's sandbox the way it runs
 outside it (DESIGN §6 *A confined command's scratch is short and private*,
-*A measurement may write `/tmp`; a held-out evaluation has it alone*, *A
-confined command's processes end with it*, *`/tmp` is not a worker's*).
+*Every confined process has its own `/tmp`, `/dev/shm` and IPC*, *A
+confined command's processes end with it*). The isolation itself — a private
+`/tmp` per process — is tests/test_heldout_isolation.py's, on a host that
+can build it; here no process is isolated, and no grant names `/tmp`.
 
 Review round 19's execution driver (H1: barnacle's tsx IPC socket, its fixed
 `/tmp/recon/<id>` paths, funeralworks' `/tmp/leerie-test-pgdata.lock`)
@@ -60,17 +62,6 @@ def _alive(pid: int) -> bool:
         return False
 
 
-@pytest.fixture()
-def shared(leerie, tmp_path, monkeypatch):
-    """A `/tmp` of the test's own (the host's is every program's), marked
-    the run's alone as the image marks the container's."""
-    d = tmp_path / "shared-tmp"
-    d.mkdir()
-    monkeypatch.setattr(leerie, "SHARED_TMP", d)
-    monkeypatch.setenv(leerie.PRIVATE_TMP_ENV, "1")
-    return d
-
-
 # --- H1, turned round: the socket fits -------------------------------------
 
 def test_the_container_measurement_tmpdir_fits_a_socket_path(leerie):
@@ -114,44 +105,30 @@ def test_a_measured_command_binds_a_socket_in_its_tmpdir(leerie, run):
         assert rc == 0 and "NODE-LISTEN-OK" in tail, tail
 
 
-def test_a_measured_command_writes_a_fixed_tmp_path(leerie, run, shared):
-    """barnacle's `/tmp/recon/<id>` and funeralworks' `exec
-    9>/tmp/leerie-test-pgdata.lock`, which the round-19 grant refused. Here
-    `/tmp` is the test's own (`shared`): the host's holds this test's state
-    root, and no grant covers a state root (`_around`); the container's
-    state root is not beneath `/tmp`."""
-    rc, tail = _stream(leerie, _st(run), _view(run), (
-        f"mkdir -p {shared}/recon/graphql && exec 9>{shared}/pgdata.lock "
-        "&& echo LOCKED"))
-    assert rc == 0 and "LOCKED" in tail, tail
-    assert (shared / "recon" / "graphql").is_dir()
-
-
-def test_the_container_grant_is_tmp_whole(leerie):
-    """With the state root outside `/tmp` (the container's `/leerie-state`)
-    the grant is `/tmp` itself, so a new top-level entry can be made."""
-    assert leerie._around([str(leerie.SHARED_TMP)],
-                          Path("/leerie-state")) == ["/tmp"]
-
-
 def _rw_of(argv: list[str]) -> list[str]:
     return [argv[i + 1] for i, a in enumerate(argv) if a == "--rw"]
 
 
-def test_only_run_streaming_grants_tmp_itself(leerie, run, shared):
-    """A confined command started outside `_run_streaming` (an AST script,
-    `mise ls`) writes its private temp directory but not `/tmp`: the `/tmp`
-    grant exists only under the lock `_run_streaming` holds."""
-    g = leerie._measurement_grants(_st(run), _view(run))
-    assert g.shared_tmp == (str(shared),)
-    got = _probe(leerie, g, f"""
+def test_no_grant_names_tmp_itself(leerie, run):
+    """`/tmp` is never granted (the `shared_tmp` grant is gone): an isolated
+    process's own is added by the shim. Unisolated, as here, a measured
+    command writes its private temp directory and not `/tmp`."""
+    st, view = _st(run), _view(run)
+    for kind in (leerie.MEASURE_KIND, leerie.SETUP_HOOK_KIND,
+                 leerie.TOOLCHAIN_KIND, leerie.STORE_FETCH_KIND):
+        g = leerie._measurement_grants(st, view, kind)
+        assert "/tmp" not in g.rw + g.ro, kind
+        assert "/tmp" not in _rw_of(leerie._confined_argv(g, ["true"]))
+    g = leerie._measurement_grants(st, view)
+    planted = Path(f"/tmp/laneB-measure-planted-{os.getpid()}")
+    try:
+        got = _probe(leerie, g, f"""
 private tmp|echo x > "$TMPDIR/ok"
-shared tmp|echo x > {shared}/planted
+shared tmp|echo x > {planted}
 """, dict(g.env))
-    assert got == {"private tmp": True, "shared tmp": False}
-    assert str(shared) in _rw_of(leerie._confined_argv(g, ["true"],
-                                                       shared_tmp=True))
-    assert str(shared) not in _rw_of(leerie._confined_argv(g, ["true"]))
+        assert got == {"private tmp": True, "shared tmp": False}
+    finally:
+        planted.unlink(missing_ok=True)
 
 
 # --- every directory leerie makes for a command is 0700 ---------------------
@@ -276,7 +253,7 @@ def test_the_private_tmps_go_at_the_process_exit(leerie, tmp_path):
     assert d.parent == Path("/tmp/l") and not d.exists()
 
 
-# --- `/tmp` is not a worker's -----------------------------------------------
+# --- an unisolated worker has no `/tmp` (an isolated one has its own) ------
 
 def test_a_worker_neither_reads_nor_writes_tmp(leerie, run):
     marker = Path(f"/tmp/laneA-worker-marker-{os.getpid()}")
@@ -380,179 +357,6 @@ def test_a_worker_sessions_background_processes_end_with_it(leerie, run):
     assert not _alive(int(r.stdout.split()[0]))
 
 
-# --- a held-out evaluation has `/tmp` alone ---------------------------------
-
-def test_a_held_out_evaluation_leaves_nothing_in_tmp(leerie, run, shared):
-    (shared / "keep.txt").write_text("before\n")
-    (shared / "recon").mkdir()
-    (shared / "recon" / "run-1").mkdir()
-    st = _st(run)
-
-    async def go() -> tuple[int, str]:
-        async with leerie._held_out_section(st):
-            return await leerie._run_streaming(
-                ["bash", "-c",
-                 f"echo held > {shared}/new.txt; "
-                 f"mkdir -p {shared}/recon/run-2 {shared}/d/e; "
-                 f"echo x > {shared}/recon/run-2/out; "
-                 f"echo after >> {shared}/keep.txt; "
-                 f"setsid sleep 300 >/dev/null 2>&1 & echo PID=$!"],
-                grants=leerie._measurement_grants(st, _view(run)),
-                cwd=str(_view(run)), timeout=60, verbosity="quiet")
-    rc, tail = asyncio.run(go())
-    assert rc == 0, tail
-    assert sorted(os.listdir(shared)) == ["keep.txt", "recon"]
-    assert os.listdir(shared / "recon") == ["run-1"]
-    # A write into an entry that was there before stays (DESIGN's residual).
-    assert (shared / "keep.txt").read_text() == "before\nafter\n"
-    assert not _alive(int(tail.split("PID=")[1].split()[0]))
-
-
-def test_on_a_shared_host_tmp_nothing_is_removed(leerie, run, shared,
-                                                 monkeypatch):
-    monkeypatch.delenv(leerie.PRIVATE_TMP_ENV)
-    st = _st(run)
-
-    async def go():
-        async with leerie._held_out_section(st):
-            await leerie._run_streaming(
-                ["bash", "-c", f"echo x > {shared}/someone-elses"],
-                grants=leerie._measurement_grants(st, _view(run)),
-                cwd=str(_view(run)), timeout=60, verbosity="quiet")
-    asyncio.run(go())
-    assert (shared / "someone-elses").exists()
-
-
-def test_run_acceptance_file_cleans_up_what_the_held_out_run_made(
-        leerie, run, shared, monkeypatch):
-    """End to end through the held-out path: the set file's own run, with
-    no caller holding a section."""
-    st = _st(run)
-    view = _view(run)
-    monkeypatch.setattr(leerie, "_acceptance_cmd",
-                        lambda _st, rels, _tree: f"bash {rels[0]}")
-    (view / "held.sh").write_text(
-        f"echo leak > {shared}/held-out-leftover\n"
-        "setsid sleep 300 >/dev/null 2>&1 &\n"
-        f"echo $! > {view}/held.pid\nexit 1\n")
-    log = run["run_dir"] / "logs" / "acc.log"
-    v = asyncio.run(leerie._run_acceptance_file(
-        st, dict(leerie.DEFAULT_CAPS), str(view), "held.sh", log, "acc"))
-    assert v is False
-    assert os.listdir(shared) == []
-    assert not _alive(int((view / "held.pid").read_text()))
-
-
-def _clocked(leerie, st, tree, name, secs, events):
-    async def one():
-        g = leerie._measurement_grants(st, tree)
-        await leerie._run_streaming(
-            ["bash", "-c", f"sleep {secs}"], grants=g, cwd=str(tree),
-            timeout=60, verbosity="quiet")
-        events.append((name, time.monotonic()))
-    return one
-
-
-def test_no_measurement_runs_during_a_held_out_evaluation(leerie, run):
-    st, tree = _st(run), _view(run)
-    events: list = []
-
-    async def held():
-        async with leerie._held_out_section(st):
-            events.append(("held-start", time.monotonic()))
-            await _clocked(leerie, st, tree, "held-cmd", 1.0, events)()
-            events.append(("held-end", time.monotonic()))
-
-    async def later_measurement():
-        await asyncio.sleep(0.3)
-        t = time.monotonic()
-        await _clocked(leerie, st, tree, "measure", 0.0, events)()
-        events.append(("asked", t))
-
-    async def go():
-        await asyncio.gather(held(), later_measurement())
-    asyncio.run(go())
-    at = dict(events)
-    assert at["asked"] < at["held-end"] < at["measure"], events
-
-
-def test_a_held_out_evaluation_waits_for_running_measurements(leerie, run):
-    """And a measurement asked for while it waits runs after it, so a
-    stream of measurements cannot starve it."""
-    st, tree = _st(run), _view(run)
-    events: list = []
-
-    async def held():
-        await asyncio.sleep(0.3)
-        async with leerie._held_out_section(st):
-            events.append(("held-start", time.monotonic()))
-            await _clocked(leerie, st, tree, "held-cmd", 0.5, events)()
-            events.append(("held-end", time.monotonic()))
-
-    async def asked_later():
-        await asyncio.sleep(0.6)
-        await _clocked(leerie, st, tree, "late", 0.0, events)()
-
-    async def go():
-        await asyncio.gather(_clocked(leerie, st, tree, "first", 1.2,
-                                      events)(), held(), asked_later())
-    asyncio.run(go())
-    at = dict(events)
-    assert at["first"] <= at["held-start"] < at["held-end"] <= at["late"], \
-        events
-
-
-def test_nested_sections_and_their_commands_pass_through(leerie):
-    async def go():
-        lock = leerie._tmp_lock()
-        async with lock.exclusive() as outer:
-            async with lock.exclusive() as inner:
-                async with lock.shared():
-                    return outer, inner, lock.readers, lock.writer
-    assert asyncio.run(asyncio.wait_for(go(), 5)) == (True, False, 0, True)
-
-
-def test_a_cancelled_waiter_does_not_wedge_the_lock(leerie):
-    async def go():
-        lock = leerie._tmp_lock()
-        async with lock.shared():
-            w = asyncio.ensure_future(lock.exclusive().__aenter__())
-            await asyncio.sleep(0.05)
-            w.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await w
-        async with lock.shared():
-            pass
-        return lock.writers_waiting, lock.readers
-    assert asyncio.run(asyncio.wait_for(go(), 5)) == (0, 0)
-
-
-def test_every_held_out_run_is_in_a_section(leerie):
-    """Every function that runs a held-out set file, or its parse probe,
-    spawns inside `_held_out_section`; `_acceptance_run_placed` holds one
-    from the first copy of a set's files to the last removal."""
-    for fn in (leerie._run_acceptance_file, leerie._acceptance_parse_probe):
-        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-        withs = [n for n in ast.walk(tree)
-                 if isinstance(n, ast.AsyncWith) and any(
-                     "_held_out_section" in ast.unparse(i.context_expr)
-                     for i in n.items)]
-        assert withs, fn.__name__
-        inside = {id(c) for w in withs for c in ast.walk(w)}
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                 and ast.unparse(n.func) == "_run_streaming"]
-        assert calls and all(id(c) in inside for c in calls), fn.__name__
-    placed = ast.parse(textwrap.dedent(
-        inspect.getsource(leerie._acceptance_run_placed)))
-    sec = [n for n in ast.walk(placed) if isinstance(n, ast.AsyncWith)
-           and "_held_out_section" in ast.unparse(n.items[0].context_expr)]
-    assert len(sec) == 1
-    copies = [n for n in ast.walk(placed) if isinstance(n, ast.Call)
-              and ast.unparse(n.func) == "shutil.copy2"]
-    inside = {id(c) for c in ast.walk(sec[0])}
-    assert copies and all(id(c) in inside for c in copies)
-
-
 # --- leerie's own temp files are never in `/tmp` ----------------------------
 
 def test_leeries_own_temp_dir_is_in_the_run_dir(leerie, tmp_path):
@@ -577,9 +381,3 @@ def test_run_phases_moves_leeries_temp_dir_first(leerie):
     calls = [ast.unparse(s.value.func) for s in body
              if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)]
     assert calls[:2] == ["log", "_use_run_tmp"], calls[:3]
-
-
-def test_the_image_marks_its_tmp_the_runs(leerie):
-    from tests.conftest import REPO_ROOT
-    text = (REPO_ROOT / "Dockerfile").read_text()
-    assert f"ENV {leerie.PRIVATE_TMP_ENV}=1" in text

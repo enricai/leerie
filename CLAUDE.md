@@ -166,19 +166,24 @@ the rest of the family stay denied.
   caches and its tree's own stores, and by kind `MISE_DATA_DIR`,
   `~/.local/bin` or (the store fetch alone) leerie's stores
   (`_measurement_grants`, through `_run_streaming`, whose `grants` has no
-  default). Through `_run_streaming` alone it may also write `/tmp`,
-  holding the run's `/tmp` lock shared; a held-out evaluation holds it
-  exclusive and removes what it created there (`_held_out_section`). A
-  worker neither reads nor writes `/tmp`, and leerie keeps nothing of its
-  own there but the preflight smoke test's empty working directory
-  (`_use_run_tmp`, `_system_temp_dir`). Every confined command's processes end with
-  it: the Landlock shim is their subreaper. The host-side workers
+  default). No grant names `/tmp`: once preflight has built a sandbox,
+  every confined process has its own `/tmp`, `/dev/shm` and IPC
+  (`--isolate`), and a held-out file runs only in a sandbox
+  (`HeldOutSandbox`, `_run_streaming(sandbox=)`), alone: every worker and
+  every confined command holds the execution lock shared, an evaluation
+  exclusive (`_exec_lock()`, `_held_out_section`). Leerie keeps nothing of
+  its own in `/tmp` but the preflight smoke test's empty working directory
+  (`_use_run_tmp`, `_system_temp_dir`). No database server leerie starts
+  is unconfined (`scripts/sandbox-db.sh`). Every confined command's
+  processes end with it: the Landlock shim is their subreaper. The host-side workers
   (rebaser, host recapture, `config --chat`) are the one exception.
   DESIGN §6 *A worker writes only where it is granted (I5)*, *Outside the
   container*, *Leerie's runs of the repository's commands are confined
-  too*, *A confined command's scratch is short and private*, *A
-  measurement may write `/tmp`; a held-out evaluation has it alone*, *A
-  confined command's processes end with it*.
+  too*, *A confined command's scratch is short and private*, *Every
+  confined process has its own `/tmp`, `/dev/shm` and IPC*, *A held-out
+  evaluation runs alone, in a world that dies with it (I3)*, *No database
+  server leerie starts is ever unconfined*, *A confined command's
+  processes end with it*.
 - **Each run has its own repository, and each committing tree its own
   (I4, I6).** The user's repository is only fetched from, and receives the
   run branch by the host-side bring-back; only leerie moves the run
