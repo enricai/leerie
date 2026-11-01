@@ -350,26 +350,37 @@ def test_the_host_level_is_released_and_absent_without_a_host_dir(
 
 # What may never be reached from inside an evaluation: a worker (which would
 # die by the guard), and every wait a shared holder may be holding while it
-# waits for the lock — the build slot, the BLT semaphore, memory admission,
-# the confirm lock, the parallelism semaphores (a shared holder takes the
-# lock after them, so waiting for one inside an evaluation could wait on a
-# holder that waits on the evaluation).
+# waits for the lock — a host build slot, the BLT semaphore, memory
+# admission, the confirm lock, the parallelism semaphores (a shared holder
+# takes the lock after them, so waiting for one inside an evaluation could
+# wait on a holder that waits on the evaluation).
 _FORBIDDEN_IN_SECTION = frozenset({
-    "claude_p", "_invoke", "_invoke_admitted", "_build_class_slot",
+    "claude_p", "_invoke", "_invoke_admitted",
     "_acquire_build_slot", "_blt_semaphore",
-    "_await_worker_memory_admission", "_confirm_lock", "_confirm_gate",
-    "Semaphore"})
+    "_await_worker_memory_admission", "_confirm_lock", "Semaphore"})
+# The three gates a measurement takes them through, which pass through
+# inside an exclusive hold instead of waiting (DESIGN §6 *Inside an
+# evaluation every concurrency gate is already the holder's*): the rule
+# stops at them inside a section, and
+# `test_every_gate_passes_through_inside_an_evaluation` executes that
+# pass-through against a gate another holder has exhausted. A falsifier's
+# confirm reaches all three: its section spans its B* reruns (DESIGN §6
+# *Evaluations queue on the lock itself*). `_confirm_gate` is not a wait on
+# a holder: a bounded poll of host CPU pressure, holding nothing.
+_PASS_THROUGH_GATES = frozenset({"_blt_slot", "_build_class_slot",
+                                 "_confirm_hold"})
 
 
-def _reach(funcs: dict[str, ast.AST], roots: set[str]) -> dict[str, list]:
+def _reach(funcs: dict[str, ast.AST], roots: set[str],
+           stop: frozenset[str] = frozenset()) -> dict[str, list]:
     """Every name reachable by call from `roots` through functions defined in
-    the module, with one path to it."""
+    the module, with one path to it; never through a name in `stop`."""
     paths: dict[str, list] = {r: [r] for r in roots}
     todo = list(roots)
     while todo:
         name = todo.pop()
         fn = funcs.get(name)
-        if fn is None:
+        if fn is None or name in stop:
             continue
         for c in ast.walk(fn):
             if not isinstance(c, ast.Call):
@@ -405,7 +416,8 @@ def _section_violations(module: ast.Module) -> list[tuple[str, list]]:
                     elif isinstance(c, ast.AsyncWith):
                         roots |= {ast.unparse(i.context_expr).split("(")[0]
                                   .split(".")[-1] for i in c.items}
-            for name, path in _reach(funcs, roots).items():
+            for name, path in _reach(funcs, roots,
+                                     _PASS_THROUGH_GATES).items():
                 if name in _FORBIDDEN_IN_SECTION:
                     out.append((fn.name, path))
     return out
@@ -433,12 +445,82 @@ def test_the_section_rule_catches_a_worker_or_a_slot_inside():
             return await claude_p("u", "s")
         async def b(st):
             async with _held_out_section(st):
-                async with _build_class_slot(st, label="x"):
+                fd = await _acquire_build_slot(st, label="x")
+        async def c(st, caps):
+            async with _held_out_section(st):
+                await measure(st, caps)
+        async def measure(st, caps):
+            async with _blt_semaphore(caps), _confirm_lock():
+                pass
+        async def d(st, caps):
+            async with _held_out_section(st):
+                async with _blt_slot(caps), _confirm_hold(), \\
+                        _build_class_slot(st, label="x"):
                     pass
+        async def _blt_slot(caps):
+            async with _blt_semaphore(caps):
+                pass
+        async def _confirm_hold():
+            async with _confirm_lock():
+                pass
+        async def _build_class_slot(st, *, label):
+            await _acquire_build_slot(st, label=label)
         """))
     got = {(f, tuple(p)) for f, p in _section_violations(planted)}
     assert ("a", ("helper", "claude_p")) in got
-    assert ("b", ("_build_class_slot",)) in got
+    assert ("b", ("_acquire_build_slot",)) in got
+    assert ("c", ("measure", "_blt_semaphore")) in got
+    assert ("c", ("measure", "_confirm_lock")) in got
+    # The pass-through gates are the sanctioned way in: not violations.
+    assert not [f for f, _ in got if f == "d"]
+
+
+def _exhausted(leerie):
+    """Hold each gate's raw resource from another task: the BLT semaphore
+    to its limit, the confirm lock, and every host build slot."""
+    caps = {"blt_parallel": 1}
+
+    async def holder(started: asyncio.Event, release: asyncio.Event, st):
+        sem = leerie._blt_semaphore(caps)
+        async with sem, leerie._confirm_lock(), \
+                leerie._build_class_slot(st, label="other"):
+            started.set()
+            await release.wait()
+    return caps, holder
+
+
+@pytest.mark.parametrize("inside", [True, False])
+def test_every_gate_passes_through_inside_an_evaluation(leerie, run,
+                                                         inside,
+                                                         monkeypatch):
+    """Inside an exclusive hold all three gates are entered at once while
+    another task holds each raw resource; outside one, the same entry
+    waits — the two arms disagree, so neither passes by accident."""
+    monkeypatch.delenv(leerie._HOST_DIR_ENV, raising=False)
+    st = _st(run)
+    st.data = {"blt_peak": {"slots": 1}}
+    caps, holder = _exhausted(leerie)
+
+    async def main() -> bool:
+        started, release = asyncio.Event(), asyncio.Event()
+        h = asyncio.ensure_future(holder(started, release, st))
+        await started.wait()
+
+        async def enter():
+            async with leerie._blt_slot(caps), leerie._confirm_hold(), \
+                    leerie._build_class_slot(st, label="mine"):
+                return True
+        try:
+            if inside:
+                async with leerie._exec_lock().exclusive():
+                    return await asyncio.wait_for(enter(), 2)
+            return await asyncio.wait_for(enter(), 0.5)
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            release.set()
+            await h
+    assert asyncio.run(main()) is inside
 
 
 def test_every_shared_holder_takes_the_lock_after_its_semaphores():

@@ -1028,3 +1028,34 @@ def test_only_an_all_executed_discard_is_an_executed_basis(
                    no_work_confirmation={"judge_evidence": "j"})
     asyncio.run(leerie._settle_pending_no_work(st, _caps(leerie, 2)))
     assert st.data["no_work_acceptance"]["verdict"] == want
+
+
+# --- the REAL DATABASE section follows a database that is there --------------
+
+@pytest.mark.parametrize("present", [True, False])
+def test_the_writer_is_promised_a_database_only_when_one_came_up(
+        leerie, tmp_path, monkeypatch, present):
+    """Review round 21, L2: a Prisma/PostgreSQL repository whose wrapper
+    falls back to no database must not be told "REAL DATABASE … schema
+    already pushed". The repository's shape is the same in both arms; only
+    the database check's outcome differs, and the payload and the session's
+    requirement follow it."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    monkeypatch.setattr(leerie, "_prisma_project", lambda root: {
+        "dir": "", "schema": "prisma/schema.prisma",
+        "provider": "postgresql"})
+    checked = []
+
+    async def db_present(st_, tree, key, *, log_path):
+        checked.append((str(tree), key))
+        return present
+    monkeypatch.setattr(leerie, "_test_db_present", db_present)
+    writer, calls = _two_round_writer([DEFECT_TEST, DEFECT_TEST])
+    monkeypatch.setattr(leerie, "claude_p", writer)
+    asyncio.run(leerie._write_acceptance_set(
+        1, st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS, head))
+    first = calls[0]
+    assert checked and checked[0][0] == first["cwd"]
+    assert ("REAL DATABASE" in first["user_prompt"]) is present
+    assert first["db"] is present and first["db_required"] is present

@@ -2478,9 +2478,12 @@ about 83 ms per spawn.
 **Fail closed, on every runtime.** The shim needs Landlock ABI 3 or later
 (ABI 2 lets a rename or link between two directories inside a grant happen
 at all, ABI 3 confines `truncate`): Linux 6.2+ with `landlock` among
-the active LSMs. Preflight checks it before any worker (`_require_landlock`)
-and the shim checks it again (exit 126); below that, or with Landlock
-absent, the run stops with a message naming the kernel. Local, Fly and EC2
+the active LSMs. Every orchestrator invocation that can start a worker or
+a repository command checks it before it starts one (`_require_landlock`,
+through the one entry `_require_confinement`, *Fail closed* under *Every
+confined process has its own `/tmp`, `/dev/shm` and IPC*) and the shim
+checks it again (exit 126); below that, or with Landlock absent, the run
+stops with a message naming the kernel. Local, Fly and EC2
 alike — never an unconfined worker (docs/INSTALL.md).
 
 **The grants, one function (`_worker_grants`), by worker kind.** Every
@@ -2643,8 +2646,8 @@ own input fails as "could not measure", which the re-drive's gate (d+)
 read as a void round — every escalated round on a JS/TS repository was
 rolled back that way once leerie's temp files moved to `<run-dir>/tmp/`
 (review round 20, execution H1).
-Fail closed as for a worker: preflight has already required Landlock
-(`_require_landlock`), and the shim refuses (exit 126) where it cannot
+Fail closed as for a worker: the invocation's entry has already required
+Landlock (`_require_confinement`), and the shim refuses (exit 126) where it cannot
 enforce, which a measurement reads as "could not measure", never a pass.
 
 **The grant, by kind.** Every kind gets the first block.
@@ -3090,12 +3093,28 @@ it. A confined process cannot make a namespace or a mount, and Landlock
 refuses a mount once a process is restricted anyway, so a worker cannot
 build or undo any of this.
 
-**Fail closed.** Preflight builds a held-out sandbox, which includes all
-of this (`_require_heldout_sandbox`, *A held-out evaluation runs alone*);
-only after it succeeds does leerie start a confined process with
-`--isolate`, and from then on every one is started so, the shim refusing
-to run the command (exit 126) when it cannot build it. Where preflight
-did not run — a test, a host harness — nothing is isolated.
+**Fail closed, on every entry.** Before an invocation starts any
+confined process it builds a held-out sandbox, which includes all of this
+(`_require_heldout_sandbox`, *A held-out evaluation runs alone*); only
+after it succeeds does leerie start a confined process with `--isolate`,
+and from then on every one is started so, the shim refusing to run the
+command (exit 126) when it cannot build it. Where no invocation entry ran
+— a test, a host harness — nothing is isolated.
+
+The check and Landlock's (`_require_landlock`) are one entry function,
+`_require_confinement(run_dir)`, which `main()` calls once its run
+directory is held and before it dispatches to anything that runs a worker
+or a repository command: a fresh run, `resume`, and `--phase judge|heal`
+alike (`list` and `--report` run neither and return before it). It used to
+be two preflight steps, and only a fresh run ran preflight, so isolation —
+a process flag only that step sets — depended on how the process entered
+`_run_phases`: every worker and command of a resumed run ran without
+`--isolate` (fixed `/tmp` paths refused, `sandbox-db.sh` without a
+database, `/dev/shm` and IPC shared again), and a runtime that could not
+build a sandbox was no longer stopped (review round 21, execution H1). The
+invariant restored: an invocation spawns no confined process before its
+entry has proved the runtime confines and isolates it; a test enumerates
+`main()`'s dispatch paths against it.
 
 ### A held-out evaluation runs alone, in a world that dies with it (I3)
 
@@ -3179,12 +3198,36 @@ It is constructed, not checked, in two halves.
   every caller of `_ts_script_run` (which took no lock at all — round 20
   H2's lock bypass — and now stops the run when called without it), and
   the `mise ls` spawn, besides `_run_streaming`. An
-  evaluation (`_held_out_section`) holds it exclusive around the sandboxed
-  command only; its own commands pass through, nested sections are one.
+  evaluation (`_held_out_section`) holds it exclusive around one logical
+  evaluation: a sandboxed command, or a falsifier sample's whole confirm —
+  its first run, its B* reruns and the facts read of its probe, one hold;
+  its own commands pass through, nested sections are one.
   A worker spawned while a section is held stops the run with an
   invariant error — no worker ever passes through — so a call site that
   would deadlock is a loud failure, never a wait. Nothing that holds the
   lock shared waits on an evaluation, so the lock cannot deadlock.
+- *Evaluations queue on the lock itself.* Writer preference stops new
+  shared holders only for an evaluation that waits on the lock. The
+  falsifier's samples used to queue for their confirm on a lock of their
+  own outside it, and took one exclusive per section: each release of an
+  exclusive admitted the workers waiting to spawn before the next queued
+  confirm could ask, so that confirm then waited for a whole worker it
+  could have preceded, and workers slipped in between one confirm's
+  sections. Measured on the real lock in the falsifier's shape: 2.9x the
+  unlocked wall time at 4 lanes and 4.7–5.5x at 8, against an inherent
+  1.5–1.8x (review round 21, execution M1). Now a sample asks for the
+  exclusive directly, and holds it from its first run to its facts read.
+  The invariant restored: the lock sees every waiting evaluation, so the
+  parallelism caps bound a phase's wall time.
+- *Inside an evaluation every concurrency gate is already the holder's.*
+  While it holds the lock exclusive nothing else of the run runs a
+  command, and no confined process of any run on the host runs: the BLT
+  semaphore, the host build slot and the confirm lock — which bound how
+  many commands run at once — pass through for the holder instead of
+  waiting. Waiting on one there could wait on a holder that holds it while
+  it waits for the lock shared, which waits on the evaluation. The B*
+  pressure gate still runs inside (a bounded wait on host CPU pressure,
+  holding nothing another holder needs).
 - *The host's* is an `flock` on `exec.lock` in the host-wide directory
   (`/leerie-host`, next to the build semaphore), taken after the run's:
   shared by every worker and confined command of every run, exclusive by
@@ -3217,8 +3260,9 @@ mounts above; the container's policy decides both.
   through `colima ssh`): when it is missing or stale the launcher loads it
   itself when it has a terminal (and no `--no-runtime-install`), and
   otherwise stops naming the two commands.
-- *Preflight fails closed* (`_require_heldout_sandbox`, after
-  `_require_landlock`): it builds a sandbox over a probe and checks that
+- *The entry fails closed* (`_require_heldout_sandbox`, after
+  `_require_landlock`, in `_require_confinement` on every invocation that
+  runs workers or commands): it builds a sandbox over a probe and checks that
   its IPC namespace differs from the orchestrator's, `lo` is its only
   interface, `/tmp` and `/dev/shm` are its own, a write to a file in an
   inherited mount gives EROFS, `add_key` gives EPERM, and a placed file is
@@ -3232,7 +3276,7 @@ mounts above; the container's policy decides both.
   user-namespace settings), EC2 (Debian 13, no container: Debian allows
   unprivileged user namespaces and does not restrict them, so it should
   build unchanged), Fly (needs user namespaces, and tmpfs and overlay in
-  one, in its guest kernel). Each fails closed at preflight, naming the
+  one, in its guest kernel). Each fails closed at the entry, naming the
   fix; Fly may then refuse to start, which is the documented cost of never
   running a held-out file outside a sandbox.
 
@@ -11687,7 +11731,20 @@ covers exactly this: pushes to throwaway test databases. The writer's
 payload gets a REAL DATABASE section (the client module, the five newest
 database-backed tests that import it unmocked, the helpers they import:
 all from the import graph), and a set file that mocks the client module
-earns one fix-up call (Q6/R4). Every worker in such a repository carries
+earns one fix-up call (Q6/R4). **The section is a promise, so it follows a
+database that is there, never the repository's shape.** Before composing
+it, code runs the wrapper once in the writer's checkout, confined as a
+measurement, over a check that the command was handed the URL the wrapper
+composes (`_test_db_present`): the section is added only when that check
+passes. The writer's own session then requires its database the same way
+— the check runs between the wrapper and the worker, and the worker
+never starts without it — so the prompt never names a database its
+session lacks. It used to be added for any Prisma/PostgreSQL repository
+whose URL leerie accepts, while the wrapper falls back to running the
+command without a database whenever a step fails: the writer was told to
+build unmocked tests on a database that did not exist, they failed on the
+base for want of one, and read as discriminating defect files (review
+round 21, execution L2, measured with `DATABASE_URL` empty). Every worker in such a repository carries
 Bash deny rules for the commands that push to or reset a database
 (`prisma db push`, `prisma migrate reset`, `prisma migrate dev`, the
 package scripts that run them, and setting the consent variable), paired

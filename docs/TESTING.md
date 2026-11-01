@@ -6088,7 +6088,7 @@ template kept at finalize.
     end with it.
   - Leerie's own temp directory is in the run directory, and `_run_phases`
     moves it first.
-- `tests/test_exec_lock.py` (14 tests; DESIGN §6 *A held-out evaluation
+- `tests/test_exec_lock.py` (15 test functions, 16 cases; DESIGN §6 *A held-out evaluation
   runs alone, in a world that dies with it (I3)*, the time half): an
   evaluation runs with no measurement beside it and waits for running ones
   without starving; it waits for a running real `_invoke` worker, and a
@@ -6099,10 +6099,41 @@ template kept at finalize.
   shared hold stops the run; the host level makes an evaluation wait for
   another process's shared holder and holds later shared takers behind it,
   and releases both files; by rule over the module nothing reachable inside
-  `_held_out_section` spawns a worker or waits on a semaphore a shared
-  holder may hold (with the rule's own catch of a planted violation), and
-  every shared holder takes the lock after its semaphores.
-- `tests/test_heldout_sandbox_callers.py` (15 tests; DESIGN §6 *A held-out
+  `_held_out_section` spawns a worker or waits on a raw semaphore or lock
+  a shared holder may hold — stopping at the three gates that pass
+  through inside an exclusive hold (`_blt_slot`, `_build_class_slot`,
+  `_confirm_hold`) — with the rule's own catch of planted violations and
+  its acceptance of the gates; the gates entered inside an exclusive hold
+  while another task holds each raw resource pass through, and the same
+  entry outside one waits (the two arms disagree); and every shared holder
+  takes the lock after its semaphores.
+- `tests/test_falsifier_exec_queue.py` (3 test functions, 5 cases;
+  DESIGN §6 *Evaluations queue on the lock itself*, review round 21
+  execution M1): the real `_falsify_items`, `_falsifier_gates`,
+  `_confirm_still_failing` and `_ExecLock`, with the worker, the probe's
+  runs and the facts read as stand-ins holding the lock as the real ones
+  do. Every item confirms (first run, B\* rerun, facts read), no worker
+  starts inside a confirm, and no worker that asked after a confirm was
+  queued starts before it — random lengths, and the convoy's shape set
+  up; the wall time stays under 2.2x the same schedule with confirms
+  serial and no worker held back. Live-falsified: the pre-fix shape
+  (a confirm lock outside the execution lock, a section per run) and the
+  one-hold-inside-a-confirm-lock shape each turn all five red. Measured
+  with the same harness (5 seeds): 1.52x at 4 lanes / 16 items and 1.79x
+  at 8 / 32, against 2.86x and 4.88x for the pre-fix shape.
+- `tests/test_confinement_entry.py` (9 tests; DESIGN §6 *Fail closed, on
+  every entry*, review round 21 execution H1): by rule, no statement of
+  `main()` before `_require_confinement` reaches `_confined_argv` through
+  the module's references, and the entry is one unconditional statement
+  of its body (with planted catches of a dispatch above it and a
+  conditional entry); the entry runs Landlock's check then the sandbox's,
+  and `preflight()` runs neither; the real `main()` driven as a fresh run,
+  `resume <id>`, `--phase judge` and `--phase heal` calls it before the
+  dispatch, whose first confined spawn carries `--isolate`; `list` and
+  `--report` skip it. Live-falsified: the entry made fresh-only fails the
+  resume test and the rule; moved below the `--phase` branch, it fails
+  both phase tests and the rule.
+- `tests/test_heldout_sandbox_callers.py` (20 test functions, 22 cases; DESIGN §6 *A held-out
   evaluation runs alone*, *No database server leerie starts is ever
   unconfined*): every run of a set file carries the whole set as `place`
   pairs in a section, none of it on disk at any spawn; a path the tree
@@ -6122,6 +6153,17 @@ template kept at finalize.
   `acceptance/`, and the server is gone with the command; a name that is
   not a test database is refused (125); confined but unisolated, the
   script runs the command unchanged without a database, its stdout clean.
+  A promised database (review round 21 execution L2): `require` puts
+  `scripts/require-test-db.sh` after the wrapper; `_test_db_present`, executed
+  under the shim, is True only when the command was handed the composed
+  URL (a fake wrapper handing it, another URL, or none), False where the
+  real wrapper falls back unisolated, and spawns nothing outside a
+  Prisma/PostgreSQL repo; `claude_p(db_required=True)` puts the guard
+  between the wrapper and `claude`. `tests/test_acceptance_set_audit.py`
+  adds the consumer (1 test function, 2 cases): the same Prisma repository
+  gets the REAL DATABASE section and `db_required` only when the check
+  says a database came up. Live-falsified by restoring the shape-based
+  `has_db` and dropping the guard (7 red).
 - `tests/test_delivery_detection.py`, a falsifier's probe as held-out
   content (DESIGN §6 *A held-out evaluation runs alone*; 3 tests): the
   confirm runs, through the real gates and `_capture_failing_test_ids`,
@@ -6202,7 +6244,8 @@ template kept at finalize.
   messages and its per-property failures with the probe's subprocess
   faked, isolation switched on only by a passing gate, `_confined_argv`
   (no `--isolate` before preflight; a held-out run always `--sandbox`),
-  preflight running the gate right after `_require_landlock`, and the real
+  the entry (`_require_confinement`) running the gate right after
+  `_require_landlock`, and the real
   gate where the runtime allows it.
 - `tests/test_seccomp_filter.py` (5 test functions, 6 cases): the x86_64
   and aarch64 programs executed by a classic-BPF interpreter (every listed

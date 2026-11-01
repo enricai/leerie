@@ -583,11 +583,11 @@ def _emulated_heldout_sandbox(request, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_real_heldout_sandbox(request, monkeypatch):
-    """Keep preflight's `_require_heldout_sandbox` from building a real
-    sandbox. It needs an unprivileged user namespace with mounts, which a
-    developer host and CI restrict (Ubuntu's
+    """Keep the entry's `_require_heldout_sandbox` (`_require_confinement`)
+    from building a real sandbox. It needs an unprivileged user namespace
+    with mounts, which a developer host and CI restrict (Ubuntu's
     `kernel.apparmor_restrict_unprivileged_userns`): every test driving real
-    `preflight()` would die there. The stub also leaves `ISOLATE_ENV` unset,
+    `main()` would die there. The stub also leaves `ISOLATE_ENV` unset,
     so nothing a test spawns is isolated. A test whose subject is the gate
     opts out with `@pytest.mark.real_heldout_sandbox` (and skips where
     `isolation_error()` reports the host cannot build one)."""

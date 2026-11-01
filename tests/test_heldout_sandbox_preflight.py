@@ -163,9 +163,12 @@ def test_a_held_out_run_is_always_sandboxed(leerie, monkeypatch):
                             "--", "run"]
 
 
-def test_preflight_runs_the_gate_right_after_landlock(leerie, monkeypatch,
-                                                      tmp_path):
-    order: list[str] = []
+def test_the_entry_runs_the_gate_right_after_landlock(leerie, monkeypatch,
+                                                     tmp_path):
+    """Every invocation's entry (`_require_confinement`), no longer a
+    fresh-only preflight step: tests/test_confinement_entry.py drives each
+    of `main()`'s dispatch paths through it."""
+    order: list = []
 
     class Stop(Exception):
         pass
@@ -179,7 +182,7 @@ def test_preflight_runs_the_gate_right_after_landlock(leerie, monkeypatch,
 
     monkeypatch.setattr(leerie, "_require_heldout_sandbox", gate)
     with pytest.raises(Stop):
-        asyncio.run(leerie.preflight(tmp_path))
+        leerie._require_confinement(tmp_path)
     assert order == ["landlock", ("sandbox", tmp_path)]
 
 

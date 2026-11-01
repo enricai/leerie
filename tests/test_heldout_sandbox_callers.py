@@ -539,3 +539,104 @@ def test_without_its_own_tmp_a_command_runs_without_a_database(leerie,
         env={**os.environ, **dict(g.env)})
     assert r.returncode == 0 and r.stdout == "ran\n", r
     assert "without a database" in r.stderr
+
+
+# --- a promised database is one that is there (review round 21, L2) ---------
+
+def _fake_wrapper(tmp_path: Path, url_expr: str) -> Path:
+    """A stand-in for `sandbox-db.sh` that hands its command `url_expr`
+    (shell, `$2` the database name) as both URLs — or none when empty."""
+    p = tmp_path / "fake-sandbox-db.sh"
+    export = (f'export DATABASE_URL="{url_expr}" DIRECT_URL="{url_expr}"; '
+              if url_expr else "")
+    p.write_text(f"#!/usr/bin/env bash\n{export}shift 3\nexec \"$@\"\n")
+    return p
+
+
+def test_require_puts_the_guard_after_the_wrapper(leerie, run):
+    st, view = _st(run), _view(run)
+    _prisma_repo(run["user"])
+    plain = leerie._test_db_argv(st, view, "k")
+    got = leerie._test_db_argv(st, view, "k", require=True)
+    assert got[:len(plain)] == plain
+    url = leerie._test_db_url(plain[3])
+    assert got[len(plain):] == ["bash", str(leerie.REQUIRE_TEST_DB_SCRIPT),
+                                url, "--"]
+
+
+@pytest.mark.parametrize("handed,present", [
+    ("composed", True), ("other", False), ("none", False)])
+def test_db_present_is_the_wrappers_outcome(leerie, run, monkeypatch,
+                                            tmp_path, handed, present):
+    """Executed under the shim: True only when the command was handed the
+    URL the wrapper composes — another URL (a DATABASE_URL from elsewhere)
+    or none (the wrapper's fallback) is no database."""
+    st, view = _st(run), _view(run)
+    _prisma_repo(run["user"])
+    user = leerie._test_db_url("x").split("://", 1)[1].split("@", 1)[0]
+    expr = {"composed": (f"postgresql://{user}@localhost/$2"
+                         f"?host={leerie.TEST_DB_SOCKET_DIR}"),
+            "other": "postgresql://u@db.example/prod", "none": ""}[handed]
+    monkeypatch.setattr(leerie, "SANDBOX_DB_SCRIPT",
+                        _fake_wrapper(tmp_path, expr))
+    got = asyncio.run(leerie._test_db_present(
+        st, view, "chk", log_path=run["run_dir"] / "logs" / "db.log"))
+    assert got is present
+
+
+def test_db_present_is_false_where_the_real_wrapper_falls_back(leerie, run):
+    """The reviewer's measured case, with the real script: unisolated (no
+    grant names `/tmp`), it cannot make its cluster and runs the command
+    without a database — which the check reads as none."""
+    st, view = _st(run), _view(run)
+    _prisma_repo(run["user"])
+    assert asyncio.run(leerie._test_db_present(
+        st, view, "chk", log_path=run["run_dir"] / "logs" / "db.log")) is False
+
+
+def test_db_present_spawns_nothing_outside_a_prisma_postgres_repo(
+        leerie, run, monkeypatch):
+    async def boom(*a, **k):
+        raise AssertionError("spawned")
+    monkeypatch.setattr(leerie, "_run_streaming", boom)
+    assert asyncio.run(leerie._test_db_present(
+        _st(run), _view(run), "chk", log_path=run["run_dir"] / "x.log")) \
+        is False
+
+
+def test_a_worker_promised_a_database_never_starts_without_it(
+        leerie, run, monkeypatch):
+    """`claude_p(db=True, db_required=True)`: the guard stands between the
+    wrapper and `claude`; `db_required=False` leaves the plain wrapper."""
+    rd, wt = run["run_dir"], _view(run)
+    seen: list = []
+
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
+                          stdin_data=None, *, grants, **_kw):
+        seen.append(cmd)
+        return {"type": "result", "subtype": "success", "is_error": False,
+                "result": "{}", "structured_output": {
+                    "title": "t", "body": "b", "used_template": None}}
+    monkeypatch.setattr(leerie, "_invoke", fake_invoke)
+    monkeypatch.setattr(leerie, "_capture_call", lambda *a, **k: None)
+    monkeypatch.setattr(leerie, "_append_system_prompt_file_supported",
+                        lambda: False)
+    (rd / "logs").mkdir(exist_ok=True)
+    st = _St(run["user"], rd)
+    st.path = rd / "state.json"
+    st.data = {"verbosity": "quiet"}
+    st.bump_workers = lambda *a, **k: None
+    st.add_telemetry = lambda *a, **k: None
+    _prisma_repo(run["user"])
+    for required in (True, False):
+        asyncio.run(leerie.claude_p(
+            user_prompt="u", system_prompt="s", schema_key="pr_writer",
+            cwd=str(wt), allowed_tools=leerie.ACT_TOOLS, max_turns=1,
+            autonomous=False, caps=dict(leerie.DEFAULT_CAPS), st=st,
+            model="haiku", sid=f"w-{required}", db=True,
+            db_required=required))
+    req, plain = seen
+    assert req[4] == "--" and req[5:7] == [
+        "bash", str(leerie.REQUIRE_TEST_DB_SCRIPT)]
+    assert req[8] == "--" and req[9] == "claude"
+    assert plain[4] == "--" and plain[5] == "claude"

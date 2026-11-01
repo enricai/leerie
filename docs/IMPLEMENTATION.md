@@ -3811,9 +3811,21 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   Landlock scopes; `--isolate` and `--sandbox` build its namespaces and
   mounts first (§ *Isolation and the held-out sandbox (I3)* below). The
   orchestrator loads it as a module (`_landlock()`).
-- `_require_landlock()` — `die()` unless `abi() >= MIN_ABI`; `preflight`
-  step 0.3, before any worker, on every runtime. Step 0.35 is
-  `_require_heldout_sandbox` (below).
+- `_require_landlock()` — `die()` unless `abi() >= MIN_ABI`; on every
+  runtime, first in `_require_confinement`.
+- `_require_confinement(run_dir: Path) -> None` — the one entry every
+  invocation that runs a worker or a repository command passes through:
+  `_require_landlock()`, then `_require_heldout_sandbox(run_dir)`.
+  `main()` calls it with `st.run_dir` as an unconditional statement of its
+  body, right after `_install_run_log_tee(st.run_dir)` and before the
+  `--phase judge|heal` branch and `_orchestrate` (so fresh runs, `resume`
+  and both phases; `list` and `--report` return earlier and spawn
+  nothing). `preflight()` no longer runs either check.
+  `tests/test_confinement_entry.py`: no statement of `main()` before the
+  call reaches `_confined_argv` (by rule, over the module's call graph),
+  and the real `main()` driven down each dispatch path (fresh, `resume
+  <id>`, `--phase judge`, `--phase heal`) calls it before its first
+  confined spawn, which carries `--isolate`.
 - `WorkerGrants(rw, ro, env=())` (NamedTuple of absolute paths; the
   `shared_tmp` field is deleted — every confined process has its own
   `/tmp`).
@@ -4447,8 +4459,9 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
     `_vitest_exact_selection(cmd, files, tree, extra=())` /
     `_vitest_filter_colliders(tree, files, extra=())` count the placed
     paths as the tree's files.
-- `_require_heldout_sandbox(run_dir: Path) -> None` — `preflight` step
-  0.35, right after `_require_landlock`, on every runtime: makes
+- `_require_heldout_sandbox(run_dir: Path) -> None` — in
+  `_require_confinement`, right after `_require_landlock`, on every
+  runtime: makes
   `<run-dir>/sandbox-probe/` (`_SANDBOX_PROBE_DIRNAME`) with `view/`, a set
   file outside it and `ro.txt`, and a marker file in the container's
   `/tmp` and `/dev/shm`; runs `_confined_argv(WorkerGrants(rw=("/dev/null",
@@ -4497,20 +4510,39 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   hold never waits behind an evaluation that waits for that hold;
   `exclusive()` called where `_EXEC_SHARED` is set `die()`s (`invariant:
   a held-out evaluation started while its own caller holds the execution
-  lock shared`). Each level is taken after every semaphore its holder
-  takes (`_build_class_slot`, `_blt_semaphore`, memory admission, the
-  confirm lock), and nothing reachable inside `_held_out_section` takes
-  one or spawns a worker (`tests/test_exec_lock.py`, by rule over the
-  module), so the lock cannot deadlock. `_held_out_section(st)` —
-  `exclusive()` around the sandboxed command only (held by
-  `_run_acceptance_file`, `_acceptance_parse_probe`,
-  `_capture_failing_test_ids` (with `place`) and `_probe_case_facts_placed`
-  around their spawn,
-  replacing `_blt_semaphore`; `_acceptance_run_placed` no longer holds it
+  lock shared`). A shared hold is taken after every semaphore its holder
+  takes (`_build_class_slot`, `_blt_slot`, memory admission,
+  `_confirm_hold`). Inside an exclusive hold those three gates pass
+  through instead of waiting (`_EXEC_EXCLUSIVE` set: the holder is alone
+  in the run and on the host), and nothing reachable inside
+  `_held_out_section` takes a raw one (`_blt_semaphore`,
+  `_acquire_build_slot`, `_confirm_lock`, a `Semaphore`) or spawns a worker
+  (`tests/test_exec_lock.py`, by rule over the module, stopping at the
+  three pass-through gates, whose pass-through it executes), so the lock
+  cannot deadlock. `_held_out_section(st)` — `exclusive()` around one
+  logical evaluation (held by `_run_acceptance_file`,
+  `_acceptance_parse_probe`, `_capture_failing_test_ids` (with `place`) and
+  `_probe_case_facts_placed` around their spawn, and by `_falsifier_gates`
+  from the probe's placement check through its facts read, so the first
+  run, the B\* reruns and the facts read are one hold — those three
+  callees' own sections nest; `_falsify_items` has no confirm lock of its
+  own: its samples queue on the execution lock; the section replaces
+  `_blt_semaphore` for a held-out run; `_acceptance_run_placed` no longer holds it
   across its loop, since nothing is placed on disk), no `/tmp` inventory;
   `_exec_lock().shared()` called for a worker while `_EXEC_EXCLUSIVE` is
   set `die()`s (`invariant: a worker spawned inside a held-out
   evaluation`); a command passes through as before.
+- **The gates that pass through inside an evaluation**:
+  `_blt_slot(caps)` — async context manager: the BLT semaphore
+  (`_blt_semaphore(caps)`), or nothing when `_EXEC_EXCLUSIVE` is set;
+  `_build_class_slot(st, *, label)` — yields None without taking a host
+  slot when `_EXEC_EXCLUSIVE` is set; `_confirm_hold()` — async context
+  manager: `_confirm_lock()`, or nothing when `_EXEC_EXCLUSIVE` is set.
+  Every former `async with _blt_semaphore(caps)` and `async with
+  _confirm_lock()` uses them (`_measure_axes`,
+  `_capture_failing_test_ids`, `_confirm_new_failures`,
+  `_confirm_still_failing`, `_intermittent_discovery`,
+  `_acceptance_discover`, `_settle_by_execution`).
 - **The host's lock**: `_host_exec_lock(exclusive: bool)` — an async
   context manager over `<LEERIE_HOST_DIR>/exec.lock` and
   `<LEERIE_HOST_DIR>/exec.intent` (`HOST_EXEC_LOCK`,
@@ -4578,6 +4610,24 @@ in front of the `claude` argv, so its `DATABASE_URL` names its own
 cluster, and the re-drive's self-check, which runs inside that worker,
 uses it through its environment (`_selfcheck_prepare(st, caps, staging,
 shown, label)`, `db_url` gone, `config.json`'s `env` empty).
+
+A database that is promised is required. `_test_db_argv(st, tree, key, *,
+require: bool = False)` with `require` appends `["bash",
+REQUIRE_TEST_DB_SCRIPT, _test_db_url(name), "--"]` after the wrapper
+(`scripts/require-test-db.sh <url> -- CMD`), which exits
+`TEST_DB_ABSENT_EXIT` (3) with one stderr line unless `DATABASE_URL` is
+exactly that URL, and otherwise `exec`s the command. `async _test_db_present(st, tree, key, *, log_path)
+-> bool` runs `_test_db_argv(…, require=True) + ["true"]` once in `tree`
+through `_run_streaming` (`_measurement_grants(st, tree)`, 300 s): True
+only on exit 0; False outside a Prisma/PostgreSQL repo, on any other
+exit, a timeout or a spawn failure (logged). `_write_acceptance_set`
+sets `has_db = await _test_db_present(st, wt, f"{name}-db-check", …)`
+after the writer's install, adds `_prisma_real_db_section` only when it
+is True, and spawns the writer with `claude_p(…, db=has_db,
+db_required=has_db)`; `claude_p(…, db_required=True)` composes its prefix
+with `require=True`, so a writer whose own database did not come up
+exits 3 before `claude` starts instead of running on a prompt that names
+a database it lacks. The set's validation runs keep `require=False`.
 
 **The launcher and the runtime** (`leerie`, `scripts/runtime-install.sh`,
 `scripts/apparmor/leerie-container`):
@@ -4663,8 +4713,8 @@ All in `leerie.py`, in execution order. This is the concrete catalogue behind
 | `claude --version` ≥ `MIN_CLAUDE_CLI` (currently `(2, 1, 22)`) | CLI too old for `--json-schema` (introduced for `claude -p` in v2.1.22) — replaces the cryptic "unknown option" message a stale CLI used to produce |
 | `claude --version` ≥ `MIN_CLAUDE_CLI_STRICT_OUTPUT` (currently `(2, 1, 289)`), only when `--dangerously-force-strict-output` is on | a CLI on which strict decoding turns leaked tool-call markup into a schema-valid payload with its fields emptied (DESIGN §7) |
 | `gh auth status` + `origin` remote (launcher bash, before container) | finalize would fail at push/PR after the full run already ran. Short-circuited when `--no-push` is passed (env / TOML mirrors). |
-| `_require_landlock()` (step 0.3) | a kernel that cannot confine a worker (Landlock ABI below `MIN_ABI`) |
-| `_require_heldout_sandbox()` (step 0.35) | a runtime that cannot build the held-out sandbox or the isolation every confined process gets — seccomp refusing a user namespace, the `leerie-container` AppArmor profile not applied, the host's user-namespace restriction, no seccomp table for the architecture, Fly's guest kernel — named in the `die()` (§ *Isolation and the held-out sandbox (I3)*) |
+| `_require_landlock()` (in `_require_confinement`, on every invocation that runs workers or commands — fresh, `resume`, `--phase`) | a kernel that cannot confine a worker (Landlock ABI below `MIN_ABI`) |
+| `_require_heldout_sandbox()` (in `_require_confinement`, after `_require_landlock`) | a runtime that cannot build the held-out sandbox or the isolation every confined process gets — seccomp refusing a user namespace, the `leerie-container` AppArmor profile not applied, the host's user-namespace restriction, no seccomp table for the architecture, Fly's guest kernel — named in the `die()` (§ *Isolation and the held-out sandbox (I3)*) |
 | live `claude -p` smoke test | auth failure or network problem |
 | live `claude -p` smoke test — client-side context refusal | `ContextOverflow` -> resumable `EXIT_LOCKED` pause naming the remedy, not a bare `Prompt is too long` |
 
@@ -7131,8 +7181,10 @@ than re-running once.
   confirm. `run_base`
   / `run_final` are `async (timeout_sec: float) -> set[str] | None`
   callables returning the failing IDs of one serial rerun (None: the
-  rerun produced no verdict). Held under `_confirm_lock()` (one confirm at
-  a time, per event loop, lazily created like `_blt_semaphore`). Runs the
+  rerun produced no verdict). Held under `_confirm_hold()` (one confirm at
+  a time, per event loop, `_confirm_lock()` lazily created like
+  `_blt_semaphore`; inside an evaluation's exclusive hold — the
+  falsifier's — the hold is already the evaluation's). Runs the
   gate, then `confirm_pairs` (or `confirm_pairs_escalated` on a gate
   timeout) interleaved pairs, base first, each rerun given the remaining
   `confirm_budget_sec`, whose clock starts when the gate returns (the gate
@@ -7524,7 +7576,7 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   log_path, label) -> dict`. The import-coupled tests are
   `_coupled_test_files(repo, staging HEAD, _changed_files(staging,
   base_sha), globs, direct=True)` that exist in staging. With a scoped
-  runner (`_acceptance_cmd`), and holding `_confirm_lock` after one
+  runner (`_acceptance_cmd`), and holding `_confirm_hold()` after one
   `_confirm_gate`, all inside one `confirm_budget_sec` counted from when
   the gate returns (DESIGN §9 *Sized to the budget*):
   1. *Durations.* `state.data["test_file_durations"]` for the coupled
@@ -7909,7 +7961,7 @@ environment_limit, tail}], dirty, removed_untracked?}`:
   argv `_is_blt_build_test_argv` matches (its tokens begin with the
   `shlex.split` of the configured build or test command) holds a
   `_build_class_slot`.
-- Exit 0 passes. A failure is re-checked under `_confirm_lock()`: one
+- Exit 0 passes. A failure is re-checked under `_confirm_hold()`: one
   `_confirm_gate`, then up to `confirm_pairs` (`confirm_pairs_escalated` on a
   gate timeout) reruns inside `confirm_budget_sec`, stopping at the first
   exit 0 (`resource_affected: True`). At the measured ceiling a run its
@@ -8048,7 +8100,8 @@ environment limit*.
   the async context manager the three callers use: `_measure_axes`
   (build/tests axes), `_capture_failing_test_ids` (every report run, so every
   B\* rerun) and `_settle_by_execution` (build/test argvs). It is taken
-  inside the in-process `_blt_semaphore`.
+  inside the in-process `_blt_slot`; both pass through inside an
+  evaluation's exclusive hold.
 - Environment limit: in `_settle_subtask`, a `PidExhaustedError` or
   `OomKilledError` while `_at_measured_ceiling(st)` goes to
   `_environment_limit_hit(st, sid, reason, hits)` — the first retries in
@@ -8246,7 +8299,9 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   without both) → one more `claude_p(user_prompt=FALSIFIER_REASK_NOTE,
   resume_session=<_log_session_id(log)>, sid=<sid>-reask)` in the same
   checkout (`claude_p`'s `resume_session` adds `--resume <id>`).
-- **Gates** (`_falsifier_gates`, one sample at a time): `new_file` (a safe
+- **Gates** (`_falsifier_gates`; from the placement check through the
+  facts read in one `_held_out_section`, so samples queue on the execution
+  lock and one confirm holds it across its runs): `new_file` (a safe
   relative path, present in the lane, absent from the final commit),
   `not_a_lead` (not under the leads, not an acceptance path), `runnable`
   (`_acceptance_cmd` renders it), `item_quote` (normalised
@@ -8904,7 +8959,7 @@ which `_acceptance_unmeasured_lines` renders for the PR), and a rerun with an `a
 settles its file failing whatever the vote says. Then discovery
 (`_acceptance_discover`): for each defect file with held cases that did
 not end failing, up to `acceptance_intermittent_repeats` (clamped to
-`_ACCEPTANCE_INTERMITTENT_MAX = 10`) serial reruns under `_confirm_lock`
+`_ACCEPTANCE_INTERMITTENT_MAX = 10`) serial reruns under `_confirm_hold()`
 and `_confirm_gate`, inside `confirm_budget_sec` counted from when the
 gate returns — each rerun runs with `worker_timeout_sec` lowered to what
 is left of the budget (`_budget_caps`), and a round whose run that

@@ -116,6 +116,9 @@ EXEMPT = {
                       "confined: the argv its callers build is literal",
     "_run_mise_install": "`mise ls --current --json`, a literal argv, "
                          "confined through `_confined_argv`",
+    "_test_db_present": "leerie's scripts/sandbox-db.sh and "
+                        "scripts/require-test-db.sh over `true`: no "
+                        "repository command",
 }
 
 

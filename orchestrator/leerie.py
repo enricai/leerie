@@ -12203,15 +12203,10 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             "Every subprocess would report a bogus failure. This is an "
             "environment problem, not a leerie configuration problem.")
 
-    # 0.3. every worker is confined (DESIGN §6 *A worker writes only where
-    # it is granted*): a kernel that cannot confine one stops the run here,
-    # before any is spawned — every runtime, Fly and EC2 included.
-    _require_landlock()
-
-    # 0.35. every held-out run is sandboxed and every confined process
-    # isolated (DESIGN §6 *A held-out evaluation runs alone, in a world that
-    # dies with it (I3)*): a runtime that cannot build one stops here.
-    _require_heldout_sandbox(leerie_dir)
+    # Landlock and the held-out sandbox are not checked here: `main()` has
+    # already run `_require_confinement` for every invocation that can start
+    # a confined process, a resumed one included (DESIGN §6 *Fail closed, on
+    # every entry*).
 
     # 0.4. reap idle runs' worktrees (DESIGN §6 *Idle runs' worktrees are
     # reaped at preflight*), before the headroom check reads free space.
@@ -22460,6 +22455,18 @@ def _landlock() -> types.ModuleType:
     return mod
 
 
+def _require_confinement(run_dir: Path) -> None:
+    """The one entry every invocation that runs a worker or a repository
+    command passes through, before it starts any (DESIGN §6 *Fail closed, on
+    every entry*): the kernel confines (`_require_landlock`) and the runtime
+    builds the held-out sandbox and isolation (`_require_heldout_sandbox`,
+    which turns isolation on). `main()` calls it for a fresh run, `resume`
+    and `--phase` alike; a resumed run used to skip both, so nothing it
+    spawned was isolated."""
+    _require_landlock()
+    _require_heldout_sandbox(run_dir)
+
+
 def _require_landlock() -> None:
     """Fail closed (DESIGN §6 *A worker writes only where it is granted*):
     no worker runs when the kernel cannot confine it."""
@@ -22474,11 +22481,12 @@ def _require_landlock() -> None:
             "granted*; docs/INSTALL.md).")
 
 
-# Set by `_require_heldout_sandbox` once preflight has built a sandbox in this
-# process: from then on every confined spawn here, and in the processes it
-# starts (`scripts/worker-guard.py`), is isolated (DESIGN §6 *Every confined
-# process has its own `/tmp`, `/dev/shm` and IPC*). Unset where preflight did
-# not run (a test, a host harness): nothing is isolated there.
+# Set by `_require_heldout_sandbox` once the invocation's entry
+# (`_require_confinement`) has built a sandbox in this process: from then on
+# every confined spawn here, and in the processes it starts
+# (`scripts/worker-guard.py`), is isolated (DESIGN §6 *Every confined process
+# has its own `/tmp`, `/dev/shm` and IPC*). Unset where no entry ran (a test,
+# a host harness): nothing is isolated there.
 ISOLATE_ENV = "LEERIE_ISOLATED"
 SANDBOX_PROBE_SCRIPT = ROOT / "scripts" / "sandbox_probe.py"
 _SANDBOX_PROBE_DIRNAME = "sandbox-probe"
@@ -27999,6 +28007,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                    notes_id: str | None = None,
                    selfcheck_dir: str | None = None,
                    db: bool = False,
+                   db_required: bool = False,
                    _suppress_capture: bool = False) -> dict:
     """Run one headless Claude Code worker and return its validated
     structured output.
@@ -28007,7 +28016,10 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     started as `scripts/sandbox-db.sh <pkg> <name> -- claude …` inside its
     own confinement, so its `DATABASE_URL` names a cluster in its own
     `/tmp`, alive for its process's lifetime (DESIGN §6 *No database server
-    leerie starts is ever unconfined*); elsewhere it is ignored.
+    leerie starts is ever unconfined*); elsewhere it is ignored. With
+    `db_required` (a worker whose prompt names that database) the worker
+    never starts without it: the spawn exits `TEST_DB_ABSENT_EXIT` instead
+    (`_test_db_argv(require=True)`).
 
     `resume_session`, when set, continues that CLI session (`--resume`) with
     `user_prompt` as the next turn instead of starting a fresh one — the
@@ -28254,7 +28266,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         # `classifier` — measured p99 412 s — no longer holds its phase for
         # the same 90 minutes a full `implementer` legitimately needs.
         timeout = resolve_worker_timeout(schema_key, caps)
-        db_argv = _test_db_argv(st, cwd, sid) if db else []
+        db_argv = (_test_db_argv(st, cwd, sid, require=db_required)
+                   if db else [])
 
         async def _spawn(retry_note: str) -> dict:
             """One `_invoke` + telemetry + NDJSON capture + non-clean-exit
@@ -42743,6 +42756,20 @@ def _blt_semaphore(caps: dict) -> asyncio.Semaphore:
     return cached[1]
 
 
+@contextlib.asynccontextmanager
+async def _blt_slot(caps: dict) -> AsyncIterator[None]:
+    """Hold the BLT semaphore around a measurement; nothing inside a
+    held-out evaluation's exclusive hold, where no other command of the run
+    runs and waiting on it could wait on a holder that waits on the
+    evaluation (DESIGN §6 *Inside an evaluation every concurrency gate is
+    already the holder's*)."""
+    if _EXEC_EXCLUSIVE.get():
+        yield
+        return
+    async with _blt_semaphore(caps):
+        yield
+
+
 # --- contained command runs, measured peaks, the host build semaphore -----
 # (DESIGN §6 *Enrollment holds the spawn*, *The repo's own build peak*,
 # *A host-wide build semaphore*)
@@ -42923,7 +42950,13 @@ async def _build_class_slot(st: "State", *,
                             label: str) -> AsyncIterator[int | None]:
     """Hold one host build slot around a build/test command (DESIGN §6
     *A host-wide build semaphore*). Yields the slot index, None when
-    ungated."""
+    ungated — and inside a held-out evaluation's exclusive hold, which no
+    confined process of any run on the host overlaps, so the host's slots
+    are already its own (DESIGN §6 *Inside an evaluation every concurrency
+    gate is already the holder's*)."""
+    if _EXEC_EXCLUSIVE.get():
+        yield None
+        return
     fd, slot, _n = await _acquire_build_slot(st, label=label)
     try:
         yield slot
@@ -43998,7 +44031,7 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         # The gate is held only around the command itself, never around the
         # memo lookup or the install: a hit must stay free, and serialising
         # installs would throttle the very worktrees waiting to be measured.
-        async with _blt_semaphore(caps), \
+        async with _blt_slot(caps), \
                 _leaves_tree_as_found(tree, axis, log_prefix):
             async with (_build_class_slot(st, label=f"{label_prefix}-{axis}")
                         if axis in _BUILD_CLASS_AXES
@@ -44227,6 +44260,20 @@ def _confirm_lock() -> asyncio.Lock:
     return lock
 
 
+@contextlib.asynccontextmanager
+async def _confirm_hold() -> AsyncIterator[None]:
+    """One confirm at a time (`_confirm_lock`); inside a held-out
+    evaluation's exclusive hold the confirm is already alone, and waiting on
+    the lock there could wait on a confirm that waits for the execution lock
+    shared (DESIGN §6 *Inside an evaluation every concurrency gate is
+    already the holder's*)."""
+    if _EXEC_EXCLUSIVE.get():
+        yield
+        return
+    async with _confirm_lock():
+        yield
+
+
 def _host_cpu_psi(path: str = _HOST_PSI_CPU_PATH) -> float | None:
     """`some avg10` from a PSI file (a fixed kernel format, DESIGN §12), or
     None when it cannot be read or parsed."""
@@ -44396,7 +44443,7 @@ async def _confirm_new_failures(
     if not cand:
         return out
     clock = clock or time.monotonic
-    async with _confirm_lock():
+    async with _confirm_hold():
         budget = float(caps.get("confirm_budget_sec",
                                 DEFAULT_CAPS["confirm_budget_sec"]))
         gate = (prior_gate if prior_gate is not None
@@ -44701,7 +44748,7 @@ async def _confirm_still_failing(
     if not cand:
         return out
     clock = clock or time.monotonic
-    async with _confirm_lock():
+    async with _confirm_hold():
         budget = float(caps.get("confirm_budget_sec",
                                 DEFAULT_CAPS["confirm_budget_sec"]))
         gate = (_CONFIRM_NO_BUDGET_GATE if budget <= 0 else
@@ -44985,7 +45032,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         try:
             _mkdir_private(reports, own)
             _unlink_beneath(own, report)
-            async with _blt_semaphore(caps), \
+            async with _blt_slot(caps), \
                     _build_class_slot(st, label=f"{label}-ids"), \
                     _leaves_tree_as_found(tree, "test run", label):
                 t_run = time.monotonic()
@@ -45349,7 +45396,7 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
             return out
         out["repeats_required"] = reps
         counts: dict[str, int] = {}
-        async with _confirm_lock():
+        async with _confirm_hold():
             budget = float(caps.get("confirm_budget_sec",
                                     DEFAULT_CAPS["confirm_budget_sec"]))
             out["gate"] = (_CONFIRM_NO_BUDGET_GATE if budget <= 0
@@ -48971,14 +49018,27 @@ def _test_db_url(name: str) -> str:
     return f"postgresql://{user}@localhost/{name}?host={TEST_DB_SOCKET_DIR}"
 
 
-def _test_db_argv(st: "State", tree: str | Path, key: str) -> list[str]:
+# The wrapper runs its command without a database whenever a step fails; a
+# command that was PROMISED one (the writer's REAL DATABASE section) runs
+# behind this script instead, which refuses unless the command was handed
+# exactly the URL the wrapper composes (DESIGN §8: the section follows a
+# database that is there).
+REQUIRE_TEST_DB_SCRIPT = ROOT / "scripts" / "require-test-db.sh"
+TEST_DB_ABSENT_EXIT = 3
+
+
+def _test_db_argv(st: "State", tree: str | Path, key: str, *,
+                  require: bool = False) -> list[str]:
     """The prefix that gives one command in `tree` a throwaway database of
     its own (DESIGN §6 *No database server leerie starts is ever
     unconfined*): `bash scripts/sandbox-db.sh <pkg-dir> <name> --`, run as
     the confined command itself, so the server, the schema push (which
     loads the tree's own `prisma.config.ts`) and the command share one
     grant and one isolation and end together. `[]` outside a Prisma repo
-    whose datasource is PostgreSQL, or when the URL is refused (logged)."""
+    whose datasource is PostgreSQL, or when the URL is refused (logged).
+    With `require`, `REQUIRE_TEST_DB_SCRIPT` follows the wrapper: the
+    command runs only with that database, else the spawn exits
+    `TEST_DB_ABSENT_EXIT`."""
     project = _prisma_project(st.repo_root)
     if (project is None
             or project.get("provider") not in ("postgresql", "postgres")):
@@ -48991,7 +49051,36 @@ def _test_db_argv(st: "State", tree: str | Path, key: str) -> list[str]:
         return []
     pkg = Path(str(tree)) / project["dir"] if project["dir"] else Path(
         str(tree))
-    return ["bash", str(SANDBOX_DB_SCRIPT), str(pkg), name, "--"]
+    argv = ["bash", str(SANDBOX_DB_SCRIPT), str(pkg), name, "--"]
+    if require:
+        argv += ["bash", str(REQUIRE_TEST_DB_SCRIPT), url, "--"]
+    return argv
+
+
+async def _test_db_present(st: "State", tree: str | Path, key: str, *,
+                           log_path: Path) -> bool:
+    """Whether a command in `tree` is actually handed a database
+    (DESIGN §8: the writer's REAL DATABASE section follows a database that
+    is there, never the repository's shape): the wrapper run once, confined
+    as a measurement, over `REQUIRE_TEST_DB_SCRIPT` and `true`. False outside
+    a Prisma/PostgreSQL repo, and on any failure — the wrapper's own
+    fallback, a timeout, a spawn error (logged)."""
+    prefix = _test_db_argv(st, tree, key, require=True)
+    if not prefix:
+        return False
+    try:
+        rc, tail = await _run_streaming(
+            prefix + ["true"], grants=_measurement_grants(st, tree),
+            cwd=str(tree), timeout=300, log_path=log_path,
+            label=f"test database check {key}", verbosity="quiet")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"  test database: check in {tree} did not run "
+            f"({type(e).__name__}); no database is promised")
+        return False
+    if rc != 0:
+        log(f"  test database: none came up in {tree} (exit {rc}); no "
+            "database is promised")
+    return rc == 0
 
 
 def _prisma_db_context(repo: str | Path, rev: str) -> dict:
@@ -50660,9 +50749,13 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             # the base for the wrong reason and could never pass anywhere.
             out["reason"] = "dependency install failed in the writer worktree"
             return out
-        # In a Prisma/PostgreSQL repo the writer's session has a database of
-        # its own (`claude_p(db=True)`), and so does every validation run.
-        has_db = bool(_test_db_argv(st, wt, name))
+        # The writer is promised a database only when one comes up here,
+        # and its session then requires its own (`claude_p(db_required=)`):
+        # the REAL DATABASE section never follows the repository's shape
+        # alone (DESIGN §8). Every validation run still gets one where the
+        # wrapper can make it.
+        has_db = await _test_db_present(st, wt, f"{name}-db-check",
+                                        log_path=log_path)
         scope = st.data.get("defect_scope") or {}
         gt = scope.get("ground_truth") or {}
         lines = [
@@ -50705,7 +50798,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 caps=caps, st=st,
                 model=models.get("acceptance_writer", MODEL_DEFAULT),
                 effort=efforts.get("acceptance_writer"),
-                sid=sid + suffix, db=has_db)
+                sid=sid + suffix, db=has_db, db_required=has_db)
         res = await _call(user)
         if db_ctx is not None:
             hits = _prisma_mock_hits(_run_repo(st), base, wt,
@@ -51599,7 +51692,7 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
         return out
     clock = clock or time.monotonic
     pending = list(rels)
-    async with _confirm_lock():
+    async with _confirm_hold():
         budget = float(caps.get("confirm_budget_sec",
                                 DEFAULT_CAPS["confirm_budget_sec"]))
         if budget > 0:
@@ -55523,68 +55616,80 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                        and quote in _scope_norm(item_text))
     if not all(g.values()):
         return out
-    dst = confirm_tree / rel
-    if _lexists_beneath(Path(confirm_tree), dst):
-        g["placed"] = False
-        return out
-    log_path = _held_out_logs(st.run_dir) / f"falsifier-confirm-{label}.log"
-    timeout = float(caps.get("worker_timeout_sec")
-                    or DEFAULT_CAPS["worker_timeout_sec"])
-    # The probe's source: a copy of leerie's own, outside every grant, so
-    # nothing the lane does later changes what was confirmed.
-    fd, src = tempfile.mkstemp(prefix="leerie-probe-",
-                               suffix=Path(rel).suffix)
-    os.close(fd)
-    try:
-        # Read from the lane, which its falsifier wrote, without following
-        # a link it left there.
-        Path(src).write_bytes(_read_beneath(lane, lane / rel))
-        place = ((src, rel),)
+    # One exclusive hold from the placement check through the facts read:
+    # the first run, the B* reruns and the facts read are one evaluation,
+    # and samples queue for it on the execution lock itself, whose writer
+    # preference then sees them — never on a lock of their own outside it,
+    # where each release admitted waiting workers ahead of the next confirm
+    # (DESIGN §6 *Evaluations queue on the lock itself*). The callees'
+    # sections nest; their slots and the confirm hold pass through.
+    async with _held_out_section(st):
+        dst = confirm_tree / rel
+        if _lexists_beneath(Path(confirm_tree), dst):
+            g["placed"] = False
+            return out
+        log_path = (_held_out_logs(st.run_dir)
+                    / f"falsifier-confirm-{label}.log")
+        timeout = float(caps.get("worker_timeout_sec")
+                        or DEFAULT_CAPS["worker_timeout_sec"])
+        # The probe's source: a copy of leerie's own, outside every grant, so
+        # nothing the lane does later changes what was confirmed.
+        fd, src = tempfile.mkstemp(prefix="leerie-probe-",
+                                   suffix=Path(rel).suffix)
+        os.close(fd)
+        try:
+            # Read from the lane, which its falsifier wrote, without
+            # following a link it left there.
+            Path(src).write_bytes(_read_beneath(lane, lane / rel))
+            place = ((src, rel),)
 
-        async def _run(left: float) -> set[str] | None:
-            got = await _capture_failing_test_ids(
-                str(confirm_tree), cmd, st, caps, label=f"falsifier-{label}",
-                log_path=log_path, timeout=min(left, timeout), serial=True,
-                files=[rel], db=True, place=place)
-            return set(got["ids"]) if got is not None else None
-        first = await _run(timeout)
-        cid = _falsifier_case_id(first or (), str(res.get("case_name") or ""))
-        g["case_fails"] = cid is not None
-        if cid is None:
-            return out
-        out["case_id"] = cid
-        verdict = await _confirm_still_failing(
-            [cid], _run, caps, label=f"falsifier {label}",
-            seen_failing=True)
-        g["fails_under_bstar"] = cid in verdict["confirmed"]
-        if not g["fails_under_bstar"]:
-            return out
-        title = cid.split(" :: ", 1)[1] if " :: " in cid else cid
-        facts = await _probe_case_facts_placed(st, confirm_tree, src, rel,
-                                               title)
-        err = str(facts.get("error") or "")
-        g["facts_read"] = not err.startswith("facts_failed")
-        if not g["facts_read"]:
-            # The check did not run: its own reason, so the miss is never
-            # read as a failed assertion or coupling gate.
-            out["facts_error"] = {k: facts[k] for k in ("error", "stderr")
-                                  if k in facts}
-            log(f"  delivery detection: falsifier {label}: AST facts "
-                f"script failed ({err}); sample not judged")
-            return out
-        reach = _scope_norm(" ".join(str(x) for x in
-                                     (facts.get("reach_src") or [])))
-        aq = _scope_norm(str(res.get("assertion_quote") or ""))
-        g["assertion_in_case"] = len(aq) >= 6 and aq in reach
-        cp = await asyncio.to_thread(_falsifier_coupling, facts, rel,
-                                     _run_repo(st), sha, item_text)
-        out["coupling"] = cp
-        g["not_coupled"] = cp.get("coupled") is False
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(src)
-    out["confirmed"] = all(g.values())
-    return out
+            async def _run(left: float) -> set[str] | None:
+                got = await _capture_failing_test_ids(
+                    str(confirm_tree), cmd, st, caps,
+                    label=f"falsifier-{label}", log_path=log_path,
+                    timeout=min(left, timeout), serial=True, files=[rel],
+                    db=True, place=place)
+                return set(got["ids"]) if got is not None else None
+            first = await _run(timeout)
+            cid = _falsifier_case_id(first or (),
+                                     str(res.get("case_name") or ""))
+            g["case_fails"] = cid is not None
+            if cid is None:
+                return out
+            out["case_id"] = cid
+            verdict = await _confirm_still_failing(
+                [cid], _run, caps, label=f"falsifier {label}",
+                seen_failing=True)
+            g["fails_under_bstar"] = cid in verdict["confirmed"]
+            if not g["fails_under_bstar"]:
+                return out
+            title = cid.split(" :: ", 1)[1] if " :: " in cid else cid
+            facts = await _probe_case_facts_placed(st, confirm_tree, src,
+                                                   rel, title)
+            err = str(facts.get("error") or "")
+            g["facts_read"] = not err.startswith("facts_failed")
+            if not g["facts_read"]:
+                # The check did not run: its own reason, so the miss is never
+                # read as a failed assertion or coupling gate.
+                out["facts_error"] = {k: facts[k]
+                                      for k in ("error", "stderr")
+                                      if k in facts}
+                log(f"  delivery detection: falsifier {label}: AST facts "
+                    f"script failed ({err}); sample not judged")
+                return out
+            reach = _scope_norm(" ".join(str(x) for x in
+                                         (facts.get("reach_src") or [])))
+            aq = _scope_norm(str(res.get("assertion_quote") or ""))
+            g["assertion_in_case"] = len(aq) >= 6 and aq in reach
+            cp = await asyncio.to_thread(_falsifier_coupling, facts, rel,
+                                         _run_repo(st), sha, item_text)
+            out["coupling"] = cp
+            g["not_coupled"] = cp.get("coupled") is False
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(src)
+        out["confirmed"] = all(g.values())
+        return out
 
 
 def _falsifier_save_probe(st: "State", lane: Path, i: int,
@@ -55693,8 +55798,6 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                 ["git", "--git-dir", str(_run_repo(st)), "diff", "--stat=160",
                  f"{own}..{sha}"], capture_output=True, text=True,
                 check=False).stdout
-        confirm_lock = asyncio.Lock()
-
         async def _sample(i: int, n: int, lane: Path) -> dict:
             item = normalized[i]
             # Back to the pristine final commit between samples. Each
@@ -55737,11 +55840,12 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             rec.update({key: res.get(key) for key in (
                 "verdict", "probe_path", "case_name", "assertion_quote",
                 "item_span_quote", "entry_point", "reason")})
-            async with confirm_lock:
-                rec.update(await _falsifier_gates(
-                    st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
-                    sha=sha, item_text=item.get("item", ""),
-                    acc_paths=acc_paths, label=f"i{i}-s{n}"))
+            # Its confirm queues on the execution lock
+            # (`_falsifier_gates`' section), one at a time.
+            rec.update(await _falsifier_gates(
+                st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
+                sha=sha, item_text=item.get("item", ""),
+                acc_paths=acc_paths, label=f"i{i}-s{n}"))
             if rec.get("confirmed"):
                 saved = _falsifier_save_probe(st, lane, i, res)
                 if saved:
@@ -60710,7 +60814,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
                 _take(cmd, await _once(argv, timeout))
                 if not cmd["passed"] and not cmd["environment_limit"]:
                     # B*: a failure is re-checked under the host-pressure gate.
-                    async with _confirm_lock():
+                    async with _confirm_hold():
                         budget = float(caps.get(
                             "confirm_budget_sec",
                             DEFAULT_CAPS["confirm_budget_sec"]))
@@ -67609,6 +67713,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # so an abnormal exit or a client that loses the piped stream still leaves
     # a diagnosable trail (the gap that made run 26fd0fa5 undiagnosable).
     _install_run_log_tee(st.run_dir)
+
+    # Before ANY dispatch that can start a worker or a repository command —
+    # a fresh run, `resume`, `--phase judge|heal` — and after the tee, so a
+    # refusal is in orchestrator.log: the one entry that proves the kernel
+    # confines and the runtime isolates, and turns isolation on (DESIGN §6
+    # *Fail closed, on every entry*). An unconditional statement of this
+    # body on purpose: `tests/test_confinement_entry.py` proves by rule that
+    # nothing above it spawns a confined process.
+    _require_confinement(st.run_dir)
 
     # Resolve per-worker cgroup memory cap; resolver die()s on a bad size
     # string. Auto-derives a fixed isolation CEILING from the shared
