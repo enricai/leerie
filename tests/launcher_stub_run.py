@@ -77,12 +77,23 @@ case "$1" in
     { for a in "$@"; do printf '%s\n' "$a"; done; } > "$w/run.argv"
     cid="" prev=""
     for a in "$@"; do [ "$prev" = "--cidfile" ] && cid=$a; prev=$a; done
+    if [ -n "${STUB_CREATED_SECONDS:-}" ]; then
+      # nerdctl writes the cidfile at create, before the task starts; a
+      # created container cannot be killed.
+      [ -z "$cid" ] || printf 'stubcid\n' > "$cid"
+      printf 'created\n' > "$w/container.state"
+      "__SLEEP__" "$STUB_CREATED_SECONDS"
+    fi
+    printf 'running\n' > "$w/container.state"
     "__SLEEP__" "${STUB_RUN_SECONDS:-0}" &
     printf '%s\n' "$!" > "$w/container.pid"
     [ -z "$cid" ] || printf 'stubcid\n' > "$cid"
     wait "$!"
     exit $? ;;
   kill)
+    if [ -f "$w/container.state" ] && [ "$(< "$w/container.state")" = created ]; then
+      printf 'container not running\n' >&2; exit 1
+    fi
     [ ! -f "$w/container.pid" ] || kill -KILL "$(< "$w/container.pid")" 2>/dev/null
     exit 0 ;;
   info|version) printf 'Version: 2.0.0\n'; exit 0 ;;

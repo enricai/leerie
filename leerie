@@ -9540,11 +9540,32 @@ else
   }
   # From the INT/TERM traps: kill the container, and stop and wait for its
   # client, so the client neither outlives the launcher nor leaves behind a
-  # container it creates after the cidfile was read.
+  # container it creates after the cidfile was read. The client is always
+  # signalled too, and the kill is retried until it has exited: nerdctl
+  # writes the cidfile when it creates the container, before the task
+  # starts, and `nerdctl kill` on a created container fails. Signalling the
+  # client only while the cidfile was empty left a TERM in that window
+  # waiting for the whole run (review round 28 B1). A started container
+  # gets the client's TERM through nerdctl's signal proxy; a client stopped
+  # before the start leaves a created container, which `--rm` and the EXIT
+  # trap's kill handle. Bounded at 30 s, then the client is killed.
   _stop_run() {
+    local _n=0
     _kill_container_from_cidfile || true
     if [ -n "${_run_pid:-}" ]; then
-      [ -s "${_cidfile:-}" ] || kill -TERM "$_run_pid" 2>/dev/null || true
+      kill -TERM "$_run_pid" 2>/dev/null || true
+      while kill -0 "$_run_pid" 2>/dev/null; do
+        if [ "$_n" -ge 300 ]; then
+          kill -KILL "$_run_pid" 2>/dev/null || true
+          break
+        fi
+        sleep 0.1
+        _n=$((_n + 1))
+        if [ $((_n % 10)) -eq 0 ]; then
+          _kill_container_from_cidfile || true
+          kill -TERM "$_run_pid" 2>/dev/null || true
+        fi
+      done
       wait "$_run_pid" 2>/dev/null || true
       _run_pid=""
       _kill_container_from_cidfile || true

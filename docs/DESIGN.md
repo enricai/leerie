@@ -6919,6 +6919,12 @@ killed by hand. Three mechanisms close this gap, defense in depth:
    it explicitly, and `wait`s for it. INT or TERM then reaches the trap at
    once. The trap kills the container, waits for the client to exit, and
    exits 130 or 143. The EXIT trap still brings the run's branch back.
+   The trap signals the client as well as killing the container, and
+   repeats both until the client has exited, for at most 30 s. nerdctl
+   writes the cidfile when it creates the container, before the task
+   starts, and `nerdctl kill` fails on a created container. A trap that
+   signalled the client only while the cidfile was empty therefore left a
+   TERM in that window waiting for the whole run (review round 28 B1).
 3. **Stale-container reaper (recovery).** Before spawning on the local
    `resume` path, the launcher checks for an already-`Up` container for
    this run whose owning launcher PID is dead (via a `leerie.launcher_pid`

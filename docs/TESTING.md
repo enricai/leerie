@@ -5764,7 +5764,9 @@ every other `cat` to the real one. `make_world(apparmor=)` is `current`
   `sleep` with it.
 - `tests/test_launcher_signal_stops_run.py` (review round 27 O1): TERM and
   INT to the launcher during a 300 s container exit 143 / 130 within 20 s,
-  after `nerdctl kill`, with the client gone and the cidfile removed.
+  after `nerdctl kill`, with the client gone and the cidfile removed. A
+  TERM in the created window (the cidfile written, the task not started)
+  ends the launcher with 143 within 5 s, and the container never starts.
 - `tests/test_launcher_double_dash.py` (review round 27 O3): `--no-push --
   <task>` for `-task`, `--no-push` and `--state-dir` hands the container
   every flag before `--` and `-- <task>` last. `-- --no-push` is a task, not

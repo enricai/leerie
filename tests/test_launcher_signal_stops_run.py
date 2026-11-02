@@ -9,6 +9,12 @@ launcher now runs the client in the background and `wait`s for it.
 Real launcher, stub `nerdctl` whose container runs for minutes: the signal
 ends the launcher within seconds with 128+signal, the container is killed
 (`nerdctl kill`), the client has exited, and the EXIT trap's clean-up ran.
+
+Review round 28 B1: a TERM after nerdctl wrote the cidfile (container
+created) but before the task started found `nerdctl kill` failing and, the
+cidfile being non-empty, left the client unsignalled; the launcher waited
+for the whole run (24.3 s on the reviewer's 2 s window and 20 s run).
+Inverted with the stub's created window.
 """
 from __future__ import annotations
 
@@ -63,5 +69,37 @@ def test_a_signal_stops_the_run_promptly(tmp_path: Path, sig, rc):
         assert marked_pids(w["mark"]) == []
         # The EXIT trap ran after the signal trap: the cidfile is removed.
         assert not list(w["state"].glob(".cidfile-*"))
+    finally:
+        reap(w["mark"])
+
+
+def test_a_signal_in_the_created_window_stops_the_run_promptly(
+        tmp_path: Path):
+    w = make_world(tmp_path)
+    state = w["world"] / "container.state"
+    try:
+        proc = launch(w, ["--no-push", "a task"],
+                      env_extra={"STUB_RUN_SECONDS": CONTAINER_SECONDS,
+                                 "STUB_CREATED_SECONDS": "3"},
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                      stdin=subprocess.DEVNULL)
+        deadline = time.monotonic() + 60
+        while not state.exists() and time.monotonic() < deadline:
+            assert proc.poll() is None, "launcher exited before the run"
+            time.sleep(0.05)
+        assert state.read_text().strip() == "created"
+        sent = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            got = proc.wait(timeout=PROMPT_S)
+        except subprocess.TimeoutExpired:
+            pytest.fail("the launcher waited for the run after a TERM in "
+                        "the created window")
+        assert got == 143, got
+        assert time.monotonic() - sent < 5.0
+        # The client was stopped before it started the container.
+        time.sleep(3.5)
+        assert state.read_text().strip() == "created"
+        assert not (w["world"] / "container.pid").exists()
     finally:
         reap(w["mark"])
