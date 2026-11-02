@@ -636,12 +636,37 @@ under `set -e` had ended the launcher there silently, leaking
 `.spawn.lock` (review r25 M1), while the older tests, which run without
 `set -e`, stayed green — and a failed `ssh-agent` spawn returns with a message and no lock.
 
-`tests/test_resume_push_writes_pr.py` (3 tests) drives the real
+`tests/test_resume_push_writes_pr.py` (4 tests) drives the real
 `_run_phases` resume of a finished run with only `claude_p` stubbed: a resume
 continuing with a push and no `run.json.pr_title` runs `pr_writer` and records
 its title (review r25 L1: `resume <id> --push` of a finished `--no-push` run
 pushed with the fallback body); a resume continuing without a push, or of a
-run whose PR is written, runs no worker.
+run whose PR is written, runs no worker; nor does a resume of a run the host
+already pushed (`pushed_at` and `pr_url` set, no `pr_title`: its `pr_writer`
+failed at finalize and its PR is open with the fallback body; review round
+26, I1). Dropping the `pushed_at` check turns that last test red.
+
+`tests/test_host_python_is_isolated.py` (11 tests: 9 functions, two of them
+run once with the operator's `tenacity` on `PYTHONPATH` and once in the user
+site; DESIGN §6 *The host never imports the repository's code*, review round
+25 I1 and round 26 F1). A rule over every host-run shell file (the launcher,
+`host-finalize.sh`, `install.sh`, `runtime-install.sh`, `scripts/remote/`)
+fails any `python3` invocation without `-I`; an anti-vacuity test checks the
+scan sees the known calls, and a planted unisolated call proves it can fail.
+The reviewer's proof, inverted: the bare-resume pick seam, the
+`config --recapture` seam and the launcher's real `NO_PUSH` block run from a
+checkout holding planted stdlib-named modules, never run them, and still do
+their job. The rebaser seam (as `host-finalize.sh` writes it) and the
+recapture seam run from a checkout holding a planted `tenacity.py`, at its
+root and behind a relative `PYTHONPATH` entry, and must import the
+operator's `tenacity`, never the plant (`admit_operator_import_paths`). The
+chain synth-merge helper, given `.` and an absolute operator entry on
+`PYTHONPATH`, imports the operator's `chain.git_ops` and not the
+checkout's. Falsified: dropping `-I` from the recapture seam, the
+bare-resume seam and the `NO_PUSH` record read turns 6 tests red (the rule,
+the three seam tests and both recapture `tenacity` cases); replacing both
+seams' `admit_operator_import_paths()` call with `pass` turns the 4
+`tenacity` cases red.
 
 ## fetch_branch, config, and group verbs
 
@@ -5966,7 +5991,7 @@ resolver stays `done` with no `failed_at`; a run with work left lists
 
 ## Run choices on resume, and a phase-1 death resumes (review round 23)
 
-`tests/test_run_choices_on_resume.py` (34 tests, DESIGN §6 *A resumed run
+`tests/test_run_choices_on_resume.py` (38 tests, DESIGN §6 *A resumed run
 continues under the choices it was started with*; review round 23 exec, run
 A′). Real `main()` runs a fresh run (`--no-push`, a cap, a per-worker model
 and effort, a skip flag, `--source-of-truth`) through the real `_run_phases`
@@ -5995,6 +6020,16 @@ tests, review round 24 L2): the launcher's real bare-resume block reads the
 run `resolve_run_id` picks, over three runs whose records disagree; the
 picked record beats the ambient env; nothing to pick falls back to env; a
 remote runtime does not pick host-side.
+`TestRunJsonNoPushHasOneWriter` (4 tests, review round 25 F3):
+`run.json.no_push` has one writer, `_record_run_push_choice`, which writes
+the run's push choice or `true` while the run has nothing to push. A plain
+resume of a no-work run whose choice is push keeps `no_push` true; a
+control with work left takes the choice; by rule (AST), only that function
+calls `_write_run_json` with `no_push`, and only `_finish_no_work_run`,
+`main` and `phase_finalize` call it; `_run_has_nothing_to_push` holds for
+the `done:` terminal phases and not otherwise. Restoring `main()`'s direct
+`_write_run_json(st.run_dir, no_push=bool(args.no_push))` turns the no-work
+resume and the rule red.
 
 `tests/test_resume_after_phase1_death.py` (5 tests, DESIGN §6 *Resumable
 planning*, *The first phase is a phase like any other*; review round 23
