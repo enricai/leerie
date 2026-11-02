@@ -8587,12 +8587,22 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `unmet_parts`) — the frozen F+ user prompt line for line; the record
   is not passed (DESIGN §8 *What ships is what was measured*).
   `prompts/falsifier.md` is the frozen `falsifier_prompt.md` +
-  `fplus_addendum.md` with `.q2ctx/` → `FALSIFIER_LEADS_DIR`. `_falsifier_probe_activity` reads the
-  sample's own log (`_iter_log_tool_use(kinds=("Write", "Edit",
-  "MultiEdit", "Bash"))`): `created` when a written path is test-shaped
-  (`_is_test_file`) and outside the leads, `ran` when a Bash command names
-  it (path or basename) and a segment's lead verb is a BLT verb or one of
-  `_FALSIFIER_RUNNER_VERBS`. `_falsifier_needs_reask` (could_not_demonstrate
+  `fplus_addendum.md` with `.q2ctx/` → `FALSIFIER_LEADS_DIR`. `_falsifier_probe_activity(log_path, lane, repo_root)`
+  runs after the sample's worker returns and before the next sample's
+  `_restore_tree` of that lane. `files` are the lane's own probes: its
+  untracked, not-ignored paths (`_untracked_listing(lane)`, git addressed
+  by `_tree_git_args`) that are test-shaped (`_is_test_file`), outside
+  `FALSIFIER_LEADS_DIR`, and a regular file reached without following a
+  link (`_regular_file_beneath`); `created` is `bool(files)`, whatever tool
+  wrote them. `ran` reads the Bash commands of the sample's registered
+  transcript (`_iter_log_tool_use(kinds=("Bash",))`) through
+  `_falsifier_runs_probe(cmd, rel, lane)`: a shell segment
+  (`_BLT_SEG_RE`, lead stripped by `_BLT_SEG_LEAD_RE`) whose runner is a
+  BLT verb or one of `_FALSIFIER_RUNNER_VERBS` — as its first token, or
+  after a Python interpreter's `-m` — and one of whose arguments (quotes
+  dropped, a `::` node suffix dropped, a path under the lane made
+  relative, normalised) is the probe, its basename, or a directory
+  holding it (`.` included). `_falsifier_needs_reask` (could_not_demonstrate
   without both) → one more `claude_p(user_prompt=FALSIFIER_REASK_NOTE,
   resume_session=<_log_session_id(log)>, sid=<sid>-reask)` in the same
   checkout (`claude_p`'s `resume_session` adds `--resume <id>`).

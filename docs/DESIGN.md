@@ -9993,9 +9993,21 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   infrastructure miss, never as a failed assertion or coupling check —
   the falsifier did not lose, the check did not run.
 - **One re-ask.** A sample that answers `could_not_demonstrate`
-  without having written a test-shaped file and run a command naming
-  it — read mechanically from its own transcript's `tool_use` records
-  — is resumed once in the same session and tree with a fixed note.
+  without having both left a probe in its checkout and run it is
+  resumed once in the same session and tree with a fixed note. Each
+  half is read from what happened, never from which tool did it: the
+  probe is a test-shaped file the sample's checkout holds untracked
+  outside the leads when the worker returns (leerie's own listing of
+  the checkout, before the next sample's restore), whatever wrote it —
+  the falsifier writes with a shell heredoc as often as with an editor
+  tool; it ran when one of the commands the sample executed (the Bash
+  calls of its registered transcript) invokes a test runner on that
+  file or on a directory holding it. A runner invoked on neither — the
+  whole suite, another path — does not count: a missed re-ask could
+  lose a demonstration, an extra one costs one worker. (Review round 24
+  M1: reading `created` from `Write`/`Edit` calls classed all 15 of 15
+  real first samples, each of which had written and run a probe in one
+  heredoc command, as having done neither, and re-asked every one.)
 
 An item is unmet when the judge confirmed it unmet OR any of its
 samples is confirmed (`delivery_gate.unmet_final`, with the per-item

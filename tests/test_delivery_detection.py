@@ -523,36 +523,150 @@ def _tool(name: str, inp: dict, session: str = "sess-1") -> dict:
                                      "name": name, "input": inp}]}}
 
 
+# Real first-sample commands of review round 24 (runs a and b2,
+# `runA.falsifier-transcripts/falsifier-i0-s0.log`): the probe is written by a
+# shell heredoc and run on its directory in the same Bash call, never by a
+# Write/Edit tool.
+R24_PY_HEREDOC = (
+    "mkdir -p probe_x && cat > probe_x/test_probe.py <<'E'\nimport pytest\n"
+    "from toystats import median\ndef test_p():\n"
+    "    assert median([5,1,3,2,4])==3\n    assert median([1,2,3,4])==2.5\n"
+    "    assert median([-1,-5])==-3\n"
+    "    with pytest.raises(ValueError): median([])\nE\n"
+    "python -m pytest probe_x -q 2>&1 | tail -3")
+R24_PY_PROBE = "probe_x/test_probe.py"
+R24_VITEST_HEREDOC = (
+    "mkdir -p test/probe_x && cat > test/probe_x/p.test.js <<'E'\n"
+    "import { it, expect } from 'vitest';\n"
+    "import { slugify } from '../../src/slugify.js';\nit('p', () => {\n"
+    "  expect(slugify('  Hello,  World! ')).toBe('hello-world');\n"
+    "  expect(slugify('--a___b--')).toBe('a-b');\n});\nE\n"
+    "npx vitest run test/probe_x 2>&1 | tail -15")
+R24_VITEST_PROBE = "test/probe_x/p.test.js"
+
+
 class TestReask:
-    def test_activity_and_reask_predicate(self, leerie, tmp_path):
+    """The re-ask predicate reads `created` from the lane itself (its
+    untracked test-shaped files) and `ran` from the commands the sample
+    executed — never from which tool wrote the file (DESIGN §8 *Delivery
+    detection*, *One re-ask*; review round 24 M1)."""
+
+    CND = {"verdict": "could_not_demonstrate"}
+
+    @staticmethod
+    def _lane(tmp_path: Path) -> tuple[Path, Path]:
         repo, _ = _repo(tmp_path)
         lane = tmp_path / "lane"
-        log = tmp_path / "f.log"
-        cnd = {"verdict": "could_not_demonstrate"}
+        _git(tmp_path, "clone", "-q", str(repo), str(lane))
+        return repo, lane
 
-        def act(events):
-            _write_log(log, events)
-            return leerie._falsifier_probe_activity(log, lane, repo)
-        # Wrote a test-shaped probe AND ran it: no re-ask.
-        a = act([_tool("Write", {"file_path": f"{lane}/{PROBE_REL}"}),
-                 _tool("Bash", {"command": "cd x && python3 -m pytest -q "
-                                f"{PROBE_REL}"})])
+    @staticmethod
+    def _act(leerie, tmp_path, repo, lane, events, name="f.log"):
+        log = tmp_path / "logs" / name
+        _write_log(log, events)
+        return leerie._falsifier_probe_activity(log, lane, repo)
+
+    def test_a_heredoc_probe_that_ran_is_not_reasked(self, leerie, tmp_path):
+        repo, lane = self._lane(tmp_path)
+        # What the sample's heredoc left in the lane.
+        (lane / "probe_x").mkdir()
+        (lane / R24_PY_PROBE).write_text("def test_p():\n    assert 1\n")
+        a = self._act(leerie, tmp_path, repo, lane,
+                      [_tool("Bash", {"command": "cat toystats.py; ls"}),
+                       _tool("Bash", {"command": R24_PY_HEREDOC})])
+        assert a == {"created": True, "ran": True, "files": [R24_PY_PROBE]}
+        assert leerie._falsifier_needs_reask(self.CND, a) is False
+
+    def test_a_heredoc_run_in_a_separate_call_counts(self, leerie, tmp_path):
+        repo, lane = self._lane(tmp_path)
+        (lane / "probe_x").mkdir()
+        (lane / R24_PY_PROBE).write_text("def test_p():\n    assert 1\n")
+        a = self._act(leerie, tmp_path, repo, lane, [
+            _tool("Bash", {"command": f"cat > {R24_PY_PROBE} <<'E'\nx\nE"}),
+            _tool("Bash", {"command": "python3 -m pytest -q probe_x/"})])
         assert a["created"] and a["ran"]
-        assert leerie._falsifier_needs_reask(cnd, a) is False
-        # Wrote it, never ran it: re-ask.
-        a = act([_tool("Write", {"file_path": f"{lane}/{PROBE_REL}"}),
-                 _tool("Bash", {"command": f"cat {PROBE_REL}"})])
+
+    def test_a_sample_that_wrote_nothing_is_reasked(self, leerie, tmp_path):
+        repo, lane = self._lane(tmp_path)
+        # It ran the suite and even claimed a Write: the lane holds no probe.
+        a = self._act(leerie, tmp_path, repo, lane, [
+            _tool("Write", {"file_path": f"{lane}/{PROBE_REL}"}),
+            _tool("Bash", {"command": f"python3 -m pytest -q {PROBE_REL}"})])
+        assert a == {"created": False, "ran": False, "files": []}
+        assert leerie._falsifier_needs_reask(self.CND, a) is True
+
+    def test_a_probe_that_never_ran_is_reasked(self, leerie, tmp_path):
+        repo, lane = self._lane(tmp_path)
+        (lane / "probe_x").mkdir()
+        (lane / R24_PY_PROBE).write_text("def test_p():\n    assert 1\n")
+        a = self._act(leerie, tmp_path, repo, lane, [
+            _tool("Bash", {"command": f"cat > {R24_PY_PROBE} <<'E'\nx\nE\n"
+                                      f"cat {R24_PY_PROBE}"}),
+            # A runner on the whole suite, or on another path, is not a run
+            # of the probe.
+            _tool("Bash", {"command": "python3 -m pytest -q"}),
+            _tool("Bash", {"command": "pytest tests/other"})])
         assert a["created"] and not a["ran"]
-        assert leerie._falsifier_needs_reask(cnd, a) is True
-        # Ran the suite on a lead copy only: the lead is not a probe.
-        a = act([_tool("Write", {"file_path":
-                                 f"{lane}/.leerie-falsifier/test_x.py"}),
-                 _tool("Bash", {"command": "pytest .leerie-falsifier/test_x.py"})])
-        assert not a["created"]
-        assert leerie._falsifier_needs_reask(cnd, a) is True
+        assert a["files"] == [R24_PY_PROBE]
+        assert leerie._falsifier_needs_reask(self.CND, a) is True
+
+    def test_a_write_tool_probe_still_counts(self, leerie, tmp_path):
+        repo, lane = self._lane(tmp_path)
+        (lane / "falsify_probe").mkdir()
+        (lane / PROBE_REL).write_text(PROBE_SRC)
+        a = self._act(leerie, tmp_path, repo, lane, [
+            _tool("Write", {"file_path": f"{lane}/{PROBE_REL}"}),
+            _tool("Bash", {"command": "cd x && python3 -m pytest -q "
+                                      f"{lane}/{PROBE_REL}::test_add"})])
+        assert a["created"] and a["ran"]
+        assert leerie._falsifier_needs_reask(self.CND, a) is False
         # Never re-asked after a demonstration claim.
         assert leerie._falsifier_needs_reask(
-            {"verdict": "unmet_demonstrated"}, a) is False
+            {"verdict": "unmet_demonstrated"},
+            {"created": False, "ran": False}) is False
+
+    def test_leads_tracked_files_and_links_are_not_probes(self, leerie,
+                                                          tmp_path):
+        repo, lane = self._lane(tmp_path)
+        leads = lane / leerie.FALSIFIER_LEADS_DIR
+        leads.mkdir()
+        (leads / "test_x.py").write_text("def test_x():\n    pass\n")
+        # An edit to a tracked file is not a new probe.
+        (lane / "conftest.py").write_text("# edited\n")
+        outside = tmp_path / "test_outside.py"
+        outside.write_text("def test_o():\n    pass\n")
+        (lane / "test_link.py").symlink_to(outside)
+        a = self._act(leerie, tmp_path, repo, lane, [
+            _tool("Bash", {"command": "pytest .leerie-falsifier/test_x.py "
+                                      "test_link.py conftest.py"})])
+        assert a == {"created": False, "ran": False, "files": []}
+        assert leerie._falsifier_needs_reask(self.CND, a) is True
+
+    def test_runs_probe_on_real_and_edge_commands(self, leerie):
+        f = leerie._falsifier_runs_probe
+        lane = "/w/lane"
+        none = frozenset()
+        assert f(R24_VITEST_HEREDOC, R24_VITEST_PROBE, lane, none)
+        assert f(R24_PY_HEREDOC, R24_PY_PROBE, lane, none)
+        assert f("python3.12 -m pytest ./probe_x", R24_PY_PROBE, lane, none)
+        assert f("pytest .", R24_PY_PROBE, lane, none)
+        assert f("cd probe_x && pytest test_probe.py", R24_PY_PROBE, lane,
+                 none)
+        assert f(f"npx vitest run '{lane}/test/probe_x'", R24_VITEST_PROBE,
+                 lane, none)
+        # The repository's own BLT verb is a runner too.
+        assert f("make check probe_x", R24_PY_PROBE, lane,
+                 frozenset({"make"}))
+        assert not f("make check probe_x", R24_PY_PROBE, lane, none)
+        # Naming the file outside a runner is not running it.
+        assert not f(f"cat {R24_PY_PROBE}; ls probe_x", R24_PY_PROBE, lane,
+                     none)
+        assert not f("python -m pytest probe_y", R24_PY_PROBE, lane, none)
+        assert not f("python -m pytest probe", R24_PY_PROBE, lane, none)
+        assert not f("python probe_x/test_probe.py", R24_PY_PROBE, lane,
+                     none)
+        assert not f("npx vitest run /elsewhere/test/probe_x",
+                     R24_VITEST_PROBE, lane, none)
 
     def test_session_id_is_read_from_the_log(self, leerie, tmp_path):
         log = tmp_path / "f.log"
@@ -1249,18 +1363,60 @@ class TestRunDeliveryDetection:
         st.data["required_items"] = [ITEMS[0]]
         st.save()
 
+        # As every real r24 first sample did: the probe written by a shell
+        # heredoc and run on its directory in one Bash call, no Write tool.
         def behave(kw, n):
-            lane = kw["cwd"]
+            lane = Path(kw["cwd"])
+            (lane / "probe_x").mkdir(exist_ok=True)
+            (lane / R24_PY_PROBE).write_text(PASSING_PROBE_SRC)
             _write_log(leerie._worker_log_path(st.run_dir, kw["sid"],
                                                "falsifier"),
-                       [_tool("Write", {"file_path": f"{lane}/{PROBE_REL}"}),
-                        _tool("Bash", {"command": f"pytest -q {PROBE_REL}"})])
+                       [_tool("Bash", {"command": R24_PY_HEREDOC})])
             return _claim(verdict="could_not_demonstrate", probe_path="")
         calls = _falsifier_stub(leerie, monkeypatch, st, behave)
         asyncio.run(leerie._run_delivery_detection(
             st.run_dir, st, caps, MODELS, EFFORTS))
         assert [c["sid"] for c in calls] == ["falsifier-i0-s0"]
-        assert st.data["delivery_gate"]["unmet_final"] == []
+        gate = st.data["delivery_gate"]
+        assert gate["unmet_final"] == []
+        smp = gate["items"][0]["falsifier"]["samples"][0]
+        assert smp["probe_activity"] == {"created": True, "ran": True,
+                                         "files": [R24_PY_PROBE]}
+        assert smp["reasked"] is False
+
+    def test_a_previous_samples_probe_is_not_the_next_samples(
+            self, leerie, tmp_path, monkeypatch):
+        # Read from the lane, `created` must be of this sample alone: the
+        # lane is restored before each sample, so the first sample's probe
+        # never counts for the second, which wrote nothing and is re-asked.
+        repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                              k=2)
+        st.data["required_items"] = [ITEMS[0]]
+        st.save()
+
+        def behave(kw, n):
+            lane = Path(kw["cwd"])
+            log = leerie._worker_log_path(st.run_dir, kw["sid"], "falsifier")
+            if kw["sid"] == "falsifier-i0-s0":
+                (lane / "probe_x").mkdir(exist_ok=True)
+                (lane / R24_PY_PROBE).write_text(PASSING_PROBE_SRC)
+                _write_log(log, [_tool("Bash", {"command": R24_PY_HEREDOC})])
+            elif not kw.get("resume_session"):
+                _write_log(log, [_tool("Bash", {
+                    "command": "python -m pytest probe_x -q"})])
+            return _claim(verdict="could_not_demonstrate", probe_path="")
+        calls = _falsifier_stub(leerie, monkeypatch, st, behave)
+        asyncio.run(leerie._run_delivery_detection(
+            st.run_dir, st, caps, MODELS, EFFORTS))
+        assert [c["sid"] for c in calls
+                if c["schema_key"] == "falsifier"] == [
+            "falsifier-i0-s0", "falsifier-i0-s1", "falsifier-i0-s1-reask"]
+        s0, s1 = st.data["delivery_gate"]["items"][0]["falsifier"]["samples"]
+        assert (s0["probe_activity"]["created"], s0["reasked"]) == (True,
+                                                                    False)
+        assert s1["probe_activity"] == {"created": False, "ran": False,
+                                        "files": []}
+        assert s1["reasked"] is True
 
     def test_resume_skips_a_finished_detection(self, leerie, tmp_path,
                                                monkeypatch):

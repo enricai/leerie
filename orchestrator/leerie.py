@@ -24330,6 +24330,18 @@ def _lexists_beneath(anchor: Path, path: Path) -> bool:
         return True
 
 
+def _regular_file_beneath(anchor: Path, path: Path) -> bool:
+    """True when `path` beneath `anchor` is a regular file, reached
+    without following a link on the way or at it."""
+    path = Path(path)
+    try:
+        with _dir_beneath(anchor, path.parent) as dfd:
+            return stat.S_ISREG(os.stat(path.name, dir_fd=dfd,
+                                        follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
 def _unlink_beneath(anchor: Path, path: Path) -> None:
     """Remove the file or link `path` beneath `anchor` (gone already, or a
     link on the way: nothing is removed)."""
@@ -56607,40 +56619,71 @@ def _log_session_id(log_path: Path) -> str | None:
     return sid
 
 
+# A Python interpreter's name (`python`, `python3`, `python3.12`): a
+# segment `python -m pytest …` invokes the runner after its `-m`.
+_PYTHON_INTERP_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?")
+
+
+def _falsifier_runs_probe(cmd: str, rel: str, lane: str | Path,
+                          verbs: frozenset[str]) -> bool:
+    """True when the executed shell command `cmd` invokes a test runner on
+    the probe `rel` (relative to `lane`): a segment whose runner — its
+    first token, or the module after a Python interpreter's `-m` — is one
+    of `verbs` (the repository's BLT verbs) or `_FALSIFIER_RUNNER_VERBS`,
+    given the probe, its basename, or a directory holding it (`.` too) as
+    an argument. A runner given neither (the whole suite, another path)
+    is not counted: a missed re-ask could lose a demonstration, an extra
+    one costs one worker (DESIGN §8 *Delivery detection*, *One re-ask*)."""
+    rel = os.path.normpath(rel)
+    base = os.path.basename(rel)
+    root = str(lane).rstrip("/") + "/"
+    for seg in _BLT_SEG_RE.split(cmd):
+        seg = seg[_BLT_SEG_LEAD_RE.match(seg).end():].strip()
+        toks = [t.strip("'\"") for t in seg.split()]
+        if not toks:
+            continue
+        lead = os.path.basename(toks[0])
+        args = toks[1:]
+        if (_PYTHON_INTERP_RE.fullmatch(lead) and len(toks) > 2
+                and toks[1] == "-m"):
+            lead, args = toks[2], toks[3:]
+        if lead not in _FALSIFIER_RUNNER_VERBS and lead not in verbs:
+            continue
+        for a in args:
+            a = a.split("::", 1)[0]
+            if a.startswith(root):
+                a = a[len(root):] or "."
+            if not a or a.startswith("-") or os.path.isabs(a):
+                continue
+            a = os.path.normpath(a)
+            if a in (rel, base, ".") or rel.startswith(a + "/"):
+                return True
+    return False
+
+
 def _falsifier_probe_activity(log_path: Path, tree: str | Path,
                               repo_root: Path) -> dict:
-    """From the falsifier's own transcript (`tool_use` records, never its
-    prose): did it write a test-shaped file outside the leads, and run a
-    command naming that file with a test runner? `{created, ran, files}`."""
+    """Did the sample leave a probe in its lane, and run it? `{created,
+    ran, files}` (DESIGN §8 *Delivery detection*, *One re-ask*). Read
+    after its worker returns and before the lane's next restore. `files`:
+    the lane's untracked, not-ignored test-shaped paths outside the leads
+    that are regular files (leerie's addressed listing, never a link
+    followed) — whatever tool wrote them, a shell heredoc included (review
+    round 24 M1). `ran`: a Bash command of its registered transcript runs
+    one of them (`_falsifier_runs_probe`)."""
     globs = resolve_test_file_globs(repo_root)
-    root = str(tree).rstrip("/") + "/"
-    files: set[str] = set()
-    cmds: list[str] = []
-    for kind, inp, _res in _iter_log_tool_use(
-            log_path, kinds=("Write", "Edit", "MultiEdit", "Bash")):
-        if kind == "Bash":
-            cmds.append(str(inp.get("command") or ""))
-            continue
-        fp = str(inp.get("file_path") or "")
-        rel = fp[len(root):] if fp.startswith(root) else fp
-        if (rel and not rel.startswith(FALSIFIER_LEADS_DIR + "/")
-                and FALSIFIER_LEADS_DIR + "/" not in rel
-                and _is_test_file(rel, globs)):
-            files.add(rel)
-    verbs = set(_blt_verbs(repo_root)) | _FALSIFIER_RUNNER_VERBS
-
-    def _runs(cmd: str, rel: str) -> bool:
-        base = os.path.basename(rel)
-        if rel not in cmd and base not in cmd:
-            return False
-        for seg in _BLT_SEG_RE.split(cmd):
-            seg = seg[_BLT_SEG_LEAD_RE.match(seg).end():].strip()
-            toks = seg.split()
-            if toks and os.path.basename(toks[0]) in verbs:
-                return True
-        return False
-    ran = any(_runs(c, f) for c in cmds for f in files)
-    return {"created": bool(files), "ran": ran, "files": sorted(files)[:5]}
+    lane = Path(tree)
+    files = sorted(
+        rel for rel in (_untracked_listing(lane) or [])
+        if not rel.startswith(FALSIFIER_LEADS_DIR + "/")
+        and _is_test_file(rel, globs)
+        and _regular_file_beneath(lane, lane / rel))
+    verbs = frozenset(_blt_verbs(repo_root))
+    cmds = [str(inp.get("command") or "") for _k, inp, _r
+            in _iter_log_tool_use(log_path, kinds=("Bash",))]
+    ran = any(_falsifier_runs_probe(c, f, lane, verbs)
+              for c in cmds for f in files)
+    return {"created": bool(files), "ran": ran, "files": files[:5]}
 
 
 def _falsifier_needs_reask(result: dict | None, activity: dict) -> bool:
