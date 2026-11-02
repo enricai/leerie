@@ -39,6 +39,49 @@ _seed_bundle_name() {
   printf '%s.bundle' "$(printf %s "$1" | od -An -v -tx1 | tr -d ' \n')"
 }
 
+# --- _seed_machine_submodules -------------------------------------------------
+# Prints the bash the machine runs, in the freshly materialized parent's
+# directory, to check out every submodule the host bundled into <subs-dir>
+# ($1), nested ones included. The machine reads the paths as the host does
+# (DESIGN §6 *The host never runs a program the checkout chose*, part 3):
+# `.gitmodules` as NUL-terminated `submodule.<name>.path\n<path>` records,
+# never `git submodule status` split on whitespace, so a path is only ever a
+# quoted argument. A record's key holds no newline (git config refuses one in
+# a subsection), so the first newline ends it. Each submodule's URL is set by
+# its name to the bundle named, as `_seed_bundle_name` names it, by the hex
+# of its full display path (prefix + path); a submodule without a bundle is
+# left uninitialised, so nothing is fetched from its own URL. Recursion
+# carries the prefix. `set -e` does not reach a function called on the left
+# of `&&`, so each step returns its failure itself. The text holds no `'`:
+# the Fly caller wraps it in `bash -c '…'`. <subs-dir> is leerie's own
+# staging path, never repository content.
+_seed_machine_submodules() {
+  local _s
+  _s="$(cat <<'MACHINE_SUBMODULES'
+_leerie_submodules() {
+  [ -f .gitmodules ] || return 0
+  local nl rec key name path bn
+  nl="
+"
+  while IFS= read -r -d "" rec <&3; do
+    key=${rec%%"$nl"*}
+    path=${rec#*"$nl"}
+    name=${key#submodule.}
+    name=${name%.path}
+    bn=$(printf %s "$1$path" | od -An -v -tx1 | tr -d " \n").bundle
+    [ -f "__SUBS_DIR__/$bn" ] || continue
+    git config "submodule.$name.url" "__SUBS_DIR__/$bn" || return 1
+    git --literal-pathspecs -c protocol.file.allow=always \
+      submodule update --init -- "$path" || return 1
+    (cd -- "$path" && _leerie_submodules "$1$path/") || return 1
+  done 3< <(git config -z --file .gitmodules --get-regexp "^submodule\..*\.path\$")
+}
+_leerie_submodules ""
+MACHINE_SUBMODULES
+)"
+  printf '%s\n' "${_s//__SUBS_DIR__/$1}"
+}
+
 # --- _seed_dirty_filter -----------------------------------------------------
 # Runs on the HOST (never shipped to the remote machine): filters the
 # newline-delimited candidate file list on stdin down to what should

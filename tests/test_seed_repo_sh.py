@@ -89,7 +89,10 @@ case "$remote_cmd" in
     ;;
   *"cat > /tmp/leerie-subs/"*)
     # Extract the per-submodule basename from "cat > /tmp/leerie-subs/<bn>".
+    # The command is `sh -c 'cat > /tmp/leerie-subs/<bn>'`: drop the
+    # closing quote, or the machine script finds no bundle by its name.
     bn="${{remote_cmd##*cat > /tmp/leerie-subs/}}"
+    bn=${{bn%\\'}}
     _drain_to "$DEST/subs/$bn"
     exit 0
     ;;

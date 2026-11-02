@@ -25,8 +25,8 @@
 #      containing exactly one file, since ec2_tar_pipe's receiver is
 #      `tar -xzC <dir>`, not a bare `cat >`). The instance then
 #      `git clone`s from the bundle (or untars + checks out the shallow
-#      .git), wires submodule URLs to their bundles, and runs
-#      `git -c protocol.file.allow=always submodule update --recursive`.
+#      .git) and checks out each bundled submodule, nested ones too,
+#      from its bundle (`_seed_machine_submodules`).
 #      Delivers committed state only.
 #
 #   2. `ec2_seed_repo_dirty` — laptop rsync's the dirty/untracked delta
@@ -330,22 +330,18 @@ cd /work'
   _machine_script="$(cat <<'MACHINE_SCRIPT'
 set -e
 __PARENT_MATERIALIZE__
-if [ -f .gitmodules ]; then
-  git submodule init
-  git submodule status | awk "{print \$2}" | while read sm; do
-    bn=$(printf %s "$sm" | od -An -v -tx1 | tr -d " \n").bundle
-    if [ -f "/tmp/leerie-subs/$bn" ]; then
-      git config "submodule.$sm.url" "/tmp/leerie-subs/$bn"
-    fi
-  done
-  git -c protocol.file.allow=always submodule update --recursive
-fi
+__SUBMODULES__
 chown -R leerie: /work
 rm -rf __CLEANUP_TMP__
 MACHINE_SCRIPT
 )"
   _machine_script="${_machine_script//__PARENT_MATERIALIZE__/$_parent_materialize}"
   _machine_script="${_machine_script//__CLEANUP_TMP__/$_cleanup_tmp}"
+  # Spliced, not `${…//…/…}`-replaced: bash 5.2 reads `&` in a replacement
+  # as the matched text, and the snippet holds `&&`.
+  local _subs
+  _subs="$(_seed_machine_submodules /tmp/leerie-subs)"
+  _machine_script="${_machine_script%%__SUBMODULES__*}${_subs}${_machine_script#*__SUBMODULES__}"
 
   local _mode="clone-from-bundle"
   [ "$_shallow" = "true" ] && _mode="shallow-untar"

@@ -2725,7 +2725,17 @@ nobody has merged. The invariant is constructed in five parts.
    repository on the host (review round 27, isolation I4). The bundling
    runs from the caller's directory with `git -C`. Each bundle is named by
    the hex of its path's bytes, so the name that reaches the machine's
-   shell is never shell syntax, and no two paths share a name.
+   shell is never shell syntax, and no two paths share a name. The
+   machine reads the same paths the same way. It lists each repository's
+   submodules from its `.gitmodules` as NUL-terminated name and path
+   records, points each submodule's URL, by name, at the bundle named by
+   the hex of its full path, checks out that submodule alone, and repeats
+   inside it, so a nested submodule is checked out too. A path is only
+   ever a quoted argument there. A submodule the host sent no bundle for
+   is left uninitialised, as it was on the host, so the machine never
+   fetches from a submodule's own URL (review round 28, exec L2: a path
+   with a space failed the seed, and a nested submodule was uploaded but
+   never checked out).
 4. *A host-side worker starts from a directory leerie owns.* The rebaser
    and `config --chat` start `claude` in a fresh, empty directory that
    leerie made outside every checkout and tree. They name the tree by

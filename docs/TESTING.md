@@ -747,6 +747,20 @@ the checkout chose*), each proof inverted and live-falsified:
   of the three shipped loops (the line-based control lists it); every bundle
   name is hex, a `'` never reaches the remote shell, and the host and
   machine sides name a bundle the same.
+- `tests/test_seed_machine_submodules.py` (5 tests, review r28 exec L2):
+  the Fly seed, the Fly inspect-dir seed and the EC2 seed each run their
+  real machine script locally, through the existing transport stubs, on a
+  checkout holding `libs/we ird<TAB>$(touch PWNED)'q"`, a plain path and a
+  submodule with a nested one, with every submodule's own URL deleted
+  first. Every submodule, the nested one included, is checked out at the
+  host's commit and nothing named `PWNED` appears; a submodule without a
+  bundle stays uninitialised; all three scripts embed
+  `_seed_machine_submodules`. Falsified: with the old machine scripts 4 of
+  the 5 are red (all three seeds exit non-zero, the EC2 one naming the
+  deleted URLs it tried to clone, and the shared-snippet pin). Writing it found the
+  Fly stub `flyctl` in `tests/test_seed_repo_sh.py` saving each submodule
+  bundle with the closing `'` of `sh -c 'cat > …'` in its name, which the
+  old machine script hid by cloning the still-reachable source URL.
 - `tests/test_host_reads_name_the_checkout.py` (8 tests, exec M1, L1, L3):
   run from `/` with the identity only in the repository, Fly's `seed_auth`
   and EC2's `ec2_seed_auth` ship the repository's identity; a rule forbids a

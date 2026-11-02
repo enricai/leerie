@@ -126,21 +126,26 @@ def test_a_quote_in_a_path_never_reaches_the_remote_shell(
 
 
 def test_the_machine_side_names_the_bundle_the_same(tmp_path: Path) -> None:
-    """The machine-side scripts compute the bundle name with the same `od`
+    """The machine-side snippet (`_seed_machine_submodules`, embedded in all
+    three machine scripts) computes the bundle name with the same `od`
     pipeline as `_seed_bundle_name`; a nested, spaced, unicode path gets
     the same name from both."""
     common = COMMON.read_text()
     machine = re.compile(
-        r'bn=\$\(printf %s "\$sm" \| od -An -v -tx1 \| tr -d " \\n"\)\.bundle')
-    sites = sum(len(machine.findall(s.read_text())) for s in SEEDS)
+        r'bn=\$\(printf %s "\$1\$path" \| od -An -v -tx1 \| tr -d " \\n"\)'
+        r'\.bundle')
+    assert len(machine.findall(_fn(common, "_seed_machine_submodules"))) == 1
+    sites = sum(s.read_text().count("$(_seed_machine_submodules ")
+                for s in SEEDS)
     assert sites == 3, sites
-    for sm in ("vendor/foo", "a b/ç", "x" * 40):
+    for prefix, sm in (("vendor/", "foo"), ("", "a b/ç"), ("", "x" * 40)):
         host = subprocess.run(
             ["/bin/bash", "-c", _fn(common, "_seed_bundle_name")
-             + '\n_seed_bundle_name "$1"', "x", sm], capture_output=True,
-            text=True, check=True, timeout=30).stdout
-        mach = subprocess.run(
-            ["/bin/sh", "-c", 'sm=$1; bn=$(printf %s "$sm" | od -An -v -tx1 '
-             '| tr -d " \\n").bundle; printf %s "$bn"', "x", sm],
+             + '\n_seed_bundle_name "$1"', "x", prefix + sm],
             capture_output=True, text=True, check=True, timeout=30).stdout
-        assert host == mach == sm.encode().hex() + ".bundle"
+        mach = subprocess.run(
+            ["/bin/bash", "-c", 'path=$2; bn=$(printf %s "$1$path" | od -An '
+             '-v -tx1 | tr -d " \\n").bundle; printf %s "$bn"', "x", prefix,
+             sm], capture_output=True, text=True, check=True,
+            timeout=30).stdout
+        assert host == mach == (prefix + sm).encode().hex() + ".bundle"

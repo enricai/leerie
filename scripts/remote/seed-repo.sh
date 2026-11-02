@@ -8,10 +8,10 @@
 #      repo and each submodule (recursive); pipes each bundle to the
 #      machine via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"`.
 #      Machine then `git clone`s from the parent bundle file on local
-#      disk, wires each submodule URL to point at its bundle, and runs
-#      `git -c protocol.file.allow=always submodule update --recursive`
-#      (the protocol-flag is required by git 2.38+ for file://-style
-#      URLs, per CVE-2022-39253). Delivers committed state only.
+#      disk and checks out each bundled submodule, nested ones too, from
+#      its bundle (`_seed_machine_submodules`; the protocol.file.allow
+#      flag it passes is required by git 2.38+ for file://-style URLs,
+#      per CVE-2022-39253). Delivers committed state only.
 #
 #      Shallow parent transport (heavy repos, DESIGN §6 *Shallow
 #      seeding for heavy repos*): for a repo whose `.git` exceeds
@@ -374,7 +374,8 @@ seed_repo_clone() {
 
   # 3. Machine-side: materialize /work, wire each submodule's URL to its
   #    bundle file (in `.git/config`, NOT `.gitmodules` — we never modify
-  #    the committed file), then submodule update. Finally chown -R
+  #    the committed file), then check each out, recursively
+  #    (`_seed_machine_submodules`, run under bash). Finally chown -R
   #    leerie: /work so the orchestrator (which runs as leerie) owns its
   #    working tree.
   #
@@ -418,16 +419,7 @@ set -e
 # blocks `file` by default per CVE-2022-39253. We trust local paths
 # because we just put them there.
 __PARENT_MATERIALIZE__
-if [ -f .gitmodules ]; then
-  git submodule init
-  git submodule status | awk "{print \$2}" | while read sm; do
-    bn=$(printf %s "$sm" | od -An -v -tx1 | tr -d " \n").bundle
-    if [ -f "/tmp/leerie-subs/$bn" ]; then
-      git config "submodule.$sm.url" "/tmp/leerie-subs/$bn"
-    fi
-  done
-  git -c protocol.file.allow=always submodule update --recursive
-fi
+__SUBMODULES__
 chown -R leerie: /work
 # Clean up the tmpfiles — they served their purpose.
 rm -rf __CLEANUP_TMP__
@@ -439,11 +431,16 @@ MACHINE_SCRIPT
   # so there is no branch-derived placeholder to collide with these tokens.
   _machine_script="${_machine_script//__PARENT_MATERIALIZE__/$_parent_materialize}"
   _machine_script="${_machine_script//__CLEANUP_TMP__/$_cleanup_tmp}"
+  # Spliced, not `${…//…/…}`-replaced: bash 5.2 reads `&` in a replacement
+  # as the matched text, and the snippet holds `&&`.
+  local _subs
+  _subs="$(_seed_machine_submodules /tmp/leerie-subs)"
+  _machine_script="${_machine_script%%__SUBMODULES__*}${_subs}${_machine_script#*__SUBMODULES__}"
 
   local _mode="clone-from-bundle"
   [ "$_shallow" = "true" ] && _mode="shallow-untar"
   if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-         --pty=false -C "sh -c '$_machine_script'" >/dev/null 2>&1; then
+         --pty=false -C "bash -c '$_machine_script'" >/dev/null 2>&1; then
     remote_log "seed_repo: machine-side reconstruction of /work failed ($_mode)"
     return 1
   fi
@@ -683,8 +680,8 @@ _seed_one_inspect_dir_clone() {
 
   # 3. Machine-side: clone the parent bundle into $remote, wire each
   #    submodule's URL to its bundle file in .git/config (NOT
-  #    .gitmodules — never modify the committed file), then submodule
-  #    update --recursive. Finally chown -R leerie: $remote so the
+  #    .gitmodules — never modify the committed file) and check it out,
+  #    recursively (`_seed_machine_submodules`). Finally chown -R leerie: $remote so the
   #    orchestrator (which runs as leerie) and inspect-bucket workers
   #    can read the tree. Clean up the staged bundle files.
   #
@@ -693,25 +690,16 @@ _seed_one_inspect_dir_clone() {
   #    default per CVE-2022-39253. We trust local paths because we
   #    just put them there.
   #
-  #    The clone script is sent over `sh -c '...'` via flyctl's -C.
-  #    We use envsubst-style replacement at host emit-time (sed) for
-  #    the three paths so the inner sh -c script doesn't need any
-  #    quoting acrobatics.
+  #    The clone script is sent over `bash -c '...'` via flyctl's -C.
+  #    We use envsubst-style replacement at host emit-time for the
+  #    three paths so the inner script doesn't need any quoting
+  #    acrobatics.
   local clone_script
   clone_script="$(cat <<'CLONE_SCRIPT'
 set -e
 git clone __BUNDLE_PATH__ __REMOTE__
 cd __REMOTE__
-if [ -f .gitmodules ]; then
-  git submodule init
-  git submodule status | awk "{print \$2}" | while read sm; do
-    bn=$(printf %s "$sm" | od -An -v -tx1 | tr -d " \n").bundle
-    if [ -f "__SUBS_DIR__/$bn" ]; then
-      git config "submodule.$sm.url" "__SUBS_DIR__/$bn"
-    fi
-  done
-  git -c protocol.file.allow=always submodule update --recursive
-fi
+__SUBMODULES__
 chown -R leerie: __REMOTE__
 rm -rf __BUNDLE_PATH__ __SUBS_DIR__
 CLONE_SCRIPT
@@ -721,9 +709,13 @@ CLONE_SCRIPT
   clone_script="${clone_script//__BUNDLE_PATH__/$bundle_path}"
   clone_script="${clone_script//__REMOTE__/$remote}"
   clone_script="${clone_script//__SUBS_DIR__/$subs_dir}"
+  # Spliced, not replaced: the snippet holds `&&` (see seed_repo_clone).
+  local _subs
+  _subs="$(_seed_machine_submodules "$subs_dir")"
+  clone_script="${clone_script%%__SUBMODULES__*}${_subs}${clone_script#*__SUBMODULES__}"
 
   if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-         --pty=false -C "sh -c '$clone_script'" >/dev/null 2>&1; then
+         --pty=false -C "bash -c '$clone_script'" >/dev/null 2>&1; then
     remote_log "seed_inspect_dirs: machine-side clone failed for $remote"
     return 1
   fi
