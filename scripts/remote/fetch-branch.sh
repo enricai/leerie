@@ -346,51 +346,21 @@ print(best[3])
   # writes for a run with no branch, alike (DESIGN §6 *One push choice per
   # run, on every runtime*).
 
-  # --- Step 4: apply the captured deps; stream .leerie/Dockerfile back (best-effort) ----
-  # The dep_capture worker records its capture in the run directory, which
-  # the state stream-back above brought home; it is applied here. A
-  # /work/.leerie/Dockerfile on the machine is streamed home so the bake loop
-  # persists across the machine->host boundary. Existence-guarded on both
-  # sides, non-fatal, and never clobbers a host-edited file (skip if the host
-  # target already exists).
-  # Cancel/kill recovery (where fetch_branch never runs) is left to the
-  # host-side --recapture / next-run backstop.
-  local host_leerie_root
-  if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
-    host_leerie_root="$LEERIE_STATE_HOST_DIR"
-  else
-    host_leerie_root="$USER_REPO/.leerie"
-  fi
-
+  # --- Step 4: name the captured deps ------------------------------------
   # The dependency captures the run recorded came home with its state
-  # directory above; write them into $USER_REPO/.leerie/config.toml as the
-  # local launcher does (DESIGN §6½ *The host applies a capture*). The
-  # machine's /work/.leerie/config.toml is no longer written.
-  if ! declare -F host_apply_captured_deps >/dev/null 2>&1; then
-    # shellcheck source=scripts/host-finalize.sh
-    . "$_FETCH_BRANCH_DIR/../host-finalize.sh" 2>/dev/null || true
+  # directory above. Nothing applies them but the operator's own
+  # `leerie config --apply-capture <run-id>`: a run never chooses what the
+  # next run's image runs (DESIGN §6½ *The operator applies a capture*). No
+  # file the machine wrote becomes a build input either: the machine's
+  # /work/.leerie/Dockerfile is not streamed back.
+  local host_runs_root
+  if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+    host_runs_root="$LEERIE_STATE_HOST_DIR/runs"
+  else
+    host_runs_root="$USER_REPO/.leerie/runs"
   fi
-  if declare -F host_apply_captured_deps >/dev/null 2>&1; then
-    host_apply_captured_deps "$host_leerie_root/runs/$run_id" || true
-  fi
-
-  local _cap_file=Dockerfile
-  local _remote_path="/work/.leerie/$_cap_file"
-  local _host_path="$host_leerie_root/$_cap_file"
-  # Skip if host target already exists (never clobber a host-edited file);
-  # existence-guard on the machine side before attempting transfer.
-  if [ ! -e "$_host_path" ] \
-     && _fetch_machine_exec test -f "$_remote_path" 2>/dev/null; then
-    remote_log "remote: streaming .leerie/$_cap_file to host ..."
-    mkdir -p "$host_leerie_root" 2>/dev/null || true
-    if _fetch_machine_exec cat "$_remote_path" \
-         > "$_host_path" 2>/dev/null; then
-      remote_log "remote: .leerie/$_cap_file written to $host_leerie_root/"
-    else
-      # Non-fatal: remove a partial write and continue.
-      rm -f "$_host_path" 2>/dev/null || true
-      remote_log "fetch_branch: warning: failed to stream .leerie/$_cap_file (non-fatal)"
-    fi
+  if [ -f "$host_runs_root/$run_id/captured-deps.json" ]; then
+    remote_log "remote: run $run_id recorded dependencies for .leerie/config.toml; review and apply them with: leerie config --apply-capture $run_id"
   fi
 
   remote_log "remote: fetch complete — run $run_id ready for host-side finalize"

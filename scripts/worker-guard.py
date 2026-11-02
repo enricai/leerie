@@ -116,7 +116,7 @@ def main(argv: list[str]) -> int:
         ["--settings", settings],
         leerie._cli_pinned_env({**genv, **env}))[1]
     confine = " ".join(shlex.quote(w) for w in
-                       leerie._confined_argv(grants, [])[:-1])
+                       leerie._confined_argv(grants, [], cli=True)[:-1])
     disallowed = leerie.DISALLOWED_TOOLS + (
         "," + guard["deny"] if guard["deny"] else "")
     notice = "".join(f"\nNOTE FROM ORCHESTRATOR: {n}" for n in notices)

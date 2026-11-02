@@ -35,6 +35,7 @@ import contextlib
 import contextvars
 import copy
 import ctypes
+import difflib
 import errno
 import fcntl
 import fnmatch
@@ -2919,6 +2920,35 @@ _FORBIDDEN_COMMANDS_ARRAY_SCHEMA: dict = {
     },
 }
 
+# DESIGN §6½ *A capture names packages and managers, never commands*. What
+# a `dep_capture` worker may record, checked in its schema, again in code
+# before a capture is recorded or applied (`_capture_problems`), and by the
+# launcher before it writes a Dockerfile line: a Debian package name (no
+# version, release or architecture suffix), a manager leerie bakes, a plain
+# relative path. The command a manager's bake runs is leerie's own, never
+# the capture's.
+DEBIAN_PACKAGE_PATTERN = r"^[a-z0-9][a-z0-9+.-]+$"
+CAPTURE_MANAGER_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+CAPTURE_INPUT_PATTERN = r"^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*/?$"
+# Equal to the launcher generator's `_INSTALL_COMMANDS`
+# (tests/test_capture_validation.py).
+BAKE_INSTALL_COMMANDS: dict[str, str] = {
+    "pnpm": "pnpm install --frozen-lockfile",
+    "yarn": "yarn install --frozen-lockfile",
+    "npm": "npm ci",
+    "uv": "uv sync",
+    "poetry": "poetry install",
+    "pipenv": "pipenv install",
+    "pip": "pip install -r requirements.txt",
+    "pip3": "pip install -r requirements.txt",
+    "go": "go mod download",
+    "cargo": "cargo fetch",
+    "bundle": "bundle install",
+    "composer": "composer install --no-interaction",
+    "dotnet": "dotnet restore",
+}
+
+
 SCHEMAS: dict[str, dict] = {
     "forbidden_command_extractor": {
         "type": "object",
@@ -3894,12 +3924,14 @@ SCHEMAS: dict[str, dict] = {
         "properties": {
             "setup_packages": {
                 # apt packages for the warm apt layer in .leerie/Dockerfile.
-                # minLength enforces "no empty package names" at the schema layer
-                # (DESIGN §12: guarantees that can be checked mechanically live in
-                # code) so an empty-item capture can't render to "" and blank the
-                # persisted config.
+                # A Debian package name and nothing else (DESIGN §6½ *A
+                # capture names packages and managers, never commands*): the
+                # launcher writes each one into an apt `RUN` line, so a
+                # word like `&&` would be shell. Checked again in code
+                # (`_capture_problems`) and by the launcher.
                 "type": "array",
-                "items": {"type": "string", "minLength": 1},
+                "items": {"type": "string",
+                          "pattern": DEBIAN_PACKAGE_PATTERN},
             },
             "language_installs": {
                 # Per-manager install commands the Dockerfile bakes in via
@@ -3908,15 +3940,20 @@ SCHEMAS: dict[str, dict] = {
                 # package.json). Hallucinated paths are validated against
                 # the repo and skipped; the RUN is still emitted.
                 "type": "array",
+                # The manager chooses the command, from leerie's own table
+                # (`BAKE_INSTALL_COMMANDS`); a `command` the worker writes
+                # is never run.
                 "items": {
                     "type": "object",
                     "required": ["manager", "command"],
                     "properties": {
-                        "manager": {"type": "string", "minLength": 1},
+                        "manager": {"type": "string",
+                                    "pattern": CAPTURE_MANAGER_PATTERN},
                         "command": {"type": "string", "minLength": 1},
                         "copy_inputs": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {"type": "string",
+                                      "pattern": CAPTURE_INPUT_PATTERN},
                         },
                     },
                 },
@@ -18932,10 +18969,64 @@ def _filter_residual_deps(language_installs: list[dict]) -> list[dict]:
                 residual.append(entry)
             continue
 
-        # Unknown managers: preserve as-is (conservative)
-        residual.append(entry)
+        # Any other manager: leerie bakes only `BAKE_INSTALL_COMMANDS`,
+        # each with its own command, so nothing else is ever recorded
+        # (DESIGN §6½ *A capture names packages and managers, never
+        # commands*).
+        if manager in BAKE_INSTALL_COMMANDS:
+            residual.append(entry)
 
     return residual
+
+
+def _capture_problems(setup_packages: object, language_installs: object
+                      ) -> list[str]:
+    """Why a capture cannot be recorded or applied, each named; [] when it
+    can (DESIGN §6½ *A capture names packages and managers, never
+    commands*): every `setup_packages` item a Debian package name, every
+    `language_installs` entry a manager leerie bakes and plain relative
+    input paths. The same rules as `SCHEMAS["dep_capture"]`, here because a
+    capture file is read back and the schema is not the only writer."""
+    out: list[str] = []
+    if not isinstance(setup_packages, list):
+        out.append("setup_packages is not a list")
+        setup_packages = []
+    for p in setup_packages:
+        if not (isinstance(p, str)
+                and re.fullmatch(DEBIAN_PACKAGE_PATTERN, p)):
+            out.append(f"setup_packages item {p!r} is not a Debian "
+                       "package name")
+    if not isinstance(language_installs, list):
+        out.append("language_installs is not a list")
+        language_installs = []
+    for e in language_installs:
+        if not isinstance(e, dict):
+            out.append(f"language_installs entry {e!r} is not an object")
+            continue
+        m = e.get("manager")
+        if not (isinstance(m, str) and m in BAKE_INSTALL_COMMANDS):
+            out.append(f"language_installs manager {m!r} is not one leerie "
+                       f"bakes ({', '.join(sorted(BAKE_INSTALL_COMMANDS))})")
+        ins = e.get("copy_inputs", [])
+        if not isinstance(ins, list):
+            out.append(f"language_installs copy_inputs {ins!r} is not a list")
+            continue
+        for ci in ins:
+            if not (isinstance(ci, str)
+                    and re.fullmatch(CAPTURE_INPUT_PATTERN, ci)
+                    and ".." not in ci.split("/")):
+                out.append(f"language_installs input {ci!r} is not a plain "
+                           "relative path")
+    return out
+
+
+def _table_installs(language_installs: list[dict]) -> list[dict]:
+    """Each entry as leerie records it: its manager, the command leerie's
+    table gives that manager (never the capture's own), and its inputs."""
+    return [{"manager": e["manager"],
+             "command": BAKE_INSTALL_COMMANDS[e["manager"]],
+             "copy_inputs": list(e.get("copy_inputs") or [])}
+            for e in language_installs]
 
 
 CAPTURED_DEPS_FILE = "captured-deps.json"
@@ -18947,7 +19038,14 @@ def _merge_capture_into_config(cfg_path: Path, setup_packages: list[str],
                                replace: bool) -> dict[str, str]:
     """Merge one capture into `cfg_path` as it is now (DESIGN §6½): union /
     never-clobber, or wholesale replace for `--recapture --force`. Returns
-    the keys written."""
+    the keys written. A capture `_capture_problems` refuses writes nothing:
+    refused whole, never trimmed to what passes."""
+    problems = _capture_problems(setup_packages, language_installs)
+    if problems:
+        log("capture: refused, nothing written to "
+            f"{cfg_path}: " + "; ".join(problems))
+        return {}
+    language_installs = _table_installs(language_installs)
     updates: dict[str, str] = {}
     if setup_packages:
         if replace:
@@ -19003,11 +19101,17 @@ def _merge_capture_into_config(cfg_path: Path, setup_packages: list[str],
 
 def _record_capture(record_in: Path, from_run: str, setup_packages: list[str],
                     language_installs: list[dict], replace: bool) -> None:
-    """Append one capture to `<record_in>/captured-deps.json` for the host to
-    apply (`apply_captured_deps`). Nothing is recorded for an empty one."""
+    """Append one capture to `<record_in>/captured-deps.json` for the
+    operator to apply (`apply_captured_deps`). Nothing is recorded for an
+    empty one, nor for one `_capture_problems` refuses."""
     if not setup_packages and not language_installs:
         log("capture: dep_capture found no deps to record")
         return
+    problems = _capture_problems(setup_packages, language_installs)
+    if problems:
+        log("capture: refused, nothing recorded: " + "; ".join(problems))
+        return
+    language_installs = _table_installs(language_installs)
     path = record_in / CAPTURED_DEPS_FILE
     try:
         entries = json.loads(path.read_text()) if path.is_file() else []
@@ -19023,19 +19127,24 @@ def _record_capture(record_in: Path, from_run: str, setup_packages: list[str],
     tmp.write_text(json.dumps(entries, indent=1) + "\n")
     os.replace(tmp, path)
     log(f"capture: recorded {len(setup_packages)} setup_packages and "
-        f"{len(language_installs)} language installs in {path.name}; the "
-        "host writes .leerie/config.toml after the run")
+        f"{len(language_installs)} language installs in {path}; review and "
+        f"apply them with `leerie config --apply-capture {record_in.name}`")
 
 
 def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
-    """Host-side: apply the captures a run recorded (`_record_capture`) to
-    `repo_root/.leerie/config.toml`, each merged against the file as it is
-    now, so a key the user edited during the run is merged with rather than
-    overwritten. The applied entries move to `captured-deps.applied.json`,
-    so a second call is a no-op. Returns how many were applied; a file that
-    cannot be read is logged and kept."""
+    """The operator's `leerie config --apply-capture <run>` (DESIGN §6½ *The
+    operator applies a capture*): apply the captures that run recorded
+    (`_record_capture`) to `repo_root/.leerie/config.toml`, each merged
+    against the file as it is now, and log the change as a diff. Nothing
+    else applies a capture: a run never chooses what the next run's image
+    runs. Every entry is checked first (`_capture_problems`); one that
+    fails refuses the whole file, which is kept. The applied entries move
+    to `captured-deps.applied.json`, so a second call is a no-op. Returns
+    how many were applied; a file that cannot be read is logged and
+    kept."""
     path = Path(run_dir) / CAPTURED_DEPS_FILE
     if not path.is_file():
+        log(f"capture: {path} does not exist; nothing to apply")
         return 0
     try:
         entries = json.loads(path.read_text())
@@ -19044,11 +19153,32 @@ def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
     except (OSError, ValueError) as e:
         log(f"capture: could not read {path} ({e}); kept for a later apply")
         return 0
+    problems = [p for e in entries
+                for p in (_capture_problems(e.get("setup_packages") or [],
+                                            e.get("language_installs") or [])
+                          if isinstance(e, dict) else [f"{e!r}"])]
+    if problems:
+        die(f"capture: {path} is refused, nothing was applied: "
+            + "; ".join(problems))
     cfg = Path(repo_root) / ".leerie" / "config.toml"
+    root = Path(repo_root)
+    try:
+        before = _read_text_beneath(root, cfg, limit=READ_LIMIT_CONFIG)
+    except OSError:
+        before = ""
     for e in entries:
         _merge_capture_into_config(
             cfg, list(e.get("setup_packages") or []),
             list(e.get("language_installs") or []), bool(e.get("replace")))
+    try:
+        after = _read_text_beneath(root, cfg, limit=READ_LIMIT_CONFIG)
+    except OSError:
+        after = ""
+    for line in difflib.unified_diff(
+            before.splitlines(), after.splitlines(),
+            fromfile=".leerie/config.toml", tofile=".leerie/config.toml",
+            lineterm=""):
+        log(f"  {line}")
     done = path.with_name(CAPTURED_DEPS_APPLIED_FILE)
     try:
         prior = json.loads(done.read_text()) if done.is_file() else []
@@ -19071,15 +19201,14 @@ async def capture_repo_deps(
         replace: bool = False,
         record_in: Path | None = None,
 ) -> None:
-    """Invoke the dep_capture LLM worker and write deps to .leerie/config.toml (non-fatal).
+    """Invoke the dep_capture LLM worker and record what it captured (non-fatal).
 
-    record_in (every in-container seam, the current run's directory): the
-    capture is recorded in `<record_in>/captured-deps.json` instead, and the
-    host writes `.leerie/config.toml` after the container exits
-    (`apply_captured_deps`). The container never writes the user's checkout,
-    which is mounted read-only (DESIGN §6 *The explicit channel*, §6½ *The
-    host applies a capture*). None: the host's own `run_recapture_deps`,
-    which writes it now.
+    record_in (the current run's directory in the container; the target
+    run's for the host's `run_recapture_deps`): the capture is recorded in
+    `<record_in>/captured-deps.json`, and only the operator's `leerie config
+    --apply-capture <run>` writes `.leerie/config.toml`
+    (`apply_captured_deps`; DESIGN §6½ *The operator applies a capture*).
+    Nothing is recorded without it.
 
     replace=False (default, every automatic seam): union / never-clobber —
     only new packages/managers are added, existing entries are preserved.
@@ -19176,8 +19305,8 @@ async def capture_repo_deps(
         _record_capture(Path(record_in), Path(str(log_dir)).parent.name,
                         setup_packages, language_installs, replace)
     else:
-        _merge_capture_into_config(repo_root / ".leerie" / "config.toml",
-                                   setup_packages, language_installs, replace)
+        log("capture: no run directory to record the capture in; "
+            "nothing recorded")
     # Write idempotency sentinel. Both a state field (for in-run readers)
     # and a lightweight file (for the next-run backstop, which reads past
     # run dirs without constructing a full State).
@@ -19373,7 +19502,7 @@ def run_recapture_deps(
                     await capture_repo_deps(
                         repo_root, target_st,
                         caps=run_caps, models=models, efforts=efforts,
-                        replace=force,
+                        replace=force, record_in=target_run_dir,
                     )
                     return True
                 # See the backstop guard above: TerminalAuthFailure /
@@ -23726,6 +23855,44 @@ def _require_confinement(run_dir: Path, state_root: Path,
     _require_landlock()
     _require_state_root_apart(state_root, checkout)
     _require_heldout_sandbox(run_dir)
+    _require_worker_view()
+
+
+# A file only the worker root has (the image's worker stage writes it), so a
+# command that finds it at `/` runs in the worker view.
+_WORKER_ENV_MARK = "/.leerie-worker-env"
+
+
+def _require_worker_view() -> None:
+    """Fail closed (DESIGN §6 *The orchestrator's root is leerie's; a
+    repository's root is only a confined process's*): where the image has a
+    worker root, an isolated command must run in it — leerie never runs the
+    repository's commands in its own root instead, nor its own processes in
+    the repository's. Runs `test -e` on the worker stage's mark in the
+    worker view; stops the run naming the shim's reason when it is not
+    there. Only once the entry has turned isolation on (`_isolated()`): a
+    command enters the worker view only through the isolation, and where it
+    is off (a test, a host harness) nothing runs in it."""
+    if _worker_root() is None or not _isolated():
+        return
+    argv = _confined_argv(WorkerGrants(rw=("/dev/null",), ro=("/",)),
+                          ["test", "-e", _WORKER_ENV_MARK])
+    try:
+        r = subprocess.run(argv, cwd="/", capture_output=True, text=True,
+                           timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        die(f"the confinement check could not run a command in the "
+            f"repository's root ({type(e).__name__}: {e}).")
+    if r.returncode != 0:
+        err = (r.stderr or "").strip()[-600:]
+        die(f"this image has a repository root ({WORKER_ROOT}), but a "
+            f"confined command did not run in it (exit {r.returncode}"
+            f"{': ' + err if err else ''}). Rebuild the repository image "
+            "(remove it with `nerdctl image rm leerie-repo/<repo>:<version>`"
+            " and launch again). Leerie runs the repository's commands only "
+            "in the repository's root, and its own only in its own (DESIGN "
+            "§6 *The orchestrator's root is leerie's; a repository's root is "
+            "only a confined process's*).")
 
 
 MOUNTINFO = Path("/proc/self/mountinfo")
@@ -23916,7 +24083,7 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
                 sandbox=HeldOutSandbox(view=str(view),
                                        place=((str(held), rel),),
                                        report=str(view / "report.json")),
-                report_fd=rep.fileno())
+                report_fd=rep.fileno(), worker_root=False)
             r = subprocess.run(argv, cwd=str(view), capture_output=True,
                                text=True, timeout=60,
                                pass_fds=(rep.fileno(),))
@@ -24535,9 +24702,26 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         egress=True)
 
 
+# DESIGN §6 *The orchestrator's root is leerie's; a repository's root is
+# only a confined process's*: where the repository image's stages are, in
+# leerie's image (`leerie`'s `_repo_image_dockerfile`). Absent in the base
+# image, and wherever no repository image was built.
+WORKER_ROOT = Path("/opt/leerie-worker-root")
+
+
+def _worker_root() -> str | None:
+    """`WORKER_ROOT` when this image has one (a directory, not a link)."""
+    try:
+        st = os.lstat(WORKER_ROOT)
+    except OSError:
+        return None
+    return str(WORKER_ROOT) if stat.S_ISDIR(st.st_mode) else None
+
+
 def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                    sandbox: HeldOutSandbox | None = None,
-                   report_fd: int | None = None) -> list[str]:
+                   report_fd: int | None = None, cli: bool = False,
+                   worker_root: bool = True) -> list[str]:
     """`cmd` started through the Landlock shim with `grants`. With
     `sandbox`, in a held-out sandbox (always: a held-out file never runs
     outside one, and the shim refuses where it cannot build one), its
@@ -24547,10 +24731,16 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
     `/tmp`, `/dev/shm` and IPC*), in a network namespace of its own: with
     an `egress` grant, the outside reached through the run's egress proxy
     (`_egress_server`), and the strict-output proxy's port relayed when it
-    is live (DESIGN §6 *A confined process has its own network*)."""
+    is live (DESIGN §6 *A confined process has its own network*). Where
+    the image has a worker root (`_worker_root`) and the command is
+    isolated, it runs in the worker view (`--worker-root`); a worker's CLI
+    (`cli`) stays in leerie's root and its commands run there instead
+    (`--cli`, `scripts/worker-shell.py`). `worker_root` False: leerie's
+    root, for the sandbox probe, which checks the shim's own machinery."""
     # `-S`: the shim imports only the standard library, and `site` cost
     # ~15 ms of every worker's start (measured).
     argv = [sys.executable, "-I", "-S", str(LANDLOCK_SCRIPT)]
+    wr = _worker_root() if worker_root else None
     if sandbox is not None:
         argv += ["--sandbox", "--view", sandbox.view]
         for src, rel in sandbox.place:
@@ -24558,6 +24748,8 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
         if sandbox.report is not None and report_fd is not None:
             argv += ["--report", sandbox.report, "--report-fd",
                      str(report_fd)]
+        if wr is not None:
+            argv += ["--worker-root", wr]
     elif _isolated():
         argv.append("--isolate")
         if grants.egress:
@@ -24568,6 +24760,8 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                 # loopback: the same port in the namespace, relayed.
                 argv += ["--forward", f"{_STRICT_PROXY.port}="
                          f"{proxy.forward(_STRICT_PROXY.port)}"]
+        if wr is not None:
+            argv += ["--worker-root", wr] + (["--cli"] if cli else [])
     for p in grants.rw:
         argv += ["--rw", p]
     for p in grants.ro:
@@ -25863,7 +26057,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # through PATH from the directory it starts in (DESIGN §6 *The host
     # never runs a program the checkout chose*, part 4).
     spawn_cmd = ([_exe_from_root(cmd[0]), *cmd[1:]] if grants is None
-                 else _confined_argv(grants, list(cmd)))
+                 else _confined_argv(grants, list(cmd), cli=True))
     gate_r: int | None = None
     gate_w: int | None = None
     if cgroup_sid is not None:

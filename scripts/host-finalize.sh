@@ -543,13 +543,13 @@ host_bring_back_run_branch() {
 
 # host_apply_captured_deps <run-dir> — write the dependency captures a run
 # recorded (`<run-dir>/captured-deps.json`) into $USER_REPO/.leerie/config.toml
-# (DESIGN §6½ *The host applies a capture*). The container never writes the
-# user's checkout, which it mounts read-only (§6 *The explicit channel*), so
-# this is where a capture reaches it: the orchestrator's own merge
-# (`apply_captured_deps`), loaded by path in host python3 like the rebaser's
-# seam, against the config as it is now. A no-op without the file; applied
-# entries move to captured-deps.applied.json, so a second call is a no-op.
-# Never fails its caller.
+# and log the change as a diff: the operator's `leerie config --apply-capture
+# <run-id>`, the only caller (DESIGN §6½ *The operator applies a capture*).
+# The orchestrator's own merge (`apply_captured_deps`, which refuses a
+# capture `_capture_problems` rejects), loaded by path in host python3 like
+# the rebaser's seam, against the config as it is now. Applied entries move
+# to captured-deps.applied.json, so a second call is a no-op. Fails when the
+# capture is refused or cannot be applied.
 host_apply_captured_deps() {
   local run_dir="$1"
   [ -f "$run_dir/captured-deps.json" ] || return 0
@@ -557,7 +557,7 @@ host_apply_captured_deps() {
   # shellcheck disable=SC2097,SC2098
   USER_REPO="$USER_REPO" \
     python3 -I - "$run_dir" "$USER_REPO" "$LEERIE_REPO/orchestrator/leerie.py" \
-      <<'PY' >&2 || echo "[leerie] capture: could not apply $run_dir/captured-deps.json; it is kept" >&2
+      <<'PY' >&2 || { echo "[leerie] capture: could not apply $run_dir/captured-deps.json; it is kept" >&2; return 1; }
 import importlib.util, pathlib, sys
 
 run_dir, user_repo, orch_path = (pathlib.Path(a) for a in sys.argv[1:4])

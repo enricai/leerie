@@ -15,6 +15,10 @@
 #   --tag TAG             override the full image tag (default: <REGISTRY>:<VERSION>)
 #   --dockerfile PATH     Dockerfile to build (default: $LEERIE_REPO/Dockerfile)
 #   --build-arg KEY=VAL   build argument forwarded to flyctl/nerdctl (repeatable)
+#   --context DIR         build context (default: $LEERIE_REPO); the launcher
+#                         passes the committed tree for a repository image
+#   --target STAGE        build only up to STAGE (the repository image's final
+#                         stage, DESIGN §6 *The orchestrator's root is leerie's*)
 #   --push                build and push in one step (implied by both modes below)
 #   --local-build         use local nerdctl/docker build+push (opt-in; see below)
 #   --dry-run             print commands without executing
@@ -76,6 +80,8 @@ PUSH=false
 DRY_RUN=false
 DOCKERFILE_OVERRIDE=""
 BUILD_ARGS=()
+CONTEXT_DIR=""
+BUILD_TARGET=""
 # BUILD_MODE: remote (default, via Fly's remote builder) or local
 # (--local-build, via nerdctl/docker on the host). The launcher exports
 # BUILD_MODE based on --local-build / LEERIE_LOCAL_BUILD; the --local-build
@@ -110,6 +116,10 @@ while [ "$#" -gt 0 ]; do
       shift; BUILD_ARGS+=("$1") ;;
     --build-arg=*)
       BUILD_ARGS+=("${1#--build-arg=}") ;;
+    --context)
+      shift; CONTEXT_DIR="$1" ;;
+    --target)
+      shift; BUILD_TARGET="$1" ;;
     --dry-run)
       DRY_RUN=true ;;
     --help|-h)
@@ -204,15 +214,19 @@ _build_push_remote() {
     build_arg_flags+=(--build-arg "$arg")
   done
 
+  local target_flags=()
+  [ -n "$BUILD_TARGET" ] && target_flags+=(--build-target "$BUILD_TARGET")
+
   local rc=0
   (
-    cd "$LEERIE_REPO"
+    cd "${CONTEXT_DIR:-$LEERIE_REPO}"
     run flyctl deploy \
       --build-only --push --remote-only --depot=false \
       --app "$FLY_APP" \
       --config "$tmp_toml" \
       --dockerfile "$dockerfile" \
       "${build_arg_flags[@]+"${build_arg_flags[@]}"}" \
+      "${target_flags[@]+"${target_flags[@]}"}" \
       --image-label "$LEERIE_VERSION"
   ) || rc=$?
   rm -f "$tmp_toml"
@@ -255,11 +269,14 @@ _build_push_local() {
 
   # Build without HOST_UID/HOST_GID: the Dockerfile ARG defaults (501/20)
   # apply. Source is baked in via COPY instructions — no bind mount required.
+  local target_flags=()
+  [ -n "$BUILD_TARGET" ] && target_flags+=(--target "$BUILD_TARGET")
   run "$build_cmd" build \
     "${dockerfile_flags[@]+"${dockerfile_flags[@]}"}" \
     "${build_arg_flags[@]+"${build_arg_flags[@]}"}" \
+    "${target_flags[@]+"${target_flags[@]}"}" \
     -t "$IMAGE_TAG" \
-    "$LEERIE_REPO"
+    "${CONTEXT_DIR:-$LEERIE_REPO}"
 
   echo "[build-push] local build complete: $IMAGE_TAG"
 

@@ -35,6 +35,8 @@ import hashlib
 import subprocess
 from pathlib import Path
 
+from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
@@ -60,8 +62,23 @@ def _extract_rebuild_decision_block() -> str:
     return src[start:end]
 
 
+def _extract_line(prefix: str) -> str:
+    src = LAUNCHER.read_text()
+    start = src.index("\n" + prefix) + 1
+    return src[start:src.index("\n", start) + 1]
+
+
 def _extracted_block() -> str:
     return "\n".join([
+        _extract_line("REPO_IMAGE_LAYOUT="),
+        _extract_line('_REPO_BUILD_DIR=""'),
+        _extract_line('_REPO_BUILD_CTX=""'),
+        _extract_fn("_repo_build_prepare() {"),
+        _extract_fn("_repo_build_done() {"),
+        _extract_fn("_repo_build_fail() {"),
+        _extract_fn("_repo_image_dockerfile() {"),
+        _extract_fn("_repo_image_nonce() {"),
+        _extract_fn("_check_repo_image() {"),
         _extract_fn("_leerie_sha256() {"),
         _extract_fn("_leerie_repo_id() {"),
         _extract_fn("_leerie_should_generate_dockerfile() {"),
@@ -88,6 +105,8 @@ nerdctl() {
     return 0   # ensure_base_in_buildkit_ns's namespace probe/copy: no-op ok
   fi
   if [ "$cmd" = "image" ]; then
+    shift
+    _stub_image_inspect "$@" && return 0
     return "${NERDCTL_INSPECT_RC:-0}"
   fi
   if [ "$cmd" = "build" ]; then
@@ -110,7 +129,7 @@ IMAGE_TAG="leerie:${LEERIE_VERSION}"
 USER_REPO="${USER_REPO:-/tmp/test-repo}"
 LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-/tmp/leerie-state-test}"
 
-""" + _extracted_block() + r"""
+""" + NERDCTL_IMAGE_INSPECT_STUB + _extracted_block() + r"""
 
 _leerie_dockerfile="$USER_REPO/.leerie/Dockerfile"
 
@@ -394,7 +413,7 @@ def test_rebuild_false_when_image_present_and_hash_matches(tmp_path: Path):
     state_dir.mkdir()
     version = "0.99.test"
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
-    (state_dir / ".dockerfile-hash").write_text(f"{version}:{sha}\n")
+    (state_dir / ".dockerfile-hash").write_text(f"{version}:worker-root-1:sha256:base-id:{sha}\n")
     result = _run_with_rebuild_decision(
         'echo "done"',
         env={

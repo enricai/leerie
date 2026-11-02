@@ -20,6 +20,17 @@ import pytest
 from tests.conftest import register_worker_transcript, transcript_path
 
 
+
+def _capture_then_apply(leerie, repo, st, **kw):
+    """`capture_repo_deps` records into the run's directory and only the
+    operator's `config --apply-capture` writes `.leerie/config.toml` (DESIGN
+    §6½ *The operator applies a capture*): the two, in order, for the
+    merge's behaviour."""
+    rec = Path(st.run_dir)
+    asyncio.run(leerie.capture_repo_deps(repo, st, record_in=rec, **kw))
+    if (rec / leerie.CAPTURED_DEPS_FILE).is_file():
+        leerie.apply_captured_deps(rec, repo)
+
 def _registered(log_dir: Path) -> Path:
     """Register every fixture log in `log_dir` as a worker transcript —
     `_extract_depcap_commands` reads registered transcripts only."""
@@ -587,10 +598,8 @@ class TestCaptureRepoDeps:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         cfg = repo / ".leerie" / "config.toml"
         assert cfg.exists()
@@ -614,10 +623,8 @@ class TestCaptureRepoDeps:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         cfg = repo / ".leerie" / "config.toml"
         assert cfg.exists()
@@ -632,8 +639,11 @@ class TestCaptureRepoDeps:
         except ImportError:  # pragma: no cover - py<3.11
             import tomli as tomllib
         parsed = tomllib.loads(content)
+        # The command is leerie's own for the manager, never the capture's
+        # (DESIGN §6½ *A capture names packages and managers, never
+        # commands*).
         assert json.loads(parsed["language_installs"]) == [
-            {"manager": "pnpm", "command": "pnpm install --offline --frozen-lockfile",
+            {"manager": "pnpm", "command": "pnpm install --frozen-lockfile",
              "copy_inputs": ["package.json", "pnpm-lock.yaml"]},
         ]
 
@@ -655,10 +665,8 @@ class TestCaptureRepoDeps:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         mtime_after = cfg.stat().st_mtime
         assert mtime_before == mtime_after
@@ -690,10 +698,8 @@ class TestCaptureRepoDeps:
                     "dockerfile_notes": None}
 
         with patch.object(leerie, "claude_p", new=AsyncMock(side_effect=_mock_claude_p)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         # Worker SHOULD run (feat-003 removes the early-return); residual written.
         assert called, "dep_capture worker must run even when Dockerfile is committed"
@@ -721,10 +727,8 @@ class TestCaptureRepoDeps:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         cfg = leerie_dir / "config.toml"
         assert cfg.exists()
@@ -746,10 +750,8 @@ class TestCaptureRepoDeps:
             with patch.object(leerie, "_write_config_toml_keys",
                               side_effect=OSError("disk full")):
                 try:
-                    asyncio.run(leerie.capture_repo_deps(
-                        repo, st, caps=_FAKE_CAPS,
-                        models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-                    ))
+                    _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                        models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
                 except Exception as exc:
                     exc_caught = exc
 
@@ -769,10 +771,8 @@ class TestCaptureRepoDeps:
             return {"setup_packages": [], "language_installs": [], "dockerfile_notes": None}
 
         with patch.object(leerie, "claude_p", new=AsyncMock(side_effect=_mock_claude_p)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         assert not called
         cfg = repo / ".leerie" / "config.toml"
@@ -796,10 +796,8 @@ class TestCaptureRepoDeps:
             return {"setup_packages": [], "language_installs": [], "dockerfile_notes": None}
 
         with patch.object(leerie, "claude_p", new=AsyncMock(side_effect=_mock_claude_p)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         assert not called
         assert "setup_packages" not in cfg.read_text()
@@ -839,7 +837,7 @@ class TestCaptureRepoDeps:
             return {"setup_packages": [], "language_installs": [], "dockerfile_notes": None}
 
         with patch.object(leerie, "claude_p", new=AsyncMock(side_effect=_mock_claude_p)):
-            asyncio.run(leerie.capture_repo_deps(repo, st, caps=None))
+            _capture_then_apply(leerie, repo, st, caps=None)
 
         assert not called
         cfg = repo / ".leerie" / "config.toml"
@@ -863,10 +861,8 @@ class TestCaptureRepoDeps:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         content = cfg.read_text()
         # Existing packages must still be there.
@@ -903,10 +899,8 @@ class TestCaptureRepoDeps:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         content = cfg.read_text()
         # pnpm is new — should be added.
@@ -940,11 +934,9 @@ class TestCaptureRepoDeps:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
                 models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-                replace=True,
-            ))
+                replace=True)
 
         content = cfg.read_text()
         assert "postgresql" in content
@@ -970,11 +962,9 @@ class TestCaptureRepoDeps:
             "setup_packages": [], "language_installs": [], "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
                 models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-                replace=True,
-            ))
+                replace=True)
 
         assert cfg.stat().st_mtime == mtime_before
         assert "postgresql" in cfg.read_text()
@@ -1036,10 +1026,8 @@ class TestDepCaptureSentinel:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         sentinel = Path(st.run_dir) / "dep_capture.done"
         assert sentinel.is_file(), "dep_capture.done sentinel must be written"
@@ -1058,10 +1046,8 @@ class TestDepCaptureSentinel:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         assert st.data.get("dep_capture_done") is True
 
@@ -1083,10 +1069,8 @@ class TestDepCaptureSentinel:
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
 
         sentinel = Path(st.run_dir) / "dep_capture.done"
         assert sentinel.is_file(), "sentinel written even for no-op captures"
@@ -1152,7 +1136,7 @@ class TestBackstopCapturePriorRuns:
             ))
 
         # The prior run's logs, recorded in the current run's directory for
-        # the host to apply (DESIGN §6½ *The host applies a capture*).
+        # the operator to apply (DESIGN §6½ *The operator applies a capture*).
         assert called == [(run_dir, tmp_path / "current-run")]
 
     def test_skips_run_with_an_empty_logs_dir(self, leerie, tmp_path,

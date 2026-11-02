@@ -13,6 +13,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.committed_tree import commit_tree
+from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
 from tests.repo_image_block_extract import extract_block as _extract_block
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -45,6 +47,7 @@ nerdctl() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     image)
+      _stub_image_inspect "$@" && return 0
       return "${NERDCTL_INSPECT_RC:-0}"
       ;;
     build)
@@ -92,7 +95,10 @@ def _run_harness(body: str, env: dict | None = None) -> subprocess.CompletedProc
     marker_end = "\n# --- translate --inspect-dir paths"
     block = _extract_block(launcher, marker_start, marker_end)
 
-    script = _HARNESS_PREFIX + block + "\n" + body
+    if env and env.get("USER_REPO"):
+        commit_tree(env["USER_REPO"])
+    script = (_HARNESS_PREFIX + NERDCTL_IMAGE_INSPECT_STUB + block + "\n"
+              + body)
 
     base_env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -270,7 +276,7 @@ def test_build_repo_image_failure_exits_1(tmp_path):
 def test_build_repo_image_error_message_matches_launcher():
     """The error message literal must match what's in the launcher source."""
     launcher_text = _launcher_text()
-    assert 'remote_log "error: per-repo container image build failed"' in launcher_text
+    assert '_repo_build_fail "per-repo container image build failed"' in launcher_text
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +297,7 @@ def test_rebuild_skipped_when_image_present_and_hash_matches(tmp_path):
     import hashlib
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
-    (state_dir / ".dockerfile-hash").write_text(f"{version}:{sha}\n")
+    (state_dir / ".dockerfile-hash").write_text(f"{version}:worker-root-1:sha256:base-id:{sha}\n")
 
     result = _run_harness(
         'echo "done"',
@@ -713,7 +719,7 @@ def test_unrelated_file_change_no_rebuild(tmp_path):
     # Store hash matching current Dockerfile.
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
-    (state_dir / ".dockerfile-hash").write_text(f"{version}:{sha}\n")
+    (state_dir / ".dockerfile-hash").write_text(f"{version}:worker-root-1:sha256:base-id:{sha}\n")
 
     # Mutate an unrelated source file — not a lockfile.
     src_dir = user_repo / "src"

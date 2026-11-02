@@ -14,3 +14,43 @@ def extract_block(text: str, start_marker: str, end_marker: str) -> str:
     s = text.index(start_marker)
     e = text.index(end_marker, s)
     return text[s:e]
+
+
+# `nerdctl image inspect -f <format> <tag>` in a harness's bash `nerdctl`
+# stub: the base image's layers and configuration, and the repository
+# image's as leerie builds it (DESIGN §6 *The orchestrator's root is
+# leerie's; a repository's root is only a confined process's*) — the base's
+# layers plus one and the base's configuration, which `_check_repo_image`
+# requires. Builtins only. Returns 0 when it answered a `-f` query, 1 for a
+# bare presence probe, which the stub's own exit code answers: call it as
+# `_stub_image_inspect "$@" && return 0` from the stub's `image)` branch,
+# after the subcommand word is shifted off.
+NERDCTL_IMAGE_INSPECT_STUB = r'''
+_stub_image_inspect() {
+  local _fmt="" _tag=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f) _fmt="${2:-}"; shift 2 || shift ;;
+      inspect) shift ;;
+      *) _tag="$1"; shift ;;
+    esac
+  done
+  case "$_fmt" in
+    *RootFS.Layers*)
+      if [ "$_tag" = "${IMAGE_TAG:-}" ]; then echo '["sha256:b"]'
+      else echo '["sha256:b","sha256:w"]'; fi ;;
+    *Config*) echo '{"Entrypoint":["/e"],"Image":"'"$_tag"'"}' ;;
+    *.Id*) echo 'sha256:base-id' ;;
+    *) return 1 ;;
+  esac
+}
+'''
+
+
+def repo_build_functions(launcher: str) -> str:
+    """The launcher's repository-image build helpers, verbatim:
+    `REPO_IMAGE_LAYOUT`, `_repo_build_prepare`/`_done`/`_fail`,
+    `_repo_image_dockerfile`, `_repo_image_nonce` and `_check_repo_image`
+    (everything from the block's first comment up to `build_repo_image`)."""
+    return extract_block(launcher, "# The repository image (DESIGN §6",
+                         "# Build the repository image. Caller")

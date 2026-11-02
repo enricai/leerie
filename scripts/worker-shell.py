@@ -16,12 +16,37 @@ cannot be made: never a command the CLI's stream is reachable from.
 The interpreter is named absolutely, with `-I -S`: this runs in the CLI's
 own domain until it nests, so nothing a worker can write — a `python3`
 earlier on `PATH`, a `PYTHONPATH`, a `site` directory — may run here. It
-imports only the standard library and the shim beside it, by path."""
+imports only the standard library and the shim beside it, by path.
+
+When the shim gave the CLI a worker view (`--worker-root`, DESIGN §6 *The
+orchestrator's root is leerie's; a repository's root is only a confined
+process's*), the command then runs in it: `chroot` into the view, every
+ambient capability dropped, the worker stage's environment laid over the
+CLI's. This file and the CLI stay in leerie's root, and so does leerie's
+own PreToolUse hook (`forbidden-command-hook.py` beside this file, run by
+the interpreter running this): it is leerie's code."""
 import importlib.util
 import os
 import sys
 
 SHELL = "/bin/bash"
+
+
+_B64 = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                 "0123456789+/=")
+
+
+def _is_leeries_hook(words: list[str], here: str) -> bool:
+    """The command is leerie's PreToolUse hook as the orchestrator writes it
+    (`_forbidden_command_hook_settings`): this interpreter, `-I`, the hook
+    beside this file and one base64 payload. Anything else is the
+    worker's."""
+    if len(words) != 1:
+        return False
+    hook = os.path.join(here, "forbidden-command-hook.py")
+    head = f"{sys.executable} -I {hook} "
+    rest = words[0][len(head):]
+    return words[0].startswith(head) and bool(rest) and set(rest) <= _B64
 
 
 def main(argv: list[str]) -> int:
@@ -40,6 +65,17 @@ def main(argv: list[str]) -> int:
               f"so it does not run: {e} (DESIGN §6 *A worker's commands "
               "cannot reach its CLI*)", file=sys.stderr)
         return 126
+    view = os.environ.pop(lk.VIEW_ENV, None)
+    root = os.environ.pop(lk.WORKER_ROOT_ENV, None)
+    if view and root and not _is_leeries_hook(argv[1:], here):
+        try:
+            lk.enter_worker_view(view, lk.worker_env_changes(root))
+        except OSError as e:
+            print(f"leerie: cannot run the command in the repository's "
+                  f"root, so it does not run: {e} (DESIGN §6 *The "
+                  "orchestrator's root is leerie's; a repository's root is "
+                  "only a confined process's*)", file=sys.stderr)
+            return 126
     # Marks the command as the worker's own for the CLI's `git` on PATH
     # (`scripts/cli-bin/git`): inside this domain the real git runs as the
     # worker asked (DESIGN §6 *The CLI's own git runs on leerie's terms*).

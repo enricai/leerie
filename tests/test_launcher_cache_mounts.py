@@ -149,25 +149,17 @@ def test_bundle_path_env_in_cache_mounts():
     )
 
 
-def test_both_bundle_path_arms_visible_to_extraction():
-    """BUNDLE_PATH is appended conditionally (CACHE_MOUNTS+=(...) in an
-    if/else, DESIGN §6½ out-of-repo bake) rather than living in the
-    CACHE_MOUNTS=( ... ) array literal itself. Pin that the extraction
-    helper reaches past the `if` arm into the `else` arm too — a
-    regression here (e.g. stopping at the first CACHE_MOUNTS+=(...)
-    block) would pass test_bundle_path_env_in_cache_mounts vacuously if
-    only the first arm happened to match, while silently missing the
-    other."""
+def test_bundle_path_is_never_chosen_from_the_repositorys_dockerfile():
+    """The orchestrator's BUNDLE_PATH is the cache mount, always: the
+    launcher no longer searches the repository's Dockerfile for `ENV
+    BUNDLE_PATH=/opt/bundle` to point the orchestrator there. A worker stage
+    that baked /opt/bundle sets it for confined commands only, through the
+    shim (DESIGN §6 *The orchestrator's root is leerie's; a repository's
+    root is only a confined process's*)."""
     text = _launcher_text()
     block = _extract_cache_mounts_block(text)
-
-    assert _BUNDLE_PATH_BAKED_ENV in block, (
-        f"Expected the baked-gems arm '{_BUNDLE_PATH_BAKED_ENV}' inside the "
-        f"extracted block (the `if` arm of the BUNDLE_PATH conditional). "
-        f"Got block:\n{block}"
-    )
-    assert _BUNDLE_PATH_ENV in block, (
-        f"Expected the cache-dir arm '{_BUNDLE_PATH_ENV}' inside the "
-        f"extracted block (the `else` arm of the BUNDLE_PATH conditional). "
-        f"Got block:\n{block}"
-    )
+    code = "\n".join(l for l in block.splitlines()
+                     if not l.lstrip().startswith("#"))
+    assert _BUNDLE_PATH_ENV in code
+    assert _BUNDLE_PATH_BAKED_ENV not in code
+    assert ".leerie/Dockerfile" not in code

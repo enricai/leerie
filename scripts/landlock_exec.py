@@ -3,10 +3,11 @@
 (DESIGN §6 *A worker writes only where it is granted (I5)*, *A confined
 command's processes end with it*).
 
-Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...]
+Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...
+                         [--worker-root DIR [--cli]]]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
        landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
-                        [--report PATH --report-fd N]
+                        [--report PATH --report-fd N] [--worker-root DIR]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
 
 Every write-class right (write, truncate, create, remove, rename and link)
@@ -48,6 +49,19 @@ writes vanish), the set's files placed into the overlay, and the shim as the
 namespace's PID 1, which copies the runner's report to `--report-fd`. Both
 exit 126 without running CMD when any step fails.
 
+`--worker-root DIR` (with either): the repository's root filesystem, built
+from the repository's image stages (DESIGN §6 *The orchestrator's root is
+leerie's; a repository's root is only a confined process's*). The shim
+builds the worker view at `WORKER_VIEW` — the worker root's system
+directories, the container's own mounts (the state root, the checkout,
+`/home`, `/tmp`, `/dev`, `/proc`...) and leerie's `/opt/leerie-*` — and CMD
+is `chroot`ed into it only after the Landlock domain and the seccomp filter
+are in place: the shim itself never runs, imports or reads code from the
+worker root. `--cli`: CMD is a worker's CLI, which stays in leerie's root;
+it starts with `CAP_SYS_CHROOT` (its only capability, in the shim's user
+namespace), so `worker-shell.py` can `chroot` each of its commands into the
+view.
+
 Stdlib only and imported by nothing heavier: it starts every worker. The
 orchestrator imports `abi()` and `MIN_ABI` from here for its preflight, so
 the requirement has one spelling."""
@@ -63,6 +77,14 @@ import stat
 import struct
 import sys
 import time
+# `os.execvp` imports `warnings` on its first call (`os.get_exec_path`): in
+# a child that has just entered the worker view, that import would read the
+# repository's `warnings.py` (and, in a root without Python, fail). Imported
+# here, in leerie's root, so the child imports nothing after it enters the
+# view (DESIGN §6 *The orchestrator's root is leerie's; a repository's root
+# is only a confined process's*: nothing of the shim's runs from the worker
+# root).
+import warnings  # noqa: F401
 
 # Landlock's syscalls share one number on every architecture (they were
 # added after the syscall tables were unified).
@@ -344,10 +366,36 @@ def _die_of(sig: int) -> int:
     return 128 + sig
 
 
-def run(cmd: list[str], relay: int | None = None) -> int:
+def _before_exec(enter: "tuple | None") -> None:
+    """In a forked child, just before it `exec`s the command: `enter` is
+    `("view", VIEW, changes)` — put it in the worker view — or
+    `("cli", VIEW, worker_root)` — keep `CAP_SYS_CHROOT` for the CLI and
+    name the view to its `worker-shell.py`. Exits 126 when it cannot: the
+    command never runs in a root other than the one asked for."""
+    if enter is None:
+        return
+    try:
+        if enter[0] == "view":
+            enter_worker_view(enter[1], enter[2])
+        else:
+            keep_chroot_across_exec()
+            os.environ[VIEW_ENV] = enter[1]
+            os.environ[WORKER_ROOT_ENV] = enter[2]
+    except OSError as e:
+        print(f"leerie: cannot start the command in the repository's root, "
+              f"so it does not run: {e} (DESIGN §6 *The orchestrator's root "
+              "is leerie's; a repository's root is only a confined "
+              "process's*)", file=sys.stderr)
+        os._exit(126)
+
+
+def run(cmd: list[str], relay: int | None = None,
+        enter: "tuple | None" = None) -> int:
     """Run `cmd` as a child of this subreaper, then end what it left.
     `relay`, the relay process, holds no state of its own: it is killed
     outright once `cmd` has ended, before the grace the rest gets.
+    `enter`: the root the child takes just before it `exec`s
+    (`_before_exec`).
     SIGCHLD and the stop signals are blocked and taken with `sigwaitinfo`,
     so none is lost between a check and the wait; the child gets the mask
     it was started with, and the dispositions it would have outside a
@@ -365,6 +413,7 @@ def run(cmd: list[str], relay: int | None = None) -> int:
     if child == 0:
         signal.pthread_sigmask(signal.SIG_SETMASK, old)
         restore_default_signals()
+        _before_exec(enter)
         try:
             os.execvp(cmd[0], cmd)
         except OSError as e:
@@ -784,14 +833,15 @@ def _mountinfo() -> list[tuple[str, set[str]]]:
     return out
 
 
-def readonly_mounts(keep: list[str]) -> int:
+def readonly_mounts(keep: list[str], private: tuple[str, ...] = PRIVATE
+                    ) -> int:
     """Every mount not already read-only, not a kept grant (or beneath one)
-    and not one of the private mounts, remounted read-only with its locked
+    and not one of the `private` mounts, remounted read-only with its locked
     flags. A file outside the grants can then not have its mode, times or
     extended attributes changed. Returns how many were remounted."""
     n = 0
     for mp, opts in _mountinfo():
-        if "ro" in opts or mp in PRIVATE:
+        if "ro" in opts or mp in private:
             continue
         if any(_beneath(mp, k) for k in keep):
             continue
@@ -893,15 +943,213 @@ def join_session_keyring() -> None:
         raise IsolationError("join a session keyring", ctypes.get_errno())
 
 
+# --- the worker view: the repository's root, for confined processes only ---
+# DESIGN §6 *The orchestrator's root is leerie's; a repository's root is only
+# a confined process's*. The repository's image stages are copied whole to
+# `--worker-root` in leerie's image; nothing of leerie's runs in it. The shim
+# builds a root from it and `chroot`s the command there once the command is
+# confined, so the first code the worker root holds that ever runs is the
+# confined command's own.
+
+WORKER_VIEW = "/.leerie-worker-view"
+# The top-level entries a worker view takes from the container whatever the
+# worker root holds: the kernel's, the run's mounts and the private ones.
+CONTAINER_ENTRIES = frozenset({"dev", "proc", "sys", "run", "tmp", "home",
+                               "work", "inspect", "leerie-state",
+                               "leerie-host"})
+# Files the image's last stages write at the worker root's top (`leerie`'s
+# `_repo_image_dockerfile`): the worker stage's environment and the base
+# image's, each `env -0`.
+WORKER_ENV_FILE = ".leerie-worker-env"
+BASE_ENV_FILE = ".leerie-base-env"
+_ENV_FILE_LIMIT = 1 << 20
+# Variables the worker stage's environment never sets in a confined
+# command's: leerie's, the CLI's and the egress proxy's, and the ones the
+# orchestrator gives every command.
+_ENV_KEPT_OUT = frozenset({"PATH", "HOME", "TMPDIR", "PWD", "OLDPWD",
+                           "SHLVL", "_", "HOSTNAME", "NO_PROXY", "no_proxy",
+                           "NODE_USE_ENV_PROXY"})
+_ENV_KEPT_OUT_PREFIXES = ("LEERIE_", "CLAUDE", "ANTHROPIC_")
+# A variable beneath it names what the worker stage built (the image's bake
+# root, `_BAKED_ROOT` in the orchestrator): the worker stage's value wins.
+_BAKED_ROOT = "/opt/"
+VIEW_ENV = "LEERIE_WORKER_VIEW"
+WORKER_ROOT_ENV = "LEERIE_WORKER_ROOT"
+_PR_CAP_AMBIENT = 47
+_PR_CAP_AMBIENT_RAISE = 2
+_PR_CAP_AMBIENT_CLEAR_ALL = 4
+CAP_SYS_CHROOT = 18
+_CAP_VERSION_3 = 0x20080522
+
+
+def _bind_entry(src: str, dst: str) -> None:
+    """`dst` made as `src` is: a link copied as a link (it resolves in the
+    view), a directory bound recursively, anything else bound as a file."""
+    if os.path.islink(src):
+        os.symlink(os.readlink(src), dst)
+    elif os.path.isdir(src):
+        os.mkdir(dst)
+        _must(f"rbind {src}", _mount(src, dst, None, MS_BIND | MS_REC))
+    elif os.path.exists(src):
+        open(dst, "w").close()
+        _must(f"bind {src}", _mount(src, dst, None, MS_BIND))
+
+
+def build_worker_view(worker_root: str) -> list[str]:
+    """Build `WORKER_VIEW` in the current root: each top-level entry of
+    `worker_root` but `CONTAINER_ENTRIES`, those from the container, and an
+    `/opt` holding the worker root's entries with leerie's own
+    (`/opt/leerie-*`) over them. Returns the view's entries that come from
+    the worker root, which the caller grants read: a Landlock rule is on an
+    inode, and the container's entries are already granted where they are.
+    Lists and stats only: nothing in the worker root is opened or run."""
+    try:
+        theirs = set(os.listdir(worker_root))
+        ours = set(os.listdir("/")) - {WORKER_VIEW.lstrip("/")}
+        os.mkdir(WORKER_VIEW, 0o755)
+        granted: list[str] = []
+        for name in sorted(theirs | ours):
+            dst = f"{WORKER_VIEW}/{name}"
+            if name == "opt" and "opt" in theirs \
+                    and os.path.isdir(f"{worker_root}/opt") \
+                    and not os.path.islink(f"{worker_root}/opt"):
+                os.mkdir(dst, 0o755)
+                w_opt = set(os.listdir(f"{worker_root}/opt"))
+                c_opt = (set(os.listdir("/opt")) if os.path.isdir("/opt")
+                         else set())
+                for sub in sorted(w_opt | c_opt):
+                    if _beneath(f"/opt/{sub}", worker_root):
+                        continue
+                    if sub.startswith("leerie-") and sub in c_opt:
+                        _bind_entry(f"/opt/{sub}", f"{dst}/{sub}")
+                    elif sub in w_opt:
+                        _bind_entry(f"{worker_root}/opt/{sub}",
+                                    f"{dst}/{sub}")
+                granted.append(dst)
+            elif name in CONTAINER_ENTRIES or name not in theirs:
+                if name in ours:
+                    _bind_entry("/" + name, dst)
+            else:
+                _bind_entry(f"{worker_root}/{name}", dst)
+                granted.append(dst)
+    except OSError as e:
+        raise IsolationError(f"build the worker view: {e}", e.errno or 0) \
+            from None
+    return granted
+
+
+def _read_env_file(path: str) -> dict[str, str]:
+    """An `env -0` file, read without following a link and bounded; {} when
+    it is absent or not a regular file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {}
+        data = b""
+        while len(data) <= _ENV_FILE_LIMIT:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    out: dict[str, str] = {}
+    for item in data[:_ENV_FILE_LIMIT].split(b"\0"):
+        k, eq, v = item.partition(b"=")
+        if eq and k:
+            out[os.fsdecode(k)] = os.fsdecode(v)
+    return out
+
+
+def worker_env_changes(worker_root: str) -> tuple[dict[str, str], list[str]]:
+    """What the repository's stages changed in the environment: the
+    variables whose value differs from the base image's (less
+    `_ENV_KEPT_OUT` and leerie's, the CLI's and Anthropic's prefixes), and
+    the `PATH` entries the base image's `PATH` lacks, in order."""
+    worker = _read_env_file(f"{worker_root}/{WORKER_ENV_FILE}")
+    base = _read_env_file(f"{worker_root}/{BASE_ENV_FILE}")
+    changed = {k: v for k, v in worker.items()
+               if base.get(k) != v and k not in _ENV_KEPT_OUT
+               and k not in PROXY_VARS
+               and not k.startswith(_ENV_KEPT_OUT_PREFIXES)}
+    base_path = set(base.get("PATH", "").split(":"))
+    added = [p for p in worker.get("PATH", "").split(":")
+             if p and p not in base_path]
+    return changed, list(dict.fromkeys(added))
+
+
+def apply_worker_env(env: "os._Environ[str] | dict[str, str]",
+                     changes: tuple[dict[str, str], list[str]]) -> None:
+    """Lay the worker stage's changes over `env`: a variable the caller did
+    not set, or one naming what the stage built (beneath `/opt/`); its
+    `PATH` entries first."""
+    changed, added = changes
+    for k, v in changed.items():
+        if k not in env or v.startswith(_BAKED_ROOT):
+            env[k] = v
+    if added:
+        rest = [p for p in env.get("PATH", "").split(":")
+                if p and p not in added]
+        env["PATH"] = ":".join(added + rest)
+
+
+def enter_worker_view(view: str, changes: tuple[dict[str, str], list[str]]
+                      ) -> None:
+    """`chroot` into `view` at the same working directory, drop every
+    ambient capability (what this process `exec`s next holds none), and
+    lay the worker stage's environment over this process's. Raises OSError.
+    Called only by a confined process: after `confine`, or `nest`."""
+    cwd = os.getcwd()
+    os.chroot(view)
+    os.chdir(cwd)
+    _libc().prctl(_PR_CAP_AMBIENT, _PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+    apply_worker_env(os.environ, changes)
+
+
+class _CapHeader(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+
+class _CapData(ctypes.Structure):
+    _fields_ = [("effective", ctypes.c_uint32),
+                ("permitted", ctypes.c_uint32),
+                ("inheritable", ctypes.c_uint32)]
+
+
+def keep_chroot_across_exec() -> None:
+    """Make `CAP_SYS_CHROOT` ambient, so the CLI this process `exec`s holds
+    it (in the shim's user namespace only) and `worker-shell.py` can put
+    each command in the worker view. The CLI is leerie's code in leerie's
+    root; every command drops it before it runs (`enter_worker_view`).
+    Raises OSError."""
+    libc = _libc()
+    hdr = _CapHeader(_CAP_VERSION_3, 0)
+    data = (_CapData * 2)()
+    if libc.capget(ctypes.byref(hdr), data) != 0:
+        raise OSError(f"capget: errno {ctypes.get_errno()}")
+    data[0].inheritable |= 1 << CAP_SYS_CHROOT
+    if libc.capset(ctypes.byref(hdr), data) != 0:
+        raise OSError(f"capset: errno {ctypes.get_errno()}")
+    if libc.prctl(_PR_CAP_AMBIENT, _PR_CAP_AMBIENT_RAISE, CAP_SYS_CHROOT,
+                  0, 0) != 0:
+        raise OSError(f"raise ambient CAP_SYS_CHROOT: errno "
+                      f"{ctypes.get_errno()}")
+
+
 def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
             view: str | None = None,
             place_pairs: list[tuple[str, str]] = (),
-            sockets: list[str] = ()) -> int:
+            sockets: list[str] = (),
+            worker_root: str | None = None) -> tuple[int, list[str]]:
     """Build the namespaces and mounts for `--isolate` (or `--sandbox`,
-    with `view`); returns how many mounts were made read-only. `sockets`:
-    the relays' unix sockets, whose directories are carried in read-only
-    (one beneath `/tmp` is otherwise not there). The caller then joins a
-    keyring, installs seccomp and confines."""
+    with `view`); returns how many mounts were made read-only and the read
+    grants the worker view needs (`build_worker_view`; none without
+    `worker_root`). `sockets`: the relays' unix sockets, whose directories
+    are carried in read-only (one beneath `/tmp` is otherwise not there).
+    The caller then joins a keyring, installs seccomp and confines."""
     cwd = os.getcwd()
     enter_namespaces(sandbox=sandbox)
     loopback_up()
@@ -916,7 +1164,15 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
         kept += overlay_grants(rw, view)
     else:
         kept += bind_grants(rw)
-    n = readonly_mounts(kept)
+    view_ro: list[str] = []
+    private = PRIVATE
+    if worker_root is not None:
+        # After the grants: the view's binds of the container's entries
+        # carry them, and stay writable where they are writable.
+        view_ro = build_worker_view(worker_root)
+        kept += [WORKER_VIEW + k for k in kept]
+        private = PRIVATE + tuple(WORKER_VIEW + p for p in PRIVATE)
+    n = readonly_mounts(kept, private)
     if sandbox:
         assert view is not None
         # After the read-only remount: the view's overlay is the one
@@ -929,7 +1185,7 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
         os.chdir(cwd)
     except OSError as e:
         raise IsolationError(f"chdir {cwd}", e.errno or 0) from None
-    return n
+    return n, view_ro
 
 
 def isolation_error() -> str | None:
@@ -1116,7 +1372,8 @@ def _copy_report(report: str | None, report_fd: int | None) -> None:
 
 
 def run_as_init(cmd: list[str], report: str | None, report_fd: int | None,
-                status_w: int, mask: set) -> None:
+                status_w: int, mask: set, enter: "tuple | None" = None
+                ) -> None:
     """PID 1 of the sandbox's PID namespace: run `cmd`, end every process of
     the namespace, copy the report to `report_fd`, write how `cmd` ended to
     `status_w` (`E<code>` or `S<signal>`) and exit. An init receives only
@@ -1134,6 +1391,7 @@ def run_as_init(cmd: list[str], report: str | None, report_fd: int | None,
         for sig in watched:
             signal.signal(sig, signal.SIG_DFL)
         restore_default_signals()
+        _before_exec(enter)
         try:
             os.execvp(cmd[0], cmd)
         except OSError as e:
@@ -1206,11 +1464,17 @@ def _isolation_failed(e: BaseException) -> int:
 
 def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                 place_pairs: list[tuple[str, str]], report: str | None,
-                report_fd: int | None) -> int:
+                report_fd: int | None, worker_root: str | None = None) -> int:
     """`--sandbox`: build it, fork PID 1 of the new PID namespace, forward
     a stop signal to it, and exit as `cmd` did."""
+    enter = None
     try:
-        isolate(rw, ro, sandbox=True, view=view, place_pairs=place_pairs)
+        _n, view_ro = isolate(rw, ro, sandbox=True, view=view,
+                              place_pairs=place_pairs,
+                              worker_root=worker_root)
+        if worker_root is not None:
+            ro = ro + view_ro
+            enter = ("view", WORKER_VIEW, worker_env_changes(worker_root))
     except (IsolationError, OSError) as e:
         return _isolation_failed(e)
     if report_fd is not None:
@@ -1233,7 +1497,7 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
         if rc is not None:
             os.write(status_w, f"E{rc}".encode())
             os._exit(0)
-        run_as_init(cmd, report, report_fd, status_w, old)
+        run_as_init(cmd, report, report_fd, status_w, old, enter)
     os.close(status_w)
     while True:
         try:
@@ -1268,17 +1532,19 @@ def _parse(argv: list[str]) -> dict | str:
     o: dict = {"rw": [], "ro": [], "isolate": False, "sandbox": False,
                "view": None, "place": [], "report": None,
                "report_fd": None, "egress": None, "forward": [],
+               "worker_root": None, "cli": False,
                "cmd": argv[sep + 1:]}
     opts = argv[:sep]
     i = 0
     while i < len(opts):
         k = opts[i]
-        if k in ("--isolate", "--sandbox"):
+        if k in ("--isolate", "--sandbox", "--cli"):
             o[k[2:]] = True
             i += 1
             continue
         if k not in ("--rw", "--ro", "--view", "--place", "--report",
-                     "--report-fd", "--egress", "--forward") \
+                     "--report-fd", "--egress", "--forward",
+                     "--worker-root") \
                 or i + 1 >= len(opts):
             return f"landlock_exec.py: bad option {k!r}"
         v = opts[i + 1]
@@ -1299,6 +1565,10 @@ def _parse(argv: list[str]) -> dict | str:
                     or not os.path.isabs(sock)):
                 return f"landlock_exec.py: bad --forward {v!r}"
             o["forward"].append((int(port), sock))
+        elif k == "--worker-root":
+            if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
+                return f"landlock_exec.py: bad --worker-root {v!r}"
+            o["worker_root"] = os.path.normpath(v)
         elif k == "--report-fd":
             if not v.isdigit():
                 return f"landlock_exec.py: bad --report-fd {v!r}"
@@ -1319,6 +1589,10 @@ def _parse(argv: list[str]) -> dict | str:
         return "landlock_exec.py: --egress and --forward need --isolate"
     if (o["report"] is None) != (o["report_fd"] is None):
         return "landlock_exec.py: --report and --report-fd go together"
+    if o["worker_root"] and not (o["isolate"] or o["sandbox"]):
+        return "landlock_exec.py: --worker-root needs --isolate or --sandbox"
+    if o["cli"] and not (o["worker_root"] and o["isolate"]):
+        return "landlock_exec.py: --cli needs --isolate and --worker-root"
     return o
 
 
@@ -1328,15 +1602,22 @@ def main(argv: list[str]) -> int:
         print(o, file=sys.stderr)
         return 2
     rw, ro, cmd = o["rw"], o["ro"], o["cmd"]
+    wr = o["worker_root"]
     if o["sandbox"]:
         return run_sandbox(cmd, rw, ro, o["view"], o["place"], o["report"],
-                           o["report_fd"])
+                           o["report_fd"], wr)
     relays: list[tuple[socket.socket, str]] = []
+    enter = None
     if o["isolate"]:
         targets = list(o["forward"]) + ([(0, o["egress"])] if o["egress"]
                                         else [])
         try:
-            isolate(rw, ro, sockets=[t for _p, t in targets])
+            _n, view_ro = isolate(rw, ro, sockets=[t for _p, t in targets],
+                                  worker_root=wr)
+            if wr is not None:
+                ro = ro + view_ro
+                enter = (("cli", WORKER_VIEW, wr) if o["cli"] else
+                         ("view", WORKER_VIEW, worker_env_changes(wr)))
             join_session_keyring()
             # Fixed ports first, so the kernel's pick cannot take one.
             relays = [(relay_listener(port), target)
@@ -1351,7 +1632,7 @@ def main(argv: list[str]) -> int:
     rc = _confine_or_126(rw, ro)
     if rc is not None:
         return rc
-    return run(cmd, start_relays(relays))
+    return run(cmd, start_relays(relays), enter)
 
 
 if __name__ == "__main__":

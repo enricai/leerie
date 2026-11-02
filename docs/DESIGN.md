@@ -2295,8 +2295,9 @@ r16 H2's two scenarios):
 
   What wrote it, and where each write went:
   - *Dependency capture's `.leerie/config.toml`.* The container records the
-    capture in the run directory; the host applies it to the checkout after
-    the container exits (§6½ *The host applies a capture*).
+    capture in the run directory; the operator applies it to the checkout
+    with `leerie config --apply-capture <run>` (§6½ *The operator applies a
+    capture*).
   - *The in-checkout state root.* `resolve_leerie_root` falls back to
     `<repo>/.leerie` only when `LEERIE_STATE_DIR` is unset. The local
     launcher always passes `LEERIE_STATE_DIR=/leerie-state`, so the
@@ -2796,6 +2797,160 @@ mount but the grants read-only to every confined process (§6 *Every
 confined process has its own `/tmp`, `/dev/shm` and IPC*), which closes
 the metadata writes. Names read by path walk outside a grant stay
 readable; they are names, not contents.
+
+### The orchestrator's root is leerie's; a repository's root is only a confined process's
+
+*Designed 2026-11-02 (review round 28, isolation E1 and E2).*
+
+**Root cause.** A repository chose the root filesystem the orchestrator
+runs in. The launcher built the run's image from the repository's
+`.leerie/Dockerfile` — committed, or generated from `.leerie/config.toml`
+and the repository's lockfiles — and the orchestrator, the root cgroup
+broker and `container-entry.sh` all ran in that image. Every line of it ran
+as root at build time with the repository's content: `npm ci` runs the root
+package's `preinstall`, `bundle install` evaluates the Gemfile, `poetry`
+and `uv sync` build the project, and a committed Dockerfile is any program
+at all. `package.json` and the lockfiles are a worker's to write and a run
+merges them. Measured (review round 28, isolation E1): a `preinstall`
+wrote a `.pth` into `/usr/lib/python3/dist-packages`, and the plant ran
+inside `python3 /opt/leerie-image/orchestrator/leerie.py` — as the
+orchestrator (uid 1000) and as root, the cgroup broker's interpreter. `-I`
+does not help: site-packages `.pth` files are still processed. The
+orchestrator holds the credentials, every held-out set and every run's
+state, and the same file could equally have replaced `ENTRYPOINT` (so
+nothing is confined), set `LD_PRELOAD`, or written `/etc/ld.so.preload`.
+Narrower fixes do not close it. `--ignore-scripts` leaves the Gemfile,
+source distributions and gems, and a lockfile names arbitrary sources.
+`--entrypoint` and a scrubbed environment leave the dynamic loader, which
+reads the image's `/etc/ld.so.preload`, libc and `.pth` files before any
+program leerie chose runs. Any dynamically linked process in a root whose
+`/etc` and `/lib` a repository wrote is the repository's. The fix has to
+choose the root itself.
+
+**Invariant.** No process of leerie's own — the orchestrator, the cgroup
+broker, `container-entry.sh`, the Landlock shim, a worker's CLI and the
+helpers it runs — runs in a root filesystem repository content shaped.
+Repository-derived filesystem content (a committed `.leerie/Dockerfile`,
+`setup_packages`, `language_installs`, the lockfile bake) is only ever the
+root of a confined process: a worker's command, a repository command
+leerie runs, a held-out sandbox's runner. It becomes their root only after
+they are confined.
+
+**Mechanism.**
+
+- *One image, two roots.* The launcher builds the repository image from
+  leerie's own Dockerfile around the repository's
+  (`_repo_image_dockerfile`): a comment first, so that no parser directive
+  of the repository's applies (a `# syntax=` line would choose the frontend
+  that builds the whole file); the repository's stages, the last one
+  named; two stages of leerie's that record the base image's environment
+  and the worker stage's (`env -0`, at `/.leerie-base-env` and
+  `/.leerie-worker-env`); and the final stage, `FROM <leerie's base>` and
+  one `COPY --from=<worker stage> / /opt/leerie-worker-root/`. The final
+  stage's name carries a nonce drawn for the build and is built with
+  `--target`, so a repository file that swallows leerie's lines (an
+  unterminated heredoc, a trailing continuation) builds nothing rather
+  than a final stage of its own. After a local build the image is checked
+  to be the base's layers plus exactly one, with the base's configuration
+  (`_check_repo_image`); anything else is removed and the launch stops.
+  The image's own root — everything outside `/opt/leerie-worker-root` — is
+  leerie's base, byte for byte, and its entrypoint is
+  `container-entry.sh`.
+- *The worker view.* A confined process's root was already one the shim
+  builds (`pivot_to_owned_root`: a tmpfs holding a bind of each entry of
+  `/`). Where the image has a worker root, the shim also builds the worker
+  view (`build_worker_view`, at `/.leerie-worker-view`): each top-level
+  entry of the worker root but the container's own (`/dev`, `/proc`,
+  `/sys`, `/run`, `/tmp`, `/home`, `/work`, `/inspect`, `/leerie-state`,
+  `/leerie-host`), those from the container — so the grants, the private
+  `/tmp` and the state root are the same mounts — and an `/opt` holding the
+  worker root's entries with leerie's own `/opt/leerie-*` over them (the
+  scripts the AST measurements run, the bundled `typescript`). Built after
+  the grants, so they are carried writable; every other mount of the view
+  is read-only, like every other mount. The worker root's entries are
+  granted read: a Landlock rule is on an inode, and the container's entries
+  are granted already where they are.
+- *Confined first, then the repository's root.* The shim never enters the
+  worker view, never imports or reads code from it, and never runs a
+  program in it: it lists directories and binds them. The command it
+  starts `chroot`s into the view in the forked child, after the Landlock
+  domain and the seccomp filter are in place and just before `exec`
+  (`_before_exec`, `enter_worker_view`): Landlock does not refuse `chroot`
+  and the seccomp filter does not list it, and the child holds
+  `CAP_SYS_CHROOT` in the shim's user namespace until its `exec` drops
+  every capability. The first code from the worker root that ever runs is
+  the confined command's own. A held-out sandbox's runner enters it the
+  same way, from its PID 1.
+- *A worker's CLI stays in leerie's root.* The CLI holds the stream leerie
+  reads a worker's record from, and its own spawns — `/bin/sh` for a hook,
+  `rg`, the `git` of `scripts/cli-bin` — run in its domain (§6 *A worker's
+  commands cannot reach its CLI*). So the CLI is `exec`ed in leerie's
+  root, from leerie's binaries and libraries, and holds one capability,
+  `CAP_SYS_CHROOT` in the shim's user namespace, made ambient
+  (`keep_chroot_across_exec`). `worker-shell.py`, the prefix every command
+  and hook runs through, nests its Landlock domain first, then `chroot`s
+  the command into the view, drops every ambient capability and lays the
+  worker stage's environment over the CLI's (`enter_worker_view`). Leerie's
+  own PreToolUse hook, recognised exactly as
+  `_forbidden_command_hook_settings` writes it, runs in leerie's root. The
+  capability gives a process no reach: `no_new_privs` is set, so no set-id
+  program in a root a worker shaped gains anything, and Landlock's rules
+  are on inodes, so a `chroot` widens no grant.
+- *The worker stage's environment reaches only confined commands.* A
+  committed Dockerfile's `ENV PATH=…`, a bake's `VIRTUAL_ENV` and
+  `BUNDLE_PATH`: the orchestrator's environment is the base image's and
+  never takes them (a `PATH` the repository chose would decide which `git`
+  the orchestrator runs). The shim and `worker-shell.py` lay the
+  difference between the two recorded environments over a command's
+  (`worker_env_changes`, `apply_worker_env`): a variable the orchestrator
+  did not set, or one beneath `/opt/` (what the worker stage built, as
+  `_BAKED_ROOT` already treats it), and the `PATH` entries the base's
+  `PATH` lacks, first. Leerie's, the CLI's and Anthropic's variables, the
+  proxy variables, `HOME` and `TMPDIR` are never taken. This replaces the
+  launcher's search of the Dockerfile for `ENV BUNDLE_PATH`.
+- *The build sees the committed tree.* The build context is the committed
+  tree at `HEAD`, exported by `git archive` into a directory of the
+  launcher's own under the state root, never the checkout directory: an
+  untracked `.env` or `.claude/settings.local.json` never reaches a build
+  a repository's Dockerfile drives (the build has the network), and a link
+  the checkout holds is a link in the context, which BuildKit does not
+  follow out of it. BuildKit reads only what a `COPY` names. The generator
+  reads its inputs from the same tree (§6 *Leerie never reads through a
+  link a repository holds*).
+- *Fail closed, on every entry.* Where the image has a worker root, the
+  confinement check every entry runs (`_require_confinement`) runs `test
+  -e /.leerie-worker-env` confined and stops the run when it does not find
+  the worker stage's mark (`_require_worker_view`): leerie never runs the
+  repository's commands in its own root instead, nor its own in theirs.
+
+**Runtimes.** *Rootless:* the worker root is the image's, owned as the
+image built it (root's files appear as the running user, the image's
+`leerie` files as `nobody`, exactly as in leerie's own root); the view's
+binds of it are read-only, so no ownership question arises. *Rootful:* the
+same files are root's and the worker reads them through their mode bits,
+as it reads leerie's root today; `container-entry.sh`'s ownership fixes
+touch only leerie's root. *Fly:* `ensure_image` builds the same two-stage
+Dockerfile through `build-push.sh` (`--context`, `--target`), from the
+committed tree; the machine's root is the base. *EC2:* the AMI is baked
+from leerie's base Dockerfile only, and no repository image is built
+there, so every process runs in leerie's root; a repository's image layers
+reach no EC2 machine. The machine's `/work/.leerie/Dockerfile` is not
+streamed back to the host on Fly or EC2 any more: a file a machine wrote
+never becomes a build input.
+
+**Cost.** `COPY --from=<worker stage> /` copies the whole worker root, which
+is the base's filesystem plus the repository's layers: about 2.4 GB more
+unpacked per repository image (one per repository and leerie version), and
+the copy's time on each rebuild. A rebuild happens only when the
+Dockerfile, its inputs, leerie's version or the base image change
+(`.dockerfile-hash` records all four and `REPO_IMAGE_LAYOUT`).
+
+**Residuals.** A worker's CLI reads with its `Read`, `Grep` and `Glob`
+tools in leerie's root: a path only the worker root has (`/opt/venv/…`)
+is found by a command, not by those tools. A worker stage whose last
+stage has no `/bin/sh` cannot record its environment, so its build fails.
+A repository Dockerfile's own parser directives (`# syntax=`, `# escape=`)
+do not apply.
 
 ### A worker's commands cannot reach its CLI
 
@@ -3340,9 +3495,15 @@ constructed in three parts.
    execution L2), and the checkout is not written while leerie runs, so one
    check holds for every read after it. Its other looks at the checkout only
    test whether a file exists, to choose between leerie's own commands.
-   The host-side recapture rewrites `.leerie/config.toml` through
-   `_write_beneath`, so a link there is replaced, never read or written
-   through.
+   The operator's `config --apply-capture` rewrites `.leerie/config.toml`
+   through `_write_beneath`, so a link there is replaced, never read or
+   written through. The Dockerfile generator reads the committed tree from
+   git (`git ls-tree`, `git cat-file`, bounded), never the checkout's paths:
+   a linked `.npmrc` is a link, which is no input (review round 28,
+   isolation A2: it was hashed and named in a `COPY`, and one linked to
+   `/proc/self/pagemap` stopped every launch). It reads the operator's
+   `.leerie/config.toml` beneath the checkout without following a link,
+   bounded.
 
 A rule over the module holds the line. Every function that still calls a
 raw read primitive is classified by why what it reads is not a repository's
@@ -9163,19 +9324,28 @@ System packages requiring root (C libraries for native gems, fonts,
 specialized tooling) cannot be installed by `.leerie-setup.sh` — that
 hook runs as the unprivileged `leerie` user. A repo that needs such
 packages commits `.leerie/Dockerfile` that extends the base image with
-`ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds a derived
-image tagged `leerie-repo/<repo-id>:<version>` (where `<repo-id>` is
-derived from the git remote URL, sanitized to tag chars) and uses it for
-all subsequent `nerdctl run` invocations. When no `.leerie/Dockerfile`
-exists but `.leerie/config.toml` declares `setup_packages`, the launcher
+`ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds an image
+tagged `leerie-repo/<repo-id>:<version>` (where `<repo-id>` is derived
+from the git remote URL, sanitized to tag chars) and uses it for all
+subsequent `nerdctl run` invocations. When no `.leerie/Dockerfile` exists
+but `.leerie/config.toml` declares `setup_packages`, the launcher
 auto-generates an apt-install Dockerfile and proceeds through the same
 build path. A committed Dockerfile always takes precedence — `setup_packages`
 is ignored when both are present.
 
-Rebuild is triggered by any of: the derived image is absent, the sha256
-of the Dockerfile changed (stored as `<base_version>:<sha256>` at
-`$LEERIE_STATE_HOST_DIR/.dockerfile-hash`), or the base version changed.
-A second run with an unchanged Dockerfile skips the build entirely.
+The repository's Dockerfile builds only the *worker stage*: its result is
+copied whole to `/opt/leerie-worker-root` in an image whose own root is
+leerie's base, and it is only ever the root of a confined process (§6 *The
+orchestrator's root is leerie's; a repository's root is only a confined
+process's*). The build context is the committed tree at `HEAD`, never the
+checkout directory.
+
+Rebuild is triggered by any of: the image is absent, the sha256 of the
+Dockerfile changed, the base image changed, leerie's version or the
+image's layout (`REPO_IMAGE_LAYOUT`) changed — all four stored as
+`<version>:<layout>:<base image id>:<sha256>` at
+`$LEERIE_STATE_HOST_DIR/.dockerfile-hash`. A second run with an unchanged
+Dockerfile skips the build entirely.
 
 The `nerdctl run` image argument uses `${REPO_IMAGE_TAG:-$IMAGE_TAG}`,
 so the base image is used transparently when no repo Dockerfile is
@@ -9189,9 +9359,10 @@ Dockerfile, computes the hash, and sets `LEERIE_FLY_IMAGE` to the per-repo
 tag — the existing override hook in `resolve_fly_image_tag()` picks it up
 transparently. `ensure_image()` then first guarantees the base image is
 published (checking `published-tags.txt`; building and pushing if absent),
-then calls `build-push.sh --dockerfile $USER_REPO/.leerie/Dockerfile
---build-arg BASE_IMAGE=$base_tag --tag $per_repo_tag` to build and push
-the derived image. Both the base tag and the per-repo tag are recorded in
+then builds and pushes the repository image with `build-push.sh`: leerie's
+two-stage Dockerfile around the repository's (`--dockerfile`), the
+committed tree as the context (`--context`), its final stage as the target
+(`--target`), `--build-arg BASE_IMAGE=$base_tag --tag $per_repo_tag`. Both the base tag and the per-repo tag are recorded in
 `published-tags.txt` so subsequent runs skip the build entirely. Without
 `.leerie/Dockerfile` the Fly path is unchanged — the base tag resolves and
 `ensure_image` proceeds as before.
@@ -9225,8 +9396,9 @@ manifest files (with commands as a hint) is what delivers the "across all
 languages and frameworks" goal. Which files and commands the worker sees is
 deterministic corpus selection in code; the model still decides content (§12
 *Prompts are advisory, code enforces*). Structured output (`setup_packages`
-and `language_installs`) is validated against a JSON schema and written to
-`.leerie/config.toml` deterministically, by the host (*The host applies a
+and `language_installs`) is validated against a JSON schema and in code,
+recorded in the run directory, and written to `.leerie/config.toml`
+deterministically when the operator applies it (*The operator applies a
 capture* below). The `dep_capture` worker defaults to
 `sonnet`/`medium`, overridable via `LEERIE_MODEL_DEP_CAPTURE`.
 
@@ -9243,11 +9415,13 @@ install-intent loop stops.
 `bake_language_deps`, default true).** `dep_capture`'s `language_installs`
 output (per-manager `{manager, command, copy_inputs}` entries) is written to
 `.leerie/config.toml`, keyed by manager, never-clobber. When enabled, the
-auto-generated `.leerie/Dockerfile` (and the derived image, when
+auto-generated `.leerie/Dockerfile` (and the repository image, when
 `build_repo_image` builds it) also includes a language-dep layer: `COPY` for
 the lockfile, manifest files, and any ancillary inputs the package manager
-requires, followed by `RUN <command>` (`pnpm install --frozen-lockfile`,
-`pip install -r requirements.txt`, etc.). Workers that inherit this image find
+requires, followed by `RUN <command>`, where the command is leerie's own
+for that manager (`pnpm install --frozen-lockfile`, `pip install -r
+requirements.txt`, etc.; *A capture names packages and managers, never
+commands* below). Workers that inherit this image find
 `node_modules`/site-packages already populated — per-worker install drops to
 near-zero.
 
@@ -9280,8 +9454,9 @@ differs, the decision-maker does not:
   over them automatically, recording each capture in the current run's
   directory; and *on-demand `--recapture`* — `leerie config
   --recapture` resolves the target run, constructs and flocks its `State`
-  (refusing to race a live orchestrator via `StateLockedError`), and runs the
-  worker via `asyncio.run`.
+  (refusing to race a live orchestrator via `StateLockedError`), runs the
+  worker via `asyncio.run` and records the capture in that run's directory,
+  for `config --apply-capture`.
 
 **Union by default; replace only on `--recapture --force`.** Every automatic
 seam — finalize, cancel, backstop — writes as a never-clobber *union*, so
@@ -9293,33 +9468,61 @@ no longer captured) — an explicit "rebuild the dep set from current history"
 gesture. Even under `--force`, an empty capture leaves the existing config
 untouched, so a bad run can never blank a good config.
 
-**The host applies a capture.** The container never writes the user's
+**A capture names packages and managers, never commands.** The capture is
+an LLM worker's answer over the commands a run's workers ran, and those
+workers are hostile by assumption, so nothing in it reaches a `RUN` line
+as text (review round 28, isolation E2: a `setup_packages` item `&&` was
+word-split into the apt `RUN` line as shell, and an unknown manager's
+`command` was emitted verbatim as `RUN <command>`). Checked mechanically,
+three times, and refused rather than trimmed: in the schema (a
+`setup_packages` item matches the Debian package-name pattern
+`DEBIAN_PACKAGE_PATTERN`; a `manager` is a plain word; a `copy_inputs`
+path a plain relative one), in code before a capture is recorded or
+applied (`_capture_problems`: every item, every manager one of
+`BAKE_INSTALL_COMMANDS`, every input a relative path without `..`), and by
+the launcher before it writes a Dockerfile line (the same package pattern
+per word; the generator's own `_INSTALL_COMMANDS` table, which a test
+keeps equal to `BAKE_INSTALL_COMMANDS`). A recorded entry is
+`{manager, command, copy_inputs}` with the command taken from leerie's
+table; the generator reads only the manager and the inputs, never a
+`command` field, so a hand-edited or committed `language_installs` names
+which bake runs, not what it runs. A manager outside the table is dropped
+by `_filter_residual_deps`, which used to keep it verbatim.
+
+**The operator applies a capture.** The container never writes the user's
 checkout (§6 *The explicit channel*; locally it is mounted read-only), so a
 capture inside the container is recorded, not written:
-`capture_repo_deps(..., record_in=<the current run's directory>)` appends
+`capture_repo_deps(..., record_in=<the run's directory>)` appends
 `{setup_packages, language_installs, replace, from_run}` to
-`<run-dir>/captured-deps.json`. The host applies the file to
-`$USER_REPO/.leerie/config.toml` with the same union (or replace) merge,
-against the file as it is at that moment, then renames it
-`captured-deps.applied.json`, so a second apply is a no-op:
-- locally, in the launcher's EXIT trap, for the run that container ran,
-  whatever the exit (as the bring-back);
-- on Fly/EC2, in `fetch_branch`, from the run directory it streamed back.
+`<run-dir>/captured-deps.json`. Only the operator's `leerie config
+--apply-capture <run-id>` writes it into `$USER_REPO/.leerie/config.toml`
+(`host_apply_captured_deps` → `apply_captured_deps`), with the same union
+(or replace) merge, against the file as it is at that moment, logging the
+change as a diff; the file is then renamed `captured-deps.applied.json`, so
+a second apply is a no-op. A file `_capture_problems` refuses is kept and
+nothing is written.
 
-The merge reads the host's config at apply time, so a key the user edited
-during the run is merged with, never overwritten by, a value read before.
-`leerie config --recapture` runs on the host and writes directly.
+The host used to apply it by itself — from the launcher's EXIT trap
+locally, from `fetch_branch` on Fly and EC2 — because the capture was
+meant to warm the next run's image without a step the operator might
+forget. That made a run choose what the next run's image runs, with no
+one reading it in between: the capture is the next build's input. With the
+image split (§6 *The orchestrator's root is leerie's*) a build reaches
+only a confined root, and the checks above bound what a capture can say;
+the explicit apply keeps the operator the one who changes their own
+configuration. At the end of a run that recorded one, the launcher (and
+`fetch_branch`) names the run and the command. `leerie config
+--recapture` records into the run it recaptured, the same way.
 
-**Idempotency.** After the capture is recorded (or, on the host, written),
+**Idempotency.** After the capture is recorded,
 `capture_repo_deps` writes a lightweight `<run_dir>/dep_capture.done`
 sentinel and sets `dep_capture_done = True` in `state.json`. The run-start
 backstop skips any run whose sentinel is already present. When the union
 merge finds nothing new, `.leerie/config.toml` is not touched.
 
-**No auto-commit.** Capture writes `.leerie/config.toml` (and, if generated,
-`.leerie/Dockerfile`) as uncommitted files. Leerie logs one line: *"captured N
-package(s)/install command — run `git add .leerie/ && git commit` to bake
-into the next run's image."* The user controls when to commit — this
+**No auto-commit.** An applied capture leaves `.leerie/config.toml` (and, if
+generated, `.leerie/Dockerfile`) as uncommitted files, and the operator
+commits them when they choose. The user controls when to commit — this
 preserves the committed-Dockerfile authority rule: a hand-authored
 `.leerie/Dockerfile` is never surprised by an auto-commit.
 
@@ -9344,13 +9547,13 @@ image* above).
 `--runtime fly` the workflow splits across two directions:
 - **Machine → host (stream-back).** The run-state tar brings
   `captured-deps.json` home with the run directory, and `fetch-branch.sh`
-  applies it as the local launcher does. It then best-effort streams
-  `/work/.leerie/Dockerfile` from the Fly Machine back to `$USER_REPO/.leerie/`
-  (or `$LEERIE_STATE_HOST_DIR`), existence-guarded on the remote side and
-  never clobbering a host-edited file; failure is non-fatal and doesn't
-  affect `fetch_branch`'s return code. This fires only on a clean finish (same condition gate that
-  runs `fetch_branch` at all — rc `0|10|11|75`). Cancel/kill recovery uses the
-  host-side `--recapture` / next-run backstop instead.
+  names the run and `leerie config --apply-capture <run-id>`, as the local
+  launcher does. Nothing the machine wrote under `/work/.leerie/` comes
+  back: the machine's `Dockerfile` used to be streamed to the host's
+  `.leerie/` when none was there, which made a machine-written file the
+  next run's build input. This fires only on a clean finish (same condition
+  gate that runs `fetch_branch` at all — rc `0|10|11|75`). Cancel/kill
+  recovery uses the host-side `--recapture` / next-run backstop instead.
 - **Host → machine (seed-repo whitelist).** Pre-existing committed `.leerie/`
   files (including a previously streamed-back and committed `config.toml` or
   `Dockerfile`) are included in `seed-repo.sh`'s dirty-delta filter so they

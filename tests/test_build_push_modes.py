@@ -172,9 +172,11 @@ def test_remote_mode_cds_to_leerie_repo_before_invoking_flyctl(tmp_path: Path):
     Verifies the launcher source contains the cd-into-LEERIE_REPO step.
     """
     text = BUILD_PUSH.read_text()
-    # The (cd "$LEERIE_REPO" ; ...) subshell pattern must wrap the
-    # flyctl deploy invocation in the remote-mode function.
-    assert 'cd "$LEERIE_REPO"' in text, \
+    # The (cd ... ; ...) subshell pattern must wrap the flyctl deploy
+    # invocation in the remote-mode function: $LEERIE_REPO unless the
+    # launcher passed a context (`--context`, a repository image's committed
+    # tree).
+    assert 'cd "${CONTEXT_DIR:-$LEERIE_REPO}"' in text, \
         "remote-mode flyctl invocation must run from cwd=$LEERIE_REPO"
     # And the comment block explaining why must be present (a refactor
     # that drops the cd should NOT also drop the explanation).

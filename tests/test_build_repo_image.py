@@ -18,6 +18,8 @@ import hashlib
 import subprocess
 from pathlib import Path
 
+from tests.committed_tree import commit_tree
+from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
 from tests.repo_image_block_extract import extract_block as _extract_block
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -58,6 +60,7 @@ nerdctl() {{
   local cmd="${{1:-}}"; shift || true
   case "$cmd" in
     image)
+      _stub_image_inspect "$@" && return 0
       # Base-image presence probe. NERDCTL_BUILDKIT_INSPECT_RC (if set) governs
       # the buildkit-ns probe specifically; else NERDCTL_INSPECT_RC.
       if [ "$ns" = "buildkit" ] && [ -n "${{NERDCTL_BUILDKIT_INSPECT_RC:-}}" ]; then
@@ -103,7 +106,10 @@ def _run_harness(
     marker_end = "\n# --- translate --inspect-dir paths"
     block = _extract_block(launcher, marker_start, marker_end)
 
-    script = _harness_prefix(tmp_path) + block + "\n" + body
+    if env and env.get("USER_REPO"):
+        commit_tree(env["USER_REPO"])
+    script = (_harness_prefix(tmp_path) + NERDCTL_IMAGE_INSPECT_STUB + block
+              + "\n" + body)
 
     base_env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -163,16 +169,26 @@ def test_build_repo_image_argv_contains_required_flags(tmp_path):
     # BASE_IMAGE build-arg must use the base IMAGE_TAG.
     assert "--build-arg BASE_IMAGE=leerie:1.2.3" in build_args, build_args
 
-    # -f must point at the repo's .leerie/Dockerfile.
-    expected_df = str(user_repo / ".leerie" / "Dockerfile")
-    assert f"-f {expected_df}" in build_args, build_args
+    # -f is leerie's Dockerfile around the repository's, in a build
+    # directory of the launcher's own under the state root; the target is
+    # its final stage, named with a 16-hex nonce (DESIGN §6 *The
+    # orchestrator's root is leerie's; a repository's root is only a
+    # confined process's*).
+    import re
+    m = re.search(r"-f (\S+/\.image-build/b\.\w+)/Dockerfile", build_args)
+    assert m and m.group(1).startswith(str(state_dir)), build_args
+    assert re.search(r"--target leerie-final-[0-9a-f]{16} ", build_args)
 
     # Tag must be the per-repo leerie-repo/<id>:<version> form.
     assert "-t leerie-repo/" in build_args, build_args
     assert ":1.2.3" in build_args, build_args
 
-    # Build context must be the USER_REPO path (last positional arg).
-    assert str(user_repo) in build_args, build_args
+    # The build context is the committed tree exported there, never the
+    # checkout (last positional arg).
+    assert build_args.endswith(f"{m.group(1)}/context"), build_args
+    assert str(user_repo) not in build_args, build_args
+    # And the build directory is gone afterwards.
+    assert not list((state_dir / ".image-build").glob("b.*"))
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +305,8 @@ def test_hash_file_written_on_success(tmp_path):
 
     stored = hash_file.read_text().strip()
     expected_sha = hashlib.sha256(df.read_bytes()).hexdigest()
-    expected = f"1.2.3:{expected_sha}"
+    # <version>:<layout>:<base image id>:<sha256> (the stub's base id).
+    expected = f"1.2.3:worker-root-1:sha256:base-id:{expected_sha}"
     assert stored == expected, f"stored={stored!r}, expected={expected!r}"
 
 
@@ -368,7 +385,7 @@ def test_hash_file_absent_when_build_fails_from_scratch(tmp_path):
 def test_per_repo_build_error_sentinel_in_launcher():
     """The per-repo build error message literal must be present in the launcher."""
     launcher_text = _launcher_text()
-    assert 'remote_log "error: per-repo container image build failed"' in launcher_text, (
+    assert '_repo_build_fail "per-repo container image build failed"' in launcher_text, (
         "Per-repo build error sentinel changed in launcher — update this test to match."
     )
 
@@ -783,7 +800,7 @@ nerdctl() {
   if [ "${1:-}" = "--namespace" ]; then ns="${2:-}"; shift 2 || true; fi
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    image) [ "$ns" = "buildkit" ] && return 1; return "${NERDCTL_INSPECT_RC:-0}" ;;
+    image) [ "$ns" = "buildkit" ] && return 1; _stub_image_inspect "$@" && return 0; return "${NERDCTL_INSPECT_RC:-0}" ;;
     save) echo "nerdctl-save-failure: disk quota exceeded" >&2; return 1 ;;
     build) return "${NERDCTL_BUILD_RC:-0}" ;;
     *) return 0 ;;
@@ -818,21 +835,6 @@ ensure_base_in_buildkit_ns
 # must point at /opt/bundle only when the Dockerfile actually baked there,
 # else keep the pre-existing cache-mount fallback path.
 # ---------------------------------------------------------------------------
-
-def test_bundle_path_runtime_env_points_at_opt_when_baked():
-    """Coupling test: the CACHE_MOUNTS BUNDLE_PATH override must consult the
-    on-disk Dockerfile for the baked ENV line rather than hard-coding one
-    value, per the correctness risk found during implementation (a
-    hard-coded /opt/bundle would break `bundle install` for repos whose
-    image was NOT built with the Ruby bake — verified live: 'File system is
-    read-only' against a nonexistent, unmounted /opt/bundle)."""
-    launcher_text = _launcher_text()
-    assert "grep -q '^ENV BUNDLE_PATH=/opt/bundle'" in launcher_text, (
-        "BUNDLE_PATH runtime-env bake-detection changed — update this test"
-    )
-    assert 'CACHE_MOUNTS+=(-e "BUNDLE_PATH=/opt/bundle")' in launcher_text
-    assert 'CACHE_MOUNTS+=(-e "BUNDLE_PATH=/home/leerie/.cache/leerie/bundle")' in launcher_text
-
 
 # ---------------------------------------------------------------------------
 # Regression guard: the already-shipped consumer-half functions

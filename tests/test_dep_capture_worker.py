@@ -67,6 +67,17 @@ _EFFORTS: dict[str, str | None] = {"dep_capture": None}
 # Fake state compatible with claude_p's expectations
 # ---------------------------------------------------------------------------
 
+
+def _capture_then_apply(leerie, repo, st, **kw):
+    """`capture_repo_deps` records into the run's directory and only the
+    operator's `config --apply-capture` writes `.leerie/config.toml` (DESIGN
+    §6½ *The operator applies a capture*): the two, in order, for the
+    merge's behaviour."""
+    rec = Path(st.run_dir)
+    asyncio.run(leerie.capture_repo_deps(repo, st, record_in=rec, **kw))
+    if (rec / leerie.CAPTURED_DEPS_FILE).is_file():
+        leerie.apply_captured_deps(rec, repo)
+
 def _make_state(leerie, run_dir: Path) -> object:
     """Minimal State-alike that satisfies claude_p without network I/O.
 
@@ -164,9 +175,7 @@ class TestDepCaptureWorkerWritePath:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         cfg = repo / ".leerie" / "config.toml"
         assert cfg.exists(), "config.toml not written"
@@ -182,9 +191,7 @@ class TestDepCaptureWorkerWritePath:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         cfg = repo / ".leerie" / "config.toml"
         assert cfg.exists(), "config.toml not written"
@@ -204,9 +211,7 @@ class TestDepCaptureWorkerWritePath:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         content = (repo / ".leerie" / "config.toml").read_text()
         assert "setup_packages" in content
@@ -254,9 +259,7 @@ class TestDepCaptureNeverClobber:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch, envelope=warm_envelope)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         assert cfg.stat().st_mtime == mtime_before, (
             "config.toml was rewritten on a warm repo (never-clobber violated)")
@@ -281,9 +284,7 @@ class TestDepCaptureNeverClobber:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch, envelope=partial_envelope)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         content = cfg.read_text()
         assert "git" in content
@@ -317,9 +318,7 @@ class TestDepCaptureNeverClobber:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch, envelope=conflict_envelope)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         content = cfg.read_text()
         # Original pip command must still be there (not replaced).
@@ -358,10 +357,8 @@ class TestDepCaptureReplace:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch, envelope=env)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-            replace=True,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+            replace=True)
 
         content = cfg.read_text()
         assert "postgresql" in content
@@ -400,10 +397,8 @@ class TestDepCaptureReplace:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch, envelope=env)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-            replace=True,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+            replace=True)
 
         raw = leerie._read_toml_key(cfg, "language_installs")
         managers = {e["manager"] for e in json.loads(raw)}
@@ -434,10 +429,8 @@ class TestDepCaptureReplace:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch, envelope=env)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-            replace=True,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+            replace=True)
 
         assert cfg.stat().st_mtime == mtime_before, (
             "empty capture under replace=True must not rewrite config.toml")
@@ -474,10 +467,8 @@ class TestDepCaptureReplace:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch, envelope=env)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-            replace=True,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+            replace=True)
 
         assert cfg.stat().st_mtime == mtime_before, (
             "empty-item capture under replace=True must not rewrite config.toml")
@@ -508,9 +499,7 @@ class TestDepCaptureReplace:
         _patch_invoke(leerie, monkeypatch, envelope=env)
 
         # No replace= kwarg — must default to union.
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         content = cfg.read_text()
         assert "stale-pkg" in content, (
@@ -540,9 +529,7 @@ class TestDepCaptureOptOut:
 
         monkeypatch.setattr(leerie, "_invoke", spy_invoke)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         assert not invoke_called, "_invoke should not be called when opt-out is set"
         cfg = repo / ".leerie" / "config.toml"
@@ -568,9 +555,7 @@ class TestDepCaptureOptOut:
 
         monkeypatch.setattr(leerie, "_invoke", spy_invoke)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         assert not invoke_called, "_invoke called despite capture_deps=false"
         assert cfg.read_text() == content_before, (
@@ -612,9 +597,7 @@ class TestDepCaptureDockerfileGuard:
 
         monkeypatch.setattr(leerie, "_invoke", spy_invoke)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         assert invoke_called, (
             "_invoke SHOULD be called even when committed Dockerfile exists (feat-003)")
@@ -637,9 +620,7 @@ class TestDepCaptureDockerfileGuard:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch)
 
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         cfg = leerie_dir / "config.toml"
         assert cfg.exists(), (
@@ -669,9 +650,7 @@ def test_missing_logs_dir_is_silent_noop(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_invoke", spy_invoke)
 
     try:
-        asyncio.run(leerie.capture_repo_deps(
-            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        ))
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
     except Exception as exc:
         pytest.fail(f"capture_repo_deps raised on missing logs dir: {exc!r}")
 
@@ -696,9 +675,7 @@ def test_write_failure_is_catchable(leerie, tmp_path, monkeypatch):
     with patch.object(leerie, "_write_config_toml_keys",
                       side_effect=OSError("disk full")):
         try:
-            asyncio.run(leerie.capture_repo_deps(
-                repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-            ))
+            _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
         except Exception as exc:
             exc_caught = exc
 
@@ -760,9 +737,7 @@ def test_worker_budget_exhausted_skips_worker(leerie, tmp_path, monkeypatch):
 
     monkeypatch.setattr(leerie, "_invoke", spy_invoke)
 
-    asyncio.run(leerie.capture_repo_deps(
-        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-    ))
+    _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
     assert not invoked, "worker budget exhausted must skip the dep_capture worker"
     assert not (repo / ".leerie" / "config.toml").exists()
@@ -783,9 +758,7 @@ def test_malformed_existing_language_installs_json_treated_as_empty(
     monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
     _patch_invoke(leerie, monkeypatch)  # default envelope carries a pnpm entry
 
-    asyncio.run(leerie.capture_repo_deps(
-        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-    ))
+    _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
     content = cfg.read_text()
     assert "pnpm" in content
@@ -817,10 +790,8 @@ def test_replace_true_worker_invoked_with_empty_capture_logs_unchanged(
     monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
     _patch_invoke(leerie, monkeypatch, envelope=env)
 
-    asyncio.run(leerie.capture_repo_deps(
-        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-        replace=True,
-    ))
+    _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+        replace=True)
 
     assert cfg.read_text() == content_before
 
@@ -843,9 +814,7 @@ def test_sentinel_file_write_failure_is_swallowed(leerie, tmp_path, monkeypatch)
 
     monkeypatch.setattr(Path, "write_text", _raise_on_sentinel)
 
-    asyncio.run(leerie.capture_repo_deps(
-        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-    ))  # must not raise
+    _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)  # must not raise
 
     # The config write itself (a different Path) still succeeded.
     assert (repo / ".leerie" / "config.toml").exists()
@@ -869,8 +838,6 @@ def test_state_data_write_failure_is_swallowed(leerie, tmp_path, monkeypatch):
 
     st.data = _RaisingData(st.data)
 
-    asyncio.run(leerie.capture_repo_deps(
-        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-    ))  # must not raise
+    _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)  # must not raise
 
     assert (repo / ".leerie" / "config.toml").exists()

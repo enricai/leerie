@@ -1657,6 +1657,30 @@ PY
         unset _recapture_force _leerie_state_dir _recapture_rc
         exit 0
         ;;
+      --apply-capture)
+        # Apply the dependency captures one run recorded
+        # (<state>/runs/<run-id>/captured-deps.json) to .leerie/config.toml,
+        # logging the change as a diff. The only way a capture reaches the
+        # config (DESIGN §6½ *The operator applies a capture*). Host-only.
+        shift
+        _ac_run="${1:-}"
+        case "$_ac_run" in
+          ""|-*|.|..|*[!A-Za-z0-9._-]*)
+            echo "Usage: leerie config --apply-capture <run-id>" >&2
+            exit 1 ;;
+        esac
+        _leerie_state_dir="${LEERIE_STATE_HOST_DIR:-$HOME/.leerie/$(basename "$_user_repo")}"
+        if [ ! -f "$_leerie_state_dir/runs/$_ac_run/captured-deps.json" ]; then
+          echo "leerie config: run $_ac_run has no capture to apply ($_leerie_state_dir/runs/$_ac_run/captured-deps.json)" >&2
+          exit 1
+        fi
+        USER_REPO="$_user_repo"
+        # shellcheck source=scripts/host-finalize.sh
+        . "$LEERIE_REPO/scripts/host-finalize.sh" || exit 1
+        host_apply_captured_deps "$_leerie_state_dir/runs/$_ac_run" || exit 1
+        unset _ac_run _leerie_state_dir
+        exit 0
+        ;;
       "")
         echo "Effective leerie config for: $_user_repo"
         echo ""
@@ -1710,7 +1734,7 @@ PY
         ;;
       *)
         echo "leerie config: unknown sub-command '$1'" >&2
-        echo "Usage: leerie config [--init | --chat | --recapture [--force]]" >&2
+        echo "Usage: leerie config [--init | --chat | --recapture [--force] | --apply-capture <run-id>]" >&2
         exit 1
         ;;
     esac
@@ -6334,20 +6358,213 @@ ensure_base_in_buildkit_ns() {
   rm -f "$_save_load_tar" "$_save_load_err"
 }
 
-# Build the per-repo derived image. Caller has already verified the build
-# is needed (image absent, Dockerfile changed, or base version changed).
+# The repository image (DESIGN §6 *The orchestrator's root is leerie's; a
+# repository's root is only a confined process's*). The repository's
+# Dockerfile — committed, or generated from .leerie/config.toml below —
+# builds only the stages leerie copies to /opt/leerie-worker-root; the
+# image's own root is leerie's base, untouched, so the orchestrator, the
+# cgroup broker and container-entry.sh never run in a root the repository
+# shaped. Confined processes get the worker root as theirs
+# (scripts/landlock_exec.py --worker-root). Bumped when the layout changes,
+# so an image built in an older one is rebuilt.
+REPO_IMAGE_LAYOUT="worker-root-1"
+
+# _repo_build_prepare — a directory of the launcher's own for the builds
+# below (never /tmp, never inside the checkout): $_REPO_BUILD_DIR, holding
+# leerie's Dockerfile, and $_REPO_BUILD_CTX, the build context — the
+# committed tree at HEAD, exported by git (`git archive`), never the
+# checkout directory. An untracked file — `.env`,
+# `.claude/settings.local.json` — never reaches a build the repository's
+# Dockerfile drives, and a link the checkout holds is a link in the context,
+# which BuildKit does not follow out of it; BuildKit reads only what a COPY
+# names. Empty for a repository with no commit. Once per launch;
+# _repo_build_done removes it, and _repo_build_fail on the way out.
+_REPO_BUILD_DIR=""
+_REPO_BUILD_CTX=""
+_repo_build_prepare() {
+  [ -n "$_REPO_BUILD_DIR" ] && return 0
+  mkdir -p "$LEERIE_STATE_HOST_DIR/.image-build" \
+    && _REPO_BUILD_DIR="$(mktemp -d "$LEERIE_STATE_HOST_DIR/.image-build/b.XXXXXX")" \
+    || { remote_log "error: could not make a build directory under $LEERIE_STATE_HOST_DIR"; exit 1; }
+  _REPO_BUILD_CTX="$_REPO_BUILD_DIR/context"
+  mkdir -p "$_REPO_BUILD_CTX" || _repo_build_fail "could not make the build context"
+  if git -C "$USER_REPO" rev-parse -q --verify 'HEAD^{commit}' >/dev/null 2>&1; then
+    git -C "$USER_REPO" archive --format=tar HEAD | tar -x -C "$_REPO_BUILD_CTX" -f - \
+      || _repo_build_fail "could not export the committed tree as the image build context"
+  fi
+}
+_repo_build_done() {
+  if [ -n "$_REPO_BUILD_DIR" ]; then
+    rm -rf "$_REPO_BUILD_DIR"
+  fi
+  _REPO_BUILD_DIR=""
+  _REPO_BUILD_CTX=""
+}
+_repo_build_fail() {
+  remote_log "error: $1"
+  _repo_build_done
+  exit 1
+}
+
+# _repo_image_dockerfile <out> <nonce> <base> — leerie's Dockerfile for the
+# repository image: a comment first (so no parser directive of the
+# repository's — `# syntax=` would choose the frontend that builds the whole
+# file — applies), the repository's .leerie/Dockerfile with its last stage
+# named, then leerie's stages: the base image's environment and the worker
+# stage's (`env -0`, for scripts/landlock_exec.py's worker_env_changes), and
+# the final stage, `FROM <base>` and one COPY of the worker stage to
+# /opt/leerie-worker-root. The final stage's name carries a nonce drawn for
+# this build and is built with --target, so a repository file that swallows
+# leerie's lines (an unterminated heredoc, a trailing continuation) builds
+# nothing rather than a final stage of its own. The repository's file is
+# read beneath the checkout without following a link, and bounded.
+_repo_image_dockerfile() {
+  python3 -I - "$USER_REPO" "$@" <<'PY'
+import os, re, stat, sys
+
+repo, out, nonce, base = sys.argv[1:5]
+LIMIT = 1 << 20
+
+
+def read_beneath(root, rel):
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in rel.split("/")[:-1]:
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        f = os.open(rel.split("/")[-1], os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=fd)
+    finally:
+        os.close(fd)
+    try:
+        if not stat.S_ISREG(os.fstat(f).st_mode):
+            raise OSError("not a regular file")
+        data = os.read(f, LIMIT + 1)
+    finally:
+        os.close(f)
+    if len(data) > LIMIT:
+        raise OSError(f"larger than {LIMIT} bytes")
+    return data.decode("utf-8", "surrogateescape")
+
+
+try:
+    text = read_beneath(repo, ".leerie/Dockerfile")
+except OSError as e:
+    sys.exit(f"leerie: .leerie/Dockerfile cannot be read as a regular file "
+             f"beneath the checkout ({e})")
+lines = text.split("\n")
+heredoc = re.compile(r"<<(-?)([\"']?)([A-Za-z_][A-Za-z0-9_]*)\2")
+last_from = None
+i = 0
+while i < len(lines):
+    if not lines[i].strip() or lines[i].lstrip().startswith("#"):
+        i += 1
+        continue
+    parts, j = [lines[i]], i
+    while parts[-1].rstrip().endswith("\\") and j + 1 < len(lines):
+        j += 1
+        if lines[j].lstrip().startswith("#"):
+            continue
+        parts.append(lines[j])
+    joined = " ".join(p.rstrip().rstrip("\\") for p in parts)
+    word = joined.split(None, 1)[0].upper()
+    if word == "FROM":
+        last_from = (j, joined.split())
+    if word in ("RUN", "COPY", "ADD"):
+        for m in heredoc.finditer(joined):
+            j += 1
+            while j < len(lines) and (
+                    lines[j].lstrip("\t") if m.group(1) else lines[j]
+            ) != m.group(3):
+                j += 1
+    i = j + 1
+if last_from is None:
+    sys.exit("leerie: .leerie/Dockerfile has no FROM")
+at, words = last_from
+if len(words) >= 4 and words[-2].upper() == "AS":
+    stage = words[-1]
+else:
+    stage = f"leerie-worker-{nonce}"
+    lines[at] = lines[at].rstrip() + f" AS {stage}"
+if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", stage):
+    sys.exit(f"leerie: .leerie/Dockerfile's last stage name {stage!r} is "
+             "not a plain name")
+with open(out, "w") as f:
+    f.write("# leerie: the repository image (DESIGN §6 *The orchestrator's "
+            "root is leerie's;\n# a repository's root is only a confined "
+            "process's*). The repository's stages\n# follow; leerie's are "
+            "last.\n")
+    f.write("\n".join(lines).rstrip("\n") + "\n\n")
+    f.write(f"FROM {base} AS leerie-baseenv-{nonce}\n"
+            'RUN ["/bin/sh", "-c", "env -0 > /.leerie-base-env"]\n'
+            f"FROM {stage} AS leerie-stage-{nonce}\n"
+            "USER root\n"
+            f"COPY --from=leerie-baseenv-{nonce} /.leerie-base-env "
+            "/.leerie-base-env\n"
+            'RUN ["/bin/sh", "-c", "env -0 > /.leerie-worker-env"]\n'
+            f"FROM {base} AS leerie-final-{nonce}\n"
+            f"COPY --from=leerie-stage-{nonce} / /opt/leerie-worker-root/\n")
+PY
+}
+
+# _repo_image_nonce — 16 hex characters from the kernel's random source.
+_repo_image_nonce() {
+  od -An -N8 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# _check_repo_image <tag> — the built image is leerie's base plus exactly one
+# layer (the worker root's COPY), with the base's own configuration
+# (entrypoint, user, environment...). Anything else is not leerie's layout:
+# the image is removed and the launch stops.
+_check_repo_image() {
+  local _tag="$1" _bl _fl _bc _fc
+  _bl="$(nerdctl image inspect -f '{{json .RootFS.Layers}}' "$IMAGE_TAG" 2>/dev/null)" || _bl=""
+  _fl="$(nerdctl image inspect -f '{{json .RootFS.Layers}}' "$_tag" 2>/dev/null)" || _fl=""
+  _bc="$(nerdctl image inspect -f '{{json .Config}}' "$IMAGE_TAG" 2>/dev/null)" || _bc=""
+  _fc="$(nerdctl image inspect -f '{{json .Config}}' "$_tag" 2>/dev/null)" || _fc=""
+  # `.Config.Image` names the image inspected, so it is the one key left out.
+  if python3 -I -c '
+import json, sys
+try:
+    bl, fl, bc, fc = (json.loads(a) for a in sys.argv[1:5])
+except ValueError:
+    sys.exit(1)
+ok = (isinstance(bl, list) and isinstance(fl, list) and bl
+      and len(fl) == len(bl) + 1 and fl[:len(bl)] == bl
+      and isinstance(bc, dict) and isinstance(fc, dict)
+      and {k: v for k, v in bc.items() if k != "Image"}
+      == {k: v for k, v in fc.items() if k != "Image"})
+sys.exit(0 if ok else 1)
+' "$_bl" "$_fl" "$_bc" "$_fc"; then
+    return 0
+  fi
+  nerdctl image rm "$_tag" >/dev/null 2>&1 || true
+  remote_log "error: the repository image $_tag is not leerie's base plus its worker root (DESIGN §6 *The orchestrator's root is leerie's; a repository's root is only a confined process's*); it was removed"
+  return 1
+}
+
+# Build the repository image. Caller has already verified the build is
+# needed (image absent, Dockerfile changed, or base changed).
 build_repo_image() {
-  local repo_image_tag="$1"
-  local dockerfile="$USER_REPO/.leerie/Dockerfile"
+  local repo_image_tag="$1" _nonce
+  _repo_build_prepare
+  _nonce="$(_repo_image_nonce)"
+  [ -n "$_nonce" ] || _repo_build_fail "could not draw a build nonce"
+  _repo_image_dockerfile "$_REPO_BUILD_DIR/Dockerfile" "$_nonce" "$IMAGE_TAG" \
+    || _repo_build_fail "could not prepare the repository image's Dockerfile"
   remote_log "building per-repo container image ($repo_image_tag)..."
   nerdctl build \
     --build-arg BASE_IMAGE="$IMAGE_TAG" \
     --build-arg HOST_UID="$(id -u)" \
     --build-arg HOST_GID="$(id -g)" \
+    --target "leerie-final-$_nonce" \
     -t "$repo_image_tag" \
-    -f "$dockerfile" \
-    "$USER_REPO" \
-    || { remote_log "error: per-repo container image build failed"; exit 1; }
+    -f "$_REPO_BUILD_DIR/Dockerfile" \
+    "$_REPO_BUILD_CTX" \
+    || _repo_build_fail "per-repo container image build failed"
+  _check_repo_image "$repo_image_tag" || _repo_build_fail "the repository image is not leerie's layout"
 }
 
 # Determine whether a per-repo image build is needed and run it.
@@ -6547,9 +6764,25 @@ if [ "$_leerie_do_gen" = "true" ]; then
     if [ -n "$_sp" ]; then
       # Convert comma-separated list to space-separated package names.
       _sp_packages="$(printf '%s' "$_sp" | tr ',' ' ' | tr -s ' ')"
+      # Split without pathname expansion: a word is never a glob.
+      read -r -a _sp_list <<< "$_sp_packages"
+      # Each word goes into an apt RUN line, so each must be a Debian
+      # package name and nothing else — `&&` would be shell (DESIGN §6½ *A
+      # capture names packages and managers, never commands*; the same
+      # pattern as the orchestrator's DEBIAN_PACKAGE_PATTERN). Refused, not
+      # dropped: the operator fixes .leerie/config.toml.
+      _deb_re='^[a-z0-9][a-z0-9+.-]+$'
+      for _pkg in ${_sp_list[@]+"${_sp_list[@]}"}; do
+        if ! [[ "$_pkg" =~ $_deb_re ]]; then
+          rm -f "$_gen_df_tmp"
+          remote_log "error: .leerie/config.toml's setup_packages holds '$_pkg', which is not a Debian package name; fix or remove it"
+          exit 1
+        fi
+      done
+      unset _deb_re
       printf 'RUN apt-get update && apt-get install -y --no-install-recommends \\\n' \
         >> "$_gen_df_tmp"
-      for _pkg in $_sp_packages; do
+      for _pkg in ${_sp_list[@]+"${_sp_list[@]}"}; do
         printf '    %s \\\n' "$_pkg" >> "$_gen_df_tmp"
       done
       # End the apt layer with the image still at USER root. Do NOT append a
@@ -6576,34 +6809,111 @@ if [ "$_leerie_do_gen" = "true" ]; then
       # the heredoc from the command substitution sidesteps that parser bug.
       _dep_pyf="$(mktemp)"
       cat >"$_dep_pyf" <<'PY'
-import glob as _glob
-import hashlib
+import fnmatch
 import json as _json
 import os
 import re
+import stat
+import subprocess
 import sys
-from pathlib import Path
 
-repo = Path(sys.argv[1])
-config_toml = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+repo = sys.argv[1]
+config_toml = sys.argv[2] if len(sys.argv) > 2 else None
+# The inputs come from the committed tree at HEAD, the image's build context
+# (`_repo_build_prepare`): git's own listing and blobs, never a path in the
+# checkout, so a link the repository holds is read as what it is — a link,
+# which is no input — and every read is bounded (DESIGN §6 *Leerie never
+# reads through a link a repository holds*). A file's hash is its blob id.
+READ_LIMIT = 1 << 20
+_FILE_MODES = ("100644", "100755")
 
 
-def sha256(p):
-    h = hashlib.sha256()
-    h.update(p.read_bytes())
-    return h.hexdigest()
+def _git(*args):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                          check=False)
+
+
+_TREE = {}
+_r = _git("ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD")
+if _r.returncode == 0:
+    for _item in _r.stdout.split(b"\0"):
+        _meta, _tab, _path = _item.partition(b"\t")
+        _f = _meta.split()
+        if _tab and len(_f) == 4:
+            _TREE[os.fsdecode(_path)] = (_f[0].decode(), _f[2].decode(),
+                                         _f[3].decode())
+
+
+def is_file(rel):
+    e = _TREE.get(rel)
+    return e is not None and e[0] in _FILE_MODES
+
+
+def is_dir(rel):
+    pre = rel.rstrip("/") + "/"
+    return any(p.startswith(pre) for p in _TREE)
+
+
+def exists(rel):
+    return is_file(rel) or is_dir(rel)
+
+
+def read_text(rel):
+    """The committed file's text, or None (absent, a link, too large)."""
+    e = _TREE.get(rel)
+    if e is None or e[0] not in _FILE_MODES or not e[2].isdigit() \
+            or int(e[2]) > READ_LIMIT:
+        return None
+    r = _git("cat-file", "blob", e[1])
+    return (r.stdout[:READ_LIMIT].decode("utf-8", "replace")
+            if r.returncode == 0 else None)
+
+
+def glob(pattern):
+    """The committed regular files matching `pattern`, one component per
+    `/` as `glob.glob` matches."""
+    want = pattern.strip("/").split("/")
+    return sorted(p for p in _TREE if is_file(p)
+                  and len(p.split("/")) == len(want)
+                  and all(fnmatch.fnmatchcase(a, b)
+                          for a, b in zip(p.split("/"), want)))
+
+
+def read_config(path):
+    """The operator's `.leerie/config.toml`, read beneath the checkout
+    without following a link, bounded; "" when it cannot be."""
+    try:
+        fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            d = os.open(".leerie", os.O_RDONLY | os.O_DIRECTORY
+                        | os.O_NOFOLLOW, dir_fd=fd)
+        finally:
+            os.close(fd)
+        try:
+            f = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW,
+                        dir_fd=d)
+        finally:
+            os.close(d)
+        try:
+            if not stat.S_ISREG(os.fstat(f).st_mode):
+                return ""
+            return os.read(f, READ_LIMIT).decode("utf-8", "replace")
+        finally:
+            os.close(f)
+    except OSError:
+        return ""
 
 
 def _hash_copy_files(repo, copy_files):
     copy_shas = {}
     for rel in copy_files:
-        p = repo / rel.rstrip("/")
-        if p.is_file():
-            copy_shas[rel] = sha256(p)
-        elif p.is_dir():
-            for f in sorted(p.rglob("*")):
-                if f.is_file():
-                    copy_shas[os.path.relpath(f, str(repo))] = sha256(f)
+        if is_file(rel):
+            copy_shas[rel] = _TREE[rel][1]
+        elif is_dir(rel):
+            pre = rel.rstrip("/") + "/"
+            for p in sorted(_TREE):
+                if p.startswith(pre) and is_file(p):
+                    copy_shas[p] = _TREE[p][1]
     return copy_shas
 
 
@@ -6673,32 +6983,28 @@ def _node_ancillary(repo, copy_files):
     workspace manifest). Workspace globs come from pnpm-workspace.yaml
     (pnpm) or package.json's "workspaces" field (yarn/npm)."""
     for f in ("pnpm-workspace.yaml", ".npmrc"):
-        if (repo / f).is_file() and f not in copy_files:
+        if is_file(f) and f not in copy_files:
             copy_files.append(f)
     globs = []
-    ws = repo / "pnpm-workspace.yaml"
-    if ws.is_file():
+    ws = read_text("pnpm-workspace.yaml")
+    if ws is not None:
+        globs += re.findall(r"[-]\s+['\"]?([^'\"#\n]+)['\"]?", ws)
+    pj = read_text("package.json")
+    if pj is not None:
         try:
-            globs += re.findall(r"[-]\s+['\"]?([^'\"#\n]+)['\"]?", ws.read_text())
-        except OSError:
-            pass
-    pj = repo / "package.json"
-    if pj.is_file():
-        try:
-            wsf = _json.loads(pj.read_text()).get("workspaces", [])
+            wsf = _json.loads(pj).get("workspaces", [])
             # yarn classic/npm: a list; yarn "nohoist" form: {"packages": [...]}.
             globs += wsf if isinstance(wsf, list) else wsf.get("packages", [])
-        except (OSError, ValueError, AttributeError):
+        except (ValueError, AttributeError):
             pass
     for g in globs:
-        g = (g or "").strip()
+        g = (g if isinstance(g, str) else "").strip()
         if not g:
             continue
-        for match in _glob.glob(os.path.join(str(repo), g, "package.json")):
-            rel = os.path.relpath(match, str(repo))
+        for rel in glob(os.path.join(g, "package.json")):
             if rel not in copy_files:
                 copy_files.append(rel)
-    if (repo / "patches").is_dir() and "patches/" not in copy_files:
+    if is_dir("patches") and "patches/" not in copy_files:
         copy_files.append("patches/")
 
 
@@ -6811,17 +7117,42 @@ def _is_node_context(repo, manager):
     if (manager or "").lower() in _NODE_MANAGERS:
         return True
     return any(
-        (repo / lf).is_file()
+        is_file(lf)
         for lf in ("pnpm-lock.yaml", "yarn.lock", "package-lock.json")
     )
 
 
+# The one install command each manager's bake runs (DESIGN §6½ *A capture
+# names managers, never commands*): a persisted `language_installs` entry
+# chooses the manager and its inputs, never the command — its `command`
+# field is not read. Equal to the orchestrator's `BAKE_INSTALL_COMMANDS`
+# (tests/test_capture_validation.py).
+_INSTALL_COMMANDS = {
+    "pnpm": "pnpm install --frozen-lockfile",
+    "yarn": "yarn install --frozen-lockfile",
+    "npm": "npm ci",
+    "uv": "uv sync",
+    "poetry": "poetry install",
+    "pipenv": "pipenv install",
+    "pip": "pip install -r requirements.txt",
+    "pip3": "pip install -r requirements.txt",
+    "go": "go mod download",
+    "cargo": "cargo fetch",
+    "bundle": "bundle install",
+    "composer": "composer install --no-interaction",
+    "dotnet": "dotnet restore",
+}
+_SAFE_REL = re.compile(r"[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*/?")
+
+
+def _safe_rel(p):
+    return (isinstance(p, str) and _SAFE_REL.fullmatch(p) is not None
+            and ".." not in p.split("/"))
+
+
 persisted_installs = []
-if config_toml and config_toml.is_file():
-    try:
-        raw = config_toml.read_text()
-    except OSError:
-        raw = ""
+if config_toml:
+    raw = read_config(config_toml)
     # Extract the language_installs value from a flat TOML file.
     # The value is a JSON string (possibly quoted with " or ').
     for line in raw.splitlines():
@@ -6846,12 +7177,22 @@ if persisted_installs:
     for entry in persisted_installs:
         if not isinstance(entry, dict):
             continue
-        run_cmd = (entry.get("command") or "").strip()
+        manager = entry.get("manager")
+        known = isinstance(manager, str) and manager in _INSTALL_COMMANDS
         copy_inputs = entry.get("copy_inputs") or []
-        if not run_cmd:
-            continue
+        bad = [ci for ci in copy_inputs if not _safe_rel(ci)] \
+            if isinstance(copy_inputs, list) else [copy_inputs]
+        if not known or bad:
+            sys.exit(f"leerie: .leerie/config.toml's language_installs names "
+                     f"{'inputs ' + repr(bad) if known else 'manager ' + repr(manager)}"
+                     f", which leerie does not bake: the managers it bakes "
+                     f"are {', '.join(sorted(_INSTALL_COMMANDS))}, each with "
+                     f"its own command, and an input is a plain path in the "
+                     f"repository (DESIGN §6½ *A capture names managers, "
+                     f"never commands*). Fix or remove the entry.")
+        run_cmd = _INSTALL_COMMANDS[manager]
         # Validate each copy_input; skip hallucinated paths but always emit RUN.
-        copy_files = [ci for ci in copy_inputs if ci and (repo / ci).exists()]
+        copy_files = [ci for ci in copy_inputs if exists(ci)]
         # A persisted copy_inputs list often names only the lockfile+manifest.
         # For node managers, augment with the ancillary inputs a frozen install
         # requires (patches/, workspace children, .npmrc) — else the bake fails
@@ -6887,17 +7228,17 @@ if persisted_installs:
     sys.exit(0 if emitted else 0)
 
 # Detect lockfile manager (mirrors _lockfile_table_entries precedence).
-has_pnpm  = (repo / "pnpm-lock.yaml").is_file()
-has_yarn  = (repo / "yarn.lock").is_file()
-has_npm   = (repo / "package-lock.json").is_file()
-has_uv    = (repo / "uv.lock").is_file()
-has_poetry = (repo / "poetry.lock").is_file()
-has_pipenv = (repo / "Pipfile.lock").is_file()
-has_go    = (repo / "go.mod").is_file() and (repo / "go.sum").is_file()
-has_cargo = (repo / "Cargo.lock").is_file()
-has_bundle = (repo / "Gemfile.lock").is_file()
-has_composer = (repo / "composer.lock").is_file()
-has_dotnet = (repo / "packages.lock.json").is_file()
+has_pnpm  = is_file("pnpm-lock.yaml")
+has_yarn  = is_file("yarn.lock")
+has_npm   = is_file("package-lock.json")
+has_uv    = is_file("uv.lock")
+has_poetry = is_file("poetry.lock")
+has_pipenv = is_file("Pipfile.lock")
+has_go    = is_file("go.mod") and is_file("go.sum")
+has_cargo = is_file("Cargo.lock")
+has_bundle = is_file("Gemfile.lock")
+has_composer = is_file("composer.lock")
+has_dotnet = is_file("packages.lock.json")
 
 copy_files = []
 run_cmd = ""
@@ -6905,40 +7246,40 @@ manager = None
 
 if has_pnpm:
     copy_files.append("pnpm-lock.yaml")
-    if (repo / "package.json").is_file():
+    if is_file("package.json"):
         copy_files.append("package.json")
     _node_ancillary(repo, copy_files)
     run_cmd = "pnpm install --frozen-lockfile"
     manager = "pnpm"
 elif has_yarn:
     copy_files.append("yarn.lock")
-    if (repo / "package.json").is_file():
+    if is_file("package.json"):
         copy_files.append("package.json")
     _node_ancillary(repo, copy_files)
     run_cmd = "yarn install --frozen-lockfile"
     manager = "yarn"
 elif has_npm:
     copy_files.append("package-lock.json")
-    if (repo / "package.json").is_file():
+    if is_file("package.json"):
         copy_files.append("package.json")
     _node_ancillary(repo, copy_files)
     run_cmd = "npm ci"
     manager = "npm"
 elif has_uv:
     copy_files.append("uv.lock")
-    if (repo / "pyproject.toml").is_file():
+    if is_file("pyproject.toml"):
         copy_files.append("pyproject.toml")
     run_cmd = "uv sync"
     manager = "uv"
 elif has_poetry:
     copy_files.append("poetry.lock")
-    if (repo / "pyproject.toml").is_file():
+    if is_file("pyproject.toml"):
         copy_files.append("pyproject.toml")
     run_cmd = "poetry install"
     manager = "poetry"
 elif has_pipenv:
     copy_files.append("Pipfile.lock")
-    if (repo / "Pipfile").is_file():
+    if is_file("Pipfile"):
         copy_files.append("Pipfile")
     run_cmd = "pipenv install"
     manager = "pipenv"
@@ -6948,19 +7289,19 @@ elif has_go:
     manager = "go"
 elif has_cargo:
     copy_files.append("Cargo.lock")
-    if (repo / "Cargo.toml").is_file():
+    if is_file("Cargo.toml"):
         copy_files.append("Cargo.toml")
     run_cmd = "cargo fetch"
     manager = "cargo"
 elif has_bundle:
     copy_files.append("Gemfile.lock")
-    if (repo / "Gemfile").is_file():
+    if is_file("Gemfile"):
         copy_files.append("Gemfile")
     run_cmd = "bundle install"
     manager = "bundle"
 elif has_composer:
     copy_files.append("composer.lock")
-    if (repo / "composer.json").is_file():
+    if is_file("composer.json"):
         copy_files.append("composer.json")
     run_cmd = "composer install --no-interaction"
     manager = "composer"
@@ -7025,13 +7366,14 @@ PY
       # buildkit namespace too, else it always fails and silently degrades to
       # apt-only (defeating the language-dep bake). See ensure_base_in_buildkit_ns.
       ensure_base_in_buildkit_ns
+      _repo_build_prepare
       if ! nerdctl build \
            --build-arg BASE_IMAGE="$IMAGE_TAG" \
            --build-arg HOST_UID="$(id -u)" \
            --build-arg HOST_GID="$(id -g)" \
            -t "leerie-lang-probe:$$" \
            -f "$_leerie_dockerfile" \
-           "$USER_REPO" \
+           "$_REPO_BUILD_CTX" \
            >/dev/null 2>&1; then
         remote_log "warning: language-dep Dockerfile build failed; falling back to apt-only bake (bake_language_deps=false for this run)"
         # Regenerate without the language-dep layer. Bug fix: this used to
@@ -7044,7 +7386,7 @@ PY
         if [ -n "$_sp" ]; then
           printf 'RUN apt-get update && apt-get install -y --no-install-recommends \\\n' \
             >> "$_gen_df_tmp2"
-          for _pkg2 in $_sp_packages; do
+          for _pkg2 in ${_sp_list[@]+"${_sp_list[@]}"}; do
             printf '    %s \\\n' "$_pkg2" >> "$_gen_df_tmp2"
           done
           # End at USER root — no trailing `USER leerie` (see the primary
@@ -7058,7 +7400,7 @@ PY
       fi
     fi
   fi
-  unset _sp _sp_packages
+  unset _sp _sp_packages _sp_list
 fi
 unset _leerie_config_toml _leerie_do_gen LEERIE_GENERATED_SENTINEL _BAKE_LANGUAGE_DEPS
 
@@ -7070,7 +7412,10 @@ if [ -f "$_leerie_dockerfile" ]; then
     # the base version or Dockerfile content change triggers a rebuild.
     _hash_file="$LEERIE_STATE_HOST_DIR/.dockerfile-hash"
     _cur_df_sha="$(_leerie_sha256 "$_leerie_dockerfile")"
-    _cur_hash="${LEERIE_VERSION}:${_cur_df_sha}"
+    # The base image's id too: the repository image is built on exactly it
+    # (_check_repo_image), so a rebuilt base rebuilds it.
+    _base_id="$(nerdctl image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)"
+    _cur_hash="${LEERIE_VERSION}:${REPO_IMAGE_LAYOUT}:${_base_id}:${_cur_df_sha}"
     _stored_hash=""
     [ -f "$_hash_file" ] && _stored_hash="$(cat "$_hash_file" 2>/dev/null || true)"
 
@@ -7091,9 +7436,10 @@ if [ -f "$_leerie_dockerfile" ]; then
     else
       remote_log "per-repo image up-to-date ($REPO_IMAGE_TAG); skipping build"
     fi
-    unset _hash_file _cur_df_sha _cur_hash _stored_hash _need_build
+    unset _hash_file _cur_df_sha _cur_hash _stored_hash _need_build _base_id
   fi
 fi
+_repo_build_done
 unset _leerie_dockerfile
 
 # --- translate --inspect-dir paths into bind-mounts ---------------------
@@ -8127,24 +8473,15 @@ CACHE_MOUNTS=(
   -v "$HOME/.cache/leerie/bundle:/home/leerie/.cache/leerie/bundle"
   -e "BUNDLE_CACHE_ALL=1"
 )
-# BUNDLE_PATH: when the per-repo image actually baked gems to /opt/bundle
-# (DESIGN §6½), this `-e` must point there too — a later `-e` wins over an
-# earlier Dockerfile `ENV`, so leaving this at the cache-mount path would
-# silently shadow the bake and send `bundle exec` back to a stale/empty
-# cache dir instead of the baked gems. But /opt/bundle only exists in
-# images that were actually built with the Ruby bake (bake_language_deps
-# disabled, or a build that fell back to apt-only, produces no /opt/bundle
-# at all — pointing BUNDLE_PATH there unconditionally would break `bundle
-# install` for those repos: verified live, "File system is read-only" /
-# ENOENT against a nonexistent, unmounted /opt/bundle). Detect the bake by
-# checking the on-disk Dockerfile (real or auto-generated, already
-# resolved by this point) for the baked ENV line, rather than assuming.
-if [ -f "$USER_REPO/.leerie/Dockerfile" ] && \
-   grep -q '^ENV BUNDLE_PATH=/opt/bundle' "$USER_REPO/.leerie/Dockerfile" 2>/dev/null; then
-  CACHE_MOUNTS+=(-e "BUNDLE_PATH=/opt/bundle")
-else
-  CACHE_MOUNTS+=(-e "BUNDLE_PATH=/home/leerie/.cache/leerie/bundle")
-fi
+# BUNDLE_PATH: the cache mount above. A repository image whose worker stage
+# baked gems to /opt/bundle sets BUNDLE_PATH there in that stage's
+# environment, which the shim lays over a confined command's — a value
+# beneath /opt/ wins over this one (scripts/landlock_exec.py
+# apply_worker_env; DESIGN §6 *The orchestrator's root is leerie's; a
+# repository's root is only a confined process's*). The orchestrator's own
+# environment is the base image's: it never takes a value the repository
+# chose.
+CACHE_MOUNTS+=(-e "BUNDLE_PATH=/home/leerie/.cache/leerie/bundle")
 # MISE_DATA_DIR / MISE_SYSTEM_DATA_DIR are baked into the image as ENV
 # (Dockerfile) so the resolver and mount target are stable across
 # launcher invocations. Not user-tunable here.
@@ -8266,17 +8603,34 @@ except Exception:
       mkdir -p "$cache_dir"
       printf '%s\n' "$base_tag" >> "$cache_file"
     fi
-    # Now build and push the per-repo derived image.
+    # Now build and push the repository image: leerie's two-stage
+    # Dockerfile around the repository's (_repo_image_dockerfile), from the
+    # committed tree (_repo_build_prepare), its final stage leerie's base
+    # (DESIGN §6 *The orchestrator's root is leerie's; a repository's root
+    # is only a confined process's*).
+    local _nonce
+    _repo_build_prepare
+    _nonce="$(_repo_image_nonce)"
+    if [ -z "$_nonce" ] || ! _repo_image_dockerfile \
+         "$_REPO_BUILD_DIR/Dockerfile" "$_nonce" "$base_tag"; then
+      _repo_build_done
+      remote_log "error: could not prepare the repository image's Dockerfile"
+      return 1
+    fi
     local per_repo_args=("${build_args[@]}"
-      --dockerfile "$_FLY_PER_REPO_DOCKERFILE"
+      --dockerfile "$_REPO_BUILD_DIR/Dockerfile"
+      --context "$_REPO_BUILD_CTX"
+      --target "leerie-final-$_nonce"
       --build-arg "BASE_IMAGE=$base_tag"
       --tag "$tag"
     )
     remote_log "remote: ensuring per-repo image $tag is published (cache miss)"
     if ! "$build_push" "${per_repo_args[@]}"; then
+      _repo_build_done
       remote_log "error: build-push.sh failed for per-repo image; remote run cannot proceed"
       return 1
     fi
+    _repo_build_done
     mkdir -p "$cache_dir"
     printf '%s\n' "$tag" >> "$cache_file"
     return 0
@@ -9422,17 +9776,16 @@ else
     host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
   }
 
-  # _apply_ran_run_captures — write the dependency captures that run
-  # recorded into your `.leerie/config.toml` (DESIGN §6½ *The host applies a
-  # capture*); the container cannot, since it mounts your checkout
-  # read-only. From the EXIT trap, whatever the exit. Never fails the exit.
-  _apply_ran_run_captures() {
+  # _note_ran_run_captures — name the dependency captures that run recorded
+  # and the command that applies them. Nothing applies a capture but that
+  # command: a run never chooses what the next run's image runs (DESIGN §6½
+  # *The operator applies a capture*). From the EXIT trap, whatever the
+  # exit. Never fails the exit.
+  _note_ran_run_captures() {
     _read_ran_run_id
     [ -n "$_ran_run_id" ] || return 0
     [ -f "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id/captured-deps.json" ] || return 0
-    # shellcheck source=scripts/host-finalize.sh
-    . "$LEERIE_REPO/scripts/host-finalize.sh" || return 0
-    host_apply_captured_deps "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
+    echo "[leerie] capture: run $_ran_run_id recorded dependencies for .leerie/config.toml; review and apply them with: leerie config --apply-capture $_ran_run_id" >&2
   }
 
   # Fix D (DESIGN §6 *container boundary's hidden precondition*): kill the
@@ -9571,7 +9924,7 @@ else
       _kill_container_from_cidfile || true
     fi
   }
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _apply_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _note_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
   trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 130' INT
   trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 143' TERM
 

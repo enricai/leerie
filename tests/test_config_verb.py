@@ -52,6 +52,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.committed_tree import commit_tree
 from tests.config_arm_extract import extract_config_arm as _extract_config_arm
 
 # Directory of the running interpreter — put on PATH for the end-to-end
@@ -1287,6 +1288,7 @@ def _run_lang_layer(
     else:
         config_toml_arg = str(repo / ".leerie" / "config.toml")  # non-existent
 
+    commit_tree(repo)
     script = _extract_lang_layer_script()
     script_file = tmp_path / "lang_layer.py"
     script_file.write_text(script)

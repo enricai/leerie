@@ -19,7 +19,9 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from tests.committed_tree import commit_tree
 from tests.dockerfile_autogen_extract import extract_autogen_block as _extract_autogen_block
+from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -40,7 +42,7 @@ remote_log() { echo "[leerie] $*" >&2; }
 nerdctl() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    image)  return "${NERDCTL_INSPECT_RC:-0}" ;;
+    image)  _stub_image_inspect "$@" && return 0; return "${NERDCTL_INSPECT_RC:-0}" ;;
     build)  return "${NERDCTL_BUILD_RC:-0}" ;;
     run)    echo "nerdctl-run: image=${REPO_IMAGE_TAG:-$IMAGE_TAG}"; return 0 ;;
     *)      return 0 ;;
@@ -65,7 +67,10 @@ LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-/tmp/leerie-state-test}"
 def _run_harness(body: str, env: dict | None = None) -> subprocess.CompletedProcess:
     launcher = _launcher_text()
     block = _extract_autogen_block(launcher)
-    script = _HARNESS_PREFIX + block + "\n" + body
+    if env and env.get("USER_REPO"):
+        commit_tree(env["USER_REPO"])
+    script = (_HARNESS_PREFIX + NERDCTL_IMAGE_INSPECT_STUB + block + "\n"
+              + body)
     base_env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
         "HOME": "/tmp",

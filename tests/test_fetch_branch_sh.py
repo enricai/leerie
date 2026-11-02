@@ -570,12 +570,13 @@ def _make_run_fixture(
     return repo, machine_runs, run_branch
 
 
-def test_step4_streams_config_and_dockerfile_to_host(tmp_path):
-    """Step 4 copies the Dockerfile from the machine to the host .leerie/
-    dir when the host has none. A config.toml on the machine is not streamed:
-    the container records captures in the run directory and the host applies
-    them (DESIGN §6½ *The host applies a capture*;
-    tests/test_fetch_branch_leerie_streamback.py)."""
+def test_step4_streams_nothing_from_the_machines_leerie_dir(tmp_path):
+    """Step 4 streams nothing from the machine's /work/.leerie/: neither
+    config.toml (the container records captures in the run directory, which
+    the operator applies, DESIGN §6½ *The operator applies a capture*) nor
+    the Dockerfile — a file a machine wrote never becomes the next run's
+    build input (DESIGN §6 *The orchestrator's root is leerie's; a
+    repository's root is only a confined process's*)."""
     run_id = "feat-streamback-001"
     repo, machine_runs, _ = _make_run_fixture(tmp_path, run_id)
 
@@ -600,8 +601,7 @@ def test_step4_streams_config_and_dockerfile_to_host(tmp_path):
 
     host_leerie = repo / ".leerie"
     assert not (host_leerie / "config.toml").exists(), "config.toml was streamed"
-    assert (host_leerie / "Dockerfile").exists(), "Dockerfile not streamed to host"
-    assert (host_leerie / "Dockerfile").read_text() == "FROM debian:13\n"
+    assert not (host_leerie / "Dockerfile").exists(), "Dockerfile was streamed"
 
 
 def test_step4_never_clobbers_existing_host_file(tmp_path):
@@ -637,8 +637,8 @@ def test_step4_never_clobbers_existing_host_file(tmp_path):
     assert (host_leerie / "config.toml").read_text() == original_content, (
         "Step 4 must not clobber an existing host-side config.toml"
     )
-    # Dockerfile was absent on the host — should have been written.
-    assert (host_leerie / "Dockerfile").exists(), "Dockerfile should be written when absent on host"
+    # Nor is the machine's Dockerfile brought in where the host has none.
+    assert not (host_leerie / "Dockerfile").exists()
 
 
 def test_step4_nonfatal_when_machine_file_absent(tmp_path):
@@ -665,8 +665,9 @@ def test_step4_nonfatal_when_machine_file_absent(tmp_path):
     )
 
 
-def test_step4_uses_leerie_state_host_dir(tmp_path):
-    """Step 4 writes to LEERIE_STATE_HOST_DIR when the env var is set."""
+def test_step4_writes_no_dockerfile_under_leerie_state_host_dir(tmp_path):
+    """With LEERIE_STATE_HOST_DIR set, the machine's Dockerfile reaches
+    neither it nor the checkout."""
     run_id = "feat-statehostdir-004"
     repo, machine_runs, _ = _make_run_fixture(tmp_path, run_id)
 
@@ -690,10 +691,7 @@ def test_step4_uses_leerie_state_host_dir(tmp_path):
         },
     )
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
-    # File must land in custom_host_dir, not repo/.leerie/.
-    assert (custom_host_dir / "Dockerfile").exists(), (
-        "Dockerfile must be written to LEERIE_STATE_HOST_DIR when set"
-    )
+    assert not (custom_host_dir / "Dockerfile").exists()
     assert not (repo / ".leerie" / "Dockerfile").exists(), (
         "Dockerfile must NOT be written to USER_REPO/.leerie when "
         "LEERIE_STATE_HOST_DIR is set"

@@ -1,9 +1,8 @@
 """Tests for Step 4 of scripts/remote/fetch-branch.sh: the run's recorded
 dependency captures (`<run-dir>/captured-deps.json`, streamed home with the
-run directory) are applied to the user's `.leerie/config.toml` on the host
-(DESIGN §6½ *The host applies a capture*), and `/work/.leerie/Dockerfile` is
-streamed back from the Fly Machine. The machine's `.leerie/config.toml` is
-no longer streamed: the container records captures, never writes config.
+run directory) are named, with `leerie config --apply-capture <run-id>`, and
+never applied here, and nothing under `/work/.leerie/` is streamed back
+(DESIGN §6½ *The operator applies a capture*).
 
 This file owns the stream-back seam exclusively so it does not collide with
 test_fetch_branch_sh.py's run-state/no_push assertions.  It re-uses the stub
@@ -11,14 +10,14 @@ helpers from that module (flyctl stub, git repo fixture) rather than
 duplicating them.
 
 Contracts under test:
-  - The capture is merged into the user's config (a hand-edited key is kept
-    and added to), and the Dockerfile is streamed when absent on the host.
+  - The capture is named and not applied, and no machine Dockerfile is
+    streamed; a hand-edited config is left as it is.
   - A pre-existing host Dockerfile is never clobbered.
   - Absence of machine files and of a capture is non-fatal: fetch_branch
     still returns 0 and writes nothing.
   - A config.toml on the machine is not streamed.
   - LEERIE_STATE_HOST_DIR (when set) is the root for the run directory and
-    the Dockerfile; the capture still goes to the user's checkout.
+    nothing else: no Dockerfile is written there.
 """
 from __future__ import annotations
 
@@ -96,7 +95,12 @@ def _setup_packages(repo: Path) -> str | None:
 # Core stream-back tests
 # ---------------------------------------------------------------------------
 
-def test_applies_the_capture_and_streams_the_dockerfile(tmp_path):
+def test_names_the_capture_and_applies_nothing_and_streams_no_dockerfile(
+        tmp_path):
+    """The run's capture came home with its directory; fetch_branch names it
+    and the command that applies it, and applies nothing (DESIGN §6½ *The
+    operator applies a capture*). The machine's Dockerfile is not streamed:
+    a file a machine wrote never becomes a build input."""
     run_id = "sb-both-new-001"
     repo, machine_runs = _make_completed_run(tmp_path, run_id)
     _capture(machine_runs, run_id, ["curl"])
@@ -109,27 +113,26 @@ def test_applies_the_capture_and_streams_the_dockerfile(tmp_path):
 
     result = _fetch(tmp_path, repo, "m-sb-both")
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
-    assert _setup_packages(repo) == "curl"
-    assert (repo / ".leerie" / "Dockerfile").read_text() == (
-        "FROM debian:13\nRUN apt-get install -y curl\n")
-    assert not (repo / ".leerie" / "runs" / run_id / "captured-deps.json").exists()
+    assert _setup_packages(repo) is None
+    assert not (repo / ".leerie" / "Dockerfile").exists()
+    assert (repo / ".leerie" / "runs" / run_id / "captured-deps.json").exists()
+    assert f"leerie config --apply-capture {run_id}" in (
+        result.stdout + result.stderr)
 
 
-def test_the_capture_merges_with_a_hand_edited_config(tmp_path):
+def test_a_hand_edited_config_is_left_as_it_is(tmp_path):
     run_id = "sb-noclobber-cfg-002"
     repo, machine_runs = _make_completed_run(tmp_path, run_id)
     host_leerie = repo / ".leerie"
     host_leerie.mkdir()
-    (host_leerie / "config.toml").write_text(
-        '# hand-edited by operator\nsetup_packages = "git curl"\n')
+    original = '# hand-edited by operator\nsetup_packages = "git curl"\n'
+    (host_leerie / "config.toml").write_text(original)
     _capture(machine_runs, run_id, ["wget"])
     _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=None)
 
     result = _fetch(tmp_path, repo, "m-noclobber")
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
-    text = (host_leerie / "config.toml").read_text()
-    assert "# hand-edited by operator" in text
-    assert _setup_packages(repo) == "git curl wget"
+    assert (host_leerie / "config.toml").read_text() == original
 
 
 def test_never_clobbers_existing_dockerfile(tmp_path):
@@ -178,7 +181,7 @@ def test_a_machine_config_toml_is_not_streamed(tmp_path):
     assert not (repo / ".leerie" / "Dockerfile").exists()
 
 
-def test_state_host_dir_takes_the_run_and_dockerfile_not_the_capture(tmp_path):
+def test_state_host_dir_takes_the_run_and_nothing_else(tmp_path):
     run_id = "sb-hostdir-007"
     repo, machine_runs = _make_completed_run(tmp_path, run_id)
     _capture(machine_runs, run_id, ["jq"])
@@ -193,8 +196,7 @@ def test_state_host_dir_takes_the_run_and_dockerfile_not_the_capture(tmp_path):
     result = _fetch(tmp_path, repo, "m-hostdir",
                     LEERIE_STATE_HOST_DIR=str(custom_root))
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
-    assert (custom_root / "Dockerfile").exists()
-    assert (custom_root / "runs" / run_id / "captured-deps.applied.json").exists()
-    # The capture goes to the user's checkout, the config's one home.
-    assert _setup_packages(repo) == "jq"
+    assert not (custom_root / "Dockerfile").exists()
+    assert (custom_root / "runs" / run_id / "captured-deps.json").exists()
+    assert _setup_packages(repo) is None
     assert not (custom_root / "config.toml").exists()

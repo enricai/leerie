@@ -12,11 +12,13 @@ launcher, prepend stubs, run the combined script in a subprocess.
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 from pathlib import Path
 
 from tests.fly_stub import make_fake_flyctl
 from tests.repo_image_block_extract import extract_block as _extract_block
+from tests.repo_image_block_extract import repo_build_functions
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -410,7 +412,8 @@ def _run_ensure_image_per_repo(
         f'ensure_image "{per_repo_tag}"\n'
         f'echo "rc=$?"\n'
     )
-    script = _HARNESS_PREFIX + sha256_block + "\n" + fly_block + "\n" + body
+    script = (_HARNESS_PREFIX + repo_build_functions(launcher) + "\n"
+              + sha256_block + "\n" + fly_block + "\n" + body)
 
     env = {
         "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
@@ -420,6 +423,7 @@ def _run_ensure_image_per_repo(
         "LEERIE_FLY_APP": "testapp",
         "LEERIE_REPO": str(leerie_repo),
         "USER_REPO": str(user_repo),
+        "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
     }
 
     result = subprocess.run(
@@ -438,11 +442,18 @@ def test_ensure_image_per_repo_calls_build_push_with_dockerfile(tmp_path):
     assert result.returncode == 0, result.stderr
     assert bp_log.exists(), f"build-push not called. stderr: {result.stderr}"
     log = bp_log.read_text()
+    # leerie's Dockerfile around the repository's, from the committed tree,
+    # its final stage the target (DESIGN §6 *The orchestrator's root is
+    # leerie's; a repository's root is only a confined process's*).
     assert "--dockerfile" in log
-    assert ".leerie/Dockerfile" in log
+    assert "/.image-build/b." in log and ".leerie/Dockerfile" not in log
+    assert re.search(r"--context \S+/\.image-build/b\.\w+/context", log)
+    assert re.search(r"--target leerie-final-[0-9a-f]{16}", log)
     assert f"BASE_IMAGE={base_tag}" in log
     assert "--tag" in log
     assert per_repo_tag in log
+    # The build directory is removed after the push.
+    assert not list((tmp_path / "state" / ".image-build").glob("b.*"))
 
 
 def test_ensure_image_per_repo_caches_per_repo_tag(tmp_path):

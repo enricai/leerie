@@ -250,26 +250,27 @@ def test_capture_in_the_container_records_and_never_writes_the_checkout(
     rec = json.loads((st.run_dir / "captured-deps.json").read_text())
     assert rec == [{"from_run": RUN_ID, "setup_packages": ["libpq-dev"],
                     "language_installs": [
-                        {"manager": "pnpm", "command": "pnpm install --offline",
+                        {"manager": "pnpm",
+                         "command": "pnpm install --frozen-lockfile",
                          "copy_inputs": ["package.json"]}],
                     "replace": False}]
     assert (st.run_dir / "dep_capture.done").is_file()
 
 
-def test_every_in_container_seam_records_into_the_current_run(leerie):
-    """phase_finalize, the main() arms and the run-start backstop all pass
-    `record_in`; only the host's recapture writes the checkout."""
+def test_every_seam_records_and_none_writes_the_checkout(leerie):
+    """phase_finalize, the main() arms, the run-start backstop and the
+    host's recapture all pass `record_in`: a capture is recorded, and only
+    the operator's `config --apply-capture` writes the checkout (DESIGN §6½
+    *The operator applies a capture*)."""
     import inspect
     src = inspect.getsource(leerie)
     calls = [m.start() for m in re.finditer(r"await capture_repo_deps\(", src)]
     assert len(calls) == 4
-    host = inspect.getsource(leerie.run_recapture_deps)
     for at in calls:
         call = src[at:src.index(")", src.index("efforts=efforts", at))]
-        if call in host:
-            assert "record_in" not in call
-        else:
-            assert "record_in=" in call, call
+        assert "record_in=" in call, call
+    assert "_merge_capture_into_config(" not in inspect.getsource(
+        leerie.capture_repo_deps)
 
 
 def test_apply_merges_against_the_users_current_config_once(leerie, tmp_path):
@@ -328,14 +329,16 @@ def test_host_apply_writes_the_users_config(leerie, tmp_path):
 def _launcher_functions() -> str:
     src = LAUNCHER.read_text()
     start = src.index("  _read_ran_run_id() {\n")
-    fn = src.index("  _apply_ran_run_captures() {\n", start)
+    fn = src.index("  _note_ran_run_captures() {\n", start)
     return src[start:src.index("\n  }\n", fn) + len("\n  }\n")]
 
 
-def test_the_launcher_exit_applies_the_ran_runs_capture(leerie, tmp_path):
+def test_the_launcher_exit_names_the_ran_runs_capture_and_applies_none(
+        leerie, tmp_path):
     """The launcher's own functions, verbatim, from its EXIT trap: the run
-    the container named in the run-id file has its capture applied; another
-    run's is not."""
+    the container named in the run-id file has its capture named, with the
+    command that applies it, and nothing is written (DESIGN §6½ *The
+    operator applies a capture*)."""
     user = _user_repo(tmp_path)
     state = tmp_path / "state"
     for rid, pkg in ((RUN_ID, "libpq-dev"), ("other-run", "zlib1g")):
@@ -347,18 +350,18 @@ def test_the_launcher_exit_applies_the_ran_runs_capture(leerie, tmp_path):
     exit_trap = [ln for ln in LAUNCHER.read_text().splitlines()
                  if ln.strip().startswith("trap '") and ln.endswith("' EXIT")
                  and "_kill_container_from_cidfile" in ln]
-    assert len(exit_trap) == 1 and "_apply_ran_run_captures" in exit_trap[0]
-    assert exit_trap[0].index("_apply_ran_run_captures") < exit_trap[0].index(
-        'rm -f "${_cidfile:-}" "${_run_id_file:-}"')
+    assert len(exit_trap) == 1 and "_note_ran_run_captures" in exit_trap[0]
+    assert "apply" not in exit_trap[0]
     r = subprocess.run(
         ["bash", "-c", "set -euo pipefail\nRUNTIME=local\n"
          f'_run_id_file="{rid_file}"\n' + _launcher_functions()
-         + "_apply_ran_run_captures\n"],
+         + "_note_ran_run_captures\n"],
         env=_host_env(tmp_path, user, state), capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert leerie._read_toml_key(user / ".leerie" / "config.toml",
-                                 "setup_packages") == "libpq-dev"
-    assert (state / "runs" / "other-run" / "captured-deps.json").is_file()
+    assert f"leerie config --apply-capture {RUN_ID}" in r.stderr
+    assert not (user / ".leerie").exists()
+    for rid in (RUN_ID, "other-run"):
+        assert (state / "runs" / rid / "captured-deps.json").is_file()
 
 
 # ------------------------------------------------------------- phase 1½

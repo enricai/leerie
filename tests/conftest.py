@@ -728,6 +728,22 @@ HELDOUT_SANDBOX_EMULATOR = REPO_ROOT / "tests" / "heldout_sandbox_emulator.py"
 
 
 @pytest.fixture(autouse=True)
+def _no_image_worker_root(request, monkeypatch):
+    """Point `WORKER_ROOT` at a path that does not exist, so the suite runs
+    the same in leerie's base image and in a repository image, which has a
+    worker root at `/opt/leerie-worker-root` (DESIGN §6 *The orchestrator's
+    root is leerie's; a repository's root is only a confined process's*).
+    `tests/test_worker_root_view.py` drives the shim's `--worker-root`
+    itself; a test that needs the image's own opts out with
+    `@pytest.mark.real_worker_root`."""
+    if request.node.get_closest_marker("real_worker_root"):
+        return
+    leerie = request.getfixturevalue("leerie")
+    monkeypatch.setattr(leerie, "WORKER_ROOT",
+                        REPO_ROOT / "tests" / "no-worker-root-in-tests")
+
+
+@pytest.fixture(autouse=True)
 def _emulated_heldout_sandbox(request, monkeypatch):
     """Run every held-out sandbox a test asks for through
     `tests/heldout_sandbox_emulator.py`. Leerie runs a held-out file only in
@@ -745,9 +761,9 @@ def _emulated_heldout_sandbox(request, monkeypatch):
     leerie = request.getfixturevalue("leerie")
     real = leerie._confined_argv
 
-    def _argv(grants, cmd, *, sandbox=None, report_fd=None):
+    def _argv(grants, cmd, *, sandbox=None, report_fd=None, **kw):
         if sandbox is None:
-            return real(grants, cmd)
+            return real(grants, cmd, **kw)
         out = [sys.executable, "-I", str(HELDOUT_SANDBOX_EMULATOR),
                "--view", sandbox.view]
         for src, rel in sandbox.place:

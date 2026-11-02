@@ -921,19 +921,19 @@ The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
 discovery, bundle fetch, run-state tar (`run.json`, its `no_push` included,
 arrives unchanged), and baseline Step
-4 stream-back (the Dockerfile streamed when the host has none, a machine
-`config.toml` not streamed, never clobbers an existing host file, non-fatal
-on absent machine files, respects `LEERIE_STATE_HOST_DIR`) via bash-harness
-subprocess tests with a stubbed `flyctl`. The expanded Step 4 contracts are
-covered by `tests/test_fetch_branch_leerie_streamback.py` (imports stub
-helpers from `test_fetch_branch_sh` to avoid duplication): the run's
-recorded capture (`captured-deps.json`, home with the run directory) is
-merged into the user's `.leerie/config.toml` and the Dockerfile streamed;
-a hand-edited config is merged with, not clobbered; an existing Dockerfile
-is never clobbered; non-fatal when nothing is there; a machine
-`config.toml` is not streamed; `LEERIE_STATE_HOST_DIR` takes the run
-directory and the Dockerfile while the capture still goes to the user's
-checkout (DESIGN §6½ *The host applies a capture*).
+4 (nothing streamed from the machine's `/work/.leerie/`, an existing host
+file never clobbered, non-fatal on absent machine files, no Dockerfile
+written under `LEERIE_STATE_HOST_DIR`) via bash-harness subprocess tests
+with a stubbed `flyctl`. The expanded Step 4 contracts are covered by
+`tests/test_fetch_branch_leerie_streamback.py` (imports stub helpers from
+`test_fetch_branch_sh` to avoid duplication): the run's recorded capture
+(`captured-deps.json`, home with the run directory) is named, with
+`leerie config --apply-capture <run-id>`, and nothing is applied; a
+hand-edited config is left as it is; no machine `Dockerfile` or
+`config.toml` is streamed, and an existing host Dockerfile is never
+clobbered; non-fatal when nothing is there; `LEERIE_STATE_HOST_DIR` takes
+the run directory and nothing else (DESIGN §6½ *The operator applies a
+capture*).
 
 The `leerie config` verb (all four sub-modes: `--init`, bare, `--chat`,
 `--recapture`) is tested in `tests/test_config_verb.py` via a
@@ -2212,10 +2212,9 @@ upload-only): a branch committed on the instance round-trips to the host as a
 fetchable bundle whose tip matches the instance-side tip; the run-state tar
 extracts under `LEERIE_STATE_HOST_DIR` (or `USER_REPO/.leerie` by default)
 and `run.json` (its `no_push` included) arrives unchanged, as from
-`fetch-branch.sh`; `.leerie/config.toml` and
-`.leerie/Dockerfile` stream back when the host has neither, are never
-clobbered when the host already has one, and are non-fatal when absent on the
-instance; and both `aws` and `ssh` appear in the transport log while `flyctl`
+`fetch-branch.sh`; neither the instance's `.leerie/config.toml` nor
+its `.leerie/Dockerfile` is streamed back, and a recorded capture is named,
+not applied; and both `aws` and `ssh` appear in the transport log while `flyctl`
 never does.
 
 ## EC2 launch/attach transport
@@ -7063,3 +7062,45 @@ sample's probe never counts for the next.
   operator's user settings (`--setting-sources user`) and gets no shell
   prefix; `scripts/worker-shell.py` fails closed (126) where it cannot nest, and
   runs a command as `bash` would.
+
+## The orchestrator's root is leerie's; a capture names packages and managers (review round 28, isolation E1, E2, A2)
+
+- `tests/test_worker_root_view.py` — the shim's worker view. Unit: the
+  worker stage's environment changes (`worker_env_changes`,
+  `apply_worker_env`), a linked env file is not read, `_parse`'s
+  `--worker-root`/`--cli` rules, an AST rule that `chroot` happens only in
+  `enter_worker_view`, called only from `_before_exec` in the forked
+  children of `run`/`run_as_init` after `_confine_or_126`, and that
+  `worker-shell.py` nests before it enters the view; `_is_leeries_hook`.
+  Isolation (container battery; skips where the host restricts user
+  namespaces): a small worker root built from this root's `sh`, `bash`,
+  `cat`, `env`, `grep` and their libraries, with a mark, an environment and
+  an `/etc/ld.so.preload` trap. A confined command and a held-out runner run
+  in it with no capability; a `--cli` process stays in leerie's root
+  holding only `CAP_SYS_CHROOT`, its `worker-shell.py` commands run in the
+  view, leerie's hook does not, and no trap complaint reaches the shim.
+  Falsified: without the `import warnings` at the shim's top, `os.execvp`
+  imported it in the child after it entered the view (two failures).
+- `tests/test_repo_image_dockerfile.py` — the launcher's
+  `_repo_image_dockerfile` and `_check_repo_image`, verbatim: the final
+  stage is `FROM <base>` and one `COPY` to `/opt/leerie-worker-root/`, the
+  repository's last stage is named (or its own name used) across
+  continuations and heredocs, a swallowing file leaves leerie's nonce
+  target its only definition, a `# syntax=` line is never the first, a
+  linked Dockerfile is refused, and an image that is not the base's layers
+  plus one with the base's configuration is removed. Opt-in
+  (`LEERIE_TEST_REPO_IMAGE=<base>`): E1's planted `.pth`, in a real build,
+  is in the worker root and never runs in the image root's interpreter, as
+  leerie or root, and the untracked `.env` is not in the image.
+- `tests/test_capture_validation.py` — E2's proof turned around: the schema,
+  `_filter_residual_deps`, `_capture_problems`, `_record_capture`,
+  `_merge_capture_into_config`, `apply_captured_deps`, the launcher's apt
+  layer (no glob expansion either) and the generator each refuse the
+  hostile capture; the generator runs `_INSTALL_COMMANDS[manager]`, equal
+  to `BAKE_INSTALL_COMMANDS`; nothing in a run's exit or fetch applies a
+  capture, and `config --apply-capture <run>` applies one with a diff. A2:
+  the generator reads the committed tree (a committed `.npmrc` link and an
+  untracked `.npmrc` are neither read nor copied; one linked to
+  `/proc/self/pagemap` no longer stops the launch) and hashes by blob id.
+- `tests/committed_tree.py` — the harnesses that write a lockfile into a
+  test checkout commit it first, since the generator reads `HEAD`.
