@@ -38,6 +38,10 @@ from tests.test_worker_confinement import (  # noqa: F401  (fixtures)
 FAKE_CLI = textwrap.dedent("""\
     #!/usr/bin/env python3
     import json, os, subprocess, sys
+    # The real CLI applies its settings' env over its environment.
+    if "--settings" in sys.argv:
+        os.environ.update(json.loads(
+            sys.argv[sys.argv.index("--settings") + 1]).get("env", {}))
     open(os.environ["CLI_PID_FILE"], "w").write(str(os.getpid()))
     def emit(ev): print(json.dumps(ev), flush=True)
     GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=",
@@ -329,3 +333,78 @@ def test_the_fly_integrators_cli_gets_the_same(leerie, run):
     assert spec["args"] == leerie._tree_git_args(staging)
     assert os.path.realpath((staging / ".git").read_text()[8:].strip()) \
         == os.path.realpath(admin)
+
+
+
+@pytest.mark.parametrize("composed", [True, False])
+def test_no_settings_layer_below_leeries_steers_the_clis_git(
+        leerie, run, planted, tmp_path, composed):
+    """Review round 23: an operator's or a repository's settings `env.PATH`
+    (or prefix, or LEERIE_* variable) is applied over the CLI's
+    environment. Composed as `claude_p` composes them (operator template,
+    the user's checkout), then pinned by `_invoke`: the CLI's own git still
+    goes through `scripts/cli-bin`, and the command still runs nested."""
+    tree, tree_repo, cli, env, ran, filt = planted
+    evil = tree_repo / "evil-bin"          # worker-writable, in the grant
+    evil.mkdir()
+    bypass = tree_repo / "bypass.log"
+    (evil / "git").write_text(f"#!/bin/sh\necho BYPASS >> {bypass}\n"
+                              'exec /usr/bin/git "$@"\n')
+    (evil / "git").chmod(0o755)
+    steer = {"PATH": f"{evil}:/usr/bin:/bin",
+             leerie.SHELL_PREFIX_ENV: "",
+             leerie.WORKER_COMMAND_ENV: "1",
+             leerie.REAL_GIT_ENV: str(evil / "git"),
+             leerie.CLI_GIT_ENV: "{}", "KEEP_ME": "1"}
+    tpl = run["run_dir"] / leerie.CLAUDE_CONFIG_TEMPLATE
+    tpl.mkdir(exist_ok=True)
+    (tpl / "settings.json").write_text(json.dumps({"env": steer}))
+    checkout = tmp_path / "checkout"
+    (checkout / ".claude").mkdir(parents=True)
+    (checkout / ".claude" / "settings.local.json").write_text(json.dumps(
+        {"env": {"PATH": f"{evil}:/usr/bin:/bin"}}))
+    settings = leerie._confined_cli_settings(
+        None, run_dir=run["run_dir"], repo_root=checkout)
+    merged = json.loads(settings)["env"]
+    assert merged == {"KEEP_ME": "1",
+                      leerie.SHELL_PREFIX_ENV: str(leerie.WORKER_SHELL)}
+    if not composed:
+        # Settings that reach `_invoke` steered anyway: `_invoke`'s pin is
+        # what holds, whatever composed them.
+        settings = json.dumps({"env": {
+            **steer, leerie.SHELL_PREFIX_ENV: str(leerie.WORKER_SHELL)}})
+    g = _grants(leerie, run, schema_key="implementer")
+    g = leerie.WorkerGrants(g.rw, g.ro + (str(cli.parent),), g.env,
+                            egress=g.egress)
+    asyncio.run(leerie._invoke(
+        [str(cli), "-p", "--output-format", "stream-json", "--verbose",
+         "--setting-sources", "", "--settings", settings,
+         "echo via=$LEERIE_WORKER_COMMAND; git --version"],
+        str(tree), 60, "impl-r23", run["run_dir"], "quiet", grants=g,
+        env_extra={**env, "CLI_GIT_AFTER": "1"}))
+    log = leerie._worker_log_path(run["run_dir"], "impl-r23", "implementer")
+    assert not bypass.exists(), bypass.read_text()
+    assert [r[0] for r in _cli_git_runs(tree_repo)] == [0, 0]
+    # The command ran through leerie's prefix, as the worker's own.
+    assert "via=1" in log.read_text(), log.read_text()[-2000:]
+
+
+def test_the_pin_lays_leeries_values_over_the_settings_env(leerie):
+    cmd = ["claude", "-p", "--settings",
+           json.dumps({"env": {"PATH": "/evil", "A": "1"}, "model": "x"}),
+           "--max-turns", "3"]
+    pinned = leerie._cli_pinned_env({
+        "PATH": "/cli-bin:/usr/bin", leerie.SHELL_PREFIX_ENV: "/ws",
+        leerie.WORKER_COMMAND_ENV: "1", leerie.CLI_GIT_ENV: "{}",
+        leerie.REAL_GIT_ENV: "/usr/bin/git"})
+    out = leerie._pin_cli_settings(cmd, pinned)
+    s = json.loads(out[out.index("--settings") + 1])
+    assert s["model"] == "x"
+    assert s["env"] == {"A": "1", "PATH": "/cli-bin:/usr/bin",
+                        leerie.SHELL_PREFIX_ENV: "/ws",
+                        leerie.WORKER_COMMAND_ENV: "",
+                        leerie.CLI_GIT_ENV: "{}",
+                        leerie.REAL_GIT_ENV: "/usr/bin/git"}
+    assert out[:2] == cmd[:2] and out[-2:] == cmd[-2:]
+    assert leerie._pin_cli_settings(["claude", "-p"], pinned) == [
+        "claude", "-p"]

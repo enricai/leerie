@@ -111,6 +111,10 @@ def main(argv: list[str]) -> int:
     settings = leerie._confined_cli_settings(
         guard["settings"], run_dir=run_dir,
         repo_root=os.path.dirname(os.path.dirname(os.path.dirname(run_dir))))
+    # Leerie's values on top of the settings' env, as `_invoke` pins them.
+    settings = leerie._pin_cli_settings(
+        ["--settings", settings],
+        leerie._cli_pinned_env({**genv, **env}))[1]
     confine = " ".join(shlex.quote(w) for w in
                        leerie._confined_argv(grants, [])[:-1])
     disallowed = leerie.DISALLOWED_TOOLS + (

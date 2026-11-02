@@ -2763,6 +2763,17 @@ there reaches it or its CLI.
   its grant now reads. Not `_git_view`'s copies of the outside settings:
   they are outside every worker's grant, and the settings they copy (system,
   global) are ones no worker writes.
+- *No settings layer below leerie's steers it.* The CLI applies its
+  settings' `env` over its process environment, so an operator's or a
+  repository's `env.PATH` sent one of its git calls (`ls-files`) past
+  `scripts/cli-bin` (review round 23, measured on the host; the other five
+  had resolved git earlier). Every variable the confinement reads — `PATH`,
+  `CLAUDE_CODE_SHELL_PREFIX`, `LEERIE_WORKER_COMMAND`, `LEERIE_CLI_GIT`,
+  `LEERIE_REAL_GIT` — is set in leerie's own layer, the top one: no lower
+  layer's `env` keeps any of them or any other `LEERIE_*` variable
+  (`_confined_cli_settings`), and `_invoke` lays the worker's own values of
+  them over the `env` of the settings it passes (`_pin_cli_settings`), the
+  marker empty, so leerie's guarantee depends on no other layer.
 - *Every start.* Before each confined worker starts, leerie puts back its
   settings over the tree's repository (`_restore_settings`) and the tree's
   `.git` file naming the administrative directory leerie's layout gives it
@@ -6028,12 +6039,16 @@ in exactly one):
   its inputs*), pip installed pytest into the view's user base, warned
   "installed in '…/pyuser/bin' which is not on PATH", and every test run
   read `pytest: command not found`, so the base and every test axis went
-  unmeasured. *Wherever leerie points `PYTHONUSERBASE`, `PATH` carries its
-  `bin`, last* (`_with_user_scripts`, in `_leerie_stores`,
-  `_worker_cache_env` and `_tree_store_env`), in place of the value it
-  replaces, and after the image's tools, so a user-installed script never
-  shadows a baked one. A value beneath the bake root is the image's and is
-  left alone.
+  unmeasured. *Wherever leerie points a confined process's
+  `PYTHONUSERBASE`, that process's `PATH` carries its `bin`, last*
+  (`_with_user_scripts`, in `_worker_cache_env`, `_tree_store_env` and
+  every command `_run_streaming` starts), in place of the value it replaces,
+  and after the image's tools, so a user-installed script never shadows a
+  baked one. A value beneath the bake root is the image's and is left
+  alone. Never on the orchestrator's own `PATH` (`_leerie_stores` sets the
+  store variables there, not `PATH`): leerie's unconfined process never
+  resolves a program from a store directory, which a confined fetch writes
+  (review round 23 isolation, an observation f0ce3e56 opened).
 
 The measurement grant gives a confined install exactly this: the fetched
 stores read-only, the verified ones writable, and its own tree's

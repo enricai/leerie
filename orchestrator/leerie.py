@@ -6030,7 +6030,6 @@ def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
     read or write them; a worker's environment replaces every one
     (`_worker_cache_env`), so nothing a worker can write reaches them."""
     root = Path(state_root) / ".stores" / "leerie"
-    user_base = env.get("PYTHONUSERBASE")
     for var, name in _STORE_VARS.items():
         if (env.get(var) or "").startswith(_BAKED_ROOT):
             continue
@@ -6038,7 +6037,11 @@ def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
         d.mkdir(parents=True, exist_ok=True)
         env[var] = str(d)
     _with_pnpm_spellings(env)
-    _with_user_scripts(env, user_base)
+    # Not `PATH`: this is the orchestrator's own environment, and leerie's
+    # unconfined process never resolves a program from a store directory
+    # (DESIGN §6 *Which stores an install may share*; review round 23). A
+    # confined command gets the user base's scripts in its own environment
+    # (`_run_streaming`).
 
 
 def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
@@ -10183,6 +10186,10 @@ async def _run_streaming(
             # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may
             # share*).
             env = _tree_stores_for(env if env is not None else os.environ, cwd)
+            # And the console scripts of whichever user base it has, on its
+            # own `PATH`, last — never on the orchestrator's (DESIGN §6
+            # *Which stores an install may share*).
+            _with_user_scripts(env, None)
             gate_r: int | None = None
             gate_w: int | None = None
             if cgroup_sid is not None:
@@ -24886,6 +24893,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             log(f"  [{sid}] put back {', '.join(restored)} of "
                 f"{_operator_path(Path(cwd))} before the worker started")
         worker_env.update(_cli_git_env(cwd, worker_env.get("PATH", "")))
+        # The same values on top of the settings the CLI reads, which it
+        # applies over this environment (review round 23).
+        cmd = _pin_cli_settings(list(cmd), _cli_pinned_env(worker_env))
 
     # The prompt is staged to a temp file BEFORE the spawn, and that file —
     # already positioned at byte 0 with the whole payload on disk — becomes
@@ -28582,6 +28592,15 @@ def _confined_cli_settings(hook_settings: str | None, *,
     if repo_root is not None:
         layers += [_settings_file(Path(repo_root) / ".claude" / name)
                    for name in ("settings.json", "settings.local.json")]
+    # No layer below leerie's names a variable leerie's confinement reads
+    # (DESIGN §6 *The CLI's own git runs on leerie's terms*): leerie's own
+    # set them, last.
+    for layer in layers:
+        env = layer.get("env")
+        if isinstance(env, dict):
+            layer["env"] = {k: v for k, v in env.items()
+                            if k not in _CLI_PINNED_NAMES
+                            and not str(k).startswith("LEERIE_")}
     if hook_settings:
         layers.append(json.loads(hook_settings))
     layers.append({"env": {SHELL_PREFIX_ENV: str(WORKER_SHELL)}})
@@ -28589,6 +28608,48 @@ def _confined_cli_settings(hook_settings: str | None, *,
     for layer in layers:
         merged = _merge_settings(merged, layer)
     return json.dumps(merged, separators=(",", ":"))
+
+
+# The CLI-environment variables leerie's confinement of a worker's CLI reads:
+# a settings `env` (applied over the process environment) that names any of
+# them would steer it, so leerie's own layer, last, names every one.
+_CLI_PINNED_NAMES = ("PATH", SHELL_PREFIX_ENV, WORKER_COMMAND_ENV,
+                     CLI_GIT_ENV, REAL_GIT_ENV)
+
+
+def _cli_pinned_env(worker_env: Mapping[str, str]) -> dict[str, str]:
+    """Leerie's values of `_CLI_PINNED_NAMES` for a confined CLI started
+    with `worker_env`: its `PATH` (`CLI_GIT_BIN` first), the shell prefix,
+    the CLI-git addressing, and the worker-command marker empty (the CLI's
+    own calls are not the worker's)."""
+    return {k: ("" if k == WORKER_COMMAND_ENV else worker_env.get(k, ""))
+            for k in _CLI_PINNED_NAMES}
+
+
+def _pin_cli_settings(cmd: list[str], pinned: Mapping[str, str]
+                      ) -> list[str]:
+    """`cmd` with `pinned` laid over the `env` of its `--settings` JSON, the
+    top of every layer the CLI reads (DESIGN §6 *The CLI's own git runs on
+    leerie's terms*): an operator's or a repository's `env.PATH` was applied
+    over the process environment and sent one of the CLI's git calls past
+    `CLI_GIT_BIN` (review round 23). A `cmd` without `--settings` is left as
+    it is."""
+    if "--settings" not in cmd:
+        return list(cmd)
+    i = cmd.index("--settings") + 1
+    if i >= len(cmd):
+        return list(cmd)
+    try:
+        settings = json.loads(cmd[i])
+    except ValueError:
+        return list(cmd)
+    if not isinstance(settings, dict):
+        return list(cmd)
+    env = settings.get("env")
+    settings["env"] = {**(env if isinstance(env, dict) else {}), **pinned}
+    out = list(cmd)
+    out[i] = json.dumps(settings, separators=(",", ":"))
+    return out
 
 def _hook_payload(raw: object) -> tuple[list[str | dict], bool]:
     """(forbidden entries, deny kills) from the hook's decoded payload. A
