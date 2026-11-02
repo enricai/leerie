@@ -24106,6 +24106,20 @@ class WorkerGrants(NamedTuple):
 # never process state, so nothing else ever inherits it.
 HOST_SEAM_CAP = "_host_seam"
 
+# What every host-side CLI carries besides the shared containment (the
+# rebaser and host recapture through `claude_p`; the launcher's
+# `config --chat` the same flags, pinned equal by a test): it is handed a
+# checkout or a tree by `--add-dir`, from which the CLI loads skills,
+# commands and agents, and with HOST_CLI_ENV_PIN's variable set the tree's
+# CLAUDE.md (DESIGN §6 *The host never runs a program the checkout chose*,
+# part 4; review round 28 C1, C2). `--setting-sources user` is what stops
+# the `--add-dir` loading (measured, CLI 2.1.316); the rest is a second
+# layer that does not rest on that one CLI behaviour.
+HOST_CLI_ARGS = ("--setting-sources", "user", "--disable-slash-commands",
+                 "--strict-mcp-config")
+HOST_CLI_DENIED_TOOLS = ("Agent", "Task", "Skill")
+HOST_CLI_ENV_PIN = {"CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "0"}
+
 # The device nodes a worker's tools write: not all of /dev. `/dev/shm`
 # holds POSIX semaphores and shared memory (Python's multiprocessing locks
 # and Chromium need it, measured); an isolated process's is its own, which
@@ -29852,6 +29866,28 @@ def _worker_guard(allowed_tools: str, repo_root: str | Path,
     }
 
 
+def _host_cli_settings(hook_settings: str | None) -> str:
+    """A host-side CLI's `--settings`: the hook's, if any, with
+    `HOST_CLI_ENV_PIN` laid over its `env` (a flag's settings override the
+    operator's settings file, which may set the variable too)."""
+    base = json.loads(hook_settings) if hook_settings else {}
+    return json.dumps(_merge_settings(base, {"env": dict(HOST_CLI_ENV_PIN)}),
+                      separators=(",", ":"))
+
+
+def _host_cli_extra_args(cmd: list[str]) -> list[str]:
+    """`HOST_CLI_ARGS`, less the shared builder's `--strict-mcp-config`
+    when `cmd` already carries it. The denials of
+    `HOST_CLI_DENIED_TOOLS` are `DISALLOWED_TOOLS`' (asserted, not
+    assumed)."""
+    denied = set(DISALLOWED_TOOLS.split(","))
+    missing = [t for t in HOST_CLI_DENIED_TOOLS if t not in denied]
+    if missing:
+        raise RuntimeError(f"DISALLOWED_TOOLS no longer denies {missing}")
+    return [a for a in HOST_CLI_ARGS
+            if not (a == "--strict-mcp-config" and a in cmd)]
+
+
 def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
                            model: str, prompt: str | None = None,
                            deny_extra: str = "",
@@ -30082,6 +30118,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # worker writes only where it is granted*); `_invoke` applies it. None
     # only on the host-side seam, which is not a run worker. After the
     # worker's own directories are named: the grants follow them.
+    if caps.get(HOST_SEAM_CAP):
+        env_extra = {**(env_extra or {}), **HOST_CLI_ENV_PIN}
     _genv = {**os.environ, **(env_extra or {})}
     grants = None if caps.get(HOST_SEAM_CAP) else _worker_grants(
         run_dir=leerie_dir, state=st.data, schema_key=schema_key, cwd=cwd,
@@ -30139,11 +30177,13 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                     _sysprompt_read_denial(getattr(st, "run_dir", None),
                                            allowed_tools, autonomous),
                     guard["deny"]) if d),
-                settings=(hook_settings if grants is None
+                settings=(_host_cli_settings(hook_settings) if grants is None
                           else _confined_cli_settings(
                               hook_settings, run_dir=_wrun_dir,
                               repo_root=getattr(st, "repo_root", None))),
                 settings_only=grants is not None)
+            if grants is None:
+                cmd.extend(_host_cli_extra_args(cmd))
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
             else:

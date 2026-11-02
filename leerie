@@ -1587,11 +1587,23 @@ TOML
             remote_log "error: the temporary directory $_chat_cwd_real is inside $_user_repo"
             exit 1 ;;
         esac
+        # What every host-side CLI carries (HOST_CLI_ARGS,
+        # HOST_CLI_DENIED_TOOLS and HOST_CLI_ENV_PIN in orchestrator/leerie.py,
+        # pinned equal by tests/test_host_cli_loads_nothing_from_the_tree.py):
+        # the CLI loads skills, commands and agents from an --add-dir
+        # directory, and a committed skill's `!` line and hooks ran on the
+        # host (DESIGN §6 *The host never runs a program the checkout chose*,
+        # part 4). `--` ends --add-dir, which takes every word after it:
+        # without it the first message was read as a directory.
         _chat_rc=0
-        (cd "$_chat_cwd" && exec "$_chat_claude" \
+        (cd "$_chat_cwd" && unset CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD \
+          && exec "$_chat_claude" \
+          --setting-sources user --disable-slash-commands --strict-mcp-config \
+          --disallowedTools Agent,Task,Skill \
+          --settings '{"env":{"CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD":"0"}}' \
           --system-prompt-file "$system_prompt" \
           --add-dir "$_user_repo" \
-          "Help me configure leerie for the repository at $_user_repo.") \
+          -- "Help me configure leerie for the repository at $_user_repo.") \
           || _chat_rc=$?
         rm -rf "$_chat_cwd"
         exit "$_chat_rc"

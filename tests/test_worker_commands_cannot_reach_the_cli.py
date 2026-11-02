@@ -228,7 +228,8 @@ def test_the_host_seam_is_untouched(leerie, monkeypatch, tmp_path):
                                leerie.HOST_SEAM_CAP: True})
     argv = got["cmd"]
     assert got["grants"] is None
-    assert "--setting-sources" not in argv
+    i = argv.index("--setting-sources")
+    assert argv[i + 1] == "user"
     settings = json.loads(argv[argv.index("--settings") + 1])
     assert leerie.SHELL_PREFIX_ENV not in settings.get("env", {})
 

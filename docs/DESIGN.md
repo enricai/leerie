@@ -2736,6 +2736,23 @@ nobody has merged. The invariant is constructed in five parts.
    `--git-dir` from `/`. Its worktree is a tree of the run branch, which
    the operator has not merged, so "the operator configured it" never
    applied to it (review round 27, isolation I1).
+   The CLI still loads skills, slash commands and agents from every
+   `--add-dir` directory. With `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`
+   set in the environment or in a settings `env`, it also loads that
+   directory's `CLAUDE.md` (measured, CLI 2.1.316). `.claude/skills/` is a
+   path a worker may commit. A skill whose description targets the
+   session was invoked by the model in `config --chat`, and its
+   `` !`cmd` `` line and its frontmatter hook ran on the host, unconfined
+   (review round 28, isolation C1 and C2). So every host-side CLI (the
+   rebaser, host recapture and `config --chat`) reads only the operator's
+   user settings (`--setting-sources user`). Measured, that stops the CLI
+   loading any skill, command or agent from an `--add-dir` directory. Each
+   also has slash commands and skills off (`--disable-slash-commands`),
+   `Agent`, `Task` and `Skill` denied, and `--strict-mcp-config`. Each pins
+   `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` to `0`, both in its
+   environment and in its `--settings` `env`, which overrides the
+   operator's own settings file. The session loses the operator's own
+   skills and agents too, a cost accepted for workers whose job is fixed.
 5. *The exception is what must start in a tree by its own design.* These
    are the operator's `pre-push` hook (part 2), the hooks and filters a
    local git command runs in the work tree it names, and the commands the

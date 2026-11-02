@@ -184,6 +184,17 @@ and the checkout's path in its first message. It removes the directory
 afterwards and exits with the CLI's status. `run_rebaser` runs its
 `claude_p` with `cwd=_host_worker_cwd(repo_root, worktree)` and
 `add_dirs=[worktree]`, and names the worktree in the prompt.
+Every host-seam `claude_p` (`HOST_SEAM_CAP`: the rebaser and host
+recapture) adds `HOST_CLI_ARGS` (`--setting-sources user
+--disable-slash-commands --strict-mcp-config`, through
+`_host_cli_extra_args(cmd)`, which omits the shared builder's
+`--strict-mcp-config` and raises `RuntimeError` if `DISALLOWED_TOOLS` stops
+denying any of `HOST_CLI_DENIED_TOOLS` = `Agent`, `Task`, `Skill`). Its
+`--settings` is `_host_cli_settings(hook_settings)`: the hook settings with
+`HOST_CLI_ENV_PIN` (`CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=0`) merged
+over its `env`, and the same pin goes into `env_extra`. `config --chat`
+passes the same flags (DESIGN §6 *The host never runs a program the
+checkout chose*, part 4; `tests/test_host_cli_loads_nothing_from_the_tree.py`).
 `_host_worker_cwd(*trees) -> Path` makes a fresh `tempfile.mkdtemp`
 directory (0700) and raises `OSError` when it is one of `trees` or beneath
 one; `run_rebaser` removes it after the call. Its own git
@@ -369,7 +380,12 @@ claims a state directory. Four sub-modes:
 - **`leerie config --chat`**: runs interactive `claude` (NOT `claude -p`)
   with `--system-prompt-file $LEERIE_REPO/prompts/config_chat.md` and
   `--add-dir $USER_REPO`, from a temporary directory of its own (§0, *The
-  host never runs a program the checkout chose*). No container started.
+  host never runs a program the checkout chose*). It also passes the
+  host-CLI containment: `--setting-sources user --disable-slash-commands
+  --strict-mcp-config --disallowedTools Agent,Task,Skill --settings
+  '{"env":{"CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD":"0"}}'`, with that
+  variable unset in its environment. The first message follows `--`,
+  because `--add-dir` takes every word up to the next option. No container started.
   Exits 1 if `prompts/config_chat.md` is missing or `claude` is not on
   PATH; otherwise exits with the session's status.
 - **`leerie config --recapture [--force]`**: host-only. Calls

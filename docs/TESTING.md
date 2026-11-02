@@ -838,6 +838,16 @@ protected paths compare folded (`_path_fold`), path lists are read with
 `-z`, and `check_diff_scope` refuses a second spelling
 (`_fold_collisions`). 16 cases fail against the parent.
 
+`tests/test_host_cli_loads_nothing_from_the_tree.py` (4 test functions, 6
+cases; DESIGN §6 *The host never runs a program the checkout chose*, part 4;
+review round 28 isolation C1, C2): the real `run_rebaser` (`_invoke`
+captured) and the launcher's `config --chat` (builtins-only stub `claude`)
+pass `--setting-sources user`, `--disable-slash-commands`,
+`--strict-mcp-config`, deny Agent/Task/Skill, pin
+`CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=0` in the environment and the
+`--settings` env, and put `--` before the first message. All 6 fail with
+the wiring removed.
+
 `tests/test_state_root_apart.py` (10 tests; part 3 of the same section).
 `_require_state_root_apart` over a planted `/proc/self/mountinfo`: a state
 root bind-mounted from inside the checkout, one holding the checkout, and
@@ -6991,6 +7001,7 @@ sample's probe never counts for the next.
   where the host cannot build a sandbox); a settings prefix below
   leerie's `--settings` cannot unset leerie's shell; settings layers merge
   in the CLI's order; a malformed settings file is logged and left out; a
-  confined worker reads no settings file; the host seam is untouched;
-  `scripts/worker-shell.py` fails closed (126) where it cannot nest, and
+  confined worker reads no settings file; the host seam reads only the
+  operator's user settings (`--setting-sources user`) and gets no shell
+  prefix; `scripts/worker-shell.py` fails closed (126) where it cannot nest, and
   runs a command as `bash` would.
