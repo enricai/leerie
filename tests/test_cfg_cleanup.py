@@ -29,7 +29,7 @@ def _extract_sweep_command() -> str:
     """Pull the `find … cfg-* -mtime +1 -exec rm -rf` sweep line from the
     launcher so the test runs the REAL command, not a copy."""
     src = LAUNCHER.read_text()
-    m = re.search(r"\(\s*find \"\$HOME/\.cache/leerie\".*?cfg-\*.*?-exec rm -rf \{\} \+ 2>/dev/null \)",
+    m = re.search(r"\(\s*find \"\$HOME/\.cache/leerie\".*?cfg-\*.*?-exec rm -rf \{\} \+ \) </dev/null >/dev/null 2>&1",
                   src, re.DOTALL)
     assert m, "could not locate the cfg-* sweep command in the launcher"
     return m.group(0)

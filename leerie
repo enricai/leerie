@@ -71,18 +71,31 @@ while [ -L "$SRC" ]; do
   esac
 done
 LEERIE_REPO="$(cd -P "$(dirname "$SRC")" && pwd)"
-# The checkout the operator started in, recorded by the prologue above
-# before it left for `/`.
-USER_REPO="$LEERIE_LAUNCHER_CWD"
+# Where the operator started leerie, recorded by the prologue above before
+# it left for `/`; and the checkout, the top level of the repository that
+# directory is in (DESIGN §6 *The host never runs a program the checkout
+# chose*, part 1). Nothing scopes a run to a subdirectory: started from one,
+# leerie runs the whole repository, which the container mounts at /work. git
+# is found and started from `/`, pointed at the directory with -C. Outside a
+# work tree the directory itself stands in, for the verbs that need none.
+OPERATOR_DIR="$LEERIE_LAUNCHER_CWD"
+USER_REPO="$(git -C "$OPERATOR_DIR" rev-parse --show-toplevel 2>/dev/null)" \
+  && [ -n "$USER_REPO" ] || USER_REPO="$OPERATOR_DIR"
+# The operator's directory below the top level ("" at the top level): a
+# relative path the container reads from /work is prefixed with it.
+OPERATOR_SUBDIR=""
+case "$OPERATOR_DIR" in
+  "$USER_REPO"/*) OPERATOR_SUBDIR="${OPERATOR_DIR#"$USER_REPO"/}" ;;
+esac
 unset LEERIE_LAUNCHER_CWD LEERIE_LAUNCHER_PID _leerie_self _leerie_bash
 
 # A path the operator gave relative to where they started leerie (a flag, an
-# environment variable, a leerie.toml value) means the same path beneath the
-# checkout, which is no longer the launcher's working directory.
+# environment variable, a leerie.toml value) means the same path beneath
+# that directory, which is no longer the launcher's working directory.
 _from_checkout() {
   case "$1" in
     /*|"") printf '%s' "$1" ;;
-    *)     printf '%s/%s' "$USER_REPO" "$1" ;;
+    *)     printf '%s/%s' "$OPERATOR_DIR" "$1" ;;
   esac
 }
 
@@ -913,6 +926,7 @@ fi
 _cli_state_dir=""
 _prev_was_state_dir=false
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if $_prev_was_state_dir; then
     _cli_state_dir="$arg"
     _prev_was_state_dir=false
@@ -933,11 +947,11 @@ case "$LEERIE_STATE_HOST_DIR" in
   "~")   LEERIE_STATE_HOST_DIR="$HOME" ;;
   "~/"*) LEERIE_STATE_HOST_DIR="$HOME/${LEERIE_STATE_HOST_DIR#"~/"}" ;;
 esac
-# A relative value is relative to where the operator started leerie: the
-# checkout, which is no longer the launcher's working directory.
+# A relative value is relative to where the operator started leerie, which
+# is no longer the launcher's working directory.
 case "$LEERIE_STATE_HOST_DIR" in
   /*) ;;
-  *)  LEERIE_STATE_HOST_DIR="$USER_REPO/$LEERIE_STATE_HOST_DIR" ;;
+  *)  LEERIE_STATE_HOST_DIR="$OPERATOR_DIR/$LEERIE_STATE_HOST_DIR" ;;
 esac
 
 export LEERIE_STATE_HOST_DIR
@@ -967,6 +981,7 @@ export LEERIE_STATE_HOST_DIR
 _cli_log_file=""
 _prev_was_log_file=false
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if $_prev_was_log_file; then
     _cli_log_file="$arg"
     _prev_was_log_file=false
@@ -1005,10 +1020,10 @@ case "$LEERIE_LOG_FILE_RESOLVED" in
   "~")   LEERIE_LOG_FILE_RESOLVED="$HOME" ;;
   "~/"*) LEERIE_LOG_FILE_RESOLVED="$HOME/${LEERIE_LOG_FILE_RESOLVED#"~/"}" ;;
 esac
-# Relative to the checkout, as the state dir above.
+# Relative to where the operator started leerie, as the state dir above.
 case "$LEERIE_LOG_FILE_RESOLVED" in
   /*|"") ;;
-  *)     LEERIE_LOG_FILE_RESOLVED="$USER_REPO/$LEERIE_LOG_FILE_RESOLVED" ;;
+  *)     LEERIE_LOG_FILE_RESOLVED="$OPERATOR_DIR/$LEERIE_LOG_FILE_RESOLVED" ;;
 esac
 
 export LEERIE_LOG_FILE_RESOLVED
@@ -1090,6 +1105,7 @@ _cli_aws_region=""
 _cli_aws_profile=""
 _prev_aws_knob=""
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if [ -n "$_prev_aws_knob" ]; then
     case "$_prev_aws_knob" in
       region)  _cli_aws_region="$arg" ;;
@@ -5074,6 +5090,7 @@ case "${LEERIE_NO_RUNTIME_INSTALL:-}" in
   *)                   NO_RUNTIME_INSTALL=false ;;
 esac
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if [ "$arg" = "--no-runtime-install" ]; then
     NO_RUNTIME_INSTALL=true
   fi
@@ -5088,6 +5105,7 @@ case "${LEERIE_NO_AUTO_PUBLISH:-}" in
   *)                   NO_AUTO_PUBLISH=false ;;
 esac
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if [ "$arg" = "--no-auto-publish" ]; then
     NO_AUTO_PUBLISH=true
   fi
@@ -5109,6 +5127,7 @@ case "${LEERIE_LOCAL_BUILD:-}" in
   *)                   LOCAL_BUILD=false ;;
 esac
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if [ "$arg" = "--local-build" ]; then
     LOCAL_BUILD=true
   fi
@@ -5123,6 +5142,7 @@ done
 NO_RE_SEED=false
 RE_SEED_FORCE=false
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   case "$arg" in
     --no-re-seed) NO_RE_SEED=true ;;
     --force)      RE_SEED_FORCE=true ;;
@@ -5138,6 +5158,7 @@ done
 RESUME_SHELL=false
 RESUME_AUTO_FINALIZE=false
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   case "$arg" in
     --shell)         RESUME_SHELL=true ;;
     --auto-finalize) RESUME_AUTO_FINALIZE=true ;;
@@ -5167,6 +5188,7 @@ if [ "${1:-}" = "resume" ]; then
 fi
 _prev=""
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if [ "$_prev" = "--run-id" ]; then
     LEERIE_RUN_ID="$arg"
   fi
@@ -5206,8 +5228,19 @@ _value_flags=" --run-id --answers --pr-template --pr-base-branch --max-workers \
 --heal-dir --phase --status --report --chain-id \
 --seed-depth --seed-shallow-threshold-mb --group-id --log-file \
 --subtask-tests "
+_task_argi=0
+_after_dd=false
 for arg in "$@"; do
   _argi=$((_argi + 1))
+  # Everything after `--` is positional: the first argument after it is the
+  # task, whatever it starts with.
+  if [ "$_after_dd" = "true" ]; then
+    [ -n "$LEERIE_TASK_ARG" ] || { LEERIE_TASK_ARG="$arg"; _task_argi=$_argi; }
+    break
+  fi
+  if [ "$arg" = "--" ]; then
+    _after_dd=true; continue
+  fi
   # Skip if this arg is the value of a previous value-taking flag.
   if [ -n "$_prev" ]; then
     case "$_value_flags" in
@@ -5231,26 +5264,37 @@ for arg in "$@"; do
   # First non-flag, non-value positional is the task.
   if [ -z "$LEERIE_TASK_ARG" ]; then
     LEERIE_TASK_ARG="$arg"
+    _task_argi=$_argi
   fi
   _prev=""
 done
-export LEERIE_TASK_ARG
+unset _after_dd
 
 # --- fail fast on missing task file ---------------------------------------
 # Matches the eager validation chain already does for prompt files (l.1722).
 # A multi-word sentence is a literal task, never a file path.
+# A relative task file is relative to where the operator started leerie,
+# which is no longer the working directory. The container reads it from
+# /work, the repository's top level, so a relative one is handed on with
+# the operator's directory below the top level prefixed (the REWRITTEN_ARGS
+# pass substitutes it at argument _task_argi).
+_task_arg_for_container=""
 case "$LEERIE_TASK_ARG" in
   *[[:space:]]*) ;;
   *.[Tt][Xx][Tt]|*.[Mm][Dd])
-    # Relative to the checkout, which is no longer the working directory.
     _task_file="$LEERIE_TASK_ARG"
-    [ "${_task_file#/}" != "$_task_file" ] || _task_file="$USER_REPO/$_task_file"
+    [ "${_task_file#/}" != "$_task_file" ] || _task_file="$OPERATOR_DIR/$_task_file"
     if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$_task_file" ]; then
       remote_log "task file not found: $LEERIE_TASK_ARG"
       exit 1
     fi
+    if [ -n "$OPERATOR_SUBDIR" ] && [ "${LEERIE_TASK_ARG#/}" = "$LEERIE_TASK_ARG" ]; then
+      LEERIE_TASK_ARG="$OPERATOR_SUBDIR/$LEERIE_TASK_ARG"
+      _task_arg_for_container="$LEERIE_TASK_ARG"
+    fi
     ;;
 esac
+export LEERIE_TASK_ARG
 
 # --- runtime-mode knob ---------------------------------------------------
 # Resolves RUNTIME=local|fly|ec2. Precedence: CLI --runtime > LEERIE_RUNTIME env
@@ -5287,6 +5331,7 @@ case "${LEERIE_RUNTIME:-}" in
 esac
 # CLI (highest priority) — scanned before REWRITTEN_ARGS loop below.
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   case "$arg" in
     --runtime=local)    RUNTIME=local; _RUNTIME_EXPLICIT=true ;;
     --runtime=fly)      RUNTIME=fly; _RUNTIME_EXPLICIT=true ;;
@@ -5300,6 +5345,7 @@ done
 # Handle the two-argument form --runtime VALUE.
 prev_was_runtime=false
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if $prev_was_runtime; then
     case "$arg" in
       local|fly|ec2) RUNTIME="$arg"; _RUNTIME_EXPLICIT=true ;;
@@ -5378,6 +5424,7 @@ fi
 # When RUNTIME=fly and no value is set, die with a clear message.
 _cli_fly_app=""
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   case "$arg" in
     --fly-app=*) _cli_fly_app="${arg#--fly-app=}" ;;
   esac
@@ -5385,6 +5432,7 @@ done
 # Handle two-argument form: --fly-app NAME
 _prev_was_fly_app=false
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if [ "$_prev_was_fly_app" = "true" ]; then
     _cli_fly_app="$arg"
     _prev_was_fly_app=false
@@ -5422,6 +5470,7 @@ fi
 _cli_fly_disk_gb=""
 _prev_was_fly_disk=false
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if $_prev_was_fly_disk; then
     _cli_fly_disk_gb="$arg"
     _prev_was_fly_disk=false
@@ -5505,6 +5554,7 @@ _cli_seed_depth=""
 _cli_seed_threshold=""
 _prev_seed_arg=""
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if [ -n "$_prev_seed_arg" ]; then
     case "$_prev_seed_arg" in
       depth)     _cli_seed_depth="$arg" ;;
@@ -5563,6 +5613,7 @@ _cli_ec2_subnet_id=""
 _cli_ec2_instance_profile=""
 _prev_ec2_arg=""
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if [ -n "$_prev_ec2_arg" ]; then
     case "$_prev_ec2_arg" in
       ami)             _cli_ec2_ami="$arg" ;;
@@ -5850,6 +5901,7 @@ NO_PUSH=false
 # orchestrator.
 _NO_PUSH_CLI=""
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   case "$arg" in
     --no-push) NO_PUSH=true; _NO_PUSH_CLI=true ;;
     --push) [ "$_NO_PUSH_CLI" = "true" ] || _NO_PUSH_CLI=false ;;
@@ -5974,6 +6026,7 @@ unset _NO_PUSH_CLI _resume_run_id
 # rather than being unconditionally reset.
 NO_VERIFY_PUSH="${NO_VERIFY_PUSH:-false}"
 for arg in "$@"; do
+  [ "$arg" = "--" ] && break   # the rest is positional
   if [ "$arg" = "--no-verify" ]; then
     NO_VERIFY_PUSH=true
   fi
@@ -6932,6 +6985,7 @@ unset _leerie_dockerfile
 # our rewritten CLI flags.
 INSPECT_MOUNTS=()
 REWRITTEN_ARGS=()
+REWRITTEN_TAIL=()
 INSPECT_NAMES=()
 # Parallel to INSPECT_MOUNTS: pairs of "<host-path>\t<remote-target>" used by
 # the remote (Fly) runtime to rsync each inspect dir to /inspect/<basename>
@@ -7047,8 +7101,35 @@ _prev_was_ec2_knob=false
 _prev_was_aws_knob=false
 _prev_was_log_file_rewrite=false
 _rw_argi=0
+_rw_after_dd=false
+_prev_was_answers=false
 for arg in "$@"; do
   _rw_argi=$((_rw_argi + 1))
+  # Everything after `--` is positional and goes to the orchestrator as it
+  # is, after every flag (REWRITTEN_TAIL); a flag the launcher adds below
+  # goes into REWRITTEN_ARGS, so it never lands after `--`.
+  if [ "$_rw_after_dd" = "true" ] || [ "$arg" = "--" ]; then
+    _rw_after_dd=true
+    if [ "$_rw_argi" -eq "$_task_argi" ] && [ -n "$_task_arg_for_container" ]; then
+      arg="$_task_arg_for_container"
+    fi
+    REWRITTEN_TAIL+=("$arg")
+    continue
+  fi
+  # A relative task file or --answers file is read in the container from
+  # /work, the repository's top level, not from where the operator stood.
+  if [ "$_rw_argi" -eq "$_task_argi" ] && [ -n "$_task_arg_for_container" ]; then
+    arg="$_task_arg_for_container"
+  fi
+  if [ "$_prev_was_answers" = "true" ]; then
+    _prev_was_answers=false
+    case "$arg" in
+      /*|"") ;;
+      *) [ -z "$OPERATOR_SUBDIR" ] || arg="$OPERATOR_SUBDIR/$arg" ;;
+    esac
+    REWRITTEN_ARGS+=("$arg")
+    continue
+  fi
   # `resume` and `list` (and any positional run-id after `resume`) flow
   # through untouched — orchestrator/leerie.py pops the bare verb itself,
   # exactly like the launcher's own `case "${1:-}"` dispatch one level up,
@@ -7113,6 +7194,19 @@ for arg in "$@"; do
       ;;
     --chain-id)
       _prev_was_chain_id=true
+      ;;
+    --answers)
+      _prev_was_answers=true
+      REWRITTEN_ARGS+=("$arg")
+      ;;
+    --answers=*)
+      _answers_val="${arg#--answers=}"
+      case "$_answers_val" in
+        /*|"") ;;
+        *) [ -z "$OPERATOR_SUBDIR" ] || _answers_val="$OPERATOR_SUBDIR/$_answers_val" ;;
+      esac
+      REWRITTEN_ARGS+=("--answers=$_answers_val")
+      unset _answers_val
       ;;
     --chain-id=*)
       export LEERIE_CHAIN_ID="${arg#--chain-id=}"
@@ -7375,9 +7469,29 @@ mkdir -p "$HOME/.cache/leerie"
 # deleted out from under itself. The keepalive below (which `touch`es $STAGE
 # hourly for the run's lifetime) is what keeps a live dir's mtime fresh, so
 # `-mtime +1` only ever matches truly-abandoned dirs.
+# Holds none of the launcher's stdio, like the keepalive below.
 ( find "$HOME/.cache/leerie" -maxdepth 1 -type d -name 'cfg-*' -mtime +1 \
-    -exec rm -rf {} + 2>/dev/null ) &
+    -exec rm -rf {} + ) </dev/null >/dev/null 2>&1 &
 
+# The $STAGE keepalive, started below. It holds none of the launcher's
+# stdio, and stopping it stops its `sleep` (DESIGN §6 *Nothing the launcher
+# starts outlives it or keeps its output open*): a `sleep 3600` left holding the launcher's stdout kept a reader of
+# it (`leerie … | tee`, `$(leerie …)`) waiting up to an hour after the
+# launcher exited. The `sleep` is a background child the subshell `wait`s
+# for, because a trap interrupts `wait` but not a foreground command; and
+# the loop ends once the launcher is gone, so a SIGKILLed launcher leaves it
+# for one interval at most.
+_stage_keepalive() {
+  local _launcher=$1 _sleep=""
+  trap '[ -z "$_sleep" ] || kill "$_sleep" 2>/dev/null; exit 0' TERM
+  while kill -0 "$_launcher" 2>/dev/null; do
+    touch "$STAGE" 2>/dev/null || exit 0
+    sleep 3600 &
+    _sleep=$!
+    wait "$_sleep" || true
+    _sleep=""
+  done
+}
 STAGE="$(mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX")"
 # Keepalive: touch $STAGE hourly so a live-but-long-running dir never looks
 # stale to the sweep above (see the -mtime note). Backgrounded; killed by the
@@ -7386,7 +7500,7 @@ STAGE="$(mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX")"
 # mtime stays comfortably fresh even across an auto-resume re-exec (each re-exec
 # is a fresh launcher-less orchestrator process, but the container — and this
 # host-side keepalive — persist for the run's lifetime).
-( while :; do touch "$STAGE" 2>/dev/null || exit 0; sleep 3600; done ) &
+( _stage_keepalive "$$" ) </dev/null >/dev/null 2>&1 &
 _stage_keepalive_pid=$!
 # Register STAGE removal + keepalive kill immediately — BEFORE the ~250 lines of
 # stage assembly below (which includes an `exit 1` on bad config) and before the
@@ -8433,7 +8547,7 @@ EARLY_PROBE_PY
         _launch_argv_json="$(python3 -I -c '
 import json, sys
 print(json.dumps(sys.argv[1:]))
-' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}")"
+' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}" ${REWRITTEN_TAIL[@]+"${REWRITTEN_TAIL[@]}"})"
         # Derive the host's IANA timezone so we can bake it into
         # child_env["TZ"] inside the heredoc below. `readlink` of
         # /etc/localtime works on both macOS (/var/db/timezone/...)
@@ -8887,7 +9001,7 @@ EARLY_PROBE_PY
           _ec2_launch_argv_json="$(python3 -I -c '
 import json, sys
 print(json.dumps(sys.argv[1:]))
-' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}")"
+' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}" ${REWRITTEN_TAIL[@]+"${REWRITTEN_TAIL[@]}"})"
           _ec2_host_tz="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
           # JSON-encode before substitution -- same discipline as the Fly
           # launch heredoc above (leerie:6695-6710): an opaque token is
@@ -9270,9 +9384,33 @@ else
   # Every step tolerates failure (`|| true`): under `set -e` a failing
   # command ends the trap, so a keepalive that had already exited — `kill`
   # returning 1 — skipped the bring-back and the clean-up after it.
+  # The container client never runs in the foreground (DESIGN §6 *container
+  # boundary's hidden precondition*, mechanism 2): bash runs a trap only
+  # once the foreground command returns, so a TERM sent to the launcher
+  # waited for the whole run. Each form below starts it in the background,
+  # with `<&0` (an asynchronous command otherwise gets /dev/null as stdin,
+  # and -it and --clarify need the terminal), and `_wait_run` waits for it;
+  # a signal interrupts that `wait` and its trap runs at once.
+  _run_pid=""
+  _wait_run() {
+    wait "$_run_pid" || container_rc=$?
+    _run_pid=""
+  }
+  # From the INT/TERM traps: kill the container, and stop and wait for its
+  # client, so the client neither outlives the launcher nor leaves behind a
+  # container it creates after the cidfile was read.
+  _stop_run() {
+    _kill_container_from_cidfile || true
+    if [ -n "${_run_pid:-}" ]; then
+      [ -s "${_cidfile:-}" ] || kill -TERM "$_run_pid" 2>/dev/null || true
+      wait "$_run_pid" 2>/dev/null || true
+      _run_pid=""
+      _kill_container_from_cidfile || true
+    fi
+  }
   trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _apply_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
-  trap '_reap_tail; _kill_container_from_cidfile; exit 130' INT
-  trap '_reap_tail; _kill_container_from_cidfile; exit 143' TERM
+  trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 130' INT
+  trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 143' TERM
 
   # Forward orchestrator-side LEERIE_* env overrides into the container.
   # The orchestrator's resolve_* functions read os.environ *inside* the
@@ -9388,6 +9526,7 @@ else
     ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"}
     -w /work
     "${REPO_IMAGE_TAG:-$IMAGE_TAG}" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}
+    ${REWRITTEN_TAIL[@]+"${REWRITTEN_TAIL[@]}"}
   )
   if [ -n "$_run_log" ]; then
     # Decoupled: nerdctl → run-log file; a tail WE own streams the file to our
@@ -9395,14 +9534,18 @@ else
     # When a --log-file target is writable, tee that same stream into it —
     # no enclosing subshell, so $! names the pipeline's last process (tee
     # when teeing, tail otherwise, matching the pre-teeing behavior exactly).
+    # The client starts first, so the tail pipeline stays the current job
+    # `_reap_tail` reads (`jobs -l %%`); `tail -n +1` loses nothing to that.
     _tail_writer_pid=""
+    nerdctl run "${_run_argv[@]}" >"$_run_log" 2>&1 <&0 &
+    _run_pid=$!
     if [ -n "$_log_tee_target" ]; then
       tail -n +1 -f "$_run_log" 2>/dev/null | tee -a "$_log_tee_target" &
     else
       tail -n +1 -f "$_run_log" 2>/dev/null &
     fi
     _tail_pid=$!
-    nerdctl run "${_run_argv[@]}" >"$_run_log" 2>&1 || container_rc=$?
+    _wait_run
     # Stop the tail and flush any trailing bytes it hasn't printed yet.
     _reap_tail
   elif [ -n "$_log_tee_target" ] && command -v script >/dev/null 2>&1; then
@@ -9438,7 +9581,9 @@ else
       done
       printf -v _darwin_rc_file_q '%q' "$_darwin_rc_file"
       script -q -a "$_log_tee_target" /bin/sh -c \
-        "$_nerdctl_run_quoted; echo \$? > $_darwin_rc_file_q"
+        "$_nerdctl_run_quoted; echo \$? > $_darwin_rc_file_q" <&0 &
+      _run_pid=$!
+      _wait_run
       _darwin_rc_read="$(cat "$_darwin_rc_file" 2>/dev/null)"
       case "$_darwin_rc_read" in
         ''|*[!0-9]*)
@@ -9461,14 +9606,17 @@ else
         printf -v _rarg_q '%q' "$_rarg"
         _nerdctl_run_quoted="$_nerdctl_run_quoted $_rarg_q"
       done
-      script -qe -c "$_nerdctl_run_quoted" -a "$_log_tee_target" \
-        || container_rc=$?
+      script -qe -c "$_nerdctl_run_quoted" -a "$_log_tee_target" <&0 &
+      _run_pid=$!
+      _wait_run
       unset _nerdctl_run_quoted _rarg _rarg_q
     fi
   else
     # Interactive/-it (or run-log uncreatable), no --log-file target or no
     # `script`(1) available: nerdctl inherits stdout directly, unchanged.
-    nerdctl run "${_run_argv[@]}" || container_rc=$?
+    nerdctl run "${_run_argv[@]}" <&0 &
+    _run_pid=$!
+    _wait_run
   fi
 fi
 

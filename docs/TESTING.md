@@ -5587,6 +5587,57 @@ usage, and a PATH with no `python3` yields one error line and exit 1 rather
 than a fall-through to the run path. Six of the eight tests fail against the
 pre-change launcher.
 
+## Launcher end to end against a stub `nerdctl`: keepalive, signals, `--`, top level
+
+`tests/launcher_stub_run.py` runs the real launcher with a stub `nerdctl`
+(shell builtins and absolute paths only) whose `run` records its argv and
+"runs the container" as a `sleep` that `kill` ends. Every process a launch
+starts carries a unique `LEERIE_TEST_MARK`, and each test kills whatever
+still carries it in `finally`. The world, not the host, decides the
+launcher's AppArmor gate: a stub `cat` answers the three files the probes
+read (the LSM list, the loaded profiles' names, the installed profile; their
+paths read from `scripts/runtime-install.sh`) from the world, and passes
+every other `cat` to the real one. `make_world(apparmor=)` is `current`
+(the default), `none` or `stale`.
+
+- `tests/test_launcher_stage_keepalive.py` (review round 26 M1): with stdout
+  on a pipe, the reader gets EOF within 15 s of the launcher's exit and no
+  marked process is left. The keepalive as shipped, sent TERM, takes its
+  `sleep` with it.
+- `tests/test_launcher_signal_stops_run.py` (review round 27 O1): TERM and
+  INT to the launcher during a 300 s container exit 143 / 130 within 20 s,
+  after `nerdctl kill`, with the client gone and the cidfile removed.
+- `tests/test_launcher_double_dash.py` (review round 27 O3): `--no-push --
+  <task>` for `-task`, `--no-push` and `--state-dir` hands the container
+  every flag before `--` and `-- <task>` last. `-- --no-push` is a task, not
+  a push opt-out. A source rule requires every top-level `for arg in "$@"`
+  scan to handle `--`.
+- `tests/test_launcher_repo_top_level.py` (review round 27 O4): from
+  `<repo>/sub`, `/work` is the top level, `USER_REPO` its name, and the
+  default state dir is keyed and owned by it. A relative task file and
+  `--answers` under `sub/` reach the container as `sub/...`, and a task file
+  only at the top level is not found from `sub/`. At the top level nothing
+  is rewritten.
+
+Twelve of these fourteen tests fail against the previous launcher, each on
+its own defect (output is written to a file, not a pipe, so the keepalive's
+orphan cannot time out the others). The two that pass on both are controls:
+the missing task file from `sub/`, and nothing rewritten at the top level.
+
+`tests/test_launcher_stub_run_apparmor.py` (4 tests) drives each world state
+through the real launcher and its real probes: `current` hands `nerdctl run`
+`seccomp=unconfined` and `apparmor=leerie-container`, `none` only the
+first, `stale` stops with "not loaded (or is stale)" before `nerdctl run`,
+and an unknown state is refused. Before the stub, every test running the
+launcher through this harness read the host's securityfs and
+`/etc/apparmor.d/`, and passed only where the loaded profile was this
+checkout's. Measured 2026-11-03 on a host whose loaded profile was older:
+13 of the harness's 16 tests (the four files above and the relay test in
+`tests/test_terminal_text.py`) failed, every one that reaches the gate.
+With the stub's call removed, 3 of the 4 fail on that host (`current`,
+`none`, the refusal); the states disagree, so on any host at least two
+fail.
+
 ## Launcher `list` / `--report` host path and bash 3.2 parse
 
 `tests/test_launcher_readonly_host_path.py` runs the real launcher against a

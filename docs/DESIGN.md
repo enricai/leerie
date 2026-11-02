@@ -2667,9 +2667,18 @@ nobody has merged. The invariant is constructed in five parts.
    exec, so a marker holding that PID tells the second pass it is done.
    From there every program the launcher and its sourced scripts start
    (`python3`, `git`, `gh`, `jq`, `nerdctl`, `flyctl`, `aws`, `ssh-agent`,
-   `ssh-add`) is found and started from `/`. A path the operator gave
-   relative to where they started (a flag, `LEERIE_STATE_DIR`,
-   `LEERIE_LOG_FILE`) is anchored at the recorded checkout. Leaving the
+   `ssh-add`) is found and started from `/`. The checkout is the top
+   level of the repository the operator stands in
+   (`git -C <where they stood> rev-parse --show-toplevel`). Nothing
+   scopes a run to a subdirectory: started from one, leerie still runs
+   the whole repository, mounts its top level at `/work`, and keys its
+   state directory by the top level's name. Before this, a run from a
+   subdirectory mounted only that subdirectory, which has no `.git`
+   (review round 27 O4). A path the operator gave relative to where they
+   started (a flag, `LEERIE_STATE_DIR`, `LEERIE_LOG_FILE`, a task file) is
+   anchored at that directory, not at the top level. A path the container
+   reads (a task file, `--answers`) is handed to it relative to the top
+   level, which is the container's working directory. Leaving the
    checkout must not change what any host command means, so nothing on
    the host takes the checkout from its working directory any more: a
    recorded checkout that is empty (a deleted directory) stops the
@@ -6588,6 +6597,15 @@ killed by hand. Three mechanisms close this gap, defense in depth:
    SIGKILL deliver an uncatchable signal, so the trap never runs in
    exactly the OOM case above — it complements the reaper, not
    substitutes for it.
+   The trap must also run *promptly*. bash runs a trap only between
+   commands, so while `nerdctl run` ran in the foreground a TERM sent to
+   the launcher waited for the whole run: the run finished, and the
+   launcher exited 143 about six minutes later (review round 27 O1). A
+   signal does interrupt the `wait` builtin. So the launcher starts the
+   container client in the background, with its standard input given to
+   it explicitly, and `wait`s for it. INT or TERM then reaches the trap at
+   once. The trap kills the container, waits for the client to exit, and
+   exits 130 or 143. The EXIT trap still brings the run's branch back.
 3. **Stale-container reaper (recovery).** Before spawning on the local
    `resume` path, the launcher checks for an already-`Up` container for
    this run whose owning launcher PID is dead (via a `leerie.launcher_pid`
@@ -6637,6 +6655,19 @@ mux, so a stuck master can no longer wedge the pipeline. Gated to the
 piped (`-i`, non-TTY-stdout) case; the interactive `-it` path has a real
 pty and thus no hang. The stale-container reaper above remains the
 backstop for the uncatchable SIGKILL case.
+
+**Nothing the launcher starts outlives it or keeps its output open.** A
+reader of the launcher's output (`leerie … | tee`, `$(leerie …)`, a CI
+log capture) gets end-of-file only when every process holding the write
+end has exited. The `$STAGE` keepalive's `sleep 3600` inherited the
+launcher's stdout and stderr. The EXIT trap killed the keepalive's shell,
+but not the `sleep` that shell was running, so the `sleep` held the pipe
+for up to an hour after the launcher had exited (review round 26 M1). So a
+helper the launcher leaves in the background holds none of the
+launcher's stdio, and stopping it stops its children. The keepalive
+`wait`s for its `sleep` and kills it on TERM. It also ends by itself once
+the launcher is gone, which bounds the case where no trap ran (SIGKILL)
+to one interval.
 
 **Worker subtree termination — Memory containment via cgroup v2.** The
 kernel reap above handles *process lifecycle*, not memory: when a worker's

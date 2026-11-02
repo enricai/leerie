@@ -447,6 +447,7 @@ def test_ctrl_c_still_brings_the_branch_back(run, tmp_path):
               # `set -e` that must not end the trap before the bring-back.
               "_stage_keepalive_pid=999999\n"
               "_reap_tail() { :; }\n_kill_container_from_cidfile() { :; }\n"
+              "_stop_run() { :; }\n"
               + _functions_block() + "\n".join(traps) + "\n"
               f'touch "{ready}"\nsleep 30\necho NOT-INTERRUPTED\n')
     proc = subprocess.Popen(

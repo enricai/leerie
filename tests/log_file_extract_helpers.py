@@ -47,11 +47,20 @@ def extract_reap_tail() -> str:
     return _extract("  _reap_tail() {\n", "  }\n")
 
 
+def extract_wait_run() -> str:
+    """`_run_pid` and `_wait_run`, which every invocation form calls: the
+    client runs in the background so a signal reaches the launcher's trap
+    at once (DESIGN §6 *container boundary's hidden precondition*)."""
+    return _extract('  _run_pid=""\n  _wait_run() {\n', "  }\n")
+
+
 def extract_invocation() -> str:
     """The full `if [ -n "$_run_log" ]; then ... fi` block: the piped
     tail/tee branch, the `script`-wrapped interactive/-it branch
-    (bugfix-005), and the unwrapped fallback."""
-    return _extract(
+    (bugfix-005), and the unwrapped fallback — preceded by the
+    `_wait_run` they call."""
+    return extract_wait_run() + _extract(
         '  if [ -n "$_run_log" ]; then\n    # Decoupled: nerdctl',
-        '    nerdctl run "${_run_argv[@]}" || container_rc=$?\n  fi\n',
+        '    nerdctl run "${_run_argv[@]}" <&0 &\n    _run_pid=$!\n'
+        '    _wait_run\n  fi\n',
     )

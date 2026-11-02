@@ -1,5 +1,5 @@
 """Adversarial wall-clock-bound regression test for the bare fallback exit
-path (leerie:8887-8890): `nerdctl run "${_run_argv[@]}" || container_rc=$?`
+path: `nerdctl run "${_run_argv[@]}" <&0 &` then `_wait_run`
 with stdout inherited directly, no decoupling of any kind.
 
 Neither tests/test_log_file_wiring.py nor tests/test_log_file_persistence.py
@@ -33,7 +33,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _INVOCATION = _extract_invocation()
 assert "nerdctl run" in _INVOCATION
-assert 'nerdctl run "${_run_argv[@]}" || container_rc=$?\n  fi' in _INVOCATION
+assert ('nerdctl run "${_run_argv[@]}" <&0 &\n    _run_pid=$!\n'
+        '    _wait_run\n  fi') in _INVOCATION
 
 # A tiny fixed lifetime for the adversarial stdout holder -- long enough to
 # prove the launcher isn't adding its own extra delay on top, short enough
