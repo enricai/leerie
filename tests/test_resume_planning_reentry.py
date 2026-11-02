@@ -67,7 +67,6 @@ def _args(**overrides) -> SimpleNamespace:
         skip_smoke=True,
         no_push=False,
         pr_template=None,
-        host_no_push=None,
         pr_base_branch=None,
         group_id=None,
         inspect_dirs=[],

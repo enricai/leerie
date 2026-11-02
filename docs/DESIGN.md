@@ -4621,6 +4621,12 @@ The mechanism:
   (*Which run the container ran*), and `host_finalize` still refuses to
   push a run whose `run.json` records `no_push`, so a pick that changed in
   between never pushes either.
+- On a remote runtime the launcher passes the remote orchestrator only
+  what the resume's command line says about pushing. The orchestrator on
+  the machine continues the run's record, and the fetch brings
+  `run.json.no_push` home to `host_finalize` (*Finalization*, *One push
+  choice per run, on every runtime*). The host holds no copy of the
+  choice to get wrong before the fetch.
 
 ### Never a repository-global git operation
 
@@ -5227,18 +5233,37 @@ bind-mounted and the branch is already in the user's repo — and calls
 interrupted-but-complete run is finalizable while a crashed-mid-wave one
 is not.
 
-**`no_push`: intent vs mechanism.** The orchestrator inside the Machine is
-*always* invoked with `--no-push` because the Fly Machine has no GitHub
-auth — a **mechanism flag**, not the user's preference. The user's actual
-launch-time intent lives separately in `fly-machine.json.host_no_push` on
-the host (set by `provision.sh` at machine creation) and is propagated
-into the Machine via a hidden `--host-no-push true|false` argv flag. The
-orchestrator gates `pr_writer` and the `run.json.no_push` it writes on
-**intent** (`push_will_happen(no_push, host_no_push)`), not the mechanism
-flag, and `host_finalize` reads that intent value to decide whether to
-skip push. This split is load-bearing: without it, `pr_writer` never runs
-on Fly and the LLM-written PR body is replaced by the deterministic
-fallback.
+**One push choice per run, on every runtime.** A run has one record of
+whether its result is pushed: `state.json.no_push`, a sticky run choice
+(*A resumed run continues under the choices it was started with*). The
+launcher resolves the choice on the host — `--no-push`, then `--push`, then
+`LEERIE_NO_PUSH`, then `no_push` in `leerie.toml` — and on a fresh run hands
+it to the orchestrator as `--no-push`, the same way on the local, Fly and
+EC2 runtimes, because neither the container nor a remote machine sees the
+host's environment. The orchestrator records it at the run's start, a
+resume continues it by the one rule every sticky choice follows, and
+`main()` writes it to `run.json.no_push` on every invocation. `pr_writer`
+runs exactly when the run will be pushed. `host_finalize` reads
+`run.json.no_push` unchanged on every runtime: on a remote runtime the
+fetch brings that file home before the host finalizes, and nothing on the
+way rewrites it.
+
+This replaced a split that lost the choice on Fly and EC2. The in-machine
+orchestrator was always started with `--no-push` as a "mechanism flag"
+because the machine has no GitHub credentials, and the user's intent
+travelled beside it as a per-invocation `--host-no-push`, re-derived by
+each launcher invocation and seeded into `fly-machine.json` (EC2 recorded
+none). The orchestrator never pushes on any runtime, so the mechanism flag
+guarded nothing; it only made `run.json.no_push` ambiguous. Every host-side
+reader then guessed which meaning it held and stripped a `true`: the fetch
+on both runtimes whenever a run branch came home, `leerie finalize`, and
+`finalize --force`. Measured on the real code with stubbed `flyctl`: a
+fresh `leerie --runtime fly --no-push` run was pushed by the auto-finalize,
+and a plain `leerie resume <id>` of a paused Fly `--no-push` run passed
+`--host-no-push false` and was pushed. The root cause was two owners of one
+choice, one of them per-invocation. The invariant now: **the push choice is
+recorded once, at the run's start, by the orchestrator; every host-side
+finalize reads that record and nothing rewrites it.**
 
 The run branch is pushed to `origin` and a pull request opened via `gh pr
 create` against the working branch (HEAD-at-run-start) by default. **This

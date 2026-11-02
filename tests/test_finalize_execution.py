@@ -682,29 +682,6 @@ def test_phase_finalize_pushes_and_composes_pr(leerie, monkeypatch, st):
     assert run_json["no_verify"] is True
 
 
-def test_phase_finalize_host_no_push_overrides_intent_on_fly(
-        leerie, monkeypatch, st):
-    """On the Fly runtime `no_push` is a mechanism flag; `host_no_push`
-    carries the user's actual intent and must win."""
-    _finalize_ready_state(st)
-
-    compose_calls = []
-
-    async def _fake_compose(*a, **k):
-        compose_calls.append(1)
-
-    monkeypatch.setattr(leerie, "_compose_pr_via_llm", _fake_compose)
-
-    asyncio.run(leerie.phase_finalize(
-        st.leerie_root, st, no_push=True, no_verify=False,
-        caps=_caps(leerie), models={}, efforts={},
-        host_no_push=False))
-
-    assert compose_calls == [1]
-    run_json = json.loads((st.run_dir / "run.json").read_text())
-    assert run_json["no_push"] is False
-
-
 def test_phase_finalize_dies_when_finalize_sh_fails(leerie, monkeypatch, st):
     _finalize_ready_state(st)
 

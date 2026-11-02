@@ -3902,63 +3902,13 @@ except Exception:
       [ "$_a" = "--no-push" ] && _FINALIZE_NO_PUSH=true
     done
     export NO_VERIFY_PUSH
-    # IMPORTANT: the launcher passes --no-push to the in-Fly orchestrator
-    # because the Fly machine cannot push (no GitHub SSH key on the
-    # machine by design). That writes no_push=true to run.json on the
-    # machine, which fetch_branch copies to the host. The user's actual
-    # intent is recorded host-side in the run dir's fly-machine.json
-    # (host_no_push field, set at launch time). On finalize:
-    #   - if --no-push is on the finalize CLI, skip push (user
-    #     explicitly opted out at finalize time).
-    #   - else, if host_no_push=true was recorded at launch, skip push
-    #     (user opted out at launch).
-    #   - else, clear the in-Fly orchestrator's no_push=true so the
-    #     host pushes. The orchestrator's no_push was a mechanism flag,
-    #     not a user-intent flag.
-    if [ "$_FINALIZE_NO_PUSH" = "false" ]; then
-      _host_intent=""
-      if [ -f "$_fin_run_dir/fly-machine.json" ]; then
-          _host_intent="$(python3 -c '
-import json, sys
-try:
-    data = json.load(open(sys.argv[1]))
-    print("true" if data.get("host_no_push") else "false")
-except Exception:
-    print("")
-' "$_fin_run_dir/fly-machine.json" 2>/dev/null || true)"
-      fi
-      if [ "$_host_intent" = "true" ]; then
-        remote_log "finalize: host_no_push was set at launch — skipping push"
-        _FINALIZE_NO_PUSH=true
-      fi
-      # Clear the in-Fly orchestrator's mechanism-flag no_push so
-      # host_finalize doesn't conflate it with user intent.
-      #
-      # Conditional on a run branch being present locally: when no
-      # branch was materialized (the cleared-but-empty terminal-state
-      # case — DESIGN §8), `_finish_no_work_run` deliberately writes
-      # no_push=true as **intent** ("nothing to push — no branch
-      # exists"). Stripping it here would disarm host_finalize's
-      # no_push gate and cause it to attempt git push on a
-      # non-existent branch.
-      if [ "$_FINALIZE_NO_PUSH" = "false" ]; then
-        _fetched_run_json="$_fetched_run_dir/run.json"
-        _fetched_run_branch="$(_json_get "$_fetched_run_json" "branch" 2>/dev/null || true)"
-        if [ -f "$_fetched_run_json" ] && [ -n "$_fetched_run_branch" ] && \
-           git -C "$USER_REPO" rev-parse --verify "refs/heads/$_fetched_run_branch" >/dev/null 2>&1; then
-          python3 - "$_fetched_run_json" <<'PY'
-import json, os, sys
-path = sys.argv[1]
-data = json.load(open(path))
-if data.get("no_push") is True:
-    data.pop("no_push", None)
-    tmp = path + ".tmp"
-    json.dump(data, open(tmp, "w"), indent=2)
-    open(tmp, "a").write("\n")
-    os.replace(tmp, path)
-PY
-        fi
-      fi
+    # The push follows the run's run.json.no_push, recorded at the run's
+    # start and brought home unchanged (DESIGN §6 *One push choice per run,
+    # on every runtime*). --no-push on this command line finalizes without
+    # pushing, on every runtime.
+    if [ "$_FINALIZE_NO_PUSH" = "true" ]; then
+      remote_log "finalize: --no-push given; skipping push + PR"
+      exit 0
     fi
     # shellcheck disable=SC1091
     . "$LEERIE_REPO/scripts/host-finalize.sh"
@@ -5120,7 +5070,7 @@ _value_flags=" --run-id --answers --pr-template --pr-base-branch --max-workers \
 --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --judge-dir \
---heal-dir --phase --host-no-push --status --report --chain-id \
+--heal-dir --phase --status --report --chain-id \
 --seed-depth --seed-shallow-threshold-mb --group-id --log-file \
 --subtask-tests "
 for arg in "$@"; do
@@ -5773,12 +5723,10 @@ case "${LEERIE_NO_PUSH:-}" in
   1|true|TRUE|yes|YES) NO_PUSH=true ;;
 esac
 # Match the orchestrator's resolve_no_push order: CLI → env → leerie.toml.
-# The launcher and the in-Fly orchestrator are now both authoritative
-# consumers of this intent — the launcher seeds fly-machine.json.
-# host_no_push and the --host-no-push argv flag, the orchestrator gates
-# pr_writer and writes run.json.no_push. Disagreement on a TOML-only
-# opt-out would make the Fly auto-finalize path push against user
-# intent. Pattern mirrors orchestrator/leerie.py:2279 `_read_toml_key`
+# A fresh run hands this choice to the orchestrator as --no-push (below,
+# after the argv rewrite), which records it; the launcher's own host-side
+# checks read it too, so the two must agree on a TOML-only opt-out.
+# Pattern mirrors orchestrator/leerie.py:2279 `_read_toml_key`
 # (flat `key = value` grep) — keeps the launcher free of a tomllib
 # dependency that would force a host-side Python 3.11+ bump.
 if [ "$NO_PUSH" = "false" ] && [ -f "$USER_REPO/leerie.toml" ]; then
@@ -7162,6 +7110,17 @@ if [ "$_SKIP_REPO_MAP" = "true" ]; then
 fi
 unset _SKIP_REPO_MAP
 
+# The run's push choice, recorded once at its start (DESIGN §6 *One push
+# choice per run, on every runtime*). A fresh run hands the launcher's
+# resolved NO_PUSH to the orchestrator as --no-push on every runtime:
+# neither the container nor a remote machine sees LEERIE_NO_PUSH, and a
+# remote machine may not see an untracked leerie.toml. A resume adds
+# nothing: the orchestrator continues its record, and only this command
+# line's own --no-push / --push (already in REWRITTEN_ARGS) override it.
+if [ "$IS_RESUME" = "false" ] && [ "$NO_PUSH" = "true" ]; then
+  REWRITTEN_ARGS+=("--no-push")
+fi
+
 # --- assemble auth/config mounts ----------------------------------------
 # Per-container config isolation. The shared host ~/.claude.json is a
 # documented corruption race (anthropics/claude-code issues #28847,
@@ -7975,20 +7934,6 @@ if [ "$RUNTIME" = "fly" ]; then
   # run_id = machine_id: set AFTER provision_machine succeeds (see below).
   # For resume, LEERIE_RUN_ID is already set from --run-id.
 
-  # Communicate the host's launch-time push intent to the in-Fly
-  # orchestrator (DESIGN §6 *Finalization*, intent vs mechanism). The
-  # orchestrator-side --no-push the in-Machine launcher injects is the
-  # mechanism flag (Fly can't reach origin); --host-no-push is the
-  # user's intent. The orchestrator gates pr_writer + the
-  # run.json.no_push it writes on intent, not mechanism. Local-runtime
-  # nerdctl invocation does NOT pass this — host_no_push stays None
-  # there and push_will_happen() falls back to (not no_push).
-  if [ "$NO_PUSH" = "true" ]; then
-    REWRITTEN_ARGS+=("--host-no-push" "true")
-  else
-    REWRITTEN_ARGS+=("--host-no-push" "false")
-  fi
-
   # Set LEERIE_FLY_IMAGE to the per-repo derived tag when .leerie/Dockerfile
   # is present; also records context for ensure_image(). No-op otherwise.
   _set_fly_per_repo_image
@@ -8605,15 +8550,6 @@ elif [ "$RUNTIME" = "ec2" ]; then
   # branch's identical default a few dozen lines up.
   export LEERIE_REMOTE_EXIT_RC=130
 
-  # Communicate the host's launch-time push intent to the in-instance
-  # orchestrator, exactly like the Fly branch above (DESIGN §6
-  # *Finalization*: EC2 instances receive no GitHub credentials either).
-  if [ "$NO_PUSH" = "true" ]; then
-    REWRITTEN_ARGS+=("--host-no-push" "true")
-  else
-    REWRITTEN_ARGS+=("--host-no-push" "false")
-  fi
-
   EC2_PROVISION_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-provision.sh"
   EC2_RESUME_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
   EC2_SEED_AUTH_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-seed-auth.sh"
@@ -9193,8 +9129,8 @@ else
   #   - LEERIE_HOST_DIR: the host path of the host-wide dir; remapped
   #     explicitly below (-e LEERIE_HOST_DIR=/leerie-host).
   #   - Fly/EC2/remote/chain/wave machinery: consumed launcher-side only.
-  #   - LEERIE_NO_PUSH: the orchestrator is always invoked with --no-push and
-  #     the host does the push; forwarding it would be redundant/confusing.
+  #   - LEERIE_NO_PUSH: resolved by the launcher, which hands a fresh run
+  #     --no-push; the run's record of the choice is the orchestrator's.
   #   - LEERIE_SKIP_PREPUSH_PREFLIGHT: gates a probe that runs on the host
   #     before the container starts; nothing inside reads it.
   _leerie_env_denylist=" \

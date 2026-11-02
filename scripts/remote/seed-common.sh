@@ -229,7 +229,7 @@ except Exception as e:
     sys.stderr.write("cgroup broker did not start: " + repr(e) + "\\n")
 with open(log_path, "ab") as log_f:
     p = subprocess.Popen(
-        ["python3", "/opt/leerie-image/orchestrator/leerie.py", "--no-push", *orch_args],
+        ["python3", "/opt/leerie-image/orchestrator/leerie.py", *orch_args],
         stdin=subprocess.DEVNULL,
         stdout=log_f,
         stderr=log_f,

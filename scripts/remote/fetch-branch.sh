@@ -176,7 +176,7 @@ print(best[3])
   # indices aligned with the python emitter above; not read here
   working_branch="$(printf '%s' "$discover_output" | sed -n '3p')"
   # shellcheck disable=SC2034  # deliberately NOT consumed — see
-  # the 'CANNOT trust run.json.no_push as a proxy' note below
+  # the 'run.json.no_push is no proxy' note below
   run_no_push="$(printf '%s' "$discover_output" | sed -n '4p')"
 
   if [ -z "$run_id" ] || [ -z "$run_branch" ]; then
@@ -197,10 +197,8 @@ print(best[3])
   #   (b) some other early-failure / placeholder case.
   # In both, skip the bundle step.
   #
-  # We CANNOT trust run.json.no_push as a proxy: the in-Fly launcher
-  # always passes --no-push to the orchestrator (the machine can't
-  # push) so no_push=true is a mechanism flag, not a "no branch was
-  # materialized" signal.
+  # run.json.no_push is no proxy for "no branch was materialized": a
+  # --no-push run has a branch too.
   local _branch_present="false"
   # Every branch of the run lives in the run's own repository on the
   # machine (DESIGN §6 *The run's own repository*), never in /work's.
@@ -342,42 +340,11 @@ print(best[3])
 
   remote_log "remote: run state directory fetched to $host_leerie_runs/$run_id"
 
-  # DEFENSE-IN-DEPTH: strip a stray mechanism-flag no_push=true from
-  # the host-side run.json **only when a run branch was actually
-  # fetched**. The in-Fly orchestrator gets --no-push (because the Fly
-  # Machine has no GitHub auth) AND --host-no-push carrying the user's
-  # actual launch-time intent; phase_finalize writes **intent**
-  # (`not push_will_happen(...)`) to run.json.no_push, so this stripper
-  # is a no-op for orchestrators built against the intent-vs-mechanism
-  # split. It is retained as defense against in-flight runs started
-  # against an older image where the orchestrator still wrote the
-  # mechanism flag and a branch *did* materialize.
-  #
-  # Conditional on $_branch_present: when no branch was fetched (the
-  # cleared-but-empty terminal-state case — DESIGN §8), the orchestrator's
-  # `_finish_no_work_run` deliberately writes `no_push=true` as **intent**
-  # ("nothing to push — no branch exists"). Stripping it here would
-  # disarm host_finalize's no_push gate and cause it to attempt
-  # `git push` on a non-existent branch.
-  if [ "$_branch_present" = "true" ]; then
-    local _host_run_json="$host_leerie_runs/$run_id/run.json"
-    if [ -f "$_host_run_json" ]; then
-      python3 - "$_host_run_json" <<'PY' || true
-import json, os, sys
-path = sys.argv[1]
-try:
-    data = json.load(open(path))
-except Exception:
-    sys.exit(0)
-if data.get("no_push") is True:
-    data.pop("no_push", None)
-    tmp = path + ".tmp"
-    json.dump(data, open(tmp, "w"), indent=2)
-    open(tmp, "a").write("\n")
-    os.replace(tmp, path)
-PY
-    fi
-  fi
+  # run.json arrives unchanged: its no_push is the run's one push choice,
+  # recorded by the orchestrator at the run's start, and host_finalize reads
+  # it as written — a --no-push run's true, and the true _finish_no_work_run
+  # writes for a run with no branch, alike (DESIGN §6 *One push choice per
+  # run, on every runtime*).
 
   # --- Step 4: apply the captured deps; stream .leerie/Dockerfile back (best-effort) ----
   # The dep_capture worker records its capture in the run directory, which

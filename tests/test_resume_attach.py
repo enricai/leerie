@@ -142,7 +142,6 @@ def _write_record(state_dir: Path, launcher_pid: int, run_id: str,
         "started_at": "2026-06-06T00:00:00+00:00",
         "run_id": run_id,
         "launcher_pid": launcher_pid,
-        "host_no_push": False,
     }))
     return record
 

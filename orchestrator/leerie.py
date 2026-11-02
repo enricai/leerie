@@ -9234,33 +9234,6 @@ def resolve_no_push(repo_root: Path, cli_value: bool) -> bool:
         env_var=NO_PUSH_ENV, file_key="no_push", file_name=NO_PUSH_FILE)
 
 
-def push_will_happen(no_push: bool, host_no_push: bool | None) -> bool:
-    """Whether the host will push after this orchestrator exits.
-
-    DESIGN §6 *Finalization*: `--no-push` on the orchestrator's argv is
-    a **mechanism flag** on Fly (the Machine has no GitHub auth and
-    cannot push regardless of user preference); the launcher always
-    passes it on the remote path. The user's actual launch-time intent
-    is a separate signal, propagated via `--host-no-push true|false`
-    (None when unset = local runtime).
-
-    The function returns the answer to one question: will a push
-    happen on the host? `pr_writer` runs iff this is True (otherwise it
-    burns budget composing a PR that will never open), and
-    `phase_finalize` writes `not push_will_happen(...)` to
-    `run.json.no_push` so `host_finalize` reads the user's intent, not
-    the mechanism flag.
-
-    Local runtime: `host_no_push is None`; the launcher and the pusher
-    are the same shell, so `no_push` alone reflects intent.
-
-    Fly runtime: `host_no_push` is the user's intent; `no_push` is
-    always True (mechanism). Intent wins."""
-    if host_no_push is None:
-        return not no_push
-    return not host_no_push
-
-
 # --- run choices on resume (DESIGN §6 *A resumed run continues under the
 # choices it was started with*; IMPLEMENTATION §2½ *Run choices on resume*) --
 #
@@ -9305,10 +9278,9 @@ _RUN_CHOICE_ARG_KEYS: tuple[str, ...] = tuple(
                  "run_caps", "models", "efforts"))
 
 # The argparse dests of `main()` whose value lives in a sidecar: the runtime
-# (`_auto_detect_run_runtime` on resume), the Fly launcher's push intent
-# (passed again from its NO_PUSH) and the run group (`run.json`).
+# (`_auto_detect_run_runtime` on resume) and the run group (`run.json`).
 RUN_OPTIONS_SIDECAR: frozenset[str] = frozenset({
-    "runtime", "host_no_push", "group_id",
+    "runtime", "group_id",
 })
 
 # Every other argparse dest of `main()`: per-invocation.
@@ -66874,8 +66846,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
                          caps: dict | None = None,
                          models: dict[str, str] | None = None,
                          efforts: dict[str, str | None] | None = None,
-                         pr_template_override: str | None = None,
-                         host_no_push: bool | None = None) -> None:
+                         pr_template_override: str | None = None) -> None:
     """Phase 6: verify the run branch and record finalize state.
 
     The push + PR step has moved to the host launcher (DESIGN §6
@@ -66890,22 +66861,13 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     `no_verify` is passed through into the run.json sidecar so the
     launcher knows whether to add `--no-verify` to its `git push`.
 
-    `pr_writer` runs after `finished_at` is recorded when
-    `push_will_happen(no_push, host_no_push)` is True AND the caller
-    threaded caps/models/efforts through. Gating on **intent** (not
-    the `no_push` mechanism flag) matters on Fly: the launcher always
-    passes `--no-push` to the in-Machine orchestrator (it can't
-    reach origin), but the user may still want the PR. `host_no_push`
-    is None on local runtime and falls back to `not no_push` for the
-    same condition. Output lands in run.json's `pr_title` / `pr_body`
-    / `pr_template_used` fields; `host_finalize` reads these and falls
-    back to the deterministic `compose_pr_body` shape if they are
-    missing.
-
-    `run.json.no_push` is written from **intent**
-    (`not push_will_happen(...)`), not the mechanism flag, so
-    `host_finalize`'s skip check honors the user's preference cleanly
-    on both runtimes.
+    `pr_writer` runs after `finished_at` is recorded when the run will
+    be pushed (`not no_push`, the run's one push choice on every runtime —
+    DESIGN §6 *One push choice per run, on every runtime*) AND the caller
+    threaded caps/models/efforts through. Output lands in run.json's
+    `pr_title` / `pr_body` / `pr_template_used` fields; `host_finalize`
+    reads these and falls back to the deterministic `compose_pr_body`
+    shape if they are missing.
     """
     log("phase 6: finalizing")
     # Completion gate (DESIGN §6 *finished_at is a discovery sentinel, not a
@@ -67017,14 +66979,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     outcome = _decide_outcome(st, any_commits=True)
     st.data["finished_at"] = now()
     st.save()
-    will_push = push_will_happen(no_push, host_no_push)
+    will_push = not no_push
     # Record finalize success in the run.json sidecar. The launcher
-    # uses `finished_at` as the "ready for push" sentinel. `no_push`
-    # here is **intent** — host_finalize reads it as "the user opted
-    # out of pushing" and short-circuits accordingly. This is the
-    # critical distinction from the orchestrator's --no-push argv
-    # flag, which on Fly is a mechanism flag (the Machine can't
-    # push). See push_will_happen / DESIGN §6.
+    # uses `finished_at` as the "ready for push" sentinel; host_finalize
+    # skips the push when `no_push` is set.
     _write_run_json(
         st.run_dir,
         finished_at=st.data["finished_at"],
@@ -68315,8 +68273,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                         no_verify=getattr(args, "no_verify", False),
                         caps=caps, models=models, efforts=efforts,
                         pr_template_override=getattr(
-                            args, "pr_template", None),
-                        host_no_push=getattr(args, "host_no_push", None))
+                            args, "pr_template", None))
 
 
 @_records_the_run_death
@@ -68408,14 +68365,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "says not to: `resume <id> --push` pushes a run "
                          "started with --no-push. --no-push wins when both "
                          "are given.")
-    # Hidden: the Fly launcher uses this to communicate the user's
-    # launch-time push intent into the in-Fly orchestrator. The
-    # orchestrator's --no-push is a mechanism flag on Fly (the Machine
-    # can't reach origin); --host-no-push carries intent. None (unset
-    # on the local-runtime path) means "no separate intent channel,
-    # --no-push is intent." See DESIGN §6 *Finalization*.
-    ap.add_argument("--host-no-push", choices=["true", "false"],
-                    default=None, help=argparse.SUPPRESS)
     ap.add_argument("--no-verify", action="store_true",
                     help="pass --no-verify to the finalize `git push` "
                          "(skips pre-push hooks). Worker commits inside "
@@ -69090,20 +69039,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # preflight() / phase_finalize() see the resolved value uniformly via
     # `args.no_push` regardless of where the choice came from.
     # `--push` sets it off whatever the env or leerie.toml says; `--no-push`
-    # wins over it, because on Fly the in-Machine orchestrator always gets
-    # `--no-push` as a mechanism flag (`--host-no-push` carries the intent).
+    # wins over it, as in the launcher.
     args.no_push = (resolve_no_push(repo_root, args.no_push)
                     if args.no_push or not args.push else False)
-
-    # Coerce --host-no-push from "true"/"false"/None into bool | None.
-    # None on the local-runtime path (launcher doesn't pass it) means
-    # push_will_happen() falls back to `not no_push`. On Fly the
-    # launcher always passes "true" or "false" reflecting the user's
-    # launch-time intent (host_no_push in fly-machine.json).
-    args.host_no_push = (
-        None if args.host_no_push is None
-        else args.host_no_push == "true"
-    )
 
     # Resolve --clarify with the same shape as --no-push (DESIGN §11).
     # Re-attach to args so _orchestrate() folds it into state.json under
@@ -69269,9 +69207,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     if not args.phase:
         # The host's record of the push choice: the intent `host_finalize`
         # and the launcher's resume read.
-        _write_run_json(
-            st.run_dir,
-            no_push=not push_will_happen(args.no_push, args.host_no_push))
+        _write_run_json(st.run_dir, no_push=bool(args.no_push))
     log(f"models: " + ", ".join(f"{w}={models[w]}" for w in WORKER_TYPES))
     # Log only workers with a resolved effort — an "unset" worker is
     # explicitly opting out of the --effort flag and showing it as

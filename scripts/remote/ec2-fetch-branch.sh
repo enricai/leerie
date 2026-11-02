@@ -178,7 +178,7 @@ print(best[3])
   # indices aligned with the python emitter above; not read here
   working_branch="$(printf '%s' "$discover_output" | sed -n '3p')"
   # shellcheck disable=SC2034  # deliberately NOT consumed — see
-  # the 'CANNOT trust run.json.no_push as a proxy' note below
+  # the 'run.json.no_push is no proxy' note below
   run_no_push="$(printf '%s' "$discover_output" | sed -n '4p')"
 
   if [ -z "$run_id" ] || [ -z "$run_branch" ]; then
@@ -192,10 +192,8 @@ print(best[3])
 
   # --- Step 2: stream the run branch via git bundle -------------------------
   # Same two skip scenarios as fetch-branch.sh's Step 2 (cleared-but-empty
-  # terminal-state run; other early-failure). Cannot trust
-  # run.json.no_push as a proxy — it's a mechanism flag on EC2 too (the
-  # instance has no GitHub auth, so the in-instance launcher always
-  # passes --no-push).
+  # terminal-state run; other early-failure). run.json.no_push is no
+  # proxy: a --no-push run has a branch too.
   local _branch_present="false"
   # Every branch of the run lives in the run's own repository on the
   # instance (DESIGN §6 *The run's own repository*), never in /work's.
@@ -315,28 +313,9 @@ print(best[3])
 
   remote_log "remote: run state directory fetched to $host_leerie_runs/$run_id"
 
-  # DEFENSE-IN-DEPTH no_push stripper — identical logic and identical
-  # $_branch_present conditional as fetch-branch.sh (see that file's
-  # Step 3 comment for the full rationale).
-  if [ "$_branch_present" = "true" ]; then
-    local _host_run_json="$host_leerie_runs/$run_id/run.json"
-    if [ -f "$_host_run_json" ]; then
-      python3 - "$_host_run_json" <<'PY' || true
-import json, os, sys
-path = sys.argv[1]
-try:
-    data = json.load(open(path))
-except Exception:
-    sys.exit(0)
-if data.get("no_push") is True:
-    data.pop("no_push", None)
-    tmp = path + ".tmp"
-    json.dump(data, open(tmp, "w"), indent=2)
-    open(tmp, "a").write("\n")
-    os.replace(tmp, path)
-PY
-    fi
-  fi
+  # run.json arrives unchanged: its no_push is the run's one push choice,
+  # recorded by the orchestrator at the run's start, and host_finalize reads
+  # it as written (DESIGN §6 *One push choice per run, on every runtime*).
 
   # --- Step 4: apply the captured deps; stream .leerie/Dockerfile back (best-effort) ----
   # Same existence-guarded, non-fatal, never-clobber contract as

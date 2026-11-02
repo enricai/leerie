@@ -292,13 +292,15 @@ def test_fetch_state_ec2_uses_leerie_state_host_dir(tmp_path):
     )
 
 
-def test_fetch_state_ec2_strips_no_push_when_branch_present(tmp_path):
-    """Defense-in-depth stripper fires when a branch was actually
-    fetched (mirrors fetch-branch.sh's positive-control test)."""
+def test_fetch_state_ec2_keeps_no_push_when_branch_present(tmp_path):
+    """A `--no-push` run has a branch, and its run.json.no_push=true is
+    the run's one push choice: the fetch brings it home unchanged, so
+    host_finalize does not push it (DESIGN §6 *One push choice per run, on
+    every runtime*; mirrors fetch-branch.sh's test)."""
     repo = _make_git_repo(tmp_path)
     instance_root, instance_work = _setup_instance(tmp_path)
 
-    run_id = "feat-ec2-stripper-001"
+    run_id = "feat-ec2-no-push-001"
     run_branch = f"leerie/runs/{run_id}"
     _init_instance_repo_with_run(instance_work, run_id, run_branch, no_push=True)
 
@@ -315,9 +317,11 @@ def test_fetch_state_ec2_strips_no_push_when_branch_present(tmp_path):
 
     host_run_dir = repo / ".leerie" / "runs" / run_id
     host_rj = json.loads((host_run_dir / "run.json").read_text())
-    assert "no_push" not in host_rj, (
-        "stripper must remove no_push=true on the branch-present path"
-    )
+    assert host_rj.get("no_push") is True, (
+        "the fetch must not rewrite the run's push choice: " + repr(host_rj))
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", run_branch],
+        capture_output=True).returncode == 0, "the branch came home too"
 
 
 def test_fetch_state_ec2_skips_bundle_and_preserves_no_push_when_branch_missing(tmp_path):

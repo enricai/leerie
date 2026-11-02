@@ -272,9 +272,9 @@ decide_teardown() {
       # when they've recovered the work.
       if _try_fetch_branch_for_teardown; then
         remote_log "remote: run branch + state synced to host"
-        # Auto-finalize: now that the run dir is on the host (and the
-        # orchestrator wrote run.json.no_push as **intent**, not the
-        # mechanism flag — see DESIGN §6), push + PR happen here so
+        # Auto-finalize: now that the run dir is on the host (its
+        # run.json.no_push is the run's one push choice, unchanged by the
+        # fetch — DESIGN §6), push + PR happen here so
         # the user doesn't need a second command. The local-runtime
         # path runs the same host_finalize inline; this is the Fly
         # parity call site.
@@ -750,21 +750,17 @@ provision_machine() {
     local remote_dir="$_state_base/remote"
     mkdir -p "$remote_dir"
     local pid_record="$remote_dir/$$.json"
-    # Record the USER's launch-time --no-push intent here so the host's
-    # `leerie finalize` step can distinguish "user opted out of pushing"
-    # from "the in-Fly orchestrator was told not to push because it
-    # can't reach github" (the latter is a mechanism flag the launcher
-    # forces, NOT a user-intent flag).
-    python3 - "$pid_record" "$machine_id" "$FLY_APP" "${LEERIE_RUN_ID:-}" "$$" "${NO_PUSH:-false}" "${LEERIE_VOLUME_ID:-}" <<'PY'
+    # No push choice here: the run's one record of it is the orchestrator's
+    # (DESIGN §6 *One push choice per run, on every runtime*).
+    python3 - "$pid_record" "$machine_id" "$FLY_APP" "${LEERIE_RUN_ID:-}" "$$" "${LEERIE_VOLUME_ID:-}" <<'PY'
 import json, sys, datetime
-path, mid, app, run_id, pid, no_push, vol_id = sys.argv[1:]
+path, mid, app, run_id, pid, vol_id = sys.argv[1:]
 data = {
     "fly_app": app,
     "fly_machine_id": mid,
     "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     "run_id": run_id or None,
     "launcher_pid": int(pid),
-    "host_no_push": no_push in ("true", "1", "yes"),
 }
 if vol_id:
     data["volume_id"] = vol_id
