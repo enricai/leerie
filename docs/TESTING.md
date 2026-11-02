@@ -529,7 +529,8 @@ see `scripts/remote/lib.sh`'s comment.
 
 The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
-discovery, bundle fetch, run-state tar, `no_push` strip, and baseline Step
+discovery, bundle fetch, run-state tar (`run.json`, its `no_push` included,
+arrives unchanged), and baseline Step
 4 stream-back (the Dockerfile streamed when the host has none, a machine
 `config.toml` not streamed, never clobbers an existing host file, non-fatal
 on absent machine files, respects `LEERIE_STATE_HOST_DIR`) via bash-harness
@@ -1820,9 +1821,8 @@ remote-command stdout straight back, since `ec2_tar_pipe` itself is
 upload-only): a branch committed on the instance round-trips to the host as a
 fetchable bundle whose tip matches the instance-side tip; the run-state tar
 extracts under `LEERIE_STATE_HOST_DIR` (or `USER_REPO/.leerie` by default)
-and the `no_push` mechanism flag is stripped only on the branch-present path
-(preserved as intent on the cleared-but-empty terminal-state path, same
-conditional as `fetch-branch.sh`); `.leerie/config.toml` and
+and `run.json` (its `no_push` included) arrives unchanged, as from
+`fetch-branch.sh`; `.leerie/config.toml` and
 `.leerie/Dockerfile` stream back when the host has neither, are never
 clobbered when the host already has one, and are non-fatal when absent on the
 instance; and both `aws` and `ssh` appear in the transport log while `flyctl`
@@ -2523,15 +2523,11 @@ Before the local arm existed, `_auto_detect_run_runtime` left `_fin_runtime`
 empty, the `_already_synced` probe missed for want of `finished_at`, and the
 dispatch chain's bare `else` sent the run into the Fly path, where
 `require_flyctl` offered to *install flyctl* for a run that never touched
-Fly. The fixture sets `no_push` in `run.json` **and** passes `--no-push`, so
-`host_finalize` short-circuits at its own early gate
-(`scripts/host-finalize.sh:294`) — a return from *inside* `host_finalize`,
-which is what proves the launcher handed off, without the test needing a git
-remote or a rebaser worker. The CLI flag is load-bearing rather than
-belt-and-braces: without it the launcher reaches its mechanism-vs-intent
-block and STRIPS `no_push` from `run.json` whenever the run branch exists
-locally, so the gate would never fire and the test would run on into the
-rebase and push. The remaining cases pin
+Fly. `no_push` set in `run.json` alone makes `host_finalize` short-circuit at
+its own early gate — a return from *inside* `host_finalize`, which is what
+proves the launcher handed off, without the test needing a git remote or a
+rebaser worker. No `--no-push` is passed: the verb no longer strips the
+record (7de505e2), so the record alone is what the gate reads. The remaining cases pin
 `--runtime local` as accepted (it used to `exit 1`), `--force` refused with
 the local message rather than the EC2 one, a missing run branch failing
 closed on the branch rather than deeper in `host_finalize`, its positive
@@ -5822,18 +5818,23 @@ invocation's `failed_at`.
 `TestEveryExitOfTheRunIsSeen` (4 tests, review round 23 C1): by rule,
 `_record_run_died` has one caller, `_records_the_run_death`, which
 decorates `main()`; the arm (`_own_the_run_death_record`) follows the
-`State`'s acquisition with only the layout refusal between, disarmed only
-for `--phase`; and no `sys.exit`/`os._exit` follows the arm, so a pause is
+`State`'s acquisition with only the layout refusal between, disarmed for
+`--phase` and for a `resume` of a run `_run_has_nothing_left` calls
+complete; and no `sys.exit`/`os._exit` follows the arm, so a pause is
 returned rather than raised. By execution, the reviewer's proof inverted: a
 resume that `die()`s at the confinement entry, or in a resolver before the
 `try:` around `_orchestrate`, lists `failed` and is not auto-picked, and an
 interrupt at the entry records nothing. Falsified: the arm moved below
 `_require_confinement` turns the rule and the entry case red; a pause
 `sys.exit`ed again turns the rule and the pause case red.
+`TestACompletedRunStaysCompleted` (3 tests, review round 24 L1, real
+`main()` and a real resolver): a finished run's no-op resume dying in a
+resolver stays `done` with no `failed_at`; a run with work left lists
+`failed` after the same death; a died finalize is work left.
 
 ## Run choices on resume, and a phase-1 death resumes (review round 23)
 
-`tests/test_run_choices_on_resume.py` (29 tests, DESIGN §6 *A resumed run
+`tests/test_run_choices_on_resume.py` (34 tests, DESIGN §6 *A resumed run
 continues under the choices it was started with*; review round 23 exec, run
 A′). Real `main()` runs a fresh run (`--no-push`, a cap, a per-worker model
 and effort, a skip flag, `--source-of-truth`) through the real `_run_phases`
@@ -5857,7 +5858,11 @@ choice before the continuation (review round 24 F4). Falsified: the
 continuation and the launcher's record step dropped turned 6 tests red; an
 unclassified dest, a spec row reclassified, and the
 `dangerously-skip-permissions: ON` log moved back above the continuation
-each turned their rule red.
+each turned their rule red. `TestABareResumeReadsThePickedRunsRecord` (5
+tests, review round 24 L2): the launcher's real bare-resume block reads the
+run `resolve_run_id` picks, over three runs whose records disagree; the
+picked record beats the ambient env; nothing to pick falls back to env; a
+remote runtime does not pick host-side.
 
 `tests/test_resume_after_phase1_death.py` (5 tests, DESIGN §6 *Resumable
 planning*, *The first phase is a phase like any other*; review round 23
@@ -5865,6 +5870,34 @@ M2): real `main()` twice — a fresh run that dies inside the real
 `phase_classify`, then `resume` on the state it left. A budget death in
 classify resumes after the cap is raised; every resumable phase-1 exit
 (worker error, context overflow, disk low) resumes and spawns the classifier; a state with no `task` is still refused.
+
+`tests/test_remote_push_choice.py` (14 test functions, 16 cases; DESIGN §6
+*One push choice per run, on every runtime*). Every step is the real code,
+no cloud CLI called: the launcher's NO_PUSH resolution and its hand-off of
+the choice to a fresh run as `--no-push` (an env-only opt-out reaches the
+orchestrator, a pushing run gets nothing, a resume forwards only its own
+push flag, the in-machine argv from `_render_launch_suffix` is exactly the
+launcher's flags); a Fly run through real `main()`, the real `fetch_branch`
+over a stubbed `flyctl` and the real `host_finalize` (a fresh `--no-push`
+run, an env-only opt-out and a plain resume of a `--no-push` run are not
+pushed, with a resume with `--push` and a fresh pushing run as controls that
+are); and the real `finalize` verb reads the record (a recorded `no_push` is
+not pushed, `--no-push` on the verb skips a run recorded to push, and a run
+recorded to push reaches the push).
+
+`tests/test_delivery_detection.py::TestReask` (9 tests; DESIGN §8 *Delivery
+detection*, *One re-ask*; review round 24 M1), rewritten over a real git
+lane: `created` is read from the lane's untracked test-shaped files, `ran`
+from the sample's executed Bash commands (`_falsifier_runs_probe`). A
+heredoc probe that ran (the r24 run a command verbatim) and one run in a
+separate call are not re-asked; a sample that wrote nothing, or wrote and
+never ran, is; a Write-tool probe still counts; leads, an edited tracked
+file and a symlink are not probes; `_falsifier_runs_probe` on the real
+pytest and vitest commands and edge shapes; the session id read from the
+log, and `claude_p` adding the resume flag. Through the real
+`_run_delivery_detection` (`TestRunDeliveryDetection`),
+`test_a_previous_samples_probe_is_not_the_next_samples` shows a previous
+sample's probe never counts for the next.
 
 ## The rev 9 redesign's other new and rewritten test files
 

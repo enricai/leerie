@@ -4,24 +4,14 @@ Regression pin for an asymmetry between the launcher and the
 orchestrator's `resolve_no_push`:
 
 The orchestrator reads `no_push` from CLI flag → LEERIE_NO_PUSH env →
-`leerie.toml` (`orchestrator/leerie.py:2635` `resolve_no_push`). The
-launcher historically read only CLI + env (`leerie:874-882`), missing
-TOML. That asymmetry was harmless before the Fly auto-finalize landed:
-
-  - On local runtime, the in-container orchestrator wrote
-    `run.json.no_push=true` (from TOML), and `host_finalize`
-    short-circuited.
-  - On Fly, no auto-finalize existed, so the launcher's
-    `host_no_push=false` only affected the manual `leerie finalize`
-    recovery command.
-
-After the Fly auto-finalize landed (decide_teardown now calls
-host_finalize on the host immediately after sync), the asymmetry
-became active: a TOML-only opt-out would propagate as
-`--host-no-push false` into the in-Fly orchestrator, which then
-writes `run.json.no_push=false` based on intent
-(`push_will_happen(no_push=True, host_no_push=False) → True`), and
-the host auto-pushes against user wishes.
+`leerie.toml` (`resolve_no_push`). The launcher historically read only
+CLI + env, missing TOML. Since 7de505e2 the launcher resolves the run's
+push choice and hands a fresh run the result as `--no-push` (DESIGN §6
+*One push choice per run, on every runtime*): the container never sees
+`LEERIE_NO_PUSH`, and a remote machine may not see an untracked
+`leerie.toml`. A TOML-only opt-out the launcher missed would therefore
+not be handed to a fresh run as `--no-push`, and the host checks would
+disagree with the record.
 
 The launcher's TOML fallback must match the orchestrator's
 `_parse_bool_envtoml` (`orchestrator/leerie.py:2590`) in two ways:

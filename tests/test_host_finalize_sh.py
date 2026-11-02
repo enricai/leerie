@@ -537,8 +537,8 @@ def test_skips_when_run_branch_absent_locally(tmp_path):
 
     Without this guard, the launcher would try to push a non-existent
     branch and fail with `src refspec ... does not match any`. The
-    guard backstops fetch-branch.sh's conditional stripper and the
-    finalize stripper in `leerie`."""
+    record arrives unchanged (no stripper since 7de505e2); this guard
+    is what keeps a branchless run from being pushed."""
     run_dir = _make_run(tmp_path, "noop-run-aaaaaa", run_json={
         "branch": "leerie/runs/noop-run-aaaaaa",
         "working_branch": "main",

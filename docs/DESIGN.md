@@ -4578,7 +4578,9 @@ then the override is recorded.**
 The mechanism:
 
 - Every run-level choice is classified once, in IMPLEMENTATION §2½ *Run
-  choices on resume*, as **sticky** or **per-invocation**. Sticky choices
+  choices on resume*, as **sticky**, **per-invocation** or **sidecar**
+  (recorded in `run.json` / `fly-machine.json` / `ec2-instance.json` and
+  read back from there). Sticky choices
   decide the run's behaviour or the destination of its result.
   Per-invocation choices belong to the invocation and the host it runs
   on: concurrency, memory and PID ceilings, timeouts, verbosity, mounted
@@ -5240,9 +5242,11 @@ launcher resolves the choice on the host — `--no-push`, then `--push`, then
 `LEERIE_NO_PUSH`, then `no_push` in `leerie.toml` — and on a fresh run hands
 it to the orchestrator as `--no-push`, the same way on the local, Fly and
 EC2 runtimes, because neither the container nor a remote machine sees the
-host's environment. The orchestrator records it at the run's start, a
-resume continues it by the one rule every sticky choice follows, and
-`main()` writes it to `run.json.no_push` on every invocation. `pr_writer`
+host's `LEERIE_NO_PUSH` (the launcher does not forward it), and a remote
+machine may not see an untracked `leerie.toml`. The orchestrator records it
+at the run's start, a resume continues it by the one rule every sticky
+choice follows, and `main()` writes it to `run.json.no_push` on every
+invocation but `--phase`. `pr_writer`
 runs exactly when the run will be pushed. `host_finalize` reads
 `run.json.no_push` unchanged on every runtime: on a remote runtime the
 fetch brings that file home before the host finalizes, and nothing on the

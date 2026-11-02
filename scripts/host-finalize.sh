@@ -609,8 +609,8 @@ host_finalize() {
   # Fail-open: if state.json is absent or its wave fields are non-numeric,
   # do NOT block — a legitimately complete run must never be refused over a
   # missing/unreadable file. The cleared-but-empty terminal state
-  # (waves==[]) sets no_push=true and already returned above; even if it
-  # reached here, `0 < len([])` is false, so it is not blocked.
+  # (waves==[]) normally returns at the no_push gate above; when it reaches
+  # here, `0 < len([])` is false, so it is not blocked.
   if [ -f "$state_json" ]; then
     local _no_work _completed _wave_total
     _no_work="$(jq -r '.no_work_required // false' "$state_json" 2>/dev/null)"
@@ -654,9 +654,9 @@ host_finalize() {
   # cleared-but-empty terminal state (DESIGN §8 — no setup-run.sh
   # ran, so no branch was created). Treat it as a no-op rather than
   # attempting a `git push` that will fail with `src refspec ... does
-  # not match any`. Upstream callers (fetch-branch.sh's stripper and
-  # the finalize stripper in `leerie`) already preserve no_push=true
-  # for this case; this guard backstops them.
+  # not match any`. Nothing upstream rewrites `run.json.no_push`
+  # (DESIGN §6 *One push choice per run, on every runtime*); this guard is
+  # what keeps a branchless run from being pushed.
   if ! git -C "$USER_REPO" rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
     echo "[leerie] finalize: run branch $run_branch absent locally; treating as no-op" >&2
     return 0
