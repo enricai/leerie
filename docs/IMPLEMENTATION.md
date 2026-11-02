@@ -1482,7 +1482,9 @@ There is no `leerie.toml` tier: a repository's file never names a host path
 anchored at the directory the operator started leerie in (`$OPERATOR_DIR`,
 §0), not at the checkout's top level.
 
-After resolution, for every verb but `version`, the launcher refuses a state
+At the state root's first use (right before the log directory beneath it is
+made, after every launcher knob is resolved), for every verb but `version`,
+which uses no state root, the launcher refuses a state
 root that overlaps the checkout (`_state_root_overlaps_checkout <state-root>
 <checkout>`, both compared by real path, a missing tail of the state root
 resolved from its deepest existing parent): equal to it, beneath it, or
@@ -2994,10 +2996,12 @@ These bare subcommands are handled by the bash launcher before the
 container starts. A summary appears in the `leerie --help` epilog.
 
 **`--help` / `-h` (no container required):** the launcher scans argv for an
-exact `-h`/`--help` (stopping at `--`, and skipping when `$1` is `prune`,
-which has its own usage) right after resolving `LEERIE_REPO`, before any
-state-dir, runtime, preflight, or provisioning work, and `exec`s
-`python3 -I -B orchestrator/leerie.py --help` on the host. Forwarding help
+exact `-h`/`--help` (stopping at `--`) right after resolving `LEERIE_REPO`,
+before any state-dir, runtime, preflight, or provisioning work, and `exec`s
+`python3 -I -B orchestrator/leerie.py --help` on the host; when `$1` is
+`prune` it prints `prune`'s own usage (`_prune_usage`, also the `prune`
+arm's) and exits 0 instead. No help answer resolves, checks or creates the
+state root. Forwarding help
 into the container ran the full run path first (including a machine
 provision on `--runtime fly|ec2`) and then let the post-run finalize block
 treat the exit 0 as a finished job. Pinned by

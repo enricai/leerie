@@ -138,8 +138,27 @@ LEERIE_COMMIT="$(git -C "$LEERIE_REPO" rev-parse --short HEAD 2>/dev/null || tru
 # container ran the entire run path first (Colima probes, git fetch, preflight,
 # image builds, and on --runtime fly|ec2 a machine provision) and then let the
 # post-run finalize block treat the exit 0 as a finished job. `prune` keeps its
-# own -h arm (it has verb-specific usage), and scanning stops at `--`.
-if [ "${1:-}" != "prune" ]; then
+# own usage (verb-specific), answered here too, and scanning stops at `--`.
+# Every help answer comes before the state root is resolved, checked or
+# created: asking for help touches no state.
+_prune_usage() {
+  echo "Usage: leerie prune [--older-than DAYS] [--apply]" >&2
+  echo "  Removes terminal run dirs, the worktrees of idle resumable" >&2
+  echo "  runs, and stale repo-map cache entries older than DAYS" >&2
+  echo "  (default 14), and subtask branches whose run dir is gone," >&2
+  echo "  reporting the space freed. Dry-run unless --apply is given." >&2
+  echo "  With AWS credentials resolvable, also lists (--apply: deletes)" >&2
+  echo "  leerie-tagged EC2 AMIs older than DAYS (current version kept)," >&2
+  echo "  snapshots, key pairs, security groups and the IAM role." >&2
+}
+if [ "${1:-}" = "prune" ]; then
+  for _help_arg in "$@"; do
+    case "$_help_arg" in
+      --) break ;;
+      -h|--help) _prune_usage; exit 0 ;;
+    esac
+  done
+else
   for _help_arg in "$@"; do
     case "$_help_arg" in
       --) break ;;
@@ -990,7 +1009,8 @@ export LEERIE_STATE_HOST_DIR
 # every worker reads: the held-out sets, every worker's notes, the copies of
 # the credentials. Above it, the state root's read-write mount holds the
 # checkout. Compared by real path; a state root that does not exist yet is
-# resolved from its deepest existing directory.
+# resolved from its deepest existing directory. Checked at the state root's
+# first use, below (no help answer reaches it).
 _state_root_overlaps_checkout() {
   python3 -I -c '
 import os, sys
@@ -1000,11 +1020,6 @@ def under(a, b):
 print("yes" if under(s, c) or under(c, s) else "")
 ' "$1" "$2"
 }
-if [ "${1:-}" != "version" ] && \
-   [ -n "$(_state_root_overlaps_checkout "$LEERIE_STATE_HOST_DIR" "$USER_REPO")" ]; then
-  remote_log "error: the state root $LEERIE_STATE_HOST_DIR overlaps the checkout $USER_REPO (it is the checkout, inside it or above it). The run's state — held-out tests, notes, copies of your credentials — must never be visible to the workers that read the checkout. Set --state-dir PATH or LEERIE_STATE_DIR=PATH to a directory outside it (default: \$HOME/.leerie/<repo>)."
-  exit 1
-fi
 
 # --- --log-file / LEERIE_LOG_FILE (N5b) -----------------------------------
 # Resolves LEERIE_LOG_FILE_RESOLVED: where a `leerie task | tee <path>`
@@ -1167,7 +1182,14 @@ export LEERIE_AWS_REGION LEERIE_AWS_PROFILE
 # teeing wired below (bugfix-002) can append to it without a manual mkdir —
 # best-effort: an unwritable/uncreatable parent just leaves teeing disabled
 # further down, mirroring the existing "$_run_log unwritable" fallback.
-mkdir -p "$(dirname "$LEERIE_LOG_FILE_RESOLVED")" 2>/dev/null || true
+# The first use of the state root (every verb but `version` uses it from
+# here on), so the overlap check runs here, right before it.
+if [ "${1:-}" != "version" ] && \
+   [ -n "$(_state_root_overlaps_checkout "$LEERIE_STATE_HOST_DIR" "$USER_REPO")" ]; then
+  remote_log "error: the state root $LEERIE_STATE_HOST_DIR overlaps the checkout $USER_REPO (it is the checkout, inside it or above it). The run's state — held-out tests, notes, copies of your credentials — must never be visible to the workers that read the checkout. Set --state-dir PATH or LEERIE_STATE_DIR=PATH to a directory outside it (default: \$HOME/.leerie/<repo>)."
+  exit 1
+fi
+[ "${1:-}" = "version" ] || mkdir -p "$(dirname "$LEERIE_LOG_FILE_RESOLVED")" 2>/dev/null || true
 
 # .owner sidecar: claims this state dir for USER_REPO so two different
 # repos sharing a basename cannot silently write into the same tree.
@@ -1679,16 +1701,7 @@ PY
         --older-than) _prune_days="${2:?--older-than needs a number of days}"; shift 2 ;;
         --older-than=*) _prune_days="${1#*=}"; shift ;;
         --apply) _prune_apply=true; shift ;;
-        -h|--help)
-          echo "Usage: leerie prune [--older-than DAYS] [--apply]" >&2
-          echo "  Removes terminal run dirs, the worktrees of idle resumable" >&2
-          echo "  runs, and stale repo-map cache entries older than DAYS" >&2
-          echo "  (default 14), and subtask branches whose run dir is gone," >&2
-          echo "  reporting the space freed. Dry-run unless --apply is given." >&2
-          echo "  With AWS credentials resolvable, also lists (--apply: deletes)" >&2
-          echo "  leerie-tagged EC2 AMIs older than DAYS (current version kept)," >&2
-          echo "  snapshots, key pairs, security groups and the IAM role." >&2
-          exit 0 ;;
+        -h|--help) _prune_usage; exit 0 ;;
         *) echo "leerie prune: unknown option '$1'" >&2; exit 1 ;;
       esac
     done

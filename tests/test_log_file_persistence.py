@@ -53,7 +53,8 @@ def _extract_resolver() -> str:
     m = re.search(
         r"(# --- --log-file / LEERIE_LOG_FILE \(N5b\) -+\n"
         r".*?\nexport LEERIE_LOG_FILE_RESOLVED\n"
-        r".*?\nmkdir -p \"\$\(dirname \"\$LEERIE_LOG_FILE_RESOLVED\"\)\" "
+        r".*?\n(?:\[ \"\$\{1:-\}\" = \"version\" \] \|\| )?"
+        r"mkdir -p \"\$\(dirname \"\$LEERIE_LOG_FILE_RESOLVED\"\)\" "
         r"2>/dev/null \|\| true\n)",
         src, re.DOTALL)
     assert m, "could not locate the --log-file resolution block in the launcher"
