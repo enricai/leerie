@@ -78,26 +78,32 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # tenacity is imported lazily inside claude_p() (its sole use site), not at
 # module scope, so orchestrator/leerie.py loads on a bare host python3 that
-# lacks requirements.txt deps. The `config --recapture` host seam
-# (leerie:864) exec_module()s this file on the host, where python3 is not
+# lacks requirements.txt deps. The launcher's `config --recapture` host seam
+# exec_module()s this file on the host, where python3 is not
 # guaranteed to have tenacity; a module-scope import there would crash before
 # run_recapture_deps()'s pathlib guards can print their diagnostic. Do not
 # hoist it back to the top.
 
 
-def admit_operator_import_paths() -> None:
+def admit_operator_import_paths(exclude: Iterable[str | Path]) -> None:
     """Put the operator's own import paths back on `sys.path` in a host seam
     that runs isolated (`python3 -I`) and can reach `claude_p` — the rebaser
-    and `config --recapture` seams. `-I` keeps the cwd (the user's checkout)
-    off `sys.path`, and with it the user site and `PYTHONPATH`, which is where
-    an operator's `pip install --user tenacity` or a `PYTHONPATH` entry put
-    the one third-party module those seams import (lazily, on a backoff).
-    Those paths are the operator's, not the checkout's, so they come back,
-    in the order a plain `python3` gives them: `PYTHONPATH` first, the user
-    site (unless `PYTHONNOUSERSITE`) ahead of the interpreter's own
-    site-packages. An empty or relative `PYTHONPATH` entry names the cwd, so
-    it is dropped (DESIGN §6 *The host never imports the repository's
-    code*).
+    and `config --recapture` seams. `-I` keeps the cwd off `sys.path`, and
+    with it the user site and `PYTHONPATH`, which is where an operator's
+    `pip install --user tenacity` or a `PYTHONPATH` entry put the one
+    third-party module those seams import (lazily, on a backoff). Those
+    paths come back, in the order a plain `python3` gives them:
+    `PYTHONPATH` first, the user site (unless `PYTHONNOUSERSITE`) ahead of
+    the interpreter's own site-packages. An empty or relative `PYTHONPATH`
+    entry names the cwd, so it is dropped (DESIGN §6 *The host never imports
+    the repository's code*).
+
+    An operator's path can still name the repository: an editable install's
+    `.pth` in the user site holds `<checkout>/src`, and direnv's
+    `PYTHONPATH=$PWD/src` is absolute (review round 27, isolation I2). So
+    once the paths are back, `.pth` files processed, every `sys.path` entry
+    whose real path is one of `exclude` (the checkout; for the rebaser, its
+    tree too), or lies beneath one, is dropped.
 
     Called explicitly by those seams, never at import: the other programs
     that load this file isolated (`scripts/worker-guard.py`, the read-only
@@ -116,6 +122,13 @@ def admit_operator_import_paths() -> None:
             i = next((k for k, p in enumerate(before) if p in system),
                      len(before))
             sys.path[:] = before[:i] + added + before[i:]
+    roots = [os.path.realpath(x) for x in exclude]
+
+    def _inside(entry: str) -> bool:
+        real = os.path.realpath(entry)
+        return any(real == r or real.startswith(r.rstrip("/") + "/")
+                   for r in roots)
+    sys.path[:] = [p for p in sys.path if not _inside(p)]
 
 
 ROOT = Path(__file__).resolve().parent.parent       # leerie plugin/repo root

@@ -2614,7 +2614,9 @@ integrator (`collect-subtrees.sh`) is a run worker: it takes its grants from
 covers leerie's own code, never the repository's. The launcher and the
 scripts it runs on the host call `python3` dozens of times — small `-c`
 helpers, stdin programs, and seams that load `orchestrator/leerie.py` by
-path — from the operator's cwd, which is the user's checkout. A program
+path. They used to run from the operator's cwd, which was the user's
+checkout (the launcher now leaves it first; see *The host never runs a program the
+checkout chose* below). A program
 read from `-c` or stdin puts the cwd first on `sys.path`, so a `json.py` or
 `contextlib.py` at the checkout's root (a file a worker wrote, in a run
 whose branch the user merged) ran on the host, unconfined, with the
@@ -2625,15 +2627,25 @@ from. The invariant: **no host-side Python resolves a module from the
 checkout.** Every host-side `python3` is isolated, spelled `python3 -I`
 at the call: no cwd or script directory on `sys.path`, no `PYTHON*`
 environment, no user site. Every host-side program imports the standard
-library and leerie's own code; the two that reach beyond it put the
-operator's own paths back explicitly, never the cwd. The chain synth-merge
+library and leerie's own code. Three of them re-admit import paths `-I`
+removed, and only the operator's, never the cwd's. The chain synth-merge
 helper imports leerie's `chain/` package from the leerie directory, after
 the operator's absolute `PYTHONPATH` entries. The host rebaser and
 `config --recapture` seams run workers, and a worker's backoff imports
 `tenacity`, which the operator may have installed in the user site or on
 `PYTHONPATH`; those seams take back the absolute `PYTHONPATH` entries and
 the user site, in a plain interpreter's order. An empty or relative
-`PYTHONPATH` entry names the cwd and is dropped. The one convention is
+`PYTHONPATH` entry names the cwd and is dropped. An operator's path can
+still name the checkout: an editable install of the project in the user
+site (`pip install --user -e .`, or a hatch, pdm or poetry editable) leaves
+a `.pth` file holding `<checkout>/src`, and direnv's `PYTHONPATH=$PWD/src`
+is absolute. A `tenacity.py` a merged run put there was then imported on
+the first backoff, ahead of the system's own copy (review round 27,
+isolation I2). So every entry whose real path is the checkout, or the
+rebaser's tree, or lies beneath one, is dropped after the paths come back,
+`.pth` files processed; the chain helper drops the same from the operator's
+`PYTHONPATH`. A finder an editable install registers maps only the names
+that install declared, and is the operator's own install. The one convention is
 checked by a rule over every host-run file, so a new call without it
 fails the suite. Commands the host sends to a Fly or EC2 machine follow
 the same spelling.

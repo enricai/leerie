@@ -253,7 +253,10 @@ def _orchestrator_shim(tmp_path: Path) -> Path:
         "_s.loader.exec_module(_m)\n"
         "admit_operator_import_paths = _m.admit_operator_import_paths\n"
         "def _which():\n"
-        "    import tenacity\n"
+        "    try:\n"
+        "        import tenacity\n"
+        "    except ImportError:\n"
+        "        return 'none'\n"
         "    return getattr(tenacity, 'WHO', 'interpreter')\n"
         "def run_rebaser(*a):\n"
         "    return {'status': _which()}\n"
@@ -270,19 +273,42 @@ def _operator_tenacity(site_dir: Path) -> None:
 
 def _host_env(tmp_path: Path, where: str) -> dict:
     """An environment whose operator tenacity is on PYTHONPATH (behind a
-    relative entry, which names the cwd) or in the user site."""
+    relative entry, which names the cwd) or in the user site. The two
+    `*_into_checkout` shapes are an operator's own paths that name the
+    checkout (review round 27, isolation I2): an absolute PYTHONPATH entry
+    (direnv's `PYTHONPATH=$PWD/src`) ahead of the operator's tenacity, and
+    an editable install's `.pth` in the user site, with no tenacity of the
+    operator's anywhere."""
     import os
     import sysconfig
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home")}
+    user_site = Path(sysconfig.get_path(
+        "purelib", f"{os.name}_user",
+        vars={"userbase": str(tmp_path / "userbase")}))
     if where == "pythonpath":
         _operator_tenacity(tmp_path / "op")
         env["PYTHONPATH"] = f".:tenacity_dir:{tmp_path / 'op'}"
+    elif where == "pythonpath_into_checkout":
+        _operator_tenacity(tmp_path / "op")
+        env["PYTHONPATH"] = (f"{tmp_path / 'checkout' / 'tenacity_dir'}:"
+                             f"{tmp_path / 'op'}")
+        env["PYTHONNOUSERSITE"] = "1"
+    elif where == "pth_into_checkout":
+        env["PYTHONUSERBASE"] = str(tmp_path / "userbase")
+        user_site.mkdir(parents=True)
+        (user_site / "__editable__.proj-0.1.pth").write_text(
+            f"{tmp_path / 'checkout' / 'tenacity_dir'}\n")
     else:
-        base = tmp_path / "userbase"
-        env["PYTHONUSERBASE"] = str(base)
-        _operator_tenacity(Path(sysconfig.get_path(
-            "purelib", f"{os.name}_user", vars={"userbase": str(base)})))
+        env["PYTHONUSERBASE"] = str(tmp_path / "userbase")
+        _operator_tenacity(user_site)
     return env
+
+
+# Each `where` and what the seam's tenacity must be. With no tenacity of the
+# operator's, the interpreter's own (if the host has one) or none at all.
+_TENACITY_CASES = [("pythonpath", {"operator"}), ("user_site", {"operator"}),
+                   ("pythonpath_into_checkout", {"operator"}),
+                   ("pth_into_checkout", {"interpreter", "none"})]
 
 
 def _plant_tenacity(checkout: Path, marker: Path) -> None:
@@ -294,9 +320,9 @@ def _plant_tenacity(checkout: Path, marker: Path) -> None:
             "WHO = 'checkout'\n")
 
 
-@pytest.mark.parametrize("where", ["pythonpath", "user_site"])
+@pytest.mark.parametrize("where,expect", _TENACITY_CASES)
 def test_the_rebaser_seam_imports_the_operators_tenacity(
-        tmp_path: Path, where: str) -> None:
+        tmp_path: Path, where: str, expect: set) -> None:
     checkout, marker = tmp_path / "checkout", tmp_path / "RAN_ON_HOST"
     _plant_tenacity(checkout, marker)
     script = tmp_path / "rebaser.py"
@@ -310,12 +336,12 @@ def test_the_rebaser_seam_imports_the_operators_tenacity(
         capture_output=True, timeout=120, check=False)
     assert not marker.exists(), marker.read_text()
     assert r.returncode == 0, r.stderr
-    assert json.loads(out.read_text()) == {"status": "operator"}
+    assert json.loads(out.read_text())["status"] in expect
 
 
-@pytest.mark.parametrize("where", ["pythonpath", "user_site"])
+@pytest.mark.parametrize("where,expect", _TENACITY_CASES)
 def test_the_recapture_seam_imports_the_operators_tenacity(
-        tmp_path: Path, where: str) -> None:
+        tmp_path: Path, where: str, expect: set) -> None:
     flags, body = _seam('"$_user_repo" "$_leerie_state_dir"')
     checkout, state, marker = (tmp_path / "checkout", tmp_path / "state",
                                tmp_path / "RAN_ON_HOST")
@@ -328,14 +354,16 @@ def test_the_recapture_seam_imports_the_operators_tenacity(
         capture_output=True, timeout=120, check=False)
     assert not marker.exists(), marker.read_text()
     assert r.returncode == 0, r.stderr
-    assert (state / "who").read_text() == "operator"
+    assert (state / "who").read_text() in expect
 
 
 def test_the_chain_synth_merge_helper_drops_a_relative_pythonpath_entry(
         tmp_path: Path) -> None:
     """The chain helper hands the operator's PYTHONPATH to sys.path itself;
-    `.` there names the cwd, the checkout, whose `chain/git_ops.py` must not
-    run, while an absolute operator entry is still honoured."""
+    `.` there names the cwd, and an absolute entry may name the checkout
+    itself (review round 27, isolation I2): the checkout's
+    `chain/git_ops.py` must not run either way, while an absolute operator
+    entry elsewhere is still honoured."""
     text = LAUNCHER.read_text()
     start = text.index("if ! python3 -I -c '\n") + len("if ! python3 -I -c '\n")
     source = text[start:text.index("\n' \"$USER_REPO\"", start) + 1]
@@ -352,7 +380,7 @@ def test_the_chain_synth_merge_helper_drops_a_relative_pythonpath_entry(
             f" 'w').write({who!r})\n")
     r = subprocess.run(
         ["python3", "-I", "-c", source, str(checkout), "main", "[]", "stage",
-         f".:{tmp_path / 'op'}", str(REPO)],
+         f".:{checkout}:{tmp_path / 'op'}", str(REPO)],
         cwd=checkout, text=True, capture_output=True, timeout=120,
         check=False)
     assert not marker.exists(), marker.read_text()

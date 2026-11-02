@@ -832,8 +832,10 @@ spec = importlib.util.spec_from_file_location("leerie_orch", orch_path)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 # Isolated, so the operator's user site and PYTHONPATH (where tenacity, which
-# claude_p imports on a backoff, may live) come back explicitly.
-m.admit_operator_import_paths()
+# claude_p imports on a backoff, may live) come back explicitly, less any
+# entry in the checkout or the run branch's tree (an editable install's .pth,
+# direnv's PYTHONPATH=$PWD/src).
+m.admit_operator_import_paths([repo_root, worktree])
 
 result = m.run_rebaser(leerie_root, repo_root, run_id, worktree,
                         run_branch, working_branch, pr_base_branch)

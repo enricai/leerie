@@ -1589,8 +1589,10 @@ spec = importlib.util.spec_from_file_location("leerie_orch", orch_path)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 # Isolated, so the operator's user site and PYTHONPATH (where tenacity, which
-# claude_p imports on a backoff, may live) come back explicitly.
-m.admit_operator_import_paths()
+# claude_p imports on a backoff, may live) come back explicitly, less any
+# entry in the checkout (an editable install's .pth, direnv's
+# PYTHONPATH=$PWD/src).
+m.admit_operator_import_paths([user_repo])
 
 m.run_recapture_deps(leerie_root, user_repo, force=force)
 PY
@@ -4718,7 +4720,10 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
         _ch_branches_repr="$(python3 -I -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${_ch_wave_branches[@]}")"
         if ! python3 -I -c '
 import json, os, sys
-sys.path[:0] = [d for d in sys.argv[5].split(":") if os.path.isabs(d)] + [sys.argv[6]]
+repo = os.path.realpath(sys.argv[1])
+sys.path[:0] = [d for d in sys.argv[5].split(":") if os.path.isabs(d)
+                and os.path.realpath(d) != repo
+                and not os.path.realpath(d).startswith(repo.rstrip("/") + "/")] + [sys.argv[6]]
 from chain.git_ops import synth_merge_branches, SynthMergeConflict
 repo, base, branches_json, stage = sys.argv[1:5]
 branches = json.loads(branches_json)

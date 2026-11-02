@@ -65,22 +65,28 @@ generation) and to render `--help` (see *Launcher verbs*); those use only
 the stdlib. Every host-side interpreter is spelled `python3 -I` at its call
 — in `leerie`, `scripts/host-finalize.sh`, `scripts/install.sh`,
 `scripts/runtime-install.sh` and `scripts/remote/*.sh`, including the
-commands those send to a Fly or EC2 machine — so neither the cwd (the
-user's checkout), a script's directory, `PYTHON*` nor the user site reaches
-`sys.path` (DESIGN §6 *The host never imports the repository's code*).
+commands those send to a Fly or EC2 machine — so neither the cwd (`/`
+since the prologue's `cd /`; the checkout for a seam run by hand from it),
+a script's directory, `PYTHON*` nor the user site reaches `sys.path` (DESIGN §6 *The host never imports the repository's code*).
 Two kinds of host program import beyond the stdlib and put the operator's
 paths back themselves, dropping every empty or relative `PYTHONPATH` entry
 (each names the cwd). The chain synth-merge helper imports `chain.git_ops`:
-it puts the operator's absolute `PYTHONPATH` entries and then the leerie
-directory on `sys.path`, from argv. The host rebaser seam
+it puts the operator's absolute `PYTHONPATH` entries whose real path is not
+the checkout or beneath it, and then the leerie directory, on `sys.path`,
+from argv. The host rebaser seam
 (`scripts/host-finalize.sh`) and the `config --recapture` seam run workers
 through `claude_p`, whose backoff imports `tenacity`. After loading
-`orchestrator/leerie.py` they call its `admit_operator_import_paths()`,
-which restores the absolute `PYTHONPATH` entries first and the user site
-(unless `PYTHONNOUSERSITE`) ahead of the interpreter's site-packages. So
-`tenacity` resolves from the host interpreter's site-packages, the user
-site or an absolute `PYTHONPATH` entry, as it did before `-I`, and never
-from the checkout. The host is not required to have it (see `config
+`orchestrator/leerie.py` they call its
+`admit_operator_import_paths(exclude)`, which restores the absolute
+`PYTHONPATH` entries first and the user site (unless `PYTHONNOUSERSITE`,
+its `.pth` files processed) ahead of the interpreter's site-packages, and
+then drops every `sys.path` entry whose real path is one of `exclude`, or
+beneath one: an editable install's `.pth` and direnv's `PYTHONPATH=$PWD/src`
+name the checkout (review round 27, isolation I2). The recapture seam passes
+the checkout; the rebaser seam passes the checkout and its worktree, the run
+branch's content. So `tenacity` resolves from the host interpreter's
+site-packages, the user site or an absolute `PYTHONPATH` entry, as it did
+before `-I`, and never from the checkout. The host is not required to have it (see `config
 --recapture` below); without it, a host-side worker's first backoff raises
 `ImportError`. The function is called explicitly and never at import, so
 the other programs that load `leerie.py` isolated keep the import path
@@ -91,8 +97,10 @@ helper from a checkout holding a planted `contextlib.py` / `json.py`, which
 must never run. It also runs the rebaser and recapture seams from a
 checkout holding a planted `tenacity.py` (at its root and behind a relative
 `PYTHONPATH` entry): they must import the operator's `tenacity` from
-`PYTHONPATH` or the user site. And it runs the chain helper with `.` on
-`PYTHONPATH`, which must not import the checkout's `chain/git_ops.py`.
+`PYTHONPATH` or the user site, also when an absolute `PYTHONPATH` entry or
+a user-site `.pth` names a directory in the checkout. And it runs the chain
+helper with `.` and an absolute entry into the checkout on `PYTHONPATH`,
+neither of which may import the checkout's `chain/git_ops.py`.
 
 Which interpreter runs is fixed too (DESIGN §6 *The host never runs a
 program the checkout chose*). `leerie` starts with `#!/bin/sh`: its
@@ -374,7 +382,7 @@ claims a state directory. Four sub-modes:
   third-party import on this path (`tenacity`) is deferred into `claude_p()`
   rather than module scope, since the host `python3` isn't guaranteed to
   have `requirements.txt` deps (§0). The seam runs `python3 -I` and calls
-  `admit_operator_import_paths()` after loading the module, so a `tenacity`
+  `admit_operator_import_paths([checkout])` after loading the module, so a `tenacity`
   in the operator's user site or on an absolute `PYTHONPATH` entry is found
   (§0 *Python runtime*).
 
