@@ -6380,6 +6380,26 @@ interrupt at the entry records nothing. Falsified: the arm moved below
   on PATH" warning, and its console script then run by a measurement.
   Live-falsified on the host and in the container: `_tree_store_env`
   without the call turned 2 host tests and 3 container tests red.
+- `tests/test_worker_sees_tree_install.py` (4 test functions, 7 cases;
+  DESIGN §6 *A worker started in a tree leerie installed for runs on that
+  tree's stores*, review round 23 exec M1): for a tree in `_DEPS_INSTALLED`,
+  the environment `_invoke` actually spawns the falsifier, acceptance
+  writer, surrogate fixer and set auditor with names, for every
+  `_TREE_STORE_VARS` variable, the value `_tree_stores_for` gives leerie's
+  commands in that tree (never the worker cache's), every other store stays
+  the side cache, `PATH` carries the tree's `pyuser/bin` and not the
+  cache's; the grant names the tree's stores `rw` for the three committing
+  workers and `ro` for the set auditor; a tree leerie never installed for
+  (a subtask's) keeps the implementer on its cache. Under real Landlock, the
+  falsifier's confined process runs by name a script an install-kind command
+  put in the tree's user base. In a runtime that can isolate: a real
+  `_ensure_worktree_deps` pip-installing pytest into the lane's user base,
+  then the falsifier's confined process running `pytest --version` and
+  `import pytest` from it. Live-falsified: `_invoke` without the overlay
+  turned 5 host cases red and the container pip case red with `exec pytest:
+  No such file or directory` (the review's symptom); `_installed_tree_stores`
+  ignoring `_DEPS_INSTALLED` turned the subtask-tree case red. Green rootless
+  and rootful in `leerie:r23` under the leerie-container profile.
 - `tests/test_heldout_sandbox_preflight.py` (10 test functions, 22 cases):
   `_sandbox_fix` on the shim's measured failure lines (and the specific
   `setgroups` rule winning over the generic `EACCES` one), the gate's die

@@ -2517,6 +2517,7 @@ worker gets the first block, then its kind's.
 | the CLI configuration template | `<run-dir>/claude-config/`, whose directories each worker's configuration links | read | `_claude_config_template` |
 | leerie's own code, the CLI, the worker's home | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check), the `claude` its `PATH` finds, and `$HOME` (the git identity, a package manager's config) unless it holds `/tmp`: each named, so that one under `/tmp` on a host is still read | read | — |
 | its side's download caches | one set per side of the run, shared by that side's workers (every store variable, the pnpm store, `XDG_CACHE_HOME`): `<run-dir>/workers/cache-held-out/` for a held-out-side worker (`HELD_OUT_LOG_WORKERS`), `<run-dir>/workers/cache/` for every other; never both (`_worker_cache_dir`) | write | `_worker_cache_env` |
+| its tree's own stores | `<run-dir>/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); the worker's per-tree store variables then name it in place of its side's cache | write for a worker that writes its tree, else read | `_tree_store_env` |
 | outside the state root | everything but `/tmp` (above) | read | — |
 | the run's system prompts | `<run-dir>/sysprompt/` | read | — |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml`, which `MISE_OVERRIDE_CONFIG_FILENAMES` names to every process of a Go repository's run (§6½ step 3): without it a worker's `mise` cannot load its configuration | read | `_synth_mise_go_override` |
@@ -6071,6 +6072,47 @@ in exactly one):
   store variables there, not `PATH`): leerie's unconfined process never
   resolves a program from a store directory, which a confined fetch writes
   (review round 23 isolation, an observation f0ce3e56 opened).
+
+**A worker started in a tree leerie installed for runs on that tree's
+stores.** Leerie prepares some trees for a worker: the acceptance writer's
+and the surrogate fixer's checkouts, each falsifier lane, the set audit's
+tree and, with `--dangerously-skip-permissions`, the planning worktree
+(`_ensure_worktree_deps` in each, before the worker starts). Where a
+manager installs inside the tree (`node_modules`, a `.venv`) the worker
+saw the install; where it installs into a per-tree store it did not.
+Review round 23 exec M1 measured it on a pip repository: leerie's install
+of each falsifier lane put pytest in that lane's user base
+(`<run-dir>/tree-stores/<lane>/pyuser`), the falsifier ran with
+`PYTHONUSERBASE` at its side's cache, and all 6 first samples answered
+"pytest isn't installed" (`could_not_demonstrate`); each re-ask
+improvised a `pip install --target /tmp/…` through egress. The root
+cause: the stores leerie's install of a tree writes and the stores a
+worker started in that tree reads were chosen by two functions
+(`_tree_store_env`, `_worker_cache_env`) that never agreed on a tree, so
+"a checkout with dependencies installed" held only for managers that
+install inside the tree. The invariant: *a worker started in a tree leerie
+installed for sees that install* — its interpreter, its manager and its
+`PATH` resolve what the install put in the tree's own stores. So one
+function chooses a tree's stores for every process started in it:
+`_tree_store_env` sets every per-tree variable (uv, cargo, bundler, NuGet,
+Go's build cache, pipenv, pnpm's metadata cache, pip's user base and its
+`bin` on `PATH`, the .NET CLI and bundler homes) for leerie's commands
+there and, laid over the worker's side cache, for a worker started there
+once leerie has installed for it (`_installed_tree_stores`: the tree is in
+this process's install record, the one that keeps leerie from installing a
+tree twice). The worker is granted the tree's stores as it is granted the
+tree: written by a worker that writes its tree (the writer, the surrogate,
+the falsifier — committing workers, whose code already runs in that tree
+and whose tree's stores no other tree reads), read by one that reads it
+(the set auditor; the judgment workers in the planning worktree). Nothing
+is copied into the worker's cache, and nothing crosses trees: a tree's
+stores are that tree's alone. A read-only worker cannot write what its
+manager writes there as it builds (Go's build cache), as it cannot write
+its tree. A tree leerie never installs for — a subtask's worktree and
+staging, which leerie measures only through their committed views (§8
+*Every measurement reads the committed view*), and every judge checkout —
+keeps its workers on their side's cache, where those workers' own installs
+land.
 
 The measurement grant gives a confined install exactly this: the fetched
 stores read-only, the verified ones writable, and its own tree's

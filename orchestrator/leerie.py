@@ -5914,22 +5914,34 @@ _FETCHED_STORE_VARS: frozenset[str] = frozenset({
     "COMPOSER_CACHE_DIR"})
 
 
-def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
-                    ) -> None:
-    """Point `env`'s `_TREE_STORE_VARS` at the tree `cwd` lies in, when that
-    tree is one of a run's (`<run-dir>/worktrees/<tree>`): `<run-dir>/
-    tree-stores/<tree>/<name>`, made here 0700 (`_mkdir_private`), like
-    every directory leerie makes for a measurement. A baked value is kept.
-    A `cwd` outside every run tree leaves `env` as it is."""
+def _tree_stores_dir(cwd: str | Path | None) -> tuple[Path, Path] | None:
+    """`(tree, stores)` for the run tree `cwd` lies in
+    (`<run-dir>/worktrees/<tree>`): its own stores are `<run-dir>/
+    tree-stores/<tree>/`. None for a `cwd` outside every run tree."""
     if cwd is None:
-        return
+        return None
     p = Path(os.path.abspath(cwd))
     for d in (p, *p.parents):
         if d.parent.name == "worktrees" and (d / ".git").exists():
-            root = d.parent.parent / "tree-stores" / d.name
-            break
-    else:
+            return d, d.parent.parent / "tree-stores" / d.name
+    return None
+
+
+def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
+                    ) -> None:
+    """Point `env`'s `_TREE_STORE_VARS` at the tree `cwd` lies in, when that
+    tree is one of a run's (`_tree_stores_dir`): `<run-dir>/
+    tree-stores/<tree>/<name>`, made here 0700 (`_mkdir_private`), like
+    every directory leerie makes for a measurement. A baked value is kept.
+    A `cwd` outside every run tree leaves `env` as it is. The one choice of
+    a tree's stores: leerie's commands there and a worker started in a tree
+    leerie installed for (`_installed_tree_stores`) both get it (DESIGN §6
+    *A worker started in a tree leerie installed for runs on that tree's
+    stores*)."""
+    found = _tree_stores_dir(cwd)
+    if found is None:
         return
+    root = found[1]
     user_base = env.get("PYTHONUSERBASE")
     for var in _TREE_STORE_VARS:
         if (env.get(var) or "").startswith(_BAKED_ROOT):
@@ -5948,6 +5960,32 @@ def _tree_stores_for(env: Mapping[str, str], cwd: str | Path | None
     out = dict(env)
     _tree_store_env(out, cwd)
     return out
+
+
+def _installed_tree_stores(cwd: str | Path | None) -> Path | None:
+    """The stores of the run tree `cwd` lies in when leerie's install ran
+    in that tree in this process (`_DEPS_INSTALLED`, the record that keeps
+    it from installing a tree twice), else None: a worker started there
+    must see that install (DESIGN §6 *A worker started in a tree leerie
+    installed for runs on that tree's stores*). A tree leerie never
+    installs for — a subtask's, staging — keeps its workers on their side's
+    cache, where their own installs land."""
+    found = _tree_stores_dir(cwd)
+    if found is None or os.path.realpath(found[0]) not in _DEPS_INSTALLED:
+        return None
+    return found[1]
+
+
+def _granted_tree_stores(grants: "WorkerGrants | None",
+                         cwd: str | Path | None) -> bool:
+    """Whether `grants` names the stores `_installed_tree_stores(cwd)`
+    returns: the worker's environment follows its grant, as its cache set
+    does (`_granted_cache_dir`)."""
+    stores = _installed_tree_stores(cwd)
+    if grants is None or stores is None:
+        return False
+    real = os.path.realpath(stores)
+    return any(os.path.realpath(p) == real for p in (*grants.rw, *grants.ro))
 
 
 # corepack resolves pnpm's version from the repo's `packageManager`, else a
@@ -23833,6 +23871,13 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         (sc / "run").mkdir(mode=0o700, parents=True, exist_ok=True)
         ro.append(str(sc))
         rw.append(str(sc / "run"))
+    # The stores of a tree leerie installed for, as the tree itself is
+    # granted: the worker sees that install (DESIGN §6 *A worker started in
+    # a tree leerie installed for runs on that tree's stores*).
+    tree_stores = _installed_tree_stores(cwd_r)
+    if tree_stores is not None:
+        _mkdir_private(tree_stores, run_dir)
+        (rw if str(cwd_r) in rw else ro).append(str(tree_stores))
     # No grant ever covers the state root whole, whatever a variable names
     # (`_reads_outside` never does, by construction: it is not re-checked,
     # which cost 0.3 s a call against a 2,000-entry `/tmp`, measured). Nor
@@ -24880,6 +24925,12 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # stores a view installs from are leerie's*).
     worker_env = _worker_cache_env(
         worker_env, leerie_dir, _granted_cache_dir(grants, leerie_dir))
+    # In a tree leerie installed for, its per-tree stores are the tree's,
+    # chosen by the one function leerie's own commands there use (DESIGN §6
+    # *A worker started in a tree leerie installed for runs on that tree's
+    # stores*; review round 23 exec M1).
+    if _granted_tree_stores(grants, cwd):
+        _tree_store_env(worker_env, cwd)
     # Every command and hook of a confined worker runs in a domain nested in
     # its CLI's, so none can write into the stream this reads (DESIGN §6 *A
     # worker's commands cannot reach its CLI*). `claude_p` also puts it in
