@@ -53,7 +53,7 @@ fi
 pgbin=""
 best=-1
 for d in /usr/lib/postgresql/*/bin; do
-  [ -x "$d/initdb" ] && [ -x "$d/pg_ctl" ] && [ -x "$d/createdb" ] || continue
+  { [ -x "$d/initdb" ] && [ -x "$d/pg_ctl" ] && [ -x "$d/createdb" ]; } || continue
   major=$(basename "$(dirname "$d")")
   [[ "$major" =~ ^[0-9]+$ ]] || major=0
   if [ "$major" -gt "$best" ]; then best=$major; pgbin=$d; fi
