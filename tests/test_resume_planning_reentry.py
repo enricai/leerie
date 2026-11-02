@@ -808,30 +808,31 @@ def test_genuinely_no_progress_and_no_task_still_dies(
             args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
 
 
-def test_progress_marker_with_no_waves_or_categories_still_dies(
-        leerie, monkeypatch, run_dirs, capsys):
-    """A resume whose state carries neither `waves` nor `categories` but
-    DOES carry a `current_phase` stamp (so the never-started demotion above
-    does not fire — a task with no progress at all is a fresh START, not
-    this case) hits the one genuinely-unusable resume state: it got past
-    its first save but never reached `_schedule()`, and there is no
-    checkpointed `plans` to re-enter from."""
+def test_progress_marker_with_no_waves_or_categories_reenters_classify(
+        leerie, monkeypatch, run_dirs):
+    """A resume whose state carries its task and phase 1's entry stamp but
+    neither `waves` nor `categories` — the run died inside classification —
+    re-enters at `phase_classify` (DESIGN §6 *The first phase is a phase like
+    any other*). This test pinned the opposite until review round 23 M2: a
+    refusal that keyed on the first phases' outputs instead of on the task,
+    and so refused the budget error's own "re-run with resume"."""
     calls: dict = {}
     _stub_common(leerie, monkeypatch, calls)
     st = _make_state(leerie, run_dirs, {
         "task": "test task", "worker_count": 1,
         "current_phase": "phase 1: classify",
+        "started_at": "2026-11-01T00:00:00Z",
+        "working_branch": "main", "pr_base_branch": "main",
     })
     caps = _caps(leerie)
     args = _args()
-    with pytest.raises(SystemExit):
-        asyncio.run(leerie._run_phases(
-            args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
-    err = capsys.readouterr().err
-    assert "cannot resume" in err
-    assert "records neither progress nor a task" in err
-    assert "phase_classify" not in calls, (
-        "this is the genuinely-unusable state — it must die(), not restart")
+    _drive(leerie, args, caps, run_dirs, st)
+    assert calls.get("phase_classify") == 1
+    assert "_preflight_repo" not in calls, (
+        "a run that entered phase 1 is resumed, not demoted to a fresh start")
+    assert calls.get("phase_plan") == 1
+    # Resumed, not reseeded: a fresh start would restamp `started_at`.
+    assert st.data["started_at"] == "2026-11-01T00:00:00Z"
 
 
 def test_resume_reexports_mise_override_env_var(

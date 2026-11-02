@@ -5200,7 +5200,15 @@ plan → reconcile → overlap-judge → adherence-gate → off-tree/satisfied
 filters → schedule) and re-enters at the first phase whose `plans_after_*`
 checkpoint key is absent, reusing the last completed phase's persisted
 `plans` rather than re-deriving from scratch. Rejects corrupt/hand-edited
-state without rejecting a legitimately-early interruption.
+state without rejecting a legitimately-early interruption. It is the only
+refusal of a state with no planning output: a run that recorded its task
+and died inside `phase_classify` (no `categories`, no `plans_after_*`)
+re-enters at `phase_classify` (DESIGN §6 *The first phase is a phase like
+any other*). A state with no `current_phase` stamp at all is started from
+its recorded task by the never-started demotion at the top of
+`_run_phases` (preflight, `_preflight_repo`, run identity), not resumed.
+Pinned by `tests/test_resume_after_phase1_death.py`, which drives the real
+`main()` through a phase-1 death and its resume.
 
 The `except SystemExit` handler in `main()` guards `st.save()` behind
 `st.data.get("task")` so that a failed `resume` (which `die()`s before

@@ -4309,6 +4309,28 @@ re-deriving it. A phase that already ran is never billed again; only the
 phases still needed to reach `_schedule()`/`_write_plan()` spend further
 budget.
 
+*The first phase is a phase like any other.* The one input `resume` needs
+is the run's `task`; everything else it re-derives by running the phases
+whose output is absent. So a run whose state records its task and no
+phase output at all — it died inside classification: the worker budget,
+a usage limit, a context-overflow or disk-low pause, a kill — re-enters at
+`phase_classify`, exactly as a run that died in reconcile re-enters at
+reconcile. A state with no usable task is the only one `resume` refuses
+(`_validate_resume_state`), because there is nothing to start from. Two
+steps come before the first phase rather than inside it: the run-start
+preflight and the run's identity in `run.json`. Those are done once
+`current_phase` holds phase 1's entry stamp, so a run whose state carries
+no stamp at all never got that far and is started from its recorded task
+instead of resumed. The invariant: *a run whose state records its task
+resumes at its first unpersisted phase.* It was broken from 2026-08-14 to
+2026-11-01 by a refusal of any state holding neither `waves` nor
+`categories`. That test keyed on the outputs of the first phases instead
+of on the input resume needs, so every exit inside classification that
+told the operator to resume — the budget error's own "re-run with resume
+after raising --max-workers" among them, and the rate-limit auto-resume's
+`exec` of `resume` — left a run that `resume` refused (review round 23
+M2).
+
 *A checkpoint covers only what ran before it is saved.* A step inside the
 block a checkpoint guards, but after the checkpoint's save, is skipped by
 every resume past that save, whether it finished or not. Provisioning

@@ -20095,9 +20095,11 @@ async def _scan_conflict_markers(staging: Path) -> str | None:
 def _validate_resume_state(data: dict) -> None:
     """Assert the structure of a loaded state.json before resuming. A corrupt
     or hand-edited file produces wrong behavior; fail fast rather than run
-    silently. Only `task` is strictly required here — a run interrupted before
-    scheduling has no `waves` yet, and main() handles that case separately with
-    a clearer message."""
+    silently. Only `task` is strictly required here — it is the one input a
+    resume needs (DESIGN §6 *The first phase is a phase like any other*): a
+    run interrupted before scheduling has no `waves` yet, and one interrupted
+    inside classification no `categories` either, and both re-enter at their
+    first unpersisted phase."""
     if "task" not in data or not str(data.get("task", "")).strip():
         die("state.json has no usable 'task' — cannot resume. "
             "Inspect the run's state.json manually "
@@ -67056,34 +67058,16 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 "resume")
             return
         # Resumable-planning re-entry (DESIGN §6 "Resumable planning — a
-        # per-phase checkpoint cursor, not a `waves` gate"). `waves` absent
-        # no longer means "cannot resume" — the shared pipeline below
-        # (used by both a fresh run and a resumed one) re-enters at the
-        # first phase whose `plans_after_*` checkpoint (or `plan_snapshot`
-        # for the post-_schedule/pre-_write_plan gap) is absent, reusing the
-        # last-persisted `plans` as that phase's input. A state.json with
-        # NONE of those keys and no `categories` either (i.e. the run
-        # never got past its very first st.save(), before phase_classify
-        # even started) is the only genuinely-unusable case left to reject.
-        if "waves" not in st.data and "categories" not in st.data:
-            # "Never started" is a RESTARTABLE state, not a corrupt one. The
-            # ordinary way to reach it is mundane — Ctrl-C, or a preflight
-            # refusal, before `phase_classify` ran — and the recorded `task` is
-            # intact, so there is nothing to recover and nothing to inspect:
-            # the run simply has to begin. Calling it "likely corrupt or
-            # hand-edited" sent an operator hunting a data-integrity problem
-            # that did not exist (docs/POSTMORTEM-2026-08-14.md, F15).
-            #
-            # Restarting in place is deliberate over die()ing: the run
-            # directory, its id and its flock already exist, and minting a
-            # second run for the same task is what R15's duplicate guard
-            # exists to prevent.
-            die(
-                "cannot resume — state.json records neither progress nor a "
-                "task, so there is nothing to start or continue. This is the "
-                "one genuinely unusable state: the run died before its very "
-                f"first save. Inspect {_operator_path(st.run_dir)}, or start a fresh run."
-            )
+        # per-phase checkpoint cursor, not a `waves` gate"): the shared
+        # pipeline below re-enters at the first phase whose output is absent,
+        # and with no phase output at all that is `phase_classify` (*The
+        # first phase is a phase like any other*). The one input a resume
+        # needs is the task, which `_validate_resume_state` has just
+        # required; there is deliberately no second refusal keyed on
+        # `waves`/`categories`. One stood here from 2026-08-14 and refused
+        # every run that died inside classification — the budget error's own
+        # "re-run with resume after raising --max-workers" among them
+        # (review round 23 M2).
         # Refresh the preferences in case env vars or leerie.toml
         # changed since the original run started. Verbosity is
         # resolved fresh every run — the user can dial up or down on
