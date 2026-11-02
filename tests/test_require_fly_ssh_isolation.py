@@ -12,6 +12,7 @@ darwin/linux dev box).
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import uuid
@@ -302,3 +303,86 @@ def test_require_fly_ssh_is_idempotent(short_home):
     assert counter.read_text().strip() == "1", (
         f"expected exactly 1 issuance across two calls, got {counter.read_text().strip()}"
     )
+
+
+# --- under the launcher's own shell options --------------------------------
+#
+# The launcher runs every Fly verb under `set -euo pipefail`, and a function
+# whose correctness depends on its caller's shell options must be tested
+# under those options, not in a bare `bash -c`. The tests above run without
+# `set -e` and passed while `_leerie_fly_agent_ensure` killed the launcher:
+# its bare `ssh-add -l` returned 1 against a keyless agent and `set -e`
+# exited before the `$?` it reads was ever examined.
+
+LAUNCHER = REPO_ROOT / "leerie"
+
+
+def _launcher_shell_options() -> str:
+    """The launcher's own `set` line, read from the launcher, so the test
+    follows the options the launcher actually runs under."""
+    for line in LAUNCHER.read_text().splitlines():
+        if line.startswith("set -"):
+            return line
+    raise AssertionError("the launcher has no top-level `set -` line")
+
+
+@pytest.mark.skipif(shutil.which("ssh-agent") is None
+                    or shutil.which("ssh-add") is None,
+                    reason="needs a real OpenSSH ssh-agent and ssh-add")
+def test_agent_ensure_reuses_a_keyless_agent_under_the_launchers_options(
+        short_home):
+    """A live private agent holding no identity (`ssh-add -l` rc 1 — its
+    state 24 h after its last Fly certificate) is reused, the caller
+    continues, and the spawn lock is released."""
+    agent_dir = short_home / ".cache" / "leerie" / "agent"
+    agent_dir.mkdir(parents=True, mode=0o700)
+    sock = agent_dir / "ssh-agent.sock"
+    started = subprocess.run(
+        ["ssh-agent", "-a", str(sock), "-t", "24h"],
+        capture_output=True, text=True, check=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(short_home)})
+    pid = int(started.stdout.split("SSH_AGENT_PID=")[1].split(";")[0])
+    probe = subprocess.run(["ssh-add", "-l"], capture_output=True,
+                           env={"SSH_AUTH_SOCK": str(sock)})
+    assert probe.returncode == 1, (
+        "precondition: a fresh agent with no identity answers rc 1; "
+        f"got {probe.returncode}")
+
+    result = _run_bash_isolated(
+        f"{_launcher_shell_options()}\n"
+        f"source {LIB_SH}\n"
+        "_leerie_fly_agent_ensure\n"
+        'echo "REACHED sock=$SSH_AUTH_SOCK"\n',
+        tmp_home=short_home)
+
+    assert result.returncode == 0, (result.returncode, result.stderr)
+    assert f"REACHED sock={sock}" in result.stdout, result.stdout
+    assert not (agent_dir / ".spawn.lock").exists(), "spawn lock leaked"
+    os.kill(pid, 0)  # the same agent still serves the socket
+    assert subprocess.run(["ssh-add", "-l"], capture_output=True,
+                          env={"SSH_AUTH_SOCK": str(sock)}).returncode == 1
+
+
+def test_agent_ensure_releases_the_lock_when_the_agent_cannot_start(
+        short_home):
+    """A spawn that fails returns its failure with a message and leaves no
+    lock behind for the next invocation to wait out."""
+    stub_dir = short_home / "bin"
+    stub_dir.mkdir()
+    stub = stub_dir / "ssh-agent"
+    stub.write_text("#!/bin/sh\nexit 3\n")
+    stub.chmod(0o755)
+    agent_dir = short_home / ".cache" / "leerie" / "agent"
+
+    result = _run_bash_isolated(
+        f"{_launcher_shell_options()}\n"
+        f'export PATH="{stub_dir}:$PATH"\n'
+        f"source {LIB_SH}\n"
+        "_leerie_fly_agent_ensure\n"
+        "echo REACHED\n",
+        tmp_home=short_home)
+
+    assert result.returncode == 3, (result.returncode, result.stderr)
+    assert "REACHED" not in result.stdout
+    assert "could not start leerie's private ssh-agent" in result.stderr
+    assert not (agent_dir / ".spawn.lock").exists(), "spawn lock leaked"

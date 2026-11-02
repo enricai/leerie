@@ -3292,13 +3292,9 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       _kill_ec2_creds_args=()
       while IFS= read -r _kill_ec2_a; do _kill_ec2_creds_args+=("$_kill_ec2_a"); done \
         < <(_leerie_aws_creds_args_tokens)
-      _kill_ec2_creds_exports="$(resolve_aws_credentials ${_kill_ec2_creds_args[@]+"${_kill_ec2_creds_args[@]}"})"
-      _kill_ec2_creds_rc=$?
-      if [ "$_kill_ec2_creds_rc" -ne 0 ]; then
-        exit 1
-      fi
+      _kill_ec2_creds_exports="$(resolve_aws_credentials ${_kill_ec2_creds_args[@]+"${_kill_ec2_creds_args[@]}"})" || exit 1
       eval "$_kill_ec2_creds_exports"
-      unset _kill_ec2_creds_args _kill_ec2_creds_exports _kill_ec2_creds_rc
+      unset _kill_ec2_creds_args _kill_ec2_creds_exports
       require_aws || exit 1
       LEERIE_EC2_INSTANCE_ID="$_kill_ec2_instance_id"
       export LEERIE_EC2_INSTANCE_ID
@@ -7938,7 +7934,7 @@ if [ "$RUNTIME" = "fly" ]; then
   # rest of this process tree. Must run BEFORE any flyctl ssh call so
   # Fly-issued certs never land in the user's main agent (which would
   # cause OpenSSH to offer them to github.com and trigger rate-limits).
-  _leerie_fly_agent_ensure
+  _leerie_fly_agent_ensure || exit 1
   if ! require_flyctl; then
     exit 1
   fi
@@ -8545,13 +8541,9 @@ elif [ "$RUNTIME" = "ec2" ]; then
   _leerie_aws_creds_args=()
   while IFS= read -r _leerie_aws_a; do _leerie_aws_creds_args+=("$_leerie_aws_a"); done \
     < <(_leerie_aws_creds_args_tokens)
-  _leerie_aws_creds_exports="$(resolve_aws_credentials ${_leerie_aws_creds_args[@]+"${_leerie_aws_creds_args[@]}"})"
-  _leerie_aws_creds_rc=$?
-  if [ "$_leerie_aws_creds_rc" -ne 0 ]; then
-    exit 1
-  fi
+  _leerie_aws_creds_exports="$(resolve_aws_credentials ${_leerie_aws_creds_args[@]+"${_leerie_aws_creds_args[@]}"})" || exit 1
   eval "$_leerie_aws_creds_exports"
-  unset _leerie_aws_creds_args _leerie_aws_creds_exports _leerie_aws_creds_rc
+  unset _leerie_aws_creds_args _leerie_aws_creds_exports
   if ! require_aws; then
     exit 1
   fi

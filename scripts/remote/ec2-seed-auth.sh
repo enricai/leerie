@@ -140,6 +140,7 @@ ec2_seed_auth() {
   for attempt in 1 2; do
     _seed_progress_bg "ec2_seed_auth" &
     _hb_pid=$!
+    tar_rc=0
     # `-z` (gzip) on both ends: the residual stage is mostly JSON /
     # markdown / small binaries; gzip cuts ~2x off the wire.
     # COPYFILE_DISABLE=1 strips the macOS provenance xattr so the stream
@@ -150,8 +151,7 @@ ec2_seed_auth() {
     COPYFILE_DISABLE=1 tar -czC "$STAGE" \
          $(_seed_auth_tar_excludes) \
          . \
-         | ec2_tar_pipe "$ssh_target" /home/leerie
-    tar_rc=$?
+         | ec2_tar_pipe "$ssh_target" /home/leerie || tar_rc=$?
     kill "$_hb_pid" 2>/dev/null || true
     wait "$_hb_pid" 2>/dev/null || true
     if [ "$tar_rc" -eq 0 ]; then

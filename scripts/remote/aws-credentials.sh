@@ -266,9 +266,8 @@ resolve_aws_credentials() {
         # shellcheck disable=SC2034  # field 2 of the helper's two-line
         # output; parsed to document the shape, not read on this path
         sso_region="$(sed -n '2p' <<<"$sso_out")"
-        local token rc
-        token="$(_aws_sso_cache_token "$start_url")"
-        rc=$?
+        local token rc=0
+        token="$(_aws_sso_cache_token "$start_url")" || rc=$?
         if [ "$rc" -eq 0 ]; then
           access_key=""
           secret_key=""

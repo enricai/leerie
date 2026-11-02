@@ -10420,6 +10420,12 @@ exit code **other than 2**: rc 0 (has keys) and rc 1 (reachable, no keys
 yet) both mean the agent is alive; only rc 2 (cannot connect) means the
 socket is stale. Treating rc 1 like rc 2 would unlink a live agent's
 socket out from under the still-running process.
+The exit code is captured (`ssh-add -l … || rc=$?`), never read from `$?`
+after a bare statement: the function runs under the launcher's
+`set -euo pipefail`, where a bare `ssh-add -l` returning 1 ends the launcher
+before the check. The function releases `.spawn.lock` on every return; a
+failed `ssh-agent` spawn returns its exit code with a `remote_log` line, and
+the launcher and `require_fly_ssh` stop on it.
 
 Any newly-spawned agent carries `-t 24h`, matching the 24h Fly cert
 (`flyctl ssh issue --agent`) — this bounds only the lifetime of

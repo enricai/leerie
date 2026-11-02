@@ -526,7 +526,7 @@ require_flyctl() {
 # accumulation). Never auto-killed. Reboot wipes the socket inode → next
 # run lazy-spawns fresh.
 _leerie_fly_agent_ensure() {
-  local agent_dir sock lockdir i
+  local agent_dir sock lockdir i rc=0
   agent_dir="${XDG_CACHE_HOME:-$HOME/.cache}/leerie/agent"
   sock="$agent_dir/ssh-agent.sock"
   lockdir="$agent_dir/.spawn.lock"
@@ -549,14 +549,20 @@ _leerie_fly_agent_ensure() {
   # subsequent function return up the call chain). Instead, we rmdir
   # explicitly at each return path below.
   if [ -S "$sock" ]; then
-    SSH_AUTH_SOCK="$sock" ssh-add -l >/dev/null 2>&1
     # ssh-add -l exit codes: 0 = has keys, 1 = agent reachable but has no
     # keys yet, 2 = cannot connect to the agent at all. Only rc 2 means
     # the socket is stale; rc 1 is a perfectly healthy, just-spawned or
     # freshly-cert-expired agent and must be reused, not respawned —
     # respawning on rc 1 unlinks a live agent's socket out from under it
     # (rm -f below) while the agent process keeps running, orphaning it.
-    if [ "$?" -ne 2 ]; then
+    #
+    # The status is data, so it is captured with `|| rc=$?`, never read
+    # from `$?` after a bare statement: under the launcher's `set -e` a bare
+    # `ssh-add -l` returning 1 ended the launcher right here, with no
+    # message and the spawn lock left behind for every later invocation
+    # to wait out.
+    SSH_AUTH_SOCK="$sock" ssh-add -l >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 2 ]; then
       export SSH_AUTH_SOCK="$sock"
       rmdir "$lockdir" 2>/dev/null || true
       return 0
@@ -577,9 +583,16 @@ _leerie_fly_agent_ensure() {
   # (it stops us orphaning a live agent in the first place); reaping an
   # agent orphaned some other way would need a real reaper, which does not
   # exist yet.
-  ssh-agent -a "$sock" -t 24h >/dev/null 2>&1
-  export SSH_AUTH_SOCK="$sock"
+  # The lock is released before a failure is returned, so a failed spawn
+  # does not make every later invocation wait out a lock nobody holds.
+  rc=0
+  ssh-agent -a "$sock" -t 24h >/dev/null 2>&1 || rc=$?
   rmdir "$lockdir" 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    remote_log "could not start leerie's private ssh-agent at $sock (ssh-agent exited $rc)"
+    return "$rc"
+  fi
+  export SSH_AUTH_SOCK="$sock"
 }
 
 # --- require_fly_ssh ------------------------------------------------------
@@ -600,7 +613,7 @@ _leerie_fly_agent_ensure() {
 # org), seed-auth will surface the original SSH error.
 require_fly_ssh() {
   local fly_org="${LEERIE_FLY_ORG:-personal}"
-  _leerie_fly_agent_ensure
+  _leerie_fly_agent_ensure || return 1
   if grep -qE 'CERT\)' < <(ssh-add -l 2>/dev/null); then
     return 0
   fi
@@ -658,10 +671,10 @@ wait_for_fly_ssh_ready() {
     # macOS Jetsam when the host is under memory pressure from
     # concurrent leerie runs. The probe still retries; we just don't
     # leak the alarming-looking stderr to the user.
+    probe_exit=0
     ( timeout --kill-after=2 10 flyctl ssh console --app "$fly_app" \
         --machine "$machine_id" --pty=false -C "true" \
-        </dev/null >/dev/null 2>&1 ) 2>/dev/null
-    probe_exit=$?
+        </dev/null >/dev/null 2>&1 ) 2>/dev/null || probe_exit=$?
     if [ "$probe_exit" -eq 0 ]; then
       remote_log "remote: hallpass ready on $machine_id"
       return 0

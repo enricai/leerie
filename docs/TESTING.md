@@ -516,14 +516,19 @@ per-completion write, including the `list(leaves)` copy that keeps a
 later crash from mutating an already-taken snapshot (the aliasing class
 `test_checkpoint_aliasing.py` exists for).
 
-`tests/test_require_fly_ssh_isolation.py` (8 tests) pins
+`tests/test_require_fly_ssh_isolation.py` (10 tests) pins
 `_leerie_fly_agent_ensure`'s reuse predicate, whose exit codes are the
 whole point: `ssh-add -l` returns **1** for a reachable-but-keyless agent,
 **0** with a key, **2** for a dead socket (verified live). Treating rc 1
 like rc 2 `rm -f`s a live agent's socket out from under it, orphaning the
 process — which is the leak. The `-t 24h` on spawn bounds the
 **identities**, not the agent process, so it is not an orphan mitigation;
-see `scripts/remote/lib.sh`'s comment.
+see `scripts/remote/lib.sh`'s comment. Two of them run the function under
+the launcher's own `set` line (read from `leerie`): a real keyless agent
+(`ssh-add -l` rc 1) is reused and the caller continues — a bare `ssh-add -l`
+under `set -e` had ended the launcher there silently, leaking
+`.spawn.lock` (review r25 M1), while the older tests, which run without
+`set -e`, stayed green — and a failed `ssh-agent` spawn returns with a message and no lock.
 
 ## fetch_branch, config, and group verbs
 

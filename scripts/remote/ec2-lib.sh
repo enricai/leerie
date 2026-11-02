@@ -172,9 +172,8 @@ ec2_remote_exec() {
   local _to=""
   _to="$(_seed_timeout_prefix)"
 
-  local out
-  out="$($_to aws ssm start-session "${aws_args[@]}" 2>&1)"
-  local transport_rc=$?
+  local out transport_rc=0
+  out="$($_to aws ssm start-session "${aws_args[@]}" 2>&1)" || transport_rc=$?
   if [ "$transport_rc" -eq 124 ] || [ "$transport_rc" -eq 137 ]; then
     printf '%s\n' "$out"
     return "$transport_rc"
