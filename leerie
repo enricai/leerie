@@ -5781,14 +5781,16 @@ fi
 _resume_run_id="$LEERIE_RUN_ID"
 if [ -z "$_NO_PUSH_CLI" ] && [ "$IS_RESUME" = "true" ] \
    && [ -z "$_resume_run_id" ] && [ "$RUNTIME" = "local" ]; then
-  _resume_run_id="$(python3 -B - "$LEERIE_REPO/orchestrator/leerie.py" \
-      "$LEERIE_STATE_HOST_DIR" <<'PY' 2>/dev/null || true
+  # The seam writes the pick to an output path: its stdout is the module
+  # log stream, never a return value (docs/POSTMORTEM-2026-08-14.md, F1).
+  _resume_pick_out="$(mktemp)"
+  python3 -B - "$LEERIE_REPO/orchestrator/leerie.py" \
+      "$LEERIE_STATE_HOST_DIR" "$_resume_pick_out" <<'PY' || true
 import contextlib, importlib.util, io, pathlib, sys
 spec = importlib.util.spec_from_file_location("leerie_orch", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
-out = sys.stdout
-# The pick's own log line and any die() message belong to the orchestrator's
-# run in the container, which makes the same pick and says so there.
+# The log line of the pick and any die() message are dropped here: the
+# orchestrator in the container makes the same pick and reports it there.
 with contextlib.redirect_stdout(io.StringIO()), \
         contextlib.redirect_stderr(io.StringIO()):
     try:
@@ -5797,9 +5799,11 @@ with contextlib.redirect_stdout(io.StringIO()), \
                                   resumable_only=True)
     except BaseException:
         picked = ""
-out.write(picked)
+pathlib.Path(sys.argv[3]).write_text(picked)
 PY
-)"
+  _resume_run_id="$(cat "$_resume_pick_out" 2>/dev/null || true)"
+  rm -f "$_resume_pick_out"
+  unset _resume_pick_out
 fi
 if [ -n "$_NO_PUSH_CLI" ]; then
   NO_PUSH="$_NO_PUSH_CLI"
