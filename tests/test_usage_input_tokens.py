@@ -9,8 +9,6 @@ call, which no worker that reads a repository can possibly use.
 `cost_usd` was unaffected, since it comes from the CLI's own `total_cost_usd`.
 That is why this went unnoticed for so long: the number operators watch was
 right while the tokens printed beside it were wrong by orders of magnitude.
-
-See docs/POSTMORTEM-2026-08-14.md, F21.
 """
 from __future__ import annotations
 

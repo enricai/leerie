@@ -1,6 +1,6 @@
 """A signal documented as advisory must not gate, and vice versa.
 
-Three instances, all measured in one corpus (docs/POSTMORTEM-2026-08-14.md, F23):
+Three instances, all measured in one corpus:
 
   * `NO_PLANNED_FILES_TOUCHED` gated on `files_likely_touched`, which
     `_clobbered_owned_files`' own docstring calls "advisory and NOT used

@@ -144,7 +144,7 @@ def test_cleanup_removes_worktrees_dir(leerie, tmp_path, monkeypatch):
     assert len(remove_calls) == 2
     # `git worktree prune` here is repository-global against a `.git` that is
     # bind-mounted and shared with the host, so it dropped every host-side
-    # `/tmp/tmp.*/rebase-*` registration (docs/POSTMORTEM-2026-08-14.md, F19).
+    # `/tmp/tmp.*/rebase-*` registration (tests/test_worktree_prune_scoping.py).
     # `_prune_leerie_worktrees` asks git what it WOULD prune (`-n -v`) and
     # removes only entries under this run's own directory.
     assert not any(c[-2:] == ["worktree", "prune"] for c in calls), (

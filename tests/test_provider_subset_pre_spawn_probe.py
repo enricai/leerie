@@ -16,7 +16,7 @@ What deliberately did NOT change: the flag never settles anything by itself.
 The probe decides, against a real tree, and fails safe to None — so anything
 short of a confident `satisfied` proceeds to the implementer untouched.
 
-See docs/POSTMORTEM-2026-08-14.md, F8, and DESIGN §8 *Probing a flagged
+See DESIGN §8 *Probing a flagged
 subtask before it spends*.
 """
 from __future__ import annotations

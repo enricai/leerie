@@ -14,7 +14,7 @@ sentence four lines above: 13 counts every kind outside `missing_requires`,
 which is the set the repair handlers DECLINE — they early-out on
 `kind != "missing_requires"` — and not the dismissal channel's scope.) One of them killed run 3bc46e7d ($20.32, 71 workers, 38
 minutes, no branch, no plan.json) on a finding whose named capability WAS
-provided by an in-plan subtask. See docs/POSTMORTEM-2026-08-14.md, F4.
+provided by an in-plan subtask.
 
 This file is the general guard: adding a sixth kind to the schema without giving
 it an arm fails here rather than in production, on a run that has already paid

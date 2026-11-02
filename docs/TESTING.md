@@ -873,7 +873,7 @@ non-retryable) so the pin fails loudly rather than silently if that changes.
 `OWNED_REGION_FILE_ESCAPE` is **gating** where the neighbouring
 `NO_PLANNED_FILES_TOUCHED` is advisory, and the distinction is provenance, not
 shape: `files_likely_touched` is a planner *guess* (re-driving on it produced a
-measured pure-rename commit, POSTMORTEM-2026-08-14 F23), while
+measured pure-rename commit; tests/test_advisory_signals_match_their_status.py), while
 `owned_region["file"]` is code-computed by `_subfile_split`. Two anti-vacuity
 pins keep it from firing where it shouldn't — `r7`'s compliant shape, and an
 ordinary subtask with no `owned_region` at all.

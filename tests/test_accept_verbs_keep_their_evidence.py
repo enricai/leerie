@@ -13,8 +13,6 @@ the evidence that advice pointed at. In one real run,
 Both also wrote through `NamedTemporaryFile` + `os.replace`, which keeps the
 SOURCE's mode — silently tightening `state.json` from 0644 to 0600, differing
 from how the orchestrator writes the same file.
-
-See docs/POSTMORTEM-2026-08-14.md, F16.
 """
 from __future__ import annotations
 

@@ -21,8 +21,6 @@ reading meaning out of prose — prescribing instead that "the owning worker mus
 surface it as a JSON field", which is what `not_applicable` is. The residual
 risk is one re-drive when a worker omits the flag: the behaviour before any of
 this existed, so not a regression.
-
-See docs/POSTMORTEM-2026-08-14.md, F3.
 """
 from __future__ import annotations
 

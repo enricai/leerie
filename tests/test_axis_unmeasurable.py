@@ -17,8 +17,6 @@ axis could be reported clean. One run shipped a PR whose entire test axis never
 executed — its command did not exist on that tree — because `tests` was also in
 `red_axes` from the baseline and the exclusion swallowed a second, different
 unmeasurability.
-
-See docs/POSTMORTEM-2026-08-14.md, F5 and F6.
 """
 from __future__ import annotations
 
@@ -35,8 +33,7 @@ from tests.source_strip import code_only as _code_only   # single owner; see tha
 # The signatures measured in real runs, and what each must classify as.
 # The negative half is as load-bearing as the positive: reading a genuine OOM as
 # "unmeasurable" would hide exactly the failures the baseline exists to surface
-# (docs/POSTMORTEM-2026-08-14.md, retraction R3 — the run whose base was red for
-# a missing test database and a real heap OOM, both genuine).
+# (the run whose base was red for a missing test database and a real heap OOM, both genuine).
 _UNMEASURABLE = [
     ("thread 'main' panicked: OS can't spawn worker thread: Resource "
      "temporarily unavailable (os error 11)"),

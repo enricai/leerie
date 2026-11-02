@@ -46,7 +46,7 @@ leerie_repo_lock
 # leerie takes its branch back into the run repository. Its registration is
 # private to that repository, so siblings never race on it; the run
 # repository's own registry is pruned for this run (scoped, never a bare
-# `git worktree prune`: POSTMORTEM-2026-08-14 F19).
+# `git worktree prune`: tests/test_worktree_prune_scoping.py).
 prune_leerie_worktrees "${RUN_DIR}"
 
 # The branch is leerie's, in the run repository: cut from the run branch's

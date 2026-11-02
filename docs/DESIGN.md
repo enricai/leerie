@@ -4802,7 +4802,7 @@ Measured: one brief ran twice three minutes apart, for $72.21 across 173
 worker calls, and produced two architecturally incompatible branches with
 14 files in collision — two PRs whose merge order decides which design
 survives. Neither run was wrong; nothing told either one the other existed
-(docs/POSTMORTEM-2026-08-14.md, F10).
+(tests/test_duplicate_task_guard.py).
 
 So a run records a fingerprint of its task text (`task_sha256` on
 `run.json`) and, before spawning its first worker, refuses to start when
@@ -13363,7 +13363,7 @@ every later measurement can hit the same condition, and the loop predicate
 must treat it as unresolved rather than silently clean: reading an
 unmeasured axis as clean is how a run once shipped a PR whose test axis
 never ran at all, its unmeasurability swallowed by the same `red_axes`
-exclusion meant for the baseline (docs/POSTMORTEM-2026-08-14.md, F6). This
+exclusion meant for the baseline (tests/test_axis_unmeasurable.py). This
 is rare by construction, so treating it as unresolved costs almost nothing.
 
 The baseline was already handed to the *worker* as prose in a `BASELINE:`
@@ -14482,7 +14482,7 @@ limits killed it (e.g. `pids.max` blocking a worker-thread spawn). Leaving
 the second uncovered pushed the judgment into workers, which then
 adjudicated it in prose — measured across a run corpus, 37 worker calls
 reasoned about `os error 11` and decided for themselves it was
-environmental (docs/POSTMORTEM-2026-08-14.md, F5). §12 says that decision
+environmental (tests/test_axis_unmeasurable.py). §12 says that decision
 belongs in code.
 
 A RED base is surfaced loudly (`log()` warning plus `run.json.health.base_suite`)

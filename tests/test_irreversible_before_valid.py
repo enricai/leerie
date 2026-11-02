@@ -1,7 +1,6 @@
 """Validate before committing irreversible state; survive your own exception.
 
-Three faces of one class, all measured in the same corpus
-(docs/POSTMORTEM-2026-08-14.md, F14 and F15):
+Three faces of one class, all measured in the same corpus:
 
   * `main()` constructed `State(...)` — which mints `<state-root>/runs/<run-id>/`,
     takes its flock and writes `state.json` — and only then reached the

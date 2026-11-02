@@ -5,8 +5,6 @@ Measured on one repo after three weeks: **1.5 GB** across 71 run dirs and
 left in the user checkout — while leerie's own preflight dies on low disk
 headroom and tells the operator to prune by hand.
 
-See docs/POSTMORTEM-2026-08-14.md, F22.
-
 The verb is dry-run by default: it deletes run directories that may hold the
 only record of a paid-for run, so the safe mode is the one you get without
 asking for it.

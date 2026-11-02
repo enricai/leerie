@@ -12,8 +12,6 @@ the `elif` to the terminal_reason branch) and compared the success-path number
 against the flag bounding the other one. Measured across a real corpus, 61 of
 those warnings fired and **11 were arithmetically impossible**: 21/20, 26/20,
 28/20, 31/30, and 62 through 72 out of 60, across three different caps.
-
-See docs/POSTMORTEM-2026-08-14.md, F7.
 """
 from __future__ import annotations
 

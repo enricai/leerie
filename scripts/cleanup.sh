@@ -126,7 +126,7 @@ _clean_one_run_here() {
   # `git worktree prune` is repository-global with no grace period, so
   # inside a container sharing the host's .git it destroys host-side
   # worktrees whose paths the container cannot see (scripts/worktree-lib.sh;
-  # docs/POSTMORTEM-2026-08-14.md, F19). THIS run's only, under the
+  # tests/test_worktree_prune_scoping.py). THIS run's only, under the
   # repository-wide lock (a subshell, so the lock ends with the prune).
   ( leerie_repo_lock; prune_leerie_worktrees "${run_dir}" )
 

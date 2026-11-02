@@ -32,7 +32,7 @@ def _fired(out: str) -> bool:
 
 def test_fires_on_test_with_no_edges_and_a_producer(leerie, capsys):
     # Real plans are per-domain, and the warn now reads the owning plan's
-    # domain rather than the id prefix (docs/POSTMORTEM-2026-08-14.md, F18),
+    # domain rather than the id prefix (tests/test_no_id_prefix_dispatch.py),
     # so the fixture has to be shaped the way a planner actually emits it.
     plans = [
         {"domain": "testing", "status": "ready", "subtasks": [

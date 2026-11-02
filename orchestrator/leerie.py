@@ -2412,8 +2412,8 @@ def _subtask_item_schema(
         # Does this subtask fix a symptom the task REPORTED as currently
         # broken? `check_symptom_evidence` gates on this, and on nothing
         # else — deliberately not on an id-prefix heuristic (CLAUDE.md
-        # *Language-to-JSON*: POSTMORTEM-2026-08-14 F18 measured 10/10 false
-        # positives from an id-prefix inference). Deliberately OPTIONAL, and
+        # *Language-to-JSON*: an id-prefix inference measured 10/10 false
+        # positives; tests/test_no_id_prefix_dispatch.py). Deliberately OPTIONAL, and
         # absence means "no" — the check is advisory, so a silent check is
         # strictly better than one at a 100% false-positive rate.
         properties["fixes_reported_symptom"] = {"type": "boolean"}
@@ -3156,7 +3156,7 @@ SCHEMAS: dict[str, dict] = {
                         # COULD NOT PASS: measured, bugfix-008 took 3 drives
                         # ($1.96) and feat-003 took 3 ($3.00), one of them
                         # narrating the contradiction before being re-driven
-                        # for it (docs/POSTMORTEM-2026-08-14.md, F3).
+                        # for it (tests/test_conformance_owned_criteria.py).
                         #
                         # Optional, and absent means "this was mine to
                         # evaluate", so nothing changes for the ordinary case.
@@ -3699,8 +3699,7 @@ SCHEMAS: dict[str, dict] = {
                     "properties": {
                         # True when the conformer fixed it here; absent
                         # means residual. Why it exists, and why a bool rather
-                        # than a status enum: POSTMORTEM-2026-08-14 F11 and
-                        # tests/test_conformer_fixed_defects.py.
+                        # than a status enum: tests/test_conformer_fixed_defects.py.
                         "fixed": {"type": "boolean"},
                         "kind": {"type": "string",
                                  "enum": _SOLUTION_DEFECT_KINDS},
@@ -4568,7 +4567,7 @@ SCHEMAS: dict[str, dict] = {
                         #     the provider-exists predicate would have dismissed
                         #     it — but the parenthetical made the lookup miss
                         #     and killed the run: $20.32, 71 workers, 38
-                        #     minutes, no branch (POSTMORTEM-2026-08-14, F4).
+                        #     minutes, no branch (tests/test_wiring_defect_kind_coverage.py).
                         #
                         # The pattern forbids parentheses ONLY. It deliberately
                         # still allows spaces, commas and slashes, because
@@ -4857,7 +4856,7 @@ def _operator_path(p: "str | Path") -> str:
     The orchestrator runs inside a container where the state root is mounted at
     `/leerie-state`, so a message naming `<state-root>/runs/<id>/state.json`
     prints a path that does not exist on the machine reading it: `ls
-    /leerie-state` fails on the host (docs/POSTMORTEM-2026-08-14.md, F17).
+    /leerie-state` fails on the host (tests/test_operator_path_translation.py).
 
     The launcher forwards the host side of that bind-mount as
     `LEERIE_STATE_HOST_DIR_DISPLAY`. The `_DISPLAY` suffix is deliberate and
@@ -6222,7 +6221,7 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
     prune), so it drops the registration of every worktree whose path is absent
     from *this* namespace — including each host-side
     `/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates, which no container
-    can see (docs/POSTMORTEM-2026-08-14.md, F19).
+    can see (tests/test_worktree_prune_scoping.py).
 
     The shell scripts were converted first and these four Python sites were
     missed, because the sweep and its guard were both scoped to `scripts/*.sh`.
@@ -7294,7 +7293,7 @@ def _task_fingerprint(task: str) -> str:
     are invisible to each other. Measured: one task ran twice, three minutes
     apart, for $72.21 across 173 worker calls, producing two architecturally
     incompatible branches with 14 files in collision and two PRs whose merge
-    order matters (docs/POSTMORTEM-2026-08-14.md, F10)."""
+    order matters (tests/test_duplicate_task_guard.py)."""
     return hashlib.sha256((task or "").encode("utf-8")).hexdigest()
 
 
@@ -12395,7 +12394,7 @@ async def _preflight_repo() -> None:
     which calls `preflight()`. So a refusal here used to leave a permanent run
     directory behind for a run that never started: four of them accumulated on
     one host from a single afternoon's dirty-tree refusals
-    (docs/POSTMORTEM-2026-08-14.md, F14).
+    (tests/test_irreversible_before_valid.py).
 
     These three need nothing but the checkout, so they run first and the run
     directory is only created once the repo is fit to run against. Everything
@@ -12437,7 +12436,7 @@ async def _preflight_repo() -> None:
         # measured case both files were leerie's OWN tracked config
         # (`leerie.toml`, `.leerie/config.toml`) — so tuning leerie dirtied the
         # tree leerie then refused to run in, with nothing in the message
-        # connecting the two (docs/POSTMORTEM-2026-08-14.md, F14).
+        # connecting the two (tests/test_irreversible_before_valid.py).
         _shown = [l[3:] for l in dirty[:10]]
         _own = [f for f in _shown
                 if f == "leerie.toml" or f.startswith(".leerie/")]
@@ -15282,7 +15281,7 @@ def check_implementer_output(
             # 1b9b52f5/test-007 was re-driven into a pure-rename commit
             # (+$0.49, 2.3 min) whose only content was moving a test from the
             # repo convention to the planner path
-            # (docs/POSTMORTEM-2026-08-14.md, F23). The label is still emitted
+            # (tests/test_advisory_signals_match_their_status.py). The label is still emitted
             # so the operator sees it; `_ADVISORY_ISSUES` keeps it out of the
             # retry decision.
             issues.append(
@@ -15388,7 +15387,7 @@ def check_symptom_evidence(result: dict, sid: str,
     re-homes a `feat-` subtask under a surviving `bugfix-` id. Measured across
     the run corpus, **10 of 10 findings were false positives** — every one of
     them a test, coverage or verification subtask that never had a symptom
-    (docs/POSTMORTEM-2026-08-14.md, F18). A warning at that rate is one nobody
+    (tests/test_no_id_prefix_dispatch.py). A warning at that rate is one nobody
     reads, which costs more than the check is worth.
 
     `fixes_reported_symptom` is optional on the subtask schema and its absence
@@ -16787,7 +16786,7 @@ def _sid_domain_map(plans: list[dict]) -> dict[str, str]:
     another and keeps the *survivor's* id, and `_repair_prescribed_commands`
     mints its verification subtask's id from the HOST subtask's domain. Reading
     the owning plan's domain is invariant under both
-    (docs/POSTMORTEM-2026-08-14.md, F18)."""
+    (tests/test_no_id_prefix_dispatch.py)."""
     out: dict[str, str] = {}
     for plan in plans:
         domain = plan.get("domain") or ""
@@ -17199,7 +17198,7 @@ def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
 # re-homed when a duplicate-provider/overlap merge folds one subtask into
 # another, and `_repair_prescribed_commands` synthesises ids from a *host*
 # subtask's domain — so an id prefix is not evidence of what the work is
-# (docs/POSTMORTEM-2026-08-14.md, F18).
+# (tests/test_no_id_prefix_dispatch.py).
 _TEST_OWNERSHIP_CODE_DOMAINS = frozenset(
     {"bug-fixing", "feature-implementation", "refactoring"})
 
@@ -17280,7 +17279,7 @@ def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
 # different thing entirely. Measured, both of its firings in one run were false:
 # `credential-field-docurl-support` (adding a docUrl to a form field spec) and
 # `passare-credential-check-helper` (a client-side API ping), neither touching
-# env files or wanting to (docs/POSTMORTEM-2026-08-14.md, F23). The remaining
+# env files or wanting to (tests/test_advisory_signals_match_their_status.py). The remaining
 # keywords name configuration plumbing rather than a subject area.
 _ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key"})
 
@@ -20463,7 +20462,7 @@ async def _best_effort_capture_deps(
     tuple for the same reason: a terminal arm exists to record a disposition,
     so a second Ctrl-C during this best-effort capture must not escape and
     skip the exit_code/cleanup that arm was reached to set
-    (docs/POSTMORTEM-2026-08-14.md, F15).
+    (tests/test_irreversible_before_valid.py).
 
     `context_label` is interpolated into the non-fatal log line only — it
     names which pause this capture attempt belongs to (e.g. "disk-low
@@ -29654,7 +29653,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # claimed to detect is exactly what the branch above already reports,
             # from the CLI's own terminal signal, and because its premise (that
             # near-cap output is degraded) was never measured here.
-            # See docs/POSTMORTEM-2026-08-14.md, F7.
+            # See tests/test_turn_cap_signal.py.
 
             return envelope
 
@@ -29991,7 +29990,7 @@ def _usage_input_tokens(usage: dict) -> int:
     ~460 input tokens per call, which no worker that reads a repository can
     possibly use. Every leerie worker runs with prompt caching, so for these
     calls the cached fields are the bulk of the input, not a footnote
-    (docs/POSTMORTEM-2026-08-14.md, F21).
+    (tests/test_usage_input_tokens.py).
 
     `cost_usd` was unaffected — it comes from the CLI's own `total_cost_usd` —
     which is why the discrepancy went unnoticed: the number operators watch was
@@ -37504,7 +37503,7 @@ def _filter_provably_false_wiring_defects(
     `die()`. That killed run 3bc46e7d — $20.32, 71 workers, 38 minutes, no
     branch and no plan.json — on a finding whose named capability WAS provided
     by an in-plan subtask, i.e. exactly the shape this predicate refutes
-    (docs/POSTMORTEM-2026-08-14.md, F4). Note repairing a `missing_provides` by
+    (tests/test_wiring_defect_kind_coverage.py). Note repairing a `missing_provides` by
     appending the tag to the named subtask's `provides` was considered and
     rejected: unlike a `requires` edge, which only ORDERS existing work and
     cannot invent any, a `provides` tag CLAIMS the work exists, so a wrong
@@ -40464,7 +40463,7 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
         # missing file: 11 wasted `tool-fail` reads across two runs, on the
         # highest-stakes prompt in the system, the one that also carries the
         # completeness gate's mandatory criteria
-        # (docs/POSTMORTEM-2026-08-14.md, F23). Opening a prompt with an
+        # (tests/test_advisory_signals_match_their_status.py). Opening a prompt with an
         # instruction that fails teaches the worker to discount what follows.
         _ckpt = _checkpoint_path(leerie_dir, sid)
         if _ckpt.is_file():
@@ -41898,7 +41897,7 @@ def _actionable_solution_defects(conf_res: dict | None) -> list[dict]:
     gap shared one channel, so the gate read both as outstanding and blocked a
     run on work its own conformer had already committed — after which that
     subtask's branch was never integrated and the run shipped a backend with no
-    UI (docs/POSTMORTEM-2026-08-14.md, F11). Absent `fixed` means residual, so
+    UI (tests/test_conformer_fixed_defects.py). Absent `fixed` means residual, so
     a conformer that never sets it behaves exactly as before."""
     if not isinstance(conf_res, dict):
         return []
@@ -41994,7 +41993,7 @@ async def _merge_base_sha(worktree: str, a: str, b: str) -> str:
     that branch checked out — the name moves the instant the worktree commits,
     so the base and `HEAD` become the same ref and every comparison collapses
     (DESIGN §9 *No clobbering the implementer's work*; see
-    docs/POSTMORTEM-2026-08-14.md, F2, where exactly that produced a false
+    tests/test_clobbered_owned_files.py; exactly that produced a false
     clobber report on every run whose final conformer committed anything)."""
     if not a or not b:
         return ""
@@ -43036,7 +43035,7 @@ def _conformance_clean(conf_res: dict, baseline: dict | None = None) -> bool:
         # whose entire test axis never executed (its command did not exist on
         # that tree) because `tests` was independently in `red` from the
         # baseline, so this predicate returned clean without ever looking at
-        # `measured` (docs/POSTMORTEM-2026-08-14.md, F6). Checked BEFORE the
+        # `measured` (tests/test_axis_unmeasurable.py). Checked BEFORE the
         # red-axis exclusion for exactly that reason. Rare by construction —
         # measured, 1 of 46 final axes that ran — so this blocks almost never.
         if a.get("ran") and not a.get("measured"):
@@ -46866,7 +46865,7 @@ def _axis_unmeasurable(output: str) -> bool:
     prose: measured across a run corpus, 37 worker calls reasoned about
     `OS can't spawn worker thread: Resource temporarily unavailable (os error
     11)` and each decided for itself that it was environmental. DESIGN §12 puts
-    that decision in code (docs/POSTMORTEM-2026-08-14.md, F5).
+    that decision in code (tests/test_axis_unmeasurable.py).
 
     Note what this deliberately does NOT catch. A vitest pool reporting
     `Worker forks emitted error` / `Worker exited unexpectedly`, or a Next.js
@@ -60644,7 +60643,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # conformer committed nothing reported nothing, which is the control. Under
     # `--strict-conformer` the same false positive drives
     # `_restore_tree`, i.e. it would `git reset --hard` away every
-    # legitimate final-conformer fix (docs/POSTMORTEM-2026-08-14.md, F2).
+    # legitimate final-conformer fix (tests/test_clobbered_owned_files.py).
     #
     # `fork_point..staging_before` is what the owned-set docstring actually
     # means here: the union of all integrated implementer work. `git merge-base`
@@ -67316,7 +67315,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # — the run simply has to begin. It restarts in place rather than asking
     # for a fresh run because the run directory, its id and its flock already
     # exist, and minting a second run for the same task is what the
-    # duplicate-task guard exists to prevent (POSTMORTEM-2026-08-14, F15).
+    # duplicate-task guard exists to prevent (tests/test_resume_planning_reentry.py).
     if args.resume and st.load():
         # "Never started" must exclude runs that TERMINATED without waves:
         # a completed run and a no-work run both reach the resume arm's own
@@ -67365,7 +67364,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # skipped the git-identity, dirty-tree and branch-collision checks
             # that every other fresh run gets. They live only in
             # `_preflight_repo()` since it was split out of `preflight()`
-            # (POSTMORTEM-2026-08-14, F14), so `preflight()` below does not
+            # (tests/test_irreversible_before_valid.py), so `preflight()` below does not
             # cover them. The skip-on-resume rationale does not apply here
             # either: its point is that a resumed run's directory already
             # exists so there is nothing left to protect, and what this path
@@ -67722,7 +67721,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 # text launched twice is otherwise invisible: measured, one
                 # task ran twice three minutes apart for $72.21, producing two
                 # architecturally incompatible branches with 14 files in
-                # collision (docs/POSTMORTEM-2026-08-14.md, F10).
+                # collision (tests/test_duplicate_task_guard.py).
                 #
                 # Checked here, before the first worker, because this is the
                 # last cheap moment. The escape hatch is an env var rather than
@@ -69029,7 +69028,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # `state.json`. Refusing after that leaves a permanent run directory for a
     # run that never started — four accumulated on one host from a single
     # afternoon of dirty-tree refusals, indistinguishable in `leerie list` from
-    # runs that did work (docs/POSTMORTEM-2026-08-14.md, F14). Skipped on
+    # runs that did work (tests/test_irreversible_before_valid.py). Skipped on
     # `resume`: a resumed run's directory already exists, so there is nothing
     # left to protect, and re-checking would refuse a resume for a dirty tree
     # the operator may be mid-way through fixing.

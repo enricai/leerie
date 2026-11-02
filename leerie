@@ -1505,7 +1505,7 @@ PY
     # weeks: 1.5 GB across 71 run dirs and 23,158 repo-map-cache entries, plus
     # 64 stale leerie/subtasks/* branches left in the user checkout -- while
     # leerie preflight itself dies on low disk headroom and tells the operator
-    # to prune by hand (docs/POSTMORTEM-2026-08-14.md, F22).
+    # to prune by hand (tests/test_prune_verb.py).
     #
     # Dry-run by DEFAULT. This deletes run directories that may hold the only
     # record of a paid-for run, so the safe mode is the one you get without
@@ -2408,7 +2408,7 @@ if not force and not in_registry and cur not in ("blocked", "failed"):
 # waived subtask was byte-indistinguishable from one that genuinely succeeded,
 # and the blocker it was waived for had been deleted. Following the advice of
 # the tool destroyed the evidence that advice pointed at
-# (docs/POSTMORTEM-2026-08-14.md, F16).
+# (tests/test_accept_verbs_keep_their_evidence.py).
 _blocker = bl.get(sid) if isinstance(bl, dict) else None
 st.setdefault("accepted_blocked", {})[sid] = {
     "at": datetime.datetime.now(datetime.timezone.utc)
@@ -2740,7 +2740,7 @@ defects = st.get("integration_defects", {})
 # Keep what was accepted, on the entry itself, before dropping it from the
 # live registry. Same rule as accept-blocked: a waiver that deletes the finding
 # it waived leaves nobody able to say what was waived
-# (docs/POSTMORTEM-2026-08-14.md, F16).
+# (tests/test_accept_verbs_keep_their_evidence.py).
 entry["accepted_at"] = (datetime.datetime.now(datetime.timezone.utc)
                         .strftime("%Y-%m-%dT%H:%M:%SZ"))
 if isinstance(defects, dict) and defects.get(sid) is not None:
@@ -9251,7 +9251,7 @@ else
     #
     # Without it, a die() naming <state-root>/runs/<id>/state.json prints
     # /leerie-state/..., and `ls /leerie-state` fails on the operator machine
-    # (docs/POSTMORTEM-2026-08-14.md, F17). The bind-mount below already knows
+    # (tests/test_operator_path_translation.py). The bind-mount below already knows
     # the answer; nothing carried it across.
     -e "LEERIE_STATE_HOST_DIR_DISPLAY=${LEERIE_STATE_HOST_DIR:-}"
     ${_leerie_env_args[@]+"${_leerie_env_args[@]}"}

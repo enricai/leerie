@@ -5794,8 +5794,8 @@ useful one — the finding may already be fixed) or `MALFORMED_SYMPTOM_EVIDENCE`
 `check_implementer_output`, since a retry cannot make a stale finding
 un-stale. Scoped by the planner's **declaration**, never by the subtask's id
 (a `bugfix-` id prefix is not evidence a symptom exists — ids are re-homed by
-merges — and scoping on it produced false positives across the run corpus,
-docs/POSTMORTEM-2026-08-14.md F18). Takes the **orchestrator's** `sid` rather
+merges — and scoping on it produced false positives across the run corpus;
+see tests/test_no_id_prefix_dispatch.py). Takes the **orchestrator's** `sid` rather
 than the worker's echoed `result["subtask_id"]`. Pinned by
 `tests/test_symptom_evidence.py`.
 
