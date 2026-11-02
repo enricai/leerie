@@ -47,7 +47,11 @@ def _launcher_keys() -> list[str]:
     return m.group(1).split()
 
 
-def _env(home: Path, **extra: str) -> dict[str, str]:
+def _operator_env(home: Path, **extra: str) -> dict[str, str]:
+    """The operator's environment without leerie's settings, under `home`.
+    Not an EC2 launcher environment (tests/ec2_stub.py's
+    `build_ec2_launcher_env` points the state root inside its checkout,
+    which this file's launcher refuses)."""
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("LEERIE_")}
     env.update(HOME=str(home), **extra)
@@ -58,7 +62,7 @@ def _launch(checkout: Path, home: Path, *args: str,
             **extra: str) -> subprocess.CompletedProcess:
     """The real launcher, started from the checkout as an operator does."""
     return subprocess.run([str(LAUNCHER), *args], cwd=checkout,
-                          env=_env(home, **extra), capture_output=True,
+                          env=_operator_env(home, **extra), capture_output=True,
                           text=True, timeout=120)
 
 
@@ -142,7 +146,7 @@ printf 'STATE=%s\nTEE=%s\n' "$LEERIE_STATE_HOST_DIR" "$_log_tee_target"
         'log_file = "~/.bashrc"\nstate_dir = ".lstate"\n')
     out = subprocess.run(
         ["/bin/bash", "-c", "set -euo pipefail\n" + block, "leerie"],
-        cwd="/", env={**_env(home), "USER_REPO": str(co)},
+        cwd="/", env={**_operator_env(home), "USER_REPO": str(co)},
         capture_output=True, text=True, check=True).stdout
     got = dict(ln.split("=", 1) for ln in out.splitlines())
     assert got["STATE"] == str(home / ".leerie" / "checkout")
