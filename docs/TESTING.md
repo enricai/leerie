@@ -635,6 +635,48 @@ the launcher's own `set` line (read from `leerie`): a real keyless agent
 under `set -e` had ended the launcher there silently, leaking
 `.spawn.lock` (review r25 M1), while the older tests, which run without
 `set -e`, stayed green — and a failed `ssh-agent` spawn returns with a message and no lock.
+Its per-test HOME fixture stops that test's agents by PID
+(`tests/conftest.py::stop_ssh_agents_under`), not by `pkill -f`.
+
+**No ssh-agent outlives the session.** The Fly seed reaches
+`require_fly_ssh`, whose spawn starts leerie's private agent under
+`${XDG_CACHE_HOME:-$HOME/.cache}/leerie/agent/`; it daemonizes, and under
+the session HOME
+nothing stopped it, so `tests/test_re_seed.py`, `tests/test_seed_repo_sh.py`,
+`tests/test_seed_inspect_dirs.py` and the seed tests importing their stubs
+leaked one agent per pytest session, on CI too. Their seeding subject does
+not need the agent: each stub `flyctl` writer also puts a no-op `ssh-agent`
+beside it (`tests/stub_helpers.py::_make_stub_ssh_agent`). The controlling
+pytest process's `pytest_sessionfinish` (`tests/conftest.py`) fails the
+session when any `ssh-agent` whose argv names the agent directory the
+product derives (`leerie_agent_dir()`) or the session's base temp
+directory (where a test's own `XDG_CACHE_HOME` puts it) is still alive,
+and stops it by PID either way. Falsified: with `_make_stub_ssh_agent` writing no stub,
+`tests/test_re_seed.py` alone exits 1 naming the agent, and none survives.
+The session's `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and
+`XDG_STATE_HOME` are set under its HOME, and `_home_is_never_the_users`
+fails a test that points one at the user's own home or at the value
+inherited from the user's environment (a test's own `tmp_path` is fine):
+with an `XDG_CACHE_HOME` inherited from outside, the agent lived beyond the HOME, a leaking session passed and its
+agent survived (review round 29 isolation F3).
+`tests/test_session_agent_guard.py` (1 test) runs a child session given an
+outside `XDG_CACHE_HOME` that starts the agent and does not stop it: the
+session fails, the agent was under the child's HOME, and none survives.
+Falsified: with the conftest before this, the agent's socket is under the
+outside directory and the test fails.
+
+**No test writes the user's real `~/.leerie`.** The same hook fails the
+session when the user's real `~/.leerie` (`REAL_HOME`) gains a top-level
+entry during it: names are listed at conftest's first import and compared at
+the end, read only, nothing removed. Empty `logs/` directories under names
+such as `ci-old` and `sub` had been found there. `tests/test_session_real_home_guard.py`
+(4 tests) runs a child session whose user's home is scratch: one that writes
+`~/.leerie/ci-old/logs` there fails naming it and leaves it in place, one
+that writes nothing passes. Falsified: with the comparison disabled, the
+first test fails. The per-test check refuses an XDG directory at the user's
+home and accepts one beneath `tmp_path`; and the session's own temp root is
+never the user's place, so with a TMPDIR beneath the user's home the
+session HOME and a test's `tmp_path` there are accepted.
 
 `tests/test_resume_push_writes_pr.py` (4 tests) drives the real
 `_run_phases` resume of a finished run with only `claude_p` stubbed: a resume

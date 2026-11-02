@@ -38,7 +38,7 @@ from pathlib import Path
 
 from tests.conftest import run_bash
 
-from tests.stub_helpers import _make_stub_timeout
+from tests.stub_helpers import _make_stub_ssh_agent, _make_stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_SH = REPO_ROOT / "scripts" / "remote" / "seed-repo.sh"
@@ -150,6 +150,7 @@ esac
 """
     )
     stub_path.chmod(0o755)
+    _make_stub_ssh_agent(stub_path.parent)
 
 
 def test_seed_repo_sh_exists():
