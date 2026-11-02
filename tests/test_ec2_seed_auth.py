@@ -75,8 +75,8 @@ def _make_stub_git(stub_path: Path, *, name: str = "Test User",
                     email: str = "test@example.com") -> None:
     stub_path.write_text(
         f"""#!/usr/bin/env bash
-if [ "$1" = 'config' ] && [ "$2" = 'user.name' ]; then echo '{name}'; exit 0; fi
-if [ "$1" = 'config' ] && [ "$2" = 'user.email' ]; then echo '{email}'; exit 0; fi
+if [ "$1" = '-C' ] && [ "$3" = 'config' ] && [ "$4" = 'user.name' ]; then echo '{name}'; exit 0; fi
+if [ "$1" = '-C' ] && [ "$3" = 'config' ] && [ "$4" = 'user.email' ]; then echo '{email}'; exit 0; fi
 exit 0
 """
     )
@@ -90,6 +90,7 @@ def _base_env(tmp_path: Path, stage: Path, **extra: str) -> dict:
         "STAGE": str(stage),
         "CLAUDE_CODE_OAUTH_TOKEN": "",
         "PATH": f"{tmp_path}:/usr/bin:/bin",
+        "USER_REPO": str(tmp_path),
     }
     env.update(extra)
     return env
@@ -437,8 +438,8 @@ def test_ec2_seed_auth_writes_git_identity(tmp_path):
     fake_git = tmp_path / "git"
     fake_git.write_text(
         "#!/usr/bin/env bash\n"
-        "if [ \"$1\" = 'config' ] && [ \"$2\" = 'user.name' ] && [ \"$#\" -eq 2 ]; then echo 'O'\"'\"'Brien'; exit 0; fi\n"
-        "if [ \"$1\" = 'config' ] && [ \"$2\" = 'user.email' ] && [ \"$#\" -eq 2 ]; then echo 'obrien@example.com'; exit 0; fi\n"
+        "if [ \"$1\" = '-C' ] && [ \"$3\" = 'config' ] && [ \"$4\" = 'user.name' ] && [ \"$#\" -eq 4 ]; then echo 'O'\"'\"'Brien'; exit 0; fi\n"
+        "if [ \"$1\" = '-C' ] && [ \"$3\" = 'config' ] && [ \"$4\" = 'user.email' ] && [ \"$#\" -eq 4 ]; then echo 'obrien@example.com'; exit 0; fi\n"
         "exec /usr/bin/git \"$@\"\n"
     )
     fake_git.chmod(0o755)

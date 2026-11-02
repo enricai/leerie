@@ -231,9 +231,16 @@ ec2_seed_auth() {
   # --- 3. Set git identity on the remote instance -------------------------
   # Read user.name and user.email from the host git config and set them
   # globally on the instance. Workers commit as the host user.
+  # The checkout's identity, which a repository-local one overrides: named
+  # with -C, never taken from the working directory, which is `/` (DESIGN
+  # §6 *The host never runs a program the checkout chose*, part 1).
   local git_name git_email
-  git_name="$(git config user.name 2>/dev/null || true)"
-  git_email="$(git config user.email 2>/dev/null || true)"
+  if [ -z "${USER_REPO:-}" ]; then
+    remote_log "ec2_seed_auth: USER_REPO is not set; cannot read the checkout's git identity"
+    return 1
+  fi
+  git_name="$(git -C "$USER_REPO" config user.name 2>/dev/null || true)"
+  git_email="$(git -C "$USER_REPO" config user.email 2>/dev/null || true)"
 
   if [ -z "$git_name" ] || [ -z "$git_email" ]; then
     remote_log "ec2_seed_auth: git user.name or user.email is not configured on the host."

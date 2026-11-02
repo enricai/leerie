@@ -12361,6 +12361,38 @@ def _payload_only_cwd(st: object) -> str:
     return str(d)
 
 
+def _exe_from_root(name: str) -> str:
+    """`name` as PATH finds it from `/`, as an absolute path; `name` itself
+    when it holds a `/` or PATH has no such program. A relative or empty
+    PATH entry names a directory below the working directory, so it is
+    anchored at `/`, never at the directory a host program would start in
+    (DESIGN §6 *The host never runs a program the checkout chose*, part 4)."""
+    if "/" in name:
+        return name
+    entries = os.environ.get("PATH", os.defpath).split(os.pathsep)
+    found = shutil.which(name, path=os.pathsep.join(
+        os.path.join("/", d) for d in entries))
+    return os.path.abspath(found) if found else name
+
+
+def _host_worker_cwd(*trees: str | Path) -> Path:
+    """A fresh, empty, private directory for a host-side worker to start in
+    (DESIGN §6 *The host never runs a program the checkout chose*, part 4):
+    never a checkout or a tree, nor a directory in one, so no shim chooses
+    its CLI and the CLI reads no project settings from them. The trees it
+    works on are named to it by `--add-dir`. Raises OSError when the system
+    temporary directory is one of `trees` or lies beneath one."""
+    d = Path(tempfile.mkdtemp(prefix="leerie-host-cwd-"))
+    real = Path(os.path.realpath(d))
+    for t in trees:
+        rt = Path(os.path.realpath(t))
+        if real == rt or real.is_relative_to(rt):
+            _rmtree_owned(d)
+            raise OSError(errno.EINVAL,
+                          f"the temporary directory {real} is inside {rt}")
+    return d
+
+
 def _judgment_cwd(st: "State") -> str:
     """The cwd every judgment worker runs in.
 
@@ -19230,8 +19262,11 @@ def run_rebaser(
     `worktree` is a worktree of the rebaser's own repository (DESIGN §6
     *The run's own repository*) checked out on `run_branch`,
     created by the caller (`host-finalize.sh`) BEFORE this runs and removed
-    by the caller AFTER — this function only operates inside it via the
-    `rebaser` worker's own `cwd`.
+    by the caller AFTER — this function only operates on it: the `rebaser`
+    worker is told its path and given it by `--add-dir`, and starts in an
+    empty directory of leerie's (`_host_worker_cwd`), never in the worktree,
+    which holds the run branch's content (DESIGN §6 *The host never runs a
+    program the checkout chose*, part 4).
 
     This is a scoped, fully-agentic exception to §12 ("prompts are advisory,
     code enforces"): the worker performs the entire rebase workflow itself —
@@ -19300,8 +19335,12 @@ def run_rebaser(
             "confidence": {"resolution": 0.0},
         }
 
+    # Leerie's own git names the worktree and starts from `/`; the worker's
+    # CLI starts in a directory of leerie's (DESIGN §6 *The host never runs
+    # a program the checkout chose*, part 4): the worktree is the run
+    # branch, which no operator has merged.
     pre_rebase_sha_r = asyncio.run(
-        run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd=str(worktree)))
+        run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd="/"))
     if pre_rebase_sha_r.returncode != 0:
         return {
             "status": "failed",
@@ -19337,6 +19376,7 @@ def run_rebaser(
     run_base = st.data.get("base_sha") or working_branch
     sys_prompt = _load_prompt("rebaser")
     user_prompt = (
+        f"The disposable worktree: {worktree}\n"
         f"Current branch (this worktree's checkout): {run_branch}\n"
         f"Base branch to rebase onto: {pr_base_branch}\n"
         f"Only replay commits unique to {run_branch} — i.e. the range "
@@ -19344,13 +19384,14 @@ def run_rebaser(
         f"{pr_base_branch}. Do not touch any other branch."
     )
 
-    async def _call_with_strict_output() -> dict:
+    async def _call_with_strict_output(cwd: Path) -> dict:
         async with _strict_output_proxy(caps, "rebaser"):
             return await claude_p(
                 user_prompt=user_prompt,
                 system_prompt=sys_prompt,
                 schema_key="rebaser",
-                cwd=str(worktree),
+                cwd=str(cwd),
+                add_dirs=[str(worktree)],
                 allowed_tools=ACT_TOOLS,
                 max_turns=60,
                 autonomous=True,
@@ -19361,9 +19402,11 @@ def run_rebaser(
                 sid=f"rebaser-{run_id}",
             )
 
+    neutral: Path | None = None
     try:
+        neutral = _host_worker_cwd(repo_root, worktree)
         st.bump_workers(caps)
-        result = asyncio.run(_call_with_strict_output())
+        result = asyncio.run(_call_with_strict_output(neutral))
     # See run_recapture_deps's identical guard above: TerminalAuthFailure /
     # RateLimitedExit are BaseException subclasses a bare `except Exception`
     # would miss, and this call must never propagate past host-finalize.sh's
@@ -19377,6 +19420,9 @@ def run_rebaser(
             "diagnosis": str(exc),
             "confidence": {"resolution": 0.0},
         }
+    finally:
+        if neutral is not None:
+            _rmtree_owned(neutral)
     # claude_p() returns the already schema-validated structured_output dict
     # directly (not an envelope) — it raises WorkerError, never returns a
     # dict missing required fields, so `result` here is always well-formed
@@ -20204,7 +20250,7 @@ async def _rebase_state_dirs(worktree: Path) -> list[str] | None:
     present = []
     for name in ("rebase-merge", "rebase-apply"):
         r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "--git-path", name],
-                           cwd=str(worktree))
+                           cwd="/")
         if r.returncode != 0:
             return None
         if (worktree / r.stdout.strip()).exists():
@@ -20224,7 +20270,7 @@ async def _conflict_marker_size(worktree: Path, path: str) -> int:
     r = await run_proc(
         ["git", *_tree_git_args(worktree), "--literal-pathspecs", "check-attr", "-z",
          "conflict-marker-size", "--", path],
-        cwd=str(worktree))
+        cwd="/")
     fields = r.stdout.split("\0") if r.returncode == 0 else []
     value = fields[2] if len(fields) > 2 else ""
     return int(value) if value.isdigit() and int(value) > 0 else 7
@@ -20247,7 +20293,7 @@ async def _introduced_conflict_markers(
     check = await run_proc(
         ["git", *_tree_git_args(worktree), "-c", "core.quotePath=off", "diff", "--no-color",
          "--no-renames", "--check", since, "--"],
-        cwd=str(worktree))
+        cwd="/")
     # 0 clean, 2 markers or whitespace errors; anything else is git failing
     if check.returncode not in (0, 2):
         return None
@@ -20257,7 +20303,7 @@ async def _introduced_conflict_markers(
 
     numstat = await run_proc(
         ["git", *_tree_git_args(worktree), "diff", "--numstat", "-z", "--no-renames", since, "--"],
-        cwd=str(worktree))
+        cwd="/")
     if numstat.returncode != 0:
         return None
     unchecked = [entry[4:] for entry in numstat.stdout.split("\0")
@@ -20273,7 +20319,7 @@ async def _introduced_conflict_markers(
             ["git", *_tree_git_args(worktree), "--literal-pathspecs", "diff", "--text", "--no-textconv",
              "--no-ext-diff", "--no-color", "--no-renames", "-U0", since,
              "--", path],
-            cwd=str(worktree))
+            cwd="/")
         if diff.returncode != 0:
             return None
         lineno = None
@@ -20342,7 +20388,7 @@ async def check_rebaser_worktree_state(
         return (f"rebaser claimed {status!r} but worktree is still "
                 f"mid-rebase ({in_progress[0]} present) — abort did not "
                 f"complete")
-    r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd=str(worktree))
+    r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd="/")
     if r.returncode != 0:
         return f"could not verify worktree HEAD after rebaser claimed {status!r}"
     current_sha = r.stdout.strip()
@@ -25483,7 +25529,10 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     except BaseException:
         await exec_hold.aclose()
         raise
-    spawn_cmd = (list(cmd) if grants is None
+    # Unconfined (the host-side seam): the CLI is found from `/`, never
+    # through PATH from the directory it starts in (DESIGN §6 *The host
+    # never runs a program the checkout chose*, part 4).
+    spawn_cmd = ([_exe_from_root(cmd[0]), *cmd[1:]] if grants is None
                  else _confined_argv(grants, list(cmd)))
     gate_r: int | None = None
     gate_w: int | None = None

@@ -53,24 +53,25 @@ _host_finalize_update_run_json() {
   mv "$tmp" "$sidecar"
 }
 
-# _host_finalize_pre_push_hook_present <repo> — mechanical hook-classification
-# probe (N24). Resolves the hooks directory the same way git itself does
-# (honoring `core.hooksPath` when set, falling back to git's own git-dir-
-# relative default via `rev-parse --git-path hooks` so worktrees and
-# non-standard `.git` layouts resolve correctly too) and tests for an
-# executable `pre-push` file there. Returns 0 when an executable pre-push
-# hook exists, 1 otherwise; prints nothing. This is
-# structural — it never inspects push stderr text, unlike vendor-specific
-# prose (husky's banner, "exit code 254") which is arbitrary and misses
-# non-husky or newer-husky hook failures entirely.
-_host_finalize_pre_push_hook_present() {
-  local repo="$1"
-  local hooks_dir
+# Leerie's own hooks directory for a push (`_repo_git_push`): its hooks run
+# the operator's from the top of the work tree.
+_HOST_FINALIZE_PUSH_HOOKS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/push-hooks"
+
+# _host_finalize_hooks_dir <repo> — the hooks directory git itself would run
+# <repo>'s hooks from, printed absolute: `core.hooksPath` when set (a relative
+# one is relative to the top of the work tree, where git runs hooks), else
+# git's own git-dir-relative default via `rev-parse --git-path hooks`, so
+# worktrees and non-standard `.git` layouts resolve correctly too. Prints
+# nothing when git cannot say.
+_host_finalize_hooks_dir() {
+  local repo="$1" hooks_dir top
+  top="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$top" ] || top="$repo"
   hooks_dir="$(git -C "$repo" config --get core.hooksPath 2>/dev/null || true)"
   if [ -n "$hooks_dir" ]; then
     case "$hooks_dir" in
       /*) : ;;                              # already absolute
-      *) hooks_dir="$repo/$hooks_dir" ;;    # relative to the worktree top
+      *) hooks_dir="$top/$hooks_dir" ;;     # relative to the worktree top
     esac
   else
     hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null || true)"
@@ -81,11 +82,23 @@ _host_finalize_pre_push_hook_present() {
       *) hooks_dir="$repo/$hooks_dir" ;;
     esac
   fi
+  printf '%s' "$hooks_dir"
+}
+
+# _host_finalize_pre_push_hook_present <repo> — mechanical hook-classification
+# probe (N24): an executable `pre-push` in the hooks directory git would run
+# (`_host_finalize_hooks_dir`). Returns 0 when one exists, 1 otherwise;
+# prints nothing. This is structural — it never inspects push stderr text,
+# unlike vendor-specific prose (husky's banner, "exit code 254") which is
+# arbitrary and misses non-husky or newer-husky hook failures entirely.
+_host_finalize_pre_push_hook_present() {
+  local hooks_dir
+  hooks_dir="$(_host_finalize_hooks_dir "$1")"
   [ -n "$hooks_dir" ] && [ -x "$hooks_dir/pre-push" ]
 }
 
 # _repo_git_from_root <repo> <git args...> — a git command that reaches a
-# remote (`fetch`, `ls-remote`, `remote show`, a hook-less `push`), run from
+# remote (`fetch`, `ls-remote`, `remote show`, `push` by `_repo_git_push`), run from
 # `/` with the repository named by its git directory and work tree. Such a
 # command starts the transport (`ssh`) and the credential helper (`gh auth
 # git-credential`) in git's own working directory, and `git -C` makes that
@@ -103,23 +116,25 @@ _repo_git_from_root() {
 }
 
 # _repo_git_push <repo> <push args...> — `git push`, from `/` like any other
-# command that reaches a remote, except when it will run the repository's own
-# pre-push hook: git starts a hook in its working directory, and the
-# operator's hook expects the work tree there, so that push keeps `-C`. The
-# hook is the operator's, and starts what it starts in the checkout, as the
-# same `git push` run by hand would (DESIGN §6 *The host never runs a program
-# the checkout chose*, part 4).
+# command that reaches a remote, so git starts the transport and the
+# credential helper there, never in the checkout. git runs the push's hooks
+# from leerie's own hooks directory (`core.hooksPath`); each of those changes
+# into the top of the work tree and execs the operator's hook of the same
+# name, if any, with git's arguments, stdin and environment — where and how
+# git itself would have started it — so only the operator's hook starts in
+# the checkout (DESIGN §6 *The host never runs a program the checkout chose*,
+# part 2). `--no-verify` still skips them: git then runs no pre-push hook.
 _repo_git_push() {
-  local _rp_repo="$1"
+  local _rp_repo="$1" _rp_top
   shift
-  case " $* " in
-    *" --no-verify "*) ;;
-    *) if _host_finalize_pre_push_hook_present "$_rp_repo"; then
-         git -C "$_rp_repo" push "$@"
-         return
-       fi ;;
-  esac
-  _repo_git_from_root "$_rp_repo" push "$@"
+  _rp_top="$(git -C "$_rp_repo" rev-parse --show-toplevel 2>/dev/null)" \
+    || _rp_top="$_rp_repo"
+  LEERIE_HOOKS_DIR="$(_host_finalize_hooks_dir "$_rp_repo")" \
+    LEERIE_HOOK_WORK_TREE="$_rp_top" \
+    LEERIE_HOOK_GCP_SET="${GIT_CONFIG_PARAMETERS+1}" \
+    LEERIE_HOOK_GCP="${GIT_CONFIG_PARAMETERS-}" \
+    _repo_git_from_root "$_rp_repo" \
+      -c "core.hooksPath=$_HOST_FINALIZE_PUSH_HOOKS" push "$@"
 }
 
 # _host_finalize_is_auth_or_network_push_error <stderr> — is this push
@@ -538,7 +553,10 @@ host_bring_back_run_branch() {
 host_apply_captured_deps() {
   local run_dir="$1"
   [ -f "$run_dir/captured-deps.json" ] || return 0
-  python3 -I - "$run_dir" "$USER_REPO" "$LEERIE_REPO/orchestrator/leerie.py" \
+  # The same value for the seam's log label as for its argument.
+  # shellcheck disable=SC2097,SC2098
+  USER_REPO="$USER_REPO" \
+    python3 -I - "$run_dir" "$USER_REPO" "$LEERIE_REPO/orchestrator/leerie.py" \
       <<'PY' >&2 || echo "[leerie] capture: could not apply $run_dir/captured-deps.json; it is kept" >&2
 import importlib.util, pathlib, sys
 
@@ -569,7 +587,8 @@ _host_finalize_rebase_repo() {
   for ref in "refs/heads/$base" "refs/remotes/origin/$base"; do
     if git -C "$USER_REPO" rev-parse --verify -q "$ref" >/dev/null 2>&1; then
       git --git-dir="$dir" -c core.hooksPath=/dev/null fetch --quiet --no-tags \
-        --no-write-fetch-head "$USER_REPO" "+$ref:$ref" >/dev/null 2>&1 \
+        --no-write-fetch-head --no-recurse-submodules "$USER_REPO" \
+        "+$ref:$ref" >/dev/null 2>&1 \
         || return 1
     fi
   done
@@ -835,7 +854,8 @@ PY
       # outright — measured, it broke 20 of 32 tests in
       # tests/test_host_finalize_sh.py, none of them about the rebase. `( … )`
       # restores the containment without restoring the shared channel.
-      ( python3 -I "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
+      # shellcheck disable=SC2097,SC2098  # its log label and its argument
+      ( USER_REPO="$USER_REPO" python3 -I "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
           "$USER_REPO" "$run_id" "$_rebase_worktree" "$run_branch" \
           "$working_branch" "$pr_base_branch" \
           "$LEERIE_REPO/orchestrator/leerie.py" "$_rebaser_out" \
@@ -862,7 +882,8 @@ PY
       # scratch refs are deleted below.
       local _rebase_scratch_ref="refs/leerie-rebase-scratch/${run_id}"
       git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch \
-        --no-write-fetch-head --no-auto-maintenance "$_rebase_worktree" \
+        --no-write-fetch-head --no-auto-maintenance --no-recurse-submodules \
+        "$_rebase_worktree" \
         "HEAD:$_rebase_scratch_ref" --force >/dev/null 2>&1 || true
       # The PR base as the rebaser fetched it: the one remote-tracking ref
       # finalize reads afterwards (`working_branch=origin/<base>` below).
@@ -872,6 +893,7 @@ PY
            >/dev/null 2>&1; then
         git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch --quiet \
           --no-tags --no-write-fetch-head --no-auto-maintenance \
+          --no-recurse-submodules \
           "$_rebase_repo" \
           "+refs/remotes/origin/$pr_base_branch:refs/remotes/origin/$pr_base_branch" \
           >/dev/null 2>&1 || true

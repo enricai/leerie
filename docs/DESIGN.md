@@ -2649,11 +2649,16 @@ checkout's own program. Even `leerie --help` ran it, with the operator's
 credentials and no confinement (review round 26, isolation I2). The same
 held for every program a shim stands for: `bash` itself (the launcher's
 `#!/usr/bin/env bash` resolved it from the checkout), `git`, `gh`, `jq`,
-`nerdctl`, `flyctl`, `aws`, `ssh`. The root cause is that the host started
-programs with the checkout as their working directory. The invariant:
-**no host program leerie starts has the checkout, or a directory in it,
-as its working directory, unless git itself must start it there.** It is
-constructed in four parts.
+`nerdctl`, `flyctl`, `aws`, `ssh`, and `claude` with the `node` its
+`#!/usr/bin/env node` names. A relative PATH entry (`.`,
+`node_modules/.bin`) does the same without a shim. The root cause is that
+the host started programs with a checkout or a tree as their working
+directory. The invariant: **no host program leerie starts has a checkout
+or a tree, or a directory in either, as its working directory, nor is
+found through one.** A checkout here is the user's, and a tree is any
+other worktree of a repository a run wrote, such as the rebaser's
+worktree of the run branch, whose content is the workers' and which
+nobody has merged. The invariant is constructed in five parts.
 
 1. *The launcher leaves the checkout before it runs anything.* It starts
    under `/bin/sh`, whose path no shim chooses. It records the checkout
@@ -2664,32 +2669,66 @@ constructed in four parts.
    (`python3`, `git`, `gh`, `jq`, `nerdctl`, `flyctl`, `aws`, `ssh-agent`,
    `ssh-add`) is found and started from `/`. A path the operator gave
    relative to where they started (a flag, `LEERIE_STATE_DIR`,
-   `LEERIE_LOG_FILE`) is anchored at the recorded checkout.
-2. *git is pointed at the checkout, never started in it.* A local git
-   command names the repository with `-C`. git changes into the work tree
-   itself, and starts nothing there that the repository chooses. A git
-   command that reaches a remote (`push`, `fetch`, `ls-remote`,
-   `remote show`) starts the transport (`ssh`) and the credential helper
-   (`gh auth git-credential`) in its own working directory. So it names
-   the repository by its git directory and work tree from `/`
-   (`_repo_git_from_root`). `gh` runs from `/` with `GIT_DIR` and
+   `LEERIE_LOG_FILE`) is anchored at the recorded checkout. Leaving the
+   checkout must not change what any host command means, so nothing on
+   the host takes the checkout from its working directory any more: a
+   recorded checkout that is empty (a deleted directory) stops the
+   launcher, a local git read names the checkout with `-C` (the Fly and
+   EC2 seeds' git identity, which a repository-local identity overrides),
+   and every host seam that loads the orchestrator is given the checkout
+   as `USER_REPO`, which its log lines are labelled with (review round 27,
+   exec M1, L1, L3).
+2. *git is pointed at a checkout or a tree, never started in it.* A local
+   git command names the repository with `-C`. git changes into the work
+   tree itself, and starts nothing there that the repository's content
+   chooses. A git command that reaches a remote (`push`, `fetch`,
+   `ls-remote`, `remote show`) starts the transport (`ssh`) and the
+   credential helper (`gh auth git-credential`) in its own working
+   directory. So it names the repository by its git directory and work
+   tree from `/` (`_repo_git_from_root`). A push does this too when the
+   operator has a `pre-push` hook: git runs the hooks of leerie's own
+   hooks directory (`core.hooksPath`), whose `pre-push` changes into the
+   work tree and execs the operator's hook with its arguments, its stdin
+   and its environment. So the hook alone starts in the work tree, as git
+   would start it, and the transport and the credential helper start in
+   `/`. Every fetch on the host carries `--no-recurse-submodules`. A fetch
+   that brings in a commit moving a submodule otherwise runs `git fetch`
+   inside that submodule's git directory in the checkout, which starts the
+   submodule's transport there. `gh` runs from `/` with `GIT_DIR` and
    `GIT_WORK_TREE`, which it honours when it resolves the repository.
-3. *No shell git starts inside a submodule runs a program.* The seed's
-   `git submodule foreach` body only prints each submodule's path. The
-   bundling runs from the caller's directory with `git -C`.
-4. *The exception is what git must start in the work tree by its own
-   design.* These are the operator's own `pre-push` hook (git starts a
-   hook in its working directory, so a push that will run one keeps
-   `-C`), a checkout's hooks and filters, and the host-side workers the
-   section above names (the rebaser and `config --chat` run the CLI in a
-   tree on purpose). They start whatever the operator configured. A
-   `git push` the operator runs by hand from that checkout starts the
-   same programs.
+3. *No shell git starts inside a submodule runs a program, and no
+   submodule path is parsed as text.* The seed's `git submodule foreach`
+   body only prints each submodule's path, as NUL-terminated records. A
+   path is repository content and may hold a newline or a tab, so a
+   line-based list let one submodule forge another entry naming any
+   repository on the host (review round 27, isolation I4). The bundling
+   runs from the caller's directory with `git -C`. Each bundle is named by
+   the hex of its path's bytes, so the name that reaches the machine's
+   shell is never shell syntax, and no two paths share a name.
+4. *A host-side worker starts from a directory leerie owns.* The rebaser
+   and `config --chat` start `claude` in a fresh, empty directory that
+   leerie made outside every checkout and tree. They name the tree by
+   `--add-dir` and in the prompt. `claude` is found once, from `/`, as an
+   absolute path. The CLI reads its project settings and its `CLAUDE.md`
+   from its working directory, which is now that directory, not the run
+   branch. The rebaser's own git commands name the worktree with `-C` or
+   `--git-dir` from `/`. Its worktree is a tree of the run branch, which
+   the operator has not merged, so "the operator configured it" never
+   applied to it (review round 27, isolation I1).
+5. *The exception is what must start in a tree by its own design.* These
+   are the operator's `pre-push` hook (part 2), the hooks and filters a
+   local git command runs in the work tree it names, and the commands the
+   rebaser's and the config session's own shell tool run in the tree they
+   were told to work on. That last case is the agentic exception (§12
+   *Scoped exception — finalize-time rebase*), not a program leerie
+   starts.
 
 A rule pins the class: a test puts a shim, built from shell builtins and
 absolute paths, in front of a bounded list of the programs above. It runs
-the launcher's host-only paths from a hostile checkout and asserts that no
-shim was started with its working directory inside the checkout.
+the launcher's host-only paths, the rebaser and a push with a hook from a
+hostile checkout, and asserts that no shim was started with its working
+directory inside the checkout or the tree. A static rule requires
+`--no-recurse-submodules` on every host fetch.
 
 **Residuals.** A committing worker can move any ref of its own tree
 repository, its tree's branch included; leerie takes only that branch, and

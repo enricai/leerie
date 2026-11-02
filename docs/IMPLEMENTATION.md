@@ -100,7 +100,17 @@ prologue sets `LEERIE_LAUNCHER_CWD=$(pwd -P)`, makes `$0` absolute, does
 `cd /`, resolves `_leerie_bash=$(command -v bash)` from there, and execs
 it with `LEERIE_LAUNCHER_PID=$$` exported, so the bash pass skips the
 prologue. That pass sets `USER_REPO` from `LEERIE_LAUNCHER_CWD`, unsets
-the markers, and never changes into the checkout again. An
+the markers, and never changes into the checkout again.
+The prologue refuses an empty `pwd -P` as well as a failing one (dash
+prints nothing and exits 0 in a deleted directory). No host file falls back
+to the working directory for the checkout (`${USER_REPO:-$PWD}` is gone:
+`USER_REPO` is always set), and `seed_auth`/`ec2_seed_auth` read the
+identity with `git -C "$USER_REPO" config user.name|user.email`, returning 1
+when `USER_REPO` is unset. Every host `python3 -I` that loads
+`orchestrator/leerie.py` (`--help`, `_exec_readonly_on_host`,
+`config --recapture`, the bare-resume pick, `host_apply_captured_deps`, the
+rebaser seam) is started with `USER_REPO=<checkout>` in its environment,
+for `log()`'s label. Pinned by `tests/test_host_reads_name_the_checkout.py`. An
 operator-relative path is anchored at `$USER_REPO`. The state dir, the
 log file and the host-side task-file check do this inline. `_from_checkout
 PATH` does it for `--inspect-dir`, `group --repo`, `--brief` and the
@@ -109,19 +119,50 @@ name the checkout with `-C`. `scripts/host-finalize.sh` (sourced by the
 launcher before its first verb) exports two functions.
 `_repo_git_from_root REPO ARGS...` runs `git --git-dir=<abs git dir>
 --work-tree=REPO ARGS` in a `cd /` subshell, for `ls-remote`,
-`remote show` and `fetch` (with `--no-recurse-submodules`).
-`_repo_git_push REPO ARGS...` does the same for `push`, except when the
-push will run the repository's `pre-push` hook (not `--no-verify`, and
-`_host_finalize_pre_push_hook_present`). In that case it keeps `git -C`,
-because git starts the hook in its working directory. `gh pr create` runs
-in a `cd /` subshell with `GIT_DIR`/`GIT_WORK_TREE`. The Fly and EC2 seeds
-list submodules with `_seed_submodule_dirs` (`scripts/remote/seed-common.sh`,
-a `foreach` body that only `printf`s) and bundle each with `git -C` from
-their own directory. `.claude` is found with `find "$USER_REPO/.claude"`.
-`chain/git_ops.py`'s `_run` starts git from `/`: with `-C` for a local
-command, and with the git directory and work tree for `fetch`, `push`,
-`ls-remote` and `pull`. `config --chat` alone runs `claude` in the
-checkout, in a subshell, as the operator's own session. Pinned by
+`remote show` and `fetch`. `_repo_git_push REPO ARGS...` does the same for
+every `push`, with `-c core.hooksPath=scripts/push-hooks` (leerie's own
+hooks directory, `_HOST_FINALIZE_PUSH_HOOKS`). Its two hooks, `pre-push`
+and `reference-transaction`, are one script of shell builtins. Each changes
+into `LEERIE_HOOK_WORK_TREE` (`rev-parse --show-toplevel` of REPO), puts
+back the operator's `GIT_CONFIG_PARAMETERS` (`LEERIE_HOOK_GCP_SET`,
+`LEERIE_HOOK_GCP`), unsets its own variables and execs the operator's hook
+of the same name in `LEERIE_HOOKS_DIR` (`_host_finalize_hooks_dir`:
+`core.hooksPath`, relative to the top of the work tree, else
+`rev-parse --git-path hooks`) with git's arguments and stdin; with no such
+executable hook it exits 0. `_host_finalize_pre_push_hook_present` tests
+for an executable `pre-push` in that same directory. Every host `fetch`
+and `pull` carries `--no-recurse-submodules`: `_repo_git_from_root`'s, the
+bring-back, the rebaser repository's and the scratch-ref and PR-base
+fetches in `host-finalize.sh`, the bundle fetch of `fetch-branch.sh` and
+`ec2-fetch-branch.sh`, the chain's `git fetch origin`, the launcher's
+update check and `install.sh`. `gh pr create` runs in a `cd /` subshell
+with `GIT_DIR`/`GIT_WORK_TREE`. The Fly and EC2 seeds list submodules with
+`_seed_submodule_dirs` (`scripts/remote/seed-common.sh`, a `foreach` body
+that only `printf`s `<displaypath>\0<dir>\0`). Each loop reads the list
+from a pipe with `IFS= read -r -d ''`, under `pipefail`, and bundles each
+submodule with `git -C` from its own directory. Each bundle is named
+`_seed_bundle_name <displaypath>`: the hex of the path's bytes
+(`od -An -v -tx1 | tr -d ' \n'`) and `.bundle`. The machine-side scripts
+compute the same name with the same pipeline. `.claude` is found with
+`find "$USER_REPO/.claude"`. `chain/git_ops.py`'s `_run` starts git from
+`/`: with `-C` for a local command, and with the git directory and work
+tree for `fetch`, `push`, `ls-remote` and `pull`.
+
+The host-side workers start `claude` outside every checkout and tree.
+`config --chat` resolves `claude` with `command -v` from `/` (a relative
+result is anchored at `/`), makes a `mktemp -d` directory, refuses one
+beneath the checkout, and runs the CLI there with `--add-dir $USER_REPO`
+and the checkout's path in its first message. It removes the directory
+afterwards and exits with the CLI's status. `run_rebaser` runs its
+`claude_p` with `cwd=_host_worker_cwd(repo_root, worktree)` and
+`add_dirs=[worktree]`, and names the worktree in the prompt.
+`_host_worker_cwd(*trees) -> Path` makes a fresh `tempfile.mkdtemp`
+directory (0700) and raises `OSError` when it is one of `trees` or beneath
+one; `run_rebaser` removes it after the call. Its own git
+(`rev-parse HEAD`, `check_rebaser_worktree_state` and its helpers) runs
+with `cwd="/"`. `_invoke` starts an unconfined command (`grants=None`, the
+host-side seam) by `_exe_from_root(cmd[0])`: the absolute path PATH finds
+from `/`, with relative and empty entries anchored at `/`. Pinned by
 `tests/test_host_python_is_isolated.py`. It covers review round 26 I2's
 proof, inverted (an asdf-shaped shim of shell builtins and absolute paths
 reading `.tool-versions` from its working directory up). It also checks
@@ -129,8 +170,19 @@ that a bounded list of shimmed programs is never started inside the
 checkout by `--help`, `version`, `config` and `list`, that the prologue
 has its shape, that relative paths still resolve, that `ls-remote` starts
 `ssh` outside the checkout (with the `-C` control), that the static rule
-on `cd` and `foreach` bodies holds, and that `chain/git_ops.py` behaves
-as above.
+on `cd` and `foreach` bodies holds, that every host `fetch` and `pull`
+carries `--no-recurse-submodules` (a static rule with its planted control,
+and the shipped scratch-ref fetch, inverted from review round 27 I5's
+proof), that `config --chat` starts its CLI outside the checkout, and that
+`chain/git_ops.py` behaves as above. Review round 27's other host proofs,
+inverted: `tests/test_host_worker_starts_outside_the_tree.py` (I1, the real
+`run_rebaser` with an asdf-shaped `claude` shim and a plant in the run
+branch), `tests/test_host_push_starts_only_the_hook_in_the_checkout.py`
+(I5, a hooked push starts `ssh` in `/`, and the operator's hook keeps its
+working directory, arguments, stdin, environment and veto) and
+`tests/test_seed_submodule_list_is_nul_delimited.py` (I4, a submodule path
+holding a newline and a tab lists no other repository, and every bundle
+name is hex on both sides).
 
 The orchestrator's
 source is baked into the image at `/opt/leerie-image/`; on local runs
@@ -286,10 +338,12 @@ claims a state directory. Four sub-modes:
   `.leerie/config.toml` with auto-detected BLT values (uncommented) and a
   commented `setup_packages` example. Refuses with exit 1 if `config.toml`
   already exists. Prints the path and suggests `git add .leerie/`.
-- **`leerie config --chat`**: execs interactive `claude` (NOT `claude -p`)
+- **`leerie config --chat`**: runs interactive `claude` (NOT `claude -p`)
   with `--system-prompt-file $LEERIE_REPO/prompts/config_chat.md` and
-  `--add-dir $USER_REPO`. No container started. Exits 1 if
-  `prompts/config_chat.md` is missing.
+  `--add-dir $USER_REPO`, from a temporary directory of its own (§0, *The
+  host never runs a program the checkout chose*). No container started.
+  Exits 1 if `prompts/config_chat.md` is missing or `claude` is not on
+  PATH; otherwise exits with the session's status.
 - **`leerie config --recapture [--force]`**: host-only. Calls
   `run_recapture_deps()`, which consolidates across all finished runs with
   `logs/` under the state dir (or just `--run-id` if given). Without
@@ -10895,12 +10949,14 @@ no GitHub credentials (DESIGN §6 *Finalization*: the host pushes via
    `-C "cat > /tmp/..."` is parsed by flyctl as if `>` were a `cat`
    argument and fails with `cat: invalid option -- 'c'`.
 
-2. **Submodule bundles, recursive.** Host runs `git submodule --quiet
-   foreach --recursive 'git bundle create - --all | flyctl ssh
-   console -C "sh -c '\''cat > /tmp/leerie-subs/<flat-displaypath>.bundle'\''"'`
-   so each submodule's pack data lands as its own file on the machine.
-   The flat-displaypath name (`/` → `_`) gives unambiguous filenames for
-   nested submodules.
+2. **Submodule bundles, recursive.** Host lists the submodules with
+   `_seed_submodule_dirs` (NUL-terminated records, §0) and, for each,
+   runs `git -C <dir> bundle create - --all | flyctl ssh console -C
+   "sh -c 'cat > /tmp/leerie-subs/<bn>'"`, so each submodule's pack data
+   lands as its own file on the machine. `<bn>` is
+   `_seed_bundle_name <displaypath>`, the hex of the path's bytes and
+   `.bundle`: a name of `[0-9a-f]` only is never shell syntax, and no two
+   paths share one.
 
 3. **Machine-side clone + submodule update.** A single
    `flyctl ssh console -C "sh -c '<script>'"` call:

@@ -142,8 +142,7 @@ _ec2_pipe_file_via_tar() {
     return "$rc"
   fi
   # tar preserves the source basename; rename to the requested remote name
-  # when they differ (the submodule bundle path flattens displaypath with
-  # "/" -> "_", which the source basename may not already match).
+  # when they differ.
   if [ "$(basename "$local_file")" != "$remote_name" ]; then
     ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" \
       "mv '$extract_dir/$(basename "$local_file")' '$extract_dir/$remote_name'" \
@@ -269,9 +268,9 @@ ec2_seed_repo_clone() {
   fi
 
   # 2. Bundle each submodule recursively, pipe each into
-  #    /tmp/leerie-subs/<flattened-displaypath>.bundle. Same displaypath
-  #    flattening ("/" -> "_") as seed-repo.sh, applied identically here
-  #    and in the machine-side clone script (step 3) below.
+  #    /tmp/leerie-subs/<hex of the displaypath>.bundle
+  #    (`_seed_bundle_name`), as seed-repo.sh does; the machine-side clone
+  #    script (step 3) below computes the same name.
   if [ -f "$USER_REPO/.gitmodules" ]; then
     local _hb_pid_subs _tmp_subs
     _tmp_subs="$(mktemp -d -t leerie-subs.XXXXXX)" || return 1
@@ -282,16 +281,14 @@ ec2_seed_repo_clone() {
     # Listed by `_seed_submodule_dirs` and bundled from here, never from a
     # shell git starts inside each submodule (DESIGN §6 *The host never runs
     # a program the checkout chose*).
-    local _subs
-    if ! _subs="$(_seed_submodule_dirs "$USER_REPO")" || ! (
-      while IFS="$(printf '\t')" read -r _sm_disp _sm_dir; do
-        [ -n "$_sm_dir" ] || continue
-        bn="$(printf %s "$_sm_disp" | tr / _).bundle"
-        git -C "$_sm_dir" bundle create "$_tmp_subs/$bn" --all 2>/dev/null \
-          || { echo "leerie: ec2_seed_repo: failed to bundle submodule $_sm_disp" >&2; exit 1; }
-      done <<SUBS
-$_subs
-SUBS
+    if ! (
+      set -o pipefail
+      _seed_submodule_dirs "$USER_REPO" | while IFS= read -r -d '' _sm_disp \
+          && IFS= read -r -d '' _sm_dir; do
+        bn="$(_seed_bundle_name "$_sm_disp")"
+        git -C "$_sm_dir" bundle create "$_tmp_subs/$bn" --all 2>/dev/null </dev/null \
+          || { echo "leerie: ec2_seed_repo: failed to bundle a submodule" >&2; exit 1; }
+      done
     ); then
       kill "$_hb_pid_subs" 2>/dev/null || true
       wait "$_hb_pid_subs" 2>/dev/null || true
@@ -336,7 +333,7 @@ __PARENT_MATERIALIZE__
 if [ -f .gitmodules ]; then
   git submodule init
   git submodule status | awk "{print \$2}" | while read sm; do
-    bn=$(printf %s "$sm" | tr / _).bundle
+    bn=$(printf %s "$sm" | od -An -v -tx1 | tr -d " \n").bundle
     if [ -f "/tmp/leerie-subs/$bn" ]; then
       git config "submodule.$sm.url" "/tmp/leerie-subs/$bn"
     fi

@@ -560,11 +560,10 @@ def test_the_remote_git_control_starts_ssh_in_the_checkout(
 
 def test_host_finalize_reaches_remotes_only_from_root() -> None:
     """Every git command in host-finalize.sh and the launcher that reaches
-    a remote goes through `_repo_git_from_root` or `_repo_git_push`; the one
-    `git -C ... push` left is `_repo_git_push`'s, for a push that will run
-    the operator's pre-push hook, which git starts in its own working
-    directory. `gh` is pointed at the repository with `GIT_DIR` and
-    `GIT_WORK_TREE`."""
+    a remote goes through `_repo_git_from_root` or `_repo_git_push`, a push
+    with the operator's pre-push hook included (review round 27, isolation
+    I5: that push kept `git -C`). `gh` is pointed at the repository with
+    `GIT_DIR` and `GIT_WORK_TREE`."""
     text = (REPO / "scripts" / "host-finalize.sh").read_text()
     bad = []
     for f in (REPO / "scripts" / "host-finalize.sh", LAUNCHER):
@@ -575,7 +574,7 @@ def test_host_finalize_reaches_remotes_only_from_root() -> None:
             if re.search(r'git -C "\$\{?\w+\}?" (push|fetch|ls-remote|pull|'
                          r'remote show)\b', ln) and "$LEERIE_REPO" not in ln:
                 bad.append(ln.strip())
-    assert bad == ['git -C "$_rp_repo" push "$@"'], bad
+    assert bad == [], bad
     assert re.search(r'GIT_DIR="\$_pr_gd" GIT_WORK_TREE="\$USER_REPO" gh pr '
                      r'create', text)
 
@@ -591,11 +590,10 @@ def test_no_host_script_makes_a_checkout_its_cwd() -> None:
             s = line.strip()
             if s.startswith("#"):
                 continue
-            # `config --chat` runs the operator's interactive CLI in the
-            # checkout on purpose (DESIGN §6 *The host never runs a program
-            # the checkout chose*, part 4).
-            if re.search(r'\bcd "\$(USER_REPO|host|_user_repo|repo)"', s) \
-                    and "exec claude" not in s:
+            # `config --chat` too (review round 27, isolation I1): its CLI
+            # starts in a directory of its own and names the checkout by
+            # `--add-dir`.
+            if re.search(r'\bcd "\$(USER_REPO|host|_user_repo|repo)"', s):
                 bad.append(f"{p.name}:{n}: {s}")
             body = s + " " + (lines[n].strip() if n < len(lines) else "")
             if re.search(r"submodule\b.*\bforeach\b", s) and not re.search(
@@ -631,3 +629,192 @@ def test_chain_git_runs_from_root_and_names_the_repo(tmp_path: Path,
         (["git", "-C", str(tmp_path), "status"], "/"),
         (["git", f"--git-dir={tmp_path / '.git'}",
           f"--work-tree={tmp_path}", "fetch", "origin"], "/")]
+
+
+# --------------------------------------------------------------------------
+# Review round 27, isolation I5: a fetch that brings in a commit moving a
+# submodule runs `git fetch` inside that submodule's git directory, in the
+# checkout (`<checkout>/.git/modules/<sub>`), and that starts the
+# submodule's transport there. Every host fetch and pull says
+# `--no-recurse-submodules`.
+# --------------------------------------------------------------------------
+
+_GIT_WORD = re.compile(
+    r"(?:^|[\s;(&|`])(?:git|_repo_git_from_root|_repo_git_push|leerie_\w*git)"
+    r"(?=\s)(?P<rest>[^|;`]*)")
+_REMOTE_WORD = re.compile(r"\s(fetch|pull)(?=\s|$)")
+
+
+def _logical_lines(path: Path) -> list[tuple[int, str]]:
+    """`path`'s lines with backslash continuations joined, comments and
+    lines that only print dropped."""
+    out: list[tuple[int, str]] = []
+    buf, start = "", 0
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        if not buf:
+            start = n
+        if line.rstrip().endswith("\\"):
+            buf += line.rstrip()[:-1] + " "
+            continue
+        buf += line
+        s = buf.strip()
+        buf = ""
+        if s.startswith(("#", "echo", "printf", "remote_log", "log ", "err ")):
+            continue
+        out.append((start, s))
+    return out
+
+
+def _fetches_recursing(path: Path) -> list[str]:
+    bad = []
+    if path.suffix == ".py":
+        text = path.read_text()
+        for m in re.finditer(r'\[\s*"git",\s*"(fetch|pull)"[^\]]*\]', text):
+            if '"--no-recurse-submodules"' not in m.group(0):
+                bad.append(f"{path.name}: {m.group(0)}")
+        return bad
+    for n, s in _logical_lines(path):
+        for g in _GIT_WORD.finditer(s):
+            if _REMOTE_WORD.search(g.group("rest")) and \
+                    "--no-recurse-submodules" not in g.group("rest"):
+                bad.append(f"{path.name}:{n}: {s}")
+    return bad
+
+
+def test_every_host_fetch_skips_submodule_recursion() -> None:
+    bad = []
+    for p in _host_files() + sorted((REPO / "chain").glob("*.py")):
+        bad += _fetches_recursing(p)
+    assert not bad, bad
+
+
+def test_the_fetch_rule_sees_the_known_fetches() -> None:
+    """The scan reaches what it must: the scratch-ref fetch, the bundle
+    fetches of both remote runtimes and the chain's fetch are among the
+    fetches it reads (a scan that matched nothing would pass)."""
+    seen = []
+    for p in _host_files() + sorted((REPO / "chain").glob("*.py")):
+        if p.suffix == ".py":
+            seen += [p.name for _ in re.finditer(
+                r'\[\s*"git",\s*"fetch"', p.read_text())]
+            continue
+        for n, s in _logical_lines(p):
+            if any(_REMOTE_WORD.search(g.group("rest"))
+                   for g in _GIT_WORD.finditer(s)):
+                seen.append(p.name)
+    for name in ("host-finalize.sh", "fetch-branch.sh",
+                 "ec2-fetch-branch.sh", "git_ops.py", "leerie"):
+        assert name in seen, (name, seen)
+    assert seen.count("host-finalize.sh") >= 5, seen
+
+
+def test_the_fetch_rule_catches_a_recursing_fetch(tmp_path: Path) -> None:
+    sh = tmp_path / "x.sh"
+    sh.write_text('git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch \\\n'
+                  '  --no-write-fetch-head "$tree" HEAD:refs/x\n'
+                  'echo "fetch it"\n')
+    assert len(_fetches_recursing(sh)) == 1
+    py = tmp_path / "x.py"
+    py.write_text('_run(["git", "fetch", "origin"], cwd=r)\n')
+    assert len(_fetches_recursing(py)) == 1
+
+
+def _submodule_bump(tmp_path: Path) -> tuple[Path, Path]:
+    """The user's checkout with a populated submodule whose remote is ssh,
+    and a run tree whose commit moves that submodule's gitlink."""
+    def g(*a: str) -> str:
+        return subprocess.run(
+            ["git", "-c", "user.email=x@x.invalid", "-c", "user.name=x",
+             "-c", "protocol.file.allow=always", *a], check=True,
+            capture_output=True, text=True, timeout=60).stdout
+    sub, user, run = (tmp_path / n for n in ("sub", "user", "run-tree"))
+    g("init", "-q", str(sub))
+    g("-C", str(sub), "commit", "-q", "--allow-empty", "-m", "s1")
+    g("init", "-q", str(user))
+    g("-C", str(user), "submodule", "add", "-q", str(sub), "lib")
+    g("-C", str(user), "commit", "-q", "-m", "with lib")
+    g("-C", str(user / "lib"), "remote", "set-url", "origin",
+      "ssh://git@leerie.invalid/lib.git")
+    g("-C", str(sub), "commit", "-q", "--allow-empty", "-m", "s2")
+    s2 = g("-C", str(sub), "rev-parse", "HEAD").strip()
+    g("clone", "-q", str(user), str(run))
+    g("-C", str(run), "update-index", "--cacheinfo", f"160000,{s2},lib")
+    g("-C", str(run), "commit", "-q", "-m", "bump lib")
+    return user, run
+
+
+def test_the_rebase_scratch_fetch_starts_nothing_in_a_submodule(
+        tmp_path: Path) -> None:
+    """Review round 27 I5's proof, inverted, on the shipped command line:
+    host-finalize's scratch-ref fetch of the rebaser's worktree, whose
+    commit moves a gitlink, starts no `ssh` (git's on-demand recursion
+    would start the submodule's transport in `<checkout>/.git/modules`).
+    The control drops the flag from the same command and is caught."""
+    text = (REPO / "scripts" / "host-finalize.sh").read_text()
+    m = re.search(r'git -C "\$USER_REPO" -c core\.hooksPath=/dev/null fetch'
+                  r' \\\n(?:.*\\\n)*?.*"HEAD:\$_rebase_scratch_ref" --force',
+                  text)
+    assert m, "the scratch-ref fetch moved"
+    cmd = " ".join(m.group(0).replace("\\\n", " ").split())
+
+    def ssh_started(line: str, where: Path) -> bool:
+        """`line` over a fresh pair of repositories (git recurses only for
+        a commit it has just fetched)."""
+        where.mkdir()
+        user, run = _submodule_bump(where)
+        env = _shims(where, user)
+        subprocess.run(["/bin/bash", "-c", f'USER_REPO="$1"; _rebase_worktree'
+                        f'="$2"; _rebase_scratch_ref=refs/leerie-scratch/x; '
+                        f'{line}', "x", str(user), str(run)],
+                       cwd="/", env=env, capture_output=True, timeout=90)
+        return (where / "shim.log.ssh").exists()
+    assert not ssh_started(cmd, tmp_path / "shipped")
+    # Control: the same command without the flag is caught.
+    assert ssh_started(cmd.replace(" --no-recurse-submodules", ""),
+                       tmp_path / "control")
+
+
+# --------------------------------------------------------------------------
+# Review round 27, isolation I1: `config --chat` ran `claude` from inside the
+# checkout (`cd "$_user_repo" && exec claude`), so a shim, or a relative PATH
+# entry such as `node_modules/.bin`, chose it from the checkout.
+# --------------------------------------------------------------------------
+
+_CLAUDE_STUB = """#!/bin/sh
+printf 'pwd=%s\\n' "$PWD" >> "$CHAT_LOG"
+for a in "$@"; do printf 'arg=%s\\n' "$a" >> "$CHAT_LOG"; done
+exit 0
+"""
+
+
+def test_config_chat_starts_its_cli_outside_the_checkout(
+        tmp_path: Path) -> None:
+    marker = tmp_path / "RAN_ON_HOST"
+    co = _hostile_checkout(tmp_path, marker)
+    # The checkout's own `claude`, reachable through a relative PATH entry.
+    (co / "node_modules" / ".bin").mkdir(parents=True)
+    (co / "node_modules" / ".bin" / "claude").write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$PWD" >> {marker}\n')
+    (co / "node_modules" / ".bin" / "claude").chmod(0o755)
+    env = _shims(tmp_path, co)
+    stub = tmp_path / "cli"
+    stub.mkdir()
+    (stub / "claude").write_text(_CLAUDE_STUB)
+    (stub / "claude").chmod(0o755)
+    env["PATH"] = f"node_modules/.bin:{env['PATH']}:{stub}"
+    env["CHAT_LOG"] = str(tmp_path / "chat.log")
+    r = _launcher(["config", "--chat"], co, env)
+    assert r.returncode == 0, r.stderr[-800:]
+    assert not marker.exists(), marker.read_text()
+    log = (tmp_path / "chat.log").read_text().splitlines()
+    pwd = log[0].removeprefix("pwd=")
+    assert not (pwd + "/").startswith(str(co.resolve()) + "/"), pwd
+    assert not Path(pwd).exists(), "the chat's directory outlived it"
+    args = [ln.removeprefix("arg=") for ln in log[1:]]
+    assert args[args.index("--add-dir") + 1] == str(co.resolve())
+    assert str(co.resolve()) in args[-1]
+    shim_log = tmp_path / "shim.log"
+    assert not shim_log.exists(), shim_log.read_text()
+    # Control: from the checkout, the relative entry finds the checkout's.
+    subprocess.run(["claude"], cwd=co, env=env, timeout=60)
+    assert marker.exists()

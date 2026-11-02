@@ -338,7 +338,7 @@ def test_records_push_error_on_git_push_failure(tmp_path):
     })
     # git stub: emit a fake error to stderr and exit 1 on `push`.
     git_body = '''
-if [ "$3" = "push" ] || [ "$1" = "push" ]; then
+if [ "$5" = "push" ] || [ "$3" = "push" ] || [ "$1" = "push" ]; then
   echo "fatal: simulated push failure" >&2
   exit 1
 fi
@@ -381,7 +381,7 @@ if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
   echo "{hooks_dir}"
   exit 0
 fi
-if [ "$3" = "push" ] || [ "$1" = "push" ]; then
+if [ "$5" = "push" ] || [ "$3" = "push" ] || [ "$1" = "push" ]; then
   echo "npm warn config production Use --omit=dev instead." >&2
   echo "husky - pre-push script failed (code 254)" >&2
   echo "error: failed to push some refs to origin" >&2
@@ -404,7 +404,7 @@ def test_does_not_diagnose_ordinary_push_failure(tmp_path):
         "finished_at": "2026-05-29T16:00:00+00:00",
     })
     git_body = '''
-if [ "$3" = "push" ] || [ "$1" = "push" ]; then
+if [ "$5" = "push" ] || [ "$3" = "push" ] || [ "$1" = "push" ]; then
   echo "fatal: Authentication failed for '"'"'https://github.com/o/r.git/'"'"'" >&2
   exit 1
 fi
@@ -447,7 +447,7 @@ if [ "$1" = "-C" ] && [ "$3" = "config" ]; then
   echo ".husky/_"
   exit 0
 fi
-if [ "$3" = "push" ] || [ "$1" = "push" ]; then
+if [ "$5" = "push" ] || [ "$3" = "push" ] || [ "$1" = "push" ]; then
   echo "> project@1.0.0 preflight" >&2
   echo "> pnpm exec lint-staged" >&2
   echo "eslint found 3 errors" >&2
@@ -485,7 +485,7 @@ fi
 if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
   exit 0
 fi
-if [ "$3" = "push" ] || [ "$1" = "push" ]; then
+if [ "$5" = "push" ] || [ "$3" = "push" ] || [ "$1" = "push" ]; then
   echo "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com" >&2
   exit 1
 fi

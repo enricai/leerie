@@ -657,5 +657,8 @@ def test_the_rebaser_is_told_the_run_by_its_base_commit(leerie, tmp_path,
                        "main")
     assert f"{base_sha}..{branch}" in seen["user_prompt"]
     assert "feature.." not in seen["user_prompt"]
-    assert _git(Path(seen["cwd"]), "rev-list", "--count",
+    # The worker starts outside the worktree and is given it by --add-dir
+    # (DESIGN §6 *The host never runs a program the checkout chose*).
+    assert seen["add_dirs"] == [str(rebase_wt)]
+    assert _git(Path(seen["add_dirs"][0]), "rev-list", "--count",
                 f"{base_sha}..{branch}") == "1"

@@ -333,14 +333,14 @@ seed_repo_clone() {
   fi
 
   # 2. Bundle each submodule recursively, pipe each into
-  #    /tmp/leerie-subs/<flattened-displaypath>.bundle. The display-path
-  #    flattening (`/` → `_`) is applied identically here and in the
-  #    machine-side clone script (step 3) so both sides agree on the
-  #    filename for nested submodules like `vendor/foo` → `vendor_foo`.
+  #    /tmp/leerie-subs/<hex of the displaypath>.bundle
+  #    (`_seed_bundle_name`). The machine-side clone script (step 3)
+  #    computes the same name with the same `od` pipeline, so both sides
+  #    agree on the filename for nested submodules like `vendor/foo`.
   #
   #    `git submodule foreach --recursive` walks every nested submodule.
   #    Inside the foreach, $displaypath is git's superproject-relative
-  #    path. We export host-side env vars the foreach body needs.
+  #    path; the foreach body only prints it (`_seed_submodule_dirs`).
   if [ -f "$USER_REPO/.gitmodules" ]; then
     local _hb_pid_subs
     _seed_progress_bg "seed_repo (submodule bundles)" &
@@ -348,22 +348,20 @@ seed_repo_clone() {
     # Listed by `_seed_submodule_dirs` and bundled from here, never from a
     # shell git starts inside each submodule (DESIGN §6 *The host never runs
     # a program the checkout chose*).
-    local _subs
-    if ! _subs="$(_seed_submodule_dirs "$USER_REPO")" || ! (
-      while IFS="$(printf '\t')" read -r _sm_disp _sm_dir; do
-        [ -n "$_sm_dir" ] || continue
-        bn="$(printf %s "$_sm_disp" | tr / _).bundle"
+    if ! (
+      set -o pipefail
+      _seed_submodule_dirs "$USER_REPO" | while IFS= read -r -d '' _sm_disp \
+          && IFS= read -r -d '' _sm_dir; do
+        bn="$(_seed_bundle_name "$_sm_disp")"
         # The `-C` arg must be `sh -c "..."` not bare `cat > ...`;
         # without the shell wrapper the remote treats `>` as an arg to
-        # `cat`.
-        git -C "$_sm_dir" bundle create - --all 2>/dev/null \
+        # `cat`. `$bn` is hex and `.bundle` only (`_seed_bundle_name`).
+        git -C "$_sm_dir" bundle create - --all 2>/dev/null </dev/null \
           | flyctl ssh console --quiet --app "$FLY_APP" \
               --machine "$LEERIE_MACHINE_ID" --pty=false \
               -C "sh -c 'cat > /tmp/leerie-subs/$bn'" >/dev/null 2>&1 \
-          || { echo "leerie: seed_repo: failed to pipe submodule $_sm_disp bundle" >&2; exit 1; }
-      done <<SUBS
-$_subs
-SUBS
+          || { echo "leerie: seed_repo: failed to pipe submodule bundle" >&2; exit 1; }
+      done
     ); then
       kill "$_hb_pid_subs" 2>/dev/null || true
       wait "$_hb_pid_subs" 2>/dev/null || true
@@ -423,7 +421,7 @@ __PARENT_MATERIALIZE__
 if [ -f .gitmodules ]; then
   git submodule init
   git submodule status | awk "{print \$2}" | while read sm; do
-    bn=$(printf %s "$sm" | tr / _).bundle
+    bn=$(printf %s "$sm" | od -An -v -tx1 | tr -d " \n").bundle
     if [ -f "/tmp/leerie-subs/$bn" ]; then
       git config "submodule.$sm.url" "/tmp/leerie-subs/$bn"
     fi
@@ -660,25 +658,23 @@ _seed_one_inspect_dir_clone() {
   fi
 
   # 2. Bundle each submodule recursively, pipe each into
-  #    <subs_dir>/<flattened-displaypath>.bundle. Displaypath-flattening
-  #    (`/` → `_`) matches the machine-side clone script below so both
-  #    sides agree on the filename for nested submodules.
+  #    <subs_dir>/<hex of the displaypath>.bundle (`_seed_bundle_name`).
+  #    The machine-side clone script below computes the same name with the
+  #    same `od` pipeline, so both sides agree on it for nested submodules.
   if [ -f "$host/.gitmodules" ]; then
     # Listed by `_seed_submodule_dirs` and bundled from here (DESIGN §6
     # *The host never runs a program the checkout chose*).
-    local _subs
-    if ! _subs="$(_seed_submodule_dirs "$host")" || ! (
-      while IFS="$(printf '\t')" read -r _sm_disp _sm_dir; do
-        [ -n "$_sm_dir" ] || continue
-        bn="$(printf %s "$_sm_disp" | tr / _).bundle"
-        git -C "$_sm_dir" bundle create - --all 2>/dev/null \
+    if ! (
+      set -o pipefail
+      _seed_submodule_dirs "$host" | while IFS= read -r -d '' _sm_disp \
+          && IFS= read -r -d '' _sm_dir; do
+        bn="$(_seed_bundle_name "$_sm_disp")"
+        git -C "$_sm_dir" bundle create - --all 2>/dev/null </dev/null \
           | flyctl ssh console --quiet --app "$FLY_APP" \
               --machine "$LEERIE_MACHINE_ID" --pty=false \
               -C "sh -c 'cat > $subs_dir/$bn'" >/dev/null 2>&1 \
-          || { echo "leerie: seed_inspect_dirs: failed to pipe submodule $_sm_disp bundle" >&2; exit 1; }
-      done <<SUBS
-$_subs
-SUBS
+          || { echo "leerie: seed_inspect_dirs: failed to pipe submodule bundle" >&2; exit 1; }
+      done
     ); then
       remote_log "seed_inspect_dirs: submodule bundling failed for $host"
       return 1
@@ -709,7 +705,7 @@ cd __REMOTE__
 if [ -f .gitmodules ]; then
   git submodule init
   git submodule status | awk "{print \$2}" | while read sm; do
-    bn=$(printf %s "$sm" | tr / _).bundle
+    bn=$(printf %s "$sm" | od -An -v -tx1 | tr -d " \n").bundle
     if [ -f "__SUBS_DIR__/$bn" ]; then
       git config "submodule.$sm.url" "__SUBS_DIR__/$bn"
     fi

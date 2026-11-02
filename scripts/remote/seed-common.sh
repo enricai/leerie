@@ -13,17 +13,30 @@
 _SEED_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- _seed_submodule_dirs --------------------------------------------------
-# Each submodule of the repository at $1, recursively, one
-# "<displaypath><TAB><directory>" line apiece. git's foreach shell runs inside
-# each submodule's checkout, so its body is that shell's own printf and
+# Each submodule of the repository at $1, recursively, as two NUL-terminated
+# fields apiece: "<displaypath>\0<directory>\0". git's foreach shell runs
+# inside each submodule's checkout, so its body is that shell's own printf and
 # nothing else: a program started there by name is found through a version
 # manager's shim, which chooses it from that checkout's version files (DESIGN
 # §6 *The host never runs a program the checkout chose*). The caller runs its
-# programs from its own directory and names each submodule with -C.
+# programs from its own directory and names each submodule with -C. NUL,
+# because a path is repository content and may hold a newline or a tab: a
+# line-based list let one submodule forge an entry naming any repository on
+# the host (review round 27, isolation I4). Read each record with
+# `IFS= read -r -d '' _sm_disp && IFS= read -r -d '' _sm_dir`.
 _seed_submodule_dirs() {
   # shellcheck disable=SC2016  # expanded by git's foreach shell, not this one
   git -C "$1" submodule --quiet foreach --recursive \
-    'printf "%s\t%s\n" "$displaypath" "$toplevel/$sm_path"'
+    'printf "%s\0%s\0" "$displaypath" "$toplevel/$sm_path"'
+}
+
+# --- _seed_bundle_name ------------------------------------------------------
+# The bundle file name for submodule display path $1: the hex of its bytes
+# then `.bundle`. Only [0-9a-f], so it is never shell syntax in the command
+# that reaches the machine, and no two paths share a name. The machine-side
+# scripts compute the same name with the same `od` pipeline.
+_seed_bundle_name() {
+  printf '%s.bundle' "$(printf %s "$1" | od -An -v -tx1 | tr -d ' \n')"
 }
 
 # --- _seed_dirty_filter -----------------------------------------------------

@@ -303,7 +303,7 @@ print(best[3])
     done
 
     # shellcheck disable=SC2086
-    if ! git -C "$USER_REPO" fetch "$host_bundle" \
+    if ! git -C "$USER_REPO" fetch --no-recurse-submodules "$host_bundle" \
            $_fetch_refspecs 2>/dev/null; then
       remote_log "fetch_branch: git fetch from bundle failed"
       rm -f "$host_bundle"

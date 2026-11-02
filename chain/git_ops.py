@@ -121,7 +121,8 @@ def synth_merge_branches(
     """
     repo_path = Path(repo_path)
 
-    fetch = _run(["git", "fetch", "origin"], cwd=repo_path, check=False)
+    fetch = _run(["git", "fetch", "--no-recurse-submodules", "origin"],
+                 cwd=repo_path, check=False)
     if fetch.returncode != 0:
         _die(f"synth_merge_branches: git fetch failed: {fetch.stderr.strip()}")
 

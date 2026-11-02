@@ -79,7 +79,7 @@ if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
   echo "{hooks_dir}"
   exit 0
 fi
-if [ "$3" = "push" ] || [ "$1" = "push" ]; then
+if [ "$5" = "push" ] || [ "$3" = "push" ] || [ "$1" = "push" ]; then
   cat <<'STDOUT_EOF'
 {push_stdout}
 STDOUT_EOF

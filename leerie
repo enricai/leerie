@@ -17,8 +17,12 @@
 # Everything below addresses the checkout as "$USER_REPO" and never makes
 # it a working directory.
 if [ "${LEERIE_LAUNCHER_PID:-}" != "$$" ]; then
-  LEERIE_LAUNCHER_CWD=$(pwd -P) || {
-    echo "leerie: cannot resolve the current directory" >&2; exit 1; }
+  # dash's `pwd -P` in a deleted directory prints nothing and exits 0, so
+  # the value is tested as well as the status.
+  LEERIE_LAUNCHER_CWD=$(pwd -P) || LEERIE_LAUNCHER_CWD=
+  if [ -z "$LEERIE_LAUNCHER_CWD" ]; then
+    echo "leerie: cannot resolve the current directory" >&2; exit 1
+  fi
   case $0 in
     /*) _leerie_self=$0 ;;
     *)  _leerie_self=$LEERIE_LAUNCHER_CWD/$0 ;;
@@ -131,7 +135,7 @@ if [ "${1:-}" != "prune" ]; then
           echo "leerie: python3 not found on PATH (needed to render --help)" >&2
           exit 1
         fi
-        exec python3 -I -B "$LEERIE_REPO/orchestrator/leerie.py" --help
+        USER_REPO="$USER_REPO" exec python3 -I -B "$LEERIE_REPO/orchestrator/leerie.py" --help
         ;;
     esac
   done
@@ -1259,7 +1263,7 @@ _exec_readonly_on_host() {
     _ro_first=false
   done
   [ "$_ro_has_verb" = "true" ] || return 1
-  LEERIE_STATE_DIR="$LEERIE_STATE_HOST_DIR" \
+  LEERIE_STATE_DIR="$LEERIE_STATE_HOST_DIR" USER_REPO="$USER_REPO" \
     exec python3 -I -B "$LEERIE_REPO/orchestrator/leerie.py" "${_ro_argv[@]}"
 }
 
@@ -1291,7 +1295,7 @@ case "${1:-}" in
     # by hand (see _infer_axis below); tests/test_config_verb.py's harness embeds
     # its own separate, narrower inferrer rather than exercising this block.
     _config_read_key() {
-      local key="$1" file="${USER_REPO:-$(pwd)}/.leerie/config.toml"
+      local key="$1" file="$USER_REPO/.leerie/config.toml"
       [ -f "$file" ] || return 0
       { grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null \
         | sed -n 1p \
@@ -1310,7 +1314,7 @@ case "${1:-}" in
       [ -f "$_user_repo/Gemfile.lock" ] && [ -f "$_user_repo/bin/rails" ]
     }
     _infer_axis() {
-      local axis="$1" _user_repo="${USER_REPO:-$(pwd)}"
+      local axis="$1" _user_repo="$USER_REPO"
       local declared
       declared="$(_config_read_key "$axis")"
       if [ -n "${declared+x}" ] && { [ -n "$declared" ] || \
@@ -1398,7 +1402,7 @@ case "${1:-}" in
       esac
     }
     _axis_source() {
-      local axis="$1" _user_repo="${USER_REPO:-$(pwd)}"
+      local axis="$1" _user_repo="$USER_REPO"
       local config_file="$_user_repo/.leerie/config.toml"
       if [ -f "$config_file" ] && \
          grep -qE "^[[:space:]]*${axis}[[:space:]]*=" "$config_file" 2>/dev/null; then
@@ -1407,7 +1411,7 @@ case "${1:-}" in
         echo "inference"
       fi
     }
-    _user_repo="${USER_REPO:-$(pwd)}"
+    _user_repo="$USER_REPO"
     case "${1:-}" in
       --init)
         mkdir -p "$_user_repo/.leerie"
@@ -1472,15 +1476,34 @@ TOML
           remote_log "error: $system_prompt not found (leerie installation may be incomplete)"
           exit 1
         fi
-        # Interactive claude session — NOT claude -p. It runs in the
-        # checkout on purpose: a host-side worker, the operator's own
-        # session (DESIGN §6 *The host never runs a program the checkout
-        # chose*, part 4).
-        (cd "$_user_repo" && exec claude \
+        # Interactive claude session — NOT claude -p. A host-side worker:
+        # it starts in an empty directory of its own, outside the checkout,
+        # and `claude` is found from `/` (we are there), so no shim or
+        # relative PATH entry picks it from the checkout, and the checkout
+        # is named by --add-dir (DESIGN §6 *The host never runs a program
+        # the checkout chose*, part 4).
+        _chat_claude="$(command -v claude || true)"
+        case "$_chat_claude" in
+          /*) ;;
+          "") remote_log "error: claude not found on PATH"; exit 1 ;;
+          *) _chat_claude="/$_chat_claude" ;;
+        esac
+        _chat_cwd="$(mktemp -d)" || exit 1
+        _chat_cwd_real="$(cd "$_chat_cwd" && pwd -P)" || exit 1
+        case "$_chat_cwd_real/" in
+          "$_user_repo"/*)
+            rm -rf "$_chat_cwd"
+            remote_log "error: the temporary directory $_chat_cwd_real is inside $_user_repo"
+            exit 1 ;;
+        esac
+        _chat_rc=0
+        (cd "$_chat_cwd" && exec "$_chat_claude" \
           --system-prompt-file "$system_prompt" \
           --add-dir "$_user_repo" \
-          "Help me configure leerie for this repo.")
-        exit 0
+          "Help me configure leerie for the repository at $_user_repo.") \
+          || _chat_rc=$?
+        rm -rf "$_chat_cwd"
+        exit "$_chat_rc"
         ;;
       --recapture)
         # Re-scan the latest completed run's logs for this repo and rewrite
@@ -1502,7 +1525,8 @@ TOML
         # Call run_recapture_deps from the orchestrator module. It handles run
         # discovery, State construction + flock, and asyncio.run(capture_repo_deps).
         _recapture_rc=0
-        python3 -I - "$_user_repo" "$_leerie_state_dir" "$_recapture_force" \
+        USER_REPO="$_user_repo" \
+          python3 -I - "$_user_repo" "$_leerie_state_dir" "$_recapture_force" \
             "$LEERIE_REPO/orchestrator/leerie.py" <<'PY' || _recapture_rc=$?
 import sys, importlib.util, pathlib
 
@@ -2297,7 +2321,6 @@ PY
         exit 1
       fi
       FLY_APP="$LEERIE_FLY_APP"
-      USER_REPO="${USER_REPO:-$PWD}"
       if ! command -v flyctl >/dev/null 2>&1; then
         echo "leerie: list --runtime fly: flyctl not found on PATH; falling back to local sidecars." >&2
         set -- "${_list_rest[@]}"
@@ -2383,7 +2406,6 @@ PY
     # For Fly runs: starts the paused machine, SSH-modifies state.json on
     # the volume, then stops it again.
     shift
-    USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
     _ab_run_id=""
     _ab_sid=""
@@ -2744,7 +2766,6 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
     # precondition.
     # Usage: leerie accept-integration <run-id> <subtask-id> [--runtime fly|ec2|local]
     shift
-    USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
     _ai_run_id=""
     _ai_sid=""
@@ -3028,7 +3049,6 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     # Fly Machine. (Phase 4: mid-run re-rsync correction.) Runs before
     # runtime preflight since it doesn't need a local container.
     shift
-    USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
     _re_seed_run_id=""
     _re_seed_force=0
@@ -3073,7 +3093,6 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     # chain_id and invoke `leerie stop <run-id>` per matching
     # running run (pause the machine; preserve state for resume).
     shift
-    USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
     # Peek at the first positional arg for UUID dispatch.
     # Chain-id stop: iterate runs with matching chain_id, stop each.
@@ -3239,7 +3258,6 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     # chain_id and invoke `leerie kill <run-id>` per matching live
     # run (idempotent — already-killed runs are skipped).
     shift
-    USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
     # Peek for UUID-formatted --chain-id / group-id as the first positional arg.
     # Chain-id kill: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
@@ -3409,7 +3427,6 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       require_aws || exit 1
       LEERIE_EC2_INSTANCE_ID="$_kill_ec2_instance_id"
       export LEERIE_EC2_INSTANCE_ID
-      USER_REPO="${USER_REPO:-$PWD}"
       export USER_REPO
       LEERIE_RUN_ID="$_kill_run_id"
       export LEERIE_RUN_ID
@@ -3533,7 +3550,6 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     # because it no longer waits for orchestrator exit. This verb runs
     # the post-orchestrator block: fetch_branch + push + gh pr create.
     shift
-    USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
     # Chain-id / group-id dispatch: `finalize <uuid>` finalizes every
     # run-id belonging to a chain/group that hasn't already been pushed.
@@ -5764,9 +5780,9 @@ _warn_if_leerie_stale() {
     # helper is not reused here: scripts/remote/lib.sh is sourced only
     # inside specific verb branches, never on this path.
     if command -v timeout >/dev/null 2>&1; then
-      timeout 5 git -C "$LEERIE_REPO" fetch --quiet >/dev/null 2>&1 || true
+      timeout 5 git -C "$LEERIE_REPO" fetch --quiet --no-recurse-submodules >/dev/null 2>&1 || true
     else
-      git -C "$LEERIE_REPO" fetch --quiet >/dev/null 2>&1 || true
+      git -C "$LEERIE_REPO" fetch --quiet --no-recurse-submodules >/dev/null 2>&1 || true
     fi
     touch "$_stamp" 2>/dev/null || true
   fi
@@ -5905,7 +5921,7 @@ if [ -z "$_NO_PUSH_CLI" ] && [ "$IS_RESUME" = "true" ] \
   # log stream, never a return value
   # (tests/test_orchestrator_seams_dont_capture_stdout.py).
   _resume_pick_out="$(mktemp)"
-  python3 -I -B - "$LEERIE_REPO/orchestrator/leerie.py" \
+  USER_REPO="$USER_REPO" python3 -I -B - "$LEERIE_REPO/orchestrator/leerie.py" \
       "$LEERIE_STATE_HOST_DIR" "$_resume_pick_out" <<'PY' || true
 import contextlib, importlib.util, io, pathlib, sys
 spec = importlib.util.spec_from_file_location("leerie_orch", sys.argv[1])

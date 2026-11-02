@@ -1,0 +1,24 @@
+#!/bin/sh
+# Leerie's hooks directory for a host-side `git push` (scripts/host-finalize.sh
+# `_repo_git_push`, DESIGN §6 *The host never runs a program the checkout
+# chose*, part 2). The push runs from `/`, so the transport and the credential
+# helper git starts are never started in the checkout. git runs this hook
+# there too; it puts back what git would have given the operator's own hook
+# of the same name — the top of the work tree as its working directory, the
+# operator's `GIT_CONFIG_PARAMETERS` — and execs it with git's arguments and
+# stdin, so its exit status is the hook's. No operator hook: nothing to run.
+# Builtins only before the exec: nothing here is found through PATH.
+_leerie_hook="${LEERIE_HOOKS_DIR:-}/${0##*/}"
+_leerie_top="${LEERIE_HOOK_WORK_TREE:-}"
+if [ "${LEERIE_HOOK_GCP_SET:-}" = 1 ]; then
+  GIT_CONFIG_PARAMETERS="${LEERIE_HOOK_GCP:-}"
+  export GIT_CONFIG_PARAMETERS
+else
+  unset GIT_CONFIG_PARAMETERS
+fi
+unset LEERIE_HOOKS_DIR LEERIE_HOOK_WORK_TREE LEERIE_HOOK_GCP_SET LEERIE_HOOK_GCP
+if [ -z "${_leerie_hook%/*}" ] || [ ! -f "$_leerie_hook" ] || [ ! -x "$_leerie_hook" ]; then
+  exit 0
+fi
+cd "$_leerie_top" || exit 1
+exec "$_leerie_hook" "$@"

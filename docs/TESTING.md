@@ -668,6 +668,39 @@ the three seam tests and both recapture `tenacity` cases); replacing both
 seams' `admit_operator_import_paths()` call with `pass` turns the 4
 `tenacity` cases red.
 
+Review round 27's host findings (DESIGN §6 *The host never runs a program
+the checkout chose*), each proof inverted and live-falsified:
+- `tests/test_host_worker_starts_outside_the_tree.py` (4 tests, I1): the real
+  `run_rebaser` with an asdf-shaped `claude` shim of builtins and a plant in
+  the run branch never runs the plant, starts the CLI outside the worktree
+  with `--add-dir <worktree>` and removes its start directory; the prompt
+  names the worktree; `_exe_from_root` anchors relative PATH entries at `/`;
+  `_host_worker_cwd` refuses a temporary directory inside a tree.
+- `tests/test_host_python_is_isolated.py` gains 5 tests: `config --chat`
+  starts its CLI outside the checkout, never through a relative PATH entry
+  (I1); every host `fetch` and `pull` carries `--no-recurse-submodules` (a
+  rule, its anti-vacuity check and a planted control), and the shipped
+  scratch-ref fetch of a commit moving a gitlink starts no `ssh` (I5).
+- `tests/test_host_push_starts_only_the_hook_in_the_checkout.py` (7 tests,
+  I5): a hooked push starts `ssh` in `/` (the `-C` control starts it in the
+  checkout); the operator's hook starts at the top of the work tree with
+  git's arguments, its ref lines on stdin and the operator's
+  `GIT_CONFIG_PARAMETERS`, still vetoes the push, honours a relative
+  `core.hooksPath`, and `--no-verify` still skips it.
+- `tests/test_seed_submodule_list_is_nul_delimited.py` (4 tests, I4): a
+  submodule path holding a newline and a tab lists no host repository in any
+  of the three shipped loops (the line-based control lists it); every bundle
+  name is hex, a `'` never reaches the remote shell, and the host and
+  machine sides name a bundle the same.
+- `tests/test_host_reads_name_the_checkout.py` (8 tests, exec M1, L1, L3):
+  run from `/` with the identity only in the repository, Fly's `seed_auth`
+  and EC2's `ec2_seed_auth` ship the repository's identity; a rule forbids a
+  host file taking the checkout from its working directory, and every host
+  seam that loads the orchestrator is given `USER_REPO`; a seam's log lines
+  carry the checkout's name; the launcher refuses a deleted working
+  directory. Falsified: reverting the identity reads, one seam's
+  `USER_REPO` and the prologue's empty check turns 6 of the 8 red.
+
 ## fetch_branch, config, and group verbs
 
 The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
