@@ -460,7 +460,7 @@ DEFAULT_CAPS = {
     # Colima VM showed agetty → journald → sshd → lima-guestagent killed
     # because a vitest worker blew past 1.85 GB RSS inside the
     # container's single memcg). Resolved at runtime by
-    # resolve_worker_memory_max — CLI > env > leerie.toml > default. The
+    # resolve_worker_memory_max — CLI > env > default. The
     # default value of None means "auto-derive from /proc/meminfo at run
     # start" (see _auto_worker_memory_max).
     "worker_memory_max_bytes": None,
@@ -496,7 +496,7 @@ DEFAULT_CAPS = {
     # that class of worker error rather than a re-derivation from the
     # workload — a genuine leak now issues twice as many forks before the
     # kernel starts refusing them here. Overridable per-repo via
-    # resolve_worker_pids_max (CLI > env > leerie.toml > this default).
+    # resolve_worker_pids_max (CLI > env > this default).
     "worker_pids_max": 2048,
     # Auth/quota backoff budget. When `claude -p` returns an envelope
     # whose `api_error_status` is 401/429/529 or whose result message
@@ -1436,7 +1436,7 @@ INSPECT_DIRS_ENV = "LEERIE_INSPECT_DIRS"
 # run branch's the operator merged — and `log_file = "~/.bashrc"` made the
 # launcher append the run's output there, `state_dir` put the state root
 # where every worker reads `/work`. `_read_toml_key` refuses these names, and
-# the launcher's `_checkout_config_location_keys` (same list, pinned by
+# the launcher's `_checkout_config_operator_keys` (same list, pinned by
 # tests/test_repo_config_names_no_location.py) stops a run whose leerie.toml
 # still sets one, naming the replacement.
 REPO_CONFIG_LOCATION_KEYS: dict[str, str] = {
@@ -1446,6 +1446,62 @@ REPO_CONFIG_LOCATION_KEYS: dict[str, str] = {
     "judge_dir": "--judge-dir / LEERIE_JUDGE_DIR",
     "heal_dir": "--heal-dir / LEERIE_HEAL_DIR",
 }
+
+# The settings that carry the operator's authority, each with its
+# operator-side spelling (DESIGN §6 *A repository chooses no operator
+# authority*). Same reason as the locations above: `leerie.toml` is
+# repository content, and a run branch the operator merges can write it. A
+# credential or profile (`aws_profile`), where worker code runs and as whom
+# (`runtime`, the `ec2_*` machine, its IAM identity), a cloud resource billed
+# to the operator (`ec2_instance_type`, `fly_disk_gb`), a waiver
+# (`dangerously_*`, every gate `skip_*`) and a worker's containment ceiling
+# (`worker_memory_max`, `worker_pids_max`) come only from a flag or the
+# environment. Same treatment as the locations: `_read_toml_key` refuses
+# them, and the launcher stops on a `leerie.toml` that sets one.
+REPO_CONFIG_AUTHORITY_KEYS: dict[str, str] = {
+    "runtime": "--runtime / LEERIE_RUNTIME",
+    "aws_region": "--aws-region / LEERIE_AWS_REGION",
+    "aws_profile": "--aws-profile / LEERIE_AWS_PROFILE",
+    "ec2_ami": "--ec2-ami / LEERIE_EC2_AMI",
+    "ec2_instance_type": "--ec2-instance-type / LEERIE_EC2_INSTANCE_TYPE",
+    "ec2_key_name": "--ec2-key-name / LEERIE_EC2_KEY_NAME",
+    "ec2_security_group": "--ec2-security-group / LEERIE_EC2_SECURITY_GROUP",
+    "ec2_subnet_id": "--ec2-subnet-id / LEERIE_EC2_SUBNET_ID",
+    "ec2_instance_profile":
+        "--ec2-instance-profile / LEERIE_EC2_INSTANCE_PROFILE",
+    "fly_disk_gb": "--fly-disk-gb / FLY_VM_DISK_GB",
+    "dangerously_skip_permissions":
+        "--dangerously-skip-permissions / LEERIE_DANGEROUSLY_SKIP_PERMISSIONS",
+    "dangerously_allow_uncapped":
+        "--dangerously-allow-uncapped / LEERIE_DANGEROUSLY_ALLOW_UNCAPPED",
+    "dangerously_force_strict_output":
+        "--dangerously-force-strict-output / "
+        "LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT",
+    "skip_overlap_judge": "--skip-overlap-judge / LEERIE_SKIP_OVERLAP_JUDGE",
+    "skip_budget_check": "--skip-budget-check / LEERIE_SKIP_BUDGET_CHECK",
+    "skip_satisfied_check":
+        "--skip-satisfied-check / LEERIE_SKIP_SATISFIED_CHECK",
+    "skip_base_baseline": "--skip-base-baseline / LEERIE_SKIP_BASE_BASELINE",
+    "skip_acceptance_check":
+        "--skip-acceptance-check / LEERIE_SKIP_ACCEPTANCE_CHECK",
+    "skip_adherence_check":
+        "--skip-adherence-check / LEERIE_SKIP_ADHERENCE_CHECK",
+    "skip_coverage_check": "--skip-coverage-check / LEERIE_SKIP_COVERAGE_CHECK",
+    "skip_completeness_check":
+        "--skip-completeness-check / LEERIE_SKIP_COMPLETENESS_CHECK",
+    "skip_integration_check":
+        "--skip-integration-check / LEERIE_SKIP_INTEGRATION_CHECK",
+    "skip_classification_check":
+        "--skip-classification-check / LEERIE_SKIP_CLASSIFICATION_CHECK",
+    "worker_memory_max": "--worker-memory-max / LEERIE_WORKER_MEMORY_MAX",
+    "worker_pids_max": "--worker-pids-max / LEERIE_WORKER_PIDS_MAX",
+}
+
+# Every setting a repository's configuration never sets: the launcher's
+# `_checkout_config_operator_keys` holds the same list, in this order
+# (tests/test_repo_config_names_no_location.py pins the two together).
+REPO_CONFIG_OPERATOR_KEYS: dict[str, str] = {
+    **REPO_CONFIG_LOCATION_KEYS, **REPO_CONFIG_AUTHORITY_KEYS}
 
 EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
 # Emitted by `check_budget_feasibility()` (DESIGN §13 *Budget feasibility —
@@ -1502,8 +1558,8 @@ SOURCE_OF_TRUTH_ENV = "LEERIE_SOURCE_OF_TRUTH"
 SOURCE_OF_TRUTH_FILE = "leerie.toml"
 
 # Runtime mode — see IMPLEMENTATION.md §2 "Runtime mode". Resolution order:
-# --runtime CLI flag → LEERIE_RUNTIME env var → per-repo leerie.toml → 'local'.
-# CLI/env are session knobs and outrank the committed file default.
+# --runtime CLI flag → LEERIE_RUNTIME env var → 'local'. No leerie.toml
+# tier: where worker code runs is the operator's (REPO_CONFIG_AUTHORITY_KEYS).
 RUNTIME_VALUES = ("local", "fly", "ec2")
 RUNTIME_ENV = "LEERIE_RUNTIME"
 RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
@@ -1521,10 +1577,10 @@ SUBTASK_TESTS_ENV = "LEERIE_SUBTASK_TESTS"
 SUBTASK_TESTS_FILE = SOURCE_OF_TRUTH_FILE
 
 # NOTE: leerie's own AWS region/profile knobs (LEERIE_AWS_REGION /
-# LEERIE_AWS_PROFILE, and the aws_region / aws_profile leerie.toml keys)
+# LEERIE_AWS_PROFILE; no leerie.toml key, REPO_CONFIG_AUTHORITY_KEYS)
 # are deliberately NOT resolved here. They are consumed only host-side,
 # when the launcher provisions --runtime ec2 machines, so the launcher
-# owns their full CLI > env > leerie.toml resolution; the orchestrator
+# owns their CLI > env resolution; the orchestrator
 # runs inside the container where the value is meaningless and declares
 # no --aws-region/--aws-profile flags. See `leerie`'s "AWS region/profile
 # prefs" block. Resolving them here previously produced a value nothing
@@ -1564,15 +1620,17 @@ MAX_PARALLEL_FILE = SOURCE_OF_TRUTH_FILE
 
 # Per-worker memory cap (cgroup v2 memory.max). Same resolution shape:
 # CLI --worker-memory-max wins; then LEERIE_WORKER_MEMORY_MAX env; then
-# worker_memory_max in leerie.toml; then auto-derive from /proc/meminfo
-# at startup. Accepted suffixes: K, M, G, T (case-insensitive, IEC
-# binary — 1G == 1024**3 bytes). See _parse_memory_size.
+# auto-derive from /proc/meminfo at startup (no leerie.toml tier: a
+# containment ceiling is the operator's, REPO_CONFIG_AUTHORITY_KEYS).
+# Accepted suffixes: K, M, G, T (case-insensitive, IEC binary — 1G ==
+# 1024**3 bytes). See _parse_memory_size.
 WORKER_MEMORY_MAX_ENV = "LEERIE_WORKER_MEMORY_MAX"
 WORKER_MEMORY_MAX_FILE = SOURCE_OF_TRUTH_FILE
 
 # Per-worker cgroup PID cap (cgroup v2 pids.max). Same resolution shape:
 # CLI --worker-pids-max wins; then LEERIE_WORKER_PIDS_MAX env; then
-# worker_pids_max in leerie.toml; then DEFAULT_CAPS["worker_pids_max"].
+# DEFAULT_CAPS["worker_pids_max"] (no leerie.toml tier: a containment
+# ceiling is the operator's, REPO_CONFIG_AUTHORITY_KEYS).
 # A positive integer — see resolve_worker_pids_max.
 WORKER_PIDS_MAX_ENV = "LEERIE_WORKER_PIDS_MAX"
 WORKER_PIDS_MAX_FILE = SOURCE_OF_TRUTH_FILE
@@ -1628,7 +1686,8 @@ CLARIFY_FILE = SOURCE_OF_TRUTH_FILE
 # ability to run arbitrary build commands, which can write outside its
 # worktree, so it is still a trust decision — just a far smaller one.
 # Resolution order: --dangerously-skip-permissions CLI
-# flag → LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env → leerie.toml → False.
+# flag → LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env → False (no leerie.toml
+# tier: a waiver is the operator's, REPO_CONFIG_AUTHORITY_KEYS).
 DANGEROUS_SKIP_PERMS_ENV = "LEERIE_DANGEROUSLY_SKIP_PERMISSIONS"
 DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1644,8 +1703,7 @@ DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 # EAGAIN crash). This flag downgrades that fatal gate to a loud warning and
 # continues uncapped, for operators on hosts that genuinely cannot delegate.
 # Resolution order: --dangerously-allow-uncapped CLI flag →
-# LEERIE_DANGEROUSLY_ALLOW_UNCAPPED env → dangerously_allow_uncapped in
-# leerie.toml → False.
+# LEERIE_DANGEROUSLY_ALLOW_UNCAPPED env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 DANGEROUS_ALLOW_UNCAPPED_ENV = "LEERIE_DANGEROUSLY_ALLOW_UNCAPPED"
 DANGEROUS_ALLOW_UNCAPPED_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1659,7 +1717,7 @@ DANGEROUS_FORCE_STRICT_OUTPUT_FILE = SOURCE_OF_TRUTH_FILE
 # bypassable by this flag; this flag only suppresses the worker spawn
 # on the runs where it would otherwise fire. Resolution order:
 # --skip-overlap-judge CLI flag → LEERIE_SKIP_OVERLAP_JUDGE env →
-# skip_overlap_judge in leerie.toml → False.
+# False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_OVERLAP_JUDGE_ENV = "LEERIE_SKIP_OVERLAP_JUDGE"
 SKIP_OVERLAP_JUDGE_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1672,7 +1730,7 @@ SKIP_OVERLAP_JUDGE_FILE = SOURCE_OF_TRUTH_FILE
 # planner/execute boundary. Use when the operator knows the conformer
 # phase will degrade heavily to advisory warnings or otherwise come in
 # under the estimate. Resolution order: --skip-budget-check CLI flag →
-# LEERIE_SKIP_BUDGET_CHECK env → skip_budget_check in leerie.toml → False.
+# LEERIE_SKIP_BUDGET_CHECK env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_BUDGET_CHECK_ENV = "LEERIE_SKIP_BUDGET_CHECK"
 SKIP_BUDGET_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1688,16 +1746,14 @@ STRICT_CONFORMER_FILE = SOURCE_OF_TRUTH_FILE
 # is green skip that up-front cost. When skipped, the conformer receives
 # no BASELINE context and falls back to its prior self-judgment of
 # "pre-existing" failures. Resolution order: --skip-base-baseline CLI
-# flag → LEERIE_SKIP_BASE_BASELINE env → skip_base_baseline in
-# leerie.toml → False.
+# flag → LEERIE_SKIP_BASE_BASELINE env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_BASE_BASELINE_ENV = "LEERIE_SKIP_BASE_BASELINE"
 SKIP_BASE_BASELINE_FILE = SOURCE_OF_TRUTH_FILE
 
 # --skip-acceptance-check bypass (DESIGN §8 *Held-out acceptance tests*).
 # Suppresses the acceptance_writer sets and the post-integration acceptance
 # gate. Resolution order: --skip-acceptance-check CLI flag →
-# LEERIE_SKIP_ACCEPTANCE_CHECK env → skip_acceptance_check in leerie.toml →
-# False.
+# LEERIE_SKIP_ACCEPTANCE_CHECK env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_ACCEPTANCE_CHECK_ENV = "LEERIE_SKIP_ACCEPTANCE_CHECK"
 SKIP_ACCEPTANCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1719,7 +1775,7 @@ SKIP_REPO_MAP_FILE = SOURCE_OF_TRUTH_FILE
 # instruction-adherence gate is producing false positives for this repo's
 # task shape and wants to bypass the discipline. Resolution order:
 # --skip-adherence-check CLI flag → LEERIE_SKIP_ADHERENCE_CHECK env →
-# skip_adherence_check in leerie.toml → False.
+# False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_ADHERENCE_CHECK_ENV = "LEERIE_SKIP_ADHERENCE_CHECK"
 SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1739,7 +1795,7 @@ SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # (_run_delivery_prejudge/_run_delivery_recheck — DESIGN §8 *The
 # delivery gate*). Resolution order:
 # --skip-coverage-check CLI flag → LEERIE_SKIP_COVERAGE_CHECK env →
-# skip_coverage_check in leerie.toml → False.
+# False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_COVERAGE_CHECK_ENV = "LEERIE_SKIP_COVERAGE_CHECK"
 SKIP_COVERAGE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1753,8 +1809,8 @@ SKIP_COVERAGE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # completeness gates advisory (found defects surface as warnings, never block/
 # die). Use only when the operator knows the completeness judge is producing
 # false positives for this repo. Resolution order: --skip-completeness-check
-# CLI flag → LEERIE_SKIP_COMPLETENESS_CHECK env → skip_completeness_check in
-# leerie.toml → False.
+# CLI flag → LEERIE_SKIP_COMPLETENESS_CHECK env → False (no leerie.toml
+# tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_COMPLETENESS_CHECK_ENV = "LEERIE_SKIP_COMPLETENESS_CHECK"
 SKIP_COMPLETENESS_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1764,7 +1820,7 @@ SKIP_COMPLETENESS_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # finding), this skips the worker spawn entirely, matching every sibling
 # advisory/gating check's escape hatch. Resolution order:
 # --skip-integration-check CLI flag → LEERIE_SKIP_INTEGRATION_CHECK env →
-# skip_integration_check in leerie.toml → False.
+# False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_INTEGRATION_CHECK_ENV = "LEERIE_SKIP_INTEGRATION_CHECK"
 SKIP_INTEGRATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1774,7 +1830,7 @@ SKIP_INTEGRATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # will not converge takes the entire run with it; every sibling gate already
 # carried an escape hatch and this one did not. Resolution order:
 # --skip-classification-check CLI flag → LEERIE_SKIP_CLASSIFICATION_CHECK env
-# → skip_classification_check in leerie.toml → False.
+# → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_CLASSIFICATION_CHECK_ENV = "LEERIE_SKIP_CLASSIFICATION_CHECK"
 SKIP_CLASSIFICATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1813,8 +1869,7 @@ CAPTURE_DEPS_CONFIG = ".leerie/config.toml"
 # (a verification-only one is settled by executing its `verify` commands,
 # any other is re-driven — DESIGN §8 *Settled by execution*). Resolution
 # order: --skip-satisfied-check CLI
-# flag → LEERIE_SKIP_SATISFIED_CHECK env → skip_satisfied_check in
-# leerie.toml → False.
+# flag → LEERIE_SKIP_SATISFIED_CHECK env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_SATISFIED_CHECK_ENV = "LEERIE_SKIP_SATISFIED_CHECK"
 SKIP_SATISFIED_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -8212,11 +8267,17 @@ def _read_toml_key(path: Path, key: str) -> str | None:
     `<root>/.leerie/config.toml`), read without following a link at it or
     at `.leerie` (DESIGN §6 *Leerie never reads through a link a repository
     holds*): one there reads as absent. A setting that names a location
-    (`REPO_CONFIG_LOCATION_KEYS`) is never read from it: asking is a
-    `ValueError` (DESIGN §6 *No host path comes from a repository*)."""
+    (`REPO_CONFIG_LOCATION_KEYS`) or carries the operator's authority
+    (`REPO_CONFIG_AUTHORITY_KEYS`) is never read from it: asking is a
+    `ValueError` (DESIGN §6 *No host path comes from a repository*, *A
+    repository chooses no operator authority*)."""
     if key in REPO_CONFIG_LOCATION_KEYS:
         raise ValueError(f"{key} names a location and has no repository "
                          "configuration key")
+    if key in REPO_CONFIG_AUTHORITY_KEYS:
+        raise ValueError(f"{key} is the operator's to set "
+                         f"({REPO_CONFIG_AUTHORITY_KEYS[key]}) and has no "
+                         "repository configuration key")
     path = Path(path)
     root = path.parent.parent if path.parent.name == ".leerie" \
         else path.parent
@@ -8335,11 +8396,12 @@ def resolve_leerie_root(repo_root: Path) -> Path:
 
 
 def _resolve_enum_pref(repo_root: Path, cli_value: str | None, *,
-                       env_var: str, file_key: str, file_name: str,
+                       env_var: str, file_key: str | None, file_name: str,
                        allowed: frozenset[str] | tuple[str, ...],
                        default: str) -> str:
     """Shared resolution for enum-valued prefs. CLI > env > file > default.
-    Bad env or file values die() at startup. Mirrors _resolve_bool_pref."""
+    Bad env or file values die() at startup. Mirrors _resolve_bool_pref.
+    `file_key` None: no file tier (an operator's setting)."""
     if cli_value:
         return cli_value
     env = os.environ.get(env_var, "").strip()
@@ -8347,6 +8409,8 @@ def _resolve_enum_pref(repo_root: Path, cli_value: str | None, *,
         if env not in allowed:
             die(f"{env_var}={env!r} is not one of {allowed}")
         return env
+    if file_key is None:
+        return default
     cfg = repo_root / file_name
     file_val = _read_toml_key(cfg, file_key)
     if file_val is not None:
@@ -8403,13 +8467,14 @@ def _effective_source_of_truth(st: "State") -> str:
 def resolve_runtime(repo_root: Path,
                     cli_value: str | None = None) -> str:
     """Resolve the runtime mode. Order:
-    --runtime CLI flag → LEERIE_RUNTIME env var → leerie.toml → default 'local'.
+    --runtime CLI flag → LEERIE_RUNTIME env var → default 'local'. No
+    leerie.toml tier (REPO_CONFIG_AUTHORITY_KEYS).
     argparse validates `cli_value` via choices=, so it is trusted when set.
     env and file values are rejected via die() if not in RUNTIME_VALUES — a
     bad config is caught at startup, not during a worker run."""
     return _resolve_enum_pref(
         repo_root, cli_value,
-        env_var=RUNTIME_ENV, file_key="runtime",
+        env_var=RUNTIME_ENV, file_key=None,
         file_name=RUNTIME_FILE,
         allowed=RUNTIME_VALUES, default="local")
 
@@ -8479,10 +8544,11 @@ def resolve_pr_base_branch(repo_root: Path,
 
 
 def _resolve_positive_int_pref(repo_root: Path, cli_value: int | None, *,
-                               env_var: str, file_key: str, file_name: str,
-                               default: int) -> int:
+                               env_var: str, file_key: str | None,
+                               file_name: str, default: int) -> int:
     """Shared resolution for positive-int prefs. CLI > env > file > default.
-    Bad env or file values die() at startup. Mirrors _resolve_bool_pref."""
+    Bad env or file values die() at startup. Mirrors _resolve_bool_pref.
+    `file_key` None: no file tier (an operator's setting)."""
     if cli_value is not None:
         return cli_value
     env = os.environ.get(env_var, "").strip()
@@ -8494,6 +8560,8 @@ def _resolve_positive_int_pref(repo_root: Path, cli_value: int | None, *,
         if n < 1:
             die(f"{env_var}={env!r} is not a positive integer")
         return n
+    if file_key is None:
+        return default
     cfg = repo_root / file_name
     file_val = _read_toml_key(cfg, file_key)
     if file_val is not None:
@@ -9076,9 +9144,11 @@ def resolve_worker_memory_max(repo_root: Path,
                               ) -> int:
     """Resolve the per-worker cgroup memory cap (bytes). Order:
     --worker-memory-max CLI flag → LEERIE_WORKER_MEMORY_MAX env →
-    leerie.toml `worker_memory_max` → auto-derive (`_auto_worker_memory_max`:
+    auto-derive (`_auto_worker_memory_max`:
     a fixed isolation ceiling from the shared `leerie.slice` budget, falling
-    back to /proc/meminfo only when no broker/slice budget is readable).
+    back to /proc/meminfo only when no broker/slice budget is readable). No
+    leerie.toml tier: a containment ceiling is the operator's
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     An explicit value bypasses the derivation only. The admission gate still
     runs — it reads shared slice headroom, which is orthogonal to any one
@@ -9097,7 +9167,7 @@ def resolve_worker_memory_max(repo_root: Path,
     (unclamped — the shared slice budget is a refusal condition, not a
     ceiling on the raise: a value exceeding it die()s rather than being
     silently trimmed); an explicit
-    CLI/env/file value is left as the operator's decision but refused with
+    CLI/env value is left as the operator's decision but refused with
     an actionable die() naming --worker-memory-max, since silently
     overriding an explicit cap would be a different kind of surprise."""
     explicit_source: str | None = None
@@ -9110,13 +9180,7 @@ def resolve_worker_memory_max(repo_root: Path,
             val = _parse_memory_size(env, WORKER_MEMORY_MAX_ENV)
             explicit_source = WORKER_MEMORY_MAX_ENV
         else:
-            cfg = repo_root / WORKER_MEMORY_MAX_FILE
-            file_val = _read_toml_key(cfg, "worker_memory_max")
-            if file_val is not None:
-                val = _parse_memory_size(file_val, f"{cfg}: worker_memory_max")
-                explicit_source = f"{cfg}: worker_memory_max"
-            else:
-                val = _auto_worker_memory_max(max_parallel)
+            val = _auto_worker_memory_max(max_parallel)
 
     # `declared_heap_bytes` is a parameter so `main()` can resolve it once
     # and reuse it for `resolve_worker_demand_estimate` without a second
@@ -9239,13 +9303,14 @@ def resolve_worker_pids_max(repo_root: Path,
                             cli_value: int | None = None) -> int:
     """Resolve the per-worker cgroup PID cap (pids.max). Order:
     --worker-pids-max CLI flag → LEERIE_WORKER_PIDS_MAX env →
-    leerie.toml `worker_pids_max` → DEFAULT_CAPS["worker_pids_max"].
+    DEFAULT_CAPS["worker_pids_max"]. No leerie.toml tier
+    (REPO_CONFIG_AUTHORITY_KEYS).
     argparse validates `cli_value` is a positive int via
     `type=_positive_int` so it is trusted when set; env and file values
     die() when not a positive int — bad config caught at startup."""
     return _resolve_positive_int_pref(
         repo_root, cli_value,
-        env_var=WORKER_PIDS_MAX_ENV, file_key="worker_pids_max",
+        env_var=WORKER_PIDS_MAX_ENV, file_key=None,
         file_name=WORKER_PIDS_MAX_FILE,
         default=DEFAULT_CAPS["worker_pids_max"])
 
@@ -9311,12 +9376,14 @@ def _parse_bool_envtoml(value: str) -> bool | None:
 
 
 def _resolve_bool_pref(repo_root: Path, cli_value: bool, *,
-                       env_var: str, file_key: str, file_name: str) -> bool:
+                       env_var: str, file_key: str | None,
+                       file_name: str) -> bool:
     """Shared resolution for `store_true` CLI flags that also have an
     env-var and per-repo TOML mirror (see DESIGN §11 / §6 patterns).
     Order: CLI True wins → env → file → False. Bad env or file values
     `die()` at startup, not mid-run. Used by `resolve_no_push` and
-    `resolve_clarify`; keep one shape so they cannot drift."""
+    `resolve_clarify`; keep one shape so they cannot drift. `file_key`
+    None: no file tier (an operator's setting, `REPO_CONFIG_AUTHORITY_KEYS`)."""
     if cli_value:
         return True
     env = os.environ.get(env_var, "").strip()
@@ -9328,6 +9395,8 @@ def _resolve_bool_pref(repo_root: Path, cli_value: bool, *,
                 "(use 1/0, true/false, yes/no, on/off)")
         if parsed is not None:
             return parsed
+    if file_key is None:
+        return False
     cfg = repo_root / file_name
     file_val = _read_toml_key(cfg, file_key)
     if file_val is not None:
@@ -9545,7 +9614,8 @@ def resolve_dangerously_skip_permissions(
     """Resolve the --dangerously-skip-permissions preference. Order:
     --dangerously-skip-permissions CLI flag (action='store_true') →
     LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env var →
-    dangerously_skip_permissions in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, judgment workers (PLANNING_WORKER_TYPES) get a WIDENED
     allowlist — the leading verbs of the repo's declared build/lint/test
@@ -9560,7 +9630,7 @@ def resolve_dangerously_skip_permissions(
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=DANGEROUS_SKIP_PERMS_ENV,
-        file_key="dangerously_skip_permissions",
+        file_key=None,
         file_name=DANGEROUS_SKIP_PERMS_FILE)
 
 
@@ -9569,7 +9639,8 @@ def resolve_dangerously_allow_uncapped(
     """Resolve the --dangerously-allow-uncapped preference. Order:
     --dangerously-allow-uncapped CLI flag (action='store_true') →
     LEERIE_DANGEROUSLY_ALLOW_UNCAPPED env var →
-    dangerously_allow_uncapped in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, a failed cgroup broker probe (workers would run without
     memory/PID containment) is a loud warning instead of a fatal error.
@@ -9578,7 +9649,7 @@ def resolve_dangerously_allow_uncapped(
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=DANGEROUS_ALLOW_UNCAPPED_ENV,
-        file_key="dangerously_allow_uncapped",
+        file_key=None,
         file_name=DANGEROUS_ALLOW_UNCAPPED_FILE)
 
 
@@ -9587,7 +9658,8 @@ def resolve_dangerously_force_strict_output(
     """Resolve the --dangerously-force-strict-output preference. Order:
     --dangerously-force-strict-output CLI flag (action='store_true') →
     LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT env var →
-    dangerously_force_strict_output in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, worker API traffic is routed through a per-run loopback proxy
     that sets `strict: true` on the `StructuredOutput` tool Claude Code
@@ -9600,7 +9672,7 @@ def resolve_dangerously_force_strict_output(
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=DANGEROUS_FORCE_STRICT_OUTPUT_ENV,
-        file_key="dangerously_force_strict_output",
+        file_key=None,
         file_name=DANGEROUS_FORCE_STRICT_OUTPUT_FILE)
 
 
@@ -9608,7 +9680,8 @@ def resolve_skip_overlap_judge(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-overlap-judge preference. Order:
     --skip-overlap-judge CLI flag (action='store_true') →
     LEERIE_SKIP_OVERLAP_JUDGE env var →
-    skip_overlap_judge in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `phase_overlap_judge` (DESIGN §5 *Cross-domain surface
     overlap*) skips the worker spawn even on multi-planner runs that
@@ -9620,7 +9693,7 @@ def resolve_skip_overlap_judge(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_OVERLAP_JUDGE_ENV,
-        file_key="skip_overlap_judge",
+        file_key=None,
         file_name=SKIP_OVERLAP_JUDGE_FILE)
 
 
@@ -9628,7 +9701,8 @@ def resolve_skip_budget_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-budget-check preference. Order:
     --skip-budget-check CLI flag (action='store_true') →
     LEERIE_SKIP_BUDGET_CHECK env var →
-    skip_budget_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `check_budget_feasibility()` (DESIGN §13 *Budget
     feasibility — fail fast at the cheapest moment*) is suppressed.
@@ -9642,7 +9716,7 @@ def resolve_skip_budget_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_BUDGET_CHECK_ENV,
-        file_key="skip_budget_check",
+        file_key=None,
         file_name=SKIP_BUDGET_CHECK_FILE)
 
 
@@ -9650,7 +9724,8 @@ def resolve_skip_satisfied_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-satisfied-check preference. Order:
     --skip-satisfied-check CLI flag (action='store_true') →
     LEERIE_SKIP_SATISFIED_CHECK env var →
-    skip_satisfied_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `_filter_satisfied_subtasks()` (DESIGN §8 *Already-
     satisfied subtask elimination*) is suppressed: no `satisfied_probe`
@@ -9666,7 +9741,7 @@ def resolve_skip_satisfied_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_SATISFIED_CHECK_ENV,
-        file_key="skip_satisfied_check",
+        file_key=None,
         file_name=SKIP_SATISFIED_CHECK_FILE)
 
 
@@ -9691,7 +9766,8 @@ def resolve_skip_base_baseline(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-base-baseline preference. Order:
     --skip-base-baseline CLI flag (action='store_true') →
     LEERIE_SKIP_BASE_BASELINE env var →
-    skip_base_baseline in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `_capture_conformance_baseline` is not run — the once-per-run
     install-into-staging + build/lint/test pass that records base-tree
@@ -9701,7 +9777,7 @@ def resolve_skip_base_baseline(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_BASE_BASELINE_ENV,
-        file_key="skip_base_baseline",
+        file_key=None,
         file_name=SKIP_BASE_BASELINE_FILE)
 
 
@@ -9709,7 +9785,8 @@ def resolve_skip_acceptance_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-acceptance-check preference. Order:
     --skip-acceptance-check CLI flag (action='store_true') →
     LEERIE_SKIP_ACCEPTANCE_CHECK env var →
-    skip_acceptance_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, no held-out acceptance sets are written and the
     post-integration acceptance gate does not run (DESIGN §8 *Held-out
@@ -9717,7 +9794,7 @@ def resolve_skip_acceptance_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_ACCEPTANCE_CHECK_ENV,
-        file_key="skip_acceptance_check",
+        file_key=None,
         file_name=SKIP_ACCEPTANCE_CHECK_FILE)
 
 
@@ -9743,7 +9820,8 @@ def resolve_skip_adherence_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-adherence-check preference. Order:
     --skip-adherence-check CLI flag (action='store_true') →
     LEERIE_SKIP_ADHERENCE_CHECK env var →
-    skip_adherence_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, the instruction-adherence gate is not run — the
     deterministic prescribed-command-coverage floor and the
@@ -9755,7 +9833,7 @@ def resolve_skip_adherence_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_ADHERENCE_CHECK_ENV,
-        file_key="skip_adherence_check",
+        file_key=None,
         file_name=SKIP_ADHERENCE_CHECK_FILE)
 
 
@@ -9763,7 +9841,8 @@ def resolve_skip_coverage_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-coverage-check preference. Order:
     --skip-coverage-check CLI flag (action='store_true') →
     LEERIE_SKIP_COVERAGE_CHECK env var →
-    skip_coverage_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, required-items checking is suppressed on BOTH sides:
     `phase_planning_coverage_gate` (the advisory `task_coverage_judge`
@@ -9776,7 +9855,7 @@ def resolve_skip_coverage_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_COVERAGE_CHECK_ENV,
-        file_key="skip_coverage_check",
+        file_key=None,
         file_name=SKIP_COVERAGE_CHECK_FILE)
 
 
@@ -9784,7 +9863,8 @@ def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-completeness-check preference. Order:
     --skip-completeness-check CLI flag (action='store_true') →
     LEERIE_SKIP_COMPLETENESS_CHECK env var →
-    skip_completeness_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, the conformer's gating `solution_defects` axis (DESIGN §9 *The
     one gating axis: solution completeness*) becomes advisory: found defects
@@ -9795,7 +9875,7 @@ def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_COMPLETENESS_CHECK_ENV,
-        file_key="skip_completeness_check",
+        file_key=None,
         file_name=SKIP_COMPLETENESS_CHECK_FILE)
 
 
@@ -9803,7 +9883,8 @@ def resolve_skip_integration_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-integration-check preference. Order:
     --skip-integration-check CLI flag (action='store_true') →
     LEERIE_SKIP_INTEGRATION_CHECK env var →
-    skip_integration_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `integrate_wave` never invokes `integration_judge` — the
     independent adversarial verification of a committed merge (DESIGN §8) —
@@ -9815,7 +9896,7 @@ def resolve_skip_integration_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_INTEGRATION_CHECK_ENV,
-        file_key="skip_integration_check",
+        file_key=None,
         file_name=SKIP_INTEGRATION_CHECK_FILE)
 
 
@@ -9823,7 +9904,8 @@ def resolve_skip_classification_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-classification-check preference. Order:
     --skip-classification-check CLI flag (action='store_true') →
     LEERIE_SKIP_CLASSIFICATION_CHECK env var →
-    skip_classification_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `phase_classification_gate` never invokes
     `classification_judge` and the classifier's own category set is used
@@ -9834,7 +9916,7 @@ def resolve_skip_classification_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_CLASSIFICATION_CHECK_ENV,
-        file_key="skip_classification_check",
+        file_key=None,
         file_name=SKIP_CLASSIFICATION_CHECK_FILE)
 
 
@@ -17622,7 +17704,7 @@ async def _filter_satisfied_subtasks(
     outranks the probe's reading)."""
     if st.data.get("skip_satisfied_check"):
         log("phase 3: satisfied-check skipped (--skip-satisfied-check / "
-            "LEERIE_SKIP_SATISFIED_CHECK / skip_satisfied_check=true)")
+            "LEERIE_SKIP_SATISFIED_CHECK)")
         return None
 
     # Flatten to (plan, subtask) pairs so the probe results can be applied
@@ -25503,7 +25585,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # makes the two halves move together or not at all.
     #
     # Auto-derivation floors at 8 GiB so this is normally >= 5760, but
-    # --worker-memory-max / LEERIE_WORKER_MEMORY_MAX / leerie.toml let an
+    # --worker-memory-max / LEERIE_WORKER_MEMORY_MAX let an
     # operator set the cap below the reserve explicitly — clamp so V8 is
     # never handed a non-positive or degenerately small ceiling.
     if worker_memory_max_bytes is not None and _is_node_repo(cwd):
@@ -29223,6 +29305,39 @@ def _settings_file(path: Path, *, root: Path | None = None) -> dict:
     return data
 
 
+# The checkout's Claude Code settings files leerie reads (the launcher's
+# `detect_bedrock_mode` reads the same two).
+CHECKOUT_SETTINGS_FILES = ("settings.json", "settings.local.json")
+
+
+@functools.lru_cache(maxsize=None)
+def _checkout_settings_are_operators(repo_root: str, name: str) -> bool:
+    """Whether the checkout's `.claude/<name>` is the operator's own: a file
+    git does not track (DESIGN §6 *A repository chooses no operator
+    authority*). A tracked one is the repository's content — a cloned
+    repository's, or a run branch's the operator merged — and a settings
+    file carries credentials and endpoints (`apiKeyHelper`, an `env`
+    `ANTHROPIC_BASE_URL`), permissions and hooks, so it adds nothing to a
+    worker's settings. No merge or clone brings an untracked file, so that
+    one is the operator's (`settings.local.json`, usually ignored). When git
+    cannot answer, the file is treated as tracked. Asked once per process:
+    the checkout is not written while leerie runs."""
+    rel = f".claude/{name}"
+    try:
+        r = _git_z_output(["git", "--literal-pathspecs",
+                           *_tree_git_args(repo_root), "ls-files", "-z",
+                           "--", rel], timeout=30)
+        tracked = r.returncode != 0 or bool(r.stdout.strip("\0"))
+    except (OSError, subprocess.TimeoutExpired):
+        tracked = True
+    if tracked and os.path.lexists(os.path.join(repo_root, rel)):
+        log(f"  {rel} is tracked by the repository: not applied to workers "
+            "(a repository's settings choose no operator authority; put "
+            "your own in ~/.claude/settings.json or an untracked "
+            ".claude/settings.local.json)")
+    return not tracked
+
+
 def _confined_cli_settings(hook_settings: str | None, *,
                            run_dir: str | Path | None,
                            repo_root: str | Path | None) -> str:
@@ -29235,10 +29350,12 @@ def _confined_cli_settings(hook_settings: str | None, *,
     without the shell prefix, measured) or unsets the prefix. In their place,
     lowest first: the operator's settings from the run's read-only
     configuration template (`run_dir`; with none, the operator's own
-    configuration directory), the repository's project and local settings
-    from the user's checkout (`repo_root`, which no worker writes), then
-    leerie's own — the PreToolUse hook (`hook_settings`) and the shell
-    prefix, which nothing below can override."""
+    configuration directory), the checkout's project and local settings
+    that git does not track (`repo_root`; the operator's own, DESIGN §6 *A
+    repository chooses no operator authority* — a tracked one is the
+    repository's and adds nothing), then leerie's own — the PreToolUse hook
+    (`hook_settings`) and the shell prefix, which nothing below can
+    override."""
     if run_dir is not None:
         user = Path(run_dir) / CLAUDE_CONFIG_TEMPLATE / "settings.json"
     else:
@@ -29249,7 +29366,8 @@ def _confined_cli_settings(hook_settings: str | None, *,
     if repo_root is not None:
         layers += [_settings_file(Path(repo_root) / ".claude" / name,
                                   root=Path(repo_root))
-                   for name in ("settings.json", "settings.local.json")]
+                   for name in CHECKOUT_SETTINGS_FILES
+                   if _checkout_settings_are_operators(str(repo_root), name)]
     # No layer below leerie's names a variable leerie's confinement reads
     # (DESIGN §6 *The CLI's own git runs on leerie's terms*): leerie's own
     # set them, last.
@@ -32682,8 +32800,7 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     `.get("miscategorizations", [])`."""
     if st.data.get("skip_classification_check"):
         log("  classification gate skipped (--skip-classification-check "
-            f"/ {SKIP_CLASSIFICATION_CHECK_ENV} / "
-            "skip_classification_check=true)")
+            f"/ {SKIP_CLASSIFICATION_CHECK_ENV})")
         return False
     sys_prompt = _load_prompt("classification_judge")
 
@@ -38624,14 +38741,13 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
     handling (see its docstring).
 
     Short-circuits entirely when `st.data["skip_adherence_check"]` is set
-    (`--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` /
-    `skip_adherence_check` in leerie.toml).
+    (`--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK`).
 
     Returns the (possibly re-planned) `plans` list, ready for
     `_schedule()` (this phase runs after `phase_overlap_judge`)."""
     if st.data.get("skip_adherence_check"):
         log("phase 2⅞: adherence-gate skipped (--skip-adherence-check / "
-            "LEERIE_SKIP_ADHERENCE_CHECK / skip_adherence_check=true)")
+            "LEERIE_SKIP_ADHERENCE_CHECK)")
         return plans
 
     prescribed_procedure = st.data.get("prescribed_procedure") or {}
@@ -38906,7 +39022,7 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
     Skipped entirely when `st.data["skip_coverage_check"]` is set."""
     if st.data.get("skip_coverage_check"):
         log("phase 2⅞½: task-coverage gate skipped (--skip-coverage-check / "
-            "LEERIE_SKIP_COVERAGE_CHECK / skip_coverage_check=true)")
+            "LEERIE_SKIP_COVERAGE_CHECK)")
         return plans
     log("phase 2⅞½: task-coverage gate (advisory)")
     st.data["current_phase"] = "phase 2⅞½: task-coverage-gate"
@@ -39255,7 +39371,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # Cheap-skip conditions, in order of cost.
     if st.data.get("skip_overlap_judge"):
         log("phase 2¾: overlap-judge skipped (--skip-overlap-judge / "
-            "LEERIE_SKIP_OVERLAP_JUDGE / skip_overlap_judge=true)")
+            "LEERIE_SKIP_OVERLAP_JUDGE)")
         return plans
 
     # Count planners that actually contributed subtasks, and total
@@ -65421,7 +65537,7 @@ async def _run_integration_judge_gate(
     backed out. Skipped entirely under `skip_integration_check`."""
     if st.data.get("skip_integration_check"):
         log(f"  integration gate skipped for {sid} (--skip-integration-check "
-            f"/ {SKIP_INTEGRATION_CHECK_ENV} / skip_integration_check=true)")
+            f"/ {SKIP_INTEGRATION_CHECK_ENV})")
         return True
     leerie_dir = staging.parent.parent
     log_path = leerie_dir / "logs" / f"integration-{sid}.log"
@@ -68910,8 +69026,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "would run `claude --dangerously-skip-permissions` "
                          "against directly. Default: off (judgment "
                          "workers narrow-allowlisted). Also "
-                         f"{DANGEROUS_SKIP_PERMS_ENV} env var or "
-                         "dangerously_skip_permissions=true in leerie.toml.")
+                         f"{DANGEROUS_SKIP_PERMS_ENV} env var (never leerie.toml).")
     ap.add_argument("--dangerously-allow-uncapped", action="store_true",
                     help="DANGEROUS: continue even if worker cgroup "
                          "containment could not be enabled (cgroup broker "
@@ -68924,8 +69039,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "can exhaust the VM thread/PID table (DESIGN §6 "
                          "Memory containment). This downgrades that fatal gate "
                          "to a loud warning and runs workers uncapped. Also "
-                         f"{DANGEROUS_ALLOW_UNCAPPED_ENV} env var or "
-                         "dangerously_allow_uncapped=true in leerie.toml.")
+                         f"{DANGEROUS_ALLOW_UNCAPPED_ENV} env var (never leerie.toml).")
     ap.add_argument("--dangerously-force-strict-output", action="store_true",
                     help="DANGEROUS: route every worker's API traffic through "
                          "a per-run loopback proxy that rewrites the outbound "
@@ -68956,8 +69070,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "you already set that variable yourself. Default is "
                          "off — leerie uses the CLI's ordinary post-hoc "
                          "validation and absorbs the retries. Also "
-                         f"{DANGEROUS_FORCE_STRICT_OUTPUT_ENV} env var or "
-                         "dangerously_force_strict_output=true in leerie.toml.")
+                         f"{DANGEROUS_FORCE_STRICT_OUTPUT_ENV} env var (never leerie.toml).")
     ap.add_argument("--max-workers", type=_positive_int, metavar="N",
                     help=f"total worker-invocation budget "
                          f"(default {DEFAULT_CAPS['max_total_workers']}); "
@@ -68988,8 +69101,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "the worker cgroup rather than cascading to "
                          "sshd / orchestrator. Auto-derived from "
                          "/proc/meminfo when unset. Also "
-                         f"{WORKER_MEMORY_MAX_ENV} env var or "
-                         "worker_memory_max in leerie.toml")
+                         f"{WORKER_MEMORY_MAX_ENV} env var (never leerie.toml)")
     ap.add_argument("--max-rate-limit-wait", type=_positive_int,
                     metavar="SEC",
                     help="longest rate-limit reset to sleep through before "
@@ -69021,8 +69133,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "worker cgroup rather than exhausting the VM's "
                          "PID table. Raise it for repos whose conformance "
                          "step runs a subprocess-heavy full test suite. "
-                         f"Also {WORKER_PIDS_MAX_ENV} env var or "
-                         "worker_pids_max in leerie.toml")
+                         f"Also {WORKER_PIDS_MAX_ENV} env var (never leerie.toml)")
     ap.add_argument("--skip-smoke", action="store_true",
                     help="skip the live claude -p smoke test during preflight. "
                          "Default: off (smoke test runs)")
@@ -69032,8 +69143,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "overlap). The cheap-skip on single-planner / "
                          "<2-subtask runs is automatic; this flag only "
                          "affects runs where the worker would otherwise fire. "
-                         f"Also {SKIP_OVERLAP_JUDGE_ENV} env or "
-                         "skip_overlap_judge in leerie.toml. Default: off.")
+                         f"Also {SKIP_OVERLAP_JUDGE_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-adherence-check", action="store_true",
                     help="skip the instruction-adherence gate: the "
                          "deterministic prescribed-command-coverage floor "
@@ -69041,8 +69151,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "planner check loop. A plan that diverges from an "
                          "explicitly prescribed procedure is not caught "
                          "before phase_execute spends. "
-                         f"Also {SKIP_ADHERENCE_CHECK_ENV} env or "
-                         "skip_adherence_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_ADHERENCE_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-coverage-check", action="store_true",
                     help="skip required-items checking on BOTH sides: the "
                          "phase 2⅞½ advisory task_coverage_judge review "
@@ -69051,8 +69160,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "do not reproduce across re-samples) AND the "
                          "phase-5 delivery gate that verifies required "
                          "items on the integrated tree before finalize. "
-                         f"Also {SKIP_COVERAGE_CHECK_ENV} env or "
-                         "skip_coverage_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_COVERAGE_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-completeness-check", action="store_true",
                     help="demote the conformer's gating solution_defects "
                          "completeness axis (DESIGN §9) to advisory: found "
@@ -69061,8 +69169,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "final-tree pass. Use when a false-positive "
                          "completeness defect is blocking finalize on every "
                          "resume. "
-                         f"Also {SKIP_COMPLETENESS_CHECK_ENV} env or "
-                         "skip_completeness_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_COMPLETENESS_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-integration-check", action="store_true",
                     help="skip the integration_judge behavioral-defect gate "
                          "(DESIGN §8 Independent adversarial verification) "
@@ -69070,8 +69177,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "run. Independent of the accept-integration/"
                          "audit-key mechanism, which only accepts a finding "
                          "the judge already produced. "
-                         f"Also {SKIP_INTEGRATION_CHECK_ENV} env or "
-                         "skip_integration_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_INTEGRATION_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-classification-check", action="store_true",
                     help="skip the classification gate (DESIGN §8 "
                          "Independent adversarial verification) entirely: the "
@@ -69080,8 +69186,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "escape hatch for a gate that will not converge; a "
                          "miscategorized set produces the wrong planners, so "
                          "prefer refining the task description first. "
-                         f"Also {SKIP_CLASSIFICATION_CHECK_ENV} env or "
-                         "skip_classification_check in leerie.toml. "
+                         f"Also {SKIP_CLASSIFICATION_CHECK_ENV} env (never leerie.toml). "
                          "Default: off.")
     ap.add_argument("--stop-on-blocked", action="store_true",
                     help="stop the run and wait for `accept-blocked` when a "
@@ -69104,8 +69209,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "no-commits backstop still catches already-satisfied "
                          "work post-execution (_settle_subtask re-probes the "
                          "criteria against HEAD and settles complete if met). "
-                         f"Also {SKIP_SATISFIED_CHECK_ENV} env or "
-                         "skip_satisfied_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_SATISFIED_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-budget-check", action="store_true",
                     help="skip the post-_schedule budget-feasibility preflight "
                          "(DESIGN §13 Budget feasibility — fail fast at the "
@@ -69115,8 +69219,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "suppresses the early die() that catches "
                          "mathematically-unwinnable runs at the plan/execute "
                          "boundary. "
-                         f"Also {SKIP_BUDGET_CHECK_ENV} env or "
-                         "skip_budget_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_BUDGET_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--strict-conformer", action="store_true",
                     help="make the conformer phase blocking: conformer "
                          "residuals (failed build/lint/test, unresolved rule "
@@ -69149,14 +69252,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "any subtask ran. The pass runs the full suite once "
                          "(tens of seconds to a few minutes); skip it when the "
                          "base is known green or the up-front cost is unwanted. "
-                         f"Also {SKIP_BASE_BASELINE_ENV} env or "
-                         "skip_base_baseline in leerie.toml. Default: off.")
+                         f"Also {SKIP_BASE_BASELINE_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-acceptance-check", action="store_true",
                     help="skip the held-out acceptance tests (DESIGN §8): no "
                          "acceptance_writer sets are written and the "
                          "post-integration acceptance gate does not run. "
-                         f"Also {SKIP_ACCEPTANCE_CHECK_ENV} env or "
-                         "skip_acceptance_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_ACCEPTANCE_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-repo-map", action="store_true",
                     help="skip the P6 repo-map structural context (DESIGN §5½ (P6)): "
                          "suppresses _build_repo_map() and the ranked subgraph "
@@ -69175,7 +69276,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     metavar="MODE",
                     help=f"execution runtime "
                          f"({'|'.join(RUNTIME_VALUES)}, default local); "
-                         f"overrides {RUNTIME_ENV} and leerie.toml")
+                         f"overrides {RUNTIME_ENV} (never leerie.toml)")
     ap.add_argument("--inspect-dir", action="append", metavar="PATH",
                     dest="inspect_dir",
                     help="extra directory the inspect-bucket workers "

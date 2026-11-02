@@ -3,7 +3,7 @@ opt-out for the conformer's gating solution_defects completeness axis
 (DESIGN §9 *The one gating axis: solution completeness*).
 
 Covers the precedence order: CLI flag → LEERIE_SKIP_COMPLETENESS_CHECK env
-var → skip_completeness_check in leerie.toml → False (the gate runs by
+var → False (no leerie.toml tier) (the gate runs by
 default). Mirrors test_resolve_skip_adherence_check.py — both resolvers share
 `_resolve_bool_pref`, so this locks the wiring (env var name + file key).
 """
@@ -37,11 +37,13 @@ def test_env_set_true(leerie, repo_root, monkeypatch):
         repo_root, cli_value=False) is True
 
 
-def test_file_set_true_no_env(leerie, repo_root):
+def test_file_is_never_read(leerie, repo_root):
+    """A waiver is the operator's (DESIGN §6 *A repository chooses no
+    operator authority*): `skip_completeness_check = true` in leerie.toml is not taken."""
     (repo_root / "leerie.toml").write_text(
         "skip_completeness_check = true\n")
     assert leerie.resolve_skip_completeness_check(
-        repo_root, cli_value=False) is True
+        repo_root, cli_value=False) is False
 
 
 def test_env_wins_over_file(leerie, repo_root, monkeypatch):

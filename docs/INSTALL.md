@@ -182,7 +182,7 @@ Install from https://cli.github.com, then `gh auth login`.
 
 ## Fly.io runtime (optional)
 
-`--runtime fly` (`LEERIE_RUNTIME=fly` / `runtime = fly` in `leerie.toml`)
+`--runtime fly` (or `LEERIE_RUNTIME=fly`; never `leerie.toml`)
 routes each worker through Fly.io Machines instead of local `nerdctl`.
 Prerequisites: `flyctl` authenticated (`flyctl auth login` — auto-installed
 on first use, or `brew install flyctl`) and a billed Fly.io account (no
@@ -190,7 +190,7 @@ free tier). First use handles the rest: creates the Fly app
 (`LEERIE_FLY_APP`/`--fly-app`), builds+pushes the image, and provisions a
 Machine per worker.
 
-**Disk sizing:** default 8 GB volume at `/work`; on `ENOSPC`, raise via `--fly-disk-gb 50` (or `FLY_VM_DISK_GB`/`fly_disk_gb`). **Orchestrator dies
+**Disk sizing:** default 8 GB volume at `/work`; on `ENOSPC`, raise via `--fly-disk-gb 50` (or `FLY_VM_DISK_GB`). **Orchestrator dies
 mid-run:** `leerie finalize <run-id> --force` SSHes in and proceeds with
 the normal push+PR flow (`IMPLEMENTATION.md` §7). **`--local-build`**
 (rarely needed) builds locally instead — needs a host Docker daemon authed
@@ -245,16 +245,17 @@ create-default-vpc`). The identity needs the EC2/SSM/IAM actions listed in
 DESIGN §6 *IAM actions required*.
 
 Six `RunInstances` parameters are **optional overrides** of those defaults.
-**CLI flag > env var > `leerie.toml` key > default**:
+**CLI flag > env var > default** (never `leerie.toml`: the machine, its
+network and its identity are yours, and a key there stops the launcher):
 
-| Var | CLI flag | `leerie.toml` key | Default |
-|---|---|---|---|
-| `LEERIE_EC2_AMI` | `--ec2-ami` | `ec2_ami` | baked/reused tagged AMI |
-| `LEERIE_EC2_INSTANCE_TYPE` | `--ec2-instance-type` | `ec2_instance_type` | `m5.xlarge` |
-| `LEERIE_EC2_KEY_NAME` | `--ec2-key-name` | `ec2_key_name` | created/reused `leerie-ssh` |
-| `LEERIE_EC2_SECURITY_GROUP` | `--ec2-security-group` | `ec2_security_group` | created/reused `leerie-ssh` group |
-| `LEERIE_EC2_SUBNET_ID` | `--ec2-subnet-id` | `ec2_subnet_id` | default-VPC public subnet |
-| `LEERIE_EC2_INSTANCE_PROFILE` | `--ec2-instance-profile` | `ec2_instance_profile` | created/reused `leerie-ssm` |
+| Var | CLI flag | Default |
+|---|---|---|
+| `LEERIE_EC2_AMI` | `--ec2-ami` | baked/reused tagged AMI |
+| `LEERIE_EC2_INSTANCE_TYPE` | `--ec2-instance-type` | `m5.xlarge` |
+| `LEERIE_EC2_KEY_NAME` | `--ec2-key-name` | created/reused `leerie-ssh` |
+| `LEERIE_EC2_SECURITY_GROUP` | `--ec2-security-group` | created/reused `leerie-ssh` group |
+| `LEERIE_EC2_SUBNET_ID` | `--ec2-subnet-id` | default-VPC public subnet |
+| `LEERIE_EC2_INSTANCE_PROFILE` | `--ec2-instance-profile` | created/reused `leerie-ssm` |
 
 ```bash
 # Optional overrides:

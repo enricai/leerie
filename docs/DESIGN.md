@@ -2827,8 +2827,10 @@ would read is one a worker can write — its own configuration directory's
 left to the write grant). So a confined worker's CLI gets
 `--setting-sources ""` and its whole settings in `--settings`
 (`_confined_cli_settings`): the operator's settings from the run's
-read-only configuration template, the repository's project and local
-settings from the user's checkout (which no worker writes), then leerie's
+read-only configuration template, the checkout's project and local
+settings that git does not track (no worker writes the checkout, and a
+tracked one is the repository's, which adds nothing: §6 *A repository
+chooses no operator authority*), then leerie's
 own — the PreToolUse hook and the shell prefix, which nothing below them
 overrides (settings given on the command line win over every file scope,
 measured). Merged as the CLI merges scopes: objects key by key, arrays
@@ -3305,7 +3307,8 @@ constructed in three parts.
    `.leerie/Dockerfile`, `.claude`, `.claude/settings.json` or
    `.claude/settings.local.json` is a link (`_checkout_config_links`). It
    reads and writes the checkout's files only at those paths (the two
-   settings files decide Bedrock mode and its AWS profile; a linked one
+   settings files, when git does not track them, decide Bedrock mode and its
+   AWS profile, §6 *A repository chooses no operator authority*; a linked one
    outside the checkout switched a run into Bedrock mode, review round 27,
    execution L2), and the checkout is not written while leerie runs, so one
    check holds for every read after it. Its other looks at the checkout only
@@ -3377,7 +3380,8 @@ parts.
    key silently ignored would move a run's state away from where its
    operator looks for it. The orchestrator reads none of them from the file,
    and its one reader of `leerie.toml` refuses those names
-   (`REPO_CONFIG_LOCATION_KEYS`).
+   (`REPO_CONFIG_LOCATION_KEYS`). The section below extends this to every
+   setting that carries the operator's authority.
 2. *The launcher refuses a state root that overlaps the checkout.* It compares
    the two by real path, after every tier is resolved. A state root equal to
    the checkout, beneath it or above it stops the run. Beneath, the checkout's
@@ -3394,6 +3398,108 @@ parts.
    nested in the checkout by path as well (the direct-call default,
    `<repo>/.leerie`, which only tests use) is carved out of every grant by
    path, as before.
+
+### A repository chooses no operator authority
+
+*Designed 2026-11-02 (generalizes *No host path comes from a repository*).*
+
+**Root cause.** The section above closed one class of a wider one. Everything
+in the checkout that git tracks is repository content: a cloned repository's,
+or a run branch's that the operator merged. A worker may commit a root
+`leerie.toml`, and leerie's own run branch is the operator's next base. A
+host path was one kind of choice that content made below only the operator's
+flag and environment. The others were the operator's authority too:
+
+- *credentials and identity.* `aws_profile` and `aws_region` chose the AWS
+  account and region leerie provisions in. `ec2_instance_profile` chose the
+  IAM identity the machine runs as. `ec2_key_name`, `ec2_security_group` and
+  `ec2_subnet_id` chose who can reach the machine that holds the run's
+  copied credentials, and from where. `ec2_ami` chose the system those
+  credentials are copied onto. `runtime` chose whether the code and the
+  credentials leave the host at all. The checkout's `.claude/settings.json`
+  and `.claude/settings.local.json` chose Bedrock mode, which stages
+  `~/.aws` into the container, and its AWS profile and region; and each
+  reached every confined worker's CLI as a settings layer, where an `env`
+  `ANTHROPIC_BASE_URL` sends the operator's token to another endpoint and an
+  `apiKeyHelper` or a hook runs in the CLI's own domain.
+- *spending.* `ec2_instance_type` and `fly_disk_gb` size a resource billed to
+  the operator's cloud account, outside the run. A model, an effort, a
+  worker budget or a round count is different: it is how much of the run's
+  own work the repository asks for, the operator overrides each per run, and
+  the budget preflight bounds it.
+- *waivers.* `dangerously_skip_permissions`, `dangerously_allow_uncapped` and
+  `dangerously_force_strict_output` each waive a guarantee by name. Each gate
+  key (`skip_overlap_judge`, `skip_budget_check`, `skip_satisfied_check`,
+  `skip_base_baseline`, `skip_acceptance_check`, `skip_adherence_check`,
+  `skip_coverage_check`, `skip_completeness_check`, `skip_integration_check`,
+  `skip_classification_check`) switches off a check of the result: a run
+  branch that wrote `skip_acceptance_check = true` turned off the held-out
+  gate for every later run once merged. `worker_pids_max` and
+  `worker_memory_max` are each worker's containment ceilings: no ceiling above
+  bounds a worker's PIDs, so raising `worker_pids_max` took the fork-bomb
+  bound away.
+
+**Invariant: a repository's content chooses no operator authority.** A host
+path, a credential or profile, where worker code runs and as whom, a resource
+billed to the operator, a waiver of a guarantee and a worker's containment
+ceiling come only from the operator: a flag, the environment, or the
+operator's own Claude settings (`~/.claude/settings.json`, and an untracked
+settings file in the checkout). Leerie has no user-level configuration file
+of its own. It is constructed in two parts.
+
+1. *`leerie.toml` has no key for any of them.* One list,
+   `REPO_CONFIG_OPERATOR_KEYS`, holds the five locations above
+   (`REPO_CONFIG_LOCATION_KEYS`) and the authority keys
+   (`REPO_CONFIG_AUTHORITY_KEYS`), each with its flag and environment
+   variable. The launcher holds the same list in the same order
+   (`_checkout_config_operator_keys`). It stops on a `leerie.toml` that sets
+   any of them, for every verb but `version`, before anything else reads the
+   file, and names each key's replacement: a key silently ignored would run
+   the operator's next run with a choice they did not make, or without one
+   they believe is set. The orchestrator's one reader of the file
+   (`_read_toml_key`) refuses every listed name, and no resolver of one has a
+   file tier. `.leerie/config.toml` is read only for repository facts, so a
+   listed name there is never read.
+2. *A tracked settings file is the repository's.* Round 24 layered the
+   checkout's settings files into every confined worker's settings, as the
+   operator's input, because no worker writes the checkout while leerie
+   runs. That holds for the run, not for what the operator merges after it,
+   or clones. So the boundary is git's: a checkout settings file that git
+   tracks (in the checkout's index) is repository content, and leerie reads
+   nothing from it. It is not a worker's settings layer
+   (`_checkout_settings_are_operators`) and does not choose Bedrock mode or
+   its profile and region (the launcher's `_OPERATOR_CLAUDE_SETTINGS`). No
+   merge or clone brings an untracked file, so an untracked one
+   (`.claude/settings.local.json`, usually ignored) is the operator's own and
+   is read as before. When git cannot answer, the file counts as tracked.
+   This is not a refusal, unlike `leerie.toml`: the same file configures the
+   repository's own interactive Claude Code users, so refusing would make the
+   operator edit shared content to run at all, while leaving it out can only
+   fall back to the operator's own credentials. Leerie says what it left
+   out: the launcher warns when a tracked file sets
+   `CLAUDE_CODE_USE_BEDROCK`, `AWS_PROFILE` or `AWS_REGION`, and the
+   orchestrator logs each tracked file it does not apply.
+
+**What a repository still chooses.** Facts about itself and how much work it
+asks for, all of which run confined or only tighten a check:
+`.leerie/config.toml`'s `build`, `lint`, `test`, the scoped runners,
+`test_file_globs`, `capture_deps`; the tool versions mise honours
+(`.mise.toml`, `.tool-versions`), installed by a confined command; and in
+`leerie.toml` the source-of-truth, clarify, model and effort keys, the round
+and budget caps, `max_parallel` (bounded by the per-worker ceilings and the
+admission gate), the worker and rate-limit timeouts, verbosity, `no_push`
+(it can only withhold a push), `pr_template`, `pr_base_branch`,
+`strict_conformer`, `stop_on_blocked`, `stop_on_repo_change` (each only
+tightens), `subtask_tests` (the final tree is measured whatever it says),
+`skip_repo_map` (context, not a check), the heal and judge tuning, the seed
+knobs and `bake_language_deps`. The operator's flag or environment overrides
+each.
+
+**Residual.** `.leerie/Dockerfile`, `setup_packages`, `language_installs` and
+a dependency lockfile build the image the run's container starts from, and
+that build is not confined: its steps run as root in the image, and the
+image holds the orchestrator itself. A repository's content therefore still
+shapes the orchestrator's own environment. This design does not close that.
 
 ### A confined command's scratch is short and private
 
@@ -6065,8 +6171,9 @@ back up on `resume` once the operator re-authenticates or sets
 
 **The same refresh-vs-static distinction applies to Bedrock auth.** The
 launcher's Bedrock support defaults to AWS SSO/profile auth:
-`detect_bedrock_mode()` reads `CLAUDE_CODE_USE_BEDROCK` out of the merged
-Claude `settings.json` files, then `bedrock_preflight()` requires the host
+`detect_bedrock_mode()` reads `CLAUDE_CODE_USE_BEDROCK` out of the operator's
+merged Claude `settings.json` files (never a tracked one in the checkout, §6
+*A repository chooses no operator authority*), then `bedrock_preflight()` requires the host
 `aws` CLI and a live `aws sts get-caller-identity` before staging `~/.aws/`
 read-only into the container. SSO access tokens are short-lived (~12h) and
 refreshed only by the host's interactive `aws sso login` browser flow — the

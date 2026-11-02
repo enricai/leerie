@@ -32,9 +32,11 @@ def test_default_when_nothing_set(leerie, repo_root):
     assert leerie.resolve_worker_pids_max(repo_root) == 2048
 
 
-def test_file_value(leerie, repo_root):
+def test_file_is_never_read(leerie, repo_root):
+    """A worker's containment ceiling is the operator's (DESIGN §6 *A
+    repository chooses no operator authority*)."""
     (repo_root / "leerie.toml").write_text("worker_pids_max = 4096\n")
-    assert leerie.resolve_worker_pids_max(repo_root) == 4096
+    assert leerie.resolve_worker_pids_max(repo_root) == 2048
 
 
 def test_env_value(leerie, repo_root, monkeypatch):
@@ -86,20 +88,10 @@ def test_negative_env_value_dies(leerie, repo_root, monkeypatch, capsys):
     assert exc.value.code != 0
 
 
-def test_bad_file_value_dies(leerie, repo_root, capsys):
-    (repo_root / "leerie.toml").write_text("worker_pids_max = bogus\n")
-    with pytest.raises(SystemExit) as exc:
-        leerie.resolve_worker_pids_max(repo_root)
-    assert exc.value.code != 0
-    err = capsys.readouterr().err
-    assert "not a positive integer" in err
-
-
-def test_zero_file_value_dies(leerie, repo_root, capsys):
-    (repo_root / "leerie.toml").write_text("worker_pids_max = 0\n")
-    with pytest.raises(SystemExit) as exc:
-        leerie.resolve_worker_pids_max(repo_root)
-    assert exc.value.code != 0
+@pytest.mark.parametrize("value", ["bogus", "0"])
+def test_bad_file_value_is_not_read(leerie, repo_root, value):
+    (repo_root / "leerie.toml").write_text(f"worker_pids_max = {value}\n")
+    assert leerie.resolve_worker_pids_max(repo_root) == 2048
 
 
 def test_empty_env_treated_as_unset(leerie, repo_root, monkeypatch):

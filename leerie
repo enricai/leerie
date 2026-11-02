@@ -203,23 +203,34 @@ if [ "${1:-}" != "version" ] && _ccl="$(_checkout_config_links)" && \
 fi
 unset _ccl
 
-# --- the checkout's leerie.toml names no location -------------------------
-# DESIGN §6 *No host path comes from a repository*. leerie.toml is the
-# repository's content — a cloned repository's, or a run branch's the
-# operator merged — and these settings name where the host writes or what a
-# worker reads: `log_file = "~/.bashrc"` made the launcher append the run's
-# output there, `state_dir` inside the checkout showed every worker the
-# run's state through /work. They come only from the operator (a flag, the
-# environment). A file that still sets one stops here, before anything reads
-# it, naming the replacement: ignoring the key would silently move a run's
-# state away from where its operator looks. One `key =` line each, matched
-# as the orchestrator's `_read_toml_key` reads them. The list is
-# REPO_CONFIG_LOCATION_KEYS in orchestrator/leerie.py
+# --- the checkout's leerie.toml chooses no operator setting ---------------
+# DESIGN §6 *No host path comes from a repository*, *A repository chooses no
+# operator authority*. leerie.toml is the repository's content — a cloned
+# repository's, or a run branch's the operator merged — and these settings
+# are the operator's: a location (`log_file = "~/.bashrc"` made the launcher
+# append the run's output there, `state_dir` inside the checkout showed every
+# worker the run's state through /work), a credential or profile, where
+# worker code runs and as whom, a cloud resource billed to the operator, a
+# waiver of a guarantee, a worker's containment ceiling. They come only from
+# the operator (a flag, the environment). A file that still sets one stops
+# here, before anything reads it, naming the replacement: ignoring the key
+# would silently run with a choice its operator did not make. One `key =`
+# line each, matched as the orchestrator's `_read_toml_key` reads them. The
+# list is REPO_CONFIG_OPERATOR_KEYS in orchestrator/leerie.py, in its order
 # (tests/test_repo_config_names_no_location.py pins the two together).
-_checkout_config_location_keys() {
+_REPO_CONFIG_OPERATOR_KEYS="state_dir log_file inspect_dirs judge_dir heal_dir
+  runtime aws_region aws_profile ec2_ami ec2_instance_type ec2_key_name
+  ec2_security_group ec2_subnet_id ec2_instance_profile fly_disk_gb
+  dangerously_skip_permissions dangerously_allow_uncapped
+  dangerously_force_strict_output skip_overlap_judge skip_budget_check
+  skip_satisfied_check skip_base_baseline skip_acceptance_check
+  skip_adherence_check skip_coverage_check skip_completeness_check
+  skip_integration_check skip_classification_check worker_memory_max
+  worker_pids_max"
+_checkout_config_operator_keys() {
   local _k _found=""
   [ -f "$USER_REPO/leerie.toml" ] || return 0
-  for _k in state_dir log_file inspect_dirs judge_dir heal_dir; do
+  for _k in $_REPO_CONFIG_OPERATOR_KEYS; do
     if grep -qE "^[[:space:]]*${_k}[[:space:]]*=" "$USER_REPO/leerie.toml" \
          2>/dev/null; then
       _found="$_found $_k"
@@ -227,20 +238,34 @@ _checkout_config_location_keys() {
   done
   printf '%s' "${_found# }"
 }
-_location_key_replacement() {
+_operator_key_replacement() {
   case "$1" in
     state_dir)    printf '%s' "--state-dir PATH or LEERIE_STATE_DIR=PATH" ;;
     log_file)     printf '%s' "--log-file PATH or LEERIE_LOG_FILE=PATH" ;;
     inspect_dirs) printf '%s' "--inspect-dir PATH (repeatable) or LEERIE_INSPECT_DIRS=PATH:PATH" ;;
     judge_dir)    printf '%s' "--judge-dir DIR or LEERIE_JUDGE_DIR=DIR" ;;
     heal_dir)     printf '%s' "--heal-dir DIR or LEERIE_HEAL_DIR=DIR" ;;
+    runtime)      printf '%s' "--runtime MODE or LEERIE_RUNTIME=MODE" ;;
+    aws_region)   printf '%s' "--aws-region REGION or LEERIE_AWS_REGION=REGION" ;;
+    aws_profile)  printf '%s' "--aws-profile PROFILE or LEERIE_AWS_PROFILE=PROFILE" ;;
+    fly_disk_gb)  printf '%s' "--fly-disk-gb N or FLY_VM_DISK_GB=N" ;;
+    worker_memory_max) printf '%s' "--worker-memory-max SIZE or LEERIE_WORKER_MEMORY_MAX=SIZE" ;;
+    worker_pids_max)   printf '%s' "--worker-pids-max N or LEERIE_WORKER_PIDS_MAX=N" ;;
+    ec2_*)
+      local _u
+      _u="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+      printf '%s' "--$(printf '%s' "$1" | tr '_' '-') VALUE or LEERIE_${_u}=VALUE" ;;
+    dangerously_*|skip_*)
+      local _u
+      _u="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+      printf '%s' "--$(printf '%s' "$1" | tr '_' '-') or LEERIE_${_u}=1" ;;
   esac
 }
-if [ "${1:-}" != "version" ] && _clk="$(_checkout_config_location_keys)" && \
+if [ "${1:-}" != "version" ] && _clk="$(_checkout_config_operator_keys)" && \
    [ -n "$_clk" ]; then
-  remote_log "error: $USER_REPO/leerie.toml sets $_clk. A setting that names a location comes only from you, never from the repository's own files, which a cloned repository or a merged run branch chooses. Remove the line from leerie.toml and set it on your side instead:"
+  remote_log "error: $USER_REPO/leerie.toml sets $_clk. A setting that names a location, chooses credentials or where workers run, spends on a cloud account, waives a guarantee or sizes a worker's containment comes only from you, never from the repository's own files, which a cloned repository or a merged run branch chooses. Remove the line from leerie.toml and set it on your side instead:"
   for _k in $_clk; do
-    echo "  $_k  →  $(_location_key_replacement "$_k")" >&2
+    echo "  $_k  →  $(_operator_key_replacement "$_k")" >&2
   done
   exit 1
 fi
@@ -948,7 +973,7 @@ _reap_orphaned_container() {
 #   → LEERIE_STATE_DIR env var
 #   → --state-dir CLI flag
 # No leerie.toml tier: the repository never chooses a host path (refused
-# above, `_checkout_config_location_keys`).
+# above, `_checkout_config_operator_keys`).
 #
 # The default key is just the repo basename. Cross-repo basename collisions
 # (two different abs_paths sharing the same basename) are caught at
@@ -1081,26 +1106,21 @@ esac
 export LEERIE_LOG_FILE_RESOLVED
 
 # --- _resolve_ec2_knob ----------------------------------------------------
-# CLI > env var > leerie.toml > (empty). Shared by the AWS region/profile
-# block immediately below and by the five --ec2-* instance-shape knobs far
-# below; defined HERE, before the top-level verb dispatch, because the AWS
-# block must run ahead of the accept-blocked/stop/kill/finalize arms that
-# consume LEERIE_AWS_* (see that block's comment). Depends only on
-# $USER_REPO, resolved at the top of this script.
+# CLI > env var > (empty). Shared by the AWS region/profile block
+# immediately below and by the --ec2-* instance-shape knobs far below;
+# defined HERE, before the top-level verb dispatch, because the AWS block
+# must run ahead of the accept-blocked/stop/kill/finalize arms that consume
+# LEERIE_AWS_* (see that block's comment).
 #
-# The CLI>env>toml ladder itself lives in a nested helper (identical in
-# shape to _resolve_seed_knob far below, minus the trailing default) rather
-# than a top-level shared function, because tests/test_resolve_ec2_vars.py
-# and tests/test_launcher_seed_depth_resolution.py each extract their own
-# function's body VERBATIM and source it standalone (see those files'
-# docstrings) -- a top-level helper defined outside either window would be
-# undefined in both isolated tests. Nesting keeps this function's own
-# extraction self-contained while still moving the ladder out of the
-# top-level body: this wrapper's own text no longer re-implements the
-# grep/sed lookup inline, it delegates to the nested helper.
+# No leerie.toml tier: an AWS profile and region, the machine's image, size,
+# key pair, network and IAM identity are the operator's (DESIGN §6 *A
+# repository chooses no operator authority*; a key for any of them stops
+# the launcher above, `_checkout_config_operator_keys`).
 _resolve_ec2_knob() {
-  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | sed -n 1p | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
-  _resolve_cli_env_toml_knob "$1" "$2" "$3"
+  local _cli="$1" _envname="$2" _envval
+  if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi
+  eval "_envval=\"\${$_envname:-}\""
+  printf '%s' "$_envval"
 }
 
 # --- _leerie_aws_creds_args_tokens -----------------------------------------
@@ -1134,7 +1154,7 @@ _leerie_aws_creds_args_tokens() {
 }
 
 # --- AWS region/profile prefs (leerie's own knobs, launcher-owned) --------
-# Resolve CLI > env > leerie.toml into LEERIE_AWS_REGION / LEERIE_AWS_PROFILE,
+# Resolve CLI > env into LEERIE_AWS_REGION / LEERIE_AWS_PROFILE,
 # the vars every consumer already reads (ec2-lib.sh's require_aws,
 # ec2-ssm.sh, ec2-provision.sh's _aws_region_profile_args, and the
 # accept-blocked/stop/kill/finalize arms). Same-name assignment + export,
@@ -1173,8 +1193,8 @@ for arg in "$@"; do
     --aws-profile)   _prev_aws_knob="profile" ;;
   esac
 done
-LEERIE_AWS_REGION="$(_resolve_ec2_knob "$_cli_aws_region" LEERIE_AWS_REGION aws_region)"
-LEERIE_AWS_PROFILE="$(_resolve_ec2_knob "$_cli_aws_profile" LEERIE_AWS_PROFILE aws_profile)"
+LEERIE_AWS_REGION="$(_resolve_ec2_knob "$_cli_aws_region" LEERIE_AWS_REGION)"
+LEERIE_AWS_PROFILE="$(_resolve_ec2_knob "$_cli_aws_profile" LEERIE_AWS_PROFILE)"
 unset _cli_aws_region _cli_aws_profile _prev_aws_knob
 export LEERIE_AWS_REGION LEERIE_AWS_PROFILE
 
@@ -5349,29 +5369,15 @@ export LEERIE_TASK_ARG
 
 # --- runtime-mode knob ---------------------------------------------------
 # Resolves RUNTIME=local|fly|ec2. Precedence: CLI --runtime > LEERIE_RUNTIME env
-# > leerie.toml `runtime` key > default `local`. Mirrors the orchestrator's
+# > default `local`. Mirrors the orchestrator's
 # resolve_runtime() (leerie.py) so the launcher routes correctly before the
 # container starts. --runtime is NOT consumed — it flows through
 # REWRITTEN_ARGS to the orchestrator's own argparse.
 RUNTIME=local
 _RUNTIME_EXPLICIT=false
-# Precedence (lowest → highest): default → toml → env → CLI.
-# TOML is resolved first so env overrides it.
-if [ -f "$USER_REPO/leerie.toml" ]; then
-  toml_runtime="$(awk '/^[[:space:]]*runtime[[:space:]]*=/ {
-                         gsub(/^[[:space:]]*runtime[[:space:]]*=[[:space:]]*/, "", $0);
-                         gsub(/^"|"$/, "", $0);
-                         print; exit
-                       }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
-  case "${toml_runtime:-}" in
-    local|fly|ec2) RUNTIME="${toml_runtime}"; _RUNTIME_EXPLICIT=true ;;
-    "")        : ;;
-    *)
-      remote_log "leerie.toml: runtime=${toml_runtime} is not one of local|fly|ec2"
-      exit 1
-      ;;
-  esac
-fi
+# Precedence (lowest → highest): default → env → CLI. No leerie.toml tier:
+# where worker code runs is the operator's (DESIGN §6 *A repository chooses
+# no operator authority*; a `runtime` key stops the launcher above).
 case "${LEERIE_RUNTIME:-}" in
   local|fly|ec2) RUNTIME="${LEERIE_RUNTIME}"; _RUNTIME_EXPLICIT=true ;;
   "")        : ;;
@@ -5511,8 +5517,9 @@ fi
 # Resolution ladder (highest → lowest):
 #   1. --fly-disk-gb N / --fly-disk-gb=N on the CLI
 #   2. $FLY_VM_DISK_GB already set in the env
-#   3. fly_disk_gb = N in leerie.toml
-#   4. default: 8 GB when RUNTIME=fly, unset when RUNTIME=local
+#   3. default: 8 GB when RUNTIME=fly, unset when RUNTIME=local
+# No leerie.toml tier: a cloud resource billed to the operator is theirs to
+# size (DESIGN §6 *A repository chooses no operator authority*).
 #
 # When set, provision.sh creates a per-machine Fly volume sized at N GB,
 # mounts it at /home/leerie, persists the volume_id into run.json, and
@@ -5534,17 +5541,6 @@ for arg in "$@"; do
 done
 if [ -n "$_cli_fly_disk_gb" ]; then
   FLY_VM_DISK_GB="$_cli_fly_disk_gb"
-elif [ -z "${FLY_VM_DISK_GB:-}" ] && [ -f "$USER_REPO/leerie.toml" ]; then
-  # Same flat-key grep pattern as the no_push read below (line ~1002),
-  # mirroring orchestrator/leerie.py:_read_toml_key.
-  _toml_fly_disk_gb="$( { grep -E '^[[:space:]]*fly_disk_gb[[:space:]]*=' \
-                              "$USER_REPO/leerie.toml" 2>/dev/null \
-                            | sed -n 1p \
-                            | sed -E 's/^[[:space:]]*fly_disk_gb[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//' ; } || true)"
-  if [ -n "$_toml_fly_disk_gb" ]; then
-    FLY_VM_DISK_GB="$_toml_fly_disk_gb"
-  fi
-  unset _toml_fly_disk_gb
 fi
 unset _cli_fly_disk_gb _prev_was_fly_disk
 # Validate: must be a positive integer when set. provision.sh would otherwise
@@ -5584,17 +5580,9 @@ fi
 # the resolved value. CLI wins; else env if set; else leerie.toml flat key;
 # else default.
 #
-# The CLI>env>toml ladder itself is the SAME nested helper
-# `_resolve_cli_env_toml_knob` that `_resolve_ec2_knob` (leerie:~919) defines
-# and delegates to -- this is the second (and only other) call site. It is
-# reproduced here, rather than shared via one top-level definition, because
-# tests/test_resolve_ec2_vars.py and tests/test_launcher_seed_depth_resolution.py
-# each extract their own function's body VERBATIM and source it standalone
-# (see those files' docstrings): a top-level helper defined outside either
-# extraction window would be undefined when that window is sourced in
-# isolation -- verified empirically. This wrapper's own body no longer
-# independently implements the grep/sed lookup; the only text this function
-# adds over the shared ladder is the trailing default-value fallback.
+# The CLI>env>toml ladder is a nested helper rather than a top-level one,
+# because tests/test_launcher_seed_depth_resolution.py extracts this
+# function's body VERBATIM and sources it standalone (see its docstring).
 _resolve_seed_knob() {
   local _cli="$1" _envname="$2" _tomlkey="$3" _default="$4" _r
   _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | sed -n 1p | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
@@ -5642,20 +5630,14 @@ export LEERIE_SEED_DEPTH LEERIE_SEED_SHALLOW_THRESHOLD_MB
 
 # --- EC2 instance-shape vars (LEERIE_EC2_AMI / _INSTANCE_TYPE / _KEY_NAME /
 # _SECURITY_GROUP / _SUBNET_ID) --------------------------------------------
-# Brings the five RunInstances-shape params up to the same CLI > env >
-# leerie.toml > (no default) precedence every other leerie knob already has
-# (FLY_VM_DISK_GB / the seed knobs above). Resolution mirrors
-# _resolve_seed_knob exactly, minus a default — there is no sensible
-# AMI/instance-type/key-pair/security-group/subnet leerie can pick on the
-# operator's behalf (docs/IMPLEMENTATION.md "EC2 instance-lifecycle vars"),
-# so an all-unset var stays empty here and _resolve_ec2_var in ec2-lib.sh
-# (sourced later, host-side, in the RUNTIME=ec2 branch) still raises its
-# existing actionable "not set — required for --runtime ec2" error.
+# CLI > env > (no default). No leerie.toml tier: the machine's image, size,
+# key pair, network and IAM identity are the operator's (DESIGN §6 *A
+# repository chooses no operator authority*). An all-unset var stays empty
+# here and the zero-config defaults in ec2-defaults.sh / ec2-ami.sh apply.
 #
-# _resolve_ec2_knob <cli-value> <env-var-name> <toml-key> — prints the
-# resolved value, or nothing if none of the three tiers has one. Defined
-# far above (beside the AWS region/profile block), because that block must
-# run ahead of the top-level verb dispatch; this call site is unaffected.
+# _resolve_ec2_knob <cli-value> <env-var-name> — prints the resolved value,
+# or nothing. Defined far above (beside the AWS region/profile block),
+# because that block must run ahead of the top-level verb dispatch.
 _cli_ec2_ami=""
 _cli_ec2_instance_type=""
 _cli_ec2_key_name=""
@@ -5692,12 +5674,12 @@ for arg in "$@"; do
     --ec2-instance-profile)  _prev_ec2_arg="instance-profile" ;;
   esac
 done
-LEERIE_EC2_AMI="$(_resolve_ec2_knob "$_cli_ec2_ami" LEERIE_EC2_AMI ec2_ami)"
-LEERIE_EC2_INSTANCE_TYPE="$(_resolve_ec2_knob "$_cli_ec2_instance_type" LEERIE_EC2_INSTANCE_TYPE ec2_instance_type)"
-LEERIE_EC2_KEY_NAME="$(_resolve_ec2_knob "$_cli_ec2_key_name" LEERIE_EC2_KEY_NAME ec2_key_name)"
-LEERIE_EC2_SECURITY_GROUP="$(_resolve_ec2_knob "$_cli_ec2_security_group" LEERIE_EC2_SECURITY_GROUP ec2_security_group)"
-LEERIE_EC2_SUBNET_ID="$(_resolve_ec2_knob "$_cli_ec2_subnet_id" LEERIE_EC2_SUBNET_ID ec2_subnet_id)"
-LEERIE_EC2_INSTANCE_PROFILE="$(_resolve_ec2_knob "$_cli_ec2_instance_profile" LEERIE_EC2_INSTANCE_PROFILE ec2_instance_profile)"
+LEERIE_EC2_AMI="$(_resolve_ec2_knob "$_cli_ec2_ami" LEERIE_EC2_AMI)"
+LEERIE_EC2_INSTANCE_TYPE="$(_resolve_ec2_knob "$_cli_ec2_instance_type" LEERIE_EC2_INSTANCE_TYPE)"
+LEERIE_EC2_KEY_NAME="$(_resolve_ec2_knob "$_cli_ec2_key_name" LEERIE_EC2_KEY_NAME)"
+LEERIE_EC2_SECURITY_GROUP="$(_resolve_ec2_knob "$_cli_ec2_security_group" LEERIE_EC2_SECURITY_GROUP)"
+LEERIE_EC2_SUBNET_ID="$(_resolve_ec2_knob "$_cli_ec2_subnet_id" LEERIE_EC2_SUBNET_ID)"
+LEERIE_EC2_INSTANCE_PROFILE="$(_resolve_ec2_knob "$_cli_ec2_instance_profile" LEERIE_EC2_INSTANCE_PROFILE)"
 unset _cli_ec2_ami _cli_ec2_instance_type _cli_ec2_key_name \
       _cli_ec2_security_group _cli_ec2_subnet_id _cli_ec2_instance_profile _prev_ec2_arg
 export LEERIE_EC2_AMI LEERIE_EC2_INSTANCE_TYPE LEERIE_EC2_KEY_NAME \
@@ -7397,21 +7379,68 @@ fi
 # paths. Container sees normal locations; no shared host state to race.
 AUTH_MOUNTS=()
 
-# Returns 0 if any Claude settings file enables Bedrock mode
-# (CLAUDE_CODE_USE_BEDROCK=1 in the env block). Checks all three files the
-# Claude CLI merges (userSettings → projectSettings → localSettings):
-#   ~/.claude/settings.json           — userSettings
-#   <repo>/.claude/settings.json      — projectSettings
-#   <repo>/.claude/settings.local.json — localSettings
+# The Claude settings files that are the operator's (DESIGN §6 *A repository
+# chooses no operator authority*): ~/.claude/settings.json, and each of the
+# checkout's .claude/settings.json and .claude/settings.local.json that git
+# does not track. A tracked one is the repository's content — a cloned
+# repository's, or a run branch's the operator merged — and Bedrock mode
+# chooses which credentials leave the host (~/.aws is staged into the
+# container) and which account is billed, so leerie reads nothing from it
+# (nor does the orchestrator, `_checkout_settings_are_operators`). No merge
+# or clone brings an untracked file, so that one is the operator's own
+# (settings.local.json, usually ignored). When git cannot answer, the file
+# counts as tracked. The checkout is not written while leerie runs.
+_checkout_settings_tracked() {
+  local _out
+  _out="$(git -C "$USER_REPO" ls-files -- ".claude/$1" 2>/dev/null)" || return 0
+  [ -n "$_out" ]
+}
+# Sets _OPERATOR_CLAUDE_SETTINGS once (the checkout is not written while
+# leerie runs), warning about a tracked file that sets a Bedrock key.
+_operator_claude_settings() {
+  local _cs _cs_keys
+  [ "${_OPERATOR_CLAUDE_SETTINGS_READY:-}" = 1 ] && return 0
+  _OPERATOR_CLAUDE_SETTINGS_READY=1
+  _OPERATOR_CLAUDE_SETTINGS=("${HOME}/.claude/settings.json")
+  for _cs in settings.json settings.local.json; do
+    if ! _checkout_settings_tracked "$_cs"; then
+      _OPERATOR_CLAUDE_SETTINGS+=("${USER_REPO}/.claude/$_cs")
+    elif [ -f "${USER_REPO}/.claude/$_cs" ]; then
+      # Not refused: the same file configures the repository's own Claude
+      # Code users, and leaving it out can only fall back to the operator's
+      # own credentials. Said, so a run that used to take Bedrock from it does
+      # not change accounts silently.
+      _cs_keys="$(python3 -I - "${USER_REPO}/.claude/$_cs" 2>/dev/null <<'PY'
+import json, sys
+try:
+    env = json.load(open(sys.argv[1])).get("env", {})
+except Exception:
+    env = {}
+if isinstance(env, dict):
+    print(" ".join(k for k in ("CLAUDE_CODE_USE_BEDROCK", "AWS_PROFILE",
+                               "AWS_REGION") if env.get(k)))
+PY
+      )" || _cs_keys=""
+      if [ -n "$_cs_keys" ]; then
+        echo "leerie: warning: .claude/$_cs is tracked by the repository and sets $_cs_keys; leerie takes Bedrock mode and its AWS profile and region only from you, so they are not applied. Set them in the env block of ~/.claude/settings.json (or of an untracked .claude/settings.local.json) to use Bedrock." >&2
+      fi
+    fi
+  done
+}
+
+# Returns 0 if any of the operator's Claude settings files enables Bedrock
+# mode (CLAUDE_CODE_USE_BEDROCK=1 in the env block), lowest first:
+#   ~/.claude/settings.json            — userSettings
+#   <repo>/.claude/settings.json       — projectSettings, when untracked
+#   <repo>/.claude/settings.local.json — localSettings, when untracked
 # Any one of them is sufficient — CLAUDE_CODE_USE_BEDROCK has no "disable" value
 # (isEnvTruthy only matches "1"/"true"/"yes"/"on"), so OR semantics are equivalent
 # to precedence here. The key is only valid inside the env block, not as a
 # top-level settings key.
 detect_bedrock_mode() {
+  _operator_claude_settings
   python3 -I - \
-    "${HOME}/.claude/settings.json" \
-    "${USER_REPO}/.claude/settings.json" \
-    "${USER_REPO}/.claude/settings.local.json" \
+    "${_OPERATOR_CLAUDE_SETTINGS[@]}" \
     2>/dev/null <<'PY'
 import json, sys
 for p in sys.argv[1:]:
@@ -7431,6 +7460,7 @@ PY
 # Catching expiry here is the only safe path; the container gets a read-only
 # snapshot of ~/.aws/ and cannot refresh tokens itself.
 bedrock_preflight() {
+  _operator_claude_settings
   if ! command -v aws >/dev/null 2>&1; then
     remote_log "error: Bedrock mode is enabled but 'aws' CLI not found on PATH."
     echo "  Install the AWS CLI and re-run leerie." >&2
@@ -7438,9 +7468,7 @@ bedrock_preflight() {
   fi
   local profile
   profile="$(python3 -I - \
-    "${HOME}/.claude/settings.json" \
-    "${USER_REPO}/.claude/settings.json" \
-    "${USER_REPO}/.claude/settings.local.json" \
+    "${_OPERATOR_CLAUDE_SETTINGS[@]}" \
     2>/dev/null <<'PY'
 import json, sys
 profile = ""
@@ -7882,12 +7910,11 @@ if [ "$_BEDROCK_BEARER_ACTIVE" = "false" ] && detect_bedrock_mode; then
   # solely on the settings.json env block (which may not be applied by all
   # claude binary versions or in all cwd contexts inside the container).
   AUTH_MOUNTS+=(-e "CLAUDE_CODE_USE_BEDROCK=1")
-  # Extract AWS_PROFILE and AWS_REGION from settings files (last-match-wins,
-  # same merge order Claude CLI uses: userSettings < projectSettings < localSettings).
+  # Extract AWS_PROFILE and AWS_REGION from the operator's settings files
+  # (last-match-wins, same merge order Claude CLI uses: userSettings <
+  # projectSettings < localSettings; a tracked checkout file is not one).
   _BEDROCK_PROFILE="$(python3 -I - \
-    "${HOME}/.claude/settings.json" \
-    "${USER_REPO}/.claude/settings.json" \
-    "${USER_REPO}/.claude/settings.local.json" \
+    "${_OPERATOR_CLAUDE_SETTINGS[@]}" \
     2>/dev/null <<'PY'
 import json, sys
 v = ""
@@ -7900,9 +7927,7 @@ print(v)
 PY
   )"
   _BEDROCK_REGION="$(python3 -I - \
-    "${HOME}/.claude/settings.json" \
-    "${USER_REPO}/.claude/settings.json" \
-    "${USER_REPO}/.claude/settings.local.json" \
+    "${_OPERATOR_CLAUDE_SETTINGS[@]}" \
     2>/dev/null <<'PY'
 import json, sys
 v = ""
@@ -8199,7 +8224,7 @@ if [ "$RUNTIME" = "fly" ]; then
   # skip .leerie/. No in-machine `git clone` (the machine deliberately has no
   # GitHub credentials). Orchestration inside the machine follows after both
   # seedings succeed.
-  remote_log "remote: starting Fly.io machine (--runtime fly / LEERIE_RUNTIME=fly / leerie.toml runtime=fly)"
+  remote_log "remote: starting Fly.io machine (--runtime fly / LEERIE_RUNTIME=fly)"
 
   # Default LEERIE_REMOTE_EXIT_RC to 130 (SIGINT) so the EXIT/INT trap
   # registered by provision.sh routes a Ctrl-C-during-tail to the
@@ -8823,7 +8848,7 @@ elif [ "$RUNTIME" = "ec2" ]; then
   # gates here too so a missing/expired AWS session fails fast with the
   # `aws sso login` hint before this branch sources any further remote
   # script.
-  remote_log "remote: starting AWS EC2 instance (--runtime ec2 / LEERIE_RUNTIME=ec2 / leerie.toml runtime=ec2)"
+  remote_log "remote: starting AWS EC2 instance (--runtime ec2 / LEERIE_RUNTIME=ec2)"
   # shellcheck disable=SC1091
   . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
   # shellcheck disable=SC1091

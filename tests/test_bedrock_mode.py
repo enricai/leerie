@@ -83,6 +83,10 @@ def _run_detect(tmp_path: Path, *, user_settings: dict | None = None,
     fake_home.mkdir(parents=True)
     user_repo = tmp_path / "repo"
     user_repo.mkdir(parents=True)
+    # A git checkout whose settings files git does not track: the
+    # operator's own (DESIGN §6 *A repository chooses no operator
+    # authority*; a tracked one is tests/test_repo_config_chooses_no_authority.py's).
+    subprocess.run(["git", "init", "-q", str(user_repo)], check=True)
     if user_settings is not None:
         _write_settings(fake_home, ".claude/settings.json", user_settings)
     if project_settings is not None:
@@ -188,6 +192,7 @@ def test_malformed_settings_json_tolerated(tmp_path: Path) -> None:
     (fake_home / ".claude" / "settings.json").write_text("{not valid json")
     user_repo = tmp_path / "repo"
     user_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(user_repo)], check=True)
     _write_settings(user_repo, ".claude/settings.json", {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}})
 
     harness = (

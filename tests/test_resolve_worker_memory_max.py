@@ -167,10 +167,14 @@ def test_env_wins_over_file(leerie, repo_root, monkeypatch):
         repo_root, max_parallel=4) == 2 * 1024**3
 
 
-def test_file_used_when_cli_and_env_unset(leerie, repo_root):
+def test_file_is_never_read(leerie, repo_root, monkeypatch):
+    """A worker's containment ceiling is the operator's (DESIGN §6 *A
+    repository chooses no operator authority*): the derivation applies."""
+    monkeypatch.setattr(leerie, "_auto_worker_memory_max",
+                        lambda _p: 3 * 1024**3)
     (repo_root / "leerie.toml").write_text("worker_memory_max = 1G\n")
     assert leerie.resolve_worker_memory_max(
-        repo_root, max_parallel=4) == 1024**3
+        repo_root, max_parallel=4) == 3 * 1024**3
 
 
 def test_auto_fallback_when_nothing_set(leerie, repo_root):
@@ -186,10 +190,9 @@ def test_garbage_env_dies(leerie, repo_root, monkeypatch):
         leerie.resolve_worker_memory_max(repo_root, max_parallel=4)
 
 
-def test_garbage_file_dies(leerie, repo_root):
+def test_garbage_file_is_not_read(leerie, repo_root):
     (repo_root / "leerie.toml").write_text("worker_memory_max = garbage\n")
-    with pytest.raises(SystemExit):
-        leerie.resolve_worker_memory_max(repo_root, max_parallel=4)
+    assert leerie.resolve_worker_memory_max(repo_root, max_parallel=4) > 0
 
 
 # ---- _is_node_repo (P9 node-repo detection) --------------------------------

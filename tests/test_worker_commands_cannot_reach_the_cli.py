@@ -134,6 +134,9 @@ def test_settings_layers_merge_in_the_clis_order(leerie, tmp_path):
         "permissions": {"allow": ["one", "two"]}}))
     repo = tmp_path / "checkout"
     (repo / ".claude").mkdir(parents=True)
+    # Untracked: the operator's own (DESIGN §6 *A repository chooses no
+    # operator authority*; a tracked one adds nothing).
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / ".claude" / "settings.json").write_text(json.dumps({
         "model": "project", "env": {"B": "project"},
         "permissions": {"allow": ["two", "three"]}}))
@@ -154,6 +157,7 @@ def test_a_malformed_settings_file_is_logged_and_left_out(leerie, tmp_path,
                                                           capsys):
     repo = tmp_path / "checkout"
     (repo / ".claude").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / ".claude" / "settings.json").write_text("{not json")
     merged = json.loads(leerie._confined_cli_settings(
         None, run_dir=tmp_path / "none", repo_root=repo))
@@ -176,6 +180,7 @@ def _claude_p_argv(leerie, monkeypatch, tmp_path, *, caps):
     run_dir.mkdir(parents=True)
     repo = tmp_path / "checkout"
     (repo / ".claude").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / ".claude" / "settings.json").write_text(json.dumps({
         "env": {"FROM_CHECKOUT": "1"}}))
     # The worker's tree: what an earlier worker could have written there.

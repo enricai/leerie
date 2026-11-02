@@ -1039,8 +1039,7 @@ export LEERIE_NO_PUSH=1
 # Route to remote execution (e.g. Fly.io) instead of local nerdctl run:
 leerie "task" --runtime fly
 export LEERIE_RUNTIME=fly
-# Or commit to leerie.toml for a per-repo default:
-#   runtime = fly
+# (never leerie.toml: where workers run is the operator's choice)
 
 # Skip pre-push hooks at finalize (the user's explicit override; defaults off).
 # Affects only the final `git push`; worker `git commit` operations inside
@@ -1210,9 +1209,9 @@ Resolution order (highest priority first):
 2. **`LEERIE_DANGEROUSLY_SKIP_PERMISSIONS`** environment variable
    (boolean, parsed by `_parse_bool_envtoml`: 1/0, true/false, yes/no,
    on/off).
-3. **`leerie.toml` at the repo root** with
-   `dangerously_skip_permissions = true`.
-4. **Default `False`.** Judgment workers stay narrow-allowlisted; the
+3. **Default `False`.** No `leerie.toml` tier: a
+   `dangerously_skip_permissions` key there stops the launcher (§2
+   *Repository configuration chooses no operator authority*). Judgment workers stay narrow-allowlisted; the
    §12 mechanical enforcement holds.
 
 An invalid value in env or file is rejected at startup via `die()` —
@@ -1242,8 +1241,9 @@ Resolution order (same shape as `--dangerously-skip-permissions`):
 
 1. **`--dangerously-allow-uncapped`** CLI flag (action=`store_true`).
 2. **`LEERIE_DANGEROUSLY_ALLOW_UNCAPPED`** environment variable.
-3. **`leerie.toml`** with `dangerously_allow_uncapped = true`.
-4. **Default `False`.** Containment is required; the run stops if it
+3. **Default `False`.** No `leerie.toml` tier: a
+   `dangerously_allow_uncapped` key there stops the launcher (§2
+   *Repository configuration chooses no operator authority*). Containment is required; the run stops if it
    cannot be enforced.
 
 ### Budget feasibility preflight
@@ -1282,8 +1282,9 @@ Resolution order for the opt-out (highest priority first):
 1. **`--skip-budget-check`** CLI flag (action=`store_true`).
 2. **`LEERIE_SKIP_BUDGET_CHECK`** environment variable
    (`_parse_bool_envtoml`).
-3. **`leerie.toml` at the repo root** with `skip_budget_check = true`.
-4. **Default `False`.** The check runs.
+3. **Default `False`.** The check runs. No `leerie.toml` tier: a
+   `skip_budget_check` key there stops the launcher (§2 *Repository
+   configuration chooses no operator authority*).
 
 Skipped on a `resume` that already reached `waves`: the resume path
 enters `_run_phases` past `_schedule()` (`waves` loads from
@@ -1617,14 +1618,9 @@ Resolution order (highest priority first):
 
 2. **`LEERIE_RUNTIME`** environment variable, same value set.
 
-3. **`leerie.toml` at the repo root** with key `runtime`. Plain
-   `key=value` syntax:
-
-   ```
-   runtime = fly
-   ```
-
-4. **Default `local`.** When unset, leerie runs workers in the local
+3. **Default `local`.** No `leerie.toml` tier: where worker code runs is
+   the operator's, and a `runtime` key there stops the launcher (§2
+   *Repository configuration chooses no operator authority*). When unset, leerie runs workers in the local
    container runtime. The default preserves all existing behavior
    for users who have not configured a remote runtime.
 
@@ -1652,8 +1648,9 @@ above). Free-form strings, no enum validation — mirrors `resolve_pr_template`,
 not `resolve_runtime`.
 
 Resolution (identical for both knobs): `--aws-region`/`--aws-profile` CLI >
-`LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` env > `leerie.toml`
-`aws_region`/`aws_profile` > default `None` (unset knobs leave
+`LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` env > default `None` (no
+`leerie.toml` tier: an `aws_region` or `aws_profile` key there stops the
+launcher, §2 *Repository configuration chooses no operator authority*) (unset knobs leave
 region/profile selection to the AWS credential chain `aws-credentials.sh`
 resolves independently).
 
@@ -1701,8 +1698,8 @@ lowest tier), resolved by the launcher (`_resolve_ec2_knob`) before
 `--ec2-subnet-id`/`--ec2-instance-profile` CLI >
 `LEERIE_EC2_AMI`/`LEERIE_EC2_INSTANCE_TYPE`/`LEERIE_EC2_KEY_NAME`/
 `LEERIE_EC2_SECURITY_GROUP`/`LEERIE_EC2_SUBNET_ID`/`LEERIE_EC2_INSTANCE_PROFILE`
-env > `leerie.toml` keys `ec2_ami`/`ec2_instance_type`/`ec2_key_name`/
-`ec2_security_group`/`ec2_subnet_id`/`ec2_instance_profile` > default.
+env > default (no `leerie.toml` tier: an `ec2_*` key there stops the
+launcher, §2 *Repository configuration chooses no operator authority*).
 Defaults when all explicit tiers are exhausted (the var exports empty and
 `ec2-lib.sh`'s `resolve_*()` returns empty without error):
 
@@ -2103,20 +2100,71 @@ a location: `state_dir`, `log_file`, `inspect_dirs`, `judge_dir`,
 `heal_dir`. They come only from a flag or the environment, and
 `leerie.toml` has no key for them.
 
-- `REPO_CONFIG_LOCATION_KEYS` (`leerie.py`) — that tuple, each mapped to
+- `REPO_CONFIG_LOCATION_KEYS` (`leerie.py`) — that dict, each mapped to
   its operator-side replacement (`--state-dir` / `LEERIE_STATE_DIR`, and so
   on). `_read_toml_key(path, key)` raises `ValueError` for a key in it, so
   no resolver can read one from the file; `resolve_inspect_dirs`,
   `resolve_judge_dir` and `resolve_heal_dir` have no file tier.
-- `_checkout_config_location_keys` (launcher) — prints the keys of that
-  list that the checkout's `leerie.toml` sets (one `key =` line each,
-  matched like `_read_toml_key`). Run right after `_checkout_config_links`,
-  for every verb but `version`, before anything else reads the file. A hit
-  stops the launcher, naming each key and its replacement: a key ignored
-  silently would move a run's state away from where its operator looks.
-  `tests/test_repo_config_names_no_location.py` pins the launcher's list to
-  `REPO_CONFIG_LOCATION_KEYS` and runs the launcher on a checkout setting each
-  key.
+- The launcher's refusal is the one below, which covers these five.
+
+### Repository configuration chooses no operator authority
+
+DESIGN §6 *A repository chooses no operator authority*. Every setting that
+carries the operator's authority comes only from a flag or the environment
+(leerie has no user-level configuration file), and `leerie.toml` has no key
+for it:
+
+| Key | Class | Operator-side replacement |
+|-----|-------|---------------------------|
+| `runtime` | where worker code runs | `--runtime` / `LEERIE_RUNTIME` |
+| `aws_region`, `aws_profile` | credentials and identity | `--aws-region` / `LEERIE_AWS_REGION`, `--aws-profile` / `LEERIE_AWS_PROFILE` |
+| `ec2_ami`, `ec2_key_name`, `ec2_security_group`, `ec2_subnet_id`, `ec2_instance_profile` | the machine, who reaches it, its IAM identity | `--ec2-<knob>` / `LEERIE_EC2_<KNOB>` |
+| `ec2_instance_type`, `fly_disk_gb` | a resource billed to the operator | `--ec2-instance-type` / `LEERIE_EC2_INSTANCE_TYPE`, `--fly-disk-gb` / `FLY_VM_DISK_GB` |
+| `dangerously_skip_permissions`, `dangerously_allow_uncapped`, `dangerously_force_strict_output` | waiver | `--dangerously-<…>` / `LEERIE_DANGEROUSLY_<…>` |
+| `skip_overlap_judge`, `skip_budget_check`, `skip_satisfied_check`, `skip_base_baseline`, `skip_acceptance_check`, `skip_adherence_check`, `skip_coverage_check`, `skip_completeness_check`, `skip_integration_check`, `skip_classification_check` | waiver (a gate or check of the result) | `--skip-<…>` / `LEERIE_SKIP_<…>` |
+| `worker_memory_max`, `worker_pids_max` | a worker's containment ceiling | `--worker-memory-max` / `LEERIE_WORKER_MEMORY_MAX`, `--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` |
+
+- `REPO_CONFIG_AUTHORITY_KEYS` (`leerie.py`) — those keys in that order,
+  each mapped to its `"<flag> / <ENV>"`. `REPO_CONFIG_OPERATOR_KEYS` is
+  `REPO_CONFIG_LOCATION_KEYS` then `REPO_CONFIG_AUTHORITY_KEYS`.
+  `_read_toml_key` raises `ValueError` for every key in it ("… is the
+  operator's to set …" for an authority key). The orchestrator's resolvers
+  of these keys pass `file_key=None` to `_resolve_enum_pref` /
+  `_resolve_bool_pref` / `_resolve_positive_int_pref`, which then have no
+  file tier; `resolve_worker_memory_max` has none either.
+- `_REPO_CONFIG_OPERATOR_KEYS` and `_checkout_config_operator_keys`
+  (launcher) — the same list in the same order, and the keys of it the
+  checkout's `leerie.toml` sets (one `key =` line each, matched like
+  `_read_toml_key`). Run right after `_checkout_config_links`, for every verb
+  but `version`, before anything else reads the file. A hit stops the
+  launcher (exit 1), naming each key and its replacement
+  (`_operator_key_replacement`). The launcher's `runtime`, `fly_disk_gb`,
+  AWS and `--ec2-*` resolutions have no file tier (`_resolve_ec2_knob
+  <cli> <env-name>`: CLI > env).
+- `_checkout_settings_are_operators(repo_root, name)` (`leerie.py`,
+  cached per process) — True when git does not track `.claude/<name>` in
+  the checkout (`git --literal-pathspecs <_tree_git_args> ls-files -z --`
+  prints nothing and exits 0). False when it is tracked or git cannot
+  answer; a tracked file that exists is logged once as not applied.
+  `_confined_cli_settings` layers only the `CHECKOUT_SETTINGS_FILES` for
+  which it is True.
+- `_checkout_settings_tracked <name>` and `_OPERATOR_CLAUDE_SETTINGS`
+  (launcher) — the same test (`git -C <checkout> ls-files -- .claude/<name>`;
+  a failure counts as tracked) and the operator's settings files:
+  `~/.claude/settings.json`, then each untracked checkout settings file.
+  `detect_bedrock_mode`, `bedrock_preflight` and the `AWS_PROFILE` /
+  `AWS_REGION` reads take only these. A tracked file whose `env` sets
+  `CLAUDE_CODE_USE_BEDROCK`, `AWS_PROFILE` or `AWS_REGION` gets a
+  `leerie: warning:` naming the keys and the replacement (the `env` block of
+  `~/.claude/settings.json` or of an untracked `.claude/settings.local.json`);
+  the run continues.
+- Tests: `tests/test_repo_config_names_no_location.py` pins the launcher's
+  list to `REPO_CONFIG_OPERATOR_KEYS` and runs the launcher on a checkout
+  setting each location key; `tests/test_repo_config_chooses_no_authority.py`
+  starts a fresh run from a checkout setting each authority key (refused,
+  replacement named, none of `aws`/`flyctl`/`fly`/`nerdctl`/`ssh` run),
+  checks every resolver ignores the file, and drives the settings boundary
+  in `_confined_cli_settings` and the launcher's Bedrock detection.
 
 ### Judge model
 
@@ -2944,21 +2992,21 @@ table.
 | `--clarify` | off | Opt into surfacing intent questions to the user. Default: questions are dropped after the classifier's codebase→research filter, and the implementer makes a documented best-effort decision. Also `LEERIE_CLARIFY` env var or `clarify = true` in `leerie.toml`. |
 | `--max-workers N` | `2000` | Cap on total `claude -p` invocations across the run. Also `LEERIE_MAX_WORKERS` env var or `max_workers` in `leerie.toml`. |
 | `--max-parallel N` | `5` | Cap on concurrent workers within a wave. Per-worker cgroup containment keeps an OOM inside one worker's cgroup; users on smaller VMs can opt down. Also `LEERIE_MAX_PARALLEL` env var or `max_parallel` in `leerie.toml`. |
-| `--worker-memory-max SIZE` | auto | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Bounds RAM the worker subtree may consume; OOMs stay inside the worker cgroup rather than cascading to sshd / orchestrator. Auto-derived when unset from the shared `leerie.slice` budget (`/proc/meminfo` only when no slice budget is readable). Raised automatically when the repo's own build/lint/test command declares a Node heap via `--max-old-space-size`; if you pin an explicit value **below** that declared heap plus headroom, leerie refuses at startup rather than issuing a cap that guarantees an in-cgroup OOM. Also `LEERIE_WORKER_MEMORY_MAX` or `worker_memory_max` in `leerie.toml`. |
+| `--worker-memory-max SIZE` | auto | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Bounds RAM the worker subtree may consume; OOMs stay inside the worker cgroup rather than cascading to sshd / orchestrator. Auto-derived when unset from the shared `leerie.slice` budget (`/proc/meminfo` only when no slice budget is readable). Raised automatically when the repo's own build/lint/test command declares a Node heap via `--max-old-space-size`; if you pin an explicit value **below** that declared heap plus headroom, leerie refuses at startup rather than issuing a cap that guarantees an in-cgroup OOM. Also `LEERIE_WORKER_MEMORY_MAX` (never `leerie.toml`). |
 | `--worker-timeout SEC` | `5400` (90 min) | Global per-worker wall-clock ceiling. Setting it **bypasses** the measured per-worker table (`TIMEOUT_DEFAULT_PER_WORKER`), which otherwise lowers the ceiling for fast worker types — e.g. `classifier` to 1236 s — using a duration distribution measured on one host. Raise it when a worker is being killed at a ceiling derived on a faster machine. A bypass rather than a bound, so an explicit value wins outright in both directions; explicitly passing the default counts as setting it. Also `LEERIE_WORKER_TIMEOUT` or `worker_timeout_sec` in `leerie.toml`. |
 | `--max-rate-limit-wait SEC` | `21600` (6 h) | Longest rate-limit reset `main()` will sleep through before it stops auto-resuming and takes the `out_of_credits` disposition instead (worktree-only cleanup, resume hint, `EXIT_LOCKED`). The five-hour session window is bounded and worth waiting out; the weekly window resets at a fixed per-account instant that can be days away, and sleeping on it holds the run-directory flock and blocks every other run on the repo. Keyed on the **computed wait**, never on `rateLimitType`, so a renamed limit type cannot silently disable it. Also `LEERIE_MAX_RATE_LIMIT_WAIT` or `max_rate_limit_wait_sec` in `leerie.toml`. |
 | `--confidence-rounds N` | `8` | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `LEERIE_CONFIDENCE_ROUNDS` and `leerie.toml`. |
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |
 | `--source-of-truth VALUE` | `both` | `codebase` / `research` / `both`. Overrides `LEERIE_SOURCE_OF_TRUTH` and `leerie.toml`. |
-| `--runtime VALUE` | `local` | `local` / `fly` / `ec2`. Execution backend for per-subtask worker containers. Overrides `LEERIE_RUNTIME` and `leerie.toml`. `--runtime ec2` provisions an EC2 instance, seeds it, and runs the orchestrator on it, mirroring `--runtime fly`; see `docs/INSTALL.md` "EC2 runtime" (bakes and reuses a tagged AMI on first use unless `--ec2-ami` names one). |
-| `--aws-region VALUE` | none | AWS region leerie itself uses when provisioning `--runtime ec2` machines. Distinct from the AWS SDK's own `AWS_REGION` credential-chain var. Also `LEERIE_AWS_REGION` env var or `aws_region` in `leerie.toml`. |
-| `--aws-profile VALUE` | none | AWS profile leerie itself uses when provisioning `--runtime ec2` machines. Distinct from the AWS SDK's own `AWS_PROFILE` credential-chain var. Also `LEERIE_AWS_PROFILE` env var or `aws_profile` in `leerie.toml`. |
-| `--ec2-ami VALUE` | `ensure_ami()` bake/reuse (optional override) | AMI id for the `RunInstances` call. Also `LEERIE_EC2_AMI` env var or `ec2_ami` in `leerie.toml`. |
-| `--ec2-instance-type VALUE` | `m5.xlarge` (optional override) | EC2 instance type (e.g. `t3.large`). Also `LEERIE_EC2_INSTANCE_TYPE` env var or `ec2_instance_type` in `leerie.toml`. |
-| `--ec2-key-name VALUE` | leerie-tagged key pair (optional override) | EC2 key-pair name for SSH access. Also `LEERIE_EC2_KEY_NAME` env var or `ec2_key_name` in `leerie.toml`. |
-| `--ec2-security-group VALUE` | leerie-tagged group (tcp/22 from launcher egress `/32`) (optional override) | Security group id to attach. Also `LEERIE_EC2_SECURITY_GROUP` env var or `ec2_security_group` in `leerie.toml`. |
-| `--ec2-subnet-id VALUE` | default-VPC public subnet (optional override) | Subnet id to launch into. Also `LEERIE_EC2_SUBNET_ID` env var or `ec2_subnet_id` in `leerie.toml`. |
-| `--ec2-instance-profile VALUE` | none (optional) | IAM instance profile name passed as `--iam-instance-profile` to `RunInstances`. Also `LEERIE_EC2_INSTANCE_PROFILE` env var or `ec2_instance_profile` in `leerie.toml`. |
+| `--runtime VALUE` | `local` | `local` / `fly` / `ec2`. Execution backend for per-subtask worker containers. Overrides `LEERIE_RUNTIME` (never `leerie.toml`). `--runtime ec2` provisions an EC2 instance, seeds it, and runs the orchestrator on it, mirroring `--runtime fly`; see `docs/INSTALL.md` "EC2 runtime" (bakes and reuses a tagged AMI on first use unless `--ec2-ami` names one). |
+| `--aws-region VALUE` | none | AWS region leerie itself uses when provisioning `--runtime ec2` machines. Distinct from the AWS SDK's own `AWS_REGION` credential-chain var. Also `LEERIE_AWS_REGION` env var (never `leerie.toml`). |
+| `--aws-profile VALUE` | none | AWS profile leerie itself uses when provisioning `--runtime ec2` machines. Distinct from the AWS SDK's own `AWS_PROFILE` credential-chain var. Also `LEERIE_AWS_PROFILE` env var (never `leerie.toml`). |
+| `--ec2-ami VALUE` | `ensure_ami()` bake/reuse (optional override) | AMI id for the `RunInstances` call. Also `LEERIE_EC2_AMI` env var (never `leerie.toml`). |
+| `--ec2-instance-type VALUE` | `m5.xlarge` (optional override) | EC2 instance type (e.g. `t3.large`). Also `LEERIE_EC2_INSTANCE_TYPE` env var (never `leerie.toml`). |
+| `--ec2-key-name VALUE` | leerie-tagged key pair (optional override) | EC2 key-pair name for SSH access. Also `LEERIE_EC2_KEY_NAME` env var (never `leerie.toml`). |
+| `--ec2-security-group VALUE` | leerie-tagged group (tcp/22 from launcher egress `/32`) (optional override) | Security group id to attach. Also `LEERIE_EC2_SECURITY_GROUP` env var (never `leerie.toml`). |
+| `--ec2-subnet-id VALUE` | default-VPC public subnet (optional override) | Subnet id to launch into. Also `LEERIE_EC2_SUBNET_ID` env var (never `leerie.toml`). |
+| `--ec2-instance-profile VALUE` | none (optional) | IAM instance profile name passed as `--iam-instance-profile` to `RunInstances`. Also `LEERIE_EC2_INSTANCE_PROFILE` env var (never `leerie.toml`). |
 | `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated); no `leerie.toml` key. |
 | `--model ALIAS` | per-worker (every worker → `sonnet`, except `pr_reviewer` → `opus`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
 | `--model-<worker> ALIAS` | per-worker default (every worker → `sonnet`, except `pr_reviewer` → `opus`) | Per-worker override. `<worker>` is any `WORKER_TYPES` entry (listed under `LEERIE_MODEL_<WORKER>` below). Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
@@ -2976,16 +3024,16 @@ table.
 | `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
 | `--report [RUN_ID]` | — | Print a read-only telemetry report for a run: per-call-type token/cost/latency/failure breakdown plus memory peak. Pass a run id, or omit to auto-pick when exactly one run exists. Exits without running orchestrate. |
 | `--status STATE` | — | With `list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`, `incomplete`, `other-leerie`. |
-| `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` or `skip_overlap_judge` in `leerie.toml`. |
-| `--skip-budget-check` | off | Skip the post-schedule budget-feasibility preflight (DESIGN §13). The runtime backstop in `State.bump_workers()` still fires. Also `LEERIE_SKIP_BUDGET_CHECK` or `skip_budget_check` in `leerie.toml`. |
+| `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` (never `leerie.toml`). |
+| `--skip-budget-check` | off | Skip the post-schedule budget-feasibility preflight (DESIGN §13). The runtime backstop in `State.bump_workers()` still fires. Also `LEERIE_SKIP_BUDGET_CHECK` (never `leerie.toml`). |
 | `--skip-repo-map` | off | Skip the P6 repo-map structural context (DESIGN §5½ (P6)): suppresses `_build_repo_map()` and the ranked subgraph injection into planner/splitter context; the planner degrades gracefully to the prior grep/glob-only path. Use on repos where tree-sitter cannot parse the primary language. Also `LEERIE_SKIP_REPO_MAP` or `skip_repo_map` in `leerie.toml`. |
-| `--skip-adherence-check` | off | Skip the instruction-adherence gate: the deterministic prescribed-command-coverage floor and the `adherence_judge` worker in `phase_adherence_gate` (a whole-plan gate, "Phase 2⅞", run after `phase_overlap_judge` and before `_schedule()`). A plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. Also `LEERIE_SKIP_ADHERENCE_CHECK` or `skip_adherence_check` in `leerie.toml`. |
-| `--skip-classification-check` | off | Skip `phase_classification_gate` (DESIGN §8) entirely: `classification_judge` never spawns and the classifier's own category set stands. The escape hatch for a gate that will not converge — it runs before any provision/plan spend and `die()`s on exhaustion, so a stuck gate otherwise takes the whole run. A miscategorized set produces the wrong planners, so prefer refining the task description first. Also `LEERIE_SKIP_CLASSIFICATION_CHECK` or `skip_classification_check` in `leerie.toml`. |
+| `--skip-adherence-check` | off | Skip the instruction-adherence gate: the deterministic prescribed-command-coverage floor and the `adherence_judge` worker in `phase_adherence_gate` (a whole-plan gate, "Phase 2⅞", run after `phase_overlap_judge` and before `_schedule()`). A plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. Also `LEERIE_SKIP_ADHERENCE_CHECK` (never `leerie.toml`). |
+| `--skip-classification-check` | off | Skip `phase_classification_gate` (DESIGN §8) entirely: `classification_judge` never spawns and the classifier's own category set stands. The escape hatch for a gate that will not converge — it runs before any provision/plan spend and `die()`s on exhaustion, so a stuck gate otherwise takes the whole run. A miscategorized set produces the wrong planners, so prefer refining the task description first. Also `LEERIE_SKIP_CLASSIFICATION_CHECK` (never `leerie.toml`). |
 | `--stop-on-blocked` | off | Stop the run and wait for `accept-blocked` when a subtask is still blocked after its re-drives from the shared budget, instead of settling it `unconverged`. Accepted on start and `resume`. Also `LEERIE_STOP_ON_BLOCKED` or `stop_on_blocked` in `leerie.toml`. |
 | `--stop-on-repo-change` | off | Stop the run when the real checkout changes mid-run (new/edited files, or — even during execute — a commit, HEAD move or branch change), instead of logging a WARNING and continuing (DESIGN §12 L4). Accepted on start and `resume`. Also `LEERIE_STOP_ON_REPO_CHANGE` or `stop_on_repo_change` in `leerie.toml`. |
-| `--skip-integration-check` | off | Skip the `integration_judge` behavioral-defect gate (DESIGN §8) entirely: no worker spawn for any subtask in this run. Independent of the accept-integration/audit-key mechanism, which only accepts a finding the judge already produced. Also `LEERIE_SKIP_INTEGRATION_CHECK` or `skip_integration_check` in `leerie.toml`. |
-| `--skip-acceptance-check` | off | Skip the held-out acceptance tests (DESIGN §8 *Held-out acceptance tests*): no `acceptance_writer` sets are written after the defect-scope audit and the post-integration acceptance gate does not run. Also `LEERIE_SKIP_ACCEPTANCE_CHECK` or `skip_acceptance_check` in leerie.toml. |
-| `--dangerously-skip-permissions` | off | Pass `--dangerously-skip-permissions` to every `claude -p` worker, including judgment workers that run in the real repo cwd. Waives DESIGN §12 read-only enforcement. Also `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` or `dangerously_skip_permissions` in `leerie.toml`. |
+| `--skip-integration-check` | off | Skip the `integration_judge` behavioral-defect gate (DESIGN §8) entirely: no worker spawn for any subtask in this run. Independent of the accept-integration/audit-key mechanism, which only accepts a finding the judge already produced. Also `LEERIE_SKIP_INTEGRATION_CHECK` (never `leerie.toml`). |
+| `--skip-acceptance-check` | off | Skip the held-out acceptance tests (DESIGN §8 *Held-out acceptance tests*): no `acceptance_writer` sets are written after the defect-scope audit and the post-integration acceptance gate does not run. Also `LEERIE_SKIP_ACCEPTANCE_CHECK` (never `leerie.toml`) in leerie.toml. |
+| `--dangerously-skip-permissions` | off | Pass `--dangerously-skip-permissions` to every `claude -p` worker, including judgment workers that run in the real repo cwd. Waives DESIGN §12 read-only enforcement. Also `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` (never `leerie.toml`). |
 | `--pr-template NAME` | none | When the target repo has multiple PR templates in `PULL_REQUEST_TEMPLATE/`, pick this one by basename (with or without `.md`). Also `LEERIE_PR_TEMPLATE` or `pr_template` in `leerie.toml`. |
 | `--pr-base-branch BRANCH` | `working_branch` | Override the final branch this run's PR merges into (passed to `gh pr create --base`). The diff fork-point used to compute the PR diff is unaffected and always stays `working_branch`. Also `LEERIE_PR_BASE_BRANCH` or `pr_base_branch` in `leerie.toml`. |
 | `--pr-writer-model ALIAS` | `sonnet` | Model alias for the finalize-time PR title + body writer. Also `LEERIE_MODEL_PR_WRITER` or `model_pr_writer` in `leerie.toml`. |
@@ -3080,12 +3128,22 @@ a container.
 
 ### Environment variables and `leerie.toml` keys
 
+Source of each setting: the env var (and its flag) is the operator's. The
+`leerie.toml` key column names the key a repository's `leerie.toml` may set,
+the repository's own fact or preference, which the operator's flag and env
+var override. `—` means no `leerie.toml` key; `— (operator only)` marks a
+setting that carries the operator's authority, and a `leerie.toml` that sets
+its key stops the launcher, naming this env var or flag (§2 *Repository
+configuration chooses no operator authority*). The checkout's
+`.claude/settings*.json` count as the operator's only while git does not
+track them (same section).
+
 | Env var | `leerie.toml` key | Description |
 |---------|---------------------|-------------|
 | `LEERIE_STATE_DIR` | — | Override the per-repo run state directory. A location, so no `leerie.toml` key: a `state_dir` there stops the launcher (§2 *Repository configuration names no location*). Never at, inside or above the checkout. Unset → default `$HOME/.leerie/<basename>/` (outside the repo; no `.gitignore` entry needed in target projects). Cross-repo basename collisions are caught at use time via an `.owner` sidecar inside the dir. Set once in your shell profile for a global directory across all repos. |
 | `LEERIE_HOST_DIR` | — | Launcher-only: the host directory mounted at `/leerie-host`, where the host-wide build semaphore keeps its slot files (DESIGN §6 *A host-wide build semaphore*). Unset → `~/.leerie/.host`, which must stay the default: the semaphore bounds only runs that share one directory, so repoint it only for a run that must be isolated from the host's other runs (a bench that must never touch `~/.leerie`). Must be absolute (`~/` expands); a relative path is refused. Not forwarded into the container: there the launcher sets `LEERIE_HOST_DIR=/leerie-host`, the mount point `_build_sem_dir` reads. |
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
-| `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly` / `ec2`). Overridden by `--runtime`. Unset → default `local`. |
+| `LEERIE_RUNTIME` | — (operator only) | Execution backend for per-subtask worker containers (`local` / `fly` / `ec2`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → every worker defaults to `sonnet`, except `pr_reviewer` → `opus`. |
 | `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ every `WORKER_TYPES` entry: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `artifact_registry`, `integration_judge`, `no_work_judge`, `delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `pr_reviewer`, `contract_extractor`, `falsifier`, `verifiability_classifier`, `delivery_ratchet`, `forbidden_command_extractor`. Unset → every worker → `sonnet`, except `pr_reviewer` → `opus`. |
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `medium`, implementer/conformer `low`, `pr_reviewer` `high`, everything else inherits Claude default. |
@@ -3104,19 +3162,26 @@ a container.
 | `LEERIE_HEAL_DIR` | — | Subdirectory name under the run dir for LLM self-heal output. Overridden by `--heal-dir`. Unset → default `heal-out`. |
 | `LEERIE_MAX_WORKERS` | `max_workers` | Total worker-invocation budget. Overridden by `--max-workers`. Unset → default `2000`. |
 | `LEERIE_MAX_PARALLEL` | `max_parallel` | Concurrent workers per wave. Overridden by `--max-parallel`. Unset → default `5`. |
-| `LEERIE_WORKER_MEMORY_MAX` | `worker_memory_max` | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Overridden by `--worker-memory-max`. Unset → auto-derived from the shared `leerie.slice` budget (`/proc/meminfo` only as a fallback), and raised automatically when the repo declares a Node heap — see the `--worker-memory-max` row above. |
+| `LEERIE_WORKER_MEMORY_MAX` | — (operator only) | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Overridden by `--worker-memory-max`. Unset → auto-derived from the shared `leerie.slice` budget (`/proc/meminfo` only as a fallback), and raised automatically when the repo declares a Node heap — see the `--worker-memory-max` row above. |
+| `LEERIE_WORKER_PIDS_MAX` | — (operator only) | Per-worker cgroup PID cap (positive integer). Overridden by `--worker-pids-max`. Unset → default `2048`. |
 | `LEERIE_WORKER_TIMEOUT` | `worker_timeout_sec` | Global per-worker wall-clock ceiling in seconds. Overridden by `--worker-timeout`. Setting it at any tier bypasses the measured per-worker timeout table — see the `--worker-timeout` row above. Unset → default `5400` and the table applies. |
 | `LEERIE_MAX_RATE_LIMIT_WAIT` | `max_rate_limit_wait_sec` | Longest rate-limit reset to sleep through, in seconds. Overridden by `--max-rate-limit-wait`. Unset → default `21600` (6 h). Beyond it, the run pauses resumably rather than sleeping — see the `--max-rate-limit-wait` row above. |
-| `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` | `dangerously_skip_permissions` | Waive §12 read-only enforcement on judgment workers (truthy → on). Overridden by `--dangerously-skip-permissions`. Unset → default `false`. |
-| `LEERIE_SKIP_OVERLAP_JUDGE` | `skip_overlap_judge` | Skip the phase 2¾ plan-overlap judge on multi-planner runs (truthy → skip). Overridden by `--skip-overlap-judge`. Unset → default `false`. |
-| `LEERIE_SKIP_ACCEPTANCE_CHECK` | `skip_acceptance_check` | Skip the held-out acceptance sets and gate (truthy → skip). Overridden by `--skip-acceptance-check`. Unset → default `false`. |
-| `LEERIE_SKIP_BUDGET_CHECK` | `skip_budget_check` | Skip the post-schedule budget-feasibility preflight (truthy → skip). Overridden by `--skip-budget-check`. Unset → default `false`. |
+| `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` | — (operator only) | Waive §12 read-only enforcement on judgment workers (truthy → on). Overridden by `--dangerously-skip-permissions`. Unset → default `false`. |
+| `LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` | — (operator only) | Run workers uncapped when the cgroup broker probe fails, with a loud warning instead of a fatal error (truthy → on). Overridden by `--dangerously-allow-uncapped`. Unset → default `false`. |
+| `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` | — (operator only) | Force constrained decoding through the per-run loopback proxy (truthy → on). Overridden by `--dangerously-force-strict-output`. Unset → default `false`. |
+| `LEERIE_SKIP_OVERLAP_JUDGE` | — (operator only) | Skip the phase 2¾ plan-overlap judge on multi-planner runs (truthy → skip). Overridden by `--skip-overlap-judge`. Unset → default `false`. |
+| `LEERIE_SKIP_ACCEPTANCE_CHECK` | — (operator only) | Skip the held-out acceptance sets and gate (truthy → skip). Overridden by `--skip-acceptance-check`. Unset → default `false`. |
+| `LEERIE_SKIP_BUDGET_CHECK` | — (operator only) | Skip the post-schedule budget-feasibility preflight (truthy → skip). Overridden by `--skip-budget-check`. Unset → default `false`. |
 | `LEERIE_SKIP_REPO_MAP` | `skip_repo_map` | Skip the P6 repo-map structural context injection (truthy → skip). Overridden by `--skip-repo-map`. Unset → default `false`. |
-| `LEERIE_SKIP_ADHERENCE_CHECK` | `skip_adherence_check` | Skip the instruction-adherence gate (deterministic command-coverage floor + `adherence_judge`) (truthy → skip). Overridden by `--skip-adherence-check`. Unset → default `false`. |
-| `LEERIE_SKIP_CLASSIFICATION_CHECK` | `skip_classification_check` | Skip the `classification_judge` category-set gate entirely (truthy → skip). Overridden by `--skip-classification-check`. Unset → default `false`. |
+| `LEERIE_SKIP_ADHERENCE_CHECK` | — (operator only) | Skip the instruction-adherence gate (deterministic command-coverage floor + `adherence_judge`) (truthy → skip). Overridden by `--skip-adherence-check`. Unset → default `false`. |
+| `LEERIE_SKIP_CLASSIFICATION_CHECK` | — (operator only) | Skip the `classification_judge` category-set gate entirely (truthy → skip). Overridden by `--skip-classification-check`. Unset → default `false`. |
 | `LEERIE_STOP_ON_BLOCKED` | `stop_on_blocked` | Halt on a subtask still blocked after its re-drives rather than settling it `unconverged` (truthy → halt). Overridden by `--stop-on-blocked`. Unset → default `false`. |
 | `LEERIE_STOP_ON_REPO_CHANGE` | `stop_on_repo_change` | Halt when the real checkout changes mid-run rather than warning and continuing (truthy → halt). Overridden by `--stop-on-repo-change`. Unset → default `false`. |
-| `LEERIE_SKIP_INTEGRATION_CHECK` | `skip_integration_check` | Skip the `integration_judge` behavioral-defect gate entirely (truthy → skip). Overridden by `--skip-integration-check`. Unset → default `false`. |
+| `LEERIE_SKIP_INTEGRATION_CHECK` | — (operator only) | Skip the `integration_judge` behavioral-defect gate entirely (truthy → skip). Overridden by `--skip-integration-check`. Unset → default `false`. |
+| `LEERIE_SKIP_SATISFIED_CHECK` | — (operator only) | Skip the plan-time `satisfied_probe` (truthy → skip). Overridden by `--skip-satisfied-check`. Unset → default `false`. |
+| `LEERIE_SKIP_BASE_BASELINE` | — (operator only) | Skip the base-tree health baseline (truthy → skip). Overridden by `--skip-base-baseline`. Unset → default `false`. |
+| `LEERIE_SKIP_COVERAGE_CHECK` | — (operator only) | Skip the required-items coverage review and the phase-5 delivery gate (truthy → skip). Overridden by `--skip-coverage-check`. Unset → default `false`. |
+| `LEERIE_SKIP_COMPLETENESS_CHECK` | — (operator only) | Make the conformer's `solution_defects` axis advisory (truthy → skip). Overridden by `--skip-completeness-check`. Unset → default `false`. |
 | `LEERIE_PR_TEMPLATE` | `pr_template` | PR template basename for repos with multiple templates. Overridden by `--pr-template`. Unset → alphabetically first `.md`. |
 | `LEERIE_PR_BASE_BRANCH` | `pr_base_branch` | Final branch this run's PR merges into. Overridden by `--pr-base-branch`. Unset → default `working_branch`. |
 | `LEERIE_MODEL_PR_WRITER` | `model_pr_writer` | Model alias for the finalize-time PR writer. Overridden by `--pr-writer-model`. Unset → default `sonnet`. |
@@ -3126,14 +3191,14 @@ a container.
 | `LEERIE_WORKER_DEBUG` | — | Enable debug-level logging injection (`DEBUG=*`, `ANTHROPIC_LOG=debug`) into worker processes. Truthy → on. |
 | `LEERIE_FLY_APP` | — | Fly.io app name (globally unique). Required when `--runtime fly`. Set via env or `--fly-app`. Launcher-only. |
 | `LEERIE_REGION` | — | Fly region used by per-job `--runtime fly` machines (including those spawned by `leerie chain`). Unset → default `iad`. Launcher-only. |
-| `LEERIE_AWS_REGION` | `aws_region` | AWS region leerie itself uses when provisioning `--runtime ec2` machines — distinct from the AWS SDK's own `AWS_REGION` credential-chain env var. Overridden by `--aws-region`. Unset → default `None` (region selection left to the AWS credential chain). |
-| `LEERIE_AWS_PROFILE` | `aws_profile` | AWS profile leerie itself uses when provisioning `--runtime ec2` machines — distinct from the AWS SDK's own `AWS_PROFILE` credential-chain env var. Overridden by `--aws-profile`. Unset → default `None`. |
-| `LEERIE_EC2_AMI` | `ec2_ami` | AMI id for the `--runtime ec2` `RunInstances` call. Overridden by `--ec2-ami`. Optional override; default: `ensure_ami()` bake/reuse. Launcher-only. |
-| `LEERIE_EC2_INSTANCE_TYPE` | `ec2_instance_type` | EC2 instance type (e.g. `t3.large`). Overridden by `--ec2-instance-type`. Optional override; default: `m5.xlarge`. Launcher-only. |
-| `LEERIE_EC2_KEY_NAME` | `ec2_key_name` | EC2 key-pair name for SSH access. Overridden by `--ec2-key-name`. Optional override; default: leerie-tagged key pair. Launcher-only. |
-| `LEERIE_EC2_SECURITY_GROUP` | `ec2_security_group` | Security group id to attach. Overridden by `--ec2-security-group`. Optional override; default: leerie-tagged group (tcp/22 from launcher egress `/32`). Launcher-only. |
-| `LEERIE_EC2_SUBNET_ID` | `ec2_subnet_id` | Subnet id to launch into. Overridden by `--ec2-subnet-id`. Optional override; default: default-VPC public subnet. Launcher-only. |
-| `LEERIE_EC2_INSTANCE_PROFILE` | `ec2_instance_profile` | IAM instance profile name for `RunInstances`. Overridden by `--ec2-instance-profile`. Optional; default: optionally a leerie-tagged SSM profile. Launcher-only. |
+| `LEERIE_AWS_REGION` | — (operator only) | AWS region leerie itself uses when provisioning `--runtime ec2` machines — distinct from the AWS SDK's own `AWS_REGION` credential-chain env var. Overridden by `--aws-region`. Unset → default `None` (region selection left to the AWS credential chain). |
+| `LEERIE_AWS_PROFILE` | — (operator only) | AWS profile leerie itself uses when provisioning `--runtime ec2` machines — distinct from the AWS SDK's own `AWS_PROFILE` credential-chain env var. Overridden by `--aws-profile`. Unset → default `None`. |
+| `LEERIE_EC2_AMI` | — (operator only) | AMI id for the `--runtime ec2` `RunInstances` call. Overridden by `--ec2-ami`. Optional override; default: `ensure_ami()` bake/reuse. Launcher-only. |
+| `LEERIE_EC2_INSTANCE_TYPE` | — (operator only) | EC2 instance type (e.g. `t3.large`). Overridden by `--ec2-instance-type`. Optional override; default: `m5.xlarge`. Launcher-only. |
+| `LEERIE_EC2_KEY_NAME` | — (operator only) | EC2 key-pair name for SSH access. Overridden by `--ec2-key-name`. Optional override; default: leerie-tagged key pair. Launcher-only. |
+| `LEERIE_EC2_SECURITY_GROUP` | — (operator only) | Security group id to attach. Overridden by `--ec2-security-group`. Optional override; default: leerie-tagged group (tcp/22 from launcher egress `/32`). Launcher-only. |
+| `LEERIE_EC2_SUBNET_ID` | — (operator only) | Subnet id to launch into. Overridden by `--ec2-subnet-id`. Optional override; default: default-VPC public subnet. Launcher-only. |
+| `LEERIE_EC2_INSTANCE_PROFILE` | — (operator only) | IAM instance profile name for `RunInstances`. Overridden by `--ec2-instance-profile`. Optional; default: optionally a leerie-tagged SSM profile. Launcher-only. |
 | `LEERIE_EC2_SSH_KEY_FILE` | — | Private key ssh uses for the EC2 instance. Unset → leerie's own key at `~/.leerie/.ec2-keys/<account>/<region>/leerie-ssh.pem` when `LEERIE_EC2_KEY_NAME` is unset; set it to the private half of an explicit `LEERIE_EC2_KEY_NAME`. Launcher-only. |
 | `LEERIE_EC2_SSH_CIDR` | — | CIDR admitted on tcp/22 by leerie's default security group. Unset → the launcher's egress IPv4 as a `/32`; `0.0.0.0/0` is refused. Launcher-only. |
 | `LEERIE_EC2_IAM_RETRY_S` | — | Seconds between `run-instances` retries while EC2 rejects a just-created instance profile. Unset → `5`. Launcher-only. |
@@ -3151,7 +3216,7 @@ a container.
 | `LEERIE_NO_AUTO_PUBLISH` | — | Skip image publish probe (truthy → skip). Also `--no-auto-publish`. Launcher-only. |
 | `LEERIE_LOCAL_BUILD` | — | Force local image build instead of Fly remote builder (truthy → local). Also `--local-build`. Launcher-only. |
 | `LEERIE_NONINTERACTIVE` | — | Suppress interactive prompts in runtime-install and auth flows (truthy → non-interactive). Launcher-only. |
-| `FLY_VM_DISK_GB` | — | Provision a Fly volume of this many GB. Also `--fly-disk-gb`. Launcher-only. |
+| `FLY_VM_DISK_GB` | — (operator only) | Provision a Fly volume of this many GB. Also `--fly-disk-gb`. Launcher-only. |
 | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | — | **Claude Code CLI variable**, not consumed by leerie. Set to `70` to backstop worker auto-compaction. |
 
 ### Precedence
@@ -3166,8 +3231,7 @@ a container.
   set `LEERIE_MODEL_<WORKER>=opus` or pass `--model-<worker> opus`.
 - **EC2 knobs** (`ec2_ami`, `ec2_instance_type`, `ec2_key_name`,
   `ec2_security_group`, `ec2_subnet_id`, `ec2_instance_profile`; highest
-  first): `--ec2-<knob>` → `LEERIE_EC2_<KNOB>` → `<knob>` in `leerie.toml`
-  → the zero-config default from `ec2-defaults.sh` / `ec2-ami.sh`. None
+  first): `--ec2-<knob>` → `LEERIE_EC2_<KNOB>` → the zero-config default from `ec2-defaults.sh` / `ec2-ami.sh`. None
   is required.
 - **Confidence rounds** (highest first): `--confidence-rounds` →
   `LEERIE_CONFIDENCE_ROUNDS` → `confidence_rounds` in
@@ -3237,18 +3301,18 @@ orchestrator, which continues its record. No host-side reader rewrites
 | `no_push` | `--no-push`, `--push` | `LEERIE_NO_PUSH` / `no_push` | sticky | where the result goes |
 | `clarify` | `--clarify` | `LEERIE_CLARIFY` / `clarify` | sticky | what the run asks |
 | `source_of_truth_pref` | `--source-of-truth` | `LEERIE_SOURCE_OF_TRUTH` / `source_of_truth` | sticky | what planning grounds on |
-| `dangerously_skip_permissions` | `--dangerously-skip-permissions` | `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `dangerously_skip_permissions` | sticky | how every worker runs |
-| `dangerously_force_strict_output` | `--dangerously-force-strict-output` | `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` / `dangerously_force_strict_output` | sticky | how every worker's output is decoded |
-| `skip_overlap_judge` | `--skip-overlap-judge` | `LEERIE_SKIP_OVERLAP_JUDGE` / `skip_overlap_judge` | sticky | a gate the run skips |
-| `skip_adherence_check` | `--skip-adherence-check` | `LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` | sticky | a gate the run skips |
-| `skip_coverage_check` | `--skip-coverage-check` | `LEERIE_SKIP_COVERAGE_CHECK` / `skip_coverage_check` | sticky | a gate the run skips |
-| `skip_completeness_check` | `--skip-completeness-check` | `LEERIE_SKIP_COMPLETENESS_CHECK` / `skip_completeness_check` | sticky | a gate the run skips |
-| `skip_integration_check` | `--skip-integration-check` | `LEERIE_SKIP_INTEGRATION_CHECK` / `skip_integration_check` | sticky | a gate the run skips |
-| `skip_classification_check` | `--skip-classification-check` | `LEERIE_SKIP_CLASSIFICATION_CHECK` / `skip_classification_check` | sticky | a gate the run skips |
-| `skip_satisfied_check` | `--skip-satisfied-check` | `LEERIE_SKIP_SATISFIED_CHECK` / `skip_satisfied_check` | sticky | a gate the run skips |
-| `skip_budget_check` | `--skip-budget-check` | `LEERIE_SKIP_BUDGET_CHECK` / `skip_budget_check` | sticky | a gate the run skips |
-| `skip_base_baseline` | `--skip-base-baseline` | `LEERIE_SKIP_BASE_BASELINE` / `skip_base_baseline` | sticky | a measurement the run skips |
-| `skip_acceptance_check` | `--skip-acceptance-check` | `LEERIE_SKIP_ACCEPTANCE_CHECK` / `skip_acceptance_check` | sticky | a gate the run skips |
+| `dangerously_skip_permissions` | `--dangerously-skip-permissions` | `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` | sticky | how every worker runs |
+| `dangerously_force_strict_output` | `--dangerously-force-strict-output` | `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` | sticky | how every worker's output is decoded |
+| `skip_overlap_judge` | `--skip-overlap-judge` | `LEERIE_SKIP_OVERLAP_JUDGE` | sticky | a gate the run skips |
+| `skip_adherence_check` | `--skip-adherence-check` | `LEERIE_SKIP_ADHERENCE_CHECK` | sticky | a gate the run skips |
+| `skip_coverage_check` | `--skip-coverage-check` | `LEERIE_SKIP_COVERAGE_CHECK` | sticky | a gate the run skips |
+| `skip_completeness_check` | `--skip-completeness-check` | `LEERIE_SKIP_COMPLETENESS_CHECK` | sticky | a gate the run skips |
+| `skip_integration_check` | `--skip-integration-check` | `LEERIE_SKIP_INTEGRATION_CHECK` | sticky | a gate the run skips |
+| `skip_classification_check` | `--skip-classification-check` | `LEERIE_SKIP_CLASSIFICATION_CHECK` | sticky | a gate the run skips |
+| `skip_satisfied_check` | `--skip-satisfied-check` | `LEERIE_SKIP_SATISFIED_CHECK` | sticky | a gate the run skips |
+| `skip_budget_check` | `--skip-budget-check` | `LEERIE_SKIP_BUDGET_CHECK` | sticky | a gate the run skips |
+| `skip_base_baseline` | `--skip-base-baseline` | `LEERIE_SKIP_BASE_BASELINE` | sticky | a measurement the run skips |
+| `skip_acceptance_check` | `--skip-acceptance-check` | `LEERIE_SKIP_ACCEPTANCE_CHECK` | sticky | a gate the run skips |
 | `skip_repo_map` | `--skip-repo-map` | `LEERIE_SKIP_REPO_MAP` / `skip_repo_map` | sticky | what planning reads |
 | `stop_on_blocked` | `--stop-on-blocked` | `LEERIE_STOP_ON_BLOCKED` / `stop_on_blocked` | sticky | how the run settles a blocked subtask |
 | `stop_on_repo_change` | `--stop-on-repo-change` | `LEERIE_STOP_ON_REPO_CHANGE` / `stop_on_repo_change` | sticky | how the run reacts to a changed checkout |
@@ -3259,8 +3323,8 @@ orchestrator, which continues its record. No host-side reader rewrites
 | `run_caps` | `--max-workers`, `--confidence-rounds`, `--planner-samples` | `LEERIE_MAX_WORKERS` / `max_workers`, `LEERIE_CONFIDENCE_ROUNDS` / `confidence_rounds`, `LEERIE_PLANNER_SAMPLES` / `planner_samples`, `LEERIE_JUDGMENT_CHECK_ROUNDS` / `judgment_check_rounds`, `LEERIE_PLANNER_CHECK_ROUNDS` / `planner_check_rounds`, `LEERIE_IMPLEMENTER_CONFIDENCE_RETRIES` / `implementer_confidence_retries` | sticky | the run's budget and its rounds of evidence |
 | `models` | `--model`, `--model-<worker>`, `--judge-model`, `--heal-model`, `--pr-writer-model` | `LEERIE_MODEL` / `model`, `LEERIE_MODEL_<WORKER>` / `model_<worker>`, `LEERIE_MODEL_JUDGE` / `model_judge`, `LEERIE_MODEL_HEAL` / `model_heal`, `LEERIE_MODEL_PR_WRITER` / `model_pr_writer`, `LEERIE_MODEL_DEP_CAPTURE` | sticky | who does the work |
 | `efforts` | `--effort`, `--effort-<worker>` | `LEERIE_EFFORT` / `effort`, `LEERIE_EFFORT_<WORKER>` / `effort_<worker>` | sticky | how hard each worker reasons |
-| concurrency and host ceilings | `--max-parallel`, `--worker-memory-max`, `--worker-pids-max`, `--worker-timeout`, `--max-rate-limit-wait` | `LEERIE_MAX_PARALLEL` / `max_parallel`, `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max`, `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max`, `LEERIE_WORKER_TIMEOUT` / `worker_timeout_sec`, `LEERIE_MAX_RATE_LIMIT_WAIT` / `max_rate_limit_wait_sec`, `LEERIE_TOKEN_PROBE_CACHE_SEC` / `token_probe_cache_sec` | per-invocation | sized to the host and its load now; a resume may run on another host |
-| containment waiver | `--dangerously-allow-uncapped` | `LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` / `dangerously_allow_uncapped` | per-invocation | waives a check of this host, made at every entry (DESIGN §6 *Fail closed, on every entry*) |
+| concurrency and host ceilings | `--max-parallel`, `--worker-memory-max`, `--worker-pids-max`, `--worker-timeout`, `--max-rate-limit-wait` | `LEERIE_MAX_PARALLEL` / `max_parallel`, `LEERIE_WORKER_MEMORY_MAX`, `LEERIE_WORKER_PIDS_MAX`, `LEERIE_WORKER_TIMEOUT` / `worker_timeout_sec`, `LEERIE_MAX_RATE_LIMIT_WAIT` / `max_rate_limit_wait_sec`, `LEERIE_TOKEN_PROBE_CACHE_SEC` / `token_probe_cache_sec` | per-invocation | sized to the host and its load now; a resume may run on another host |
+| containment waiver | `--dangerously-allow-uncapped` | `LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` | per-invocation | waives a check of this host, made at every entry (DESIGN §6 *Fail closed, on every entry*) |
 | smoke test | `--skip-smoke` | — | per-invocation | the preflight smoke test runs only on a fresh run |
 | hook skipping at push | `--no-verify` | — | per-invocation | CLI-only by design: hook skipping is asked for each time |
 | display | `--verbosity`, `-v`, `-q` | `LEERIE_VERBOSITY` / `verbosity` | per-invocation | output only |
@@ -3268,7 +3332,7 @@ orchestrator, which continues its record. No host-side reader rewrites
 | supplied answers | `--answers` | — | per-invocation | input to this invocation, absorbed into `answers` |
 | verbs and selectors | `task`, `resume`, `list`, `--run-id`, `--status`, `--report`, `--phase`, `--judge-dir`, `--heal-dir`, `--heal-max-rounds`, `--heal-success-threshold` | `LEERIE_JUDGE_DIR`, `LEERIE_HEAL_DIR`, `LEERIE_HEAL_MAX_ROUNDS` / `heal_max_rounds`, `LEERIE_HEAL_SUCCESS_THRESHOLD` / `heal_success_threshold` | per-invocation | say what this invocation does, or tune a post-run `--phase` analysis that never continues the run |
 | launcher and resume modifiers | `--shell`, `--auto-finalize`, `--no-re-seed`, `--state-dir`, `--no-runtime-install`, `--no-auto-publish`, `--local-build` | `LEERIE_STATE_DIR`, `LEERIE_HOST_DIR`, `LEERIE_NO_RUNTIME_INSTALL`, `LEERIE_NO_AUTO_PUBLISH`, `LEERIE_LOCAL_BUILD`, `LEERIE_NONINTERACTIVE`, `LEERIE_SKIP_FRESHNESS_CHECK`, `LEERIE_WORKER_DEBUG`, `LEERIE_CAPTURE_DEPS`, `LEERIE_BAKE_LANGUAGE_DEPS`, `LEERIE_PAUSE_NOTIFY_CMD`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | per-invocation | how this invocation starts and reports, or host-wide setup |
-| runtime and remote provisioning | `--runtime`, `--fly-app`, `--fly-disk-gb`, `--aws-region`, `--aws-profile`, `--ec2-ami`, `--ec2-instance-type`, `--ec2-key-name`, `--ec2-security-group`, `--ec2-subnet-id`, `--ec2-instance-profile` | `LEERIE_RUNTIME` / `runtime`, `LEERIE_FLY_APP`, `FLY_VM_DISK_GB`, `LEERIE_REGION`, `LEERIE_AWS_REGION` / `aws_region`, `LEERIE_AWS_PROFILE` / `aws_profile`, `LEERIE_EC2_AMI` / `ec2_ami`, `LEERIE_EC2_INSTANCE_TYPE` / `ec2_instance_type`, `LEERIE_EC2_KEY_NAME` / `ec2_key_name`, `LEERIE_EC2_SECURITY_GROUP` / `ec2_security_group`, `LEERIE_EC2_SUBNET_ID` / `ec2_subnet_id`, `LEERIE_EC2_INSTANCE_PROFILE` / `ec2_instance_profile`, `LEERIE_EC2_SSH_KEY_FILE`, `LEERIE_EC2_SSH_CIDR`, `LEERIE_EC2_IAM_RETRY_S`, `LEERIE_EC2_IAM_RETRY_BUDGET_S`, `LEERIE_EC2_AMI_WAIT_S`, `LEERIE_EC2_BAKE_BASE_AMI`, `LEERIE_EC2_BAKE_SSH_RETRIES`, `LEERIE_EC2_BAKE_POLL_S`, `LEERIE_EC2_BAKE_WAIT_TRIES`, `LEERIE_SEED_TIMEOUT_S`, `LEERIE_PROGRESS_INTERVAL_S`, `LEERIE_MACHINE_START_TIMEOUT` | sidecar | a resume finds the run's runtime and machine from `fly-machine.json` / `ec2-instance.json` (`_auto_detect_run_runtime`) and provisions nothing |
+| runtime and remote provisioning | `--runtime`, `--fly-app`, `--fly-disk-gb`, `--aws-region`, `--aws-profile`, `--ec2-ami`, `--ec2-instance-type`, `--ec2-key-name`, `--ec2-security-group`, `--ec2-subnet-id`, `--ec2-instance-profile` | `LEERIE_RUNTIME`, `LEERIE_FLY_APP`, `FLY_VM_DISK_GB`, `LEERIE_REGION`, `LEERIE_AWS_REGION`, `LEERIE_AWS_PROFILE`, `LEERIE_EC2_AMI`, `LEERIE_EC2_INSTANCE_TYPE`, `LEERIE_EC2_KEY_NAME`, `LEERIE_EC2_SECURITY_GROUP`, `LEERIE_EC2_SUBNET_ID`, `LEERIE_EC2_INSTANCE_PROFILE`, `LEERIE_EC2_SSH_KEY_FILE`, `LEERIE_EC2_SSH_CIDR`, `LEERIE_EC2_IAM_RETRY_S`, `LEERIE_EC2_IAM_RETRY_BUDGET_S`, `LEERIE_EC2_AMI_WAIT_S`, `LEERIE_EC2_BAKE_BASE_AMI`, `LEERIE_EC2_BAKE_SSH_RETRIES`, `LEERIE_EC2_BAKE_POLL_S`, `LEERIE_EC2_BAKE_WAIT_TRIES`, `LEERIE_SEED_TIMEOUT_S`, `LEERIE_PROGRESS_INTERVAL_S`, `LEERIE_MACHINE_START_TIMEOUT` | sidecar | a resume finds the run's runtime and machine from `fly-machine.json` / `ec2-instance.json` (`_auto_detect_run_runtime`) and provisions nothing |
 | run group | `--group-id` | — | sidecar | the run's identity, written to `run.json` by the fresh run |
 
 ### Worker types
@@ -3402,8 +3466,8 @@ quoted into the prompt; a second failure raises `WorkerError`.
 
 Off by default. Resolved by `resolve_dangerously_force_strict_output(repo_root,
 cli_value)` with the standard CLI > env
-(`LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT`) > `leerie.toml`
-(`dangerously_force_strict_output`) precedence.
+(`LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT`) precedence; no `leerie.toml`
+tier (§2 *Repository configuration chooses no operator authority*).
 
 **Why it exists.** `--json-schema` is *validated*, not constrained: the CLI
 injects the schema as a synthetic `StructuredOutput` tool with no
@@ -4014,8 +4078,8 @@ one constant, never retyped, so this and
 heap → cap computation) cannot drift. The reserve covers Node's own
 non-heap RSS plus the resident `claude -p` process sharing the cgroup;
 the `max(..., 256)` clamp guards the explicit-override path
-(`--worker-memory-max` / `LEERIE_WORKER_MEMORY_MAX` / leerie.toml
-`worker_memory_max`, none of which share the auto-derive path's 8 GiB
+(`--worker-memory-max` / `LEERIE_WORKER_MEMORY_MAX`, neither of which
+shares the auto-derive path's 8 GiB
 floor) from handing V8 a non-positive or degenerately small ceiling. The
 variable is absent for a non-Node repo or when `worker_memory_max_bytes`
 is `None`.
@@ -5327,7 +5391,7 @@ All in `leerie.py`, in execution order. This is the concrete catalogue behind
 | Check | Catches |
 |-------|---------|
 | `resolve_source_of_truth()` at startup | invalid value in `leerie.toml`, `LEERIE_SOURCE_OF_TRUTH`, or `--source-of-truth` — caught before any worker spawns, not mid-planner |
-| `resolve_runtime()` at startup | invalid value in `leerie.toml`, `LEERIE_RUNTIME`, or `--runtime` — caught before any worker spawns |
+| `resolve_runtime()` at startup | invalid value in `LEERIE_RUNTIME` or `--runtime` — caught before any worker spawns |
 | `resolve_models()` at startup | invalid model alias in `leerie.toml`, any `LEERIE_MODEL[_*]` env var, or any `--model[-*]` CLI flag — caught before any worker spawns |
 | `git user.email` / `user.name` set | commits would fail silently without identity |
 | working tree clean | dirty tree → ambiguous diffs, corrupt merge history |
@@ -5752,7 +5816,7 @@ away). Neither alone is sufficient.
 above runs at worker *exit*; leaked `run_in_background` subprocesses
 accumulate against the worker cgroup's `pids.max` (default
 `worker_pids_max = 2048`, resolved `--worker-pids-max` >
-`LEERIE_WORKER_PIDS_MAX` > `leerie.toml` > `DEFAULT_CAPS`) *during* the
+`LEERIE_WORKER_PIDS_MAX` > `DEFAULT_CAPS`) *during* the
 run. Once hit, every `fork()` in the subtree returns `EAGAIN`, so every
 `Bash` tool-call fails and the worker spirals without diagnosing the cause
 (DESIGN §6 *Detecting PID exhaustion*). The broker's read-only `stat <sid>`
@@ -6709,7 +6773,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | per-worker idle-event warning (`worker_idle_warn_sec`) | 300 s (5 min) | log a `no stdout events in <gap>s` warning naming the worker, its PID, and any stderr tail. Observation-only — the worker is NOT killed. |
 | per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived via `_auto_worker_memory_max` → `_worker_memory_ceiling(slice_max)` from the shared `leerie.slice/memory.max` budget alone (broker `slice` verb; `_cgroup_slice_info`): `max(_WORKER_BUILD_PEAK_BYTES, min(_WORKER_BUILD_PEAK_BYTES * _WORKER_MEMORY_CEILING_MULTIPLIER, slice_max // 2))` — a **fixed isolation ceiling**, deliberately **independent of the live sibling count and of `max_parallel`**, since `memory.max` is a ceiling, not a reservation (DESIGN §6). Falls back to the legacy `/proc/meminfo`-derived basis (`_auto_worker_memory_max_legacy`, VM RAM split across `max_parallel + 1` slots, floored at 8 GiB) only when no broker/slice budget is readable. **Raised to the repo's measured build peak** once the base-health baseline has measured one: `max(ceiling, 1.25 × peak + 0.3 GiB)` (`_apply_blt_peak`; §6 *Spawn-held enrollment and measured sizing*), re-applied on resume. Contention is handled by admission in **two stages**, never by shrinking caps. Stage 1, `_degrade_max_parallel_for_wave(max_parallel, build_peak_bytes=None)`, runs once at wave entry and is synchronous: it returns the largest N in `[1, max_parallel]` with `slice_max - unreclaimable >= demand * N` and sizes the wave's `asyncio.Semaphore` accordingly. Stage 2 is the per-spawn gate: before spawning, `_await_worker_memory_admission` blocks (polling every 5s, up to 10 min) while measured slice headroom (`slice_max - unreclaimable`, never `memory.current`) is below `demand * (1 + in-flight workers)`. Reservations are bounded by worker LIFETIME — the gate returns a token from `_active_admissions` and `_invoke_admitted` releases it in a `finally`. Pinned by `tests/test_memory_admission_degrade.py`. Overridable via `--worker-memory-max SIZE` / `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max` in `leerie.toml` (bypasses the derivation only — the admission gate still runs). Suffixes K/M/G/T accepted. **Reconciled against the repo's own declared Node heap** (`resolve_worker_memory_max`, `_declared_node_heap_bytes`): an explicit `--max-old-space-size` in a `package.json` script overrides Node's host-derived default regardless of container size, so `_declared_node_heap_bytes` follows the package-manager indirection through `scripts`, matching all four V8 spellings via `_pm_script_candidates` (splits on shell separators first — a whitespace split alone misses `"build&&node"`). Deliberately over-inclusive: a missed script under-sizes the cage and OOMs the worker; an extra candidate costs nothing. A declared heap overrides whatever `NODE_OPTIONS` leerie injects for that subprocess (P9), sharing the headroom constant `_NODE_HEAP_HEADROOM_BYTES` = 2432 MiB with P9's own injection so both read one name, not a duplicated literal (`tests/test_resolve_worker_memory_max.py` AST-pins it; `test_node_heap_headroom_is_2432_mib` pins the value). When the resolved cap undershoots `declared heap + headroom`: an auto-derived cap is raised unclamped; an explicit override is refused with an actionable `die()`; when even the whole slice can't fit the declared heap, `die()`s naming the shortfall. Regression: `tests/test_worker_heap_ceiling_reconcile.py`, `tests/test_worker_memory_heap_reconcile.py` | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services are not eligible victims. Enforcement goes through the **cgroup broker** (`scripts/cgroup-broker.py`), driven by the dropped-privilege orchestrator over a descriptor it inherits (no socket path). It creates `<V2_ROOT>/leerie.slice/leerie-w-<sid>` (cgroup **v2** — `V2_ROOT` is `/sys/fs/cgroup` rootful/Fly, or the systemd-delegated user slice under rootless containerd via `LEERIE_CGROUP_V2_ROOT`) or the split `pids/`+`memory/` hierarchies at the fixed `V1_ROOT` (v1/hybrid, never rootless) and sets its `memory.max`. Local nerdctl needs the launcher's cgroup bind-mount (`bind-propagation=rshared` rootful, plain bind rootless) + `--cgroupns=host`; Fly's microVM exposes cgroupfs directly. `_cgroup_probe` asks the broker to round-trip a create+enroll+destroy, and `_enforce_and_record_cgroup_containment` `die()`s before the first worker if it fails (unless `--dangerously-allow-uncapped`). See DESIGN §6 *Memory containment*. |
 | per-worker memory demand estimate (`worker_demand_estimate_bytes`) | resolved once at run start by `resolve_worker_demand_estimate()`: `_WORKER_BUILD_PEAK_BYTES` unless the repo declares a Node heap, else `declared_heap + _NODE_HEAP_HEADROOM_BYTES`. Threaded to both admission surfaces as a parameter, not module state. **Distinct from the ceiling above** — that bounds one worker, this predicts what one will use. | `_degrade_max_parallel_for_wave` shrinks the wave; `_await_worker_memory_admission` blocks the spawn. Both fall back to `_WORKER_BUILD_PEAK_BYTES` when the key is absent, so the three entrypoints that build their own caps (`run_recapture_deps`, `run_rebaser`, `_replay_capture`) are unchanged. |
-| per-worker cgroup PIDs cap (`worker_pids_max`) | 2048, or `--worker-pids-max N` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in `leerie.toml` (positive integer; `resolve_worker_pids_max` `die()`s on bad input). Raised, never lowered, to `ceil(1.5 × measured pids peak)` once the base-health baseline has measured one (`_apply_blt_peak`; §6 *Spawn-held enrollment and measured sizing*) | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Sized against measurement (DESIGN §6 *Detecting PID exhaustion*): leerie's own suite peaks at 33 concurrent PIDs, so 2048 sits well above the workload and a worker near it is leaking rather than testing. Raise it per-repo for suites heavier than the default. |
+| per-worker cgroup PIDs cap (`worker_pids_max`) | 2048, or `--worker-pids-max N` / `LEERIE_WORKER_PIDS_MAX`, never `leerie.toml` (positive integer; `resolve_worker_pids_max` `die()`s on bad input). Raised, never lowered, to `ceil(1.5 × measured pids peak)` once the base-health baseline has measured one (`_apply_blt_peak`; §6 *Spawn-held enrollment and measured sizing*) | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Sized against measurement (DESIGN §6 *Detecting PID exhaustion*): leerie's own suite peaks at 33 concurrent PIDs, so 2048 sits well above the workload and a worker near it is leaking rather than testing. Raise it per-repo for suites heavier than the default. |
 | aggregate container memory cap (`leerie.slice/memory.max`) | auto-derived in `scripts/container-entry.sh` (PID 1) from VM `MemTotal` in `/proc/meminfo`: `MemTotal - max(1 GiB, 12.5%)`, reserving headroom for PID 1 + VM daemons (sshd, lima-guestagent, containerd). Overridable via `LEERIE_CONTAINER_MEMORY_MAX_BYTES` (raw bytes); `0`/`max` opts out. No CLI flag / `leerie.toml` key / `DEFAULT_CAPS` entry — the cap is applied by the shell entrypoint before the Python orchestrator starts. Best-effort: any read/write failure leaves the slice uncapped. Sets `memory.max` (RAM) only, not `memory.swap.max`. | when the slice's aggregate RSS exceeds the cap the kernel triggers a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`) that kills a process *inside the container*, instead of a VM-wide *global* OOM that would kill unprotected host-session processes and orphan the container. See DESIGN §6 *container boundary's hidden precondition*. |
 | auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/529/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap (401/429/auth-text) or the transient overload (529). See §3 *Auth/quota backoff*. Terminal auth failures (`_is_terminal_auth_failure`, below) never reach this loop. |
 | rate-limit wait ceiling (`max_rate_limit_wait_sec`) | 21600 s (6 h), or `--max-rate-limit-wait SEC` / `LEERIE_MAX_RATE_LIMIT_WAIT` / `max_rate_limit_wait_sec` in `leerie.toml` (positive integer; `resolve_max_rate_limit_wait_sec`, same `_resolve_positive_int_pref` ladder as `resolve_worker_timeout_sec`) | Longest rate-limit reset `main()`'s `except RateLimitedExit` arm will sleep through before it stops auto-resuming and takes the `out_of_credits` disposition instead (worktree-only cleanup, resume hint, `EXIT_LOCKED`). Sized to the subscription's windows: the five-hour session limit is bounded and worth waiting out; the weekly limit resets at a fixed per-account instant that can be days away, and sleeping on it holds the run-directory flock. Keyed on the **computed wait**, never on `rateLimitType`, so a renamed limit type cannot disable it. See DESIGN §6 *A ceiling on the wait*. |
@@ -10539,7 +10603,7 @@ orchestrator records it, gates `pr_writer` and writes `run.json.no_push`).
 
 ### Remote execution mode
 
-`--runtime fly` (or `LEERIE_RUNTIME=fly` / `leerie.toml runtime=fly`) routes
+`--runtime fly` (or `LEERIE_RUNTIME=fly`) routes
 execution to Fly.io Machines instead of the local `nerdctl run`. The
 Colima/containerd preflight block is gated on `RUNTIME=local` and skipped
 entirely when `RUNTIME=fly`. `--runtime` flows through `REWRITTEN_ARGS`
@@ -10554,8 +10618,9 @@ Resolution order (highest priority first):
    orchestrator so both the launcher and the orchestrator share the same
    resolved value.
 2. **`LEERIE_RUNTIME`** environment variable, values `local` | `fly` | `ec2`.
-3. **`leerie.toml`** at the repo root, `runtime = local|fly|ec2`.
-4. **Default `local`** — local `nerdctl run` is used when unset.
+3. **Default `local`** — local `nerdctl run` is used when unset. A
+   `runtime` key in `leerie.toml` stops the launcher instead (§2
+   *Repository configuration chooses no operator authority*).
 
 Invalid values in env or TOML are rejected immediately with an error
 message and exit 1 before any preflight runs.
@@ -10681,7 +10746,7 @@ Environment variables consumed by `provision.sh`:
 | `FLY_REGION` | `iad` | Fly.io region |
 | `FLY_VM_CPUS` | `4` | vCPU count for the machine. Setting >8 auto-promotes to Fly's `performance` CPU class (much more expensive — ~14x per CPU-second). |
 | `FLY_VM_MEMORY` | `8192` | Memory in MB for the machine. Setting >16384 auto-promotes to Fly's `performance` CPU class. |
-| `FLY_VM_DISK_GB` | `8` (on Fly runtime) | Per-machine Fly volume size in GB, mounted at `/work` — the path where the seeded repo, `.leerie/runs/<id>/` state, and per-subtask worktrees all live (and grow). The launcher defaults to `8` when `RUNTIME=fly` and no explicit value is given (CLI / env / toml). The volume is destroyed when the machine is destroyed (clean exit or `kill`). Override to a larger value for runs that hit ENOSPC (the rootfs is hard-capped at 2,000 IOPS / 8 MiB/s — N-wide worktree fans-out hit both the IOPS ceiling and the size cap fast). `/home/leerie` (caches + the `.claude` auth bundle) stays on the rootfs — `seed_auth` runs unconditionally on every resume, so the auth bundle is refreshed from host `$STAGE` regardless of pause length. |
+| `FLY_VM_DISK_GB` | `8` (on Fly runtime) | Per-machine Fly volume size in GB, mounted at `/work` — the path where the seeded repo, `.leerie/runs/<id>/` state, and per-subtask worktrees all live (and grow). The launcher defaults to `8` when `RUNTIME=fly` and no explicit value is given (CLI / env; never `leerie.toml`). The volume is destroyed when the machine is destroyed (clean exit or `kill`). Override to a larger value for runs that hit ENOSPC (the rootfs is hard-capped at 2,000 IOPS / 8 MiB/s — N-wide worktree fans-out hit both the IOPS ceiling and the size cap fast). `/home/leerie` (caches + the `.claude` auth bundle) stays on the rootfs — `seed_auth` runs unconditionally on every resume, so the auth bundle is refreshed from host `$STAGE` regardless of pause length. |
 | `LEERIE_MACHINE_START_TIMEOUT` | `120` | Seconds to wait for `state=started` |
 
 `FLY_IMAGE_TAG` is resolved by the launcher (`resolve_fly_image_tag()`)
@@ -12257,7 +12322,7 @@ command line overrides it.
 | `contract_literal_checks` | dict | per worker-flagged contract, keyed `<sid>#<risk index>` (DESIGN §8 *Typed evidence for the delivery judge*): `{owner_sid, risk_index, detail, where, extracted?: {counterpart_sid, literal, literal_kind, symbol, literal_unverified?}, error?, flag?, why?}` — `extracted` from `contract_extractor` (cached; resume never re-asks), `flag`/`why` from the latest `_check_contract_literals`. For the PR; never gates. |
 | `pr_review` | dict | the advisory whole-PR review (DESIGN §9 *An advisory whole-PR review feeds the final conformer*), written once by `_run_pr_review`: `{base, head, model, effort, diff_cut, findings[{item_id, kind, path, line_start, line_end, quote, item_span_quote, explanation, path_exists, quote_ok, line_ok, item_id_norm, item_known, span_ok, verified}], n_findings, n_verified, at, error?}`. Only `verified` findings reach the final conformer; for the PR; never gates and never read by `_decide_outcome`. Its presence is the resume sentinel. |
 | `acceptance` | dict | the held-out acceptance record (DESIGN §8 *Held-out acceptance tests*): `{validity_base, report_base, written, sets[], discarded[{index, reason}], audit_conflicts?[], skipped?, gate?}` — `validity_base` is the run's own start, `report_base` the earliest same-task base (informational). Each valid set `{index, valid, dir, defect_files[], control_files[], support_files[], cases{file: [names]}, modes{defect file: "assertion" | "import" (observed failing to load on the base)}, base_failing_cases{defect file: [runner case IDs that failed at the own start]}, report_reproduced: bool | null, base_case_status{defect file: {case id: status}}, base_failure_messages{defect file: {case id: message}}, scope?, own_start_rewrite?, rewrite_rounds?, audit?, rewrite?, broken?}`, stored under `<run_dir>/acceptance/set-<k>/` (a replacing rewrite under `set-<k>-rw/`) — `own_start_rewrite: true` when the writer's one own-start retry produced it; `rewrite_rounds` the `acceptance_rewrite_rounds` counter; `audit` the latest set audit `{findings[{case, defect_kind, test_quote, prod_quote, reason, sample}], kinds[], sample_kinds[[kind]], samples, skipped?, verdicts?{case: set_defect|implementation_gap}, case_keys?{case: {key, assertion, target[]}}, reconciled?[case]}` (only quote-verified `set_defect` cases, minus any `_reconcile_audit_verdicts` withdrew; `sample_kinds` the verified kinds of each sample that answered, what the delivery re-drive's escalation gate counts a majority over); `rewrite` `{triggers[mechanical | set_audit | surrogate_witness], outcome: replaced | kept_original, reason?, retried_empty, original?{dir, defect_files, control_files, support_files, cases, modes, base_failing_cases, base_case_status, base_failure_messages, scope}, result}` (`result` the set's verdict on the integrated tree after the rewrite, which replaces its `gate.final` entry); `broken: true` (written only by `_acceptance_audit_and_rewrite`; read only through `_acceptance_set_broken`) keeps the set out of the next run's residual and out of `_decide_outcome`'s failing count. `scope` (report-pointer tasks only, `_acceptance_scope_judge_sets`) is `{bounded: true, counted_cases{file: [case ids]}, judged{file: {case id: {origin, in_range, quote_ok, counted}}}}` or `{bounded: false, error}`; a bounded set with no counted case is a variant set — repaired, never work (`_acceptance_result_has_work`). An invalid set from the writer's own-start retry whose defect files all still pass carries `reason: "fixed_on_head_by_execution"`. `{"skipped": reason}` when the run is not a defect fix (no `bug-fixing` category), there is no scoped test command (also `skip_kind: "no_scoped_runner"`, `reason`, `test_command`), `--skip-acceptance-check` is set, or writing raised anything but a budget-exhaustion `WorkerError` (which stops the run). `gate` is `{initial[], initial_sha?, rounds[{round, results?, sha?, error?, retried?, pre_sha?, fixed_cases?, ratchet?, rollback_reason?, rolled_back?, rollback_failed?}], round_pre?{round, sha}, test_ids?{sha: {ids[], files{}, kind, messages{}, command} | {unmeasured: true}}, final[], final_sha?, before_sha?, pre_tests_passed?, post_tests_confirm?, residual?, rolled_back?, rollback_reason?, rollback_failed?, final_unremeasured?{sha, label}}` (`final_unremeasured` written by `_acceptance_remeasure_final` when re-measuring `sha` measured no set, so `final` stays of `final_sha`; dropped when a re-measure succeeds) (`round_pre` the in-flight round's own start, saved before its worker runs and dropped when the round is recorded; a round's `pre_sha` is that start, `fixed_cases` `_acceptance_fixed_cases(verdict before, its verdict)`, `ratchet` the round's `_delivery_ratchet` result (or `{error}`), `test_ids` the test axis's failing IDs per measured commit, and `rollback_reason: "fixed no failing case"` | `"regressed a previously met required item"` | `"broke an existing test"` marks a round reset to `pre_sha` — `rolled_back` the confirmed reset, absent while the decision is on disk but the reset not yet done, which a resume finishes; `_acceptance_round_kept` skips such a round wherever the latest or last measured verdict is read) (`initial` persisted before any repair; `initial_sha`/`rounds[].sha` the commit each verdict was measured on, `final_sha` the staging HEAD when `final` was written — rewritten with `final` by the delivery re-drive, and by `_acceptance_remeasure_final` when a resumed gate finds `final` of another commit than staging's HEAD: the sets are measured again on HEAD with no repair round, and the gate otherwise skips only while `final_sha` is HEAD — absent from a state saved before they existed, which then always counts as moved), each result `{index, passed, unmeasured, failing_files[], failing_cases?{file: [case ids]}, resource_affected_files?[], intermittent_cases?{file: [held case ids]}, budget_short_files?[], budget_short_unsettled_files?[], no_case_evidence_files?[], discovery?, unmeasured_reason?, unmeasured_files?{file: reason}}` (`failing_files` confirmed under B*; on an unmeasured result, `unmeasured_reason` a whole-set cause and `unmeasured_files` the per-file causes, both codes of `ACCEPTANCE_UNMEASURED_WHY`; `failing_cases` the runner report's failing case IDs per confirmed failing file, where one was readable); `residual` `{failing_sets, held_back_failing_sets, total_sets, cases[], sets[], cases_by_set{index: [names]}, files_by_set{index: [failing files]}, failing_cases_by_set{index: {file: [case ids]}}, intermittent?[set indices whose failure is a held case seen failing only with resource signatures], unmeasured_final?, rollback_failed?}` — from the last MEASURED verdict when the final one measured nothing (`unmeasured_final: true`, forwarded to the planner) — feeds the next same-task run via `_prior_delivery_residual` as `acceptance_unmet`, after `_acceptance_residual_unbroken` drops the sets typed broken, and the variant sets (no counted case among their `files_by_set` files), at read time (None when none is left and no rollback failed; a residual without `sets` is used with `cases` emptied). `cases` and `cases_by_set` hold the shown sets' declared names only (`_acceptance_shown_indices(sets)`), a failing held-back set counted in `held_back_failing_sets`; `_acceptance_residual_unbroken` re-derives `cases` (and `held_back_failing_sets`) from the shown sets at read time, and only `cases` is handed on (`cases_by_set` is copied unchanged), so a residual recorded before that rule hands on no held-back name, and `acceptance_unmet` carries `held_back_failing_sets` beside `cases` (DESIGN §8 *Nothing a held-out evaluation produces reaches a fixer*). Presence of the key is the write half's resume checkpoint (skipped when `plans_after_plan` is present, like `defect_scope`); `gate.final` is the gate half's sentinel. |
-| `skip_acceptance_check` | bool | whether the held-out acceptance sets and gate are suppressed. Resolved from `--skip-acceptance-check` / `LEERIE_SKIP_ACCEPTANCE_CHECK` / `leerie.toml` / default `False`; seeded in both the fresh and resume branches. |
+| `skip_acceptance_check` | bool | whether the held-out acceptance sets and gate are suppressed. Resolved from `--skip-acceptance-check` / `LEERIE_SKIP_ACCEPTANCE_CHECK` / default `False`; seeded in both the fresh and resume branches. |
 | `no_work_pending` | bool | set by `_confirm_no_work_on_converged_gate` when the `no_work_judge` confirms and `_acceptance_can_check(st)` holds (acceptance not skipped, `bug-fixing` category, a scoped test template): the confirmation is held instead of finishing, and `_settle_pending_no_work` decides it after `phase_acceptance_write` (DESIGN §8 *No work is declared on executed evidence, and a dispute is bounded*). Cleared on a dispute. |
 | `no_work_acceptance` | dict | `_settle_pending_no_work`'s verdict: `{verdict: pass \| dispute \| accepted after dispute \| fixed_on_head_by_execution \| no valid sets \| not measurable \| error: <type>, results?, cases?, discarded?}` — `fixed_on_head_by_execution` (an executed basis, with `discarded` copied from `acceptance.discarded`) when there is no valid set, `acceptance.written` ≥ 1 and every one of the `written` sets is in `acceptance.discarded` with that reason; its presence is the settle step's resume sentinel. |
 | `acceptance_dispute` | dict | `{failing_sets, total_sets, cases[], accepted?, unacted?, redispute?}` written when held-out sets fail on HEAD — as a new dispute when the previous completed same-task run had NOT already disputed, and again with `accepted: true` when it had (the carry-forward); `_prior_acceptance_dispute` reads it from that sibling on the next run, which then accepts no work instead of disputing again. `unacted: true` is set by `_mark_dispute_unacted` when the disputing run still ended as no work by another exit (empty plans, or the satisfied-probe sweep emptying the plan); `_prior_acceptance_dispute` does not count such a dispute unless it also carries `redispute: true` — written when the dispute was raised because the previous run's dispute was unacted (`_prior_acceptance_dispute_record`), so a second unacted dispute counts and the wrong-tests loop stays bounded at two extra runs (DESIGN §8 *A dispute counts only once it is acted on*). |
@@ -12270,22 +12335,22 @@ command line overrides it.
 | `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation. |
 | `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both`) |
 | `clarify` | bool | whether asking the user is allowed for this run (resolved from `--clarify` / `LEERIE_CLARIFY` / `leerie.toml` / default `False`) |
-| `dangerously_skip_permissions` | bool | the operator's tooling escape hatch. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. |
-| `dangerously_force_strict_output` | bool | whether this run forced constrained decoding via the per-run loopback proxy (`--dangerously-force-strict-output` / `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` / `dangerously_force_strict_output` in leerie.toml). |
+| `dangerously_skip_permissions` | bool | the operator's tooling escape hatch. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / default `False`. |
+| `dangerously_force_strict_output` | bool | whether this run forced constrained decoding via the per-run loopback proxy (`--dangerously-force-strict-output` / `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT`). |
 | `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). |
 | `skip_adherence_check` | bool | whether the instruction-adherence gate (the deterministic prescribed-command-coverage floor + the `adherence_judge` worker in the planner check loop) is suppressed. |
 | `skip_coverage_check` | bool | whether required-items checking is suppressed — one flag governs BOTH sides: the phase 2⅞½ task-coverage gate (a single advisory `task_coverage_judge` invocation since 2026-08-04; the deterministic `check_required_items_coverage` floor it used to compose with was deleted) and the phase 5 delivery gate (`_run_delivery_prejudge`/`_run_delivery_recheck` — DESIGN §8 *The delivery gate*). |
 | `skip_completeness_check` | bool | whether the conformer's gating `solution_defects` completeness axis (DESIGN §9 *The one gating axis: solution completeness*) is demoted to advisory. |
 | `skip_integration_check` | bool | whether `integrate_wave`'s `integration_judge` behavioral-defect gate (DESIGN §8 *Independent adversarial verification*) is suppressed entirely — no worker spawn for any subtask in this run. |
-| `skip_budget_check` | bool | whether `check_budget_feasibility()` (DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*) is suppressed. Resolved from `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml` / default `False`. |
-| `skip_classification_check` | bool | whether `phase_classification_gate` (DESIGN §8 *Independent adversarial verification*) is suppressed. Resolved from `--skip-classification-check` / `LEERIE_SKIP_CLASSIFICATION_CHECK` / `leerie.toml` / default `False`. |
+| `skip_budget_check` | bool | whether `check_budget_feasibility()` (DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*) is suppressed. Resolved from `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / default `False`. |
+| `skip_classification_check` | bool | whether `phase_classification_gate` (DESIGN §8 *Independent adversarial verification*) is suppressed. Resolved from `--skip-classification-check` / `LEERIE_SKIP_CLASSIFICATION_CHECK` / default `False`. |
 | `stop_on_blocked` | bool | whether a subtask still blocked after its re-drives from the shared budget halts the run instead of being settled `unconverged`. Resolved from `--stop-on-blocked` / `LEERIE_STOP_ON_BLOCKED` / `leerie.toml` / default `False`. |
 | `stop_on_repo_change` | bool | whether a change to the real checkout halts the run (`_assert_repo_unchanged` die()s, and the execute-wave check also compares HEAD and refs) instead of being logged as a WARNING. Resolved from `--stop-on-repo-change` / `LEERIE_STOP_ON_REPO_CHANGE` / `leerie.toml` / default `False`. |
 | `repo_change_warned` | dict[str, str] | `{delta: fingerprint}` for every `_diff_repo_state` delta `_assert_repo_unchanged` has already warned about (fingerprint from `_delta_fingerprint`). A delta that persists across later phases and waves (the baseline is never refreshed) is warned once; it re-warns, marked `(changed again)`, only when its fingerprint changes, so a later write to an already-warned path is not hidden. Absent until the first warning. A `list[str]` written by an earlier build of this feature is converted in place to `{delta: current fingerprint}` (those deltas were already warned, so they stay quiet). |
-| `skip_satisfied_check` | bool | whether `_filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) is suppressed. Resolved from `--skip-satisfied-check` / `LEERIE_SKIP_SATISFIED_CHECK` / `leerie.toml` / default `False`. |
+| `skip_satisfied_check` | bool | whether `_filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) is suppressed. Resolved from `--skip-satisfied-check` / `LEERIE_SKIP_SATISFIED_CHECK` / default `False`. |
 | `strict_conformer` | bool | whether the conformer phase is blocking instead of advisory (DESIGN §9 *Post-work conformance*, "Opt-in strict mode" paragraph). Resolved from `--strict-conformer` / `LEERIE_STRICT_CONFORMER` / `leerie.toml` / default `False`. |
 | `subtask_tests` | str | How much of the repo's suite each per-subtask conformance round measures (DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*). |
-| `skip_base_baseline` | bool | whether the base-tree health baseline (DESIGN §9 *Base-tree health baseline*) is suppressed. Resolved from `--skip-base-baseline` / `LEERIE_SKIP_BASE_BASELINE` / `leerie.toml` / default `False`. |
+| `skip_base_baseline` | bool | whether the base-tree health baseline (DESIGN §9 *Base-tree health baseline*) is suppressed. Resolved from `--skip-base-baseline` / `LEERIE_SKIP_BASE_BASELINE` / default `False`. |
 | `skip_repo_map` | bool | whether the P6 repo-map structural context (DESIGN §5½ (P6) *Codebase structural map*) is suppressed. Resolved from `--skip-repo-map` / `LEERIE_SKIP_REPO_MAP` / `skip_repo_map` in `leerie.toml` / default `False`. |
 | `no_push` | bool | the orchestrator's resolved `--no-push` (after `--push`), a sticky run choice (§2½ *Run choices on resume*), the same on every runtime; `_record_run_push_choice` derives `run.json.no_push`, the record the host reads, from it (`true` regardless while the run has nothing to push). |
 | `pr_template` | str \| None | the resolved `--pr-template` / `LEERIE_PR_TEMPLATE` / `pr_template` in `leerie.toml`; None means the discovery default. A sticky run choice. |

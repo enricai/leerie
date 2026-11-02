@@ -179,10 +179,11 @@ def test_explicit_env_value_too_small_dies(leerie, tmp_path, monkeypatch):
         leerie.resolve_worker_memory_max(tmp_path, max_parallel=4)
 
 
-def test_explicit_file_value_too_small_dies(leerie, tmp_path, monkeypatch):
-    monkeypatch.delenv("LEERIE_WORKER_MEMORY_MAX", raising=False)
+def test_explicit_env_value_too_small_dies(leerie, tmp_path, monkeypatch):
+    # The env var, not leerie.toml: a containment ceiling has no file tier
+    # (DESIGN §6 *A repository chooses no operator authority*).
+    monkeypatch.setenv("LEERIE_WORKER_MEMORY_MAX", "1G")
     _write_config(tmp_path, test="NODE_OPTIONS=--max-old-space-size=8192 jest")
-    (tmp_path / "leerie.toml").write_text("worker_memory_max = 1G\n")
     with pytest.raises(SystemExit):
         leerie.resolve_worker_memory_max(tmp_path, max_parallel=4)
 

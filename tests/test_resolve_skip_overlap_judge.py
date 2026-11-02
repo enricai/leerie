@@ -2,7 +2,7 @@
 opt-out (DESIGN §5 *Cross-domain surface overlap*).
 
 Covers the precedence order: CLI flag → LEERIE_SKIP_OVERLAP_JUDGE env
-var → skip_overlap_judge in leerie.toml → False (the judge runs on
+var → False (no leerie.toml tier) (the judge runs on
 multi-planner runs by default).
 
 Mirrors test_resolve_dangerously_skip_permissions.py — both resolvers
@@ -51,11 +51,13 @@ def test_env_set_false_falls_through_to_default(
         repo_root, cli_value=False) is False
 
 
-def test_file_set_true_no_env(leerie, repo_root):
+def test_file_is_never_read(leerie, repo_root):
+    """A waiver is the operator's (DESIGN §6 *A repository chooses no
+    operator authority*): `skip_overlap_judge = true` in leerie.toml is not taken."""
     (repo_root / "leerie.toml").write_text(
         "skip_overlap_judge = true\n")
     assert leerie.resolve_skip_overlap_judge(
-        repo_root, cli_value=False) is True
+        repo_root, cli_value=False) is False
 
 
 def test_env_wins_over_file(leerie, repo_root, monkeypatch):
@@ -92,12 +94,12 @@ def test_env_garbage_dies(leerie, repo_root, monkeypatch):
             repo_root, cli_value=False)
 
 
-def test_file_garbage_dies(leerie, repo_root):
+def test_file_garbage_is_not_read(leerie, repo_root):
+    """Never read, so not validated either."""
     (repo_root / "leerie.toml").write_text(
         "skip_overlap_judge = sometimes\n")
-    with pytest.raises(SystemExit):
-        leerie.resolve_skip_overlap_judge(
-            repo_root, cli_value=False)
+    assert leerie.resolve_skip_overlap_judge(
+        repo_root, cli_value=False) is False
 
 
 def test_env_empty_string_falls_through(leerie, repo_root, monkeypatch):

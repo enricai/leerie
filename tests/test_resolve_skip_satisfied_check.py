@@ -1,8 +1,8 @@
 """Tests for resolve_skip_satisfied_check() — the --skip-satisfied-check
 opt-out (DESIGN §8 *Already-satisfied subtask elimination*).
 
-Precedence: CLI flag → LEERIE_SKIP_SATISFIED_CHECK env → skip_satisfied_check
-in leerie.toml → False (the probe runs by default).
+Precedence: CLI flag → LEERIE_SKIP_SATISFIED_CHECK env → False (no
+leerie.toml tier) (the probe runs by default).
 
 Mirrors test_resolve_skip_overlap_judge.py — both share `_resolve_bool_pref`,
 so this file locks the wiring (env var name + file key), not the resolution
@@ -37,10 +37,13 @@ def test_env_set_true(leerie, repo_root, monkeypatch):
         repo_root, cli_value=False) is True
 
 
-def test_file_set_true_no_env(leerie, repo_root):
-    (repo_root / "leerie.toml").write_text("skip_satisfied_check = true\n")
+def test_file_is_never_read(leerie, repo_root):
+    """A waiver is the operator's (DESIGN §6 *A repository chooses no
+    operator authority*): `skip_satisfied_check = true` in leerie.toml is not taken."""
+    (repo_root / "leerie.toml").write_text(
+        "skip_satisfied_check = true\n")
     assert leerie.resolve_skip_satisfied_check(
-        repo_root, cli_value=False) is True
+        repo_root, cli_value=False) is False
 
 
 def test_env_wins_over_file(leerie, repo_root, monkeypatch):

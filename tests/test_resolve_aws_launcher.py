@@ -74,18 +74,20 @@ def repo(tmp_path):
 
 
 class TestPrecedenceLadder:
-    """CLI > env > leerie.toml > empty, per knob."""
+    """CLI > env > empty, per knob. No leerie.toml tier: an AWS profile and
+    region are the operator's (DESIGN §6 *A repository chooses no operator
+    authority*)."""
 
     def test_all_unset_is_empty(self, repo):
         got = _run([], {}, repo)
         assert got["REGION"] == "" and got["PROFILE"] == ""
 
-    def test_toml_only(self, repo):
+    def test_toml_is_never_read(self, repo):
         (repo / "leerie.toml").write_text(
             'aws_region = us-east-1\naws_profile = tomlprof\n')
         got = _run([], {}, repo)
-        assert got["REGION"] == "us-east-1"
-        assert got["PROFILE"] == "tomlprof"
+        assert got["REGION"] == ""
+        assert got["PROFILE"] == ""
 
     def test_env_beats_toml(self, repo):
         (repo / "leerie.toml").write_text('aws_region = us-east-1\n')
@@ -103,9 +105,9 @@ class TestPrecedenceLadder:
         assert got["REGION"] == "sa-east-1"
         assert got["PROFILE"] == "eqprof"
 
-    def test_quoted_toml_value(self, repo):
+    def test_quoted_toml_value_is_never_read(self, repo):
         (repo / "leerie.toml").write_text('aws_region = "us-west-2"\n')
-        assert _run([], {}, repo)["REGION"] == "us-west-2"
+        assert _run([], {}, repo)["REGION"] == ""
 
     def test_knobs_are_independent(self, repo):
         """Setting one must not populate or clobber the other."""
@@ -165,8 +167,8 @@ class TestReachesAConsumer:
         assert "--profile" in args and "cliprof" in args
         assert "--region" in args and "us-east-1" in args
 
-    def test_toml_tier_reaches_the_aws_argv(self, repo):
-        """The other previously-inert tier."""
+    def test_a_toml_profile_never_reaches_the_aws_argv(self, repo):
+        """The repository's file chooses no AWS profile or region."""
         (repo / "leerie.toml").write_text(
             'aws_region = eu-central-1\naws_profile = tomlprof\n')
         got = _run([], {}, repo)
@@ -174,8 +176,7 @@ class TestReachesAConsumer:
             "LEERIE_AWS_PROFILE": got["PROFILE"],
             "LEERIE_AWS_REGION": got["REGION"],
         })
-        assert "--profile" in args and "tomlprof" in args
-        assert "--region" in args and "eu-central-1" in args
+        assert "tomlprof" not in args and "eu-central-1" not in args
 
     def test_nothing_set_emits_no_flags(self, repo):
         """ANTI-VACUITY: if the consumer emitted flags unconditionally the

@@ -16,11 +16,14 @@ LAUNCHER_PATH = Path(__file__).resolve().parents[1] / "leerie"
 def extract_bedrock_functions() -> str:
     """Pull detect_bedrock_mode() and bedrock_preflight() verbatim from the
     launcher so the harness has real implementations, not stubs, for the
-    SSO/profile control-flow paths."""
+    SSO/profile control-flow paths — with the helpers before them that
+    choose which settings files are the operator's
+    (`_checkout_settings_tracked`, `_operator_claude_settings`)."""
     src = LAUNCHER_PATH.read_text()
-    start = src.index("detect_bedrock_mode() {")
+    start = src.index("_checkout_settings_tracked() {")
     end = src.index("\n}\n", src.index("bedrock_preflight() {")) + len("\n}\n")
     block = src[start:end]
+    assert "_operator_claude_settings() {" in block
     assert "detect_bedrock_mode() {" in block
     assert "bedrock_preflight() {" in block
     return block

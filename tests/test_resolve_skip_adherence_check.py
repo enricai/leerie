@@ -3,7 +3,7 @@ opt-out for the instruction-adherence gate (deterministic prescribed-
 command-coverage floor + `adherence_judge` worker).
 
 Covers the precedence order: CLI flag → LEERIE_SKIP_ADHERENCE_CHECK env
-var → skip_adherence_check in leerie.toml → False (the gate runs on
+var → False (no leerie.toml tier) (the gate runs on
 every plan by default).
 
 Mirrors test_resolve_skip_overlap_judge.py — both resolvers share
@@ -52,11 +52,13 @@ def test_env_set_false_falls_through_to_default(
         repo_root, cli_value=False) is False
 
 
-def test_file_set_true_no_env(leerie, repo_root):
+def test_file_is_never_read(leerie, repo_root):
+    """A waiver is the operator's (DESIGN §6 *A repository chooses no
+    operator authority*): `skip_adherence_check = true` in leerie.toml is not taken."""
     (repo_root / "leerie.toml").write_text(
         "skip_adherence_check = true\n")
     assert leerie.resolve_skip_adherence_check(
-        repo_root, cli_value=False) is True
+        repo_root, cli_value=False) is False
 
 
 def test_env_wins_over_file(leerie, repo_root, monkeypatch):
@@ -93,12 +95,12 @@ def test_env_garbage_dies(leerie, repo_root, monkeypatch):
             repo_root, cli_value=False)
 
 
-def test_file_garbage_dies(leerie, repo_root):
+def test_file_garbage_is_not_read(leerie, repo_root):
+    """Never read, so not validated either."""
     (repo_root / "leerie.toml").write_text(
         "skip_adherence_check = sometimes\n")
-    with pytest.raises(SystemExit):
-        leerie.resolve_skip_adherence_check(
-            repo_root, cli_value=False)
+    assert leerie.resolve_skip_adherence_check(
+        repo_root, cli_value=False) is False
 
 
 def test_env_empty_string_falls_through(leerie, repo_root, monkeypatch):

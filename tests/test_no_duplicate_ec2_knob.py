@@ -1,6 +1,6 @@
 """`_resolve_ec2_knob` has exactly one implementation: the launcher's.
 
-The helper runs the CLI > env > `leerie.toml` ladder for the five `--ec2-*`
+The helper runs the CLI > env ladder (no `leerie.toml` tier) for the five `--ec2-*`
 instance-shape knobs and for leerie's own `--aws-region` / `--aws-profile`.
 Two test files exercise it, and both must reach for the REAL one —
 `tests/test_resolve_ec2_vars.py` via `_extract_resolve_ec2_knob()`,
@@ -112,12 +112,12 @@ def test_consumers_extract_rather_than_reproduce() -> None:
 def test_instance_profile_knob_has_one_launcher_resolution() -> None:
     """The sixth knob goes through the same single helper, not a bespoke
     read: exactly one launcher resolution line names it, and it calls
-    `_resolve_ec2_knob` with the env var and toml key that disagree in name
-    from every other knob's."""
+    `_resolve_ec2_knob` with its own env var (no leerie.toml key: DESIGN §6
+    *A repository chooses no operator authority*)."""
     src = LAUNCHER.read_text()
     needle = 'LEERIE_EC2_INSTANCE_PROFILE="$(_resolve_ec2_knob '
     assert src.count(needle) == 1, src.count(needle)
     line = next(l for l in src.splitlines() if l.startswith(needle))
     assert line.endswith(
-        '"$_cli_ec2_instance_profile" LEERIE_EC2_INSTANCE_PROFILE ec2_instance_profile)"'
+        '"$_cli_ec2_instance_profile" LEERIE_EC2_INSTANCE_PROFILE)"'
     ), line

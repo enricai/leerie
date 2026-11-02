@@ -769,11 +769,43 @@ checkout naming `~/.bashrc` and `.lstate`. The launcher refuses a state root
 equal to, inside or above the checkout from the environment and the flag, a
 relative one anchored inside it, and a link into it (by real path); a
 sibling whose name starts with the checkout's passes. The launcher's key
-list is `REPO_CONFIG_LOCATION_KEYS`, `_read_toml_key` raises for each key,
-and neither the orchestrator nor the launcher spells a read of one.
+list is `REPO_CONFIG_OPERATOR_KEYS` (the locations first), `_read_toml_key`
+raises for each location key, and neither the orchestrator nor the launcher
+spells a read of any operator key.
 Falsified: disabling the launcher's refusal turns the 6 key tests red;
 making `_state_root_overlaps_checkout` print nothing turns the 8 overlap
 tests red; dropping `_read_toml_key`'s guard turns its 5 cases red.
+
+`tests/test_repo_config_chooses_no_authority.py` (75 tests; DESIGN §6 *A
+repository chooses no operator authority*). The real launcher, started on a
+fresh run (`--no-push "fix the bug"`) from a checkout whose `leerie.toml`
+sets any one of the 25 `REPO_CONFIG_AUTHORITY_KEYS` (`runtime`, the AWS and
+`ec2_*` keys, `fly_disk_gb`, `dangerously_*`, the gate `skip_*` keys,
+`worker_memory_max`, `worker_pids_max`), exits 1 naming the key with its flag
+and env var, runs none of the shimmed `aws`, `flyctl`, `fly`, `nerdctl`,
+`ssh`, and creates no state root; repository facts (`effort_*`, `model`,
+`max_workers`, `no_push`, `strict_conformer`, `skip_repo_map`, `seed_depth`)
+pass. `_read_toml_key` raises for each authority key; every waiver resolver
+ignores `<key> = true` in the file and still honours its env var;
+`resolve_runtime`, `resolve_worker_pids_max` and `resolve_worker_memory_max`
+ignore the file. A checkout settings file git tracks adds nothing to
+`_confined_cli_settings` (no `apiKeyHelper`, `permissions` or
+`ANTHROPIC_BASE_URL`; logged) while an untracked one does, and a checkout
+git cannot read counts as tracked; the launcher's own
+`_checkout_settings_tracked` / `_operator_claude_settings` /
+`detect_bedrock_mode` (extracted by `tests/bedrock_extract.py`) do not enter
+Bedrock mode from a tracked `settings.json` or `settings.local.json` and
+warn naming the keys, while an untracked one and `~/.claude/settings.json`
+still do. Falsified: dropping `runtime` and `skip_acceptance_check` from the
+launcher's list turns 4 red (with the list-equality test in
+`test_repo_config_names_no_location.py`); giving
+`resolve_skip_acceptance_check` its file tier back turns 1 red; treating every
+checkout settings file as the operator's in the orchestrator turns 2 red, and
+in the launcher 2 red. The Bedrock tests (`test_bedrock_mode.py`), the
+settings-layer tests (`test_worker_commands_cannot_reach_the_cli.py`) and
+the resolver tests that used to pin a `leerie.toml` tier for these keys now
+make their checkout a git repository whose settings are untracked, or
+assert the file is never read.
 
 `tests/test_state_root_apart.py` (10 tests; part 3 of the same section).
 `_require_state_root_apart` over a planted `/proc/self/mountinfo`: a state

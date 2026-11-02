@@ -276,11 +276,13 @@ def test_uncapped_env_true(leerie, uncapped_repo_root, monkeypatch):
         uncapped_repo_root, cli_value=False) is True
 
 
-def test_uncapped_file_true_no_env(leerie, uncapped_repo_root):
+def test_uncapped_file_is_never_read(leerie, uncapped_repo_root):
+    """A waiver is the operator's (DESIGN §6 *A repository chooses no
+    operator authority*)."""
     (uncapped_repo_root / "leerie.toml").write_text(
         "dangerously_allow_uncapped = true\n")
     assert leerie.resolve_dangerously_allow_uncapped(
-        uncapped_repo_root, cli_value=False) is True
+        uncapped_repo_root, cli_value=False) is False
 
 
 def test_uncapped_env_wins_over_file(leerie, uncapped_repo_root, monkeypatch):
@@ -298,12 +300,11 @@ def test_uncapped_env_garbage_dies(leerie, uncapped_repo_root, monkeypatch):
             uncapped_repo_root, cli_value=False)
 
 
-def test_uncapped_file_garbage_dies(leerie, uncapped_repo_root):
+def test_uncapped_file_garbage_is_not_read(leerie, uncapped_repo_root):
     (uncapped_repo_root / "leerie.toml").write_text(
         "dangerously_allow_uncapped = sometimes\n")
-    with pytest.raises(SystemExit):
-        leerie.resolve_dangerously_allow_uncapped(
-            uncapped_repo_root, cli_value=False)
+    assert leerie.resolve_dangerously_allow_uncapped(
+        uncapped_repo_root, cli_value=False) is False
 
 
 def test_uncapped_env_empty_string_falls_through(leerie, uncapped_repo_root, monkeypatch):

@@ -20,7 +20,9 @@ against such a checkout and got TEE = `$HOME/.bashrc` (created) and STATE =
 - the resolution block, run on its own, reads none of them;
 - the launcher refuses a state root at, inside or above the checkout, from
   any tier;
-- the launcher's list is the orchestrator's `REPO_CONFIG_LOCATION_KEYS`,
+- the launcher's list is the orchestrator's `REPO_CONFIG_OPERATOR_KEYS`
+  (the locations, then the authority keys of
+  tests/test_repo_config_chooses_no_authority.py),
   `_read_toml_key` refuses those names, and nothing reads them from the file.
 """
 from __future__ import annotations
@@ -40,10 +42,9 @@ LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 def _launcher_keys() -> list[str]:
     src = LAUNCHER.read_text()
-    body = src[src.index("_checkout_config_location_keys() {"):]
-    body = body[:body.index("\n}\n")]
-    m = re.search(r"for _k in ([a-z_ ]+); do", body)
-    assert m, "the launcher's location-key loop moved"
+    m = re.search(r'^_REPO_CONFIG_OPERATOR_KEYS="([a-z0-9_\s]+)"$', src, re.M)
+    assert m, "the launcher's operator-key list moved"
+    assert "for _k in $_REPO_CONFIG_OPERATOR_KEYS; do" in src
     return m.group(1).split()
 
 
@@ -77,7 +78,9 @@ def site(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_the_launcher_list_is_the_orchestrators(leerie):
-    assert _launcher_keys() == list(leerie.REPO_CONFIG_LOCATION_KEYS)
+    assert _launcher_keys() == list(leerie.REPO_CONFIG_OPERATOR_KEYS)
+    assert list(leerie.REPO_CONFIG_OPERATOR_KEYS)[:5] == \
+        list(leerie.REPO_CONFIG_LOCATION_KEYS)
 
 
 @pytest.mark.parametrize("key,value,replacement", [
@@ -115,7 +118,7 @@ def test_other_keys_and_comments_pass(site):
     and a commented-out key is not a setting."""
     checkout, home = site
     (checkout / "leerie.toml").write_text(
-        'runtime = "local"\n# state_dir = ".lstate"\n')
+        'model = "sonnet"\n# state_dir = ".lstate"\n')
     r = _launch(checkout, home, "list")
     assert r.returncode == 0, r.stderr
     assert (home / ".leerie" / "checkout").is_dir()
