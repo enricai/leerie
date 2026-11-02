@@ -84,6 +84,44 @@ _host_finalize_pre_push_hook_present() {
   [ -n "$hooks_dir" ] && [ -x "$hooks_dir/pre-push" ]
 }
 
+# _repo_git_from_root <repo> <git args...> — a git command that reaches a
+# remote (`fetch`, `ls-remote`, `remote show`, a hook-less `push`), run from
+# `/` with the repository named by its git directory and work tree. Such a
+# command starts the transport (`ssh`) and the credential helper (`gh auth
+# git-credential`) in git's own working directory, and `git -C` makes that
+# the work tree: a version manager's shim on PATH would then choose them
+# from the checkout's version files, which a merged run may have committed
+# (DESIGN §6 *The host never runs a program the checkout chose*). git does
+# not change into a work tree it is outside of unless the command needs
+# one, and none of these does. Variables set before the call reach git.
+_repo_git_from_root() {
+  local _rg_repo="$1" _rg_gd
+  shift
+  _rg_gd="$(git -C "$_rg_repo" rev-parse --absolute-git-dir 2>/dev/null)" \
+    || return 128
+  ( cd / && exec git --git-dir="$_rg_gd" --work-tree="$_rg_repo" "$@" )
+}
+
+# _repo_git_push <repo> <push args...> — `git push`, from `/` like any other
+# command that reaches a remote, except when it will run the repository's own
+# pre-push hook: git starts a hook in its working directory, and the
+# operator's hook expects the work tree there, so that push keeps `-C`. The
+# hook is the operator's, and starts what it starts in the checkout, as the
+# same `git push` run by hand would (DESIGN §6 *The host never runs a program
+# the checkout chose*, part 4).
+_repo_git_push() {
+  local _rp_repo="$1"
+  shift
+  case " $* " in
+    *" --no-verify "*) ;;
+    *) if _host_finalize_pre_push_hook_present "$_rp_repo"; then
+         git -C "$_rp_repo" push "$@"
+         return
+       fi ;;
+  esac
+  _repo_git_from_root "$_rp_repo" push "$@"
+}
+
 # _host_finalize_is_auth_or_network_push_error <stderr> — is this push
 # failure git's own auth/network problem, rather than a hook that failed?
 #
@@ -240,7 +278,7 @@ host_prepush_preflight() {
   # auth/network arm and returns 0 silently. Deliberately not also forcing
   # ssh's BatchMode: an ssh passphrase prompt moved earlier is arguably an
   # improvement, and BatchMode would break agent-less setups that work today.
-  GIT_TERMINAL_PROMPT=0 git -C "$repo" push --dry-run origin \
+  GIT_TERMINAL_PROMPT=0 _repo_git_push "$repo" --dry-run origin \
       "$branch:refs/heads/leerie/runs/preflight-probe" \
       >"$_o" 2>"$_e" || rc=$?
   out="$(cat "$_o")"; err="$(cat "$_e")"
@@ -363,11 +401,19 @@ host_base_freshness_check() {
   local remote_branch="${upstream#*/}"
   local _fetch_rc=0
   if command -v timeout >/dev/null 2>&1; then
-    GIT_TERMINAL_PROMPT=0 timeout 30 git -C "$repo" fetch --quiet \
-        "$remote_name" "$remote_branch" >/dev/null 2>&1 || _fetch_rc=$?
+    # `timeout` cannot run a shell function: the same command
+    # `_repo_git_from_root` runs, spelled out.
+    local _fetch_gd
+    _fetch_gd="$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null)" \
+      || _fetch_rc=128
+    [ "$_fetch_rc" -ne 0 ] || ( cd / && GIT_TERMINAL_PROMPT=0 exec timeout 30 \
+        git --git-dir="$_fetch_gd" --work-tree="$repo" fetch --quiet \
+        --no-recurse-submodules "$remote_name" "$remote_branch" \
+        >/dev/null 2>&1 ) || _fetch_rc=$?
   else
-    GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet \
-        "$remote_name" "$remote_branch" >/dev/null 2>&1 || _fetch_rc=$?
+    GIT_TERMINAL_PROMPT=0 _repo_git_from_root "$repo" fetch --quiet \
+        --no-recurse-submodules "$remote_name" "$remote_branch" \
+        >/dev/null 2>&1 || _fetch_rc=$?
   fi
   if [ "$_fetch_rc" -ne 0 ]; then
     echo "leerie: warning: could not refresh $upstream (offline, or no" >&2
@@ -575,7 +621,7 @@ host_finalize() {
       # `ls-remote` (no origin remote, or origin lacks the ref — the exact
       # partial-push shape) would otherwise abort finalize via pipefail.
       _lt="$(git -C "$USER_REPO" rev-parse "refs/heads/$_rb" 2>/dev/null || true)"
-      _ot="$(git -C "$USER_REPO" ls-remote origin "refs/heads/$_rb" 2>/dev/null | cut -f1 || true)"
+      _ot="$(_repo_git_from_root "$USER_REPO" ls-remote origin "refs/heads/$_rb" 2>/dev/null | cut -f1 || true)"
       if [ -n "$_ot" ] && [ "$_lt" = "$_ot" ]; then
         echo "[leerie] finalize: run already pushed (origin up to date); nothing to do" >&2
         return 0
@@ -714,7 +760,7 @@ host_finalize() {
   local rebase_diagnosis_note=""
   if git -C "$USER_REPO" rev-parse --verify "refs/heads/$pr_base_branch" \
        >/dev/null 2>&1 || \
-     git -C "$USER_REPO" ls-remote --exit-code --heads origin \
+     _repo_git_from_root "$USER_REPO" ls-remote --exit-code --heads origin \
        "$pr_base_branch" >/dev/null 2>&1; then
     local _rebase_scratch _rebase_worktree _rebase_repo
     _rebase_scratch="$(mktemp -d)"
@@ -913,7 +959,7 @@ $_diagnosis"
   fi
 
   # --- step 1: push -----------------------------------------------------
-  local push_args=(git -C "$USER_REPO" push -u origin "$run_branch")
+  local push_args=(_repo_git_push "$USER_REPO" -u origin "$run_branch")
   [ "${NO_VERIFY_PUSH:-false}" = "true" ] && push_args+=(--no-verify)
 
   echo "[leerie] finalize: pushing $run_branch to origin$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " (--no-verify)")" >&2
@@ -1232,9 +1278,9 @@ $end_state"
   # flight, or an overridden base that was renamed/removed. Detect and
   # fall back to the repo's default branch so `gh pr create` doesn't 404.
   local original_pr_base_branch="$pr_base_branch"
-  if ! git -C "$USER_REPO" ls-remote --exit-code --heads origin "$pr_base_branch" >/dev/null 2>&1; then
+  if ! _repo_git_from_root "$USER_REPO" ls-remote --exit-code --heads origin "$pr_base_branch" >/dev/null 2>&1; then
     local default_branch
-    default_branch="$(git -C "$USER_REPO" remote show origin 2>/dev/null \
+    default_branch="$(_repo_git_from_root "$USER_REPO" remote show origin 2>/dev/null \
                        | sed -n 's/.*HEAD branch: //p')"
     if [ -n "$default_branch" ]; then
       echo "[leerie] finalize: base branch $pr_base_branch no longer exists on origin; falling back to $default_branch" >&2
@@ -1252,7 +1298,8 @@ $end_state"
     pr_draft="--draft"
   fi
   echo "[leerie] finalize: opening ${pr_draft:+draft }PR against $pr_base_branch" >&2
-  local pr_output pr_ok=false
+  local pr_output pr_ok=false _pr_gd
+  _pr_gd="$(git -C "$USER_REPO" rev-parse --absolute-git-dir 2>/dev/null || true)"
   # GitHub's API may not have indexed the freshly-pushed refs yet;
   # retry with backoff to ride out the race (symptom: "Head sha
   # can't be blank" / "No commits between" immediately after push).
@@ -1264,12 +1311,16 @@ $end_state"
       echo "[leerie] finalize: gh pr create failed; retrying in ${_pr_delay}s…" >&2
       sleep "$_pr_delay"
     }
-    if pr_output="$(echo "$pr_body" | gh pr create \
+    # gh runs from `/` and finds the repository through GIT_DIR and
+    # GIT_WORK_TREE, which it honours, so it starts no program in the
+    # checkout (DESIGN §6 *The host never runs a program the checkout
+    # chose*).
+    if pr_output="$(echo "$pr_body" | ( cd / && GIT_DIR="$_pr_gd" GIT_WORK_TREE="$USER_REPO" gh pr create \
                       ${pr_draft:+"$pr_draft"} \
                       --base "$pr_base_branch" \
                       --head "$run_branch" \
                       --title "$pr_title" \
-                      --body-file - 2>&1)"; then
+                      --body-file - 2>&1 ))"; then
       pr_ok=true
       break
     fi

@@ -12,6 +12,20 @@
 
 _SEED_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --- _seed_submodule_dirs --------------------------------------------------
+# Each submodule of the repository at $1, recursively, one
+# "<displaypath><TAB><directory>" line apiece. git's foreach shell runs inside
+# each submodule's checkout, so its body is that shell's own printf and
+# nothing else: a program started there by name is found through a version
+# manager's shim, which chooses it from that checkout's version files (DESIGN
+# §6 *The host never runs a program the checkout chose*). The caller runs its
+# programs from its own directory and names each submodule with -C.
+_seed_submodule_dirs() {
+  # shellcheck disable=SC2016  # expanded by git's foreach shell, not this one
+  git -C "$1" submodule --quiet foreach --recursive \
+    'printf "%s\t%s\n" "$displaypath" "$toplevel/$sm_path"'
+}
+
 # --- _seed_dirty_filter -----------------------------------------------------
 # Runs on the HOST (never shipped to the remote machine): filters the
 # newline-delimited candidate file list on stdin down to what should

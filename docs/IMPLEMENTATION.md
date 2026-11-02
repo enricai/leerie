@@ -92,7 +92,47 @@ must never run. It also runs the rebaser and recapture seams from a
 checkout holding a planted `tenacity.py` (at its root and behind a relative
 `PYTHONPATH` entry): they must import the operator's `tenacity` from
 `PYTHONPATH` or the user site. And it runs the chain helper with `.` on
-`PYTHONPATH`, which must not import the checkout's `chain/git_ops.py`. The orchestrator's
+`PYTHONPATH`, which must not import the checkout's `chain/git_ops.py`.
+
+Which interpreter runs is fixed too (DESIGN §6 *The host never runs a
+program the checkout chose*). `leerie` starts with `#!/bin/sh`: its
+prologue sets `LEERIE_LAUNCHER_CWD=$(pwd -P)`, makes `$0` absolute, does
+`cd /`, resolves `_leerie_bash=$(command -v bash)` from there, and execs
+it with `LEERIE_LAUNCHER_PID=$$` exported, so the bash pass skips the
+prologue. That pass sets `USER_REPO` from `LEERIE_LAUNCHER_CWD`, unsets
+the markers, and never changes into the checkout again. An
+operator-relative path is anchored at `$USER_REPO`. The state dir, the
+log file and the host-side task-file check do this inline. `_from_checkout
+PATH` does it for `--inspect-dir`, `group --repo`, `--brief` and the
+chain's job files. Local git calls
+name the checkout with `-C`. `scripts/host-finalize.sh` (sourced by the
+launcher before its first verb) exports two functions.
+`_repo_git_from_root REPO ARGS...` runs `git --git-dir=<abs git dir>
+--work-tree=REPO ARGS` in a `cd /` subshell, for `ls-remote`,
+`remote show` and `fetch` (with `--no-recurse-submodules`).
+`_repo_git_push REPO ARGS...` does the same for `push`, except when the
+push will run the repository's `pre-push` hook (not `--no-verify`, and
+`_host_finalize_pre_push_hook_present`). In that case it keeps `git -C`,
+because git starts the hook in its working directory. `gh pr create` runs
+in a `cd /` subshell with `GIT_DIR`/`GIT_WORK_TREE`. The Fly and EC2 seeds
+list submodules with `_seed_submodule_dirs` (`scripts/remote/seed-common.sh`,
+a `foreach` body that only `printf`s) and bundle each with `git -C` from
+their own directory. `.claude` is found with `find "$USER_REPO/.claude"`.
+`chain/git_ops.py`'s `_run` starts git from `/`: with `-C` for a local
+command, and with the git directory and work tree for `fetch`, `push`,
+`ls-remote` and `pull`. `config --chat` alone runs `claude` in the
+checkout, in a subshell, as the operator's own session. Pinned by
+`tests/test_host_python_is_isolated.py`. It covers review round 26 I2's
+proof, inverted (an asdf-shaped shim of shell builtins and absolute paths
+reading `.tool-versions` from its working directory up). It also checks
+that a bounded list of shimmed programs is never started inside the
+checkout by `--help`, `version`, `config` and `list`, that the prologue
+has its shape, that relative paths still resolve, that `ls-remote` starts
+`ssh` outside the checkout (with the `-C` control), that the static rule
+on `cd` and `foreach` bodies holds, and that `chain/git_ops.py` behaves
+as above.
+
+The orchestrator's
 source is baked into the image at `/opt/leerie-image/`; on local runs
 the launcher's bind mount (`-v $LEERIE_REPO:/opt/leerie-image:ro`)
 shadows the baked copy, so iterating on `orchestrator/leerie.py` needs
@@ -2012,6 +2052,10 @@ no template at all.
 Resolution: `--pr-template NAME` CLI > `LEERIE_PR_TEMPLATE` env >
 `leerie.toml` `pr_template = "bug"` > default: alphabetically first `.md`
 in the discovered directory.
+
+The template is the one committed at the run's `base_sha`, read from the
+run's own repository; a template committed as a link is not a template
+(§3 *Leerie's reads of a repository's content*).
 
 An override that does not match an existing template is **not fatal** —
 finalize must not block over a cosmetic preference — leerie logs a
@@ -4389,6 +4433,70 @@ git directory. Tests: `tests/test_leerie_writes_never_follow_links.py`
 (the primitives; review round 21's R1, R2 and R5 proofs inverted; the rule
 that every function calling a raw write primitive is classified, and the
 converted functions call none).
+
+### Leerie's reads of a repository's content
+
+DESIGN §6 *Leerie never reads through a link a repository holds*. The
+read side of the family above, anchored at the repository's root (`/work`,
+a worker's tree, a tree repository, a measurement's tree, a subtask's
+notes directory):
+
+- `_read_text_beneath(anchor, path, *, errors="replace") -> str` —
+  `_read_beneath` decoded as UTF-8 (`errors="strict"` where the caller
+  parses JSON or TOML and treats a decode error as unreadable).
+- `_no_link_beneath(anchor, path) -> bool` — exists, and neither it nor a
+  directory on the way is a link; `_dir_beneath_exists(anchor, path)`;
+  `_link_on_the_way(anchor, path) -> bool`;
+  `_listdir_beneath(anchor, path) -> list[str]` (the directory reached
+  without a link; `OSError` otherwise); `_glob_beneath(anchor, pattern)
+  -> list[Path]` (`anchor.glob`, sorted, filtered by `_no_link_beneath`).
+- `_copy_beneath(..., src_anchor=)` and `_copytree_beneath(...,
+  src_anchor=)` read the source beneath `src_anchor`.
+
+The PR template is a git blob: `_find_pr_template(git_dir, rev,
+override=None) -> (rel, text, truncated) | None` lists
+`_PR_TEMPLATE_SINGLE_LOCATIONS`, then each of `_PR_TEMPLATE_MULTI_DIRS`,
+with `git ls-tree -z --full-tree <rev> -- <path>` in the run's own
+repository (`_committed_blobs`, regular blobs only: mode 100644/100755),
+and reads the chosen blob with `git cat-file blob`
+(`_committed_text`, capped at `PR_WRITER_TEMPLATE_MAX_BYTES`).
+`_compose_pr_via_llm(st, caps, models, efforts, pr_template_override)`
+calls it with `_run_repo(st)` and `_diff_base(st)`; with no `base_sha` the
+worker gets no template.
+
+Converted readers: `_read_toml_key` (anchored at the repository root:
+the file's parent, or its grandparent for `.leerie/config.toml`),
+`_write_config_toml_keys` (read beneath, written with `_write_beneath`),
+`_settings_file(path, *, root=None)` (the repository's `.claude` settings
+with `root`), `_gather_provision_fixtures`, `_read_file_safely(root, path,
+budget)`, `_sample_workspace_manifests`, `_gather_dep_manifests`,
+`_workspace_globs`, `_parse_repo_file(root, path)`,
+`_extract_symbol_ranges(root, path)`, `_subfile_split`,
+`_peel_oversized_file`, `_is_same_document(root, path, text_len, text)`,
+`_glob_task_references` (matches reached through a link dropped),
+`_d1_report_sources`, `_task_file_text` (`resolve_task_argument`; a path
+outside the working directory is the operator's), `_go_already_pinned`,
+`_read_idiomatic_pins`, `_synth_mise_go_override`,
+`_existing_mise_toml_path`, `_infer_build_lint_test`,
+`_js_runner_scoped_templates`, `_package_json_name`,
+`_package_json_scripts`, `_reads_package_manager`, `_ci_safe_rel`
+(lexical, never resolved), `_ci_config_files`, `_ci_check_problems`,
+`_ci_coverage_pcts`, `_prisma_project`, `_prisma_reset_scripts`,
+`_prisma_mock_hits`, `_go_test_func_names(root, path)`,
+`_binary_install_source`, `_validate_checkpoint(path, worktree_root=None,
+notes_dir=None)` (read beneath `notes_dir`, which the gate passes as
+`_notes_dir(leerie_dir, sid)`), `_introduced_conflict_markers`,
+`_restore_git_pointer`, `_admin_dir_of`, `_run_tree_location`,
+`_stage_worktree_extras`, `_copy_task_references`,
+`_verify_set_audit_case`, `_category_evidence_found`
+(`follow_symlinks=False`). The launcher, after its `--help` scan and
+before any verb but `version`, exits 1 when `_checkout_config_links`
+names a link among `leerie.toml`, `.leerie`, `.leerie/config.toml` and
+`.leerie/Dockerfile` in `$USER_REPO`. Tests: `tests/test_leerie_reads_never_follow_links.py` (the
+primitives; review round 26 I1's proof inverted, the credentials file and
+`/proc/self/environ`; the converted readers; the rule that every function
+calling a raw read primitive is classified, and the converted functions
+call none).
 
 ## 4. Phase walkthrough (`leerie.py`)
 

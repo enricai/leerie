@@ -100,7 +100,7 @@ def test_git_helper_bounded_by_timeout_not_unbounded_hang(
     async def _bounded():
         return await asyncio.wait_for(
             leerie._compose_pr_via_llm(
-                st, _caps(leerie), {}, {}, repo, None),
+                st, _caps(leerie), {}, {}, None),
             timeout=5.0)
 
     # The whole call must return well within the outer 5s ceiling instead of
@@ -134,7 +134,7 @@ def test_risk_section_is_appended_to_the_llm_body(leerie, monkeypatch, st, repo)
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
     asyncio.run(leerie._compose_pr_via_llm(
-        st, _caps(leerie), {}, {}, repo, None))
+        st, _caps(leerie), {}, {}, None))
 
     run_json = json.loads((st.run_dir / "run.json").read_text())
     body = run_json["pr_body"]
@@ -154,7 +154,7 @@ def test_no_risk_section_appended_when_register_empty(leerie, monkeypatch,
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
     asyncio.run(leerie._compose_pr_via_llm(
-        st, _caps(leerie), {}, {}, repo, None))
+        st, _caps(leerie), {}, {}, None))
     body = json.loads((st.run_dir / "run.json").read_text())["pr_body"]
     assert body == "## Summary\n\nworker body"
     assert "Residual risks" not in body
@@ -180,7 +180,7 @@ def test_worker_emitted_risk_section_is_stripped_not_doubled(
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
     asyncio.run(leerie._compose_pr_via_llm(
-        st, _caps(leerie), {}, {}, repo, None))
+        st, _caps(leerie), {}, {}, None))
     body = json.loads((st.run_dir / "run.json").read_text())["pr_body"]
     assert body.count("## Needs human verification") == 1, body
     assert "worker-invented entry" not in body
@@ -208,7 +208,7 @@ def test_mid_body_worker_section_strip_preserves_trailing_content(
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
     asyncio.run(leerie._compose_pr_via_llm(
-        st, _caps(leerie), {}, {}, repo, None))
+        st, _caps(leerie), {}, {}, None))
     body = json.loads((st.run_dir / "run.json").read_text())["pr_body"]
     assert "worker-invented entry" not in body
     assert "merge the parent PR first" in body, body
@@ -231,7 +231,7 @@ def test_worker_section_is_stripped_even_with_empty_register(
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
     asyncio.run(leerie._compose_pr_via_llm(
-        st, _caps(leerie), {}, {}, repo, None))
+        st, _caps(leerie), {}, {}, None))
     body = json.loads((st.run_dir / "run.json").read_text())["pr_body"]
     assert "Residual risks" not in body, body
     assert "hallucinated" not in body

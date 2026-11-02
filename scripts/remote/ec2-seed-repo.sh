@@ -279,18 +279,19 @@ ec2_seed_repo_clone() {
     trap "rm -rf '$_tmp_subs'" RETURN
     _seed_progress_bg "ec2_seed_repo (submodule bundles)" &
     _hb_pid_subs=$!
-    if ! (
-      # shellcheck disable=SC2016  # single quotes are REQUIRED: $displaypath
-      # and $bn are expanded by git's own `foreach` shell, never by this one
-      cd "$USER_REPO" && \
-      LEERIE_EC2_INSTANCE_ID="$LEERIE_EC2_INSTANCE_ID" \
-      LEERIE_EC2_SSH_TARGET="$LEERIE_EC2_SSH_TARGET" \
-      LEERIE_TMP_SUBS="$_tmp_subs" \
-      git submodule --quiet foreach --recursive '
-        bn="$(printf %s "$displaypath" | tr / _).bundle"
-        git bundle create "$LEERIE_TMP_SUBS/$bn" --all 2>/dev/null \
-          || { echo "leerie: ec2_seed_repo: failed to bundle submodule $displaypath" >&2; exit 1; }
-      '
+    # Listed by `_seed_submodule_dirs` and bundled from here, never from a
+    # shell git starts inside each submodule (DESIGN §6 *The host never runs
+    # a program the checkout chose*).
+    local _subs
+    if ! _subs="$(_seed_submodule_dirs "$USER_REPO")" || ! (
+      while IFS="$(printf '\t')" read -r _sm_disp _sm_dir; do
+        [ -n "$_sm_dir" ] || continue
+        bn="$(printf %s "$_sm_disp" | tr / _).bundle"
+        git -C "$_sm_dir" bundle create "$_tmp_subs/$bn" --all 2>/dev/null \
+          || { echo "leerie: ec2_seed_repo: failed to bundle submodule $_sm_disp" >&2; exit 1; }
+      done <<SUBS
+$_subs
+SUBS
     ); then
       kill "$_hb_pid_subs" 2>/dev/null || true
       wait "$_hb_pid_subs" 2>/dev/null || true
@@ -393,7 +394,13 @@ ec2_seed_repo_dirty() {
 
   local claude_files=""
   if [ -d "$USER_REPO/.claude" ]; then
-    claude_files="$(cd "$USER_REPO" && find .claude -type f 2>/dev/null)"
+    # `find` started from here and handed the directory, never from the
+    # checkout (DESIGN §6 *The host never runs a program the checkout
+    # chose*); each path is made checkout-relative as before.
+    claude_files="$(find "$USER_REPO/.claude" -type f 2>/dev/null \
+                    | while IFS= read -r _cf; do
+                        printf '%s\n' "${_cf#"$USER_REPO"/}"
+                      done)"
   fi
 
   if [ -z "$dirty_files" ] && [ -z "$claude_files" ]; then

@@ -39,7 +39,7 @@ def test_returns_false_when_parse_repo_file_raises(leerie):
     scenario (e.g. language-pack 0.9.0 lacking process()) where
     _parse_repo_file's internals would raise. The probe's own except clause
     must swallow it and return False, not propagate."""
-    def _raise(path):
+    def _raise(root, path):
         raise AttributeError("module 'tree_sitter_language_pack' has no "
                               "attribute 'process'")
 
@@ -57,7 +57,7 @@ def test_returns_false_when_parse_repo_file_extracts_nothing(leerie):
     """Host-independent: simulates a parser that imports fine and returns
     cleanly but extracts no symbols (_parse_repo_file's own graceful-degrade
     contract). The probe must treat an empty defs list as non-functional."""
-    def _empty_parse(path):
+    def _empty_parse(root, path):
         return [], []
 
     with patch.object(leerie, "_parse_repo_file", new=_empty_parse):

@@ -1294,14 +1294,15 @@ class TestGatherDepManifestsErrorAndBudget:
         (tmp_path / "requirements.txt").write_text("tenacity==9.1.4\n")
         (tmp_path / "package.json").write_text('{"dependencies":{}}')
 
-        real_read_text = Path.read_text
+        real_read = leerie._read_text_beneath
 
-        def _raise_on_requirements(self, *a, **kw):
-            if self.name == "requirements.txt":
+        def _raise_on_requirements(root, path, **kw):
+            if Path(path).name == "requirements.txt":
                 raise OSError("simulated unreadable file")
-            return real_read_text(self, *a, **kw)
+            return real_read(root, path, **kw)
 
-        monkeypatch.setattr(Path, "read_text", _raise_on_requirements)
+        monkeypatch.setattr(leerie, "_read_text_beneath",
+                            _raise_on_requirements)
         block = leerie._gather_dep_manifests(tmp_path)
         # The unreadable manifest is skipped entirely (no exception escapes,
         # no empty section for it); the readable one still appears.

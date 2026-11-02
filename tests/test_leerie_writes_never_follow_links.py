@@ -461,8 +461,6 @@ _LEERIE_ONLY = {
     "_payload_only_cwd", "_acceptance_scope_judge_sets",
     "_ratchet_verifiability", "_worker_grants", "_measurement_grants",
     "preflight",
-    # Host-side: the user's checkout, outside the container.
-    "_write_config_toml_keys",
 }
 _CONFINED = {
     # Runs inside a confined worker's process tree (the re-drive's
@@ -543,5 +541,5 @@ def test_the_converted_sites_write_only_beneath():
                "_probe_case_facts_placed", "_acceptance_report_spec",
                "_redrive_ast_hits", "_rescue_integrator_work",
                "_writable_dirs_to", "_restore_write_bits",
-               "_tree_store_env", "_cache_vars"):
+               "_tree_store_env", "_cache_vars", "_write_config_toml_keys"):
         assert fn not in found, (fn, found.get(fn))

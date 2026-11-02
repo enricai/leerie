@@ -6047,7 +6047,8 @@ def _reads_package_manager(tree: str | Path, wd: str) -> bool:
     """Whether `<tree>/<wd>/package.json` pins `packageManager` — which
     corepack honours over the seeded default."""
     try:
-        pj = json.loads((Path(tree) / wd / "package.json").read_text())
+        pj = json.loads(_read_text_beneath(
+            Path(tree), Path(tree) / wd / "package.json", errors="strict"))
     except (OSError, ValueError):
         return False
     return bool(isinstance(pj, dict) and pj.get("packageManager"))
@@ -8177,10 +8178,20 @@ def _read_toml_key(path: Path, key: str) -> str | None:
     None when the file does not exist or the key is absent. Strips
     matched surrounding double or single quotes from the value. Used
     by both source-of-truth and model resolvers — keeping one parser
-    means a fix benefits both."""
-    if not path.exists():
+    means a fix benefits both.
+
+    The file is the repository's (`<root>/leerie.toml` or
+    `<root>/.leerie/config.toml`), read without following a link at it or
+    at `.leerie` (DESIGN §6 *Leerie never reads through a link a repository
+    holds*): one there reads as absent."""
+    path = Path(path)
+    root = path.parent.parent if path.parent.name == ".leerie" \
+        else path.parent
+    try:
+        text = _read_text_beneath(root, path, errors="strict")
+    except (OSError, ValueError):
         return None
-    for raw in path.read_text().splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -8209,6 +8220,21 @@ def _is_task_file_reference(raw: str) -> bool:
 # (ENAMETOOLONG, ELOOP, EACCES, …) means the filesystem could not answer at
 # all, which is not the same as "no" — see resolve_task_argument.
 _DEFINITE_ABSENCE = frozenset({errno.ENOENT, errno.ENOTDIR})
+
+
+def _task_file_text(p: Path) -> str:
+    """The text of the task file `p`. One in the checkout (the working
+    directory) is the repository's, read beneath it without following a link
+    (DESIGN §6 *Leerie never reads through a link a repository holds*): a
+    committed `TASK.md` linked to the orchestrator's environment would
+    otherwise become the task every worker and the PR body carry. One
+    outside it is a file the operator named themselves."""
+    cwd = Path(os.getcwd())
+    try:
+        _beneath_parts(cwd, p)
+    except OSError:
+        return p.read_text()
+    return _read_text_beneath(cwd, cwd / p, errors="strict")
 
 
 def resolve_task_argument(raw: str) -> str:
@@ -8244,7 +8270,11 @@ def resolve_task_argument(raw: str) -> str:
         if e.errno not in _DEFINITE_ABSENCE:
             stat_ok = False
     if is_task_file:
-        contents = p.read_text().strip()
+        try:
+            contents = _task_file_text(p).strip()
+        except (OSError, ValueError) as e:
+            die(f"task file {raw!r} cannot be read as a file of the "
+                f"checkout: {e}")
         if not contents:
             die(f"task file {raw!r} is empty")
         return contents
@@ -10674,16 +10704,21 @@ def _is_git_dir(p: Path) -> bool:
 def _admin_dir_of(common: Path, tree: Path) -> Path | None:
     """`common`'s administrative directory for its worktree `tree`, found
     from the repository's side (each `worktrees/*/gitdir`), never from
-    `tree/.git`."""
+    `tree/.git`. A tree repository is its committing worker's to write
+    whole, so each record is read beneath `common` and never through a link
+    or a FIFO (`_read_beneath`)."""
     want = os.path.realpath(tree)
+    common = Path(common)
     try:
-        dirs = sorted((Path(common) / "worktrees").iterdir())
+        dirs = [common / "worktrees" / n for n in sorted(
+            _listdir_beneath(common, common / "worktrees"))]
     except OSError:
         return None
     for d in dirs:
         try:
-            got = (d / "gitdir").read_text().strip()
-        except OSError:
+            got = _read_text_beneath(common, d / "gitdir",
+                                     errors="strict").strip()
+        except (OSError, ValueError):
             continue
         if os.path.realpath(os.path.dirname(got)) == want:
             return d
@@ -10725,8 +10760,9 @@ def _run_tree_location(tree: str | Path
             return shadow, shadow, run_dir
         return False
     try:
-        named = (admin / "commondir").read_text().strip()
-    except OSError:
+        named = _read_text_beneath(common, admin / "commondir",
+                                   errors="strict").strip()
+    except (OSError, ValueError):
         return False
     if os.path.realpath(admin / named) != os.path.realpath(common):
         return False
@@ -11544,21 +11580,24 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                         "see it")
                     continue
                 try:
-                    if src.is_dir():
+                    if _dir_beneath_exists(repo_root, src):
                         _copytree_beneath(
                             src, wt, dst,
-                            ignore=_ignore_repo_paths(repo_root, skip))
+                            ignore=_ignore_repo_paths(repo_root, skip),
+                            src_anchor=repo_root)
                     else:
-                        _copy_beneath(src, wt, dst)
+                        _copy_beneath(src, wt, dst, src_anchor=repo_root)
                     staged += 1
                 except Exception:
                     continue
         claude_src, claude_dst = repo_root / ".claude", wt / ".claude"
-        if claude_src.is_dir() and not _lexists_beneath(wt, claude_dst):
+        if _dir_beneath_exists(repo_root, claude_src) \
+                and not _lexists_beneath(wt, claude_dst):
             skip = _switched_branch_only_paths(repo_root, ".claude", wb_ref)
             try:
                 _copytree_beneath(claude_src, wt, claude_dst,
-                                  ignore=_ignore_repo_paths(repo_root, skip))
+                                  ignore=_ignore_repo_paths(repo_root, skip),
+                                  src_anchor=repo_root)
                 staged += 1
             except Exception:
                 pass
@@ -12870,7 +12909,7 @@ def _category_evidence_found(repo_root: Path, cat: str) -> bool:
         with os.scandir(repo_root) as entries:
             for entry in entries:
                 name = entry.name.lower()
-                if entry.is_dir():
+                if entry.is_dir(follow_symlinks=False):
                     if name in wanted_dirs:
                         return True
                     # One level down, for `src/infrastructure/`-style
@@ -12883,7 +12922,7 @@ def _category_evidence_found(repo_root: Path, cat: str) -> bool:
                     try:
                         with os.scandir(entry.path) as children:
                             for child in children:
-                                if (child.is_dir()
+                                if (child.is_dir(follow_symlinks=False)
                                         and child.name.lower() in wanted_dirs):
                                     return True
                     except OSError:
@@ -12894,7 +12933,7 @@ def _category_evidence_found(repo_root: Path, cat: str) -> bool:
     except OSError:
         # An unreadable or absent repo root is not evidence of absence.
         return True
-    return any(any(repo_root.glob(pat)) for pat in spec.get("globs", []))
+    return any(_glob_beneath(repo_root, pat) for pat in spec.get("globs", []))
 
 
 def _category_evidence_summary(cat: str) -> str:
@@ -13776,12 +13815,13 @@ def _subfile_split(subtask: dict, repo_root: Path,
             return []
         abs_path = repo_root / file
         try:
-            total_lines = abs_path.read_text(errors="replace").count("\n") + 1
+            total_lines = _read_text_beneath(
+                repo_root, abs_path).count("\n") + 1
         except OSError:
             return []  # file unreadable — can't region-split; leave as leaf
         if total_lines <= max_span:
             return []  # whole file already within the cap — leaf
-        ranges = _extract_symbol_ranges(abs_path)
+        ranges = _extract_symbol_ranges(repo_root, abs_path)
         regions = _partition_symbols_by_line(ranges, total_lines, max_span)
         if len(regions) <= 1:
             # No usable boundaries (or one span covers the file): tier-2 fallback
@@ -13857,7 +13897,8 @@ def _peel_oversized_file(subtask: dict, repo_root: Path,
 
     def _line_count(f: str) -> int:
         try:
-            return (repo_root / f).read_text(errors="replace").count("\n") + 1
+            return _read_text_beneath(
+                repo_root, repo_root / f).count("\n") + 1
         except OSError:
             return 0  # unreadable → treat as not-oversized (leaf-safe)
 
@@ -15785,7 +15826,8 @@ def _format_task_file_references(
     )
 
 
-def _is_same_document(path: Path, text_len: int, text: str) -> bool:
+def _is_same_document(root: Path, path: Path, text_len: int,
+                      text: str) -> bool:
     """True when `path` holds exactly `text` (modulo surrounding whitespace).
 
     Used to keep a task file out of its own reference list. The planner is
@@ -15799,9 +15841,9 @@ def _is_same_document(path: Path, text_len: int, text: str) -> bool:
     passed in rather than recomputed because this runs once per candidate and
     the task can be hundreds of KB."""
     try:
-        if abs(path.stat().st_size - text_len) > 8:
+        if abs(path.lstat().st_size - text_len) > 8:
             return False
-        return path.read_text(errors="replace").strip() == text
+        return _read_text_beneath(root, path).strip() == text
     except (OSError, ValueError):
         return False
 
@@ -15854,6 +15896,12 @@ def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
         for expanded in _expand_braces(cand):
             for m in sorted(_glob.glob(str(repo_root / expanded))):
                 p = Path(m)
+                # A match reached through a link — the match itself, or a
+                # linked directory on the way — names what the link points
+                # at, not the repository's own file (DESIGN §6 *Leerie never
+                # reads through a link a repository holds*).
+                if not _no_link_beneath(repo_root, p):
+                    continue
                 # Containment re-check, independent of the token-level guard
                 # above: `../` segments survive the startswith("/") test and
                 # would otherwise escape the same way. `resolve()` follows
@@ -15866,8 +15914,9 @@ def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
                         continue
                 except (OSError, ValueError):
                     continue
-                if p.is_file() and str(p) not in seen:
-                    if _is_same_document(p, task_len, task_stripped):
+                if _regular_file_beneath(repo_root, p) and str(p) not in seen:
+                    if _is_same_document(repo_root, p, task_len,
+                                         task_stripped):
                         continue
                     seen.add(str(p))
                     matched.append(p)
@@ -16021,7 +16070,7 @@ def _walk_calls(node: "object") -> list[str]:
     return results
 
 
-def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
+def _parse_repo_file(root: Path, path: Path) -> tuple[list[str], list[str]]:
     """Parse one source file and return ``(defs, refs)``.
 
     *defs* — list of defined symbol names (functions, classes, methods).
@@ -16047,7 +16096,7 @@ def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
         lang = tslp.detect_language(str(path))
         if not lang:
             return [], []
-        source = path.read_text(errors="replace")
+        source = _read_text_beneath(root, path)
         proc_result = tslp.process(
             source,
             tslp.ProcessConfig(language=lang, structure=True, imports=False),
@@ -16072,7 +16121,8 @@ def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
         return [], []
 
 
-def _extract_symbol_ranges(path: Path) -> list[tuple[str, int, int]]:
+def _extract_symbol_ranges(root: Path,
+                           path: Path) -> list[tuple[str, int, int]]:
     """Return the top-level symbols of *path* as ``(name, start_line, end_line)``,
     sorted by ``start_line`` — the ordered, exhaustive span sequence the sub-file
     splitter tiles into regions (DESIGN §5½ (P1) *Sub-file*).
@@ -16099,7 +16149,7 @@ def _extract_symbol_ranges(path: Path) -> list[tuple[str, int, int]]:
         lang = tslp.detect_language(str(path))
         if not lang:
             return []
-        source = path.read_text(errors="replace")
+        source = _read_text_beneath(root, path)
         proc_result = tslp.process(
             source,
             tslp.ProcessConfig(language=lang, structure=True, imports=False),
@@ -16153,7 +16203,7 @@ def _tree_sitter_extraction_works() -> bool:
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "_probe.py"
             f.write_text("def _probe_sym():\n    return 1\n")
-            defs, _refs = _parse_repo_file(f)
+            defs, _refs = _parse_repo_file(Path(d), f)
         return "_probe_sym" in defs
     except Exception as e:
         _last_parse_error = f"{type(e).__name__}: {e}"
@@ -16245,7 +16295,7 @@ def _build_repo_map(
         try:
             with open(cp, "rb") as fh:
                 entry = pickle.load(fh)  # noqa: S301
-            if entry.get("mtime_ns") == abs_path.stat().st_mtime_ns:
+            if entry.get("mtime_ns") == abs_path.lstat().st_mtime_ns:
                 return entry["defs"], entry["refs"]
         except Exception:
             pass
@@ -16262,7 +16312,7 @@ def _build_repo_map(
         try:
             with open(cp, "wb") as fh:
                 pickle.dump({
-                    "mtime_ns": abs_path.stat().st_mtime_ns,
+                    "mtime_ns": abs_path.lstat().st_mtime_ns,
                     "defs": defs,
                     "refs": refs,
                 }, fh, protocol=4)
@@ -16285,7 +16335,7 @@ def _build_repo_map(
             if cached is not None:
                 defs, file_refs = cached
             else:
-                defs, file_refs = _parse_repo_file(abs_path)
+                defs, file_refs = _parse_repo_file(repo_root, abs_path)
                 _save_cache(abs_path, defs, file_refs)
             if not defs and not file_refs:
                 continue
@@ -17937,10 +17987,11 @@ def _workspace_globs(repo_root: Path) -> list[str]:
     an exclusion and is kept with its `!`."""
     globs: list[str] = []
     ws = repo_root / "pnpm-workspace.yaml"
-    if ws.is_file():
+    if _regular_file_beneath(repo_root, ws):
         try:
             in_packages = False
-            for line in ws.read_text(encoding="utf-8").splitlines():
+            for line in _read_text_beneath(repo_root, ws,
+                                           errors="strict").splitlines():
                 bare = line.split("#", 1)[0].rstrip()
                 if not bare.strip():
                     continue
@@ -17955,8 +18006,8 @@ def _workspace_globs(repo_root: Path) -> list[str]:
         except (OSError, UnicodeDecodeError):
             pass
     try:
-        pkg = json.loads((repo_root / "package.json").read_text(
-            encoding="utf-8"))
+        pkg = json.loads(_read_text_beneath(
+            repo_root, repo_root / "package.json", errors="strict"))
         w = pkg.get("workspaces") if isinstance(pkg, dict) else None
         if isinstance(w, dict):
             w = w.get("packages")
@@ -18432,10 +18483,8 @@ def _gather_dep_manifests(repo_root: Path) -> str:
     total = 0
     for name in _DEP_MANIFEST_NAMES:
         p = repo_root / name
-        if not p.is_file():
-            continue
         try:
-            text = p.read_text(errors="replace")
+            text = _read_text_beneath(repo_root, p)
         except OSError:
             continue
         if len(text.encode()) > _DEPCAP_MANIFEST_FILE_BUDGET:
@@ -18513,13 +18562,29 @@ def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
 
     Creates cfg_path with a standard header if absent. For each key in
     updates: replaces the first uncommented `key = ...` line if present,
-    otherwise appends. Never touches commented lines. Uses os.replace
-    atomicity (mirrors State.save discipline).
+    otherwise appends. Never touches commented lines. Written as a new
+    file renamed into place (mirrors State.save discipline).
+
+    The file is the checkout's (`<root>/.leerie/config.toml`), whose content
+    a merged run may have committed: it is read and written beneath the
+    checkout without following a link (`_read_beneath`, `_write_beneath`) —
+    a link there is replaced, never read or written through, and a link at
+    `.leerie` refuses the write (DESIGN §6 *Leerie never reads through a
+    link a repository holds*).
     """
-    if cfg_path.exists():
-        lines = cfg_path.read_text().splitlines(keepends=True)
-    else:
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path = Path(cfg_path)
+    root = cfg_path.parent.parent if cfg_path.parent.name == ".leerie" \
+        else cfg_path.parent
+    try:
+        lines = _read_text_beneath(root, cfg_path).splitlines(keepends=True)
+    except OSError as e:
+        # Absent, or a link at the file itself, which the write below
+        # replaces; a link on the way (ENOTDIR, or ELOOP at `.leerie`)
+        # refuses the write there.
+        if not (isinstance(e, FileNotFoundError) or (
+                e.errno == errno.ELOOP
+                and not _link_on_the_way(root, cfg_path))):
+            raise
         lines = [
             "# leerie per-repo configuration — commit this file to version-control.\n",
             "# Generated by: leerie capture\n",
@@ -18545,9 +18610,7 @@ def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
     # Append any keys that were not found in the file.
     for k, v in remaining.items():
         out.append(f'{k} = {_toml_value(v)}\n')
-    tmp = Path(str(cfg_path) + f".tmp.{os.getpid()}")
-    tmp.write_text("".join(out))
-    os.replace(tmp, cfg_path)
+    _write_beneath(root, cfg_path, "".join(out).encode())
 
 
 def _extract_depcap_commands(log_dir: Path) -> tuple[str, bool]:
@@ -19445,12 +19508,13 @@ def _extract_readme_sections(text: str) -> str:
     return cut[:boundary] if boundary > 0 else cut
 
 
-def _read_file_safely(path: Path, budget: int) -> str:
-    """Read a file with a byte ceiling, swallowing missing-file and
-    decode errors. Used by _gather_provision_fixtures to assemble the
-    fixture dict from optional repo files."""
+def _read_file_safely(root: Path, path: Path, budget: int) -> str:
+    """Read a file of the repository at `root` with a byte ceiling,
+    swallowing missing-file and decode errors, and refusing a link
+    (`_read_text_beneath`). Used by _gather_provision_fixtures to assemble
+    the fixture dict from optional repo files."""
     try:
-        return path.read_text(errors="replace")[:budget]
+        return _read_text_beneath(root, path)[:budget]
     except (OSError, UnicodeError):
         return ""
 
@@ -19492,14 +19556,15 @@ def _sample_workspace_manifests(repo_root: Path, pkg_json_text: str,
             continue
         # glob via Path.glob (handles `packages/*` style).
         try:
-            for child in sorted(repo_root.glob(pattern + "/package.json")):
+            for child in _glob_beneath(repo_root, pattern + "/package.json"):
                 if len(sampled) >= max_files:
                     break
                 if child in seen:
                     continue
                 seen.add(child)
                 rel = child.relative_to(repo_root).as_posix()
-                sampled.append((rel, _read_file_safely(child, per_file_budget)))
+                sampled.append((rel, _read_file_safely(
+                    repo_root, child, per_file_budget)))
         except (OSError, ValueError):
             continue
     return sampled
@@ -19556,8 +19621,8 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
         repo_root / "README.adoc",
     ]
     for rp in readme_paths:
-        if rp.is_file():
-            raw = _read_file_safely(rp, _README_EXTRACT_BUDGET * 4)
+        if _regular_file_beneath(repo_root, rp):
+            raw = _read_file_safely(repo_root, rp, _README_EXTRACT_BUDGET * 4)
             extract = _extract_readme_sections(raw)
             if add_bytes(len(extract)):
                 out["readme"] = extract
@@ -19570,7 +19635,7 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
                 # classifying prose) lets the worker weight the manifests
                 # and workflows accordingly.
                 try:
-                    full = rp.stat().st_size
+                    full = rp.lstat().st_size
                 except OSError:
                     full = len(raw)
                 out["readme_bytes_unseen"] = max(0, full - len(extract))
@@ -19582,7 +19647,7 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
                 # rather than deriving from the same truncated buffer used
                 # for the extract itself.
                 try:
-                    full_text = rp.read_text(errors="replace")
+                    full_text = _read_text_beneath(repo_root, rp)
                 except (OSError, UnicodeError):
                     full_text = raw
                 out["readme_sections_unseen"] = max(
@@ -19596,9 +19661,9 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
         if out["hit_ceiling"]:
             break
         p = repo_root / name
-        if not p.is_file():
+        if not _regular_file_beneath(repo_root, p):
             continue
-        text = _read_file_safely(p, 8192)
+        text = _read_file_safely(repo_root, p, 8192)
         if not add_bytes(len(text)):
             break
         out["manifests"][name] = text
@@ -19617,11 +19682,14 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
     # --- Workflows ---
     if not out["hit_ceiling"]:
         wf_dir = repo_root / ".github" / "workflows"
-        if wf_dir.is_dir():
+        if _dir_beneath_exists(repo_root, wf_dir):
             try:
-                candidates = [p for p in sorted(wf_dir.iterdir())
-                              if p.suffix in (".yml", ".yaml") and p.is_file()
-                              and not _PROVISION_WORKFLOW_SKIP_RE.search(p.name)]
+                candidates = [
+                    p for p in (wf_dir / n for n in sorted(
+                        _listdir_beneath(repo_root, wf_dir)))
+                    if p.suffix in (".yml", ".yaml")
+                    and _regular_file_beneath(repo_root, p)
+                    and not _PROVISION_WORKFLOW_SKIP_RE.search(p.name)]
             except OSError:
                 candidates = []
             # Prefer files whose names match ci/test/build/release.
@@ -19630,7 +19698,7 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
             others = [p for p in candidates if p not in preferred]
             ordered = preferred + others
             for p in ordered[:2]:
-                text = _read_file_safely(p, 4096)
+                text = _read_file_safely(repo_root, p, 4096)
                 if not add_bytes(len(text)):
                     break
                 out["workflows"].append((p.name, text))
@@ -19640,8 +19708,8 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
         for cand in (repo_root / "CONTRIBUTING.md",
                      repo_root / "docs" / "DEVELOPMENT.md",
                      repo_root / "DEVELOPMENT.md"):
-            if cand.is_file():
-                text = _read_file_safely(cand, 4096)
+            if _regular_file_beneath(repo_root, cand):
+                text = _read_file_safely(repo_root, cand, 4096)
                 if add_bytes(len(text)):
                     out["contributing"] = text
                 break
@@ -19699,7 +19767,8 @@ def _split_checkpoint_sections(content: str) -> dict[str, list[str]]:
 
 
 def _validate_checkpoint(path: str,
-                        worktree_root: Path | None = None) -> str | None:
+                        worktree_root: Path | None = None,
+                        notes_dir: Path | None = None) -> str | None:
     """Return an error description if the checkpoint is structurally incomplete,
     None if it looks good. A missing section produces a confused successor;
     so does a section that contains only a placeholder.
@@ -19707,11 +19776,24 @@ def _validate_checkpoint(path: str,
     `worktree_root`, when supplied, enables the freshness check on
     `## Files touched`: every path listed there must either exist in the
     worktree or carry a `[deleted]` annotation in its bullet line. Skip the
-    freshness check when the worktree is gone (e.g. cleaned up already)."""
+    freshness check when the worktree is gone (e.g. cleaned up already).
+
+    `notes_dir`: the subtask's own notes directory, where its checkpoint
+    lives (`_checkpoint_path`). The path is the worker's to name, so it is
+    read only beneath that directory and never through a link
+    (`_read_beneath`; DESIGN §6 *Leerie never reads through a link a
+    repository holds*) — a path elsewhere is not this subtask's checkpoint.
+    None: the directory holding `path`."""
     p = Path(path)
     if not p.exists():
         return f"checkpoint file does not exist: {path}"
-    content = p.read_text()
+    try:
+        content = _read_text_beneath(
+            p.parent if notes_dir is None else Path(notes_dir), p,
+            errors="strict")
+    except (OSError, ValueError) as e:
+        return (f"checkpoint {path} is not a regular file in this subtask's "
+                f"notes directory: {e}")
 
     missing = [s for s in _CHECKPOINT_SECTIONS if s not in content]
     if missing:
@@ -20182,10 +20264,9 @@ async def _introduced_conflict_markers(
                  if entry.startswith("-\t-\t")]
     for path in unchecked:
         try:
-            with open(worktree / path, "rb") as f:
-                if b"\0" in f.read(8000):
-                    continue
-        except OSError:  # deleted by the rebase
+            if b"\0" in _read_beneath(worktree, worktree / path)[:8000]:
+                continue
+        except OSError:  # deleted by the rebase, or a link
             continue
         size = await _conflict_marker_size(worktree, path)
         diff = await run_proc(
@@ -23356,7 +23437,7 @@ def _restore_git_pointer(tree: str | Path) -> bool:
         st = None
     if st is not None and stat.S_ISREG(st.st_mode):
         try:
-            text = dot.read_text()
+            text = _read_text_beneath(t, dot)
         except OSError:
             text = ""
         if (text.startswith("gitdir: ") and os.path.realpath(
@@ -24348,6 +24429,71 @@ def _read_beneath(anchor: Path, path: Path) -> bytes:
             return f.read()
 
 
+def _read_text_beneath(anchor: Path, path: Path, *,
+                       errors: str = "replace") -> str:
+    """`_read_beneath`, decoded as UTF-8: a repository's file read without
+    following a link (DESIGN §6 *Leerie never reads through a link a
+    repository holds*)."""
+    return _read_beneath(anchor, path).decode("utf-8", errors)
+
+
+def _no_link_beneath(anchor: Path, path: Path) -> bool:
+    """True when `path` beneath `anchor` exists and is reached without a
+    link: neither it nor any directory on the way to it is one."""
+    path = Path(path)
+    if os.path.normpath(os.path.abspath(path)) == os.path.normpath(
+            os.path.abspath(anchor)):
+        return os.path.isdir(anchor)
+    try:
+        with _dir_beneath(anchor, path.parent) as dfd:
+            return not stat.S_ISLNK(os.stat(path.name, dir_fd=dfd,
+                                            follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _link_on_the_way(anchor: Path, path: Path) -> bool:
+    """True when a directory on the way from `anchor` to `path` cannot be
+    reached without following a link."""
+    try:
+        with _dir_beneath(anchor, Path(path).parent):
+            return False
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _dir_beneath_exists(anchor: Path, path: Path) -> bool:
+    """True when `path` beneath `anchor` is a directory reached without a
+    link."""
+    try:
+        with _dir_beneath(anchor, path):
+            return True
+    except OSError:
+        return False
+
+
+def _listdir_beneath(anchor: Path, path: Path) -> list[str]:
+    """The names in the directory `path` beneath `anchor`, reached without
+    a link (`OSError` otherwise). A name may itself be a link: read it with
+    `_read_beneath`, which refuses one."""
+    with _dir_beneath(anchor, path) as dfd:
+        return os.listdir(dfd)
+
+
+def _glob_beneath(anchor: Path, pattern: str) -> list[Path]:
+    """`anchor.glob(pattern)`, sorted, keeping only the matches reached
+    without a link (`_no_link_beneath`): a match through a linked directory
+    names another tree's files, and a match that is a link names whatever it
+    points at."""
+    try:
+        hits = sorted(Path(anchor).glob(pattern))
+    except (OSError, ValueError):
+        return []
+    return [p for p in hits if _no_link_beneath(anchor, p)]
+
+
 def _lexists_beneath(anchor: Path, path: Path) -> bool:
     """True when anything is at `path` beneath `anchor`, or a link or a
     non-directory stands on the way to it: either way the path is taken."""
@@ -24466,14 +24612,18 @@ def _copy_beneath(src: Path, anchor: Path, dst: Path, *,
 
 def _copytree_beneath(src: Path, anchor: Path, dst: Path, *,
                       ignore: Callable[[str, list[str]], Iterable[str]]
-                      | None = None) -> None:
+                      | None = None,
+                      src_anchor: Path | None = None) -> None:
     """`shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True,
     ignore=ignore)` with every write beneath `anchor` (`_write_beneath`): a
-    link in `src` is copied as a link, never followed on either side."""
+    link in `src` is copied as a link, never followed on either side.
+    `src_anchor`: `src` is read beneath it (`_listdir_beneath`,
+    `_read_beneath`), so a link on the way to `src` refuses the copy."""
     src = Path(src)
     with _dir_beneath(anchor, dst, make=True):
         pass
-    names = os.listdir(src)
+    names = (_listdir_beneath(src_anchor, src) if src_anchor is not None
+             else os.listdir(src))
     skip = set(ignore(str(src), names)) if ignore is not None else set()
     for name in names:
         if name in skip:
@@ -24485,9 +24635,10 @@ def _copytree_beneath(src: Path, anchor: Path, dst: Path, *,
                     os.unlink(name, dir_fd=dfd)
                 os.symlink(os.readlink(s), name, dir_fd=dfd)
         elif s.is_dir():
-            _copytree_beneath(s, anchor, d, ignore=ignore)
+            _copytree_beneath(s, anchor, d, ignore=ignore,
+                              src_anchor=src_anchor)
         else:
-            _copy_beneath(s, anchor, d)
+            _copy_beneath(s, anchor, d, src_anchor=src_anchor)
 
 
 def _mkdir_private(path: Path, top: Path) -> None:
@@ -28847,11 +28998,16 @@ def _merge_settings(low: dict, high: dict) -> dict:
     return out
 
 
-def _settings_file(path: Path) -> dict:
+def _settings_file(path: Path, *, root: Path | None = None) -> dict:
     """A settings file's object; {} when absent, and when unreadable or not
-    an object (logged: the CLI would have read it)."""
+    an object (logged: the CLI would have read it). `root`: the file is the
+    repository's, read beneath it without following a link (DESIGN §6
+    *Leerie never reads through a link a repository holds*); None for the
+    operator's own."""
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(
+            _read_text_beneath(root, path, errors="strict")
+            if root is not None else path.read_text())
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:
@@ -28887,7 +29043,8 @@ def _confined_cli_settings(hook_settings: str | None, *,
                 else Path.home() / ".claude") / "settings.json"
     layers = [_settings_file(user)]
     if repo_root is not None:
-        layers += [_settings_file(Path(repo_root) / ".claude" / name)
+        layers += [_settings_file(Path(repo_root) / ".claude" / name,
+                                  root=Path(repo_root))
                    for name in ("settings.json", "settings.local.json")]
     # No layer below leerie's names a variable leerie's confinement reads
     # (DESIGN §6 *The CLI's own git runs on leerie's terms*): leerie's own
@@ -31035,7 +31192,7 @@ def _existing_mise_toml_path(repo_root: Path) -> Path | None:
     """
     for name in ("mise.toml", ".mise.toml"):
         p = repo_root / name
-        if p.is_file():
+        if _regular_file_beneath(repo_root, p):
             return p
     return None
 
@@ -31046,12 +31203,12 @@ def _go_already_pinned(repo_root: Path) -> bool:
     `[tools] go = "..."` in `mise.toml`/`.mise.toml`. In any of these
     cases leerie should NOT synthesize an override; the existing pin wins.
     """
-    if (repo_root / ".go-version").is_file():
+    if _regular_file_beneath(repo_root, repo_root / ".go-version"):
         return True
     tv = repo_root / ".tool-versions"
-    if tv.is_file():
+    if _regular_file_beneath(repo_root, tv):
         try:
-            for line in tv.read_text(errors="replace").splitlines():
+            for line in _read_text_beneath(repo_root, tv).splitlines():
                 stripped = line.strip()
                 if stripped.startswith("#") or not stripped:
                     continue
@@ -31064,7 +31221,7 @@ def _go_already_pinned(repo_root: Path) -> bool:
     mt = _existing_mise_toml_path(repo_root)
     if mt is not None:
         try:
-            content = mt.read_text(errors="replace")
+            content = _read_text_beneath(repo_root, mt)
             # Cheap text-level check — TOML parsing here would pull in
             # tomllib but the heuristic is sufficient: any `go =` line
             # under a [tools] section indicates a pin.
@@ -31157,10 +31314,10 @@ def _read_idiomatic_pins(repo_root: Path,
         if tool in already_pinned:
             continue
         path = repo_root / filename
-        if not path.is_file():
+        if not _regular_file_beneath(repo_root, path):
             continue
         try:
-            raw = path.read_text(errors="replace").strip()
+            raw = _read_text_beneath(repo_root, path).strip()
         except OSError:
             continue
         if not raw:
@@ -31176,9 +31333,9 @@ def _read_idiomatic_pins(repo_root: Path,
     # before the dedup check so we don't pin both `node` AND `nodejs`
     # (which mise treats as the same tool — ambiguous resolution).
     tv = repo_root / ".tool-versions"
-    if tv.is_file():
+    if _regular_file_beneath(repo_root, tv):
         try:
-            content = tv.read_text(errors="replace")
+            content = _read_text_beneath(repo_root, tv)
         except OSError:
             content = ""
         for line in content.splitlines():
@@ -31249,12 +31406,12 @@ def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     See DESIGN §6½ and IMPLEMENTATION §6½ step 3.
     """
     gomod = repo_root / "go.mod"
-    if not gomod.is_file():
+    if not _regular_file_beneath(repo_root, gomod):
         return None
     if _go_already_pinned(repo_root):
         return None
     try:
-        text = gomod.read_text(errors="replace")
+        text = _read_text_beneath(repo_root, gomod)
     except OSError:
         return None
     m = _GO_MOD_VERSION_RE.search(text)
@@ -31276,7 +31433,7 @@ def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     existing_text: str | None = None
     if existing is not None:
         try:
-            existing_text = existing.read_text(errors="replace")
+            existing_text = _read_text_beneath(repo_root, existing)
         except OSError:
             existing_text = None
 
@@ -31599,11 +31756,11 @@ def _d1_report_sources(task: str, repo_root: Path) -> dict[str, str]:
         if tracked:
             continue
         try:
-            if f.stat().st_size > D1_REPORT_MAX_BYTES:
+            if f.lstat().st_size > D1_REPORT_MAX_BYTES:
                 log(f"  requirement coverage: {rel} is over "
                     f"{D1_REPORT_MAX_BYTES} bytes — not inlined")
                 continue
-            out[rel] = f.read_text(errors="replace")
+            out[rel] = _read_text_beneath(repo_root, f)
         except OSError:
             continue
     return out
@@ -40773,10 +40930,10 @@ def _infer_build_lint_test(repo_root: Path) -> dict[str, str]:
     if (repo_root / "detekt.yml").is_file() or \
        (repo_root / "detekt.yaml").is_file():
         out["lint"] = out["lint"] or "detekt"
-    if next(repo_root.glob("*.sln"), None) is not None:
+    if _glob_beneath(repo_root, "*.sln"):
         out["build"] = out["build"] or "dotnet build"
         out["test"] = out["test"] or "dotnet test"
-    elif next(repo_root.glob("*.csproj"), None) is not None:
+    elif _glob_beneath(repo_root, "*.csproj"):
         out["build"] = out["build"] or "dotnet build"
         out["test"] = out["test"] or "dotnet test"
     if (repo_root / "phpunit.xml").is_file() or \
@@ -41051,11 +41208,11 @@ def _js_runner_scoped_templates(repo_root: Path) -> tuple[str, str] | None:
     them, measured 1.9-5x slower on the same files on barnacle (DESIGN §9
     *Operands that are already test files take the runner's direct
     form*)."""
-    if (next(repo_root.glob("vitest.config.*"), None) is not None
-            or next(repo_root.glob("vitest.workspace.*"), None) is not None):
+    if (_glob_beneath(repo_root, "vitest.config.*")
+            or _glob_beneath(repo_root, "vitest.workspace.*")):
         return ("npx vitest related --run {files} --passWithNoTests",
                 "npx vitest run {test_files} --passWithNoTests")
-    if next(repo_root.glob("jest.config.*"), None) is not None:
+    if _glob_beneath(repo_root, "jest.config.*"):
         return ("npx jest --findRelatedTests {files} --passWithNoTests",
                 "npx jest --runTestsByPath {test_files} --passWithNoTests")
     return None
@@ -41587,7 +41744,8 @@ def _package_json_name(repo_root: Path) -> str | None:
     """The repo's `package.json` `name`, or None when absent or not a
     non-empty string."""
     try:
-        data = json.loads((repo_root / "package.json").read_text())
+        data = json.loads(_read_text_beneath(
+            repo_root, repo_root / "package.json", errors="strict"))
     except (OSError, ValueError):
         return None
     name = data.get("name") if isinstance(data, dict) else None
@@ -41598,7 +41756,8 @@ def _package_json_scripts(repo_root: Path) -> dict[str, str]:
     """The repo's `package.json` `scripts` map, or `{}` when absent or
     unparseable. Pure JSON — no natural-language interpretation."""
     try:
-        data = json.loads((repo_root / "package.json").read_text())
+        data = json.loads(_read_text_beneath(
+            repo_root, repo_root / "package.json", errors="strict"))
     except (OSError, ValueError):
         return {}
     scripts = data.get("scripts") if isinstance(data, dict) else None
@@ -47205,22 +47364,20 @@ def _ci_flat(text: str) -> str:
 
 
 def _ci_safe_rel(tree: Path, rel: str) -> Path | None:
-    """`tree/rel` when `rel` is a relative path staying inside `tree`."""
+    """`tree/rel` when `rel` is a relative path staying inside `tree`,
+    lexically: it is read beneath `tree` (`_read_beneath`), which refuses a
+    link on the way, never resolved through one."""
     rel = (rel or ".").strip()
     if rel.startswith("/") or ".." in rel.split("/"):
         return None
-    p = (tree / rel).resolve()
-    root = tree.resolve()
-    if p != root and root not in p.parents:
-        return None
-    return p
+    return Path(os.path.normpath(tree / rel))
 
 
 def _ci_config_files(tree: Path) -> list[str]:
     out: set[str] = set()
     for pat in CI_CONFIG_GLOBS:
-        for f in glob.glob(str(tree / pat)):
-            if os.path.isfile(f):
+        for f in _glob_beneath(tree, pat):
+            if _regular_file_beneath(tree, f):
                 out.add(os.path.relpath(f, tree))
     return sorted(out)
 
@@ -47234,14 +47391,14 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
     list = the check may run."""
     probs: list[str] = []
     src = _ci_safe_rel(tree, ((check.get("source") or {}).get("file") or ""))
-    if src is None or not src.is_file():
+    if src is None or not _regular_file_beneath(tree, src):
         return ["source file missing or outside the repo"]
     try:
-        flat = _ci_flat(src.read_text(errors="replace"))
+        flat = _ci_flat(_read_text_beneath(tree, src))
     except OSError:
         return ["source file unreadable"]
     cwd = _ci_safe_rel(tree, check.get("cwd") or ".")
-    if cwd is None or not cwd.is_dir():
+    if cwd is None or not _dir_beneath_exists(tree, cwd):
         probs.append(f"cwd {check.get('cwd')!r} is not a directory in the "
                      "repo")
     argv = [str(a) for a in (check.get("argv") or [])]
@@ -47267,8 +47424,7 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
         for base in {cwd or tree, tree}:
             for m in CI_STRICT_MANIFESTS:
                 with contextlib.suppress(OSError):
-                    texts.append(_ci_flat((base / m).read_text(
-                        errors="replace")))
+                    texts.append(_ci_flat(_read_text_beneath(tree, base / m)))
         for t in strict:
             ft = _ci_flat(t)
             if ft and not t.startswith("-") and not any(
@@ -47280,13 +47436,14 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
         cfg = _ci_safe_rel(tree, cov.get("config_file") or "")
         summ = (cov.get("summary_path") or "").strip()
         ths = cov.get("thresholds") or []
-        if cfg is None or not cfg.is_file() or not summ or not ths or (
+        if (cfg is None or not _regular_file_beneath(tree, cfg) or not summ
+                or not ths) or (
                 _ci_safe_rel(cwd or tree, summ) is None):
             probs.append("coverage check without a readable config file, a "
                          "summary path or thresholds")
         else:
             try:
-                ctext = _ci_flat(cfg.read_text(errors="replace"))
+                ctext = _ci_flat(_read_text_beneath(tree, cfg))
             except OSError:
                 ctext = ""
             for th in ths:
@@ -47414,7 +47571,10 @@ def _ci_coverage_pcts(summary: Path, tree: Path, cwd: str,
     file matches."""
     out: dict[str, float | None] = {}
     try:
-        data = json.loads(summary.read_text())
+        # The measurement wrote it, in the tree: read beneath the tree,
+        # never through a link the code under measurement left.
+        data = json.loads(_read_text_beneath(Path(tree), Path(summary),
+                                             errors="strict"))
     except (OSError, ValueError):
         data = None
     for th in thresholds:
@@ -50181,9 +50341,10 @@ def _prisma_project(repo_root: str | Path) -> dict | None:
         d = Path(schema).parent
         while True:
             pkg = root / d / "package.json"
-            if pkg.is_file():
+            if _regular_file_beneath(root, pkg):
                 try:
-                    data = json.loads(pkg.read_text())
+                    data = json.loads(_read_text_beneath(root, pkg,
+                                                         errors="strict"))
                 except (OSError, ValueError):
                     data = {}
                 deps = {**(data.get("dependencies") or {}),
@@ -50191,7 +50352,7 @@ def _prisma_project(repo_root: str | Path) -> dict | None:
                     if isinstance(data, dict) else {}
                 if any(p in deps for p in _PRISMA_PACKAGES):
                     try:
-                        text = (root / schema).read_text(errors="replace")
+                        text = _read_text_beneath(root, root / schema)
                     except OSError:
                         text = ""
                     m = _PRISMA_PROVIDER_RE.search(text)
@@ -50212,7 +50373,8 @@ def _prisma_reset_scripts(repo_root: str | Path, project: dict) -> list[str]:
     left out: they cannot be written as a rule."""
     pkg = Path(str(repo_root)) / project["dir"] / "package.json"
     try:
-        scripts = (json.loads(pkg.read_text()).get("scripts") or {})
+        scripts = (json.loads(_read_text_beneath(
+            Path(str(repo_root)), pkg, errors="strict")).get("scripts") or {})
     except (OSError, ValueError, AttributeError):
         return []
     out = []
@@ -50422,9 +50584,9 @@ def _prisma_mock_hits(repo: str | Path, rev: str, wt: Path,
     hits = []
     for f in files:
         p = wt / f
-        if not f.endswith(_JS_SRC_EXT) or not p.is_file():
+        if not f.endswith(_JS_SRC_EXT) or not _regular_file_beneath(wt, p):
             continue
-        for m in _JS_MOCK_RE.finditer(p.read_text(errors="replace")):
+        for m in _JS_MOCK_RE.finditer(_read_text_beneath(wt, p)):
             spec = m.group(1)
             if (_js_resolve(spec, f, allf, g["aliases"]) in client
                     or spec == "@prisma/client"
@@ -51685,9 +51847,10 @@ def _acceptance_cmd(st: "State", files: list[str],
         if tree is None or not all(f.endswith("_test.go") for f in files):
             return None
         names = sorted({n for f in files
-                        for n in _go_test_func_names(
-                            Path(placed[f]) if f in placed
-                            else Path(tree) / f)})
+                        for n in (_go_test_func_names(
+                            Path(placed[f]).parent, Path(placed[f]))
+                            if f in placed else _go_test_func_names(
+                                Path(tree), Path(tree) / f))})
         if not names:
             return None
         rendered += " -run " + shlex.quote("^(" + "|".join(names) + ")$")
@@ -51825,10 +51988,11 @@ _GO_TEST_FUNC_RE = re.compile(r"^func\s+(Test[A-Za-z0-9_]*)\s*\(",
                               re.MULTILINE)
 
 
-def _go_test_func_names(path: Path) -> list[str]:
-    """The test functions a Go test file declares, or [] when unreadable."""
+def _go_test_func_names(root: Path, path: Path) -> list[str]:
+    """The test functions the Go test file `path` beneath `root` declares,
+    or [] when unreadable or reached through a link."""
     try:
-        text = path.read_text(errors="replace")
+        text = _read_text_beneath(root, path)
     except OSError:
         return []
     return [n for n in _GO_TEST_FUNC_RE.findall(text) if n != "TestMain"]
@@ -53530,12 +53694,13 @@ def _verify_set_audit_case(case: dict, *, set_texts: dict[str, str],
     if "prod" in need:
         pq = case.get("prod_quote") or {}
         rel = os.path.normpath(str(pq.get("file") or "_"))
-        path = (tree / rel).resolve()
+        path = Path(os.path.normpath(tree / rel))
         text = ""
         if (rel not in set_texts and not os.path.isabs(rel)
-                and ".." not in Path(rel).parts and path.is_file()):
+                and ".." not in Path(rel).parts
+                and _regular_file_beneath(tree, path)):
             with contextlib.suppress(OSError):
-                text = path.read_text(errors="replace")
+                text = _read_text_beneath(tree, path)
         if not _audit_quote_in(text, pq.get("quote")):
             bad.append("prod_quote")
     if "task" in need and not _audit_quote_in(task_text,
@@ -53674,7 +53839,7 @@ def _copy_task_references(st: "State", wt: Path, task: str
         dst = wt / rel
         if not _lexists_beneath(wt, dst):
             with contextlib.suppress(OSError):
-                _copy_beneath(Path(f), wt, dst)
+                _copy_beneath(Path(f), wt, dst, src_anchor=st.repo_root)
                 copied.append(dst)
         refs.append(rel)
     return copied, refs
@@ -53798,7 +53963,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
                 set_texts[rel] = (Path(set_["dir"]) / rel).read_text(
                     errors="replace")
         task_text = task + "\n" + "\n".join(
-            (wt / r).read_text(errors="replace") for r in refs
+            _read_text_beneath(wt, wt / r) for r in refs
             if (wt / r).is_file())
         messages = {c["case"]: c["failure_message"] for c in failing}
         names = {c["case"] for c in failing}
@@ -56845,9 +57010,10 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
     for f in referenced:
         rel = _repo_rel(f, st.repo_root)
         dst = wt / rel
-        if not _lexists_beneath(wt, dst) and Path(f).is_file():
+        if not _lexists_beneath(wt, dst) and _regular_file_beneath(
+                st.repo_root, Path(f)):
             with contextlib.suppress(OSError):
-                _copy_beneath(Path(f), wt, dst)
+                _copy_beneath(Path(f), wt, dst, src_anchor=st.repo_root)
                 excludes.append(rel)
         if _lexists_beneath(wt, dst):
             refs.append(rel)
@@ -62665,7 +62831,8 @@ def _binary_install_source(name: str, worktree: str, st: "State") -> str:
 
     def _json(rel: str) -> dict:
         try:
-            data = json.loads((wt / rel).read_text())
+            data = json.loads(_read_text_beneath(wt, wt / rel,
+                                                 errors="strict"))
         except (OSError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
@@ -62685,11 +62852,11 @@ def _binary_install_source(name: str, worktree: str, st: "State") -> str:
 
     def _lines(rel: str) -> list[str]:
         try:
-            return (wt / rel).read_text(errors="replace").splitlines()
+            return _read_text_beneath(wt, wt / rel).splitlines()
         except OSError:
             return []
 
-    for req in sorted(wt.glob("requirements*.txt")):
+    for req in _glob_beneath(wt, "requirements*.txt"):
         for line in _lines(req.name):
             tok = _REQUIREMENT_NAME_END_RE.split(line.strip(), 1)[0]
             if tok and not tok.startswith(("#", "-")) \
@@ -63356,7 +63523,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         nonlocal continuations
         wt_root = _subtask_worktree_path(leerie_dir, sid)
         cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
-                                     worktree_root=wt_root)
+                                     worktree_root=wt_root,
+                                     notes_dir=_notes_dir(leerie_dir, sid))
         if cp_err:
             log(f"  bad checkpoint for {sid}: {cp_err}")
             return {"subtask_id": sid, "status": "blocked",
@@ -66407,18 +66575,52 @@ _PR_TEMPLATE_MULTI_DIRS = (
 )
 
 
-def _find_pr_template(repo_root: Path,
-                     override: str | None = None) -> tuple[Path, str] | None:
-    """Locate the PR template the worker should fill out, or None when
-    the repo has no template.
+def _committed_blobs(git_dir: Path, rev: str, rel: str) -> list[tuple[str, str]]:
+    """`(path, blob)` of each regular file `git ls-tree` lists for `rel` at
+    `rev` in the repository at `git_dir` — `rel` itself, or the entries of
+    the directory `rel/`. A committed link (mode 120000) or a submodule is
+    not a file and is left out: its blob is a link's target text, never the
+    content it would reach. Empty when `rev` or `rel` is absent."""
+    r = _git_z_output(["git", "--literal-pathspecs", "--git-dir",
+                       str(git_dir), "ls-tree", "-z", "--full-tree", rev,
+                       "--", rel], timeout=60)
+    if r.returncode != 0:
+        return []
+    out: list[tuple[str, str]] = []
+    for entry in r.stdout.split("\0"):
+        meta, sep, path = entry.partition("\t")
+        fields = meta.split()
+        if sep and len(fields) == 3 and fields[1] == "blob" \
+                and fields[0] in ("100644", "100755"):
+            out.append((path, fields[2]))
+    return out
 
-    Returns `(absolute_path, relative_path_from_repo_root)` so the caller
-    can both read the file and report which template was used (the
-    relative path goes into run.json under `pr_template_used`).
+
+def _committed_text(git_dir: Path, blob: str, limit: int) -> str:
+    """At most `limit` bytes of the blob `blob`, decoded as UTF-8."""
+    r = subprocess.run(["git", "--git-dir", str(git_dir), "cat-file", "blob",
+                        blob], capture_output=True, check=True, timeout=60)
+    return r.stdout[:limit].decode("utf-8", "replace")
+
+
+def _find_pr_template(git_dir: Path, rev: str,
+                      override: str | None = None
+                      ) -> tuple[str, str, bool] | None:
+    """The PR template the worker should fill out, as committed at `rev`
+    in the run's own repository (`git_dir`), or None when it holds none.
+
+    Returns `(relative_path, text, truncated)`: the text is the blob's,
+    capped at `PR_WRITER_TEMPLATE_MAX_BYTES`. It is read from git, never
+    from the checkout: the orchestrator is unconfined and publishes what it
+    reads into the PR body, and a committed link at a template's path read
+    through the filesystem put its target there — the orchestrator's own
+    environment, the CLI's credentials (DESIGN §6 *Leerie never reads
+    through a link a repository holds*; review round 26 isolation I1). A
+    template committed as a link is not a template.
 
     Discovery order:
-      1. The four single-template locations in
-         `_PR_TEMPLATE_SINGLE_LOCATIONS` (GitHub's canonical order).
+      1. The single-template locations in `_PR_TEMPLATE_SINGLE_LOCATIONS`
+         (GitHub's canonical order).
       2. Any `PULL_REQUEST_TEMPLATE/` directory in
          `_PR_TEMPLATE_MULTI_DIRS`. When `override` matches a basename
          inside one of these directories (with or without `.md`), that
@@ -66430,28 +66632,32 @@ def _find_pr_template(repo_root: Path,
     leerie normalizes on the canonical casing rather than scanning every
     case-variant.
     """
+    def _found(rel: str, blob: str) -> tuple[str, str, bool]:
+        raw = _committed_text(git_dir, blob, PR_WRITER_TEMPLATE_MAX_BYTES + 1)
+        text, truncated = _cap_text(raw, PR_WRITER_TEMPLATE_MAX_BYTES,
+                                    "PR template")
+        return rel, text, truncated
+
     for rel in _PR_TEMPLATE_SINGLE_LOCATIONS:
-        candidate = repo_root / rel
-        if candidate.is_file():
-            return (candidate, rel)
+        hit = [b for p, b in _committed_blobs(git_dir, rev, rel) if p == rel]
+        if hit:
+            return _found(rel, hit[0])
     for rel_dir in _PR_TEMPLATE_MULTI_DIRS:
-        d = repo_root / rel_dir
-        if not d.is_dir():
-            continue
-        mds = sorted(p for p in d.iterdir()
-                     if p.is_file() and p.suffix == ".md")
+        mds = sorted((p.rsplit("/", 1)[-1], p, b) for p, b in
+                     _committed_blobs(git_dir, rev, f"{rel_dir}/")
+                     if p.endswith(".md") and p.rsplit("/", 1)[0] == rel_dir)
         if not mds:
             continue
         if override:
             wanted = override if override.endswith(".md") else f"{override}.md"
-            for p in mds:
-                if p.name == wanted:
-                    return (p, f"{rel_dir}/{p.name}")
+            for name, p, b in mds:
+                if name == wanted:
+                    return _found(p, b)
             # Override named, no match — fall through to the default rather
             # than die(), since a bad pr_template setting should not block
             # finalize. The fail-open path in _compose_pr_via_llm logs a
             # warning if pr_template was set but didn't resolve.
-        return (mds[0], f"{rel_dir}/{mds[0].name}")
+        return _found(mds[0][1], mds[0][2])
     return None
 
 
@@ -66694,7 +66900,6 @@ async def _compose_pr_via_llm(st: "State",
                               caps: dict,
                               models: dict[str, str],
                               efforts: dict[str, str | None],
-                              repo_root: Path,
                               pr_template_override: str | None) -> None:
     """Run the pr_writer worker and persist its title/body to run.json.
 
@@ -66711,22 +66916,23 @@ async def _compose_pr_via_llm(st: "State",
     body must never block finalize success.
     """
     try:
-        # 1. Locate the template (may be None).
-        tpl = _find_pr_template(repo_root, pr_template_override)
+        # 1. Locate the template (may be None): the one committed at the
+        # commit the run branch was cut from, read from the run's own
+        # repository (`_find_pr_template`).
         tpl_content = ""
         tpl_rel: str | None = None
         tpl_truncated = False
-        if tpl is not None:
-            tpl_path, tpl_rel = tpl
+        base = _diff_base(st)
+        if base:
             try:
-                raw = tpl_path.read_text()
-                tpl_content, tpl_truncated = _cap_text(
-                    raw, PR_WRITER_TEMPLATE_MAX_BYTES, "PR template")
-            except OSError as e:
-                log(f"pr_writer: failed to read template {tpl_rel}: {e} "
+                tpl = _find_pr_template(_run_repo(st), base,
+                                        pr_template_override)
+            except (OSError, subprocess.SubprocessError) as e:
+                log(f"pr_writer: failed to read the PR template: {e} "
                     "(falling back to no-template mode)")
                 tpl = None
-                tpl_rel = None
+            if tpl is not None:
+                tpl_rel, tpl_content, tpl_truncated = tpl
         if pr_template_override and tpl_rel is None:
             log(f"pr_writer: --pr-template={pr_template_override!r} did "
                 f"not match any template; using default discovery")
@@ -66932,7 +67138,6 @@ async def _compose_pr_for_a_push_chosen_after_finalize(
         "running pr_writer")
     await _compose_pr_via_llm(
         st, caps, models, efforts,
-        repo_root=Path(os.getcwd()),
         pr_template_override=pr_template_override,
     )
 
@@ -67122,7 +67327,6 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     if will_push and caps is not None and models is not None and efforts is not None:
         await _compose_pr_via_llm(
             st, caps, models, efforts,
-            repo_root=Path(os.getcwd()),
             pr_template_override=pr_template_override,
         )
 

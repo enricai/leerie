@@ -28,7 +28,9 @@ def _launcher_block() -> str:
 
 
 def _run_launcher_block(task_arg: str, cwd: Path) -> subprocess.CompletedProcess:
-    script = f"LEERIE_TASK_ARG=$1\n{_launcher_block()}\n"
+    # The launcher runs from `/`; the operator's relative path is the
+    # checkout's (USER_REPO), here the directory the block is run from.
+    script = f"LEERIE_TASK_ARG=$1\nUSER_REPO=$PWD\n{_launcher_block()}\n"
     return subprocess.run(["bash", "-c", script, "bash", task_arg], cwd=cwd,
                           capture_output=True, text=True)
 

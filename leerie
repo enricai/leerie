@@ -1,4 +1,35 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# shellcheck shell=bash
+# --- leave the checkout before anything runs (DESIGN §6 *The host never
+# runs a program the checkout chose*) --------------------------------------
+# A version manager's shim on PATH (asdf, mise, pyenv) chooses the program it
+# runs from the version files of its working directory and every directory
+# above it. The operator starts leerie inside the checkout, whose content a
+# merged run may have committed: a `.tool-versions` naming
+# `python path:/proc/self/cwd/.evil` made every host `python3` the launcher
+# ran — even `leerie --help` — the checkout's own program, unconfined, with
+# the operator's credentials. `#!/usr/bin/env bash` chose bash itself the
+# same way. So this prologue, for /bin/sh (a fixed path no shim chooses),
+# records the checkout, changes to `/`, and execs the bash PATH names from
+# there, by absolute path. A process keeps its PID across exec, so a marker
+# holding it tells the second pass the work is done; one inherited from
+# another launcher (a group member's) names another PID and is ignored.
+# Everything below addresses the checkout as "$USER_REPO" and never makes
+# it a working directory.
+if [ "${LEERIE_LAUNCHER_PID:-}" != "$$" ]; then
+  LEERIE_LAUNCHER_CWD=$(pwd -P) || {
+    echo "leerie: cannot resolve the current directory" >&2; exit 1; }
+  case $0 in
+    /*) _leerie_self=$0 ;;
+    *)  _leerie_self=$LEERIE_LAUNCHER_CWD/$0 ;;
+  esac
+  cd / || exit 1
+  _leerie_bash=$(command -v bash) || {
+    echo "leerie: bash not found on PATH" >&2; exit 1; }
+  LEERIE_LAUNCHER_PID=$$
+  export LEERIE_LAUNCHER_CWD LEERIE_LAUNCHER_PID
+  exec "$_leerie_bash" "$_leerie_self" "$@"
+fi
 # leerie — entry point for the Leerie orchestrator.
 # After install: `leerie "your task description"` from any git repo.
 # Direct git-clone: `/path/to/leerie/leerie "your task description"`,
@@ -36,7 +67,20 @@ while [ -L "$SRC" ]; do
   esac
 done
 LEERIE_REPO="$(cd -P "$(dirname "$SRC")" && pwd)"
-USER_REPO="$(pwd -P)"
+# The checkout the operator started in, recorded by the prologue above
+# before it left for `/`.
+USER_REPO="$LEERIE_LAUNCHER_CWD"
+unset LEERIE_LAUNCHER_CWD LEERIE_LAUNCHER_PID _leerie_self _leerie_bash
+
+# A path the operator gave relative to where they started leerie (a flag, an
+# environment variable, a leerie.toml value) means the same path beneath the
+# checkout, which is no longer the launcher's working directory.
+_from_checkout() {
+  case "$1" in
+    /*|"") printf '%s' "$1" ;;
+    *)     printf '%s/%s' "$USER_REPO" "$1" ;;
+  esac
+}
 
 # Bring remote_log into scope before any further stderr emit so every
 # leerie-tagged line carries the HH:MM:SS [leerie] [<repo>] prefix.
@@ -44,6 +88,11 @@ USER_REPO="$(pwd -P)"
 # chase that resolves LEERIE_REPO hasn't completed at that point.
 # shellcheck disable=SC1091
 . "$LEERIE_REPO/scripts/remote/_log.sh"
+# `_repo_git_from_root` / `_repo_git_push` for every git command below that
+# reaches a remote (DESIGN §6 *The host never runs a program the checkout
+# chose*); the file defines functions only.
+# shellcheck source=scripts/host-finalize.sh
+. "$LEERIE_REPO/scripts/host-finalize.sh"
 
 # Image tag = leerie:<version>. Version comes from plugin.json (single source of
 # truth — same one `leerie version` reads). The launcher only needs the value
@@ -88,6 +137,30 @@ if [ "${1:-}" != "prune" ]; then
   done
 fi
 unset _help_arg
+
+# --- the checkout's leerie configuration is never a link ------------------
+# DESIGN §6 *Leerie never reads through a link a repository holds*. Every
+# host-side read of the checkout's configuration — `leerie.toml`,
+# `.leerie/config.toml`, the derived `.leerie/Dockerfile` — and every write
+# the launcher makes under `.leerie/` names a path in the checkout, whose
+# content a merged run branch may have committed. A link at one of them, or
+# at `.leerie`, would be read or written through: a `leerie.toml` linked to a
+# credentials file, a `.leerie` linked anywhere on the host. The checkout is
+# not written while leerie runs (the container mounts it read-only), so one
+# check here holds for every read below. `version` reads none of them.
+_checkout_config_links() {
+  local _c _found=""
+  for _c in leerie.toml .leerie .leerie/config.toml .leerie/Dockerfile; do
+    [ -L "$USER_REPO/$_c" ] && _found="$_found $_c"
+  done
+  printf '%s' "${_found# }"
+}
+if [ "${1:-}" != "version" ] && _ccl="$(_checkout_config_links)" && \
+   [ -n "$_ccl" ]; then
+  remote_log "error: $_ccl in $USER_REPO is a symbolic link; leerie reads its configuration only from regular files in the checkout. Replace it with the file itself (or remove it) and run again."
+  exit 1
+fi
+unset _ccl
 
 
 # Extract the host's Claude OAuth credentials JSON for forwarding to
@@ -856,6 +929,12 @@ case "$LEERIE_STATE_HOST_DIR" in
   "~")   LEERIE_STATE_HOST_DIR="$HOME" ;;
   "~/"*) LEERIE_STATE_HOST_DIR="$HOME/${LEERIE_STATE_HOST_DIR#"~/"}" ;;
 esac
+# A relative value is relative to where the operator started leerie: the
+# checkout, which is no longer the launcher's working directory.
+case "$LEERIE_STATE_HOST_DIR" in
+  /*) ;;
+  *)  LEERIE_STATE_HOST_DIR="$USER_REPO/$LEERIE_STATE_HOST_DIR" ;;
+esac
 
 export LEERIE_STATE_HOST_DIR
 
@@ -921,6 +1000,11 @@ unset _cli_log_file _prev_was_log_file
 case "$LEERIE_LOG_FILE_RESOLVED" in
   "~")   LEERIE_LOG_FILE_RESOLVED="$HOME" ;;
   "~/"*) LEERIE_LOG_FILE_RESOLVED="$HOME/${LEERIE_LOG_FILE_RESOLVED#"~/"}" ;;
+esac
+# Relative to the checkout, as the state dir above.
+case "$LEERIE_LOG_FILE_RESOLVED" in
+  /*|"") ;;
+  *)     LEERIE_LOG_FILE_RESOLVED="$USER_REPO/$LEERIE_LOG_FILE_RESOLVED" ;;
 esac
 
 export LEERIE_LOG_FILE_RESOLVED
@@ -1388,11 +1472,14 @@ TOML
           remote_log "error: $system_prompt not found (leerie installation may be incomplete)"
           exit 1
         fi
-        # Interactive claude session — NOT claude -p.
-        claude \
+        # Interactive claude session — NOT claude -p. It runs in the
+        # checkout on purpose: a host-side worker, the operator's own
+        # session (DESIGN §6 *The host never runs a program the checkout
+        # chose*, part 4).
+        (cd "$_user_repo" && exec claude \
           --system-prompt-file "$system_prompt" \
           --add-dir "$_user_repo" \
-          "Help me configure leerie for this repo."
+          "Help me configure leerie for this repo.")
         exit 0
         ;;
       --recapture)
@@ -1594,8 +1681,11 @@ def _git(*args: str) -> subprocess.CompletedProcess:
     # LC_ALL=C: `git worktree prune -n -v` and friends emit gettext-translated
     # messages (builtin/worktree.c wraps them in _()), so parsing English
     # prefixes under another locale silently matches nothing.
-    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True,
-                          text=True, check=False,
+    # `-C`, never `cwd=`: git is started from the launcher's own `/`, not
+    # in the checkout, where a version manager's shim would choose it
+    # (DESIGN §6 *The host never runs a program the checkout chose*).
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True, check=False,
                           env={**os.environ, "LC_ALL": "C", "LANGUAGE": ""})
 
 
@@ -3605,7 +3695,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
           # (no origin remote, or origin lacks the ref) would otherwise
           # abort the verb via pipefail before the comparison.
           _fin_local_tip="$(git -C "$USER_REPO" rev-parse "refs/heads/$_fin_branch" 2>/dev/null || true)"
-          _fin_origin_tip="$(git -C "$USER_REPO" ls-remote origin "refs/heads/$_fin_branch" 2>/dev/null | cut -f1 || true)"
+          _fin_origin_tip="$(_repo_git_from_root "$USER_REPO" ls-remote origin "refs/heads/$_fin_branch" 2>/dev/null | cut -f1 || true)"
           if [ "$_fin_local_tip" != "$_fin_origin_tip" ]; then
             # Local branch present but origin behind/absent → partial prior
             # push. Fall through so host_finalize re-pushes — but only when
@@ -4303,6 +4393,7 @@ except Exception:
       for _job_file in "${_w_jobs[@]}"; do
         _job_file="$(echo "$_job_file" | sed 's/^ *//;s/ *$//')"
         [ -z "$_job_file" ] && continue
+        _job_file="$(_from_checkout "$_job_file")"
         if [ ! -f "$_job_file" ]; then
           remote_log "chain: prompt file not found: $_job_file"; exit 1
         fi
@@ -4532,9 +4623,9 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
         # via `git checkout -B` and clobber the resolved state, then
         # re-conflict. Instead fetch + checkout the existing stage
         # branch and advance current_base.
-        if git -C "$USER_REPO" ls-remote --exit-code origin "$_ch_next_stage" >/dev/null 2>&1; then
+        if _repo_git_from_root "$USER_REPO" ls-remote --exit-code origin "$_ch_next_stage" >/dev/null 2>&1; then
           remote_log "wave $_wave_idx → $((_wave_idx + 1)): stage branch $_ch_next_stage already on origin; skipping synth-merge"
-          git -C "$USER_REPO" fetch origin "$_ch_next_stage" >/dev/null 2>&1 \
+          _repo_git_from_root "$USER_REPO" fetch --no-recurse-submodules origin "$_ch_next_stage" >/dev/null 2>&1 \
             || { remote_log "chain: failed to fetch existing stage branch $_ch_next_stage"; exit 1; }
           git -C "$USER_REPO" checkout -B "$_ch_next_stage" "origin/$_ch_next_stage" >/dev/null 2>&1 \
             || { remote_log "chain: failed to checkout existing stage branch $_ch_next_stage"; exit 1; }
@@ -4592,7 +4683,7 @@ except SynthMergeConflict as exc:
         # Push the staged base branch to origin so subsequent wave's
         # workers can use it as their starting point (via seed-repo.sh
         # in their own ./leerie invocation).
-        if ! git -C "$USER_REPO" push origin "$_ch_next_stage" >/dev/null 2>&1; then
+        if ! _repo_git_push "$USER_REPO" origin "$_ch_next_stage" >/dev/null 2>&1; then
           remote_log "chain: failed to push $_ch_next_stage to origin"
           exit 1
         fi
@@ -4643,7 +4734,7 @@ except SynthMergeConflict as exc:
           if [ -z "$_grp_repo" ] || [ -z "$_grp_prompt" ]; then
             remote_log "group: --repo requires two arguments: <path> \"<prompt>\""; exit 1
           fi
-          _grp_repos+=("$_grp_repo")
+          _grp_repos+=("$(_from_checkout "$_grp_repo")")
           _grp_prompts+=("$_grp_prompt")
           shift 3
           ;;
@@ -4701,6 +4792,7 @@ except SynthMergeConflict as exc:
 
     # Validate brief file if supplied.
     if [ -n "$_grp_brief_file" ]; then
+      _grp_brief_file="$(_from_checkout "$_grp_brief_file")"
       if [ ! -f "$_grp_brief_file" ]; then
         remote_log "group: brief file not found: $_grp_brief_file"; exit 1
       fi
@@ -5134,7 +5226,10 @@ export LEERIE_TASK_ARG
 case "$LEERIE_TASK_ARG" in
   *[[:space:]]*) ;;
   *.[Tt][Xx][Tt]|*.[Mm][Dd])
-    if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$LEERIE_TASK_ARG" ]; then
+    # Relative to the checkout, which is no longer the working directory.
+    _task_file="$LEERIE_TASK_ARG"
+    [ "${_task_file#/}" != "$_task_file" ] || _task_file="$USER_REPO/$_task_file"
+    if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$_task_file" ]; then
       remote_log "task file not found: $LEERIE_TASK_ARG"
       exit 1
     fi
@@ -5869,8 +5964,8 @@ for arg in "$@"; do
 done
 export NO_VERIFY_PUSH
 
-# 1. cwd is a git repo (orchestrator's old check at leerie.py:7652).
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# 1. The checkout is a git repo (orchestrator's old check at leerie.py:7652).
+if ! git -C "$USER_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   remote_log "error: not inside a git repository"
   exit 1
 fi
@@ -5883,7 +5978,7 @@ fi
 #    command). Preflighting gh auth surfaced false-positives without
 #    catching anything the post-push failure path doesn't handle.
 if [ "$NO_PUSH" = "false" ]; then
-  if ! git remote get-url origin >/dev/null 2>&1; then
+  if ! git -C "$USER_REPO" remote get-url origin >/dev/null 2>&1; then
     remote_log "error: this repository has no \`origin\` remote — finalize cannot"
     echo "  push without one. Add one with \`git remote add origin <url>\` or pass" >&2
     echo "  \`--no-push\`." >&2
@@ -6839,7 +6934,7 @@ collect_inspect_path() {
   case "$host_path" in
     "~")   expanded="$HOME" ;;
     "~/"*) expanded="$HOME/${host_path#~/}" ;;
-    *)     expanded="$host_path" ;;
+    *)     expanded="$(_from_checkout "$host_path")" ;;
   esac
   resolved="$(cd -P "$expanded" 2>/dev/null && pwd)" || {
     remote_log "--inspect-dir path not found: $host_path"

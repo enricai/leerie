@@ -89,7 +89,7 @@ def test_pr_writer_runs_outside_the_checkout(leerie, tmp_path, monkeypatch,
     try:
         asyncio.run(leerie._compose_pr_via_llm(
             st, dict(leerie.DEFAULT_CAPS), {"pr_writer": "sonnet"},
-            {"pr_writer": "medium"}, repo, None))
+            {"pr_writer": "medium"}, None))
     except Exception:
         pass        # git plumbing after the call may fail in a bare repo
     assert seen, "pr_writer never ran; this test proves nothing"

@@ -100,7 +100,7 @@ def test_compose_pr_via_llm_happy_path(leerie, monkeypatch, st, repo, tmp_path):
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
 
     asyncio.run(leerie._compose_pr_via_llm(
-        st, _caps(leerie), {}, {}, repo, None))
+        st, _caps(leerie), {}, {}, None))
 
     run_json = json.loads((st.run_dir / "run.json").read_text())
     # The leading "leerie: " must be stripped (DESIGN §12 prompts-advisory).
@@ -122,7 +122,7 @@ def test_compose_pr_via_llm_budget_exhausted_skips(leerie, monkeypatch, st, repo
         return {"title": "t", "body": "b"}
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
-    asyncio.run(leerie._compose_pr_via_llm(st, caps, {}, {}, repo, None))
+    asyncio.run(leerie._compose_pr_via_llm(st, caps, {}, {}, None))
     assert not called
     assert not (st.run_dir / "run.json").exists() or \
         "pr_title" not in json.loads((st.run_dir / "run.json").read_text() or "{}")
@@ -135,7 +135,7 @@ def test_compose_pr_via_llm_empty_result_skips_write(leerie, monkeypatch, st, re
         return {"title": "", "body": ""}
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
-    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, repo, None))
+    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, None))
     assert not (st.run_dir / "run.json").exists()
 
 
@@ -148,7 +148,7 @@ def test_compose_pr_via_llm_swallows_worker_exception(leerie, monkeypatch, st,
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
     # Must not raise — fail-open contract.
-    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, repo, None))
+    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, None))
     assert not (st.run_dir / "run.json").exists()
 
 
@@ -163,7 +163,7 @@ def test_compose_pr_via_llm_malformed_plan_json_is_tolerated(
         return {"title": "t", "body": "b"}
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
-    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, repo, None))
+    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, None))
     run_json = json.loads((st.run_dir / "run.json").read_text())
     assert run_json["pr_title"] == "t"
 
@@ -171,11 +171,11 @@ def test_compose_pr_via_llm_malformed_plan_json_is_tolerated(
 def test_compose_pr_via_llm_template_read_failure_falls_back(
         leerie, monkeypatch, st, repo, tmp_path):
     st.data["working_branch"] = "main"
+    st.data["base_sha"] = "HEAD"
 
-    missing = tmp_path / "does-not-exist" / "TEMPLATE.md"
-    monkeypatch.setattr(
-        leerie, "_find_pr_template",
-        lambda repo_root, override: (missing, "TEMPLATE.md"))
+    def _unreadable(git_dir, rev, override):
+        raise OSError("cannot read the run repository")
+    monkeypatch.setattr(leerie, "_find_pr_template", _unreadable)
 
     async def _fake_claude_p(**kwargs):
         payload = json.loads(kwargs["user_prompt"])
@@ -183,21 +183,24 @@ def test_compose_pr_via_llm_template_read_failure_falls_back(
         return {"title": "t", "body": "b"}
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
-    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, repo, None))
+    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, None))
     run_json = json.loads((st.run_dir / "run.json").read_text())
     assert run_json["pr_title"] == "t"
 
 
 def test_compose_pr_via_llm_reads_a_real_template(
         leerie, monkeypatch, st, repo, tmp_path):
-    """The successful `tpl_path.read_text()` branch (as opposed to the
-    OSError fallback above)."""
-    tpl_path = tmp_path / "TEMPLATE.md"
-    tpl_path.write_text("## Summary\n")
-    monkeypatch.setattr(
-        leerie, "_find_pr_template",
-        lambda repo_root, override: (tpl_path, "TEMPLATE.md"))
+    """The template `_find_pr_template` read from the run's own repository
+    at `base_sha` reaches the payload (as opposed to the OSError fallback
+    above)."""
+    seen = {}
+
+    def _found(git_dir, rev, override):
+        seen.update(git_dir=git_dir, rev=rev)
+        return ("TEMPLATE.md", "## Summary\n", False)
+    monkeypatch.setattr(leerie, "_find_pr_template", _found)
     st.data["working_branch"] = "main"
+    st.data["base_sha"] = "abc123"
 
     async def _fake_claude_p(**kwargs):
         payload = json.loads(kwargs["user_prompt"])
@@ -206,9 +209,10 @@ def test_compose_pr_via_llm_reads_a_real_template(
         return {"title": "t", "body": "b", "used_template": "TEMPLATE.md"}
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
-    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, repo, None))
+    asyncio.run(leerie._compose_pr_via_llm(st, _caps(leerie), {}, {}, None))
     run_json = json.loads((st.run_dir / "run.json").read_text())
     assert run_json["pr_template_used"] == "TEMPLATE.md"
+    assert seen == {"git_dir": leerie._run_repo(st), "rev": "abc123"}
 
 
 def test_compose_pr_via_llm_warns_on_unmatched_template_override(
@@ -216,15 +220,16 @@ def test_compose_pr_via_llm_warns_on_unmatched_template_override(
     """--pr-template=<name> that matches nothing must log a warning but
     still proceed in no-template mode."""
     monkeypatch.setattr(
-        leerie, "_find_pr_template", lambda repo_root, override: None)
+        leerie, "_find_pr_template", lambda git_dir, rev, override: None)
     st.data["working_branch"] = "main"
+    st.data["base_sha"] = "HEAD"
 
     async def _fake_claude_p(**kwargs):
         return {"title": "t", "body": "b"}
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
     asyncio.run(leerie._compose_pr_via_llm(
-        st, _caps(leerie), {}, {}, repo, "nonexistent-template"))
+        st, _caps(leerie), {}, {}, "nonexistent-template"))
     out = capfd.readouterr().out
     assert "did not match any template" in out
 

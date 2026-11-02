@@ -345,23 +345,25 @@ seed_repo_clone() {
     local _hb_pid_subs
     _seed_progress_bg "seed_repo (submodule bundles)" &
     _hb_pid_subs=$!
-    # shellcheck disable=SC2016  # single quotes are REQUIRED: $displaypath and
-    # $bn are expanded by git's own `foreach` shell (and the innermost $bn by
-    # the remote `sh -c`), never by this one
-    if ! (
-      cd "$USER_REPO" && \
-      LEERIE_FLY_APP="$FLY_APP" LEERIE_MACHINE_ID="$LEERIE_MACHINE_ID" \
-      git submodule --quiet foreach --recursive '
-        bn="$(printf %s "$displaypath" | tr / _).bundle"
+    # Listed by `_seed_submodule_dirs` and bundled from here, never from a
+    # shell git starts inside each submodule (DESIGN §6 *The host never runs
+    # a program the checkout chose*).
+    local _subs
+    if ! _subs="$(_seed_submodule_dirs "$USER_REPO")" || ! (
+      while IFS="$(printf '\t')" read -r _sm_disp _sm_dir; do
+        [ -n "$_sm_dir" ] || continue
+        bn="$(printf %s "$_sm_disp" | tr / _).bundle"
         # The `-C` arg must be `sh -c "..."` not bare `cat > ...`;
         # without the shell wrapper the remote treats `>` as an arg to
-        # `cat`. Single-quote the inner script for the foreach context.
-        git bundle create - --all 2>/dev/null \
-          | flyctl ssh console --quiet --app "$LEERIE_FLY_APP" \
+        # `cat`.
+        git -C "$_sm_dir" bundle create - --all 2>/dev/null \
+          | flyctl ssh console --quiet --app "$FLY_APP" \
               --machine "$LEERIE_MACHINE_ID" --pty=false \
-              -C "sh -c '\''cat > /tmp/leerie-subs/$bn'\''" >/dev/null 2>&1 \
-          || { echo "leerie: seed_repo: failed to pipe submodule $displaypath bundle" >&2; exit 1; }
-      '
+              -C "sh -c 'cat > /tmp/leerie-subs/$bn'" >/dev/null 2>&1 \
+          || { echo "leerie: seed_repo: failed to pipe submodule $_sm_disp bundle" >&2; exit 1; }
+      done <<SUBS
+$_subs
+SUBS
     ); then
       kill "$_hb_pid_subs" 2>/dev/null || true
       wait "$_hb_pid_subs" 2>/dev/null || true
@@ -513,7 +515,13 @@ seed_repo_dirty() {
   # isn't in the bundle); this rsync step is where it lands.
   local claude_files=""
   if [ -d "$USER_REPO/.claude" ]; then
-    claude_files="$(cd "$USER_REPO" && find .claude -type f 2>/dev/null)"
+    # `find` started from here and handed the directory, never from the
+    # checkout (DESIGN §6 *The host never runs a program the checkout
+    # chose*); each path is made checkout-relative as before.
+    claude_files="$(find "$USER_REPO/.claude" -type f 2>/dev/null \
+                    | while IFS= read -r _cf; do
+                        printf '%s\n' "${_cf#"$USER_REPO"/}"
+                      done)"
   fi
 
   if [ -z "$dirty_files" ] && [ -z "$claude_files" ]; then
@@ -656,22 +664,21 @@ _seed_one_inspect_dir_clone() {
   #    (`/` → `_`) matches the machine-side clone script below so both
   #    sides agree on the filename for nested submodules.
   if [ -f "$host/.gitmodules" ]; then
-    # shellcheck disable=SC2016  # single quotes are REQUIRED: $displaypath and
-    # $bn are expanded by git's own `foreach` shell (and the innermost $bn by
-    # the remote `sh -c`), never by this one
-    if ! (
-      cd "$host" && \
-      LEERIE_FLY_APP="$FLY_APP" \
-      LEERIE_MACHINE_ID="$LEERIE_MACHINE_ID" \
-      LEERIE_SUBS_DIR="$subs_dir" \
-      git submodule --quiet foreach --recursive '
-        bn="$(printf %s "$displaypath" | tr / _).bundle"
-        git bundle create - --all 2>/dev/null \
-          | flyctl ssh console --quiet --app "$LEERIE_FLY_APP" \
+    # Listed by `_seed_submodule_dirs` and bundled from here (DESIGN §6
+    # *The host never runs a program the checkout chose*).
+    local _subs
+    if ! _subs="$(_seed_submodule_dirs "$host")" || ! (
+      while IFS="$(printf '\t')" read -r _sm_disp _sm_dir; do
+        [ -n "$_sm_dir" ] || continue
+        bn="$(printf %s "$_sm_disp" | tr / _).bundle"
+        git -C "$_sm_dir" bundle create - --all 2>/dev/null \
+          | flyctl ssh console --quiet --app "$FLY_APP" \
               --machine "$LEERIE_MACHINE_ID" --pty=false \
-              -C "sh -c '\''cat > $LEERIE_SUBS_DIR/$bn'\''" >/dev/null 2>&1 \
-          || { echo "leerie: seed_inspect_dirs: failed to pipe submodule $displaypath bundle" >&2; exit 1; }
-      '
+              -C "sh -c 'cat > $subs_dir/$bn'" >/dev/null 2>&1 \
+          || { echo "leerie: seed_inspect_dirs: failed to pipe submodule $_sm_disp bundle" >&2; exit 1; }
+      done <<SUBS
+$_subs
+SUBS
     ); then
       remote_log "seed_inspect_dirs: submodule bundling failed for $host"
       return 1

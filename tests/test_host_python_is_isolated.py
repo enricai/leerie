@@ -358,3 +358,276 @@ def test_the_chain_synth_merge_helper_drops_a_relative_pythonpath_entry(
     assert not marker.exists(), marker.read_text()
     assert r.returncode == 0, r.stderr
     assert (tmp_path / "who").read_text() == "operator"
+
+
+# --------------------------------------------------------------------------
+# DESIGN §6 *The host never runs a program the checkout chose* (review round
+# 26, isolation I2). `-I` decides what an interpreter imports, not WHICH
+# interpreter runs: a version manager's shim on PATH (asdf, mise, pyenv)
+# chooses the program from the version files of its working directory and
+# every directory above it. The launcher leaves the checkout before it runs
+# anything, its own bash included, and points git at it from `/`.
+#
+# The shims below are built from shell builtins and absolute paths only, for
+# a bounded list of names, each exec-ing the real program by the absolute
+# path found before the shim directory went on PATH: no shim can start
+# another shim, so none can recurse (the 2026-11-02 host crash was a shim in
+# front of every program that called sed and head through PATH).
+# --------------------------------------------------------------------------
+
+import os  # noqa: E402
+import shutil  # noqa: E402
+
+_SHIMMED = ("python3", "bash", "git", "gh", "jq", "nerdctl", "flyctl", "aws",
+            "ssh", "ssh-agent", "ssh-add", "sed", "awk", "grep", "cat",
+            "head", "tail", "tr", "cut", "sort", "dirname", "basename",
+            "uname", "mktemp", "readlink", "find", "id", "date", "timeout")
+
+_SHIM = """#!/bin/sh
+# A version manager's shim, as asdf behaves: builtins and absolute paths only.
+d=$(pwd -P)
+case "$d/" in "$SHIM_CHECKOUT"/*) printf '%s %s\\n' {name} "$d" >> "$SHIM_LOG" ;; esac
+if [ {name} = python3 ]; then
+  while :; do
+    if [ -f "$d/.tool-versions" ]; then
+      while IFS= read -r l || [ -n "$l" ]; do
+        case "$l" in
+          "python path:"*) exec "${{l#python path:}}/bin/python3" "$@" ;;
+        esac
+      done < "$d/.tool-versions"
+    fi
+    [ "$d" = / ] && break
+    d=${{d%/*}}
+    [ -n "$d" ] || d=/
+  done
+fi
+{tail}
+"""
+
+
+def _shims(tmp_path: Path, checkout: Path) -> dict:
+    """PATH with a shim in front of each of `_SHIMMED` present on this host;
+    each logs a start whose working directory is in `checkout`. `ssh` never
+    connects anywhere: it logs and fails."""
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    for name in _SHIMMED:
+        real = shutil.which(name)
+        if real is None:
+            continue
+        tail = ('printf "%s\\n" "$d" >> "$SHIM_LOG.ssh"; exit 255'
+                if name == "ssh" else f'exec {real} "$@"')
+        (shims / name).write_text(_SHIM.format(name=name, tail=tail))
+        (shims / name).chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("LEERIE_", "GIT_"))}
+    return {**env, "PATH": f"{shims}:{os.environ['PATH']}",
+            "SHIM_LOG": str(tmp_path / "shim.log"),
+            "SHIM_CHECKOUT": str(checkout.resolve()),
+            "LEERIE_STATE_DIR": str(tmp_path / "state"),
+            "HOME": str(home)}
+
+
+def _hostile_checkout(tmp_path: Path, marker: Path) -> Path:
+    """A checkout as a merged run branch could leave it: a `.tool-versions`
+    naming the checkout's own program, which records that it ran."""
+    co = tmp_path / "checkout"
+    evil = co / ".evil" / "bin"
+    evil.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(co)], check=True, timeout=60)
+    (co / ".tool-versions").write_text("python path:/proc/self/cwd/.evil\n")
+    (evil / "python3").write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {marker}\n'
+        f'exec {shutil.which("python3")} "$@"\n')
+    (evil / "python3").chmod(0o755)
+    return co
+
+
+def _launcher(argv: list[str], co: Path, env: dict
+              ) -> subprocess.CompletedProcess:
+    return subprocess.run(["/usr/bin/timeout", "120", str(LAUNCHER), *argv],
+                          cwd=co, env=env, capture_output=True, text=True,
+                          timeout=150)
+
+
+def test_the_checkouts_tool_versions_never_picks_the_launchers_python3(
+        tmp_path: Path) -> None:
+    """Review round 26 I2's proof, inverted and runnable without asdf: a
+    shim that reads `.tool-versions` from its working directory up, as
+    asdf's does, and a checkout naming `python path:/proc/self/cwd/.evil`.
+    `leerie --help` from the checkout runs leerie's python3, not the
+    checkout's — and still prints the help."""
+    marker = tmp_path / "RAN_ON_HOST"
+    co = _hostile_checkout(tmp_path, marker)
+    env = _shims(tmp_path, co)
+    r = _launcher(["--help"], co, env)
+    assert not marker.exists(), marker.read_text()
+    assert r.returncode == 0 and "usage: leerie" in r.stdout, r.stderr[-800:]
+    # Control: the same shim started in the checkout does pick its program,
+    # so the assertion above can fail.
+    subprocess.run(["python3", "-c", "pass"], cwd=co, env=env, timeout=60,
+                   check=True)
+    assert marker.exists()
+
+
+def test_no_program_the_launcher_starts_runs_in_the_checkout(
+        tmp_path: Path) -> None:
+    """The class, not the one interpreter: with each of `_SHIMMED` behind a
+    shim that logs a start whose working directory is the checkout, the
+    launcher's host-only paths start none there — its own `bash` included."""
+    co = _hostile_checkout(tmp_path, tmp_path / "RAN_ON_HOST")
+    env = _shims(tmp_path, co)
+    for argv in (["--help"], ["version"], ["config"], ["list"]):
+        r = _launcher(argv, co, env)
+        assert r.returncode == 0, (argv, r.stdout[-800:], r.stderr[-800:])
+    log = tmp_path / "shim.log"
+    assert not log.exists(), log.read_text()
+    # Control: a program started in the checkout is logged.
+    subprocess.run(["cat", "/dev/null"], cwd=co, env=env, timeout=60,
+                   check=True)
+    assert log.read_text().startswith("cat ")
+
+
+def test_a_relative_path_the_operator_gave_is_still_the_checkouts(
+        tmp_path: Path) -> None:
+    """Leaving the checkout keeps the operator's relative paths meaning
+    what they meant: a missing relative task file is reported as missing,
+    and a relative `--state-dir` lands beneath the checkout."""
+    co = _hostile_checkout(tmp_path, tmp_path / "RAN_ON_HOST")
+    env = _shims(tmp_path, co)
+    env.pop("LEERIE_STATE_DIR")
+    r = _launcher(["list", "--state-dir", "rel-state"], co, env)
+    assert r.returncode == 0, r.stderr[-800:]
+    assert (co / "rel-state").is_dir()
+    (co / "task.md").write_text("do it\n")
+    r = _launcher(["missing.md"], co, env)
+    assert r.returncode == 1 and "task file not found: missing.md" in \
+        r.stderr, r.stderr[-800:]
+
+
+def test_the_launcher_leaves_the_checkout_before_its_interpreter_is_chosen(
+        ) -> None:
+    """`#!/usr/bin/env bash` resolved bash through PATH from the checkout;
+    the launcher starts under /bin/sh, whose path no shim chooses, and
+    changes to `/` before it execs the bash PATH names there."""
+    lines = LAUNCHER.read_text().splitlines()
+    assert lines[0] == "#!/bin/sh"
+    end = next(i for i, line in enumerate(lines)
+               if line.strip().startswith('exec "$_leerie_bash"'))
+    prologue = "\n".join(lines[:end])
+    assert "cd / || exit 1" in prologue
+    assert prologue.index("cd / || exit 1") < prologue.index(
+        "_leerie_bash=$(command -v bash)")
+
+
+def _git_remote_cwds(tmp_path: Path, script: str) -> str:
+    """Run `script` (bash, host-finalize.sh sourced) from `/` against a
+    checkout whose origin is an ssh URL, with `ssh` behind a logging shim;
+    the shim log ("" when nothing ran in the checkout). Asserts `ssh` was
+    started at all, so an empty log is never a command that did not run."""
+    co = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(co)], check=True, timeout=60)
+    subprocess.run(["git", "-C", str(co), "remote", "add", "origin",
+                    "ssh://git@leerie.invalid/x/y.git"], check=True)
+    env = _shims(tmp_path, co)
+    subprocess.run(["/usr/bin/timeout", "60", "/bin/bash", "-c",
+                    f'. "{REPO}/scripts/host-finalize.sh"; USER_REPO="{co}"; '
+                    + script],
+                   cwd="/", env=env, capture_output=True, text=True,
+                   timeout=90)
+    assert (tmp_path / "shim.log.ssh").is_file(), "git never started ssh"
+    log = tmp_path / "shim.log"
+    return log.read_text() if log.exists() else ""
+
+
+def test_a_git_command_that_reaches_a_remote_starts_nothing_in_the_checkout(
+        tmp_path: Path) -> None:
+    """`git -C` changes into the work tree and starts `ssh` (and the
+    credential helper) there; `_repo_git_from_root` names the repository by
+    its git directory and work tree, so they start in `/`."""
+    assert _git_remote_cwds(
+        tmp_path, '_repo_git_from_root "$USER_REPO" ls-remote origin') == ""
+
+
+def test_the_remote_git_control_starts_ssh_in_the_checkout(
+        tmp_path: Path) -> None:
+    """Control for the test above: the `-C` form it replaced is caught."""
+    assert _git_remote_cwds(
+        tmp_path, 'git -C "$USER_REPO" ls-remote origin').startswith("ssh ")
+
+
+def test_host_finalize_reaches_remotes_only_from_root() -> None:
+    """Every git command in host-finalize.sh and the launcher that reaches
+    a remote goes through `_repo_git_from_root` or `_repo_git_push`; the one
+    `git -C ... push` left is `_repo_git_push`'s, for a push that will run
+    the operator's pre-push hook, which git starts in its own working
+    directory. `gh` is pointed at the repository with `GIT_DIR` and
+    `GIT_WORK_TREE`."""
+    text = (REPO / "scripts" / "host-finalize.sh").read_text()
+    bad = []
+    for f in (REPO / "scripts" / "host-finalize.sh", LAUNCHER):
+        for ln in f.read_text().splitlines():
+            if ln.lstrip().startswith(("#", "echo", "printf")):
+                continue
+            # `$LEERIE_REPO` is leerie's own install, not a checkout.
+            if re.search(r'git -C "\$\{?\w+\}?" (push|fetch|ls-remote|pull|'
+                         r'remote show)\b', ln) and "$LEERIE_REPO" not in ln:
+                bad.append(ln.strip())
+    assert bad == ['git -C "$_rp_repo" push "$@"'], bad
+    assert re.search(r'GIT_DIR="\$_pr_gd" GIT_WORK_TREE="\$USER_REPO" gh pr '
+                     r'create', text)
+
+
+def test_no_host_script_makes_a_checkout_its_cwd() -> None:
+    """The scripts the host runs address a checkout with `-C` or by path:
+    none `cd`s into it, and no `git submodule foreach` body starts a program
+    inside a submodule's checkout (only the shell's own printf)."""
+    bad = []
+    for p in _host_files() + [REPO / "scripts" / "remote" / "seed-common.sh"]:
+        lines = p.read_text().splitlines()
+        for n, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith("#"):
+                continue
+            # `config --chat` runs the operator's interactive CLI in the
+            # checkout on purpose (DESIGN §6 *The host never runs a program
+            # the checkout chose*, part 4).
+            if re.search(r'\bcd "\$(USER_REPO|host|_user_repo|repo)"', s) \
+                    and "exec claude" not in s:
+                bad.append(f"{p.name}:{n}: {s}")
+            body = s + " " + (lines[n].strip() if n < len(lines) else "")
+            if re.search(r"submodule\b.*\bforeach\b", s) and not re.search(
+                    r"""foreach --recursive \\?\s*'printf "[^']*"[^']*'$""",
+                    " ".join(body.split())):
+                bad.append(f"{p.name}:{n}: {s}")
+    assert not bad, bad
+
+
+def test_chain_git_runs_from_root_and_names_the_repo(tmp_path: Path,
+                                                     monkeypatch) -> None:
+    """chain/git_ops.py starts git from `/`: `-C` for a local command, the
+    git directory and work tree for one that reaches a remote."""
+    import sys
+    sys.path.insert(0, str(REPO))
+    try:
+        from chain import git_ops
+    finally:
+        sys.path.remove(str(REPO))
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    seen = []
+    real = subprocess.run
+
+    def fake_run(args, cwd=None, **kw):
+        if "rev-parse" in args and "--absolute-git-dir" in args:
+            return real(args, cwd=cwd, **kw)
+        seen.append((args, cwd))
+        return subprocess.CompletedProcess(args, 0, "", "")
+    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+    git_ops._run(["git", "status"], cwd=tmp_path)
+    git_ops._run(["git", "fetch", "origin"], cwd=tmp_path)
+    assert seen == [
+        (["git", "-C", str(tmp_path), "status"], "/"),
+        (["git", f"--git-dir={tmp_path / '.git'}",
+          f"--work-tree={tmp_path}", "fetch", "origin"], "/")]

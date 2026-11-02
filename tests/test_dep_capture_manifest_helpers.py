@@ -48,17 +48,17 @@ class TestReadFileSafely:
     def test_reads_full_content_under_budget(self, leerie, tmp_path):
         p = tmp_path / "f.txt"
         p.write_text("hello world")
-        assert leerie._read_file_safely(p, 1000) == "hello world"
+        assert leerie._read_file_safely(tmp_path, p, 1000) == "hello world"
 
     def test_missing_file_returns_empty_string(self, leerie, tmp_path):
         p = tmp_path / "does-not-exist.txt"
-        assert leerie._read_file_safely(p, 1000) == ""
+        assert leerie._read_file_safely(tmp_path, p, 1000) == ""
 
     def test_missing_file_never_raises(self, leerie, tmp_path):
         p = tmp_path / "nested" / "does-not-exist.txt"
         # Parent dir doesn't exist either — still must not raise.
         try:
-            result = leerie._read_file_safely(p, 1000)
+            result = leerie._read_file_safely(tmp_path, p, 1000)
         except OSError:
             pytest.fail("_read_file_safely raised OSError instead of swallowing it")
         assert result == ""
@@ -69,18 +69,18 @@ class TestReadFileSafely:
         # arm is exercised via a path that is a directory, not a file.
         p = tmp_path / "a-directory"
         p.mkdir()
-        result = leerie._read_file_safely(p, 1000)
+        result = leerie._read_file_safely(tmp_path, p, 1000)
         assert result == ""
 
     def test_truncates_to_byte_budget(self, leerie, tmp_path):
         p = tmp_path / "f.txt"
         p.write_text("abcdefghij")
-        assert leerie._read_file_safely(p, 5) == "abcde"
+        assert leerie._read_file_safely(tmp_path, p, 5) == "abcde"
 
     def test_budget_larger_than_content_returns_whole_file(self, leerie, tmp_path):
         p = tmp_path / "f.txt"
         p.write_text("short")
-        assert leerie._read_file_safely(p, 1000) == "short"
+        assert leerie._read_file_safely(tmp_path, p, 1000) == "short"
 
 
 # ---------------------------------------------------------------------------

@@ -2638,6 +2638,59 @@ checked by a rule over every host-run file, so a new call without it
 fails the suite. Commands the host sends to a Fly or EC2 machine follow
 the same spelling.
 
+**The host never runs a program the checkout chose.** `-I` decides what
+an interpreter imports. It does not decide which interpreter runs. A
+version manager's shim on the operator's PATH (asdf, mise, pyenv, nodenv)
+chooses the program it runs from the version files of its working
+directory and of every directory above it. The launcher ran from the
+checkout, so a committed `.tool-versions` naming
+`python path:/proc/self/cwd/.evil` made every host `python3` the
+checkout's own program. Even `leerie --help` ran it, with the operator's
+credentials and no confinement (review round 26, isolation I2). The same
+held for every program a shim stands for: `bash` itself (the launcher's
+`#!/usr/bin/env bash` resolved it from the checkout), `git`, `gh`, `jq`,
+`nerdctl`, `flyctl`, `aws`, `ssh`. The root cause is that the host started
+programs with the checkout as their working directory. The invariant:
+**no host program leerie starts has the checkout, or a directory in it,
+as its working directory, unless git itself must start it there.** It is
+constructed in four parts.
+
+1. *The launcher leaves the checkout before it runs anything.* It starts
+   under `/bin/sh`, whose path no shim chooses. It records the checkout
+   (`pwd -P`), changes to `/`, and only then execs the `bash` that PATH
+   names from `/`, by absolute path. The process keeps its PID across the
+   exec, so a marker holding that PID tells the second pass it is done.
+   From there every program the launcher and its sourced scripts start
+   (`python3`, `git`, `gh`, `jq`, `nerdctl`, `flyctl`, `aws`, `ssh-agent`,
+   `ssh-add`) is found and started from `/`. A path the operator gave
+   relative to where they started (a flag, `LEERIE_STATE_DIR`,
+   `LEERIE_LOG_FILE`) is anchored at the recorded checkout.
+2. *git is pointed at the checkout, never started in it.* A local git
+   command names the repository with `-C`. git changes into the work tree
+   itself, and starts nothing there that the repository chooses. A git
+   command that reaches a remote (`push`, `fetch`, `ls-remote`,
+   `remote show`) starts the transport (`ssh`) and the credential helper
+   (`gh auth git-credential`) in its own working directory. So it names
+   the repository by its git directory and work tree from `/`
+   (`_repo_git_from_root`). `gh` runs from `/` with `GIT_DIR` and
+   `GIT_WORK_TREE`, which it honours when it resolves the repository.
+3. *No shell git starts inside a submodule runs a program.* The seed's
+   `git submodule foreach` body only prints each submodule's path. The
+   bundling runs from the caller's directory with `git -C`.
+4. *The exception is what git must start in the work tree by its own
+   design.* These are the operator's own `pre-push` hook (git starts a
+   hook in its working directory, so a push that will run one keeps
+   `-C`), a checkout's hooks and filters, and the host-side workers the
+   section above names (the rebaser and `config --chat` run the CLI in a
+   tree on purpose). They start whatever the operator configured. A
+   `git push` the operator runs by hand from that checkout starts the
+   same programs.
+
+A rule pins the class: a test puts a shim, built from shell builtins and
+absolute paths, in front of a bounded list of the programs above. It runs
+the launcher's host-only paths from a hostile checkout and asserts that no
+shim was started with its working directory inside the checkout.
+
 **Residuals.** A committing worker can move any ref of its own tree
 repository, its tree's branch included; leerie takes only that branch, and
 reads every other branch in the run repository, which the worker cannot
@@ -3124,6 +3177,91 @@ none (`tests/test_leerie_writes_never_follow_links.py`). Git's own writes
 into a tree are git's, which refuses a path beyond a link; leerie names
 the repository for it (*Leerie's git never takes a tree's repository from
 the tree*).
+
+### Leerie never reads through a link a repository holds
+
+*Designed 2026-11-02 (review round 26, isolation I1).*
+
+**Root cause.** The section above closed leerie's *writes* through paths
+confined code shaped, and its reads of what confined code *wrote*. It left
+the reads of what a repository *holds*. The orchestrator is unconfined: its
+environment carries `CLAUDE_CODE_OAUTH_TOKEN`, and it can read the CLI's
+credentials and the state root with every held-out set. It read many of a
+repository's files by path, so the kernel followed every link the
+repository held. The most direct case was the PR template.
+`_compose_pr_via_llm` read `.github/pull_request_template.md` from `/work`
+(`is_file()`, `read_text()`), and `pr_writer` is told to fill the template
+into the PR body, which `gh pr create` publishes. A repository whose
+template is a committed link to `/proc/self/environ` or to
+`~/.claude/.credentials.json` therefore published the token. The
+repository did not need to know anything about the run. Its content is a
+worker's to shape:
+
+- a cloned third-party repository;
+- a merged run branch;
+- a worker's own tree or tree repository;
+- the output of a measurement.
+
+The same class reached:
+
+- the configuration (`leerie.toml`, `.leerie/config.toml`);
+- the manifests, README, workflows and contributing guide handed to the
+  provision and dependency-capture workers;
+- the CI files a `ci_checks` provenance check quotes;
+- the version files mise is pinned from;
+- the files the task names, and a task file itself;
+- the repository's `.claude` settings applied to every worker;
+- a worker-named checkpoint path;
+- a coverage summary a measurement wrote;
+- a tree repository's worktree records. Unlike the rest, these could hold
+  a FIFO, which made the orchestrator's read block for good.
+
+**Invariant: what leerie reads as a repository's content is that
+repository's content, never what a link in it points at.** It is
+constructed in three parts.
+
+1. *What leerie publishes from the commit the run planned against is a git
+   blob.* The PR template is read from the run's own repository at
+   `base_sha` (`git ls-tree`, then `git cat-file blob`; `_find_pr_template`),
+   never from the checkout. The read matches the committed view the run
+   planned against, so an uncommitted edit in the checkout is not
+   published either. A template committed as a link (mode 120000) is a blob
+   holding a path. It is not a template, and it is skipped.
+2. *Every other read of a repository's files by path walks from the
+   repository's root without following a link.* The roots are `/work`, a
+   worker's tree, a tree repository, a measurement's tree, and a subtask's
+   notes directory. Each read uses the same walk as part 2 above
+   (`_read_beneath`, `_read_text_beneath`, `_regular_file_beneath`), and a
+   link at the file or on the way to it reads as absent. A FIFO is refused,
+   never waited on. A listing keeps only entries it reached without a link
+   (`_glob_beneath`, `_listdir_beneath`, `_dir_beneath_exists`;
+   `os.walk` without `followlinks`). A checkpoint is read only beneath the
+   subtask's own notes directory, whatever path the worker names. A task
+   file in the checkout is read beneath it. One the operator names outside
+   it is theirs. A probe that only tests whether a file exists, to choose
+   between leerie's own commands, reads no content and is not covered.
+3. *The host reads the checkout the same way.* The launcher refuses to
+   start when `leerie.toml`, `.leerie`, `.leerie/config.toml` or
+   `.leerie/Dockerfile` is a link (`_checkout_config_links`). It reads and
+   writes its configuration only at those paths, and the checkout is not
+   written while leerie runs, so one check holds for every read after it.
+   The host-side recapture rewrites `.leerie/config.toml` through
+   `_write_beneath`, so a link there is replaced, never read or written
+   through.
+
+A rule over the module holds the line. Every function that still calls a
+raw read primitive is classified by why what it reads is not a repository's
+content reached through a path the repository shapes:
+
+- leerie's install;
+- the run directory and the state root;
+- leerie's own copies of the held-out sets, made through `_read_beneath`;
+- the kernel's files;
+- a file the operator named;
+- a listing that follows no link.
+
+The functions that read a repository's content use no raw primitive
+(`tests/test_leerie_reads_never_follow_links.py`).
 
 ### A confined command's scratch is short and private
 
@@ -5325,9 +5463,12 @@ if the override branch isn't the actual fork point.
 
 The PR title and body are written by an LLM worker (`pr_writer`, defaults
 to Sonnet) that runs inside the container right before it exits, where
-`claude -p` and the bind-mounted repo are both available. The worker
-reads the target repo's PR template if one exists (canonical GitHub
-locations, then any `PULL_REQUEST_TEMPLATE/` directory) and fills it out
+`claude -p` and the run's own repository are both available. The worker
+is handed the target repo's PR template if one exists (canonical GitHub
+locations, then any `PULL_REQUEST_TEMPLATE/` directory), read as the blob
+committed at `base_sha` in the run's own repository and never from the
+checkout (*Leerie never reads through a link a repository holds*), and
+fills it out
 faithfully — preserving HTML comments, leaving checklists unticked unless
 the diff demonstrably satisfies them, honoring "delete if N/A" markers;
 absent a template it produces a default structure (Summary / What changed
@@ -15445,7 +15586,7 @@ The accepted residuals, recorded here rather than only in commit
 history: some inputs read the checkout directly — the repo map,
 provisioning, decomposition greps, dependency capture's manifests, the
 build/lint/test commands in `.leerie/config.toml` (`resolve_blt_scoped`)
-and the PR template — so an operator's mid-run edits or branch switch
+— so an operator's mid-run edits or branch switch
 can colour them; `_coverage_citation_clears` checks a cited path's
 existence in the checkout rather than the merged staging tree; the
 acceptance writer copies every task-named file its worktree (at the
