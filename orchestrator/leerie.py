@@ -66868,6 +66868,36 @@ async def _compose_pr_via_llm(st: "State",
             "launcher will use deterministic fallback")
 
 
+async def _compose_pr_for_a_push_chosen_after_finalize(
+        st: "State",
+        no_push: bool,
+        caps: dict,
+        models: dict[str, str],
+        efforts: dict[str, str | None],
+        pr_template_override: str | None) -> None:
+    """Write the PR of a finished run whose push was chosen after finalize.
+
+    DESIGN §6 *One push choice per run, on every runtime*: a run that is
+    pushed has its PR written by `pr_writer` whenever its push choice was
+    made. `phase_finalize` runs the worker only when the run is then to be
+    pushed, and `leerie resume <id> --push` of a finished `--no-push` run
+    changes the choice after it — the host then pushed with the fallback
+    body. So the resume that finds nothing left to run writes the PR here
+    when it continues with a push and `run.json` holds no `pr_title`.
+    """
+    if no_push:
+        return
+    if (_read_run_json_sidecar(st.run_dir / "run.json") or {}).get("pr_title"):
+        return
+    log("resume: the run is to be pushed and has no PR written; "
+        "running pr_writer")
+    await _compose_pr_via_llm(
+        st, caps, models, efforts,
+        repo_root=Path(os.getcwd()),
+        pr_template_override=pr_template_override,
+    )
+
+
 async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
                          no_verify: bool,
                          caps: dict | None = None,
@@ -67322,6 +67352,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 and not st.data.get("no_work_required")):
             log(f"run already completed at {st.data['finished_at']} — "
                 "nothing to resume (host launcher will push + open PR)")
+            await _compose_pr_for_a_push_chosen_after_finalize(
+                st, no_push=getattr(args, "no_push", False),
+                caps=caps, models=models, efforts=efforts,
+                pr_template_override=getattr(args, "pr_template", None))
             return
         # A no-work run (DESIGN §8 *The cleared-but-empty terminal state*)
         # is already complete — finished_at is set, no run branch was

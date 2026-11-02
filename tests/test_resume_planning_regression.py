@@ -477,6 +477,10 @@ def test_completed_run_guard_returns_early_unchanged(leerie, run_dirs):
         "current_phase": "phase 6: finalize",
     }
     st.save()
+    # A pushed run whose finalize wrote its PR: the resume has nothing to
+    # write either (without a `pr_title` it would run `pr_writer` —
+    # tests/test_resume_push_writes_pr.py).
+    leerie._write_run_json(st.run_dir, pr_title="t", pr_body="b")
     args = _args()
     # Must return (not raise, not die) — no _StopAtExecute, since
     # phase_execute must never even be reached.

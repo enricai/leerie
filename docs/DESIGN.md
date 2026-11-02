@@ -5273,8 +5273,16 @@ run's own record: the choice, or `true` while the run has nothing to push
 it on every invocation but `--phase`, and the run's two terminal states
 call it as they finish. A plain resume of a no-work run used to write the
 choice over the no-work run's `true` (review round 25, F3); computed from
-the record, it cannot. `pr_writer`
-runs exactly when the run will be pushed. `host_finalize` reads
+the record, it cannot. A run that is pushed has its PR written by
+`pr_writer` (the deterministic fallback only when the worker fails),
+whenever its push choice was made: at finalize when the run is then to be
+pushed, and — because a resume may change the choice after finalize
+(`leerie resume <id> --push` of a finished `--no-push` run is the one way
+to push it) — on a resume of a finished run that continues with a push and
+whose `run.json` holds no `pr_title`, before that resume answers "nothing
+to resume". Binding the worker to finalize alone left such a push with the
+fallback body, its PR composed by a choice that was no longer the run's.
+`host_finalize` reads
 `run.json.no_push` unchanged on every runtime: on a remote runtime the
 fetch brings that file home before the host finalizes, and nothing on the
 way rewrites it.

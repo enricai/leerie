@@ -530,6 +530,13 @@ under `set -e` had ended the launcher there silently, leaking
 `.spawn.lock` (review r25 M1), while the older tests, which run without
 `set -e`, stayed green — and a failed `ssh-agent` spawn returns with a message and no lock.
 
+`tests/test_resume_push_writes_pr.py` (3 tests) drives the real
+`_run_phases` resume of a finished run with only `claude_p` stubbed: a resume
+continuing with a push and no `run.json.pr_title` runs `pr_writer` and records
+its title (review r25 L1: `resume <id> --push` of a finished `--no-push` run
+pushed with the fallback body); a resume continuing without a push, or of a
+run whose PR is written, runs no worker.
+
 ## fetch_branch, config, and group verbs
 
 The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
