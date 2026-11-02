@@ -320,15 +320,16 @@ def _launcher_no_push_block() -> str:
     recorded-choice step, sliced out of the real launcher."""
     text = LAUNCHER.read_text()
     start = text.index("\nNO_PUSH=false\n")
-    end = text.index("unset _NO_PUSH_CLI\n", start) + len("unset _NO_PUSH_CLI\n")
+    tail = "unset _NO_PUSH_CLI _resume_run_id\n"
+    end = text.index(tail, start) + len(tail)
     return text[start:end]
 
 
 def _launcher_no_push(tmp_path: Path, *, args: list[str], is_resume: bool,
                       run_id: str, run_json: dict | None,
-                      env_no_push: str = "") -> str:
+                      env_no_push: str = "", runtime: str = "local") -> str:
     host = tmp_path / "host-state"
-    if run_json is not None:
+    if run_json is not None and run_id:
         d = host / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
         (d / "run.json").write_text(json.dumps(run_json))
@@ -340,6 +341,8 @@ def _launcher_no_push(tmp_path: Path, *, args: list[str], is_resume: bool,
               f"LEERIE_STATE_HOST_DIR={host}\n"
               f"IS_RESUME={'true' if is_resume else 'false'}\n"
               f"LEERIE_RUN_ID={run_id}\n"
+              f"RUNTIME={runtime}\n"
+              f"LEERIE_REPO={LAUNCHER.parent}\n"
               + _launcher_no_push_block() + '\necho "$NO_PUSH"\n')
     env = {"PATH": "/usr/bin:/bin"}
     if env_no_push:
@@ -381,6 +384,76 @@ class TestLauncherResolvesTheRecordedPushChoice:
         assert _launcher_no_push(
             tmp_path, args=["resume", "r1"], is_resume=True, run_id="r1",
             run_json=None, env_no_push="1") == "true"
+
+
+def _host_run(leerie, host: Path, run_id: str, *, started: str,
+              no_push: bool, finished: bool = False) -> None:
+    d = host / "runs" / run_id
+    d.mkdir(parents=True)
+    state = {"task": "t", "started_at": started,
+             "run_layout": leerie.RUN_LAYOUT_VERSION}
+    rj: dict = {"no_push": no_push}
+    if finished:
+        state.update(finished_at=started, current_phase="phase 6: finalize")
+        rj["finished_at"] = started
+    (d / "state.json").write_text(json.dumps(state))
+    (d / "run.json").write_text(json.dumps(rj))
+
+
+class TestABareResumeReadsThePickedRunsRecord:
+    """Review round 24, L2: a bare `resume` names no run, so the launcher
+    asks the orchestrator's own `resolve_run_id` (host-side, same state root)
+    which run it resumes and continues that run's recorded push choice. The
+    runs disagree: an older resumable run would push, the newest run is
+    finished (never auto-picked) and would push, and only the run the
+    orchestrator picks was started `--no-push`."""
+
+    @staticmethod
+    def _runs(leerie, tmp_path, *, picked_no_push: bool) -> Path:
+        host = tmp_path / "host-state"
+        _host_run(leerie, host, "older", started="2026-01-01T00:00:00",
+                  no_push=not picked_no_push)
+        _host_run(leerie, host, "picked", started="2026-01-02T00:00:00",
+                  no_push=picked_no_push)
+        _host_run(leerie, host, "finished", started="2026-01-03T00:00:00",
+                  no_push=not picked_no_push, finished=True)
+        return host
+
+    def test_the_orchestrator_picks_the_run_the_record_is_read_from(
+            self, leerie, tmp_path):
+        host = self._runs(leerie, tmp_path, picked_no_push=True)
+        assert leerie.resolve_run_id(host, None,
+                                     resumable_only=True) == "picked"
+
+    def test_a_bare_resume_continues_the_picked_runs_no_push(
+            self, leerie, tmp_path):
+        self._runs(leerie, tmp_path, picked_no_push=True)
+        assert _launcher_no_push(
+            tmp_path, args=["resume"], is_resume=True, run_id="",
+            run_json=None) == "true"
+
+    def test_the_picked_record_beats_the_ambient_env(self, leerie, tmp_path):
+        self._runs(leerie, tmp_path, picked_no_push=False)
+        assert _launcher_no_push(
+            tmp_path, args=["resume"], is_resume=True, run_id="",
+            run_json=None, env_no_push="1") == "false"
+
+    def test_nothing_to_pick_falls_back_to_env(self, tmp_path):
+        assert _launcher_no_push(
+            tmp_path, args=["resume"], is_resume=True, run_id="",
+            run_json=None, env_no_push="1") == "true"
+        assert _launcher_no_push(
+            tmp_path, args=["resume"], is_resume=True, run_id="",
+            run_json=None) == "false"
+
+    def test_a_remote_runtime_does_not_pick_host_side(self, leerie,
+                                                      tmp_path):
+        # Fly/EC2 choose their run from the active launcher records, not
+        # from `resolve_run_id`, so the host pick is not theirs to make.
+        self._runs(leerie, tmp_path, picked_no_push=True)
+        assert _launcher_no_push(
+            tmp_path, args=["resume"], is_resume=True, run_id="",
+            run_json=None, runtime="fly") == "false"
 
 
 # --------------------------------------------------------------------------

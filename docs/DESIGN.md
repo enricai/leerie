@@ -4612,10 +4612,15 @@ The mechanism:
   `--no-push` or `--push` on the command line wins. Otherwise
   `run.json.no_push` wins. Only then do the environment and `leerie.toml`
   count. So the host-side checks and the push decision both follow the
-  recorded choice. Without a run id on the command line the launcher
-  cannot read the record before the container starts. `host_finalize`
-  still refuses to push a run whose `run.json` records `no_push`, so that
-  case still never pushes.
+  recorded choice. A bare `resume` names no run, so the launcher first
+  asks the orchestrator's own pick (`resolve_run_id`, run host-side over
+  the same state root) which run it will resume, and reads that run's
+  record. Deciding the push before knowing the run refused a bare
+  `resume` of a `--no-push` run in a repository with no `origin` (review
+  round 24, L2). The container still names the run it actually ran
+  (*Which run the container ran*), and `host_finalize` still refuses to
+  push a run whose `run.json` records `no_push`, so a pick that changed in
+  between never pushes either.
 
 ### Never a repository-global git operation
 
@@ -5124,7 +5129,8 @@ same as a completion (review round 22, a preflight death and a held-out
 set's death both listed `done`). A run that died of a worker error or an
 unhandled exception stamped nothing and listed `in-progress`. The root
 cause is that nothing recorded the death itself; the invariant is that
-**a run whose last invocation died is listed as died**. The record,
+**a run whose last invocation died is listed as died** — an
+invocation that continued the run, not one that found nothing to do. The record,
 `run.json`'s `failed_at`, has one owner, and it sees every exit of the
 invocation: it wraps the whole of `main()` and is armed where the run's
 `State` is acquired and its layout accepted, so a death from any
@@ -5139,7 +5145,16 @@ operator's interrupt; `main()` returns a pause's, an interrupt's or a
 completion's exit code rather than raising it, so a pause, an interrupt
 and a clarification wait record nothing — they are not deaths. A
 `--phase` verb analyses a run and never continues it, so it is not
-armed. Each invocation clears the previous one's `failed_at` as it is
+armed. Nor is a `resume` of a run that has nothing left to do (it
+completed: finalized, or no work was required — the test the resume
+itself uses to answer "nothing to resume"). An invocation's death is a
+fact about the invocation; the run's status is a fact about the run, and
+an invocation that has nothing to continue owns no part of it. Armed
+anyway, a no-op resume that died in a resolver (`--worker-memory-max
+bogus`) relabelled a finished run `failed`, and the next no-op resume
+relabelled it `done` (review round 24, L1). So **a run that completed
+stays listed as it completed**, whatever later invocations of it do.
+Each armed invocation clears the previous one's `failed_at` as it is
 armed, so a run resumed to completion is not listed `failed`. `leerie list` shows such a
 run `failed`, or `incomplete` when it died mid-wave (the more specific
 status, which a bare `resume` still picks); a `failed` run is resumed by

@@ -7323,6 +7323,19 @@ def _clear_run_died(run_dir: Path) -> None:
 _RUN_DEATH_OWNER: Path | None = None
 
 
+def _run_has_nothing_left(data: dict) -> bool:
+    """Whether a run, by its `state.json`, has completed: no work was
+    required, or it finalized (`finished_at` with `current_phase` at phase 6,
+    which `phase_finalize` stamps only after `finalize.sh` succeeded — a
+    `die()`'s discovery stamp of `finished_at` leaves the phase where it
+    died). A `resume` of such a run has nothing to continue: `_run_phases`
+    answers "nothing to resume", and `main()` does not arm the death record
+    for it (DESIGN §6 *A run that died says so*)."""
+    return bool(data.get("no_work_required")) or (
+        bool(data.get("finished_at"))
+        and data.get("current_phase") == "phase 6: finalize")
+
+
 def _own_the_run_death_record(run_dir: Path) -> None:
     """This process owns the run's invocation from here: clear the last
     invocation's `failed_at` and arm `_records_the_run_death` to record this
@@ -67274,12 +67287,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # where a concurrent decide_teardown (from the prior exit's
         # launcher child) can race with the second orchestrator and
         # destroy the machine mid-cycle.
-        # Guard: finished_at + current_phase == finalize. The die()
-        # handler also sets finished_at (for fetch_branch discovery)
-        # but leaves current_phase at whatever phase died — those runs
-        # ARE resumable and must fall through.
-        if (st.data.get("finished_at")
-                and st.data.get("current_phase") == "phase 6: finalize"
+        # Guard: `_run_has_nothing_left`. The die() handler also sets
+        # finished_at (for fetch_branch discovery) but leaves current_phase
+        # at whatever phase died — those runs ARE resumable and must fall
+        # through.
+        if (_run_has_nothing_left(st.data)
                 and not st.data.get("no_work_required")):
             log(f"run already completed at {st.data['finished_at']} — "
                 "nothing to resume (host launcher will push + open PR)")
@@ -68961,8 +68973,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # `main()` below, whichever statement it comes from, is seen by the one
     # owner of the death record (DESIGN §6 *A run that died says so*). Not a
     # `--phase` verb's: it analyses a run and never continues it, so it
-    # neither clears a death nor records one.
-    if not args.phase:
+    # neither clears a death nor records one. Nor a `resume` of a run that
+    # completed: it has nothing to continue, so its death is the
+    # invocation's alone and a finished run stays listed as finished.
+    if not (args.phase or (args.resume and _run_has_nothing_left(st.data))):
         _own_the_run_death_record(st.run_dir)
     # The run is this process's from here (its flock is held): tell the
     # launcher which one, for the bring-back after the container exits

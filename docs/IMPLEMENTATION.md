@@ -2994,7 +2994,11 @@ The push choice has a second record, `run.json.no_push`. It is the intent
 the host reads (`not push_will_happen(no_push, host_no_push)`). `main()`
 writes it on every non-`--phase` invocation, after the continuation. The
 launcher resolves its own `NO_PUSH` as follows: `--no-push`, then `--push`,
-then (on `resume` with a run id) `run.json.no_push`, then `LEERIE_NO_PUSH`
+then (on `resume`) `run.json.no_push` of the run it resumes — the id on
+the command line, or for a bare `resume` on the local runtime the one the
+launcher gets by loading `orchestrator/leerie.py` host-side and calling its
+`resolve_run_id(<state root>, None, resumable_only=True)` —
+then `LEERIE_NO_PUSH`
 and `no_push` in `leerie.toml`. `--no-push` wins over `--push` in both the
 launcher and the orchestrator. On Fly the in-Machine orchestrator always
 receives `--no-push` as a mechanism flag, and `--host-no-push` carries the
@@ -11799,7 +11803,7 @@ discovery without parsing the full `state.json`):
 | `brought_back_sha` | str | written by the host only (`host_bring_back_run_branch`): the run-branch commit leerie last brought back from `<run-dir>/repo` into the user's repository — the compare-and-swap's expected value. |
 | `started_at` | ISO-8601 str | wall-clock start time (also mirrored in `state.json`) |
 | `finished_at` | ISO-8601 str \| null | wall-clock end time. Set at finalize success, or by the `except SystemExit` handler in `main()` for `die()` exits after the run directory exists (on Fly, the tail wrapper propagates the exit code). Idempotent on `resume`. |
-| `failed_at` | ISO-8601 str \| null | when the run's last invocation died (DESIGN §6 *A run that died says so*). Written by `_record_run_died(run_dir)`, whose one caller is `_records_the_run_death`, the decorator wrapping `main()`: it records when an exception leaves `main()` after `_own_the_run_death_record(st.run_dir)` armed it — right after the `State` is acquired and the layout refusal, for every verb but `--phase` — and `_is_a_death` holds (a `SystemExit` with a code other than 0 and `EXIT_NEEDS_ANSWERS`, or any exception but `KeyboardInterrupt` / `InterruptedBySignal`). `main()` returns its exit code for a pause, an interrupt and a completion, and the decorator exits with it, so none of those is recorded. `_own_the_run_death_record` first calls `_clear_run_died(run_dir)`, which sets it to null. Pinned by `tests/test_main_exception_arms.py::TestEveryExitOfTheRunIsSeen`. `_derive_run_status` reads it (`failed`, and `incomplete` mid-wave). |
+| `failed_at` | ISO-8601 str \| null | when the run's last invocation died (DESIGN §6 *A run that died says so*). Written by `_record_run_died(run_dir)`, whose one caller is `_records_the_run_death`, the decorator wrapping `main()`: it records when an exception leaves `main()` after `_own_the_run_death_record(st.run_dir)` armed it — right after the `State` is acquired and the layout refusal, for every verb but `--phase`, and on `resume` only when `_run_has_nothing_left(st.data)` is false (a run that completed — `no_work_required`, or `finished_at` with `current_phase == "phase 6: finalize"`, the same predicate `_run_phases`' "nothing to resume" short-circuit uses — is neither cleared nor recorded by a no-op resume; pinned by `TestACompletedRunStaysCompleted`) — and `_is_a_death` holds (a `SystemExit` with a code other than 0 and `EXIT_NEEDS_ANSWERS`, or any exception but `KeyboardInterrupt` / `InterruptedBySignal`). `main()` returns its exit code for a pause, an interrupt and a completion, and the decorator exits with it, so none of those is recorded. `_own_the_run_death_record` first calls `_clear_run_died(run_dir)`, which sets it to null. Pinned by `tests/test_main_exception_arms.py::TestEveryExitOfTheRunIsSeen`. `_derive_run_status` reads it (`failed`, and `incomplete` mid-wave). |
 | `task` | str | the task description (mirrored from `state.json`) |
 | `task_sha256` | str | sha256 of the resolved task text, written at run start. Two launches of byte-identical task text are otherwise invisible to each other and can produce incompatible branches; `_live_duplicate_runs` refuses a duplicate unless `LEERIE_ALLOW_DUPLICATE_TASK=1`. |
 | `pushed_at` | ISO-8601 str \| null | when the run branch was pushed to `origin`; null until push runs |

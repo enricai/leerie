@@ -788,8 +788,12 @@ class TestEveryExitOfTheRunIsSeen:
         between = main.body[acquire[0] + 1:arm[0]]
         assert all(calls(s, "_refuse_other_run_layout") for s in between)
         assert len(between) == 1
-        # Disarmed only for `--phase`, which never continues the run.
-        assert ast.unparse(main.body[arm[0]].test) == "not args.phase"
+        # Disarmed only for `--phase`, which never continues the run, and
+        # for a `resume` of a run that completed (TestACompletedRunStays-
+        # Completed executes both faces).
+        assert ast.unparse(main.body[arm[0]].test) == (
+            "not (args.phase or (args.resume and "
+            "_run_has_nothing_left(st.data)))")
 
         # Every exit after the arm is a raise the owner classifies or a
         # returned code: no `sys.exit`/`os._exit` that would make a pause
@@ -849,3 +853,68 @@ class TestEveryExitOfTheRunIsSeen:
             leerie.main()
         assert not T()._run_json(repo, "ctrl-c-at-entry").get("failed_at")
         assert T._status(leerie, repo, "ctrl-c-at-entry") == "in-progress"
+
+
+class TestACompletedRunStaysCompleted:
+    """DESIGN §6 *A run that died says so* (review round 24, L1): an
+    invocation's death is a fact about the invocation, the run's status a
+    fact about the run. A `resume` of a run that completed has nothing to
+    continue, so a death of it (an argv typo caught by a resolver) does not
+    relabel the run `failed`; a resume of a run with work left that dies the
+    same way still does. Real `main()`, real resolver: `--worker-memory-max
+    bogus` dies after the `State` is taken, where the arm sits."""
+
+    @staticmethod
+    def _seed(leerie, monkeypatch, repo, run_id, *, finalized):
+        T = TestListShowsADeath
+        held: list = []
+
+        def then():
+            st = held[0]
+            if finalized:
+                st.data.update(finished_at=leerie.now(),
+                               current_phase="phase 6: finalize")
+                st.save()
+                leerie._write_run_json(st.run_dir, finished_at=leerie.now())
+        _run_main(leerie, monkeypatch, repo, run_id,
+                  orchestrate_stub=T._seeded(leerie, then, held))
+        held[0].release_lock()
+
+    @staticmethod
+    def _resume_with_a_bad_flag(leerie, monkeypatch, run_id):
+        async def _unreached(*a, **kw):
+            raise AssertionError("the resolver should have died first")
+        monkeypatch.setattr(leerie, "_orchestrate", _unreached)
+        monkeypatch.setattr(sys, "argv", ["leerie", "resume", run_id,
+                                          "--worker-memory-max", "bogus"])
+        with pytest.raises(SystemExit) as e:
+            leerie.main()
+        assert e.value.code == 1
+
+    def test_a_finished_run_stays_done_after_a_dying_no_op_resume(
+            self, leerie, monkeypatch, repo):
+        T = TestListShowsADeath
+        self._seed(leerie, monkeypatch, repo, "finished", finalized=True)
+        assert T._status(leerie, repo, "finished") == "done"
+        self._resume_with_a_bad_flag(leerie, monkeypatch, "finished")
+        assert not T()._run_json(repo, "finished").get("failed_at")
+        assert T._status(leerie, repo, "finished") == "done"
+
+    def test_a_run_with_work_left_lists_failed_after_the_same_death(
+            self, leerie, monkeypatch, repo):
+        T = TestListShowsADeath
+        self._seed(leerie, monkeypatch, repo, "mid-run", finalized=False)
+        assert T._status(leerie, repo, "mid-run") == "in-progress"
+        self._resume_with_a_bad_flag(leerie, monkeypatch, "mid-run")
+        assert T()._run_json(repo, "mid-run")["failed_at"]
+        assert T._status(leerie, repo, "mid-run") == "failed"
+
+    def test_a_died_finalize_is_work_left(self, leerie):
+        # `die()` stamps `finished_at` for discovery but leaves the phase
+        # where it died: that run is not complete, so its resume is armed.
+        assert not leerie._run_has_nothing_left(
+            {"finished_at": "t", "current_phase": "phase 5: execute"})
+        assert leerie._run_has_nothing_left(
+            {"finished_at": "t", "current_phase": "phase 6: finalize"})
+        assert leerie._run_has_nothing_left({"no_work_required": True})
+        assert not leerie._run_has_nothing_left({})

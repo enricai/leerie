@@ -193,11 +193,18 @@ def test_phase_finalize_survives_a_cleanup_sh_timeout(
 def test_resume_completion_guard_keys_on_current_phase(leerie):
     """The resume completion guard (in _run_phases) treats a run as
     terminal when finished_at is set AND current_phase == "phase 6:
-    finalize". This test pins that the guard reads current_phase — the
-    discriminator the Fix-1 ordering change relies on. If the guard stopped
-    consulting current_phase, the ordering fix would be silently defeated."""
+    finalize" — `_run_has_nothing_left`, which `main()` also reads to leave
+    a completed run's death record unarmed. This test pins that the guard
+    goes through it and that it reads current_phase — the discriminator the
+    Fix-1 ordering change relies on. If the guard stopped consulting
+    current_phase, the ordering fix would be silently defeated."""
     src = inspect.getsource(leerie._run_phases)
-    assert '"phase 6: finalize"' in src and "finished_at" in src, (
+    assert "_run_has_nothing_left(st.data)" in src
+    done = {"finished_at": "t", "current_phase": "phase 6: finalize"}
+    died_in_finalize = {"finished_at": "t",
+                        "current_phase": "phase 5: execute"}
+    assert leerie._run_has_nothing_left(done)
+    assert not leerie._run_has_nothing_left(died_in_finalize), (
         "the resume completion guard must key on finished_at AND "
         'current_phase == "phase 6: finalize"; the Fix-1 ordering change '
         "depends on current_phase distinguishing a died finalize from a "

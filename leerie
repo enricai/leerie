@@ -5821,11 +5821,41 @@ fi
 # A resumed run continues under the push choice it was started with (DESIGN
 # §6 *A resumed run continues under the choices it was started with*):
 # --no-push / --push on this command line, else the run's recorded
-# run.json.no_push, else the env / leerie.toml resolved above. Without a run
-# id the record is unknown here; host_finalize still honours run.json.no_push.
+# run.json.no_push, else the env / leerie.toml resolved above. The record is
+# that of the run this resume continues: the id on the command line or, for a
+# bare `resume` on the local runtime, the run the orchestrator will pick —
+# asked of its own `resolve_run_id` here, host-side over the same state root,
+# not re-implemented (review round 24, L2: deciding the push before knowing
+# the run refused a bare resume of a --no-push run without `origin`). The
+# container still names the run it actually ran, and host_finalize still
+# honours that run's run.json.no_push. `_resume_run_id` is used for this read
+# only: LEERIE_RUN_ID stays what the command line said.
+_resume_run_id="$LEERIE_RUN_ID"
+if [ -z "$_NO_PUSH_CLI" ] && [ "$IS_RESUME" = "true" ] \
+   && [ -z "$_resume_run_id" ] && [ "$RUNTIME" = "local" ]; then
+  _resume_run_id="$(python3 -B - "$LEERIE_REPO/orchestrator/leerie.py" \
+      "$LEERIE_STATE_HOST_DIR" <<'PY' 2>/dev/null || true
+import contextlib, importlib.util, io, pathlib, sys
+spec = importlib.util.spec_from_file_location("leerie_orch", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+out = sys.stdout
+# The pick's own log line and any die() message belong to the orchestrator's
+# run in the container, which makes the same pick and says so there.
+with contextlib.redirect_stdout(io.StringIO()), \
+        contextlib.redirect_stderr(io.StringIO()):
+    try:
+        spec.loader.exec_module(m)
+        picked = m.resolve_run_id(pathlib.Path(sys.argv[2]), None,
+                                  resumable_only=True)
+    except BaseException:
+        picked = ""
+out.write(picked)
+PY
+)"
+fi
 if [ -n "$_NO_PUSH_CLI" ]; then
   NO_PUSH="$_NO_PUSH_CLI"
-elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
+elif [ "$IS_RESUME" = "true" ] && [ -n "$_resume_run_id" ]; then
   _recorded_no_push="$(python3 -c '
 import json, sys
 try:
@@ -5833,7 +5863,7 @@ try:
     print({True: "true", False: "false"}.get(v, "") if isinstance(v, bool) else "")
 except Exception:
     pass
-' "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json")"
+' "$LEERIE_STATE_HOST_DIR/runs/$_resume_run_id/run.json")"
   if [ -n "$_recorded_no_push" ]; then
     if [ "$_recorded_no_push" != "$NO_PUSH" ]; then
       remote_log "resume: continuing the run's recorded push choice (no_push=$_recorded_no_push); pass --push or --no-push to override"
@@ -5842,7 +5872,7 @@ except Exception:
   fi
   unset _recorded_no_push
 fi
-unset _NO_PUSH_CLI
+unset _NO_PUSH_CLI _resume_run_id
 
 # Parse --no-verify and export NO_VERIFY_PUSH here, BEFORE
 # provision_machine registers the EXIT trap. The trap's clean-exit
