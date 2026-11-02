@@ -81,11 +81,11 @@ def test_read_beneath_refuses_a_link_and_a_fifo(leerie, tmp_path):
     (tmp_path / "a").mkdir()
     (tmp_path / "a" / "r").symlink_to(secret)
     with pytest.raises(OSError):
-        leerie._read_beneath(tmp_path / "a", tmp_path / "a" / "r")
+        leerie._read_beneath(tmp_path / "a", tmp_path / "a" / "r", limit=64)
     os.mkfifo(tmp_path / "a" / "p")
     # Refused at once, never waited on for a writer.
     with pytest.raises(OSError):
-        leerie._read_beneath(tmp_path / "a", tmp_path / "a" / "p")
+        leerie._read_beneath(tmp_path / "a", tmp_path / "a" / "p", limit=64)
 
 
 def test_mkdir_private_replaces_a_planted_link_with_a_directory(leerie,

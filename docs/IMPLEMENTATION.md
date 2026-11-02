@@ -4517,14 +4517,16 @@ link:
   `.leerie-<hex>` made `O_CREAT|O_EXCL|O_NOFOLLOW` in the directory's
   descriptor, written, `fchmod` to `mode` (default the replaced regular
   file's mode, else 0o666 less the umask), renamed over `path.name`.
-- `_read_beneath(anchor, path) -> bytes` (`O_NOFOLLOW|O_NONBLOCK`; a
-  non-regular file raises), `_lexists_beneath(anchor, path) -> bool` (a
+- `_read_beneath(anchor, path, *, limit) -> bytes` (`O_NOFOLLOW|O_NONBLOCK`; a
+  non-regular file raises, so does one over `limit`; § *Leerie's reads of a
+  repository's content* below), `_lexists_beneath(anchor, path) -> bool` (a
   link or non-directory on the way counts as taken), `_unlink_beneath`,
   `_remove_beneath` (a directory through `_rmtree_owned` of
   `/proc/self/fd/<dirfd>/<name>`), `_rmdirs_beneath` (`os.removedirs` up to
-  the anchor), `_copy_beneath(src, anchor, dst, *, src_anchor=None)` (with
-  `src`'s mode; `src_anchor` reads `src` through `_read_beneath`),
-  `_copytree_beneath(src, anchor, dst, *, ignore=None)` (links copied as
+  the anchor), `_copy_beneath(src, anchor, dst, *, src_anchor=None, limit=None)`
+  (with `src`'s mode; `src_anchor` reads `src` through `_read_beneath`
+  within `limit`), `_copytree_beneath(src, anchor, dst, *, ignore=None,
+  src_anchor=None, limit=None)` (links copied as
   links), `_copy_out_of_tree(tree, src, names, dest)` (copies out of a
   tree, a link never followed: `_populate_leerie_store`'s staging).
 - `_add_dir_bits_beneath(anchor, rel, bits)` — the owner bits on `anchor`
@@ -4560,7 +4562,24 @@ read side of the family above, anchored at the repository's root (`/work`,
 a worker's tree, a tree repository, a measurement's tree, a subtask's
 notes directory):
 
-- `_read_text_beneath(anchor, path, *, errors="replace") -> str` —
+- `_read_beneath(anchor, path, *, limit: int) -> bytes` — the regular
+  file reached without a link; `limit` has no default. After the open,
+  `fstat` on the descriptor: a file over `limit` bytes is refused
+  (`OSError` `EFBIG`, which every caller already treats as unreadable), and
+  the read takes at most `limit + 1` bytes in 1 MiB chunks, refusing the
+  file if it grew past `limit`. `_read_head_beneath(anchor, path, *,
+  limit)` returns at most the first `limit` bytes instead, for a caller
+  that uses only the start (`_read_file_safely`, the binary probe in
+  `_introduced_conflict_markers`). DESIGN §6 *No read is unbounded*.
+- The limits, by what the file is: `READ_LIMIT_CONFIG = 1 MiB`
+  (configuration, manifests, version pins, CI files, git's admin files, a
+  checkpoint, a `.gitignore`, a measurement's id file), `READ_LIMIT_TEXT =
+  16 MiB` (text read whole: a task file or reference, a source file parsed
+  or counted, a README, a held-out or test file copied out of a tree) and
+  `READ_LIMIT_LARGE = 256 MiB` (a measurement's own report: a JSON test
+  report, a coverage map or summary; a copy of the operator's untracked
+  files into the planning worktree).
+- `_read_text_beneath(anchor, path, *, limit, errors="replace") -> str` —
   `_read_beneath` decoded as UTF-8 (`errors="strict"` where the caller
   parses JSON or TOML and treats a decode error as unreadable).
 - `_no_link_beneath(anchor, path) -> bool` — exists, and neither it nor a
@@ -4569,8 +4588,9 @@ notes directory):
   `_listdir_beneath(anchor, path) -> list[str]` (the directory reached
   without a link; `OSError` otherwise); `_glob_beneath(anchor, pattern)
   -> list[Path]` (`anchor.glob`, sorted, filtered by `_no_link_beneath`).
-- `_copy_beneath(..., src_anchor=)` and `_copytree_beneath(...,
-  src_anchor=)` read the source beneath `src_anchor`.
+- `_copy_beneath(..., src_anchor=, limit=)` and `_copytree_beneath(...,
+  src_anchor=, limit=)` read the source beneath `src_anchor`, each file
+  within `limit` (required with `src_anchor`: a `TypeError` without it).
 
 The PR template is a git blob: `_find_pr_template(git_dir, rev,
 override=None) -> (rel, text, truncated) | None` lists

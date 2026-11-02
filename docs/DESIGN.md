@@ -3328,6 +3328,19 @@ content reached through a path the repository shapes:
 The functions that read a repository's content use no raw primitive
 (`tests/test_leerie_reads_never_follow_links.py`).
 
+**No read is unbounded.** The orchestrator is unconfined. A worker can make a
+sparse file of a terabyte at no disk cost (`truncate -s 1T`) in its tree, its
+notes or a measurement's output. A read of the whole file then cost the
+orchestrator that much memory: `MemoryError` past RAM and swap, which no caller
+caught, and below that the container's OOM killer (review round 27, isolation
+I3). Every read of a repository's file states its limit. The descriptor's size
+is checked after the open, and a file over the limit is refused like a link
+(`OSError` `EFBIG`). The read takes at most one byte more than the limit, so a
+file that grows after the check is refused too. A caller that uses only the
+start of a file reads only that much (`_read_head_beneath`). The limits are
+named, by what the file is: configuration, text read whole, and a measurement's
+report or a copy of the operator's files.
+
 ### No host path comes from a repository
 
 *Designed 2026-11-02 (review round 27, isolation I6).*

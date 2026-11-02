@@ -6076,7 +6076,7 @@ def _reads_package_manager(tree: str | Path, wd: str) -> bool:
     corepack honours over the seeded default."""
     try:
         pj = json.loads(_read_text_beneath(
-            Path(tree), Path(tree) / wd / "package.json", errors="strict"))
+            Path(tree), Path(tree) / wd / "package.json", errors="strict", limit=READ_LIMIT_CONFIG))
     except (OSError, ValueError):
         return False
     return bool(isinstance(pj, dict) and pj.get("packageManager"))
@@ -8221,7 +8221,7 @@ def _read_toml_key(path: Path, key: str) -> str | None:
     root = path.parent.parent if path.parent.name == ".leerie" \
         else path.parent
     try:
-        text = _read_text_beneath(root, path, errors="strict")
+        text = _read_text_beneath(root, path, errors="strict", limit=READ_LIMIT_CONFIG)
     except (OSError, ValueError):
         return None
     for raw in text.splitlines():
@@ -8267,7 +8267,7 @@ def _task_file_text(p: Path) -> str:
         _beneath_parts(cwd, p)
     except OSError:
         return p.read_text()
-    return _read_text_beneath(cwd, cwd / p, errors="strict")
+    return _read_text_beneath(cwd, cwd / p, errors="strict", limit=READ_LIMIT_TEXT)
 
 
 def resolve_task_argument(raw: str) -> str:
@@ -10746,7 +10746,7 @@ def _admin_dir_of(common: Path, tree: Path) -> Path | None:
     for d in dirs:
         try:
             got = _read_text_beneath(common, d / "gitdir",
-                                     errors="strict").strip()
+                                     errors="strict", limit=READ_LIMIT_CONFIG).strip()
         except (OSError, ValueError):
             continue
         if os.path.realpath(os.path.dirname(got)) == want:
@@ -10790,7 +10790,7 @@ def _run_tree_location(tree: str | Path
         return False
     try:
         named = _read_text_beneath(common, admin / "commondir",
-                                   errors="strict").strip()
+                                   errors="strict", limit=READ_LIMIT_CONFIG).strip()
     except (OSError, ValueError):
         return False
     if os.path.realpath(admin / named) != os.path.realpath(common):
@@ -11613,9 +11613,9 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                         _copytree_beneath(
                             src, wt, dst,
                             ignore=_ignore_repo_paths(repo_root, skip),
-                            src_anchor=repo_root)
+                            src_anchor=repo_root, limit=READ_LIMIT_LARGE)
                     else:
-                        _copy_beneath(src, wt, dst, src_anchor=repo_root)
+                        _copy_beneath(src, wt, dst, src_anchor=repo_root, limit=READ_LIMIT_LARGE)
                     staged += 1
                 except Exception:
                     continue
@@ -11626,7 +11626,7 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
             try:
                 _copytree_beneath(claude_src, wt, claude_dst,
                                   ignore=_ignore_repo_paths(repo_root, skip),
-                                  src_anchor=repo_root)
+                                  src_anchor=repo_root, limit=READ_LIMIT_LARGE)
                 staged += 1
             except Exception:
                 pass
@@ -13877,7 +13877,7 @@ def _subfile_split(subtask: dict, repo_root: Path,
         abs_path = repo_root / file
         try:
             total_lines = _read_text_beneath(
-                repo_root, abs_path).count("\n") + 1
+                repo_root, abs_path, limit=READ_LIMIT_TEXT).count("\n") + 1
         except OSError:
             return []  # file unreadable — can't region-split; leave as leaf
         if total_lines <= max_span:
@@ -13959,7 +13959,7 @@ def _peel_oversized_file(subtask: dict, repo_root: Path,
     def _line_count(f: str) -> int:
         try:
             return _read_text_beneath(
-                repo_root, repo_root / f).count("\n") + 1
+                repo_root, repo_root / f, limit=READ_LIMIT_TEXT).count("\n") + 1
         except OSError:
             return 0  # unreadable → treat as not-oversized (leaf-safe)
 
@@ -15904,7 +15904,7 @@ def _is_same_document(root: Path, path: Path, text_len: int,
     try:
         if abs(path.lstat().st_size - text_len) > 8:
             return False
-        return _read_text_beneath(root, path).strip() == text
+        return _read_text_beneath(root, path, limit=READ_LIMIT_TEXT).strip() == text
     except (OSError, ValueError):
         return False
 
@@ -16157,7 +16157,7 @@ def _parse_repo_file(root: Path, path: Path) -> tuple[list[str], list[str]]:
         lang = tslp.detect_language(str(path))
         if not lang:
             return [], []
-        source = _read_text_beneath(root, path)
+        source = _read_text_beneath(root, path, limit=READ_LIMIT_TEXT)
         proc_result = tslp.process(
             source,
             tslp.ProcessConfig(language=lang, structure=True, imports=False),
@@ -16210,7 +16210,7 @@ def _extract_symbol_ranges(root: Path,
         lang = tslp.detect_language(str(path))
         if not lang:
             return []
-        source = _read_text_beneath(root, path)
+        source = _read_text_beneath(root, path, limit=READ_LIMIT_TEXT)
         proc_result = tslp.process(
             source,
             tslp.ProcessConfig(language=lang, structure=True, imports=False),
@@ -18052,7 +18052,7 @@ def _workspace_globs(repo_root: Path) -> list[str]:
         try:
             in_packages = False
             for line in _read_text_beneath(repo_root, ws,
-                                           errors="strict").splitlines():
+                                           errors="strict", limit=READ_LIMIT_CONFIG).splitlines():
                 bare = line.split("#", 1)[0].rstrip()
                 if not bare.strip():
                     continue
@@ -18068,7 +18068,7 @@ def _workspace_globs(repo_root: Path) -> list[str]:
             pass
     try:
         pkg = json.loads(_read_text_beneath(
-            repo_root, repo_root / "package.json", errors="strict"))
+            repo_root, repo_root / "package.json", errors="strict", limit=READ_LIMIT_CONFIG))
         w = pkg.get("workspaces") if isinstance(pkg, dict) else None
         if isinstance(w, dict):
             w = w.get("packages")
@@ -18545,7 +18545,7 @@ def _gather_dep_manifests(repo_root: Path) -> str:
     for name in _DEP_MANIFEST_NAMES:
         p = repo_root / name
         try:
-            text = _read_text_beneath(repo_root, p)
+            text = _read_text_beneath(repo_root, p, limit=READ_LIMIT_CONFIG)
         except OSError:
             continue
         if len(text.encode()) > _DEPCAP_MANIFEST_FILE_BUDGET:
@@ -18637,7 +18637,7 @@ def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
     root = cfg_path.parent.parent if cfg_path.parent.name == ".leerie" \
         else cfg_path.parent
     try:
-        lines = _read_text_beneath(root, cfg_path).splitlines(keepends=True)
+        lines = _read_text_beneath(root, cfg_path, limit=READ_LIMIT_CONFIG).splitlines(keepends=True)
     except OSError as e:
         # Absent, or a link at the file itself, which the write below
         # replaces; a link on the way (ENOTDIR, or ELOOP at `.leerie`)
@@ -19584,12 +19584,14 @@ def _extract_readme_sections(text: str) -> str:
 
 
 def _read_file_safely(root: Path, path: Path, budget: int) -> str:
-    """Read a file of the repository at `root` with a byte ceiling,
-    swallowing missing-file and decode errors, and refusing a link
-    (`_read_text_beneath`). Used by _gather_provision_fixtures to assemble
-    the fixture dict from optional repo files."""
+    """Read a file of the repository at `root` with a character ceiling,
+    swallowing missing-file and decode errors, and refusing a link. Only the
+    start is read (`_read_head_beneath`): `budget` characters of UTF-8 lie
+    within `4 * budget` bytes. Used by _gather_provision_fixtures to
+    assemble the fixture dict from optional repo files."""
     try:
-        return _read_text_beneath(root, path)[:budget]
+        return _read_head_beneath(root, path, limit=4 * budget).decode(
+            "utf-8", "replace")[:budget]
     except (OSError, UnicodeError):
         return ""
 
@@ -19722,7 +19724,7 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
                 # rather than deriving from the same truncated buffer used
                 # for the extract itself.
                 try:
-                    full_text = _read_text_beneath(repo_root, rp)
+                    full_text = _read_text_beneath(repo_root, rp, limit=READ_LIMIT_TEXT)
                 except (OSError, UnicodeError):
                     full_text = raw
                 out["readme_sections_unseen"] = max(
@@ -19865,10 +19867,11 @@ def _validate_checkpoint(path: str,
     try:
         content = _read_text_beneath(
             p.parent if notes_dir is None else Path(notes_dir), p,
-            errors="strict")
+            errors="strict", limit=READ_LIMIT_CONFIG)
     except (OSError, ValueError) as e:
-        return (f"checkpoint {path} is not a regular file in this subtask's "
-                f"notes directory: {e}")
+        return (f"checkpoint {path} is not a readable regular file of at "
+                f"most {READ_LIMIT_CONFIG} bytes in this subtask's notes "
+                f"directory: {e}")
 
     missing = [s for s in _CHECKPOINT_SECTIONS if s not in content]
     if missing:
@@ -20339,7 +20342,8 @@ async def _introduced_conflict_markers(
                  if entry.startswith("-\t-\t")]
     for path in unchecked:
         try:
-            if b"\0" in _read_beneath(worktree, worktree / path)[:8000]:
+            if b"\0" in _read_head_beneath(worktree, worktree / path,
+                                            limit=8000):
                 continue
         except OSError:  # deleted by the rebase, or a link
             continue
@@ -23512,7 +23516,7 @@ def _restore_git_pointer(tree: str | Path) -> bool:
         st = None
     if st is not None and stat.S_ISREG(st.st_mode):
         try:
-            text = _read_text_beneath(t, dot)
+            text = _read_text_beneath(t, dot, limit=READ_LIMIT_CONFIG)
         except OSError:
             text = ""
         if (text.startswith("gitdir: ") and os.path.realpath(
@@ -24566,26 +24570,67 @@ def _write_beneath(anchor: Path, path: Path, data: bytes, *,
             raise
 
 
-def _read_beneath(anchor: Path, path: Path) -> bytes:
-    """The bytes of the regular file `path` beneath `anchor`, reached
-    without following a link (`OSError` otherwise, a FIFO included: it is
-    opened non-blocking and refused, never waited on)."""
+# How much of a repository's file leerie reads, by what the file is (DESIGN §6
+# *No read is unbounded*): a worker makes a terabyte sparse file at no disk
+# cost, and the orchestrator is unconfined. Every read states one.
+READ_LIMIT_CONFIG = 1 << 20      # configuration, manifests, pins, git admin
+READ_LIMIT_TEXT = 16 << 20       # text read whole: sources, task files
+READ_LIMIT_LARGE = 256 << 20     # a measurement's report; the operator's files
+_READ_CHUNK = 1 << 20
+
+
+def _read_regular_beneath(anchor: Path, path: Path, limit: int, *,
+                          whole: bool) -> bytes:
+    """At most `limit` bytes of the regular file `path` beneath `anchor`,
+    reached without following a link (`OSError` otherwise, a FIFO included:
+    it is opened non-blocking and refused, never waited on). `whole`: a file
+    over `limit` is refused (`EFBIG`), by its size after the open and by
+    what the read finds, so one that grows after the check is refused too;
+    otherwise its first `limit` bytes are the answer."""
     path = Path(path)
     with _dir_beneath(anchor, path.parent) as dfd:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                      | os.O_CLOEXEC, dir_fd=dfd)
         with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
                 raise OSError(errno.EINVAL, f"{path} is not a regular file")
-            return f.read()
+            if whole and st.st_size > limit:
+                raise OSError(errno.EFBIG, f"{path} is over {limit} bytes")
+            want = limit + 1 if whole else limit
+            chunks: list[bytes] = []
+            got = 0
+            while got < want:
+                b = f.read(min(_READ_CHUNK, want - got))
+                if not b:
+                    break
+                chunks.append(b)
+                got += len(b)
+            if whole and got > limit:
+                raise OSError(errno.EFBIG, f"{path} is over {limit} bytes")
+            return b"".join(chunks)
 
 
-def _read_text_beneath(anchor: Path, path: Path, *,
+def _read_beneath(anchor: Path, path: Path, *, limit: int) -> bytes:
+    """The bytes of the regular file `path` beneath `anchor`, reached
+    without following a link, refused (`OSError` `EFBIG`) over `limit`
+    bytes (DESIGN §6 *No read is unbounded*)."""
+    return _read_regular_beneath(anchor, path, limit, whole=True)
+
+
+def _read_head_beneath(anchor: Path, path: Path, *, limit: int) -> bytes:
+    """The first `limit` bytes of the regular file `path` beneath `anchor`,
+    reached without following a link: for a caller that uses only the
+    start of a file."""
+    return _read_regular_beneath(anchor, path, limit, whole=False)
+
+
+def _read_text_beneath(anchor: Path, path: Path, *, limit: int,
                        errors: str = "replace") -> str:
     """`_read_beneath`, decoded as UTF-8: a repository's file read without
     following a link (DESIGN §6 *Leerie never reads through a link a
-    repository holds*)."""
-    return _read_beneath(anchor, path).decode("utf-8", errors)
+    repository holds*), within `limit` bytes."""
+    return _read_beneath(anchor, path, limit=limit).decode("utf-8", errors)
 
 
 def _no_link_beneath(anchor: Path, path: Path) -> bool:
@@ -24746,12 +24791,16 @@ def _rmdirs_beneath(anchor: Path, path: Path) -> None:
 
 
 def _copy_beneath(src: Path, anchor: Path, dst: Path, *,
-                  src_anchor: Path | None = None) -> None:
+                  src_anchor: Path | None = None,
+                  limit: int | None = None) -> None:
     """Copy the file `src` to `dst` beneath `anchor` (`_write_beneath`),
     with its mode. `src_anchor`: `src` lies where confined code writes too,
-    and is read without following a link (`_read_beneath`)."""
+    and is read without following a link (`_read_beneath`), within `limit`
+    bytes, which such a copy must state."""
     if src_anchor is not None:
-        data = _read_beneath(src_anchor, src)
+        if limit is None:
+            raise TypeError("a copy read beneath src_anchor states its limit")
+        data = _read_beneath(src_anchor, src, limit=limit)
         with _dir_beneath(src_anchor, Path(src).parent) as sfd:
             m = os.stat(Path(src).name, dir_fd=sfd,
                         follow_symlinks=False).st_mode
@@ -24764,7 +24813,8 @@ def _copy_beneath(src: Path, anchor: Path, dst: Path, *,
 def _copytree_beneath(src: Path, anchor: Path, dst: Path, *,
                       ignore: Callable[[str, list[str]], Iterable[str]]
                       | None = None,
-                      src_anchor: Path | None = None) -> None:
+                      src_anchor: Path | None = None,
+                      limit: int | None = None) -> None:
     """`shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True,
     ignore=ignore)` with every write beneath `anchor` (`_write_beneath`): a
     link in `src` is copied as a link, never followed on either side.
@@ -24787,9 +24837,9 @@ def _copytree_beneath(src: Path, anchor: Path, dst: Path, *,
                 os.symlink(os.readlink(s), name, dir_fd=dfd)
         elif s.is_dir():
             _copytree_beneath(s, anchor, d, ignore=ignore,
-                              src_anchor=src_anchor)
+                              src_anchor=src_anchor, limit=limit)
         else:
-            _copy_beneath(s, anchor, d, src_anchor=src_anchor)
+            _copy_beneath(s, anchor, d, src_anchor=src_anchor, limit=limit)
 
 
 def _mkdir_private(path: Path, top: Path) -> None:
@@ -24944,7 +24994,7 @@ def _sweep_measure_dirs(root: Path) -> None:
         if not stale and id_file:
             try:
                 stale = _read_beneath(
-                    root.parent, Path(id_file)).decode().strip() != \
+                    root.parent, Path(id_file), limit=READ_LIMIT_CONFIG).decode().strip() != \
                     own.name.rsplit("-", 1)[-1]
             except (OSError, ValueError):
                 stale = True
@@ -25005,7 +25055,7 @@ def _measure_dir_at(run_dir: Path, tree: Path,
         # directories, or a fresh one.
         id_file = id_dir / _MEASURE_ID_FILE
         with contextlib.suppress(OSError, ValueError):
-            tid = _read_beneath(run_dir, id_file).decode().strip()
+            tid = _read_beneath(run_dir, id_file, limit=READ_LIMIT_CONFIG).decode().strip()
         if not _MEASURE_ID_RE.fullmatch(tid):
             tid = uuid.uuid4().hex[:16]
             with contextlib.suppress(OSError):
@@ -29160,7 +29210,7 @@ def _settings_file(path: Path, *, root: Path | None = None) -> dict:
     operator's own."""
     try:
         data = json.loads(
-            _read_text_beneath(root, path, errors="strict")
+            _read_text_beneath(root, path, errors="strict", limit=READ_LIMIT_CONFIG)
             if root is not None else path.read_text())
     except FileNotFoundError:
         return {}
@@ -31362,7 +31412,7 @@ def _go_already_pinned(repo_root: Path) -> bool:
     tv = repo_root / ".tool-versions"
     if _regular_file_beneath(repo_root, tv):
         try:
-            for line in _read_text_beneath(repo_root, tv).splitlines():
+            for line in _read_text_beneath(repo_root, tv, limit=READ_LIMIT_CONFIG).splitlines():
                 stripped = line.strip()
                 if stripped.startswith("#") or not stripped:
                     continue
@@ -31375,7 +31425,7 @@ def _go_already_pinned(repo_root: Path) -> bool:
     mt = _existing_mise_toml_path(repo_root)
     if mt is not None:
         try:
-            content = _read_text_beneath(repo_root, mt)
+            content = _read_text_beneath(repo_root, mt, limit=READ_LIMIT_CONFIG)
             # Cheap text-level check — TOML parsing here would pull in
             # tomllib but the heuristic is sufficient: any `go =` line
             # under a [tools] section indicates a pin.
@@ -31471,7 +31521,7 @@ def _read_idiomatic_pins(repo_root: Path,
         if not _regular_file_beneath(repo_root, path):
             continue
         try:
-            raw = _read_text_beneath(repo_root, path).strip()
+            raw = _read_text_beneath(repo_root, path, limit=READ_LIMIT_CONFIG).strip()
         except OSError:
             continue
         if not raw:
@@ -31489,7 +31539,7 @@ def _read_idiomatic_pins(repo_root: Path,
     tv = repo_root / ".tool-versions"
     if _regular_file_beneath(repo_root, tv):
         try:
-            content = _read_text_beneath(repo_root, tv)
+            content = _read_text_beneath(repo_root, tv, limit=READ_LIMIT_CONFIG)
         except OSError:
             content = ""
         for line in content.splitlines():
@@ -31565,7 +31615,7 @@ def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     if _go_already_pinned(repo_root):
         return None
     try:
-        text = _read_text_beneath(repo_root, gomod)
+        text = _read_text_beneath(repo_root, gomod, limit=READ_LIMIT_CONFIG)
     except OSError:
         return None
     m = _GO_MOD_VERSION_RE.search(text)
@@ -31587,7 +31637,7 @@ def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     existing_text: str | None = None
     if existing is not None:
         try:
-            existing_text = _read_text_beneath(repo_root, existing)
+            existing_text = _read_text_beneath(repo_root, existing, limit=READ_LIMIT_CONFIG)
         except OSError:
             existing_text = None
 
@@ -31914,7 +31964,7 @@ def _d1_report_sources(task: str, repo_root: Path) -> dict[str, str]:
                 log(f"  requirement coverage: {rel} is over "
                     f"{D1_REPORT_MAX_BYTES} bytes — not inlined")
                 continue
-            out[rel] = _read_text_beneath(repo_root, f)
+            out[rel] = _read_text_beneath(repo_root, f, limit=READ_LIMIT_TEXT)
         except OSError:
             continue
     return out
@@ -41899,7 +41949,7 @@ def _package_json_name(repo_root: Path) -> str | None:
     non-empty string."""
     try:
         data = json.loads(_read_text_beneath(
-            repo_root, repo_root / "package.json", errors="strict"))
+            repo_root, repo_root / "package.json", errors="strict", limit=READ_LIMIT_CONFIG))
     except (OSError, ValueError):
         return None
     name = data.get("name") if isinstance(data, dict) else None
@@ -41911,7 +41961,7 @@ def _package_json_scripts(repo_root: Path) -> dict[str, str]:
     unparseable. Pure JSON — no natural-language interpretation."""
     try:
         data = json.loads(_read_text_beneath(
-            repo_root, repo_root / "package.json", errors="strict"))
+            repo_root, repo_root / "package.json", errors="strict", limit=READ_LIMIT_CONFIG))
     except (OSError, ValueError):
         return {}
     scripts = data.get("scripts") if isinstance(data, dict) else None
@@ -46654,7 +46704,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         data: bytes | None = bytes(got) if place else None
         if not place:
             with contextlib.suppress(OSError):
-                data = _read_beneath(own, report)
+                data = _read_beneath(own, report, limit=READ_LIMIT_LARGE)
             with contextlib.suppress(OSError):
                 _unlink_beneath(own, report)
         ids = _runner_report_failing_ids(kind, data or None, str(tree))
@@ -47548,7 +47598,7 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
     if src is None or not _regular_file_beneath(tree, src):
         return ["source file missing or outside the repo"]
     try:
-        flat = _ci_flat(_read_text_beneath(tree, src))
+        flat = _ci_flat(_read_text_beneath(tree, src, limit=READ_LIMIT_CONFIG))
     except OSError:
         return ["source file unreadable"]
     cwd = _ci_safe_rel(tree, check.get("cwd") or ".")
@@ -47578,7 +47628,7 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
         for base in {cwd or tree, tree}:
             for m in CI_STRICT_MANIFESTS:
                 with contextlib.suppress(OSError):
-                    texts.append(_ci_flat(_read_text_beneath(tree, base / m)))
+                    texts.append(_ci_flat(_read_text_beneath(tree, base / m, limit=READ_LIMIT_CONFIG)))
         for t in strict:
             ft = _ci_flat(t)
             if ft and not t.startswith("-") and not any(
@@ -47597,7 +47647,7 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
                          "summary path or thresholds")
         else:
             try:
-                ctext = _ci_flat(_read_text_beneath(tree, cfg))
+                ctext = _ci_flat(_read_text_beneath(tree, cfg, limit=READ_LIMIT_CONFIG))
             except OSError:
                 ctext = ""
             for th in ths:
@@ -47728,7 +47778,7 @@ def _ci_coverage_pcts(summary: Path, tree: Path, cwd: str,
         # The measurement wrote it, in the tree: read beneath the tree,
         # never through a link the code under measurement left.
         data = json.loads(_read_text_beneath(Path(tree), Path(summary),
-                                             errors="strict"))
+                                             errors="strict", limit=READ_LIMIT_LARGE))
     except (OSError, ValueError):
         data = None
     for th in thresholds:
@@ -50498,7 +50548,7 @@ def _prisma_project(repo_root: str | Path) -> dict | None:
             if _regular_file_beneath(root, pkg):
                 try:
                     data = json.loads(_read_text_beneath(root, pkg,
-                                                         errors="strict"))
+                                                         errors="strict", limit=READ_LIMIT_CONFIG))
                 except (OSError, ValueError):
                     data = {}
                 deps = {**(data.get("dependencies") or {}),
@@ -50506,7 +50556,7 @@ def _prisma_project(repo_root: str | Path) -> dict | None:
                     if isinstance(data, dict) else {}
                 if any(p in deps for p in _PRISMA_PACKAGES):
                     try:
-                        text = _read_text_beneath(root, root / schema)
+                        text = _read_text_beneath(root, root / schema, limit=READ_LIMIT_TEXT)
                     except OSError:
                         text = ""
                     m = _PRISMA_PROVIDER_RE.search(text)
@@ -50528,7 +50578,7 @@ def _prisma_reset_scripts(repo_root: str | Path, project: dict) -> list[str]:
     pkg = Path(str(repo_root)) / project["dir"] / "package.json"
     try:
         scripts = (json.loads(_read_text_beneath(
-            Path(str(repo_root)), pkg, errors="strict")).get("scripts") or {})
+            Path(str(repo_root)), pkg, errors="strict", limit=READ_LIMIT_CONFIG)).get("scripts") or {})
     except (OSError, ValueError, AttributeError):
         return []
     out = []
@@ -50740,7 +50790,7 @@ def _prisma_mock_hits(repo: str | Path, rev: str, wt: Path,
         p = wt / f
         if not f.endswith(_JS_SRC_EXT) or not _regular_file_beneath(wt, p):
             continue
-        for m in _JS_MOCK_RE.finditer(_read_text_beneath(wt, p)):
+        for m in _JS_MOCK_RE.finditer(_read_text_beneath(wt, p, limit=READ_LIMIT_TEXT)):
             spec = m.group(1)
             if (_js_resolve(spec, f, allf, g["aliases"]) in client
                     or spec == "@prisma/client"
@@ -52146,7 +52196,7 @@ def _go_test_func_names(root: Path, path: Path) -> list[str]:
     """The test functions the Go test file `path` beneath `root` declares,
     or [] when unreadable or reached through a link."""
     try:
-        text = _read_text_beneath(root, path)
+        text = _read_text_beneath(root, path, limit=READ_LIMIT_TEXT)
     except OSError:
         return []
     return [n for n in _GO_TEST_FUNC_RE.findall(text) if n != "TestMain"]
@@ -52647,7 +52697,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     _rmtree_owned(dest)
     for rel in defect + control + support:
         # Read from the writer's checkout without following a link it left.
-        _copy_beneath(wt / rel, st.run_dir, dest / rel, src_anchor=wt)
+        _copy_beneath(wt / rel, st.run_dir, dest / rel, src_anchor=wt, limit=READ_LIMIT_TEXT)
     out.update(valid=True, dir=str(dest), defect_files=defect,
                control_files=control, support_files=support, cases=cases,
                modes=modes, base_failing_cases=base_failing,
@@ -53854,7 +53904,7 @@ def _verify_set_audit_case(case: dict, *, set_texts: dict[str, str],
                 and ".." not in Path(rel).parts
                 and _regular_file_beneath(tree, path)):
             with contextlib.suppress(OSError):
-                text = _read_text_beneath(tree, path)
+                text = _read_text_beneath(tree, path, limit=READ_LIMIT_TEXT)
         if not _audit_quote_in(text, pq.get("quote")):
             bad.append("prod_quote")
     if "task" in need and not _audit_quote_in(task_text,
@@ -53993,7 +54043,7 @@ def _copy_task_references(st: "State", wt: Path, task: str
         dst = wt / rel
         if not _lexists_beneath(wt, dst):
             with contextlib.suppress(OSError):
-                _copy_beneath(Path(f), wt, dst, src_anchor=st.repo_root)
+                _copy_beneath(Path(f), wt, dst, src_anchor=st.repo_root, limit=READ_LIMIT_LARGE)
                 copied.append(dst)
         refs.append(rel)
     return copied, refs
@@ -54117,7 +54167,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
                 set_texts[rel] = (Path(set_["dir"]) / rel).read_text(
                     errors="replace")
         task_text = task + "\n" + "\n".join(
-            _read_text_beneath(wt, wt / r) for r in refs
+            _read_text_beneath(wt, wt / r, limit=READ_LIMIT_TEXT) for r in refs
             if (wt / r).is_file())
         messages = {c["case"]: c["failure_message"] for c in failing}
         names = {c["case"] for c in failing}
@@ -57083,7 +57133,7 @@ def _checkout_ignorable(wt: Path, rel: str) -> bool:
     if not _lexists_beneath(wt, gi):
         return True
     try:
-        return (_read_beneath(wt, gi).decode().splitlines()[:1]
+        return (_read_beneath(wt, gi, limit=READ_LIMIT_CONFIG).decode().splitlines()[:1]
                 == [_CHECKOUT_IGNORE_TAG])
     except (OSError, UnicodeDecodeError):
         return False
@@ -57115,7 +57165,7 @@ def _checkout_ignore(wt: Path, rels: Iterable[str]) -> list[str]:
         # writes through a path confined code shaped*).
         gi = wt / d / ".gitignore"
         try:
-            lines = _read_beneath(wt, gi).decode(
+            lines = _read_beneath(wt, gi, limit=READ_LIMIT_CONFIG).decode(
                 errors="replace").splitlines()
         except OSError:
             lines = [_CHECKOUT_IGNORE_TAG, "/.gitignore"]
@@ -57167,7 +57217,7 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
         if not _lexists_beneath(wt, dst) and _regular_file_beneath(
                 st.repo_root, Path(f)):
             with contextlib.suppress(OSError):
-                _copy_beneath(Path(f), wt, dst, src_anchor=st.repo_root)
+                _copy_beneath(Path(f), wt, dst, src_anchor=st.repo_root, limit=READ_LIMIT_LARGE)
                 excludes.append(rel)
         if _lexists_beneath(wt, dst):
             refs.append(rel)
@@ -57274,7 +57324,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         try:
             # Read from the lane, which its falsifier wrote, without
             # following a link it left there.
-            Path(src).write_bytes(_read_beneath(lane, lane / rel))
+            Path(src).write_bytes(_read_beneath(lane, lane / rel, limit=READ_LIMIT_TEXT))
             place = ((src, rel),)
 
             async def _run(left: float) -> set[str] | None:
@@ -57339,7 +57389,7 @@ def _falsifier_save_probe(st: "State", lane: Path, i: int,
     dst_dir = st.run_dir / "acceptance" / "probes" / f"i{i}"
     try:
         _rmtree_owned(dst_dir)
-        _copy_beneath(lane / rel, st.run_dir, dst_dir / rel, src_anchor=lane)
+        _copy_beneath(lane / rel, st.run_dir, dst_dir / rel, src_anchor=lane, limit=READ_LIMIT_TEXT)
     except OSError:
         return None
     return {"dir": str(dst_dir), "file": rel}
@@ -61820,7 +61870,7 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
     real = os.path.realpath(tree)
     status = {t: False for t in tests}
     with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
-        for tr in json.loads(_read_beneath(own, report)).get(
+        for tr in json.loads(_read_beneath(own, report, limit=READ_LIMIT_LARGE)).get(
                 "testResults") or []:
             rel = os.path.relpath(os.path.realpath(tr.get("name") or ""),
                                   real)
@@ -61831,7 +61881,7 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
     if coverage:
         with contextlib.suppress(OSError, ValueError, AttributeError,
                                  TypeError, KeyError):
-            for path, d in json.loads(_read_beneath(own, cf)).items():
+            for path, d in json.loads(_read_beneath(own, cf, limit=READ_LIMIT_LARGE)).items():
                 rel = os.path.relpath(os.path.realpath(path), real)
                 lh: dict[int, int] = {}
                 for k, loc in (d.get("statementMap") or {}).items():
@@ -62986,7 +63036,7 @@ def _binary_install_source(name: str, worktree: str, st: "State") -> str:
     def _json(rel: str) -> dict:
         try:
             data = json.loads(_read_text_beneath(wt, wt / rel,
-                                                 errors="strict"))
+                                                 errors="strict", limit=READ_LIMIT_CONFIG))
         except (OSError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
@@ -63006,7 +63056,7 @@ def _binary_install_source(name: str, worktree: str, st: "State") -> str:
 
     def _lines(rel: str) -> list[str]:
         try:
-            return _read_text_beneath(wt, wt / rel).splitlines()
+            return _read_text_beneath(wt, wt / rel, limit=READ_LIMIT_CONFIG).splitlines()
         except OSError:
             return []
 

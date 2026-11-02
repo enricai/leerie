@@ -55,8 +55,8 @@ def test_read_text_beneath_refuses_a_link_at_the_file_and_on_the_way(
     (root / "ok").write_text("ok\n")
     for p in (root / "d" / "f", root / "ld" / "s"):
         with pytest.raises(OSError):
-            leerie._read_text_beneath(root, p)
-    assert leerie._read_text_beneath(root, root / "ok") == "ok\n"
+            leerie._read_text_beneath(root, p, limit=64)
+    assert leerie._read_text_beneath(root, root / "ok", limit=64) == "ok\n"
 
 
 def test_no_link_beneath_glob_and_listdir(leerie, tmp_path):
@@ -353,6 +353,69 @@ def test_the_launcher_never_reads_claude_settings_through_a_link(
     r = subprocess.run([str(REPO_ROOT / "leerie"), "list"], cwd=co, env=env,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
+
+
+def _sparse(path: Path, size: int = 1 << 40) -> Path:
+    """A file of `size` bytes that uses no disk, as a worker makes one with
+    `truncate -s 1T`."""
+    with open(path, "wb") as f:
+        f.truncate(size)
+    return path
+
+
+def test_a_sparse_checkpoint_is_refused_not_read(leerie, tmp_path):
+    """Review round 27, isolation I3, inverted: `_read_beneath` read the
+    whole file, so a 1 TiB sparse checkpoint raised `MemoryError` out of
+    `_validate_checkpoint` (or had the container OOM-killed). Its size is
+    now checked on the opened descriptor, and the gate reports it."""
+    notes = tmp_path / "notes" / "s1"
+    notes.mkdir(parents=True)
+    cp = _sparse(notes / "checkpoint.md")
+    assert os.stat(cp).st_blocks == 0
+    err = leerie._validate_checkpoint(str(cp), notes_dir=notes)
+    assert isinstance(err, str) and f"is over {leerie.READ_LIMIT_CONFIG} bytes" in err, err
+
+
+def test_a_budgeted_read_reads_only_its_budget(leerie, tmp_path):
+    _sparse(tmp_path / "package.json")
+    got = leerie._read_file_safely(tmp_path, tmp_path / "package.json", 4000)
+    assert got == "\0" * 4000
+
+
+def test_the_limit_is_exact(leerie, tmp_path):
+    import errno
+    f = tmp_path / "f"
+    f.write_bytes(b"x" * 10)
+    assert leerie._read_beneath(tmp_path, f, limit=10) == b"x" * 10
+    with pytest.raises(OSError) as e:
+        leerie._read_beneath(tmp_path, f, limit=9)
+    assert e.value.errno == errno.EFBIG
+    assert leerie._read_head_beneath(tmp_path, f, limit=4) == b"xxxx"
+    with pytest.raises(TypeError):
+        leerie._copy_beneath(f, tmp_path, tmp_path / "g", src_anchor=tmp_path)
+
+
+_LIMITED = {"_read_beneath", "_read_text_beneath", "_read_head_beneath"}
+
+
+def test_every_read_beneath_states_its_limit():
+    """Every call of the readers passes `limit=`, and every copy read beneath
+    a `src_anchor` does too: no read of a repository's file is unbounded
+    (DESIGN §6 *No read is unbounded*)."""
+    tree = ast.parse(LEERIE_PY.read_text())
+    seen, bad = 0, []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None)
+        kws = {k.arg for k in node.keywords}
+        if name in _LIMITED or (name in ("_copy_beneath", "_copytree_beneath")
+                                and "src_anchor" in kws):
+            seen += 1
+            if "limit" not in kws:
+                bad.append(node.lineno)
+    assert seen > 50, seen
+    assert bad == []
 
 
 def test_a_fifo_in_a_tree_repository_never_blocks_the_orchestrator(
