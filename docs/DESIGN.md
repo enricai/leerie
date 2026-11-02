@@ -2624,9 +2624,16 @@ that the host interpreter took its import path from the place it was run
 from. The invariant: **no host-side Python resolves a module from the
 checkout.** Every host-side `python3` is isolated, spelled `python3 -I`
 at the call: no cwd or script directory on `sys.path`, no `PYTHON*`
-environment, no user site. That holds because every host-side program
-imports only the standard library, plus leerie's own `chain/` package,
-whose directory is put on `sys.path` explicitly. The one convention is
+environment, no user site. Every host-side program imports the standard
+library and leerie's own code; the two that reach beyond it put the
+operator's own paths back explicitly, never the cwd. The chain synth-merge
+helper imports leerie's `chain/` package from the leerie directory, after
+the operator's absolute `PYTHONPATH` entries. The host rebaser and
+`config --recapture` seams run workers, and a worker's backoff imports
+`tenacity`, which the operator may have installed in the user site or on
+`PYTHONPATH`; those seams take back the absolute `PYTHONPATH` entries and
+the user site, in a plain interpreter's order. An empty or relative
+`PYTHONPATH` entry names the cwd and is dropped. The one convention is
 checked by a rule over every host-run file, so a new call without it
 fails the suite. Commands the host sends to a Fly or EC2 machine follow
 the same spelling.

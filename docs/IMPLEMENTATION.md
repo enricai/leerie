@@ -67,15 +67,32 @@ the stdlib. Every host-side interpreter is spelled `python3 -I` at its call
 `scripts/runtime-install.sh` and `scripts/remote/*.sh`, including the
 commands those send to a Fly or EC2 machine — so neither the cwd (the
 user's checkout), a script's directory, `PYTHON*` nor the user site reaches
-`sys.path` (DESIGN §6 *The host never imports the repository's code*). The
-chain synth-merge helper, the one host program importing a non-stdlib
-module (`chain.git_ops`), puts the operator's `PYTHONPATH` entries and the
-leerie directory on `sys.path` itself, from argv. Pinned by
-`tests/test_host_python_is_isolated.py`, a rule over those files that
-rejects any `python3` invocation without `-I`, and that runs the
-bare-resume pick seam, the `config --recapture` seam and a `-c` helper
-from a checkout holding a planted `contextlib.py` / `json.py`, which must
-never run. The orchestrator's
+`sys.path` (DESIGN §6 *The host never imports the repository's code*).
+Two kinds of host program import beyond the stdlib and put the operator's
+paths back themselves, dropping every empty or relative `PYTHONPATH` entry
+(each names the cwd). The chain synth-merge helper imports `chain.git_ops`:
+it puts the operator's absolute `PYTHONPATH` entries and then the leerie
+directory on `sys.path`, from argv. The host rebaser seam
+(`scripts/host-finalize.sh`) and the `config --recapture` seam run workers
+through `claude_p`, whose backoff imports `tenacity`. After loading
+`orchestrator/leerie.py` they call its `admit_operator_import_paths()`,
+which restores the absolute `PYTHONPATH` entries first and the user site
+(unless `PYTHONNOUSERSITE`) ahead of the interpreter's site-packages. So
+`tenacity` resolves from the host interpreter's site-packages, the user
+site or an absolute `PYTHONPATH` entry, as it did before `-I`, and never
+from the checkout. The host is not required to have it (see `config
+--recapture` below); without it, a host-side worker's first backoff raises
+`ImportError`. The function is called explicitly and never at import, so
+the other programs that load `leerie.py` isolated keep the import path
+`-I` gave them. Pinned by `tests/test_host_python_is_isolated.py`. It has a
+rule over those files that rejects any `python3` invocation without `-I`.
+It runs the bare-resume pick seam, the `config --recapture` seam and a `-c`
+helper from a checkout holding a planted `contextlib.py` / `json.py`, which
+must never run. It also runs the rebaser and recapture seams from a
+checkout holding a planted `tenacity.py` (at its root and behind a relative
+`PYTHONPATH` entry): they must import the operator's `tenacity` from
+`PYTHONPATH` or the user site. And it runs the chain helper with `.` on
+`PYTHONPATH`, which must not import the checkout's `chain/git_ops.py`. The orchestrator's
 source is baked into the image at `/opt/leerie-image/`; on local runs
 the launcher's bind mount (`-v $LEERIE_REPO:/opt/leerie-image:ro`)
 shadows the baked copy, so iterating on `orchestrator/leerie.py` needs
@@ -242,9 +259,12 @@ claims a state directory. Four sub-modes:
   — an empty capture leaves the config untouched. Each run's `State` is
   flocked (skipped, not fatal, on `StateLockedError`). Exits 1 if no runs
   directory or no finished run found. `orchestrator/leerie.py`'s sole
-  third-party import (`tenacity`) is deferred into `claude_p()` rather than
-  module scope, since the host `python3` isn't guaranteed to have
-  `requirements.txt` deps (§0).
+  third-party import on this path (`tenacity`) is deferred into `claude_p()`
+  rather than module scope, since the host `python3` isn't guaranteed to
+  have `requirements.txt` deps (§0). The seam runs `python3 -I` and calls
+  `admit_operator_import_paths()` after loading the module, so a `tenacity`
+  in the operator's user site or on an absolute `PYTHONPATH` entry is found
+  (§0 *Python runtime*).
 
 All four sub-modes share an inline BLT inferrer (`_config_read_key`,
 `_infer_axis`, `_axis_source`) implemented directly in launcher bash so the

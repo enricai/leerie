@@ -25,6 +25,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO / "leerie"
 
@@ -222,3 +224,137 @@ def test_the_launcher_push_choice_helpers_never_run_a_checkout_module(
         assert r.returncode == 0, r.stderr
         assert not marker.exists(), marker.read_text()
         assert r.stdout.strip() == "true", (run_id, r.stdout, r.stderr)
+
+
+# --------------------------------------------------------------------------
+# The seams that reach claude_p find the operator's tenacity, never the
+# checkout's (review round 26, F1). `-I` drops the user site and PYTHONPATH
+# along with the cwd; `admit_operator_import_paths` takes back the first two.
+# --------------------------------------------------------------------------
+
+def _rebaser_seam() -> str:
+    """The host rebaser's script, as host-finalize.sh writes it."""
+    text = (REPO / "scripts" / "host-finalize.sh").read_text()
+    start = text.index("cat > \"$_rebaser_py\" <<'PY'\n")
+    start = text.index("\n", start) + 1
+    return text[start:text.index("\nPY\n", start) + 1]
+
+
+def _orchestrator_shim(tmp_path: Path) -> Path:
+    """The real leerie.py, with the seams' worker entrypoints replaced by a
+    `claude_p`-style lazy `import tenacity` that reports which one it got.
+    The real `admit_operator_import_paths` is what the seams call."""
+    shim = tmp_path / "orch_shim.py"
+    shim.write_text(
+        "import importlib.util, json, sys\n"
+        "_s = importlib.util.spec_from_file_location(\n"
+        f"    'leerie_real', {str(REPO / 'orchestrator' / 'leerie.py')!r})\n"
+        "_m = importlib.util.module_from_spec(_s)\n"
+        "_s.loader.exec_module(_m)\n"
+        "admit_operator_import_paths = _m.admit_operator_import_paths\n"
+        "def _which():\n"
+        "    import tenacity\n"
+        "    return getattr(tenacity, 'WHO', 'interpreter')\n"
+        "def run_rebaser(*a):\n"
+        "    return {'status': _which()}\n"
+        "def run_recapture_deps(leerie_root, user_repo, force=False):\n"
+        "    (leerie_root / 'who').write_text(_which())\n")
+    return shim
+
+
+def _operator_tenacity(site_dir: Path) -> None:
+    pkg = site_dir / "tenacity"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("WHO = 'operator'\n")
+
+
+def _host_env(tmp_path: Path, where: str) -> dict:
+    """An environment whose operator tenacity is on PYTHONPATH (behind a
+    relative entry, which names the cwd) or in the user site."""
+    import os
+    import sysconfig
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home")}
+    if where == "pythonpath":
+        _operator_tenacity(tmp_path / "op")
+        env["PYTHONPATH"] = f".:tenacity_dir:{tmp_path / 'op'}"
+    else:
+        base = tmp_path / "userbase"
+        env["PYTHONUSERBASE"] = str(base)
+        _operator_tenacity(Path(sysconfig.get_path(
+            "purelib", f"{os.name}_user", vars={"userbase": str(base)})))
+    return env
+
+
+def _plant_tenacity(checkout: Path, marker: Path) -> None:
+    _plant(checkout, marker)
+    for d in (checkout, checkout / "tenacity_dir"):
+        d.mkdir(exist_ok=True)
+        (d / "tenacity.py").write_text(
+            f"open({str(marker)!r}, 'a').write('tenacity\\n')\n"
+            "WHO = 'checkout'\n")
+
+
+@pytest.mark.parametrize("where", ["pythonpath", "user_site"])
+def test_the_rebaser_seam_imports_the_operators_tenacity(
+        tmp_path: Path, where: str) -> None:
+    checkout, marker = tmp_path / "checkout", tmp_path / "RAN_ON_HOST"
+    _plant_tenacity(checkout, marker)
+    script = tmp_path / "rebaser.py"
+    script.write_text(_rebaser_seam())
+    out = tmp_path / "rebaser.json"
+    r = subprocess.run(
+        ["python3", "-I", str(script), str(tmp_path), str(checkout), "rid",
+         str(checkout), "b", "w", "main", str(_orchestrator_shim(tmp_path)),
+         str(out)],
+        cwd=checkout, env=_host_env(tmp_path, where), text=True,
+        capture_output=True, timeout=120, check=False)
+    assert not marker.exists(), marker.read_text()
+    assert r.returncode == 0, r.stderr
+    assert json.loads(out.read_text()) == {"status": "operator"}
+
+
+@pytest.mark.parametrize("where", ["pythonpath", "user_site"])
+def test_the_recapture_seam_imports_the_operators_tenacity(
+        tmp_path: Path, where: str) -> None:
+    flags, body = _seam('"$_user_repo" "$_leerie_state_dir"')
+    checkout, state, marker = (tmp_path / "checkout", tmp_path / "state",
+                               tmp_path / "RAN_ON_HOST")
+    _plant_tenacity(checkout, marker)
+    state.mkdir()
+    r = subprocess.run(
+        ["python3", *flags, "-", str(checkout), str(state), "false",
+         str(_orchestrator_shim(tmp_path))],
+        input=body, cwd=checkout, env=_host_env(tmp_path, where), text=True,
+        capture_output=True, timeout=120, check=False)
+    assert not marker.exists(), marker.read_text()
+    assert r.returncode == 0, r.stderr
+    assert (state / "who").read_text() == "operator"
+
+
+def test_the_chain_synth_merge_helper_drops_a_relative_pythonpath_entry(
+        tmp_path: Path) -> None:
+    """The chain helper hands the operator's PYTHONPATH to sys.path itself;
+    `.` there names the cwd, the checkout, whose `chain/git_ops.py` must not
+    run, while an absolute operator entry is still honoured."""
+    text = LAUNCHER.read_text()
+    start = text.index("if ! python3 -I -c '\n") + len("if ! python3 -I -c '\n")
+    source = text[start:text.index("\n' \"$USER_REPO\"", start) + 1]
+    checkout, marker = tmp_path / "checkout", tmp_path / "RAN_ON_HOST"
+    _plant(checkout, marker)
+    for root, who in ((checkout, "checkout"), (tmp_path / "op", "operator")):
+        pkg = root / "chain"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        (pkg / "git_ops.py").write_text(
+            "class SynthMergeConflict(Exception): pass\n"
+            "def synth_merge_branches(repo, base, branches, stage):\n"
+            f"    open({str(marker if who == 'checkout' else tmp_path / 'who')!r},"
+            f" 'w').write({who!r})\n")
+    r = subprocess.run(
+        ["python3", "-I", "-c", source, str(checkout), "main", "[]", "stage",
+         f".:{tmp_path / 'op'}", str(REPO)],
+        cwd=checkout, text=True, capture_output=True, timeout=120,
+        check=False)
+    assert not marker.exists(), marker.read_text()
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "who").read_text() == "operator"

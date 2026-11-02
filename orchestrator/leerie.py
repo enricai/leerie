@@ -84,6 +84,40 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # run_recapture_deps()'s pathlib guards can print their diagnostic. Do not
 # hoist it back to the top.
 
+
+def admit_operator_import_paths() -> None:
+    """Put the operator's own import paths back on `sys.path` in a host seam
+    that runs isolated (`python3 -I`) and can reach `claude_p` — the rebaser
+    and `config --recapture` seams. `-I` keeps the cwd (the user's checkout)
+    off `sys.path`, and with it the user site and `PYTHONPATH`, which is where
+    an operator's `pip install --user tenacity` or a `PYTHONPATH` entry put
+    the one third-party module those seams import (lazily, on a backoff).
+    Those paths are the operator's, not the checkout's, so they come back,
+    in the order a plain `python3` gives them: `PYTHONPATH` first, the user
+    site (unless `PYTHONNOUSERSITE`) ahead of the interpreter's own
+    site-packages. An empty or relative `PYTHONPATH` entry names the cwd, so
+    it is dropped (DESIGN §6 *The host never imports the repository's
+    code*).
+
+    Called explicitly by those seams, never at import: the other programs
+    that load this file isolated (`scripts/worker-guard.py`, the read-only
+    verbs, the other host seams) import nothing outside the standard library,
+    and keep their import path as `-I` left it."""
+    import site
+    sys.path[:0] = [d for d in os.environ.get("PYTHONPATH", "").split(
+        os.pathsep) if os.path.isabs(d) and d not in sys.path]
+    if not os.environ.get("PYTHONNOUSERSITE"):
+        user_site = site.getusersitepackages()
+        if os.path.isdir(user_site) and user_site not in sys.path:
+            before = list(sys.path)
+            site.addsitedir(user_site)  # its .pth files too
+            added = [p for p in sys.path if p not in before]
+            system = set(site.getsitepackages())
+            i = next((k for k, p in enumerate(before) if p in system),
+                     len(before))
+            sys.path[:] = before[:i] + added + before[i:]
+
+
 ROOT = Path(__file__).resolve().parent.parent       # leerie plugin/repo root
 PROMPTS = ROOT / "prompts"
 SCRIPTS = ROOT / "scripts"
