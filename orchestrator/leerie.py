@@ -66917,11 +66917,17 @@ async def _compose_pr_for_a_push_chosen_after_finalize(
     pushed, and `leerie resume <id> --push` of a finished `--no-push` run
     changes the choice after it — the host then pushed with the fallback
     body. So the resume that finds nothing left to run writes the PR here
-    when it continues with a push and `run.json` holds no `pr_title`.
+    when it continues with a push, the host has not pushed it yet
+    (`run.json` holds no `pushed_at`), and `run.json` holds no `pr_title`.
+    A pushed run already had its chance at `pr_writer`, under the choice
+    that pushed it; if the worker failed then, its PR is open with the
+    fallback body and nothing would read a title written now (review round
+    26, I1).
     """
     if no_push:
         return
-    if (_read_run_json_sidecar(st.run_dir / "run.json") or {}).get("pr_title"):
+    run_json = _read_run_json_sidecar(st.run_dir / "run.json") or {}
+    if run_json.get("pushed_at") or run_json.get("pr_title"):
         return
     log("resume: the run is to be pushed and has no PR written; "
         "running pr_writer")

@@ -5285,9 +5285,11 @@ the record, it cannot. A run that is pushed has its PR written by
 whenever its push choice was made: at finalize when the run is then to be
 pushed, and — because a resume may change the choice after finalize
 (`leerie resume <id> --push` of a finished `--no-push` run is the one way
-to push it) — on a resume of a finished run that continues with a push and
-whose `run.json` holds no `pr_title`, before that resume answers "nothing
-to resume". Binding the worker to finalize alone left such a push with the
+to push it) — on a resume of a finished run that continues with a push,
+that the host has not pushed yet (no `pushed_at`) and whose `run.json`
+holds no `pr_title`, before that resume returns. A run already pushed had
+its PR composed under the choice that pushed it, so a later resume does not
+compose it again. Binding the worker to finalize alone left such a push with the
 fallback body, its PR composed by a choice that was no longer the run's.
 `host_finalize` reads
 `run.json.no_push` unchanged on every runtime: on a remote runtime the
