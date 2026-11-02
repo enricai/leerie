@@ -806,13 +806,13 @@ Both pass the **basename**, never the host path: `$USER_REPO` is a host absolute
 
 ### `--inspect-dir` path translation
 
-Inspect dirs (`--add-dir` forwarded to `claude -p` for cross-repo context) come from CLI flags, the `LEERIE_INSPECT_DIRS` env var, or `leerie.toml`'s `inspect_dirs` key. They are *host* paths. The launcher:
+Inspect dirs (`--add-dir` forwarded to `claude -p` for cross-repo context) come from CLI flags or the `LEERIE_INSPECT_DIRS` env var — never from `leerie.toml` (DESIGN §6 *No host path comes from a repository*; § *Repository configuration names no location* below). They are *host* paths. The launcher:
 
-1. Collects all three sources before any container is started.
+1. Collects both sources before any container is started.
 2. For each host path: resolves it on the host (`cd -P "$path" && pwd`, so symlinks and `~` are expanded), bind-mounts it read-only at `/inspect/<basename>` inside the container, and rewrites the corresponding CLI flag to point at the in-container path.
 3. Passes only the rewritten flags into the container, and clears `LEERIE_INSPECT_DIRS` in the container env so the in-container resolver doesn't see any host paths.
 
-This honors the orchestrator's precedence rules in `resolve_inspect_dirs` (CLI > env > TOML) by emitting only CLI args — the env and TOML pre-passes in the launcher synthesize CLI flags.
+This honors the orchestrator's precedence rules in `resolve_inspect_dirs` (CLI > env) by emitting only CLI args — the env pre-pass in the launcher synthesizes CLI flags.
 
 A host path *inside* `$USER_REPO` (already visible at `/work/<subpath>`) collides with the launcher's `/inspect/<basename>` target. The launcher warns and skips the redundant mount.
 
@@ -1459,23 +1459,27 @@ Resolution order (lowest → highest priority):
    `_state_dir_default` helper in the launcher as just the basename of
    `$USER_REPO`. No hashing; no `state/` segment.
 
-2. **`leerie.toml` at the repo root** with key `state_dir`. Plain
-   `key=value` syntax; bare `~` and `~/`-prefixed values are expanded to
-   `$HOME`:
+2. **`LEERIE_STATE_DIR`** environment variable. Overrides the default;
+   bare `~` and `~/`-prefixed values are expanded.
 
-   ```
-   state_dir = ~/.leerie/myproject
-   ```
-
-3. **`LEERIE_STATE_DIR`** environment variable. Overrides the default and
-   any toml value; bare `~` and `~/`-prefixed values are expanded.
-
-4. **`--state-dir PATH`** / `--state-dir=PATH` CLI flag. Highest priority;
+3. **`--state-dir PATH`** / `--state-dir=PATH` CLI flag. Highest priority;
    overrides everything. Launcher-only (stripped from `REWRITTEN_ARGS`;
    the orchestrator never sees it). Bare `~` and `~/`-prefixed values
    are expanded.
 
-After resolution and before the verb dispatch, the launcher runs
+There is no `leerie.toml` tier: a repository's file never names a host path
+(§ *Repository configuration names no location* below). A relative value is
+anchored at the directory the operator started leerie in (`$OPERATOR_DIR`,
+§0), not at the checkout's top level.
+
+After resolution, for every verb but `version`, the launcher refuses a state
+root that overlaps the checkout (`_state_root_overlaps_checkout <state-root>
+<checkout>`, both compared by real path, a missing tail of the state root
+resolved from its deepest existing parent): equal to it, beneath it, or
+above it. The message names `--state-dir` and `LEERIE_STATE_DIR` (DESIGN §6
+*No host path comes from a repository*, part 2).
+
+Then, before the verb dispatch, the launcher runs
 `_validate_state_ownership` against the resolved path:
 
 - **Fresh dir (does not exist):** create it and write `.owner` containing
@@ -1483,7 +1487,7 @@ After resolution and before the verb dispatch, the launcher runs
 - **Dir exists with matching `.owner`:** continue.
 - **Dir exists with mismatched `.owner`:** error and exit. Two different
   repos share a basename; the operator must pick an explicit override
-  (`--state-dir` / `LEERIE_STATE_DIR` / `leerie.toml: state_dir = ...`).
+  (`--state-dir` / `LEERIE_STATE_DIR`).
 - **Dir exists, no `.owner`, contains `runs/` or `worktrees/`:** backfill
   the `.owner` sidecar from `$USER_REPO` (covers operators upgrading from
   the pre-`.owner` layout).
@@ -1499,7 +1503,7 @@ talk to the chain Fly app or are host-only fast paths that don't touch local sta
 Resolution and ownership validation live entirely in the launcher (bash);
 no Python counterpart — the path is passed to `nerdctl run` as a
 bind-mount volume argument once resolved. Tested by
-`tests/test_resolve_state_dir.py` (resolver + ownership check, 27 cases).
+`tests/test_resolve_state_dir.py` (resolver + ownership check, 25 cases).
 
 > The CLI/env > file order follows the same session-scoped vs.
 > committed-default split as `--source-of-truth` and `--runtime`.
@@ -1874,11 +1878,12 @@ resume corollary.)
 
 Resolved **in the `leerie` launcher** (bash — the Python orchestrator never
 reads it), mirroring the `--state-dir` resolution block: CLI flag > env var
-> `leerie.toml` flat key > default.
+> default. There is no `leerie.toml` tier (§ *Repository configuration names
+no location* below).
 
 - **`LEERIE_LOG_FILE_RESOLVED`** — the resolved log file path, exported for
   the teeing wiring below. Resolution: `--log-file <path>` CLI >
-  `LEERIE_LOG_FILE` env > `leerie.toml` `log_file = "..."` > default
+  `LEERIE_LOG_FILE` env > default
   `$LEERIE_STATE_HOST_DIR/logs/leerie-<pid>.log`.
 
 A log left inside `$USER_REPO` (e.g. via manual `leerie task | tee
@@ -2029,9 +2034,8 @@ fallback to `ls`/`find` even though `INSPECT_TOOLS` allowlists those
 verbs.
 
 Resolution: `--inspect-dir PATH` CLI (repeatable) > `LEERIE_INSPECT_DIRS`
-env (colon-separated) > `leerie.toml` `inspect_dirs =
-"/abs/path/a,/abs/path/b"` (comma-separated, parsed by `_read_toml_key`) >
-default `[]` (no extra directories).
+env (colon-separated) > default `[]` (no extra directories). There is no
+`leerie.toml` tier (§ *Repository configuration names no location* below).
 
 Paths are expanded (`~` → `$HOME`) and resolved to absolute form at
 startup. A `~name` prefix naming nobody in the password database is left
@@ -2068,16 +2072,39 @@ are written.
 
 Resolution order (highest priority first):
 
-Resolution: `--judge-dir DIR` CLI > `LEERIE_JUDGE_DIR` env > `leerie.toml`
-`judge_dir = "judge-out"` > default `"judge-out"` (`JUDGE_DIR_DEFAULT`).
+Resolution: `--judge-dir DIR` CLI > `LEERIE_JUDGE_DIR` env > default
+`"judge-out"` (`JUDGE_DIR_DEFAULT`). No `leerie.toml` tier (§ *Repository
+configuration names no location* below).
 
 ### Heal output directory
 
 The subdirectory name (relative to `<run-dir>`) where LLM self-heal loop
 output files are written.
 
-Resolution: `--heal-dir DIR` CLI > `LEERIE_HEAL_DIR` env > `leerie.toml`
-`heal_dir = "heal-out"` > default `"heal-out"` (`HEAL_DIR_DEFAULT`).
+Resolution: `--heal-dir DIR` CLI > `LEERIE_HEAL_DIR` env > default
+`"heal-out"` (`HEAL_DIR_DEFAULT`). No `leerie.toml` tier.
+
+### Repository configuration names no location
+
+DESIGN §6 *No host path comes from a repository*, part 1. Five settings name
+a location: `state_dir`, `log_file`, `inspect_dirs`, `judge_dir`,
+`heal_dir`. They come only from a flag or the environment, and
+`leerie.toml` has no key for them.
+
+- `REPO_CONFIG_LOCATION_KEYS` (`leerie.py`) — that tuple, each mapped to
+  its operator-side replacement (`--state-dir` / `LEERIE_STATE_DIR`, and so
+  on). `_read_toml_key(path, key)` raises `ValueError` for a key in it, so
+  no resolver can read one from the file; `resolve_inspect_dirs`,
+  `resolve_judge_dir` and `resolve_heal_dir` have no file tier.
+- `_checkout_config_location_keys` (launcher) — prints the keys of that
+  list that the checkout's `leerie.toml` sets (one `key =` line each,
+  matched like `_read_toml_key`). Run right after `_checkout_config_links`,
+  for every verb but `version`, before anything else reads the file. A hit
+  stops the launcher, naming each key and its replacement: a key ignored
+  silently would move a run's state away from where its operator looks.
+  `tests/test_repo_config_names_no_location.py` pins the launcher's list to
+  `REPO_CONFIG_LOCATION_KEYS` and runs the launcher on a checkout setting each
+  key.
 
 ### Judge model
 
@@ -2920,7 +2947,7 @@ table.
 | `--ec2-security-group VALUE` | leerie-tagged group (tcp/22 from launcher egress `/32`) (optional override) | Security group id to attach. Also `LEERIE_EC2_SECURITY_GROUP` env var or `ec2_security_group` in `leerie.toml`. |
 | `--ec2-subnet-id VALUE` | default-VPC public subnet (optional override) | Subnet id to launch into. Also `LEERIE_EC2_SUBNET_ID` env var or `ec2_subnet_id` in `leerie.toml`. |
 | `--ec2-instance-profile VALUE` | none (optional) | IAM instance profile name passed as `--iam-instance-profile` to `RunInstances`. Also `LEERIE_EC2_INSTANCE_PROFILE` env var or `ec2_instance_profile` in `leerie.toml`. |
-| `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
+| `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated); no `leerie.toml` key. |
 | `--model ALIAS` | per-worker (every worker → `sonnet`, except `pr_reviewer` → `opus`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
 | `--model-<worker> ALIAS` | per-worker default (every worker → `sonnet`, except `pr_reviewer` → `opus`) | Per-worker override. `<worker>` is any `WORKER_TYPES` entry (listed under `LEERIE_MODEL_<WORKER>` below). Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
 | `--effort LEVEL` | per-worker (judgment: `medium`; implementer/conformer: `low`; `pr_reviewer`: `high`) | `low` / `medium` / `high` / `xhigh` / `max`. Reasoning-depth dial forwarded to `claude -p --effort`. Pins judgment workers to a consistent depth across runs to reduce same-job variance (e.g. planner subtask-count drift); implementer/conformer are pinned to `low` for cost/latency. §2 "Effort selection". |
@@ -2932,8 +2959,8 @@ table.
 | `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `<state-root>/runs/<run-id>/logs/transcripts/<sid>.log` (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/<basename>/`). |
 | `-v` / `-vv` | `0` (off) | Shortcuts that anchor to `normal`: `-v` = `stream`, `-vv` = `debug`. With no `-v` and no `--verbosity`, falls through to `LEERIE_VERBOSITY` / `leerie.toml` / default `stream`. |
 | `-q` / `-qq` | `0` (off) | Shortcuts that anchor to `normal`: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. With no `-q` and no `--verbosity`, falls through to the same chain as `-v`. |
-| `--judge-dir DIR` | `judge-out` | Subdirectory name under the run dir for LLM judge output. Also `LEERIE_JUDGE_DIR` or `judge_dir` in `leerie.toml`. |
-| `--heal-dir DIR` | `heal-out` | Subdirectory name under the run dir for LLM self-heal output. Also `LEERIE_HEAL_DIR` or `heal_dir` in `leerie.toml`. |
+| `--judge-dir DIR` | `judge-out` | Subdirectory name under the run dir for LLM judge output. Also `LEERIE_JUDGE_DIR`; no `leerie.toml` key. |
+| `--heal-dir DIR` | `heal-out` | Subdirectory name under the run dir for LLM self-heal output. Also `LEERIE_HEAL_DIR`; no `leerie.toml` key. |
 | `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
 | `--report [RUN_ID]` | — | Print a read-only telemetry report for a run: per-call-type token/cost/latency/failure breakdown plus memory peak. Pass a run id, or omit to auto-pick when exactly one run exists. Exits without running orchestrate. |
 | `--status STATE` | — | With `list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`, `incomplete`, `other-leerie`. |
@@ -3030,7 +3057,7 @@ a container.
 
 | Flag | Description |
 |------|-------------|
-| `--state-dir PATH` | Override the per-repo state directory. Also `LEERIE_STATE_DIR` env var or `state_dir` in `leerie.toml`. |
+| `--state-dir PATH` | Override the per-repo state directory. Also `LEERIE_STATE_DIR` env var; no `leerie.toml` key. Never at, inside or above the checkout. |
 | `--fly-app NAME` | Fly.io app name (required for `--runtime fly`; globally unique). Also `LEERIE_FLY_APP` env var. |
 | `--fly-disk-gb N` | Provision a Fly volume of N GB mounted at `/home/leerie`. Also `FLY_VM_DISK_GB` env var. |
 | `--no-runtime-install` | Skip auto-install of container runtime (Colima / nerdctl / containerd). Also `LEERIE_NO_RUNTIME_INSTALL`. |
@@ -3041,7 +3068,7 @@ a container.
 
 | Env var | `leerie.toml` key | Description |
 |---------|---------------------|-------------|
-| `LEERIE_STATE_DIR` | `state_dir` | Override the per-repo run state directory. Unset → default `$HOME/.leerie/<basename>/` (outside the repo; no `.gitignore` entry needed in target projects). Cross-repo basename collisions are caught at use time via an `.owner` sidecar inside the dir. Set once in your shell profile for a global directory across all repos. |
+| `LEERIE_STATE_DIR` | — | Override the per-repo run state directory. A location, so no `leerie.toml` key: a `state_dir` there stops the launcher (§2 *Repository configuration names no location*). Never at, inside or above the checkout. Unset → default `$HOME/.leerie/<basename>/` (outside the repo; no `.gitignore` entry needed in target projects). Cross-repo basename collisions are caught at use time via an `.owner` sidecar inside the dir. Set once in your shell profile for a global directory across all repos. |
 | `LEERIE_HOST_DIR` | — | Launcher-only: the host directory mounted at `/leerie-host`, where the host-wide build semaphore keeps its slot files (DESIGN §6 *A host-wide build semaphore*). Unset → `~/.leerie/.host`, which must stay the default: the semaphore bounds only runs that share one directory, so repoint it only for a run that must be isolated from the host's other runs (a bench that must never touch `~/.leerie`). Must be absolute (`~/` expands); a relative path is refused. Not forwarded into the container: there the launcher sets `LEERIE_HOST_DIR=/leerie-host`, the mount point `_build_sem_dir` reads. |
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly` / `ec2`). Overridden by `--runtime`. Unset → default `local`. |
@@ -3050,7 +3077,7 @@ a container.
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `medium`, implementer/conformer `low`, `pr_reviewer` `high`, everything else inherits Claude default. |
 | `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `medium`; `pr_reviewer` `high`; implementer/conformer `low`; `satisfied_probe` unset. |
 | `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
-| `LEERIE_INSPECT_DIRS` | `inspect_dirs` | Extra directories the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded as `--add-dir`. Env value is colon-separated; TOML value is comma-separated. Overridden by `--inspect-dir` (repeatable). Unset → none. |
+| `LEERIE_INSPECT_DIRS` | — | Extra directories the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded as `--add-dir`. Colon-separated. A location, so no `leerie.toml` key. Overridden by `--inspect-dir` (repeatable). Unset → none. |
 | `LEERIE_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. Unset → default `stream`. |
 | `LEERIE_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. Unset → default `false` (push + PR happen). |
 | `LEERIE_SKIP_FRESHNESS_CHECK` | — | Truthy → skip host preflight step 5, the stale-base refusal (`host_base_freshness_check` — DESIGN §6 *A fresh run refuses a stale base*): a fresh run whose HEAD is strictly behind its remote upstream — or, with no usable upstream, behind a same-named origin branch — refuses to start, because it would re-solve merged work and its finalize rebase can land the older solution over the newer one (measured). Env-only, mirroring `LEERIE_SKIP_PREPUSH_PREFLIGHT` — an argv flag would leak into the orchestrator's argparse passthrough. Fresh runs only; resume never runs the check. |
@@ -3059,8 +3086,8 @@ a container.
 | `LEERIE_MODEL_HEAL` | `model_heal` | Model alias for the post-run self-heal skill. Overridden by `--heal-model`. Unset → default `sonnet`. |
 | `LEERIE_HEAL_MAX_ROUNDS` | `heal_max_rounds` | Maximum heal-loop iterations per `call_type`. Overridden by `--heal-max-rounds`. Unset → default `10`. |
 | `LEERIE_HEAL_SUCCESS_THRESHOLD` | `heal_success_threshold` | Pass-rate threshold for the heal-loop SUCCESS verdict. Overridden by `--heal-success-threshold`. Unset → default `0.9`. |
-| `LEERIE_JUDGE_DIR` | `judge_dir` | Subdirectory name under the run dir for LLM judge output. Overridden by `--judge-dir`. Unset → default `judge-out`. |
-| `LEERIE_HEAL_DIR` | `heal_dir` | Subdirectory name under the run dir for LLM self-heal output. Overridden by `--heal-dir`. Unset → default `heal-out`. |
+| `LEERIE_JUDGE_DIR` | — | Subdirectory name under the run dir for LLM judge output. Overridden by `--judge-dir`. Unset → default `judge-out`. |
+| `LEERIE_HEAL_DIR` | — | Subdirectory name under the run dir for LLM self-heal output. Overridden by `--heal-dir`. Unset → default `heal-out`. |
 | `LEERIE_MAX_WORKERS` | `max_workers` | Total worker-invocation budget. Overridden by `--max-workers`. Unset → default `2000`. |
 | `LEERIE_MAX_PARALLEL` | `max_parallel` | Concurrent workers per wave. Overridden by `--max-parallel`. Unset → default `5`. |
 | `LEERIE_WORKER_MEMORY_MAX` | `worker_memory_max` | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Overridden by `--worker-memory-max`. Unset → auto-derived from the shared `leerie.slice` budget (`/proc/meminfo` only as a fallback), and raised automatically when the repo declares a Node heap — see the `--worker-memory-max` row above. |
@@ -3223,10 +3250,10 @@ orchestrator, which continues its record. No host-side reader rewrites
 | smoke test | `--skip-smoke` | — | per-invocation | the preflight smoke test runs only on a fresh run |
 | hook skipping at push | `--no-verify` | — | per-invocation | CLI-only by design: hook skipping is asked for each time |
 | display | `--verbosity`, `-v`, `-q` | `LEERIE_VERBOSITY` / `verbosity` | per-invocation | output only |
-| inspect directories | `--inspect-dir` | `LEERIE_INSPECT_DIRS` / `inspect_dirs` | per-invocation | mounted by this invocation's container |
+| inspect directories | `--inspect-dir` | `LEERIE_INSPECT_DIRS` | per-invocation | mounted by this invocation's container |
 | supplied answers | `--answers` | — | per-invocation | input to this invocation, absorbed into `answers` |
-| verbs and selectors | `task`, `resume`, `list`, `--run-id`, `--status`, `--report`, `--phase`, `--judge-dir`, `--heal-dir`, `--heal-max-rounds`, `--heal-success-threshold` | `LEERIE_JUDGE_DIR` / `judge_dir`, `LEERIE_HEAL_DIR` / `heal_dir`, `LEERIE_HEAL_MAX_ROUNDS` / `heal_max_rounds`, `LEERIE_HEAL_SUCCESS_THRESHOLD` / `heal_success_threshold` | per-invocation | say what this invocation does, or tune a post-run `--phase` analysis that never continues the run |
-| launcher and resume modifiers | `--shell`, `--auto-finalize`, `--no-re-seed`, `--state-dir`, `--no-runtime-install`, `--no-auto-publish`, `--local-build` | `LEERIE_STATE_DIR` / `state_dir`, `LEERIE_HOST_DIR`, `LEERIE_NO_RUNTIME_INSTALL`, `LEERIE_NO_AUTO_PUBLISH`, `LEERIE_LOCAL_BUILD`, `LEERIE_NONINTERACTIVE`, `LEERIE_SKIP_FRESHNESS_CHECK`, `LEERIE_WORKER_DEBUG`, `LEERIE_CAPTURE_DEPS`, `LEERIE_BAKE_LANGUAGE_DEPS`, `LEERIE_PAUSE_NOTIFY_CMD`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | per-invocation | how this invocation starts and reports, or host-wide setup |
+| verbs and selectors | `task`, `resume`, `list`, `--run-id`, `--status`, `--report`, `--phase`, `--judge-dir`, `--heal-dir`, `--heal-max-rounds`, `--heal-success-threshold` | `LEERIE_JUDGE_DIR`, `LEERIE_HEAL_DIR`, `LEERIE_HEAL_MAX_ROUNDS` / `heal_max_rounds`, `LEERIE_HEAL_SUCCESS_THRESHOLD` / `heal_success_threshold` | per-invocation | say what this invocation does, or tune a post-run `--phase` analysis that never continues the run |
+| launcher and resume modifiers | `--shell`, `--auto-finalize`, `--no-re-seed`, `--state-dir`, `--no-runtime-install`, `--no-auto-publish`, `--local-build` | `LEERIE_STATE_DIR`, `LEERIE_HOST_DIR`, `LEERIE_NO_RUNTIME_INSTALL`, `LEERIE_NO_AUTO_PUBLISH`, `LEERIE_LOCAL_BUILD`, `LEERIE_NONINTERACTIVE`, `LEERIE_SKIP_FRESHNESS_CHECK`, `LEERIE_WORKER_DEBUG`, `LEERIE_CAPTURE_DEPS`, `LEERIE_BAKE_LANGUAGE_DEPS`, `LEERIE_PAUSE_NOTIFY_CMD`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | per-invocation | how this invocation starts and reports, or host-wide setup |
 | runtime and remote provisioning | `--runtime`, `--fly-app`, `--fly-disk-gb`, `--aws-region`, `--aws-profile`, `--ec2-ami`, `--ec2-instance-type`, `--ec2-key-name`, `--ec2-security-group`, `--ec2-subnet-id`, `--ec2-instance-profile` | `LEERIE_RUNTIME` / `runtime`, `LEERIE_FLY_APP`, `FLY_VM_DISK_GB`, `LEERIE_REGION`, `LEERIE_AWS_REGION` / `aws_region`, `LEERIE_AWS_PROFILE` / `aws_profile`, `LEERIE_EC2_AMI` / `ec2_ami`, `LEERIE_EC2_INSTANCE_TYPE` / `ec2_instance_type`, `LEERIE_EC2_KEY_NAME` / `ec2_key_name`, `LEERIE_EC2_SECURITY_GROUP` / `ec2_security_group`, `LEERIE_EC2_SUBNET_ID` / `ec2_subnet_id`, `LEERIE_EC2_INSTANCE_PROFILE` / `ec2_instance_profile`, `LEERIE_EC2_SSH_KEY_FILE`, `LEERIE_EC2_SSH_CIDR`, `LEERIE_EC2_IAM_RETRY_S`, `LEERIE_EC2_IAM_RETRY_BUDGET_S`, `LEERIE_EC2_AMI_WAIT_S`, `LEERIE_EC2_BAKE_BASE_AMI`, `LEERIE_EC2_BAKE_SSH_RETRIES`, `LEERIE_EC2_BAKE_POLL_S`, `LEERIE_EC2_BAKE_WAIT_TRIES`, `LEERIE_SEED_TIMEOUT_S`, `LEERIE_PROGRESS_INTERVAL_S`, `LEERIE_MACHINE_START_TIMEOUT` | sidecar | a resume finds the run's runtime and machine from `fly-machine.json` / `ec2-instance.json` (`_auto_detect_run_runtime`) and provisions nothing |
 | run group | `--group-id` | — | sidecar | the run's identity, written to `run.json` by the fresh run |
 
@@ -4093,14 +4120,26 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   orchestrator loads it as a module (`_landlock()`).
 - `_require_landlock()` — `die()` unless `abi() >= MIN_ABI`; on every
   runtime, first in `_require_confinement`.
-- `_require_confinement(run_dir: Path) -> None` — the one entry every
-  invocation that runs a worker or a repository command passes through:
-  `_require_landlock()`, then `_require_heldout_sandbox(run_dir)`.
-  `main()` calls it with `st.run_dir` as an unconditional statement of its
+- `_require_confinement(run_dir: Path, state_root: Path, checkout: Path)
+  -> None` — the one entry every invocation that runs a worker or a
+  repository command passes through: `_require_landlock()`, then
+  `_require_state_root_apart(state_root, checkout)`, then
+  `_require_heldout_sandbox(run_dir)`.
+  `main()` calls it with `st.run_dir`, `leerie_root` and `repo_root` as an unconditional statement of its
   body, right after `_install_run_log_tee(st.run_dir)` and before the
   `--phase judge|heal` branch and `_orchestrate` (so fresh runs, `resume`
   and both phases; `list` and `--report` return earlier and spawn
   nothing). `preflight()` no longer runs either check.
+- `_require_state_root_apart(state_root: Path, checkout: Path) -> None` —
+  `die()` when the state root has a second name the checkout's grants do not
+  carve out (DESIGN §6 *No host path comes from a repository*, part 3): each
+  path's place on disk is `_disk_place(path) -> (device, path within the
+  filesystem)`, from the `/proc/self/mountinfo` entry of the mount holding
+  its real path (the longest mount point that is it or above it, the last
+  such line winning; octal escapes decoded). The run stops when one place is
+  at or beneath the other on the same device while the real paths are not
+  nested the same way. Without a readable mountinfo the places are the real
+  paths themselves. `tests/test_state_root_apart.py`.
   `tests/test_confinement_entry.py`: no statement of `main()` before the
   call reaches `_confined_argv` (by rule, over the module's call graph),
   and the real `main()` driven down each dispatch path (fresh, `resume
@@ -4920,7 +4959,7 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
     `_vitest_filter_colliders(tree, files, extra=())` count the placed
     paths as the tree's files.
 - `_require_heldout_sandbox(run_dir: Path) -> None` — in
-  `_require_confinement`, right after `_require_landlock`, on every
+  `_require_confinement`, after `_require_landlock` and `_require_state_root_apart`, on every
   runtime: makes
   `<run-dir>/sandbox-probe/` (`_SANDBOX_PROBE_DIRNAME`) with `view/`, a set
   file outside it and `ro.txt`, and a marker file in the container's
@@ -5259,7 +5298,8 @@ All in `leerie.py`, in execution order. This is the concrete catalogue behind
 | `claude --version` ≥ `MIN_CLAUDE_CLI_STRICT_OUTPUT` (currently `(2, 1, 289)`), only when `--dangerously-force-strict-output` is on | a CLI on which strict decoding turns leaked tool-call markup into a schema-valid payload with its fields emptied (DESIGN §7) |
 | `gh auth status` + `origin` remote (launcher bash, before container) | finalize would fail at push/PR after the full run already ran. Short-circuited when `--no-push` is passed (env / TOML mirrors). |
 | `_require_landlock()` (in `_require_confinement`, on every invocation that runs workers or commands — fresh, `resume`, `--phase`) | a kernel that cannot confine a worker (Landlock ABI below `MIN_ABI`) |
-| `_require_heldout_sandbox()` (in `_require_confinement`, after `_require_landlock`) | a runtime that cannot build the held-out sandbox or the isolation every confined process gets — seccomp refusing a user namespace, the `leerie-container` AppArmor profile not applied, the host's user-namespace restriction, no seccomp table for the architecture, Fly's guest kernel — named in the `die()` (§ *Isolation and the held-out sandbox (I3)*) |
+| `_require_state_root_apart()` (in `_require_confinement`, after `_require_landlock`) | a state root reachable under a second name through the checkout's mount, or holding the checkout (DESIGN §6 *No host path comes from a repository*) |
+| `_require_heldout_sandbox()` (in `_require_confinement`, after `_require_state_root_apart`) | a runtime that cannot build the held-out sandbox or the isolation every confined process gets — seccomp refusing a user namespace, the `leerie-container` AppArmor profile not applied, the host's user-namespace restriction, no seccomp table for the architecture, Fly's guest kernel — named in the `die()` (§ *Isolation and the held-out sandbox (I3)*) |
 | live `claude -p` smoke test | auth failure or network problem |
 | live `claude -p` smoke test — client-side context refusal | `ContextOverflow` -> resumable `EXIT_LOCKED` pause naming the remedy, not a bare `Prompt is too long` |
 
@@ -11984,8 +12024,10 @@ DESIGN.md §19 holds the architecture rationale.
 
 State lives under the resolved state root — by default
 `$HOME/.leerie/<basename>/`, or the path set via `LEERIE_STATE_DIR` /
-`--state-dir` / `leerie.toml state_dir` (see §2 *Host-side per-repo state
-directory* for the full resolution order). The state root is always outside the target repo,
+`--state-dir` (see §2 *Host-side per-repo state
+directory* for the full resolution order). The state root is never at,
+inside or above the target repo (the launcher refuses it; DESIGN §6 *No host
+path comes from a repository*),
 so no `.leerie/` directory accumulates in project checkouts and no
 `.gitignore` entry is needed. Worktrees are
 disposable; the coordination directory outlives them.

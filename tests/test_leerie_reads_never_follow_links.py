@@ -375,6 +375,7 @@ _SYSTEM = {
     "_auto_worker_memory_max_legacy", "_host_cpu_psi", "_mem_available_bytes",
     "_own_addresses", "_sigchld_is_ignored", "_collect_memory_sample",
     "_network_local_host", "_beside", "_service_credential_source",
+    "_disk_place",
 }
 _OPERATOR = {
     # A file the operator named: `--answers`, host settings, a task file

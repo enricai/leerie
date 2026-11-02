@@ -1413,9 +1413,26 @@ def _widen_inspect_tools(base: str, repo_root: Path) -> str:
 # allowlisted Bash verbs in INSPECT_TOOLS are sandboxed to the repo cwd,
 # so cross-repo references like "~/src/enric/beacon" fail with "blocked,
 # outside allowed working directories". Repeatable on the CLI; env var is
-# colon-separated; TOML key is a comma-separated string. Empty by default.
+# colon-separated. No leerie.toml key: see REPO_CONFIG_LOCATION_KEYS. Empty by
+# default.
 INSPECT_DIRS_ENV = "LEERIE_INSPECT_DIRS"
-INSPECT_DIRS_FILE = "leerie.toml"
+
+# The settings that name a location, each with its operator-side spelling.
+# None has a leerie.toml key (DESIGN §6 *No host path comes from a
+# repository*): the file is repository content — a cloned repository's, or a
+# run branch's the operator merged — and `log_file = "~/.bashrc"` made the
+# launcher append the run's output there, `state_dir` put the state root
+# where every worker reads `/work`. `_read_toml_key` refuses these names, and
+# the launcher's `_checkout_config_location_keys` (same list, pinned by
+# tests/test_repo_config_names_no_location.py) stops a run whose leerie.toml
+# still sets one, naming the replacement.
+REPO_CONFIG_LOCATION_KEYS: dict[str, str] = {
+    "state_dir": "--state-dir / LEERIE_STATE_DIR",
+    "log_file": "--log-file / LEERIE_LOG_FILE",
+    "inspect_dirs": "--inspect-dir / LEERIE_INSPECT_DIRS",
+    "judge_dir": "--judge-dir / LEERIE_JUDGE_DIR",
+    "heal_dir": "--heal-dir / LEERIE_HEAL_DIR",
+}
 
 EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
 # Emitted by `check_budget_feasibility()` (DESIGN §13 *Budget feasibility —
@@ -2159,17 +2176,15 @@ MODEL_DEP_CAPTURE_ENV = "LEERIE_MODEL_DEP_CAPTURE"
 
 # Judge output directory name — relative to <run-dir>. Holds LLM judge
 # output files. Resolution order: --judge-dir CLI → LEERIE_JUDGE_DIR env →
-# judge_dir in leerie.toml → "judge-out".
+# "judge-out" (a location: no leerie.toml key, REPO_CONFIG_LOCATION_KEYS).
 JUDGE_DIR_DEFAULT = "judge-out"
 JUDGE_DIR_ENV = "LEERIE_JUDGE_DIR"
-JUDGE_DIR_FILE = "leerie.toml"
 
 # Heal output directory name — relative to <run-dir>. Holds LLM self-heal
 # loop output files. Resolution order: --heal-dir CLI → LEERIE_HEAL_DIR env →
-# heal_dir in leerie.toml → "heal-out".
+# "heal-out" (a location: no leerie.toml key, REPO_CONFIG_LOCATION_KEYS).
 HEAL_DIR_DEFAULT = "heal-out"
 HEAL_DIR_ENV = "LEERIE_HEAL_DIR"
-HEAL_DIR_FILE = "leerie.toml"
 
 # Heal-loop convergence knobs — see IMPLEMENTATION.md §2 "Heal-loop convergence
 # parameters". User-tunable knobs use the standard CLI/env/TOML/default
@@ -8183,7 +8198,12 @@ def _read_toml_key(path: Path, key: str) -> str | None:
     The file is the repository's (`<root>/leerie.toml` or
     `<root>/.leerie/config.toml`), read without following a link at it or
     at `.leerie` (DESIGN §6 *Leerie never reads through a link a repository
-    holds*): one there reads as absent."""
+    holds*): one there reads as absent. A setting that names a location
+    (`REPO_CONFIG_LOCATION_KEYS`) is never read from it: asking is a
+    `ValueError` (DESIGN §6 *No host path comes from a repository*)."""
+    if key in REPO_CONFIG_LOCATION_KEYS:
+        raise ValueError(f"{key} names a location and has no repository "
+                         "configuration key")
     path = Path(path)
     root = path.parent.parent if path.parent.name == ".leerie" \
         else path.parent
@@ -9221,10 +9241,10 @@ def resolve_inspect_dirs(repo_root: Path,
                          cli_values: list[str] | None = None) -> list[str]:
     """Resolve the extra inspection directories for classifier/planner/
     reconciler/provision. Order: --inspect-dir CLI flags (one or more, repeatable) →
-    LEERIE_INSPECT_DIRS env var (colon-separated) → inspect_dirs in
-    leerie.toml (comma-separated string) → []. Paths are expanded
-    (~ → $HOME) and resolved to absolute form so a relative path in TOML
-    still works after the orchestrator changes cwd. Non-existent paths
+    LEERIE_INSPECT_DIRS env var (colon-separated) → []. No leerie.toml tier:
+    a host directory comes only from the operator (REPO_CONFIG_LOCATION_KEYS).
+    Paths are expanded (~ → $HOME) and resolved to absolute form so a
+    relative path still works after the orchestrator changes cwd. Non-existent paths
     are accepted at resolve time — the CLI surfaces a clearer error if
     --add-dir gets a bad path, and we want startup to fail fast at the
     use site rather than rejecting a typo before classify even runs."""
@@ -9259,13 +9279,6 @@ def resolve_inspect_dirs(repo_root: Path,
     if env:
         for p in env.split(":"):
             _add(p)
-        return out
-    cfg = repo_root / INSPECT_DIRS_FILE
-    file_val = _read_toml_key(cfg, "inspect_dirs")
-    if file_val is not None:
-        for p in file_val.split(","):
-            _add(p)
-        return out
     return out
 
 
@@ -10047,28 +10060,31 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
     return efforts
 
 
+def _resolve_operator_str(cli_value: str | None, env_var: str,
+                          default: str) -> str:
+    """CLI > env > default, with no repository-file tier: for a setting that
+    names a location (REPO_CONFIG_LOCATION_KEYS)."""
+    if cli_value and cli_value.strip():
+        return cli_value.strip()
+    return os.environ.get(env_var, "").strip() or default
+
+
 def resolve_judge_dir(repo_root: Path, cli_value: str | None = None) -> str:
     """Resolve the judge output directory name. Order:
     --judge-dir CLI flag → LEERIE_JUDGE_DIR env var →
-    judge_dir in leerie.toml → JUDGE_DIR_DEFAULT ("judge-out").
-    The value is a plain directory name (or relative path) appended to
-    the run dir — not validated against the filesystem at resolve time."""
-    return _resolve_str_pref(
-        repo_root, cli_value,
-        env_var=JUDGE_DIR_ENV, file_key="judge_dir",
-        file_name=JUDGE_DIR_FILE, default=JUDGE_DIR_DEFAULT)
+    JUDGE_DIR_DEFAULT ("judge-out"). No leerie.toml tier: the value is a
+    location (REPO_CONFIG_LOCATION_KEYS). It is a plain directory name (or
+    relative path) appended to the run dir — not validated against the
+    filesystem at resolve time."""
+    return _resolve_operator_str(cli_value, JUDGE_DIR_ENV, JUDGE_DIR_DEFAULT)
 
 
 def resolve_heal_dir(repo_root: Path, cli_value: str | None = None) -> str:
     """Resolve the heal output directory name. Order:
     --heal-dir CLI flag → LEERIE_HEAL_DIR env var →
-    heal_dir in leerie.toml → HEAL_DIR_DEFAULT ("heal-out").
-    The value is a plain directory name (or relative path) appended to
-    the run dir — not validated against the filesystem at resolve time."""
-    return _resolve_str_pref(
-        repo_root, cli_value,
-        env_var=HEAL_DIR_ENV, file_key="heal_dir",
-        file_name=HEAL_DIR_FILE, default=HEAL_DIR_DEFAULT)
+    HEAL_DIR_DEFAULT ("heal-out"). No leerie.toml tier, as
+    `resolve_judge_dir`."""
+    return _resolve_operator_str(cli_value, HEAL_DIR_ENV, HEAL_DIR_DEFAULT)
 
 
 def resolve_heal_max_rounds(repo_root: Path, cli_value: int | None = None) -> int:
@@ -23518,16 +23534,92 @@ def _landlock() -> types.ModuleType:
     return mod
 
 
-def _require_confinement(run_dir: Path) -> None:
+def _require_confinement(run_dir: Path, state_root: Path,
+                         checkout: Path) -> None:
     """The one entry every invocation that runs a worker or a repository
     command passes through, before it starts any (DESIGN §6 *Fail closed, on
-    every entry*): the kernel confines (`_require_landlock`) and the runtime
-    builds the held-out sandbox and isolation (`_require_heldout_sandbox`,
-    which turns isolation on). `main()` calls it for a fresh run, `resume`
-    and `--phase` alike; a resumed run used to skip both, so nothing it
-    spawned was isolated."""
+    every entry*): the kernel confines (`_require_landlock`), no grant on the
+    checkout reaches the state root by a second name
+    (`_require_state_root_apart`), and the runtime builds the held-out
+    sandbox and isolation (`_require_heldout_sandbox`, which turns isolation
+    on). `main()` calls it for a fresh run, `resume` and `--phase` alike; a
+    resumed run used to skip the checks, so nothing it spawned was
+    isolated."""
     _require_landlock()
+    _require_state_root_apart(state_root, checkout)
     _require_heldout_sandbox(run_dir)
+
+
+MOUNTINFO = Path("/proc/self/mountinfo")
+
+
+def _mountinfo_unescape(field: str) -> str:
+    """A mountinfo path field, its octal escapes (`\\040` for a space)
+    decoded."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _disk_place(path: Path) -> tuple[str, str]:
+    """Where `path` is on disk: the device and the path within its
+    filesystem, from the `/proc/self/mountinfo` line of the mount holding
+    its real path (the longest mount point at or above it; of equal ones the
+    last, which is the mount on top). Two names of one directory — a bind
+    mount of it, and its path under another mount of the same filesystem —
+    have one place. Without a readable mountinfo the place is the real path."""
+    real = os.path.realpath(path)
+    best: tuple[int, str, str] | None = None
+    try:
+        lines = MOUNTINFO.read_text().splitlines()
+    except OSError:
+        return ("", real)
+    for line in lines:
+        f = line.split(" ")
+        if len(f) < 5:
+            continue
+        dev, root, point = f[2], _mountinfo_unescape(f[3]), \
+            _mountinfo_unescape(f[4])
+        if real != point and not real.startswith(point.rstrip("/") + "/"):
+            continue
+        if best is None or len(point) >= best[0]:
+            rest = real[len(point.rstrip("/")):]
+            best = (len(point), dev, root.rstrip("/") + rest or "/")
+    if best is None:
+        return ("", real)
+    return (best[1], os.path.normpath(best[2]))
+
+
+def _nested(a: str, b: str) -> bool:
+    """`a` is `b` or beneath it, or `b` beneath `a`."""
+    a, b = a.rstrip("/") or "/", b.rstrip("/") or "/"
+    return (a == b or a.startswith(b.rstrip("/") + "/")
+            or b.startswith(a.rstrip("/") + "/"))
+
+
+def _require_state_root_apart(state_root: Path, checkout: Path) -> None:
+    """Stop the run when the state root has a second name through the
+    checkout (DESIGN §6 *No host path comes from a repository*, part 3).
+    Every grant is carved by path: `_around` takes the state root out of a
+    grant whose path contains it. A state root that is the checkout's
+    directory under another mount — `/leerie-state` bind-mounted from
+    `<checkout>/.lstate`, which `/work` shows too — is contained by no
+    grant's path, so every worker's read of `/work` reached the held-out sets
+    and the credentials' copies. A state root that holds the checkout under a
+    second name makes the checkout writable through it. The places on disk
+    are compared (`_disk_place`), and their nesting must be the paths'."""
+    s_dev, s_place = _disk_place(state_root)
+    c_dev, c_place = _disk_place(checkout)
+    on_disk = s_dev == c_dev and _nested(s_place, c_place)
+    by_path = _nested(os.path.realpath(state_root),
+                      os.path.realpath(checkout))
+    if on_disk and not by_path:
+        die(f"the state root {state_root} and the checkout {checkout} are "
+            f"one directory tree on disk ({s_place} and {c_place}) under "
+            "two names, so the checkout's mount would show every worker the "
+            "run's state, or the state root's would hold the checkout "
+            "writable. Keep the state root outside the checkout: set "
+            "--state-dir or LEERIE_STATE_DIR to a directory neither inside "
+            "nor above it (DESIGN §6 *No host path comes from a "
+            "repository*).")
 
 
 def _require_landlock() -> None:
@@ -69028,8 +69120,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "Forwarded to `claude -p` as --add-dir. Repeatable. "
                          "Use for sibling repos referenced in the task that "
                          "live outside the current repo cwd. Default: none. "
-                         f"Also {INSPECT_DIRS_ENV} (colon-separated) or "
-                         "inspect_dirs in leerie.toml (comma-separated).")
+                         f"Also {INSPECT_DIRS_ENV} (colon-separated).")
     ap.add_argument("--model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for all workers "
                          f"({'|'.join(MODEL_VALUES)}); without an override, "
@@ -69111,11 +69202,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     ap.add_argument("--judge-dir", metavar="DIR",
                     help=f"subdirectory name under the run dir for LLM judge "
                          f"output (default '{JUDGE_DIR_DEFAULT}'); also "
-                         f"{JUDGE_DIR_ENV} or judge_dir in leerie.toml")
+                         f"{JUDGE_DIR_ENV}")
     ap.add_argument("--heal-dir", metavar="DIR",
                     help=f"subdirectory name under the run dir for LLM self-heal "
                          f"output (default '{HEAL_DIR_DEFAULT}'); also "
-                         f"{HEAL_DIR_ENV} or heal_dir in leerie.toml")
+                         f"{HEAL_DIR_ENV}")
     ap.add_argument("--phase", choices=["judge", "heal"], metavar="PHASE",
                     help="run a post-run skill phase against an existing run's "
                          "captured LLM calls instead of starting a new run. "
@@ -69344,7 +69435,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # *Fail closed, on every entry*). An unconditional statement of this
     # body on purpose: `tests/test_confinement_entry.py` proves by rule that
     # nothing above it spawns a confined process.
-    _require_confinement(st.run_dir)
+    _require_confinement(st.run_dir, leerie_root, repo_root)
 
     # Resolve per-worker cgroup memory cap; resolver die()s on a bad size
     # string. Auto-derives a fixed isolation CEILING from the shared
@@ -69503,8 +69594,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         repo_root, getattr(args, "pr_base_branch", None))
 
     # Resolve --inspect-dir: CLI flags (repeatable) → LEERIE_INSPECT_DIRS
-    # env (colon-separated) → inspect_dirs in leerie.toml (comma-separated)
-    # → []. Re-attached to args so _orchestrate() can fold it into state.
+    # env (colon-separated) → [] (no leerie.toml key:
+    # REPO_CONFIG_LOCATION_KEYS). Re-attached to args so _orchestrate() can fold it into state.
     args.inspect_dirs = resolve_inspect_dirs(
         repo_root, getattr(args, "inspect_dir", None))
 

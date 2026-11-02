@@ -494,13 +494,15 @@ def test_a_relative_path_the_operator_gave_is_still_the_checkouts(
         tmp_path: Path) -> None:
     """Leaving the checkout keeps the operator's relative paths meaning
     what they meant: a missing relative task file is reported as missing,
-    and a relative `--state-dir` lands beneath the checkout."""
+    and a relative `--state-dir` is anchored at the checkout (beside it
+    here: one inside it is refused, DESIGN §6 *No host path comes from a
+    repository*)."""
     co = _hostile_checkout(tmp_path, tmp_path / "RAN_ON_HOST")
     env = _shims(tmp_path, co)
     env.pop("LEERIE_STATE_DIR")
-    r = _launcher(["list", "--state-dir", "rel-state"], co, env)
+    r = _launcher(["list", "--state-dir", "../rel-state"], co, env)
     assert r.returncode == 0, r.stderr[-800:]
-    assert (co / "rel-state").is_dir()
+    assert (tmp_path / "rel-state").is_dir()
     (co / "task.md").write_text("do it\n")
     r = _launcher(["missing.md"], co, env)
     assert r.returncode == 1 and "task file not found: missing.md" in \

@@ -89,9 +89,9 @@ case "$OPERATOR_DIR" in
 esac
 unset LEERIE_LAUNCHER_CWD LEERIE_LAUNCHER_PID _leerie_self _leerie_bash
 
-# A path the operator gave relative to where they started leerie (a flag, an
-# environment variable, a leerie.toml value) means the same path beneath
-# that directory, which is no longer the launcher's working directory.
+# A path the operator gave relative to where they started leerie (a flag or an
+# environment variable; no leerie.toml key names a path) means the same path
+# beneath that directory, which is no longer the launcher's working directory.
 _from_checkout() {
   case "$1" in
     /*|"") printf '%s' "$1" ;;
@@ -178,6 +178,49 @@ if [ "${1:-}" != "version" ] && _ccl="$(_checkout_config_links)" && \
   exit 1
 fi
 unset _ccl
+
+# --- the checkout's leerie.toml names no location -------------------------
+# DESIGN §6 *No host path comes from a repository*. leerie.toml is the
+# repository's content — a cloned repository's, or a run branch's the
+# operator merged — and these settings name where the host writes or what a
+# worker reads: `log_file = "~/.bashrc"` made the launcher append the run's
+# output there, `state_dir` inside the checkout showed every worker the
+# run's state through /work. They come only from the operator (a flag, the
+# environment). A file that still sets one stops here, before anything reads
+# it, naming the replacement: ignoring the key would silently move a run's
+# state away from where its operator looks. One `key =` line each, matched
+# as the orchestrator's `_read_toml_key` reads them. The list is
+# REPO_CONFIG_LOCATION_KEYS in orchestrator/leerie.py
+# (tests/test_repo_config_names_no_location.py pins the two together).
+_checkout_config_location_keys() {
+  local _k _found=""
+  [ -f "$USER_REPO/leerie.toml" ] || return 0
+  for _k in state_dir log_file inspect_dirs judge_dir heal_dir; do
+    if grep -qE "^[[:space:]]*${_k}[[:space:]]*=" "$USER_REPO/leerie.toml" \
+         2>/dev/null; then
+      _found="$_found $_k"
+    fi
+  done
+  printf '%s' "${_found# }"
+}
+_location_key_replacement() {
+  case "$1" in
+    state_dir)    printf '%s' "--state-dir PATH or LEERIE_STATE_DIR=PATH" ;;
+    log_file)     printf '%s' "--log-file PATH or LEERIE_LOG_FILE=PATH" ;;
+    inspect_dirs) printf '%s' "--inspect-dir PATH (repeatable) or LEERIE_INSPECT_DIRS=PATH:PATH" ;;
+    judge_dir)    printf '%s' "--judge-dir DIR or LEERIE_JUDGE_DIR=DIR" ;;
+    heal_dir)     printf '%s' "--heal-dir DIR or LEERIE_HEAL_DIR=DIR" ;;
+  esac
+}
+if [ "${1:-}" != "version" ] && _clk="$(_checkout_config_location_keys)" && \
+   [ -n "$_clk" ]; then
+  remote_log "error: $USER_REPO/leerie.toml sets $_clk. A setting that names a location comes only from you, never from the repository's own files, which a cloned repository or a merged run branch chooses. Remove the line from leerie.toml and set it on your side instead:"
+  for _k in $_clk; do
+    echo "  $_k  →  $(_location_key_replacement "$_k")" >&2
+  done
+  exit 1
+fi
+unset _clk _k
 
 
 # Extract the host's Claude OAuth credentials JSON for forwarding to
@@ -878,9 +921,10 @@ _reap_orphaned_container() {
 #
 # Precedence (lowest → highest):
 #   default ($HOME/.leerie/<basename>)
-#   → leerie.toml `state_dir = ...`
 #   → LEERIE_STATE_DIR env var
 #   → --state-dir CLI flag
+# No leerie.toml tier: the repository never chooses a host path (refused
+# above, `_checkout_config_location_keys`).
 #
 # The default key is just the repo basename. Cross-repo basename collisions
 # (two different abs_paths sharing the same basename) are caught at
@@ -895,27 +939,6 @@ _state_dir_default() {
 }
 
 LEERIE_STATE_HOST_DIR="$(_state_dir_default)"
-
-# TOML override: state_dir = /some/path
-if [ -f "$USER_REPO/leerie.toml" ]; then
-  _toml_state_dir="$( { grep -E '^[[:space:]]*state_dir[[:space:]]*=' \
-                            "$USER_REPO/leerie.toml" 2>/dev/null \
-                        || true; } \
-                      | sed -n 1p \
-                      | sed -E 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*//;
-                                s/[[:space:]]*$//;
-                                s/^"(.*)"$/\1/;
-                                s/^'"'"'(.*)'"'"'$/\1/')"
-  if [ -n "$_toml_state_dir" ]; then
-    # Expand leading ~ so relative-home paths work as TOML values.
-    case "$_toml_state_dir" in
-      "~")   _toml_state_dir="$HOME" ;;
-      "~/"*) _toml_state_dir="$HOME/${_toml_state_dir#"~/"}" ;;
-    esac
-    LEERIE_STATE_HOST_DIR="$_toml_state_dir"
-  fi
-  unset _toml_state_dir
-fi
 
 # Env override: LEERIE_STATE_DIR
 if [ -n "${LEERIE_STATE_DIR:-}" ]; then
@@ -956,7 +979,29 @@ esac
 
 export LEERIE_STATE_HOST_DIR
 
-# --- --log-file / LEERIE_LOG_FILE / leerie.toml log_file (N5b) -----------
+# --- the state root never overlaps the checkout ---------------------------
+# DESIGN §6 *No host path comes from a repository*, part 2. Beneath the
+# checkout, the state root is in the checkout's mount (/work) too, where
+# every worker reads: the held-out sets, every worker's notes, the copies of
+# the credentials. Above it, the state root's read-write mount holds the
+# checkout. Compared by real path; a state root that does not exist yet is
+# resolved from its deepest existing directory.
+_state_root_overlaps_checkout() {
+  python3 -I -c '
+import os, sys
+s, c = (os.path.realpath(a) for a in sys.argv[1:3])
+def under(a, b):
+    return a == b or a.startswith(b.rstrip("/") + "/")
+print("yes" if under(s, c) or under(c, s) else "")
+' "$1" "$2"
+}
+if [ "${1:-}" != "version" ] && \
+   [ -n "$(_state_root_overlaps_checkout "$LEERIE_STATE_HOST_DIR" "$USER_REPO")" ]; then
+  remote_log "error: the state root $LEERIE_STATE_HOST_DIR overlaps the checkout $USER_REPO (it is the checkout, inside it or above it). The run's state — held-out tests, notes, copies of your credentials — must never be visible to the workers that read the checkout. Set --state-dir PATH or LEERIE_STATE_DIR=PATH to a directory outside it (default: \$HOME/.leerie/<repo>)."
+  exit 1
+fi
+
+# --- --log-file / LEERIE_LOG_FILE (N5b) -----------------------------------
 # Resolves LEERIE_LOG_FILE_RESOLVED: where a `leerie task | tee <path>`
 # operator should point their tee (or, once bugfix-002 wires teeing itself,
 # where the launcher writes its own copy). N5 (PR #188) added a startup
@@ -975,9 +1020,9 @@ export LEERIE_STATE_HOST_DIR
 #
 # Precedence (lowest → highest), mirroring the --state-dir block above:
 #   default ($LEERIE_STATE_HOST_DIR/logs/leerie-<pid>.log)
-#   → leerie.toml `log_file = ...`
 #   → LEERIE_LOG_FILE env var
 #   → --log-file CLI flag
+# No leerie.toml tier: the repository never chooses where the host writes.
 _cli_log_file=""
 _prev_was_log_file=false
 for arg in "$@"; do
@@ -998,20 +1043,7 @@ if [ -n "$_cli_log_file" ]; then
 elif [ -n "${LEERIE_LOG_FILE:-}" ]; then
   LEERIE_LOG_FILE_RESOLVED="$LEERIE_LOG_FILE"
 else
-  _toml_log_file="$( { grep -E '^[[:space:]]*log_file[[:space:]]*=' \
-                            "$USER_REPO/leerie.toml" 2>/dev/null \
-                        || true; } \
-                      | sed -n 1p \
-                      | sed -E 's/^[[:space:]]*log_file[[:space:]]*=[[:space:]]*//;
-                                s/[[:space:]]*$//;
-                                s/^"(.*)"$/\1/;
-                                s/^'"'"'(.*)'"'"'$/\1/')"
-  if [ -n "$_toml_log_file" ]; then
-    LEERIE_LOG_FILE_RESOLVED="$_toml_log_file"
-  else
-    LEERIE_LOG_FILE_RESOLVED="$LEERIE_STATE_HOST_DIR/logs/leerie-$$.log"
-  fi
-  unset _toml_log_file
+  LEERIE_LOG_FILE_RESOLVED="$LEERIE_STATE_HOST_DIR/logs/leerie-$$.log"
 fi
 unset _cli_log_file _prev_was_log_file
 
@@ -1141,7 +1173,7 @@ mkdir -p "$(dirname "$LEERIE_LOG_FILE_RESOLVED")" 2>/dev/null || true
 # Called once after resolution and again from verb arms that need it
 # (skipped for version, which exits before doing any I/O on the state
 # dir). On any anomaly: die() with an actionable message naming the
-# --state-dir / LEERIE_STATE_DIR / leerie.toml overrides.
+# --state-dir / LEERIE_STATE_DIR overrides.
 _validate_state_ownership() {
   local dir="$LEERIE_STATE_HOST_DIR"
   if [ ! -e "$dir" ]; then
@@ -1164,7 +1196,6 @@ _validate_state_ownership() {
     echo "refusing to write run state here. pick a different path with one of:" >&2
     echo "  --state-dir /some/path" >&2
     echo "  LEERIE_STATE_DIR=/some/path" >&2
-    echo "  leerie.toml: state_dir = \"/some/path\"" >&2
     exit 1
   fi
   if [ -f "$dir/.owner" ]; then
@@ -1179,7 +1210,6 @@ _validate_state_ownership() {
     echo "two repos share a basename. pick a different path with one of:" >&2
     echo "  --state-dir /some/path" >&2
     echo "  LEERIE_STATE_DIR=/some/path" >&2
-    echo "  leerie.toml: state_dir = \"/some/path\"" >&2
     exit 1
   fi
   # No .owner sidecar. Distinguish a legitimate state dir (one with
@@ -1196,7 +1226,6 @@ _validate_state_ownership() {
     echo "refusing to write run state here. pick a different path with one of:" >&2
     echo "  --state-dir /some/path" >&2
     echo "  LEERIE_STATE_DIR=/some/path" >&2
-    echo "  leerie.toml: state_dir = \"/some/path\"" >&2
     exit 1
   fi
   # Installer-subtree detect. The installer (scripts/install.sh) clones
@@ -1217,8 +1246,7 @@ _validate_state_ownership() {
         echo "refusing to write run state here. pick a different path with one of:" >&2
         echo "  --state-dir /some/path" >&2
         echo "  LEERIE_STATE_DIR=/some/path" >&2
-        echo "  leerie.toml: state_dir = \"/some/path\"" >&2
-        exit 1
+            exit 1
         ;;
     esac
   fi
@@ -6979,8 +7007,9 @@ unset _leerie_dockerfile
 # inspect-bucket workers need read access to (--add-dir under the hood).
 # Bind-mount each one read-only at /inspect/<basename> and rewrite the arg
 # so the in-container view matches. Paths from LEERIE_INSPECT_DIRS (colon-sep)
-# and leerie.toml's inspect_dirs (comma-sep) need the same treatment — we
-# resolve them on the host and emit --inspect-dir CLI flags. LEERIE_INSPECT_DIRS
+# need the same treatment — we resolve them on the host and emit
+# --inspect-dir CLI flags. (leerie.toml has no inspect_dirs key: a host
+# directory to mount comes only from the operator.) LEERIE_INSPECT_DIRS
 # is cleared inside the container so resolve_inspect_dirs() picks up only
 # our rewritten CLI flags.
 INSPECT_MOUNTS=()
@@ -7068,26 +7097,6 @@ if [ -n "${LEERIE_INSPECT_DIRS:-}" ]; then
     [ -z "$p" ] || collect_inspect_path "$p"
   done
   IFS="$OIFS"
-fi
-# Pre-pass: leerie.toml inspect_dirs key (comma-separated).
-# The orchestrator's resolve_inspect_dirs() precedence is CLI > env > TOML,
-# so once we emit --inspect-dir CLI flags here, the in-container TOML pass
-# is bypassed. Best-effort parse: awk-grep the simple key=value form.
-if [ -f "$USER_REPO/leerie.toml" ]; then
-  toml_dirs="$(awk -F= '/^[[:space:]]*inspect_dirs[[:space:]]*=/ {
-                          gsub(/^[[:space:]]*inspect_dirs[[:space:]]*=[[:space:]]*/, "", $0);
-                          gsub(/^"|"$/, "", $0);
-                          print; exit
-                        }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
-  if [ -n "$toml_dirs" ]; then
-    OIFS="$IFS"; IFS=","
-    for p in $toml_dirs; do
-      # Trim whitespace.
-      p="$(printf '%s' "$p" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-      [ -z "$p" ] || collect_inspect_path "$p"
-    done
-    IFS="$OIFS"
-  fi
 fi
 # Main pass: rewrite --inspect-dir in $@. The orchestrator's argparse
 # declares only --inspect-dir (no -i alias — see leerie.py:6079), so we

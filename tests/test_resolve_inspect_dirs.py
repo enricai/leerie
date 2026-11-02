@@ -1,8 +1,8 @@
 """Tests for resolve_inspect_dirs() — the --inspect-dir resolver.
 
 Covers the precedence order: CLI flag (repeatable) → LEERIE_INSPECT_DIRS
-env var (colon-separated) → inspect_dirs in leerie.toml (comma-separated)
-→ [].
+env var (colon-separated) → []. No leerie.toml tier (DESIGN §6 *No host
+path comes from a repository*).
 
 Also covers path expansion (~ → $HOME), absolute-path normalization, and
 dedup of repeated entries.
@@ -89,43 +89,20 @@ def test_env_colon_separated(leerie, repo_root, tmp_path, monkeypatch):
     assert out == [str(a.resolve()), str(b.resolve())]
 
 
-def test_env_wins_over_file(leerie, repo_root, tmp_path, monkeypatch):
-    """Env is a session knob and outranks the committed leerie.toml
-    default — same precedence pattern as source-of-truth / no-push."""
-    env_dir = tmp_path / "env"
-    file_dir = tmp_path / "file"
-    env_dir.mkdir()
-    file_dir.mkdir()
-    monkeypatch.setenv("LEERIE_INSPECT_DIRS", str(env_dir))
-    (repo_root / "leerie.toml").write_text(
-        f'inspect_dirs = "{file_dir}"\n')
-    out = leerie.resolve_inspect_dirs(repo_root, cli_values=None)
-    assert out == [str(env_dir.resolve())]
-
-
-def test_file_comma_separated(leerie, repo_root, tmp_path):
+def test_leerie_toml_names_no_inspect_dir(leerie, repo_root, tmp_path):
+    """A host directory to mount comes only from the operator: a
+    repository's `inspect_dirs` (`~/.ssh`) is never read (DESIGN §6 *No host
+    path comes from a repository*)."""
     a = tmp_path / "a"
-    b = tmp_path / "b"
     a.mkdir()
-    b.mkdir()
-    (repo_root / "leerie.toml").write_text(
-        f'inspect_dirs = "{a},{b}"\n')
-    out = leerie.resolve_inspect_dirs(repo_root, cli_values=None)
-    assert out == [str(a.resolve()), str(b.resolve())]
+    (repo_root / "leerie.toml").write_text(f'inspect_dirs = "{a}"\n')
+    assert leerie.resolve_inspect_dirs(repo_root, cli_values=None) == []
 
-
-def test_env_empty_string_falls_through(leerie, repo_root, tmp_path,
-                                        monkeypatch):
+def test_env_empty_string_falls_through(leerie, repo_root, monkeypatch):
     """LEERIE_INSPECT_DIRS="" should be treated as unset, not as a single
     empty-path value."""
-    file_dir = tmp_path / "file"
-    file_dir.mkdir()
     monkeypatch.setenv("LEERIE_INSPECT_DIRS", "")
-    (repo_root / "leerie.toml").write_text(
-        f'inspect_dirs = "{file_dir}"\n')
-    out = leerie.resolve_inspect_dirs(repo_root, cli_values=None)
-    assert out == [str(file_dir.resolve())]
-
+    assert leerie.resolve_inspect_dirs(repo_root, cli_values=None) == []
 
 def test_tilde_expansion(leerie, repo_root, monkeypatch, tmp_path):
     """`~/foo` in any source must expand to $HOME/foo so a user can write

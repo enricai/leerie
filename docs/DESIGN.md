@@ -3311,6 +3311,59 @@ content reached through a path the repository shapes:
 The functions that read a repository's content use no raw primitive
 (`tests/test_leerie_reads_never_follow_links.py`).
 
+### No host path comes from a repository
+
+*Designed 2026-11-02 (review round 27, isolation I6).*
+
+**Root cause.** `leerie.toml` is repository content (the section above): a
+cloned repository's, or a run branch's that the operator merged, since a
+worker may commit a root `leerie.toml`. Five of its keys named a location on
+the host or in the run directory, below only the operator's flag and
+environment. `log_file = "~/.bashrc"` made the launcher create that file and
+append the whole run's output to it, and that output carries worker text
+verbatim (a judge's `concrete_case`, a blocker's reason), with its newlines.
+The operator's next shell would run it. `state_dir = ".lstate"` put the state
+root inside the checkout. In the container that one directory is then both
+`/leerie-state` and `/work/.lstate`. Every grant is carved by path, and `/work`
+does not contain `/leerie-state`, so every worker's read of `/work` reached
+the held-out sets, every other worker's notes and the copies of the
+credentials. `inspect_dirs` chose a host directory to mount into the container,
+or on Fly and EC2 to copy to the machine. `judge_dir` and `heal_dir`, joined to
+the run directory, could name any path the orchestrator can write. "Always
+outside the target repo" was written down and never checked.
+
+**Invariant: no host path comes from a repository's content, and the state
+root is never at, inside or above the checkout.** It is constructed in three
+parts.
+
+1. *A location comes only from the operator.* `state_dir`, `log_file`,
+   `inspect_dirs`, `judge_dir` and `heal_dir` have no `leerie.toml` key. They
+   come from a flag or the environment (`--state-dir` / `LEERIE_STATE_DIR`,
+   `--log-file` / `LEERIE_LOG_FILE`, `--inspect-dir` / `LEERIE_INSPECT_DIRS`,
+   `--judge-dir` / `LEERIE_JUDGE_DIR`, `--heal-dir` / `LEERIE_HEAL_DIR`). A
+   `leerie.toml` that still sets one stops the launcher before anything else
+   reads it, and the message names the key's operator-side replacement: a
+   key silently ignored would move a run's state away from where its
+   operator looks for it. The orchestrator reads none of them from the file,
+   and its one reader of `leerie.toml` refuses those names
+   (`REPO_CONFIG_LOCATION_KEYS`).
+2. *The launcher refuses a state root that overlaps the checkout.* It compares
+   the two by real path, after every tier is resolved. A state root equal to
+   the checkout, beneath it or above it stops the run. Beneath, the checkout's
+   mount shows the state root to every worker. Above, the state root's mount
+   holds the checkout writable.
+3. *The orchestrator refuses a state root reachable by a second name.* Inside
+   the container the two are separate mounts, and the launcher's check is the
+   only one that sees the host's paths. So the entry every invocation runs
+   (`_require_confinement`) resolves each of the two paths to its place on
+   disk: the device and the path within the filesystem that
+   `/proc/self/mountinfo` gives for the mount holding it. When one lies
+   at or beneath the other on disk, but not by path, the state root has a
+   second name that no grant carves out, and the run stops. A state root
+   nested in the checkout by path as well (the direct-call default,
+   `<repo>/.leerie`, which only tests use) is carved out of every grant by
+   path, as before.
+
 ### A confined command's scratch is short and private
 
 *Designed 2026-11-01 (review round 19, execution H1).*
@@ -15330,8 +15383,8 @@ stored inside it would vanish exactly when a successor worker needs it.
 Coordination state is **per-run**, rooted at `<state-root>/runs/<run-id>/`
 (where `<state-root>` is the resolved state directory — default
 `$HOME/.leerie/<basename>/`, overridable via `LEERIE_STATE_DIR` /
-`--state-dir` / `leerie.toml state_dir`; always outside the target
-repo). The default key is the repo basename only; cross-repo basename
+`--state-dir`, never a `leerie.toml` key; never at, inside or above the
+target repo, §6 *No host path comes from a repository*). The default key is the repo basename only; cross-repo basename
 collisions (two different abs_paths sharing a basename) are caught at
 use time via an `.owner` sidecar inside the dir that records the
 abs_path of the repo that owns it — the launcher refuses to write into

@@ -701,6 +701,36 @@ the checkout chose*), each proof inverted and live-falsified:
   directory. Falsified: reverting the identity reads, one seam's
   `USER_REPO` and the prologue's empty check turns 6 of the 8 red.
 
+`tests/test_repo_config_names_no_location.py` (25 tests: 12 functions;
+DESIGN §6 *No host path comes from a repository*, review round 27 isolation
+I6). The real launcher, started in a checkout whose `leerie.toml` sets
+`log_file`, `state_dir`, `inspect_dirs`, `judge_dir` or `heal_dir`, exits 1
+naming each key and its operator-side replacement, and creates neither
+`~/.bashrc` nor a state root; a file with only other keys, or a
+commented-out key, passes. The reviewer's harness (the resolution block
+from `_state_dir_default` through `export LEERIE_LOG_FILE_RESOLVED`, plus
+the tee-target check) resolves the default state root and log for a
+checkout naming `~/.bashrc` and `.lstate`. The launcher refuses a state root
+equal to, inside or above the checkout from the environment and the flag, a
+relative one anchored inside it, and a link into it (by real path); a
+sibling whose name starts with the checkout's passes. The launcher's key
+list is `REPO_CONFIG_LOCATION_KEYS`, `_read_toml_key` raises for each key,
+and neither the orchestrator nor the launcher spells a read of one.
+Falsified: disabling the launcher's refusal turns the 6 key tests red;
+making `_state_root_overlaps_checkout` print nothing turns the 8 overlap
+tests red; dropping `_read_toml_key`'s guard turns its 5 cases red.
+
+`tests/test_state_root_apart.py` (10 tests; part 3 of the same section).
+`_require_state_root_apart` over a planted `/proc/self/mountinfo`: a state
+root bind-mounted from inside the checkout, one holding the checkout, and
+the same directory under two mounts stop the run (the first also shows the
+reviewer's mechanism, `_around(["/work"], Path("/leerie-state"))` keeping
+`/work` whole); the default sibling layout, a prefix-sharing name and
+another device pass; octal escapes are decoded and the mount on top wins.
+On the real mounts, a state root nested by path (the direct-call default)
+and two separate directories pass. Falsified: never stopping turns the 4
+stopping tests red.
+
 ## fetch_branch, config, and group verbs
 
 The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)

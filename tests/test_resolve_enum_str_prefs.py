@@ -212,20 +212,15 @@ def test_judge_dir_env_var_name(leerie, dir_repo_root, monkeypatch):
     assert leerie.resolve_judge_dir(dir_repo_root) == "custom-judge"
 
 
-def test_judge_dir_file_key(leerie, dir_repo_root):
-    (dir_repo_root / "leerie.toml").write_text("judge_dir = custom-judge\n")
-    assert leerie.resolve_judge_dir(dir_repo_root) == "custom-judge"
-
+def test_judge_dir_has_no_file_key(leerie, dir_repo_root):
+    """A location: a repository's leerie.toml never chooses it (DESIGN §6
+    *No host path comes from a repository*)."""
+    (dir_repo_root / "leerie.toml").write_text("judge_dir = ../../escape\n")
+    assert leerie.resolve_judge_dir(dir_repo_root) == "judge-out"
 
 def test_judge_dir_cli_wins(leerie, dir_repo_root, monkeypatch):
     monkeypatch.setenv("LEERIE_JUDGE_DIR", "from-env")
     assert leerie.resolve_judge_dir(dir_repo_root, cli_value="from-cli") == "from-cli"
-
-
-def test_judge_dir_env_wins_over_file(leerie, dir_repo_root, monkeypatch):
-    (dir_repo_root / "leerie.toml").write_text("judge_dir = from-toml\n")
-    monkeypatch.setenv("LEERIE_JUDGE_DIR", "from-env")
-    assert leerie.resolve_judge_dir(dir_repo_root) == "from-env"
 
 
 def test_heal_dir_default(leerie, dir_repo_root):
@@ -237,20 +232,13 @@ def test_heal_dir_env_var_name(leerie, dir_repo_root, monkeypatch):
     assert leerie.resolve_heal_dir(dir_repo_root) == "custom-heal"
 
 
-def test_heal_dir_file_key(leerie, dir_repo_root):
-    (dir_repo_root / "leerie.toml").write_text("heal_dir = custom-heal\n")
-    assert leerie.resolve_heal_dir(dir_repo_root) == "custom-heal"
-
+def test_heal_dir_has_no_file_key(leerie, dir_repo_root):
+    (dir_repo_root / "leerie.toml").write_text("heal_dir = /leerie-host/x\n")
+    assert leerie.resolve_heal_dir(dir_repo_root) == "heal-out"
 
 def test_heal_dir_cli_wins(leerie, dir_repo_root, monkeypatch):
     monkeypatch.setenv("LEERIE_HEAL_DIR", "from-env")
     assert leerie.resolve_heal_dir(dir_repo_root, cli_value="from-cli") == "from-cli"
-
-
-def test_heal_dir_env_wins_over_file(leerie, dir_repo_root, monkeypatch):
-    (dir_repo_root / "leerie.toml").write_text("heal_dir = from-toml\n")
-    monkeypatch.setenv("LEERIE_HEAL_DIR", "from-env")
-    assert leerie.resolve_heal_dir(dir_repo_root) == "from-env"
 
 
 def test_judge_dir_and_heal_dir_are_independent(leerie, dir_repo_root, monkeypatch):

@@ -1,19 +1,20 @@
-"""The launcher's --log-file / LEERIE_LOG_FILE / leerie.toml log_file
+"""The launcher's --log-file / LEERIE_LOG_FILE
 resolution (N5b, docs/IMPLEMENTATION.md "--log-file / LEERIE_LOG_FILE
 (N5b)").
 
 N5 (PR #188) added a startup warning for a tee log left inside $USER_REPO
 -- bind-mounted whole into every worker container, letting a worker read
 its own orchestration log and defeat judge independence. N5b is the
-promised follow-up: a --log-file knob, resolved with the same CLI > env >
-leerie.toml precedence every other leerie knob uses, whose *default* lands
+promised follow-up: a --log-file knob, resolved CLI > env (no leerie.toml
+tier: a repository never chooses where the host writes, DESIGN §6 *No host
+path comes from a repository*), whose *default* lands
 outside the repo -- specifically under LEERIE_STATE_HOST_DIR, settling N5's
 own stated residual over whether "outside the repo" should mean the state
 dir specifically.
 
 Resolution-only in this subtask: no I/O/teeing wiring is exercised here,
 only that LEERIE_LOG_FILE_RESOLVED comes out right for a given
-CLI/env/toml/none combination.
+CLI/env/none combination.
 
 The resolution block is extracted verbatim from the launcher (the
 `_extract_forwarding_loop` convention in `test_launcher_env_forwarding.py`,
@@ -36,8 +37,8 @@ def _extract_resolver() -> str:
     """Pull the --log-file resolution block verbatim from the launcher."""
     src = LAUNCHER.read_text()
     m = re.search(
-        r"(# --- --log-file / LEERIE_LOG_FILE / leerie\.toml log_file "
-        r"\(N5b\) -----------\n.*?\nexport LEERIE_LOG_FILE_RESOLVED\n)",
+        r"(# --- --log-file / LEERIE_LOG_FILE \(N5b\) -+\n"
+        r".*?\nexport LEERIE_LOG_FILE_RESOLVED\n)",
         src, re.DOTALL)
     assert m, "could not locate the --log-file resolution block in the launcher"
     return m.group(1)
@@ -96,25 +97,26 @@ def test_default_lands_under_state_dir_not_repo(tmp_path):
     assert str(repo) not in resolved
 
 
-def test_toml_wins_over_default(tmp_path):
+def test_toml_log_file_is_never_read(tmp_path):
+    """`log_file = "~/.bashrc"` in a repository's leerie.toml made the host
+    append the run's output, worker text included, to the operator's shell
+    startup file. The resolver has no file tier: the default stands."""
     repo, state_dir = _setup(tmp_path)
-    (repo / "leerie.toml").write_text('log_file = "/tmp/from-toml.log"\n')
+    (repo / "leerie.toml").write_text('log_file = "~/.bashrc"\n')
     result = _run(repo, state_dir, [])
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "/tmp/from-toml.log"
+    assert result.stdout.strip().startswith(str(state_dir) + "/logs/leerie-")
 
 
-def test_env_wins_over_toml(tmp_path):
+def test_env_wins_over_default(tmp_path):
     repo, state_dir = _setup(tmp_path)
-    (repo / "leerie.toml").write_text('log_file = "/tmp/from-toml.log"\n')
     result = _run(repo, state_dir, [], env={"LEERIE_LOG_FILE": "/tmp/from-env.log"})
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "/tmp/from-env.log"
 
 
-def test_cli_wins_over_env_and_toml(tmp_path):
+def test_cli_wins_over_env(tmp_path):
     repo, state_dir = _setup(tmp_path)
-    (repo / "leerie.toml").write_text('log_file = "/tmp/from-toml.log"\n')
     result = _run(
         repo, state_dir, ["--log-file", "/tmp/from-cli.log"],
         env={"LEERIE_LOG_FILE": "/tmp/from-env.log"},
@@ -135,7 +137,6 @@ def test_precedence_is_falsified_by_reverting_the_order(tmp_path):
     change the outcome, proving the precedence chain is load-bearing rather
     than accidentally satisfied by every tier agreeing."""
     repo, state_dir = _setup(tmp_path)
-    (repo / "leerie.toml").write_text('log_file = "/tmp/from-toml.log"\n')
     result = _run(
         repo, state_dir, ["--log-file", "/tmp/from-cli.log"],
         env={"LEERIE_LOG_FILE": "/tmp/from-env.log"},
@@ -143,7 +144,6 @@ def test_precedence_is_falsified_by_reverting_the_order(tmp_path):
     resolved = result.stdout.strip()
     assert resolved == "/tmp/from-cli.log"
     assert resolved != "/tmp/from-env.log"
-    assert resolved != "/tmp/from-toml.log"
 
 
 def test_log_file_registered_in_value_flags():

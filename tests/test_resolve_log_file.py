@@ -1,5 +1,6 @@
-"""Tests for the --log-file / LEERIE_LOG_FILE / leerie.toml `log_file`
-resolution block in the launcher (N5b).
+"""Tests for the --log-file / LEERIE_LOG_FILE resolution block in the
+launcher (N5b). No leerie.toml tier (DESIGN §6 *No host path comes from a
+repository*).
 
 The resolution logic lives in the bash launcher (`leerie`), extracted
 verbatim via regex (mirroring `_extract_guard()` in
@@ -9,7 +10,6 @@ echoes the resolved LEERIE_LOG_FILE_RESOLVED value.
 
 Precedence (lowest → highest):
   default ($LEERIE_STATE_HOST_DIR/logs/leerie-<pid>.log)
-  → leerie.toml `log_file = ...`
   → LEERIE_LOG_FILE env var
   → --log-file CLI flag
 """
@@ -29,7 +29,7 @@ def _extract_block() -> str:
     LEERIE_LOG_FILE_RESOLVED` line."""
     src = LAUNCHER.read_text()
     m = re.search(
-        r"(# --- --log-file / LEERIE_LOG_FILE / leerie\.toml log_file.*?"
+        r"(# --- --log-file / LEERIE_LOG_FILE \(N5b\).*?"
         r"\nexport LEERIE_LOG_FILE_RESOLVED\n)",
         src,
         re.DOTALL,
@@ -113,51 +113,16 @@ def test_default_key_is_stable_modulo_pid(tmp_path):
     assert out2.startswith(str(state_dir) + "/logs/leerie-")
 
 
-# ── leerie.toml `log_file` override ──────────────────────────────────────────
+# ── leerie.toml `log_file`: never read ───────────────────────────────────────
 
 
-def test_toml_log_file_overrides_default(tmp_path):
+def test_toml_log_file_is_never_read(tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     user_repo = tmp_path / "myproject"
     user_repo.mkdir()
     state_dir = tmp_path / "home" / ".leerie" / "myproject"
-    toml_log = tmp_path / "custom.log"
-    (user_repo / "leerie.toml").write_text(f"log_file = {toml_log}\n")
-    out = _run(user_repo, fake_home, state_dir, {}, [])
-    assert out == str(toml_log)
-
-
-def test_toml_log_file_quoted_value(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    state_dir = tmp_path / "home" / ".leerie" / "myproject"
-    toml_log = str(tmp_path / "quoted.log")
-    (user_repo / "leerie.toml").write_text(f'log_file = "{toml_log}"\n')
-    out = _run(user_repo, fake_home, state_dir, {}, [])
-    assert out == toml_log
-
-
-def test_toml_log_file_tilde_expansion(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    state_dir = tmp_path / "home" / ".leerie" / "myproject"
-    (user_repo / "leerie.toml").write_text("log_file = ~/mylog.log\n")
-    out = _run(user_repo, fake_home, state_dir, {}, [])
-    assert out == str(fake_home) + "/mylog.log"
-
-
-def test_toml_unrelated_key_leaves_default(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    state_dir = tmp_path / "home" / ".leerie" / "myproject"
-    (user_repo / "leerie.toml").write_text("runtime = local\n")
+    (user_repo / "leerie.toml").write_text('log_file = "~/.bashrc"\n')
     out = _run(user_repo, fake_home, state_dir, {}, [])
     assert out.startswith(str(state_dir) + "/logs/leerie-")
 
@@ -172,19 +137,6 @@ def test_env_overrides_default(tmp_path):
     user_repo.mkdir()
     state_dir = tmp_path / "home" / ".leerie" / "myproject"
     env_log = str(tmp_path / "env.log")
-    out = _run(user_repo, fake_home, state_dir, {"LEERIE_LOG_FILE": env_log}, [])
-    assert out == env_log
-
-
-def test_env_overrides_toml(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    state_dir = tmp_path / "home" / ".leerie" / "myproject"
-    toml_log = str(tmp_path / "toml.log")
-    env_log = str(tmp_path / "env.log")
-    (user_repo / "leerie.toml").write_text(f"log_file = {toml_log}\n")
     out = _run(user_repo, fake_home, state_dir, {"LEERIE_LOG_FILE": env_log}, [])
     assert out == env_log
 
@@ -239,19 +191,6 @@ def test_cli_overrides_env(tmp_path):
     assert out == cli_log
 
 
-def test_cli_overrides_toml(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    state_dir = tmp_path / "home" / ".leerie" / "myproject"
-    toml_log = str(tmp_path / "toml.log")
-    cli_log = str(tmp_path / "cli.log")
-    (user_repo / "leerie.toml").write_text(f"log_file = {toml_log}\n")
-    out = _run(user_repo, fake_home, state_dir, {}, [f"--log-file={cli_log}"])
-    assert out == cli_log
-
-
 def test_cli_tilde_expansion(tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
@@ -275,32 +214,23 @@ def test_env_tilde_expansion(tmp_path):
 # ── precedence summary ────────────────────────────────────────────────────────
 
 
-def test_precedence_cli_beats_env_beats_toml_beats_default(tmp_path):
-    """Full precedence ladder: CLI wins over env wins over toml wins over
-    default. Each tier is independently falsifiable -- remove the CLI
-    parse and the first assertion fails, remove the env check and the
-    second fails, remove the toml parse and the third fails."""
+def test_precedence_cli_beats_env_beats_default(tmp_path):
+    """Full precedence ladder: CLI wins over env wins over default. Each tier
+    is independently falsifiable -- remove the CLI parse and the first
+    assertion fails, remove the env check and the second fails."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     user_repo = tmp_path / "myproject"
     user_repo.mkdir()
     state_dir = tmp_path / "home" / ".leerie" / "myproject"
-    toml_log = str(tmp_path / "toml.log")
     env_log = str(tmp_path / "env.log")
     cli_log = str(tmp_path / "cli.log")
-    (user_repo / "leerie.toml").write_text(f"log_file = {toml_log}\n")
-
-    # All three set; CLI should win.
     out = _run(
         user_repo, fake_home, state_dir,
         {"LEERIE_LOG_FILE": env_log}, [f"--log-file={cli_log}"],
     )
     assert out == cli_log
-
-    # Remove CLI; env should win over toml.
     out = _run(user_repo, fake_home, state_dir, {"LEERIE_LOG_FILE": env_log}, [])
     assert out == env_log
-
-    # Remove env; toml should win over default.
     out = _run(user_repo, fake_home, state_dir, {}, [])
-    assert out == toml_log
+    assert out.startswith(str(state_dir) + "/logs/leerie-")

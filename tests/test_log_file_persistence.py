@@ -4,8 +4,7 @@ not just that the path resolves correctly (test_log_file_resolution.py)
 and not just that the teeing wiring exists in isolation
 (test_log_file_wiring.py, which takes LEERIE_LOG_FILE_RESOLVED as a given
 input). This file drives the launcher's own --log-file resolver
-(leerie:846-916, "# --- --log-file / LEERIE_LOG_FILE / leerie.toml
-log_file (N5b) ---") together with the decoupled-streaming teeing block
+("# --- --log-file / LEERIE_LOG_FILE (N5b) ---") together with the decoupled-streaming teeing block
 (leerie:7771-7935) in one harness, with a stubbed `nerdctl` that writes
 fixed, recognizable content to its stdout standing in for a real
 container run.
@@ -46,14 +45,14 @@ def _extract(start_marker: str, end_marker: str) -> str:
 
 
 def _extract_resolver() -> str:
-    """The --log-file / LEERIE_LOG_FILE / leerie.toml resolution block,
+    """The --log-file / LEERIE_LOG_FILE resolution block,
     including the parent-mkdir line that follows it -- without that mkdir
     a fresh target under a not-yet-existing directory (the common case)
     could never be probed writable by the setup block."""
     src = _launcher_text()
     m = re.search(
-        r"(# --- --log-file / LEERIE_LOG_FILE / leerie\.toml log_file "
-        r"\(N5b\) -----------\n.*?\nexport LEERIE_LOG_FILE_RESOLVED\n"
+        r"(# --- --log-file / LEERIE_LOG_FILE \(N5b\) -+\n"
+        r".*?\nexport LEERIE_LOG_FILE_RESOLVED\n"
         r".*?\nmkdir -p \"\$\(dirname \"\$LEERIE_LOG_FILE_RESOLVED\"\)\" "
         r"2>/dev/null \|\| true\n)",
         src, re.DOTALL)

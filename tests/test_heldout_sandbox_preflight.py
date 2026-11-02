@@ -169,8 +169,8 @@ def test_a_held_out_run_is_always_sandboxed(leerie, monkeypatch):
                             "--", "run"]
 
 
-def test_the_entry_runs_the_gate_right_after_landlock(leerie, monkeypatch,
-                                                     tmp_path):
+def test_the_entry_runs_landlock_the_state_root_check_then_the_gate(
+        leerie, monkeypatch, tmp_path):
     """Every invocation's entry (`_require_confinement`), no longer a
     fresh-only preflight step: tests/test_confinement_entry.py drives each
     of `main()`'s dispatch paths through it."""
@@ -181,15 +181,19 @@ def test_the_entry_runs_the_gate_right_after_landlock(leerie, monkeypatch,
 
     monkeypatch.setattr(leerie, "_require_landlock",
                         lambda: order.append("landlock"))
+    monkeypatch.setattr(leerie, "_require_state_root_apart",
+                        lambda s, c: order.append(("apart", s, c)))
 
     def gate(run_dir):
         order.append(("sandbox", run_dir))
         raise Stop
 
     monkeypatch.setattr(leerie, "_require_heldout_sandbox", gate)
+    state, repo = tmp_path / "state", tmp_path / "repo"
     with pytest.raises(Stop):
-        leerie._require_confinement(tmp_path)
-    assert order == ["landlock", ("sandbox", tmp_path)]
+        leerie._require_confinement(tmp_path, state, repo)
+    assert order == ["landlock", ("apart", state, repo),
+                     ("sandbox", tmp_path)]
 
 
 # --- the real gate, where the runtime can build one -------------------------
