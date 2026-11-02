@@ -519,9 +519,12 @@ def test_mkstemp_itself_failing_is_converted(leerie, leerie_dir, monkeypatch,
     assert "None" not in excinfo.value.raw_message, (
         f"the message interpolates an unset path: "
         f"{excinfo.value.raw_message!r}")
-    assert tempfile.gettempdir() in excinfo.value.raw_message, (
-        "the message should name where staging was attempted — $TMPDIR is "
-        "not necessarily the state-dir filesystem the resume hint names")
+    # Staging is in the run directory's `stdin/`, on the state-dir filesystem
+    # the resume hint names — never `$TMPDIR`. Asserting the system temp dir
+    # here passed only while pytest's basetemp happened to live under it.
+    assert str(leerie_dir / "stdin") in excinfo.value.raw_message, (
+        "the message should name where staging was attempted: the run "
+        "directory's stdin/")
 
 
 def test_staging_failure_that_is_not_enospc_propagates_unchanged(
@@ -623,10 +626,23 @@ def test_no_staged_file_leaks_when_the_spawn_fails(leerie, leerie_dir,
     import glob
     import tempfile
 
-    pattern = os.path.join(tempfile.gettempdir(), "leerie-prompt-*")
+    # Staging is in the run directory's `stdin/`, never `$TMPDIR`; a pattern
+    # under `tempfile.gettempdir()` matched nothing and passed vacuously.
+    pattern = os.path.join(leerie_dir, "stdin", "leerie-prompt-*")
     before = set(glob.glob(pattern))
+    staged: list[str] = []
+    real_mkstemp = tempfile.mkstemp
+
+    def recording_mkstemp(*a, **kw):
+        fd, path = real_mkstemp(*a, **kw)
+        staged.append(path)
+        return fd, path
+
+    monkeypatch.setattr(tempfile, "mkstemp", recording_mkstemp)
 
     async def boom(*cmd, **kwargs):
+        assert staged and glob.glob(pattern), (
+            "the prompt was not staged where this test looks")
         raise OSError(11, "Resource temporarily unavailable")  # EAGAIN
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
