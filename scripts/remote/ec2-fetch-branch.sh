@@ -9,12 +9,11 @@
 # "Transport substitution for `flyctl ssh console`":
 #
 #   - Small text commands (run discovery, branch-existence probe,
-#     .leerie/ file existence probes) go over `ec2_remote_exec` (SSM
-#     Session Manager, ec2-lib.sh). ec2_remote_exec captures the remote
-#     command's stdout via bash command substitution, which is fine for
-#     short text output but is NOT binary-safe (it drops trailing
-#     newlines/NUL bytes) — it must never be used to carry bundle/tar
-#     bytes.
+#     .leerie/ file existence probes) go over `ec2_remote_exec` (SSH,
+#     ec2-lib.sh). Its callers here capture that stdout via bash command
+#     substitution, which is fine for short text output but is NOT
+#     binary-safe (it drops trailing newlines/NUL bytes) — it must never
+#     be used to carry bundle/tar bytes.
 #   - Bulk binary data (the git bundle, the run-state tar, each
 #     .leerie/ file's bytes) goes over plain `ssh` directly — the same
 #     "closer textual analog to `flyctl ssh console`" transport
@@ -78,16 +77,19 @@ fi
 # Wrapped in $(_seed_timeout_prefix) so a stalled session yields rc
 # 124/137 instead of hanging. Returns the remote command's exit code
 # (ssh forwards it natively).
+#
+# Runs under `sudo -n`: the login is ec2-user, and the run state and repo it
+# reads were written by leerie (DESIGN §6 "Neither transport lands as root").
 # ---------------------------------------------------------------------------
 _ec2_fetch_ssh() {
   local remote_cmd="$1"
   local _to=""
   _to="$(_seed_timeout_prefix)"
   local _id=() _a
-  while IFS= read -r _a; do _id+=("$_a"); done < <(ec2_ssh_identity_args)
+  while IFS= read -r _a; do _id+=("$_a"); done < <(ec2_ssh_identity_args; ec2_ssh_known_hosts_args)
   $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     ${_id[@]+"${_id[@]}"} \
-    "$LEERIE_EC2_SSH_TARGET" "$remote_cmd"
+    "$LEERIE_EC2_SSH_TARGET" "sudo -n $remote_cmd"
 }
 
 # ---------------------------------------------------------------------------

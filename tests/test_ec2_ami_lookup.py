@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -20,14 +21,23 @@ def _run(tmp_path: Path, aws_out: str, env_extra: dict | None = None) -> subproc
     )
 
 
-def test_hit_prints_id(tmp_path):
-    r = _run(tmp_path, "ami-123")
-    assert r.returncode == 0 and r.stdout.strip() == "ami-123"
-    assert "tag:leerie:source-hash" in (tmp_path / "calls").read_text()
+def test_hit_prints_newest_available_id(tmp_path):
+    # Listed out of date order, with a newer one still pending: the newest
+    # *available* image wins, so neither list order nor a pending bake can
+    # decide the answer.
+    images = {"Images": [
+        {"ImageId": "ami-newer", "CreationDate": "2026-02-01T00:00:00.000Z", "State": "available"},
+        {"ImageId": "ami-older", "CreationDate": "2026-01-01T00:00:00.000Z", "State": "available"},
+        {"ImageId": "ami-pending", "CreationDate": "2026-03-01T00:00:00.000Z", "State": "pending"},
+    ]}
+    r = _run(tmp_path, json.dumps(images))
+    assert r.returncode == 0 and r.stdout.strip() == "ami-newer"
+    calls = (tmp_path / "calls").read_text()
+    assert "tag:leerie:source-hash" in calls and "--query" not in calls
 
 
-def test_none_is_a_miss(tmp_path):
-    r = _run(tmp_path, "None")
+def test_empty_image_list_is_a_miss(tmp_path):
+    r = _run(tmp_path, json.dumps({"Images": []}))
     assert r.returncode == 0 and r.stdout.strip() == ""
 
 

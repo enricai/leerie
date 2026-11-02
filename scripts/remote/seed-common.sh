@@ -28,8 +28,8 @@ _seed_dirty_filter() {
 
 # --- _seed_timeout_prefix --------------------------------------------------
 # Emit the `timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` prefix
-# used to bound the bulk-transfer side of `flyctl ssh console` (Fly) / `aws
-# ssm start-session` (EC2). On hosts without GNU `timeout` (BSD macOS w/o
+# used to bound the bulk-transfer side of `flyctl ssh console` (Fly) / `ssh`
+# (EC2). On hosts without GNU `timeout` (BSD macOS w/o
 # coreutils) the function echoes nothing — caller falls back to an
 # unbounded pipe, matching pre-fix behavior. The fix converts a silent
 # multi-hour hang into a clean non-zero rc (124 on TERM, 137 on KILL) that
@@ -40,7 +40,7 @@ _seed_dirty_filter() {
 #
 # Usage:
 #   $(_seed_timeout_prefix) flyctl ssh console ... -C ...
-#   $(_seed_timeout_prefix) aws ssm start-session ...
+#   $(_seed_timeout_prefix) ssh ... ec2-user@<ip> ...
 _seed_timeout_prefix() {
   if ! command -v timeout >/dev/null 2>&1; then
     return 0

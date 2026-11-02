@@ -16,7 +16,8 @@ what woke it**. `accept-blocked`'s EC2 arm already does this wake → act →
 re-pause-if-we-woke-it dance; this mirrors it rather than inventing one.
 
 **The teardown trap.** `resume_instance()` re-arms
-`trap 'decide_ec2_teardown' EXIT INT TERM` for the normal launch path. Inside
+`trap 'decide_ec2_teardown exit' EXIT` (and the bare form on INT/TERM) for the
+normal launch path. Inside
 `finalize` that trap could TERMINATE the instance on exit — destroying the very
 run being finalized. The arm neutralizes it two ways (the
 `LEERIE_TEARDOWN_DONE` short-circuit plus clearing the trap), and
@@ -292,7 +293,7 @@ class TestAwsArgsAreNotWordSplit:
 class TestOneWayRatchet:
     def test_finalize_never_terminates_the_instance(self, tmp_path):
         """The teardown-trap pin. `resume_instance()` arms
-        `trap decide_ec2_teardown EXIT INT TERM`; if that fired inside
+        the `decide_ec2_teardown` EXIT/INT/TERM traps; if one fired inside
         finalize it could terminate the run being finalized."""
         for state in ("stopped", "running"):
             env, aws_dir, _, iid = _fixture(

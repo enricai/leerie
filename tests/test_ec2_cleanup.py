@@ -44,6 +44,12 @@ TAGGED = {"leerie": "managed"}
 LOOKALIKE = {"Name": "leerie-lookalike", "leerie": "unmanaged"}
 
 
+def _key_pem(tmp_path: Path) -> Path:
+    """Where ec2_default_key_file puts leerie's key for the stub's account
+    (123456789012) and the region this fixture pins (us-east-1)."""
+    return tmp_path / ".leerie" / ".ec2-keys" / "123456789012" / "us-east-1" / "leerie-ssh.pem"
+
+
 def _world(tmp_path: Path, extra_env: dict | None = None):
     aws_dir = tmp_path / "bin"
     stub = _stub_aws(aws_dir)
@@ -53,7 +59,8 @@ def _world(tmp_path: Path, extra_env: dict | None = None):
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
     state_dir = tmp_path / "state"
     state_dir.mkdir()
-    (state_dir / "leerie-key.pem").write_text("pem")
+    _key_pem(tmp_path).parent.mkdir(parents=True)
+    _key_pem(tmp_path).write_text("pem")
     (state_dir / "other-key.pem").write_text("pem")
     state = {
         "instances": {},
@@ -71,7 +78,7 @@ def _world(tmp_path: Path, extra_env: dict | None = None):
             "snap-bare": {"state": "completed", "tags": {}},
         },
         "key_pairs": {
-            "leerie-key": {"name": "leerie-key", "tags": dict(TAGGED)},
+            "leerie-ssh": {"name": "leerie-ssh", "tags": dict(TAGGED)},
             "other-key": {"name": "other-key", "tags": dict(LOOKALIKE)},
         },
         "security_groups": {
@@ -117,8 +124,8 @@ def test_dry_run_is_default_and_changes_nothing(tmp_path):
     assert r.returncode == 0, r.stderr
     assert read_state(aws_dir) == before
     assert _mutations(aws_dir) == []
-    assert (state_dir / "leerie-key.pem").exists()
-    for rid in ("ami-tagged", "ami-tagged2", "snap-tagged", "leerie-key", "sg-tagged"):
+    assert _key_pem(tmp_path).exists()
+    for rid in ("ami-tagged", "ami-tagged2", "snap-tagged", "leerie-ssh", "sg-tagged"):
         assert f"would delete" in r.stdout and rid in r.stdout
     assert "deleting" not in r.stdout
     for rid in ("ami-untagged", "ami-bare", "other-key", "sg-untagged"):
@@ -135,8 +142,8 @@ def test_apply_removes_exactly_the_tagged_set(tmp_path):
     assert state["images"]["ami-tagged2"]["state"] == "deregistered"
     assert state["snapshots"]["snap-tagged"]["state"] == "deleted"
     assert state["snapshots"]["snap-tagged2"]["state"] == "deleted"
-    assert "leerie-key" not in state["key_pairs"]
-    assert not (state_dir / "leerie-key.pem").exists()
+    assert "leerie-ssh" not in state["key_pairs"]
+    assert not _key_pem(tmp_path).exists()
     assert "sg-tagged" not in state["security_groups"]
     assert "leerie-ssm" not in state["roles"]
     assert "leerie-ssm" not in state["instance_profiles"]
@@ -165,15 +172,15 @@ def test_untagged_snapshot_of_a_tagged_ami_is_not_deleted(tmp_path):
 def test_ami_in_use_by_a_live_instance_is_not_deregistered(tmp_path):
     aws_dir, _, env = _world(tmp_path)
     (aws_dir / "instances.json").write_text(json.dumps({"Reservations": [{"Instances": [
-        {"InstanceId": "i-1", "ImageId": "ami-tagged", "KeyName": "leerie-key"}]}]}))
+        {"InstanceId": "i-1", "ImageId": "ami-tagged", "KeyName": "leerie-ssh"}]}]}))
     r = _cleanup(env, "--apply")
     assert r.returncode == 0, r.stderr
     state = read_state(aws_dir)
     assert state["images"]["ami-tagged"]["state"] == "available"
     assert state["snapshots"]["snap-tagged"]["state"] == "completed"
     assert "skip AMI ami-tagged (in use by an instance)" in r.stdout
-    assert "leerie-key" in state["key_pairs"]
-    assert "skip key pair leerie-key" in r.stdout
+    assert "leerie-ssh" in state["key_pairs"]
+    assert "skip key pair leerie-ssh" in r.stdout
     assert state["images"]["ami-tagged2"]["state"] == "deregistered"
 
 
