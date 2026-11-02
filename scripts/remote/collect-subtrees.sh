@@ -152,7 +152,7 @@ if [ -f "$state_json" ]; then
   while IFS= read -r sid; do
     [ -n "$sid" ] || continue
     ordered_sids+=("$sid")
-  done < <(python3 -c '
+  done < <(python3 -I -c '
 import json, sys
 try:
     st = json.load(open(sys.argv[1]))
@@ -366,7 +366,7 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
     fi
 
     # Extract status from structured_output.
-    status=$(printf '%s' "$claude_out" | python3 -c '
+    status=$(printf '%s' "$claude_out" | python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)

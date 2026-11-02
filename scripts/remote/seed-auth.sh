@@ -341,7 +341,7 @@ if [ -s "$KNOWN" ]; then
   # `2>>"$LOG"` captures the python3 stderr so a JSON parse error
   # (corrupted file, schema drift) lands in plugin-install.log
   # instead of silently zero-iterating the while loop below.
-  python3 -c '
+  python3 -I -c '
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))
@@ -370,7 +370,7 @@ fi
 # user-scope makes the plugin available to whichever task is running
 # instead of nothing (the host projectPath doesn't exist remotely).
 if [ -s "$INSTALLED" ]; then
-  python3 -c '
+  python3 -I -c '
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))

@@ -45,7 +45,7 @@ default_instance_type() {
 _ec2_default_vpc_id() {
   local out vpc
   out="$(_ec2_aws ec2 describe-vpcs --filters Name=isDefault,Values=true --output json 2>/dev/null)" || out=""
-  vpc="$(printf '%s' "$out" | python3 -c '
+  vpc="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -68,7 +68,7 @@ default_subnet_id() {
   local vpc
   vpc="$(_ec2_default_vpc_id)" || return 1
   out="$(_ec2_aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc" "Name=map-public-ip-on-launch,Values=true" --output json 2>/dev/null)" || out=""
-  v="$(printf '%s' "$out" | python3 -c '
+  v="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 vpc=sys.argv[1]
 try: d=json.load(sys.stdin)
@@ -115,14 +115,14 @@ ensure_security_group() {
   cidr="$(ec2_egress_cidr)" || return 1
   vpc="$(_ec2_default_vpc_id)" || return 1
   out="$(_ec2_aws ec2 describe-security-groups --filters "Name=tag:$EC2_TAG_KEY,Values=$EC2_TAG_VALUE" "Name=group-name,Values=$EC2_SG_NAME" "Name=vpc-id,Values=$vpc" --output json 2>/dev/null)" || out=""
-  gid="$(printf '%s' "$out" | python3 -c '
+  gid="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
 g=d.get("SecurityGroups",[])
 print(g[0]["GroupId"] if g else "")' 2>/dev/null)"
   if [ -z "$gid" ]; then
-    gid="$(_ec2_aws ec2 create-security-group --group-name "$EC2_SG_NAME" --description "leerie SSH from launcher" --vpc-id "$vpc" --tag-specifications "$(_ec2_tag_spec security-group)" --output json 2>/dev/null | python3 -c '
+    gid="$(_ec2_aws ec2 create-security-group --group-name "$EC2_SG_NAME" --description "leerie SSH from launcher" --vpc-id "$vpc" --tag-specifications "$(_ec2_tag_spec security-group)" --output json 2>/dev/null | python3 -I -c '
 import json,sys
 try: print(json.load(sys.stdin).get("GroupId",""))
 except Exception: print("")' 2>/dev/null)"
@@ -133,7 +133,7 @@ except Exception: print("")' 2>/dev/null)"
     fi
     have=""
   else
-    have="$(printf '%s' "$out" | python3 -c '
+    have="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 d=json.load(sys.stdin)
 for p in d["SecurityGroups"][0].get("IpPermissions",[]):
@@ -168,7 +168,7 @@ ensure_key_pair() {
   dir="$(_ec2_state_dir)"
   keyfile="$dir/$EC2_KEY_NAME_DEFAULT.pem"
   out="$(_ec2_aws ec2 describe-key-pairs --filters "Name=tag:$EC2_TAG_KEY,Values=$EC2_TAG_VALUE" "Name=key-name,Values=$EC2_KEY_NAME_DEFAULT" --output json 2>/dev/null)" || out=""
-  found="$(printf '%s' "$out" | python3 -c '
+  found="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -183,7 +183,7 @@ print(d["KeyPairs"][0]["KeyName"] if d.get("KeyPairs") else "")' 2>/dev/null)"
   else
     mkdir -p "$dir" || return 1
     local material
-    material="$(_ec2_aws ec2 create-key-pair --key-name "$EC2_KEY_NAME_DEFAULT" --key-type rsa --tag-specifications "$(_ec2_tag_spec key-pair)" --output json 2>/dev/null | python3 -c '
+    material="$(_ec2_aws ec2 create-key-pair --key-name "$EC2_KEY_NAME_DEFAULT" --key-type rsa --tag-specifications "$(_ec2_tag_spec key-pair)" --output json 2>/dev/null | python3 -I -c '
 import json,sys
 try: print(json.load(sys.stdin).get("KeyMaterial",""))
 except Exception: print("")' 2>/dev/null)"

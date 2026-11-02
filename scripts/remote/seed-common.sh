@@ -23,7 +23,7 @@ _SEED_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # USER_REPO must already be exported by the caller — it anchors the
 # lexists() vanished-entry check.
 _seed_dirty_filter() {
-  python3 "$_SEED_COMMON_DIR/seed_dirty_filter.py"
+  python3 -I "$_SEED_COMMON_DIR/seed_dirty_filter.py"
 }
 
 # --- _seed_timeout_prefix --------------------------------------------------

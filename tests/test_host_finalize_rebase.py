@@ -83,8 +83,10 @@ def _make_stub_python3(bin_dir: Path, rebaser_json: str, marker: str = "run_reba
     parse exactly as it did in production.
 
     The verdict path is taken as the LAST argument rather than a fixed index:
-    the stub stands in for `python3`, so the seam script itself is `$1` and
-    every seam argument is shifted by one. Hard-coding the wrong index here is
+    the stub stands in for `python3`, so the seam script itself is the first
+    argument after the interpreter's flags (`-I`), and every seam argument is
+    shifted by those. A stub that read the script from `$1` saw `-I`, fell
+    through to the real interpreter, ran the real rebaser and never returned. Hard-coding the wrong index here is
     not a benign test bug — an earlier revision of a sibling stub wrote to the
     slot holding "$LEERIE_REPO/orchestrator/leerie.py" and truncated the real
     orchestrator source to 15 bytes.
@@ -92,6 +94,12 @@ def _make_stub_python3(bin_dir: Path, rebaser_json: str, marker: str = "run_reba
     p = bin_dir / "python3"
     p.write_text(f"""#!/usr/bin/env bash
 echo "$@" >> {bin_dir}/python3.log
+# The seam script is the first argument after the interpreter's own flags
+# (host-side python3 always runs `-I`): skip them, but pass the original
+# argv through untouched.
+argv=("$@")
+while [ "$#" -gt 0 ] && case "$1" in -) false ;; -?*) true ;; *) false ;; esac
+do shift; done
 script="$1"
 if [ -f "$script" ] && grep -q '{marker}' "$script"; then
   for _out; do :; done
@@ -101,7 +109,7 @@ if [ -f "$script" ] && grep -q '{marker}' "$script"; then
 JSON
   exit 0
 fi
-exec /usr/bin/env python3 "$@"
+exec /usr/bin/env python3 "${{argv[@]}}"
 """)
     p.chmod(0o755)
 
@@ -376,6 +384,12 @@ def test_the_rebaser_works_in_a_repository_of_its_own(tmp_path):
     seen = tmp_path / "seen"
     p = bin_dir / "python3"
     p.write_text(f"""#!/usr/bin/env bash
+# The seam script is the first argument after the interpreter's own flags
+# (host-side python3 always runs `-I`): skip them, but pass the original
+# argv through untouched.
+argv=("$@")
+while [ "$#" -gt 0 ] && case "$1" in -) false ;; -?*) true ;; *) false ;; esac
+do shift; done
 script="$1"
 if [ -f "$script" ] && grep -q run_rebaser "$script"; then
   wt="$5"
@@ -385,7 +399,7 @@ if [ -f "$script" ] && grep -q run_rebaser "$script"; then
   printf '%s' '{_rebaser_result("failed", diagnosis="x")}' > "$_out"
   exit 0
 fi
-exec /usr/bin/python3 "$@"
+exec /usr/bin/python3 "${{argv[@]}}"
 """)
     p.chmod(0o755)
     run_dir = _make_run(tmp_path, repo, "test-run", run_json={

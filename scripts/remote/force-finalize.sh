@@ -371,9 +371,9 @@ PYEOF
   # through a shell quoter.
   # When the caller exports FORCE_STOP=1, propagate it into the remote
   # env so the Python payload SIGTERMs the orchestrator instead of refusing.
-  local remote_cmd="python3 -"
+  local remote_cmd="python3 -I -"
   if [ "${FORCE_STOP:-}" = "1" ]; then
-    remote_cmd="bash -lc 'FORCE_STOP=1 exec python3 -'"
+    remote_cmd="bash -lc 'FORCE_STOP=1 exec python3 -I -'"
   fi
   local result
   if ! result="$(printf '%s' "$payload" \

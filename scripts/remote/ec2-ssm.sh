@@ -169,7 +169,7 @@ _ec2_ssm_session() {
 # also produce this, but the launch wrapper's own fast-path flock check
 # — see the Fly launch script's fcntl probe — usually fires first).
 ec2_launch_detached() {
-  _ec2_ssm_session "python3 -"
+  _ec2_ssm_session "python3 -I -"
 }
 
 # --- ec2_attach ----------------------------------------------------------

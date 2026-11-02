@@ -66,7 +66,7 @@ update_run_json() {
   # Python handles the read+merge+write so we don't reimplement JSON
   # escaping in bash. The trailing args are key/value pairs; odd-count
   # is a programming error.
-  if ! python3 - "$sidecar" "$tmp" "$@" <<'PY'
+  if ! python3 -I - "$sidecar" "$tmp" "$@" <<'PY'
 import json, os, sys
 sidecar, tmp, *rest = sys.argv[1:]
 if len(rest) % 2 != 0:
@@ -101,7 +101,7 @@ PY
 # Emit an ISO-8601 UTC timestamp (sub-second precision). Used as
 # paused_at / similar event markers.
 iso_now() {
-  python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))'
+  python3 -I -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))'
 }
 
 # --- remote_log ----------------------------------------------------------

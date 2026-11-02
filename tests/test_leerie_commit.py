@@ -264,7 +264,7 @@ class TestLauncher:
         the established `*_json` pattern is what the Fly stray-substitution
         guard exists to prevent."""
         for name in ("_leerie_commit_json", "_ec2_leerie_commit_json"):
-            assert (f"""{name}="$(python3 -c 'import json, sys; """
+            assert (f"""{name}="$(python3 -I -c 'import json, sys; """
                     f"""print(json.dumps(sys.argv[1]))'""") in LAUNCHER, (
                 f"{name} is not JSON-encoded host-side")
         assert '"${LEERIE_COMMIT:-}"' in LAUNCHER
@@ -277,6 +277,6 @@ class TestLauncher:
         raw value broke out of a Python literal — and deviating from it silently
         is what the stray-substitution guard exists to prevent.
         """
-        assert "_leerie_commit_json=\"$(python3 -c 'import json, sys; " \
+        assert "_leerie_commit_json=\"$(python3 -I -c 'import json, sys; " \
                "print(json.dumps(sys.argv[1]))'" in LAUNCHER
         assert '"${LEERIE_COMMIT:-}"' in LAUNCHER

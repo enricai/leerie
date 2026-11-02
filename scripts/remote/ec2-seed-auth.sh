@@ -304,7 +304,7 @@ KNOWN="$HOME/.claude/plugins/known_marketplaces.json"
 INSTALLED="$HOME/.claude/plugins/installed_plugins.json"
 
 if [ -s "$KNOWN" ]; then
-  python3 -c "
+  python3 -I -c "
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))
@@ -326,7 +326,7 @@ for entry in data.values():
 fi
 
 if [ -s "$INSTALLED" ]; then
-  python3 -c "
+  python3 -I -c "
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))

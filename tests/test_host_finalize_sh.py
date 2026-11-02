@@ -1058,13 +1058,15 @@ def test_rebase_fallback_arm_logs_and_persists_disposition(tmp_path):
     )
     r = _run_host_finalize(
         tmp_path, run_dir,
-        # ${10}, not ${9}: the stub stands in for `python3`, so $1 is the seam
-        # script itself and the seam's own argv[9] (the verdict file) lands one
-        # position later. The `echo` to stdout is deliberate and load-bearing —
-        # it stands in for the worker log stream, and the assertions below prove
-        # the log text is NOT what gets persisted.
+        # The verdict file is the seam's LAST argument; a fixed index is not
+        # safe, since the stub stands in for `python3` and sees its flags
+        # (`-I`) and the seam script ahead of the seam's own argv. The `echo`
+        # to stdout is deliberate and load-bearing — it stands in for the
+        # worker log stream, and the assertions below prove the log text is
+        # NOT what gets persisted.
         python3_body='echo "log noise from the worker"; '
-                     'printf "not json at all" > "${10}"; exit 0',
+                     'for _out; do :; done; '
+                     'printf "not json at all" > "$_out"; exit 0',
         extra_env={
             # Deliberately NOT REPO_ROOT. host-finalize.sh uses LEERIE_REPO for
             # exactly one thing on this path — building the

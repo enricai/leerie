@@ -60,7 +60,7 @@ FLY_APP="${LEERIE_FLY_APP:-}"
 # ---------------------------------------------------------------------------
 _fetch_machine_exec() {
   local cmd
-  cmd="$(python3 -c '
+  cmd="$(python3 -I -c '
 import shlex, sys
 print(" ".join(shlex.quote(a) for a in sys.argv[1:]))
 ' "$@")"
@@ -120,7 +120,7 @@ fetch_branch() {
   # the failure type adequately.
   local _discover_err
   _discover_err="$(mktemp)"
-  discover_output="$(_fetch_machine_exec python3 -c '
+  discover_output="$(_fetch_machine_exec python3 -I -c '
 import os, json, sys
 
 runs_dir = "/work/.leerie/runs"

@@ -492,7 +492,7 @@ host_bring_back_run_branch() {
 host_apply_captured_deps() {
   local run_dir="$1"
   [ -f "$run_dir/captured-deps.json" ] || return 0
-  python3 - "$run_dir" "$USER_REPO" "$LEERIE_REPO/orchestrator/leerie.py" \
+  python3 -I - "$run_dir" "$USER_REPO" "$LEERIE_REPO/orchestrator/leerie.py" \
       <<'PY' >&2 || echo "[leerie] capture: could not apply $run_dir/captured-deps.json; it is kept" >&2
 import importlib.util, pathlib, sys
 
@@ -786,7 +786,7 @@ PY
       # outright — measured, it broke 20 of 32 tests in
       # tests/test_host_finalize_sh.py, none of them about the rebase. `( … )`
       # restores the containment without restoring the shared channel.
-      ( python3 "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
+      ( python3 -I "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
           "$USER_REPO" "$run_id" "$_rebase_worktree" "$run_branch" \
           "$working_branch" "$pr_base_branch" \
           "$LEERIE_REPO/orchestrator/leerie.py" "$_rebaser_out" \

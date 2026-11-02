@@ -611,7 +611,7 @@ provision_machine() {
     # Declared separately so a failing python3 surfaces as a nonzero rc
     # rather than being masked by `local`'s own exit status (SC2155).
     local vol_name
-    vol_name="leerie_data_$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+    vol_name="leerie_data_$(python3 -I -c 'import secrets; print(secrets.token_hex(3))')"
     remote_log "remote: creating volume $vol_name (${FLY_VM_DISK_GB} GB, region=$FLY_REGION)..."
     local vol_create_output=""
     if ! vol_create_output="$(flyctl volumes create "$vol_name" \
@@ -752,7 +752,7 @@ provision_machine() {
     local pid_record="$remote_dir/$$.json"
     # No push choice here: the run's one record of it is the orchestrator's
     # (DESIGN §6 *One push choice per run, on every runtime*).
-    python3 - "$pid_record" "$machine_id" "$FLY_APP" "${LEERIE_RUN_ID:-}" "$$" "${LEERIE_VOLUME_ID:-}" <<'PY'
+    python3 -I - "$pid_record" "$machine_id" "$FLY_APP" "${LEERIE_RUN_ID:-}" "$$" "${LEERIE_VOLUME_ID:-}" <<'PY'
 import json, sys, datetime
 path, mid, app, run_id, pid, vol_id = sys.argv[1:]
 data = {

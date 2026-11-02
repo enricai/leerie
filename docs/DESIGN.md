@@ -2610,6 +2610,27 @@ comes only from `claude_p` on those caps. The Fly recovery
 integrator (`collect-subtrees.sh`) is a run worker: it takes its grants from
 `worker-guard.py` and is skipped, never run, without them.
 
+**The host never imports the repository's code.** The host-side exception
+covers leerie's own code, never the repository's. The launcher and the
+scripts it runs on the host call `python3` dozens of times — small `-c`
+helpers, stdin programs, and seams that load `orchestrator/leerie.py` by
+path — from the operator's cwd, which is the user's checkout. A program
+read from `-c` or stdin puts the cwd first on `sys.path`, so a `json.py` or
+`contextlib.py` at the checkout's root (a file a worker wrote, in a run
+whose branch the user merged) ran on the host, unconfined, with the
+operator's gh and ssh credentials (review round 25, I1: a planted
+`contextlib.py` ran under the bare-resume pick seam). The root cause is
+that the host interpreter took its import path from the place it was run
+from. The invariant: **no host-side Python resolves a module from the
+checkout.** Every host-side `python3` is isolated, spelled `python3 -I`
+at the call: no cwd or script directory on `sys.path`, no `PYTHON*`
+environment, no user site. That holds because every host-side program
+imports only the standard library, plus leerie's own `chain/` package,
+whose directory is put on `sys.path` explicitly. The one convention is
+checked by a rule over every host-run file, so a new call without it
+fails the suite. Commands the host sends to a Fly or EC2 machine follow
+the same spelling.
+
 **Residuals.** A committing worker can move any ref of its own tree
 repository, its tree's branch included; leerie takes only that branch, and
 reads every other branch in the run repository, which the worker cannot
@@ -5245,8 +5266,14 @@ EC2 runtimes, because neither the container nor a remote machine sees the
 host's `LEERIE_NO_PUSH` (the launcher does not forward it), and a remote
 machine may not see an untracked `leerie.toml`. The orchestrator records it
 at the run's start, a resume continues it by the one rule every sticky
-choice follows, and `main()` writes it to `run.json.no_push` on every
-invocation but `--phase`. `pr_writer`
+choice follows, and `run.json.no_push` — the intent the host reads — has
+one writer, `_record_run_push_choice`, which computes it each time from the
+run's own record: the choice, or `true` while the run has nothing to push
+(it last ended without a run branch, as a no-work run does). `main()` calls
+it on every invocation but `--phase`, and the run's two terminal states
+call it as they finish. A plain resume of a no-work run used to write the
+choice over the no-work run's `true` (review round 25, F3); computed from
+the record, it cannot. `pr_writer`
 runs exactly when the run will be pushed. `host_finalize` reads
 `run.json.no_push` unchanged on every runtime: on a remote runtime the
 fetch brings that file home before the host finalizes, and nothing on the
@@ -5267,7 +5294,8 @@ and a plain `leerie resume <id>` of a paused Fly `--no-push` run passed
 `--host-no-push false` and was pushed. The root cause was two owners of one
 choice, one of them per-invocation. The invariant now: **the push choice is
 recorded once, at the run's start, by the orchestrator; every host-side
-finalize reads that record and nothing rewrites it.**
+finalize reads that record, and its one writer only ever derives it from the
+run's record.**
 
 The run branch is pushed to `origin` and a pull request opened via `gh pr
 create` against the working branch (HEAD-at-run-start) by default. **This

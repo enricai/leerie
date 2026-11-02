@@ -210,13 +210,18 @@ def _flyctl_stub(tmp_path: Path, host_state_file: Path,
         '      true) exit 0 ;;\n'
         '      python3*-*)\n'
         '        SCRIPT="$(cat)"\n'
-        # Parse the -C string the way the remote shell would. Strip the
-        # leading `python3 - ` and let the shell word-split + de-quote the
-        # rest into $1 (remote-state) and $2 (sid). This faithfully models
-        # flyctl's remote-shell parsing, so a quoting regression in the
-        # launcher would show up here as wrong/misparsed args.
-        '        REST="${CMD#python3 - }"\n'
-        '        eval "set -- $REST"\n'
+        # Parse the -C string the way the remote shell would: let the shell
+        # word-split + de-quote the whole command, drop `python3`, its
+        # interpreter flags (`-I` — DESIGN §6 *The host never imports the
+        # repository's code*) and the stdin marker `-`, leaving $1
+        # (remote-state) and $2 (sid). This faithfully models flyctl's
+        # remote-shell parsing, so a quoting regression in the launcher
+        # would show up here as wrong/misparsed args.
+        '        eval "set -- $CMD"\n'
+        '        shift\n'
+        '        while case "$1" in -) false ;; -?*) true ;; *) false ;; esac\n'
+        '        do shift; done\n'
+        '        shift\n'
         '        GOT_STATE="$1"\n'
         '        GOT_SID="$2"\n'
         '        if [ "$GOT_STATE" != "$EXPECT_REMOTE" ]; then\n'

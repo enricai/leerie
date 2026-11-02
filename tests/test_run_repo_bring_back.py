@@ -180,7 +180,7 @@ def test_prune_keeps_a_run_whose_branch_cannot_come_back(run, tmp_path):
     old = 946684800                                # 2000-01-01
     os.utime(run_dir, (old, old))
     src = LAUNCHER.read_text()
-    start = src.index("      python3 - \"$LEERIE_STATE_HOST_DIR\" \"$USER_REPO\" <<'PY'\n")
+    start = src.index("      python3 -I - \"$LEERIE_STATE_HOST_DIR\" \"$USER_REPO\" <<'PY'\n")
     body = src[src.index("\n", start) + 1:]
     body = body[:body.index("\nPY\n")]
     script = tmp_path / "prune.py"

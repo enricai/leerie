@@ -7323,6 +7323,33 @@ def _clear_run_died(run_dir: Path) -> None:
 _RUN_DEATH_OWNER: Path | None = None
 
 
+# The `current_phase` prefix `_finish_no_work_run` stamps, and only it: the
+# run ended without a run branch, so it has nothing to push.
+_NOTHING_TO_PUSH_PHASE = "done:"
+
+
+def _run_has_nothing_to_push(data: dict) -> bool:
+    """Whether the run, by its `state.json`, last ended in
+    `_finish_no_work_run`'s terminal state (no work required, or an outcome
+    with no commits): no run branch exists. A resume that goes on to do work
+    moves `current_phase` on, and so stops being this."""
+    return str(data.get("current_phase") or "").startswith(
+        _NOTHING_TO_PUSH_PHASE)
+
+
+def _record_run_push_choice(st: "State", choice: bool, **fields) -> None:
+    """The one writer of `run.json.no_push`, the push intent the host reads
+    (DESIGN §6 *A resumed run continues under the choices it was started
+    with*): the run's push choice, or true while the run has nothing to
+    push. Computed from the run's own record each time, so no later
+    invocation can turn a run with no branch into one the host would push
+    (review round 25, F3: a plain resume of a no-work run rewrote it to the
+    choice). `fields` are other run.json fields the same write carries."""
+    _write_run_json(st.run_dir,
+                    no_push=bool(choice) or _run_has_nothing_to_push(st.data),
+                    **fields)
+
+
 def _run_has_nothing_left(data: dict) -> bool:
     """Whether a run, by its `state.json`, has completed: no work was
     required, or it finalized (`finished_at` with `current_phase` at phase 6,
@@ -39469,7 +39496,8 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
     `headline` overrides the summary log line for callers that did not arrive
     here from phase 3.
 
-    `no_push=True` on the run.json write is load-bearing: the host
+    The run.json write records `no_push=True` (`_record_run_push_choice`,
+    from the `current_phase` stamped here), and that is load-bearing: the host
     launcher polls `finished_at` as the "ready to push" sentinel, and
     there is no run branch to push (none was materialized). `_derive_
     run_status` reads `finished_at` + the missing `pushed_at` / `pr_url`
@@ -39497,9 +39525,9 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
     st.data["no_work_required"] = outcome == "no_work"
     st.data["no_work_reasons"] = dict(no_work_map)
     st.data["finished_at"] = now()
-    st.data["current_phase"] = ("done: no work required"
-                                if outcome == "no_work"
-                                else f"done: {outcome}, nothing to push")
+    st.data["current_phase"] = (
+        f"{_NOTHING_TO_PUSH_PHASE} no work required" if outcome == "no_work"
+        else f"{_NOTHING_TO_PUSH_PHASE} {outcome}, nothing to push")
     st.save()
     # Reap the judgment worktree. This path reaches neither `cleanup.sh` (see
     # the docstring) nor `_cleanup_on_abnormal_exit` — it returns normally, so
@@ -39520,10 +39548,9 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
                 _rmtree_owned(_wt)
         except Exception as e:                     # never block the exit
             log(f"could not remove the judgment worktree (non-fatal): {e}")
-    _write_run_json(
-        st.run_dir,
+    _record_run_push_choice(
+        st, bool(st.data.get("no_push")),
         finished_at=st.data["finished_at"],
-        no_push=True,
         no_verify=False,
     )
     log("done — task already satisfied on HEAD; no commits made, "
@@ -66983,10 +67010,9 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # Record finalize success in the run.json sidecar. The launcher
     # uses `finished_at` as the "ready for push" sentinel; host_finalize
     # skips the push when `no_push` is set.
-    _write_run_json(
-        st.run_dir,
+    _record_run_push_choice(
+        st, not will_push,
         finished_at=st.data["finished_at"],
-        no_push=not will_push,
         no_verify=no_verify,
         # Rendered once, after the outcome: the launcher's LLM-less
         # fallback appends this text as-is (DESIGN §6 *The PR's end-state
@@ -69206,8 +69232,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             "§12 enforcement waived)")
     if not args.phase:
         # The host's record of the push choice: the intent `host_finalize`
-        # and the launcher's resume read.
-        _write_run_json(st.run_dir, no_push=bool(args.no_push))
+        # and the launcher's resume read. A run with nothing to push keeps
+        # `true` there whatever this invocation's choice.
+        _record_run_push_choice(st, bool(args.no_push))
     log(f"models: " + ", ".join(f"{w}={models[w]}" for w in WORKER_TYPES))
     # Log only workers with a resolved effort — an "unset" worker is
     # explicitly opting out of the --effort flag and showing it as

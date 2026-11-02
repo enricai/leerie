@@ -62,7 +62,7 @@ resume_machine() {
   local current_tag="${FLY_IMAGE_TAG:-}"
   if [ -n "$current_tag" ] && [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
     local stored_tag=""
-    stored_tag="$(python3 -c "
+    stored_tag="$(python3 -I -c "
 import json, sys
 try:
     print(json.load(open(sys.argv[1])).get('image_tag', ''))

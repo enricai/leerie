@@ -777,7 +777,7 @@ _seed_one_inspect_dir_dirty() {
   file_list="$(mktemp -t leerie-inspect-dirty-list.XXXXXX)"
 
   printf '%s\n' "$dirty_files" \
-    | python3 -c '
+    | python3 -I -c '
 import sys
 for line in sys.stdin.read().splitlines():
     if not line:

@@ -813,3 +813,75 @@ def test_the_read_rule_sees_a_read_before_the_continuation(leerie):
                               "        log('ON')\n" + anchor)
     found = _reads_before_continuation(leerie, bad)
     assert any("args.dangerously_skip_permissions" in f for f in found), found
+
+
+class TestRunJsonNoPushHasOneWriter:
+    """Review round 25, F3: `run.json.no_push` is derived by one writer,
+    `_record_run_push_choice`, from the run's record — the choice, or `true`
+    while the run has nothing to push. A plain resume of a no-work run wrote
+    the choice over `_finish_no_work_run`'s `true`."""
+
+    @staticmethod
+    def _make_terminal(run_dir: Path, *, phase: str, **extra) -> None:
+        state = json.loads((run_dir / "state.json").read_text())
+        state.update(current_phase=phase, finished_at="2026-01-01T00:00:00",
+                     **extra)
+        (run_dir / "state.json").write_text(json.dumps(state))
+        rj = json.loads((run_dir / "run.json").read_text())
+        rj.update(no_push=True, finished_at="2026-01-01T00:00:00")
+        (run_dir / "run.json").write_text(json.dumps(rj))
+
+    def test_a_plain_resume_of_a_no_work_run_keeps_no_push(
+            self, leerie, monkeypatch, run_env):
+        _repo, run_dir = run_env
+        _fresh(leerie, monkeypatch, [])  # the run's choice: push
+        self._make_terminal(run_dir, phase="done: no work required",
+                            no_work_required=True)
+
+        got = _resume(leerie, monkeypatch, [])
+
+        assert got["args"].no_push is False, "the choice itself is push"
+        rj = json.loads((run_dir / "run.json").read_text())
+        assert rj["no_push"] is True, (
+            "a resume turned a run with no branch into one the host pushes")
+
+    def test_control_a_run_with_work_left_takes_the_choice(
+            self, leerie, monkeypatch, run_env):
+        _repo, run_dir = run_env
+        _fresh(leerie, monkeypatch, [])
+        self._make_terminal(run_dir, phase="phase 5: delivery gate")
+
+        _resume(leerie, monkeypatch, [])
+
+        rj = json.loads((run_dir / "run.json").read_text())
+        assert rj["no_push"] is False
+
+    def test_by_rule_only_the_one_writer_writes_it(self, leerie) -> None:
+        import ast
+        tree = ast.parse(LEERIE_PY.read_text())
+        writers = sorted(
+            fn.name for fn in ast.walk(tree)
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for c in ast.walk(fn)
+            if isinstance(c, ast.Call)
+            and getattr(c.func, "id", None) == "_write_run_json"
+            and any(k.arg == "no_push" for k in c.keywords))
+        assert writers == ["_record_run_push_choice"], writers
+        callers = sorted(
+            fn.name for fn in tree.body
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(isinstance(c, ast.Call)
+                    and getattr(c.func, "id", None)
+                    == "_record_run_push_choice" for c in ast.walk(fn)))
+        assert callers == ["_finish_no_work_run", "main", "phase_finalize"]
+
+    def test_the_no_work_terminal_state_is_nothing_to_push(self, leerie):
+        # `_finish_no_work_run` stamps the prefix the writer reads; a run
+        # that moved on to work again is not it.
+        assert leerie._run_has_nothing_to_push(
+            {"current_phase": "done: no work required"})
+        assert leerie._run_has_nothing_to_push(
+            {"current_phase": "done: unconverged, nothing to push"})
+        assert not leerie._run_has_nothing_to_push(
+            {"current_phase": "phase 6: finalize"})
+        assert not leerie._run_has_nothing_to_push({})

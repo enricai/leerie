@@ -126,7 +126,7 @@ fetch_state_ec2() {
   # (text-only output — safe for command substitution).
   local run_id run_branch working_branch run_no_push
   local discover_output
-  discover_output="$(ec2_remote_exec "$instance_id" 'python3 -c "
+  discover_output="$(ec2_remote_exec "$instance_id" 'python3 -I -c "
 import os, json, sys
 
 runs_dir = \"/work/.leerie/runs\"

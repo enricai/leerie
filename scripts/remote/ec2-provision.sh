@@ -349,7 +349,7 @@ wait_for_instance_ready() {
   while true; do
     local describe_out state
     describe_out="$(aws ec2 describe-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
-    state="$(printf '%s' "$describe_out" | python3 -c '
+    state="$(printf '%s' "$describe_out" | python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -377,7 +377,7 @@ except (ValueError, KeyError, IndexError):
   while true; do
     local status_out instance_status system_status statuses
     status_out="$(aws ec2 describe-instance-status --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
-    statuses="$(printf '%s' "$status_out" | python3 -c '
+    statuses="$(printf '%s' "$status_out" | python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -463,7 +463,7 @@ provision_instance() {
        --output json \
        2>&1)"; then
     instance_id="$(printf '%s' "$create_output" \
-                    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Instances"][0]["InstanceId"])' \
+                    | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d["Instances"][0]["InstanceId"])' \
                     2>/dev/null || true)"
   fi
 
@@ -514,7 +514,7 @@ provision_instance() {
     local remote_dir="$_state_base/remote"
     mkdir -p "$remote_dir" 2>/dev/null || true
     local pid_record="$remote_dir/$$.json"
-    python3 - "$pid_record" "$instance_id" "${LEERIE_AWS_REGION:-${AWS_REGION:-}}" "${LEERIE_RUN_ID:-}" "$$" <<'PY'
+    python3 -I - "$pid_record" "$instance_id" "${LEERIE_AWS_REGION:-${AWS_REGION:-}}" "${LEERIE_RUN_ID:-}" "$$" <<'PY'
 import json, sys, datetime
 path, iid, region, run_id, pid = sys.argv[1:]
 data = {
