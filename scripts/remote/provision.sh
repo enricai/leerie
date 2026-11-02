@@ -287,9 +287,9 @@ _decide_teardown_body() {
       # when they've recovered the work.
       if _try_fetch_branch_for_teardown; then
         remote_log "remote: run branch + state synced to host"
-        # Auto-finalize: now that the run dir is on the host (and the
-        # orchestrator wrote run.json.no_push as **intent**, not the
-        # mechanism flag — see DESIGN §6), push + PR happen here so
+        # Auto-finalize: now that the run dir is on the host (its
+        # run.json.no_push is the run's one push choice, unchanged by the
+        # fetch — DESIGN §6), push + PR happen here so
         # the user doesn't need a second command. The local-runtime
         # path runs the same host_finalize inline; this is the Fly
         # parity call site.
@@ -342,14 +342,6 @@ _decide_teardown_body() {
               remote_log "remote: run 'leerie finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR after the run completes"
             fi
           fi
-          destroy_machine
-        elif [ -n "$run_dir" ] && [ -d "$run_dir" ] \
-             && [ "$(remote_host_no_push "$run_dir/fly-machine.json")" = "true" ]; then
-          # --no-push at launch: the work is already on the host; leave
-          # the run branch there (run.json.no_push was stripped by the
-          # fetch, so the sidecar is the intent of record).
-          remote_log "auto-finalize: --no-push was set at launch; run branch left on the host, no push or PR"
-          remote_log "remote: run 'leerie finalize $LEERIE_REMOTE_RUN_ID --runtime fly' to push and open a PR later"
           destroy_machine
         elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
           local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
@@ -584,7 +576,7 @@ wait_for_started() {
     state="$(flyctl machine status "$mid" \
                --app "$FLY_APP" 2>/dev/null \
              | sed 's/\x1b\[[0-9;]*m//g' \
-             | awk -F': *' '/^State: / { print $2; exit }' \
+             | awk -F': *' '/^State: / && !f { print $2; f = 1 }' \
              | tr -d '[:space:]' || true)"
     case "$state" in
       started)
@@ -634,7 +626,7 @@ provision_machine() {
     # Declared separately so a failing python3 surfaces as a nonzero rc
     # rather than being masked by `local`'s own exit status (SC2155).
     local vol_name
-    vol_name="leerie_data_$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+    vol_name="leerie_data_$(python3 -I -c 'import secrets; print(secrets.token_hex(3))')"
     remote_log "remote: creating volume $vol_name (${FLY_VM_DISK_GB} GB, region=$FLY_REGION)..."
     local vol_create_output=""
     if ! vol_create_output="$(flyctl volumes create "$vol_name" \
@@ -652,7 +644,7 @@ provision_machine() {
     # like "ID: vol_abc123..." (with possible ANSI color codes).
     LEERIE_VOLUME_ID="$(printf '%s' "$vol_create_output" \
                        | sed 's/\x1b\[[0-9;]*m//g' \
-                       | awk '/^[[:space:]]*ID[[:space:]]*[:=]/ { print $2; exit }')"
+                       | awk '/^[[:space:]]*ID[[:space:]]*[:=]/ && !f { print $2; f = 1 }')"
     if [ -z "$LEERIE_VOLUME_ID" ]; then
       remote_log "failed to extract volume ID from flyctl output:"
       printf '  %s\n' "$vol_create_output" >&2
@@ -702,7 +694,7 @@ provision_machine() {
     # Tolerant of ANSI color codes by stripping ESC[<...>m sequences first.
     machine_id="$(printf '%s' "$create_output" \
                   | sed 's/\x1b\[[0-9;]*m//g' \
-                  | awk '/Machine ID:/ { for (i=1; i<=NF; i++) if ($i == "ID:") { print $(i+1); exit } }')"
+                  | awk '/Machine ID:/ && !f { for (i=1; i<=NF; i++) if ($i == "ID:" && !f) { print $(i+1); f = 1 } }')"
   fi
 
   if [ -z "$machine_id" ]; then
@@ -776,21 +768,17 @@ provision_machine() {
     local remote_dir="$_state_base/remote"
     mkdir -p "$remote_dir"
     local pid_record="$remote_dir/$$.json"
-    # Record the USER's launch-time --no-push intent here so the host's
-    # `leerie finalize` step can distinguish "user opted out of pushing"
-    # from "the in-Fly orchestrator was told not to push because it
-    # can't reach github" (the latter is a mechanism flag the launcher
-    # forces, NOT a user-intent flag).
-    python3 - "$pid_record" "$machine_id" "$FLY_APP" "${LEERIE_RUN_ID:-}" "$$" "${NO_PUSH:-false}" "${LEERIE_VOLUME_ID:-}" <<'PY'
+    # No push choice here: the run's one record of it is the orchestrator's
+    # (DESIGN §6 *One push choice per run, on every runtime*).
+    python3 -I - "$pid_record" "$machine_id" "$FLY_APP" "${LEERIE_RUN_ID:-}" "$$" "${LEERIE_VOLUME_ID:-}" <<'PY'
 import json, sys, datetime
-path, mid, app, run_id, pid, no_push, vol_id = sys.argv[1:]
+path, mid, app, run_id, pid, vol_id = sys.argv[1:]
 data = {
     "fly_app": app,
     "fly_machine_id": mid,
     "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     "run_id": run_id or None,
     "launcher_pid": int(pid),
-    "host_no_push": no_push in ("true", "1", "yes"),
 }
 if vol_id:
     data["volume_id"] = vol_id

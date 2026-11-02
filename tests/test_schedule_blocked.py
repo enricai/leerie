@@ -269,7 +269,7 @@ def test_orchestrate_calls_detect_no_work_between_reconcile_and_schedule():
     fn = rest[:end if end > 0 else len(rest)]
     reconcile_idx = fn.find("await phase_reconcile(")
     detect_idx = fn.find("_detect_no_work(")
-    schedule_idx = fn.find("_schedule(plans)")
+    schedule_idx = fn.find("_schedule(\n                plans")
     assert reconcile_idx >= 0
     assert detect_idx >= 0, (
         "_run_phases must call _detect_no_work() — without it, a run "

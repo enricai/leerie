@@ -194,8 +194,8 @@ _seed_shallow_parent() {
   tar -C "$_tmp_shallow/repo" -cf - .git 2>/dev/null \
         | $_seed_to flyctl ssh console --quiet --app "$FLY_APP" \
             --machine "$LEERIE_MACHINE_ID" --pty=false \
-            -C "sh -c 'cat > /tmp/leerie-seed-git.tar'" >/dev/null 2>&1
-  _rc=${PIPESTATUS[1]}
+            -C "sh -c 'cat > /tmp/leerie-seed-git.tar'" >/dev/null 2>&1 \
+        || _rc=${PIPESTATUS[1]}
   kill "$_hb_pid" 2>/dev/null || true
   wait "$_hb_pid" 2>/dev/null || true
   if [ "$_rc" -ne 0 ]; then
@@ -319,8 +319,8 @@ seed_repo_clone() {
     git -C "$USER_REPO" bundle create - --all 2>/dev/null \
           | $_seed_to flyctl ssh console --quiet --app "$FLY_APP" \
               --machine "$LEERIE_MACHINE_ID" --pty=false \
-              -C "sh -c 'cat > /tmp/leerie-seed.bundle'" >/dev/null 2>&1
-    _parent_rc=${PIPESTATUS[1]}
+              -C "sh -c 'cat > /tmp/leerie-seed.bundle'" >/dev/null 2>&1 \
+          || _parent_rc=${PIPESTATUS[1]}
     kill "$_hb_pid_parent" 2>/dev/null || true
     wait "$_hb_pid_parent" 2>/dev/null || true
     if [ "$_parent_rc" -ne 0 ]; then
@@ -575,8 +575,7 @@ seed_repo_dirty() {
     --from0 --files-from="$file_list" \
     -e "$wrapper" \
     "$USER_REPO/" "$LEERIE_MACHINE_ID:/work/" \
-    >/dev/null 2>"$rsync_err"
-  rsync_rc=$?
+    >/dev/null 2>"$rsync_err" || rsync_rc=$?
 
   if [ "$rsync_rc" -ne 0 ]; then
     remote_log "seed_repo: rsync delta transfer failed (exit $rsync_rc)"
@@ -777,7 +776,7 @@ _seed_one_inspect_dir_dirty() {
   file_list="$(mktemp -t leerie-inspect-dirty-list.XXXXXX)"
 
   printf '%s\n' "$dirty_files" \
-    | python3 -c '
+    | python3 -I -c '
 import sys
 for line in sys.stdin.read().splitlines():
     if not line:
@@ -791,8 +790,7 @@ for line in sys.stdin.read().splitlines():
     --from0 --files-from="$file_list" \
     -e "$wrapper" \
     "$host/" "$LEERIE_MACHINE_ID:$remote/" \
-    >/dev/null 2>&1
-  rc=$?
+    >/dev/null 2>&1 || rc=$?
 
   if [ "$rc" -ne 0 ]; then
     rm -f "$file_list" "$wrapper"
@@ -830,8 +828,7 @@ _seed_one_inspect_dir_rsync_fallback() {
   LEERIE_FLY_APP="$FLY_APP" rsync -a -H \
     -e "$wrapper" \
     "$host/" "$LEERIE_MACHINE_ID:$remote/" \
-    >/dev/null 2>&1
-  rc=$?
+    >/dev/null 2>&1 || rc=$?
 
   if [ "$rc" -ne 0 ]; then
     rm -f "$wrapper"

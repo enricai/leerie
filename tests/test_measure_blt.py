@@ -20,8 +20,10 @@ from tests.conftest import _run
 
 def _call(leerie, cmd="pytest", tree="/tmp/x", timeout=60.0, **kw):
     return _run(leerie._measure_blt(
-        "tests", cmd, tree, timeout=timeout,
-        log_path=kw.pop("log_path", None), verbosity="quiet", **kw))
+        "tests", cmd, tree,
+        grants=kw.pop("grants", leerie.WorkerGrants((), ())), timeout=timeout,
+        log_path=kw.pop("log_path", None), verbosity="quiet",
+        forbidden=kw.pop("forbidden", []), **kw))
 
 
 @pytest.fixture
@@ -45,8 +47,12 @@ def streaming(leerie, monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_exit_zero_is_measured_and_passed(leerie, streaming):
-    streaming((0, "42 passed"))
-    ax = _call(leerie)
+    calls = streaming((0, "42 passed"))
+    g = leerie.WorkerGrants(("/x",), ("/y",), (("TMPDIR", "/x/tmp"),))
+    ax = _call(leerie, grants=g)
+    # The command runs confined to the grant its caller derived (DESIGN §6
+    # *Leerie's runs of the repository's commands are confined too*).
+    assert calls[0][1]["grants"] is g
     assert (ax["ran"], ax["measured"], ax["passed"]) == (True, True, True)
     assert ax["command"] == "pytest"
     assert ax["summary"] == "42 passed"
@@ -92,8 +98,11 @@ def test_absent_command_is_not_applicable(leerie, streaming, cmd):
     """A repo with no command for an axis. `ran=False` means 'not
     applicable', and no subprocess is spawned at all."""
     calls = streaming((0, "unreachable"))
-    ax = _run(leerie._measure_blt("lint", cmd, "/tmp/x", timeout=1.0,
-                                  log_path=None, verbosity="quiet"))
+    ax = _run(leerie._measure_blt("lint", cmd, "/tmp/x",
+                                  grants=leerie.WorkerGrants((), ()),
+                                  timeout=1.0,
+                                  log_path=None, verbosity="quiet",
+                                  forbidden=[]))
     assert (ax["ran"], ax["measured"], ax["passed"]) == (False, False, None)
     assert ax["command"] == ""
     assert calls == [], "an absent command must not spawn a subprocess"
@@ -127,7 +136,19 @@ def test_source_never_uses_a_login_shell(leerie):
     fine under `-c`."""
     src = inspect.getsource(leerie._measure_blt)
     assert '"-lc"' not in src and "'-lc'" not in src
-    assert '["bash", "-c", cmd]' in src
+    # The argv is built by the one forbidden-command gate (DESIGN §9).
+    assert "_blt_shell_argv(cmd, forbidden)" in src
+    assert '["bash", "-c", cmd]' in inspect.getsource(leerie._blt_shell_argv)
+
+
+def test_a_forbidden_command_is_not_run(leerie, streaming):
+    """DESIGN §9: the orchestrator does not run what the task forbids — the
+    axis is unmeasured `forbidden_by_task` and nothing is spawned."""
+    calls = streaming((0, "ok"))
+    ax = _call(leerie, cmd="pnpm run test", forbidden=["pnpm test"])
+    assert calls == []
+    assert (ax["ran"], ax["measured"], ax["passed"]) == (False, False, None)
+    assert ax["skip_kind"] == "forbidden_by_task"
 
 
 def test_summary_is_tail_truncated(leerie, streaming):

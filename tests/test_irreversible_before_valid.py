@@ -242,9 +242,16 @@ class TestNeverStartedIsRestartable:
         assert "no_work_required" in src[max(0, i - 1200):i]
 
     def test_no_task_at_all_still_dies(self, leerie):
-        src = inspect.getsource(leerie._run_phases)
-        assert "neither progress nor a" in src, (
-            "the one genuinely unusable state must still die")
+        """The one unusable state is a state with no task, refused by
+        `_validate_resume_state`; a task with no phase output is not it
+        (DESIGN §6 *The first phase is a phase like any other*). End to end
+        in tests/test_resume_after_phase1_death.py."""
+        with pytest.raises(SystemExit):
+            leerie._validate_resume_state(
+                {"current_phase": "phase 1: classify", "worker_count": 2})
+        leerie._validate_resume_state(
+            {"task": "t", "current_phase": "phase 1: classify",
+             "worker_count": 2})
 
     def test_the_demotion_runs_the_repo_preflight(self, leerie):
         """`main()` gates `_preflight_repo()` on `if not args.resume:`, and

@@ -35,6 +35,7 @@ import pathlib
 import types
 
 import pytest
+from tests.conftest import fake_run_dir
 
 
 # The production layout: run state lives outside the checkout
@@ -97,8 +98,8 @@ def _argv_for(leerie, monkeypatch, *, schema_key, autonomous, repo_root):
                 "result": "{}", "structured_output": {"categories": []}}
 
     st = types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         repo_root=repo_root,
         data={"verbosity": "quiet"}, run_id="r1",
         bump_workers=lambda *a, **k: None,
@@ -135,7 +136,7 @@ class TestReachesTheArgv:
         if schema_key == "implementer":
             deny = _deny_value(argv)
             assert "/acceptance/**)," in deny
-            assert deny.endswith(",Read(~/.claude/projects/**)")
+            assert ",Read(~/.claude/projects/**)," in deny
 
     def test_the_acting_worker_really_does_carry_the_bypass_flag(
             self, leerie, monkeypatch):

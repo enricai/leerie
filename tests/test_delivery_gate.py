@@ -21,8 +21,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import subprocess
 
 import pytest
+
+from tests.stub_helpers import _delivery_tree, _judge_verdict
+from tests.conftest import register_worker_transcript, transcript_path
 
 MODELS = {"delivery_judge": "sonnet", "conformer": "sonnet"}
 EFFORTS = {"delivery_judge": "medium", "conformer": "low"}
@@ -35,22 +39,28 @@ ITEMS = [
 
 
 def _verdicts(*met_flags, evidence="checked"):
-    return {"verdicts": [
-        {"item_index": i, "met": m, "evidence": f"{evidence}-{i}"}
-        for i, m in enumerate(met_flags)]}
+    # Each verdict cites a line `_state`'s staging tree carries, so a met
+    # survives the citation screen (DESIGN §8 *Delivery detection*).
+    return {"verdicts": [_judge_verdict(i, m, f"{evidence}-{i}")
+                         for i, m in enumerate(met_flags)]}
 
 
 def _state(leerie, tmp_path, **overrides):
     leerie_root = tmp_path / ".leerie"
     run_id = "test-delivery-gate"
     run_dir = leerie_root / "runs" / run_id
-    (run_dir / "worktrees" / "staging").mkdir(parents=True)
+    staging = _delivery_tree(run_dir / "worktrees" / "staging")
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "test task", "worker_count": 0,
-               # The gate mirrors _run_final_conformance's own guard: no
-               # working_branch → the conformer pass it routes into
-               # would skip, so the gate skips too.
                "working_branch": "main",
+               # The gate mirrors _run_final_conformance's own guard: no
+               # base_sha (the commit the run branch was cut from) → the
+               # conformer pass it routes into would skip, so the gate
+               # skips too.
+               "base_sha": subprocess.run(
+                   ["git", "-C", str(staging), "rev-parse", "HEAD"],
+                   capture_output=True, text=True,
+                   check=True).stdout.strip(),
                "required_items": [dict(i) for i in ITEMS]}
     st.data.update(overrides)
     st.save()
@@ -133,9 +143,11 @@ def test_clean_first_pass_costs_one_sample(leerie, tmp_path, monkeypatch):
     assert len(calls) == 1, "confirm-on-first-pass must not vote"
     gate = st.data["delivery_gate"]
     assert gate["unmet_before"] == [] and gate["samples_before"] == 1
-    # Judge scope pins: read-only tools, staging cwd, non-autonomous.
+    # Judge scope pins: read-only tools, a checkout of staging's HEAD as
+    # cwd (`_judge_checkout`, DESIGN §8), non-autonomous.
     assert calls[0]["allowed_tools"] == leerie.SATISFIED_PROBE_TOOLS
-    assert calls[0]["cwd"].endswith("staging")
+    assert calls[0]["cwd"] == str(leerie._helper_worktree_path(
+        st, "delivery-judge"))
     assert calls[0]["autonomous"] is False
 
 
@@ -200,9 +212,9 @@ def test_item_supplied_index_cannot_override_position(
     poisoned = [{"item": "poisoned requirement", "item_index": 99}]
     st, run_dir = _state(leerie, tmp_path, required_items=poisoned)
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e0"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e1"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e2"}]},
+        {"verdicts": [_judge_verdict(0, False, "e0")]},
+        {"verdicts": [_judge_verdict(0, False, "e1")]},
+        {"verdicts": [_judge_verdict(0, False, "e2")]},
     ])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
@@ -223,7 +235,7 @@ def test_plain_string_items_are_coerced_not_fatal(
     st, run_dir = _state(leerie, tmp_path,
                          required_items=["a plain string requirement"])
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": True, "evidence": "ok"}]}])
+        {"verdicts": [_judge_verdict(0, True, "ok")]}])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
     assert unmet == []
@@ -243,9 +255,9 @@ def test_no_item_key_serialization_excludes_stray_item_index(
     st, run_dir = _state(leerie, tmp_path, required_items=[
         {"requirement": "keyless with stray index", "item_index": 99}])
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
     ])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
@@ -268,7 +280,7 @@ def test_nested_item_value_serializes_with_sorted_keys(
     st, run_dir = _state(leerie, tmp_path, required_items=[
         {"item": {"zebra": 1, "alpha": 2}}])
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": True, "evidence": "ok"}]}])
+        {"verdicts": [_judge_verdict(0, True, "ok")]}])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
     assert unmet == []
@@ -280,14 +292,14 @@ def test_nested_item_value_serializes_with_sorted_keys(
         "fixture starts with zebra")
 
 
-def test_missing_working_branch_skips(leerie, tmp_path, monkeypatch):
-    """Review round 1: with working_branch absent the final-conformer
+def test_missing_base_sha_skips(leerie, tmp_path, monkeypatch):
+    """Review round 1: with the base (`base_sha`) absent the final-conformer
     pass skips, so the gate must not spend judge samples on a routing
     target that will not run (and a recheck that would then report
     'still unmet after the final-conformer pass' for a pass that never
     ran)."""
     st, run_dir = _state(leerie, tmp_path)
-    del st.data["working_branch"]
+    del st.data["base_sha"]
     st.save()
     calls = _patch_judge(leerie, monkeypatch, [])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
@@ -309,9 +321,9 @@ def test_dict_item_without_item_key_gets_serialized_text(
     st, run_dir = _state(leerie, tmp_path, required_items=[
         {"requirement": "no item key here", "source_ref": "x"}])
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
     ])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
@@ -338,9 +350,9 @@ def test_non_string_item_value_survives_the_recheck_residual_log(
                                                "evidence": "e"}],
                              "samples_before": 3})
     _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
     ])
     lines: list[str] = []
     monkeypatch.setattr(leerie, "log", lines.append)
@@ -354,17 +366,17 @@ def test_non_string_item_value_survives_the_recheck_residual_log(
     assert any("delivery gate residual" in ln for ln in lines)
 
 
-def test_recheck_skips_without_working_branch(
+def test_recheck_skips_without_base_sha(
         leerie, tmp_path, monkeypatch):
-    """Review round 2: the prejudge's working_branch guard sat below its
+    """Review round 2: the prejudge's base guard sat below its
     resume early-return, so a resume carrying unmet_before with
-    working_branch since lost spent 3 samples and logged a residual for
+    the base since lost spent 3 samples and logged a residual for
     a conformer pass that skipped. Both halves must refuse
     independently."""
     st, run_dir = _state(leerie, tmp_path, delivery_gate={
         "unmet_before": [{"item_index": 0, "item": "x", "evidence": "e"}],
         "samples_before": 3})
-    del st.data["working_branch"]
+    del st.data["base_sha"]
     st.save()
     calls = _patch_judge(leerie, monkeypatch, [])
     # The prejudge resume path must not hand back a truthy list either.
@@ -708,10 +720,11 @@ def test_exec_digest_section_reaches_the_judge(
     monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
     logs = run_dir / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    (logs / "conformer-x.log").write_text(json.dumps({
+    transcript_path(logs, "conformer-x.log").write_text(json.dumps({
         "message": {"content": [
             {"type": "tool_use", "id": "u1", "name": "Bash",
              "input": {"command": "pnpm test src/a.test.ts"}}]}}) + "\n")
+    register_worker_transcript(transcript_path(logs, "conformer-x.log"))
     calls = _patch_judge(leerie, monkeypatch, [_verdicts(True, True)])
     asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))

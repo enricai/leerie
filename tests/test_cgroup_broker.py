@@ -419,6 +419,32 @@ def _seed_pids_files(broker, sid, current, maxval, events_max, oom_kill=0):
     return d
 
 
+def test_peak_reads_v2_high_water_marks(broker):
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    d.mkdir(parents=True)
+    (d / "memory.peak").write_text("19123456789\n")
+    (d / "pids.peak").write_text("2852\n")
+    assert broker._handle("peak wsid") == "OK 19123456789 2852"
+
+
+def test_peak_unreadable_is_minus_one_not_zero(broker):
+    """A kernel without the files (or a cgroup already gone) reports -1 —
+    "unknown" — never 0, which would read as a measured zero."""
+    assert broker._handle("peak ghost") == "OK -1 -1"
+
+
+def test_peak_v1_reads_max_usage_and_has_no_pids_peak(broker, monkeypatch):
+    monkeypatch.setattr(broker, "_HIER", "v1")
+    mdir = Path(broker.V2_ROOT) / "memory" / broker.SLICE / "leerie-w-wsid"
+    mdir.mkdir(parents=True)
+    (mdir / "memory.max_usage_in_bytes").write_text("7340032\n")
+    assert broker._handle("peak wsid") == "OK 7340032 -1"
+
+
+def test_peak_rejects_bad_sid(broker):
+    assert broker._handle("peak ../evil") == "ERR bad sid"
+
+
 def test_stat_reads_v2_counters(broker):
     _seed_pids_files(broker, "wsid", current=256, maxval=256, events_max=42)
     assert broker._handle("stat wsid") == "OK 256 256 42 0"
@@ -822,35 +848,35 @@ def test_sweep_is_selective_across_a_mixed_slice(broker, monkeypatch):
     assert str(young) not in attempted
 
 
-def test_sweep_runs_before_the_socket_is_bound(broker):
-    """Source-coupled: ordering IS the safety argument. Sweeping after
-    `listen()` would race a client of this very broker through its
-    create/enroll window, which no age floor is meant to cover."""
-    src = inspect.getsource(broker.main)
-    i_sweep = src.index("_sweep_orphaned_worker_cgroups")
-    i_bind = src.index("srv.bind(")
-    assert i_sweep < i_bind, (
-        "the orphan sweep must run before the socket is bound")
+def test_sweep_runs_before_the_first_request_is_read(broker, monkeypatch):
+    """Ordering IS the safety argument: sweeping while serving would race a
+    client of this very broker through its create/enroll window, which no
+    age floor is meant to cover. Executed, not read: the broker's child
+    runs `_start` and then `serve`, in that order."""
+    order: list[str] = []
+    monkeypatch.setattr(broker, "_detect", lambda: "v2")
+    monkeypatch.setattr(broker, "_sweep_orphaned_worker_cgroups",
+                        lambda: order.append("sweep") or 0)
+    broker._start()
+    src = inspect.getsource(broker.spawn)
+    assert src.index("_start()") < src.index("serve(theirs)")
+    assert order == ["sweep"]
 
 
-def test_sweep_failure_does_not_stop_the_broker(broker, monkeypatch):
+def test_sweep_failure_does_not_stop_the_broker(broker, monkeypatch,
+                                                capsys):
     """The broker is the only thing that can enforce containment; a sweep
     is housekeeping. If housekeeping can abort startup, a cosmetic bug
-    becomes a fail-closed die() for the whole run."""
-    src = inspect.getsource(broker.main)
-    i_sweep = src.index("_sweep_orphaned_worker_cgroups")
-    assert "try:" in src[:i_sweep], "the sweep call is not wrapped in try/"
-    assert "non-fatal" in src, (
-        "the sweep's failure arm should say plainly that it is non-fatal")
-    # ...and must not re-raise. Without this, adding `raise` to the except
-    # arm — the exact behaviour this test forbids — keeps both assertions
-    # above green, since the log line still says "non-fatal".
-    except_arm = src[src.index("except Exception"):]
-    except_arm = except_arm[:except_arm.index("\n    if ")]
-    assert "raise" not in except_arm, (
-        "the sweep's failure arm re-raises; a housekeeping failure would "
-        "then stop the broker, and the broker is the only thing that can "
-        "enforce containment")
+    becomes a fail-closed die() for the whole run. Executed: a sweep that
+    raises leaves `_start` returning normally, logged as non-fatal."""
+    monkeypatch.setattr(broker, "_detect", lambda: "v2")
+
+    def boom():
+        raise RuntimeError("sweep bug")
+    monkeypatch.setattr(broker, "_sweep_orphaned_worker_cgroups", boom)
+    broker._start()
+    err = capsys.readouterr().err
+    assert "orphan sweep failed (non-fatal)" in err and "sweep bug" in err
 
 
 def test_sweep_on_v1_walks_both_controller_dirs(broker, monkeypatch):
@@ -1179,3 +1205,52 @@ def test_probe_reports_err_on_oserror(broker, monkeypatch):
     monkeypatch.setattr(broker.os, "fork", raising_fork)
     resp = broker._handle("probe")
     assert resp.startswith("ERR probe:")
+
+
+# ---- destroy names the PIDs it killed -------------------------------------
+# cgroup.kill kills a daemon the command started under `setsid` too (a
+# repository's test-database wrapper). It reparents to the orchestrator as a
+# zombie, and only the client can wait for it, so `destroy` names what it
+# killed (DESIGN §6 *Zombie reaping*). Found live: an unreaped postgres
+# zombie made every later `pg_ctl start` in the run fail.
+
+def test_destroy_replies_with_the_pids_it_killed(broker, monkeypatch):
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-daemon"
+    d.mkdir(parents=True)
+    killed = {"done": False}
+    orig_write = broker._write
+
+    def write(path, *a, **kw):
+        if path.endswith("cgroup.kill"):
+            killed["done"] = True
+            return None
+        return orig_write(path, *a, **kw)
+
+    def read(path):
+        # Members until the kill, drained after it.
+        if path.endswith("cgroup.procs"):
+            return "" if killed["done"] else "1761\n1764\n"
+        return ""
+
+    monkeypatch.setattr(broker, "_write", write)
+    monkeypatch.setattr(broker, "_read", read)
+    assert broker._handle("destroy daemon") == "OK 1761 1764"
+    assert not d.exists()
+
+
+def test_destroy_of_an_empty_cgroup_replies_bare_ok(broker, monkeypatch):
+    broker._handle("create empty 0 0")
+    orig_write = broker._write
+    monkeypatch.setattr(
+        broker, "_write",
+        lambda path, *a, **kw: None if path.endswith("cgroup.kill")
+        else orig_write(path, *a, **kw))
+    assert broker._handle("destroy empty") == "OK"
+
+
+def test_destroy_failure_still_replies_err(broker, monkeypatch):
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-stuckd"
+    d.mkdir(parents=True)
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    monkeypatch.setattr(broker, "_read", lambda path: "1761\n")
+    assert broker._handle("destroy stuckd").startswith("ERR ")

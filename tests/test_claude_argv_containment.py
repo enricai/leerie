@@ -53,6 +53,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.conftest import fake_run_dir
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
@@ -253,8 +254,8 @@ def _worker_argv(leerie, monkeypatch) -> list[str]:
                 "result": "{}", "structured_output": {"categories": []}}
 
     st = SimpleNamespace(
-        path=Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         # `repo_root` is real, not decorative: claude_p derives the
         # path-scoped write denial from it (`_repo_write_denials`). An
         # under-specified stub here hides that producer-side contract.
@@ -331,7 +332,8 @@ def test_both_sites_share_the_builder(leerie, monkeypatch, tmp_path):
     assert smoke[smoke.index("--disallowedTools") + 1] == \
         leerie.DISALLOWED_TOOLS
     assert worker[worker.index("--disallowedTools") + 1] == \
-        leerie.DISALLOWED_TOOLS + ",Edit(//work/**)"
+        leerie.DISALLOWED_TOOLS + ",Edit(//work/**)" \
+        + f",Read(/{fake_run_dir()}/sysprompt/**)"
 
     # (b) break the single owner — BOTH must lose it. A site that rebuilt its
     #     own argv would keep the flag here and fail.
@@ -390,8 +392,15 @@ def test_smoke_argv_equals_the_derived_builder_output(leerie, monkeypatch,
     expected = leerie._contained_claude_argv(
         schema=leerie.SMOKE_SCHEMA, allowed_tools=leerie.SMOKE_TOOLS,
         max_turns=leerie.SMOKE_MAX_TURNS, model="sonnet",
-        prompt=leerie.SMOKE_PROMPT)
+        prompt=leerie.SMOKE_PROMPT,
+        # Confined like a worker, so its settings are a confined worker's
+        # (DESIGN §6 *A worker's commands cannot reach its CLI*).
+        # from the run's template its own configuration was made from.
+        settings=leerie._confined_cli_settings(None, run_dir=tmp_path,
+                                               repo_root=None),
+        settings_only=True)
     assert cap["cmd"] == expected
+    assert cap["cmd"][cap["cmd"].index("--setting-sources") + 1] == ""
 
 
 def test_smoke_runs_in_an_empty_directory(leerie, monkeypatch, tmp_path):

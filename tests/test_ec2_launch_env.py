@@ -60,42 +60,28 @@ def test_operator_ami_without_the_file_keeps_the_session_env(tmp_path):
     assert "MISE_RUBY_COMPILE" not in env
 
 
-def _orch_argv(orch_args: list[str]) -> list[str]:
-    """Execute the shared launch suffix's own argv-assembly lines."""
-    suffix = subprocess.run(
+def _launch_suffix() -> str:
+    return subprocess.run(
         ["bash", "-c", f". {ROOT}/scripts/remote/seed-common.sh; _render_launch_suffix"],
         capture_output=True, text=True, check=True).stdout
-    lines = [l for l in suffix.splitlines() if l.startswith(("_split = ", "orch_argv = "))]
-    assert len(lines) == 2, suffix
-    ns = {"orch_args": orch_args}
-    exec("\n".join(lines), ns)
-    return ns["orch_argv"]
 
 
-def test_resume_keeps_its_verb_and_run_id_first():
-    # A leading --no-push made the orchestrator miss `resume` (it is
-    # recognized only as argv[0]) and reject the run id — on a real resume.
-    assert _orch_argv(["resume", "i-0abc", "--runtime", "ec2", "--host-no-push", "false"]) == [
-        "resume", "i-0abc", "--runtime", "ec2", "--host-no-push", "false", "--no-push"]
-
-
-def test_fresh_task_gets_no_push_after_its_args():
-    assert _orch_argv(["Fix the bug", "--run-id", "i-0abc"]) == [
-        "Fix the bug", "--run-id", "i-0abc", "--no-push"]
-
-
-def test_no_push_stays_before_a_literal_separator():
-    # After "--" argparse would read --no-push as a positional.
-    assert _orch_argv(["--run-id", "r1", "--", "-task starting with a dash"]) == [
-        "--run-id", "r1", "--no-push", "--", "-task starting with a dash"]
+def test_the_wrapper_forwards_the_orchestrator_argv_unchanged():
+    # The wrapper adds no flag of its own: a leading --no-push once made the
+    # orchestrator miss `resume` (recognized only as argv[0]), and the push
+    # choice is the orchestrator's own record, handed to a fresh run by the
+    # launcher (DESIGN §6 *One push choice per run, on every runtime*).
+    suffix = _launch_suffix()
+    assert '"/opt/leerie-image/orchestrator/leerie.py", *orch_args],' in suffix
+    assert "--no-push" not in suffix
 
 
 def test_launch_argv_parses_as_resume_in_the_orchestrator(leerie):
-    # The orchestrator's own verb handling, applied to what the wrapper builds.
-    argv = _orch_argv(["resume", "i-0abc", "--host-no-push", "false"])
-    assert argv[0] == "resume"
+    # The orchestrator's own verb handling, applied to what the wrapper
+    # forwards for `leerie resume <id> --runtime ec2`.
+    argv = ["resume", "i-0abc", "--runtime", "ec2"]
     run_id, rest = leerie._extract_resume_run_id(argv[1:])
-    assert run_id == "i-0abc" and "--no-push" in rest
+    assert run_id == "i-0abc" and rest == ["--runtime", "ec2"]
 
 
 def test_remote_launcher_exit_cleanup_kills_the_keepalive_and_removes_stage(tmp_path):

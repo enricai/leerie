@@ -435,3 +435,65 @@ def test_worker_sid_passes_broker_validation(leerie):
         "279400a6d7d79916565abba313a4df0ec9fdd8b91b7fbf73872ad475ec898c8c",
         "fit-judge-docs-001-d0")
     assert broker._valid_sid(scoped)
+
+
+# ---- destroy's killed PIDs reach the zombie reaper ------------------------
+
+def test_destroy_marks_the_killed_pids_reapable(leerie, monkeypatch):
+    """`OK <pid>…` names what cgroup.kill killed; those zombies are ours to
+    wait for (DESIGN §6 *Zombie reaping*)."""
+    _stub_broker(leerie, monkeypatch, "OK 1761 1764")
+    monkeypatch.setattr(leerie, "_REAPABLE_PIDS", set())
+    monkeypatch.setattr(leerie, "_ASYNCIO_MANAGED_PIDS", {1764})
+    logged = []
+    monkeypatch.setattr(leerie, "log", lambda msg: logged.append(msg))
+    leerie._cgroup_destroy("sid-k")
+    # 1764 is a PID asyncio owns: never handed to the reaper.
+    assert leerie._REAPABLE_PIDS == {1761}
+    assert logged == []
+
+
+def test_destroy_err_reply_marks_nothing(leerie, monkeypatch):
+    _stub_broker(leerie, monkeypatch, "ERR Device or resource busy")
+    monkeypatch.setattr(leerie, "_REAPABLE_PIDS", set())
+    monkeypatch.setattr(leerie, "log", lambda msg: None)
+    leerie._cgroup_destroy("sid-l")
+    assert leerie._REAPABLE_PIDS == set()
+
+
+def test_a_killed_daemon_is_reaped_so_its_pid_is_free(leerie, monkeypatch):
+    """End to end with a real process: a daemon left the command's session,
+    was SIGKILLed by a teardown and is now our zombie. While it is a zombie
+    `kill(pid, 0)` still succeeds (which is what makes a PID-lock daemon
+    refuse to restart); once destroy's reply reaches the reaper it is
+    waited for and the PID is free."""
+    import asyncio
+    import os
+    import signal
+
+    pid = os.fork()
+    if pid == 0:  # the "daemon"
+        os.setsid()
+        signal.pause()
+        os._exit(0)
+    os.kill(pid, signal.SIGKILL)
+    deadline = __import__("time").monotonic() + 5
+    while __import__("time").monotonic() < deadline:
+        with open(f"/proc/{pid}/stat") as f:
+            if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                break
+    os.kill(pid, 0)  # a zombie: still "running" to a PID-lock check
+
+    _stub_broker(leerie, monkeypatch, f"OK {pid}")
+    monkeypatch.setattr(leerie, "_REAPABLE_PIDS", set())
+    monkeypatch.setattr(leerie, "_ASYNCIO_MANAGED_PIDS", set())
+    leerie._cgroup_destroy("sid-z")
+
+    async def one_tick():
+        task = asyncio.ensure_future(leerie._zombie_reaper(interval_sec=0.01))
+        await asyncio.sleep(0.1)
+        task.cancel()
+
+    asyncio.run(one_tick())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

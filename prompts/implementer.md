@@ -121,7 +121,7 @@ that directory is protected and any commit touching it is rejected.
 Turn `success_criteria_seed` into a brief criteria file describing what
 success looks like for this subtask — the explicit success condition plus
 any regression guards (adjacent behavior that must not change) worth
-naming. Write it to `LEERIE_DIR/criteria/<id>.md`.
+naming. Write it to `LEERIE_DIR/notes/<id>/criteria.md`.
 
 The criteria file is **informational**, not a gate. The orchestrator does
 not check whether each criterion is satisfied; the §8 confidence
@@ -424,7 +424,10 @@ entry instead:
 "self_reported_risks": [
   {"kind": "external_contract_assumption",
    "detail": "treats the provider's error-message wording as the discriminator; only `resolve_blt` -style documented fields were available for the happy path",
-   "where": "orchestrator/leerie.py:_run_checked_loop"}
+   "where": "orchestrator/leerie.py:_run_checked_loop",
+   "gap": "unverified_external",
+   "where_paths": ["orchestrator/leerie.py"],
+   "resource": "the provider's live API"}
 ]
 ```
 
@@ -433,15 +436,49 @@ executed here — pairs with `exercised: false` above),
 `"external_contract_assumption"` (behavior depends on an undocumented or
 unverified detail of an external interface — message text, implicit format,
 unstated ordering), `"untested_change"` (you committed code no new or
-existing test exercises). One line of `detail` each; `where` when it is one
-place.
+existing test exercises), and `"process_note"` (a note about your own
+process — what you did or did not run, commit, install or check, e.g.
+"typecheck was not run"). The orchestrator runs its own build, lint and
+test checks, so a `process_note` is informational and goes nowhere. One
+line of `detail` each; `where` when it is one place.
+
+Every entry also carries the typed fields code routes on:
+
+- `where_paths` — the exact repository-relative paths of the files the risk
+  is about: the production code whose behaviour is uncertain, or the weak
+  test. Each must be a file that exists in your worktree when you finish;
+  a path that does not is dropped. `[]` only if no file applies.
+- `gap` — exactly one of:
+  - `test_missing`: production code in this subtask's change has no test
+    that exercises it;
+  - `test_weak`: a test exists but does not assert the behaviour the change
+    is about (it mocks the code under test away, asserts too little, or
+    misses a case the change introduced);
+  - `unverified_external`: the behaviour depends on something outside this
+    repository's own checks (a live service, real database, cloud resource,
+    real browser or device, or a separate package the repository's root
+    type-check and test commands do not cover) and was not verified;
+  - `none`: not a gap in the code or its tests — information, a design
+    decision.
+- `settle_by` *(optional)* — what would settle it: `test` (the default),
+  `typecheck`, `install`, or `build`.
+- `resource` *(optional; give it for `unverified_external`)* — a short noun
+  phrase naming what a human needs to check it ("a live payment-provider
+  sandbox", "a Postgres server under load").
+- `simulated_interleaving` *(optional)* — `true` for a race or concurrency
+  behaviour whose tests can only stub the interleaving.
+
+Before finishing, check that each production file you changed is exercised
+by a test; report a risk for each one that is not.
 
 This field is **routed, not judged**: entries go to your conformer as
-explicit challenges and onto the run's risk register, which the PR body
-shows the human reviewer verbatim. It never gates and never costs a retry —
-honesty here is free, and silence is the only wrong answer. Do not use it
-to restate ordinary limitations of the subtask's scope; use it for the
-thing you would want the reviewer to know before merging.
+explicit challenges; a `test_missing` or `test_weak` gap the orchestrator
+cannot settle mechanically comes back to you as a re-drive, and an
+`unverified_external` one is listed in the PR for a human to check. It
+never gates and never costs a retry — honesty here is free, and silence is
+the only wrong answer. Do not use it to restate ordinary limitations of the
+subtask's scope; use it for the thing you would want the reviewer to know
+before merging.
 
 ### 6. Suspending across a worker boundary
 
@@ -458,7 +495,7 @@ You cannot read your exact context usage, but you can notice the proxies: a very
 long transcript, many files read, dozens of tool calls. If you sense you will
 not finish cleanly before your context degrades, **stop early and hand off**:
 
-- Write a checkpoint to `LEERIE_DIR/checkpoints/<id>.md` using the schema below.
+- Write a checkpoint to `LEERIE_DIR/notes/<id>/checkpoint.md` using the schema below.
 - Commit any partial, coherent code to the branch.
 - Return status `incomplete-handoff` with the checkpoint path.
 
@@ -477,7 +514,7 @@ When this exit is available, the filter that decides whether a question
 qualifies is the shared one (see the top of this prompt). To take the
 exit:
 
-- Write a checkpoint to `LEERIE_DIR/checkpoints/<id>.md` using the schema below.
+- Write a checkpoint to `LEERIE_DIR/notes/<id>/checkpoint.md` using the schema below.
   Capture the work-in-progress so the re-spawned worker can pick it up.
 - Commit any partial, coherent code to the branch.
 - Return status `needs-clarification` with `checkpoint_path` set AND
@@ -500,7 +537,7 @@ will be answered, but it costs you one of your `subtask_continuations`
 re-spawns; burn the budget and the orchestrator treats the subtask as
 mis-scoped.
 
-Checkpoint schema (`LEERIE_DIR/checkpoints/<id>.md`):
+Checkpoint schema (`LEERIE_DIR/notes/<id>/checkpoint.md`):
 
 ```markdown
 # Checkpoint: <subtask-id>
@@ -561,6 +598,85 @@ Return **only** this JSON object as your final message — no prose, no fences:
 - `incomplete-handoff` requires `checkpoint_path` set.
 - `blocked` requires `blocker` set with the precise missing evidence/input.
 - `failed` requires a diagnosis in `summary`.
+- `blocker_kind` is required whenever `status` is `blocked` or `failed` —
+  see "Blocker kind" below. Omit it, `external_resource` and
+  `external_resource_claim` on any other status (none of them accepts
+  null).
+
+### Blocker kind (required whenever status is `blocked` or `failed`)
+
+When you return `blocked` or `failed`, set `blocker_kind` to exactly one
+value. The orchestrator routes on it, not on your `blocker` text:
+
+- `nothing_to_change` — the requested change is already present in the
+  tree (or your owned scope contains nothing to change); no edit is needed.
+  The subtask is driven again with your blocker as input, so say exactly
+  what you checked.
+- `external_precondition` — the work needs something that only a human
+  outside this run can supply: credentials or secrets, a live third-party
+  service or account, a human decision or approval, physical hardware. Set
+  `external_resource` to name it, and type it in `external_resource_claim`
+  (below). This is the **only** kind that is accepted without more work,
+  and it is listed for human verification. A command that fails or is
+  killed because of this container's own resources is NOT
+  `external_precondition` — use `environment_limit`.
+- `environment_limit` — a command could not complete because of this
+  container's resources: killed (exit 137 / OOM), cannot spawn threads or
+  processes (EAGAIN), a dependency install or test run that hung or timed
+  out, a missing tool or `node_modules`. Name the command and the symptom in
+  `blocker`. The orchestrator owns the container's limits and retries once.
+- `upstream_missing` — another subtask's output that this one depends on is
+  not in your tree yet.
+- `cannot_reproduce` — you could not reproduce the defect you were meant to
+  fix. The orchestrator then runs the subtask's verify commands itself; it
+  settles the subtask only if they pass on your unchanged tree, so commit
+  nothing for this kind.
+- `regression_unresolved` — you made changes or wrote tests, but tests still
+  fail or criteria remain unmet and more work in this repository could
+  address them.
+- `other` — anything else; explain in `blocker`.
+
+`environment_limit` is retried once, then settled. `external_precondition`
+is accepted only when the orchestrator's own check backs it, and
+`nothing_to_change` and `cannot_reproduce` settle only when its own checks
+back them. Anything else — every other kind, and any of these the checks do
+not back — is driven again: another round receives your blocker as input,
+unless the environment itself keeps the orchestrator from running its
+check on the same claim a second blocked attempt running, which settles the
+subtask unconverged (the first time, it is driven again). A missing kind, or `external_precondition` without `external_resource`, is
+treated as `other`.
+
+`external_resource_claim` types the resource of an `external_precondition`
+so the orchestrator can check it in this container before accepting.
+Exactly one `kind`, with its field:
+- `env_var` + `name` — an environment variable that is unset or empty;
+  the name itself, upper-case letters, digits and underscores, at least
+  three characters (a common word such as EXPORT or ERROR is refused);
+- `network` + `host` and `port` — a host this container cannot resolve or
+  connect to;
+- `file` + `path` — a file that does not exist (relative to your worktree,
+  or absolute), written as a path;
+- `binary` + `name` — a program not on `PATH` that the repository's own
+  lockfiles and install recipe do not provide;
+- `service_credential` + `name` — a credential for a service, held in no
+  environment variable or credential file here, named as the environment
+  variable or the file path that would hold it;
+- `human_action` + `description` and `quote` — a step only a person can
+  take (an approval in a dashboard, a manual sign-off); `quote` copies,
+  verbatim, the words of one of the run's declared external items that ask
+  for it. A quote from the task text alone is refused.
+
+Name the resource exactly, and only as it is written in the task, your
+subtask's spec or the repository: the name is matched as a whole word or
+path, never as part of a longer one.
+
+The orchestrator checks the claim: the variable must be unset, the host
+unreachable, the file absent, the binary uninstallable, the credential
+absent, the quote present; the name must have its kind's shape and
+appear in the task, your
+subtask's spec or the repository; and when your subtask has verify
+commands, one must fail with output naming it. A claim that does not
+check out is driven again as `other`, with the reason.
 - `needs-clarification` requires both `checkpoint_path` set AND
   `clarification_question` set to `{id, question, why_underivable}` (all
   three string fields non-empty). See §6b for the gate.

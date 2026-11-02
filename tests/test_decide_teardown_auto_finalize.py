@@ -281,26 +281,17 @@ def _events(result: subprocess.CompletedProcess) -> list[str]:
     return out
 
 
-def test_launch_time_no_push_skips_finalize_and_destroys(tmp_path):
-    # The fetch strips run.json.no_push when a branch exists, so the
-    # fly-machine.json intent is what must stop the push.
+@pytest.mark.parametrize("kw", [{"sidecar_no_push": True}, {"no_push_env": "true"},
+                                {"sidecar_no_push": False}])
+def test_teardown_leaves_the_push_choice_to_host_finalize(tmp_path, kw):
+    # DESIGN §6 *One push choice per run, on every runtime*: the choice is
+    # run.json.no_push, recorded by the orchestrator and read by
+    # host_finalize, which nothing strips. Neither a sidecar field nor this
+    # launcher's NO_PUSH is a second owner, so the teardown always hands a
+    # finished run to host_finalize (it skips the push itself).
     result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
-                                  tmp_path=tmp_path, sidecar_no_push=True)
+                                  tmp_path=tmp_path, **kw)
     assert result.returncode == 0, result.stderr
-    assert _events(result) == ["fetch", "destroy"]
-    assert "--no-push was set at launch" in result.stdout + result.stderr
-
-
-def test_no_push_on_the_tearing_down_launcher_also_skips_finalize(tmp_path):
-    result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
-                                  tmp_path=tmp_path, no_push_env="true")
-    assert _events(result) == ["fetch", "destroy"]
-
-
-def test_recorded_push_intent_still_finalizes(tmp_path):
-    # Control: the same sidecar with host_no_push false keeps auto-finalize.
-    result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
-                                  tmp_path=tmp_path, sidecar_no_push=False)
     assert _events(result) == ["fetch", "finalize", "destroy"]
 
 

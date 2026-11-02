@@ -15,6 +15,7 @@ import json
 import pytest
 
 from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
+from tests.stub_helpers import _d1_covered
 
 try:
     import jsonschema  # type: ignore
@@ -86,6 +87,9 @@ def test_prescribed_procedure_evidence_is_string(leerie):
 
 def test_classifier_schema_accepts_prescribed_procedure_incident_shape(leerie):
     _validate(leerie, {
+        # The requirement-coverage fields are schema-required since
+        # DESIGN §8 *Requirement coverage*.
+        **_d1_covered(),
         "categories": ["feature-implementation"],
         "confidence": _conf(classification=9.2),
         "prescribed_procedure": {
@@ -100,6 +104,9 @@ def test_classifier_schema_accepts_prescribed_procedure_incident_shape(leerie):
 
 def test_classifier_schema_accepts_prescribed_procedure_goal_only_shape(leerie):
     _validate(leerie, {
+        # The requirement-coverage fields are schema-required since
+        # DESIGN §8 *Requirement coverage*.
+        **_d1_covered(),
         "categories": ["feature-implementation"],
         "confidence": _conf(classification=9.0),
         "prescribed_procedure": {
@@ -115,6 +122,9 @@ def test_classifier_schema_accepts_missing_prescribed_procedure(leerie):
     """prescribed_procedure is not in `required` — older/degenerate worker
     output omitting it entirely must still validate."""
     _validate(leerie, {
+        # The requirement-coverage fields are schema-required since
+        # DESIGN §8 *Requirement coverage*.
+        **_d1_covered(),
         "categories": ["bug-fixing"],
         "confidence": _conf(classification=9.0),
     })

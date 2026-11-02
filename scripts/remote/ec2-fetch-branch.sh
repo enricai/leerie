@@ -128,7 +128,7 @@ fetch_state_ec2() {
   # (text-only output — safe for command substitution).
   local run_id run_branch working_branch run_no_push
   local discover_output
-  discover_output="$(ec2_remote_exec "$instance_id" 'python3 -c "
+  discover_output="$(ec2_remote_exec "$instance_id" 'python3 -I -c "
 import os, json, sys
 
 runs_dir = \"/work/.leerie/runs\"
@@ -169,7 +169,7 @@ print(best[3])
     return 1
   }
 
-  if printf '%s' "$discover_output" | grep -q "^ERROR:"; then
+  if grep -q "^ERROR:" < <(printf '%s\n' "$discover_output"); then
     remote_log "fetch_state_ec2: $discover_output"
     return 1
   fi
@@ -180,7 +180,7 @@ print(best[3])
   # indices aligned with the python emitter above; not read here
   working_branch="$(printf '%s' "$discover_output" | sed -n '3p')"
   # shellcheck disable=SC2034  # deliberately NOT consumed — see
-  # the 'CANNOT trust run.json.no_push as a proxy' note below
+  # the 'run.json.no_push is no proxy' note below
   run_no_push="$(printf '%s' "$discover_output" | sed -n '4p')"
 
   if [ -z "$run_id" ] || [ -z "$run_branch" ]; then
@@ -194,20 +194,21 @@ print(best[3])
 
   # --- Step 2: stream the run branch via git bundle -------------------------
   # Same two skip scenarios as fetch-branch.sh's Step 2 (cleared-but-empty
-  # terminal-state run; other early-failure). Cannot trust
-  # run.json.no_push as a proxy — it's a mechanism flag on EC2 too (the
-  # instance has no GitHub auth, so the in-instance launcher always
-  # passes --no-push).
+  # terminal-state run; other early-failure). run.json.no_push is no
+  # proxy: a --no-push run has a branch too.
   local _branch_present="false"
+  # Every branch of the run lives in the run's own repository on the
+  # instance (DESIGN §6 *The run's own repository*), never in /work's.
+  local _run_repo="/work/.leerie/runs/$run_id/repo"
   if ec2_remote_exec "$instance_id" \
-       "git -C /work rev-parse --verify refs/heads/$run_branch" >/dev/null 2>&1; then
+       "git --git-dir=$_run_repo rev-parse --verify refs/heads/$run_branch" >/dev/null 2>&1; then
     _branch_present="true"
   fi
 
   local _subtask_refs=""
   local _subtask_prefix="leerie/subtasks/${run_id}/"
   _subtask_refs="$(ec2_remote_exec "$instance_id" \
-    "git -C /work for-each-ref --format='%(refname:short)' refs/heads/${_subtask_prefix}" \
+    "git --git-dir=$_run_repo for-each-ref --format='%(refname:short)' refs/heads/${_subtask_prefix}" \
     2>/dev/null || true)"
 
   if [ "$_branch_present" = "false" ] && [ -z "$_subtask_refs" ]; then
@@ -242,11 +243,11 @@ print(best[3])
       remote_log "remote: streaming git bundle for $_subtask_count subtask branch(es) (run branch absent) ..."
     fi
 
-    if ! _ec2_fetch_ssh "git -C /work bundle create - $_bundle_refs" \
+    if ! _ec2_fetch_ssh "git --git-dir=$_run_repo bundle create - $_bundle_refs" \
          > "$host_bundle" 2>/dev/null; then
       if [ "$_branch_present" = "true" ] && [ "$_subtask_count" -gt 0 ]; then
         remote_log "fetch_state_ec2: full bundle failed; retrying with run branch only"
-        if ! _ec2_fetch_ssh "git -C /work bundle create - $run_branch" \
+        if ! _ec2_fetch_ssh "git --git-dir=$_run_repo bundle create - $run_branch" \
              > "$host_bundle" 2>/dev/null; then
           remote_log "fetch_state_ec2: failed to create git bundle on instance $instance_id"
           rm -f "$host_bundle"
@@ -306,7 +307,7 @@ print(best[3])
   mkdir -p "$host_leerie_runs"
 
   remote_log "remote: streaming .leerie/runs/$run_id state directory ..."
-  if ! _ec2_fetch_ssh "tar -cC /work/.leerie/runs $run_id" \
+  if ! _ec2_fetch_ssh "tar -cC /work/.leerie/runs --exclude=$run_id/repo --exclude=$run_id/tree-repos $run_id" \
        | tar -xC "$host_leerie_runs" 2>/dev/null; then
     remote_log "fetch_state_ec2: failed to stream run state directory from instance $instance_id"
     return 1
@@ -314,30 +315,11 @@ print(best[3])
 
   remote_log "remote: run state directory fetched to $host_leerie_runs/$run_id"
 
-  # DEFENSE-IN-DEPTH no_push stripper — identical logic and identical
-  # $_branch_present conditional as fetch-branch.sh (see that file's
-  # Step 3 comment for the full rationale).
-  if [ "$_branch_present" = "true" ]; then
-    local _host_run_json="$host_leerie_runs/$run_id/run.json"
-    if [ -f "$_host_run_json" ]; then
-      python3 - "$_host_run_json" <<'PY' || true
-import json, os, sys
-path = sys.argv[1]
-try:
-    data = json.load(open(path))
-except Exception:
-    sys.exit(0)
-if data.get("no_push") is True:
-    data.pop("no_push", None)
-    tmp = path + ".tmp"
-    json.dump(data, open(tmp, "w"), indent=2)
-    open(tmp, "a").write("\n")
-    os.replace(tmp, path)
-PY
-    fi
-  fi
+  # run.json arrives unchanged: its no_push is the run's one push choice,
+  # recorded by the orchestrator at the run's start, and host_finalize reads
+  # it as written (DESIGN §6 *One push choice per run, on every runtime*).
 
-  # --- Step 4: stream .leerie/config.toml + Dockerfile back (best-effort) ----
+  # --- Step 4: apply the captured deps; stream .leerie/Dockerfile back (best-effort) ----
   # Same existence-guarded, non-fatal, never-clobber contract as
   # fetch-branch.sh's Step 4.
   local host_leerie_root
@@ -347,16 +329,23 @@ PY
     host_leerie_root="$USER_REPO/.leerie"
   fi
 
-  local _cap_file
-  for _cap_file in config.toml Dockerfile; do
-    local _remote_path="/work/.leerie/$_cap_file"
-    local _host_path="$host_leerie_root/$_cap_file"
-    if [ -e "$_host_path" ]; then
-      continue
-    fi
-    if ! ec2_remote_exec "$instance_id" "test -f '$_remote_path'" >/dev/null 2>&1; then
-      continue
-    fi
+  # The dependency captures the run recorded came home with its state
+  # directory above; write them into $USER_REPO/.leerie/config.toml as the
+  # local launcher does (DESIGN §6½ *The host applies a capture*). The
+  # machine's /work/.leerie/config.toml is no longer written.
+  if ! declare -F host_apply_captured_deps >/dev/null 2>&1; then
+    # shellcheck source=scripts/host-finalize.sh
+    . "$_EC2_FETCH_BRANCH_DIR/../host-finalize.sh" 2>/dev/null || true
+  fi
+  if declare -F host_apply_captured_deps >/dev/null 2>&1; then
+    host_apply_captured_deps "$host_leerie_root/runs/$run_id" || true
+  fi
+
+  local _cap_file=Dockerfile
+  local _remote_path="/work/.leerie/$_cap_file"
+  local _host_path="$host_leerie_root/$_cap_file"
+  if [ ! -e "$_host_path" ] \
+     && ec2_remote_exec "$instance_id" "test -f '$_remote_path'" >/dev/null 2>&1; then
     remote_log "remote: streaming .leerie/$_cap_file to host ..."
     mkdir -p "$host_leerie_root" 2>/dev/null || true
     if _ec2_fetch_ssh "cat '$_remote_path'" > "$_host_path" 2>/dev/null; then
@@ -365,7 +354,7 @@ PY
       rm -f "$_host_path" 2>/dev/null || true
       remote_log "fetch_state_ec2: warning: failed to stream .leerie/$_cap_file (non-fatal)"
     fi
-  done
+  fi
 
   remote_log "remote: fetch complete — run $run_id ready for host-side finalize"
   return 0

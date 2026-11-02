@@ -117,16 +117,17 @@ def test_git_helper_bounded_by_timeout_not_unbounded_hang(
 
 
 def test_risk_section_is_appended_to_the_llm_body(leerie, monkeypatch, st, repo):
-    """DESIGN §6 *The residual-risk section is appended by code on every
-    composition path*: the pr_writer path's append happens BEFORE the
-    run.json write, so the handed-off pr_body already carries the section
-    verbatim — the launcher needs no risk logic on this path (and must not
-    add any, or the section renders twice)."""
+    """DESIGN §6 *The PR's end-state section is rendered by code, from
+    typed state*: the pr_writer path's append happens BEFORE the run.json
+    write, so the handed-off pr_body already carries the section verbatim —
+    the launcher needs no section logic on this path (and must not add
+    any, or the section renders twice)."""
     st.data["working_branch"] = "main"
     st.data["risk_register"] = {"feat-001": [
         {"kind": "external_contract_assumption",
          "detail": "matches the provider's error-message wording",
-         "source": "implementer", "addressed": False}]}
+         "source": "implementer", "gap": "unverified_external",
+         "where_paths": [], "addressed": False}]}
 
     async def _fake_claude_p(**kwargs):
         return {"title": "add a feature", "body": "## Summary\n\nworker body"}
@@ -138,9 +139,10 @@ def test_risk_section_is_appended_to_the_llm_body(leerie, monkeypatch, st, repo)
     run_json = json.loads((st.run_dir / "run.json").read_text())
     body = run_json["pr_body"]
     assert body.startswith("## Summary\n\nworker body"), body
-    expected = leerie._format_risk_register_section(st.data)
-    assert expected and expected in body, (
-        f"risk section missing from LLM pr_body.\n---got---\n{body!r}")
+    expected = leerie._format_pr_end_state_section(st.data)
+    assert expected and body.endswith(expected), (
+        f"end-state section missing from LLM pr_body.\n---got---\n{body!r}")
+    assert "matches the provider's error-message wording" in body
 
 
 def test_no_risk_section_appended_when_register_empty(leerie, monkeypatch,
@@ -166,19 +168,21 @@ def test_worker_emitted_risk_section_is_stripped_not_doubled(
     and the final body carries exactly one."""
     st.data["working_branch"] = "main"
     st.data["risk_register"] = {"feat-001": [
-        {"kind": "untested_change", "detail": "no test covers the branch",
-         "source": "implementer", "addressed": False}]}
+        {"kind": "external_contract_assumption",
+         "detail": "no test covers the branch",
+         "source": "implementer", "gap": "unverified_external",
+         "where_paths": [], "addressed": False}]}
 
     async def _fake_claude_p(**kwargs):
         return {"title": "t",
-                "body": "## Summary\n\nwork\n\n## ⚠ Residual risks\n\n"
-                        "- worker-invented entry"}
+                "body": "## Summary\n\nwork\n\n## Needs human "
+                        "verification\n\n- worker-invented entry"}
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
     asyncio.run(leerie._compose_pr_via_llm(
         st, _caps(leerie), {}, {}, repo, None))
     body = json.loads((st.run_dir / "run.json").read_text())["pr_body"]
-    assert body.count("Residual risks") == 1, body
+    assert body.count("## Needs human verification") == 1, body
     assert "worker-invented entry" not in body
     assert "no test covers the branch" in body
 
@@ -191,8 +195,10 @@ def test_mid_body_worker_section_strip_preserves_trailing_content(
     ordering section was silently lost)."""
     st.data["working_branch"] = "main"
     st.data["risk_register"] = {"feat-001": [
-        {"kind": "untested_change", "detail": "real register entry",
-         "source": "implementer", "addressed": False}]}
+        {"kind": "external_contract_assumption",
+         "detail": "real register entry",
+         "source": "implementer", "gap": "unverified_external",
+         "where_paths": [], "addressed": False}]}
 
     async def _fake_claude_p(**kwargs):
         return {"title": "t",
@@ -206,7 +212,8 @@ def test_mid_body_worker_section_strip_preserves_trailing_content(
     body = json.loads((st.run_dir / "run.json").read_text())["pr_body"]
     assert "worker-invented entry" not in body
     assert "merge the parent PR first" in body, body
-    assert body.count("Residual risks") == 1, body
+    assert "Residual risks" not in body, body
+    assert body.count("## Needs human verification") == 1, body
     assert "real register entry" in body
 
 

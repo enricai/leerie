@@ -53,8 +53,8 @@ dockerfile_env() {
     | while IFS= read -r line; do printf '%s\n' "${line//\$PATH/$BASE_PATH}"; done
 }
 
-MISE_VERSION="$(sed -n 's/^ARG MISE_VERSION=//p' "$DOCKERFILE" | head -n1)"
-CLAUDE_SPEC="$(sed -n "s/.*npm install -g '\\(@anthropic-ai\\/claude-code@[^']*\\)'.*/\\1/p" "$DOCKERFILE" | head -n1)"
+MISE_VERSION="$(sed -n 's/^ARG MISE_VERSION=//p' "$DOCKERFILE" | sed -n 1p)"
+CLAUDE_SPEC="$(sed -n "s/.*npm install -g '\\(@anthropic-ai\\/claude-code@[^']*\\)'.*/\\1/p" "$DOCKERFILE" | sed -n 1p)"
 if [ -z "$MISE_VERSION" ] || [ -z "$CLAUDE_SPEC" ]; then log "could not derive pins from Dockerfile"; exit 1; fi
 if [ "$(dockerfile_env | wc -l)" -ne "$(grep -c '^ENV ' "$DOCKERFILE")" ]; then
   log "an ENV line in the Dockerfile is not of the single KEY=VALUE form"; exit 1
@@ -106,7 +106,7 @@ set -a
 set +a
 mise install --system node@lts python@3.12
 
-node_dir="$(find /usr/local/share/mise/installs/node -mindepth 1 -maxdepth 1 -type d | head -n1)/"
+node_dir="$(find /usr/local/share/mise/installs/node -mindepth 1 -maxdepth 1 -type d | sed -n 1p)/"
 ln -sfn "${node_dir%/}" /usr/local/share/mise/installs/node/lts-current
 
 # Login shells (an operator's `ssh` + `sudo -iu leerie`) get the same set.
@@ -191,12 +191,14 @@ CFG
 chmod g+w /work
 
 # --- What container-entry.sh does as PID 1, for an instance that has none ---
-# The cgroup broker (DESIGN §6 *Memory containment*): without it the
-# orchestrator's fail-closed containment gate refuses to start any worker.
-# Root on a real host is the rootful case, so leerie.slice sits at the top
-# of the hierarchy as in a rootful container. Not a Delegate=yes unit
-# cgroup: the broker would occupy it, and cgroup v2 forbids enabling
-# controllers on a cgroup that holds processes.
+# leerie.slice for the cgroup broker (DESIGN §6 *Memory containment*):
+# without it the orchestrator's fail-closed containment gate refuses to
+# start any worker. The broker itself is not a service: the launch wrapper
+# (seed-common.sh's _render_launch_suffix), running as root, spawns it and
+# hands the orchestrator its descriptor, so no pathname reaches it (DESIGN
+# §6 *No leerie service is reachable by a path from a process it does not
+# serve*). Root on a real host is the rootful case, so leerie.slice sits at
+# the top of the hierarchy as in a rootful container.
 cat > /usr/local/sbin/leerie-instance-setup <<'SETUP'
 #!/bin/sh
 # Boot-time half of container-entry.sh (scripts/remote/ec2-bake.sh).
@@ -223,22 +225,20 @@ mkdir -p "$cache" && chown leerie: "$cache" 2>/dev/null; chmod 1777 "$cache" 2>/
 exit 0
 SETUP
 chmod 755 /usr/local/sbin/leerie-instance-setup
-cat > /etc/systemd/system/leerie-cgroup-broker.service <<'UNIT'
+cat > /etc/systemd/system/leerie-instance-setup.service <<'UNIT'
 [Unit]
-Description=leerie cgroup broker (worker containment)
+Description=leerie instance setup (leerie.slice, /tmp/.cache)
 After=local-fs.target
 
 [Service]
-Type=simple
-ExecStartPre=/usr/local/sbin/leerie-instance-setup
-ExecStart=/usr/bin/python3 /opt/leerie-image/scripts/cgroup-broker.py
-Restart=always
-RestartSec=2
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/leerie-instance-setup
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-systemctl enable leerie-cgroup-broker.service
+systemctl enable leerie-instance-setup.service
 
 # Disk-backed /tmp, as in the container. Debian 13 mounts /tmp as a RAM
 # tmpfs by default; seed bundles land there and XDG_CACHE_HOME points there,

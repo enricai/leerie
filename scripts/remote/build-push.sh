@@ -279,7 +279,7 @@ _build_push_local() {
 
     echo "[build-push] smoke: leerie version (baked source, no bind mount) ..."
     if run "$build_cmd" run --rm "$IMAGE_TAG" \
-         python3 /opt/leerie-image/orchestrator/leerie.py version; then
+         python3 -I /opt/leerie-image/orchestrator/leerie.py version; then
       echo "[build-push] smoke OK"
     else
       echo "build-push: WARNING — version smoke failed (baked source not working)" >&2
@@ -318,4 +318,4 @@ echo "  flyctl machine run $IMAGE_TAG --app $FLY_APP"
 echo ""
 echo "To verify inside the machine:"
 echo "  flyctl machine run $IMAGE_TAG --app $FLY_APP \\"
-echo "    -- python3 /opt/leerie-image/orchestrator/leerie.py version"
+echo "    -- python3 -I /opt/leerie-image/orchestrator/leerie.py version"

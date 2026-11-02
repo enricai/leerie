@@ -58,18 +58,27 @@ def _write_run(state_dir: Path, run_id: str, fields: dict) -> None:
 
 
 def _stub_group_self_cmd(tmp_path: Path) -> tuple[Path, Path]:
-    """Stub for fan-out: records argv, creates a minimal run.json in the
-    correct per-basename state dir so tag-back can find a run to update."""
+    """Stub for fan-out: records argv and starts one run in the member's
+    per-basename state dir, as a member's orchestrator does: its run.json
+    carries the `--group-id` it was given, from run start."""
     log = tmp_path / "stub-self.log"
     stub = tmp_path / "self-stub"
     stub.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
         echo "$@" >> "{log}"
+        _gid=""
+        while [ "$#" -gt 0 ]; do
+          [ "$1" = --group-id ] && _gid="$2"
+          shift
+        done
         _bn="$(basename "$(pwd)")"
         _sd="{tmp_path}/.leerie/$_bn"
         mkdir -p "$_sd/runs/stub-run-$_bn"
-        printf '{{"run_id":"stub-run-%s","finished_at":"2026-07-01T00:00:00Z","branch":"leerie/runs/stub-run-%s"}}' \\
-          "$_bn" "$_bn" >"$_sd/runs/stub-run-$_bn/run.json"
+        printf '{{"run_id":"stub-run-%s","finished_at":"2026-07-01T00:00:00Z","branch":"leerie/runs/stub-run-%s","group_id":"%s"}}' \\
+          "$_bn" "$_bn" "$_gid" >"$_sd/runs/stub-run-$_bn/run.json"
+        # Older than the runs already on disk, so "the newest finished run"
+        # is never this one.
+        touch -d '2020-01-01' "$_sd/runs/stub-run-$_bn/run.json"
         exit 0
         """))
     stub.chmod(0o755)
@@ -333,6 +342,53 @@ class TestGroupFanOut:
         assert result.returncode == 0, result.stderr
         assert (tmp_path / ".leerie" / "alpha-repo").is_dir()
         assert (tmp_path / ".leerie" / "beta-repo").is_dir()
+
+    def test_only_this_groups_runs_are_tagged(self, tmp_path: Path) -> None:
+        """Two groups' runs, and a standalone run, coexist in each member's
+        state dir, all finished and newer than the member's own run. Only
+        the run each member started carries this group's id: the group arm
+        tags no run of its own choosing (DESIGN §6 *Which run the container
+        ran*)."""
+        repo_a = tmp_path / "alpha-repo"
+        repo_b = tmp_path / "beta-repo"
+        _make_git_repo(repo_a)
+        _make_git_repo(repo_b)
+        other = "0ddba11e-0000-4000-8000-000000000001"
+        for bn in ("alpha-repo", "beta-repo"):
+            sd = tmp_path / ".leerie" / bn
+            _write_run(sd, f"other-group-{bn}", {
+                "run_id": f"other-group-{bn}", "group_id": other,
+                "finished_at": "2026-07-02T00:00:00Z",
+                "branch": f"leerie/runs/other-group-{bn}"})
+            _write_run(sd, f"standalone-{bn}", {
+                "run_id": f"standalone-{bn}",
+                "finished_at": "2026-07-03T00:00:00Z",
+                "branch": f"leerie/runs/standalone-{bn}"})
+        stub, stub_log = _stub_group_self_cmd(tmp_path)
+        result = _run(
+            tmp_path,
+            ["group",
+             "--group-id", GROUP_ID,
+             "--repo", str(repo_a), "task a",
+             "--repo", str(repo_b), "task b"],
+            env_extra={"LEERIE_STATE_DIR": ""},
+            stub=stub, stub_log=stub_log,
+        )
+        assert result.returncode == 0, result.stderr
+        tags = {}
+        for rj in sorted((tmp_path / ".leerie").glob("*/runs/*/run.json")):
+            tags[rj.parent.name] = json.loads(rj.read_text()).get("group_id")
+        assert tags == {
+            "other-group-alpha-repo": other, "other-group-beta-repo": other,
+            "standalone-alpha-repo": None, "standalone-beta-repo": None,
+            "stub-run-alpha-repo": GROUP_ID, "stub-run-beta-repo": GROUP_ID}
+        # And the group's status names its own two runs, no other.
+        status = _run(tmp_path, ["status", GROUP_ID],
+                      env_extra={"LEERIE_STATE_DIR": ""})
+        assert "stub-run-alpha-repo" in status.stdout
+        assert "stub-run-beta-repo" in status.stdout
+        assert "standalone" not in status.stdout
+        assert "other-group" not in status.stdout
 
     def test_invalid_repo_path_rejected(self, tmp_path: Path) -> None:
         """A --repo path that is not a git repo causes a fast failure."""

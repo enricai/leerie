@@ -138,22 +138,21 @@ fi
 # identity: cross-scope task migration needs write on the common-ancestor
 # cgroup leerie doesn't own, and (in the rootful case) the kernel keeps
 # controller limit files root-owned in a subtree that was merely chowned
-# rather than created by the delegatee (both reproduced). So we launch a
-# tiny broker HERE, at PID 1 before the privilege drop, and the
-# orchestrator drives it over a Unix socket. In the rootful case PID 1 is
-# real root; in the rootless case PID 1 is the rootlesskit-mapped host
-# UID, which is exactly the identity CGROUP_ROOT above is delegated to —
-# no separate privilege level is needed or available. LEERIE_CGROUP_V2_ROOT
-# tells the broker which root to operate under (default /sys/fs/cgroup
-# when unset, i.e. every case except rootless). Best-effort: if it can't
-# start, the orchestrator's probe round-trip fails and its fail-closed gate
-# fires (or --dangerously-allow-uncapped downgrades to a warning). It runs on
-# both runtimes; the idle-PID-1 Fly path below still needs it because the
-# orchestrator is launched out-of-band via ssh and connects to this socket.
-if command -v python3 >/dev/null 2>&1; then
-  LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py \
-    </dev/null >>/tmp/cgroup-broker.log 2>&1 &
-fi
+# rather than created by the delegatee (both reproduced). So a tiny broker
+# runs at THIS identity — real root rootful, the rootlesskit-mapped host UID
+# rootless, which is exactly the identity CGROUP_ROOT above is delegated to.
+# It is started at the very end, by the exec that drops privilege
+# (`cgroup-broker.py --spawn`): it makes a socket pair, forks the broker
+# with one end, and execs the drop with the other end inherited — the
+# orchestrator's only way to reach it. No pathname exists, so no confined
+# process can connect to it (DESIGN §6 *No leerie service is reachable
+# by a path from a process it does not serve*). Best-effort as before: a
+# broker that cannot start leaves the
+# orchestrator's probe failing, and its fail-closed gate fires (or
+# --dangerously-allow-uncapped downgrades to a warning). On Fly/EC2 the
+# orchestrator is launched out-of-band, so its launch wrapper starts the
+# broker the same way (scripts/remote/seed-common.sh) and PID 1 starts none.
+BROKER="/opt/leerie-image/scripts/cgroup-broker.py"
 
 cd /work
 
@@ -191,11 +190,24 @@ fi
 # skipped when the base image already has a group at that GID (so no
 # group literally named "leerie" exists). On the no-volume and local
 # nerdctl paths the chown is a no-op against an already-correct /work
-# (rootfs /work is leerie-owned from image build; local bind-mount
-# preserves host ownership).
+# (rootfs /work is leerie-owned from image build).
 # (DESIGN §6 *Remote disk policy*; IMPLEMENTATION §0.5 *Container shape*.)
+#
+# Never on a read-only /work: locally /work is the user's checkout, mounted
+# read-only (DESIGN §6 *The explicit channel*). There the chown could only
+# fail — and on a read-write mount, rootful, it re-owned the user's checkout
+# directory to the image's leerie uid (measured: 1234 became 1000). Reading
+# it needs no ownership: the image sets git's safe.directory '*'.
+_work_is_read_only() {
+  # `/proc/self/mounts`: device, mount point, type, options (comma-separated).
+  awk '$2 == "/work" { n = split($4, o, ","); for (i = 1; i <= n; i++)
+         if (o[i] == "ro") ro = 1 } END { exit ro ? 0 : 1 }' \
+    /proc/self/mounts 2>/dev/null
+}
 if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
-  chown leerie: /work 2>/dev/null || true
+  if ! _work_is_read_only; then
+    chown leerie: /work 2>/dev/null || true
+  fi
   # The Dockerfile leaves /home/leerie/.local, .cache, and .gnupg
   # root-owned (rootless needs that; see the Dockerfile comment there).
   # The rootful `runuser -u leerie` drop is a real uid switch, so it
@@ -221,6 +233,15 @@ if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   chown -R leerie: /tmp/.cache 2>/dev/null || true
   chmod -R a+rwX /tmp/.cache 2>/dev/null || true
   chmod 1777 /tmp/.cache 2>/dev/null || true
+  # The host-wide build-semaphore dir the launcher mounts (`~/.leerie/.host`;
+  # DESIGN §6 *A host-wide build semaphore*). The orchestrator creates its
+  # slot files there, and rootful's `runuser -u leerie` is a real uid
+  # switch, so it needs literal leerie ownership. Rootless needs nothing:
+  # the host user's dir is outer UID 0, which maps to inner leerie. The dir
+  # only, never -R — slot files are opened read-only, whoever made them.
+  if [ -d /leerie-host ]; then
+    chown leerie: /leerie-host 2>/dev/null || true
+  fi
 fi
 
 # Fly path: idle as PID 1 so the machine stays up. The orchestrator is
@@ -287,10 +308,14 @@ unset _is_resume _a
 if [ "$ROOTLESS" = "true" ]; then
   _leerie_uid="$(id -u leerie)"
   _leerie_gid="$(id -g leerie)"
-  exec unshare --user --map-user="$_leerie_uid" --map-group="$_leerie_gid" \
+  LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" exec python3 "$BROKER" --spawn \
+    --log /tmp/cgroup-broker.log -- \
+    unshare --user --map-user="$_leerie_uid" --map-group="$_leerie_gid" \
     env HOME=/home/leerie USER=leerie LOGNAME=leerie \
     python3 /opt/leerie-image/orchestrator/leerie.py "$@"
 fi
-exec runuser -u leerie -- \
+LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" exec python3 "$BROKER" --spawn \
+  --log /tmp/cgroup-broker.log -- \
+  runuser -u leerie -- \
   env HOME=/home/leerie USER=leerie LOGNAME=leerie \
   python3 /opt/leerie-image/orchestrator/leerie.py "$@"

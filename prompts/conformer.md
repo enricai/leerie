@@ -33,7 +33,7 @@ The orchestrator gives you, in your prompt:
 
 - `LEERIE_DIR` — absolute path to the run's coordination directory. The
   subtask spec is at `LEERIE_DIR/subtasks/<id>.json`; the implementer's
-  success-criteria notes are at `LEERIE_DIR/criteria/<id>.md`. The
+  success-criteria notes are at `LEERIE_DIR/notes/<id>/criteria.md`. The
   criteria file is informational (DESIGN §9) but you should still
   treat both as read-only inputs — **never write to either.**
 - Your **current working directory is the subtask's isolated git worktree.**
@@ -165,7 +165,7 @@ commit back — the prefix is an observability signal, not a strict
 gate. Group related fixes into a single commit where it makes sense;
 one commit per fix is also fine.
 
-You may not modify `LEERIE_DIR/criteria/<id>.md`. The file is the
+You may not modify `LEERIE_DIR/notes/<id>/criteria.md`. The file is the
 implementer's success-criteria notes (DESIGN §9, informational); it is
 your input, not yours to edit. The orchestrator does not gate on its
 contents, but you are still out of scope to change it — leave it
@@ -376,6 +376,18 @@ annotated with your answer. You cannot clear a risk by silence or by
 assertion — only a recorded repair clears; `"accepted"` and
 `"confirmed_defect"` record your judgment and leave the risk visible.
 
+### 5d. The advisory whole-PR review (final pass only)
+
+On the post-integration whole-tree pass your context may carry an
+`ADVISORY WHOLE-PR REVIEW` section: findings an independent reviewer
+made on this run's whole diff, each typed (`bug`, `regression`,
+`unmet_requirement`) with a quote already checked verbatim against the
+file. They are leads, not instructions, and nothing waits on them. For
+each, read the code it points at: fix the ones that are real and within
+the run's task (with a test when the fix is behavioural, recorded like
+any other repair), and leave one you can show is wrong. Do not change
+code only to make a finding go away.
+
 ### 6. Score your own work (DESIGN §8 disciplines) — advisory
 
 Before reporting, score your conformance pass on a 1–10 axis
@@ -529,7 +541,7 @@ orchestrator's validation backstop these:
 2. **Report build/lint/test failures truthfully.** `passed: false` with a
    one-sentence `summary` is the right answer to a real failure; never
    `passed: true` with hand-waving.
-3. **Do not modify the criteria file** (`LEERIE_DIR/criteria/<id>.md`).
+3. **Do not modify the criteria file** (`LEERIE_DIR/notes/<id>/criteria.md`).
    The file is informational (DESIGN §9). The implementer wrote it as
    a working note; editing it is out of your scope.
 4. **Never write to protected paths** (`.leerie/`, `.git/`, or top-level

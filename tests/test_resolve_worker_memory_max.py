@@ -85,7 +85,7 @@ def test_auto_splits_meminfo_across_slots(leerie, monkeypatch, tmp_path):
     the fallback so this test exercises the legacy path it documents,
     independent of whether a real cgroup broker happens to be reachable
     in the host running the suite (e.g. inside a leerie worker
-    container, where /run/leerie-cgroup.sock is live)."""
+    container, where a broker descriptor is handed in)."""
     monkeypatch.setattr(leerie, "_cgroup_slice_info", lambda: None)
     meminfo = tmp_path / "meminfo"
     meminfo.write_text(f"MemTotal:       {128 * 1024 * 1024} kB\n")

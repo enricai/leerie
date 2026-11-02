@@ -17,7 +17,9 @@ The companion bash-harness tests cover the script-level mechanics:
 - `tests/test_host_finalize_sh.py::test_skips_when_run_branch_absent_locally`
   for Fix C (host_finalize rev-parse defense in depth).
 - `tests/test_fetch_branch_sh.py::test_fetch_branch_skips_bundle_when_branch_missing`
-  for Fix A (fetch-branch.sh's conditional stripper preserves intent).
+  (the run.json, its `no_push` included, arrives unchanged; there is no
+  stripper since 7de505e2, DESIGN §6 *One push choice per run, on every
+  runtime*).
 
 This test focuses on Fix B (the finalize arm of `leerie` itself).
 """
@@ -102,8 +104,8 @@ def test_finalize_no_work_run_exits_cleanly(tmp_path):
 
     Without Fix B1, finalize takes the `else` arm at leerie:423 and
     dies with "no fly_machine_id and is not already synced."
-    Without Fix B2, the stripper at leerie:499-533 would clear
-    no_push=true, host_finalize would attempt `git push` on the
+    The record arrives unchanged (no stripper since 7de505e2): were
+    no_push=true lost, host_finalize would attempt `git push` on the
     non-existent branch, and the run would fail with `src refspec ...
     does not match any`."""
     user_repo = _make_user_repo(tmp_path)
@@ -139,15 +141,13 @@ def test_finalize_no_work_run_exits_cleanly(tmp_path):
     assert "no fly_machine_id and is not already synced" not in combined, (
         "The old dead-end branch must not fire for no-work runs."
     )
-    # And the run.json must still carry no_push=true (Fix B2 — the
-    # stripper at lines 499-533 must have been skipped because the
-    # branch is absent locally).
+    # And the run.json must still carry no_push=true: nothing on the
+    # finalize path rewrites the record.
     after = json.loads(
         (state_dir / "runs" / run_id / "run.json").read_text()
     )
     assert after.get("no_push") is True, (
-        "Fix B2: no_push=true must be preserved when the run branch "
-        "is absent locally. Found: " + json.dumps(after, indent=2)
+        "no_push=true must arrive unchanged. Found: " + json.dumps(after, indent=2)
     )
     # And nothing was pushed.
     assert after.get("pushed_at") is None

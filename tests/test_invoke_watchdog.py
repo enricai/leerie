@@ -22,6 +22,7 @@ binary is required (matching test_invoke_streaming.py's pattern).
 """
 from __future__ import annotations
 
+import os
 import asyncio
 import json
 from pathlib import Path
@@ -163,7 +164,7 @@ def test_create_subprocess_exec_passes_stdin_devnull(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stdin", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     assert captured.get("stdin") == asyncio.subprocess.DEVNULL, (
         "_invoke must pass stdin=asyncio.subprocess.DEVNULL so workers "
@@ -196,7 +197,7 @@ def test_spawn_heartbeat_logged_at_normal_verbosity(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-spawn", leerie_dir=leerie_dir,
-        verbosity="normal"))
+        verbosity="normal", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert f"[t-spawn] spawned (pid={_MOCK_PID_SENTINEL})" in out, (
@@ -220,7 +221,7 @@ def test_spawn_heartbeat_suppressed_at_quiet(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-spawn-q", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "spawned (pid=" not in out, (
@@ -251,7 +252,7 @@ def test_idle_watchdog_warns_on_silent_worker(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=10, sid="t-idle", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "[t-idle] no stdout events in" in out, (
@@ -286,7 +287,7 @@ def test_idle_watchdog_does_not_fire_on_active_worker(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=30, sid="t-active", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "no stdout events in" not in out, (
@@ -317,7 +318,7 @@ def test_idle_watchdog_cancels_cleanly_on_success(leerie, leerie_dir,
         return await asyncio.wait_for(leerie._invoke(
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=10, sid="t-cancel", leerie_dir=leerie_dir,
-            verbosity="quiet"), timeout=5.0)
+            verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())), timeout=5.0)
 
     result = asyncio.run(runner())
     assert result["subtype"] == "success"
@@ -343,7 +344,7 @@ def test_idle_watchdog_includes_stderr_tail(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=10, sid="t-tail", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "[t-tail] no stdout events in" in out
@@ -376,7 +377,7 @@ def test_leerie_worker_debug_injects_env(leerie, leerie_dir, monkeypatch):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-debug", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     env = captured.get("env")
     assert env is not None, (
@@ -393,10 +394,11 @@ def test_leerie_worker_debug_injects_env(leerie, leerie_dir, monkeypatch):
 
 def test_no_env_override_when_leerie_worker_debug_unset(leerie, leerie_dir,
                                                        monkeypatch):
-    """When LEERIE_WORKER_DEBUG is NOT set, env= must be None so the
-    worker simply inherits the parent environment (preserving the
-    OAuth token, mise PATH, etc.). Passing a partial env dict would
-    break the worker by stripping required variables."""
+    """When LEERIE_WORKER_DEBUG is NOT set, the worker inherits the
+    parent environment whole (the OAuth token, mise PATH, etc.) — less
+    only leerie's hooks-off git entry (DESIGN §6½ *Hooks off*), with its
+    own stores and caches (DESIGN §6 *The stores a view installs from are
+    leerie's*) — and no debug variables."""
     captured: dict = {}
 
     async def fake(*cmd, **kwargs):
@@ -410,13 +412,23 @@ def test_no_env_override_when_leerie_worker_debug_unset(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-no-debug", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
-    assert captured.get("env") is None, (
-        "without LEERIE_WORKER_DEBUG, env= must be None so the worker "
-        "inherits the orchestrator's full environment (token, PATH, "
-        "etc.). Passing a partial dict would strip required vars."
-    )
+    env = captured.get("env")
+    base = leerie._worker_cache_env(
+        leerie._git_hooks_on(os.environ), leerie_dir)
+    assert env == {**base,
+        # A confined worker's commands run nested in its CLI's domain
+        # (DESIGN §6 *A worker's commands cannot reach its CLI*), and its
+        # CLI's own git on leerie's terms (*The CLI's own git runs on
+        # leerie's terms*).
+        leerie.SHELL_PREFIX_ENV: str(leerie.WORKER_SHELL),
+        **leerie._cli_git_env(str(leerie_dir.parent),
+                              base.get("PATH", ""))}, (
+        "without LEERIE_WORKER_DEBUG the worker inherits the orchestrator's "
+        "full environment (token, PATH, etc.), less leerie's hooks entry, "
+        "with its own stores and its shell prefix")
+    assert "DEBUG" not in env or env["DEBUG"] == os.environ.get("DEBUG")
 
 
 # ---- DEFAULT_CAPS cap registration --------------------------------------
@@ -582,7 +594,7 @@ def test_idle_warn_sec_falls_back_to_default_when_cap_absent(
 def test_stderr_written_to_log_file_live(leerie, leerie_dir, monkeypatch):
     """Each stderr line must be written to the per-sid log file with a
     `[ts] stderr` header, regardless of verbosity. This is the property
-    that lets `tail -f .leerie/logs/<sid>.log` show stderr as it arrives,
+    that lets `tail -f <run-dir>/logs/transcripts/<sid>.log` show stderr as it arrives,
     instead of (today) buffering silently until the worker exits or the
     watchdog fires."""
     events = [json.dumps({"type": "result", "subtype": "success",
@@ -596,9 +608,9 @@ def test_stderr_written_to_log_file_live(leerie, leerie_dir, monkeypatch):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stderr-file", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
-    log_text = (leerie_dir / "logs" / "t-stderr-file.log").read_text()
+    log_text = (leerie._transcripts_dir(leerie_dir / "logs") / "t-stderr-file.log").read_text()
     assert "stderr" in log_text, (
         "per-sid log file must contain a `stderr` header for each "
         "stderr line; got log text:\n" + log_text)
@@ -624,7 +636,7 @@ def test_stderr_echoed_to_orchestrator_at_stream(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stderr-stream", leerie_dir=leerie_dir,
-        verbosity="stream"))
+        verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "[t-stderr-stream] stderr: " in out, (
@@ -650,14 +662,14 @@ def test_stderr_not_echoed_at_quiet(leerie, leerie_dir, monkeypatch, capsys):
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stderr-quiet", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "stderr:" not in out, (
         "stderr must not echo to the orchestrator at `quiet` verbosity; "
         f"got:\n{out}")
     # File still gets it.
-    log_text = (leerie_dir / "logs" / "t-stderr-quiet.log").read_text()
+    log_text = (leerie._transcripts_dir(leerie_dir / "logs") / "t-stderr-quiet.log").read_text()
     assert "chatty progress message" in log_text, (
         "per-sid log file must still capture stderr even at quiet; got "
         f"log text:\n{log_text}")
@@ -695,7 +707,7 @@ def test_stderr_activity_resets_idle_watchdog(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=10, sid="t-stderr-liveness", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
 
     out = capsys.readouterr().out
     assert "no stdout events in" not in out, (
@@ -722,7 +734,7 @@ def test_stderr_chunks_preserved_for_no_result_envelope(leerie, leerie_dir,
     envelope = asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-stderr-exiterr", leerie_dir=leerie_dir,
-        verbosity="quiet"))
+        verbosity="quiet", grants=leerie.WorkerGrants(("/",), ())))
     msg = str(envelope.get("result"))
     assert "authentication failed for tenant Z" in msg, (
         "the no-result envelope must still surface the full stderr "

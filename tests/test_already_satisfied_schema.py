@@ -16,6 +16,7 @@ import json
 import pytest
 
 from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
+from tests.stub_helpers import _d1_covered
 
 if HAS_JSONSCHEMA:
     import jsonschema  # type: ignore
@@ -63,6 +64,9 @@ def test_likely_already_satisfied_not_required(leerie):
 def test_classifier_schema_accepts_likely_already_satisfied_true_with_evidence(
         leerie):
     _validate(leerie, {
+        # The requirement-coverage fields are schema-required since
+        # DESIGN §8 *Requirement coverage*.
+        **_d1_covered(),
         "categories": ["bug-fixing"],
         "confidence": _conf(classification=9.0),
         "likely_already_satisfied": True,
@@ -76,6 +80,9 @@ def test_classifier_schema_accepts_likely_already_satisfied_true_with_evidence(
 
 def test_classifier_schema_accepts_likely_already_satisfied_false(leerie):
     _validate(leerie, {
+        # The requirement-coverage fields are schema-required since
+        # DESIGN §8 *Requirement coverage*.
+        **_d1_covered(),
         "categories": ["feature-implementation"],
         "confidence": _conf(classification=9.0),
         "likely_already_satisfied": False,
@@ -87,6 +94,9 @@ def test_classifier_schema_accepts_missing_likely_already_satisfied(leerie):
     """The common case: the classifier omits both fields entirely (a task
     that is not already done). Must still validate — schema-optional."""
     _validate(leerie, {
+        # The requirement-coverage fields are schema-required since
+        # DESIGN §8 *Requirement coverage*.
+        **_d1_covered(),
         "categories": ["bug-fixing"],
         "confidence": _conf(classification=9.0),
     })

@@ -346,11 +346,8 @@ now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 data["finished_at"] = now
 data["recovered_at"] = now
 data["recovered_via"] = "force-finalize"
-# Mechanism flag: the orchestrator died before it could set its own
-# no_push intent; treat as user-intent-push (the host-side finalize gate
-# remains the source of truth for actual push decisions).
-if data.get("no_push") is True:
-    data["no_push"] = False
+# no_push is left as recorded: it is the run's one push choice, written at
+# the run's start (DESIGN §6 *One push choice per run, on every runtime*).
 
 tmp_path = run_json_path.with_suffix(".json.tmp")
 tmp_path.write_text(json.dumps(data, indent=2) + "\n")
@@ -374,9 +371,9 @@ PYEOF
   # through a shell quoter.
   # When the caller exports FORCE_STOP=1, propagate it into the remote
   # env so the Python payload SIGTERMs the orchestrator instead of refusing.
-  local remote_cmd="python3 -"
+  local remote_cmd="python3 -I -"
   if [ "${FORCE_STOP:-}" = "1" ]; then
-    remote_cmd="bash -lc 'FORCE_STOP=1 exec python3 -'"
+    remote_cmd="bash -lc 'FORCE_STOP=1 exec python3 -I -'"
   fi
   local result
   if ! result="$(printf '%s' "$payload" \

@@ -78,14 +78,19 @@ def test_tsconfig_infers_a_build_proxy(leerie, tmp_path):
     assert leerie.resolve_blt_scoped(tmp_path)["build"] == "npx tsc --noEmit"
 
 
-def test_a_python_repo_infers_nothing(leerie, tmp_path):
-    """No pytest inference on purpose: `{files}` for a repo whose changed
-    file is `orchestrator/leerie.py` renders `pytest orchestrator/leerie.py`,
-    which collects nothing. Such repos declare nothing and fall back to the
-    canonical command — the honest outcome, rather than a template that looks
-    right and selects nothing."""
+def test_a_python_repo_infers_pytest_over_test_files(leerie, tmp_path):
+    """Rewritten (A4): pytest IS inferred now, but only over `{test_files}`.
+    `{files}` would render `pytest orchestrator/leerie.py`, which collects
+    nothing; `{test_files}` renders nothing for that diff and the axis
+    defers to the whole-tree pass, and runs the touched tests otherwise."""
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
-    assert leerie.resolve_blt_scoped(tmp_path) == {}
+    scoped = leerie.resolve_blt_scoped(tmp_path)
+    assert scoped == {"test": "pytest {test_files}"}
+    assert leerie._render_scoped(scoped["test"], ["orchestrator/leerie.py"],
+                                 "HEAD") is None
+    assert leerie._render_scoped(
+        scoped["test"], ["orchestrator/leerie.py", "tests/test_x.py"],
+        "HEAD") == "pytest tests/test_x.py"
 
 
 def test_config_declaration_beats_inference(leerie, tmp_path):

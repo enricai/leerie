@@ -48,8 +48,19 @@ def _dense_file(tmp_path, lines=2100):
     return p
 
 
-def _subtask(change_shape, *, file="dense.ts"):
+def _subtask(change_shape, *, file="dense.ts", independent=True,
+             sites=("const",)):
+    """A sweep carries the rest of the split gate by default: independent
+    sites, and a site identifier (`const`) that every line of `_dense_file`
+    holds, so a sweep tiles the whole file exactly as before site-limiting."""
+    extra = {}
+    if change_shape == "sweep":
+        if independent is not None:
+            extra["independent_sites"] = independent
+        if sites is not None:
+            extra["sweep_sites"] = list(sites)
     return {
+        **extra,
         "id": "bugfix-001",
         "title": "Stop foldReturn being dropped when a paging signal exists",
         "success_criteria_seed": (
@@ -92,13 +103,85 @@ def test_sweep_on_the_same_file_is_still_tiled(leerie, tmp_path):
         "must discriminate on change_shape, not suppress all splitting")
 
 
-def test_absent_change_shape_preserves_pre_gate_behavior(leerie, tmp_path):
-    """`reconciler.added_subtasks` and `splitter.children` do not carry the
-    field. Absence means "not declared", NOT "refuse to split" -- otherwise the
-    gate silently disables the mechanism for those two call sites."""
+def test_absent_change_shape_refuses_the_split(leerie, tmp_path):
+    """REWRITTEN (DESIGN §5½ (P1) *Sub-file*, Q5/E1). This used to pin the
+    opposite: absence meant "not declared" and the file was tiled, so that
+    reconciler- and splitter-made subtasks could still be split. That default
+    was the main path of harmful tilings on fresh data (splitter and peel
+    children carrying no `change_shape`), so absence now refuses."""
     _dense_file(tmp_path)
-    children = leerie._subfile_split(_subtask(None), tmp_path, 700)
-    assert len(children) > 1
+    assert leerie._subfile_split(_subtask(None), tmp_path, 700) == []
+
+
+@pytest.mark.parametrize("independent", [None, False])
+def test_sweep_without_independent_sites_is_not_tiled(leerie, tmp_path,
+                                                      independent):
+    """The other half of the typed gate: a sweep whose sites are not declared
+    independent (a shared helper first, a new file) stays one subtask."""
+    _dense_file(tmp_path)
+    sub = _subtask("sweep", independent=independent)
+    assert leerie._subfile_split(sub, tmp_path, 700) == []
+    assert leerie._subfile_split_gate(sub) is not None
+
+
+def test_only_regions_holding_a_site_are_tiled(leerie, tmp_path):
+    """Site-limited tiling: the identifier sits in two places, three windows
+    apart; only the windows holding it become children, and the children's
+    regions cover exactly those lines."""
+    lines = [f"let v{i} = {i};" for i in range(2100)]
+    lines[100] = "renameMe(1);"
+    lines[1800] = "renameMe(2);"
+    (tmp_path / "dense.ts").write_text("\n".join(lines) + "\n")
+    sub = _subtask("sweep", sites=("renameMe",))
+    children = leerie._subfile_split(sub, tmp_path, 700)
+    assert len(children) == 2
+    spans = [(c["owned_region"]["start"], c["owned_region"]["end"])
+             for c in children]
+    assert any(a <= 101 <= b for a, b in spans)
+    assert any(a <= 1801 <= b for a, b in spans)
+    assert [c["id"] for c in children] == ["bugfix-001-r1", "bugfix-001-r2"]
+    assert len(_owners(children)) == 1
+
+
+def test_whole_word_match_only(leerie, tmp_path):
+    """`git grep -w`: a longer identifier containing the site is not a site,
+    so a sweep whose identifier never appears as a word is not split."""
+    lines = [f"let renameMeToo{i} = {i};" for i in range(2100)]
+    (tmp_path / "dense.ts").write_text("\n".join(lines) + "\n")
+    sub = _subtask("sweep", sites=("renameMe",))
+    assert leerie._sweep_site_lines(sub, tmp_path, "dense.ts") == set()
+    assert leerie._subfile_split(sub, tmp_path, 700) == []
+
+
+def test_a_site_in_one_region_only_is_a_leaf(leerie, tmp_path):
+    lines = [f"let v{i} = {i};" for i in range(2100)]
+    lines[5] = "renameMe(1);"
+    (tmp_path / "dense.ts").write_text("\n".join(lines) + "\n")
+    sub = _subtask("sweep", sites=("renameMe",))
+    assert leerie._sweep_site_lines(sub, tmp_path, "dense.ts") == {6}
+    assert leerie._subfile_split(sub, tmp_path, 700) == []
+
+
+@pytest.mark.parametrize("bad", ["two words", "a/b", "", 7])
+def test_unusable_site_identifiers_are_skipped(leerie, tmp_path, bad):
+    _dense_file(tmp_path)
+    sub = _subtask("sweep", sites=(bad,))
+    assert leerie._sweep_site_lines(sub, tmp_path, "dense.ts") == set()
+
+
+def test_splitter_children_inherit_the_gate_fields(leerie):
+    parent = _subtask("sweep", sites=("const", "x1"))
+    kids = [{"id": "bugfix-001-1", "title": "t", "success_criteria_seed": "c"},
+            {"id": "bugfix-001-2", "title": "t", "success_criteria_seed": "c",
+             "change_shape": "point"}]
+    leerie._inherit_split_fields(parent, kids)
+    for k in kids:
+        assert k["change_shape"] == "sweep"
+        assert k["independent_sites"] is True
+        assert k["sweep_sites"] == ["const", "x1"]
+    # A copy, not an alias.
+    kids[0]["sweep_sites"].append("y")
+    assert parent["sweep_sites"] == ["const", "x1"]
 
 
 def test_gate_reads_the_named_constant(leerie):
@@ -130,6 +213,11 @@ def test_migration_child_carries_change_shape_forward(leerie):
     child = leerie._migration_child(
         parent, ["dense.ts"], "bugfix-001-f1", "t", "c")
     assert child["change_shape"] == "point"
+    sweep = leerie._migration_child(
+        _subtask("sweep", sites=("renameMe",)), ["dense.ts"],
+        "bugfix-001-f1", "t", "c")
+    assert sweep["independent_sites"] is True
+    assert sweep["sweep_sites"] == ["renameMe"]
 
 
 def test_peel_path_child_still_hits_the_gate(leerie, tmp_path):

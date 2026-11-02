@@ -1,0 +1,661 @@
+"""The run's own repository (DESIGN §6 *The run's own repository*, RC4/I4).
+
+Every tree a worker gets hangs off `<run-dir>/repo`, a bare, self-contained
+repository leerie makes once per run, so no worker's git verb reaches the
+user's refs, stash, config, `info/exclude`, hooks or worktree registry.
+
+Everything here runs real git against a throwaway "user" repository, through
+the real scripts and helpers. Review round 16 H2's two drivers are rewritten
+as I4 tests: the user's stash survives a worker's `stash`/`pop`, and a worker
+cannot move the user's branches.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from tests.conftest import run_git_at  # noqa: E402
+
+pytestmark = pytest.mark.real_planning_worktree
+
+RUN_ID = "r1abcdef0123"
+
+
+_git = run_git_at
+
+
+def _user_repo(tmp_path: Path) -> Path:
+    r = tmp_path / "user"
+    r.mkdir()
+    _git(r, "init", "-q", "-b", "main")
+    _git(r, "config", "user.email", "t@x")
+    _git(r, "config", "user.name", "t")
+    (r / "app.py").write_text("x = 1\n")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "base")
+    _git(r, "tag", "-a", "v1", "-m", "v1")
+    return r
+
+
+class _St:
+    """The attributes the run-repository code touches."""
+
+    def __init__(self, repo: Path, state_root: Path, run_id: str = RUN_ID):
+        self.repo_root = repo
+        self.run_id = run_id
+        self.run_dir = state_root / "runs" / run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.data: dict = {"working_branch": "main"}
+        self.saves = 0
+
+    def save(self) -> None:
+        self.saves += 1
+
+
+@pytest.fixture()
+def env(tmp_path, monkeypatch):
+    repo = _user_repo(tmp_path)
+    state = tmp_path / "state"
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("LEERIE_STATE_DIR", str(state))
+    return repo, state, _St(repo, state)
+
+
+def _refs(repo: Path) -> list[str]:
+    return _git(repo, "for-each-ref", "--format=%(refname)").split()
+
+
+# ---------------------------------------------------------------- creation
+
+def test_run_repo_is_bare_self_contained_and_holds_only_the_base(leerie,
+                                                                 env):
+    repo, _state, st = env
+    _git(repo, "branch", "develop")
+    (repo / "app.py").write_text("x = 1\nWIP = 1\n")
+    _git(repo, "stash", "push", "-qm", "user wip")
+    run_repo = leerie._ensure_run_repo(st)
+    assert run_repo == st.run_dir / "repo"
+    assert _git(run_repo, "rev-parse", "--is-bare-repository") == "true"
+    # Self-contained: no borrowed object store, no remote of the user's.
+    assert not (run_repo / "objects" / "info" / "alternates").exists()
+    assert _git(run_repo, "remote") == ""
+    # The working branch, the user's HEAD and the tags in that history —
+    # nothing else: no develop, no refs/stash.
+    assert sorted(_refs(run_repo)) == ["refs/heads/main",
+                                       "refs/leerie/user-head",
+                                       "refs/tags/v1"]
+    assert _git(run_repo, "rev-parse", "HEAD") == _git(repo, "rev-parse",
+                                                       "HEAD")
+    assert (_git(run_repo, "rev-parse", "--show-object-format")
+            == _git(repo, "rev-parse", "--show-object-format"))
+    assert st.data["run_repo"] == "repo"
+
+
+def test_ensure_is_idempotent_and_leaves_no_temporary(leerie, env):
+    _repo, _state, st = env
+    first = leerie._ensure_run_repo(st)
+    marker = first / "leerie-marker"
+    marker.write_text("kept")
+    assert leerie._ensure_run_repo(st) == first
+    assert marker.read_text() == "kept"
+    assert [p.name for p in st.run_dir.iterdir()
+            if p.name.startswith(".repo.tmp")] == []
+
+
+def test_a_failed_creation_leaves_no_repository(leerie, tmp_path,
+                                                monkeypatch):
+    not_git = tmp_path / "plain"
+    not_git.mkdir()
+    monkeypatch.chdir(not_git)
+    st = _St(not_git, tmp_path / "state")
+    with pytest.raises(leerie.RunRepoError):
+        leerie._ensure_run_repo(st)
+    assert not (st.run_dir / "repo").exists()
+    assert "run_repo" not in st.data
+
+
+# ----------------------------------------------------------- config carry
+
+def test_config_carry_copies_behaviour_and_drops_identity_keys(leerie,
+                                                                tmp_path):
+    user = _user_repo(tmp_path)
+    _git(user, "config", "core.hooksPath", ".husky/_")
+    _git(user, "config", "include.path", "../extra.cfg")
+    _git(user, "config", "core.autocrlf", "input")
+    run_repo = tmp_path / "run.git"
+    _git(tmp_path, "init", "-q", "--bare", str(run_repo))
+    leerie._carry_repo_config(user, run_repo)
+    cfg = str(run_repo / "config")
+    assert _git(tmp_path, "config", "-f", cfg, "user.email") == "t@x"
+    assert _git(tmp_path, "config", "-f", cfg, "core.hooksPath") == ".husky/_"
+    assert _git(tmp_path, "config", "-f", cfg, "core.autocrlf") == "input"
+    assert _git(tmp_path, "config", "-f", cfg, "core.bare") == "true"
+    assert _git(tmp_path, "config", "-f", cfg, "--get-all",
+                "core.bare").splitlines() == ["true"]
+    assert _git(tmp_path, "config", "-f", cfg, "include.path",
+                check=False) == ""
+
+
+def test_no_hooks_path_points_at_the_users_hooks_even_with_hooks_off(
+        leerie, tmp_path, monkeypatch):
+    """`main()` puts leerie's hooks-off entry in the environment; the carry
+    must read the user's real hooks path, not that entry."""
+    env = dict(os.environ)
+    leerie._git_hooks_off(env)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    user = _user_repo(tmp_path)
+    run_repo = tmp_path / "run.git"
+    _git(tmp_path, "init", "-q", "--bare", str(run_repo))
+    leerie._carry_repo_config(user, run_repo)
+    got = _git(tmp_path, "config", "-f", str(run_repo / "config"),
+               "core.hooksPath")
+    assert got == str((user / ".git" / "hooks").resolve())
+
+
+def test_a_workers_commit_in_the_run_repo_runs_the_users_hook(leerie, env,
+                                                               tmp_path):
+    """Substance: workers keep the repository's hooks (DESIGN §6
+    *Finalization*), in the run's repository too."""
+    repo, _state, st = env
+    log = tmp_path / "hook.log"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\necho ran >> '{log}'\n")
+    hook.chmod(0o755)
+    run_repo = leerie._ensure_run_repo(st)
+    wt = tmp_path / "wt"
+    _git(run_repo, "worktree", "add", "-q", "-b", "w", str(wt), "main")
+    (wt / "app.py").write_text("x = 2\n")
+    _git(wt, "commit", "-qam", "worker")
+    assert log.read_text() == "ran\n"
+    assert _git(wt, "log", "-1", "--format=%ae") == "t@x"
+
+
+# ---------------------------------------------------------------- refresh
+
+def test_refresh_follows_the_users_tip_and_restores_a_moved_copy(leerie,
+                                                                 env):
+    repo, _state, st = env
+    run_repo = leerie._ensure_run_repo(st)
+    start = _git(run_repo, "rev-parse", "HEAD")
+    # A worker commits onto the run repository's copy of `main`.
+    wt = st.run_dir / "wt-main"
+    _git(run_repo, "worktree", "add", "-q", str(wt), "main")
+    (wt / "w.txt").write_text("worker\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "worker on main")
+    _git(wt, "checkout", "-q", "--detach")
+    (repo / "b.txt").write_text("b\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "user advances")
+    tip = _git(repo, "rev-parse", "main")
+    assert leerie._refresh_run_repo_base(st) == tip
+    assert _git(run_repo, "rev-parse", "main") == tip
+    # The run's own start is kept: HEAD is not followed after creation.
+    assert _git(run_repo, "rev-parse", "HEAD") == start
+
+
+def test_a_detached_start_gives_a_detached_bare_head(leerie, env):
+    repo, _state, st = env
+    first = _git(repo, "rev-parse", "HEAD")
+    (repo / "b.txt").write_text("b\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "two")
+    _git(repo, "checkout", "-q", "--detach", first)
+    st.data["working_branch"] = "HEAD"
+    run_repo = leerie._ensure_run_repo(st)
+    assert _git(run_repo, "rev-parse", "HEAD") == first
+    assert _git(run_repo, "symbolic-ref", "-q", "HEAD", check=False) == ""
+
+
+# ------------------------------------------------- r16 H2, as I4 tests
+
+def _setup_run(leerie, st) -> Path:
+    asyncio.run(leerie._ensure_run_repo_or_die(st))
+    proc = asyncio.run(leerie._run_script("setup-run.sh", st.run_id, "main",
+                                          st=st))
+    assert proc.returncode == 0, proc.stderr
+    return st.run_dir / "worktrees" / "staging"
+
+
+def _subtask(leerie, st, sid: str) -> Path:
+    proc = asyncio.run(leerie._run_script("new-worktree.sh", sid, st.run_id,
+                                          st=st))
+    assert proc.returncode == 0, proc.stderr
+    return Path(proc.stdout.strip().splitlines()[-1])
+
+
+def test_a_workers_stash_pop_never_sees_the_users_stash(leerie, env):
+    repo, _state, st = env
+    (repo / "app.py").write_text("x = 1\nSECRET_WIP = 'do not ship'\n")
+    _git(repo, "stash", "push", "-qm", "user wip")
+    _setup_run(leerie, st)
+    wt = _subtask(leerie, st, "s1")
+    branch = f"leerie/subtasks/{RUN_ID}/s1"
+    base = _git(wt, "rev-parse", "HEAD")
+    out = subprocess.run(["git", "stash"], cwd=wt, capture_output=True,
+                         text=True)
+    assert "No local changes to save" in out.stdout
+    pop = subprocess.run(["git", "stash", "pop"], cwd=wt,
+                         capture_output=True, text=True)
+    assert pop.returncode != 0 and "No stash entries" in pop.stderr
+    assert "SECRET_WIP" not in (wt / "app.py").read_text()
+
+    async def reask(note):            # never needed: the tree is clean
+        raise AssertionError(note)
+    got = asyncio.run(leerie._clean_tree_gate(
+        wt, caps=dict(leerie.DEFAULT_CAPS), label="s1", reask=reask,
+        branch=branch, base=base))
+    assert got == []
+    assert "user wip" in _git(repo, "stash", "list")
+
+
+def test_a_worker_cannot_move_the_users_branches(leerie, env):
+    repo, _state, st = env
+    _git(repo, "branch", "develop")
+    before = {r: _git(repo, "rev-parse", r) for r in ("main", "develop")}
+    staging = _setup_run(leerie, st)
+    # The user's develop is not in the run's repository at all.
+    co = subprocess.run(["git", "checkout", "-q", "develop"], cwd=staging,
+                        capture_output=True, text=True)
+    assert co.returncode != 0 and "did not match" in co.stderr
+    # Staging's own repository holds only the run branch (DESIGN §6 *A
+    # repository per committing tree (I6)*): a worker's `main` and forced
+    # `develop` there reach neither the user's repository nor the run's.
+    run_main = _git(st.run_dir / "repo", "rev-parse", "main")
+    _git(staging, "checkout", "-qb", "main")
+    (staging / "app.py").write_text("x = 2\n")
+    _git(staging, "commit", "-qam", "worker on main")
+    _git(staging, "branch", "-f", "develop", "HEAD")
+    _git(staging, "checkout", "-q", f"leerie/runs/{RUN_ID}")
+    leerie._take_tree_branch(staging)
+    assert {r: _git(repo, "rev-parse", r)
+            for r in ("main", "develop")} == before
+    assert _git(st.run_dir / "repo", "rev-parse", "main") == run_main
+
+
+# --------------------------------------- every tree hangs off the run repo
+
+def test_every_tree_of_a_run_hangs_off_the_run_repository(leerie, env):
+    """Every kind of tree leerie makes — planning, staging, two subtasks
+    and their merge, a judge checkout, a helper worktree, the acceptance
+    writer's clone — and afterwards the user's repository has no leerie
+    worktree, branch or ref: `git worktree list` there names only the
+    user's own checkout."""
+    repo, _state, st = env
+    planning = asyncio.run(leerie._ensure_planning_worktree(st))
+    staging = _setup_run(leerie, st)
+    for sid in ("s1", "s2"):
+        wt = _subtask(leerie, st, sid)
+        (wt / f"{sid}.txt").write_text(sid)
+        _git(wt, "add", "-A")
+        _git(wt, "commit", "-qm", sid)
+        leerie._take_tree_branch(wt)   # as a worker's exit does
+        merged = asyncio.run(leerie._integrate_merge(staging, st, sid))
+        assert merged.returncode == 0, merged.stderr
+
+    async def judge():
+        async with leerie._judge_checkout(st, staging, "delivery-judge") as c:
+            return _git(c, "rev-parse", "--path-format=absolute",
+                        "--git-common-dir")
+    judge_common = asyncio.run(judge())
+    helper = leerie._helper_worktree_path(st, "confirm-base")
+    add = leerie._worktree_add_detached(st, helper, st.data["base_sha"]
+                                        if "base_sha" in st.data else "HEAD")
+    assert add.returncode == 0, add.stderr
+    writer = leerie._helper_worktree_path(st, "acceptance-1")
+    assert leerie._acceptance_writer_checkout(
+        st, writer, _git(repo, "rev-parse", "HEAD")) == "clone"
+
+    run_repo = (st.run_dir / "repo").resolve()
+    user_list = _git(repo, "worktree", "list", "--porcelain")
+    assert [ln for ln in user_list.splitlines()
+            if ln.startswith("worktree ")] == [f"worktree {repo.resolve()}"]
+    assert [r for r in _refs(repo)
+            if r.startswith(("refs/heads/leerie", "refs/leerie"))] == []
+    run_list = _git(run_repo, "worktree", "list", "--porcelain")
+    for tree in (planning, helper):
+        assert f"worktree {Path(tree).resolve()}" in run_list
+    assert Path(judge_common).resolve() == run_repo
+    for tree in (planning, helper):
+        assert (Path(_git(Path(tree), "rev-parse", "--path-format=absolute",
+                          "--git-common-dir")).resolve() == run_repo)
+    # Staging, a committing tree, is a worktree of its own repository,
+    # which borrows the run repository's objects (DESIGN §6 *A repository
+    # per committing tree (I6)*).
+    staging_repo = st.run_dir / "tree-repos" / "staging"
+    assert (Path(_git(staging, "rev-parse", "--path-format=absolute",
+                      "--git-common-dir")).resolve() == staging_repo.resolve())
+    assert (staging_repo / "objects" / "info" / "alternates").read_text(
+        ).strip() == str(run_repo / "objects")
+    assert _git(run_repo, "rev-parse", f"leerie/runs/{RUN_ID}:s2.txt")
+
+
+def test_setup_run_records_base_sha_through_phase_execute_code(leerie, env):
+    """`base_sha` is the commit `setup-run.sh` cut the run branch from."""
+    repo, _state, st = env
+    _setup_run(leerie, st)
+    cut = _git(st.run_dir / "repo", "rev-parse", f"leerie/runs/{RUN_ID}")
+    assert cut == _git(repo, "rev-parse", "main")
+    src = Path(leerie.__file__).read_text()
+    i = src.index('    proc = await _run_script("setup-run.sh"')
+    seg = src[i:i + 1500]
+    assert 'st.data["base_sha"] = cut.stdout.strip()' in seg
+
+
+# ------------------------------------------------ base_sha, not the name
+
+def test_site_token_check_reads_the_base_not_the_moved_name(leerie, env):
+    """A worker moving the run repository's `main` onto staging's HEAD
+    empties `main..HEAD`; the check reads `base_sha` and still sees the
+    added line. The moved name and `base_sha` disagree on purpose."""
+    repo, _state, st = env
+    staging = _setup_run(leerie, st)
+    st.data["base_sha"] = _git(staging, "rev-parse", "HEAD")
+    (staging / "app.py").write_text("x = 1\nfixture = 'acme-widget'\n")
+    _git(staging, "commit", "-qam", "fix")
+    leerie._take_tree_branch(staging)   # as a worker's exit does
+    _git(st.run_dir / "repo", "update-ref", "refs/heads/main",
+         _git(staging, "rev-parse", "HEAD"))
+    st.data["defect_scope"] = {"ground_truth": {"inline_examples": [
+        {"literal": "acme-widget", "site_tokens": ["acme-widget"]}]}}
+    hits = leerie._warn_site_token_leaks(st, st.run_dir)
+    assert [h["token"] for h in hits] == ["acme-widget"]
+
+
+def test_finalize_sh_counts_from_the_base_it_is_given(leerie, env):
+    repo, _state, st = env
+    staging = _setup_run(leerie, st)
+    base = _git(staging, "rev-parse", "HEAD")
+    (staging / "app.py").write_text("x = 3\n")
+    _git(staging, "commit", "-qam", "work")
+    leerie._take_tree_branch(staging)   # as a worker's exit does
+    _git(st.run_dir / "repo", "update-ref", "refs/heads/main",
+         _git(staging, "rev-parse", "HEAD"))
+    by_name = asyncio.run(leerie._run_script("finalize.sh", st.run_id,
+                                             st=st))
+    assert by_name.returncode == 1          # the moved name hides the work
+    by_base = asyncio.run(leerie._run_script("finalize.sh", st.run_id, base,
+                                             st=st))
+    assert by_base.returncode == 0, by_base.stderr
+    assert "1 commit(s) ahead" in by_base.stdout
+
+
+# --------------------------------------------------------- resume refusal
+
+# A run made before per-run repositories is refused by its run layout, not by
+# a check of its own: tests/test_run_layout.py.
+
+
+# ------------------------------------------------------ deletions' guards
+
+def test_full_purge_leaves_the_users_repository_alone(leerie, env):
+    """The purge removes the run directory (the run's repository with it)
+    and deletes nothing in the user's repository — not even a brought-back
+    run branch of the same id."""
+    repo, _state, st = env
+    _setup_run(leerie, st)
+    _git(repo, "branch", f"leerie/runs/{RUN_ID}")
+    leerie._cleanup_on_abnormal_exit(st, full_purge=True)
+    assert not st.run_dir.exists()
+    assert _git(repo, "rev-parse", "--verify", f"leerie/runs/{RUN_ID}")
+
+
+def test_finalize_cleanup_deletes_no_branch(leerie):
+    """Finalize's cleanup removes worktrees only: no `--subtask-branches`
+    or `--branches`, and no check that the run branch survived it."""
+    import inspect
+    src = inspect.getsource(leerie.phase_finalize)
+    assert "--subtask-branches" not in src and "--branches" not in src
+    assert "disappeared" not in src
+    assert src.count('_run_script("cleanup.sh", "--run-id", st.run_id, '
+                     'st=st)') == 2
+
+
+# ------------------------------- which run the container ran (launcher file)
+
+def test_the_run_id_file_is_written_atomically_and_only_when_asked(
+        leerie, tmp_path, monkeypatch):
+    target = tmp_path / ".runid-1"
+    monkeypatch.delenv("LEERIE_RUN_ID_FILE", raising=False)
+    leerie._record_run_id_for_launcher("r1")
+    assert not target.exists()
+    monkeypatch.setenv("LEERIE_RUN_ID_FILE", str(target))
+    leerie._record_run_id_for_launcher("r1")
+    assert target.read_text() == "r1\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".runid-1"]
+    monkeypatch.setenv("LEERIE_RUN_ID_FILE", str(tmp_path / "no" / "x"))
+    leerie._record_run_id_for_launcher("r1")        # logged, never raised
+
+
+def test_main_names_the_run_a_bare_resume_picked(leerie, tmp_path,
+                                                  monkeypatch):
+    """Substance: the real `main()`, a bare `resume` with two runs on disk.
+    The orchestrator's own pick — not anything the launcher could know — is
+    what reaches the launcher's file, before the run is driven."""
+    from tests.conftest import fake_claude_on_path
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-q", "--allow-empty", "-m", "init"],
+                   cwd=repo, check=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("LEERIE_STATE_DIR", raising=False)
+    fake_claude_on_path(tmp_path, monkeypatch)
+    monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
+    runs = repo / ".leerie" / "runs"
+    for rid, started in (("older-run", "2026-01-01T00:00:00+00:00"),
+                         ("newer-run", "2026-02-01T00:00:00+00:00")):
+        (runs / rid).mkdir(parents=True)
+        (runs / rid / "state.json").write_text(json.dumps(
+            {"task": "t", "started_at": started,
+             "run_layout": leerie.RUN_LAYOUT_VERSION}))
+        (runs / rid / "run.json").write_text(json.dumps(
+            {"run_id": rid, "started_at": started}))
+    target = tmp_path / ".runid-launcher"
+    monkeypatch.setenv("LEERIE_RUN_ID_FILE", str(target))
+    seen: dict = {}
+
+    async def orchestrate(args, caps, leerie_dir, st, *a, **k):
+        seen["run_id"] = st.run_id
+        seen["file_before_drive"] = target.read_text()
+    monkeypatch.setattr(leerie, "_orchestrate", orchestrate)
+    monkeypatch.setattr(sys, "argv", ["leerie", "resume"])
+    try:
+        leerie.main()
+    except SystemExit:
+        pass
+    assert seen["run_id"] == "newer-run", seen
+    assert seen["file_before_drive"] == "newer-run\n"
+    assert target.read_text() == "newer-run\n"
+
+
+# ------------------------------------------------------- review round 17
+
+def test_a_workers_git_init_never_costs_the_run_its_repository(leerie, env):
+    """H1: `git init` in a worker's tree rewrites `core.bare` in that tree's
+    repository's config — staging's own (DESIGN §6 *A repository per
+    committing tree (I6)*), no longer the run repository's. The run's
+    repository is recorded, so the next ensure (every resume) checks it by
+    naming it and finding the run's start — and keeps it: the run branch
+    and its integrated commit survive."""
+    _repo, _state, st = env
+    staging = _setup_run(leerie, st)
+    (staging / "w.txt").write_text("integrated\n")
+    _git(staging, "add", "-A")
+    _git(staging, "commit", "-qm", "integrated work")
+    leerie._take_tree_branch(staging)   # as a worker's exit does
+    work = _git(staging, "rev-parse", "HEAD")
+    subprocess.run(["git", "init", "-q"], cwd=staging, check=True)
+    run_repo = st.run_dir / "repo"
+    assert _git(st.run_dir / "tree-repos" / "staging", "config",
+                "core.bare") == "false"
+    assert _git(run_repo, "config", "core.bare") == "true"
+    assert leerie._ensure_run_repo(st) == run_repo
+    assert _git(run_repo, "rev-parse", f"leerie/runs/{RUN_ID}") == work
+    assert _git(staging, "status", "--porcelain") == ""
+
+
+def test_a_recorded_repository_that_fails_its_check_is_never_rebuilt(
+        leerie, env):
+    """H1: a recorded repository without the run's start stops the run,
+    naming it; nothing is deleted or rebuilt."""
+    _repo, _state, st = env
+    run_repo = leerie._ensure_run_repo(st)
+    st.data["base_sha"] = "1" * 40
+    marker = run_repo / "leerie-marker"
+    marker.write_text("kept")
+    with pytest.raises(leerie.RunRepoError, match="will not delete or rebuild"):
+        leerie._ensure_run_repo(st)
+    assert marker.read_text() == "kept"
+
+
+def test_a_crash_left_scratch_directory_is_removed(leerie, env):
+    """L2: a scratch directory of an earlier, crashed creation is removed;
+    an unrecorded but complete repository at the final path is adopted, not
+    deleted."""
+    _repo, _state, st = env
+    stale = st.run_dir / ".repo.tmp-424242"
+    (stale / "objects").mkdir(parents=True)
+    run_repo = leerie._ensure_run_repo(st)
+    assert not stale.exists()
+    st.data.pop("run_repo")
+    (run_repo / "leerie-marker").write_text("kept")
+    assert leerie._ensure_run_repo(st) == run_repo
+    assert (run_repo / "leerie-marker").read_text() == "kept"
+    assert st.data["run_repo"] == "repo"
+
+
+def test_a_mid_run_branch_switch_brings_no_other_history(leerie, env):
+    """L1: after creation a refresh fetches the working branch alone; the
+    branch the operator switched to never reaches the run's repository."""
+    repo, _state, st = env
+    run_repo = leerie._ensure_run_repo(st)
+    head_before = _git(run_repo, "rev-parse", "refs/leerie/user-head")
+    _git(repo, "checkout", "-qb", "other")
+    (repo / "o.txt").write_text("other\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "other branch work")
+    other = _git(repo, "rev-parse", "HEAD")
+    leerie._refresh_run_repo_base(st)
+    assert _git(run_repo, "rev-parse", "refs/leerie/user-head") == head_before
+    assert subprocess.run(["git", "--git-dir", str(run_repo), "cat-file",
+                           "-e", other], capture_output=True).returncode != 0
+
+
+@pytest.fixture()
+def explicit_bare(tmp_path, monkeypatch):
+    """M3: the git hardening setting that refuses to discover a bare
+    repository, as a user's global config carries it into the container."""
+    cfg = tmp_path / "global.gitconfig"
+    cfg.write_text("[safe]\n\tbareRepository = explicit\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    return cfg
+
+
+def test_every_tree_works_under_safe_bare_repository_explicit(
+        leerie, env, explicit_bare):
+    """M3: the whole tree set of a run — planning, staging, a subtask and
+    its merge, a judge checkout, a helper worktree, the acceptance writer's
+    clone, a subtask removal and the prune — under
+    `safe.bareRepository=explicit`. leerie names its bare repository; it
+    never discovers it."""
+    repo, _state, st = env
+    run_repo = st.run_dir / "repo"
+    assert subprocess.run(["git", "-C", str(repo), "config", "--global",
+                           "safe.bareRepository"], capture_output=True,
+                          text=True).stdout.strip() == "explicit"
+    asyncio.run(leerie._ensure_planning_worktree(st))
+    staging = _setup_run(leerie, st)
+    wt = _subtask(leerie, st, "s1")
+    (wt / "s1.txt").write_text("s1")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "s1")
+    leerie._take_tree_branch(wt)   # as a worker's exit does
+    merged = asyncio.run(leerie._integrate_merge(staging, st, "s1"))
+    assert merged.returncode == 0, merged.stderr
+
+    async def judge():
+        async with leerie._judge_checkout(st, staging, "delivery-judge") as c:
+            return (c / "s1.txt").is_file()
+    assert asyncio.run(judge())
+    helper = leerie._helper_worktree_path(st, "confirm-base")
+    assert leerie._worktree_add_detached(
+        st, helper, _git(repo, "rev-parse", "HEAD")).returncode == 0
+    assert leerie._acceptance_writer_checkout(
+        st, leerie._helper_worktree_path(st, "acceptance-1"),
+        _git(repo, "rev-parse", "HEAD")) == "clone"
+    asyncio.run(leerie._prune_subtask_worktree("s1", st.run_dir))
+    assert not wt.exists()
+    leerie._prune_leerie_worktrees(st.run_dir)
+    assert leerie._shipping_tree(st)
+    refused = subprocess.run(["git", "-C", str(run_repo), "show-ref"],
+                             capture_output=True, text=True)
+    assert refused.returncode != 0          # discovery is really refused
+
+
+def test_the_rebaser_is_told_the_run_by_its_base_commit(leerie, tmp_path,
+                                                        monkeypatch):
+    """M1: the run started on `feature`, its PR goes to `main`. The
+    rebaser's single-branch repository has no `feature`; the prompt names
+    the run's commits from `base_sha`, which it has."""
+    run_id = "r17reb000000"
+    branch = f"leerie/runs/{run_id}"
+    user = tmp_path / "user"
+    user.mkdir()
+    _git(user, "init", "-q", "-b", "main")
+    _git(user, "config", "user.email", "t@x")
+    _git(user, "config", "user.name", "t")
+    (user / "a.txt").write_text("a\n")
+    _git(user, "add", "-A")
+    _git(user, "commit", "-qm", "base")
+    _git(user, "checkout", "-qb", "feature")
+    (user / "f.txt").write_text("f\n")
+    _git(user, "add", "-A")
+    _git(user, "commit", "-qm", "feature work")
+    base_sha = _git(user, "rev-parse", "feature")
+    _git(user, "branch", branch, "feature")
+    wt0 = tmp_path / "runwt"
+    _git(user, "worktree", "add", "-q", str(wt0), branch)
+    (wt0 / "r.txt").write_text("r\n")
+    _git(wt0, "add", "-A")
+    _git(wt0, "commit", "-qm", "run work")
+    _git(user, "worktree", "remove", "--force", str(wt0))
+    state = tmp_path / "state"
+    (state / "runs" / run_id).mkdir(parents=True)
+    (state / "runs" / run_id / "state.json").write_text(json.dumps(
+        {"base_sha": base_sha, "worker_count": 0}))
+    rebase_repo = tmp_path / "scratch" / f"rebase-{run_id}.git"
+    rebase_wt = tmp_path / "scratch" / f"rebase-{run_id}"
+    rebase_repo.parent.mkdir()
+    host_finalize = Path(leerie.__file__).resolve().parents[1] / "scripts" / "host-finalize.sh"
+    r = subprocess.run(
+        ["bash", "-c",
+         'set -euo pipefail; . "$1"; _host_finalize_rebase_repo "$2" "$3" "$4"'
+         ' && git --git-dir="$2" -c core.hooksPath=/dev/null worktree add -q "$5" "$3"',
+         "_", str(host_finalize), str(rebase_repo), branch, "main",
+         str(rebase_wt)],
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(tmp_path),
+             "USER_REPO": str(user)},
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    seen: dict = {}
+
+    async def fake_claude_p(**kw):
+        seen.update(kw)
+        return {"status": "failed", "final_branch_state": "unchanged",
+                "resolution_summary": "", "diagnosis": "stub",
+                "confidence": {"resolution": 9.0}}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    leerie.run_rebaser(state, user, run_id, rebase_wt, branch, "feature",
+                       "main")
+    assert f"{base_sha}..{branch}" in seen["user_prompt"]
+    assert "feature.." not in seen["user_prompt"]
+    assert _git(Path(seen["cwd"]), "rev-list", "--count",
+                f"{base_sha}..{branch}") == "1"

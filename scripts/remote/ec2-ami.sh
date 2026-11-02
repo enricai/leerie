@@ -110,7 +110,7 @@ ec2_ami_lookup() {
               "Name=tag:$EC2_AMI_TAG_HASH,Values=$hash" \
               "Name=state,Values=available" \
     --output json)" || return 1
-  ami="$(printf '%s' "$out" | python3 -c '
+  ami="$(printf '%s' "$out" | python3 -I -c '
 import json, sys
 try: imgs = json.load(sys.stdin).get("Images", [])
 except Exception: imgs = []
@@ -270,7 +270,7 @@ _ec2_ami_bake_steps() {
   _EC2_AMI_BAKE_RESULT=""
   # The nonce is set before run-instances so an interrupt that lands while
   # the call is in flight can still find and terminate the instance.
-  _EC2_AMI_BAKE_NONCE="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  _EC2_AMI_BAKE_NONCE="$(python3 -I -c 'import uuid; print(uuid.uuid4().hex)')"
   # --network-interfaces carries the public IP explicitly: a subnet
   # override need not auto-assign one, and the bake is driven over SSH.
   iid="$(_ec2_ami_aws ec2 run-instances --image-id "$base_ami" --instance-type "$itype" \

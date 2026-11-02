@@ -103,16 +103,18 @@ def _flyctl_stub(
         f'    exec python3 {discover_py}\n'
         '    ;;\n'
         '  git*rev-parse*--verify*)\n'
-        # rewrite "git -C /work rev-parse --verify refs/heads/<branch>"
-        # → "git -C $REPO rev-parse --verify refs/heads/<branch>" so the
-        # probe consults the test fixture's local refs.
-        '    NEWCMD="${CMD//\\/work/$REPO}"\n'
+        # rewrite "git --git-dir=/work/.leerie/runs/<id>/repo rev-parse
+        # --verify refs/heads/<branch>" (the run's own repository, named
+        # explicitly, DESIGN §6) → "git -C $REPO ..." so the probe consults
+        # the fixture's refs.
+        '    NEWCMD="$(printf %s "$CMD" | sed -E "s#--git-dir=/work/\\.leerie/runs/[^ ]+/repo#-C $REPO#g")"\n'
         '    eval "$NEWCMD"\n'
         '    exit $?\n'
         '    ;;\n'
         '  git*bundle*create*)\n'
-        # rewrite "git -C /work bundle create - <branch>" → "git -C $REPO bundle create - <branch>"
-        '    NEWCMD="${CMD//\\/work/$REPO}"\n'
+        # rewrite "git --git-dir=/work/.leerie/runs/<id>/repo bundle create - <branch>"
+        # → "git -C $REPO bundle create - <branch>"
+        '    NEWCMD="$(printf %s "$CMD" | sed -E "s#--git-dir=/work/\\.leerie/runs/[^ ]+/repo#-C $REPO#g")"\n'
         '    eval "$NEWCMD"\n'
         '    exit $?\n'
         '    ;;\n'
@@ -302,10 +304,8 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
         shows the run as `done`.
 
     Critically, fetch_branch must NOT use `run.json.no_push` as a
-    proxy for "no branch was materialized" — `no_push=true` is the
-    mechanism flag the launcher always forces on the in-Fly
-    orchestrator (the machine can't push). Using it as the probe
-    would also skip the bundle for runs the user wants pushed.
+    proxy for "no branch was materialized" — a `--no-push` run has a
+    branch too, and using it as the probe would skip that run's bundle.
 
     Without the branch-existence probe, the bundle step would fail
     with "git bundle is empty — run branch may not exist on machine"
@@ -324,7 +324,7 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "finished_at": "2026-05-31T20:00:00Z",
-        "no_push": True,  # mechanism flag from in-Fly orchestrator; NOT the trigger
+        "no_push": True,  # the run's push choice; NOT the bundle-skip trigger
         "branch": run_branch,
         "working_branch": "main",
     }))
@@ -377,35 +377,24 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
     )
     assert (host_run_dir / "run.json").exists()
     assert (host_run_dir / "state.json").exists()
-    # CRITICAL: the defense-in-depth stripper at fetch-branch.sh:291 is
-    # conditional on $_branch_present="true". Since the branch was
-    # absent on the machine here, the stripper MUST be skipped and
-    # the in-Fly orchestrator's `no_push=true` intent (written by
-    # `_finish_no_work_run` per DESIGN §8) MUST be preserved on the
-    # host-side run.json. Stripping it would disarm host_finalize's
-    # no_push gate and the launcher would attempt `git push` against
-    # a non-existent branch.
+    # The `no_push=true` that `_finish_no_work_run` writes (DESIGN §8) must
+    # arrive unchanged: it is what makes host_finalize skip a push of a
+    # branch that does not exist.
     host_rj = json.loads((host_run_dir / "run.json").read_text())
     assert host_rj.get("no_push") is True, (
         "fetch-branch.sh must preserve no_push=true on the host-side "
         "run.json when no run branch was materialized (the "
-        "cleared-but-empty terminal state). The stripper at "
-        "fetch-branch.sh:291 must remain conditional on "
-        "$_branch_present=\"true\"."
+        "cleared-but-empty terminal state)."
     )
 
 
-def test_fetch_branch_strips_no_push_when_branch_present(tmp_path):
-    """Positive control for Fix A's conditional stripper.
-
-    When a run branch *was* fetched (the `--branch_present="true"`
-    arm), the defense-in-depth stripper at fetch-branch.sh:291 must
-    still fire and remove `no_push=true` from the host-side run.json.
-    This protects against in-flight runs started against an older
-    image where the in-Fly orchestrator wrote the mechanism flag
-    instead of the post-split intent flag. Without this, an old-image
-    run that the user *wanted* pushed would be skipped by
-    host_finalize's no_push gate."""
+def test_fetch_branch_keeps_no_push_when_branch_present(tmp_path):
+    """A `--no-push` run has a branch, and its run.json.no_push=true is the
+    run's one push choice. The fetch brings both home and rewrites neither,
+    so host_finalize does not push it (DESIGN §6 *One push choice per run,
+    on every runtime*). This replaced a "defense-in-depth stripper" that
+    removed the true whenever a branch came home, which pushed every fresh
+    `leerie --runtime fly --no-push` run."""
     repo = _make_git_repo(tmp_path)
     run_id = "feat-stripper-test-abc123"
     run_branch = f"leerie/runs/{run_id}"
@@ -419,7 +408,6 @@ def test_fetch_branch_strips_no_push_when_branch_present(tmp_path):
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "finished_at": "2026-01-01T00:00:00Z",
-        # Stray mechanism flag — old-image shape we want stripped.
         "no_push": True,
         "branch": run_branch,
         "working_branch": "main",
@@ -441,11 +429,11 @@ def test_fetch_branch_strips_no_push_when_branch_present(tmp_path):
 
     host_run_dir = repo / ".leerie" / "runs" / run_id
     host_rj = json.loads((host_run_dir / "run.json").read_text())
-    assert "no_push" not in host_rj, (
-        "fetch-branch.sh's stripper must remove no_push=true on the "
-        "branch-present path so host_finalize will push. Found: "
-        f"{host_rj}"
-    )
+    assert host_rj.get("no_push") is True, (
+        f"the fetch must not rewrite the run's push choice: {host_rj}")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", run_branch],
+        capture_output=True).returncode == 0, "the branch came home too"
 
 
 def test_fetch_branch_picks_normal_run_over_no_push(tmp_path):
@@ -583,8 +571,11 @@ def _make_run_fixture(
 
 
 def test_step4_streams_config_and_dockerfile_to_host(tmp_path):
-    """Step 4 copies config.toml and Dockerfile from the machine to the
-    host .leerie/ dir when neither exists on the host yet."""
+    """Step 4 copies the Dockerfile from the machine to the host .leerie/
+    dir when the host has none. A config.toml on the machine is not streamed:
+    the container records captures in the run directory and the host applies
+    them (DESIGN §6½ *The host applies a capture*;
+    tests/test_fetch_branch_leerie_streamback.py)."""
     run_id = "feat-streamback-001"
     repo, machine_runs, _ = _make_run_fixture(tmp_path, run_id)
 
@@ -608,9 +599,8 @@ def test_step4_streams_config_and_dockerfile_to_host(tmp_path):
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
 
     host_leerie = repo / ".leerie"
-    assert (host_leerie / "config.toml").exists(), "config.toml not streamed to host"
+    assert not (host_leerie / "config.toml").exists(), "config.toml was streamed"
     assert (host_leerie / "Dockerfile").exists(), "Dockerfile not streamed to host"
-    assert (host_leerie / "config.toml").read_text() == "[config]\nsetup_packages = []\n"
     assert (host_leerie / "Dockerfile").read_text() == "FROM debian:13\n"
 
 
@@ -682,7 +672,7 @@ def test_step4_uses_leerie_state_host_dir(tmp_path):
 
     machine_leerie = tmp_path / "machine_leerie"
     machine_leerie.mkdir()
-    (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = ['curl']\n")
+    (machine_leerie / "Dockerfile").write_text("FROM debian:13\n")
 
     _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
@@ -701,10 +691,10 @@ def test_step4_uses_leerie_state_host_dir(tmp_path):
     )
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
     # File must land in custom_host_dir, not repo/.leerie/.
-    assert (custom_host_dir / "config.toml").exists(), (
-        "config.toml must be written to LEERIE_STATE_HOST_DIR when set"
+    assert (custom_host_dir / "Dockerfile").exists(), (
+        "Dockerfile must be written to LEERIE_STATE_HOST_DIR when set"
     )
-    assert not (repo / ".leerie" / "config.toml").exists(), (
-        "config.toml must NOT be written to USER_REPO/.leerie when "
+    assert not (repo / ".leerie" / "Dockerfile").exists(), (
+        "Dockerfile must NOT be written to USER_REPO/.leerie when "
         "LEERIE_STATE_HOST_DIR is set"
     )

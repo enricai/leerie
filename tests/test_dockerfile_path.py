@@ -95,3 +95,17 @@ def test_mise_user_shims_comes_before_inherited_path():
     assert line.index("/home/leerie/.local/share/mise/shims") < line.index(
         "$PATH"
     )
+
+
+def test_the_system_has_a_python_for_the_unpinned_shim():
+    """A mise `python` shim with no pinned version falls through to the
+    system `python`. Debian ships only `python3`, so the base apt layer
+    installs python-is-python3; without it, a planner verify argv such as
+    `python -m pytest` failed in every run ("No version is set for shim:
+    python"), and a sibling-delivered no-op could not settle by execution.
+    Measured: with /usr/bin/python present, `python --version` through the
+    shim resolves to the system 3.13."""
+    text = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text()
+    apt = text[text.index("RUN apt-get update && apt-get install"):]
+    apt = apt[:apt.index("rm -rf /var/lib/apt/lists/*")]
+    assert "python-is-python3" in apt.split()

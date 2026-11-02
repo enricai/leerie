@@ -93,7 +93,10 @@ def test_setup_run_idempotency_check_uses_fixed_string():
     test_finalize_references_per_run_branch below.
     """
     src = _script("setup-run.sh")
-    assert 'grep -qxF "worktree $STAGING_WT"' in src
+    # Staging is a worktree of its own repository (DESIGN §6 *A repository
+    # per committing tree (I6)*): `leerie_tree` decides reuse by the tree's
+    # common directory, not by grepping the run repository's list.
+    assert 'leerie_tree "${TREE_REPOS}/staging" "${BRANCH}" "${STAGING_WT}"' in src
     non_comment = "\n".join(
         line for line in src.splitlines() if not line.lstrip().startswith("#")
     )
@@ -133,8 +136,13 @@ def test_setup_run_reclaims_orphaned_staging_dir():
     non_comment = "\n".join(
         line for line in src.splitlines() if not line.lstrip().startswith("#")
     )
-    assert 'rm -rf "$STAGING_WT"' in non_comment
-    assert '[ -d "$STAGING_WT" ]' in non_comment
+    # The orphan is removed by `leerie_tree` (worktree-lib.sh) before it adds
+    # the tree from its own repository.
+    lib = "\n".join(line for line in _script("worktree-lib.sh").splitlines()
+                    if not line.lstrip().startswith("#"))
+    body = lib[lib.index("leerie_tree() {"):]
+    assert body.index('leerie_drop_tree "$tr" "$wt"') < body.index(
+        'worktree add --quiet "$wt" "$branch"')
     assert 'prune_leerie_worktrees' in non_comment, (
         "setup-run.sh must run the scoped prune (prune_leerie_worktrees) in an executable line — "
         "the comment explaining prune's limits does not satisfy this."
@@ -163,7 +171,8 @@ def test_new_worktree_takes_run_id_arg():
 def test_new_worktree_uses_per_run_paths():
     src = _script("new-worktree.sh")
     assert 'LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"' in src
-    assert 'WT="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/${ID}"' in src
+    assert ('WT="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/'
+            '$(leerie_worktree_name "$RUN_ID" "$ID")"') in src
 
 
 def test_new_worktree_branch_uses_subtasks_namespace():
@@ -192,7 +201,13 @@ def test_new_worktree_idempotency_check_uses_fixed_string():
     script falls through to `git worktree add` on an existing directory, and
     every continuation retry dies with "fatal: '...' already exists"."""
     src = _script("new-worktree.sh")
-    assert 'grep -qxF "worktree $WT"' in src
+    # Reuse is `leerie_tree`'s, by the tree's common directory from leerie's
+    # layout (DESIGN §6 *A repository per committing tree (I6)*, *Leerie's
+    # git never takes a tree's repository from the tree*), and needs the
+    # absolute $WT.
+    assert 'leerie_tree "${RUN_DIR_ABS}/tree-repos/$(basename "$WT")"' in src
+    lib = _script("worktree-lib.sh")
+    assert '[ "$(leerie_tree_location "$wt" | sed -n 1p)" = "$tr" ]' in lib
     assert 'grep -q "worktree .*/' not in src
 
 
@@ -231,7 +246,7 @@ def test_integrate_branch_uses_subtasks_namespace():
 
 def test_finalize_takes_run_id_arg():
     src = _script("finalize.sh")
-    assert 'RUN_ID="${1:?usage: finalize.sh <run-id>}"' in src
+    assert 'RUN_ID="${1:?usage: finalize.sh <run-id> [<base>]}"' in src
 
 
 def test_finalize_references_per_run_branch():

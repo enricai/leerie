@@ -612,22 +612,9 @@ class TestPhaseFlagShortCircuit:
         run_dir = repo / ".leerie" / "runs" / run_id
         run_dir.mkdir(parents=True)
         (run_dir / "subtasks").mkdir()
-        (run_dir / "state.json").write_text(
-            json.dumps({"task": "a trivial task"}))
-        # `main()`'s own PRIMARY `State(...)` construction (before the
-        # `if args.phase:` branch) takes an exclusive flock on this same
-        # run_dir for the whole call, because `--phase` reuses one
-        # `args.run_id` for both the primary state and the target run to
-        # inspect — the SECOND `State(...)` inside the `--phase` branch then
-        # self-conflicts with the first, since flock is scoped to the open
-        # file description, not the process (verified live: two `os.open()`s
-        # of the same directory in one process do NOT share a lock). That
-        # conflict is real production behaviour, not a test artifact, and
-        # fixing it is outside this subtask's owned line range (the primary
-        # `State(...)` call sits above :32811). Disabling the lock here
-        # isolates the `--phase` branch itself for coverage purposes without
-        # taking on that fix.
-        monkeypatch.setattr(leerie.State, "_acquire_lock", lambda self: None)
+        (run_dir / "state.json").write_text(json.dumps(
+            {"task": "a trivial task",
+             "run_layout": leerie.RUN_LAYOUT_VERSION}))
 
         judge_calls = []
 
@@ -649,3 +636,285 @@ class TestPhaseFlagShortCircuit:
         leerie.main()
 
         assert judge_calls == [1], "phase_judge should run once (no index)"
+
+
+
+class TestListShowsADeath:
+    """DESIGN §6 *A run that died says so*: `leerie list` derives each run's
+    status from what the real `main()` left behind. A `die()` used to list
+    `done` (its discovery stamp of `finished_at` was the only record) and a
+    worker error `in-progress`; a pause or an interrupt is not a death.
+
+    Each stub first records what a real run has by the time it can die —
+    its task and its layout — so `state.json` exists for `list` to find."""
+
+    @staticmethod
+    def _status(leerie, repo, run_id):
+        rows = {r[0]: r[2]
+                for r in leerie._collect_run_rows(repo / ".leerie")}
+        return rows[run_id]
+
+    @staticmethod
+    def _seeded(leerie, then, held=None):
+        async def stub(args, caps, run_dir, st, *a):
+            st.data.update(task="a trivial task",
+                           run_layout=leerie.RUN_LAYOUT_VERSION)
+            st.save()
+            if held is not None:
+                held.append(st)
+            then()
+        return stub
+
+    def _run_json(self, repo, run_id):
+        p = repo / ".leerie" / "runs" / run_id / "run.json"
+        return json.loads(p.read_text()) if p.is_file() else {}
+
+    def test_a_die_lists_failed(self, leerie, monkeypatch, repo):
+        def die():
+            leerie.die("synthetic mid-run failure")
+        exit_code, _ = _run_main(leerie, monkeypatch, repo, "list-die",
+                                 orchestrate_stub=self._seeded(leerie, die))
+        assert exit_code == 1
+        rj = self._run_json(repo, "list-die")
+        assert rj["finished_at"] and rj["failed_at"]
+        assert self._status(leerie, repo, "list-die") == "failed"
+
+    def test_a_worker_error_and_a_crash_list_failed(self, leerie,
+                                                    monkeypatch, repo):
+        def worker():
+            raise leerie.WorkerError("worker died")
+        _run_main(leerie, monkeypatch, repo, "list-worker",
+                  orchestrate_stub=self._seeded(leerie, worker))
+        assert self._status(leerie, repo, "list-worker") == "failed"
+
+        def crash():
+            raise RuntimeError("genuinely unexpected")
+        monkeypatch.setattr(
+            sys, "argv", ["leerie", "a trivial task", "--run-id", "list-crash"])
+        monkeypatch.setattr(leerie, "_orchestrate",
+                            self._seeded(leerie, crash))
+        with pytest.raises(RuntimeError):
+            leerie.main()
+        assert self._status(leerie, repo, "list-crash") == "failed"
+
+    def test_a_pause_an_interrupt_and_a_clean_exit_do_not(
+            self, leerie, monkeypatch, repo):
+        def ctx():
+            raise leerie.ContextOverflow("Prompt is too long",
+                                         from_worker=True)
+
+        def ctrl_c():
+            raise KeyboardInterrupt()
+
+        def answers():
+            sys.exit(leerie.EXIT_NEEDS_ANSWERS)
+
+        def ok():
+            return None
+        for run_id, then in (("list-pause", ctx), ("list-ctrl-c", ctrl_c),
+                             ("list-answers", answers), ("list-ok", ok)):
+            _run_main(leerie, monkeypatch, repo, run_id,
+                      orchestrate_stub=self._seeded(leerie, then))
+            assert not self._run_json(repo, run_id).get("failed_at"), run_id
+            assert self._status(leerie, repo, run_id) in (
+                "in-progress", "done"), run_id
+
+    def test_a_resume_that_ends_cleanly_is_no_longer_failed(
+            self, leerie, monkeypatch, repo):
+        held: list = []
+
+        def die():
+            leerie.die("synthetic failure")
+        _run_main(leerie, monkeypatch, repo, "list-resumed",
+                  orchestrate_stub=self._seeded(leerie, die, held))
+        assert self._status(leerie, repo, "list-resumed") == "failed"
+        # The first invocation's process would have exited by now.
+        held[0].release_lock()
+
+        async def _ok(*a, **kw):
+            return None
+        monkeypatch.setattr(sys, "argv", ["leerie", "resume", "list-resumed"])
+        monkeypatch.setattr(leerie, "_orchestrate", _ok)
+        leerie.main()
+        assert self._run_json(repo, "list-resumed")["failed_at"] is None
+        assert self._status(leerie, repo, "list-resumed") != "failed"
+
+
+class TestEveryExitOfTheRunIsSeen:
+    """The death record has one owner, `_records_the_run_death`, which wraps
+    the whole of `main()` and is armed where the run's `State` is acquired
+    and its layout accepted. Review round 23 found the record owned by the
+    exit arms around `_orchestrate` instead: a `die()` at the confinement
+    entry, or in any resolver before the `try:`, recorded nothing, and the
+    run listed `in-progress` — which a bare `resume` auto-picks."""
+
+    @staticmethod
+    def _main_and_module(leerie):
+        import ast
+        from pathlib import Path
+        module = ast.parse(Path(leerie.__file__).read_text())
+        defs = {n.name: n for n in module.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        return module, defs
+
+    def test_by_rule_no_exit_after_the_state_is_outside_the_owner(
+            self, leerie):
+        import ast
+        module, defs = self._main_and_module(leerie)
+        main = defs["main"]
+
+        def calls(node, name):
+            return [c for c in ast.walk(node) if isinstance(c, ast.Call)
+                    and (getattr(c.func, "id", None) == name
+                         or getattr(c.func, "attr", None) == name)]
+
+        # One owner: nothing but the decorator wrapping main() writes it.
+        writers = sorted(n for n, d in defs.items()
+                         if calls(d, "_record_run_died"))
+        assert writers == ["_records_the_run_death"], writers
+        assert [getattr(d, "id", None) for d in main.decorator_list] == [
+            "_records_the_run_death"]
+
+        # Armed right where the run becomes this process's: the statements
+        # between the State's acquisition and the arm are the layout refusal
+        # alone (a directory of another layout is not this leerie's to write).
+        acquire = [i for i, s in enumerate(main.body)
+                   if any(isinstance(n, ast.Call)
+                          and getattr(n.func, "id", None) == "State"
+                          for n in ast.walk(s))]
+        arm = [i for i, s in enumerate(main.body)
+               if calls(s, "_own_the_run_death_record")]
+        assert len(acquire) == 1 and len(arm) == 1, (acquire, arm)
+        between = main.body[acquire[0] + 1:arm[0]]
+        assert all(calls(s, "_refuse_other_run_layout") for s in between)
+        assert len(between) == 1
+        # Disarmed only for `--phase`, which never continues the run, and
+        # for a `resume` of a run that completed (TestACompletedRunStays-
+        # Completed executes both faces).
+        assert ast.unparse(main.body[arm[0]].test) == (
+            "not (args.phase or (args.resume and "
+            "_run_has_nothing_left(st.data)))")
+
+        # Every exit after the arm is a raise the owner classifies or a
+        # returned code: no `sys.exit`/`os._exit` that would make a pause
+        # indistinguishable from a death.
+        after = main.body[arm[0] + 1:]
+        exits = [ast.unparse(c) for s in after for c in ast.walk(s)
+                 if isinstance(c, ast.Call)
+                 and ast.unparse(c.func) in ("sys.exit", "os._exit")]
+        assert exits == []
+
+    @pytest.mark.parametrize("where", ["entry", "resolver"])
+    def test_a_resume_that_dies_before_the_orchestrate_try_lists_failed(
+            self, leerie, monkeypatch, repo, where):
+        T = TestListShowsADeath
+        run_id = f"died-at-{where}"
+        held: list = []
+        _run_main(leerie, monkeypatch, repo, run_id,
+                  orchestrate_stub=T._seeded(leerie, lambda: None, held))
+        held[0].release_lock()
+        assert T._status(leerie, repo, run_id) == "in-progress"
+
+        def dies(*a, **kw):
+            leerie.die("kernel has no Landlock")
+        if where == "entry":
+            monkeypatch.setattr(leerie, "_require_confinement", dies)
+        else:
+            monkeypatch.setattr(leerie, "resolve_runtime", dies)
+
+        async def _unreached(*a, **kw):
+            raise AssertionError("the resume died before _orchestrate")
+        monkeypatch.setattr(sys, "argv", ["leerie", "resume", run_id])
+        monkeypatch.setattr(leerie, "_orchestrate", _unreached)
+        with pytest.raises(SystemExit) as e:
+            leerie.main()
+        assert e.value.code == 1
+        assert T()._run_json(repo, run_id)["failed_at"]
+        assert T._status(leerie, repo, run_id) == "failed"
+        # Not auto-picked: the run is this repo's only one, and a bare
+        # `resume` finds nothing it may choose.
+        with pytest.raises(SystemExit):
+            leerie.resolve_run_id(repo / ".leerie", None, resumable_only=True)
+
+    def test_an_interrupt_at_the_entry_is_not_a_death(
+            self, leerie, monkeypatch, repo):
+        T = TestListShowsADeath
+        held: list = []
+        _run_main(leerie, monkeypatch, repo, "ctrl-c-at-entry",
+                  orchestrate_stub=T._seeded(leerie, lambda: None, held))
+        held[0].release_lock()
+
+        def interrupted(*a, **kw):
+            raise KeyboardInterrupt()
+        monkeypatch.setattr(leerie, "_require_confinement", interrupted)
+        monkeypatch.setattr(sys, "argv", ["leerie", "resume",
+                                          "ctrl-c-at-entry"])
+        with pytest.raises(KeyboardInterrupt):
+            leerie.main()
+        assert not T()._run_json(repo, "ctrl-c-at-entry").get("failed_at")
+        assert T._status(leerie, repo, "ctrl-c-at-entry") == "in-progress"
+
+
+class TestACompletedRunStaysCompleted:
+    """DESIGN §6 *A run that died says so* (review round 24, L1): an
+    invocation's death is a fact about the invocation, the run's status a
+    fact about the run. A `resume` of a run that completed has nothing to
+    continue, so a death of it (an argv typo caught by a resolver) does not
+    relabel the run `failed`; a resume of a run with work left that dies the
+    same way still does. Real `main()`, real resolver: `--worker-memory-max
+    bogus` dies after the `State` is taken, where the arm sits."""
+
+    @staticmethod
+    def _seed(leerie, monkeypatch, repo, run_id, *, finalized):
+        T = TestListShowsADeath
+        held: list = []
+
+        def then():
+            st = held[0]
+            if finalized:
+                st.data.update(finished_at=leerie.now(),
+                               current_phase="phase 6: finalize")
+                st.save()
+                leerie._write_run_json(st.run_dir, finished_at=leerie.now())
+        _run_main(leerie, monkeypatch, repo, run_id,
+                  orchestrate_stub=T._seeded(leerie, then, held))
+        held[0].release_lock()
+
+    @staticmethod
+    def _resume_with_a_bad_flag(leerie, monkeypatch, run_id):
+        async def _unreached(*a, **kw):
+            raise AssertionError("the resolver should have died first")
+        monkeypatch.setattr(leerie, "_orchestrate", _unreached)
+        monkeypatch.setattr(sys, "argv", ["leerie", "resume", run_id,
+                                          "--worker-memory-max", "bogus"])
+        with pytest.raises(SystemExit) as e:
+            leerie.main()
+        assert e.value.code == 1
+
+    def test_a_finished_run_stays_done_after_a_dying_no_op_resume(
+            self, leerie, monkeypatch, repo):
+        T = TestListShowsADeath
+        self._seed(leerie, monkeypatch, repo, "finished", finalized=True)
+        assert T._status(leerie, repo, "finished") == "done"
+        self._resume_with_a_bad_flag(leerie, monkeypatch, "finished")
+        assert not T()._run_json(repo, "finished").get("failed_at")
+        assert T._status(leerie, repo, "finished") == "done"
+
+    def test_a_run_with_work_left_lists_failed_after_the_same_death(
+            self, leerie, monkeypatch, repo):
+        T = TestListShowsADeath
+        self._seed(leerie, monkeypatch, repo, "mid-run", finalized=False)
+        assert T._status(leerie, repo, "mid-run") == "in-progress"
+        self._resume_with_a_bad_flag(leerie, monkeypatch, "mid-run")
+        assert T()._run_json(repo, "mid-run")["failed_at"]
+        assert T._status(leerie, repo, "mid-run") == "failed"
+
+    def test_a_died_finalize_is_work_left(self, leerie):
+        # `die()` stamps `finished_at` for discovery but leaves the phase
+        # where it died: that run is not complete, so its resume is armed.
+        assert not leerie._run_has_nothing_left(
+            {"finished_at": "t", "current_phase": "phase 5: execute"})
+        assert leerie._run_has_nothing_left(
+            {"finished_at": "t", "current_phase": "phase 6: finalize"})
+        assert leerie._run_has_nothing_left({"no_work_required": True})
+        assert not leerie._run_has_nothing_left({})

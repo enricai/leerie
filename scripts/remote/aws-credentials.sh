@@ -72,7 +72,7 @@ _aws_resolve_profile_name() {
 _aws_read_config_value() {
   local file="$1" section="$2" key="$3"
   [ -f "$file" ] || return 1
-  python3 - "$file" "$section" "$key" <<'PY'
+  python3 -I - "$file" "$section" "$key" <<'PY'
 import configparser
 import sys
 
@@ -162,7 +162,7 @@ _aws_sso_cache_token() {
   local start_url="$1" cache_dir
   cache_dir="$(_aws_dir)/sso/cache"
   [ -d "$cache_dir" ] || return 1
-  python3 - "$cache_dir" "$start_url" <<'PY'
+  python3 -I - "$cache_dir" "$start_url" <<'PY'
 import glob
 import json
 import os
@@ -266,9 +266,8 @@ resolve_aws_credentials() {
         # shellcheck disable=SC2034  # field 2 of the helper's two-line
         # output; parsed to document the shape, not read on this path
         sso_region="$(sed -n '2p' <<<"$sso_out")"
-        local token rc
-        token="$(_aws_sso_cache_token "$start_url")"
-        rc=$?
+        local token rc=0
+        token="$(_aws_sso_cache_token "$start_url")" || rc=$?
         if [ "$rc" -eq 0 ]; then
           access_key=""
           secret_key=""

@@ -83,8 +83,10 @@ def _make_stub_python3(bin_dir: Path, rebaser_json: str, marker: str = "run_reba
     parse exactly as it did in production.
 
     The verdict path is taken as the LAST argument rather than a fixed index:
-    the stub stands in for `python3`, so the seam script itself is `$1` and
-    every seam argument is shifted by one. Hard-coding the wrong index here is
+    the stub stands in for `python3`, so the seam script itself is the first
+    argument after the interpreter's flags (`-I`), and every seam argument is
+    shifted by those. A stub that read the script from `$1` saw `-I`, fell
+    through to the real interpreter, ran the real rebaser and never returned. Hard-coding the wrong index here is
     not a benign test bug — an earlier revision of a sibling stub wrote to the
     slot holding "$LEERIE_REPO/orchestrator/leerie.py" and truncated the real
     orchestrator source to 15 bytes.
@@ -92,6 +94,12 @@ def _make_stub_python3(bin_dir: Path, rebaser_json: str, marker: str = "run_reba
     p = bin_dir / "python3"
     p.write_text(f"""#!/usr/bin/env bash
 echo "$@" >> {bin_dir}/python3.log
+# The seam script is the first argument after the interpreter's own flags
+# (host-side python3 always runs `-I`): skip them, but pass the original
+# argv through untouched.
+argv=("$@")
+while [ "$#" -gt 0 ] && case "$1" in -) false ;; -?*) true ;; *) false ;; esac
+do shift; done
 script="$1"
 if [ -f "$script" ] && grep -q '{marker}' "$script"; then
   for _out; do :; done
@@ -101,7 +109,7 @@ if [ -f "$script" ] && grep -q '{marker}' "$script"; then
 JSON
   exit 0
 fi
-exec /usr/bin/env python3 "$@"
+exec /usr/bin/env python3 "${{argv[@]}}"
 """)
     p.chmod(0o755)
 
@@ -256,13 +264,15 @@ def test_worktree_add_failure_skips_rebase_and_still_pushes(tmp_path):
     p.write_text("#!/usr/bin/env bash\necho UNEXPECTED_PYTHON3_CALL >&2\nexit 1\n")
     p.chmod(0o755)
     # Shadow `git worktree add` to fail while leaving every other git
-    # subcommand to the real binary.
+    # subcommand to the real binary. Matched by its words, not argv
+    # positions: host-finalize's add carries `-C <repo> -c
+    # core.hooksPath=/dev/null` ahead of them (DESIGN §6½ *Hooks off*).
     real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
     git_shim = bin_dir / "git"
     git_shim.write_text(f"""#!/usr/bin/env bash
-if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
-  exit 1
-fi
+case " $* " in
+  *" worktree add "*) exit 1 ;;
+esac
 exec {real_git} "$@"
 """)
     git_shim.chmod(0o755)
@@ -358,3 +368,56 @@ def test_pr_diff_base_correct_after_successful_rebase(tmp_path):
     # depends on. A worktree-mutation-level proof is covered by the two
     # live trials in the plan file, not re-derived here.
     assert "rebased leerie/runs/test-run onto main" in r.stderr
+
+
+def test_the_rebaser_works_in_a_repository_of_its_own(tmp_path):
+    """DESIGN §6 *The run's own repository*: the rebaser's worktree belongs
+    to a host-side repository of its own, never to the user's — while it
+    runs, the user's repository registers no worktree but its own checkout
+    and holds no stash or branch of the rebaser's; afterwards nothing of it
+    is left there. Recorded from inside the seam, where the worker would
+    run."""
+    repo = _make_diverged_repo(tmp_path)
+    run_git_repo_first(repo, "stash", "list")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    seen = tmp_path / "seen"
+    p = bin_dir / "python3"
+    p.write_text(f"""#!/usr/bin/env bash
+# The seam script is the first argument after the interpreter's own flags
+# (host-side python3 always runs `-I`): skip them, but pass the original
+# argv through untouched.
+argv=("$@")
+while [ "$#" -gt 0 ] && case "$1" in -) false ;; -?*) true ;; *) false ;; esac
+do shift; done
+script="$1"
+if [ -f "$script" ] && grep -q run_rebaser "$script"; then
+  wt="$5"
+  for _out; do :; done
+  git -C "$wt" rev-parse --path-format=absolute --git-common-dir > {seen}.common
+  git -C "{repo}" worktree list --porcelain > {seen}.userlist
+  printf '%s' '{_rebaser_result("failed", diagnosis="x")}' > "$_out"
+  exit 0
+fi
+exec /usr/bin/python3 "${{argv[@]}}"
+""")
+    p.chmod(0o755)
+    run_dir = _make_run(tmp_path, repo, "test-run", run_json={
+        "branch": "leerie/runs/test-run",
+        "working_branch": "main",
+        "pr_base_branch": "main",
+        "finished_at": "2026-07-31T00:00:00+00:00",
+    })
+    r = _run_host_finalize(tmp_path, repo, run_dir, bin_dir)
+    assert r.returncode == 0, r.stderr
+    common = Path((tmp_path / "seen.common").read_text().strip())
+    assert common.resolve() != (repo / ".git").resolve()
+    assert common.name == "rebase-test-run.git"
+    userlist = (tmp_path / "seen.userlist").read_text()
+    assert userlist.count("worktree ") == 1
+    after = run_git_repo_first(repo, "worktree", "list", "--porcelain").stdout
+    assert after.count("worktree ") == 1
+    refs = run_git_repo_first(repo, "for-each-ref", "--format=%(refname)",
+                              "refs/leerie-rebase-scratch").stdout
+    assert refs.strip() == ""
+    assert not common.exists()          # gone with finalize's scratch dir

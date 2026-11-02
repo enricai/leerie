@@ -166,7 +166,7 @@ def test_capture_does_not_merge_the_log_stream_into_the_verdict() -> None:
     # assertions below could not see it. The `( … ) >&2` wrapper fell outside
     # it too, which is why neither was pinned.
     m = re.search(
-        r'^[ \t]*[^\n]*python3 "\$_rebaser_py"[^\n]*\n'
+        r'^[ \t]*[^\n]*python3(?: -\w+)* "\$_rebaser_py"[^\n]*\n'
         r'(?:[^\n]*\n){0,6}?[^\n]*_rebaser_rc=\$\?',
         src, re.M)
     assert m, "could not locate the rebaser seam invocation"

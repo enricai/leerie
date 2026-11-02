@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock
 
 from functools import partial
 
+from tests.conftest import judge_checkout_in_place
 from tests.test_accept_blocked import (
     _expected_remote_state,
     _flyctl_stub,
@@ -108,6 +109,30 @@ def test_noop_on_already_accepted(tmp_path):
     r = _run_accept(sf, "feat-001")
     assert r.returncode == 0
     assert "already accepted" in r.stdout
+
+
+def test_backed_out_record_reports_nothing_integrated_and_changes_nothing(
+        tmp_path):
+    """A record the integration fallback backed out has no merge on the run
+    branch: the verb must not print ACCEPTED (it used to, flipping
+    `accepted` on a merge that is not there). It says what happened and
+    leaves state.json byte-identical."""
+    sf = _make_state(
+        tmp_path,
+        {"feat-001": {"defects": [], "advisories": [], "merge_commit_sha": "",
+                      "accepted": False, "outcome": "backed_out",
+                      "fallback_reason": "integrator design-conflict on the "
+                                         "first resolution: shapes differ",
+                      "reset_to": "abc123"}})
+    before = sf.read_bytes()
+    r = _run_accept(sf, "feat-001")
+    assert r.returncode == 0, r.stderr
+    assert "ACCEPTED" not in r.stdout
+    assert "NOOP:" in r.stdout
+    assert "backed out of the run branch" in r.stdout
+    assert "shapes differ" in r.stdout
+    assert "none of its work is integrated" in r.stdout
+    assert sf.read_bytes() == before
 
 
 def test_errors_on_unknown_subtask(tmp_path):
@@ -218,13 +243,14 @@ def test_integration_gate_is_declared_per_sid_keyed_by_sid(leerie):
     """The producing domain decides per-sid vs per-run granularity; this
     reads STATE_FIELDS and the real write site rather than assuming.
     `integration_gate` is a dict keyed by subtask id (verified against
-    `_run_integration_judge_gate`'s own write:
-    `st.data.setdefault("integration_gate", {})[sid] = {...}`), matching
-    what `_run_accept`/`_make_state` above already assume."""
+    `_run_integration_judge_gate`'s own write, `gates[sid] = rec` with
+    `gates = st.data.setdefault("integration_gate", {})`), matching what
+    `_run_accept`/`_make_state` above already assume."""
     assert "integration_gate" in leerie.STATE_FIELDS
     import inspect
     src = inspect.getsource(leerie._run_integration_judge_gate)
-    assert 'st.data.setdefault("integration_gate", {})[sid] = {' in src
+    assert 'gates = st.data.setdefault("integration_gate", {})' in src
+    assert "gates[sid] = rec" in src
 
 
 # --- end-to-end composition: real launcher write -> real integrate_wave read #
@@ -315,7 +341,7 @@ def test_accept_then_resume_skips_the_judge(leerie, tmp_path, monkeypatch):
             calls["judge"] += 1
         return {}
 
-    async def fake_run_script(script, s, rid):
+    async def fake_run_script(script, s, rid, **_kw):
         calls["integrate_sh"] += 1
         mock = AsyncMock()
         mock.returncode = 0
@@ -365,7 +391,7 @@ def test_without_accept_resume_reinvokes_the_judge(
                     "rationale": "clean on re-review"}
         return {}
 
-    async def fake_run_proc(cmd, cwd=None):
+    async def fake_run_proc(cmd, cwd=None, env=None):
         mock = AsyncMock()
         mock.returncode = 0
         mock.stdout = "abc123\n" if "rev-parse" in cmd else "Merge\n\ndiff\n"
@@ -374,6 +400,7 @@ def test_without_accept_resume_reinvokes_the_judge(
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    judge_checkout_in_place(leerie, monkeypatch)
 
     async def _run():
         return await leerie.integrate_wave(

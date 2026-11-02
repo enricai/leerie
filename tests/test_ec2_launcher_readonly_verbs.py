@@ -331,7 +331,9 @@ def test_list_ec2_run_renders_populated_status_without_fly_app(leerie, tmp_path,
     monkeypatch.delenv("LEERIE_FLY_APP", raising=False)
     _make_run(
         tmp_path, RUN_ID,
-        {"started_at": "2026-07-01T00:00:00+00:00", "task": "x"},
+        # A run of the leerie under test: its run layout recorded.
+        {"started_at": "2026-07-01T00:00:00+00:00", "task": "x",
+         "run_layout": leerie.RUN_LAYOUT_VERSION},
         run_json={"ec2_instance_id": "i-0000000000000000a",
                   "branch": f"leerie/runs/{RUN_ID}"},
         ec2_sidecar={"ec2_instance_id": "i-0000000000000000a"},

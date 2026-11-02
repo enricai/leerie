@@ -161,7 +161,7 @@ _resolve_ssh_target_from_instance() {
     < <(_aws_region_profile_args)
   local describe_out ip
   describe_out="$(aws ec2 describe-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
-  ip="$(printf '%s' "$describe_out" | python3 -c '
+  ip="$(printf '%s' "$describe_out" | python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -297,7 +297,7 @@ ec2_default_key_file() {
   local args=() _a account region
   while IFS= read -r _a; do args+=("$_a"); done < <(_aws_region_profile_args)
   account="$(aws sts get-caller-identity ${args[@]+"${args[@]}"} --output json 2>/dev/null \
-    | python3 -c 'import json,sys
+    | python3 -I -c 'import json,sys
 try: print(json.load(sys.stdin).get("Account",""))
 except Exception: pass' 2>/dev/null)"
   region="$(_ec2_region)"

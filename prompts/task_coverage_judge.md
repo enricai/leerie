@@ -89,6 +89,15 @@ whether the run proceeds, so do not soften a real finding to avoid that.
 You are handed the task text and the reconciled subtask set. Read-only
 analysis: do not write or modify any files.
 
+**Check the numbered required items.** When the payload carries
+`required_items`, they are the task's requirements as the classifier
+accounted for them, one per requirement the task (or a report it points
+at) states, each with its `item_index` and the `span` of the task it
+came from. A required item that no subtask's intent would produce is
+`missing_work`: say which `item_index` in `description`, and cite the
+item and the subtask set in `concrete_evidence`. The items help you find
+gaps; they do not limit you — a gap the items miss is still a gap.
+
 **Read the files the task names.** When the task points at a spec, a
 checklist, a config or a design doc — `CLAUDE.md`, a `docs/*.md`, a YAML
 manifest — open it. Those files routinely carry the concrete requirements

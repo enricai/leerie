@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""The delivery re-drive's self-check (DESIGN §8 *A held-out set never
+enters a tree a worker commits from*): runs the shown acceptance sets
+against a copy of the worker's current working tree, outside it.
+
+Usage: selfcheck.py <config.json> [set file…] [-t PATTERN] [runner args…]
+
+The orchestrator writes the config and a `leerie-selfcheck` wrapper that
+calls this with it (`_selfcheck_prepare`). The logic is the orchestrator's
+own (`selfcheck_main`), imported from the sibling `orchestrator/`
+directory as `forbidden-command-hook.py` does, so the self-check renders
+the sets' command as the evaluation does (`_acceptance_cmd`), on a copy of
+the tree with the sets placed by `_place_set` (the evaluation places them
+in its sandbox instead)."""
+import os
+import sys
+
+
+def main() -> int:
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "orchestrator"))
+    import leerie
+    return leerie.selfcheck_main(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

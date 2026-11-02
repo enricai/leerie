@@ -6,7 +6,7 @@ spawning real workers. They confirm that:
 
 - Two runs' State instances write to disjoint paths.
 - Mutations on one State don't bleed into the other's saved state.json.
-- Per-run subdirectories (worktrees/, criteria/, logs/, etc.) are
+- Per-run subdirectories (worktrees/, notes/, logs/, etc.) are
   scoped under the run dir, so two runs can use the same `sid` without
   colliding.
 
@@ -40,12 +40,12 @@ def test_disjoint_run_dirs(leerie, tmp_path):
 
 def test_disjoint_subpaths(leerie, tmp_path):
     """The per-run subdirectories that leerie code uses
-    (leerie_dir / 'worktrees', '/criteria', '/logs', '/subtasks',
-    '/checkpoints') are all under the run_dir — and therefore disjoint
+    (leerie_dir / 'worktrees', '/notes', '/logs', '/subtasks') are all
+    under the run_dir — and therefore disjoint
     between runs."""
     sa = leerie.State(tmp_path, "feat-a-aaaaaa")
     sb = leerie.State(tmp_path, "fix-b-bbbbbb")
-    for sub in ("worktrees", "criteria", "logs", "subtasks", "checkpoints"):
+    for sub in ("worktrees", "notes", "logs", "subtasks"):
         assert sa.run_dir / sub != sb.run_dir / sub
 
 

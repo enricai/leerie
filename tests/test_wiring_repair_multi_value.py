@@ -200,11 +200,16 @@ class TestCycleGuardStillApplies:
                 {"id": "c-1", "depends_on": [], "requires": [], "provides": []}]
         plans = [{"domain": "d", "subtasks": subs}]
         d = [_defect(sid="a-1", tag_or_dep="b-1, c-1")]
-        repairs, unrepaired = leerie._repair_missing_requires(plans, d)
+        warns: list[dict] = []
+        repairs, unrepaired = leerie._repair_missing_requires(plans, d, warns)
         got = {r["tag"] for r in repairs}
         assert "c-1" in got, "the safe edge should still be applied"
         assert "b-1" not in got, "the cycling edge must be refused"
-        assert unrepaired, "the refused edge must reach the die path"
+        # Since N3 the refused edge is a typed warning, not a death: its only
+        # provider (b-1 itself) is a descendant of a-1.
+        assert unrepaired == []
+        assert [w["why"] for w in warns] == ["every_provider_is_a_descendant"]
+        assert leerie._would_cycle_after(plans, lambda tr: None) is False
 
 
 # --- wiring --------------------------------------------------------------- #
@@ -212,11 +217,11 @@ class TestCycleGuardStillApplies:
 class TestWiring:
     def test_repair_calls_the_expander(self, leerie):
         import inspect
-        src = inspect.getsource(leerie._repair_missing_requires)
+        src = inspect.getsource(leerie._repair_wiring_channels)
         assert "_expand_multi_value_wiring_defects(" in src
 
     def test_expansion_precedes_the_repair_loop(self, leerie):
         import inspect
-        src = inspect.getsource(leerie._repair_missing_requires)
+        src = inspect.getsource(leerie._repair_wiring_channels)
         assert (src.index("_expand_multi_value_wiring_defects(")
                 < src.index("for d in defects:"))

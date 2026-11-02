@@ -18,17 +18,22 @@ import types
 
 import pytest
 
+from tests.conftest import measure_run_dir
+
 
 @pytest.fixture(autouse=True)
 def _clear_deps_memo(leerie):
     leerie._DEPS_INSTALLED.clear()
+    leerie._DEPS_FAILED.clear()
     yield
     leerie._DEPS_INSTALLED.clear()
+    leerie._DEPS_FAILED.clear()
 
 
 @pytest.fixture
-def st():
+def st(tmp_path):
     return types.SimpleNamespace(
+        run_dir=measure_run_dir(tmp_path, beside=True),
         data={"provision": {"recipe": [
             {"kind": "install", "command": ["pnpm", "install"]},
         ]}},
@@ -64,6 +69,16 @@ def test_installs_on_first_call(leerie, st, streaming, tmp_path):
     calls = streaming()
     _go(leerie, tmp_path, st)
     assert [c[0] for c in calls] == [["pnpm", "install"]]
+    # Confined to the tree it installs into, with its temp the tree's own
+    # private temp directory (DESIGN §6 *Leerie's runs of the repository's
+    # commands are confined too*, *A confined command's scratch is short
+    # and private*).
+    g = calls[0][1]["grants"]
+    assert str(tmp_path.resolve()) in g.rw
+    own = leerie._measure_dir(st, tmp_path)
+    assert str(own) in g.rw
+    assert dict(g.env)["TMPDIR"] == str(leerie._private_tmp(own))
+    assert dict(g.env)["TMPDIR"] in g.rw
 
 
 def test_second_call_on_the_same_tree_installs_nothing(leerie, st, streaming,
@@ -107,14 +122,16 @@ def test_only_install_and_build_kinds_run(leerie, streaming, tmp_path):
         {"kind": "build", "command": ["pnpm", "build"]},
         {"kind": "verify", "command": ["pnpm", "test"]},
         {"kind": "install"},                       # no command
-    ]}}, save=lambda: None)
+    ]}}, save=lambda: None,
+        run_dir=measure_run_dir(tmp_path, beside=True))
     _go(leerie, tmp_path, st)
     assert [c[0] for c in calls] == [["pnpm", "install"], ["pnpm", "build"]]
 
 
 def test_empty_or_absent_recipe_is_a_no_op(leerie, streaming, tmp_path):
     calls = streaming()
-    _go(leerie, tmp_path, types.SimpleNamespace(data={}, save=lambda: None))
+    _go(leerie, tmp_path, types.SimpleNamespace(data={}, save=lambda: None,
+        run_dir=measure_run_dir(tmp_path, beside=True)))
     assert calls == []
 
 
@@ -122,7 +139,8 @@ def test_working_dir_is_resolved_under_the_tree(leerie, streaming, tmp_path):
     calls = streaming()
     st = types.SimpleNamespace(data={"provision": {"recipe": [
         {"kind": "install", "command": ["pnpm", "i"], "working_dir": "web"},
-    ]}}, save=lambda: None)
+    ]}}, save=lambda: None,
+        run_dir=measure_run_dir(tmp_path, beside=True))
     _go(leerie, tmp_path, st)
     assert calls[0][1]["cwd"] == str(tmp_path / "web")
 
@@ -135,7 +153,8 @@ def test_entry_env_layers_over_the_process_env(leerie, streaming, tmp_path):
     st = types.SimpleNamespace(data={"provision": {"recipe": [
         {"kind": "install", "command": ["pnpm", "i"],
          "env": {"UV_THREADPOOL_SIZE": "4"}},
-    ]}}, save=lambda: None)
+    ]}}, save=lambda: None,
+        run_dir=measure_run_dir(tmp_path, beside=True))
     _go(leerie, tmp_path, st)
     env = calls[0][1]["env"]
     assert env["UV_THREADPOOL_SIZE"] == "4"
@@ -231,11 +250,16 @@ def test_measure_installs_once_across_repeated_rounds(
     assert len(installs) == 1
 
 
-def test_a_failing_install_still_marks_the_tree_done(leerie, st, streaming,
-                                                     tmp_path):
-    """Retrying a broken install once per measurement would multiply the
-    cost this function exists to remove."""
+def test_a_failing_install_is_retried_a_bounded_number_of_times(
+        leerie, st, streaming, tmp_path):
+    """A broken install is retried once per later measurement, but only
+    `deps_install_retries` times (review round 10 M2): one outage must not
+    unmeasure the tree for the whole run, and a permanently broken install
+    must not multiply the cost this function exists to remove."""
     calls = streaming(OSError("boom"))
-    _go(leerie, tmp_path, st)
-    _go(leerie, tmp_path, st)
-    assert len(calls) == 1
+    got = [_go(leerie, tmp_path, st) for _ in range(6)]
+    assert got == [False] * 6
+    assert len(calls) == 1 + leerie.DEFAULT_CAPS["deps_install_retries"]
+    calls.clear()
+    assert _go(leerie, tmp_path, st, {"deps_install_retries": 0}) is False
+    assert calls == []

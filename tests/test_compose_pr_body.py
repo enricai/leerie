@@ -272,19 +272,25 @@ def test_compose_pr_body_deploy_section_no_reasons(leerie):
 # --- residual-risk section (DESIGN §9 *Self-reported risk is routed, ------
 # not read*; DESIGN §6 *appended by code on every composition path*) -------
 
-def test_risk_register_section_renders_details_verbatim(leerie):
-    """A populated register must put each entry's own words in the body —
-    the value, not just the heading."""
+def test_end_state_section_renders_details_verbatim(leerie):
+    """A typed external register entry must put its own words in the body
+    under "Needs human verification" — the value, not just the heading —
+    and the body ends with the same text `_format_pr_end_state_section`
+    renders (the canonical fallback carries the section)."""
     state = _full_state()
     state["risk_register"] = {"feat-001": [
         {"kind": "external_contract_assumption",
          "detail": "matches the provider's error-message wording",
-         "source": "implementer", "addressed": False},
+         "source": "implementer", "gap": "unverified_external",
+         "where_paths": [], "resource": "the provider's sandbox",
+         "addressed": False},
     ]}
     body = leerie.compose_pr_body(state, "feat-foo-abc123")
-    assert "## ⚠ Residual risks" in body
-    assert "matches the provider's error-message wording" in body
-    assert "unaddressed" in body
+    assert "## Needs human verification" in body
+    assert ("**the provider's sandbox**\n- [ ] **feat-001**: matches the "
+            "provider's error-message wording") in body
+    assert body.endswith(leerie._format_pr_end_state_section(state))
+    assert "Residual risks" not in body
 
 
 def test_no_risk_section_when_register_empty(leerie):

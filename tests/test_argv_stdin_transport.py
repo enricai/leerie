@@ -40,6 +40,7 @@ import types
 import unittest.mock as mock
 
 import pytest
+from tests.conftest import fake_run_dir
 
 # Linux's per-argument ceiling (PAGE_SIZE * 32 on a 4KB-page kernel).
 # Not a leerie constant — the external fact the fix routes around,
@@ -73,8 +74,8 @@ def _incident_shaped_system_prompt() -> str:
 
 def _make_state():
     return types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         # claude_p derives the checkout write-denial from this
         # (_repo_write_denials) and the §12 cwd guard compares against it;
         # a stub without it silently disables both.
@@ -311,7 +312,7 @@ def test_stubbed_spawn_does_not_raise_e2big_at_incident_scale(
         ["claude", "-p", "--append-system-prompt-file", "/tmp/sp.txt",
          "--json-schema", "{}"],
         cwd=str(leerie_dir.parent), timeout=30, sid="incident-stub",
-        leerie_dir=leerie_dir, verbosity="quiet", stdin_data=user_prompt))
+        leerie_dir=leerie_dir, verbosity="quiet", stdin_data=user_prompt, grants=leerie.WorkerGrants(("/",), ())))
 
     assert envelope["type"] == "result"
     assert envelope["is_error"] is False
@@ -344,7 +345,7 @@ def test_stubbed_spawn_stages_full_payload_before_exec(
     asyncio.run(leerie._invoke(
         ["claude", "-p"], cwd=str(leerie_dir.parent), timeout=30,
         sid="incident-feed", leerie_dir=leerie_dir, verbosity="quiet",
-        stdin_data=user_prompt))
+        stdin_data=user_prompt, grants=leerie.WorkerGrants(("/",), ())))
 
     assert seen["at_spawn"] == user_prompt.encode()
 
@@ -370,7 +371,7 @@ def test_real_subprocess_incident_payload_no_deadlock(leerie, leerie_dir):
 
     envelope = asyncio.run(leerie._invoke(
         cmd, cwd=str(leerie_dir.parent), timeout=30, sid="incident-e2e",
-        leerie_dir=leerie_dir, verbosity="quiet", stdin_data=user_prompt))
+        leerie_dir=leerie_dir, verbosity="quiet", stdin_data=user_prompt, grants=leerie.WorkerGrants(("/",), ())))
 
     assert envelope["type"] == "result"
     assert envelope["is_error"] is False

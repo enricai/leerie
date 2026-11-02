@@ -3,10 +3,10 @@
 Unlike tests/test_cgroup_helpers.py (which stubs `_cgroup_request` and
 never touches a real socket) and tests/test_cgroup_broker.py (which drives
 the broker module in-process, never over a socket), this file runs a REAL
-Unix-domain-socket server thread wrapping the actual `scripts/cgroup-broker.py`
-module's `_handle()` dispatch against a fake cgroupfs, and drives
-`leerie._cgroup_destroy` against it over the real socket path
-(`leerie._CGROUP_BROKER_SOCK`). It asserts the resource is actually reaped
+server thread running the actual `scripts/cgroup-broker.py`
+`serve()` loop against a fake cgroupfs, and drives
+`leerie._cgroup_destroy` against it over the orchestrator's real descriptor
+(`leerie._CGROUP_BROKER`, one end of the socket pair the broker serves). It asserts the resource is actually reaped
 (the fake `leerie-w-<sid>` directory is gone from disk), not merely that
 `_cgroup_destroy` returned without raising -- mirroring
 tests/test_provision_volume.py's discipline for Fly volume reaping.
@@ -56,49 +56,27 @@ def _load_broker():
 
 
 class _FakeBrokerServer:
-    """A real Unix-socket server thread that dispatches through the real
-    broker module's `_handle()` -- single connection at a time, mirroring
-    the shipped broker's single-threaded accept loop (the property this
+    """The real broker loop (`serve()`) in a thread, on one end of a socket
+    pair whose other end is the orchestrator's descriptor (`client`) --
+    one request at a time, as the shipped broker serves (the property this
     incident depends on: a slow `destroy` blocks the broker from doing
     anything else, including finishing that same `destroy` any faster)."""
 
-    def __init__(self, broker_mod, sock_path: str):
-        self._mod = broker_mod
-        self._sock_path = sock_path
-        self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        if os.path.exists(sock_path):
-            os.unlink(sock_path)
-        self._srv.bind(sock_path)
-        self._srv.listen(16)
-        self._srv.settimeout(0.2)
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+    def __init__(self, broker_mod):
+        self.client, self._theirs = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.client.settimeout(5.0)
+        self._thread = threading.Thread(target=broker_mod.serve,
+                                        args=(self._theirs,), daemon=True)
 
     def start(self):
         self._thread.start()
 
-    def _run(self):
-        while not self._stop.is_set():
-            try:
-                conn, _ = self._srv.accept()
-            except OSError:
-                continue
-            try:
-                conn.settimeout(5.0)
-                data = conn.recv(4096).decode(errors="replace")
-                resp = self._mod._handle(data)
-                conn.sendall((resp + "\n").encode())
-            except OSError:
-                pass
-            finally:
-                conn.close()
-
     def stop(self):
-        self._stop.set()
+        # The orchestrator's end closing is what stops the broker.
+        self.client.close()
         self._thread.join(timeout=2.0)
-        self._srv.close()
-        if os.path.exists(self._sock_path):
-            os.unlink(self._sock_path)
+        self._theirs.close()
 
 
 @pytest.fixture
@@ -177,11 +155,10 @@ def test_destroy_with_fixed_timeout_actually_reaps_a_slow_draining_worker(
     finishes, and the directory is gone by the time the call returns --
     the resource is verifiably reaped, not merely that `destroy` was sent."""
     mod, root, slice_dir, drain_at = fake_cgroupfs
-    sock_path = str(root / "broker.sock")
-    srv = _FakeBrokerServer(mod, sock_path)
+    srv = _FakeBrokerServer(mod)
     srv.start()
     try:
-        monkeypatch.setattr(leerie, "_CGROUP_BROKER_SOCK", sock_path)
+        monkeypatch.setattr(leerie, "_CGROUP_BROKER", srv.client)
         # Scaled client timeout: same >= relationship as production
         # (_CGROUP_DESTROY_TIMEOUT_SEC 15.0s vs broker's 10.0s), applied to
         # this test's 0.6s broker budget.
@@ -206,11 +183,10 @@ def test_destroy_across_repeated_create_destroy_cycles_leaves_no_directories(
     real (faked) cgroupfs leave zero leerie-w-* directories behind, even
     when several of them have a realistically slow drain."""
     mod, root, slice_dir, drain_at = fake_cgroupfs
-    sock_path = str(root / "broker.sock")
-    srv = _FakeBrokerServer(mod, sock_path)
+    srv = _FakeBrokerServer(mod)
     srv.start()
     try:
-        monkeypatch.setattr(leerie, "_CGROUP_BROKER_SOCK", sock_path)
+        monkeypatch.setattr(leerie, "_CGROUP_BROKER", srv.client)
         monkeypatch.setattr(leerie, "_CGROUP_DESTROY_TIMEOUT_SEC", 0.9)
 
         for i in range(5):
@@ -278,11 +254,10 @@ def test_pre_fix_short_timeout_plus_broker_teardown_leaks_the_directory(
 
     monkeypatch.setattr(mod, "_drain_then_rmdir", killable_drain)
 
-    sock_path = str(root / "broker.sock")
-    srv = _FakeBrokerServer(mod, sock_path)
+    srv = _FakeBrokerServer(mod)
     srv.start()
     try:
-        monkeypatch.setattr(leerie, "_CGROUP_BROKER_SOCK", sock_path)
+        monkeypatch.setattr(leerie, "_CGROUP_BROKER", srv.client)
         # Pre-fix shape: client timeout (0.15s) UNDER the broker's own
         # drain budget (0.6s) -- same ratio as the real bug's 5.0s vs 10.0s.
         monkeypatch.setattr(leerie, "_CGROUP_DESTROY_TIMEOUT_SEC", 0.15)

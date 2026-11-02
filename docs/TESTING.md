@@ -23,6 +23,17 @@ enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
 `resolve_blt`), including a coupling test that the retry-policy markers
 match the live check-function strings.
 
+**The suite runs in its own HOME.** `tests/conftest.py` points `HOME` at a
+fresh temporary directory before any test module is imported, with the git
+identity CI sets globally, and an autouse fixture fails any test that
+points it back at the user's (`REAL_HOME` holds that path, for a test that
+reads a cache there on purpose: the pnpm fallback check uses the user's
+corepack cache, without which corepack fetches the newest pnpm). The
+launcher resolves its state dir to `$HOME/.leerie/<repo>` and makes `logs/`
+there before any verb, so `test_re_seed` and `test_version_flag` wrote
+`~/.leerie/_self/logs` and `.owner` into the user's run state; both now
+pin `LEERIE_STATE_DIR` to `tmp_path` as well.
+
 ## Launcher AWS / EC2 knobs
 
 The `--aws-region`/`--aws-profile` knobs (which region/profile leerie
@@ -138,8 +149,9 @@ the install checkout).
   executed against a fake cgroup root and meminfo and writes the same
   slice memory cap container-entry.sh computes (14 GiB for 16 GiB, the
   1 GiB floor for 4 GiB), honours the `max` opt-out, and re-creates
-  `/tmp/.cache` 1777; `leerie-cgroup-broker.service` is an enabled root
-  unit running the shipped broker after that setup; leerie's home is
+  `/tmp/.cache` 1777; `leerie-instance-setup.service` is an enabled oneshot
+  root unit running that setup, and no broker service exists (the launch
+  wrapper spawns the broker and hands over its descriptor); leerie's home is
   chowned after its dirs exist; the SSM agent prefers the regional bucket.
 - `tests/test_ec2_defaults.py` (`ec2-defaults.sh`): per knob, the default
   and the override. Instance type; subnet (public subnet in the default VPC,
@@ -176,19 +188,15 @@ the install checkout).
   refused and no rc sentinel comes back, and `ec2_tar_pipe` extracts under
   `sudo -n`; the fetch ssh and rsync receiver are elevated too. Neither
   transport lands as root (DESIGN §6).
-- `tests/test_ec2_decide_teardown_auto_finalize.py` also pins the
-  launch-time `--no-push`: with `host_no_push` in the run's
-  `ec2-instance.json` (or `NO_PUSH=true` on the tearing-down launcher) the
-  clean exit fetches and terminates without `host_finalize`; the same
-  sidecar with `host_no_push=false` still finalizes. `tests/test_ec2_provision.py`
-  pins that `provision_instance` records that intent in the sidecar.
-  `tests/test_decide_teardown_auto_finalize.py` pins the same for Fly: with
-  `host_no_push` in `fly-machine.json` (or `NO_PUSH=true`) the ordered
-  stub calls are fetch → destroy with no `host_finalize`, and a
-  `host_no_push=false` control still runs fetch → finalize → destroy.
-  `tests/test_remote_host_no_push.py` covers the shared `lib.sh` reader
-  both teardowns use: either sidecar, missing or malformed reads `false`,
-  only a real `true` counts, and the launcher's `NO_PUSH` overrides.
+- `tests/test_ec2_decide_teardown_auto_finalize.py` and
+  `tests/test_decide_teardown_auto_finalize.py` pin that neither teardown
+  is a second owner of the push choice (DESIGN §6 *One push choice per
+  run, on every runtime*): a sidecar `host_no_push` (true or false) or
+  `NO_PUSH=true` on the tearing-down launcher leaves the ordered calls at
+  fetch → `host_finalize` → terminate/destroy, `host_finalize` being the
+  reader of `run.json.no_push` (whose skip `tests/test_remote_push_choice.py`
+  drives). `tests/test_ec2_provision.py` pins that `provision_instance`
+  writes no push field into `ec2-instance.json`.
 - Both teardown files also pin the launcher's STAGE-cleanup hook
   (`_remote_launcher_exit_cleanup`): it runs once, last, on the `exit`
   pass (after an INT-style pass that skips it), also when the
@@ -205,10 +213,11 @@ the install checkout).
   `kill` and leak STAGE); the launcher's three STAGE traps each tolerate
   a failed `kill`. Without it every remote run leaked a
   `cfg-*` dir of staged credentials (DESIGN §6 *Finalization parity*).
-- `tests/test_ec2_launch_env.py` also executes the shared launch suffix's
-  argv assembly: `--no-push` goes after the forwarded args (before a
-  literal `--`), so `resume <run-id>` keeps the verb first — a leading flag
-  made a real EC2 resume reject its own run id.
+- `tests/test_ec2_launch_env.py` also pins that the shared launch suffix
+  forwards the orchestrator argv unchanged (no `--no-push` of its own, so
+  `resume <run-id>` keeps the verb first — a leading flag once made a real
+  EC2 resume reject its own run id), and that the orchestrator splits the
+  run id off a forwarded `resume` argv.
 - `tests/test_ec2_launch_env.py`: renders the launcher's EC2 `child_env`
   heredoc and executes it: the baked `leerie.env` overrides the session env,
   splits on the first `=`, and the wrapper's own `HOME`/`USER_REPO`/`TZ` win
@@ -613,31 +622,46 @@ per-completion write, including the `list(leaves)` copy that keeps a
 later crash from mutating an already-taken snapshot (the aliasing class
 `test_checkpoint_aliasing.py` exists for).
 
-`tests/test_require_fly_ssh_isolation.py` (8 tests) pins
+`tests/test_require_fly_ssh_isolation.py` (10 tests) pins
 `_leerie_fly_agent_ensure`'s reuse predicate, whose exit codes are the
 whole point: `ssh-add -l` returns **1** for a reachable-but-keyless agent,
 **0** with a key, **2** for a dead socket (verified live). Treating rc 1
 like rc 2 `rm -f`s a live agent's socket out from under it, orphaning the
 process — which is the leak. The `-t 24h` on spawn bounds the
 **identities**, not the agent process, so it is not an orphan mitigation;
-see `scripts/remote/lib.sh`'s comment.
+see `scripts/remote/lib.sh`'s comment. Two of them run the function under
+the launcher's own `set` line (read from `leerie`): a real keyless agent
+(`ssh-add -l` rc 1) is reused and the caller continues — a bare `ssh-add -l`
+under `set -e` had ended the launcher there silently, leaking
+`.spawn.lock` (review r25 M1), while the older tests, which run without
+`set -e`, stayed green — and a failed `ssh-agent` spawn returns with a message and no lock.
+
+`tests/test_resume_push_writes_pr.py` (3 tests) drives the real
+`_run_phases` resume of a finished run with only `claude_p` stubbed: a resume
+continuing with a push and no `run.json.pr_title` runs `pr_writer` and records
+its title (review r25 L1: `resume <id> --push` of a finished `--no-push` run
+pushed with the fallback body); a resume continuing without a push, or of a
+run whose PR is written, runs no worker.
 
 ## fetch_branch, config, and group verbs
 
 The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
-discovery, bundle fetch, run-state tar, `no_push` strip, and baseline Step
-4 stream-back (both files streamed when host has neither, never clobbers
-an existing host file, non-fatal on absent machine files, respects
-`LEERIE_STATE_HOST_DIR`) via bash-harness subprocess tests with a stubbed
-`flyctl`. The expanded Step 4 best-effort `.leerie/` stream-back contracts
-are covered by `tests/test_fetch_branch_leerie_streamback.py` (imports
-stub helpers from `test_fetch_branch_sh` to avoid duplication): streams
-both files when host has neither, never clobbers an existing
-`config.toml`, never clobbers an existing `Dockerfile`, non-fatal when
-machine files are absent, streams only the present machine file when only
-one exists, skips both when both host files exist, and respects
-`LEERIE_STATE_HOST_DIR` for the destination root.
+discovery, bundle fetch, run-state tar (`run.json`, its `no_push` included,
+arrives unchanged), and baseline Step
+4 stream-back (the Dockerfile streamed when the host has none, a machine
+`config.toml` not streamed, never clobbers an existing host file, non-fatal
+on absent machine files, respects `LEERIE_STATE_HOST_DIR`) via bash-harness
+subprocess tests with a stubbed `flyctl`. The expanded Step 4 contracts are
+covered by `tests/test_fetch_branch_leerie_streamback.py` (imports stub
+helpers from `test_fetch_branch_sh` to avoid duplication): the run's
+recorded capture (`captured-deps.json`, home with the run directory) is
+merged into the user's `.leerie/config.toml` and the Dockerfile streamed;
+a hand-edited config is merged with, not clobbered; an existing Dockerfile
+is never clobbered; non-fatal when nothing is there; a machine
+`config.toml` is not streamed; `LEERIE_STATE_HOST_DIR` takes the run
+directory and the Dockerfile while the capture still goes to the user's
+checkout (DESIGN §6½ *The host applies a capture*).
 
 The `leerie config` verb (all four sub-modes: `--init`, bare, `--chat`,
 `--recapture`) is tested in `tests/test_config_verb.py` via a
@@ -653,7 +677,14 @@ in `tests/test_group_launcher.py` via the same bash-harness pattern
 across two state dirs (combined paused/unpushed + pushed fixture, plus
 `stop` dispatch) is covered by `tests/test_group_launcher_verbs.py`.
 Fan-out core contract (cwd per member, `--inspect-dir` for siblings, brief
-prepend) is in `tests/test_group_launcher_fanout.py`. Python-layer
+prepend) is in `tests/test_group_launcher_fanout.py`.
+`TestGroupFanOut::test_only_this_groups_runs_are_tagged` puts another
+group's runs and standalone runs, all finished and newer, beside each
+member's own run, and asserts that only the runs the members started carry
+the group's id and appear in its `status` (DESIGN §6 *Which run the
+container ran*). Its stub writes `group_id` at run start, as a member's
+orchestrator does. With the old newest-finished scan put back, the
+standalone runs get the group's id and the test fails. Python-layer
 `group_id` in `run.json` (`_validate_run_json`, `_write_run_json`,
 `_derive_run_status`) is in `tests/test_group_run_json.py`. State-dir
 isolation (distinct basename-keyed dirs per member, guard rejects
@@ -1698,7 +1729,7 @@ flagged; the load-bearing round-0 snapshot test — a per-round HEAD misses
 a round-0 clobber while the pre-loop `impl_head_sha` catches it;
 empty-ref no-op), `_blob_sha`'s present/absent contract (missing-path
 returns None, guarding the bare `git rev-parse <ref>:<path>` footgun),
-`_rollback_conformer_commits` restoring clobbered content and dropping
+`_restore_tree` restoring clobbered content and dropping
 the conformer commit (`TestRollbackRestoresClobber`), and source-coupling
 guards that both `_run_conformance_phase` and `_run_final_conformance`
 snapshot before the round loop and call the guard under
@@ -1908,9 +1939,8 @@ remote-command stdout straight back, since `ec2_tar_pipe` itself is
 upload-only): a branch committed on the instance round-trips to the host as a
 fetchable bundle whose tip matches the instance-side tip; the run-state tar
 extracts under `LEERIE_STATE_HOST_DIR` (or `USER_REPO/.leerie` by default)
-and the `no_push` mechanism flag is stripped only on the branch-present path
-(preserved as intent on the cleared-but-empty terminal-state path, same
-conditional as `fetch-branch.sh`); `.leerie/config.toml` and
+and `run.json` (its `no_push` included) arrives unchanged, as from
+`fetch-branch.sh`; `.leerie/config.toml` and
 `.leerie/Dockerfile` stream back when the host has neither, are never
 clobbered when the host already has one, and are non-fatal when absent on the
 instance; and both `aws` and `ssh` appear in the transport log while `flyctl`
@@ -2110,12 +2140,41 @@ unchanged, the retry is bounded at exactly `max_rounds`, and a crash must
 clear `last_res` so a stale earlier result is never returned as the crashed
 round's output.
 
+## Unjudged integrator merge on resume
+
+DESIGN §6 *A committed resolution is not a judged one*:
+`tests/test_resume_unjudged_integration.py` drives the real `phase_execute`,
+`integrate_wave`, `setup-run.sh` / `new-worktree.sh` / `integrate.sh` and the
+real integration gate on a wave whose second subtask conflicts, with an
+integrator that commits a resolution dropping one side under its own message.
+The process is killed inside the integrator before and after its commit, and
+after each save until the verdict is recorded and the `integration_unjudged`
+marker cleared; every resume must judge the merge, repair the drop, give the
+merge its `leerie: integrate <sid>` subject, leave the clean sibling unjudged
+and advance the wave. Before the fix the kill after the commit and the kill
+after the first save in the window both resumed onto an unjudged merge
+("all 2 subtask(s) already settled, skipping"); removing the marker, the
+`integrate_wave` resume branch or the `phase_execute` shortcut exclusion each
+fails the suite again.
+
+## Wiring-gate repair on resume
+
+DESIGN §5 *A wiring re-check on the fully-merged plan*:
+`tests/test_wiring_gate_repair_resume.py` drives the real `_run_phases` and
+`phase_wiring_gate` (judge scripted to a repairable `missing_requires`) and
+kills after each save from the verdict's first appearance until the repaired
+`plan_snapshot` is on disk, plus once inside the re-schedule. Disk holds both
+or neither, and every resume reaches `phase_execute` with the repaired wave
+order. With the gate saving its own verdict the window is two saves, and the
+first resumed past the gate onto the unrepaired snapshot.
+
 ## Integrator-crash salvage path
 
-The integrator-crash salvage path (DESIGN §12 *salvage if there is something
+The integrator-crash salvage path (DESIGN §7 *salvage if there is something
 to salvage*) is tested in `tests/test_rescue_integrator_work.py` against real
 temp git repos left mid-merge. `_rescue_integrator_work` captures a crashed
-integrator's in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>`
+integrator's in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>/<n>`
+(a new ref per rescue, never overwritten: `tests/test_rescue_ref_unique.py`)
 before `git merge --abort` destroys it (verified: abort reverts a resolved
 file to its pre-merge content, leaving no stash and no reachable object). The
 load-bearing pin is `test_rescue_does_not_require_a_merge_commit`: the rescue
@@ -2137,8 +2196,12 @@ empty diff.
 
 **`scripts/remote/collect-subtrees.sh` embeds a second copy of
 `SCHEMAS["integrator"]`** as a single-quoted shell string, because it invokes
-`claude -p --json-schema` directly from bash on the remote machine and
-cannot import the orchestrator. **Any edit to that schema must update both.**
+`claude -p --json-schema` directly from bash on the remote machine. Its
+payload does load the orchestrator module baked into the image, but only
+through `scripts/worker-guard.py` for the worker guard (deny rules, notices,
+hook, env); the schema is not taken from it, and the duplicated base deny
+list is used only when that load fails. **Any edit to that schema must
+update both.**
 That same direct invocation also puts the script outside the
 `--dangerously-force-strict-output` path — it runs only after the
 orchestrator (which owns the proxy) has exited, so output there is
@@ -2588,15 +2651,11 @@ Before the local arm existed, `_auto_detect_run_runtime` left `_fin_runtime`
 empty, the `_already_synced` probe missed for want of `finished_at`, and the
 dispatch chain's bare `else` sent the run into the Fly path, where
 `require_flyctl` offered to *install flyctl* for a run that never touched
-Fly. The fixture sets `no_push` in `run.json` **and** passes `--no-push`, so
-`host_finalize` short-circuits at its own early gate
-(`scripts/host-finalize.sh:294`) — a return from *inside* `host_finalize`,
-which is what proves the launcher handed off, without the test needing a git
-remote or a rebaser worker. The CLI flag is load-bearing rather than
-belt-and-braces: without it the launcher reaches its mechanism-vs-intent
-block and STRIPS `no_push` from `run.json` whenever the run branch exists
-locally, so the gate would never fire and the test would run on into the
-rebase and push. The remaining cases pin
+Fly. `no_push` set in `run.json` alone makes `host_finalize` short-circuit at
+its own early gate — a return from *inside* `host_finalize`, which is what
+proves the launcher handed off, without the test needing a git remote or a
+rebaser worker. No `--no-push` is passed: the verb no longer strips the
+record (7de505e2), so the record alone is what the gate reads. The remaining cases pin
 `--runtime local` as accepted (it used to `exit 1`), `--force` refused with
 the local message rather than the EC2 one, a missing run branch failing
 closed on the branch rather than deeper in `host_finalize`, its positive
@@ -3486,7 +3545,7 @@ to appear exactly once and never at the start of a line in any test file.
 Converting N13's five named files fixed those instances but not the rule:
 three more reproductions were found afterwards, two already drifted —
 `tests/test_launcher_state_mount.py` reproduced the `nerdctl run` argv
-missing `--cidfile`, `--cgroupns=host`, `ROOTLESS_SECOPT`, the `LEERIE_*`
+missing `--cidfile`, `--cgroupns=host`, `SECOPT`, the `LEERIE_*`
 auto-forward and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`;
 `tests/test_launcher_runtime_knob.py` omitted `_RUNTIME_EXPLICIT` entirely —
 a flag set at six sites and read by the resume auto-detect (`leerie:4127`,
@@ -4128,8 +4187,8 @@ a crash or a repeat warning; the fingerprint never raises (a non-UTF-8
 directory listing, an undecodable porcelain escape, any unexpected
 error all give a value); a commit during planning is warned as becoming
 part of what the run builds on and pushes, a file edit is not; the
-baseline is untouched after a warning (it feeds
-`_acceptance_validity_base`); with the flag on, a HEAD move dies under the
+baseline is untouched after a warning (it feeds `_acceptance_own_start` and
+`_acceptance_report_base`); with the flag on, a HEAD move dies under the
 execute-wave call shape (through the real `_execute_check_porcelain_only`)
 that is silent by default, and both die framings name the way to continue
 past one's own changes (resume without the flag). Plus
@@ -4405,53 +4464,21 @@ cited path absent from the phase's own diff;
 `test_zero_commit_fixed_claim_is_neutralized` — fixed:true with zero
 phase commits; and the positive control
 `test_committed_cited_repair_is_not_neutralized`, proving a real
-committed repair still clears), and the
-uncommitted-tests-path check via the full `-z -uall` porcelain parse
-(`test_uncommitted_tests_entry_neutralizes_repair`,
-`test_uncommitted_tests_file_in_new_directory_is_caught`, the
-parametrized `test_porcelain_evasion_shapes_are_caught` over
-space/non-ASCII/staged-rename paths,
-`test_worktree_rename_origin_desync_does_not_swallow_records` — the
-two-sided ` R` record walk whose one-sided mutant survived every other
-test in the targeted battery — `test_noncanonical_cited_path_is_still_caught` over
-`./`-prefixed, absolute, trailing-space and tab-prefixed citations
-(the validator strips and resolves; exact-string matching missed
-each), `test_directory_citation_does_not_mask_uncommitted_tests`
-over dir / dir-slash / `.` citations — ancestor-prefix matching,
-because the validator checks existence, never file-ness — and
-`test_partially_committed_directory_citation_is_caught`, the one input
-where the porcelain arm is the SOLE catcher: one file under the cited
-directory committed, a second left uncommitted, so the
-committed-by-this-pass arm sees the directory in the phase diff and
-passes it), `test_staged_rename_origin_under_cited_directory_is_caught`
-(a staged `git mv` out of the cited directory: the rename ORIGIN is the
-only evidence, which no destination-matching pin exercises), the
-`one-char` evasion case (a 1-character path, the record walk's minimum
-length) and a `..` citation spelling (only `.resolve()` folds it). Every
-porcelain pin asserts the porcelain arm's OWN warning
-(`_assert_porcelain_arm_fired`, or the equivalent inline check in
-`test_uncommitted_tests_entry_neutralizes_repair`), not just the flag:
-the committed-by-this-pass arm also flags any wholly-uncommitted
-citation, and with flag-only assertions 5 of 7 porcelain mutants
-(ancestor clause, canonicalization, `.strip()`, one-sided rename parse,
-`-uall`) survived every test in `test_run_conformance_phase.py` and
-`test_risk_register.py` after S-6 (#274) merged, at that two-file
-scope. Three NEGATIVE pins with a dirty worktree guard the other
-direction, where a loosened check discards a real repair:
-`test_sibling_prefix_path_not_flagged` (a string-prefix sibling,
-`tests_new_scratch.txt` beside a cited `tests_new`),
-`test_rename_origin_is_not_reread_as_a_record` (a staged rename's
-origin field must be consumed; re-reading `xx_tests/test.py` as a
-record yields the junk path `tests/test.py`, which matches a cited
-`tests`), and `test_trailing_space_sibling_not_flagged` (record paths
-are compared verbatim; `test_x.py ` is not the cited `test_x.py`).
-Against a combined set of 20 porcelain mutants (the 7 above plus 13
-built independently by a reviewer), all 20 are killed at the same
-two-file scope. The clause-specific mutants are each killed by the pin
-named for their clause. The four that change the record walk's
-structure (record offset, walk start, early break, and a warning
-emitted without setting the flag) are killed by several pins, none
-named for them.
+committed repair still clears), and the clean-tree gate (I1, DESIGN
+§8 *A worker leaves its tree clean*): a round left dirty past its re-asks
+is rolled back and neutralized
+(`test_conformer_left_dirty_is_rolled_back_and_recorded`), one committed
+on the re-ask keeps its repair
+(`test_conformer_reasked_commits_and_its_repair_counts`), and the cited
+path is canonicalized before it meets the phase's diff
+(`test_noncanonical_spelling_of_a_committed_repair_counts`). The I1 gate
+replaced the uncommitted-tests-path check that parsed `-z -uall`
+porcelain; its pins (the porcelain-evasion, directory-citation,
+rename-origin and sibling cases, 15 collected cases) were deleted with it,
+since a tree the gate passed has no uncommitted path to cite, and its
+canonicalization pin was rewritten onto the phase-diff match. The gate itself, at every
+worker site, is pinned in `tests/test_clean_tree_gate.py` and beside the
+implementer, conformer and final-conformer harnesses.
 
 **The PR composition renderers** (two live paths plus `compose_pr_body`,
 the never-invoked canonical reference the bash fallback mirrors):
@@ -4469,11 +4496,30 @@ tracked per fence line, so an inline ``` in prose does not flip it and
 the section END equally fence-aware so a fenced `## ` line inside the
 section is not a boundary (`test_strip_section_end_is_fence_aware`),
 and the U+FE0F variation-selector heading still matched), and
-`tests/test_host_finalize_sh.py` (the bash fallback's jq renderer
-byte-matches `_format_risk_register_section` on the same state —
-including the blocked-sid and `accepted_blocked` filters — with the
-expectation computed from the Python renderer, so the two cannot drift
-independently of the test).
+`tests/test_host_finalize_sh.py` (the bash fallback appends run.json's
+`pr_end_state` as-is and never re-renders state itself — the jq mirror of
+the retired risk dump is gone, so there is no second renderer to drift).
+
+**The PR's end-state section** (DESIGN §6 *The PR's end-state section is
+rendered by code, from typed state*), in `tests/test_pr_end_state.py`: the
+renderer executed on a state carrying every source, asserting each rendered
+line and the order of the six headings; integration content loss under its
+own heading, not as a worker risk; caps on the advisory lists; entry text
+that cannot open a heading; malformed state rendering nothing; and the strip
+of a worker-emitted copy of every code-owned heading, whole-line anchored.
+`tests/test_finalize_execution.py::test_phase_finalize_writes_the_end_state_after_the_outcome`
+pins that `pr_end_state` is rendered after `_decide_outcome`.
+
+**The coverage re-drive** (DESIGN §9 *Changed lines no test executes are
+re-driven*), in `tests/test_coverage_redrive.py`: real git worktrees and a
+stand-in `node_modules/.bin/vitest` that speaks vitest's JSON reporter and
+the v8 `coverage-final.json`, so the detector (pass-only counting, the
+importing-test settle with mocks excluded, helper modules excluded), the
+threshold, both re-drive rounds with round 2's "NOT ADDRESSED" line, the
+spent-budget `untested` listing, the rollback of a re-drive that does not
+complete, the resume skip and the typed-gap settles (`test_missing` by an
+importing test, `typecheck` only for a file in `tsc --listFiles`) run
+unmodified.
 
 **The gating robustness kinds**, in `tests/test_solution_defects.py`:
 `external_contract_assumption` / `unrevalidated_precondition` pass the
@@ -4590,10 +4636,10 @@ stubbed, and the stubs write files the way the workers would.
   user's checkout stays clean. The writer is shown the defect contract, the
   inline examples and the referenced report, at `medium` effort, as an acting
   worker.
-- **Skips** (audit not applicable, `--skip-acceptance-check`) are recorded with
-  their reason.
-- **Validity base**: the earliest same-task sibling's starting HEAD; a
-  different task is ignored.
+- **Skips** (no `bug-fixing` category, `--skip-acceptance-check`) are recorded
+  with their reason.
+- **Report base** (informational, never a filter): the earliest same-task
+  sibling's starting HEAD; a different task is ignored.
 - **Evaluation** never overwrites, or runs in place of, a file the run itself
   put at the same path, and removes what it copied.
 - **Repair**: one fixing round at `EFFORT_ACCEPTANCE_REPAIR == "high"`, its
@@ -4670,7 +4716,9 @@ tests; see below.)
   2026-10-06 an unacted dispute is re-raised once —
   `test_a_second_failing_run_accepts_no_work`
   asserts the carried-forward marker; `test_a_third_run_still_does_not_dispute`).
-- **Ties are not a passing majority** (`test_majority_rule`).
+- **Ties are not a passing majority** — superseded by the any-failing rule
+  (`_acceptance_any_fails`; `test_majority_rule` was rewritten as
+  `test_any_failing_set_fails`).
 - **No residue** — superseded in round 4: evaluation no longer writes the
   target tree at all (`test_evaluation_never_touches_the_tree_and_never_overwrites`).
 - **Markup check precision** (`test_ordinary_markup_named_like_a_schema_field_is_not_a_hit`):
@@ -4712,8 +4760,9 @@ that coincidence.
   evaluation worktree — `test_evaluation_installs_deps_before_running`).
 - **Created directories** — a round-1 behaviour first pinned in round 2, removed
   in round 4 with in-tree evaluation (a disposable worktree makes it moot).
-- **Validity base** skips an undated sibling
-  (`test_validity_base_prefers_the_earliest_same_task_sibling`).
+- **Validity base** skips an undated sibling — now the informational
+  report base (`_acceptance_report_base`; the validity tree is the run's own
+  start), pinned by `test_report_base_prefers_the_earliest_same_task_sibling`.
 - **No claim of hidden tests that do not exist**
   (`test_no_hidden_sets_means_no_claim_of_hidden_tests`).
 - **Counts over measured sets only** (`test_residual_counts_only_measured_sets`,
@@ -5498,3 +5547,1183 @@ platform (no apostrophe in a heredoc body nested in `$(`, with an anti-vacuity
 floor on how many such heredocs it finds) and `/bin/bash -n leerie`, which runs
 only where `/bin/bash` is 3.2 and skips on CI. Two of its three tests fail
 against the previous launcher on a Mac; only the static scan is visible to CI.
+
+## B\* verdicts, the shared re-drive budget and the run outcome
+
+`tests/test_bstar_confirm.py` covers B\* (DESIGN §9 *Which failures are
+new*): the host PSI reader and gate (the gate is pinned to
+`/proc/pressure/cpu`, paired with a test that the default reader is the one
+called), the per-ID verdict (interleaved base-first pairs, a flake or a
+base failing on some reruns is `resource_affected`, a base failing every
+rerun is `pre_existing`, a gate timeout or an unreadable PSI file
+escalates to 5 pairs, the budget cuts pairs short), the report parser,
+and end-to-end runs against a real pytest suite in a real git repo (the
+`e3_repo` fixture) — among them one real regression confirmed new while an
+alternating flake is typed `resource_affected`. One of them executes
+`_run_final_conformance` (`test_final_loop_continues_only_on_a_confirmed_new_failure`): with
+the `tests` axis red on every round, the loop stops after one round when no
+ID is confirmed new, and spends every round when one is.
+
+Review round 6 H1 (a budget shortfall is unsettled, not `new`): the same
+file pins that a candidate with no finished base/final pair is
+`budget_short_unsettled` (`test_a_rerun_ending_past_the_budget_with_no_verdict_is_not_a_run`,
+rewritten from the zero-rerun `new` it used to pin), that a discovery find
+is never new on a shortfall, that `confirm_budget_sec = 0` runs no gate and
+no rerun, `_confirm_select`'s ranking and sizing, both empty-base-list
+callers of the final diff (a scoped command, unknown baseline IDs — review
+round 6 D-H3), a file sized out of the final diff, and the as-written retry
+bounded by what is left (review round 6 C1).
+`tests/test_bstar_one_off_flake_budget.py` is the reviewer's end-to-end
+driver turned regression test: a one-off flake in a file too slow for one
+pair ends `done` with a "could not confirm within the budget" entry in the
+PR's "Needs human verification", and with a budget that fits the pairs it
+is `resource_affected` with no entry. `tests/test_ci_parity.py` pins the
+CI side (a slow red check is unsettled, a long check is sized out so it
+cannot starve a short one), `tests/test_integration_repair_loop.py` that an
+unsettled merged-tree failure is never a `test_failure`, and
+`tests/test_delivery_ratchet.py` that an unsettled re-drive candidate
+leaves the execution items unchecked, never a rollback.
+
+`tests/test_redrive_test_id_diff_refresh.py` (review round 6, the stale
+row after a re-drive, driven and fixed): on a real pytest suite a test
+confirmed new at detection and then fixed by a re-drive group is measured
+again on the shipping tree (`_redrive_refresh_test_id_diff`), so the row
+reads met and the run `done`; when the tree cannot be measured the diff is
+marked `stale_for_tree` — its `new` still counts, named as of an earlier
+tree, and with none the row reads unknown, never met. A third test pins
+that the re-drive's end-of-pass block refreshes before re-checking items.
+
+`tests/test_acceptance_held_case_intermittent.py::test_a_vote_file_seen_failing_only_by_a_timeout_is_unsettled_not_failing`
+(review round 6, driven and fixed): a held-out vote file whose first run
+timed out and whose every rerun the budget cut is unsettled and the set
+unmeasured, not failing; the assertion-failing control beside it stays
+failing under the same cut.
+
+`tests/test_acceptance_unmeasured_pr.py` (review round 7 M3, driven and
+fixed; DESIGN §8 *A held-out set the final tree leaves unmeasured is never
+silent*): every cause an evaluation can end a held-out set unmeasured —
+a first-run timeout / signal death with every rerun cut, no rerun verdict,
+reruns that disagree, no runner verdict, a path already in the tree,
+placement, commit, worktree, dependency install and evaluation failures —
+records its code on the result and reaches the PR under "Needs human
+verification" with the outcome still `done`; so do valid sets with no
+final verdict and a re-measure of the shipping commit that measured
+nothing (`final_unremeasured`). Broken and variant sets are not listed; a
+measured set records no code. A derivation guard checks the
+`ACCEPTANCE_UNMEASURED_WHY` vocabulary both ways, and a real hanging
+pytest file pins `timed_out`. The reviewer's driver itself is
+`tests/test_acceptance_held_case_intermittent.py::test_a_timeout_only_vote_file_is_named_in_the_pr`.
+
+`tests/test_redrive_budget.py` drives `phase_execute` (DESIGN §13 *One
+re-drive budget per subtask*): a blocked subtask is re-driven with its
+blocker as the note and at most `subtask_redrive_rounds` times, then settled
+`unconverged`; a `failed` one is never re-driven; a spent run budget or a
+counter already consumed stops every re-drive; dependents of an unconverged
+subtask settle without running; and the resume filter skips
+`unconverged`/`accepted_external`. The default auto-accept test in
+`tests/test_phase_execute_wave_flow.py` was rewritten to the unconverged
+settle.
+
+`tests/test_decide_outcome.py` covers `_decide_outcome` (each unfinished-work
+signal unconverges a run with or without commits — the ordering the P7
+decider requires — an AST pin that it is the only writer of `outcome`, the
+empty-branch `_finish_no_work_run` exit, and an execution of
+`phase_finalize` recording the outcome in `run.json`).
+`tests/test_host_finalize_sh.py` pins `--draft` on `unconverged` only.
+
+## Settle by execution, spawn-held enrollment and measured sizing
+
+`tests/test_settle_by_execution.py` drives the real `_settle_by_execution`
+(DESIGN §8 *Settled by execution*) in a real git worktree with real child
+processes, the broker and the pressure gate stubbed: the
+`verification_only` truth table (one argv-less criterion refuses the label),
+a bracketed path reaching the command as a literal argument (paired with a
+`bash -c` control that glob-expands it), a failure re-checked
+`confirm_pairs` times (escalated on a gate timeout), a flaky failure passing
+as `resource_affected`, a command that rewrites a tracked file failing and
+being reverted, a dirty worktree never run over, a cgroup kill at the
+measured ceiling typed `environment_limit` without a re-check (an ordinary
+failure below it), only build/test argvs taking a build slot, and the
+re-drive blocker fencing output as data. The `_settle_subtask` arms are
+executed in `tests/test_settle_subtask_branch_coverage.py` (verification-only
+no-commits settles by execution; a failing execution or a
+non-verification-only claim is `blocked` for the shared budget, the HEAD
+probe never asked) and `tests/test_declared_commands_executed.py` (the
+`empty_handoff` rescue settles by execution once, or is blocked — the
+warning-only settle was rewritten). The wiring guards in
+`tests/test_mid_run_satisfied_no_commits.py` were rewritten to the new
+placement: the HEAD probe survives only before the implementer.
+
+`tests/test_spawn_held_enrollment.py` spawns real processes through
+`_run_streaming`: at the moment the broker would enroll, after a pause long
+enough for an unheld child to have finished, the command has not run; the
+enrolled pid is the command's own; an interrupted enroll never runs it; the
+gate refuses anything but the release byte. `_invoke` is executed with the
+spawn mocked: create, spawn (the worker argv behind the gate, its read end in
+`pass_fds`), enroll, release — in that order — and a failed spawn destroys the
+pre-created cgroup. An AST-level guard pins `_invoke` and `_run_streaming` as
+the only enrollment sites.
+
+`tests/test_build_peak_sizing.py` covers F1 sizing: the benched funeralworks
+peak (17.81 GiB / 2852 PIDs) yields the benched 22.56 GiB / 4278-PID caps;
+caps only rise; the slot count floors at one; slots are shared through the
+host directory, a slot held by another process makes the acquirer wait until
+that process is killed, a read-only slot file still locks; only the build and
+tests axes take a slot; the baseline measures every axis uncapped and raises
+the caps, and a resumed baseline re-applies without re-measuring; and the
+environment-limit retry-then-unconverged. Its rootless-shape test (an
+`unshare --user --map-user` child locking a slot in the outer user's
+directory) skips where unprivileged user namespaces are disabled.
+`tests/test_host_dir_ownership.py` pins the `.host` mount: the launcher
+creates and mounts it after the `LEERIE_*` forward, and the real rootful
+guard, executed with `chown` faked, chowns `/leerie-host` (the directory
+only) under rootful and nothing under rootless. `tests/test_cgroup_broker.py`
+and `tests/test_broker_wire_contract.py` cover the broker's `peak` verb and
+its parse in `_cgroup_peak`.
+
+## Held-out sets at own start, every failing set repaired, scoped runners
+
+`tests/test_acceptance_own_start.py` (DESIGN §8 *The validity tree is the
+run's own start*, *Written whenever the defect-scope audit ran*, *A set typed
+broken is not handed on*, *Scoped runners for every runner leerie can read*;
+§5 *`applicable: false` is honoured only when three samples agree*) runs the
+real writer/validation/evaluation code against real git repos and a real
+pytest command, `claude_p` stubbed and the host PSI pinned quiet:
+
+- **A1.** Sets are written and validated at the run's own start while an
+  earlier same-task run started on an older tree (the writer's HEAD is the
+  own start; `report_reproduced` is True there, False where the older base
+  passes); the writer's clone has no ref, no remote and cannot reach an
+  earlier run's fix, and a failed clone falls back to a worktree, logged.
+  Per case: one failing case among passing ones keeps a defect file (its
+  failing IDs recorded), and a session hook forcing exit 1 with every case
+  passing no longer discards a control.
+- **A2.** One failing set of three fails (`_acceptance_any_fails`, which
+  replaced the majority rule — its tests in `test_acceptance_gate.py` and
+  `test_acceptance_no_work.py` were rewritten, including a passing-majority
+  settle that now disputes); a set that fails once and then passes its B*
+  reruns is `resource_affected` and no evidence, a consistent failure is
+  confirmed; `_confirm_still_failing` needs every rerun (with `seen_failing`,
+every finished one, unless the candidate is in `needs_rerun` and none
+finished) and escalates on a
+  gate timeout; HEAD at the validity base is answered without running the
+  sets; a set typed broken leaves the next run's residual (all broken: no
+  residual), and a residual without set indices is kept.
+- **A4.** `_infer_scoped_test_template` over bare pytest/rspec/minitest/go/
+  cargo commands and the typed `no_scoped_runner` reasons for everything
+  else; `{test_packages}`/`{test_targets}` rendering and their absence rule;
+  pytest inferred by `resolve_blt_scoped` (the `test_scoped_axes.py`
+  "infers nothing" test was rewritten); the go `-run` selector and report
+  request; cargo's `RUSTC_BOOTSTRAP`; rspec and minitest report requests
+  (the plugin written); per-case statuses from the real C9 bench reports of
+  every runner (`tests/fixtures/runner_reports/`); a go package that never
+  built is a load error; B*'s JUnit IDs keep their shape.
+- **N1-L.** Sets are written when the audit said not applicable (no contract
+  in the payload), none when no audit ran; no scoped runner is a loud typed
+  skip; `applicable: false` needs three agreeing samples, a crashed sample
+  being no vote.
+
+## N3: wiring fan-in, the integration repair loop and overlap prevention
+
+`tests/test_wiring_fanin_fallback.py` covers `_fanin_and_fallback` through
+`_repair_missing_requires` (DESIGN §5 *What is left after that is ordered,
+not refused*): providers in two clusters get a fan-in `requires` and
+`_schedule` then orders the subtask behind both; a descendant provider is
+skipped by the `depends_on` fallback with the graph still acyclic; every
+provider a descendant, nothing providing the value, and `missing_provides`
+are typed warnings; and `phase_wiring_gate` persists the warnings and dies
+only on a sid not in the plan. The channel tests in
+`tests/test_wiring_gate_repair.py` (each "declines" case and the
+already-ordered re-check) now target `_repair_wiring_channels`, the stage they
+pin; the gate-level die tests there and in `tests/test_phase_wiring_gate.py`
+were rewritten to the warning, keeping a die on an unknown sid so the
+severity pins still have a gate to observe.
+
+`tests/test_integration_repair_loop.py` executes `_run_integration_judge_gate`
+against a real two-parent merge in a real git staging tree, only `claude_p` and
+the conflicted-area test run stubbed (DESIGN §6 *When integration cannot
+succeed*): a clean verdict keeps the merge; a finding is repaired in the order
+judge → integrator → re-judge, the re-judge reviewing a synthetic merge of the
+repaired tree over both parents, drawing one round from `redrive_rounds`; an
+`intent_conflict`, a spent shared budget, a `design-conflict` during repair and
+exhausted rounds each reset staging to the merge's first parent and settle the
+subtask `unconverged`; a round with no new commit is reset and spent; a
+confirmed test failure blocks the pass and reaches the next round typed, with
+the stale list; residual content loss is recorded unless a `superseded`
+entry's `by_line` is at HEAD. `_integration_dropped_lines` is run on real
+diffs (S3: a conflict-hunk drop stays listed), `_conflicted_area_tests` on a
+real repo (one-hop importers), and `_integration_test_failures` with the
+runner stubbed per tree (a parent failure is no candidate; a B\*-unconfirmed
+candidate is no failure; routing by the overlay). The detect-and-die tests in
+`tests/test_integrate_wave_judge_gate.py` were rewritten on a real merge: the
+wave continues past a backed-out subtask, the verdict is on disk before the
+repair integrator spawns, and a resume re-enters the loop without
+`integrate.sh`. `tests/test_integration_judge_coverage.py`'s source pins
+follow the filters into `_integration_defect_records` /
+`_integration_judge_verdict`.
+
+`tests/test_schedule_overlap.py` covers `_serialize_planned_overlap` through
+`_schedule` (split, cap 0, the cap counted over the whole plan, largest overlap
+first, predecessor order kept, `./` normalised, both `_run_phases` call sites
+passing the cap). `tests/test_json_key_merge.py` covers `_json_key_merge3` and
+`_try_json_key_merge` on real git conflicts: an i18n conflict is committed as
+the merge with both sides' keys and the file's formatting; a key conflict or a
+non-JSON file in the conflict leaves the merge exactly as git left it.
+
+**The AST-script tests run on CI, not only where `typescript` happens to
+resolve.** `scripts/test-case-facts.cjs` (the falsifier's coupling facts,
+`tests/test_delivery_detection.py`) and `scripts/redrive-ast-gate.cjs` (the
+delivery re-drive's escalation gate, `tests/test_delivery_redrive.py`) load
+`typescript` from the tree they run in (else from the image's bundled copy,
+which a host test run does not have), so both skip on a host where node cannot
+resolve it — which was every CI run.
+`.github/workflows/test.yml` now installs a pinned `typescript` under
+`$RUNNER_TEMP` and exports `LEERIE_TEST_TYPESCRIPT_DIR`. A set
+`LEERIE_TEST_TYPESCRIPT_DIR` is binding: the tests use it as given, so a
+broken install fails them instead of skipping them, and
+`test_ci_provisions_the_typescript_the_ast_tests_need` fails on CI
+(`GITHUB_ACTIONS=true`) when the variable is unset or names nothing node can
+load. To run them locally: `npm install --no-save --prefix <dir> typescript`
+and point the variable at `<dir>/node_modules/typescript`.
+
+**A TypeScript 7 tree parses with the bundled compiler.** The native port's
+`typescript` package resolves but exports a version string only, so the AST
+scripts used to crash on `ts.ScriptTarget` and every falsifier sample on such
+a repo read as rejected. `scripts/load-typescript.cjs` loads the tree's own
+copy only when `typeof ts.createSourceFile === 'function'`, else the pinned
+copy at `BUNDLED_TYPESCRIPT`. `tests/test_delivery_detection.py` builds a fake
+TS7-shaped package (`_ts7_tree`): without a bundle `_ts_resolvable` is False
+and `_probe_case_facts_placed` (the probe placed in a held-out sandbox)
+returns `facts_failed`; with `BUNDLED_TYPESCRIPT`
+pointed at the test's typescript the loader reports `bundled` and the facts
+come out; `tests/test_delivery_redrive.py::TestAstGate::test_ts7_tree_runs_on_the_bundled_typescript`
+does the same for gate (d+). `TestFalsifierGates::test_a_facts_script_failure_is_its_own_gate_not_a_rejection`
+pins `facts_read: false` with no `assertion_in_case` / `not_coupled`, and
+`test_the_image_ships_the_bundled_typescript_where_leerie_looks` pins the
+Dockerfile's extraction path to the constant.
+
+## I3: a held-out set never enters a tree a worker commits from
+
+`tests/test_redrive_selfcheck_out_of_tree.py` (DESIGN §8 *A held-out set
+never enters a tree a worker commits from*) runs the real self-check
+command (`bin/leerie-selfcheck` → `scripts/selfcheck.py` →
+`selfcheck_main`) with real pytest on a repository whose state root sits
+inside it: the verdict follows the worker's uncommitted edit, the ignored
+helper package is shared, a set file under an ignored directory is placed
+in a real directory of the copy (never through the link into the worker's
+tree), git run by a test finds no enclosing repository, a subset by file
+name and a `-t` filter run, a set path the tree already has is refused
+(exit 3), and no set file or byte is left in the worker's tree. A whole
+`_run_delivery_redrive`, its implementer stubbed to put a copy of the shown
+set in its tree and run the command, leaves no byte of a shown or held-back
+set in `git cat-file --batch-all-objects`. Thirteen tests in all: the
+real-command test, nine argument cases (path, file name, unique path
+suffix, an ambiguous name, pass-through), a SIGTERM mid-run that still
+deletes the copy, the object-store test, and a dash-led file name the
+copy's `tar` reads as a file, never an option. Live-falsified six ways, each
+failing a test: sharing a set file's ignored parent, dropping
+`GIT_CEILING_DIRECTORIES`, snapshotting through a temporary index (`add
+-A`), removing the signal handlers, selecting by file name only (no
+suffix), and killing only the runner instead of its process group.
+`tests/test_heldout_bytes_never_reach_history.py` keeps the anti-cheat
+history check (spans of the shown sets' source in any commit void a
+group); its staging and unstage tests went with the staging.
+
+## A worker that does not commit never runs in a tree leerie measures
+
+`tests/test_pr_review_runs_outside_staging.py` (DESIGN §8, review round 15
+M1): the reviewer's driver (`test_zz_r15e_pr_review_leftover_dies.py`)
+inverted — the real `_run_pr_review` with a worker that leaves a file in a
+read-only directory, a dangling symlink or a nested repository, then the
+real `_run_final_conformance`, which now runs its conformer instead of
+`die()`ing; the reviewer reads staging's installed dependency through
+`_judge_checkout(share_ignored=True)`; `_ci_discover` and
+`_integration_judge_verdict` run in their own checkouts. Tests that fake
+git with a made-up commit use `tests.conftest.judge_checkout_in_place`.
+`tests/test_payload_only_workers.py` (7 tests) drives `capture_repo_deps` and
+`_compose_pr_via_llm` through the real `claude_p` (`_invoke` stubbed) and
+reads the argv and cwd: an empty `<run_dir>/payload-only/`, `--allowedTools
+Read`, never the repo root, with and without `dangerously_skip_permissions`.
+It covers the post-run skills too: `_judge_capture` and `_request_patch`
+run payload-only the same way, and `_replay_capture` reads a ref-less
+`--shared` clone of its repository at HEAD (`_ref_less_clone`) — HEAD's
+files only, removed with the replay's temporary directory — never the
+checkout, whose uncommitted file stays untouched.
+
+## A host that cannot build the sandbox runs the suite green
+
+`main()` runs `_require_confinement` on every entry, and a host that
+restricts unprivileged user namespaces (a developer host, CI's
+ubuntu-latest) cannot build the sandbox it requires. `tests/conftest.py`'s
+autouse `_no_real_heldout_sandbox` stubs `_require_heldout_sandbox` in the
+pytest process and, through `tests/no_real_heldout_sandbox_site/sitecustomize.py`
+first on `PYTHONPATH`, in every Python child a test starts (the 15
+real-`main()` children of `tests/test_credentials_never_outlive_the_run.py`
+were red without it). `tests/test_no_real_heldout_sandbox_site.py` (2
+tests): a child's entry (`_require_confinement`) passes on such a host, and a
+`real_heldout_sandbox` test's child keeps the real gate. Falsified: with the
+`PYTHONPATH` entry dropped, those 15 and the first test are red.
+
+## A worker cannot change another worker's environment
+
+`tests/test_worker_config_isolation.py` (6 tests, DESIGN §6 *Each worker's
+own configuration and temporary directories*) drives the real `claude_p`
+and `_invoke` against a stub `claude` that acts as the CLI does where it
+matters: no credentials in its configuration directory means no session,
+it runs the `SessionStart` hooks that directory's `settings.json` names,
+it writes its transcript under `projects/`, and it resolves its temporary
+directory as Node's `os.tmpdir()` does (`TMPDIR`, else `/tmp`). A hook one
+worker plants never runs in the next; both read the operator's credentials
+and settings from their own copies of the run's template, which leaves out
+per-session state; the template's directories reach each worker as links
+to one read-only copy, which a worker cannot write; each worker has its
+own `TMPDIR`, gone once the call returns; a `--resume` runs in the
+directories that hold its session; and `_remove_worker_dirs`
+removes them all and the template. Falsified, each turning a test red: one
+shared `<wid>`, `CLAUDE_CONFIG_DIR` or `TMPDIR` left unset, the resume
+lookup bypassed, the `tmp` removal dropped, an empty `_CLAUDE_CONFIG_SKIP`,
+directories copied instead of linked, the template left writable, and the
+template kept at finalize.
+
+`tests/test_confined_cli_env.py` (7 tests, DESIGN §6 *Every confined CLI is
+given its own directories, by one builder*; review round 22 exec H2). The
+rule: every function that derives a CLI's grant or builds its argv
+(`_worker_grants`, `_contained_claude_argv`, in `leerie.py` and
+`scripts/*.py`) calls `_confined_cli_env`, and `_worker_dirs` has no other
+caller. The behaviour, after `_use_run_tmp` and with `CLAUDE_CODE_TMPDIR`
+inherited from the orchestrator: preflight's smoke test and a `claude_p`
+worker, each through the real `_invoke` and the Landlock shim against a stub
+`claude` that makes `$TMPDIR/claude-<uid>` first as the CLI does, and the
+Fly integrator's environment and shim argv as `worker-guard.py` prints them,
+each give their CLI no path in the state root outside its grant and every
+`_WORKER_ENV_DIRS` variable inside what it writes; `worker-guard.py`
+without a `<wid>` refuses to confine. Falsified, each turning tests red: the
+smoke test's environment dropped (the stub's `mkdir` fails as in the
+finding), `claude_p`'s old hand-built four variables, and the old
+`worker-guard.py`. A real smoke test (`claude` 2.1.316 in `leerie:r22`,
+rootless, `apparmor=leerie-container`) passed with the fix and died with the
+finding's EROFS without it.
+
+## The CLI's own git, transcripts apart, and a run that died (review round 22)
+
+`tests/test_clis_own_git_is_leeries.py` (10 tests, DESIGN §6 *The CLI's own
+git runs on leerie's terms*; review round 22 isolation H1). A stand-in CLI
+runs `git` by name from its `PATH` at session start, as the real one does;
+the shim, grants, `worker-shell.py`, `scripts/cli-git.py`, `_invoke`, the
+settings and `.git` pointer restore (`_ready_tree_for_worker`), `_tree_dirt`
+and the transcript readers are real. A clean filter the last worker planted
+never runs for the next worker's CLI; a filter a worker defines for its own
+CLI runs nested, so it cannot reach the CLI's stream; `_cli_git_env` names
+leerie's repository; the shim passes a worker's own git through and fails
+closed; a `.git` rewritten mid-session is not followed; and the Fly
+integrator's CLI (`collect-subtrees.sh` → `worker-guard.py`) gets the same.
+Since review round 23: no settings layer below leerie's steers the CLI's git
+(`test_no_settings_layer_below_leeries_steers_the_clis_git`, composed and
+uncomposed: an operator's or a repository's settings `env.PATH`, prefix or
+`LEERIE_*` variable still goes through `scripts/cli-bin`), and `_invoke`'s
+pin lays leerie's values over the settings env
+(`test_the_pin_lays_leeries_values_over_the_settings_env`).
+
+`tests/test_transcripts_apart_from_command_logs.py` (5 tests, DESIGN §8
+*What a worker ran is read from its own transcript*; review round 22 H4).
+The acceptance writer's transcript and its set's validation log were one
+file. Now every worker's transcript is in its log directory's
+`transcripts/` (`_worker_log_path`, `_transcripts_dir`), and a command log
+of the same name is another file; nothing but the transcript functions names
+that directory; `_run_streaming` refuses any path in it, registered or not;
+and `_write_acceptance_set`, through the real `claude_p` → `_invoke`,
+validates its set beside its writer's transcript. Fixtures that hand-write a
+transcript use `tests.conftest.transcript_path` and
+`register_worker_transcript` — `tests/test_final_diff_measured_once.py`'s
+two among them since review round 23 C6, which made its Bash-versus-Write
+parametrization able to tell the two apart (falsified: a clean-tree check
+that counts only files a `Write` named fails the `Bash` case alone; with
+the old unregistered `logs/<sid>.log` both cases failed alike).
+
+`tests/test_main_exception_arms.py::TestListShowsADeath` (4 tests, DESIGN
+§6 *A run that died says so*) drives the real `main()` and reads `leerie
+list`'s status and `run.json`'s `failed_at`: a `die()` lists `failed` with
+`finished_at` and `failed_at` both set; a worker error and an unhandled
+exception list `failed`; a pause, an interrupt, a clarification exit and a
+clean exit record nothing; and a resume that ends cleanly clears the last
+invocation's `failed_at`.
+`TestEveryExitOfTheRunIsSeen` (4 tests, review round 23 C1): by rule,
+`_record_run_died` has one caller, `_records_the_run_death`, which
+decorates `main()`; the arm (`_own_the_run_death_record`) follows the
+`State`'s acquisition with only the layout refusal between, disarmed for
+`--phase` and for a `resume` of a run `_run_has_nothing_left` calls
+complete; and no `sys.exit`/`os._exit` follows the arm, so a pause is
+returned rather than raised. By execution, the reviewer's proof inverted: a
+resume that `die()`s at the confinement entry, or in a resolver before the
+`try:` around `_orchestrate`, lists `failed` and is not auto-picked, and an
+interrupt at the entry records nothing. Falsified: the arm moved below
+`_require_confinement` turns the rule and the entry case red; a pause
+`sys.exit`ed again turns the rule and the pause case red.
+`TestACompletedRunStaysCompleted` (3 tests, review round 24 L1, real
+`main()` and a real resolver): a finished run's no-op resume dying in a
+resolver stays `done` with no `failed_at`; a run with work left lists
+`failed` after the same death; a died finalize is work left.
+
+## Run choices on resume, and a phase-1 death resumes (review round 23)
+
+`tests/test_run_choices_on_resume.py` (34 tests, DESIGN §6 *A resumed run
+continues under the choices it was started with*; review round 23 exec, run
+A′). Real `main()` runs a fresh run (`--no-push`, a cap, a per-worker model
+and effort, a skip flag, `--source-of-truth`) through the real `_run_phases`
+seed, then `resume` with an env that disagrees with every recorded choice:
+the resume runs under the recorded values; a flag on the resume overrides
+one cap and leaves the others, and is recorded in `run_choice_overrides`;
+`--model` on a resume gives every model, `judge`/`heal`/`pr_writer`/
+`dep_capture` included, the flag's value even with each worker's own
+`LEERIE_MODEL_*` env set otherwise (review round 24 F2); `--push` overrides
+a recorded `no_push` and `--no-push` wins over it; a run recorded before
+`no_push` falls back to `run.json.no_push`. Host side (jq-gated): the real
+`host_finalize` does not push a `--no-push` run resumed with no flag, and
+a `--push` control does. The launcher's real `NO_PUSH` block, sliced from
+`leerie`: the record wins over the ambient env, `--push`/`--no-push`
+override, a fresh run ignores a record, no record falls back to env. The
+pure `_continue_run_choices`. Rule tests: every orchestrator option is in
+exactly one of the three classes; every §2½ flag and knob has a row; the
+spec's sticky rows equal `RUN_CHOICES_STICKY`; each orchestrator option has
+the same class in the spec and the code; nothing in `main()` reads a sticky
+choice before the continuation (review round 24 F4). Falsified: the
+continuation and the launcher's record step dropped turned 6 tests red; an
+unclassified dest, a spec row reclassified, and the
+`dangerously-skip-permissions: ON` log moved back above the continuation
+each turned their rule red. `TestABareResumeReadsThePickedRunsRecord` (5
+tests, review round 24 L2): the launcher's real bare-resume block reads the
+run `resolve_run_id` picks, over three runs whose records disagree; the
+picked record beats the ambient env; nothing to pick falls back to env; a
+remote runtime does not pick host-side.
+
+`tests/test_resume_after_phase1_death.py` (5 tests, DESIGN §6 *Resumable
+planning*, *The first phase is a phase like any other*; review round 23
+M2): real `main()` twice — a fresh run that dies inside the real
+`phase_classify`, then `resume` on the state it left. A budget death in
+classify resumes after the cap is raised; every resumable phase-1 exit
+(worker error, context overflow, disk low) resumes and spawns the classifier; a state with no `task` is still refused.
+
+`tests/test_remote_push_choice.py` (14 test functions, 16 cases; DESIGN §6
+*One push choice per run, on every runtime*). Every step is the real code,
+no cloud CLI called: the launcher's NO_PUSH resolution and its hand-off of
+the choice to a fresh run as `--no-push` (an env-only opt-out reaches the
+orchestrator, a pushing run gets nothing, a resume forwards only its own
+push flag, the in-machine argv from `_render_launch_suffix` is exactly the
+launcher's flags); a Fly run through real `main()`, the real `fetch_branch`
+over a stubbed `flyctl` and the real `host_finalize` (a fresh `--no-push`
+run, an env-only opt-out and a plain resume of a `--no-push` run are not
+pushed, with a resume with `--push` and a fresh pushing run as controls that
+are); and the real `finalize` verb reads the record (a recorded `no_push` is
+not pushed, `--no-push` on the verb skips a run recorded to push, and a run
+recorded to push reaches the push).
+
+`tests/test_delivery_detection.py::TestReask` (9 tests; DESIGN §8 *Delivery
+detection*, *One re-ask*; review round 24 M1), rewritten over a real git
+lane: `created` is read from the lane's untracked test-shaped files, `ran`
+from the sample's executed Bash commands (`_falsifier_runs_probe`). A
+heredoc probe that ran (the r24 run a command verbatim) and one run in a
+separate call are not re-asked; a sample that wrote nothing, or wrote and
+never ran, is; a Write-tool probe still counts; leads, an edited tracked
+file and a symlink are not probes; `_falsifier_runs_probe` on the real
+pytest and vitest commands and edge shapes; the session id read from the
+log, and `claude_p` adding the resume flag. Through the real
+`_run_delivery_detection` (`TestRunDeliveryDetection`),
+`test_a_previous_samples_probe_is_not_the_next_samples` shows a previous
+sample's probe never counts for the next.
+
+## The rev 9 redesign's other new and rewritten test files
+
+- `tests/test_resume_staging_is_reset.py` (7 tests, DESIGN §8 *The final
+  diff describes the tree that ships*): the real `setup-run.sh` resets a
+  staging worktree a SIGKILL left registered — tracked edits, untracked
+  files and a merge in progress go; ignored files and the run branch stay.
+- `tests/test_one_restore.py` (8 tests, DESIGN §8 *One restore*, review
+  round 15 M2): `_restore_tree` and `leerie_reset_worktree` are the one
+  restore — write bits restored, a nested repository removed, and I1's
+  checker reading nothing afterwards — so I1's exhaustion path rolls the
+  round back instead of `die()`ing; the reviewer's proofs, inverted. Also:
+  a derived guard that no `reset --hard` runs outside the primitive, a
+  back-out whose reset does not land never reports the work as gone, and
+  the shell reset never `chmod`s through a symlink.
+- `tests/test_merge_leaves_staging_as_found.py` (2 tests, DESIGN §6½,
+  review round 15 M3): on the real setup-run.sh, new-worktree.sh and
+  integrate.sh, a merged `.gitignore` change that un-ignores a build's
+  output has that output removed by the merge's bracket, and a
+  repository `post-merge` hook does not run on leerie's merge.
+- `tests/test_tree_on_its_branch.py` (11 tests, review round 15 H1/H2): a
+  worker leaves its tree on the branch leerie gave it, at a descendant of
+  where it started (I1's branch and base lines); the tree that ships is
+  `refs/heads/leerie/runs/<id>^{tree}`, read after finalize's cleanup.
+- `tests/test_leerie_git_runs_no_hooks.py` (7 tests, DESIGN §6½ *Hooks
+  off*): every git process leerie starts runs with hooks off through the
+  environment entry `main()` installs before anything spawns
+  (`_git_hooks_off`; it round-trips and keeps the operator's own
+  `GIT_CONFIG_*` entries), and only a worker's spawn takes it back out
+  (`_git_hooks_on` in `_invoke`). Real git with every hook installed: the
+  I2 bracket's put-back and every git form leerie uses fire none, and every
+  script leerie runs turns hooks off itself (`leerie_git_hooks_off`), also
+  when run outside the orchestrator.
+- `tests/test_run_repo.py` (27 tests, DESIGN §6 *The run's own
+  repository*, RC4/I4): every tree a worker gets hangs off `<run-dir>/repo`,
+  a bare repository of the run's own, so no worker's git verb reaches the
+  user's refs, stash, config, `info/exclude`, hooks or worktree registry;
+  review round 16 H2's drivers inverted — the user's stash survives a
+  worker's `stash`/`pop`, and a worker cannot move the user's branches.
+  Review round 17: a worker's `git init` in staging (`core.bare` rewritten)
+  costs the run nothing, and a recorded repository failing its check is
+  never deleted (H1); every tree kind works under
+  `safe.bareRepository=explicit` (M3); the rebaser's prompt range resolves
+  in its own repository (M1); a mid-run branch switch brings no other
+  commit in (L1); a crash-left scratch directory is removed (L2). Real git,
+  real scripts and helpers.
+- `tests/test_work_read_only.py` (17 tests, DESIGN §6 *The explicit
+  channel: the user's checkout is mounted read-only*): the launcher mounts
+  `$USER_REPO:/work:ro` and keeps the state root out of it; a worker-style
+  write to a read-only bind mount fails while the run's reads work (skipped
+  where unprivileged user namespaces are refused) and, with
+  `LEERIE_TEST_CONTAINER_IMAGE` set, the same through the real
+  `container-entry.sh` in a real container; the entry's `chown` runs only on
+  a writable `/work` (its mount-table read, four shapes); capture inside the
+  container records into the run directory and leaves the checkout alone,
+  every in-container seam passes `record_in`, the host apply merges against
+  the user's current config once and keeps an unreadable file, and both
+  `host_apply_captured_deps` and the launcher's EXIT-trap function apply the
+  ran run's capture only; phase 1½'s hook and `mise` run in a removed
+  throwaway checkout; the checkout snapshot never rewrites the user's index;
+  with no run repository the prune and the abnormal-exit clean-up write
+  nothing in the cwd's `.git`.
+- `tests/test_credentials_never_outlive_the_run.py` (10 test functions, 24
+  cases; DESIGN §6 *No copy of the credentials outlives its run's process*,
+  *Every deleter of a run's directories deletes them*; review round 18 M1,
+  round 19 claims H1, exec M1 and L2): the owner-aware removal takes
+  read-only and unreadable directories, never follows a link, and reports a
+  survivor; the real `main()`, run in its own process with `_orchestrate`
+  making a worker's configuration (so the template), `measure/`,
+  `tree-stores/` and `.store-fetch/`, leaves none of them, nor the secret,
+  however it ends — a return, a return with no copy of the credentials, a
+  real `phase_finalize` whose dependency capture makes the template again
+  (it is there after finalize, gone after the exit), a forked child's own
+  exit (which leaves the parent's), the rate limit's exec (released before
+  it), and each exit `main()`'s top-level `try` handles; the set of those
+  handlers is read from `main()`'s source and must equal the set the test
+  drives; a full purge removes a run whose template is read-only; the
+  preflight reap removes an idle run's copies; the reviewer's driver
+  inverted — the real launcher `prune --apply` removes a run that died
+  mid-run, its read-only template with it; prune counts a run removed only
+  when it is gone; the shell removal; no run-directory deleter ignores its
+  errors. With it, `tests/test_collect_subtrees_sh.py`'s
+  `test_the_integrator_gets_the_shared_kill_deny_notice_and_hook`: the
+  collection's integrator had its own configuration while it ran, and the
+  payload removed it and the template when it exited, keeping the shared
+  caches (red when the template's making registered for removal at the
+  guard helper's exit, which removed them before the integrator ran).
+- `tests/test_every_removal_is_owner_aware.py` (3 tests, DESIGN §6 *Every
+  deleter of a run's directories deletes them*; review round 19 claims M1):
+  `rmtree` is called only inside `_rmtree_owned`; the launcher's
+  `shutil.rmtree` only inside `_rm_owned`; every `rm -rf` in
+  `scripts/*.sh` is inside `leerie_rm_owned` or of a `mktemp` directory the
+  same script made.
+- `tests/test_view_moves.py` (6 tests, DESIGN §8 *A view moves to the next
+  tip when the install's inputs are unchanged*; review round 18 L1), real
+  git, the real scripts and `_measured_tree` with an incremental stand-in
+  install: a new tip with the same inputs moves the view — the install's
+  file keeps its inode, the install runs again over it, the build runs
+  again, and a measurement's report, a cache under `node_modules`, a stale
+  build output, a build's file under the install's output, the view's own
+  stores and its measurement directory are all gone;
+  a changed `package.json` makes a fresh view; an in-place edit of an
+  installed file that keeps its size and resets its mtime makes a fresh
+  view; a rewritten `.git` is pointed back at the view's own repository and
+  the other repository is untouched; a failed install is not recorded; the
+  install key changes with an input, a `patches/` file, a nested manifest,
+  the install entries, their environment and a named copy input, and with
+  nothing else.
+- `tests/test_tree_repos.py` (11 tests, DESIGN §6 *A repository per
+  committing tree (I6)*): staging and a subtask tree are worktrees of their
+  own bare repositories (the run repository's objects through the
+  alternates, the run's settings copied, one ref, no object copied), and the
+  run repository never prunes; with the run repository read-only, as I5
+  grants it, a worker commits and cannot move the run branch or a sibling's;
+  a take moves exactly the tree's own branch (a ref the worker made, a
+  run-branch copy it moved, the branch its HEAD is on stay out); every
+  worker exit takes, a failed one included; integration merges from the run
+  repository and takes staging, and a rollback through `_restore_tree`
+  reaches the run repository; a resume takes what a killed worker committed;
+  a judge checks out a synthetic merge, and a commit a worker left on a
+  detached HEAD, from the run repository; a tree made
+  in the run repository is made again; a tree repository's settings are
+  checked and restored; pruning a tree takes it and removes its repository.
+  `tests/conftest.py::worker_exit` is what a worker's exit does, for tests
+  that stand in for a worker by committing in its tree.
+- `tests/test_run_repo_bring_back.py` (19 tests): `host_bring_back_run_branch`
+  brings the run branch back from the run's repository into the user's as
+  leerie's own git (hooks off, no `FETCH_HEAD`), as a compare-and-swap
+  against `run.json` `brought_back_sha`, so a finalize rebase or the user's
+  own change to the ref is never undone, and only as a fast-forward (round
+  17 H1). The launcher's post-exit steps read only the run the container
+  named (two runs: the older one, which it ran, is finalized), and its own
+  traps bring the branch back under SIGINT (round 17 M2). Real git, real
+  bash, `jq`.
+- `tests/test_run_repo_missing_dies.py` (4 tests, review round 17 H1/L4): a
+  helper worktree added with no run repository dies naming it — the add
+  itself, CI parity's `_ci_worktree` and `_evaluate_acceptance_sets`, which
+  had read `no_base_worktree` and "no evidence" — and the conftest tripwire
+  fails a test that would make a real run repository under this checkout.
+- `tests/test_hidden_dirt.py` (17 tests, review round 16 H1/M2, DESIGN §8
+  *A worker leaves its tree clean*, *One restore*): dirt a worker hides from
+  `git status` — `skip-worktree`/`assume-unchanged` index flags, a pattern
+  in the shared `info/exclude` or `core.excludesFile` — is read by I1's
+  checker (untracked files by git's standard rules through leerie's
+  settings, §8 *One ignore rule*, with `info/exclude` put back first) and
+  cleared by the restore; the implementer's base is where its subtask
+  branch forked from the run branch.
+- `tests/test_worker_settings_are_put_back.py` (5 tests, review round 18
+  H1, DESIGN §8 *The settings are leerie's*). A worker's change to its
+  tree repository's settings is put back by leerie and never counted
+  against it. Real run repository, real `setup-run.sh` and
+  `new-worktree.sh`, real git, and the gate:
+  - The real husky 9 `prepare` (node, `LEERIE_TEST_HUSKY_DIR`, binding when
+    set; skipped unset) runs in a worker tree, with the user's checkout
+    holding `hooksPath = .husky/_` and holding no hooks path. The worker
+    commits, `_take_after_worker` puts the config back and takes, and the
+    gate finds the tree clean with no re-ask, the commit in the run
+    repository.
+  - `core.fileMode=false` hides a mode change from the worker's own git,
+    but each checker half alone shows ` M run.sh`, and the re-ask names it
+    and says nothing about settings.
+  - A missing copy stops the run at the gate and at the worker's exit.
+
+  Falsified, each turning a test red: the tip's code; no put-back at the
+  worker's exit; none in the Python checker; none in the shell checker;
+  and a gate that re-asks a settings line. `tests/test_run_settings.py`
+  and `tests/test_hidden_dirt.py` assert the same contract: what a setting
+  hid is the file's own line, and every key DESIGN §8 lists is put back by
+  either checker half alone.
+- `tests/test_needs_human_sources_render.py` (14 tests, DESIGN §6 *The
+  PR's end-state section*, review round 14 H1): every "Needs human
+  verification" source the code can write renders in the PR; the sources
+  are derived from the code (`*_GAP_SOURCE` constants and literal `source`
+  keys of dicts written to `needs_human_verification`), never listed by
+  hand.
+- `tests/test_round14_delivery_verdicts.py` (7 tests): review round 14's
+  kept delivery items end to end — M2, a verdict counts only on the tree
+  it was measured on and a final judge that fails in any way reads
+  nothing; M3, a ratchet's unverified items derive from what its routes
+  read; M4, an item index means one item everywhere.
+- `tests/test_judges_read_the_committed_tree.py` (7 tests, rewritten, DESIGN
+  §8 *Every post-execution verdict is of the committed tree*): the
+  delivery judges read a detached checkout of staging's HEAD, no install,
+  removed afterwards — never staging, whose ignored files (an untracked
+  helper, a stale `dist/` build) held a verdict up in review rounds 12-13.
+- `tests/test_test_files_template.py` (35 tests, DESIGN §9 *Operands that
+  are already test files take the runner's direct form*): the direct
+  (`vitest run`, `jest --runTestsByPath`) and affected (`related`,
+  `--findRelatedTests`) templates, the direct form derived from a declared
+  `test_scoped` (wrapper and environment kept), vitest's substring-filter
+  collisions excluded by escaped absolute path or no command at all, and
+  the executed call sites.
+- `tests/test_clean_tree_gate.py` (17 tests, DESIGN §8 *A worker leaves its
+  tree clean*): the I1 checker, the bounded re-ask of the same session,
+  exhaustion rolling the round back, and every staging site.
+- `tests/test_committed_view.py` (10 tests, review round 17, DESIGN §8
+  *Every measurement reads the committed view*): a measurement of a worker
+  tree runs in a detached checkout of its branch tip. A self-ignoring
+  untracked `.gitignore` and the `helper.py` it hid are not measured, and
+  nothing is shared in from the worker's tree: dependencies are leerie's
+  install from the committed lockfile, build outputs leerie's build.
+- `tests/test_stores_are_leeries.py` (9 tests, DESIGN §6 *The stores a view
+  installs from are leerie's*): leerie's commands read only
+  `<state-root>/.stores/leerie/`, a worker only its run's caches, and no
+  tree leerie installs into, a view included, links into leerie's store:
+  every leerie install copies from it, so neither an in-place edit of a
+  hard-linked file in a worker's `node_modules` nor a committed
+  `postinstall` reaches the store or a view. Driven with a pnpm-like
+  stand-in installer.
+- `tests/test_worker_confinement.py` (20 tests, DESIGN §6 *A worker writes
+  only where it is granted (I5)*): a real child confined by
+  `scripts/landlock_exec.py` with the grants `_worker_grants` derives, on
+  leerie's run layout, writes only its grant and reads nothing of the run
+  it is not given; the writes notice is rendered from that grant
+  (`_confined_writes_notice`), every path it names writable under the
+  shim, and `claude_p` appends it to a worker with a shell (review round
+  18 M9).
+- `tests/test_run_settings.py` (54 tests, review rounds 17 H2 and 18 H1,
+  DESIGN §8 *The settings are leerie's*): both checker halves and both
+  restore halves. A setting written from a worker's tree (each key DESIGN
+  §8 lists, in each half) is put back before the read, so what it hid is
+  the file's own line; the global settings are read from leerie's copy.
+- `tests/test_one_ignore_rule.py` (4 tests, review round 17 H3, DESIGN §8
+  *One ignore rule*): I1 and I2 read untracked files by the same rule, and
+  a guard derived from the source finds no listing of untracked files
+  outside it, in Python or the shell.
+- `tests/test_repo_commands_keep_their_hooks.py` (6 tests, review round 17
+  M4, DESIGN §6½ *Hooks off*, §6 *Leerie's runs of the repository's
+  commands are confined too*): the repository's own commands, launched
+  through `_run_streaming` or the self-check's spawn with
+  `_repo_command_env`, run with hooks as the repository expects, while
+  leerie's own git keeps them off. Derived guards: every call of
+  `_run_streaming`, `_run_contained` and `_measure_blt` passes `grants`,
+  which has no default; `_run_streaming`'s one spawn is the confined argv;
+  the self-check is the one raw spawn; `node` and `mise` are never spawned
+  directly.
+- `tests/test_measurement_confinement.py` (4 tests, DESIGN §6 *Leerie's
+  runs of the repository's commands are confined too*): a real child
+  confined with `_measurement_grants` writes its view and measurement
+  directory and is refused the run's state (the held-out sets,
+  `state.json`, the worker cache, leerie's store, the run repository's
+  refs, sibling trees, another tree's measurement directory); its temp and
+  caches point at its own directory.
+- `tests/test_measurement_grant_lifetime.py` (8 tests, same section): a
+  tree made again at a path gets a fresh measurement directory and a
+  removed tree's is swept; the grant kinds differ only where designed; the
+  toolchain kind empties the hook's trust records; a tree holding the run
+  directory is refused; `claude_p` records the first committing worker; a
+  confined worker reads the run's mise overrides.
+- `tests/test_store_classes.py` (12 tests, DESIGN §6 *Which stores an
+  install may share*): every store variable has exactly one class; a run
+  tree's commands get that tree's own stores, each made 0700 (review round
+  20 claims L3: under umask 0 a plain `mkdir` left them 0777); each manager's no-code fetch
+  runs its argv on data files only (6 cases); a bun install copies; a
+  replaced view takes its tree stores with it.
+- `tests/test_tree_git_is_addressed.py` (9 tests, review round 19
+  isolation H1, DESIGN §6 *Leerie's git never takes a tree's repository
+  from the tree*):
+  - A view and a subtask tree have their `.git` rewritten, as a file
+    naming a planted repository and as a `.git` directory in its place.
+    The planted repository names programs through `core.fsmonitor`,
+    filters, textconv and hooks. Every leerie read and restore of the tree,
+    in Python and in the shell, reads the real repository, and none of the
+    programs runs.
+  - A tree repository whose worktree's `commondir` names another
+    repository is refused.
+  - The round's measurement proof, inverted: the confined command's
+    planted fsmonitor never runs, and the held-back set, the run branch
+    and `state.json` stay as they were.
+  - Three guards derived from the source: no `-C` in a leerie git argv
+    outside `_tree_git_args`; every git command run with a working
+    directory names its repository; and every script that sources
+    `worktree-lib.sh` runs git on a tree only through `leerie_tgit`.
+
+  Falsified, each turning tests red: the helper following `.git`, in
+  Python and in the shell; no `commondir` check; a `.git` directory read
+  as a clone before the repository's record; and one site of each kind
+  put back for each guard.
+- `tests/test_unmeasured_is_not_done.py` (9 tests, review round 19
+  execution, DESIGN §6 *The run outcome is decided once*, "`done` rests on
+  measurements that ran"). Driven through the real `_decide_outcome`, and
+  the real `_refresh_test_id_diff` for the install case, on a run
+  repository whose run branch is the tree that ships:
+  - `done` needs a failing-test-ID diff of exactly that tree when the
+    repository has a test command. No diff, a diff of another tree, a
+    failed install on that tree (named in the reason), or failing tests
+    the base could not be rerun against each make the run `unconverged`.
+  - An unmeasured held-out set makes the run `unconverged`.
+  - A test command the task forbids, a repository with no test command,
+    and a run with no commits are not gaps.
+
+  Falsified, each turning tests red: the decider not consulting the rule
+  (5), the held-out part dropped (1), the refresh not recording why (1),
+  and the base-rerun check dropped (1). Eight assertions in four files
+  that expected `done` with no verdict now expect `unconverged`:
+  - `test_acceptance_unmeasured_pr` (3);
+  - `test_delivery_detection` (2);
+  - `test_acceptance_held_case_intermittent` (2);
+  - `test_decide_outcome`'s unmeasured case (1), now its own test.
+- `tests/test_provision_survives_resume.py` (4 tests, review round 19 M3,
+  DESIGN §6 *Resumable planning*, "A checkpoint covers only what ran
+  before it is saved"). Through the real `_run_phases` on the resume
+  harness of `test_resume_planning_reentry.py`, a resume past the
+  `plans_after_classify` checkpoint:
+  - with no recipe runs `phase_provision` and the gate;
+  - with a recipe and no gate result runs only the gate;
+  - with both runs neither.
+
+  The gate records its result. Against the code before the fix, 3 of the
+  4 fail. The fourth, finished provisioning not being redone, holds there
+  too, because nothing was ever redone.
+- `tests/test_confined_store_install.py` (8 test functions, 9 cases;
+  DESIGN §6 *A measurement pins pnpm's version*, *Which stores an install
+  may share*; review round 19 exec H2, H3 and M2). Under real Landlock with
+  `_measurement_grants`: a measured command reads a fetched store and
+  cannot write it, and writes a verified store, its tree's own stores and
+  the measurement's state and runtime directories (where pnpm keeps its
+  lock and db); a measured Python's user base is its tree's store, not
+  `$HOME`; measurements open pnpm's store frozen and the fetch does not.
+  corepack is bounded and never floats; `_reads_package_manager`; the pin
+  is seeded only for a tree that pins no version (2 cases); two concurrent
+  fetches into one store each get their own staging directory and take
+  turns under the store's lock.
+- `tests/test_measurement_tmp.py` (18 test functions, 19 cases; DESIGN §6
+  *A confined command's scratch is short and private*, *Every confined
+  process has its own `/tmp`, `/dev/shm` and IPC*, *A confined command's
+  processes end with it*; review round 19 exec H1). Review round 19's
+  execution driver turned round, on the real shim and
+  `_measurement_grants`, unisolated:
+  - The private temp directory fits a socket path whatever the run
+    directory's length, a measured command binds a socket in it, and its
+    chain up to `/tmp` is one SWC accepts. Every directory leerie makes for
+    a command or a worker is 0700; a private temp directory that is not
+    this user's stops the run, and one made open before is closed.
+  - No grant of any kind names `/tmp` itself, and an unisolated measured
+    command writes its private temp directory and not `/tmp`. An
+    unisolated worker neither reads nor writes `/tmp`, and its read grant
+    names nothing in it.
+  - The private temp directories go with their tree, with the run's
+    scratch, and at the process's exit.
+  - A background process (2 cases: one that ignores SIGTERM) and a timed-out
+    command's processes are gone when the command returns, the shim keeps
+    the command's exit status, and a worker session's background processes
+    end with it.
+  - Leerie's own temp directory is in the run directory, and `_run_phases`
+    moves it first.
+- `tests/test_exec_lock.py` (15 test functions, 16 cases; DESIGN §6 *A held-out evaluation
+  runs alone, in a world that dies with it (I3)*, the time half): an
+  evaluation runs with no measurement beside it and waits for running ones
+  without starving; it waits for a running real `_invoke` worker, and a
+  worker asked for meanwhile starts after it; a worker spawned inside an
+  evaluation stops the run before spawning; a cancelled worker and a
+  cancelled waiter release the lock; sections nest, a shared holder's own
+  commands pass through a waiting evaluation, and an evaluation inside a
+  shared hold stops the run; the host level makes an evaluation wait for
+  another process's shared holder and holds later shared takers behind it,
+  and releases both files; by rule over the module nothing reachable inside
+  `_held_out_section` spawns a worker or waits on a raw semaphore or lock
+  a shared holder may hold — stopping at the three gates that pass
+  through inside an exclusive hold (`_blt_slot`, `_build_class_slot`,
+  `_confirm_hold`) — with the rule's own catch of planted violations and
+  its acceptance of the gates; the gates entered inside an exclusive hold
+  while another task holds each raw resource pass through, and the same
+  entry outside one waits (the two arms disagree); and every shared holder
+  takes the lock after its semaphores.
+- `tests/test_falsifier_exec_queue.py` (3 test functions, 5 cases;
+  DESIGN §6 *Evaluations queue on the lock itself*, review round 21
+  execution M1): the real `_falsify_items`, `_falsifier_gates`,
+  `_confirm_still_failing` and `_ExecLock`, with the worker, the probe's
+  runs and the facts read as stand-ins holding the lock as the real ones
+  do. Every item confirms (first run, B\* rerun, facts read), no worker
+  starts inside a confirm, and no worker that asked after a confirm was
+  queued starts before it — random lengths, and the convoy's shape set
+  up; the wall time stays under 2.2x the same schedule with confirms
+  serial and no worker held back. Live-falsified: the pre-fix shape
+  (a confirm lock outside the execution lock, a section per run) and the
+  one-hold-inside-a-confirm-lock shape each turn all five red. Measured
+  with the same harness (5 seeds): 1.52x at 4 lanes / 16 items and 1.79x
+  at 8 / 32, against 2.86x and 4.88x for the pre-fix shape.
+- `tests/test_confinement_entry.py` (9 tests; DESIGN §6 *Fail closed, on
+  every entry*, review round 21 execution H1): by rule, no statement of
+  `main()` before `_require_confinement` reaches `_confined_argv` through
+  the module's references, and the entry is one unconditional statement
+  of its body (with planted catches of a dispatch above it and a
+  conditional entry); the entry runs Landlock's check then the sandbox's,
+  and `preflight()` runs neither; the real `main()` driven as a fresh run,
+  `resume <id>`, `--phase judge` and `--phase heal` calls it before the
+  dispatch, whose first confined spawn carries `--isolate`; `list` and
+  `--report` skip it. Live-falsified: the entry made fresh-only fails the
+  resume test and the rule; moved below the `--phase` branch, it fails
+  both phase tests and the rule.
+- `tests/test_heldout_sandbox_callers.py` (20 test functions, 22 cases; DESIGN §6 *A held-out
+  evaluation runs alone*, *No database server leerie starts is ever
+  unconfined*): every run of a set file carries the whole set as `place`
+  pairs in a section, none of it on disk at any spawn; a path the tree
+  already has is never placed; end to end (through
+  `tests/heldout_sandbox_emulator.py`) the report reaches leerie only
+  through the descriptor and the tree is unchanged; the parse probe is
+  placed and its marker is the report; a rule over the held-out runners.
+  The database: the URL refusal accepts only the command's own socket;
+  `_test_db_argv` wraps only a Prisma/PostgreSQL repo, one name per
+  command; a held-out run, a worker (`claude_p(db=True)`) and a
+  database-requiring CI check are wrapped; by rule leerie never starts a
+  server or runs `prisma`; F2 turned round — the schema push runs under
+  the command's Landlock domain (`NoNewPrivs: 1`, `acceptance/` refused)
+  and the command gets the URL but never the consent; F1 turned round with
+  the host's real PostgreSQL (skipped without one) — the command's own
+  server answers over its socket, `COPY … TO PROGRAM` cannot read
+  `acceptance/`, and the server is gone with the command; a name that is
+  not a test database is refused (125); confined but unisolated, the
+  script runs the command unchanged without a database, its stdout clean.
+  A promised database (review round 21 execution L2): `require` puts
+  `scripts/require-test-db.sh` after the wrapper; `_test_db_present`, executed
+  under the shim, is True only when the command was handed the composed
+  URL (a fake wrapper handing it, another URL, or none), False where the
+  real wrapper falls back unisolated, and spawns nothing outside a
+  Prisma/PostgreSQL repo; `claude_p(db_required=True)` puts the guard
+  between the wrapper and `claude`. `tests/test_acceptance_set_audit.py`
+  adds the consumer (1 test function, 2 cases): the same Prisma repository
+  gets the REAL DATABASE section and `db_required` only when the check
+  says a database came up. Live-falsified by restoring the shape-based
+  `has_db` and dropping the guard (7 red).
+- `tests/test_delivery_detection.py`, a falsifier's probe as held-out
+  content (DESIGN §6 *A held-out evaluation runs alone*; 3 tests): the
+  confirm runs, through the real gates and `_capture_failing_test_ids`,
+  each run alone in a sandbox over the pristine checkout with the probe
+  placed and never on disk there; the AST facts read places the probe too
+  and returns its JSON through the report (needs node and a `typescript`
+  copy, `LEERIE_TEST_TYPESCRIPT_DIR`); a sentinel in a confirmed probe's
+  source and the sample's prose is in neither `unmet_final` nor the
+  re-drive's re-check, the saved probe is outside every implementer grant,
+  and the re-drive's re-run of it is placed in a sandbox.
+- `tests/test_heldout_isolation.py` (5 tests, all `real_heldout_sandbox`,
+  skipped where the shim has no `isolation_error()` or the host cannot
+  build a sandbox): review round 20's H1 (`/dev/shm`, System V) and H2 (the
+  AST gate's relay of `/tmp`) and the measured F1 (`COPY … TO PROGRAM`
+  from the command's own database; its one listener `127.0.0.1:5432` in a
+  namespace not the orchestrator's), each asserted closed; an isolated
+  command has a fixed `/tmp/<name>` of its own; and review round 21's M2
+  turned round (tooling that reads host and port from `DATABASE_URL`
+  reaches the database, as `localhost` and as the URL's host, in two
+  concurrent commands on the one port).
+- `tests/test_confined_inputs.py` (4 tests; formerly
+  `tests/test_worker_tree_tmp.py`, whose worker-tree cases went with
+  `_is_worker_tree`): an input outside the grant stops the run, the AST
+  gate runs with leerie's temp files in the run directory, an AST script
+  without the execution lock stops the run, and every caller holds it (a
+  rule over the module).
+- `tests/test_held_out_relays.py` (6 tests; DESIGN §8 *Nothing a held-out
+  evaluation produces reaches a fixer but its verdict and leerie's own
+  identifiers*): a synthetic held-back set whose declared names, file path
+  and runner output carry a sentinel, driven through the real consumers —
+  the residual names shown sets only; the next run's planner
+  (`_prior_delivery_residual`) gets no held-back name; a residual recorded
+  before the rule is re-derived at read time; the judge record gives a
+  held-back set its verdict only; held-out transcripts never reach the
+  record (through the real `claude_p` → `_invoke_admitted` → `_invoke`);
+  leerie's runs of set files log on the held-out side. Each absence is
+  paired with a shown set's names still arriving.
+- `tests/test_worker_transcript_record.py` (13 tests; DESIGN §8 *What a
+  worker ran is read from its own transcript, never from a command's
+  output*): a measured command prints a forged `tool_use`/`tool_result`
+  line, and each reader — the delivery record, the dependency-capture
+  hint, the session a re-ask resumes, the malformed-envelope retry, run
+  health — is shown not to read it, beside a real worker event it must
+  read; a registry entry names a file of its own directory only; the
+  CLI's stderr in a transcript is never an event; the conformer's axes are
+  not measured into its transcript; `_run_streaming` refuses a worker's
+  transcript as a command's log; a reader's named path is no transcript
+  until registered; one reader (`_iter_transcript_events`) parses events
+  out of line text, and a rule over the module catches a second
+  transcript reader (with its own falsifier).
+- `tests/test_commands_keep_default_signals.py` (4 tests; DESIGN §6 *A
+  command leerie runs starts with the signal dispositions it would have
+  outside leerie*; review round 20 L1): the reset list is every signal
+  Python ignores at startup; a real `yes | head` started through the shim,
+  through a measurement (`_run_streaming`) and through the spawn gate
+  has the dispositions it has outside leerie (its own `SigIgn` read
+  against the same probe run directly).
+- `tests/test_landlock_isolation.py` (17 tests; DESIGN §6 *Every confined
+  process has its own `/tmp`, `/dev/shm` and IPC*, *A held-out evaluation
+  runs alone, in a world that dies with it (I3)*). The shim's `--sandbox`
+  and `--isolate`, run for real; each channel the held-out isolation design
+  measured open is attempted by the evaluated code and checked from the
+  orchestrator's own namespace: `/dev/shm` and `/tmp` files, System V and
+  POSIX IPC, the user and session keyrings, loopback TCP, an abstract
+  socket and the internet, signals to outer processes, `utime`/`chmod`/
+  `setxattr` outside the grants (EROFS), writes in the tree (overlay),
+  leftover and SIGTERM-ignoring processes, a namespace or mount from the
+  evaluated code; placement (overlay only, never over the tree's file),
+  the report through its descriptor, the exit code and signal, a stop
+  signal ending the namespace; `--isolate`'s private `/tmp` per command, a
+  carried grant beneath `/tmp`, read-only metadata, the caller-owned root
+  and IPC namespace; and review round 20's H1 proof turned around. Skipped
+  where `isolation_error()` reports the host cannot build one (a developer
+  host, CI): run in the container under the `leerie-container` profile
+  with `--basetemp` outside `/tmp`. Live-falsified there, one mechanism at
+  a time (no read-only remount, no private tmpfs, no IPC namespace, no
+  seccomp, no overlay): each turned its own tests red. The keyring join is
+  not separately observable: seccomp refuses `add_key` first.
+- `tests/test_confined_network.py` (22 test functions, 34 cases; DESIGN
+  §6 *A confined process has its own network; the outside is reached only
+  through leerie's proxy*; review round 21 execution H2 and isolation
+  R6). Anywhere: `_egress_refusal` over
+  loopback, link-local, unspecified, multicast, IPv4-mapped and the
+  container's own addresses; the real `_EgressProxy` on its unix socket
+  refusing `CONNECT` and absolute-`http://` requests to loopback (by IP and
+  by name), tunnelling to an allowed destination, rewriting a plain request
+  to origin form without the hop-by-hop headers, answering 400 to anything
+  else, and `forward` piping to the orchestrator's port; its 0700
+  directory, a new one per proxy, so a second proxy in one process leaves
+  the first one's socket serving (review r22 L1); `_confined_argv` naming the proxy only for an `egress` grant
+  when isolated, and relaying the strict-output proxy's port; which kinds
+  and workers carry `egress`; the shim's `--egress`/`--forward` parsing
+  and `proxy_env`; `_require_egress_relay` naming each failure. In a
+  runtime that can isolate: H2 turned round (a measurement's loopback
+  server, which writes with its grant, unreachable from a worker directly
+  and through the proxy); two concurrent commands binding one fixed port;
+  a command without egress has `lo` only, no proxy variables, no route and
+  no resolver; the relay tunnels, forwards, and ends with the command; the
+  real probe of the confinement check every entry runs
+  (`_require_confinement`) passes and fails closed on a shared network; and
+  R6 turned round (a placement through a linked directory refused, the
+  worker's tree untouched). Live-falsified in the container, one mechanism
+  at a time: no network namespace, the proxy refusing nothing, placement
+  following links before the read-only remount.
+- `tests/test_install_reaches_inputs.py` (9 test functions; DESIGN §6 *An
+  install reaches its inputs*; review round 22 execution H3). Anywhere:
+  `INSTALL_KIND` is `MEASURE_KIND`'s grant with `egress` and nothing else
+  (leerie's fetched stores still read-only); the consumers executed — a
+  recipe's `install` entries get egress and its `build` entry none
+  (`_ensure_worktree_deps`), CI parity's recipe install and prerequisites
+  get it and its check none (`_ci_prepare`, `_ci_run`), a `settle_by:
+  install` re-install gets it and a coverage run none (`_install_settles`,
+  `_cov_contained`); a rule over `leerie.py`: every function that reads a
+  recipe's install entries or a check's prerequisites and spawns names
+  `INSTALL_KIND` (leerie's own store fetch aside), and no other function
+  names it, with the rule checked on a synthetic module. In a runtime
+  that can isolate: a pip recipe in a committed view installs from PyPI
+  through leerie's real egress proxy, while its `build` entry and a plain
+  measurement of the same view, running the same download, reach nothing.
+  Live-falsified on the host and in the container (rootless): the install
+  entry back on `MEASURE_KIND`, the prerequisite without `INSTALL_KIND`,
+  and every kind given egress, each turned its own tests red.
+- `tests/test_user_scripts_on_path.py` (7 test functions; DESIGN §6
+  *Which stores an install may share*, a moved user base's scripts on
+  `PATH`): `_with_user_scripts` appending `<base>/bin` last in place of the
+  replaced base's, never doubled, leaving a baked base and a `PATH`-less
+  env alone; `_leerie_stores` leaving the orchestrator's `PATH` unchanged
+  while `_worker_cache_env` and `_tree_stores_for` each end theirs in their
+  own base's `bin`; a rule over the module: nothing sets the orchestrator's
+  `PATH` (`test_nothing_sets_the_orchestrators_path`); a confined command
+  outside every tree gets the stores' scripts on its own `PATH`
+  (`_run_streaming`); under real
+  Landlock, a measurement of a run tree running by name a script an
+  install-kind command put in that tree's user base. In a runtime that can
+  isolate: a real `pip install` defaulting to the user base, with no "not
+  on PATH" warning, and its console script then run by a measurement.
+  Live-falsified on the host and in the container: `_tree_store_env`
+  without the call turned 2 host tests and 3 container tests red.
+- `tests/test_worker_sees_tree_install.py` (4 test functions, 7 cases;
+  DESIGN §6 *A worker started in a tree leerie installed for runs on that
+  tree's stores*, review round 23 exec M1): for a tree in `_DEPS_INSTALLED`,
+  the environment `_invoke` actually spawns the falsifier, acceptance
+  writer, surrogate fixer and set auditor with names, for every
+  `_TREE_STORE_VARS` variable, the value `_tree_stores_for` gives leerie's
+  commands in that tree (never the worker cache's), every other store stays
+  the side cache, `PATH` carries the tree's `pyuser/bin` and not the
+  cache's; the grant names the tree's stores `rw` for the three committing
+  workers and `ro` for the set auditor; a tree leerie never installed for
+  (a subtask's) keeps the implementer on its cache. Under real Landlock, the
+  falsifier's confined process runs by name a script an install-kind command
+  put in the tree's user base. In a runtime that can isolate: a real
+  `_ensure_worktree_deps` pip-installing pytest into the lane's user base,
+  then the falsifier's confined process running `pytest --version` and
+  `import pytest` from it. Live-falsified: `_invoke` without the overlay
+  turned 5 host cases red and the container pip case red with `exec pytest:
+  No such file or directory` (the review's symptom); `_installed_tree_stores`
+  ignoring `_DEPS_INSTALLED` turned the subtask-tree case red. Green rootless
+  and rootful in `leerie:r23` under the leerie-container profile.
+- `tests/test_heldout_sandbox_preflight.py` (10 test functions, 22 cases):
+  `_sandbox_fix` on the shim's measured failure lines (and the specific
+  `setgroups` rule winning over the generic `EACCES` one), the gate's die
+  messages and its per-property failures with the probe's subprocess
+  faked, isolation switched on only by a passing gate, `_confined_argv`
+  (no `--isolate` before the confinement check every entry runs; a
+  held-out run always `--sandbox`),
+  the entry (`_require_confinement`) running the gate right after
+  `_require_landlock`, and the real
+  gate where the runtime allows it.
+- `tests/test_seccomp_filter.py` (5 test functions, 6 cases): the x86_64
+  and aarch64 programs executed by a classic-BPF interpreter (every listed
+  call EPERM, `clone3` ENOSYS, `clone` with each `CLONE_NEW*` flag EPERM,
+  every other call below 460 allowed, a foreign architecture killed, x32
+  refused), aarch64's numbers, the real filter on the host, Node's worker
+  threads under it, and no table being a refusal.
+- `tests/test_launcher_secopt.py` (12 tests; replaces
+  `tests/test_rootless_seccomp.py`): the launcher's `SECOPT`/`APPARMOR_OPT`
+  block executed with the runtime stubbed (seccomp unconfined on every
+  runtime; the profile applied when loaded; a missing one stopping the
+  launcher without a terminal or with `--no-runtime-install`), both
+  expanded in the run argv, `scripts/runtime-install.sh`'s AppArmor
+  helpers with the kernel stubbed, and the profile compiled
+  (`apparmor_parser -Q`) with its mount rules.
+- `tests/test_runtime_probes_pipefail.py` (11 test functions, 39 cases;
+  DESIGN §6 *The launcher's detection gives the kernel's answer*, review
+  r22 H1): the REAL `runtime_has_apparmor`/`runtime_apparmor_current` (and
+  the launcher's `APPARMOR_OPT` block over them) under `set -euo pipefail`
+  against a fixture securityfs (Ubuntu's LSM list with `apparmor` not last,
+  300 profiles with `leerie-container` fourth), through the injectable
+  `_RUNTIME_LSM_FILE`/`_RUNTIME_AA_PROFILES_DIR`/`LEERIE_APPARMOR_DEST`;
+  and the rule — the pipefail files derived from the scripts' own `set`
+  lines and `.` sourcing, none piping into an early-exit consumer (`grep
+  -q/-m/-l`, `head`, `awk … exit`, `sed … q`, `cmp`, `read`), with the
+  detector's positives and negatives pinned. Live-falsified: the old
+  pipelines turn 15 cases red; one restored `| grep -Fxq` in
+  `worktree-lib.sh` turns the rule red. The stubbed tests in
+  `test_launcher_secopt.py` could not see it: a single `echo` gives the
+  producer no second write to die on.
+- `tests/test_ref_less_clone_git_is_leeries.py` (5 tests, DESIGN §6
+  *Leerie's git never takes a tree's repository from the tree*): a ref-less
+  clone is located at leerie's git directory (`<run>/clone-gits/<name>`);
+  leerie's reads of the clone, in Python and in the shell, run nothing
+  planted in the clone's own `.git`; a clone without leerie's git directory
+  is refused, with no fallback to its own `.git`; removing the checkout
+  removes leerie's git directory.
+- `tests/test_run_layout.py` (9 tests; DESIGN §6 *A run directory is
+  continued only by a leerie of its layout*, review round 21 L1): over a
+  fixture shaped like a run directory main's code made (`branch` in
+  `run.json`, no `run_layout` or `run_repo` in `state.json`, a transcript
+  with no `transcripts.ndjson`), `resume` of an old layout and of a newer
+  one is refused before anything writes in the directory, which is left
+  untouched; `resume` of this layout is driven; a bare `resume` picks this
+  layout's run over a later old one; `--phase` on an old layout is refused
+  before its workers; a fresh run records `run_layout` and a resume never
+  rewrites it; `leerie list` shows an old run with work left as
+  `other-leerie`, and the overlay leaves orphans and finished runs alone.
+  Replaces `tests/test_run_repo.py`'s pins of the old refusal, which keyed
+  on `run_repo`-absent-and-`branch`-present and refused only after the run
+  directory was loaded.
+- `tests/test_phase_single_state.py` (3 tests): `--phase judge|heal`
+  reaches its workers with one `State` per run per process. The real
+  `main()`, with the real run-directory lock, is driven to each phase's
+  first worker spawn (`claude_p`, stubbed), which must receive the `State`
+  `main()` opened — the defect, on `main` since 60fca170, opened a second
+  `State` whose flock the first refused, exiting 75 before any worker;
+  heal with a failing verdict already indexed skips the judge and reaches
+  its baseline worker; a `--phase` run-id naming no run is refused with no
+  directory left behind.
+- `tests/test_leerie_writes_never_follow_links.py` (17 tests; DESIGN §6
+  *Leerie never writes through a path confined code shaped*, review round
+  21 isolation R1, R2, R5): the primitives (`_write_beneath`,
+  `_read_beneath`, `_mkdir_private`, `_remove_beneath`,
+  `_add_dir_bits_beneath`) never follow a link at the destination or on
+  the way, keep a replaced file's mode, and refuse a link or a FIFO to
+  read; restoring a tree and placing a set write nothing through a link a
+  command left or a commit carried; R1 — a held-out report is parsed from
+  the sandbox's descriptor and never written back through a planted
+  `reports/` link (behind the emulator, and in a real sandbox the set
+  never reaches the worker's tree); R5 — a planted measurement-id link
+  and a planted settings-restore temp link redirect nothing; R2 — each
+  worker kind is granted its side's cache set only, and a held-out-side
+  worker's `GOCACHE` is unreadable by a later implementer; a rule over the
+  module classifies every function that uses a raw write primitive
+  (primitives, leerie-only, confined), and the converted sites use none.
+  The real-sandbox cases skip where the host cannot build a sandbox.
+- `tests/test_cgroup_broker_descriptor.py` (7 tests; DESIGN §6 *No leerie
+  service is reachable by a path from a process it does not serve*, review
+  round 21 isolation R3): the real `scripts/cgroup-broker.py --spawn`
+  chain, `serve()` loop and orchestrator client (`_adopt_cgroup_broker`,
+  `_cgroup_request`, `_hand_cgroup_broker_to_exec`) over a throwaway
+  v2-shaped directory: the orchestrator reaches the broker through its
+  descriptor alone; the broker stops when the orchestrator is gone; an
+  exec of the orchestrator (`_sleep_then_reexec`) keeps it; concurrent
+  requests each get their own answer; a timed-out request leaves nothing
+  for the next; no descriptor is an unreachable broker; and a descriptor
+  that is not the broker's is not used.
+- `tests/test_heldout_sandbox_reaches_no_broker.py` (2 tests,
+  `real_heldout_sandbox`; same section): held-out code in a real sandbox
+  cannot reach a real broker, and an isolated worker started through the
+  shim holds no socket of the orchestrator's. Needs a real sandbox and a
+  broker started by `cgroup-broker.py --spawn` with its v2 root at
+  `$R21_CG_SLICE` (a container harness run as root, dropping to leerie as
+  `container-entry.sh` does); skips otherwise.
+- `tests/test_worker_commands_cannot_reach_the_cli.py` (8 test functions,
+  9 cases; DESIGN §6 *A worker's commands cannot reach its CLI*, review
+  round 21 isolation R4): with a stand-in CLI that runs
+  `CLAUDE_CODE_SHELL_PREFIX` as the real one does (the shim, grants,
+  `_invoke`, transcript registry and readers real), code a worker runs
+  cannot write a forged event into its transcript through
+  `/proc/<cli>/fd/1` (2 cases: unisolated and isolated, the latter skipped
+  where the host cannot build a sandbox); a settings prefix below
+  leerie's `--settings` cannot unset leerie's shell; settings layers merge
+  in the CLI's order; a malformed settings file is logged and left out; a
+  confined worker reads no settings file; the host seam is untouched;
+  `scripts/worker-shell.py` fails closed (126) where it cannot nest, and
+  runs a command as `bash` would.

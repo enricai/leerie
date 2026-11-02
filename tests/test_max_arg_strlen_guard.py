@@ -14,6 +14,7 @@ Mirrors test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined.
 from __future__ import annotations
 
 import inspect
+from tests.conftest import fake_run_dir
 
 # Linux's real per-argument ceiling (PAGE_SIZE * 32 on a 4KB-page kernel),
 # measured directly in the incident's Colima VM. Not raisable, and
@@ -158,8 +159,8 @@ def test_build_size_retry_prompt_reaches_stdin_not_argv(leerie):
                 "result": "{}", "structured_output": {"categories": []}}
 
     st = types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         # claude_p derives the checkout write-denial from this
         # (_repo_write_denials) and the §12 cwd guard compares against it;
         # a stub without it silently disables both.

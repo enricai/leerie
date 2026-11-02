@@ -73,8 +73,7 @@ def _drive_to_finalize(leerie, monkeypatch, run_dirs, *, conformance_raises):
     st = _make_state(leerie, run_dirs, _seeded())
     leerie_root, run_id, run_dir = run_dirs
     asyncio.run(leerie._run_phases(
-        _args(no_push=True, no_verify=True, pr_template="tmpl",
-              host_no_push=False),
+        _args(no_push=True, no_verify=True, pr_template="tmpl"),
         _caps(leerie), run_dir, st, "codebase", "normal", MODELS, EFFORTS))
     return st, calls, finalize_kwargs
 
@@ -113,12 +112,15 @@ def test_final_conformance_success_reaches_finalize_with_no_fabricated_warning(
 
 def test_phase_finalize_receives_the_run_flags_from_args(
         leerie, monkeypatch, run_dirs):  # noqa: F811
-    """The four `getattr(args, ..., default)` reads at the `phase_finalize`
-    call site must actually reach it with the values `args` carries."""
+    """The three `getattr(args, ..., default)` reads at the `phase_finalize`
+    call site must actually reach it with the values `args` carries, and
+    nothing else can stand in for the run's push choice."""
     _st, _calls, kwargs = _drive_to_finalize(
         leerie, monkeypatch, run_dirs, conformance_raises=False)
 
     assert kwargs["no_push"] is True
     assert kwargs["no_verify"] is True
     assert kwargs["pr_template_override"] == "tmpl"
-    assert kwargs["host_no_push"] is False
+    assert set(kwargs) & {"no_push", "no_verify", "pr_template_override"} \
+        == {"no_push", "no_verify", "pr_template_override"}
+    assert not any("push" in k for k in kwargs if k != "no_push")

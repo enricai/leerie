@@ -1535,7 +1535,14 @@ def test_all_required_output_still_validates_against_the_original(leerie):
     """
     jsonschema = pytest.importorskip("jsonschema")
 
+    root: dict = {}
+
     def synth(node):
+        # A local `$ref` (the planner/classifier/auditor `$defs`) is
+        # resolved against the schema being synthesised.
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            return synth(root["$defs"][ref[len("#/$defs/"):]])
         t = node.get("type")
         if isinstance(t, list):
             non_null = [x for x in t if x != "null"]
@@ -1558,6 +1565,7 @@ def test_all_required_output_still_validates_against_the_original(leerie):
 
     bad = []
     for name, schema in leerie.SCHEMAS.items():
+        root = schema
         try:
             jsonschema.validate(synth(schema), schema)
         except jsonschema.ValidationError as e:

@@ -17,6 +17,18 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tests.conftest import register_worker_transcript, transcript_path
+
+
+def _registered(log_dir: Path) -> Path:
+    """Register every fixture log in `log_dir` as a worker transcript —
+    `_extract_depcap_commands` reads registered transcripts only."""
+    for p in sorted(log_dir.glob("*.log")):
+        dest = transcript_path(log_dir, p.name)
+        p.rename(dest)
+        register_worker_transcript(dest)
+    return log_dir
+
 
 # ---------------------------------------------------------------------------
 # Absence pins — regex path must not exist
@@ -130,7 +142,7 @@ def _make_jsonl_log(tmp_path: Path, commands: list[str], fname: str = "worker-00
     """Write a synthetic JSONL log file in the _iter_log_tool_use shape."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir(exist_ok=True)
-    log_path = log_dir / fname
+    log_path = transcript_path(log_dir, fname)
     lines: list[str] = []
     for i, cmd in enumerate(commands):
         event = {
@@ -147,6 +159,7 @@ def _make_jsonl_log(tmp_path: Path, commands: list[str], fname: str = "worker-00
         }
         lines.append(json.dumps(event))
     log_path.write_text("\n".join(lines) + "\n")
+    register_worker_transcript(log_path)
     return log_dir
 
 
@@ -158,7 +171,7 @@ class TestExtractDepcapCommands:
             "sudo -n apt-get install -y postgresql libpq-dev",
             "pip install -r requirements.txt",
         ])
-        text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+        text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
         assert "apt-get install" in text
         assert "pip install" in text
         assert not hit_ceiling
@@ -166,7 +179,7 @@ class TestExtractDepcapCommands:
     def test_empty_log_dir(self, leerie, tmp_path):
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
-        text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+        text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
         assert text == ""
         assert not hit_ceiling
 
@@ -187,7 +200,7 @@ class TestExtractDepcapCommands:
                 }
             }
             log_path.write_text(json.dumps(event) + "\n")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         # Command should appear only once (deduped).
         assert text.count("apt-get install -y postgresql") == 1
 
@@ -195,7 +208,7 @@ class TestExtractDepcapCommands:
         """Only Bash tool_use blocks are extracted; Read blocks are skipped."""
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
-        log_path = log_dir / "worker-001.log"
+        log_path = transcript_path(log_dir, "worker-001.log")
         event = {
             "message": {
                 "content": [
@@ -209,12 +222,12 @@ class TestExtractDepcapCommands:
             }
         }
         log_path.write_text(json.dumps(event) + "\n")
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "should-not-appear" not in text
 
     def test_returns_tuple_str_bool(self, leerie, tmp_path):
         log_dir = _make_jsonl_log(tmp_path, ["apt-get install -y curl"])
-        result = leerie._extract_depcap_commands(log_dir)
+        result = leerie._extract_depcap_commands(_registered(log_dir))
         assert isinstance(result, tuple)
         assert len(result) == 2
         text, hit_ceiling = result
@@ -231,7 +244,7 @@ class TestExtractDepcapCommands:
         orig_budget = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = 2000
-            text, hit_ceiling = leerie._extract_depcap_commands(log_dir)
+            text, hit_ceiling = leerie._extract_depcap_commands(_registered(log_dir))
             assert hit_ceiling
         finally:
             leerie._DEPCAP_TOTAL_BUDGET = orig_budget
@@ -246,7 +259,7 @@ class TestExtractDepcapCommands:
             "ls /work/subtasks",                 # dropped
             "python3 -m pytest tests/ -x",       # dropped
         ])
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert "pip install -r requirements.txt" in text
         assert "apt-get install -y libvips-dev" in text
         assert "pnpm add sharp" in text
@@ -264,7 +277,7 @@ class TestExtractDepcapCommands:
             "git commit -m 'wire pip install seam'",
             'echo "run pnpm install to build"',
         ])
-        text, _ = leerie._extract_depcap_commands(log_dir)
+        text, _ = leerie._extract_depcap_commands(_registered(log_dir))
         assert text == ""
 
 
@@ -397,7 +410,7 @@ def _make_fake_state(tmp_path: Path, commands: list[str]):
 
 def _make_jsonl_log_in(log_dir: Path, commands: list[str]) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "worker-001.log"
+    log_path = transcript_path(log_dir, "worker-001.log")
     lines: list[str] = []
     for i, cmd in enumerate(commands):
         event = {
@@ -412,6 +425,7 @@ def _make_jsonl_log_in(log_dir: Path, commands: list[str]) -> None:
         }
         lines.append(json.dumps(event))
     log_path.write_text("\n".join(lines) + "\n")
+    register_worker_transcript(log_path)
 
 
 def _git_init(repo: Path) -> None:
@@ -1105,6 +1119,7 @@ class TestBackstopCapturePriorRuns:
             asyncio.run(leerie._backstop_capture_prior_runs(
                 leerie_root, repo,
                 caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                record_in=tmp_path / "current-run",
             ))
 
         assert called == [], "run with sentinel must not trigger capture"
@@ -1126,15 +1141,19 @@ class TestBackstopCapturePriorRuns:
         called = []
 
         async def _fake_capture(repo_root, st, **kwargs):
-            called.append(getattr(st, "run_dir", None))
+            called.append((getattr(st, "run_dir", None),
+                           kwargs.get("record_in")))
 
         with patch.object(leerie, "capture_repo_deps", new=_fake_capture):
             asyncio.run(leerie._backstop_capture_prior_runs(
                 leerie_root, repo,
                 caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                record_in=tmp_path / "current-run",
             ))
 
-        assert len(called) == 1 and called[0] == run_dir
+        # The prior run's logs, recorded in the current run's directory for
+        # the host to apply (DESIGN §6½ *The host applies a capture*).
+        assert called == [(run_dir, tmp_path / "current-run")]
 
     def test_skips_run_with_an_empty_logs_dir(self, leerie, tmp_path,
                                                monkeypatch):
@@ -1166,6 +1185,7 @@ class TestBackstopCapturePriorRuns:
             asyncio.run(leerie._backstop_capture_prior_runs(
                 leerie_root, repo,
                 caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                record_in=tmp_path / "current-run",
             ))
 
         assert called == [], (
@@ -1192,6 +1212,7 @@ class TestBackstopCapturePriorRuns:
             asyncio.run(leerie._backstop_capture_prior_runs(
                 leerie_root, repo,
                 caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                record_in=tmp_path / "current-run",
             ))
 
         assert called == [], "run without logs/ must not trigger capture"

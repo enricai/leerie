@@ -84,7 +84,6 @@ def _args(**overrides) -> SimpleNamespace:
         skip_smoke=True,
         no_push=False,
         pr_template=None,
-        host_no_push=None,
         pr_base_branch=None,
         group_id=None,
         inspect_dirs=[],
@@ -478,6 +477,10 @@ def test_completed_run_guard_returns_early_unchanged(leerie, run_dirs):
         "current_phase": "phase 6: finalize",
     }
     st.save()
+    # A pushed run whose finalize wrote its PR: the resume has nothing to
+    # write either (without a `pr_title` it would run `pr_writer` —
+    # tests/test_resume_push_writes_pr.py).
+    leerie._write_run_json(st.run_dir, pr_title="t", pr_body="b")
     args = _args()
     # Must return (not raise, not die) — no _StopAtExecute, since
     # phase_execute must never even be reached.
@@ -494,8 +497,7 @@ def test_no_work_required_guard_returns_early_unchanged(leerie, run_dirs):
         "no_work_required": True,
         # Deliberately no `current_phase == "phase 6: finalize"` and no
         # `waves`/`categories` — proves this guard fires independently of
-        # the completed-run guard and ahead of the "no progress at all"
-        # die() below it.
+        # the completed-run guard.
     }
     st.save()
     args = _args()

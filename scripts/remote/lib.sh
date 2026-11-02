@@ -66,7 +66,7 @@ update_run_json() {
   # Python handles the read+merge+write so we don't reimplement JSON
   # escaping in bash. The trailing args are key/value pairs; odd-count
   # is a programming error.
-  if ! python3 - "$sidecar" "$tmp" "$@" <<'PY'
+  if ! python3 -I - "$sidecar" "$tmp" "$@" <<'PY'
 import json, os, sys
 sidecar, tmp, *rest = sys.argv[1:]
 if len(rest) % 2 != 0:
@@ -97,25 +97,11 @@ PY
   mv "$tmp" "$sidecar"
 }
 
-# --- remote_host_no_push ---------------------------------------------------
-# Print "true" when the user opted out of pushing at launch, else "false":
-# the launcher's NO_PUSH, or host_no_push in the runtime sidecar
-# (fly-machine.json / ec2-instance.json). Both remote teardowns gate
-# auto-finalize on this. run.json cannot carry the intent: the fetch strips
-# no_push=true whenever a run branch exists. A missing sidecar reads false.
-remote_host_no_push() {
-  if [ "${NO_PUSH:-false}" = "true" ]; then echo true; return 0; fi
-  python3 -c '
-import json, sys
-try: print("true" if json.load(open(sys.argv[1])).get("host_no_push") is True else "false")
-except Exception: print("false")' "$1" 2>/dev/null || echo false
-}
-
 # --- iso_now -------------------------------------------------------------
 # Emit an ISO-8601 UTC timestamp (sub-second precision). Used as
 # paused_at / similar event markers.
 iso_now() {
-  python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))'
+  python3 -I -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))'
 }
 
 # --- remote_log ----------------------------------------------------------
@@ -540,7 +526,7 @@ require_flyctl() {
 # accumulation). Never auto-killed. Reboot wipes the socket inode → next
 # run lazy-spawns fresh.
 _leerie_fly_agent_ensure() {
-  local agent_dir sock lockdir i
+  local agent_dir sock lockdir i rc=0
   agent_dir="${XDG_CACHE_HOME:-$HOME/.cache}/leerie/agent"
   sock="$agent_dir/ssh-agent.sock"
   lockdir="$agent_dir/.spawn.lock"
@@ -563,14 +549,20 @@ _leerie_fly_agent_ensure() {
   # subsequent function return up the call chain). Instead, we rmdir
   # explicitly at each return path below.
   if [ -S "$sock" ]; then
-    SSH_AUTH_SOCK="$sock" ssh-add -l >/dev/null 2>&1
     # ssh-add -l exit codes: 0 = has keys, 1 = agent reachable but has no
     # keys yet, 2 = cannot connect to the agent at all. Only rc 2 means
     # the socket is stale; rc 1 is a perfectly healthy, just-spawned or
     # freshly-cert-expired agent and must be reused, not respawned —
     # respawning on rc 1 unlinks a live agent's socket out from under it
     # (rm -f below) while the agent process keeps running, orphaning it.
-    if [ "$?" -ne 2 ]; then
+    #
+    # The status is data, so it is captured with `|| rc=$?`, never read
+    # from `$?` after a bare statement: under the launcher's `set -e` a bare
+    # `ssh-add -l` returning 1 ended the launcher right here, with no
+    # message and the spawn lock left behind for every later invocation
+    # to wait out.
+    SSH_AUTH_SOCK="$sock" ssh-add -l >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 2 ]; then
       export SSH_AUTH_SOCK="$sock"
       rmdir "$lockdir" 2>/dev/null || true
       return 0
@@ -591,9 +583,16 @@ _leerie_fly_agent_ensure() {
   # (it stops us orphaning a live agent in the first place); reaping an
   # agent orphaned some other way would need a real reaper, which does not
   # exist yet.
-  ssh-agent -a "$sock" -t 24h >/dev/null 2>&1
-  export SSH_AUTH_SOCK="$sock"
+  # The lock is released before a failure is returned, so a failed spawn
+  # does not make every later invocation wait out a lock nobody holds.
+  rc=0
+  ssh-agent -a "$sock" -t 24h >/dev/null 2>&1 || rc=$?
   rmdir "$lockdir" 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    remote_log "could not start leerie's private ssh-agent at $sock (ssh-agent exited $rc)"
+    return "$rc"
+  fi
+  export SSH_AUTH_SOCK="$sock"
 }
 
 # --- require_fly_ssh ------------------------------------------------------
@@ -614,8 +613,8 @@ _leerie_fly_agent_ensure() {
 # org), seed-auth will surface the original SSH error.
 require_fly_ssh() {
   local fly_org="${LEERIE_FLY_ORG:-personal}"
-  _leerie_fly_agent_ensure
-  if ssh-add -l 2>/dev/null | grep -qE 'CERT\)'; then
+  _leerie_fly_agent_ensure || return 1
+  if grep -qE 'CERT\)' < <(ssh-add -l 2>/dev/null); then
     return 0
   fi
   remote_log "remote: issuing Fly SSH certificate (24h) for org=$fly_org"
@@ -672,10 +671,10 @@ wait_for_fly_ssh_ready() {
     # macOS Jetsam when the host is under memory pressure from
     # concurrent leerie runs. The probe still retries; we just don't
     # leak the alarming-looking stderr to the user.
+    probe_exit=0
     ( timeout --kill-after=2 10 flyctl ssh console --app "$fly_app" \
         --machine "$machine_id" --pty=false -C "true" \
-        </dev/null >/dev/null 2>&1 ) 2>/dev/null
-    probe_exit=$?
+        </dev/null >/dev/null 2>&1 ) 2>/dev/null || probe_exit=$?
     if [ "$probe_exit" -eq 0 ]; then
       remote_log "remote: hallpass ready on $machine_id"
       return 0

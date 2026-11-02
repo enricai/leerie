@@ -141,6 +141,7 @@ seed_auth() {
     err_log="$(mktemp)"
     _seed_progress_bg "seed_auth" &
     _hb_pid=$!
+    tar_rc=0
     # `-z` (gzip) on both ends: the residual stage is mostly JSON /
     # markdown / small binaries; gzip cuts ~2x off the wire. The
     # Debian 13 image has GNU tar which auto-detects -z. macOS bsdtar
@@ -156,8 +157,8 @@ seed_auth() {
              --app "$FLY_APP" \
              --machine "$machine_id" \
              --pty=false \
-             -C "sh -c 'tar -xzC /home/leerie && chown -R leerie: /home/leerie'" 2>"$err_log"
-    tar_rc=${PIPESTATUS[1]}
+             -C "sh -c 'tar -xzC /home/leerie && chown -R leerie: /home/leerie'" 2>"$err_log" \
+         || tar_rc=${PIPESTATUS[1]}
     kill "$_hb_pid" 2>/dev/null || true
     wait "$_hb_pid" 2>/dev/null || true
     if [ "$tar_rc" -eq 0 ]; then
@@ -341,7 +342,7 @@ if [ -s "$KNOWN" ]; then
   # `2>>"$LOG"` captures the python3 stderr so a JSON parse error
   # (corrupted file, schema drift) lands in plugin-install.log
   # instead of silently zero-iterating the while loop below.
-  python3 -c '
+  python3 -I -c '
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))
@@ -370,7 +371,7 @@ fi
 # user-scope makes the plugin available to whichever task is running
 # instead of nothing (the host projectPath doesn't exist remotely).
 if [ -s "$INSTALLED" ]; then
-  python3 -c '
+  python3 -I -c '
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))

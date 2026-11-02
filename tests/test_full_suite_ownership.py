@@ -330,8 +330,8 @@ def _spawn(leerie, monkeypatch, repo_root, *, schema_key="implementer",
                 "result": "{}", "structured_output": {"categories": []}}
 
     st = types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         repo_root=repo_root, data={"verbosity": "quiet", **(data or {})},
         run_id="r1", bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None)
@@ -359,10 +359,19 @@ def test_the_deny_reaches_the_argv(leerie, monkeypatch, tmp_path):
     assert deny.startswith("Agent,Task,"), "base denials must be preserved"
 
 
+def _suite_rules(leerie, deny):
+    """The `Bash(...)` rules in `deny` other than the process-kill rules
+    every shell-capable worker carries (DESIGN §9)."""
+    kill = {f"Bash({p})" for p in leerie._forbidden_command_rule_patterns(
+        list(leerie.PROCESS_KILL_DENY_COMMANDS))}
+    return [r for r in deny.split(",") if r.startswith("Bash(")
+            and r not in kill]
+
+
 def test_no_deny_when_the_repo_has_no_test_command(leerie, monkeypatch,
                                                    tmp_path):
     deny = _argv_for(leerie, monkeypatch, _repo(tmp_path, test=""))
-    assert "Bash(" not in deny
+    assert _suite_rules(leerie, deny) == []
 
 
 def _notice_lines(prompt):
@@ -403,15 +412,24 @@ def test_a_worker_that_cannot_reach_the_runner_gets_no_notice(
 
 def test_a_widened_runner_grant_does_get_the_notice(leerie, monkeypatch,
                                                     tmp_path):
+    repo = _repo(tmp_path)
     _deny, prompt = _spawn(
-        leerie, monkeypatch, _repo(tmp_path), schema_key="classifier",
+        leerie, monkeypatch, repo, schema_key="planner",
         allowed_tools=leerie.INSPECT_TOOLS + ",Bash(pytest:*)")
     assert len(_notice_lines(prompt)) == 1
+    # The classifier is the exception: it types constraints from the task,
+    # so it never receives an orchestrator notice (DESIGN §9 *A command the
+    # task forbids*); its deny rules still apply.
+    deny, prompt = _spawn(
+        leerie, monkeypatch, repo, schema_key="classifier",
+        allowed_tools=leerie.INSPECT_TOOLS + ",Bash(pytest:*)")
+    assert _notice_lines(prompt) == []
+    assert "Bash(pytest tests)" in deny
 
 
 def test_no_deny_means_no_notice(leerie, monkeypatch, tmp_path):
     deny, prompt = _spawn(leerie, monkeypatch, _repo(tmp_path, test=""))
-    assert "Bash(" not in deny
+    assert _suite_rules(leerie, deny) == []
     assert _notice_lines(prompt) == []
 
 
@@ -447,7 +465,7 @@ def test_docs_only_subtask_defers_tests_end_to_end(leerie, monkeypatch,
     for d in ("subtasks", "criteria", "logs", "worktrees"):
         (run_dir / d).mkdir(parents=True)
     sid = "docs-002"
-    wt = run_dir / "worktrees" / sid
+    wt = leerie._subtask_worktree_path(run_dir, sid)
     run_git_repo_first(repo, "worktree", "add", "-q", "-b",
                        f"leerie/subtasks/{run_id}/{sid}", str(wt), run_branch)
     (wt / "docs" / "DESIGN.md").write_text("# design\n\nnew section\n")
@@ -590,11 +608,14 @@ class TestHostileRepoFiles:
 # ---------------------------------------------------------------------------
 
 from tests.test_declared_commands_executed import (  # noqa: E402
-    _COMPLETE_RES_EXTRA, _declare, _settle, _write_worker_log)
+    _COMPLETE_RES_EXTRA, _declare, _settle, _verification_only_harness,
+    _write_worker_log)
 from tests.test_oom_naming import env  # noqa: E402,F401  (pytest fixture)
+from tests.conftest import fake_run_dir
 
 
-def _settle_env(env, monkeypatch, *, declared, prescribed=None):  # noqa: F811
+def _settle_env(env, monkeypatch, *, declared, prescribed=None,
+                settle_by_execution=False):  # noqa: F811
     leerie_mod = env["leerie"]
     repo = env["repo"]
     (repo / ".leerie").mkdir(exist_ok=True)
@@ -604,7 +625,8 @@ def _settle_env(env, monkeypatch, *, declared, prescribed=None):  # noqa: F811
     if prescribed is not None:
         env["st"].data["prescribed_procedure"] = prescribed
     _declare(env, declared)
-    _write_worker_log(env["run_dir"] / "logs" / f"{env['sid']}.log",
+    _write_worker_log(env["leerie"]._worker_log_path(
+        env["run_dir"], env["sid"], "implementer"),
                       ["python3 -m pytest tests/test_x.py -q"])
     calls: list = []
 
@@ -615,12 +637,12 @@ def _settle_env(env, monkeypatch, *, declared, prescribed=None):  # noqa: F811
                 **_COMPLETE_RES_EXTRA}
     monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
 
-    async def _stub_probe(subtask, worktree_, st, caps, models, efforts,
-                          label="post"):
-        return {"satisfied": True, "evidence": "on the run branch",
-                "checked": ["src.py"]}
-    monkeypatch.setattr(leerie_mod, "_probe_criteria_satisfied_on_head",
-                        _stub_probe)
+    if settle_by_execution:
+        # Settle the no-commits claim by (stubbed) execution so no conformer
+        # spawns (DESIGN §8 *Settled by execution*). The controls leave it
+        # off: with neither commits nor `verification_only`, an unrun
+        # declared command can only block.
+        _verification_only_harness(env, monkeypatch)
     res = _settle(leerie_mod, env, failed_retries=0,
                   implementer_confidence_retries=1)
     return res, calls
@@ -632,7 +654,8 @@ def test_settle_exempts_a_denied_declared_command(
     complete on targeted runs alone, with no corrective re-drive."""
     res, calls = _settle_env(
         env, monkeypatch,
-        declared=["pytest tests/", "python3 -m pytest tests/test_x.py -q"])
+        declared=["pytest tests/", "python3 -m pytest tests/test_x.py -q"],
+        settle_by_execution=True)
     assert res["status"] == "complete"
     assert len(calls) == 1
 

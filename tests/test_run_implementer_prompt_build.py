@@ -48,7 +48,7 @@ def env(leerie, tmp_path):
     leerie_root = repo / ".leerie"
     run_dir = leerie_root / "runs" / run_id
     (run_dir / "subtasks").mkdir(parents=True)
-    (run_dir / "checkpoints").mkdir()
+    (run_dir / "notes").mkdir()
     (run_dir / "artifacts").mkdir()
 
     spec = {
@@ -84,7 +84,7 @@ def env(leerie, tmp_path):
 
 
 def _stub_run_script_ok(leerie_mod, monkeypatch, worktree_path):
-    async def _fake(name, *args):
+    async def _fake(name, *args, **_kw):
         assert name == "new-worktree.sh"
         return subprocess.CompletedProcess(
             args=["bash"], returncode=0, stdout=f"{worktree_path}\n", stderr="")
@@ -94,7 +94,7 @@ def _stub_run_script_ok(leerie_mod, monkeypatch, worktree_path):
 def _stub_claude_p_capture(leerie_mod, monkeypatch, calls):
     async def _fake(user_prompt, system_prompt, *, schema_key, cwd,
                     allowed_tools, max_turns, autonomous, caps, st, model,
-                    sid, add_dirs=None, effort=None, _suppress_capture=False):
+                    sid, add_dirs=None, effort=None, _suppress_capture=False, **_kw):
         calls.append({"user_prompt": user_prompt, "schema_key": schema_key,
                      "cwd": cwd, "model": model, "sid": sid})
         return {"subtask_id": sid, "status": "complete", "branch": "b"}
@@ -198,7 +198,8 @@ def test_continuation_with_checkpoint_present(env, monkeypatch):
     _stub_run_script_ok(leerie_mod, monkeypatch, env["repo"] / "wt")
     calls: list = []
     _stub_claude_p_capture(leerie_mod, monkeypatch, calls)
-    ckpt = env["run_dir"] / "checkpoints" / f"{env['sid']}.md"
+    ckpt = env["run_dir"] / "notes" / env["sid"] / "checkpoint.md"
+    ckpt.parent.mkdir(parents=True)
     ckpt.write_text("# Checkpoint\n")
 
     asyncio.run(leerie_mod._run_implementer(
@@ -255,7 +256,7 @@ def test_worker_error_becomes_incomplete_handoff(env, monkeypatch):
 
     assert res["status"] == "incomplete-handoff"
     assert res["checkpoint_path"] == str(
-        env["run_dir"] / "checkpoints" / f"{env['sid']}.md")
+        env["run_dir"] / "notes" / env["sid"] / "checkpoint.md")
     assert "hit --max-turns mid-task" in res["summary"]
 
 
@@ -287,7 +288,7 @@ def test_worktree_setup_error_on_nonzero_returncode(env, monkeypatch):
     through the real function body rather than a stub of it."""
     leerie_mod = env["leerie"]
 
-    async def _fake(name, *args):
+    async def _fake(name, *args, **_kw):
         return subprocess.CompletedProcess(
             args=["bash"], returncode=1, stdout="", stderr="fatal: exists")
     monkeypatch.setattr(leerie_mod, "_run_script", _fake)

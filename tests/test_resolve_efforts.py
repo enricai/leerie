@@ -286,14 +286,41 @@ def test_judgment_workers_pinned_set(leerie):
         # Held-out acceptance test writer (DESIGN §8 *Held-out acceptance
         # tests*) — measured at medium (40/40 page verdicts correct).
         "acceptance_writer",
+        # The held-out set audit and the surrogate witness (DESIGN §8 *A
+        # set that keeps failing is audited, and rewritten once*), both
+        # benched at medium (Q6).
+        "set_auditor",
+        "surrogate_fixer",
+        # Enumerates the repository's own merge checks (DESIGN §9), benched
+        # at medium (N6).
+        "ci_checks",
+        # The report-bounded scope judge (DESIGN §8), benched at medium (P2).
+        "scope_judge",
+        # Types a worker-flagged contract (DESIGN §8 *Typed evidence for
+        # the delivery judge*), benched at medium.
+        "contract_extractor",
+        # The delivery falsifier (DESIGN §8 *Delivery detection*), benched
+        # at medium (Q2 F+).
+        "falsifier",
+        # The delivery ratchet's classifier and judge (DESIGN §8 *A repair
+        # that regresses met work is rolled back*), benched at medium (Q4).
+        "verifiability_classifier",
+        "delivery_ratchet",
+        # Re-draws the forbidden-command extraction (DESIGN §9 *A command
+        # the task forbids*): the judgment tier's medium.
+        "forbidden_command_extractor",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'
     # (determinism/reproducibility). A deliberate override of the prior
     # "bounded by the DESIGN §8 evidence gate" unset default.
     acting_workers = {"implementer", "conformer"}
+    # The advisory whole-PR review runs at high, as benched (bench N2f).
+    high_workers = {"pr_reviewer"}
 
-    assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == judgment_workers | acting_workers
+    assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == (
+        judgment_workers | acting_workers | high_workers)
+    assert leerie.EFFORT_DEFAULT_PER_WORKER["pr_reviewer"] == "high"
     for w in judgment_workers:
         assert leerie.EFFORT_DEFAULT_PER_WORKER[w] == "medium"
     for w in acting_workers:

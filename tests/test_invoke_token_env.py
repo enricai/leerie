@@ -6,6 +6,7 @@ is set fresh on every subprocess spawn).
 """
 from __future__ import annotations
 
+import os
 import asyncio
 
 import pytest
@@ -66,7 +67,7 @@ class TestActiveTokenEnvThreading:
                     ["claude", "-p"], cwd="/work", timeout=60,
                     sid="test-sid", leerie_dir=tmp_path, verbosity="quiet",
                     active_token="fresh-token",
-                )
+                grants=leerie.WorkerGrants(("/",), ()))
             except Exception:
                 # _invoke's streaming loop may raise once the fake stream
                 # dries up with no result event — irrelevant to this test,
@@ -79,9 +80,17 @@ class TestActiveTokenEnvThreading:
         assert env is not None
         assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "fresh-token"
 
-    def test_no_active_token_leaves_env_none(self, leerie, monkeypatch, tmp_path):
-        """Byte-identical to pre-feature behavior when active_token is not
-        passed — env=None, full os.environ inheritance."""
+    def test_no_active_token_inherits_the_full_environment(
+            self, leerie, monkeypatch, tmp_path):
+        """No token: the worker inherits the orchestrator's whole
+        environment — except leerie's hooks-off git entry, which a worker
+        never gets (DESIGN §6½ *Hooks off*), and with its own stores and
+        caches (DESIGN §6 *The stores a view installs from are leerie's*)."""
+        env0 = dict(os.environ)
+        leerie._git_hooks_off(env0)             # what main() does
+        for k, v in env0.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("LEERIE_PROBE_MARK", "inherited")
         captured = []
         _patch_invoke_internals(leerie, monkeypatch, captured)
         monkeypatch.delenv("LEERIE_WORKER_DEBUG", raising=False)
@@ -91,12 +100,23 @@ class TestActiveTokenEnvThreading:
                 await leerie._invoke(
                     ["claude", "-p"], cwd="/work", timeout=60,
                     sid="test-sid", leerie_dir=tmp_path, verbosity="quiet",
-                )
+                grants=leerie.WorkerGrants(("/",), ()))
             except Exception:
                 pass
 
         asyncio.run(run())
-        assert captured[0] is None
+        env = captured[0]
+        base = leerie._worker_cache_env(
+            leerie._git_hooks_on(os.environ), tmp_path)
+        assert env == {**base,
+            # Confined: its commands run nested in its CLI's domain (DESIGN
+            # §6 *A worker's commands cannot reach its CLI*), and its CLI's
+            # own git on leerie's terms (*The CLI's own git runs on leerie's
+            # terms*).
+            leerie.SHELL_PREFIX_ENV: str(leerie.WORKER_SHELL),
+            **leerie._cli_git_env("/work", base.get("PATH", ""))}
+        assert env["LEERIE_PROBE_MARK"] == "inherited"
+        assert "LEERIE_GIT_HOOKS_OFF" not in env
 
     def test_active_token_composes_with_worker_debug(
             self, leerie, monkeypatch, tmp_path):
@@ -112,7 +132,7 @@ class TestActiveTokenEnvThreading:
                     ["claude", "-p"], cwd="/work", timeout=60,
                     sid="test-sid", leerie_dir=tmp_path, verbosity="quiet",
                     active_token="fresh-token",
-                )
+                grants=leerie.WorkerGrants(("/",), ()))
             except Exception:
                 pass
 
@@ -136,7 +156,7 @@ class TestActiveTokenEnvThreading:
                         ["claude", "-p"], cwd="/work", timeout=60,
                         sid="test-sid", leerie_dir=tmp_path, verbosity="quiet",
                         active_token=tok,
-                    )
+                    grants=leerie.WorkerGrants(("/",), ()))
                 except Exception:
                     pass
 

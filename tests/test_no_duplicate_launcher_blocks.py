@@ -9,7 +9,7 @@ instances; it did not stop the next one. Three MORE reproductions were
 found afterwards outside the original list, and two had already drifted:
 
 - `tests/test_launcher_state_mount.py` reproduced the `nerdctl run` argv,
-  missing `--cidfile`, `--cgroupns=host`, `ROOTLESS_SECOPT`, the `LEERIE_*`
+  missing `--cidfile`, `--cgroupns=host`, `SECOPT`, the `LEERIE_*`
   auto-forward and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`, and inlining one of
   three `CGROUP_MOUNT_ARG` branches as a literal.
 - `tests/test_launcher_runtime_knob.py` reproduced the RUNTIME block with

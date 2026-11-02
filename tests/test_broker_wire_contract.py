@@ -50,6 +50,8 @@ _PIDS_CURRENT = 137
 _PIDS_MAX = 2048
 _PIDS_EVENTS_MAX = 3
 _OOM_KILL = 2
+_MEMORY_PEAK = 19123456789
+_PIDS_PEAK = 2852
 
 
 @pytest.fixture
@@ -86,6 +88,8 @@ def broker(tmp_path, monkeypatch):
     (w / "pids.max").write_text(f"{_PIDS_MAX}\n")
     (w / "pids.events").write_text(f"max {_PIDS_EVENTS_MAX}\n")
     (w / "memory.events").write_text(f"oom_kill {_OOM_KILL}\n")
+    (w / "memory.peak").write_text(f"{_MEMORY_PEAK}\n")
+    (w / "pids.peak").write_text(f"{_PIDS_PEAK}\n")
 
     monkeypatch.setattr(mod, "V2_ROOT", str(root))
     monkeypatch.setattr(mod, "V1_ROOT", str(root))
@@ -176,6 +180,23 @@ def test_stat_arity_drift_is_detected(broker, leerie, monkeypatch):
     assert leerie._cgroup_stat("wsid") is None
 
 
+# ---- peak ---------------------------------------------------------------
+
+def test_peak_response_parses_in_leerie(broker, leerie, monkeypatch):
+    """`peak` sizes the run's worker caps (DESIGN §6 *The repo's own build
+    peak*); a silent None would leave every cap at the constant."""
+    resp = broker._handle("peak wsid")
+    assert resp.startswith("OK "), resp
+    _feed(leerie, monkeypatch, resp)
+    assert leerie._cgroup_peak("wsid") == (_MEMORY_PEAK, _PIDS_PEAK)
+
+
+def test_peak_arity_drift_is_detected(broker, leerie, monkeypatch):
+    real = broker._handle("peak wsid")
+    _feed(leerie, monkeypatch, real + " 999")
+    assert leerie._cgroup_peak("wsid") is None
+
+
 # ---- probe ------------------------------------------------------------
 
 def test_probe_response_parses_in_leerie(broker, leerie, monkeypatch):
@@ -211,3 +232,4 @@ def test_broker_emits_the_verbs_this_file_pins(broker):
     assert not broker._handle("slice").startswith("ERR")
     assert not broker._handle("stat wsid").startswith("ERR")
     assert not broker._handle("probe").startswith("ERR")
+    assert not broker._handle("peak wsid").startswith("ERR")

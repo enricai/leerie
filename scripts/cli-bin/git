@@ -1,0 +1,10 @@
+#!/bin/sh
+# The `git` first on a confined worker's CLI's PATH (DESIGN §6 *The CLI's own
+# git runs on leerie's terms*). A command of the worker's own — run through
+# `worker-shell.py`, which marks it — gets the real git untouched: inside its
+# nested domain its choices reach only itself. Anything else is the CLI's own
+# git, which `cli-git.py` runs on leerie's addressing, nested.
+if [ "${LEERIE_WORKER_COMMAND-}" = 1 ]; then
+  exec "${LEERIE_REAL_GIT:-/usr/bin/git}" "$@"
+fi
+exec /usr/bin/python3 -IS "$(dirname "$0")/../cli-git.py" "$@"

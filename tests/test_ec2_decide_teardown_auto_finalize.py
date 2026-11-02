@@ -91,21 +91,13 @@ def test_detach_rc_130_does_not_finalize_or_terminate(tmp_path):
     assert "terminate" not in calls
 
 
-def test_launch_time_no_push_skips_finalize_and_terminates(tmp_path):
-    # A resumed run's launcher may not carry --no-push; the sidecar does.
-    out = _run(tmp_path, sidecar_no_push=True)
-    assert _calls(out) == ["fetch", "terminate"]
-    assert "--no-push was set at launch" in out
-
-
-def test_no_push_on_this_launcher_also_skips_finalize(tmp_path):
-    assert _calls(_run(tmp_path, no_push_env="true")) == ["fetch", "terminate"]
-
-
-def test_recorded_push_intent_still_finalizes(tmp_path):
-    # Control: the same sidecar with host_no_push false keeps auto-finalize.
-    assert _calls(_run(tmp_path, sidecar_no_push=False)) == [
-        "fetch", "host_finalize", "terminate"]
+@pytest.mark.parametrize("kw", [{"sidecar_no_push": True}, {"no_push_env": "true"},
+                                {"sidecar_no_push": False}])
+def test_teardown_leaves_the_push_choice_to_host_finalize(tmp_path, kw):
+    # DESIGN §6 *One push choice per run, on every runtime*: host_finalize
+    # reads the run's one record, run.json.no_push; a sidecar field or this
+    # launcher's NO_PUSH is not a second owner and changes nothing here.
+    assert _calls(_run(tmp_path, **kw)) == ["fetch", "host_finalize", "terminate"]
 
 
 def test_launcher_cleanup_runs_once_on_the_exit_pass(tmp_path):

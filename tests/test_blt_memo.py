@@ -22,6 +22,7 @@ import types
 
 import pytest
 
+from tests.conftest import measure_run_dir
 from tests.conftest import run_git_cwd_kw as _git
 
 
@@ -40,11 +41,12 @@ def repo(tmp_path):
 
 
 @pytest.fixture
-def st():
+def st(tmp_path):
     saves = []
     s = types.SimpleNamespace(
         data={"provision": {"recipe": []}},
         save=lambda: saves.append(1),
+        run_dir=measure_run_dir(tmp_path),
     )
     s.saves = saves
     return s

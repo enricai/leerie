@@ -5,6 +5,53 @@ comes from the kernel tearing down the container's PID namespace, not
 Python heuristics (`DESIGN.md` §6, `IMPLEMENTATION.md` §0.5). Below:
 one-time container-runtime setup per OS, then installing leerie itself.
 
+## Kernel requirement: Landlock
+
+Leerie confines every worker with Landlock (DESIGN §6 *A worker writes only
+where it is granted (I5)*) and never runs one unconfined. The kernel that
+runs the container — the Colima VM on macOS, the host on Linux, the Fly or
+EC2 machine — needs Landlock ABI 3 or later: Linux 6.2+ with `landlock`
+among the active LSMs. Check with:
+
+```bash
+cat /sys/kernel/security/lsm     # must list landlock
+```
+
+Without it the run stops at the confinement check every entry runs
+(`_require_confinement`: a fresh run, `resume` and `--phase`), naming the
+kernel's ABI.
+
+## Runtime requirement: user namespaces and the `leerie-container` profile
+
+Every confined process also runs in namespaces of its own, and every
+held-out acceptance run in a sandbox that dies with it (DESIGN §6 *A
+held-out evaluation runs alone, in a world that dies with it (I3)*). The
+confinement shim builds them in an unprivileged user namespace, so the
+container must allow one:
+
+- the launcher passes `--security-opt seccomp=unconfined` on every local
+  run (the shim installs its own, stricter, seccomp filter per process);
+- where the kernel runs AppArmor (Ubuntu, Debian; on macOS, Colima's VM),
+  the container runs under the `leerie-container` profile
+  (`scripts/apparmor/leerie-container`). The launcher loads it the first
+  time, from a terminal (it asks for sudo); without a terminal it stops and
+  prints the two commands:
+
+```bash
+sudo install -m 0644 scripts/apparmor/leerie-container /etc/apparmor.d/leerie-container
+sudo apparmor_parser -r -W /etc/apparmor.d/leerie-container
+# Colima: colima ssh -- sudo tee /etc/apparmor.d/leerie-container < scripts/apparmor/leerie-container
+#         colima ssh -- sudo apparmor_parser -r -W /etc/apparmor.d/leerie-container
+```
+
+The confinement check every entry runs (`_require_confinement`: a fresh
+run, `resume` and `--phase`) builds a sandbox before any worker or
+repository command runs and stops the run, naming the missing flag or
+profile, when it cannot. Measured on rootless and
+rootful containerd on Linux; Colima, EC2 and Fly are not yet measured and
+fail closed the same way (a Fly machine whose kernel offers no user
+namespaces does not start a run).
+
 ## macOS
 
 ```bash

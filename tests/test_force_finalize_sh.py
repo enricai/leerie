@@ -21,6 +21,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.conftest import run_bash
 from tests.fly_stub import make_fake_flyctl
 
@@ -142,7 +144,32 @@ def test_patches_dead_run(tmp_path):
     assert patched.get("finished_at"), patched
     assert patched.get("recovered_at"), patched
     assert patched.get("recovered_via") == "force-finalize", patched
-    assert patched.get("no_push") is False or patched.get("no_push") is None
+    assert "no_push" not in patched, patched
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_patch_keeps_the_runs_push_choice(tmp_path, recorded):
+    """`finalize --force` must not rewrite run.json.no_push: it is the run's
+    one push choice, written at its start (DESIGN §6 *One push choice per
+    run, on every runtime*). The patch used to turn a recorded true into
+    false, so a forced finalize of a `--no-push` run pushed it."""
+    mruns = tmp_path / "runs"
+    mruns.mkdir()
+    run_id = "feat-keep-choice-001"
+    run_dir = _make_run(mruns, run_id, pid=999_999_999)
+    rj = json.loads((run_dir / "run.json").read_text())
+    rj["no_push"] = recorded
+    (run_dir / "run.json").write_text(json.dumps(rj))
+    stub = _flyctl_stub(tmp_path, mruns)
+    result = run_bash(
+        f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
+        env={"LEERIE_REPO": str(REPO_ROOT),
+             "PATH": f"{stub.parent}:{os.environ['PATH']}"},
+    )
+    assert result.returncode == 0, result.stderr
+    patched = json.loads((run_dir / "run.json").read_text())
+    assert patched.get("finished_at"), patched
+    assert patched["no_push"] is recorded, patched
 
 
 def test_idempotent_when_already_finalized(tmp_path):

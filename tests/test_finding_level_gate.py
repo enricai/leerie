@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+from tests.conftest import register_worker_transcript, transcript_path
+
 MODELS = {"planner": "sonnet", "fit_judge": "sonnet", "splitter": "sonnet"}
 EFFORTS = {"planner": "medium", "fit_judge": "medium", "splitter": "medium"}
 
@@ -42,7 +44,8 @@ def _write_log(logs_dir, sid, pairs):
         lines.append(_log_line_use(uid, cmd))
         if result is not None:
             lines.append(_log_line_result(uid, result))
-    (logs_dir / f"{sid}.log").write_text("\n".join(lines) + "\n")
+    register_worker_transcript(transcript_path(logs_dir, f"{sid}.log")).write_text(
+        "\n".join(lines) + "\n")
 
 
 # === _executed_commands_digest =============================================
@@ -56,7 +59,7 @@ def test_digest_extracts_blt_commands_with_result_tails(
         ("pnpm test src/x.test.ts", "Test Files  1 passed (1)"),
         ("git status --short", "M src/x.ts"),
     ])
-    d = leerie._executed_commands_digest(tmp_path, tmp_path)
+    d = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path))
     assert "[bugfix-001] $ pnpm test src/x.test.ts" in d
     assert "Test Files  1 passed (1)" in d
     assert "git status" not in d
@@ -65,10 +68,10 @@ def test_digest_extracts_blt_commands_with_result_tails(
 def test_digest_no_result_and_missing_logs(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
     _write_log(tmp_path / "logs", "s1", [("pnpm typecheck", None)])
-    d = leerie._executed_commands_digest(tmp_path, tmp_path)
+    d = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path))
     assert "(no result recorded)" in d
-    assert leerie._executed_commands_digest(
-        tmp_path / "absent", tmp_path) == ""
+    assert leerie._executed_commands_digest(leerie._executed_command_entries(
+        tmp_path / "absent", tmp_path)) == ""
 
 
 def test_digest_empty_without_blt_verbs(leerie, tmp_path, monkeypatch):
@@ -76,15 +79,15 @@ def test_digest_empty_without_blt_verbs(leerie, tmp_path, monkeypatch):
     without them everything or nothing would be arbitrary)."""
     monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: [])
     _write_log(tmp_path / "logs", "s1", [("pnpm test", "ok")])
-    assert leerie._executed_commands_digest(tmp_path, tmp_path) == ""
+    assert leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path)) == ""
 
 
 def test_digest_entry_cap(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
     _write_log(tmp_path / "logs", "s1", [
         (f"pnpm test f{i}.ts", "ok") for i in range(5)])
-    d = leerie._executed_commands_digest(tmp_path, tmp_path,
-                                         max_entries=2)
+    d = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path,
+                                         max_entries=2))
     assert d.count("$ pnpm test") == 2
 
 
@@ -352,7 +355,7 @@ def test_digest_strips_timeout_and_env_prefixes(
         ("timeout 600 pnpm test src/a.test.ts", "1 passed"),
         ("NODE_ENV=test pnpm test src/b.test.ts", "2 passed"),
     ])
-    d = leerie._executed_commands_digest(tmp_path, tmp_path)
+    d = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path))
     assert "timeout 600 pnpm test src/a.test.ts" in d
     assert "NODE_ENV=test pnpm test src/b.test.ts" in d
 
@@ -366,13 +369,20 @@ def test_digest_failure_degrades_to_items_only_judging(
     def boom(*_a2, **_k):
         raise UnicodeDecodeError("utf-8", b"", 0, 1, "torn log")
 
-    monkeypatch.setattr(leerie, "_executed_commands_digest", boom)
+    monkeypatch.setattr(leerie, "_executed_command_entries", boom)
     leerie_root = tmp_path / ".leerie"
     run_id = "digest-degrade"
     run_dir = leerie_root / "runs" / run_id
-    (run_dir / "worktrees" / "staging").mkdir(parents=True)
+    from tests.stub_helpers import _delivery_tree, _judge_verdict
+    staging = _delivery_tree(run_dir / "worktrees" / "staging")
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "t", "worker_count": 0, "working_branch": "main",
+               # The base the run branch was cut from (DESIGN §6 *The
+               # run's own repository*): the prejudge runs only with it.
+               "base_sha": __import__("subprocess").run(
+                   ["git", "-C", str(staging), "rev-parse", "HEAD"],
+                   capture_output=True, text=True,
+                   check=True).stdout.strip(),
                "required_items": [{"item": "a required thing",
                                    "source_ref": "task"}]}
     st.save()
@@ -380,8 +390,7 @@ def test_digest_failure_degrades_to_items_only_judging(
 
     async def fake_claude_p(**kwargs):
         calls.append(kwargs)
-        return {"verdicts": [{"item_index": 0, "met": True,
-                              "evidence": "ok"}]}
+        return {"verdicts": [_judge_verdict(0, True, "ok")]}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     unmet = _a.run(leerie._run_delivery_prejudge(
@@ -421,13 +430,13 @@ def test_digest_admits_repro_led_commands_only_with_repro(
          "--force", "classification: REST; output compiles"),
         ("pnpm test src/x.test.ts", "1 passed"),
     ])
-    without = leerie._executed_commands_digest(tmp_path, tmp_path)
+    without = leerie._executed_commands_digest(leerie._executed_command_entries(tmp_path, tmp_path))
     assert "example_repro" not in without
     assert "pnpm test src/x.test.ts" in without
-    with_repro = leerie._executed_commands_digest(
+    with_repro = leerie._executed_commands_digest(leerie._executed_command_entries(
         tmp_path, tmp_path,
         repro_command="EXAMPLE_RUN_ID=example-run node "
-                      "scripts/example_repro.py --force")
+                      "scripts/example_repro.py --force"))
     assert "[accept-001] $ EXAMPLE_RUN_ID=example-run node " \
            "scripts/example_repro.py --force" in with_repro
     assert "classification: REST; output compiles" in with_repro

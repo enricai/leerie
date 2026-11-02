@@ -31,9 +31,14 @@ FROM debian:13-slim
 # rsync is the receiver for the dirty-delta phase of seed-repo.sh
 # (`seed_repo_dirty` rsync's uncommitted edits + untracked files + the
 # repo-local `.claude/` directory after the bundle clone completes).
+# python-is-python3 gives the system a `python`. mise puts a `python` shim
+# first on PATH, and with no version pinned a shim falls through to the
+# system binary of the same name. Debian ships `python3` only, so without
+# this every bare `python` (a planner's verify argv, a worker's command)
+# died with "No version is set for shim: python" while `python3` worked.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git openssh-client \
-      python3 python3-pip \
+      python3 python3-pip python-is-python3 \
       procps \
       build-essential \
       rsync \
@@ -244,8 +249,10 @@ ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
 #   (falls back to ~/.cache/rubocop_cache without it).
 # MISE_STATE_DIR: mise reads this for tracked-configs and other state
 #   (falls back to ~/.local/state/mise without it).
-# The explicitly bind-mounted caches (pip, pnpm, go, cargo, mise-data) all
-# have their own env vars and are unaffected by XDG_CACHE_HOME.
+# mise-data, the one bind-mounted cache besides Bundler's, and the package
+# stores the orchestrator sets in the state mount (pip, pnpm, Go, Cargo,
+# corepack) all have their own env vars and are unaffected by
+# XDG_CACHE_HOME.
 ENV XDG_CACHE_HOME=/tmp/.cache
 ENV MISE_STATE_DIR=/tmp/.mise-state
 
@@ -305,6 +312,29 @@ ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-cur
 # /usr/local/share/mise/installs/node/lts-current/lib/node_modules
 # with a bin shim at .../bin/claude (on PATH via the line above).
 RUN npm install -g '@anthropic-ai/claude-code@>=2.1.289'
+
+# A pinned JS-API `typescript` for leerie's two AST scripts
+# (scripts/load-typescript.cjs falls back to it when the tree under test's
+# own `typescript` has no compiler API — the TypeScript 7 native port
+# exports a version string only; DESIGN §8 *Delivery detection*). The facts
+# are syntax-only, so the version need not match the repository's. Exact
+# version, verified against npm's dist.integrity (the same sha512, in hex)
+# before extraction. Lives outside /opt/leerie-image, which local runs
+# bind-mount over. Root-owned and world-readable: every runtime only reads
+# it (rootless maps outer root to the running user; rootful runuser leerie
+# and Fly/EC2 read via a+rX), so no chown.
+ARG BUNDLED_TYPESCRIPT_VERSION=5.9.3
+ARG BUNDLED_TYPESCRIPT_SHA512=8e5d6f6733c38a72ebf5e52ddc9feded5e8580d130f508ef04f772b33f4a7d00c3e357d0ac2d98e2f290762694a454f86d795bd511e12e9a7cc2d9ba3394e04b
+RUN set -eu; \
+    dst=/opt/leerie-vendor/node_modules/typescript; \
+    curl -fsSL -o /tmp/typescript.tgz \
+      "https://registry.npmjs.org/typescript/-/typescript-${BUNDLED_TYPESCRIPT_VERSION}.tgz"; \
+    echo "${BUNDLED_TYPESCRIPT_SHA512}  /tmp/typescript.tgz" | sha512sum -c -; \
+    mkdir -p "$dst"; \
+    tar -xzf /tmp/typescript.tgz -C "$dst" --strip-components=1 --no-same-owner; \
+    rm /tmp/typescript.tgz; \
+    chmod -R a+rX /opt/leerie-vendor; \
+    node -e "const ts=require('$dst'); if (ts.version!=='${BUNDLED_TYPESCRIPT_VERSION}' || typeof ts.createSourceFile!=='function') process.exit(1)"
 
 # Non-root user matching the host UID/GID so bind-mounted files keep their
 # host ownership. Defaults are macOS-typical; the launcher overrides them

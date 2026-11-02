@@ -28,7 +28,7 @@ PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
 # The awk-extraction pipeline used in provision.sh. Pinned here so a
 # refactor of provision.sh that breaks the parser fails THIS test.
 _PARSE = r'''
-sed 's/\x1b\[[0-9;]*m//g' | awk '/Machine ID:/ { for (i=1; i<=NF; i++) if ($i == "ID:") { print $(i+1); exit } }'
+sed 's/\x1b\[[0-9;]*m//g' | awk '/Machine ID:/ && !f { for (i=1; i<=NF; i++) if ($i == "ID:" && !f) { print $(i+1); f = 1 } }'
 '''
 
 
@@ -125,8 +125,9 @@ def test_provision_uses_awk_parser_for_machine_id():
     """Pin the awk parser used to extract Machine ID from text output."""
     text = PROVISION_SH.read_text()
     # The awk filter signature.
-    assert "/Machine ID:/" in text
-    assert 'if ($i == "ID:")' in text
+    # The awk program this file executes is provision.sh's own, verbatim, so
+    # the behaviour tests above exercise the shipped parser.
+    assert _PARSE.strip().split(" | ", 1)[1] in text
 
 
 # --- wait_for_started also affected: flyctl machine status has no --json --
@@ -162,7 +163,7 @@ def _parse_state(text: str) -> str:
     r = subprocess.run(
         ["bash", "-c",
          "sed 's/\\x1b\\[[0-9;]*m//g' | "
-         "awk -F': *' '/^State: / { print $2; exit }' | "
+         "awk -F': *' '/^State: / && !f { print $2; f = 1 }' | "
          "tr -d '[:space:]'"],
         input=text,
         capture_output=True, text=True, check=False,

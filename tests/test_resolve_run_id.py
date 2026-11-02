@@ -33,10 +33,21 @@ from pathlib import Path
 import pytest
 
 
+# The runs these helpers make stand for runs of the leerie under test, so
+# they carry its run layout; a run of another layout lists as `other-leerie`
+# (tests/test_run_layout.py).
+_LAYOUT: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _this_leeries_layout(leerie):
+    _LAYOUT["run_layout"] = leerie.RUN_LAYOUT_VERSION
+
+
 def _make_run(leerie_root: Path, run_id: str, state: dict) -> None:
     run_dir = leerie_root / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "state.json").write_text(json.dumps(state))
+    (run_dir / "state.json").write_text(json.dumps({**_LAYOUT, **state}))
 
 
 def _make_finished_run(leerie_root: Path, run_id: str, started: str) -> None:

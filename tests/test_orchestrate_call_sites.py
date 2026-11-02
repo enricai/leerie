@@ -132,7 +132,7 @@ def test_orchestrate_calls_phase_reconcile_between_plan_and_schedule():
     body = _function_body("_run_phases")
     plan_idx = body.find("await phase_plan(")
     reconcile_idx = body.find("await phase_reconcile(")
-    schedule_idx = body.find("_schedule(plans)")
+    schedule_idx = body.find("_schedule(\n                plans")
     assert plan_idx >= 0, "_orchestrate() must call phase_plan()"
     assert reconcile_idx >= 0, (
         "_orchestrate() must call phase_reconcile() between phase_plan "

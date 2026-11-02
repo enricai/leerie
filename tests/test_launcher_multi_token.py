@@ -158,7 +158,7 @@ def test_fly_heredoc_json_encodes_oauth_tokens_before_substitution():
     a raw Python string literal in the unquoted heredoc."""
     src = LAUNCHER.read_text()
     assert re.search(
-        r'_oauth_tokens_json="\$\(python3 -c \'import json, sys; '
+        r'_oauth_tokens_json="\$\(python3 -I -c \'import json, sys; '
         r'print\(json\.dumps\(sys\.argv\[1\]\)\)\' '
         r'"\$\{CLAUDE_CODE_OAUTH_TOKENS:-\}"\)"',
         src,
@@ -176,7 +176,7 @@ def test_ec2_heredoc_forwards_oauth_tokens():
 def test_ec2_heredoc_json_encodes_oauth_tokens_before_substitution():
     src = LAUNCHER.read_text()
     assert re.search(
-        r'_ec2_oauth_tokens_json="\$\(python3 -c \'import json, sys; '
+        r'_ec2_oauth_tokens_json="\$\(python3 -I -c \'import json, sys; '
         r'print\(json\.dumps\(sys\.argv\[1\]\)\)\' '
         r'"\$\{CLAUDE_CODE_OAUTH_TOKENS:-\}"\)"',
         src,

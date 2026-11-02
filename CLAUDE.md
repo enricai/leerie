@@ -24,6 +24,14 @@ Runtime: containerd + nerdctl. On Linux, native. On macOS, via
 [Colima](https://colima.run) (a Lima-managed Linux VM). See
 `docs/INSTALL.md` for per-OS install steps.
 
+The kernel must offer Landlock ABI 3 or later (Linux 6.2+): every worker
+and every repository command leerie runs is confined, and the confinement
+check every entry runs (`_require_confinement`: a fresh run, `resume` and
+`--phase`) stops a run without it rather than run either unconfined (DESIGN §6 *A worker
+writes only where it is granted (I5)*, *Leerie's runs of the repository's
+commands are confined too*). The user's checkout is mounted at `/work` read-only (DESIGN §6
+*The run's own repository*, *The explicit channel*).
+
 Python is provisioned *inside the container* by the image (Python 3
 from Debian 13). The launcher itself is a portable bash script; it
 no longer needs `uv`, and uses the host's stdlib-only `python3` just for
@@ -136,12 +144,58 @@ orchestrator and not used anywhere in this repo.
 not only `Agent`: `Agent` is the retired spelling and current CLI builds ship
 `Task`. Until 2026-08-18 the deny list carried `Agent` and the `Task*` family
 (`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, retired from current builds,
-plus the live `TaskOutput`/`TaskStop`) but not the bare `Task`, so this invariant
-was enforced against a name the live CLI no longer emits — the shape to watch
-for whenever the CLI renames a tool.
+plus the live `TaskOutput`) but not the bare `Task`, so this invariant was
+enforced against a name the live CLI no longer emits — the shape to watch for
+whenever the CLI renames a tool.
+
+`TaskStop` is the one task tool **not** denied (it is in `ACT_TOOLS`): it
+stops only the calling session's own background commands — a foreign task ID
+gets "No task found" — and it is what the process-kill notice tells workers to
+use instead of `pkill`, which `claude_p` denies to every worker with a shell
+(DESIGN §2, §9 *A worker never kills a process by name*). `Task`, `Agent` and
+the rest of the family stay denied.
 
 ## Mandatory requirements
 
+- **Every run worker and every repository command leerie runs is confined
+  (I5).** A worker's processes write only what its grant names
+  (`_worker_grants`, Landlock). A repository command leerie runs — build,
+  lint, tests, install, the held-out sets, CI parity, coverage, `verify`,
+  the setup hook, `mise`, the AST scripts — writes its tree, its
+  measurement directory, its tree's private temp directory
+  (`/tmp/l/<id>/`, 0700, its `TMPDIR` and `XDG_CACHE_HOME`), the verified
+  caches and its tree's own stores, and by kind `MISE_DATA_DIR`,
+  `~/.local/bin` or (the store fetch alone) leerie's stores
+  (`_measurement_grants`, through `_run_streaming`, whose `grants` has no
+  default). No grant names `/tmp`: once the confinement check every entry
+  runs (`_require_confinement`) has built a sandbox,
+  every confined process has its own `/tmp`, `/dev/shm` and IPC
+  (`--isolate`), and a held-out file runs only in a sandbox
+  (`HeldOutSandbox`, `_run_streaming(sandbox=)`), alone: every worker and
+  every confined command holds the execution lock shared, an evaluation
+  exclusive (`_exec_lock()`, `_held_out_section`). Leerie keeps nothing of
+  its own in `/tmp` but the preflight smoke test's empty working directory
+  (`_use_run_tmp`, `_system_temp_dir`) and its egress proxy's 0700 socket
+  directory `/tmp/l/egress-<random>/` (`_egress_server`). No database server leerie starts
+  is unconfined (`scripts/sandbox-db.sh`). Every confined command's
+  processes end with it: the Landlock shim is their subreaper. The host-side workers
+  (rebaser, host recapture, `config --chat`) are the one exception.
+  DESIGN §6 *A worker writes only where it is granted (I5)*, *Outside the
+  container*, *Leerie's runs of the repository's commands are confined
+  too*, *A confined command's scratch is short and private*, *Every
+  confined process has its own `/tmp`, `/dev/shm` and IPC*, *A held-out
+  evaluation runs alone, in a world that dies with it (I3)*, *No database
+  server leerie starts is ever unconfined*, *A confined command's
+  processes end with it*.
+- **Each run has its own repository, and each committing tree its own
+  (I4, I6).** The user's repository is only fetched from, and receives the
+  run branch by the host-side bring-back; only leerie moves the run
+  repository's refs. DESIGN §6 *The run's own repository*, *A repository
+  per committing tree (I6)*.
+- **Every measurement runs in a committed view installed from leerie's
+  own stores,** never in a worker's tree. DESIGN §8 *Every measurement
+  reads the committed view*; §6 *The stores a view installs from are
+  leerie's*.
 - **Worker outputs are JSON-schema-validated.** New worker types must
   define a schema in the `SCHEMAS` dict in `orchestrator/leerie.py` and
   pass it via `--json-schema` in `claude_p()`.
@@ -177,23 +231,32 @@ for whenever the CLI renames a tool.
   "medium"` — that dial is about reproducibility/determinism, not model
   tier, and is unaffected by this change.
   **Separately, `implementer` and `conformer` — the two workers that
-  write the fix — are pinned to `EFFORT_DEFAULT_PER_WORKER =
+  write the run's fix — are pinned to `EFFORT_DEFAULT_PER_WORKER =
   "low"`,** a deliberate cost/latency trade-off distinct from the
   judgment workers' `medium`: these previously inherited Claude's own
   default reasoning depth (unset, i.e. high) so their effort stayed
   bounded by their own evidence gates (DESIGN §8); that tradeoff is now
   overridden in favor of a fixed low-effort ceiling, with the downstream
-  conformer/confidence-gate loops absorbing the quality difference. Two
+  conformer/confidence-gate loops absorbing the quality difference. Four
   scoped exceptions: `acceptance_writer` writes only held-out *tests*, at
-  `medium`; and the held-out acceptance gate's repair rounds call the
-  conformer at `EFFORT_ACCEPTANCE_REPAIR = "high"` regardless of effort
-  overrides — measured as the lever on multi-mechanism defects, paid only
-  by runs whose held-out sets fail (DESIGN §8 *Held-out acceptance tests*).
+  `medium`; `surrogate_fixer` writes a fix too, but only the set audit's
+  witness fix in a throwaway worktree, also at `medium`; the held-out
+  acceptance gate's repair rounds call the conformer at
+  `EFFORT_ACCEPTANCE_REPAIR = "high"` regardless of effort overrides —
+  measured as the lever on multi-mechanism defects, paid only by runs
+  whose held-out sets fail (DESIGN §8 *Held-out acceptance tests*); and the
+  delivery re-drive's last round calls the implementer at
+  `EFFORT_REDRIVE_ESCALATION = "high"`, only for a group that passes every
+  escalation gate (DESIGN §8 *Delivery re-drive*).
   `satisfied_probe` remains an explicit `MODEL_DEFAULT_PER_WORKER` entry
   (still sonnet, matching the global default, but kept for its own
   documented reason: it runs once per subtask and throughput dominates,
   with correctness resting on its base-tree-only tool scope rather than
   model tier — see the comment at its `MODEL_DEFAULT_PER_WORKER` entry).
+  `pr_reviewer` is the one worker on `opus` (effort `high`): the advisory
+  whole-PR review, which never gates, measured at about 5x sonnet's
+  verified findings on code no required item names (bench N2f; the
+  reason is at its `MODEL_DEFAULT_PER_WORKER` entry and DESIGN §12).
 - **Caps are real Python counters in `DEFAULT_CAPS`**, not prompt
   instructions. Adding a new cap means adding a counter and a check, not
   asking a worker to bound itself.
@@ -307,7 +370,8 @@ One-time runtime setup (leerie runs in a container) and install steps are in
 # instead of re-reaching the same verdict forever:
 ./leerie accept-integration <run-id> <subtask-id>
 
-# Reclaim disk. Nothing reaps run state automatically; dry-run by default.
+# Reclaim disk. Only idle runs' worktrees are reaped automatically (at
+# preflight, after 7 idle days); everything else waits for prune. Dry-run by default.
 ./leerie prune                        # show what would go
 ./leerie prune --apply                # default cutoff is 14 days
 
@@ -410,6 +474,11 @@ inventory itself.
   creating a full checkout of this repo inside itself — invisible because
   `.leerie/*` is gitignored and the dirs outlive the session (measured: 2
   worktrees, 25 MB, one CI-only red test with no visible link to the change).
+  Since per-run repositories it is registered in that run's `<run-dir>/repo`,
+  and a real `_run_phases` over a real git `repo_root` also makes that
+  repository — a full bare copy of the branch (31 MB, ~11 s here).
+  `_no_run_repo_without_a_git_repo` fails any test that would make it under
+  this checkout, naming the fix: pin the state root to `tmp_path`.
   Assume the state root is inside the repo unless a test pins it elsewhere.
 - `leerie resume <run-id>` (the documented positional form) is pinned by
   `tests/test_resume_positional_run_id.py`. It silently ignored the run-id on

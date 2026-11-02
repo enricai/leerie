@@ -19,6 +19,8 @@ import types
 
 import pytest
 
+from tests.conftest import measure_run_dir
+
 
 @pytest.fixture(autouse=True)
 def _reset_sem(leerie):
@@ -79,7 +81,9 @@ def _peak_under(leerie, monkeypatch, tmp_path, cap, n=6, tag=""):
     async def _go():
         trees = [_tree(tmp_path, f"wt{tag}{i}") for i in range(n)]
         sts = [types.SimpleNamespace(data={"provision": {"recipe": []}},
-                                     save=lambda: None) for _ in trees]
+                                     save=lambda: None,
+                                     run_dir=measure_run_dir(tmp_path))
+               for _ in trees]
         await asyncio.gather(*[
             leerie._measure_axes(str(t), {"tests": "pytest"}, st,
                                  {"blt_parallel": cap},
@@ -119,7 +123,8 @@ def test_a_memo_hit_does_not_take_the_gate(leerie, monkeypatch, tmp_path):
     leerie._DEPS_INSTALLED.clear()
     d = _git_repo(tmp_path, "wt")
     st = types.SimpleNamespace(data={"provision": {"recipe": []}},
-                               save=lambda: None)
+                               save=lambda: None,
+                               run_dir=measure_run_dir(tmp_path))
 
     async def _go():
         await leerie._measure_axes(str(d), {"tests": "pytest"}, st,

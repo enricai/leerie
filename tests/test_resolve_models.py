@@ -30,7 +30,10 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "classification_judge", "wiring_judge", "provision_judge",
            "task_coverage_judge", "artifact_registry", "integration_judge",
            "no_work_judge", "delivery_judge", "defect_scope_auditor",
-           "rebaser", "acceptance_writer")
+           "rebaser", "acceptance_writer", "set_auditor", "surrogate_fixer",
+           "ci_checks", "scope_judge", "pr_reviewer",
+           "contract_extractor", "falsifier", "verifiability_classifier",
+           "delivery_ratchet", "forbidden_command_extractor")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -58,6 +61,28 @@ DEFAULTS = {
     "defect_scope_auditor": "sonnet",
     "rebaser": "sonnet",
     "acceptance_writer": "sonnet",
+    # The held-out set audit and the surrogate witness (DESIGN §8 *A set
+    # that keeps failing is audited, and rewritten once*): sonnet through
+    # the MODEL_DEFAULT fallback.
+    "set_auditor": "sonnet",
+    "surrogate_fixer": "sonnet",
+    # The repository's own merge checks (DESIGN §9 *The repository's own
+    # merge checks run too*): sonnet through the MODEL_DEFAULT fallback.
+    "ci_checks": "sonnet",
+    # The report-bounded scope judge (DESIGN §8 *A task that points at a
+    # report is bounded by the report's own scenarios*): MODEL_DEFAULT.
+    "scope_judge": "sonnet",
+    # The advisory whole-PR review: the one documented opus exception
+    # (DESIGN §12; bench N2f). The contract extractor falls through.
+    "pr_reviewer": "opus",
+    "contract_extractor": "sonnet",
+    # The delivery falsifier (DESIGN §8 *Delivery detection*): MODEL_DEFAULT.
+    "falsifier": "sonnet",
+    # The delivery ratchet's two workers: MODEL_DEFAULT.
+    "verifiability_classifier": "sonnet",
+    "delivery_ratchet": "sonnet",
+    # The forbidden-command extractor (DESIGN §9): MODEL_DEFAULT.
+    "forbidden_command_extractor": "sonnet",
 }
 
 

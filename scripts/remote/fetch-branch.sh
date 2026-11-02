@@ -60,7 +60,7 @@ FLY_APP="${LEERIE_FLY_APP:-}"
 # ---------------------------------------------------------------------------
 _fetch_machine_exec() {
   local cmd
-  cmd="$(python3 -c '
+  cmd="$(python3 -I -c '
 import shlex, sys
 print(" ".join(shlex.quote(a) for a in sys.argv[1:]))
 ' "$@")"
@@ -120,7 +120,7 @@ fetch_branch() {
   # the failure type adequately.
   local _discover_err
   _discover_err="$(mktemp)"
-  discover_output="$(_fetch_machine_exec python3 -c '
+  discover_output="$(_fetch_machine_exec python3 -I -c '
 import os, json, sys
 
 runs_dir = "/work/.leerie/runs"
@@ -165,7 +165,7 @@ print(best[3])
   rm -f "$_discover_err"
 
   # Check for ERROR prefix from the Python script
-  if printf '%s' "$discover_output" | grep -q "^ERROR:"; then
+  if grep -q "^ERROR:" < <(printf '%s\n' "$discover_output"); then
     remote_log "fetch_branch: $discover_output"
     return 1
   fi
@@ -176,7 +176,7 @@ print(best[3])
   # indices aligned with the python emitter above; not read here
   working_branch="$(printf '%s' "$discover_output" | sed -n '3p')"
   # shellcheck disable=SC2034  # deliberately NOT consumed — see
-  # the 'CANNOT trust run.json.no_push as a proxy' note below
+  # the 'run.json.no_push is no proxy' note below
   run_no_push="$(printf '%s' "$discover_output" | sed -n '4p')"
 
   if [ -z "$run_id" ] || [ -z "$run_branch" ]; then
@@ -197,12 +197,13 @@ print(best[3])
   #   (b) some other early-failure / placeholder case.
   # In both, skip the bundle step.
   #
-  # We CANNOT trust run.json.no_push as a proxy: the in-Fly launcher
-  # always passes --no-push to the orchestrator (the machine can't
-  # push) so no_push=true is a mechanism flag, not a "no branch was
-  # materialized" signal.
+  # run.json.no_push is no proxy for "no branch was materialized": a
+  # --no-push run has a branch too.
   local _branch_present="false"
-  if _fetch_machine_exec git -C /work rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
+  # Every branch of the run lives in the run's own repository on the
+  # machine (DESIGN §6 *The run's own repository*), never in /work's.
+  local _run_repo="/work/.leerie/runs/$run_id/repo"
+  if _fetch_machine_exec git --git-dir="$_run_repo" rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
     _branch_present="true"
   fi
 
@@ -213,7 +214,7 @@ print(best[3])
   local _subtask_refs=""
   local _subtask_prefix="leerie/subtasks/${run_id}/"
   _subtask_refs="$(_fetch_machine_exec \
-    git -C /work for-each-ref --format='%(refname:short)' \
+    git --git-dir="$_run_repo" for-each-ref --format='%(refname:short)' \
     "refs/heads/${_subtask_prefix}" 2>/dev/null || true)"
 
   if [ "$_branch_present" = "false" ] && [ -z "$_subtask_refs" ]; then
@@ -256,7 +257,7 @@ print(best[3])
     # the file. flyctl machine exec streams that stdout back to the host.
     # shellcheck disable=SC2086
     if ! _fetch_machine_exec \
-         git -C /work bundle create - $_bundle_refs \
+         git --git-dir="$_run_repo" bundle create - $_bundle_refs \
          > "$host_bundle" 2>/dev/null; then
       # Fallback: if bundling all refs failed (race with concurrent
       # cleanup deleting a subtask branch between discovery and bundle),
@@ -264,7 +265,7 @@ print(best[3])
       if [ "$_branch_present" = "true" ] && [ "$_subtask_count" -gt 0 ]; then
         remote_log "fetch_branch: full bundle failed; retrying with run branch only"
         if ! _fetch_machine_exec \
-             git -C /work bundle create - "$run_branch" \
+             git --git-dir="$_run_repo" bundle create - "$run_branch" \
              > "$host_bundle" 2>/dev/null; then
           remote_log "fetch_branch: failed to create git bundle on machine $machine_id"
           rm -f "$host_bundle"
@@ -331,7 +332,7 @@ print(best[3])
 
   remote_log "remote: streaming .leerie/runs/$run_id state directory ..."
   if ! _fetch_machine_exec \
-       tar -cC /work/.leerie/runs "$run_id" \
+       tar -cC /work/.leerie/runs --exclude="$run_id/repo" --exclude="$run_id/tree-repos" "$run_id" \
        | tar -xC "$host_leerie_runs" 2>/dev/null; then
     remote_log "fetch_branch: failed to stream run state directory from machine $machine_id"
     return 1
@@ -339,49 +340,19 @@ print(best[3])
 
   remote_log "remote: run state directory fetched to $host_leerie_runs/$run_id"
 
-  # DEFENSE-IN-DEPTH: strip a stray mechanism-flag no_push=true from
-  # the host-side run.json **only when a run branch was actually
-  # fetched**. The in-Fly orchestrator gets --no-push (because the Fly
-  # Machine has no GitHub auth) AND --host-no-push carrying the user's
-  # actual launch-time intent; phase_finalize writes **intent**
-  # (`not push_will_happen(...)`) to run.json.no_push, so this stripper
-  # is a no-op for orchestrators built against the intent-vs-mechanism
-  # split. It is retained as defense against in-flight runs started
-  # against an older image where the orchestrator still wrote the
-  # mechanism flag and a branch *did* materialize.
-  #
-  # Conditional on $_branch_present: when no branch was fetched (the
-  # cleared-but-empty terminal-state case — DESIGN §8), the orchestrator's
-  # `_finish_no_work_run` deliberately writes `no_push=true` as **intent**
-  # ("nothing to push — no branch exists"). Stripping it here would
-  # disarm host_finalize's no_push gate and cause it to attempt
-  # `git push` on a non-existent branch.
-  if [ "$_branch_present" = "true" ]; then
-    local _host_run_json="$host_leerie_runs/$run_id/run.json"
-    if [ -f "$_host_run_json" ]; then
-      python3 - "$_host_run_json" <<'PY' || true
-import json, os, sys
-path = sys.argv[1]
-try:
-    data = json.load(open(path))
-except Exception:
-    sys.exit(0)
-if data.get("no_push") is True:
-    data.pop("no_push", None)
-    tmp = path + ".tmp"
-    json.dump(data, open(tmp, "w"), indent=2)
-    open(tmp, "a").write("\n")
-    os.replace(tmp, path)
-PY
-    fi
-  fi
+  # run.json arrives unchanged: its no_push is the run's one push choice,
+  # recorded by the orchestrator at the run's start, and host_finalize reads
+  # it as written — a --no-push run's true, and the true _finish_no_work_run
+  # writes for a run with no branch, alike (DESIGN §6 *One push choice per
+  # run, on every runtime*).
 
-  # --- Step 4: stream .leerie/config.toml + Dockerfile back (best-effort) ----
-  # On a clean Fly finish the in-container dep_capture worker has already
-  # written /work/.leerie/config.toml and /work/.leerie/Dockerfile.  Stream
-  # them home so the bake loop persists across the machine->host boundary.
-  # Existence-guarded on both sides, non-fatal, and never clobbers a
-  # host-edited file (skip if the host target already exists).
+  # --- Step 4: apply the captured deps; stream .leerie/Dockerfile back (best-effort) ----
+  # The dep_capture worker records its capture in the run directory, which
+  # the state stream-back above brought home; it is applied here. A
+  # /work/.leerie/Dockerfile on the machine is streamed home so the bake loop
+  # persists across the machine->host boundary. Existence-guarded on both
+  # sides, non-fatal, and never clobbers a host-edited file (skip if the host
+  # target already exists).
   # Cancel/kill recovery (where fetch_branch never runs) is left to the
   # host-side --recapture / next-run backstop.
   local host_leerie_root
@@ -391,18 +362,25 @@ PY
     host_leerie_root="$USER_REPO/.leerie"
   fi
 
-  local _cap_file
-  for _cap_file in config.toml Dockerfile; do
-    local _remote_path="/work/.leerie/$_cap_file"
-    local _host_path="$host_leerie_root/$_cap_file"
-    # Skip if host target already exists (never clobber a host-edited file).
-    if [ -e "$_host_path" ]; then
-      continue
-    fi
-    # Existence-guard on the machine side before attempting transfer.
-    if ! _fetch_machine_exec test -f "$_remote_path" 2>/dev/null; then
-      continue
-    fi
+  # The dependency captures the run recorded came home with its state
+  # directory above; write them into $USER_REPO/.leerie/config.toml as the
+  # local launcher does (DESIGN §6½ *The host applies a capture*). The
+  # machine's /work/.leerie/config.toml is no longer written.
+  if ! declare -F host_apply_captured_deps >/dev/null 2>&1; then
+    # shellcheck source=scripts/host-finalize.sh
+    . "$_FETCH_BRANCH_DIR/../host-finalize.sh" 2>/dev/null || true
+  fi
+  if declare -F host_apply_captured_deps >/dev/null 2>&1; then
+    host_apply_captured_deps "$host_leerie_root/runs/$run_id" || true
+  fi
+
+  local _cap_file=Dockerfile
+  local _remote_path="/work/.leerie/$_cap_file"
+  local _host_path="$host_leerie_root/$_cap_file"
+  # Skip if host target already exists (never clobber a host-edited file);
+  # existence-guard on the machine side before attempting transfer.
+  if [ ! -e "$_host_path" ] \
+     && _fetch_machine_exec test -f "$_remote_path" 2>/dev/null; then
     remote_log "remote: streaming .leerie/$_cap_file to host ..."
     mkdir -p "$host_leerie_root" 2>/dev/null || true
     if _fetch_machine_exec cat "$_remote_path" \
@@ -413,7 +391,7 @@ PY
       rm -f "$_host_path" 2>/dev/null || true
       remote_log "fetch_branch: warning: failed to stream .leerie/$_cap_file (non-fatal)"
     fi
-  done
+  fi
 
   remote_log "remote: fetch complete — run $run_id ready for host-side finalize"
   return 0

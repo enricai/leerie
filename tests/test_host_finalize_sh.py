@@ -537,8 +537,8 @@ def test_skips_when_run_branch_absent_locally(tmp_path):
 
     Without this guard, the launcher would try to push a non-existent
     branch and fail with `src refspec ... does not match any`. The
-    guard backstops fetch-branch.sh's conditional stripper and the
-    finalize stripper in `leerie`."""
+    record arrives unchanged (no stripper since 7de505e2); this guard
+    is what keeps a branchless run from being pushed."""
     run_dir = _make_run(tmp_path, "noop-run-aaaaaa", run_json={
         "branch": "leerie/runs/noop-run-aaaaaa",
         "working_branch": "main",
@@ -1058,13 +1058,15 @@ def test_rebase_fallback_arm_logs_and_persists_disposition(tmp_path):
     )
     r = _run_host_finalize(
         tmp_path, run_dir,
-        # ${10}, not ${9}: the stub stands in for `python3`, so $1 is the seam
-        # script itself and the seam's own argv[9] (the verdict file) lands one
-        # position later. The `echo` to stdout is deliberate and load-bearing —
-        # it stands in for the worker log stream, and the assertions below prove
-        # the log text is NOT what gets persisted.
+        # The verdict file is the seam's LAST argument; a fixed index is not
+        # safe, since the stub stands in for `python3` and sees its flags
+        # (`-I`) and the seam script ahead of the seam's own argv. The `echo`
+        # to stdout is deliberate and load-bearing — it stands in for the
+        # worker log stream, and the assertions below prove the log text is
+        # NOT what gets persisted.
         python3_body='echo "log noise from the worker"; '
-                     'printf "not json at all" > "${10}"; exit 0',
+                     'for _out; do :; done; '
+                     'printf "not json at all" > "$_out"; exit 0',
         extra_env={
             # Deliberately NOT REPO_ROOT. host-finalize.sh uses LEERIE_REPO for
             # exactly one thing on this path — building the
@@ -1137,86 +1139,76 @@ def test_rebase_fallback_arm_persists_null_raw_json_when_payload_empty(tmp_path)
 # reported risk is routed, not read*; §6 *appended by code on every --------
 # composition path*) --------------------------------------------------------
 
-_RISK_REGISTER = {
-    "feat-001": [
+# DESIGN §6 *The PR's end-state section is rendered by code, from typed
+# state*: the orchestrator renders it once into run.json's `pr_end_state`,
+# and the LLM-less fallback appends that text as-is — the jq re-renderer of
+# the retired risk dump is gone, so there is no second renderer to drift.
+
+_END_STATE = ("\n## Unconverged\n\nThis PR is a draft: the run did not "
+              "finish its work.\n\n- 1 subtask(s) unconverged: feat-002"
+              "\n- **feat-002**: re-drive budget spent")
+
+
+def _with_end_state(run_dir: Path, text: str) -> None:
+    rj = run_dir / "run.json"
+    data = json.loads(rj.read_text())
+    data["pr_end_state"] = text
+    rj.write_text(json.dumps(data))
+
+
+def test_fallback_appends_the_rendered_end_state(tmp_path):
+    run_dir = _finalizable_run(tmp_path, "end-state-aaaa", extra_state={})
+    _with_end_state(run_dir, _END_STATE)
+    proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
+    assert proc.returncode == 0, proc.stderr
+    assert body.rstrip("\n").endswith(_END_STATE), body
+    assert body.count("## Unconverged") == 1, body
+
+
+def test_fallback_does_not_rerender_state_itself(tmp_path, leerie):
+    """A state whose register renders in `_format_pr_end_state_section`
+    adds nothing to the fallback body when run.json carries no
+    `pr_end_state`: the launcher only appends what the orchestrator
+    rendered."""
+    state = {"risk_register": {"feat-001": [
         {"kind": "external_contract_assumption",
          "detail": "matches the provider's error-message wording",
-         "where": "app/services/x.rb", "source": "implementer",
-         "disposition": "accepted", "addressed": False},
-        {"kind": "unexercised_behavior", "detail": "needs a live API",
-         "source": "implementer", "disposition": "mitigated",
-         "addressed": True},
-        {"kind": "untested_change", "detail": "escalated to the gate",
-         "source": "implementer", "disposition": "confirmed_defect",
-         "addressed": False},
-    ],
-    "feat-002": [
-        {"kind": "untested_change", "detail": "no test covers the branch",
-         "source": "conformer", "addressed": False},
-    ],
-    # Still blocked at finalize: excluded from integration, so BOTH
-    # renderers must skip it (the subtask_status filter).
-    "feat-003": [
-        {"kind": "untested_change", "detail": "orphan risk on blocked work",
-         "source": "implementer", "addressed": False},
-    ],
-    # Accept-blocked'ed: status rewritten to `complete` by the launcher
-    # mutator, but the branch is never merged — the accepted_blocked
-    # registry is the discriminator both renderers must honor.
-    "feat-004": [
-        {"kind": "untested_change", "detail": "orphan risk on accepted work",
-         "source": "implementer", "addressed": False},
-    ],
-}
-
-_RISK_STATUSES = {"feat-001": "complete", "feat-002": "complete",
-                  "feat-003": "blocked", "feat-004": "complete"}
-
-_RISK_ACCEPTED = {"feat-004": {"accepted_at": "2026-10-01T00:00:00Z"}}
-
-
-def test_fallback_renders_risk_note_from_state(tmp_path):
-    run_dir = _finalizable_run(
-        tmp_path, "risk-note-aaaa",
-        extra_state={"risk_register": _RISK_REGISTER,
-                     "subtask_status": _RISK_STATUSES,
-                     "accepted_blocked": _RISK_ACCEPTED})
+         "source": "implementer", "gap": "unverified_external",
+         "where_paths": [], "addressed": False}]},
+        "subtask_status": {"feat-001": "complete"}}
+    assert leerie._format_pr_end_state_section(state)
+    run_dir = _finalizable_run(tmp_path, "end-state-bbbb", extra_state=state)
     proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
     assert proc.returncode == 0, proc.stderr
-    assert "⚠ Residual risks" in body, body
-    assert "matches the provider's error-message wording" in body, body
-    assert "no test covers the branch" in body, body
-    # The still-blocked sid's entry must NOT render (work not integrated).
-    assert "orphan risk on blocked work" not in body, body
-    assert "orphan risk on accepted work" not in body, body
+    assert "error-message wording" not in body, body
+    assert "Residual risks" not in body, body
 
 
-def test_fallback_risk_note_byte_matches_python_renderer(tmp_path, leerie):
-    """The bash (jq) residual-risks section must be byte-identical to
-    `_format_risk_register_section` on the same state — true
-    cross-implementation parity, computed from the Python renderer itself
-    rather than a hand-written expectation (so the two cannot drift
-    independently of this test). The state includes a blocked sid and an
-    accept-blocked'ed sid so both renderer filters are part of the
-    parity contract."""
-    state = {"risk_register": _RISK_REGISTER,
-             "subtask_status": _RISK_STATUSES,
-             "accepted_blocked": _RISK_ACCEPTED}
-    run_dir = _finalizable_run(
-        tmp_path, "risk-parity-aa", extra_state=state)
-    proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
-    assert proc.returncode == 0, proc.stderr
-    expected = leerie._format_risk_register_section(state)
-    assert expected, "Python renderer returned nothing for a populated register"
-    assert expected in body, (
-        f"section not byte-identical.\n---got---\n{body!r}"
-        f"\n---want---\n{expected!r}")
-
-
-def test_fallback_no_risk_note_when_register_absent_or_empty(tmp_path):
-    for rid, extra in (("risk-none-aaaa", {}),
-                       ("risk-empty-aaa", {"risk_register": {}})):
-        run_dir = _finalizable_run(tmp_path / rid, rid, extra_state=extra)
-        proc, body = _run_host_finalize_capturing_body(tmp_path / rid, run_dir)
+def test_fallback_no_end_state_when_absent_or_empty(tmp_path):
+    for rid, text in (("end-none-aaaa", None), ("end-empty-aaa", "")):
+        run_dir = _finalizable_run(tmp_path / rid, rid, extra_state={})
+        if text is not None:
+            _with_end_state(run_dir, text)
+        proc, body = _run_host_finalize_capturing_body(tmp_path / rid,
+                                                       run_dir)
         assert proc.returncode == 0, proc.stderr
-        assert "Residual risks" not in body, body
+        assert body.rstrip().endswith("for full run state."), body
+
+
+# --- outcome: an unconverged run opens a draft PR (DESIGN §6) --------------
+
+@pytest.mark.parametrize("outcome,draft", [("unconverged", True),
+                                           ("done", False), (None, False)])
+def test_gh_pr_create_is_draft_only_when_unconverged(tmp_path, outcome,
+                                                     draft):
+    run_json = {"branch": "leerie/runs/feat-out-aaaaaa",
+                "working_branch": "main",
+                "finished_at": "2026-05-29T16:00:00+00:00"}
+    if outcome is not None:
+        run_json["outcome"] = outcome
+    run_dir = _make_run(tmp_path, "feat-out-aaaaaa", run_json=run_json)
+    r = _run_host_finalize(tmp_path, run_dir)
+    assert r.returncode == 0, r.stderr
+    gh_log = (tmp_path / "gh.log").read_text()
+    assert ("--draft" in gh_log) is draft, gh_log
+    assert ("opening draft PR against main" in r.stderr) is draft, r.stderr

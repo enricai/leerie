@@ -148,7 +148,11 @@ def test_embedded_disallowed_tools_matches_the_live_deny_list(leerie):
 
 
 def test_the_integrator_call_uses_both_variables():
-    """Assigning the lists but not passing them is the inert-fix shape."""
+    """Assigning the lists but not passing them is the inert-fix shape. The
+    deny list reaches the call as `$guard_disallowed`: the shared worker
+    guard's (`scripts/worker-guard.py`), seeded with the embedded base list
+    as its fallback."""
     text = COLLECT_SH.read_text()
     assert '--allowedTools "$integrator_allowed_tools"' in text
-    assert '--disallowedTools "$integrator_disallowed_tools"' in text
+    assert 'guard_disallowed="$integrator_disallowed_tools"' in text
+    assert '--disallowedTools "$guard_disallowed"' in text

@@ -14,6 +14,7 @@ used internally for `state.json`'s `leerie_version` field).
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -25,11 +26,14 @@ PLUGIN_JSON = REPO_ROOT / ".claude-plugin" / "plugin.json"
 MARKETPLACE_JSON = REPO_ROOT / ".claude-plugin" / "marketplace.json"
 
 
-def test_version_verb_prints_plugin_json_version():
+def test_version_verb_prints_plugin_json_version(tmp_path):
     expected = json.loads(PLUGIN_JSON.read_text())["version"]
+    # The launcher makes its state dir's `logs/` before any verb: pinned to
+    # tmp_path, never `~/.leerie/<repo>`.
     result = subprocess.run(
         [str(LAUNCHER), "version"],
         capture_output=True, text=True, check=False,
+        env={**os.environ, "LEERIE_STATE_DIR": str(tmp_path / "state")},
     )
     assert result.returncode == 0, result.stderr
     assert re.fullmatch(rf"leerie {re.escape(expected)}\s*", result.stdout), (

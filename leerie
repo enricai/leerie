@@ -82,7 +82,7 @@ if [ "${1:-}" != "prune" ]; then
           echo "leerie: python3 not found on PATH (needed to render --help)" >&2
           exit 1
         fi
-        exec python3 -B "$LEERIE_REPO/orchestrator/leerie.py" --help
+        exec python3 -I -B "$LEERIE_REPO/orchestrator/leerie.py" --help
         ;;
     esac
   done
@@ -127,7 +127,7 @@ unset _help_arg
 # non-empty JSON but carries no usable Claude session token — see the
 # note on that function for why this check exists.
 _claude_creds_has_oauth_token() {
-  printf '%s' "$1" | python3 -c \
+  printf '%s' "$1" | python3 -I -c \
     'import json, sys
 try:
     d = json.load(sys.stdin)
@@ -226,7 +226,7 @@ _extract_claude_credentials_json() {
 _CLAUDE_TTL_WARN_THRESHOLD_SEC=$((90 * 60))
 _check_claude_credential_ttl() {
   local creds="$1" status
-  status="$(python3 - "$creds" "$_CLAUDE_TTL_WARN_THRESHOLD_SEC" <<'PY'
+  status="$(python3 -I - "$creds" "$_CLAUDE_TTL_WARN_THRESHOLD_SEC" <<'PY'
 import json
 import sys
 import time
@@ -262,7 +262,7 @@ PY
     warn:*)
       local expires_at_ms="${status#warn:}"
       local expiry_human
-      expiry_human="$(python3 -c \
+      expiry_human="$(python3 -I -c \
         "import datetime, sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]) / 1000.0, datetime.timezone.utc).isoformat())" \
         "$expires_at_ms" 2>/dev/null || echo "$expires_at_ms")"
       echo "leerie: warning: the resolved Claude credential expires soon ($expiry_human)." >&2
@@ -281,7 +281,7 @@ PY
 # chain to pack the queue spec and Claude creds into env-safe values
 # without duplicating the same python one-liner per call site.
 _b64_stdin() {
-  python3 -c 'import sys, base64; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())'
+  python3 -I -c 'import sys, base64; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())'
 }
 
 # UUID format pattern (8-4-4-4-12 hex). Used by all chain-scoped verb
@@ -298,7 +298,7 @@ export UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 # repeating the same python3 one-liner.
 _json_get() {
   local file="$1" key="$2"
-  python3 -c '
+  python3 -I -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -318,7 +318,7 @@ except Exception:
 # Reads $LEERIE_STATE_HOST_DIR/runs/*/run.json. Quiet on stdout/stderr.
 _wave_already_done() {
   local chain_id="$1" wave_idx="$2" n_expected="$3"
-  python3 - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$wave_idx" "$n_expected" <<'PY'
+  python3 -I - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$wave_idx" "$n_expected" <<'PY'
 import json, sys
 from pathlib import Path
 state_dir = Path(sys.argv[1])
@@ -376,7 +376,7 @@ _chain_runs_filter() {
       return 2
       ;;
   esac
-  python3 - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$verb" <<'PY'
+  python3 -I - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$verb" <<'PY'
 import json, sys
 from pathlib import Path
 state_dir = Path(sys.argv[1])
@@ -451,7 +451,7 @@ _group_runs_filter() {
       ;;
   esac
   # Pass all state dirs as extra argv; Python reads sys.argv[3:].
-  python3 - "$group_id" "$verb" "$@" <<'PY'
+  python3 -I - "$group_id" "$verb" "$@" <<'PY'
 import json, sys
 from pathlib import Path
 group_id = sys.argv[1]
@@ -508,7 +508,7 @@ PY
 # and the resume path (single discovery surface).
 _wave_branches() {
   local chain_id="$1" wave_idx="$2"
-  python3 - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$wave_idx" <<'PY'
+  python3 -I - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$wave_idx" <<'PY'
 import json, sys
 from pathlib import Path
 state_dir = Path(sys.argv[1])
@@ -543,7 +543,7 @@ _resolve_volume_id_from_run_dir() {
   local vid
   for candidate in "$run_dir/fly-machine.json" "$run_dir/run.json"; do
     if [ -f "$candidate" ]; then
-      vid="$(python3 -c '
+      vid="$(python3 -I -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -578,7 +578,7 @@ _resolve_ec2_instance_id_from_run_dir() {
   local candidate iid
   for candidate in "$run_dir/ec2-instance.json" "$run_dir/run.json"; do
     if [ -f "$candidate" ]; then
-      iid="$(python3 -c '
+      iid="$(python3 -I -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -619,7 +619,7 @@ _resolve_volume_id_from_fly() {
   local mid="$1"
   local app="$2"
   [ -n "$mid" ] && [ -n "$app" ] || return 0
-  flyctl machine list --app "$app" --json 2>/dev/null | python3 -c '
+  flyctl machine list --app "$app" --json 2>/dev/null | python3 -I -c '
 import json, sys
 try:
     mid = sys.argv[1]
@@ -651,7 +651,7 @@ _ensure_run_json() {
   local fmj="$run_dir/fly-machine.json"
   local eij="$run_dir/ec2-instance.json"
   if [ -f "$fmj" ]; then
-    python3 -c '
+    python3 -I -c '
 import json, sys
 fmj = sys.argv[1]
 sidecar = sys.argv[2]
@@ -669,7 +669,7 @@ with open(sidecar, "w") as f:
     return 0
   fi
   if [ -f "$eij" ]; then
-    python3 -c '
+    python3 -I -c '
 import json, sys
 eij = sys.argv[1]
 sidecar = sys.argv[2]
@@ -800,7 +800,7 @@ _reap_orphaned_container() {
 # and other fast-path verbs can use it without the full launcher startup.
 _state_dir_default() {
   local basename
-  basename="$(python3 -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$USER_REPO")"
+  basename="$(python3 -I -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$USER_REPO")"
   echo "$HOME/.leerie/$basename"
 }
 
@@ -811,7 +811,7 @@ if [ -f "$USER_REPO/leerie.toml" ]; then
   _toml_state_dir="$( { grep -E '^[[:space:]]*state_dir[[:space:]]*=' \
                             "$USER_REPO/leerie.toml" 2>/dev/null \
                         || true; } \
-                      | head -1 \
+                      | sed -n 1p \
                       | sed -E 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*//;
                                 s/[[:space:]]*$//;
                                 s/^"(.*)"$/\1/;
@@ -903,7 +903,7 @@ else
   _toml_log_file="$( { grep -E '^[[:space:]]*log_file[[:space:]]*=' \
                             "$USER_REPO/leerie.toml" 2>/dev/null \
                         || true; } \
-                      | head -1 \
+                      | sed -n 1p \
                       | sed -E 's/^[[:space:]]*log_file[[:space:]]*=[[:space:]]*//;
                                 s/[[:space:]]*$//;
                                 s/^"(.*)"$/\1/;
@@ -944,7 +944,7 @@ export LEERIE_LOG_FILE_RESOLVED
 # top-level body: this wrapper's own text no longer re-implements the
 # grep/sed lookup inline, it delegates to the nested helper.
 _resolve_ec2_knob() {
-  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
+  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | sed -n 1p | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
   _resolve_cli_env_toml_knob "$1" "$2" "$3"
 }
 
@@ -1176,7 +1176,7 @@ _exec_readonly_on_host() {
   done
   [ "$_ro_has_verb" = "true" ] || return 1
   LEERIE_STATE_DIR="$LEERIE_STATE_HOST_DIR" \
-    exec python3 -B "$LEERIE_REPO/orchestrator/leerie.py" "${_ro_argv[@]}"
+    exec python3 -I -B "$LEERIE_REPO/orchestrator/leerie.py" "${_ro_argv[@]}"
 }
 
 # `--report` (telemetry for one run) can appear anywhere in argv; scanning stops
@@ -1210,7 +1210,7 @@ case "${1:-}" in
       local key="$1" file="${USER_REPO:-$(pwd)}/.leerie/config.toml"
       [ -f "$file" ] || return 0
       { grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null \
-        | head -1 \
+        | sed -n 1p \
         | sed -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//;
                   s/[[:space:]]*$//;
                   s/^\"(.*)\"$/\1/;
@@ -1369,6 +1369,14 @@ test = "$_test_val"
 # to override or to cover a runner it does not know:
 # test_scoped = "npx vitest related --run {files} --passWithNoTests"
 # build_scoped = "npx tsc --noEmit"
+#
+# Commands over files that are already tests (held-out acceptance sets,
+# reruns) use the runner's direct form instead; {test_files} expands to
+# those files. Without it, leerie derives it from a declared test_scoped
+# (vitest related -> vitest run, jest --findRelatedTests -> --runTestsByPath,
+# wrapper and environment kept) and uses a test_scoped it cannot read that
+# way as written. Uncomment only to override that:
+# test_files_scoped = "npx vitest run {test_files} --passWithNoTests"
 TOML
         echo "Created $config_path"
         echo "  Suggested next step: git add .leerie/ && git commit -m 'chore: add leerie config'"
@@ -1407,7 +1415,7 @@ TOML
         # Call run_recapture_deps from the orchestrator module. It handles run
         # discovery, State construction + flock, and asyncio.run(capture_repo_deps).
         _recapture_rc=0
-        python3 - "$_user_repo" "$_leerie_state_dir" "$_recapture_force" \
+        python3 -I - "$_user_repo" "$_leerie_state_dir" "$_recapture_force" \
             "$LEERIE_REPO/orchestrator/leerie.py" <<'PY' || _recapture_rc=$?
 import sys, importlib.util, pathlib
 
@@ -1444,7 +1452,7 @@ PY
         # live in resolve_blt_scoped and are deliberately not mirrored in
         # bash, so this prints "(not set)" for a repo relying on them rather
         # than guessing a second time and risking drift.
-        for axis in build_scoped test_scoped; do
+        for axis in build_scoped test_scoped test_files_scoped; do
           val=""
           if [ -f "$_user_repo/.leerie/config.toml" ]; then
             # `|| true`: the launcher runs under `set -o pipefail`, so a
@@ -1452,11 +1460,18 @@ PY
             # the empty string this loop treats as "not declared".
             val="$(grep -E "^[[:space:]]*${axis}[[:space:]]*=" \
                      "$_user_repo/.leerie/config.toml" 2>/dev/null \
-                   | head -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/^"//; s/"$//' \
+                   | sed -n 1p | sed -E 's/^[^=]*=[[:space:]]*//; s/^"//; s/"$//' \
                    || true)"
           fi
           if [ -n "$val" ]; then
             printf '  %-13s = %-40s  [config]\n' "$axis" "$val"
+            [ "$axis" = test_scoped ] && _test_scoped_declared=1
+          elif [ "$axis" = test_files_scoped ] \
+              && [ -n "${_test_scoped_declared:-}" ]; then
+            # Derived by the orchestrator, not here (no second derivation
+            # to drift): name the source, not a guessed value.
+            printf '  %-13s = %-40s  [%s]\n' "$axis" "(not set)" \
+              "derived from test_scoped at runtime"
           else
             printf '  %-13s = %-40s  [%s]\n' "$axis" "(not set)" \
               "inferred at runtime"
@@ -1501,9 +1516,10 @@ PY
         --apply) _prune_apply=true; shift ;;
         -h|--help)
           echo "Usage: leerie prune [--older-than DAYS] [--apply]" >&2
-          echo "  Removes terminal run dirs and stale repo-map cache entries" >&2
-          echo "  older than DAYS (default 14), and subtask branches whose run" >&2
-          echo "  dir is gone. Dry-run unless --apply is given." >&2
+          echo "  Removes terminal run dirs, the worktrees of idle resumable" >&2
+          echo "  runs, and stale repo-map cache entries older than DAYS" >&2
+          echo "  (default 14), and subtask branches whose run dir is gone," >&2
+          echo "  reporting the space freed. Dry-run unless --apply is given." >&2
           echo "  With AWS credentials resolvable, also lists (--apply: deletes)" >&2
           echo "  leerie-tagged EC2 AMIs older than DAYS (current version kept)," >&2
           echo "  snapshots, key pairs, security groups and the IAM role." >&2
@@ -1515,7 +1531,8 @@ PY
       ''|*[!0-9]*) echo "leerie prune: --older-than needs a whole number of days" >&2; exit 1 ;;
     esac
     LEERIE_PRUNE_DAYS="$_prune_days" LEERIE_PRUNE_APPLY="$_prune_apply" \
-      python3 - "$LEERIE_STATE_HOST_DIR" "$USER_REPO" <<'PY'
+      LEERIE_PRUNE_HOST_FINALIZE="$LEERIE_REPO/scripts/host-finalize.sh" \
+      python3 -I - "$LEERIE_STATE_HOST_DIR" "$USER_REPO" <<'PY'
 import fcntl, json, os, pathlib, shutil, subprocess, sys, time
 
 root = pathlib.Path(sys.argv[1])
@@ -1526,6 +1543,39 @@ cutoff = time.time() - days * 86400
 freed = 0
 runs_removed = []
 reaped_dirs = set()
+
+def _rm_owned(path) -> bool:
+    """Remove `path` after giving every directory under it the owner's read,
+    write and search bits, top down, never following a link; True when
+    nothing is left (DESIGN §6 *Every deleter of a run's directories deletes
+    them*). The orchestrator's `_rmtree_owned`, here because this host
+    process does not load the orchestrator. A plain `rmtree(...,
+    ignore_errors=True)` left a run's read-only configuration template —
+    a copy of the credentials — and reported the run removed (review round
+    18 M1)."""
+    p = pathlib.Path(path)
+    if not os.path.lexists(p):
+        return True
+    if p.is_symlink() or not p.is_dir():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return not os.path.lexists(p)
+    stack = [str(p)]
+    while stack:
+        d = stack.pop()
+        try:
+            os.chmod(d, (os.lstat(d).st_mode & 0o7777) | 0o700)
+        except OSError:
+            pass
+        try:
+            with os.scandir(d) as it:
+                stack += [e.path for e in it if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            pass
+    shutil.rmtree(p, ignore_errors=True)
+    return not os.path.lexists(p)
 
 def size_of(p: "os.PathLike[str] | str") -> int:
     total = 0
@@ -1554,7 +1604,7 @@ def _host_spelling(p: str) -> str:
 
     Subtask worktrees are created INSIDE the container, where the state root
     is bind-mounted at `/leerie-state` -- so `new-worktree.sh` writes
-    `/leerie-state/runs/<id>/worktrees/<sid>/.git` into
+    `/leerie-state/runs/<id>/worktrees/<id[:12]>-<sid>/.git` into
     `.git/worktrees/<n>/gitdir`, while `prune` runs on the host and knows the
     directory as `$LEERIE_STATE_HOST_DIR/runs/<id>/...`. Comparing the two
     spellings without translating never matched, which made the whole
@@ -1685,11 +1735,111 @@ def _deregister_orphaned_worktrees(reaped: set) -> None:
         orphaned = not os.path.exists(target) or any(
             target == d or target.startswith(d + os.sep) for d in reaped)
         if orphaned and apply:
-            shutil.rmtree(entry, ignore_errors=True)
+            _rm_owned(entry)
+
+
+def _last_activity(d) -> float:
+    """Newest mtime among the run dir, the files a live run keeps writing,
+    and the entries of `logs/`, `logs/transcripts/` and `worktrees/` -- the
+    same signal the orchestrator's preflight reap reads
+    (`_run_last_activity`)."""
+    ts = [d.stat().st_mtime]
+    for f in ("state.json", "run.json", "orchestrator.log", "calls.ndjson",
+              "memory.ndjson", "orchestrator.exit_code"):
+        try:
+            ts.append((d / f).stat().st_mtime)
+        except OSError:
+            pass
+    for sub in ("logs", "logs/transcripts", "worktrees"):
+        try:
+            ts.append((d / sub).stat().st_mtime)
+            for e in os.scandir(d / sub):
+                try:
+                    ts.append(e.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return max(ts)
+
+
+def _bring_back(d) -> bool:
+    """`host_bring_back_run_branch` (scripts/host-finalize.sh) for run dir
+    `d`: the one implementation of the bring-back and its compare-and-swap.
+    True when it returned 0."""
+    lib = os.environ.get("LEERIE_PRUNE_HOST_FINALIZE", "")
+    if not lib:
+        return False
+    try:
+        r = subprocess.run(
+            ["bash", "-c", '. "$1" && host_bring_back_run_branch "$2"', "_",
+             lib, str(d)],
+            env={**os.environ, "USER_REPO": str(repo)}, check=False,
+            timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def _reap_worktrees(d) -> int:
+    """Delete an idle, non-live run's `worktrees/` only (its state, logs and
+    branches stay, so it can still resume -- its scripts rebuild every
+    worktree from its branches). Renamed under the run-directory flock, then
+    deleted, as the orchestrator's preflight reap does (DESIGN §6 *Idle
+    runs' worktrees are reaped at preflight*). Returns the bytes it frees
+    (each inode once); 0 when it did nothing."""
+    wt = d / "worktrees"
+    if not wt.is_dir() or wt.is_symlink() or not any(wt.iterdir()):
+        # No worktrees, but the copies of the credentials still go.
+        if apply:
+            for name in ("workers", "claude-config"):
+                if os.path.lexists(d / name) and not _rm_owned(d / name):
+                    print(f"  could not remove {d / name}; it may hold a "
+                          "copy of your credentials")
+        return 0
+    seen = set()
+    nbytes = 0
+    for dirpath, _dirnames, filenames in os.walk(wt):
+        for f in filenames:
+            try:
+                st_ = os.lstat(os.path.join(dirpath, f))
+            except OSError:
+                continue
+            if (st_.st_dev, st_.st_ino) in seen:
+                continue
+            seen.add((st_.st_dev, st_.st_ino))
+            nbytes += st_.st_size
+    if not apply:
+        return nbytes
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return 0
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        trash = d / (".worktrees.reap-%d" % os.getpid())
+        os.rename(wt, trash)
+        # The workers' directories and configuration template hold copies of
+        # the credentials: an idle run's go with its worktrees (DESIGN §6 *No
+        # copy of the credentials outlives its run's process*).
+        for name in ("workers", "claude-config"):
+            if not _rm_owned(d / name):
+                print(f"  could not remove {d / name}; it may hold a copy of "
+                      "your credentials")
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+    _rm_owned(trash)
+    return nbytes
 
 
 runs = root / "runs"
 live = set()
+worktrees_reaped = 0
 if runs.is_dir():
     for d in sorted(runs.iterdir()):
         if not d.is_dir():
@@ -1708,16 +1858,46 @@ if runs.is_dir():
         # Terminal AND old AND not live. The first two are timestamps and a
         # timestamp cannot see a running orchestrator -- see `_is_live`.
         if terminal and mtime < cutoff and not _is_live(d, d.name):
-            freed += size_of(d)
-            runs_removed.append(d.name)
+            # The run's branch lives in its own repository until it is
+            # brought back (DESIGN §6 *The run's own repository*): bring it
+            # back before the directory goes, or keep the directory.
+            if apply and (d / "repo" / "HEAD").is_file() \
+                    and not _bring_back(d):
+                print(f"  kept run dir {d.name}: its run branch could not be "
+                      "brought back into your repository")
+                live.add(d.name)
+                continue
+            size = size_of(d)
             try:
-                reaped_dirs.add(str(d.resolve()))
+                resolved = str(d.resolve())
             except OSError:
-                pass
-            if apply:
-                shutil.rmtree(d, ignore_errors=True)
+                resolved = None
+            # Counted removed only when it is gone: an owner-aware removal,
+            # then the check (DESIGN §6 *Every deleter of a run's
+            # directories deletes them*).
+            if apply and not _rm_owned(d):
+                print(f"  kept run dir {d.name}: it could not be removed "
+                      "whole (remove it by hand)")
+                live.add(d.name)
+                continue
+            freed += size
+            runs_removed.append(d.name)
+            if resolved is not None:
+                reaped_dirs.add(resolved)
         else:
             live.add(d.name)
+            # A resumable run keeps its directory, but not an old idle
+            # run's worktrees -- a full checkout plus node_modules per
+            # subtask -- which a resume rebuilds anyway.
+            if _last_activity(d) < cutoff and not _is_live(d, d.name):
+                _freed = _reap_worktrees(d)
+                if _freed:
+                    freed += _freed
+                    worktrees_reaped += 1
+                    try:
+                        reaped_dirs.add(str((d / "worktrees").resolve()))
+                    except OSError:
+                        pass
 
 # Deregister BEFORE reaping branches, and after the removal loop so the sweep
 # sees the directories it just deleted as gone.
@@ -1806,6 +1986,7 @@ for ref in out.splitlines():
 verb = "removed" if apply else "would remove"
 print(f"leerie prune ({'apply' if apply else 'dry-run'}, older than {days}d)")
 print(f"  {verb} {len(runs_removed)} terminal run dir(s)")
+print(f"  {verb} the worktrees of {worktrees_reaped} idle resumable run(s)")
 print(f"  {verb} {cache_removed} repo-map cache entr(y/ies)")
 print(f"  {verb} {len(branches_removed)} orphaned subtask branch(es)")
 if branches_kept:
@@ -1883,7 +2064,7 @@ PY
     # Fly coordinator machine to query; the chain identity lives only
     # in each run's run.json (set by chain's wave loop post-finalize).
     if [ "$_list_chains_only" = "1" ]; then
-      python3 - "$LEERIE_STATE_HOST_DIR" <<'PY'
+      python3 -I - "$LEERIE_STATE_HOST_DIR" <<'PY'
 import json, os, sys
 from pathlib import Path
 
@@ -1950,7 +2131,7 @@ PY
     # list --groups: iterate all $HOME/.leerie/*/runs/*/run.json across
     # every per-repo state dir, group by group_id, render one row per group.
     if [ "$_list_groups_only" = "1" ]; then
-      python3 - "$HOME/.leerie" <<'PY'
+      python3 -I - "$HOME/.leerie" <<'PY'
 import json, os, sys
 from pathlib import Path
 
@@ -2033,7 +2214,7 @@ PY
         echo "  Falling back to local sidecars." >&2
         set -- "${_list_rest[@]}"
       else
-        LEERIE_LIST_FLY_JSON="$_list_json" python3 - "$USER_REPO" "$FLY_APP" "$LEERIE_STATE_HOST_DIR" <<'PY'
+        LEERIE_LIST_FLY_JSON="$_list_json" python3 -I - "$USER_REPO" "$FLY_APP" "$LEERIE_STATE_HOST_DIR" <<'PY'
 import json, os, sys
 from pathlib import Path
 
@@ -2319,7 +2500,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       }
       _ab_remote_state="/work/.leerie/runs/$_ab_run_id/state.json"
       _ab_out="$(printf '%s' "$_ab_mutate" \
-        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 - '$_ab_remote_state' '$_ab_sid' $_ab_force" 2>&1 || true)"
+        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 -I - '$_ab_remote_state' '$_ab_sid' $_ab_force" 2>&1 || true)"
       _ab_sentinel="$(printf '%s\n' "$_ab_out" | tr -d '\r' \
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ab_sentinel" in
@@ -2337,7 +2518,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       # consistent (best-effort; host copy is optional — EC2 state.json
       # normally lives only on the instance until fetch-back).
       if [ -f "$_ab_state_file" ]; then
-        python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" $_ab_force >/dev/null 2>&1 || true
+        python3 -I -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" $_ab_force >/dev/null 2>&1 || true
       fi
       _ab_teardown_ec2
       remote_log "accept-blocked: done. Resume via: leerie resume $_ab_run_id"
@@ -2371,7 +2552,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       _ab_started_machine=false
       _ab_mstate="$(flyctl machine status "$LEERIE_MACHINE_ID" --app "$FLY_APP" 2>/dev/null \
                     | sed 's/\x1b\[[0-9;]*m//g' \
-                    | awk -F': *' '/^State: / { print $2; exit }' \
+                    | awk -F': *' '/^State: / && !f { print $2; f = 1 }' \
                     | tr -d '[:space:]' || true)"
       case "$_ab_mstate" in
         started|starting) : ;;
@@ -2428,7 +2609,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       # flattens the remote exit code.
       _ab_out="$(printf '%s' "$_ab_mutate" \
         | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-            --pty=false -C "python3 - '$_ab_remote_state' '$_ab_sid' $_ab_force" 2>&1 || true)"
+            --pty=false -C "python3 -I - '$_ab_remote_state' '$_ab_sid' $_ab_force" 2>&1 || true)"
       _ab_sentinel="$(printf '%s\n' "$_ab_out" | tr -d '\r' \
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ab_sentinel" in
@@ -2445,7 +2626,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       # Mirror the mutation onto the host copy so list / audits stay
       # consistent (best-effort; host copy is optional).
       if [ -f "$_ab_state_file" ]; then
-        python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" $_ab_force >/dev/null 2>&1 || true
+        python3 -I -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" $_ab_force >/dev/null 2>&1 || true
       fi
       _ab_teardown
       remote_log "accept-blocked: done. Resume via: leerie resume $_ab_run_id"
@@ -2455,7 +2636,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
         remote_log "accept-blocked: no state.json at $_ab_state_file"
         exit 1
       fi
-      python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" $_ab_force
+      python3 -I -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" $_ab_force
       remote_log "accept-blocked: done. Resume via: leerie resume $_ab_run_id"
     fi
     exit 0
@@ -2539,6 +2720,15 @@ entry = gate.get(sid)
 if entry is None:
     print(f"ERROR: subtask {sid!r} not found in integration_gate", file=sys.stderr)
     sys.exit(1)
+if entry.get("outcome") == "backed_out":
+    # Nothing is integrated: the subtask was reset off the run branch and
+    # settled unconverged, so flipping "accepted" would claim a merge that
+    # is not there. Changes nothing.
+    _why = entry.get("fallback_reason") or "no reason recorded"
+    print(f"NOOP: subtask {sid!r} was backed out of the run branch ({_why}); "
+          "none of its work is integrated, so there is no finding to accept. "
+          "It is settled unconverged; a later run redoes its work")
+    sys.exit(0)
 if entry.get("accepted"):
     print(f"NOOP: subtask {sid!r} integration finding is already accepted")
     sys.exit(0)
@@ -2629,7 +2819,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       }
       _ai_remote_state="/work/.leerie/runs/$_ai_run_id/state.json"
       _ai_out="$(printf '%s' "$_ai_mutate" \
-        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 - '$_ai_remote_state' '$_ai_sid'" 2>&1 || true)"
+        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 -I - '$_ai_remote_state' '$_ai_sid'" 2>&1 || true)"
       _ai_sentinel="$(printf '%s\n' "$_ai_out" | tr -d '\r' \
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ai_sentinel" in
@@ -2644,7 +2834,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
           ;;
       esac
       if [ -f "$_ai_state_file" ]; then
-        python3 -c "$_ai_mutate" "$_ai_state_file" "$_ai_sid" >/dev/null 2>&1 || true
+        python3 -I -c "$_ai_mutate" "$_ai_state_file" "$_ai_sid" >/dev/null 2>&1 || true
       fi
       _ai_teardown_ec2
       remote_log "accept-integration: done. Resume via: leerie resume $_ai_run_id"
@@ -2666,7 +2856,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       _ai_started_machine=false
       _ai_mstate="$(flyctl machine status "$LEERIE_MACHINE_ID" --app "$FLY_APP" 2>/dev/null \
                     | sed 's/\x1b\[[0-9;]*m//g' \
-                    | awk -F': *' '/^State: / { print $2; exit }' \
+                    | awk -F': *' '/^State: / && !f { print $2; f = 1 }' \
                     | tr -d '[:space:]' || true)"
       case "$_ai_mstate" in
         started|starting) : ;;
@@ -2710,7 +2900,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       _ai_remote_state="/work/.leerie/runs/$_ai_run_id/state.json"
       _ai_out="$(printf '%s' "$_ai_mutate" \
         | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-            --pty=false -C "python3 - '$_ai_remote_state' '$_ai_sid'" 2>&1 || true)"
+            --pty=false -C "python3 -I - '$_ai_remote_state' '$_ai_sid'" 2>&1 || true)"
       _ai_sentinel="$(printf '%s\n' "$_ai_out" | tr -d '\r' \
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ai_sentinel" in
@@ -2725,7 +2915,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
           ;;
       esac
       if [ -f "$_ai_state_file" ]; then
-        python3 -c "$_ai_mutate" "$_ai_state_file" "$_ai_sid" >/dev/null 2>&1 || true
+        python3 -I -c "$_ai_mutate" "$_ai_state_file" "$_ai_sid" >/dev/null 2>&1 || true
       fi
       _ai_teardown
       remote_log "accept-integration: done. Resume via: leerie resume $_ai_run_id"
@@ -2735,7 +2925,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
         remote_log "accept-integration: no state.json at $_ai_state_file"
         exit 1
       fi
-      python3 -c "$_ai_mutate" "$_ai_state_file" "$_ai_sid"
+      python3 -I -c "$_ai_mutate" "$_ai_state_file" "$_ai_sid"
       remote_log "accept-integration: done. Resume via: leerie resume $_ai_run_id"
     fi
     exit 0
@@ -2795,7 +2985,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     # Peek at the first positional arg for UUID dispatch.
     # Chain-id stop: iterate runs with matching chain_id, stop each.
     # Group-id stop: if no chain runs found, try group_id across all state dirs.
-    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
+    if [ "$#" -gt 0 ] && grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$1"); then
       _sp_chain="$1"; shift
       _sp_pass_args=("$@")
       _sp_run_ids="$(_chain_runs_filter "$_sp_chain" stop)"
@@ -2962,7 +3152,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     # Chain-id kill: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # find runs with matching chain_id, invoke single-run kill on each.
     # Group-id kill: if no chain runs found, try group_id across all state dirs.
-    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
+    if [ "$#" -gt 0 ] && grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$1"); then
       _kc_chain="$1"; shift
       # Pass through --force / --runtime / etc. flags to per-run kill.
       _kc_pass_args=("$@")
@@ -3120,13 +3310,9 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       _kill_ec2_creds_args=()
       while IFS= read -r _kill_ec2_a; do _kill_ec2_creds_args+=("$_kill_ec2_a"); done \
         < <(_leerie_aws_creds_args_tokens)
-      _kill_ec2_creds_exports="$(resolve_aws_credentials ${_kill_ec2_creds_args[@]+"${_kill_ec2_creds_args[@]}"})"
-      _kill_ec2_creds_rc=$?
-      if [ "$_kill_ec2_creds_rc" -ne 0 ]; then
-        exit 1
-      fi
+      _kill_ec2_creds_exports="$(resolve_aws_credentials ${_kill_ec2_creds_args[@]+"${_kill_ec2_creds_args[@]}"})" || exit 1
       eval "$_kill_ec2_creds_exports"
-      unset _kill_ec2_creds_args _kill_ec2_creds_exports _kill_ec2_creds_rc
+      unset _kill_ec2_creds_args _kill_ec2_creds_exports
       require_aws || exit 1
       LEERIE_EC2_INSTANCE_ID="$_kill_ec2_instance_id"
       export LEERIE_EC2_INSTANCE_ID
@@ -3258,7 +3444,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     export USER_REPO
     # Chain-id / group-id dispatch: `finalize <uuid>` finalizes every
     # run-id belonging to a chain/group that hasn't already been pushed.
-    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
+    if [ "$#" -gt 0 ] && grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$1"); then
       _fc_chain="$1"; shift
       _fc_pass_args=("$@")
       _fc_run_ids="$(_chain_runs_filter "$_fc_chain" finalize)"
@@ -3468,7 +3654,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       _has_finished="$(_json_get "$_fin_run_dir/run.json" "finished_at")"
       if [ -n "$_has_finished" ]; then
         _run_branch="$(_json_get "$_fin_run_dir/run.json" "branch")"
-        _run_no_push="$(python3 -c '
+        _run_no_push="$(python3 -I -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -3516,7 +3702,12 @@ except Exception:
       # was deleted — where host_finalize would otherwise fail further in
       # with a message about run.json rather than about the missing branch.
       _fin_local_branch="$(_json_get "$_fin_run_dir/run.json" "branch")"
-      _fin_local_no_push="$(python3 -c '
+      # The run branch lives in the run's own repository until it is brought
+      # back into yours (DESIGN §6 *The run's own repository*).
+      # shellcheck source=scripts/host-finalize.sh
+      . "$LEERIE_REPO/scripts/host-finalize.sh"
+      host_bring_back_run_branch "$_fin_run_dir" || true
+      _fin_local_no_push="$(python3 -I -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -3530,7 +3721,7 @@ except Exception:
         remote_log "finalize: local run $_fin_run_id has no run branch in $USER_REPO"
         remote_log "  Expected branch: ${_fin_local_branch:-<none recorded in run.json>}"
         remote_log "  Nothing to push. The per-subtask work (if any) is on the"
-        remote_log "  leerie/subtasks/$_fin_run_id/* branches."
+        remote_log "  leerie/subtasks/$_fin_run_id/* branches of $_fin_run_dir/repo."
         exit 1
       fi
       remote_log "finalize: local run $_fin_run_id; state and branch already on this host, skipping fetch"
@@ -3595,7 +3786,7 @@ except Exception:
         _fin_ec2_aws_args+=("$_fin_ec2_a")
       done < <(_aws_region_profile_args)
       _fin_ec2_state="$(aws ec2 describe-instances --instance-ids "$_fin_ec2_iid" \
-        ${_fin_ec2_aws_args[@]+"${_fin_ec2_aws_args[@]}"} 2>/dev/null | python3 -c '
+        ${_fin_ec2_aws_args[@]+"${_fin_ec2_aws_args[@]}"} 2>/dev/null | python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -3726,63 +3917,13 @@ except Exception:
       [ "$_a" = "--no-push" ] && _FINALIZE_NO_PUSH=true
     done
     export NO_VERIFY_PUSH
-    # IMPORTANT: the launcher passes --no-push to the in-Fly orchestrator
-    # because the Fly machine cannot push (no GitHub SSH key on the
-    # machine by design). That writes no_push=true to run.json on the
-    # machine, which fetch_branch copies to the host. The user's actual
-    # intent is recorded host-side in the run dir's fly-machine.json
-    # (host_no_push field, set at launch time). On finalize:
-    #   - if --no-push is on the finalize CLI, skip push (user
-    #     explicitly opted out at finalize time).
-    #   - else, if host_no_push=true was recorded at launch, skip push
-    #     (user opted out at launch).
-    #   - else, clear the in-Fly orchestrator's no_push=true so the
-    #     host pushes. The orchestrator's no_push was a mechanism flag,
-    #     not a user-intent flag.
-    if [ "$_FINALIZE_NO_PUSH" = "false" ]; then
-      _host_intent=""
-      if [ -f "$_fin_run_dir/fly-machine.json" ]; then
-          _host_intent="$(python3 -c '
-import json, sys
-try:
-    data = json.load(open(sys.argv[1]))
-    print("true" if data.get("host_no_push") else "false")
-except Exception:
-    print("")
-' "$_fin_run_dir/fly-machine.json" 2>/dev/null || true)"
-      fi
-      if [ "$_host_intent" = "true" ]; then
-        remote_log "finalize: host_no_push was set at launch — skipping push"
-        _FINALIZE_NO_PUSH=true
-      fi
-      # Clear the in-Fly orchestrator's mechanism-flag no_push so
-      # host_finalize doesn't conflate it with user intent.
-      #
-      # Conditional on a run branch being present locally: when no
-      # branch was materialized (the cleared-but-empty terminal-state
-      # case — DESIGN §8), `_finish_no_work_run` deliberately writes
-      # no_push=true as **intent** ("nothing to push — no branch
-      # exists"). Stripping it here would disarm host_finalize's
-      # no_push gate and cause it to attempt git push on a
-      # non-existent branch.
-      if [ "$_FINALIZE_NO_PUSH" = "false" ]; then
-        _fetched_run_json="$_fetched_run_dir/run.json"
-        _fetched_run_branch="$(_json_get "$_fetched_run_json" "branch" 2>/dev/null || true)"
-        if [ -f "$_fetched_run_json" ] && [ -n "$_fetched_run_branch" ] && \
-           git -C "$USER_REPO" rev-parse --verify "refs/heads/$_fetched_run_branch" >/dev/null 2>&1; then
-          python3 - "$_fetched_run_json" <<'PY'
-import json, os, sys
-path = sys.argv[1]
-data = json.load(open(path))
-if data.get("no_push") is True:
-    data.pop("no_push", None)
-    tmp = path + ".tmp"
-    json.dump(data, open(tmp, "w"), indent=2)
-    open(tmp, "a").write("\n")
-    os.replace(tmp, path)
-PY
-        fi
-      fi
+    # The push follows the run's run.json.no_push, recorded at the run's
+    # start and brought home unchanged (DESIGN §6 *One push choice per run,
+    # on every runtime*). --no-push on this command line finalizes without
+    # pushing, on every runtime.
+    if [ "$_FINALIZE_NO_PUSH" = "true" ]; then
+      remote_log "finalize: --no-push given; skipping push + PR"
+      exit 0
     fi
     # shellcheck disable=SC1091
     . "$LEERIE_REPO/scripts/host-finalize.sh"
@@ -3799,10 +3940,10 @@ PY
     if [ -z "$_st_id" ]; then
       remote_log "status: <id> is required (--chain-id, group-id, or run-id)"; exit 1
     fi
-    if echo "$_st_id" | grep -qiE "$UUID_PATTERN"; then
+    if grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$_st_id"); then
       # Try chain_id first (runs in current state dir).
       _st_chain_rc=0
-      python3 - "$LEERIE_STATE_HOST_DIR" "$_st_id" <<'PY' || _st_chain_rc=$?
+      python3 -I - "$LEERIE_STATE_HOST_DIR" "$_st_id" <<'PY' || _st_chain_rc=$?
 import json, sys
 from pathlib import Path
 
@@ -3863,7 +4004,7 @@ PY
         exit "$_st_chain_rc"
       fi
       # chain_id not found (exit 2); try group_id across all state dirs.
-      python3 - "$HOME/.leerie" "$_st_id" <<'PY'
+      python3 -I - "$HOME/.leerie" "$_st_id" <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -3937,10 +4078,10 @@ PY
     if [ -z "$_at_id" ]; then
       remote_log "attach: <id> is required (--chain-id or run-id)"; exit 1
     fi
-    if echo "$_at_id" | grep -qiE "$UUID_PATTERN"; then
+    if grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$_at_id"); then
       remote_log "attach: polling $LEERIE_STATE_HOST_DIR for chain $_at_id (Ctrl-C to detach)"
       while :; do
-        _at_done="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_at_id" <<'PY'
+        _at_done="$(python3 -I - "$LEERIE_STATE_HOST_DIR" "$_at_id" <<'PY'
 import json, sys
 from pathlib import Path
 state_dir = Path(sys.argv[1])
@@ -3984,7 +4125,7 @@ PY
     # user to reattach to. If the UUID is a group_id (no chain runs found),
     # dispatch group-scoped resume instead. Non-UUID args fall through to
     # the existing run-id resume path below.
-    if [ "$#" -ge 2 ] && echo "$2" | grep -qiE "$UUID_PATTERN"; then
+    if [ "$#" -ge 2 ] && grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$2"); then
       _rs_chain="$2"
       shift 2
       _rs_pass_args=("$@")
@@ -4036,7 +4177,7 @@ PY
         echo "$_rs_running" | while read -r _rid; do
           [ -z "$_rid" ] && continue
           _rs_rj="$LEERIE_STATE_HOST_DIR/runs/$_rid/run.json"
-          _rs_info="$(python3 -c '
+          _rs_info="$(python3 -I -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -4141,14 +4282,14 @@ except Exception:
       # chain's lowercase tag — without this, --chain-id with any
       # uppercase letter silently bypasses idempotency and forks the
       # chain into a second chain_id (v8 audit finding S1).
-      if ! echo "$_ch_id_override" | grep -qiE "$UUID_PATTERN"; then
+      if ! grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$_ch_id_override"); then
         remote_log "chain: --chain-id value '$_ch_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
         exit 1
       fi
       _ch_id="$(echo "$_ch_id_override" | tr '[:upper:]' '[:lower:]')"
       remote_log "chain: pinning chain_id to $_ch_id (resuming prior chain)"
     else
-      _ch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+      _ch_id="$(python3 -I -c 'import uuid; print(uuid.uuid4())')"
     fi
     _ch_jobs_per_wave=()   # one entry per wave: "n_jobs"
     _ch_prompts=()         # flat list of prompts (length = total jobs)
@@ -4330,11 +4471,11 @@ except Exception:
           _ch_mid=""
           _ch_remote_pointer="$LEERIE_STATE_HOST_DIR/remote/$_cp.json"
           if [ -f "$_ch_remote_pointer" ]; then
-            _ch_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_ch_remote_pointer" 2>/dev/null)"
+            _ch_mid="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_ch_remote_pointer" 2>/dev/null)"
           fi
           # Fallback: scan fly-machine.json files for matching launcher_pid.
           if [ -z "$_ch_mid" ]; then
-            _ch_mid="$(python3 -c '
+            _ch_mid="$(python3 -I -c '
 import json, sys
 from pathlib import Path
 state_dir, pid = Path(sys.argv[1]), int(sys.argv[2])
@@ -4405,14 +4546,20 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
         # Each wave-N branch is already on origin (each host_finalize
         # pushed it), so the function's git fetch origin + git merge
         # origin/<branch> works as-is.
-        # Preserve any caller PYTHONPATH (e.g. test seam that shadows
-        # chain.git_ops with a stub) by prepending our leerie dir.
+        # Isolated (-I) like every host-side python3, so neither the cwd
+        # (the user's checkout) nor PYTHONPATH reaches sys.path on its own.
+        # The import path is handed over explicitly instead: the operator's
+        # PYTHONPATH entries first (e.g. a test seam that shadows
+        # chain.git_ops with a stub), then our leerie dir — the order the
+        # PYTHONPATH prefix gave before. Empty entries are dropped, since
+        # an empty entry means the cwd.
         # Single-quoted python source + argv pass-through avoids shell-
         # quoting bugs when $USER_REPO or branch names contain
         # apostrophes (legal in git refs, uncommon but possible in paths).
-        _ch_branches_repr="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${_ch_wave_branches[@]}")"
-        if ! PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$_ch_leerie_dir" python3 -c '
+        _ch_branches_repr="$(python3 -I -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${_ch_wave_branches[@]}")"
+        if ! python3 -I -c '
 import json, sys
+sys.path[:0] = [d for d in sys.argv[5].split(":") if d] + [sys.argv[6]]
 from chain.git_ops import synth_merge_branches, SynthMergeConflict
 repo, base, branches_json, stage = sys.argv[1:5]
 branches = json.loads(branches_json)
@@ -4421,7 +4568,8 @@ try:
 except SynthMergeConflict as exc:
     sys.stderr.write(f"synth-merge conflict on {exc.branch}: {exc.output}\n")
     sys.exit(1)
-' "$USER_REPO" "$_ch_current_base" "$_ch_branches_repr" "$_ch_next_stage"; then
+' "$USER_REPO" "$_ch_current_base" "$_ch_branches_repr" "$_ch_next_stage" \
+            "${PYTHONPATH:-}" "$_ch_leerie_dir"; then
           remote_log "wave $_wave_idx: synth-merge conflict; chain paused"
           echo ""
           echo "Wave-$_wave_idx PRs are open (each per-job host_finalize"
@@ -4569,14 +4717,14 @@ except SynthMergeConflict as exc:
         _grp_id_override="$_grp_id_stripped"
       fi
       unset _grp_id_stripped
-      if ! echo "$_grp_id_override" | grep -qiE "$UUID_PATTERN"; then
+      if ! grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$_grp_id_override"); then
         remote_log "group: --group-id value '$_grp_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
         exit 1
       fi
       _grp_id="$(echo "$_grp_id_override" | tr '[:upper:]' '[:lower:]')"
       remote_log "group: reusing group_id $_grp_id"
     else
-      _grp_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+      _grp_id="$(python3 -I -c 'import uuid; print(uuid.uuid4())')"
     fi
 
     # Source lib.sh for update_run_json (used in tag-back below).
@@ -4680,50 +4828,29 @@ ${_grp_member_prompt}"
     # Clear signal trap; fan-out complete.
     trap - INT TERM
 
-    # Group tag-back: write group_id into each member's run.json.
-    # Discovery: scan <member-state-dir>/runs/*/run.json for the newest
-    # run.json with finished_at set — same mechanism as the local
-    # finalize discovery (leerie:4967-4992). The member's state dir is
-    # derived from its repo basename (same as _state_dir_default does
-    # for USER_REPO).
+    # No tag-back of local runs: each member's orchestrator wrote group_id
+    # into the run.json of the run it resolved, at run start — the one
+    # source of which run a container ran (DESIGN §6 *Which run the
+    # container ran*). Nothing here scans a state dir for runs: the newest
+    # finished run there can be another group's.
+    #
+    # Fly/EC2: the host-side run.json of the member's own run gets
+    # group_id too, for the time before the machine's copy is synced back.
+    # The run is the one that member launcher's pointer names (its pid is
+    # $!): remote/<pid>.json, else the fly-machine.json with that
+    # launcher_pid. A local member has neither, and nothing is written.
     for _gi in $(seq 0 $((_grp_n - 1))); do
       _grp_member_repo="${_grp_repos[$_gi]}"
-      _grp_member_basename="$(python3 -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$_grp_member_repo")"
+      _grp_member_basename="$(python3 -I -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$_grp_member_repo")"
       _grp_member_state_dir="$HOME/.leerie/$_grp_member_basename"
-
-      # Discover the member's run.json: newest run dir with finished_at.
-      _grp_run_json="$(python3 - "$_grp_member_state_dir" <<'PY'
-import json, os, sys
-from pathlib import Path
-state_dir = Path(sys.argv[1])
-runs_dir = state_dir / "runs"
-best_mtime = 0
-best_path = ""
-for rj in runs_dir.glob("*/run.json") if runs_dir.is_dir() else []:
-    try:
-        data = json.loads(rj.read_text())
-    except (OSError, ValueError):
-        continue
-    if not data.get("finished_at"):
-        continue
-    mtime = rj.stat().st_mtime
-    if mtime > best_mtime:
-        best_mtime = mtime
-        best_path = str(rj)
-print(best_path)
-PY
-)"
-      if [ -z "$_grp_run_json" ] || [ ! -f "$_grp_run_json" ]; then
-        # Fly runtime: try remote/<child-pid>.json pointer, then
-        # fly-machine.json scan — same as chain tag-back (leerie:2263-2289).
-        _grp_cp="${_grp_child_pids[$_gi]}"
-        _grp_remote_ptr="$_grp_member_state_dir/remote/$_grp_cp.json"
-        _grp_mid=""
-        if [ -f "$_grp_remote_ptr" ]; then
-          _grp_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_grp_remote_ptr" 2>/dev/null)"
-        fi
-        if [ -z "$_grp_mid" ]; then
-          _grp_mid="$(python3 -c '
+      _grp_cp="${_grp_child_pids[$_gi]}"
+      _grp_remote_ptr="$_grp_member_state_dir/remote/$_grp_cp.json"
+      _grp_mid=""
+      if [ -f "$_grp_remote_ptr" ]; then
+        _grp_mid="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_grp_remote_ptr" 2>/dev/null)"
+      fi
+      if [ -z "$_grp_mid" ]; then
+        _grp_mid="$(python3 -I -c '
 import json, sys
 from pathlib import Path
 state_dir, pid = Path(sys.argv[1]), int(sys.argv[2])
@@ -4736,16 +4863,10 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
         print(fmj.parent.name)
         break
 ' "$_grp_member_state_dir" "$_grp_cp" 2>/dev/null)"
-        fi
-        if [ -n "$_grp_mid" ]; then
-          _grp_run_json="$_grp_member_state_dir/runs/$_grp_mid/run.json"
-        fi
       fi
-
-      if [ -n "$_grp_run_json" ] && [ -f "$_grp_run_json" ]; then
+      _grp_run_json="$_grp_member_state_dir/runs/$_grp_mid/run.json"
+      if [ -n "$_grp_mid" ] && [ -f "$_grp_run_json" ]; then
         update_run_json "$_grp_run_json" group_id "$_grp_id" || true
-      else
-        remote_log "group: could not locate run.json for member $_grp_member_repo (tag-back skipped)"
       fi
     done
 
@@ -4971,7 +5092,7 @@ _value_flags=" --run-id --answers --pr-template --pr-base-branch --max-workers \
 --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --judge-dir \
---heal-dir --phase --host-no-push --status --report --chain-id \
+--heal-dir --phase --status --report --chain-id \
 --seed-depth --seed-shallow-threshold-mb --group-id --log-file \
 --subtask-tests "
 for arg in "$@"; do
@@ -5204,7 +5325,7 @@ elif [ -z "${FLY_VM_DISK_GB:-}" ] && [ -f "$USER_REPO/leerie.toml" ]; then
   # mirroring orchestrator/leerie.py:_read_toml_key.
   _toml_fly_disk_gb="$( { grep -E '^[[:space:]]*fly_disk_gb[[:space:]]*=' \
                               "$USER_REPO/leerie.toml" 2>/dev/null \
-                            | head -1 \
+                            | sed -n 1p \
                             | sed -E 's/^[[:space:]]*fly_disk_gb[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//' ; } || true)"
   if [ -n "$_toml_fly_disk_gb" ]; then
     FLY_VM_DISK_GB="$_toml_fly_disk_gb"
@@ -5262,7 +5383,7 @@ fi
 # adds over the shared ladder is the trailing default-value fallback.
 _resolve_seed_knob() {
   local _cli="$1" _envname="$2" _tomlkey="$3" _default="$4" _r
-  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
+  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | sed -n 1p | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
   _r="$(_resolve_cli_env_toml_knob "$_cli" "$_envname" "$_tomlkey")"
   if [ -n "$_r" ]; then printf '%s' "$_r"; else printf '%s' "$_default"; fi
 }
@@ -5563,7 +5684,7 @@ _warn_if_leerie_stale() {
   local _up_v
   _up_v="$(git -C "$LEERIE_REPO" show \
              '@{upstream}:.claude-plugin/plugin.json' 2>/dev/null \
-           | awk -F'"' '/"version"/ {print $4; exit}')"
+           | awk -F'"' '/"version"/ && !f {print $4; f = 1}')"
   remote_log "warning: the installed leerie is $_behind commit(s) behind" \
              "origin (v$LEERIE_VERSION -> v${_up_v:-unknown})."
   echo "  Runs use the INSTALLED copy at $LEERIE_REPO, not any other" >&2
@@ -5610,21 +5731,24 @@ _warn_if_log_in_repo || true
 # the host-side finalize entirely). The flag is also passed through to
 # the orchestrator so phase_finalize knows not to do its own bookkeeping.
 NO_PUSH=false
+# What this command line itself says about pushing: "true" (--no-push),
+# "false" (--push) or empty. --no-push wins when both are given, as in the
+# orchestrator.
+_NO_PUSH_CLI=""
 for arg in "$@"; do
   case "$arg" in
-    --no-push) NO_PUSH=true ;;
+    --no-push) NO_PUSH=true; _NO_PUSH_CLI=true ;;
+    --push) [ "$_NO_PUSH_CLI" = "true" ] || _NO_PUSH_CLI=false ;;
   esac
 done
 case "${LEERIE_NO_PUSH:-}" in
   1|true|TRUE|yes|YES) NO_PUSH=true ;;
 esac
 # Match the orchestrator's resolve_no_push order: CLI → env → leerie.toml.
-# The launcher and the in-Fly orchestrator are now both authoritative
-# consumers of this intent — the launcher seeds fly-machine.json.
-# host_no_push and the --host-no-push argv flag, the orchestrator gates
-# pr_writer and writes run.json.no_push. Disagreement on a TOML-only
-# opt-out would make the Fly auto-finalize path push against user
-# intent. Pattern mirrors orchestrator/leerie.py:2279 `_read_toml_key`
+# A fresh run hands this choice to the orchestrator as --no-push (below,
+# after the argv rewrite), which records it; the launcher's own host-side
+# checks read it too, so the two must agree on a TOML-only opt-out.
+# Pattern mirrors orchestrator/leerie.py:2279 `_read_toml_key`
 # (flat `key = value` grep) — keeps the launcher free of a tomllib
 # dependency that would force a host-side Python 3.11+ bump.
 if [ "$NO_PUSH" = "false" ] && [ -f "$USER_REPO/leerie.toml" ]; then
@@ -5635,7 +5759,7 @@ if [ "$NO_PUSH" = "false" ] && [ -f "$USER_REPO/leerie.toml" ]; then
   _toml_no_push="$( { grep -E '^[[:space:]]*no_push[[:space:]]*=' \
                           "$USER_REPO/leerie.toml" 2>/dev/null \
                       || true; } \
-                    | head -1 \
+                    | sed -n 1p \
                     | sed -E 's/^[[:space:]]*no_push[[:space:]]*=[[:space:]]*//;
                               s/[[:space:]]*$//;
                               s/^"(.*)"$/\1/;
@@ -5664,6 +5788,66 @@ if [ "$NO_PUSH" = "false" ] && [ -f "$USER_REPO/leerie.toml" ]; then
   esac
   unset _toml_no_push _toml_no_push_lc
 fi
+# A resumed run continues under the push choice it was started with (DESIGN
+# §6 *A resumed run continues under the choices it was started with*):
+# --no-push / --push on this command line, else the run's recorded
+# run.json.no_push, else the env / leerie.toml resolved above. The record is
+# that of the run this resume continues: the id on the command line or, for a
+# bare `resume` on the local runtime, the run the orchestrator will pick —
+# asked of its own `resolve_run_id` here, host-side over the same state root,
+# not re-implemented (review round 24, L2: deciding the push before knowing
+# the run refused a bare resume of a --no-push run without `origin`). The
+# container still names the run it actually ran, and host_finalize still
+# honours that run's run.json.no_push. `_resume_run_id` is used for this read
+# only: LEERIE_RUN_ID stays what the command line said.
+_resume_run_id="$LEERIE_RUN_ID"
+if [ -z "$_NO_PUSH_CLI" ] && [ "$IS_RESUME" = "true" ] \
+   && [ -z "$_resume_run_id" ] && [ "$RUNTIME" = "local" ]; then
+  # The seam writes the pick to an output path: its stdout is the module
+  # log stream, never a return value
+  # (tests/test_orchestrator_seams_dont_capture_stdout.py).
+  _resume_pick_out="$(mktemp)"
+  python3 -I -B - "$LEERIE_REPO/orchestrator/leerie.py" \
+      "$LEERIE_STATE_HOST_DIR" "$_resume_pick_out" <<'PY' || true
+import contextlib, importlib.util, io, pathlib, sys
+spec = importlib.util.spec_from_file_location("leerie_orch", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+# The log line of the pick and any die() message are dropped here: the
+# orchestrator in the container makes the same pick and reports it there.
+with contextlib.redirect_stdout(io.StringIO()), \
+        contextlib.redirect_stderr(io.StringIO()):
+    try:
+        spec.loader.exec_module(m)
+        picked = m.resolve_run_id(pathlib.Path(sys.argv[2]), None,
+                                  resumable_only=True)
+    except BaseException:
+        picked = ""
+pathlib.Path(sys.argv[3]).write_text(picked)
+PY
+  _resume_run_id="$(cat "$_resume_pick_out" 2>/dev/null || true)"
+  rm -f "$_resume_pick_out"
+  unset _resume_pick_out
+fi
+if [ -n "$_NO_PUSH_CLI" ]; then
+  NO_PUSH="$_NO_PUSH_CLI"
+elif [ "$IS_RESUME" = "true" ] && [ -n "$_resume_run_id" ]; then
+  _recorded_no_push="$(python3 -I -c '
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("no_push")
+    print({True: "true", False: "false"}.get(v, "") if isinstance(v, bool) else "")
+except Exception:
+    pass
+' "$LEERIE_STATE_HOST_DIR/runs/$_resume_run_id/run.json")"
+  if [ -n "$_recorded_no_push" ]; then
+    if [ "$_recorded_no_push" != "$NO_PUSH" ]; then
+      remote_log "resume: continuing the run's recorded push choice (no_push=$_recorded_no_push); pass --push or --no-push to override"
+    fi
+    NO_PUSH="$_recorded_no_push"
+  fi
+  unset _recorded_no_push
+fi
+unset _NO_PUSH_CLI _resume_run_id
 
 # Parse --no-verify and export NO_VERIFY_PUSH here, BEFORE
 # provision_machine registers the EXIT trap. The trap's clean-exit
@@ -5864,7 +6048,7 @@ _leerie_should_generate_dockerfile() {
     _li="$( { grep -E '^[[:space:]]*language_installs[[:space:]]*=' \
                   "$_li_cfg" 2>/dev/null \
               || true; } \
-            | head -1 \
+            | sed -n 1p \
             | sed -E 's/^[[:space:]]*language_installs[[:space:]]*=[[:space:]]*//;
                       s/[[:space:]]*$//')"
     # language_installs is a JSON array string in config.toml; "[]" (or
@@ -5887,7 +6071,7 @@ resolve_repo_image_tag() {
     sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
                 "$USER_REPO/.leerie/config.toml" 2>/dev/null \
             || true; } \
-          | head -1 \
+          | sed -n 1p \
           | sed -E 's/^[[:space:]]*setup_packages[[:space:]]*=[[:space:]]*//;
                     s/[[:space:]]*$//;
                     s/^"(.*)"$/\1/;
@@ -5970,7 +6154,7 @@ if [ -n "${LEERIE_BAKE_LANGUAGE_DEPS:-}" ]; then
 elif [ -f "$USER_REPO/leerie.toml" ]; then
   _bld_toml="$( { grep -E '^[[:space:]]*bake_language_deps[[:space:]]*=' \
                       "$USER_REPO/leerie.toml" 2>/dev/null \
-                  | head -1 \
+                  | sed -n 1p \
                   | sed -E 's/^[[:space:]]*bake_language_deps[[:space:]]*=[[:space:]]*//;
                             s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
   case "${_bld_toml:-}" in
@@ -5981,7 +6165,7 @@ elif [ -f "$USER_REPO/leerie.toml" ]; then
 elif [ -f "$_leerie_config_toml" ]; then
   _bld_cfg="$( { grep -E '^[[:space:]]*bake_language_deps[[:space:]]*=' \
                      "$_leerie_config_toml" 2>/dev/null \
-                 | head -1 \
+                 | sed -n 1p \
                  | sed -E 's/^[[:space:]]*bake_language_deps[[:space:]]*=[[:space:]]*//;
                            s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
   case "${_bld_cfg:-}" in
@@ -6007,7 +6191,7 @@ if [ -n "${LEERIE_SKIP_REPO_MAP:-}" ]; then
 elif [ -f "$USER_REPO/leerie.toml" ]; then
   _srm_toml="$( { grep -E '^[[:space:]]*skip_repo_map[[:space:]]*=' \
                       "$USER_REPO/leerie.toml" 2>/dev/null \
-                  | head -1 \
+                  | sed -n 1p \
                   | sed -E 's/^[[:space:]]*skip_repo_map[[:space:]]*=[[:space:]]*//;
                             s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
   case "${_srm_toml:-}" in
@@ -6051,7 +6235,7 @@ if [ "$_leerie_do_gen" = "true" ]; then
   _sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
                 "$_leerie_config_toml" 2>/dev/null \
             || true; } \
-          | head -1 \
+          | sed -n 1p \
           | sed -E 's/^[[:space:]]*setup_packages[[:space:]]*=[[:space:]]*//;
                     s/[[:space:]]*$//;
                     s/^"(.*)"$/\1/;
@@ -6085,7 +6269,7 @@ if [ "$_leerie_do_gen" = "true" ]; then
       # and launch the cgroup broker before dropping to leerie via `runuser` (see
       # DESIGN §6; the base Dockerfile omits `USER leerie` for the same reason).
       # A trailing `USER leerie` makes PID 1 run as leerie → cgroup writes, the
-      # broker socket bind, and `runuser` all fail EACCES and the container exits 1.
+      # broker's cgroup setup, and `runuser` all fail EACCES and the container exits 1.
       printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp"
     fi
 
@@ -6232,9 +6416,9 @@ def _node_ancillary(repo, copy_files):
 # Out-of-repo bake targets (DESIGN §6½, IMPLEMENTATION.md §0.5). Node/pnpm is
 # deliberately absent: node_modules cannot be fully baked (must live in the
 # repo tree for resolution), so the pnpm/yarn/npm install still targets the
-# inherited /work WORKDIR — only the pnpm *store* is warmed (via the existing
-# npm_config_store_dir cache mount, already wired at runtime), unchanged by
-# this feature. Composer/.NET are also left targeting /work: no verified
+# inherited /work WORKDIR. The pnpm store is not baked either: the
+# orchestrator sets its stores in the state mount at runtime (DESIGN §6 *The
+# pnpm store shares the worktrees' mount*). Composer/.NET are also left targeting /work: no verified
 # out-of-repo bake exists for them yet (out of scope — Python/Ruby/Rust/Go
 # are the four ecosystems this feature covers per the plan).
 #
@@ -6529,7 +6713,7 @@ PY
       # re-raise a real interpreter crash — the original inline command-sub
       # aborted the launcher on python failure, and that contract is preserved.
       _lang_rc=0
-      _lang_layer="$(python3 "$_dep_pyf" "$USER_REPO" "$_leerie_config_toml")" \
+      _lang_layer="$(python3 -I "$_dep_pyf" "$USER_REPO" "$_leerie_config_toml")" \
         || _lang_rc=$?
       rm -f "$_dep_pyf"
       if [ "$_lang_rc" != "0" ]; then exit "$_lang_rc"; fi
@@ -6953,6 +7137,17 @@ if [ "$_SKIP_REPO_MAP" = "true" ]; then
 fi
 unset _SKIP_REPO_MAP
 
+# The run's push choice, recorded once at its start (DESIGN §6 *One push
+# choice per run, on every runtime*). A fresh run hands the launcher's
+# resolved NO_PUSH to the orchestrator as --no-push on every runtime:
+# neither the container nor a remote machine sees LEERIE_NO_PUSH, and a
+# remote machine may not see an untracked leerie.toml. A resume adds
+# nothing: the orchestrator continues its record, and only this command
+# line's own --no-push / --push (already in REWRITTEN_ARGS) override it.
+if [ "$IS_RESUME" = "false" ] && [ "$NO_PUSH" = "true" ]; then
+  REWRITTEN_ARGS+=("--no-push")
+fi
+
 # --- assemble auth/config mounts ----------------------------------------
 # Per-container config isolation. The shared host ~/.claude.json is a
 # documented corruption race (anthropics/claude-code issues #28847,
@@ -6973,7 +7168,7 @@ AUTH_MOUNTS=()
 # to precedence here. The key is only valid inside the env block, not as a
 # top-level settings key.
 detect_bedrock_mode() {
-  python3 - \
+  python3 -I - \
     "${HOME}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.local.json" \
@@ -7002,7 +7197,7 @@ bedrock_preflight() {
     exit 1
   fi
   local profile
-  profile="$(python3 - \
+  profile="$(python3 -I - \
     "${HOME}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.local.json" \
@@ -7111,7 +7306,7 @@ _remote_launcher_exit_cleanup() {
 # container-entry.sh copy just .claude.json out of it — see the
 # AUTH_MOUNTS comment below for why a single-file bind mount of this path
 # corrupts it under concurrent workers.
-python3 - "$HOME/.claude.json" "$STAGE/.claude.json" <<'PY'
+python3 -I - "$HOME/.claude.json" "$STAGE/.claude.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 d.pop("projects", None)
@@ -7429,7 +7624,7 @@ if [ "$_BEDROCK_BEARER_ACTIVE" = "false" ] && detect_bedrock_mode; then
   AUTH_MOUNTS+=(-e "CLAUDE_CODE_USE_BEDROCK=1")
   # Extract AWS_PROFILE and AWS_REGION from settings files (last-match-wins,
   # same merge order Claude CLI uses: userSettings < projectSettings < localSettings).
-  _BEDROCK_PROFILE="$(python3 - \
+  _BEDROCK_PROFILE="$(python3 -I - \
     "${HOME}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.local.json" \
@@ -7444,7 +7639,7 @@ for p in sys.argv[1:]:
 print(v)
 PY
   )"
-  _BEDROCK_REGION="$(python3 - \
+  _BEDROCK_REGION="$(python3 -I - \
     "${HOME}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.local.json" \
@@ -7517,41 +7712,48 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; rm -rf "$STAGE"; rm -f "
 # already work. The host preflight above verified gh auth + origin.
 
 # --- per-repo dependency caches (DESIGN §6½, IMPLEMENTATION §0.5) -------
-# Five host-side cache dirs survive across runs so:
-#   - mise doesn't re-install Node 20.11.0 every time the user runs leerie
-#     against a repo with .nvmrc: 20.11.0,
-#   - pnpm / pip / Go / Cargo installs hit warm caches.
-# Created lazily (mkdir -p) on every leerie invocation — cheap on existing
-# dirs, free of failure modes on first run.
-# Concurrency-safety per cache is documented in IMPLEMENTATION §0.5;
-# pip's pattern (warm once serially in phase_provision, hit cached
-# wheels in parallel from worktree replays) is documented in DESIGN §6½.
+# Two host-side cache dirs survive across runs: mise-data, so mise doesn't
+# re-install Node 20.11.0 every time the user runs leerie against a repo
+# with .nvmrc: 20.11.0, and Bundler's. Package stores (pnpm, pip, Go,
+# Cargo, corepack) are not host caches: they live in the state mount
+# (DESIGN §6 *The pnpm store shares the worktrees' mount*). Created lazily
+# (mkdir -p) on every leerie invocation — cheap on existing dirs, free of
+# failure modes on first run. Concurrency-safety per cache is documented
+# in IMPLEMENTATION §0.5.
+#
+# The host-wide dir (build semaphore, DESIGN §6 *A host-wide build
+# semaphore*) defaults to ~/.leerie/.host and must stay shared: the
+# semaphore bounds only the runs that mount the same dir. LEERIE_HOST_DIR
+# repoints it for an isolated run (a bench) that must never touch
+# ~/.leerie. Inside the container the same name means the mount point, set
+# after the LEERIE_* forward below, so this host value never leaks in.
+_leerie_host_dir="${LEERIE_HOST_DIR:-$HOME/.leerie/.host}"
+case "$_leerie_host_dir" in
+  "~")   _leerie_host_dir="$HOME" ;;
+  \~/*)  _leerie_host_dir="$HOME/${_leerie_host_dir#"~/"}" ;;
+esac
+case "$_leerie_host_dir" in
+  /*) ;;
+  *)
+    echo "leerie: error: LEERIE_HOST_DIR='$_leerie_host_dir' is not an absolute path" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$HOME/.cache/leerie/mise-data" \
-         "$HOME/.cache/leerie/pnpm-store" \
-         "$HOME/.cache/leerie/pip" \
-         "$HOME/.cache/leerie/go-mod" \
-         "$HOME/.cache/leerie/cargo" \
-         "$HOME/.cache/leerie/corepack" \
          "$HOME/.cache/leerie/bundle" \
-         "$LEERIE_STATE_HOST_DIR"
+         "$LEERIE_STATE_HOST_DIR" \
+         "$_leerie_host_dir"
 
 CACHE_MOUNTS=(
   -v "$HOME/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
-  -v "$HOME/.cache/leerie/pnpm-store:/home/leerie/.cache/leerie/pnpm-store"
-  -v "$HOME/.cache/leerie/pip:/home/leerie/.cache/leerie/pip"
-  -v "$HOME/.cache/leerie/go-mod:/home/leerie/.cache/leerie/go-mod"
-  -v "$HOME/.cache/leerie/cargo:/home/leerie/.cache/leerie/cargo"
-  -v "$HOME/.cache/leerie/corepack:/home/leerie/.cache/leerie/corepack"
-  # pnpm reads its store path from `npm_config_store_dir` (or `store-dir`
-  # in .npmrc, or `--store-dir` CLI). There is no `PNPM_STORE_PATH`; a
-  # prior version of this file set that and pnpm silently ignored it,
-  # falling back to ~/.local/share/pnpm/store inside the container —
-  # which is NOT bind-mounted, so every run paid full registry cost.
-  -e "npm_config_store_dir=/home/leerie/.cache/leerie/pnpm-store"
-  -e "PIP_CACHE_DIR=/home/leerie/.cache/leerie/pip"
-  -e "GOMODCACHE=/home/leerie/.cache/leerie/go-mod"
-  -e "CARGO_HOME=/home/leerie/.cache/leerie/cargo"
-  -e "COREPACK_HOME=/home/leerie/.cache/leerie/corepack"
+  # Package stores and caches are not mounted from the host: the
+  # orchestrator points its own commands at `<state-root>/.stores/leerie/`
+  # and each worker at `<run-dir>/workers/` (DESIGN §6 *The stores a view
+  # installs from are leerie's*). Both are in the state mount, beside the
+  # worktrees, so a worker's install can hard-link from its run's cache;
+  # leerie's own installs copy from its store (DESIGN §6 *The pnpm store
+  # shares the worktrees' mount*, *A view's install never writes leerie's
+  # store*).
   -v "$HOME/.cache/leerie/bundle:/home/leerie/.cache/leerie/bundle"
   -e "BUNDLE_CACHE_ALL=1"
 )
@@ -7655,7 +7857,7 @@ ensure_image() {
   # array; check for a Name match. The remote builder and registry push
   # both require the app to exist. Idempotent on existing apps.
   if ! flyctl apps list --json 2>/dev/null \
-       | python3 -c '
+       | python3 -I -c '
 import json, sys
 try:
     apps = json.load(sys.stdin)
@@ -7762,27 +7964,13 @@ if [ "$RUNTIME" = "fly" ]; then
   # rest of this process tree. Must run BEFORE any flyctl ssh call so
   # Fly-issued certs never land in the user's main agent (which would
   # cause OpenSSH to offer them to github.com and trigger rate-limits).
-  _leerie_fly_agent_ensure
+  _leerie_fly_agent_ensure || exit 1
   if ! require_flyctl; then
     exit 1
   fi
 
   # run_id = machine_id: set AFTER provision_machine succeeds (see below).
   # For resume, LEERIE_RUN_ID is already set from --run-id.
-
-  # Communicate the host's launch-time push intent to the in-Fly
-  # orchestrator (DESIGN §6 *Finalization*, intent vs mechanism). The
-  # orchestrator-side --no-push the in-Machine launcher injects is the
-  # mechanism flag (Fly can't reach origin); --host-no-push is the
-  # user's intent. The orchestrator gates pr_writer + the
-  # run.json.no_push it writes on intent, not mechanism. Local-runtime
-  # nerdctl invocation does NOT pass this — host_no_push stays None
-  # there and push_will_happen() falls back to (not no_push).
-  if [ "$NO_PUSH" = "true" ]; then
-    REWRITTEN_ARGS+=("--host-no-push" "true")
-  else
-    REWRITTEN_ARGS+=("--host-no-push" "false")
-  fi
 
   # Set LEERIE_FLY_IMAGE to the per-repo derived tag when .leerie/Dockerfile
   # is present; also records context for ensure_image(). No-op otherwise.
@@ -7857,7 +8045,7 @@ if [ "$RUNTIME" = "fly" ]; then
           # error path below by leaving LEERIE_RUN_ID empty.
           ;;
         1)
-          LEERIE_RUN_ID="$(python3 -c '
+          LEERIE_RUN_ID="$(python3 -I -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -7873,7 +8061,7 @@ except Exception:
         *)
           remote_log "resume: multiple active launches — pass the run-id to disambiguate:"
           for _f in "${_active_records[@]}"; do
-            python3 -c "
+            python3 -I -c "
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -8017,7 +8205,7 @@ EARLY_PROBE_PY
         _early_probe_stderr="$(mktemp)"
         printf '%s' "$_early_probe_script" \
           | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-              --pty=false -C "python3 - '$LEERIE_RUN_ID'" \
+              --pty=false -C "python3 -I - '$LEERIE_RUN_ID'" \
               2>"$_early_probe_stderr" \
           || _early_probe_rc=$?
         if [ "$_early_probe_rc" != "0" ]; then
@@ -8128,7 +8316,7 @@ EARLY_PROBE_PY
         # run_id = machine_id, so the log path is known from the start.
         remote_log "remote: machine $LEERIE_MACHINE_ID seeded — starting orchestrator (detached)"
 
-        _launch_argv_json="$(python3 -c '
+        _launch_argv_json="$(python3 -I -c '
 import json, sys
 print(json.dumps(sys.argv[1:]))
 ' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}")"
@@ -8148,17 +8336,17 @@ print(json.dumps(sys.argv[1:]))
         # AWS_BEARER_TOKEN_BEDROCK specifically (an opaque secret token is
         # exactly the kind of value likely to contain such bytes), applied
         # to every substituted value here for consistency.
-        _host_tz_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_host_tz")"
+        _host_tz_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_host_tz")"
         # JSON-encoded like every other heredoc substitution: the heredoc is
         # unquoted, so a raw value could break out of the Python literal. A sha
         # is alphanumeric and carries no such risk, but the pattern is the
         # pattern — and the stray-substitution guard fails loudly if skipped.
-        _leerie_commit_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${LEERIE_COMMIT:-}")"
-        _bedrock_bearer_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_BEARER_TOKEN_BEDROCK:-}")"
-        _bedrock_use_bedrock_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_USE_BEDROCK:-1}")"
-        _bedrock_bearer_region_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_REGION:-}")"
-        _bedrock_profile_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_BEDROCK_PROFILE")"
-        _bedrock_region_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_BEDROCK_REGION")"
+        _leerie_commit_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${LEERIE_COMMIT:-}")"
+        _bedrock_bearer_token_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_BEARER_TOKEN_BEDROCK:-}")"
+        _bedrock_use_bedrock_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_USE_BEDROCK:-1}")"
+        _bedrock_bearer_region_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_REGION:-}")"
+        _bedrock_profile_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_BEDROCK_PROFILE")"
+        _bedrock_region_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_BEDROCK_REGION")"
         # CLAUDE_CODE_OAUTH_TOKEN(S) — same JSON-encoding discipline as the
         # Bedrock values above, load-bearing for the same reason: an opaque
         # token is exactly the kind of value likely to contain `"`/`\` that
@@ -8167,8 +8355,8 @@ print(json.dumps(sys.argv[1:]))
         # orchestrator's multi-token probe/rotation (DESIGN §6 *Multi-token
         # rotation*) sees the full list, independent of which single token
         # seed-auth.sh staged into .credentials.json.
-        _oauth_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
-        _oauth_tokens_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKENS:-}")"
+        _oauth_token_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
+        _oauth_tokens_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKENS:-}")"
         # Carry the host's IANA timezone so the in-machine orchestrator's
         # log() ISO-8601 prefix matches the host-side remote_log() offset.
         # Fly machines default to UTC; without this the user reads mixed
@@ -8264,7 +8452,7 @@ PY
         _launch_stderr="$(mktemp)"
         printf '%s' "$_launch_script" \
           | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-              --pty=false -C "python3 -" \
+              --pty=false -C "python3 -I -" \
               2>"$_launch_stderr" \
           || _launch_rc=$?
         # flyctl ssh console does not forward remote exit codes — it
@@ -8383,13 +8571,9 @@ elif [ "$RUNTIME" = "ec2" ]; then
   _leerie_aws_creds_args=()
   while IFS= read -r _leerie_aws_a; do _leerie_aws_creds_args+=("$_leerie_aws_a"); done \
     < <(_leerie_aws_creds_args_tokens)
-  _leerie_aws_creds_exports="$(resolve_aws_credentials ${_leerie_aws_creds_args[@]+"${_leerie_aws_creds_args[@]}"})"
-  _leerie_aws_creds_rc=$?
-  if [ "$_leerie_aws_creds_rc" -ne 0 ]; then
-    exit 1
-  fi
+  _leerie_aws_creds_exports="$(resolve_aws_credentials ${_leerie_aws_creds_args[@]+"${_leerie_aws_creds_args[@]}"})" || exit 1
   eval "$_leerie_aws_creds_exports"
-  unset _leerie_aws_creds_args _leerie_aws_creds_exports _leerie_aws_creds_rc
+  unset _leerie_aws_creds_args _leerie_aws_creds_exports
   if ! require_aws; then
     exit 1
   fi
@@ -8406,15 +8590,6 @@ elif [ "$RUNTIME" = "ec2" ]; then
   # `130|143)` detach arm in decide_ec2_teardown — mirrors the Fly
   # branch's identical default a few dozen lines up.
   export LEERIE_REMOTE_EXIT_RC=130
-
-  # Communicate the host's launch-time push intent to the in-instance
-  # orchestrator, exactly like the Fly branch above (DESIGN §6
-  # *Finalization*: EC2 instances receive no GitHub credentials either).
-  if [ "$NO_PUSH" = "true" ]; then
-    REWRITTEN_ARGS+=("--host-no-push" "true")
-  else
-    REWRITTEN_ARGS+=("--host-no-push" "false")
-  fi
 
   EC2_PROVISION_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-provision.sh"
   EC2_RESUME_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
@@ -8470,7 +8645,7 @@ elif [ "$RUNTIME" = "ec2" ]; then
         "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/ec2-instance.json" \
         "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json"; do
         [ -f "$_ec2_sidecar" ] || continue
-        _ec2_paused_iid="$(python3 -c '
+        _ec2_paused_iid="$(python3 -I -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -8569,7 +8744,7 @@ EARLY_PROBE_PY
 )"
         _ec2_early_probe_rc=0
         printf '%s' "$_ec2_early_probe_script" \
-          | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 - '$LEERIE_RUN_ID'" \
+          | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 -I - '$LEERIE_RUN_ID'" \
               >/dev/null \
           || _ec2_early_probe_rc=$?
         if [ "$_ec2_early_probe_rc" = "75" ]; then
@@ -8595,7 +8770,7 @@ EARLY_PROBE_PY
         if [ "$_ec2_seed_ok" = "true" ]; then
           remote_log "remote: instance $LEERIE_EC2_INSTANCE_ID seeded — starting orchestrator (detached)"
 
-          _ec2_launch_argv_json="$(python3 -c '
+          _ec2_launch_argv_json="$(python3 -I -c '
 import json, sys
 print(json.dumps(sys.argv[1:]))
 ' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}")"
@@ -8604,9 +8779,9 @@ print(json.dumps(sys.argv[1:]))
           # launch heredoc above (leerie:6695-6710): an opaque token is
           # exactly the kind of value likely to contain `"`/`\` that would
           # break out of a raw Python string literal on this remote machine.
-          _ec2_oauth_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
-          _ec2_oauth_tokens_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKENS:-}")"
-          _ec2_leerie_commit_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${LEERIE_COMMIT:-}")"
+          _ec2_oauth_token_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
+          _ec2_oauth_tokens_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKENS:-}")"
+          _ec2_leerie_commit_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${LEERIE_COMMIT:-}")"
           # TZ is deliberately a raw quoted-var substitution here (not
           # JSON-encoded like the Fly launch block's TZ) -- an IANA zone
           # name from readlink/sed contains no quote/backslash bytes, so
@@ -8798,20 +8973,97 @@ else
     CGROUP_MOUNT_ARG=(--mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared")
   fi
 
-  # Rootless nerdctl: container-entry.sh uses `unshare --user` to remap
-  # UID 0 to leerie so claude accepts --dangerously-skip-permissions.
-  # The OCI default seccomp profile blocks unshare(CLONE_NEWUSER), so we
-  # lift it for rootless runs. Gate on the same containerd-rootless
-  # sentinel the cgroup probe uses — the file only exists when
-  # containerd-rootless-setuptool.sh was used on Linux; on macOS (Colima)
-  # containerd is rootful inside the VM and no seccomp lift is needed.
-  ROOTLESS_SECOPT=()
-  if [ -f "/run/user/$(id -u)/containerd-rootless/child_pid" ]; then
-    ROOTLESS_SECOPT=(--security-opt seccomp=unconfined)
+  # Every local run, rootless, rootful and Colima: seccomp unconfined. The
+  # rootless entry needs it for its `unshare --user` (container-entry.sh
+  # remaps UID 0 to leerie so claude accepts --dangerously-skip-permissions),
+  # and the confinement shim makes an unprivileged user namespace for every
+  # confined process on every runtime (DESIGN §6 *Every confined process has
+  # its own `/tmp`, `/dev/shm` and IPC*), which the OCI default profile
+  # refuses (`unshare(CLONE_NEWUSER)`: EPERM, measured rootful). The shim's
+  # own per-process filter takes back, tighter, what the profile refused.
+  SECOPT=(--security-opt seccomp=unconfined)
+
+  # Where the containers' kernel runs AppArmor, the container runs under the
+  # leerie-container profile: nerdctl-default plus the shim's mounts, each by
+  # type and target (DESIGN §6 *A held-out evaluation runs alone*, *What the
+  # runtime must allow*). Not `apparmor=unconfined`: that works on Ubuntu only
+  # because runc's own profile then attaches; elsewhere the host's
+  # user-namespace restriction applies and the shim cannot build anything.
+  # Loaded once by root; a missing or stale profile is installed here (with a
+  # terminal) or named with its commands. Preflight still checks the result
+  # (`_require_heldout_sandbox`) and stops the run without it.
+  APPARMOR_OPT=()
+  _aa_src="$LEERIE_REPO/scripts/apparmor/leerie-container"
+  if declare -F runtime_has_apparmor >/dev/null && runtime_has_apparmor; then
+    if ! runtime_apparmor_current "$_aa_src"; then
+      if [ "$NO_RUNTIME_INSTALL" != "true" ] && [ -t 0 ]; then
+        remote_log "loading the leerie-container AppArmor profile (one-time; may prompt for sudo)..."
+        if ! runtime_install_apparmor "$_aa_src"; then
+          remote_log "could not load the leerie-container AppArmor profile; run:"
+          runtime_apparmor_hint "$_aa_src" >&2
+          exit 1
+        fi
+      else
+        remote_log "the leerie-container AppArmor profile is not loaded (or is stale)."
+        echo "  Load it once (as root), then re-run leerie:" >&2
+        runtime_apparmor_hint "$_aa_src" >&2
+        exit 1
+      fi
+    fi
+    APPARMOR_OPT=(--security-opt apparmor=leerie-container)
   fi
 
   _cidfile="$LEERIE_STATE_HOST_DIR/.cidfile-$$"
   rm -f "$_cidfile"
+  # Where the orchestrator names the run this container runs (DESIGN §6
+  # *Which run the container ran*): its own resolution, a bare `resume`'s
+  # pick included, is the one source the bring-back below reads. In the
+  # state root, which the container already writes at /leerie-state.
+  _run_id_file="$LEERIE_STATE_HOST_DIR/.runid-$$"
+  rm -f "$_run_id_file"
+
+  # _read_ran_run_id — which run this container ran (DESIGN §6 *Which run
+  # the container ran*): the one the orchestrator named in the run-id file,
+  # a fresh run, `resume <id>` and a bare `resume`'s own pick alike. Every
+  # post-exit step reads `_ran_run_id` and nothing else names the run (not
+  # `--run-id`, not the cidfile, not the newest run on disk). No file, or a
+  # first line that is no run id: the container ran no run.
+  _read_ran_run_id() {
+    _ran_run_id=""
+    if [ "$RUNTIME" = "local" ] && [ -f "${_run_id_file:-}" ]; then
+      _ran_run_id="$(head -n 1 "$_run_id_file" 2>/dev/null || true)"
+      case "$_ran_run_id" in
+        ''|*[!A-Za-z0-9._-]*|.*) _ran_run_id="" ;;
+      esac
+    fi
+  }
+
+  # _bring_back_ran_run — bring that run's branch back from its own
+  # repository into yours (DESIGN §6 *The run's own repository*). Run from
+  # the EXIT trap, so it runs whatever the exit is: a clean exit, a failed
+  # run, --no-push, Ctrl-C or TERM (whose traps exit through EXIT; review
+  # round 17 M2). Never fails the exit.
+  _bring_back_ran_run() {
+    _read_ran_run_id
+    [ -n "$_ran_run_id" ] || return 0
+    [ -f "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id/repo/HEAD" ] || return 0
+    # shellcheck source=scripts/host-finalize.sh
+    . "$LEERIE_REPO/scripts/host-finalize.sh" || return 0
+    host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
+  }
+
+  # _apply_ran_run_captures — write the dependency captures that run
+  # recorded into your `.leerie/config.toml` (DESIGN §6½ *The host applies a
+  # capture*); the container cannot, since it mounts your checkout
+  # read-only. From the EXIT trap, whatever the exit. Never fails the exit.
+  _apply_ran_run_captures() {
+    _read_ran_run_id
+    [ -n "$_ran_run_id" ] || return 0
+    [ -f "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id/captured-deps.json" ] || return 0
+    # shellcheck source=scripts/host-finalize.sh
+    . "$LEERIE_REPO/scripts/host-finalize.sh" || return 0
+    host_apply_captured_deps "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
+  }
 
   # Fix D (DESIGN §6 *container boundary's hidden precondition*): kill the
   # container if the launcher is interrupted, so a Ctrl-C / SIGTERM to this
@@ -8889,7 +9141,7 @@ else
       # pipe's first bytes reaching our stdout, which is exactly what
       # the sleep above exists to avoid.
       _tail_writer_pid="$(jobs -l %% 2>/dev/null \
-        | awk '/tail -n/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) {print $i; exit} }')"
+        | awk '/tail -n/ && !f { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/ && !f) {print $i; f = 1} }')"
       kill "$_tail_pid" ${_tail_writer_pid:+"$_tail_writer_pid"} 2>/dev/null || true
       _tail_pid=""
       _tail_writer_pid=""
@@ -8901,7 +9153,10 @@ else
       _run_log=""
     fi
   }
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail; _kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+  # Every step tolerates failure (`|| true`): under `set -e` a failing
+  # command ends the trap, so a keepalive that had already exited — `kill`
+  # returning 1 — skipped the bring-back and the clean-up after it.
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _apply_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
   trap '_reap_tail; _kill_container_from_cidfile; exit 130' INT
   trap '_reap_tail; _kill_container_from_cidfile; exit 143' TERM
 
@@ -8925,15 +9180,18 @@ else
   #     value would point at a host path meaningless inside the container.
   #   - LEERIE_HOME / LEERIE_REPO / LEERIE_STATE_HOST_DIR / LEERIE_SELF_CMD:
   #     launcher self-location + host paths.
+  #   - LEERIE_HOST_DIR: the host path of the host-wide dir; remapped
+  #     explicitly below (-e LEERIE_HOST_DIR=/leerie-host).
   #   - Fly/EC2/remote/chain/wave machinery: consumed launcher-side only.
-  #   - LEERIE_NO_PUSH: the orchestrator is always invoked with --no-push and
-  #     the host does the push; forwarding it would be redundant/confusing.
+  #   - LEERIE_NO_PUSH: resolved by the launcher, which hands a fresh run
+  #     --no-push; the run's record of the choice is the orchestrator's.
   #   - LEERIE_SKIP_PREPUSH_PREFLIGHT: gates a probe that runs on the host
   #     before the container starts; nothing inside reads it.
   _leerie_env_denylist=" \
     LEERIE_SKIP_PREPUSH_PREFLIGHT \
     LEERIE_STATE_DIR LEERIE_INSPECT_DIRS LEERIE_HOME LEERIE_REPO \
-    LEERIE_STATE_HOST_DIR LEERIE_SELF_CMD LEERIE_VERSION LEERIE_TASK_ARG \
+    LEERIE_STATE_HOST_DIR LEERIE_HOST_DIR LEERIE_SELF_CMD LEERIE_VERSION \
+    LEERIE_TASK_ARG LEERIE_RUN_ID_FILE \
     LEERIE_NO_PUSH LEERIE_GENERATED_SENTINEL LEERIE_RECAPTURE_WROTE \
     LEERIE_NO_AUTO_PUBLISH LEERIE_LOCAL_BUILD LEERIE_FORCE_KILL \
     LEERIE_NO_RUNTIME_INSTALL LEERIE_INSPECT_HOST_TARGETS \
@@ -8971,6 +9229,7 @@ else
     -v "$_cidfile:/run/leerie-cidfile:ro"
     -e LEERIE_INSPECT_DIRS=
     -e LEERIE_STATE_DIR=/leerie-state
+    -e "LEERIE_RUN_ID_FILE=/leerie-state/.runid-$$"
     # Basename only: the host path doesn't exist in the container (the repo
     # is at /work), and log() takes Path(USER_REPO).name. Without this the
     # orchestrator's cwd=/work falls back to basename "work" and every line
@@ -8993,10 +9252,21 @@ else
     # the answer; nothing carried it across.
     -e "LEERIE_STATE_HOST_DIR_DISPLAY=${LEERIE_STATE_HOST_DIR:-}"
     ${_leerie_env_args[@]+"${_leerie_env_args[@]}"}
+    # Host-wide directory shared by every run on this host, whatever the
+    # repo: the build-class semaphore's slot files live here (DESIGN §6 *A
+    # host-wide build semaphore*). After the LEERIE_* forward so a host value
+    # of the same name cannot repoint it. Ownership: rootless sees this
+    # host-user dir as its own; rootful's entry guard chowns it to leerie.
+    -v "$_leerie_host_dir:/leerie-host"
+    -e LEERIE_HOST_DIR=/leerie-host
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
     --cgroupns=host
-    ${ROOTLESS_SECOPT[@]+"${ROOTLESS_SECOPT[@]}"}
-    -v "$USER_REPO:/work"
+    ${SECOPT[@]+"${SECOPT[@]}"}
+    ${APPARMOR_OPT[@]+"${APPARMOR_OPT[@]}"}
+    # Read-only: nothing in the container writes the user's checkout; what
+    # the run gives it reaches it through the host after the container exits
+    # (the bring-back, the captured deps). DESIGN §6 *The explicit channel*.
+    -v "$USER_REPO:/work:ro"
     -v "$LEERIE_REPO:/opt/leerie-image:ro"
     -v "$LEERIE_STATE_HOST_DIR:/leerie-state"
     ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"}
@@ -9095,79 +9365,61 @@ fi
 # the HOST so the host's working auth state (gh token, ssh-agent,
 # Keychain) is what authenticates — no in-container forwarding required.
 #
-# **Local runtime only.** On the Fly path the run dir is NOT yet on the
-# host when we reach this block — the stream-back happens inside
-# `decide_teardown` (an EXIT trap in scripts/remote/provision.sh) that
-# fires *after* this code returns. If we let this block run on Fly it
-# always finds nothing (LATEST_RUN_DIR is empty, exits 0), then the
-# trap syncs and destroys the machine without ever pushing. So: on
-# Fly, finalize happens inside `decide_teardown` (it sources the same
-# scripts/host-finalize.sh and calls host_finalize directly). On
-# local, finalize happens here.
+# **Local runtime only.** On the Fly and EC2 paths the run dir is NOT yet
+# on the host when we reach this block — the stream-back happens inside
+# `decide_teardown` / `decide_ec2_teardown` (EXIT traps in
+# scripts/remote/provision.sh and ec2-provision.sh) that fire *after* this
+# code returns, and finalize happens there (they source the same
+# scripts/host-finalize.sh and call host_finalize directly). On local,
+# finalize happens here, for the run the container named.
 #
 # Skip if:
 #   - container exited non-zero (run failed; nothing to push)
 #   - --no-push set (the user explicitly opted out)
 #   - the structured-exit code (EXIT_NEEDS_ANSWERS=10) — the launcher's
 #     plugin re-runs leerie with --answers after the user responds.
+# Which run this container ran (DESIGN §6 *Which run the container ran*):
+# `_read_ran_run_id`, the run the orchestrator named in the run-id file.
+# Every post-exit step below reads `_ran_run_id` and nothing else names the
+# run (not `--run-id`, not the cidfile, not the newest run on disk). Its
+# branch is brought back by the EXIT trap (`_bring_back_ran_run`), whatever
+# the exit; a push below brings it back first itself (`host_finalize`).
+_ran_run_id=""
+[ "$RUNTIME" != "local" ] || _read_ran_run_id
 if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
   if [ "$container_rc" -ne 0 ]; then
-    # Prefer the explicit/positional run id (--run-id / `resume <id>`)
-    # when known; fall back to the local container id (the run id for a
-    # fresh local run — DESIGN §6) read from the cidfile this launcher
-    # invocation wrote. Neither is set on the Fly/EC2 paths, where this
-    # message is unreachable in practice (see the comment above).
-    _finalize_skip_run_id="${LEERIE_RUN_ID:-}"
-    if [ -z "$_finalize_skip_run_id" ] && [ -f "${_cidfile:-}" ]; then
-      _finalize_skip_run_id="$(cat "$_cidfile" 2>/dev/null)"
-    fi
-    if [ -n "$_finalize_skip_run_id" ]; then
-      remote_log "finalize: skipped — container exited with code $container_rc (run $_finalize_skip_run_id)"
+    if [ -n "$_ran_run_id" ]; then
+      remote_log "finalize: skipped — container exited with code $container_rc (run $_ran_run_id)"
     else
       remote_log "finalize: skipped — container exited with code $container_rc"
     fi
-    unset _finalize_skip_run_id
   fi
   exit "$container_rc"
 fi
 
-if [ "$RUNTIME" != "fly" ]; then
-  # Locate the most-recent run dir under .leerie/runs/ that has a run.json
-  # with finished_at set. The orchestrator writes run.json at finalize.
-  # `find` + sort isn't portable with -printf; iterate and pick newest.
-  LATEST_RUN_DIR=""
-  LATEST_RUN_MTIME=0
-  if [ -d "$LEERIE_STATE_HOST_DIR/runs" ]; then
-    for run_json in "$LEERIE_STATE_HOST_DIR"/runs/*/run.json; do
-      [ -f "$run_json" ] || continue
-      # finished_at must be present and non-null.
-      if [ "$(jq -r '.finished_at // ""' "$run_json")" = "" ]; then
-        continue
-      fi
-      # pushed_at must be absent or null — otherwise this run was already
-      # pushed (e.g. on a previous launcher invocation).
-      if [ "$(jq -r '.pushed_at // ""' "$run_json")" != "" ]; then
-        continue
-      fi
-      # branch and working_branch must both be present — a run.json
-      # without them was created by the die() handler before
-      # phase_classify completed (orchestrator/leerie.py:15116); it
-      # cannot be finalized.
-      if [ "$(jq -r '.branch // ""' "$run_json")" = "" ] || \
-         [ "$(jq -r '.working_branch // ""' "$run_json")" = "" ]; then
-        continue
-      fi
-      # Use mtime of run.json as the recency proxy.
-      mtime="$(stat -c %Y "$run_json" 2>/dev/null || stat -f %m "$run_json" 2>/dev/null || echo 0)"
-      if [ "$mtime" -gt "$LATEST_RUN_MTIME" ]; then
-        LATEST_RUN_MTIME=$mtime
-        LATEST_RUN_DIR="$(dirname "$run_json")"
-      fi
-    done
+if [ "$RUNTIME" = "local" ]; then
+  # Finalize the run this container ran — never another. The newest
+  # unpushed finished run under the state root, which this used to pick,
+  # could be a second run of the same repository, finished or still
+  # running (DESIGN §6 *Which run the container ran*). It must be finished
+  # (`finished_at`), not yet pushed (`pushed_at`), and carry its identity
+  # (`branch`, `working_branch`: a run.json without them was written by the
+  # die() handler before phase_classify completed and cannot be finalized).
+  if [ -z "$_ran_run_id" ]; then
+    echo "[leerie] finalize: the container named no run; nothing to push" >&2
+    exit 0
   fi
-
-  if [ -z "$LATEST_RUN_DIR" ]; then
-    echo "[leerie] finalize: no unpushed finished run found under $LEERIE_STATE_HOST_DIR/runs/" >&2
+  _ran_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id"
+  _ran_run_json="$_ran_run_dir/run.json"
+  if [ ! -f "$_ran_run_json" ] \
+     || [ "$(jq -r '.finished_at // ""' "$_ran_run_json")" = "" ] \
+     || [ "$(jq -r '.branch // ""' "$_ran_run_json")" = "" ] \
+     || [ "$(jq -r '.working_branch // ""' "$_ran_run_json")" = "" ]; then
+    echo "[leerie] finalize: run $_ran_run_id is not finished; nothing to push" >&2
+    exit 0
+  fi
+  if [ "$(jq -r '.pushed_at // ""' "$_ran_run_json")" != "" ]; then
+    echo "[leerie] finalize: run $_ran_run_id is already pushed" >&2
     exit 0
   fi
 
@@ -9180,7 +9432,7 @@ if [ "$RUNTIME" != "fly" ]; then
   # fast-path; both source scripts/host-finalize.sh and call host_finalize.
   # shellcheck disable=SC1091
   . "$LEERIE_REPO/scripts/host-finalize.sh"
-  host_finalize "$LATEST_RUN_DIR" || exit $?
+  host_finalize "$_ran_run_dir" || exit $?
 fi
 # Fly path: decide_teardown's EXIT trap will source host-finalize.sh and
 # call host_finalize after fetch_branch. Nothing else to do here.

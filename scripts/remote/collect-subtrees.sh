@@ -63,7 +63,10 @@ collect_subtrees_remote() {
 set -eu -o pipefail
 
 SCRIPTS="/opt/leerie-image/scripts"
-LEERIE_STATE_DIR="${LEERIE_STATE_DIR:-/leerie-state}"
+# The remote orchestrator's state root is /work/.leerie (no LEERIE_STATE_DIR
+# there), so the scripts below must use the same one: they find the run's
+# staging and its own repository under it.
+LEERIE_STATE_DIR="/work/.leerie"
 export LEERIE_STATE_DIR
 
 RUNS_DIR="/work/.leerie/runs"
@@ -92,7 +95,18 @@ run_dir="${candidates[0]%/}"
 run_id="$(basename "$run_dir")"
 run_branch="leerie/runs/${run_id}"
 
-cd /work
+# Every branch and worktree of the run lives in the run's own repository
+# (DESIGN §6 *The run's own repository*); the scripts act on the
+# repository at their working directory.
+if [ ! -f "$run_dir/repo/HEAD" ]; then
+  echo "COLLECT-ERROR:no run repository at $run_dir/repo"
+  exit 0
+fi
+cd "$run_dir/repo" || { echo "COLLECT-ERROR:cannot enter $run_dir/repo"; exit 0; }
+# Named, never discovered (safe.bareRepository=explicit): the scripts' and
+# this payload's repository-level git.
+LEERIE_GIT_DIR="$run_dir/repo"
+export LEERIE_GIT_DIR
 
 # Ensure the run branch + staging worktree exist.  setup-run.sh is
 # idempotent — it never resets an existing branch.
@@ -107,7 +121,7 @@ branches=()
 while IFS= read -r ref; do
   [ -n "$ref" ] || continue
   branches+=("$ref")
-done < <(git for-each-ref --format='%(refname:short)' "refs/heads/${subtask_prefix}")
+done < <(git --git-dir="$LEERIE_GIT_DIR" for-each-ref --format='%(refname:short)' "refs/heads/${subtask_prefix}")
 
 if [ "${#branches[@]}" -eq 0 ]; then
   echo "COLLECTED-NONE:${run_id}"
@@ -117,7 +131,7 @@ fi
 # Filter out already-integrated branches.
 unintegrated=()
 for br in "${branches[@]}"; do
-  if git merge-base --is-ancestor "$br" "$run_branch" 2>/dev/null; then
+  if git --git-dir="$LEERIE_GIT_DIR" merge-base --is-ancestor "$br" "$run_branch" 2>/dev/null; then
     continue
   fi
   unintegrated+=("$br")
@@ -138,7 +152,7 @@ if [ -f "$state_json" ]; then
   while IFS= read -r sid; do
     [ -n "$sid" ] || continue
     ordered_sids+=("$sid")
-  done < <(python3 -c '
+  done < <(python3 -I -c '
 import json, sys
 try:
     st = json.load(open(sys.argv[1]))
@@ -185,7 +199,10 @@ for sid in "${!unintegrated_by_sid[@]}"; do
     remaining+=("$sid")
   fi
 done
-IFS=$'\n' sorted_remaining=($(printf '%s\n' "${remaining[@]}" | sort)); unset IFS
+sorted_remaining=()
+if [ "${#remaining[@]}" -gt 0 ]; then
+  mapfile -t sorted_remaining < <(printf '%s\n' "${remaining[@]}" | sort)
+fi
 for sid in "${sorted_remaining[@]}"; do
   integrate_order+=("$sid")
 done
@@ -193,23 +210,70 @@ done
 staging="${LEERIE_STATE_DIR}/runs/${run_id}/worktrees/staging"
 leerie_dir="${LEERIE_STATE_DIR}/runs/${run_id}"
 integrator_prompt="${SCRIPTS}/../prompts/integrator.md"
-# Must be kept in sync with SCHEMAS["integrator"] in orchestrator/leerie.py —
-# this script can't import Python, so there's no other guard against drift.
+# Must be kept in sync with SCHEMAS["integrator"] in orchestrator/leerie.py.
 # Embedded copies of the orchestrator's ACT_TOOLS / DISALLOWED_TOOLS. This
-# script invokes `claude -p` directly on the remote machine and cannot import
-# orchestrator/leerie.py, so the values are duplicated here — exactly like
-# integrator_schema below, and guarded the same way, by
+# script invokes `claude -p` directly on the remote machine; it loads
+# orchestrator/leerie.py only through worker-guard.py (below), for the worker
+# guard, and falls back to this deny list when that load fails. The schema
+# and both lists are duplicated here and guarded by
 # tests/test_collect_subtrees_integrator_schema.py. ANY EDIT TO EITHER LIST
 # IN leerie.py MUST BE MIRRORED HERE.
-integrator_allowed_tools='Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit,NotebookEdit'
-integrator_disallowed_tools='Agent,Task,SendMessage,ScheduleWakeup,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification,Workflow,ReportFindings,Skill,Monitor,TaskCreate,TaskGet,TaskList,TaskUpdate,TaskOutput,TaskStop,ListAgents,EnterWorktree,ExitWorktree,DesignSync,ToolSearch,ListMcpResourcesTool,ReadMcpResourceTool,ReadMcpResourceDirTool'
-integrator_schema='{"type":"object","required":["incoming_subtask","status"],"properties":{"incoming_subtask":{"type":"string"},"status":{"type":"string","enum":["resolved","design-conflict","failed"]},"resolution_summary":{"type":"string"},"diagnosis":{"type":["string","null"]},"confidence":{"type":"object","required":["resolution","basis"],"properties":{"resolution":{"type":"number"},"basis":{"type":"string"},"falsifiers_tested":{"type":"array","items":{"type":"string"}},"contradictions_reconciled":{"type":"array","items":{"type":"string"}}}}}}'
+integrator_allowed_tools='Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit,NotebookEdit,TaskStop'
+integrator_disallowed_tools='Agent,Task,SendMessage,ScheduleWakeup,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification,Workflow,ReportFindings,Skill,Monitor,TaskCreate,TaskGet,TaskList,TaskUpdate,TaskOutput,ListAgents,EnterWorktree,ExitWorktree,DesignSync,ToolSearch,ListMcpResourcesTool,ReadMcpResourceTool,ReadMcpResourceDirTool'
+integrator_schema='{"type":"object","required":["incoming_subtask","status"],"properties":{"incoming_subtask":{"type":"string"},"status":{"type":"string","enum":["resolved","design-conflict","failed"]},"resolution_summary":{"type":"string"},"diagnosis":{"type":["string","null"]},"confidence":{"type":"object","required":["resolution","basis"],"properties":{"resolution":{"type":"number"},"basis":{"type":"string"},"falsifiers_tested":{"type":"array","items":{"type":"string"}},"contradictions_reconciled":{"type":"array","items":{"type":"string"}}}},"superseded":{"type":"array","items":{"type":"object","required":["file","line","by_line","reason"],"properties":{"file":{"type":"string"},"line":{"type":"string"},"by_line":{"type":"string"},"reason":{"type":"string","enum":["other_side_rewrite","duplicate","moved","obsolete_by_merged_intent"]}}}}}}'
 
 integrated_count=0
 resolved_count=0
 skipped_count=0
 skipped_sids=""
 integrated_so_far=""
+
+# A branch that does not integrate leaves staging exactly as it found it:
+# reset to the commit before its merge, untracked files removed (ignored
+# ones kept). `git merge --abort` kept an edit the integrator made outside
+# the merge, which the next branch's merge then refused or the next
+# integrator swept in (DESIGN §6 *Subtree collection*).
+# The reset is setup-run.sh's (`leerie_reset_worktree`, which first restores
+# the write bit a killed test's read-only directory took away). One that
+# still fails stops the collection: every remaining branch is skipped, never
+# merged onto a tree the reset could not restore.
+# shellcheck source=scripts/worktree-lib.sh
+. "$SCRIPTS/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
+# Each integrator's copy of the credentials (`worker-guard.py` makes its
+# `workers/integrator-<sid>/` from the run's template, then exits) is this
+# process's: they and the template go when this payload exits, however it
+# exits (DESIGN §6 *No copy of the credentials outlives its run's process*).
+_drop_integrator_copies() {
+  local d
+  for d in "$leerie_dir"/workers/integrator-*; do
+    [ -e "$d" ] || [ -L "$d" ] || continue
+    leerie_rm_owned "$d" \
+      || echo "collect-subtrees: could not remove $d; it may hold a copy of your credentials" >&2
+  done
+  leerie_rm_owned "$leerie_dir/claude-config" \
+    || echo "collect-subtrees: could not remove $leerie_dir/claude-config; it may hold a copy of your credentials" >&2
+}
+trap _drop_integrator_copies EXIT
+backout_failed=false
+# Staging is a worktree of its own repository (DESIGN §6 *A repository per
+# committing tree (I6)*): what the integrator commits there, and every
+# back-out, reaches the run repository only when leerie takes the run branch.
+_take_staging() {
+  local tr
+  tr="$(leerie_tree_common "$staging" || true)"
+  [ -n "$tr" ] || return 1
+  [ "$tr" != "$(leerie_repo_git rev-parse --path-format=absolute --git-common-dir)" ] || return 0
+  leerie_take_tree_branch "$tr" "$run_branch"
+}
+_back_out() {
+  if ! leerie_reset_worktree "$staging" "$run_branch" "$1" >&2 \
+      || ! _take_staging >&2; then
+    backout_failed=true
+    echo "collect-subtrees: staging could not be reset to ${1}; the remaining branches are skipped" >&2
+  fi
+}
 
 _skip() {
   skipped_count=$((skipped_count + 1))
@@ -221,7 +285,11 @@ _skip() {
 }
 
 for sid in "${integrate_order[@]}"; do
-  branch="${subtask_prefix}${sid}"
+  if [ "$backout_failed" = true ]; then
+    _skip "$sid"
+    continue
+  fi
+  pre=$(leerie_tgit "$staging" rev-parse HEAD)
   rc=0
   bash "$SCRIPTS/integrate.sh" "$sid" "$run_id" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -234,7 +302,7 @@ for sid in "${integrate_order[@]}"; do
   elif [ "$rc" -eq 1 ]; then
     # Conflict — staging worktree is mid-merge. Spawn integrator.
     if [ ! -f "$integrator_prompt" ]; then
-      (cd "$staging" && git merge --abort 2>/dev/null || true)
+      _back_out "$pre"
       _skip "$sid"
       continue
     fi
@@ -243,14 +311,48 @@ LEERIE_DIR is ${leerie_dir}.
 Incoming subtask: ${sid}
 Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
 
+    # The per-worker guard (deny rules + notices + PreToolUse hook + script
+    # shell env) from the orchestrator module baked into this image — the
+    # same `_worker_guard` every orchestrator-spawned worker gets (DESIGN §9
+    # *A worker never kills a process by name*), and its Landlock grants.
+    # Without them the branch is skipped, never integrated unconfined.
+    guard_disallowed="$integrator_disallowed_tools"
+    guard_notice=""
+    guard_settings=""
+    guard_env=()
+    guard_confine=()
+    guard_sh=""
+    if guard_sh=$(python3 -I "$SCRIPTS/worker-guard.py" \
+        "$integrator_allowed_tools" "$staging" "$leerie_dir/state.json" \
+        "integrator-${sid}" \
+        2>/dev/null) && [ -n "$guard_sh" ]; then
+      eval "$guard_sh"
+    fi
+    # Never unconfined (DESIGN §6 *A worker writes only where it is
+    # granted*): without the guard's Landlock grants the branch is skipped.
+    if [ "${#guard_confine[@]}" -eq 0 ]; then
+      echo "collect-subtrees: cannot confine the integrator for ${sid}; skipped" >&2
+      _back_out "$pre"
+      _skip "$sid"
+      continue
+    fi
+    # The worker's whole settings, and no settings file read (DESIGN §6 *A
+    # worker's commands cannot reach its CLI*).
+    guard_settings_args=()
+    if [ -n "$guard_settings" ]; then
+      guard_settings_args=(--setting-sources "" --settings "$guard_settings")
+    fi
+
     claude_out=""
     claude_rc=0
-    claude_out=$(cd "$staging" && claude -p "$user_prompt" \
+    claude_out=$(cd "$staging" && env ${guard_env[@]+"${guard_env[@]}"} \
+      "${guard_confine[@]}" claude -p "${user_prompt}${guard_notice}" \
       --append-system-prompt "$(cat "$integrator_prompt")" \
       --output-format json \
       --json-schema "$integrator_schema" \
       --allowedTools "$integrator_allowed_tools" \
-      --disallowedTools "$integrator_disallowed_tools" \
+      --disallowedTools "$guard_disallowed" \
+      ${guard_settings_args[@]+"${guard_settings_args[@]}"} \
       --max-turns 60 \
       --model sonnet \
       --effort high \
@@ -258,13 +360,13 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
       --dangerously-skip-permissions 2>/dev/null) || claude_rc=$?
 
     if [ "$claude_rc" -ne 0 ]; then
-      (cd "$staging" && git merge --abort 2>/dev/null || true)
+      _back_out "$pre"
       _skip "$sid"
       continue
     fi
 
     # Extract status from structured_output.
-    status=$(printf '%s' "$claude_out" | python3 -c '
+    status=$(printf '%s' "$claude_out" | python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -275,12 +377,17 @@ except Exception:
 ' 2>/dev/null || true)
 
     if [ "$status" = "resolved" ]; then
-      # Verify the merge was actually committed.
+      # Verify the merge was actually committed, and that the integrator
+      # left its tree clean (I1, DESIGN §8 *A worker leaves its tree
+      # clean* — no re-ask here: there is no session to resume).
       merge_head_rc=0
-      (cd "$staging" && git rev-parse --verify --quiet MERGE_HEAD 2>/dev/null) || merge_head_rc=$?
+      leerie_tgit "$staging" rev-parse --verify --quiet MERGE_HEAD >/dev/null 2>&1 || merge_head_rc=$?
       staged_files=""
-      staged_files=$(cd "$staging" && git diff --cached --name-only 2>/dev/null || true)
-      if [ "$merge_head_rc" -ne 0 ] && [ -z "$staged_files" ]; then
+      staged_files=$(leerie_tgit "$staging" diff --cached --name-only 2>/dev/null || true)
+      dirt=$(leerie_tree_dirt "$staging" 2>/dev/null || echo "status failed")
+      now=$(leerie_tgit "$staging" rev-parse HEAD)
+      if [ "$merge_head_rc" -ne 0 ] && [ -z "$staged_files" ] \
+          && [ -z "$dirt" ] && [ "$now" != "$pre" ] && _take_staging >&2; then
         resolved_count=$((resolved_count + 1))
         if [ -n "$integrated_so_far" ]; then
           integrated_so_far="${integrated_so_far}, ${sid}"
@@ -288,11 +395,11 @@ except Exception:
           integrated_so_far="$sid"
         fi
       else
-        (cd "$staging" && git merge --abort 2>/dev/null || true)
+        _back_out "$pre"
         _skip "$sid"
       fi
     else
-      (cd "$staging" && git merge --abort 2>/dev/null || true)
+      _back_out "$pre"
       _skip "$sid"
     fi
   else

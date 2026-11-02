@@ -18,6 +18,8 @@ import os
 import stat
 import types
 
+from tests.conftest import register_worker_transcript, transcript_path
+
 
 def _st(tmp_path, conformance=None):
     run_dir = tmp_path / "run"
@@ -223,7 +225,8 @@ def test_base_health_payload_unmeasurable_axis_not_red(leerie, tmp_path):
 def _write_result_log(logs_dir, sid, duration_ms, terminal="completed"):
     rec = {"type": "result", "subtype": "success",
            "duration_ms": duration_ms, "terminal_reason": terminal}
-    (logs_dir / f"{sid}.log").write_text(json.dumps(rec) + "\n")
+    register_worker_transcript(transcript_path(logs_dir, f"{sid}.log")).write_text(
+        json.dumps(rec) + "\n")
 
 
 def test_record_run_health_picks_slowest_and_counts_truncation(
@@ -343,9 +346,11 @@ def test_capture_baseline_never_uses_login_shell_flag(leerie):
     assert '"-lc"' not in src and "'-lc'" not in src, (
         "_measure_blt must never invoke a BLT command "
         "with a login-shell (-lc) flag — it discards Docker ENV-only PATH.")
-    assert '["bash", "-c", cmd]' in src, (
+    assert "_blt_shell_argv(cmd, forbidden)" in src and (
+        '["bash", "-c", cmd]' in inspect.getsource(leerie._blt_shell_argv)), (
         "_measure_blt must invoke each BLT axis command "
-        'as the exact argv ["bash", "-c", cmd] (non-login shell).')
+        'as the exact argv ["bash", "-c", cmd] (non-login shell), built by '
+        "the forbidden-command gate _blt_shell_argv.")
 
     # The pin followed the argv out of `_capture_conformance_baseline` when
     # `_measure_blt` was extracted. Assert the baseline no longer builds a

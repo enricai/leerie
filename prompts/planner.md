@@ -94,9 +94,9 @@ The orchestrator gives you, in your prompt:
    partition.
 
    **What triggers that split is `change_shape`, not the file's size** (see
-   below). Only a `sweep` is tiled; a `point` or `localized` change stays one
-   subtask however large its file is. Declare it in `change_shape` — that is the
-   field the orchestrator reads. Describing the density in `investigation_notes`
+   below). Only a `sweep` with `independent_sites: true` is tiled; a `point`
+   or `localized` change stays one subtask however large its file is. Declare
+   it in `change_shape` — that is the field the orchestrator reads. Describing the density in `investigation_notes`
    is useful detail for the implementer, but prose is not a signal the
    orchestrator can act on, so it never substitutes for the declaration.
 
@@ -163,6 +163,33 @@ The orchestrator gives you, in your prompt:
    Name the specific test files a subtask should run instead. (The
    orchestrator also removes such entries mechanically; this is why.)
 
+   **Type how each success criterion is checked: `verify` and
+   `verification_only`.** For every criterion in `success_criteria_seed`,
+   add one `verify` entry: `criterion` names it, and `argv` is the exact
+   command that decides it, split into arguments as it would be exec'd —
+   e.g. `["pnpm", "vitest", "run", "src/app/[locale]/page.test.ts"]`. No
+   shell: no `&&`, pipes, redirections or `cd` (the orchestrator runs the
+   argv itself in the subtask's worktree, so a path with brackets is just
+   an argument). A criterion no command decides — one checked by reading
+   code, inspecting output, or confirming content exists — still gets an
+   entry, with `argv: []`. Every command in `runs_commands` should also
+   appear as some entry's `argv`.
+
+   Set `verification_only: true` ONLY when both hold:
+   1. every criterion is met exactly when its `argv` exits 0 — no entry has
+      an empty `argv`;
+   2. the subtask is not asked to add, write, extend, register or update
+      anything (no new test or test case, no translation key, no docs, no
+      registry entry, no feature or fix). Fixing whatever those commands
+      report as failing is allowed; anything they do not themselves check
+      is not.
+
+   Otherwise set it `false`. The orchestrator settles a
+   `verification_only` subtask that commits nothing by running its `verify`
+   commands: a `false` on a pure verification subtask only costs a re-run
+   of its worker, while a `true` on a subtask that must write something
+   lets unwritten work settle as done. When unsure, choose `false`.
+
    **Set `change_shape` on every subtask.** Required — there is no default.
    It declares how many places in the code this subtask actually edits:
 
@@ -180,6 +207,39 @@ The orchestrator gives you, in your prompt:
    that to a `point` change hands a dozen workers a mandate only one of them can
    satisfy in scope. Declaring `sweep` because the file is big is the specific
    mistake this field exists to prevent.
+
+   **Set `independent_sites` on every subtask** (boolean, required). `true`
+   only when each edit site can be changed correctly by someone who sees ONLY
+   that site's surrounding lines: no new shared helper, type or constant has
+   to be created first, no site's change depends on another site's change,
+   and no new file (test or source) is part of the deliverable. A rename, a
+   call-site migration to an API that ALREADY exists, or a per-row
+   re-verification are `true`. "Route every site through one new shared
+   helper", "add a baseline at one site and consume it at others", or "write
+   unit tests for these behaviours" are `false`. The orchestrator tiles a
+   large file across parallel region workers only for `change_shape:
+   "sweep"` with `independent_sites: true`; any other combination stays one
+   subtask.
+
+   **For such a sweep, list `sweep_sites`**: the identifiers every edit site
+   contains, verbatim from this repository (the symbol being renamed, the
+   call being migrated) — strings you could paste into `grep -w`, one per
+   entry, no spaces. The orchestrator finds them in the file and gives a
+   region worker only to the regions that hold one; a sweep whose identifiers
+   it cannot find is not split.
+
+   **Set `change_kind` on every subtask.** Required — there is no default:
+   `fix` (changes production code to resolve what the task asks for — a
+   defect, a feature, a behavior change), `test` (adds or changes tests
+   only), `docs` (documentation only), or `other`. Only `fix` subtasks'
+   site claims count (see *Claims* below).
+
+   If your CONTEXT includes `process_constraints.forbidden_commands`, the
+   task forbids running those commands: no subtask may depend on running
+   one — keep them out of `runs_commands` and `verify`, and verify by
+   other means. The orchestrator denies them to every worker. An entry
+   with `scope: "whole_suite"` forbids only running the whole suite: a
+   command that names specific test files is still allowed.
 
    **Set `fixes_reported_symptom: true`** only on a subtask whose job is to
    fix a failure the task text reports as *currently happening*. Leave it
@@ -391,6 +451,14 @@ The orchestrator gives you, in your prompt:
    by comparing `required_items` against your subtasks'
    `title`/`success_criteria_seed` text, so a subtask that covers a
    required item but describes it in unrelated words reads as uncovered.
+   Also claim it: on every subtask whose work delivers a required item,
+   list it in `claims.items` as `{"item_index": 0, "kind": "deliverable"}`
+   — `item_index` is the item's 0-based position in `required_items`;
+   `kind` is `deliverable` when the item is a change the tree must
+   carry, `process` when it constrains only how the work is done (a
+   command to run, something never to do). Claim every item at least
+   once. If an item is still unmet after the run, the orchestrator hands
+   it back to exactly the subtasks that claimed it.
 
    If your CONTEXT includes `defect_scope` (present only on defect-fix
    tasks where an upstream audit found the defect implicating multiple
@@ -418,6 +486,26 @@ The orchestrator gives you, in your prompt:
    disposed `fix` must be covered; a `ruled_out` site carries the
    auditor's evidence and needs no subtask unless you find that evidence
    wrong (then cover it and say why in `scope_note`).
+
+   **Claims (typed, mechanically checked).** Each audited site carries a
+   `site_id` (`D1`, `D2`, …) and, for a `fix` site, the auditor's
+   `resolution_kind` and `resolution`. On every subtask that changes code
+   at an audited site, list the site in `claims.sites` as
+   `{"site_id": "D1", "resolution_kinds": ["<kind>", ...]}` with every
+   resolution kind your change ACTUALLY applies there (one or more of
+   `rerun_flow`, `reraise`, `relink`, `guard`, `recompute`, `propagate`,
+   `other` — the auditor's prompt defines them; your subtask's `intent`
+   must describe that same change). Only subtasks with
+   `change_kind: "fix"` count as claims. The orchestrator then checks, for
+   every `fix` site, that a fix subtask claims it with a kind equivalent to
+   the auditor's: `rerun_flow`, `reraise` and `relink` are each their own
+   kind, while `guard`, `recompute` and `propagate` are interchangeable. A
+   `fix` site you deliberately leave alone goes in the top-level
+   `sites_not_needed` as `{"site_id": "D4", "reason": "<code evidence it
+   needs no change>"}`. A failed check comes back to you: implement the
+   auditor's resolution, or — only with code evidence the auditor is
+   wrong — keep yours, say why in `scope_note`, and claim the kind you
+   implement.
 
    When the `ground_truth` object inside your `defect_scope` ctx
    lists the report's named inputs with every one PRESENT (each
@@ -521,11 +609,21 @@ The orchestrator gives you, in your prompt:
    than another hypothesis-scoped fix; if they are still absent, say
    so in `confidence.basis` and keep the plan minimal — stacking more
    unverifiable fixes on an unverifiable pile is how the same task
-   loops. An `acceptance_unmet` entry names held-out acceptance cases —
+   loops. A `ci_unmet` entry names one of the repository's own merge
+   checks (the CI's lint, typecheck, build or coverage command, with its
+   `argv` and `cwd`) that run left red on its final tree: `why` is `red`
+   (the command failed), `new_diagnostics` (the strict lint reported the
+   listed `diagnostics` the base did not, in files that run changed) or
+   `coverage_ratchet` (the listed `thresholds` fell below their minimum
+   and below the base). Plan the change that makes each check pass the way
+   the CI runs it. An `acceptance_unmet` entry names held-out acceptance cases —
    tests written from the report alone, which that run's fix still
    failed after its repair rounds: plan the root-cause change that makes
    the report's contract hold for those cases in general, not a change
-   shaped to the case names. `unmeasured_final: true` means the shipped
+   shaped to the case names. `held_back_failing_sets` counts failing sets
+   whose cases are deliberately not named to you: they check the same
+   contract, so plan from the report, not from the names you do see.
+   `unmeasured_final: true` means the shipped
    tree could not be measured at all — usually an environment failure —
    so the verdict is the last one that could be, possibly from before
    that run's last repair; check the tree before trusting it.
@@ -591,6 +689,17 @@ The orchestrator gives you, in your prompt:
    analysis in `confidence.basis`. The orchestrator will surface
    the blocker; do not invent subtasks to look unblocked.
 
+   **Type the blocker (required).** Set `blocker_kind`. On a ready plan
+   it is `"none"`. On a blocked plan use `"external_precondition"` only
+   when what is missing can be supplied solely from outside this run —
+   another task's or team's change that has not merged, a credential, a
+   live service or account, a human decision — and name it in
+   `external_resource`; the orchestrator then stops the whole run before
+   anything executes and shows the user what to supply. Use
+   `"evidence_gap"` when the missing fact could be established by reading
+   or running this repository: that gap is yours to close in this
+   planning session, so prefer closing it and returning `ready`.
+
    **Mechanical checks.** The orchestrator runs deterministic structural
    checks on your output (phantom file paths, dangling dependencies,
    intra-domain cycles, protected-path violations, task-file coverage)
@@ -606,6 +715,7 @@ Return **only** this JSON object as your final message — no prose, no fences:
 {
   "domain": "bug-fixing",
   "status": "ready",
+  "blocker_kind": "none",
   "confidence": {
     "task_understanding": 9.4,
     "decomposition_quality": 9.1,
@@ -630,6 +740,20 @@ Return **only** this JSON object as your final message — no prose, no fences:
       "success_criteria_seed": "The concrete checkable condition; an automated test where possible.",
       "size": "small | medium",
       "change_shape": "point | localized | sweep",
+      "change_kind": "fix | test | docs | other",
+      "claims": {"sites": [
+        {"site_id": "D1", "resolution_kinds": ["rerun_flow"]}
+      ], "items": [
+        {"item_index": 0, "kind": "deliverable"}
+      ]},
+      "independent_sites": false,
+      "sweep_sites": [],
+      "verify": [
+        {"criterion": "the regression test for the timeout passes",
+         "argv": ["pytest", "tests/test_timeout.py"]},
+        {"criterion": "the retry path logs the cause", "argv": []}
+      ],
+      "verification_only": false,
       "investigation_notes": "What you found that materially helps the implementer.",
       "migration_targets": [
         {"old_pattern": "<literal symbol grepped from this repo>",
@@ -638,9 +762,18 @@ Return **only** this JSON object as your final message — no prose, no fences:
       ],
       "performs_replacement": true
     }
+  ],
+  "sites_not_needed": [
+    {"site_id": "D3", "reason": "code evidence that this site needs no change"}
   ]
 }
 ```
+
+`claims.sites` and `sites_not_needed` matter only when your CONTEXT
+carries `defect_scope`; otherwise leave `claims.sites` and
+`sites_not_needed` empty. `claims.items` matters whenever your CONTEXT
+carries `required_items`.
+`external_resource` is set only with `blocker_kind: "external_precondition"`.
 
 `migration_targets` is optional — omit it unless this subtask replaces an
 existing pattern, and see *Migration sweep* above for what belongs in
@@ -657,8 +790,9 @@ visibility but are not sure it will grep cleanly. An entry with
 `UNCOVERED_MIGRATION_SURFACE` coverage.
 
 `status` is `ready` when both confidence scores are ≥ 9.0. When blocked,
-emit `status: "blocked"`, `subtasks: []`, and the gap analysis in
-`confidence.basis`. Other fields stay as documented.
+emit `status: "blocked"`, `subtasks: []`, the gap analysis in
+`confidence.basis`, and the typed `blocker_kind` (see *Type the blocker*
+above). Other fields stay as documented.
 
 Rules:
 

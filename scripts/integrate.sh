@@ -9,6 +9,11 @@
 # the leerie-integrator to resolve.
 set -euo pipefail
 
+# shellcheck source=scripts/worktree-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
+
 ID="${1:?usage: integrate.sh <subtask-id> <run-id>}"
 RUN_ID="${2:?usage: integrate.sh <subtask-id> <run-id>}"
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
@@ -19,14 +24,33 @@ if [ ! -d "$STAGING" ]; then
   echo "error: run-branch worktree missing — run setup-run.sh ${RUN_ID} first" >&2
   exit 2
 fi
-if ! git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+if ! leerie_repo_git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
   echo "error: branch ${BRANCH} does not exist" >&2
   exit 2
 fi
 
-cd "$STAGING"
+# Staging is a worktree of its own repository (DESIGN §6 *A repository per
+# committing tree (I6)*), which holds only the run branch: leerie fetches the
+# subtask branch into it from the run repository right before the merge,
+# and takes the run branch back after it. A staging of the run repository
+# itself (a run made before tree repositories) has both already.
+RUN_REPO="$(leerie_repo_git rev-parse --path-format=absolute --git-common-dir)"
+# Named from leerie's layout, never from staging's `.git` file (DESIGN §6
+# *Leerie's git never takes a tree's repository from the tree*).
+STAGING_REPO="$(leerie_tree_common "$STAGING" || true)"
+[ -n "$STAGING_REPO" ] || { echo "integrate: cannot locate staging's repository" >&2; exit 2; }
+if [ "$STAGING_REPO" != "$RUN_REPO" ]; then
+  leerie_tgit "$STAGING" fetch --quiet --no-tags --no-write-fetch-head \
+    --no-auto-maintenance "$RUN_REPO" "+refs/heads/${BRANCH}:refs/heads/${BRANCH}"
+fi
+_take_staging() {
+  if [ "$STAGING_REPO" != "$RUN_REPO" ]; then
+    leerie_take_tree_branch "$STAGING_REPO" "leerie/runs/${RUN_ID}"
+  fi
+}
 
-if git merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
+if leerie_tgit "$STAGING" merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
+  _take_staging
   echo "integrated: ${ID}"
   exit 0
 else

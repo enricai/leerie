@@ -23,7 +23,7 @@ REQUIRED_DENIALS = {
     "CronCreate", "CronDelete", "CronList",
     "RemoteTrigger", "PushNotification",
     "Workflow", "ReportFindings", "Skill", "Monitor",
-    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
+    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput",
     "ListAgents", "EnterWorktree", "ExitWorktree", "DesignSync",
     # ToolSearch is a judgment call, not strictly required like the rest —
     # denied here for consistency with the other autonomy/spawn-shaped tools.
@@ -47,6 +47,21 @@ REQUIRED_DENIALS = {
 # --dangerously-skip-permissions by default and so are already held by
 # --allowedTools. Bash/Write/Edit stay allowed regardless, so the deny never
 # produced the read-only property it was justified by.
+
+
+def test_taskstop_is_granted_not_denied(leerie):
+    """TaskStop stops only the calling session's own background commands (a
+    foreign task ID gets "No task found"), and it is what the process-kill
+    notice sends a worker to instead of `pkill` (DESIGN §2, §9). Denying it
+    would leave a worker no handle on its own background command but a
+    pattern kill that reaches its siblings."""
+    denied = {e.strip() for e in leerie.DISALLOWED_TOOLS.split(",")}
+    assert "TaskStop" not in denied
+    assert "TaskStop" in {e.strip() for e in leerie.ACT_TOOLS.split(",")}
+    assert "TaskStop" in leerie.KNOWN_TOOLS
+    # Every other Task* name and both subagent spellings stay denied.
+    assert {"Task", "Agent", "TaskOutput", "TaskCreate"} <= denied
+    assert "TaskStop" in leerie.PROCESS_KILL_NOTICE
 
 
 def test_disallowed_tools_contains_required_denials(leerie):

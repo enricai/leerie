@@ -23,6 +23,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.conftest import register_worker_transcript, transcript_path
+
 
 # ---------------------------------------------------------------------------
 # Fixed _invoke envelope containing dep_capture structured_output
@@ -98,7 +100,7 @@ def _make_state(leerie, run_dir: Path) -> object:
 
 def _make_jsonl_log_in(log_dir: Path, commands: list[str]) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "worker-001.log"
+    log_path = transcript_path(log_dir, "worker-001.log")
     lines: list[str] = []
     for i, cmd in enumerate(commands):
         event = {
@@ -113,6 +115,7 @@ def _make_jsonl_log_in(log_dir: Path, commands: list[str]) -> None:
         }
         lines.append(json.dumps(event))
     log_path.write_text("\n".join(lines) + "\n")
+    register_worker_transcript(log_path)
 
 
 def _make_fake_state(leerie, tmp_path: Path, commands: list[str]) -> object:

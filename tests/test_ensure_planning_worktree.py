@@ -76,7 +76,7 @@ class TestEnsurePlanningWorktree:
     def test_creates_the_worktree_and_records_the_path(self, leerie, env):
         repo, state, st = env
         path = _run(leerie, st)
-        assert (state / "runs" / "r1" / "worktrees" / "planning").is_dir()
+        assert (state / "runs" / "r1" / "worktrees" / "r1-planning").is_dir()
         assert st.data["planning_worktree"] == path
         assert st.saves >= 1, "the path must be persisted, not just returned"
 
@@ -103,7 +103,7 @@ class TestEnsurePlanningWorktree:
         exactly the exposure this exists to remove."""
         repo, state, st = env
 
-        async def failing(_name, *_a):
+        async def failing(_name, *_a, **_kw):
             return subprocess.CompletedProcess(
                 args=[], returncode=1, stdout="", stderr="boom")
 
@@ -120,7 +120,7 @@ class TestEnsurePlanningWorktree:
         repo, state, st = env
         seen = {}
 
-        async def failing(_name, *_a):
+        async def failing(_name, *_a, **_kw):
             return subprocess.CompletedProcess(
                 args=[], returncode=1, stdout="", stderr="boom")
 
@@ -141,7 +141,7 @@ class TestEnsurePlanningWorktree:
         orchestrator's own directory."""
         repo, state, st = env
 
-        async def chatty(_name, *_a):
+        async def chatty(_name, *_a, **_kw):
             return subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="something unexpected\n",
                 stderr="")
@@ -158,7 +158,7 @@ class TestEnsurePlanningWorktree:
         (repo / "brief.md").write_text("the spec\n")     # untracked
         st.data["task"] = "implement what brief.md says"
         _run(leerie, st)
-        wt = state / "runs" / "r1" / "worktrees" / "planning"
+        wt = state / "runs" / "r1" / "worktrees" / "r1-planning"
         assert (wt / "brief.md").exists()
         _run(leerie, st)
         assert (wt / "brief.md").exists(), (
@@ -220,6 +220,11 @@ class TestStageWorktreeExtras:
         """Degraded context must not take down a run that would otherwise
         proceed — the worktree itself is already established by this point."""
         repo, state, st = env
+        # The run's repository first, unfaulted: making it copies leerie's
+        # settings (`_take_run_settings`, `shutil.copytree`), and a failure
+        # there rightly stops the run (DESIGN §8 *The settings are
+        # leerie's*). The fault below is for the extras' copies alone.
+        leerie._ensure_run_repo(st)
 
         def boom(*_a, **_k):
             raise OSError("disk on fire")

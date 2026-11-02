@@ -50,7 +50,7 @@ ec2_default_instance_type() {
 _ec2_default_vpc_id() {
   local out vpc
   out="$(_ec2_aws ec2 describe-vpcs --filters Name=isDefault,Values=true --output json 2>/dev/null)" || out=""
-  vpc="$(printf '%s' "$out" | python3 -c '
+  vpc="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -73,7 +73,7 @@ ec2_default_subnet_id() {
   local vpc
   vpc="$(_ec2_default_vpc_id)" || return 1
   out="$(_ec2_aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc" "Name=map-public-ip-on-launch,Values=true" --output json 2>/dev/null)" || out=""
-  v="$(printf '%s' "$out" | python3 -c '
+  v="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 vpc=sys.argv[1]
 try: d=json.load(sys.stdin)
@@ -98,7 +98,7 @@ ec2_egress_cidr() {
     ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')"
     cidr="${ip:+$ip/32}"
   fi
-  if ! printf '%s' "$cidr" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'; then
+  if ! grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' < <(printf '%s\n' "$cidr"); then
     remote_log "error: could not determine the launcher's egress IP for the SSH security-group rule."
     echo "  Set LEERIE_EC2_SSH_CIDR=<your-ip>/32 and re-run." >&2
     return 1
@@ -123,7 +123,7 @@ ec2_default_security_group() {
   cidr="$(ec2_egress_cidr)" || return 1
   vpc="$(_ec2_default_vpc_id)" || return 1
   out="$(_ec2_aws ec2 describe-security-groups --filters "Name=group-name,Values=$EC2_SG_NAME" "Name=vpc-id,Values=$vpc" --output json 2>/dev/null)" || out=""
-  gid="$(printf '%s' "$out" | python3 -c "$_EC2_TAGGED_PY"'
+  gid="$(printf '%s' "$out" | python3 -I -c "$_EC2_TAGGED_PY"'
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -137,7 +137,7 @@ else: print("untagged")' 2>/dev/null)"
     return 1
   fi
   if [ -z "$gid" ]; then
-    gid="$(_ec2_aws ec2 create-security-group --group-name "$EC2_SG_NAME" --description "leerie SSH from launcher" --vpc-id "$vpc" --tag-specifications "$(_ec2_tag_spec security-group)" --output json 2>/dev/null | python3 -c '
+    gid="$(_ec2_aws ec2 create-security-group --group-name "$EC2_SG_NAME" --description "leerie SSH from launcher" --vpc-id "$vpc" --tag-specifications "$(_ec2_tag_spec security-group)" --output json 2>/dev/null | python3 -I -c '
 import json,sys
 try: print(json.load(sys.stdin).get("GroupId",""))
 except Exception: print("")' 2>/dev/null)"
@@ -148,14 +148,14 @@ except Exception: print("")' 2>/dev/null)"
     fi
     have=""
   else
-    have="$(printf '%s' "$out" | python3 -c '
+    have="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 d=json.load(sys.stdin)
 for p in d["SecurityGroups"][0].get("IpPermissions",[]):
     if p.get("FromPort")==22:
         for r in p.get("IpRanges",[]): print(r.get("CidrIp",""))' 2>/dev/null)"
   fi
-  if ! printf '%s\n' "$have" | grep -qxF "$cidr"; then
+  if ! grep -qxF -- "$cidr" < <(printf '%s\n' "$have"); then
     if ! _ec2_aws ec2 authorize-security-group-ingress --group-id "$gid" --protocol tcp --port 22 --cidr "$cidr" >/dev/null 2>&1; then
       remote_log "error: could not authorize 22/tcp from $cidr on $gid."
       echo "  Check ec2:AuthorizeSecurityGroupIngress, or set LEERIE_EC2_SECURITY_GROUP." >&2
@@ -173,7 +173,7 @@ for p in d["SecurityGroups"][0].get("IpPermissions",[]):
 ec2_reauthorize_instance_sg() {
   local iid="$1" out gids gid cidr have
   out="$(_ec2_aws ec2 describe-instances --instance-ids "$iid" --output json 2>/dev/null)" || out=""
-  gids="$(printf '%s' "$out" | python3 -c '
+  gids="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -183,7 +183,7 @@ for r in d.get("Reservations",[]):
   [ -n "$gids" ] || return 0
   # shellcheck disable=SC2086  # one or more group ids
   out="$(_ec2_aws ec2 describe-security-groups --group-ids $gids --output json 2>/dev/null)" || out=""
-  gid="$(printf '%s' "$out" | python3 -c "$_EC2_TAGGED_PY"'
+  gid="$(printf '%s' "$out" | python3 -I -c "$_EC2_TAGGED_PY"'
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -191,7 +191,7 @@ for g in d.get("SecurityGroups",[]):
     if tagged(g.get("Tags")): print(g["GroupId"]); break' 2>/dev/null)"
   [ -n "$gid" ] || return 0
   cidr="$(ec2_egress_cidr)" || return 1
-  have="$(printf '%s' "$out" | python3 -c '
+  have="$(printf '%s' "$out" | python3 -I -c '
 import json,sys
 gid=sys.argv[1]
 for g in json.load(sys.stdin).get("SecurityGroups",[]):
@@ -199,7 +199,7 @@ for g in json.load(sys.stdin).get("SecurityGroups",[]):
     for p in g.get("IpPermissions",[]):
         if p.get("FromPort")==22:
             for r in p.get("IpRanges",[]): print(r.get("CidrIp",""))' "$gid" 2>/dev/null)"
-  printf '%s\n' "$have" | grep -qxF "$cidr" && return 0
+  grep -qxF -- "$cidr" < <(printf '%s\n' "$have") && return 0
   _ec2_aws ec2 authorize-security-group-ingress --group-id "$gid" --protocol tcp --port 22 --cidr "$cidr" >/dev/null 2>&1 || {
     remote_log "error: could not authorize 22/tcp from $cidr on $gid."
     return 1
@@ -221,7 +221,7 @@ ec2_default_key_name() {
     return 1
   }
   out="$(_ec2_aws ec2 describe-key-pairs --filters "Name=key-name,Values=$EC2_KEY_NAME_DEFAULT" --output json 2>/dev/null)" || out=""
-  found="$(printf '%s' "$out" | python3 -c "$_EC2_TAGGED_PY"'
+  found="$(printf '%s' "$out" | python3 -I -c "$_EC2_TAGGED_PY"'
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -252,7 +252,7 @@ else: print("untagged")' 2>/dev/null)"
   else
     mkdir -p "$(dirname "$keyfile")" || return 1
     local material
-    material="$(_ec2_aws ec2 create-key-pair --key-name "$EC2_KEY_NAME_DEFAULT" --key-type rsa --tag-specifications "$(_ec2_tag_spec key-pair)" --output json 2>/dev/null | python3 -c '
+    material="$(_ec2_aws ec2 create-key-pair --key-name "$EC2_KEY_NAME_DEFAULT" --key-type rsa --tag-specifications "$(_ec2_tag_spec key-pair)" --output json 2>/dev/null | python3 -I -c '
 import json,sys
 try: print(json.load(sys.stdin).get("KeyMaterial",""))
 except Exception: print("")' 2>/dev/null)"
@@ -297,7 +297,7 @@ ec2_default_instance_profile() {
 # _ec2_iam_denied <stderr> — AWS CLI v2 error shape is "An error occurred
 # (AccessDenied) when calling ..."; match the code field, not the prose.
 _ec2_iam_denied() {
-  printf '%s' "$1" | grep -Eq 'An error occurred \((AccessDenied|AccessDeniedException|UnauthorizedOperation)\)'
+  grep -Eq 'An error occurred \((AccessDenied|AccessDeniedException|UnauthorizedOperation)\)' < <(printf '%s\n' "$1")
 }
 
 _ec2_iam_warn() {

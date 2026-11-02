@@ -135,10 +135,9 @@ _ec2_seed_repo_preflight() {
 # SSH session yields rc 124/137, never hangs.
 # ---------------------------------------------------------------------------
 _ec2_pipe_file_via_tar() {
-  local local_file="$1" remote_name="$2" extract_dir="$3"
+  local local_file="$1" remote_name="$2" extract_dir="$3" rc=0
   tar -C "$(dirname "$local_file")" -czf - "$(basename "$local_file")" \
-    | ec2_tar_pipe "$LEERIE_EC2_SSH_TARGET" "$extract_dir"
-  local rc=$?
+    | ec2_tar_pipe "$LEERIE_EC2_SSH_TARGET" "$extract_dir" || rc=$?
   if [ "$rc" -ne 0 ]; then
     return "$rc"
   fi
@@ -148,8 +147,7 @@ _ec2_pipe_file_via_tar() {
   if [ "$(basename "$local_file")" != "$remote_name" ]; then
     ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" \
       "mv '$extract_dir/$(basename "$local_file")' '$extract_dir/$remote_name'" \
-      >/dev/null
-    rc=$?
+      >/dev/null || rc=$?
   fi
   return "$rc"
 }
@@ -186,8 +184,7 @@ _ec2_seed_shallow_parent() {
   _seed_progress_bg "ec2_seed_repo (shallow parent .git)" &
   _hb_pid=$!
   _ec2_pipe_file_via_tar "$_tmp_shallow/leerie-seed-git.tar" \
-    "leerie-seed-git.tar" "/tmp"
-  _rc=$?
+    "leerie-seed-git.tar" "/tmp" || _rc=$?
   kill "$_hb_pid" 2>/dev/null || true
   wait "$_hb_pid" 2>/dev/null || true
   if [ "$_rc" -ne 0 ]; then
@@ -259,8 +256,7 @@ ec2_seed_repo_clone() {
     _seed_progress_bg "ec2_seed_repo (parent bundle)" &
     _hb_pid_parent=$!
     _ec2_pipe_file_via_tar "$_tmp_bundle/leerie-seed.bundle" \
-      "leerie-seed.bundle" "/tmp"
-    _parent_rc=$?
+      "leerie-seed.bundle" "/tmp" || _parent_rc=$?
     kill "$_hb_pid_parent" 2>/dev/null || true
     wait "$_hb_pid_parent" 2>/dev/null || true
     if [ "$_parent_rc" -ne 0 ]; then
@@ -428,8 +424,7 @@ ec2_seed_repo_dirty() {
     --from0 --files-from="$file_list" \
     -e "$wrapper" --rsync-path="sudo -n rsync" \
     "$USER_REPO/" "$LEERIE_EC2_SSH_TARGET:/work/" \
-    >/dev/null 2>"$rsync_err"
-  rsync_rc=$?
+    >/dev/null 2>"$rsync_err" || rsync_rc=$?
 
   if [ "$rsync_rc" -ne 0 ]; then
     remote_log "ec2_seed_repo: rsync delta transfer failed (exit $rsync_rc)"

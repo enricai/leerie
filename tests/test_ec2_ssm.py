@@ -79,7 +79,7 @@ def test_ec2_launch_detached_runs_the_payload_over_ssh_as_root(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout == "launched-ok\n"
     (line,) = _ssh_lines(bin_dir)
-    assert line.endswith("ec2-user@203.0.113.5 sudo -n python3 -")
+    assert line.endswith("ec2-user@203.0.113.5 sudo -n python3 -I -")
     assert "BatchMode=yes" in line
     # No SSM session for a non-interactive payload.
     assert not any("ssm" in l for l in (bin_dir / "aws.log").read_text().splitlines()) \

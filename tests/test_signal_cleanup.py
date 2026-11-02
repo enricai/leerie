@@ -102,6 +102,13 @@ def test_cleanup_handles_none_state_gracefully(leerie):
     leerie._cleanup_on_abnormal_exit(None, full_purge=False)  # must not raise
 
 
+def _fake_run_repo(run_dir) -> None:
+    """A `<run-dir>/repo` that `_run_repo_of` accepts under the stubbed
+    `subprocess.run` below (its `rev-parse` answers)."""
+    (run_dir / "repo" / "objects").mkdir(parents=True, exist_ok=True)
+    (run_dir / "repo" / "HEAD").write_text("ref: refs/heads/main\n")
+
+
 def test_cleanup_removes_worktrees_dir(leerie, tmp_path, monkeypatch):
     """_cleanup_on_abnormal_exit calls `git worktree remove --force` for
     each subdir of run_dir/worktrees/. Test by stubbing subprocess.run
@@ -110,6 +117,12 @@ def test_cleanup_removes_worktrees_dir(leerie, tmp_path, monkeypatch):
     run_dir = tmp_path / "runs" / run_id
     (run_dir / "worktrees" / "staging").mkdir(parents=True)
     (run_dir / "worktrees" / "feat-001").mkdir(parents=True)
+    # The run's own repository, where its worktrees are registered (DESIGN
+    # §6 *The run's own repository*); without one nothing is pruned.
+    _fake_run_repo(run_dir)
+    # The git common dir the stub reports: the prune takes its repository
+    # lock file there, so it must exist.
+    (tmp_path / ".git").mkdir()
     st = _FakeState(run_id, run_dir)
 
     calls: list[list[str]] = []
@@ -118,7 +131,7 @@ def test_cleanup_removes_worktrees_dir(leerie, tmp_path, monkeypatch):
         # The scoped prune's first step asks git where the common dir is; an
         # empty answer makes it (correctly) decline to attribute anything, so
         # the stub has to answer it for the rest of the path to run at all.
-        if list(cmd)[:2] == ["git", "rev-parse"]:
+        if "rev-parse" in cmd:
             return subprocess.CompletedProcess(
                 cmd, 0, str(tmp_path / ".git") + "\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -127,17 +140,17 @@ def test_cleanup_removes_worktrees_dir(leerie, tmp_path, monkeypatch):
     leerie._cleanup_on_abnormal_exit(st, full_purge=False)
 
     # Two worktree-remove calls + a SCOPED prune.
-    remove_calls = [c for c in calls if c[:3] == ["git", "worktree", "remove"]]
+    remove_calls = [c for c in calls if "worktree" in c and "remove" in c]
     assert len(remove_calls) == 2
     # `git worktree prune` here is repository-global against a `.git` that is
     # bind-mounted and shared with the host, so it dropped every host-side
     # `/tmp/tmp.*/rebase-*` registration (docs/POSTMORTEM-2026-08-14.md, F19).
     # `_prune_leerie_worktrees` asks git what it WOULD prune (`-n -v`) and
     # removes only entries under this run's own directory.
-    assert not any(c == ["git", "worktree", "prune"] for c in calls), (
+    assert not any(c[-2:] == ["worktree", "prune"] for c in calls), (
         "a bare repository-global prune must not be issued from inside the "
         f"container: {calls}")
-    assert any(c[:5] == ["git", "worktree", "prune", "-n", "-v"]
+    assert any(c[-4:] == ["worktree", "prune", "-n", "-v"]
                for c in calls), calls
 
 
@@ -325,40 +338,28 @@ def test_cleanup_no_purge_preserves_run_dir(leerie, tmp_path, monkeypatch):
     assert (run_dir / "state.json").exists(), "state.json must survive non-purge cleanup"
 
 
-def test_cleanup_full_purge_deletes_branches(leerie, tmp_path, monkeypatch):
-    """full_purge=True invokes `git for-each-ref` to enumerate branches
-    and `git branch -D` to delete each one."""
+def test_cleanup_full_purge_deletes_no_branch(leerie, tmp_path, monkeypatch):
+    """full_purge=True removes the run directory — the run's own repository
+    (`<run-dir>/repo`) with it, which holds every branch of the run (DESIGN
+    §6 *The run's own repository*) — and runs no `git for-each-ref` or
+    `git branch -D`: nothing of the run is in the user's repository to
+    delete. It replaces the branch enumeration this test used to pin."""
     run_id = "feat-x-aaa111"
     run_dir = tmp_path / "runs" / run_id
-    run_dir.mkdir(parents=True)
+    (run_dir / "repo").mkdir(parents=True)
     st = _FakeState(run_id, run_dir)
-
-    branches_to_delete = [
-        f"leerie/runs/{run_id}",
-        f"leerie/subtasks/{run_id}/feat-001",
-    ]
     calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
-        if cmd[:2] == ["git", "for-each-ref"]:
-            # The cleanup walks two globs: refs/heads/leerie/runs/<id>
-            # (the run branch, exact match) and refs/heads/leerie/subtasks/<id>/
-            # (the subtask-branch prefix). Distinguish by the runs/ vs subtasks/
-            # segment so each glob returns the matching branch.
-            glob = cmd[3]
-            if glob == f"refs/heads/leerie/runs/{run_id}":
-                return subprocess.CompletedProcess(cmd, 0, f"leerie/runs/{run_id}\n", "")
-            if glob == f"refs/heads/leerie/subtasks/{run_id}/":
-                return subprocess.CompletedProcess(cmd, 0, f"leerie/subtasks/{run_id}/feat-001\n", "")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
     monkeypatch.setattr(leerie.subprocess, "run", fake_run)
 
     leerie._cleanup_on_abnormal_exit(st, full_purge=True)
 
-    delete_calls = [c for c in calls if c[:3] == ["git", "branch", "-D"]]
-    assert len(delete_calls) == 2, f"expected 2 branch deletes, got {delete_calls}"
+    assert not run_dir.exists()
+    assert [c for c in calls
+            if c[:2] == ["git", "for-each-ref"] or "-D" in c] == []
 
 
 # --- main() try/except/finally pinning -----------------------------------
@@ -367,7 +368,7 @@ def _main_body() -> str:
     """Extract main()'s body from leerie.py source."""
     src = LEERIE_PY.read_text()
     m = re.search(
-        r"^def main\(\) -> None:\n(.*?)(?=^(?:def |class |if __name__))",
+        r"^def main\(\) -> int \| None:\n(.*?)(?=^(?:def |class |@|if __name__))",
         src, re.DOTALL | re.MULTILINE,
     )
     assert m
@@ -772,13 +773,16 @@ def test_cleanup_skips_non_directory_entries_in_worktrees_dir(leerie, tmp_path,
     worktrees_dir = run_dir / "worktrees"
     worktrees_dir.mkdir(parents=True)
     (worktrees_dir / "stray.lock").write_text("not a directory")
+    # The run's own repository, where its worktrees are registered (DESIGN
+    # §6 *The run's own repository*); without one nothing is pruned.
+    _fake_run_repo(run_dir)
     st = _FakeState(run_id, run_dir)
 
     calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
-        if list(cmd)[:2] == ["git", "rev-parse"]:
+        if "rev-parse" in cmd:
             return subprocess.CompletedProcess(
                 cmd, 0, str(tmp_path / ".git") + "\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -786,7 +790,7 @@ def test_cleanup_skips_non_directory_entries_in_worktrees_dir(leerie, tmp_path,
 
     leerie._cleanup_on_abnormal_exit(st, full_purge=False)
 
-    remove_calls = [c for c in calls if c[:3] == ["git", "worktree", "remove"]]
+    remove_calls = [c for c in calls if "worktree" in c and "remove" in c]
     assert not remove_calls, (
         f"a non-directory entry under worktrees/ must never be passed to "
         f"`git worktree remove`: {calls}"
@@ -794,49 +798,6 @@ def test_cleanup_skips_non_directory_entries_in_worktrees_dir(leerie, tmp_path,
     # The file itself is untouched — the loop's `continue` skips it
     # entirely rather than attempting any removal.
     assert (worktrees_dir / "stray.lock").exists()
-
-
-def test_cleanup_full_purge_skips_failed_for_each_ref_and_blank_lines(
-        leerie, tmp_path, monkeypatch):
-    """Full-purge branch deletion must tolerate a `git for-each-ref` that
-    fails for one glob (nonzero exit — e.g. a corrupt or missing ref
-    namespace) by moving on to the next glob, and must skip blank lines
-    in a successful glob's stdout rather than passing an empty string to
-    `git branch -D`."""
-    run_id = "feat-x-aaa111"
-    run_dir = tmp_path / "runs" / run_id
-    run_dir.mkdir(parents=True)
-    st = _FakeState(run_id, run_dir)
-
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        if cmd[:2] == ["git", "for-each-ref"]:
-            glob = cmd[3]
-            if glob == f"refs/heads/leerie/runs/{run_id}":
-                # This glob fails outright (nonzero exit).
-                return subprocess.CompletedProcess(cmd, 1, "", "error")
-            if glob == f"refs/heads/leerie/subtasks/{run_id}/":
-                # Blank lines interleaved with one real ref must be
-                # skipped rather than turned into a `git branch -D ""`
-                # call.
-                return subprocess.CompletedProcess(
-                    cmd, 0,
-                    f"\nleerie/subtasks/{run_id}/feat-001\n\n", "")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
-
-    leerie._cleanup_on_abnormal_exit(st, full_purge=True)
-
-    delete_calls = [c for c in calls if c[:3] == ["git", "branch", "-D"]]
-    assert delete_calls == [
-        ["git", "branch", "-D", f"leerie/subtasks/{run_id}/feat-001"]
-    ], (
-        f"expected exactly one delete for the real ref, with the failed "
-        f"glob and blank lines both skipped: {delete_calls}"
-    )
 
 
 def test_prune_leerie_worktrees_removes_matching_stale_entry(leerie, tmp_path,
@@ -848,6 +809,9 @@ def test_prune_leerie_worktrees_removes_matching_stale_entry(leerie, tmp_path,
     falls under the given root."""
     leerie_root = tmp_path / "runs" / "feat-x-aaa111"
     leerie_root.mkdir(parents=True)
+    # The run's own repository, where its worktrees are registered (DESIGN
+    # §6 *The run's own repository*); without one nothing is pruned.
+    _fake_run_repo(leerie_root)
     worktree_path = leerie_root / "worktrees" / "feat-001"
     worktree_path.mkdir(parents=True)
 
@@ -857,10 +821,10 @@ def test_prune_leerie_worktrees_removes_matching_stale_entry(leerie, tmp_path,
     (entry_dir / "gitdir").write_text(str(worktree_path / ".git") + "\n")
 
     def fake_run(cmd, **kwargs):
-        if cmd[:2] == ["git", "rev-parse"]:
+        if "rev-parse" in cmd:
             return subprocess.CompletedProcess(
                 cmd, 0, str(git_common_dir) + "\n", "")
-        if cmd[:3] == ["git", "worktree", "prune"]:
+        if "prune" in cmd:
             # Real git emits this line on stderr, not stdout.
             return subprocess.CompletedProcess(
                 cmd, 0, "",
@@ -885,6 +849,9 @@ def test_prune_leerie_worktrees_leaves_out_of_scope_entry(leerie, tmp_path,
     specifically so leerie never touches registrations it doesn't own."""
     leerie_root = tmp_path / "runs" / "feat-x-aaa111"
     leerie_root.mkdir(parents=True)
+    # The run's own repository, where its worktrees are registered (DESIGN
+    # §6 *The run's own repository*); without one nothing is pruned.
+    _fake_run_repo(leerie_root)
 
     other_worktree = tmp_path / "elsewhere" / "not-ours"
     other_worktree.mkdir(parents=True)
@@ -895,10 +862,10 @@ def test_prune_leerie_worktrees_leaves_out_of_scope_entry(leerie, tmp_path,
     (entry_dir / "gitdir").write_text(str(other_worktree / ".git") + "\n")
 
     def fake_run(cmd, **kwargs):
-        if cmd[:2] == ["git", "rev-parse"]:
+        if "rev-parse" in cmd:
             return subprocess.CompletedProcess(
                 cmd, 0, str(git_common_dir) + "\n", "")
-        if cmd[:3] == ["git", "worktree", "prune"]:
+        if "prune" in cmd:
             return subprocess.CompletedProcess(
                 cmd, 0, "",
                 "Removing worktrees/not-ours: gitdir file points to "
@@ -917,8 +884,11 @@ def test_prune_leerie_worktrees_swallows_rev_parse_failure(leerie, tmp_path,
     """A failing (or timing-out) `git rev-parse --git-common-dir` must
     make the function decline silently rather than raise — pruning is
     best-effort housekeeping and must never take down the caller."""
+    # The run's own repository, where its worktrees are registered (DESIGN
+    # §6 *The run's own repository*); without one nothing is pruned.
+    _fake_run_repo(tmp_path)
     def fake_run(cmd, **kwargs):
-        if cmd[:2] == ["git", "rev-parse"]:
+        if "rev-parse" in cmd:
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
         raise AssertionError(f"unexpected call: {cmd}")
     monkeypatch.setattr(leerie.subprocess, "run", fake_run)

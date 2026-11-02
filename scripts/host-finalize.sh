@@ -6,7 +6,7 @@
 # push/PR mechanics — the discovery of *which* run to finalize differs.
 #
 # Exports: host_finalize <run-dir>, host_prepush_preflight <repo> <branch>,
-#          host_base_freshness_check <repo>
+#          host_base_freshness_check <repo>, host_bring_back_run_branch <run-dir>
 #
 # Inputs (env or args):
 #   $1                — absolute path to .leerie/runs/<run-id>/
@@ -404,12 +404,141 @@ host_base_freshness_check() {
   return 0
 }
 
+# host_bring_back_run_branch <run-dir> — bring `leerie/runs/<id>` back from
+# the run's own repository (`<run-dir>/repo`, DESIGN §6 *The run's own
+# repository*) into $USER_REPO: the one ref of the run the user receives.
+# leerie's own git, so hooks off, no FETCH_HEAD and no auto-maintenance in
+# the user's repository. A compare-and-swap: the user's ref is moved only
+# when it is absent and nothing was ever brought back, or when it is still
+# at the commit leerie last brought back (`run.json` `brought_back_sha`) —
+# so a finalize rebase, or the user's own change to the ref, is never
+# undone — and only as a fast-forward: the run's tip must descend from the
+# user's current ref (review round 17 H1). The run's tip is recorded as
+# `brought_back_sha`. A run with no repository of its own (made before
+# per-run repositories, or a remote run whose branch `fetch_branch` brings)
+# is a no-op. Returns 1 when the fetch or the update fails, 2 when the swap
+# was refused while the run's tip is not what was last brought back (its
+# newest commits are then in no ref of the user's), else 0.
+host_bring_back_run_branch() {
+  local run_dir="$1"
+  local repo="$run_dir/repo"
+  local run_json="$run_dir/run.json"
+  [ -f "$repo/HEAD" ] || return 0
+  local run_id branch tip recorded current
+  run_id="$(basename "$run_dir")"
+  branch="leerie/runs/$run_id"
+  # Named, never discovered: git refuses to find a bare repository from a
+  # path under safe.bareRepository=explicit (review round 17 M3).
+  tip="$(git --git-dir="$repo" rev-parse --verify -q "refs/heads/$branch^{commit}" 2>/dev/null || true)"
+  [ -n "$tip" ] || return 0
+  recorded=""
+  if [ -f "$run_json" ]; then
+    recorded="$(jq -r '.brought_back_sha // ""' "$run_json")"
+  fi
+  current="$(git -C "$USER_REPO" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null || true)"
+  if [ "$current" = "$tip" ]; then
+    [ -f "$run_json" ] && [ "$recorded" != "$tip" ] \
+      && _host_finalize_update_run_json "$run_json" "brought_back_sha=$tip"
+    return 0
+  fi
+  if [ "$current" != "$recorded" ]; then
+    echo "[leerie] bring-back: $branch in your repository is at ${current:-(absent)}, not the commit leerie last brought back (${recorded:-none}) — leaving it as it is; the run's branch is at $tip in $repo" >&2
+    # 2: the run has commits that are in no ref of yours — a caller about
+    # to delete the run's repository must keep it.
+    [ "$tip" = "$recorded" ] && return 0
+    return 2
+  fi
+  local incoming="refs/leerie/incoming/$run_id"
+  if ! git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch --quiet --no-tags \
+      --no-write-fetch-head --no-auto-maintenance --no-recurse-submodules \
+      "$repo" "+refs/heads/$branch:$incoming"; then
+    echo "[leerie] bring-back: could not fetch $branch from $repo" >&2
+    return 1
+  fi
+  # Only a fast-forward of what was brought back (review round 17 H1): the
+  # user may have pushed or built on it, and a tip that does not descend
+  # from it — a rebuilt run repository, a run rewound after a crash — must
+  # not replace it. Its commits stay in the run's repository (rc 2: prune
+  # keeps the run).
+  if [ -n "$current" ] && ! git -C "$USER_REPO" merge-base --is-ancestor \
+       "$current" "$tip" 2>/dev/null; then
+    git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref -d "$incoming" 2>/dev/null || true
+    echo "[leerie] bring-back: the run's branch at $tip does not descend from $branch in your repository ($current) — leaving it; the run's branch is in $repo" >&2
+    return 2
+  fi
+  # `$current` is empty when the ref is absent: update-ref then insists it
+  # still is.
+  if ! git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref \
+      -m "leerie: bring back $branch" "refs/heads/$branch" "$tip" "$current"; then
+    git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref -d "$incoming" 2>/dev/null || true
+    echo "[leerie] bring-back: $branch moved while it was brought back — leaving it" >&2
+    return 1
+  fi
+  git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref -d "$incoming" 2>/dev/null || true
+  [ -f "$run_json" ] && _host_finalize_update_run_json "$run_json" "brought_back_sha=$tip"
+  echo "[leerie] bring-back: $branch is at $tip in your repository" >&2
+  return 0
+}
+
+# host_apply_captured_deps <run-dir> — write the dependency captures a run
+# recorded (`<run-dir>/captured-deps.json`) into $USER_REPO/.leerie/config.toml
+# (DESIGN §6½ *The host applies a capture*). The container never writes the
+# user's checkout, which it mounts read-only (§6 *The explicit channel*), so
+# this is where a capture reaches it: the orchestrator's own merge
+# (`apply_captured_deps`), loaded by path in host python3 like the rebaser's
+# seam, against the config as it is now. A no-op without the file; applied
+# entries move to captured-deps.applied.json, so a second call is a no-op.
+# Never fails its caller.
+host_apply_captured_deps() {
+  local run_dir="$1"
+  [ -f "$run_dir/captured-deps.json" ] || return 0
+  python3 -I - "$run_dir" "$USER_REPO" "$LEERIE_REPO/orchestrator/leerie.py" \
+      <<'PY' >&2 || echo "[leerie] capture: could not apply $run_dir/captured-deps.json; it is kept" >&2
+import importlib.util, pathlib, sys
+
+run_dir, user_repo, orch_path = (pathlib.Path(a) for a in sys.argv[1:4])
+spec = importlib.util.spec_from_file_location("leerie_orch", orch_path)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.apply_captured_deps(run_dir, user_repo)
+PY
+  return 0
+}
+
+# _host_finalize_rebase_repo <dir> <run-branch> <pr-base-branch> — the
+# rebaser's own bare repository at <dir>: a `--shared` single-branch clone
+# of $USER_REPO holding the run branch, with no remote (the clone's would be
+# $USER_REPO), and the user's local and remote-tracking PR base. The user's
+# repository-local config — its `origin`, the user's real remote, among it —
+# is carried in by `run_rebaser` (`_carry_repo_config`), in the one python
+# seam this step already runs. Returns non-zero when it cannot be made; the
+# caller then skips the rebase, as it always has for a worktree it could not
+# create.
+_host_finalize_rebase_repo() {
+  local dir="$1" branch="$2" base="$3"
+  git clone --quiet --bare --shared --no-tags --single-branch \
+    --branch "$branch" "$USER_REPO" "$dir" >/dev/null 2>&1 || return 1
+  git --git-dir="$dir" remote remove origin >/dev/null 2>&1 || return 1
+  local ref
+  for ref in "refs/heads/$base" "refs/remotes/origin/$base"; do
+    if git -C "$USER_REPO" rev-parse --verify -q "$ref" >/dev/null 2>&1; then
+      git --git-dir="$dir" -c core.hooksPath=/dev/null fetch --quiet --no-tags \
+        --no-write-fetch-head "$USER_REPO" "+$ref:$ref" >/dev/null 2>&1 \
+        || return 1
+    fi
+  done
+  return 0
+}
+
 host_finalize() {
   local run_dir="$1"
   if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
     echo "host_finalize: missing or invalid <run-dir>: $run_dir" >&2
     return 1
   fi
+  # The run branch lives in the run's own repository until it is brought
+  # back; every finalize path reads it from the user's repository below.
+  host_bring_back_run_branch "$run_dir" || true
 
   local run_json="$run_dir/run.json"
   local state_json="$run_dir/state.json"
@@ -480,8 +609,8 @@ host_finalize() {
   # Fail-open: if state.json is absent or its wave fields are non-numeric,
   # do NOT block — a legitimately complete run must never be refused over a
   # missing/unreadable file. The cleared-but-empty terminal state
-  # (waves==[]) sets no_push=true and already returned above; even if it
-  # reached here, `0 < len([])` is false, so it is not blocked.
+  # (waves==[]) normally returns at the no_push gate above; when it reaches
+  # here, `0 < len([])` is false, so it is not blocked.
   if [ -f "$state_json" ]; then
     local _no_work _completed _wave_total
     _no_work="$(jq -r '.no_work_required // false' "$state_json" 2>/dev/null)"
@@ -525,9 +654,9 @@ host_finalize() {
   # cleared-but-empty terminal state (DESIGN §8 — no setup-run.sh
   # ran, so no branch was created). Treat it as a no-op rather than
   # attempting a `git push` that will fail with `src refspec ... does
-  # not match any`. Upstream callers (fetch-branch.sh's stripper and
-  # the finalize stripper in `leerie`) already preserve no_push=true
-  # for this case; this guard backstops them.
+  # not match any`. Nothing upstream rewrites `run.json.no_push`
+  # (DESIGN §6 *One push choice per run, on every runtime*); this guard is
+  # what keeps a branchless run from being pushed.
   if ! git -C "$USER_REPO" rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
     echo "[leerie] finalize: run branch $run_branch absent locally; treating as no-op" >&2
     return 0
@@ -587,10 +716,20 @@ host_finalize() {
        >/dev/null 2>&1 || \
      git -C "$USER_REPO" ls-remote --exit-code --heads origin \
        "$pr_base_branch" >/dev/null 2>&1; then
-    local _rebase_scratch _rebase_worktree
+    local _rebase_scratch _rebase_worktree _rebase_repo
     _rebase_scratch="$(mktemp -d)"
     _rebase_worktree="$_rebase_scratch/rebase-${run_id}"
-    if git -C "$USER_REPO" worktree add "$_rebase_worktree" "$run_branch" \
+    # The rebaser's own repository (DESIGN §6 *The run's own repository*):
+    # a worker never gets a linked worktree of the user's repository, whose
+    # refs, stash and config it would share. Host-side and gone with this
+    # function, so it may borrow the user's objects (`--shared`). Its `origin`
+    # is the user's, carried by the same config rule as the run's repository;
+    # the user's last-fetched view of the PR base comes along.
+    _rebase_repo="$_rebase_scratch/rebase-${run_id}.git"
+    if _host_finalize_rebase_repo "$_rebase_repo" "$run_branch" \
+         "$pr_base_branch" && \
+       git --git-dir="$_rebase_repo" -c core.hooksPath=/dev/null worktree add \
+         "$_rebase_worktree" "$run_branch" \
          >/dev/null 2>&1; then
       echo "[leerie] finalize: attempting rebase of $run_branch onto $pr_base_branch" >&2
       # Write the python3 seam to a script file rather than a heredoc so the
@@ -647,7 +786,7 @@ PY
       # outright — measured, it broke 20 of 32 tests in
       # tests/test_host_finalize_sh.py, none of them about the rebase. `( … )`
       # restores the containment without restoring the shared channel.
-      ( python3 "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
+      ( python3 -I "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
           "$USER_REPO" "$run_id" "$_rebase_worktree" "$run_branch" \
           "$working_branch" "$pr_base_branch" \
           "$LEERIE_REPO/orchestrator/leerie.py" "$_rebaser_out" \
@@ -673,10 +812,21 @@ PY
       # "rebased" claim always has a scratch-ref snapshot available; unused
       # scratch refs are deleted below.
       local _rebase_scratch_ref="refs/leerie-rebase-scratch/${run_id}"
-      git -C "$USER_REPO" fetch "$_rebase_worktree" \
+      git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch \
+        --no-write-fetch-head --no-auto-maintenance "$_rebase_worktree" \
         "HEAD:$_rebase_scratch_ref" --force >/dev/null 2>&1 || true
-      git -C "$USER_REPO" worktree remove --force "$_rebase_worktree" \
-        >/dev/null 2>&1 || true
+      # The PR base as the rebaser fetched it: the one remote-tracking ref
+      # finalize reads afterwards (`working_branch=origin/<base>` below).
+      # It used to reach the user's repository through the shared worktree.
+      if [ "$_rebaser_status" = "rebased" ] && git --git-dir="$_rebase_repo" \
+           rev-parse --verify -q "refs/remotes/origin/$pr_base_branch" \
+           >/dev/null 2>&1; then
+        git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch --quiet \
+          --no-tags --no-write-fetch-head --no-auto-maintenance \
+          "$_rebase_repo" \
+          "+refs/remotes/origin/$pr_base_branch:refs/remotes/origin/$pr_base_branch" \
+          >/dev/null 2>&1 || true
+      fi
       rm -rf "$_rebase_scratch" 2>/dev/null || true
 
       case "$_rebaser_status" in
@@ -903,7 +1053,7 @@ $(printf '%s' "$push_all" | tail -c 4000)"
       # `push_stderr` in the guard above, which is what keeps the corpus
       # score intact. It reads `push_hook_out` rather than `push_all` so the
       # section marker's own "pre-push hook" text cannot be matched first.
-      _hook_name="$(printf '%s\n%s' "$push_stderr" "$push_hook_out" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | head -1 || true)"
+      _hook_name="$(printf '%s\n%s' "$push_stderr" "$push_hook_out" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | sed -n 1p || true)"
       echo "  This looks like a failing git hook (${_hook_name:-pre-push} failed) rather than a push/auth/network problem." >&2
       # WHICH TREE the hook measured is the fact that ends the confusion,
       # and nothing used to say it. git runs pre-push in the repo root
@@ -1051,41 +1201,19 @@ EOF
       pr_body="$pr_body$deploy_note"
     fi
 
-    # Residual-risk section (DESIGN §9 *Self-reported risk is routed, not
-    # read*; DESIGN §6 *The residual-risk section is appended by code on
-    # every composition path*). Mirror of _format_risk_register_section
-    # (orchestrator/leerie.py) — keep format-identical, like the cost line.
-    # Lives INSIDE the fallback branch only: on the pr_writer path the
-    # orchestrator already appended the section to run.json's pr_body, so
-    # appending here too would render it twice. jq emits nothing when the
-    # register is absent/empty; `2>/dev/null || true` keeps a missing or
-    # unreadable state.json from aborting finalize under `set -euo
-    # pipefail`.
-    local risk_note
-    risk_note="$(jq -r '
-      (.subtask_status // {} | if type == "object" then . else {} end) as $statuses
-      | (.accepted_blocked // {} | if type == "object" then . else {} end) as $accepted
-      | (.risk_register // {} | if type == "object" then . else {} end)
-      | [to_entries[] | .key as $sid
-         | select(($statuses[$sid] // "") != "blocked"
-                  and ($accepted | has($sid) | not))
-         | (.value | if type == "array" then . else [] end)[]
-         | select(type == "object")
-         | "- **" + $sid + "** [" + ((.kind // "risk") | tostring) + "] "
-           + ((.detail // "") | tostring)
-           + (if ((.where // "") | tostring) != ""
-              then " (" + ((.where // "") | tostring) + ")" else "" end)
-           + " — " + (if .addressed == true
-                      then "addressed (" + ((.disposition // "") | tostring) + ")"
-                      elif ((.disposition // "") | tostring) != ""
-                      then ((.disposition) | tostring) + ", not cleared"
-                      else "unaddressed" end)]
-      | select(length > 0)
-      | "\n## ⚠ Residual risks\n\nSelf-reported by workers; entries cleared by a verifiable act during conformance are annotated addressed. Full entries in state.json `risk_register`.\n\n"
-        + join("\n")
-    ' "$state_json" 2>/dev/null || true)"
-    if [ -n "$risk_note" ]; then
-      pr_body="$pr_body$risk_note"
+    # End-state section (DESIGN §6 *The PR's end-state section is rendered
+    # by code, from typed state*). The orchestrator renders it once at
+    # finalize (`_format_pr_end_state_section`) and writes it to run.json as
+    # `pr_end_state`; this fallback appends that text as-is, so there is no
+    # second renderer to keep in sync. INSIDE the fallback branch only: on
+    # the pr_writer path the orchestrator already appended it to pr_body.
+    # `2>/dev/null || true` keeps a missing or unreadable run.json from
+    # aborting finalize under `set -euo pipefail`.
+    local end_state
+    end_state="$(jq -r '.pr_end_state // "" | strings' "$run_json" 2>/dev/null || true)"
+    if [ -n "$end_state" ]; then
+      pr_body="$pr_body
+$end_state"
     fi
   fi
 
@@ -1111,7 +1239,16 @@ EOF
     fi
   fi
 
-  echo "[leerie] finalize: opening PR against $pr_base_branch" >&2
+  # An `unconverged` run (DESIGN §6 *The run outcome is decided once*) still
+  # opens its PR — it carries everything that did converge — but as a draft,
+  # so it cannot be mistaken for finished work.
+  # A plain string, not an array: an empty array under `set -u` is an
+  # unbound variable on macOS's bash 3.2.
+  local pr_draft=""
+  if [ "$(jq -r '.outcome // ""' "$run_json")" = "unconverged" ]; then
+    pr_draft="--draft"
+  fi
+  echo "[leerie] finalize: opening ${pr_draft:+draft }PR against $pr_base_branch" >&2
   local pr_output pr_ok=false
   # GitHub's API may not have indexed the freshly-pushed refs yet;
   # retry with backoff to ride out the race (symptom: "Head sha
@@ -1125,6 +1262,7 @@ EOF
       sleep "$_pr_delay"
     }
     if pr_output="$(echo "$pr_body" | gh pr create \
+                      ${pr_draft:+"$pr_draft"} \
                       --base "$pr_base_branch" \
                       --head "$run_branch" \
                       --title "$pr_title" \

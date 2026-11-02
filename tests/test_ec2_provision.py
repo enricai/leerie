@@ -574,9 +574,11 @@ def test_no_profile_means_no_profile_retry(tmp_path):
     assert "--iam-instance-profile" not in (aws_dir / "attempts.log").read_text()
 
 
-@pytest.mark.parametrize("no_push,expected", [("true", True), ("false", False), ("", False)])
-def test_sidecar_records_the_launch_time_no_push_intent(tmp_path, no_push, expected):
-    # decide_ec2_teardown reads this; the fetched run.json cannot carry it.
+@pytest.mark.parametrize("no_push", ["true", "false", ""])
+def test_sidecar_carries_no_push_choice(tmp_path, no_push):
+    # DESIGN §6 *One push choice per run, on every runtime*: the choice lives
+    # in run.json.no_push alone, recorded by the orchestrator. The sidecar
+    # is not a second owner, whatever this launcher's NO_PUSH holds.
     aws_dir = tmp_path / "bin"
     _stub_aws(aws_dir)
     state_host_dir = tmp_path / "state"
@@ -587,4 +589,6 @@ def test_sidecar_records_the_launch_time_no_push_intent(tmp_path, no_push, expec
                               "LEERIE_RUN_ID": "run-np1", "NO_PUSH": no_push})
     result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
     assert result.returncode == 0, result.stderr
-    assert json.loads((run_dir / "ec2-instance.json").read_text())["host_no_push"] is expected
+    sidecar = json.loads((run_dir / "ec2-instance.json").read_text())
+    assert sidecar["ec2_instance_id"] and sidecar["run_id"] == "run-np1"
+    assert not any("push" in k for k in sidecar)

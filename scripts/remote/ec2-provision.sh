@@ -234,11 +234,6 @@ _decide_ec2_teardown_body() {
             remote_log "remote: run 'leerie finalize $_rid' to push and open a PR after the run completes"
           fi
           terminate_instance
-        elif [ -n "$run_dir" ] && [ -d "$run_dir" ] \
-             && [ "$(remote_host_no_push "$run_dir/ec2-instance.json")" = "true" ]; then
-          remote_log "auto-finalize: --no-push was set at launch; run branch left on the host, no push or PR"
-          remote_log "remote: run 'leerie finalize $_rid' to push and open a PR later"
-          terminate_instance
         elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
           local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
           if [ -f "$_leerie_dir/scripts/host-finalize.sh" ]; then
@@ -369,7 +364,7 @@ wait_for_instance_ready() {
   while true; do
     local describe_out state
     describe_out="$(aws ec2 describe-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
-    state="$(printf '%s' "$describe_out" | python3 -c '
+    state="$(printf '%s' "$describe_out" | python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -397,7 +392,7 @@ except (ValueError, KeyError, IndexError):
   while true; do
     local status_out instance_status system_status statuses
     status_out="$(aws ec2 describe-instance-status --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
-    statuses="$(printf '%s' "$status_out" | python3 -c '
+    statuses="$(printf '%s' "$status_out" | python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -498,13 +493,13 @@ provision_instance() {
          --output json \
          2>&1)"; then
       instance_id="$(printf '%s' "$create_output" \
-                      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Instances"][0]["InstanceId"])' \
+                      | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d["Instances"][0]["InstanceId"])' \
                       2>/dev/null || true)"
       break
     fi
     if [ -n "$instance_profile" ] && [ "$_iam_waited" -lt "$_iam_budget" ] \
-       && printf '%s' "$create_output" | grep -q '(InvalidParameterValue)' \
-       && printf '%s' "$create_output" | grep -q 'iamInstanceProfile'; then
+       && grep -qF '(InvalidParameterValue)' < <(printf '%s\n' "$create_output") \
+       && grep -qF 'iamInstanceProfile' < <(printf '%s\n' "$create_output"); then
       remote_log "remote: instance profile $instance_profile not visible to EC2 yet; retrying (${_iam_waited}s/${_iam_budget}s)"
       sleep "$_iam_step"
       _iam_waited=$((_iam_waited + (_iam_step > 0 ? _iam_step : 1)))
@@ -563,20 +558,15 @@ provision_instance() {
     local remote_dir="$_state_base/remote"
     mkdir -p "$remote_dir" 2>/dev/null || true
     local pid_record="$remote_dir/$$.json"
-    # host_no_push: the user's launch-time --no-push intent, which the
-    # fetched run.json cannot carry (fetch_state_ec2 strips no_push=true
-    # whenever a run branch exists); decide_ec2_teardown reads it here.
-    # Same field fly-machine.json records for Fly.
-    python3 - "$pid_record" "$instance_id" "${LEERIE_AWS_REGION:-${AWS_REGION:-}}" "${LEERIE_RUN_ID:-}" "$$" "${NO_PUSH:-false}" <<'PY'
+    python3 -I - "$pid_record" "$instance_id" "${LEERIE_AWS_REGION:-${AWS_REGION:-}}" "${LEERIE_RUN_ID:-}" "$$" <<'PY'
 import json, sys, datetime
-path, iid, region, run_id, pid, no_push = sys.argv[1:]
+path, iid, region, run_id, pid = sys.argv[1:]
 data = {
     "ec2_instance_id": iid,
     "region": region or None,
     "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     "run_id": run_id or None,
     "launcher_pid": int(pid),
-    "host_no_push": no_push in ("true", "1", "yes"),
 }
 with open(path, "w") as f:
     json.dump(data, f, indent=2)

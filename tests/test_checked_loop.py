@@ -13,6 +13,8 @@ import asyncio
 
 import pytest
 
+from tests.conftest import register_worker_transcript
+
 
 # --- _format_check_feedback ---------------------------------------------- #
 
@@ -139,7 +141,7 @@ def test_loop_crash_breaks(leerie):
     assert "crashed" in warnings[0]
 
 
-# --- WorkerError crash retry (DESIGN §12 *salvage if there is something to
+# --- WorkerError crash retry (DESIGN §7 *salvage if there is something to
 # salvage*) -------------------------------------------------------------------
 # A PID-exhausted / OOM-killed worker is an infrastructure failure, not a
 # verdict about the work. `_read_stream`'s own PID-cap message promises "a
@@ -748,8 +750,10 @@ def test_loop_log_path_malformed_envelope_forces_a_retry(leerie, tmp_path):
             log_path.write_text(_user_event(
                 'Unexpected parameter "Bash": {"command": "ls"} is not '
                 "valid for this tool", is_error=True))
+            register_worker_transcript(log_path)
         else:
             log_path.write_text(_user_event("ls: fine", is_error=False))
+            register_worker_transcript(log_path)
         return {"n": calls[0]}
 
     result, warnings = _run(leerie._run_checked_loop(

@@ -48,12 +48,14 @@ set -euo pipefail
 
 # shellcheck source=scripts/worktree-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
 
 RUN_ID="${1:?usage: planning-worktree.sh <run-id> [<working-branch>]}"
 REQUESTED_BRANCH="${2:-}"
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
 RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"
-WT="${RUN_DIR}/worktrees/planning"
+WT="${RUN_DIR}/worktrees/$(leerie_worktree_name "$RUN_ID" planning)"
 
 # `git worktree list --porcelain` prints absolute, symlink-resolved paths, so
 # $WT must be in that shape before the reuse grep. Same normalization as
@@ -64,7 +66,7 @@ case "$WT" in
   *)  WT="$(pwd -P)/$WT" ;;
 esac
 
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if ! leerie_repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "error: not inside a git repository" >&2
   exit 1
 fi
@@ -78,43 +80,55 @@ fi
 # branch's name.
 TARGET_REF="HEAD"
 if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
-  if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
+  if leerie_repo_git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
     TARGET_REF="refs/heads/${REQUESTED_BRANCH}"
   elif [ "${REQUESTED_BRANCH#heads/}" != "$REQUESTED_BRANCH" ] \
-     && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
+     && leerie_repo_git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
     TARGET_REF="refs/heads/${REQUESTED_BRANCH#heads/}"
   elif [ "${REQUESTED_BRANCH#refs/heads/}" != "$REQUESTED_BRANCH" ] \
-     && git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
+     && leerie_repo_git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
     TARGET_REF="$REQUESTED_BRANCH"
   else
     echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
   fi
 fi
-TARGET_SHA="$(git rev-parse "$TARGET_REF")"
+TARGET_SHA="$(leerie_repo_git rev-parse "$TARGET_REF")"
 
 mkdir -p "${RUN_DIR}/worktrees"
+
+# The same repository-wide lock as new-worktree.sh: this script runs while
+# the run's own subtask worktrees are being added, and against other runs.
+leerie_repo_lock
+
+# Scoped prune (never a bare `git worktree prune`): the repo's .git is shared
+# with the host and other containers, and a repository-global prune destroys
+# registrations whose paths this namespace cannot see. THIS run only.
+#
+# ORDER IS LOAD-BEARING: prune BEFORE the orphan check, as new-worktree.sh
+# does. A prune is itself what orphans a directory (it drops the admin entry
+# and leaves the directory); pruning after the check let `worktree add` hit
+# the directory the prune had just orphaned ("already exists").
+prune_leerie_worktrees "${RUN_DIR}"
 
 # Drop an orphaned directory git no longer knows about. Same failure mode
 # setup-run.sh documents: a SIGKILLed container leaves the directory without
 # its admin entry, and `worktree add` then refuses with "already exists" on
 # every subsequent resume. Neither `prune` nor `--force` covers it.
-if ! git worktree list --porcelain | grep -qxF "worktree $WT" && [ -d "$WT" ]; then
-  rm -rf "$WT"
+# `git worktree list` is captured before grep reads it: piped into `grep -q`
+# under `pipefail` it SIGPIPEs past 4 KiB and reads as "not registered"
+# (new-worktree.sh).
+if ! grep -qxF "worktree $WT" <<<"$(leerie_repo_git worktree list --porcelain)" \
+    && [ -d "$WT" ]; then
+  leerie_rm_owned "$WT"
 fi
 
-# Scoped prune (never a bare `git worktree prune`): the repo's .git is shared
-# with the host and other containers, and a repository-global prune destroys
-# registrations whose paths this namespace cannot see.
-prune_leerie_worktrees "${LEERIE_ROOT}"
-
-if git worktree list --porcelain | grep -qxF "worktree $WT"; then
+if grep -qxF "worktree $WT" <<<"$(leerie_repo_git worktree list --porcelain)"; then
   # Reuse: force the tree back to the target and drop anything a
   # previous judgment worker left behind. --force because the checkout is
   # detached and may carry commits; that is expected and discarded.
-  git -C "$WT" reset --hard "$TARGET_SHA" >/dev/null
-  git -C "$WT" clean -fd >/dev/null
+  leerie_reset_worktree "$WT" "" "$TARGET_SHA" >/dev/null
 else
-  git worktree add --detach "$WT" "$TARGET_SHA" >/dev/null
+  leerie_repo_git worktree add --detach "$WT" "$TARGET_SHA" >/dev/null
 fi
 
 echo "planning-worktree: $(cd "$WT" && pwd)"

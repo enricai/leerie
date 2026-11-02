@@ -483,3 +483,109 @@ runtime_install_linux() {
   fi
   return 0
 }
+
+# --- public: the leerie-container AppArmor profile -----------------------
+#
+# DESIGN §6 *A held-out evaluation runs alone, in a world that dies with it
+# (I3)*, *What the runtime must allow*. Every local container runs under
+# `--security-opt apparmor=leerie-container` where the runtime's kernel runs
+# AppArmor: nerdctl-default plus exactly the mounts the confinement shim
+# makes in its own unprivileged user namespace. Loaded once by root; the file
+# under /etc/apparmor.d/ makes it persist across reboots. On macOS the
+# kernel is Colima's VM, reached through `colima ssh`.
+LEERIE_APPARMOR_PROFILE=leerie-container
+LEERIE_APPARMOR_DEST=/etc/apparmor.d/leerie-container
+# Where the kernel publishes its LSM list and its loaded profiles' names.
+# Variables, not literals, so a test can run the real probes below against a
+# fixture tree (tests/test_runtime_probes_pipefail.py).
+_RUNTIME_LSM_FILE=/sys/kernel/security/lsm
+_RUNTIME_AA_PROFILES_DIR=/sys/kernel/security/apparmor/policy/profiles
+
+# Run a command on the kernel the containers run on: the host, or Colima's VM.
+_runtime_on_kernel() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    colima ssh -- "$@"
+  else
+    "$@"
+  fi
+}
+
+# The probes below read what the kernel says into a variable and test it with
+# no pipe. Every caller runs them under `set -euo pipefail` (the launcher,
+# install.sh), where a pipeline's status is its worst member's: a consumer
+# that stops at its first match (`grep -q`) leaves the producer to die of
+# SIGPIPE on its next write, and the pipe then reads as "no" although the
+# answer was yes. Measured on Ubuntu (lsm `…,apparmor,ima,evm`; 164 profiles,
+# one `cat` write each): both probes returned false on every run, so the
+# launcher never passed `apparmor=leerie-container` and every local run died
+# at the confinement entry. The invariant: the launcher's runtime detection
+# gives the kernel's answer (DESIGN §6 *What the runtime must allow*).
+
+# 0 when the containers' kernel runs AppArmor.
+runtime_has_apparmor() {
+  local lsm
+  lsm="$(_runtime_on_kernel cat "$_RUNTIME_LSM_FILE" 2>/dev/null)" || return 1
+  case ",$lsm," in
+    *,apparmor,*) return 0 ;;
+  esac
+  return 1
+}
+
+# 0 when the profile is loaded AND the installed file is this checkout's
+# (a stale one lacks a rule a newer shim needs). The policy directory's
+# `name` files are readable without root; `apparmor/profiles` is not. A
+# `name` file that vanishes mid-read (a profile unloaded) makes `cat` exit
+# non-zero with every other name read, so its status is not the answer —
+# the names are.
+runtime_apparmor_current() {
+  local src="$1" names installed nl='
+'
+  names="$(_runtime_on_kernel sh -c \
+    "cat $_RUNTIME_AA_PROFILES_DIR/*/name 2>/dev/null; :")" || return 1
+  case "$nl$names$nl" in
+    *"$nl$LEERIE_APPARMOR_PROFILE$nl"*) ;;
+    *) return 1 ;;
+  esac
+  installed="$(_runtime_on_kernel cat "$LEERIE_APPARMOR_DEST" 2>/dev/null)" \
+    || return 1
+  [ "$installed" = "$(cat "$src")" ]
+}
+
+# The two commands that load it, for a message when we cannot run them.
+runtime_apparmor_hint() {
+  local src="$1"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    printf '    colima ssh -- sudo tee %s < %s > /dev/null\n' \
+      "$LEERIE_APPARMOR_DEST" "$src"
+    printf '    colima ssh -- sudo apparmor_parser -r -W %s\n' \
+      "$LEERIE_APPARMOR_DEST"
+  else
+    printf '    sudo install -m 0644 %s %s\n' "$src" "$LEERIE_APPARMOR_DEST"
+    printf '    sudo apparmor_parser -r -W %s\n' "$LEERIE_APPARMOR_DEST"
+  fi
+}
+
+# Install and load it (may prompt for sudo). Returns 1 with a printed error.
+runtime_install_apparmor() {
+  local src="$1"
+  if [ ! -f "$src" ]; then
+    _runtime_err "the AppArmor profile $src is missing from this install"
+    return 1
+  fi
+  _runtime_log "loading the $LEERIE_APPARMOR_PROFILE AppArmor profile"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    printf '  $ colima ssh -- sudo tee %s < %s\n' "$LEERIE_APPARMOR_DEST" "$src"
+    if [ "$DRY_RUN" = "false" ]; then
+      colima ssh -- sudo tee "$LEERIE_APPARMOR_DEST" < "$src" > /dev/null \
+        || return 1
+    fi
+    _runtime_run colima ssh -- sudo apparmor_parser -r -W \
+      "$LEERIE_APPARMOR_DEST" || return 1
+  else
+    _runtime_run sudo install -m 0644 "$src" "$LEERIE_APPARMOR_DEST" \
+      || return 1
+    _runtime_run sudo apparmor_parser -r -W "$LEERIE_APPARMOR_DEST" \
+      || return 1
+  fi
+  return 0
+}

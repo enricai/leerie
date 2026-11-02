@@ -172,7 +172,14 @@ def test_the_overwrite_runs_before_any_gate_that_can_break(leerie):
 def test_the_overwrite_is_applied_twice_per_round(leerie):
     """Once before the gates (from `pre`, which describes the tree a rollback
     path leaves behind) and once at the tail (from `post`). Dropping either
-    re-opens a path on which claimed axes reach a consumer."""
+    re-opens a path on which claimed axes reach a consumer; that substance is
+    driven per exit in tests/test_run_conformance_phase.py (`*_still_reports_
+    measured_axes`, `test_a_completed_round_reports_the_post_measurement`).
+
+    This count pins the shape that makes those exits safe by construction:
+    ONE pre-apply ahead of every exit, not one per exit. A third call is a
+    gate inserted between the dict and the overwrite, patched with its own
+    apply — the next exit added there would need its own too."""
     for fn in (leerie._run_conformance_phase, leerie._run_final_conformance):
         src = _strip_comments(inspect.getsource(fn))
         assert src.count("_apply_measured_axes") == 2, (

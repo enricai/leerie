@@ -74,7 +74,7 @@ _describe_instance_state() {
     < <(_aws_region_profile_args)
   local describe_out
   describe_out="$(aws ec2 describe-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
-  printf '%s' "$describe_out" | python3 -c '
+  printf '%s' "$describe_out" | python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)

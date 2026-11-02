@@ -6,7 +6,7 @@
 # bulk-upload roles are ec2-lib.sh's ec2_remote_exec / ec2_tar_pipe).
 #
 # Despite the file name, launch and attach go over SSH:
-#   ssh … ec2-user@<ip> "sudo -n python3 -"   (launch wrapper on stdin)
+#   ssh … ec2-user@<ip> "sudo -n python3 -I -"   (launch wrapper on stdin)
 #   ssh … ec2-user@<ip> "sudo -n sh -s"       (tail wrapper on stdin)
 # are the analogs of `flyctl ssh console --pty=false -C "python3 -"` /
 # `-C "sh -s"`. An SSM AWS-StartInteractiveCommand session cannot carry a
@@ -87,7 +87,7 @@ _ec2_ssm_shell() {
 # the instance via `python3 -`. Returns the wrapper's real exit code,
 # notably rc=75 (the flock-loser smart-resume pivot).
 ec2_launch_detached() {
-  _ec2_ssh_session "python3 -"
+  _ec2_ssh_session "python3 -I -"
 }
 
 # --- ec2_attach ----------------------------------------------------------

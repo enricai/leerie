@@ -141,3 +141,75 @@ def test_recipe_entries_have_required_fields(leerie, tmp_path):
         assert entry["working_dir"] == "."
         assert isinstance(entry["timeout_s"], int)
         assert entry["timeout_s"] > 0
+
+
+# --- independent package roots below the top (F4; DESIGN §6½ *One install
+# per independent package root*) ---------------------------------------------
+
+def _entries(recipe):
+    return [(e["working_dir"], e["command"]) for e in recipe]
+
+
+def test_each_nested_non_workspace_root_gets_its_own_install(leerie,
+                                                             tmp_path):
+    """The shape that killed 7 runs at the provision gate: a root pnpm
+    project plus `worker/` and `infra/` with their own lockfiles and no
+    workspace covering them."""
+    _make_files(tmp_path, ["pnpm-lock.yaml", "worker/pnpm-lock.yaml",
+                           "infra/pnpm-lock.yaml"])
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
+    assert _entries(recipe) == [
+        (".", ["pnpm", "install", "--frozen-lockfile"]),
+        ("infra", ["pnpm", "install", "--frozen-lockfile"]),
+        ("worker", ["pnpm", "install", "--frozen-lockfile"]),
+    ]
+    leerie._validate_provision_recipe(recipe)
+
+
+def test_workspace_members_are_not_separate_roots(leerie, tmp_path):
+    _make_files(tmp_path, ["pnpm-lock.yaml", "packages/a/pnpm-lock.yaml",
+                           "tools/x/pnpm-lock.yaml"])
+    (tmp_path / "pnpm-workspace.yaml").write_text(
+        "packages:\n  - 'packages/*'\n  # - 'tools/*'\n")
+    assert _entries(leerie._detect_recipe_from_lockfiles(tmp_path)) == [
+        (".", ["pnpm", "install", "--frozen-lockfile"]),
+        ("tools/x", ["pnpm", "install", "--frozen-lockfile"]),
+    ]
+
+
+def test_package_json_workspaces_and_exclusions(leerie, tmp_path):
+    import json
+    _make_files(tmp_path, ["yarn.lock", "apps/web/yarn.lock",
+                           "apps/legacy/package-lock.json",
+                           "apps/web/deep/yarn.lock"])
+    (tmp_path / "package.json").write_text(json.dumps(
+        {"workspaces": {"packages": ["apps/*", "!apps/legacy"]}}))
+    # `apps/*` stays within one segment, so apps/web/deep is its own root.
+    assert _entries(leerie._detect_recipe_from_lockfiles(tmp_path)) == [
+        (".", ["yarn", "install", "--frozen-lockfile"]),
+        ("apps/legacy", ["npm", "ci"]),
+        ("apps/web/deep", ["yarn", "install", "--frozen-lockfile"]),
+    ]
+
+
+def test_precedence_within_a_nested_root_and_node_modules_ignored(
+        leerie, tmp_path):
+    _make_files(tmp_path, ["svc/pnpm-lock.yaml", "svc/package-lock.json",
+                           "svc/node_modules/dep/package-lock.json",
+                           "node_modules/x/yarn.lock"])
+    assert _entries(leerie._detect_recipe_from_lockfiles(tmp_path)) == [
+        ("svc", ["pnpm", "install", "--frozen-lockfile"]),
+    ]
+
+
+def test_in_a_git_repo_only_tracked_lockfiles_count(leerie, tmp_path):
+    """An untracked nested lockfile (a scratch checkout, a build output) is
+    not part of the project."""
+    import subprocess
+    _make_files(tmp_path, ["pnpm-lock.yaml", "worker/pnpm-lock.yaml",
+                           "scratch/pnpm-lock.yaml"])
+    for args in (["init", "-q"], ["add", "pnpm-lock.yaml",
+                                  "worker/pnpm-lock.yaml"]):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True)
+    assert [d for d, _ in _entries(
+        leerie._detect_recipe_from_lockfiles(tmp_path))] == [".", "worker"]

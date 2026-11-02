@@ -24,8 +24,9 @@ result without further human input except where input is genuinely
 impossible to derive. Every loop is bounded, every decision is made from the
 codebase or research, and state is kept on disk so a run is observable and
 resumable. Every worker — judgment and workhorse alike — runs on Sonnet 5 (§12
-*Opus-judgment, sonnet-workhorse (historical) — now sonnet for both*); a
-many-worker graph stays cheap against a subscription instead of accumulating
+*Opus-judgment, sonnet-workhorse (historical) — now sonnet for both*), with
+one exception: `pr_reviewer`, the advisory whole-PR review that never gates,
+runs on Opus (§12); a many-worker graph stays cheap against a subscription instead of accumulating
 per-call API charges the way a fleet of Opus-tier agents would.
 
 **On the term "graph engineering."** Leerie's task graph is literal, not
@@ -62,6 +63,17 @@ process; the program owns all control flow. Subagent nesting is impossible
 because there are no subagents, only independent OS processes. Control-flow
 drift is impossible because the orchestrator is real loops and
 conditionals, not a model interpreting instructions.
+
+The workers themselves are headless CLI sessions whose tool surface code
+fixes: `--disallowedTools` removes every tool that would start work the
+orchestrator cannot see (subagents under both the live `Task` and the
+retired `Agent` name, messages, timers, workflows, task lists and output
+readers). One task tool stays: `TaskStop`. It acts only on the calling
+session's own background commands — a foreign task ID gets "No task found"
+— so it gives a worker no reach beyond itself, and it is the sanctioned way
+for a worker to stop its own `run_in_background` command instead of a
+pattern kill that reaches its siblings (§9 *A worker never kills a process
+by name*).
 
 **Why a headless CLI process, not an API library.** The CLI binary runs on
 the interactive Claude Code subscription with only the CLI as a
@@ -322,6 +334,20 @@ subtask it tests). Three mechanisms reconcile that coupling:
   all, and for defects with a single obvious location and no repeated
   or multi-candidate structure.
 
+  **`applicable: false` is honoured only when three samples agree.** A
+  false answer is drawn again — up to `applicability_samples` (3)
+  independent samples in all, a crashed sample being no vote and drawn
+  again within two extra attempts — and the first `applicable: true`
+  sample is the one used; false stands only when every sample cast says
+  so, and when crashes use up the attempts first, on the votes cast.
+  Measured (Q5/N1, production-faithful strict decoding, 9 audits whose
+  task was a real open defect): the single sample said false on 8, the
+  3/3 rule on 3 (rescued 5 of 8), and on 5 not-needed tasks the rule
+  turned no correct false into a true (0/5). The false that survives is
+  stable, not sampling noise — it is judgment ("feature build, not a
+  defect fix") — which is why the held-out sets no longer depend on it
+  (§8: they are written whenever the audit ran).
+
   **Report-named ground truth is extracted and mechanically
   checked.** A data-triggered report pins its defect to evidence
   outside the repository — a capture archive, a configuration file, a
@@ -408,7 +434,9 @@ subtask it tests). Three mechanisms reconcile that coupling:
   requirements; the `site_tokens` back an advisory, never gating,
   diff check after integration — measured precision 100% but recall
   only 1 of 3 leaking commits across 36 shipped commits, because a
-  leak already present in the base tree hides later ones.
+  leak already present in the base tree hid later ones. That skip is
+  gone; the hits are now evidence for the delivery judge (§8 *Typed
+  evidence for the delivery judge*).
 
   **Every site carries a disposition.** Listing a site is not deciding
   it. The dominant cause of serial narrow fixing — 5 of 11 historical
@@ -431,6 +459,60 @@ subtask it tests). Three mechanisms reconcile that coupling:
   was tried and dropped: it caught every missed site but at 16%
   precision — on long site lists it defaulted to "unfixed" instead of
   reading the code.
+
+  **Every `fix` site is claimed, with how it is resolved.** Covering a
+  site's *file* is not resolving the site. Measured on a chain whose
+  first run's plan covered every audited file: the audit's fix for one
+  decision site was "re-run the whole flow from the top" on the losing
+  path of a race, the plan's subtask re-raised the error instead, and
+  the defect shipped and was re-planned by later runs. So each
+  audited site carries a code-assigned `site_id` (`D1`, `D2`, … in
+  audit order — Python assigns IDs only) and, when disposed `fix`, a
+  typed `resolution_kind` (`rerun_flow`, `reraise`, `relink`, `guard`,
+  `recompute`, `propagate`, `other`) with a one-sentence `resolution`.
+  Every planner subtask carries a typed `change_kind` (`fix`, `test`,
+  `docs`, `other`) and, per site it changes, a claim listing every
+  resolution kind its change applies there. Only `change_kind: fix`
+  subtasks' claims count. The check is set arithmetic on those typed
+  fields, against an equivalence table that is a code constant: the
+  error-handling kinds `rerun_flow`, `reraise` and `relink` each stay
+  their own class (that is where the measured chain broke), while
+  `guard`, `recompute` and `propagate` form one class (threading a
+  value into a decision, recomputing it and tightening its predicate
+  are routinely one edit described three ways). `other` contradicts
+  nothing — an `other` on either side never makes a mismatch — but the
+  site is recorded as resting on an untyped resolution, for the PR. A
+  `fix` site that no fix subtask claims needs either a claim or a typed
+  `sites_not_needed` entry (`{site_id, reason}`); one claimed only with
+  kinds outside the audit's class is a mismatch. Recursive decomposition
+  (§5½) re-homes a split subtask into children; every child — code-built
+  or written by the splitter, whose schema has no claims — carries its
+  parent's `change_kind` and claims, stamped by code, and the record is
+  re-derived over the leaves so a claim names a subtask that exists. Both are fed back to
+  the bug-fixing planner through its mechanical-check loop — the
+  planner either implements the audit's resolution or, only with code
+  evidence the audit is wrong, keeps its own and says so. What is left
+  when the rounds run out is persisted (`site_claims`) and logged, never
+  fatal: the audit is judgment, and an unclaimed site becomes work only
+  through a validated held-out acceptance set that fails (§8 *Held-out
+  acceptance tests*). Measured (bench D3/P6, live planners with the
+  claims check over the same audits, 9 runs: the PR383 target ×3 and 6
+  converged controls): every target run ended claiming all 4 fix sites
+  with the audit's kinds (two needed the feedback round), 8 of 9 runs
+  ended with no open issue and one control kept one unclaimed site; a
+  blind annotator reading the final plans found no claim on the target
+  whose kind contradicted its intent, and the only contradictions it
+  read on a control (4 sites, one run) were all `other` claims — which
+  is why `other` is surfaced instead of contradicting.
+
+  **Required items are claimed too.** On every run, not only a defect
+  fix, each planner subtask lists in `claims.items` the required items
+  (§8 *The delivery gate*) its work delivers, each typed `deliverable`
+  (a change the tree must carry) or `process` (a constraint on how to
+  work). The claim is not checked at plan time; it is the routing key of
+  the delivery re-drive (§8 *Delivery re-drive*), which hands an unmet
+  deliverable item back to every subtask that claimed it, and never
+  routes a process item. Split children inherit it with the site claims.
 
   A top-level `already_resolved_on_tree` flag was tried alongside and
   dropped: under strict decoding, every schema variant carrying that one
@@ -600,29 +682,53 @@ unsatisfied prerequisites are `extent: external`, the worker discovers
 the dependency is missing (e.g. no Postgres server in the container) and
 returns `status: blocked`; the orchestrator doesn't gate dispatch on
 external preconditions, so `resume` would block again indefinitely.
-By default the orchestrator itself settles a blocked or failed subtask
-once its wave finishes: it logs a warning, records the same
-`accepted_blocked` entry the verb would, marks the subtask `complete`
-and continues (the wave's successful subtasks are integrated first).
-With `--stop-on-blocked` (`LEERIE_STOP_ON_BLOCKED`, `stop_on_blocked` in
+The orchestrator never accepts a blocked subtask as done; it routes on the
+typed `blocker_kind` (§13 *A blocked implementer says why, as a type*). An
+`external_precondition` is settled **`accepted_external`** — not
+integrated, listed under "Needs human verification", and not making the run
+`unconverged` — only when code verifies the typed resource it names (§13
+*An external claim is checked, not taken on the word*); an unverified claim
+is re-driven as `other`, except that the same claim unverifiable for an
+environmental reason on two blocked attempts in a row (no completed
+attempt between them) settles `unconverged`
+(`external_unverified`, §13 *An environment that cannot check a claim does
+not burn the budget*). An `environment_limit` is retried in place once,
+then settled `unconverged`. A `nothing_to_change` is settled `complete` only
+when a sibling integrated this run changed its surface, its verify commands
+(if any) pass, and the satisfied-probe finds its criteria met; a
+`cannot_reproduce` with no commits is settled `complete` when its verify commands pass. In
+both, a verify execution that hits the environment limit settles
+`unconverged`; any other unmet check re-drives it. Every other blocked subtask is re-driven once its wave finishes,
+from the subtask's shared re-drive budget (§13 *One re-drive budget per
+subtask*);
+when that budget is spent — or a subtask `failed` (the two-tier retry policy
+already spent its retries) — it is settled **`unconverged`**: a terminal
+status that is never left `blocked`, whose branch is not integrated, whose
+dependents settle `unconverged` without running, and which makes the run's
+outcome `unconverged` (§6 *The run outcome is decided once*), so the PR
+opens as a draft. Accepting an auto-accepted blocker as `complete` used to
+present unfinished work as done; `unconverged` says what happened. With
+`--stop-on-blocked` (`LEERIE_STOP_ON_BLOCKED`, `stop_on_blocked` in
 `leerie.toml`) the run instead halts with `wave has unresolved
-subtasks`, and `accept-blocked <run-id> <subtask-id>` is the manual path:
-it sets `subtask_status[sid]` to `complete` so `resume` skips it,
-keeping external preconditions a human concern.
+subtasks` once the re-drives are spent, and `accept-blocked <run-id>
+<subtask-id>` is the manual path: it sets `subtask_status[sid]` to
+`complete` so `resume` skips it, keeping external preconditions a human
+concern.
 
-**The integration gate needs the same escape hatch, for a sharper
-reason:** `integrate_wave` dies on a behavioral defect from
-`integration_judge`, an LLM whose false positive would otherwise
-permanently kill a run after full spend, since the merge is already
-committed to staging and a naive resume re-reaches the same verdict.
-`integrate_wave` persists the verdict to `integration_gate[sid]` *before*
-dying, so resume distinguishes "rejected" from "accepted" rather than
-seeing an already-merged branch and skipping past a rejected verdict.
-`accept-integration <run-id> <subtask-id>` flips the record's `accepted`
-flag; an unaccepted finding re-invokes the judge on resume, so a verdict
-that no longer reproduces resolves itself. `--skip-integration-check`
-disables the gate wholesale, matching the five other gates that carry a
-bypass.
+**The integration gate no longer dies on a finding** (§6 *When
+integration cannot succeed*): a behavioral defect from `integration_judge`
+re-drives the integrator against the committed merge, and a merge that does
+not converge is backed out and its subtask settled `unconverged`, so the
+wave continues. The verdict is still persisted to `integration_gate[sid]`
+before anything else happens, so a resume distinguishes "rejected" from
+"accepted" rather than seeing an already-merged branch and skipping past a
+rejected verdict. `accept-integration <run-id> <subtask-id>` still flips the
+record's `accepted` flag — the manual path for a run recorded by a release
+whose gate died; an unaccepted, un-backed-out record re-enters the repair
+loop on resume. A backed-out record has nothing integrated to accept: the
+verb says so and changes nothing, since its subtask's work is not on the run
+branch. `--skip-integration-check` disables the gate wholesale,
+matching the five other gates that carry a bypass.
 
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
@@ -1012,7 +1118,7 @@ semantic dangles the structural check is blind to: the deterministic check owns
 "does every declared edge resolve," the judge owns "is the set of declared
 edges the right one."
 
-**The judge repairs what is unambiguously repairable, and dies on the rest.**
+**The judge's findings are repaired, not died on.**
 Detecting-and-dying alone was wrong: the commonest defect this judge finds is one
 *no planner could have avoided*. Planners run blind and in parallel — a planner's
 context carries the task, the repo map, and the shared artifact registry, never a
@@ -1074,8 +1180,9 @@ properties matter:
   the canonical *true* finding.
 - **Direct edges only, not the transitive closure.** A further 127 corpus
   orderings hold only transitively. Those would refute the finding just as
-  soundly, but dismissing on them is a much broader claim to make on a die-only
-  gate, so the check stays 1:1 with the graph's own edge definition.
+  soundly, but dismissing on them is a much broader claim to make on a
+  correctness gate, so the check stays 1:1 with the graph's own edge
+  definition.
 
 It applies to `missing_requires` alone. The repair loop routes *every*
 non-repairable defect to the same residual, so `broken_by_drop` and
@@ -1087,13 +1194,9 @@ It runs after the repairs rather than before them because a defect can be
 mooted by an edge a *sibling* defect's repair added, and the judge's
 emission order is arbitrary. Each dismissal is logged naming the responsible
 edges, so a judge degrading over time stays visible rather than being
-silently absorbed. Anything else is refused and the gate dies as before: a
-value that is neither a subtask id nor a provided tag means the plan
-genuinely lacks the capability, and several providers spanning *different*
-clusters is an ambiguity only a human can resolve. The cycle trial is
-load-bearing rather than defensive — a well-formed but wrong edge can close
-a cycle spanning the entire plan, so skipping it would convert a survivable
-planning defect into a dead run.
+silently absorbed. The cycle trial is load-bearing rather than defensive — a
+well-formed but wrong edge can close a cycle spanning the entire plan, so
+skipping it would convert a survivable planning defect into a dead run.
 
 Reading only the tag channel was the original shape of this repair, and was
 the dominant reason a repairable run still died: measured across the
@@ -1103,10 +1206,46 @@ counting split siblings as rival providers accounted for the rest in a
 second run. Closing both channels takes the corpus from 19/27 runs clearing
 the gate to 21/27, with the residual defects then all genuine missing work.
 
+**What is left after that is ordered, not refused.** The gate used to die on
+the residual: several providers spanning *different* clusters, an id edge
+refused for a cycle. Neither is an ambiguity that needs a human — "order the
+subtask behind the capability" has one safe reading when every provider is a
+legitimate predecessor. So the residual is worked once more, cumulatively
+against the already-repaired plan:
+
+- **Fan-in.** The value names a tag with at least one provider other than
+  the subtask, and the subtask does not already require it → append an
+  in-plan `requires` on the tag, which orders the subtask behind *all* of its
+  providers. Applied when the cycle trial passes. This covers
+  `missing_requires` and the edge requests `broken_by_merge`,
+  `broken_by_drop` and `orphaned_dependent` carry.
+- **`depends_on` fallback.** When the fan-in would cycle (or the value is a
+  surviving id whose edge was refused for a cycle), add a `depends_on` to
+  each provider individually in sorted order, skipping any whose edge would
+  cycle — that provider is a descendant of the subtask, and nothing can order
+  a subtask behind its own descendant. One added edge is a repair; the
+  skipped providers are recorded.
+- **Warn, don't die,** when no provider is left: no in-plan provider at all,
+  every provider a descendant, or a `missing_provides` (which names no edge).
+  Each is logged and persisted as a typed warning on `wiring_gate`.
+
+The only shape that still dies is a defect naming a subtask id that is not
+in the plan: the judge is then talking about a plan this is not. Every trial
+keeps the graph acyclic. Benched as q4 W on the gate's real helpers: across
+26 replayed cases (52 judge passes) today's gate died on 15 passes (19
+defects) and the fan-in/fallback gate on none, with no cycle; on 119
+synthetic residuals, 0 deaths and 0 cycles (86 warnings, 32 `depends_on`
+fallbacks).
+
 Because added edges change the wave partition, the scheduler is re-run and the
 plan snapshot rewritten after a repair, so everything downstream — the budget
 preflight, the deterministic wiring re-check, `_validate_plan`, `_write_plan` — sees
-the repaired graph rather than the one the judge rejected.
+the repaired graph rather than the one the judge rejected. The verdict and the
+rewritten snapshot are saved together, in one write: the verdict is what a
+resume skips the gate on, and the repairs live only in the plan the snapshot
+holds, so a kill between two writes resumed past the gate onto the unrepaired
+snapshot and executed without the edges it added. A kill before that one write
+leaves neither, and the resume runs the gate again.
 
 **Each defect declares a severity, and the severity is asked for rather than
 required.** A `live_defect` gates; a `latent_risk` is logged as a warning only.
@@ -1246,6 +1385,22 @@ everything it depends on — never a half-finished intermediate state. Sequentia
 waves are what make "this subtask depends on that one" mean something concrete:
 the dependency is satisfied in the filesystem the dependent subtask starts from.
 
+**Planned file overlap is serialised, within a cap.** Two subtasks in one wave
+whose planned `files_likely_touched` intersect are the commonest source of an
+integration conflict: of 15 natural integrator conflicts in the run corpus, 12
+were between same-wave subtasks that both planned the conflicting file (q4
+overlap replay). Serialising every such pair avoided those 12 but cost 163
+extra waves across 77 runs. So `_schedule` splits a wave only as far as
+`overlap_extra_waves` (3) extra waves per run allows: overlapping pairs are
+taken largest overlap first, a pair is kept only while the whole plan's extra
+waves stay within the cap, and each wave is then packed first-fit in id order
+so a kept pair lands in different sub-waves. Every sub-wave still follows all
+of its predecessors, so the graph's order is untouched; only parallelism is
+spent. Replayed on the same 77 runs, the capped rule avoids 8 of the 15
+conflicts for 90 extra waves (at most 3 in any run, 40 runs affected); the
+bench's own capped arm reached 10/15 by ranking pairs on historical per-file
+conflict risk, which a run does not have.
+
 ---
 
 ## 5½. ENRIC grounding — codebase-structural decomposition (P6 + P1)
@@ -1365,6 +1520,37 @@ split mechanism therefore separates by structural type:
   the planner holds; code cannot derive it from the file, and reading it out of
   `investigation_notes` would be exactly the regex-over-prose this design
   forbids.
+
+  **A sweep is tiled only when its sites are independent, and only where its
+  sites are.** `sweep` alone was not enough: a sweep that routes every site
+  through one new shared helper, or whose deliverable includes a new file,
+  cannot be finished by a worker that sees one region. The planner therefore
+  also types `independent_sites` (each site can be changed correctly from its
+  own surrounding lines alone: no new shared helper, type or constant first, no
+  site depending on another, no new file) and `sweep_sites` (the identifiers
+  every site contains). The gate is `change_shape == "sweep"` **and**
+  `independent_sites` true; a **missing** field means **no split**. That
+  reverses the earlier absence-means-split default, which existed so that
+  reconciler- and splitter-made subtasks (whose schemas lack the field) could
+  still be tiled — and that default was the main way harmful tilings happened:
+  across 8 executed tilings, region children ended blocked 66 of 86 times, and
+  in the fresh data the main path was a splitter or peel child carrying no
+  `change_shape` at all. Splitter and peel children now inherit the parent's
+  `change_shape`, `independent_sites` and `sweep_sites`, so a child is gated
+  exactly as its parent was. Tiling is then site-limited: each `sweep_sites`
+  identifier is located in the file with `git grep -w -F` (a fixed-string,
+  whole-word match — the planner names the identifier, code finds the lines),
+  and only regions containing at least one site get a child; a sweep none of
+  whose identifiers is found in the file, or whose sites fall in one region, is
+  a leaf. Benched as Q5/E1 with the gate frozen before scoring: on 6 fresh
+  genuine sweeps the gate split 12 of 12 samples (site-only tiling kept 6/25,
+  1/25, 7/25, 2/2, 2/2 and 1/9 regions); on 28 historical subtasks today's rule
+  would tile it tiled 0 (none was a genuine independent sweep, hand-labelled);
+  on 17 fresh re-plans with the frozen planner it tiled 1 subtask, a benign
+  one-site call migration, and 0 harmful ones, where today's rule tiled 2.
+  On the three development sweeps (P11) the gate permitted the split in 6 of 6
+  samples, site-limiting cut the regions 25→9, 26→10 and 25→8, and 0 of 2
+  harmful-split rechecks tiled.
 
   **Region ownership constrains paths, not only lines.** A region child owns a
   line range *and* owns no other path: the parent's criteria may demand a new
@@ -1582,10 +1768,2268 @@ workers.
 ### Isolation
 
 Parallel workers that write to a shared directory race. Leerie gives each
-implementer its own git worktree — an isolated checkout backed by the same
-repository. Parallel writes land in separate working directories and never
+implementer its own git worktree — an isolated checkout backed by the run's
+own repository (*The run's own repository* below), never the user's. Parallel writes land in separate working directories and never
 collide. This is what makes "a wave of parallel implementers" safe even when
 two of them touch the same file.
+
+### Each worker's own configuration and temporary directories
+
+**Root cause: every worker shared one CLI configuration and one `/tmp`.**
+Every `claude -p` read and wrote `~/.claude` (in the container, the staged
+copy of the operator's) and `/tmp`. The configuration directory is not
+inert data: its `settings.json` carries hooks the CLI runs. Measured on the
+host (CLI 2.1.312, haiku, a scratch `CLAUDE_CONFIG_DIR` holding only
+`.credentials.json`): a `settings.json` with `SessionStart`,
+`UserPromptSubmit` and `Stop` hooks written into it before a session ran
+all three hooks in that session. So one worker that wrote a hook there —
+with Bash, or the Write tool — ran code in every later worker's session;
+and one worker could leave or read files in another's `/tmp`.
+
+**Invariant: no worker can change the environment of another worker or
+of leerie.** Each worker gets its own directories, at the layout the
+write grant (§6 *A worker writes only where it is granted (I5)*) grants
+and nothing else:
+
+- `<run-dir>/workers/<wid>/config/` — the worker's `CLAUDE_CONFIG_DIR`;
+- `<run-dir>/workers/<wid>/tmp/` — its `TMPDIR` (and `TMP`, `TEMP`);
+- not its caches: those are one set per side of the run, shared by every
+  worker of that side and never by leerie's measurements (§6 *The stores a
+  view installs from are leerie's*): `<run-dir>/workers/cache/` for the
+  fixers' side, `<run-dir>/workers/cache-held-out/` for the held-out side
+  (§8 *Nothing a held-out evaluation produces reaches a fixer*).
+
+`<wid>` is the `sid` of the worker's first call. A call that resumes a
+session (`--resume`: the clean-tree re-ask, the falsifier's re-ask) runs
+in the directories that hold that session, found by its transcript under
+`config/projects/`, so the CLI finds what it resumes. A worker's `tmp/`
+is removed when each of its calls returns; its `config/` lives as long as
+a resume of it can follow within the process.
+
+*Every confined CLI is given its own directories, by one builder.* The
+CLI's first act, whatever its flags, is to make `$TMPDIR/claude-<uid>`
+(measured on the host and in the image with a read-only `TMPDIR`: it stops
+with EROFS/EACCES before reading its settings). So a confined CLI given a
+path variable its grant does not cover cannot start. Root cause of review
+round 22 exec H2: the directories a confined CLI's environment names were
+made at each spawn site — `claude_p` made them, the Fly integrator's guard
+helper made them, and `preflight`'s smoke test made none, inheriting the
+orchestrator's own `TMPDIR` (`<run-dir>/tmp/`, `_use_run_tmp`), which no
+worker's grant names; every fresh run without `--skip-smoke` died in
+preflight. **Invariant: every path variable a confined CLI is given lies
+inside its grant** — its own `TMPDIR`/`TMP`/`TEMP`/`CLAUDE_CODE_TMPDIR`
+and `CLAUDE_CONFIG_DIR` written, and nothing it is given names a path in
+the state root that its grant does not cover. One builder makes the CLI's
+own directories and names them for every confined spawn — `claude_p`, the
+smoke test (`sid` `smoke`) and the Fly integrator — before its grant is
+derived from that environment, so no spawn site can hand a CLI an
+environment built another way.
+
+*No copy of the credentials outlives its run's process.* `workers/` and the
+template below hold copies of the operator's credentials. They go when the
+process that made or used them exits, whatever the exit: a return, a
+`sys.exit`, a `die()`, an unhandled exception, an interrupt or a signal.
+The owner is the process's exit itself (`_release_owned_run_dirs`, an
+`atexit` handler), not each way out of it: a run directory is registered
+when the process takes the run's `State` lock — the orchestrator, and the
+host-side rebaser, which opens the `State` — and at exit every run
+directory the process registered is released, under the run's lock. Only
+the run's owner registers. A process that makes copies for another to use
+leaves them to that one: the collection's guard helper
+(`scripts/worker-guard.py`) makes each integrator's configuration from the
+template and exits before the integrator starts, and the collection
+payload, which runs the integrators, removes `workers/integrator-*` and the
+template when it exits (an `EXIT` trap). Registering at the template's
+making, as this first did, removed them under the integrator before it ran. Removing them at
+named exits — finalize, the abnormal exit — left them after every normal
+return that was neither: each no-work exit of planning, the template
+dep-capture makes again after finalize removed it, and the rebaser's on
+the host (review round 19 claims H1, exec M1). The same exit removes the
+run's other per-process scratch: the measurement directories
+(`measure/`), the trees' own stores (`tree-stores/`), the store
+fetch's staging (`.store-fetch/`) and the ref-less clones' git directories
+(`clone-gits/`), which nothing reads once the process is gone (review
+round 19 exec L2). The auto-resume after a rate limit
+replaces the process image (`os.execv`), which runs no exit handlers, so
+`_sleep_then_reexec` releases first. A SIGKILL runs no exit; the preflight
+reap and `leerie prune` remove what such a run left. A resume makes the
+template again at its first worker; a worker session the process recorded
+is then not resumable across processes (its transcript was in
+`workers/`), and the re-ask that would resume it takes its no-session
+path. A forked child that exits is not the run's process: the handler
+releases only what its own pid registered, under the run's lock — the one
+its `State` still holds, else one it can take now; a run directory another
+process has locked is left.
+
+*Every deleter of a run's directories deletes them.* The template is
+read-only, and so is a killed test's directory in a tree. A plain
+`rmtree(..., ignore_errors=True)` cannot unlink the entries of a read-only
+directory and says nothing: `leerie prune --apply` reported a run removed,
+left its credentials, and deleted its `run.json`, so later prunes read what
+was left as a live run and never removed it. Every removal leerie makes
+goes through the one owner-aware removal — `_rmtree_owned` in the
+orchestrator, its copy `_rm_owned` in the launcher's host Python,
+`leerie_rm_owned` in the scripts (each directory's owner write and search
+bits restored top-down, then the removal) — which reports whether the path
+is gone; a deleter whose survivor matters (a run directory, the
+credentials, prune's count) acts on that. The only other removal is of a
+`mktemp` directory the same script made. Removing only the run
+directories' deleters this way left 25 plain removals in the orchestrator,
+many under the run directory — helper checkouts, `repo-settings/`, the
+measured coverage directory that repository code writes (review round 19
+claims M1) — so the rule has no exceptions by path: a new plain removal
+fails a guard whatever it removes. A run counts as removed only when its
+directory is.
+
+*What a config directory holds.* It is made from the run's configuration
+template, `<run-dir>/claude-config/`: a read-only snapshot, taken once
+when the run's first worker starts and kept for the run, of the
+operator's CLI configuration (`$CLAUDE_CONFIG_DIR`, else `~/.claude`)
+without its per-session state (transcripts, sessions, shell snapshots,
+history, caches, backups), plus `~/.claude.json`, which the CLI reads
+from the configuration directory when one is set. A worker's
+configuration directory holds a writable copy of each of the template's
+top-level files (settings, credentials, account state: what the CLI and a
+worker may rewrite) and a link to each of its directories (plugins,
+skills and the like). Copying those directories per worker would cost
+about 26 MB a worker on this host's staged configuration, mostly
+`skills/`, times the hundreds of worker sessions a run makes. Measured
+(haiku, one Bash call, with the linked directories read-only), the CLI
+authenticated, ran the call and wrote only into the worker's own
+`projects/`, `sessions/`, `session-env/`, `shell-snapshots/`, `backups/`
+and `.claude.json`, never into a linked directory. So a worker still
+authenticates the way it did — `.credentials.json` in its copy, or
+`CLAUDE_CODE_OAUTH_TOKEN` in its environment, which the token rotation
+sets per call and which wins over the file — and still sees the
+operator's own settings, plugins and skills, but every write it can make
+lands in its own directory. The template's read-only mode stops the CLI
+and an ordinary write. A worker running as the template's owner could
+change the mode back; the write grant (I5), which grants no part of the
+template, is what stops that.
+Leerie's own controls do not live there at all: the PreToolUse hook and
+its deny rules travel on the argv (`--settings`, `--disallowedTools`) and
+the system prompt as a file in the run directory, so they apply to every
+worker whatever its configuration directory holds.
+
+*`HOME` is not written.* With `CLAUDE_CONFIG_DIR`, `TMPDIR` and
+`--strict-mcp-config` set — which every worker carries — a measured
+session (haiku, one Bash call) wrote nothing under a scratch `HOME`, and
+ran with `HOME` read-only. (Without `--strict-mcp-config` it wrote MCP
+logs to `~/.cache/claude-cli-nodejs/`.) So `HOME` needs no grant.
+
+*Not covered here.* A repository's own project settings
+(`.claude/settings.json`, and an ignored `.claude/settings.local.json`)
+in a worker's tree are read by every later worker in that tree; a worker
+that writes the local one in staging reaches later staging workers. That
+is a tree, not a configuration directory, and is the write grant's to
+close.
+
+*Runtimes.* The directories are made by the orchestrator, under the run
+directory it owns, as the uid the workers run as: the `unshare`-mapped
+leerie on rootless, `runuser` leerie on rootful, leerie on Fly. The
+template is copied from the mounted or seeded `~/.claude`, which that uid
+already reads on each runtime; no chown is added.
+
+### The run's own repository (RC4, I4)
+
+*Designed and built 2026-10-30 (review round 16, H2). The statements
+elsewhere in this document it changed are listed at the end.*
+
+**Root cause (RC4): a worker's tree is isolated, but its repository is the
+user's.** Almost every tree leerie hands a worker is a *linked* worktree of
+the user's repository: planning, staging, a subtask, each helper and judge
+checkout, the post-run replay's checkout and the host-side rebase tree.
+Only the acceptance writer, the surrogate and the falsifier get a ref-less
+`--shared` clone. A linked worktree shares the common
+directory with the user's own checkout: every branch and tag, `refs/stash`,
+the repository config, `info/exclude`, the hooks, the worktree registry and
+the object store. So every git verb a worker runs in its own tree acts on
+the user's repository, without the worker ever naming it. Review round 16
+drove both harms on the real `_clean_tree_gate`:
+
+- a worker on a clean subtask tree runs `git stash` ("No local changes to
+  save"), then `git stash pop`, which pops the *user's* `stash@{0}`; the
+  re-ask has it commit, I1 passes, the user's stash is gone and their WIP is
+  on the subtask branch, headed for the PR. §12 records a measured worker
+  doing exactly a `git stash`/`pop` pair;
+- a worker in staging runs `git checkout develop` (a user branch) and
+  commits; the re-ask has it cherry-pick back, I1 passes, and `develop`
+  keeps the worker's commit. `_restore_tree` cannot put it back either.
+
+The sharing also leaves residue the user never asked for. A read-only look
+at one user repository on 2026-10-30 found 34 leerie admin entries in its
+`.git/worktrees` (30 `acceptance-*`, 4 `planning*`) and 8 leerie branches (6 run
+branches, 2 subtask branches).
+
+Every guard written so far bounds one verb at a time: the clean-tree gate
+checks HEAD and its ancestry, the sentinel compares `refs/heads`, the
+falsifier stopped writing `info/exclude`. None of them can bound "any git
+verb, in any tree, on any ref". That is the shape of a design gap, not of a
+missing check.
+
+**Invariant (I4): no worker's repository is the user's.** Every tree a
+worker gets belongs to a repository leerie created for the run. The
+worker's refs, stash, config, `info/exclude`, worktree registry and object
+store are that repository's. The user's repository is touched only by
+leerie's own enumerated git:
+
+- reads at the start (the working branch, HEAD, the tree's state);
+- `fetch`es *from* it into the run's repository;
+- one write, after the run, of the one ref the user receives:
+  `leerie/runs/<run-id>`, plus the host finalize's existing push and PR.
+
+**The mechanism.**
+
+- *The run's repository* is `<run-dir>/repo`, a bare repository leerie
+  makes once per run, at run start, before the planning worktree (on Fly and
+  EC2, `/work/.leerie/runs/<id>/repo` on the volume):
+  - `git init --bare` in the user's object format;
+  - a `fetch` from the user's repository of the working branch, kept under
+    the same name, and the user's HEAD commit as the bare repository's
+    detached HEAD. leerie's own git, hooks off.
+
+  It is built in a scratch directory and renamed into place. A scratch
+  directory a crash left behind is removed at the next creation (review
+  round 17 L2). Creation runs only while holding the run's flock, so any
+  scratch directory found then is dead.
+- *Recorded, never rebuilt* (review round 17 H1). Once `run_repo` is in
+  state, the repository holds every commit of the run and is its only
+  store. leerie never deletes it and never builds it again. At each entry,
+  leerie checks it by something no worker's git command can change:
+  - it names the repository explicitly (`--git-dir`, below);
+  - it checks that the commit the run started from is there: `base_sha`
+    once the run branch is cut, `refs/leerie/user-head` before.
+
+  A repository that fails the check stops the run with a `die()` naming
+  its path, never with a rebuild. Before, the probe read `core.bare`, and
+  a worker's `git init` in its own tree rewrites that in the shared config
+  ("Reinitialized existing Git repository"). The next resume then read the
+  repository as absent, deleted it with every run, subtask and integration
+  commit, and rebuilt it from the user's. The bring-back then moved the
+  user's branch onto the rebuilt, unrelated tip.
+- *Named, never discovered* (review round 17 M3). git's
+  `safe.bareRepository=explicit`, a hardening setting the launcher mounts
+  with the user's global config, refuses to find a bare repository from the
+  working directory (`git -C <repo>` or a cwd inside it). So leerie names
+  the run's repository explicitly everywhere it addresses it:
+  - `--git-dir` in the orchestrator, the host bring-back, the rebaser's
+    repository and Fly's `fetch_branch`;
+  - `LEERIE_GIT_DIR` in the scripts, which pass it to every
+    repository-level git command through `leerie_repo_git`.
+
+  Workers need nothing: a linked worktree is found through its `.git`
+  file, which the setting allows. Measured on git 2.53.0 under the
+  setting: `-C <bare>` is refused, while `--git-dir` fetch, `worktree add`,
+  `bundle`, a commit in a linked worktree, `clone --shared <bare path>` and
+  `fetch <bare path>` all work.
+- *What the fetch brings.* The fetch copies objects, so the run's repository
+  is self-contained: it has no alternates and no `origin` remote of the user
+  repository. What it brings:
+  - only the working branch's history;
+  - the tags that point into that history, because git's tag auto-follow
+    applies (`git describe` reads as it does in the user's checkout).
+
+  What it leaves behind: no other branch, no `refs/stash`, no remote-tracking
+  ref, no earlier run's branch.
+- *Refreshing the base.* Wherever leerie reads the working branch's tip to
+  (re)base something, the run's repository fetches that tip first. Today
+  that is the planning worktree's reset on every entry, and `setup-run.sh`
+  cutting the run branch at phase 4. So the run still follows the working
+  branch's moving tip, as §12 L4 describes. A worker that commits onto the
+  repository's copy of the working branch moves only that copy, and the next
+  refresh puts it back.
+
+  A refresh fetches the working branch alone. The user's HEAD is fetched
+  only at creation (the run's own start) and for a run started on a
+  detached HEAD, which has no branch to follow. So an operator switching
+  branches mid-run brings no other branch's history into the run's
+  repository (review round 17 L1).
+- *leerie reads the base by commit.* When the run branch is cut, leerie
+  records `base_sha`. Its own comparisons against the base use that commit,
+  never a branch name a worker can move:
+  - the diff-scope check;
+  - the final conformer's and PR reviewer's diff base;
+  - the PR writer's log and diff;
+  - the finalize commit count;
+  - the merge-base for the final test-failure check.
+
+  The DIFF_BASE line in prompts names the same commit.
+- *Every tree is made from the run's repository.* The scripts name the
+  run's repository (`LEERIE_GIT_DIR`, *Named, never discovered* above),
+  with the state root passed explicitly. That covers:
+  - staging and each subtask tree, each a worktree of its own tree
+    repository cut from the run repository's branch and taken back into
+    it (*A repository per committing tree (I6)* below);
+  - the planning worktree, every `_worktree_add_detached` and
+    `_judge_checkout`, which are worktrees or checkouts of the run
+    repository itself;
+  - the acceptance writer's, surrogate's and falsifier's ref-less clones
+    (which clone the run's repository).
+
+  The post-run replay is not a run's tree: it re-runs a captured call
+  against the user's checkout as it is now, through a ref-less `--shared`
+  clone of the *user's* repository (`_ref_less_clone`), which shares no
+  ref, stash, config or hook with it.
+
+  A helper worktree is only ever added there, after `_run_phases` has
+  made the repository, so its absence at an add is leerie's own bug, not
+  an external condition: `_worktree_add_detached` dies naming it, rather
+  than letting the CI-parity gate record `no_base_worktree` or the
+  acceptance evaluation "no evidence either way" (review round 17 H1:
+  both hid it).
+  `leerie_repo_lock`'s lock file follows `--git-common-dir` into the run's
+  repository. It still serialises the run's own parallel `worktree add`s,
+  and no longer serialises against other runs.
+- *What is carried from the user's configuration.* The run's repository
+  takes the user's repository-local config keys, except those that describe
+  where and what kind of repository a config file belongs to: `core.bare`,
+  `core.worktree`, `core.repositoryformatversion`, `extensions.*`,
+  `include.*`, `includeIf.*`. It also skips any key the new repository
+  already set.
+
+  When the user sets no `core.hooksPath` anywhere, it is set to the user's
+  hooks directory (`git rev-parse --path-format=absolute --git-path hooks`).
+
+  So workers' commits still run the repository's hooks, as §6
+  *Finalization* promises ("worker commits inside worktrees still run all
+  hooks normally"), and a repository-local identity still signs them. All
+  four user repositories looked at carry `core.hooksPath=.husky/_` in local
+  config, which is copied as written and resolves per worktree, as it does
+  today.
+
+  Measured on git 2.53.0 with a synthetic repository:
+  - a commit in a run-repository worktree ran the user's `.git/hooks`
+    `pre-commit` and carried the repository-local identity;
+  - a husky-style `git config core.hooksPath .husky/_` run from that
+    worktree wrote the run repository's config, and the user's stayed unset.
+
+  Why not a blanket `include.path` of the user's config: measured, the
+  user's `core.bare = false` then overrides the bare repository's. git reads
+  the run repository as non-bare and refuses `worktree add` of the run
+  branch as "already used by worktree at <repo>".
+- *Its settings are leerie's.* Once carried, the run repository's `config`
+  and `info/` are copied to `<run-dir>/repo-settings/`, and leerie reads
+  every tree of the run through that copy and through a per-process copy
+  of the settings outside the repository (§8 *The settings are leerie's*):
+  a worker's `git config` in its tree is put back before leerie reads the
+  tree, so it never changes what git reports to leerie.
+- *Bringing the run branch back* is host-side, after the run, as it already
+  is on Fly (`fetch_branch`). The launcher fetches
+  `refs/heads/leerie/runs/<id>` from `<state-root>/runs/<id>/repo` into the
+  user's repository:
+  - hooks off, no `FETCH_HEAD`, no auto-maintenance;
+  - only when the user's ref is absent or still at the commit leerie last
+    brought back (`run.json` `brought_back_sha`), so a finalize rebase is
+    never undone;
+  - and only as a fast-forward of what was brought back: the run's new tip
+    must descend from the user's current ref (review round 17 H1).
+
+  Why the fast-forward, and not "descends from `base_sha`": a branch leerie
+  brought back is the run's record, and the user may have pushed it or
+  built on it. A later bring-back must only add to it. A tip cut afresh
+  from an unmoved working branch descends from `base_sha`, so that rule
+  would still have let H1's rebuilt, unrelated tip replace the brought-back
+  work. A run whose branch moved back or sideways since, for example a
+  back-out after a crash, is refused with rc 2. Its tip stays in the run's
+  repository, `prune` keeps the run, and the operator decides.
+
+  It runs:
+  - on the launcher's exit path, for the run that container ran (*Which run
+    the container ran* below): its EXIT trap, so it runs whatever the exit
+    is (a clean exit, a failed run, `--no-push`, Ctrl-C or TERM; review
+    round 17 M2). The INT and TERM traps used to exit before the
+    bring-back. Every step of that trap tolerates failure: under `set -e`
+    a failing step ends the trap, and a keepalive that had already exited
+    (`kill` returning 1) skipped the bring-back after it;
+  - at the start of every `host_finalize`;
+  - in `leerie finalize <id>`;
+  - in `prune`, before a run directory is deleted. A refused swap while the
+    run's tip is not what was last brought back (its newest commits are in
+    no ref of the user's) keeps the directory, so a run whose launcher died
+    is never lost.
+
+  *Which run the container ran.* Only the orchestrator knows which run it
+  ran: a bare `resume` picks one itself (`resolve_run_id`), and the
+  launcher's own guesses (`--run-id`, the container id of a fresh run) miss
+  that case. Until this was closed, an auto-picked resume that exited
+  without pushing left its branch in the run's repository until a later
+  finalize or prune. So the orchestrator says which run it ran.
+  - The launcher names a file of its own invocation in the state root
+    (`.runid-<launcher pid>`) and passes its container path in
+    `LEERIE_RUN_ID_FILE`.
+  - The orchestrator writes the run id there as soon as it holds that
+    run's directory. That is the moment the run is its, after
+    `resolve_run_id` and the `State` flock.
+  - After the container exits, every post-exit step of the launcher reads
+    that file, and nothing else, to know its run:
+    - the bring-back;
+    - the "finalize: skipped … (run <id>)" line;
+    - the auto-finalize (push and PR).
+
+    The last two used to guess. The skip line read `--run-id`, or the
+    cidfile, which names the container rather than a run. The auto-finalize
+    pushed the *newest* unpushed finished run under the state root. With
+    two runs in one repository, that was whichever had written its run.json
+    last, so it could push another run, finished or still running, instead
+    of the one this container ran. Now the auto-finalize finalizes the run
+    the file names, and only when it is finished and unpushed. The same
+    checks as before apply: `finished_at` and the run identity are set, and
+    `pushed_at` is not.
+
+  The orchestrator's own resolution is the one source of "which run". The
+  launcher does no resolution of its own, so the two cannot disagree. No
+  file means the container ran no run, for example a preflight refusal:
+  nothing is brought back or finalized, and the skip line names no run.
+  There is no scan for a run to guess. The
+  file lives in the state root the container already writes, so no mount
+  or ownership change is needed on any runtime. Fly and EC2 never set the
+  variable: their branch comes back through `fetch_branch`.
+
+  A container runs one run, so the file names one. A run group (§20) is no
+  exception: the `group` arm starts one launcher per member, and each runs
+  its own container and its own run. The group arm reads no run id at all.
+  Each member's orchestrator writes `group_id` into the `run.json` of the
+  run it resolved, when it starts that run, so it tags exactly that run.
+  The group arm used to tag runs itself, after the members exited. It
+  picked the newest finished run in each member's state directory, which
+  could be another group's run or a standalone run of the same repository,
+  and it missed a member that had not finished.
+
+  On Fly and EC2, `fetch_branch` bundles from the run's repository instead
+  of `/work`, and leaves `repo/` out of the state directory it copies to the
+  host: the branch is already in the bundle.
+- *The finalize rebaser* gets a host-side repository of its own: a
+  `--shared` single-branch clone, which is valid there because it lives only
+  for finalize on the host. `run_rebaser` carries in the user's config by
+  the rule above, `origin` among it. The rebaser is told the run's own
+  commits as `<base_sha>..<run branch>`: that commit is an ancestor of the
+  run branch, so it is in the clone, while the working branch's name is not
+  (review round 17 M1). A run made before `base_sha` existed keeps the
+  name, and its rebase is best-effort as before. Its result already
+  comes back by a fetch (`refs/leerie-rebase-scratch/<id>`). After a
+  rebase, leerie also fetches the `origin/<pr_base_branch>` the rebaser
+  fetched into the user's repository, the one remote-tracking ref finalize
+  then reads. Today that update happens implicitly through the shared
+  worktree.
+
+**Why a self-contained repository, not `--shared`.** A `git clone --shared`
+borrows the user's object store through `objects/info/alternates`. It is
+fast:
+
+| | `--shared` clone | self-contained (`init --bare` + `fetch`) |
+|---|---|---|
+| funeralworks copy | 0.068 s, 172 KB | 1.19 s / 1.21 s, 9.7 MB |
+| barnacle copy | 0.10 s, 184 KB | 2.68 s / 2.76 s, 8.4–8.9 MB |
+| leerie copy | not measured | 11.5 s / 11.3 s, 31–32 MB |
+
+A refresh that brings nothing new takes 0.04 s to 0.06 s.
+
+The `--shared` clone fails in two ways:
+
+- **The host cannot read it.** The alternates path is written inside the
+  container (`/work/.git/objects`). On the host, git prints "error: unable
+  to normalize alternate object path" on every command, so the post-run
+  bring-back, a finalize after a crash, and `prune` could not use it.
+- **It depends on the user's object store.** Measured: with a `--shared`
+  clone in use, the user deletes a branch and runs `git reflog expire
+  --expire=now --all; git gc --prune=now`. The clone's copy of that branch
+  then dangles: `git log --all` fails with "bad object", and `git gc` exits
+  128. A single-branch clone avoids the dangling copy. But the base commit
+  itself would then need a pin ref in the user's repository for the run's
+  life, which is a new ref in the user's repository that leerie must clean
+  up.
+
+The self-contained repository pays its cost once per run, against runs
+that take hours. It also stops the run's intermediate objects (re-drive
+attempts, rescue commits, test fixtures leerie snapshots) from accumulating
+in the user's object store. Only the brought-back branch's objects land
+there.
+
+**What it settles, measured on the new layout** (synthetic repository,
+r16 H2's two scenarios):
+
+- `git stash pop` in a subtask tree reports "No stash entries found", and
+  the user's stash list is unchanged.
+- `git checkout develop` fails ("pathspec 'develop' did not match").
+- A commit on the run repository's copy of `main` leaves the user's `main`
+  and `develop` where they were.
+- `git rev-parse --git-path info/exclude` in a run worktree resolves to
+  `<run-dir>/repo/info/exclude`, so round 16 H1's leak is settled: a
+  pattern a worker adds there can no longer hide the user's own files.
+
+**What it does not settle.**
+
+- *H1's hidden dirt.* A worker can still write its tree repository's
+  `info/exclude` or set `skip-worktree`. I1's checker reads untracked
+  files by git's standard rules through leerie's settings (§8 *One ignore
+  rule*): leerie's copy of `info/exclude`, put back before every read, and
+  leerie's copy of the global ignore file (§8 *The settings are
+  leerie's*). It also reads the index flags, as H1's fix states (§8 *A
+  worker leaves its tree clean*).
+  `_checkout_ignore` stays, because one checkout's ignore must not reach
+  staging.
+- *M1.* The run repository carries the user's hooks on purpose, so
+  leerie's own git there must still run with the hooks off. It does,
+  through the environment every git process leerie starts inherits (§6½
+  *Hooks off*, `_git_hooks_off`); the per-call `GIT_NO_HOOKS` flag M1 was
+  first fixed with is gone (a344b0c).
+- *The explicit channel: the user's checkout is mounted read-only.* I4
+  removed the implicit reach, where every git verb landed in the user's
+  repository. The explicit one was left: `/work` was the user's checkout
+  bind-mounted read-write, so a worker's Bash could `cd /work`, run
+  `git -C /work`, or write `/work/.git`. §12 records 146 `Edit`/`Write`
+  calls into the user's checkout before the path deny, and Bash writes there
+  that the deny does not cover. Locally the launcher now mounts it
+  `/work:ro`. Invariant: nothing in the local container writes the user's
+  checkout; what the run gives the user reaches it through the host, after
+  the container exits (the run branch's bring-back, the captured
+  dependencies below).
+
+  Measured with the real `container-entry.sh` and a stand-in for the
+  orchestrator, as `leerie` after the privilege drop, on rootless and on
+  rootful (`sudo nerdctl`, an existing image; no new image needed): every
+  write fails with `EROFS` — a file in the tree, a file in `.git`,
+  `mkdir .leerie`, `git commit`, `git branch` — and every read leerie does
+  works: `rev-parse`, `status`, `worktree list`, a `fetch` from it into
+  another repository, a `clone --shared` from it.
+
+  What wrote it, and where each write went:
+  - *Dependency capture's `.leerie/config.toml`.* The container records the
+    capture in the run directory; the host applies it to the checkout after
+    the container exits (§6½ *The host applies a capture*).
+  - *The in-checkout state root.* `resolve_leerie_root` falls back to
+    `<repo>/.leerie` only when `LEERIE_STATE_DIR` is unset. The local
+    launcher always passes `LEERIE_STATE_DIR=/leerie-state`, so the
+    fallback is unreachable in the local container. It stays for Fly/EC2,
+    where `/work` is the machine's own clone (below), and for direct
+    invocation.
+  - *The rootful entry's `chown leerie: /work`.* It exists for Fly, where a
+    volume mounted at `/work` has a root-owned root on first attach. Locally
+    it was a no-op at best: the image's `leerie` has the host user's uid.
+    At worst, on rootful with a checkout whose owner is not that uid, it
+    re-owned the user's checkout directory (measured: 1234 became 1000).
+    Nothing needs it for reading: git's `safe.directory '*'` is baked in,
+    and a checkout's modes let `leerie` read it (measured rootful, checkout
+    owned by 1234, read-only: every read above works). It now runs only on a
+    writable `/work`, which locally `/work` never is. Rootless never ran it.
+  - *The setup hook and `mise install`* ran with the checkout as their
+    working directory. A hook or `mise` (`mise.lock`, a configured `.venv`)
+    could write there. They now run in a throwaway checkout of the planning
+    tree's commit (§6½ *Phase 1½*).
+  - *`git status` on the checkout* (the preflight's clean check and the
+    sentinel's snapshot) refreshed the user's index opportunistically,
+    taking `index.lock`. leerie's status reads there run with
+    `GIT_OPTIONAL_LOCKS=0`, so they never try.
+  - *The prune and the abnormal-exit clean-up of a run with no repository
+    of its own* fell back to the working directory's registry, the user's
+    `.git`: the prune created `leerie-worktree.lock` there. They now leave
+    the user's repository alone. A run made before per-run repositories has
+    its registrations in the user's repository; the host's `leerie prune`
+    deregisters those, as it already did.
+
+  Hooks are unchanged: the run's repository carries `core.hooksPath` at the
+  user's `.git/hooks`, which the workers' commits run from the read-only
+  mount. A hook that writes beside itself fails, and so does the commit
+  that ran it.
+
+  *Fly and EC2 stay read-write.* There `/work` is a clone the machine made
+  of the user's repository, on the machine's own disk, and it also holds
+  the state root (`/work/.leerie`). The user's checkout is never on the
+  machine. It receives only what `fetch_branch` brings back. Mounting
+  `/work` read-only there would first need the state root moved off the
+  volume. That protects nothing of the user's.
+
+  *The sentinel and `_repo_write_denials`, by reachability.* Both stay.
+  - `_repo_write_denials` is reachable where workers run against the
+    user's real checkout with acting tools: the host-side `run_rebaser` and
+    `run_recapture_deps`. In the local container the read-only mount stops
+    the write first. On Fly/EC2 the denial is already skipped, because the
+    state root is inside `/work`.
+  - The sentinel (`_assert_repo_unchanged`) can still catch a worker on
+    Fly/EC2, where a worker can write the machine's clone. Locally no
+    process in the container can write the checkout, so a delta there is
+    the operator's own edit on the host; its hint already names operator
+    signatures. Its baseline, `repo_state_before_planning`, is also the
+    acceptance own start's and report base's (`_acceptance_own_start`,
+    `_acceptance_report_base`).
+- *The network remote.* `remote.*` is carried, so a worker can still push
+  to the user's `origin` from the container, as it can today.
+
+**Edge cases, measured or stated.**
+
+- *Submodules.* In both layouts, `git submodule update --init` in a worktree
+  clones from the `.gitmodules` URL into that worktree's own admin
+  directory. Measured: today's layout did not reuse the user's
+  `.git/modules`, so nothing changes.
+- *A shallow user repository* (Fly's shallow seed) yields a shallow run
+  repository. Measured with a `--no-local` clone of a depth-3 copy.
+- *Partial clones (promisor remotes) and Git LFS* are not measured. None of
+  the four user repositories looked at uses LFS. For a partial repository,
+  whether the fetch can obtain objects the user's repository lacks is
+  untested. The run's repository has no LFS store, so LFS content would come
+  from the LFS remote. Both are stated, not solved.
+- *A detached HEAD start.* The bare repository's HEAD is detached at the
+  user's HEAD commit, so the scripts' existing "fall back to HEAD" keeps its
+  meaning.
+
+**Resume of a run made before this change: refused.** Its staging, subtask
+worktrees and branches live in the user's repository, and its run directory
+records no `run_layout`, so `resume` refuses it under *A run directory is
+continued only by a leerie of its layout* (below), whatever phase it reached;
+its integrated work is on `leerie/runs/<id>` in the user's repository, where
+the leerie that started it can finish it. Resuming the old way would keep
+every user-repository code path alive only for runs in flight at upgrade:
+the scoped prune of the shared registry, the cross-run lock,
+subtask-branch deletion in the user's repository and
+`_redrive_exclude_clear`. Those runs would also run without I4 while
+nothing said so. A one-time re-run is cheaper than a permanent second
+layout. Host-side tools (`list`, `finalize`, `prune`, `accept-*`) keep
+working on such runs.
+
+**Runtimes.** No mount changes and no chown is added.
+
+- *Local rootless.* The run's repository is created by the inner `leerie`
+  in the bind-mounted state root (outer UID 0 is the host user), so its
+  files are the host user's. That is the same as today's worktrees there,
+  and host git's ownership check (`safe.directory`) passes when the
+  bring-back reads them.
+- *Local rootful.* The image's `leerie` is built with `HOST_UID=$(id -u)`,
+  so its files are again the host user's.
+- *Fly and EC2.* The repository lives under `/work/.leerie/runs/<id>`,
+  which the launch wrapper already chowns to `leerie`, on the only
+  persistent volume. Fly's `collect-subtrees.sh` now runs its scripts in
+  that repository, with the state root the remote orchestrator uses
+  (`/work/.leerie`; it used to default to `/leerie-state`, which does not
+  exist on a machine). It still runs as root, so its merges leave
+  root-owned files, now in the run's repository instead of `/work/.git`.
+  That is the known follow-up §6½ records, not a new one.
+- *Reading `/work`.* The in-container fetch reads `/work` exactly as
+  today's in-container git does, and needs nothing more.
+
+**What this deletes or simplifies.**
+
+- The scoped prune runs on the run's repository. `_prune_leerie_worktrees`
+  prunes the registry `<run-dir>/repo` holds, and `cleanup.sh` acts inside
+  it whatever its caller's directory. The per-entry attribution stays,
+  against the design's first draft: the preflight reap and `prune` still
+  reach runs made before the change, whose registrations are in the user's
+  repository, and in the run's repository the attribution is merely
+  conservative.
+- Finalize's `--subtask-branches` and the check that the run branch
+  survived cleanup. Finalize's cleanup still runs, for the worktrees only
+  (deleting it would leave a full checkout per subtask until `prune`); it
+  deletes no branch, so nothing it does can take the run branch.
+- `_cleanup_on_abnormal_exit`'s `branch -D` of user refs under `full_purge`.
+- `_redrive_exclude_clear`, needed only by a resumed pre-change run.
+- The cross-run reach of `leerie_repo_lock`.
+- The user-ref half of `_restore_tree`'s blast radius. A reset can now move
+  only the run's own refs.
+
+It keeps the sentinel, `_repo_write_denials` (both by reachability, under
+*The explicit channel* above),
+`_checkout_ignore` and `_helper_worktree_path`'s run-id prefix (harmless
+once the registry is private). The launcher's `prune` keeps the
+user-registry deregistration and subtask-branch deletion for runs made
+before the change.
+
+**Statements this changed elsewhere.**
+
+- §6 *Isolation*: each worktree is backed by the run's repository.
+- §6 *Never a repository-global git operation*: its premise, a shared
+  `.git`, now holds for the user's repository and for runs made before the
+  change.
+- §6 *Ignores are per checkout*: the shared `info/exclude` is the run's
+  repository's, shared by the run's own checkouts.
+- §6 *Finalization*: the rebase runs in the rebaser's own repository.
+- §12 L4: the run branch, staging and subtask worktrees are refs of the
+  run's repository.
+- IMPLEMENTATION §7: the script rows; the lock is per run repository.
+- §6 *Branch cleanup at finalize*: finalize deletes no branch; the subtask
+  branches are refs of the run's repository.
+- §6 *Finalization* (the PR base override): the diff starts at `base_sha`,
+  not at `working_branch`.
+- §8 *A worker that does not commit never runs in a tree leerie measures*:
+  the post-run replay reads a ref-less clone of the user's repository.
+
+### A worker writes only where it is granted (I5)
+
+*Designed 2026-10-30 (the user's decision: close every hostile-worker
+trick). Lanes A, B, C and D build to the layout below.*
+
+**Root cause.** Every check so far reads what a worker left and asks
+whether it is honest: I1's checker, the settings copy, the fresh-index
+read, the sentinel. Each round found a place a worker could write that a
+reader then trusted — the run repository's config, `info/`, the index's
+stat cache, another branch's ref, `state.json` itself — or read what it
+must not: the held-out acceptance sets were kept from the fixers by the
+CLI's `Read` deny rules, which a `cat` in Bash bypasses. A worker runs as
+the same user as the orchestrator, so every path the orchestrator can
+write or read, the worker can too. Checking after the fact closes one path
+per round; the class is "a worker reaches outside what is its own".
+
+**Invariant (I5): a worker's processes write only beneath their grants,
+and read nothing of the state root but their grants.** The kernel enforces
+it (Landlock, a Linux LSM an unprivileged process applies to itself):
+`_invoke` starts `claude` through a shim (`scripts/landlock_exec.py`)
+that handles every write-class filesystem right — write, truncate, create,
+remove, rename and link (`REFER`) — and the read rights (read a file, list
+a directory), allows each only beneath a grant, then runs `claude` as its
+child and ends whatever it leaves (§6 *A confined command's processes end
+with it*). The
+restriction is inherited by every process the worker starts and cannot be
+lifted, so it binds `claude`'s own Write, Edit and Read tools as well as
+Bash, and a symlink, hardlink or rename out of a grant is refused
+(measured by lane B, rootless and rootful, ABI 8, and by
+`tests/test_worker_confinement.py`). Reads outside the state root and
+`/tmp` stay open: every entry at each directory from `/` down to the state
+root's parent is granted for reading except the one on the way to it and
+`/tmp` (a symlink that resolves into the state root or onto its path is
+skipped — pytest's `pytest-current` would otherwise have granted the whole
+root, measured — and so is one that resolves into `/tmp`). Leerie's
+grants never name the container's `/tmp`: the shim gives every confined
+process a `/tmp` and a `/dev/shm` of its own and makes every other mount
+read-only to it (§6 *Every confined process has its own `/tmp`,
+`/dev/shm` and IPC*).
+`/` itself cannot be granted without granting everything beneath it, so a
+worker cannot list `/`. Lane B measured no overhead on a warm install and
+about 83 ms per spawn.
+
+**Fail closed, on every runtime.** The shim needs Landlock ABI 3 or later
+(ABI 2 lets a rename or link between two directories inside a grant happen
+at all, ABI 3 confines `truncate`): Linux 6.2+ with `landlock` among
+the active LSMs. Every orchestrator invocation that can start a worker or
+a repository command checks it before it starts one (`_require_landlock`,
+through the one entry `_require_confinement`, *Fail closed* under *Every
+confined process has its own `/tmp`, `/dev/shm` and IPC*) and the shim
+checks it again (exit 126); below that, or with Landlock absent, the run
+stops with a message naming the kernel. Local, Fly and EC2
+alike — never an unconfined worker (docs/INSTALL.md).
+
+**The grants, one function (`_worker_grants`), by worker kind.** Every
+worker gets the first block, then its kind's.
+
+| Grant | Path | Access | Who makes it |
+|---|---|---|---|
+| devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, `/dev/pts`, `/dev/shm` (POSIX semaphores: Python's multiprocessing locks and Chromium need it, measured); `/dev/pts` and `/dev/shm` are the process's own | write | — |
+| its own `/tmp` | a fresh tmpfs per process tree, made by the shim, gone when it ends | write | the shim |
+| own temp dir | what `TMPDIR`, `TMP` and `TEMP` name: `<run-dir>/workers/<wid>/tmp/` | write | `_worker_dirs` |
+| own CLI config | what `CLAUDE_CONFIG_DIR` names: `<run-dir>/workers/<wid>/config/` (sessions live there, so `--resume` finds them) | write | `_worker_dirs` |
+| the CLI configuration template | `<run-dir>/claude-config/`, whose directories each worker's configuration links | read | `_claude_config_template` |
+| leerie's own code, the CLI, the worker's home | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check), the `claude` its `PATH` finds, and `$HOME` (the git identity, a package manager's config) unless it holds `/tmp`: each named, so that one under `/tmp` on a host is still read | read | — |
+| its side's download caches | one set per side of the run, shared by that side's workers (every store variable, the pnpm store, `XDG_CACHE_HOME`): `<run-dir>/workers/cache-held-out/` for a held-out-side worker (`HELD_OUT_LOG_WORKERS`), `<run-dir>/workers/cache/` for every other; never both (`_worker_cache_dir`) | write | `_worker_cache_env` |
+| its tree's own stores | `<run-dir>/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); the worker's per-tree store variables then name it in place of its side's cache | write for a worker that writes its tree, else read | `_tree_store_env` |
+| outside the state root | everything but `/tmp` (above) | read | — |
+| the run's system prompts | `<run-dir>/sysprompt/` | read | — |
+| the run's mise overrides | `<run-dir>/mise-overrides.toml`, which `MISE_OVERRIDE_CONFIG_FILENAMES` names to every process of a Go repository's run (§6½ step 3): without it a worker's `mise` cannot load its configuration | read | `_synth_mise_go_override` |
+
+`<wid>` is the worker's id, its first call's log sid; a re-ask or resume
+reuses the same worker's directories. A temp or config variable's
+directory is granted only when it lies beneath `<run-dir>/workers/`
+(`_worker_own_dirs`): one left at a shared default — `/tmp`, `~/.claude` —
+grants nothing. The caches are granted as the one directory its side
+shares, and nothing a worker's caches name outside it is: `/tmp/.cache`, the image's
+`MISE_DATA_DIR`, `/opt/venv`, `/opt/bundle`, `/opt/cargo-target`,
+`/opt/go-cache` and leerie's own stores `<state-root>/.stores/leerie/` are
+never granted, so no store leerie's own commands install from can be
+written by a worker. The grants are computed after `claude_p` has named
+the worker's own directories, and follow them.
+
+**A worker's `/tmp` is its own.** Until 2026-11-01 `/tmp` was shared by
+every process of the container and leerie's runs of the repository's
+commands wrote it, so a worker was refused `/tmp` whole, for reading too
+(`_reads_outside(root, tmp=False)`): a write there would have been a write
+into what leerie measures, a read there a read of what a measurement left.
+A private mount was believed to hold on one runtime only; that premise was
+wrong (§6 *Every confined process has its own `/tmp`, `/dev/shm` and
+IPC*). Now the shim mounts a fresh `/tmp` for each worker's process tree:
+nothing in it is shared, and the worker reads and writes it freely — 155 of
+the 310 corpus sessions that wrote an absolute path wrote under `/tmp`
+(lane B, e.g. `/tmp/fr_fixed.ts`). It does not outlive the process: a
+re-ask or resume starts with an empty one. A worker's temp directory is
+still its own `TMPDIR` (`<run-dir>/workers/<wid>/tmp/`; the CLI honours
+it: measured 2026-11-01, with `TMPDIR` unset the confined CLI refused to
+start on `/tmp/claude-<uid>`, with it set it made `$TMPDIR/claude-<uid>/`
+and ran). Every worker with a shell is told where it can write. The notice
+is rendered from that worker's own grant (`_confined_writes_notice`), never
+a fixed sentence: a fixed one told the implementer "only your working
+directory and $TMPDIR" while its grant, and its prompt, also had its notes
+directory (review round 18). It names its `/tmp` as private scratch that
+ends with the session. It is a notice; the kernel is the guarantee. The
+prompt a worker reads on stdin is staged in `<run-dir>/stdin/`, never in
+the container's `/tmp`.
+
+| Kind | Workers | Tree | Run repository | Run files |
+|---|---|---|---|---|
+| committing, run worktree | implementer, per-subtask conformer (subtask worktree); final conformer, acceptance-repair conformer, delivery re-drive implementer, integrator (staging) | write | its `objects/` read, nothing else of it; the tree's git metadata write (below) | read `subtasks/`, `task.md`, `notes/`; the implementer writes its own `notes/<id>/` (`criteria.md`, `checkpoint.md`) |
+| committing, disposable clone | acceptance writer, surrogate fixer, falsifier | write (its `.git` is inside it) | its `objects/` read (the clone's objects borrow them), nothing else of it | — |
+| non-committing, own checkout | delivery judge, integration judge, CI checks, PR reviewer, set auditor, verifiability classifier, delivery ratchet, replay capture, satisfied probe on a subtask tree | write with bare `Bash`, else read | read | — |
+| judgment, shared planning worktree | classifier, planners, reconciler, the judges, splitter, fit judge, satisfied probe, provision | read | read | — |
+| payload-only | judge, patch generator, PR writer, dep capture, scope judge, contract extractor | read its empty directory | read | — |
+
+A committing worker's git metadata is its tree's own repository,
+`<run-dir>/tree-repos/<tree>/` (`<tree>`: `staging` or
+`<run-id[:12]>-<sid>`; lane D, *A repository per committing tree*),
+written whole, and `<run-dir>/repo/objects/` read for the alternates —
+nothing else of `<run-dir>/repo/`. The repository belongs to the tree, not
+the worker: the workers of one tree take turns in it. A committing worker
+whose tree is a worktree of the run repository itself (a layout I6 never
+makes: the scripts remake such a tree from a tree repository) is not
+spawned at all: no grant to the run repository's `refs/` or `objects/`
+exists, and the run stops naming the tree (`_tree_git_dirs`). The settings
+check (§8 *The settings are leerie's*) reads each tree repository against
+the run's one copy. The delivery re-drive also
+reads its self-check directory `<run-dir>/selfcheck/<group>/` (the shown
+sets, the config) and writes its `run/` (the self-check's copies and call
+log).
+
+An implementer's notes are `notes/<id>/criteria.md` and
+`notes/<id>/checkpoint.md`, one directory per subtask, because a grant can
+name a directory before either file exists; the earlier
+`criteria/<id>.md` and `checkpoints/<id>.md` could not be granted one
+subtask at a time.
+
+Nothing else is granted: not `state.json`, `acceptance/`, `logs/` or
+anything else in the run directory, not `repo-settings/`, not staging or a
+view (unless it is the worker's own tree), not a sibling's worktree, not
+`/work`, `$HOME` for writing, the container's `/tmp`. A tool that writes
+beneath `$HOME` by a fixed path is redirected by environment to the
+worker's own directories, or fails — then that is a finding, not a grant
+to widen.
+
+**Outside the container.** The host-side workers — the rebaser
+(`host-finalize.sh` → `run_rebaser`), the host recapture
+(`run_recapture_deps`) and `leerie config --chat` — are not confined. They
+run on the user's host, they are not run workers (no run is in flight;
+each is started by the user or by the launcher after the container exits),
+and macOS has no Landlock. They keep their existing scoped rules (§12
+*Scoped exception — finalize-time rebase*). The one place that marks a call
+as this seam is `_resolve_host_seam_settings`, on that call's own caps
+(`HOST_SEAM_CAP`), never on process state another call could inherit;
+`_invoke` takes `grants` as a required keyword, and `None` (unconfined)
+comes only from `claude_p` on those caps. The Fly recovery
+integrator (`collect-subtrees.sh`) is a run worker: it takes its grants from
+`worker-guard.py` and is skipped, never run, without them.
+
+**The host never imports the repository's code.** The host-side exception
+covers leerie's own code, never the repository's. The launcher and the
+scripts it runs on the host call `python3` dozens of times — small `-c`
+helpers, stdin programs, and seams that load `orchestrator/leerie.py` by
+path — from the operator's cwd, which is the user's checkout. A program
+read from `-c` or stdin puts the cwd first on `sys.path`, so a `json.py` or
+`contextlib.py` at the checkout's root (a file a worker wrote, in a run
+whose branch the user merged) ran on the host, unconfined, with the
+operator's gh and ssh credentials (review round 25, I1: a planted
+`contextlib.py` ran under the bare-resume pick seam). The root cause is
+that the host interpreter took its import path from the place it was run
+from. The invariant: **no host-side Python resolves a module from the
+checkout.** Every host-side `python3` is isolated, spelled `python3 -I`
+at the call: no cwd or script directory on `sys.path`, no `PYTHON*`
+environment, no user site. That holds because every host-side program
+imports only the standard library, plus leerie's own `chain/` package,
+whose directory is put on `sys.path` explicitly. The one convention is
+checked by a rule over every host-run file, so a new call without it
+fails the suite. Commands the host sends to a Fly or EC2 machine follow
+the same spelling.
+
+**Residuals.** A committing worker can move any ref of its own tree
+repository, its tree's branch included; leerie takes only that branch, and
+reads every other branch in the run repository, which the worker cannot
+write (I6). Below Landlock ABI 6 a worker can signal any process of its
+user, the orchestrator included; from ABI 6 the shim scopes signals and
+abstract unix sockets to the worker's own Landlock domain. The
+process-kill deny rules (§9) and `TaskStop` stay the guard where the ABI
+is lower.
+
+**Landlock does not mediate inode metadata or path walk.** A process can
+`chmod`, `utime` and `setxattr` any file of its user that it can name,
+outside every write grant — `state.json` included — and `readlink` and
+`lstat` names in a directory it may not list (measured, ABI 8). A
+read-only mount, or a distinct uid, is the only fix; the shim makes every
+mount but the grants read-only to every confined process (§6 *Every
+confined process has its own `/tmp`, `/dev/shm` and IPC*), which closes
+the metadata writes. Names read by path walk outside a grant stay
+readable; they are names, not contents.
+
+### A worker's commands cannot reach its CLI
+
+*Designed 2026-11-01 (review round 21, isolation R4).*
+
+**Root cause.** What a worker ran is read from its own transcript (§8),
+and the transcript is the CLI's stdout: a pipe to the orchestrator. The
+CLI and every process it starts shared one uid and one Landlock domain, and
+`/proc` is readable to every grant, so any command the worker runs — a
+test file, a build script, code under measurement — could open
+`/proc/<cli pid>/fd/1` (a ptrace-mode read: allowed within one domain, and
+Yama does not restrict reads) and write stream-json into the pipe. The
+round-12 and round-14 fixes attribute events by *file* (the registry); the
+stream itself was reachable by the code the worker runs. Measured (review
+round 21; again 2026-11-01 with the real CLI 2.1.312 in both local
+runtimes, isolated): a Bash-tool command wrote a forged `tool_use` into
+the stream, and it reached the transcript. The same route injects a
+`result` event or a `session_id`, which steers the re-ask's resume.
+
+**Invariant.** Nothing the worker's CLI starts on the worker's behalf runs
+in the CLI's own Landlock domain: each command and hook runs in a domain
+nested inside it, so no process the worker's code can be may open, attach
+to or read the memory of the CLI, and the CLI's stream carries only the
+CLI's events.
+
+**Mechanism.** The CLI runs every Bash-tool command and every hook as
+`$CLAUDE_CODE_SHELL_PREFIX <command>` (measured, CLI 2.1.312: the prefix is
+the CLI's direct child for a Bash command, and run under `/bin/sh -c` for a
+hook; it gets the command as one argument). Every confined worker's CLI is
+given `scripts/worker-shell.py` there (`_invoke`; and in its settings,
+below). It enters a Landlock domain nested in the worker's
+(`landlock_exec.nest`) and `exec`s `bash -c <command>`. The nested ruleset
+handles every right the worker's does and allows all of it beneath `/`, so
+the command reaches exactly what the worker's grants allow — an access
+passes only when every layer of the domain allows it. But Landlock refuses
+a process ptrace-class access to any process outside its domain and its
+nested ones: `/proc/<cli>/fd`, `/proc/<cli>/mem`, `ptrace`, `pidfd_getfd`.
+No scope is set in the nested domain, so a command may still signal, or
+connect to an abstract socket of, what an earlier command of the same
+worker left running. It fails closed: when the domain cannot be made, the
+command does not run (126). The shell is named absolutely with `-I -S`: it
+runs in the CLI's domain until it nests, so nothing a worker can write (a
+`python3` earlier on `PATH`, a `site` directory) runs there. Measured
+2026-11-01, real CLI, rootless and rootful, isolated: without the prefix a
+command opened the CLI's `fd/1` and a forged line reached the stream; with
+it both were refused, and `git`, `node` and `pnpm` ran unchanged; about
+40 ms more per command on the host.
+
+*The CLI reads no settings file.* A settings file runs code in the CLI's
+own domain: `apiKeyHelper` runs under `/bin/sh -c` without the prefix
+(measured), and a settings `env` can unset the prefix. Every file the CLI
+would read is one a worker can write — its own configuration directory's
+`settings.json`, and its tree's `.claude/settings.json` and
+`.claude/settings.local.json`, which reach every later worker in that tree
+(the gap §6 *Each worker's own configuration and temporary directories*
+left to the write grant). So a confined worker's CLI gets
+`--setting-sources ""` and its whole settings in `--settings`
+(`_confined_cli_settings`): the operator's settings from the run's
+read-only configuration template, the repository's project and local
+settings from the user's checkout (which no worker writes), then leerie's
+own — the PreToolUse hook and the shell prefix, which nothing below them
+overrides (settings given on the command line win over every file scope,
+measured). Merged as the CLI merges scopes: objects key by key, arrays
+concatenated. The Fly recovery integrator gets the same from
+`worker-guard.py`.
+
+**Residuals.** The CLI's own spawns that are not commands: its `git`
+calls are on leerie's terms (§6 *The CLI's own git runs on leerie's
+terms*; the earlier claim here that they "run no code a worker chose" was
+false — review round 22 isolation H1); `rg` for Grep and Glob runs in its
+domain and runs no code a worker chose through settings, which it no
+longer reads. A worker's configuration directory is writable whole, so a worker can replace
+its links to the template's `plugins/` with its own; a plugin is loaded only
+when the operator's settings enable it, and then at the next start of that
+configuration — the worker's own re-ask. Closing that needs the
+configuration's code-bearing directories out of the worker's reach, which
+this design does not do. A nested command can still signal the CLI, at
+every Landlock ABI: `nest()` sets no scope, deliberately, so a later
+command can still stop or reach what an earlier command of the same worker
+left running (sibling nested domains would otherwise refuse each other),
+and the worker's own signal scope (ABI 6 and later) admits every process of
+its own domain, the CLI included. That is a stop, not a forgery, and it
+breaks no isolation invariant: the CLI is the worker's own process, which
+any process of the worker could already signal, and the missing nested
+scope adds no reach beyond the worker's domain — what a worker can signal
+outside it is the worker's scope alone (*A worker writes only where it is
+granted (I5)*, Residuals), so no worker reaches another worker or leerie
+through it.
+
+### The CLI's own git runs on leerie's terms
+
+*Designed 2026-11-01 (review round 22, isolation H1).*
+
+**Root cause.** The nest (§6 *A worker's commands cannot reach its CLI*)
+was aimed at the commands the CLI runs for the worker; the CLI also runs git
+for itself, in its own domain. At the start of every session it runs
+`status`, `log`, `ls-files`, `config` and `remote` in its working directory
+(measured, CLI 2.1.312; it passes `core.hooksPath=/dev/null` and
+`core.fsmonitor=` but not `filter.*`). git found the repository through the
+tree's `.git` file, and a committing worker writes that file and its whole
+tree repository. So an implementer pointed `.git` at a git dir of its own
+with a clean filter and `info/attributes`, the next worker's CLI ran the
+filter in its session-start `git status`, and the filter wrote a forged
+`tool_use` into `/proc/<cli>/fd/1`: the transcript. Leerie's clean-tree
+checker never follows that `.git` (§6 *Leerie's git never takes a tree's
+repository from the tree*), so it read the tree clean. The same holds for
+the Fly recovery integrator. The CLI strips `GIT_DIR` and `GIT_WORK_TREE`
+and sets its own `GIT_CONFIG_*` for these calls (measured), so no
+environment pin reaches them.
+
+**Invariant.** Every git process that runs on a worker's tree outside that
+worker's own nested command domain addresses the repository from leerie's
+layout, never the tree's `.git`, and runs in a domain nested away from the
+CLI; and every worker starts on its tree's repository with leerie's
+settings and a `.git` that names it, so nothing a worker before it chose
+there reaches it or its CLI.
+
+**Mechanism.**
+
+- *The CLI's `git`.* A confined worker's CLI finds git on its `PATH`, and
+  `scripts/cli-bin/` (holding only `git`) is first there (`_cli_git_env`,
+  set by `_invoke` for every spawn with a grant, and by `worker-guard.py`
+  for the Fly integrator). A call from one of the worker's own commands —
+  marked by `worker-shell.py`, so inside the nested domain — gets the real
+  git untouched. Any other call is the CLI's own: `scripts/cli-git.py`
+  enters a nested Landlock domain (`landlock_exec.nest`) and runs the real
+  git with the arguments leerie's own git on that tree takes
+  (`_tree_git_args`: `--git-dir` of the tree's administrative directory,
+  found from the repository's side, `--work-tree` the tree, leerie's pins).
+  The tree's `.git` is never followed, and a driver it does run (one the
+  same worker defined in its own repository's settings during its session)
+  cannot open the CLI's `/proc` entries. It fails closed (126). A ref-less
+  clone's CLI reads the clone through leerie's git directory for it, which
+  its grant now reads. Not `_git_view`'s copies of the outside settings:
+  they are outside every worker's grant, and the settings they copy (system,
+  global) are ones no worker writes.
+- *No settings layer below leerie's steers it.* The CLI applies its
+  settings' `env` over its process environment, so an operator's or a
+  repository's `env.PATH` sent one of its git calls (`ls-files`) past
+  `scripts/cli-bin` (review round 23, measured on the host; the other five
+  had resolved git earlier). Every variable the confinement reads — `PATH`,
+  `CLAUDE_CODE_SHELL_PREFIX`, `LEERIE_WORKER_COMMAND`, `LEERIE_CLI_GIT`,
+  `LEERIE_REAL_GIT` — is set in leerie's own layer, the top one: no lower
+  layer's `env` keeps any of them or any other `LEERIE_*` variable
+  (`_confined_cli_settings`), and `_invoke` lays the worker's own values of
+  them over the `env` of the settings it passes (`_pin_cli_settings`), the
+  marker empty, so leerie's guarantee depends on no other layer.
+- *Every start.* Before each confined worker starts, leerie puts back its
+  settings over the tree's repository (`_restore_settings`) and the tree's
+  `.git` file naming the administrative directory leerie's layout gives it
+  (`_restore_git_pointer`; a `.git` directory or link in its place is
+  removed first, nothing is written through a link) —
+  `_ready_tree_for_worker`. A rewritten pointer is not a violation to type:
+  it is made irrelevant. Leerie's own git never reads it, the CLI's own git
+  never reads it, and the next worker starts with it put back. A worker's
+  own git — in its commands, nested — follows its tree's `.git` as git
+  does, so what it chooses there reaches only itself.
+
+Measured 2026-11-01, real CLI 2.1.312 (haiku), confined like a worker, in
+both local runtimes (rootless and rootful): with the tree's `.git` pointed at
+a planted git dir with a clean filter, without the shim the filter ran in
+the session-start `git status` and a forged line reached the stream (the
+round's finding reproduced); with the shim and the pointer put back the
+filter never ran, nothing was forged, the CLI's git answered from the
+tree's repository, and the worker's own `git add`/`commit` landed on the
+tree's branch. On the host, the shim alone with no addressing let the
+filter run but refused its write to the CLI's `fd/1` (the nest), and the
+shim with addressing ran nothing.
+
+### Leerie's runs of the repository's commands are confined too (I5, measurements)
+
+*Designed 2026-10-31 (review round 18, H1).*
+
+**Root cause.** I5 confined the worker's session, but a worker's output
+is code, and leerie runs that code whenever it measures or installs: the
+repository's build, lint and test commands, its install recipe, the
+held-out acceptance runs, CI parity, coverage, the settle-by-execution
+`verify` commands, and leerie's own AST scripts, which load the tree's
+`typescript`. Each ran as the orchestrator, with the orchestrator's
+access to the run directory. So the confinement boundary stopped one step
+short of the code the worker wrote: the project's `conftest.py`, a
+`postinstall`, a `Makefile` target. A worker could get through leerie's
+commands what I5 refuses its session.
+
+**Invariant (I5, measurement kind): a command leerie runs on a
+repository's code writes only beneath its measurement grant, and reads
+nothing of the state root but that grant.** The kernel enforces it the
+way it enforces a worker's: the command is started through the same shim
+(`scripts/landlock_exec.py`) with the grants `_measurement_grants(st,
+tree, kind)` derives. `_run_streaming`, through which every repository
+command leerie runs is spawned (`_run_contained` included), takes
+`grants` as a required keyword and has no unconfined path; the AST scripts
+and `mise ls` are started through `_confined_argv` with the same grants.
+Every input leerie hands such a command — a path in its argv — lies
+inside its grant: a file leerie writes for the command to read (the
+re-drive AST gate's base copy) is written in the tree's private temp
+directory, never in leerie's own temp directory `<run-dir>/tmp/`, which no
+grant reads — and written there without following a link (*Leerie never
+writes through a path confined code shaped*).
+`_run_streaming` and `_ts_script_run` check every absolute argv path that
+exists against the grant before they spawn (`_argv_outside_grant`) and
+stop the run (`die`) on one outside it: a command that cannot read its
+own input fails as "could not measure", which the re-drive's gate (d+)
+read as a void round — every escalated round on a JS/TS repository was
+rolled back that way once leerie's temp files moved to `<run-dir>/tmp/`
+(review round 20, execution H1).
+Fail closed as for a worker: the invocation's entry has already required
+Landlock (`_require_confinement`), and the shim refuses (exit 126) where it cannot
+enforce, which a measurement reads as "could not measure", never a pass.
+
+**The grant, by kind.** Every kind gets the first block.
+
+| Grant | Path | Access |
+|---|---|---|
+| devices | as a worker's | write |
+| the measured tree | the checkout the command runs in (a committed view, an evaluation tree, a helper checkout, a worker tree an install runs in) | write |
+| its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `mise-state/` (`MISE_STATE_DIR`), `state/` (`XDG_STATE_HOME`), `reports/` (the runner report of every run that is not held-out; a held-out run's report path is there inside its sandbox only), `coverage/` (the coverage detector's output) | write |
+| its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, and its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) (*A confined command's scratch is short and private*), carried into its own `/tmp` | write |
+| `/tmp`, `/dev/shm` | the command's own, made by the shim, every kind, every tree (*Every confined process has its own `/tmp`, `/dev/shm` and IPC*) | read and write |
+| leerie's install, the home | `ROOT` (the AST scripts), `HOME` (unless it holds `/tmp`), named as a worker's are | read |
+| the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
+| leerie's stores | `<state-root>/.stores/leerie/`: the fetched stores (*Which stores an install may share*) | read |
+| the verified stores | what `PIP_CACHE_DIR`, `POETRY_CACHE_DIR` and `YARN_GLOBAL_FOLDER` name (`_VERIFIED_STORE_VARS`): the manager refuses an edited entry on reuse | write (read only in a held-out run's grant, `_heldout_grants`: an evaluation installs nothing) |
+| the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
+| the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
+| outside the state root | everything but `/tmp`, as a worker's | read |
+| *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
+| *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR`; `mise-state/` emptied first | write |
+| *store-fetch kind* (`_populate_leerie_store`, in its staging directory) | also leerie's store, its store variables left pointing there | write |
+| *install kind* (every install leerie runs: a recipe's `install` entries, CI parity's prerequisites, `_install_settles`) | nothing more on disk; the outside network through the egress proxy (*A confined process has its own network*, *An install reaches its inputs*) | — |
+
+Nothing else is granted: not `state.json`, `acceptance/`, `logs/`,
+`workers/`, `repo-settings/`, another tree's repository in `tree-repos/`,
+the run repository's refs for writing, a sibling tree, or another tree's
+measurement directory. The git metadata is read-only because no
+measurement needs more: in a confined view `git status`, `log`, `diff`,
+`rev-parse`, `ls-files`, `stash list` and `describe` all succeed with the
+run repository read-only, and `git status` skips its opportunistic index
+refresh (measured 2026-10-31). A tree whose path holds or lies beneath one
+of the run directory's private entries is no measured tree: the run stops
+naming it (`die`), since granting it would grant them.
+
+**The measurement directory belongs to one tree, for that tree's
+lifetime.** It is named for the tree and for an id leerie writes into the
+tree's git directory on first use (`leerie-measure-id`): a tree removed and
+made again at the same path gets a new git directory, so a new id and a
+fresh directory, and nothing a measurement left behind reaches the next
+tree. The git directory is the one leerie's layout names
+(`_run_tree_location`), and for a committing tree it is in the tree
+repository its worker writes, so the id is an untrusted key: read and
+written from the run directory down without following a link (*Leerie
+never writes through a path confined code shaped*), and any value the
+worker could leave names only one of that tree's own measurement
+directories, or a fresh one. Nothing else that tree's id could hold is
+leerie's: no other place keeps the tree's lifetime, since an inode number
+is reused (on ext4 the freed one is the next given in its group). A directory whose tree is gone, or whose tree's id has changed, is
+removed by the next measurement's sweep (moved aside at once, deleted in
+the background). It is never shared between trees: one held-out
+evaluation's tree is not another's, and no worker is granted any of them.
+It lives under `<run-dir>/measure/`, outside `<run-dir>/repo/`, which
+every non-committing worker reads. Leerie reads a report there after the
+command exits, without following a link the command left; a held-out
+run's report never lands there at all.
+
+**The variables follow the grant.** The grant names its own environment:
+`TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` point at the tree's private
+temp directory and `MISE_STATE_DIR` at the measurement directory, laid
+over the caller's environment last. The store
+variables stay as leerie's environment (`_leerie_stores`) and
+`_tree_store_env` set them, each in the class the grant writes or reads.
+A recipe entry's or a CI check's own variables still apply; a temp or cache
+path they name outside the grant is refused, which is a finding, not a
+grant to widen. A fixed `/tmp/<name>` path is not: every command writes
+its own `/tmp` as it would outside leerie.
+
+**Leerie's stores, by class.** The fetched stores under
+`<state-root>/.stores/leerie/` (`_FETCHED_STORE_VARS`) are written by
+leerie's own scripts-free fetch alone (`_populate_leerie_store`, the
+store-fetch kind: no repository code runs there) and read only by every
+other measurement; a confined install copies from them
+(`_COPY_IMPORT_ENV`). The verified stores are written by installs, which a
+manager that refuses an edited entry makes safe to share. The tree's own
+stores are written by that tree's commands and read by no other tree; they
+follow the measurement directory's lifetime: a tree made again at the same
+path starts with them empty (`_measure_dir`). No worker is granted any of
+them.
+
+**The setup hook is the user's code, run once before any worker.**
+`.leerie-setup.sh` runs in phase 1½, in a throwaway checkout of the
+planning commit (§6½ step 1), before any worker that commits exists: it is
+the repository's own code as the user committed it, not a worker's. It is
+confined with the setup-hook kind, whose extra writes are exactly what §6½
+says a hook may do — install a language runtime with `mise`
+(`MISE_DATA_DIR`) and a user-space tool into `~/.local/bin` — and nothing
+of the state root but its checkout and its measurement directory. The
+premise is checked, not assumed: `claude_p` records the first committing
+worker's start (`committing_worker_started`), and a hook that has not run
+yet when that is set stops the run instead of running.
+
+**`mise install` runs the repository's code only from a configuration it
+trusts.** Measured on the image (mise v2026.5.4): a trusted `mise.toml`
+runs its `exec()` templates, its `_.source` scripts and a tool's
+`postinstall`; an untrusted one makes mise refuse to run; `.tool-versions`
+and the idiomatic version files run nothing. So it is confined with the
+toolchain kind — it must write `MISE_DATA_DIR`, outside the state root —
+and its `MISE_STATE_DIR`, where mise keeps its trust records, is emptied
+first: whatever the hook trusted is gone, and mise trusts nothing by code,
+not by what a shared `/tmp/.mise-state` happens to hold. `mise ls
+--current --json` runs under the same grant.
+
+**The re-drive's self-check** (`scripts/selfcheck.py`) is started by a
+confined worker's shell and spawns the runner itself, so it runs inside
+that worker's grants (*A worker writes only where it is granted*): no
+second grant applies.
+
+### Leerie's git never takes a tree's repository from the tree
+
+**Root cause (review round 19 isolation H1).** Confined code writes its
+whole tree: a measurement's install in a committed view, a worker in its
+own tree, which for a committing worker includes its tree repository. The
+tree's `.git` file is in the tree. Leerie's own git commands on the tree
+run unconfined, and every one of them found its repository from the tree
+(`git -C <tree>`, or a working directory), so they followed whatever that
+`.git` file named and read that repository's configuration. The
+configuration names programs git runs on its own, `core.fsmonitor` on every
+index refresh among them, so leerie's own git would run what confined code
+wrote, outside every grant. The command was confined; leerie's housekeeping
+around it was its proxy.
+
+**Invariant: leerie's own git commands never take a repository's location
+or configuration from a path confined code can write.** Every leerie git
+command on a tree goes through one helper (`_tree_git_args`, and
+`leerie_tgit` in the scripts), which names the repository from leerie's
+layout:
+
+- A tree is in a run's `worktrees/`. It is a worktree of its tree
+  repository, `<run-dir>/tree-repos/<name>` when that exists, and else of
+  the run repository. Its git directory is the administrative directory
+  of that repository whose `gitdir` record names the tree, found from the
+  repository's side. The administrative directory's `commondir` must name
+  that same repository, since a committing worker can write its own tree
+  repository. A tree that the record names stays a worktree whatever its
+  `.git` now is, a directory included. One no record names is a ref-less
+  clone of the run repository, read through the git directory leerie made
+  for it (below), never its own `.git`.
+- The command is `git -C <tree> --git-dir <git dir> --work-tree <tree>`,
+  so the tree's `.git` is never followed. It always carries leerie's
+  pins: `core.fsmonitor` and `core.untrackedCache` off. The readers that
+  need leerie's settings (`_git_view`, `leerie_vgit`) add them as before
+  (§8 *The settings are leerie's*). The repository's own `config` and
+  `info/` are put back before a read, which covers what a committing
+  worker can write.
+- A run tree that matches none of this is refused. git then fails, and
+  the caller reads that as git unable to answer, never as clean.
+- A tree outside every run (the user's checkout, a test's repository) is
+  addressed `-C <tree>` with the pins: no confined code writes it.
+
+Guards derived from the source hold every site to it: no leerie git argv
+carries `-C` except in the helper, every git command run with a working
+directory names its repository, and the scripts that source
+`worktree-lib.sh` run git on a tree only through `leerie_tgit`.
+
+*A ref-less clone is read through leerie's own git directory.* The
+acceptance writer's, the surrogate fixer's and the falsifier's checkouts
+are ref-less clones of the run repository, and a clone keeps its
+repository in its own `.git`, inside the tree its confined worker writes —
+config, hooks and attributes included. So when `_ref_less_clone` makes a
+clone in a run's `worktrees/`, it also makes `<run>/clone-gits/<name>`
+(`_make_clone_git_dir`): a git directory whose objects are the run
+repository's (an `alternates` entry), whose HEAD is the clone's commit
+detached, and whose index is that commit's tree. It is written by leerie
+alone, before any worker runs there, in a directory no worker's grant
+names. `_run_tree_location` and `leerie_tree_location` locate a ref-less
+clone at it and never at the clone's `.git`; a clone without it is
+refused. The worker's result — files it edited or added — is read as
+before, as working-tree data against the clone's commit, and a commit the
+worker makes in its own `.git` is not followed: what it changed is still
+in the tree. Measured with a planted config in the clone's `.git` (an
+fsmonitor, a clean and smudge filter, a filter process, a textconv, a hooks
+path) and `* filter=x diff=x` attributes: reading the clone's own `.git`,
+leerie's `git status` ran the planted filter program; through leerie's git
+directory it saw the worker's edit and ran nothing. Of the two candidates —
+fetching the clone's result into the run repository, or running leerie's
+reads confined — this one needs neither a commit from the worker nor trust
+in what a confined program reports, and it is the same rule every other
+tree follows: the repository is located from leerie's layout. The setup
+commands of `_ref_less_clone` itself name the clone's `.git` explicitly,
+which is still leerie's until a worker runs.
+
+### Leerie never writes through a path confined code shaped
+
+*Designed 2026-11-01 (review round 21, isolation R1 and R5).*
+
+**Root cause.** Confined code writes more than its own files: every
+directory on the way to them inside its grant. A committing worker writes
+its tree and its tree repository whole; a measurement writes the tree and
+its measurement directory. Leerie's housekeeping around them — restoring a
+tree, putting a repository's settings back, keeping a tree's measurement
+id, placing a set or a task's report in a checkout, writing a held-out
+run's report back to disk — runs unconfined, and it addressed those
+directories by path, so the kernel resolved every link confined code had
+left there on leerie's behalf. Round 19 found this for git (*Leerie's git
+never takes a tree's repository from the tree*); round 21 found it for
+leerie's own writes:
+
+- *R1.* A held-out run's report came back through the sandbox's
+  descriptor, and `_run_streaming` then wrote it to the path the runner
+  had used, in the tree's `reports/`. An ordinary measurement of the same
+  view, which runs the worker's code with that directory in its grant, had
+  replaced `reports/` with a link to an implementer's tree; the evaluated
+  code had copied the placed set into its report. Leerie's write put the
+  set's text in the implementer's tree. The descriptor protected the bytes
+  in transit, not the place they landed.
+- *R5.* `_measure_dir_at` rewrote the tree's `leerie-measure-id` with a
+  plain write, and `_restore_settings` copied the settings to a fixed temp
+  name in the tree repository before renaming it. A committing worker
+  planted a link at either name; leerie's next write went through it, over
+  `state.json` and a held-out set, which the worker's own grant refuses.
+
+The class is "leerie, unconfined, resolves a path through a directory
+confined code can write", and a check of each site's target would only
+find the next one.
+
+**Invariant: an unconfined write leerie makes lands at the path it names,
+or nowhere.** It is constructed in three parts.
+
+1. *Leerie's own records live outside every grant.* A held-out run's
+   report is parsed from the descriptor's bytes and never put on disk
+   (`_run_streaming(report_into=)`; the parse probe's marker and the AST
+   facts likewise); the minitest reporter is part of leerie's install
+   (`MINITEST_REPORT_LIB`), read by every confined command and written by
+   none; the integrator rescue's throwaway index is in leerie's temp
+   directory, not the tree's git directory. The one record that must stay
+   with a tree — its measurement id, which has to share the tree's
+   lifetime — is an untrusted key (*Leerie's runs of the repository's
+   commands are confined too*).
+2. *Every write into a directory confined code can write is made from an
+   anchor down, never through a link.* The anchor is a directory no
+   confined process can replace: the run directory, or a grant's own root
+   (its entry lies in a directory no grant names, and Landlock grants what
+   is beneath a path, not the path's entry in its parent). From there each
+   component is opened `O_DIRECTORY|O_NOFOLLOW` (`_open_dir_beneath`); a
+   file is made `O_CREAT|O_EXCL|O_NOFOLLOW` at a fresh name in that
+   directory's descriptor and renamed over the destination
+   (`_write_beneath`), so a link at the destination is replaced, never
+   written through, and a link on the way refuses the write. Reads of what
+   confined code wrote take the same walk and refuse a link or a FIFO
+   (`_read_beneath`); removals and chmods likewise (`_unlink_beneath`,
+   `_remove_beneath`, `_add_dir_bits_beneath`, which reaches each directory
+   through an `O_PATH` descriptor). A directory of leerie's own layout
+   found as a link or a file — a measurement's `reports/`, a tree's stores —
+   is removed and made a directory (`_mkdir_private`).
+3. *A checkout of committed code is confined code's too.* A set's files, a
+   task's report, a falsifier's leads and the planning worktree's extras
+   are copied into checkouts whose content a worker committed, links
+   included: a committed `tests -> ../wt-a/tests` would carry a set into a
+   fixer's tree. Every such copy goes through the same walk, and a path a
+   link stands on is a taken path.
+
+A rule over the module holds the line: every function that still calls a
+raw write primitive is classified, by why its target is out of every
+confined process's reach (leerie's own state, logs and run repository; a
+grant's root itself; the host side; code that runs inside a worker's own
+confinement), and the functions that write where confined code writes use
+none (`tests/test_leerie_writes_never_follow_links.py`). Git's own writes
+into a tree are git's, which refuses a path beyond a link; leerie names
+the repository for it (*Leerie's git never takes a tree's repository from
+the tree*).
+
+### A confined command's scratch is short and private
+
+*Designed 2026-11-01 (review round 19, execution H1).*
+
+**Root cause.** The measurement grant put a confined command's scratch
+space where leerie keeps its state — `TMPDIR` and `XDG_CACHE_HOME` deep in
+the run directory (`/leerie-state/runs/<64 hex>/measure/<tree>-<id>/tmp`,
+138 to 166 characters in the container) — instead of where scratch space
+must be: at a short path, private to its user all the way up. Nothing ran a
+real repository's test suite under the grant before it shipped. Measured
+on barnacle: tsx binds its IPC socket in `os.tmpdir()`, and a Unix socket
+path holds at most 107 bytes, so 495 tests in 356 files failed confined
+against 1 unconfined. Measured on funeralworks: Next's SWC refuses a cache
+root with an ancestor writable by another user and not sticky, and the
+state root is 775 under the host's umask (`~/.leerie`), so `next build`
+died in 6 s.
+
+**Invariant: a confined command's temp directory is short, and readable
+and writable by its user alone on its whole path.** Each measured tree has
+one, `/tmp/l/<id>/` (`PRIVATE_TMP_ROOT`, `_private_tmp`; `<id>` is 16 hex
+digits of the hash of its measurement directory's path, so its length
+never depends on the run's id or the tree's name): 23 characters, so tsx's
+`<dir>/tsx-<uid>/<pid>.pipe` fits with room to spare. `/tmp/l` and each
+directory in it are made 0700 and must be this user's directories, not
+links — anything else stops the run, since a command whose scratch it is
+could be read or planted (`_own_private_dir`). The shim carries it into
+the command's own `/tmp`, sticky, under a root the caller owns (§6 *Every
+confined process has its own `/tmp`*), which SWC's check accepts. `TMPDIR`, `TMP`, `TEMP`
+and `XDG_CACHE_HOME` all name it; `MISE_STATE_DIR` stays in the
+measurement directory, which no tool inspects for ownership. It lives as
+long as its tree: the sidecar of the tree's measurement directory names it,
+and the sweep that removes the measurement directory removes it too, as
+does the release of the run's scratch when its process exits or execs
+(`_release_run_dir`, §6 *No copy of the credentials outlives its run's
+process*); a directory with no run removes itself at its process's exit.
+Every removal is the owner-aware one (`_rmtree_owned`). Every directory leerie makes for a
+measurement or a worker — the measurement directory and its subdirectories,
+a tree's own stores, a worker's configuration and temp directory, the
+workers' caches, a worker's notes — is made 0700 (`_mkdir_private`).
+
+Measured 2026-11-01 on the user's two repositories, each command through
+leerie's measured path (`_measured_tree` and `_measure_axes` on staging's
+committed view), then the same command unconfined in the same view:
+barnacle's `pnpm test` failed 1 test file of 1,298 confined (1 test of
+7,172: the repository's own site-vocabulary guard) against 2 unconfined
+(that guard, and a 6 s wall-clock bound a loaded host missed); its build
+and lint passed both ways. funeralworks' configured `test`
+(`./scripts/leerie-test-db.sh pnpm run test`: a postgres started with
+`-k /tmp`, its lock at a fixed `/tmp` path, tsx in `pretest`) passed all
+1,287 files and 13,036 tests both ways, and `next build` compiled both
+ways with no SWC cache refusal.
+
+A worker's own temp directory is still `<run-dir>/workers/<wid>/tmp/`
+(§6 *Each worker's own configuration and temporary directories*), at the
+run directory's depth: a socket in it can exceed `sun_path` too. That is
+this design's open edge on the worker side, not closed here; a worker's
+own `/tmp` is now private and short, so pointing its `TMPDIR` there would
+close it.
+
+### Every confined process has its own `/tmp`, `/dev/shm` and IPC, and sees every other mount read-only
+
+*Designed 2026-11-01 (the held-out isolation design, its §3.6; adopted in
+full). It replaces "A measurement may write `/tmp`; a held-out evaluation
+has it alone" (round 19) and "A command in a worker's tree is kept from
+`/tmp` as the worker is" (round 20, 7bd42ed7).*
+
+**Root cause.** `/tmp`, `/dev/shm`, the System V and POSIX IPC objects and
+the metadata of every file of leerie's user were stores every process of
+the container shared, and Landlock mediates none of them but `/tmp`'s
+contents: it handles opening, creating, removing and renaming files, not
+a file's mode, times or extended attributes (`chmod`, `utime`, `setxattr`
+on a file outside every write grant succeed), not path walk (`readlink`
+and `lstat` work in a directory a process may not list), not IPC objects
+and not the kernel keyrings (measured, ABI 8). So each round confined one
+of them by rule — workers refused `/tmp` (round 19), measurements given it
+under a lock with leftovers removed by inventory (round 19), commands in a
+worker's tree refused it again (round 20) — and each rule had a cost the
+next found: a repository's tests that need a fixed `/tmp/<name>`
+(barnacle's `/tmp/recon`) failed in a worker's tree, and a set auditor
+with a shell read a tree whose command had run with `/tmp`. The rules
+existed because the store was shared; a store that is not shared needs
+none of them.
+
+**The premise was wrong.** DESIGN said a private `/tmp` per command was
+not available: "`unshare -m` is refused in both the rootless and the
+rootful container", and a private mount "needs a user namespace, which the
+default seccomp profile refuses on rootful". The first holds only for
+`unshare` without a user namespace — container root lacks `CAP_SYS_ADMIN`
+in the container's own namespace (EPERM, rootless and rootful, measured).
+An unprivileged process that first creates a user namespace, mapping its
+own uid and gid onto themselves, holds the namespace capabilities inside
+it, and can then make mount, IPC, network, UTS and PID namespaces and
+mount `tmpfs`, `devpts`, an overlay (`userxattr`) and bind and read-only
+remounts in them. What stood in the way was the container's policy, not a
+missing privilege:
+
+| runtime and flags | user namespace | other namespaces after it | mounts |
+|---|---|---|---|
+| rootless, the launcher's flags before this (`seccomp=unconfined`, AppArmor `nerdctl-default`) | yes | yes | EACCES (AppArmor `deny mount`) |
+| rootful, the launcher's flags before this (default seccomp, `nerdctl-default`) | EPERM (seccomp) | — | — |
+| either, `seccomp=unconfined` and the `leerie-container` profile (below) | yes | yes | yes, each allowed by type and target |
+| the host's own shell (Ubuntu, `kernel.apparmor_restrict_unprivileged_userns=1`) | restricted: `setgroups` EACCES, no capability | — | — |
+
+Measured 2026-11-01, kernel 7.0, nerdctl 2.3.5, containerd 2.2.2, runc
+1.4.0, images `leerie:0.41.0` and the barnacle and funeralworks repository
+images.
+
+**Invariant: no state a confined process can change outside its write
+grants outlives it or is seen by another confined process — except what
+its grants hold.** The shim (`scripts/landlock_exec.py`), which starts
+every worker and every repository command, builds it before it confines
+and runs anything (`--isolate`):
+
+1. a new user namespace, the caller's uid and gid mapped onto themselves
+   (no privilege outside it), then new mount and IPC namespaces;
+2. a new root that the caller owns: a tmpfs holding a bind of each entry
+   of the old root, the root pivoted into it. On rootful the user
+   namespace maps only the caller, so the real root shows as `nobody`, and
+   a tool that checks the ownership of every ancestor of its cache refuses
+   one under `/` owned by another user (measured: Next's SWC refused
+   `/tmp` as a cache root, failing 1 of funeralworks' 13,036 tests). After
+   the pivot `/` is the caller's on both runtimes. This is the shape
+   `bwrap` uses;
+3. a fresh `tmpfs` on `/tmp` and on `/dev/shm` (mode 1777, `nosuid`,
+   `nodev`), and a new `devpts` instance; a grant beneath `/tmp` (the
+   command's private temp directory `/tmp/l/<id>/`, a host's state root)
+   is carried into the new `/tmp` at its own path;
+4. every write grant bound onto itself, then every other mount remounted
+   read-only, its locked flags kept. A file outside the grants can then
+   not have its mode, times or extended attributes changed (EROFS), and a
+   device node on a read-only mount still writes;
+5. its own session keyring, then a seccomp filter that refuses every
+   namespace, mount and keyring call (below), then Landlock with the
+   process's grants plus its own `/tmp`, `/dev/shm` and `/dev/pts`, and
+   from Landlock ABI 6 the abstract-socket and signal scopes;
+6. the command, run and ended as before (*A confined command's processes
+   end with it*).
+
+So `/tmp` and `/dev/shm` are a confined process's own: every worker and
+every repository command reads and writes them as it would outside leerie,
+including a fixed `/tmp/<name>`, and what it leaves there is gone when its
+process tree ends. Two concurrent measurements' fixed paths (funeralworks'
+`/tmp/leerie-test-pgdata`) no longer collide. The network namespace is the
+process's own too, loopback only (*A confined process has its own
+network*): a worker and every kind that fetches reach the outside through
+leerie's egress proxy alone. Leerie's grants never name `/tmp` or
+`/dev/shm` themselves: a grant of either names the process's own.
+
+What this replaces:
+- *A measurement may write `/tmp`* — its rules 1 to 3: the run's `/tmp`
+  lock in its shared mode for commands (`_TmpLock`, `_tmp_lock()`), the
+  grant's `shared_tmp`, the inventory of `/tmp` before a held-out
+  evaluation and the removal of what it created (`_tmp_inventory`,
+  `_remove_created`, `LEERIE_PRIVATE_TMP`), and their residual (a
+  measurement's `/tmp` state read by a later one; an evaluation's writes
+  into a pre-existing `/tmp` entry). None is needed: no `/tmp` is shared.
+  The lock's mechanism becomes the run's execution lock (*A held-out
+  evaluation runs alone*, the time half).
+- *A command in a worker's tree is kept from `/tmp`* — `_is_worker_tree`,
+  `_declare_worker_tree`, `_TMP_GRANTED_TREES` and the cost it accepted:
+  the acceptance writer's validation and the surrogate set audit failing on
+  a repository whose tests need `/tmp/recon`. A command in a worker's tree
+  has a `/tmp` again, its own, with nothing in it to relay. The read side
+  round 20 left open (a set auditor with a shell reading a tree whose
+  command ran with `/tmp`) has nothing to read either.
+- *`/tmp` is not a worker's* (§6 *A worker writes only where it is
+  granted*): a worker reads and writes its own `/tmp`.
+- The I5 residual "`/dev/shm` is shared; leerie never reads it".
+
+**The seccomp filter.** Rootful now runs with `seccomp=unconfined`, which
+the container's default profile used to refuse for every process. The
+shim takes it back per process, tighter: after `no_new_privs` it installs
+a filter that answers `EPERM` to `unshare`, `setns`, `mount`, `umount2`,
+`pivot_root`, the new mount API (`open_tree`, `move_mount`, `fsopen`,
+`fsconfig`, `fsmount`, `fspick`, `mount_setattr`) and the keyring calls
+(`add_key`, `request_key`, `keyctl`); `EPERM` to `clone` with any
+`CLONE_NEW*` flag; `ENOSYS` to `clone3`, whose flags a filter cannot read,
+so libc falls back to `clone`; and refuses the x32 ABI. A different
+architecture than the filter's kills the process. The tables are x86_64's
+and aarch64's (Colima on Apple Silicon). Python threads, `subprocess`,
+Node's `worker_threads`, pnpm, vitest, Prisma and postgres all ran under
+it. A confined process cannot make a namespace or a mount, and Landlock
+refuses a mount once a process is restricted anyway, so a worker cannot
+build or undo any of this.
+
+**Fail closed, on every entry.** Before an invocation starts any
+confined process it builds a held-out sandbox, which includes all of this
+(`_require_heldout_sandbox`, *A held-out evaluation runs alone*); only
+after it succeeds does leerie start a confined process with `--isolate`,
+and from then on every one is started so, the shim refusing to run the
+command (exit 126) when it cannot build it. Where no invocation entry ran
+— a test, a host harness — nothing is isolated.
+
+The check and Landlock's (`_require_landlock`) are one entry function,
+`_require_confinement(run_dir)`, which `main()` calls once its run
+directory is held and before it dispatches to anything that runs a worker
+or a repository command: a fresh run, `resume`, and `--phase judge|heal`
+alike (`list` and `--report` run neither and return before it). It used to
+be two preflight steps, and only a fresh run ran preflight, so isolation —
+a process flag only that step sets — depended on how the process entered
+`_run_phases`: every worker and command of a resumed run ran without
+`--isolate` (fixed `/tmp` paths refused, `sandbox-db.sh` without a
+database, `/dev/shm` and IPC shared again), and a runtime that could not
+build a sandbox was no longer stopped (review round 21, execution H1). The
+invariant restored: an invocation spawns no confined process before its
+entry has proved the runtime confines and isolates it; a test enumerates
+`main()`'s dispatch paths against it.
+
+### A confined process has its own network; the outside is reached only through leerie's proxy
+
+*Found 2026-11-01 (review round 21, execution H2 and M2); decided the same
+day.*
+
+**Root cause.** `--isolate` gave a confined process its own mount and IPC
+namespaces but left the network namespace shared, and Landlock mediates
+no network. A loopback listener is state one confined process creates and
+every other sees — the class the invariant above says cannot exist — and
+it is also a program that acts with its creator's grant. Measured
+(rootless, the funeralworks image): a measurement of tree `fw` ran the
+repository's own test-database script, which started postgres on
+`localhost:55432` with `--auth-host=trust`; a "worker" whose grant was
+only its own tree could not `touch` a file in `fw` (`Read-only file
+system`) but asked that server `COPY (SELECT 1) TO PROGRAM 'id >
+…/fw/PWNED'`, and the file appeared — written with the measurement's
+grant. A second concurrent measurement found the first one's server on
+the shared port, never started its own, pushed its schema into it, and
+lost it when the first ended. I5 ("a worker's processes write only what
+its grant names") and the invariant above were both broken, by every
+server any repository starts: a test database, a dev server, a mock.
+
+**Invariant: a confined process's network namespace is its own; it
+reaches the outside only through a proxy leerie holds, which reaches
+nothing inside the container.** The shim makes a network namespace for
+every confined process (`--isolate` and `--sandbox`) and brings up its
+loopback; a listener there is reachable by the processes of that one
+command and by no other, worker or measurement. Two concurrent
+measurements each have the whole port space; a fixed port (`55432`,
+`5432`) never collides. An abstract unix socket is per network namespace,
+so it is the command's own too. A process that needs the outside network
+gets it from its grant (`WorkerGrants.egress`):
+
+- **Who.** Every worker (the API, WebFetch, the fetches its shell runs),
+  and the kinds that fetch: every install leerie runs on a repository's
+  code (`INSTALL_KIND`, *An install reaches its inputs*, below), the setup
+  hook, the toolchain install, the store fetch (`SETUP_HOOK_KIND`,
+  `TOOLCHAIN_KIND`, `STORE_FETCH_KIND`). A measurement (`MEASURE_KIND`:
+  build, lint, tests, a recipe's `build` entry, verify, CI parity's
+  checks, coverage, the AST scripts) and a held-out evaluation reach
+  nothing beyond their own loopback.
+- **How.** The orchestrator runs an egress proxy (`_EgressProxy`, on its
+  own thread and event loop, so a synchronous spawn never stalls it) on a
+  unix socket in a 0700 directory it owns under `/tmp/l/`. The directory is
+  the proxy's own: each proxy makes a new one (an exclusive `mkdir`), never
+  a path derived from its pid, since a second proxy at the same path binds
+  the same socket name and unlinks the first one's while it serves (review
+  r22 L1: a second proxy in one test process left the first's clients
+  `ConnectionResetError`). The invariant: no proxy can take another's
+  socket. The container's
+  `/tmp` is no confined process's, so the socket exists in a namespace
+  only when the shim carries its directory in (`--egress SOCK`): a
+  measurement never sees it. Inside, the shim forks a relay — a child of
+  the shim, ended with the command (*A confined command's processes end
+  with it*) — listening on the namespace's `127.0.0.1:<port>` and
+  forwarding each connection to the socket, and sets `HTTPS_PROXY`,
+  `HTTP_PROXY`, `ALL_PROXY` (both cases) to it,
+  `NO_PROXY=localhost,127.0.0.1,::1`, and `NODE_USE_ENV_PROXY=1` (Node's
+  own `http` and `fetch` read the variables only with it).
+- **What it allows.** HTTP `CONNECT` and absolute `http://` requests. It
+  resolves names itself, drops every address that is loopback,
+  link-local, unspecified, multicast or one of the container's own
+  (`_egress_refusal`, from the kernel's tables), and connects to an
+  address it checked, never to a name resolved again; a destination with
+  no allowed address is refused (403) and logged by host and port. It
+  never logs a payload. So the proxy is no way back to a listener in the
+  container. When the container has the operator's own proxy variables,
+  the egress proxy tunnels through that proxy (`_egress_proxy`, §13), as
+  the tools did before.
+- **Leerie's own listener a worker must reach.** The strict-output proxy
+  (`--dangerously-force-strict-output`) listens on the orchestrator's
+  loopback and `ANTHROPIC_BASE_URL` names its port. The egress proxy adds
+  a socket that pipes to that port (`_EgressProxy.forward`), and the shim
+  relays the same port inside the namespace to it (`--forward
+  PORT=SOCK`), so the variable is unchanged.
+
+**What a tool that ignores the proxy variables loses.** Direct egress, by
+design: inside the namespace there is no route and no resolver. The
+measured list is in IMPLEMENTATION *The egress proxy*. A repository whose
+tests reach the internet fails in a measurement as it would on an offline
+CI runner; a measurement measures the committed view, not the network.
+
+**An install reaches its inputs.** *Found 2026-11-01 (review round 22,
+execution H3); decided the same day.* When the network namespaces above
+landed, every install leerie runs in a tree ran as a measurement, with no
+network, on the assumption that a view installs offline from leerie's
+stores. That holds only where a store fetch filled the store first
+(`_STORE_FETCH`: pnpm, npm, yarn, bun, go, composer); pip, uv, poetry,
+pipenv, cargo, bundler and NuGet have none, and some cannot have one that
+runs no committed code (*Which stores an install may share*). Measured on
+a real run of a pytest repository: the recipe's `pip install` failed
+name resolution in every view — the base baseline, each subtask's
+coverage install, the final conformance and the falsifier's checkout —
+so nothing was measured and the run ended `unconverged` for a reason
+that had nothing to do with its change. **Root cause:** the network rule
+treated an install as a measurement, so whether an install could reach
+its inputs depended on a store contract six managers meet and the rest do
+not. **Invariant: every install leerie runs on a repository's code can
+reach its inputs.** An install is its own grant kind, `INSTALL_KIND`:
+the measurement grant (the tree, its measurement directory, its own
+stores and the verified stores written; leerie's fetched stores read
+only, still filled by the script-free fetch alone) with egress through
+the proxy. It runs repository code a worker already runs with egress —
+a `postinstall`, a `setup.py` — and the proxy refuses every destination
+inside the container, so it reaches nothing a worker cannot. It is every
+install, wherever it runs: a recipe's `install` entries in
+`_ensure_worktree_deps` (a committed view, the baseline, the acceptance
+writer's, the surrogate's and the falsifier's checkouts, CI parity's
+tree, the re-drive's and integration trees), CI parity's prerequisites
+(the setup steps its checks depend on: a code generator, a browser or a
+sub-directory install), and a `settle_by: install` gap's re-install
+(`_install_settles`). What is measured keeps no network: a recipe's
+`build` entry, the build, lint and test commands, CI parity's checks,
+coverage, `verify`, the AST scripts and every held-out run.
+
+**What it replaces.** The socket-only test database (*No database server
+leerie starts is ever unconfined*): it listened on no TCP address because
+a TCP listener would have been every confined process's. Now it listens
+on `127.0.0.1:5432` of the command's own namespace and hands out a plain
+TCP URL, from which a repository's own tooling reads host and port
+(funeralworks' `pretest` runs `psql -h localhost -p 5432`; with the
+socket URL its configured `test` failed, rc 1, review round 21 M2).
+
+**Residual.** A pathname unix socket is not in the network namespace:
+one a confined process binds inside its write grant can be connected to
+by another confined process that knows its path (Landlock, at the ABIs
+this kernel offers, does not mediate `connect`). The servers a repository
+starts for its tests bind theirs in the process's private `/tmp`
+(postgres, the test database), which no other process sees; a socket
+bound in a tree stays reachable. Closing it needs pathname-socket scoping
+in Landlock.
+
+**Fail closed.** A namespace that cannot be made, a loopback that cannot
+be brought up, or a relay that cannot listen is a failed isolation step:
+the shim exits 126 and the command does not run. The sandbox probe of
+the confinement check every entry runs (`_require_heldout_sandbox`, in
+`_require_confinement`) builds a network namespace (the held-out sandbox always had one),
+then runs an isolated process with `--egress` that must reach the egress
+proxy through its relay and be refused a loopback destination
+(`_require_egress_relay`); a runtime that cannot do either stops the run
+naming the fix. Fly, EC2 and Colima are unmeasured: they fail closed
+rather than run a confined process on the shared network.
+
+### A held-out evaluation runs alone, in a world that dies with it (I3)
+
+*Designed 2026-11-01 (review rounds 19 and 20, H1; the measured
+held-out isolation design, adopted in full).*
+
+**Root cause.** I3 was enforced on one store at a time — the tree (RC3,
+§8), then `/tmp` (round 19) — by cleaning up after an evaluation that
+shared the container with everything else: its `/dev/shm`, its IPC
+namespace, its network (the throwaway database, loopback, the internet),
+its keyrings, the metadata of every file its user owns, and its time with
+the workers running beside it. Each review found the next shared store.
+The class is "an evaluation shares state with the run", and cleanup by
+inventory cannot close it: it misses what an evaluation *changed*, what is
+not a path, and what is read while it runs. Measured open on 2026-11-01,
+from a Landlock-confined evaluation to a later, separately confined
+reader: a file in `/dev/shm` and in `/tmp`; three System V IPC objects
+and a POSIX message queue; a key in the user keyring and one in the
+session keyring (the session keyring leaks even across a nested user
+namespace); TCP to a listener on 127.0.0.1 and an abstract unix socket,
+both delivering the set's text; TCP and UDP to the internet; `kill(pid,
+0)` on an outer process; `utime`, `chmod` and `setxattr` on a file outside
+every write grant, read back with `stat` and `getxattr`. Landlock's network
+rules and scopes close TCP, abstract sockets and signals from ABI 4 and 6,
+and leave UDP and pathname sockets open (measured).
+
+**Invariant (I3).** Nothing a held-out evaluation can change, and nothing
+it can cause, is observable by a worker or by any command that runs a
+worker's code; what leaves it is its output stream, its exit status and
+its runner report, through descriptors leerie holds — the report parsed
+from the descriptor's bytes, never written to a path (*Leerie never writes
+through a path confined code shaped*) — and leerie reduces
+the report to identifiers it holds itself (set indices, the writer's
+declared case names, file paths from the set's declaration). I3's older
+half (§8 *A held-out set never enters a tree a worker commits from*) keeps
+the set out of every tree a worker commits from; this keeps it out of
+everything else.
+
+It is constructed, not checked, in two halves.
+
+1. **Space.** Every run leerie makes of a held-out file — the
+   evaluation, its parse probe, the writer's validation, the case-failure
+   capture, the discovery reruns, the set audit's witness runs, and a
+   delivery falsifier's probe (its confirm runs, the AST facts read of it,
+   and every later re-run of a saved probe, the re-drive's included) —
+   starts in a sandbox the shim builds before it runs anything
+   (`--sandbox`). The one run of set files outside a sandbox is the
+   delivery re-drive's self-check, and it runs only the shown sets — files
+   the re-drive's worker is already shown — in a snapshot of its own,
+   inside that worker's own isolation; no hidden or held-back file ever
+   runs outside a sandbox. The sandbox is the isolation every confined
+   process gets (*Every confined process has its own `/tmp`*),
+   plus new network, UTS and PID namespaces; its tree as an overlay whose
+   upper layer is on its private `/tmp`, every other write grant overlaid
+   the same way (a grant beneath `/tmp` is a fresh, empty copy of its
+   directories); the set's files placed into the overlay by the shim,
+   never into a tree on disk (it refuses when the tree already has a file
+   at a set's path); loopback as its only network. The shim is the
+   namespace's PID 1: when the command exits it sends every process in the
+   namespace SIGTERM, then SIGKILL, copies the runner's report to a
+   descriptor leerie holds, and exits as the command did; the kernel frees
+   the namespaces and everything in them — IPC objects, sockets, keyrings,
+   the tmpfs and the overlay's writes. A database the set needs is started
+   inside the sandbox, on its `/tmp` and loopback, and dies with it (*No
+   database server leerie starts is ever unconfined*).
+2. **Time.** While an evaluation runs, no worker process and no other
+   command leerie runs on the repository's code exists — in the run, and
+   on the host. Every worker holds the execution lock shared for its
+   process's lifetime, as every confined command does, and an evaluation
+   holds it exclusive. What a namespace cannot hide — the evaluation's
+   `/proc/<pid>/cmdline`, its cgroup's counters, CPU, memory, page-cache
+   and disk contention, a socket a worker holds open — has no observer
+   while it exists.
+
+**The execution lock.** Two levels, one rule.
+- *The run's* is the reader/writer lock the run's `/tmp` used
+  (`_ExecLock`, `_exec_lock()`; one per event loop, writer preference, so
+  a stream of measurements cannot starve an evaluation). New shared
+  holders: `_invoke`, from before a worker's spawn until its process has
+  exited (`_invoke_admitted` delegates to it after memory admission),
+  every caller of `_ts_script_run` (which took no lock at all — round 20
+  H2's lock bypass — and now stops the run when called without it), and
+  the `mise ls` spawn, besides `_run_streaming`. An
+  evaluation (`_held_out_section`) holds it exclusive around one logical
+  evaluation: a sandboxed command, or a falsifier sample's whole confirm —
+  its first run, its B* reruns and the facts read of its probe, one hold;
+  its own commands pass through, nested sections are one.
+  A worker spawned while a section is held stops the run with an
+  invariant error — no worker ever passes through — so a call site that
+  would deadlock is a loud failure, never a wait. Nothing that holds the
+  lock shared waits on an evaluation, so the lock cannot deadlock.
+- *Evaluations queue on the lock itself.* Writer preference stops new
+  shared holders only for an evaluation that waits on the lock. The
+  falsifier's samples used to queue for their confirm on a lock of their
+  own outside it, and took one exclusive per section: each release of an
+  exclusive admitted the workers waiting to spawn before the next queued
+  confirm could ask, so that confirm then waited for a whole worker it
+  could have preceded, and workers slipped in between one confirm's
+  sections. Measured on the real lock in the falsifier's shape: 2.9x the
+  unlocked wall time at 4 lanes and 4.7–5.5x at 8, against an inherent
+  1.5–1.8x (review round 21, execution M1). Now a sample asks for the
+  exclusive directly, and holds it from its first run to its facts read.
+  The invariant restored: the lock sees every waiting evaluation, so the
+  parallelism caps bound a phase's wall time.
+- *Inside an evaluation every concurrency gate is already the holder's.*
+  While it holds the lock exclusive nothing else of the run runs a
+  command, and no confined process of any run on the host runs: the BLT
+  semaphore, the host build slot and the confirm lock — which bound how
+  many commands run at once — pass through for the holder instead of
+  waiting. Waiting on one there could wait on a holder that holds it while
+  it waits for the lock shared, which waits on the evaluation. The B*
+  pressure gate still runs inside (a bounded wait on host CPU pressure,
+  holding nothing another holder needs).
+- *The host's* is an `flock` on `exec.lock` in the host-wide directory
+  (`/leerie-host`, next to the build semaphore), taken after the run's:
+  shared by every worker and confined command of every run, exclusive by
+  an evaluation, with writer preference by a second file (`exec.intent`,
+  held exclusive by a waiting evaluation and briefly shared by every
+  shared taker first), since `flock` gives none and the host's workers
+  overlap continuously. Without the host directory (Fly and EC2, one run
+  per machine; a test) the run's lock is the whole lock.
+  *Cost:* an evaluation waits for every worker running on the host, and
+  while it waits no new worker starts on the host. Accepted: the user's
+  rule is "however obscure", and other runs' workers share the host's
+  cgroup tree (`--cgroupns=host`), CPU and memory with it.
+
+**What the runtime must allow.** The shim needs a user namespace and the
+mounts above; the container's policy decides both.
+- *Seccomp.* Every local run passes `--security-opt seccomp=unconfined`
+  (rootless already did, for the entry's `unshare --user`; rootful and
+  Colima now too). The per-process filter above restores what the default
+  profile refused, and refuses more.
+- *AppArmor.* Where the host (or Colima's VM) runs AppArmor, the launcher
+  passes `--security-opt apparmor=leerie-container`:
+  `scripts/apparmor/leerie-container` is `nerdctl-default` plus exactly
+  the sandbox's mounts, each by type and target, and `userns`, `mqueue`
+  and `io_uring` (ABI 4.0 mediates them). `apparmor=unconfined` is not
+  used: it works on Ubuntu only because runc then runs under Ubuntu's
+  `runc` profile, which attaches by runc's path; elsewhere the process is
+  plain `unconfined`, the host's user-namespace restriction applies, and
+  the namespace is useless (measured). The profile is loaded by root
+  (`apparmor_parser -r -W`, persisted under `/etc/apparmor.d/`; on Colima
+  through `colima ssh`): when it is missing or stale the launcher loads it
+  itself when it has a terminal (and no `--no-runtime-install`), and
+  otherwise stops naming the two commands.
+- *The launcher's detection gives the kernel's answer.* Whether the kernel
+  runs AppArmor and whether the profile is loaded are read into a variable
+  and tested with no pipe. They were pipelines into `grep -q`; under the
+  launcher's `set -euo pipefail` a pipeline's status is its worst member's,
+  and a consumer that stops at its first match leaves the producer to die
+  of SIGPIPE on its next write, so the pipe read "no" when the kernel said
+  yes. Ubuntu lists modules after `apparmor` and loads ~160 profiles, so
+  both probes were false on every run: the launcher never passed the
+  profile, and every local run on Ubuntu stopped at the entry with a fix
+  the launcher believed it had applied (review r22 H1). The rule is
+  general, not this probe's: **no shell leerie runs under `pipefail` — the
+  launcher, `scripts/`, and every library they source — pipes into a
+  consumer that can exit before EOF** (`grep -q`/`-m`/`-l`, `head`, `awk`
+  with `exit`, `sed` with `q`, `cmp`). A value is tested with `case`, or fed
+  to `grep -q` by process substitution, whose writer's death no status
+  sees; a first line is `sed -n 1p`; an awk program stops with a flag.
+  Every such site was rewritten, and a test derives the pipefail files and
+  rejects the shape in any of them.
+- *The entry fails closed* (`_require_heldout_sandbox`, after
+  `_require_landlock`, in `_require_confinement` on every invocation that
+  runs workers or commands): it builds a sandbox over a probe and checks that
+  its IPC namespace differs from the orchestrator's, `lo` is its only
+  interface, `/tmp` and `/dev/shm` are its own, a write to a file in an
+  inherited mount gives EROFS, `add_key` gives EPERM, and a placed file is
+  in the overlay and not on disk. Any failure stops the run naming the
+  flag or profile it lacks. No hidden or held-back file ever runs outside
+  a sandbox (the re-drive's self-check runs only the shown sets, which its
+  worker already sees, in its own snapshot inside that worker's
+  isolation), and no confined process runs outside its isolation.
+- *Measured:* rootless and rootful Linux (Ubuntu 26.04, kernel 7.0). Not
+  measured: Colima (aarch64: the seccomp table, the VM's AppArmor and
+  user-namespace settings), EC2 (Debian 13, no container: Debian allows
+  unprivileged user namespaces and does not restrict them, so it should
+  build unchanged), Fly (needs user namespaces, and tmpfs and overlay in
+  one, in its guest kernel). Each fails closed at the entry, naming the
+  fix; Fly may then refuse to start, which is the documented cost of never
+  running a held-out file outside a sandbox.
+
+**Why not a privileged broker.** Container root cannot make the
+namespaces without a user namespace (EPERM, rootless and rootful). A
+broker would need `--cap-add SYS_ADMIN`, which on rootful is real
+`CAP_SYS_ADMIN` in the host's initial user namespace, and with it Docker's
+seccomp profile allows `unshare` and `mount` to every process in the
+container, plus a relay of output, report and exit status over a socket.
+The unprivileged route holds namespace capabilities only inside a child
+user namespace, which the evaluated code never holds after `exec`, and
+needs no privileged code.
+
+**A falsifier's probe is held-out content.** The falsifier reads every
+valid set, held-back ones included (its leads), so what it writes — the
+probe's source, its case title, its quoted assertion, its prose — can carry
+a held-back set's text. Its probe is therefore run as a set file is: placed
+in a sandbox over the pristine checkout of the final commit, never copied
+into a checkout (it was, for its confirm runs and its facts read, and the
+checkout outlives the sample); a saved probe (`acceptance/probes/`) is
+re-run only through the evaluation (`_evaluate_acceptance_sets`). What
+reaches a fixer from a confirmed sample is the span of the item's own
+words the probe tests (checked verbatim in the item) and the fact that it
+fails under B\* — never the probe's text, its case title, or the sample's
+prose — and no fixer's grant reaches `acceptance/`, where saved probes are
+kept.
+
+**Residual.** The verdict itself (which files of which set failed), which
+is the evaluation's purpose; and its duration, which a later worker can
+estimate from the clock: at most log2(timeout ÷ clock resolution) bits per
+evaluation, about 14 at the default caps, the same order as the verdict.
+Both carry what the evaluated code chooses, never the set's text unless
+that code encodes it. Side channels below the kernel's abstractions
+(caches, speculation) and kernel bugs are out of scope; the seccomp filter
+narrows the user-namespace attack surface `seccomp=unconfined` opens. One
+relay of leerie's own is outside this design and stays as it is: the
+runner's failure text (`failing_messages`), used mechanically to classify
+resource failures. The hidden sets' declared case names no longer reach
+the next run's planner (§8 *Nothing a held-out evaluation produces
+reaches a fixer*).
+
+**Nothing of leerie's own is in `/tmp`.** A file leerie keeps there — a
+staged git index, a copy of a set — is outside every confined process's
+`/tmp` now, but `<run-dir>/tmp/` (0700) stays the orchestrator's temp
+directory (`_use_run_tmp`: `tempfile.tempdir` and `TMPDIR` for the commands
+it runs unconfined), one of the run directory's entries no measured tree
+may hold (`_MEASURE_PRIVATE`), so nothing of leerie's depends on which
+`/tmp` a process sees. The one thing left in the system temp directory is
+the preflight smoke test's empty working directory, which must lie outside
+every repository (the run directory is inside one when the state root is
+`<repo>/.leerie`); it is made before any measurement runs
+(`_system_temp_dir`).
+
+### No leerie service is reachable by a path from a process it does not serve (I3, I5)
+
+*Designed 2026-11-01 (review round 21, isolation R3).*
+
+**Root cause.** The sandbox's "world that dies with it" is built from
+namespaces, and the enumeration of what it shares — network, IPC, mounts,
+keyrings — left out the services the container already runs. One of them,
+the cgroup broker (§6 *Memory containment*), ran as the container's root
+outside every namespace the shim makes and listened on
+`/run/leerie-cgroup.sock`, mode 0666. A pathname socket is reached through
+the filesystem: the sandbox's own network namespace does not stop it, the
+read-only remount of `/run` does not (a connect is not a write), and
+Landlock does not mediate connecting to one (its ABI 6 scopes cover
+abstract sockets only). Measured (review round 21, rootless and rootful):
+the evaluated code sent `create <the set's text, hex> 0 0`, the cgroup
+`leerie-w-<hex>` outlived the sandbox, and a confined implementer listed
+`/sys/fs/cgroup` and decoded it. `stat` and `peak` of named cgroups and the
+limits of `create` were further encodings; the same socket let any worker
+`destroy` another's cgroup (`cgroup.kill`) or `enroll` any pid. The
+broker's docstring accepted that only because "there is no adversarial
+process model inside" the container, which I3 and I5 replaced.
+
+**Invariant.** No leerie service is reachable by a path from a process it
+does not serve. A service leerie runs for itself (a control service: the
+broker) is reached only through a descriptor the orchestrator holds, which
+no worker or command inherits; a service leerie runs for confined processes
+is named only inside the processes it serves. What cannot be named cannot
+be connected to, whatever the namespaces, mounts or Landlock rules of the
+process that tries.
+
+**Mechanism.** The broker serves one end of a `socketpair(AF_UNIX,
+SOCK_SEQPACKET)` (`scripts/cgroup-broker.py`'s `spawn`), and the
+orchestrator holds the other; no socket is bound to a name. A request is
+one message carrying the client's reply socket (`SCM_RIGHTS`), so
+concurrent requests never share a reply and one that times out leaves
+nothing behind. The orchestrator takes its end before it starts anything
+(`_adopt_cgroup_broker`, first in `main`): non-inheritable, and the variable
+that named it (`LEERIE_CGROUP_BROKER_FD`) removed, so no worker, command or
+shim holds it. The rate-limit auto-resume, which `exec`s the orchestrator
+again, hands it to the new image the same way (`_sleep_then_reexec`). When
+every holder of the orchestrator's end has closed it, the broker stops.
+
+The descriptor reaches the orchestrator through each runtime's privilege
+drop (measured 2026-11-01 for the local two):
+
+- *Local rootless.* PID 1 (the rootlesskit-mapped host UID, the slice's
+  delegate) execs `cgroup-broker.py --spawn -- unshare --user … python3
+  leerie.py`: the broker is forked with one end, and `unshare` (which
+  `exec`s, no fork) passes the other to the orchestrator.
+- *Local rootful.* The same, with `runuser -u leerie --`, which keeps the
+  descriptor open across its fork and `exec` (measured). Its waiting parent
+  holds a copy as root, out of every confined process's reach.
+- *Fly and EC2.* PID 1 starts no broker: the orchestrator is launched
+  out-of-band by the launch wrapper, which runs as root, so the wrapper
+  starts the broker (`spawn`) and hands its end to the orchestrator in
+  `Popen(user="leerie", pass_fds=…)` (`scripts/remote/seed-common.sh`).
+
+A confined process cannot take the descriptor from the broker or the
+orchestrator either: `/proc/<pid>/fd` of either is a ptrace-mode access
+Landlock refuses to a process in a domain to one outside it, and a socket
+cannot be reopened through `/proc` at all (ENXIO).
+
+**Other services.** The broker was leerie's one control socket. Leerie's
+pathname sockets in the container are the egress proxy's (§6 *A confined
+process has its own network*): `egress.sock`, and one `fwd-<port>.sock` per
+forwarded port, in the proxy's 0700 directory `/tmp/l/egress-<random>/`
+(`_EgressProxy`, made by `_egress_server` in a new `_new_private_tmp`). They are
+services for confined processes on purpose, and only the processes they
+serve can name them: every confined process has a `/tmp` of its own, and
+the shim carries the proxy's directory, read-only, into a process only when
+its grant has `egress` (`_confined_argv`'s `--egress`/`--forward`, the
+shim's `isolate(…, sockets=)`) — every worker, and the install, toolchain,
+setup-hook and store-fetch kinds of a repository command. A measurement
+(`MEASURE_KIND`) and a held-out sandbox get no egress, so neither can name
+them. The strict-output proxy listens on the orchestrator's loopback TCP,
+outside every confined process's network namespace; a worker reaches it
+only through its `fwd-<port>.sock`, relayed onto the same port inside the
+worker's namespace. The `ssh-agent` socket the launcher makes for Fly is on
+the user's host. A service leerie offers to confined processes follows this
+rule: reached through something carried into the process that may use it,
+never a path a process it does not serve can name.
+
+### No database server leerie starts is ever unconfined
+
+*Found 2026-11-01 (the held-out isolation design, F1 and F2).*
+
+**Root cause.** Leerie started the throwaway PostgreSQL cluster itself,
+unconfined (`_start_test_db_cluster`, a plain `subprocess.run`), with
+`--auth-host=trust`, reachable over TCP on 127.0.0.1 for as long as any
+`_test_db_session` was open — the acceptance writers, the gate's repair
+rounds, the falsifier and the re-drive, all with workers alive. A server
+is a program that runs what it is asked: a Landlock-confined process that
+was refused a read of `acceptance/` found the port in postgres's
+`/proc/<pid>/cmdline` and asked `COPY (SELECT 1) TO PROGRAM 'cat
+…/acceptance/set1/heldout.test.ts > <its own directory>'`, and read the
+held-out file back (F1, measured); the command ran as leerie's user
+outside every grant, so it could equally have read the credentials or
+rewritten `state.json`. And `_create_test_db` ran `prisma db push`
+unconfined, which loads the tree's `prisma.config.ts` — a worker's file:
+it ran (`NoNewPrivs: 0`, no Landlock) and executed `id` as leerie (F2,
+measured). The confinement boundary stopped at leerie's process, and
+leerie started a server and a tool that run the worker's code or anyone's
+query.
+
+**Invariant: every database server leerie starts, and every command that
+pushes a schema, runs inside the confinement and the isolation of the one
+command that needs it, and dies with it.** A command that needs a
+database is wrapped by `scripts/sandbox-db.sh`, inside its own isolation
+(a sandbox for a held-out run): it runs `initdb` in the command's private
+`/tmp`, starts postgres on `127.0.0.1:5432` of the command's own network
+namespace (so no other process reaches it, and concurrent commands never
+collide on the port; *A confined process has its own network*), creates
+`leerie_<hash>_test`, runs `prisma db push` with the consent variable on
+that one process, and execs the command with `DATABASE_URL` and
+`DIRECT_URL` the plain TCP URL `postgresql://<user>@127.0.0.1:5432/<name>`. All of it is confined by the command's
+grant; the shim ends the server with the command. A worker that needs a
+database for its session (the acceptance writer, the re-drive implementer
+for its self-check) is started the same way: its cluster lives in its own
+`/tmp`, inside its own Landlock domain, for its process's lifetime. The
+URL check (`_test_db_url_refusal`) is kept: leerie runs it on the URL the
+wrapper will compose for the name it is handed (`_test_db_url`), before
+the command starts, and the wrapper refuses any name outside
+`leerie_<16 hex>_test`. No server leerie starts runs outside a confined
+process's tree, and leerie never runs `prisma` itself.
+
+### A confined command's processes end with it
+
+*Designed 2026-11-01 (review round 19, execution H1).*
+
+**Root cause.** A command's processes outlived it whenever they left its
+process group: `_run_streaming` killed the group only on a timeout or an
+error, never on a normal exit, and a daemon under `setsid` — the
+postmaster funeralworks' test script starts "so it outlives the caller's
+session" — is in no group leerie knows. Without a cgroup (containment off,
+or a host) it ran on, held the output pipe so the read loop waited for it,
+and could read or write what later commands saw. A worker session's
+background processes had the same gap: `_DescendantTracker` polls every
+0.5 s, so a process that detached and lost its parent between two polls
+was never seen.
+
+**Invariant: when a confined command exits, every process it started has
+exited, and leerie continues only after that is confirmed.** The Landlock
+shim (`scripts/landlock_exec.py`), which starts every worker and every
+repository command, stays as the command's parent and makes itself a
+child subreaper (`PR_SET_CHILD_SUBREAPER`): a descendant that loses its
+parent is reparented to the shim, whatever its session or process group.
+When the command exits, the shim sends every descendant SIGTERM, then
+SIGKILL after 2 s (a test database shuts down cleanly in that time and
+removes its PID file), and exits only when `waitpid` reports it has no
+child left — which, for a subreaper, the kernel guarantees means no
+descendant is left either. Told to stop (SIGTERM, SIGINT, SIGHUP from the
+orchestrator's group kill) it does the same with a 1 s grace, inside the
+orchestrator's own 2 s. It then exits as the command did, the command's
+exit code or its terminating signal raised on itself, so a caller reading
+`-9` as an OOM kill reads the same. The shim reads `/proc` to find its
+descendants, which it grants itself for reading. A cgroup, where there is
+one, still bounds and kills the whole tree; the shim does not depend on
+it.
+
+Measured with a confined `setsid sleep 300 &` and with one that ignores
+SIGTERM: both gone when `_run_streaming` returns; a background process
+that held the output pipe no longer holds the read loop for its lifetime.
+The one escape is the shim's own death by SIGKILL before it has ended
+its descendants (the orchestrator's last-resort kill after its grace):
+they are then the orchestrator's (its subreaper) or init's, and the
+container boundary (§6 *Worker subtree termination*) is what remains.
+
+**In a held-out sandbox the shim is the namespace's PID 1** (§6 *A
+held-out evaluation runs alone*). It cannot mount a `/proc` of its own
+namespace (EPERM, and EACCES under the profile: the container masks
+`/proc` paths), so it does not walk `/proc`: when the command exits it
+sends `kill(-1, SIGTERM)`, which reaches exactly the processes of its
+namespace, waits the grace, sends `kill(-1, SIGKILL)` and reaps, copies the
+report, and exits; the kernel kills whatever is left when a PID
+namespace's init exits, so the shim's own death by SIGKILL leaves nothing
+either. A PID namespace's init receives only the signals it handles, so it
+installs handlers for the stop signals, and the shim outside the namespace
+forwards a stop to it. It reports how the command ended over a pipe to
+that outer shim, which exits the same way (an init cannot die of a signal
+it raises on itself). The first prototype walked the outer `/proc` from
+inside the namespace and hung; with `kill(-1)` the namespace ended in
+under a second after the command.
+
+### A command leerie runs starts with the signal dispositions it would have outside leerie
+
+*Found 2026-11-01 (review r20, L1); present since the shim was added.*
+
+**Root cause.** Every worker and every repository command is `exec`ed by a
+Python process — the Landlock shim's forked child and, under a cgroup, the
+spawn gate (*Enrollment holds the spawn*). CPython sets SIGPIPE and SIGXFSZ
+(and SIGXFZ where it exists) to `SIG_IGN` at startup, and `exec` keeps an
+ignored signal ignored. The shim's child restored only the signal mask, so
+every confined command started with both ignored. Measured: `yes | head`
+through the shim gave `PIPESTATUS` `1 0` and `yes: standard output: Broken
+pipe` on stderr; run directly, `141 0` and nothing — `SigIgn` in
+`/proc/self/status` was `0x1001000` (bits 13 and 25) against `0`. A
+non-interactive shell cannot un-ignore a signal it inherited ignored, so a
+repository's own script could not repair it either.
+
+**Invariant: a command leerie runs sees the process environment it would see
+outside leerie,** apart from what confinement itself grants and denies —
+leerie measures the code, not its sandbox. So every place leerie `exec`s a
+command from a Python process without `subprocess` (whose `restore_signals`
+does this) gives each signal Python ignored at startup its default action
+back first: the shim's child (`restore_default_signals`) and the spawn gate,
+both from the one list the shim names (`PYTHON_IGNORED_SIGNALS`). The
+orchestrator's own re-exec (`_sleep_then_reexec`) starts Python again, which
+ignores them anew, so it needs nothing.
+
+### A repository per committing tree (I6)
+
+*Designed 2026-10-30. It is the prerequisite of I5's git grant (*A worker
+writes only where it is granted*, being built alongside it).*
+
+**Root cause.** Every committing worker's tree was a worktree of the run's
+repository, `<run-dir>/repo`. A commit writes that repository's `objects/`,
+`refs/` and `logs/`, so I5 had to grant them, and a ref store is one
+directory: a worker that may write its own branch may write every branch.
+Lane B measured it under Landlock: `update-ref` on another subtask's branch
+succeeds, and the run branch is no different. Detect-and-roll-back would
+read refs a worker could have moved; the user chose prevention.
+
+**Invariant (I6): a worker writes only its own tree's repository; leerie
+alone moves the run repository's refs.** The run repository is leerie's
+record of every branch. A worker's work enters it only when leerie *takes*
+it, and only onto that tree's own branch.
+
+**The tree repository.** Each committing tree — staging, and each subtask
+tree — has its own bare repository at `<run-dir>/tree-repos/<tree>/`
+(`<tree>`: the worktree's directory name, `staging` or
+`<run-id[:12]>-<sid>`), and the tree is a `git worktree` of it, never of the
+run repository. It is per tree, not per worker: the workers of one tree
+take turns in it (implementer, clean-tree re-asks, per-subtask conformer
+rounds and re-drives in a subtask tree; the integrators, the
+acceptance-repair and final conformers and the delivery re-drive implementer
+in staging), as they take turns in the tree. The scripts make it with the
+tree (`leerie_tree_repo`, worktree-lib.sh):
+- `git init --bare`, the run repository's object format;
+- `objects/info/alternates` naming `<run-dir>/repo/objects`: every object
+  of the run is readable through it, none is copied (measured on this
+  repository, 21 MB and 1053 commits: 0.03 s and 88 KB; the `worktree add`
+  0.2 s);
+- its `config` and `info/` copied from leerie's settings copy
+  (`<run-dir>/repo-settings`, DESIGN §8 *The settings are leerie's*), so
+  I1's settings check and restore read a tree repository against the same
+  copy as the run repository (`_run_settings_of` maps both to it);
+- one ref: the tree's branch, fetched from the run repository (a subtask
+  branch; for staging, the run branch).
+
+A commit's new objects land in the tree repository's own `objects/`.
+Nothing else of the run repository's refs is there, and whatever other
+refs a worker makes in its own repository never leave it.
+
+**Taking a tree's branch (`_take_tree_branch`).** `git --git-dir
+<run-dir>/repo fetch --no-tags --no-write-fetch-head --no-auto-maintenance
+<tree-repo> +refs/heads/<branch>:refs/heads/<branch>`: it copies the new
+objects into the run repository and moves exactly that tree's branch.
+leerie takes it:
+- when a worker call whose cwd is a committing tree returns (`claude_p`,
+  before anything reads the result), which also covers the clean-tree
+  re-asks;
+- after each of leerie's own writes in a tree: `_restore_tree`, the
+  integration merge (`_integrate_merge`, with its JSON-key merge and
+  subject amend), `_reintegrate_settled_head`, `_restart_integration_merge`,
+  and collect-subtrees' integrator and back-out on Fly;
+- before a tree is removed (the subtask prune, the reset, cleanup), so
+  nothing committed is lost with it.
+
+**leerie's own writes to a branch** go to the run repository and reach a
+tree repository only when its tree is made: a tree is made only with a fresh
+tree repository, cloned from the run repository's branch. Removing a tree
+removes its tree repository after taking its branch. So a branch leerie
+creates, deletes or resets while its tree is absent (`_create_empty_subtask_
+branch`, the reset's `branch -D`, `_undo_interrupted_redrives`) is what the
+next tree starts from. A resume takes every existing tree's branch first,
+then resets the tree to it, as it does today. A tree found registered in
+the run repository itself (a run made before this change) is removed and
+made again from a tree repository.
+
+**Reads go to the run repository, by commit.** leerie never reads a branch
+by name inside a worker tree: the worker owns every ref there.
+- A tree's own branch is read in the run repository after it is taken
+  (`_record_settled_head`, `_fork_point`, the settled heads, the views).
+- The run branch, wherever a subtask tree's diff or log is measured against
+  it (`check_diff_scope`, `_branch_has_commits_ahead`,
+  `check_branch_has_commits`, `_changed_files` and `_clobbered_owned_files`
+  in conformance, the settle's diff, coverage, the external-claim checks,
+  the per-subtask conformer's `DIFF_BASE`), is its commit in the run
+  repository; the tree reaches its objects through the alternates.
+- A sibling branch merged into staging is fetched into staging's tree
+  repository by leerie right before the merge (leerie may write any tree
+  repository), and the ancestor checks of integration (`_ancestor_codes`,
+  `_integration_refs`) read the run repository.
+- Committed views (`_committed_view`) and judge checkouts
+  (`_judge_checkout`) are worktrees of the run repository at the taken
+  commit, never of a tree repository a worker can write.
+
+**gc.** A tree repository borrows the run repository's objects and never
+lends: its own `gc` drops only its own objects, and taken objects are
+copies. The other direction is the hazard: the run repository pruning an
+object a tree repository still reaches through the alternates — a commit a
+back-out made unreachable while staging's tree repository still has it. So
+the run repository never prunes while the run lives: `_seal_run_repo_config`
+sets `gc.auto=0`, `gc.pruneExpire=never`, `gc.worktreePruneExpire=never` and
+`maintenance.auto=false` there, after the carried user config, and leerie's
+own fetches into it pass `--no-auto-maintenance`. A worker cannot run `gc`
+on the run repository: it has no write grant there. Everything goes with the
+run directory.
+
+**Cost.** Per committing tree, one `git init` and one local fetch of a ref
+whose objects are already readable (milliseconds, under 100 KB). Per take,
+one local fetch (0.08 s measured) that copies the tree's new objects once,
+so those objects are on disk twice until the run directory goes.
+
+**I5's grant.** A committing worker's git metadata grant is its tree
+repository, whole (`<run-dir>/tree-repos/<tree>/`, write), and a read grant
+on `<run-dir>/repo/objects/` for the alternates. Nothing else of
+`<run-dir>/repo/` is granted.
+
+**Runtimes.** Local rootless and rootful: everything is under the state
+root, made and used by the same identity. Fly and EC2: the same layout under
+`/work/.leerie/runs/<id>/`; `collect-subtrees.sh` and `fetch_branch` read
+the run repository, which holds every taken branch; the state tar excludes
+`<id>/tree-repos` as it excludes `<id>/repo`.
+
+**Unchanged.** The planning worktree and every helper checkout (none
+commits) stay worktrees of the run repository. The disposable clones of the
+acceptance writer, the surrogate fixer and the falsifier
+(`_ref_less_clone`) are already their own repositories.
 
 ### The run identifier
 
@@ -1652,7 +4096,10 @@ order: `integrate_wave` runs before `die()`. `completed_waves` is **not**
 incremented for a partially-integrated wave, so `resume` re-enters it.
 Already-integrated subtask branches produce a no-op `git merge --no-ff`
 ("Already up to date.", exit 0) — idempotent on branches that are already
-ancestors of the run branch.
+ancestors of the run branch. That halt is the `--stop-on-blocked` path; by
+default a wave whose re-drives are spent settles its remaining subtasks
+`unconverged` (§5 *Accepting external-blocked subtasks*), so every subtask in
+it is terminal and `completed_waves` advances.
 
 ### The run branch is the resume contract
 
@@ -1664,6 +4111,146 @@ resume contract. Within a wave, `phase_execute` skips subtasks whose
 `subtask_status` is already `complete`; when every subtask in a wave is
 already complete, the wave is skipped entirely and `completed_waves` is
 advanced.
+
+**Skipping a settled subtask never skips its integration.** `complete` says
+the subtask's own work is done, not that it reached the run branch. Between
+the moment a wave's subtasks settle and the moment it integrates, the wave
+re-drives what ended blocked and what no test executes (§13, §9) — full
+implementer sessions, hours of them — and an interruption there (Ctrl-C,
+SIGTERM, an OOM, the resumable disk-headroom pause) used to leave a finished
+sibling `complete` but unmerged. The resumed wave then ran only what was
+unsettled, integrated only that, counted only that in the integrity check,
+and advanced: the finished work stayed on its subtask branch and the PR
+shipped without it. So on resume, a `complete` subtask of the wave whose
+branch is not yet an ancestor of the run branch, and which has no
+integration-gate record (a sid with one is the gate's to resume), is
+integrated with the wave and counted in what the wave must integrate; the
+wave-already-settled shortcut does not apply while one exists. Re-merging is
+safe by construction: a branch already merged is a no-op merge.
+
+**Integrated means the settled commit is on the run branch, not that the
+merge exited 0.** A merge of a branch already contained in the run branch
+exits 0 ("Already up to date"), so a subtask branch that does not point at
+the work its subtask settled on is "integrated" with nothing merged. In a
+replayed run (barnacle 45fa4253, pass 1) a test-only subtask's implementer
+checked out the base commit detached to compare behaviour, never switched
+back, and committed its three commits on the detached HEAD. Its conformer
+read them (`git diff <run-branch>..HEAD`), the subtask settled `complete`,
+its branch still pointed at the run branch, the merge was a no-op, the
+wave reported "integrated 1 of 1", and the 232-line test file never
+reached the PR; the delivery judges found it absent. Two rules close it:
+
+- *At settle, the work is on the branch.* The clean-tree gate (§8 *A
+  worker leaves its tree clean*) holds every implementer and conformer to
+  its subtask branch: a worker that left it is re-asked to put its commits
+  back on it, and one that does not is never settled `complete`. So the
+  subtask's **settled head** is its branch tip, read when it settles. (A
+  repair used to move the branch to a detached HEAD at settle — leerie
+  choosing the worker's commits for it, for subtasks only; the gate
+  replaced it, review round 15 H2.)
+- *After its merge, the settled head must be an ancestor of the run
+  branch.* When it is not, the subtask branch is pointed at the settled
+  head and the subtask is integrated once more (a conflict goes to the
+  integrator as any other). When it still is not, the subtask is backed
+  out (§6 *When integration cannot succeed*) and settled `unconverged`
+  with the settled head named — the work is never silently dropped. A
+  resumed wave counts a subtask integrated only when **both** its branch
+  tip and its settled head are ancestors of the run branch; either one
+  missing is work still to integrate. (Testing the head alone read an
+  unmerged branch as integrated when the recorded head was the base the
+  worker had checked out: the wave skipped the merge and the branch's
+  commits never reached the PR.) Re-pointing the branch at the settled
+  head is refused unless the branch is an ancestor of it.
+
+**A committed resolution is not a judged one.** An integrator's merge
+reaches the run branch before the integration judge reviews it (§6 *When
+integration cannot succeed*): the commit lands, then the judge runs, then
+its verdict is recorded. A kill between the commit and the verdict left a
+`complete` subtask whose settled head *is* on the run branch and which has
+no gate record — so the rule above read it as integrated, the
+wave-already-settled shortcut applied, and the merge reached the PR having
+never been judged; a resolution that dropped one side's change shipped
+with the drop. This is the non-crash path, not only the integrator-crash
+retry: any integrator merge passes through the window. So the gate is
+written ahead: before an integrator is spawned for a conflict, the merge's
+first parent is saved for the subtask, and the marker is cleared only once
+the integration is decided — a verdict recorded, the subtask backed out,
+the gate skipped by the operator, or the merge kept because its judge
+crashed every round. A resume that finds the marker with no
+gate record runs the gate on the committed merge (its subject set first, a
+dying integrator may not have reached it), and the wave is not settled
+until it has; a marker whose merge is not on the run branch is an
+integration that never committed, merged again in its own turn. A conflict
+merged mechanically (JSON by key) and a clean merge are never judged on the
+first pass and carry no marker, so a resume does not judge them either.
+
+**A re-drive interrupted mid-round is undone, never integrated.** That rule
+alone integrated half-done work: a coverage re-drive keeps its subtask
+`complete` for the whole implementer session, so a crash after the session
+committed a half-written test left a `complete`, unmerged branch, and the
+resume merged commits no confidence gate, completeness check or coverage
+verdict had seen (review round 2 M2). So every re-drive that works while
+the status it started from still stands is written ahead: its starting
+commit is saved before the round, and cleared only once the round is
+decided. A resume that finds one rolls the work back to that commit,
+restores the status the round started from, and treats the round as not
+done — a coverage record is evaluated again — and the "complete but not
+yet integrated" path refuses any subtask still carrying the marker. The
+round's draw on the shared re-drive budget stays spent (§13). The
+re-drives that work under a status they did not earn, and how each is
+covered:
+
+- the *coverage re-drive* (§9) — `complete` throughout; marker on the
+  subtask, rollback of its branch;
+- the *blocked re-drive* (§13) — `blocked` until its session writes the
+  new status, which a crash before the round is decided would leave
+  unverified; marker on the subtask, rollback of its branch;
+- the *delivery re-drive* (§8) — members stay `complete` while it
+  changes the run branch; its own in-flight group marker, rollback of the
+  run branch;
+- the *integration repair* (§6 *When integration cannot succeed*) — the
+  subtask stays `complete` while the merge is repaired; its in-round
+  marker, the round redone from its start;
+- the *held-out acceptance repair* (§8) — on the run branch, after every
+  subtask settled; its saved round start, the round measured and rolled
+  back by verdict before it is kept.
+
+The completeness re-drive inside a subtask's own attempt is not on the
+list: it sets the status back to `in_progress` before it loops, so a
+resume re-runs the attempt and every gate after it.
+
+A merge a hard kill interrupted is not resumed; it is gone before the
+resume reads staging. A SIGKILL, an OOM or a container death while an
+integrator is resolving leaves the staging worktree mid-merge
+(`MERGE_HEAD`), with no rescue and no abort. Review r2 L4 drove what that
+did on resume: the first sid `integrate_wave` reached need not be the one
+whose merge was in progress (a sibling blocked before the kill and
+complete after its retry comes earlier in wave order), its `git merge`
+refused, `integrate.sh` reported a conflict, and the sibling's integrator
+committed the other sid's half-resolved merge under its own subject. That
+was answered at the reader — an abandon-on-entry in `integrate_wave` and a
+mid-merge refusal in `integrate.sh` (919a0ee). The root is the resume: every
+process starts on staging at its branch tip with nothing uncommitted
+(`setup-run.sh` resets a staging that survived, §8 *The final diff
+describes the tree that ships*), and a reset ends the merge. Within one
+process no integrator round can leave staging mid-merge either: every way
+out of a conflict — a committed merge the integrator's clean-tree gate (I1)
+passed, a back-out of a verdict, an unclean tree or a merge claimed but not
+committed, the crash path's reset — ends at a commit with nothing
+uncommitted. Subtree collection after the run holds itself to the same
+rule (§6 *Subtree collection*). So no reader can meet a merge in progress,
+and neither check is kept. The interrupted integration was never recorded,
+so nothing of it is lost but the half resolution, as under a Ctrl-C's
+cleanup; the sid is integrated again in its turn.
+
+Every crash rescue gets a ref of its own,
+`refs/leerie/rescue/<run-id>/<sid>/<n>` with `n` one past the highest
+already there, and is written only if that ref does not exist: a rescue
+ref is never overwritten. Under one fixed name per sid, a second crash
+replaced the first rescue — the one the operator had been told to apply —
+and `refs/leerie/*` keeps no reflog to get it back (round-3 review L3).
+The log line names the exact ref, and so does the back-out reason when an
+integrator's crash retries run out (§7).
 
 This places one hard requirement on the design: **a run branch, once
 created, is never reset.** Setup creates it only if it does not already
@@ -1682,8 +4269,10 @@ guess when the user named a run). Without one, the orchestrator considers
 only the runs that are actually resumable — those whose derived status is
 `in-progress`, `paused`, or `incomplete` — and picks the most recent. A
 run that has finished (`done`, `done-pushed-pr`) has nothing to resume, and
-one that needs operator attention first (`seed-failed`, `sync-failed`) is
-never auto-picked: both are listed, not chosen. When no run is resumable,
+one that needs operator attention first (`seed-failed`, `sync-failed`,
+`failed`) is never auto-picked: both are listed, not chosen. Nor is a run another
+leerie's layout made (`other-leerie`, *A run directory is continued only by
+a leerie of its layout*): this leerie refuses to resume it. When no run is resumable,
 or the newest cannot be identified, `resume` lists the candidates and
 requires an explicit id.
 
@@ -1741,6 +4330,44 @@ output — reusing the persisted `plans` as that phase's input rather than
 re-deriving it. A phase that already ran is never billed again; only the
 phases still needed to reach `_schedule()`/`_write_plan()` spend further
 budget.
+
+*The first phase is a phase like any other.* The one input `resume` needs
+is the run's `task`; everything else it re-derives by running the phases
+whose output is absent. So a run whose state records its task and no
+phase output at all — it died inside classification: the worker budget,
+a usage limit, a context-overflow or disk-low pause, a kill — re-enters at
+`phase_classify`, exactly as a run that died in reconcile re-enters at
+reconcile. A state with no usable task is the only one `resume` refuses
+(`_validate_resume_state`), because there is nothing to start from. Two
+steps come before the first phase rather than inside it: the run-start
+preflight and the run's identity in `run.json`. Those are done once
+`current_phase` holds phase 1's entry stamp, so a run whose state carries
+no stamp at all never got that far and is started from its recorded task
+instead of resumed. The invariant: *a run whose state records its task
+resumes at its first unpersisted phase.* It was broken from 2026-08-14 to
+2026-11-01 by a refusal of any state holding neither `waves` nor
+`categories`. That test keyed on the outputs of the first phases instead
+of on the input resume needs, so every exit inside classification that
+told the operator to resume — the budget error's own "re-run with resume
+after raising --max-workers" among them, and the rate-limit auto-resume's
+`exec` of `resume` — left a run that `resume` refused (review round 23
+M2).
+
+*A checkpoint covers only what ran before it is saved.* A step inside the
+block a checkpoint guards, but after the checkpoint's save, is skipped by
+every resume past that save, whether it finished or not. Provisioning
+(phase 1½: the setup hook, the recipe and `mise install`, then the
+provision gate) once sat inside the `plans_after_classify` block, after
+its save. A kill anywhere in it resumed with no hook run and no recipe,
+and the run ended `done` having installed nothing (review round 19 M3).
+Provisioning now runs after that block, each step keyed on its own
+result: `phase_provision` on the presence of `provision.recipe`, the gate
+on `provision.gate`, which records `skipped`, `degraded` or `passed`. So a
+resume redoes exactly the step that did not finish. The setup hook is
+idempotent on its own (`provision.sh_hook_ran`). The clarification
+answers stay in the block, so on a fresh run they are gathered before
+provisioning. A deferred-answers exit then comes before it, and the
+resume that carries the answers provisions.
 
 **Why the resume cursor is the *presence of an output key*, and not
 `current_phase` — the load-bearing distinction.** Every planning phase
@@ -1832,6 +4459,13 @@ orchestrator that tries to construct `State` on the same run dir gets
 user to `leerie resume <run-id>` instead, which attaches to the live log
 stream rather than spawning a duplicate.
 
+The lock is held by an open descriptor, not by a process, so a process
+holds one `State` per run: a second `State` on the same run in the same
+process opens a second descriptor and is refused exactly as another
+orchestrator would be. Every verb that works in an existing run — `resume`,
+`--phase judge|heal` — names it before `main()` opens its one `State`, and
+works through that one.
+
 Why the *directory* and not `state.json`: `State.save()`'s atomic
 `tmp + rename` swaps state.json's inode every save, so a lock on
 state.json's fd would be orphaned from the new inode at every save,
@@ -1876,11 +4510,155 @@ orchestrator is sufficient to declare "alive," making the pid file
 advisory: even a future race produces at worst a false-positive REFUSE,
 never silent corruption.
 
+### A run directory is continued only by a leerie of its layout
+
+A run directory's layout is whatever the leerie that made it writes there:
+where the worktrees and branches live (the user's repository, or the run's
+own `repo`), the per-tree repositories, the measurement directories, the
+transcript registry (`transcripts.ndjson`), `logs/held-out/`, the
+transcripts directories (`logs/transcripts/`), the ref-less
+clones' git directories. A later process of the same run reads those
+records back, and it reads them with its own idea of the layout. Run with a
+different one, a record's *absence* is misread: a directory made before the
+transcript registry has no `transcripts.ndjson`, so every transcript it
+holds reads as "not a transcript", and the delivery judge's executed-
+commands record, the dependency-capture backstop and run health silently
+drop every worker run from before the resume (review round 21, L1).
+Measured on a run directory made by main's code (run branch cut, staging
+worktree in the user's repository), `resume` on this layout did refuse, by
+the per-feature check `run_repo`-absent-and-`branch`-present, but only
+after it had loaded the run, so the refusal's own exit path then ran this
+layout's abnormal-exit clean-up on the old directory: it stamped
+`finished_at` into `state.json` and `run.json`, removed the staging
+worktree's directory (leaving its registration in the user's repository
+prunable) and added `notes/`, `tmp/` and `orchestrator.log`. A run from
+earlier on this branch, which has `run_repo` but no registry, passed that
+check and resumed with its transcripts unread.
+
+The root cause is that nothing recorded which layout a directory has, so
+each layout change was guarded, if at all, by a check inferring "old" from
+the absence of its own new record — one check per change, each blind to
+the others. The invariant: **only a leerie whose layout made a run
+directory spawns workers in it or writes its records.** No migration: a
+migration is one more code path per layout change, run only for directories
+in flight at an upgrade, and a missed record is exactly the L1 failure.
+
+The mechanism:
+
+- A fresh run records `run_layout` in `state.json`, set once from
+  `RUN_LAYOUT_VERSION` and never rewritten by a resume. A directory with no
+  `run_layout` is an older layout: every directory made before the field
+  existed. Any change to what a run directory holds that a later process of
+  the run reads back bumps `RUN_LAYOUT_VERSION`.
+- `resume` and `--phase judge|heal`, the two verbs that spawn workers in an
+  existing run directory, compare it as soon as `State` holds the
+  directory's lock and its `state.json` is read — before anything else
+  writes there — and stop with a message naming the run's layout, the
+  leerie version that made it, and the fix: finish it with that leerie, or
+  start the task again as a fresh run. The refusal happens before the
+  orchestrator's exit arms are armed, so it stamps nothing and cleans up
+  nothing: the directory stays exactly as the other leerie left it, for
+  that leerie to resume. A run that never reached its first phase is
+  refused too; its recorded task is the whole of it, and a fresh run with
+  the same task is the restart.
+- `leerie list` shows a run of another layout that still has work left
+  (`in-progress`, `paused`, `incomplete`) as `other-leerie`, and a bare
+  `resume` does not auto-pick it. Finished runs keep their status.
+- The other verbs need no particular layout, because they read or write
+  only records every layout has: `list` and `--report` read `state.json`,
+  `run.json`, `calls.ndjson` and `memory.ndjson`; `accept-blocked` and `accept-integration`
+  edit `state.json` fields that layout never moved (so the leerie that made
+  the run then resumes past them); the host's `finalize` and `prune`
+  already handle both the run's own repository and its absence
+  (`host_bring_back_run_branch` is a no-op without one, and `prune`
+  deregisters an old run's worktrees from the user's repository).
+
+### A resumed run continues under the choices it was started with
+
+An operator starts a run with choices that decide what the run does and
+where its result goes: `--no-push`, the models and efforts, the worker
+budget, the gates it skips. `resume` used to resolve each of them again
+from the resume's own command line, environment and `leerie.toml`, and
+then overwrite what the fresh run had seeded in `state.json`. A choice
+made on the fresh run's command line is not on the resume's, so it fell
+back to its default. A run started with `--no-push` and resumed with a
+plain `leerie resume <id>` wrote `run.json.no_push=false` at finalize, and
+the host pushed it and opened a PR. Round 23 hit the other face of it: a
+plain `resume` of a finished `--no-push` run stopped at the launcher's
+"no `origin` remote" check, because the launcher did not know the run had
+been started not to push. The same held for every skip flag, the caps and
+the models: a resume silently ran a different run from the one started.
+An auto-resume re-execs `resume <id>` with no flags at all, so it lost
+every command-line choice.
+
+The root cause is that a run had no record of its own choices. The
+invariant: **a resumed run continues under the choices it was started
+with, unless the operator overrides one on the resume's command line, and
+then the override is recorded.**
+
+The mechanism:
+
+- Every run-level choice is classified once, in IMPLEMENTATION §2½ *Run
+  choices on resume*, as **sticky**, **per-invocation** or **sidecar**
+  (recorded in `run.json` / `fly-machine.json` / `ec2-instance.json` and
+  read back from there). Sticky choices
+  decide the run's behaviour or the destination of its result.
+  Per-invocation choices belong to the invocation and the host it runs
+  on: concurrency, memory and PID ceilings, timeouts, verbosity, mounted
+  inspect directories, the containment waiver, the smoke test, hook
+  skipping at push. A resume may run on another host or after a reboot,
+  so those are measured again each time. A rule test fails when a flag or
+  knob is added without a class.
+- The fresh run records every sticky choice in `state.json`, in the keys
+  the run already reads them from, plus `no_push`, `pr_template`,
+  `models`, `efforts` and `run_caps`. It also writes the push choice to `run.json.no_push`,
+  the record the host reads.
+- On `resume`, `main()` continues the recorded value of each sticky
+  choice before anything reads it. A flag given on the resume's command
+  line wins, and `run_choice_overrides` records it: the choice, the old
+  value and the new one. The resume's environment and `leerie.toml` do
+  not override a recorded choice. They are ambient. The operator did not
+  state them for this run, and they may have changed since it began. A
+  run recorded before this field existed has nothing to continue, so its
+  choices resolve as they always did (`no_push` first falls back to
+  `run.json.no_push`, which finalize wrote as the run's push intent).
+- A recorded `no_push` is switched off only by the new `--push` flag. It
+  is the one sticky boolean whose "off" sends a result somewhere, and
+  without it a run started not to push could never be pushed. The other
+  sticky on/off flags (`--skip-*`, `--stop-on-*`, `--clarify`,
+  `--strict-conformer`, the `--dangerously-*` waivers that are sticky)
+  have no "off" spelling. One turned on stays on for the rest of the run,
+  and a fresh run is how to drop it. Valued choices (caps, models,
+  efforts, `--source-of-truth`, `--subtask-tests`, `--pr-template`) take
+  any value on a resume.
+- The launcher resolves its own `NO_PUSH` the same way. On `resume`,
+  `--no-push` or `--push` on the command line wins. Otherwise
+  `run.json.no_push` wins. Only then do the environment and `leerie.toml`
+  count. So the host-side checks and the push decision both follow the
+  recorded choice. A bare `resume` names no run, so the launcher first
+  asks the orchestrator's own pick (`resolve_run_id`, run host-side over
+  the same state root) which run it will resume, and reads that run's
+  record. Deciding the push before knowing the run refused a bare
+  `resume` of a `--no-push` run in a repository with no `origin` (review
+  round 24, L2). The container still names the run it actually ran
+  (*Which run the container ran*), and `host_finalize` still refuses to
+  push a run whose `run.json` records `no_push`, so a pick that changed in
+  between never pushes either.
+- On a remote runtime the launcher passes the remote orchestrator only
+  what the resume's command line says about pushing. The orchestrator on
+  the machine continues the run's record, and the fetch brings
+  `run.json.no_push` home to `host_finalize` (*Finalization*, *One push
+  choice per run, on every runtime*). The host holds no copy of the
+  choice to get wrong before the fetch.
+
 ### Never a repository-global git operation
 
-The user's repo is bind-mounted whole, so `.git` is SHARED — with the host,
-and with every other container. A repository-global operation therefore
-reaches state this run does not own and cannot see.
+The user's repo is bind-mounted whole, so its `.git` is SHARED — with the
+host, and with every other container. A repository-global operation on it
+therefore reaches state this run does not own and cannot see. Since *The
+run's own repository*, every worktree of a run is registered in that run's
+own repository instead; the rule still governs the user's repository, and
+the registrations of runs made before the change.
 
 `git worktree prune` is the case that bit. It has no grace period (the
 three-month `gc.worktreePruneExpire` applies to `git gc`, not to an
@@ -1901,6 +4679,111 @@ was stale", worse than the bare prune it replaced.
 The rule generalises: any git verb that acts on the whole repository rather
 than on this run's own refs and worktrees is out of bounds from inside a
 container.
+
+**Ignores are per checkout.** A file is part of that shared state too:
+`info/exclude` lives in the common dir, so `git rev-parse --git-path
+info/exclude` in a linked worktree names the common exclude file — the
+user's, until *The run's own repository*; now the run's repository's,
+shared by every checkout of the run. The falsifier once appended its leads and the task's referenced files there and
+never removed them, so the untracked report the task pointed at vanished
+from the user's own `git status`, and `git add` of it was refused as
+ignored. A file leerie places in a checkout and must keep out of commits
+(the falsifier's leads) is instead
+ignored by a self-ignoring `.gitignore` beside it — `/.gitignore` and the
+file's literal name, under a leerie tag — written only in a directory that
+has no `.gitignore` of its own and removed with the file. A directory that
+has one is never edited: the falsifier's (disposable, never committed)
+checkout leaves that file visible. (The delivery re-drive no longer places
+anything in its checkout: §8 *A held-out set never enters a tree a worker
+commits from*.) The alternatives fail on correctness: a per-worktree
+`core.excludesFile` needs `extensions.worktreeConfig`, itself a write to
+the shared `.git/config`, and replaces the user's global excludes file;
+`--assume-unchanged` and `--skip-worktree` apply only to tracked paths
+(and git reads a skip-worktree `.gitignore` from the index, not the
+file); and staged tests outside the work tree lose their relative imports.
+The `.gitignore` is plain worktree content, so it behaves the same on
+every runtime.
+
+**Even leerie's own scope is one run, not the state root.** A prune scoped to
+the whole state root still reached sibling runs: racing a sibling's
+`worktree add` (admin entry written, the worktree's `.git` link not yet), it
+dropped a live registration, and the sibling died on "already exists" — 4
+run deaths across 4 chains. Four rules close it:
+
+- **Every in-container prune names its own run directory.** A stale entry of
+  another run is that run's to clean (on resume) or the reaper's (below).
+- **One repository-wide lock.** Every script that adds a worktree
+  (`setup-run.sh`, `new-worktree.sh`, `planning-worktree.sh`), `cleanup.sh`'s
+  prune and the Python prune take `flock` on
+  `<git-common-dir>/leerie-worktree.lock` around the prune → orphan check →
+  add sequence. The per-run lock it replaces serialised one run's siblings
+  but not two runs, nor a run's planning worktree against its subtasks. The
+  lock file sits where git writes its own worktree admin entries, so it is
+  writable wherever `worktree add` is, on every runtime.
+- **Re-check before deleting.** git's "prunable" verdict is read before the
+  loop reaches an entry; an entry is deleted only if its worktree's `.git`
+  link is still gone at that moment.
+- **Run-id-prefixed worktree names.** git names a worktree's admin entry
+  after the directory's basename, so every run's `bugfix-001` competed for
+  one admin name; subtask and planning worktrees are now
+  `worktrees/<run-id[:12]>-<sid>`. A run started before the change
+  predates per-run repositories too, and its resume is refused (§6 *The
+  run's own repository*), so no worktree is ever moved from the old path.
+- **The orchestrator's own helper worktrees follow the same two rules.**
+  `confirm-base`, `acceptance-eval`, `redrive-base`, the CI and
+  integration trees and the writer/falsifier checkouts' worktree fallback
+  ran a bare `git worktree add` under an unprefixed name. Each now goes
+  through one function that takes the repository-wide lock around the add
+  and names the directory `<run-id[:12]>-<name>`. It waits a bounded time
+  for the lock and then adds without it, logged: these trees are
+  fail-open evidence, and a stuck lock holder must not stall the run.
+  Nor may the wait stall the event loop: every caller is a coroutine, and
+  a lock wait (up to that bound) plus the checkout run on the loop froze
+  every worker's watchdog and stream reader while another run's script
+  held the lock. A coroutine reaches the add only through a worker thread
+  (`asyncio.to_thread`), enforced by a test over every coroutine that
+  calls the add or a sync helper that reaches it.
+
+The planning worktree also pruned *after* its orphan check, the order
+`new-worktree.sh` had already learned is wrong (a prune is what orphans a
+directory); it now prunes first. And every registration check captures `git
+worktree list --porcelain` before grep reads it: piped into `grep -q` under
+`pipefail`, grep exits at the first match, git takes SIGPIPE once its output
+passes the 4 KiB pipe buffer, and a registered worktree reads as absent —
+300/300 false negatives for an entry in the first 4 KiB of a 9 KiB list, and
+19 of 35 worktrees of a live repository read absent at least once in 10
+checks. All seven such checks were rewritten. Measured together (6
+concurrent runs × 200 iterations of planning + 3 subtask worktrees with
+random removal and simulated SIGKILL leftovers, once with no other worktrees
+and once with 40 live ones): 0 failed iterations of 2,400, against 4 of
+1,200 (no other worktrees) and 8 of 300 (40 live ones) before.
+
+### Idle runs' worktrees are reaped at preflight
+
+A paused or died run keeps a full checkout — node_modules included — per
+subtask for as long as its directory exists, and nothing reaped them: the
+disk preflight then refused new runs. `preflight` now deletes the
+`worktrees/` of every other run that is neither live nor touched for
+`WORKTREE_REAP_IDLE_DAYS` (7) days — touched meaning the newest mtime of the
+run directory, its state/log files and the entries of `logs/` and
+`worktrees/`. Only `worktrees/` goes: state, logs and branches stay, and a
+resume rebuilds every worktree from its branches (uncommitted edits are
+lost, exactly as on an abnormal exit). Liveness is the run-directory flock
+(§6 *Single owner per run dir*), and it fails closed: the directory is
+renamed to `.worktrees.reap-<pid>` while holding that flock — a run whose
+flock is held is skipped — and deleted after releasing it, so a resume that
+takes the lock a moment later never sees a half-deleted tree. The run's own
+registrations are then pruned (scoped to its directory). Housekeeping never
+stops a run: any error is counted and logged.
+
+`leerie prune` does the same for an idle resumable run older than its
+`--older-than` cutoff (it already removed terminal runs whole), and reports
+the space each kind frees. Measured on a copy of one repository's 440 run
+directories (16 with worktrees): 8 reaped, 3 live (flock held) and 5 recent
+skipped, 0 errors, no file outside `worktrees/` changed, identically on
+rootless and rootful containerd. A resume after the reap recreated all four worktrees at
+their branch tips with committed work intact and left no stale
+registration.
 
 ### One task, one run
 
@@ -1970,6 +4853,27 @@ purely textual merge can satisfy git while silently breaking behavior one
 side was validated against, and only a worker that understands intent can
 avoid that.
 
+**A conflict confined to JSON files is merged by key, mechanically.** Registry
+files — i18n message bundles above all — conflict whenever two subtasks each
+add keys at the same place, and no intent is in play: both sides' keys belong
+in the result. When every conflicted file of a merge is `.json`, the
+orchestrator three-way merges each one at key level (base, ours, theirs; a key
+changed on one side only takes that side, nested objects recurse, a key both
+sides changed differently is a conflict) and commits the merge itself when
+every file merges with no key conflict and keeps both sides' keys. Anything
+else — a non-JSON conflicted file, a file that does not parse, a key
+conflict — goes to the integrator unchanged. So does a file whose
+formatting the merge cannot reproduce byte for byte: the merged value is
+rendered with the serializer settings (indent, escaping, final newline)
+that re-render OUR side exactly, so only the merged keys' lines change; a
+file in a style no such setting writes (prettier's inline arrays, CRLF,
+duplicate keys) would come back wholly reformatted — unrelated churn in
+the PR and a red formatter check caused by leerie's own merge — so it is
+not key-merged. Of the two JSON-only natural
+conflicts in the q4 corpus, one merged cleanly this way; the other was a real
+key conflict (the same message key changed on both sides) and stays the
+integrator's.
+
 The mechanical re-check that *catches* a merge that broke the tree runs
 immediately after: once the integrator commits, the orchestrator scans the
 integrated worktree for unresolved conflict markers (`<<<<<<<`); a merge
@@ -2013,10 +4917,126 @@ Two outcomes are not failures of the integrator but facts about the work:
   nothing is.
 - **Genuinely irreconcilable intents are a design conflict.** If two subtasks
   want contradictory things, no merge can satisfy both — that is a problem with
-  the decomposition or the task, not a merge to be papered over. The
-  orchestrator stops the run, leaves the run branch intact at the last
-  fully-integrated wave, and reports the conflict for a human to resolve. An
-  unresolved conflict never proceeds silently onto a corrupt run-branch state.
+  the decomposition or the task, not a merge to be papered over. An integrator
+  that says so — `design-conflict`, or `failed` — while first resolving the
+  conflict takes the same fallback as a failed repair round (below): the
+  merge is abandoned, the run branch is reset to the merge's first parent,
+  the subtask settles `unconverged` and the wave continues, with the lost work
+  recorded and the PR opened as a draft so the conflict reaches a human. So
+  does an unverified `resolved` claim. An unresolved conflict never proceeds
+  silently onto a corrupt run-branch state, and neither verdict kills the
+  run: it used to, discarding every completed subtask of the run over one
+  subtask's merge. A back-out is written ahead: the decision is saved before
+  the reset, so a crash between the two is finished on resume rather than
+  re-judged. Re-judging it passed a synthetic merge of the reset tree and
+  reported "the merge stands" for a merge no longer on the branch, with the
+  subtask still `complete` and its work silently out of the PR. Only that
+  marker finishes a back-out on resume. A repair round is written ahead
+  too: its starting commit is saved before the integrator runs, and a
+  resume that finds a round in flight resets the run branch to that commit
+  and redoes the round — never backs the subtask out. Inferring an
+  interrupted back-out from the merge no longer being an ancestor of the
+  run branch (review round 1) misread a round whose integrator had amended
+  the merge and then died — a mistake the round's own check would have
+  reset — and took every line of the subtask out of the PR without the
+  round it still had (review round 2 M1). A record whose merge is off the
+  branch with neither marker is restored to that merge and judged again:
+  the tree then matches the record, whatever the verdict.
+- **What still stops the run** is a state no fallback can step back from:
+  `integrate.sh`'s precondition failure (the staging worktree or the subtask
+  branch is missing), a failure of the back-out itself (the `git reset` to
+  the merge's first parent does not land — the repository, not the merge, is
+  broken). An integrator *crash* is not on this list: it is infrastructure
+  rather than a verdict, so its in-progress resolution is rescued, staging is
+  reset to the merge's first parent and the merge is retried in the run; when
+  the retries run out the subtask is backed out like a verdict (§7).
+
+**A committed merge the integration judge rejects is repaired, not died on.**
+The gate used to die on any finding (detect-and-die). That killed 3 runs in
+the corpus at a mean of 24 completed subtasks discarded each — 73 subtasks,
+$79 and 16 hours of work — on findings an integrator could fix once told what
+was wrong. Now the gate is a repair loop on the committed merge, at most
+`integration_repair_rounds` (2) rounds per subtask, counted on the subtask's
+gate record and charged to the run's re-drive wall time
+(`redrive_budget_sec`, §13), but **not** drawn from the subtask's shared
+re-drive counter. Integration repair is a different failure class: the
+subtask's own work is finished — the other re-drives exist because it is
+not — and the defect is in a merge leerie made. Drawn from the shared
+counter, a subtask that spent its rounds earlier in the wave (a completeness
+re-drive and a blocked re-drive, or two advisory coverage rounds) had none
+left, so the first gating finding backed the subtask out with no repair at
+all, taking every line of its finished work out of the PR — adding tests
+could cost the feature. The bound is unchanged in kind: the counter is
+persisted before each round, and the loop ends at its cap or when the run's
+re-drive time is spent. A round a crash interrupted reached no verdict, so
+the resume that redoes it from its starting commit takes its count back
+with it; kept spent, a crash in the last round would back the subtask out
+for a failure of the machine, not of the merge. It takes it back once per
+round: the redone round is marked refunded, and when that round is
+interrupted again its count stays spent. Without the bound, a crash the
+round itself causes every time (an OOM kill or SIGKILL the integrator
+session reliably triggers, which also skips the re-drive time charge) was
+redone on every resume with neither the round counter nor the time budget
+ever drawn down (round-3 review L2); with it, a deterministic crash costs
+at most two sessions per round before the loop reaches its cap and backs
+the subtask out:
+
+1. **The integrator is re-driven with typed findings,** never prose: the
+   judge's gating `defects[]`; the lines the merge dropped; failing tests,
+   typed as code to fix or as stale.
+   - *Dropped lines* are computed mechanically: in every file both parents
+     changed, the lines (stripped, at least 8 characters) one parent added
+     against the merge base that are absent from the current tree. A line
+     is left off the list only when the *other* side's own diff deleted or
+     rewrote that exact line (S3); drops inside conflict hunks stay on it.
+     For each listed line the integrator restores it or marks it
+     `superseded {file, line, by_line, reason}` with the line that now
+     carries it. Superseded entries are recorded, not checked: a code
+     re-insert (S4) was benched and dropped.
+   - *Failing tests* are routed: a failure that also appears on the home
+     side's tree once the *other* side's production files are applied over
+     it is `stale_by_other_side` — the other side's deliberate behaviour
+     change broke the test, so the integrator updates the test and never the
+     production code. Any other failure is code to fix.
+2. **Code checks the round, in order:** the new commit descends from the
+   merge, the tracked tree is clean and carries no conflict marker (else the
+   round is spent and reset); then **the tests of the conflicted area**:
+   the test files the merge or the repair changed plus one-hop importers of
+   the changed sources, run on both parents and the repaired HEAD. A test
+   failing on HEAD and on neither parent is a candidate, confirmed under
+   B\* (§9 *Which failures are new*) against the parent it passed on; only
+   a confirmed one counts. They run only through the repo's scoped runner
+   over those files, never the raw test command, and not at all when the
+   task forbids the scoped command (§9 *A command the task forbids*); then
+   a **full re-judge** — the same judge on a synthetic merge of the
+   repaired tree over both parents, so the repaired result is reviewed as
+   one whole merge with no prior findings shown.
+3. A round passes when the re-judge has no gating defect and no test
+   failure is confirmed. The merge then stands, and any listed line still
+   absent and not superseded is recorded as residual content loss.
+
+**The fallback is a backed-out subtask, never a dead run.** A typed
+`intent_conflict` from the judge (the two sides' stated intents cannot both
+hold — the judge quotes both), an integrator verdict of `design-conflict` or
+`failed` during repair, or exhausted rounds reset the run branch to the
+merge's first parent, settle the subtask `unconverged` (§5; its dependents
+settle `unconverged` without running) and continue the wave. The outcome
+becomes `unconverged`, so the PR opens as a draft, and the backed-out work is
+recorded as residual content loss on the subtask, which the PR reports.
+
+Benched (q4 S3, 11 cases × 2 samples, sonnet): 22/22 gate passes, 0/22 new
+test failures under B\*. Lost content by diff read on 9/22 samples (7 clear,
+2 only under the strict rule that an equivalent must be shown). Of the 469
+lines the 11 merges dropped, S2's hunk-overlap filter listed 43 for the
+integrator; S3 lists 464 — the other 5 were lines the other side itself
+rewrote. The earlier design-I bench gave 27/28 gate passes, with one fallback
+on exhausted rounds.
+
+**Resume reads the subtask's own spec.** The judge and the repair integrator
+are given the incoming subtask's intent and criteria from `subtasks/<sid>.json`,
+and the already-integrated subtasks are read from the run branch's history,
+so a resumed gate sees what a fresh one does instead of an empty intent and
+an empty integrated list.
 
 ### Finalization
 
@@ -2131,6 +5151,45 @@ completion against `state.json`. Three gates enforce this:
 A genuine completion is unaffected: by the time `phase_finalize` and
 `host_finalize` run, `completed_waves == len(waves)`.
 
+**A run that died says so.** `leerie list` showed a run that `die()`d
+before its waves existed or after they all integrated as `done`: the
+die-path stamp of `finished_at` was the only record, and it reads the
+same as a completion (review round 22, a preflight death and a held-out
+set's death both listed `done`). A run that died of a worker error or an
+unhandled exception stamped nothing and listed `in-progress`. The root
+cause is that nothing recorded the death itself; the invariant is that
+**a run whose last invocation died is listed as died** — an
+invocation that continued the run, not one that found nothing to do. The record,
+`run.json`'s `failed_at`, has one owner, and it sees every exit of the
+invocation: it wraps the whole of `main()` and is armed where the run's
+`State` is acquired and its layout accepted, so a death from any
+statement after that — the confinement entry, a resolver or
+`_orchestrate` itself — is recorded. A
+first version gave the record to the exit arms around `_orchestrate`;
+a `die()` before their `try:`, the confinement entry's included, then
+recorded nothing and the run listed `in-progress`, which a bare `resume`
+auto-picks (review round 23). A death is a `die()` at any exit code but
+0 and the deferred clarification's, or any other exception but the
+operator's interrupt; `main()` returns a pause's, an interrupt's or a
+completion's exit code rather than raising it, so a pause, an interrupt
+and a clarification wait record nothing — they are not deaths. A
+`--phase` verb analyses a run and never continues it, so it is not
+armed. Nor is a `resume` of a run that has nothing left to do (it
+completed: finalized, or no work was required — the test the resume
+itself uses to answer "nothing to resume"). An invocation's death is a
+fact about the invocation; the run's status is a fact about the run, and
+an invocation that has nothing to continue owns no part of it. Armed
+anyway, a no-op resume that died in a resolver (`--worker-memory-max
+bogus`) relabelled a finished run `failed`, and the next no-op resume
+relabelled it `done` (review round 24, L1). So **a run that completed
+stays listed as it completed**, whatever later invocations of it do.
+Each armed invocation clears the previous one's `failed_at` as it is
+armed, so a run resumed to completion is not listed `failed`. `leerie list` shows such a
+run `failed`, or `incomplete` when it died mid-wave (the more specific
+status, which a bare `resume` still picks); a `failed` run is resumed by
+id, not auto-picked, because a death's message names a fix the operator
+owes first.
+
 **Recovery when the orchestrator dies before `finished_at`.** An
 uncontrolled exit (SIGKILL, OOM, power loss, or any crash bypassing the
 `except SystemExit` handler) before `phase_finalize` leaves a run
@@ -2150,7 +5209,18 @@ branches, runs `setup-run.sh` to ensure the staging worktree exists, and
 merges each via `integrate.sh` — conflicts resolved by spawning a
 `claude -p` integrator worker (same prompt, schema, and verification as
 `integrate_wave()`). Branches the integrator cannot resolve are skipped
-and reported. This runs after the `finished_at` patch and before
+and reported. Each branch starts on a clean staging and leaves one: a
+skipped branch — no integrator, a crash, a verdict other than `resolved`,
+or a `resolved` whose merge is not committed or whose tree is not clean
+(I1, §8 *A worker leaves its tree clean*, with no re-ask: the script has
+no session to resume) — is restored to the commit before its merge on
+the run branch by the one restore (§8 *One restore*: write bits, `reset
+--hard`, `clean -ffd`, ignored files kept, the postcondition checked). A reset that fails stops the collection: the
+remaining branches are reported skipped, never merged onto a tree the
+reset could not restore. A `git merge
+--abort` did not do that: it keeps an edit the integrator made to a file
+outside the merge, which the next branch's merge then refused or the
+next integrator swept in. This runs after the `finished_at` patch and before
 `fetch_branch` streams the result to the host. `fetch-branch.sh`'s bundle
 already carries the raw subtask branches regardless of whether collection
 ran, so a crash between subtask completion and integration is still
@@ -2186,27 +5256,63 @@ bind-mounted and the branch is already in the user's repo — and calls
 interrupted-but-complete run is finalizable while a crashed-mid-wave one
 is not.
 
-**`no_push`: intent vs mechanism.** The orchestrator inside the Machine is
-*always* invoked with `--no-push` because the Fly Machine has no GitHub
-auth — a **mechanism flag**, not the user's preference. The user's actual
-launch-time intent lives separately in `fly-machine.json.host_no_push` on
-the host (set by `provision.sh` at machine creation) and is propagated
-into the Machine via a hidden `--host-no-push true|false` argv flag. The
-orchestrator gates `pr_writer` and the `run.json.no_push` it writes on
-**intent** (`push_will_happen(no_push, host_no_push)`), not the mechanism
-flag, and `host_finalize` reads that intent value to decide whether to
-skip push. This split is load-bearing: without it, `pr_writer` never runs
-on Fly and the LLM-written PR body is replaced by the deterministic
-fallback.
+**One push choice per run, on every runtime.** A run has one record of
+whether its result is pushed: `state.json.no_push`, a sticky run choice
+(*A resumed run continues under the choices it was started with*). The
+launcher resolves the choice on the host — `--no-push`, then `--push`, then
+`LEERIE_NO_PUSH`, then `no_push` in `leerie.toml` — and on a fresh run hands
+it to the orchestrator as `--no-push`, the same way on the local, Fly and
+EC2 runtimes, because neither the container nor a remote machine sees the
+host's `LEERIE_NO_PUSH` (the launcher does not forward it), and a remote
+machine may not see an untracked `leerie.toml`. The orchestrator records it
+at the run's start, a resume continues it by the one rule every sticky
+choice follows, and `run.json.no_push` — the intent the host reads — has
+one writer, `_record_run_push_choice`, which computes it each time from the
+run's own record: the choice, or `true` while the run has nothing to push
+(it last ended without a run branch, as a no-work run does). `main()` calls
+it on every invocation but `--phase`, and the run's two terminal states
+call it as they finish. A plain resume of a no-work run used to write the
+choice over the no-work run's `true` (review round 25, F3); computed from
+the record, it cannot. A run that is pushed has its PR written by
+`pr_writer` (the deterministic fallback only when the worker fails),
+whenever its push choice was made: at finalize when the run is then to be
+pushed, and — because a resume may change the choice after finalize
+(`leerie resume <id> --push` of a finished `--no-push` run is the one way
+to push it) — on a resume of a finished run that continues with a push and
+whose `run.json` holds no `pr_title`, before that resume answers "nothing
+to resume". Binding the worker to finalize alone left such a push with the
+fallback body, its PR composed by a choice that was no longer the run's.
+`host_finalize` reads
+`run.json.no_push` unchanged on every runtime: on a remote runtime the
+fetch brings that file home before the host finalizes, and nothing on the
+way rewrites it.
+
+This replaced a split that lost the choice on Fly and EC2. The in-machine
+orchestrator was always started with `--no-push` as a "mechanism flag"
+because the machine has no GitHub credentials, and the user's intent
+travelled beside it as a per-invocation `--host-no-push`, re-derived by
+each launcher invocation and seeded into `fly-machine.json` (EC2 recorded
+none). The orchestrator never pushes on any runtime, so the mechanism flag
+guarded nothing; it only made `run.json.no_push` ambiguous. Every host-side
+reader then guessed which meaning it held and stripped a `true`: the fetch
+on both runtimes whenever a run branch came home, `leerie finalize`, and
+`finalize --force`. Measured on the real code with stubbed `flyctl`: a
+fresh `leerie --runtime fly --no-push` run was pushed by the auto-finalize,
+and a plain `leerie resume <id>` of a paused Fly `--no-push` run passed
+`--host-no-push false` and was pushed. The root cause was two owners of one
+choice, one of them per-invocation. The invariant now: **the push choice is
+recorded once, at the run's start, by the orchestrator; every host-side
+finalize reads that record, and its one writer only ever derives it from the
+run's record.**
 
 The run branch is pushed to `origin` and a pull request opened via `gh pr
 create` against the working branch (HEAD-at-run-start) by default. **This
 PR base is overridable** — `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` /
 `pr_base_branch` in `leerie.toml` — without changing where the diff is
-computed from: `working_branch` always remains the diff fork-point
-(`rev_range = working_branch..run_branch`) regardless of the override, so
-the diff base never corrupts if the override branch isn't the actual fork
-point.
+computed from: the diff always starts at the commit the run branch was cut
+from, `base_sha` (`rev_range = base_sha..run_branch`, *The run's own
+repository*), regardless of the override, so the diff base never corrupts
+if the override branch isn't the actual fork point.
 
 The PR title and body are written by an LLM worker (`pr_writer`, defaults
 to Sonnet) that runs inside the container right before it exits, where
@@ -2233,25 +5339,68 @@ logged and swallowed, falling back to a deterministic body composed from
 `compose_pr_body`, the canonical reference for that shape). Generating a
 richer body must never block finalize success.
 
-**The residual-risk section is appended by code on every composition
-path.** When the run's `risk_register` (§9 *Self-reported risk is routed,
-not read*) is non-empty, a `## ⚠ Residual risks` section rendering each
-entry verbatim is appended to the PR body mechanically, on both live
-composition paths: by Python after the `pr_writer` worker's body is
-accepted, and in the launcher's LLM-less bash fallback by a `jq` renderer
-format-identical to `compose_pr_body` — the never-invoked canonical
-fallback reference the bash mirrors, which carries the same section —
-the same append-regardless-of-path discipline as the rebaser's diagnosis
-note. The `pr_writer` prompt tells the worker not to render its own risks
-section, but the guarantee is the append, not the prompt (§12): a
-worker-emitted section is stripped unconditionally — span-limited to the
-section, so surrounding legitimate content survives — whether or not the
-register has anything to append in its place. The section renders only
-subtasks whose work the PR actually contains: a sid still `blocked` at
-finalize was excluded from wave integration, and an `accept-blocked`ed
-sid's branch is likewise never merged (resume excludes it, so
-integration sees no result entry) — both are skipped, via
-`subtask_status` and the `accepted_blocked` registry.
+**The PR's end-state section is rendered by code, from typed state, on
+every composition path.** `_format_pr_end_state_section` turns what the run
+recorded into at most six short lists, each under its own heading, each
+present only when it has an entry:
+
+- `## Unconverged` — why the PR is a draft: the outcome decider's reasons
+  (§6 *The run outcome is decided once*) and every `unconverged` subtask
+  with its own reason.
+- `## Needs human verification` — one checkbox list, grouped by the
+  resource a human must supply: the task's required items the classifier
+  typed `external`, subtasks accepted on an `external_precondition`
+  blocker (§13), risks a worker typed `gap: unverified_external` (a
+  concurrency risk whose tests can only stub the interleaving is labelled
+  so — `simulated_interleaving`), audited fix sites resolved by an
+  untyped (`other`) change (§5 *Every `fix` site is claimed*), and
+  held-out acceptance sets the final tree left unmeasured, with why (§8
+  *A held-out set the final tree leaves unmeasured is never silent*).
+- `## Untested after re-drive` — changed lines that no test executes after
+  the coverage re-drive spent its rounds (§9 *Changed lines no test
+  executes are re-driven*). Listed, never a reason to draft.
+- `## Integration content loss` — work a merge dropped (§6 *When
+  integration cannot succeed*).
+- `## Repository merge checks still red` — the CI-parity checks confirmed
+  red on the final tree (§9 *The repository's own merge checks run too*).
+- `## Advisory (not verified by this run)` — the whole-PR review's verified
+  findings, the contract-literal flags and the site-token hits (§8, §9),
+  labelled advisory because nothing waited on them.
+
+*Every entry the run records for a human renders.* The invariant: an
+entry in `needs_human_verification` is a check the run handed to a human,
+so the PR shows every one of them — a group per source where the source
+has one, and an "Other checks the run could not make" group for any
+source that does not. Review round 14 H1 drove the root cause: the
+renderer was a hand-kept chain of one branch per source, unconnected to
+the writers, so the two sources that round added — a final delivery
+judge that crashed on every attempt (`delivery_judge_unknown`) and a
+ratchet that could not re-verify a met item (`ratchet_unverified`) —
+were written to state and rendered nowhere: a non-draft PR with nothing
+for the reviewer to check. Both now render under "Task requirements";
+and a guard derives every source the code writes (each `*_GAP_SOURCE`
+constant and each literal `source` in a writer of that list) and fails
+on one the group table does not name, so the next source is placed
+deliberately rather than falling to the catch-all.
+
+It replaces a generic dump of every worker's self-reported risk, verbatim,
+under one "Residual risks" heading — which mixed in-container gaps,
+process notes and external checks, and filed integration content loss
+under "Self-reported by workers". Benched as Q5/G (sonnet judge, two
+samples with the order swapped): on a fresh 10-PR corpus the typed lists
+were preferred for "what do I do" and as less confusing on 10 of 10 PRs
+in both samples; summed over the two samples, 92 of 92 entries were
+actionable against 1 of 485 in the dump, which carried 268 noise entries. The section is written to
+`run.json` as `pr_end_state` beside `finished_at`, so the launcher's
+LLM-less fallback appends the same text rather than re-deriving it in
+`jq`; on the `pr_writer` path it is appended to the accepted body. The
+`pr_writer` prompt tells the worker not to write these headings; the
+guarantee is the append (§12) — a worker-emitted copy of any of them is
+stripped, span-limited to that section, whether or not the run has
+anything to append. The risk-derived and untested lists render only
+subtasks whose work the PR contains (not `blocked`, `unconverged`,
+`accepted_external`, or `accept-blocked`ed); integration content loss is
+listed precisely because the work is not there.
 
 When the target repo has multiple templates inside
 `PULL_REQUEST_TEMPLATE/`, the alphabetically first `.md` wins by
@@ -2267,8 +5416,8 @@ best-effort rebase step, inserted after the empty-branch guard and before
 the push, that is deliberately **not** driven by mechanical bash
 rebase/conflict/abort logic. Instead a single autonomous worker
 (`rebaser`, Sonnet, `EFFORT_DEFAULT_PER_WORKER["rebaser"] = "medium"`,
-matching `integrator`) is handed a disposable `git worktree add` copy of
-the run branch and told to fetch the latest `pr_base_branch`, rebase the
+matching `integrator`) is handed a disposable worktree of the run branch,
+in a host-side repository of its own (*The run's own repository*), and told to fetch the latest `pr_base_branch`, rebase the
 run's own commits (`working_branch..run_branch`) onto it, resolve any
 conflicts itself — preserving both sides' intent — and abort the rebase
 itself, leaving the branch untouched, if a conflict is genuinely
@@ -2294,8 +5443,10 @@ rather than trusting the worker's self-report.
 What stays mechanical, because it is cheap, objective, and losing it would
 be a real regression:
 
-- **Isolation.** The worker never operates on the user's real checkout or
-  the run's primary worktree — only a disposable `git worktree add` copy,
+- **Isolation.** The worker never operates on the user's real checkout, the
+  user's repository, or the run's primary worktree — only a disposable
+  worktree of a repository of its own (a `--shared` single-branch clone,
+  its `origin` the user's remote),
   matching the containment already used for every other `ACT_TOOLS` +
   `autonomous=True` worker (`implementer`, `conformer`, `integrator` — §6;
   none of their call sites pass a real-repo `cwd`).
@@ -2339,7 +5490,7 @@ Two flags control push and PR independently of body composition:
 probed at run start.** git runs `pre-push` in the repository root against
 whatever is *checked out*. leerie never checks out the run branch — the push
 happens from the user's own checkout, and the finalize rebase uses a
-disposable worktree — so a hook that lints, typechecks, or tests the working
+disposable worktree of its own repository — so a hook that lints, typechecks, or tests the working
 tree measures the host's state and can reject a push for reasons no run
 could have caused or prevented (a stale `node_modules`, a tool missing from
 the hook's PATH, a half-finished dependency bump). Measured: every recorded
@@ -2437,19 +5588,90 @@ signals it needs review. Defaulting to push + PR turns every run into a
 reviewable artifact. `--no-push` exists for offline use or repos without a
 GitHub remote.
 
-**Branch cleanup at finalize.** After the push + PR (or after the run
-completes under `--no-push`), the orchestrator deletes the per-subtask
-branches `leerie/subtasks/<run-id>/*` automatically. They were the
-mechanism by which parallel implementers committed in isolation; once
-their work has been merged into the run branch their individual commit
-histories are still reachable from the run branch's `--no-ff` merges, so
-the named refs are pure clutter. The **run branch** itself
+**Branch cleanup at finalize.** Finalize deletes no branch. The
+per-subtask branches `leerie/subtasks/<run-id>/*` are refs of the run's
+own repository (*The run's own repository*): only the run branch is
+brought back into the user's repository, so the subtask branches never
+reach it, and they go with the run directory when `leerie prune` reclaims
+it. Finalize's `cleanup.sh` removes the run's worktrees only. The **run
+branch** itself
 (`leerie/runs/<run-id>`) is *kept* — it is the PR head, and deleting it
 locally before the PR is merged would dangle the PR base reference. The
 per-run state directory (`state.json`, `run.json`, logs, criteria,
 checkpoints) is also kept as an audit trail. A user who wants to
 completely scrub a finished run can do so with
 `scripts/cleanup.sh --run-id <id> --branches`.
+
+**The run outcome is decided once.** `_decide_outcome` is the single
+writer of state's `outcome` — `done`, `no_work` or `unconverged` — and every
+terminal path reaches it: the planning-time no-work exits and finalize's
+empty-branch exit (both through `_finish_no_work_run`) and the normal
+finalize path. The rule, benched as the P7 outcome simulation (90 historical
+runs, 2000 trials each): the run is `unconverged` when any subtask settled
+`unconverged`, when the failing-test-ID diff confirmed a new failure (§9
+*Which failures are new*), when a measured held-out acceptance set still
+fails (a set typed `broken` by the set audit does not count — §8 *A set
+that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*), or when the delivery re-drive declared a `conflict` (the same fix-for-regression trade recurred — §8 *Delivery re-drive*; the reason names both sides), or when the final-tree conformance left an actionable solution defect unfixed after its last round (§9, final-tree pass; the reason names each defect's kind, location and case) —
+consulted *before* the no-work check, so an empty branch that left work
+unfinished is never reported as "no work required". Otherwise an empty run
+branch is `no_work` and anything else is `done`. The outcome is mirrored
+into `run.json`, and the host launcher opens the PR as a **draft** when it
+is `unconverged` — the PR still carries everything that did converge, but it
+cannot be mistaken for finished work — and the body says why: the end-state
+section (§6 *Finalization*) opens with `## Unconverged`, the decider's
+reasons followed by each unconverged subtask's own. Before this, no-work was decided in
+five scattered places and a run with unfinished work shipped an ordinary PR.
+
+*A delivery verdict counts only on the tree it was measured on.* Each
+delivery pass records the committed tree it read beside its verdict
+(final detection's `final_tree`, the recheck's and the pre-pass's
+`judged_*.tree`), and the decider takes the latest one only when that tree
+is the tree that ships — the run branch's tree,
+`refs/heads/leerie/runs/<id>^{tree}`, read from the repository, which is
+the ref finalize pushes (review round 15 H1: read from staging's HEAD, it
+was "" once finalize's `cleanup.sh` had removed staging, so every run with
+a delivery verdict ended `unconverged`; and staging's HEAD is not what
+ships unless I1 holds staging on the branch). Every pass stamps its verdict
+with that same ref's tree. Any other verdict, or none of the shipping tree at all, makes the
+run `unconverged` with the reason "the required items were not read on
+the tree that ships". The root cause this removes (review round 14 M2):
+the decider read whichever unmet list existed — final detection's, else
+the recheck's, else the pre-pass's — with no check of which tree it
+described, so a final judge that failed in a way its retry did not catch
+(a checkout `RuntimeError`) left detection with no verdict, the recheck's
+"nothing unmet" of an earlier commit decided the outcome, and the run
+ended `done` on a tree nothing had read. A delivery re-drive that moves
+HEAD re-keys detection's verdict to its final commit and tree only when
+every routed and every unverified item was read there; otherwise the
+verdict stays of its own tree and the run says so. And a final judge that
+fails in any way, not only a worker crash or timeout, is a judge that read
+nothing: its items are `unknown`, never `met`.
+
+*`done` rests on measurements that ran (review round 19).* Root cause:
+every regression check stepped aside when it could not measure. The
+failing-test-ID diff returned "nothing to diff" when the test axis gave no
+verdict or its install failed, and the decider read an absent diff as no
+new failure. An unmeasured held-out set was "no evidence". So in two
+measured runs every install failed, nothing was measured, and the run
+ended `done`; one shipped a broken test. Invariant: `done` is a claim
+about the tree that ships, and it holds only when the measurements it
+rests on ran on that tree. Each one the run could not take makes the run
+`unconverged`, with the reason naming what was not measured and why, and
+the PR's "Needs human verification" listing it as before:
+
+- *The tests,* when the repository has a test command: a failing-test-ID
+  diff of exactly the tree that ships. No diff, or a diff of another tree,
+  is not measured. `_refresh_test_id_diff` records why it could not take
+  one (`shipping_tests_gap`), and the decider names it. Failing tests that
+  the base could not be rerun against (`no_verdict`) leave the diff's
+  answer unknown for them, so they count too. A test command the task
+  forbids is the task's own constraint, listed by its own gap, and does
+  not count.
+- *The held-out sets:* every set the final tree left unmeasured, the same
+  sets `_acceptance_unmeasured_lines` lists for the PR.
+
+The rule is in the decider, read from what the measurements recorded, so
+any future cause of an unmeasured tree ends the same way, whatever it is.
 
 ### Credential strategy
 
@@ -2772,12 +5994,311 @@ content-addressed and normally *hardlink* from a shared store into each
 almost nothing when store and tree share a mount (measured once, on one
 host: 92.6% of `node_modules` bytes shared, private remainder 102 MiB
 against a 1.35 GiB tree — illustrative, not a verified general quantity).
-But leerie bind-mounts the package-manager store and the state directory
-as *separate* mounts, and Linux refuses `link()` across different mounts
-even when both resolve to the same filesystem (`do_linkat`'s `EXDEV`) — so
-the store cannot hardlink into a worktree, pnpm falls back to copying, and
-each worktree pays full freight. That is the multiplier behind the 51 GB,
-and the mid-run prune bounds coexistence to one wave's worth of trees.
+But leerie used to bind-mount the package-manager store and the state
+directory as *separate* mounts, and Linux refuses `link()` across different
+mounts even when both resolve to the same filesystem (`do_linkat`'s
+`EXDEV`) — so the store could not hardlink into a worktree, pnpm fell back
+to copying, and each worktree paid full freight. That is the multiplier
+behind the 51 GB, and the mid-run prune bounds coexistence to one wave's
+worth of trees.
+
+**The pnpm store shares the worktrees' mount.** Every package store lives
+in the state mount, beside the worktrees, so a worker's install can
+hard-link from its run's cache (a hard link cannot cross mounts); leerie's
+own installs copy from leerie's store instead (*A view's install never
+writes leerie's store*, below). There are three sets, all set by the
+orchestrator through environment variables, with no mount or `-e` of their
+own (*The stores a view installs from are leerie's*, *Which stores an
+install may share*, below): leerie's own, `<state-root>/.stores/leerie/
+<name>`, kept across runs; each run's workers', `<run-dir>/workers/cache/
+<name>` (the held-out side's at `<run-dir>/workers/cache-held-out/<name>`),
+which goes with the run; and each run tree's own,
+`<run-dir>/tree-stores/<tree>/<name>`. The state root is `/leerie-state` locally and `/work/.leerie` on Fly.
+The host cache mounts that used to hold them (pnpm, pip, Go, Cargo,
+corepack) are gone. Copying was not only a disk cost: concurrent installs
+copying whole trees ran past their timeouts, and three chains lost work to
+it (an install that "did not finish within 600 s", held-out sets discarded
+on install timeouts). pnpm's store is content-addressed with atomic
+writes, so concurrent installs into one store are safe. Ownership follows
+the worktrees on every runtime, because it is the same mount: measured
+rootful (real uid switch), five worktrees installed into one store with 0
+EACCES, the worker owning every new store file, one package file carrying
+6 links (the store's and one per worktree), and no chown. EC2 keeps its
+image-default store.
+
+**The stores a view installs from are leerie's.** One store, shared by
+leerie's installs and every worker's across runs, was a path from a worker
+to a committed view (§8 *Every measurement reads the committed view*):
+pnpm hard-links a package's files from its store, so a worker that edits
+`node_modules/<lib>/<file>` in its own tree in place edits the store's copy,
+and the next install anywhere links the edit. pnpm's own check does not see
+it when the size is kept and the mtime put back: measured with pnpm 10.4.1
+on barnacle, such an edit in one checkout's `node_modules` was in a fresh
+install of another. The invariant: *a committed view's environment comes
+only from stores that leerie alone writes.* So there are three sets:
+
+- *Leerie's*, `<state-root>/.stores/leerie/<name>`, set on the
+  orchestrator's own environment before anything installs
+  (`_leerie_stores`): the pnpm store and every other cache an installer the
+  provision recipe can name reads — npm, yarn (classic and berry), bun,
+  corepack, pip, uv, poetry, pipenv, go (modules and build), cargo,
+  bundler, composer, NuGet (`_STORE_VARS`). Only leerie's commands use
+  them, so they are kept across runs: one cold install per repository
+  (measured: barnacle 9.0 s, funeralworks 23.2 s), warm after.
+- *The run's workers'*, `<run-dir>/workers/cache/<name>` with
+  `XDG_CACHE_HOME` at `<run-dir>/workers/cache/xdg`
+  (`_worker_cache_env`, in the worker's spawn), one set per side of the
+  run, shared by that side's workers: the held-out side's workers
+  (`HELD_OUT_LOG_WORKERS`) have their own, `<run-dir>/workers/cache-held-out/`,
+  which no fixer's grant names (§8 *Nothing a held-out evaluation produces
+  reaches a fixer*). Per side rather than per worker, because what a worker
+  leaves in a cache can mislead only another worker of its side, never a
+  measurement, while every cold copy is paid again: a cold pnpm store
+  costs 9–23 s and 0.5–1.3 GB; on funeralworks, Playwright's chromium
+  costs 20.1 s and 656 MB cold against 2.1 s warm, and a warm-store
+  install with a cold `XDG_CACHE_HOME` 14.8 s against 11.8 s (corepack's
+  pnpm 23 MB, Prisma's engines 22 MB). A worker's configuration and
+  temporary directory stay its own: they carry hooks and sessions, a
+  cache carries neither. The set goes with the run directory.
+- *Each run tree's own*, `<run-dir>/tree-stores/<tree>/<name>`
+  (`_tree_store_env`): the stores of the managers no other tree may share
+  (*Which stores an install may share*, below).
+
+Since leerie's installs are confined (*Leerie's runs of the repository's
+commands are confined too*), the kernel holds each store class to its
+access: a fetched store read-only to an install, written by the fetch
+below alone.
+
+Two stores never share a file: each fetches its own copy (measured: 0
+inodes in common after the same lockfile was installed from both). A
+variable pointing beneath the image's bake root (`/opt/`, the *persistent
+out-of-repo dependency bake*) is left alone on both sides: those are
+dependencies leerie built into the image, which the recipe no longer
+installs.
+
+**A view's install never writes leerie's store.** The invariant: *leerie's
+store is written only by a process that runs no committed code.* Review
+round 18 H1 found the gap the split above left. A committed view's install
+is the repository's own install — its `package.json` `postinstall` and
+every dependency's lifecycle script run — and it ran against leerie's
+store with hard links, so a committed `postinstall` that edits a file in
+`node_modules` edited the store's own copy, for every later view and every
+later run. Measured on barnacle's real store: a hard-linked install shares
+the store's inode (`nlink` 3), and an in-place edit through the view grew
+the store's file from 3,284 to 3,305 bytes. Two measures close it:
+
+- *The store is filled with no committed code* (`_populate_leerie_store`).
+  Before an install, each install entry's lockfile is fetched into leerie's
+  store by `pnpm fetch --ignore-scripts`, run in a staging directory that
+  holds only the data files the fetch reads — the lockfile, `package.json`
+  (for `patchedDependencies`), `pnpm-workspace.yaml` and `patches/` — and
+  never the committed `.pnpmfile.cjs`, `.npmrc` or a script. `pnpm fetch`
+  reads no manifest scripts; `--ignore-scripts` keeps dependency lifecycle
+  scripts from running, and it is load-bearing: measured with pnpm 10.4.1,
+  a crafted lockfile whose own `package.json` allow-lists a git-hosted
+  dependency and a tarball dependency ran their `prepare` and `postinstall`
+  during a plain `pnpm fetch`, and none of them with `--ignore-scripts`. The
+  fetch is confined like every command leerie runs (*Leerie's runs of the
+  repository's commands are confined too*), with the store-fetch grant:
+  its staging directory and leerie's store, of which it is the one writer;
+  its cost on barnacle is 6.8 s cold and 3.1 s warm, on funeralworks
+  14.7 s cold.
+- *Every install copies from the store* (`_COPY_IMPORT_ENV`, now for every
+  tree, a view included): pnpm's `package-import-method=copy` and
+  `UV_LINK_MODE=copy`. No file the install or its scripts write shares an
+  inode with the store, so a `postinstall` edits only the view's own copy.
+  Measured: a copied install leaves the view's file at `nlink` 1, sharing no
+  inode with the store. `copy`, not `clone-or-copy`, which would reflink on
+  a copy-on-write filesystem: pnpm 11 silently drops `clone-or-copy`
+  (`pnpm config get package-import-method` reads `undefined`) and falls
+  back to its default, which hard-links. The earlier exception that let a
+  view hard-link is gone.
+
+The install still runs the repository's scripts, as it must to measure
+them; the install grant confines it — the measurement grant on disk, with
+the network through the egress proxy (§6 *An install reaches its
+inputs*) (*Leerie's runs of the
+repository's commands are confined too*), and with the store already
+filled it can run against a store it may only read (measured: a
+Landlock-confined `pnpm install` with the store read-only succeeds,
+barnacle 13–15 s, funeralworks 29–43 s with `prisma generate`). Copying is
+not the cost it looked: with the store read-only, a copied install of
+barnacle took 13.4 s against 12.9–14.6 s hard-linked, because the
+repository's own scripts dominate either way.
+
+**Which stores an install may share.** The same question, asked of every
+installer the recipe can name, measured in a container (Debian 13; npm
+11.19, yarn 1.22 and 4.9, bun 1.4, pip 25.1, uv 0.13, poetry 2.1, pipenv
+2024.0, cargo 1.85, go 1.24, bundler 2.6, composer 2.8, .NET SDK 8.0):
+does any command that writes the manager's store run committed code, and
+does the store refuse an entry edited in place when it is used again? A
+project carried a committed hook that wrote a marker (a `postinstall`, a
+`setup.py`, a `build.rs`, a `Gemfile` line, a `post-install-cmd`, an MSBuild
+target); an edit was a same-size, mtime-restored change to a cached file,
+or for an archive cache a valid rebuilt archive carrying a marker.
+
+| manager | a fetch that runs no committed code | edited entry on reuse |
+|---|---|---|
+| pnpm | `fetch --ignore-scripts` | served (mtime only) |
+| npm | `ci --ignore-scripts` | refused: content is looked up by its integrity, so an edited entry is a miss |
+| yarn classic | `install` with `YARN_IGNORE_SCRIPTS=true` | served |
+| yarn berry | `install` with `YARN_ENABLE_SCRIPTS=false` | refused: `yarn.lock` checksum |
+| bun | `install --ignore-scripts` | served, and hard-linked into the tree |
+| pip | `download --only-binary` | refused, with and without `--require-hashes` (the edited wheel was reported "Using cached" and not installed) |
+| uv | `sync --no-install-project` | served |
+| poetry | `install --no-root` | refused: `poetry.lock` hash |
+| pipenv | — | refused: `Pipfile.lock` hashes |
+| cargo | `cargo fetch` | served (`registry/src` reused unchecked) |
+| go | `go mod download` | served (`go mod verify` sees it; a build does not) |
+| composer | `install --no-scripts --no-plugins` | served |
+| bundler | none: the `Gemfile` is Ruby and runs on every command | served |
+| NuGet | none: `restore` runs the project's MSBuild targets | served |
+
+That puts each store in one class (`_FETCHED_STORE_VARS`,
+`_VERIFIED_STORE_VARS`, `_TREE_STORE_VARS`; every `_STORE_VARS` variable
+in exactly one):
+
+- *Fetched* — pnpm, npm, yarn classic, bun, corepack, go modules, composer:
+  shared, written only by the manager's `_STORE_FETCH` entry, one fetch at a
+  time under an exclusive lock on the store (`_store_fetch_lock`; review
+  round 19 exec M2 found concurrent fetches sharing one staging directory
+  and removing each other's), each in a staging directory of its own
+  (`tempfile.mkdtemp`) holding data files (never a committed `.npmrc`, `.yarnrc.yml`,
+  `.pnpmfile.cjs`, plugin or script), and read-only to every install.
+  Measured: each fetch ran no hook, and the real install then succeeded
+  against the store made read-only. For yarn the spelling matters:
+  `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=0` each let a
+  root `postinstall` run, while `YARN_IGNORE_SCRIPTS=true` with
+  `YARN_ENABLE_SCRIPTS=false` stopped it in both generations. bun hard-links from its cache and reads
+  its import backend only from the command line, so a recipe's bun install
+  gets `--backend=copyfile`.
+- *Verified* — pip, poetry, yarn berry's global cache: shared, and an
+  install may write them, because what it writes is checked against a hash
+  the commit pins before it is used.
+- *Per tree* — uv, cargo, bundler, NuGet, Go's build cache, pipenv's
+  environments, pnpm's metadata cache: one set per tree, at
+  `<run-dir>/tree-stores/<tree>/<name>`, set for every command leerie runs
+  in a tree under `<run-dir>/worktrees/` (`_tree_store_env`, applied by
+  `_run_streaming`), and emptied whenever a view's tip moves: a replaced
+  view's go with it, and a moved view is a new tree to every measurement
+  (§8 *A view moves to the next tip when the install's inputs are
+  unchanged*). bundler and
+  NuGet have no fetch free of committed code; uv's install of the project,
+  cargo's package lock and Go's build cache write the store as they build,
+  so an install could not run against it read-only (measured for uv: the
+  project build fails on a read-only cache). Nothing one tree's code leaves
+  there reaches another tree or a later commit. The class also holds where
+  a user-level install lands when the system location is not writable —
+  pip's user base (`PYTHONUSERBASE`), the .NET CLI's home
+  (`DOTNET_CLI_HOME`) and bundler's home (`BUNDLE_USER_HOME`) — because each
+  otherwise falls back to `$HOME`, which no measurement grant writes. Review
+  round 19 exec H2 found every pip recipe failing in every view that way.
+  Measured as the leerie user with `$HOME` read-only: `pip install`
+  answered "Defaulting to user installation" and failed, and succeeded
+  with `PYTHONUSERBASE` set, the package importable from it; `dotnet
+  restore` failed needing `~/.dotnet`; bundler warned and fell back to a
+  temporary home. npm, yarn, bun, uv, cargo, go and composer needed no
+  `$HOME` write once their store variables were set.
+  A user base carries one more property than its files: pip puts a
+  package's console scripts in `<user base>/bin`, which only `PATH` finds,
+  and the image has the default base's `~/.local/bin` last on `PATH` for
+  that. Relocated, the scripts were on no `PATH`: measured on a real run of
+  a pytest repository once its install reached PyPI (*An install reaches
+  its inputs*), pip installed pytest into the view's user base, warned
+  "installed in '…/pyuser/bin' which is not on PATH", and every test run
+  read `pytest: command not found`, so the base and every test axis went
+  unmeasured. *Wherever leerie points a confined process's
+  `PYTHONUSERBASE`, that process's `PATH` carries its `bin`, last*
+  (`_with_user_scripts`, in `_worker_cache_env`, `_tree_store_env` and
+  every command `_run_streaming` starts), in place of the value it replaces,
+  and after the image's tools, so a user-installed script never shadows a
+  baked one. A value beneath the bake root is the image's and is left
+  alone. Never on the orchestrator's own `PATH` (`_leerie_stores` sets the
+  store variables there, not `PATH`): leerie's unconfined process never
+  resolves a program from a store directory, which a confined fetch writes
+  (review round 23 isolation, an observation f0ce3e56 opened).
+
+**A worker started in a tree leerie installed for runs on that tree's
+stores.** Leerie prepares some trees for a worker: the acceptance writer's
+and the surrogate fixer's checkouts, each falsifier lane, the set audit's
+tree and, with `--dangerously-skip-permissions`, the planning worktree
+(`_ensure_worktree_deps` in each, before the worker starts). Where a
+manager installs inside the tree (`node_modules`, a `.venv`) the worker
+saw the install; where it installs into a per-tree store it did not.
+Review round 23 exec M1 measured it on a pip repository: leerie's install
+of each falsifier lane put pytest in that lane's user base
+(`<run-dir>/tree-stores/<lane>/pyuser`), the falsifier ran with
+`PYTHONUSERBASE` at its side's cache, and all 6 first samples answered
+"pytest isn't installed" (`could_not_demonstrate`); each re-ask
+improvised a `pip install --target /tmp/…` through egress. The root
+cause: the stores leerie's install of a tree writes and the stores a
+worker started in that tree reads were chosen by two functions
+(`_tree_store_env`, `_worker_cache_env`) that never agreed on a tree, so
+"a checkout with dependencies installed" held only for managers that
+install inside the tree. The invariant: *a worker started in a tree leerie
+installed for sees that install* — its interpreter, its manager and its
+`PATH` resolve what the install put in the tree's own stores. So one
+function chooses a tree's stores for every process started in it:
+`_tree_store_env` sets every per-tree variable (uv, cargo, bundler, NuGet,
+Go's build cache, pipenv, pnpm's metadata cache, pip's user base and its
+`bin` on `PATH`, the .NET CLI and bundler homes) for leerie's commands
+there and, laid over the worker's side cache, for a worker started there
+once leerie has installed for it (`_installed_tree_stores`: the tree is in
+this process's install record, the one that keeps leerie from installing a
+tree twice). The worker is granted the tree's stores as it is granted the
+tree: written by a worker that writes its tree (the writer, the surrogate,
+the falsifier — committing workers, whose code already runs in that tree
+and whose tree's stores no other tree reads), read by one that reads it
+(the set auditor; the judgment workers in the planning worktree). Nothing
+is copied into the worker's cache, and nothing crosses trees: a tree's
+stores are that tree's alone. A read-only worker cannot write what its
+manager writes there as it builds (Go's build cache), as it cannot write
+its tree. A tree leerie never installs for — a subtask's worktree and
+staging, which leerie measures only through their committed views (§8
+*Every measurement reads the committed view*), and every judge checkout —
+keeps its workers on their side's cache, where those workers' own installs
+land.
+
+The measurement grant gives a confined install exactly this: the fetched
+stores read-only, the verified ones writable, and its own tree's
+`tree-stores` writable (*Leerie's runs of the repository's commands are
+confined too*).
+
+**A measurement pins pnpm's version.** A confined install reads leerie's
+fetched store read-only, which only some pnpm versions can do. Measured
+under Landlock on barnacle and funeralworks, with the store read-only and
+`copy` import: pnpm 10.4.1 installs cleanly (barnacle 14.5 s with its
+scripts skipped; funeralworks 107.6 s with its scripts); pnpm 10.28.2 fails
+writing a project ref into the store (`<store>/v10/projects/`); pnpm 11
+fails writing its SQLite index (`v11/index.db`), which it opens read-write
+for every install and before every `pnpm <script>` (review round 19 exec
+H3). pnpm 11 has a mode for exactly this, `frozen-store` ("open the package
+store read-only and skip all store writes"): measured on a pnpm 11 project
+under Landlock, the install against the read-only store failed with
+`ERR_SQLITE_ERROR` without it and succeeded with it (2.2 s, no inode
+shared), and `pnpm run` succeeded too. So every measurement except the
+store fetch sets `frozen_store=true` and `verify_deps_before_run=false`
+under both spellings (`_measurement_grants`); pnpm 10.4.1 accepts both
+unchanged (install and `pnpm run` succeed). The fetched class can then hold
+pnpm 11's store as well as pnpm 10's. corepack picks the version from the
+repository's `packageManager`, else a last-known-good it keeps in
+`COREPACK_HOME`, else the newest on the registry, which was pnpm 11.1.2. So
+corepack never floats (`_COREPACK_PIN_ENV`: `COREPACK_DEFAULT_TO_LATEST=0`,
+no auto-pin, no prompt, set in `main()`), and when a tree pins no
+`packageManager` the fetch phase first seeds `_PNPM_DEFAULT_PIN` (10.4.1)
+as the known-good version (`_seed_pnpm_pin`); a tree that pins one keeps
+it. pnpm also writes a lock and state under `XDG_STATE_HOME` and
+`XDG_RUNTIME_DIR`, which `_measurement_grants` points at the measurement
+directory and, for the runtime directory, which holds sockets, the tree's
+private temp directory (*A confined command's scratch is short and
+private*).
+
+What this does not cover: a worker writing leerie's store, a view, `/opt`
+or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside
+the worker's own tree, which the worker's write boundary forbids; this
+removes the ones a worker made legitimately, through its own installs and
+the links they share, and the ones leerie's own install made through a
+committed `postinstall`.
 
 This explains *why* worktrees are expensive; it deliberately does not
 drive a gate. A per-worktree measured bound was attempted and withdrawn
@@ -2786,10 +6307,8 @@ worktree depends on mount topology leerie does not control and a peak
 count that depends on scheduling. The disk guardrail is instead a
 proportional free-space floor plus a resumable pause; see
 IMPLEMENTATION.md's "Disk headroom (N30)". Colocating the store with the
-worktrees on one mount would collapse the per-worktree cost and is the
-more fundamental fix, but it changes runtime behaviour across the local,
-Fly and EC2 runtimes and both privilege models, so it is held as a
-separate change rather than folded into the guardrail.
+worktrees (above) collapses the per-worktree cost; the guardrail stays,
+since mount topology on a given host is still not leerie's to assume.
 
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
@@ -2800,7 +6319,7 @@ SIGTERM, SIGHUP, WorkerError, or any other exception:
   on `resume` from the deterministic branch names.
 - State.json, the run branch (`leerie/runs/<run-id>`), and per-subtask
   branches (`leerie/subtasks/<run-id>/*`) all survive. Implementer
-  checkpoints under `<state-root>/runs/<run-id>/checkpoints/` survive too,
+  checkpoints under `<state-root>/runs/<run-id>/notes/<id>/` survive too,
   so in-flight subtasks resume from where they left off.
 
 **Worker subtree termination — kernel-enforced via the container
@@ -2837,7 +6356,9 @@ be.
 The per-worker async cleanup that lives in `claude_p` (the PPID walk in
 `_terminate_proc_tree`, the `_DescendantTracker` polling loop) is *kept*
 as the fast happy path that reaps a single worker's subtree promptly on
-clean exit, but it is no longer the abnormal-exit guarantee — if it
+clean exit — under the shim, which ends every confined command's
+descendants at its exit (§6 *A confined command's processes end with
+it*) — but it is no longer the abnormal-exit guarantee — if it
 half-finishes under Ctrl-C, that's no longer a leak, since the container
 boundary catches every survivor when the orchestrator exits.
 
@@ -2978,6 +6499,28 @@ combined peak, so no VM size could auto-derive a sufficient cap — every
 build-running worker was cgroup-OOM-killed regardless of host RAM. Any
 cap below the combined peak guarantees the OOM it exists to contain.
 
+**Enrollment holds the spawn.** A cgroup bounds only the processes inside
+it, and a process's children are born in whatever cgroup the process is in
+*when it forks*. Enrolling a worker after spawning it therefore races the
+worker's own first forks: everything forked before the enroll lands stays
+in the container scope, uncapped, for the rest of its life. Measured on a
+`pnpm run build` (bench F4/P5): with enroll-after-spawn on rootful, 71 of
+72 descendants escaped the worker cgroup and 16.4 GiB of RSS sat outside
+it, its `memory.peak` reading 0 — `runuser` forks before a 65 ms enroll
+lands; rootless lost 1 of 70. So every process leerie enrolls — each
+worker, and each command the orchestrator runs inside a cgroup — is
+spawned **held**: the cgroup is created first, the process starts as a
+tiny gate that blocks reading one byte from a pipe, the gate's pid is
+enrolled, and only then is the byte written and the gate `exec`s the real
+command. `exec` keeps the pid and the cgroup, and nothing has forked
+before it, so every descendant inherits the cgroup. Measured: 0 escapes
+in every held run (rootless and rootful), and `memory.peak` within 1.5%
+of a whole-container measurement. The per-worker failure policy is
+unchanged: an enroll the broker rejects still releases the gate and the
+worker runs uncapped (the run-level gate below is the fail-closed one);
+an orchestrator that is cancelled before the release closes the pipe
+instead, and the gate exits without running anything.
+
 **Reap the worker's own subprocesses before destroying its cgroup.** The
 `finally` that tears a worker down calls
 `descendant_tracker.stop_and_reap()` *before* `_cgroup_destroy()`.
@@ -3036,6 +6579,52 @@ headroom, but the build peak outranks it: on a slice too small to honour
 both, a `memory.max` above the slice is harmless (the aggregate cap binds
 first) while one below the build peak guarantees the OOM. Being
 load-independent is what makes resolving it once, at startup, correct.
+
+**The repo's own build peak, measured, raises the ceiling.** The constant
+above is one Next.js measurement; a repo whose build is heavier OOMs at it
+however large the host. The base-health baseline (§9) already runs the
+repo's build and test commands once, so it runs each inside its own
+uncapped measurement cgroup (spawn-held, above) and reads the cgroup's
+`memory.peak` and `pids.peak` through the broker (cgroup v1 has no
+`pids.peak`: `memory.max_usage_in_bytes` and a polled `pids.current`
+stand in). From the largest peak the run raises the per-worker ceiling to
+`max(ceiling, 1.25 × peak + 0.3 GiB)` and the PID cap to `max(pids cap,
+⌈1.5 × pids peak⌉)` (2048 is the default floor). Benched on a funeralworks
+build peaking at 17.81 GiB / 2852 PIDs: a 22.56 GiB / 4278-PID ceiling ran
+every build to completion with no OOM (6 of 6 under the semaphore below,
+and the rootful capped run: peak 13.9 GiB, 2767 PIDs), where the
+constant-derived 9.85 GiB ceiling sat 8 GiB below the measured peak. The
+peak is persisted, so a resumed run re-applies it.
+
+**A host-wide build semaphore, not admission by reservation.** Two runs
+each admitting three such builds at once took the host to global reclaim
+thrash: 0 of 6 finished in 1078 s and one was OOM-killed, because each
+admission check passes before the builds it admitted have ramped (bench
+F4/P4 arm D). The same six builds through a flock semaphore finished 6 of
+6 in 562 s (arm S). So the commands that are themselves build or test
+runs — the orchestrator's own BLT measurements and B\* reruns, and a
+settle-by-execution command that is the repo's build or test command —
+take a slot first: `⌊(MemAvailable − 4 GiB) / peak⌋` slots, sized when the
+peak is measured and never fewer than one, so a build too large for the
+host still runs alone rather than deadlocking. Before a peak is known the
+measured-constant build peak sizes it. The slots are lock files in a host
+directory the launcher creates and mounts into every run's container
+(`~/.leerie/.host` → `/leerie-host`), so runs of different repos share
+one count; the kernel drops a slot when its holder dies, even on SIGKILL.
+Workers are never gated as a whole — only these commands. Ownership
+follows the runtime rule (§6 *Rootless exception*): rootless sees the
+host user's directory as its own (outer UID 0 → inner leerie), rootful's
+entry guard `chown`s it to leerie, and the slot files are opened
+read-only (`flock` needs no write access), so a slot another identity
+created still locks. Where no such mount exists (Fly, EC2 — one run per
+machine) the slots live under the state root, which is host-wide there.
+
+**At the measured ceiling, a resource kill is an environment limit.** Once
+the ceiling is the measured one, a worker OOM-killed or PID-exhausted
+inside its cgroup is not a worker mistake a fresh attempt fixes; it is
+typed `environment_limit`, retried in place once, and then settled
+`unconverged` (§13 *One re-drive budget per subtask*), as is a
+settle-by-execution command killed the same way.
 
 **A repo can declare its own memory needs, and the ceiling must honour
 them.** Node 20+ sizes its heap from the container it finds itself in,
@@ -3201,9 +6790,10 @@ omits `USER leerie`); *before the privilege drop* it launches the broker
 at the identity that owns (or was delegated) the slice — real root in
 the rootful case (Colima, Fly), the rootlesskit-mapped host UID in the
 rootless case (which owns the systemd-delegated user slice; see
-*Rootless exception* below). The broker listens on a Unix socket at
-`/run/leerie-cgroup.sock` (world-connectable; every request is
-validated). It performs `create` / `enroll` / `destroy` at that owning
+*Rootless exception* below). The orchestrator reaches it only through a
+descriptor it inherits — one end of a socket pair, never a pathname (§6
+*No leerie service is reachable by a path from a process it does not
+serve*), and every request is validated. It performs `create` / `enroll` / `destroy` at that owning
 identity — the only identities where enrollment and limit-setting work
 — and detects the cgroup hierarchy: **v2** (Colima) uses the unified
 `leerie.slice/leerie-w-<sid>/{pids,memory}.max`; **v1/hybrid** (observed
@@ -3213,11 +6803,12 @@ the split hierarchies (`/sys/fs/cgroup/pids/leerie.slice/...`,
 templates is the run-scoped composed sid (`<run-id-prefix>-<worker-sid>`,
 above); the broker treats it as an opaque validated string. The
 entrypoint then drops to the leerie user via `runuser -u leerie --`
-before exec'ing the orchestrator (local nerdctl) or sleeping as PID 1
-(Fly, where the orchestrator is started out-of-band by the launcher's
-ssh-console wrapper that drops via `Popen(user="leerie")`). The
-orchestrator's `_cgroup_*` helpers are thin socket clients of the
-broker; it never writes cgroupfs directly. (Rootless containerd has no
+before exec'ing the orchestrator (local nerdctl; the broker is started by
+that same exec), or sleeps as PID 1 (Fly, where the orchestrator is started
+out-of-band by the launcher's ssh-console wrapper, which starts the broker
+and drops via `Popen(user="leerie")`). The
+orchestrator's `_cgroup_*` helpers are thin clients of the
+broker over that descriptor; it never writes cgroupfs directly. (Rootless containerd has no
 real root to drop from or broker as — see *Rootless exception* below.)
 
 **Fail-closed gate.** Because a silently-uncapped run is what caused the
@@ -3284,9 +6875,13 @@ image dirs at `/opt/leerie-image/` (outer UID leerie) traverse via their
 mode-755 bits, and Claude Code sees `getuid() == leerie` and accepts the
 flag with no escape-hatch check. The OCI default seccomp profile blocks
 `unshare(CLONE_NEWUSER)` inside containers, so the launcher passes
-`--security-opt seccomp=unconfined` for rootless runs (gated on the
-`containerd-rootless/child_pid` sentinel, not `id -u`, so macOS/Colima
-runs are unaffected).
+`--security-opt seccomp=unconfined` — for rootless runs first (gated on the
+`containerd-rootless/child_pid` sentinel, not `id -u`), and since
+2026-11-01 for every local run, rootful and Colima included: the
+confinement shim makes a user namespace for every confined process (§6
+*Every confined process has its own `/tmp`, `/dev/shm` and IPC*), and its
+per-process seccomp filter takes back, tighter, what the default profile
+refused.
 
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
@@ -3558,6 +7153,30 @@ observed is not reaped, with the cgroup PID cap plus the container
 boundary as backstop. Because the subreaper reparents orphans to the
 orchestrator rather than PID 1, the mid-run `_reparented_orphans` filter
 accepts `ppid in (1, getpid())`; exit-time `stop_and_reap` is unaffected.
+
+**What a cgroup teardown kills, it also reaps.** The broker's `destroy`
+(`cgroup.kill` on v2) SIGKILLs every process still in the cgroup,
+including one that left the command's session on purpose, such as a test
+database a repository's own wrapper starts under `setsid` so it outlives
+one test run. Those killed processes reparent to the orchestrator and
+become zombies. When no tracker observed them, the allowlist never names
+them, so nobody waits for them, and a zombie still answers `kill(pid, 0)`.
+A daemon that guards its data directory with a PID lock file therefore
+refuses to start again for the rest of the run ("lock file already exists
+… Is another postmaster running?"). The build-peak measurement and the CI
+parity checks run in their own broker cgroup with no tracker, and a
+tracker that polls every 0.5 s can miss a daemon whose launcher exits
+sooner. So `destroy` on v2 reads `cgroup.procs` before it writes
+`cgroup.kill` and returns those PIDs as `OK <pid>…`, and the client adds
+them to the reaper's allowlist. This keeps the allowlist rule: every one
+of those PIDs was alive in a cgroup leerie created and is killed by
+leerie, so none of them is in the fork→`pidfd_open` window, and `_mark_reapable`
+still drops any PID asyncio manages. On v1 `destroy` migrates survivors
+instead of killing them, so it returns no PIDs. Found by the first live
+integration run on a Prisma repository: the baseline test measurement
+killed the wrapper's postgres, and every later test run in the container
+failed at `pg_ctl start`.
+
 This is chosen over inserting a real init (e.g. `nerdctl run --init` / tini
 as PID 1) because the subreaper covers both local and Fly runtimes
 (`--init` is nerdctl-local only) and is purely additive, changing nothing
@@ -4195,17 +7814,18 @@ fresh AWS account with no operator-built artifact. Three strategies:
      seed bundles and the tool caches the container keeps under `/tmp`
      would compete with the workers for memory and vanish on every boot.
      And it takes over what `container-entry.sh` does as the container's
-     PID 1, since an instance has no such process: a root systemd unit
-     runs the cgroup broker (*Memory containment* — without it the
-     orchestrator's fail-closed containment gate refuses to start any
-     worker), after a boot-time step that creates `leerie.slice` with the
-     memory and pids controllers and the same aggregate memory cap the
-     container sets, and re-creates the `/tmp` cache directory the boot
-     cleans. Root on a real host is the rootful case, so the slice sits
+     PID 1, since an instance has no such process: a root oneshot systemd
+     unit, at boot, creates `leerie.slice` with the memory and pids
+     controllers and the same aggregate memory cap the container sets, and
+     re-creates the `/tmp` cache directory the boot cleans. The cgroup
+     broker (*Memory containment* — without it the orchestrator's
+     fail-closed containment gate refuses to start any worker) is not a
+     boot service: as on Fly, the launch wrapper, running as root, starts
+     it and hands the orchestrator its descriptor, so no path reaches it
+     (*No leerie service is reachable by a path from a process it does not
+     serve*). Root on a real host is the rootful case, so the slice sits
      at the top of the cgroup hierarchy exactly as it does in a rootful
-     container; a `Delegate=yes` unit cgroup would not do, since the
-     broker itself would occupy it and cgroup v2 forbids enabling
-     controllers on a cgroup that holds processes.
+     container.
    - **Tag and rebake rule.** The AMI is tagged with the leerie version
      and a source hash (over the files baked in: orchestrator, scripts,
      prompts, plugin manifest, `requirements.txt`, the bake script).
@@ -4292,14 +7912,12 @@ destroying unpushed work.
 Two rules hold for both remote runtimes' teardown (Fly's `decide_teardown`
 and EC2's `decide_ec2_teardown` alike):
 
-- **A launch-time `--no-push` is honored by auto-finalize.** The runtime
-  sidecar (`fly-machine.json` / `ec2-instance.json`) records it as
-  `host_no_push`, and teardown reads it there, because the fetched
-  `run.json` cannot carry it — the fetch strips `no_push=true` whenever a
-  run branch exists (a defense against old images that wrote the
-  mechanism flag). With it set, the run branch is left on the host for a
-  later `leerie finalize`, no push or PR is attempted, and the machine or
-  instance is destroyed (the work is already on the host).
+- **A launch-time `--no-push` is honored by auto-finalize.** The run's
+  one push choice is `run.json.no_push`, recorded by the orchestrator at
+  the run's start (*One push choice per run, on every runtime*); the fetch
+  brings `run.json` home unchanged, and the teardown hands the run to
+  `host_finalize`, which reads that record and skips the push. No sidecar
+  field and no launcher variable is a second owner of the choice.
 - **The teardown trap keeps the launcher's exit duties.** Provisioning
   replaces the launcher's EXIT trap with the teardown function, so the
   teardown's exit pass ends by running the launcher's own cleanup:
@@ -4514,6 +8132,200 @@ worktree path and lives in the process, not in run state: it records a
 filesystem fact, and re-installing once after a `resume` is correct
 since a fresh container starts with an empty worktree.
 
+**Leerie's own commands leave a worker's tree as they found it.** The
+invariant (I2): *every command leerie itself runs in a tree a worker
+works in — the recipe's install and build entries, a measured
+build/lint/test axis, a test-ID report run, a coverage settle's commands,
+a settle by execution's verify commands — leaves that tree as it was just
+before the command, apart from ignored files*: every tracked file the
+command changed is put back, every untracked, not-ignored file it created
+is deleted (with the directories that leaves empty), and an ignored file
+— installed dependencies, a build a repository ignores — stays, so the
+tree stays runnable. Together with I1 (§8 *A worker leaves its tree
+clean*) it makes the tree leerie measures, judges and ships nameable by
+its commit alone: at every point leerie reads it, staging is its HEAD plus
+ignored files.
+
+The root cause it removes. An install can rewrite a tracked file in
+ordinary use — `uv sync` relocks `uv.lock` under a newer uv, `bundle
+install` adds the container's platform to a `Gemfile.lock` made on a Mac,
+`pipenv install` rewrites `Pipfile.lock` on a hash mismatch — and so can
+a build (`next build` rewrites a tracked `tsconfig.json`) or a test run (a
+snapshot written). And a test run leaves untracked output in any
+repository that does not ignore it: `__pycache__/`, `coverage/`,
+`junit.xml`, a first-run snapshot. Left in place, that output sat in the
+tree workers commit from and leerie measures, indistinguishable from a
+worker's: review round 9 drove a clean run whose install appended to the
+tracked `pnpm-lock.yaml` into an end-state line "uncommitted edits to 1
+tracked file(s) that do not ship", the final conformer's "left 1
+uncommitted change(s)" warning, and a leftovers commit shipping the churn.
+The tracked half was put back from then on; the untracked half was
+*recorded* instead — which untracked file leerie's command produced
+first, which one it wrote last, which ones a test run writes — so that a
+later reader could tell leerie's output from a worker's file. Rounds 10 to
+14 each found that record answering a question a little wrong (a
+conformer re-running the tests turned `coverage/` into a file of unknown
+origin; a worker's rewrite of a generated file read as leerie's; a test
+run in a checkout no longer refreshed staging's record), and each added a
+record. Every one of them existed only because leerie's own output stayed
+in the tree. Deleting what a command created removes the question.
+
+Measured before building it, across barnacle, funeralworks and api: no
+later step needs a non-ignored file an install, build or test run
+generates — every real output (`dist/`, `.next/`, the Prisma client,
+`coverage/`, `node_modules/`) is ignored, so it stays. The residuals are
+husky's install, which changes git config rather than writing a file, and
+a first-run snapshot file, which a deletion correctly removes: a snapshot
+a test writes on its first run is the worker's to commit, not leerie's.
+A repository that does not ignore its dependency directory (`.venv/`,
+`node_modules/`) gets it deleted after each install; I1 already holds its
+workers to the same rule, and real repositories ignore it.
+
+The bracket: a snapshot of the tracked files' content (path → blob of the
+working bytes) and the list of untracked, not-ignored files (the one
+listing, §8 *One ignore rule*) are taken before the command.
+Afterwards every tracked file whose content changed is put back as it was
+just before — from HEAD when it matched HEAD, from its saved bytes when it
+was already edited, so nothing anyone left is lost — and then every
+untracked, not-ignored file not in the earlier list is deleted. A file
+that existed before the command is never deleted, whatever the command
+did to it. The run repository's settings, which a command can change too
+(husky's install sets `core.hooksPath`), are copied back from leerie's
+copy (§8 *The settings are leerie's*). The other commands leerie runs do not need it: CI parity and
+the held-out sets' parse probe and runs work in disposable checkouts no
+worker commits from; the setup hook and
+`mise install` run in a throwaway checkout no worker commits from; and
+the advisory whole-PR review, a worker, has what it leaves undone by the
+same two acts.
+
+Ownership and permissions do not stand in the bracket's way on any
+runtime, and the reason is one property: every file the bracketed command
+can create in a worker's tree is owned by the orchestrator's own uid. The
+command is a child of the orchestrator; the cgroup broker, which runs as
+root, only enrolls the pid and never spawns; the image ships no `sudo`.
+Rootful's `runuser -u leerie` is a real uid switch, rootless's `unshare
+--map-user` maps the host user to that same inner uid (the
+bind-mounted state root is the host user's), and Fly runs the
+orchestrator as `leerie` too, so the tree's files are the orchestrator's
+in all three. One exception, on Fly only: subtree collection after a
+dead run (`collect-subtrees.sh`, over `flyctl ssh console`) runs git as
+root, so a merge it makes leaves root-owned files in staging, and a later
+resume's restore there stops with the paths instead of removing them. It
+is a known follow-up, not something the bracket can absorb. What can
+still stop a removal is a permission *bit*: a test
+that makes a directory read-only (testing an `EACCES` path) and dies
+before restoring it. `git clean` and `unlink` then fail with "Permission
+denied" on every runtime alike. Since the directory is the orchestrator's
+own, the bracket restores the write bit on the directories between the
+tree and a path it removes or puts back, and only then acts. A path it
+still cannot remove or restore — so not the orchestrator's own — stops
+the run there, naming the path and the error, rather than leaving dirt
+the next worker's I1 gate would hold it to with no cause. An untracked entry that is a directory — a nested
+repository a test `git init`s, which `git ls-files --others` lists as one
+`fx-repo/` entry — is removed whole (review round 15 M2).
+
+The integration merge (`integrate.sh`) is one of leerie's own commands
+in staging, and is bracketed like the rest, with two refinements (review
+round 15 M3, where a merge's own output reached `_assert_staging_clean`
+as "a leerie bug").
+
+- *Hooks off.* No git command of leerie's own runs a repository hook.
+  Those commits, checkouts and resets are leerie's, not the user's; a
+  `post-merge` or `post-checkout` hook (husky turns them on during
+  leerie's own install) writes files into the tree leerie then measures,
+  and a `pre-commit` hook can rewrite what leerie commits. Which commands
+  fire a hook cannot be listed by subcommand: measured on git 2.53.0
+  with every hook installed, `git checkout -- <path>` and `git checkout
+  HEAD -- <path>` fire `post-checkout`; `git status`, `git add`, `git reset
+  --hard` and a path checkout fire `post-index-change`; `git reset
+  --hard`, `git update-ref`, `git commit` and `git worktree add` fire
+  `reference-transaction`; only pure readers (`rev-parse`, `ls-files`,
+  `diff`, `merge-base`) and `clean` fired none. Review round 16 (claims H1)
+  drove the cost of a list: the round-15 version turned hooks off per
+  "hook-firing" subcommand, assumed a path checkout fires none, and left
+  the I2 bracket's own tracked put-back and the key-level JSON merge's
+  `checkout -m --` running `post-checkout` in staging. So the invariant
+  is held for every git process at once, through the one channel they all
+  share: the environment. Before it spawns anything, the orchestrator adds
+  `core.hooksPath=/dev/null` to its own environment through git's
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` (appended to
+  any the operator set, which config files cannot override), so every git
+  it runs — directly, through a helper or through a script — inherits it.
+  Two kinds of spawn take it back out, because neither is leerie's own
+  git. A worker's: its git commands are the worker's and keep the
+  repository's hooks. And every command of the repository's that leerie
+  runs — the recipe's install and build, a measured build/lint/test axis,
+  a test-ID run, the held-out sets' parse probe and runs, a settle by
+  execution's verify commands, CI parity's and the coverage settle's
+  checks, the setup hook, the self-check: the repository's commands run in
+  the environment the repository expects. The entry is git's command
+  scope, which no repository config overrides, so inherited it also
+  turned hooks off inside repositories the code under test creates for
+  itself; a suite that tests hook behaviour was green outside leerie and
+  red in every leerie measurement, a false regression a repair round then
+  tried to fix (review round 17 M4). Every such command is launched
+  through `_run_streaming` (`_run_contained` included) or the self-check's
+  own spawn, and both build its environment with `_repo_command_env`.
+  A hook such a command's own git fires in the measured tree is still
+  removed by I2. The scripts leerie runs add the same entry themselves,
+  so they hold it when run outside the orchestrator (the subtree
+  collection over `flyctl ssh`).
+- *The untracked half only.* The merge's tracked changes are its product
+  — a committed merge, or a conflict left for the integrator — so the
+  bracket does not put tracked files back around it; it removes only the
+  untracked, not-ignored paths the merge created. The case that matters:
+  a merged commit changes `.gitignore`, and output a build or install
+  left — ignored until then, kept by I2 as environment — becomes
+  untracked. Removing it loses nothing: ignore status is a property of
+  the commit staging is at, and under the merged commit that file is
+  neither part of what ships (it is not committed) nor ignored
+  environment; left, it would put a file that does not ship in front of
+  every later measurement, which is exactly the guess §8 removed. Whatever
+  produced it is the build or install, which the next measurement runs
+  again — so when the merge's bracket removes anything, staging's
+  dependency-install memo is dropped and the next measurement installs
+  afresh.
+
+Three details keep the snapshot itself sound. Only the snapshot taken
+before a command writes its blobs to the object store, since only those
+bytes are ever written back; every other snapshot is only compared
+(review round 10 drove a test that rewrote a 5 MB tracked fixture ten
+times into about 48 MB of loose objects in the store every worktree
+shares).
+A submodule is listed by the commit it has checked out, and only when
+that moved: content modified inside it is its own state, and leerie
+never moves a submodule back. A directory is a submodule only when the
+index records one at that path: a tracked file a command replaced with a
+plain directory is a file that is gone, and is put back (the directory
+removed first). Asking the directory itself which commit it has checked
+out answers with the enclosing repository's HEAD, which read that case
+as a submodule that is never restored (review round 11). A path git cannot hash is listed as such
+and left alone instead of failing the snapshot — one dirty submodule
+had switched off the put-back for the whole tree. And every path goes to
+git as a literal pathspec: `git checkout
+HEAD -- app/[slug]/page.tsx` otherwise reads the brackets as a glob and
+also reverts a worker's edit to `app/s/page.tsx`. That holds for every
+git command leerie runs with a path it did not write as a constant, not
+only for the snapshot: review round 11 drove the key-level JSON merge's
+`git add -- cfg/[ab]/x.json` also committing an untracked `cfg/a/x.json`,
+and a read-only `git diff -- app/[slug]/p.ts` reporting a line of
+`app/s/p.ts`. A call site that means a glob says so — `:(glob)` magic, or
+a pathspec a prompt defines as one (`ABSENT:<pathspec>`) — and is named
+as deliberate in the source scan that guards the rest.
+
+Nor is a rewrite committed as part of the change. Leerie cannot tell an
+environment-driven rewrite (a newer tool, the container's platform) from
+one the change caused, and committing the first ships churn the user
+never asked for. The case where the change causes it — a worker edited
+`package.json` and did not update the lockfile — is the worker's to
+commit: workers run the install themselves for their own work (above),
+and the table's JavaScript installs are frozen (`pnpm install
+--frozen-lockfile`, `yarn install --frozen-lockfile`, `npm ci`), so that
+drift fails the install instead of rewriting the lockfile, which §9
+*Which failures are new* treats as "could not measure", never as a pass.
+For the unfrozen installers the rewrite is put back like any other and
+logged by path.
+
 The orchestrator addresses both with a dedicated phase between
 classification and planning, layered top-to-bottom by determinism:
 
@@ -4525,7 +8337,16 @@ classification and planning, layered top-to-bottom by determinism:
    orchestrator execs it inside the container as the non-root `leerie`
    user (the image deliberately does not ship `sudo`). Repo author
    controls trust; the script runs in the same container that runs the
-   workers.
+   workers. Its working directory is a throwaway checkout of the planning
+   tree's commit (`_judge_checkout`), removed afterwards with whatever the
+   hook made in it; never the user's checkout, which is read-only (§6 *The
+   explicit channel*). Step 2's `mise install` and `mise ls` run in the same
+   checkout. Both are confined (§6 *Leerie's runs of the repository's
+   commands are confined too*): the hook may write its checkout, its own
+   temp and cache, `MISE_DATA_DIR` and `~/.local/bin`; `mise` its
+   checkout, its own temp and cache and `MISE_DATA_DIR`, trusting no
+   configuration. The hook runs once, before any worker that commits: one
+   that would run after one has started stops the run instead.
 
    System packages requiring root (apt-get-installable libraries,
    anything writing to `/usr/*` or `/etc/*`) are out of scope for the
@@ -4550,6 +8371,18 @@ classification and planning, layered top-to-bottom by determinism:
    the first match — silently dropping a frontend install would leave
    half the workers broken. When the table returns a non-empty result
    the orchestrator uses it; no model in this path either.
+
+   **One install per independent package root.** A Node lockfile in a
+   subdirectory (`worker/`, `infra/`) that is not a member of the root's
+   workspace (`pnpm-workspace.yaml` `packages:`, or `package.json`
+   `workspaces`) is a separate project a root install never reaches, so
+   the table emits one entry per such directory, with that directory as
+   `working_dir`, pnpm > yarn > npm within it as at the root. Tracked
+   lockfiles only, `node_modules` excluded, at most 16 roots. The
+   one-entry recipe was rejected by the provision judge as missing those
+   roots' dependencies, killing 7 runs across 5 chains at the provision
+   gate — two after the no-work judge had already confirmed the task
+   done.
 4. **LLM provision worker — fallback.** When the table returns empty
    (Java with Gradle, a bare `pyproject.toml` without lockfile, a
    polyglot Makefile-driven setup), the orchestrator invokes a
@@ -4827,10 +8660,11 @@ the repo genuinely needs across all languages and frameworks:
   in total). These are the unambiguous ground truth for a repo's language
   dependencies.
 - **Secondary — install-filtered commands.** A hint list of package-manager
-  *install* commands observed during the run (extracted from `logs/*.log` via
-  `_iter_log_tool_use`, then narrowed by `_extract_depcap_commands` to commands
-  that invoke an install verb at a command boundary, excluding text-scanning
-  tools; deduped, newest-first, byte-bounded). Purpose: surface **system/native**
+  *install* commands observed during the run (extracted from the run's
+  registered worker transcripts — never a command's output, §8 *What a
+  worker ran is read from its own transcript* — via `_iter_log_tool_use`,
+  then narrowed by `_extract_depcap_commands` to commands that invoke an
+  install verb at a command boundary, excluding text-scanning tools; deduped, newest-first, byte-bounded). Purpose: surface **system/native**
   (apt) deps a worker had to install that no language manifest records (e.g.
   `libvips-dev`, `pkg-config`).
 
@@ -4843,7 +8677,8 @@ languages and frameworks" goal. Which files and commands the worker sees is
 deterministic corpus selection in code; the model still decides content (§12
 *Prompts are advisory, code enforces*). Structured output (`setup_packages`
 and `language_installs`) is validated against a JSON schema and written to
-`.leerie/config.toml` deterministically. The `dep_capture` worker defaults to
+`.leerie/config.toml` deterministically, by the host (*The host applies a
+capture* below). The `dep_capture` worker defaults to
 `sonnet`/`medium`, overridable via `LEERIE_MODEL_DEP_CAPTURE`.
 
 **System packages → `setup_packages` → warm apt layer.** `dep_capture`'s
@@ -4890,10 +8725,11 @@ differs, the decision-maker does not:
   runs there — same post-loop pattern as the `RateLimitedExit` arm. Non-fatal;
   covers `nerdctl stop` / Ctrl-C. `SIGKILL` gives no window.
 - **SIGKILL / crash / host-side → backstop + `--recapture`.** Covered two
-  ways, both host-side, modeled on the `--phase judge` scaffolding: a
+  ways, modeled on the `--phase judge` scaffolding: a
   *run-start backstop* scans prior run dirs at start, before `phase_classify`,
   for any with `logs/` but no `dep_capture.done` sentinel and runs capture
-  over them automatically; and *on-demand `--recapture`* — `leerie config
+  over them automatically, recording each capture in the current run's
+  directory; and *on-demand `--recapture`* — `leerie config
   --recapture` resolves the target run, constructs and flocks its `State`
   (refusing to race a live orchestrator via `StateLockedError`), and runs the
   worker via `asyncio.run`.
@@ -4908,11 +8744,28 @@ no longer captured) — an explicit "rebuild the dep set from current history"
 gesture. Even under `--force`, an empty capture leaves the existing config
 untouched, so a bad run can never blank a good config.
 
-**Idempotency.** After a successful write, `capture_repo_deps` writes a
-lightweight `<run_dir>/dep_capture.done` sentinel and sets
-`dep_capture_done = True` in `state.json`. The run-start backstop skips any
-run whose sentinel is already present. When the union merge finds nothing
-new, the function returns immediately without touching `.leerie/config.toml`.
+**The host applies a capture.** The container never writes the user's
+checkout (§6 *The explicit channel*; locally it is mounted read-only), so a
+capture inside the container is recorded, not written:
+`capture_repo_deps(..., record_in=<the current run's directory>)` appends
+`{setup_packages, language_installs, replace, from_run}` to
+`<run-dir>/captured-deps.json`. The host applies the file to
+`$USER_REPO/.leerie/config.toml` with the same union (or replace) merge,
+against the file as it is at that moment, then renames it
+`captured-deps.applied.json`, so a second apply is a no-op:
+- locally, in the launcher's EXIT trap, for the run that container ran,
+  whatever the exit (as the bring-back);
+- on Fly/EC2, in `fetch_branch`, from the run directory it streamed back.
+
+The merge reads the host's config at apply time, so a key the user edited
+during the run is merged with, never overwritten by, a value read before.
+`leerie config --recapture` runs on the host and writes directly.
+
+**Idempotency.** After the capture is recorded (or, on the host, written),
+`capture_repo_deps` writes a lightweight `<run_dir>/dep_capture.done`
+sentinel and sets `dep_capture_done = True` in `state.json`. The run-start
+backstop skips any run whose sentinel is already present. When the union
+merge finds nothing new, `.leerie/config.toml` is not touched.
 
 **No auto-commit.** Capture writes `.leerie/config.toml` (and, if generated,
 `.leerie/Dockerfile`) as uncommitted files. Leerie logs one line: *"captured N
@@ -4938,14 +8791,15 @@ Dockerfile speaks for itself. This mirrors the existing rule: `setup_packages`
 is ignored when a committed Dockerfile is present (see *Per-repo container
 image* above).
 
-**Fly parity.** Capture writes the same files regardless of runtime. On
+**Fly parity.** Capture records the same file regardless of runtime. On
 `--runtime fly` the workflow splits across two directions:
-- **Machine → host (stream-back).** After the run-state tar, `fetch-branch.sh`
-  best-effort streams `/work/.leerie/config.toml` and `/work/.leerie/Dockerfile`
-  from the Fly Machine back to `$USER_REPO/.leerie/` (or `$LEERIE_STATE_HOST_DIR`).
-  Each file is existence-guarded on the remote side and never clobbers a
-  host-edited file; failure is non-fatal and doesn't affect `fetch_branch`'s
-  return code. This fires only on a clean finish (same condition gate that
+- **Machine → host (stream-back).** The run-state tar brings
+  `captured-deps.json` home with the run directory, and `fetch-branch.sh`
+  applies it as the local launcher does. It then best-effort streams
+  `/work/.leerie/Dockerfile` from the Fly Machine back to `$USER_REPO/.leerie/`
+  (or `$LEERIE_STATE_HOST_DIR`), existence-guarded on the remote side and
+  never clobbering a host-edited file; failure is non-fatal and doesn't
+  affect `fetch_branch`'s return code. This fires only on a clean finish (same condition gate that
   runs `fetch_branch` at all — rc `0|10|11|75`). Cancel/kill recovery uses the
   host-side `--recapture` / next-run backstop instead.
 - **Host → machine (seed-repo whitelist).** Pre-existing committed `.leerie/`
@@ -5144,6 +8998,36 @@ rewritten/passed-through/fell-back counters identical under either alias —
 the window is bought back without giving up the constrained decoding the
 flag exists for.
 
+**The system prompt is staged in the run directory.** A worker's appended
+system prompt travels as a file (`--append-system-prompt-file`; inline it
+would compound the user prompt toward the per-argument limit), and the CLI
+reads that file at every spawn of the call — a call that can last a
+90-minute worker plus its retries. The file used to live in /tmp, which
+nothing guarantees: anything that clears /tmp under a live run (a host
+cleanup, a lost overlay) took every in-flight worker's file with it, and 5
+runs died at their next spawn. It now lives under `<run-dir>/sysprompt/`,
+the state the run already depends on, deleted when its call ends. Another
+worker's instructions are not input to this one, so no worker may read
+there. How that holds depends on the worker:
+
+- **Acting workers** run with the boundary erased (§12 L1), so they get a
+  `Read` deny rule on the directory.
+- **Judgment workers** hold no blanket `Read`/`Grep`/`Glob` grant. The CLI
+  allows those tools inside the working directories and refuses them
+  outside, as it already refuses every allowlisted shell read outside. The
+  run directory lies outside every judgment cwd, so it is unreadable to
+  them with no rule at all.
+
+They must not carry the deny rule as well. While any `Read()` deny is
+configured, the CLI refuses a compound `cd <dir>; <read> <relative path>`
+whenever it cannot resolve the paths statically, and a grep pattern or a
+`--include=*.ts` is enough to prevent that. When this branch first gave
+every worker the deny, that refusal hit a satisfied-probe, a delivery
+judge and the PR reviewer in one smoke run, each in its own tree. Code
+decides by the worker's actual grant: any worker that is autonomous, or
+holds a bare `Read`, `Grep` or `Glob`, gets the deny. The system temp dir
+remains the fallback only when the run directory cannot hold the file.
+
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a
 checkpoint, so its failure converts into a handoff: a fresh implementer can
@@ -5168,14 +9052,38 @@ exactly this). Preservation therefore cannot be conditioned on
 `check_merge_committed` — that predicate is false in precisely the case
 worth salvaging.
 
-This distinction is between a *crash* and a *verdict*, and only the first is
-new. A crash is infrastructure — PID exhaustion, OOM, a killed session — and
-says nothing about whether the resolution was any good; the run rescues the
-work and pauses for `resume`. A `design-conflict` or `failed` **verdict** is
-the integrator's considered judgment that the merge should not stand, and
-still aborts and discards, exactly as *When integration cannot succeed*
-describes: a verdict is a fact about the work, a crash is a fact about the
-machine.
+This distinction is between a *crash* and a *verdict*. A crash is
+infrastructure — PID exhaustion, OOM, a killed session, a worker killed at
+its wall-clock ceiling, an exit with no schema-valid JSON — and says nothing
+about whether the resolution was any good. A timeout is a crash in exactly
+this sense and takes exactly the same path as a `WorkerError`; neither is
+told apart from the other anywhere on it. A `design-conflict` or `failed`
+**verdict** is the integrator's considered judgment that the merge should
+not stand, so the merge is abandoned and the subtask backed out, exactly as
+*When integration cannot succeed* describes — the run continues without it:
+a verdict is a fact about the work, a crash is a fact about the machine.
+
+A crash is retried in the run, not handed to `resume`. A run is meant to
+finish in one pass, and pausing a whole run for an operator to type `resume`
+over an infrastructure blip spends the operator's attention on something a
+fresh process fixes. Each crash is handled the same way: the in-progress
+resolution is rescued to a ref of its own (never overwritten), the merge is
+aborted, staging is reset to the merge's first parent — the commit read
+before `integrate.sh` ran, the same marker a back-out resets to — and the
+merge is started again from scratch for a fresh integrator, at most
+`integrator_crash_retries` (2) times per subtask. The reset comes first so a
+retry never inherits a dead session's half-made edits or a merge it may have
+committed before it died: every attempt meets the same conflict the first
+one did. Retries are not taken inside the integrator's own check loop, which
+would re-run it on whatever tree the crash left. When the retries run out,
+the subtask is backed out exactly as a verdict is — staging at the merge's
+first parent, the subtask settled `unconverged`, the content loss on its
+risk register for the PR — with a reason naming every rescue ref, so the
+discarded resolutions can still be applied by hand; the wave continues. The
+retry count lives for one invocation: an orchestrator killed mid-retry is
+not an integrator crash, and on `resume` the interrupted merge is gone
+(the resume resets staging) and the subtask is integrated again in its
+turn.
 
 ### Forcing constrained decoding
 
@@ -5385,6 +9293,32 @@ ready+empty, some ready+nonempty) proceeds normally, the empty domains simply
 contributing nothing. The all-blocked case still dies — a blocker is a gate
 failure the user must see.
 
+**A partially blocked plan is recorded, and an external prerequisite stops
+the run.** When some domains plan and others exit blocked, scheduling
+proceeds with the ready domains — but the dropped domains used to leave no
+record beyond a log line. Each blocked plan now also types its blocker:
+`blocker_kind` is `none` on a ready plan, `external_precondition` (with
+`external_resource` naming it) when what is missing can be supplied only
+from outside this run — another task's or team's change that has not
+merged, a credential, a live service, a human decision — and
+`evidence_gap` when the missing fact could be established by reading or
+running this repository. Every blocked domain is persisted in
+`domain_blocked` (`{domain, blocker_kind, external_resource, gap}`)
+whenever a plan is about to be scheduled. A typed external prerequisite
+stops the run there, before any subtask executes, naming each domain and
+its prerequisite: the plan cannot be complete without it, and running the
+ready domains would only ship a partial change the next run must re-plan
+around. An evidence gap keeps today's behaviour (proceed, recorded). No
+re-plan is attempted (the scoped re-plan was benched and deferred).
+Measured (bench P3, live re-planning of 7 historical blocked domains at
+their own base trees, 2 samples each): the 4 domains blocked on unmerged
+prerequisite tasks typed `external_precondition` 8/8; the 3 non-external
+cases (a real evidence gap, and the same prerequisite blocks replayed
+after the prerequisite merged) planned `ready` with `none` on every
+sample that returned (6/6), so no non-external block was typed external.
+The kind names follow the implementer's typed blocker (§13 *A blocked
+implementer says why, as a type*) so the two read the same.
+
 **Reaching it from finalize, after a plan has fully executed.** The two
 routes above both fire *before* any subtask runs. A third case arrives from
 the other end: every subtask reaches `complete`, yet the run branch carries
@@ -5487,9 +9421,9 @@ sufficient, because the alternative there was dying, not planning.
 `--skip-satisfied-check` suppresses this consumer along with the phase-3
 pre-schedule sweep — one flag governs both already-satisfied *prunes*.
 Two adjacent mechanisms are deliberately outside that flag's scope: the
-post-execution HEAD-probe *rescues* (which settle work, never delete it,
-so skipping them would only re-create the retry-cap failure they exist
-to prevent), and `--skip-classification-check`, which suppresses this
+post-execution settles by execution (§8 *Settled by execution*, which
+settle work, never delete it, so skipping them would only re-create the
+retry-cap failure they exist to prevent), and `--skip-classification-check`, which suppresses this
 consumer as a side effect — the gate it hooks never runs — as does a
 `classification_judge` that crashes every round.
 
@@ -5514,8 +9448,8 @@ acceptance available, the judge's confirmation is held as *pending*; the
 run continues through provisioning, the defect-scope audit and the
 acceptance sets (§8 *Held-out acceptance tests* — they need the installed
 dependencies, which is why the decision moves after provisioning), and the
-sets are run on HEAD. A majority passing ends the run as no work. A
-majority failing is a dispute: the failing case names become the
+sets are run on HEAD. Every measured set passing ends the run as no work.
+Any set failing is a dispute: the failing case names become the
 `no_work_dispute` evidence and the run plans the work. Only the names from
 sets a repair round would be shown are used: the planners' words reach the
 implementers, and the held-back sets must stay unseen until the gate
@@ -5528,10 +9462,21 @@ all three sets failed it — and a wrong dispute repeated on every re-run
 would be a new infinite loop. So a dispute is raised once per task (twice
 when the first goes unacted, below): when the previous same-task run
 already disputed on acceptance evidence, a
-still-failing majority ends the run as no work with a loud warning and the
+still-failing set ends the run as no work with a loud warning and the
 residual recorded. The cost of a wrong dispute is bounded to one extra run
 (two when the first dispute goes unacted, below).
-With no valid sets the judge's confirmation stands, as before.
+With no valid sets the judge's confirmation stands, as before — except
+when every set written was discarded because its defect cases all pass on
+this HEAD after the writer's retry (`fixed_on_head_by_execution`, below).
+That is executed evidence, not the judge's reading: the runner ran the
+report-shaped cases on HEAD and they passed. So the run records it as such
+(`no_work_acceptance.verdict = "fixed_on_head_by_execution"`, with each
+discarded set's index and reason kept on `acceptance.discarded`) rather
+than as "no valid sets", which cannot tell it from "no writer produced
+anything". Measured (barnacle 7cc87f9a, early replay, pass 3): all five
+writers' sets passed at the own start twice and were discarded on that
+reason, yet the run recorded `no valid sets` and its `no_work` read as
+judge-only.
 
 A dispute counts only once it is acted on. The run that disputed could
 still end as no work by another exit — its planners return nothing, or
@@ -5539,8 +9484,8 @@ the satisfied-probe sweep drops every subtask — and the next run would
 then accept "no work" after a dispute no run ever acted on, leaving the
 defect the tests still show on HEAD unfixed for good. So executed
 evidence outranks the probe: whenever held-out sets exist, some of them
-could be run on HEAD, and no strict majority of those passes (a tie counts
-as failing, as everywhere in the gate; nothing measured protects nothing),
+could be run on HEAD, and any of those fails (as everywhere in the gate;
+nothing measured protects nothing),
 the sweep is not offered the subtasks that fix the reported
 symptom (below). And a disputing run that still ends as no
 work by either of those two planning-time exits records its dispute as not
@@ -5564,10 +9509,85 @@ every subtask flagged `fixes_reported_symptom` was dropped as already
 satisfied and the held-out sets pass on HEAD, the run ends as no work;
 otherwise it proceeds as before. When the held-out sets FAIL on HEAD,
 those subtasks are never offered to the probe — the tests outrank its
-reading — so the plan cannot lose its fixes and ship without them. When
-the sets were validated on HEAD itself (a task's first run, nothing merged
-since), every one has a defect file that failed there, so the answer is
-already known: the fixes are protected without running the sets again.
+reading — so the plan cannot lose its fixes and ship without them. Since
+the sets are validated on the run's own start (§8), planning's HEAD is
+normally that very commit: every set has a defect case that failed there,
+so the answer is already known and the sets are not run again — the
+fixes are protected and a held no-work confirmation is disputed.
+
+**Requirement coverage: every span of the task is accounted for.** The
+classifier used to extract `required_items` only when the task was
+"genuinely enumerable", with a when-in-doubt-omit posture. A requirement
+it never extracted was enforced by nothing downstream: the planners, the
+no-work judge and the delivery gate all verify the items they are
+handed. So the classifier now accounts for the WHOLE task, and code
+checks that it did, by set arithmetic over identifiers it assigned
+itself:
+
+- **Python cuts; it never reads.** The task text is cut into spans
+  `S1, S2, …` at markdown delimiters only: a heading, a blank line, a
+  list item at any indent; a fenced block stays whole
+  (`_d1_split_spans`). Each nested list item carries a `parent` link —
+  the nearest preceding list item of smaller indent in the same block —
+  computed from indentation alone. Each referenced report (a markdown
+  file the task names that is not tracked at HEAD, so a report filed
+  for this task rather than a standing repo document such as a
+  CLAUDE.md) is cut at its headings into sections `R1, R2, …`
+  (`_d1_split_sections`). Python assigns the IDs and nothing else (§12
+  *Delimiter-only cutting is not the deleted heading harvest*).
+- **All meaning comes from the classifier's JSON.** One
+  `span_dispositions` entry per span: `items` when the span states
+  something the delivered work must do, contain, preserve or never
+  contain — a negative constraint ("never X", "out of scope: X") is an
+  item — or `no_requirement` with a typed `kind` (`heading`,
+  `background`, `restatement` with the S/R id it `restates`, or
+  `process_note`). One `section_roles` entry per report section:
+  `requirement`, `evidence`, `suggestion` or `context`, the last three
+  carrying the requirement section they `supports`. Exactly one
+  `required_items` entry per `items` span and per `requirement`
+  section, anchored on it by `span`. A findings table whose rows the
+  task asks to address yields one item per row, typed by `table_row`
+  (the row's first cell, copied). Each item is typed
+  `verifiability: tree | external | execution` and, when its whole
+  content is that some paths must not change, `untouched_paths`. An item
+  or part decided by whether the repository's existing tests newly fail
+  ("no regressions", "existing tests still pass", "don't break the X
+  tests") is typed `execution` with `check: test_id_diff` — the whole
+  item, or, inside a mixed item, the part (`part_checks`, each naming one
+  of the item's `parts` verbatim).
+- **The coverage gate is set arithmetic.** `_d1_coverage_holes` sends
+  back, by ID, every span without a disposition, section without a
+  role, `items` span or `requirement` section carried by no item (or by
+  more than one, unless each carries a distinct `table_row`), item
+  anchored elsewhere, `no_requirement` span without a valid `kind`,
+  `restates`/`supports` link that resolves to no requirement, nested
+  span typed a restatement of its own ancestor, and `table_row` that is
+  not found verbatim in its anchor span (a quote check after whitespace
+  normalisation, never a parse of the table). These ride the
+  classifier's existing `judgment_check_rounds` loop. A report with no
+  `requirement` section is asked about **once**; a second answer of no
+  requirement stands, since a referenced file can be pure background.
+  The closure — `items` spans, `requirement` sections, restatements
+  that resolve to one of them (directly or through a heading whose
+  block holds an `items` span), and sections supporting a requirement —
+  is persisted in `state.data["requirement_coverage"]` with any
+  residual holes. Residual holes after the rounds are logged and the
+  run proceeds: the gate improves the item list, it never stops a run.
+
+Measured (bench D1, sonnet, frozen designs). v6 (top-level list items
+only) on 22 fresh tasks, 2 samples each: deliverable-closure Jaccard
+≥ 0.8 between samples 22/22; hand-checked real requirement losses 0/22
+tasks; but of the 8 recorded instances where a lost requirement caused
+or contributed to a repeat run, v6 surfaced 6 as their own item and
+missed a causal one — a nested sub-bullet folded into its parent's
+coarse item. v6.1 (list items at any indent are delimiters, with the
+parent link) surfaced the replayed targets as their own item in 12/12
+sample-instances (4 targets × 3), bringing the 8 to 8/8 (causal 3/3),
+and held Jaccard ≥ 0.8 on 12/12 tasks with changed spans, at 2.9× the items
+(446 → 1,293 over those 12 tasks). v6.2 (one item may carry several
+sibling spans) was rejected: still 2× the items and its coverage loop
+did not converge. The item count is paid on the verification side
+instead (*Grouped judging*, below).
 
 **The delivery gate: required items are verified on the tree that
 ships.** The no-work judge above enforces `required_items` against the
@@ -5637,8 +9657,9 @@ dozen items and beyond) can again exhaust the cap and skip the gate
 — an accepted, bounded residual, preferred over an uncapped budget.
 The same failure hit the satisfied-probe
 (§ *satisfied-probe* below). Both of its call sites judge the same
-single criterion (the HEAD-probe helper — serving the no-commit
-rescue and the provider-subset pre-spawn check — sends the same one
+single criterion (the HEAD-probe helper — serving the provider-subset
+pre-spawn check, and until settle-by-execution replaced it the no-commit
+rescue — sends the same one
 `success_criteria_seed` payload the pre-schedule probe sends); what
 balloons the cost, at either site, is a criterion that is met or
 audit-shaped on the judged tree, because a probe cannot say
@@ -5656,6 +9677,154 @@ larger cap; a pre-schedule cap-out is retried, and a double cap-out
 merely fail-safe-keeps the subtask — one wasted implementer round
 whose resulting no-op then lands on the larger-capped rescue — so
 the small cap stays acceptable there.
+
+**Grouped judging at coverage item counts.** Requirement coverage
+(above) hands the gate about three times the items, and one prompt
+does not survive that: measured on 12 recorded delivery-judge calls
+(bench Q7/D1, 9–58 items per prompt even at the old item counts), the
+single-prompt judge left 59% of all items not met — 317 of them unmet
+with no citation, "not inspected" — so its adjudicated false-unmet
+rate on labelled controls was 46% and it flagged a labelled defect for
+the right reason in 2 of 34 samples. So the gate judges in packs
+(`_d1_judge_packs`):
+
+- **Group by root ancestor.** An item's group is the root of its
+  anchor span's parent chain; items on one report section share a
+  group; an item whose anchor is unknown is its own group. Groups,
+  ordered by their smallest item index, are packed consecutively while
+  a pack stays within `d1_pack_items` (20); a single group larger than
+  30 is cut into consecutive chunks of 30, so a nested requirement and
+  its siblings are judged side by side.
+- **Each prompt knows its slice** ("these are k of the task's N
+  required items… return a verdict for exactly these item_index
+  values"), carries the global `item_index` of each item, and gets the
+  turn budget of its own pack size. Verdicts merge by `item_index`; a
+  verdict for an index outside the pack is ignored. Packs run
+  concurrently up to `max_parallel`. The dispute vote above applies per
+  pack (a pack whose first sample flags nothing costs one spawn). There
+  is **no per-item re-judge**.
+- **Code settles what code can.** An item typed
+  `verifiability: external` (a PR description, a deploy, a human
+  action) is never judged: it goes to `state.data
+  ["needs_human_verification"]`, the list the PR shows. An item whose
+  whole content is that some paths stay unchanged is settled by
+  `git diff --name-only <own start>..HEAD -- <paths>` on the integrated
+  tree (`_d1_untouched_verdict`): empty output is met, a listed file is
+  unmet with that file as evidence; an unsafe path, an unknown own
+  start or a git error sends the item to the judge.
+- **A test outcome is the failing-test-ID diff's to settle, never prose.**
+  An item typed `execution` / `check: test_id_diff` is never judged, never
+  falsified and never sent to an implementer: code reads the final tree's
+  failing-test-ID diff (§9 *Which failures are new*) — **met** when B\*
+  confirmed no new failing ID on the tree being judged: the diff had no
+  candidates, or every candidate failed on every base rerun
+  (`pre_existing`); **unmet** when it confirmed new ones; **unknown** in
+  every other case — no diff for this tree (no IDs on either side, no
+  measurement, or a tree that moved since), or a candidate B\* never
+  settled: no rerun produced a verdict for it (`no_verdict`, which is what
+  every candidate gets when the base checkout could not be created), its
+  reruns disagreed (`resource_affected`), or the confirm budget left it
+  unsettled (`budget_short_unsettled`: no base/final pair finished, a
+  discovery find the budget cut, or a file sized out — the reason says
+  "could not confirm within the budget: <files>", and for a file never
+  rerun "not rerun (sized out of the budget): <files>"). A candidate the budget
+  alone kept short, at least one pair finished and every finished rerun
+  agreeing, is new (§9 *Which failures are new*, step 4), so the item is
+  unmet. A candidate that failed on the final tree and was
+  never measured on the base is not confirmed absent; reading it as met
+  shipped a "no regressions" item as met with the candidate never checked
+  (review round 4 M2). Unmet needs nothing more: the confirmed new IDs
+  already make the run `unconverged` (§6) and already drive the final
+  conformance's next round. Unknown goes to the PR's "Needs human
+  verification" list with its reason (which candidates, and why B\* could
+  not settle them); like any human-verification gap it is not unfinished
+  work, so it does not by itself change the run outcome, but the item's
+  row reads `unknown`, never `met`. Inside a
+  mixed item the judge types such a part `kind: test_outcome` (the
+  payload names the classifier's `part_checks` for it), and code drops
+  that part from the verdict before it is checked or voted: the item is
+  met or unmet on its other parts. Its row still carries the diff's verdict
+  for that part. When the other parts are met and the diff did not say
+  met, the row reads the diff's verdict — `unknown`, its reason
+  `met except: <part>, unknown — <why>`, or `unmet` when B\* confirmed
+  new failures — never `met` over a part B\* did not settle (review round
+  5 L3: a compound item read `met` while its "no regressions" part was
+  unknown, though the gap was written). The row also says its other parts
+  were met, so the delivery ratchet keeps protecting them, and like a pure
+  test-outcome item it never reaches `unmet_final`. In a replayed run (barnacle 45fa4253,
+  pass 1) the judges held an item unmet on its "no regressions: the
+  final-tree full test run must not show new failures" part, read from a
+  record that said only "red", and the delivery re-drive spent its whole
+  budget — four implementer sessions, about 25 minutes — on an unmet item
+  no implementer could change: each ran its own base-vs-tree comparison,
+  reported "33 failed on both", committed nothing, and the item stayed
+  unmet.
+- **The finding-level contract** (below) is asked of the first pack
+  only, so it is judged once, not once per pack.
+
+Measured (bench Q7/D1, arm (c): routing, packs of 20, table rows typed;
+dev and fresh cases, hand-adjudicated): real false unmet 3/116 = 2.6%
+(CI 0.9–7.3; all three the "note it in the PR" half of a mixed item),
+right-reason catch 13/39 = 33% (on the dev cases 7/17 targets, equal to
+grouped judging without routing, against 1/17 for the single prompt),
+at $2.54 per pass — 7.3× the single prompt. Arm (d) — per-part typing,
+packs of 30, and the per-item re-judge — was **not** adopted: its catch
+was unchanged (2/14 against (c)'s 2/14 on the same cases), its false
+unmet rose to 7.4% (conservative), and the re-judge made a pass 8.6×
+on average and 15–32× on large tasks.
+
+**Typed evidence for the delivery judge.** Two mechanical checks hand
+the judge evidence it would otherwise have to find by reading, each as
+a section of its prompt that is present only when there is something to
+show (a run without either sends a byte-identical prompt). Neither ever
+re-drives on its own: what happens to an item is the judge's verdict,
+under the same dispute vote.
+
+- **Site tokens.** When the report's inline examples carry
+  site-identifying tokens (§5 *The report's own example inputs are
+  captured too*), every line the run's diff adds is matched against
+  them, case-insensitively, on identifier-segment boundaries (`_`, `-`,
+  `.`, `/` separate segments, so a token is found inside
+  `Token_Forms_Field`). A guard test's bare term list — a test file
+  whose added line is nothing but quoted or regex literals of single
+  terms — is a denylist, not a leak, and is not a hit. There is no
+  base-tree skip. Hits, with the report example each token came from,
+  go to the judge for any item that forbids naming the sites (at most 3
+  per file and 30 in all, the total stated). Measured (bench Q5/N7a,
+  whole-word rules): with the base-tree skip the check was inert (0 of
+  74); without it and with the provenance, the gated judge called 17 of
+  17 fresh leaking PRs unmet against 6 of 17 for one sample of today's
+  judge, and 30 of 30 clean PRs met. The segment-boundary rule comes
+  from the later lever round: on its no-harm stress the judge kept all 29
+  clean PRs it judged met (31 calls; one of the 30 clean cases was never
+  judged), while of the 4 PRs that touched a guard list, 3 were judged
+  unmet (6 of 7 calls) — the residual harm the guard-line exclusion only partly
+  removes, and the reason the hits stay evidence, never a gate.
+- **Contract literals.** An implementer's `external_contract_assumption`
+  risk says its change is right only if something outside its subtask
+  holds. A `contract_extractor` worker types each one once: the
+  counterpart subtask of this run (or none), the exact literal, its kind
+  (`string_value`, `identifier`, `route_path`, `other`), and a carrying
+  symbol; code drops a counterpart that is not another subtask of the
+  run and marks a literal not found verbatim in the risk unverified.
+  The check (v7e) then reads the counterpart's integration diff and the
+  integrated tree: only a plain token literal is checked; a route must
+  be served by an app-router page or appear on a counterpart added line;
+  a string or identifier is honoured by a counterpart added line, else
+  only by a non-test code file outside the owner's own files — a doc,
+  an i18n file or a migration does not honour a code contract — and is
+  flagged even then when the counterpart's added lines carry a
+  near-variant of it (`autopay` for `auto`). Flags go to the judge with
+  the risk text. Measured (bench Q10, held-out half): v7e flagged 157 of
+  162 synthetic mismatches (one side of a verified real producer/consumer
+  pair renamed) and 0 of 105 unmutated controls, where the rule set
+  without the code-only and near-variant rules flagged 106 — every miss
+  of that one was a literal still present in a doc or another consumer.
+  On the recorded real risks (Q5 worlds), which v7e was designed on, so
+  these are design-set numbers and not held-out evidence: 6 of 8
+  violations flagged, 0 of 288 false flags. The checks read JavaScript/TypeScript repos;
+  the code-file and test-file patterns also take other languages'
+  usual suffixes.
 
 **The gate judges the finding, not only the items.** Measured across
 three reports' repeat-run loops (14 of the 17 v0.32.x runs,
@@ -5791,7 +9960,1337 @@ citing it. The record contains only what the run actually ran —
 conformers execute targeted falsifiers, not necessarily a full
 suite — so an item whose commands appear nowhere remains honestly
 unmet, and its remediation is the routed conformer RUNNING them,
-which the recheck's fresh record then shows.
+which the recheck's fresh record then shows. The record also carries
+the orchestrator's OWN results, which no worker log holds: the
+final-tree build/lint/test axes it measured, the test IDs B* confirmed
+newly failing, and each held-out acceptance set's final verdict
+(`_orchestrator_results_digest`), so an execution-shaped item is not
+called unmet merely because the run that settled it was leerie's own.
+Only those lines can verify a `met`: a worker's runs happened in a
+worker's working tree — the final conformer's and a re-drive
+implementer's in staging, beside files that may not ship — so a cite of
+one is shown to the judge and kept as a falsifier lead, but verifies
+nothing on its own (§8 *Every post-execution verdict is of the committed
+tree*).
+
+**What a worker ran is read from its own transcript, never from a
+command's output.** Leerie's record of what a worker executed — the
+worker half of this record, the dependency capture's install-command
+hint (§6½), the settle-time declared-command check (§9), the conformer's
+axis-run warnings, the falsifier's probe activity, the malformed-envelope
+retry, the session a re-ask resumes, the run-health telemetry — is the
+structured events of that worker's own `claude -p` session, keyed by the
+worker it was spawned as, and one reader yields them to every consumer. A build, a test run, CI parity or any other
+measurement prints whatever the code under measurement prints, and a line
+it prints in the shape of a tool call is not one. Measured: the record
+took every `logs/*.log`, which also holds leerie's runs of the
+repository's commands (the base baseline, CI parity, coverage, the
+settle-time execution check), and the per-subtask and final conformers'
+axes were measured into the conformer's own transcript file — so a test
+printing a `tool_use` line for `pnpm test` and a `tool_result` line
+saying it passed entered the record as a passing run, in the conformer's
+name. So: a worker's transcript is written in its log directory's own
+`transcripts/` directory (`logs/transcripts/`, `logs/held-out/transcripts/`),
+which only leerie's spawn of a worker writes, and every log of a command
+leerie runs is written beside it, never in it. The two are separate
+namespaces, so no command's output path can name a transcript, whatever
+names the two sides pick. Measured (review round 22 H4): while both were
+`<logs>/<name>.log`, a command log and a transcript met whenever the
+names did — the acceptance writer's transcript and its set's validation
+run were both `logs/held-out/acceptance-<k>.log`, the refusal below fired
+on leerie's own path, and every run that wrote held-out sets died at the
+first set's validation; earlier, per-site suffixes (`-axes.log`) had kept
+the conformers' axes out of their transcripts one name at a time. The
+root cause was the shared namespace, and the invariant is that no
+command's output path can name a transcript. Leerie also registers each
+transcript as it spawns the worker (`transcripts.ndjson` beside it), and
+a reader that enumerates transcripts takes only registered ones; a
+measurement refuses any path in a transcripts directory, or a registered
+transcript's; and within a transcript only the stream's own events count — a line of
+the CLI's stderr, which leerie writes into the same file under its own
+header, is never parsed as an event. The stream is the CLI's alone: no
+command the worker runs can write into it, because each runs in a Landlock
+domain nested inside the CLI's (§6 *A worker's commands cannot reach its
+CLI*; review round 21 R4 wrote a forged `tool_use` into it through
+`/proc/<cli>/fd/1`). A second reader was the gap: with
+the record closed, the re-ask's session choice and the health scan still
+parsed `logs/` text on their own, so a printed `session_id` could steer
+which session a re-ask resumed. A run directory made before the registry
+is never resumed by this leerie (§6 *A run directory is continued only by
+a leerie of its layout*), so a missing registry line always means "not a
+transcript", never "written before records existed".
+
+That rule leaves an item whose only evidence is a command the
+orchestrator never runs itself — the audit's repro, `npm run e2e`,
+`make docs` — with no measurement of the committed tree: the judge cites
+the worker's run and the cite cannot verify. Such a `met` is neither
+confirmed nor refuted, so it is `unknown`: the vote is typed
+`record_worker_only`, and an item whose unmet votes are all of that kind
+is not confirmed unmet — it goes to "Needs human verification" with the
+commands the worker ran, never to a re-drive (review round 12 L3: an
+implementer cannot make a worker's past run count either, so a re-drive
+of it could only end `unconverged`).
+
+`unknown` has to hold everywhere the judge's pass is read, not only in
+the human list. Review round 14 (claims M1, execution L3) drove the gap:
+the judge's pass reported only the items it confirmed unmet, and every
+reader took "not unmet" for "met" — so the worker-only item went to a
+human while its detection row read `met`, the delivery ratchet counted
+it among the items met before a repair (and so re-verified, and could
+"regress", an item nothing had read), and a re-drive's re-check of it
+rewrote the row `met`. The root cause is a two-valued interface for a
+three-valued verdict. So a judge pass records, per item, that its met
+rests only on a worker's run, and every reader reads it: the detection
+row is `unknown` (with the reason), the item is not prior met for the
+ratchet, and a re-check that finds the same writes `unknown`. The
+invariant is the one this section opens with: a verdict becomes `met`
+only on a read of a commit.
+
+An entry names its item by the item's index in the run's required
+items, and every pass keys it that way — the invariant is that an item
+index means one item everywhere it is written. Review round 14 M4 drove
+the root cause: the judge numbered the items it was handed, and the
+re-drive's re-check handed it only the items it re-checks, so a re-check
+of item 1 judged it as item 0 and replaced item 0's entry — erasing the
+human check of an item it never read — and an entry it wrote carried the
+same wrong index. The judge is now always given the whole list and told
+which indices to read.
+
+Leerie does not re-run the worker's command to settle it. That was built
+(review round 12 L3) and withdrawn (round 14), for two measured reasons.
+It never ran: of the 252 distinct worker commands the two bench replays'
+logs put on the record, none qualified under the rule a safe re-run
+needs — the repository's own build, lint, test or repro command as one
+plain argv, with only its runner's options and paths in the commit;
+workers write `pnpm test <file>`, not the configured `pnpm run test`,
+and chain `cd`, `mkdir`, pipes and heredocs. And it was risk surface:
+review found two high-severity defects in it (round 13 H1 —
+the worker's own result tail entered the store a cite verifies against,
+so whatever a worker's run printed verified; and an interpreter-led
+record entry, `python3 -c <worker code>`, ran in the orchestrator). A
+mechanism that measured nothing in practice and executed worker-chosen
+argv when it did is removed rather than narrowed further; every such
+item already ended at a human once the re-run was refused, and now
+reaches one directly.
+
+**Delivery detection: a cited judge, or a falsifier that proves it
+by execution.** A read-only judge misses the defects that only
+execution shows — measured on the labelled delivery corpus (bench
+N2e, 14 pre-registered undelivered items, 52 delivered controls), the
+cited judge alone caught 3/14 (1/52 false unmet), and the misses were
+behaviours (a threshold, a delay, an input shape on a second code
+path) the code *reads* as delivered. So the final verdict on each item is a union of
+two detectors, each checked by code (bench Q2 *F+*, frozen design):
+
+- **The judge cites, and code checks every citation.** Each verdict
+  splits its item into typed `parts` (`static` / `behavioral`, status
+  `met` / `unmet` / `not_inspected`), each carrying `cites`
+  `{path, line_start, line_end, quote}`. Code verifies every quote as a
+  whitespace-normalised substring of that file at `HEAD`
+  (`_verify_delivery_cite`); `path: "RECORD"` is checked against the
+  executed-commands record; `path: "ABSENT"` / `"ABSENT:<pathspec>"`
+  is the absence claim, which code re-runs as `git grep -E` and accepts
+  only when nothing matches. A `met` whose parts are not all `met`, or
+  whose every part does not carry at least one verified citation, is
+  rejected — counted as an unmet vote — so a fabricated quote cannot buy
+  a `met`. The pack and the 2-of-3 dispute vote are unchanged; the
+  benched pipeline's per-item re-judge is not added (*Grouped judging*
+  measured it at 8.6× a pass for no catch). Unlike the benched verifier,
+  a real quote cited at the wrong lines still verifies: it is a
+  mislocation, not a fabrication.
+- **A falsifier tries to prove the item undelivered.** After the
+  held-out acceptance gate, on the tree that ships, every item the
+  judge is asked about (never an `external` item, never an
+  `untouched_paths` item — code and the PR's "needs human
+  verification" own those) gets up to `falsifier_samples` (3)
+  independent `falsifier` samples. Each runs in a disposable checkout
+  of the final commit with dependencies installed (and, on a Prisma
+  repository, a fresh throwaway database — §8 *Prisma repositories get
+  a real database*), and gets the item,
+  the run's own diff (start commit and stat), the run's valid
+  held-out acceptance files (read-only, git-ignored in that checkout
+  only, leads only), and
+  the judge's typed unmet parts for that item (hypotheses, never
+  expected values). It writes ONE new probe test through a public entry
+  point, asserting the item's own words, and runs it.
+- **What ships is what was measured.** The falsifier's system prompt
+  is the frozen F+ prompt and its leads addendum, concatenated
+  verbatim, and its input is the frozen F+ user prompt. The only
+  differences are the ones the code requires:
+  1. the leads directory `.q2ctx/` is `.leerie-falsifier/`
+     (`FALSIFIER_LEADS_DIR`), twice in the addendum;
+  2. when the run's start commit cannot be read, the input says
+     `START COMMIT of this run: unknown.` in place of the commit and its
+     diff stat (the bench always had one);
+  3. the item's `source_ref` is its typed span when it has one (the
+     bench corpus carried `source_ref` directly).
+  The first shipped prompt also told the worker what the orchestrator
+  checks and offered the executed-commands record as a lead, and its
+  input carried that record: none of it was benched, so the Q2 numbers
+  did not describe it. All three are gone. The checks were already in the
+  benched prompt's own words — one NEW file, run with the repository's
+  test runner, outside the leads; the item span copied
+  character-for-character; the failure confirmed by a second run; the
+  failing assertion copied from the probe; no source reads, code
+  evaluation or test-only imports, "discarded automatically".
+- **Code decides whether a falsifier demonstrated anything.** A
+  sample is confirmed only when all of these hold: the probe is one
+  new file, outside the leads and not an acceptance file, that the
+  repository's scoped test runner can run; the item quote it claims to
+  test is verbatim in the item (after NFC/whitespace normalisation);
+  its named case fails under B* on a pristine installed copy of the
+  final commit (`_confirm_still_failing`, serial runner, so a load
+  flake never confirms), the probe placed in a held-out sandbox over that
+  copy, never written into it (§6 *A held-out evaluation runs alone*); the failing assertion it quotes lies inside
+  that case's reachable code; and the AST coupling check is clean —
+  the case reads no source or document text, evaluates no code text,
+  and imports no symbol only tests use (`_falsifier_coupling`, over
+  the TypeScript AST of the probe, policy in Python). The coupling
+  check is JS/TS-only, as benched. Its facts are syntax-only — a parse
+  of one file, no type checking, no program — so the repository's own
+  compiler version does not matter to them, and any TypeScript with the
+  JS compiler API reads them the same. The facts script therefore uses
+  the tree's own `typescript` when that package has the compiler API,
+  and otherwise a pinned 5.x the image ships for exactly this: a
+  repository on the TypeScript 7 native port, whose package exports a
+  version string and no compiler API, would else leave the falsifier
+  able to run but structurally unable to confirm anything. Availability
+  is tested as the compiler API being loadable, never as a package name
+  resolving; inside the image it always is. Where it is not (a host run
+  without the bundled copy and no usable tree copy) the falsifier is not
+  spawned and detection is the judge alone. A sample whose facts still
+  fail to load records that as its own gate (`facts_read: false`), an
+  infrastructure miss, never as a failed assertion or coupling check —
+  the falsifier did not lose, the check did not run.
+- **One re-ask.** A sample that answers `could_not_demonstrate`
+  without having both left a probe in its checkout and run it is
+  resumed once in the same session and tree with a fixed note. Each
+  half is read from what happened, never from which tool did it: the
+  probe is a test-shaped file the sample's checkout holds untracked
+  outside the leads when the worker returns (leerie's own listing of
+  the checkout, before the next sample's restore), whatever wrote it —
+  the falsifier writes with a shell heredoc as often as with an editor
+  tool; it ran when one of the commands the sample executed (the Bash
+  calls of its registered transcript) invokes a test runner on that
+  file or on a directory holding it. A runner invoked on neither — the
+  whole suite, another path — does not count: a missed re-ask could
+  lose a demonstration, an extra one costs one worker. (Review round 24
+  M1: reading `created` from `Write`/`Edit` calls classed all 15 of 15
+  real first samples, each of which had written and run a probe in one
+  heredoc command, as having done neither, and re-asked every one.)
+
+An item is unmet when the judge confirmed it unmet OR any of its
+samples is confirmed (`delivery_gate.unmet_final`, with the per-item
+record in `delivery_gate.items`); the samples of one item run in order
+and stop at the first confirm, which cannot change an any-of-k verdict.
+Measured (bench Q2 F+, held-out, pooled over three fresh corpora, 31
+target / 148 control items, frozen labels): F+ k=3 caught 23/31 =
+74.2% with false unmet 12/148 = 8.1%; on the adjudicated labels 27/35 =
+77.1% and 8/144 = 5.6%; with the re-ask, 24/31 and 13/148 (adjudicated
+28/35 and 9/144). One sample alone caught 19/31.
+
+**Delivery re-drive: unmet work goes back to the subtasks that own it.**
+Detection alone ships a PR that says what is missing; the next run then
+re-plans from scratch. After the repository's merge checks have run on the
+final tree, every piece of confirmed-unmet work is handed back to the
+subtasks whose work it is, on the integrated staging tree, in the same
+pass (benched as P8b–P8d and Q3, frozen rules):
+
+1. *What is unmet.* A held-out set that fails on the final tree, confirmed
+   under B\*, forces unmet — whatever the judge said. A set typed `broken`
+   (the set audit) is settled and never chased; a variant set of a
+   report-pointer task never counts as work (*A task that points at a
+   report is bounded by the report's own scenarios*). An item in
+   `delivery_gate.unmet_final`, and a red merge check
+   (`ci_parity.final.unmet`), are unmet too. So is a solution defect the
+   final-tree conformance left unfixed after its last round
+   (`conformance._final.residual_defects`, §9 final-tree pass): it goes
+   as a typed `solution_defect` note (kind, `where`, concrete case), is
+   routed like a failing control — to the subtasks whose integrated diff
+   touches the file its `where` names, with none the same fallback a
+   control takes — and is driven once (a group that is rolled back leaves
+   it open for the next). No step re-verifies it mechanically, so it stays
+   in the outcome's reasons.
+2. *Who owns it.* The planner types, per subtask, the required items it
+   delivers (`claims.items[] = {item_index, kind: deliverable | process}`).
+   An unmet deliverable item re-drives **every** claimer; a process item
+   (how to work, never a tree change) is not routed. A failing defect file
+   goes to the subtasks whose production diff — the files their
+   `leerie: integrate <sid>` merge changed — touches a file that test file
+   imports (the import graph, mechanical); with none, to the audited fix
+   sites' claimers; with none, to every integrated subtask. A failing
+   control file goes the same way, to the subtasks whose diff touches what
+   it exercises; a red merge check is routed like a failing control (its
+   diagnostics' files, a coverage glob's files).
+3. *Groups, in sequence.* Subtasks that share a production file re-drive
+   as one implementer session (their scopes merged), and groups run one
+   after another on the same tree. Before each group the open work is
+   re-checked, and a group with nothing left failing is skipped.
+4. *A self-check, then a re-check.* The implementer is given a command
+   that runs the shown sets against a copy of its current working tree,
+   outside that tree (*A held-out set never enters a tree a worker commits
+   from*, below), and the sets' source, readable outside the tree: without
+   a self-check (bench Q3 arm L3) whole-set closure was 0 of 4, against 18
+   of 24 with one (every one of the 24 closed its sets). After each
+   group the orchestrator re-runs the sets and the repository's tests — a
+   test command the task forbids replaced by the scoped run of the coupled
+   tests, as at final and in the ratchet, never run raw; a
+   result that is worse is rolled back to the group's start by the one
+   restore (§8 *One restore*). Worse is counted in cases, the same unit as
+   progress: any set case that passed before the group and fails after it
+   — a newly failing case in a file that was already failing, or any case
+   of a set file that passed before — or a control newly failing, or a
+   test newly failing, each confirmed under B\*. Counted in files, a group
+   that fixed one case of a failing file and broke three others in it read
+   as progress and stood (review round 1 M4); and a group that fixed one
+   set file by breaking another read as not worse, the file counts being
+   equal. So is a group that
+   had failing set cases and fixed **none** of them, even when nothing got
+   worse: a change that measurably fixes nothing is speculative. Progress is
+   counted in cases, not files — fixing one of a file's three failing cases
+   is progress — wherever the runner's report names the cases; a file
+   without that record counts as one case, and a newly failing case is
+   counted by name where both sides name their cases. A set file that
+   passed, or failed with named cases, and now fails as a whole — an
+   import or collection error, no case list — is worse, counted as one
+   case (the file): every case it had that passed is now failing, and
+   reading the lost names as "no evidence" let a round that fixed one case
+   elsewhere by making a file unimportable stand as progress (review round
+   2 M4). A file failing as a whole on both sides, or turning from a whole
+   failure to named cases, is not on its own worse. The cases a failing
+   file names come from every run of its vote, never the first alone. A
+   run with a resource signature contributes no case evidence: one that
+   timed out, one killed by a signal with no report, or one whose every
+   failing case's message carries a resource signature
+   (`_RESOURCE_FAILURE_RE`, as in *A held case that fails again*). Every
+   other failing run contributes the cases its report names, none when it
+   names none (a collection error is evidence of a whole-file failure).
+   The file names the cases every such run named, or all of them when no
+   case was named by every run; it fails as a whole only when no such run
+   named any case; and a file whose every run carried a resource signature
+   has no case evidence at all. Such a file is failing but never a
+   whole-file collapse, so it is not worse on that count. A file settled
+   by a held case failing with no resource signature names that run's
+   cases, and an intermittent file its held cases. Reading the first run
+   alone, a first run that timed out followed by a confirming rerun that
+   failed in the ordinary way, naming the same case as before, read as a
+   collapse, and a round that fixed another set was rolled back as worse
+   (review round 3 L1). In a
+   replayed run (barnacle 7cc87f9a, pass 1) two repair rounds that fixed no
+   failing case each added a defensive fallback the task explicitly
+   forbade, and both shipped. A run that produces no verdict (a missing
+   report) is `resource_affected`, never on its own a reason to roll back,
+   and a set without a verdict cannot make a group zero-progress. A group
+   that survives all of that still goes through the delivery ratchet
+   (*A repair that regresses met work is rolled back*): when it made an
+   item that was met before it unmet, it is rolled back too. The item then
+   goes to the remaining groups as a `control_regression` note, so a fix
+   cannot hedge or remove what an earlier pass had already verified.
+5. *A trade is not progress.* A group that fixes a case only by breaking a
+   control or a passing test is rolled back, and the broken behaviour goes
+   as a typed `control_regression` note to every remaining group and to the
+   next round. Only when the same (fixed, broken) pair breaks again is the
+   work declared a `conflict`: the re-drive stops, the run is
+   `unconverged`, and the PR is a draft whose reason names both sides. When
+   the broken side is a test already tracked in the repository, the pair
+   is recorded as a contradiction with that test — typed PR evidence; the
+   set is never dropped for it.
+6. *Held-back names.* With four or more valid sets two are held back
+   (*Held-out acceptance tests*). Once the shown sets pass, the held-back
+   ones run; if any fail, one round names their failing cases — names
+   only, never source or output, with "fitting these names will fail the
+   recheck". It takes its round from the same counter.
+7. *The last round may think harder — behind four gates.* A group whose
+   members are on their last round and whose failing sets were all written
+   by this run's own-start writer runs at effort `high` instead of the
+   implementer's own, but only when every gate holds: (a) the set audit
+   (three samples) did not type a case `contradicts_task` in a majority of
+   them; (b) the round edits no tracked test so as to weaken it (fewer
+   `expect`/assert calls, fewer cases, an added `skip`/`only`, a deleted
+   file) — else the round is void and rolled back; (c) no new nullable or
+   defaulted read of a required field (Prisma schema, zod object,
+   interface member) appears on an added line — only patterns new in their
+   hunk, with error branches and empty-collection defaults exempt — else
+   rolled back; (d) a TypeScript-compiler AST check of every changed
+   production file finds no removed null-guarded throw or error return
+   (D1), no new success-shaped early return on a null branch (D2), and no
+   new catch swallowing an error class thrown under a null guard (D3) —
+   else rolled back. The AST check reads syntax only, so it loads the
+   tree's own `typescript` when that package has the JS compiler API and
+   the image's pinned 5.x otherwise (*Delivery detection* above): inside
+   the image it can always run. Only where it cannot (no `node`, no
+   compiler API from the tree or the bundled copy — a host run) is there
+   no escalation.
+8. *One budget.* Every group draws one round from each member's shared
+   counter (§13 *One re-drive budget per subtask*) and its wall time from
+   `redrive_budget_sec`, the hard stop.
+
+After the last round the sets are measured once more on the tree that
+ships, the merge checks re-run when the tree moved, the failing-test-ID
+diff (§9 *Which failures are new*) is measured again on that tree, and
+each routed item is re-checked: re-judged by the cited judge, and an item
+a falsifier proved unmet by re-running its saved probe on the new tree.
+Every row's test-outcome part is then re-read from the diff of the tree
+that ships. That verdict is what `_decide_outcome` reads.
+
+The diff is re-measured because nothing else is. Before review round 6
+the re-drive re-applied the test-outcome verdict recorded at detection,
+and `_decide_outcome` read detection's `new`, on a tree the diff never
+measured. Driven on a real suite: a test confirmed new at detection, then
+fixed by a re-drive group, left the row "unmet — new failing test(s)
+confirmed against the base" and the run `unconverged` on a tree where the
+test passes. The opposite direction is the one that matters more: a "no
+regressions" verdict must describe the shipping tree. A group's own
+ratchet confirms only that the group added no new failure against its own
+start, and its unsettled candidates never roll it back (§9 step 4). When
+the test axis cannot be measured on the shipping tree, the diff keeps its
+old tree and is marked stale: with no `new` a test-outcome part reads
+`unknown` ("not of the final tree"), never met; a `new` it carries still
+counts — the item stays unmet and the run `unconverged`, the outcome
+reason saying the failure was confirmed on an earlier tree.
+
+**The final diff describes the tree that ships, whatever moved it.** The
+re-drive's tail was the only place the diff was measured again, so it held
+only when the re-drive itself moved HEAD. Review round 7 drove two more
+ways the outcome came to describe a tree that does not ship. The final
+conformance takes the diff only after a round's own post-measurement, and
+a round that ends earlier — a worker error, a timeout, a malformed result,
+a protected-path or clobber rollback — takes none: on a real suite a
+regression the run introduced shipped `done` with an empty end-state
+section when round 0's worker raised. And the held-out acceptance gate's
+repair rounds commit to staging after the conformance: a kept repair left
+the diff of the tree before it, so a test the repair fixed still made the
+run `unconverged` ("newly failing on the final tree"), and a "no
+regressions" item read unknown on every run whose repair kept a commit.
+
+So the diff is a property of the shipping tree, not a side effect of a
+conformer round. Right after the acceptance gate (so detection and the
+re-drive route from the tree they judge) and again immediately before the
+outcome is decided, it is measured again whenever it is missing or of
+another tree than the one that ships; on the tree it already describes
+this costs nothing. Every row's test-outcome part is then re-read from it,
+as after a re-drive.
+
+The tree that ships has one definition: the run branch's tree,
+`refs/heads/leerie/runs/<id>^{tree}` (§6 *A delivery verdict counts only
+on the tree it was measured on*) — finalize pushes that ref, and nothing
+uncommitted reaches it. While staging is live, its `HEAD^{tree}` is that
+same tree by construction, not by coincidence: every worker that runs
+there passes I1's branch line (`_clean_tree_gate` requires `branch=`, and
+every staging gate gives it the run branch, so a worker that leaves HEAD
+detached or on another branch is re-asked or rolled back), and leerie's
+own merges, rollbacks and resume resets all act on that branch. So the
+measurements below carry the run ref's tree, and the decider, which
+reads the ref once staging is gone, compares like with like.
+
+**Every measurement reads the committed view.** The invariant: *what
+leerie measures is exactly what ships, plus the environment* — the
+dependencies installed into the tree. Staging is where workers work, and
+I1 is what keeps their uncommitted files out of it; measured in staging,
+a measurement is only as exact as I1's reading of it. Review round 17
+drove the hole that cannot close from inside I1: a worker writes an
+untracked `.gitignore` that ignores itself and a `helper.py` beside it.
+I1 honours that `.gitignore` (git's standard rule, which every tool's own
+cache relies on), so the tree reads clean; the build, lint, tests and
+held-out sets run with `helper.py` present; the shipped commit lacks it.
+The stricter rule — only committed `.gitignore` files count — breaks every
+tool that writes a self-ignoring cache. Two ways were measured:
+
+- *(b) I1 honours only committed ignore files.* Across the bench corpus
+  under `~/.cache/leerie-bench-b3/` (every worker stream log), 537 of the
+  3,735 sessions that ran Bash (14.4%) ran a package install. Both target
+  repositories install husky v9 through `prepare`, which writes
+  `.husky/_/.gitignore` containing `*`, and neither commits a rule for
+  `.husky/_`; it was the only self-ignoring `.gitignore` found anywhere in
+  the bench trees (157 copies). Under (b) every one of those sessions would
+  leave I1 dirt and be re-asked, the only answer being to delete husky's
+  hook shims or commit them; leerie's own installs would have I2 delete
+  `.husky/_` after each one. 19 sessions ran pytest, mypy or ruff, whose
+  caches are the same shape.
+- *(a) Measurements run in a checkout of the commit.* A detached `git
+  worktree add` of the branch tip costs a median 0.20 s on barnacle
+  (1,369 files) and 0.44 s on funeralworks (2,845 files), seven runs each,
+  once per commit measured; barnacle's test axis alone took 906 s and
+  1,116 s in the two e2e runs that recorded it.
+
+So (a): every command leerie runs to measure a worker's tree — the
+measured build/lint/test axes, every test-ID run (B\*'s final side, the
+intermittent-discovery repeats, the ratchet's and the re-drive's test
+IDs, the integration gate's), settle by execution's verify commands and
+the coverage settle's — runs in that tree's *committed view*
+(`_committed_view`): a detached checkout of its branch tip (the run branch
+for staging, the subtask branch for a subtask's worktree; never the
+tree's HEAD, which a worker can move), kept while the tip stands and
+replaced when it moves. The view is bracketed by I2 like any tree, so one
+measurement's reports never reach the next.
+
+Nothing a measurement reads comes from a tree a worker can write. Its
+environment is installed by leerie into the view, from the view's own
+committed manifests and lockfile: the provision recipe's `install` entries
+(`_ensure_worktree_deps` on the view), so a `postinstall` generator (a
+Prisma client) runs from the committed schema too; and its build outputs
+are produced there by the recipe's `build` entries and the build axis,
+from the committed sources. The first version shared the worker tree's
+ignored paths into the view by symlink instead, and that carried two
+holes: a worker that patched `node_modules/<lib>` in place had the patch
+measured (green on code that fails in CI), and a symlinked build output
+described whatever the worker last built, not the commit. The install
+cost was measured before choosing (pnpm 10.4.1 with a store on the same
+filesystem, as the state mount's store is, `--frozen-lockfile`, three
+runs each): barnacle 9.0 s cold (empty store, 501 packages fetched),
+4.3–4.5 s warm, plus 1.7 s for its second recipe entry
+(`examples/plugins/hello-site`); funeralworks 23.2 s cold, 10.6–10.7 s
+warm, its `prisma generate` included. A view is made once per branch tip
+measured: the measurement memo of the four barnacle e2e runs held at most
+7 distinct trees for any one command, so even 20 views (122 s warm) is 4%
+of the shortest of those runs (3,051 s), against a test axis of 906 s and
+more. The worker's own install stays where it was: a worker installs into
+its own tree for its own runs, and leerie never measures through it.
+
+*A view moves to the next tip when the install's inputs are unchanged*
+(review round 18 L1). Making a view per tip measured 7.3 s (barnacle) and
+15.8 s (funeralworks) per new tip with a warm store — a fresh checkout, the
+removal of the old view's 0.6–1.4 GB of dependencies, and a full install —
+and a run makes several views per subtask. So a view is kept per tree and,
+when the tree's tip moves, moved rather than made again, if the install it
+holds is one leerie made from the same inputs and is as that install left
+it:
+- the *install key* is the recipe's `install` entries (command, working
+  directory, environment) and the git blob of every install input at the
+  tip: every tracked file named as a manifest, lockfile or package-manager
+  configuration (`_INSTALL_INPUT_NAMES`), everything under a `patches/`
+  directory, and every path the dependency capture's `copy_inputs` names.
+  The blobs are read from the run repository at the tip, never from a tree.
+  The key is recorded with the view's install only when that install
+  succeeded;
+- the install's *outputs* are the ignored paths that appeared while leerie
+  ran the recipe's `install` entries in the view. When the last of them is
+  done, before any build runs, leerie records every entry under those paths
+  with its state: a file's or link's inode, size, mode and change time — a
+  time its owner cannot set back, moved by every write, rename, chmod or
+  link — and a directory's inode and mode;
+- when the key at the new tip is the key recorded, the view's `.git` is
+  pointed back at its own administrative directory, found from the run
+  repository's side; its measurement id there is removed, so to every
+  measurement it is a new tree — a fresh measurement directory and empty
+  stores of its own (DESIGN §6 *Leerie's runs of the repository's commands
+  are confined too*), as a replaced view gets; it is checked out at the new
+  tip (`checkout --detach --force`); everything untracked but the outputs
+  is removed (`clean -x`);
+  under the outputs, every entry the install did not make (a tool's cache, a
+  report a measurement wrote) is removed; and every entry it made must be
+  there in the state recorded, with no tracked path changed. Any failure,
+  or a different key, and the view is removed and made afresh, as before;
+- either way the recipe then runs again in the view in full — the store
+  fetch, every `install` entry and every `build` entry. A moved view's
+  install finds its own output in place, so the package manager does only
+  what the tip needs, and the repository's own lifecycle scripts (a
+  `prepare`, a `postinstall` generating from the sources) run against the
+  new tip's files as they would in a fresh view. Builds are never reused.
+
+So what a moved view holds is what a fresh view would: the install's output
+reused is one leerie produced, under the same confinement as any repository
+command it runs, from inputs identical at both tips, and verified untouched
+since; no worker can write a view (I5), and whatever a measurement changed
+under it sends the view back to a fresh one. A file the install reads that
+the key does not name leaves no stale install either: the install runs
+again on the new tip and reads it, over its own earlier output — the package
+manager's incremental install, which is the residual difference from a fresh
+view.
+
+Measured with the confined install, copy import, the store fetch and the
+stores emptied on a move (review round 19), a new tip with unchanged install
+inputs: barnacle 14.6–16.1 s moved against 28.8–34.6 s remade (three of
+each, idle host), funeralworks 24.4–25.6 s against 47.0–47.2 s (two of
+each, load under 9). What a move still pays is the store fetch, the install
+run again in place and the two walks of the install's output.
+
+What this removes: the measurement no longer depends on I1's reading of
+staging, so the assertion every staging reader made — that staging was
+clean, or the run stopped — is gone; each reader stamps the branch's tree
+(`_view_tree_sha`: the run branch's tree, for staging), which is what
+its view measured. I1 still
+holds every worker to a clean tree: it is what keeps uncommitted work out
+of the commits that ship and out of the next worker's way. No worker
+reaches a view: it lies under the run directory, of which a worker's
+processes may read and write only their own grant, and no grant names a
+view (§6 *A worker writes only where it is granted (I5)*); nothing names a
+view to a worker either. Each tip's view is a fresh checkout, or one
+moved there whose install is verified as leerie made it (*A view moves to
+the next tip when the install's inputs are unchanged*, above).
+
+Staging is restored at every resume all the same: an interrupted run's
+cleanup removes it, but a SIGKILL (Fly's `machine stop`, an OOM kill of
+the container) skips cleanup and leaves staging as the killed worker left
+it — partial edits, a merge half
+resolved, or a HEAD a worker detached or moved to another branch. So
+`setup-run.sh`, which every process runs once before it reads staging,
+restores a staging that survived with the one restore primitive (*One
+restore*, §8 below): it checks out the run branch itself — `git reset
+--hard HEAD` alone kept a detached HEAD, review round 15 H2 — ends any
+merge, and removes what is untracked, ignored files and so the installed
+dependencies kept. Nothing uncommitted in
+it is anything leerie may keep: I1 never commits a worker's leftovers,
+and the run branch — every integrated commit — is untouched. The same
+holds for every subtask worktree the process will reuse: a SIGKILL leaves
+each as its implementer or conformer stopped, and `new-worktree.sh`
+reattaches to a registered worktree as it is, so a resumed subtask's
+first measurement, or its next worker, would start on the killed
+worker's half-made edits (a measurement through I2 leaves them; the next
+worker's I1 gate holds it to files it never made). `setup-run.sh` restores
+every subtask worktree of this run the same way onto its own
+`leerie/subtasks/<run-id>/<sid>` branch, before any wave runs, and keeps
+the branch's commits. It finds them by path — the run's worktree
+directory, a name whose subtask branch exists — never by the branch git
+reports as checked out there: a worktree a worker detached reports none,
+and was skipped (review round 15 H2). That is exactly what a
+Ctrl-C's cleanup, which removes the worktree and keeps the branch, leaves
+the resume. This runs once per process; within a process the per-attempt
+rules govern a subtask's worktree (I1 after every attempt — `complete`,
+`blocked` or `failed` — and before an in-place retry; a handoff
+commits its partial work and leaves its checkpoint in the run
+directory). A restore that still leaves dirt stops setup, naming it. A killed
+integrator's half resolution goes with it, as it already did under a
+Ctrl-C's cleanup.
+
+**Every post-execution verdict is of the committed tree.** The invariant:
+*a verdict becomes `met` only on a read of a commit, or on a measurement
+the orchestrator itself made of the committed tree.* Review round 9
+asked whether the delivery judges, and the held-out re-measure, judge
+the wrong tree when staging holds what does not ship. Every check that
+can make a verdict *met* reads a commit, and a check that fails to read
+one makes nothing *met*:
+
+- the delivery judges — every item verdict, the DEFECT CONTRACT verdict,
+  and the delivery ratchet's judged re-verification of the items a
+  re-drive group did not route (its execution-typed items are read from
+  the failing-test-ID diff of the commit, below) — read exactly the
+  commit: a detached checkout of staging's HEAD (`git worktree add
+  --detach`), with no dependency install, made for each judge pass and
+  removed after it. A judge runs nothing — its tools read files and git —
+  so it needs no environment, and gets none. A checkout that cannot be
+  made fails the judge like a crash (it reads nothing, so it settles
+  nothing *met*), never falls back to staging.
+
+  Why not staging, which I1 and I2 keep at HEAD plus ignored files: the
+  ignored files are exactly what a judge must not read. Its tools include
+  `grep -r`, `cat` and `ls`, which (unlike `rg`) read ignored paths, and
+  two of its verdicts carry no citation — the DEFECT CONTRACT verdict and
+  the ratchet's re-verification — so nothing checks what they rested on
+  against `HEAD`. And ignored output in staging is stale by construction
+  once HEAD moves: the final conformance builds staging (`dist/`, `.next/`,
+  generated clients), then the acceptance repair and the re-drive commit
+  on top without rebuilding, and a worker's own build reflects whatever
+  its tree held then. A `grep -rn` for the fixed symbol then finds it in
+  the stale build of a fix that was rolled back (pinned by
+  `tests/test_judges_read_the_committed_tree.py`). Review round 12 drove
+  the uncited half (an untracked helper held the contract up), and round
+  13 L2 the ignored half (a worker's uncommitted `dist/` build). A test
+  run is the opposite case — it needs the installed dependencies and
+  regenerates its own output — which is why measurements run in staging
+  and judges do not;
+- a judge's `met` counts only when each part cites a quote found in
+  `git show HEAD:<path>` (`_verify_delivery_cite`), and an `ABSENT` cite
+  is `git grep` over `HEAD`, so content only the working tree holds buys
+  no met, and committed content it lost still verifies;
+- an "unchanged paths" item is `git diff <own start>..HEAD`;
+- a test-outcome part is read from the failing-test-ID diff of the
+  committed tree (above);
+- the held-out sets, the re-measure included, and the falsifier run in
+  disposable checkouts of the commit, never in staging;
+- a `RECORD` cite verifies only against the orchestrator's own lines of
+  the executed-commands record — the final-tree build/lint/test axes,
+  the B\* diff, the held-out sets' final verdicts — and those are in it
+  only while they describe staging's HEAD: the axes and the B\* diff
+  carry the committed tree they measured (the branch's, measured in its
+  committed view, §8 above), the held-out sets their commit.
+  The orchestrator's entries are kept apart from the text the judge reads,
+  and a cite is checked against that separate store, never against a
+  tag in the text: a worker's entry cannot become one by its contents.
+  A quote found only in a worker's entry is `record_worker`: supporting
+  evidence the judge sees, never a verified citation.
+
+Review rounds 10 and 11 drove the gaps the last bullet closes. Round 10:
+the final axes are measured in staging's working tree, so a worker's
+untracked file could turn a red axis green, and a cite of that line
+bought a met no file read could. Round 11: the record's other half — the
+commands workers ran, from their logs — had been left outside the rule,
+yet a cite of it verified like any other; the final conformer runs in
+staging, so its `pytest` passed on an untracked `helper.py` HEAD lacks,
+and a RECORD cite of that result bought `met`. That half is a record of
+what was executed in a worker's own tree, not a read of the tree that
+ships, so it informs the judge and verifies nothing. Round 12 drove the
+way round 11's fix still let it through: an orchestrator entry was told
+apart by its text — a column-0 line starting `[orchestrator ` — and a
+worker's command was copied into the record with its newlines, so a
+heredoc whose first segment was a test command (`pytest -q; cat <<'EOF'`
+followed by a forged `[orchestrator final-tree tests] … passed` line)
+started an entry of its own, and a cite of the forged line bought `met`.
+A text tag is forgeable by whoever writes the text; the store the cite
+check reads is now built only from the orchestrator's typed state, and a
+worker's command is joined onto one line besides.
+
+A check that fails reads nothing, so it settles nothing *met* (review
+round 13 claims M1 found three paths where it had):
+
+- a final delivery judge that crashes (a worker error or a timeout) is
+  asked again, up to `delivery_judge_crash_retries` more times; if every
+  attempt crashes, each item nothing else read is `unknown` and listed
+  under "Needs human verification" — an item the falsifier confirmed is
+  still unmet, and an "unchanged paths" item is still settled by its
+  `git diff`. It had been `met` with no read at all;
+- a delivery ratchet whose judge pack fails, whose verifiability
+  classifier fails, whose execution route measured nothing (no
+  failing-test-ID diff on either side, or candidates the confirm budget
+  left unsettled), or which raises leaves each item it did not read
+  *unverified* on the repair's commit — derived as the prior met items no
+  route read, never listed failure by failure, which is how the
+  execution route was left out (review round 14 M3: a kept repair whose ID
+  diff measured nothing kept its execution-shaped items `met`, re-keyed to
+  the repair's commit and listed nowhere): its row is `unknown`, it is no
+  longer prior met for the next ratchet, and it is listed. The re-drive
+  reads those items once more on the commit it ends on, and only when
+  none is left unverified does it re-key the verdict to that commit
+  (below); detection, which reads every item, clears the marks. They had
+  kept their `met` with no read of the new commit, and the re-key then
+  stamped it with that commit;
+- the ratchet's execution route — the failing-test-ID measurement, its
+  intermittent-discovery repeats and B\*'s rerun of the repaired side —
+  runs where only the commit is: staging's committed view (§8 *Every
+  measurement reads the committed view*: the run branch's tip plus the
+  environment). It had measured staging as it stood, beside a withheld
+  leftover.
+
+The judges no longer see staging-only content at all, and the ratchet's
+test IDs are measured on the commit. The final diff measures the committed
+tree again before the outcome is decided.
+
+When the `tests` axis cannot be measured on that tree — the command did not
+run, or no test command resolves for a run that had a diff — the old diff
+(if any) is kept and marked stale, and the gap is listed under "Needs human
+verification" ("Regression checks the run could not settle") whether or not
+a required item names the test outcome; a run with no test command and no
+diff has no regression check to miss and lists nothing. One fact is listed
+once: when the axis went unmeasured because the task forbids the test
+command and its scoped replacement could not run, that gap is already
+listed (§9 *A command the task forbids*), and the final-diff gap is not
+listed beside it (review round 8 L2 drove one forbidden suite into three
+lines in one group). And every regression-check entry leads with what the
+reviewer must do, the measured output last: the PR caps an entry at
+`_PR_ENTRY_MAX` characters, and a failed measurement's 200-character
+summary placed first cut "Run the tests on the PR branch and compare
+with the base" mid-word. A final conformance
+round that breaks before its post-measurement still has its
+pre-measurement: when the committed tree has not moved since and no tracked
+file was edited, that measurement's failing IDs are confirmed against the
+base there and then, instead of being thrown away. The places HEAD can move after the
+diff is measured are the final conformance's own commits and rollbacks
+(each round re-measures, and a round that broke is covered by the pre
+measurement or the refresh), the acceptance gate's repair rounds and
+rollbacks, and the re-drive's groups and rollbacks; the
+delivery recheck and detection are read-only on staging (the falsifier works
+in its own checkouts), CI parity runs in its own worktree, and finalize
+only verifies the branch.
+
+Measured. P8d (fresh cases, rules 1–5): every rollback restored the
+pre-group tree. Q3 (frozen L1, held-back names, 9 cases × up to 3
+samples): whole-set closure 18/24 within the two rounds of the shared
+counter, 0 B\*-confirmed new failures on the closed runs, all 15 rollbacks
+correct. Escalation (Q3-FRESH2, gates (a)+(b)+(c)+(d+), fresh sets never
+escalated before): 9 of the 10 fair sets closed (no escalation is
+recorded for the tenth); of the 10 broken sets, 3 were stopped by gates
+(b), (c) and (d), 3 did not close, and 4 closed, each hand-reviewed in the
+bench.
+
+**A worker that does not commit never runs in a tree leerie measures.**
+I1 holds a committing worker to a clean tree, and I2 brackets leerie's own
+commands. A worker that must not commit — the advisory `pr_reviewer`, the
+`ci_checks` discoverer, the `integration_judge` — fits neither: it cannot
+commit what it made, and what it runs is not leerie's own command. Review
+round 15 M1 drove the result. The `pr_reviewer`, allowed the repo's build
+and test verbs in staging, was followed by a restore of its own that
+unlinked only regular files: a file left in a directory a test had made
+read-only, a dangling symlink and a nested fixture repository all
+survived it, and the final conformance then stopped the run as a broken
+leerie invariant. That restore was a third tree-restore mechanism with its
+own gaps; mending it would have been a fourth. The root fix removes the
+need: each such worker reads, and runs anything it is allowed to run, in
+its own disposable detached checkout of the commit it reviews
+(`_judge_checkout`, as the delivery judges already do), removed with
+whatever is in it — write bits restored first, so a read-only directory or
+a nested repository goes too. Nothing is restored anywhere, because
+nothing of it was ever in a measured tree. The `pr_reviewer` runs the
+repo's build and test verbs, so its checkout shares staging's ignored
+paths (installed dependencies, nested `node_modules`, a generated client)
+as symlinks, the way the re-drive's self-check does; a write through one
+lands only in an ignored path, which no measured tree's cleanliness
+counts. The `ci_checks` and `integration_judge` workers run nothing by
+default (their tools read files and git), and under
+`--dangerously-skip-permissions`, which widens their tools with the
+build verbs, they still run where nothing is measured; their checkouts
+get no install, as the judges' do not. Workers that commit (implementer,
+conformer, integrator, the acceptance repair, the re-drive) stay where
+they commit, under I1; the satisfied-probe reads a subtask worktree with
+a fixed read-only tool set that no flag widens. The two finalize workers
+whose whole input is their payload — `pr_writer` (the template, commit
+log and diff are gathered by code) and `dep_capture` (the manifests and
+the install-command hint likewise) — ran in the user's real checkout
+(the container's `/work`, bind-mounted) with INSPECT_TOOLS, whose
+prefix-matched verbs include `find` (`-delete`) and `git branch`
+(`-D`); neither needs any of them. They run in an empty run-private
+directory with only `Read`, which reaches nothing there. The post-run
+skills had the same shape: the `judge` scores a captured call against
+the inputs the record itself carries, and the heal loop's
+`patch_generator` edits the prompt text it is handed, so both run the
+same way, payload-only. A replay re-runs one captured call, which may
+have read the repository when it first ran, so it gets a read of the
+repository — a ref-less `--shared` clone of the user's repository at its
+HEAD (`_ref_less_clone`, §6 *The run's own repository*), made in the
+replay's temporary directory and removed with whatever it made — never
+the checkout itself.
+
+**A worker leaves its tree clean.** The invariant (I1): *after every
+worker that runs in a tree leerie measures, integrates or ships, I1's
+checker (*Exact*, below) reads nothing in that tree, and
+the tree is on the branch leerie gave the worker, at a commit that
+descends from where the worker started* — everything the worker means to
+keep is committed, on that branch, and nothing untracked exists outside
+`.gitignore`. The branch is staging's run branch (`leerie/runs/<id>`) or
+the subtask's (`leerie/subtasks/<id>/<sid>`), the refs leerie merges and
+pushes. The workers it binds are the six that run in
+such a tree: the implementer and the per-subtask conformer in a subtask's
+worktree, and the final conformer, the acceptance-repair conformer, the
+delivery re-drive implementer and the integrator (conflict resolution and
+repair rounds) in staging. Leerie never commits on a worker's behalf and
+never decides which of a worker's files are its change.
+
+The root cause it removes. Only the implementer used to be held to a clean
+tree, and even that check skipped untracked files; every worker that runs
+in staging was unchecked, advisory-only ("left N uncommitted change(s)"),
+or had its leftovers committed by leerie. So leerie measured and shipped a
+tree whose contents it had to guess, and each guess became a defect class
+of its own. Review rounds 9 to 14 drove one such guess after another into
+a leftovers commit for re-drive groups: `git add -u` shipped a lockfile an
+install had rewritten (round 9); taking only files a Write/Edit call named
+dropped a module made through `mv` in Bash (round 10); taking every new
+file committed 505 files of `node_modules/`, reports and a core dump
+(round 11), which brought a fixed artifact-name list, a size cap, a saved
+archive of what the cap withheld and its PR entry (rounds 11–13); and
+first-producer, last-writer and test-output records decided which files
+were leerie's (rounds 12–14). Every round closed the last example and
+opened the next hole, because the question each rule answered — *which
+uncommitted file did the worker mean?* — has no answer leerie can read
+from the files. The worker knows; leerie does not. So the worker is asked.
+
+Measured before building it (2,745 worker sessions across 167 snapshot,
+e2e and smoke runs): no session ended with a dirty tree — 0
+`dirty_worktree` retries, 0 conformer "left N uncommitted change(s)"
+warnings, 0 re-drive leftovers commits; the 108 `no_commits` retries all
+ended `complete`, none a forgotten commit. Dirt did appear mid-session —
+scratch tests, a killed e2e run's debris, a formatter's edits to
+unrelated files — and the worker always cleaned it up. So the gate below
+almost never fires and costs little, and the leftovers machinery guarded a
+case real runs did not produce; the dirt real runs had came from leerie's
+own commands (§6½). Prior art agrees on the shape: OpenAI Codex requires a
+clean worktree ("Only committed code will be evaluated"), and Claude Code
+on the web enforces one with a stop hook; SWE-agent, OpenHands and
+SWE-bench capture with `git add -A` instead and document the junk that
+drags in — the pattern the leftovers commit was a variant of. The failure
+modes others hit name the three properties the gate has: a checker that
+is not exact makes a loop that never converges, an unbounded re-ask, and
+checking while something else still writes the tree.
+
+The gate:
+
+- *Exact.* The checker reads what leerie relies on — the working tree is
+  HEAD's tree plus what the repository's ignore rules ignore — through
+  settings no worker can change (`_tree_dirt`; *The settings are leerie's*,
+  below): a line when the run repository's own settings differ from
+  leerie's copy of them; a tracked edit or a staged change (`git status
+  --porcelain --untracked-files=no`), read twice, through the tree's index
+  and through a fresh index of HEAD that records no file's stat, so git
+  hashes every tracked file again (a stat cache that vouches for an edited
+  file hides it from the first read, not from the second); every index
+  entry flagged `assume-unchanged` or `skip-worktree` (`git ls-files -v`:
+  such a flag hides an edit from status, and `reset --hard` leaves a
+  skip-worktree edit in place); and every untracked file the ignore rules
+  do not ignore (*One ignore rule*, below). A change to a tracked
+  `.gitignore` is a tracked edit, and an uncommitted one is an untracked
+  file like any other — unless it ignores itself, which is how tools mark
+  the caches they write (pytest's `.pytest_cache/`, mypy's and ruff's
+  caches carry a `.gitignore` of `*`). Those are honoured: reporting them
+  made every Python run's staging "dirty" at its first measurement
+  (measured while building this). The residual is a worker that writes
+  such a file to hide its own: not closed by the checker, and raised as a
+  design question rather than met with a list of cache names. An ignored
+  file — installed dependencies, build output a repository ignores — never
+  appears, so it can never trigger a re-ask; a git failure is not clean
+  (nothing was read). Two more lines can come
+  with it, each from git's own answer, not from the files: HEAD is not the
+  worker's branch (`git symbolic-ref`: detached, or another branch), and
+  HEAD does not descend from the commit leerie relies on the worker's work
+  sitting on (`git merge-base --is-ancestor`: its branch moved back or
+  sideways). That commit is the one a leerie record points at: a
+  conformer round's, an acceptance-repair round's or a re-drive group's
+  start, the integrator's `pre_sha`, a repair round's merge — and, for the
+  implementer, where its subtask branch forked from the run branch, never
+  its own earlier attempt's commit, which it may amend or rebase (review
+  round 16 M2: a continuation that amended its previous attempt read as
+  having left its start, and correct work settled `unconverged`).
+  Review round 16 H1 drove the index flags: a checker that is `git
+  status`, which honours them, was passed by a worker that ran `git
+  update-index --skip-worktree` on its edited file — the textbook way to
+  make a status line go away without committing — and the tree leerie
+  measured green was not the commit it shipped. The same round's other
+  example, an untracked `conftest.py` patching the code under test and
+  listed in `info/exclude`, is a settings change (below).
+- *Only when nothing else writes the tree.* It runs right after the
+  worker's `claude -p` has returned and its process subtree is reaped
+  (§6 *Worker subtree termination*), before leerie runs anything of its
+  own there — a measurement, a commit, the next worker. Staging is
+  written by one stage at a time; a subtask's worktree by its own settle.
+  For the re-drive implementer nothing of leerie's is in the tree to
+  take out first: its self-check runs outside it (§8 *A held-out set
+  never enters a tree a worker commits from*).
+- *Bounded.* On a violation the same worker is asked again — its CLI
+  session resumed (`--resume`) with one note that carries the porcelain
+  lines verbatim and allows exactly two acts per line: commit it (it is
+  part of the change) or delete it (it is not; a tracked file is restored
+  with `git checkout`). A branch line allows one: check the branch out and
+  put the commits that belong in the change on it. At most `clean_tree_reasks` (2) re-asks; each is a
+  worker and counts against `max_total_workers`. A re-ask that crashes,
+  or a worker with no session to resume, spends its attempt.
+- *Exhaustion is unfinished work, never a guess.* When the tree is still
+  dirty after the last re-ask, the worker's round is rolled back by the
+  rule that already undoes that round — a subtask is settled `unconverged`
+  and not integrated; a conformer round, an acceptance-repair round or a
+  re-drive group is reset to its start on its branch (*One restore*, below: the branch
+  checked out again, ignored files kept); an integrator's merge is backed
+  out — and the porcelain lines are recorded with it. A conformer,
+  acceptance-repair or re-drive round's record makes the run
+  `unconverged`, its lines named under "Unconverged" in the PR; an
+  implementer's or an integrator's is its subtask's `unconverged` reason
+  (an integration repair round's is the round's mechanical failure). Nothing a worker left
+  is committed for it, and nothing is dropped without a line saying so.
+
+Why the branch is part of "clean" (review round 15 H2). A worker that
+commits on a detached HEAD, or on a branch of its own, leaves `git status`
+empty, so an I1 that read only the porcelain passed it — and every reader
+after it read the tree's HEAD while finalize pushed and the next merge
+moved the branch: the final conformer's fix was measured, stamped and
+judged on a commit the PR did not carry, and in staging every later merge
+landed off the run branch. The root cause is that the checker left out
+the state leerie actually relies on: the tree on its branch. It had
+already happened in a subtask (barnacle 45fa4253: an implementer ran `git
+checkout <base>~0` to compare behaviour and committed three times on the
+detached HEAD), where a repair at settle moved the subtask branch to the
+worker's HEAD — leerie deciding which of a worker's commits were the
+change, for one of the six workers only. The branch lines replace that
+repair: the worker that left its branch is asked to put its commits back
+on it, and the settled head is simply the branch tip.
+
+**The settings are leerie's (review round 17 H2).** What git reports for a
+tree depends on more than the tree. Config changes it: `core.fileMode`
+(`false` hides an executable-bit change), `core.autocrlf`, `core.eol`,
+`core.safecrlf`, `core.ignoreCase`, `core.precomposeUnicode`,
+`core.symlinks`, `core.checkStat`, `core.trustctime`,
+`diff.ignoreSubmodules`, `submodule.<name>.ignore`, `filter.<driver>.*`,
+`core.attributesFile`, `core.excludesFile`, `core.sparseCheckout`,
+`core.fsmonitor`, `core.untrackedCache`, `status.showUntrackedFiles`, and
+`extensions.worktreeConfig` or `include.path`, which bring in another
+file of keys. Attributes change it (a clean filter makes an edited file
+hash to HEAD's blob). The ignore rules change it. And the index's stat
+cache changes it: an entry whose recorded stat matches the file is not
+read again. Every worktree of the run shares the run repository's `config`
+and `info/` (`attributes`, `exclude`, `sparse-checkout`), and a worker
+writes them from its own tree with a plain `git config` — the textbook
+answer to "status shows my chmod"; its container's system and global
+config, attributes and ignore files are writable too. Round 17 drove two
+through both checker halves and the one restore, each of which reported
+clean and restored "successfully" with the change still on disk:
+`core.fileMode=false` hid an executable bit the tree ran and the commit
+lacked, and a clean filter declared in `info/attributes` hid a tracked
+edit outright. Pinning the keys that matter on the checker's command line
+closes those two and not the class: the list is git's and grows, a filter
+driver is named by whoever writes it, and `info/attributes` has no switch.
+The root cause is that the checker read the tree through settings it did
+not own. The invariant: *the settings git reads to report a tree of the
+run are fixed by leerie; a worker cannot change what git reports.* Three
+parts, each by mechanism rather than by key:
+
+- *The run repository's own settings are put back before leerie reads.*
+  When leerie creates the run's repository it copies its `config` and its
+  `info/` directory to `<run-dir>/repo-settings/`, and never writes either
+  afterwards (it sets `repack.updateServerInfo=false` first: an automatic
+  `git gc` otherwise writes `info/refs`, measured). Every key, filter,
+  include or per-worktree config file can take effect only through one of
+  those two, and git reads both live: `_git_view` replaces only the
+  settings outside the repository. Measured (review round 18), a tree
+  repository's `core.fileMode=false` hid a mode change from the checker,
+  and an `info/exclude` line hid a new file. So leerie copies its two back
+  wherever they differ before it reads a tree: at every worker's exit,
+  before the take (`_take_after_worker`), at the start of both checker
+  halves (`_tree_dirt`, `leerie_tree_dirt`), and first in the one restore.
+  What a setting hid then shows as the file's own line (` M run.sh`,
+  `?? new.txt`).
+
+  A worker's settings change is its environment, not its product. Leerie
+  puts it back and logs it, and the worker is never re-asked about it or
+  rolled back for it. The commit is what ships, and nothing a setting did
+  can hide in a tree leerie reads through its own settings. A settings
+  line remains only when leerie cannot put its copy back (the copy is
+  missing, or the copy-back fails). That is leerie's own fault, so the run
+  stops there (`_take_after_worker`, `_clean_tree_gate`) instead of
+  holding a worker to it.
+
+  husky's install, which every `pnpm install` in a husky repository runs
+  through `prepare`, is the ordinary case. It does
+  `git config core.hooksPath .husky/_` in the worker's tree, and that is a
+  change either way (review round 18 H1, measured):
+  - The carry copies keys through `git config --list`, which prints names
+    lowercased, so leerie's copy says `hookspath`. husky's write of the
+    same value rewrites the line as `hooksPath`, so the bytes differ.
+  - When the user's checkout has no hooks path, leerie carries
+    `core.hooksPath` set to the user's hooks directory. husky's
+    `.husky/_` is then a different value.
+
+  Before this, the checker counted that as the worker's dirt, which no
+  `git config --unset` could clear. In every husky repository each
+  subtask's work was rolled back. Carrying the user's spelling would
+  close only the first case. Putting the settings back closes both, and
+  any other setting an install writes. The worker's next install sets it
+  again, for that session's own commits.
+- *Everything outside the run's repository is read from a copy.* The
+  system and global config with the files they include, the system and
+  global attributes files and the global ignore file are copied once per
+  orchestrator process — config flattened, includes resolved — to
+  `repo-settings/host.config`, `host.attributes` and `host.exclude`, and
+  every checker and restore git reads those copies (`GIT_CONFIG_SYSTEM`,
+  `GIT_CONFIG_GLOBAL`, `GIT_ATTR_NOSYSTEM`, `core.attributesFile`,
+  `core.excludesFile`). Copied, not compared: they are the user's (the
+  launcher stages them into the container), so the checker is made immune
+  to them rather than restoring them; and per process, not per run, so a
+  user who changes them between a run and its resume gets the new ones.
+- *Optimisations are off, the stat cache is not trusted.* `core.fsmonitor`
+  (a program that tells git which files changed) and `core.untrackedCache`
+  (a directory's mtime vouching for its listing) never change a correct
+  answer, and each is a channel to a wrong one, so the checker turns both
+  off. The stat cache is the third such optimisation, and the one a
+  setting leaves behind: a worker that declares a filter, stages through
+  it and removes the filter again leaves settings equal to leerie's and
+  an index whose stat vouches for the edited file. The fresh-index read
+  above does not consult it. The one restore drops the index before
+  `reset --hard` when the two reads disagree, since the reset trusts the
+  same stat and otherwise keeps the edit (measured).
+
+A tree that belongs to no run repository (the user's own checkout, a
+ref-less clone) is read with its own settings, the two optimisations off.
+Leerie's own commands keep the run repository's settings as they found
+them too: I2's bracket (§6½) copies them back after each command, the
+same copy the restore makes. The residuals: replace refs (`refs/replace/`)
+change which tree a commit names to every reader alike, the shipping read
+included, so they are not a view of the tree; a worker can still edit the
+copy under `<run-dir>/repo-settings/`, which is leerie's own state, like
+`state.json`; and the user's own repository-local settings are carried
+(*The run's own repository*), so a user who sets `core.fileMode=false`
+in their checkout has the checker read the run's trees that way, as their
+own `git status` does. A worker that sets `extensions.worktreeConfig`
+makes git unable to read any worktree of the run (the bare repository's
+`core.bare` then applies to each); the checker reports the tree
+unreadable, which is not clean, and the restore copies the config back.
+
+**One ignore rule (review round 17 H3).** "Ignored" means one thing in
+every tree leerie reads: what git's standard ignore rules say — the tree's
+`.gitignore` files, the run repository's `info/exclude` and the global
+ignore file — read through the run's settings (above). One function
+builds every listing of untracked files (`_untracked_cmd`; in shell
+`leerie_untracked`): I1's checker, I2's bracket, the one restore and its
+write bits, the self-check's copy and the ignored paths it shares, the
+acceptance writer's collection, the surrogate's change check and the
+checkout sentinel. No other `ls-files --others` exists in leerie, and no
+`git status` that lists untracked files (`tests/test_one_ignore_rule.py`,
+derived from the source). The root cause: two definitions. Round 16
+narrowed I1 to the tree's own `.gitignore` files, because `info/exclude`
+and the global ignore were writable by any worker, and left I2 on
+`--exclude-standard`. The launcher mounts the developer's global ignore
+into the container, so a `__pycache__/` that only it covers, written by
+leerie's own test run, was "ignored, so environment" to I2 and dirt to
+I1, and `_assert_staging_clean` stopped the run blaming leerie's own
+invariant. Making the ignore sources leerie's (*The settings are
+leerie's*) removes the reason round 16 narrowed the rule, so the one rule
+is git's own: a developer's globally ignored caches stay ignored, and an
+`info/exclude` a worker edits is put back before the read, so the file it
+hid is untracked dirt.
+
+The rollbacks this rests on are made exact for the same reason: a back-out
+of an integrator's merge and the reset before an integrator is retried
+also remove untracked files, so the next worker in staging starts from a
+tree I1 already held, and is never asked about files it did not make. A
+worker that was reaped mid-turn (an `empty_handoff` rescued on its
+commits) has no session to ask; its uncommitted debris, tracked and
+untracked, is discarded, as its tracked debris always was — the
+deliverable is the committed diff.
+
+**One restore.** Every rollback and reset of a tree to a commit — a
+conformer, acceptance-repair or re-drive round rolled back, an
+integrator's merge backed out or restarted, a repair round reset, a
+reaped implementer's debris, the falsifier's checkout between samples,
+and `setup-run.sh`'s and the subtree collection's resets — is one
+primitive, in Python (`_restore_tree`) and in shell
+(`leerie_reset_worktree`), with one postcondition: the tree is at the
+commit, and I1's own checker (`_tree_dirt`, above) reads nothing. Review round 15 M2 drove why: "back to the
+committed state" had three implementations of different reach — one
+restored no write bits, none removed a nested repository (a fixture `git
+init`, a clone into the tree: `git clean -fd` skips them, `-ffd` does
+not), and none checked that the dirt I1 reports was gone — so I1's
+designed exhaustion path, roll back and record, became a `die()` at the
+next reader, and the nested-repo case one that recurred on every resume.
+The primitive copies leerie's settings back over the run repository's
+(*The settings are leerie's*, above), restores the owner's write bit on
+the tracked directories and the untracked paths (§6½), clears every
+`assume-unchanged` and `skip-worktree` flag (`reset --hard` keeps a
+skip-worktree edit), drops the index when its stat cache vouches for a
+file the fresh read says differs, resets, runs `git clean -ffd` (ignored
+files kept) — every step through the run's settings, so the reset and
+`clean` see what the checker sees — and reads the checker — in shell the same steps and the same checker, line
+for line (`leerie_tree_dirt`), so the two halves are one behaviour. Dirt it
+cannot remove is not the
+orchestrator's own (Fly's root-run subtree collection, §6½, is the one
+known producer) and stops the run there, with the lines. In shell it also checks out the expected branch
+(§8 *The final diff describes the tree that ships*, the resume).
+
+Superseded by this: the leftovers commit with its artifact-name list, its
+caps and its saved archive, the "Files a re-drive left uncommitted" PR
+entry, the conformers' advisory dirty-tree warnings, and the per-subtask
+conformer's parse of `-z -uall` porcelain for a `tests` repair cited at an
+uncommitted path — a clean tree has no uncommitted path to cite. The records of which untracked files leerie's
+own commands produced went with I2 (§6½): those commands now leave
+nothing behind to attribute.
+
+A worker that crashes or times out is held to the same rule as one that
+returns, in either tree: it may already have edited the tree, so the gate
+runs after a raised `claude -p` too (the re-ask resumes whatever session
+it recorded, and with none recorded spends its attempt), and only then
+does the round end. The root cause of the gap this closes is one shape
+in two workers: a crash arm that `break`s out of the round before the
+gate is reached, leaving the dead worker's edits for every later reader.
+Each of the six, audited:
+
+- *The final conformer* and *the per-subtask conformer* broke on a worker
+  error or a timeout (the per-subtask one also on PID exhaustion) before
+  their gate; both now run it first and break after.
+- *The implementer.* An attempt killed by its cgroup (PID or memory
+  exhaustion) is retried in place, in the same worktree, by a fresh worker
+  that no checkpoint tells about the dead one's edits — the gate runs
+  before that retry. An attempt that returns `complete`, `blocked` or
+  `failed` is gated before leerie reads its tree at all (the
+  declared-command and mechanical checks, settle by execution, the
+  conformer), not only on the `complete` path's last step: a `complete`
+  with no commits and a `blocked` routed to settle by execution used to be
+  measured with the worker's uncommitted edits in the tree. A checkpointed
+  handoff (`incomplete-handoff`, `needs-clarification`) passes its tree to
+  its own continuation, which is gated in turn; a session that died with no
+  result is the `empty_handoff` case below, and one with no commits is
+  reset.
+- *The acceptance-repair conformer* runs its gate after a raise and after a
+  return alike, before its round is measured.
+- *The re-drive implementer:* `_redrive_drive` returns a crash as a result,
+  never raises, so the gate after the drive always runs.
+- *The integrator.* A crash restarts the merge from `pre_sha`, and a
+  `design-conflict`, `failed`, uncommitted merge or crashed repair round is
+  backed out or reset; each of those rollbacks removes untracked files too,
+  so the round's tree is gone exactly, which is what the gate would demand
+  of a round that cannot be kept.
+
+**A held-out set never enters a tree a worker commits from.** (I3.) The
+re-drive's self-check used to stage the shown sets read-only in staging,
+the tree the implementer commits from, git-ignored there. That was the
+root cause (RC3) of a class of defects the re-drive kept re-opening:
+whatever a runner made of a staged file — its bytecode under an
+unignored `__pycache__/`, its snapshots — sat beside the implementer's
+change and reached history through a commit (review round 11); the fix
+for that removed files at unstage by name and by content, and each rule
+it needed drew the next review's counter-example (rounds 12 and 13: an
+honest fix voided for a literal it shares with the test, an implementer's
+own module deleted for lying beside the test, a crash between staging and
+unstaging leaving a hidden test in staging). Every one of them existed
+only because the test was in the tree.
+
+So the test never is. The self-check is a command leerie provides on the
+implementer's `PATH` (`scripts/selfcheck.py`, its logic in the
+orchestrator); one call:
+
+1. copies the worker's current working tree — HEAD, its uncommitted
+   edits and its untracked, not-ignored files, as the one listing (§8
+   *One ignore rule*) gives them — into a run-private
+   directory with no `.git`, with `GIT_CEILING_DIRECTORIES` at that
+   directory's parent so a test that shells out to git resolves no
+   enclosing repository;
+2. shares every ignored path of the worker tree (`node_modules`, nested
+   ones, a generated Prisma client, build output) into the copy as a
+   symlink, so nothing is installed or generated per call — except a path
+   that is a set file or holds one, which the set's own placement needs as
+   a real directory, so a set file is never written through a link into
+   the worker's tree;
+3. places the shown sets (`_place_set`), refusing — exit 3, with the
+   paths — when the copy already has a file at a set's path, since a set is
+   never placed over the tree's own file;
+4. runs the repository's scoped runner over the sets' test files
+   (`_acceptance_cmd`, the same command the evaluation runs, exact file
+   selection included), with its worker's own throwaway database
+   (`claude_p(db=True)`: `DATABASE_URL` and `DIRECT_URL` name the socket in
+   that worker's `/tmp`) when the repository has one, else the caller's
+   own;
+5. prints the runner's output and a one-line verdict, and deletes the
+   copy.
+
+It also checks part of a set: naming one or more of its files (by path,
+file name or a unique path suffix) runs only those, every set file still
+placed, and `-t`/`--testNamePattern <pattern>` (or
+`-k`) becomes the runner's own test-name filter. A signal to the
+command (a shell timeout, a cancelled call) unwinds through the same
+clean-up as any other exit, so the copy is deleted on every exit.
+
+**The pre-registered latency bar failed, three times.** Each bench round
+ran the in-tree staging (IN) against the out-of-tree command over four
+re-drive cases (two samples each in the first round, three after), with
+a bar frozen in advance: closure not lower, invocations at least 0.8 of
+IN's, median per-call latency within IN + 2 s, zero leaks.
+
+- I3-1 (FROZEN, the first out-of-tree command): closure 6 of 8 against
+  6 of 8, 28 calls against 35 (floor 28), zero leaks, median call
+  67.6 s against 30.1 s — **not met**, on latency. An extra arm added
+  in that round and not frozen (OUTR, the direct-run form found after the
+  fact) also missed invocations, 27 against the floor of 28.
+- I3-2 (FROZEN2, the whole-set command): closure 9 of 12 against 9 of
+  12, 58 calls against 49, zero leaks, median call 32.6 s against
+  21.8 s — **not met**, on latency. In-tree implementers ran a subset in
+  about a third of their calls; the command could not.
+- I3-3 (FROZEN3, with the subset forms above, which the note documents
+  with one example each): closure 9 of 12 against 9 of 12 (the same
+  cases), 44 calls against 52 (floor 41.6), zero leaks, median call
+  22.8 s against 13.8 s — **not met** again, on latency alone; the
+  median session was 64 s against 122 s.
+
+Measured cause of the gap: worker behaviour and host load, not the
+mechanism. Out-of-tree implementers chained other heavy commands into the
+same Bash call as the self-check in 18 of 44 calls, in-tree ones in 5 of
+52; unchained calls alone took 14.8 s against 13.7 s. Out-of-tree calls
+also ran at higher load (median 1-minute load 19.6 against 13.5) and used
+the subset less (20 % of calls against 35 %). The mechanism's own cost,
+the same command on the same tree, is +0.8 to +2.3 s per call with the
+bench's temporary-index script (b2e's tree exceeds the 2 s bar by itself),
+and +1.2 s for this command on a funeralworks clone (one set file, five
+interleaved runs each: the in-tree run a median 2.09 s, the self-check
+3.31 s, its copy of the 2,778-file tree a median 0.43 s of that,
+measured alone seven times (0.37–0.49 s) — one `tar` pipe of the listed
+files, where a copy per file took 1.2 s). That copy is the
+next lever if the bar must hold on a heavy tree.
+
+The design takes I3 anyway, because the bar measured the wrong risk for
+this decision: RC3 is the root cause behind review rounds 11 to 14, I3
+removes it rather than patching another exit, and across the three rounds
+the frozen out-of-tree arm showed no harm on what the bar exists to
+protect — closure, invocations, leaks (the unfrozen OUTR arm of the first
+round missed invocations by one call). Latency is a cost the run pays,
+not a defect it ships. No unmeasured prompt line ("run the self-check as
+its own Bash call") is added to chase the gap: it would be a behavioural
+nudge no bench has measured.
+
+The shown sets' source stays readable to the implementer, in a
+directory under the run's own `selfcheck/` that no read denial covers
+(the run's `acceptance/` stays denied), laid out by repository path, and
+removed with the group. The held-back sets are in neither place.
+
+**No set byte enters the repository's object store.** The copy is made
+from the worker's files directly, never through a temporary index: a
+temp-index `add -A` hashes every not-ignored file of the worker tree into
+the object store, and the worker can read the shown sets — a copy it put
+in its tree would be hashed by leerie's own self-check, unreachable but
+present to `git cat-file --batch-all-objects` (SWE-bench #465 read future
+fixes out of a repository's history). The listing writes no object, the
+sets are placed only into the copy, which has no `.git`, and the held-back
+sets are never read by the self-check at all.
+
+**Kept as anti-cheat, not hygiene: no line of a set's source reaches
+history.** A worker can still copy test source into a commit, and
+self-check feedback raises cheating along with pass rate (ImpossibleBench:
+33 to 38 %). So every group's commits are searched; what this guards is
+exactly one thing, *the held-out test's source never reaches history*. The
+values the test asserts — an error message, an enum value, a JSON key, a
+route, the path of the module it imports — are not covered: they are the
+specification, and the code that makes the test pass has to contain them.
+
+1. *A copy is recognised by a span of the test's source.* Each shown set
+   file is fingerprinted by its spans of `_HELDOUT_SPAN_LINES` (4)
+   consecutive lines of code, each line normalised (whitespace trimmed and
+   collapsed, a line with no letter or digit skipped). A line that is only
+   a literal and punctuation — `"ERR_X",`, `42,`, `"key": 1,` — is a piece
+   of a value, not code, and is skipped on both sides: a value is
+   specification however many lines a formatter breaks it over, and the
+   fix has to contain it (review round 13 M1). A file shorter than four
+   code lines is one span of all of them, and one with fewer than two has
+   none: one line is a value. A span the group's starting commit already
+   contains is dropped: it is the repository's idiom, not the test. Why
+   four: an honest sibling test written in the same idiom shares at most
+   a short header with it (the framework import, the subject import, one
+   client or fixture line), while a copied case — its signature, its call,
+   its assertion, and the line before it — does not. The input is bounded
+   (lines read in pieces of at most 4 KiB, 1 MiB of each set file, 64 MiB
+   of the base), and the lines go to `git grep` through a pattern file,
+   never the argument vector (review round 12 L1: a 160 KB inline base64
+   literal past the kernel's per-argument limit).
+2. *A span or a set path voids a group.* Every blob any commit of the
+   group added — not the net diff, since a file committed and then
+   deleted is still in the history, and a merge commit's own blobs against
+   each of its parents, since an evil merge's resolution is in no other
+   commit — is searched for the spans; a hit, or a commit naming a set
+   file's path, voids the group, which is rolled back.
+
+Because nothing of leerie's is ever in the tree, the group's tree is held
+to the clean-tree gate like every other worker's, with no exception for a
+group that committed a set path (that group is clean, and void by rule 2),
+and its test IDs are measured like any other. What these rules do not
+cover: a copy reflowed line by line or re-rendered into another form; a
+copy whose only shared lines are the values, which is the specification;
+and a report that names the test's cases or path, which carries no source
+line — the case names are given to the implementer in a held-back round
+anyway. The acceptance evaluation, the set audit, the surrogate witness
+and the falsifier (its `.leerie-falsifier/` leads and the confirm
+checkout) all work in disposable checkouts that are removed and never
+committed from.
+
+**A finished verdict is reused only on the commit it was measured on.** A
+resume skips a finalize-side gate that already finished, but "finished"
+says only that it ran on some tree: staging's HEAD can have moved since —
+a re-drive group kept before a crash moves it. So every verdict of the
+shipping tree carries the commit it describes, and a resume reuses it only
+while staging's HEAD is still that commit: final delivery detection
+(`delivery_gate.unmet_final`, keyed `final_sha`), the held-out acceptance
+gate's final verdict (`acceptance.gate.final`, keyed `final_sha`) and the
+repository's merge checks (`ci_parity.final.sha`). On any other HEAD the
+verdict is measured again there: detection runs whole (judge and
+falsifier), after dropping the old verdict so that a detection that fails
+leaves none rather than one of another tree; the acceptance gate measures
+every set on HEAD with no repair round, its repair budget having been
+spent on the tree it repaired (a HEAD where nothing can be measured keeps
+the last measured verdict, as at the end of the re-drive); the merge
+checks re-run. The re-drive's own verdict is re-keyed rather than
+re-measured: when the detection it routed from was of the commit it
+started on, and it has re-checked its routed items on the commit it ends
+on, and no item a failed ratchet left unverified remains, `final_sha`
+becomes that commit — every kept group's ratchet re-verified the items
+it did not route — so a resume after it keeps the verdict
+`_decide_outcome` reads instead of running detection over it. With an
+item still unverified the key stays, and a resume runs detection.
+Until this rule, detection's skip read only the presence of `unmet_final`
+and the acceptance gate's only the presence of `final`: a resume after a
+re-drive group had moved the tree reused verdicts of a tree that no longer
+shipped. Records that describe an earlier tree on purpose are not
+shipping-tree verdicts and stay as they are: the delivery gate's
+`unmet_before` / `unmet_after` (the trees before and after the final
+conformer — detection reuses their `judged_*` only on that same sha) and
+the acceptance gate's pre-repair `initial`.
 
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
@@ -5966,32 +11465,128 @@ the time it runs, its work is already on the run branch — it reports
 retry reproduces the identical no-op deterministically until the retry cap
 exhausts and the wave dies.
 
-The resolution is the post-execution analogue: on a no-commits result,
-before failing, the orchestrator re-runs the satisfied-probe against
-`success_criteria_seed` on the **run-branch HEAD** (which *does* contain the
-sibling's commit). If met there, the subtask settles as satisfied (recorded
-as `already_satisfied_mid_run`) rather than routed to the retry cap; a
-genuinely unsatisfied probe leaves the existing retryable-failure path
-unchanged. The base-tree-only-vs-HEAD distinction is deliberate: the
-pre-schedule probe must not span history, while the post-execution probe
-measures against exactly the ref the commit-presence gate uses
-(`_compute_run_branch`).
+The resolution used to be a post-execution satisfied-probe on the
+run-branch HEAD, settling the subtask complete when a reader judged its
+criteria met there. That is an LLM accepting a worker's unbacked claim,
+and it did so wrongly: on the 22 no-commit and unrun-declared-command
+settles sampled from the corpus (bench E4/d4, ground truth by hand), the
+read-and-accept rule settled `e33` complete although its required test
+case was never written.
 
-**Scope: sibling-committed *or* base-tree-already-satisfied.** The probe
-judges *whether* criteria are met on HEAD, not *who* met them, so this
-rescue also covers a subtask satisfied on the seeded base whose pre-schedule
-probe was skipped or false-negatived. That's intended: such a subtask is
-legitimately complete regardless of provenance.
+**Settled by execution (E4).** The planner now types, per success
+criterion, the command that decides it — `verify: [{criterion, argv}]`,
+one entry per criterion, `argv` empty for a criterion no command checks —
+and `verification_only`, true only when the subtask writes nothing and
+every criterion is decided by its command. Code holds the planner to the
+second half: `verification_only` counts only when every `verify` entry
+carries an argv. Where a worker's claim is unbacked, the orchestrator
+decides by running the commands itself, instead of asking a reader:
 
-**Probing a flagged subtask before it spends.** The rescue above is correct
-but wasteful in ordering: `_warn_provider_subset_subtasks` (§5
+- a **verification-only** subtask with no commits, and
+- a subtask with **its own commits** whose declared commands its worker
+  never ran (§9 *A declared command must also have been executed*),
+
+are settled by executing each `argv` — never through `bash -c`, so a path
+like `src/app/[locale]/…` is a literal argument — in the subtask's
+worktree, as `leerie`, inside a capped broker cgroup, spawn-held (§6). A
+command passes on exit 0; a command that fails is re-checked under B\*
+(§9 *Which failures are new*: the host-pressure gate, then up to
+`confirm_pairs` reruns, any exit 0 passing it as `resource_affected`).
+The settle needs every command to pass and the worktree's tracked files
+to be unchanged afterwards (a command that rewrites tracked files has not
+verified the tree it ran on). The verify commands are leerie's own
+commands in a worker's tree, so they run inside the I2 bracket (§6½) on
+every exit — a pass, a fail, an environment limit, a forbidden argv that
+stops the loop, an exception: a tracked file they changed is put back and
+an untracked file they created is removed, files that were already there
+and ignored files (installed dependencies) staying. Review round 15
+(claims H1) drove why it is the bracket and not a step of the verdict: the
+put-back used to run only on a pass, so a failing command's tracked edit
+stayed for the next worker's I1 gate to hold it to. Command output is
+data — it is logged, and only a tail ever reaches a worker, fenced as
+untrusted output in a re-drive note, never as instructions. A no-commit
+claim on a subtask whose planned surface a sibling already changed this
+run is settled on evidence (below). Every other unbacked claim — a
+no-commit subtask that is not verification-only, a failed execution, an
+unrun declared command with no `verify` argv — is re-driven from the
+shared budget (§13) and settles `unconverged` when the budget is spent. A command killed by its cgroup at the measured ceiling is
+`environment_limit` and settles `unconverged` without a re-drive (§6).
+
+Benched (E4/d4, the same 22 cases): execution with the verification-only
+or own-commits rule made 0 false settles; its 4 misses (`e163`, `e165`,
+`e78`, `e90`) were all re-drives of work that was in fact met, which
+costs a round, not correctness. The planner's `verification_only` label
+(bench E4-LABEL) was true on 0 of 38 subtasks that must write something
+and on 0 of 6 mixed ones, and on all 18 strict verification subtasks. The
+one first-run build failure in the sample (`e20`, a Next build that exits 1
+once and passes on rerun) is exactly what the re-check absorbs. On rootful
+the five rerun cases settled identically to rootless (bench P5, 5/5).
+The pre-spawn probe of a provider-subset subtask (below) is unchanged: it
+spends a read-only probe to avoid an implementer, and never overrides a
+worker's claim. After execution the probe never settles a claim alone:
+it is one of the three checks a sibling-delivered no-op must pass (below).
+
+**A no-op a sibling already delivered is settled on evidence.** The
+rule above re-drove every no-commit claim that was not verification-only,
+which turned the mid-run sibling case (above) back into a failure: in a
+two-wave smoke run, the first wave's conformer wrote the regression test
+that a second-wave subtask was planned to add. The second subtask reported
+`nothing_to_change` three times (the first try and both re-drives) and
+the run ended `unconverged`, on a task whose whole deliverable was on the
+branch. Re-driving a worker whose work is already done cannot converge, so
+the re-drive is the wrong arm for this shape. The implementer's word still
+settles nothing, so the claim is settled by evidence the orchestrator
+gathers itself (§12: prompts are advisory, code enforces). This applies to
+a `nothing_to_change` blocker and to a `complete` claim with nothing
+committed, including one whose declared commands went unrun. A claim
+settles `complete` only when all of these hold:
+
+1. **A sibling changed this subtask's surface this run.** This check is
+   mechanical. Code walks the first-parent `leerie: integrate <sid>`
+   merges on the subtask's HEAD and keeps those whose diff touches a file
+   in this subtask's `files_likely_touched`. These merges are the
+   `satisfied_by` evidence: the sibling's sid and its integration commit.
+   That subject is set by code, never left to a worker: an integrator
+   that commits its conflict resolution under a message of its own has
+   the merge re-worded (tree and parents unchanged, its message kept as
+   the body), or the sibling's landed work would be invisible here.
+   With none, the claim is the `e33` shape and is re-driven. In `e33` a
+   wave-1 test subtask whose test was never written reported its run of
+   the file's existing tests as done. Nothing had landed on its surface,
+   so nothing else could have done its work.
+2. **Its `verify` commands pass on HEAD**, when it has any. They run
+   exactly as settle-by-execution runs them, on the subtask's worktree,
+   which is the run branch plus nothing.
+3. **The `satisfied_probe` finds its criteria met on HEAD.** This is the
+   base-tree-only probe the pre-spawn check already uses. It is given the
+   `success_criteria_seed` and each `verify` criterion, and it defaults to
+   not satisfied.
+
+Each check covers a gap in the others. The probe alone once settled `e33`
+on a reading of the tree. Execution alone settled `e33` too (bench E4/d4,
+`exec_v1`), because running a test file passes whether or not the new
+case was written. A criterion with no command is decided only by the
+probe. The sibling precondition holds the rest to the one case where an
+earlier wave can have done the work. A settle records `dropped_subtasks
+[sid]` with reason `satisfied_by_sibling`, the `satisfied_by` merges, the
+probe's evidence and the executed commands. It goes through the same
+helper and branch rules as every no-commit settle, so its zero-commit
+branch integrates as a no-op. Anything short of all three keeps the
+re-drive, and the reason it was not settled joins the blocker. A
+re-driven attempt that reports the same claim is checked again, with the
+same evidence and against the same budget. A verify command killed at the
+measured ceiling settles `unconverged` as `environment_limit`, as the
+other execution arms do.
+
+**Probing a flagged subtask before it spends.** Settling a no-op only after
+its implementer has run is wasteful in ordering: `_warn_provider_subset_subtasks` (§5
 *Provider-subset subtasks*) already flags, at plan time, every subtask whose
 entire `files_likely_touched` surface belongs to an ordered predecessor —
 measured always right and inert (a run's three flagged subtasks all ran a
-full implementer and committed nothing; twelve corpus-wide reached this
-rescue only after their whole spend). So the flagged sids are persisted
-(`provider_subset_sids`) and `_settle_subtask` runs the same HEAD probe
-against staging *before* spawning the implementer — staging sits at
+full implementer and committed nothing; twelve corpus-wide reached the
+post-execution settle only after their whole spend). So the flagged sids are persisted
+(`provider_subset_sids`) and `_settle_subtask` runs the satisfied-probe on
+HEAD against staging *before* spawning the implementer — staging sits at
 run-branch HEAD, and a provider-subset predecessor is by construction
 already merged there. A hit settles on one read-only probe instead of a
 full implementer (one run's three cost ≈18 worker-minutes/≈$2.6 combined). A
@@ -6002,8 +11597,8 @@ file) and the decision stays the probe's, judged against a real tree; only
 
 **A settle without an implementer still owes the wave a branch.**
 `integrate_wave` filters only on `status == "complete"`, never on whether
-`leerie/subtasks/<run-id>/<sid>` exists. The post-execution rescue is safe
-because its implementer ran and created the branch (zero commits, a true
+`leerie/subtasks/<run-id>/<sid>` exists. A post-execution settle
+(settled by execution, above) is safe because its implementer ran and created the branch (zero commits, a true
 `git merge --no-ff` no-op). The pre-spawn probe returns *before*
 `_run_implementer`, so no branch exists and `integrate.sh` exits 2 on every
 probe hit. So the pre-spawn path creates the branch itself, at the
@@ -6140,7 +11735,9 @@ mis-wirings:
   context (only when non-empty), mirroring the instruction-adherence gate's
   `prescribed_procedure` injection, so the planner can echo a required
   item's wording into a subtask at birth instead of the omission surfacing
-  only after the fact.
+  only after the fact. The coverage judge is handed the same items,
+  numbered, and cites the `item_index` of a required item no subtask
+  addresses; it stays advisory.
 - **integrator `resolution`** → an independent `integration_judge` that did
   not perform the merge, handed the merged result plus both parent diffs and
   the conflicting subtasks' intents: did the merge actually resolve the
@@ -6150,11 +11747,13 @@ mis-wirings:
   one side's behavior — e.g. a merge that keeps side A's function signature
   but side B's call sites, compiling but breaking at runtime. Gates on a
   non-empty array of
-  concretely-named behavioral defects in the merged result. An integrator
-  cannot always mechanically fix a semantic finding it didn't itself reason
-  through the same way a planner can add a subtask, so this gate is
-  **detect-and-die, single pass**, mirroring `wiring_judge` /
-  `provision_judge`.
+  concretely-named behavioral defects in the merged result. A finding is
+  handed back to the integrator as typed data and the repaired tree is
+  re-judged whole, up to `integration_repair_rounds`; a typed
+  `intent_conflict` (both sides' intents quoted, no merged tree can keep
+  both) or a merge that does not converge backs the subtask out as
+  `unconverged` instead of killing the run (§6 *When integration cannot
+  succeed*).
 
   **Location is not coverage.** A merge that drops a *duplicate* is textually
   indistinguishable from one that drops the only copy — both remove content
@@ -6215,20 +11814,61 @@ ImpossibleBench (ICLR 2026) shows that test visibility is exactly what
 drives special-casing to a test's inputs.
 
 So after the defect-scope audit, an `acceptance_writer` worker — an
-acting worker in a disposable worktree at the **validity base** (the
-tree the report was filed against: the earliest same-task run's starting
-HEAD, else this run's) — writes tests from the report alone. It sees the
-report, the audited `defect_shape` and the report's `inline_examples`;
-it never sees the plan or any code the run will write. It writes several
+acting worker in a disposable checkout at the **validity base**, which is
+the run's **own start** (the HEAD the run started from) — writes tests
+from the report alone. It sees the report, the audited `defect_shape` and
+the report's `inline_examples`; it never sees the plan or any code the run
+will write. It writes several
 independent *sets*, each split into **defect files** (must fail on the
 validity base) and **control files** (correct behaviour that must keep
 passing), driving the behaviour through the module's stable entry points
 rather than internal helpers whose signatures a fix may change. Python
-validates each set mechanically — by exit code, and where the runner can
-write one by its structured report of what ran (below), never by reading
-runner prose: a defect file that
-passes on the validity base cannot discriminate and is dropped; a set
-needs at least one discriminating defect file and every control passing.
+validates each set mechanically, **per case** — from the runner's
+structured report of what ran (below), and by exit code only where the
+runner can write none, never by reading runner prose: a set is valid when
+it has at least one control case, every control case passes, and at least
+one defect case fails; a defect file none of whose cases fails cannot
+discriminate and is dropped. A set with no control cannot show an
+over-broad fix, so it is not valid however its defect cases fail — the rule
+the C1 bench validated with (every one of its 11 own-start-valid sets
+carried passing controls, and ground truth called 9 of the 10 it could
+resolve valid).
+
+**The validity tree is the run's own start, not the report's.** It used
+to be the tree the report was filed against — the earliest same-task
+run's starting HEAD — so a chain's later runs validated against a tree
+the chain had long since changed. Measured (Q6, 6/7 sets of one failing
+cluster): those sets were written at a base where the production probe
+the report concerns did not exist yet, while at the run's own start both
+the probe and the repository's own helper that answers it (imported by
+59 tests) did; the sets then demanded a shape no later tree had. Written
+and validated at own start, a set says what is still wrong *now*, on the
+tree this run will change: a defect the chain already fixed yields no
+failing defect case and so no set. The earliest same-task base is still
+looked up, but only as information: each valid set records
+`report_reproduced` — whether it also fails there — and nothing filters
+on it. Sets from earlier runs are never carried forward or re-validated;
+each run writes its own. The writer's checkout is a clone whose only
+reachable commit is the own start — no branch, tag or run branch — so
+neither a later commit nor an earlier run's fix can steer the tests, and
+everything the writer runs runs on that base tree (fail-open to a plain
+worktree, logged, when the clone cannot be made).
+
+**Written whenever the defect-scope audit ran.** The sets used to be
+written only when the audit said `applicable`. Measured over 152
+historical audits, 18 said `applicable: false`, and on those runs no set
+was ever written — including runs whose task was a real, still-open
+defect (Q5/N1: of 9 such strict-decoding cases labelled *needs*, 8 had a
+false first sample). Ungated (Q7/N1-L), the writer put adjudicated
+right-reason work on 14 of 16 *needs* tasks, and on the not-needed side
+0 of 22 lever-covered sets created false work (CI 0–15); on a task that
+is already done, own-start validity discards the sets by itself, because
+no defect case fails. So every run whose classification triggered the
+audit gets sets, whatever the audit returned — its fail-open
+`{"applicable": false}` included — and a set left failing feeds the
+run-outcome decider (§6 *The run outcome is decided once*) like any other
+unfinished work. When the audit is not applicable the writer's payload
+simply carries no contract and no examples.
 A set carries what its validation ran on: a writer that
 edited an existing file loses the set, and every other new file it left
 (a helper or fixture beside the tests, even one the repo's ignore rules
@@ -6268,7 +11908,16 @@ and vitest — validation asks for one and reads how many tests executed (a
 test whose fixture failed to set up counts as executed: it ran and failed)
 and whether the file loaded — pytest marks a file it could not collect
 with a fixed "collection failure" message, which no report option
-renames.
+renames. The same report carries each case's own status, and that, not
+the exit code, is the verdict: a defect file fails on the base when one
+of its cases failed, and a control passes when none of its cases failed
+— so a coverage threshold or a teardown error that turns the exit code
+red no longer discards a set whose cases all passed, and a failing
+case sitting in an otherwise-passing file still counts. The reports read
+are pytest's JUnit XML, the jest-compatible JSON, rspec's JSON formatter,
+a minitest reporter leerie supplies (a plugin found through `RUBYLIB`,
+writing one record per case), `go test -json` and libtest's JSON events
+(`cargo test`, through `RUSTC_BOOTSTRAP=1`).
 
 Asking means appending report flags to the test command (or, for pytest,
 setting `PYTEST_ADDOPTS`, unless the command names its own JUnit path,
@@ -6354,8 +12003,165 @@ back to the runner's own "ran no test" exits where they exist (pytest's), and
 otherwise to the exit code alone — so on `go test`, a file that ran
 nothing reads as passing: it cannot become a defect file (it does not
 fail on the base), but it can be accepted as a control that proves
-nothing. A majority of
-failing sets triggers **at most two repair rounds**: the conformer is
+nothing. **Every failing validated set is repaired** — not only when a
+majority fails. Under the old majority rule a minority of failing sets
+was shipped as a residual with no repair round at all (G1: a failing
+validated set left unrepaired because the majority passed). A set
+failure is a verdict like a new test failure and is confirmed the same
+way (§9 *Which failures are new*) — with one asymmetry, below: a set file
+that fails on the tree is rerun serially behind the host-pressure gate,
+`confirm_pairs` times (or `confirm_pairs_escalated` after a gate timeout)
+inside `confirm_budget_sec`, and it stays failing only if it failed on
+every rerun that produced a verdict. A rerun the budget cuts short is not
+a run (§9 *Which failures are new*, step 4): when the budget alone stopped
+the vote short and every rerun that finished failed the file, it stays
+failing — a budget cut is never evidence that a failure went away. The
+exception is a file whose first run failed only by timing out or dying of
+a signal: that is a resource signature, not the assertion the file was
+written to make, so with no finished rerun it is unsettled
+(`budget_short_unsettled_files`) — the set is unmeasured unless another
+file fails, never failing on the timeout alone. Measured (review round 6):
+such a file, every rerun cut, was confirmed failing and the run
+`unconverged`.
+Anything else is `resource_affected`,
+and a set whose only failures were resource-affected and touched no held
+case is no evidence either way — so a load flake never forces a repair
+round, nor a residual.
+
+**A held-out set the final tree leaves unmeasured is never silent.** The
+sets exist to show the task's own scenario works; one that ends with no
+verdict on the tree that ships is verification the run did not finish, so it makes the run `unconverged`
+(§6 *The run outcome is decided once*, "`done` rests on measurements that
+ran"; before review round 19 it did not: no evidence was taken as no
+failure). It is always listed under the PR's "Needs human
+verification", one line per set naming its files and why each could not
+be measured, from a fixed vocabulary the evaluation records on the set's
+result (`unmeasured_reason` for the whole set, `unmeasured_files` per
+file): the evaluation could not be set up, the commit or the worktree
+could not be made, the dependency install failed, the files could not be
+placed, a file's path is already used by the tree, the runner gave no
+verdict, a file timed out (or was killed by a signal) on its first run
+and the budget cut every rerun, no rerun produced a verdict, or the
+reruns disagreed. Two whole-gate shapes are listed the same way: valid
+sets with no final verdict at all (the gate raised or never ran), and a
+final verdict of an earlier commit because re-measuring the commit that
+ships measured nothing. A set typed broken, and a variant set of a
+report-pointer task (no counted case), are left out: neither could be
+work. Measured (review round 7, M3): a vote file that only timed out,
+every rerun cut, left its set unmeasured — the run `done` and the PR's
+end-state section empty, the file named nowhere.
+
+*A timeout is not read as failing, even on a file that ran to a verdict
+at the own start* (every valid set file did, by construction). A
+deterministic hang the change introduced looks exactly like this, and
+that reading would end fewer such runs `done`; it is rejected because the
+evidence cannot tell the hang from load. The first run's timeout is one
+observation, recorded the same way as a signal death — the out-of-memory
+kill that is the commonest load signature. A rerun the budget cut is a
+second non-finish only if it was given time the file needed, and the own
+start's duration is not recorded, so a cut after two seconds of a shared
+budget would count the same as one after thirty minutes; any threshold
+would be an unbenched constant. And round 6 measured the failing reading
+directly: a file confirmed failing on a timeout alone sends repair
+rounds at a failure with no case to name and ends the run `unconverged`.
+This is the same trade §9 *Which failures are new* (step 4) makes for a
+base-paired candidate too slow for one pair: unsettled, `done`, named for
+a human. What this rule adds is that the human always sees it, with a
+timeout called out as the hang it may be.
+
+**A held case that fails again is a failure, not a flake.** A set's
+*held* cases are the defect cases validation saw fail at the run's own
+start (`base_failing_cases`; in a set the scope judge bounded, only its
+counted cases). Each failed there by construction, so on the tree under
+test the vote is the wrong question for them: the rerun vote exists to
+tell a load flake from a regression, and a held case failing again for a
+non-resource reason is the reported defect showing, however rarely. So:
+
+1. *No vote for the defect showing.* A held case failing on the tree,
+   whose runner-report message carries no resource signature — a timeout,
+   a worker crash or exit signal, an out-of-memory kill
+   (`_RESOURCE_FAILURE_RE`, the same mechanical match on fixed runner
+   output as §9's intermittent typing) — makes its file failing outright.
+   Only the rest goes to the vote: a held case failing with a resource
+   signature or with no message to read, a failure whose report names no
+   case, a control. A vote rerun that shows a held case failing with no
+   resource signature also settles its file as failing.
+2. *Discovery.* Every set measured with confirmation whose defect files
+   did not end failing — it passed, or the vote typed its failures
+   `resource_affected` — has those files rerun up to
+   `acceptance_intermittent_repeats` (10, never more than 10) more times,
+   serially behind the gate and inside `confirm_budget_sec` counted from
+   when the gate returns, each rerun's timeout what is left of it (§9
+   *Which failures are new*, step 2), stopping at
+   the first rerun that shows a held case failing with no resource
+   signature, which makes the file failing. Discovery always leaves a
+   record on the set's result when it had files to rerun, found or not,
+   with how many rounds ran of how many required and, when it stopped
+   short, why (the budget ran out): "held cases rerun ten times clean"
+   must never read the same as "held cases never rerun". A set whose
+   discovery stopped short is logged `discovery_incomplete` and listed in
+   the PR's advisory section. Discovery the operator turned off
+   (`acceptance_intermittent_repeats` = 0) is recorded `disabled`, not
+   incomplete: nothing stopped short of what was asked, and listing every
+   set with held cases under a deliberate setting was noise (review round
+   5 L4). A record that requires 0 rounds is never read as stopped short,
+   whatever else it says: run state saved before that change carries
+   `incomplete` (reason `repeats_disabled`) for the same setting, and a
+   resumed run finalizing over it would otherwise still list it.
+3. *A held case that failed is never unmeasured.* A set whose held case
+   failed at least once, but only with resource signatures (or none
+   readable), and that neither rule settled, is not "no evidence": it is
+   typed **intermittent** (`intermittent_cases`) and counts as a failing
+   set — the repair rounds and the delivery re-drive take it like any
+   failing set, the gate's residual names it (`residual.intermittent`),
+   and left unresolved it makes the run `unconverged`. A set unmeasured
+   with no held-case failure is not a failing set, but it is not a passing
+   one either: it makes the run `unconverged` as unmeasured (§6 *The run
+   outcome is decided once*), and the gate never logs that the held-out
+   sets pass while any set is unmeasured: it logs how many were.
+
+Measured (barnacle 7cc87f9a, early replay, pass 1): the shipped generator
+drew its one guaranteed special from an alphabet that included `-` and
+`_`, which the report's sites do not count. Two sets' counted case ("every
+sample contains a special other than `-`/`_`", 2000 samples) failed per
+run with p = 0.546; the vote confirmed it only when all four runs failed,
+0.546⁴ = 8.9%. In 45.7% of first passes it was seen failing on an
+`AssertionError`, typed `resource_affected`, the set went unmeasured and
+the gate logged that the held-out sets pass — about 91% of first passes
+shipped the defect with a green verdict, and the chain took three passes.
+Rule 1 catches it whenever the first run fails (54.6%); with discovery's
+ten reruns a set misses it with probability 0.454¹¹ < 0.02%.
+
+The asymmetry is deliberately confined to held cases. Elsewhere a B\*
+verdict has no own-start failure to lean on, and each place keeps its
+symmetric rule:
+
+- *The final ID diff (E3) and the delivery ratchet's execution route
+  (N5's `_ratchet_exec`).* A candidate there passed on the base: it is an
+  expected-to-pass case, and an expected-to-pass case failing now and then
+  is exactly what a pre-existing flaky test looks like, which a few base
+  reruns bound but cannot exclude. So a non-resource intermittent failure
+  stays typed `intermittent_regression` — evidence, not a trigger (§9 *An
+  intermittent failure the run introduced is evidence*). What these routes
+  must not do is go silent: the ratchet records the execution-shaped items
+  it could not check (`exec_unchecked`) when its ID diff measured nothing,
+  rather than keeping the round as if they had held.
+- *The delivery re-drive (B2's `_redrive_verdict`).* Its set verdicts come
+  from the same evaluation, so rules 1–3 reach it unchanged; a set with no
+  verdict keeps its earlier one (`_redrive_carry`), never a pass.
+- *The falsifier's confirm.* A probe is written against the final tree and
+  never failed at an own start; an unconfirmed probe leaves the item at the
+  judge's verdict and is recorded in the sample's gates. It stays a vote:
+  a probe that fails one run in four may be the probe's own nondeterminism,
+  and a confirmed probe drives a re-drive.
+
+A failing
+set triggers **at most two repair rounds**: the conformer is
+given the task text and its typed required items, with each item's
+classifier-typed parts verbatim — neither is held-out data, and a round
+shown neither repairs blind: in the replayed barnacle 7cc87f9a pass 1 both
+rounds, never told that the task forbade defensive code, guessed that the
+hidden tests stub the crypto source and added a fallback for it — and is
 told which declared cases failed and the defect contract — cases whose
 file was SEEN failing to load against the unfixed tree (declared an
 import defect by the writer and confirmed by the runner's report) listed
@@ -6365,7 +12171,11 @@ failure — never the
 runner output or the test source, because a conformer shown the failing
 output special-cased it (one shown runner output patched the visible
 redirect parameter; failing names plus the contract got 2/4 page fixes
-at the root against 1/4). When four or more sets are valid, the two
+at the root against 1/4). The repair note stays **names-only** even when
+richer evidence is at hand: measured as P1, the held-back sets of 9
+repairs passed 7 times when the note named the failing cases and only 4
+when it also carried the failure evidence — the evidence taught the
+repair the shown cases, not the defect. When four or more sets are valid, the two
 highest-indexed are never shown at all; every round is re-judged on all
 sets, so a fix fitted to the shown names still fails the hidden ones.
 When only hidden sets fail, the round is told exactly that — every failing
@@ -6385,16 +12195,82 @@ a round left. With
 fewer valid sets every failing set is shown and nothing is held back — a
 weaker check, logged as such, and the repair is not told of hidden tests
 that do not exist. A set whose files could not all be run (a
-missing runner, a path the target tree already uses) is no evidence either
-way: it is left out of the vote rather than counted as passing, and when
-no set can be run the gate records no evidence instead of a pass. A tie is
-not a passing majority. Repair rounds run the conformer at **high
+missing runner, a path the target tree already uses) and none of whose
+run files was confirmed failing is no evidence either way: it is left out
+of the vote rather than counted as passing (a confirmed failing file
+still makes it failing), and when
+no set can be run the gate records no evidence instead of a pass. Repair rounds run the conformer at **high
 effort**, regardless of the operator's `--effort`/`--effort-conformer`
 settings — the rounds exist only on failing runs, and effort is the
 measured lever: on the multi-mechanism generate report the low-effort
 pinned conformer fixed the contract from HEAD 1/2 times, medium 2/3,
 high every time it finished (6/6) — effort, not turn budget, was the
 lever, and only failing runs pay for it.
+
+**Nothing a held-out evaluation produces reaches a fixer but its verdict
+and leerie's own identifiers.** (I3, its relay half: the rule above keeps
+a set out of a fixer's tree, this one keeps what the set yields out of a
+fixer's input.) What may leave an evaluation of a held-out set for any
+worker's input — a prompt, a file a worker reads, a record a judge cites
+and a fixer then reads in the judge's evidence — is the set's index, its
+verdict (passed, failed, unmeasured), and, for a set a repair round is
+shown, the paths and case names its writer declared. Never runner output:
+the code under evaluation is a worker's, so whatever the runner prints is
+chosen by it, and an assertion diff prints the test's expected values.
+Runner output is read in code only, for its resource signature
+(`_RESOURCE_FAILURE_RE`, a fixed runner string). Never a held-back set's
+paths or names either, except in the delivery re-drive's one held-back
+round (*Delivery re-drive* rule 6). The audit for this rule found four
+relays, each closed where it relayed:
+
+- *The next run's planner.* The residual handed to the next same-task
+  run named the failing cases of every set, held-back ones included. The
+  previous run's sets never run again, but the next run's writer writes
+  its own from the same report and the same prompt, so those names
+  describe its held-back tests, and the planner's words reach its
+  implementers — the reason the no-work dispute already took names from
+  shown sets only (*No work is declared on executed evidence*). The residual names the shown sets' cases and
+  counts the failing held-back sets apart (`held_back_failing_sets`), and
+  a residual recorded before this rule is re-derived when it is read.
+- *The delivery judge's record.* `_orchestrator_results_digest` named
+  every failing set's files and cases. The judge's evidence reaches the
+  final conformer, the re-drive's implementers and the next run's
+  planner, so a held-back set's line gives its verdict only.
+- *The logs the record reads.* The record took every `logs/*.log` for a
+  worker's transcript: the acceptance writer's included, whose runs of
+  its own tests carry their output, and leerie's runs of set files, whose
+  output the evaluated code writes — a printed line shaped like a tool
+  call is read as one. Every log of the held-out side is now written under
+  `logs/held-out/` (`HELD_OUT_LOGS_DIRNAME`): leerie's runs of set files
+  and of falsifier probes, and, in its `transcripts/`, the transcripts of
+  the workers that read a set or run one (`HELD_OUT_LOG_WORKERS`: the
+  acceptance writer, the set auditor, the scope judge and the falsifier,
+  whose leads are every valid set). Nothing that builds a worker's input
+  reads that directory.
+- *The falsifier's evidence.* A confirmed sample put its probe's case
+  title and its own prose into `unmet_final`, which the re-drive's
+  implementers read; both come from a worker that read the held-back
+  sets. The evidence is now the span of the item the probe tests, which
+  code checks is verbatim in the item, and the fact that it fails under
+  B\*.
+- *The caches* (review round 21 R2). Every worker's processes wrote one
+  cache set per run, `<run-dir>/workers/cache/` (`XDG_CACHE_HOME`,
+  `GOCACHE`, `CARGO_HOME`, …), the held-out side's included, so whatever
+  a held-out-side worker's processes left there a later fixer read: `go
+  test` alone keeps a run's compiled test package, string constants
+  included, in `GOCACHE`, and the falsifier runs the final commit's own
+  harness — a fixer's code — with the probe on disk. The rule is over
+  every store a held-out-side worker can write, not only what it returns:
+  that side (`HELD_OUT_LOG_WORKERS`) has a cache set of its own,
+  `<run-dir>/workers/cache-held-out/`, granted to it in place of the
+  fixers' and named by no fixer's grant (`_worker_cache_dir`; the
+  environment follows the grant, `_granted_cache_dir`). Its cost is one
+  cold set per run for that side.
+
+Workers on the held-out side — the writer, the set auditor, the scope
+judge, the surrogate fixer's witness run — read set source or runner
+output by design; what they return feeds only the held-out side (a
+rewrite of the set, which cases count) or a typed verdict code reads.
 
 **Non-blocking, with a mechanical safety net.** Held-out tests can be
 wrong: on a report that states no expected behaviour (a diagnostic
@@ -6404,9 +12280,21 @@ never blocks the PR; it is recorded and handed to the next same-task
 run's planner (`prior_delivery_residual`), where a full plan-and-
 implement cycle settled the generate residual 2/3 times. And a repair
 round must not trade the report for a regression: if the repo's test
-axis goes from passing to failing across the repair rounds, their
-commits are reset away and the residual is recorded instead — likewise
-if the repair turned measurable held-out sets unmeasurable (a broken
+axis goes from passing to failing across the repair rounds, and the
+failure is confirmed, their commits are reset away and the residual is
+recorded instead. Confirmed means what it means everywhere else (§9
+*Which failures are new*): the IDs failing on the repaired tree are
+confirmed under B\* against the pre-repair tree, which passed, and only a
+confirmed new failure resets; when the red run produced no per-test report
+at all (the suite could not run — a broken import or build), the axis is
+run once more, unmemoised, and a second red resets; a confirmation that
+itself fails falls back to the red run. Unconfirmed, one red
+run of one flaky test reset every round's work, the fixes included. The
+per-round ratchet does not make this rule redundant: it is the same B\*
+check per round, but it is blind exactly where the suite stops reporting
+(no IDs on one side is no verdict), and a ratchet that raises keeps its
+round; this rule, over the whole repair, is the net under both. The
+commits are likewise reset if the repair turned measurable held-out sets unmeasurable (a broken
 dependency manifest, which the staging test axis, installed long before,
 would not notice) — but only after the repaired tree is measured once
 more and the pre-repair tree measures where it does not, since every
@@ -6430,6 +12318,371 @@ the verdict would read the already-repaired tree and skip it. Measured
 on the finished task with wrong held-out tests: the repair conformer
 changed code in 3/3 trials, but 0 of the task's 247 regression tests
 and 0 attributable scraper tests (of 1,605) regressed.
+
+**A repair round that fixes nothing, or makes the verdict worse, is rolled
+back.** Each round is also
+judged on its own, against the verdict before it: a round that committed
+and fixed **none** of the failing held-out cases — counted per case where
+the runner's report names them, over the sets measured on both sides,
+variant sets included since the rounds repair them too — is reset to that
+round's own start (recorded before its worker runs), whatever the test
+axis says. So is a round that made any held-out case that passed before it
+fail — in a set that was already failing or in one that passed — by the
+same per-case count as the delivery re-drive's rule 4 (*Delivery
+re-drive*). Without it a round that fixed one case of a failing set and
+broke a passing set kept its commits: the held-out verdict got strictly
+worse and the round stood. A blind change that measurably fixes nothing is speculative by
+construction. In the replayed barnacle 7cc87f9a pass 1 both repair rounds
+left every failing set failing, and each added code the task forbade (the
+second a defensive `Math.random` fallback); both shipped, because the only
+rollback rules were a test axis turning red (the axis was not even
+measured) and sets turning unmeasurable. The decision is on disk before
+the reset, so a resume finishes it; a rolled-back round's verdict never
+describes the tree again, and the next round starts from the tree before
+it. A failed reset is recorded and stops the rounds, like the gate's own.
+The price: when every set still failing is one no correct fix can pass (a
+set the audit below would type broken), a correct repair fixes no case and
+is reset too. With several valid sets a correct fix shows up as progress on
+the sound ones; the set audit and rewrite after the rounds then deal with
+the broken one, and its residual reaches the next run.
+
+**A repair that regresses met work is rolled back (the delivery ratchet).**
+A repair writer runs after the judges that verified the run's required
+items. A round that fixes a failing case can still undo an item that was
+met before it: drop a guard, hedge a path the task said to fix at the root,
+delete a test. Nothing judged that tree again. In the replayed barnacle
+7cc87f9a pass 1 the only delivery judge ran before either repair round, and
+a re-drive group's commits were re-judged only for the items it was sent to
+fix. So after **every** acceptance-repair round and every delivery
+re-drive group that commits and survives its own rules, the items the latest
+delivery verdict holds met are verified again, on the tree after it, by
+route:
+
+- An item that only says paths stay untouched is settled in code, as
+  everywhere else.
+- An item the coverage classifier typed `execution` / `check:
+  test_id_diff` is `execution` here without asking; a judge part typed
+  `test_outcome` is dropped from the ratchet judge's verdict, as at final.
+- A verifiability classifier types every other item, once per run, by its
+  own text: `in_tree` (a reader of the repository can cite whether it holds)
+  or `execution` (only running something shows it: "no regressions", "the
+  suite passes"). An `execution` item is never judged by reading. It is
+  flagged when the repair's failing-test-ID diff confirms a new failure
+  under B\* (§9 *Which failures are new*). The test axis therefore always
+  runs after a repair: its start is measured before the worker, its tree
+  after it. A command the task forbids is replaced by the scoped run of the
+  coupled tests, as at final. The tests that import a file the repair
+  changed are rerun first, as at final, so an intermittent regression the
+  repair introduced is found and typed. Like the final one, it is evidence,
+  not a trigger: it goes to the ratchet's judge and to the PR.
+- An `in_tree` item goes to the delivery judge. Its input is the item, the
+  evidence it was verified on and the repair's diff. Each verdict also types
+  `evidence_files`, the files it relies on. One sample runs. Two more run
+  only when it marks an item unmet, or when an item's evidence files meet
+  the files the diff changed. An item in that set is confirmed regressed on
+  2 of 3 unmet votes.
+
+A confirmed regressed item, or a test confirmed newly failing, resets the
+repair to its own start, using the sha recorded for that round or group.
+In a re-drive, the regressed item then goes to the next groups as a
+`control_regression` note. A kept repair's verdicts become the prior
+evidence of the next one.
+
+Measured (bench Q4 N5, frozen design): 49 natural repair rounds and
+cross-run pairs, 517 met items re-verified. 2 runs false-alarmed (4.1%,
+Wilson 95% 1.1–13.7%), on 2 of the 517 items. One was a defect already
+present before the change; the other was an execution-shaped item typed
+`in_tree`. The judge confirmed 2 real regressions and the execution route
+2 more. On 17 freshly generated repair rounds, scored against a
+ground truth by execution, the ratchet caught all 3 rounds that regressed
+an item and raised nothing on the other 14. The judge confirmed 5 of their
+7 regressed items. The execution route caught the third round, whose 2 items
+only a test showed.
+
+**A set that keeps failing is audited, and rewritten once.** A held-out
+set can be wrong in ways validity at the own start cannot see: it fails
+there for the reported reason, and then fails every correct fix too,
+because it was built on how the code happens to work rather than on what
+the report asks for. Measured on Q6's 58 own-start-valid sets: 33 still
+failed on a tree where the run's original sets passed, and a blind
+second labeller (hand-checked where it disagreed) found 19 of those 33
+were sets no correct fix could pass. Leaving such a set as a residual sends
+the next run after a contract the set itself got wrong. So after the
+repair rounds, each measured set that still fails goes through three
+triggers, in order, and **any trigger leads to exactly one rewrite at the
+run's own start** (`acceptance_rewrite_rounds`, a per-set counter); no
+trigger ever drops a case, a set or a residual on its own:
+
+- **Mechanical checks M1 and M2**, on code identifiers only (Q6/R5): M1,
+  a set file reads a recorded mock call by position (`.mock.calls[0]`,
+  `toHaveBeenNthCalledWith`), so it depends on which calls the test's own
+  setup or the implementation makes; M2, a set file imports a named symbol
+  from a production module that no other production module uses at the
+  own start, an internal helper whose place a fix may change. Measured on
+  the 58 fresh sets before the rule was frozen, M1 flagged a set later
+  labelled broken 3 times of 9 and M2 8 of 16 — too imprecise to type a
+  set broken, enough to buy one rewrite, whose harm was then measured:
+  on the 6 fairly-failing sets M1/M2 trigger, every rewrite was valid at
+  the own start and still failed the run's tree (Q6/R6, first sample) —
+  the real gap stayed caught.
+- **The c+ set audit**: a judgment worker, `set_auditor`, reads the set
+  staged in a fresh worktree of the integrated tree, the report, the
+  audited contract and every failing case with its runner failure message,
+  and types each failing case `implementation_gap` (the default) or
+  `set_defect` with a `defect_kind` (`harness_unreachable`, `coupling`,
+  `contradicts_task`, `overspecified_mechanism`, `environment`,
+  `test_bug`). Its payload carries a REPOSITORY TEST HARNESS section built
+  by code from the import graph and `git log`: the newest existing tests
+  that drive the production modules the set imports, the test-helper
+  modules they import with their exported names, and the five newest as
+  exemplars. Its rule for them: a set fake that does not answer a request
+  production makes on this tree — so production takes an error or
+  fallback path before reaching the reported behaviour — is `coupling`.
+  Every typed `set_defect` must quote the set file (`test_quote`) and, by
+  kind, the production line, the task or the failure message; code checks
+  each quote is a verbatim substring of the file it names, and a case
+  whose quotes do not check counts as `implementation_gap`. The audit is
+  run `set_audit_samples` (3) times independently and the union of the
+  counted cases is the verdict — one sample is unstable (Q6 R2: one set
+  typed 9/9 cases broken in one run and 0/9 on the re-run). On the 33
+  labelled sets (Q6 R3, the first three runs per set) one sample flagged
+  13, all correctly, but found only 13 of the 19 broken sets; the union of
+  three flagged 18, 16 of them correctly (recall 16/19). The writers
+  almost never use the repository's own test helpers (S1: 4 of 44 writes
+  imported one); the harness section is how the audit sees what they
+  should have used.
+
+  *Identical assertions get one verdict.* Every still-failing set is
+  audited before any audit is acted on. Code then reconciles the verdicts
+  across sets. It matches failing cases mechanically by their **assertion
+  key**: the normalised `expect(...)` / `assert` statements of the case's
+  own test block in the set file (located by its title or function name),
+  plus its **target**, the repository modules that set file imports. When
+  one key is typed `set_defect` in one place and `implementation_gap` in
+  another, the verdict that keeps the case wins (`implementation_gap`).
+  The `set_defect` finding is withdrawn from its set, so it no longer
+  triggers a rewrite or marks the set broken, and the conflict is recorded.
+  A set rewritten later is re-audited against the other sets' recorded
+  verdicts in the same way. Measured (barnacle 7cc87f9a, pass 1): two sets
+  held the identical assertion `expect(samples().filter((p) =>
+  /[\s$]/.test(p))).toEqual([])` against `src/lib/random.ts`. Set 1's audit
+  typed it `contradicts_task` in 3 of 3 samples and the rewrite removed
+  it, while set 5's audit typed it `implementation_gap` in 3 of 3. The
+  rewrite removed the only signal the repair loop could see (set 5 was
+  held back), and the run ended `unconverged` on set 5. Case titles differ
+  between sets ("dollar signs" vs "template interpolation characters"),
+  so the titles are not the key; the assertion and its target are.
+- **The surrogate witness**, only when neither of the above fired: one
+  independent `surrogate_fixer` per gate fixes the report in a ref-less
+  clone of the own start (the writer's checkout) without ever seeing a set
+  — its `Read` denies cover them as they cover the fixers — and each
+  remaining failing set is run on its tree, confirmed under B*. A set that
+  still fails on an independent fix is a trigger and nothing more: the
+  surrogate is one fix, not the contract, so a failure there never drops a
+  case, never types a set broken and never stops the residual. The set is
+  then audited on the surrogate's tree, and its typed cases (if any) go
+  into the note. Q6/R7 ran the witness on 11 failing sets: all 6
+  broken ones failed on the independent fix (both held-out sets the other
+  triggers missed among them), and so did 4 of the 5 sets that were
+  failing fairly — which is why a surrogate failure buys a rewrite, whose
+  no-harm R6 measured, and nothing else.
+
+The rewrite is the `acceptance_writer` again, at the own start, in the
+same ref-less clone, with its original payload, its set's files put back
+where it wrote them, and a typed note: every trigger that fired with its
+evidence (the counted cases and their quotes, the M1 lines, the M2 symbol
+and module, the cases failing on the independent fix), and the closing
+instruction benched for each kind — check the report's contract through
+the public entry point, model the world the code talks to rather than the
+implementation's private protocol, keep cases the note does not name. It
+is validated exactly like a first write. Two guards keep a bad rewrite
+from costing the set: **a rewrite that declares no defect file is asked
+once more with the identical prompt** (Q6/R8: of the 5 surrogate-triggered
+rewrites, 2 came back with no defect file; one retry recovered one of
+them), **and the original set is kept whenever the rewrite is not valid**
+(no defect file after the retry, none failing at the own start, a failing
+control, an edited tracked file). A replaced set is judged again on the
+same integrated tree, under B*. A set still failing after its rewrite is
+audited once more; **a set the audit still types broken after its rewrite
+is marked `broken: true`** — so is a set the audit typed broken whose
+rewrite was not kept. A broken set is not chased again: no further
+rewrite, it does not count as unfinished work in the run outcome (§6 *The
+run outcome is decided once*), and it is kept out of the next run's
+residual (below). Only the audit types a set broken; M1/M2 and the
+surrogate are triggers only.
+
+**The writer gets one more try when nothing fails at the own start.**
+When every declared defect file ran and passed on the own start — the set
+cannot discriminate as written — the writer is asked once more in the
+same checkout, its files still there, with the runner's per-case result
+for its defect files: rewrite them to fail for the reported reason if the
+defect still reproduces here, or say in `notes` that it does not and
+return the files unchanged (C1's writer, Fix A.3). Still nothing failing
+discards the set, as before; a done task still yields no sets. The note
+carries only what the runner reported of the writer's own tests.
+
+**Prisma repositories get a real database.** On a repository whose
+schema lives in Prisma (a tracked `schema.prisma` whose nearest
+`package.json` declares `prisma` or `@prisma/client`, with a PostgreSQL
+datasource — read mechanically), a writer working from fakes hand-rolls
+the persistence layer, and a hand-rolled fake that does not answer a query
+a correct fix makes fails that fix (the `coupling` kind above; 10 of Q6's
+broken sets were on such a repository). So the writer, the rewrite and
+every set run use the repository's real Prisma client against a throwaway
+database. Each command that needs one — a set run, the writer's session
+in its checkout, an evaluation, the audit, the surrogate's clone, a
+delivery-detection falsifier's (§8 *Delivery detection*), a CI-parity
+check that `require`s a database (§9 *The repository's own merge checks
+run too*) — gets a private PostgreSQL cluster of its own, from the server
+binaries the image provides (the repository's own provisioning installs
+them), started inside that command's own confinement and isolation and
+gone with it, listening only on a socket in that command's own `/tmp`,
+with a database named `leerie_<hash>_test` and the tree's schema pushed by
+`prisma db push` inside the same confinement: the push loads the tree's
+`prisma.config.ts`, which a worker wrote, and the cluster the orchestrator
+used to start unconfined ran any query's `COPY … TO PROGRAM` outside every
+grant (§6 *No database server leerie starts is ever unconfined*). A falsifier and a CI check are the same case as a set run: a
+probe or a database-backed check that runs against no database fails for
+the missing database, not the defect, so without one the falsifier could
+not demonstrate a persistence-layer item and every database-backed CI
+check went red at the baseline and dropped out of the gate. A falsifier
+lane is reset between samples, and its database is a new one per
+command, so one sample's rows never reach the next; the confirm checkout
+the probe is re-run in has its own. A CI check's prerequisites that would
+themselves push to or reset a database (matched by the same rule list the
+worker deny reads) are not run: the push `scripts/sandbox-db.sh` makes
+inside the command's own confinement is the only push. The set runs still
+go through the repository's own test command; a test-database wrapper
+script there (one that starts its own cluster when DATABASE_URL is unset)
+defers to the database it is handed. **Before every command that pushes,
+code checks the target the wrapper will push to**: a postgres URL whose host is the command's own socket directory
+in its `/tmp`, a database name starting `leerie_` and ending `_test`, and
+DIRECT_URL equal to DATABASE_URL (Prisma configs commonly push to
+`DIRECT_URL ?? DATABASE_URL`); anything else is refused. Prisma's AI-agent
+consent variable is set on that push subprocess alone — never in a
+worker's environment, which is scrubbed of it — and the user's consent
+covers exactly this: pushes to throwaway test databases. The writer's
+payload gets a REAL DATABASE section (the client module, the five newest
+database-backed tests that import it unmocked, the helpers they import:
+all from the import graph), and a set file that mocks the client module
+earns one fix-up call (Q6/R4). **The section is a promise, so it follows a
+database that is there, never the repository's shape.** Before composing
+it, code runs the wrapper once in the writer's checkout, confined as a
+measurement, over a check that the command was handed the URL the wrapper
+composes (`_test_db_present`): the section is added only when that check
+passes. The writer's own session then requires its database the same way
+— the check runs between the wrapper and the worker, and the worker
+never starts without it — so the prompt never names a database its
+session lacks. It used to be added for any Prisma/PostgreSQL repository
+whose URL leerie accepts, while the wrapper falls back to running the
+command without a database whenever a step fails: the writer was told to
+build unmocked tests on a database that did not exist, they failed on the
+base for want of one, and read as discriminating defect files (review
+round 21, execution L2, measured with `DATABASE_URL` empty). Every worker in such a repository carries
+Bash deny rules for the commands that push to or reset a database
+(`prisma db push`, `prisma migrate reset`, `prisma migrate dev`, the
+package scripts that run them, and setting the consent variable), paired
+with an orchestrator notice, as the whole-suite deny is (#292: deny alone
+ended 2/2 replayed workers `blocked`). Without server binaries, as root,
+or when a step fails, the sets run as before, without a database, logged
+once. Q6/R4 measured 0 database-path errors across the 22 database
+rewrites and their evaluations.
+
+**A set typed broken is not handed on.** The residual records which sets
+still failed, by index. A set the set audit types `broken` after its rewrite
+(its `broken` field — a test no correct fix could pass) is left out of the next run's `prior_delivery_residual`: the next
+planner is not sent after a contract the set itself got wrong. The filter
+is applied when the residual is read, so a set typed after its run
+finished is excluded all the same.
+
+**A task that points at a report is bounded by the report's own
+scenarios.** A writer told to break the fix writes variants — a later
+retry, the last step instead of a middle one, a delay outside the range
+the report states — and every variant left failing used to be unfinished
+work, so a chain re-ran until the variants ran out. The user's rule (option
+a): a report-pointer task — one naming a report file the repository does
+not track (`_d1_report_sources`) — is finished once the report's own
+scenarios pass. An independent `scope_judge` reads, per defect file with a
+case failing at the own start, the task, the report, the test source and
+each case's own-start outcome, and reports typed facts only: the numeric
+ranges the report states (`{param, min, max, unit, span_quote}`) and, per
+case, its `origin` (`report_example`, `report_regression_test`,
+`report_symptom` or `other_scenario`), the values it sets for those ranges
+and the report passage it comes from. Code decides: a case **counts** when
+it failed at the own start, its origin is not `other_scenario`, every value
+it sets lies inside its range (milliseconds and seconds compared in one
+unit; overlapping verified ranges for one unit merge), and its
+`span_quote` — like every range's — is a substring of the task or report
+after NFC and whitespace normalisation. A set with no counted case is a
+**variant set**: it is still repaired in the same pass, but it never
+creates a run — the no-work settle, the already-fixed check, the
+satisfied-probe protection, the delivery re-drive and the run outcome read
+only failing cases that are counted ones, and the next run's residual
+leaves variant sets out like broken ones. The decision is **per case, not
+per file**: the evaluation asks the runner for the same structured report
+validation reads and records which cases of each failing file failed, so a
+variant case left failing in a file whose counted case now passes is not
+work. Decided per file, it was: in a replayed run (barnacle 7cc87f9a, pass
+1) the scope judge typed the one case still failing `other_scenario`, but
+its file also held a counted case — passing by then — and the run ended
+`unconverged` on a variant. A file whose run produced no readable report
+still counts as a whole. A judge that fails leaves the set unbounded (every
+failing file counts, as before). A set whose defect cases all pass at the
+own start even after the writer's one retry is recorded with the reason
+`fixed_on_head_by_execution` — assigned by code from the runner's
+per-case report, never by a worker. Benched as P2 (v3b, frozen; 15 sets
+from the C1/D1 corpora, three samples each, every failing case hand-labelled
+under option a): 242 of 246 in-scope failing cases counted and 102 of 102
+out-of-scope ones dropped; per set-sample, 15 of 15 with an in-scope case
+kept and 30 of 30 without one dropped; and the late runs of the two replayed
+chains (12 and 4) all converged, in every sample.
+
+**Scoped runners for every runner leerie can read.** A set runs only
+through a scoped test template — the canonical command over the set's own
+files, in the runner's direct form (`vitest run`, `jest --runTestsByPath`,
+never the impact-analysis form; §9 *Operands that are already test files
+take the runner's direct form*) — so a repo with no template got no sets
+at all, silently. The
+template is inferred, when the repo declares none, from a canonical test
+command that is a bare runner invocation (only options after the runner,
+read from its argv, never from prose): `pytest` (also `python -m pytest`
+under any `python<version>`, and behind an environment wrapper — `uv
+run`, `poetry run`, `pipenv run`, `pdm run`, `rye run`, `hatch run`, with
+the wrapper's own options — which the template keeps; its path positionals,
+such as `pytest -q tests`, are replaced by the set's files rather than
+disqualifying it, while a node id, a selecting option such as `-k`/`-m`/
+`--lf`, or a word after a long option leerie cannot tell is a flag still
+does; which pytest options take a value is one table derived from real
+pytest 9's parser with its common plugins, not written by hand — a
+hand-written one listed the flag `--cov-branch` as value-taking, so
+`pytest --cov=src --cov-branch tests` kept `tests` as the option's
+"value" and ran the whole suite beside every set; and a suite-level
+threshold is dropped from it, because a set is judged by exit code and
+one file of tests is below any threshold set for the whole suite —
+`--cov-fail-under` and `--max-warnings`, the junit report options whose
+file nobody reads, and, when the command shows pytest-cov is installed
+(any `--cov` option), every coverage option, replaced by `--no-cov`,
+which also disables a `fail_under` the coverage config sets. Measured
+with pytest 9.2 and pytest-cov 7.1: `--cov=src --cov-fail-under=90` over
+one passing file exits 1 with every case passing, as does `--cov=src`
+under a `.coveragerc` `fail_under = 90`, and `--no-cov` over the same
+file exits 0. A threshold reached only through the repo's own `addopts`
+is not seen — the command does not say pytest-cov is there, so
+`--no-cov` could be an unknown option), `rspec` (also `bundle exec rspec`, `bin/rspec`) and
+minitest's `rails test` take `{test_files}` as written; `rake test`, which
+takes one path, becomes a `ruby -Itest -Ilib` loader over `{test_files}`;
+`go test` takes the test files' packages (`{test_packages}`, with a
+`-run` selector naming the set's own test functions, read from the Go
+source, so a package's existing tests stay out of the set's verdict); and
+`cargo test` takes `--test <name>` per integration-test file
+(`{test_targets}`, `--no-fail-fast`). Benched as C9 on one fixture per
+runner (pytest, rspec, minitest through the loader and `bin/rails test`,
+go, cargo): every derived command ran exactly the set's files and the
+per-case report gave the expected verdict, 6/6, and the minitest pair
+matched on the rootful runtime. When no scoped runner applies — `npm test`,
+`make test`, a runner invocation with its own selectors, a cargo file that
+is not an integration test — the skip is typed (`no_scoped_runner`, with
+the command) and logged as a warning, never silent.
 
 **Hidden from the fixers.** The sets live under the run's state root,
 and implementers and conformers carry `Read` denies on that directory
@@ -6579,24 +12832,26 @@ case for each is the re-drive round then the blocked terminal,
 adjudicated by the operator via `accept-blocked`. A miss first re-drives
 the implementer through the existing mechanical-check feedback loop —
 forgetting to run a declared command is exactly the "retryable mistake"
-shape that loop exists for — and when the confidence-retry budget
-exhausts with the command still unexecuted the
-subtask settles **`blocked`**, naming the command, feeding the existing
-`accept-blocked` escape hatch. That
-terminal is deliberate: a command that cannot run in-container (a live
-site, credentials, an absent fixture) is precisely the
-external-precondition case `accept-blocked` exists to adjudicate, and the
-one thing the run must never do is what it measurably did — settle
-`complete` on a verification it *silently* skipped. One path deliberately
-does not block: a result rescued from `empty_handoff` (§6 *Detecting
-memory OOM* — the worker was reaped mid-turn with
-committed work). Blocking there would strand the very commits the rescue
-exists to keep: `accept-blocked` marks the sid complete, resume then
-excludes it from the remaining set, and integration — which reads
-results, not branches — never merges it. So the rescue settles complete
-with the unrun-command warning logged loudly and persisted to state
-(`declared_unrun_warnings`), which is what keeps the skip visible in the
-run record: not silent, and not stranded. The check binds only
+shape that loop exists for. When the confidence-retry budget exhausts
+with the command still unexecuted, and the subtask has its own commits or
+is verification-only, the orchestrator runs the subtask's typed `verify`
+argvs itself (§8 *Settled by execution*): a pass settles the claim on the
+orchestrator's own execution, not the worker's word. Otherwise — no
+`verify` argv, a failing execution, or neither commits nor
+verification-only — the subtask settles **`blocked`**, naming the
+command, and the wave-end re-drive takes it from the shared budget (§13),
+ending `unconverged` when that is spent. The one thing the run must never
+do is what it measurably did — settle `complete` on a verification it
+*silently* skipped. A result rescued from `empty_handoff` (§6 *Detecting
+memory OOM* — the worker was reaped mid-turn with committed work) used to
+settle complete with only a warning, because blocking it stranded its
+commits behind `accept-blocked`. It has commits by construction, so it is
+now settled the same way: a passing execution settles it complete; an
+unsettled one is re-driven as a continuation, which keeps the branch and
+its commits, and a spent budget ends it `unconverged` — reported, never
+silently merged as done. The warning record that rescue wrote
+(`declared_unrun_warnings`) is therefore no longer written; finalize still
+surfaces one a run recorded before this change. The check binds only
 where the field is populated (under 5% of subtasks), but
 `_repair_prescribed_commands` above makes prescribed commands
 always-declared, so the two halves together close the loop: plan-level
@@ -6620,6 +12875,13 @@ parsing over one mechanism, and the source of a real freeze incident
 backtick+MUST convention headings cannot appear verbatim in a subtask by
 construction). It is deleted; `task_coverage_judge` reads the referenced
 files itself and judges substance rather than string overlap.
+
+The classifier is the one worker handed a referenced file's text: a
+markdown report the task names that is not tracked at HEAD is inlined,
+cut at its headings, so requirement coverage (§8) can anchor items on
+its sections. That cut assigns IDs only (§12 *Delimiter-only cutting is
+not the deleted heading harvest*); the planner's section above stays a
+list of paths.
 
 ### Multi-sample planning
 
@@ -6793,19 +13055,35 @@ Two further disciplines sit at the §12 axis:
   1. **A `risk_register` in run state.** `_collect_subtask_risks` folds the
      already-typed tier (`production_evidence.exercised == false`, from the
      implementer and the conformer) together with an explicit typed
-     `self_reported_risks` field on the implementer result (kind enum +
-     one-line detail), keyed by subtask, set and cleared on the same
-     settle path as `symptom_findings`. (Measured across 2,627 implementer
-     calls on three repos: the `exercised: false` tier fires on 3.2% of
-     results; on the motivating run — a fourth, separate corpus — it
-     flagged exactly the defect-bearing subtasks. A low-noise,
-     high-recall signal.)
-  2. **A Python-appended PR section.** The register renders into the PR
-     body as a `## ⚠ Residual risks` section appended by code on every
-     composition path — LLM-written, deterministic fallback, and the
-     launcher's bash fallback alike — so the reviewer sees the worker's own
-     caveats verbatim. The `pr_writer` worker never owns this section: an
-     LLM composer can summarize a caveat away; an append cannot.
+     `self_reported_risks` field on the implementer result, keyed by
+     subtask, set and cleared on the same settle path as
+     `symptom_findings`. (Measured across 2,627 implementer calls on three
+     repos: the `exercised: false` tier fires on 3.2% of results; on the
+     motivating run — a fourth, separate corpus — it flagged exactly the
+     defect-bearing subtasks. A low-noise, high-recall signal.) Each typed
+     entry says what is missing, where, and what would settle it, so code
+     can route it: `gap` — `test_missing` (changed production code no test
+     exercises), `test_weak` (a test exists but does not assert the
+     change), `unverified_external` (depends on something outside the
+     repository's own checks: a live service, real database, cloud
+     resource, real device), or `none` (informational); `where_paths` —
+     exact repository paths, which code keeps only when each is a file in
+     the subtask's worktree; `settle_by` — `test`, `typecheck`, `install`
+     or `build`; an optional `resource` naming what a human must supply,
+     and `simulated_interleaving` for a race whose tests can only stub the
+     interleaving. A note about the worker's own process ("typecheck was
+     not run") is kind `process_note` and never enters the register: the
+     orchestrator runs its own checks. (Bench Q7/G v5: of the 9 frozen
+     late-chain subtasks, 8 of 9 first emissions carried only a
+     process note.) The `exercised: false` tier is typed
+     `unverified_external` — the worker could not exercise the path here.
+  2. **Routed by type, never dumped.** `gap: unverified_external` reaches
+     the PR's "Needs human verification" list (§6 *Finalization*);
+     `test_missing` / `test_weak` feed the coverage re-drive below (*Changed
+     lines no test executes are re-driven*); `none` and every entry the
+     conformer cleared stay in `state.json` only. The PR section is code's,
+     not the `pr_writer`'s: an LLM composer can summarize a caveat away; an
+     append cannot.
   3. **Conformer challenge items, answered through a typed disposition.**
      The implementer's disclosed risks are injected into its conformer's
      context, and the conformer must answer each through a positional
@@ -6828,7 +13106,9 @@ Two further disciplines sit at the §12 axis:
      (`conformer_repair_rolled_back`) and never counts when the PR will
      not contain it or it cannot be trusted: the conformance phase's
      own rollback arms reverted the round's commits (protected-path,
-     strict-clobber), the tests entry points at an uncommitted path, the
+     strict-clobber, or a tree left unclean past its re-asks — §8 *A
+     worker leaves its tree clean*, which also means a cited tests path
+     can never be an uncommitted one), the
      cited tests path does not appear in the phase's own commits (a
      zero-commit pass citing a pre-existing committed file — or an
      always-existing directory — passed every other check and rendered
@@ -6862,6 +13142,57 @@ Two further disciplines sit at the §12 axis:
      whose unrelated fix in the same pass co-occurs with a `mitigated`
      answer to a different risk — is bounded by the PR section rendering
      every entry, addressed or not, with its disposition visible.
+
+- **Changed lines no test executes are re-driven.** A worker's own risk
+  disclosure misses the commonest gap: in Q7/G v6, 15 subtasks whose test
+  was removed were re-run twice with the typed `gap` field, and a gap named
+  the seeded file in 6 of 30 emissions. So the orchestrator measures it. After a subtask settles `complete` and before
+  its wave integrates, `_measure_subtask_coverage` runs the subtask's own
+  test files — the test-shaped files its diff changed — with line coverage
+  restricted to its changed production files, and reads which changed
+  executable lines ran. Coverage counts only from a test file that passed
+  (one that fails is re-run once; failing twice, it contributes nothing).
+  For a file with lines still unexecuted, every other test file that
+  imports it (at most 30 per file, a module it mocks does not count) runs
+  the same way, and the lines it executes are settled. A test-path helper
+  module — under a test directory but not itself a test file — is never a
+  test here: in the bench one was counted as a failing test and cost a
+  closure. The subtask is re-driven when the unexecuted share of its
+  changed executable lines is at least `coverage_uncovered_share` (0.25),
+  or when one of its risks typed `test_missing` / `test_weak` is not
+  settled:
+
+  - `test_missing` settles without a re-drive when an existing test file
+    that imports one of its `where_paths` passes (under B*: a failure is
+    re-run before it counts).
+  - `settle_by: typecheck` / `build` settles only when the type-checker
+    passes and lists every `where_paths` file among the files it checked
+    (`tsc --listFiles`): an axis passing says nothing about a file outside
+    its own file list.
+  - `test_weak` has no mechanical settle before a re-drive; after one, it
+    settles when a test file the re-drive changed, in or importing its
+    `where_paths`, passes.
+
+  One note per subtask names the unexecuted `file:line`s and the unsettled
+  gaps, and the implementer continues on its own branch. Each round draws
+  from the subtask's shared re-drive counter (§13 *One re-drive budget per
+  subtask*), so there are at most two, and round 2 is told why round 1 was
+  not enough: the lines still unexecuted and the tests that failed twice.
+  A re-drive that does not end `complete` is rolled back to the subtask's
+  pre-re-drive commit — adding tests must never cost finished work. What
+  is still unexecuted after the rounds is listed in the PR's "Untested
+  after re-drive" and never drafts the PR. JS/TS with vitest's v8
+  coverage only, as benched; elsewhere the measurement is recorded
+  `unmeasured` and nothing is re-driven. Bench Q7/G v8 (funeralworks; a
+  seed deletes or reverts one test file the subtask added): detection
+  fired on 16 of 19 hard seeds (a seeded line left unexecuted); on clean
+  final trees it fired on 4 of 20 fresh subtasks and 1 of 12 more; within
+  two rounds 13 of 16 detected seeds closed (every line executed by tests
+  that pass, and a judge read the tests as addressing the lines), with 0
+  new test failures; the detector took a median 53 s per subtask. Line
+  coverage cannot see a weakened assertion: of 8 soft seeds (the test
+  kept but reverted) it fired on 1, and the typed gap on none of 16
+  emissions.
 
 - **A stale finding is not a bug.** The evidence contract above asks whether
   a fix fires; this asks whether the failure it fixes still happens. On one
@@ -7070,10 +13401,14 @@ reads them — the loop-continuation predicate, the residual summary, and the
 persisted `conformance` entry all see what was measured, never what was
 claimed; the worker's own report survives only as telemetry. The overwrite
 happens twice per round: once at the tail for the ordinary case, and once
-immediately after the worker returns for the three gates that abandon a
-round early (a malformed result, a protected-path violation, a strict-mode
-clobber) — also the accurate answer there, since two of those three exits
-roll the worktree back toward the state that earlier measurement describes.
+immediately after the worker returns for the gates that abandon a round
+early (a tree the worker left unclean, §8 *A worker leaves its tree clean*;
+a malformed result; a protected-path violation; a strict-mode clobber) —
+also the accurate answer there, since three of those four exits roll the
+worktree back toward the state that earlier measurement describes. It is
+ONE application ahead of every such gate, never one per gate: a gate added
+between the worker's return and the overwrite, carrying its own copy, is
+the shape that lets the next gate added there carry the claim out.
 
 This does *not* fix over-firing conformers (measured, implementers ran the
 full suite zero times and conformers ran it almost exactly once per round
@@ -7100,7 +13435,9 @@ ran the whole ~990-file suite at ~499s a time against ~23s for a scoped run
 of the same repo.
 
 A proxy is repo-declared (`test_scoped` / `build_scoped` in
-`.leerie/config.toml`) or inferred from two narrow signals, rendered from a
+`.leerie/config.toml`) or inferred — from a vitest or jest config, or, for
+the test axis, from a canonical test command that is a bare pytest, rspec,
+minitest, `go test` or `cargo test` invocation (below) — rendered from a
 template with `{files}` and `{base}`. It is **not a subset** of the
 canonical command and is not expected to be — `tsc --noEmit` catches a
 different set than `next build`. It is a cheap falsifier run once per
@@ -7124,6 +13461,105 @@ import-graph kind, running the tests the diff *touched* rather than the
 tests it *affects*, which is the price of working at all on a runner with
 no impact analysis. The absence rule below makes it safe: a diff with no
 test file renders nothing, and the axis is deferred to the whole-tree pass.
+
+**Operands that are already test files take the runner's direct form, not
+its impact analysis.** Two kinds of call hand a scoped test command its
+operands, and they want different commands. The per-subtask proxy above
+gets the implementer's diff — source, docs and tests mixed — and the goal
+is "the tests these changes affect": that is what `vitest related` and
+`jest --findRelatedTests` are for. Every other caller already holds test
+files and wants exactly those run: a held-out acceptance set and its
+parse probe (§8), the re-drive self-check, the coupled tests that replace a
+forbidden suite, discovery repeats, B* confirm reruns, and the delivery
+ratchet's measurements where they run a forbidden suite's replacement. One template once served both, so all of the second kind ran
+`vitest related --run <test files>`, and `related` first resolves the
+module graph of the whole suite to find what imports its operands — work
+that is pure overhead when the operands are the tests themselves. The I3
+bench's paired check (`i3bench/latcheck3.out`, same tree and command, five
+runs each) put `related` at 1.8–2.2× the time of `vitest run <files>` on
+the two barnacle trees (8.7–10.4 s more per invocation) and 3.3–4.5× on
+the two funeralworks trees (15.3–15.8 s more). That cost is paid on every
+acceptance run, rerun and self-check; the implementers given the `related` command in the I3 bench
+mostly bypassed it for `vitest run` themselves. The invariant restored:
+**a command over named test files runs those files directly; a command
+over a diff resolves the diff's affected tests.** So there are two
+templates, chosen by the call site from its own data, not by inspecting
+the operands: `resolve_blt_scoped` (the diff's affected tests: `vitest
+related --run {files}`, `jest --findRelatedTests {files}`) feeds only the
+per-subtask proxy, and `resolve_test_files_scoped` (named test files:
+`vitest run {test_files}`, `jest --runTestsByPath {test_files}`) feeds
+`_acceptance_cmd`, through which every test-file caller renders. For the
+runners with no impact analysis the two are the same `{test_files}`-tier
+template. Over `{test_files}`, a name that is not test-shaped renders
+nothing, so a source file can never reach the direct form, where it would
+mean something else. A repo may declare the direct form as
+`test_files_scoped`. Otherwise a declared `test_scoped` is the operator's
+command for this runner — its wrapper, its environment, its options — and
+the direct form is derived from it, not from a fresh inference that would
+drop them: the impact-analysis selector of the runner it names is swapped
+for that runner's direct one (`vitest related` → `vitest run`, `jest
+--findRelatedTests` → `jest --runTestsByPath`) and `{files}` for
+`{test_files}`, every other word kept as written. The rule is the
+invariant above applied to a declared command, not a special case: before
+it, a repo that had declared `test_scoped` (funeralworks declares its
+`related` form behind a database wrapper and a raised Node heap, both of
+which an inferred `npx vitest run` would lose, the heap measured as an OOM
+in its own config's note) kept the whole-suite walk for every named test
+file, because the declaration it made for diffs silently also served test
+files: on a funeralworks clone with its real config, one acceptance file
+took a median 18.6 s through the declared `related` form and 2.05 s through
+the derived `run` form, five interleaved runs each, same verdict every
+run. A declared command leerie cannot read that way — not one simple
+command, a substitution in it, no runner it knows, or no selector to swap
+— is used as written (`related` over a test file still runs that test,
+only slower), and only with nothing declared are the inferred forms used.
+The direct form must still
+run exactly the files it names, and vitest's does not by itself: its
+positionals are case-insensitive substring filters over each test file's
+path relative to its project root, with no option for exact selection, so
+`vitest run src/a.test.ts` also runs `src/a.test.tsx`, `pkg/src/a.test.ts`
+and `SRC/A.test.ts.d/z.test.ts`. Every caller's verdict reads the whole
+run — the exit code, or every case in the report — so such a file's
+failure decided the named file's verdict: driven against real vitest
+4.1.11 with passing named files and failing colliders, the acceptance
+placement and falsifier runs (exit code and per-case), a B* capture's
+failing IDs, and the coupled-replacement and self-check commands all read
+red. Leerie's own operand is not where the collision comes from — the
+writer's acceptance path, an existing repo test — so the root is the
+command: `_acceptance_cmd` lists every file in the tree the command runs
+in that vitest's rule would also select (an over-approximation, taking
+every shared ancestor as a possible project root, that can only drop
+files nobody named) and excludes each by its own escaped absolute path
+(`--exclude`, added to the configured excludes). jest's `--runTestsByPath`
+already matches exactly. When the flags cannot be placed as vitest's own
+last arguments (a package-manager script call, a pipe after it) and a
+collider exists, there is no command at all, never one that runs more than
+it names. The listing skips what vitest's default exclude skips
+(`node_modules`, `.git`), which keeps it at 0.08 s on funeralworks' 61k-file
+tree instead of 1.1 s; re-measured there with a planted collider, five
+interleaved runs each, `vitest run <file>` took a median 1.99 s (wrong
+verdict: 1 failed, 1 passed), the rendered command 2.00 s (1 passed), and
+`related` about 18 s. The forbidden-command
+gate (*A command the task forbids*) reads both forms as scoped: `run` is a
+suite subcommand it drops, leaving the files as operands, and
+`--runTestsByPath` takes no value, so the files stay operands; with no
+file either form is a whole-suite run, and `_render_scoped` never renders
+one without a file.
+
+That is why the test proxy is now also **inferred for runners with no
+impact analysis**, which it once was not: with only `{files}` available,
+inferring `pytest {files}` would have rendered `pytest
+orchestrator/leerie.py` and collected nothing. Under `{test_files}` the
+same diff renders no command and defers, so a bare canonical runner
+invocation becomes `<canonical> {test_files}` (pytest, rspec, `rails
+test`), a `ruby -Itest -Ilib` loader over `{test_files}` (`rake test`),
+`go test <its options> {test_packages}` (the test files' packages) or
+`cargo test <its options> --no-fail-fast {test_targets}` (`--test <name>`
+per integration-test file). A canonical command with selectors of its own
+(`pytest -k smoke tests/`), shell operators or anything but options after
+the runner infers nothing. The held-out acceptance sets (§8) need the same
+template, and the reversal was made for them: without it a pytest, Ruby,
+Go or Rust repo got no sets.
 
 Absence is the default in every direction, and for the test axis absence
 means **deferred, never full**: under `scoped`, a `tests` axis with no
@@ -7184,9 +13620,10 @@ mechanism exists to remove. Four mechanisms read that list:
 
 - **Hard deny.** The rules go into `--disallowedTools` as scoped
   `Bash(...)` patterns, the only permission control that survives
-  `--dangerously-skip-permissions`, on every worker `claude_p` spawns (the
-  Fly remote integrator and the preflight smoke test build their own argv
-  and carry neither the deny nor the notice). The CLI strips
+  `--dangerously-skip-permissions`, on every worker `claude_p` spawns and on
+  the Fly remote integrator, whose bash-built argv takes the same deny and
+  notice from `_worker_guard` through `scripts/worker-guard.py` (only the
+  preflight smoke test builds its own argv and carries neither). The CLI strips
   `timeout`-style wrappers and redirections and checks every segment of a
   compound command, so anything aimed at a test root is refused, `-k`/`-m`
   selections included; file-targeted runs, loops over files and selections
@@ -7204,8 +13641,9 @@ mechanism exists to remove. Four mechanisms read that list:
   each denied). Outside quotes the boundaries are the shell operators,
   newlines, a subshell's brackets and brace *groups* — brace *expansion*
   (`tests/{a,b}.py`) stays part of a word, as the CLI read it. Redirections
-  are dropped with their target, quoted or not, and a backslash-newline
-  continues the line. It then tries the match from every word of a
+  are dropped with their target, quoted or not; outside quotes an escaped
+  blank stays part of its word and a backslash-newline is removed, as bash
+  reads them (`bash -c pnpm\ test` passes `-c` the one word `pnpm test`). It then tries the match from every word of a
   subcommand, which covers the CLI's prefix stripping and errs wide on
   purpose: it also strips a paraphrase such as "run pytest tests/ to
   verify", since the declared-command check would accept only the refused
@@ -7257,6 +13695,552 @@ under `--skip-adherence-check`). Immunity is deliberately not widened to
 paraphrases: a prescribed `pytest tests/test_a.py` would then shield a
 planner's `pytest tests/ tests/test_a.py`, which the CLI denies.
 
+**A command the task forbids is denied in every spelling, and the
+orchestrator does not run it either.** A task sometimes forbids a command
+outright ("do not run `pnpm test`; it hangs the box"). The classifier
+returns it as typed data — `process_constraints.forbidden_commands`, one
+entry per command: the `command`, an `evidence_quote` and a `scope` — and
+Python never reads the task for it.
+
+- *Evidence is the task's own words, checked by code.* An entry counts only
+  when its `evidence_quote` (NFC, whitespace collapsed) is a substring of
+  the task text or of a report the task references. Text leerie injects
+  never qualifies. Measured (barnacle 7cc87f9a, pass 1): a re-classify call
+  received the orchestrator's own whole-suite notice ("running it is denied
+  to you") in its prompt and returned `pnpm run test` as forbidden, citing
+  that notice. The next call then saw the forbidden-command notice built
+  from its own output and re-sourced the entry from the task. So the
+  classifier also never receives an orchestrator notice: it is the worker
+  that types constraints from the task, and anything else in its prompt
+  can become a constraint. The deny rules still bind it.
+- *Scope.* `scope: "any"` forbids every invocation of the command.
+  `scope: "whole_suite"` is for a task that forbids running the whole test
+  suite ("don't run the full test suite unnecessarily"). It forbids only a
+  whole-suite invocation, with the semantics of the whole-suite deny below
+  (*The whole suite is orchestrator-owned*): the bare runner, a flags-only
+  runner, or a runner aimed at a test root. A run that names test files is
+  still allowed. Measured on the same run: the prefix match denied every
+  `pnpm test <file>`, so acceptance writers 1–4 could not validate their
+  sets.
+- *Several draws, unioned.* One draw misses forbids. Measured: the same
+  barnacle 45fa4253 task ("don't run the full test suite unnecessarily as
+  part of any validation") was typed `forbidden_commands: []` on pass 1
+  and `pnpm run test` / `whole_suite` on pass 2; 7cc87f9a's task, which
+  asks the same, was typed empty on all three passes of its replay: 1
+  typed forbid in 5 classifier draws. A
+  missed forbid costs every whole-suite run the task asked to avoid; on
+  barnacle that is 15–19 min per run. So the list is also extracted by a
+  small judgment worker of its own, `forbidden_command_extractor`, run
+  `forbidden_command_samples` (3) times, at the same time as the
+  classifier. The kept list is the union of every draw's entries (the
+  classifier's and each sample's) that pass the quote check. The union is
+  safe against invented forbids because every entry must carry a verbatim
+  task quote, which code checks. A forbid without one is dropped, however
+  many draws typed it. If each draw types a real forbid independently with
+  probability q, k draws find it with probability 1 − (1 − q)^k: at the
+  measured q ≈ 0.2, one draw finds it 20% of the time, four (the
+  classifier plus 3 samples) 59%, and at q = 0.5, 94%.
+  A separate worker, not more classifier draws: the classifier is the most
+  expensive judgment call before planning (repo inspection, up to 60
+  turns, a 1,236 s per-worker timeout). Its output is the whole
+  classification, and redrawing it would only take one field. The
+  extractor reads the task, the reports it names and the repo's resolved
+  test command, which it needs to name a whole-suite forbid. It has
+  read-only tools and a few turns, so its samples run in parallel with the
+  classifier and add no wall time. Like the classifier it types
+  constraints from the task, so it gets no orchestrator notice
+  (`NOTICE_FREE_WORKERS`). A crashed sample is no vote and is not
+  redrawn: the union only grows with draws, so a missing one costs recall,
+  never safety.
+
+Three layers follow, each derived from that one list:
+
+- **Deny rules with a paired notice.** Each forbidden `scope: "any"`
+  command becomes `Bash(<cmd>)` / `Bash(<cmd> *)` rules in
+  `--disallowedTools`. A `whole_suite` entry becomes the whole-suite rule
+  set instead (`R`, `R T`, `R T/`, `R T *`, `R T/ *`, `R * T`, `R * T/`
+  for each spelling R and test root T) (for a
+  package-manager test script also its `X test` / `X run test` twin), via
+  the same `deny_extra` path as the whole-suite deny, and `claude_p`
+  appends a `NOTE FROM ORCHESTRATOR:` naming the forbidden commands to
+  every worker whose tools reach them. Deny without a notice was measured
+  to block workers (2/2 replayed workers ended `blocked`, above).
+- **A PreToolUse hook for the forms prefix rules cannot match.** A rule
+  sees the literal text; `bash -c '…'`, `sh -c "eval …"`, `npx -c`,
+  `corepack pnpm …`, `node -e "require('child_process').execSync('…')"`,
+  `python3 -c "os.system('…')"`, `env -S '…'`, `xargs`, a command
+  substitution, an absolute-path binary, package-manager global options
+  and the `pnpm test`/`npm run test`/`yarn test` aliases all reach the
+  same script. `claude_p` passes `--settings` carrying one PreToolUse hook
+  on `Bash` that runs leerie's own matcher in a separate process: it
+  splits the command with the same quote-aware scan as the whole-suite
+  rules, unwraps wrappers, shells, `eval`, runner proxies and
+  interpreter eval flags (each string literal in the code is read as a
+  command too), normalises package-manager spellings — each manager's OWN global options
+  (one table for all of them listed `-w` as taking a value, which is npm's
+  `--workspace <name>` but pnpm's flag `--workspace-root`, so `pnpm -w
+  test` ran past a forbidden `pnpm test`), checked against the real pnpm,
+  npm and yarn, and the subcommands that only pick where a script runs
+  (`pnpm recursive`/`multi`/`m`, `yarn workspace <name>`, `yarn workspaces
+  run`/`foreach`) — and denies a
+  command whose normalised argv starts with a forbidden one. For a
+  `whole_suite` entry, it also requires the words that follow to be only
+  flags or test roots (the hook payload carries the roots); for pytest an
+  option's value is part of the flag, read from pytest's own option table,
+  so `pytest -p no:cacheprovider` is still a whole-suite run, not a run of
+  a file named `no:cacheprovider`.
+
+  *pnpm's binary fallback reads no option values.* pnpm reads a global
+  option's value only on the way to one of its own commands or a script.
+  When the word after the options is neither and pnpm falls back to
+  running a package binary, it reads every option as a bare flag: the
+  binary is the first word that does not start with `-` (one `--` before
+  it is dropped), and every word after it is handed on. So `pnpm --dir . vitest` runs `.`, and `pnpm -C
+  vitest x` runs `vitest x` inside `vitest/` — a value table applied there
+  read `vitest` as the directory and `x` as the binary, and let the runner
+  through. A `--filter`/`-F`/`--filter-prod` or `-r`/`--recursive`
+  selector (or `recursive`/`multi`/`m`) makes pnpm run a script only, never
+  a binary, so no binary reading is made for it; `-w`/`--workspace-root`
+  is a flag either way, and `x` is no command of pnpm's (npm's and bun's
+  `x` is `exec`; `pnpm x vitest` runs a binary named `x`). Which branch pnpm takes depends on the
+  repository's scripts, which the matcher cannot see, so it reads both:
+  the script reading with the value table, the binary reading without it.
+  Measured with the real pnpm 11.21 through real bash on argv-printing
+  binaries; the spellings are pinned in
+  `tests/fixtures/forbid_runner_options.json`.
+
+  *One runner, every spelling.* Since every orchestrator-side launch
+  (CI parity, the provision recipe, coverage, settle-by-execution) is
+  checked by this matcher alone, a spelling it misses runs the forbidden
+  suite. The common CI spellings were missed (round-3 review M3): `vitest
+  run` read `run` as a test filter, and `python -m pytest`, `uv run
+  pytest`, `poetry run pytest` were not `pytest` at all. So the matcher
+  also unwraps `python[3[.x]] [opts] -m <module>` to the module, the
+  Python run-wrappers `uv run` (and `uv run -m`, `uv tool run`, `uvx`),
+  `poetry run`, `pipenv run`, `hatch run [ENV:]`, `pdm run`, `rye run`,
+  Ruby's `bundle exec`, `xvfb-run` (its getopt options, clustered
+  `-as ARGS` included), the JS env wrappers `cross-env` and
+  `cross-env-shell` (leading `NAME=value` words, as cross-env's own
+  setter regex reads them; `-shell` runs the rest through a shell),
+  `dotenv` (dotenv-cli parses with minimist and no option table: an
+  option takes the next word unless it starts with `-`, positionals are
+  collected across options, and `--` ends them) and `env-cmd` (commander:
+  `-f`/`-r [path]` take an optional value, `-e [envs...]` is variadic and
+  takes every word up to the next option, the first operand is the
+  command and the words after it are its own; `--use-shell` runs it
+  through a shell) — each measured with the real tool (cross-env 10.1,
+  dotenv-cli 11.1, env-cmd 11.0) —
+  `node <…>/node_modules/<pkg>/…` to the package's
+  binary, a runner proxy's `<pkg>@<version>` (`npx -y vitest@3`, `pnpm
+  dlx`, `yarn dlx`, `bunx`, `npm exec`, `corepack`) to the package, and `pnpm`/`yarn`/`bun <bin>` (a script of that name, else the
+  binary: both readings are checked); npm and yarn drop one `--` before
+  the binary's arguments, pnpm and npx do not. And every runner gets a
+  table of what is not a test-file operand, taken from its real CLI
+  (`--help`, or its own option metadata) and checked by running the real
+  runner: vitest, jest, mocha, pytest, `go test`, `cargo test` (and its
+  test binary's options behind `--`), rspec, `rails test`. A table names
+  the options whose next word is their value; the subcommands that run the
+  suite (`vitest run`/`watch`/`dev` — `vitest related <files>` stays a
+  scoped run); the options that themselves select files or targets (jest
+  `--testPathPatterns`/`--onlyChanged`, cargo `--test`/`-p`); the options
+  whose value is a test-path operand (mocha `--spec`, rspec `--pattern`);
+  the operands that name the whole suite (`go test ./...`);
+  and two parser quirks the real runners showed — vitest and jest read a
+  `true`/`false` after a flag as its value (`jest --ci false` is a
+  whole-suite run; mocha does not), and vitest takes nothing after `--` as
+  a filter. A name filter (`-k`, `-t`, `--grep`, `-run`) is a value
+  option, not selection: the runner still loads every test file, which is
+  what a whole-suite forbid is about. What it still cannot see: a run that
+  lists every package or file by name (`go test ./a ./b`), and a selecting
+  option that happens to select everything (below).
+
+  *A selector reads as scoped unless it selects everything.* A project,
+  package or target selector runs a named subset of the suite. Measured
+  with the real runners on a two-project vitest and jest workspace and a
+  two-crate cargo workspace: `vitest run --project unit`, `jest
+  --selectProjects unit` and `cargo test -p p1` each ran one of the two
+  (round-4 review L3). Like a test directory under the root (`pytest
+  tests/unit`), they stay allowed. A selector selects the whole suite
+  only when its value is the runner's match-everything spelling, or when
+  it names every project, which only the runner's config can tell. The
+  matcher decides per runner from what the CLI does:
+  - vitest `--project` and cargo `-p`/`--package` take globs, so `*` (and
+    vitest's `**`) is a whole-suite run (`select_all`). Measured: both
+    ran everything.
+  - jest `--selectProjects` takes literal names (`'*'` ran nothing), so
+    it stays a selector. `--ignoreProjects` also runs a subset, and was
+    refused as a flags-only run (a false refusal), so it is a selector
+    now. `--runTestsByPath` is a flag that changes how paths are read.
+    Bare, it ran the whole suite, so it is no longer a selector.
+  - mocha `--spec` and rspec `--pattern`/`-P` name test files, so their
+    value is read as an operand (`operand_opts`). `mocha --spec test` is
+    the root, and a recursive glob from a root whose last component is a
+    wildcard (`test/**/*.spec.js`, rspec's default
+    `spec/**{,/*/**}/*_spec.rb`, `**/*_spec.rb`) selects every test file.
+    A quoted glob in any operand position is read the same way.
+  - cargo `--lib`/`--doc`/`--test`/`--bin`/`--example`/`--bench` select
+    target kinds or one target, so they stay selectors. cargo's `*` is
+    one match-everything value for all of its selectors, so `--test
+    '*'` (likewise `--bin`/`--example`/`--bench '*'`) reads as a
+    whole-suite run though it runs one target kind: a false refusal.
+  What it cannot see: a selector list naming every project (`--project
+  unit --project e2e`, `--selectProjects unit e2e`, `-p p1 -p p2`), a
+  partial glob that happens to match all (`-p 'p*'`), `cargo test -p` or
+  `--lib` in a workspace that has nothing else, and `rspec
+  --only-failures` with no failure record. Each needs the runner's
+  config or state, which the matcher, running in the hook with no
+  repository, does not read.
+
+  *A whole-suite run contains every selector's run.* A whole-suite forbid
+  whose own entry selects (`vitest run --project unit`, `cargo test -p
+  p1`, a derived entry of a script that runs one project) also hits the
+  runner's whole-suite run — the bare runner, flags only, or aimed at a
+  test root — since that run runs the selected part too. Before, such an
+  entry kept only its whole prefix, so the bare `vitest run` passed a
+  forbidden `vitest run --project unit` it contains. Another selector
+  (`--project e2e`) and a run naming files stay allowed.
+
+  *A pnpm filter that names one package of several is scoped.* `pnpm
+  --filter <pkg> test` runs that package's `test` script only. It was
+  refused under a whole-suite `pnpm test` forbid, beside vitest's
+  `--project unit`, which reads as scoped (round-5 review L2). Measured
+  with pnpm 11.21 in a workspace (root, `@s/a`, `@s/b`) and a
+  single-package repo, each `test` echoing a marker: `--filter @s/a`,
+  `-F`, `--filter-prod`, `@s/*`, `./packages/**`, `{packages/a}` and
+  `./*` never ran the root's `test`, the script a forbidden `pnpm test`
+  names; `*`, `**`, `.`, the root's own name and a glob matching it did,
+  and in the single-package repo so did `--filter <its name>`. So a
+  `--filter`/`-F`/`--filter-prod` value is read like a selector: a
+  whole-suite entry that names no filter hits a filtered run only when
+  the run selects the root package. Round-6 review M1 found four ways a
+  filter list selects it that the first reading missed, each measured
+  with pnpm 11.21 in the same workspace and in one whose root lists
+  `@s/a` as a `workspace:*` devDependency:
+  - `-w`/`--workspace-root` beside a filter adds the root: `pnpm -w
+    --filter @s/a test` ran `a` and the root, wherever the flag stands
+    (before the filter, after it, among `run`'s own options);
+  - a path selector — one starting with `.`, or braced — selects the root
+    when its glob matches `.`: `./**`, `{./**}`, `{**}`, `./`, `{.}` ran
+    the root, while `./*` ran nothing and `{./packages/**}` only the
+    packages;
+  - a dependency-closure selector (`...x`, `x...`, `^x`, `...^x`,
+    `x^...`) selects the root whenever the root is in the closure:
+    `...@s/a` ran `a`, `b` and the root once the root depended on `@s/a`,
+    and `a` and `b` without that edge. The matcher does not read the
+    workspace's dependency graph, so it reads every closure selector
+    conservatively, as it reads an exclusion (`!x`) or a changed-since
+    (`[ref]`) selector, whose packages it cannot list either: as
+    selecting the root. That refuses `pnpm --filter '...@s/a' test` in a
+    repo whose root depends on nothing — a false refusal, never a miss.
+  So a filter list selects the root when any value is `*`, `**`, a path
+  glob matching `.`, a name pattern matching the root package's name, a
+  closure, exclusion or changed-since selector, or when `-w` stands
+  beside it. The root's name comes
+  from `package.json`: `_process_constraints` records it on the
+  whole-suite entry (`package_name`), since the hook reads no repository.
+  `pnpm -r test` with no filter stays a whole-suite run: measured, it ran
+  every workspace package's `test` but not the root's, and those together
+  are the monorepo's suite. `npm -w`, `yarn workspace` and `bun --filter`
+  are the same shape and are still read as whole-suite runs (refused,
+  never missed).
+
+  *A whole-suite forbid matches on the runner alone.* The extractor is told
+  to return the repo's test command for a whole-suite forbid, and on every
+  Go repo that is `go test ./...`. A prefix match on the whole entry then
+  missed the same run with any flag before the operand: `go test -race
+  ./...` and `go test -v -count=1 ./...`, the standard CI spellings, both
+  ran past it, as did `pytest -q tests` past `pytest tests` (round-4
+  review M4). So a `whole_suite` entry that names a known runner is split
+  into the runner head and its operands. Its flags are dropped, its
+  operands join the test roots as whole-suite operands, and a candidate
+  matches on the head alone, with the runner's own flag-aware operand
+  reading deciding the rest. The repo root (`.`, `./`) is a whole-suite
+  operand too, except where the runner reads it as something smaller:
+  `go test .` tests one package, `cargo test .` is a name filter, and
+  `mocha .` loads only the files directly in the root (each measured with
+  the real runner). A run aimed at a package or a test file is still
+  scoped: `go test ./pkg/x`, `pytest tests/test_a.py`.
+
+  *A forbidden package script forbids what it runs.* On a JS repo the
+  repo's test command is `<pm> run test`, so that is the entry a
+  whole-suite forbid carries. Matching only that spelling let every other
+  spelling of the same run through (round-4 review M3): on a
+  barnacle-shaped repo whose `test` script is `vitest run`, `vitest run`,
+  `npx vitest run`, `pnpm exec vitest run --coverage`, `pnpm run test:ci`
+  and CI's `pnpm install && pnpm vitest run --coverage` all passed a
+  forbidden `pnpm run test`. The launch side already resolved a script
+  call to its body; the entry side never did. So `_process_constraints`,
+  which has the repository, resolves each forbidden script call through
+  `package.json` (scripts calling scripts included) and adds, with the
+  same scope, roots and quote and a `derived_from` naming the task's
+  entry:
+  - each test runner the body runs (`vitest run --coverage`); a body's
+    other commands (`tsc --noEmit && vitest run`) are not forbidden,
+    because the task forbade the suite, not the type check. A body that
+    runs one runner several times (`vitest run --project unit && vitest
+    run --project e2e`) derives that runner's bare command instead
+    (`vitest`), with the environment its runs share: each run alone is a
+    part of what the script ran, and a part is scoped (*A selector reads
+    as scoped*), while the runner's whole-suite run contains every part.
+    Deriving each run as its own entry refused the parts and let the bare
+    `vitest run`, which runs both, through (round-5 review L1). Whether
+    the parts cover every project does not matter: the bare run contains
+    them either way. Nor could it be read: vitest 5 reads no workspace
+    file (its dist has none), so the project list lives in
+    `vitest.config.*`, a program the matcher does not run;
+  - every other script whose resolved body runs a forbidden command
+    (`test:ci` → `vitest run --coverage`), by name. A forbidden runner
+    entry does the same, so a forbidden `vitest run` also forbids
+    `pnpm run test`.
+  The derived entries travel in the hook's payload like any other, so
+  the worker hook, which reads no `package.json`, refuses them too. The
+  run log lists them apart from the task's own forbids, but the worker
+  notice names them with the task's own ("this task forbids running
+  …"), and a derived entry the task prescribes is dropped like any
+  other.
+
+  *A script's environment is part of what it runs.* Deriving from a body
+  first dropped its environment: `"test:db": "NODE_ENV=production vitest
+  run"` derived `vitest run`, so a task forbidding that one script (it
+  hits the production database) refused every test run in the repo, and
+  the sibling scan then forbade `pnpm test` (round-5 review M1). The task
+  forbade that environment, not the runner. So the environment a command
+  sets is read with it — leading `NAME=value` words, `env`'s assignments
+  and `-u`/`-i`/`-C`, and the JS env wrappers `cross-env`,
+  `cross-env-shell`, `dotenv` (dotenv-cli) and `env-cmd`, whose env files
+  count as the environment they load — and an entry that carries an
+  environment hits only a command that sets at least the same one. A
+  command's `export NAME=value`, bare assignment or `source <file>`
+  statements count for every command it runs, an over-reading that can
+  only add hits. A derived entry keeps the body's environment unless that
+  environment cannot be what the task forbade:
+  - the script is the repo's own test command (`_canonical_test_command`):
+    it is the suite, and its environment is how the repo runs the suite,
+    so the runner in any environment runs what the task forbade. `"test":
+    "cross-env TZ=UTC vitest run"` still derives `vitest run`, and a
+    worker's `npx vitest run` is refused (review M2);
+  - or every token of the environment is a test-hygiene assignment, one
+    that changes how a run reports or how much memory it gets, never what
+    it touches: `TZ`, `CI`, `FORCE_COLOR`, `NO_COLOR`, `LANG`, `LC_*`, and
+    `NODE_OPTIONS` carrying only `--max-old-space-size`,
+    `--max-semi-space-size` and `--inspect*` flags; and `NODE_ENV=test`
+    for a runner that sets it itself when it is unset, jest and vitest
+    (measured: jest 30.5.2 and vitest 5.0.5 each saw `NODE_ENV=test` in a
+    test run with it unset; mocha 12.0.3 saw it unset, so for mocha it
+    stays an environment). For those runners the assignment changes
+    nothing: `"test:unit": "NODE_ENV=test jest"` runs exactly what `jest`
+    runs, and round-7 review found the cost of keeping it — in a
+    turborepo-shaped root, forbidding `pnpm run test:unit` derived
+    `NODE_ENV=test jest`, and `npx jest` ran the whole suite. `"test:ui":
+    "cross-env TZ=UTC vitest run"` derives `vitest run`. An env file, `env
+    -i`/`-u`, an env-cmd environment or any other variable is not hygiene.
+  Otherwise the derived entry carries the environment
+  (`NODE_ENV=production vitest run`), and the sibling scan names only the
+  scripts that set it too. The second rule first read "no other script
+  runs that runner without the environment", and round-6 review L2 found
+  its failure: in a turborepo-shaped root (`"test": "turbo run test"`)
+  the only root script that calls vitest is the one carrying the
+  dangerous `DATABASE_URL`, so the rule dropped the environment and a
+  forbidden `pnpm run test:db` refused every vitest run in the repo,
+  leerie's own scoped launches included. The fixed list costs the other
+  direction, accepted: a repo whose only mocha script is `NODE_ENV=test
+  mocha`, not its test command, keeps that environment (mocha leaves
+  `NODE_ENV` unset, so it is a real difference), and a plain `mocha`
+  passes the forbid.
+
+  *An environment set on a script call reaches the script's body.*
+  `NODE_ENV=production pnpm test` and `export NODE_ENV=production && pnpm
+  test` run `"test": "vitest run"` in production, which is exactly a
+  forbidden `"test:db2": "NODE_ENV=production vitest run"` (round-6
+  review L3). The hook reads no `package.json`, so the join is made where
+  the repository is read: the sibling scan also runs each script's body
+  under every forbidden entry's environment, and a script whose body then
+  hits the entry is forbidden by name *in that environment*
+  (`NODE_ENV=production pnpm run test`), under the same containment rule
+  as any entry with an environment. A plain `pnpm test` stays allowed.
+  Such an entry never names its script to the runtime guard
+  (`LEERIE_FORBIDDEN_SCRIPTS`), which sees a lifecycle name and no
+  environment, and would refuse the plain run too.
+  What it cannot see: a different spelling of the same environment
+  (`NODE_ENV=production` typed against an entry that loads
+  `.env.production`), since an env file's content is not read; and an
+  assignment the body makes over the call's (`NODE_ENV=production pnpm
+  test` with `"test": "NODE_ENV=test vitest run"` reads as both, a false
+  refusal), since the environment is read as a set of tokens.
+  Hooks fire
+  under `--dangerously-skip-permissions`. The hook fails open (a crash
+  allows the call; the deny rules still stand) — a matcher bug must not
+  block every Bash call of a run.
+- **A runtime guard for a forbidden package script.** When a forbidden
+  `scope: "any"` command is exactly a package script (`pnpm test`, `npm run
+  lint`), the
+  worker's environment points npm's and pnpm's `script-shell` at a small
+  guard that refuses that script by its lifecycle name and runs every
+  other one with the shell the repository configured (`script-shell` in
+  `.npmrc`, `scriptShell` in `pnpm-workspace.yaml`, read back from the
+  package manager with leerie's override removed; `/bin/sh` when none).
+  The override outranks the repository's setting, so a guard that ran
+  `/bin/sh` itself broke a repo's bash-syntax scripts (measured with npm 11
+  and pnpm 11: `[[ 1 == 1 ]] && echo BASH-OK` printed BASH-OK plainly and
+  `[[: not found` under the guard). It sees every run the package manager makes,
+  so it covers the one the command-line layers cannot: a script reached
+  through another script (`pnpm run ci` whose body is `pnpm test`), a
+  Makefile target, any spelling the matcher misses.
+- **The orchestrator's own measurement skips it, except for the test
+  axis, which it replaces.** `_measure_axes` does not run a build or lint
+  command the task forbids. That axis is recorded unmeasured with
+  `skip_kind: forbidden_by_task`. A forbidden test command is *replaced*,
+  not skipped, because it is the run's only regression check. The
+  replacement is the repo's scoped test runner (the `{test_files}` /
+  `{files}` template the held-out sets use, §8 *Scoped runners*), run over
+  the test files coupled to the run's changes. Those are the changed test
+  files plus every test file whose import closure reaches a changed
+  production file. The closure comes from the mechanical import graph:
+  JS/TS import specifiers, and Python `import` statements read with
+  `ast`. These are *the coupled tests*.
+  The baseline has no changes to couple to, so its test axis is recorded
+  `skip_kind: scoped_at_final`. For the ID diff, a scoped final result
+  starts from an empty base list, and B\* reruns each candidate on the
+  base, so a failure the base already had is still not counted. When no
+  scoped runner exists, or no test file is coupled, the axis stays
+  unmeasured. That is logged as a WARNING and listed under "Needs human
+  verification", never dropped silently. Measured (barnacle 7cc87f9a, pass
+  1): the skip removed the final test axis, the run's only regression
+  measurement, on a task that also said "NEVER INTRODUCE REGRESSIONS". A
+  flaky test the run introduced never ran on the final tree. Nor does
+  settle-by-execution (§8 *Settled by execution*): a planner `verify`
+  argv that runs a forbidden command is emptied before scheduling and
+  refused if one reaches the settle anyway, so that criterion is one no
+  command decides and the claim falls back to the re-drive.
+- **Every orchestrator-side run of a build, lint or test command passes
+  one gate.** The axis measurement is not the only place leerie runs the
+  repo's commands itself: B\* reruns, failing-test-ID captures, the
+  delivery re-drive's and ratchet's measurements, the held-out sets' runs
+  and parse probes, the falsifier's confirm and the integration gate's
+  conflicted-area tests all do. Each one builds its shell through the same
+  helper, which checks the exact command it is about to run — and the
+  command it was rendered from — against the forbidden list and refuses a
+  hit. A refused run is no verdict for its caller, never a pass. A caller
+  that holds the canonical test command replaces it as the axis does: the
+  scoped runner over the caller's own test files (the coupled tests for the
+  ratchet and the re-drive, the conflicted area's tests for the
+  integration gate), and nothing when that scoped command is forbidden too
+  — never a fallback to the raw command. Found in review of the N5
+  follow-ups: the re-drive's test IDs and the integration gate both read
+  the raw test command and would run it, past the axis's check, on a task
+  that forbade it.
+  The gate takes either form a launch uses: a shell string (it builds the
+  `bash -c` argv) or an argv that is exec'd directly (checked as the shell
+  would read it, and returned unchanged). Execution review r2 found three
+  launches that exec'd repo commands as argv lists and so never reached
+  the shell-only gate: CI parity's checks and their prerequisites (by
+  construction the repo's own lint, type-check and coverage commands; a
+  task forbidding the whole suite still had it run on the base, the final
+  tree and the confirm tree), the coverage runs (vitest, `tsc`, and the
+  `settle_by: install` re-run of the recipe), and the provision recipe's
+  install and build entries that make each measured tree runnable.
+  Settle-by-execution's verify argvs, already refused before they run,
+  now also pass the gate at the launch. A CI check the task forbids is not
+  selected (`forbidden_by_task`), and a forbidden strict variant is
+  dropped, so the check is never judged on a run that did not happen.
+- *Recipe install steps fall under the forbid too.* The provision recipe
+  is derived from the repository, so its commands are repo commands, and
+  the task's words are the more specific instruction: a user who wrote
+  "never run `pnpm install`" is not overruled because leerie wanted a
+  dependency tree. A refused `install` entry counts as a failed install —
+  the tree was not made runnable, and the callers that judge by exit code
+  already treat that as no verdict — and a refused `build` entry is
+  skipped, as a failed one is. The provisioner worker's own runs are
+  covered by the worker layers above, like any worker's. The operator's
+  `.leerie-setup.sh` is not a task command and is not gated.
+  Code enforces the single gate: a test fails when a shell launch appears
+  outside the helper, or when any process launch (`subprocess`,
+  `asyncio.create_subprocess_*`, `os.exec*`, `run_proc`, `_run_streaming`,
+  `_run_contained`) runs an argv that is neither a literal led by a
+  program leerie chose (`git`, `claude`, …) nor bound from the gate in
+  the same function, outside a short reviewed list of launchers that run
+  no repository command.
+
+A forbidden command that is also a prescribed command is not forbidden
+(the prescription is the more specific instruction), and `runs_commands`
+entries that match one are stripped before scheduling, as the whole-suite
+strip does, so the declared-command check never requires one. Measured
+(bench C7, P10): deny rules alone let 4 of 9 replayed spellings run
+(`bash -c`, `pnpm test`, `npx pnpm run test`, `/usr/bin/env pnpm run
+test`); with the hook, 0 of 30 offline attack forms escaped the matcher
+and 0 of 12 live attempts by workers told to keep trying escaped, while
+0 of 13 offline and 0 of 10 live legitimate commands (`node -e
+"console.log(1)"`, `bash -c 'echo test'`, `grep 'pnpm run test'`, other
+scripts) were blocked. The runtime guard alone (no hook) refused 29 of
+32 offline forms (P10's runtime layer); the three it let run were two
+that override the script shell itself (`pnpm
+--config.script-shell=/bin/sh run test`, `pnpm_config_script_shell=
+pnpm test`), which the hook denies, and `node scripts/t.js`. So it added
+no catch on that bench; it is kept because it is the only layer that sees
+a nested run — measured here, `npm run ci` and `pnpm run ci` with `ci`
+running `pnpm test` were both refused, and `npm run lint` ran. Not
+covered by any layer, deliberately: running the script's body directly
+(`node scripts/t.js`) — that is a different command, and no package
+manager is involved.
+
+**Scope of the forbidden-command matcher.** Six review rounds widened the
+matcher spelling by spelling; after round 6 its scope is frozen, and the
+limits below are documented rather than chased. One row was closed after
+the freeze, because it was a real whole-suite miss on an ordinary
+monorepo shape and cost nothing to close: round 7 found `NODE_ENV=test`
+kept on a derived jest or vitest entry, so `npx jest` passed a forbidden
+`"test:unit": "NODE_ENV=test jest"`; it is now hygiene for the runners
+that set it themselves (above). What it guarantees:
+
+- *The orchestrator's own commands go through a code gate.* Every
+  orchestrator-side launch of a repository command passes
+  `_blt_shell_argv`, which refuses a hit, and a refused run is no verdict
+  for its caller, never a pass (above). This is the enforced layer: a
+  forbidden command leerie would run itself does not run in any spelling
+  the matcher reads.
+- *Every spelling it reads is read the same in both places.* The worker
+  hook runs the same matcher over the same entries (derived ones
+  included), so a worker and the orchestrator are refused the same set.
+- *Readings it cannot settle lean to refusal* where the run could be the
+  forbidden one and the matcher lacks the repository fact that would tell
+  (a pnpm exclusion, changed-since or closure selector; `npm -w`, `yarn
+  workspace`, `bun --filter`), and to allowing only where the miss is
+  named below.
+- *An entry exists only on the task's own words* (a verbatim quote,
+  checked by code), and the matcher never raises: an error reads as no
+  hit.
+
+For workers, the deny rules plus the hook (and the runtime script guard)
+are a best-effort guard on the command a worker writes, not a security
+boundary: the hook fails open, a deny rule sees only literal text, and a
+worker can always reach the same run through a program the matcher does
+not model. Known limits, each a miss unless marked as a false refusal:
+
+- *Config-dependent selection.* A selector list naming every project
+  (`--project unit --project e2e`, `--selectProjects unit e2e`, `-p p1 -p
+  p2`), a partial glob that matches all (`-p 'p*'`), `cargo test -p` or
+  `--lib` in a workspace that has nothing else, `rspec --only-failures`,
+  and a run listing every package or file by name (`go test ./a ./b`):
+  the answer lives in the runner's config or state.
+- *Workspaces it cannot enumerate.* pnpm closure (`...x`, `x...`, `^`),
+  exclusion (`!x`) and changed-since (`[ref]`) selectors read as selecting
+  the root (false refusal when they do not); `npm -w`, `yarn workspace`
+  and `bun --filter` read as whole-suite runs (false refusal); only the
+  root `package.json`'s scripts are read, so a forbidden script in a
+  workspace package, or the suite a task runner (`turbo run test`, `nx
+  test`) fans out to, derives nothing.
+- *Environment it does not read.* An env file's content (`NODE_ENV=production`
+  against an entry that loads `.env.production`); an assignment the body
+  makes over the caller's (false refusal); `NODE_ENV=test` on a runner
+  that does not set it itself (`NODE_ENV=test mocha` is kept, so a plain
+  `mocha` passes); and Python's `dotenv run`
+  (python-dotenv's CLI), which the matcher parses as dotenv-cli and reads
+  as running a command named `run`.
+- *Programs it does not model.* A script's body run directly (`node
+  scripts/t.js`), a Makefile target, a test runner launched by another
+  tool it does not unwrap (`coverage run -m pytest`), and a runner not in
+  its runner tables.
+
 The derivation reads the target repo's files on every worker spawn, so it is
 total: an unreadable or odd ini file (`testpaths` from `pytest.ini`,
 `tox.ini` or `setup.cfg`; `pyproject.toml` is not read, and such a repo gets
@@ -7276,6 +14260,60 @@ canonical command containing `*` is declined outright, since the CLI would
 read it as a wildcard. None appeared among the full-suite invocations
 leerie's own workers ran on record, which is the honest extent of the claim;
 the notice, not the deny, is what such a worker is left with.
+
+**A worker never kills a process by name.** Every worker of a run shares
+one process table (the run's container), so `pkill -f vitest` stops every
+sibling's vitest too, and an install or test run killed mid-way surfaces as a
+sibling's mysterious failure. Of 48 pattern kills on record (all `pkill
+-f …`), 15 killed another worker's (or the orchestrator's own)
+install, test run or watcher. The usual motive is innocent: a worker wants to
+stop its own background command, and a pattern is the only handle it has.
+
+So the same three layers as forbidden commands, over a fixed list, for every
+worker whose tools reach a shell — the Fly recovery integrator included,
+which builds its own `claude` command line in bash but takes the layers from
+the same Python construction every other worker gets (`_worker_guard`,
+through `scripts/worker-guard.py`), so it cannot be the one worker that
+lacks them:
+
+- **Deny rules** `Bash(pkill)`, `Bash(killall)`, `Bash(killall5)`,
+  `Bash(xargs kill)` and their ` *` forms (the CLI checks each pipeline
+  segment, so `pgrep -f x | xargs kill` meets `xargs kill`).
+- **The PreToolUse hook**, the same process and matcher as above, also
+  denies `kill` behind `xargs`, `kill` in the same command as a pid finder
+  (`kill $(pgrep -f x)`, a `pgrep … | while read` loop, `pidof`), `fuser -k`,
+  and all of these inside `sh -c`, `eval`, wrappers or interpreter strings.
+  It reads normalised argv heads only — a commit message, a grep pattern or
+  `echo "kill $(pgrep x)"` is not a kill — and `kill -0` / `kill -l` signal
+  nothing and pass. `kill <pid>` of a PID the worker saved stays allowed.
+  Because the hook now runs before every Bash call of every acting worker,
+  the hook script allows a call whose text contains neither `kill` nor
+  `fuser` without importing leerie when the run forbids no command (an
+  import costs ~1.7 s where no bytecode cache can be written); with a
+  forbidden entry in the payload, every call is matched.
+- **A paired notice**: kills by name are denied because other workers share
+  the process table; stop your own background command with `TaskStop`, or
+  `kill` a PID you saved from `$!`. `TaskStop` is therefore no longer
+  denied (§2).
+
+Measured: the matcher denies all 48 recorded kill commands and the wrapped
+forms above, and none of the legitimate controls. In a replay of 12 recorded
+kill-motive implementer cases × 2 samples × 2 arms (47 rows scored), workers
+made 0 bypass attempts (`sh -c`, `xargs`, `os.kill`, `fuser -k`) in either
+arm; with `TaskStop` allowed, workers used it 4 times, each successfully,
+and 24/24 completed (23/23 without it). The bench's own wide glob
+(`Bash(*pgrep*|*kill*)`) denied one `git commit` whose message mentioned
+`pkill`; matching normalised argv heads instead is why no glob of that shape
+ships. The arm with `TaskStop` still denied made no kill attempt at all, so
+the replay did not reproduce the motive; that the deny stops the harm rests
+on the matcher covering the 48 recorded commands, not on the replay. A
+per-worker PID namespace, which would make the kill harmless rather than
+denied, is deferred: a worker keeps the container's `/proc`, where a pid it
+reads from `getpid()` would name another process. Since 2026-11-01 the
+shim's Landlock signal scope (ABI 6 and later) keeps a worker's processes
+from signalling any process outside their own domain, and a held-out
+evaluation gets a PID namespace of its own (§6 *A held-out evaluation runs
+alone*).
 
 **The round signal is a regression, not a verdict.** Because a scoped
 result and a full baseline are not comparable, the base-health baseline
@@ -7323,7 +14361,89 @@ unchanged — only the inputs (cwd, `DIFF_BASE`, and the absence of a
 subtask spec / criteria file) differ. The pass's structured output
 lands at `st.data["conformance"]["_final"]` and is threaded into the
 `pr_writer` payload so its residuals surface as an advisory section
-in the PR body alongside the wave-by-wave summary.
+in the PR body alongside the wave-by-wave summary. That record is also the
+pass's resume sentinel, but only for a pass that **cleared**: `resume`
+skips the pass when `_final` is recorded with `blocked` false, and runs it
+again when `blocked` is true. A blocked final pass (`--strict-conformer`
+only, below) stops the run with "fix and resume"; skipping it on that
+resume would let the very run the operator resumed to finish the gap ship
+without the pass ever looking at the gap again (in the attribution of 32
+traced chains, one needed exactly this fix).
+
+**An unfixed solution defect keeps the final loop going, and what survives
+it is unfinished work, not a stop.** The round loop ends early only when
+the axes are clean against the base, nothing regressed, **and** no
+actionable `solution_defect` is left unfixed — the one gating axis is part
+of "clean" here. While one is left and rounds remain, the next round gets
+the unfixed defects as a typed note. Before this, the loop's exit test
+looked only at the residual and axis channels: in a replayed run (barnacle
+45fa4253, pass 1) the final conformer reported one unfixed
+`unhandled_path` in round 0 against a baseline-red test axis, the loop
+read clean and exited with two of its three rounds unused, and the run
+`die()`d "fix and resume"; the resumed run's final conformer fixed the same
+defect, same tree, in one round. A defect still unfixed after the last
+round is recorded on `_final` as `residual_defects`; it is no reason to
+stop the run. Every wave has integrated, but the subtasks that own the
+code still exist for the delivery re-drive (§8 *Delivery re-drive*), which
+takes each residual defect as a typed `solution_defect` note, routed to
+the subtasks whose integrated diff touches the file the defect's `where`
+names, and drives it once from their shared budget. Nothing mechanical can
+re-verify a defect the conformer found, so a residual defect makes the run
+`unconverged` (§6 *The run outcome is decided once*), its reason naming
+each defect's kind, location and case — the PR is a draft that says what
+is open, never a run that stopped with the work on a branch nobody opens.
+`--skip-completeness-check` still demotes the defects to warnings, and
+`--strict-conformer` still stops the run on its own axes (clobbered files,
+residuals): that flag is the operator asking for exactly that stop.
+
+**A stop after execution begins is for a state no step can continue
+from.** Once the first wave starts, a `die()` throws away a run's whole
+spend and leaves nothing a reviewer can open; `unconverged` keeps
+everything that converged and names what did not. So every `die()`
+reachable from execution, integration, the final passes and finalize is
+either a state the run cannot safely continue from — the operator's
+checkout moved (§12 L4), a `git reset` that did not land, conflict markers
+committed to the run branch, staging or a subtask branch missing, a wave
+whose completed subtasks are neither on the run branch nor backed out (an
+invariant the per-subtask settled-head check, §6 *Integrated means the
+settled commit is on the run branch*, makes unreachable), a run
+branch gone after cleanup, `finalize.sh` failing — or an operator's own
+opt-in stop (`--stop-on-blocked`, `--stop-on-repo-change`,
+`--strict-conformer`). A gap in the work is never one of them: it settles
+the subtask or the run `unconverged`.
+
+**An advisory whole-PR review feeds the final conformer.** Every check
+above is anchored to something the run already wrote down — a required
+item, a subtask's criteria, an axis. A bug in code no item names passes
+all of them, and a later human review keeps finding exactly those. So,
+once per run, after the delivery gate's first half and before this final
+pass, a `pr_reviewer` worker reviews the whole PR the way that reviewer
+would: the task, its referenced reports, the required items (numbered,
+plus the audited defect contract), and the full diff from the working
+branch, in its own disposable checkout of staging's HEAD with staging's
+ignored paths shared (§8 *A worker that does not commit never runs in a
+tree leerie measures*), allowed to run the repo's build and test verbs to
+confirm a suspicion. Those are the verbs the repo's
+build, lint and test commands invoke, plus every spelling of the
+canonical test runner (`python -m pytest` as well as `pytest`), and the
+whole-suite deny (§9 *The whole suite is orchestrator-owned*) still
+applies. The user message names exactly what it may run, and when the
+repo has no known test command it says that no test runner is granted.
+The prompt promises nothing the tools do not grant: in a smoke run the
+reviewer twice tried `python -m pytest`, which the prompt invited and no
+grant covered. Each finding is typed (`bug`,
+`regression`, `unmet_requirement`, the item it bears on or none) and
+quotes the file at HEAD; code checks the quote verbatim against the
+file, and an item's quoted span against that item's text, and only a
+finding whose quote checks out reaches the final conformer, as an
+advisory section it verifies against the code before acting. The review
+never gates and never changes the run's outcome; whatever it made goes
+with its checkout; its record (`pr_review`) is for the PR. It runs on
+`opus` at effort `high` — the one model-tier exception (§12): measured
+(bench N2f, 66 calls per arm on 33 PRs), opus high returned 38 verified
+findings that name no required item against 8 for sonnet high and 7
+for sonnet medium, and of 18 opus findings hand-checked 13 were real,
+5 plausible and none false.
 
 **Base-tree health baseline.** Before this existed, the conformer was the
 first place the repo's build/lint/test suite ran at all, so a red base tree
@@ -7367,6 +14487,550 @@ remains the only load-bearing signal.
 The baseline runs the full suite once (tens of seconds to a few minutes on
 real repos), so it is **skippable**, and each BLT command is bounded by the
 same per-command timeout the provision recipe uses.
+
+**Which failures are new: the failing-test-ID diff, confirmed under load.**
+An axis-level verdict cannot see a regression on a base that is already
+red: the `tests` axis is red before and after, so a new failure hides behind
+the old ones ("treated as pre-existing") and ships. So the baseline and the
+final-tree conformance measurements ask the test runner for its structured
+report (the same machine formats the held-out acceptance sets use: JUnit for
+pytest, jest-compatible JSON for jest and vitest) and record the failing test
+IDs — `baseline_failing_ids` and `final_failing_ids`. The runner is found
+on the command's own words, and a package-manager script call
+(`pnpm|npm|yarn|bun [run] <name>`) is first replaced by its `package.json`
+script body, recursively, since a script may call a script. The body is
+then run with the tree's `node_modules/.bin` on PATH, as the manager runs
+it. Without that, `pnpm run test` (whose script is `vitest run`) named no
+runner. On barnacle 7cc87f9a's early replay, all three passes recorded
+`baseline_failing_ids: null` on a red base, and the whole diff below never
+ran. The same resolution serves every place that asks a runner for its
+report: the axis IDs, the delivery ratchet and re-drive, and the held-out
+set runs. A final ID that did
+not fail on the base is only a *candidate*: one failing run is not evidence
+under load. Benched (Q9), "failed twice" — today's informal rule — labelled
+17 of 17 clean trials as having a new failure under sustained host load
+(71 of 77 flaky IDs called new).
+
+The candidate is confirmed by **B\***, one reusable mechanism every "is this
+failure new / does this set still fail" verdict uses:
+
+1. *Gate.* Wait until the **host's** CPU pressure (`/proc/pressure/cpu`,
+   `some avg10`) is below `confirm_psi_cpu_max` (40), for at most
+   `confirm_gate_wait_sec` (300 s). The host file, never the container
+   cgroup's `cpu.pressure`, which reads near zero while the host is
+   saturated; measured from inside a rootless leerie container, the file's
+   cumulative `total` lies between two host reads taken around it, i.e. it
+   is the host's (the benches found it readable as `leerie` on rootless and
+   rootful). An unreadable file is treated as a gate timeout, loudly.
+2. *Pairs.* Rerun serially (`--runInBand` / `--no-file-parallelism
+   --maxWorkers=1` / `-p no:xdist`), only the files that contain a
+   candidate, as interleaved base/final pairs — base, final, base, final … —
+   `confirm_pairs` (3) of them, or `confirm_pairs_escalated` (5) when the
+   gate timed out. One confirm runs at a time, and its reruns are bounded
+   by `confirm_budget_sec` (1800 s): every rerun's timeout is what is left
+   of it. The budget's clock starts when the gate
+   returns. The gate wait is not rerun work and has its own cap, and
+   charging it to the budget would starve the reruns exactly when they need
+   the most time: the gate times out only on a loaded host, which is when
+   the pairs escalate from 3 to 5 and each rerun runs slowest, and the
+   300 s wait is a sixth of the budget. Splitting the budget per phase
+   instead was rejected: the gate already is a phase with its own cap, and
+   a further split among a confirm's reruns would add caps without
+   bounding anything the single budget does not. So one confirm, and every
+   discovery below, takes at most `confirm_gate_wait_sec` + one 2 s gate
+   poll + `confirm_budget_sec` — 2102 s at the defaults — plus at most 1 s
+   once (the floor under one rerun's timeout, reached only when less than
+   a second is left) and the waits no B\* rerun charges to its own
+   timeout: the host build slot (§6 *A host-wide build semaphore*) and, for
+   the test axis, the in-process BLT gate (`blt_parallel`). A sized confirm
+   (below) that reruns in passes stays inside it: a later pass gets only
+   what the passes before it left, waits on no second gate, and starts
+   only with at least a second left, so the 1 s floor is still reached
+   once. A serial
+   rerun that writes no report (a config that insists on a flag the serial
+   form contradicts) is retried once as written, inside what is left of
+   that rerun's own timeout, and not at all under a second. Before review
+   round 6 the retry got the full timeout again, so one rerun could take
+   twice what was left and the 2102 s was not a bound.
+
+   *Sized before the reruns start.* One rerun runs every candidate file
+   serially, so its cost is the sum of those files' times: it grows with
+   how many tests failed, and both grow with host load. Without sizing, a
+   single long file decided how many pairs every other candidate got. So
+   the candidate files are sized first, from the per-file durations every
+   structured report already yields (`test_file_durations`, the same record
+   discovery sizes from below): a file holding a candidate the final run
+   itself failed ranks before one holding only a discovery find (the more
+   informative observation), then the shortest first; a file is taken
+   while (Σ duration + one rerun's start-up) × 2 — one base/final pair —
+   fits the budget, and the first file always, since it may still finish a
+   pair. One pair, not all `k`: one finished agreeing pair is what step 4
+   needs to call a candidate new, so sizing for `k` left out files that
+   could have been settled. When that first pass is done, the budget it
+   left goes to the files it left out, in the same order: each further
+   pass takes the files one pair of which fits what is left, and passes
+   continue until none is left or none fits, so no file is skipped while
+   one pair of it fits the remaining budget. A file never rerun is sized
+   out: its candidates are `budget_short_unsettled` (step 4), listed as
+   "not rerun (sized out of the budget)" — apart from a rerun the budget
+   cut, "could not confirm within the budget". A file with no measured
+   duration costs the start-up alone. When a candidate has no known file
+   the rerun is the whole command and nothing is sized. CI parity sizes
+   its red checks the same way by their final-run times, shortest first,
+   so a long check first in CI order no longer starves the checks after it.
+   Review round 7 drove the cost of sizing for `k` on a real suite: a
+   final run failing a 30 s file (a load flake) and a 290 s file (a real
+   regression) sized the long file out at the defaults, (30 + 290 + 10) ×
+   6 = 1980 > 1800, on every measurement — detection, each re-drive group,
+   the refresh — so the regression was never new and the run ended `done`
+   with about 1600 s of the budget unused; alone, two of its pairs fit.
+
+   *One pair for every file before a second for any.* Sizing alone still
+   let the first pass spend all `k` of its pairs before a file it left out
+   got its first (review round 8 L3): the estimate decides which files
+   share a pass, but what a pass actually costs is only known once it ran,
+   and a first pass that ran faster than its files' recorded durations
+   spent the difference on its own second and third pairs. So when the
+   first pass leaves a file out, every pass stops after one finished pair
+   while files are still waiting, and only when no left-out file fits what
+   remains does each pass, in the same order, continue to its `k` pairs
+   with the budget left — the pairs it already finished counted, so its
+   verdict is over all of them. A pass that stopped at one pair and never
+   continued is a budget shortfall (step 4): the budget kept it from `k`,
+   whichever file it went to. Driven with a 300 s flake file and a 600 s
+   regression file whose flake file reran in 100 s: the first pass spent
+   660 s on three pairs and left 1140 s, short of the regression file's
+   one pair (1220 s), which was never rerun; stopping at one pair (220 s)
+   leaves 1580 s, and the regression is rerun and confirmed new. When the
+   estimates are right, a file the first pass left out can never get its
+   pair after the first pass's one pair either — the start-up is paid once
+   more by the extra pass — so on the reviewer's own durations no order
+   reruns both files: (300 + 600 + 10) × 2 = 1820 and (300 + 10) × 2 +
+   (600 + 10) × 2 = 1840 both exceed 1800, and putting the regression file
+   first only sizes the flake file out instead.
+3. *Verdict.* An ID is **new** only if it failed on every final rerun and
+   passed on every base rerun. An ID that failed on every one of the `k`
+   base reruns, each of which produced a report, is **`pre_existing`**: the
+   base already fails it deterministically, whatever the final side did.
+   An ID for which no rerun on either side produced a report is
+   **`no_verdict`**: nothing was measured. One that only a rerun the budget
+   cut measured, with no pair finished, is not `no_verdict` — something
+   ran — but `budget_short_unsettled` (step 4). Everything else — flaky on
+   either side, failing on some base reruns and not others — is
+   `resource_affected`. None of the
+   three is counted as a regression, but they are reported apart, because
+   they mean different things to the reader: `resource_affected` is the
+   label for mixed evidence (the flake label), and it is never given to a
+   test that failed on every base rerun. Measured (barnacle 45fa4253 pass
+   2): 33 IDs with `final_failed 3, base_failed 3` were labelled
+   `resource_affected`, so the run's record showed 33 base failures as
+   flakiness. The same split holds where B\* has no base side (a held-out
+   set, a falsifier probe): `confirmed` when every rerun failed it,
+   `no_verdict` when no rerun produced a report, `resource_affected`
+   otherwise.
+4. *A rerun the budget cuts short is not a run.* A rerun that ends with
+   no verdict once the budget is spent — its timeout was what was left of
+   the budget — is neither a failure nor a pass, and it is not counted; it
+   ends the confirm (`budget_exhausted`). The files a cut rerun did finish
+   still count against a candidate: on the base side the finished files
+   that failed it, on the final side the finished files that passed it. A
+   candidate the budget alone kept from the full count — every rerun that
+   finished agreed with the observation it started from (every final rerun
+   failed it, every base rerun passed it), none ended with no verdict for
+   another reason, and no finished file of a cut rerun refuted it — is
+   then decided by what that observation is worth, which differs by
+   caller. One whose finished reruns disagreed stays `resource_affected`.
+
+   - *Base-paired confirms* — the final failing-test-ID diff, a re-drive
+     group's diff, the integration gate's head confirm, CI parity. Their
+     candidates come from one failing run, a population Q9 measured as
+     mostly flakes under load ("failed twice" called 17 of 17 clean trials
+     new under sustained load). Nor is the candidate list base evidence:
+     a scoped final command and unknown baseline IDs both start from an
+     empty base list, so only a base rerun shows the base passing. Such a
+     candidate is **new** (listed in `budget_short`) only when at least
+     one base/final pair finished. With none it is
+     **`budget_short_unsettled`**: never new, and never "went away". A
+     discovery find (below) is intermittent by construction, so it is
+     never new on a shortfall, whatever finished. Unsettled is the
+     test outcome's `unknown`: on the final tree it is listed under
+     "Needs human verification" as "could not confirm within the budget:
+     <files>" (CI parity: the check ids), an item typed `test_id_diff`
+     reads unknown with the same words (§8 *A test outcome is the
+     failing-test-ID diff's to settle*), and it never makes the run
+     `unconverged`. In a re-drive group it never rolls the group back
+     (the ratchet records the group's execution-shaped items unchecked):
+     an unsettled candidate is not a confirmed regression, and rolling a
+     group back on one would undo work on the strength of a load flake as
+     readily as a regression. Nor is the group kept silently: its unsettled
+     files and the required items its ratchet could not check are listed
+     under "Needs human verification" (site "delivery re-drive"), and the
+     final diff, measured again on the tree that ships, reruns any of
+     them still failing there against the base. That diff is the
+     authority the entry defers to: an unsettled test it measured on the
+     tree that ships — passing there, or typed `new` or `pre_existing`
+     against the base — leaves the entry, which keeps only the tests still
+     unsettled there and the items no diff can check (review round 8 L1:
+     the entry used to outlive a `done` run whose shipping diff had
+     settled every one of them). A group's candidate is unsettled in
+     three ways: one pair of its file did not fit what the group's budget
+     left (sized out); a discovery find whose pairs the budget cut short
+     of `k` (never new on a shortfall, above); or a candidate with no
+     known file, whose whole-command reruns the budget cut. Rerunning
+     such a candidate with priority inside the group was rejected. A
+     sized-out file can fit when it goes first — files of 400, 400 and
+     800 s at a budget of 1800 s size the 800 s file out in rank order,
+     and put first its pair fits — but only by sizing out files ranked
+     before it, whose evidence is equal or stronger: priority moves the
+     shortfall onto them, it does not remove it, and the shipping-tree
+     diff reruns whatever stays unsettled with a fresh budget.
+     With no known file the whole command reruns every candidate at once,
+     so there is nothing to put first. A discovery find's file could get
+     its missing pairs only by taking them from the files of the
+     candidates the group's own run failed, which rank first because one
+     finished pair of them is enough to call them new: priority would
+     trade the stronger evidence for the weaker, while the shipping-tree
+     diff reruns all of them with a fresh budget anyway,
+     and in the integration gate it is never sent to the integrator and
+     never backs out a merge; the final diff settles the shipping tree.
+     A candidate the sizing above left out is unsettled the same way.
+   - *The held-out vote and the falsifier probe.* The file was written to
+     fail at the run's own start, and its first run failed on an
+     assertion: a budget-cut rerun is not evidence it passes. A candidate
+     every finished rerun failed is **`confirmed`** (`budget_short`), even
+     with none finished. The exception is a vote file whose first run was
+     a timeout or a signal death — a resource signature, not an assertion:
+     with no finished rerun it is `budget_short_unsettled`, and the set is
+     unmeasured unless another of its files fails, listed under "Needs
+     human verification" (§8 *A held-out set the final tree leaves
+     unmeasured is never silent*). The integration gate's head confirm with no home parent has
+     no base side either, but it is base-paired in kind (a merged-tree
+     failure seen once) and needs a finished rerun the same way.
+   - The integration gate's overlay confirm (§6), which decides whether a
+     merged-tree failure is the other side's (`stale_by_other_side`),
+     takes no such reading: a shortfall leaves the failure a
+     `test_failure`. Not because "stale" exonerates the merge — a round
+     with a stale failure fails exactly like one with a `test_failure`.
+     The asymmetry is routing: "stale" tells the integrator to update the
+     test and never the production code, so a false "stale" invites it to
+     rewrite a test to match a broken merge, while a shortfall read as a
+     `test_failure` sends it to fix code. And the premise of the reading
+     is false there: nothing ran on the overlay tree before the confirm,
+     so it was never seen failing.
+
+   The alternative was to give a rerun that has started its full
+   `worker_timeout_sec` and stop only *starting* reruns once the budget is
+   spent (the rule before the budget bounded every rerun). It was rejected
+   on both counts. It bounds nothing: one vote rerun runs every failing
+   file of its set, each up to `worker_timeout_sec` (5400 s), past the
+   budget. And it does not fix the defect: a file whose `k − 1` reruns
+   exceed the budget still ends short of `k`, so a slow set that failed on
+   every run that finished still read `resource_affected`. Measured (review
+   round 5, H1): a held-out set file costing 0.4 s that failed every run
+   deterministically, under a 1.0 s budget with k = 3, read `unmeasured`
+   and the run decided `done`; under this rule it stays failing and the
+   run is `unconverged`.
+
+   *The trade-off, and when it lands.* Review round 5's fix first read
+   every base-paired shortfall as new on the caller's observation alone.
+   Review round 6 measured the cost with the real confirm on a simulated
+   clock (4000 trials per cell, a pure flake failing each run with
+   probability p on both trees): once one side's serial rerun of the
+   candidate files took over 900 s (zero pairs finish at k = 3), a flake
+   was typed new unless the first base rerun, which still finished,
+   failed it — a share of 1 − p (0.900, 0.712, 0.501 at p = 0.1, 0.3, 0.5
+   with c = 1000 s) — and 100% once that rerun took the whole budget
+   (1800 s, the first base rerun cut too); the run ended `unconverged`,
+   reproduced end to end on a real pytest suite. Under the rule above the
+   zero-pair share is 0 (re-measured by review round 7, 2000 trials per
+   cell, at c = 910, 1790 and 1810 s). What remains is exactly one
+   finished pair, from one side at 450 s to 900 s at k = 3: a flake is new
+   with probability at most p(1 − p) — measured 0.081, 0.150, 0.130 at
+   500 s (the second base rerun still finishes and can refute), 0.098,
+   0.184, 0.244 at 610 s and 0.091, 0.203, 0.250 at 890 s, for p = 0.1,
+   0.3, 0.5 — the price of counting a real regression whose pairs the
+   budget cuts after the first. Sizing for one pair (step 2) reaches this
+   regime by design, not only under load: files packed into one rerun so
+   that one pair fits but not `k` get fewer than `k` pairs, and a pass
+   held at one pair while left-out files took their first (review round 8)
+   rests on that one pair when nothing is left to continue it. That is the
+   trade review round 7 chose — a real regression in such a file is new,
+   where sizing for `k` left it unsettled on every measurement. The cost lands when the total
+   serial rerun time of all the candidate files outgrows the budget, and
+   that time grows with load: more flakes surface and each file runs
+   slower. Sizing moves it from "every candidate" to "the files that do
+   not fit". A real regression in a file too slow for one pair is
+   reported as unsettled, not new: the run ends `done` with the file
+   named under "Needs human verification", rather than `unconverged`.
+   The verdict records `budget_short_unsettled` (and
+   `budget_short_unsettled_files`, `sized_out`, `sized_out_files`, and
+   `passes` when the confirm ran in more than one), and when a shortfall did
+   make a candidate new, the outcome reason says how many rested on fewer
+   than every pair. `confirm_budget_sec` is not an operator setting (no
+   flag, environment variable or `leerie.toml` key); a budget of 0 or less
+   runs nothing and waits for no gate — in the confirms, discovery, the
+   held-out discovery and the execution settle alike — so every
+   base-paired candidate is unsettled.
+
+The pairing and `k` carry the guarantee (a p≈0.5 flake goes 3/3 vs 0/3 with
+probability 4⁻³ ≈ 1.6%); the gate only reduces how often `k` must grow.
+Held-out (Q9: 124 trials on three repos, 88 clean, 36 with a reverted real
+fix, host and emulated load up to 17 spinners in a 4-CPU lane): B\* called
+0 of 88 clean trials new (Wilson 95% upper bound 4.2%) and detected 36 of
+36 defects; "failed twice" called 4 of 88 new (3 of 6 under sustained load).
+A confirmed-new ID is a regression even on a red base: it continues the
+final conformer loop like any green→red axis and, if it survives, makes the
+run `unconverged`. On a green base the same rule applies, so a final-tree
+failure that B\* types `resource_affected` no longer spends conformer rounds.
+Where the runner has no structured report, nothing changes — the axis
+verdict stands.
+
+**A failed install is no measurement.** Every side of the diff is a tree
+leerie installed into itself, and a suite run without its dependencies
+fails broadly for a reason that has nothing to do with the change. Review
+round 9 drove what that did when the install was ignored: staging's
+install had succeeded, a later commit really broke a test, and then the
+install failed in every fresh checkout (a registry outage, a cache miss,
+a full disk). The clean checkout of the tree that ships failed every test,
+B\*'s base checkout failed every test too, and every candidate — the real
+regression among them — read `pre_existing`: the run ended `done` with an
+empty end-state section. So an install that failed, on either side, makes
+that side unmeasured, never "failed like the base":
+
+- the install's result is remembered with the install, so a later
+  measurement of the same tree knows it, not only the first — but a
+  failure is not remembered for good: the next measurement of that tree
+  installs again, up to `deps_install_retries` (2) times per worktree, and
+  a success clears it. Review round 10 drove the run a single registry
+  503 at staging's first install made: every later measurement carried
+  the failure for the whole run, and a clean run listed "not measured on
+  the tree that ships";
+- a `tests` measurement taken after a failed install carries
+  `deps_failed`, is never memoised (an outage is not a fact about the
+  tree), and gives the final diff no final side — the refresh lists "not
+  measured on the tree that ships" with that reason;
+- a baseline measured that way records no failing IDs (they would make
+  every final failure the base's own), and the gap says the base was
+  measured without its dependencies. That baseline is saved run state,
+  so it would outlive the outage and every resume: before a final diff
+  is taken or reused, the base commit is measured again in a fresh
+  checkout (staging has moved on), up to `deps_install_retries` times
+  per process, and one whose install succeeds replaces the baseline —
+  for every reader from then on, the final conformance loop's own
+  baseline included (review round 11: the loop kept the copy it read
+  before its first round, so an axis the failed install had counted red
+  stayed forgiven on the final tree for the rest of the loop);
+- a B\* base checkout (the final diff's, a re-drive group's) whose
+  install failed reruns nothing: its candidates are `no_verdict`, and on
+  the tree that ships they are listed for a human to rerun against the
+  base. Such a diff is never reused as-is: each later refresh measures
+  it again with a fresh base checkout.
+
+The comparison is then unknown and says so; it is never settled by two
+broken installs agreeing.
+
+**An intermittent failure the run introduced is evidence, not a verdict.**
+B\* calls an ID new only when it fails on every final rerun, so a test the
+run made fail one time in ten is never new. Measured (barnacle 7cc87f9a):
+the run's alphabet fed a generated password to `new RegExp`, and 10.5% of
+passwords throw (Monte Carlo, 200k samples). The final run surfaces that
+test at all with p = 0.105, and B\* calls it new with p = 0.105⁴ ≈ 0.012%.
+Finding it is the binding constraint, not the verdict. So the final ID diff
+adds two steps:
+
+1. *Discovery.* The run's import-coupled tests are the test files that
+   directly import a production file the run changed. They come from the
+   mechanical import graph: JS/TS specifiers, and Python `import` read with
+   `ast`. These are rerun serially `confirm_intermittent_repeats` (20)
+   times on the final tree, under the host-pressure gate and inside
+   `confirm_budget_sec`, as many of them as that budget holds at the full
+   repeat count (*Sized to the budget*, below). Every ID that failed in the final run or a discovery
+   repeat and not on the base joins the B\* candidates, so it gets base
+   reruns. The list is fixed before any B\* rerun: an ID that fails only
+   in a B\* final rerun gets no base reruns and is not typed. At p = 0.105, R = 20 finds such a
+   test with probability 1 − 0.895²⁰ ≈ 89% (R = 10: 67%; R = 30: 96%).
+   Discovery needs only the coupled test files and the base commit, not
+   the base's failing IDs: when those are unknown (no report on a red
+   base), it still runs and its findings still get B\*'s base reruns, which
+   decide alone whether the base failed them.
+   Direct imports, not the transitive closure: on barnacle one changed
+   module's closure reaches 864–956 of ~1,200 test files. That is the
+   whole suite twenty times, and it couples every flaky test in the repo.
+   *Sized to the budget.* A repeat count only buys detection when every
+   repeat runs. At per-run failure rate p, R repeats find a test with
+   probability 1 − (1 − p)^R: for p = 0.1 that is 88% at R = 20, 65% at
+   R = 10 and 19% at R = 2. So discovery never trades repeats for files:
+   it reruns the files whose `confirm_intermittent_repeats` repeats all fit
+   in `confirm_budget_sec`, and records the rest as skipped. Fewer files at
+   R = 20 beats every file at R = 2. Measured (barnacle 45fa4253 pass 2):
+   the changed `flow-runner.ts` is imported directly by 301 test files, one
+   serial repeat of them takes about 15 min, and the old rule ran 2 of 20
+   repeats in each 30-min budget, per final-conformer round. That bought a
+   19% chance per flaky test, at the full budget every round.
+
+   The files are chosen from measured per-file durations: every structured
+   report leerie reads (the axis IDs, B\* reruns, discovery repeats) also
+   yields each file's wall time (jest/vitest JSON suite start/end, the sum of
+   JUnit `time` or rspec `run_time` per file), kept run-wide. Files are
+   ranked by closeness, then duration: every discovery file already imports
+   a changed file directly (a transitive importer is never a discovery
+   file, above), and among them one importing more of the changed files
+   ranks first; then the shortest first, so the most files fit. A file is
+   taken while (Σ duration + one repeat's runner start-up) × R stays inside
+   what is left of the budget. A file with no measured duration is
+   calibrated first: the unmeasured files run once with a report, in rank
+   order and in chunks of 1, 2, 4 … files, inside one repeat's share of the
+   budget (`confirm_budget_sec` / R); a chunk that does not finish leaves
+   its files unmeasured and skipped. Calibration runs are not repeats: a
+   file is counted only over its R repeats. A repeat that wrote no report is
+   not counted as one either, and a repeat the budget cut short ends
+   discovery (`budget_exhausted`): counted, it would inflate the "failed
+   x of n final runs" an intermittent-regression row reports. When not even the first file
+   fits, discovery records `skipped: "over budget"` and runs nothing. So one
+   discovery — final-tree or the delivery ratchet's (N5), which calls the
+   same function — costs at most `confirm_budget_sec` after the gate,
+   calibration included, and so at most 2102 s with the gate wait, plus
+   the 1 s floor and the build-slot and BLT-gate waits (step 2 above). On barnacle's hub file (~3 s per importer) that is
+   about 26 importers, each rerun all 20 times, instead of all 301 rerun
+   twice; the other 275 are recorded as skipped, not silently dropped.
+2. *Typing.* An ID is typed `intermittent_regression` only when all of
+   these hold. Its base was clean: it is not in the baseline's failing IDs
+   and failed none of B\*'s base reruns. It failed at least once on the
+   final tree. Its file directly imports a changed production file. And no
+   failure of it carries a resource signature in the runner's own report:
+   a timeout, a worker crash, an out-of-memory kill or an exit signal. The
+   report is fixed runner output, so this is a mechanical match; an ID with
+   no recorded message cannot show its signature and is not typed.
+
+The type is **evidence, not a trigger**. The ID stays `resource_affected`
+in B\*'s verdict, so it never spends a conformer round or makes a run
+`unconverged`. It goes to the delivery judge as a typed evidence section,
+and to the PR under "Needs human verification". It ships as evidence because
+its false-positive rate cannot be bounded on the data available. Of the
+bench Q9 trials that carry the B arm (48 clean — 25 dev and 23 held-out,
+of Q9's 184 clean trials — and 73 with a reverted fix), the count rule alone
+(clean base, at least one final failure) fired in 8 of 48 clean trials
+(16.7%). Of those trial hits, 18 IDs in clean and defect trials were not
+truly new: 16 synthetic wall-clock tests that import nothing, and 2 real
+barnacle tests. Direct coupling excludes all 18. That includes the 2 real
+ones in the counterfactual where the run changed the defect's own
+production files; the transitive closure would have coupled both. But
+only 2 real flaky IDs ever reached the filter: 0 of 2 has a 95% upper bound
+far above 2%, and 0 of 48 clean trials gives 7.4%. Q9 also stored no
+failure messages, so the signature condition was not measured at all. The
+one positive control is the barnacle test above, which imports the changed
+module directly. A trigger needs a bench that captures failure messages and
+includes reverted fixes that leave a coupled flaky test.
+
+**The repository's own merge checks run too (CI parity).** The base-health
+axes run the build, lint and test commands leerie resolved for the repo, which
+is not what the repo's CI runs before a merge. On the benched repos those
+three commands covered 4 of the 22 merge-gating checks (barnacle 2/5,
+funeralworks 1/10, api 1/4, leerie 0/3); a PR that broke a typecheck, a
+second package's lint, a translations check or a coverage threshold shipped
+green. So leerie also runs the repo's own merge checks, at the baseline and
+on the final tree:
+
+1. *Discovery is a worker; trust is code.* A read-only judgment worker,
+   `ci_checks`, reads the CI configuration (workflows, CI files, blocking git
+   hooks, and the manifests that resolve what a step calls) and emits typed
+   checks: `kind`, the `argv` exactly as the step runs it, `cwd`, literal
+   `env`, prerequisites, `trigger`s, `requires` (external resources), a
+   `strict_argv` (the warnings-as-errors form) and, for a coverage check,
+   its typed thresholds. It runs only when such a file exists. Code then
+   checks **provenance**: every argv token, prerequisite token and env value
+   must appear verbatim (whitespace-collapsed) in the CI file the check
+   cites; a strict form's non-flag tokens must appear in that file or a
+   manifest beside it; a coverage threshold's glob, metric and minimum must
+   appear in the config file it cites. A check that fails provenance, or
+   still carries a CI expression placeholder, never runs.
+2. *Selection is code.* A check runs only when one of its triggers is a pull
+   request or a blocking hook (pre-push / pre-commit) and `requires` names no
+   external resource (`browser`, `network`, `secrets`, `cloud_credentials`,
+   `gpu`; a `database` is not external — on a Prisma repository with a
+   PostgreSQL datasource such a check runs against a throwaway database of
+   its own (§8 *Prisma repositories get a real database*); elsewhere a check
+   without one goes red at the baseline and drops out). Test-kind checks are left to the test axis (§9
+   *Which failures are new*), which already runs the suite with failing-ID
+   diffs.
+3. *The baseline decides what gates.* Each selected check runs at the
+   baseline in its own detached worktree of the base. A check red there is
+   not a gate (the repo was already red; leerie cannot attribute it). The
+   strict variant is used **only if it is green at the baseline**; then it
+   replaces the plain one — the CI's own lint exits 0 on a warning the
+   strict form catches. A check that changes tracked files is not a check
+   and is dropped.
+4. *Ratchets, where a binary gate is blind.*
+   - A strict lint red at the baseline ratchets **per diagnostic**: the
+     strict output's diagnostics (file plus message, positions dropped —
+     fixed tool output, parsed mechanically) are compared base to final, and
+     a diagnostic new on the final tree in a file the run changed is red.
+   - A coverage check ratchets **per glob and metric**: a threshold fires
+     only when the final percentage is below its minimum, below the base's
+     by more than `ci_coverage_epsilon_pct`, and the glob covers a file the
+     run changed. The coverage command's own exit code is not a gate: the
+     benched repo's coverage job was red at the baseline on 13 of 15 PRs, so
+     the binary gate dropped out and missed the regression the ratchet
+     caught.
+5. *Final.* The same checks run on the final tree in a fresh worktree; a
+   gate red there is confirmed under B\* (interleaved base/final reruns) and
+   only a confirmed one counts — anything else is typed as B\* types it
+   (`resource_affected`, `pre_existing`, `no_verdict`, or
+   `budget_short_unsettled` when the budget left it unsettled, which is
+   listed under "Needs human verification"), reported, never red. Every check run is spawn-held in a capped broker
+   cgroup at the worker caps and holds a host build slot (§6 *Enrollment
+   holds the spawn*, *A host-wide build semaphore*). The reruns are bounded
+   like every other B\* rerun (§9 *Which failures are new*, steps 2 and 4):
+   one rerun runs each red check in turn, and each check's timeout is what
+   is left of `confirm_budget_sec`, never its own `worker_timeout_sec`
+   alone. A rerun the budget cuts — a check timed out on what was left, or
+   no budget left to start the next check — is not a run: it ends the
+   confirm, and only the checks it finished count, so a cut never reads as
+   "the red went away". Before this, a rerun gave every check its full
+   `worker_timeout_sec` (5400 s), and the budget only stopped the next rerun
+   from starting: the last rerun started over n red checks could end
+   n × 5400 s after it began, whatever was left of the 1800 s budget. Now the confirm's worst case
+   is the B\* bound — `confirm_gate_wait_sec` + one 2 s gate poll +
+   `confirm_budget_sec` (2102 s at the defaults) — plus at most 1 s once
+   (the floor under one check run's timeout) and the build-slot waits,
+   which no B\* rerun charges to its own timeout, and one base worktree
+   setup. The base worktree's dependency install precedes the confirm and
+   is outside it, as it is for the test axis's base reruns. One setup per
+   confirm, not per pass: the sized passes (§9 *Which failures are new*,
+   step 2) used to remove and re-create the base worktree for each pass,
+   and since a pass's base tree is the same commit every time, each
+   re-creation repaid the checkout, the dependency install (its
+   installed-once mark goes with the worktree), the throwaway database and
+   every prerequisite, none of it charged to the budget, so the bound grew
+   with the number of passes (at most one per red check, and with the
+   one-pair-first continuations up to two per check). The checkout alone
+   measured 0.24 s for this repository's 800 files; the install and the
+   prerequisites are the repository's own and can be minutes. The base
+   worktree is now created on the first pass, kept for the later ones —
+   each later pass runs only the prerequisites of checks no earlier pass
+   prepared — and removed when the confirm ends, so the uncharged setup
+   is what a single-pass confirm pays: one checkout, one install, one
+   database, and each distinct prerequisite once.
+
+A red final check makes delivery unmet: the run's outcome is `unconverged`
+(§6 *The run outcome is decided once*) and the next same-task run's planners
+are handed the red checks as part of the prior delivery residual. Re-driving
+the subtasks that broke a check is the delivery re-drive's job, not this
+section's; the record it reads is `ci_parity.final.unmet`.
+
+Benched (N6, N6b). Discovery: 12 worker runs (4 repos × 3 samples) found
+92/92 checks with the right kind, requirements and gate selection (78/78
+gate-eligible), 0 provenance failures, 0 harmful extras. Gate runs on 39
+clean merged PRs (barnacle 22, api 11, funeralworks 6; 203 gate checks):
+0 false gates (Wilson 95% upper bound 9.0%), and 5 true catches — four by
+the strict lint (warnings the CI's own lint exits 0 on), one by the plain
+lint. Coverage: the ratchet fired
+0 times on the 7 funeralworks pairs (the 6 clean PRs and one whose
+lint-strict break a later PR fixed), and once on the replayed PR that
+dropped a 95% branch threshold (91.62% → 91.53%, fixed by the next PR);
+the base against a rerun of the base fired 0 times.
+The same check runs gave identical exit codes under rootless and rootful
+containers, with no file left unowned or unwritable.
 
 ---
 
@@ -7749,7 +15413,8 @@ cost.
 
 Continuing past a delta is safe because nothing that is committed, merged
 or pushed is built from the checkout's working tree: the run branch,
-staging and subtask worktrees are all git refs. Both `setup-run.sh` (the
+staging and subtask worktrees are all git refs (of the run's own
+repository, §6 *The run's own repository*). Both `setup-run.sh` (the
 run branch, cut at phase 4) and `planning-worktree.sh` (re-reset on every
 re-entry) follow the tip of the *recorded working branch*
 (`working_branch`, resolved by `_working_branch_ref` — which also accepts
@@ -7804,10 +15469,13 @@ warning classifies each newly-warned batch, so a later batch of only new
 untracked files reads as the operator's even after an earlier batch
 carried a tracked edit — that earlier warning already pointed at it.
 
-This does **not** achieve kernel-level confinement: `/work` is a read-write
-bind mount in the same container for the whole run, and nothing short of a
-read-only mount or a separate uid stops a determined worker. L1–L3 make the
-escape unlikely; L4 makes it loud.
+Locally that kernel-level confinement now exists: the launcher mounts the
+user's checkout `/work:ro` (§6 *The explicit channel*), so no process in the
+container can write it, determined or not, and a delta L4 sees there is the
+operator's own edit on the host. On Fly/EC2 `/work` is the machine's own
+clone, read-write, and nothing short of a read-only mount or a separate uid
+stops a determined worker there. L1–L3 make that escape unlikely; L4 makes
+it loud.
 
 A further layer sits underneath all four and holds even for `autonomous`
 workers, which still carry the permission bypass: `DISALLOWED_TOOLS` via
@@ -7872,11 +15540,15 @@ the direct-invocation/test path; the launcher always sets
 `/leerie-state`), since a blanket deny there would deny each worker its own
 worktree; `_repo_write_denials` returns `""` in that layout and logs once
 rather than staying silently confident. The remote integrator
-(`scripts/remote/collect-subtrees.sh`) cannot import the orchestrator, so
-it carries its own duplicated deny list (like its duplicated
-`SCHEMAS["integrator"]`) — its blast radius is the seeded machine and the
-branch it pushes, not the laptop, which is the argument against adding a
-third copy of a value the orchestrator owns.
+(`scripts/remote/collect-subtrees.sh`) carries no repo-write denial — its
+blast radius is the seeded machine and the branch it pushes, not the laptop
+— but it is not otherwise a second construction of the worker guard: its
+bash payload asks the orchestrator module baked into the same image
+(`scripts/worker-guard.py`) for the deny rules, notices, hook and
+environment `claude_p` would give a worker with its tools (§9 *A worker
+never kills a process by name*), and falls back to its duplicated base deny
+list (kept drift-guarded, like its duplicated `SCHEMAS["integrator"]`) only
+when that module cannot be loaded.
 
 `Task` is the live CLI's name for subagent spawning, `Agent` the retired
 one — until `Task` was added, the "no subagent spawning" constraint (§2,
@@ -8018,6 +15690,26 @@ extraction: the task-file coverage harvest, the migration-surface signal
 `PHANTOM_ARTIFACT` (now reads a structured `artifact_paths` field — see §5
 *Cross-domain surface overlap*).
 
+**Delimiter-only cutting is not the deleted heading harvest.**
+Requirement coverage (§8) cuts the task text and its referenced reports
+into numbered spans and sections, and that sits next to a mechanism
+this section records as deleted, so the line between them is stated
+here. The cut uses markdown's delimiters only — a heading line, a blank
+line, a list marker (with its indent, for the parent link), a code
+fence — which are document syntax, as mechanical as a file path. It
+assigns IDs and nothing else: no span is kept or dropped, ranked,
+classified, or compared with anything by its words. Every span and
+section reaches the classifier, which says what each one means
+(disposition, kind, role, links) in typed JSON, and the gate checks
+only ID sets and ID links. The deleted heading harvest did the
+opposite at every step: it kept the headings as the requirements
+themselves, classified the harvested prose with a second regex, and
+gated on substring overlap between that prose and the plan's prose —
+the shape that froze a run for 33 identical rounds. The one string
+comparison the coverage gate makes, a `table_row` found verbatim in
+its anchor span, is a quote check on text the classifier copied, the
+same kind of check as verifying a judge's quoted line against the file.
+
 ### Opus-judgment, sonnet-workhorse (historical) — now sonnet for both
 
 Judgment workers (classify, plan, reconcile, judge, verify, gate) and
@@ -8033,6 +15725,12 @@ separate, cost-motivated decision; see IMPLEMENTATION.md §2 "Effort
 selection".) If a verdict-flip-with-tier regression is ever observed again
 on a future model swap, re-run the adherence-judge incident/control pair
 before reintroducing a tier split.
+
+One worker is deliberately on `opus`: `pr_reviewer`, the advisory
+whole-PR review (§9 *An advisory whole-PR review feeds the final
+conformer*), at effort `high`. It is not a judgment the run waits on;
+it looks for what nothing else is anchored to, and there the tier
+measured about five times the verified findings (bench N2f).
 
 ---
 
@@ -8069,7 +15767,7 @@ worker-specific: planners proceed with the best result + warnings, the
 classifier dies, the integrator aborts the merge. (That last is the
 *check-exhaustion* path — the integrator kept returning output the
 mechanical checks rejected, a verdict about the work. A worker **crash**
-mid-resolution takes the salvage path in §12 instead.)
+mid-resolution takes the salvage path in §7 instead.)
 
 The multi-sample cap (`planner_samples`) controls independent parallel
 invocations. Selection among samples is mechanical (fewest issues, most
@@ -8123,11 +15821,260 @@ failed at the process level even after the schema retry. Re-running a
 broken worker does not make it honest — a terminal failure ends the
 subtask on first occurrence.
 
-Either way a terminated subtask is fatal at its wave boundary: the run
-stops with state saved rather than carrying a broken subtask forward into
-integration. The specific failure-to-tier mapping is in
+Either way a terminated subtask is never carried forward into
+integration. At its wave boundary a `failed` subtask settles `unconverged`
+(its retries are spent), and a `blocked` one is re-driven from the shared
+budget below, then settled `unconverged` — or, under `--stop-on-blocked`,
+the run stops with state saved. The specific failure-to-tier mapping is in
 `IMPLEMENTATION.md`; the *principle* — correctable-mistake versus
 broken-worker — is the design.
+
+### One re-drive budget per subtask
+
+Re-driving a subtask — running its implementer again because a gate found
+its work incomplete — used to be budgeted per gate, and the budgets
+multiplied: a completeness re-drive inside one settle, then a fresh settle on
+`resume` with every per-attempt budget reset, indefinitely for a subtask left
+`blocked`. One measured run spent 15,017 s. Every re-drive now draws from
+**one persisted counter per subtask**, `redrive_rounds[sid]`, capped by
+`subtask_redrive_rounds` (2): the completeness gate's re-drive and the
+wave-end re-drive of a `blocked` subtask take from the same counter, and so
+does each coverage re-drive round (§9 *Changed lines no test executes are
+re-driven*) and each delivery re-drive group (§8 *Delivery re-drive*),
+as will every later re-drive kind that re-runs the subtask's implementer
+because its work is unfinished or unproven. Integration repair does not
+(§6 *When integration cannot succeed*): it repairs a merge leerie made of
+work already finished, so it has its own counter, at most
+`integration_repair_rounds` per subtask on the gate record, under the same
+`redrive_budget_sec`. Sharing it let earlier, cheaper re-drives — advisory
+coverage among them — spend the rounds and turn the first merge finding
+into a back-out of the whole subtask with no repair attempted. Every counter
+stays finite and persisted, and the wall-time budget bounds them all, so the
+termination argument below is unchanged. An unbacked claim settle-by-execution cannot
+settle (§8 *Settled by execution*) ends its attempt `blocked` and so enters
+through the wave-end re-drive. The per-attempt budgets (`failed_retries`,
+`implementer_confidence_retries`, `subtask_continuations`) still bound one
+attempt; they are not re-drives. A run-level `redrive_budget_sec` (14,400 s)
+of re-drive wall time is the hard stop — measured per wave as the longest
+in-settle re-drive plus the wave-end re-drive rounds, since siblings re-drive
+in parallel.
+
+An exhausted subtask is settled `unconverged` (§5), never left `blocked`;
+its dependents settle `unconverged` without running; and `resume` treats
+`unconverged` (like `complete`, and `accepted_external` once typed blockers
+exist) as settled, so a resumed run does not loop on it. Every subtask of a
+wave therefore ends terminal and `completed_waves` advances. Benched as the
+P7 replay (90 historical runs, 2000 trials each): the 95th-percentile
+re-drive time fit the budget in 90 of 90 runs, no subtask exceeded 2 rounds,
+and every wave's subtasks ended terminal.
+
+### A blocked implementer says why, as a type
+
+An implementer that ends `blocked` or `failed` types the cause as
+`blocker_kind`, and code routes on the type alone — never on the `blocker`
+prose:
+
+| `blocker_kind` | Routing |
+|---|---|
+| `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
+| `external_precondition` (+ `external_resource`, `external_resource_claim`) | the only kind that may be accepted, and only when code verifies the typed resource (below): settled `accepted_external` and listed under "Needs human verification"; a claim the check does not verify is `other`, except that the same claim unverified for an environmental reason on two blocked attempts in a row (no completed attempt between them) settles `unconverged` (`external_unverified`, below) |
+| `environment_limit` | retried in place once, then `unconverged` (the rule of §6 *At the measured ceiling, a resource kill is an environment limit*) |
+| `upstream_missing` | re-driven |
+| `cannot_reproduce` | settled by execution (§8 *Settled by execution*); a claim execution cannot back is re-driven |
+| `regression_unresolved` | re-driven |
+| `other` | re-driven |
+
+Re-driven means the wave-end re-drive from the shared budget above; a spent
+budget settles `unconverged`. An `external_precondition` that names no
+resource, and a result with no kind at all, are typed `other`: acceptance is
+the one outcome that ends work without code, so it needs the resource named.
+`accepted_external` is settled (resume skips it), its branch is not
+integrated, it does not make the run `unconverged`, and the State list
+`needs_human_verification` gains `{source: "blocker", subtask, resource,
+blocker}` beside the classifier's external items.
+
+**An external claim is checked, not taken on the word.** Acceptance ends
+work without code, so it is the one outcome a worker's word must not
+decide (§12): until this check, a resource the implementer made up — "a
+staging API key nobody named" — settled `accepted_external` like a real
+one. The implementer now types the resource as `external_resource_claim`,
+one of six kinds, and code verifies it in the worker's own environment —
+the container every worker shares, with the orchestrator's environment
+that `claude -p` inherits:
+
+| kind | the claim is backed when |
+|---|---|
+| `env_var{name}` | the variable is unset or empty |
+| `network{host, port}` | DNS or a TCP connect to it fails within a short timeout, through the container's network |
+| `file{path}` | the path is absent (relative to the worktree) |
+| `binary{name}` | `shutil.which` finds nothing, and the repository's own lockfiles, local tool directories, tool-version files and provision recipe do not install it |
+| `service_credential{name}` | no environment variable and no well-known credential file matches it |
+| `human_action{description, quote}` | its `quote` — a step only a person can take, such as an approval in a dashboard — appears verbatim (whitespace aside) in one of the run's typed external items: the planner's `external_preconditions`, the D4 `domain_blocked` rows, the classifier's `verifiability: external` items. Never in the task text alone: the task is where the work is described, so any span of it would do, and a quote lifted from it names no human step anyone declared |
+
+*The key has the shape of its kind.* Before any probe, the key must look
+like what it claims to be, or the claim is refuted: an `env_var` name
+matches `[A-Z_][A-Z0-9_]{2,}` and is not on a small fixed list of common
+English and shell words (`EXPORT`, `THE`, `FAILED`, `ERROR`, …); a
+`binary` name is a valid executable name (no `/`, no whitespace, not one
+of those words); a `file` is a path (a `/` or an extension, no
+whitespace, not a URL); a `network` host is a dotted host name or an IP
+literal; a `service_credential` name is env-var-shaped or path-shaped.
+Without this a one-letter or common-word key passes every check below:
+it occurs in any task and repository, and in the failure output of any
+undone subtask (`FAILED`, `assert`), so a claim of "env var `FAILED`"
+settled an undone subtask `accepted_external` (round-3 review M1).
+
+Three cross-checks follow, all mechanical whole-token matches of the
+claim's typed key (the name, host, path or quote), never a substring and
+never a reading of prose. An env var or credential name matches at
+identifier boundaries in its exact case; a path matches on path-component
+boundaries (`config/x.pem` inside `/srv/app/config/x.pem`, never inside
+`myconfig/x.pem`); a host matches at host-label boundaries, case-folded;
+a binary name at command-word boundaries; a `human_action` quote
+verbatim:
+
+- *Grounded.* The key appears in the task, the subtask's own spec, a typed
+  external item, or the repository at the run branch's tip (`git grep -F`,
+  each hit line then token-matched)
+  — so a resource named nowhere is not accepted, whatever the probe says,
+  since a probe for absence always backs something invented.
+- *Consistent.* When the planner declared external preconditions for this
+  subtask, or this subtask claims a classifier item typed external, or a
+  domain is blocked on an external, the key appears in one of them.
+- *Executed.* When the subtask has `verify` argvs, they are run (§8
+  *Settled by execution*): at least one must fail, and — for every kind
+  but `human_action`, whose description is prose — its output must name
+  the key.
+
+The check returns one of three verdicts. `verified` accepts. `refuted` (the
+variable is set, the key does not have its kind's shape, the host
+answers, the file exists, the quote is not there, the verify commands
+pass) and `unverified` (the check could not run:
+no claim was typed, the network probe's control host is unreachable, the
+probe hit its hard timeout, `git grep` or the verify commands could not
+decide) both type the result `other` and re-drive it from the shared
+budget, with the typed reason — "claimed missing env var X, but it is set"
+— in the re-drive note; the one exception is an `unverified` claim the
+environment cannot check twice running (*An environment that cannot check a
+claim does not burn the budget*, below), which settles `unconverged`. A check that cannot run never accepts: the user's
+rule is that leftover work is accepted only when its cause is an external
+resource no in-container step can supply, and an unrun check has not shown
+that.
+
+*A local service is not external.* A `network` claim on a host that is
+the container's own — `localhost` or a `.localhost` name, a name the
+container's `/etc/hosts` serves, or a host that resolves to a loopback,
+private (RFC 1918, IPv6 ULA), link-local or unspecified address — is never
+verified, whatever the probe sees. The user's rule accepts leftover work
+only for a resource no in-container step can supply, and a Postgres or
+Redis on localhost, or a compose service name, is exactly what an
+in-container step starts (leerie itself starts a throwaway Postgres for
+Prisma repos): "could not connect to the database" is the commonest
+blocker text, and on a closed local port the probe reads `unreachable`,
+which settled the subtask `accepted_external` with no work (round-3 review
+M2). Such a claim is refuted with the typed reason "local service: start
+it in-container", naming the address it resolved to, and re-driven. The
+check runs on the resolved address, not the spelling: the name is
+resolved by the probe itself, which reports a local address before it
+tries to connect. The price is a corporate service on a private address
+(split-horizon DNS): it cannot be accepted as external and ends
+`unconverged` with that reason, which the PR reports — a human reading it
+can supply the service; a run that wrongly accepted a local one would have
+skipped work leerie could do.
+
+The rule is about the resource, not the spelling of the claim. The same
+Postgres is as naturally claimed as a missing variable — "DATABASE_URL
+not set" is what the worker sees — so an `env_var` claim, and a
+`service_credential` claim whose name is variable-shaped, is checked
+against the value the repository itself gives that variable: a `KEY=value`
+line in an env template (`.env.example`, `.env.sample`, `.env.template`,
+`.env.test`, a committed `.env`) or a compose file's `environment:` entry,
+at the run branch's tip. A value whose host is local by the rule above —
+a URL's host, a DSN's `host=`, a bare `host:port` — or is a service the
+repository's own compose file defines, refutes the claim as a local
+service. So does a variable a Prisma schema reads as the URL of a
+`sqlite` datasource: a file database is the container's own. A value the
+templates leave as a placeholder (`${…}`, empty) decides nothing, and the
+other checks run as before; a template pointing at a remote host is not
+evidence the variable can be supplied, so it does not refute either.
+
+The network probe runs as a child process with a connect timeout inside a
+hard wall-clock timeout that kills it, so a resolver that never answers
+cannot stall the run; a hard timeout is `unverified`. When the claimed
+host is unreachable, it then probes a control — the API endpoint every worker already
+talks to (`ANTHROPIC_BASE_URL`'s host when set, else
+`api.anthropic.com:443`): if the control is unreachable, the container has
+no usable network and an unreachable claimed host proves nothing. The
+three runtimes differ only in the path out, not in what the probe sees:
+rootless containerd routes the container's TCP through its user-mode
+network (slirp4netns or pasta), which answers the container's SYN only
+once its own host-side connect succeeds, so a refused or unroutable host
+still fails the connect; rootful containerd (Colima on macOS) bridges and
+NATs, an ordinary connect; Fly and EC2 run the image on the machine's own
+network. DNS in each goes through the container's `resolv.conf`; a
+resolver that is down is a temporary failure (`EAI_AGAIN`), read as
+`unverified`, never as a missing host.
+
+*The probe takes the worker's way out.* Where egress is only through an
+HTTP proxy (`HTTPS_PROXY` / `HTTP_PROXY`), a direct connect to the control
+fails, so every network claim read `unverified` — re-driven until the
+budget was spent, a full implementer session each time, then `blocked`
+(round-3 review L4). A worker's own tools go through that proxy, so the
+probe does too: when a proxy is set and `NO_PROXY` does not exempt the
+host, the control and the claimed host are each probed by an HTTP
+`CONNECT host:port` through the proxy (with its credentials when the proxy
+URL carries them). A 2xx is reachable; a 502, 503 or 504 — the proxy could
+not resolve or reach the host — is unreachable; any other answer (a 403
+policy refusal, a 407) or a proxy that does not answer decides nothing,
+`unverified`. A local host is never proxied.
+
+*An environment that cannot check a claim does not burn the budget.* When
+the network probe cannot decide — the control is unreachable, the probe
+hit its hard timeout, the proxy refused to say — the claim is `unverified`
+with `reason: "environment"`: nothing the worker does next changes it. The
+first time, the subtask is re-driven as before (the worker may type a
+different, checkable claim, or finish the work). When the next blocked
+attempt returns the same claim and it is unverified for an environmental
+reason again, the subtask is settled `unconverged` at once, with the typed
+reason naming exactly what could not be checked — so the PR says which
+host could not be probed, and the rest of the budget is not spent
+rediscovering the environment. "Again" means on two blocked attempts with
+no completed one between them: an attempt that completes clears the
+earlier check, so a subtask that finished and is later re-driven (by
+coverage or delivery) and blocks once more on the same claim is re-driven
+once before it can settle this way — the earlier blocked attempt is no
+longer the one before it.
+
+**A dependent of accepted-external work is accepted-external too.** A
+subtask whose predecessor in the scheduler's graph — `depends_on`, or a
+`requires` tag that predecessor `provides`, transitively — settled
+`accepted_external` is not run. It settles `accepted_external` itself,
+citing the same resource, with its own entry under "Needs human
+verification" (`{source: "blocker", subtask, resource, blocker, via}`,
+`via` naming the predecessors). The decision is the graph's, a mechanism,
+never a reading of either subtask's prose: the edge says the dependent
+builds on the predecessor's output, and that output is exactly what never
+reaches the run branch (an accepted-external branch is not integrated). Run
+anyway, the dependent cannot succeed — it ends `blocked` on the missing
+upstream (`upstream_missing`), spends its re-drive rounds rediscovering
+that, and settles `unconverged`, turning the run `unconverged` for what is
+really the one human-only resource the run already reported. Settled this
+way it spends no implementer and no re-drive round, does not make the run
+`unconverged`, and the human sees one resource gating both subtasks. A
+subtask with an `unconverged` predecessor still settles `unconverged`
+(§13 *One re-drive budget per subtask*): unfinished work outranks
+human-gated work, since a human supplying the resource would not finish it.
+
+Before this, every
+`blocked` subtask was auto-accepted: of 246 auto-accepted subtasks over seven
+days, a classifier over the implementers' own evidence typed only 10
+`external_precondition`. Benched as D3/B1 on 47 hand-labelled blocked
+subtasks (4 external, 12 environment, 22 no-op, 9 real work), two samples of
+the typed prompt: 4 of 4 externals typed external in both samples, 0 of 86
+non-external results typed external (an earlier wording without the
+`environment_limit` kind and its exclusion sentence typed 23 of 86 external),
+and the routing agreed with the hand label on 36 and 37 of 47, 38 of 47 once
+`cannot_reproduce` is settled by execution.
 
 ### Budget feasibility — fail fast at the cheapest moment
 
@@ -8195,14 +16142,17 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the twenty-three worker types in
+Every main-loop LLM call in Leerie passes through one of the thirty-three worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
 `artifact_registry`, `integration_judge`, `no_work_judge`,
-`delivery_judge`, `defect_scope_auditor`, `acceptance_writer`, or `rebaser`
-(`fit_judge`/`splitter` are the P1
+`delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`,
+`set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`,
+`pr_reviewer`, `contract_extractor`, `falsifier`,
+`verifiability_classifier`, `delivery_ratchet`, or
+`forbidden_command_extractor` (`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
 `integration_judge`, `no_work_judge`, and `delivery_judge` are the
@@ -8210,8 +16160,17 @@ independent adversarial
 verifiers — see §8; `artifact_registry` is the pre-planning
 shared-vocabulary worker and `defect_scope_auditor` the pre-planning
 defect-shape enumerator — see §5; `acceptance_writer` writes the held-out
-acceptance tests — see §8; `rebaser` is the finalize-time rebase
-worker — see §6). Each worker type is a distinct **call type** — a
+acceptance tests, `set_auditor` audits a held-out set that keeps failing,
+`surrogate_fixer` is that audit's witness fix and `scope_judge` bounds a
+report-pointer task's sets to the report's own scenarios — see §8;
+`ci_checks` reads the repository's CI configuration — see §9;
+`pr_reviewer` is the advisory whole-PR review and `contract_extractor`
+types a worker-flagged contract — see §8 and §9; `falsifier` tries to prove a
+required item undelivered, and `verifiability_classifier` and
+`delivery_ratchet` re-verify met items after a repair — see §8;
+`forbidden_command_extractor` re-draws the commands the task forbids — see
+§9; `rebaser` is the
+finalize-time rebase worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
 worker role, no overlap, no gap. Post-run skill workers — `judge`,
@@ -8801,10 +16760,14 @@ directory.
 
 The group launcher runs on the laptop (the same node as chain fan-out, §19):
 it mints a `group_id`, fans out one leerie invocation per member (each
-`cd`'d into the member's repo), waits, then tags each member's `run.json`
-with the shared `group_id` — discovered from each member's basename-keyed
-state dir via the same newest-`finished_at` scan local finalize already
-uses. No coordinator machine, no in-container group state, no cross-machine
+`cd`'d into the member's repo, with `--group-id`), and waits. Each member's
+own orchestrator writes `group_id` into the `run.json` of the run it
+resolved, when that run starts: the one source of which run a container
+ran (§6 *Which run the container ran*), so only the group's own runs are
+tagged. On Fly and EC2 the launcher also writes it into the host-side
+`run.json` of the member's own run, found by that member launcher's pointer,
+for the time before the machine's copy is synced back. No coordinator
+machine, no in-container group state, no cross-machine
 protocol; GitHub is touched only host-side, per member, by that member's own
 `host_finalize`.
 

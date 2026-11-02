@@ -103,7 +103,7 @@ def test_enroll_failure_named_in_crash_message_when_worker_also_crashes(
             timeout=60, sid="planner-documentation-s0", leerie_dir=leerie_dir,
             verbosity="stream",
             worker_memory_max_bytes=1 << 30, worker_pids_max=64,
-            run_id="deadbeef1234"))
+            run_id="deadbeef1234", grants=leerie.WorkerGrants(("/",), ())))
 
     msg = str(exc_info.value)
     assert "ProcessLookupError" in msg, (
@@ -125,7 +125,7 @@ def test_no_enroll_note_when_enroll_succeeded(leerie, leerie_dir, monkeypatch):
             timeout=60, sid="planner-documentation-s0", leerie_dir=leerie_dir,
             verbosity="stream",
             worker_memory_max_bytes=1 << 30, worker_pids_max=64,
-            run_id="deadbeef1234"))
+            run_id="deadbeef1234", grants=leerie.WorkerGrants(("/",), ())))
 
     msg = str(exc_info.value)
     assert "possibly related" not in msg
@@ -146,7 +146,7 @@ def test_no_enroll_note_when_containment_disabled(leerie, leerie_dir, monkeypatc
         asyncio.run(leerie._invoke(
             ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
             timeout=60, sid="planner-documentation-s0", leerie_dir=leerie_dir,
-            verbosity="stream"))
+            verbosity="stream", grants=leerie.WorkerGrants(("/",), ())))
 
     assert enroll_calls == []
     assert "possibly related" not in str(exc_info.value)
@@ -155,36 +155,28 @@ def test_no_enroll_note_when_containment_disabled(leerie, leerie_dir, monkeypatc
 def test_cgroup_enroll_return_type_is_str_or_none(leerie, monkeypatch):
     """Direct unit pin: _cgroup_enroll's new contract is `str | None`
     (the failure reason, or None on success) — not the old bare bool."""
-    class _FakeSock:
-        def __init__(self, resp: str):
-            self._resp = resp
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def settimeout(self, *a):
-            pass
-
-        def connect(self, *a):
-            pass
-
-        def sendall(self, *a):
-            pass
-
-        def recv(self, *a):
-            return self._resp.encode()
-
+    # The real `_cgroup_request` over the orchestrator's descriptor, served
+    # by a peer that answers with the canned line.
     import socket as socket_mod
+    import threading
 
-    monkeypatch.setattr(
-        socket_mod, "socket",
-        lambda *a, **k: _FakeSock("ERR ProcessLookupError: [Errno 3] No such process"))
+    def _serve(resp: str):
+        ours, theirs = socket_mod.socketpair(socket_mod.AF_UNIX,
+                                             socket_mod.SOCK_SEQPACKET)
+
+        def answer():
+            _data, fds, _f, _a = socket_mod.recv_fds(theirs, 4096, 1)
+            with socket_mod.socket(fileno=fds[0]) as reply:
+                reply.sendall((resp + "\n").encode())
+            theirs.close()
+        threading.Thread(target=answer, daemon=True).start()
+        return ours
+
+    monkeypatch.setattr(leerie, "_CGROUP_BROKER", _serve(
+        "ERR ProcessLookupError: [Errno 3] No such process"))
     reason = leerie._cgroup_enroll("sid", 123)
     assert reason == "ERR ProcessLookupError: [Errno 3] No such process"
 
-    monkeypatch.setattr(socket_mod, "socket", lambda *a, **k: _FakeSock("OK"))
+    monkeypatch.setattr(leerie, "_CGROUP_BROKER", _serve("OK"))
     ok = leerie._cgroup_enroll("sid", 123)
     assert ok is None

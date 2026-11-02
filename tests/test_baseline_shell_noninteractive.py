@@ -20,6 +20,8 @@ import subprocess
 import sys
 import types
 
+from tests.conftest import measure_run_dir
+
 
 # --- source-coupling: the call site itself -------------------------------
 
@@ -37,10 +39,11 @@ def test_capture_baseline_uses_non_login_shell(leerie):
         "/etc/profile, which discards the Docker-image-ENV PATH mise "
         "needs to stay resolvable."
     )
-    assert '["bash", "-c", cmd]' in src, (
+    assert "_blt_shell_argv(cmd, forbidden)" in src and (
+        '["bash", "-c", cmd]' in inspect.getsource(leerie._blt_shell_argv)), (
         "_measure_blt must invoke commands via "
-        '["bash", "-c", cmd], matching every other command path in the '
-        "module."
+        '["bash", "-c", cmd] (built by _blt_shell_argv), matching every '
+        "other command path in the module."
     )
     cap = inspect.getsource(leerie._capture_conformance_baseline)
     assert '"bash"' not in cap, (
@@ -114,7 +117,11 @@ def test_login_shell_loses_the_mise_path_a_plain_shell_keeps(tmp_path):
 # --- end-to-end: _capture_conformance_baseline resolves the runner -------
 
 def _st(tmp_path, repo_root):
-    run_dir = tmp_path / "run"
+    # A state root of its own (`<tmp_path>/state`): the measured command is
+    # confined to its grant and reads nothing of the state root, so the
+    # runner fixture beside it must lie outside it (DESIGN §6 *Leerie's runs
+    # of the repository's commands are confined too*).
+    run_dir = measure_run_dir(tmp_path)
     (run_dir / "logs").mkdir(parents=True)
     st = types.SimpleNamespace(
         run_dir=run_dir,

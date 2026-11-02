@@ -16,6 +16,7 @@ with a real pytest command (`test_scoped` in `.leerie/config.toml`); only
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -42,6 +43,42 @@ EFFORTS = {"acceptance_writer": "medium", "conformer": "low"}
 
 
 @pytest.fixture(autouse=True)
+def _confirm_at_once(leerie, monkeypatch):
+    """A failing set file is confirmed without B*'s reruns here: each rerun
+    re-ran real pytest files, and the file grew from 6m22s (fae7d99) to
+    about thirteen minutes; with this stub it is back to about six and a
+    half. B* itself is pinned with real reruns in
+    tests/test_acceptance_own_start.py (a flaky set file is resource-affected,
+    a consistent one confirmed) and tests/test_bstar_confirm.py."""
+    async def confirm_all(candidates, run_final, caps, *, label, **_kw):
+        cand = sorted(set(candidates))
+        return {"candidates": cand, "confirmed": cand,
+                "resource_affected": [], "reruns_required": 0,
+                "reruns_run": 0, "budget_exhausted": False, "gate": None}
+    monkeypatch.setattr(leerie, "_confirm_still_failing", confirm_all)
+
+    # Held-case discovery reruns every passing defect file up to ten times
+    # (DESIGN §8 *A held case that fails again*); these fixtures are
+    # deterministic, so it would find nothing and only cost time. Pinned
+    # with real reruns in tests/test_acceptance_held_case_intermittent.py.
+    async def discover_nothing(st, caps, wt, rels, *a, **_kw):
+        return {"files": list(rels), "repeats_required": 0,
+                "repeats_run": 0, "budget_exhausted": False, "found": [],
+                "incomplete": False, "reason": ""}
+    monkeypatch.setattr(leerie, "_acceptance_discover", discover_nothing)
+
+
+@pytest.fixture(autouse=True)
+def _no_set_audit(leerie, monkeypatch):
+    """The post-repair set audit and rewrite has its own file
+    (tests/test_acceptance_set_audit.py); the gate tests here pin the repair
+    rounds, whose fakes answer only the conformer."""
+    async def unchanged(st, caps, models, efforts, staging, final, sha):
+        return final
+    monkeypatch.setattr(leerie, "_acceptance_audit_and_rewrite", unchanged)
+
+
+@pytest.fixture(autouse=True)
 def _clear_deps_memo(leerie):
     leerie._DEPS_INSTALLED.clear()
     yield
@@ -62,6 +99,11 @@ def _repo(tmp_path: Path) -> tuple[Path, str]:
         'test_scoped = "python3 -m pytest -q -p no:cacheprovider {test_files}"\n'
         'test = "python3 -m pytest -q -p no:cacheprovider"\n')
     (repo / "report.md").write_text("add(2, 3) returns -1; it must return 5\n")
+    # Leerie's own test runs in staging write `__pycache__/`; until its
+    # commands leave the tree as they found it (I2, DESIGN §6½) a repair
+    # worker would be held to that output by the clean-tree gate (DESIGN §8
+    # *A worker leaves its tree clean*). These tests are not about it.
+    (repo / ".gitignore").write_text("__pycache__/\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     return repo, _git(repo, "rev-parse", "HEAD")
@@ -74,13 +116,30 @@ def _st(leerie, tmp_path, repo, head, **data):
     (run_dir / "logs").mkdir()
     st = leerie.State(root, "run-a", repo_root=repo)
     st.data = {"task": "fix the bug in report.md", "verbosity": "quiet",
+               "categories": ["bug-fixing"],
                "repo_state_before_planning": {"head": head},
                "defect_scope": {"applicable": True, "sites": [],
                                 "defect_shape": "add subtracts"},
                "worker_count": 0}
     st.data.update(data)
     st.save()
+    # The run's own repository, as `_run_phases` makes it before any tree a
+    # worker gets (DESIGN §6 *The run's own repository*).
+    leerie._ensure_run_repo(st)
     return st
+
+
+def _plus_control(wt, out: dict, rel: str = "acc/test_control_zero.py"
+                  ) -> dict:
+    """A valid set needs at least one passing control (DESIGN §8): a writer
+    stub that declares only defect files adds this one."""
+    p = Path(wt) / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(CONTROL_TEST)
+    out["files"].append({"path": rel, "kind": "control",
+                         "cases": ["zero stays zero"],
+                         "failure_mode": "assertion"})
+    return out
 
 
 def _writer_stub(leerie, monkeypatch, files_by_set):
@@ -136,7 +195,7 @@ def test_valid_set_keeps_only_discriminating_defect_files(leerie, tmp_path,
     assert stored.read_text() == DEFECT_TEST
     assert "acceptance" in str(stored.relative_to(st.run_dir))
     # The disposable worktree is gone and the user's checkout is untouched.
-    assert not (st.run_dir / "worktrees" / "acceptance-1").exists()
+    assert not leerie._helper_worktree_path(st, "acceptance-1").exists()
     assert _git(repo, "status", "--porcelain") == ""
 
 
@@ -183,20 +242,24 @@ def test_writer_sees_the_report_contract_and_examples(leerie, tmp_path,
     assert seen[0]["effort"] == "medium" and seen[0]["autonomous"] is True
 
 
-@pytest.mark.parametrize("scope,skip,reason", [
-    ({"applicable": False}, False, "not applicable"),
-    ({"applicable": True, "sites": []}, True, "--skip-acceptance-check"),
+@pytest.mark.parametrize("cats,skip,reason", [
+    # N1-L: the audit's `applicable` no longer gates the sets; only a run
+    # whose classification never triggered the audit is skipped.
+    (["feature"], False, "not a defect-fix run"),
+    (["bug-fixing"], True, "--skip-acceptance-check"),
 ])
-def test_skips_are_recorded(leerie, tmp_path, scope, skip, reason):
+def test_skips_are_recorded(leerie, tmp_path, cats, skip, reason):
     repo, head = _repo(tmp_path)
-    st = _st(leerie, tmp_path, repo, head, defect_scope=scope,
+    st = _st(leerie, tmp_path, repo, head, categories=cats,
              skip_acceptance_check=skip)
     acc = asyncio.run(leerie.phase_acceptance_write(
         "t", st, _caps(leerie, 1), MODELS, EFFORTS))
     assert reason in acc["skipped"]
 
 
-def test_validity_base_prefers_the_earliest_same_task_sibling(leerie, tmp_path):
+def test_report_base_prefers_the_earliest_same_task_sibling(leerie, tmp_path):
+    """The earliest same-task base is now informational (`report_reproduced`);
+    the validity tree is the run's own start (DESIGN §8)."""
     repo, head = _repo(tmp_path)
     (repo / "calc.py").write_text(FIXED)
     _git(repo, "commit", "-qam", "later")
@@ -209,17 +272,17 @@ def test_validity_base_prefers_the_earliest_same_task_sibling(leerie, tmp_path):
         (d / "state.json").write_text(json.dumps({
             "task": st.data["task"], "started_at": started,
             "repo_state_before_planning": {"head": h}}))
-    assert leerie._acceptance_validity_base(st) == head
+    assert leerie._acceptance_report_base(st) == head
     # A sibling with no recorded start time cannot be ranked earliest ("" would
     # sort first): it is skipped, not chosen.
     d = st.run_dir.parent / "run-undated"
     d.mkdir()
     (d / "state.json").write_text(json.dumps({
         "task": st.data["task"], "repo_state_before_planning": {"head": later}}))
-    assert leerie._acceptance_validity_base(st) == head
+    assert leerie._acceptance_report_base(st) == head
     # A different task is ignored.
     st.data["task"] = "another task"
-    assert leerie._acceptance_validity_base(st) == later
+    assert leerie._acceptance_report_base(st) == later
 
 
 # --- the gate on the integrated tree -----------------------------------------
@@ -241,7 +304,10 @@ def _make_sets(leerie, st, n):
 
 def _staging(st, repo):
     staging = st.run_dir / "worktrees" / "staging"
-    _git(repo, "worktree", "add", "-q", "-b", "leerie/runs/x", str(staging))
+    # On the run's own branch (`_compute_run_branch`), as setup-run.sh leaves
+    # it: the clean-tree gate holds every worker there.
+    _git(st.run_repo, "worktree", "add", "-q", "-b",
+         f"leerie/runs/{st.run_id}", str(staging))
     return staging
 
 
@@ -286,15 +352,37 @@ def test_evaluation_never_touches_the_tree_and_never_overwrites(
         (False, True), (False, False)]
     assert _tree_snapshot(staging) == before    # not a byte changed
     assert seen_trees and all(t != str(staging) for t in seen_trees)
-    assert not (st.run_dir / "worktrees" / "acceptance-eval").exists()
+    assert not leerie._helper_worktree_path(st, "acceptance-eval").exists()
+
+
+@pytest.mark.parametrize("committed,uncommitted,passes", [
+    (FIXED, BUGGY, True), (BUGGY, FIXED, False)])
+def test_the_final_remeasure_reads_the_committed_tree(
+        leerie, tmp_path, committed, uncommitted, passes):
+    """Review round 9 suspicion (b): staging is the re-measure's `tree`,
+    and its working tree may differ from what ships. The verdict follows
+    the commit either way (DESIGN §8 *Every post-execution verdict is of
+    the committed tree*)."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    (staging / "calc.py").write_text(committed)
+    _git(staging, "commit", "-q", "--allow-empty", "-am", "the change")
+    sha = _git(staging, "rev-parse", "HEAD")
+    (staging / "calc.py").write_text(uncommitted)        # does not ship
+    sets = _make_sets(leerie, st, 1)
+    assert asyncio.run(leerie._acceptance_remeasure_final(
+        st, _caps(leerie, 1), str(staging), sets, sha, "final")) is True
+    final = st.data["acceptance"]["gate"]["final"]
+    assert [r["passed"] for r in final] == [passes]
 
 
 def test_a_crashed_evaluations_worktree_is_replaced(leerie, tmp_path):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     staging = _staging(st, repo)
-    stale = st.run_dir / "worktrees" / "acceptance-eval"
-    _git(repo, "worktree", "add", "-q", "--detach", str(stale), head)
+    stale = leerie._helper_worktree_path(st, "acceptance-eval")
+    _git(st.run_repo, "worktree", "add", "-q", "--detach", str(stale), head)
     (stale / "acc").mkdir()
     (stale / "acc" / "test_defect_1.py").write_text("# left by a crash\n")
     _commit_fix(staging)
@@ -348,7 +436,7 @@ def test_a_failed_install_is_no_evidence(leerie, tmp_path):
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 3), str(staging), sets, "t"))
     assert all(r["unmeasured"] for r in res)
-    assert not leerie._acceptance_majority_fails(res)
+    assert not leerie._acceptance_any_fails(res)
     _failing_recipe(st, fail=False)
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 3), str(staging), sets, "t2"))
@@ -409,15 +497,17 @@ def test_a_set_that_cannot_be_placed_is_no_evidence(leerie, tmp_path,
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     staging = _staging(st, repo)
-    real = leerie.shutil.copy2
+    # Nothing is copied onto disk any more (the sandbox places the set): a
+    # set whose run cannot start (a full disk) is the placement failure.
+    real = leerie._run_acceptance_file
     calls = []
 
-    def full(src, dst, *a, **k):
-        calls.append(dst)
+    async def full(*a, **k):
+        calls.append(a)
         if len(calls) == 1:
             raise OSError(28, "No space left on device")
-        return real(src, dst, *a, **k)
-    monkeypatch.setattr(leerie.shutil, "copy2", full)
+        return await real(*a, **k)
+    monkeypatch.setattr(leerie, "_run_acceptance_file", full)
     _commit_fix(staging)
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 2), str(staging), _make_sets(leerie, st, 2), "t"))
@@ -469,8 +559,9 @@ def test_helper_beside_the_tests_travels_with_the_set(leerie, tmp_path,
         # What running the test leaves behind.
         subprocess.run([sys.executable, "-m", "pytest", "-q",
                         "tests/test_defect_h.py"], cwd=wt, capture_output=True)
-        return {"files": [{"path": "tests/test_defect_h.py", "kind": "defect",
-                           "cases": ["sums via helper"]}]}
+        return _plus_control(wt, {"files": [
+            {"path": "tests/test_defect_h.py", "kind": "defect",
+             "cases": ["sums via helper"]}]}, "tests/test_control_zero.py")
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
@@ -484,6 +575,9 @@ def test_helper_beside_the_tests_travels_with_the_set(leerie, tmp_path,
                    env={**os.environ, "PYTHONPATH": str(staging)})
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 1), str(staging), acc["sets"], "t"))
+    # Discovery always leaves its record (review round 4 L1); it found
+    # nothing here.
+    assert res[0].pop("discovery")["found"] == []
     assert res == [{"index": 1, "passed": True, "unmeasured": False,
                     "failing_files": []}]
 
@@ -571,8 +665,15 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
                                               want):
     p = tmp_path / "report"
     p.write_text(text)
-    assert leerie._parse_runner_report(kind, p) == want
-    assert leerie._parse_runner_report(kind, tmp_path / "absent") is None
+    got = leerie._parse_runner_report(kind, p.read_bytes())
+    if want is None:
+        assert got is None
+    else:
+        # The per-case statuses ride along (A1); their own test below.
+        assert {k: got[k] for k in ("executed", "collection_error")} == want
+        assert set(got["cases"].values()) <= {"passed", "failed", "skipped",
+                                              "load_error"}
+    assert leerie._parse_runner_report(kind, None) is None
 
 
 @pytest.mark.parametrize("cmd,placed", [
@@ -665,8 +766,10 @@ def test_an_appended_junit_path_is_the_report_pytest_writes(
         cmd, tmp_path / "r.xml")
     subprocess.run(run_cmd, shell=True, cwd=tmp_path, env=env,
                    capture_output=True, check=False)
-    assert leerie._parse_runner_report(kind, tmp_path / "r.xml") == {
-        "executed": 1, "collection_error": False}
+    assert leerie._parse_runner_report(
+            kind, (tmp_path / "r.xml").read_bytes()) == {
+        "executed": 1, "collection_error": False,
+        "cases": {"test_a :: test_a.test_a": "passed"}}
 
 
 @pytest.mark.parametrize("cmd,rel", [
@@ -1028,7 +1131,19 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
 ])
 def test_runner_detection_reads_operators_as_the_shell_does(
         leerie, cmd, runner):
-    assert leerie._acceptance_runner(cmd, leerie._RUNNER_REPORTS) == runner
+    # The shell reading is the subject: the JS/Python runners only, since
+    # `go` is a reported runner of its own now (A4) and these commands use
+    # `go test` as the thing that is NOT pytest.
+    known = {k: leerie._RUNNER_REPORTS[k] for k in ("pytest", "jest",
+                                                    "vitest")}
+    assert leerie._acceptance_runner(cmd, known) == runner
+
+
+def test_go_and_cargo_are_reported_runners_now(leerie):
+    assert leerie._acceptance_runner("go test ./...",
+                                     leerie._RUNNER_REPORTS) == "go"
+    assert leerie._acceptance_runner("cargo test --test a",
+                                     leerie._RUNNER_REPORTS) == "cargo"
 
 
 def test_a_containerised_pytest_gets_no_environment_request_either(
@@ -1105,7 +1220,10 @@ def _import_writer(leerie, monkeypatch, files):
             if mode:
                 decl.append({"path": rel, "kind": "defect",
                              "cases": ["mul exists"], "failure_mode": mode})
-        return {"files": decl}
+        control = ("acc/control_zero_test.py"
+                   if any(r.endswith("_test.py") for r in files)
+                   else "acc/test_control_zero.py")
+        return _plus_control(wt, {"files": decl}, control)
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
 
@@ -1292,26 +1410,30 @@ def test_a_probe_failure_that_is_not_about_parsing_says_what_it_was(
     assert got is None and want_reason in why
 
 
-@pytest.mark.skipif(os.geteuid() == 0,
-                    reason="root ignores directory permissions")
-def test_an_unwritable_marker_directory_is_named_as_such(leerie, tmp_path):
-    """The probe's body could not write its marker, which read as "failed
-    before reaching the parse check (… a conftest …)"."""
+def test_the_parse_probe_never_touches_its_marker_on_disk(leerie, tmp_path):
+    """The marker is the sandbox's report, a path inside the sandbox only:
+    leerie neither writes nor removes it on disk, where its directory is the
+    tree's measurement directory, which confined code writes. Here a
+    measurement left `reports/` a link to a directory holding a file at the
+    marker's name; leerie used to truncate and remove it, "proving" the
+    directory writable (DESIGN §6 *Leerie never writes through a path
+    confined code shaped*)."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     (repo / "acc").mkdir()
     (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
-    reports = st.run_dir / "acceptance" / "reports"
-    reports.mkdir(parents=True)
-    reports.chmod(0o555)
-    try:
-        got, why = asyncio.run(leerie._acceptance_parse_probe(
-            st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
-            ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
-    finally:
-        reports.chmod(0o755)
-    assert got is None and "could not be prepared" in why
-    assert "conftest" not in why
+    reports = leerie._measure_dir(st, repo) / "reports"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    name = ("p-probe-" + hashlib.sha256(
+        b"acc/test_defect_mul.py").hexdigest()[:12])
+    (victim / name).write_text("someone else's\n")
+    reports.rmdir()
+    reports.symlink_to(victim)
+    asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+        ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
+    assert (victim / name).read_text() == "someone else's\n"
 
 
 def test_a_target_that_does_not_compile_is_a_parse_failure(leerie, tmp_path):
@@ -1473,14 +1595,16 @@ def test_an_import_defect_set_validates_and_passes_on_the_fix(
     assert res[0]["passed"] is True
 
 
-def test_majority_rule(leerie):
-    f = leerie._acceptance_majority_fails
+def test_any_failing_set_fails(leerie):
+    """Rewritten from the majority rule (A2): every failing validated set is
+    repaired, so one failing set of three fails."""
+    f = leerie._acceptance_any_fails
     assert f([{"passed": False}, {"passed": False}, {"passed": True}])
-    assert not f([{"passed": True}, {"passed": True}, {"passed": False}])
-    # A tie is not a passing majority.
+    assert f([{"passed": True}, {"passed": True}, {"passed": False}])
     assert f([{"passed": False}, {"passed": True}])
-    # Unmeasured sets are not evidence: excluded from the vote, and nothing
-    # measured is "no evidence", never a failing (or passing) majority.
+    assert not f([{"passed": True}, {"passed": True}])
+    # Unmeasured sets are not evidence, and nothing measured is "no
+    # evidence", never a failure (or a pass).
     assert not f([{"passed": True}, {"passed": False, "unmeasured": True}])
     assert not f([{"passed": False, "unmeasured": True}])
     assert not f([])
@@ -1516,8 +1640,9 @@ def test_undeclared_helper_travels_with_the_set(leerie, tmp_path,
         (wt / "acc" / "__init__.py").write_text("")
         (wt / "acc" / "helper_vals.py").write_text("EXPECTED = 5\n")
         (wt / "acc" / "test_defect_h.py").write_text(helper_test)
-        return {"files": [{"path": "acc/test_defect_h.py", "kind": "defect",
-                           "cases": ["sums via helper"]}]}
+        return _plus_control(wt, {"files": [
+            {"path": "acc/test_defect_h.py", "kind": "defect",
+             "cases": ["sums via helper"]}]})
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
@@ -1528,6 +1653,9 @@ def test_undeclared_helper_travels_with_the_set(leerie, tmp_path,
     _commit_fix(staging)
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 1), str(staging), acc["sets"], "t"))
+    # Discovery always leaves its record (review round 4 L1); it found
+    # nothing here.
+    assert res[0].pop("discovery")["found"] == []
     assert res == [{"index": 1, "passed": True, "unmeasured": False,
                     "failing_files": []}]
 
@@ -1592,14 +1720,15 @@ def test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest(
         if k == 1:
             q = Path(kw["cwd"]) / "acc" / "test_defect_1b.py"
             q.write_text(DEFECT_TEST)
-            return {"files": [
+            return _plus_control(kw["cwd"], {"files": [
                 {"path": str(p), "kind": "defect", "cases": ["a"]},
                 {"path": "acc/test_defect_1b.py", "kind": "defect",
-                 "cases": ["b"]}]}
+                 "cases": ["b"]}]})
         if k == 2:
             raise OSError("writer 2 blew up")
-        return {"files": [{"path": f"acc/test_defect_{k}.py", "kind": "defect",
-                           "cases": ["c"]}]}
+        return _plus_control(kw["cwd"], {"files": [
+            {"path": f"acc/test_defect_{k}.py", "kind": "defect",
+             "cases": ["c"]}]})
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
@@ -1656,8 +1785,9 @@ def test_ignored_build_output_elsewhere_does_not_travel(leerie, tmp_path,
         (wt / "dist" / "calc_built.py").write_text(BUGGY)
         (wt / "acc").mkdir()
         (wt / "acc" / "test_defect_x.py").write_text(DEFECT_TEST)
-        return {"files": [{"path": "acc/test_defect_x.py", "kind": "defect",
-                           "cases": ["sums"]}]}
+        return _plus_control(wt, {"files": [
+            {"path": "acc/test_defect_x.py", "kind": "defect",
+             "cases": ["sums"]}]})
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
         st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
@@ -1684,8 +1814,9 @@ def test_a_gitignored_helper_still_travels(leerie, tmp_path, monkeypatch):
         (wt / "acc").mkdir()
         (wt / "acc" / "cases.json").write_text('{"want": 5}')
         (wt / "acc" / "test_defect_j.py").write_text(reader)
-        return {"files": [{"path": "acc/test_defect_j.py", "kind": "defect",
-                           "cases": ["sums per cases.json"]}]}
+        return _plus_control(wt, {"files": [
+            {"path": "acc/test_defect_j.py", "kind": "defect",
+             "cases": ["sums per cases.json"]}]})
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
         st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
@@ -1712,6 +1843,52 @@ def test_verdict_is_by_exit_code(leerie, tmp_path, body, want):
         st, _caps(leerie, 1), str(repo), "test_probe.py",
         st.run_dir / "logs" / "p.log", "p"))
     assert got is want
+
+
+def test_evaluation_records_failing_cases_and_keeps_the_exit_verdict(
+        leerie, tmp_path):
+    """Evaluation asks the runner for its report only to name the failing
+    cases (has-work is decided per case, DESIGN §8); the verdict stays the
+    exit code — a file that cannot load still fails, and names nothing."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_two.py").write_text(
+        "def test_counted():\n    assert True\n\n"
+        "def test_variant():\n    assert False\n")
+    (repo / "test_broken.py").write_text("import no_such_module\n")
+    obs: dict = {}
+    got = asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "test_two.py",
+        st.run_dir / "logs" / "p.log", "p", cases_out=obs))
+    assert got is False
+    assert len(obs["failing_cases"]) == 1
+    assert "test_variant" in obs["failing_cases"][0]
+    obs2: dict = {}
+    got2 = asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "test_broken.py",
+        st.run_dir / "logs" / "p.log", "p2", cases_out=obs2))
+    assert got2 is False and "failing_cases" not in obs2
+
+
+def test_a_failing_sets_result_names_its_failing_cases(leerie, tmp_path):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 1)
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), sets, "cases"))
+    assert res[0]["failing_files"] == ["acc/test_defect_1.py"]
+    ids = res[0]["failing_cases"]["acc/test_defect_1.py"]
+    assert len(ids) == 1 and "test_add_sums" in ids[0]
+    # The id is the one validation records, so the scope judge's counted
+    # cases compare to it.
+    obs: dict = {}
+    (repo / "acc").mkdir(exist_ok=True)
+    (repo / "acc" / "test_defect_1.py").write_text(DEFECT_TEST)
+    asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_1.py",
+        st.run_dir / "logs" / "v.log", "v", validating=True, observed=obs))
+    assert obs["failing_cases"] == ids
 
 
 @pytest.mark.parametrize("body", [
@@ -1945,7 +2122,11 @@ def test_failures_section_is_names_only_and_hides_the_holdout(leerie, tmp_path):
     assert "add subtracts" in text
 
 
-def _run_gate(leerie, monkeypatch, st, fixer, measured=None):
+def _run_gate(leerie, monkeypatch, st, fixer, measured=None,
+              confirm_red=True):
+    """`measured` scripts the test axis; a red post-repair axis is then
+    confirmed (`confirm_red`) or not by a stubbed B* confirmation — its
+    real behaviour is pinned in tests/test_acceptance_red_axis_confirm.py."""
     calls = []
 
     async def fake_claude_p(**kw):
@@ -1960,6 +2141,12 @@ def _run_gate(leerie, monkeypatch, st, fixer, measured=None):
         async def fake_axes(tree, axes, st_, caps, **kw):
             return {"tests": seq.pop(0)}
         monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+
+        async def fake_confirm(*a, **kw):
+            return (("turned the test axis red", {"new": ["t::x"]})
+                    if confirm_red else ("", {"new": []}))
+        monkeypatch.setattr(leerie, "_acceptance_confirm_red_axis",
+                            fake_confirm)
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     return calls
@@ -1984,6 +2171,11 @@ def test_gate_repairs_at_high_effort_and_records_a_clean_final(
     assert "case from set 1" in up and "case from set 5" not in up
     gate = st.data["acceptance"]["gate"]
     assert all(r["passed"] for r in gate["final"]) and "residual" not in gate
+    # The commit `final` describes: the repaired HEAD, not the start — what
+    # the delivery re-drive compares before reusing the verdict.
+    staging = st.run_dir / "worktrees" / "staging"
+    assert gate["final_sha"] == _git(staging, "rev-parse", "HEAD")
+    assert gate["final_sha"] != gate["initial_sha"]
 
 
 def test_unfixed_tree_ships_with_a_residual_after_two_rounds(
@@ -2012,6 +2204,57 @@ def test_repair_that_turns_the_test_axis_red_is_rolled_back(
     assert gate["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
     assert gate["residual"]["failing_sets"] == 5
+
+
+def test_an_unconfirmed_red_test_axis_keeps_the_repair(
+        leerie, tmp_path, monkeypatch):
+    """The gate-wide rule resets only a confirmed regression: one red run
+    with no failure confirmed new under B* (a flake) keeps the repair's
+    fixes (DESIGN §8)."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    before = _git(staging, "rev-parse", "HEAD")
+    _run_gate(leerie, monkeypatch, st, _commit_fix,
+              measured=[{"passed": True, "measured": True},
+                        {"passed": False, "measured": True}],
+              confirm_red=False)
+    gate = st.data["acceptance"]["gate"]
+    assert "rolled_back" not in gate
+    assert gate["post_tests_confirm"] == {"new": []}
+    assert _git(staging, "rev-parse", "HEAD") != before
+    assert (staging / "calc.py").read_text() == FIXED
+
+
+def test_a_confirmation_that_raises_falls_back_to_the_red_run(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    before = _git(staging, "rev-parse", "HEAD")
+
+    async def boom(*a, **kw):
+        raise RuntimeError("no base worktree")
+    seq = [{"passed": True, "measured": True},
+           {"passed": False, "measured": True}]
+
+    async def fake_axes(tree, axes, st_, caps, **kw):
+        return {"tests": seq.pop(0)}
+
+    async def fake_claude_p(**kw):
+        _commit_fix(Path(kw["cwd"]))
+        return {}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+    monkeypatch.setattr(leerie, "_acceptance_confirm_red_axis", boom)
+    asyncio.run(leerie._run_acceptance_gate(
+        st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    gate = st.data["acceptance"]["gate"]
+    assert gate["rolled_back"] is True
+    assert gate["post_tests_confirm"]["error"].startswith("RuntimeError")
+    assert _git(staging, "rev-parse", "HEAD") == before
 
 
 def test_resume_mid_repair_still_rolls_back_a_red_repair(
@@ -2118,7 +2361,7 @@ def test_evaluation_installs_deps_before_running(leerie, tmp_path, monkeypatch):
     _run_gate(leerie, monkeypatch, st, _commit_fix)
     # Deps are installed in the evaluation worktree before its first
     # held-out file runs there — never in staging.
-    eval_wt = str(st.run_dir / "worktrees" / "acceptance-eval")
+    eval_wt = str(leerie._helper_worktree_path(st, "acceptance-eval"))
     assert events[0] == ("deps", eval_wt)
     assert events[1] == ("run", eval_wt)
 
@@ -2127,7 +2370,9 @@ def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
                                                       monkeypatch):
     """Round 1 commits a repair that turns the test axis red; round 2's
     `bump_workers` exhausts the budget. The rollback check must still run
-    (the budget error used to escape the gate before it)."""
+    (the budget error used to escape the gate before it). The repair fixes
+    no failing case either, so it is the per-round rule that resets it,
+    before round 2 — and nothing is left for the gate-wide one."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -2155,7 +2400,8 @@ def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
     gate = st.data["acceptance"]["gate"]
     assert len(calls) == 1
     assert "budget exhausted" in gate["rounds"][-1]["error"]
-    assert gate["rolled_back"] is True
+    assert gate["rounds"][0]["rollback_reason"] == "fixed no failing case"
+    assert gate["rounds"][0]["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
     assert gate["final"] is not None
 
@@ -2290,6 +2536,13 @@ def _passing(n):
              "failing_files": []} for k in range(1, n + 1)]
 
 
+def _no_cases(results):
+    """A measured verdict without the runner's per-case IDs (which only
+    the evaluation knows), for comparing with `_failing`/`_passing`."""
+    return [{k: v for k, v in r.items() if k != "failing_cases"}
+            for r in results]
+
+
 def _failing(n):
     return [{"index": k, "passed": False, "unmeasured": False,
              "failing_files": [f"acc/test_defect_{k}.py"]}
@@ -2323,7 +2576,7 @@ def test_resume_after_a_passing_but_red_round_still_rolls_back(
     if with_initial:
         # What ships is the pre-repair tree, so its persisted verdict — not
         # one re-measured on the repaired tree — is the record.
-        assert gate["final"] == _failing(5)
+        assert _no_cases(gate["final"]) == _failing(5)
         assert gate["residual"]["failing_sets"] == 5
 
 
@@ -2346,7 +2599,7 @@ def test_the_pre_repair_verdict_is_on_disk_before_round_one(
         asyncio.run(leerie._run_acceptance_gate(
             st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     disk = json.loads((st.run_dir / "state.json").read_text())
-    assert disk["acceptance"]["gate"]["initial"] == _failing(5)
+    assert _no_cases(disk["acceptance"]["gate"]["initial"]) == _failing(5)
 
 
 def test_resume_after_a_passing_round_runs_no_further_round(
@@ -2392,7 +2645,7 @@ def test_every_round_is_on_disk_before_the_rollback_check(
             st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     disk = json.loads((st.run_dir / "state.json").read_text())
     assert [r["round"] for r in disk["acceptance"]["gate"]["rounds"]] == [1]
-    assert disk["acceptance"]["gate"]["initial"] == _failing(5)
+    assert _no_cases(disk["acceptance"]["gate"]["initial"]) == _failing(5)
 
 
 def test_resume_after_the_rollback_decision_finishes_the_reset(
@@ -2414,7 +2667,7 @@ def test_resume_after_the_rollback_decision_finishes_the_reset(
     gate = st.data["acceptance"]["gate"]
     assert calls == []
     assert _git(staging, "rev-parse", "HEAD") == before
-    assert gate["final"] == _failing(5) and gate["residual"]["failing_sets"] == 5
+    assert _no_cases(gate["final"]) == _failing(5) and gate["residual"]["failing_sets"] == 5
 
 
 def test_a_recorded_rollback_runs_no_further_round(leerie, tmp_path,
@@ -2710,7 +2963,10 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
     repaired, failed = [], []
 
     async def eagain_once(argv, *a, **k):
-        if repaired and not failed and argv[:2] == ["git", "rev-parse"]:
+        # Wherever the subcommand sits: leerie names the tree's
+        # repository before it (`_tree_git_args`).
+        if (repaired and not failed and argv[:1] == ["git"]
+                and "rev-parse" in argv):
             failed.append(1)
             raise BlockingIOError(11, "Resource temporarily unavailable")
         return await real(argv, *a, **k)
@@ -2733,7 +2989,10 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     assert failed == [1]
     gate = st.data["acceptance"]["gate"]
-    assert gate["rolled_back"] is True
+    # The bad commit fixed no failing case: reset by the per-round rule,
+    # through the errored-round path.
+    assert gate["rounds"][0]["rollback_reason"] == "fixed no failing case"
+    assert gate["rounds"][0]["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
@@ -2768,7 +3027,9 @@ def test_a_failure_spawning_a_later_round_still_rolls_back(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     gate = st.data["acceptance"]["gate"]
     assert len(calls) == 2 and "error" in gate["rounds"][1]
-    assert gate["rolled_back"] is True
+    # Round 1's red commit fixed no failing case: the per-round rule reset
+    # it before round 2's spawn failure.
+    assert gate["rounds"][0]["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
@@ -2800,14 +3061,23 @@ def test_a_repair_that_breaks_the_install_is_rolled_back(
     assert gate["residual"]["failing_sets"] == 5
 
 
-def _counted_recipe(st, tmp_path, fail_from: int, fail_to: int):
-    """An install that fails on calls fail_from..fail_to (1-based)."""
-    counter = tmp_path / "install-calls"
-    st.data["provision"] = {"recipe": [{"kind": "install", "command": [
-        "bash", "-c",
-        f'n=$(( $(cat {counter} 2>/dev/null || echo 0) + 1 )); '
-        f'echo $n > {counter}; '
-        f'[ $n -lt {fail_from} ] || [ $n -gt {fail_to} ]']}]}
+def _counted_recipe(leerie, monkeypatch, st, fail_from: int, fail_to: int):
+    """An install that fails on calls fail_from..fail_to (1-based), counted
+    at leerie's own launch: every evaluation installs in a fresh tree, and a
+    confined install keeps nothing across trees (DESIGN §6 *Leerie's runs of
+    the repository's commands are confined too*)."""
+    st.data["provision"] = {"recipe": [{"kind": "install",
+                                        "command": ["true"]}]}
+    real = leerie._run_streaming
+    calls = {"n": 0}
+
+    async def counted(argv, **kw):
+        if (kw.get("label") or "").endswith("-install: true"):
+            calls["n"] += 1
+            if fail_from <= calls["n"] <= fail_to:
+                return 1, "install failed"
+        return await real(argv, **kw)
+    monkeypatch.setattr(leerie, "_run_streaming", counted)
 
 
 def test_a_one_off_install_failure_keeps_a_correct_repair(
@@ -2818,7 +3088,7 @@ def test_a_one_off_install_failure_keeps_a_correct_repair(
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
-    _counted_recipe(st, tmp_path, 2, 2)       # the round-1 evaluation fails
+    _counted_recipe(leerie, monkeypatch, st, 2, 2)       # the round-1 evaluation fails
     _run_gate(leerie, monkeypatch, st, _commit_fix,
               measured=[{"passed": True, "measured": True},
                         {"passed": True, "measured": True}])
@@ -2836,7 +3106,7 @@ def test_a_lasting_environment_failure_keeps_the_repair(
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
-    _counted_recipe(st, tmp_path, 2, 99)      # every later install fails
+    _counted_recipe(leerie, monkeypatch, st, 2, 99)      # every later install fails
     _run_gate(leerie, monkeypatch, st, _commit_fix,
               measured=[{"passed": True, "measured": True},
                         {"passed": True, "measured": True}])
@@ -2926,7 +3196,8 @@ def test_a_reset_that_cannot_spawn_is_tried_again(leerie, tmp_path,
         return real(argv, *a, **k)
     monkeypatch.setattr(leerie.subprocess, "run", eagain_once)
     monkeypatch.setattr(leerie.asyncio, "sleep", _no_sleep)
-    assert asyncio.run(leerie._acceptance_rollback(str(repo), before))
+    assert asyncio.run(leerie._restore_tree(repo, before, where="t",
+                                           branch="main"))
     assert _git(repo, "rev-parse", "HEAD") == before
 
 
@@ -2944,7 +3215,8 @@ def test_an_unreadable_head_after_a_reset_is_read_again(leerie, tmp_path,
         return "" if len(n) == 1 else await real(wt)
     monkeypatch.setattr(leerie, "_branch_head_sha", blip)
     monkeypatch.setattr(leerie.asyncio, "sleep", _no_sleep)
-    assert asyncio.run(leerie._acceptance_rollback(str(staging), before))
+    assert asyncio.run(leerie._restore_tree(staging, before, where="t",
+                                           branch="main"))
     assert _git(repo, "rev-parse", "HEAD") == before
 
 
@@ -2992,7 +3264,9 @@ def test_a_one_off_install_failure_mid_loop_keeps_the_next_round(
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
-    _counted_recipe(st, tmp_path, 2, 2)       # round 1's evaluation fails
+    # Call 2 is staging's committed view (the gate's test IDs); call 3 is
+    # round 1's evaluation.
+    _counted_recipe(leerie, monkeypatch, st, 3, 3)       # round 1's evaluation fails
     calls = _run_gate(leerie, monkeypatch, st, lambda _p: None,
                       measured=[{"passed": True, "measured": True}])
     gate = st.data["acceptance"]["gate"]
@@ -3009,7 +3283,7 @@ def test_a_commit_already_retried_in_the_loop_is_not_retried_again(
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
-    _counted_recipe(st, tmp_path, 2, 99)      # every later install fails
+    _counted_recipe(leerie, monkeypatch, st, 2, 99)      # every later install fails
     labels = []
     real = leerie._evaluate_acceptance_sets_inner
 
@@ -3029,8 +3303,42 @@ def test_gate_is_resume_idempotent(leerie, tmp_path, monkeypatch):
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 1),
-                             "gate": {"final": []}}
+                             "gate": {"final": [], "final_sha": head}}
+    measured: list = []
+
+    async def no_eval(*a, **kw):
+        measured.append(a)
+        return []
+    monkeypatch.setattr(leerie, "_evaluate_acceptance_sets", no_eval)
     assert _run_gate(leerie, monkeypatch, st, _commit_fix) == []
+    assert measured == []
+    assert st.data["acceptance"]["gate"] == {"final": [], "final_sha": head}
+
+
+def test_a_finished_gate_of_another_commit_is_measured_again(
+        leerie, tmp_path, monkeypatch):
+    # DESIGN §8 *A finished verdict is reused only on the commit it was
+    # measured on*: a passing `final` of a tree that no longer ships (a
+    # re-drive group moved HEAD before a crash) is measured again on HEAD —
+    # with no repair round.
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    stale = [{"index": 1, "passed": True, "unmeasured": False,
+              "failing_files": []}]
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 1),
+                             "gate": {"final": stale, "final_sha": "0" * 40,
+                                      "rounds": []}}
+    assert _run_gate(leerie, monkeypatch, st, _commit_fix) == []
+    gate = st.data["acceptance"]["gate"]
+    assert gate["final_sha"] == head
+    assert [(r["index"], r["passed"]) for r in gate["final"]] == [(1, False)]
+    assert gate["final"][0]["failing_files"] == ["acc/test_defect_1.py"]
+    assert gate["residual"]["failing_sets"] == 1
+    assert gate["rounds"] == []
+    leerie._decide_outcome(st, any_commits=True)
+    assert ("1 held-out acceptance set(s) still fail"
+            in st.data["outcome_reasons"])
 
 
 # --- cross-run residual, hiding, wiring --------------------------------------
@@ -3043,11 +3351,15 @@ def test_residual_reaches_the_next_runs_planner_ctx(leerie, tmp_path):
     (d / "orchestrator.exit_code").write_text("0")
     (d / "state.json").write_text(json.dumps({
         "task": st.data["task"],
-        "acceptance": {"gate": {"residual": {
-            "failing_sets": 3, "total_sets": 5,
-            "cases": ["add sums two ints"]}}}}))
+        "acceptance": {
+            "sets": [{"index": i} for i in (1, 2, 3)],
+            "gate": {"residual": {
+                "failing_sets": 1, "total_sets": 3,
+                "cases": ["add sums two ints"], "sets": [1],
+                "cases_by_set": {"1": ["add sums two ints"]}}}}}))
     res = leerie._prior_delivery_residual(st)
     assert res["acceptance_unmet"]["cases"] == ["add sums two ints"]
+    assert res["acceptance_unmet"]["held_back_failing_sets"] == 0
     assert res["acceptance_unmet"]["unmeasured_final"] is False
     assert "acceptance_unmet" in leerie._load_prompt("planner")
 
@@ -3060,16 +3372,19 @@ def test_fixers_cannot_read_the_sets(leerie, tmp_path):
         # calls.ndjson the writers' responses.
         assert leerie._acceptance_read_denials(w, run_dir).split(",") == [
             f"Read(/{run_dir}/acceptance/**)",
-            f"Read(/{run_dir}/worktrees/acceptance-eval/**)",
+            # run-id-prefixed: the run directory's name is the run id
+            f"Read(/{run_dir}/worktrees/r-acceptance-eval/**)",
             f"Read(/{run_dir}/logs/**)",
             f"Read(/{run_dir}/orchestrator.log)",
             f"Read(/{run_dir}/calls.ndjson)",
             f"Read(/{run_dir}/state.json)",
+            # each worker's own CLI configuration, its transcripts included
+            f"Read(/{run_dir}/workers/*/config/**)",
             "Read(~/.claude/projects/**)"]
     # The fixers' prompts read only these run-directory paths, none denied.
     for w in ("implementer", "conformer"):
         prompt = leerie._load_prompt(w)
-        for used in ("subtasks/", "criteria/"):
+        for used in ("subtasks/", "notes/"):
             assert used in prompt
     for w in ("planner", "acceptance_writer", "delivery_judge"):
         assert leerie._acceptance_read_denials(w, run_dir) == ""
@@ -3087,3 +3402,443 @@ def test_wiring_order_in_run_phases(leerie):
     i_gate = src.index("await _run_acceptance_gate(")
     i_final = src.index("await phase_finalize(")
     assert i_recheck < i_gate < i_final
+
+
+# --- per-round rollback: a repair round that fixes nothing (DESIGN §8 *A
+# repair round that fixes nothing is rolled back*) -----------------------
+
+def _hedge(staging: Path):
+    """What the replayed rounds did: a change that fixes no failing case."""
+    (staging / "calc.py").write_text(
+        BUGGY + "\n\ndef _fallback(a, b):\n    return a - b\n")
+    _git(staging, "commit", "-qam", "conformer: defensive fallback")
+
+
+def test_a_round_that_fixes_no_failing_case_is_reset_to_its_own_start(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    start = _git(staging, "rev-parse", "HEAD")
+    # Round 1 hedges, round 2 fixes: round 2 starts from the tree before
+    # round 1, and its fix is kept.
+    fixers = [_hedge, _commit_fix]
+    calls = _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    assert len(calls) == 2
+    gate = st.data["acceptance"]["gate"]
+    r1, r2 = gate["rounds"]
+    assert r1["pre_sha"] == start and r1["fixed_cases"] == []
+    assert r1["rollback_reason"] == "fixed no failing case"
+    assert r1["rolled_back"] is True
+    assert r2["pre_sha"] == start and r2["fixed_cases"]
+    assert not r2.get("rollback_reason")
+    log = _git(staging, "log", "--format=%s", f"{start}..HEAD")
+    assert log == "conformer: fix add"           # the hedge is gone
+    assert "_fallback" not in (staging / "calc.py").read_text()
+    assert all(r["passed"] for r in gate["final"])
+    assert "round_pre" not in gate
+
+
+def test_two_rounds_that_fix_nothing_leave_the_tree_they_started_from(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    start = _git(staging, "rev-parse", "HEAD")
+    _run_gate(leerie, monkeypatch, st, _hedge)
+    gate = st.data["acceptance"]["gate"]
+    assert [r["rollback_reason"] for r in gate["rounds"]] == [
+        "fixed no failing case"] * 2
+    assert _git(staging, "rev-parse", "HEAD") == start
+    # The residual is the measured verdict of the tree that ships.
+    assert gate["residual"]["failing_sets"] == 5
+    assert gate["final_sha"] == start
+
+
+TWO_CASES = ("from calc import add\n\n"
+             "def test_two_and_three():\n    assert add(2, 3) == 5\n\n"
+             "def test_one_and_one():\n    assert add(1, 1) == 2\n")
+HALF_FIX = ("def add(a, b):\n"
+            "    return a + b if a == 2 else a - b\n")
+
+
+def test_a_round_that_fixes_one_case_of_a_failing_file_is_kept(
+        leerie, tmp_path, monkeypatch):
+    """Counted in cases: the file still fails, but one of its two failing
+    cases passes now — progress."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 1)
+    (Path(sets[0]["dir"]) / "acc" / "test_defect_1.py").write_text(TWO_CASES)
+    st.data["acceptance"] = {"sets": sets}
+
+    def half(p):
+        (p / "calc.py").write_text(HALF_FIX)
+        _git(p, "commit", "-qam", "conformer: half")
+    fixers = [half, lambda p: None]
+    _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    r1 = st.data["acceptance"]["gate"]["rounds"][0]
+    assert len(r1["fixed_cases"]) == 1
+    assert "test_two_and_three" in r1["fixed_cases"][0]
+    assert not r1.get("rollback_reason")
+    assert (staging / "calc.py").read_text() == HALF_FIX
+
+
+MIXED_CASES = ("from calc import add\n\n"
+               "def test_two_and_three():\n    assert add(2, 3) == 5\n\n"
+               "def test_three_and_zero():\n    assert add(3, 0) == 3\n\n"
+               "def test_four_and_zero():\n    assert add(4, 0) == 4\n")
+# Fixes add(2, 3) and breaks add(3, 0) and add(4, 0), which passed before.
+TRADE_FIX = ("def add(a, b):\n"
+             "    return a + b if a == 2 else a * b\n")
+
+
+def test_a_round_that_fixes_one_case_by_breaking_passing_ones_is_reset(
+        leerie, tmp_path, monkeypatch):
+    """Review round 1 M4: worse is counted in cases, like progress. The round
+    fixes one failing case and makes two passing cases of the same set fail;
+    counted in files nothing changed (one failing file before and after),
+    and the round stood with the held-out verdict strictly worse."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    start = _git(staging, "rev-parse", "HEAD")
+    sets = _make_sets(leerie, st, 1)
+    (Path(sets[0]["dir"]) / "acc" / "test_defect_1.py").write_text(
+        MIXED_CASES)
+    st.data["acceptance"] = {"sets": sets}
+
+    def trade(p):
+        (p / "calc.py").write_text(TRADE_FIX)
+        _git(p, "commit", "-qam", "conformer: trade")
+    fixers = [trade, lambda p: None]
+    _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    r1 = st.data["acceptance"]["gate"]["rounds"][0]
+    assert len(r1["fixed_cases"]) == 1
+    assert "test_two_and_three" in r1["fixed_cases"][0]
+    assert len(r1["broken_cases"]) == 2
+    assert all("zero" in c for c in r1["broken_cases"])
+    assert r1["rollback_reason"] == "broke previously passing held-out case(s)"
+    assert r1["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == start
+    assert (staging / "calc.py").read_text() == BUGGY
+
+
+def test_acceptance_broken_cases_counts_a_passing_set_that_fails(leerie):
+    """The reviewer's case: set 1 trades c1 for c2/c3 and set 2, passing
+    before, fails after — every newly failing case is counted, the fixed one
+    is still reported as fixed."""
+    before = [{"index": 1, "passed": False, "failing_files": ["a.test.ts"],
+               "failing_cases": {"a.test.ts": ["c1"]}},
+              {"index": 2, "passed": True, "failing_files": []}]
+    after = [{"index": 1, "passed": False, "failing_files": ["a.test.ts"],
+              "failing_cases": {"a.test.ts": ["c2", "c3"]}},
+             {"index": 2, "passed": False, "failing_files": ["b.test.ts"],
+              "failing_cases": {"b.test.ts": ["x"]}}]
+    assert leerie._acceptance_fixed_cases(before, after) == [
+        "1:a.test.ts::c1"]
+    assert leerie._acceptance_broken_cases(before, after) == [
+        "1:a.test.ts::c2", "1:a.test.ts::c3", "2:b.test.ts::x"]
+    # Nothing newly failing: an honest partial fix.
+    assert leerie._acceptance_broken_cases(before, before) == []
+
+
+def test_acceptance_broken_cases_counts_a_file_that_fails_as_a_whole(
+        leerie):
+    """Review round 2 M4 (the reviewer's probe): set 1's case is fixed and
+    set 2's file, failing before with a named case, fails after with no
+    case list — a collection error. Every case of it that passed now
+    fails: worse, counted as the file's key."""
+    before = [{"index": 1, "passed": False, "unmeasured": False,
+               "failing_files": ["a.py"], "failing_cases": {"a.py": ["c1"]}},
+              {"index": 2, "passed": False, "unmeasured": False,
+               "failing_files": ["b.py"], "failing_cases": {"b.py": ["d1"]}}]
+    after = [{"index": 1, "passed": True, "unmeasured": False,
+              "failing_files": []},
+             {"index": 2, "passed": False, "unmeasured": False,
+              "failing_files": ["b.py"]}]
+    assert leerie._acceptance_fixed_cases(before, after) == ["1:a.py::c1"]
+    assert leerie._acceptance_broken_cases(before, after) == ["2:b.py"]
+    # Whole-file on both sides, or whole-file to named: not on its own worse.
+    whole = [dict(after[1])]
+    assert leerie._acceptance_broken_cases(whole, whole) == []
+    assert leerie._acceptance_broken_cases(whole, [before[1]]) == []
+
+
+HELPER_BUGGY = "def mul(a, b):\n    return a + b\n"
+HELPER_TEST = ("from helper import mul\n\n"
+               "def test_mul():\n    assert mul(2, 3) == 6\n\n"
+               "def test_mul_zero():\n    assert mul(0, 0) == 0\n")
+
+
+def test_a_round_that_fixes_a_case_by_making_a_set_file_unimportable_is_reset(
+        leerie, tmp_path, monkeypatch):
+    """Review round 2 M4, end to end: the round fixes one case of set 1 and
+    deletes the module set 2 imports, so set 2's file — failing one named
+    case and passing another before — now fails to collect. Counted only
+    by name, nothing newly failed and the round stood."""
+    repo, head = _repo(tmp_path)
+    (repo / "helper.py").write_text(HELPER_BUGGY)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "helper")
+    head = _git(repo, "rev-parse", "HEAD")
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    start = _git(staging, "rev-parse", "HEAD")
+    sets = _make_sets(leerie, st, 2)
+    (Path(sets[0]["dir"]) / "acc" / "test_defect_1.py").write_text(TWO_CASES)
+    (Path(sets[1]["dir"]) / "acc" / "test_defect_2.py").write_text(
+        HELPER_TEST)
+    st.data["acceptance"] = {"sets": sets}
+
+    def half_and_break(p):
+        (p / "calc.py").write_text(HALF_FIX)
+        (p / "helper.py").unlink()
+        _git(p, "commit", "-qam", "conformer: half, drop helper")
+    fixers = [half_and_break, lambda p: None]
+    _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    r1 = st.data["acceptance"]["gate"]["rounds"][0]
+    assert any("test_two_and_three" in c for c in r1["fixed_cases"])
+    assert r1["broken_cases"] == ["2:acc/test_defect_2.py"]
+    assert r1["rollback_reason"] == "broke previously passing held-out case(s)"
+    assert r1["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == start
+    assert (staging / "helper.py").read_text() == HELPER_BUGGY
+
+
+def _timeout_first_after_run(leerie, monkeypatch, rel: str, nth: int,
+                             seen: list):
+    """Make the `nth` first-run (not a confirm or discovery rerun) of `rel`
+    time out; every other run is real. `seen` collects the labels."""
+    real = leerie._run_streaming
+    count = {"n": 0}
+
+    async def spy(argv, **kw):
+        label = kw.get("label") or ""
+        if rel in label and "confirm" not in label and "discover" not in label:
+            count["n"] += 1
+            seen.append(label)
+            if count["n"] == nth:
+                raise subprocess.TimeoutExpired(argv, 1.0)
+        return await real(argv, **kw)
+    monkeypatch.setattr(leerie, "_run_streaming", spy)
+
+
+def test_a_first_run_timeout_then_an_ordinary_failure_does_not_roll_back(
+        leerie, tmp_path, monkeypatch):
+    """Review round 3 L1, end to end with real pytest: the round fixes one
+    case of set 1 and leaves set 2's file failing the same named case it
+    failed before. On the repaired tree set 2's first run times out and the
+    confirming rerun fails in the ordinary way, naming that case. The
+    file's cases come from every run of the vote, so nothing newly fails:
+    the good round is kept. Read from the first run alone, the file was a
+    whole-file collapse and the round was rolled back as worse."""
+    repo, head = _repo(tmp_path)
+    (repo / "helper.py").write_text(HELPER_BUGGY)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "helper")
+    head = _git(repo, "rev-parse", "HEAD")
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 2)
+    (Path(sets[0]["dir"]) / "acc" / "test_defect_1.py").write_text(TWO_CASES)
+    (Path(sets[1]["dir"]) / "acc" / "test_defect_2.py").write_text(
+        HELPER_TEST)
+    st.data["acceptance"] = {"sets": sets}
+    labels: list = []
+    reruns: list = []
+
+    async def confirm_by_one_real_rerun(candidates, run_final, caps, *,
+                                        label, **_kw):
+        # B* with one real rerun (the autouse stub confirms with none, and
+        # this defect needs the confirming rerun to happen).
+        cand = sorted(set(candidates))
+        still = await run_final(600.0)
+        reruns.append((label, cand, sorted(still or [])))
+        ok = [c for c in cand if still is not None and c in still]
+        return {"candidates": cand, "confirmed": ok,
+                "resource_affected": [c for c in cand if c not in ok],
+                "reruns_required": 1, "reruns_run": 1,
+                "budget_exhausted": False, "gate": None}
+    monkeypatch.setattr(leerie, "_confirm_still_failing",
+                        confirm_by_one_real_rerun)
+    # Call 1 is the start's evaluation; call 2 the repaired tree's.
+    _timeout_first_after_run(leerie, monkeypatch, "acc/test_defect_2.py", 2,
+                             labels)
+
+    def half(p):
+        (p / "calc.py").write_text(HALF_FIX)
+        _git(p, "commit", "-qam", "conformer: half")
+    fixers = [half, lambda p: None]
+    _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    assert len(labels) >= 2                 # the timeout really fired
+    # ... and the confirming rerun on the repaired tree failed set 2's file
+    # in the ordinary way.
+    assert any(c == ["acc/test_defect_2.py"] == s for _l, c, s in reruns[2:])
+    r1 = st.data["acceptance"]["gate"]["rounds"][0]
+    assert any("test_two_and_three" in c for c in r1["fixed_cases"])
+    assert r1["broken_cases"] == []
+    assert "rollback_reason" not in r1
+    assert not r1.get("rolled_back")
+    assert _git(staging, "rev-parse", "HEAD") != _git(repo, "rev-parse",
+                                                      "main")
+    assert (staging / "calc.py").read_text() == HALF_FIX
+    # Round 1's own verdict on set 2's file names the case the confirming
+    # rerun saw failing (round 2's evaluation ran with no timeout).
+    assert labels[1].startswith("acceptance-gate-r1-")
+    after = {r["index"]: r for r in r1["results"]}
+    (case,) = after[2]["failing_cases"]["acc/test_defect_2.py"]
+    assert case.endswith("test_mul")
+    assert "no_case_evidence_files" not in after[2]
+
+
+def test_run_acceptance_file_marks_a_timeout_as_a_resource_run(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    (repo / "acc" / "test_x.py").write_text(DEFECT_TEST)
+
+    async def boom(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 1.0)
+    monkeypatch.setattr(leerie, "_run_streaming", boom)
+    obs: dict = {}
+    assert asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 5), str(repo), "acc/test_x.py",
+        st.run_dir / "logs" / "x.log", "t", cases_out=obs)) is False
+    # `timed_out` tells a timeout from a signal death for the PR's line on
+    # an unmeasured set (DESIGN §8 *A held-out set the final tree leaves
+    # unmeasured is never silent*).
+    assert obs == {"resource": True, "timed_out": True}
+    assert leerie._acceptance_run_case_evidence(obs) is None
+
+
+def test_rc_is_resource_signal(leerie):
+    assert leerie._rc_is_resource_signal(-9)
+    assert leerie._rc_is_resource_signal(137)       # 128 + SIGKILL
+    assert leerie._rc_is_resource_signal(139)       # 128 + SIGSEGV
+    assert not leerie._rc_is_resource_signal(1)
+    assert not leerie._rc_is_resource_signal(2)
+    assert not leerie._rc_is_resource_signal(0)
+
+
+def test_acceptance_vote_cases_reads_every_run(leerie):
+    """Review round 3 L1: the cases come from every failing run of the
+    vote, and a run with a resource signature gives no case evidence."""
+    timeout = {"resource": True}
+    named = {"failing_cases": ["t::a"],
+             "failing_messages": {"t::a": "AssertionError: 1 != 2"}}
+    signed = {"failing_cases": ["t::b"],
+              "failing_messages": {"t::b": "Failed: Timeout >5.0s"}}
+    collection = {}
+    # The first run timed out: the rerun's cases, not a whole-file failure.
+    assert leerie._acceptance_vote_cases([timeout, named]) == ["t::a"]
+    assert leerie._acceptance_vote_cases([named, timeout]) == ["t::a"]
+    # A run whose every failing case carries a resource signature is none.
+    assert leerie._acceptance_vote_cases([signed, named]) == ["t::a"]
+    # Every run resource-signed: no case evidence at all.
+    assert leerie._acceptance_vote_cases([timeout, signed]) is None
+    assert leerie._acceptance_vote_cases([]) is None
+    # An ordinary failure naming no case is a whole-file failure ...
+    assert leerie._acceptance_vote_cases([timeout, collection]) == []
+    # ... unless another run named cases.
+    assert leerie._acceptance_vote_cases([collection, named]) == ["t::a"]
+    # A case named by every run; all of them when none is.
+    ab = {"failing_cases": ["t::a", "t::c"]}
+    assert leerie._acceptance_vote_cases([named, ab]) == ["t::a"]
+    assert leerie._acceptance_vote_cases(
+        [{"failing_cases": ["t::c"]}, named]) == ["t::a", "t::c"]
+    # A case with no message is named evidence, never a signature.
+    assert leerie._acceptance_vote_cases(
+        [{"failing_cases": ["t::d"]}]) == ["t::d"]
+
+
+def test_a_file_with_no_case_evidence_is_not_a_collapse(leerie):
+    """Every run after carried a resource signature: failing, but no
+    evidence it lost its named cases — not worse. A collection error (an
+    ordinary failure naming nothing) still is (review round 2 M4)."""
+    before = [{"index": 2, "passed": False, "unmeasured": False,
+               "failing_files": ["b.py"], "failing_cases": {"b.py": ["d1"]}}]
+    blind = [{"index": 2, "passed": False, "unmeasured": False,
+              "failing_files": ["b.py"], "no_case_evidence_files": ["b.py"]}]
+    whole = [{"index": 2, "passed": False, "unmeasured": False,
+              "failing_files": ["b.py"]}]
+    assert leerie._acceptance_broken_cases(before, blind) == []
+    assert leerie._acceptance_broken_cases(before, whole) == ["2:b.py"]
+    # A file that passed before and fails after is still worse, blind or not.
+    passed = [{"index": 2, "passed": True, "unmeasured": False,
+               "failing_files": []}]
+    assert leerie._acceptance_broken_cases(passed, blind) == ["2:b.py"]
+    # The delivery re-drive's keys carry the mark too.
+    keys, _ = leerie._redrive_failing(
+        blind, [{"index": 2, "defect_files": ["b.py"],
+                 "control_files": []}], {2})
+    assert keys["2:b.py"]["no_case_evidence"] is True
+    assert leerie._redrive_broken_cases(
+        {"2:b.py": {"failing_cases": ["d1"]}}, keys) == []
+
+
+def test_a_resume_finishes_a_decided_round_rollback(leerie, tmp_path,
+                                                    monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    start = _git(staging, "rev-parse", "HEAD")
+    _hedge(staging)
+    hedged = _git(staging, "rev-parse", "HEAD")
+    sets = _make_sets(leerie, st, 5)
+    st.data["acceptance"] = {"sets": sets, "gate": {
+        "before_sha": start, "initial": _failing(5), "initial_sha": start,
+        "pre_tests_passed": False,
+        "rounds": [{"round": 1, "results": _failing(5), "sha": hedged,
+                    "pre_sha": start, "fixed_cases": [],
+                    "rollback_reason": "fixed no failing case"}]}}
+    calls = _run_gate(leerie, monkeypatch, st, lambda p: None)
+    gate = st.data["acceptance"]["gate"]
+    assert gate["rounds"][0]["rolled_back"] is True
+    assert len(calls) == 1                       # round 2 only
+    assert _git(staging, "rev-parse", "HEAD") == start
+
+
+# --- repair rounds see the task and its required items (lane A 3d item 3) --
+
+def test_repair_rounds_get_the_task_and_required_items_not_held_data(
+        leerie, tmp_path, monkeypatch):
+    """Not blind: the task text and every required item, with its typed
+    parts, come before the failure names — and the held-out discipline
+    stands (no held-back names, no test source)."""
+    repo, head = _repo(tmp_path)
+    items = [{"item": "add returns the sum", "span": "S1",
+              "verifiability": "tree",
+              "parts": ["Root-cause fix with no defensive code",
+                        "No regressions in existing functionality"]},
+             "a plain-string item"]
+    st = _st(leerie, tmp_path, repo, head, working_branch="main",
+             required_items=items)
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    calls = _run_gate(leerie, monkeypatch, st, _commit_fix)
+    up = calls[0]["user_prompt"]
+    i_task = up.index("TASK (")
+    i_items = up.index("REQUIRED ITEMS (")
+    i_fail = up.index("ACCEPTANCE FAILURES")
+    assert i_task < i_items < i_fail
+    assert "fix the bug in report.md" in up[i_task:i_items]
+    block = up[i_items:i_fail]
+    entries = json.loads(block[block.index("["):block.rindex("]") + 1])
+    assert entries == [
+        {"item_index": 0, "item": "add returns the sum",
+         "parts": ["Root-cause fix with no defensive code",
+                   "No regressions in existing functionality"]},
+        {"item_index": 1, "item": "a plain-string item"}]
+    assert "case from set 4" not in up and "case from set 5" not in up
+    assert "assert add(2, 3) == 5" not in up
+
+
+def test_task_section_without_items_names_the_task_only(leerie):
+    text = leerie._format_acceptance_task_section("do the thing", [])
+    assert text.startswith("TASK (") and "do the thing" in text
+    assert "REQUIRED ITEMS" not in text

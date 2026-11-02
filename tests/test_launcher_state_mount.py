@@ -19,7 +19,7 @@ import subprocess
 # it inlined one of three `CGROUP_MOUNT_ARG` branches as a literal and was
 # missing `--cidfile` and its bind, `--label`, `-e USER_REPO=`,
 # `-e LEERIE_COMMIT=`, the `LEERIE_*` auto-forward, `--cgroupns=host`,
-# `ROOTLESS_SECOPT`, `REWRITTEN_ARGS`, and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`.
+# `SECOPT`, `APPARMOR_OPT`, `REWRITTEN_ARGS`, and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`.
 # None of that flipped an assertion, which is the point: the tests were
 # blind, not wrong. They would pass identically if the launcher dropped the
 # state mount tomorrow — the exact regression this file exists to catch.
@@ -50,9 +50,11 @@ AUTH_MOUNTS=()
 CACHE_MOUNTS=()
 INSPECT_MOUNTS=()
 CGROUP_MOUNT_ARG=()
-ROOTLESS_SECOPT=()
+SECOPT=(--security-opt seccomp=unconfined)
+APPARMOR_OPT=(--security-opt apparmor=leerie-container)
 REWRITTEN_ARGS=()
 _leerie_env_args=()
+_leerie_host_dir="$HOME/.leerie/.host"
 """
     + extract_run_argv()
     + '\nnerdctl run "${_run_argv[@]}"\n'
@@ -124,14 +126,16 @@ def test_state_dir_env_in_nerdctl_argv(tmp_path):
 
 
 def test_work_mount_still_present(tmp_path):
-    """-v <user-repo>:/work is present alongside the state mount."""
+    """-v <user-repo>:/work:ro is present alongside the state mount: the
+    user's checkout is read-only in the container (DESIGN §6 *The explicit
+    channel*)."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     user_repo = tmp_path / "myproject"
     user_repo.mkdir()
 
     tokens, _ = _run(user_repo, fake_home, {}, [])
-    expected_work = f"{user_repo}:/work"
+    expected_work = f"{user_repo}:/work:ro"
     assert expected_work in tokens, (
         f"Expected -v token '{expected_work}' not found in nerdctl argv.\n"
         f"Got tokens: {tokens}"

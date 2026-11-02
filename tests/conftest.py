@@ -7,18 +7,52 @@ fixture.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import ctypes
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# No test reaches the user's real `~/.leerie` (or anything else under their
+# home). The launcher resolves its state dir to `$HOME/.leerie/<repo>` and
+# makes `logs/` there before any verb, so a test that ran it without
+# `LEERIE_STATE_DIR` wrote into the user's run state (`test_re_seed`,
+# `test_version_flag`: `~/.leerie/_self/logs`, `.owner`). The session gets
+# its own HOME before any test module is imported, with the git identity CI
+# sets globally (.github/workflows/test.yml); `REAL_HOME` is the user's, for
+# a test that must read a cache there on purpose.
+# Idempotent: a second import of this module (under another name) keeps the
+# first one's HOME and its record of the user's.
+if os.environ.get("PYTEST_LEERIE_TEST_HOME") and \
+        os.environ.get("PYTEST_LEERIE_TEST_HOME") == os.environ.get("HOME"):
+    REAL_HOME = os.environ.get("PYTEST_LEERIE_REAL_HOME", "")
+else:
+    REAL_HOME = os.environ.get("HOME", "")
+    _TEST_HOME = Path(tempfile.mkdtemp(prefix="leerie-test-home-"))
+    (_TEST_HOME / ".gitconfig").write_text(
+        "[user]\n\temail = ci@leerie.invalid\n\tname = Leerie CI\n")
+    os.environ["HOME"] = str(_TEST_HOME)
+    os.environ["PYTEST_LEERIE_TEST_HOME"] = str(_TEST_HOME)
+    os.environ["PYTEST_LEERIE_REAL_HOME"] = REAL_HOME
+    atexit.register(shutil.rmtree, _TEST_HOME, True)
+
+
+@pytest.fixture(autouse=True)
+def _home_is_never_the_users():
+    """A test that points HOME back at the user's fails, before and after."""
+    assert os.environ.get("HOME") != REAL_HOME or not REAL_HOME
+    yield
+    assert os.environ.get("HOME") != REAL_HOME or not REAL_HOME
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 
@@ -39,6 +73,37 @@ def run_git_cwd_first_stdout(cwd: Path, *args: str) -> str:
     out = subprocess.run(["git", *args], cwd=str(cwd), check=True,
                          capture_output=True, text=True)
     return out.stdout.strip()
+
+
+def run_git_out(cwd: Path, *args: str, check: bool = True,
+                env: dict[str, str] | None = None, strip: bool = True,
+                errors: str | None = None,
+                config: tuple[str, ...] = ()) -> str:
+    """`git [-c <k=v> ...] <args>` run in `cwd`, returning its stdout
+    (stripped unless `strip=False`). `check=False` returns the stdout of a
+    failing command instead of raising; `env` replaces the environment;
+    `errors` decodes the output as UTF-8 with that error handler (for git's
+    raw byte paths); `config` is `-c` settings laid before `args`. The one
+    git runner every test with a local `_git` aliases, so its variants live
+    here once (`tests/test_no_duplicate_git_test_helpers.py`)."""
+    cfg = [x for kv in config for x in ("-c", kv)]
+    kw: dict = ({"encoding": "utf-8", "errors": errors} if errors
+                else {"text": True})
+    out = subprocess.run(["git", *cfg, *args], cwd=str(cwd), check=check,
+                         env=env, capture_output=True, **kw).stdout
+    return out.strip() if strip else out
+
+
+def run_git_at(path: Path, *args: str, check: bool = True) -> str:
+    """`git <args>` at `path`, as leerie names a repository: a bare one (the
+    run's own) with `--git-dir`, a work tree with `-C`. Returns stripped
+    stdout."""
+    path = Path(path)
+    at = (["--git-dir", str(path)]
+          if (path / "HEAD").is_file() and (path / "objects").is_dir()
+          else ["-C", str(path)])
+    return subprocess.run(["git", *at, *args], check=check,
+                          capture_output=True, text=True).stdout.strip()
 
 
 def run_git_cwd_first_unchecked(
@@ -117,6 +182,28 @@ def validate_or_fallback_required(schema: dict, instance: dict) -> bool:
     for k in schema["required"]:
         assert k in instance, f"missing required field {k!r}"
     return False
+
+
+def transcript_path(log_dir: Path, name: str) -> Path:
+    """Where `_invoke` writes worker transcript `name` of log directory
+    `log_dir` (`logs/` or `logs/held-out/`): its transcripts directory,
+    apart from leerie's command logs (DESIGN §8 *What a worker ran is read
+    from its own transcript*). The directory is made."""
+    d = Path(log_dir) / "transcripts"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / name
+
+
+def register_worker_transcript(log_path: Path) -> Path:
+    """Register a hand-written fixture log as a worker's transcript, the
+    line `_invoke` appends when it spawns one (`TRANSCRIPTS_REGISTRY`): the
+    readers of what a worker ran take registered transcripts only (DESIGN §8
+    *What a worker ran is read from its own transcript*). A fixture meant
+    to be found by a reader is written at `transcript_path`."""
+    with (log_path.parent / "transcripts.ndjson").open("a") as f:
+        f.write(json.dumps({"sid": log_path.stem, "log": log_path.name})
+                + "\n")
+    return log_path
 
 
 @pytest.fixture(scope="session")
@@ -314,6 +401,85 @@ def _no_iam_propagation_wait(monkeypatch):
     monkeypatch.setenv("LEERIE_EC2_IAM_RETRY_S", "0")
 
 
+def measure_run_dir(tmp_path: Path, *, beside: bool = False) -> Path:
+    """A run directory for a test double of the state whose repository
+    commands leerie runs. Every such command is confined to its measurement
+    grant (DESIGN §6 *Leerie's runs of the repository's commands are
+    confined too*), which lives in the run directory; its state root,
+    `<tmp_path>/state`, holds nothing else, so the test's own files beside
+    it (a tree, a fake binary) stay readable and the tree stays outside.
+    `beside`: for a test whose tree is `tmp_path` itself, the run directory
+    goes beside it rather than inside it."""
+    base = (tmp_path.parent / f"{tmp_path.name}-run") if beside else tmp_path
+    d = base / "state" / "runs" / "r1"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def measured_tmp_files(run_dir: Path, name: str) -> list[Path]:
+    """Every `<private temp dir>/<name>` of the run's measured trees: where
+    a confined command's `$TMPDIR` put a file a test reads back (a run
+    counter, a marker). Each tree's private temp directory (`/tmp/l/<id>/`)
+    is named in its measurement directory's sidecar."""
+    out: list[Path] = []
+    for side in (Path(run_dir) / "measure").glob("*.tree"):
+        try:
+            tmp = json.loads(side.read_text()).get("tmp")
+        except (OSError, ValueError):
+            continue
+        if tmp:
+            out += Path(tmp).glob(name)
+    return sorted(out)
+
+
+_FAKE_RUN_DIR: Path | None = None
+
+
+def fake_run_dir() -> Path:
+    """This test's own run directory, for a test double of the state that
+    has no real one. `claude_p` makes per-worker directories and a
+    configuration template in the run directory (DESIGN §6 *Each worker's
+    own configuration and temporary directories*), so one fixed path shared
+    by every test (and every suite on the host) would carry one test's
+    template and workers into the next."""
+    assert _FAKE_RUN_DIR is not None
+    return _FAKE_RUN_DIR
+
+
+@pytest.fixture(autouse=True)
+def _own_temp_dir_restored():
+    """Put the process's temp directory back after a test that ran
+    `_run_phases`, which makes the run directory's `tmp/` leerie's own
+    (`_use_run_tmp`: `tempfile.tempdir` and `TMPDIR`)."""
+    saved, env = tempfile.tempdir, os.environ.get("TMPDIR")
+    yield
+    tempfile.tempdir = saved
+    if env is None:
+        os.environ.pop("TMPDIR", None)
+    else:
+        os.environ["TMPDIR"] = env
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fake_run_dir(tmp_path_factory):
+    global _FAKE_RUN_DIR
+    _FAKE_RUN_DIR = tmp_path_factory.mktemp("fake-run")
+    yield
+    _FAKE_RUN_DIR = None
+
+
+@pytest.fixture(autouse=True)
+def _no_operator_claude_config(tmp_path_factory, monkeypatch):
+    """Point the operator's CLI configuration at an empty directory: every
+    `claude_p` snapshots it into the run's template (DESIGN §6 *Each
+    worker's own configuration and temporary directories*), and the real
+    `~/.claude` holds the developer's credentials and tens of MB of skills
+    and plugins, which would otherwise land in every test's run directory
+    under /tmp. A test of that snapshot sets its own."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR",
+                       str(tmp_path_factory.mktemp("operator-claude")))
+
+
 @pytest.fixture(autouse=True)
 def _fresh_head_acceptance_results(leerie, monkeypatch):
     """Give every test an empty `_HEAD_ACCEPTANCE_RESULTS`: the `leerie`
@@ -324,6 +490,17 @@ def _fresh_head_acceptance_results(leerie, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_cgroup_probe(leerie, monkeypatch):
+    """Give every test an unprobed broker: `_cgroup_probe` memoizes into
+    module globals, and the base-health baseline's peak measurement now
+    probes (DESIGN §6 *The repo's own build peak*) — on a host with no
+    broker one test's `False` would otherwise answer every later test's
+    probe."""
+    monkeypatch.setattr(leerie, "_CGROUP_PROBE_RESULT", None)
+    monkeypatch.setattr(leerie, "_CGROUP_HIERARCHY", None)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_planning_worktree(request, monkeypatch):
     """Keep `_ensure_planning_worktree` from shelling out to real git.
 
@@ -331,8 +508,10 @@ def _no_real_planning_worktree(request, monkeypatch):
     `git worktree add` rooted at `resolve_leerie_root()`. With
     `LEERIE_STATE_DIR` unset -- the default for a direct Python caller -- that
     resolves to `<repo>/.leerie`, so any test driving the real `_run_phases`
-    created a FULL CHECKOUT OF THIS REPO inside this repo and left it
-    registered in `.git/worktrees/`.
+    created a FULL CHECKOUT OF THIS REPO inside this repo (registered, since
+    per-run repositories, in that run's `<run-dir>/repo`; before them, in
+    this repo's own `.git/worktrees/`). The run's repository itself is
+    `_no_run_repo_without_a_git_repo`'s concern, below.
 
     The failure mode is silent in three ways at once, which is why this is a
     conftest-level guard rather than a stub in each driving test: `.leerie/*`
@@ -351,8 +530,9 @@ def _no_real_planning_worktree(request, monkeypatch):
     leerie = request.getfixturevalue("leerie")
 
     async def _stub(st):
-        path = str(Path(getattr(st, "run_dir", ".")) / "worktrees"
-                   / "planning")
+        run_dir = Path(getattr(st, "run_dir", "."))
+        path = str(run_dir / "worktrees"
+                   / leerie._worktree_dirname(run_dir.name, "planning"))
         try:
             st.data["planning_worktree"] = path
             st.save()
@@ -364,10 +544,257 @@ def _no_real_planning_worktree(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _test_tmp_readable_by_measurements(request, monkeypatch):
+    """Let a measured command read the test's own `tmp_path`, outside its
+    state root. pytest's `tmp_path` is under the host's `/tmp`, which no
+    grant names — an isolated command's `/tmp` is its own (DESIGN §6 *Every
+    confined process has its own `/tmp`, `/dev/shm` and IPC*) — so a fake
+    runner or installer a test puts there could not even be executed. In
+    production no tool lives in `/tmp`. Never the state root
+    (`_around`), never the rest of `/tmp`."""
+    if "tmp_path" not in request.fixturenames:
+        return
+    leerie = request.getfixturevalue("leerie")
+    tmp = request.getfixturevalue("tmp_path")
+    real = leerie._measurement_grants
+
+    def grants(st, tree, kind=leerie.MEASURE_KIND):
+        g = real(st, tree, kind)
+        root = leerie._run_dir_of(st).parent.parent
+        extra = tuple(p for p in leerie._around([str(tmp)], root)
+                      if p not in g.rw + g.ro)
+        return g._replace(ro=g.ro + extra)
+    monkeypatch.setattr(leerie, "_measurement_grants", grants)
+
+
+HELDOUT_SANDBOX_EMULATOR = REPO_ROOT / "tests" / "heldout_sandbox_emulator.py"
+
+
+@pytest.fixture(autouse=True)
+def _emulated_heldout_sandbox(request, monkeypatch):
+    """Run every held-out sandbox a test asks for through
+    `tests/heldout_sandbox_emulator.py`. Leerie runs a held-out file only in
+    a sandbox (`_confined_argv(…, sandbox=)` always emits `--sandbox`), which
+    needs an unprivileged user namespace with mounts — refused on a
+    developer host and CI (Ubuntu's
+    `kernel.apparmor_restrict_unprivileged_userns`), where every real
+    held-out run would exit 126. The emulator keeps the sandbox's contract
+    with leerie (files placed for the run and gone after it, the report
+    back through its descriptor) without its isolation; a test whose
+    subject is the isolation opts out with `@pytest.mark.real_heldout_sandbox`
+    and skips where `isolation_error()` reports the host cannot build one."""
+    if request.node.get_closest_marker("real_heldout_sandbox"):
+        return
+    leerie = request.getfixturevalue("leerie")
+    real = leerie._confined_argv
+
+    def _argv(grants, cmd, *, sandbox=None, report_fd=None):
+        if sandbox is None:
+            return real(grants, cmd)
+        out = [sys.executable, "-I", str(HELDOUT_SANDBOX_EMULATOR),
+               "--view", sandbox.view]
+        for src, rel in sandbox.place:
+            out += ["--place", f"{src}={rel}"]
+        if sandbox.report is not None and report_fd is not None:
+            out += ["--report", sandbox.report, "--report-fd",
+                    str(report_fd)]
+        return out + ["--", *real(grants, cmd)]
+    monkeypatch.setattr(leerie, "_confined_argv", _argv)
+
+
+NO_REAL_HELDOUT_SANDBOX_SITE = REPO_ROOT / "tests" / "no_real_heldout_sandbox_site"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_heldout_sandbox(request, monkeypatch):
+    """Keep the entry's `_require_heldout_sandbox` (`_require_confinement`)
+    from building a real sandbox. It needs an unprivileged user namespace
+    with mounts, which a developer host and CI restrict (Ubuntu's
+    `kernel.apparmor_restrict_unprivileged_userns`): every test driving real
+    `main()` would die there. The stub also leaves `ISOLATE_ENV` unset,
+    so nothing a test spawns is isolated. A Python child a test starts gets
+    the same stub through `tests/no_real_heldout_sandbox_site/` put first on
+    `PYTHONPATH` (its `sitecustomize`): a test that drives the real `main()`
+    in a process of its own would otherwise die at `_require_confinement`
+    on that host before reaching its subject. A test whose subject is the
+    gate opts out with `@pytest.mark.real_heldout_sandbox` (and skips where
+    `isolation_error()` reports the host cannot build one)."""
+    # The real gate sets the variable in `os.environ` itself, which
+    # monkeypatch would not undo: cleared before and after every test.
+    os.environ.pop("LEERIE_ISOLATED", None)
+    if not request.node.get_closest_marker("real_heldout_sandbox"):
+        # Every loaded copy of the orchestrator: the session fixture's, and
+        # one a test imports itself (`import leerie` off sys.path, or its own
+        # spec), so a test driving `preflight()` through any of them is
+        # covered.
+        mods = [request.getfixturevalue("leerie")] + [
+            m for m in list(sys.modules.values())
+            if getattr(m, "__file__", None)
+            and os.path.realpath(m.__file__) == os.path.realpath(LEERIE_PY)]
+        for mod in {id(m): m for m in mods}.values():
+            if hasattr(mod, "_require_heldout_sandbox"):
+                monkeypatch.setattr(mod, "_require_heldout_sandbox",
+                                    lambda run_dir: None)
+        prior = os.environ.get("PYTHONPATH")
+        monkeypatch.setenv("PYTHONPATH", os.pathsep.join(
+            [str(NO_REAL_HELDOUT_SANDBOX_SITE)] + ([prior] if prior else [])))
+    yield
+    os.environ.pop("LEERIE_ISOLATED", None)
+
+
+_WORKER_EXIT_MODULE = None
+
+
+def worker_exit(tree) -> None:
+    """What a worker's exit does in production, for a test that stands in
+    for a worker by committing in its tree itself: leerie takes the tree's
+    branch from its tree repository into the run repository
+    (`_invoke_admitted` → `_take_after_worker`; DESIGN §6 *A repository per
+    committing tree (I6)*). A no-op for a tree of no tree repository. The
+    real function, from the module loaded once for helpers."""
+    global _WORKER_EXIT_MODULE
+    if _WORKER_EXIT_MODULE is None:
+        spec = importlib.util.spec_from_file_location("_leerie_worker_exit",
+                                                      LEERIE_PY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WORKER_EXIT_MODULE = mod
+    _WORKER_EXIT_MODULE._take_tree_branch(tree)
+
+
+def relocate_into_run_repo(leerie, st) -> Path:
+    """Turn a hand-built pre-change layout into the run's own repository
+    (DESIGN §6 *The run's own repository*): for a test that committed the
+    run's branches in its "user" repository (`st.repo_root`) and checked
+    staging out there, make `<run-dir>/repo` (`_ensure_run_repo`), move
+    every `leerie/*` branch into it (deleted from the user's repository),
+    re-create every worktree of the user's repository that lies under the
+    run directory as a worktree of the run's repository on the same branch
+    or commit, and record `base_sha` — the cut point, the merge-base of the
+    run branch and the working branch — when the state names a working
+    branch and has none. Afterwards the user's repository holds no leerie
+    ref or worktree, as in a real run. Returns the run's repository."""
+    user = Path(st.repo_root)
+    run_dir = Path(st.run_dir).resolve()
+
+    def git(cwd, *a, check=True):
+        return subprocess.run(["git", "-C", str(cwd), *a], check=check,
+                              capture_output=True, text=True).stdout.strip()
+    trees = []
+    cur: dict = {}
+    for line in git(user, "worktree", "list", "--porcelain").splitlines() + [""]:
+        if not line:
+            if cur.get("path") and Path(cur["path"]).resolve().is_relative_to(
+                    run_dir):
+                trees.append(cur)
+            cur = {}
+        elif line.startswith("worktree "):
+            cur["path"] = line[len("worktree "):]
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            cur["branch"] = line[len("branch "):]
+    for t in trees:
+        git(user, "worktree", "remove", "--force", t["path"])
+    repo = leerie._ensure_run_repo(st)
+    refs = git(user, "for-each-ref", "--format=%(refname)",
+               "refs/heads/leerie").split()
+    if refs:
+        git(repo, "fetch", "-q", str(user), *[f"+{r}:{r}" for r in refs])
+        for r in refs:
+            git(user, "update-ref", "-d", r)
+    for t in trees:
+        if t.get("branch"):
+            git(repo, "worktree", "add", "-q", t["path"],
+                t["branch"][len("refs/heads/"):])
+        else:
+            git(repo, "worktree", "add", "-q", "--detach", t["path"],
+                t["head"])
+    wb = st.data.get("working_branch")
+    run_branch = f"refs/heads/leerie/runs/{st.run_id}"
+    if wb and not st.data.get("base_sha") and git(
+            repo, "rev-parse", "-q", "--verify", run_branch, check=False):
+        st.data["base_sha"] = git(repo, "merge-base", run_branch,
+                                  f"refs/heads/{wb}")
+        st.save()
+    return repo
+
+
+@pytest.fixture(autouse=True)
+def _no_run_repo_without_a_git_repo(request, monkeypatch):
+    """Let a test drive `_run_phases` / `phase_execute` / the planning
+    worktree over a state whose `repo_root` is no git repository.
+
+    Every run makes its own repository from the user's at start
+    (`_ensure_run_repo`, DESIGN §6 *The run's own repository*), and dies
+    when it cannot — `_preflight_repo` guarantees a repository in
+    production. Many tests drive those phases with the scripts and git
+    stubbed, over a temporary directory or a `Mock` state; for them the
+    creation and the refresh are no-ops here. A test whose `repo_root` is a
+    real repository gets the real thing, unstubbed."""
+    leerie = request.getfixturevalue("leerie")
+    real_ensure = leerie._ensure_run_repo_or_die
+    real_refresh = leerie._refresh_run_repo_base_or_die
+
+    def _has_repo(st) -> bool:
+        root = getattr(st, "repo_root", None)
+        run_dir = getattr(st, "run_dir", None)
+        if not isinstance(root, (str, os.PathLike)) or not isinstance(
+                run_dir, (str, os.PathLike)):
+            return False
+        return subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--git-dir"],
+            capture_output=True).returncode == 0
+
+    async def ensure(st):
+        if _has_repo(st):
+            # A real run repository is a full copy of the user's branch
+            # (measured on this repository: 31 MB, ~11 s). Under this
+            # checkout — the default state root `<repo>/.leerie` when
+            # LEERIE_STATE_DIR is unset — it would outlive the session,
+            # gitignored and unseen, the planning worktree's old leak
+            # (above). Fail the test that would make it, by name.
+            run_dir = Path(str(st.run_dir)).resolve()
+            if run_dir.is_relative_to(REPO_ROOT):
+                pytest.fail(
+                    f"this test drives the real run repository under this "
+                    f"checkout ({run_dir}): pin the state root to tmp_path "
+                    "(State(tmp_path / ..., ...) or LEERIE_STATE_DIR)")
+            return await real_ensure(st)
+        return Path(str(getattr(st, "run_dir", "."))) / "repo"
+
+    async def refresh(st, where):
+        if _has_repo(st):
+            return await real_refresh(st, where)
+        return ""
+    monkeypatch.setattr(leerie, "_ensure_run_repo_or_die", ensure)
+    monkeypatch.setattr(leerie, "_refresh_run_repo_base_or_die", refresh)
+
+
+@pytest.fixture(autouse=True)
+def _restore_git_hooks_env():
+    """Put the git config environment back after every test.
+
+    `main()` turns leerie's hooks off by appending `core.hooksPath` to
+    `os.environ`'s `GIT_CONFIG_*` entries (`_git_hooks_off`, DESIGN §6½
+    *Hooks off*). A test that drives the real `main()` would leave that on
+    the pytest process, and every later test's git would then run no hook
+    — silently, depending on collection order (the same shape as the
+    subreaper flag below)."""
+    keys = lambda: {k for k in os.environ  # noqa: E731
+                    if k.startswith(("GIT_CONFIG_", "LEERIE_GIT_HOOKS"))}
+    before = {k: os.environ[k] for k in keys()}
+    yield
+    for k in keys() - set(before):
+        os.environ.pop(k, None)
+    os.environ.update(before)
+
+
+@pytest.fixture(autouse=True)
 def _restore_child_subreaper():
     """Put `PR_SET_CHILD_SUBREAPER` back after every test.
 
-    `main()` calls `_become_subreaper()` as its SECOND statement, before
+    `main()` calls `_become_subreaper()` among its first statements, before
     argparse -- so every test that drives the real `main()` sets
     `prctl(PR_SET_CHILD_SUBREAPER, 1)` on the *pytest* process, and nothing
     ever cleared it. The flag then silently changes the meaning of process
@@ -387,3 +814,17 @@ def _restore_child_subreaper():
     """
     with child_subreaper_restored():
         yield
+
+
+def judge_checkout_in_place(leerie, monkeypatch) -> None:
+    """For a test that fakes git itself (`run_proc` stubbed, a made-up
+    commit): `_judge_checkout` yields the given tree instead of adding a
+    real checkout of a commit that does not exist. Where the judge reads is
+    not such a test's subject; tests/test_pr_review_runs_outside_staging.py
+    drives the real one."""
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def in_place(st, staging, name, *, rev=None, share_ignored=False):
+        yield staging
+    monkeypatch.setattr(leerie, "_judge_checkout", in_place)

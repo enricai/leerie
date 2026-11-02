@@ -53,7 +53,7 @@ def _run(repo, state_dir, run_id="r1"):
 def env(tmp_path):
     repo = _repo(tmp_path)
     state = tmp_path / "state"
-    wt = state / "runs" / "r1" / "worktrees" / "planning"
+    wt = state / "runs" / "r1" / "worktrees" / "r1-planning"
     return repo, state, wt
 
 

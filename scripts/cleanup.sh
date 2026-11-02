@@ -14,8 +14,8 @@
 #     With --branches also delete leerie/runs/<id> and
 #     leerie/subtasks/<id>/* branches.
 #     With --subtask-branches delete only the subtask branches and keep
-#     leerie/runs/<id> (the post-finalize default — the run branch is
-#     the PR head and must outlive the orchestrator).
+#     leerie/runs/<id> (operator use; finalize passes no branch flag — the
+#     subtask branches are refs of the run's own repository).
 #
 #   cleanup.sh --all-runs [--branches | --subtask-branches]
 #     Same as above, applied to every directory under <state-root>/runs/.
@@ -27,6 +27,8 @@ set -euo pipefail
 
 # shellcheck source=scripts/worktree-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+# No git command of leerie's own runs a repository hook (DESIGN §6½).
+leerie_git_hooks_off
 
 # Honor LEERIE_STATE_DIR — matches setup-run.sh:25 and finalize.sh.
 # Without this, in-container invocations (LEERIE_STATE_DIR=/leerie-state)
@@ -46,28 +48,63 @@ clean_one_run() {
   #       $2 = branch-scope: "0" = keep all branches (audit trail),
   #                          "1" = delete run branch + subtask branches (--branches),
   #                          "2" = delete subtask branches only, keep the run
-  #                                branch (--subtask-branches; the post-finalize
-  #                                default, since the run branch is the PR head).
+  #                                branch (--subtask-branches; operator use —
+  #                                finalize passes no branch flag).
   #
   # Removes ${run_dir}/worktrees/* (the worktree directories), prunes git
   # worktree metadata, and optionally deletes branches. The state dir
-  # itself (state.json, run.json, criteria/, logs/, checkpoints/) is KEPT
+  # itself (state.json, run.json, notes/, logs/) is KEPT
   # as an audit trail. Full nuke-the-run-entirely is the Ctrl-C
   # (full_purge) path inside the orchestrator, not this script.
   local run_id="$1"
   local branch_scope="$2"
   local run_dir="${LEERIE_ROOT}/runs/${run_id}"
+  # The registry and branches of a run live in its own repository
+  # (`<run-dir>/repo`, DESIGN §6 *The run's own repository*), whatever the
+  # caller's cwd; a run from before per-run repositories has them in the
+  # repository at the cwd.
+  if [ -f "${run_dir}/repo/HEAD" ]; then
+    run_dir="$(cd "$run_dir" && pwd -P)"
+    # Named, never discovered (safe.bareRepository=explicit). A temporary
+    # assignment: in effect for the function and every command it runs,
+    # gone after it, so no subshell is needed.
+    LEERIE_GIT_DIR="${run_dir}/repo" \
+      _clean_one_run_here "$run_id" "$branch_scope" "$run_dir"
+    return
+  fi
+  LEERIE_GIT_DIR="" _clean_one_run_here "$run_id" "$branch_scope" "$run_dir"
+}
+
+_clean_one_run_here() {
+  local run_id="$1"
+  local branch_scope="$2"
+  local run_dir="$3"
 
   if [ -d "${run_dir}/worktrees" ]; then
     for d in "${run_dir}/worktrees"/*/; do
       [ -d "$d" ] || continue
+      # A committing tree of its own repository (DESIGN §6 *A repository
+      # per committing tree (I6)*): its branch is taken into the run
+      # repository, then the tree and its repository go.
+      d="${d%/}"
+      tr="${run_dir}/tree-repos/${d##*/}"
+      if [ -n "${LEERIE_GIT_DIR:-}" ] && [ -f "$tr/HEAD" ]; then
+        if leerie_take_tree_branch "$tr" \
+            "$(leerie_tree_branch_of "$run_id" "${d##*/}")"; then
+          leerie_drop_tree "$tr" "$d"
+        else
+          # Kept: its commits are not in the run repository yet.
+          echo "cleanup: could not take ${tr}; kept it and ${d}" >&2
+        fi
+        continue
+      fi
       # 240s timeout mirrors the calibrated bound on the abnormal-exit
       # Python path (_cleanup_on_abnormal_exit, leerie.py:3896-3920): a
       # 868MB/41k-file worktree takes ~45-90s uncontested and several-fold
       # more under N-way concurrent wave cleanup, but a genuinely hung
       # `git worktree remove` (stale mount, held index.lock, disk
       # contention) must not block the whole orchestrator forever.
-      timeout "$WORKTREE_REMOVE_TIMEOUT" git worktree remove --force "$d" 2>/dev/null || true
+      timeout "$WORKTREE_REMOVE_TIMEOUT" git ${LEERIE_GIT_DIR:+--git-dir="$LEERIE_GIT_DIR"} worktree remove --force "$d" 2>/dev/null || true
       # Fall back to rm -rf when `git worktree remove` administratively
       # succeeded but left the directory behind (timeout mid-rmtree) or
       # when git no longer tracks the worktree (already pruned) and so
@@ -75,10 +112,10 @@ clean_one_run() {
       # stale worktree directory persists across cleanups and blocks
       # `resume`'s new-worktree.sh from re-creating the worktree at
       # the same path. Path is sandboxed under
-      # .leerie/runs/<run-id>/worktrees/<sid>; the leading `[ -d ]` plus
+      # .leerie/runs/<run-id>/worktrees/<run-id[:12]>-<sid>; the leading `[ -d ]` plus
       # the glob restricts scope to that directory's children.
-      if [ -d "$d" ]; then
-        rm -rf "$d"
+      if [ -d "$d" ] && ! leerie_rm_owned "$d"; then
+        echo "cleanup: could not remove ${d}" >&2
       fi
     done
     # Remove the now-empty worktrees dir if everything went; harmless if
@@ -89,8 +126,9 @@ clean_one_run() {
   # `git worktree prune` is repository-global with no grace period, so
   # inside a container sharing the host's .git it destroys host-side
   # worktrees whose paths the container cannot see (scripts/worktree-lib.sh;
-  # docs/POSTMORTEM-2026-08-14.md, F19).
-  prune_leerie_worktrees "${LEERIE_ROOT}"
+  # docs/POSTMORTEM-2026-08-14.md, F19). THIS run's only, under the
+  # repository-wide lock (a subshell, so the lock ends with the prune).
+  ( leerie_repo_lock; prune_leerie_worktrees "${run_dir}" )
 
   # Per-run branches live under two disjoint namespaces:
   #   leerie/runs/<run-id>           (the run branch itself)
@@ -98,17 +136,17 @@ clean_one_run() {
   # See DESIGN.md §3 for why the namespaces are split.
   case "$branch_scope" in
     1)  # --branches: delete both
-      for b in $(git for-each-ref --format='%(refname:short)' \
+      for b in $(leerie_repo_git for-each-ref --format='%(refname:short)' \
                  "refs/heads/leerie/runs/${run_id}" \
                  "refs/heads/leerie/subtasks/${run_id}/"); do
-        git branch -D "$b" 2>/dev/null || true
+        leerie_repo_git branch -D "$b" 2>/dev/null || true
       done
       echo "cleanup: removed worktrees + branches for run ${run_id} (state dir kept as audit trail at ${run_dir}; rm -rf manually if no longer needed)"
       ;;
     2)  # --subtask-branches: delete subtask branches only
-      for b in $(git for-each-ref --format='%(refname:short)' \
+      for b in $(leerie_repo_git for-each-ref --format='%(refname:short)' \
                  "refs/heads/leerie/subtasks/${run_id}/"); do
-        git branch -D "$b" 2>/dev/null || true
+        leerie_repo_git branch -D "$b" 2>/dev/null || true
       done
       echo "cleanup: removed worktrees + subtask branches for run ${run_id} (run branch leerie/runs/${run_id} and state dir kept; pass --branches to delete the run branch too)"
       ;;
@@ -137,7 +175,7 @@ most_recent_failed_run() {
       continue
     fi
     local started
-    started="$(grep '"started_at":' "$state" | head -1 \
+    started="$(grep '"started_at":' "$state" | sed -n 1p \
                | sed 's/.*"started_at": *"\([^"]*\)".*/\1/')"
     if [ -z "$newest" ] || [ "$started" \> "$newest_started" ]; then
       newest="$base"

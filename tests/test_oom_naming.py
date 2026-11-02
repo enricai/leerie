@@ -79,7 +79,7 @@ def env(leerie, tmp_path):
     (run_dir / "criteria").mkdir()
     (run_dir / "logs").mkdir()
     (run_dir / "worktrees").mkdir()
-    worktree = run_dir / "worktrees" / sid
+    worktree = leerie._subtask_worktree_path(run_dir, sid)
     _run(["git", "worktree", "add", "-q", "-b", subtask_branch,
           str(worktree), run_branch], cwd=repo)
 
@@ -118,7 +118,7 @@ def _stub_named_oom_handoff(leerie_mod, sid, run_dir, monkeypatch,
         return {
             "subtask_id": sid_,
             "status": "incomplete-handoff",
-            "checkpoint_path": str(run_dir / "checkpoints" / f"{sid_}.md"),
+            "checkpoint_path": str(run_dir / "notes" / sid_ / "checkpoint.md"),
             "summary": summary,
         }
     monkeypatch.setattr(leerie_mod, "_run_implementer", _stub)

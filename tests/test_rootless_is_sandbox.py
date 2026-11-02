@@ -47,10 +47,12 @@ def test_unshare_maps_leerie_uid():
 
 
 def test_unshare_precedes_python():
-    """unshare must appear before python3 in the exec chain."""
+    """unshare must appear before the orchestrator's python3 in the exec
+    chain (the broker's `--spawn`, which hands the chain its descriptor,
+    runs before both)."""
     block = _orchestrator_rootless_block()
     unshare_pos = block.index("unshare")
-    exec_pos = block.index("python3")
+    exec_pos = block.index("python3 /opt/leerie-image/orchestrator/leerie.py")
     assert unshare_pos < exec_pos, (
         "unshare must precede the python3 invocation"
     )

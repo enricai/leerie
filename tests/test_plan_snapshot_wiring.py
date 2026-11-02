@@ -61,7 +61,7 @@ class TestSnapshotPrecedesTheDieGates:
     def test_snapshot_follows_schedule(self, leerie):
         """It captures _schedule()'s output, so it cannot precede the call."""
         src = _phases_src(leerie)
-        sched = src.find("subtasks, waves = _schedule(plans)")
+        sched = src.find("subtasks, waves = _schedule(\n                plans")
         snap = src.find('st.data["plan_snapshot"]')
         assert sched != -1, "_run_phases must call _schedule(plans)"
         assert snap != -1

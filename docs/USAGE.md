@@ -106,7 +106,9 @@ On stdout you'll see lines like (with a hypothetical `<run-id>` of
 After every implementer commits in its worktree, the integrator merges
 its branch into the run branch, and the post-work conformance phase
 runs your project's detected build/lint/test commands as advisory
-checks against the worktree — surfacing residuals as warnings on the
+checks in a fresh checkout of the committed work (DESIGN §8 *Every
+measurement reads the committed view*), never the worker's own tree —
+surfacing residuals as warnings on the
 subtask result, not gating the wave. The wave boundary itself only
 runs a deterministic conflict-marker scan; whether the work landed is
 the implementer's confidence-gate call. See [`DESIGN.md`](DESIGN.md) §6, §8, §9.
@@ -133,10 +135,11 @@ Phase 6 verifies `leerie/runs/<run-id>` is non-empty, pushes it to
 `origin`, and opens a PR via `gh pr create --base <working-branch>
 --head leerie/runs/<run-id>`. Your working branch is **not** modified
 locally — review and merge the PR on GitHub when you're satisfied. The
-per-subtask branches `leerie/subtasks/<run-id>/*` are **deleted
-automatically** at finalize — they were the mechanism for parallel
-implementer isolation and carry no information that isn't already in the
-run branch's merge graph (each subtask is merged with `--no-ff`, so its
+per-subtask branches `leerie/subtasks/<run-id>/*` never reach your
+repository: they live in the run's own repository, only the run branch is
+brought back, and they go with the run directory at `leerie prune` — they
+were the mechanism for parallel implementer isolation and carry no
+information that isn't already in the run branch's merge graph (each subtask is merged with `--no-ff`, so its
 commits still appear as a named merge bubble in `git log leerie/runs/<run-id>
 --graph`).
 
@@ -156,9 +159,29 @@ past run, use `--all-runs --branches`.
 
 **A subtask reports `blocked`.** The implementer hit something it cannot
 resolve (an external dependency, an ambiguous spec, a failing test it
-cannot fix). By default Leerie logs a warning, auto-accepts the subtask
-(it is marked complete and skipped), integrates the wave's successful
-subtasks and continues. Pass `--stop-on-blocked` (or set
+cannot fix), and says why as a typed kind. A missing external resource
+(a credential, a service, a step only a person can take) is settled
+`accepted_external` — not merged, listed under "Needs human verification"
+in the PR, and not making the run `unconverged` — but only after Leerie
+checks the claim itself (the variable really is unset, the host really is
+unreachable, and so on); a claim the check does not back is re-driven —
+unless the container itself cannot check it (the probe cannot reach the
+network to decide) on two blocked attempts in a row for the same claim,
+with no completed attempt between them, when it settles
+`unconverged` with a reason naming what could not be checked. A
+resource kill at the container's limit is retried once in place, then
+settles `unconverged`. A "nothing to change" claim is settled done only
+when a sibling subtask already changed the files it planned to touch, its
+verify commands (if any) pass, and a separate check finds its criteria met; a
+"cannot reproduce" claim only when Leerie runs the subtask's verify commands
+and they pass. If running those verify commands hits the container's limit,
+either claim settles `unconverged`. Every other
+blocker is re-driven with its blocker as the note,
+from one re-drive budget per subtask (`subtask_redrive_rounds`, bounded
+run-wide by `redrive_budget_sec`); once that budget is spent the subtask
+settles `unconverged`, the wave's successful subtasks are integrated and
+the run continues. A run with an unconverged subtask ends `unconverged`
+and its PR opens as a draft — never presented as done. Pass `--stop-on-blocked` (or set
 `LEERIE_STOP_ON_BLOCKED` / `stop_on_blocked` in `leerie.toml`) to halt
 instead: the blocker reason lands in
 `<state-root>/runs/<run-id>/state.json` and Leerie exits non-zero. You
@@ -274,9 +297,14 @@ resume-after-conflict, the complete verb list) are in
 
 ## Reclaiming disk: `leerie prune`
 
-Nothing reaps run state automatically; leerie's own preflight refuses to
-start a run on low disk headroom and tells you to prune by hand:
-`leerie prune` (dry-run, default) / `leerie prune --apply`. It removes
-terminal run directories, repo-map cache entries, and orphaned subtask
+The one automatic reap is narrow: every run's preflight deletes the
+`worktrees/` of each other run in the repo that is not live and has been
+idle for 7 days (`WORKTREE_REAP_IDLE_DAYS`). Its state, logs and branches
+stay, so it can still resume — resume rebuilds the worktrees from the
+branches (uncommitted edits are lost). Everything else waits for you;
+leerie's own preflight refuses to start a run on low disk headroom and
+tells you to prune by hand: `leerie prune` (dry-run, default) /
+`leerie prune --apply`. It removes terminal run directories, the worktrees
+of idle resumable runs, repo-map cache entries, and orphaned subtask
 branches — only ever on positive evidence a piece is safe to delete. Full
 mechanics in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).

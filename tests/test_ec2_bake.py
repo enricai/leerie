@@ -210,13 +210,18 @@ def test_instance_setup_honours_the_cap_opt_out(tmp_path):
     assert not (slice_dir / "memory.max").exists()
 
 
-def test_broker_runs_as_an_enabled_root_unit_after_the_setup():
-    unit = re.search(r"cat > /etc/systemd/system/leerie-cgroup-broker.service <<'UNIT'\n(.*?)\nUNIT\n", BODY, re.S).group(1)
+def test_setup_runs_as_an_enabled_oneshot_root_unit_and_no_broker_service():
+    unit = re.search(r"cat > /etc/systemd/system/leerie-instance-setup.service <<'UNIT'\n(.*?)\nUNIT\n", BODY, re.S).group(1)
     lines = dict(l.split("=", 1) for l in unit.splitlines() if "=" in l)
-    assert lines["ExecStartPre"] == "/usr/local/sbin/leerie-instance-setup"
-    assert lines["ExecStart"] == "/usr/bin/python3 /opt/leerie-image/scripts/cgroup-broker.py"
-    assert lines["Restart"] == "always" and lines["WantedBy"] == "multi-user.target"
-    assert "User" not in lines and "Delegate" not in lines   # root, top-level slice
-    assert "systemctl enable leerie-cgroup-broker.service" in BODY
-    # The broker it launches is the shipped one, at the path the image copies.
-    assert (ROOT / "scripts" / "cgroup-broker.py").is_file()
+    assert lines["Type"] == "oneshot" and lines["RemainAfterExit"] == "yes"
+    assert lines["ExecStart"] == "/usr/local/sbin/leerie-instance-setup"
+    assert lines["WantedBy"] == "multi-user.target"
+    assert "User" not in lines   # root: leerie.slice is at the top level
+    assert "systemctl enable leerie-instance-setup.service" in BODY
+    # The broker is never a boot service: one listening from boot would be
+    # reachable by a path (DESIGN §6). The launch wrapper spawns it and hands
+    # the orchestrator its descriptor, as on Fly.
+    assert "cgroup-broker" not in unit
+    assert "leerie-cgroup-broker.service" not in BODY
+    suffix = (ROOT / "scripts" / "remote" / "seed-common.sh").read_text()
+    assert '_broker.spawn("/tmp/cgroup-broker.log")' in suffix

@@ -26,11 +26,22 @@ import json
 import pytest
 
 
+# The runs these helpers make stand for runs of the leerie under test, so
+# they carry its run layout; a run of another layout lists as `other-leerie`
+# (tests/test_run_layout.py).
+_LAYOUT: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _this_leeries_layout(leerie):
+    _LAYOUT["run_layout"] = leerie.RUN_LAYOUT_VERSION
+
+
 def _mk_run(root, run_id, *, started=None, run_json=None, state=None):
     """Create a run dir _discover_runs() will find."""
     d = root / "runs" / run_id
     d.mkdir(parents=True, exist_ok=True)
-    st = {"task": "t", "worker_count": 0}
+    st = {"task": "t", "worker_count": 0, **_LAYOUT}
     if started is not None:
         st["started_at"] = started
     if state:
@@ -69,6 +80,18 @@ def test_seed_failed_is_never_auto_picked(leerie, tmp_path):
     (d / "fly-machine.json").write_text(json.dumps({"id": "m1"}))  # orphan
     _mk_run(tmp_path, "a" * 64, started="2026-01-01T00:00:00+00:00")
     assert leerie.resolve_run_id(tmp_path, None, resumable_only=True) == "a" * 64
+
+
+def test_a_failed_run_is_never_auto_picked(leerie, tmp_path):
+    """A death's message names a fix the operator owes first (DESIGN §6 *A
+    run that died says so*): listed, resumable by id, never chosen."""
+    _mk_run(tmp_path, "a" * 64, started="2026-01-01T00:00:00+00:00")
+    _mk_run(tmp_path, "b" * 64, started="2026-06-01T00:00:00+00:00",
+            run_json={"finished_at": "2026-06-01T01:00:00+00:00",
+                      "failed_at": "2026-06-01T01:00:00+00:00"})
+    assert leerie.resolve_run_id(tmp_path, None, resumable_only=True) == "a" * 64
+    assert leerie.resolve_run_id(tmp_path, "b" * 64,
+                                 resumable_only=True) == "b" * 64
 
 
 def test_missing_started_at_never_outranks_a_real_timestamp(leerie, tmp_path):

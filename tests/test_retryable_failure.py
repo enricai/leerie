@@ -22,7 +22,6 @@ LEERIE_PY = (Path(__file__).resolve().parent.parent
 
 @pytest.mark.parametrize("kind", [
     "no_commits",
-    "dirty_worktree",
     "empty_handoff",
 ])
 def test_retryable_kinds_return_true(leerie, kind):
@@ -48,7 +47,7 @@ def test_retryable_kinds_constant_matches_documented_set(leerie):
     retry policy" section (under §5 "Deterministic enforcement points")
     in the same change."""
     assert leerie._RETRYABLE_FAILURE_KINDS == frozenset(
-        {"no_commits", "dirty_worktree", "empty_handoff", "worktree_setup",
+        {"no_commits", "empty_handoff", "worktree_setup",
          "pid_exhausted", "oom_killed", "corrupted_envelope"}
     )
 
@@ -111,8 +110,6 @@ def test_no_commits_still_resets(leerie):
 _PRODUCER_RETRYABLE_KINDS = {
     # check_branch_has_commits → "no_commits"
     "no_commits",
-    # the inline dirty-worktree check in _settle_subtask → "dirty_worktree"
-    "dirty_worktree",
     # _validate_result's incomplete-handoff missing-checkpoint arm → "empty_handoff"
     "empty_handoff",
     # _settle_subtask's `except WorktreeSetupError` arm → "worktree_setup"
@@ -163,22 +160,13 @@ def test_validate_result_tags_empty_handoff_for_missing_checkpoint(leerie):
     )
 
 
-def test_settle_subtask_tags_dirty_worktree(leerie):
-    """The inline dirty-worktree check in `_settle_subtask` is the only
-    producer of the `dirty_worktree` kind. Find it in the leerie.py
-    source text and confirm the literal appears."""
-    source = LEERIE_PY.read_text()
-    settle_match = re.search(
-        r"^(?:async )?def _settle_subtask\b.*?"
-        r"(?=^(?:async )?(?:def |class ))",
-        source, re.DOTALL | re.MULTILINE,
-    )
-    assert settle_match, "could not locate _settle_subtask in source"
-    assert '"dirty_worktree"' in settle_match.group(0), (
-        "_settle_subtask's dirty-worktree check no longer tags "
-        "`dirty_worktree` — that retryable case would be silently "
-        "downgraded to terminal."
-    )
+def test_dirty_worktree_is_no_longer_a_failure_kind(leerie):
+    """A tree an implementer left dirty is not a retryable failure any
+    more: the I1 gate re-asks the same worker and, exhausted, settles the
+    subtask `unconverged` (executed in tests/test_clean_tree_gate.py) —
+    never a reset and a fresh worker."""
+    assert "dirty_worktree" not in leerie._RETRYABLE_FAILURE_KINDS
+    assert '"dirty_worktree"' not in LEERIE_PY.read_text()
 
 
 def test_settle_subtask_fail_calls_use_two_arg_signature():

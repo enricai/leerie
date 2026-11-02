@@ -128,10 +128,20 @@ class TestPhaseExecuteDiskLowSpace:
     begins) raises DiskLowSpace rather than letting a subsequent write
     crash with an unhandled OSError."""
 
+    @pytest.fixture(autouse=True)
+    def _no_run_repo(self, monkeypatch):
+        """A Mock state has no repository: the run's own repository (DESIGN
+        §6 *The run's own repository*) is not made or refreshed here."""
+        monkeypatch.setattr(leerie, "_ensure_run_repo_or_die",
+                            mock.AsyncMock())
+        monkeypatch.setattr(leerie, "_refresh_run_repo_base_or_die",
+                            mock.AsyncMock())
+
     def test_low_disk_raises_disklowspace_before_wave_work(self, tmp_path):
         st = mock.Mock()
         st.data = {"waves": [["feat-001"]], "completed_waves": 0,
-                   "subtask_status": {}, "integration_gate": {}}
+                   "subtask_status": {}, "integration_gate": {},
+                   "base_sha": "0" * 40}
         st.save = mock.Mock()
 
         caps = {"max_parallel": 5}
@@ -159,7 +169,8 @@ class TestPhaseExecuteDiskLowSpace:
         st = mock.Mock()
         st.data = {"waves": [["feat-001"]], "completed_waves": 0,
                    "subtask_status": {"feat-001": "complete"},
-                   "integration_gate": {}, "skip_base_baseline": True}
+                   "integration_gate": {}, "skip_base_baseline": True,
+                   "base_sha": "0" * 40}
         st.save = mock.Mock()
         caps = {"max_parallel": 5}
 
@@ -655,7 +666,7 @@ class TestInvokeStdinStagingDiskLowSpace:
             return await leerie._invoke(
                 ["claude", "-p"], cwd=str(tmp_path), timeout=60,
                 sid="t-stage", leerie_dir=tmp_path, verbosity="quiet",
-                stdin_data=stdin_data)
+                stdin_data=stdin_data, grants=leerie.WorkerGrants(("/",), ()))
 
     def test_mkstemp_enospc_becomes_disklowspace(self, tmp_path):
         import errno as _errno

@@ -103,11 +103,13 @@ set -euo pipefail
 USER_REPO=/Users/andres/src/enric/sibling-service
 LEERIE_REPO=/opt/leerie
 LEERIE_STATE_HOST_DIR=/tmp/state
+HOME=/home/test
 TTY_FLAGS=""
 _cidfile=/tmp/cid
 REPO_IMAGE_TAG=""
 IMAGE_TAG=leerie:test
 _leerie_env_args=()
+_leerie_host_dir=/home/test/.leerie/.host
 
 # ---- _run_argv, extracted verbatim from the launcher --------------------
 __RUN_ARGV__
@@ -303,19 +305,27 @@ def test_empty_var_not_forwarded():
 
 # ── coupling guard: no orchestrator override is silently deny-listed ─────────
 
-# The four orchestrator-read LEERIE_* vars that are legitimately deny-listed
+# The six orchestrator-read LEERIE_* vars that are legitimately deny-listed
 # (see the launcher's `_leerie_env_denylist` comment):
-#   LEERIE_STATE_DIR / LEERIE_INSPECT_DIRS — remapped separately to
-#     container-internal values.
+#   LEERIE_STATE_DIR / LEERIE_INSPECT_DIRS / LEERIE_HOST_DIR — remapped
+#     separately to container-internal values (the host value of
+#     LEERIE_HOST_DIR picks the host dir mounted at /leerie-host).
 #   LEERIE_NO_PUSH — the orchestrator is always invoked with --no-push; the
 #     host does the push.
 #   LEERIE_RUNTIME — the runtime is decided launcher-side before the container
 #     launches; the orchestrator's read is informational.
+#   LEERIE_RUN_ID_FILE — launcher-computed per invocation (below).
 _JUSTIFIED_DENYLISTED = {
     "LEERIE_STATE_DIR",
     "LEERIE_INSPECT_DIRS",
+    "LEERIE_HOST_DIR",
     "LEERIE_NO_PUSH",
     "LEERIE_RUNTIME",
+    # Launcher-computed per invocation: the container path of the file the
+    # orchestrator names its run in (DESIGN §6 *Which run the container
+    # ran*). A host value would point the launcher's bring-back at a file
+    # it never reads.
+    "LEERIE_RUN_ID_FILE",
 }
 
 
@@ -334,7 +344,7 @@ def _launcher_denylist() -> set[str]:
 
 def test_every_orchestrator_override_reaches_the_container():
     """Coupling guard: an orchestrator-read LEERIE_* var must either reach the
-    container (not deny-listed) or be one of the four justified exceptions.
+    container (not deny-listed) or be one of the five justified exceptions.
 
     Catches a future `LEERIE_FOO` override added to the orchestrator that a
     stale deny-list would silently strand at the container boundary — the exact
@@ -348,3 +358,13 @@ def test_every_orchestrator_override_reaches_the_container():
         "Either remove them from `_leerie_env_denylist` in `leerie` (so they "
         "forward), or add them to _JUSTIFIED_DENYLISTED here with a reason."
     )
+
+
+def test_host_dir_override_is_not_forwarded_into_the_container():
+    """`LEERIE_HOST_DIR` on the host names the host dir the launcher mounts
+    at /leerie-host; inside the container the same name must mean the mount
+    point, never the host path (IMPLEMENTATION §2½)."""
+    names = _forwarded_names(_run({"LEERIE_HOST_DIR": "/bench/host",
+                                   "LEERIE_MODEL": "sonnet"}))
+    assert "LEERIE_HOST_DIR" not in names
+    assert "LEERIE_MODEL" in names

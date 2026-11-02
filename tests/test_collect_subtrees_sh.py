@@ -78,8 +78,20 @@ def _flyctl_stub(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
         # Rewrite in-machine paths to fixture paths.
         '    REWRITTEN="${SCRIPT//\\/opt\\/leerie-image\\/scripts/$SCRIPTS}"\n'
         '    REWRITTEN="${REWRITTEN//\\/opt\\/leerie-image\\/prompts/$PROMPTS}"\n'
-        '    REWRITTEN="${REWRITTEN//\\/work\\/.leerie\\/runs/$STATE_DIR/runs}"\n'
-        '    REWRITTEN="${REWRITTEN//cd \\/work/cd $REPO}"\n'
+        '    REWRITTEN="${REWRITTEN//\\/work\\/.leerie/$STATE_DIR}"\n'
+        # The run's own repository (DESIGN §6 *The run's own repository*)
+        # is `<run-dir>/repo`; the fixture repository's git dir stands in.
+        '    for d in "$STATE_DIR"/runs/*/; do\n'
+        '      [ -d "$d" ] && ln -sfn "$REPO/.git" "${d}repo"\n'
+        # leerie's copy of its settings, which a real run takes with the
+        # repository (DESIGN §8 *The settings are leerie's*); a tree
+        # repository's config is copied from it.
+        '      if [ -d "$d" ] && [ ! -d "${d}repo-settings" ]; then\n'
+        '        mkdir -p "${d}repo-settings"\n'
+        '        cp "$REPO/.git/config" "${d}repo-settings/config"\n'
+        '        [ -d "$REPO/.git/info" ] && cp -R "$REPO/.git/info" "${d}repo-settings/info"\n'
+        '      fi\n'
+        '    done\n'
         # Override LEERIE_STATE_DIR for the payload.
         f'    export LEERIE_STATE_DIR="{state_dir}"\n'
         '    printf "%s" "$REWRITTEN" | bash -s\n'
@@ -377,3 +389,242 @@ def test_setup_run_creates_missing_worktree(tmp_path):
         ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:new_file.txt"],
         capture_output=True, text=True, check=False)
     assert show.returncode == 0, "new_file.txt missing from run branch"
+
+
+# --- the integrator carries the same worker guard as every other worker ------
+
+def _worker_dir(state_dir: Path, run_id: str) -> Path:
+    """A worker directory of the run (`<run-dir>/workers/`), the one place
+    outside its tree a confined stub may write (DESIGN §6 *A worker writes
+    only where it is granted*): the payload's `TMPDIR`."""
+    d = state_dir / "runs" / run_id / "workers" / "cache" / "stub"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _recording_claude(tmp_path: Path, rec_dir: Path) -> tuple[Path, Path]:
+    """A stub claude that records its argv (NUL-separated), two env values
+    and whether its own configuration directory is there, then resolves
+    the conflict by accepting theirs."""
+    rec = rec_dir / "claude-argv"
+    stub = tmp_path / "bin" / "claude"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    stub.write_text(
+        '#!/usr/bin/env bash\n'
+        f'printf "%s\\0" "$@" > "{rec}"\n'
+        f'printf "%s" "${{LEERIE_FORBIDDEN_SCRIPTS:-}}" > "{rec}.env"\n'
+        f'[ -d "${{CLAUDE_CONFIG_DIR:-/nonexistent}}" ] && '
+        f'echo CLAUDE_CONFIG_DIR > "{rec}.cfg"\n'
+        'git checkout --theirs . >/dev/null 2>&1\n'
+        'git add -A >/dev/null 2>&1\n'
+        'git commit --no-edit >/dev/null 2>&1\n'
+        'echo \'{"type":"result","structured_output":'
+        '{"incoming_subtask":"s2","status":"resolved",'
+        '"resolution_summary":"theirs","diagnosis":null}}\'\n')
+    stub.chmod(0o755)
+    return stub, rec
+
+
+def _conflicting_run(tmp_path: Path, run_id: str, extra_state: dict):
+    repo = _make_fixture_repo(tmp_path)
+    state_dir = tmp_path / "state"
+    _make_run_branch(repo, run_id)
+    _make_state_json(state_dir, run_id, waves=[["s1", "s2"]],
+                     completed_waves=0)
+    sj = state_dir / "runs" / run_id / "state.json"
+    sj.write_text(json.dumps({**json.loads(sj.read_text()), **extra_state}))
+    _make_subtask_branch(repo, run_id, "s1", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version A\n"})
+    _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version B\n"})
+    return repo, state_dir
+
+
+def test_the_integrator_gets_the_shared_kill_deny_notice_and_hook(
+        tmp_path, leerie):
+    run_id = "test-guard-abc"
+    repo, state_dir = _conflicting_run(tmp_path, run_id, {
+        "process_constraints": {"forbidden_commands": ["npm run deploy"]}})
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
+    wdir = _worker_dir(state_dir, run_id)
+    _claude, rec = _recording_claude(tmp_path, wdir)
+    result = run_bash(
+        f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
+        env={"LEERIE_REPO": str(REPO_ROOT), "TMPDIR": str(wdir),
+             "PATH": f"{stub.parent}:{os.environ['PATH']}"})
+    assert result.returncode == 0, f"stderr={result.stderr}"
+    assert "integrated 2" in result.stderr.lower()
+    # The integrator had its own copy of the credentials while it ran, and
+    # the payload removed it, and the template, when it was done (DESIGN §6
+    # *No copy of the credentials outlives its run's process*); the shared
+    # caches stay.
+    run_dir = state_dir / "runs" / run_id
+    assert "CLAUDE_CONFIG_DIR" in (rec.parent / "claude-argv.cfg").read_text()
+    assert not (run_dir / "claude-config").exists()
+    assert list((run_dir / "workers").glob("integrator-*")) == []
+    assert wdir.is_dir()
+    argv = rec.read_text().split("\0")[:-1]
+
+    def after(flag: str) -> str:
+        return argv[argv.index(flag) + 1]
+    staging = state_dir / "runs" / run_id / "worktrees" / "staging"
+    expect = leerie._worker_guard(
+        leerie.ACT_TOOLS, str(staging),
+        {"process_constraints": {"forbidden_commands": ["npm run deploy"]}})
+    # The deny list is the base list plus exactly what `claude_p` adds.
+    assert after("--disallowedTools") == (
+        leerie.DISALLOWED_TOOLS + "," + expect["deny"])
+    for rule in ("Bash(pkill)", "Bash(xargs kill *)", "Bash(npm run deploy)"):
+        assert rule in after("--disallowedTools").split(","), rule
+    assert "TaskStop" in after("--allowedTools").split(",")
+    assert "TaskStop" not in after("--disallowedTools").split(",")
+    # Every notice, on the user prompt, as claude_p appends them; the last
+    # says where its grant lets it write.
+    prompt = after("-p")
+    assert prompt.startswith("Resolve the in-progress merge conflict")
+    guard_part, writes = prompt.rsplit("\nNOTE FROM ORCHESTRATOR: ", 1)
+    assert guard_part.endswith("".join(f"\nNOTE FROM ORCHESTRATOR: {n}"
+                                       for n in expect["notices"]))
+    assert writes.startswith("your processes can write only these: "
+                             "your working directory; $TMPDIR")
+    assert leerie.PROCESS_KILL_NOTICE in prompt
+    # The PreToolUse hook (kills + the forbidden command) and the script
+    # shell guard's environment.
+    hook = json.loads(after("--settings"))
+    cmd = hook["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "forbidden-command-hook.py" in cmd
+    assert (rec.parent / "claude-argv.env").read_text() == "deploy"
+
+
+def test_the_integrator_never_runs_without_its_guard(tmp_path, leerie):
+    """Without a loadable guard there are no grants, so the branch is
+    skipped and no integrator runs (DESIGN §6 *A worker writes only where
+    it is granted*) — before, it ran with the embedded deny list alone."""
+    run_id = "test-guard-fallback"
+    repo, state_dir = _conflicting_run(tmp_path, run_id, {})
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
+    wdir = _worker_dir(state_dir, run_id)
+    _claude, rec = _recording_claude(tmp_path, wdir)
+    shadow = tmp_path / "py"
+    shadow.mkdir()
+    # A python3 that fails only the guard script, so the payload's other
+    # python3 uses still work.
+    real = subprocess.run(["bash", "-c", "command -v python3"],
+                          capture_output=True, text=True).stdout.strip()
+    (shadow / "python3").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in *worker-guard.py*) exit 1 ;; esac\n'
+        f'exec {real} "$@"\n')
+    (shadow / "python3").chmod(0o755)
+    result = run_bash(
+        f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
+        env={"LEERIE_REPO": str(REPO_ROOT), "TMPDIR": str(wdir),
+             "PATH": f"{shadow}:{stub.parent}:{os.environ['PATH']}"})
+    assert result.returncode == 0, f"stderr={result.stderr}"
+    assert "integrated 1, skipped 1" in result.stderr.lower()
+    assert not rec.exists()
+
+
+def _make_messy_claude(tmp_path: Path, *, status: str) -> Path:
+    """Stub integrator that edits a file outside the merge (README.md) and
+    leaves a scratch file, then returns `status` — `failed`, or a
+    `resolved` that commits the merge but leaves the scratch file."""
+    stub = tmp_path / "bin" / "claude"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    commit = ("git checkout --theirs conflict.txt >/dev/null 2>&1\n"
+              "git add conflict.txt >/dev/null 2>&1\n"
+              "git commit --no-edit >/dev/null 2>&1\n"
+              if status == "resolved" else "")
+    stub.write_text(
+        '#!/usr/bin/env bash\n'
+        'printf "integrator scratch\\n" >> README.md\n'
+        'printf "x\\n" > scratch.txt\n'
+        + commit +
+        'echo \'{"type":"result","structured_output":'
+        '{"incoming_subtask":"test","status":"' + status + '",'
+        '"resolution_summary":null,"diagnosis":"d"}}\'\n')
+    stub.chmod(0o755)
+    return stub
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("status", ["failed", "resolved"])
+def test_a_skipped_branch_leaves_staging_as_it_found_it(tmp_path, status):
+    """I1 for the collection's integrator: a `failed` verdict, or a
+    `resolved` one that left its tree dirty, is backed out to the commit
+    before the merge. `git merge --abort` used to keep the integrator's edit
+    to README.md, so the next branch — which touches README.md — could not
+    merge and was handed to an integrator too (skipped), and a `resolved`
+    with a scratch file counted as integrated."""
+    repo = _make_fixture_repo(tmp_path)
+    run_id = "test-messy-abc"
+    state_dir = tmp_path / "state"
+    _make_run_branch(repo, run_id)
+    _make_state_json(state_dir, run_id, waves=[["s1", "s2", "s3"]],
+                     completed_waves=0)
+    _make_subtask_branch(repo, run_id, "s1", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version A\n"})
+    _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version B\n"})
+    _make_subtask_branch(repo, run_id, "s3", f"leerie/runs/{run_id}",
+                         {"README.md": "hello from s3\n"})
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
+    _make_messy_claude(tmp_path, status=status)
+    env = {"LEERIE_REPO": str(REPO_ROOT),
+           "PATH": f"{stub.parent}:{os.environ['PATH']}"}
+    result = run_bash(
+        f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
+        env=env)
+    assert result.returncode == 0, f"stderr={result.stderr}"
+    assert "integrated 2" in result.stderr.lower(), result.stderr
+    assert "skipped 1" in result.stderr.lower(), result.stderr
+    readme = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:README.md"],
+        capture_output=True, text=True, check=True).stdout
+    assert readme == "hello from s3\n"
+    staging = state_dir / "runs" / run_id / "worktrees" / "staging"
+    assert subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=staging, capture_output=True, text=True).stdout == ""
+
+
+def test_a_reset_that_fails_stops_the_collection(tmp_path):
+    """A back-out that cannot restore staging (here an `index.lock` the
+    integrator left, which every git write then refuses) stops the
+    collection: the remaining branch is skipped, not merged onto a tree the
+    reset could not restore, and no second integrator is spawned on it.
+    Before, the `|| true` back-out let the loop go on."""
+    repo = _make_fixture_repo(tmp_path)
+    run_id = "test-stuck-abc"
+    state_dir = tmp_path / "state"
+    _make_run_branch(repo, run_id)
+    _make_state_json(state_dir, run_id, waves=[["s1", "s2", "s3"]],
+                     completed_waves=0)
+    _make_subtask_branch(repo, run_id, "s1", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version A\n"})
+    _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version B\n"})
+    _make_subtask_branch(repo, run_id, "s3", f"leerie/runs/{run_id}",
+                         {"other.txt": "s3\n"})
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
+    wdir = _worker_dir(state_dir, run_id)
+    calls = wdir / "integrator-calls"
+    claude = tmp_path / "bin" / "claude"
+    claude.write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo x >> "{calls}"\n'
+        'touch "$(git rev-parse --git-dir)/index.lock"\n'
+        'echo \'{"type":"result","structured_output":'
+        '{"incoming_subtask":"t","status":"failed","diagnosis":"d"}}\'\n')
+    claude.chmod(0o755)
+    env = {"LEERIE_REPO": str(REPO_ROOT), "TMPDIR": str(wdir),
+           "PATH": f"{stub.parent}:{os.environ['PATH']}"}
+    result = run_bash(
+        f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
+        env=env)
+    assert result.returncode == 0, f"stderr={result.stderr}"
+    assert "integrated 1" in result.stderr.lower(), result.stderr
+    assert "skipped 2" in result.stderr.lower(), result.stderr
+    assert calls.read_text().count("x") == 1

@@ -519,15 +519,13 @@ def test_finalize_local_run_without_finished_at_reaches_host_finalize(tmp_path):
     """THE reported bug: a local run interrupted before `finished_at` was
     written must finalize locally, never ask for flyctl.
 
-    `no_push` is set in run.json AND `--no-push` is passed, so `host_finalize`
-    short-circuits at its own early gate (host-finalize.sh:294) — a return from
-    *inside* host_finalize, which proves the launcher handed off, without this
-    test needing a git remote or a rebaser worker.
-
-    The CLI flag is load-bearing, not belt-and-braces: without it the launcher
-    reaches its mechanism-vs-intent block and STRIPS `no_push` from run.json
-    whenever the run branch exists locally, so the gate would never fire and
-    this test would run on into the rebase and push.
+    `no_push` is set in run.json, so `host_finalize` short-circuits at its
+    own early gate — a return from *inside* host_finalize, which proves the
+    launcher handed off, without this test needing a git remote or a rebaser
+    worker. No `--no-push` is passed: the verb used to strip a recorded
+    `no_push` whenever the run branch existed locally, and needed the flag to
+    keep it; the record alone now decides (DESIGN §6 *One push choice per
+    run, on every runtime*).
 
     Note the existing local-shaped fixtures in
     tests/test_launcher_finalize_no_work.py cannot catch this regression:
@@ -538,7 +536,7 @@ def test_finalize_local_run_without_finished_at_reaches_host_finalize(tmp_path):
     run_dir, repo = _make_local_run(state_dir, tmp_path, "r1", no_push=True)
     assert "finished_at" not in json.loads((run_dir / "run.json").read_text())
 
-    r = _finalize(["finalize", "r1", "--no-push"], state_dir, repo)
+    r = _finalize(["finalize", "r1"], state_dir, repo)
 
     combined = r.stdout + r.stderr
     assert "flyctl" not in combined.lower(), combined

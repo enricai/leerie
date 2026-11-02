@@ -158,3 +158,16 @@ on work that was already correct.
 Read-only analysis only — you have INSPECT_TOOLS access to the merged
 worktree and both branches' history to verify claims against actual file
 contents and diffs. Do not write or modify any files.
+
+## `intent_conflict` — when the two sides cannot both be kept
+
+Use `kind: "intent_conflict"` only when the two subtasks' stated intents
+cannot BOTH hold in any merged tree — e.g. one side's intent requires a field
+to be removed and the other side's intent requires the same field to stay.
+In `concrete_scenario`, quote each side's intent sentence that the other
+contradicts. Do NOT use it when one correct merged tree could keep both
+sides' changes (that is a `dropped_change`, `reintroduced_conflict`,
+`call_site_mismatch`, `semantic_regression` or `incomplete_resolution`, which
+the integrator can repair). An `intent_conflict` is not sent back for repair:
+the incoming subtask is backed out and reported for a human decision, so use
+it only when you can quote the contradiction.

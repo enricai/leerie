@@ -5,9 +5,9 @@ cleanup.sh supports:
 - `--all-runs [--branches | --subtask-branches]` — every per-run dir
 - no flag — most-recently-failed run, with y/N prompt
 
-`--subtask-branches` is the post-finalize default (invoked by
-phase_finalize): it deletes only the per-subtask branches and keeps
-leerie/runs/<id> (the PR head). `--branches` is broader and deletes
+`--subtask-branches` deletes only the per-subtask branches and keeps
+leerie/runs/<id> (the PR head); phase_finalize passes no branch flag (the
+subtask branches are refs of the run's own repository). `--branches` is broader and deletes
 both the run branch and the subtask branches; they are mutually
 exclusive.
 
@@ -266,8 +266,13 @@ def test_cleanup_wraps_worktree_remove_in_timeout():
     Python path, leerie.py:3896-3920), so a stalled removal (stale mount,
     held index.lock, disk contention) cannot hang the script forever."""
     src = _src()
-    clean_one_run = src.split("clean_one_run() {")[1].split("\n}")[0]
-    assert 'timeout "$WORKTREE_REMOVE_TIMEOUT" git worktree remove --force' in clean_one_run
+    # The body moved to `_clean_one_run_here`, which `clean_one_run` runs
+    # inside the run's own repository (DESIGN §6 *The run's own
+    # repository*).
+    clean_one_run = src.split("_clean_one_run_here() {")[1].split("\n}")[0]
+    assert ('timeout "$WORKTREE_REMOVE_TIMEOUT" git '
+            '${LEERIE_GIT_DIR:+--git-dir="$LEERIE_GIT_DIR"} worktree remove '
+            '--force') in clean_one_run
     assert 'WORKTREE_REMOVE_TIMEOUT="${CLEANUP_SH_TEST_WORKTREE_REMOVE_TIMEOUT:-240}"' in src
 
 

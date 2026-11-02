@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import subprocess
+import types
+from pathlib import Path
 
 import pytest
 
@@ -35,12 +37,19 @@ def test_run_script_passes_a_bounded_timeout_to_run_proc(leerie, monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, "", "")
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
 
-    asyncio.run(leerie._run_script("cleanup.sh", "--run-id", "r1"))
+    run_dir = Path("/state-root/runs/r1")
+    st = types.SimpleNamespace(run_dir=run_dir)
+    asyncio.run(leerie._run_script("cleanup.sh", "--run-id", "r1", st=st))
 
     assert captured.get("timeout") is not None, (
         "_run_script must pass an explicit, non-None timeout to run_proc"
     )
     assert captured["timeout"] > 0
+    # In the run's own repository, with the state root passed absolute
+    # (DESIGN §6 *The run's own repository*).
+    assert captured["cwd"] == str(run_dir / "repo")
+    assert captured["env"]["LEERIE_STATE_DIR"] == str(
+        run_dir.resolve().parent.parent)
 
 
 def test_phase_finalize_invokes_cleanup_with_run_id(leerie):
@@ -48,16 +57,12 @@ def test_phase_finalize_invokes_cleanup_with_run_id(leerie):
 
     Without the explicit --run-id, cleanup.sh falls into its interactive
     no-arg mode, reads EOF from the orchestrator's non-tty stdin, and
-    silently aborts — leaving every subtask worktree on disk."""
+    silently aborts — leaving every subtask worktree on disk. Worktrees
+    only: every branch of the run lives in its own repository and goes
+    with it (DESIGN §6 *The run's own repository*), so no branch flag."""
     src = inspect.getsource(leerie.phase_finalize)
-    assert '_run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")' in src, (
-        "phase_finalize must invoke cleanup.sh with --run-id st.run_id and "
-        "--subtask-branches. The --run-id avoids the interactive no-arg "
-        "path (which silently aborts non-interactively); the "
-        "--subtask-branches deletes per-subtask branches that are pure "
-        "clutter post-finalize while keeping leerie/runs/<id> as the "
-        "PR head."
-    )
+    assert '_run_script("cleanup.sh", "--run-id", st.run_id, st=st)' in src
+    assert "--subtask-branches" not in src and "--branches" not in src
 
 
 def test_phase_finalize_does_not_use_bare_cleanup(leerie):
@@ -143,7 +148,7 @@ def test_phase_finalize_survives_a_cleanup_sh_timeout(
     """Execution-level pin: if cleanup.sh times out, phase_finalize must
     still reach its terminal state instead of letting TimeoutExpired
     propagate uncaught and crash the run."""
-    async def _fake_run_script(name, *args):
+    async def _fake_run_script(name, *args, **_kw):
         if name == "cleanup.sh":
             raise subprocess.TimeoutExpired(["bash", name, *args], 600)
         return subprocess.CompletedProcess(["bash", name, *args], 0, "", "")
@@ -188,11 +193,18 @@ def test_phase_finalize_survives_a_cleanup_sh_timeout(
 def test_resume_completion_guard_keys_on_current_phase(leerie):
     """The resume completion guard (in _run_phases) treats a run as
     terminal when finished_at is set AND current_phase == "phase 6:
-    finalize". This test pins that the guard reads current_phase — the
-    discriminator the Fix-1 ordering change relies on. If the guard stopped
-    consulting current_phase, the ordering fix would be silently defeated."""
+    finalize" — `_run_has_nothing_left`, which `main()` also reads to leave
+    a completed run's death record unarmed. This test pins that the guard
+    goes through it and that it reads current_phase — the discriminator the
+    Fix-1 ordering change relies on. If the guard stopped consulting
+    current_phase, the ordering fix would be silently defeated."""
     src = inspect.getsource(leerie._run_phases)
-    assert '"phase 6: finalize"' in src and "finished_at" in src, (
+    assert "_run_has_nothing_left(st.data)" in src
+    done = {"finished_at": "t", "current_phase": "phase 6: finalize"}
+    died_in_finalize = {"finished_at": "t",
+                        "current_phase": "phase 5: execute"}
+    assert leerie._run_has_nothing_left(done)
+    assert not leerie._run_has_nothing_left(died_in_finalize), (
         "the resume completion guard must key on finished_at AND "
         'current_phase == "phase 6: finalize"; the Fix-1 ordering change '
         "depends on current_phase distinguishing a died finalize from a "

@@ -26,12 +26,14 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import subprocess
 import types
 import unittest.mock as mock
 
 import pytest
+from tests.conftest import fake_run_dir
 
 
 @pytest.fixture(autouse=True)
@@ -132,8 +134,8 @@ def test_probe_writes_and_cleans_up_temp_file(leerie, monkeypatch, tmp_path):
 
 def _make_state():
     return types.SimpleNamespace(
-        path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
-        run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        path=fake_run_dir() / "state.json",
+        run_dir=fake_run_dir(),
         # claude_p derives the checkout write-denial from this
         # (_repo_write_denials) and the §12 cwd guard compares against it;
         # a stub without it silently disables both.
@@ -308,3 +310,132 @@ def test_live_cli_accepts_append_system_prompt_file():
             check=False,
         )
     assert "unknown option" not in (r.stderr or "")
+
+
+# --- F5: the staged file lives in the run directory (DESIGN §7 *The system
+# prompt is staged in the run directory*) ------------------------------------
+
+def test_staged_file_lives_in_the_run_dir_and_survives_a_tmp_wipe(
+        leerie, tmp_path, monkeypatch):
+    """The CLI reads the file at every spawn of the call. A /tmp cleared
+    under a live call used to take it with it; the run directory is the
+    state the run already depends on."""
+    import tempfile
+    fake_tmp = tmp_path / "tmp"
+    fake_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(fake_tmp))
+    run_dir = tmp_path / "state" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    path = leerie._write_system_prompt_file(run_dir, "SYSTEM")
+    assert pathlib.Path(path).parent == run_dir / leerie.SYSPROMPT_DIRNAME
+    # What a host cleanup does under a live call: /tmp emptied.
+    for p in fake_tmp.iterdir():
+        p.unlink()
+    assert pathlib.Path(path).read_text() == "SYSTEM"
+
+
+def test_falls_back_to_the_temp_dir_when_the_run_dir_cannot_hold_it(
+        leerie, tmp_path):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    path = leerie._write_system_prompt_file(blocker, "SYSTEM")
+    try:
+        assert pathlib.Path(path).read_text() == "SYSTEM"
+        assert not str(path).startswith(str(blocker))
+    finally:
+        os.unlink(path)
+
+
+def test_claude_p_stages_in_the_run_dir_denies_reads_and_cleans_up(
+        leerie, tmp_path, monkeypatch):
+    """The real claude_p: the file it passes is under <run_dir>/sysprompt/,
+    exists while the worker runs, is Read-denied to it, and is gone after."""
+    run_dir = tmp_path / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    observed: dict = {}
+
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
+                          stdin_data=None, **_kw):
+        p = cmd[cmd.index("--append-system-prompt-file") + 1]
+        observed["path"] = p
+        observed["text"] = pathlib.Path(p).read_text()
+        observed["deny"] = cmd[cmd.index("--disallowedTools") + 1]
+        return {"type": "result", "subtype": "success", "is_error": False,
+                "result": "{}", "structured_output": {"categories": []}}
+
+    st = types.SimpleNamespace(
+        path=run_dir / "state.json", run_dir=run_dir,
+        repo_root=tmp_path / "repo", data={"verbosity": "quiet"},
+        run_id="r1", bump_workers=lambda *a, **k: None,
+        add_telemetry=lambda *a, **k: None)
+    monkeypatch.setattr(leerie, "_invoke", fake_invoke)
+    monkeypatch.setattr(leerie, "_capture_call", lambda *a, **k: None)
+    monkeypatch.setattr(
+        leerie, "_append_system_prompt_file_supported", lambda: True)
+    asyncio.run(leerie.claude_p(
+        "u", "THE SYSTEM PROMPT", schema_key="classifier",
+        cwd=str(tmp_path / "planning"), allowed_tools="Read", max_turns=5,
+        autonomous=False, caps=dict(leerie.DEFAULT_CAPS), st=st,
+        model="sonnet", sid="t"))
+    assert pathlib.Path(observed["path"]).parent == run_dir / "sysprompt"
+    assert observed["text"] == "THE SYSTEM PROMPT"
+    assert f"Read(/{run_dir}/sysprompt/**)" in observed["deny"].split(",")
+    assert not pathlib.Path(observed["path"]).exists()
+
+
+def _deny_for(leerie, tmp_path, monkeypatch, allowed_tools, autonomous):
+    run_dir = tmp_path / "runs" / "r1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    observed: dict = {}
+
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
+                          stdin_data=None, **_kw):
+        observed["deny"] = cmd[cmd.index("--disallowedTools") + 1]
+        return {"type": "result", "subtype": "success", "is_error": False,
+                "result": "{}", "structured_output": {"categories": []}}
+
+    st = types.SimpleNamespace(
+        path=run_dir / "state.json", run_dir=run_dir,
+        repo_root=tmp_path / "repo", data={"verbosity": "quiet"},
+        run_id="r1", bump_workers=lambda *a, **k: None,
+        add_telemetry=lambda *a, **k: None)
+    monkeypatch.setattr(leerie, "_invoke", fake_invoke)
+    monkeypatch.setattr(leerie, "_capture_call", lambda *a, **k: None)
+    monkeypatch.setattr(
+        leerie, "_append_system_prompt_file_supported", lambda: True)
+    asyncio.run(leerie.claude_p(
+        "u", "S", schema_key="classifier", cwd=str(tmp_path / "planning"),
+        allowed_tools=allowed_tools, max_turns=5, autonomous=autonomous,
+        caps=dict(leerie.DEFAULT_CAPS), st=st, model="sonnet", sid="t"))
+    return observed["deny"].split(","), run_dir
+
+
+@pytest.mark.parametrize("tools_name, autonomous, denied", [
+    ("INSPECT_TOOLS", False, False),
+    ("SATISFIED_PROBE_TOOLS", False, False),
+    ("ACT_TOOLS", True, True),
+    ("SMOKE_TOOLS", False, True),
+])
+def test_read_deny_only_for_workers_that_can_read_beyond_cwd(
+        leerie, tmp_path, monkeypatch, tools_name, autonomous, denied):
+    """DESIGN §7: a judgment worker held to the working-directory boundary
+    carries no `Read()` rule. Any such rule makes the CLI refuse `cd <dir>;
+    <read> <relative path>` compounds it cannot resolve. A worker that can
+    read anywhere (acting, or a bare `Read` grant) keeps the deny."""
+    deny, run_dir = _deny_for(leerie, tmp_path, monkeypatch,
+                              getattr(leerie, tools_name), autonomous)
+    reads = [d for d in deny if d.startswith("Read(")]
+    assert reads == ([f"Read(/{run_dir}/sysprompt/**)"] if denied else [])
+
+
+def test_judgment_tool_profiles_grant_no_blanket_read(leerie):
+    """The boundary that replaces the deny for judgment workers holds only
+    while they lack a bare Read/Grep/Glob grant, which the CLI honours on
+    any path (measured live: `<run-dir>/state.json` read with it, refused
+    without it)."""
+    for tools in (leerie.INSPECT_TOOLS, leerie.SATISFIED_PROBE_TOOLS):
+        names = {t.strip() for t in tools.split(",")}
+        assert not names & {"Read", "Grep", "Glob"}
+        assert not leerie._reads_beyond_cwd(tools, False)
+    assert leerie._reads_beyond_cwd(leerie.ACT_TOOLS, True)
+    assert leerie._reads_beyond_cwd("Glob,Bash(ls:*)", False)

@@ -162,7 +162,8 @@ class TestRollbackRestoresClobber:
         assert asyncio.run(
             leerie._clobbered_owned_files(str(d), "run", impl)) \
             == ["a.py (reverted-to-base)"]
-        asyncio.run(leerie._rollback_conformer_commits(str(d), impl))
+        asyncio.run(leerie._restore_tree(d, impl, where="t",
+                                         branch="main"))
         # implementer content restored, and no clobber remains detectable
 
     def test_empty_before_sha_is_a_noop(self, leerie, tmp_path):
@@ -172,7 +173,8 @@ class TestRollbackRestoresClobber:
         # worktree rather than resetting to a garbage ref.
         d, impl = _impl_repo(tmp_path)
         before_head = _rev(d)
-        asyncio.run(leerie._rollback_conformer_commits(str(d), ""))
+        assert asyncio.run(leerie._restore_tree(d, "", where="t",
+                                         branch="main")) is False
         assert _rev(d) == before_head
         assert (d / "a.py").read_text() == "IMPL a\n"
         assert _rev(d) == impl
@@ -384,36 +386,6 @@ class TestProtectedPathsSince:
         assert r == [".leerie/config.toml"], r
 
 
-class TestUncommittedPaths:
-    def test_clean_worktree_returns_empty(self, leerie, tmp_path):
-        d, _base = _single_commit_repo(tmp_path)
-        r = asyncio.run(leerie._uncommitted_paths(str(d)))
-        assert r == []
-
-    def test_tracked_modified_kept_untracked_excluded(self, leerie, tmp_path):
-        d, _base = _single_commit_repo(tmp_path)
-        (d / "a.py").write_text("uncommitted edit\n")
-        (d / "new.py").write_text("untracked\n")
-        r = asyncio.run(leerie._uncommitted_paths(str(d)))
-        assert len(r) == 1
-        assert "a.py" in r[0]
-        assert not any(line.startswith("??") for line in r)
-        assert not any("new.py" in line for line in r)
-
-    def test_non_git_directory_returns_empty(self, leerie, tmp_path):
-        d = tmp_path / "not-a-repo"
-        d.mkdir()
-        r = asyncio.run(leerie._uncommitted_paths(str(d)))
-        assert r == []
-
-    def test_nonexistent_directory_returns_empty(self, leerie, tmp_path):
-        """`run_proc` raising OSError (e.g. cwd does not exist) must
-        degrade to empty, not propagate — the except OSError branch."""
-        missing = tmp_path / "does-not-exist"
-        r = asyncio.run(leerie._uncommitted_paths(str(missing)))
-        assert r == []
-
-
 class TestBranchHeadSha:
     def test_returns_head_sha(self, leerie, tmp_path):
         d, impl = _impl_repo(tmp_path)
@@ -427,13 +399,14 @@ class TestBranchHeadSha:
         assert r == ""
 
 
-class TestRollbackConformerCommits:
+class TestRestoreTreeOnAnEmptyRev:
     def test_empty_before_sha_is_a_noop(self, leerie, tmp_path):
         """An empty before_sha must not attempt a reset at all — the
         early-return guard, distinct from a no-op reset to the same sha."""
         d, impl = _impl_repo(tmp_path)
         head_before = _rev(d)
-        asyncio.run(leerie._rollback_conformer_commits(str(d), ""))
+        assert asyncio.run(leerie._restore_tree(d, "", where="t",
+                                         branch="main")) is False
         assert _rev(d) == head_before
 
 

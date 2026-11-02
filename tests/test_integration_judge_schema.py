@@ -50,7 +50,7 @@ def test_defect_item_shape(leerie):
         "kind", "concrete_scenario", "location", "why_broken"}
     assert set(item["properties"]["kind"]["enum"]) == {
         "dropped_change", "reintroduced_conflict", "call_site_mismatch",
-        "semantic_regression", "incomplete_resolution"}
+        "semantic_regression", "incomplete_resolution", "intent_conflict"}
 
 
 def test_no_confidence_subobject(leerie):

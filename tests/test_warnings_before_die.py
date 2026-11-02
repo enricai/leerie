@@ -90,31 +90,31 @@ def test_run_checked_loop_still_records_the_exception_text(leerie):
             "printed with no cause attached")
 
 
-def test_integrate_wave_logs_warnings_before_die(leerie):
-    """`integrate_wave`'s crash path is the same convention as the four
-    phases above, but its die string differs ("crashed; merge aborted"), so
-    the parametrized guard cannot cover it.
-
-    Pinned separately because this site is where the convention was *missed*
-    once already: the crash path used to die() without recording
-    `blocked[sid]` or logging its warnings at all, which is precisely how a
-    PID-exhausted integrator's cause went unprinted."""
+def test_integrate_wave_logs_crash_warnings_before_backing_out(leerie):
+    """Rewritten: an integrator crash no longer die()s — it is retried in
+    the run and, retries spent, backs the subtask out (DESIGN §7 *The
+    integrator*). The convention this guarded still holds on that path: the
+    crash's warnings carry its cause, so they are logged before the
+    back-out discards the merge. The crash block itself has no die()."""
     src = inspect.getsource(leerie.integrate_wave)
     log_at = src.index("for w in int_warnings")
-    die_at = src.index("crashed; merge aborted")
-    assert log_at < die_at, (
-        "integrate_wave: the crash path must log its int_warnings BEFORE "
-        "die() — die() calls sys.exit(), so anything after it is dead code "
-        "and the crash cause is destroyed unprinted")
+    back_out_at = src.index(
+        "await _back_out_unmerged(st, staging, sid, pre_sha, reason)")
+    assert log_at < back_out_at
+    crash_block = src[src.index("crash_cap = "):
+                      src.index('if ires.get("status") == "resolved"')]
+    assert "die(" not in crash_block
+    assert 'setdefault("blocked"' not in crash_block
 
 
 def test_integrate_wave_records_blocked_before_die(leerie):
     """The other half of the local convention its own neighbor documents:
     record the block to state before dying, so `resume` and the operator
-    can see why the run stopped."""
+    can see why the run stopped. Since an integrator crash stopped dying,
+    the precondition failure is the die this pins."""
     src = inspect.getsource(leerie.integrate_wave)
     blocked_at = src.index('setdefault("blocked", {})[sid]')
-    die_at = src.index("crashed; merge aborted")
+    die_at = src.index('die(f"integrate.sh precondition failure')
     assert blocked_at < die_at, (
         "integrate_wave: blocked[sid] must be recorded (and saved) before "
         "die()")
