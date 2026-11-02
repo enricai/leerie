@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import REPO_ROOT
+from tests.conftest import REPO_ROOT, run_git_out
 from tests.test_worker_confinement import (  # noqa: F401  (fixture)
     _St, _grants, pytestmark as _landlock_mark, run)
 
@@ -129,10 +129,8 @@ def test_add_dir_bits_never_chmods_through_a_link(leerie, tmp_path):
         (outside / "inner").chmod(0o700)
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-c", "user.email=t@x", "-c", "user.name=t", *args],
-        cwd=str(cwd), capture_output=True, text=True, check=True).stdout
+# The committer identity the restore test's commit needs.
+_IDENT = ("user.email=t@x", "user.name=t")
 
 
 def test_restoring_a_tree_never_writes_through_a_link_the_command_left(
@@ -142,11 +140,11 @@ def test_restoring_a_tree_never_writes_through_a_link_the_command_left(
     of the same name. Putting the tree back writes nothing through it."""
     tree = tmp_path / "tree"
     tree.mkdir()
-    _git(tree, "init", "-q", "-b", "main")
+    run_git_out(tree, "init", "-q", "-b", "main", config=_IDENT)
     (tree / "pkg").mkdir()
     (tree / "pkg" / "mod.py").write_text("ORIGINAL = 1\n")
-    _git(tree, "add", "-A")
-    _git(tree, "commit", "-qm", "base")
+    run_git_out(tree, "add", "-A", config=_IDENT)
+    run_git_out(tree, "commit", "-qm", "base", config=_IDENT)
     (tree / "pkg" / "mod.py").write_text("EDITED = 1\n")    # a worker's edit
     before = leerie._tracked_content(tree)
     victim = tmp_path / "victim"
