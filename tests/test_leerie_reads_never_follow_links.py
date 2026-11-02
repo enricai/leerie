@@ -550,11 +550,52 @@ def test_every_raw_read_is_classified():
     assert sorted(known - set(found)) == []
 
 
+# Path probes that follow a link: in a converted function each one decided
+# what was read (`_existing_mise_toml_path` returned a path `.is_file()`
+# passed; `_stage_worktree_extras` walked what `.is_dir()` passed), so its
+# conversion is to `_regular_file_beneath` / `_dir_beneath_exists`, and a
+# copy's to `src_anchor=`. Without these, three of the converted functions
+# could revert to following a link and the rule below stayed green.
+_FOLLOWING_PROBES = {"is_file", "is_dir", "exists"}
+# The converted functions whose remaining probes only test whether a file
+# exists, to choose between leerie's own commands or report a missing file
+# (DESIGN §6 part 2): what they read, they read beneath.
+_EXISTENCE_ONLY = {"_infer_build_lint_test", "_binary_install_source",
+                   "_validate_checkpoint"}
+
+
+def _following_probes() -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    tree = ast.parse(LEERIE_PY.read_text())
+    for fn in tree.body:
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for c in ast.walk(fn):
+            if not isinstance(c, ast.Call):
+                continue
+            f = c.func
+            if isinstance(f, ast.Attribute) and f.attr in _FOLLOWING_PROBES:
+                out.setdefault(fn.name, set()).add(f".{f.attr}")
+            if (isinstance(f, ast.Attribute) and f.attr in
+                    {"isfile", "isdir", "exists"}
+                    and isinstance(f.value, ast.Attribute)
+                    and f.value.attr == "path"):
+                out.setdefault(fn.name, set()).add(f"os.path.{f.attr}")
+            if (getattr(f, "id", None) in ("_copy_beneath",
+                                           "_copytree_beneath")
+                    and "src_anchor" not in {k.arg for k in c.keywords}):
+                out.setdefault(fn.name, set()).add(f"{f.id} without "
+                                                   "src_anchor")
+    return out
+
+
 def test_the_converted_sites_read_only_beneath():
     """The functions that read a repository's content — the checkout, a
     worker's tree, a tree repository, a measurement's output — use no raw
-    read primitive."""
+    read primitive, and decide what to read with no probe that follows a
+    link."""
     found = _raw_readers()
+    probes = _following_probes()
     for fn in ("_find_pr_template", "_read_toml_key",
                "_write_config_toml_keys", "_gather_provision_fixtures",
                "_read_file_safely", "_sample_workspace_manifests",
@@ -575,3 +616,5 @@ def test_the_converted_sites_read_only_beneath():
                "_stage_worktree_extras", "_copy_task_references",
                "_verify_set_audit_case"):
         assert fn not in found, (fn, found.get(fn))
+        if fn not in _EXISTENCE_ONLY:
+            assert fn not in probes, (fn, probes.get(fn))

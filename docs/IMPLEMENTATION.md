@@ -141,8 +141,10 @@ argument after it, untouched, into `REWRITTEN_TAIL`. Every flag the
 launcher adds (`--skip-repo-map`, `--no-push`, `--run-id`) goes into
 `REWRITTEN_ARGS`. The orchestrator's argv is `REWRITTEN_ARGS` followed by
 `REWRITTEN_TAIL`, on every runtime. Pinned by
-`tests/test_launcher_double_dash.py`. `scripts/host-finalize.sh` (sourced by the
-launcher before its first verb) exports two functions.
+`tests/test_launcher_double_dash.py`.
+
+`scripts/host-finalize.sh` (sourced by the launcher before its first verb)
+defines two functions.
 `_repo_git_from_root REPO ARGS...` runs `git --git-dir=<abs git dir>
 --work-tree=REPO ARGS` in a `cd /` subshell, for `ls-remote`,
 `remote show` and `fetch`. `_repo_git_push REPO ARGS...` does the same for
@@ -4637,7 +4639,8 @@ names a link among `leerie.toml`, `.leerie`, `.leerie/config.toml`,
 primitives; review round 26 I1's proof inverted, the credentials file and
 `/proc/self/environ`; the converted readers; the rule that every function
 calling a raw read primitive is classified, and the converted functions
-call none).
+call none and, but for three existence-only ones, use no `.is_file()`,
+`.is_dir()`, `.exists()`, `os.path` probe or copy without `src_anchor=`).
 
 ## 4. Phase walkthrough (`leerie.py`)
 

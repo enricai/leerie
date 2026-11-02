@@ -3325,7 +3325,8 @@ content reached through a path the repository shapes:
 - a file the operator named;
 - a listing that follows no link.
 
-The functions that read a repository's content use no raw primitive
+The functions that read a repository's content use no raw primitive, and
+decide what to read with no probe that follows a link
 (`tests/test_leerie_reads_never_follow_links.py`).
 
 **No read is unbounded.** The orchestrator is unconfined. A worker can make a

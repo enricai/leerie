@@ -646,10 +646,11 @@ already pushed (`pushed_at` and `pr_url` set, no `pr_title`: its `pr_writer`
 failed at finalize and its PR is open with the fallback body; review round
 26, I1). Dropping the `pushed_at` check turns that last test red.
 
-`tests/test_host_python_is_isolated.py` (11 tests: 9 functions, two of them
-run once with the operator's `tenacity` on `PYTHONPATH` and once in the user
-site; DESIGN §6 *The host never imports the repository's code*, review round
-25 I1 and round 26 F1). A rule over every host-run shell file (the launcher,
+`tests/test_host_python_is_isolated.py` (29 tests: 23 functions, two of
+them run four times each, over where the operator's `tenacity` is; DESIGN §6
+*The host never imports the repository's code* and *The host never runs a
+program the checkout chose*, review round 25 I1, round 26 F1 and I2, round
+27 isolation I2). A rule over every host-run shell file (the launcher,
 `host-finalize.sh`, `install.sh`, `runtime-install.sh`, `scripts/remote/`)
 fails any `python3` invocation without `-I`; an anti-vacuity test checks the
 scan sees the known calls, and a planted unisolated call proves it can fail.
@@ -657,16 +658,70 @@ The reviewer's proof, inverted: the bare-resume pick seam, the
 `config --recapture` seam and the launcher's real `NO_PUSH` block run from a
 checkout holding planted stdlib-named modules, never run them, and still do
 their job. The rebaser seam (as `host-finalize.sh` writes it) and the
-recapture seam run from a checkout holding a planted `tenacity.py`, at its
-root and behind a relative `PYTHONPATH` entry, and must import the
-operator's `tenacity`, never the plant (`admit_operator_import_paths`). The
-chain synth-merge helper, given `.` and an absolute operator entry on
+recapture seam run from a checkout holding a planted `tenacity.py`, with the
+operator's `tenacity` behind a relative `PYTHONPATH` entry, in the user
+site, or behind an absolute `PYTHONPATH` entry into the checkout, and must
+import the operator's; with only a user-site `.pth` naming the checkout
+(an editable install), the interpreter's or none
+(`admit_operator_import_paths(exclude)`). The chain synth-merge helper,
+given `.`, the checkout itself and an absolute operator entry on
 `PYTHONPATH`, imports the operator's `chain.git_ops` and not the
-checkout's. Falsified: dropping `-I` from the recapture seam, the
-bare-resume seam and the `NO_PUSH` record read turns 6 tests red (the rule,
-the three seam tests and both recapture `tenacity` cases); replacing both
-seams' `admit_operator_import_paths()` call with `pass` turns the 4
-`tenacity` cases red.
+checkout's.
+
+The same file pins that no program the launcher starts runs in the
+checkout (round 26 I2). Shims built from shell builtins and absolute paths
+stand in front of a bounded list of 29 names, asdf-shaped: each records its
+working directory and execs the real program found before the shim
+directory went on `PATH`, so none can start another. The launcher's
+host-only verbs, run from a checkout whose `.tool-versions` names its own
+`python3`, start no shim inside it and never run the plant, and a
+`.tool-versions` cannot pick the launcher's own `python3`. The prologue's
+shape (`/bin/sh`, `cd /` before `bash` is chosen) is checked, a relative
+`--state-dir` and task file still mean the checkout's (the state dir beside
+it, since one inside is refused), and `ls-remote` starts `ssh` from `/`,
+with a `git -C` control that starts it in the checkout. Static rules reject
+a `cd` into the checkout in the host scripts and a `git submodule foreach`
+body that runs more than `printf`, require every remote git call in
+`host-finalize.sh` and the launcher to go through `_repo_git_from_root` or
+`_repo_git_push`, and chain's git runs from `/` naming the repository.
+
+Falsified on the current tree: dropping `-I` from the recapture seam, the
+bare-resume seam and the `NO_PUSH` record read turns 8 tests red (the rule,
+the three seam tests and the four recapture `tenacity` cases); replacing
+both seams' `admit_operator_import_paths(...)` call with `pass` turns 6 red
+(every rebaser and recapture case but the two `.pth` ones, which import no
+plant either way); replacing only the final drop with a no-op turns the 4
+`*_into_checkout` cases red.
+
+`tests/test_leerie_reads_never_follow_links.py` (23 tests: 20 functions;
+the credentials test runs twice, the `.claude` settings test three times,
+and `test_environ_child` is the `/proc/self/environ` child, skipped unless
+its parent runs it; DESIGN §6 *Leerie never reads through a link a
+repository holds*, review round 26 I1, round 27 isolation I3 and execution
+L2). The primitives refuse a link at the file or on the way, and a listing
+keeps only what it reached without one. The reviewer's proof, inverted: a
+PR template linked to a credentials file or to `/proc/self/environ` reaches
+no `pr_writer` payload, while the committed template does, and a link in
+the multi-template directory is not a template. Configuration, the inputs
+handed to workers, task references and the task file, a checkpoint named
+outside its notes directory and the repository's `.claude` settings are
+read never through a link, and a FIFO in a tree repository never blocks the
+orchestrator. The launcher refuses a linked `.claude`,
+`.claude/settings.json` or `.claude/settings.local.json` (a regular file
+passes). No read is unbounded: a 1 TiB sparse checkpoint gets the gate's
+error string, `_read_file_safely` of a 1 TiB sparse file returns its
+budget, the limit is exact, and a rule requires `limit=` on every reader
+call and anchored copy. The rule over the module: every function calling a
+raw read primitive is classified (87 names: 58 leerie's own, 10 the
+kernel's, 5 the operator's, 10 listings that follow no link, 4 primitives),
+and the 39 converted functions call none and decide what to read with no
+probe that follows a link (`.is_file()`, `.is_dir()`, `.exists()`,
+`os.path.*`, a copy without `src_anchor=`), but for three whose probes only
+test existence. Without that second part three converted functions
+(`_existing_mise_toml_path`, `_stage_worktree_extras`,
+`_copy_task_references`) could revert and stay green (round 27 claims C9);
+reverting `_copy_task_references`' anchored copy, or
+`_existing_mise_toml_path`'s `_regular_file_beneath`, now turns it red.
 
 Review round 27's host findings (DESIGN §6 *The host never runs a program
 the checkout chose*), each proof inverted and live-falsified:
@@ -676,7 +731,7 @@ the checkout chose*), each proof inverted and live-falsified:
   with `--add-dir <worktree>` and removes its start directory; the prompt
   names the worktree; `_exe_from_root` anchors relative PATH entries at `/`;
   `_host_worker_cwd` refuses a temporary directory inside a tree.
-- `tests/test_host_python_is_isolated.py` gains 5 tests: `config --chat`
+- `tests/test_host_python_is_isolated.py`, 5 of its 29 tests: `config --chat`
   starts its CLI outside the checkout, never through a relative PATH entry
   (I1); every host `fetch` and `pull` carries `--no-recurse-submodules` (a
   rule, its anti-vacuity check and a planted control), and the shipped
