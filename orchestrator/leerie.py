@@ -686,6 +686,11 @@ STATE_FIELDS = (
     "subtask_tests",
     "skip_base_baseline",
     "skip_repo_map",
+    # The sticky run choices with no key of their own before (DESIGN §6 *A
+    # resumed run continues under the choices it was started with*), and
+    # the record of a resume's command-line overrides of any of them.
+    "no_push", "pr_template", "run_caps", "models", "efforts",
+    "run_choice_overrides",
     # overlap_replan_done: set once when phase_overlap_judge responds to an
     # `unresolvable` collision with a scoped re-plan instead of dying
     # (DESIGN §5). Bounds that recovery to a single attempt — a second
@@ -9240,6 +9245,170 @@ def push_will_happen(no_push: bool, host_no_push: bool | None) -> bool:
     if host_no_push is None:
         return not no_push
     return not host_no_push
+
+
+# --- run choices on resume (DESIGN §6 *A resumed run continues under the
+# choices it was started with*; IMPLEMENTATION §2½ *Run choices on resume*) --
+#
+# A run-level choice is either sticky (what the run does, or where its result
+# goes: recorded by the fresh run, continued by a resume) or per-invocation
+# (this invocation and its host: resolved again each time). Every argparse
+# dest of `main()` is in exactly one of the two; a rule test derives the dest
+# set from the parser and fails on an unclassified one.
+
+# Sticky choices, by their `state.json` key. Each scalar's key is also its
+# `args` attribute except where `_run_choice_dests` says otherwise.
+RUN_CHOICES_STICKY: tuple[str, ...] = (
+    "no_push", "clarify", "source_of_truth_pref",
+    "dangerously_skip_permissions", "dangerously_force_strict_output",
+    "skip_overlap_judge", "skip_adherence_check", "skip_coverage_check",
+    "skip_completeness_check", "skip_integration_check",
+    "skip_classification_check", "skip_satisfied_check", "skip_budget_check",
+    "skip_base_baseline", "skip_acceptance_check", "skip_repo_map",
+    "stop_on_blocked", "stop_on_repo_change", "strict_conformer",
+    "subtask_tests", "pr_template", "pr_base_branch",
+    "run_caps", "models", "efforts",
+)
+
+# The sticky caps (`run_caps`): `DEFAULT_CAPS` key -> the argparse dest that
+# sets it on a command line, or None for an env/`leerie.toml`-only cap (never
+# overridden by a resume, since nothing on its command line can name it).
+RUN_CAPS_STICKY: dict[str, str | None] = {
+    "max_total_workers": "max_workers",
+    "confidence_rounds": "confidence_rounds",
+    "planner_samples": "planner_samples",
+    "judgment_check_rounds": None,
+    "planner_check_rounds": None,
+    "implementer_confidence_retries": None,
+}
+
+# The scalar sticky choices that live on `args` under their own key.
+_RUN_CHOICE_ARG_KEYS: tuple[str, ...] = tuple(
+    k for k in RUN_CHOICES_STICKY
+    if k not in ("source_of_truth_pref", "dangerously_force_strict_output",
+                 "run_caps", "models", "efforts"))
+
+# Every other argparse dest of `main()`: per-invocation.
+RUN_OPTIONS_PER_INVOCATION: frozenset[str] = frozenset({
+    "task", "run_id", "status_filter", "report", "answers", "phase",
+    "judge_dir", "heal_dir", "heal_max_rounds", "heal_success_threshold",
+    "no_verify", "host_no_push", "group_id", "runtime", "inspect_dir",
+    "verbosity", "verbose", "quiet", "skip_smoke",
+    "dangerously_allow_uncapped",
+    "max_parallel", "worker_memory_max", "worker_pids_max", "worker_timeout",
+    "max_rate_limit_wait",
+})
+
+# The post-run workers whose model has its own flag.
+_MODEL_OWN_DEST: dict[str, str] = {
+    "judge": "judge_model", "heal": "heal_model",
+    "pr_writer": "pr_writer_model",
+}
+
+
+def _run_choice_dests(choice: str, entry: str | None = None) -> tuple[str, ...]:
+    """The argparse dests whose presence on a command line sets sticky
+    `choice` (or its `entry`, for `run_caps` / `models` / `efforts`)."""
+    if choice == "run_caps":
+        dest = RUN_CAPS_STICKY[entry]
+        return (dest,) if dest else ()
+    if choice == "models":
+        own = _MODEL_OWN_DEST.get(entry) or (
+            f"model_{entry}" if entry in WORKER_TYPES else None)
+        return ("model",) + ((own,) if own else ())
+    if choice == "efforts":
+        return ("effort",) + (
+            (f"effort_{entry}",) if entry in WORKER_TYPES else ())
+    return {"no_push": ("no_push", "push"),
+            "source_of_truth_pref": ("source_of_truth",)}.get(
+                choice, (choice,))
+
+
+def _given_on_command_line(given: dict, dests: tuple[str, ...]) -> bool:
+    """Whether any of `dests` was given on this command line. `given` is the
+    parsed namespace before any resolution: every option of `main()`
+    defaults to None, False, 0 or an empty list, so a value other than
+    those was typed."""
+    return any(given.get(d) not in (None, False, 0, []) for d in dests)
+
+
+def _resolved_run_choices(args, caps: dict, models: dict[str, str],
+                          efforts: dict[str, str | None],
+                          sot_pref: str) -> dict:
+    """This invocation's resolved value of every sticky choice, keyed as
+    `state.json` records it."""
+    out = {k: getattr(args, k, None) for k in _RUN_CHOICE_ARG_KEYS}
+    out["source_of_truth_pref"] = sot_pref
+    out["dangerously_force_strict_output"] = bool(
+        caps.get("force_strict_output"))
+    out["run_caps"] = {k: caps[k] for k in RUN_CAPS_STICKY}
+    out["models"] = dict(models)
+    out["efforts"] = dict(efforts)
+    return out
+
+
+def _continue_run_choices(recorded: dict, resolved: dict,
+                          given: dict) -> tuple[dict, list[dict]]:
+    """The sticky choices a resume runs under, and the overrides to record.
+
+    Per choice (per entry for a dict-valued one): a value given on the
+    resume's command line wins, and is an override when it differs from
+    the recorded value; otherwise the recorded value wins over this
+    invocation's env, `leerie.toml` and defaults. A choice the run never
+    recorded (a run from before its key existed, or a worker type added
+    since) takes this invocation's resolved value. Pure: the caller applies
+    and persists the result."""
+    out: dict = {}
+    overrides: list[dict] = []
+    for key in RUN_CHOICES_STICKY:
+        new = resolved[key]
+        if key not in recorded:
+            out[key] = new
+            continue
+        old = recorded[key]
+        if isinstance(new, dict):
+            old = old if isinstance(old, dict) else {}
+            merged = {}
+            for entry, value in new.items():
+                if entry not in old:
+                    merged[entry] = value
+                elif _given_on_command_line(
+                        given, _run_choice_dests(key, entry)):
+                    merged[entry] = value
+                    if value != old[entry]:
+                        overrides.append({"choice": f"{key}.{entry}",
+                                          "recorded": old[entry],
+                                          "now": value})
+                else:
+                    merged[entry] = old[entry]
+            out[key] = merged
+        elif _given_on_command_line(given, _run_choice_dests(key)):
+            out[key] = new
+            if new != old:
+                overrides.append({"choice": key, "recorded": old,
+                                  "now": new})
+        else:
+            out[key] = old
+    return out, overrides
+
+
+def _apply_run_choices(choices: dict, args, caps: dict,
+                       models: dict[str, str],
+                       efforts: dict[str, str | None]) -> str:
+    """Put the continued sticky choices where the run reads them: `args`,
+    `caps`, and the `models` / `efforts` dicts (in place). Returns the
+    source-of-truth preference, which `main()` passes on as `sot_pref`."""
+    for k in _RUN_CHOICE_ARG_KEYS:
+        setattr(args, k, choices[k])
+    caps["force_strict_output"] = bool(
+        choices["dangerously_force_strict_output"])
+    caps.update(choices["run_caps"])
+    caps["strict_conformer"] = bool(choices["strict_conformer"])
+    models.clear()
+    models.update(choices["models"])
+    efforts.clear()
+    efforts.update(choices["efforts"])
+    return choices["source_of_truth_pref"]
 
 
 def resolve_clarify(repo_root: Path, cli_value: bool) -> bool:
@@ -67171,6 +67340,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["skip_acceptance_check"] = bool(
             getattr(args, "skip_acceptance_check", False))
         st.data["skip_repo_map"] = bool(args.skip_repo_map)
+        # The sticky choices `main()` continued (DESIGN §6 *A resumed run
+        # continues under the choices it was started with*), recorded again
+        # with any override this command line made.
+        st.data["no_push"] = bool(getattr(args, "no_push", False))
+        st.data["pr_template"] = getattr(args, "pr_template", None)
+        st.data["run_caps"] = {k: caps.get(k, DEFAULT_CAPS[k])
+                               for k in RUN_CAPS_STICKY}
+        st.data["models"] = dict(models)
+        st.data["efforts"] = dict(efforts)
         # leerie_version/leerie_commit are set ONCE, at the run's original
         # start, and must stay immutable across every later resume — a
         # resume overwriting them with whatever happens to be installed NOW
@@ -67286,6 +67464,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "skip_acceptance_check": bool(
                        getattr(args, "skip_acceptance_check", False)),
                    "skip_repo_map": bool(args.skip_repo_map),
+                   # The run's record of its own choices, which every
+                   # resume continues (DESIGN §6 *A resumed run continues
+                   # under the choices it was started with*).
+                   "no_push": bool(getattr(args, "no_push", False)),
+                   "pr_template": getattr(args, "pr_template", None),
+                   "run_caps": {k: caps.get(k, DEFAULT_CAPS[k])
+                                for k in RUN_CAPS_STICKY},
+                   "models": dict(models),
+                   "efforts": dict(efforts),
                    # The layout this leerie writes the run directory in. Fresh
                    # runs only, deliberately: a resume never rewrites it, or a
                    # directory of another layout would pass for this one
@@ -68139,7 +68326,14 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "completes with the run branch local-only; your "
                          "working branch is unchanged. Default: off (push "
                          f"and PR happen). Also {NO_PUSH_ENV} env var or "
-                         "no_push in leerie.toml.")
+                         "no_push in leerie.toml. A resume continues the "
+                         "run's recorded choice.")
+    ap.add_argument("--push", action="store_true",
+                    help="push and open the PR at finalize even though the "
+                         "run recorded no_push, or the env / leerie.toml "
+                         "says not to: `resume <id> --push` pushes a run "
+                         "started with --no-push. --no-push wins when both "
+                         "are given.")
     # Hidden: the Fly launcher uses this to communicate the user's
     # launch-time push intent into the in-Fly orchestrator. The
     # orchestrator's --no-push is a mechanism flag on Fly (the Machine
@@ -68585,6 +68779,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     positional_run_id, argv = (
         _extract_resume_run_id(argv) if is_resume else (None, argv))
     args = ap.parse_args(argv)
+    # What this command line itself gave, before any resolver rewrites
+    # `args`: a resume's override of a recorded run choice is exactly a value
+    # here (DESIGN §6 *A resumed run continues under the choices it was
+    # started with*).
+    given_on_command_line = dict(vars(args))
     if positional_run_id:
         if args.run_id and args.run_id != positional_run_id:
             die(f"conflicting run ids: positional '{positional_run_id}' and "
@@ -68669,7 +68868,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # auto-resuming and pausing (DESIGN §6 *A ceiling on the wait*).
     caps["max_rate_limit_wait_sec"] = resolve_max_rate_limit_wait_sec(
         Path(os.getcwd()), args.max_rate_limit_wait)
-    caps["strict_conformer"] = args.strict_conformer
 
     # Resolve verbosity. Explicit --verbosity wins; else -v/-q
     # shortcuts (anchored to `normal`); else env / TOML / default.
@@ -68809,21 +69007,17 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     sot_pref = resolve_source_of_truth(repo_root, args.source_of_truth)
     args.runtime = resolve_runtime(repo_root, args.runtime)
     models = resolve_models(repo_root, args)
-    log(f"models: " + ", ".join(f"{w}={models[w]}" for w in WORKER_TYPES))
     efforts = resolve_efforts(repo_root, args)
-    # Log only workers with a resolved effort — an "unset" worker is
-    # explicitly opting out of the --effort flag and showing it as
-    # "effort=None" in the log would be noise.
-    _e_pairs = [f"{w}={efforts[w]}" for w in WORKER_TYPES
-                if efforts[w] is not None]
-    if _e_pairs:
-        log("efforts: " + ", ".join(_e_pairs))
 
     # Resolve --no-push: CLI flag → LEERIE_NO_PUSH env → no_push in
     # leerie.toml → False. Re-attach to args so _orchestrate() /
     # preflight() / phase_finalize() see the resolved value uniformly via
     # `args.no_push` regardless of where the choice came from.
-    args.no_push = resolve_no_push(repo_root, args.no_push)
+    # `--push` sets it off whatever the env or leerie.toml says; `--no-push`
+    # wins over it, because on Fly the in-Machine orchestrator always gets
+    # `--no-push` as a mechanism flag (`--host-no-push` carries the intent).
+    args.no_push = (resolve_no_push(repo_root, args.no_push)
+                    if args.no_push or not args.push else False)
 
     # Coerce --host-no-push from "true"/"false"/None into bool | None.
     # None on the local-runtime path (launcher doesn't pass it) means
@@ -68931,6 +69125,84 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # Forced constrained decoding (DESIGN §7 *Forcing constrained decoding*).
     caps["force_strict_output"] = resolve_dangerously_force_strict_output(
         repo_root, args.dangerously_force_strict_output)
+
+    # Resolve --pr-template: free-form string (no enum). Re-attach to
+    # args so phase_finalize sees the resolved value via
+    # `args.pr_template`. None means "alphabetically first .md in
+    # PULL_REQUEST_TEMPLATE/" (the discovery helper's default).
+    args.pr_template = resolve_pr_template(
+        repo_root, getattr(args, "pr_template", None))
+
+    # Resolve --pr-base-branch: free-form string (no enum), None when
+    # unset. The default-to-working_branch fallback happens at the
+    # run-start call site (working_branch isn't known until git HEAD is
+    # read there), not here.
+    args.pr_base_branch = resolve_pr_base_branch(
+        repo_root, getattr(args, "pr_base_branch", None))
+
+    # Resolve --inspect-dir: CLI flags (repeatable) → LEERIE_INSPECT_DIRS
+    # env (colon-separated) → inspect_dirs in leerie.toml (comma-separated)
+    # → []. Re-attached to args so _orchestrate() can fold it into state.
+    args.inspect_dirs = resolve_inspect_dirs(
+        repo_root, getattr(args, "inspect_dir", None))
+
+    args.judge_dir = resolve_judge_dir(repo_root, args.judge_dir)
+    args.heal_dir = resolve_heal_dir(repo_root, args.heal_dir)
+    args.heal_max_rounds = resolve_heal_max_rounds(
+        repo_root, getattr(args, "heal_max_rounds", None))
+    args.heal_success_threshold = resolve_heal_success_threshold(
+        repo_root, getattr(args, "heal_success_threshold", None))
+
+    args.subtask_tests = resolve_subtask_tests(
+        repo_root, getattr(args, "subtask_tests", None))
+
+    # A resumed run continues under the choices it was started with (DESIGN
+    # §6 *A resumed run continues under the choices it was started with*):
+    # every sticky choice resolved above is replaced by the run's recorded
+    # value unless this command line gave it, BEFORE anything below reads
+    # one. Not for `--phase`, which analyses a run and never continues it.
+    if args.resume and st.load():
+        _recorded = dict(st.data)
+        if "no_push" not in _recorded:
+            # A run recorded before `state.json` carried `no_push`: its
+            # push choice is the intent finalize wrote to run.json.
+            _rj_no_push = (_read_run_json_sidecar(st.run_dir / "run.json")
+                           or {}).get("no_push")
+            if isinstance(_rj_no_push, bool):
+                _recorded["no_push"] = _rj_no_push
+        _choices, _overrides = _continue_run_choices(
+            _recorded,
+            _resolved_run_choices(args, caps, models, efforts, sot_pref),
+            given_on_command_line)
+        sot_pref = _apply_run_choices(_choices, args, caps, models, efforts)
+        for _o in _overrides:
+            log(f"resume: {_o['choice']} overridden on the command line: "
+                f"{_o['recorded']!r} -> {_o['now']!r} (recorded)")
+        if _overrides:
+            _at = now()
+            st.data["run_choice_overrides"] = (
+                list(st.data.get("run_choice_overrides") or [])
+                + [{**_o, "at": _at} for _o in _overrides])
+            if any(_o["choice"] == "pr_base_branch" for _o in _overrides):
+                st.data["pr_base_branch"] = args.pr_base_branch
+                _write_run_json(st.run_dir, pr_base_branch=args.pr_base_branch)
+            st.save()
+    caps["strict_conformer"] = bool(args.strict_conformer)
+    if not args.phase:
+        # The host's record of the push choice: the intent `host_finalize`
+        # and the launcher's resume read.
+        _write_run_json(
+            st.run_dir,
+            no_push=not push_will_happen(args.no_push, args.host_no_push))
+    log(f"models: " + ", ".join(f"{w}={models[w]}" for w in WORKER_TYPES))
+    # Log only workers with a resolved effort — an "unset" worker is
+    # explicitly opting out of the --effort flag and showing it as
+    # "effort=None" in the log would be noise.
+    _e_pairs = [f"{w}={efforts[w]}" for w in WORKER_TYPES
+                if efforts[w] is not None]
+    if _e_pairs:
+        log("efforts: " + ", ".join(_e_pairs))
+
     if caps["force_strict_output"] and os.environ.get("ANTHROPIC_BASE_URL"):
         # The flag works by owning ANTHROPIC_BASE_URL. Overriding an operator's
         # gateway silently would hijack their setup; honouring theirs and
@@ -68968,33 +69240,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             "auth for this run.")
     if caps["force_strict_output"]:
         _check_strict_output_cli_version()
-
-    # Resolve --pr-template: free-form string (no enum). Re-attach to
-    # args so phase_finalize sees the resolved value via
-    # `args.pr_template`. None means "alphabetically first .md in
-    # PULL_REQUEST_TEMPLATE/" (the discovery helper's default).
-    args.pr_template = resolve_pr_template(
-        repo_root, getattr(args, "pr_template", None))
-
-    # Resolve --pr-base-branch: free-form string (no enum), None when
-    # unset. The default-to-working_branch fallback happens at the
-    # run-start call site (working_branch isn't known until git HEAD is
-    # read there), not here.
-    args.pr_base_branch = resolve_pr_base_branch(
-        repo_root, getattr(args, "pr_base_branch", None))
-
-    # Resolve --inspect-dir: CLI flags (repeatable) → LEERIE_INSPECT_DIRS
-    # env (colon-separated) → inspect_dirs in leerie.toml (comma-separated)
-    # → []. Re-attached to args so _orchestrate() can fold it into state.
-    args.inspect_dirs = resolve_inspect_dirs(
-        repo_root, getattr(args, "inspect_dir", None))
-
-    args.judge_dir = resolve_judge_dir(repo_root, args.judge_dir)
-    args.heal_dir = resolve_heal_dir(repo_root, args.heal_dir)
-    args.heal_max_rounds = resolve_heal_max_rounds(
-        repo_root, getattr(args, "heal_max_rounds", None))
-    args.heal_success_threshold = resolve_heal_success_threshold(
-        repo_root, getattr(args, "heal_success_threshold", None))
 
     # --phase judge|heal: post-run skill phases. Short-circuit the normal
     # _orchestrate() flow — just pick an existing run and run the skill.

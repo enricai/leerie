@@ -2189,9 +2189,11 @@ the historical judgment-tier baseline) can still opt in per worker with
 `--model-<worker> opus` / `LEERIE_MODEL_<WORKER>=opus`, or globally with
 `--model opus` / `LEERIE_MODEL=opus`.
 
-Models are not persisted in `<state-root>/state.json`. On `resume`, models are
-re-resolved from the current environment, so changing `LEERIE_MODEL` between
-the original run and the resume is intentional and takes effect.
+Models are recorded in `state.json` (`models`) by the fresh run, and a
+`resume` continues them (§2½ *Run choices on resume*). A `--model` or
+`--model-<worker>` flag on the resume's command line overrides them and is
+recorded in `run_choice_overrides`. A changed `LEERIE_MODEL` or `leerie.toml`
+does not change a recorded run.
 
 ### Effort selection
 
@@ -2288,8 +2290,8 @@ values are validated by argparse `choices=`. A worker that resolves to `None`
 (no override and no per-worker default) produces the exact same CLI as
 before this feature landed — zero behavior change for unconfigured workers.
 
-Efforts are not persisted in `<state-root>/state.json`. Like models, on `resume`
-they are re-resolved from the current environment.
+Efforts are recorded in `state.json` (`efforts`) and continued on `resume`
+exactly like models (§2½ *Run choices on resume*).
 
 ### The `--answers` file
 
@@ -2724,7 +2726,8 @@ table.
 | `resume` (verb) | off | Resume an interrupted run. Auto-picks if exactly one run exists; pass the run-id if multiple. |
 | `--run-id ID` | — | Select a specific run by id (e.g., for `resume` or `--phase` when multiple runs are in flight). |
 | `list` (verb) | off | Enumerate in-flight and completed runs in this repository (run id, started, status, cost, branch). |
-| `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `LEERIE_NO_PUSH` / `leerie.toml`. |
+| `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `LEERIE_NO_PUSH` / `leerie.toml`. Sticky: a `resume` continues it (§2½ *Run choices on resume*). |
+| `--push` | off | Push and open the PR at finalize even though the run recorded `no_push` (or `LEERIE_NO_PUSH` / `leerie.toml` says not to). The way to push a run started with `--no-push`: `leerie resume <id> --push`. `--no-push` wins when both are given. |
 | `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
 | `--clarify` | off | Opt into surfacing intent questions to the user. Default: questions are dropped after the classifier's codebase→research filter, and the implementer makes a documented best-effort decision. Also `LEERIE_CLARIFY` env var or `clarify = true` in `leerie.toml`. |
@@ -2954,6 +2957,82 @@ a container.
 
 See §2 above for the rationale behind these orders and the full
 validation contract.
+
+### Run choices on resume
+
+DESIGN §6 *A resumed run continues under the choices it was started with*.
+Every flag and knob in this section has exactly one class:
+
+- **sticky** — a choice about what the run does or where its result goes.
+  The fresh run records it in `state.json` under the key in the first
+  column. `main()` continues it on `resume` (`_continue_run_choices`)
+  before anything reads it. A flag in the second column given on the
+  resume's command line overrides it, and the override is appended to
+  `run_choice_overrides`. The resume's environment and `leerie.toml` never
+  override a recorded value. They count only for a run recorded before the
+  key existed. `run_caps`, `models` and `efforts` are continued per entry:
+  `--model-planner opus` on a resume changes only the planner, and
+  `--model` changes every model.
+- **per-invocation** — belongs to the invocation or to the host it runs on.
+  Each invocation resolves it again (CLI → env → `leerie.toml` → default).
+- **sidecar** — recorded by the launcher or the fresh run in a sidecar
+  (`run.json`, `fly-machine.json`, `ec2-instance.json`) and read back from
+  there on `resume`. This mechanism does not handle these.
+
+`RUN_CHOICES_STICKY`, `RUN_CAPS_STICKY` and `RUN_OPTIONS_PER_INVOCATION` in
+`orchestrator/leerie.py` hold the same classification for the
+orchestrator's own options. `tests/test_run_choices_on_resume.py` fails when
+a flag or knob in this §2½ or an orchestrator option has no row here, or
+when this table and the code disagree on a class.
+
+The push choice has a second record, `run.json.no_push`. It is the intent
+the host reads (`not push_will_happen(no_push, host_no_push)`). `main()`
+writes it on every non-`--phase` invocation, after the continuation. The
+launcher resolves its own `NO_PUSH` as follows: `--no-push`, then `--push`,
+then (on `resume` with a run id) `run.json.no_push`, then `LEERIE_NO_PUSH`
+and `no_push` in `leerie.toml`. `--no-push` wins over `--push` in both the
+launcher and the orchestrator. On Fly the in-Machine orchestrator always
+receives `--no-push` as a mechanism flag, and `--host-no-push` carries the
+intent.
+
+| Choice | Flags | Env var / `leerie.toml` key | Class | Why |
+|--------|-------|-----------------------------|-------|-----|
+| `no_push` | `--no-push`, `--push` | `LEERIE_NO_PUSH` / `no_push` | sticky | where the result goes |
+| `clarify` | `--clarify` | `LEERIE_CLARIFY` / `clarify` | sticky | what the run asks |
+| `source_of_truth_pref` | `--source-of-truth` | `LEERIE_SOURCE_OF_TRUTH` / `source_of_truth` | sticky | what planning grounds on |
+| `dangerously_skip_permissions` | `--dangerously-skip-permissions` | `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `dangerously_skip_permissions` | sticky | how every worker runs |
+| `dangerously_force_strict_output` | `--dangerously-force-strict-output` | `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` / `dangerously_force_strict_output` | sticky | how every worker's output is decoded |
+| `skip_overlap_judge` | `--skip-overlap-judge` | `LEERIE_SKIP_OVERLAP_JUDGE` / `skip_overlap_judge` | sticky | a gate the run skips |
+| `skip_adherence_check` | `--skip-adherence-check` | `LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` | sticky | a gate the run skips |
+| `skip_coverage_check` | `--skip-coverage-check` | `LEERIE_SKIP_COVERAGE_CHECK` / `skip_coverage_check` | sticky | a gate the run skips |
+| `skip_completeness_check` | `--skip-completeness-check` | `LEERIE_SKIP_COMPLETENESS_CHECK` / `skip_completeness_check` | sticky | a gate the run skips |
+| `skip_integration_check` | `--skip-integration-check` | `LEERIE_SKIP_INTEGRATION_CHECK` / `skip_integration_check` | sticky | a gate the run skips |
+| `skip_classification_check` | `--skip-classification-check` | `LEERIE_SKIP_CLASSIFICATION_CHECK` / `skip_classification_check` | sticky | a gate the run skips |
+| `skip_satisfied_check` | `--skip-satisfied-check` | `LEERIE_SKIP_SATISFIED_CHECK` / `skip_satisfied_check` | sticky | a gate the run skips |
+| `skip_budget_check` | `--skip-budget-check` | `LEERIE_SKIP_BUDGET_CHECK` / `skip_budget_check` | sticky | a gate the run skips |
+| `skip_base_baseline` | `--skip-base-baseline` | `LEERIE_SKIP_BASE_BASELINE` / `skip_base_baseline` | sticky | a measurement the run skips |
+| `skip_acceptance_check` | `--skip-acceptance-check` | `LEERIE_SKIP_ACCEPTANCE_CHECK` / `skip_acceptance_check` | sticky | a gate the run skips |
+| `skip_repo_map` | `--skip-repo-map` | `LEERIE_SKIP_REPO_MAP` / `skip_repo_map` | sticky | what planning reads |
+| `stop_on_blocked` | `--stop-on-blocked` | `LEERIE_STOP_ON_BLOCKED` / `stop_on_blocked` | sticky | how the run settles a blocked subtask |
+| `stop_on_repo_change` | `--stop-on-repo-change` | `LEERIE_STOP_ON_REPO_CHANGE` / `stop_on_repo_change` | sticky | how the run reacts to a changed checkout |
+| `strict_conformer` | `--strict-conformer` | `LEERIE_STRICT_CONFORMER` / `strict_conformer` | sticky | whether conformance blocks |
+| `subtask_tests` | `--subtask-tests` | `LEERIE_SUBTASK_TESTS` / `subtask_tests` | sticky | what each subtask's tests measure |
+| `pr_template` | `--pr-template` | `LEERIE_PR_TEMPLATE` / `pr_template` | sticky | the result's PR body |
+| `pr_base_branch` | `--pr-base-branch` | `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` | sticky | where the result goes (also `run.json.pr_base_branch`) |
+| `run_caps` | `--max-workers`, `--confidence-rounds`, `--planner-samples` | `LEERIE_MAX_WORKERS` / `max_workers`, `LEERIE_CONFIDENCE_ROUNDS` / `confidence_rounds`, `LEERIE_PLANNER_SAMPLES` / `planner_samples`, `LEERIE_JUDGMENT_CHECK_ROUNDS` / `judgment_check_rounds`, `LEERIE_PLANNER_CHECK_ROUNDS` / `planner_check_rounds`, `LEERIE_IMPLEMENTER_CONFIDENCE_RETRIES` / `implementer_confidence_retries` | sticky | the run's budget and its rounds of evidence |
+| `models` | `--model`, `--model-<worker>`, `--judge-model`, `--heal-model`, `--pr-writer-model` | `LEERIE_MODEL` / `model`, `LEERIE_MODEL_<WORKER>` / `model_<worker>`, `LEERIE_MODEL_JUDGE` / `model_judge`, `LEERIE_MODEL_HEAL` / `model_heal`, `LEERIE_MODEL_PR_WRITER` / `model_pr_writer`, `LEERIE_MODEL_DEP_CAPTURE` | sticky | who does the work |
+| `efforts` | `--effort`, `--effort-<worker>` | `LEERIE_EFFORT` / `effort`, `LEERIE_EFFORT_<WORKER>` / `effort_<worker>` | sticky | how hard each worker reasons |
+| concurrency and host ceilings | `--max-parallel`, `--worker-memory-max`, `--worker-pids-max`, `--worker-timeout`, `--max-rate-limit-wait` | `LEERIE_MAX_PARALLEL` / `max_parallel`, `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max`, `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max`, `LEERIE_WORKER_TIMEOUT` / `worker_timeout_sec`, `LEERIE_MAX_RATE_LIMIT_WAIT` / `max_rate_limit_wait_sec`, `LEERIE_TOKEN_PROBE_CACHE_SEC` / `token_probe_cache_sec` | per-invocation | sized to the host and its load now; a resume may run on another host |
+| containment waiver | `--dangerously-allow-uncapped` | `LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` / `dangerously_allow_uncapped` | per-invocation | waives a check of this host, made at every entry (DESIGN §6 *Fail closed, on every entry*) |
+| smoke test | `--skip-smoke` | — | per-invocation | the preflight smoke test runs only on a fresh run |
+| hook skipping at push | `--no-verify` | — | per-invocation | CLI-only by design: hook skipping is asked for each time |
+| display | `--verbosity`, `-v`, `-q` | `LEERIE_VERBOSITY` / `verbosity` | per-invocation | output only |
+| inspect directories | `--inspect-dir` | `LEERIE_INSPECT_DIRS` / `inspect_dirs` | per-invocation | mounted by this invocation's container |
+| supplied answers | `--answers` | — | per-invocation | input to this invocation, absorbed into `answers` |
+| verbs and selectors | `task`, `resume`, `list`, `--run-id`, `--status`, `--report`, `--phase`, `--judge-dir`, `--heal-dir`, `--heal-max-rounds`, `--heal-success-threshold` | `LEERIE_JUDGE_DIR` / `judge_dir`, `LEERIE_HEAL_DIR` / `heal_dir`, `LEERIE_HEAL_MAX_ROUNDS` / `heal_max_rounds`, `LEERIE_HEAL_SUCCESS_THRESHOLD` / `heal_success_threshold` | per-invocation | say what this invocation does, or tune a post-run `--phase` analysis that never continues the run |
+| launcher and resume modifiers | `--shell`, `--auto-finalize`, `--no-re-seed`, `--state-dir`, `--no-runtime-install`, `--no-auto-publish`, `--local-build` | `LEERIE_STATE_DIR` / `state_dir`, `LEERIE_HOST_DIR`, `LEERIE_NO_RUNTIME_INSTALL`, `LEERIE_NO_AUTO_PUBLISH`, `LEERIE_LOCAL_BUILD`, `LEERIE_NONINTERACTIVE`, `LEERIE_SKIP_FRESHNESS_CHECK`, `LEERIE_WORKER_DEBUG`, `LEERIE_CAPTURE_DEPS`, `LEERIE_BAKE_LANGUAGE_DEPS`, `LEERIE_PAUSE_NOTIFY_CMD`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | per-invocation | how this invocation starts and reports, or host-wide setup |
+| runtime and remote provisioning | `--runtime`, `--fly-app`, `--fly-disk-gb`, `--aws-region`, `--aws-profile`, `--ec2-ami`, `--ec2-instance-type`, `--ec2-key-name`, `--ec2-security-group`, `--ec2-subnet-id`, `--ec2-instance-profile`, `--host-no-push` | `LEERIE_RUNTIME` / `runtime`, `LEERIE_FLY_APP`, `FLY_VM_DISK_GB`, `LEERIE_REGION`, `LEERIE_AWS_REGION` / `aws_region`, `LEERIE_AWS_PROFILE` / `aws_profile`, `LEERIE_EC2_AMI` / `ec2_ami`, `LEERIE_EC2_INSTANCE_TYPE` / `ec2_instance_type`, `LEERIE_EC2_KEY_NAME` / `ec2_key_name`, `LEERIE_EC2_SECURITY_GROUP` / `ec2_security_group`, `LEERIE_EC2_SUBNET_ID` / `ec2_subnet_id`, `LEERIE_EC2_INSTANCE_PROFILE` / `ec2_instance_profile`, `LEERIE_SEED_TIMEOUT_S`, `LEERIE_PROGRESS_INTERVAL_S`, `LEERIE_MACHINE_START_TIMEOUT` | sidecar | a resume finds the run's runtime and machine from `fly-machine.json` / `ec2-instance.json` (`_auto_detect_run_runtime`) and provisions nothing; `--host-no-push` is passed again from the launcher's `NO_PUSH` |
+| run group | `--group-id` | — | sidecar | the run's identity, written to `run.json` by the fresh run |
 
 ### Worker types
 
@@ -5220,16 +5299,12 @@ state was loaded) does not poison the host-side `state.json` with a bare
 `{"finished_at": …}` stub — that would block subsequent resume attempts
 with "no usable task" instead of the clearer "no state.json".
 
-`_orchestrate()` also re-resolves the source-of-truth preference on every
-`resume` and overwrites `state.json`'s `source_of_truth_pref` with the
-fresh value, so a change to `leerie.toml` or `LEERIE_SOURCE_OF_TRUTH`
-between runs takes effect on resume.
-
-Per-worker models are likewise re-resolved on every `resume` from the
-current CLI flags, env, and `leerie.toml`. They are *not* persisted in
-`state.json` (they are startup config, not run state), so a change to
-`LEERIE_MODEL`, `--model`, or the per-worker overrides between runs
-takes effect immediately on resume.
+On `resume`, `main()` continues every sticky run choice the fresh run
+recorded — the source-of-truth preference, the models and efforts, the
+skip flags, the caps, `no_push` — before `_orchestrate()` reads any of
+them (`_continue_run_choices`, §2½ *Run choices on resume*). Only a flag
+on the resume's command line overrides a recorded choice; the resume's
+env and `leerie.toml` do not.
 
 ### Concurrency model
 The orchestrator runs on a single `asyncio` event loop. Each `claude -p`
@@ -5467,13 +5542,12 @@ A terminal auth failure (`_is_terminal_auth_failure`, §3) copies this arm
 verbatim — an expired session has no clock-based reset either.
 
 **Auto-resume override persistence.** The re-exec passes only `resume
-<id>` as argv — CLI overrides on the original launch (`--model`,
-`--max-workers`, `--max-parallel`, `--confidence-rounds`,
-`--source-of-truth`, `--clarify`, `--no-push`) are **not** propagated;
-they fall back to `LEERIE_*` env vars and `leerie.toml`, re-resolved on
-every `resume`. Configure non-default settings via env/`leerie.toml`
-rather than a single CLI flag if they must survive an auto-resume; a
-manual `resume` can re-supply CLI overrides.
+<id>` as argv. Every sticky choice of the original launch (`--model`,
+`--max-workers`, `--confidence-rounds`, `--source-of-truth`, `--clarify`,
+`--no-push`, the skip flags) is recorded in `state.json` and continued, so
+it survives the auto-resume (§2½ *Run choices on resume*). Per-invocation
+choices (`--max-parallel`, the worker ceilings, `--verbosity`) fall back to
+`LEERIE_*` env vars and `leerie.toml`, as on any resume.
 
 Ctrl-C (SIGINT) is **resumable** — same contract as every other abnormal
 exit. The explicit "throw this away" gesture is `scripts/cleanup.sh
@@ -11785,8 +11859,9 @@ writes to `st.data` must appear here, and every field listed here must be
 written somewhere in `orchestrator/leerie.py`. The coupling test in
 `tests/test_state_fields.py` enforces parity in both directions against the
 `STATE_FIELDS` tuple in `leerie.py`. Every `skip_*`/`strict_*`/`dangerously_*`
-flag below is **re-resolved fresh on every run, including `resume`**, so the
-user can flip it via CLI flag / env var / `leerie.toml` without editing state.
+flag below is a **sticky run choice** (§2½ *Run choices on resume*): the fresh
+run records it, a `resume` continues it, and only a flag on the resume's
+command line overrides it.
 
 | Field | Shape | Purpose |
 |-------|-------|---------|
@@ -11872,6 +11947,12 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `subtask_tests` | str | How much of the repo's suite each per-subtask conformance round measures (DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*). |
 | `skip_base_baseline` | bool | whether the base-tree health baseline (DESIGN §9 *Base-tree health baseline*) is suppressed. Resolved from `--skip-base-baseline` / `LEERIE_SKIP_BASE_BASELINE` / `leerie.toml` / default `False`. |
 | `skip_repo_map` | bool | whether the P6 repo-map structural context (DESIGN §5½ (P6) *Codebase structural map*) is suppressed. Resolved from `--skip-repo-map` / `LEERIE_SKIP_REPO_MAP` / `skip_repo_map` in `leerie.toml` / default `False`. |
+| `no_push` | bool | the orchestrator's resolved `--no-push` (after `--push`), a sticky run choice (§2½ *Run choices on resume*). On Fly it is the mechanism flag; the intent the host reads is `run.json.no_push`. |
+| `pr_template` | str \| None | the resolved `--pr-template` / `LEERIE_PR_TEMPLATE` / `pr_template` in `leerie.toml`; None means the discovery default. A sticky run choice. |
+| `run_caps` | dict[str, int] | the sticky caps, keyed as in `DEFAULT_CAPS` — exactly the keys of `RUN_CAPS_STICKY` (`max_total_workers`, `confidence_rounds`, `planner_samples`, `judgment_check_rounds`, `planner_check_rounds`, `implementer_confidence_retries`). Continued per entry on `resume`. |
+| `models` | dict[str, str] | `resolve_models`' result, per worker, as the run uses it. Continued per entry on `resume`. |
+| `efforts` | dict[str, str \| None] | `resolve_efforts`' result, per worker. Continued per entry on `resume`. |
+| `run_choice_overrides` | list[dict] | one `{choice, recorded, now, at}` per sticky choice a `resume`'s command line changed (`choice` is `<key>` or `<key>.<entry>`), appended by `main()` in order. |
 | `cgroup_containment` | dict | recorded by the fail-closed gate (`_enforce_and_record_cgroup_containment`, in `_run_phases` just before the first worker spawns) (DESIGN §6 *Memory containment*): `{enforced: bool, hierarchy: "v2"\|"v1"\|null}`. |
 | `verbosity` | str | resolved verbosity level (`quiet` / `normal` / `stream` / `debug`); re-resolved fresh on every run, including `resume`, so the user can dial up or down without editing state |
 | `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) via `--add-dir`. |

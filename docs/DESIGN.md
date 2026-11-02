@@ -4552,6 +4552,70 @@ The mechanism:
   (`host_bring_back_run_branch` is a no-op without one, and `prune`
   deregisters an old run's worktrees from the user's repository).
 
+### A resumed run continues under the choices it was started with
+
+An operator starts a run with choices that decide what the run does and
+where its result goes: `--no-push`, the models and efforts, the worker
+budget, the gates it skips. `resume` used to resolve each of them again
+from the resume's own command line, environment and `leerie.toml`, and
+then overwrite what the fresh run had seeded in `state.json`. A choice
+made on the fresh run's command line is not on the resume's, so it fell
+back to its default. A run started with `--no-push` and resumed with a
+plain `leerie resume <id>` wrote `run.json.no_push=false` at finalize, and
+the host pushed it and opened a PR. Round 23 hit the other face of it: a
+plain `resume` of a finished `--no-push` run stopped at the launcher's
+"no `origin` remote" check, because the launcher did not know the run had
+been started not to push. The same held for every skip flag, the caps and
+the models: a resume silently ran a different run from the one started.
+An auto-resume re-execs `resume <id>` with no flags at all, so it lost
+every command-line choice.
+
+The root cause is that a run had no record of its own choices. The
+invariant: **a resumed run continues under the choices it was started
+with, unless the operator overrides one on the resume's command line, and
+then the override is recorded.**
+
+The mechanism:
+
+- Every run-level choice is classified once, in IMPLEMENTATION §2½ *Run
+  choices on resume*, as **sticky** or **per-invocation**. Sticky choices
+  decide the run's behaviour or the destination of its result.
+  Per-invocation choices belong to the invocation and the host it runs
+  on: concurrency, memory and PID ceilings, timeouts, verbosity, mounted
+  inspect directories, the containment waiver, the smoke test, hook
+  skipping at push. A resume may run on another host or after a reboot,
+  so those are measured again each time. A rule test fails when a flag or
+  knob is added without a class.
+- The fresh run records every sticky choice in `state.json`, in the keys
+  the run already reads them from, plus `no_push`, `models`, `efforts`
+  and `run_caps`. It also writes the push choice to `run.json.no_push`,
+  the record the host reads.
+- On `resume`, `main()` continues the recorded value of each sticky
+  choice before anything reads it. A flag given on the resume's command
+  line wins, and `run_choice_overrides` records it: the choice, the old
+  value and the new one. The resume's environment and `leerie.toml` do
+  not override a recorded choice. They are ambient. The operator did not
+  state them for this run, and they may have changed since it began. A
+  run recorded before this field existed has nothing to continue, so its
+  choices resolve as they always did.
+- A recorded `no_push` is switched off only by the new `--push` flag. It
+  is the one sticky boolean whose "off" sends a result somewhere, and
+  without it a run started not to push could never be pushed. The other
+  sticky on/off flags (`--skip-*`, `--stop-on-*`, `--clarify`,
+  `--strict-conformer`, the `--dangerously-*` waivers that are sticky)
+  have no "off" spelling. One turned on stays on for the rest of the run,
+  and a fresh run is how to drop it. Valued choices (caps, models,
+  efforts, `--source-of-truth`, `--subtask-tests`, `--pr-template`) take
+  any value on a resume.
+- The launcher resolves its own `NO_PUSH` the same way. On `resume`,
+  `--no-push` or `--push` on the command line wins. Otherwise
+  `run.json.no_push` wins. Only then do the environment and `leerie.toml`
+  count. So the host-side checks and the push decision both follow the
+  recorded choice. Without a run id on the command line the launcher
+  cannot read the record before the container starts. `host_finalize`
+  still refuses to push a run whose `run.json` records `no_push`, so that
+  case still never pushes.
+
 ### Never a repository-global git operation
 
 The user's repo is bind-mounted whole, so its `.git` is SHARED — with the

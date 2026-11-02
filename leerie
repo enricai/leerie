@@ -5759,9 +5759,14 @@ _warn_if_log_in_repo || true
 # the host-side finalize entirely). The flag is also passed through to
 # the orchestrator so phase_finalize knows not to do its own bookkeeping.
 NO_PUSH=false
+# What this command line itself says about pushing: "true" (--no-push),
+# "false" (--push) or empty. --no-push wins when both are given, as in the
+# orchestrator.
+_NO_PUSH_CLI=""
 for arg in "$@"; do
   case "$arg" in
-    --no-push) NO_PUSH=true ;;
+    --no-push) NO_PUSH=true; _NO_PUSH_CLI=true ;;
+    --push) [ "$_NO_PUSH_CLI" = "true" ] || _NO_PUSH_CLI=false ;;
   esac
 done
 case "${LEERIE_NO_PUSH:-}" in
@@ -5813,6 +5818,31 @@ if [ "$NO_PUSH" = "false" ] && [ -f "$USER_REPO/leerie.toml" ]; then
   esac
   unset _toml_no_push _toml_no_push_lc
 fi
+# A resumed run continues under the push choice it was started with (DESIGN
+# §6 *A resumed run continues under the choices it was started with*):
+# --no-push / --push on this command line, else the run's recorded
+# run.json.no_push, else the env / leerie.toml resolved above. Without a run
+# id the record is unknown here; host_finalize still honours run.json.no_push.
+if [ -n "$_NO_PUSH_CLI" ]; then
+  NO_PUSH="$_NO_PUSH_CLI"
+elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
+  _recorded_no_push="$(python3 -c '
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("no_push")
+    print({True: "true", False: "false"}.get(v, "") if isinstance(v, bool) else "")
+except Exception:
+    pass
+' "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json")"
+  if [ -n "$_recorded_no_push" ]; then
+    if [ "$_recorded_no_push" != "$NO_PUSH" ]; then
+      remote_log "resume: continuing the run's recorded push choice (no_push=$_recorded_no_push); pass --push or --no-push to override"
+    fi
+    NO_PUSH="$_recorded_no_push"
+  fi
+  unset _recorded_no_push
+fi
+unset _NO_PUSH_CLI
 
 # Parse --no-verify and export NO_VERIFY_PUSH here, BEFORE
 # provision_machine registers the EXIT trap. The trap's clean-exit
