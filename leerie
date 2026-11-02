@@ -162,12 +162,17 @@ unset _help_arg
 # the launcher makes under `.leerie/` names a path in the checkout, whose
 # content a merged run branch may have committed. A link at one of them, or
 # at `.leerie`, would be read or written through: a `leerie.toml` linked to a
-# credentials file, a `.leerie` linked anywhere on the host. The checkout is
-# not written while leerie runs (the container mounts it read-only), so one
-# check here holds for every read below. `version` reads none of them.
+# credentials file, a `.leerie` linked anywhere on the host. The same holds
+# for `.claude/settings.json` and `.claude/settings.local.json`, which
+# `detect_bedrock_mode` and `bedrock_preflight` read: a linked one outside the
+# checkout switched a run into Bedrock mode (review round 27, execution L2).
+# The checkout is not written while leerie runs (the container mounts it
+# read-only), so one check here holds for every read below. `version` reads
+# none of them.
 _checkout_config_links() {
   local _c _found=""
-  for _c in leerie.toml .leerie .leerie/config.toml .leerie/Dockerfile; do
+  for _c in leerie.toml .leerie .leerie/config.toml .leerie/Dockerfile \
+            .claude .claude/settings.json .claude/settings.local.json; do
     [ -L "$USER_REPO/$_c" ] && _found="$_found $_c"
   done
   printf '%s' "${_found# }"

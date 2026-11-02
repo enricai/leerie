@@ -3289,10 +3289,15 @@ constructed in three parts.
    it is theirs. A probe that only tests whether a file exists, to choose
    between leerie's own commands, reads no content and is not covered.
 3. *The host reads the checkout the same way.* The launcher refuses to
-   start when `leerie.toml`, `.leerie`, `.leerie/config.toml` or
-   `.leerie/Dockerfile` is a link (`_checkout_config_links`). It reads and
-   writes its configuration only at those paths, and the checkout is not
-   written while leerie runs, so one check holds for every read after it.
+   start when `leerie.toml`, `.leerie`, `.leerie/config.toml`,
+   `.leerie/Dockerfile`, `.claude`, `.claude/settings.json` or
+   `.claude/settings.local.json` is a link (`_checkout_config_links`). It
+   reads and writes the checkout's files only at those paths (the two
+   settings files decide Bedrock mode and its AWS profile; a linked one
+   outside the checkout switched a run into Bedrock mode, review round 27,
+   execution L2), and the checkout is not written while leerie runs, so one
+   check holds for every read after it. Its other looks at the checkout only
+   test whether a file exists, to choose between leerie's own commands.
    The host-side recapture rewrites `.leerie/config.toml` through
    `_write_beneath`, so a link there is replaced, never read or written
    through.

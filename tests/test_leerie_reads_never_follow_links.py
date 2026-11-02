@@ -317,6 +317,44 @@ def test_project_settings_are_read_never_through_a_link(leerie, tmp_path):
                                  root=root) == {}
 
 
+@pytest.mark.parametrize("link", [".claude/settings.json",
+                                  ".claude/settings.local.json", ".claude"])
+def test_the_launcher_never_reads_claude_settings_through_a_link(
+        tmp_path, link):
+    """Review round 27, execution L2: `detect_bedrock_mode` and
+    `bedrock_preflight` `json.load(open(...))` the checkout's
+    `.claude/settings{,.local}.json`; one linked to a file outside the
+    checkout switched the run into Bedrock mode. The launcher now refuses
+    the link before any verb reads it (`_checkout_config_links`)."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for name in ("settings.json", "settings.local.json"):
+        (outside / name).write_text(json.dumps(
+            {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}))
+    home, co = tmp_path / "home", tmp_path / "checkout"
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(co)], check=True, timeout=60)
+    if link == ".claude":
+        (co / ".claude").symlink_to(outside)
+    else:
+        (co / ".claude").mkdir()
+        (co / link).symlink_to(outside / Path(link).name)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("LEERIE_")}
+    env["HOME"] = str(home)
+    r = subprocess.run([str(REPO_ROOT / "leerie"), "list"], cwd=co, env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert f"{link} in {co} is a symbolic link" in r.stderr, r.stderr
+    # Control: the same content as a regular file is the checkout's own.
+    (co / ".claude").unlink() if link == ".claude" else (co / link).unlink()
+    (co / ".claude").mkdir(exist_ok=True)
+    (co / ".claude" / "settings.json").write_text("{}")
+    r = subprocess.run([str(REPO_ROOT / "leerie"), "list"], cwd=co, env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+
+
 def test_a_fifo_in_a_tree_repository_never_blocks_the_orchestrator(
         leerie, tmp_path):
     """A committing worker writes its tree repository whole; a FIFO at a

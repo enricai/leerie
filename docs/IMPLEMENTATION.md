@@ -4602,8 +4602,10 @@ notes_dir=None)` (read beneath `notes_dir`, which the gate passes as
 `_verify_set_audit_case`, `_category_evidence_found`
 (`follow_symlinks=False`). The launcher, after its `--help` scan and
 before any verb but `version`, exits 1 when `_checkout_config_links`
-names a link among `leerie.toml`, `.leerie`, `.leerie/config.toml` and
-`.leerie/Dockerfile` in `$USER_REPO`. Tests: `tests/test_leerie_reads_never_follow_links.py` (the
+names a link among `leerie.toml`, `.leerie`, `.leerie/config.toml`,
+`.leerie/Dockerfile`, `.claude`, `.claude/settings.json` and
+`.claude/settings.local.json` in `$USER_REPO` (the last three are read by
+`detect_bedrock_mode` and `bedrock_preflight`). Tests: `tests/test_leerie_reads_never_follow_links.py` (the
 primitives; review round 26 I1's proof inverted, the credentials file and
 `/proc/self/environ`; the converted readers; the rule that every function
 calling a raw read primitive is classified, and the converted functions
