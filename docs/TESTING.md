@@ -5778,7 +5778,7 @@ finding's EROFS without it.
 
 ## The CLI's own git, transcripts apart, and a run that died (review round 22)
 
-`tests/test_clis_own_git_is_leeries.py` (7 tests, DESIGN §6 *The CLI's own
+`tests/test_clis_own_git_is_leeries.py` (10 tests, DESIGN §6 *The CLI's own
 git runs on leerie's terms*; review round 22 isolation H1). A stand-in CLI
 runs `git` by name from its `PATH` at session start, as the real one does;
 the shim, grants, `worker-shell.py`, `scripts/cli-git.py`, `_invoke`, the
@@ -5789,6 +5789,12 @@ CLI runs nested, so it cannot reach the CLI's stream; `_cli_git_env` names
 leerie's repository; the shim passes a worker's own git through and fails
 closed; a `.git` rewritten mid-session is not followed; and the Fly
 integrator's CLI (`collect-subtrees.sh` → `worker-guard.py`) gets the same.
+Since review round 23: no settings layer below leerie's steers the CLI's git
+(`test_no_settings_layer_below_leeries_steers_the_clis_git`, composed and
+uncomposed: an operator's or a repository's settings `env.PATH`, prefix or
+`LEERIE_*` variable still goes through `scripts/cli-bin`), and `_invoke`'s
+pin lays leerie's values over the settings env
+(`test_the_pin_lays_leeries_values_over_the_settings_env`).
 
 `tests/test_transcripts_apart_from_command_logs.py` (5 tests, DESIGN §8
 *What a worker ran is read from its own transcript*; review round 22 H4).
@@ -5824,6 +5830,41 @@ resume that `die()`s at the confinement entry, or in a resolver before the
 interrupt at the entry records nothing. Falsified: the arm moved below
 `_require_confinement` turns the rule and the entry case red; a pause
 `sys.exit`ed again turns the rule and the pause case red.
+
+## Run choices on resume, and a phase-1 death resumes (review round 23)
+
+`tests/test_run_choices_on_resume.py` (29 tests, DESIGN §6 *A resumed run
+continues under the choices it was started with*; review round 23 exec, run
+A′). Real `main()` runs a fresh run (`--no-push`, a cap, a per-worker model
+and effort, a skip flag, `--source-of-truth`) through the real `_run_phases`
+seed, then `resume` with an env that disagrees with every recorded choice:
+the resume runs under the recorded values; a flag on the resume overrides
+one cap and leaves the others, and is recorded in `run_choice_overrides`;
+`--model` on a resume gives every model, `judge`/`heal`/`pr_writer`/
+`dep_capture` included, the flag's value even with each worker's own
+`LEERIE_MODEL_*` env set otherwise (review round 24 F2); `--push` overrides
+a recorded `no_push` and `--no-push` wins over it; a run recorded before
+`no_push` falls back to `run.json.no_push`. Host side (jq-gated): the real
+`host_finalize` does not push a `--no-push` run resumed with no flag, and
+a `--push` control does. The launcher's real `NO_PUSH` block, sliced from
+`leerie`: the record wins over the ambient env, `--push`/`--no-push`
+override, a fresh run ignores a record, no record falls back to env. The
+pure `_continue_run_choices`. Rule tests: every orchestrator option is in
+exactly one of the three classes; every §2½ flag and knob has a row; the
+spec's sticky rows equal `RUN_CHOICES_STICKY`; each orchestrator option has
+the same class in the spec and the code; nothing in `main()` reads a sticky
+choice before the continuation (review round 24 F4). Falsified: the
+continuation and the launcher's record step dropped turned 6 tests red; an
+unclassified dest, a spec row reclassified, and the
+`dangerously-skip-permissions: ON` log moved back above the continuation
+each turned their rule red.
+
+`tests/test_resume_after_phase1_death.py` (5 tests, DESIGN §6 *Resumable
+planning*, *The first phase is a phase like any other*; review round 23
+M2): real `main()` twice — a fresh run that dies inside the real
+`phase_classify`, then `resume` on the state it left. A budget death in
+classify resumes after the cap is raised; every resumable phase-1 exit
+(worker error, context overflow, disk low) resumes and spawns the classifier; a state with no `task` is still refused.
 
 ## The rev 9 redesign's other new and rewritten test files
 
@@ -6368,12 +6409,16 @@ interrupt at the entry records nothing. Falsified: the arm moved below
   Live-falsified on the host and in the container (rootless): the install
   entry back on `MEASURE_KIND`, the prerequisite without `INSTALL_KIND`,
   and every kind given egress, each turned its own tests red.
-- `tests/test_user_scripts_on_path.py` (5 test functions; DESIGN §6
+- `tests/test_user_scripts_on_path.py` (7 test functions; DESIGN §6
   *Which stores an install may share*, a moved user base's scripts on
   `PATH`): `_with_user_scripts` appending `<base>/bin` last in place of the
   replaced base's, never doubled, leaving a baked base and a `PATH`-less
-  env alone; `_leerie_stores`, `_worker_cache_env` and `_tree_stores_for`
-  executed in turn, each `PATH` ending in its own base's `bin`; under real
+  env alone; `_leerie_stores` leaving the orchestrator's `PATH` unchanged
+  while `_worker_cache_env` and `_tree_stores_for` each end theirs in their
+  own base's `bin`; a rule over the module: nothing sets the orchestrator's
+  `PATH` (`test_nothing_sets_the_orchestrators_path`); a confined command
+  outside every tree gets the stores' scripts on its own `PATH`
+  (`_run_streaming`); under real
   Landlock, a measurement of a run tree running by name a script an
   install-kind command put in that tree's user base. In a runtime that can
   isolate: a real `pip install` defaulting to the user base, with no "not

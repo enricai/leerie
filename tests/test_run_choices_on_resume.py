@@ -201,6 +201,25 @@ class TestResumeContinuesTheRecordedChoices:
             **by_choice["models.planner"], "recorded": "opus", "now": "haiku"}
         assert all(o.get("at") for o in overrides)
 
+    def test_a_global_flag_on_resume_is_not_outranked_by_a_workers_env(
+            self, leerie, monkeypatch, run_env):
+        """Review round 24 F2. On a fresh run `LEERIE_MODEL_JUDGE` outranks
+        `--model` for `judge` (and likewise heal, pr_writer, dep_capture).
+        On a resume the override must come from the command line alone, or
+        the resume's env changes a recorded entry under an override's name."""
+        run_dir, _state = _start(leerie, monkeypatch, run_env)
+        for w in ("JUDGE", "HEAL", "PR_WRITER", "DEP_CAPTURE"):
+            monkeypatch.setenv(f"LEERIE_MODEL_{w}", "haiku")
+
+        got = _resume(leerie, monkeypatch, ["--model", "opus"])
+
+        for w in ("judge", "heal", "pr_writer", "dep_capture", "planner"):
+            assert got["models"][w] == "opus", (w, got["models"][w])
+        overrides = json.loads(
+            (run_dir / "state.json").read_text())["run_choice_overrides"]
+        assert all(o["now"] == "opus" for o in overrides
+                   if o["choice"].startswith("models.")), overrides
+
     def test_push_overrides_a_recorded_no_push(self, leerie, monkeypatch,
                                                run_env):
         run_dir, _state = _start(leerie, monkeypatch, run_env)
@@ -420,6 +439,28 @@ class TestContinueRunChoices:
         assert out["models"] == {"planner": "opus", "judge": "haiku"}
         assert [o["choice"] for o in ov] == ["models.judge"]
 
+    def test_an_override_takes_the_command_lines_value_not_the_resolved(
+            self, leerie):
+        """`resolved` carries the env's value for `judge` (its own env var
+        outranks `--model`); the override is the flag's value."""
+        recorded = _resolved(leerie, models={"planner": "sonnet",
+                                             "judge": "sonnet"})
+        out, ov = leerie._continue_run_choices(
+            recorded,
+            _resolved(leerie, models={"planner": "opus", "judge": "haiku"}),
+            {"model": "opus"})
+        assert out["models"] == {"planner": "opus", "judge": "opus"}
+        assert {o["choice"]: o["now"] for o in ov} == {
+            "models.planner": "opus", "models.judge": "opus"}
+
+    def test_an_entrys_own_flag_beats_the_global_one(self, leerie):
+        recorded = _resolved(leerie, models={"planner": "sonnet",
+                                             "judge": "sonnet"})
+        out, _ = leerie._continue_run_choices(
+            recorded, _resolved(leerie),
+            {"model": "opus", "judge_model": "haiku"})
+        assert out["models"] == {"planner": "opus", "judge": "haiku"}
+
     def test_env_only_cap_is_never_overridden(self, leerie):
         recorded = _resolved(leerie)
         recorded["run_caps"] = {**recorded["run_caps"],
@@ -482,20 +523,32 @@ def _sticky_dests(leerie) -> set[str]:
     return out
 
 
+def _code_class(leerie, dest: str) -> str | None:
+    if dest in _sticky_dests(leerie):
+        return "sticky"
+    if dest in leerie.RUN_OPTIONS_PER_INVOCATION:
+        return "per-invocation"
+    if dest in leerie.RUN_OPTIONS_SIDECAR:
+        return "sidecar"
+    return None
+
+
 def test_every_orchestrator_option_is_classified_exactly_once(leerie):
     dests = set(_main_argparse_dests(leerie))
-    sticky = _sticky_dests(leerie)
-    per_inv = set(leerie.RUN_OPTIONS_PER_INVOCATION)
+    classes = [_sticky_dests(leerie), set(leerie.RUN_OPTIONS_PER_INVOCATION),
+               set(leerie.RUN_OPTIONS_SIDECAR)]
     assert len(dests) > 60, "the argparse walk found too little"
-    assert not (sticky & per_inv), sorted(sticky & per_inv)
-    assert dests - sticky - per_inv == set(), (
+    for i, a in enumerate(classes):
+        for b in classes[i + 1:]:
+            assert not (a & b), sorted(a & b)
+    every = set().union(*classes)
+    assert dests - every == set(), (
         "orchestrator options with no run-choice class (add each to "
-        "RUN_CHOICES_STICKY or RUN_OPTIONS_PER_INVOCATION, and to "
-        f"IMPLEMENTATION §2½ *Run choices on resume*): "
-        f"{sorted(dests - sticky - per_inv)}")
-    assert (sticky | per_inv) - dests == set(), (
-        f"classified dests main() has no option for: "
-        f"{sorted((sticky | per_inv) - dests)}")
+        "RUN_CHOICES_STICKY, RUN_OPTIONS_PER_INVOCATION or "
+        "RUN_OPTIONS_SIDECAR, and to IMPLEMENTATION §2½ *Run choices on "
+        f"resume*): {sorted(dests - every)}")
+    assert every - dests == set(), (
+        f"classified dests main() has no option for: {sorted(every - dests)}")
 
 
 def _section_2_5() -> str:
@@ -571,7 +624,6 @@ def test_each_orchestrator_option_has_the_class_the_code_gives_it(leerie):
     for r in rows:
         for f in r["flags"]:
             flag_class[f] = r["class"]
-    sticky = _sticky_dests(leerie)
     wrong = []
     for dest, opts in _main_argparse_dests(leerie).items():
         opt = next((o for o in opts if o.startswith("--")), opts[0])
@@ -586,6 +638,105 @@ def test_each_orchestrator_option_has_the_class_the_code_gives_it(leerie):
             cls = flag_class.get("task")
         if cls is None:
             wrong.append((opt, "unclassified"))
-        elif (cls == "sticky") != (dest in sticky):
-            wrong.append((opt, cls))
+        elif cls != _code_class(leerie, dest):
+            wrong.append((opt, cls, _code_class(leerie, dest)))
     assert not wrong, wrong
+
+
+# --------------------------------------------------------------------------
+# Rule: main() reads no sticky choice before the continuation
+# --------------------------------------------------------------------------
+
+def _sticky_reads(node: ast.AST, sticky_args: set[str],
+                  sticky_caps: set[str]) -> set[str]:
+    """Every read of a sticky choice in `node`: `args.<k>` (or
+    `getattr(args, "<k>", ...)`), `caps["<k>"]`, and the names `models`,
+    `efforts`, `sot_pref`."""
+    out: set[str] = set()
+    for n in ast.walk(node):
+        if (isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load)
+                and isinstance(n.value, ast.Name) and n.value.id == "args"
+                and n.attr in sticky_args):
+            out.add(f"args.{n.attr}")
+        elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+              and n.func.id == "getattr" and len(n.args) >= 2
+              and isinstance(n.args[0], ast.Name) and n.args[0].id == "args"
+              and isinstance(n.args[1], ast.Constant)
+              and n.args[1].value in sticky_args):
+            out.add(f"args.{n.args[1].value}")
+        elif (isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Load)
+              and isinstance(n.value, ast.Name) and n.value.id == "caps"
+              and isinstance(n.slice, ast.Constant)
+              and n.slice.value in sticky_caps):
+            out.add(f'caps["{n.slice.value}"]')
+        elif (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+              and n.id in ("models", "efforts", "sot_pref")):
+            out.add(n.id)
+    return out
+
+
+def _targets(stmt: ast.stmt) -> set[str]:
+    """What an assignment statement writes, spelled as `_sticky_reads`
+    spells a read."""
+    out: set[str] = set()
+    if not isinstance(stmt, ast.Assign):
+        return out
+    for t in stmt.targets:
+        if (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+                and t.value.id == "args"):
+            out.add(f"args.{t.attr}")
+        elif (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+              and t.value.id == "caps" and isinstance(t.slice, ast.Constant)):
+            out.add(f'caps["{t.slice.value}"]')
+        elif isinstance(t, ast.Name):
+            out.add(t.id)
+    return out
+
+
+def _reads_before_continuation(leerie, source: str) -> list[str]:
+    tree = ast.parse(source)
+    main = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    sticky_args = set(leerie._RUN_CHOICE_ARG_KEYS) | {
+        "source_of_truth", "dangerously_force_strict_output", "push",
+        "max_workers", "confidence_rounds", "planner_samples", "model",
+        "effort", "judge_model", "heal_model", "pr_writer_model"}
+    sticky_args |= {f"{p}_{w}" for p in ("model", "effort")
+                    for w in leerie.WORKER_TYPES}
+    sticky_caps = set(leerie.RUN_CAPS_STICKY) | {"force_strict_output",
+                                                 "strict_conformer"}
+    found: list[str] = []
+    for stmt in main.body:
+        if "_continue_run_choices" in ast.unparse(stmt):
+            return found
+        # A resolution step — an assignment to a sticky choice's holder —
+        # reads that choice's raw command-line value; that is how the value
+        # the continuation starts from is made. Anything else is a use.
+        holders = {f"args.{k}" for k in sticky_args} | {
+            f'caps["{k}"]' for k in sticky_caps} | {
+            "models", "efforts", "sot_pref"}
+        if _targets(stmt) & holders:
+            continue
+        for r in sorted(_sticky_reads(stmt, sticky_args, sticky_caps)):
+            found.append(f"line {stmt.lineno}: {r}")
+    raise AssertionError("the continuation was not found in main()")
+
+
+def test_main_reads_no_sticky_choice_before_the_continuation(leerie):
+    found = _reads_before_continuation(leerie, LEERIE_PY.read_text())
+    assert not found, (
+        "main() reads a sticky choice before `_continue_run_choices`, so a "
+        "resume sees its own env/leerie.toml value there, not the run's "
+        f"(DESIGN §6): {found}")
+
+
+def test_the_read_rule_sees_a_read_before_the_continuation(leerie):
+    """Anti-vacuity: the round 24 F4 log line, put back above the
+    continuation, is found."""
+    src = LEERIE_PY.read_text()
+    anchor = "    args.skip_overlap_judge = resolve_skip_overlap_judge("
+    assert src.count(anchor) == 1
+    bad = src.replace(anchor, "    if args.dangerously_skip_permissions:\n"
+                              "        log('ON')\n" + anchor)
+    found = _reads_before_continuation(leerie, bad)
+    assert any("args.dangerously_skip_permissions" in f for f in found), found

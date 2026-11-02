@@ -7351,7 +7351,8 @@ def _records_the_run_death(
     exit arms around `_orchestrate` missed when the record was theirs, a
     `die()` at the confinement entry or in a resolver before the `try:`.
     `main()` returns a pause's, an interrupt's or a completion's exit code
-    and raises only for a death or an interrupt, so the code it returns is
+    and raises only for a death, an interrupt or a deferred clarification
+    (`EXIT_NEEDS_ANSWERS`), so the code it returns is
     exited with here."""
     @functools.wraps(main_fn)
     def owner() -> None:
@@ -9250,11 +9251,13 @@ def push_will_happen(no_push: bool, host_no_push: bool | None) -> bool:
 # --- run choices on resume (DESIGN §6 *A resumed run continues under the
 # choices it was started with*; IMPLEMENTATION §2½ *Run choices on resume*) --
 #
-# A run-level choice is either sticky (what the run does, or where its result
-# goes: recorded by the fresh run, continued by a resume) or per-invocation
-# (this invocation and its host: resolved again each time). Every argparse
-# dest of `main()` is in exactly one of the two; a rule test derives the dest
-# set from the parser and fails on an unclassified one.
+# A run-level choice is sticky (what the run does, or where its result goes:
+# recorded by the fresh run, continued by a resume), per-invocation (this
+# invocation and its host: resolved again each time) or sidecar (recorded by
+# the launcher or the fresh run in `run.json` / `fly-machine.json` /
+# `ec2-instance.json` and read back from there, not by this mechanism). Every
+# argparse dest of `main()` is in exactly one of the three; a rule test
+# derives the dest set from the parser and fails on an unclassified one.
 
 # Sticky choices, by their `state.json` key. Each scalar's key is also its
 # `args` attribute except where `_run_choice_dests` says otherwise.
@@ -9288,11 +9291,18 @@ _RUN_CHOICE_ARG_KEYS: tuple[str, ...] = tuple(
     if k not in ("source_of_truth_pref", "dangerously_force_strict_output",
                  "run_caps", "models", "efforts"))
 
+# The argparse dests of `main()` whose value lives in a sidecar: the runtime
+# (`_auto_detect_run_runtime` on resume), the Fly launcher's push intent
+# (passed again from its NO_PUSH) and the run group (`run.json`).
+RUN_OPTIONS_SIDECAR: frozenset[str] = frozenset({
+    "runtime", "host_no_push", "group_id",
+})
+
 # Every other argparse dest of `main()`: per-invocation.
 RUN_OPTIONS_PER_INVOCATION: frozenset[str] = frozenset({
     "task", "run_id", "status_filter", "report", "answers", "phase",
     "judge_dir", "heal_dir", "heal_max_rounds", "heal_success_threshold",
-    "no_verify", "host_no_push", "group_id", "runtime", "inspect_dir",
+    "no_verify", "inspect_dir",
     "verbosity", "verbose", "quiet", "skip_smoke",
     "dangerously_allow_uncapped",
     "max_parallel", "worker_memory_max", "worker_pids_max", "worker_timeout",
@@ -9370,10 +9380,18 @@ def _continue_run_choices(recorded: dict, resolved: dict,
             old = old if isinstance(old, dict) else {}
             merged = {}
             for entry, value in new.items():
+                dests = _run_choice_dests(key, entry)
                 if entry not in old:
                     merged[entry] = value
-                elif _given_on_command_line(
-                        given, _run_choice_dests(key, entry)):
+                elif _given_on_command_line(given, dests):
+                    # From the command line alone. `value` is the full
+                    # resolution, where a worker's own env var can outrank
+                    # `--model` (`LEERIE_MODEL_JUDGE` over it, for one);
+                    # recording that as the override would let the resume's
+                    # env change a recorded entry. `dests` lists the global
+                    # flag first, so the last one given is the entry's own.
+                    value = [given[d] for d in dests
+                             if given.get(d) not in (None, False, 0, [])][-1]
                     merged[entry] = value
                     if value != old[entry]:
                         overrides.append({"choice": f"{key}.{entry}",
@@ -67288,10 +67306,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # every run that died inside classification — the budget error's own
         # "re-run with resume after raising --max-workers" among them
         # (review round 23 M2).
-        # Refresh the preferences in case env vars or leerie.toml
-        # changed since the original run started. Verbosity is
-        # resolved fresh every run — the user can dial up or down on
-        # resume without editing state.json.
+        # Recorded again: `sot_pref` and the sticky flags below are the
+        # run's continued choices (DESIGN §6 *A resumed run continues under
+        # the choices it was started with*). Verbosity and the inspect dirs
+        # are per-invocation, resolved fresh every run — the user can dial
+        # up or down on resume without editing state.json.
         st.data["source_of_truth_pref"] = sot_pref
         # NOT refreshed into st.data["answers"] here, deliberately.
         # `gather_answers` is reachable only inside the
@@ -69041,10 +69060,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # on every invocation instead of threading another parameter.
     args.dangerously_skip_permissions = resolve_dangerously_skip_permissions(
         repo_root, args.dangerously_skip_permissions)
-    if args.dangerously_skip_permissions:
-        log("dangerously-skip-permissions: ON "
-            "(judgment workers run with prompts disabled — "
-            "§12 enforcement waived)")
 
     # Resolve --skip-overlap-judge (DESIGN §5 *Cross-domain surface
     # overlap*). Same precedence shape as --clarify /
@@ -69188,6 +69203,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 _write_run_json(st.run_dir, pr_base_branch=args.pr_base_branch)
             st.save()
     caps["strict_conformer"] = bool(args.strict_conformer)
+    # Every read of a sticky choice is from here on, so it reads the value
+    # the run uses (`tests/test_run_choices_on_resume.py` holds this by rule).
+    if args.dangerously_skip_permissions:
+        log("dangerously-skip-permissions: ON "
+            "(judgment workers run with prompts disabled — "
+            "§12 enforcement waived)")
     if not args.phase:
         # The host's record of the push choice: the intent `host_finalize`
         # and the launcher's resume read.

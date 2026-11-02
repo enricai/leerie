@@ -4587,8 +4587,8 @@ The mechanism:
   so those are measured again each time. A rule test fails when a flag or
   knob is added without a class.
 - The fresh run records every sticky choice in `state.json`, in the keys
-  the run already reads them from, plus `no_push`, `models`, `efforts`
-  and `run_caps`. It also writes the push choice to `run.json.no_push`,
+  the run already reads them from, plus `no_push`, `pr_template`,
+  `models`, `efforts` and `run_caps`. It also writes the push choice to `run.json.no_push`,
   the record the host reads.
 - On `resume`, `main()` continues the recorded value of each sticky
   choice before anything reads it. A flag given on the resume's command
@@ -4597,7 +4597,8 @@ The mechanism:
   not override a recorded choice. They are ambient. The operator did not
   state them for this run, and they may have changed since it began. A
   run recorded before this field existed has nothing to continue, so its
-  choices resolve as they always did.
+  choices resolve as they always did (`no_push` first falls back to
+  `run.json.no_push`, which finalize wrote as the run's push intent).
 - A recorded `no_push` is switched off only by the new `--push` flag. It
   is the one sticky boolean whose "off" sends a result somewhere, and
   without it a run started not to push could never be pushed. The other

@@ -2970,20 +2970,25 @@ Every flag and knob in this section has exactly one class:
   resume's command line overrides it, and the override is appended to
   `run_choice_overrides`. The resume's environment and `leerie.toml` never
   override a recorded value. They count only for a run recorded before the
-  key existed. `run_caps`, `models` and `efforts` are continued per entry:
+  key existed (`no_push` first falls back to `run.json.no_push`).
+  `run_caps`, `models` and `efforts` are continued per entry:
   `--model-planner opus` on a resume changes only the planner, and
-  `--model` changes every model.
+  `--model` changes every model. An overridden entry takes its value from
+  the command line alone (its own flag, else the global one): a worker's
+  own env var such as `LEERIE_MODEL_JUDGE`, which outranks `--model` on a
+  fresh run, does not reach a recorded run through an override.
 - **per-invocation** — belongs to the invocation or to the host it runs on.
   Each invocation resolves it again (CLI → env → `leerie.toml` → default).
 - **sidecar** — recorded by the launcher or the fresh run in a sidecar
   (`run.json`, `fly-machine.json`, `ec2-instance.json`) and read back from
   there on `resume`. This mechanism does not handle these.
 
-`RUN_CHOICES_STICKY`, `RUN_CAPS_STICKY` and `RUN_OPTIONS_PER_INVOCATION` in
-`orchestrator/leerie.py` hold the same classification for the
-orchestrator's own options. `tests/test_run_choices_on_resume.py` fails when
-a flag or knob in this §2½ or an orchestrator option has no row here, or
-when this table and the code disagree on a class.
+`RUN_CHOICES_STICKY` (with `RUN_CAPS_STICKY`), `RUN_OPTIONS_PER_INVOCATION`
+and `RUN_OPTIONS_SIDECAR` in `orchestrator/leerie.py` hold the same three
+classes for the orchestrator's own options. `tests/test_run_choices_on_resume.py`
+fails when a flag or knob in this §2½ or an orchestrator option has no row
+here, when this table and the code give an orchestrator option different
+classes, or when `main()` reads a sticky choice before the continuation.
 
 The push choice has a second record, `run.json.no_push`. It is the intent
 the host reads (`not push_will_happen(no_push, host_no_push)`). `main()`

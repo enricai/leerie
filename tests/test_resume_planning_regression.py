@@ -494,8 +494,7 @@ def test_no_work_required_guard_returns_early_unchanged(leerie, run_dirs):
         "no_work_required": True,
         # Deliberately no `current_phase == "phase 6: finalize"` and no
         # `waves`/`categories` — proves this guard fires independently of
-        # the completed-run guard and ahead of the "no progress at all"
-        # die() below it.
+        # the completed-run guard.
     }
     st.save()
     args = _args()
