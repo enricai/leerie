@@ -6401,6 +6401,83 @@ elif [ -f "$USER_REPO/leerie.toml" ]; then
   unset _srm_toml
 fi
 
+# Whether the checkout file $1 (a path relative to the checkout) is a
+# repository's content rather than the operator's (DESIGN §6 *A repository
+# chooses no operator authority*; the orchestrator's `_checkout_file_tracked`
+# is the same test): an index entry is the file or a directory above it — a
+# submodule is one gitlink entry, so its files have no entry of their own —
+# or a directory above it inside the checkout holds a .git (a submodule, or a
+# repository nested there). Decided by the file, not by its name (DESIGN §6
+# *A path is the file it names, not its spelling*): on a case-insensitive
+# checkout `.claude/settings.json` opens a tracked `.claude/Settings.json`. So
+# the file is opened beneath the checkout without following a link, and the
+# index entries under the top directory it was opened through are compared
+# with it and its directories (st_dev, st_ino). One reached through a link,
+# or not a regular file, counts as tracked too (it is not read); an absent
+# one does not. When git cannot answer, the file counts as tracked. The
+# helper says "untracked" with exit 3 alone, so a helper that fails counts as
+# tracked. Defined here, before its first use (the Dockerfile refresh below).
+_checkout_file_tracked() {
+  local _rc=0
+  python3 -I - "$USER_REPO" "$1" 2>/dev/null <<'PY' || _rc=$?
+import os, stat, subprocess, sys
+root, rel = sys.argv[1], sys.argv[2]
+*dirs, name = rel.split("/")
+NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+same = lambda a, b: (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+above = []
+try:
+    rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    dfd = rfd
+    for d in dirs:
+        dfd = os.open(d, NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
+        above.append(os.fstat(dfd))
+        try:
+            os.stat(".git", dir_fd=dfd, follow_symlinks=False)
+            sys.exit(0)
+        except FileNotFoundError:
+            pass
+    fd = os.open(name, NOFOLLOW, dir_fd=dfd)
+    mine = os.fstat(fd)
+except FileNotFoundError:
+    sys.exit(3)
+except OSError:
+    sys.exit(0)
+if not stat.S_ISREG(mine.st_mode):
+    sys.exit(0)
+try:
+    r = subprocess.run(["git", "--literal-pathspecs", "-C", root, "ls-files",
+                        "-z"], capture_output=True, timeout=30)
+except (OSError, subprocess.TimeoutExpired):
+    sys.exit(0)
+if r.returncode != 0:
+    sys.exit(0)
+chain = [mine, *above]
+top_of_chain = above[0] if above else mine
+tops = {}
+for e in os.fsdecode(r.stdout).split("\0"):
+    if not e:
+        continue
+    top = e.partition("/")[0]
+    if top not in tops:
+        try:
+            tops[top] = same(os.stat(top, dir_fd=rfd, follow_symlinks=False),
+                             top_of_chain)
+        except OSError:
+            tops[top] = False
+    if not tops[top]:
+        continue
+    try:
+        st = os.stat(e, dir_fd=rfd, follow_symlinks=False)
+    except OSError:
+        continue
+    if any(same(st, c) for c in chain):
+        sys.exit(0)
+sys.exit(3)
+PY
+  [ "$_rc" -ne 3 ]
+}
+
 # Auto-generate a Dockerfile from setup_packages. Runs when no Dockerfile
 # exists OR when the existing one is an UNCOMMITTED prior leerie-generated file
 # (carries the LEERIE_GENERATED_SENTINEL on line 1 AND is not git-tracked) —
@@ -7381,20 +7458,15 @@ AUTH_MOUNTS=()
 
 # The Claude settings files that are the operator's (DESIGN §6 *A repository
 # chooses no operator authority*): ~/.claude/settings.json, and each of the
-# checkout's .claude/settings.json and .claude/settings.local.json that git
-# does not track. A tracked one is the repository's content — a cloned
-# repository's, or a run branch's the operator merged — and Bedrock mode
-# chooses which credentials leave the host (~/.aws is staged into the
-# container) and which account is billed, so leerie reads nothing from it
-# (nor does the orchestrator, `_checkout_settings_are_operators`). No merge
-# or clone brings an untracked file, so that one is the operator's own
-# (settings.local.json, usually ignored). When git cannot answer, the file
-# counts as tracked. The checkout is not written while leerie runs.
-_checkout_settings_tracked() {
-  local _out
-  _out="$(git -C "$USER_REPO" ls-files -- ".claude/$1" 2>/dev/null)" || return 0
-  [ -n "$_out" ]
-}
+# checkout's .claude/settings.json and .claude/settings.local.json that no
+# repository holds (`_checkout_file_tracked`). A tracked one is the
+# repository's content — a cloned repository's, a submodule's, or a run
+# branch's the operator merged — and Bedrock mode chooses which credentials
+# leave the host (~/.aws is staged into the container) and which account is
+# billed, so leerie reads nothing from it (nor does the orchestrator,
+# `_checkout_settings_are_operators`). No merge or clone brings an untracked
+# file, so that one is the operator's own (settings.local.json, usually
+# ignored). The checkout is not written while leerie runs.
 # Sets _OPERATOR_CLAUDE_SETTINGS once (the checkout is not written while
 # leerie runs), warning about a tracked file that sets a Bedrock key.
 _operator_claude_settings() {
@@ -7403,9 +7475,10 @@ _operator_claude_settings() {
   _OPERATOR_CLAUDE_SETTINGS_READY=1
   _OPERATOR_CLAUDE_SETTINGS=("${HOME}/.claude/settings.json")
   for _cs in settings.json settings.local.json; do
-    if ! _checkout_settings_tracked "$_cs"; then
+    if ! _checkout_file_tracked ".claude/$_cs"; then
       _OPERATOR_CLAUDE_SETTINGS+=("${USER_REPO}/.claude/$_cs")
-    elif [ -f "${USER_REPO}/.claude/$_cs" ]; then
+    elif [ -f "${USER_REPO}/.claude/$_cs" ] && [ ! -L "${USER_REPO}/.claude" ] \
+         && [ ! -L "${USER_REPO}/.claude/$_cs" ]; then
       # Not refused: the same file configures the repository's own Claude
       # Code users, and leaving it out can only fall back to the operator's
       # own credentials. Said, so a run that used to take Bedrock from it does

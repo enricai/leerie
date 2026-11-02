@@ -776,7 +776,8 @@ Falsified: disabling the launcher's refusal turns the 6 key tests red;
 making `_state_root_overlaps_checkout` print nothing turns the 8 overlap
 tests red; dropping `_read_toml_key`'s guard turns its 5 cases red.
 
-`tests/test_repo_config_chooses_no_authority.py` (75 tests; DESIGN §6 *A
+`tests/test_repo_config_chooses_no_authority.py` (17 test functions, 86
+cases; DESIGN §6 *A
 repository chooses no operator authority*). The real launcher, started on a
 fresh run (`--no-push "fix the bug"`) from a checkout whose `leerie.toml`
 sets any one of the 25 `REPO_CONFIG_AUTHORITY_KEYS` (`runtime`, the AWS and
@@ -792,7 +793,7 @@ ignore the file. A checkout settings file git tracks adds nothing to
 `_confined_cli_settings` (no `apiKeyHelper`, `permissions` or
 `ANTHROPIC_BASE_URL`; logged) while an untracked one does, and a checkout
 git cannot read counts as tracked; the launcher's own
-`_checkout_settings_tracked` / `_operator_claude_settings` /
+`_checkout_file_tracked` / `_operator_claude_settings` /
 `detect_bedrock_mode` (extracted by `tests/bedrock_extract.py`) do not enter
 Bedrock mode from a tracked `settings.json` or `settings.local.json` and
 warn naming the keys, while an untracked one and `~/.claude/settings.json`
@@ -806,6 +807,36 @@ settings-layer tests (`test_worker_commands_cannot_reach_the_cli.py`) and
 the resolver tests that used to pin a `leerie.toml` tier for these keys now
 make their checkout a git repository whose settings are untracked, or
 assert the file is never read.
+Review round 31 S1 (11 cases): a checkout cloned with
+`--recurse-submodules` whose `.claude` is a submodule, and one with a
+repository cloned into `.claude` that the superproject's index does not
+record, each with both settings files: neither file is a worker's settings
+layer (`_checkout_settings_are_operators`, via `_checkout_file_tracked`) or
+chooses Bedrock (the launcher's `_checkout_file_tracked`), though the
+superproject's `ls-files` names neither; the operator's untracked
+`.claude/settings.local.json` beside a submodule elsewhere still does both
+(control); and a report the task names inside such a directory is not
+inlined (`_d1_report_sources`) while the operator's own untracked report
+is. `tests/test_launcher_per_repo_image.py::test_a_submodules_generated_dockerfile_is_not_overwritten`
+covers the same rule at the launcher's `.leerie/Dockerfile` refresh, and
+`tests/test_requirement_coverage.py`'s phase test makes its checkout a git
+repository (a report is inlined only when git says no repository holds
+it). Falsified against the code before the fix (the tests kept): all 11
+S1 cases and the Dockerfile case fail, the control through the extracted
+launcher block, which the fix renamed (`tests/bedrock_extract.py` now
+extracts `_checkout_file_tracked` from before the Dockerfile refresh, where
+it is defined, and `_operator_claude_settings` onward).
+
+`tests/test_a_path_is_the_file_not_its_spelling.py` (11 test functions;
+DESIGN §6 *A path is the file it names, not its spelling*; review round 28
+isolation A1): a hard link standing in for a case-insensitive alias — a
+tracked `.claude/settings.json` reached by another spelling is the
+operator's (`_checkout_settings_are_operators`, `_checkout_file_tracked`,
+`_index_holds`; the launcher's `_checkout_file_tracked`, exit 3 only for
+untracked),
+protected paths compare folded (`_path_fold`), path lists are read with
+`-z`, and `check_diff_scope` refuses a second spelling
+(`_fold_collisions`). 16 cases fail against the parent.
 
 `tests/test_state_root_apart.py` (10 tests; part 3 of the same section).
 `_require_state_root_apart` over a planted `/proc/self/mountinfo`: a state

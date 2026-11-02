@@ -47,6 +47,7 @@ import ipaddress
 import json
 import math
 import os
+import posixpath
 import pwd
 import re
 import shlex
@@ -1126,15 +1127,66 @@ _CLAUDE_DELIVERABLE_PREFIXES = (
 )
 
 
+# The code points HFS+ (and APFS's compatibility with it) leave out of a name
+# when it compares two: git's own list for `.git` (`is_hfs_dotgit`).
+_HFS_IGNORABLE = frozenset(
+    [*range(0x200C, 0x2010), *range(0x202A, 0x202F),
+     *range(0x206A, 0x2070), 0xFEFF])
+
+
+def _path_fold(path: str) -> str:
+    """`path` as one key for every spelling a case-, normalization- or
+    HFS-insensitive filesystem resolves to the same file (DESIGN §6 *A path
+    is the file it names, not its spelling*): lexically normalised, the
+    HFS-ignorable code points dropped, NFKC, casefolded, NFKC again. It
+    equates at least what those filesystems equate, so a test made on it
+    errs towards a match."""
+    p = posixpath.normpath(path) if path else path
+    p = "".join(c for c in p if ord(c) not in _HFS_IGNORABLE)
+    return unicodedata.normalize(
+        "NFKC", unicodedata.normalize("NFKC", p).casefold())
+
+
 def _is_protected_path(path: str) -> bool:
     """Return True if `path` is a meta-directory the implementer must not
     write to. See `_PROTECTED_PREFIXES` and `_CLAUDE_DELIVERABLE_PREFIXES`
-    for the rule."""
+    for the rule. Compared folded (`_path_fold`): on a case-insensitive
+    checkout `.Leerie/Dockerfile` is `.leerie/Dockerfile`."""
+    path = _path_fold(path) + "/"
     if any(path.startswith(p) for p in _PROTECTED_PREFIXES):
         return True
     if path.startswith(".claude/"):
         return not any(path.startswith(p) for p in _CLAUDE_DELIVERABLE_PREFIXES)
     return False
+
+
+def _path_spellings(paths: Iterable[str]) -> set[str]:
+    """Every path in `paths` and every directory above one, as spelled."""
+    out: set[str] = set()
+    for p in paths:
+        parts = p.split("/")
+        out.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+    return out
+
+
+def _fold_collisions(added: Iterable[str], tree: Iterable[str], *,
+                     before: Iterable[str] = ()) -> list[tuple[str, str]]:
+    """Each `(added path or directory, tree path or directory)` pair that is
+    spelled differently but folds to one key (`_path_fold`): on a case- or
+    normalization-insensitive filesystem the two are one file or one
+    directory (DESIGN §6 *A path is the file it names, not its spelling*,
+    part 3). A pair whose two spellings were both already among `before`'s
+    paths and directories is not reported: it was there before."""
+    known: dict[str, set[str]] = {}
+    for t in _path_spellings(tree):
+        known.setdefault(_path_fold(t), set()).add(t)
+    old = _path_spellings(before)
+    hits: list[tuple[str, str]] = []
+    for a in sorted(_path_spellings(added)):
+        for t in sorted(known.get(_path_fold(a), ())):
+            if t != a and not (a in old and t in old):
+                hits.append((a, t))
+    return hits
 
 _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
 # Judgment workers get no blanket Read/Grep/Glob grant. The CLI allows those
@@ -20243,13 +20295,17 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     (the branch doesn't exist), so the protected-path enforcement was off."""
     run_branch = await _branch_commit_for_tree_async(
         worktree, _compute_run_branch(st.run_id))
+    # NUL-separated: git quotes a name holding a byte outside ASCII, and the
+    # quoted form matched no protected prefix (DESIGN §6 *A path is the file
+    # it names, not its spelling*).
     r = await run_proc(
-        ["git", *_tree_git_args(worktree), "diff", "--name-only", f"{run_branch}..HEAD"],
+        ["git", *_tree_git_args(worktree), "diff", "--name-only", "-z",
+         f"{run_branch}..HEAD"],
         cwd=worktree,
     )
     if r.returncode != 0:
         return None
-    touched = [f for f in r.stdout.strip().splitlines() if f]
+    touched = [f for f in r.stdout.split("\0") if f]
     if not touched:
         return None
 
@@ -20262,6 +20318,28 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     if protected:
         return (f"{sid}: diff touches protected path(s): {protected} — "
                 "implementers must not modify meta-directories")
+
+    # fatal: a second spelling of a path or directory the tree already had
+    # (DESIGN §6 *A path is the file it names, not its spelling*, part 3).
+    # A pair both of whose spellings the run branch already had is not this
+    # subtask's; when git cannot list the run branch the check is skipped,
+    # like the diff above.
+    base = await run_proc(
+        ["git", *_tree_git_args(worktree), "ls-tree", "-r", "-z",
+         "--name-only", run_branch], cwd=worktree)
+    if base.returncode == 0:
+        ours = await run_proc(
+            ["git", *_tree_git_args(worktree), "ls-tree", "-r", "-z",
+             "--name-only", "HEAD"], cwd=worktree)
+        head = {f for f in ours.stdout.split("\0") if f} \
+            if ours.returncode == 0 else set()
+        collisions = _fold_collisions(
+            [f for f in touched if f in head], head,
+            before=[f for f in base.stdout.split("\0") if f])
+        if collisions:
+            return (f"{sid}: diff adds a second spelling of a path in the "
+                    f"tree: {collisions} — on a case- or normalization-"
+                    "insensitive filesystem each pair is one file")
 
     # non-fatal: log a warning for radically unexpected scope
     expected = subtask.get("files_likely_touched", [])
@@ -20343,13 +20421,14 @@ async def check_integrator_commit(staging: Path) -> str | None:
     """Return an error if the integrator's merge commit touched .leerie/ files.
     The integrator should only touch project files, never coordination artifacts."""
     r = await run_proc(
-        ["git", *_tree_git_args(staging), "show", "--name-only", "--format=", "HEAD"],
+        ["git", *_tree_git_args(staging), "show", "--name-only", "-z",
+         "--format=", "HEAD"],
         cwd=str(staging),
     )
     if r.returncode != 0:
         return None
-    bad = [f for f in r.stdout.strip().splitlines()
-           if f and f.startswith(".leerie/")]
+    bad = [f for f in r.stdout.strip("\n").split("\0")
+           if f and (_path_fold(f) + "/").startswith(".leerie/")]
     if bad:
         return f"integrator commit touched coordination files: {bad}"
     return None
@@ -29313,29 +29392,116 @@ CHECKOUT_SETTINGS_FILES = ("settings.json", "settings.local.json")
 @functools.lru_cache(maxsize=None)
 def _checkout_settings_are_operators(repo_root: str, name: str) -> bool:
     """Whether the checkout's `.claude/<name>` is the operator's own: a file
-    git does not track (DESIGN §6 *A repository chooses no operator
-    authority*). A tracked one is the repository's content — a cloned
-    repository's, or a run branch's the operator merged — and a settings
-    file carries credentials and endpoints (`apiKeyHelper`, an `env`
-    `ANTHROPIC_BASE_URL`), permissions and hooks, so it adds nothing to a
-    worker's settings. No merge or clone brings an untracked file, so that
-    one is the operator's (`settings.local.json`, usually ignored). When git
-    cannot answer, the file is treated as tracked. Asked once per process:
-    the checkout is not written while leerie runs."""
+    no repository holds (`_checkout_file_tracked`; DESIGN §6 *A repository
+    chooses no operator authority*). A tracked one is the repository's
+    content — a cloned repository's, a submodule's, or a run branch's the
+    operator merged — and a settings file carries credentials and endpoints
+    (`apiKeyHelper`, an `env` `ANTHROPIC_BASE_URL`), permissions and hooks,
+    so it adds nothing to a worker's settings. No merge or clone brings an
+    untracked file, so that one is the operator's (`settings.local.json`,
+    usually ignored). An absent one is the operator's (there is nothing to
+    read). Asked once per process: the checkout is not written while
+    leerie runs."""
     rel = f".claude/{name}"
-    try:
-        r = _git_z_output(["git", "--literal-pathspecs",
-                           *_tree_git_args(repo_root), "ls-files", "-z",
-                           "--", rel], timeout=30)
-        tracked = r.returncode != 0 or bool(r.stdout.strip("\0"))
-    except (OSError, subprocess.TimeoutExpired):
-        tracked = True
-    if tracked and os.path.lexists(os.path.join(repo_root, rel)):
+    tracked = _checkout_file_tracked(Path(repo_root), rel)
+    if tracked:
         log(f"  {rel} is tracked by the repository: not applied to workers "
             "(a repository's settings choose no operator authority; put "
             "your own in ~/.claude/settings.json or an untracked "
             ".claude/settings.local.json)")
     return not tracked
+
+
+def _checkout_file_tracked(root: Path, rel: str) -> bool:
+    """Whether the checkout file `rel` (`/`-separated) is a repository's
+    content rather than the operator's (DESIGN §6 *A repository chooses no
+    operator authority*): an index entry is the file or a directory above
+    it — a submodule is one gitlink entry, so its files have no entry of
+    their own — or a directory above it inside the checkout holds a `.git`
+    (a submodule, or a repository nested there).
+
+    Decided by the file, not by its name (DESIGN §6 *A path is the file it
+    names, not its spelling*): on a case-insensitive checkout a read of
+    `.claude/settings.json` opens a tracked `.claude/Settings.json`. So the
+    file is opened as `_read_text_beneath` reads it (beneath the checkout,
+    no link followed), and the index entries under the top directory it was
+    opened through are compared with it and its directories by `(st_dev,
+    st_ino)`. When git cannot answer, or the file is reached through a link
+    or is not a regular file, it is tracked; an absent one is not."""
+    *dirs, name = rel.split("/")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    fds: list[int] = []
+    above: list[os.stat_result] = []
+    try:
+        fds.append(os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
+        for d in dirs:
+            fds.append(os.open(d, flags | os.O_DIRECTORY, dir_fd=fds[-1]))
+            above.append(os.fstat(fds[-1]))
+            try:
+                os.stat(".git", dir_fd=fds[-1], follow_symlinks=False)
+                return True
+            except FileNotFoundError:
+                pass
+        fd = os.open(name, flags, dir_fd=fds[-1])
+        try:
+            mine = os.fstat(fd)
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    finally:
+        for fd in fds:
+            os.close(fd)
+    if not stat.S_ISREG(mine.st_mode):
+        return True
+    try:
+        r = _git_z_output(["git", "--literal-pathspecs",
+                           *_tree_git_args(root), "ls-files", "-z"],
+                          timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if r.returncode != 0:
+        return True
+    return _index_holds(root, [e for e in r.stdout.split("\0") if e],
+                        [mine, *above])
+
+
+def _index_holds(root: Path, entries: list[str],
+                 chain: list[os.stat_result]) -> bool:
+    """True when one of the index `entries` (paths beneath `root`) is, by
+    `lstat` from the root, one of `chain` — a file, then the directories
+    above it from the top, compared by `(st_dev, st_ino)` (DESIGN §6 *A path
+    is the file it names, not its spelling*). Only entries whose top
+    component is `chain`'s top (the directory first opened, or the file
+    itself at the top level) are looked at; an entry with no `/` is its own
+    top, so a submodule's gitlink is compared like any other entry."""
+    same = (lambda a, b: (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino))
+    top_of_chain = chain[1] if len(chain) > 1 else chain[0]
+    rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        tops: dict[str, bool] = {}
+        for e in entries:
+            top = e.partition("/")[0]
+            if top not in tops:
+                try:
+                    tops[top] = same(os.stat(top, dir_fd=rfd,
+                                             follow_symlinks=False),
+                                     top_of_chain)
+                except OSError:
+                    tops[top] = False
+            if not tops[top]:
+                continue
+            try:
+                st = os.stat(e, dir_fd=rfd, follow_symlinks=False)
+            except OSError:
+                continue
+            if any(same(st, c) for c in chain):
+                return True
+        return False
+    finally:
+        os.close(rfd)
 
 
 def _confined_cli_settings(hook_settings: str | None, *,
@@ -32062,20 +32228,17 @@ def _d1_split_sections(text: str, source: str, start: int) -> list[dict]:
 
 def _d1_report_sources(task: str, repo_root: Path) -> dict[str, str]:
     """The reports to inline for the classifier: files the task names
-    (`_glob_task_references`) with a markdown suffix that `git ls-files`
-    does not list, each at most `D1_REPORT_MAX_BYTES`. Path and git-index
-    checks only; a file too large is named in the log and left to the
+    (`_glob_task_references`) with a markdown suffix that no repository
+    holds (`_checkout_file_tracked`: a submodule's file is the repository's
+    too), each at most `D1_REPORT_MAX_BYTES`. Path and git-index checks
+    only; a file too large is named in the log and left to the
     classifier's own tools."""
     out: dict[str, str] = {}
     for f in _glob_task_references(task, repo_root):
         if f.suffix.lower() not in _D1_REPORT_SUFFIXES:
             continue
         rel = _repo_rel(f, repo_root)
-        tracked = subprocess.run(
-            ["git", "--literal-pathspecs", *_tree_git_args(repo_root), "ls-files",
-             "--error-unmatch", "--", rel], capture_output=True,
-            check=False).returncode == 0
-        if tracked:
+        if _checkout_file_tracked(Path(repo_root), rel):
             continue
         try:
             if f.lstat().st_size > D1_REPORT_MAX_BYTES:
@@ -42497,12 +42660,13 @@ async def _protected_paths_since(worktree: str,
     if not before_sha:
         return []
     r = await run_proc(
-        ["git", *_tree_git_args(worktree), "diff", "--name-only", f"{before_sha}..HEAD"],
+        ["git", *_tree_git_args(worktree), "diff", "--name-only", "-z",
+         f"{before_sha}..HEAD"],
         cwd=worktree,
     )
     if r.returncode != 0:
         return []
-    touched = [f for f in r.stdout.strip().splitlines() if f]
+    touched = [f for f in r.stdout.split("\0") if f]
     return [f for f in touched if _is_protected_path(f)]
 
 

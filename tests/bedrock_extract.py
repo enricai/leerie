@@ -18,11 +18,14 @@ def extract_bedrock_functions() -> str:
     launcher so the harness has real implementations, not stubs, for the
     SSO/profile control-flow paths — with the helpers before them that
     choose which settings files are the operator's
-    (`_checkout_settings_tracked`, `_operator_claude_settings`)."""
+    (`_checkout_file_tracked`, defined earlier in the launcher, and
+    `_operator_claude_settings`)."""
     src = LAUNCHER_PATH.read_text()
-    start = src.index("_checkout_settings_tracked() {")
+    h = src.index("_checkout_file_tracked() {")
+    helper = src[h:src.index("\n}\n", h) + len("\n}\n")]
+    start = src.index("_operator_claude_settings() {")
     end = src.index("\n}\n", src.index("bedrock_preflight() {")) + len("\n}\n")
-    block = src[start:end]
+    block = helper + src[start:end]
     assert "_operator_claude_settings() {" in block
     assert "detect_bedrock_mode() {" in block
     assert "bedrock_preflight() {" in block

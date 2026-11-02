@@ -326,6 +326,9 @@ class TestPhaseClassify:
         hole and still names no requirement section — round 2's feedback
         must carry only the unrelated hole, since the report was already
         asked about once."""
+        # A checkout is a repository: a report is inlined only when git says
+        # no repository holds it (`_checkout_file_tracked`).
+        _git(tmp_path, "init", "-q")
         (tmp_path / "BUG.md").write_text(REPORT["BUG.md"])
         task = TASK + "\nSee BUG.md\n"
         u = _units(leerie, task=task, reports=REPORT)

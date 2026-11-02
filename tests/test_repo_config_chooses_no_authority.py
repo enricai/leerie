@@ -310,3 +310,115 @@ def test_the_operators_user_settings_still_choose_bedrock(checkout, tmp_path):
     (home / ".claude" / "settings.json").write_text(json.dumps(
         {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}))
     assert _detect(checkout, home).stdout.splitlines()[0] == "BEDROCK"
+
+
+# --- a file another repository holds is not the operator's -----------------
+#
+# Review round 31, S1: `.claude` as a submodule is one gitlink entry in the
+# superproject's index, `.claude`, so a check that compared the settings file
+# with the index entries below `.claude/` found none and read a cloned
+# submodule's settings as the operator's. A checkout file is the operator's
+# only when no index entry is the file or a directory above it, and no
+# directory above it inside the checkout holds a `.git`.
+
+_ID = ("-c", "user.email=t@t", "-c", "user.name=t",
+       "-c", "protocol.file.allow=always")
+
+
+def _repo_with(path: Path, files: dict[str, str]) -> Path:
+    path.mkdir(parents=True)
+    _git(path, "init", "-q")
+    for rel, text in files.items():
+        (path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (path / rel).write_text(text)
+    _git(path, "add", "-A")
+    _git(path, *_ID, "commit", "-qm", "m")
+    return path
+
+
+def _with_submodule(tmp_path: Path, at: str, files: dict[str, str]) -> Path:
+    """A checkout cloned with `--recurse-submodules` from a repository whose
+    `at` is a submodule holding `files`."""
+    sub = _repo_with(tmp_path / "sub", files)
+    up = _repo_with(tmp_path / "upstream", {"README": "hi\n"})
+    _git(up, *_ID, "submodule", "add", "-q", str(sub), at)
+    _git(up, *_ID, "commit", "-qm", "sub")
+    co = tmp_path / "checkout"
+    _git(tmp_path, *_ID, "clone", "-q", "--recurse-submodules", str(up),
+         str(co))
+    assert (co / at / ".git").is_file()
+    return co
+
+
+def _nested_repository(tmp_path: Path, at: str, files: dict[str, str]
+                       ) -> Path:
+    """A checkout with a repository cloned into `at` that the superproject's
+    index does not record at all."""
+    co = _repo_with(tmp_path / "checkout", {"README": "hi\n"})
+    _git(tmp_path, "clone", "-q",
+         str(_repo_with(tmp_path / "sub", files)), str(co / at))
+    return co
+
+
+HELD = {"submodule": _with_submodule, "nested repository": _nested_repository}
+SETTINGS = {"settings.json": json.dumps(STEER),
+            "settings.local.json": json.dumps(STEER)}
+
+
+@pytest.mark.parametrize("how", HELD)
+@pytest.mark.parametrize("name", ["settings.json", "settings.local.json"])
+def test_settings_another_repository_holds_add_nothing_to_a_worker(
+        leerie, tmp_path, how, name):
+    co = HELD[how](tmp_path, ".claude", SETTINGS)
+    # The superproject's index names no file below `.claude`:
+    assert _git(co, "ls-files", "--", f".claude/{name}").stdout == ""
+    assert not leerie._checkout_settings_are_operators(str(co), name)
+    merged = json.loads(leerie._confined_cli_settings(
+        None, run_dir=tmp_path / "none", repo_root=co))
+    assert "apiKeyHelper" not in merged
+    assert merged["env"] == {leerie.SHELL_PREFIX_ENV:
+                             str(leerie.WORKER_SHELL)}
+
+
+@pytest.mark.parametrize("how", HELD)
+@pytest.mark.parametrize("name", ["settings.json", "settings.local.json"])
+def test_settings_another_repository_holds_do_not_choose_bedrock(
+        tmp_path, how, name):
+    co = HELD[how](tmp_path, ".claude", SETTINGS)
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    r = _detect(co, home)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines()[0] == "FIRST", r.stdout
+    assert str(co / ".claude" / name) not in r.stdout
+
+
+def test_an_untracked_file_beside_a_submodule_is_the_operators(leerie,
+                                                               tmp_path):
+    """Control: a submodule elsewhere in the checkout takes nothing from the
+    operator's own untracked settings file."""
+    co = _with_submodule(tmp_path, "vendor", {"README": "v\n"})
+    (co / ".claude").mkdir()
+    (co / ".claude" / "settings.local.json").write_text(json.dumps(
+        {"env": {"AWS_PROFILE": "operator"}}))
+    assert leerie._checkout_settings_are_operators(str(co),
+                                                   "settings.local.json")
+    merged = json.loads(leerie._confined_cli_settings(
+        None, run_dir=tmp_path / "none", repo_root=co))
+    assert merged["env"]["AWS_PROFILE"] == "operator"
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    assert _detect(co, home).stdout.splitlines()[0] == "FIRST"
+    assert str(co / ".claude" / "settings.local.json") in \
+        _detect(co, home).stdout
+
+
+@pytest.mark.parametrize("how", HELD)
+def test_a_report_another_repository_holds_is_not_inlined(leerie, tmp_path,
+                                                          how):
+    """`_d1_report_sources` inlines only a report no repository holds (a
+    task that points at one is bounded by its scenarios, DESIGN §8)."""
+    co = HELD[how](tmp_path, "docs", {"REPORT.md": "# theirs\n"})
+    (co / "MINE.md").write_text("# mine\n")
+    assert leerie._d1_report_sources(
+        "See docs/REPORT.md and MINE.md", co) == {"MINE.md": "# mine\n"}

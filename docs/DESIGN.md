@@ -3479,6 +3479,38 @@ of its own. It is constructed in two parts.
    out: the launcher warns when a tracked file sets
    `CLAUDE_CODE_USE_BEDROCK`, `AWS_PROFILE` or `AWS_REGION`, and the
    orchestrator logs each tracked file it does not apply.
+   *Tracked* is a fact about the file leerie reads, not about the name it
+   asked for (§6 *A path is the file it names, not its spelling*).
+   *Untracked* means no repository holds the file, not only the
+   checkout's own index: a submodule's files are in no superproject index
+   entry of their own (`.claude` as a submodule is one gitlink entry,
+   `.claude`), so a check of the file's own entry read a cloned
+   submodule's `.claude/settings.json` as the operator's, and its
+   `apiKeyHelper` and `ANTHROPIC_BASE_URL` reached every worker (review
+   round 31, S1; `git clone --recurse-submodules` is all it takes). So a
+   checkout file is the operator's only when no index entry is the file or
+   any directory above it in the checkout, and no directory above it in the
+   checkout holds a `.git` (a submodule, or any repository nested there).
+   Every decision that a checkout file is the operator's because git does
+   not track it applies this one rule (`_checkout_file_tracked`; the
+   launcher's `_checkout_file_tracked`): the settings files above, a report
+   the task points at (§8 *A task that points at a report is bounded by the
+   report's own scenarios*), and the launcher's refresh of a generated
+   `.leerie/Dockerfile`, which leaves a committed one alone.
+
+**The names an untracked settings file may still set.** Round 28 suggested a
+further list of names no checkout settings layer may set, tracked or not:
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+`apiKeyHelper`, `CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX`, and
+`AWS_*`. Leerie does not refuse them in an untracked file. The boundary is
+who wrote the file. The only writers of an untracked checkout file are the
+operator and programs the operator ran on the host with their own
+authority, and such a program could write `~/.claude/settings.json` just as
+easily. Repository content reached that layer only by being misjudged as
+untracked, and the identity rule closes that. A refusal would therefore stop
+no writer that the operator's own domain does not already hold. It would
+also take away a documented operator channel: Bedrock mode from an
+untracked `.claude/settings.local.json`.
 
 **What a repository still chooses.** Facts about itself and how much work it
 asks for, all of which run confined or only tighten a check:
@@ -3500,6 +3532,79 @@ a dependency lockfile build the image the run's container starts from, and
 that build is not confined: its steps run as root in the image, and the
 image holds the orchestrator itself. A repository's content therefore still
 shapes the orchestrator's own environment. This design does not close that.
+
+### A path is the file it names, not its spelling
+
+*Designed 2026-11-02 (review round 28, isolation A1).*
+
+**Root cause.** Leerie decided things about a path by comparing its
+spelling, but the filesystem resolves a path by its own rules. A
+case-insensitive filesystem (APFS by default, so every checkout and state
+root on macOS and Colima) treats `.Claude/Settings.json` and
+`.claude/settings.json` as one file. A normalization-insensitive one treats
+the NFC and NFD spellings of a name as one file, and HFS+ and APFS also
+ignore some invisible code points. Two decisions broke on this:
+
+- *Tracked or not.* `git ls-files -- .claude/settings.json` matches
+  spellings, case-sensitively. A repository that tracked
+  `.claude/Settings.json` was reported as tracking nothing, so the read of
+  `.claude/settings.json` (which opens the tracked file) counted as the
+  operator's own. Its `env` then went into every confined worker's
+  settings, and an `ANTHROPIC_BASE_URL` there sent the operator's token to
+  the repository's endpoint. The launcher's Bedrock reads had the same
+  flaw.
+- *Protected or not.* `_is_protected_path` compared prefixes
+  case-sensitively, so a worker could commit `.Claude/settings.json` or
+  `.Leerie/Dockerfile`. On a case-insensitive checkout, both are the
+  protected files once merged.
+
+**Invariant: a decision about a path a repository or a worker can spell is
+made about the file the filesystem resolves it to.** It is built in three
+parts.
+
+1. *Tracked is decided by identity.* Leerie opens the checkout's settings
+   file without following a link (§6 *Leerie never reads through a link a
+   repository holds*) and `fstat`s the descriptor. It then lists the index
+   (`git ls-files -z`, no pathspec), and `lstat`s each entry whose top
+   directory is the top directory it opened on the way (same device and
+   inode). If any of those entries is the same file, or the same directory
+   as one above it (a submodule's gitlink, §6 *A repository chooses no
+   operator authority*), the file is tracked. This covers case, Unicode normalisation and ignorable code
+   points without leerie knowing any filesystem's folding rules. When git
+   cannot answer, or the file is reached through a link or is not a regular
+   file, it is not read as the operator's. The orchestrator
+   (`_checkout_file_tracked`) and the launcher
+   (`_checkout_file_tracked`) apply the same test.
+2. *A protected path is compared folded.* Before the prefix test, a path is
+   normalised lexically and then folded: the code points HFS+ ignores are
+   removed (the same list git uses for `.git`), then the path is
+   NFKC-normalised, casefolded and NFKC-normalised again. A folded key
+   equates at least the spellings any of those filesystems equates, so over
+   them the test can only protect more. Every path list the test reads from
+   git is read NUL-separated (`-z`), because git quotes a name holding a
+   byte outside ASCII and the quoted form never matched a prefix.
+3. *No worker's diff adds a second spelling of a path.* A subtask whose
+   diff touches a path that, folded, equals a different path or directory
+   already in its tree is refused like a protected path
+   (`check_diff_scope`). On a case-insensitive filesystem the two names are
+   one file. Whichever is checked out last wins, so a worker could replace
+   a file it may not touch, such as a test the orchestrator owns, through
+   a name it may touch. A collision the tree already had before the subtask
+   is not the subtask's, and is not reported.
+
+**Decisions that need no change.** Each was checked against the same
+question.
+
+- The Landlock grants are resolved by the kernel to inodes.
+- The checkout deny rules (`Edit(//work/**)`) match a container mount point
+  on Linux, and `/work` is mounted read-only anyway.
+- The held-out sets live outside every tree.
+- The launcher's test for `.leerie/Dockerfile` reads repository content as
+  repository content: a worker can no longer commit a folded spelling of it
+  (part 2), and what a repository's Dockerfile can do is the residual of
+  *A repository chooses no operator authority* above.
+- `check_integrator_commit` uses the folded test of part 2 and reads its
+  list with `-z`.
 
 ### A confined command's scratch is short and private
 
