@@ -14462,6 +14462,19 @@ configuration (`setupFiles`, a custom `forceRerunTriggers`) is not known
 without reading that configuration and is not modelled; a setup file is
 usually a source file and can still reach `related`.
 
+The worker-side gate reads an impact-analysis run by the same rule
+(*A command the task forbids*). `vitest related <files>` and `jest
+--findRelatedTests <files>` are a scoped run only when every operand is
+one of the runner's module sources that is not its configuration — the
+run leerie itself would render, classified by the same
+`_IMPACT_SOURCE_EXTS` and `_is_runner_config`. Any other operand
+(`package.json`, a lockfile, a workflow, `vitest.config.ts`), or none at
+all, makes it a whole-suite run, which a whole-suite forbid denies: the
+gate cannot know which non-source operand the repository's
+`forceRerunTriggers` holds, and `package.json` alone, the default, ran
+all 1,299 of barnacle's test files. A worker that wants the tests a
+manifest change affects names those test files and runs them directly.
+
 So a template may instead ask for `{test_files}`, which substitutes only
 the test-shaped members of the changed-file set — a narrower proxy than the
 import-graph kind, running the tests the diff *touched* rather than the
@@ -14872,8 +14885,8 @@ Three layers follow, each derived from that one list:
   runner: vitest, jest, mocha, pytest, `go test`, `cargo test` (and its
   test binary's options behind `--`), rspec, `rails test`. A table names
   the options whose next word is their value; the subcommands that run the
-  suite (`vitest run`/`watch`/`dev` — `vitest related <files>` stays a
-  scoped run); the options that themselves select files or targets (jest
+  suite (`vitest run`/`watch`/`dev` — `vitest related <files>` is a
+  scoped run only over module sources, below); the options that themselves select files or targets (jest
   `--testPathPatterns`/`--onlyChanged`, cargo `--test`/`-p`); the options
   whose value is a test-path operand (mocha `--spec`, rspec `--pattern`);
   the operands that name the whole suite (`go test ./...`);

@@ -28991,9 +28991,9 @@ _FORBID_NODE_MODULES_BIN = re.compile(
 
 # What, after a matched runner, is not a test-file operand (DESIGN §9 *A
 # command the task forbids*): `subs` are subcommands that run the suite
-# (`vitest run`/`watch`/`dev`; `related <files>` is a scoped run and stays
-# an operand); `value` the options whose next word is their value;
-# `select` the options that themselves narrow the run to some files or
+# (`vitest run`/`watch`/`dev`; `related <files>` stays an operand, read by
+# `_forbidden_impact_whole`); `value` the options whose next word is their
+# value; `select` the options that themselves narrow the run to some files or
 # targets (a scoped run whatever else is said, unless its value is one of
 # `select_all`, the runner's match-everything glob); `operand_opts` the
 # options whose value is a test-path operand (`mocha --spec`, `rspec
@@ -29025,7 +29025,7 @@ _FORBID_RUNNERS: dict[tuple[str, ...], dict[str, frozenset[str]]] = {
             "--testPathPatterns", "--testMatch", "--testRegex",
             "--onlyChanged", "-o", "--changedSince", "--lastCommit",
             "--changedFilesWithAncestor", "--onlyFailures", "-f",
-            "--findRelatedTests", "--selectProjects", "--ignoreProjects"})},
+            "--selectProjects", "--ignoreProjects"})},
     ("mocha",): {"value": _MOCHA_VALUE_OPTS,
                  "operand_opts": frozenset({"--spec"}),
                  "dot_scoped": frozenset({"no_recursion"})},
@@ -29245,10 +29245,42 @@ def _forbidden_glob_whole(w: str, norm: set[str]) -> bool:
     return w[k:].startswith("**") and w.rsplit("/", 1)[-1].startswith("*")
 
 
+def _forbidden_impact_whole(rest: list[str],
+                            spec: dict[str, frozenset[str]],
+                            value_opts: frozenset[str], impact: str
+                            ) -> bool | None:
+    """For an impact-analysis run of `impact` (a `_RUNNER_DIRECT_SELECTORS`
+    runner: vitest's `related` subcommand, jest's `--findRelatedTests`),
+    whether it runs the whole suite; None when `rest` is no such run. It is
+    scoped only over module sources leerie itself would hand it
+    (`_impact_module_source`, the classification `_render_scoped` filters
+    `{files}` by): no operand, or any other one — `package.json`, which
+    vitest's default `forceRerunTriggers` reads as rerun-everything, a
+    lockfile, the runner's own configuration — is a whole-suite run (DESIGN
+    §9 *An impact-analysis runner is handed only its own module sources*).
+    Mechanical path tests only."""
+    affected = _RUNNER_DIRECT_SELECTORS[impact][0]
+    if affected.startswith("-"):
+        if affected not in rest:
+            return None
+        pos = _forbidden_runner_operands(
+            [w for w in rest if w != affected], spec, value_opts)
+        if pos is None:
+            # Another selecting option narrows it as well.
+            return False
+    else:
+        pos = _forbidden_runner_operands(rest, spec, value_opts)
+        if not pos or pos[0] != affected:
+            return None
+        pos = pos[1:]
+    return not pos or not all(_impact_module_source(w, impact) for w in pos)
+
+
 def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
                                 value_opts: frozenset[str] = frozenset(),
                                 *, runner: dict[str, frozenset[str]]
-                                | None = None) -> bool:
+                                | None = None,
+                                impact: str | None = None) -> bool:
     """True when the words after a matched runner still run the whole suite
     — the whole-suite deny's semantics (`_suite_rule_bodies`: the bare
     runner, or one aimed at a test root), plus a flags-only runner, which
@@ -29260,8 +29292,14 @@ def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
     `runner` (a `_FORBID_RUNNERS` entry) adds its value options, its
     selecting options (a hit is a scoped run), its whole-suite operands
     and, after `--`, its test binary's value options
-    (`_forbidden_runner_operands`)."""
+    (`_forbidden_runner_operands`). `impact` names the runner when it has
+    impact analysis (`_RUNNER_DIRECT_SELECTORS`): its impact-analysis run is
+    read by `_forbidden_impact_whole`."""
     spec = runner or {}
+    if impact is not None:
+        whole = _forbidden_impact_whole(rest, spec, value_opts, impact)
+        if whole is not None:
+            return whole
     pos = _forbidden_runner_operands(rest, spec, value_opts)
     if pos is None:
         return False
@@ -29322,7 +29360,8 @@ def _forbidden_command_hit(command: str,
                             continue
                         if (scope == "any" or _forbidden_whole_suite_rest(
                                 c[len(head):], roots + ops,
-                                runner=_forbidden_runner(forb))):
+                                runner=_forbidden_runner(forb),
+                                impact=_forbidden_impact_runner(forb))):
                             return cmd
     except Exception:
         return None
@@ -29430,6 +29469,14 @@ def _process_constraints(result: dict, prescribed: dict | None,
             entries.append(d)
     return {"forbidden_commands": originals,
             "entries": entries, "dropped": dropped}
+
+
+def _forbidden_impact_runner(forb: list[str]) -> str | None:
+    """The `_RUNNER_DIRECT_SELECTORS` runner a canonical forbidden argv
+    names, else None."""
+    key = _forbidden_runner_key(forb)
+    return key[0] if key and len(key) == 1 \
+        and key[0] in _RUNNER_DIRECT_SELECTORS else None
 
 
 def _forbidden_runner_key(argv: list[str]) -> tuple[str, ...] | None:
@@ -42193,6 +42240,16 @@ def _is_runner_config(path: str, runner: str) -> bool:
                for g in _RUNNER_CONFIG_GLOBS.get(runner, ()))
 
 
+def _impact_module_source(path: str, runner: str) -> bool:
+    """`path` is one of the files `runner`'s module graph holds and not its
+    configuration: an operand impact analysis answers (DESIGN §9 *An
+    impact-analysis runner is handed only its own module sources*). The
+    one classification `_render_scoped` and the forbid gate
+    (`_forbidden_impact_whole`) share."""
+    return (os.path.splitext(path)[1] in _IMPACT_SOURCE_EXTS
+            and not _is_runner_config(path, runner))
+
+
 def _render_scoped(template: str | None, files: list[str],
                    base_ref: str,
                    test_globs: list[str] | None = None) -> str | None:
@@ -42249,9 +42306,9 @@ def _render_scoped(template: str | None, files: list[str],
         _warn_unknown_placeholder_once(template, leftover.group(0))
         return None
     if "{files}" in template:
-        if _impact_runner(template) is not None:
-            files = [f for f in files
-                     if os.path.splitext(f)[1] in _IMPACT_SOURCE_EXTS]
+        impact = _impact_runner(template)
+        if impact is not None:
+            files = [f for f in files if _impact_module_source(f, impact)]
         if not files:
             return None
         template = template.replace(
