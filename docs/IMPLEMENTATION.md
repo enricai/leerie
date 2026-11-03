@@ -4365,8 +4365,8 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `_COMMITTING_WORKERS`: implementer, conformer, integrator,
   acceptance_writer, surrogate_fixer, falsifier, rebaser): `rw` it and
   `_tree_git_dirs(cwd, run_dir)`'s write list, `ro` its read list or, for
-  a clone (both empty), `<run>/repo/objects`. `_tree_git_dirs` (`git
-  rev-parse --path-format=absolute --git-dir --git-common-dir`): a common
+  a clone (both empty), `<run>/repo/objects`. `_tree_git_dirs` (from
+  `_git_dirs(tree)`; `([], [])` when it is None): a common
   dir in `<run>/tree-repos/` (`TREE_REPOS_DIRNAME`) → write it whole, read
   `<run>/repo/objects`; the run repository itself (a committing tree I6
   never makes) → `die()` naming the tree, before any spawn, so no grant to
@@ -4374,7 +4374,11 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   inside the tree (a clone) → nothing. For any other worker: `rw` the
   cwd when `_bash_unrestricted(allowed_tools)` (bare `Bash` in the list),
   else `ro` (the shared planning worktree and the payload-only directory
-  included: no worker there has a shell); `ro` `<run>/repo`. `_RUN_NOTES_READERS`
+  included: no worker there has a shell); `ro` `<run>/repo` and
+  `_tree_repo_read(cwd, run_dir)` — the common dir (`_git_dirs(tree)`:
+  `git rev-parse --path-format=absolute --git-dir --git-common-dir`,
+  resolved, or None) when it is in `<run>/tree-repos/`, else nothing
+  (never a `die()`: no write is granted). `_RUN_NOTES_READERS`
   (implementer, conformer, integrator): `ro` `<run>/subtasks`,
   `<run>/task.md`, `<run>/notes`. `notes_id`: `rw` `<run>/notes/<id>/`
   (created). `selfcheck_dir`: `ro` it, `rw` its `run/` (created). The

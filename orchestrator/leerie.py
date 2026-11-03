@@ -24764,6 +24764,32 @@ def _worker_own_dirs(env: Mapping[str, str], run_dir: Path) -> list[str]:
 TREE_REPOS_DIRNAME = "tree-repos"
 
 
+def _git_dirs(tree: Path) -> tuple[Path, Path] | None:
+    """`(git dir, common dir)` of the worktree or clone `tree`, resolved;
+    None when git cannot say."""
+    r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse",
+                        "--path-format=absolute", "--git-dir",
+                        "--git-common-dir"], capture_output=True, text=True,
+                       check=False, timeout=30)
+    lines = r.stdout.split("\n")
+    if r.returncode != 0 or len(lines) < 2:
+        return None
+    return Path(lines[0]).resolve(), Path(lines[1]).resolve()
+
+
+def _tree_repo_read(tree: Path, run_dir: Path) -> list[str]:
+    """The tree repository (`<run>/tree-repos/<tree>/`) `tree` is a worktree
+    of, for a worker that only reads `tree`; `[]` for any other tree (the
+    run repository is granted read on its own)."""
+    dirs = _git_dirs(tree)
+    if dirs is None or dirs[0].is_relative_to(tree):
+        return []
+    common = dirs[1]
+    if common.parent == (run_dir / TREE_REPOS_DIRNAME).resolve():
+        return [str(common)]
+    return []
+
+
 def _tree_git_dirs(tree: Path, run_dir: Path) -> tuple[list[str], list[str]]:
     """`(write, read)`: the git metadata a commit in `tree` writes, and what
     it reads besides, when that lives in the run directory outside `tree`.
@@ -24774,14 +24800,10 @@ def _tree_git_dirs(tree: Path, run_dir: Path) -> tuple[list[str], list[str]]:
     remake one from a tree repository); writing it would grant the run
     repository's `refs/`, every branch, so the run stops instead.
     `([], [])` for a clone, whose `.git` is inside it."""
-    r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse",
-                        "--path-format=absolute", "--git-dir",
-                        "--git-common-dir"], capture_output=True, text=True,
-                       check=False, timeout=30)
-    lines = r.stdout.split("\n")
-    if r.returncode != 0 or len(lines) < 2:
+    dirs = _git_dirs(tree)
+    if dirs is None:
         return [], []
-    git_dir, common = Path(lines[0]).resolve(), Path(lines[1]).resolve()
+    git_dir, common = dirs
     run_repo = (run_dir / RUN_REPO_NAME).resolve()
     if git_dir.is_relative_to(tree):
         return [], []
@@ -24862,6 +24884,9 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     else:
         (rw if _bash_unrestricted(allowed_tools) else ro).append(str(cwd_r))
         ro.append(str(run_dir / RUN_REPO_NAME))
+        # A tree of its own repository: that repository read, never
+        # written, so the worker's `git` reads the tree it is in.
+        ro += _tree_repo_read(cwd_r, run_dir)
     if schema_key in _RUN_NOTES_READERS:
         ro += [str(run_dir / "subtasks"), str(run_dir / "task.md"),
                str(run_dir / NOTES_DIRNAME)]

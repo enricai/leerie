@@ -4831,7 +4831,12 @@ so those objects are on disk twice until the run directory goes.
 **I5's grant.** A committing worker's git metadata grant is its tree
 repository, whole (`<run-dir>/tree-repos/<tree>/`, write), and a read grant
 on `<run-dir>/repo/objects/` for the alternates. Nothing else of
-`<run-dir>/repo/` is granted.
+`<run-dir>/repo/` is granted. A worker that only reads a tree (the
+satisfied probe, a judge) is granted its tree repository read, never
+written, beside the run repository every non-committing worker reads: its
+`git status` in the tree it was started in read the tree's `.git` file,
+which names `tree-repos/<tree>/worktrees/<tree>`, and failed with "not a
+git repository" (review round 30, execution).
 
 **Runtimes.** Local rootless and rootful: everything is under the state
 root, made and used by the same identity. Fly and EC2: the same layout under

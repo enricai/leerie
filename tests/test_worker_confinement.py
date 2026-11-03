@@ -271,6 +271,32 @@ own tmp|echo x > $TMPDIR/f
                                                "own tmp"}
 
 
+def test_a_read_only_worker_runs_git_in_a_tree_of_its_own_repository(
+        leerie, run):
+    """A worker that only reads a subtask tree whose repository is its own
+    (`<run>/tree-repos/<tree>/`, DESIGN §6 *A repository per committing tree
+    (I6)*) reads that repository, so its `git` works there; it writes
+    nothing of it (review round 30 execution: a satisfied probe's `git
+    status` failed with "not a git repository")."""
+    rd, wt = run["run_dir"], run["wts"]["wt-a"]
+    tr = rd / "tree-repos" / "wt-a"
+    g = leerie._worker_grants(
+        run_dir=rd, state={}, schema_key="satisfied_probe", cwd=wt,
+        allowed_tools=leerie.SATISFIED_PROBE_TOOLS, env=run["env"])
+    assert str(tr.resolve()) in g.ro
+    assert not [p for p in g.rw if Path(p).is_relative_to(tr.resolve())]
+    got = _probe(leerie, g, f"""
+git status|git -C {wt} status --porcelain
+git log|git -C {wt} log -1 --format=%H
+write tree repo|echo x > {tr}/planted
+move own branch|git -C {wt} update-ref refs/heads/b-wt-a HEAD~0
+write its cwd|echo x > {wt}/f
+""", run["env"])
+    assert got == {"git status": True, "git log": True,
+                   "write tree repo": False, "move own branch": False,
+                   "write its cwd": False}
+
+
 def test_a_temp_dir_that_holds_the_state_root_never_grants_it(
         leerie, run, tmp_path):
     """`TMPDIR=/tmp` with the state root beneath it (pytest's layout, and a
