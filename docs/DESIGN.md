@@ -2940,7 +2940,7 @@ never becomes a build input.
 
 **Cost.** `COPY --from=<worker stage> /` copies the whole worker root, which
 is the base's filesystem plus the repository's layers: about 2.4 GB more
-unpacked per repository image (one per repository and leerie version), and
+unpacked per repository image (one per checkout and leerie version), and
 the copy's time on each rebuild. A rebuild happens only when the
 Dockerfile, its inputs, leerie's version or the base image change
 (`.dockerfile-hash` records all four and `REPO_IMAGE_LAYOUT`).
@@ -9328,9 +9328,10 @@ specialized tooling) cannot be installed by `.leerie-setup.sh` — that
 hook runs as the unprivileged `leerie` user. A repo that needs such
 packages commits `.leerie/Dockerfile` that extends the base image with
 `ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds an image
-tagged `leerie-repo/<repo-id>:<version>` (where `<repo-id>` is derived
-from the git remote URL, sanitized to tag chars) and uses it for all
-subsequent `nerdctl run` invocations. When no `.leerie/Dockerfile` exists
+tagged `leerie-repo/<repo-id>-<checkout-id>:<version>` (where `<repo-id>`
+is derived from the git remote URL, sanitized to tag chars, and
+`<checkout-id>` from the checkout's path) and uses it for all subsequent
+`nerdctl run` invocations. When no `.leerie/Dockerfile` exists
 but `.leerie/config.toml` declares `setup_packages`, the launcher
 auto-generates an apt-install Dockerfile and proceeds through the same
 build path. A committed Dockerfile always takes precedence — `setup_packages`
@@ -9343,16 +9344,34 @@ orchestrator's root is leerie's; a repository's root is only a confined
 process's*). The build context is the committed tree at `HEAD`, never the
 checkout directory.
 
+**An image is reused only when it is the one built for this checkout.**
+A repository image's root is the root of every command its checkout's
+workers run, so an image another checkout built must never be run for
+this one. `<repo-id>` alone does not tell checkouts apart: origin's
+`owner/repo` tail is the same for `github.com/alice/app` and
+`evil.example/alice/app`, and the basename fallback is the same for any
+two directories of one name. Before review round 29 (isolation F2) the
+name was `leerie-repo/<repo-id>:<version>` and reuse was decided by a hash
+file in each checkout's own state directory and by the tag's presence, so
+when a second checkout with a colliding id built and retagged the shared
+name, the first checkout's next launch found its own hash unchanged and ran
+the other checkout's image. The name now carries the checkout, the hash
+file records the digest of the image this checkout built, and the image is
+reused only when its tag still names that digest. The container runs the
+digest, not the tag, so a tag moved between the check and the run changes
+nothing.
+
 Rebuild is triggered by any of: the image is absent, the sha256 of the
 Dockerfile changed, the base image changed, leerie's version or the
 image's layout (`REPO_IMAGE_LAYOUT`) changed — all four stored as
 `<version>:<layout>:<base image id>:<sha256>` at
-`$LEERIE_STATE_HOST_DIR/.dockerfile-hash`. A second run with an unchanged
-Dockerfile skips the build entirely.
+`$LEERIE_STATE_HOST_DIR/.dockerfile-hash`, followed by the digest of the
+image built — or the tag names an image other than that digest. A second
+run with an unchanged Dockerfile skips the build entirely.
 
-The `nerdctl run` image argument uses `${REPO_IMAGE_TAG:-$IMAGE_TAG}`,
-so the base image is used transparently when no repo Dockerfile is
-present.
+The `nerdctl run` image argument uses `${REPO_IMAGE_REF:-$IMAGE_TAG}`
+(`REPO_IMAGE_REF` is the recorded digest), so the base image is used
+transparently when no repo Dockerfile is present.
 
 **Fly runtime variant.** On `--runtime fly` the same `.leerie/Dockerfile`
 triggers a derived image at `registry.fly.io/$APP:$VERSION-$HASH` where

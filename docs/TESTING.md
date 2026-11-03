@@ -307,6 +307,18 @@ carries the linked file's digest. In a full launch `_checkout_config_links`
 refuses a linked `.leerie/Dockerfile` first; these pin the sites
 themselves.
 
+A repository image is only its own checkout's (review round 29, isolation
+F2; `tests/test_resolve_repo_image_tag.py`): checkouts whose `<repo-id>`
+collide (`github.com/alice/app`, `evil.example/alice/app`, a directory
+named `alice-app`) get three distinct names; an image reused is run by the
+digest recorded when this checkout built it (`REPO_IMAGE_REF`); a tag that
+names another digest is rebuilt and the new digest recorded and run; a hash
+file that records no digest reuses nothing. The shared `nerdctl` stub
+(`tests/repo_image_block_extract.py`) answers the repository image's
+`RepoDigests` with `$STUB_REPO_DIGEST`, present once a harness's `build`
+branch has run. Falsified: with the launcher before this change, all four
+fail.
+
 ## Worker cgroup containment
 
 Worker cgroup containment (DESIGN §6 *Memory containment*) is tested in

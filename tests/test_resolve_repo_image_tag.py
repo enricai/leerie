@@ -3,13 +3,14 @@ leerie launcher.
 
 Verifies Phase-2 per-repo image identity and rebuild-trigger logic:
   - empty tag when no .leerie/Dockerfile and no setup_packages
-  - tag format leerie-repo/<repo-id>:<version> when Dockerfile present
+  - tag format leerie-repo/<repo-id>-<checkout-id>:<version> when Dockerfile present
   - repo-id derived from git remote get-url origin owner/repo, with
     basename fallback when no remote
   - rebuild signals: image absent, Dockerfile hash mismatch, base version change
   - no rebuild when image present and hash matches
 
 Strategy: extract the real functions (`_leerie_repo_id`,
+`_leerie_checkout_id`, `_repo_image_digest`,
 `_leerie_should_generate_dockerfile`, `resolve_repo_image_tag`,
 `ensure_base_in_buildkit_ns`, `build_repo_image`) and the top-level
 rebuild-decision block verbatim out of the launcher (mirroring
@@ -32,10 +33,11 @@ launcher's source at all.
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 from pathlib import Path
 
-from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
+from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB, REPO_DIGEST
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -71,6 +73,7 @@ def _extract_line(prefix: str) -> str:
 def _extracted_block() -> str:
     return "\n".join([
         _extract_line("REPO_IMAGE_LAYOUT="),
+        _extract_line('REPO_IMAGE_REF=""'),
         _extract_line('_REPO_BUILD_DIR=""'),
         _extract_line('_REPO_BUILD_CTX=""'),
         _extract_line('_REPO_NONCE=""'),
@@ -84,6 +87,8 @@ def _extracted_block() -> str:
         _extract_fn("_check_repo_image() {"),
         _extract_fn("_repo_image_prepare() {"),
         _extract_fn("_leerie_repo_id() {"),
+        _extract_fn("_leerie_checkout_id() {"),
+        _extract_fn("_repo_image_digest() {"),
         _extract_fn("_leerie_should_generate_dockerfile() {"),
         _extract_fn("resolve_repo_image_tag() {"),
         _extract_fn("ensure_base_in_buildkit_ns() {"),
@@ -113,6 +118,7 @@ nerdctl() {
     return "${NERDCTL_INSPECT_RC:-0}"
   fi
   if [ "$cmd" = "build" ]; then
+    _stub_build_done
     return "${NERDCTL_BUILD_RC:-0}"
   fi
   return 0
@@ -137,6 +143,12 @@ LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-/tmp/leerie-state-test}"
 _leerie_dockerfile="$USER_REPO/.leerie/Dockerfile"
 
 """
+
+
+def _checkout_id(user_repo: Path) -> str:
+    """The checkout identity the tag carries: 12 hex characters of the
+    sha256 of the checkout's path."""
+    return hashlib.sha256(os.fsencode(str(user_repo))).hexdigest()[:12]
 
 
 def _run(body: str, *, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -218,7 +230,7 @@ def test_lockfile_without_setup_packages_resolves_nonempty_tag(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     tag = result.stdout.strip().removeprefix("tag=")
-    assert tag == "leerie-repo/owner-myrepo:1.2.3", tag
+    assert tag == f"leerie-repo/owner-myrepo-{_checkout_id(user_repo)}:1.2.3", tag
 
 
 def test_bare_requirements_txt_without_setup_packages_returns_empty(tmp_path: Path):
@@ -236,11 +248,11 @@ def test_bare_requirements_txt_without_setup_packages_returns_empty(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
-# (b) Tag format: leerie-repo/<sanitized-repo-id>:<version>
+# (b) Tag format: leerie-repo/<sanitized-repo-id>-<checkout-id>:<version>
 # ---------------------------------------------------------------------------
 
 def test_tag_format_https_remote(tmp_path: Path):
-    """Tag is leerie-repo/<owner-repo>:<version> for an HTTPS remote URL."""
+    """Tag is leerie-repo/<owner-repo>-<checkout-id>:<version> for an HTTPS remote URL."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -259,7 +271,7 @@ def test_tag_format_https_remote(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     tag = result.stdout.strip().removeprefix("tag=")
-    assert tag == "leerie-repo/myorg-myrepo:1.2.3", tag
+    assert tag == f"leerie-repo/myorg-myrepo-{_checkout_id(user_repo)}:1.2.3", tag
 
 
 def test_tag_format_ssh_remote(tmp_path: Path):
@@ -282,7 +294,7 @@ def test_tag_format_ssh_remote(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     tag = result.stdout.strip().removeprefix("tag=")
-    assert tag == "leerie-repo/owner-repo:2.0.0", tag
+    assert tag == f"leerie-repo/owner-repo-{_checkout_id(user_repo)}:2.0.0", tag
 
 
 def test_tag_format_basename_fallback_when_no_remote(tmp_path: Path):
@@ -305,7 +317,7 @@ def test_tag_format_basename_fallback_when_no_remote(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     tag = result.stdout.strip().removeprefix("tag=")
-    assert tag == "leerie-repo/my-project:3.0.0", tag
+    assert tag == f"leerie-repo/my-project-{_checkout_id(user_repo)}:3.0.0", tag
 
 
 def test_tag_format_uppercase_remote_sanitized(tmp_path: Path):
@@ -328,7 +340,7 @@ def test_tag_format_uppercase_remote_sanitized(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     tag = result.stdout.strip().removeprefix("tag=")
-    assert tag == "leerie-repo/myorg-my-repo:1.0.0", tag
+    assert tag == f"leerie-repo/myorg-my-repo-{_checkout_id(user_repo)}:1.0.0", tag
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +428,8 @@ def test_rebuild_false_when_image_present_and_hash_matches(tmp_path: Path):
     state_dir.mkdir()
     version = "0.99.test"
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
-    (state_dir / ".dockerfile-hash").write_text(f"{version}:worker-root-1:sha256:base-id:{sha}\n")
+    (state_dir / ".dockerfile-hash").write_text(
+        f"{version}:worker-root-1:sha256:base-id:{sha} {REPO_DIGEST}\n")
     result = _run_with_rebuild_decision(
         'echo "done"',
         env={
@@ -450,7 +463,7 @@ def test_a_linked_dockerfile_is_never_read_nor_reused(tmp_path: Path):
     version = "0.99.test"
     sha = hashlib.sha256(outside.read_bytes()).hexdigest()
     (state_dir / ".dockerfile-hash").write_text(
-        f"{version}:worker-root-1:sha256:base-id:{sha}\n")
+        f"{version}:worker-root-1:sha256:base-id:{sha} {REPO_DIGEST}\n")
     result = _run_with_rebuild_decision(
         'echo "done"',
         env={
@@ -466,3 +479,94 @@ def test_a_linked_dockerfile_is_never_read_nor_reused(tmp_path: Path):
     assert "cannot be read as a regular file beneath the checkout" in \
         result.stderr
     assert "done" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# (d) A repository image is only its own checkout's (review round 29,
+# isolation F2)
+# ---------------------------------------------------------------------------
+
+def test_checkouts_whose_repo_ids_collide_get_distinct_images(tmp_path: Path):
+    """Origin's owner/repo tail, or a directory basename, is shared by
+    `github.com/alice/app`, `evil.example/alice/app` and a checkout in a
+    directory named `alice-app`; the image name also carries the checkout,
+    so none of them is ever named by another's."""
+    tags = []
+    for path, origin in (("work/app", "https://github.com/alice/app.git"),
+                         ("clones/app-fork",
+                          "https://evil.example/alice/app.git"),
+                         ("dl/alice-app", "")):
+        user_repo = tmp_path / path
+        (user_repo / ".leerie").mkdir(parents=True)
+        (user_repo / ".leerie" / "Dockerfile").write_text(
+            "ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+        result = _run('echo "tag=$(resolve_repo_image_tag)"',
+                      env={"USER_REPO": str(user_repo),
+                           "FAKE_GIT_REMOTE": origin,
+                           "LEERIE_VERSION": "1.0.0"})
+        assert result.returncode == 0, result.stderr
+        tag = result.stdout.strip().removeprefix("tag=")
+        assert tag == f"leerie-repo/alice-app-{_checkout_id(user_repo)}:1.0.0"
+        tags.append(tag)
+    assert len(set(tags)) == 3, tags
+
+
+def _up_to_date_world(tmp_path: Path, stored: str) -> tuple[Path, Path]:
+    user_repo = tmp_path / "repo"
+    (user_repo / ".leerie").mkdir(parents=True)
+    df = user_repo / ".leerie" / "Dockerfile"
+    df.write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    sha = hashlib.sha256(df.read_bytes()).hexdigest()
+    (state_dir / ".dockerfile-hash").write_text(
+        f"0.99.test:worker-root-1:sha256:base-id:{sha}{stored}\n")
+    return user_repo, state_dir
+
+
+def test_an_image_built_here_is_run_by_its_digest(tmp_path: Path):
+    """Reused, the image runs by the digest recorded when this checkout built
+    it, never by a tag that can be moved between the check and the run."""
+    user_repo, state_dir = _up_to_date_world(tmp_path, f" {REPO_DIGEST}")
+    result = _run_with_rebuild_decision(
+        'echo "ref=$REPO_IMAGE_REF"',
+        env={"USER_REPO": str(user_repo),
+             "LEERIE_STATE_HOST_DIR": str(state_dir),
+             "FAKE_GIT_REMOTE": "", "NERDCTL_INSPECT_RC": "0"})
+    assert result.returncode == 0, result.stderr
+    assert "per-repo image up-to-date" in result.stderr
+    assert f"ref={REPO_DIGEST}" in result.stdout
+
+
+def test_a_tag_naming_another_image_is_rebuilt_not_reused(tmp_path: Path):
+    """The inputs match, but the tag now names an image other than the one
+    this checkout built: it is rebuilt, and the new build's digest runs."""
+    user_repo, state_dir = _up_to_date_world(tmp_path, f" {REPO_DIGEST}")
+    other = "sha256:" + "b" * 64
+    result = _run_with_rebuild_decision(
+        'echo "ref=$REPO_IMAGE_REF"',
+        env={"USER_REPO": str(user_repo),
+             "LEERIE_STATE_HOST_DIR": str(state_dir),
+             "FAKE_GIT_REMOTE": "", "NERDCTL_INSPECT_RC": "0",
+             "STUB_REPO_DIGEST": other})
+    assert result.returncode == 0, result.stderr
+    assert "per-repo image up-to-date" not in result.stderr
+    assert "building per-repo container image" in result.stderr
+    assert f"ref={other}" in result.stdout
+    assert (state_dir / ".dockerfile-hash").read_text().endswith(
+        f" {other}\n")
+
+
+def test_an_image_with_no_recorded_digest_is_rebuilt(tmp_path: Path):
+    """A hash file that records no image (one written before images were
+    recorded, or by another checkout's state dir) reuses nothing, even when
+    the tag exists and every input matches."""
+    user_repo, state_dir = _up_to_date_world(tmp_path, "")
+    result = _run_with_rebuild_decision(
+        'echo "ref=$REPO_IMAGE_REF"',
+        env={"USER_REPO": str(user_repo),
+             "LEERIE_STATE_HOST_DIR": str(state_dir),
+             "FAKE_GIT_REMOTE": "", "NERDCTL_INSPECT_RC": "0"})
+    assert result.returncode == 0, result.stderr
+    assert "per-repo image up-to-date" not in result.stderr
+    assert "building per-repo container image" in result.stderr

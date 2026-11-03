@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 from tests.committed_tree import commit_tree
-from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
+from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB, REPO_DIGEST
 from tests.repo_image_block_extract import extract_block as _extract_block
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -51,10 +51,11 @@ nerdctl() {
       return "${NERDCTL_INSPECT_RC:-0}"
       ;;
     build)
+      _stub_build_done
       return "${NERDCTL_BUILD_RC:-0}"
       ;;
     run)
-      echo "nerdctl-run: image=${REPO_IMAGE_TAG:-$IMAGE_TAG}"
+      echo "nerdctl-run: image=${REPO_IMAGE_REF:-$IMAGE_TAG}"
       return 0
       ;;
     *)
@@ -302,7 +303,8 @@ def test_rebuild_skipped_when_image_present_and_hash_matches(tmp_path):
     import hashlib
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
-    (state_dir / ".dockerfile-hash").write_text(f"{version}:worker-root-1:sha256:base-id:{sha}\n")
+    (state_dir / ".dockerfile-hash").write_text(
+        f"{version}:worker-root-1:sha256:base-id:{sha} {REPO_DIGEST}\n")
 
     result = _run_harness(
         'echo "done"',
@@ -486,11 +488,13 @@ def test_existing_dockerfile_wins_over_setup_packages(tmp_path):
     assert "# CUSTOM" in result.stdout
 
 
-def test_nerdctl_run_uses_repo_image_tag_when_set(tmp_path):
-    """REPO_IMAGE_TAG is set when Dockerfile is present; fallback to IMAGE_TAG otherwise."""
+def test_nerdctl_run_uses_repo_image_ref_when_set(tmp_path):
+    """The container runs the repository image by the digest this checkout
+    built (REPO_IMAGE_REF), never by its tag; the base image otherwise."""
     launcher_text = _launcher_text()
     # The nerdctl run line must use the fallback expression
-    assert '"${REPO_IMAGE_TAG:-$IMAGE_TAG}"' in launcher_text
+    assert '"${REPO_IMAGE_REF:-$IMAGE_TAG}"' in launcher_text
+    assert '"${REPO_IMAGE_TAG:-$IMAGE_TAG}"' not in launcher_text
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +728,8 @@ def test_unrelated_file_change_no_rebuild(tmp_path):
     # Store hash matching current Dockerfile.
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
-    (state_dir / ".dockerfile-hash").write_text(f"{version}:worker-root-1:sha256:base-id:{sha}\n")
+    (state_dir / ".dockerfile-hash").write_text(
+        f"{version}:worker-root-1:sha256:base-id:{sha} {REPO_DIGEST}\n")
 
     # Mutate an unrelated source file — not a lockfile.
     src_dir = user_repo / "src"

@@ -19,7 +19,7 @@ import subprocess
 # it inlined one of three `CGROUP_MOUNT_ARG` branches as a literal and was
 # missing `--cidfile` and its bind, `--label`, `-e USER_REPO=`,
 # `-e LEERIE_COMMIT=`, the `LEERIE_*` auto-forward, `--cgroupns=host`,
-# `SECOPT`, `APPARMOR_OPT`, `REWRITTEN_ARGS`, and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`.
+# `SECOPT`, `APPARMOR_OPT`, `REWRITTEN_ARGS`, and `${REPO_IMAGE_REF:-$IMAGE_TAG}`.
 # None of that flipped an assertion, which is the point: the tests were
 # blind, not wrong. They would pass identically if the launcher dropped the
 # state mount tomorrow — the exact regression this file exists to catch.
@@ -44,7 +44,7 @@ _HARNESS = (
 nerdctl() { for a in "$@"; do printf '%s\\n' "$a"; done; }
 TTY_FLAGS="-i"
 _cidfile="/dev/null"
-REPO_IMAGE_TAG=""
+REPO_IMAGE_REF=""
 LEERIE_COMMIT=""
 AUTH_MOUNTS=()
 CACHE_MOUNTS=()

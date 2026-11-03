@@ -24,8 +24,14 @@ def extract_block(text: str, start_marker: str, end_marker: str) -> str:
 # requires. Builtins only. Returns 0 when it answered a `-f` query, 1 for a
 # bare presence probe, which the stub's own exit code answers: call it as
 # `_stub_image_inspect "$@" && return 0` from the stub's `image)` branch,
-# after the subcommand word is shifted off.
+# after the subcommand word is shifted off. The repository image's digest
+# (`{{index .RepoDigests 0}}`) is `$STUB_REPO_DIGEST` (default
+# `REPO_DIGEST`), present when `$NERDCTL_INSPECT_RC` is 0 or once the
+# harness's `build` branch has called `_stub_build_done`.
+REPO_DIGEST = "sha256:" + "a" * 64
 NERDCTL_IMAGE_INSPECT_STUB = r'''
+_STUB_BUILT=""
+_stub_build_done() { _STUB_BUILT=1; }
 _stub_image_inspect() {
   local _fmt="" _tag=""
   while [ $# -gt 0 ]; do
@@ -36,6 +42,12 @@ _stub_image_inspect() {
     esac
   done
   case "$_fmt" in
+    *RepoDigests*)
+      if [ "${NERDCTL_INSPECT_RC:-0}" = 0 ] || [ -n "$_STUB_BUILT" ]; then
+        echo "${_tag%:*}@${STUB_REPO_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+      else
+        return 1
+      fi ;;
     *RootFS.Layers*)
       if [ "$_tag" = "${IMAGE_TAG:-}" ]; then echo '["sha256:b"]'
       else echo '["sha256:b","sha256:w"]'; fi ;;

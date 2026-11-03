@@ -6286,8 +6286,30 @@ _leerie_should_generate_dockerfile() {
   return 1
 }
 
+# _leerie_checkout_id — 12 hex characters of the sha256 of $USER_REPO, the
+# checkout's path as `.owner` records it. Two checkouts whose
+# _leerie_repo_id collide (one origin's owner/repo tail, or one directory
+# basename) never share an image name.
+_leerie_checkout_id() {
+  python3 -I -c 'import hashlib, os, sys
+print(hashlib.sha256(os.fsencode(sys.argv[1])).hexdigest()[:12])' "$USER_REPO"
+}
+
+# _repo_image_digest <tag> — the digest of the image <tag> names
+# (`sha256:<hex>`, which `nerdctl run` takes), or nothing.
+_repo_image_digest() {
+  local _d
+  _d="$(nerdctl image inspect -f '{{index .RepoDigests 0}}' "$1" 2>/dev/null)" || return 0
+  _d="${_d##*@}"
+  case "$_d" in
+    sha256:*) printf '%s' "$_d" ;;
+  esac
+}
+
 # Returns the per-repo image tag when a .leerie/Dockerfile is present
-# (real or auto-generated); empty string otherwise.
+# (real or auto-generated); empty string otherwise. The name carries this
+# checkout's identity (_leerie_checkout_id): a repository image is only
+# ever its own checkout's (DESIGN §6½ *Per-repo container image*).
 resolve_repo_image_tag() {
   local dockerfile="$USER_REPO/.leerie/Dockerfile"
   if [ ! -f "$dockerfile" ]; then
@@ -6312,9 +6334,10 @@ resolve_repo_image_tag() {
     fi
     # Something to bake; a Dockerfile will be auto-generated (see below).
   fi
-  local repo_id
+  local repo_id checkout_id
   repo_id="$(_leerie_repo_id)"
-  echo "leerie-repo/${repo_id}:${LEERIE_VERSION}"
+  checkout_id="$(_leerie_checkout_id)"
+  echo "leerie-repo/${repo_id}-${checkout_id}:${LEERIE_VERSION}"
 }
 
 # Make the base image resolvable by BuildKit for the derived `FROM $BASE_IMAGE`.
@@ -6580,7 +6603,10 @@ build_repo_image() {
 }
 
 # Determine whether a per-repo image build is needed and run it.
+# REPO_IMAGE_REF is the digest of the image this checkout built, which the
+# container runs: a tag another checkout moved since is never run.
 REPO_IMAGE_TAG=""
+REPO_IMAGE_REF=""
 _leerie_config_toml="$USER_REPO/.leerie/config.toml"
 _leerie_dockerfile="$USER_REPO/.leerie/Dockerfile"
 
@@ -7421,8 +7447,10 @@ unset _leerie_config_toml _leerie_do_gen LEERIE_GENERATED_SENTINEL _BAKE_LANGUAG
 if [ -f "$_leerie_dockerfile" ]; then
   REPO_IMAGE_TAG="$(resolve_repo_image_tag)"
   if [ -n "$REPO_IMAGE_TAG" ]; then
-    # Hash file stores "<base_version>:<dockerfile_sha256>" so either
-    # the base version or Dockerfile content change triggers a rebuild.
+    # Hash file stores "<version>:<layout>:<base id>:<dockerfile sha256>
+    # <image digest>": any input changing triggers a rebuild, and an image
+    # is reused only when it is the one this checkout built — the digest
+    # its tag names now is the digest recorded when it was built.
     _hash_file="$LEERIE_STATE_HOST_DIR/.dockerfile-hash"
     # The digest of the bytes leerie's Dockerfile was made from, never of
     # the path (DESIGN §6 *Leerie never reads through a link a repository
@@ -7433,13 +7461,16 @@ if [ -f "$_leerie_dockerfile" ]; then
     # (_check_repo_image), so a rebuilt base rebuilds it.
     _base_id="$(nerdctl image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)"
     _cur_hash="${LEERIE_VERSION}:${REPO_IMAGE_LAYOUT}:${_base_id}:${_cur_df_sha}"
-    _stored_hash=""
-    [ -f "$_hash_file" ] && _stored_hash="$(cat "$_hash_file" 2>/dev/null || true)"
+    _stored=""
+    [ -f "$_hash_file" ] && _stored="$(head -n 1 "$_hash_file" 2>/dev/null || true)"
+    _stored_hash="${_stored% *}"
+    _stored_ref="${_stored##* }"
+    _cur_ref="$(_repo_image_digest "$REPO_IMAGE_TAG")"
 
     _need_build=false
-    if ! nerdctl image inspect "$REPO_IMAGE_TAG" >/dev/null 2>&1; then
+    if [ -z "$_cur_ref" ]; then
       _need_build=true
-    elif [ "$_cur_hash" != "$_stored_hash" ]; then
+    elif [ "$_cur_hash" != "$_stored_hash" ] || [ "$_cur_ref" != "$_stored_ref" ]; then
       _need_build=true
     fi
 
@@ -7449,11 +7480,14 @@ if [ -f "$_leerie_dockerfile" ]; then
       # copy it across first (idempotent) or the build 401s against the registry.
       ensure_base_in_buildkit_ns
       build_repo_image "$REPO_IMAGE_TAG"
-      printf '%s\n' "$_cur_hash" > "$_hash_file"
+      _cur_ref="$(_repo_image_digest "$REPO_IMAGE_TAG")"
+      [ -n "$_cur_ref" ] || _repo_build_fail "the repository image $REPO_IMAGE_TAG has no digest"
+      printf '%s %s\n' "$_cur_hash" "$_cur_ref" > "$_hash_file"
     else
       remote_log "per-repo image up-to-date ($REPO_IMAGE_TAG); skipping build"
     fi
-    unset _hash_file _cur_df_sha _cur_hash _stored_hash _need_build _base_id
+    REPO_IMAGE_REF="$_cur_ref"
+    unset _hash_file _cur_df_sha _cur_hash _stored _stored_hash _stored_ref _cur_ref _need_build _base_id
   fi
 fi
 _repo_build_done
@@ -10053,7 +10087,7 @@ else
     ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}
     ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"}
     -w /work
-    "${REPO_IMAGE_TAG:-$IMAGE_TAG}" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}
+    "${REPO_IMAGE_REF:-$IMAGE_TAG}" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}
     ${REWRITTEN_TAIL[@]+"${REWRITTEN_TAIL[@]}"}
   )
   if [ -n "$_run_log" ]; then

@@ -4,7 +4,7 @@ Focuses on three checkable conditions not fully covered by
 test_launcher_per_repo_image.py:
   (a) exact nerdctl argv on success: build, --build-arg BASE_IMAGE=<base>,
       -f <repo>/.leerie/Dockerfile, -t <repo-tag>, and <repo> as context.
-  (b) .dockerfile-hash written with <version>:<sha256> on success; NOT
+  (b) .dockerfile-hash written with <version>:<sha256> <digest> on success; NOT
       updated when nerdctl build fails.
   (c) Coupling: base-image build error guard (Fix 1) sentinel present in
       launcher (the live behaviour is covered by test_launcher_base_image_build_error.py).
@@ -19,7 +19,7 @@ import subprocess
 from pathlib import Path
 
 from tests.committed_tree import commit_tree
-from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
+from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB, REPO_DIGEST
 from tests.repo_image_block_extract import extract_block as _extract_block
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -69,6 +69,7 @@ nerdctl() {{
       return "${{NERDCTL_INSPECT_RC:-0}}"
       ;;
     build)
+      _stub_build_done
       return "${{NERDCTL_BUILD_RC:-0}}"
       ;;
     *)
@@ -273,11 +274,12 @@ def test_base_not_recopied_when_present_in_buildkit_namespace(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# (a) .dockerfile-hash written with <version>:<sha256> on success
+# (a) .dockerfile-hash written with <version>:<sha256> <digest> on success
 # ---------------------------------------------------------------------------
 
 def test_hash_file_written_on_success(tmp_path):
-    """After a successful build, .dockerfile-hash contains <version>:<sha256>."""
+    """After a successful build, .dockerfile-hash contains <version>:<sha256>
+    and the digest of the image built."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -305,8 +307,10 @@ def test_hash_file_written_on_success(tmp_path):
 
     stored = hash_file.read_text().strip()
     expected_sha = hashlib.sha256(df.read_bytes()).hexdigest()
-    # <version>:<layout>:<base image id>:<sha256> (the stub's base id).
-    expected = f"1.2.3:worker-root-1:sha256:base-id:{expected_sha}"
+    # <version>:<layout>:<base image id>:<sha256> (the stub's base id),
+    # then the digest of the image built.
+    expected = (f"1.2.3:worker-root-1:sha256:base-id:{expected_sha} "
+                f"{REPO_DIGEST}")
     assert stored == expected, f"stored={stored!r}, expected={expected!r}"
 
 

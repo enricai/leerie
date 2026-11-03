@@ -43,8 +43,8 @@ nerdctl() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     image)  _stub_image_inspect "$@" && return 0; return "${NERDCTL_INSPECT_RC:-0}" ;;
-    build)  return "${NERDCTL_BUILD_RC:-0}" ;;
-    run)    echo "nerdctl-run: image=${REPO_IMAGE_TAG:-$IMAGE_TAG}"; return 0 ;;
+    build)  _stub_build_done; return "${NERDCTL_BUILD_RC:-0}" ;;
+    run)    echo "nerdctl-run: image=${REPO_IMAGE_REF:-$IMAGE_TAG}"; return 0 ;;
     *)      return 0 ;;
   esac
 }
