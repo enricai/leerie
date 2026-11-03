@@ -85,6 +85,8 @@ case "$1" in
       "__SLEEP__" "$STUB_CREATED_SECONDS"
     fi
     printf 'running\n' > "$w/container.state"
+    # What the container prints, for a test of the launcher's relay.
+    [ -z "${STUB_RUN_PRINT:-}" ] || printf '%s\n' "$STUB_RUN_PRINT"
     "__SLEEP__" "${STUB_RUN_SECONDS:-0}" &
     printf '%s\n' "$!" > "$w/container.pid"
     [ -z "$cid" ] || printf 'stubcid\n' > "$cid"

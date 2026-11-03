@@ -2513,7 +2513,7 @@ worker gets the first block, then its kind's.
 
 | Grant | Path | Access | Who makes it |
 |---|---|---|---|
-| devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, `/dev/pts`, `/dev/shm` (POSIX semaphores: Python's multiprocessing locks and Chromium need it, measured); `/dev/pts` and `/dev/shm` are the process's own | write | — |
+| devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/shm` (POSIX semaphores: Python's multiprocessing locks and Chromium need it, measured): the only paths of `/dev` any grant names, and no terminal but `/dev/tty`, which names nothing once the shim has left its controlling terminal; `/dev/shm` is the process's own, and so is the `devpts` (`/dev/pts`, `/dev/ptmx`) the shim grants an isolated process (*No confined process holds or can open the operator's terminal*) | write | — |
 | its own `/tmp` | a fresh tmpfs per process tree, made by the shim, gone when it ends | write | the shim |
 | own temp dir | what `TMPDIR`, `TMP` and `TEMP` name: `/tmp/l/<id>/`, `<id>` derived from `<run-dir>/workers/<wid>/` (*A confined command's scratch is short and private*) | write | `_worker_dirs` |
 | own CLI config | what `CLAUDE_CONFIG_DIR` names: `<run-dir>/workers/<wid>/config/` (sessions live there, so `--resume` finds them) | write | `_worker_dirs` |
@@ -2521,7 +2521,7 @@ worker gets the first block, then its kind's.
 | leerie's own code, the CLI, the worker's home | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check), the `claude` its `PATH` finds, and `$HOME` (the git identity, a package manager's config) unless it holds `/tmp`: each named, so that one under `/tmp` on a host is still read | read | — |
 | its side's download caches | one set per side of the run, shared by that side's workers (every store variable, the pnpm store, `XDG_CACHE_HOME`): `<run-dir>/workers/cache-held-out/` for a held-out-side worker (`HELD_OUT_LOG_WORKERS`), `<run-dir>/workers/cache/` for every other; never both (`_worker_cache_dir`) | write | `_worker_cache_env` |
 | its tree's own stores | `<run-dir>/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); the worker's per-tree store variables then name it in place of its side's cache | write for a worker that writes its tree, else read | `_tree_store_env` |
-| outside the state root | everything but `/tmp` (above) | read | — |
+| outside the state root | everything but `/tmp` (above) and `/dev` (the devices above) | read | — |
 | the run's system prompts | `<run-dir>/sysprompt/` | read | — |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml`, which `MISE_OVERRIDE_CONFIG_FILENAMES` names to every process of a Go repository's run (§6½ step 3): without it a worker's `mise` cannot load its configuration | read | `_synth_mise_go_override` |
 
@@ -2780,6 +2780,117 @@ the launcher's host-only paths, the rebaser and a push with a hook from a
 hostile checkout, and asserts that no shim was started with its working
 directory inside the checkout or the tree. A static rule requires
 `--no-recurse-submodules` on every host fetch.
+
+**No text leerie did not write reaches the operator's terminal as a control
+sequence.** The operator's terminal is part of the host, and a terminal
+acts on what it is sent: OSC 52 sets the clipboard on many terminals, OSC 8
+disguises a link, CSI rewrites the screen, a bidirectional override
+reorders what is read. Leerie prints text a repository or a worker chose —
+a file name from the repository image (the `/home/leerie` extras message),
+a worker's JSON string (a JSON schema string admits `\u001b`: an
+acceptance `reason`, a classifier `question`), a path a worker declared —
+and printed it with its control characters intact, through `log()`,
+`die()`, the question UI and the launcher's relay of the container's
+output (review round 30 isolation T1). The rule is one function, applied
+where text leaves for the terminal: C0 controls but newline and tab, DEL
+and C1, U+061C, U+200E/U+200F, U+2028–U+202E, U+2066–U+2069 and a lone
+surrogate (a byte that was not UTF-8) are written as their escapes
+(`\x1b`, `\u202e`), which are printable, so the rule is idempotent.
+Inside the orchestrator it is `_terminal_text`: `log()` and `die()` apply
+it (the host seams that load the orchestrator call them without
+`main()`), `main()` makes `sys.stdout` and `sys.stderr` escaping streams
+before anything prints (the question UI, `list`, a traceback), and the run
+log's tee writes the escaped text to `orchestrator.log` too, which
+`attach` and an operator's `cat` show. The launcher relays what a
+container or a machine prints through `scripts/terminal-text.py`, the same
+rule (`_terminal_relay`): the piped run's relay and its `--log-file` copy,
+the Fly and EC2 log tails and attaches, and a failed Fly launch's stderr.
+The boundary is not a list of relays but every place the launcher or a
+host-side script it runs (`scripts/host-finalize.sh`, `scripts/remote/`)
+prints text a repository, a hook, a worker or a machine chose (review round
+31: the repository image's build output reached the terminal raw, and so did
+a pre-push hook's output and `leerie config`'s values). A stream of it goes
+through `_terminal_relay` on the producer's own exit status: the repository
+image's build, local (`nerdctl build`) and on Fly (`build-push.sh`),
+`leerie config`'s listing, the pre-push probe's and the push's hook output,
+`gh pr create`'s output, the rebaser's payload, and a machine's stderr in the
+seeding and fetch scripts. A value of it inside leerie's own message goes
+through `_terminal_safe`, the same rule: a `.leerie/config.toml` or
+`leerie.toml` value an error names, the PR base branch a repository's
+`leerie.toml` chose, the BLT commands named after a failed push, and a
+machine command's output. Review round 32 (execution X3, isolation P2)
+found the list form leaking again — a committed `seed_depth` named raw in
+its rejection, a stored `push_error` (a hook's output, kept in `run.json`)
+printed raw by `status` — so the rule is stated by source, not by site:
+every message the launcher or a host-side script prints that names a
+value read from `leerie.toml`, `.leerie/config.toml` or `run.json`, or a
+git command's names or text (a branch, an upstream, a commit's subject, a
+file name; not a count or an object id), passes it through
+`_terminal_safe`, and every table of stored values (`status`, `list`)
+writes each cell through the same rule. A static rule over the shell
+holds every such message to it.
+An interactive run (`-it`) hands the container a terminal, which no
+filter can sit in front of without taking the terminal from it; there
+the orchestrator's own streams are the boundary, and what else a container
+process writes to the terminal directly is leerie's own (the entry script,
+the broker).
+
+**No confined process holds or can open the operator's terminal.** In
+an interactive run the orchestrator's fds 0, 1 and 2 are the operator's
+pty, opened read-write, and a child inherits every descriptor it is not
+given in its place. Landlock checks opens, not inherited descriptors; a new
+`devpts` does not reach a descriptor already open; and a new session drops
+only the controlling terminal, not the fd. So a repository's `npm test`
+run with the orchestrator's fd 0 wrote OSC 52 straight to the operator's
+terminal, past every filter above, and could read what the operator typed
+(review round 32 isolation P1). The rule is enforced where every confined
+process passes, the Landlock shim, before it confines anything: a
+terminal on fd 0 becomes `/dev/null` (a confined command takes no input
+but a worker's prompt file); a terminal on any other descriptor is a
+spawner's defect, and the shim refuses to run (exit 126); and a
+controlling terminal is given up, so `/dev/tty`, which a worker's tools
+are granted, names nothing. Each spawner also passes no terminal: a
+confined command's stdin is `/dev/null` and its output a pipe. The
+processes leerie runs on the operator's terminal on purpose are
+unconfined and host-side (`leerie config --chat`), or leerie's own (the
+question UI).
+
+Holding none is not enough: a process can open one. Under `nerdctl run
+-it` runc binds the operator's pty at `/dev/console` (the same device as
+the orchestrator's fd 0), the container's `devpts` holds it as
+`/dev/pts/0`, and after the rootless drop it shows as owned by `leerie`.
+Every grant leerie derived read all of `/dev` (the reads outside the state
+root), and the isolation replaced `/dev/pts` but kept `/dev/console`, so
+any confined process could open it read-only — enough to read what the
+operator types and, with `tcsetattr`, to turn the terminal's echo and
+`ISIG` off, so Ctrl-C no longer stops the run (review round 33 isolation
+Q1). Masking one path would leave the class open (`/dev/tty0`,
+`/dev/ttyS*`, the outer `devpts`, whatever a runtime adds: a Fly machine's
+`/dev` is the VM's whole devtmpfs). So the rule is enforced in two
+independent layers, and a third checks it:
+
+1. **An isolated process's `/dev` is its own** (*Every confined process
+   has its own `/tmp`, `/dev/shm` and IPC*, step 3): a tmpfs holding only
+   the device nodes leerie grants, each bound from the container's (a
+   user namespace cannot `mknod`), the links every `/dev` has (`fd`,
+   `stdin`, `stdout`, `stderr`, and `ptmx` into the new `devpts`), its own
+   `/dev/shm` and a new `devpts` instance. No terminal of the container is
+   in it, whatever the grants say.
+2. **No grant names `/dev` but the devices** (the table above): the reads
+   outside the state root leave `/dev` out as they leave `/tmp` out, and
+   no grant names a pseudo-terminal; the shim grants an isolated process
+   its own `devpts`. This alone holds where there is no isolation, which
+   no run is (the confinement check every entry runs stops a run whose
+   runtime cannot isolate, *Fail closed*): Landlock refuses the console and
+   every pty of the container's `devpts`.
+3. **The shim checks**, once it is confined as the command will be, that
+   `/dev/console` does not open, and exits 126 if it does: one named path,
+   where the operator's terminal is under `-it`, never a scan for
+   terminals. Any other terminal is absent from an isolated `/dev` by
+   construction, and `/dev/tty` already names nothing (above).
+
+A process that needs a terminal makes its own: `script`, `expect` and
+node-pty open `/dev/ptmx` in the process's own `devpts`.
 
 **Residuals.** A committing worker can move any ref of its own tree
 repository, its tree's branch included; leerie takes only that branch, and
@@ -3293,7 +3404,7 @@ enforce, which a measurement reads as "could not measure", never a pass.
 | the verified stores | what `PIP_CACHE_DIR`, `POETRY_CACHE_DIR` and `YARN_GLOBAL_FOLDER` name (`_VERIFIED_STORE_VARS`): the manager refuses an edited entry on reuse | write (read only in a held-out run's grant, `_heldout_grants`: an evaluation installs nothing) |
 | the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
-| outside the state root | everything but `/tmp`, as a worker's | read |
+| outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
 | *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR`; `mise-state/` emptied first | write |
 | *store-fetch kind* (`_populate_leerie_store`, in its staging directory) | also leerie's store, its store variables left pointing there | write |
@@ -4057,8 +4168,12 @@ and runs anything (`--isolate`):
    `/tmp` as a cache root, failing 1 of funeralworks' 13,036 tests). After
    the pivot `/` is the caller's on both runtimes. This is the shape
    `bwrap` uses;
-3. a fresh `tmpfs` on `/tmp` and on `/dev/shm` (mode 1777, `nosuid`,
-   `nodev`), and a new `devpts` instance; a grant beneath `/tmp` (the
+3. a fresh `tmpfs` on `/tmp`, and a `/dev` of its own: a tmpfs holding
+   only the device nodes leerie grants, bound from the container's, the
+   standard links, a fresh `tmpfs` on `/dev/shm` (mode 1777, `nosuid`,
+   `nodev`) and a new `devpts` instance — never the container's `/dev`,
+   which holds the operator's terminal (*No confined process holds or can
+   open the operator's terminal*); a grant beneath `/tmp` (the
    command's private temp directory `/tmp/l/<id>/`, a host's state root)
    is carried into the new `/tmp` at its own path;
 4. every write grant bound onto itself, then every other mount remounted
@@ -4476,6 +4591,21 @@ mounts above; the container's policy decides both.
   through `colima ssh`): when it is missing or stale the launcher loads it
   itself when it has a terminal (and no `--no-runtime-install`), and
   otherwise stops naming the two commands.
+- *The profile only grows.* The profile is the host's, not a version's:
+  one file under `/etc/apparmor.d/` and one loaded policy, shared by every
+  leerie version on the host, and a reload applies at once to every
+  container already running under it. A container started by an older
+  version keeps its own shim after the operator upgrades and the new
+  launcher reloads the profile, so the profile allows the union of what
+  every version that can still be running needs. A rule is added when a
+  shim starts needing it and is not removed when a shim stops: a removal
+  is a change of its own, with a migration that first ensures no
+  container of a version that needed it can still be running. A rule a
+  broader one also matches is kept by name all the same (0.43.0's
+  `/dev/pts/ptmx -> /dev/ptmx` bind, which the `-> /**` bind rule also
+  matches), so the guard reads rules and does not evaluate policy: a test
+  pins the allow rules of the last release's profile, as a list written
+  out in the test.
 - *The launcher's detection gives the kernel's answer.* Whether the kernel
   runs AppArmor and whether the profile is loaded are read into a variable
   and tested with no pipe. They were pipelines into `grep -q`; under the

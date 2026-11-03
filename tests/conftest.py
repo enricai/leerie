@@ -22,6 +22,13 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# The launcher's logging and terminal-filter helpers (`remote_log`,
+# `_terminal_relay`, `_terminal_safe`), sourced by a harness that runs an
+# extracted launcher block: the block prints text a repository or a machine
+# chose through the real filter (DESIGN §6 *No text leerie did not write
+# reaches the operator's terminal as a control sequence*). A harness that
+# stubs `remote_log` defines its stub after this line.
+LOG_SH_SOURCE = f'. "{REPO_ROOT}/scripts/remote/_log.sh"\n'
 
 # No test reaches the user's real `~/.leerie` (or anything else under their
 # home). The launcher resolves its state dir to `$HOME/.leerie/<repo>` and

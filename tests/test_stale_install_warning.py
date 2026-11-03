@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 import pytest
-from tests.conftest import run_git_cwd_first_stdout
+from tests.conftest import LOG_SH_SOURCE, run_git_cwd_first_stdout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -44,9 +44,12 @@ def _extract_guard() -> str:
     return m.group(1)
 
 
+# The real `_log.sh` first (the guard names the upstream version through its
+# `_terminal_safe`), then this harness's own `remote_log`.
 _HARNESS = r"""#!/usr/bin/env bash
 set -euo pipefail
 
+""" + LOG_SH_SOURCE + r"""
 remote_log() { printf '[leerie] %s\n' "$*" >&2; }
 
 LEERIE_REPO="__REPO__"

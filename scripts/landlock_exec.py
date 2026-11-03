@@ -62,6 +62,13 @@ it starts with `CAP_SYS_CHROOT` (its only capability, in the shim's user
 namespace), so `worker-shell.py` can `chroot` each of its commands into the
 view.
 
+Before it confines anything the shim holds no descriptor of a terminal
+(`leave_terminal`; DESIGN §6 *No confined process holds or can open the
+operator's terminal*): a terminal on fd 0 becomes `/dev/null`, one on any
+other fd exits 126, and a controlling terminal is given up. Isolated, its
+`/dev` is its own and holds no terminal of the container (`private_dev`);
+confined, it exits 126 if it can still open `/dev/console`.
+
 Stdlib only and imported by nothing heavier: it starts every worker. The
 orchestrator imports `abi()` and `MIN_ABI` from here for its preflight, so
 the requirement has one spelling."""
@@ -76,6 +83,7 @@ import socket
 import stat
 import struct
 import sys
+import termios
 import time
 # `os.execvp` imports `warnings` on its first call (`os.get_exec_path`): in
 # a child that has just entered the worker view, that import would read the
@@ -597,10 +605,24 @@ _KEYCTL_JOIN_SESSION_KEYRING = 1
 _SIOCGIFFLAGS, _SIOCSIFFLAGS, _IFF_UP = 0x8913, 0x8914, 0x1
 
 TMP = "/tmp"
+DEV = "/dev"
 SHM = "/dev/shm"
 PTS = "/dev/pts"
 # The private mounts the shim makes and grants itself.
 PRIVATE = (TMP, SHM, PTS)
+# A confined process's `/dev` is its own and holds only these (DESIGN §6
+# *No confined process holds or can open the operator's terminal*): the
+# device nodes bound from the container's `/dev`, its own `devpts` and
+# `/dev/shm`, and the links every `/dev` has. No terminal of the container
+# is among them: not `/dev/console`, which `nerdctl run -it` binds to the
+# operator's pty (review round 33 isolation Q1), nor the container's
+# `devpts`, nor any other node a runtime adds (Fly's VM `/dev` is a whole
+# devtmpfs).
+DEV_NODES = ("null", "zero", "full", "random", "urandom", "tty")
+DEV_LINKS = (("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"),
+             ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2"),
+             ("ptmx", "pts/ptmx"))
+CONSOLE = "/dev/console"
 _OLDROOT = "/.oldroot"
 _OVERLAY_DIR = "/tmp/.leerie-overlay"
 # The most of a runner's report PID 1 copies out (a larger one is cut short
@@ -671,19 +693,46 @@ def enter_namespaces(*, sandbox: bool) -> None:
           libc.unshare(flags))
 
 
-def private_mounts() -> None:
-    """A fresh tmpfs on `/tmp` and on `/dev/shm`, and a new `devpts`
-    instance (`/dev/ptmx` follows it: a symlink in leerie's images, bound
-    over otherwise)."""
-    for tgt in (TMP, SHM):
-        _must(f"tmpfs {tgt}", _mount("tmpfs", tgt, "tmpfs",
-                                     MS_NOSUID | MS_NODEV, "mode=1777"))
+def private_mounts(old_dev: str) -> None:
+    """A fresh tmpfs on `/tmp`, and `/dev` made the process's own
+    (`private_dev`, from the old root's `old_dev`)."""
+    _must(f"tmpfs {TMP}", _mount("tmpfs", TMP, "tmpfs",
+                                 MS_NOSUID | MS_NODEV, "mode=1777"))
+    private_dev(old_dev)
+
+
+def private_dev(old_dev: str) -> None:
+    """A tmpfs on `/dev` holding only `DEV_NODES`, each bound from
+    `old_dev` (a node the container lacks is left out), the `DEV_LINKS`
+    (`/dev/ptmx` among them: it follows the new `devpts`), a fresh tmpfs on
+    `/dev/shm` and a new `devpts` instance on `/dev/pts`. Made in the user
+    namespace, so no node can be made (`mknod` needs the initial
+    namespace's `CAP_MKNOD`): a bound node is the container's own device."""
+    _must(f"tmpfs {DEV}", _mount("tmpfs", DEV, "tmpfs",
+                                 MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                                 "mode=0755"))
+    try:
+        for name in DEV_NODES:
+            src = f"{old_dev}/{name}"
+            try:
+                if not stat.S_ISCHR(os.stat(src).st_mode):
+                    continue
+            except FileNotFoundError:
+                continue
+            open(f"{DEV}/{name}", "w").close()
+            _must(f"bind {DEV}/{name}",
+                  _mount(src, f"{DEV}/{name}", None, MS_BIND))
+        for name, target in DEV_LINKS:
+            os.symlink(target, f"{DEV}/{name}")
+        os.mkdir(SHM)
+        os.mkdir(PTS)
+    except OSError as e:
+        raise IsolationError(f"make {DEV}: {e}", e.errno or 0) from None
+    _must(f"tmpfs {SHM}", _mount("tmpfs", SHM, "tmpfs",
+                                 MS_NOSUID | MS_NODEV, "mode=1777"))
     _must("devpts /dev/pts",
           _mount("devpts", PTS, "devpts", MS_NOSUID | MS_NOEXEC,
                  "newinstance,ptmxmode=0666,mode=620"))
-    if not os.path.islink("/dev/ptmx"):
-        _must("bind /dev/ptmx",
-              _mount("/dev/pts/ptmx", "/dev/ptmx", None, MS_BIND))
 
 
 def _skeleton(src: str, dst: str) -> None:
@@ -714,7 +763,7 @@ def pivot_to_owned_root(carry_ro: list[str], carry_rw: list[str], *,
     try:
         for name in sorted(os.listdir("/")):
             src, dst = "/" + name, new + "/" + name
-            if name == "tmp":
+            if name in ("tmp", "dev"):
                 os.mkdir(dst)
             elif os.path.islink(src):
                 os.symlink(os.readlink(src), dst)
@@ -736,7 +785,7 @@ def pivot_to_owned_root(carry_ro: list[str], carry_rw: list[str], *,
     _must("pivot_root", libc.syscall(nr, os.fsencode(new),
                                      os.fsencode(new + _OLDROOT)))
     os.chdir("/")
-    private_mounts()
+    private_mounts(_OLDROOT + DEV)
     kept: list[str] = []
     for paths, writable in ((carry_ro, False), (carry_rw, True)):
         for p in paths:
@@ -1457,6 +1506,20 @@ def _close_fds_except(keep: set[int]) -> None:
     os.closerange(lo, 1 << 20)
 
 
+def console_open() -> bool:
+    """True when this process can open `/dev/console` for reading. Under
+    `nerdctl run -it` it is the operator's pty, and a read-only descriptor
+    is enough to read what the operator types and to turn the terminal's
+    echo and signals off (review round 33 isolation Q1)."""
+    try:
+        fd = os.open(CONSOLE, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK
+                     | os.O_CLOEXEC)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
 def _confine_or_126(rw: list[str], ro: list[str]) -> int | None:
     try:
         install_seccomp()
@@ -1468,6 +1531,14 @@ def _confine_or_126(rw: list[str], ro: list[str]) -> int | None:
         print(f"leerie: cannot confine the worker, so it does not run: {e} "
               "(DESIGN §6 *A worker writes only where it is granted*)",
               file=sys.stderr)
+        return 126
+    # Confined as the command will be: an isolated process's `/dev` has no
+    # console, and no grant names one, so an open that succeeds is a broken
+    # invariant, refused rather than run.
+    if console_open():
+        print(f"leerie: the command does not run, because it could open "
+              f"{CONSOLE} (DESIGN §6 *No confined process holds or can "
+              "open the operator's terminal*)", file=sys.stderr)
         return 126
     return None
 
@@ -1536,6 +1607,57 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
     if word.startswith("E") and word[1:].isdigit():
         return int(word[1:])
     return 1
+
+
+def _fd_numbers() -> list[int]:
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError:
+        names = [str(fd) for fd in range(3)]
+    return sorted(int(n) for n in names if n.isdigit())
+
+
+def leave_terminal() -> str | None:
+    """Hold no descriptor of a terminal before anything is confined (DESIGN
+    §6 *No confined process holds or can open the operator's terminal*):
+    in an interactive run the orchestrator's fds 0-2 are the
+    operator's pty, open read-write, and Landlock checks opens, not the
+    descriptors a process inherits. A terminal on fd 0 is replaced by
+    `/dev/null` (a confined command reads no input); a terminal on any other
+    descriptor is a spawner's defect, refused. A controlling terminal is
+    left (`setsid`, or `TIOCNOTTY` when the shim leads its process group),
+    so `/dev/tty` names nothing. Returns why the shim must not run, or
+    None."""
+    if os.isatty(0):
+        null = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(null, 0)
+        os.close(null)
+    for fd in _fd_numbers():
+        if fd != 0 and os.isatty(fd):
+            return (f"its fd {fd} is a terminal; a confined process writes "
+                    "only to a pipe or a file")
+    try:
+        tty = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if os.getsid(0) == os.getpid():
+            # A session leader that has a terminal: giving it up would hang
+            # up the terminal's foreground group.
+            return "it leads a session that has a controlling terminal"
+        try:
+            os.setsid()
+        except OSError:
+            fcntl.ioctl(tty, termios.TIOCNOTTY)
+    except OSError as e:
+        return f"it cannot leave its controlling terminal: {e}"
+    finally:
+        os.close(tty)
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY))
+    except OSError:
+        return None
+    return "it cannot leave its controlling terminal"
 
 
 def _parse(argv: list[str]) -> dict | str:
@@ -1618,6 +1740,12 @@ def main(argv: list[str]) -> int:
     if isinstance(o, str):
         print(o, file=sys.stderr)
         return 2
+    why = leave_terminal()
+    if why is not None:
+        print(f"leerie: the command does not run, because {why} (DESIGN §6 "
+              "*No confined process holds or can open the operator's "
+              "terminal*)", file=sys.stderr)
+        return 126
     rw, ro, cmd = o["rw"], o["ro"], o["cmd"]
     wr = o["worker_root"]
     if o["sandbox"]:

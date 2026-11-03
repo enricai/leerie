@@ -200,11 +200,12 @@ def test_falsified_by_reverting_the_tee_wiring(tmp_path):
 
     reverted_invocation = _extract_invocation().replace(
         'if [ -n "$_log_tee_target" ]; then\n'
-        '      tail -n +1 -f "$_run_log" 2>/dev/null | tee -a "$_log_tee_target" &\n'
+        '      tail -n +1 -f "$_run_log" 2>/dev/null | _terminal_relay \\\n'
+        '        | tee -a "$_log_tee_target" &\n'
         "    else\n"
-        '      tail -n +1 -f "$_run_log" 2>/dev/null &\n'
+        '      tail -n +1 -f "$_run_log" 2>/dev/null | _terminal_relay &\n'
         "    fi",
-        '    tail -n +1 -f "$_run_log" 2>/dev/null &',
+        '    tail -n +1 -f "$_run_log" 2>/dev/null | _terminal_relay &',
     )
     assert "tee -a" not in reverted_invocation
 

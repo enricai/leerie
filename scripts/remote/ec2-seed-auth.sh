@@ -267,7 +267,7 @@ ec2_seed_auth() {
     return 1
   fi
 
-  remote_log "remote: git identity set (${git_name} <${git_email}>) (ec2)"
+  remote_log "remote: git identity set ($(_terminal_safe "${git_name}") <$(_terminal_safe "${git_email}")>) (ec2)"
 
   # Pre-warm the Claude CLI. The very first `claude --version` on a cold
   # instance takes tens of seconds (Node runtime warm-up, statsig network

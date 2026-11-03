@@ -541,3 +541,50 @@ class TestDualPurposeVerbFallback:
         result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0
         assert NON_GROUP_RUN not in result.stub_log
+
+
+# ---------------------------------------------------------------------------
+# Stored text reaches the terminal escaped (review round 32 isolation P2)
+# ---------------------------------------------------------------------------
+
+# What a repository's pre-push hook printed, kept as `push_error` in run.json
+# and shown later as a table cell: an OSC 52 clipboard write.
+HOSTILE = "hook said \x1b]52;c;cHduZWQ=\x07 no"
+
+
+class TestStoredTextIsEscaped:
+    """`status` and `list` print run.json values through leerie's terminal
+    rule (DESIGN §6 *No text leerie did not write reaches the operator's
+    terminal as a control sequence*)."""
+
+    def _fixture(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / ".leerie" / "myrepo"
+        for rid, extra in ((RUN_ID_A, {"group_id": GROUP_ID}),
+                           (RUN_ID_B, {"chain_id": CHAIN_ID_ONLY,
+                                       "wave_idx": 0})):
+            _write_run(state_dir, rid, {
+                "run_id": rid, "branch": f"leerie/runs/{rid}",
+                "finished_at": "2026-07-01T11:00:00Z",
+                "push_error": HOSTILE, "started_at": HOSTILE, **extra})
+
+    def _check(self, result: subprocess.CompletedProcess) -> None:
+        assert result.returncode == 0, result.stderr
+        out = result.stdout + result.stderr
+        assert "\x1b" not in out and "\x07" not in out
+        assert "\\x1b]52;c;cHduZWQ=\\x07" in result.stdout
+
+    def test_status_of_a_group(self, tmp_path: Path) -> None:
+        self._fixture(tmp_path)
+        self._check(_run(tmp_path, ["status", GROUP_ID]))
+
+    def test_status_of_a_chain(self, tmp_path: Path) -> None:
+        self._fixture(tmp_path)
+        self._check(_run(tmp_path, ["status", CHAIN_ID_ONLY]))
+
+    def test_list_groups(self, tmp_path: Path) -> None:
+        self._fixture(tmp_path)
+        self._check(_run(tmp_path, ["list", "--groups"]))
+
+    def test_list_chains(self, tmp_path: Path) -> None:
+        self._fixture(tmp_path)
+        self._check(_run(tmp_path, ["list", "chains"]))

@@ -109,7 +109,9 @@ if [ -f "$script" ] && grep -q '{marker}' "$script"; then
 JSON
   exit 0
 fi
-exec /usr/bin/env python3 "${{argv[@]}}"
+# Every other call (the terminal filter, `_terminal_relay`) is the real
+# interpreter, by absolute path: `env python3` found this stub again.
+exec /usr/bin/python3 "${{argv[@]}}"
 """)
     p.chmod(0o755)
 
@@ -261,7 +263,11 @@ def test_worktree_add_failure_skips_rebase_and_still_pushes(tmp_path):
     # A python3 stub that would fail the test if invoked at all — proves
     # the seam is never reached when worktree add fails.
     p = bin_dir / "python3"
-    p.write_text("#!/usr/bin/env bash\necho UNEXPECTED_PYTHON3_CALL >&2\nexit 1\n")
+    p.write_text("#!/usr/bin/env bash\n"
+                 # The terminal filter is not the seam: the real one.
+                 'case "${3:-}" in */terminal-text.py) '
+                 'exec /usr/bin/python3 "$@" ;; esac\n'
+                 "echo UNEXPECTED_PYTHON3_CALL >&2\nexit 1\n")
     p.chmod(0o755)
     # Shadow `git worktree add` to fail while leaving every other git
     # subcommand to the real binary. Matched by its words, not argv
@@ -303,7 +309,11 @@ def test_unresolvable_base_branch_skips_rebase_entirely(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     p = bin_dir / "python3"
-    p.write_text("#!/usr/bin/env bash\necho UNEXPECTED_PYTHON3_CALL >&2\nexit 1\n")
+    p.write_text("#!/usr/bin/env bash\n"
+                 # The terminal filter is not the seam: the real one.
+                 'case "${3:-}" in */terminal-text.py) '
+                 'exec /usr/bin/python3 "$@" ;; esac\n'
+                 "echo UNEXPECTED_PYTHON3_CALL >&2\nexit 1\n")
     p.chmod(0o755)
     run_dir = _make_run(tmp_path, repo, "test-run", run_json={
         "branch": "leerie/runs/test-run",

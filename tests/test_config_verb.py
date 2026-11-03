@@ -53,6 +53,7 @@ from pathlib import Path
 import pytest
 
 from tests.committed_tree import commit_tree
+from tests.conftest import LOG_SH_SOURCE
 from tests.config_arm_extract import extract_config_arm as _extract_config_arm
 
 # Directory of the running interpreter — put on PATH for the end-to-end
@@ -114,6 +115,7 @@ def _run_config(
     script = (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
+        + LOG_SH_SOURCE +
         'remote_log() { echo "[leerie] $*" >&2; }\n'
         'case "${1:-}" in\n'
         f"{block}\n"
@@ -625,6 +627,7 @@ def _run_real_config_arm(
     script = (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
+        + LOG_SH_SOURCE +
         'remote_log() { echo "[leerie] $*" >&2; }\n'
         "claude() {\n"
         "  printf '%s\\n' \"$*\" >> \"${CLAUDE_LOG:-/dev/null}\"\n"
@@ -818,6 +821,7 @@ def _run_real_config_arm_with_state(
     script = (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
+        + LOG_SH_SOURCE +
         'remote_log() { echo "[leerie] $*" >&2; }\n'
         "claude() {\n"
         "  printf '%s\\n' \"$*\" >> \"${CLAUDE_LOG:-/dev/null}\"\n"

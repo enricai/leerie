@@ -188,14 +188,14 @@ seed_auth() {
     fi
     if [ "$attempt" -eq 1 ] \
        && grep -qE "tunnel unavailable|context deadline exceeded|i/o timeout" "$err_log"; then
-      cat "$err_log" >&2
+      _terminal_relay < "$err_log" >&2
       remote_log "remote: tunnel unavailable; restarting flyctl agent and retrying once..."
       flyctl agent restart >/dev/null 2>&1 || true
       sleep 2
       rm -f "$err_log"
       continue
     fi
-    cat "$err_log" >&2
+    _terminal_relay < "$err_log" >&2
     rm -f "$err_log"
     break
   done
@@ -283,7 +283,7 @@ seed_auth() {
     return 1
   fi
 
-  remote_log "remote: git identity set (${git_name} <${git_email}>)"
+  remote_log "remote: git identity set ($(_terminal_safe "${git_name}") <$(_terminal_safe "${git_email}")>)"
 
   # Pre-warm the Claude CLI. The very first `claude --version` on a
   # cold Fly machine takes ~17 s (Node runtime warm-up, statsig

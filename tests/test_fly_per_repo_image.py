@@ -16,6 +16,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from tests.conftest import LOG_SH_SOURCE
 from tests.fly_stub import make_fake_flyctl
 from tests.repo_image_block_extract import extract_block as _extract_block
 from tests.repo_image_block_extract import fly_repo_hash, repo_build_functions
@@ -72,6 +73,7 @@ LEERIE_REPO="${LEERIE_REPO:-/tmp/leerie-repo}"
 LOCAL_BUILD="${LOCAL_BUILD:-false}"
 
 """
+_HARNESS_PREFIX = LOG_SH_SOURCE + _HARNESS_PREFIX
 
 # Fly image functions block (extracted verbatim from launcher)
 _FLY_MARKER_START = "# --- remote: resolve Fly.io image tag ---"

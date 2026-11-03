@@ -436,7 +436,7 @@ BASH_EOF
         | flyctl ssh console --app "$app" --machine "$machine" \
             --pty=false -C "bash -s" 2>&1)"; then
     remote_log "collect-subtrees: SSH to machine $machine failed"
-    remote_log "  output: $result"
+    remote_log "  output: $(_terminal_safe "$result")"
     return 1
   fi
 
@@ -447,7 +447,7 @@ BASH_EOF
               | tail -1 || true)"
   if [ -z "$sentinel" ]; then
     remote_log "collect-subtrees: no sentinel in remote output:"
-    remote_log "  $result"
+    remote_log "  $(_terminal_safe "$result")"
     return 1
   fi
 

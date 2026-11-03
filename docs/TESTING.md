@@ -957,6 +957,114 @@ pass `--setting-sources user`, `--disable-slash-commands`,
 `--settings` env, and put `--` before the first message. All 6 fail with
 the wiring removed.
 
+`tests/test_terminal_text.py` (13 test functions, 15 cases; DESIGN §6 *No
+text leerie did not
+write reaches the operator's terminal as a control sequence*; review round
+30 isolation T1), with an OSC 52 sequence, a CSI, a C1 CSI, a bidi
+override, U+2028, BEL and CR: `_terminal_text` escapes each, keeps newline
+and tab, and is idempotent; `scripts/terminal-text.py` is the same rule
+over U+0000–U+2FFF and surrogates, and relays bytes fed one at a time (a
+split UTF-8 character, a byte that is not UTF-8); `log()` and `die()`; a
+worker's JSON string printed through `main()`'s guarded `sys.stdout`; the
+run log's tee, both copies; a repository-image file name through
+`_require_worker_view`'s `die`; the real launcher, piped, relaying a stub
+container's output; and the launcher's, `lib.sh`'s and `ec2-ssm.sh`'s
+relays naming `_terminal_relay`. All 9 fail without the change; the
+launcher test fails with only the relay taken out of the piped branch.
+Review round 31 (T2, execution F1, F2, F4) added 4 functions, 6 cases, each
+with a producer of shell builtins printing the sequences: `build_repo_image`
+with a `nerdctl` that prints on stdout and stderr and exits 0 or 1 (both
+streams escaped; the build's own status still decides), `_fly_push` with a
+`build-push.sh` doing the same (the digest taken on 0, nothing on 1), the
+real launcher's `leerie config` over a `.leerie/config.toml` and a
+`leerie.toml` holding them, and `host_prepush_preflight` with a real
+pre-push hook printing them. `tests/test_host_finalize_sh.py` (2 more, 38
+functions, 40 cases) drives `host_finalize`: a failed push's hook output
+and a repository's `pr_base_branch` holding U+202E, and an unusable
+rebaser payload, reach stderr escaped. Falsified against the code before
+the fix: all 8 cases fail. Harnesses that run an extracted launcher block
+now source the real `scripts/remote/_log.sh` (`tests/conftest.py`'s
+`LOG_SH_SOURCE`, before their own `remote_log` stub: `test_build_repo_image`,
+`test_dockerfile_autogen`, `test_dockerfile_bake_from_capture`,
+`test_ensure_image`, `test_fly_per_repo_image`,
+`test_launcher_per_repo_image`, `test_config_verb`, `test_capture_validation`;
+`tests/log_file_extract_helpers.py`'s `extract_terminal_relay` sources it
+too, since the relay finds `terminal-text.py` beside `_log.sh`); the
+`nerdctl` stub (`tests/repo_image_block_extract.py`) records a build in a
+file, since the build now runs in a pipeline; and the `python3` stubs that
+stand in for the rebaser seam (`tests/test_host_finalize_sh.py`,
+`tests/test_host_finalize_rebase.py`) hand the terminal filter to
+`/usr/bin/python3` by absolute path — one of them ended in `exec
+/usr/bin/env python3`, which found the stub again and looped once the
+filter called `python3`.
+
+Review round 32. `tests/test_confined_terminal.py` (11 test functions, 17
+cases; DESIGN §6 *No confined process holds or can open the operator's
+terminal*, isolation P1 and round 33's Q1) hands the real shim a real pty whose master holds
+a typed line, and a probe that writes OSC 52 to fd 0, reads fd 0 and opens
+`/dev/tty`: a pty on stdin becomes `/dev/null` and nothing reaches the
+master or is read from it (plain and `--isolate`); a pty on fd 1, fd 2 or
+another passed fd exits 126 without running the command (3 cases); a shim
+started inside a session whose controlling terminal is the pty (as
+`_ts_script_run` starts it) cannot open `/dev/tty` (plain and `--isolate`);
+a shim leading a session that has one exits 126; and `_run_streaming`,
+`run_proc` and `_ts_script_run`, with the shim taken out, give the command
+`/dev/null` while the test process's fd 0 is a pty. The `--isolate` cases
+skip on a host that cannot build a sandbox; run in the `leerie:0.43.0`
+image (the test file under a stub `pytest`), both pass, and with
+`leave_terminal()` taken out the stdin case reads the typed line from
+`/dev/pts/0`. Falsified on the host: with `leave_terminal()` taken out the
+6 plain shim cases fail; with the spawners' `stdin=DEVNULL` taken out the 3
+spawner cases fail; all 9 fail against the parent. Round 33 (Q1: under
+`nerdctl run -it` the operator's pty is `/dev/console`, which every grant
+read) added 4 functions, 6 cases: with the real shim, the real
+`_WORKER_DEVICES` and the real `_reads_outside`, the test's pty (by its
+`/dev/pts/<n>` name) and `/dev/console` do not open, and null, zero,
+random, urandom and full still work (plain and `--isolate`); no read grant
+`_reads_outside` makes resolves into `/dev`, and `_WORKER_DEVICES` is
+exactly the seven nodes; the confined shim exits 126 without running the
+command when its `CONSOLE` (pointed at the test's pty) opens under a grant
+of `/` and `/dev/pts`, and runs under leerie's grants; and an isolated
+process's `/dev`, under a grant of `/`, lists exactly the six nodes, the
+five links, `pts` and `shm`, its `pts` only `ptmx`, and a pty opens as
+`/dev/pts/0`. `_shim_argv` now reads every top-level entry but `/dev` and
+`/tmp`, as leerie's grants do. On the host (no user namespaces) 4 fail
+against the parent: the plain pty case (the typed line read, its echo
+turned off), the console check (the command ran), `/dev` in the reads, and
+the AppArmor rule. In the `leerie:0.43.0` image under `nerdctl run -it` and
+the rootless drop all 17 run, and against the parent 5 fail: those three
+of `test_confined_terminal.py`, plus the isolated pty case (`/dev/console`
+opened and its echo turned off) and the isolated `/dev` (it lists
+`console`, `core` and `mqueue`). In `tests/test_launcher_secopt.py` (13
+functions, 13 cases)
+`test_profile_allows_exactly_the_shims_mounts` pins the private `/dev`'s
+tmpfs rule, and `test_profile_keeps_every_rule_a_released_shim_needs` pins
+0.43.0's allow rules (DESIGN §6 *The profile only grows*): the private
+`/dev` no longer binds `/dev/pts/ptmx` over `/dev/ptmx`, but a 0.43.0
+container still running when the profile is reloaded does, so that rule
+stays; with it deleted the test fails.
+`tests/test_terminal_safe_messages.py` (4 functions, 4 cases; execution
+X3) is the static rule by source: every message in the launcher,
+`scripts/host-finalize.sh` and `scripts/remote/*.sh` that expands
+a variable read from `leerie.toml`, `.leerie/config.toml`, `run.json` or a
+git command printing names or text does so inside `_terminal_safe` or on a
+`_terminal_relay` line; every script sourcing `_log.sh` is scanned; and the
+rule finds 4 raw synthetic shapes (in place, through a path variable,
+through a reading function, propagated from git text) and passes 4 safe
+ones (escaped, relayed, a count and an object id, never printed). It found
+88 raw messages on the parent; with either seed-knob message unwrapped it
+fails. `tests/test_launcher_seed_depth_resolution.py`'s
+`test_a_committed_value_reaches_the_terminal_escaped` (1 function, 2
+cases; the file has 12 functions, 18 cases) runs the
+launcher's seed-knob block over a committed OSC 52 value; both fail
+against the parent. `tests/test_group_launcher_verbs.py`'s
+`TestStoredTextIsEscaped` (4 functions, 4 cases; the file has 31
+functions, 31 cases; isolation P2) puts a hook's OSC 52
+in `push_error` and `started_at` and runs the real launcher's `status
+<group-id>`, `status <chain-id>`, `list --groups` and `list chains`: no
+control byte reaches stdout or stderr, and the escaped form is in the
+table. All 4 fail with the cell filter taken out.
+
 `tests/test_state_root_apart.py` (10 tests; part 3 of the same section).
 `_require_state_root_apart` over a planted `/proc/self/mountinfo`: a state
 root bind-mounted from inside the checkout, one holding the checkout, and
@@ -3492,7 +3600,12 @@ catch (`test_warns_when_the_cached_ref_is_stale`, falsified live: removing the
 fetch fails 4 tests). Bounded at `timeout 5`, throttled to once per 24h via an
 mtime stamp in the state dir (same convention as `.dockerfile-hash`), and
 warn-only — a detached HEAD, no upstream, a non-git prefix, or an unreachable
-remote must all stay silent and never fail a run.
+remote must all stay silent and never fail a run. Its harness (the file
+has 18 functions, 18 cases) sources the
+real `scripts/remote/_log.sh` (`LOG_SH_SOURCE`) before its own `remote_log`:
+since review round 32 (execution X3) the guard names the upstream version
+through `_terminal_safe`, and without it the two warning tests failed on
+`_terminal_safe: command not found`.
 
 ## Plan checkpoints: snapshot aliasing
 
@@ -6474,7 +6587,11 @@ sample's probe never counts for the next.
   environment entry `main()` installs before anything spawns
   (`_git_hooks_off`; it round-trips and keeps the operator's own
   `GIT_CONFIG_*` entries), and only a worker's spawn takes it back out
-  (`_git_hooks_on` in `_invoke`). Real git with every hook installed: the
+  (`_git_hooks_on` in `_invoke`). The order is checked as the property, not
+  a position: the call precedes `_become_subreaper`, and nothing before it
+  in `main()` reaches a process-starting call through the module's
+  functions (the position pin broke when `_guard_terminal_streams()` went
+  first; with the call moved after `_become_subreaper` the test fails). Real git with every hook installed: the
   I2 bracket's put-back and every git form leerie uses fire none, and every
   script leerie runs turns hooks off itself (`leerie_git_hooks_off`), also
   when run outside the orchestrator.
@@ -7073,14 +7190,15 @@ sample's probe never counts for the next.
   every other call below 460 allowed, a foreign architecture killed, x32
   refused), aarch64's numbers, the real filter on the host, Node's worker
   threads under it, and no table being a refusal.
-- `tests/test_launcher_secopt.py` (12 tests; replaces
+- `tests/test_launcher_secopt.py` (13 tests; replaces
   `tests/test_rootless_seccomp.py`): the launcher's `SECOPT`/`APPARMOR_OPT`
   block executed with the runtime stubbed (seccomp unconfined on every
   runtime; the profile applied when loaded; a missing one stopping the
   launcher without a terminal or with `--no-runtime-install`), both
   expanded in the run argv, `scripts/runtime-install.sh`'s AppArmor
   helpers with the kernel stubbed, and the profile compiled
-  (`apparmor_parser -Q`) with its mount rules.
+  (`apparmor_parser -Q`) with its mount rules and every allow rule of the
+  released 0.43.0 profile.
 - `tests/test_runtime_probes_pipefail.py` (11 test functions, 39 cases;
   DESIGN §6 *The launcher's detection gives the kernel's answer*, review
   r22 H1): the REAL `runtime_has_apparmor`/`runtime_apparmor_current` (and

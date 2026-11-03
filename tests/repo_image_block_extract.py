@@ -29,7 +29,8 @@ def extract_block(text: str, start_marker: str, end_marker: str) -> str:
 # after the subcommand word is shifted off. The repository image's digest
 # (`{{index .RepoDigests 0}}`) is `$STUB_REPO_DIGEST` (default
 # `REPO_DIGEST`), present when `$NERDCTL_INSPECT_RC` is 0 or once the
-# harness's `build` branch has called `_stub_build_done`.
+# harness's `build` branch has called `_stub_build_done` (in this harness
+# shell, whose pid names the record).
 REPO_DIGEST = "sha256:" + "a" * 64
 # The digest of an empty build context (`_repo_context_sha` over nothing):
 # a Dockerfile that reads nothing from the committed tree (DESIGN §6 *A
@@ -44,8 +45,13 @@ def fly_repo_hash(dockerfile: bytes, context_sha: str = EMPTY_CONTEXT_SHA
     df = hashlib.sha256(dockerfile).hexdigest()
     return hashlib.sha256(f"{df}:{context_sha}".encode()).hexdigest()[:12]
 NERDCTL_IMAGE_INSPECT_STUB = r'''
-_STUB_BUILT=""
-_stub_build_done() { _STUB_BUILT=1; }
+# The build is recorded in a file, as an image store would hold it: the
+# launcher runs `nerdctl build` in a pipeline (its output through the
+# terminal filter), so a shell variable the stub set there is gone.
+_STUB_BUILT="${TMPDIR:-/tmp}/.leerie-stub-image-built.$$"
+/usr/bin/rm -f "$_STUB_BUILT"
+trap '/usr/bin/rm -f "$_STUB_BUILT"' EXIT
+_stub_build_done() { : > "$_STUB_BUILT"; }
 _stub_image_inspect() {
   local _fmt="" _tag=""
   while [ $# -gt 0 ]; do
@@ -57,7 +63,7 @@ _stub_image_inspect() {
   done
   case "$_fmt" in
     *RepoDigests*)
-      if [ "${NERDCTL_INSPECT_RC:-0}" = 0 ] || [ -n "$_STUB_BUILT" ]; then
+      if [ "${NERDCTL_INSPECT_RC:-0}" = 0 ] || [ -e "$_STUB_BUILT" ]; then
         echo "${_tag%:*}@${STUB_REPO_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
       else
         return 1

@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path
 
 from tests.committed_tree import commit_tree
+from tests.conftest import LOG_SH_SOURCE
 from tests.dockerfile_autogen_extract import extract_autogen_block as _extract_autogen_block
 from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
 
@@ -63,6 +64,7 @@ USER_REPO="${USER_REPO:-/tmp/test-user-repo}"
 IMAGE_TAG="${IMAGE_TAG:-leerie:${LEERIE_VERSION}}"
 LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-/tmp/leerie-state-test}"
 """
+_HARNESS_PREFIX = LOG_SH_SOURCE + _HARNESS_PREFIX
 
 
 def _make_config_toml(

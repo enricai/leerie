@@ -19,6 +19,7 @@ import subprocess
 from pathlib import Path
 
 from tests.committed_tree import commit_tree
+from tests.conftest import LOG_SH_SOURCE
 from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
                                             NERDCTL_IMAGE_INSPECT_STUB,
                                             REPO_DIGEST)
@@ -47,7 +48,7 @@ def _harness_prefix(tmp_path: Path) -> str:
 set -euo pipefail
 
 NERDCTL_LOG="{nerdctl_log}"
-
+{LOG_SH_SOURCE}
 remote_log() {{ echo "[leerie] $*" >&2; }}
 
 # argv-recording nerdctl stub.  `return` (not `exit`) so set -e does not

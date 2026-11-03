@@ -165,12 +165,12 @@ print(best[2])
 print(best[3])
 "')" || {
     remote_log "fetch_state_ec2: failed to discover completed run on instance $instance_id"
-    echo "  Output: $discover_output" >&2
+    echo "  Output: $(_terminal_safe "$discover_output")" >&2
     return 1
   }
 
   if grep -q "^ERROR:" < <(printf '%s\n' "$discover_output"); then
-    remote_log "fetch_state_ec2: $discover_output"
+    remote_log "fetch_state_ec2: $(_terminal_safe "$discover_output")"
     return 1
   fi
 
@@ -185,7 +185,7 @@ print(best[3])
 
   if [ -z "$run_id" ] || [ -z "$run_branch" ]; then
     remote_log "fetch_state_ec2: could not parse run-id or branch from instance output"
-    echo "  Output was: $discover_output" >&2
+    echo "  Output was: $(_terminal_safe "$discover_output")" >&2
     return 1
   fi
 

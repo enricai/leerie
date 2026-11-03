@@ -87,7 +87,12 @@ def _run_host_finalize(tmp_path: Path, run_dir: Path,
     # visible in gh.log); only the delay is removed.
     _make_stub_bin(tmp_path, "sleep", "exit 0")
     if python3_body is not None:
-        _make_stub_bin(tmp_path, "python3", python3_body)
+        # The stub stands in for the rebaser seam only: the terminal filter
+        # (`_terminal_relay`, `python3 -I -S <scripts>/terminal-text.py`) is
+        # the real interpreter, by absolute path.
+        _make_stub_bin(tmp_path, "python3",
+                       'case "${3:-}" in */terminal-text.py) '
+                       'exec /usr/bin/python3 "$@" ;; esac\n' + python3_body)
     user_repo = run_dir.parent.parent.parent  # .leerie/runs/<id>/.. → .leerie → repo
     # Run under `set -euo pipefail` to match production faithfully:
     # host-finalize.sh is always sourced INTO the launcher, which sets
@@ -1213,3 +1218,52 @@ def test_gh_pr_create_is_draft_only_when_unconverged(tmp_path, outcome,
     gh_log = (tmp_path / "gh.log").read_text()
     assert ("--draft" in gh_log) is draft, gh_log
     assert ("opening draft PR against main" in r.stderr) is draft, r.stderr
+
+
+# --- review round 31: a hook's and a worker's text reaches the terminal as
+# text (DESIGN §6 *No text leerie did not write reaches the operator's
+# terminal as a control sequence*) -----------------------------------------
+
+_OSC52 = "\x1b]52;c;cHduZWQ=\x07"
+
+
+def test_a_failed_pushs_hook_output_reaches_the_terminal_as_text(tmp_path):
+    run_dir = _make_run(tmp_path, "feat-esc-aaaaaa", run_json={
+        "branch": "leerie/runs/feat-esc-aaaaaa",
+        "working_branch": "main",
+        "pr_base_branch": "ma‮in",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    git_body = '''
+if [ "$5" = "push" ] || [ "$3" = "push" ] || [ "$1" = "push" ]; then
+  printf 'hook says %s\\n' "$H" >&2
+  exit 1
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body,
+                           extra_env={"H": _OSC52})
+    assert r.returncode == 1, r.stderr
+    assert "hook says \\x1b]52;c;" in r.stderr, r.stderr
+    assert "PR base branch: ma\\u202ein" in r.stderr, r.stderr
+    assert "\x1b" not in r.stderr and "‮" not in r.stderr
+
+
+def test_an_unusable_rebaser_payload_reaches_the_terminal_as_text(tmp_path):
+    run_dir = _make_run(tmp_path, "rebase-esc-aaaaaa", run_json={
+        "branch": "leerie/runs/rebase-esc-aaaaaa",
+        "working_branch": "main",
+        "pr_base_branch": "main",
+        "finished_at": "2026-08-07T00:00:00+00:00",
+    })
+    r = _run_host_finalize(
+        tmp_path, run_dir,
+        python3_body='for _out; do :; done; '
+                     'printf "worker %s" "$H" > "$_out"; exit 0',
+        extra_env={"H": _OSC52,
+                   "LEERIE_REPO": str(tmp_path / "not-a-real-leerie-checkout"),
+                   "LEERIE_STATE_HOST_DIR": str(tmp_path / "state")})
+    assert r.returncode == 0, r.stderr
+    assert "rebaser raw payload" in r.stderr
+    assert "worker \\x1b]52;c;" in r.stderr, r.stderr
+    assert "\x1b" not in r.stderr

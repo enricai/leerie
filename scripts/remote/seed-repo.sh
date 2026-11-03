@@ -180,7 +180,7 @@ _seed_shallow_parent() {
   trap "rm -rf '$_tmp_shallow'" RETURN
   if ! git clone --quiet --depth="$LEERIE_SEED_DEPTH" --no-local \
          --branch "$_branch" "file://$USER_REPO" "$_tmp_shallow/repo" 2>/dev/null; then
-    remote_log "seed_repo: shallow clone (depth=$LEERIE_SEED_DEPTH) of $_branch failed"
+    remote_log "seed_repo: shallow clone (depth=$LEERIE_SEED_DEPTH) of $(_terminal_safe "$_branch") failed"
     return 1
   fi
 
@@ -268,13 +268,13 @@ seed_repo_clone() {
       # machine-side `sh -c '…'` wrapper. Fall back to the full-bundle path
       # (which never interpolates the branch name) rather than risk a broken
       # or injected remote command.
-      remote_log "seed_repo: branch '$_branch' has non-shell-safe characters; using full bundle instead of shallow"
+      remote_log "seed_repo: branch '$(_terminal_safe "$_branch")' has non-shell-safe characters; using full bundle instead of shallow"
     else
       _shallow=true
     fi
   fi
   if [ "$_shallow" = "true" ]; then
-    remote_log "remote: seeding — shallow-cloning $USER_REPO ($_branch, .git > ${LEERIE_SEED_SHALLOW_THRESHOLD_MB}MB, depth=$LEERIE_SEED_DEPTH) + submodules to /work ..."
+    remote_log "remote: seeding — shallow-cloning $USER_REPO ($(_terminal_safe "$_branch"), .git > ${LEERIE_SEED_SHALLOW_THRESHOLD_MB}MB, depth=$LEERIE_SEED_DEPTH) + submodules to /work ..."
   else
     remote_log "remote: seeding — bundling $USER_REPO (parent + submodules) to /work ..."
   fi

@@ -34,6 +34,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import LOG_SH_SOURCE
 from tests.fly_stub import make_fake_flyctl
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -70,6 +71,7 @@ def _harness() -> str:
     return (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
+        + LOG_SH_SOURCE +
         # remote_log matches the real _log.sh format closely enough for
         # these tests' substring assertions ("[leerie] ..." on stderr).
         'remote_log() { echo "[leerie] $*" >&2; }\n'

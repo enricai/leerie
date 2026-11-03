@@ -1682,6 +1682,11 @@ PY
         exit 0
         ;;
       "")
+        # Through the relay: the values are the repository's own text
+        # (.leerie/config.toml, leerie.toml), and reach the terminal as text
+        # (DESIGN §6 *No text leerie did not write reaches the operator's
+        # terminal as a control sequence*).
+        {
         echo "Effective leerie config for: $_user_repo"
         echo ""
         for axis in build lint test; do
@@ -1730,6 +1735,7 @@ PY
               printf '  %s\n' "$line"
             done
         fi
+        } | _terminal_relay
         exit 0
         ;;
       *)
@@ -2337,9 +2343,17 @@ PY
     # Fly coordinator machine to query; the chain identity lives only
     # in each run's run.json (set by chain's wave loop post-finalize).
     if [ "$_list_chains_only" = "1" ]; then
-      python3 -I - "$LEERIE_STATE_HOST_DIR" <<'PY'
+      LEERIE_TERMINAL_TEXT="$LEERIE_REPO/scripts/terminal-text.py" python3 -I - "$LEERIE_STATE_HOST_DIR" <<'PY'
 import json, os, sys
 from pathlib import Path
+import importlib.util
+# Every cell through leerie's terminal rule (DESIGN §6 *No text leerie
+# did not write reaches the operator's terminal as a control sequence*):
+# a run.json value can be a hook's output (`push_error`).
+_tt = importlib.util.spec_from_file_location("terminal_text", os.environ["LEERIE_TERMINAL_TEXT"])
+_ttm = importlib.util.module_from_spec(_tt)
+_tt.loader.exec_module(_ttm)
+text = _ttm.text
 
 state_dir = Path(sys.argv[1])
 runs_dir = state_dir / "runs"
@@ -2391,6 +2405,7 @@ for cid, info in chains.items():
     rows.append((cid, status, f"{n_pushed}/{n_runs}", str(n_waves), started))
 
 headers = ("chain_id", "status", "pushed", "waves", "started_at")
+rows = [tuple(text(str(c)) for c in r) for r in rows]
 widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
 fmt = "  ".join(f"{{:<{w}}}" for w in widths)
 print(fmt.format(*headers))
@@ -2404,9 +2419,17 @@ PY
     # list --groups: iterate all $HOME/.leerie/*/runs/*/run.json across
     # every per-repo state dir, group by group_id, render one row per group.
     if [ "$_list_groups_only" = "1" ]; then
-      python3 -I - "$HOME/.leerie" <<'PY'
+      LEERIE_TERMINAL_TEXT="$LEERIE_REPO/scripts/terminal-text.py" python3 -I - "$HOME/.leerie" <<'PY'
 import json, os, sys
 from pathlib import Path
+import importlib.util
+# Every cell through leerie's terminal rule (DESIGN §6 *No text leerie
+# did not write reaches the operator's terminal as a control sequence*):
+# a run.json value can be a hook's output (`push_error`).
+_tt = importlib.util.spec_from_file_location("terminal_text", os.environ["LEERIE_TERMINAL_TEXT"])
+_ttm = importlib.util.module_from_spec(_tt)
+_tt.loader.exec_module(_ttm)
+text = _ttm.text
 
 leerie_home = Path(sys.argv[1])
 if not leerie_home.is_dir():
@@ -2461,6 +2484,7 @@ for gid, info in groups.items():
     rows.append((gid, status, f"{n_pushed}/{n_runs}", repos_str, started))
 
 headers = ("group_id", "status", "pushed", "repos", "started_at")
+rows = [tuple(text(str(c)) for c in r) for r in rows]
 widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
 fmt = "  ".join(f"{{:<{w}}}" for w in widths)
 print(fmt.format(*headers))
@@ -2482,13 +2506,21 @@ PY
         set -- "${_list_rest[@]}"
       elif ! _list_json="$(flyctl machines list --app "$FLY_APP" --json 2>&1)"; then
         echo "leerie: list --runtime fly: flyctl machines list failed:" >&2
-        echo "$_list_json" >&2
+        printf '%s\n' "$_list_json" | _terminal_relay >&2
         echo "  Falling back to local sidecars." >&2
         set -- "${_list_rest[@]}"
       else
-        LEERIE_LIST_FLY_JSON="$_list_json" python3 -I - "$USER_REPO" "$FLY_APP" "$LEERIE_STATE_HOST_DIR" <<'PY'
+        LEERIE_LIST_FLY_JSON="$_list_json" LEERIE_TERMINAL_TEXT="$LEERIE_REPO/scripts/terminal-text.py" python3 -I - "$USER_REPO" "$FLY_APP" "$LEERIE_STATE_HOST_DIR" <<'PY'
 import json, os, sys
 from pathlib import Path
+import importlib.util
+# Every cell through leerie's terminal rule (DESIGN §6 *No text leerie
+# did not write reaches the operator's terminal as a control sequence*):
+# a run.json value can be a hook's output (`push_error`).
+_tt = importlib.util.spec_from_file_location("terminal_text", os.environ["LEERIE_TERMINAL_TEXT"])
+_ttm = importlib.util.module_from_spec(_tt)
+_tt.loader.exec_module(_ttm)
+text = _ttm.text
 
 repo = Path(sys.argv[1])
 app = sys.argv[2]
@@ -2535,6 +2567,7 @@ for m in machines:
     rows.append((mid, state, region, created, run_id))
 
 headers = ("machine_id", "state", "region", "created_at", "run_id (local)")
+rows = [tuple(text(str(c)) for c in r) for r in rows]
 widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
 fmt = "  ".join(f"{{:<{w}}}" for w in widths)
 print(fmt.format(*headers))
@@ -2739,13 +2772,13 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       _ab_ec2_state="$(_describe_instance_state "$LEERIE_EC2_INSTANCE_ID")"
       case "$_ab_ec2_state" in
         terminated|shutting-down|"")
-          remote_log "accept-blocked: instance $LEERIE_EC2_INSTANCE_ID is terminated or missing — cannot modify state"
+          remote_log "accept-blocked: instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID") is terminated or missing — cannot modify state"
           exit 1
           ;;
       esac
       _ab_started_instance=false
       if [ "$_ab_ec2_state" != "running" ]; then
-        remote_log "accept-blocked: starting stopped instance $LEERIE_EC2_INSTANCE_ID..."
+        remote_log "accept-blocked: starting stopped instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID")..."
         # resume_instance() arms the run-launch teardown traps. Left armed,
         # this verb's exit would run decide_ec2_teardown as a clean run exit
         # (sync, then finalize or terminate) against the run being unblocked;
@@ -2753,7 +2786,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
         LEERIE_TEARDOWN_DONE=1
         export LEERIE_TEARDOWN_DONE
         if ! resume_instance "$LEERIE_EC2_INSTANCE_ID"; then
-          remote_log "accept-blocked: instance $LEERIE_EC2_INSTANCE_ID never became ready"
+          remote_log "accept-blocked: instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID") never became ready"
           exit 1
         fi
         trap - EXIT INT TERM
@@ -2776,11 +2809,11 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ab_sentinel" in
         ACCEPTED:*|NOOP:*)
-          remote_log "accept-blocked: $_ab_sentinel"
+          remote_log "accept-blocked: $(_terminal_safe "$_ab_sentinel")"
           ;;
         *)
           remote_log "accept-blocked: failed to modify state on instance"
-          [ -n "$_ab_out" ] && remote_log "  output: $_ab_out"
+          [ -n "$_ab_out" ] && remote_log "  output: $(_terminal_safe "$_ab_out")"
           _ab_teardown_ec2
           exit 1
           ;;
@@ -2885,11 +2918,11 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ab_sentinel" in
         ACCEPTED:*|NOOP:*)
-          remote_log "accept-blocked: $_ab_sentinel"
+          remote_log "accept-blocked: $(_terminal_safe "$_ab_sentinel")"
           ;;
         *)
           remote_log "accept-blocked: failed to modify state on machine"
-          [ -n "$_ab_out" ] && remote_log "  output: $_ab_out"
+          [ -n "$_ab_out" ] && remote_log "  output: $(_terminal_safe "$_ab_out")"
           _ab_teardown
           exit 1
           ;;
@@ -3057,13 +3090,13 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       _ai_ec2_state="$(_describe_instance_state "$LEERIE_EC2_INSTANCE_ID")"
       case "$_ai_ec2_state" in
         terminated|shutting-down|"")
-          remote_log "accept-integration: instance $LEERIE_EC2_INSTANCE_ID is terminated or missing — cannot modify state"
+          remote_log "accept-integration: instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID") is terminated or missing — cannot modify state"
           exit 1
           ;;
       esac
       _ai_started_instance=false
       if [ "$_ai_ec2_state" != "running" ]; then
-        remote_log "accept-integration: starting stopped instance $LEERIE_EC2_INSTANCE_ID..."
+        remote_log "accept-integration: starting stopped instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID")..."
         # resume_instance() arms the run-launch teardown traps. Left armed,
         # this verb's exit would run decide_ec2_teardown as a clean run exit
         # (sync, then finalize or terminate) against the run being unblocked;
@@ -3071,7 +3104,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
         LEERIE_TEARDOWN_DONE=1
         export LEERIE_TEARDOWN_DONE
         if ! resume_instance "$LEERIE_EC2_INSTANCE_ID"; then
-          remote_log "accept-integration: instance $LEERIE_EC2_INSTANCE_ID never became ready"
+          remote_log "accept-integration: instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID") never became ready"
           exit 1
         fi
         trap - EXIT INT TERM
@@ -3094,11 +3127,11 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ai_sentinel" in
         ACCEPTED:*|NOOP:*)
-          remote_log "accept-integration: $_ai_sentinel"
+          remote_log "accept-integration: $(_terminal_safe "$_ai_sentinel")"
           ;;
         *)
           remote_log "accept-integration: failed to modify state on instance"
-          [ -n "$_ai_out" ] && remote_log "  output: $_ai_out"
+          [ -n "$_ai_out" ] && remote_log "  output: $(_terminal_safe "$_ai_out")"
           _ai_teardown_ec2
           exit 1
           ;;
@@ -3175,11 +3208,11 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ai_sentinel" in
         ACCEPTED:*|NOOP:*)
-          remote_log "accept-integration: $_ai_sentinel"
+          remote_log "accept-integration: $(_terminal_safe "$_ai_sentinel")"
           ;;
         *)
           remote_log "accept-integration: failed to modify state on machine"
-          [ -n "$_ai_out" ] && remote_log "  output: $_ai_out"
+          [ -n "$_ai_out" ] && remote_log "  output: $(_terminal_safe "$_ai_out")"
           _ai_teardown
           exit 1
           ;;
@@ -3332,13 +3365,13 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       # --rm on the original nerdctl run auto-removes the container.
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/lib.sh"
-      remote_log "stop: stopping local container $LEERIE_RUN_ID..."
+      remote_log "stop: stopping local container $(_terminal_safe "$LEERIE_RUN_ID")..."
       nerdctl stop "$_stop_run_id" >/dev/null 2>&1 || true
       _ensure_run_json "$_stop_run_dir" || true
       update_run_json "$_stop_sidecar" \
         paused_at "$(iso_now)" \
         pause_reason "user-requested" || true
-      remote_log "stop: paused. Resume via: leerie resume $LEERIE_RUN_ID"
+      remote_log "stop: paused. Resume via: leerie resume $(_terminal_safe "$LEERIE_RUN_ID")"
       exit 0
     fi
     if [ "$_stop_runtime" = "ec2" ]; then
@@ -3362,21 +3395,21 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       LEERIE_EC2_INSTANCE_ID="$(_resolve_ec2_instance_id_from_run_dir "$_stop_run_dir")"
       export LEERIE_EC2_INSTANCE_ID
       if [ -z "$LEERIE_EC2_INSTANCE_ID" ]; then
-        remote_log "stop: no ec2_instance_id found for run $LEERIE_RUN_ID"
+        remote_log "stop: no ec2_instance_id found for run $(_terminal_safe "$LEERIE_RUN_ID")"
         exit 1
       fi
       _ensure_run_json "$_stop_run_dir" || true
-      remote_log "stop: pausing instance $LEERIE_EC2_INSTANCE_ID (run $LEERIE_RUN_ID)"
+      remote_log "stop: pausing instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID") (run $(_terminal_safe "$LEERIE_RUN_ID"))"
       stop_instance
       update_run_json "$_stop_sidecar" \
         paused_at "$(iso_now)" \
         pause_reason "user-requested" \
         ec2_instance_id "$LEERIE_EC2_INSTANCE_ID" || true
-      remote_log "stop: paused. Resume via: leerie resume $LEERIE_RUN_ID"
+      remote_log "stop: paused. Resume via: leerie resume $(_terminal_safe "$LEERIE_RUN_ID")"
       exit 0
     fi
     if [ "$_stop_runtime" != "fly" ]; then
-      remote_log "stop: run $LEERIE_RUN_ID is not a live Fly machine, local container, or EC2 instance"
+      remote_log "stop: run $(_terminal_safe "$LEERIE_RUN_ID") is not a live Fly machine, local container, or EC2 instance"
       echo "  If the container already exited, there is nothing to stop." >&2
       echo "  Check 'leerie list' for active runs." >&2
       exit 1
@@ -3394,13 +3427,13 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     LEERIE_MACHINE_ID="$_stop_run_id"
     export LEERIE_MACHINE_ID
     _ensure_run_json "$_stop_run_dir" || true
-    remote_log "stop: pausing machine $LEERIE_MACHINE_ID (run $LEERIE_RUN_ID)"
+    remote_log "stop: pausing machine $LEERIE_MACHINE_ID (run $(_terminal_safe "$LEERIE_RUN_ID"))"
     stop_machine
     update_run_json "$_stop_sidecar" \
       paused_at "$(iso_now)" \
       pause_reason "user-requested" \
       fly_machine_id "$LEERIE_MACHINE_ID" || true
-    remote_log "stop: paused. Resume via: leerie resume $LEERIE_RUN_ID"
+    remote_log "stop: paused. Resume via: leerie resume $(_terminal_safe "$LEERIE_RUN_ID")"
     exit 0
     ;;
   kill)
@@ -3558,14 +3591,14 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       fi
       if [ "$_kill_force" != "1" ]; then
         printf "This will terminate EC2 instance %s (run %s). Type the run-id to confirm: " \
-          "$_kill_ec2_instance_id" "$_kill_run_id" >&2
+          "$(_terminal_safe "$_kill_ec2_instance_id")" "$_kill_run_id" >&2
         read -r _kill_confirm
         if [ "$_kill_confirm" != "$_kill_run_id" ]; then
           remote_log "kill: confirmation mismatch; aborted."
           exit 1
         fi
       fi
-      remote_log "kill: resolving AWS credentials for instance $_kill_ec2_instance_id"
+      remote_log "kill: resolving AWS credentials for instance $(_terminal_safe "$_kill_ec2_instance_id")"
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
       # shellcheck disable=SC1091
@@ -3603,16 +3636,16 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       # duplicating its "source ec2-fetch-branch.sh if present, fail
       # closed if absent" logic. Must run — and succeed — BEFORE
       # terminate_instance below.
-      remote_log "kill: syncing run branch + state from instance $_kill_ec2_instance_id before terminating"
+      remote_log "kill: syncing run branch + state from instance $(_terminal_safe "$_kill_ec2_instance_id") before terminating"
       if _try_fetch_state_for_ec2_teardown; then
         remote_log "kill: run branch + state synced to host"
       else
         remote_log "kill: sync from instance to host FAILED — instance LEFT RUNNING so work is not lost"
         echo "  Recover manually, then re-run: leerie kill $_kill_run_id --force" >&2
-        echo "  Instance: $_kill_ec2_instance_id (still running on EC2)" >&2
+        echo "  Instance: $(_terminal_safe "$_kill_ec2_instance_id") (still running on EC2)" >&2
         exit 1
       fi
-      remote_log "kill: terminating instance $_kill_ec2_instance_id"
+      remote_log "kill: terminating instance $(_terminal_safe "$_kill_ec2_instance_id")"
       terminate_instance
       if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
         _ensure_run_json "$_kill_run_dir" || true
@@ -3681,7 +3714,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       LEERIE_VOLUME_ID="$(_resolve_volume_id_from_fly \
         "$_kill_machine_id" "$FLY_APP")"
       if [ -n "$LEERIE_VOLUME_ID" ]; then
-        remote_log "kill: resolved volume $LEERIE_VOLUME_ID from Fly (no sidecar)"
+        remote_log "kill: resolved volume $(_terminal_safe "$LEERIE_VOLUME_ID") from Fly (no sidecar)"
       fi
     fi
     export LEERIE_VOLUME_ID
@@ -3984,7 +4017,7 @@ except Exception:
            ! git -C "$USER_REPO" rev-parse --verify \
                "refs/heads/$_fin_local_branch" >/dev/null 2>&1; }; then
         remote_log "finalize: local run $_fin_run_id has no run branch in $USER_REPO"
-        remote_log "  Expected branch: ${_fin_local_branch:-<none recorded in run.json>}"
+        remote_log "  Expected branch: $(_terminal_safe "${_fin_local_branch:-<none recorded in run.json>}")"
         remote_log "  Nothing to push. The per-subtask work (if any) is on the"
         remote_log "  leerie/subtasks/$_fin_run_id/* branches of $_fin_run_dir/repo."
         exit 1
@@ -4061,7 +4094,7 @@ except Exception:
 ' || true)"
       _fin_ec2_woke="false"
       if [ "$_fin_ec2_state" = "stopped" ] || [ "$_fin_ec2_state" = "stopping" ]; then
-        remote_log "finalize: instance $_fin_ec2_iid is $_fin_ec2_state; waking it to stream the run back"
+        remote_log "finalize: instance $(_terminal_safe "$_fin_ec2_iid") is $(_terminal_safe "$_fin_ec2_state"); waking it to stream the run back"
         # resume_instance() re-arms the teardown traps (`decide_ec2_teardown
         # exit` on EXIT, `decide_ec2_teardown` on INT TERM) for the normal
         # launch path. In finalize that trap could TERMINATE
@@ -4071,7 +4104,7 @@ except Exception:
         LEERIE_TEARDOWN_DONE=1
         export LEERIE_TEARDOWN_DONE
         if ! resume_instance "$_fin_ec2_iid"; then
-          remote_log "finalize: could not wake instance $_fin_ec2_iid; nothing streamed back"
+          remote_log "finalize: could not wake instance $(_terminal_safe "$_fin_ec2_iid"); nothing streamed back"
           exit 1
         fi
         trap - EXIT INT TERM
@@ -4080,20 +4113,20 @@ except Exception:
         LEERIE_EC2_SSH_TARGET="$_fin_ec2_target"
         export LEERIE_EC2_SSH_TARGET
       fi
-      remote_log "finalize: instance=$_fin_ec2_iid run=$_fin_run_id action=fetch"
+      remote_log "finalize: instance=$(_terminal_safe "$_fin_ec2_iid") run=$_fin_run_id action=fetch"
       if ! fetch_state_ec2; then
         # One-way ratchet (DESIGN §6): a failed fetch must not push a partial
         # branch, and must not leave the instance in a state the operator did
         # not ask for. Re-stop it if we woke it, then fail.
         if [ "$_fin_ec2_woke" = "true" ]; then
-          remote_log "finalize: re-stopping instance $_fin_ec2_iid after failed fetch"
+          remote_log "finalize: re-stopping instance $(_terminal_safe "$_fin_ec2_iid") after failed fetch"
           stop_instance || true
         fi
         remote_log "error: fetch_state_ec2 failed; nothing pushed"
         exit 1
       fi
       if [ "$_fin_ec2_woke" = "true" ]; then
-        remote_log "finalize: re-stopping instance $_fin_ec2_iid (finalize woke it)"
+        remote_log "finalize: re-stopping instance $(_terminal_safe "$_fin_ec2_iid") (finalize woke it)"
         stop_instance || remote_log "warning: could not re-stop instance $_fin_ec2_iid"
       fi
       _fetched_run_id="$_fin_run_id"
@@ -4208,9 +4241,17 @@ except Exception:
     if grep -qiE "$UUID_PATTERN" < <(printf '%s\n' "$_st_id"); then
       # Try chain_id first (runs in current state dir).
       _st_chain_rc=0
-      python3 -I - "$LEERIE_STATE_HOST_DIR" "$_st_id" <<'PY' || _st_chain_rc=$?
-import json, sys
+      LEERIE_TERMINAL_TEXT="$LEERIE_REPO/scripts/terminal-text.py" python3 -I - "$LEERIE_STATE_HOST_DIR" "$_st_id" <<'PY' || _st_chain_rc=$?
+import json, os, sys
 from pathlib import Path
+import importlib.util
+# Every cell through leerie's terminal rule (DESIGN §6 *No text leerie
+# did not write reaches the operator's terminal as a control sequence*):
+# a run.json value can be a hook's output (`push_error`).
+_tt = importlib.util.spec_from_file_location("terminal_text", os.environ["LEERIE_TERMINAL_TEXT"])
+_ttm = importlib.util.module_from_spec(_tt)
+_tt.loader.exec_module(_ttm)
+text = _ttm.text
 
 state_dir = Path(sys.argv[1])
 chain_id = sys.argv[2]
@@ -4255,6 +4296,7 @@ rows.sort(key=lambda r: (str(r[0]), r[1]))
 print(f"chain {chain_id}: {len(rows)} run(s)")
 print()
 headers = ("wave", "run_id", "status", "branch", "notes")
+rows = [tuple(text(str(c)) for c in r) for r in rows]
 widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
 fmt = "  ".join(f"{{:<{w}}}" for w in widths)
 print(fmt.format(*headers))
@@ -4269,9 +4311,17 @@ PY
         exit "$_st_chain_rc"
       fi
       # chain_id not found (exit 2); try group_id across all state dirs.
-      python3 -I - "$HOME/.leerie" "$_st_id" <<'PY'
-import json, sys
+      LEERIE_TERMINAL_TEXT="$LEERIE_REPO/scripts/terminal-text.py" python3 -I - "$HOME/.leerie" "$_st_id" <<'PY'
+import json, os, sys
 from pathlib import Path
+import importlib.util
+# Every cell through leerie's terminal rule (DESIGN §6 *No text leerie
+# did not write reaches the operator's terminal as a control sequence*):
+# a run.json value can be a hook's output (`push_error`).
+_tt = importlib.util.spec_from_file_location("terminal_text", os.environ["LEERIE_TERMINAL_TEXT"])
+_ttm = importlib.util.module_from_spec(_tt)
+_tt.loader.exec_module(_ttm)
+text = _ttm.text
 
 leerie_home = Path(sys.argv[1])
 group_id = sys.argv[2]
@@ -4319,6 +4369,7 @@ rows.sort(key=lambda r: r[0])
 print(f"group {group_id}: {len(rows)} member(s)")
 print()
 headers = ("run_id", "status", "branch", "notes")
+rows = [tuple(text(str(c)) for c in r) for r in rows]
 widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
 fmt = "  ".join(f"{{:<{w}}}" for w in widths)
 print(fmt.format(*headers))
@@ -4655,7 +4706,7 @@ except Exception:
       if _wave_already_done "$_ch_id" "$_wave_idx" "$_n"; then
         remote_log "wave $_wave_idx: already complete ($_n runs pushed); skipping fan-out"
       else
-        remote_log "wave $_wave_idx: launching $_n job(s) from base $_ch_current_base"
+        remote_log "wave $_wave_idx: launching $_n job(s) from base $(_terminal_safe "$_ch_current_base")"
 
         # Ensure laptop HEAD = current_base so seed-repo.sh ships the
         # right starting state to each worker.
@@ -5532,7 +5583,7 @@ if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
   _fly_sidecar="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json"
   if [ -f "$_fly_sidecar" ]; then
     remote_log "warning: resuming a Fly run with --runtime local — host-side state.json may be incomplete"
-    echo "  Consider: leerie resume $LEERIE_RUN_ID --runtime fly" >&2
+    echo "  Consider: leerie resume $(_terminal_safe "$LEERIE_RUN_ID") --runtime fly" >&2
   fi
 fi
 
@@ -5688,13 +5739,13 @@ unset _cli_seed_depth _cli_seed_threshold _prev_seed_arg
 # integer. Reject garbage at startup rather than letting seed-repo.sh mishandle it.
 case "$LEERIE_SEED_DEPTH" in
   ''|*[!0-9]*)
-    remote_log "LEERIE_SEED_DEPTH='$LEERIE_SEED_DEPTH' is not a non-negative integer (0 = full history)"
+    remote_log "LEERIE_SEED_DEPTH='$(_terminal_safe "$LEERIE_SEED_DEPTH")' is not a non-negative integer (0 = full history)"
     exit 1
     ;;
 esac
 case "$LEERIE_SEED_SHALLOW_THRESHOLD_MB" in
   ''|*[!0-9]*|0)
-    remote_log "LEERIE_SEED_SHALLOW_THRESHOLD_MB='$LEERIE_SEED_SHALLOW_THRESHOLD_MB' is not a positive integer (MB)"
+    remote_log "LEERIE_SEED_SHALLOW_THRESHOLD_MB='$(_terminal_safe "$LEERIE_SEED_SHALLOW_THRESHOLD_MB")' is not a positive integer (MB)"
     exit 1
     ;;
 esac
@@ -5956,7 +6007,7 @@ _warn_if_leerie_stale() {
              '@{upstream}:.claude-plugin/plugin.json' 2>/dev/null \
            | awk -F'"' '/"version"/ && !f {print $4; f = 1}')"
   remote_log "warning: the installed leerie is $_behind commit(s) behind" \
-             "origin (v$LEERIE_VERSION -> v${_up_v:-unknown})."
+             "origin (v$LEERIE_VERSION -> v$(_terminal_safe "${_up_v:-unknown}"))."
   echo "  Runs use the INSTALLED copy at $LEERIE_REPO, not any other" >&2
   echo "  checkout you may be developing in." >&2
   echo "  Update with: git -C \"$LEERIE_REPO\" pull --ff-only" >&2
@@ -6053,7 +6104,7 @@ if [ "$NO_PUSH" = "false" ] && [ -f "$USER_REPO/leerie.toml" ]; then
       # through would be the worse failure mode (a typo'd opt-out
       # silently becomes "push", which surprises the user). Both
       # layers should agree on what's a valid boolean.
-      echo "leerie: error: $USER_REPO/leerie.toml: no_push='$_toml_no_push' is not a boolean" >&2
+      echo "leerie: error: $USER_REPO/leerie.toml: no_push='$(_terminal_safe "$_toml_no_push")' is not a boolean" >&2
       echo "  (expected one of: 1, 0, true, false, yes, no, on, off — case-insensitive)" >&2
       exit 1 ;;
   esac
@@ -7148,6 +7199,11 @@ build_repo_image() {
   [ -n "$_nonce" ] || _repo_build_fail "the repository image's Dockerfile was not prepared"
   _repo_build_prepare
   remote_log "building per-repo container image ($repo_image_tag)..."
+  # The build prints what the repository's Dockerfile steps print, so it
+  # reaches the terminal through the relay (DESIGN §6 *No text leerie did not
+  # write reaches the operator's terminal as a control sequence*); the
+  # build's own status decides.
+  local _st=(0 0)
   nerdctl build \
     --build-arg BASE_IMAGE="$IMAGE_TAG" \
     --build-arg HOST_UID="$(id -u)" \
@@ -7155,8 +7211,8 @@ build_repo_image() {
     --target "leerie-final-$_nonce" \
     -t "$repo_image_tag" \
     -f "$_REPO_BUILD_DIR/Dockerfile" \
-    "$_REPO_BUILD_CTX" \
-    || _repo_build_fail "per-repo container image build failed"
+    "$_REPO_BUILD_CTX" 2>&1 | _terminal_relay >&2 || _st=("${PIPESTATUS[@]}")
+  [ "${_st[0]}" -eq 0 ] || _repo_build_fail "per-repo container image build failed"
   _check_repo_image "$repo_image_tag" || _repo_build_fail "the repository image is not leerie's layout"
 }
 
@@ -7351,7 +7407,7 @@ if [ "$_leerie_do_gen" = "true" ]; then
   # stays conditional on `$_sp` specifically so a repo with zero system
   # packages gets a Dockerfile with no dangling/empty apt RUN.
   if _leerie_should_generate_dockerfile "$USER_REPO" "$_sp"; then
-    remote_log "auto-generating .leerie/Dockerfile (setup_packages=${_sp:-<none>})"
+    remote_log "auto-generating .leerie/Dockerfile (setup_packages=$(_terminal_safe "${_sp:-<none>}"))"
     mkdir -p "$USER_REPO/.leerie"
     # Write to a temp file then move atomically so a half-written file is
     # never visible to the hash check below.
@@ -7372,7 +7428,7 @@ if [ "$_leerie_do_gen" = "true" ]; then
       for _pkg in ${_sp_list[@]+"${_sp_list[@]}"}; do
         if ! [[ "$_pkg" =~ $_deb_re ]]; then
           rm -f "$_gen_df_tmp"
-          remote_log "error: .leerie/config.toml's setup_packages holds '$_pkg', which is not a Debian package name; fix or remove it"
+          remote_log "error: .leerie/config.toml's setup_packages holds '$(_terminal_safe "$_pkg")', which is not a Debian package name; fix or remove it"
           exit 1
         fi
       done
@@ -8044,7 +8100,7 @@ if [ -f "$_leerie_dockerfile" ]; then
       [ -n "$_cur_ref" ] || _repo_build_fail "the repository image $REPO_IMAGE_TAG has no digest"
       printf '%s %s\n' "$_cur_hash" "$_cur_ref" > "$_hash_file"
     else
-      remote_log "per-repo image up-to-date ($REPO_IMAGE_TAG); skipping build"
+      remote_log "per-repo image up-to-date ($(_terminal_safe "$REPO_IMAGE_TAG")); skipping build"
     fi
     REPO_IMAGE_REF="$_cur_ref"
     unset _hash_file _cur_df_sha _cur_hash _stored _stored_hash _stored_ref _cur_ref _need_build _base_id
@@ -9214,7 +9270,14 @@ _fly_push() {
   shift 3
   _FLY_PUSHED=""
   mkdir -p "$cache_dir" && digest_file="$(mktemp "$cache_dir/.digest.XXXXXX")" || return 1
-  if ! "$build_push" "$@" --tag "$tag" --digest-file "$digest_file"; then
+  # build-push.sh prints the build's output, a repository image's Dockerfile
+  # steps included: through the relay (DESIGN §6 *No text leerie did not
+  # write reaches the operator's terminal as a control sequence*), on the
+  # script's own status.
+  local _st=(0 0)
+  "$build_push" "$@" --tag "$tag" --digest-file "$digest_file" 2>&1 \
+    | _terminal_relay >&2 || _st=("${PIPESTATUS[@]}")
+  if [ "${_st[0]}" -ne 0 ]; then
     rm -f "$digest_file"
     return 1
   fi
@@ -9471,7 +9534,7 @@ except Exception:
 ' "${_active_records[0]}" 2>/dev/null || true)"
           export LEERIE_RUN_ID
           if [ -n "$LEERIE_RUN_ID" ]; then
-            remote_log "resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
+            remote_log "resume: auto-discovered run-id $(_terminal_safe "$LEERIE_RUN_ID") from active launcher record"
           fi
           ;;
         *)
@@ -9523,7 +9586,7 @@ except Exception:
       # resume against a run-id whose machine is not found. The
       # run_id IS the machine ID, so resume_machine would have found it
       # if it existed. Fail loudly.
-      remote_log "resume: machine $LEERIE_RUN_ID not found or not resumable"
+      remote_log "resume: machine $(_terminal_safe "$LEERIE_RUN_ID") not found or not resumable"
       echo "  Run 'leerie list' to see known runs, or omit resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
@@ -9884,7 +9947,7 @@ PY
         # smart-resume pivot (rc=75 → attach) fires correctly.
         if [ "$_launch_rc" != "0" ]; then
           _launch_rc="$(_extract_flyctl_remote_rc "$_launch_stderr" "$_launch_rc")"
-          cat "$_launch_stderr" >&2
+          _terminal_relay < "$_launch_stderr" >&2
         fi
         rm -f "$_launch_stderr"
         if [ "$_launch_rc" = "75" ]; then
@@ -9937,6 +10000,7 @@ $_tail_script"
             | flyctl ssh console --app "$FLY_APP" \
                 --machine "$LEERIE_MACHINE_ID" --pty=false \
                 -C "sh -s" \
+            | _terminal_relay \
             || orch_rc=$?
 
           # On a clean tail exit (the orchestrator's pid disappeared), we
@@ -10093,7 +10157,7 @@ except Exception:
         container_rc=1
       fi
     elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
-      remote_log "resume: no EC2 instance sidecar found for run $LEERIE_RUN_ID"
+      remote_log "resume: no EC2 instance sidecar found for run $(_terminal_safe "$LEERIE_RUN_ID")"
       echo "  Run 'leerie list' to see known runs, or omit resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
@@ -10121,7 +10185,7 @@ except Exception:
           LEERIE_EC2_SSH_TARGET="$_ec2_ssh_target"
           export LEERIE_EC2_SSH_TARGET
         else
-          remote_log "error: could not resolve a public IP for instance $LEERIE_EC2_INSTANCE_ID"
+          remote_log "error: could not resolve a public IP for instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID")"
           container_rc=1
         fi
       fi
@@ -10185,13 +10249,13 @@ EARLY_PROBE_PY
           container_rc=1
           _ec2_seed_ok=false
         elif ! ec2_seed_repo; then
-          remote_log "error: repo seeding failed for instance $LEERIE_EC2_INSTANCE_ID"
+          remote_log "error: repo seeding failed for instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID")"
           container_rc=1
           _ec2_seed_ok=false
         fi
 
         if [ "$_ec2_seed_ok" = "true" ]; then
-          remote_log "remote: instance $LEERIE_EC2_INSTANCE_ID seeded — starting orchestrator (detached)"
+          remote_log "remote: instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID") seeded — starting orchestrator (detached)"
 
           _ec2_launch_argv_json="$(python3 -I -c '
 import json, sys
@@ -10273,7 +10337,7 @@ PY
             # lines up for the full rc-routing rationale.
             _attach_to_live_orchestrator_ec2
           elif [ "$_ec2_launch_rc" != "0" ]; then
-            remote_log "error: failed to start detached orchestrator on instance $LEERIE_EC2_INSTANCE_ID (rc=$_ec2_launch_rc)"
+            remote_log "error: failed to start detached orchestrator on instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID") (rc=$_ec2_launch_rc)"
             container_rc=1
           else
             remote_log "remote: tailing orchestrator log (Ctrl-C to detach — orchestrator keeps running)"
@@ -10281,7 +10345,8 @@ PY
             _ec2_tail_invocation="LEERIE_TAIL_RUN_ID='$LEERIE_RUN_ID'; export LEERIE_TAIL_RUN_ID
 $_ec2_tail_script"
             _ec2_orch_rc=0
-            printf '%s' "$_ec2_tail_invocation" | ec2_attach || _ec2_orch_rc=$?
+            printf '%s' "$_ec2_tail_invocation" | ec2_attach | _terminal_relay \
+              || _ec2_orch_rc=$?
             # On a clean tail exit we cannot read the orchestrator's true
             # exit code — it ran detached. `leerie finalize` (not this
             # launcher) does the fetch, same as the Fly branch.
@@ -10759,10 +10824,14 @@ else
     _tail_writer_pid=""
     nerdctl run "${_run_argv[@]}" >"$_run_log" 2>&1 <&0 &
     _run_pid=$!
+    # Through _terminal_relay: no control sequence the container printed
+    # reaches the terminal or the --log-file (DESIGN §6 *No text leerie did
+    # not write reaches the operator's terminal as a control sequence*).
     if [ -n "$_log_tee_target" ]; then
-      tail -n +1 -f "$_run_log" 2>/dev/null | tee -a "$_log_tee_target" &
+      tail -n +1 -f "$_run_log" 2>/dev/null | _terminal_relay \
+        | tee -a "$_log_tee_target" &
     else
-      tail -n +1 -f "$_run_log" 2>/dev/null &
+      tail -n +1 -f "$_run_log" 2>/dev/null | _terminal_relay &
     fi
     _tail_pid=$!
     _wait_run

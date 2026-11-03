@@ -259,6 +259,9 @@ remote_log() {{ echo "[leerie] $*" >&2; }}
 # The point of this test is the *wrapper around it*, not the tail
 # wrapper itself (covered by test_render_tail_wrapper.py).
 . {LIB_SH}
+# The relay the helper pipes through, from this checkout: LEERIE_REPO below
+# is a fake one, for the finalize exec it names.
+_terminal_relay() {{ python3 -I -S {LIB_SH.parent.parent / "terminal-text.py"}; }}
 
 # Invoke the helper. Args mirror the production signature.
 LEERIE_REPO='/tmp/fake-leerie-repo' \\

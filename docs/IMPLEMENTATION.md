@@ -978,6 +978,52 @@ VirtioFS is the mount type leerie documents (`colima start --runtime containerd 
 
 ### Logging, signal flow, and TTY adaptation
 
+**Terminal text** (DESIGN §6 *No text leerie did not write reaches the
+operator's terminal as a control sequence*). `_TERMINAL_CONTROL` (C0 but
+`\n`/`\t`, `\x7f`–`\x9f`, U+061C, U+200E, U+200F, U+2028–U+202E,
+U+2066–U+2069, U+D800–U+DFFF); `_terminal_text(s) -> str` writes each as
+`\xNN` (a `surrogateescape` byte as its byte) or `\uNNNN`.
+`_TerminalStream(orig)`: `write` passes `_terminal_text(s)` on and returns
+`len(s)`; attributes fall through. `_guard_terminal_streams()` wraps
+`sys.stdout` and `sys.stderr` once (not a `_TerminalStream` or `_TeeStream`
+already); `main()`'s first statement. `log()` and `die()` print
+`_terminal_text` of their whole line; `_TeeStream.write` escapes before it
+writes either copy. `scripts/terminal-text.py` (host `python3 -I -S`,
+stdlib): `text(s)` is the same rule (pinned equal over U+0000–U+2FFF and
+surrogates), `main()` relays fd 0 to fd 1 through an incremental UTF-8
+`surrogateescape` decoder. `scripts/remote/_log.sh`'s `_terminal_relay`
+runs it; the launcher's piped relay (`tail -f $_run_log | _terminal_relay
+[| tee -a <log-file>]`), the Fly tail and launch-stderr, the EC2 tail,
+`lib.sh`'s `tail_with_optional_autofinalize` (stdout, and stderr after its
+token capture) and `ec2-ssm.sh`'s attach pipe through it, and so do
+`build_repo_image`'s `nerdctl build` and `_fly_push`'s `build-push.sh`
+(stdout and stderr together, to stderr; `${PIPESTATUS[0]}`, the producer's
+status, decides), `leerie config`'s listing, and in
+`scripts/host-finalize.sh` (which sources `_log.sh` itself)
+`host_prepush_preflight`'s hook output, the push failure's output, `gh pr
+create`'s failure output and the rebaser seam's payload, and the seeding
+stderr in `seed-auth.sh`. `_terminal_safe <text>` (`_log.sh`) prints
+`<text>` through the same filter, for a value inside leerie's own message:
+the `setup_packages` and `no_push` values the launcher names, a fetch's or a
+collect's machine output (`fetch-branch.sh`, `ec2-fetch-branch.sh`,
+`collect-subtrees.sh`, `force-finalize.sh`, the `accept-blocked` and
+`accept-integration` output lines), and host-finalize's PR base branch,
+rebaser payload tail and passed BLT commands. The rule by source
+(`tests/test_terminal_safe_messages.py`): in the launcher,
+`scripts/host-finalize.sh` and `scripts/remote/*.sh`, a variable assigned
+from a command substitution that reads `leerie.toml`,
+`.leerie/config.toml` or `run.json` (directly, through a variable holding
+such a path, or through a function that reads one), or runs a git command
+that prints names or text, or from another such variable, is expanded in a
+message (`remote_log`, `_runtime_log`, `_runtime_err`,
+`_aws_die_with_hint`, `_repo_build_fail`, an `echo`/`printf` to stderr) only
+inside `$(_terminal_safe ...)` or on a line piped through `_terminal_relay`.
+The `status` and `list` tables (`status <chain-id|group-id>`, `list chains`,
+`list --groups`, `list --runtime fly`) load `scripts/terminal-text.py`'s
+`text()` by path (`LEERIE_TERMINAL_TEXT`) and write every cell through it
+before sizing the columns; a failed `flyctl machines list`'s output is
+relayed.
+
 **`log()` and `die()` never raise.** Both wrap their `print` in `contextlib.suppress(OSError, ValueError)`. This matters because on the remote runtime `sys.stdout` **is** `<run_dir>/orchestrator.log` (fd1 redirected there; `_install_run_log_tee` skips its guarded tee in that case), so `print(..., flush=True)` writes to the state filesystem and can raise `ENOSPC` when full. Every terminating arm in `main()` logs *before* assigning `exit_code`, so an unguarded write failure would turn a resumable pause (`ContextOverflow`, `TerminalAuthFailure`, `RateLimitedExit`, `KeyboardInterrupt`, `InterruptedBySignal`) into an exit-1 traceback. For `die()` the exit **code** is load-bearing — an unwritable stderr must not convert a deliberate coded exit into an unhandled `OSError`.
 
 `OSError`/`ValueError` only, never `BaseException`: a `KeyboardInterrupt` arriving mid-write must still propagate. `_save_state_best_effort` uses the same "not a real interrupt" tuple for the same reason, and `_TeeStream`'s log-copy guard carries the same two exceptions, covering its own `_orig.write`/`_orig.flush`. A failed write is deliberately lost silently rather than losing the whole run.
@@ -4310,7 +4356,21 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   raised on itself with core files off (`_die_of`). `abi()`
   (`landlock_create_ruleset(NULL, 0, VERSION)`, 0 when absent) and
   `MIN_ABI = 3`. Exits 126 ("cannot confine the worker") without running
-  CMD when the ABI is below that or any step fails. Every confined process
+  CMD when the ABI is below that or any step fails. Before any of it,
+  `main()` calls `leave_terminal() -> str | None` (DESIGN §6 *No confined
+  process holds or can open the operator's terminal*): a terminal on
+  fd 0 is `dup2`ed over by `/dev/null`; a terminal on any other open fd
+  (`/proc/self/fd`) returns a reason; a controlling terminal (`/dev/tty`
+  opens) is left by `setsid()`, or `TIOCNOTTY` when the shim leads its
+  process group, and a session leader that has one, or a `/dev/tty` that
+  still opens afterwards, returns a reason; a reason exits 126 without
+  running CMD. After it confines itself (`_confine_or_126`, every mode,
+  the sandbox's PID 1 included) the shim calls `console_open() -> bool`
+  (`os.open(CONSOLE, O_RDONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)`,
+  `CONSOLE = "/dev/console"`): True exits 126 ("could open /dev/console")
+  without running CMD. `run_proc`, `_run_streaming`, `_ts_script_run` and the
+  confinement check's probes spawn with `stdin=DEVNULL` and their output on
+  pipes; a worker's is its prompt file or `DEVNULL` (`_invoke`). Every confined process
   also installs the seccomp filter (`install_seccomp`) and, from ABI 6, the
   Landlock scopes; `--isolate` and `--sandbox` build its namespaces and
   mounts first (§ *Isolation and the held-out sandbox (I3)* below). The
@@ -4404,7 +4464,14 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   neither beneath nor above it. Either way the host directory
   (`_host_dir()`, the build slots) is then taken out by `_around`: a
   read-only descriptor can `flock` a slot (DESIGN §6 *A host-wide build
-  semaphore*). `_measurement_grants` ends the same way (`_apart`).
+  semaphore*). Either way every path whose realpath is `_DEV`
+  (`Path("/dev")`) or beneath it is then left out: no read grant covers
+  `/dev` (DESIGN §6 *No confined process holds or can open the operator's
+  terminal*). `_WORKER_DEVICES = ("/dev/null", "/dev/zero", "/dev/full",
+  "/dev/random", "/dev/urandom", "/dev/tty", "/dev/shm")`, written, are
+  the only paths of `/dev` a grant names; no pseudo-terminal (`/dev/ptmx`,
+  `/dev/pts`), which the shim grants with an isolated process's own
+  `devpts` (`PRIVATE`). `_measurement_grants` ends the same way (`_apart`).
 - `_confined_argv(grants, cmd, *, sandbox=None, report_fd=None, cli=False,
   worker_root=True)` — `[sys.executable, "-I", "-S", LANDLOCK_SCRIPT,
   <--isolate | --sandbox …>, --rw…, --ro…, "--", *cmd]` (§ *Isolation and
@@ -5053,19 +5120,30 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `/tmp` as the new root, holding, for each entry of the old root, a
   directory with the entry `rbind`-mounted (a directory), an empty file
   with it bound (a file), the same symlink (a symlink), or an empty
-  directory (`tmp`); `pivot_root(new, new/.oldroot)`; then
-  `private_mounts()`; then each grant beneath `/tmp` (not `/tmp` itself)
+  directory (`tmp` and `dev`: the container's `/dev` is never bound into
+  the new root); `pivot_root(new, new/.oldroot)`; then
+  `private_mounts("/.oldroot/dev")`; then each grant beneath `/tmp` (not `/tmp` itself)
   bound from `/.oldroot<path>` onto the same path in the new `/tmp` —
   except, in a sandbox, a write grant, which becomes an empty copy of its
   subdirectories (`_skeleton`: a held-out run gets a fresh private temp
   directory, `run/` included); then `/.oldroot` detached
   (`umount2(MNT_DETACH)`) and removed, and `chdir` back. Returns the
   carried write grants' mount points.
-- `private_mounts() -> None` — tmpfs on `/tmp` and on `/dev/shm`
+- `private_mounts(old_dev: str) -> None` — tmpfs on `/tmp` (`mode=1777`,
+  `nosuid,nodev`), then `private_dev(old_dev)`.
+- `private_dev(old_dev: str) -> None` — DESIGN §6 *No confined process
+  holds or can open the operator's terminal*. A tmpfs on `/dev` (`DEV`;
+  `mode=0755`, `nosuid,nodev,noexec`); for each of `DEV_NODES = ("null",
+  "zero", "full", "random", "urandom", "tty")` that is a character device
+  in `old_dev`, an empty file bound over from it (`MS_BIND`; a user
+  namespace cannot `mknod`); the `DEV_LINKS` symlinks `fd ->
+  /proc/self/fd`, `stdin`/`stdout`/`stderr -> /proc/self/fd/0..2`, `ptmx
+  -> pts/ptmx`; directories `shm` and `pts`; tmpfs on `/dev/shm`
   (`mode=1777`, `nosuid,nodev`); `devpts` on `/dev/pts`
-  (`newinstance,ptmxmode=0666,mode=620`, `nosuid,noexec`), and
-  `/dev/pts/ptmx` bound on `/dev/ptmx` when that is not already a
-  symlink (it is one in leerie's images).
+  (`newinstance,ptmxmode=0666,mode=620`, `nosuid,noexec`). A failure is
+  step `make /dev: …`, `tmpfs /dev`, `bind /dev/<name>`, `tmpfs /dev/shm`
+  or `devpts /dev/pts`. `readonly_mounts` makes `/dev` and each bound node
+  read-only (a node on a read-only mount still writes).
 - `bind_grants(rw: list[str]) -> list[str]` (`--isolate`) — each `rw`
   path that exists and is not beneath `/tmp` or `/dev` (`_bindable`),
   bound onto itself (`MS_BIND | MS_REC`);
@@ -5432,7 +5510,7 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   unconfined use, `_test_db_session`'s cluster, `_create_test_db`'s
   unconfined `prisma db push` and `_drop_test_db`. `_reads_outside(root,
   tmp=False)` keeps leaving the container's `/tmp` out of every grant
-  (the shim grants the private one). `_WORKER_DEVICES` keeps `/dev/shm`
+  (the shim grants the private one), and `/dev` (round 33). `_WORKER_DEVICES` keeps `/dev/shm`
   (the shim maps it to the private one).
 - `_confined_writes_notice` names `/tmp` as the worker's private scratch,
   gone when its session ends, and no longer says `/tmp` is not writable —
@@ -5600,11 +5678,20 @@ a database it lacks. The set's validation runs keep `require=False`.
   `userns,`, `mqueue,`, `io_uring,`, `pivot_root,`, `remount /,`,
   `remount /**,`, `mount options=(rw, rprivate) -> /,`, `mount
   fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /tmp/,` and `->
-  /dev/shm/,`, `mount fstype=devpts options=(rw, nosuid, noexec) devpts
-  -> /dev/pts/,`, `mount options=(rw, bind) /dev/pts/ptmx -> /dev/ptmx,`,
+  /dev/shm/,`, `mount fstype=tmpfs options=(rw, nosuid, nodev, noexec)
+  tmpfs -> /dev/,` (`private_dev`; its nodes are bound by the bind rule
+  below), `mount fstype=devpts options=(rw, nosuid, noexec) devpts
+  -> /dev/pts/,`, `mount options=(rw, bind) /dev/pts/ptmx -> /dev/ptmx,`
+  (0.43.0's shim; this one makes no such mount),
   `mount fstype=overlay overlay -> /leerie-state/**,`, `mount options=(rw,
   bind) -> /**,` and `mount options=(rw, rbind) -> /**,` (the staged root
-  under `/tmp`, the carried grants, the grants bound onto themselves).
+  under `/tmp`, the carried grants, the grants bound onto themselves). The
+  profile keeps every allow rule of a released profile (DESIGN §6 *The
+  profile only grows*): `tests/test_launcher_secopt.py`'s
+  `RELEASED_0_43_0_RULES` lists 0.43.0's allow rules verbatim, and
+  `test_profile_keeps_every_rule_a_released_shim_needs` asserts each is a
+  line of the profile. A release that adds a rule extends the list; none
+  removes from it but a change carrying its own migration.
 - `container-entry.sh` and the image: no change but the removed `ENV`.
 - Tests: `tests/test_landlock_isolation.py` (every channel of the
   measured design's §1.2 closed, in a real sandbox; skipped where

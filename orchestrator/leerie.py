@@ -4980,8 +4980,61 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# DESIGN §6 *No text leerie did not write reaches the operator's terminal
+# as a control sequence*: C0 but newline and tab, DEL and C1, the
+# bidirectional and line/paragraph separators a terminal acts on, and a
+# lone surrogate (a byte that was not UTF-8, kept by `surrogateescape`).
+# `scripts/terminal-text.py` holds the same rule for the launcher's relay.
+_TERMINAL_CONTROL = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e"
+    "\u2066-\u2069\ud800-\udfff]")
+
+
+def _terminal_escape(m: "re.Match[str]") -> str:
+    o = ord(m.group())
+    if 0xdc80 <= o <= 0xdcff:
+        return f"\\x{o - 0xdc00:02x}"
+    return f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}"
+
+
+def _terminal_text(s: str) -> str:
+    """`s` with every control character written as its escape, so text a
+    repository or a worker chose (a file name, a worker's JSON string)
+    reaches the operator's terminal as text, never as a sequence the
+    terminal acts on (OSC 52 sets the clipboard). Idempotent: an escape is
+    printable."""
+    return _TERMINAL_CONTROL.sub(_terminal_escape, s)
+
+
+class _TerminalStream:
+    """`orig` with every write passed through `_terminal_text`: what
+    `main()` makes `sys.stdout` and `sys.stderr`, so nothing the process
+    prints — a `print` of the question UI or `list`, a traceback — reaches
+    the terminal as a control sequence. Attribute access falls through."""
+
+    def __init__(self, orig: TextIO) -> None:
+        self._orig = orig
+
+    def write(self, s: str) -> int:
+        self._orig.write(_terminal_text(s))
+        return len(s)
+
+    def __getattr__(self, name: str):
+        return getattr(self._orig, name)
+
+
+def _guard_terminal_streams() -> None:
+    """Make `sys.stdout` and `sys.stderr` `_TerminalStream`s, once."""
+    for name in ("stdout", "stderr"):
+        cur = getattr(sys, name)
+        if not isinstance(cur, (_TerminalStream, _TeeStream)):
+            setattr(sys, name, _TerminalStream(cur))
+
+
 def log(msg: str) -> None:
-    """Emit one orchestrator line. **Never raises.**
+    """Emit one orchestrator line. **Never raises.** `msg` is printed as
+    `_terminal_text` (the host-side seams that load this module call `log`
+    without `main()`'s streams).
 
     A logging call must not be able to kill a run, and here it could. On the
     remote runtime `sys.stdout` IS `<run_dir>/orchestrator.log` — the launcher
@@ -5016,7 +5069,7 @@ def log(msg: str) -> None:
     with contextlib.suppress(OSError, ValueError):
         repo = Path(os.environ.get("USER_REPO") or os.getcwd()).name or "?"
         ts = datetime.now().astimezone().isoformat(timespec="seconds")
-        print(f"{ts} [leerie] [{repo}] {msg}", flush=True)
+        print(_terminal_text(f"{ts} [leerie] [{repo}] {msg}"), flush=True)
 
 
 # Module-level run id, set once `State.__init__` has assigned a run
@@ -5065,7 +5118,8 @@ def die(msg: str, code: int = 1):
     if _CURRENT_RUN_ID:
         msg = f"{msg} (run {_CURRENT_RUN_ID})"
     with contextlib.suppress(OSError, ValueError):
-        print(f"leerie: error: {msg}", file=sys.stderr, flush=True)
+        print(_terminal_text(f"leerie: error: {msg}"), file=sys.stderr,
+              flush=True)
     sys.exit(code)
 
 
@@ -5086,6 +5140,9 @@ class _TeeStream:
         self._logf = logf
 
     def write(self, s: str) -> int:
+        # The terminal and the log file (which `leerie attach` and an
+        # operator's `cat` show) get the same escaped text.
+        s = _terminal_text(s)
         n = self._orig.write(s)
         try:
             self._logf.write(s)
@@ -10380,6 +10437,10 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
         *cmd,
         cwd=cwd,
         env=env,
+        # Never the orchestrator's fd 0, the operator's terminal in an
+        # interactive run (DESIGN §6 *No confined process holds a
+        # descriptor of the operator's terminal*).
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
@@ -10700,6 +10761,9 @@ async def _run_streaming(
                                    if fd is not None),
                     cwd=cwd,
                     env={**_repo_command_env(env), **dict(grants.env)},
+                    # DESIGN §6 *No confined process holds or can open
+                    # the operator's terminal*.
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
@@ -24063,8 +24127,9 @@ def _require_worker_view() -> None:
     argv = _confined_argv(WorkerGrants(rw=("/dev/null",), ro=("/",)),
                           ["test", "-e", _WORKER_ENV_MARK])
     try:
-        r = subprocess.run(argv, cwd="/", capture_output=True, text=True,
-                           timeout=60, check=False)
+        r = subprocess.run(argv, cwd="/", stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60,
+                           check=False)
     except (OSError, subprocess.SubprocessError) as e:
         die(f"the confinement check could not run a command in the "
             f"repository's root ({type(e).__name__}: {e}).")
@@ -24270,8 +24335,8 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
                                        place=((str(held), rel),),
                                        report=str(view / "report.json")),
                 report_fd=rep.fileno(), worker_root=False)
-            r = subprocess.run(argv, cwd=str(view), capture_output=True,
-                               text=True, timeout=60,
+            r = subprocess.run(argv, cwd=str(view), stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=60,
                                pass_fds=(rep.fileno(),))
             rep.seek(0)
             raw = rep.read()
@@ -24389,8 +24454,8 @@ def _require_egress_relay() -> None:
                 "--ro", "/", "--", sys.executable, "-I", "-S", "-c",
                 _EGRESS_RELAY_PROBE, str(port)]
         try:
-            r = subprocess.run(argv, cwd="/", capture_output=True, text=True,
-                               timeout=60)
+            r = subprocess.run(argv, cwd="/", stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=60)
         except (OSError, subprocess.SubprocessError) as e:
             die("the confinement check every entry runs "
                 "(`_require_confinement`) could not run the network probe "
@@ -24473,14 +24538,24 @@ HOST_CLI_ARGS = ("--setting-sources", "user", "--disable-slash-commands",
 HOST_CLI_DENIED_TOOLS = ("Agent", "Task", "Skill")
 HOST_CLI_ENV_PIN = {"CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "0"}
 
-# The device nodes a worker's tools write: not all of /dev. `/dev/shm`
-# holds POSIX semaphores and shared memory (Python's multiprocessing locks
-# and Chromium need it, measured); an isolated process's is its own, which
-# the shim maps it to (DESIGN §6 *Every confined process has its own
-# `/tmp`, `/dev/shm` and IPC*).
+# The device nodes a confined process opens, and the only paths of `/dev`
+# any grant names (`_reads_outside` leaves `/dev` out): never a terminal
+# but `/dev/tty`, which names nothing once the shim has left its
+# controlling terminal (DESIGN §6 *No confined process holds or can open
+# the operator's terminal*). `/dev/shm` holds POSIX semaphores and shared
+# memory (Python's multiprocessing locks and Chromium need it, measured);
+# an isolated process's is its own, which the shim maps it to (DESIGN §6
+# *Every confined process has its own `/tmp`, `/dev/shm` and IPC*). A
+# pseudo-terminal (`/dev/ptmx`, `/dev/pts`) is granted by the shim with the
+# isolated process's own `devpts`, never the container's, which holds the
+# operator's pty.
 _WORKER_DEVICES = ("/dev/null", "/dev/zero", "/dev/full", "/dev/random",
-                   "/dev/urandom", "/dev/tty", "/dev/ptmx", "/dev/pts",
-                   "/dev/shm")
+                   "/dev/urandom", "/dev/tty", "/dev/shm")
+# Left out of every read grant `_reads_outside` makes: the container's
+# `/dev` holds the operator's terminal (`/dev/console` under `nerdctl run
+# -it`, its `devpts`), and a read-only descriptor of it reads keystrokes and
+# sets the terminal's modes (review round 33 isolation Q1).
+_DEV = Path("/dev")
 
 # The variables that name a worker's own directories, its temp dir and CLI
 # config (`_worker_dirs`). Each is granted only when it names a path beneath
@@ -24720,7 +24795,10 @@ def _reads_outside(root: Path, *, tmp: bool = True) -> list[str]:
     (`SHARED_TMP`) too, which no grant names: an isolated process's `/tmp`
     is its own, granted by the shim (DESIGN §6 *Every confined process has
     its own `/tmp`, `/dev/shm` and IPC*). An entry that resolves into
-    `/tmp` is left out with it."""
+    `/tmp` is left out with it. `/dev` (`_DEV`), and any entry that
+    resolves into it, is never in it: the devices a confined process opens
+    are named by `_WORKER_DEVICES` (DESIGN §6 *No confined process holds or
+    can open the operator's terminal*)."""
     if tmp:
         out = _beside(Path("/"), root)
     else:
@@ -24734,6 +24812,8 @@ def _reads_outside(root: Path, *, tmp: bool = True) -> list[str]:
                 if not (real.is_relative_to(shared)
                         or shared.is_relative_to(real)):
                     out.append(p)
+    out = [p for p in out
+           if not Path(os.path.realpath(p)).is_relative_to(_DEV)]
     host = _host_dir()
     return out if host is None else _around(out, host)
 
@@ -58055,6 +58135,7 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
             "broken (DESIGN §6 *Leerie's runs of the repository's commands "
             "are confined too*). Report this.")
     return subprocess.run(_confined_argv(grants, argv), cwd=str(tree),
+                          stdin=subprocess.DEVNULL,
                           capture_output=True, text=text, timeout=timeout,
                           check=False,
                           env={**_ts_script_env(), **dict(grants.env)})
@@ -70007,6 +70088,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
 
 @_records_the_run_death
 def main() -> int | None:
+    # Before anything prints (DESIGN §6 *No text leerie did not write
+    # reaches the operator's terminal as a control sequence*).
+    _guard_terminal_streams()
     # Must precede every spawn — including _become_subreaper's descendants.
     _restore_sigchld_default()
     # Before any git runs: no git command of leerie's own fires a repository

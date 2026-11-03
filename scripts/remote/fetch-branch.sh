@@ -157,8 +157,8 @@ print(best[2])
 print(best[3])
 ' 2>"$_discover_err")" || {
     remote_log "fetch_branch: failed to discover completed run on machine $machine_id"
-    echo "  Output: $discover_output" >&2
-    echo "  Stderr: $(cat "$_discover_err")" >&2
+    echo "  Output: $(_terminal_safe "$discover_output")" >&2
+    echo "  Stderr: $(_terminal_relay < "$_discover_err")" >&2
     rm -f "$_discover_err"
     return 1
   }
@@ -166,7 +166,7 @@ print(best[3])
 
   # Check for ERROR prefix from the Python script
   if grep -q "^ERROR:" < <(printf '%s\n' "$discover_output"); then
-    remote_log "fetch_branch: $discover_output"
+    remote_log "fetch_branch: $(_terminal_safe "$discover_output")"
     return 1
   fi
 
@@ -181,7 +181,7 @@ print(best[3])
 
   if [ -z "$run_id" ] || [ -z "$run_branch" ]; then
     remote_log "fetch_branch: could not parse run-id or branch from machine output"
-    echo "  Output was: $discover_output" >&2
+    echo "  Output was: $(_terminal_safe "$discover_output")" >&2
     return 1
   fi
 

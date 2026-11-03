@@ -35,8 +35,17 @@ profile leerie-container flags=(attach_disconnected,mediate_deleted) {
   # and target, in the order it makes them.
   mount options=(rw, rprivate) -> /,
   mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /tmp/,
+  # A private /dev (private_dev): a tmpfs, the allowed device nodes bound
+  # into it (the bind rule below), its own /dev/shm and devpts.
+  mount fstype=tmpfs options=(rw, nosuid, nodev, noexec) tmpfs -> /dev/,
   mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /dev/shm/,
   mount fstype=devpts options=(rw, nosuid, noexec) devpts -> /dev/pts/,
+  # 0.43.0's shim binds the new devpts's ptmx over /dev/ptmx. This shim no
+  # longer does, but the profile is the host's, shared by every leerie
+  # version still running there, and a reload reaches running containers:
+  # it keeps every rule a released shim needs (DESIGN §6 *What the runtime
+  # must allow*, *The profile only grows*). The bind rule below matches
+  # this one too; it is kept by name so the release pin reads it.
   mount options=(rw, bind) /dev/pts/ptmx -> /dev/ptmx,
   # The new root is staged on /tmp and its entries bound into it; after the
   # pivot, the grants beneath /tmp are carried in and every write grant is

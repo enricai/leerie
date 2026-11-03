@@ -130,7 +130,7 @@ _attach_to_live_orchestrator_ec2() {
     _tail_script="$(render_tail_wrapper)"
     _tail_invocation="LEERIE_TAIL_RUN_ID='$LEERIE_RUN_ID'; export LEERIE_TAIL_RUN_ID
 $_tail_script"
-    printf '%s' "$_tail_invocation" | ec2_attach || true
+    printf '%s' "$_tail_invocation" | ec2_attach | _terminal_relay || true
   fi
   # shellcheck disable=SC2034  # set in the CALLER's scope on purpose —
   # see this function's 'Side-effect: sets container_rc=130' header

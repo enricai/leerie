@@ -26,6 +26,7 @@ import pytest
 
 from tests.config_arm_extract import extract_config_arm
 from tests.conftest import run_git_repo_first as _git
+from tests.conftest import LOG_SH_SOURCE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -226,6 +227,7 @@ def test_nothing_in_a_runs_exit_or_fetch_applies_a_capture():
 def _config_arm(repo: Path, state: Path, args: list[str], tmp_path: Path
                 ) -> subprocess.CompletedProcess:
     script = ("#!/usr/bin/env bash\nset -euo pipefail\n"
+              + LOG_SH_SOURCE +
               'remote_log() { echo "[leerie] $*" >&2; }\n'
               'case "${1:-}" in\n' + extract_config_arm() + "\nesac\n")
     return subprocess.run(
@@ -279,6 +281,7 @@ def _apt_layer(sp_value: str, tmp_path: Path) -> subprocess.CompletedProcess:
     e = text.index("      printf '    && rm -rf /var/lib/apt/lists/*\\n' >> "
                    '"$_gen_df_tmp"', s)
     script = ("set -euo pipefail\n"
+              + LOG_SH_SOURCE +
               'remote_log() { echo "[leerie] $*" >&2; }\n'
               f'_sp={json.dumps(sp_value)}\n'
               f'_gen_df_tmp="{tmp_path}/Dockerfile.gen"\n'

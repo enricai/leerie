@@ -25,6 +25,15 @@
 # DESIGN §6 *Finalization*. The host owns this step because gh auth,
 # ssh-agent, and Keychain are host-side; the Fly Machine cannot push.
 
+# What this file prints that a repository, a hook or a worker chose — a
+# hook's output, the rebaser's payload, the push's and gh's output, a PR
+# base branch a repository's leerie.toml named — goes through the terminal
+# filter (`_terminal_relay`, `_terminal_safe`; DESIGN §6 *No text leerie did
+# not write reaches the operator's terminal as a control sequence*), which
+# lives with the launcher's logging helper.
+# shellcheck source=scripts/remote/_log.sh
+. "${BASH_SOURCE[0]%/*}/remote/_log.sh"
+
 # update_run_json (local jq-based helper). Kept here rather than in
 # scripts/remote/lib.sh because that one uses python3, and the launcher
 # already imports jq via the preflight; using jq keeps this file
@@ -309,7 +318,7 @@ host_prepush_preflight() {
 --- pre-push hook output (stdout) ---
 $out"
   echo "leerie: warning: this repository's \`pre-push\` hook already fails on your" >&2
-  echo "  checked-out tree (\`$branch\`), before this run has changed anything." >&2
+  echo "  checked-out tree (\`$(_terminal_safe "$branch")\`), before this run has changed anything." >&2
   echo "  git runs pre-push against the WORKING TREE, not against the commits being" >&2
   echo "  pushed, and leerie never checks out the run branch — so unless you fix this," >&2
   echo "  finalize will reject the push after the run has already been paid for." >&2
@@ -324,7 +333,7 @@ $out"
   else
     echo "  Hook output:" >&2
   fi
-  printf '%s\n' "$shown" | sed 's/^/    /' >&2
+  printf '%s\n' "$shown" | sed 's/^/    /' | _terminal_relay >&2
   echo "  Fix the hook's complaint, or run with --no-verify to bypass hooks at push time." >&2
   echo "  Set LEERIE_SKIP_PREPUSH_PREFLIGHT=1 to skip this probe." >&2
   return 1
@@ -431,7 +440,7 @@ host_base_freshness_check() {
         >/dev/null 2>&1 || _fetch_rc=$?
   fi
   if [ "$_fetch_rc" -ne 0 ]; then
-    echo "leerie: warning: could not refresh $upstream (offline, or no" >&2
+    echo "leerie: warning: could not refresh $(_terminal_safe "$upstream") (offline, or no" >&2
     echo "  credentials for a non-interactive fetch); the freshness check" >&2
     echo "  runs against the last-fetched state." >&2
   fi
@@ -447,7 +456,7 @@ host_base_freshness_check() {
     local behind
     behind="$(git -C "$repo" rev-list --count \
               "${head_sha}..${up_sha}" 2>/dev/null || echo '?')"
-    echo "leerie: error: your checkout ($branch) is $behind commit(s) BEHIND $upstream." >&2
+    echo "leerie: error: your checkout ($(_terminal_safe "$branch")) is $behind commit(s) BEHIND $(_terminal_safe "$upstream")." >&2
     echo "  A fresh run plans against the tree it sees. Started on a stale base, it" >&2
     echo "  re-solves work that already merged — and its finalize rebase can land the" >&2
     echo "  older solution OVER the newer one (measured: a re-run started one minute" >&2
@@ -457,7 +466,7 @@ host_base_freshness_check() {
     # a bare `git pull --ff-only` fails with "There is no tracking
     # information for the current branch" — a refusal whose only printed
     # working exit would otherwise be the skip env var (round 8).
-    echo "    git -C $repo pull --ff-only $remote_name $remote_branch" >&2
+    echo "    git -C $repo pull --ff-only $(_terminal_safe "$remote_name") $(_terminal_safe "$remote_branch")" >&2
     echo "  Or, to deliberately run on this older base:" >&2
     echo "    LEERIE_SKIP_FRESHNESS_CHECK=1 ./leerie ..." >&2
     return 1
@@ -503,7 +512,7 @@ host_bring_back_run_branch() {
     return 0
   fi
   if [ "$current" != "$recorded" ]; then
-    echo "[leerie] bring-back: $branch in your repository is at ${current:-(absent)}, not the commit leerie last brought back (${recorded:-none}) — leaving it as it is; the run's branch is at $tip in $repo" >&2
+    echo "[leerie] bring-back: $(_terminal_safe "$branch") in your repository is at ${current:-(absent)}, not the commit leerie last brought back ($(_terminal_safe "${recorded:-none}")) — leaving it as it is; the run's branch is at $tip in $repo" >&2
     # 2: the run has commits that are in no ref of yours — a caller about
     # to delete the run's repository must keep it.
     [ "$tip" = "$recorded" ] && return 0
@@ -513,7 +522,7 @@ host_bring_back_run_branch() {
   if ! git -C "$USER_REPO" -c core.hooksPath=/dev/null fetch --quiet --no-tags \
       --no-write-fetch-head --no-auto-maintenance --no-recurse-submodules \
       "$repo" "+refs/heads/$branch:$incoming"; then
-    echo "[leerie] bring-back: could not fetch $branch from $repo" >&2
+    echo "[leerie] bring-back: could not fetch $(_terminal_safe "$branch") from $repo" >&2
     return 1
   fi
   # Only a fast-forward of what was brought back (review round 17 H1): the
@@ -524,7 +533,7 @@ host_bring_back_run_branch() {
   if [ -n "$current" ] && ! git -C "$USER_REPO" merge-base --is-ancestor \
        "$current" "$tip" 2>/dev/null; then
     git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref -d "$incoming" 2>/dev/null || true
-    echo "[leerie] bring-back: the run's branch at $tip does not descend from $branch in your repository ($current) — leaving it; the run's branch is in $repo" >&2
+    echo "[leerie] bring-back: the run's branch at $tip does not descend from $(_terminal_safe "$branch") in your repository ($current) — leaving it; the run's branch is in $repo" >&2
     return 2
   fi
   # `$current` is empty when the ref is absent: update-ref then insists it
@@ -532,12 +541,12 @@ host_bring_back_run_branch() {
   if ! git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref \
       -m "leerie: bring back $branch" "refs/heads/$branch" "$tip" "$current"; then
     git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref -d "$incoming" 2>/dev/null || true
-    echo "[leerie] bring-back: $branch moved while it was brought back — leaving it" >&2
+    echo "[leerie] bring-back: $(_terminal_safe "$branch") moved while it was brought back — leaving it" >&2
     return 1
   fi
   git -C "$USER_REPO" -c core.hooksPath=/dev/null update-ref -d "$incoming" 2>/dev/null || true
   [ -f "$run_json" ] && _host_finalize_update_run_json "$run_json" "brought_back_sha=$tip"
-  echo "[leerie] bring-back: $branch is at $tip in your repository" >&2
+  echo "[leerie] bring-back: $(_terminal_safe "$branch") is at $tip in your repository" >&2
   return 0
 }
 
@@ -723,7 +732,7 @@ host_finalize() {
   # (DESIGN §6 *One push choice per run, on every runtime*); this guard is
   # what keeps a branchless run from being pushed.
   if ! git -C "$USER_REPO" rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
-    echo "[leerie] finalize: run branch $run_branch absent locally; treating as no-op" >&2
+    echo "[leerie] finalize: run branch $(_terminal_safe "$run_branch") absent locally; treating as no-op" >&2
     return 0
   fi
 
@@ -745,12 +754,12 @@ host_finalize() {
     if [ "$_ahead" = "0" ]; then
       _host_finalize_update_run_json "$run_json" \
         "push_error=run branch $run_branch has no commits beyond $working_branch — nothing to push"
-      echo "leerie: error: run branch \`$run_branch\` has no commits beyond \`$working_branch\` — refusing to push an empty branch." >&2
+      echo "leerie: error: run branch \`$(_terminal_safe "$run_branch")\` has no commits beyond \`$(_terminal_safe "$working_branch")\` — refusing to push an empty branch." >&2
       echo "  This usually means the run's waves were never integrated into the run branch." >&2
       echo "  The per-subtask work (if any) is on the leerie/subtasks/<run-id>/* branches." >&2
       echo "  Inspect and recover:" >&2
       echo "    git -C $USER_REPO branch --list 'leerie/subtasks/*'" >&2
-      echo "    git -C $USER_REPO log --oneline $working_branch..$run_branch" >&2
+      echo "    git -C $USER_REPO log --oneline $(_terminal_safe "$working_branch")..$(_terminal_safe "$run_branch")" >&2
       return 1
     fi
   fi
@@ -796,7 +805,7 @@ host_finalize() {
        git --git-dir="$_rebase_repo" -c core.hooksPath=/dev/null worktree add \
          "$_rebase_worktree" "$run_branch" \
          >/dev/null 2>&1; then
-      echo "[leerie] finalize: attempting rebase of $run_branch onto $pr_base_branch" >&2
+      echo "[leerie] finalize: attempting rebase of $(_terminal_safe "$run_branch") onto $(_terminal_safe "$pr_base_branch")" >&2
       # Write the python3 seam to a script file rather than a heredoc so the
       # invocation below stays a plain command (no command substitution), which
       # keeps it parseable under bash 3.2 (macOS's /bin/bash; see CLAUDE.md
@@ -871,7 +880,7 @@ PY
         _rebaser_status="$(printf '%s' "$_rebaser_json" | jq -r '.status // ""' 2>/dev/null || true)"
       else
         echo "[leerie] finalize: rebaser python seam failed (rc=$_rebaser_rc); skipping rebase" >&2
-        echo "$_rebaser_json" >&2
+        printf '%s\n' "$_rebaser_json" | _terminal_relay >&2
       fi
 
       # Fetch the worktree's HEAD into a scratch ref BEFORE removing the
@@ -918,7 +927,7 @@ PY
             working_branch="origin/$pr_base_branch"
             _host_finalize_update_run_json "$run_json" \
               "working_branch=$working_branch"
-            echo "[leerie] finalize: rebased $run_branch onto $pr_base_branch; working_branch now $working_branch" >&2
+            echo "[leerie] finalize: rebased $(_terminal_safe "$run_branch") onto $(_terminal_safe "$pr_base_branch"); working_branch now $(_terminal_safe "$working_branch")" >&2
           else
             echo "[leerie] finalize: rebaser reported 'rebased' but fetch-back failed; pushing original branch" >&2
           fi
@@ -933,7 +942,7 @@ PY
 
 $_diagnosis"
           fi
-          echo "[leerie] finalize: rebase not applied ($_rebaser_status); pushing $run_branch as-is" >&2
+          echo "[leerie] finalize: rebase not applied ($_rebaser_status); pushing $(_terminal_safe "$run_branch") as-is" >&2
           ;;
         *)
           # The one artifact that would identify why the rebase degraded is
@@ -954,8 +963,8 @@ $_diagnosis"
           local _rebaser_json_trunc _rebaser_jq_rc=0
           printf '%s' "$_rebaser_json" | jq -e '.status // ""' >/dev/null 2>&1 || _rebaser_jq_rc=$?
           _rebaser_json_trunc="$(printf '%s' "$_rebaser_json" | tail -c 2000)"
-          echo "[leerie] finalize: rebaser returned no usable status; pushing $run_branch as-is" >&2
-          echo "[leerie] finalize: rebaser raw payload (truncated, jq_rc=$_rebaser_jq_rc): $_rebaser_json_trunc" >&2
+          echo "[leerie] finalize: rebaser returned no usable status; pushing $(_terminal_safe "$run_branch") as-is" >&2
+          echo "[leerie] finalize: rebaser raw payload (truncated, jq_rc=$_rebaser_jq_rc): $(_terminal_safe "$_rebaser_json_trunc")" >&2
           _host_finalize_update_run_json "$run_json" \
             "rebase_disposition_status=unusable" \
             "rebase_disposition_jq_rc=$_rebaser_jq_rc" \
@@ -986,7 +995,7 @@ $_diagnosis"
   local push_args=(_repo_git_push "$USER_REPO" -u origin "$run_branch")
   [ "${NO_VERIFY_PUSH:-false}" = "true" ] && push_args+=(--no-verify)
 
-  echo "[leerie] finalize: pushing $run_branch to origin$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " (--no-verify)")" >&2
+  echo "[leerie] finalize: pushing $(_terminal_safe "$run_branch") to origin$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " (--no-verify)")" >&2
   # Capture the push's two streams SEPARATELY, because the two
   # consumers below want different things and merging them breaks one.
   #
@@ -1080,13 +1089,13 @@ $push_persist"
     _host_finalize_update_run_json "$run_json" \
       "pushed_at=" "push_error=${push_persist:-git push failed}" \
       "pr_url=" "pr_error="
-    echo "leerie: error: git push failed for branch \`$run_branch\`." >&2
+    echo "leerie: error: git push failed for branch \`$(_terminal_safe "$run_branch")\`." >&2
     echo "  Local state is intact:" >&2
-    echo "    - run branch:     $run_branch (holds all wave merges)" >&2
-    echo "    - working branch: $working_branch (unchanged from run start)" >&2
-    echo "    - PR base branch: $pr_base_branch (intended PR base)" >&2
+    echo "    - run branch:     $(_terminal_safe "$run_branch") (holds all wave merges)" >&2
+    echo "    - working branch: $(_terminal_safe "$working_branch") (unchanged from run start)" >&2
+    echo "    - PR base branch: $(_terminal_safe "$pr_base_branch") (intended PR base)" >&2
     echo "  Resolve and retry manually:" >&2
-    echo "    git push -u origin $run_branch$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " --no-verify")" >&2
+    echo "    git push -u origin $(_terminal_safe "$run_branch")$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " --no-verify")" >&2
     # The terminal gets a much tighter bound than run.json — a pre-push hook
     # running a test suite reaches megabytes easily, and the same tail-anchor
     # reasoning applies as above (and as the rebaser's `*)` arm applies to a
@@ -1103,7 +1112,7 @@ $(printf '%s' "$push_all" | tail -c 4000)"
     # `sed` rather than `printf '    %s\n'`: that form indents only the
     # FIRST line of a multi-line value, which ran the git error onto the
     # end of a hook's last line and read as one corrupted sentence.
-    printf '%s\n' "$push_display" | sed 's/^/    /' >&2
+    printf '%s\n' "$push_display" | sed 's/^/    /' | _terminal_relay >&2
     if _host_finalize_pre_push_hook_present "$USER_REPO" \
         && ! _host_finalize_is_auth_or_network_push_error "$push_stderr"; then
       local _hook_name _checked_out _blt_passed
@@ -1127,7 +1136,7 @@ $(printf '%s' "$push_all" | tail -c 4000)"
       # score intact. It reads `push_hook_out` rather than `push_all` so the
       # section marker's own "pre-push hook" text cannot be matched first.
       _hook_name="$(printf '%s\n%s' "$push_stderr" "$push_hook_out" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | sed -n 1p || true)"
-      echo "  This looks like a failing git hook (${_hook_name:-pre-push} failed) rather than a push/auth/network problem." >&2
+      echo "  This looks like a failing git hook ($(_terminal_safe "${_hook_name:-pre-push}") failed) rather than a push/auth/network problem." >&2
       # WHICH TREE the hook measured is the fact that ends the confusion,
       # and nothing used to say it. git runs pre-push in the repo root
       # against whatever is CHECKED OUT; leerie never checks out the run
@@ -1138,8 +1147,8 @@ $(printf '%s' "$push_all" | tail -c 4000)"
       # out base branch because the host's node_modules was three weeks
       # stale, while the run's own two files were clean.
       _checked_out="$(git -C "$USER_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-      echo "  Note the hook ran against your checkout's working tree (${_checked_out:-current branch}), NOT the" >&2
-      echo "  commits being pushed — leerie never checks out $run_branch. A hook that lints or" >&2
+      echo "  Note the hook ran against your checkout's working tree ($(_terminal_safe "${_checked_out:-current branch}")), NOT the" >&2
+      echo "  commits being pushed — leerie never checks out $(_terminal_safe "$run_branch"). A hook that lints or" >&2
       echo "  typechecks the working tree is measuring host state; check that your dependencies" >&2
       echo "  are installed and up to date before assuming this run is at fault." >&2
       # `[]?` tolerates an absent/!object blt_results; `|| true` keeps a
@@ -1149,10 +1158,10 @@ $(printf '%s' "$push_all" | tail -c 4000)"
                             | unique | join(", ")' "$state_json" 2>/dev/null || true)"
       if [ -n "$_blt_passed" ] && [ "$_blt_passed" != "null" ]; then
         echo "  leerie already verified the integrated tree in-container; these passed there:" >&2
-        echo "    $(printf '%s' "$_blt_passed" | cut -c1-300)" >&2
+        echo "    $(_terminal_safe "$(printf '%s' "$_blt_passed" | cut -c1-300)")" >&2
       fi
       echo "  If the hook failure is expected or unrelated to this run's changes, bypass it with:" >&2
-      echo "    git push -u origin $run_branch --no-verify" >&2
+      echo "    git push -u origin $(_terminal_safe "$run_branch") --no-verify" >&2
       echo "  (or set NO_VERIFY_PUSH=true before invoking finalize)." >&2
     fi
     return 1
@@ -1160,7 +1169,7 @@ $(printf '%s' "$push_all" | tail -c 4000)"
   local pushed_at
   pushed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   _host_finalize_update_run_json "$run_json" "pushed_at=$pushed_at" "push_error="
-  echo "[leerie] finalize: pushed $run_branch" >&2
+  echo "[leerie] finalize: pushed $(_terminal_safe "$run_branch")" >&2
 
   # --- step 2: PR creation ---------------------------------------------
   # Primary path: the pr_writer worker (DESIGN §6 *Finalization*) wrote
@@ -1307,7 +1316,7 @@ $end_state"
     default_branch="$(_repo_git_from_root "$USER_REPO" remote show origin 2>/dev/null \
                        | sed -n 's/.*HEAD branch: //p')"
     if [ -n "$default_branch" ]; then
-      echo "[leerie] finalize: base branch $pr_base_branch no longer exists on origin; falling back to $default_branch" >&2
+      echo "[leerie] finalize: base branch $(_terminal_safe "$pr_base_branch") no longer exists on origin; falling back to $default_branch" >&2
       pr_base_branch="$default_branch"
     fi
   fi
@@ -1321,7 +1330,7 @@ $end_state"
   if [ "$(jq -r '.outcome // ""' "$run_json")" = "unconverged" ]; then
     pr_draft="--draft"
   fi
-  echo "[leerie] finalize: opening ${pr_draft:+draft }PR against $pr_base_branch" >&2
+  echo "[leerie] finalize: opening ${pr_draft:+draft }PR against $(_terminal_safe "$pr_base_branch")" >&2
   local pr_output pr_ok=false _pr_gd
   _pr_gd="$(git -C "$USER_REPO" rev-parse --absolute-git-dir 2>/dev/null || true)"
   # GitHub's API may not have indexed the freshly-pushed refs yet;
@@ -1354,16 +1363,16 @@ $end_state"
     _host_finalize_update_run_json "$run_json" \
       "pr_url=" "pr_error=${pr_output:-gh pr create failed}"
     echo "⚠  \`gh pr create\` failed; branch was pushed successfully." >&2
-    echo "  Pushed branch: $run_branch (on origin)" >&2
+    echo "  Pushed branch: $(_terminal_safe "$run_branch") (on origin)" >&2
     if [ "$pr_base_branch" != "$original_pr_base_branch" ]; then
-      echo "  (base branch $original_pr_base_branch was already deleted from origin;" >&2
-      echo "   tried fallback to $pr_base_branch, which also failed)" >&2
+      echo "  (base branch $(_terminal_safe "$original_pr_base_branch") was already deleted from origin;" >&2
+      echo "   tried fallback to $(_terminal_safe "$pr_base_branch"), which also failed)" >&2
     fi
     echo "  Open the PR manually:" >&2
-    echo "    gh pr create --base $pr_base_branch --head $run_branch" >&2
+    echo "    gh pr create --base $(_terminal_safe "$pr_base_branch") --head $(_terminal_safe "$run_branch")" >&2
     echo "  Or via the GitHub web UI for the repo." >&2
     echo "  gh stderr was:" >&2
-    printf '    %s\n' "$pr_output" >&2
+    printf '%s\n' "$pr_output" | sed 's/^/    /' | _terminal_relay >&2
     return 0
   fi
   local pr_url
