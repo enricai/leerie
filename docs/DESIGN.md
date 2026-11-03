@@ -9996,27 +9996,21 @@ reads that file at every spawn of the call — a call that can last a
 nothing guarantees: anything that clears /tmp under a live run (a host
 cleanup, a lost overlay) took every in-flight worker's file with it, and 5
 runs died at their next spawn. It now lives under `<run-dir>/sysprompt/`,
-the state the run already depends on, deleted when its call ends. Another
-worker's instructions are not input to this one, so no worker may read
-there. How that holds depends on the worker:
-
-- **Acting workers** run with the boundary erased (§12 L1), so they get a
-  `Read` deny rule on the directory.
-- **Judgment workers** hold no blanket `Read`/`Grep`/`Glob` grant. The CLI
-  allows those tools inside the working directories and refuses them
-  outside, as it already refuses every allowlisted shell read outside. The
-  run directory lies outside every judgment cwd, so it is unreadable to
-  them with no rule at all.
-
-They must not carry the deny rule as well. While any `Read()` deny is
-configured, the CLI refuses a compound `cd <dir>; <read> <relative path>`
-whenever it cannot resolve the paths statically, and a grep pattern or a
-`--include=*.ts` is enough to prevent that. When this branch first gave
-every worker the deny, that refusal hit a satisfied-probe, a delivery
-judge and the PR reviewer in one smoke run, each in its own tree. Code
-decides by the worker's actual grant: any worker that is autonomous, or
-holds a bare `Read`, `Grep` or `Glob`, gets the deny. The system temp dir
-remains the fallback only when the run directory cannot hold the file.
+the state the run already depends on, deleted when its call ends. Every
+worker's CLI reads its own file there, so the directory is in every
+worker's read grant (I5). What it holds is no secret from any worker:
+each file is a shipped prompt (`prompts/*.md`, through `_load_prompt`),
+and leerie's own code, `prompts/` included, is in every worker's read
+grant too. So no rule hides it. A CLI `Read` deny on it used to, for
+acting workers and any worker holding a bare `Read`, `Grep` or `Glob`;
+it hid nothing a worker could not read one directory over, and it cost
+turns: while any `Read()` deny is configured, the CLI refuses a compound
+`cd <dir>; <read> <relative path>` whenever it cannot resolve the paths
+statically, and a grep pattern or a `--include=*.ts` is enough to
+prevent that. On the seven live 0.43.0 barnacle runs the refusal naming
+this directory appears on 39 log lines (streams and transcripts
+overlap, so lines, not refusals). The system temp dir remains the
+fallback only when the run directory cannot hold the file.
 
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a
@@ -13693,17 +13687,24 @@ is not an integration test — the skip is typed (`no_scoped_runner`, with
 the command) and logged as a warning, never silent.
 
 **Hidden from the fixers.** The sets live under the run's state root,
-and implementers and conformers carry `Read` denies on that directory
-and on every run-directory file that records them — the evaluation
-worktree, the logs (the writers' transcripts carry the test source), the
-orchestrator log, the captured-call log and the run state (case names
-and paths) — and on the CLI's own session transcripts; the fixers read
-nothing else there but their subtask specs, criteria and checkpoints.
-It is the same deny mechanism that keeps acting workers out of the
-user's checkout, and evaluation output is never echoed. Nothing of a set
-reaches staging at all (above). A shell `cat` is not covered by a `Read`
-deny; hiding is a best-effort reduction of the special-casing incentive,
-not a guarantee.
+and no fixer's grant (I5, §6 *A worker writes only where it is granted*)
+names that directory or any run-directory file that records them — the
+evaluation worktree, the logs (the writers' transcripts carry the test
+source), the orchestrator log, the captured-call log, the run state (case
+names and paths) and every other worker's configuration (its session
+transcripts). The fixers — implementer, conformer, the surrogate
+witness's fixer and the falsifier — read nothing of the state root but
+their own directories, their subtask specs, criteria and checkpoints, and
+the kernel refuses the rest to the Read tool and a shell `cat` alike.
+Their own configuration holds only their own sessions, and the home
+directory's `~/.claude/projects` holds none: every CLI leerie starts in
+the container is given its own configuration directory. Evaluation output
+is never echoed, and nothing of a set reaches staging at all (above).
+The CLI `Read` denies that hid these paths before Landlock covered them
+are gone: they added nothing the grant does not refuse, and any `Read()`
+deny makes the CLI refuse ordinary `cd <dir>; grep …` compounds — the
+refusal naming `acceptance/` appears on 45 log lines of the seven live
+0.43.0 barnacle runs.
 
 ### Mechanical-feedback loops (the CRITIC pattern)
 

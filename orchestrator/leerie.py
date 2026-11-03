@@ -1200,8 +1200,9 @@ _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
 # Measured live (claude 2.1.310, a scratch run dir): with a bare `Read`
 # granted, a judgment worker read `<run-dir>/state.json` and a staged system
 # prompt; without it, both were refused while a file in its cwd still read.
-# The boundary is what keeps them out of the run directory, so they need no
-# `Read()` deny rule, and must not carry one (`_reads_beyond_cwd`).
+# The boundary is what keeps them out of the run directory; Landlock keeps
+# every worker there to its grants (I5). No worker carries a `Read()` deny
+# rule: any one makes the CLI refuse `cd <dir>; <read> <relative path>`.
 _JUDGE_READ_BASE = "WebSearch,WebFetch"
 # INSPECT_TOOLS is the read-only-with-shell bucket for every judgment worker
 # (PLANNING_WORKER_TYPES). Those workers run in a disposable detached worktree
@@ -27312,8 +27313,8 @@ def _write_system_prompt_file(run_dir: str | Path | None, text: str) -> str:
     90-minute worker and its retries, and anything that clears /tmp under a
     live run (a host cleanup, a lost overlay) takes every in-flight file
     with it: 5 runs died that way at their next spawn. The run directory is
-    the state the run already depends on, and the directory is read-denied
-    to workers (`_sysprompt_read_denial`). Falls back to the system temp dir
+    the state the run already depends on; every worker's grant reads it (its
+    CLI reads its own file there). Falls back to the system temp dir
     only when the run directory cannot hold it."""
     import tempfile  # noqa: PLC0415
     d: str | None = None
@@ -27328,61 +27329,6 @@ def _write_system_prompt_file(run_dir: str | Path | None, text: str) -> str:
             mode="w", suffix=".txt", delete=False, dir=d) as f:
         f.write(text)
         return f.name
-
-
-def _reads_beyond_cwd(allowed_tools: str, autonomous: bool) -> bool:
-    """Whether a worker can read outside its working directories: an
-    acting worker (its boundary is erased), or one granted a bare `Read`,
-    `Grep` or `Glob`, which the CLI then allows on any path."""
-    tools = {t.strip() for t in (allowed_tools or "").split(",")}
-    return autonomous or bool(tools & {"Read", "Grep", "Glob"})
-
-
-def _sysprompt_read_denial(run_dir: str | Path | None, allowed_tools: str,
-                           autonomous: bool) -> str:
-    """`Read` deny on the staged system prompts, for every worker that can
-    read beyond its working directories: another worker's instructions are
-    not input to this one (DESIGN §7 *The system prompt is staged in the
-    run directory*). A worker held to the boundary gets none. Any `Read()`
-    deny makes the CLI refuse `cd <dir>; <read> <relative path>` compounds
-    it cannot resolve statically, and the boundary already keeps such a
-    worker out of the run directory."""
-    if run_dir is None or not _reads_beyond_cwd(allowed_tools, autonomous):
-        return ""
-    return f"Read(/{Path(run_dir) / SYSPROMPT_DIRNAME}/**)"
-
-
-def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
-    """Keep the held-out acceptance sets out of the fixers' reach (DESIGN §8
-    *Held-out acceptance tests*): `Read` denies for implementer, conformer
-    and the surrogate witness's `surrogate_fixer` on every run-directory file that records a set — the sets
-    themselves, the evaluation worktree, every log (the writers' stream
-    transcripts carry the test source), `orchestrator.log` (where streamed
-    output is echoed), `calls.ndjson` (the writers' responses) and
-    `state.json` (case names and paths) — and on the CLI's own session
-    transcripts. The fixers' prompts read only `subtasks/`, `task.md` and
-    `notes/` there. Joined with `_repo_write_denials`' rules at the
-    call site. A shell `cat` is not covered; hiding reduces the
-    special-casing incentive, it does not guarantee it. The delivery
-    `falsifier` is denied the same run state (bench Q2 F+ hid it): it gets
-    its own read-only copies of the valid sets as leads (DESIGN §8
-    *Delivery detection*)."""
-    if schema_key not in ("implementer", "conformer", "surrogate_fixer",
-                          "falsifier"):
-        return ""
-    rd = Path(run_dir)
-    # The evaluation worktree is run-id-prefixed (`_helper_worktree_path`);
-    # the run directory's own name is the run id.
-    eval_wt = rd / "worktrees" / _worktree_dirname(rd.name, "acceptance-eval")
-    # `//` anchors an absolute path for the CLI, as in _repo_write_denials.
-    return ",".join([f"Read(/{rd / 'acceptance'}/**)",
-                     f"Read(/{eval_wt}/**)",
-                     f"Read(/{rd / 'logs'}/**)",
-                     f"Read(/{rd / 'orchestrator.log'})",
-                     f"Read(/{rd / 'calls.ndjson'})",
-                     f"Read(/{rd / 'state.json'})",
-                     f"Read(/{rd / WORKERS_DIR}/*/config/**)",
-                     "Read(~/.claude/projects/**)"])
 
 
 def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
@@ -30843,9 +30789,6 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 max_turns=max_turns, model=model,
                 deny_extra=",".join(d for d in (
                     _repo_write_denials(st.repo_root, st.run_dir),
-                    _acceptance_read_denials(schema_key, st.run_dir),
-                    _sysprompt_read_denial(getattr(st, "run_dir", None),
-                                           allowed_tools, autonomous),
                     guard["deny"]) if d),
                 settings=(_host_cli_settings(hook_settings) if grants is None
                           else _confined_cli_settings(
@@ -58584,8 +58527,8 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
 def _falsifier_save_probe(st: "State", lane: Path, i: int,
                           res: dict) -> dict | None:
     """Keep a confirmed sample's probe beside the held-out sets, under
-    `<run_dir>/acceptance/probes/i<k>/` (Read-denied to every fixer,
-    `_acceptance_read_denials`), so the delivery re-drive can re-run it on a
+    `<run_dir>/acceptance/probes/i<k>/` (outside every fixer's grant,
+    `_worker_grants`), so the delivery re-drive can re-run it on a
     later tree (DESIGN §8 *Delivery re-drive*). `{dir, file}`, or None when
     it cannot be copied."""
     rel = _delivery_cite_rel(str(res.get("probe_path") or ""), lane)

@@ -346,10 +346,12 @@ def test_falls_back_to_the_temp_dir_when_the_run_dir_cannot_hold_it(
         os.unlink(path)
 
 
-def test_claude_p_stages_in_the_run_dir_denies_reads_and_cleans_up(
+def test_claude_p_stages_in_the_run_dir_and_cleans_up(
         leerie, tmp_path, monkeypatch):
     """The real claude_p: the file it passes is under <run_dir>/sysprompt/,
-    exists while the worker runs, is Read-denied to it, and is gone after."""
+    exists while the worker runs, carries no `Read()` deny (it holds a
+    shipped prompt every worker reads under leerie's code anyway), and is
+    gone after."""
     run_dir = tmp_path / "runs" / "r1"
     run_dir.mkdir(parents=True)
     observed: dict = {}
@@ -379,7 +381,8 @@ def test_claude_p_stages_in_the_run_dir_denies_reads_and_cleans_up(
         model="sonnet", sid="t"))
     assert pathlib.Path(observed["path"]).parent == run_dir / "sysprompt"
     assert observed["text"] == "THE SYSTEM PROMPT"
-    assert f"Read(/{run_dir}/sysprompt/**)" in observed["deny"].split(",")
+    assert not [d for d in observed["deny"].split(",")
+                if d.startswith("Read(")]
     assert not pathlib.Path(observed["path"]).exists()
 
 
@@ -410,22 +413,21 @@ def _deny_for(leerie, tmp_path, monkeypatch, allowed_tools, autonomous):
     return observed["deny"].split(","), run_dir
 
 
-@pytest.mark.parametrize("tools_name, autonomous, denied", [
-    ("INSPECT_TOOLS", False, False),
-    ("SATISFIED_PROBE_TOOLS", False, False),
-    ("ACT_TOOLS", True, True),
-    ("SMOKE_TOOLS", False, True),
+@pytest.mark.parametrize("tools_name, autonomous", [
+    ("INSPECT_TOOLS", False),
+    ("SATISFIED_PROBE_TOOLS", False),
+    ("ACT_TOOLS", True),
+    ("SMOKE_TOOLS", False),
 ])
-def test_read_deny_only_for_workers_that_can_read_beyond_cwd(
-        leerie, tmp_path, monkeypatch, tools_name, autonomous, denied):
-    """DESIGN §7: a judgment worker held to the working-directory boundary
-    carries no `Read()` rule. Any such rule makes the CLI refuse `cd <dir>;
-    <read> <relative path>` compounds it cannot resolve. A worker that can
-    read anywhere (acting, or a bare `Read` grant) keeps the deny."""
-    deny, run_dir = _deny_for(leerie, tmp_path, monkeypatch,
-                              getattr(leerie, tools_name), autonomous)
-    reads = [d for d in deny if d.startswith("Read(")]
-    assert reads == ([f"Read(/{run_dir}/sysprompt/**)"] if denied else [])
+def test_no_worker_carries_a_read_deny(
+        leerie, tmp_path, monkeypatch, tools_name, autonomous):
+    """DESIGN §7, §8 *Hidden from the fixers*: Landlock holds every worker's
+    reads to its grants, so no worker carries a `Read()` rule — any such
+    rule makes the CLI refuse `cd <dir>; <read> <relative path>` compounds
+    it cannot resolve (84 such refusal lines on the live 0.43.0 runs)."""
+    deny, _run_dir = _deny_for(leerie, tmp_path, monkeypatch,
+                               getattr(leerie, tools_name), autonomous)
+    assert [d for d in deny if d.startswith("Read(")] == []
 
 
 def test_judgment_tool_profiles_grant_no_blanket_read(leerie):
@@ -436,6 +438,3 @@ def test_judgment_tool_profiles_grant_no_blanket_read(leerie):
     for tools in (leerie.INSPECT_TOOLS, leerie.SATISFIED_PROBE_TOOLS):
         names = {t.strip() for t in tools.split(",")}
         assert not names & {"Read", "Grep", "Glob"}
-        assert not leerie._reads_beyond_cwd(tools, False)
-    assert leerie._reads_beyond_cwd(leerie.ACT_TOOLS, True)
-    assert leerie._reads_beyond_cwd("Glob,Bash(ls:*)", False)

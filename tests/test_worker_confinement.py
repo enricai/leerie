@@ -211,6 +211,34 @@ proc root escape|cat /proc/$$/root{rd}/state.json
             set() if under_tmp else {"user checkout"}), got
 
 
+@pytest.mark.parametrize("fixer", ["implementer", "conformer",
+                                   "surrogate_fixer", "falsifier"])
+def test_no_fixer_reads_what_records_a_held_out_set(leerie, run, fixer):
+    """DESIGN §8 *Hidden from the fixers*: every path the CLI `Read` denies
+    once named for the fixers is refused by the kernel to a shell `cat`
+    too, so those denies were redundant (they are gone: any `Read()` deny
+    makes the CLI refuse ordinary `cd <dir>; grep …` compounds)."""
+    rd = run["run_dir"]
+    files = {
+        "set": rd / "acceptance" / "set-1" / "test_held.py",
+        "eval tree": rd / "worktrees" / f"{RUN_ID}-acceptance-eval" / "t.py",
+        "writer log": rd / "logs" / "acceptance-1.log",
+        "orchestrator.log": rd / "orchestrator.log",
+        "calls.ndjson": rd / "calls.ndjson",
+        "state.json": rd / "state.json",
+        "writer transcript": rd / "workers" / "acceptance_writer-1"
+        / "config" / "projects" / "p" / "s.jsonl",
+    }
+    for f in files.values():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("held\n")
+    g = _grants(leerie, run, schema_key=fixer,
+                notes_id="wt-a" if fixer == "implementer" else None)
+    got = _probe(leerie, g, "\n".join(
+        f"{name}|cat {path}" for name, path in files.items()), run["env"])
+    assert not any(got.values()), got
+
+
 def test_a_judge_in_the_planning_worktree_writes_nothing_of_the_run(
         leerie, run):
     planning = run["wts"]["staging"]

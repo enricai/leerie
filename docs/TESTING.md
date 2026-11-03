@@ -4992,8 +4992,9 @@ stubbed, and the stubs write files the way the workers would.
   resume-idempotent on `gate.final`.
 - **Cross-run**: the residual reaches `_prior_delivery_residual` as
   `acceptance_unmet`, and the planner prompt carries guidance for it.
-- **Hiding**: `_acceptance_read_denials` adds the `Read` deny for implementer
-  and conformer only, and `claude_p` wires it.
+- **Hiding**: no fixer's grant (`_worker_grants`: implementer, conformer,
+  surrogate_fixer, falsifier) reaches the sets or any run file that records
+  them, and no worker's argv carries a `Read(` deny.
 - **Order**: in `_run_phases`, audit → acceptance write → plan, and
   delivery recheck → acceptance gate → finalize.
 
@@ -5001,8 +5002,11 @@ Falsified five ways, each turning at least one test red: repair at the
 conformer's own effort; no hidden sets; no rollback; keeping
 non-discriminating defect files; no Read deny.
 `tests/test_repo_write_denial.py` now asserts the write deny's presence rather
-than its position (the acceptance Read deny follows it for implementer and
-conformer), and the registry tests (`test_resolve_models`,
+than its position, and (since the CLI `Read` denies went, Landlock refusing
+those reads instead: `tests/test_worker_confinement.py::test_no_fixer_reads_what_records_a_held_out_set`)
+that no `Read(` deny is on the argv, for a judgment worker and an
+implementer — both cases fail with the denies back, and the implementer's
+old assertion of `/acceptance/**` was red from that change on; the registry tests (`test_resolve_models`,
 `test_resolve_efforts`) list the new worker.
 
 ## No work on executed evidence, with a bounded dispute (2026-10-04)
