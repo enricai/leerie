@@ -707,8 +707,8 @@ def _test_tmp_readable_by_measurements(request, monkeypatch):
     grant names — an isolated command's `/tmp` is its own (DESIGN §6 *Every
     confined process has its own `/tmp`, `/dev/shm` and IPC*) — so a fake
     runner or installer a test puts there could not even be executed. In
-    production no tool lives in `/tmp`. Never the state root
-    (`_around`), never the rest of `/tmp`."""
+    production no tool lives in `/tmp`. Never the state root or the host
+    directory (`_apart`), never the rest of `/tmp`."""
     if "tmp_path" not in request.fixturenames:
         return
     leerie = request.getfixturevalue("leerie")
@@ -718,7 +718,7 @@ def _test_tmp_readable_by_measurements(request, monkeypatch):
     def grants(st, tree, kind=leerie.MEASURE_KIND):
         g = real(st, tree, kind)
         root = leerie._run_dir_of(st).parent.parent
-        extra = tuple(p for p in leerie._around([str(tmp)], root)
+        extra = tuple(p for p in leerie._apart([str(tmp)], root)
                       if p not in g.rw + g.ro)
         return g._replace(ro=g.ro + extra)
     monkeypatch.setattr(leerie, "_measurement_grants", grants)

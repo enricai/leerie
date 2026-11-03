@@ -7503,7 +7503,12 @@ follows the runtime rule (§6 *Rootless exception*): rootless sees the
 host user's directory as its own (outer UID 0 → inner leerie), rootful's
 entry guard `chown`s it to leerie, and the slot files are opened
 read-only (`flock` needs no write access), so a slot another identity
-created still locks. Where no such mount exists (Fly, EC2 — one run per
+created still locks. For the same reason no confined process reads the
+host directory: Landlock does not handle `flock`, so a worker or a command
+of one run that could open a slot file held every slot from under the
+other runs (review round 30 isolation B1). It is left out of every grant
+as the state root is (`_reads_outside`, `_apart`); nothing confined needs
+it, since only the orchestrator takes a slot. Where no such mount exists (Fly, EC2 — one run per
 machine) the slots live under the state root, which is host-wide there.
 
 **At the measured ceiling, a resource kill is an environment limit.** Once

@@ -24711,23 +24711,48 @@ def _beside(top: Path, root: Path) -> list[str]:
 
 
 def _reads_outside(root: Path, *, tmp: bool = True) -> list[str]:
-    """Read grants for everything outside the state root `root`; with `tmp`
-    False, for everything outside `root` and the container's `/tmp`
-    (`SHARED_TMP`), which no grant names: an isolated process's `/tmp` is
-    its own, granted by the shim (DESIGN §6 *Every confined process has its
-    own `/tmp`, `/dev/shm` and IPC*). An entry that resolves into `/tmp`
-    is left out with it."""
+    """Read grants for everything outside the state root `root` and the
+    host directory every run on the host shares (`_HOST_DIR_ENV`, its build
+    slots: `flock` needs only a read-only descriptor and Landlock does not
+    handle it, so a process that could open a slot file could hold every
+    slot from under the other runs — DESIGN §6 *A host-wide build
+    semaphore*); with `tmp` False, outside the container's `/tmp`
+    (`SHARED_TMP`) too, which no grant names: an isolated process's `/tmp`
+    is its own, granted by the shim (DESIGN §6 *Every confined process has
+    its own `/tmp`, `/dev/shm` and IPC*). An entry that resolves into
+    `/tmp` is left out with it."""
     if tmp:
-        return _beside(Path("/"), root)
-    shared = Path(os.path.realpath(SHARED_TMP))
-    if root.is_relative_to(shared):
-        return _beside(Path("/"), shared)
-    out = []
-    for p in _beside(Path("/"), root):
-        real = Path(os.path.realpath(p))
-        if not (real.is_relative_to(shared) or shared.is_relative_to(real)):
-            out.append(p)
-    return out
+        out = _beside(Path("/"), root)
+    else:
+        shared = Path(os.path.realpath(SHARED_TMP))
+        if root.is_relative_to(shared):
+            out = _beside(Path("/"), shared)
+        else:
+            out = []
+            for p in _beside(Path("/"), root):
+                real = Path(os.path.realpath(p))
+                if not (real.is_relative_to(shared)
+                        or shared.is_relative_to(real)):
+                    out.append(p)
+    host = _host_dir()
+    return out if host is None else _around(out, host)
+
+
+def _host_dir() -> Path | None:
+    """The host directory every run on the host shares (`_HOST_DIR_ENV`),
+    resolved; None where there is none."""
+    host = os.environ.get(_HOST_DIR_ENV, "").strip()
+    return (Path(os.path.realpath(host)) if host and os.path.isdir(host)
+            else None)
+
+
+def _apart(paths: list[str], state_root: Path) -> list[str]:
+    """`paths` with the state root and the host directory (`_host_dir`)
+    taken out of each that contains one (`_around`): no grant covers
+    either."""
+    out = _around(paths, state_root)
+    host = _host_dir()
+    return out if host is None else _around(out, host)
 
 
 def _around(paths: list[str], root: Path) -> list[str]:
@@ -24914,9 +24939,9 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     # Every worker reaches the API (and WebFetch, and what its shell
     # fetches) through the egress proxy.
     return WorkerGrants(
-        tuple(dict.fromkeys(_around(rw, state_root))),
+        tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
-                            + _around(ro, state_root))),
+                            + _apart(ro, state_root))),
         egress=True)
 
 
@@ -25845,9 +25870,9 @@ def _measurement_grants(st: "State", tree: str | Path,
     # confined process has its own network*, *An install reaches its
     # inputs*).
     return WorkerGrants(
-        tuple(dict.fromkeys(_around(rw, state_root))),
+        tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
-                            + _around(ro, state_root))),
+                            + _apart(ro, state_root))),
         tuple(env.items()), egress=kind != MEASURE_KIND)
 
 

@@ -297,6 +297,49 @@ write its cwd|echo x > {wt}/f
                    "write its cwd": False}
 
 
+@pytest.mark.parametrize("kind", ["worker", "measurement"])
+def test_no_confined_process_reads_the_hosts_build_slots(
+        leerie, run, tmp_path, monkeypatch, kind):
+    """The host directory every run shares (`LEERIE_HOST_DIR`, its build
+    slots) is in no read grant: `flock` needs only a read-only descriptor
+    and Landlock does not handle it, so a confined process that could open
+    a slot file held every slot from under the other runs (review round 30
+    isolation B1). What lies beside it is still read."""
+    host = tmp_path / "host"
+    (host / "build-slots").mkdir(parents=True)
+    slot = host / "build-slots" / "slot-0"
+    slot.write_text("")
+    beside = tmp_path / "beside"
+    beside.mkdir()
+    (beside / "f").write_text("x\n")
+    monkeypatch.setenv("LEERIE_HOST_DIR", str(host))
+    if kind == "worker":
+        # `tmp_path` lies under the host's `/tmp` (unless TMPDIR moves it),
+        # which no worker grant names (DESIGN §6 *`/tmp` is not a
+        # worker's*): grant it the way conftest's
+        # `_test_tmp_readable_by_measurements` does for the measurement
+        # case, through `_apart`, which must still leave the host directory
+        # out. Without this the worker case read nothing beside it, and
+        # passed only with TMPDIR beneath $HOME.
+        g = _grants(leerie, run)
+        g = g._replace(ro=g.ro + tuple(
+            p for p in leerie._apart([str(tmp_path)], run["state_root"])
+            if p not in g.rw + g.ro))
+    else:
+        g = leerie._measurement_grants(
+            _St(run["user"], run["run_dir"]),
+            run["wts"][f"{RUN_ID}-view-staging"])
+    assert not [p for p in g.ro + g.rw
+                if host.resolve().is_relative_to(os.path.realpath(p))]
+    got = _probe(leerie, g, f"""
+hold a slot|python3 -c 'import fcntl, os; fcntl.flock(os.open("{slot}", os.O_RDONLY), fcntl.LOCK_EX | fcntl.LOCK_NB)'
+list the slots|ls {host}/build-slots
+read beside|cat {beside}/f
+""", {**run["env"], **dict(g.env)})
+    assert got == {"hold a slot": False, "list the slots": False,
+                   "read beside": True}
+
+
 def test_a_temp_dir_that_holds_the_state_root_never_grants_it(
         leerie, run, tmp_path):
     """`TMPDIR=/tmp` with the state root beneath it (pytest's layout, and a

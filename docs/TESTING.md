@@ -6654,14 +6654,26 @@ sample's probe never counts for the next.
   hard-linked file in a worker's `node_modules` nor a committed
   `postinstall` reaches the store or a view. Driven with a pnpm-like
   stand-in installer.
-- `tests/test_worker_confinement.py` (20 tests, DESIGN §6 *A worker writes
-  only where it is granted (I5)*): a real child confined by
+- `tests/test_worker_confinement.py` (23 test functions, 27 cases, DESIGN
+  §6 *A worker writes only where it is granted (I5)*): a real child confined by
   `scripts/landlock_exec.py` with the grants `_worker_grants` derives, on
   leerie's run layout, writes only its grant and reads nothing of the run
   it is not given; the writes notice is rendered from that grant
   (`_confined_writes_notice`), every path it names writable under the
   shim, and `claude_p` appends it to a worker with a shell (review round
-  18 M9).
+  18 M9). Every fixer (4 cases) is refused by the kernel each file that
+  records a held-out set, a shell `cat` included, which is why those CLI
+  `Read` denies are gone. A read-only worker in a subtask tree reads that
+  tree's own repository (`<run>/tree-repos/<tree>/`), so its `git` works
+  there, and writes nothing of it. No confined process, a worker or a
+  measurement (2 cases), can open or list the host's build slots
+  (`LEERIE_HOST_DIR`), while what lies beside that directory is read; the
+  worker case grants the test's `tmp_path` through `_apart`, as conftest's
+  `_test_tmp_readable_by_measurements` does for the measurement case,
+  because a worker's grants never name `/tmp`, where pytest puts
+  `tmp_path` — without it the worker case read nothing beside the host
+  directory and passed only with `TMPDIR` beneath `$HOME`. With `_host_dir()`
+  returning None both cases fail.
 - `tests/test_run_settings.py` (54 tests, review rounds 17 H2 and 18 H1,
   DESIGN §8 *The settings are leerie's*): both checker halves and both
   restore halves. A setting written from a worker's tree (each key DESIGN

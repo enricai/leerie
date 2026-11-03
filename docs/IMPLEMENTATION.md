@@ -4386,16 +4386,22 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   for runs on that tree's stores*): when `_installed_tree_stores(cwd)` is
   not None, that directory (made 0700) is added to `rw` when the cwd is
   (a committing worker, or bare `Bash`), else to `ro`. Last,
-  `_around(paths, state_root)` replaces any path that contains the state
-  root by `_beside(path, state_root)` — no grant covers the root whole;
-  `_reads_outside`'s paths, which never do, are not passed through it.
+  `_apart(paths, state_root)` replaces any path that contains the state
+  root by `_beside(path, state_root)` (`_around`), then any that contains
+  the host directory (`_host_dir()`: the realpath of `$LEERIE_HOST_DIR`
+  when it is a directory, else None) the same way — no grant covers
+  either whole; `_reads_outside`'s paths, which never do, are not passed
+  through it.
 - `_beside(top, root)` — at each directory from `top` down to `root`'s
   parent, every entry except the one on the way to `root` and except a
   symlink resolving onto that path or beneath `root`. `_reads_outside(root,
   *, tmp=True)` is `_beside(Path("/"), root)`; with `tmp=False` (every
   worker) `SHARED_TMP` is left out too: `_beside(Path("/"), SHARED_TMP)`
   when the root lies beneath it, else every path whose realpath is
-  neither beneath nor above it.
+  neither beneath nor above it. Either way the host directory
+  (`_host_dir()`, the build slots) is then taken out by `_around`: a
+  read-only descriptor can `flock` a slot (DESIGN §6 *A host-wide build
+  semaphore*). `_measurement_grants` ends the same way (`_apart`).
 - `_confined_argv(grants, cmd, *, sandbox=None, report_fd=None, cli=False,
   worker_root=True)` — `[sys.executable, "-I", "-S", LANDLOCK_SCRIPT,
   <--isolate | --sandbox …>, --rw…, --ro…, "--", *cmd]` (§ *Isolation and
