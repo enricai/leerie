@@ -8298,6 +8298,18 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     "view-<basename>"), <tip>, repo=<run repo>)`.
     Nothing is shared in from `tree`. An unreadable branch or a failed add
     `die()`s ("the committed view of <tree> cannot be made: …").
+    `_drop_view(leerie_dir, tree) -> None` (DESIGN §8 *A view lives no
+    longer than its tree*): the view at `<run-dir>/worktrees/
+    _worktree_dirname(<run id>, "view-<tree name>")` removed (`git
+    --git-dir <run-dir>/repo worktree remove --force`, then
+    `_rmtree_owned` of what is left), `<run-dir>/tree-stores/<view name>`
+    removed, and `_VIEWS[realpath(tree)]` and the view's
+    `_VIEW_INSTALLS`/`_DEPS_FAILED`/`_DEPS_KEPT`/`_INSTALL_OUTPUTS`/
+    `_DEPS_INSTALLED` entries dropped; absent ones are no error.
+    `_prune_subtask_worktree` calls it after removing the tree (a tree of
+    its own repository: only when `_drop_tree_repo(..., take=True)`
+    succeeded), `_reset_subtask_worktree` after `_drop_tree_repo(...,
+    take=False)`.
     `async _measured_tree(st, tree, caps, *, log_path, label) -> str`: the
     view with `_ensure_worktree_deps(<view>, …, label_prefix=label,
     log_prefix=label)` applied (the recipe's `install` and `build` entries,

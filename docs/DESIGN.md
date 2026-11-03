@@ -11406,6 +11406,24 @@ again on the new tip and reads it, over its own earlier output — the package
 manager's incremental install, which is the residual difference from a fresh
 view.
 
+*A view lives no longer than its tree.* *Designed 2026-11-03 (the live
+0.43.0 barnacle runs).* A view was replaced or moved only when its tree's
+tip moved, so nothing removed it when its tree went: a subtask's tree is
+pruned once its branch is integrated, and reset before a retry, and its
+view — a full checkout with a copied install, about 650 MB on barnacle
+(603 MB of it `node_modules`, link count 1 by design: *A view's install
+never writes leerie's store*) — stayed until the run ended. Counted on the
+seven live runs: 43 views (37 of subtask trees, 6 of staging), about 27 GB
+of the runs' 40 GB by `du`; one run held 9 subtask views beside 2
+remaining subtask trees. And the in-process record of views
+does not survive a resume, so a view made before one was reachable by
+nothing for the rest of the run. Now the view of a tree, and the tree's
+view stores, are removed wherever the tree is: when a subtask's tree is
+pruned after integration (only once its branch is taken, as the tree
+itself) and when it is reset for a retry (`_drop_view`). The view's path is
+derived from the tree's name, never from the process's record, so a view a
+process before a resume made goes the same way.
+
 Measured with the confined install, copy import, the store fetch and the
 stores emptied on a move (review round 19), a new tip with unchanged install
 inputs: barnacle 14.6–16.1 s moved against 28.8–34.6 s remade (three of

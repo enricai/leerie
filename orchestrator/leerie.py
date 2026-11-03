@@ -6535,6 +6535,30 @@ async def _rmtree_fallback_and_prune(worktree: Path, leerie_dir: Path) -> None:
     await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
 
 
+def _drop_view(leerie_dir: Path, tree: Path) -> None:
+    """Remove the committed view of the worker tree `tree` and its own
+    stores (DESIGN §8 *A view lives no longer than its tree*): the view at
+    `<run-dir>/worktrees/<prefix>-view-<tree name>` — a checkout of the run
+    repository — and `<run-dir>/tree-stores/<view name>`, with every record
+    this process keeps of it. Derived from the tree's name alone, so a view
+    a process before a resume made goes too. Absent ones are the idempotent
+    case."""
+    run_dir = Path(leerie_dir)
+    view = run_dir / "worktrees" / _worktree_dirname(
+        run_dir.name, f"view-{Path(tree).name}")
+    subprocess.run(["git", "--git-dir", str(run_dir / RUN_REPO_NAME),
+                    "worktree", "remove", "--force", str(view)],
+                   capture_output=True, check=False)
+    if view.exists() or view.is_symlink():
+        _rmtree_owned(view)
+    _rmtree_owned(run_dir / TREE_STORES_DIRNAME / view.name)
+    _VIEWS.pop(os.path.realpath(tree), None)
+    real = os.path.realpath(view)
+    for memo in (_VIEW_INSTALLS, _DEPS_FAILED, _DEPS_KEPT, _INSTALL_OUTPUTS):
+        memo.pop(real, None)
+    _DEPS_INSTALLED.discard(real)
+
+
 async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> None:
     """Remove the per-subtask worktree directory and branch so a corrective
     retry can start clean from `new-worktree.sh`'s "fresh subtask" path.
@@ -6566,6 +6590,7 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     # repository per committing tree (I6)*).
     await asyncio.to_thread(_drop_tree_repo, Path(leerie_dir),
                             worktree.name, take=False)
+    await asyncio.to_thread(_drop_view, Path(leerie_dir), worktree)
 
 
 async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
@@ -6583,11 +6608,12 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     worktree = _subtask_worktree_path(leerie_dir, sid)
     # A tree of its own repository: its branch is taken, then the tree and
     # its repository go (DESIGN §6 *A repository per committing tree (I6)*).
-    # A take that fails keeps both.
+    # A take that fails keeps both, and the view of what it holds.
     if (Path(leerie_dir) / TREE_REPOS_NAME / worktree.name / "HEAD").is_file():
         if await asyncio.to_thread(_drop_tree_repo, Path(leerie_dir),
                                    worktree.name, take=True):
             await asyncio.to_thread(_rmtree_owned, worktree)
+            await asyncio.to_thread(_drop_view, Path(leerie_dir), worktree)
         return
     try:
         await run_proc(["git", "--git-dir",
@@ -6597,6 +6623,7 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     except subprocess.TimeoutExpired:
         log(f"[{sid}] git worktree remove timed out; falling back to rmtree")
     await _rmtree_fallback_and_prune(worktree, leerie_dir)
+    await asyncio.to_thread(_drop_view, Path(leerie_dir), worktree)
 
 
 def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
