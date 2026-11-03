@@ -19,8 +19,14 @@ jobs:
     # Raised from 10 on 2026-08-19. Observed runtime had reached
     # 7.9-9.7 min against the old 10 min cap, so a fully green suite
     # was one slow runner away from failing on the timeout rather than
-    # on a test. Headroom, not a licence to let the suite grow.
-    timeout-minutes: 20
+    # on a test.
+    #
+    # Raised again from 20 on 2026-11-03: on PR #297 all three matrix
+    # legs (3.10/3.11/3.12) reported "Cancelled after 20m" — killed by
+    # this cap, not by a failing test. 40 restores roughly the 2x
+    # headroom over observed runtime that the 20 min cap originally
+    # had. Headroom, not a licence to let the suite grow.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
