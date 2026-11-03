@@ -45,15 +45,20 @@ DIGEST = "sha256:" + "d" * 64
 
 
 def _extract_ensure_image() -> str:
-    """The REAL `ensure_image()` function and its helpers (`_fly_cache_get`,
-    `_fly_digest_ok`, `_fly_push`), lifted out of the launcher verbatim.
+    """The REAL `ensure_image()` function and its helpers (`_build_job`,
+    `_build_job_end`, `_fly_cache_get`, `_fly_digest_ok`, `_fly_push`),
+    lifted out of the launcher verbatim.
     See module docstring for the body-blindness rationale and the live
     falsification result."""
     src = LAUNCHER.read_text()
     start = src.index("# _fly_cache_get <cache-file> <tag>")
     fn = src.index("ensure_image() {", start)
     end = src.index("\n}\n", fn) + len("\n}\n")
-    return src[start:end]
+    # `_fly_push` runs build-push.sh through `_build_job` (DESIGN §6 *A
+    # repository image's build directory lives only as long as its launch*).
+    job = src.index('_BUILD_JOB_PID=""\n_build_job() {')
+    job_end = src.index("\n}\n", src.index("_build_job_end() {", job)) + 3
+    return src[job:job_end] + src[start:end]
 
 
 # Bash harness wrapping the REAL ensure_image() extracted above.

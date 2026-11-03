@@ -294,7 +294,8 @@ def test_interactive_script_command_is_a_single_quoted_string(tmp_path):
     concatenation that would break on paths/values containing spaces or
     shell metacharacters."""
     invocation = _extract_invocation()
-    assert '_nerdctl_run_quoted="nerdctl run"' in invocation
+    assert ('_nerdctl_run_quoted="nerdctl --namespace $LEERIE_IMAGE_NS run"'
+            in invocation)
     assert "printf -v _rarg_q '%q' \"$_rarg\"" in invocation
     assert 'script -qe -c "$_nerdctl_run_quoted" -a "$_log_tee_target"' in invocation
 

@@ -12,7 +12,7 @@ Verifies Phase-2 per-repo image identity and rebuild-trigger logic:
 Strategy: extract the real functions (`_leerie_repo_id`,
 `_leerie_checkout_id`, `_repo_image_digest`,
 `_leerie_should_generate_dockerfile`, `resolve_repo_image_tag`,
-`ensure_base_in_buildkit_ns`, `build_repo_image`) and the top-level
+`ensure_base_in_worker_ns`, `build_repo_image`) and the top-level
 rebuild-decision block verbatim out of the launcher (mirroring
 `tests/test_resolve_ec2_vars.py`'s `_extract_resolve_ec2_knob`), rather than
 hand-reproducing them. A hand-copied reproduction is body-blind by
@@ -37,6 +37,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE
 from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
                                             NERDCTL_IMAGE_INSPECT_STUB,
                                             REPO_DIGEST)
@@ -78,16 +79,20 @@ def _extracted_block() -> str:
         _extract_line('REPO_IMAGE_REF=""'),
         _extract_line('_REPO_BUILD_DIR=""'),
         _extract_line('_REPO_BUILD_CTX=""'),
-        _extract_line('_REPO_NONCE=""'),
         _extract_line('_REPO_DF_SHA=""'),
         _extract_line('_REPO_CTX_SHA=""'),
         _extract_fn("_repo_build_dir() {"),
         _extract_fn("_repo_build_prepare() {"),
+        _extract_line('_BUILD_JOB_PID=""'),
+        _extract_fn("_build_job() {"),
+        _extract_fn("_build_job_end() {"),
         _extract_fn("_repo_build_done() {"),
         _extract_fn("_repo_build_fail() {"),
+        _extract_fn("_repo_context_retime() {"),
         _extract_fn("_repo_context_sha() {"),
         _extract_fn("_repo_image_dockerfile() {"),
-        _extract_fn("_repo_image_nonce() {"),
+        _extract_fn("_repo_image_wrap() {"),
+        _extract_fn("_repo_layout_digest() {"),
         _extract_fn("_check_repo_image() {"),
         _extract_fn("_repo_image_prepare() {"),
         _extract_fn("_leerie_repo_id() {"),
@@ -95,7 +100,7 @@ def _extracted_block() -> str:
         _extract_fn("_repo_image_digest() {"),
         _extract_fn("_leerie_should_generate_dockerfile() {"),
         _extract_fn("resolve_repo_image_tag() {"),
-        _extract_fn("ensure_base_in_buildkit_ns() {"),
+        _extract_fn("ensure_base_in_worker_ns() {"),
         _extract_fn("build_repo_image() {"),
     ])
 
@@ -108,21 +113,21 @@ def _harness() -> str:
     return r"""
 #!/usr/bin/env bash
 set -euo pipefail
+""" + FRONTEND_SH_SOURCE + BUILDCTL_STUB + r"""
 
 remote_log() { echo "[leerie] $*" >&2; }
 
 nerdctl() {
+  # leerie names its namespace on every call (LEERIE_IMAGE_NS).
+  if [ "${1:-}" = "--namespace" ]; then shift 2; fi
   local cmd="${1:-}"
-  if [ "$cmd" = "--namespace" ]; then
-    return 0   # ensure_base_in_buildkit_ns's namespace probe/copy: no-op ok
-  fi
   if [ "$cmd" = "image" ]; then
     shift
     _stub_image_inspect "$@" && return 0
     return "${NERDCTL_INSPECT_RC:-0}"
   fi
   if [ "$cmd" = "build" ]; then
-    _stub_build_done
+    _stub_build_done "$@"
     return "${NERDCTL_BUILD_RC:-0}"
   fi
   return 0
@@ -433,7 +438,7 @@ def test_rebuild_false_when_image_present_and_hash_matches(tmp_path: Path):
     version = "0.99.test"
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     (state_dir / ".dockerfile-hash").write_text(
-        f"{version}:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
+        f"{version}:worker-root-2:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
     result = _run_with_rebuild_decision(
         'echo "done"',
         env={
@@ -467,7 +472,7 @@ def test_a_linked_dockerfile_is_never_read_nor_reused(tmp_path: Path):
     version = "0.99.test"
     sha = hashlib.sha256(outside.read_bytes()).hexdigest()
     (state_dir / ".dockerfile-hash").write_text(
-        f"{version}:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
+        f"{version}:worker-root-2:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
     result = _run_with_rebuild_decision(
         'echo "done"',
         env={
@@ -524,7 +529,7 @@ def _up_to_date_world(tmp_path: Path, stored: str) -> tuple[Path, Path]:
     state_dir.mkdir()
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     (state_dir / ".dockerfile-hash").write_text(
-        f"0.99.test:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA}{stored}\n")
+        f"0.99.test:worker-root-2:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA}{stored}\n")
     return user_repo, state_dir
 
 

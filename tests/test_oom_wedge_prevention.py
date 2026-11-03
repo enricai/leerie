@@ -119,7 +119,7 @@ def test_reaper_uses_label_and_kill():
     fn = text[start:end]
     assert "leerie.launcher_pid" in fn
     assert "kill -0" in fn
-    assert "nerdctl kill" in fn
+    assert 'nerdctl --namespace "$_cns" kill' in fn
     # Must only act on a running container.
     assert "running" in fn
 
@@ -153,6 +153,7 @@ set -u
 remote_log() {{ echo "$@"; }}
 STUB_STATUS="{status}"; STUB_PID="{pid}"; KILLED=""
 nerdctl() {{
+  [ "$1" = "--namespace" ] && shift 2
   case "$2" in
     "-f")
       case "$3" in
@@ -161,7 +162,10 @@ nerdctl() {{
       esac ;;
     *) [ "$1" = "kill" ] && KILLED="yes" ;;
   esac
+  return 0
 }}
+LEERIE_IMAGE_NS=leerie
+{cns}
 {fn}
 _reap_orphaned_container "fakeid"
 echo "KILLED=${{KILLED}}"
@@ -177,9 +181,17 @@ def _reaper_fn_source() -> str:
     return fn.replace("\n  sleep 1", "\n  :")
 
 
+def _container_ns_source() -> str:
+    text = _launcher_text()
+    start = text.index("_container_ns() {")
+    return text[start:text.index("\n}", start) + 2]
+
+
 def _run_reaper(status: str, pid: str) -> bool:
     """Return True if the reaper issued `nerdctl kill`."""
-    script = _REAPER_HARNESS.format(status=status, pid=pid, fn=_reaper_fn_source())
+    script = _REAPER_HARNESS.format(status=status, pid=pid,
+                                    fn=_reaper_fn_source(),
+                                    cns=_container_ns_source())
     out = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, timeout=30
     )

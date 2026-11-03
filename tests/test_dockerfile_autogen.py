@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 
 from tests.committed_tree import commit_tree
-from tests.conftest import LOG_SH_SOURCE
+from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
 from tests.dockerfile_autogen_extract import extract_autogen_block as _extract_autogen_block
 from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
 
@@ -41,10 +41,12 @@ set -euo pipefail
 remote_log() { echo "[leerie] $*" >&2; }
 
 nerdctl() {
+  # leerie names its namespace on every call (LEERIE_IMAGE_NS).
+  if [ "${1:-}" = "--namespace" ]; then shift 2; fi
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     image)  _stub_image_inspect "$@" && return 0; return "${NERDCTL_INSPECT_RC:-0}" ;;
-    build)  _stub_build_done; return "${NERDCTL_BUILD_RC:-0}" ;;
+    build)  _stub_build_done "$@"; return "${NERDCTL_BUILD_RC:-0}" ;;
     run)    echo "nerdctl-run: image=${REPO_IMAGE_REF:-$IMAGE_TAG}"; return 0 ;;
     *)      return 0 ;;
   esac
@@ -63,7 +65,11 @@ USER_REPO="${USER_REPO:-/tmp/test-user-repo}"
 IMAGE_TAG="${IMAGE_TAG:-leerie:${LEERIE_VERSION}}"
 LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-/tmp/leerie-state-test}"
 """
-_HARNESS_PREFIX = LOG_SH_SOURCE + _HARNESS_PREFIX
+# The launcher sources scripts/dockerfile-frontend.sh near its top, and the
+# extracted block's build decision calls ensure_frontend_in_worker_ns, and
+# leerie_buildkit_check asks `buildctl` (BUILDCTL_STUB).
+_HARNESS_PREFIX = (LOG_SH_SOURCE + FRONTEND_SH_SOURCE + BUILDCTL_STUB
+                   + _HARNESS_PREFIX)
 
 
 def _run_harness(body: str, env: dict | None = None) -> subprocess.CompletedProcess:

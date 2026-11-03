@@ -110,6 +110,14 @@ _from_checkout() {
 # chose*); the file defines functions only.
 # shellcheck source=scripts/host-finalize.sh
 . "$LEERIE_REPO/scripts/host-finalize.sh"
+# LEERIE_DOCKERFILE_FRONTEND, the frontend every build is given, and
+# ensure_frontend_in_worker_ns (DESIGN §6 *A repository's parser directives
+# are its own build's; its frontend is leerie's*); LEERIE_IMAGE_NS, the
+# containerd namespace leerie's images and containers live in, and the
+# checks that no BuildKit worker reads it (DESIGN §6 *No build consumes what
+# another build left in BuildKit*).
+# shellcheck disable=SC1091
+. "$LEERIE_REPO/scripts/dockerfile-frontend.sh"
 
 # Image tag = leerie:<version>. Version comes from plugin.json (single source of
 # truth — same one `leerie version` reads). The launcher only needs the value
@@ -916,7 +924,23 @@ _auto_detect_fly_runtime() {
 # fly-machine.json sidecar exists.
 _is_local_container() {
   local run_id="$1"
-  [ -n "$run_id" ] && nerdctl inspect "$run_id" >/dev/null 2>&1
+  [ -n "$run_id" ] && _container_ns "$run_id" >/dev/null
+}
+
+# _container_ns <run-id> — prints the containerd namespace holding the run's
+# container: leerie's (LEERIE_IMAGE_NS), or `default`, where a run an earlier
+# leerie launched keeps it (DESIGN §6 *No build consumes what another build
+# left in BuildKit*). Returns 1, printing nothing, when neither holds one.
+_container_ns() {
+  local _n
+  [ -n "$1" ] || return 1
+  for _n in "$LEERIE_IMAGE_NS" default; do
+    if nerdctl --namespace "$_n" inspect "$1" >/dev/null 2>&1; then
+      printf '%s\n' "$_n"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # --- _reap_orphaned_container ---------------------------------------------
@@ -937,15 +961,17 @@ _is_local_container() {
 _reap_orphaned_container() {
   local run_id="$1"
   [ -n "$run_id" ] || return 0
+  local _cns
+  _cns="$(_container_ns "$run_id")" || return 0
   # Only act on a container that exists AND is still running.
   local status
-  status="$(nerdctl inspect -f '{{.State.Status}}' "$run_id" 2>/dev/null)" || return 0
+  status="$(nerdctl --namespace "$_cns" inspect -f '{{.State.Status}}' "$run_id" 2>/dev/null)" || return 0
   [ "$status" = "running" ] || return 0
   # Read the owning launcher PID from the label. Missing label (older
   # container from before this change) → treat as unknown; do NOT reap, to
   # avoid killing a genuinely live run.
   local owner_pid
-  owner_pid="$(nerdctl inspect -f '{{index .Config.Labels "leerie.launcher_pid"}}' "$run_id" 2>/dev/null)"
+  owner_pid="$(nerdctl --namespace "$_cns" inspect -f '{{index .Config.Labels "leerie.launcher_pid"}}' "$run_id" 2>/dev/null)"
   case "$owner_pid" in
     ''|'<no value>') return 0 ;;
     *[!0-9]*) return 0 ;;
@@ -957,7 +983,7 @@ _reap_orphaned_container() {
     return 0
   fi
   remote_log "resume: reaping orphaned container for run $run_id (owning launcher pid $owner_pid is dead)"
-  nerdctl kill "$run_id" >/dev/null 2>&1 || true
+  nerdctl --namespace "$_cns" kill "$run_id" >/dev/null 2>&1 || true
   # nerdctl --rm removes it on kill; give the kernel a moment to release the
   # run-dir flock before the fresh orchestrator tries to acquire it.
   sleep 1
@@ -1772,6 +1798,7 @@ PY
     esac
     LEERIE_PRUNE_DAYS="$_prune_days" LEERIE_PRUNE_APPLY="$_prune_apply" \
       LEERIE_PRUNE_HOST_FINALIZE="$LEERIE_REPO/scripts/host-finalize.sh" \
+      LEERIE_PRUNE_CONTAINER_NS="$LEERIE_IMAGE_NS default" \
       python3 -I - "$LEERIE_STATE_HOST_DIR" "$USER_REPO" <<'PY'
 import fcntl, json, os, pathlib, re, shutil, stat, subprocess, sys, time
 
@@ -1925,9 +1952,14 @@ def _is_live(run_dir, run_id: str) -> bool:
         return True
     finally:
         os.close(fd)
+    # Leerie's namespace, then `default`, where a run an earlier leerie
+    # launched keeps its container (the launcher's _container_ns).
     try:
-        return subprocess.run(["nerdctl", "inspect", run_id],
-                              capture_output=True, timeout=10).returncode == 0
+        return any(
+            subprocess.run(["nerdctl", "--namespace", ns, "inspect", run_id],
+                           capture_output=True, timeout=10).returncode == 0
+            for ns in os.environ.get("LEERIE_PRUNE_CONTAINER_NS",
+                                     "leerie default").split())
     except subprocess.TimeoutExpired:
         # Fail closed: an unreachable container runtime is "cannot
         # determine", and prune must never resolve that as "dead".
@@ -3366,7 +3398,8 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/lib.sh"
       remote_log "stop: stopping local container $(_terminal_safe "$LEERIE_RUN_ID")..."
-      nerdctl stop "$_stop_run_id" >/dev/null 2>&1 || true
+      _stop_cns="$(_container_ns "$_stop_run_id")" || _stop_cns="$LEERIE_IMAGE_NS"
+      nerdctl --namespace "$_stop_cns" stop "$_stop_run_id" >/dev/null 2>&1 || true
       _ensure_run_json "$_stop_run_dir" || true
       update_run_json "$_stop_sidecar" \
         paused_at "$(iso_now)" \
@@ -3554,7 +3587,8 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/lib.sh"
       remote_log "kill: destroying local container $_kill_run_id"
-      nerdctl kill "$_kill_run_id" >/dev/null 2>&1 || true
+      _kill_cns="$(_container_ns "$_kill_run_id")" || _kill_cns="$LEERIE_IMAGE_NS"
+      nerdctl --namespace "$_kill_cns" kill "$_kill_run_id" >/dev/null 2>&1 || true
       if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
         _ensure_run_json "$_kill_run_dir" || true
         _kill_sidecar="$_kill_run_dir/run.json"
@@ -6282,15 +6316,64 @@ fi
 unset _skip_freshness_check
 
 # --- build image if not present (one-time, ~60-120s) --------------------
-if ! nerdctl image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+# In leerie's containerd namespace, which no BuildKit worker reads (DESIGN §6
+# *No build consumes what another build left in BuildKit*); nerdctl exports
+# the image there. With the operator's Docker config: leerie's own
+# Dockerfile names only public images.
+if ! nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
   remote_log "building container image (one-time; ~60-120s)..."
-  nerdctl build \
+  ensure_frontend_in_worker_ns
+  _base_ns="$(leerie_cache_mount_ns)" \
+    || { remote_log "error: could not draw a cache-mount namespace for the build"; exit 1; }
+  nerdctl --namespace "$LEERIE_IMAGE_NS" build \
+    ${LEERIE_BUILDKIT_HOST:+--buildkit-host "$LEERIE_BUILDKIT_HOST"} --no-cache \
+    --build-arg BUILDKIT_SYNTAX="$LEERIE_DOCKERFILE_FRONTEND" \
+    --build-arg BUILDKIT_CACHE_MOUNT_NS="$_base_ns" \
     --build-arg HOST_UID="$(id -u)" \
     --build-arg HOST_GID="$(id -g)" \
     -t "$IMAGE_TAG" \
     "$LEERIE_REPO" \
-    || { remote_log "error: container image build failed"; exit 1; }
+    || { leerie_prune_cache_mounts "$_base_ns" || true
+         remote_log "error: container image build failed"; exit 1; }
+  leerie_prune_cache_mounts "$_base_ns" || true
+  unset _base_ns
 fi
+
+# --- a repository image's build directory -------------------------------
+# $_REPO_BUILD_DIR (.image-build/b.<launcher pid>.<random>, _repo_build_dir)
+# holds the context and, between a repository image's two builds, a ~1 GB
+# OCI layout; it lives only as long as its launch (DESIGN §6 *A repository
+# image's build directory lives only as long as its launch*). The EXIT trap
+# below removes it on every exit that runs code, and bash runs it on TERM and
+# HUP too, at once (a TERM trap would wait for the foreground build to end);
+# the $STAGE traps that replace it later call _repo_build_done as well. What
+# no trap survives (SIGKILL, an OOM kill, a host crash) the next launch's
+# sweep removes: a b.<pid>.* whose launcher no longer runs, at once, and any
+# entry untouched for a day (a name without a PID, from before this rule, or
+# a PID a live process reuses). Backgrounded, holding none of the launcher's
+# stdio, like _sweep_stale_stages, whose rule this is.
+_sweep_stale_builds() {
+  local _e _n _pid
+  for _e in "$LEERIE_STATE_HOST_DIR/.image-build"/b.*; do
+    [ -e "$_e" ] || [ -L "$_e" ] || continue
+    _n=${_e##*/b.}
+    _pid=${_n%%.*}
+    case "$_pid" in
+      ''|*[!0-9]*) _pid="" ;;
+    esac
+    [ "$_pid" = "$_n" ] && _pid=""
+    if [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; then
+      rm -rf "$_e"
+      continue
+    fi
+    if [ -n "$(find "$_e" -maxdepth 0 -mmin +1440 2>/dev/null)" ]; then
+      rm -rf "$_e"
+    fi
+  done
+  return 0
+}
+( _sweep_stale_builds ) </dev/null >/dev/null 2>&1 &
+trap '_repo_build_done' EXIT
 
 # --- per-repo derived image (local nerdctl) -----------------------------
 # When the repo supplies .leerie/Dockerfile (or setup_packages in
@@ -6386,7 +6469,7 @@ print(hashlib.sha256(os.fsencode(sys.argv[1])).hexdigest()[:12])' "$USER_REPO"
 # (`sha256:<hex>`, which `nerdctl run` takes), or nothing.
 _repo_image_digest() {
   local _d
-  _d="$(nerdctl image inspect -f '{{index .RepoDigests 0}}' "$1" 2>/dev/null)" || return 0
+  _d="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{index .RepoDigests 0}}' "$1" 2>/dev/null)" || return 0
   _d="${_d##*@}"
   case "$_d" in
     sha256:*) printf '%s' "$_d" ;;
@@ -6429,48 +6512,152 @@ resolve_repo_image_tag() {
 
 # Make the base image resolvable by BuildKit for the derived `FROM $BASE_IMAGE`.
 #
-# Colima's buildkitd runs a containerd worker bound to the `buildkit` containerd
-# namespace (`org.mobyproject.buildkit.worker.containerd.namespace=buildkit`),
-# while `nerdctl build`/`inspect`/`run` all operate in the `default` namespace.
-# containerd namespaces are isolated, so a `FROM leerie:$VERSION` in the derived
-# build cannot see the base image (which lives in `default`) and BuildKit falls
-# back to the registry — where the never-pushed tag 401s ("pull access denied,
-# repository does not exist"). Copy the base into the `buildkit` namespace so the
-# `FROM` resolves locally. The derived build still runs in `default` (below), so
-# the built image lands where `nerdctl run` reads it. Idempotent: skip when the
-# base tag is already present in the buildkit namespace (a `save|load` of the
-# multi-GB base is ~15-20s). Best-effort and non-fatal — if the copy fails, the
-# build still attempts and surfaces its own error.
-ensure_base_in_buildkit_ns() {
-  if nerdctl --namespace buildkit image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
-    return 0
-  fi
-  remote_log "copying base image into buildkit namespace (one-time; ~15-20s)..."
-  local _save_load_tar _save_load_err
-  _save_load_tar="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image.XXXXXX.tar")"
-  _save_load_err="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image-copy.XXXXXX.log")"
-  if ! { nerdctl save -o "$_save_load_tar" "$IMAGE_TAG" && \
-         nerdctl --namespace buildkit load -i "$_save_load_tar"; } >"$_save_load_err" 2>&1; then
-    remote_log "warning: could not copy base image into buildkit namespace — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
-    remote_log "warning: save/load error output: $(cat "$_save_load_err")"
-  fi
-  rm -f "$_save_load_tar" "$_save_load_err"
+# The base lives in leerie's namespace ($LEERIE_IMAGE_NS), which no BuildKit
+# worker reads (DESIGN §6 *No build consumes what another build left in
+# BuildKit*), so a `FROM leerie:$VERSION` there would fall back to the
+# registry, where the never-pushed tag 401s ("pull access denied, repository
+# does not exist"). Copy the base into each namespace BuildKit's workers read
+# ($LEERIE_BUILDKIT_WORKER_NS, leerie_buildkit_resolve: `default` on the
+# standard rootless setup, `buildkit` on Colima); the base holds nothing a
+# repository may not read. Skipped when the copy there has the base's id; a
+# base rebuilt under the same tag is copied again, or the repository image
+# would be built on a base other than the one _check_repo_image compares it
+# with. Best-effort and non-fatal — if the copy fails, the build still
+# attempts and surfaces its own error.
+ensure_base_in_worker_ns() {
+  local _w _id _wid _save_load_tar _save_load_err
+  _id="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null)" || _id=""
+  for _w in $LEERIE_BUILDKIT_WORKER_NS; do
+    _wid="$(nerdctl --namespace "$_w" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null)" || _wid=""
+    if [ -n "$_id" ] && [ "$_wid" = "$_id" ]; then
+      continue
+    fi
+    remote_log "copying base image into $_w, the namespace BuildKit's worker reads (one-time; ~15-20s)..."
+    _save_load_tar="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image.XXXXXX.tar")"
+    _save_load_err="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image-copy.XXXXXX.log")"
+    if ! { nerdctl --namespace "$LEERIE_IMAGE_NS" save -o "$_save_load_tar" "$IMAGE_TAG" && \
+           nerdctl --namespace "$_w" load -i "$_save_load_tar"; } >"$_save_load_err" 2>&1; then
+      remote_log "warning: could not copy base image into $_w — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
+      remote_log "warning: save/load error output: $(cat "$_save_load_err")"
+    fi
+    rm -f "$_save_load_tar" "$_save_load_err"
+  done
 }
 
 # The repository image (DESIGN §6 *The orchestrator's root is leerie's; a
 # repository's root is only a confined process's*). The repository's
-# Dockerfile — committed, or generated from .leerie/config.toml below —
-# builds only the stages leerie copies to /opt/leerie-worker-root; the
-# image's own root is leerie's base, untouched, so the orchestrator, the
-# cgroup broker and container-entry.sh never run in a root the repository
-# shaped. Confined processes get the worker root as theirs
+# Dockerfile — committed, or generated from .leerie/config.toml below — is
+# built as it is, and its result, BuildKit's own default target, is copied
+# by leerie's own Dockerfile (a second build) to /opt/leerie-worker-root;
+# the image's own root is leerie's base, untouched, so the orchestrator,
+# the cgroup broker and container-entry.sh never run in a root the
+# repository shaped. Confined processes get the worker root as theirs
 # (scripts/landlock_exec.py --worker-root). Bumped when the layout changes,
-# so an image built in an older one is rebuilt.
-REPO_IMAGE_LAYOUT="worker-root-1"
+# so an image built in an older one is rebuilt: worker-root-2 is the first
+# built without rewriting the repository's file.
+REPO_IMAGE_LAYOUT="worker-root-2"
+
+# _build_job <cmd> [args...] — runs one build of a repository image, its
+# output through the relay (DESIGN §6 *No text leerie did not write reaches
+# the operator's terminal as a control sequence*), as a background job in a
+# process group of its own, and waits for it; returns <cmd>'s own status.
+# _build_job_end kills that group and waits, and _repo_build_done calls it
+# before it removes the build directory: no build outlives the launch that
+# started it, so none writes the directory again once it is gone (DESIGN §6
+# *A repository image's build directory lives only as long as its launch*).
+# A foreground build would not do: a signal to the launcher's PID alone left
+# its pipeline running, reparented to init, to export into the directory
+# the EXIT trap had removed. `set -m` gives the job its own group (bash 3.2
+# too) and is turned off again at once; stdin is /dev/null, so a job never
+# reads the terminal from the background. The group is never the terminal's
+# foreground one, so the signal handling that follows is stated here, not
+# left to the shell. The job ignores SIGTTOU and SIGTTIN, and what it runs
+# inherits that: under `stty tostop` the relay's first write would stop the
+# whole group, and the wait below would never return; a read of the terminal
+# fails instead of stopping it. While the launcher waits, SIGINT, SIGTERM
+# and SIGHUP run _build_job_die: the cleanup is done in the handler, and
+# only then the signal re-raised with the shell's default handling, so the
+# launcher dies of it. Left to the EXIT trap, a terminal hangup's two
+# SIGHUPs a millisecond apart killed bash 5 before the trap ran, and the
+# build outlived the launch (review round 37, execution E1); bash 3.2
+# otherwise exits 129 on SIGINT. SIGTSTP (^Z) runs _build_job_stop, which
+# stops the build's group with the launcher and continues it when the
+# launcher is continued: the terminal's ^Z reaches only the launcher's
+# group. A trapped signal ends `wait` early, so the launcher waits again
+# while the job still runs. The caller's traps for the four signals are
+# put back afterwards.
+_BUILD_JOB_PID=""
+_build_job() {
+  local _rc=0 _traps
+  _traps="$(trap -p INT TERM HUP TSTP)"
+  _BUILD_JOB_STOPPED=""
+  trap '_build_job_die INT' INT
+  trap '_build_job_die TERM' TERM
+  trap '_build_job_die HUP' HUP
+  set -m
+  {
+    trap '' TTOU TTIN
+    _st=(0 0)
+    "$@" 2>&1 </dev/null | _terminal_relay >&2 || _st=("${PIPESTATUS[@]}")
+    exit "${_st[0]}"
+  } &
+  _BUILD_JOB_PID=$!
+  set +m
+  # After `set +m`: job control sets the shell's own SIGTSTP handling,
+  # replacing a trap set before it (measured, bash 5 and 3.2).
+  trap '_build_job_stop' TSTP
+  while :; do
+    _rc=0
+    wait "$_BUILD_JOB_PID" || _rc=$?
+    if [ -n "$_BUILD_JOB_STOPPED" ]; then
+      # The launcher was stopped by ^Z and is running again: so is the build.
+      _BUILD_JOB_STOPPED=""
+      trap '_build_job_stop' TSTP
+      kill -CONT -- "-$_BUILD_JOB_PID" 2>/dev/null || true
+    fi
+    if [ "$_rc" -gt 128 ] && kill -0 "$_BUILD_JOB_PID" 2>/dev/null; then
+      continue
+    fi
+    break
+  done
+  _BUILD_JOB_PID=""
+  trap - INT TERM HUP TSTP
+  eval "$_traps"
+  return "$_rc"
+}
+# _build_job_die <SIG> — the cleanup first (_repo_build_done ends the
+# build's group and removes the build directory), then <SIG> again with its
+# default handling, so the launcher dies of it.
+_build_job_die() {
+  _repo_build_done
+  trap - "$1"
+  kill -"$1" $$
+}
+# _build_job_stop — ^Z: the build's group stops, then the launcher stops by
+# the same SIGTSTP with its default handling. _build_job's wait, which the
+# trap ended, continues the build and sets the trap again once the launcher
+# is continued (`fg`, `bg`): bash 5 stops inside this handler, bash 3.2 only
+# after it returns (measured), so the handler cannot continue the build.
+_BUILD_JOB_STOPPED=""
+_build_job_stop() {
+  [ -n "$_BUILD_JOB_PID" ] || return 0
+  kill -STOP -- "-$_BUILD_JOB_PID" 2>/dev/null || true
+  _BUILD_JOB_STOPPED=1
+  trap - TSTP
+  kill -TSTP $$
+}
+_build_job_end() {
+  [ -n "${_BUILD_JOB_PID:-}" ] || return 0
+  kill -KILL -- "-$_BUILD_JOB_PID" 2>/dev/null || true
+  wait "$_BUILD_JOB_PID" 2>/dev/null || true
+  _BUILD_JOB_PID=""
+}
 
 # _repo_build_dir — a directory of the launcher's own for the builds below
-# (never /tmp, never inside the checkout): $_REPO_BUILD_DIR, holding
-# leerie's Dockerfile. _repo_build_prepare adds $_REPO_BUILD_CTX beneath
+# (never /tmp, never inside the checkout), named for the launcher's PID
+# (b.<pid>.<random>, which _sweep_stale_builds reads): $_REPO_BUILD_DIR, holding
+# the repository's Dockerfile (repo/), leerie's (wrap/) and, between the two
+# builds, the first one's image as an OCI layout (worker/). _repo_build_prepare adds $_REPO_BUILD_CTX beneath
 # it, the build context — exactly the paths of the committed tree at HEAD
 # that the repository's Dockerfile can read (_repo_image_dockerfile's
 # list), exported by git (`git archive`), never the checkout directory. An
@@ -6489,7 +6676,7 @@ _REPO_CTX_SHA=""
 _repo_build_dir() {
   [ -n "$_REPO_BUILD_DIR" ] && return 0
   mkdir -p "$LEERIE_STATE_HOST_DIR/.image-build" \
-    && _REPO_BUILD_DIR="$(mktemp -d "$LEERIE_STATE_HOST_DIR/.image-build/b.XXXXXX")" \
+    && _REPO_BUILD_DIR="$(mktemp -d "$LEERIE_STATE_HOST_DIR/.image-build/b.$$.XXXXXX")" \
     || { remote_log "error: could not make a build directory under $LEERIE_STATE_HOST_DIR"; exit 1; }
 }
 _repo_build_prepare() {
@@ -6508,19 +6695,45 @@ _repo_build_prepare() {
         | tar -x -C "$_REPO_BUILD_CTX" -f - \
       || _repo_build_fail "could not export the committed tree as the image build context"
   fi
+  _repo_context_retime "$_REPO_BUILD_CTX" \
+    || _repo_build_fail "could not date the image build context"
   if ! _REPO_CTX_SHA="$(_repo_context_sha "$_REPO_BUILD_CTX")" \
      || [ -z "$_REPO_CTX_SHA" ]; then
     _repo_build_fail "could not hash the image build context"
   fi
 }
 _repo_build_done() {
+  _build_job_end
   if [ -n "$_REPO_BUILD_DIR" ]; then
     rm -rf "$_REPO_BUILD_DIR"
   fi
   _REPO_BUILD_DIR=""
   _REPO_BUILD_CTX=""
   _REPO_CTX_SHA=""
-  _REPO_NONCE=""
+}
+
+# _repo_context_retime <dir> — dates <dir> and every entry beneath it (a
+# link itself, never what it names) at one moment of the past year, to the
+# nanosecond, chosen by a CSPRNG. BuildKit keeps one snapshot of the build
+# context for every nerdctl build and skips a file whose size, mode, owner
+# and time match the snapshot's, without reading it; `git archive` dates
+# every file at the commit's committer time, which a committer chooses. So a
+# contributor's branch, its commit dated at the trusted HEAD's time and each
+# copied file the same size, put its bytes in the trusted branch's image
+# (DESIGN §6 *No build consumes what another build left in BuildKit*). One
+# date for all keeps the order git gave them (a `make` comparing two copied
+# files); a past one keeps tools that refuse future or pre-1980 times.
+_repo_context_retime() {
+  python3 -I -S - "$1" <<'PY'
+import os, secrets, sys, time
+
+root = sys.argv[1]
+t = time.time_ns() - 1 - secrets.randbelow(365 * 86400 * 10**9)
+for d, dirs, files in os.walk(root):
+    for name in dirs + files:
+        os.utime(os.path.join(d, name), ns=(t, t), follow_symlinks=False)
+os.utime(root, ns=(t, t))
+PY
 }
 
 # _repo_context_sha <dir> — the sha256 of a build context as extracted:
@@ -6559,24 +6772,18 @@ _repo_build_fail() {
   exit 1
 }
 
-# _repo_image_dockerfile <out> <nonce> <base> — leerie's Dockerfile for the
-# repository image: the repository's `escape` and `check` parser directives
-# first, where BuildKit reads them, then a comment (so no other directive
-# applies: its `# syntax=` would choose the frontend that builds the whole
-# file, leerie's stages included), the repository's .leerie/Dockerfile with
-# its last stage named, then leerie's stages: the base image's environment and the worker
-# stage's (`env -0`, for scripts/landlock_exec.py's worker_env_changes), and
-# the final stage, `FROM <base>` and one COPY of the worker stage to
-# /opt/leerie-worker-root. The final stage's name carries a nonce drawn for
-# this build and is built with --target, so a repository file that swallows
-# leerie's lines (an unterminated heredoc, a trailing continuation) builds
-# nothing rather than a final stage of its own. The repository's file is
-# read beneath the checkout without following a link, and bounded. Prints
-# the sha256 of the bytes it read: the one digest of the repository's
-# Dockerfile the launcher keys an image on, so no other read of the file by
-# its path (which would follow a committed link, unbounded) ever happens.
-# Writes the build context's paths, NUL-separated, to context-paths beside
-# <out>: every path of HEAD's tree an instruction
+# _repo_image_dockerfile <dir> — the repository's .leerie/Dockerfile, as it
+# is, for the first of the repository image's two builds: its bytes, read
+# beneath the checkout without following a link and bounded, written
+# unchanged to <dir>/repo/Dockerfile (a directory holding nothing else: it
+# is that build's Dockerfile directory). Leerie never edits the file
+# (DESIGN §6 *One image, two roots*): BuildKit alone reads it to build it,
+# and its own default target is the stage leerie copies. Prints the sha256
+# of the bytes it read: the one digest of the repository's Dockerfile the
+# launcher keys an image on, so no other read of the file by its path
+# (which would follow a committed link, unbounded) ever happens.
+# Writes the build context's paths, NUL-separated, to <dir>/context-paths:
+# every path of HEAD's tree an instruction
 # can read from the context (a COPY or ADD source, ONBUILD's too, a RUN
 # bind mount's source; a source with a variable, or a wildcard anywhere but
 # in its last part, stands for its directory up to there, and a wildcard in
@@ -6585,15 +6792,19 @@ _repo_build_fail() {
 # out (the build then fails naming it); "." is the whole tree. A source
 # through a committed link adds each link and what it names within the tree
 # (a target leaving the tree adds nothing, and the build fails as it would).
-# The Dockerfile is lexed as BuildKit lexes it: `# escape=`, any whitespace
-# after the instruction word, comment and empty lines inside a continuation
-# skipped, a continuation joined with no separator, and a heredoc only where
-# a whole shell word is one (`$((1<<N))` and `<<<word` are not).
+# The Dockerfile is lexed as BuildKit lexes it: a leading byte-order mark
+# dropped once, `# escape=`, any whitespace after the instruction word,
+# comment and empty lines inside a continuation skipped, a continuation
+# joined with no separator, and a heredoc only where a whole shell word is
+# one (`$((1<<N))` and `<<<word` are not), words split on Go's whitespace.
+# This reading only makes the context, and never selects a stage: one that
+# differs from BuildKit's can only widen the context or fail the build by
+# name, and the context built is the context keyed.
 _repo_image_dockerfile() {
   python3 -I - "$USER_REPO" "$@" <<'PY'
 import hashlib, json, os, re, stat, subprocess, sys
 
-repo, out, nonce, base = sys.argv[1:5]
+repo, outdir = sys.argv[1:3]
 LIMIT = 1 << 20
 
 
@@ -6626,6 +6837,13 @@ except OSError as e:
     sys.exit(f"leerie: .leerie/Dockerfile cannot be read as a regular file "
              f"beneath the checkout ({e})")
 lines = raw.decode("utf-8", "surrogateescape").split("\n")
+# BuildKit drops a leading byte-order mark, once.
+if lines[0].startswith("\ufeff"):
+    lines[0] = lines[0][1:]
+# Go's unicode.IsSpace, which BuildKit's lexers use: Python's str.isspace
+# also takes \x1c-\x1f, which Go does not.
+GO_WS = ("\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+         "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
 # BuildKit's own lexing (frontend/dockerfile/parser): the parser directives
 # at the top (`# escape=` sets the line-continuation character), a line
 # whose first non-blank character is `#` a comment wherever it is, an empty
@@ -6634,34 +6852,25 @@ lines = raw.decode("utf-8", "surrogateescape").split("\n")
 WS = re.compile(r"[\t\v\f\r ]+")
 
 
-def parser_directives():
-    """[(key, value)] of the parser directives BuildKit reads: from the
-    first line on, each a whole `# key=value` line whose key is one it
-    knows, read until the first line that is not (a comment, a blank line,
-    an instruction or an unknown key ends them)."""
-    found, seen = [], set()
-    for n, line in enumerate(lines):
-        if n == 0 and line.startswith("\ufeff"):
-            line = line[1:]
+def escape_directive():
+    """The `escape` parser directive BuildKit reads: from the first line
+    on, each a whole `# key=value` line whose key is one it knows, read
+    until the first line that is not (a comment, a blank line, an
+    instruction or an unknown key ends them). `\\` when there is none, or
+    one BuildKit refuses (the build then fails by itself)."""
+    escape = "\\"
+    for line in lines:
         d = re.fullmatch(r"#[\t\n\f\r ]*([A-Za-z][A-Za-z0-9]*)[\t\n\f\r ]*="
                          r"[\t\n\f\r ]*(.+?)[\t\n\f\r ]*", line)
         if d is None or d.group(1).lower() not in ("syntax", "escape",
                                                      "check"):
             break
-        key = d.group(1).lower()
-        if key in seen:
-            sys.exit(f"leerie: .leerie/Dockerfile names the {key} parser "
-                     "directive twice (BuildKit refuses it)")
-        seen.add(key)
-        found.append((key, d.group(2)))
-    return found
+        if d.group(1).lower() == "escape" and d.group(2) in ("\\", "`"):
+            escape = d.group(2)
+    return escape
 
 
-directives = parser_directives()
-escape = dict(directives).get("escape", "\\")
-if escape not in ("\\", "`"):
-    sys.exit(f"leerie: .leerie/Dockerfile's escape directive {escape!r} is "
-             "neither \\ nor ` (BuildKit refuses it)")
+escape = escape_directive()
 continuation = re.compile(re.escape(escape) + r"[ \t]*$")
 
 
@@ -6692,7 +6901,10 @@ def shell_name(s, i):
 def shell_dollar(s, i, keep_unset):
     """BuildKit's `processDollar` at `s[i] == "$"`, in an empty
     environment: a name is unset (empty, or kept as written when
-    `keep_unset`), `${n:-w}`/`${n-w}` is `w`. Returns (text, next)."""
+    `keep_unset`), `${n:-w}`/`${n-w}` is `w`, and any other modifier
+    (`${n:?w}`, `${n/a/b}`, `${n//a/b}`, `${n:1:2}`, `${n#w}`...) is read
+    to its closing brace and is empty: BuildKit reads a heredoc on such a
+    line (review round 33, execution F1). Returns (text, next)."""
     start = i
     i += 1
     if i >= len(s) or s[i] != "{":
@@ -6712,15 +6924,11 @@ def shell_dollar(s, i, keep_unset):
         if i >= len(s):
             raise Unlexable("unterminated ${")
         c = s[i]
-    if c not in "-+?" and (colon or c not in "#%"):
-        raise Unlexable(f"unsupported modifier {c!r}")
     word, i = shell_text(s, i + 1, "}", keep_unset)
     if keep_unset:
         return s[start:i], i
     if c == "-":
         return word, i
-    if c == "?":
-        raise Unlexable("unset variable")
     return "", i
 
 
@@ -6783,14 +6991,14 @@ def shell_words(s):
     words, split on unquoted whitespace."""
     words, cur, i = [], "", 0
     while i < len(s):
-        if s[i].isspace():
+        if s[i] in GO_WS:
             if cur:
                 words.append(cur)
                 cur = ""
             i += 1
             continue
         j = i
-        while j < len(s) and not s[j].isspace() and s[j] not in "\\'\"$":
+        while j < len(s) and s[j] not in GO_WS and s[j] not in "\\'\"$":
             j += 1
         if j > i:
             cur += s[i:j]
@@ -6851,7 +7059,7 @@ def split_flags(rest):
     while rest.startswith("--"):
         flag, *more = WS.split(rest, 1)
         flags.append(flag)
-        rest = more[0].strip() if more else ""
+        rest = more[0].strip(GO_WS) if more else ""
     return flags, rest
 
 
@@ -6871,7 +7079,7 @@ def json_form(rest):
 
 
 def is_comment(line):
-    return line.lstrip().startswith("#")
+    return line.lstrip(GO_WS).startswith("#")
 
 
 def instructions():
@@ -6884,7 +7092,7 @@ def instructions():
         if is_comment(first):
             i += 1
             continue
-        joined, ended, j = first.lstrip(), True, i
+        joined, ended, j = first.lstrip(GO_WS), True, i
         m = continuation.search(joined)
         if m:
             joined, ended = joined[:m.start()], False
@@ -6894,7 +7102,7 @@ def instructions():
         while not ended and j + 1 < len(lines):
             j += 1
             part = lines[j].rstrip("\r")
-            if is_comment(part) or not part.strip():
+            if is_comment(part) or not part.strip(GO_WS):
                 continue
             m = continuation.search(part)
             if m:
@@ -6902,44 +7110,23 @@ def instructions():
             else:
                 ended = True
             joined += part
-        words = WS.split(joined.strip(), 1)
+        words = WS.split(joined.strip(GO_WS), 1)
         word, rest = words[0].upper(), (words[1] if len(words) > 1 else "")
         if word == "ONBUILD":
-            words = WS.split(rest.strip(), 1)
+            words = WS.split(rest.strip(GO_WS), 1)
             word, rest = words[0].upper(), (words[1] if len(words) > 1 else "")
         # A JSON-form instruction holds no heredoc (BuildKit's
         # `canContainHeredoc`).
         if word in ("RUN", "COPY", "ADD") and json_form(
-                split_flags(rest.strip())[1]) is None:
+                split_flags(rest.strip(GO_WS))[1]) is None:
             for name, chomp in heredocs(joined):
                 j += 1
                 while j < len(lines) and (
                         lines[j].rstrip("\r").lstrip("\t") if chomp
                         else lines[j].rstrip("\r")) != name:
                     j += 1
-        yield word, rest.strip(), i, j
+        yield word, rest.strip(GO_WS), i, j
         i = j + 1
-
-
-last_from = None
-for word, rest, first, last in instructions():
-    if word == "FROM":
-        last_from = (last, [WS.split(lines[first].strip(), 1)[0]]
-                     + WS.split(rest))
-if last_from is None:
-    sys.exit("leerie: .leerie/Dockerfile has no FROM")
-at, words = last_from
-if len(words) >= 4 and words[-2].upper() == "AS":
-    stage = words[-1]
-else:
-    stage = f"leerie-worker-{nonce}"
-    # In the FROM's own case, so no `FromAsCasing` check (an error under a
-    # repository's `# check=error=true`) fires on leerie's addition.
-    as_word = "as" if words[0] == words[0].lower() else "AS"
-    lines[at] = lines[at].rstrip() + f" {as_word} {stage}"
-if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", stage):
-    sys.exit(f"leerie: .leerie/Dockerfile's last stage name {stage!r} is "
-             "not a plain name")
 
 
 def head_tree():
@@ -7104,37 +7291,56 @@ def context_paths():
     return sorted(out)
 
 
-with open(os.path.join(os.path.dirname(out), "context-paths"), "wb") as f:
+with open(os.path.join(outdir, "context-paths"), "wb") as f:
     f.write(b"".join(os.fsencode(p) + b"\0" for p in context_paths()))
-with open(out, "w") as f:
-    # The repository's `escape` and `check` directives, first, where BuildKit
-    # reads them; never its `syntax` (the built-in frontend builds the file:
-    # it is the grammar this lexer reads, and leerie's own stages are
-    # written for it).
-    for key, value in directives:
-        if key != "syntax":
-            f.write(f"# {key}={value}\n")
-    f.write("# leerie: the repository image (DESIGN §6 *The orchestrator's "
-            "root is leerie's;\n# a repository's root is only a confined "
-            "process's*). The repository's stages\n# follow; leerie's are "
-            "last.\n")
-    f.write("\n".join(lines).rstrip("\n") + "\n\n")
-    f.write(f"FROM {base} AS leerie-baseenv-{nonce}\n"
-            'RUN ["/bin/sh", "-c", "env -0 > /.leerie-base-env"]\n'
-            f"FROM {stage} AS leerie-stage-{nonce}\n"
-            "USER root\n"
-            f"COPY --from=leerie-baseenv-{nonce} /.leerie-base-env "
-            "/.leerie-base-env\n"
-            'RUN ["/bin/sh", "-c", "env -0 > /.leerie-worker-env"]\n'
-            f"FROM {base} AS leerie-final-{nonce}\n"
-            f"COPY --from=leerie-stage-{nonce} / /opt/leerie-worker-root/\n")
+os.makedirs(os.path.join(outdir, "repo"), exist_ok=True)
+with open(os.path.join(outdir, "repo", "Dockerfile"), "wb") as f:
+    f.write(raw)
 print(hashlib.sha256(raw).hexdigest())
 PY
 }
 
-# _repo_image_nonce — 16 hex characters from the kernel's random source.
-_repo_image_nonce() {
-  od -An -N8 -tx1 /dev/urandom | tr -d ' \n'
+# _repo_image_wrap <out> <base> <worker> — leerie's own Dockerfile for the
+# second of the repository image's two builds, written to <out>: no text of
+# the repository's is in it. Two stages record the base image's environment
+# and the worker stage's (`env -0`, for scripts/landlock_exec.py's
+# worker_env_changes), the worker stage <worker> being the first build's
+# image (locally the named build context `leerie-worker`, on Fly that
+# image's digest in the registry); its final stage, the file's default
+# target, is `FROM <base>` and one COPY of the worker stage to
+# /opt/leerie-worker-root.
+_repo_image_wrap() {
+  mkdir -p "$(dirname "$1")" && printf '%s\n' \
+    "# leerie: the repository image (DESIGN §6 *One image, two roots*)." \
+    "FROM $2 AS leerie-baseenv" \
+    'RUN ["/bin/sh", "-c", "env -0 > /.leerie-base-env"]' \
+    "FROM $3 AS leerie-stage" \
+    "USER root" \
+    "COPY --from=leerie-baseenv /.leerie-base-env /.leerie-base-env" \
+    'RUN ["/bin/sh", "-c", "env -0 > /.leerie-worker-env"]' \
+    "FROM $2" \
+    "COPY --from=leerie-stage / /opt/leerie-worker-root/" > "$1"
+}
+
+# _repo_layout_digest <layout> — the manifest digest of the one image an
+# OCI image layout holds, or nothing (and status 1) unless it holds exactly
+# one: the layout the second build reads its worker stage from is the
+# first build's image and nothing else.
+_repo_layout_digest() {
+  python3 -I -S - "$1/index.json" <<'PY'
+import json, re, sys
+try:
+    with open(sys.argv[1]) as f:
+        m = json.load(f).get("manifests")
+except (OSError, ValueError, AttributeError):
+    sys.exit(1)
+if not isinstance(m, list) or len(m) != 1 or not isinstance(m[0], dict):
+    sys.exit(1)
+d = m[0].get("digest")
+if not isinstance(d, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", d):
+    sys.exit(1)
+print(d)
+PY
 }
 
 # _check_repo_image <tag> — the built image is leerie's base plus exactly one
@@ -7143,10 +7349,10 @@ _repo_image_nonce() {
 # the image is removed and the launch stops.
 _check_repo_image() {
   local _tag="$1" _bl _fl _bc _fc
-  _bl="$(nerdctl image inspect -f '{{json .RootFS.Layers}}' "$IMAGE_TAG" 2>/dev/null)" || _bl=""
-  _fl="$(nerdctl image inspect -f '{{json .RootFS.Layers}}' "$_tag" 2>/dev/null)" || _fl=""
-  _bc="$(nerdctl image inspect -f '{{json .Config}}' "$IMAGE_TAG" 2>/dev/null)" || _bc=""
-  _fc="$(nerdctl image inspect -f '{{json .Config}}' "$_tag" 2>/dev/null)" || _fc=""
+  _bl="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{json .RootFS.Layers}}' "$IMAGE_TAG" 2>/dev/null)" || _bl=""
+  _fl="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{json .RootFS.Layers}}' "$_tag" 2>/dev/null)" || _fl=""
+  _bc="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{json .Config}}' "$IMAGE_TAG" 2>/dev/null)" || _bc=""
+  _fc="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{json .Config}}' "$_tag" 2>/dev/null)" || _fc=""
   # `.Config.Image` names the image inspected, so it is the one key left out.
   if python3 -I -c '
 import json, sys
@@ -7163,17 +7369,16 @@ sys.exit(0 if ok else 1)
 ' "$_bl" "$_fl" "$_bc" "$_fc"; then
     return 0
   fi
-  nerdctl image rm "$_tag" >/dev/null 2>&1 || true
+  nerdctl --namespace "$LEERIE_IMAGE_NS" image rm "$_tag" >/dev/null 2>&1 || true
   remote_log "error: the repository image $_tag is not leerie's base plus its worker root (DESIGN §6 *The orchestrator's root is leerie's; a repository's root is only a confined process's*); it was removed"
   return 1
 }
 
-# _repo_image_prepare — draws the build's nonce ($_REPO_NONCE) and writes
-# leerie's Dockerfile for it into $_REPO_BUILD_DIR on base <base>; sets
-# $_REPO_DF_SHA, the sha256 of the repository Dockerfile bytes it read, and
-# makes the build context those bytes read (_repo_build_prepare,
-# $_REPO_CTX_SHA), in place of any made for an earlier Dockerfile.
-_REPO_NONCE=""
+# _repo_image_prepare — copies the repository's Dockerfile into
+# $_REPO_BUILD_DIR/repo (_repo_image_dockerfile); sets $_REPO_DF_SHA, the
+# sha256 of the bytes it read, and makes the build context those bytes read
+# (_repo_build_prepare, $_REPO_CTX_SHA), in place of any made for an
+# earlier Dockerfile.
 _REPO_DF_SHA=""
 _repo_image_prepare() {
   _repo_build_dir
@@ -7182,37 +7387,88 @@ _repo_image_prepare() {
     _REPO_BUILD_CTX=""
     _REPO_CTX_SHA=""
   fi
-  _REPO_NONCE="$(_repo_image_nonce)"
-  [ -n "$_REPO_NONCE" ] || _repo_build_fail "could not draw a build nonce"
-  if ! _REPO_DF_SHA="$(_repo_image_dockerfile "$_REPO_BUILD_DIR/Dockerfile" \
-                         "$_REPO_NONCE" "$1")" || [ -z "$_REPO_DF_SHA" ]; then
+  rm -rf "$_REPO_BUILD_DIR/repo" "$_REPO_BUILD_DIR/wrap" "$_REPO_BUILD_DIR/worker"
+  if ! _REPO_DF_SHA="$(_repo_image_dockerfile "$_REPO_BUILD_DIR")" \
+     || [ -z "$_REPO_DF_SHA" ]; then
     _repo_build_fail "could not prepare the repository image's Dockerfile"
   fi
   _repo_build_prepare
 }
 
-# Build the repository image from the Dockerfile _repo_image_prepare wrote.
-# Caller has already verified the build is needed (image absent, Dockerfile
-# changed, or base changed).
+# Build the repository image in its two builds (DESIGN §6 *One image, two
+# roots*). Caller has already verified the build is needed (image absent,
+# Dockerfile changed, or base changed). The first builds the repository's
+# Dockerfile as _repo_image_prepare copied it, unchanged, from the committed
+# context; BuildKit builds its own default target, the file's final stage,
+# and exports it as an OCI layout into the build directory, never into an
+# image store (so no tag names it, and no containerd namespace need hold
+# it). The second builds leerie's Dockerfile (_repo_image_wrap), whose
+# worker stage is that layout's one image, as the named context
+# `leerie-worker`. Both are given `--no-cache`, the pinned frontend and a
+# cache-mount namespace of their own (DESIGN §6 *No build consumes what
+# another build left in BuildKit*). Both run in leerie's containerd
+# namespace on the daemon leerie_buildkit_check vetted, whose workers read
+# another (same section), and with DOCKER_CONFIG an empty 0700 directory of
+# leerie's own, so neither pulls with the operator's registry credentials
+# (DESIGN §6 *A repository's build carries no operator credential*).
 build_repo_image() {
-  local repo_image_tag="$1" _nonce="$_REPO_NONCE"
-  [ -n "$_nonce" ] || _repo_build_fail "the repository image's Dockerfile was not prepared"
+  local repo_image_tag="$1" _soft="${2:-}" _layout _q _digest _ns _auth _rc=0
+  [ -f "$_REPO_BUILD_DIR/repo/Dockerfile" ] \
+    || _repo_build_fail "the repository image's Dockerfile was not prepared"
+  leerie_buildkit_check || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
   _repo_build_prepare
+  _auth="$_REPO_BUILD_DIR/registry-auth"
+  rm -rf "$_auth"
+  mkdir -m 0700 "$_auth" || _repo_build_fail "could not make the build's empty Docker config"
   remote_log "building per-repo container image ($repo_image_tag)..."
+  _layout="$_REPO_BUILD_DIR/worker"
+  # `-o` is CSV: the path quoted, a quote in it doubled.
+  _q="${_layout//\"/\"\"}"
   # The build prints what the repository's Dockerfile steps print, so it
-  # reaches the terminal through the relay (DESIGN §6 *No text leerie did not
-  # write reaches the operator's terminal as a control sequence*); the
-  # build's own status decides.
-  local _st=(0 0)
-  nerdctl build \
+  # reaches the terminal through the relay (_build_job); the build's own
+  # status decides. With `soft` (leerie's generated file, which has a
+  # fallback) a failure of this build returns 1 to the caller. Each build
+  # is given a cache-mount namespace of its own (leerie_cache_mount_ns).
+  _ns="$(leerie_cache_mount_ns)" \
+    || _repo_build_fail "could not draw a cache-mount namespace for the build"
+  DOCKER_CONFIG="$_auth" _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
+    --buildkit-host "$LEERIE_BUILDKIT_HOST" --no-cache \
+    --build-arg BUILDKIT_SYNTAX="$LEERIE_DOCKERFILE_FRONTEND" \
+    --build-arg BUILDKIT_CACHE_MOUNT_NS="$_ns" \
     --build-arg BASE_IMAGE="$IMAGE_TAG" \
     --build-arg HOST_UID="$(id -u)" \
     --build-arg HOST_GID="$(id -g)" \
-    --target "leerie-final-$_nonce" \
+    -o "type=oci,\"dest=$_q\",tar=false" \
+    -f "$_REPO_BUILD_DIR/repo/Dockerfile" \
+    "$_REPO_BUILD_CTX" || _rc=$?
+  # The cache-mount records it left are dead: no build can name $_ns again.
+  leerie_prune_cache_mounts "$_ns" \
+    || remote_log "warning: could not remove the build's cache-mount records ($_ns); BuildKit's garbage collection keeps them"
+  if [ "$_rc" -ne 0 ]; then
+    [ "$_soft" = soft ] && return 1
+    _repo_build_fail "per-repo container image build failed"
+  fi
+  _digest="$(_repo_layout_digest "$_layout")" \
+    || _repo_build_fail "the repository's build did not leave exactly one image"
+  remote_log "repository stage built ($_digest); copying it to the worker root..."
+  _repo_image_wrap "$_REPO_BUILD_DIR/wrap/Dockerfile" "$IMAGE_TAG" leerie-worker \
+    || _repo_build_fail "could not write leerie's Dockerfile"
+  _rc=0
+  _ns="$(leerie_cache_mount_ns)" \
+    || _repo_build_fail "could not draw a cache-mount namespace for the build"
+  DOCKER_CONFIG="$_auth" _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
+    --buildkit-host "$LEERIE_BUILDKIT_HOST" --no-cache \
+    --build-arg BUILDKIT_SYNTAX="$LEERIE_DOCKERFILE_FRONTEND" \
+    --build-arg BUILDKIT_CACHE_MOUNT_NS="$_ns" \
+    --build-context "leerie-worker=oci-layout://$_layout" \
     -t "$repo_image_tag" \
-    -f "$_REPO_BUILD_DIR/Dockerfile" \
-    "$_REPO_BUILD_CTX" 2>&1 | _terminal_relay >&2 || _st=("${PIPESTATUS[@]}")
-  [ "${_st[0]}" -eq 0 ] || _repo_build_fail "per-repo container image build failed"
+    -f "$_REPO_BUILD_DIR/wrap/Dockerfile" \
+    "$_REPO_BUILD_DIR/wrap" || _rc=$?
+  # The cache-mount records it left are dead: no build can name $_ns again.
+  leerie_prune_cache_mounts "$_ns" \
+    || remote_log "warning: could not remove the build's cache-mount records ($_ns); BuildKit's garbage collection keeps them"
+  rm -rf "$_layout"
+  [ "$_rc" -eq 0 ] || _repo_build_fail "per-repo container image build failed"
   _check_repo_image "$repo_image_tag" || _repo_build_fail "the repository image is not leerie's layout"
 }
 
@@ -7376,6 +7632,7 @@ LEERIE_GENERATED_SENTINEL="# leerie-generated: do not edit (regenerated from .le
 # even when the file is absent (against a stale var) — a real bug. Use an
 # explicit boolean instead.
 _leerie_do_gen=false
+_REPO_GEN_FALLBACK=""
 if [ -f "$_leerie_config_toml" ]; then
   if [ ! -f "$_leerie_dockerfile" ]; then
     _leerie_do_gen=true
@@ -8001,6 +8258,9 @@ PY
       rm -f "$_dep_pyf"
       if [ "$_lang_rc" != "0" ]; then exit "$_lang_rc"; fi
       if [ -n "$_lang_layer" ]; then
+        # The same file without the language-dep layer: what the launch
+        # builds when the layer does not (below, at the build decision).
+        _REPO_GEN_FALLBACK="$(cat "$_gen_df_tmp")"
         printf '%s\n' "$_lang_layer" >> "$_gen_df_tmp"
       else
         remote_log "auto-generating: no lockfile detected; skipping language-dep layer"
@@ -8010,48 +8270,6 @@ PY
 
     mv "$_gen_df_tmp" "$_leerie_dockerfile"
     unset _gen_df_tmp _pkg
-
-    # Verify the language-dep layer builds correctly; on failure fall back
-    # to apt-only by regenerating without the COPY+RUN lines.
-    if [ "$_BAKE_LANGUAGE_DEPS" = "true" ] && \
-       grep -q "^COPY " "$_leerie_dockerfile" 2>/dev/null; then
-      # This probe also does `FROM $BASE_IMAGE`; it needs the base in the
-      # buildkit namespace too, else it always fails and silently degrades to
-      # apt-only (defeating the language-dep bake). See ensure_base_in_buildkit_ns.
-      ensure_base_in_buildkit_ns
-      _repo_image_prepare "$IMAGE_TAG"
-      if ! nerdctl build \
-           --build-arg BASE_IMAGE="$IMAGE_TAG" \
-           --build-arg HOST_UID="$(id -u)" \
-           --build-arg HOST_GID="$(id -g)" \
-           -t "leerie-lang-probe:$$" \
-           -f "$_leerie_dockerfile" \
-           "$_REPO_BUILD_CTX" \
-           >/dev/null 2>&1; then
-        remote_log "warning: language-dep Dockerfile build failed; falling back to apt-only bake (bake_language_deps=false for this run)"
-        # Regenerate without the language-dep layer. Bug fix: this used to
-        # unconditionally emit an apt RUN (looping possibly-unset
-        # $_sp_packages) even for a repo with no setup_packages — guard it
-        # the same way as the primary apt layer above.
-        _gen_df_tmp2="$USER_REPO/.leerie/.Dockerfile.gen2.$$"
-        printf '%s\n' "$LEERIE_GENERATED_SENTINEL" > "$_gen_df_tmp2"
-        printf 'ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n' >> "$_gen_df_tmp2"
-        if [ -n "$_sp" ]; then
-          printf 'RUN apt-get update && apt-get install -y --no-install-recommends \\\n' \
-            >> "$_gen_df_tmp2"
-          for _pkg2 in ${_sp_list[@]+"${_sp_list[@]}"}; do
-            printf '    %s \\\n' "$_pkg2" >> "$_gen_df_tmp2"
-          done
-          # End at USER root — no trailing `USER leerie` (see the primary
-          # generator above: PID-1 must be root for cgroup containment).
-          printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp2"
-        fi
-        mv "$_gen_df_tmp2" "$_leerie_dockerfile"
-        unset _gen_df_tmp2 _pkg2
-      else
-        nerdctl image rm "leerie-lang-probe:$$" >/dev/null 2>&1 || true
-      fi
-    fi
   fi
   unset _sp _sp_packages _sp_list
 fi
@@ -8062,25 +8280,26 @@ if [ -f "$_leerie_dockerfile" ]; then
   REPO_IMAGE_TAG="$(resolve_repo_image_tag)"
   if [ -n "$REPO_IMAGE_TAG" ]; then
     # Hash file stores "<version>:<layout>:<base id>:<dockerfile sha256>:
-    # <context sha256> <image digest>": any input changing triggers a
+    # <context sha256> <image digest>", and a third field, `apt-only`, when
+    # the image is the generated file's fallback: any input changing triggers a
     # rebuild — the context is what the Dockerfile's instructions read, so a
     # COPY of a file that changed rebuilds and nothing else does — and an image
     # is reused only when it is the one this checkout built — the digest
     # its tag names now is the digest recorded when it was built.
     _hash_file="$LEERIE_STATE_HOST_DIR/.dockerfile-hash"
-    # The digest of the bytes leerie's Dockerfile was made from, never of
-    # the path (DESIGN §6 *Leerie never reads through a link a repository
-    # holds*).
-    _repo_image_prepare "$IMAGE_TAG"
+    # The digest of the repository's Dockerfile bytes the build is given,
+    # never of the path (DESIGN §6 *Leerie never reads through a link a
+    # repository holds*).
+    _repo_image_prepare
     _cur_df_sha="$_REPO_DF_SHA"
     # The base image's id too: the repository image is built on exactly it
     # (_check_repo_image), so a rebuilt base rebuilds it.
-    _base_id="$(nerdctl image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)"
+    _base_id="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)"
     _cur_hash="${LEERIE_VERSION}:${REPO_IMAGE_LAYOUT}:${_base_id}:${_cur_df_sha}:${_REPO_CTX_SHA}"
-    _stored=""
-    [ -f "$_hash_file" ] && _stored="$(head -n 1 "$_hash_file" 2>/dev/null || true)"
-    _stored_hash="${_stored% *}"
-    _stored_ref="${_stored##* }"
+    _stored_hash="" _stored_ref="" _stored_mark="" _cur_mark=""
+    if [ -f "$_hash_file" ]; then
+      read -r _stored_hash _stored_ref _stored_mark < "$_hash_file" || true
+    fi
     _cur_ref="$(_repo_image_digest "$REPO_IMAGE_TAG")"
 
     _need_build=false
@@ -8091,22 +8310,47 @@ if [ -f "$_leerie_dockerfile" ]; then
     fi
 
     if [ "$_need_build" = "true" ]; then
-      # BuildKit resolves the derived `FROM $BASE_IMAGE` from the `buildkit`
-      # containerd namespace, not the `default` one the base was built in —
-      # copy it across first (idempotent) or the build 401s against the registry.
-      ensure_base_in_buildkit_ns
-      build_repo_image "$REPO_IMAGE_TAG"
+      # The daemon must not read leerie's namespace, and no image an earlier
+      # leerie built for a repository may be left where it reads (DESIGN §6
+      # *No build consumes what another build left in BuildKit*). BuildKit
+      # resolves the derived `FROM $BASE_IMAGE` from its worker's namespace,
+      # not leerie's, where the base was built — copy it across first
+      # (idempotent) or the build 401s against the registry.
+      leerie_buildkit_check || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
+      leerie_sweep_worker_images || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
+      ensure_base_in_worker_ns
+      ensure_frontend_in_worker_ns
+      if [ -z "${_REPO_GEN_FALLBACK:-}" ]; then
+        build_repo_image "$REPO_IMAGE_TAG"
+      elif ! build_repo_image "$REPO_IMAGE_TAG" soft; then
+        # Leerie's generated file is tested only by its own build (DESIGN
+        # §6½ *Language deps*): when its language-dep layer does not build,
+        # the same file without it is built, and recorded under the key
+        # computed above, the generated file's, so the next launch, which
+        # generates that file again, reuses the image instead of failing
+        # the layer again; the record marks it, and each reuse says so.
+        remote_log "warning: language-dep Dockerfile build failed; falling back to apt-only bake, reused until an input of its key changes (to retry the layer, remove $(_terminal_safe "$_hash_file"))"
+        _cur_mark=" apt-only"
+        printf '%s\n' "$_REPO_GEN_FALLBACK" > "$USER_REPO/.leerie/.Dockerfile.gen2.$$"
+        mv "$USER_REPO/.leerie/.Dockerfile.gen2.$$" "$_leerie_dockerfile"
+        _repo_image_prepare
+        build_repo_image "$REPO_IMAGE_TAG"
+      fi
       _cur_ref="$(_repo_image_digest "$REPO_IMAGE_TAG")"
       [ -n "$_cur_ref" ] || _repo_build_fail "the repository image $REPO_IMAGE_TAG has no digest"
-      printf '%s %s\n' "$_cur_hash" "$_cur_ref" > "$_hash_file"
+      printf '%s %s%s\n' "$_cur_hash" "$_cur_ref" "${_cur_mark:-}" > "$_hash_file"
     else
       remote_log "per-repo image up-to-date ($(_terminal_safe "$REPO_IMAGE_TAG")); skipping build"
+      if [ "$_stored_mark" = "apt-only" ]; then
+        remote_log "warning: this image is the apt-only fallback: its language-dep layer failed to build, so no language dependency is installed in it; to retry the layer, remove $(_terminal_safe "$_hash_file")"
+      fi
     fi
     REPO_IMAGE_REF="$_cur_ref"
-    unset _hash_file _cur_df_sha _cur_hash _stored _stored_hash _stored_ref _cur_ref _need_build _base_id
+    unset _hash_file _cur_df_sha _cur_hash _stored_hash _stored_ref _stored_mark _cur_mark _cur_ref _need_build _base_id
   fi
 fi
 _repo_build_done
+unset _REPO_GEN_FALLBACK
 unset _leerie_dockerfile
 
 # --- translate --inspect-dir paths into bind-mounts ---------------------
@@ -8684,7 +8928,7 @@ _stage_keepalive_pid=$!
 # container-arm EXIT trap is set. Bash keeps only the last EXIT trap per scope;
 # the container arm re-sets it (adding container-kill) and still removes $STAGE
 # + kills the keepalive, so this early trap only matters for exits before that.
-trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; rm -rf "$STAGE" 2>/dev/null' EXIT
+trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; rm -rf "$STAGE" 2>/dev/null' EXIT
 # `|| true`: under set -e a failed kill (keepalive already gone) would end
 # the trap before $STAGE — staged credentials — is removed.
 # The same duty as a named hook: the remote runtimes replace the EXIT trap
@@ -9103,7 +9347,7 @@ fi
 
 # Best-effort host cleanup. Container is --rm; its writes inside the
 # mounts vanish with the container. This removes the host scratch.
-trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
 
 # --- finalize-phase auth is host-side now -------------------------------
 # Previous versions of leerie bind-mounted ~/.config/gh, ~/.git-credentials,
@@ -9198,12 +9442,11 @@ FLY_IMAGE_REF=""
 # When .leerie/Dockerfile is present (real or auto-generated), set
 # LEERIE_FLY_IMAGE to registry.fly.io/$APP:$VERSION-$REPO_HASH so that
 # resolve_fly_image_tag() returns the per-repo tag. $REPO_HASH is the
-# digest of the Dockerfile bytes leerie's Dockerfile is made from and of
-# the build context they read (_repo_image_prepare: _REPO_DF_SHA,
-# _REPO_CTX_SHA), recorded in _FLY_REPO_DF_SHA and _FLY_REPO_CTX_SHA with
-# the base tag in _FLY_BASE_TAG for ensure_image(), which makes leerie's
-# Dockerfile and its context again on the base's digest and requires the
-# same bytes and the same context.
+# digest of the repository's Dockerfile bytes and of the build context they
+# read (_repo_image_prepare: _REPO_DF_SHA, _REPO_CTX_SHA), recorded in
+# _FLY_REPO_DF_SHA and _FLY_REPO_CTX_SHA with the base tag in _FLY_BASE_TAG
+# for ensure_image(), which copies the Dockerfile and makes its context
+# again and requires the same bytes and the same context.
 # Idempotent: called once before resolve_fly_image_tag().
 _set_fly_per_repo_image() {
   if [ ! -f "$USER_REPO/.leerie/Dockerfile" ]; then
@@ -9213,7 +9456,7 @@ _set_fly_per_repo_image() {
   fly_app="$LEERIE_FLY_APP"
   version="$LEERIE_VERSION"
   base_tag="registry.fly.io/$fly_app:$version"
-  _repo_image_prepare "$base_tag"
+  _repo_image_prepare
   # First 12 hex chars of the sha256 of the Dockerfile bytes' digest and
   # the context's — short but collision-free at the scale of per-repo image
   # variants for a single leerie installation.
@@ -9241,10 +9484,13 @@ _set_fly_per_repo_image() {
 # (--digest-file).
 #
 # When _FLY_REPO_DF_SHA is set (a per-repo .leerie/Dockerfile exists), the
-# base image is ensured first; the repository image is then built FROM the
-# base's digest, and build-push.sh requires the pushed image to be that
-# base's layers plus one with its configuration (--layout-base), as
-# _check_repo_image does locally. A cached repository image is reused only
+# base image is ensured first; the repository image is then built in the
+# two builds build_repo_image makes locally (DESIGN §6 *One image, two
+# roots*): the repository's Dockerfile as committed, on the base's digest,
+# pushed under <tag>-repo and never run here (--no-run), then leerie's,
+# FROM the base's digest and that image's, and build-push.sh requires the
+# pushed image to be that base's layers plus one with its configuration
+# (--layout-base), as _check_repo_image does locally. A cached repository image is reused only
 # when it was built on the base digest cached now, in this layout.
 #
 # Skipped entirely when NO_AUTO_PUBLISH=true (the operator manages
@@ -9271,13 +9517,12 @@ _fly_push() {
   _FLY_PUSHED=""
   mkdir -p "$cache_dir" && digest_file="$(mktemp "$cache_dir/.digest.XXXXXX")" || return 1
   # build-push.sh prints the build's output, a repository image's Dockerfile
-  # steps included: through the relay (DESIGN §6 *No text leerie did not
-  # write reaches the operator's terminal as a control sequence*), on the
-  # script's own status.
-  local _st=(0 0)
-  "$build_push" "$@" --tag "$tag" --digest-file "$digest_file" 2>&1 \
-    | _terminal_relay >&2 || _st=("${PIPESTATUS[@]}")
-  if [ "${_st[0]}" -ne 0 ]; then
+  # steps included: through the relay, on the script's own status, as a job
+  # _repo_build_done ends (_build_job): no build outlives the launch.
+  local _rc=0
+  _build_job "$build_push" "$@" --tag "$tag" --digest-file "$digest_file" \
+    || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
     rm -f "$digest_file"
     return 1
   fi
@@ -9357,13 +9602,12 @@ except Exception:
       printf '%s %s\n' "$base_tag" "$base_digest" >> "$cache_file"
     fi
     base_ref="${base_tag%:*}@$base_digest"
-    # Now build and push the repository image: leerie's two-stage
-    # Dockerfile around the repository's, made again on the base's digest
-    # from the same bytes the tag names (_repo_image_prepare), from the
-    # committed tree (_repo_build_prepare), its final stage leerie's base
-    # (DESIGN §6 *The orchestrator's root is leerie's; a repository's root
-    # is only a confined process's*).
-    _repo_image_prepare "$base_ref"
+    # Now build and push the repository image in its two builds (DESIGN
+    # §6 *One image, two roots*): the repository's Dockerfile as committed,
+    # the same bytes the tag names (_repo_image_prepare), from the committed
+    # tree (_repo_build_prepare), its own default target; then leerie's,
+    # whose final stage is leerie's base and the worker root.
+    _repo_image_prepare
     if [ "$_REPO_DF_SHA" != "$_FLY_REPO_DF_SHA" ] \
        || [ "$_REPO_CTX_SHA" != "$_FLY_REPO_CTX_SHA" ]; then
       _repo_build_done
@@ -9371,11 +9615,20 @@ except Exception:
       return 1
     fi
     remote_log "remote: ensuring per-repo image $tag is published (cache miss)"
-    if ! _fly_push "$build_push" "$cache_dir" "$tag" "${build_args[@]}" \
-           --dockerfile "$_REPO_BUILD_DIR/Dockerfile" \
+    if ! _fly_push "$build_push" "$cache_dir" "$tag-repo" "${build_args[@]}" \
+           --dockerfile "$_REPO_BUILD_DIR/repo/Dockerfile" \
            --context "$_REPO_BUILD_CTX" \
-           --target "leerie-final-$_REPO_NONCE" \
            --build-arg "BASE_IMAGE=$base_ref" \
+           --no-run; then
+      _repo_build_done
+      remote_log "error: build-push.sh failed for the repository's stage; remote run cannot proceed"
+      return 1
+    fi
+    if ! _repo_image_wrap "$_REPO_BUILD_DIR/wrap/Dockerfile" "$base_ref" \
+           "${tag%:*}@$_FLY_PUSHED" \
+       || ! _fly_push "$build_push" "$cache_dir" "$tag" "${build_args[@]}" \
+           --dockerfile "$_REPO_BUILD_DIR/wrap/Dockerfile" \
+           --context "$_REPO_BUILD_DIR/wrap" \
            --layout-base "$base_ref"; then
       _repo_build_done
       remote_log "error: build-push.sh failed for per-repo image; remote run cannot proceed"
@@ -10569,7 +10822,7 @@ else
     if [ -f "${_cidfile:-}" ]; then
       local _cid
       _cid="$(cat "$_cidfile" 2>/dev/null)"
-      [ -n "$_cid" ] && nerdctl kill "$_cid" >/dev/null 2>&1 || true
+      [ -n "$_cid" ] && nerdctl --namespace "$LEERIE_IMAGE_NS" kill "$_cid" >/dev/null 2>&1 || true
     fi
   }
 
@@ -10688,7 +10941,7 @@ else
       _kill_container_from_cidfile || true
     fi
   }
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _note_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _note_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
   trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 130' INT
   trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 143' TERM
 
@@ -10822,7 +11075,7 @@ else
     # The client starts first, so the tail pipeline stays the current job
     # `_reap_tail` reads (`jobs -l %%`); `tail -n +1` loses nothing to that.
     _tail_writer_pid=""
-    nerdctl run "${_run_argv[@]}" >"$_run_log" 2>&1 <&0 &
+    nerdctl --namespace "$LEERIE_IMAGE_NS" run "${_run_argv[@]}" >"$_run_log" 2>&1 <&0 &
     _run_pid=$!
     # Through _terminal_relay: no control sequence the container printed
     # reaches the terminal or the --log-file (DESIGN §6 *No text leerie did
@@ -10863,7 +11116,7 @@ else
       # we supply one) — the same technique the util-linux branch below
       # already uses %q-quoting for, just wrapped in `; echo $? > file`.
       _darwin_rc_file="$(mktemp 2>/dev/null || echo "/tmp/.leerie-rc-$$")"
-      _nerdctl_run_quoted="nerdctl run"
+      _nerdctl_run_quoted="nerdctl --namespace $LEERIE_IMAGE_NS run"
       for _rarg in "${_run_argv[@]}"; do
         printf -v _rarg_q '%q' "$_rarg"
         _nerdctl_run_quoted="$_nerdctl_run_quoted $_rarg_q"
@@ -10890,7 +11143,7 @@ else
       rm -f "$_darwin_rc_file" 2>/dev/null || true
       unset _nerdctl_run_quoted _rarg _rarg_q _darwin_rc_file _darwin_rc_file_q
     else
-      _nerdctl_run_quoted="nerdctl run"
+      _nerdctl_run_quoted="nerdctl --namespace $LEERIE_IMAGE_NS run"
       for _rarg in "${_run_argv[@]}"; do
         printf -v _rarg_q '%q' "$_rarg"
         _nerdctl_run_quoted="$_nerdctl_run_quoted $_rarg_q"
@@ -10903,7 +11156,7 @@ else
   else
     # Interactive/-it (or run-log uncreatable), no --log-file target or no
     # `script`(1) available: nerdctl inherits stdout directly, unchanged.
-    nerdctl run "${_run_argv[@]}" <&0 &
+    nerdctl --namespace "$LEERIE_IMAGE_NS" run "${_run_argv[@]}" <&0 &
     _run_pid=$!
     _wait_run
   fi

@@ -63,7 +63,7 @@ def test_a_signal_stops_the_run_promptly(tmp_path: Path, sig, rc):
         assert got == rc, got
         assert took < PROMPT_S
         calls = (w["world"] / "nerdctl.calls").read_text().splitlines()
-        assert "kill stubcid" in calls, calls
+        assert "--namespace leerie kill stubcid" in calls, calls
         # The container and its client are gone, not left behind.
         assert container not in marked_pids(w["mark"])
         assert marked_pids(w["mark"]) == []

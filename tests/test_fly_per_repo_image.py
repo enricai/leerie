@@ -16,7 +16,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from tests.conftest import LOG_SH_SOURCE
+from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
 from tests.fly_stub import make_fake_flyctl
 from tests.repo_image_block_extract import extract_block as _extract_block
 from tests.repo_image_block_extract import fly_repo_hash, repo_build_functions
@@ -73,7 +73,8 @@ LEERIE_REPO="${LEERIE_REPO:-/tmp/leerie-repo}"
 LOCAL_BUILD="${LOCAL_BUILD:-false}"
 
 """
-_HARNESS_PREFIX = LOG_SH_SOURCE + _HARNESS_PREFIX
+_HARNESS_PREFIX = (LOG_SH_SOURCE + FRONTEND_SH_SOURCE + BUILDCTL_STUB
+                   + _HARNESS_PREFIX)
 
 # Fly image functions block (extracted verbatim from launcher)
 _FLY_MARKER_START = "# --- remote: resolve Fly.io image tag ---"
@@ -259,6 +260,7 @@ def test_a_linked_dockerfile_is_never_read(tmp_path):
 
 BASE_DIGEST = "sha256:" + "b" * 64
 FLY_REPO_DIGEST = "sha256:" + "c" * 64
+STAGE_DIGEST = "sha256:" + "d" * 64
 OTHER_DIGEST = "sha256:" + "e" * 64
 BASE_TAG = "registry.fly.io/testapp:0.99.test"
 LAYOUT = re.search(r'^REPO_IMAGE_LAYOUT="([^"]+)"', _launcher_text(),
@@ -268,9 +270,11 @@ LAYOUT = re.search(r'^REPO_IMAGE_LAYOUT="([^"]+)"', _launcher_text(),
 def _install_build_push(tmp_path: Path, rc: int = 0) -> tuple[Path, Path]:
     """A stub scripts/remote/build-push.sh under a stand-in LEERIE_REPO: it
     records its argv, keeps a copy of the Dockerfile it is given
-    (`dockerfile.copy`), and on success reports through `--digest-file`
-    FLY_REPO_DIGEST for a push with `--layout-base` (a repository image),
-    BASE_DIGEST otherwise. Builtins only."""
+    (`repo-dockerfile.copy` for a push with `--no-run`, the repository's
+    own stage; `dockerfile.copy` otherwise), and on success reports through
+    `--digest-file` STAGE_DIGEST for the repository's stage,
+    FLY_REPO_DIGEST for a push with `--layout-base` (leerie's repository
+    image), BASE_DIGEST otherwise. Builtins only."""
     log = tmp_path / "build-push.log"
     copy = tmp_path / "dockerfile.copy"
     leerie_repo = tmp_path / "leerie-repo"
@@ -281,17 +285,19 @@ def _install_build_push(tmp_path: Path, rc: int = 0) -> tuple[Path, Path]:
         "#!/usr/bin/env bash\n"
         f'echo "$@" >> "{log}"\n'
         f"[ {rc} -eq 0 ] || exit {rc}\n"
-        f'd="{BASE_DIGEST}"\n'
+        f'd="{BASE_DIGEST}"; out="{copy}"; dfp=""\n'
         'while [ $# -gt 0 ]; do\n'
         '  case "$1" in\n'
         f'    --layout-base) d="{FLY_REPO_DIGEST}" ;;\n'
-        '    --dockerfile)\n'
-        '      while IFS= read -r l; do printf "%s\\n" "$l"; done < "$2" \\\n'
-        f'        > "{copy}" ;;\n'
+        f'    --no-run) d="{STAGE_DIGEST}"; out="{tmp_path}/repo-dockerfile.copy" ;;\n'
+        '    --dockerfile) dfp="$2" ;;\n'
         '    --digest-file) df="$2" ;;\n'
         '  esac\n'
         '  shift\n'
         'done\n'
+        'if [ -n "$dfp" ]; then\n'
+        '  while IFS= read -r l; do printf "%s\\n" "$l"; done < "$dfp" > "$out"\n'
+        'fi\n'
         'printf "%s\\n" "$d" > "$df"\n'
         "exit 0\n"
     )
@@ -395,22 +401,35 @@ def test_ensure_image_per_repo_pushes_its_own_tag_from_the_base_digest(
                                                   cache=cache)
     assert result.returncode == 0, result.stderr
     invocations = bp_log.read_text().strip().split("\n")
-    assert len(invocations) == 1, invocations
-    log = invocations[0]
+    assert len(invocations) == 2, invocations
+    stage, final = invocations
     base_ref = f"registry.fly.io/testapp@{BASE_DIGEST}"
-    # leerie's Dockerfile around the repository's, from the committed tree,
-    # its final stage the target (DESIGN §6 *The orchestrator's root is
-    # leerie's; a repository's root is only a confined process's*).
-    assert re.search(r"--dockerfile \S+/\.image-build/b\.\w+/Dockerfile", log)
-    assert re.search(r"--context \S+/\.image-build/b\.\w+/context", log)
-    assert re.search(r"--target leerie-final-[0-9a-f]{16}", log)
-    assert f"--build-arg BASE_IMAGE={base_ref}" in log
-    assert f"--layout-base {base_ref}" in log
-    assert f"--tag {tag} --digest-file " in log
-    assert f"--tag {BASE_TAG} " not in log
-    wrapper = (tmp_path / "dockerfile.copy").read_text()
-    assert f"FROM {base_ref} AS leerie-final-" in wrapper
-    assert f"FROM {BASE_TAG} " not in wrapper
+    # Two builds (DESIGN §6 *One image, two roots*). The repository's
+    # Dockerfile as committed, from the committed tree, on the base's
+    # digest, pushed under its own tag, never started here, no target.
+    assert re.search(r"--dockerfile \S+/\.image-build/b\.\d+\.\w+/repo/Dockerfile",
+                     stage)
+    assert re.search(r"--context \S+/\.image-build/b\.\d+\.\w+/context", stage)
+    assert f"--build-arg BASE_IMAGE={base_ref}" in stage
+    assert "--no-run" in stage and "--layout-base" not in stage
+    assert f"--tag {tag}-repo --digest-file " in stage
+    df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
+    assert (tmp_path / "repo-dockerfile.copy").read_text() == df_content
+    # Then leerie's own, FROM the base's digest and the stage's, its layout
+    # checked against that base; it alone carries the per-repo tag.
+    assert re.search(r"--dockerfile \S+/\.image-build/b\.\d+\.\w+/wrap/Dockerfile",
+                     final)
+    assert re.search(r"--context \S+/\.image-build/b\.\d+\.\w+/wrap( |$)", final)
+    assert f"--layout-base {base_ref}" in final and "--no-run" not in final
+    assert f"--tag {tag} --digest-file " in final
+    assert "--target" not in stage + final
+    assert f"--tag {BASE_TAG} " not in stage + final
+    wrapper = (tmp_path / "dockerfile.copy").read_text().splitlines()
+    assert f"FROM {base_ref} AS leerie-baseenv" in wrapper
+    assert (f"FROM registry.fly.io/testapp@{STAGE_DIGEST} AS leerie-stage"
+            in wrapper)
+    assert wrapper[-2:] == [f"FROM {base_ref}",
+                            "COPY --from=leerie-stage / /opt/leerie-worker-root/"]
     assert cache_file.read_text() == (
         cache + f"{tag} {FLY_REPO_DIGEST} {BASE_DIGEST} {LAYOUT}\n")
     assert f"ref=registry.fly.io/testapp@{FLY_REPO_DIGEST}" in result.stdout
@@ -424,11 +443,12 @@ def test_ensure_image_per_repo_ensures_base_first_when_not_cached(tmp_path):
     result, bp_log, cache_file, tag = _run_ensure(tmp_path, per_repo=True)
     assert result.returncode == 0, result.stderr
     invocations = bp_log.read_text().strip().split("\n")
-    assert len(invocations) == 2, invocations
+    assert len(invocations) == 3, invocations
     assert "--dockerfile" not in invocations[0], invocations[0]
     assert f"--tag {BASE_TAG} --digest-file " in invocations[0]
     assert "--dockerfile" in invocations[1], invocations[1]
-    assert f"--tag {tag} --digest-file " in invocations[1]
+    assert f"--tag {tag}-repo --digest-file " in invocations[1]
+    assert f"--tag {tag} --digest-file " in invocations[2]
     assert cache_file.read_text() == (
         f"{BASE_TAG} {BASE_DIGEST}\n"
         f"{tag} {FLY_REPO_DIGEST} {BASE_DIGEST} {LAYOUT}\n")

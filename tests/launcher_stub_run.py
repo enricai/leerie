@@ -72,9 +72,12 @@ APPARMOR_STATES = ("current", "none", "stale")
 _STUB = r"""#!/bin/bash
 w="__WORLD__"
 printf '%s\n' "$*" >> "$w/nerdctl.calls"
+ns=""
+if [ "$1" = "--namespace" ]; then ns=$2; shift 2; fi
 case "$1" in
   run)
     { for a in "$@"; do printf '%s\n' "$a"; done; } > "$w/run.argv"
+    printf '%s\n' "$ns" > "$w/run.ns"
     cid="" prev=""
     for a in "$@"; do [ "$prev" = "--cidfile" ] && cid=$a; prev=$a; done
     if [ -n "${STUB_CREATED_SECONDS:-}" ]; then

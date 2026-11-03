@@ -404,8 +404,9 @@ _runtime_linux_ensure_subid() {
 # Run the rootless containerd setup as the invoking (non-root) user — the
 # setuptool installs a `systemctl --user` unit and must NOT run under sudo.
 # Then install the BuildKit containerd-worker (the variant leerie needs: its
-# ensure_base_in_buildkit_ns copies the base image into the `buildkit`
-# containerd namespace, which the OCI-worker variant can't read). Finally
+# ensure_base_in_worker_ns copies the base image into the containerd
+# namespace the worker reads, `default` here, and the OCI-worker variant
+# reads none; leerie keeps its own images in another, LEERIE_IMAGE_NS). Finally
 # enable linger so the user services survive logout.
 _runtime_linux_rootless_setup() {
   # Ensure the just-installed binaries resolve regardless of the caller's PATH.

@@ -308,7 +308,8 @@ truth for run cost and structure.
   else `--dangerously-allow-uncapped` (DESIGN §6).
 - **"$HOME/.claude not found"** — run `claude --version` once first.
 - **Permission denied on `.leerie/`** — UID mismatch after copying the
-  image elsewhere; `nerdctl image rm leerie:<version>` and re-run.
+  image elsewhere; `nerdctl --namespace leerie image rm leerie:<version>`
+  and re-run.
 - **Slow `npm install`/`vitest` on macOS** — confirm `--mount-type
   virtiofs`; see *bind-mount scope* above if a path appears empty.
 - **`gh: command not found` on push** — `~/.gitconfig`'s helper hard-codes
@@ -319,7 +320,9 @@ truth for run cost and structure.
 ## Uninstalling
 
 ```bash
-nerdctl image rm $(nerdctl images -q leerie)
+# leerie keeps its images in the containerd namespace `leerie`; up to 0.43.0
+# they were in `default`
+nerdctl --namespace leerie image rm $(nerdctl --namespace leerie images -q)
 rm -rf ~/.leerie ~/.local/bin/leerie
 
 # Optional: remove the runtime.

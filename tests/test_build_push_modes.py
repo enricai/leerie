@@ -18,6 +18,7 @@ in --dry-run mode where possible, and assert on:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -43,11 +44,13 @@ def _stub_flyctl(tmp_path: Path, exit_code: int = 0) -> Path:
 
 def _stub_container_cmd(tmp_path: Path, name: str) -> Path:
     """Stub nerdctl/docker that records argv and exits 0 on most calls.
-    Returns a fake JSON entrypoint for `inspect`, fake stdout for `run`."""
+    Returns a fake JSON entrypoint for `inspect`, fake stdout for `run`
+    (after a leading `--namespace <ns>`, which nerdctl's calls carry)."""
     stub = tmp_path / name
     stub.write_text(
         "#!/usr/bin/env bash\n"
         f"echo \"$@\" >> {tmp_path}/{name}.log\n"
+        'if [ "$1" = "--namespace" ]; then shift 2; fi\n'
         'if [ "$1" = "inspect" ]; then\n'
         '  echo "/opt/leerie-image/scripts/container-entry.sh"\n'
         '  exit 0\n'
@@ -62,6 +65,19 @@ def _stub_container_cmd(tmp_path: Path, name: str) -> Path:
     return stub
 
 
+def _stub_buildctl(tmp_path: Path, worker_ns: str = "default") -> Path:
+    """Stub buildctl (builtins only): one daemon whose one containerd worker
+    reads `worker_ns`, for leerie_buildkit_check before a --local-build."""
+    stub = tmp_path / "buildctl"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {tmp_path}/buildctl.log\n"
+        "printf '%s\\n' '[{\"labels\":{\"org.mobyproject.buildkit.worker."
+        f"containerd.namespace\":\"{worker_ns}\"}}}}]'\n")
+    stub.chmod(0o755)
+    return stub
+
+
 def _run(tmp_path: Path, *args: str, env_extra: dict | None = None,
          stub_only: str | None = None) -> subprocess.CompletedProcess:
     """Run build-push.sh with PATH stubbing. By default stubs both flyctl
@@ -69,6 +85,7 @@ def _run(tmp_path: Path, *args: str, env_extra: dict | None = None,
     _stub_flyctl(tmp_path)
     if stub_only != "flyctl":
         _stub_container_cmd(tmp_path, "nerdctl")
+        _stub_buildctl(tmp_path)
     env = dict(os.environ)
     env["PATH"] = f"{tmp_path}:/usr/bin:/bin"
     if env_extra:
@@ -263,12 +280,18 @@ def test_no_dockerfile_flag_uses_default(tmp_path: Path):
 
 
 def test_no_build_arg_no_build_arg_in_flyctl(tmp_path: Path):
-    """Without --build-arg, flyctl must not receive any --build-arg flags."""
+    """Without --build-arg, flyctl receives leerie's two only: the frontend
+    (DESIGN §6 *A repository's parser directives are its own build's; its
+    frontend is leerie's*) and the build's cache-mount namespace (*No
+    build consumes what another build left in BuildKit*)."""
     r = _run(tmp_path, "--app", "testapp", "--push")
     assert r.returncode == 0, r.stderr
     flyctl_log = (tmp_path / "flyctl.log").read_text()
-    assert "--build-arg" not in flyctl_log, \
-        f"no --build-arg flags expected in default mode; got:\n{flyctl_log}"
+    assert flyctl_log.count("--build-arg") == 2, flyctl_log
+    assert "--build-arg BUILDKIT_SYNTAX=docker/dockerfile:1@sha256:" \
+        in flyctl_log, flyctl_log
+    assert re.search(r"--build-arg BUILDKIT_CACHE_MOUNT_NS=leerie-[0-9a-f]{32} ",
+                     flyctl_log), flyctl_log
 
 
 def test_no_dockerfile_flag_local_build_no_f_flag(tmp_path: Path):
@@ -360,3 +383,31 @@ def test_digest_file_without_push_is_refused(tmp_path: Path):
              "--digest-file", str(tmp_path / "d"))
     assert r.returncode == 1
     assert "pass --push" in r.stderr
+
+
+# --- the repository's own stage is never run here --------------------------
+# (DESIGN §6 *One image, two roots*: ensure_image pushes the repository's
+# Dockerfile, built as it is, as its own image, and that root only ever
+# runs as a confined process's.)
+
+@pytest.mark.parametrize("no_run, verbs", [
+    (True, ["build", "push"]),
+    (False, ["build", "inspect", "run", "push"]),
+])
+def test_no_run_never_starts_the_image_it_built(tmp_path: Path, no_run,
+                                                verbs):
+    r = _run(tmp_path, "--app", "testapp", "--push", "--local-build",
+             *(["--no-run"] if no_run else []))
+    assert r.returncode == 0, r.stderr
+    calls = (tmp_path / "nerdctl.log").read_text().splitlines()
+    # Every call is in leerie's containerd namespace (DESIGN §6 *No build
+    # consumes what another build left in BuildKit*).
+    assert [c.split()[:3] for c in calls] == [
+        ["--namespace", "leerie", v] for v in verbs], calls
+
+
+def test_no_build_is_given_a_target(tmp_path: Path):
+    """Every build builds its file's default target: `--target` is gone
+    with the rewrite of the repository's Dockerfile it existed for."""
+    r = _run(tmp_path, "--app", "testapp", "--push", "--target", "x")
+    assert r.returncode == 1 and "unknown argument: --target" in r.stderr

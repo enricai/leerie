@@ -15,11 +15,14 @@ the exit-code-only stub in test_launcher_per_repo_image.py.
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.committed_tree import commit_tree
-from tests.conftest import LOG_SH_SOURCE
+from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
 from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
                                             NERDCTL_IMAGE_INSPECT_STUB,
                                             REPO_DIGEST)
@@ -49,6 +52,8 @@ set -euo pipefail
 
 NERDCTL_LOG="{nerdctl_log}"
 {LOG_SH_SOURCE}
+{FRONTEND_SH_SOURCE}
+{BUILDCTL_STUB}
 remote_log() {{ echo "[leerie] $*" >&2; }}
 
 # argv-recording nerdctl stub.  `return` (not `exit`) so set -e does not
@@ -57,22 +62,76 @@ nerdctl() {{
   # Record the full argv for later inspection.
   echo "$*" >> "$NERDCTL_LOG"
   # Skip a leading `--namespace <ns>` so the real subcommand is inspected
-  # (ensure_base_in_buildkit_ns calls `nerdctl --namespace buildkit image …`).
+  # (leerie's images are in `--namespace leerie`; ensure_base_in_worker_ns
+  # also inspects the worker's, `$STUB_WORKER_NS`, default `default`).
   local ns=""
   if [ "${{1:-}}" = "--namespace" ]; then ns="${{2:-}}"; shift 2 || true; fi
   local cmd="${{1:-}}"; shift || true
   case "$cmd" in
     image)
-      _stub_image_inspect "$@" && return 0
-      # Base-image presence probe. NERDCTL_BUILDKIT_INSPECT_RC (if set) governs
-      # the buildkit-ns probe specifically; else NERDCTL_INSPECT_RC.
-      if [ "$ns" = "buildkit" ] && [ -n "${{NERDCTL_BUILDKIT_INSPECT_RC:-}}" ]; then
-        return "$NERDCTL_BUILDKIT_INSPECT_RC"
+      # In the worker's namespace: NERDCTL_WORKER_INSPECT_RC (if set) answers
+      # every query (the base absent there), STUB_WORKER_BASE_ID (if set) is
+      # the id of the base copy there.
+      if [ "$ns" = "${{STUB_WORKER_NS:-default}}" ]; then
+        if [ -n "${{NERDCTL_WORKER_INSPECT_RC:-}}" ]; then
+          return "$NERDCTL_WORKER_INSPECT_RC"
+        fi
+        if [ -n "${{STUB_WORKER_BASE_ID:-}}" ]; then
+          echo "$STUB_WORKER_BASE_ID"; return 0
+        fi
       fi
+      # `image rm <name>`: fails for a name a container still uses.
+      if [ "${{1:-}}" = rm ]; then
+        case " ${{STUB_IN_USE:-}} " in *" $2 "*) return 1 ;; esac
+        return 0
+      fi
+      _stub_image_inspect "$@" && return 0
       return "${{NERDCTL_INSPECT_RC:-0}}"
       ;;
+    images)
+      # The worker's namespace's images: $STUB_WORKER_IMAGES, less those
+      # an `image rm` removed (all but $STUB_IN_USE).
+      if [ "$ns" = "${{STUB_WORKER_NS:-default}}" ]; then
+        local _i
+        for _i in ${{STUB_WORKER_IMAGES:-}}; do
+          case "$(/usr/bin/cat "$NERDCTL_LOG")" in
+            *"image rm $_i"*)
+              case " ${{STUB_IN_USE:-}} " in *" $_i "*) echo "$_i" ;; esac ;;
+            *) echo "$_i" ;;
+          esac
+        done
+      fi
+      return 0
+      ;;
     build)
-      _stub_build_done
+      # What the build's Docker config is: its path, mode, and whether it
+      # holds anything (builtins and absolute paths only).
+      {{
+        printf 'DOCKER_CONFIG=%s' "${{DOCKER_CONFIG-unset}}"
+        if [ -n "${{DOCKER_CONFIG:-}}" ] && [ -d "$DOCKER_CONFIG" ]; then
+          printf ' mode=%s' "$(/usr/bin/stat -c %a "$DOCKER_CONFIG")"
+          if compgen -G "$DOCKER_CONFIG/*" >/dev/null \
+             || compgen -G "$DOCKER_CONFIG/.[!.]*" >/dev/null; then
+            printf ' nonempty'
+          else
+            printf ' empty'
+          fi
+        fi
+        echo
+      }} >> "$NERDCTL_LOG.env"
+      # NERDCTL_FAIL_LANG_LAYER: a build whose -f file holds a language-dep
+      # layer (its `# copy-input-shas:` line) fails, as a layer that does not
+      # build would (builtins only).
+      if [ -n "${{NERDCTL_FAIL_LANG_LAYER:-}}" ]; then
+        local _a _prev="" _f="" _l
+        for _a in "$@"; do [ "$_prev" = -f ] && _f="$_a"; _prev="$_a"; done
+        if [ -n "$_f" ]; then
+          while IFS= read -r _l; do
+            case "$_l" in "# copy-input-shas:"*) return 1 ;; esac
+          done < "$_f"
+        fi
+      fi
+      _stub_build_done "$@"
       return "${{NERDCTL_BUILD_RC:-0}}"
       ;;
     *)
@@ -145,6 +204,9 @@ def test_build_repo_image_argv_contains_required_flags(tmp_path):
     df.write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    operator_cfg = tmp_path / "operator-docker"
+    operator_cfg.mkdir()
+    (operator_cfg / "config.json").write_text('{"auths":{"r.example":{"auth":"eDp5"}}}')
 
     result = _run_harness(
         tmp_path,
@@ -157,6 +219,8 @@ def test_build_repo_image_argv_contains_required_flags(tmp_path):
             "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
             "LEERIE_VERSION": "1.2.3",
             "IMAGE_TAG": "leerie:1.2.3",
+            # The operator's Docker config, which no repository build reads.
+            "DOCKER_CONFIG": str(operator_cfg),
         },
     )
     assert result.returncode == 0, result.stderr
@@ -165,48 +229,64 @@ def test_build_repo_image_argv_contains_required_flags(tmp_path):
     assert nerdctl_log.exists(), "nerdctl was never called"
     log_content = nerdctl_log.read_text()
 
-    # Must call `nerdctl build` (not just inspect).
-    build_lines = [l for l in log_content.splitlines() if l.startswith("build ")]
-    assert build_lines, f"no `build` call found in nerdctl log:\n{log_content}"
-    build_args = build_lines[0]
+    # Two `nerdctl build`s (not just inspect): the repository's file, then
+    # leerie's (DESIGN §6 *One image, two roots*).
+    build_lines = [l for l in log_content.splitlines() if l.startswith("--namespace leerie build ")]
+    assert len(build_lines) == 2, f"not two `build` calls:\n{log_content}"
+    first, second = build_lines
 
     # BASE_IMAGE build-arg must use the base IMAGE_TAG.
-    assert "--build-arg BASE_IMAGE=leerie:1.2.3" in build_args, build_args
+    assert "--build-arg BASE_IMAGE=leerie:1.2.3" in first, first
 
-    # -f is leerie's Dockerfile around the repository's, in a build
-    # directory of the launcher's own under the state root; the target is
-    # its final stage, named with a 16-hex nonce (DESIGN §6 *The
-    # orchestrator's root is leerie's; a repository's root is only a
-    # confined process's*).
+    # The first build's -f is the repository's Dockerfile, copied into a
+    # build directory of the launcher's own under the state root; no
+    # target, so BuildKit builds the file's own default target, exported as
+    # an OCI layout there.
     import re
-    m = re.search(r"-f (\S+/\.image-build/b\.\w+)/Dockerfile", build_args)
-    assert m and m.group(1).startswith(str(state_dir)), build_args
-    assert re.search(r"--target leerie-final-[0-9a-f]{16} ", build_args)
-
-    # Tag must be the per-repo leerie-repo/<id>:<version> form.
-    assert "-t leerie-repo/" in build_args, build_args
-    assert ":1.2.3" in build_args, build_args
+    m = re.search(r"-f (\S+/\.image-build/b\.\d+\.\w+)/repo/Dockerfile ", first)
+    assert m and m.group(1).startswith(str(state_dir)), first
+    d = m.group(1)
+    assert "--target" not in first and "--target" not in second
+    assert f'-o type=oci,"dest={d}/worker",tar=false ' in first, first
+    assert " -t " not in first, first
 
     # The build context is the committed tree exported there, never the
     # checkout (last positional arg).
-    assert build_args.endswith(f"{m.group(1)}/context"), build_args
-    assert str(user_repo) not in build_args, build_args
+    assert first.endswith(f"{d}/context"), first
+    assert str(user_repo) not in first + second
+
+    # The second is leerie's own file, its worker stage that layout, and
+    # it alone is tagged: the per-repo leerie-repo/<id>:<version> form.
+    assert f"--build-context leerie-worker=oci-layout://{d}/worker " in second
+    assert f"-f {d}/wrap/Dockerfile {d}/wrap" in second, second
+    assert "-t leerie-repo/" in second and ":1.2.3" in second, second
+    # Both run on the daemon leerie_buildkit_check vetted (DESIGN §6 *No
+    # build consumes what another build left in BuildKit*)...
+    for b in (first, second):
+        assert b.startswith("--namespace leerie build --buildkit-host unix://"), b
+    # ...and with an empty, 0700 Docker config of leerie's own in the build
+    # directory, never the operator's (DESIGN §6 *A repository's build
+    # carries no operator credential*).
+    envs = (tmp_path / "nerdctl.log.env").read_text().splitlines()
+    assert envs == [f"DOCKER_CONFIG={d}/registry-auth mode=700 empty"] * 2, envs
     # And the build directory is gone afterwards.
     assert not list((state_dir / ".image-build").glob("b.*"))
 
 
 # ---------------------------------------------------------------------------
-# (a) buildkit-namespace copy before the derived build (Bug B)
+# (a) the base copied into the worker's namespace before the derived build (Bug B)
 # ---------------------------------------------------------------------------
 
-def test_base_copied_into_buildkit_namespace_before_build(tmp_path):
-    """Before the derived build, the base is copied into the buildkit namespace.
+def test_base_copied_into_the_workers_namespace_before_build(tmp_path):
+    """Before the derived build, the base is copied into the namespace
+    BuildKit's worker reads.
 
-    Colima's buildkitd reads the `buildkit` containerd namespace, not the
-    `default` one the base is built in; without this copy `FROM $BASE_IMAGE`
-    401s against the registry. Assert the launcher probes the buildkit ns and
-    (when absent) runs `nerdctl save | nerdctl --namespace buildkit load`,
-    and that this happens before the `nerdctl build`."""
+    The base lives in leerie's namespace, which no worker reads (DESIGN §6
+    *No build consumes what another build left in BuildKit*); without this
+    copy `FROM $BASE_IMAGE` 401s against the registry. Assert the launcher
+    probes the worker's namespace (`default` here, from `buildctl debug
+    workers`) and (when absent) runs `nerdctl --namespace leerie save |
+    nerdctl --namespace default load`, before the `nerdctl build`."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -221,7 +301,7 @@ def test_base_copied_into_buildkit_namespace_before_build(tmp_path):
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
             "NERDCTL_INSPECT_RC": "1",            # derived image absent → build fires
-            "NERDCTL_BUILDKIT_INSPECT_RC": "1",   # base absent in buildkit ns → copy fires
+            "NERDCTL_WORKER_INSPECT_RC": "1",     # base absent in the worker's ns → copy fires
             "NERDCTL_BUILD_RC": "0",
             "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
             "LEERIE_VERSION": "1.2.3",
@@ -232,20 +312,22 @@ def test_base_copied_into_buildkit_namespace_before_build(tmp_path):
 
     log_content = (tmp_path / "nerdctl.log").read_text()
     lines = log_content.splitlines()
-    # The copy path: `save -o <tmpfile> leerie:1.2.3` and a `--namespace buildkit load -i <tmpfile>`.
-    assert any(l.startswith("save ") and l.endswith(" leerie:1.2.3") for l in lines), log_content
-    assert any("--namespace buildkit load -i " in l for l in lines), log_content
-    # The buildkit-ns probe is `--namespace buildkit image inspect leerie:1.2.3`.
-    assert any("--namespace buildkit image inspect leerie:1.2.3" in l
-               for l in lines), log_content
+    # The copy path: `--namespace leerie save -o <tmpfile> leerie:1.2.3` and
+    # a `--namespace default load -i <tmpfile>`.
+    assert any(l.startswith("--namespace leerie save ") and l.endswith(" leerie:1.2.3") for l in lines), log_content
+    assert any(l.startswith("--namespace default load -i ") for l in lines), log_content
+    # The probe is `--namespace default image inspect -f {{.Id}} leerie:1.2.3`.
+    assert any(l.startswith("--namespace default image inspect ")
+               and l.endswith(" leerie:1.2.3") for l in lines), log_content
     # Copy must precede the derived build.
-    save_idx = next(i for i, l in enumerate(lines) if l.startswith("save "))
-    build_idx = next(i for i, l in enumerate(lines) if l.startswith("build "))
+    save_idx = next(i for i, l in enumerate(lines) if l.startswith("--namespace leerie save "))
+    build_idx = next(i for i, l in enumerate(lines) if l.startswith("--namespace leerie build "))
     assert save_idx < build_idx, f"copy did not precede build:\n{log_content}"
 
 
-def test_base_not_recopied_when_present_in_buildkit_namespace(tmp_path):
-    """Idempotency: when the base is already in the buildkit ns, skip save|load."""
+def test_base_not_recopied_when_present_in_the_workers_namespace(tmp_path):
+    """Idempotency: when the base, by id, is already in the worker's ns,
+    skip save|load."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -260,7 +342,7 @@ def test_base_not_recopied_when_present_in_buildkit_namespace(tmp_path):
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
             "NERDCTL_INSPECT_RC": "1",            # derived image absent → build fires
-            "NERDCTL_BUILDKIT_INSPECT_RC": "0",   # base already in buildkit ns → no copy
+            # base already in the worker's ns, same id → no copy
             "NERDCTL_BUILD_RC": "0",
             "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
             "LEERIE_VERSION": "1.2.3",
@@ -269,11 +351,84 @@ def test_base_not_recopied_when_present_in_buildkit_namespace(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     log_content = (tmp_path / "nerdctl.log").read_text()
-    # Base present in buildkit ns → no save|load copy.
-    assert not any(l.startswith("save ") for l in log_content.splitlines()), log_content
-    assert "buildkit load" not in log_content, log_content
+    # Base present in the worker's ns → no save|load copy.
+    assert not any(l.startswith("--namespace leerie save ") for l in log_content.splitlines()), log_content
+    assert " load " not in log_content, log_content
     # But the build still happens.
-    assert any(l.startswith("build ") for l in log_content.splitlines()), log_content
+    assert any(l.startswith("--namespace leerie build ") for l in log_content.splitlines()), log_content
+
+
+def test_base_copied_again_when_the_workers_copy_is_another_image(tmp_path):
+    """The copy in the worker's namespace is the base only when its id is
+    the base's: a base rebuilt under the same tag is copied again, or the
+    repository image would be built on another base than the one
+    `_check_repo_image` compares it with. Falsified (2026-11-03): the
+    probe reduced to presence (`image inspect` succeeding) skips the copy."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "Dockerfile").write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    result = _run_harness(
+        tmp_path,
+        'echo "done"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "STUB_WORKER_BASE_ID": "sha256:an-older-base",
+            "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
+            "LEERIE_VERSION": "1.2.3",
+            "IMAGE_TAG": "leerie:1.2.3",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    lines = (tmp_path / "nerdctl.log").read_text().splitlines()
+    assert any(l.startswith("--namespace leerie save ") for l in lines), lines
+    assert any(l.startswith("--namespace default load -i ") for l in lines), lines
+
+
+@pytest.mark.parametrize("in_use", ["", "leerie-repo/enricai-barnacle:0.43.0"])
+def test_old_repository_images_are_swept_before_a_build(tmp_path, in_use):
+    """Before a repository build, the launcher removes the images an earlier
+    leerie tagged where BuildKit's worker reads (`leerie-repo/…`), and runs
+    no build while one a container uses is left (DESIGN §6 *No build
+    consumes what another build left in BuildKit*). Falsified (2026-11-03):
+    the sweep's call dropped from the build decision (no `image rm`, and the
+    in-use case builds)."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "Dockerfile").write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    old = "leerie-repo/enricai-barnacle:0.43.0 leerie-repo/repo-d07714eaab33:0.43.0"
+    result = _run_harness(
+        tmp_path,
+        'echo "done"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "STUB_WORKER_IMAGES": old + " leerie:1.2.3 company/app:1",
+            "STUB_IN_USE": in_use,
+            "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
+            "LEERIE_VERSION": "1.2.3",
+            "IMAGE_TAG": "leerie:1.2.3",
+        },
+    )
+    lines = (tmp_path / "nerdctl.log").read_text().splitlines()
+    rms = sorted(l for l in lines if l.startswith("--namespace default image rm "))
+    assert rms == [f"--namespace default image rm {n}" for n in sorted(old.split())], lines
+    builds = [l for l in lines if l.startswith("--namespace leerie build ")]
+    if in_use:
+        assert result.returncode == 1, result.stderr
+        assert in_use in result.stderr and "still uses" in result.stderr, result.stderr
+        assert builds == [], lines
+    else:
+        assert result.returncode == 0, result.stderr
+        assert len(builds) == 2, lines
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +468,7 @@ def test_hash_file_written_on_success(tmp_path):
     # <version>:<layout>:<base image id>:<sha256>:<context sha256> (the
     # stub's base id; this Dockerfile reads nothing from the tree), then
     # the digest of the image built.
-    expected = (f"1.2.3:worker-root-1:sha256:base-id:{expected_sha}:"
+    expected = (f"1.2.3:worker-root-2:sha256:base-id:{expected_sha}:"
                 f"{EMPTY_CONTEXT_SHA} "
                 f"{REPO_DIGEST}")
     assert stored == expected, f"stored={stored!r}, expected={expected!r}"
@@ -752,44 +907,98 @@ def test_lockfile_bump_still_changes_hash_against_opt_target(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# N1: the language-dep probe build tag must be a valid OCI reference (no
-# leading underscore), and ensure_base_in_buildkit_ns must use a file-based
-# save+load with captured stderr logged on failure, not a bare silenced pipe.
+# Review round 35, execution R35E-1: leerie's generated Dockerfile is tested
+# only by its own build (DESIGN §6½ *Language deps*). A separate probe build
+# ran on every launch, before the rebuild check; under `--no-cache` it
+# reinstalled every language dependency each launch and threw it away.
+# ensure_base_in_worker_ns keeps its save+load-through-files rule (N1).
 # ---------------------------------------------------------------------------
 
-def test_lang_probe_build_tag_is_a_valid_oci_reference(tmp_path):
-    """The language-dep probe build (and its cleanup `image rm`) must never
-    use a tag with a leading underscore — OCI/nerdctl rejects that reference
-    outright, so the probe always failed and the bake silently degraded to
-    apt-only. Falsify by reverting to `__leerie_lang_probe_$$`."""
+def _lang_repo(tmp_path: Path) -> tuple[Path, Path]:
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir)
+    _write_config_toml(leerie_dir, setup_packages="jq")
     (user_repo / "uv.lock").write_text("")
     (user_repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    return user_repo, state_dir
 
-    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result.returncode == 0, result.stderr
 
-    log_content = (tmp_path / "nerdctl.log").read_text()
-    build_lines = [l for l in log_content.splitlines() if l.startswith("build ")]
-    # Two builds fire: the language-dep probe, then the real per-repo build.
-    probe_lines = [l for l in build_lines if " -t leerie-repo/" not in l]
-    assert probe_lines, f"no probe build call found:\n{log_content}"
-    assert not any("__leerie_lang_probe_" in l for l in probe_lines), log_content
-    assert not any(" -t _" in l for l in probe_lines), log_content
+def _take_builds(tmp_path: Path) -> list[str]:
+    log = tmp_path / "nerdctl.log"
+    builds = [line for line in log.read_text().splitlines()
+              if line.startswith("--namespace leerie build ")] if log.exists() else []
+    log.unlink(missing_ok=True)
+    return builds
 
-    rm_lines = [l for l in log_content.splitlines() if l.startswith("image rm ")]
-    assert rm_lines, f"no `image rm` cleanup call found:\n{log_content}"
-    assert not any("__leerie_lang_probe_" in l for l in rm_lines), log_content
-    assert not any(l.split()[-1].startswith("_") for l in rm_lines), log_content
+
+def test_an_up_to_date_generated_image_runs_no_build(tmp_path):
+    """A launch whose generated file, context, version and base match the
+    recorded image runs no build at all; the one that builds runs the
+    repository image's two builds and nothing else. Its record carries no
+    `apt-only` mark, and its reuse says nothing of a fallback (the converse
+    of review round 36's X3). Falsified: the probe restored (the first
+    launch runs 3 builds, the second 1); the mark written for every
+    generated image (fails)."""
+    user_repo, state_dir = _lang_repo(tmp_path)
+    r = _generate_dockerfile(tmp_path, user_repo, state_dir)
+    assert r.returncode == 0, r.stderr
+    assert "COPY " in (user_repo / ".leerie" / "Dockerfile").read_text()
+    assert len(_take_builds(tmp_path)) == 2, r.stderr
+    key = (state_dir / ".dockerfile-hash").read_text()
+    assert re.fullmatch(r"\S+ sha256:\S+\n", key), key
+    r = _generate_dockerfile(tmp_path, user_repo, state_dir,
+                             {"NERDCTL_INSPECT_RC": "0"})
+    assert r.returncode == 0, r.stderr
+    assert "up-to-date (" in r.stderr and "skipping build" in r.stderr, \
+        r.stderr
+    assert "apt-only" not in r.stderr, r.stderr
+    assert _take_builds(tmp_path) == []
+
+
+def test_a_language_layer_that_does_not_build_falls_back_once(tmp_path):
+    """When the generated file's own build fails, the launch builds it
+    without the language-dep layer and records that image under the
+    generated file's key, marked `apt-only`: the next launch, which
+    generates the same file, reuses it and runs no build, and says, on
+    every such launch, that the image is the apt-only fallback and which
+    file to remove to retry (review round 36, execution X3). Falsified:
+    the fallback image recorded under its own file's key (the second
+    launch rebuilds); the probe restored (the second launch runs it); the
+    mark not written, or the reuse warning removed (no warning on the
+    second and third launches)."""
+    user_repo, state_dir = _lang_repo(tmp_path)
+    hash_file = state_dir / ".dockerfile-hash"
+    fail = {"NERDCTL_FAIL_LANG_LAYER": "1"}
+    r = _generate_dockerfile(tmp_path, user_repo, state_dir, fail)
+    assert r.returncode == 0, r.stderr
+    assert "falling back to apt-only bake" in r.stderr, r.stderr
+    assert "for this run" not in r.stderr, r.stderr
+    assert f"remove {hash_file}" in r.stderr, r.stderr
+    builds = _take_builds(tmp_path)
+    assert len(builds) == 3, builds
+    df = (user_repo / ".leerie" / "Dockerfile").read_text()
+    assert "COPY " not in df and "apt-get install" in df and " jq " in df, df
+    key = hash_file.read_text()
+    assert re.fullmatch(r"\S+ sha256:\S+ apt-only\n", key), key
+    for _ in range(2):
+        r = _generate_dockerfile(tmp_path, user_repo, state_dir,
+                                 {**fail, "NERDCTL_INSPECT_RC": "0"})
+        assert r.returncode == 0, r.stderr
+        assert "up-to-date (" in r.stderr and "skipping build" in r.stderr, \
+            r.stderr
+        assert "image is the apt-only fallback" in r.stderr, r.stderr
+        assert f"remove {hash_file}" in r.stderr, r.stderr
+        assert _take_builds(tmp_path) == []
+        assert hash_file.read_text() == key
+    assert "COPY " in (user_repo / ".leerie" / "Dockerfile").read_text()
+
 
 
 def test_save_load_uses_tempfile_and_logs_stderr_on_failure(tmp_path):
-    """ensure_base_in_buildkit_ns must save/load through temp files (not a
+    """ensure_base_in_worker_ns must save/load through temp files (not a
     bare `nerdctl save | nerdctl load` pipe) so a failure's stderr survives,
     and must log that captured stderr via remote_log on failure. Falsify by
     reverting to the piped, stderr-discarding form."""
@@ -809,13 +1018,14 @@ nerdctl() {
   if [ "${1:-}" = "--namespace" ]; then ns="${2:-}"; shift 2 || true; fi
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    image) [ "$ns" = "buildkit" ] && return 1; _stub_image_inspect "$@" && return 0; return "${NERDCTL_INSPECT_RC:-0}" ;;
+    image) [ "$ns" = "default" ] && return 1; _stub_image_inspect "$@" && return 0; return "${NERDCTL_INSPECT_RC:-0}" ;;
     save) echo "nerdctl-save-failure: disk quota exceeded" >&2; return 1 ;;
     build) return "${NERDCTL_BUILD_RC:-0}" ;;
     *) return 0 ;;
   esac
 }
-ensure_base_in_buildkit_ns
+leerie_buildkit_resolve
+ensure_base_in_worker_ns
 """
     result = _run_harness(
         tmp_path,
@@ -832,11 +1042,11 @@ ensure_base_in_buildkit_ns
 
     log_content = (tmp_path / "nerdctl.log").read_text()
     # A file-based save is used (an `-o <path>` output flag), not a bare pipe.
-    save_lines = [l for l in log_content.splitlines() if l.startswith("save ")]
+    save_lines = [l for l in log_content.splitlines() if l.startswith("--namespace leerie save ")]
     assert save_lines, f"no save call found:\n{log_content}"
     assert " -o " in save_lines[0], save_lines[0]
     # load must never be reached — save failed, so the `&&` guard short-circuits.
-    assert not any(l.startswith("--namespace buildkit load") or "load -i" in l
+    assert not any(l.startswith("--namespace default load") or "load -i" in l
                     for l in log_content.splitlines()), log_content
 
     # The captured stderr diagnostic must be surfaced via remote_log.

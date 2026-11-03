@@ -32,8 +32,9 @@ from tests.log_file_extract_helpers import extract_invocation as _extract_invoca
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _INVOCATION = _extract_invocation()
-assert "nerdctl run" in _INVOCATION
-assert ('nerdctl run "${_run_argv[@]}" <&0 &\n    _run_pid=$!\n'
+assert 'nerdctl --namespace "$LEERIE_IMAGE_NS" run' in _INVOCATION
+assert ('nerdctl --namespace "$LEERIE_IMAGE_NS" run "${_run_argv[@]}" <&0 &\n'
+        '    _run_pid=$!\n'
         '    _wait_run\n  fi') in _INVOCATION
 
 # A tiny fixed lifetime for the adversarial stdout holder -- long enough to

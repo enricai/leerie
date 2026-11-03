@@ -29,6 +29,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # reaches the operator's terminal as a control sequence*). A harness that
 # stubs `remote_log` defines its stub after this line.
 LOG_SH_SOURCE = f'. "{REPO_ROOT}/scripts/remote/_log.sh"\n'
+# The launcher sources scripts/dockerfile-frontend.sh near its top
+# (LEERIE_DOCKERFILE_FRONTEND, ensure_frontend_in_worker_ns, LEERIE_IMAGE_NS);
+# a harness that runs an extracted block holding a build sources it the same
+# way.
+FRONTEND_SH_SOURCE = f'. "{REPO_ROOT}/scripts/dockerfile-frontend.sh"\n'
+# A bash `buildctl` stub for a harness that runs a repository build, defined
+# after FRONTEND_SH_SOURCE: leerie_buildkit_resolve asks BuildKit which
+# containerd namespaces its workers read (DESIGN §6 *No build consumes what
+# another build left in BuildKit*), and a test must not ask the host's daemon
+# (CI has none). One daemon, one containerd worker reading
+# `$STUB_WORKER_NS` (default `default`, the standard rootless setup's);
+# `$STUB_BUILDCTL_RC` non-zero makes no daemon answer; with `$BUILDCTL_LOG`
+# set each call's arguments are appended to it. Builtins only.
+BUILDCTL_STUB = r"""
+buildctl() {
+  [ -z "${BUILDCTL_LOG:-}" ] || printf '%s\n' "$*" >> "$BUILDCTL_LOG"
+  [ "${STUB_BUILDCTL_RC:-0}" = 0 ] || return "$STUB_BUILDCTL_RC"
+  printf '[{"id":"w0","labels":{"org.mobyproject.buildkit.worker.containerd.namespace":"%s"}}]\n' \
+    "${STUB_WORKER_NS:-default}"
+}
+"""
 
 # No test reaches the user's real `~/.leerie` (or anything else under their
 # home). The launcher resolves its state dir to `$HOME/.leerie/<repo>` and

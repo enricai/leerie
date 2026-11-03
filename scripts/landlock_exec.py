@@ -1010,8 +1010,8 @@ CONTAINER_ENTRIES = frozenset({"dev", "proc", "sys", "run", "tmp", "home",
 # them when the container starts, so no image snapshot holds them, and they
 # are the run's name service (`localhost` resolves through `hosts`).
 CONTAINER_ETC_FILES = frozenset({"hosts", "hostname", "resolv.conf"})
-# Files the image's last stages write at the worker root's top (`leerie`'s
-# `_repo_image_dockerfile`): the worker stage's environment and the base
+# Files leerie's own image stages write at the worker root's top (`leerie`'s
+# `_repo_image_wrap`): the worker stage's environment and the base
 # image's, each `env -0`.
 WORKER_ENV_FILE = ".leerie-worker-env"
 BASE_ENV_FILE = ".leerie-base-env"

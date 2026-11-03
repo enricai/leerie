@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 from tests.committed_tree import commit_tree
-from tests.conftest import LOG_SH_SOURCE
+from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
 from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
                                             NERDCTL_IMAGE_INSPECT_STUB,
                                             REPO_DIGEST)
@@ -47,6 +47,8 @@ remote_log() { echo "[leerie] $*" >&2; }
 
 # Stub nerdctl: dispatch on first two words of subcommand.
 nerdctl() {
+  # leerie names its namespace on every call (LEERIE_IMAGE_NS).
+  if [ "${1:-}" = "--namespace" ]; then shift 2; fi
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     image)
@@ -54,7 +56,7 @@ nerdctl() {
       return "${NERDCTL_INSPECT_RC:-0}"
       ;;
     build)
-      _stub_build_done
+      _stub_build_done "$@"
       return "${NERDCTL_BUILD_RC:-0}"
       ;;
     run)
@@ -89,7 +91,8 @@ IMAGE_TAG="${IMAGE_TAG:-leerie:${LEERIE_VERSION}}"
 LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-/tmp/leerie-state-test}"
 
 """
-_HARNESS_PREFIX = LOG_SH_SOURCE + _HARNESS_PREFIX
+_HARNESS_PREFIX = (LOG_SH_SOURCE + FRONTEND_SH_SOURCE + BUILDCTL_STUB
+                   + _HARNESS_PREFIX)
 
 
 def _run_harness(body: str, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -308,7 +311,7 @@ def test_rebuild_skipped_when_image_present_and_hash_matches(tmp_path):
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
     (state_dir / ".dockerfile-hash").write_text(
-        f"{version}:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
+        f"{version}:worker-root-2:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
 
     result = _run_harness(
         'echo "done"',
@@ -733,7 +736,7 @@ def test_unrelated_file_change_no_rebuild(tmp_path):
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
     (state_dir / ".dockerfile-hash").write_text(
-        f"{version}:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
+        f"{version}:worker-root-2:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
 
     # Mutate an unrelated source file — not a lockfile.
     src_dir = user_repo / "src"

@@ -1,37 +1,41 @@
-"""The repository image: the repository's stages, then leerie's, whose final
-stage is leerie's base and one copy of the worker stage (DESIGN §6 *The
-orchestrator's root is leerie's; a repository's root is only a confined
-process's*; review round 28, isolation E1).
+"""The repository image: the repository's Dockerfile built as it is, then
+leerie's own Dockerfile, whose final stage is leerie's base and one copy of
+the first build's image (DESIGN §6 *The orchestrator's root is leerie's; a
+repository's root is only a confined process's*, *One image, two roots*;
+review round 28, isolation E1; review rounds 32 and 33).
 
 E1's proof turned around: a lockfile whose root `preinstall` plants a `.pth`
 in `/usr/lib/python3/dist-packages` ran, as root, in the build of the image
 the orchestrator runs in, and the orchestrator's interpreter (and the root
-cgroup broker's) ran it. Here the launcher's own Dockerfile writer
-(`_repo_image_dockerfile`) and image check (`_check_repo_image`) run
-verbatim: the repository's lines build only the worker stage, the final
-stage is `FROM <base>` and one `COPY` to `/opt/leerie-worker-root/`, a file
-that swallows leerie's lines or picks its own frontend builds no final stage
-of its own, and an image that is not the base plus one layer is refused.
+cgroup broker's) ran it. Here the launcher's own helpers run verbatim:
+`_repo_image_dockerfile` copies the repository's file unchanged,
+`_repo_image_wrap` writes leerie's file with no repository text in it,
+`build_repo_image` gives the first build the repository's bytes and no
+target and the second the first's image as a named context, and
+`_check_repo_image` refuses an image that is not the base plus one layer.
+Rounds 32 and 33 found, three times over, readings in which leerie's lexer
+and BuildKit's differed and a rewrite of the repository's file chose the
+wrong stage; each such shape is here, given to the build byte for byte.
 With `LEERIE_TEST_REPO_IMAGE=<base image>` (a host with nerdctl and that
-image), the real build runs too: the planted `.pth` is in the worker root
-and the orchestrator's interpreter, as leerie and as root, does not run it.
-That build copies a whole root (minutes, about 2.4 GB), so it is opt-in."""
+image), the real builds run too: a two-stage repository file's final stage
+is the worker root, and the planted `.pth` is in the worker root and the
+orchestrator's interpreter, as leerie and as root, does not run it. Each
+copies a whole root (minutes, about 2.4 GB), so they are opt-in."""
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
 from tests.repo_image_block_extract import repo_build_functions
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
-NONCE = "0123456789abcdef"
 BASE = "leerie:9.9.9"
 
 _PTH = 'import sys; sys.stderr.write("R28-PLANT" + chr(10))'
@@ -48,13 +52,24 @@ def _fns() -> str:
     return repo_build_functions(LAUNCHER.read_text())
 
 
-def _write(repo: Path, dockerfile: str, out: Path) -> subprocess.CompletedProcess:
+def _launcher_fn(name: str) -> str:
+    text = LAUNCHER.read_text()
+    fn = text[text.index(f"{name}() {{"):]
+    return fn[:fn.index("\n}\n") + 3]
+
+
+def _write(repo: Path, dockerfile: str | bytes,
+           out: Path) -> subprocess.CompletedProcess:
+    """`_repo_image_dockerfile <out>`: what it copied is
+    `<out>/repo/Dockerfile`."""
     (repo / ".leerie").mkdir(parents=True, exist_ok=True)
     df = repo / ".leerie" / "Dockerfile"
     if not df.is_symlink():
-        df.write_text(dockerfile)
+        df.write_bytes(dockerfile if isinstance(dockerfile, bytes)
+                       else dockerfile.encode())
+    out.mkdir(parents=True, exist_ok=True)
     script = ("set -euo pipefail\n" + 'remote_log() { echo "$*" >&2; }\n'
-              + _fns() + f'\n_repo_image_dockerfile "{out}" {NONCE} {BASE}\n')
+              + _fns() + f'\n_repo_image_dockerfile "{out}"\n')
     return subprocess.run(["bash", "-c", script], capture_output=True,
                           text=True, timeout=60,
                           env={"PATH": "/usr/bin:/bin",
@@ -67,67 +82,26 @@ GENERATED = ("# leerie-generated: do not edit (regenerated from "
              "RUN npm ci\n")
 
 
-def _stages(text: str) -> list[str]:
-    return [l for l in text.splitlines() if l.upper().startswith("FROM ")]
-
-
-def test_the_final_stage_is_leeries_base_and_one_copy(tmp_path):
-    out = tmp_path / "Dockerfile"
-    r = _write(tmp_path / "repo", GENERATED, out)
+def test_leeries_dockerfile_holds_no_repository_text(tmp_path):
+    """The second build's file is leerie's alone: the base's and the worker
+    stage's environments recorded, and a final stage, its default target,
+    that is the base and one copy of the worker stage."""
+    out = tmp_path / "wrap" / "Dockerfile"
+    r = subprocess.run(
+        ["bash", "-c", _fns() + f'\n_repo_image_wrap "{out}" {BASE} '
+         "leerie-worker\n"], capture_output=True, text=True, timeout=60,
+        env={"PATH": "/usr/bin:/bin"})
     assert r.returncode == 0, r.stderr
-    text = out.read_text()
-    final = text[text.index(f"FROM {BASE} AS leerie-final-{NONCE}"):]
-    assert final.splitlines() == [
-        f"FROM {BASE} AS leerie-final-{NONCE}",
-        f"COPY --from=leerie-stage-{NONCE} / /opt/leerie-worker-root/"]
-    # The repository's lines are all above leerie's, in its named stage.
-    assert text.index("RUN npm ci") < text.index(f"leerie-baseenv-{NONCE}")
-    assert f"FROM $BASE_IMAGE AS leerie-worker-{NONCE}" in text
-    assert f"FROM leerie-worker-{NONCE} AS leerie-stage-{NONCE}" in text
-    # No parser directive of the repository's applies: leerie's comment is
-    # the first line.
-    assert text.startswith("# leerie: the repository image")
-
-
-def test_an_existing_last_stage_name_is_used(tmp_path):
-    out = tmp_path / "Dockerfile"
-    df = ("FROM debian AS build\nRUN make\nFROM $BASE_IMAGE as Tools\n"
-          "COPY --from=build /x /x\n")
-    r = _write(tmp_path / "repo", df, out)
-    assert r.returncode == 0, r.stderr
-    assert f"FROM Tools AS leerie-stage-{NONCE}" in out.read_text()
-
-
-def test_continuations_and_heredocs_are_not_instructions(tmp_path):
-    out = tmp_path / "Dockerfile"
-    df = ("FROM a AS one\nRUN <<EOF\nFROM fake AS nope\nEOF\n"
-          "RUN echo \\\n  FROM not-a-stage\nFROM b \\\n  AS two\n"
-          "RUN true\n")
-    r = _write(tmp_path / "repo", df, out)
-    assert r.returncode == 0, r.stderr
-    assert f"FROM two AS leerie-stage-{NONCE}" in out.read_text()
-
-
-def test_a_swallowing_file_leaves_no_final_stage_to_build(tmp_path):
-    """An unterminated heredoc or a trailing continuation swallows leerie's
-    lines; the `--target` names a stage only leerie's text defines, with a
-    nonce the repository cannot know, so the build finds no target."""
-    for tail in ("RUN <<EOF\necho\n", "RUN echo \\\n"):
-        out = tmp_path / "Dockerfile"
-        r = _write(tmp_path / "repo", "FROM $BASE_IMAGE\n" + tail, out)
-        assert r.returncode == 0, r.stderr
-        text = out.read_text()
-        assert text.count(f"leerie-final-{NONCE}") == 1
-        assert NONCE not in tail
-
-
-def test_a_repository_syntax_directive_is_not_the_first_line(tmp_path):
-    out = tmp_path / "Dockerfile"
-    r = _write(tmp_path / "repo",
-               "# syntax=attacker.invalid/frontend:1\nFROM $BASE_IMAGE\n", out)
-    assert r.returncode == 0, r.stderr
-    first = out.read_text().splitlines()[0]
-    assert first.startswith("# leerie:") and "=" not in first
+    assert out.read_text().splitlines() == [
+        "# leerie: the repository image (DESIGN §6 *One image, two roots*).",
+        f"FROM {BASE} AS leerie-baseenv",
+        'RUN ["/bin/sh", "-c", "env -0 > /.leerie-base-env"]',
+        "FROM leerie-worker AS leerie-stage",
+        "USER root",
+        "COPY --from=leerie-baseenv /.leerie-base-env /.leerie-base-env",
+        'RUN ["/bin/sh", "-c", "env -0 > /.leerie-worker-env"]',
+        f"FROM {BASE}",
+        "COPY --from=leerie-stage / /opt/leerie-worker-root/"]
 
 
 def test_a_linked_dockerfile_is_refused(tmp_path):
@@ -135,14 +109,16 @@ def test_a_linked_dockerfile_is_refused(tmp_path):
     (repo / ".leerie").mkdir(parents=True)
     (tmp_path / "elsewhere").write_text("FROM x\n")
     (repo / ".leerie" / "Dockerfile").symlink_to(tmp_path / "elsewhere")
-    r = _write(repo, "", tmp_path / "Dockerfile")
-    assert r.returncode != 0 and not (tmp_path / "Dockerfile").exists()
+    r = _write(repo, "", tmp_path / "out")
+    assert r.returncode != 0
+    assert not (tmp_path / "out" / "repo" / "Dockerfile").exists()
 
 
 def _check(layers_base: str, layers_repo: str, cfg_base: str, cfg_repo: str,
            tmp_path: Path) -> subprocess.CompletedProcess:
     stub = f'''
 nerdctl() {{
+  [ "$1" = --namespace ] && shift 2
   if [ "$1" = image ] && [ "$2" = inspect ]; then
     case "$4" in
       *RootFS*) if [ "$5" = "{BASE}" ]; then echo '{layers_base}'; else echo '{layers_repo}'; fi ;;
@@ -154,7 +130,8 @@ nerdctl() {{
   return 0
 }}
 '''
-    script = ("set -euo pipefail\n" + 'remote_log() { echo "$*" >&2; }\n'
+    script = ("set -euo pipefail\n" + FRONTEND_SH_SOURCE
+              + 'remote_log() { echo "$*" >&2; }\n'
               + stub + _fns() + f'\nIMAGE_TAG={BASE}\n'
               '_check_repo_image leerie-repo/x:1 && echo OK\n')
     return subprocess.run(["bash", "-c", script], capture_output=True,
@@ -177,70 +154,257 @@ def test_the_image_must_be_the_base_plus_one_layer(tmp_path, layers, cfg, ok):
     assert (tmp_path / "rm.log").exists() is not ok
 
 
-def test_build_repo_image_builds_leeries_target_from_the_committed_tree():
-    text = LAUNCHER.read_text()
-    fn = text[text.index("build_repo_image() {"):]
-    fn = fn[:fn.index("\n}\n")]
-    assert '--target "leerie-final-$_nonce"' in fn
-    assert '-f "$_REPO_BUILD_DIR/Dockerfile"' in fn
-    assert '"$_REPO_BUILD_CTX"' in fn and '"$USER_REPO"' not in fn
-    assert "_check_repo_image" in fn
-    prep = text[text.index("_repo_build_prepare() {"):]
-    prep = prep[:prep.index("\n}\n")]
-    assert 'archive --format=tar HEAD' in prep
+# --- the build is given the repository's bytes, unchanged ------------------
+# Review rounds 32 and 33: each shape below made leerie's rewrite of the
+# repository's file diverge from BuildKit — a stage chosen from a heredoc's
+# body or an earlier stage, a parser directive lost or applied to leerie's
+# lines, a BOM left mid-file. The first build is now handed the file as it
+# is, byte for byte, with no `--target` (BuildKit's own default target), and
+# the second build is handed only leerie's file, its worker stage the first
+# build's one image.
+
+ROUND_SHAPES = {
+    # Round 32 X1: an arithmetic shift and a here-string are no heredoc.
+    "shift": b"FROM a AS builder\nRUN echo $((1<<N)) > /s\n"
+             b"FROM b AS runtime\nRUN true\n",
+    "here-string": b"FROM a AS builder\nRUN cat <<<hello > /h\n"
+                   b"FROM b AS runtime\nRUN true\n",
+    # Round 33 F1: a modifier hid the heredoc, so its body's FROM was "the
+    # last FROM".
+    "modifier-decoy": b"FROM a AS runtime\nRUN echo ${X//a/b} <<EOF\n"
+                      b"FROM users\nEOF\n",
+    "offset-decoy": b"FROM a AS runtime\nRUN echo ${X:1:2} <<EOF\n"
+                    b"FROM users\nEOF\n",
+    "error-decoy": b"FROM a AS runtime\nRUN echo ${X:?m} <<EOF\n"
+                   b"FROM users\nEOF\n",
+    # Round 33 F2: lower-case instructions under check=error=true.
+    "check-lowercase": b"# check=error=true\nfrom a as build\nrun true\n"
+                       b"from b\ncopy --from=build /x /x\n",
+    # Round 33 F3: a byte-order mark on line 1.
+    "bom": b"\xef\xbb\xbf# escape=`\nFROM a\nRUN echo `\n  hi\n",
+    "bom-from": b"\xef\xbb\xbfFROM a\nRUN true\n",
+    # Round 32 X2: the escape directive.
+    "escape-backtick": b"# escape=`\nFROM a\nCOPY a `\n  /a\n",
+    # Round 33 isolation X1r: \x1c is no whitespace to Go.
+    "fs-separator": b"FROM a AS builder\nCOPY a.txt /f\x1c<<EOF\n"
+                    b"FROM users\nEOF\nFROM b AS runtime\n",
+    # The repository's own frontend applies to its own build.
+    "syntax": b"# syntax=docker/dockerfile:1\nFROM a\nRUN true\n",
+    # A file that leaves a heredoc or a continuation open.
+    "open-heredoc": b"FROM a\nRUN <<EOF\necho\n",
+    "open-continuation": b"FROM a\nRUN echo \\\n",
+}
+
+_BUILD_STUB = r'''
+nerdctl() {
+  local _f="" _o="" _ctx="" _bc="" _t="" _n=0
+  [ "${1:-}" = "--namespace" ] && shift 2
+  case "$1" in
+    build) shift ;;
+    image)
+      case "$4" in
+        *RootFS*) if [ "$5" = "$IMAGE_TAG" ]; then echo '["b"]'; else echo '["b","w"]'; fi ;;
+        *Config*) echo '{"Entrypoint":["/e"],"Image":"'"$5"'"}' ;;
+      esac
+      return 0 ;;
+    *) return 1 ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f) _f="$2"; shift 2 ;;
+      -o) _o="$2"; shift 2 ;;
+      -t) _t="$2"; shift 2 ;;
+      --build-context) _bc="$2"; shift 2 ;;
+      --target) printf 'TARGET %s\n' "$2" >> "$LOG"; shift 2 ;;
+      --build-arg) shift 2 ;;
+      *) _ctx="$1"; shift ;;
+    esac
+  done
+  read -r _n < "$LOG.n" 2>/dev/null || _n=0
+  _n=$((_n + 1))
+  printf '%s\n' "$_n" > "$LOG.n"
+  /usr/bin/cp "$_f" "$LOG.df$_n"
+  printf 'BUILD %s f=%s o=%s ctx=%s bc=%s t=%s\n' "$_n" "$_f" "$_o" "$_ctx" "$_bc" "$_t" >> "$LOG"
+  if [ -n "$_o" ]; then
+    _o="${_o#*dest=}"; _o="${_o%%\",tar=false}"
+    /usr/bin/mkdir -p "$_o"
+    printf '{"manifests":[{"digest":"sha256:%s"}]}' \
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+      > "$_o/index.json"
+  fi
+}
+'''
 
 
-# --- the real build (opt-in) ------------------------------------------------
+def _build(tmp_path: Path, dockerfile: bytes) -> tuple[subprocess.CompletedProcess, Path]:
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    (repo / ".leerie").mkdir()
+    (repo / ".leerie" / "Dockerfile").write_bytes(dockerfile)
+    (repo / "a.txt").write_text("a\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@x", "-c",
+                    "user.name=t", "commit", "-qm", "c"], check=True,
+                   capture_output=True)
+    state = tmp_path / "state"
+    state.mkdir()
+    log = tmp_path / "build.log"
+    script = ("set -euo pipefail\n" + LOG_SH_SOURCE + FRONTEND_SH_SOURCE
+              + BUILDCTL_STUB + 'remote_log() { echo "$*" >&2; }\n'
+              + _BUILD_STUB + _fns()
+              + "\n" + _launcher_fn("build_repo_image")
+              + f"IMAGE_TAG={BASE}\n_repo_image_prepare\n"
+              'echo "BUILDDIR $_REPO_BUILD_DIR"\n'
+              "build_repo_image leerie-repo/x-1:9.9.9\n")
+    r = subprocess.run(["bash", "-c", script], capture_output=True,
+                       text=True, timeout=60,
+                       env={"PATH": "/usr/bin:/bin", "USER_REPO": str(repo),
+                            "LEERIE_STATE_HOST_DIR": str(state),
+                            "LOG": str(log)})
+    return r, log
+
+
+@pytest.mark.parametrize("shape", sorted(ROUND_SHAPES))
+def test_the_first_build_is_given_the_repositorys_bytes_unchanged(
+        tmp_path, shape):
+    dockerfile = ROUND_SHAPES[shape]
+    r, log = _build(tmp_path, dockerfile)
+    assert r.returncode == 0, r.stderr
+    builds = [l for l in log.read_text().splitlines()]
+    assert len(builds) == 2 and not any(l.startswith("TARGET") for l in builds)
+    build_dir = r.stdout.split("BUILDDIR ", 1)[1].split()[0]
+    # The first build: the repository's file, as committed, from the
+    # committed context, its own default target, out to an OCI layout.
+    assert Path(f"{log}.df1").read_bytes() == dockerfile
+    first = builds[0]
+    assert f"f={build_dir}/repo/Dockerfile " in first
+    assert f'o=type=oci,"dest={build_dir}/worker",tar=false ' in first
+    assert f"ctx={build_dir}/context " in first and "bc= " in first
+    # The second: leerie's file alone, its worker stage the layout.
+    second = builds[1]
+    assert f"f={build_dir}/wrap/Dockerfile " in second
+    assert f"bc=leerie-worker=oci-layout://{build_dir}/worker " in second
+    assert second.endswith("t=leerie-repo/x-1:9.9.9")
+    wrap = Path(f"{log}.df2").read_text()
+    assert "FROM leerie-worker AS leerie-stage\n" in wrap
+    assert dockerfile.decode("utf-8", "replace") not in wrap
+    # Nothing is left of the build directory's layout.
+    assert not Path(build_dir, "worker").exists()
+
+
+def test_a_first_build_that_leaves_other_than_one_image_stops(tmp_path):
+    """`_repo_layout_digest`: the layout the second build reads must hold
+    the first build's one image and nothing else."""
+    lay = tmp_path / "lay"
+    lay.mkdir()
+    d = "sha256:" + "b" * 64
+    for manifests, ok in ((f'[{{"digest":"{d}"}}]', True),
+                          (f'[{{"digest":"{d}"}},{{"digest":"{d}"}}]', False),
+                          ("[]", False), ('[{"digest":"sha256:zz"}]', False)):
+        (lay / "index.json").write_text(f'{{"manifests":{manifests}}}')
+        r = subprocess.run(["bash", "-c", _fns() + f'\n_repo_layout_digest "{lay}"\n'],
+                           capture_output=True, text=True, timeout=60,
+                           env={"PATH": "/usr/bin:/bin"})
+        assert (r.returncode == 0 and r.stdout.strip() == d) is ok, manifests
+
+
+# --- the real builds (opt-in) -----------------------------------------------
 
 _REAL = os.environ.get("LEERIE_TEST_REPO_IMAGE")
+_real = pytest.mark.skipif(
+    not _REAL or not shutil.which("nerdctl"),
+    reason="LEERIE_TEST_REPO_IMAGE=<base image, in the `leerie` containerd "
+           "namespace> builds a real repository image (minutes, ~2.4 GB)")
 
 
-@pytest.mark.skipif(not _REAL or not shutil.which("nerdctl"),
-                    reason="LEERIE_TEST_REPO_IMAGE=<base image> builds a real "
-                           "repository image (minutes, ~2.4 GB)")
-def test_a_planted_pth_never_reaches_the_orchestrators_interpreter(tmp_path):
+def _real_build(tmp_path: Path, files: dict[str, str], dockerfile: str,
+                tag: str) -> subprocess.CompletedProcess:
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    (repo / "package.json").write_text(PLANT_PKG)
-    (repo / "package-lock.json").write_text(PLANT_LOCK)
+    for rel, text in files.items():
+        (repo / rel).write_text(text)
     (repo / ".env").write_text("untracked-secret\n")
-    subprocess.run(["git", "-C", str(repo), "add", "package.json",
-                    "package-lock.json"], check=True)
+    (repo / ".leerie").mkdir()
+    (repo / ".leerie" / "Dockerfile").write_text(dockerfile)
+    subprocess.run(["git", "-C", str(repo), "add", *files,
+                    ".leerie/Dockerfile"], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.email=a@b", "-c",
                     "user.name=a", "commit", "-qm", "i"], check=True)
-    tag = "leerie-test-e1:" + NONCE
     state = tmp_path / "state"
     state.mkdir()
-    script = ("set -euo pipefail\n" + 'remote_log() { echo "$*" >&2; }\n'
-              + _fns() + "\n" + LAUNCHER.read_text()[
-                  LAUNCHER.read_text().index("build_repo_image() {"):].split(
-                  "\n}\n", 1)[0] + "\n}\n"
-              + f"IMAGE_TAG={_REAL}\nbuild_repo_image {tag}\n")
-    (repo / ".leerie").mkdir()
-    (repo / ".leerie" / "Dockerfile").write_text(GENERATED)
+    script = ("set -euo pipefail\n" + LOG_SH_SOURCE + FRONTEND_SH_SOURCE
+              + 'remote_log() { echo "$*" >&2; }\n' + _fns() + "\n"
+              + _launcher_fn("build_repo_image")
+              + f"IMAGE_TAG={_REAL}\n_repo_image_prepare\n"
+              f"build_repo_image {tag}\n"
+              f"_check_repo_image {tag} && echo CHECKED\n_repo_build_done\n")
+    return subprocess.run(["bash", "-c", script], capture_output=True,
+                          text=True, timeout=3600,
+                          env={**os.environ, "USER_REPO": str(repo),
+                               "LEERIE_STATE_HOST_DIR": str(state)})
+
+
+def _in_image(tag: str, cmd: str, user: str = "0") -> str:
+    return subprocess.run(
+        ["nerdctl", "run", "--rm", "--network", "none", "--user", user,
+         "--entrypoint", "/bin/sh", tag, "-c", cmd],
+        capture_output=True, text=True, timeout=300).stdout
+
+
+# A two-stage repository file whose final stage is not its first, with a
+# decoy `FROM` in a heredoc's body (round 33 F1) and lower-case
+# instructions under `# check=error=true` (round 33 F2): built as it is,
+# the worker root is the final stage.
+TWO_STAGE = ("# check=error=true\narg BASE_IMAGE=scratch\n"
+             "from $BASE_IMAGE as early\nrun echo early > /early-stage\n"
+             "from $BASE_IMAGE as final\n"
+             "copy --from=early /early-stage /from-early\n"
+             "run cat <<EOF > /decoy\nfrom $BASE_IMAGE as decoy\nEOF\n"
+             "env LEERIE_TEST_FINAL=final-stage\n"
+             "run echo final > /final-stage\n")
+
+
+@_real
+def test_the_worker_root_is_the_repositorys_final_stage(tmp_path):
+    tag = "leerie-test-two-stage:1"
     try:
-        r = subprocess.run(["bash", "-c", script], capture_output=True,
-                           text=True, timeout=3600,
-                           env={**os.environ, "USER_REPO": str(repo),
-                                "LEERIE_STATE_HOST_DIR": str(state)})
-        assert r.returncode == 0, r.stderr
+        r = _real_build(tmp_path, {}, TWO_STAGE, tag)
+        assert r.returncode == 0 and "CHECKED" in r.stdout, r.stderr
+        out = _in_image(tag, (
+            "cd /opt/leerie-worker-root && ls final-stage from-early decoy; "
+            "test -e early-stage || echo no-early; "
+            "test -e /final-stage || echo base-clean; "
+            "tr '\\0' '\\n' < .leerie-worker-env | grep LEERIE_TEST_FINAL"))
+        assert "final-stage\nfrom-early\n" in out.replace("decoy\n", "")
+        assert "no-early" in out and "base-clean" in out
+        assert "LEERIE_TEST_FINAL=final-stage" in out
+    finally:
+        subprocess.run(["nerdctl", "image", "rm", tag], capture_output=True)
+
+
+@_real
+def test_a_planted_pth_never_reaches_the_orchestrators_interpreter(tmp_path):
+    tag = "leerie-test-e1:1"
+    try:
+        r = _real_build(tmp_path, {"package.json": PLANT_PKG,
+                                   "package-lock.json": PLANT_LOCK},
+                        GENERATED, tag)
+        assert r.returncode == 0 and "CHECKED" in r.stdout, r.stderr
         for user in ("leerie", "0"):
             o = subprocess.run(
                 ["nerdctl", "run", "--rm", "--network", "none", "--user",
                  user, "--entrypoint", "python3", tag, "-c", "print('ran')"],
                 capture_output=True, text=True, timeout=300)
             assert "ran" in o.stdout and "R28-PLANT" not in o.stderr, o
-        w = subprocess.run(
-            ["nerdctl", "run", "--rm", "--network", "none", "--entrypoint",
-             "/bin/sh", tag, "-c",
-             "test -f /opt/leerie-worker-root/usr/lib/python3/dist-packages/"
-             "zz-plant.pth && echo planted-in-worker-root; "
-             "test -e /usr/lib/python3/dist-packages/zz-plant.pth || "
-             "echo base-clean; find /opt/leerie-worker-root -maxdepth 2 "
-             "-name .env"], capture_output=True, text=True, timeout=300)
-        assert "planted-in-worker-root" in w.stdout
-        assert "base-clean" in w.stdout and ".env" not in w.stdout
+        w = _in_image(tag, (
+            "test -f /opt/leerie-worker-root/usr/lib/python3/dist-packages/"
+            "zz-plant.pth && echo planted-in-worker-root; "
+            "test -e /usr/lib/python3/dist-packages/zz-plant.pth || "
+            "echo base-clean; find /opt/leerie-worker-root -maxdepth 2 "
+            "-name .env"))
+        assert "planted-in-worker-root" in w
+        assert "base-clean" in w and ".env" not in w
     finally:
         subprocess.run(["nerdctl", "image", "rm", tag], capture_output=True)
 
@@ -266,7 +430,7 @@ def _context(repo: Path, state: Path) -> tuple[list[str], str, list[str]]:
     """(context paths, context sha, files in the extracted context), from
     the launcher's own `_repo_image_prepare`."""
     script = ("set -euo pipefail\n" + 'remote_log() { echo "$*" >&2; }\n'
-              + _fns() + f'\n_repo_image_prepare {BASE}\n'
+              + _fns() + '\n_repo_image_prepare\n'
               'tr "\\0" "\\n" < "$_REPO_BUILD_DIR/context-paths"\n'
               'echo "CTX $_REPO_CTX_SHA"\n'
               '(cd "$_REPO_BUILD_CTX" && find . -type f | sort)\n'
@@ -417,13 +581,13 @@ def test_a_source_through_a_committed_link_reads_what_it_names(
         assert "vendor/lib/v.txt" in files
 
 
-# Review round 32, execution X1: a `<<` was read as a heredoc wherever it
-# appeared on a RUN/COPY/ADD line, so a shell shift or a here-string
-# swallowed the rest of the file, an earlier stage was named the worker
-# stage and the build succeeded. BuildKit reads a heredoc only where a whole
-# shell word matches `^(\d*)<<(-?)([^<]*)$`. Each file's last FROM is the
-# `runtime` stage, and the stage leerie names must be it.
-_TAIL = "FROM ruby:3.3-slim AS runtime\nCOPY a /a\nRUN true\n"
+# Review rounds 32 and 33 (execution X1, F1; isolation X1r): heredocs the
+# context reading must see as BuildKit does. A body is not instructions, so
+# a `COPY` in it names nothing; what follows the body does. Before the
+# repository's file was built as it is, each of these chose the stage
+# leerie copied; now a reading that differed could only widen the context
+# or fail the build by name.
+_AFTER = "COPY src/a.ts /app/\n"
 
 
 @pytest.mark.parametrize("line", [
@@ -431,38 +595,41 @@ _TAIL = "FROM ruby:3.3-slim AS runtime\nCOPY a /a\nRUN true\n"
     "RUN cat <<<hello > /h",                     # here-string
     "RUN echo '<<x' > /q",                       # quoted, single
     'RUN echo "a <<x b" > /q',                   # quoted, double
-    "RUN echo a\\<<x > /q",                      # escaped
+    "RUN echo a\\<<x > /q",                    # escaped
     'RUN ["sh", "-c", "cat <<EOF"]',             # JSON form holds none
     "RUN echo x<<y",                             # not the word's start
+    "COPY README.md /f\x1c<<EOF",               # \x1c is no space to Go
 ])
 def test_a_shift_or_here_string_is_no_heredoc(tmp_path, line):
-    out = tmp_path / "Dockerfile"
-    r = _write(tmp_path / "repo",
-               f"FROM ruby:3.3-slim AS builder\n{line}\n{_TAIL}", out)
-    assert r.returncode == 0, r.stderr
-    assert f"FROM runtime AS leerie-stage-{NONCE}" in out.read_text()
+    got, _sha, _f = _context(
+        _repo(tmp_path, f"FROM node:20 AS builder\n{line}\n{_AFTER}"),
+        tmp_path / "st")
+    assert "src/a.ts" in got
 
 
 @pytest.mark.parametrize("line, body", [
-    ("RUN cat <<END-OF > /x", "FROM fake AS nope\nEND-OF"),
-    ("RUN cat <<'END OF' > /x", "FROM fake AS nope\nEND OF"),
-    ('RUN cat <<"E.O.F" > /x', "FROM fake AS nope\nE.O.F"),
-    ("RUN cat <<E'O'F > /x", "FROM fake AS nope\nEOF"),
-    ("RUN cat <<-EOF > /x", "\tFROM fake AS nope\n\t\tEOF"),
-    ("RUN cat 0<<EOF > /x", "FROM fake AS nope\nEOF"),
-    ("RUN cat <<A <<B > /x", "FROM fake AS nope\nA\nFROM fake2 AS no\nB"),
+    ("RUN cat <<END-OF > /x", "COPY docs /nope\nEND-OF"),
+    ("RUN cat <<'END OF' > /x", "COPY docs /nope\nEND OF"),
+    ('RUN cat <<"E.O.F" > /x', "COPY docs /nope\nE.O.F"),
+    ("RUN cat <<E'O'F > /x", "COPY docs /nope\nEOF"),
+    ("RUN cat <<-EOF > /x", "\tCOPY docs /nope\n\t\tEOF"),
+    ("RUN cat 0<<EOF > /x", "COPY docs /nope\nEOF"),
+    ("RUN cat <<A <<B > /x", "COPY docs /nope\nA\nCOPY README.md /no\nB"),
+    # Round 33 F1: a modifier on the line does not hide its heredoc.
+    ("RUN echo ${X//a/b} <<EOF", "COPY docs /nope\nEOF"),
+    ("RUN echo ${X/a/b} <<EOF", "COPY docs /nope\nEOF"),
+    ("RUN echo ${X:1:2} <<EOF", "COPY docs /nope\nEOF"),
+    ("RUN echo ${X:?m} <<EOF", "COPY docs /nope\nEOF"),
+    ("RUN echo ${X##*/} <<EOF", "COPY docs /nope\nEOF"),
 ])
 def test_a_heredoc_name_is_read_as_buildkit_reads_it(tmp_path, line, body):
     """The delimiter is the whole rest of the word, unquoted (`END-OF`
     was read as `END`, and the body ran past the end of the file); a
     `<<-` body's terminator may be indented by tabs."""
-    out = tmp_path / "Dockerfile"
-    r = _write(tmp_path / "repo",
-               f"FROM ruby:3.3-slim AS builder\n{line}\n{body}\n{_TAIL}",
-               out)
-    assert r.returncode == 0, r.stderr
-    text = out.read_text()
-    assert f"FROM runtime AS leerie-stage-{NONCE}" in text
+    got, _sha, _f = _context(
+        _repo(tmp_path, f"FROM node:20 AS builder\n{line}\n{body}\n{_AFTER}"),
+        tmp_path / "st")
+    assert got == [".dockerignore", "src/a.ts"]
 
 
 def test_a_heredoc_names_no_context_path_but_a_shifted_copy_does(tmp_path):
@@ -473,43 +640,28 @@ def test_a_heredoc_names_no_context_path_but_a_shifted_copy_does(tmp_path):
     assert got == [".dockerignore", "src/a.ts"]
 
 
-# Review round 32, execution X2: leerie's file began with its own comment,
-# so BuildKit read none of the repository's parser directives and a file
-# written with `# escape=`` failed to parse. Its `escape` and `check`
-# directives come first, as BuildKit reads them; `syntax` never does.
-def test_the_repositorys_parser_directives_come_first(tmp_path):
-    out = tmp_path / "Dockerfile"
-    r = _write(tmp_path / "repo",
-               "# Escape=`\n#check = error=true\n"
-               "# syntax=attacker.invalid/frontend:1\n"
-               "FROM ruby:3.3-slim\nCOPY a `\n  /a\n", out)
-    assert r.returncode == 0, r.stderr
-    head = out.read_text().splitlines()[:3]
-    assert head[0] == "# escape=`"
-    assert head[1] == "# check=error=true"
-    assert head[2].startswith("# leerie:")
-    assert "attacker.invalid" not in "\n".join(head)
-
-
-@pytest.mark.parametrize("dockerfile", [
-    # A comment or a blank line ends the directives: what follows is a
-    # comment to BuildKit, and to leerie.
-    "# a comment\n# escape=`\nFROM ruby:3.3-slim\n",
-    "\n# escape=`\nFROM ruby:3.3-slim\n",
-    # So does an unknown key.
-    "# foo=bar\n# escape=`\nFROM ruby:3.3-slim\n",
+@pytest.mark.parametrize("dockerfile, paths", [
+    # Round 32 X2: the escape directive sets the continuation character.
+    ("# Escape=`\n#check = error=true\n# syntax=docker/dockerfile:1\n"
+     "FROM node:20\nCOPY package.json `\n  docs /app/\n",
+     ["docs", "package.json"]),
+    # A comment, a blank line or an unknown key ends the directives: what
+    # follows is a comment, and backtick no continuation.
+    ("# a comment\n# escape=`\nFROM node:20\nCOPY package.json `\n"
+     "  docs /app/\n", ["package.json"]),
+    ("\n# escape=`\nFROM node:20\nCOPY package.json `\n  docs /app/\n",
+     ["package.json"]),
+    ("# foo=bar\n# escape=`\nFROM node:20\nCOPY package.json `\n"
+     "  docs /app/\n", ["package.json"]),
+    # Round 33 F3: a byte-order mark is dropped once, so line 1 is still a
+    # directive, or an instruction.
+    ("\ufeff# escape=`\nFROM node:20\nCOPY package.json `\n  docs /app/\n",
+     ["docs", "package.json"]),
+    ("\ufeffCOPY src/a.ts /app/\n", ["src/a.ts"]),
+    # Lower case is read as BuildKit reads it.
+    ("from node:20\ncopy src/a.ts /app/\n", ["src/a.ts"]),
 ])
-def test_a_directive_after_the_top_is_a_comment(tmp_path, dockerfile):
-    out = tmp_path / "Dockerfile"
-    r = _write(tmp_path / "repo", dockerfile, out)
-    assert r.returncode == 0, r.stderr
-    assert out.read_text().startswith("# leerie:")
-
-
-def test_a_lowercase_from_gets_a_lowercase_as(tmp_path):
-    """A repository's `# check=error=true` turns BuildKit's FromAsCasing
-    warning into an error; the name leerie adds is in its FROM's case."""
-    out = tmp_path / "Dockerfile"
-    r = _write(tmp_path / "repo", "from ruby:3.3-slim\nrun true\n", out)
-    assert r.returncode == 0, r.stderr
-    assert f"from ruby:3.3-slim as leerie-worker-{NONCE}" in out.read_text()
+def test_the_parser_directives_are_read_as_buildkit_reads_them(
+        tmp_path, dockerfile, paths):
+    got, _sha, _f = _context(_repo(tmp_path, dockerfile), tmp_path / "st")
+    assert got == sorted(paths + [".dockerignore"])

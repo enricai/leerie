@@ -69,8 +69,12 @@ def extract_invocation() -> str:
     (bugfix-005), and the unwrapped fallback — preceded by the
     `_wait_run` they call and the `_terminal_relay` the piped branch
     calls."""
-    return extract_wait_run() + extract_terminal_relay() + _extract(
+    # The run names leerie's containerd namespace, LEERIE_IMAGE_NS, which
+    # the launcher takes from scripts/dockerfile-frontend.sh.
+    return (f'. "{REPO_ROOT}/scripts/dockerfile-frontend.sh"\n'
+            + extract_wait_run() + extract_terminal_relay()) + _extract(
         '  if [ -n "$_run_log" ]; then\n    # Decoupled: nerdctl',
-        '    nerdctl run "${_run_argv[@]}" <&0 &\n    _run_pid=$!\n'
+        '    nerdctl --namespace "$LEERIE_IMAGE_NS" run "${_run_argv[@]}" <&0 &\n'
+        '    _run_pid=$!\n'
         '    _wait_run\n  fi\n',
     )

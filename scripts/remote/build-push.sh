@@ -19,8 +19,10 @@
 #   --build-arg KEY=VAL   build argument forwarded to flyctl/nerdctl (repeatable)
 #   --context DIR         build context (default: $LEERIE_REPO); the launcher
 #                         passes the committed tree for a repository image
-#   --target STAGE        build only up to STAGE (the repository image's final
-#                         stage, DESIGN §6 *The orchestrator's root is leerie's*)
+#   --no-run              never start a container from the built image (the
+#                         repository's own stage, which only ever runs as a
+#                         confined process's root, DESIGN §6 *One image, two
+#                         roots*): --local-build skips its smoke test
 #   --digest-file PATH    after the push, write the digest the pushed tag names
 #                         (sha256:<hex>), read from the registry
 #   --layout-base REF     after the push, require the pushed image to be REF's
@@ -74,6 +76,13 @@ while [ -L "$SRC" ]; do
   esac
 done
 LEERIE_REPO="$(cd -P "$(dirname "$SRC")/../.." && pwd)"
+# LEERIE_DOCKERFILE_FRONTEND: every build below is given it as
+# BUILDKIT_SYNTAX, and a fresh leerie_cache_mount_ns as
+# BUILDKIT_CACHE_MOUNT_NS, ahead of the caller's --build-args, on both
+# builders; LEERIE_IMAGE_NS and leerie_buildkit_check for --local-build's
+# nerdctl.
+# shellcheck disable=SC1091
+. "$LEERIE_REPO/scripts/dockerfile-frontend.sh"
 
 # --- version (single source of truth: .claude-plugin/plugin.json) --------
 LEERIE_VERSION="$(awk -F'"' '/"version"/ {print $4; exit}' \
@@ -88,7 +97,7 @@ DRY_RUN=false
 DOCKERFILE_OVERRIDE=""
 BUILD_ARGS=()
 CONTEXT_DIR=""
-BUILD_TARGET=""
+NO_RUN=false
 DIGEST_FILE=""
 LAYOUT_BASE=""
 # BUILD_MODE: remote (default, via Fly's remote builder) or local
@@ -127,8 +136,8 @@ while [ "$#" -gt 0 ]; do
       BUILD_ARGS+=("${1#--build-arg=}") ;;
     --context)
       shift; CONTEXT_DIR="$1" ;;
-    --target)
-      shift; BUILD_TARGET="$1" ;;
+    --no-run)
+      NO_RUN=true ;;
     --digest-file)
       shift; DIGEST_FILE="$1" ;;
     --layout-base)
@@ -145,6 +154,20 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# The frontend and the cache-mount namespace are leerie's alone (given
+# above every caller's --build-arg): a caller cannot name another frontend,
+# nor share a namespace with another build. Any letter case is refused, so
+# the rule does not rest on how BuildKit spells the names it reads.
+shopt -s nocasematch
+for arg in "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"; do
+  case "$arg" in
+    BUILDKIT_SYNTAX|BUILDKIT_SYNTAX=*|BUILDKIT_CACHE_MOUNT_NS|BUILDKIT_CACHE_MOUNT_NS=*)
+      echo "build-push: --build-arg ${arg%%=*} is leerie's own (scripts/dockerfile-frontend.sh); refusing $arg" >&2
+      exit 1 ;;
+  esac
+done
+shopt -u nocasematch
 
 # Validate: FLY_APP must be set (either via LEERIE_FLY_APP env or --app flag).
 if [ -z "$FLY_APP" ]; then
@@ -205,7 +228,15 @@ run() {
 # file with the `image = ...` line stripped from the [build] section,
 # pass config $tmp.
 _build_push_remote() {
-  local tmp_toml
+  local tmp_toml ns
+  # Drawn before the temporary fly.toml exists, so a failed draw leaves no
+  # file behind (review round 37, execution E3). The file is the host's,
+  # short-lived and not secret, in the operator's $TMPDIR as the launcher's
+  # other host-side temporary files are.
+  ns="$(leerie_cache_mount_ns)" || {
+    echo "build-push: could not draw a cache-mount namespace for the build" >&2
+    return 1
+  }
   tmp_toml="$(mktemp -t leerie-build.XXXXXX.toml)"
   # awk strips the `image = ...` line only while inside the [build] section.
   awk '
@@ -231,6 +262,17 @@ _build_push_remote() {
   # builder doesn't have this issue. Documented at
   # https://community.fly.io/t/when-i-run-fly-deploy-with-the-image-label-flag-why-does-it-deploy-an-older-version-of-my-code/26151
   #
+  # --no-cache: the remote builder is one per Fly organization, shared by
+  # every app in it, so a build reuses no step another build cached and
+  # mounts no cache another filled (DESIGN §6 *No build consumes what
+  # another build left in BuildKit*); likewise on --local-build below.
+  # `no-cache` is an option of the frontend, so the frontend is leerie's
+  # (BUILDKIT_SYNTAX, read before a Dockerfile's `# syntax=` line; DESIGN §6
+  # *A repository's parser directives are its own build's; its frontend is
+  # leerie's*), on both builders too, and so is the cache-mount namespace:
+  # `--no-cache` empties a cache mount only when the build's steps are
+  # loaded, so each build gets a namespace of its own (leerie_cache_mount_ns).
+  #
   # We run from a subshell with cwd=$LEERIE_REPO because `flyctl deploy`
   # uses the cwd (or the directory containing --dockerfile) as the
   # build context, and the Dockerfile's COPY instructions reference
@@ -240,24 +282,21 @@ _build_push_remote() {
   # build context instead of leerie's, and the build fails with
   # "orchestrator: not found".
   local dockerfile="${DOCKERFILE_OVERRIDE:-$LEERIE_REPO/Dockerfile}"
-  local build_arg_flags=()
+  local build_arg_flags=(--build-arg "BUILDKIT_SYNTAX=$LEERIE_DOCKERFILE_FRONTEND" \
+                         --build-arg "BUILDKIT_CACHE_MOUNT_NS=$ns")
   for arg in "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"; do
     build_arg_flags+=(--build-arg "$arg")
   done
-
-  local target_flags=()
-  [ -n "$BUILD_TARGET" ] && target_flags+=(--build-target "$BUILD_TARGET")
 
   local rc=0
   (
     cd "${CONTEXT_DIR:-$LEERIE_REPO}"
     run flyctl deploy \
-      --build-only --push --remote-only --depot=false \
+      --build-only --push --remote-only --depot=false --no-cache \
       --app "$FLY_APP" \
       --config "$tmp_toml" \
       --dockerfile "$dockerfile" \
       "${build_arg_flags[@]+"${build_arg_flags[@]}"}" \
-      "${target_flags[@]+"${target_flags[@]}"}" \
       --image-label "$IMAGE_LABEL"
   ) || rc=$?
   rm -f "$tmp_toml"
@@ -289,32 +328,62 @@ _build_push_local() {
   fi
   echo "[build-push] local build tool: $build_cmd"
 
+  # With nerdctl, every image is built, inspected, run and pushed in
+  # leerie's containerd namespace, on a daemon none of whose workers reads it
+  # (leerie_buildkit_check): a tag left where a worker reads is an image any
+  # repository's build, local or for Fly, can name (DESIGN §6 *No build
+  # consumes what another build left in BuildKit*). docker has one image
+  # store, which every build it runs can name.
+  local ns_flags=() bk_flags=()
+  if [ "$build_cmd" = "nerdctl" ]; then
+    ns_flags=(--namespace "$LEERIE_IMAGE_NS")
+    if [ "$DRY_RUN" = "false" ]; then
+      leerie_buildkit_check || {
+        echo "build-push: $LEERIE_BUILDKIT_REFUSAL" >&2
+        return 1
+      }
+      bk_flags=(--buildkit-host "$LEERIE_BUILDKIT_HOST")
+    fi
+  fi
+
   local dockerfile_flags=()
   if [ -n "$DOCKERFILE_OVERRIDE" ]; then
     dockerfile_flags+=(-f "$DOCKERFILE_OVERRIDE")
   fi
-  local build_arg_flags=()
+  local ns
+  ns="$(leerie_cache_mount_ns)" || {
+    echo "build-push: could not draw a cache-mount namespace for the build" >&2
+    return 1
+  }
+  local build_arg_flags=(--build-arg "BUILDKIT_SYNTAX=$LEERIE_DOCKERFILE_FRONTEND" \
+                         --build-arg "BUILDKIT_CACHE_MOUNT_NS=$ns")
   for arg in "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"; do
     build_arg_flags+=(--build-arg "$arg")
   done
 
   # Build without HOST_UID/HOST_GID: the Dockerfile ARG defaults (501/20)
   # apply. Source is baked in via COPY instructions — no bind mount required.
-  local target_flags=()
-  [ -n "$BUILD_TARGET" ] && target_flags+=(--target "$BUILD_TARGET")
-  run "$build_cmd" build \
+  local build_rc=0
+  run "$build_cmd" "${ns_flags[@]+"${ns_flags[@]}"}" build \
+    "${bk_flags[@]+"${bk_flags[@]}"}" --no-cache \
     "${dockerfile_flags[@]+"${dockerfile_flags[@]}"}" \
     "${build_arg_flags[@]+"${build_arg_flags[@]}"}" \
-    "${target_flags[@]+"${target_flags[@]}"}" \
     -t "$IMAGE_TAG" \
-    "${CONTEXT_DIR:-$LEERIE_REPO}"
+    "${CONTEXT_DIR:-$LEERIE_REPO}" || build_rc=$?
+  # The build's cache-mount records are dead once it ends (no build can
+  # name its namespace); docker and a dry run have no daemon to prune.
+  if [ -n "${bk_flags[*]+set}" ] && ! leerie_prune_cache_mounts "$ns"; then
+    echo "build-push: warning: could not remove the build's cache-mount records ($ns)" >&2
+  fi
+  [ "$build_rc" -eq 0 ] || return "$build_rc"
 
   echo "[build-push] local build complete: $IMAGE_TAG"
 
-  # Verify entrypoint + smoke test version on the built image.
-  if [ "$DRY_RUN" = "false" ]; then
+  # Verify entrypoint + smoke test version on the built image — never on a
+  # repository's own stage (--no-run), whose root runs only confined.
+  if [ "$DRY_RUN" = "false" ] && [ "$NO_RUN" = "false" ]; then
     local entry
-    entry="$("$build_cmd" inspect "$IMAGE_TAG" \
+    entry="$("$build_cmd" "${ns_flags[@]+"${ns_flags[@]}"}" inspect "$IMAGE_TAG" \
               --format '{{join .Config.Entrypoint " "}}' 2>/dev/null || true)"
     local expected="/opt/leerie-image/scripts/container-entry.sh"
     if [ "$entry" = "$expected" ]; then
@@ -326,7 +395,7 @@ _build_push_local() {
     fi
 
     echo "[build-push] smoke: leerie version (baked source, no bind mount) ..."
-    if run "$build_cmd" run --rm "$IMAGE_TAG" \
+    if run "$build_cmd" "${ns_flags[@]+"${ns_flags[@]}"}" run --rm "$IMAGE_TAG" \
          python3 -I /opt/leerie-image/orchestrator/leerie.py version; then
       echo "[build-push] smoke OK"
     else
@@ -336,7 +405,7 @@ _build_push_local() {
 
   if [ "$PUSH" = "true" ]; then
     echo "[build-push] pushing $IMAGE_TAG ..."
-    run "$build_cmd" push "$IMAGE_TAG"
+    run "$build_cmd" "${ns_flags[@]+"${ns_flags[@]}"}" push "$IMAGE_TAG"
     echo "[build-push] pushed: $IMAGE_TAG"
   fi
 }

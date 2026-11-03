@@ -2951,36 +2951,91 @@ they are confined.
 
 **Mechanism.**
 
-- *One image, two roots.* The launcher builds the repository image from
-  leerie's own Dockerfile around the repository's
-  (`_repo_image_dockerfile`): the repository's `escape` and `check` parser
-  directives first, where BuildKit reads them (only at the very top,
-  before any comment or blank line; review round 32 X2: leerie's comment
-  came first and a file written with `` # escape=` `` no longer parsed),
-  then a comment, so that no other directive of the repository's applies.
-  Its `# syntax=` is dropped: it chooses the frontend that builds the
-  whole file, leerie's own stages included, with a grammar leerie's lexer
-  does not read; without it the built-in frontend builds the file, and a
-  feature only the chosen frontend had fails the build by name rather than
-  silently. Then the repository's stages, the last one named. Leerie reads
-  that file as BuildKit's built-in frontend does, and a heredoc only where
-  BuildKit reads one: a whole shell word matching `^(\d*)<<(-?)([^<]*)$`,
-  its delimiter the rest of the word unquoted (review round 32 X1: any
-  `<<word` was read as one, so a `$((1<<N))` or a `<<<` here-string
-  swallowed the rest of the file, an earlier stage was named the worker
-  stage and the build succeeded with the wrong root); two stages of leerie's that record the base image's environment
-  and the worker stage's (`env -0`, at `/.leerie-base-env` and
-  `/.leerie-worker-env`); and the final stage, `FROM <leerie's base>` and
-  one `COPY --from=<worker stage> / /opt/leerie-worker-root/`. The final
-  stage's name carries a nonce drawn for the build and is built with
-  `--target`, so a repository file that swallows leerie's lines (an
-  unterminated heredoc, a trailing continuation) builds nothing rather
-  than a final stage of its own. After a local build the image is checked
-  to be the base's layers plus exactly one, with the base's configuration
-  (`_check_repo_image`); anything else is removed and the launch stops.
-  The image's own root — everything outside `/opt/leerie-worker-root` — is
-  leerie's base, byte for byte, and its entrypoint is
-  `container-entry.sh`.
+- *One image, two roots.* The launcher builds the repository image in two
+  builds and never edits the repository's Dockerfile (`build_repo_image`).
+  The first builds `.leerie/Dockerfile` as the repository wrote it, byte for
+  byte, from the build context below; what it produces is BuildKit's own
+  default target, the file's final stage, exported as an OCI image layout
+  into the launcher's build directory. The second builds leerie's own
+  Dockerfile (`_repo_image_wrap`), which holds no repository text: two
+  stages that record the base image's environment and the worker stage's
+  (`env -0`, at `/.leerie-base-env` and `/.leerie-worker-env`), the worker
+  stage being the first build's image, handed to BuildKit as a named build
+  context (`--build-context leerie-worker=oci-layout://<layout>`, the
+  layout holding exactly that one image, whose manifest digest nerdctl reads
+  from the layout's `index.json` and hands BuildKit pinned); and the final
+  stage, `FROM <leerie's base>` and one
+  `COPY --from=<worker stage> / /opt/leerie-worker-root/`, the file's
+  default target. The layout is read from the launcher's directory, not
+  from an image store, so no containerd namespace has to hold it (BuildKit
+  reads its worker's, `ensure_base_in_worker_ns`), no tag names it
+  between the two builds, and it is removed with the build directory.
+  After a local build the image is checked to be the base's layers plus
+  exactly one, with the base's configuration (`_check_repo_image`);
+  anything else is removed and the launch stops. The image's own root —
+  everything outside `/opt/leerie-worker-root` — is leerie's base, byte for
+  byte, and its entrypoint is `container-entry.sh`.
+  *Revised 2026-11-03 (review rounds 31 to 33).* Leerie used to build one
+  Dockerfile of its own making: the repository's, its last `FROM` found by
+  leerie's lexer and named, its parser directives moved above leerie's
+  comment, and leerie's stages appended after it under a target named with
+  a nonce. Every reading in which leerie's lexer and BuildKit's differed
+  could choose the stage leerie copied, and three consecutive review rounds
+  each found new ones: an instruction word split on a space only, a
+  continuation ended at an empty line or joined with a space, and
+  `# escape=` ignored (round 31 execution 6); a `$((1<<N))` shift or a `<<<`
+  here-string read as a heredoc (round 32 X1), so an earlier stage was named
+  the worker stage and the build succeeded; `${X//a/b}`, `${X:1:2}` or
+  `${X:?m}` on the line hiding a heredoc BuildKit reads, so a `FROM` in its
+  body became "the last `FROM`"; a `# check=error=true` file failing on
+  leerie's upper-case additions to its lower-case instructions; a byte-order
+  mark kept on a line that was no longer the first; a `\x1c` taken for
+  whitespace, opening a heredoc BuildKit does not read; and a BOM-led file
+  refused as having no `FROM` (round 33). Round 31's and 32's were patched
+  as instances. The class, round 33's findings with it, is closed by never
+  rewriting: only BuildKit reads the repository's file to build it, so no
+  reading of leerie's selects a stage, and BuildKit's own default target is
+  the stage leerie copies. The nonce went with the rewrite: no repository
+  text reaches leerie's file, so no line of the repository's can define,
+  swallow or name a stage in it. The layout (`REPO_IMAGE_LAYOUT`) moved with
+  it, so no image built from a rewritten file is reused, locally or on Fly.
+- *A repository's parser directives are its own build's; its frontend is
+  leerie's.* `# escape=` and `# check=` apply to the repository's file as
+  BuildKit applies them, and to nothing of leerie's. `# syntax=` is not
+  honoured. Every build leerie runs is given `--build-arg
+  BUILDKIT_SYNTAX=<LEERIE_DOCKERFILE_FRONTEND>`, `docker/dockerfile:1`
+  pinned by digest. BuildKit's Dockerfile frontend reads that argument
+  before it reads the file's `# syntax=` line, so the file is still built
+  byte for byte, and the frontend that builds it is the one leerie pinned.
+  A frontend is not one more build step. It is the code that turns the
+  build's options into what BuildKit solves, and `--no-cache` reaches
+  BuildKit only as one of those options (`no-cache`). Only the frontend
+  turns it into the solver's ignore-cache flag, and only a step given that
+  flag starts its cache mounts empty. So `--no-cache` holds only for a
+  frontend leerie chooses (*No build consumes what another build left in
+  BuildKit*, below). Leerie's own files, its base Dockerfile and the second
+  build's, are given the same pin. They name no frontend, so the built-in
+  one would build them, and that one is whichever the host's BuildKit
+  ships. With the pin, no build of leerie's runs a frontend chosen
+  anywhere but here, and the rule has no exception for a test of every
+  build site to argue about. What a repository loses: syntax beyond the
+  pinned `docker/dockerfile:1` release, such as the `labs` channel's
+  features, a newer release's, or a frontend of its own. A file that needs
+  them fails its build at parse time, with the frontend's error. The pin
+  is moved by a leerie release, never by a repository
+  (`scripts/dockerfile-frontend.sh` says how).
+  *Revised 2026-11-03 (review round 35, isolation I1).* Before, `# syntax=`
+  was honoured. The reasoning was that a frontend runs with what any build
+  step has, so it reaches nothing a `RUN` could not, and that a frontend
+  ignoring `no-cache` consumes cache only for the repository that chose
+  it. Both were false. A repository whose `# syntax=` named the official
+  `docker/dockerfile:1` image behind a two-line wrapper that drops the
+  `no-cache` option read, under `--no-cache`, a private file another
+  repository's `--no-cache` build had left in a cache mount (measured on
+  BuildKit 0.31.2). With the pin, the same build read nothing. The
+  victim's `--no-cache` empties the mount before its own step runs, not
+  after, so what that step writes stays under the mount's id for the next
+  build whose frontend does not ask for it to be emptied.
 - *The worker view.* A confined process's root was already one the shim
   builds (`pivot_to_owned_root`: a tmpfs holding a bind of each entry of
   `/`). Where the image has a worker root, the shim also builds the worker
@@ -3075,10 +3130,18 @@ they are confined.
   execution 6: a tab after `COPY`, an empty line inside a continuation and
   a source through a committed link each read short, and builds that
   passed with the whole tree failed): a source through a committed link
-  reads the link and what it names, within the tree. Whatever the reading,
-  the key covers the context that was built, so a reading that is too
-  narrow can only fail the build (BuildKit names the missing source), never
-  reuse an image built from other files. A
+  reads the link and what it names, within the tree. A byte-order mark is
+  dropped from the first line once, and a heredoc is read only where a
+  whole shell word is one, words split on Go's whitespace (`\x1c`–`\x1f`
+  are not), as BuildKit reads them. This reading is the only one leerie
+  makes of the file, and it only makes the context: it never selects a
+  stage (*One image, two roots*). Whatever the reading, the key covers the
+  context that was built, so a reading that is too narrow can only fail
+  the build (BuildKit names the missing source), and one too wide only
+  rebuilds more often; neither reuses an image built from other files. The
+  file is always read by the frontend leerie pins, `docker/dockerfile:1`
+  (*A repository's parser directives are its own build's; its frontend is
+  leerie's*), whose grammar this reading follows. A
   base image's own `ONBUILD` instructions read only that context too.
   *Designed 2026-11-03 (review round 30 isolation R1).* The image was
   built from the whole of `git archive HEAD` but reused on the
@@ -3092,6 +3155,189 @@ they are confined.
   is exactly as wide as what the build reads. Leerie's generated
   Dockerfile copies only the files it names, so its image is rebuilt when
   one of them changes, as before.
+- *No build consumes what another build left in BuildKit.* One BuildKit
+  serves every build on a host: leerie's base, both builds of each
+  repository's image, and every branch of each repository. BuildKit lets one
+  build's result stand in for another's in four places (measured on
+  rootless nerdctl 2.3.5 with BuildKit 0.31.2):
+  - *The context snapshot.* BuildKit keeps a snapshot of a build context
+    under one key for every nerdctl build (`context:context:`). The next
+    build syncs onto that snapshot and skips any file whose size, mode,
+    owner and modification time are unchanged, without comparing content.
+  - *The cache.* A `RUN` step's cache key leaves out the proxy and the
+    extra hosts' addresses a frontend can give the step. So a frontend a
+    repository chose could run the step of leerie's base Dockerfile through
+    its own proxy, under the key leerie's next base build reused.
+  - *Cache mounts.* A `RUN --mount=type=cache` mount is shared by its id
+    across every build, so one repository's build read what another's
+    planted.
+  - *The image store.* A `FROM`, or a `RUN --mount=…,from=`, naming an
+    image the registry refuses is resolved from the image store of the
+    containerd namespace BuildKit's worker reads, by its name alone. A
+    repository image's name, `leerie-repo/<repo-id>-<checkout-id>:<version>`,
+    is no secret: each part is guessable. So one repository's Dockerfile
+    read another's whole worker root by naming it, with no race (below).
+
+  Every build leerie runs is given `--no-cache`: the base, both builds of a
+  repository image, and `build-push.sh`'s builds on either builder.
+  `--no-cache` is an option of the frontend, which turns it into the
+  solver's ignore-cache flag, so each of those builds is also given the
+  frontend leerie pinned (*A repository's parser directives are its own
+  build's; its frontend is leerie's*, above). BuildKit then reuses no cached
+  step. For a cache mount `--no-cache` is not enough: it empties the
+  mount's id once, when the build's steps are loaded, and does not separate
+  two builds that run at the same time. A mount is looked up by its id in
+  one table for the whole daemon, and a later step is handed the live
+  directory another build's running step holds (measured). So every build
+  leerie runs is also given `--build-arg
+  BUILDKIT_CACHE_MOUNT_NS=leerie-<random>`, a fresh value from a CSPRNG for
+  each build (`leerie_cache_mount_ns`). The pinned frontend puts that value
+  in front of every cache mount's id, an explicit `id=` included, so no two
+  builds name one mount, whenever they run. A repository cannot set it: the
+  frontend reads it only from the build's options, never from the file, and
+  `build-push.sh` refuses it from a caller as it refuses `BUILDKIT_SYNTAX`.
+  `--no-cache` does not reach the context snapshot. With it alone, a
+  contributor's branch still put its bytes in the trusted branch's worker
+  root (measured): the contributor dates the commit at the trusted HEAD's
+  committer time and keeps each copied file the same size, and `git
+  archive` gives every file the commit's time. So the launcher dates every
+  entry of a context it exports at one moment of the past year, chosen by
+  a CSPRNG, to the nanosecond (`_repo_context_retime`). No file of the
+  snapshot one build left can then match a file of the next build's
+  context. One date for every entry, as `git archive` gave them, keeps the
+  files' relative order, so a `make` that compares two copied files sees
+  what it saw before. A date in the past keeps working the tools that
+  refuse a future time or one before 1980 (`zipfile`). The context's digest
+  holds no dates, so the image key is unchanged. Leerie's base build reads
+  leerie's own directory, dated by its installer. No repository's context
+  can match those dates, since every one of its own is random.
+  `--no-cache` holds only for a frontend leerie chooses. A frontend that
+  ignores it reads every cache mount as another build left it, whoever's
+  build that was, so leerie pins the frontend and a repository's
+  `# syntax=` is not honoured (review round 35, isolation I1; above). The
+  pinned `docker/dockerfile:1` honours `no-cache` for the step cache and
+  the cache mounts alike (measured), and reads the cache-mount namespace.
+  No build resolves by name an image another repository's build produced.
+  Leerie keeps its images, and runs its containers, in a containerd
+  namespace of its own, `leerie` (`LEERIE_IMAGE_NS`), which no BuildKit
+  worker reads: its base, every repository image, and the images
+  `build-push.sh --local-build` tags with nerdctl. nerdctl, given a
+  namespace its daemon's worker does not read, exports the image and loads
+  it there, so no name leerie gives an image is in a namespace a build
+  reads. Before a repository's build the launcher asks the BuildKit daemon
+  nerdctl would use, found as nerdctl finds it, which containerd
+  namespaces its workers read (`buildctl debug workers`, each worker's
+  `org.mobyproject.buildkit.worker.containerd.namespace` label), and runs
+  both builds on that daemon (`--buildkit-host`); it refuses to build when
+  a worker reads `leerie`, or when the daemon cannot be asked
+  (`leerie_buildkit_check`). A repository's build still reads leerie's
+  base, which holds nothing secret, from a copy in the worker's namespace
+  (`ensure_base_in_worker_ns`, copied again whenever its id differs from
+  the base's), and the pinned frontend there
+  (`ensure_frontend_in_worker_ns`); nothing else of leerie's is there.
+  With repository images in a namespace of their own, the attacking
+  Dockerfile's `FROM` of the victim's name failed ("pull access denied")
+  and an honest `FROM $BASE_IMAGE` built (measured 2026-11-03, BuildKit
+  0.31.2). `--pull` does not do it: BuildKit's built-in frontend then
+  refuses the image store, but under the pinned frontend the read still
+  succeeded (measured). What leerie cannot keep apart is what the
+  operator keeps in the worker's namespace. On the standard rootless setup
+  (`containerd-rootless-setuptool.sh install-buildkit-containerd`, as
+  `scripts/runtime-install.sh` runs it) that namespace is `default`,
+  nerdctl's own, and any image the operator has there can be named by a
+  repository's build; Colima's worker reads `buildkit`, which holds only
+  what leerie copies there. *Cost:* where the worker read nerdctl's
+  namespace, BuildKit stored the image there itself; now nerdctl exports
+  each image leerie tags, its base and each repository image, and loads it
+  into `leerie`, as it always did on Colima, and the base is unpacked
+  twice, in `leerie` and in the worker's namespace, about 2.4 GB each (as
+  on Colima; on the rootless setup leerie's copy into `buildkit`, which no
+  worker read there, was already a second). The export's time at full size
+  is not measured.
+  *The images an earlier leerie left.* Up to 0.43.0 leerie tagged
+  repository images in nerdctl's namespace, `default`, which is the
+  worker's on the standard rootless setup, so they stay readable until they
+  are gone. None is reused: leerie looks its images up only in `leerie`,
+  so the first launch after the change builds its base and each repository
+  image again there. Before each repository build, leerie removes from every
+  namespace a worker reads each image named `leerie-repo/…` (its own name
+  for a repository image, and nothing else) that no container uses
+  (`nerdctl image rm`, never forced: nerdctl refuses to remove the name a
+  container was created from, which it records even for a container
+  created by digest, as leerie's are; measured 2026-11-03, nerdctl 2.3.5),
+  and refuses the build while one is left: an earlier leerie's run still runs from it, and the launch can be
+  repeated once that run ends. A removed image is a cache: the earlier
+  version builds it again on its next launch. The images an earlier
+  `--local-build` tagged (`registry.fly.io/<app>:…`) do not carry a name
+  only leerie uses, so they are not removed. A run an earlier leerie
+  launched keeps its container in `default`: `stop`, `kill`, `resume`'s
+  reaper and `prune` look a run's container up in `leerie` and then in
+  `default` (`_container_ns`).
+  *Revised 2026-11-03 (review round 36, isolation I2).* This section said
+  each cache mount "starts empty, whatever another build left in it", and
+  the namespace was considered and not used because `--no-cache` already
+  kept builds apart. That was measured with one build after another.
+  With two builds overlapping on one BuildKit, both under the pinned
+  frontend and `--no-cache`, an attacker's build that ran short cache-mount
+  steps while the victim's ran read the victim's committed file from the
+  mount, and the victim's image held what the attacker planted (measured
+  2026-11-03, BuildKit 0.31.2). With a namespace per build, the attacker
+  read nothing and the victim's step read its own mount.
+  *Designed 2026-11-03 (review round 34, isolation R1, R2 and its
+  observation).* R1: a contributor's branch got its bytes into the image
+  the trusted branch then reused, through the context snapshot. R2: a
+  frontend could set a proxy on a step identical to leerie's own base
+  step. The observation: cache mounts were shared across repositories.
+  Rejected: a BuildKit daemon per repository. It would keep repositories
+  apart, but not the branches of one, which would still share its
+  snapshot, its cache and its cache mounts. So R1 would still need the
+  dating, and a branch's cache would still stand in for another's. It
+  would also need the base image copied into its own namespace (about
+  2.4 GB unpacked, per repository) and a daemon the launcher starts inside
+  Colima's VM. And it has no form on Fly: the remote builder is one per
+  organization and shared by every app in it, so leerie cannot give a
+  repository its own there. nerdctl exposes no per-build context name or
+  session key that would keep the snapshots apart either.
+  *Designed 2026-11-03 (review round 37, isolation I3).* A hostile
+  repository's Dockerfile did `FROM leerie-repo/<owner>-<repo>-<hash>:<version>`,
+  another checkout's name, or `RUN --mount=type=bind,from=` it, and copied
+  that checkout's committed file out of its worker root, on a BuildKit whose
+  worker reads the namespace nerdctl tags in, as this host's does (measured
+  2026-11-03, BuildKit 0.31.2). Before the fix this section counted three
+  places; the image store is the fourth. *Fly:* the remote builder, the
+  default, is Fly's, one per organization: it keeps the images built there
+  and pulls with the organization's token, so a repository's Dockerfile
+  there can name the organization's other images; leerie cannot partition
+  it (not measured). With `--local-build` and nerdctl, every image is
+  tagged in `leerie`; with docker there is one image store, so the read
+  holds there (not covered).
+- *A repository's build carries no operator credential.* nerdctl runs
+  `buildctl`, which hands BuildKit every registry credential in the
+  invoking user's Docker config, so a repository's `FROM` could pull
+  anything the operator can, another repository's pushed image included
+  (measured 2026-11-03 with a registry of the review's own: `401
+  Unauthorized` with an empty Docker config, the victim's file with the
+  operator's). Both builds of a repository image run with `DOCKER_CONFIG`
+  set to an empty 0700 directory of leerie's own in the build directory
+  (`$_REPO_BUILD_DIR/registry-auth`), so they pull as no one, the same rule
+  as *A repository chooses no operator authority*. A repository's `FROM` a
+  public image still works; a private one is pulled by the operator into
+  the worker's namespace first (`nerdctl --namespace <worker namespace>
+  pull`), where the build resolves it by name: what a build may read is
+  the operator's choice, made image by image, so leerie has no setting
+  that shares a registry. Leerie's own builds, its base and the frontend
+  it pulls into the worker's namespace, keep the operator's config: no
+  repository text reaches them, they name only public images, and an
+  operator behind a mirror or a rate limit needs it. *Fly:* the
+  repository's stage is built `FROM` leerie's base in
+  `registry.fly.io/<app>`, so that build needs the app's registry
+  credential, and the one it can have reads every image of the
+  organization (the remote builder's token; with `--local-build`, the
+  operator's `flyctl auth docker`). `build-push.sh`'s build and push are
+  separate commands, so each could be given its own Docker config, but
+  the build itself needs the credential: on Fly a repository's build can
+  read the organization's images (not covered). *Designed 2026-11-03
+  (review round 37, isolation I4).*
 - *Fail closed, on every entry.* Where the image has a worker root, the
   confinement check every entry runs (`_require_confinement`) runs `test
   -e /.leerie-worker-env` confined and stops the run when it does not find
@@ -3104,9 +3350,16 @@ image built it (root's files appear as the running user, the image's
 binds of it are read-only, so no ownership question arises. *Rootful:* the
 same files are root's and the worker reads them through their mode bits,
 as it reads leerie's root today; `container-entry.sh`'s ownership fixes
-touch only leerie's root. *Fly:* `ensure_image` builds the same two-stage
-Dockerfile through `build-push.sh` (`--context`, `--target`), from the
-committed tree; the machine's root is the base. Each image is pushed
+touch only leerie's root. Both run the same two `nerdctl build`s; the
+named OCI-layout context and the OCI export are BuildKit features nerdctl
+passes through (measured on rootless nerdctl 2.3.5 with BuildKit 0.31.2).
+*Fly:* `ensure_image` runs the same two builds through `build-push.sh`:
+the repository's file as committed, from the committed tree, pushed under
+its own tag, then leerie's, whose worker stage is that image's digest in
+the registry (`FROM registry.fly.io/<app>@<digest>`), checked as
+`_check_repo_image` checks it (`--layout-base`). The repository's image
+is never started as a container there (`--no-run`, where a local build
+would smoke-test it); the machine's root is the base. Each image is pushed
 under its own tag and a machine starts from the digest leerie pushed
 (§6½ *Per-repo container image*). *EC2:* the AMI is baked
 from leerie's base Dockerfile only, and no repository image is built
@@ -3118,19 +3371,70 @@ never becomes a build input.
 **Cost.** `COPY --from=<worker stage> /` copies the whole worker root, which
 is the base's filesystem plus the repository's layers: about 2.4 GB more
 unpacked per repository image (one per checkout and leerie version), and
-the copy's time on each rebuild. A rebuild happens only when the
+the copy's time on each rebuild. Locally the first build's image is also
+written out once as an OCI layout in the build directory, about 1 GB and
+49 s for an image on leerie's base (measured 2026-11-03), removed with the
+directory; on Fly it is pushed under its own tag. A rebuild happens only when the
 Dockerfile, what it reads from the committed tree, leerie's version or the
 base image change (`.dockerfile-hash` records all four and
 `REPO_IMAGE_LAYOUT`). A Dockerfile that copies the whole tree (`COPY .`)
-is rebuilt on every commit; the layers whose inputs did not change are
-BuildKit cache hits. Each launch exports and hashes the context, which
-for a whole-tree copy is the size of the tree.
+is rebuilt on every commit. A rebuild runs every step of the repository's
+file, since no build reuses BuildKit's cache (*No build consumes what
+another build left in BuildKit*). An `apt-get install` step took 3.8 s
+from the cache and 25.8 s with `--no-cache` (measured 2026-11-03). On
+every rebuild the second build's copy of the whole root takes minutes
+anyway. A checkout that switches between two branches whose copied files
+differ rebuilds from nothing on each switch. Each launch exports, dates
+and hashes the context, which for a whole-tree copy is the size of the
+tree. A launch that needs no rebuild runs no build at all, whatever wrote
+the Dockerfile. Leerie's generated file is tested only by its own build:
+when its language-dep layer does not build, the launch builds the same
+file without that layer (*Language deps*, §6½), and records the image
+under the key of the file it generated, so the next launch, which
+generates the same file, reuses it, and warns that it does. *Revised
+2026-11-03 (review round 35, execution R35E-1).* A separate probe build of the generated file ran on
+every launch, before the rebuild check; once every build was given
+`--no-cache`, it reinstalled every language dependency on each launch and
+threw the result away (32 s instead of 11 s for a one-package bake,
+measured; minutes for a real lockfile), and each launch needed apt and the
+package registry. On a rebuild it doubled the build.
 
 **Residuals.** A worker's CLI reads with its `Read`, `Grep` and `Glob`
 tools in leerie's root: a path only the worker root has (`/opt/venv/…`)
 is found by a command, not by those tools. A worker stage whose last
 stage has no `/bin/sh` cannot record its environment, so its build fails.
-A repository Dockerfile's `# syntax=` does not apply.
+The pinned frontend image is a network pull (about 14 MB), as a
+`# syntax=` frontend was. The launcher pulls it into the containerd
+namespace BuildKit's worker reads before its first build
+(`ensure_frontend_in_worker_ns`, as `ensure_base_in_worker_ns` copies the
+base there) and keeps it there.
+BuildKit's own pull of a frontend lives only in BuildKit's cache: after a
+prune, a build on a host without the network failed to resolve it, while
+one whose namespace held the pulled image built (measured 2026-11-03,
+BuildKit 0.31.2, with the daemon's registry access cut). A host that has
+never had the network has no base image either, so the frontend adds no
+first-install case. On Fly the remote builder resolves the pin itself
+(not measured there), and the cache-mount namespace holds there only if
+the remote builder passes `--build-arg` through to the frontend (not
+measured there). With a namespace per build no build reuses another's
+cache mount, so the records a build leaves are dead once it ends, and
+BuildKit's collection did not reclaim them: 13 builds each filling a
+60 MB mount left 838 MB, above the default policy's 512 MB for cache
+mounts, with nothing removed after 90 s idle (measured 2026-11-03,
+BuildKit 0.31.2; the policy's 48-hour keep duration is the likely reason,
+not proven), leaving only the disk-wide rules (10 GB reserved, 39 GB
+kept free) as the bound. So after each build leerie removes the records
+its own namespace names (`leerie_prune_cache_mounts`: `buildctl prune
+--filter 'type==exec.cachemount,description~="<ns>/"'`, whose description
+names the mount's id, which the frontend prefixes with the namespace; it
+removed that build's record and no other's, measured): the base build,
+both of `build_repo_image`'s, and `build-push.sh --local-build`'s with
+nerdctl, whatever the build's status. A failed prune warns. Left to
+BuildKit's collection: the records of a build its launch was killed
+during, and every record on Fly's remote builder, which leerie cannot
+prune. *Revised 2026-11-03 (review round 37, execution E4).* This said a
+record is kept "until BuildKit's garbage collection removes it", one per
+build; the collection did not.
 
 ### A worker's commands cannot reach its CLI
 
@@ -7515,6 +7819,104 @@ runs: 21 `cfg-*` entries, among them a 0-byte regular file from
 from the 2026-11-02 host crash its `-mtime +1` (more than 48 h, not the
 day it documented) had not reached yet.
 
+**A repository image's build directory lives only as long as its launch.**
+`.image-build/b.<launcher pid>.<random>` under the state root holds the
+exported context and, between a repository image's two builds, the first
+build's image as an OCI layout of about 1 GB. Every exit path that runs
+any code removes it. The launcher sets an EXIT trap before it makes the
+first build directory, and every EXIT trap it sets later removes the
+directory too. bash runs the EXIT trap on TERM and HUP as well, at once. A
+TERM trap would run only after the foreground build finished: measured,
+it ran 7 s after the TERM, at the end of an 8 s command, where the EXIT
+trap ran at once. What no trap survives (SIGKILL, an out-of-memory kill,
+a host crash) is left to the next launch's sweep (`_sweep_stale_builds`),
+the same rule as the credentials' stage. The sweep removes every `b.*`
+whose name carries a launcher PID that no longer runs, whatever its age.
+It also removes one untouched for a day: a name with no PID (a launcher
+from before this rule) or a PID a live process reuses.
+
+No build of a repository image outlives the launch that started it. Each
+build, local or through `build-push.sh`, runs as a background job in a
+process group of its own (`_build_job`), which the launcher waits on.
+Removing the directory (`_repo_build_done`) first kills that group and
+waits for it, so no build is left to write the directory again once it is
+gone. Ctrl-C at the terminal signals the launcher's group, not the
+build's, and the EXIT trap then ends the build's. The group is there only
+to be killed whole: it holds nerdctl's own children too (the `buildctl`
+that writes the export, a credential helper), which no list of the
+pipeline's PIDs names, and the launcher's own group cannot be killed
+instead, since it holds whatever else the operator's shell put in it
+(`leerie … | tee log`). It is never the terminal's foreground group, so
+the launcher states the signal handling that follows from that, instead
+of leaving it to the shell:
+- The job ignores SIGTTOU and SIGTTIN, and the commands it runs inherit
+  that. With `stty tostop` the kernel stops a background group that
+  writes to its terminal; the relay's first line of build output would
+  stop the whole build, and the launcher would wait for it forever. With
+  SIGTTOU ignored the write goes through; with SIGTTIN ignored a read of
+  the terminal fails instead of stopping the job (its stdin is
+  `/dev/null`, so only a program that opens the terminal itself reads it).
+- While the launcher waits for the job, SIGINT, SIGTERM and SIGHUP are
+  each cleaned up in the signal's own handler, not by the EXIT trap: the
+  handler removes the build directory and ends the build's group
+  (`_repo_build_done`), then the signal is re-raised with its default
+  handling, so the launcher dies of it (`_build_job_die`). Left to the
+  EXIT trap, a terminal that goes away (a closed window, a dropped ssh
+  session) delivers two SIGHUPs about a millisecond apart, one forwarded
+  by the operator's shell and one from the kernel's hangup, and bash 5
+  died of the second before its EXIT trap ran, in 4 of 6 hangups of the
+  real launcher; the build, in a group neither SIGHUP reaches, ran on,
+  reparented to init. Re-raising alone (`trap - INT; kill -INT $$`) lost
+  the same race for two SIGINTs (11 of 20 at 0.5 ms). And left to the
+  shell, bash 3.2, macOS's `/bin/bash`, exits 129 on SIGINT, which a
+  calling script reads as a normal exit. The earlier traps for these
+  signals are put back when the job ends.
+- A SIGTSTP (^Z) reaches only the launcher's group, so its handler stops
+  the build's group and then the launcher by the same signal
+  (`_build_job_stop`); once the launcher is continued (`fg`, `bg`), its
+  wait continues the build. Left to the shell, the launcher stopped and
+  the build ran on, writing over the operator's prompt, under `tostop`
+  too. The handler is set after `set +m`, which replaces it; bash 3.2
+  stops only after the handler returns, so the build is continued from
+  the wait, not from the handler. A trapped signal ends `wait` early, so
+  the launcher waits again while the job runs.
+
+Leerie's local base build is not one (on Fly it goes through
+`build-push.sh`, so it is): it reads only leerie's own directory and
+writes only the image store, and it runs before any build directory
+exists, so a base build that outlives its launch leaves no file behind and
+finishes the build the next launch would run.
+*Designed 2026-11-03 (review round 34, execution R34E-1).* A SIGTERM or
+SIGHUP 3 s after the first build finished left 931 MB each, and nothing
+removed it. Ctrl-C was cleaned up only because nerdctl turns it into a
+failed build. *Revised 2026-11-03 (review round 35, execution R35E-2;
+claims R1).* A SIGTERM to the launcher's PID alone removed the directory,
+but the build pipeline kept running, reparented to init, and its export
+wrote the directory again (44 MB of a layout 60 s later, measured), left
+for the next launch's sweep. The local run's EXIT trap, set after the
+directory is removed, did not call `_repo_build_done`; it had nothing to
+remove, but now it does call it, so the rule holds for every EXIT trap
+rather than for those set while a build directory can exist.
+*Revised 2026-11-03 (review round 36, execution X1, X2).* The job's own
+group, added in round 35, made every build hang on a terminal with
+`stty tostop`: the build and its relay stopped at their first write, the
+launcher printed nothing more and waited with no end (measured on real
+BuildKit and on a job of the launcher's text without it; the foreground
+pipeline before it finished). And on bash 3.2 a Ctrl-C during a build
+exited 129 instead of dying of SIGINT. Considered instead: no group of its
+own, the build a job in the launcher's group with its pipeline's PIDs
+recorded. It has no `tostop` case, but the recorded PIDs do not include
+nerdctl's child `buildctl`, which writes the export, so killing them
+would leave the export running (from the process tree, not measured),
+which is what round 35's group was made to stop; reaching it would take a
+walk of the process tree, a case of its own.
+*Revised 2026-11-03 (review round 37, execution E1, E2).* This section
+said SIGTERM and SIGHUP needed nothing, measured with one SIGHUP to the
+launcher's PID; a terminal's hangup sends two, and the second killed bash
+5 before its EXIT trap (above). And with the build in a group of its own,
+^Z stopped the launcher alone, where the foreground build on main had
+stopped with it.
+
 **Worker subtree termination — Memory containment via cgroup v2.** The
 kernel reap above handles *process lifecycle*, not memory: when a worker's
 tool subtree (a `pnpm test` spawning vitest pools, a `tsc --noEmit`
@@ -8642,7 +9044,8 @@ failed sync leaves the instance running; `flyctl` is never invoked for
 an EC2 run.
 
 When no sidecar exists, `stop`/`kill` probe for a live local nerdctl
-container via `_is_local_container` (`nerdctl inspect <run-id>`).
+container via `_is_local_container` (`nerdctl inspect <run-id>`, in
+`leerie` and then, for a run an earlier leerie launched, `default`).
 `stop` uses `nerdctl stop` (SIGTERM → grace → SIGKILL, letting the
 signal handler save state) or `aws ec2 stop-instances`; `kill` uses
 `nerdctl kill` (immediate SIGKILL) or `aws ec2 terminate-instances`
@@ -9689,8 +10092,10 @@ packages commits `.leerie/Dockerfile` that extends the base image with
 `ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds an image
 tagged `leerie-repo/<repo-id>-<checkout-id>:<version>` (where `<repo-id>`
 is derived from the git remote URL, sanitized to tag chars, and
-`<checkout-id>` from the checkout's path) and uses it for all subsequent
-`nerdctl run` invocations. When no `.leerie/Dockerfile` exists
+`<checkout-id>` from the checkout's path), in leerie's containerd namespace
+`leerie` (§6 *No build consumes what another build left in BuildKit*), and
+uses it for all subsequent `nerdctl run` invocations. When no
+`.leerie/Dockerfile` exists
 but `.leerie/config.toml` declares `setup_packages`, the launcher
 auto-generates an apt-install Dockerfile and proceeds through the same
 build path. A committed Dockerfile always takes precedence — `setup_packages`
@@ -9744,10 +10149,12 @@ Dockerfile, computes the hash, and sets `LEERIE_FLY_IMAGE` to the per-repo
 tag — the existing override hook in `resolve_fly_image_tag()` picks it up
 transparently. `ensure_image()` then first guarantees the base image is
 published (checking `published-tags.txt`; building and pushing if absent),
-then builds and pushes the repository image with `build-push.sh`: leerie's
-two-stage Dockerfile around the repository's (`--dockerfile`), what it
-reads of the committed tree as the context (`--context`), its final stage as the target
-(`--target`), built `FROM` the base's digest, `--tag $per_repo_tag`.
+then builds and pushes the repository image with `build-push.sh` in the
+two builds of §6 *One image, two roots*: the repository's Dockerfile as
+committed (`--dockerfile`), what it reads of the committed tree as the
+context (`--context`), `BASE_IMAGE` the base's digest, `--tag
+$per_repo_tag-repo`; then leerie's Dockerfile, `FROM` the base's digest
+and the repository image's, `--tag $per_repo_tag`.
 Without `.leerie/Dockerfile` the Fly path is unchanged — the base tag
 resolves and `ensure_image` proceeds as before.
 
@@ -9852,6 +10259,25 @@ requirements.txt`, etc.; *A capture names packages and managers, never
 commands* below). Workers that inherit this image find
 `node_modules`/site-packages already populated — per-worker install drops to
 near-zero.
+The generated file's own build is its only test: when it fails, the launch
+builds the file again without the language-dep layer (apt only;
+`bake_language_deps=false` for that launch) and records that image under
+the key of the file it generated. The next launch generates the same file
+and reuses the image, so a layer that cannot build costs one failed build,
+not one per launch; a change to any input the key holds tries the layer
+again, and so does removing `.dockerfile-hash` from the state root. The
+record marks such an image as the apt-only one, and every launch that
+reuses it says so, naming that file: the checkout's generated
+`.leerie/Dockerfile` again shows the language-dep layer, so nothing else
+tells the operator that the image running lacks it, or that a failure that
+was only a registry outage is still being reused. *Revised 2026-11-03
+(review round 36, execution X3).* The warning said the apt-only bake was
+"for this run", and later launches reused the image without a word.
+Considered instead: never recording the apt-only image under the
+generated file's key, so every launch tries the layer again. That makes a
+transient failure heal itself, but it puts back what this paragraph rules
+out, a full failing build on every launch for a layer that cannot build;
+the record stays, and is no longer silent.
 
 **Rebuild tradeoff.** A dependency-input change triggers a full image rebuild
 (`build_repo_image` fires when the hash mismatches). To keep rebuilds narrow,

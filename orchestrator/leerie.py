@@ -24138,7 +24138,7 @@ def _require_worker_view() -> None:
         die(f"this image has a repository root ({WORKER_ROOT}), but a "
             f"confined command did not run in it (exit {r.returncode}"
             f"{': ' + err if err else ''}). Rebuild the repository image "
-            "(remove it with `nerdctl image rm "
+            "(remove it with `nerdctl --namespace leerie image rm "
             "leerie-repo/<repo>-<checkout>:<version>`"
             " and launch again). Leerie runs the repository's commands only "
             "in the repository's root, and its own only in its own (DESIGN "
