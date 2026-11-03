@@ -243,3 +243,273 @@ def test_a_planted_pth_never_reaches_the_orchestrators_interpreter(tmp_path):
         assert "base-clean" in w.stdout and ".env" not in w.stdout
     finally:
         subprocess.run(["nerdctl", "image", "rm", tag], capture_output=True)
+
+
+# --- the build context is what the Dockerfile reads, and keys the image ----
+# (DESIGN §6 *A repository image is the one built from what it reads*;
+# review round 30 isolation R1: the image was built from `git archive HEAD`
+# but reused on the Dockerfile's bytes alone, so a branch's COPY'd files
+# stayed in the image a later run on another branch reused.)
+
+def _commit(repo: Path, files: dict[str, str]) -> None:
+    for rel, text in files.items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+    for args in (["add", "-A"], ["-c", "user.email=t@x", "-c",
+                                 "user.name=t", "commit", "-qm", "c"]):
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True)
+
+
+def _context(repo: Path, state: Path) -> tuple[list[str], str, list[str]]:
+    """(context paths, context sha, files in the extracted context), from
+    the launcher's own `_repo_image_prepare`."""
+    script = ("set -euo pipefail\n" + 'remote_log() { echo "$*" >&2; }\n'
+              + _fns() + f'\n_repo_image_prepare {BASE}\n'
+              'tr "\\0" "\\n" < "$_REPO_BUILD_DIR/context-paths"\n'
+              'echo "CTX $_REPO_CTX_SHA"\n'
+              '(cd "$_REPO_BUILD_CTX" && find . -type f | sort)\n'
+              "_repo_build_done\n")
+    state.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["bash", "-c", script], capture_output=True,
+                       text=True, timeout=60,
+                       env={"PATH": "/usr/bin:/bin", "USER_REPO": str(repo),
+                            "LEERIE_STATE_HOST_DIR": str(state)})
+    assert r.returncode == 0, r.stderr
+    head, _, files = r.stdout.partition("CTX ")
+    sha, _, files = files.partition("\n")
+    return ([p for p in head.splitlines() if p], sha,
+            [f[2:] for f in files.splitlines()])
+
+
+def _repo(tmp_path: Path, dockerfile: str) -> Path:
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)],
+                   check=True)
+    _commit(repo, {".leerie/Dockerfile": dockerfile,
+                   "package.json": "{}\n", "package-lock.json": "{}\n",
+                   "src/a.ts": "a\n", "docs/d.md": "d\n",
+                   "README.md": "r\n", ".dockerignore": "node_modules\n"})
+    return repo
+
+
+READS = ("FROM node:20 AS deps\nWORKDIR /app\nCOPY package*.json ./\n"
+         "COPY --chown=1:1 src/ /app/src/\n"
+         "RUN --mount=type=bind,source=docs,target=/d true\n"
+         "COPY --from=deps /x /y\nCOPY <<EOT /etc/x\nhi\nEOT\n"
+         "ADD https://example.com/x /x\n")
+
+
+def test_the_context_is_what_the_dockerfile_reads(tmp_path):
+    paths, _sha, files = _context(_repo(tmp_path, READS), tmp_path / "st")
+    assert paths == [".dockerignore", "docs", "package-lock.json",
+                     "package.json", "src"]
+    assert files == [".dockerignore", "docs/d.md", "package-lock.json",
+                     "package.json", "src/a.ts"]
+
+
+def test_the_key_moves_with_what_the_image_reads_and_nothing_else(tmp_path):
+    """The reviewer's two branches: the same Dockerfile bytes, different
+    COPY'd content, now different keys; a file no instruction reads leaves
+    the key (and the image) as it was."""
+    repo = _repo(tmp_path, READS)
+    _p, base, _f = _context(repo, tmp_path / "st")
+    _commit(repo, {"README.md": "changed\n"})
+    assert _context(repo, tmp_path / "st")[1] == base
+    _commit(repo, {"src/a.ts": "planted\n"})
+    planted = _context(repo, tmp_path / "st")[1]
+    assert planted != base
+    _commit(repo, {"src/a.ts": "a\n"})
+    assert _context(repo, tmp_path / "st")[1] == base
+
+
+def test_the_local_key_and_the_fly_tag_carry_the_context():
+    text = LAUNCHER.read_text()
+    assert ('_cur_hash="${LEERIE_VERSION}:${REPO_IMAGE_LAYOUT}:${_base_id}:'
+            '${_cur_df_sha}:${_REPO_CTX_SHA}"') in text
+    fly = text[text.index("_set_fly_per_repo_image() {"):]
+    fly = fly[:fly.index("\n}\n")]
+    assert '"$_REPO_DF_SHA:$_REPO_CTX_SHA"' in fly
+
+
+@pytest.mark.parametrize("copy, paths", [
+    ("COPY . /app", ["."]),
+    ("COPY ./ /app", ["."]),
+    ("COPY $SRC /app", ["."]),
+    ("COPY src/$X/a.ts /app", ["src"]),
+    ("COPY */a.ts /app", ["."]),
+    ("COPY [\"src/a.ts\", \"/app/\"]", ["src/a.ts"]),
+    ("COPY ../x /app", ["."]),
+    ("COPY absent.txt /app", []),
+    ("ONBUILD COPY docs /d", ["docs"]),
+    ("RUN --mount=target=/w true", ["."]),
+    ("RUN --mount=type=cache,target=/c true", []),
+    ("COPY package?json /app", ["package.json"]),
+    ("COPY [p]ackage-lock.json /app", ["package-lock.json"]),
+])
+def test_each_source_form_names_its_context(tmp_path, copy, paths):
+    got, _sha, _f = _context(_repo(tmp_path, f"FROM node:20\n{copy}\n"),
+                             tmp_path / "st")
+    assert got == (paths if paths == ["."]
+                   else sorted(paths + [".dockerignore"]))
+
+
+def test_a_whole_tree_copy_keys_on_the_whole_tree(tmp_path):
+    repo = _repo(tmp_path, "FROM node:20\nCOPY . /app\n")
+    base = _context(repo, tmp_path / "st")[1]
+    _commit(repo, {"README.md": "changed\n"})
+    assert _context(repo, tmp_path / "st")[1] != base
+
+
+# Review round 31, execution 6: the reading followed BuildKit's lexing only
+# approximately, so each shape below read short and a build that passed with
+# the whole tree failed with "not found". Each is lexed as BuildKit lexes it.
+@pytest.mark.parametrize("dockerfile, paths", [
+    # Any whitespace ends the instruction word.
+    ("FROM node:20\nCOPY\tsrc/a.ts /app/\n", ["src/a.ts"]),
+    ("FROM node:20\nCOPY --chown=1:1\tsrc/ /app/\n", ["src"]),
+    # An empty line inside a continuation is skipped, not the end of it.
+    ("FROM node:20\nCOPY package.json \\\n\n  docs /app/\n",
+     ["docs", "package.json"]),
+    # A comment line inside a continuation too, and a whitespace-only one.
+    ("FROM node:20\nCOPY package.json \\\n  # c\n \t\n  docs /app/\n",
+     ["docs", "package.json"]),
+    # A continuation is joined with no separator.
+    ("FROM node:20\nCOPY READ\\\nME.md /app/\n", ["README.md"]),
+    # `# escape=` sets the continuation character.
+    ("# escape=`\nFROM node:20\nCOPY package.json `\n  docs /app/\n",
+     ["docs", "package.json"]),
+])
+def test_the_dockerfile_is_lexed_as_buildkit_lexes_it(tmp_path, dockerfile,
+                                                      paths):
+    got, _sha, _f = _context(_repo(tmp_path, dockerfile), tmp_path / "st")
+    assert got == sorted(paths + [".dockerignore"])
+
+
+def _linked_repo(tmp_path: Path, dockerfile: str) -> Path:
+    repo = _repo(tmp_path, dockerfile)
+    _commit(repo, {"vendor/lib/v.txt": "v\n", "vendor/x.txt": "x\n"})
+    os.symlink("vendor/lib", repo / "lib")
+    os.symlink("../../outside", repo / "vendor" / "away")
+    os.symlink("/etc", repo / "abs")
+    _commit(repo, {})
+    return repo
+
+
+@pytest.mark.parametrize("copy, paths", [
+    # A committed link to a directory: the link and what it names.
+    ("COPY lib/ /x/", ["lib", "vendor/lib"]),
+    # A path through a linked directory.
+    ("COPY lib/v.txt /x/", ["lib", "vendor/lib/v.txt"]),
+    # A wildcard that matches a link.
+    ("COPY li? /x/", ["lib", "vendor/lib"]),
+    # A target leaving the tree adds nothing past the link.
+    ("COPY vendor/away /x/", ["vendor/away"]),
+    ("COPY abs /x/", ["abs"]),
+])
+def test_a_source_through_a_committed_link_reads_what_it_names(
+        tmp_path, copy, paths):
+    got, _sha, files = _context(
+        _linked_repo(tmp_path, f"FROM node:20\n{copy}\n"), tmp_path / "st")
+    assert got == sorted(paths + [".dockerignore"])
+    if "vendor/lib" in paths:
+        assert "vendor/lib/v.txt" in files
+
+
+# Review round 32, execution X1: a `<<` was read as a heredoc wherever it
+# appeared on a RUN/COPY/ADD line, so a shell shift or a here-string
+# swallowed the rest of the file, an earlier stage was named the worker
+# stage and the build succeeded. BuildKit reads a heredoc only where a whole
+# shell word matches `^(\d*)<<(-?)([^<]*)$`. Each file's last FROM is the
+# `runtime` stage, and the stage leerie names must be it.
+_TAIL = "FROM ruby:3.3-slim AS runtime\nCOPY a /a\nRUN true\n"
+
+
+@pytest.mark.parametrize("line", [
+    "RUN echo $((1<<SHIFT)) > /shift",          # arithmetic shift
+    "RUN cat <<<hello > /h",                     # here-string
+    "RUN echo '<<x' > /q",                       # quoted, single
+    'RUN echo "a <<x b" > /q',                   # quoted, double
+    "RUN echo a\\<<x > /q",                      # escaped
+    'RUN ["sh", "-c", "cat <<EOF"]',             # JSON form holds none
+    "RUN echo x<<y",                             # not the word's start
+])
+def test_a_shift_or_here_string_is_no_heredoc(tmp_path, line):
+    out = tmp_path / "Dockerfile"
+    r = _write(tmp_path / "repo",
+               f"FROM ruby:3.3-slim AS builder\n{line}\n{_TAIL}", out)
+    assert r.returncode == 0, r.stderr
+    assert f"FROM runtime AS leerie-stage-{NONCE}" in out.read_text()
+
+
+@pytest.mark.parametrize("line, body", [
+    ("RUN cat <<END-OF > /x", "FROM fake AS nope\nEND-OF"),
+    ("RUN cat <<'END OF' > /x", "FROM fake AS nope\nEND OF"),
+    ('RUN cat <<"E.O.F" > /x', "FROM fake AS nope\nE.O.F"),
+    ("RUN cat <<E'O'F > /x", "FROM fake AS nope\nEOF"),
+    ("RUN cat <<-EOF > /x", "\tFROM fake AS nope\n\t\tEOF"),
+    ("RUN cat 0<<EOF > /x", "FROM fake AS nope\nEOF"),
+    ("RUN cat <<A <<B > /x", "FROM fake AS nope\nA\nFROM fake2 AS no\nB"),
+])
+def test_a_heredoc_name_is_read_as_buildkit_reads_it(tmp_path, line, body):
+    """The delimiter is the whole rest of the word, unquoted (`END-OF`
+    was read as `END`, and the body ran past the end of the file); a
+    `<<-` body's terminator may be indented by tabs."""
+    out = tmp_path / "Dockerfile"
+    r = _write(tmp_path / "repo",
+               f"FROM ruby:3.3-slim AS builder\n{line}\n{body}\n{_TAIL}",
+               out)
+    assert r.returncode == 0, r.stderr
+    text = out.read_text()
+    assert f"FROM runtime AS leerie-stage-{NONCE}" in text
+
+
+def test_a_heredoc_names_no_context_path_but_a_shifted_copy_does(tmp_path):
+    df = ("FROM node:20 AS builder\nRUN echo $((1<<2))\n"
+          "FROM node:20 AS runtime\nCOPY <<EOT /etc/x\nhi\nEOT\n"
+          "COPY src/a.ts /app/\n")
+    got, _sha, _f = _context(_repo(tmp_path, df), tmp_path / "st")
+    assert got == [".dockerignore", "src/a.ts"]
+
+
+# Review round 32, execution X2: leerie's file began with its own comment,
+# so BuildKit read none of the repository's parser directives and a file
+# written with `# escape=`` failed to parse. Its `escape` and `check`
+# directives come first, as BuildKit reads them; `syntax` never does.
+def test_the_repositorys_parser_directives_come_first(tmp_path):
+    out = tmp_path / "Dockerfile"
+    r = _write(tmp_path / "repo",
+               "# Escape=`\n#check = error=true\n"
+               "# syntax=attacker.invalid/frontend:1\n"
+               "FROM ruby:3.3-slim\nCOPY a `\n  /a\n", out)
+    assert r.returncode == 0, r.stderr
+    head = out.read_text().splitlines()[:3]
+    assert head[0] == "# escape=`"
+    assert head[1] == "# check=error=true"
+    assert head[2].startswith("# leerie:")
+    assert "attacker.invalid" not in "\n".join(head)
+
+
+@pytest.mark.parametrize("dockerfile", [
+    # A comment or a blank line ends the directives: what follows is a
+    # comment to BuildKit, and to leerie.
+    "# a comment\n# escape=`\nFROM ruby:3.3-slim\n",
+    "\n# escape=`\nFROM ruby:3.3-slim\n",
+    # So does an unknown key.
+    "# foo=bar\n# escape=`\nFROM ruby:3.3-slim\n",
+])
+def test_a_directive_after_the_top_is_a_comment(tmp_path, dockerfile):
+    out = tmp_path / "Dockerfile"
+    r = _write(tmp_path / "repo", dockerfile, out)
+    assert r.returncode == 0, r.stderr
+    assert out.read_text().startswith("# leerie:")
+
+
+def test_a_lowercase_from_gets_a_lowercase_as(tmp_path):
+    """A repository's `# check=error=true` turns BuildKit's FromAsCasing
+    warning into an error; the name leerie adds is in its FROM's case."""
+    out = tmp_path / "Dockerfile"
+    r = _write(tmp_path / "repo", "from ruby:3.3-slim\nrun true\n", out)
+    assert r.returncode == 0, r.stderr
+    assert f"from ruby:3.3-slim as leerie-worker-{NONCE}" in out.read_text()

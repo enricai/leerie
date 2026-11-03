@@ -7224,7 +7224,40 @@ sample's probe never counts for the next.
   continuations and heredocs, a swallowing file leaves leerie's nonce
   target its only definition, a `# syntax=` line is never the first, a
   linked Dockerfile is refused, and an image that is not the base's layers
-  plus one with the base's configuration is removed. Opt-in
+  plus one with the base's configuration is removed. The build context and
+  the image key (review round 30 isolation R1, DESIGN §6 *A repository
+  image is the one built from what it reads*; 4 functions, 17 cases): the
+  context is exactly what the instructions read (COPY/ADD sources, ONBUILD's,
+  a RUN bind mount's, `.dockerignore`) and the extracted files are those;
+  the key moves when a read file changes and not when another does; the
+  local key and the Fly tag carry the context digest; each source form
+  (`.`, `$VAR`, a wildcard before or in the last part, JSON form, `..`, an
+  absent file, ONBUILD, a bind mount with and without a source, a cache
+  mount) names its context; a whole-tree COPY keys on the whole tree. The
+  lexing (review round 31, execution 6; 2 functions, 11 cases): the
+  Dockerfile is lexed as BuildKit lexes it — a tab after the instruction
+  word or a flag, an empty, comment or whitespace-only line inside a
+  continuation, a continuation joined with no separator, `# escape=` — and a
+  source through a committed link reads the link and what it names (a
+  directory link, a path through one, a wildcard matching one), while a link
+  leaving the tree, relative or absolute, adds nothing past itself. Against
+  the parser before the fix the 6 lexing cases and the 3 link-following
+  cases fail; the 2 leaving-the-tree cases pass there too (guards). Review
+  round 32 (execution X1, X2; 6 functions, 20 cases): a `<<` that BuildKit
+  does not read as a heredoc — `$((1<<SHIFT))`, `<<<hello`, `'<<x'`,
+  `"a <<x b"`, `a\<<x`, `x<<y`, a JSON-form `RUN` — leaves the last `FROM`
+  the named worker stage (7 cases); a heredoc's delimiter is read as
+  BuildKit reads it — `END-OF`, `'END OF'`, `"E.O.F"`, `E'O'F`, `<<-` with
+  tab-indented terminator, `0<<`, two on one line — with a `FROM` inside
+  each body (7 cases); a heredoc names no context path while a shifted
+  `RUN` leaves the later `COPY` in it; the repository's `escape` and
+  `check` directives come first and `syntax` never does; a comment, a
+  blank line or an unknown key ends the directives (3 cases); a lower-case
+  `from` gets a lower-case `as`. Against the parent the 7 shapes,
+  `END-OF` and `E'O'F`, the directives case and the casing case fail (11);
+  the other 5 delimiter cases, the context case and the 3 end-of-directive
+  cases pass there too (guards). With only the word rule reverted to the
+  old pattern, the 6 non-JSON shapes and the 2 delimiters fail. Opt-in
   (`LEERIE_TEST_REPO_IMAGE=<base>`): E1's planted `.pth`, in a real build,
   is in the worker root and never runs in the image root's interpreter, as
   leerie or root, and the untracked `.env` is not in the image.

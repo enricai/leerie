@@ -18,7 +18,7 @@ from pathlib import Path
 
 from tests.fly_stub import make_fake_flyctl
 from tests.repo_image_block_extract import extract_block as _extract_block
-from tests.repo_image_block_extract import repo_build_functions
+from tests.repo_image_block_extract import fly_repo_hash, repo_build_functions
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -173,7 +173,8 @@ def test_set_fly_per_repo_image_with_dockerfile(tmp_path):
 
 
 def test_set_fly_per_repo_image_hash_matches_dockerfile_content(tmp_path):
-    """The REPO_HASH in LEERIE_FLY_IMAGE matches first 12 chars of sha256(Dockerfile)."""
+    """The REPO_HASH in LEERIE_FLY_IMAGE is the first 12 chars of the sha256
+    of the Dockerfile's sha256 and its (here empty) context's."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -181,7 +182,7 @@ def test_set_fly_per_repo_image_hash_matches_dockerfile_content(tmp_path):
     df_path = leerie_dir / "Dockerfile"
     df_path.write_text(df_content)
 
-    expected_hash = hashlib.sha256(df_content.encode()).hexdigest()[:12]
+    expected_hash = fly_repo_hash(df_content.encode())
 
     result = _run_harness(
         '_set_fly_per_repo_image\necho "fly_image=${LEERIE_FLY_IMAGE:-UNSET}"',
@@ -314,7 +315,7 @@ def _run_ensure(tmp_path: Path, *, per_repo: bool, cache: str = "",
     if per_repo:
         (user_repo / ".leerie").mkdir()
         (user_repo / ".leerie" / "Dockerfile").write_text(df_content)
-        repo_hash = hashlib.sha256(df_content.encode()).hexdigest()[:12]
+        repo_hash = fly_repo_hash(df_content.encode())
         tag = f"{BASE_TAG}-{repo_hash}"
     cache_dir = tmp_path / "leerie"
     cache_dir.mkdir()
@@ -435,7 +436,7 @@ def test_ensure_image_per_repo_cache_hit_skips_build(tmp_path):
     """The repository image cached on the base digest cached now: no build,
     and the machine starts from its digest."""
     df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
-    tag = f"{BASE_TAG}-{hashlib.sha256(df_content.encode()).hexdigest()[:12]}"
+    tag = f"{BASE_TAG}-{fly_repo_hash(df_content.encode())}"
     result, bp_log, _, _ = _run_ensure(
         tmp_path, per_repo=True,
         cache=(f"{BASE_TAG} {BASE_DIGEST}\n"
@@ -449,7 +450,7 @@ def test_ensure_image_per_repo_on_another_base_is_rebuilt(tmp_path):
     """A repository image cached on a base digest other than the one cached
     now is built again on the current base."""
     df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
-    tag = f"{BASE_TAG}-{hashlib.sha256(df_content.encode()).hexdigest()[:12]}"
+    tag = f"{BASE_TAG}-{fly_repo_hash(df_content.encode())}"
     result, bp_log, _, _ = _run_ensure(
         tmp_path, per_repo=True,
         cache=(f"{BASE_TAG} {BASE_DIGEST}\n"
@@ -464,7 +465,7 @@ def test_ensure_image_per_repo_in_another_layout_is_rebuilt(tmp_path):
     (or with none recorded) is built again, never reused (review round 29,
     execution L2)."""
     df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
-    tag = f"{BASE_TAG}-{hashlib.sha256(df_content.encode()).hexdigest()[:12]}"
+    tag = f"{BASE_TAG}-{fly_repo_hash(df_content.encode())}"
     for stale in (f"{tag} {OTHER_DIGEST} {BASE_DIGEST} worker-root-0\n",
                   f"{tag} {OTHER_DIGEST} {BASE_DIGEST}\n"):
         sub = tmp_path / str(len(stale))
@@ -499,7 +500,7 @@ def test_fly_image_tag_pipeline_with_dockerfile(tmp_path):
     leerie_dir.mkdir(parents=True)
     df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\n"
     (leerie_dir / "Dockerfile").write_text(df_content)
-    repo_hash = hashlib.sha256(df_content.encode()).hexdigest()[:12]
+    repo_hash = fly_repo_hash(df_content.encode())
 
     launcher = _launcher_text()
     build_block = repo_build_functions(launcher)

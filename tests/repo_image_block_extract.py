@@ -8,6 +8,8 @@ deliberately not consolidated here.
 """
 from __future__ import annotations
 
+import hashlib
+
 
 def extract_block(text: str, start_marker: str, end_marker: str) -> str:
     """Return the text between start_marker and end_marker (exclusive)."""
@@ -29,6 +31,18 @@ def extract_block(text: str, start_marker: str, end_marker: str) -> str:
 # `REPO_DIGEST`), present when `$NERDCTL_INSPECT_RC` is 0 or once the
 # harness's `build` branch has called `_stub_build_done`.
 REPO_DIGEST = "sha256:" + "a" * 64
+# The digest of an empty build context (`_repo_context_sha` over nothing):
+# a Dockerfile that reads nothing from the committed tree (DESIGN §6 *A
+# repository image is the one built from what it reads*).
+EMPTY_CONTEXT_SHA = hashlib.sha256(b"").hexdigest()
+
+
+def fly_repo_hash(dockerfile: bytes, context_sha: str = EMPTY_CONTEXT_SHA
+                  ) -> str:
+    """The 12 hex characters of a per-repo Fly tag: the sha256 of
+    `<Dockerfile sha256>:<context sha256>` (`_set_fly_per_repo_image`)."""
+    df = hashlib.sha256(dockerfile).hexdigest()
+    return hashlib.sha256(f"{df}:{context_sha}".encode()).hexdigest()[:12]
 NERDCTL_IMAGE_INSPECT_STUB = r'''
 _STUB_BUILT=""
 _stub_build_done() { _STUB_BUILT=1; }

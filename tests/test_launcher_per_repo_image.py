@@ -14,7 +14,9 @@ import subprocess
 from pathlib import Path
 
 from tests.committed_tree import commit_tree
-from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB, REPO_DIGEST
+from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
+                                            NERDCTL_IMAGE_INSPECT_STUB,
+                                            REPO_DIGEST)
 from tests.repo_image_block_extract import extract_block as _extract_block
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -304,7 +306,7 @@ def test_rebuild_skipped_when_image_present_and_hash_matches(tmp_path):
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
     (state_dir / ".dockerfile-hash").write_text(
-        f"{version}:worker-root-1:sha256:base-id:{sha} {REPO_DIGEST}\n")
+        f"{version}:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
 
     result = _run_harness(
         'echo "done"',
@@ -729,7 +731,7 @@ def test_unrelated_file_change_no_rebuild(tmp_path):
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
     (state_dir / ".dockerfile-hash").write_text(
-        f"{version}:worker-root-1:sha256:base-id:{sha} {REPO_DIGEST}\n")
+        f"{version}:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
 
     # Mutate an unrelated source file — not a lockfile.
     src_dir = user_repo / "src"

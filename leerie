@@ -6420,16 +6420,21 @@ REPO_IMAGE_LAYOUT="worker-root-1"
 # _repo_build_dir — a directory of the launcher's own for the builds below
 # (never /tmp, never inside the checkout): $_REPO_BUILD_DIR, holding
 # leerie's Dockerfile. _repo_build_prepare adds $_REPO_BUILD_CTX beneath
-# it, the build context — the
-# committed tree at HEAD, exported by git (`git archive`), never the
-# checkout directory. An untracked file — `.env`,
-# `.claude/settings.local.json` — never reaches a build the repository's
-# Dockerfile drives, and a link the checkout holds is a link in the context,
-# which BuildKit does not follow out of it; BuildKit reads only what a COPY
-# names. Empty for a repository with no commit. Once per launch;
-# _repo_build_done removes it, and _repo_build_fail on the way out.
+# it, the build context — exactly the paths of the committed tree at HEAD
+# that the repository's Dockerfile can read (_repo_image_dockerfile's
+# list), exported by git (`git archive`), never the checkout directory. An
+# untracked file — `.env`, `.claude/settings.local.json` — never reaches a
+# build the repository's Dockerfile drives, and a link the checkout holds is
+# a link in the context, which BuildKit does not follow out of it. Empty for
+# a repository with no commit. $_REPO_CTX_SHA is the digest of the context
+# as extracted (_repo_context_sha), which keys the image: an image is
+# reused only for the context it was built from (DESIGN §6 *A repository
+# image is the one built from what it reads*). _repo_image_prepare drops a
+# context made for an earlier Dockerfile; _repo_build_done removes it all,
+# and _repo_build_fail on the way out.
 _REPO_BUILD_DIR=""
 _REPO_BUILD_CTX=""
+_REPO_CTX_SHA=""
 _repo_build_dir() {
   [ -n "$_REPO_BUILD_DIR" ] && return 0
   mkdir -p "$LEERIE_STATE_HOST_DIR/.image-build" \
@@ -6439,11 +6444,22 @@ _repo_build_dir() {
 _repo_build_prepare() {
   _repo_build_dir
   [ -n "$_REPO_BUILD_CTX" ] && return 0
+  [ -f "$_REPO_BUILD_DIR/context-paths" ] \
+    || _repo_build_fail "the repository image's Dockerfile was not prepared"
   _REPO_BUILD_CTX="$_REPO_BUILD_DIR/context"
   mkdir -p "$_REPO_BUILD_CTX" || _repo_build_fail "could not make the build context"
-  if git -C "$USER_REPO" rev-parse -q --verify 'HEAD^{commit}' >/dev/null 2>&1; then
-    git -C "$USER_REPO" archive --format=tar HEAD | tar -x -C "$_REPO_BUILD_CTX" -f - \
+  local _p _paths=()
+  while IFS= read -r -d '' _p; do _paths+=("$_p"); done \
+    < "$_REPO_BUILD_DIR/context-paths"
+  if [ "${#_paths[@]}" -gt 0 ]; then
+    git --literal-pathspecs -C "$USER_REPO" archive --format=tar HEAD \
+        -- "${_paths[@]}" \
+        | tar -x -C "$_REPO_BUILD_CTX" -f - \
       || _repo_build_fail "could not export the committed tree as the image build context"
+  fi
+  if ! _REPO_CTX_SHA="$(_repo_context_sha "$_REPO_BUILD_CTX")" \
+     || [ -z "$_REPO_CTX_SHA" ]; then
+    _repo_build_fail "could not hash the image build context"
   fi
 }
 _repo_build_done() {
@@ -6452,7 +6468,39 @@ _repo_build_done() {
   fi
   _REPO_BUILD_DIR=""
   _REPO_BUILD_CTX=""
+  _REPO_CTX_SHA=""
   _REPO_NONCE=""
+}
+
+# _repo_context_sha <dir> — the sha256 of a build context as extracted:
+# every entry's path, kind, executable bit, and its bytes or its link's
+# target, in path order. What git's export applied (export-ignore,
+# export-subst) is in it; a tar's mtimes are not, so a context that holds
+# the same files gives the same digest whatever the commit.
+_repo_context_sha() {
+  python3 -I -S - "$1" <<'PY'
+import hashlib, os, stat, sys
+
+root = sys.argv[1]
+h = hashlib.sha256()
+for d, dirs, files in os.walk(root):
+    dirs.sort()
+    for name in sorted(dirs + files):
+        p = os.path.join(d, name)
+        rel = os.path.relpath(p, root).encode("utf-8", "surrogateescape")
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode):
+            body = b"l" + os.fsencode(os.readlink(p))
+        elif stat.S_ISDIR(st.st_mode):
+            body = b"d"
+        else:
+            with open(p, "rb") as f:
+                body = (b"x" if st.st_mode & stat.S_IXUSR else b"f") \
+                    + hashlib.sha256(f.read()).digest()
+        h.update(len(rel).to_bytes(8, "big") + rel
+                 + len(body).to_bytes(8, "big") + body)
+print(h.hexdigest())
+PY
 }
 _repo_build_fail() {
   remote_log "error: $1"
@@ -6461,10 +6509,11 @@ _repo_build_fail() {
 }
 
 # _repo_image_dockerfile <out> <nonce> <base> — leerie's Dockerfile for the
-# repository image: a comment first (so no parser directive of the
-# repository's — `# syntax=` would choose the frontend that builds the whole
-# file — applies), the repository's .leerie/Dockerfile with its last stage
-# named, then leerie's stages: the base image's environment and the worker
+# repository image: the repository's `escape` and `check` parser directives
+# first, where BuildKit reads them, then a comment (so no other directive
+# applies: its `# syntax=` would choose the frontend that builds the whole
+# file, leerie's stages included), the repository's .leerie/Dockerfile with
+# its last stage named, then leerie's stages: the base image's environment and the worker
 # stage's (`env -0`, for scripts/landlock_exec.py's worker_env_changes), and
 # the final stage, `FROM <base>` and one COPY of the worker stage to
 # /opt/leerie-worker-root. The final stage's name carries a nonce drawn for
@@ -6475,9 +6524,23 @@ _repo_build_fail() {
 # the sha256 of the bytes it read: the one digest of the repository's
 # Dockerfile the launcher keys an image on, so no other read of the file by
 # its path (which would follow a committed link, unbounded) ever happens.
+# Writes the build context's paths, NUL-separated, to context-paths beside
+# <out>: every path of HEAD's tree an instruction
+# can read from the context (a COPY or ADD source, ONBUILD's too, a RUN
+# bind mount's source; a source with a variable, or a wildcard anywhere but
+# in its last part, stands for its directory up to there, and a wildcard in
+# its last part for the names in that directory of HEAD it matches), and
+# `.dockerignore` when HEAD has one. A source naming nothing in HEAD is left
+# out (the build then fails naming it); "." is the whole tree. A source
+# through a committed link adds each link and what it names within the tree
+# (a target leaving the tree adds nothing, and the build fails as it would).
+# The Dockerfile is lexed as BuildKit lexes it: `# escape=`, any whitespace
+# after the instruction word, comment and empty lines inside a continuation
+# skipped, a continuation joined with no separator, and a heredoc only where
+# a whole shell word is one (`$((1<<N))` and `<<<word` are not).
 _repo_image_dockerfile() {
   python3 -I - "$USER_REPO" "$@" <<'PY'
-import hashlib, os, re, stat, sys
+import hashlib, json, os, re, stat, subprocess, sys
 
 repo, out, nonce, base = sys.argv[1:5]
 LIMIT = 1 << 20
@@ -6512,31 +6575,306 @@ except OSError as e:
     sys.exit(f"leerie: .leerie/Dockerfile cannot be read as a regular file "
              f"beneath the checkout ({e})")
 lines = raw.decode("utf-8", "surrogateescape").split("\n")
-heredoc = re.compile(r"<<(-?)([\"']?)([A-Za-z_][A-Za-z0-9_]*)\2")
-last_from = None
-i = 0
-while i < len(lines):
-    if not lines[i].strip() or lines[i].lstrip().startswith("#"):
-        i += 1
-        continue
-    parts, j = [lines[i]], i
-    while parts[-1].rstrip().endswith("\\") and j + 1 < len(lines):
-        j += 1
-        if lines[j].lstrip().startswith("#"):
-            continue
-        parts.append(lines[j])
-    joined = " ".join(p.rstrip().rstrip("\\") for p in parts)
-    word = joined.split(None, 1)[0].upper()
-    if word == "FROM":
-        last_from = (j, joined.split())
-    if word in ("RUN", "COPY", "ADD"):
-        for m in heredoc.finditer(joined):
+# BuildKit's own lexing (frontend/dockerfile/parser): the parser directives
+# at the top (`# escape=` sets the line-continuation character), a line
+# whose first non-blank character is `#` a comment wherever it is, an empty
+# or comment line inside a continuation skipped, a continuation joined with
+# no separator, and an instruction's word ended by any whitespace.
+WS = re.compile(r"[\t\v\f\r ]+")
+
+
+def parser_directives():
+    """[(key, value)] of the parser directives BuildKit reads: from the
+    first line on, each a whole `# key=value` line whose key is one it
+    knows, read until the first line that is not (a comment, a blank line,
+    an instruction or an unknown key ends them)."""
+    found, seen = [], set()
+    for n, line in enumerate(lines):
+        if n == 0 and line.startswith("\ufeff"):
+            line = line[1:]
+        d = re.fullmatch(r"#[\t\n\f\r ]*([A-Za-z][A-Za-z0-9]*)[\t\n\f\r ]*="
+                         r"[\t\n\f\r ]*(.+?)[\t\n\f\r ]*", line)
+        if d is None or d.group(1).lower() not in ("syntax", "escape",
+                                                     "check"):
+            break
+        key = d.group(1).lower()
+        if key in seen:
+            sys.exit(f"leerie: .leerie/Dockerfile names the {key} parser "
+                     "directive twice (BuildKit refuses it)")
+        seen.add(key)
+        found.append((key, d.group(2)))
+    return found
+
+
+directives = parser_directives()
+escape = dict(directives).get("escape", "\\")
+if escape not in ("\\", "`"):
+    sys.exit(f"leerie: .leerie/Dockerfile's escape directive {escape!r} is "
+             "neither \\ nor ` (BuildKit refuses it)")
+continuation = re.compile(re.escape(escape) + r"[ \t]*$")
+
+
+class Unlexable(Exception):
+    """A line BuildKit's shell lexer refuses; it then reads no heredoc on
+    it."""
+
+
+SPECIAL_PARAMS = set("@*#?-$!0")
+
+
+def shell_name(s, i):
+    """BuildKit's `processName`: digits, one special parameter, or a run of
+    letters, digits and `_`."""
+    if i < len(s) and s[i].isdigit():
+        j = i
+        while j < len(s) and s[j].isdigit():
             j += 1
-            while j < len(lines) and (
-                    lines[j].lstrip("\t") if m.group(1) else lines[j]
-            ) != m.group(3):
+        return s[i:j], j
+    if i < len(s) and s[i] in SPECIAL_PARAMS:
+        return s[i], i + 1
+    j = i
+    while j < len(s) and (s[j].isalnum() or s[j] == "_"):
+        j += 1
+    return s[i:j], j
+
+
+def shell_dollar(s, i, keep_unset):
+    """BuildKit's `processDollar` at `s[i] == "$"`, in an empty
+    environment: a name is unset (empty, or kept as written when
+    `keep_unset`), `${n:-w}`/`${n-w}` is `w`. Returns (text, next)."""
+    start = i
+    i += 1
+    if i >= len(s) or s[i] != "{":
+        name, i = shell_name(s, i)
+        if not name:
+            return "$", i
+        return (s[start:i] if keep_unset else ""), i
+    name, i = shell_name(s, i + 1)
+    if i >= len(s):
+        raise Unlexable("unterminated ${")
+    c = s[i]
+    if c == "}":
+        return (s[start:i + 1] if keep_unset else ""), i + 1
+    colon = c == ":"
+    if colon:
+        i += 1
+        if i >= len(s):
+            raise Unlexable("unterminated ${")
+        c = s[i]
+    if c not in "-+?" and (colon or c not in "#%"):
+        raise Unlexable(f"unsupported modifier {c!r}")
+    word, i = shell_text(s, i + 1, "}", keep_unset)
+    if keep_unset:
+        return s[start:i], i
+    if c == "-":
+        return word, i
+    if c == "?":
+        raise Unlexable("unset variable")
+    return "", i
+
+
+def shell_double(s, i, raw, keep_unset):
+    """BuildKit's `processDoubleQuote` at `s[i] == '"'`."""
+    out = '"' if raw else ""
+    i += 1
+    while True:
+        if i >= len(s):
+            raise Unlexable("unterminated double quote")
+        c = s[i]
+        if c == '"':
+            return out + ('"' if raw else ""), i + 1
+        if c == "$":
+            text, i = shell_dollar(s, i, keep_unset)
+            out += text
+            continue
+        if c == "\\" and i + 1 < len(s) and s[i + 1] in '"$\\':
+            out += (s[i:i + 2] if raw else s[i + 1])
+            i += 2
+            continue
+        out += c
+        i += 1
+
+
+def shell_text(s, i, stop, keep_unset, raw=True):
+    """BuildKit's lexer from `s[i]` to an unquoted `stop` (None: the end),
+    as one word. Returns (text, index after `stop`)."""
+    out = ""
+    while i < len(s) and s[i] != stop:
+        c = s[i]
+        if c == "\\":
+            out += (s[i:i + 2] if raw else s[i + 1:i + 2])
+            i += 2
+        elif c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                raise Unlexable("unterminated single quote")
+            out += s[i:j + 1] if raw else s[i + 1:j]
+            i = j + 1
+        elif c == '"':
+            text, i = shell_double(s, i, raw, keep_unset)
+            out += text
+        elif c == "$":
+            text, i = shell_dollar(s, i, keep_unset)
+            out += text
+        else:
+            out += c
+            i += 1
+    if stop is not None:
+        if i >= len(s):
+            raise Unlexable(f"no closing {stop}")
+        i += 1
+    return out, i
+
+
+def shell_words(s):
+    """BuildKit's `ProcessWords` as `heredocsFromLine` calls it (escape
+    `\\`, quotes and escapes kept raw, an empty environment): the line's
+    words, split on unquoted whitespace."""
+    words, cur, i = [], "", 0
+    while i < len(s):
+        if s[i].isspace():
+            if cur:
+                words.append(cur)
+                cur = ""
+            i += 1
+            continue
+        j = i
+        while j < len(s) and not s[j].isspace() and s[j] not in "\\'\"$":
+            j += 1
+        if j > i:
+            cur += s[i:j]
+            i = j
+            continue
+        c = s[i]
+        if c == "\\":
+            cur += s[i:i + 2]
+            i += 2
+        elif c == "'":
+            k = s.find("'", i + 1)
+            if k < 0:
+                raise Unlexable("unterminated single quote")
+            cur += s[i:k + 1]
+            i = k + 1
+        elif c == '"':
+            text, i = shell_double(s, i, True, False)
+            cur += text
+        else:
+            text, i = shell_dollar(s, i, False)
+            cur += text
+    if cur:
+        words.append(cur)
+    return words
+
+
+HEREDOC = re.compile(r"(\d*)<<(-?)([^<]*)", re.S)
+
+
+def heredoc_word(word):
+    """BuildKit's `ParseHeredoc`: (name, chomp) when the whole shell word is
+    a heredoc (`^(\\d*)<<(-?)([^<]*)$`, a non-empty word after it), its
+    name unquoted; None otherwise (`$((1<<N))`, `<<<word` are not)."""
+    m = HEREDOC.fullmatch(word)
+    if m is None or not m.group(3):
+        return None
+    try:
+        name, _i = shell_text(m.group(3), 0, None, True, raw=False)
+    except Unlexable:
+        return None
+    return name, m.group(2) == "-"
+
+
+def heredocs(line):
+    """The heredocs BuildKit reads on an instruction's joined line, in
+    order."""
+    try:
+        words = shell_words(line)
+    except Unlexable:
+        return []
+    return [h for h in map(heredoc_word, words) if h is not None]
+
+
+def split_flags(rest):
+    """(flags, rest): an instruction's leading `--flag` words, and what
+    follows them."""
+    flags = []
+    while rest.startswith("--"):
+        flag, *more = WS.split(rest, 1)
+        flags.append(flag)
+        rest = more[0].strip() if more else ""
+    return flags, rest
+
+
+def json_form(rest):
+    """An instruction's arguments when they are BuildKit's JSON form (a
+    JSON array of strings), else None."""
+    if not rest.startswith("["):
+        return None
+    try:
+        args = json.loads(rest)
+    except ValueError:
+        return None
+    if not isinstance(args, list) or not all(isinstance(a, str)
+                                             for a in args):
+        return None
+    return args
+
+
+def is_comment(line):
+    return line.lstrip().startswith("#")
+
+
+def instructions():
+    """(word, rest, first line, last line) for each instruction, lexed as
+    BuildKit lexes it, heredoc bodies skipped; ONBUILD's instruction as its
+    own."""
+    i = 0
+    while i < len(lines):
+        first = lines[i].rstrip("\r")
+        if is_comment(first):
+            i += 1
+            continue
+        joined, ended, j = first.lstrip(), True, i
+        m = continuation.search(joined)
+        if m:
+            joined, ended = joined[:m.start()], False
+        if ended and not joined:
+            i += 1
+            continue
+        while not ended and j + 1 < len(lines):
+            j += 1
+            part = lines[j].rstrip("\r")
+            if is_comment(part) or not part.strip():
+                continue
+            m = continuation.search(part)
+            if m:
+                part = part[:m.start()]
+            else:
+                ended = True
+            joined += part
+        words = WS.split(joined.strip(), 1)
+        word, rest = words[0].upper(), (words[1] if len(words) > 1 else "")
+        if word == "ONBUILD":
+            words = WS.split(rest.strip(), 1)
+            word, rest = words[0].upper(), (words[1] if len(words) > 1 else "")
+        # A JSON-form instruction holds no heredoc (BuildKit's
+        # `canContainHeredoc`).
+        if word in ("RUN", "COPY", "ADD") and json_form(
+                split_flags(rest.strip())[1]) is None:
+            for name, chomp in heredocs(joined):
                 j += 1
-    i = j + 1
+                while j < len(lines) and (
+                        lines[j].rstrip("\r").lstrip("\t") if chomp
+                        else lines[j].rstrip("\r")) != name:
+                    j += 1
+        yield word, rest.strip(), i, j
+        i = j + 1
+
+
+last_from = None
+for word, rest, first, last in instructions():
+    if word == "FROM":
+        last_from = (last, [WS.split(lines[first].strip(), 1)[0]]
+                     + WS.split(rest))
 if last_from is None:
     sys.exit("leerie: .leerie/Dockerfile has no FROM")
 at, words = last_from
@@ -6544,11 +6882,187 @@ if len(words) >= 4 and words[-2].upper() == "AS":
     stage = words[-1]
 else:
     stage = f"leerie-worker-{nonce}"
-    lines[at] = lines[at].rstrip() + f" AS {stage}"
+    # In the FROM's own case, so no `FromAsCasing` check (an error under a
+    # repository's `# check=error=true`) fires on leerie's addition.
+    as_word = "as" if words[0] == words[0].lower() else "AS"
+    lines[at] = lines[at].rstrip() + f" {as_word} {stage}"
 if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", stage):
     sys.exit(f"leerie: .leerie/Dockerfile's last stage name {stage!r} is "
              "not a plain name")
+
+
+def head_tree():
+    """{path: (mode, object)} for every entry of HEAD."""
+    r = subprocess.run(["git", "-C", repo, "ls-tree", "-r", "-z", "HEAD"],
+                       capture_output=True, cwd="/")
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for rec in r.stdout.split(b"\0"):
+        meta, tab, path = rec.partition(b"\t")
+        if not tab:
+            continue
+        mode, _type, obj = meta.decode().split(" ")
+        out[os.fsdecode(path)] = (mode, obj)
+    return out
+
+
+def link_targets(tree):
+    """{path: target} for every symbolic link HEAD commits, read from its
+    blob."""
+    links = sorted(p for p, (mode, _o) in tree.items() if mode == "120000")
+    if not links:
+        return {}
+    r = subprocess.run(["git", "-C", repo, "cat-file", "--batch"],
+                       input=b"".join(tree[p][1].encode() + b"\n"
+                                      for p in links),
+                       capture_output=True, cwd="/")
+    if r.returncode != 0:
+        return {}
+    out, data = {}, r.stdout
+    for p in links:
+        head, _, data = data.partition(b"\n")
+        size = int(head.split(b" ")[2])
+        out[p], data = os.fsdecode(data[:size]), data[size + 1:]
+    return out
+
+
+def go_glob(pattern):
+    """Go's filepath.Match, BuildKit's rule for a COPY source, as a regex."""
+    out, i = "", 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            out += "[^/]*"
+        elif c == "?":
+            out += "[^/]"
+        elif c == "\\" and i + 1 < len(pattern):
+            i += 1
+            out += re.escape(pattern[i])
+        elif c == "[":
+            j = pattern.find("]", i + 1)
+            if j < 0:
+                out += re.escape(c)
+            else:
+                body = pattern[i + 1:j]
+                neg = body.startswith("^")
+                body = body[1:] if neg else body
+                out += "[" + ("^" if neg else "") + body.replace(
+                    "\\", "\\\\") + "]"
+                i = j
+        else:
+            out += re.escape(c)
+        i += 1
+    return re.compile(out + r"\Z")
+
+
+def sources():
+    """Every context path an instruction names, as written."""
+    for word, rest, _first, _last in instructions():
+        flags, rest = split_flags(rest)
+        if word == "RUN":
+            for f in flags:
+                if not f.startswith("--mount="):
+                    continue
+                kv = dict(x.partition("=")[::2]
+                          for x in f[len("--mount="):].split(","))
+                if kv.get("type", "bind") == "bind" and "from" not in kv:
+                    yield kv.get("source") or kv.get("src") or "."
+            continue
+        if word not in ("COPY", "ADD") or any(
+                f.startswith("--from") for f in flags):
+            continue
+        args = json_form(rest)
+        heredoc_args = args is None
+        if args is None:
+            args = WS.split(rest)
+        for a in args[:-1]:
+            if heredoc_args and heredoc_word(a) is not None:
+                continue
+            if word == "ADD" and re.match(r"[A-Za-z][A-Za-z0-9+.-]*://|git@",
+                                         a):
+                continue
+            yield a
+
+
+def context_paths():
+    tree = head_tree()
+    if not tree:
+        return []
+    have = set(tree)
+    dirs = {"/".join(p.split("/")[:k]) for p in tree
+            for k in range(1, p.count("/") + 1)}
+    links = link_targets(tree)
+
+    def resolve(path):
+        """What the build reads of HEAD for the source `path`: each
+        committed link on the way to it, and the path it names, as BuildKit
+        follows a source's links. A link whose target leaves the tree
+        (absolute, or `..` past its top) adds nothing past itself."""
+        got, parts, k = [], path.split("/"), 0
+        for _hop in range(41):
+            while k < len(parts) and "/".join(parts[:k + 1]) not in links:
+                k += 1
+            if k == len(parts):
+                break
+            link = "/".join(parts[:k + 1])
+            got.append(link)
+            target = links[link]
+            if target.startswith("/"):
+                return got
+            new = []
+            for c in parts[:k] + target.split("/"):
+                if c in ("", "."):
+                    continue
+                if c != "..":
+                    new.append(c)
+                elif new:
+                    new.pop()
+                else:
+                    return got
+            parts, k = new + parts[k + 1:], 0
+        else:
+            return got
+        final = "/".join(parts)
+        if final in have or final in dirs:
+            got.append(final)
+        return got
+
+    out = set()
+    for src in sources():
+        parts = [p for p in src.split("/") if p not in ("", ".")]
+        if ".." in parts:
+            return ["."]
+        special = [k for k, p in enumerate(parts) if re.search(r"[$*?\[\\]", p)]
+        if special and (special[0] < len(parts) - 1 or "$" in parts[-1]):
+            parts = parts[:special[0]]
+            special = []
+        if not parts:
+            return ["."]
+        if special:
+            base = "/".join(parts[:-1])
+            rx = go_glob(parts[-1])
+            for p in have | dirs:
+                head, _, name = p.rpartition("/")
+                if head == base and rx.match(name):
+                    out.update(resolve(p))
+            continue
+        out.update(resolve("/".join(parts)))
+    if ".dockerignore" in have:
+        out.add(".dockerignore")
+    return sorted(out)
+
+
+with open(os.path.join(os.path.dirname(out), "context-paths"), "wb") as f:
+    f.write(b"".join(os.fsencode(p) + b"\0" for p in context_paths()))
 with open(out, "w") as f:
+    # The repository's `escape` and `check` directives, first, where BuildKit
+    # reads them; never its `syntax` (the built-in frontend builds the file:
+    # it is the grammar this lexer reads, and leerie's own stages are
+    # written for it).
+    for key, value in directives:
+        if key != "syntax":
+            f.write(f"# {key}={value}\n")
     f.write("# leerie: the repository image (DESIGN §6 *The orchestrator's "
             "root is leerie's;\n# a repository's root is only a confined "
             "process's*). The repository's stages\n# follow; leerie's are "
@@ -6605,17 +7119,25 @@ sys.exit(0 if ok else 1)
 
 # _repo_image_prepare — draws the build's nonce ($_REPO_NONCE) and writes
 # leerie's Dockerfile for it into $_REPO_BUILD_DIR on base <base>; sets
-# $_REPO_DF_SHA, the sha256 of the repository Dockerfile bytes it read.
+# $_REPO_DF_SHA, the sha256 of the repository Dockerfile bytes it read, and
+# makes the build context those bytes read (_repo_build_prepare,
+# $_REPO_CTX_SHA), in place of any made for an earlier Dockerfile.
 _REPO_NONCE=""
 _REPO_DF_SHA=""
 _repo_image_prepare() {
   _repo_build_dir
+  if [ -n "$_REPO_BUILD_CTX" ]; then
+    rm -rf "$_REPO_BUILD_CTX"
+    _REPO_BUILD_CTX=""
+    _REPO_CTX_SHA=""
+  fi
   _REPO_NONCE="$(_repo_image_nonce)"
   [ -n "$_REPO_NONCE" ] || _repo_build_fail "could not draw a build nonce"
   if ! _REPO_DF_SHA="$(_repo_image_dockerfile "$_REPO_BUILD_DIR/Dockerfile" \
                          "$_REPO_NONCE" "$1")" || [ -z "$_REPO_DF_SHA" ]; then
     _repo_build_fail "could not prepare the repository image's Dockerfile"
   fi
+  _repo_build_prepare
 }
 
 # Build the repository image from the Dockerfile _repo_image_prepare wrote.
@@ -7441,7 +7963,7 @@ PY
       # buildkit namespace too, else it always fails and silently degrades to
       # apt-only (defeating the language-dep bake). See ensure_base_in_buildkit_ns.
       ensure_base_in_buildkit_ns
-      _repo_build_prepare
+      _repo_image_prepare "$IMAGE_TAG"
       if ! nerdctl build \
            --build-arg BASE_IMAGE="$IMAGE_TAG" \
            --build-arg HOST_UID="$(id -u)" \
@@ -7483,8 +8005,10 @@ unset _leerie_config_toml _leerie_do_gen LEERIE_GENERATED_SENTINEL _BAKE_LANGUAG
 if [ -f "$_leerie_dockerfile" ]; then
   REPO_IMAGE_TAG="$(resolve_repo_image_tag)"
   if [ -n "$REPO_IMAGE_TAG" ]; then
-    # Hash file stores "<version>:<layout>:<base id>:<dockerfile sha256>
-    # <image digest>": any input changing triggers a rebuild, and an image
+    # Hash file stores "<version>:<layout>:<base id>:<dockerfile sha256>:
+    # <context sha256> <image digest>": any input changing triggers a
+    # rebuild — the context is what the Dockerfile's instructions read, so a
+    # COPY of a file that changed rebuilds and nothing else does — and an image
     # is reused only when it is the one this checkout built — the digest
     # its tag names now is the digest recorded when it was built.
     _hash_file="$LEERIE_STATE_HOST_DIR/.dockerfile-hash"
@@ -7496,7 +8020,7 @@ if [ -f "$_leerie_dockerfile" ]; then
     # The base image's id too: the repository image is built on exactly it
     # (_check_repo_image), so a rebuilt base rebuilds it.
     _base_id="$(nerdctl image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)"
-    _cur_hash="${LEERIE_VERSION}:${REPO_IMAGE_LAYOUT}:${_base_id}:${_cur_df_sha}"
+    _cur_hash="${LEERIE_VERSION}:${REPO_IMAGE_LAYOUT}:${_base_id}:${_cur_df_sha}:${_REPO_CTX_SHA}"
     _stored=""
     [ -f "$_hash_file" ] && _stored="$(head -n 1 "$_hash_file" 2>/dev/null || true)"
     _stored_hash="${_stored% *}"
@@ -8609,6 +9133,7 @@ resolve_fly_image_tag() {
 # Module-level context set by _set_fly_per_repo_image() and read by
 # ensure_image() to build the per-repo derived image on Fly.
 _FLY_REPO_DF_SHA=""
+_FLY_REPO_CTX_SHA=""
 _FLY_BASE_TAG=""
 # The image a Fly Machine starts from: registry.fly.io/<app>@<digest>, the
 # digest leerie pushed under the tag (set by ensure_image).
@@ -8617,10 +9142,12 @@ FLY_IMAGE_REF=""
 # When .leerie/Dockerfile is present (real or auto-generated), set
 # LEERIE_FLY_IMAGE to registry.fly.io/$APP:$VERSION-$REPO_HASH so that
 # resolve_fly_image_tag() returns the per-repo tag. $REPO_HASH is the
-# digest of the Dockerfile bytes leerie's Dockerfile is made from
-# (_repo_image_prepare), recorded in _FLY_REPO_DF_SHA with the base tag in
-# _FLY_BASE_TAG for ensure_image(), which makes leerie's Dockerfile again
-# on the base's digest and requires the same bytes.
+# digest of the Dockerfile bytes leerie's Dockerfile is made from and of
+# the build context they read (_repo_image_prepare: _REPO_DF_SHA,
+# _REPO_CTX_SHA), recorded in _FLY_REPO_DF_SHA and _FLY_REPO_CTX_SHA with
+# the base tag in _FLY_BASE_TAG for ensure_image(), which makes leerie's
+# Dockerfile and its context again on the base's digest and requires the
+# same bytes and the same context.
 # Idempotent: called once before resolve_fly_image_tag().
 _set_fly_per_repo_image() {
   if [ ! -f "$USER_REPO/.leerie/Dockerfile" ]; then
@@ -8631,14 +9158,16 @@ _set_fly_per_repo_image() {
   version="$LEERIE_VERSION"
   base_tag="registry.fly.io/$fly_app:$version"
   _repo_image_prepare "$base_tag"
-  # First 12 hex chars of the sha256 of the Dockerfile bytes leerie's
-  # Dockerfile was made from — short but collision-free at the scale of
-  # per-repo image variants for a single leerie installation.
-  repo_hash="${_REPO_DF_SHA:0:12}"
+  # First 12 hex chars of the sha256 of the Dockerfile bytes' digest and
+  # the context's — short but collision-free at the scale of per-repo image
+  # variants for a single leerie installation.
+  repo_hash="$(python3 -I -S -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "$_REPO_DF_SHA:$_REPO_CTX_SHA")"
+  [ -n "$repo_hash" ] || _repo_build_fail "could not key the repository image"
   per_repo_tag="registry.fly.io/$fly_app:${version}-${repo_hash}"
   LEERIE_FLY_IMAGE="$per_repo_tag"
   export LEERIE_FLY_IMAGE
   _FLY_REPO_DF_SHA="$_REPO_DF_SHA"
+  _FLY_REPO_CTX_SHA="$_REPO_CTX_SHA"
   _FLY_BASE_TAG="$base_tag"
   remote_log "remote: per-repo Fly image tag: $per_repo_tag (base: $base_tag)"
 }
@@ -8772,12 +9301,12 @@ except Exception:
     # (DESIGN §6 *The orchestrator's root is leerie's; a repository's root
     # is only a confined process's*).
     _repo_image_prepare "$base_ref"
-    if [ "$_REPO_DF_SHA" != "$_FLY_REPO_DF_SHA" ]; then
+    if [ "$_REPO_DF_SHA" != "$_FLY_REPO_DF_SHA" ] \
+       || [ "$_REPO_CTX_SHA" != "$_FLY_REPO_CTX_SHA" ]; then
       _repo_build_done
-      remote_log "error: .leerie/Dockerfile changed while leerie was launching; launch again"
+      remote_log "error: .leerie/Dockerfile or the committed tree changed while leerie was launching; launch again"
       return 1
     fi
-    _repo_build_prepare
     remote_log "remote: ensuring per-repo image $tag is published (cache miss)"
     if ! _fly_push "$build_push" "$cache_dir" "$tag" "${build_args[@]}" \
            --dockerfile "$_REPO_BUILD_DIR/Dockerfile" \

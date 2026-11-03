@@ -2842,10 +2842,22 @@ they are confined.
 
 - *One image, two roots.* The launcher builds the repository image from
   leerie's own Dockerfile around the repository's
-  (`_repo_image_dockerfile`): a comment first, so that no parser directive
-  of the repository's applies (a `# syntax=` line would choose the frontend
-  that builds the whole file); the repository's stages, the last one
-  named; two stages of leerie's that record the base image's environment
+  (`_repo_image_dockerfile`): the repository's `escape` and `check` parser
+  directives first, where BuildKit reads them (only at the very top,
+  before any comment or blank line; review round 32 X2: leerie's comment
+  came first and a file written with `` # escape=` `` no longer parsed),
+  then a comment, so that no other directive of the repository's applies.
+  Its `# syntax=` is dropped: it chooses the frontend that builds the
+  whole file, leerie's own stages included, with a grammar leerie's lexer
+  does not read; without it the built-in frontend builds the file, and a
+  feature only the chosen frontend had fails the build by name rather than
+  silently. Then the repository's stages, the last one named. Leerie reads
+  that file as BuildKit's built-in frontend does, and a heredoc only where
+  BuildKit reads one: a whole shell word matching `^(\d*)<<(-?)([^<]*)$`,
+  its delimiter the rest of the word unquoted (review round 32 X1: any
+  `<<word` was read as one, so a `$((1<<N))` or a `<<<` here-string
+  swallowed the rest of the file, an earlier stage was named the worker
+  stage and the build succeeded with the wrong root); two stages of leerie's that record the base image's environment
   and the worker stage's (`env -0`, at `/.leerie-base-env` and
   `/.leerie-worker-env`); and the final stage, `FROM <leerie's base>` and
   one `COPY --from=<worker stage> / /opt/leerie-worker-root/`. The final
@@ -2925,15 +2937,50 @@ they are confined.
   `PATH` lacks, first. Leerie's, the CLI's and Anthropic's variables, the
   proxy variables, `HOME` and `TMPDIR` are never taken. This replaces the
   launcher's search of the Dockerfile for `ENV BUNDLE_PATH`.
-- *The build sees the committed tree.* The build context is the committed
-  tree at `HEAD`, exported by `git archive` into a directory of the
-  launcher's own under the state root, never the checkout directory: an
-  untracked `.env` or `.claude/settings.local.json` never reaches a build
-  a repository's Dockerfile drives (the build has the network), and a link
-  the checkout holds is a link in the context, which BuildKit does not
-  follow out of it. BuildKit reads only what a `COPY` names. The generator
-  reads its inputs from the same tree (§6 *Leerie never reads through a
-  link a repository holds*).
+- *The build sees the committed tree.* The build context is taken from
+  the committed tree at `HEAD`, exported by `git archive` into a directory
+  of the launcher's own under the state root, never the checkout
+  directory: an untracked `.env` or `.claude/settings.local.json` never
+  reaches a build a repository's Dockerfile drives (the build has the
+  network), and a link the checkout holds is a link in the context, which
+  BuildKit does not follow out of it. The generator reads its inputs from
+  the same tree (§6 *Leerie never reads through a link a repository
+  holds*).
+- *A repository image is the one built from what it reads.* An image is
+  reused only for the context it was built from, so the context keys it:
+  the digest of the context as extracted (every path, kind, executable bit
+  and content; what git's export applied is in it, a tar's times are not)
+  is part of the local key and of the Fly tag. And the context is exactly
+  what the Dockerfile's instructions can read from it — each `COPY` and
+  `ADD` source (an `ONBUILD` one too) and each `RUN` bind mount's source,
+  `.dockerignore` — so a commit that changes nothing an instruction reads
+  changes neither the key nor the image. A source the launcher cannot
+  resolve exactly stands for more, never less: a variable, or a wildcard
+  before its last part, stands for its directory up to there (the whole
+  tree when that is the top), a wildcard in its last part for the names
+  it matches in that directory of `HEAD` (Go's `filepath.Match`, BuildKit's
+  rule). The Dockerfile is read as BuildKit reads it, by BuildKit's
+  lexing rules rather than an approximation of them (review round 31,
+  execution 6: a tab after `COPY`, an empty line inside a continuation and
+  a source through a committed link each read short, and builds that
+  passed with the whole tree failed): a source through a committed link
+  reads the link and what it names, within the tree. Whatever the reading,
+  the key covers the context that was built, so a reading that is too
+  narrow can only fail the build (BuildKit names the missing source), never
+  reuse an image built from other files. A
+  base image's own `ONBUILD` instructions read only that context too.
+  *Designed 2026-11-03 (review round 30 isolation R1).* The image was
+  built from the whole of `git archive HEAD` but reused on the
+  Dockerfile's bytes alone: a run on a contributor's branch baked that
+  branch's `COPY`ed files into the worker root, and the next run on the
+  trusted branch, with the same Dockerfile, logged "per-repo image
+  up-to-date" and ran its confined commands, its measurements and its
+  held-out runner in the branch's root. Keying on the whole tree instead
+  would rebuild on every commit — a full build is 10–17 minutes — for a
+  Dockerfile that copies two lockfiles; the context is narrowed so the key
+  is exactly as wide as what the build reads. Leerie's generated
+  Dockerfile copies only the files it names, so its image is rebuilt when
+  one of them changes, as before.
 - *Fail closed, on every entry.* Where the image has a worker root, the
   confinement check every entry runs (`_require_confinement`) runs `test
   -e /.leerie-worker-env` confined and stops the run when it does not find
@@ -2961,15 +3008,18 @@ never becomes a build input.
 is the base's filesystem plus the repository's layers: about 2.4 GB more
 unpacked per repository image (one per checkout and leerie version), and
 the copy's time on each rebuild. A rebuild happens only when the
-Dockerfile, its inputs, leerie's version or the base image change
-(`.dockerfile-hash` records all four and `REPO_IMAGE_LAYOUT`).
+Dockerfile, what it reads from the committed tree, leerie's version or the
+base image change (`.dockerfile-hash` records all four and
+`REPO_IMAGE_LAYOUT`). A Dockerfile that copies the whole tree (`COPY .`)
+is rebuilt on every commit; the layers whose inputs did not change are
+BuildKit cache hits. Each launch exports and hashes the context, which
+for a whole-tree copy is the size of the tree.
 
 **Residuals.** A worker's CLI reads with its `Read`, `Grep` and `Glob`
 tools in leerie's root: a path only the worker root has (`/opt/venv/…`)
 is found by a command, not by those tools. A worker stage whose last
 stage has no `/bin/sh` cannot record its environment, so its build fails.
-A repository Dockerfile's own parser directives (`# syntax=`, `# escape=`)
-do not apply.
+A repository Dockerfile's `# syntax=` does not apply.
 
 ### A worker's commands cannot reach its CLI
 
@@ -9541,12 +9591,15 @@ digest, not the tag, so a tag moved between the check and the run changes
 nothing.
 
 Rebuild is triggered by any of: the image is absent, the sha256 of the
-Dockerfile changed, the base image changed, leerie's version or the
-image's layout (`REPO_IMAGE_LAYOUT`) changed — all four stored as
-`<version>:<layout>:<base image id>:<sha256>` at
+Dockerfile changed, what it reads from the committed tree changed (the
+build context's digest, §6 *A repository image is the one built from what
+it reads*), the base image changed, leerie's version or the image's
+layout (`REPO_IMAGE_LAYOUT`) changed — stored as
+`<version>:<layout>:<base image id>:<sha256>:<context sha256>` at
 `$LEERIE_STATE_HOST_DIR/.dockerfile-hash`, followed by the digest of the
 image built — or the tag names an image other than that digest. A second
-run with an unchanged Dockerfile skips the build entirely.
+run with an unchanged Dockerfile and unchanged inputs skips the build
+entirely.
 
 The `nerdctl run` image argument uses `${REPO_IMAGE_REF:-$IMAGE_TAG}`
 (`REPO_IMAGE_REF` is the recorded digest), so the base image is used
@@ -9554,15 +9607,16 @@ transparently when no repo Dockerfile is present.
 
 **Fly runtime variant.** On `--runtime fly` the same `.leerie/Dockerfile`
 triggers a derived image at `registry.fly.io/$APP:$VERSION-$HASH` where
-`$HASH` is the first 12 hex characters of the Dockerfile's sha256. Before
+`$HASH` is the first 12 hex characters of the sha256 of the Dockerfile's
+sha256 and the build context's (`<df>:<context>`). Before
 `resolve_fly_image_tag()` is called, `_set_fly_per_repo_image()` detects the
 Dockerfile, computes the hash, and sets `LEERIE_FLY_IMAGE` to the per-repo
 tag — the existing override hook in `resolve_fly_image_tag()` picks it up
 transparently. `ensure_image()` then first guarantees the base image is
 published (checking `published-tags.txt`; building and pushing if absent),
 then builds and pushes the repository image with `build-push.sh`: leerie's
-two-stage Dockerfile around the repository's (`--dockerfile`), the
-committed tree as the context (`--context`), its final stage as the target
+two-stage Dockerfile around the repository's (`--dockerfile`), what it
+reads of the committed tree as the context (`--context`), its final stage as the target
 (`--target`), built `FROM` the base's digest, `--tag $per_repo_tag`.
 Without `.leerie/Dockerfile` the Fly path is unchanged — the base tag
 resolves and `ensure_image` proceeds as before.

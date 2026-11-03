@@ -19,7 +19,9 @@ import subprocess
 from pathlib import Path
 
 from tests.committed_tree import commit_tree
-from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB, REPO_DIGEST
+from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
+                                            NERDCTL_IMAGE_INSPECT_STUB,
+                                            REPO_DIGEST)
 from tests.repo_image_block_extract import extract_block as _extract_block
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -307,9 +309,11 @@ def test_hash_file_written_on_success(tmp_path):
 
     stored = hash_file.read_text().strip()
     expected_sha = hashlib.sha256(df.read_bytes()).hexdigest()
-    # <version>:<layout>:<base image id>:<sha256> (the stub's base id),
-    # then the digest of the image built.
-    expected = (f"1.2.3:worker-root-1:sha256:base-id:{expected_sha} "
+    # <version>:<layout>:<base image id>:<sha256>:<context sha256> (the
+    # stub's base id; this Dockerfile reads nothing from the tree), then
+    # the digest of the image built.
+    expected = (f"1.2.3:worker-root-1:sha256:base-id:{expected_sha}:"
+                f"{EMPTY_CONTEXT_SHA} "
                 f"{REPO_DIGEST}")
     assert stored == expected, f"stored={stored!r}, expected={expected!r}"
 

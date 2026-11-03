@@ -37,7 +37,9 @@ import os
 import subprocess
 from pathlib import Path
 
-from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB, REPO_DIGEST
+from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
+                                            NERDCTL_IMAGE_INSPECT_STUB,
+                                            REPO_DIGEST)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -78,10 +80,12 @@ def _extracted_block() -> str:
         _extract_line('_REPO_BUILD_CTX=""'),
         _extract_line('_REPO_NONCE=""'),
         _extract_line('_REPO_DF_SHA=""'),
+        _extract_line('_REPO_CTX_SHA=""'),
         _extract_fn("_repo_build_dir() {"),
         _extract_fn("_repo_build_prepare() {"),
         _extract_fn("_repo_build_done() {"),
         _extract_fn("_repo_build_fail() {"),
+        _extract_fn("_repo_context_sha() {"),
         _extract_fn("_repo_image_dockerfile() {"),
         _extract_fn("_repo_image_nonce() {"),
         _extract_fn("_check_repo_image() {"),
@@ -429,7 +433,7 @@ def test_rebuild_false_when_image_present_and_hash_matches(tmp_path: Path):
     version = "0.99.test"
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     (state_dir / ".dockerfile-hash").write_text(
-        f"{version}:worker-root-1:sha256:base-id:{sha} {REPO_DIGEST}\n")
+        f"{version}:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
     result = _run_with_rebuild_decision(
         'echo "done"',
         env={
@@ -463,7 +467,7 @@ def test_a_linked_dockerfile_is_never_read_nor_reused(tmp_path: Path):
     version = "0.99.test"
     sha = hashlib.sha256(outside.read_bytes()).hexdigest()
     (state_dir / ".dockerfile-hash").write_text(
-        f"{version}:worker-root-1:sha256:base-id:{sha} {REPO_DIGEST}\n")
+        f"{version}:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
     result = _run_with_rebuild_decision(
         'echo "done"',
         env={
@@ -520,7 +524,7 @@ def _up_to_date_world(tmp_path: Path, stored: str) -> tuple[Path, Path]:
     state_dir.mkdir()
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     (state_dir / ".dockerfile-hash").write_text(
-        f"0.99.test:worker-root-1:sha256:base-id:{sha}{stored}\n")
+        f"0.99.test:worker-root-1:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA}{stored}\n")
     return user_repo, state_dir
 
 
