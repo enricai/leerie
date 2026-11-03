@@ -30049,15 +30049,15 @@ def _confined_cli_settings(hook_settings: str | None, *,
                                   root=Path(repo_root))
                    for name in CHECKOUT_SETTINGS_FILES
                    if _checkout_settings_are_operators(str(repo_root), name)]
-    # No layer below leerie's names a variable leerie's confinement reads
-    # (DESIGN §6 *The CLI's own git runs on leerie's terms*): leerie's own
-    # set them, last.
-    for layer in layers:
-        env = layer.get("env")
-        if isinstance(env, dict):
-            layer["env"] = {k: v for k, v in env.items()
-                            if k not in _CLI_PINNED_NAMES
-                            and not str(k).startswith("LEERIE_")}
+    # A layer below leerie's own contributes only what `_lower_layer_part`
+    # keeps (DESIGN §6 *The CLI reads no settings file*): what narrows a
+    # worker's tools and what names the operator's endpoint and
+    # credentials. Every other key is dropped — a permission mode or an
+    # allow list (an operator's `defaultMode: bypassPermissions` gave every
+    # judgment worker every tool, DESIGN §12 *L1*), `additionalDirectories`,
+    # a hook (one that answers "allow" approves the call), a variable
+    # leerie's confinement reads.
+    layers = [_lower_layer_part(layer) for layer in layers]
     if hook_settings:
         layers.append(json.loads(hook_settings))
     layers.append({"env": {SHELL_PREFIX_ENV: str(WORKER_SHELL)}})
@@ -30065,6 +30065,79 @@ def _confined_cli_settings(hook_settings: str | None, *,
     for layer in layers:
         merged = _merge_settings(merged, layer)
     return json.dumps(merged, separators=(",", ":"))
+
+
+# What a settings layer below leerie's own may give a confined worker, and
+# nothing else (DESIGN §6 *The CLI reads no settings file*): `permissions`
+# rules that only narrow; and the operator's endpoint, credentials and model
+# mapping, which an untracked settings file may choose (DESIGN §6 *The names
+# an untracked settings file may still set*) — none of them widens a
+# worker's tools. Every name is the CLI's own, from its settings schema and
+# the environment variables its Bedrock, Vertex and gateway setups document.
+_LOWER_LAYER_PERMISSIONS = frozenset({"deny", "ask"})
+# The CLI's credential helpers for the operator's endpoint.
+_LOWER_LAYER_KEYS = frozenset({
+    "apiKeyHelper",         # prints the Anthropic API key or token
+    "awsCredentialExport",  # Bedrock: prints the AWS credentials
+    "awsAuthRefresh",       # Bedrock: refreshes the AWS login (SSO)
+    "gcpAuthRefresh",       # Vertex: refreshes the Google login
+})
+_LOWER_LAYER_ENV = frozenset({
+    # Endpoint: the provider, and its base URL (a gateway's, which then
+    # authenticates itself).
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    # Foundry, the third provider the CLI documents beside Bedrock and
+    # Vertex: its switch, skip-auth switch, base URL and resource.
+    "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "ANTHROPIC_FOUNDRY_BASE_URL", "ANTHROPIC_FOUNDRY_RESOURCE",
+    # Credentials: the key and token, the headers a gateway at
+    # `ANTHROPIC_BASE_URL` authenticates by, and Foundry's key. A name that
+    # holds a path on the operator's host (`CLAUDE_CODE_CLIENT_CERT`/`_KEY`,
+    # `GOOGLE_APPLICATION_CREDENTIALS`, `ANTHROPIC_UNIX_SOCKET`) is left
+    # out: the path names nothing in the container. So is
+    # `CLAUDE_CODE_OAUTH_TOKEN`, the subscription credential leerie seeds.
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    # Vertex's project and default region (a model's own region is a
+    # `VERTEX_REGION_CLAUDE_*` name, below).
+    "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION",
+    # Model mapping: the model each alias leerie passes (`--model sonnet`)
+    # resolves to, which on Bedrock and Vertex can lag the API's by a
+    # generation; leerie still chooses the alias.
+    "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+})
+# Bedrock's credentials, profile and region; Vertex's per-model regions.
+_LOWER_LAYER_ENV_PREFIXES = ("AWS_", "VERTEX_REGION_CLAUDE_")
+
+
+def _lower_layer_part(layer: Mapping) -> dict:
+    """The part of a settings layer below leerie's own that a confined
+    worker gets: `_LOWER_LAYER_KEYS`, `permissions` cut to
+    `_LOWER_LAYER_PERMISSIONS`, and `env` cut to `_LOWER_LAYER_ENV` and
+    names starting with one of `_LOWER_LAYER_ENV_PREFIXES` (none of them
+    one leerie's own layer pins, `_CLI_PINNED_NAMES`). Every other key is
+    left out."""
+    out: dict = {k: layer[k] for k in _LOWER_LAYER_KEYS if k in layer}
+    perms = layer.get("permissions")
+    if isinstance(perms, dict):
+        kept = {k: v for k, v in perms.items()
+                if k in _LOWER_LAYER_PERMISSIONS}
+        if kept:
+            out["permissions"] = kept
+    env = layer.get("env")
+    if isinstance(env, dict):
+        kept = {k: v for k, v in env.items()
+                if isinstance(k, str) and (
+                    k in _LOWER_LAYER_ENV
+                    or k.startswith(_LOWER_LAYER_ENV_PREFIXES))}
+        if kept:
+            out["env"] = kept
+    return out
 
 
 # The CLI-environment variables leerie's confinement of a worker's CLI reads:

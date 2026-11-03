@@ -3036,7 +3036,53 @@ own — the PreToolUse hook and the shell prefix, which nothing below them
 overrides (settings given on the command line win over every file scope,
 measured). Merged as the CLI merges scopes: objects key by key, arrays
 concatenated. The Fly recovery integrator gets the same from
-`worker-guard.py`.
+`worker-guard.py`. A layer below leerie's own contributes only what is
+listed, and every other key of it is dropped: `permissions.deny` and
+`permissions.ask`, which only narrow; and the operator's endpoint and
+credentials, which an untracked settings file may choose (*The names an
+untracked settings file may still set*). That list is three things the
+CLI names, none of which widens a worker's tools: the endpoint (the
+provider switches, the API's, Bedrock's, Vertex's and Foundry's base URLs,
+Foundry's resource, and the skip-auth switches a gateway uses), the
+credentials (the CLI's credential helpers `apiKeyHelper`,
+`awsCredentialExport`, `awsAuthRefresh` and `gcpAuthRefresh`; the API key
+and token; the headers a gateway authenticates by; `AWS_*`; Vertex's
+project and regions; Foundry's key) and the model mapping (`ANTHROPIC_DEFAULT_*_MODEL` and
+`ANTHROPIC_SMALL_FAST_MODEL`, which say what the alias leerie passes
+resolves to on that endpoint, where it can lag the API's by a
+generation). Review round 31 found the first list short: it kept
+`CLAUDE_CODE_USE_VERTEX` but not Vertex's project and region, so Vertex
+from settings always failed; `apiKeyHelper` but not its Bedrock
+siblings; and no model mapping, which IMPLEMENTATION §0.5 documents for
+Bedrock. Review round 32 found it short again: it kept
+`ANTHROPIC_BASE_URL` but not `ANTHROPIC_CUSTOM_HEADERS`, so a gateway's
+requests went out without the header that authenticates them; and it
+kept no name of Foundry, a provider the CLI documents beside Bedrock and
+Vertex. A name that holds a path on the operator's host (a client
+certificate and key, a Google credentials file, a unix socket) stays
+out: the path names nothing in the container. So does
+`CLAUDE_CODE_OAUTH_TOKEN`: the subscription credential is the one leerie
+seeds, and a settings layer does not replace it. So do the CLI's
+provider switches that no documented setup sets: the list holds only
+names a documented setup reads. A worker's tool scope is leerie's argv alone (§12 *L1*), and no other key
+can be trusted not to widen it: a permission mode (`defaultMode:
+bypassPermissions` approves every tool), an allow list,
+`additionalDirectories` (the directories the CLI's tools may reach), a
+hook (a PreToolUse hook that answers "allow" approves the call), an `env`
+name the CLI reads. A list of what to drop would miss the next such key,
+as the first one did (review round 30: it dropped `defaultMode` and
+`allow` and passed `additionalDirectories` and the hooks through).
+*Designed 2026-11-03 (the live 0.43.0 barnacle runs).*
+The operator's own `settings.json` on the host carried `defaultMode:
+bypassPermissions` and `allow: [Bash, Read, Edit, Write, …]`; merged into
+every confined worker's settings, it put every judgment worker in
+`bypassPermissions` (every transcript checked — the classifier, the three
+planners, five satisfied-probe logs — reports it), so its `--allowedTools`
+scope approved nothing it would not have approved anyway. A satisfied
+probe, read-only by its tools, ran `npx vitest` over twelve test files in
+its read-only tree; eleven failed on `mkdirSync`, which Landlock refused,
+and it answered `cannot_verify`, settling a subtask `unconverged` whose
+work a sibling had delivered.
 
 **Residuals.** The CLI's own spawns that are not commands: its `git`
 calls are on leerie's terms (§6 *The CLI's own git runs on leerie's
@@ -3720,7 +3766,9 @@ easily. Repository content reached that layer only by being misjudged as
 untracked, and the identity rule closes that. A refusal would therefore stop
 no writer that the operator's own domain does not already hold. It would
 also take away a documented operator channel: Bedrock mode from an
-untracked `.claude/settings.local.json`.
+untracked `.claude/settings.local.json`. The same holds for every name the
+keep-list carries (*The CLI reads no settings file*: endpoint, credentials
+and model mapping), and for each the tracked file sets nothing.
 
 **What a repository still chooses.** Facts about itself and how much work it
 asks for, all of which run confined or only tighten a check:
@@ -16323,7 +16371,12 @@ rejected every such attempt, naming the allowed working directory. **The
 working-directory boundary is real; the flag is what erases it.** A
 separate probe combined cwd = detached worktree with the flag still on, and
 the worker overwrote a tracked file in the real checkout and committed on
-its branch — the result behind L2's caveat below.
+its branch — the result behind L2's caveat below. The flag is not the
+only way to erase it: a settings layer's `defaultMode:
+bypassPermissions`, an allow list naming a tool, or a hook that answers
+"allow" does the same, so leerie's settings for a confined worker carry
+from a layer below its own only the keys that cannot (§6 *The CLI reads no
+settings file*).
 
 **L2 — they run in a disposable worktree.** A detached worktree per run,
 reset on entry to the recorded working branch's tip, else the checkout's

@@ -355,7 +355,7 @@ def test_no_settings_layer_below_leeries_steers_the_clis_git(
              leerie.SHELL_PREFIX_ENV: "",
              leerie.WORKER_COMMAND_ENV: "1",
              leerie.REAL_GIT_ENV: str(evil / "git"),
-             leerie.CLI_GIT_ENV: "{}", "KEEP_ME": "1"}
+             leerie.CLI_GIT_ENV: "{}", "AWS_PROFILE": "1"}
     tpl = run["run_dir"] / leerie.CLAUDE_CONFIG_TEMPLATE
     tpl.mkdir(exist_ok=True)
     (tpl / "settings.json").write_text(json.dumps({"env": steer}))
@@ -366,7 +366,7 @@ def test_no_settings_layer_below_leeries_steers_the_clis_git(
     settings = leerie._confined_cli_settings(
         None, run_dir=run["run_dir"], repo_root=checkout)
     merged = json.loads(settings)["env"]
-    assert merged == {"KEEP_ME": "1",
+    assert merged == {"AWS_PROFILE": "1",
                       leerie.SHELL_PREFIX_ENV: str(leerie.WORKER_SHELL)}
     if not composed:
         # Settings that reach `_invoke` steered anyway: `_invoke`'s pin is

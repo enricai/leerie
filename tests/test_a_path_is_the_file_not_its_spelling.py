@@ -70,11 +70,11 @@ def test_an_untracked_file_is_still_the_operators(leerie, tmp_path):
     _git(co, "add", ".claude/Settings.json")
     _git(co, "commit", "-qm", "m")
     (co / ".claude" / "settings.json").write_text(json.dumps(
-        {"env": {"OPERATOR_OWN": "1"}}))
+        {"env": {"AWS_PROFILE": "operator"}}))
     assert leerie._checkout_settings_are_operators(str(co), "settings.json")
     merged = json.loads(leerie._confined_cli_settings(
         None, run_dir=tmp_path / "none", repo_root=co))
-    assert merged["env"]["OPERATOR_OWN"] == "1"
+    assert merged["env"]["AWS_PROFILE"] == "operator"
 
 
 def test_a_linked_settings_directory_is_not_the_operators(leerie, tmp_path):

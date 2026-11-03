@@ -4493,8 +4493,32 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `_cli_git_env(<staging>, <PATH>)` to `guard_env`.
   Settings pin (review round 23): `_CLI_PINNED_NAMES = ("PATH",
   SHELL_PREFIX_ENV, WORKER_COMMAND_ENV, CLI_GIT_ENV, REAL_GIT_ENV)`.
-  `_confined_cli_settings` drops each of them and every `LEERIE_*` key
-  from the `env` of every layer below leerie's own.
+  `_confined_cli_settings` passes every layer below leerie's own through
+  `_lower_layer_part(layer) -> dict`, which keeps only
+  `_LOWER_LAYER_KEYS` (the CLI's credential helpers: `apiKeyHelper`,
+  `awsCredentialExport`, `awsAuthRefresh`, `gcpAuthRefresh`),
+  `permissions` cut to `_LOWER_LAYER_PERMISSIONS` (`deny`, `ask`; the key
+  left out when nothing is left) and `env` cut to `_LOWER_LAYER_ENV` —
+  endpoint (`ANTHROPIC_BASE_URL`, `ANTHROPIC_BEDROCK_BASE_URL`,
+  `ANTHROPIC_VERTEX_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`,
+  `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_SKIP_BEDROCK_AUTH`,
+  `CLAUDE_CODE_SKIP_VERTEX_AUTH`, and Foundry's `CLAUDE_CODE_USE_FOUNDRY`,
+  `CLAUDE_CODE_SKIP_FOUNDRY_AUTH`, `ANTHROPIC_FOUNDRY_BASE_URL`,
+  `ANTHROPIC_FOUNDRY_RESOURCE`), credentials (`ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_API_KEY`, `ANTHROPIC_CUSTOM_HEADERS`,
+  `ANTHROPIC_FOUNDRY_API_KEY`), Vertex's project and region
+  (`ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION`) and model mapping
+  (`ANTHROPIC_DEFAULT_SONNET_MODEL`, `_OPUS_MODEL`, `_HAIKU_MODEL`,
+  `_FABLE_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`,
+  `ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION`) — and names starting with one
+  of `_LOWER_LAYER_ENV_PREFIXES` (`AWS_`, `VERTEX_REGION_CLAUDE_`); none of
+  them is a `_CLI_PINNED_NAMES` name or `LEERIE_*`. Each is a name the
+  installed CLI (2.1.317) defines: its settings schema lists the four
+  helpers as its credential helpers, and the environment names are those
+  its Bedrock, Vertex, Foundry and gateway setups read; the CLI's
+  provider switches that no documented setup sets are left out. So
+  a worker's tool scope is its argv alone (DESIGN §6 *The CLI reads no
+  settings file*, §12 *L1*).
   `_cli_pinned_env(worker_env) -> dict`: each name's value in
   `worker_env`, `WORKER_COMMAND_ENV` as `""`. `_pin_cli_settings(cmd,
   pinned) -> list`: `cmd` with `pinned` laid over its `--settings` JSON's

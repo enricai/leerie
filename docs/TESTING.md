@@ -7145,8 +7145,8 @@ sample's probe never counts for the next.
   broker started by `cgroup-broker.py --spawn` with its v2 root at
   `$R21_CG_SLICE` (a container harness run as root, dropping to leerie as
   `container-entry.sh` does); skips otherwise.
-- `tests/test_worker_commands_cannot_reach_the_cli.py` (8 test functions,
-  9 cases; DESIGN §6 *A worker's commands cannot reach its CLI*, review
+- `tests/test_worker_commands_cannot_reach_the_cli.py` (12 test functions,
+  13 cases; DESIGN §6 *A worker's commands cannot reach its CLI*, review
   round 21 isolation R4): with a stand-in CLI that runs
   `CLAUDE_CODE_SHELL_PREFIX` as the real one does (the shim, grants,
   `_invoke`, transcript registry and readers real), code a worker runs
@@ -7154,11 +7154,34 @@ sample's probe never counts for the next.
   `/proc/<cli>/fd/1` (2 cases: unisolated and isolated, the latter skipped
   where the host cannot build a sandbox); a settings prefix below
   leerie's `--settings` cannot unset leerie's shell; settings layers merge
-  in the CLI's order; a malformed settings file is logged and left out; a
+  in the CLI's order; no settings layer below leerie's widens a worker's
+  tools — a lower layer gives only `permissions.deny`/`ask` and the
+  keep-list below: the operator's `defaultMode`/`allow` and a checkout
+  layer's are dropped, and
+  so are `additionalDirectories`, an operator PreToolUse hook answering
+  "allow", `enableAllProjectMcpServers`, `statusLine` and any other `env`
+  name, while leerie's own hook stays (DESIGN §6 *The CLI reads no settings
+  file*); a malformed settings file is logged and left out; a
   confined worker reads no settings file; the host seam reads only the
   operator's user settings (`--setting-sources user`) and gets no shell
   prefix; `scripts/worker-shell.py` fails closed (126) where it cannot nest, and
-  runs a command as `bash` would.
+  runs a command as `bash` would. The keep-list (review rounds 31 and 32,
+  execution 3 and X4) is the endpoint, the credentials and the model
+  mapping: from the operator's untracked settings file every one of these
+  CLI names reaches the worker — the four credential helpers
+  `apiKeyHelper`, `awsCredentialExport`, `awsAuthRefresh`,
+  `gcpAuthRefresh`; the API's, Bedrock's and Vertex's base URLs, switches
+  and skip-auth switches; Foundry's switch, skip-auth switch, base URL,
+  resource and key; the key and token; `ANTHROPIC_CUSTOM_HEADERS`;
+  Vertex's project, region and a `VERTEX_REGION_CLAUDE_*` name;
+  `ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU,FABLE}_MODEL`,
+  `ANTHROPIC_SMALL_FAST_MODEL` and its AWS region; `AWS_*` — while
+  `otelHeadersHelper`, `NODE_OPTIONS`, a host path
+  (`CLAUDE_CODE_CLIENT_CERT`, `ANTHROPIC_UNIX_SOCKET`) and
+  `CLAUDE_CODE_OAUTH_TOKEN` do not, and a tracked settings file sets none
+  of them. The first fails against the round-30 list, and against the
+  round-31 list (no `ANTHROPIC_CUSTOM_HEADERS`, no Foundry name); the
+  second passes there too (a guard: the tracked file was never read).
 
 ## The orchestrator's root is leerie's; a capture names packages and managers (review round 28, isolation E1, E2, A2)
 

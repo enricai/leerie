@@ -233,12 +233,12 @@ def test_a_tracked_settings_file_adds_nothing_to_a_worker(leerie, checkout,
     (checkout / ".claude" / "settings.json").write_text(json.dumps(STEER))
     _git(checkout, "add", ".claude/settings.json")
     (checkout / ".claude" / "settings.local.json").write_text(json.dumps(
-        {"env": {"OPERATOR_OWN": "1"}}))
+        {"env": {"AWS_PROFILE": "operator"}}))
     merged = json.loads(leerie._confined_cli_settings(
         None, run_dir=tmp_path / "none", repo_root=checkout))
     assert "apiKeyHelper" not in merged
     assert "permissions" not in merged
-    assert merged["env"] == {"OPERATOR_OWN": "1",
+    assert merged["env"] == {"AWS_PROFILE": "operator",
                              leerie.SHELL_PREFIX_ENV:
                                  str(leerie.WORKER_SHELL)}
     assert ".claude/settings.json is tracked by the repository" in \
@@ -248,10 +248,10 @@ def test_a_tracked_settings_file_adds_nothing_to_a_worker(leerie, checkout,
 def test_an_untracked_settings_file_is_the_operators(leerie, checkout,
                                                      tmp_path):
     (checkout / ".claude" / "settings.json").write_text(json.dumps(
-        {"env": {"FROM_PROJECT": "1"}}))
+        {"env": {"AWS_REGION": "project"}}))
     merged = json.loads(leerie._confined_cli_settings(
         None, run_dir=tmp_path / "none", repo_root=checkout))
-    assert merged["env"]["FROM_PROJECT"] == "1"
+    assert merged["env"]["AWS_REGION"] == "project"
 
 
 def test_a_checkout_git_cannot_read_counts_as_tracked(leerie, tmp_path):
