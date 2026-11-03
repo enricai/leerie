@@ -1792,7 +1792,9 @@ write grant (§6 *A worker writes only where it is granted (I5)*) grants
 and nothing else:
 
 - `<run-dir>/workers/<wid>/config/` — the worker's `CLAUDE_CONFIG_DIR`;
-- `<run-dir>/workers/<wid>/tmp/` — its `TMPDIR` (and `TMP`, `TEMP`);
+- `/tmp/l/<id>/` — its `TMPDIR` (and `TMP`, `TEMP`, `CLAUDE_CODE_TMPDIR`),
+  short and private (§6 *A confined command's scratch is short and
+  private*), `<id>` derived from `<run-dir>/workers/<wid>/`;
 - not its caches: those are one set per side of the run, shared by every
   worker of that side and never by leerie's measurements (§6 *The stores a
   view installs from are leerie's*): `<run-dir>/workers/cache/` for the
@@ -2295,8 +2297,9 @@ r16 H2's two scenarios):
 
   What wrote it, and where each write went:
   - *Dependency capture's `.leerie/config.toml`.* The container records the
-    capture in the run directory; the host applies it to the checkout after
-    the container exits (§6½ *The host applies a capture*).
+    capture in the run directory; the operator applies it to the checkout
+    with `leerie config --apply-capture <run>` (§6½ *The operator applies a
+    capture*).
   - *The in-checkout state root.* `resolve_leerie_root` falls back to
     `<repo>/.leerie` only when `LEERIE_STATE_DIR` is unset. The local
     launcher always passes `LEERIE_STATE_DIR=/leerie-state`, so the
@@ -2510,15 +2513,15 @@ worker gets the first block, then its kind's.
 
 | Grant | Path | Access | Who makes it |
 |---|---|---|---|
-| devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, `/dev/pts`, `/dev/shm` (POSIX semaphores: Python's multiprocessing locks and Chromium need it, measured); `/dev/pts` and `/dev/shm` are the process's own | write | — |
+| devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/shm` (POSIX semaphores: Python's multiprocessing locks and Chromium need it, measured): the only paths of `/dev` any grant names, and no terminal but `/dev/tty`, which names nothing once the shim has left its controlling terminal; `/dev/shm` is the process's own, and so is the `devpts` (`/dev/pts`, `/dev/ptmx`) the shim grants an isolated process (*No confined process holds or can open the operator's terminal*) | write | — |
 | its own `/tmp` | a fresh tmpfs per process tree, made by the shim, gone when it ends | write | the shim |
-| own temp dir | what `TMPDIR`, `TMP` and `TEMP` name: `<run-dir>/workers/<wid>/tmp/` | write | `_worker_dirs` |
+| own temp dir | what `TMPDIR`, `TMP` and `TEMP` name: `/tmp/l/<id>/`, `<id>` derived from `<run-dir>/workers/<wid>/` (*A confined command's scratch is short and private*) | write | `_worker_dirs` |
 | own CLI config | what `CLAUDE_CONFIG_DIR` names: `<run-dir>/workers/<wid>/config/` (sessions live there, so `--resume` finds them) | write | `_worker_dirs` |
 | the CLI configuration template | `<run-dir>/claude-config/`, whose directories each worker's configuration links | read | `_claude_config_template` |
 | leerie's own code, the CLI, the worker's home | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check), the `claude` its `PATH` finds, and `$HOME` (the git identity, a package manager's config) unless it holds `/tmp`: each named, so that one under `/tmp` on a host is still read | read | — |
 | its side's download caches | one set per side of the run, shared by that side's workers (every store variable, the pnpm store, `XDG_CACHE_HOME`): `<run-dir>/workers/cache-held-out/` for a held-out-side worker (`HELD_OUT_LOG_WORKERS`), `<run-dir>/workers/cache/` for every other; never both (`_worker_cache_dir`) | write | `_worker_cache_env` |
 | its tree's own stores | `<run-dir>/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); the worker's per-tree store variables then name it in place of its side's cache | write for a worker that writes its tree, else read | `_tree_store_env` |
-| outside the state root | everything but `/tmp` (above) | read | — |
+| outside the state root | everything but `/tmp` (above) and `/dev` (the devices above) | read | — |
 | the run's system prompts | `<run-dir>/sysprompt/` | read | — |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml`, which `MISE_OVERRIDE_CONFIG_FILENAMES` names to every process of a Go repository's run (§6½ step 3): without it a worker's `mise` cannot load its configuration | read | `_synth_mise_go_override` |
 
@@ -2546,7 +2549,7 @@ nothing in it is shared, and the worker reads and writes it freely — 155 of
 the 310 corpus sessions that wrote an absolute path wrote under `/tmp`
 (lane B, e.g. `/tmp/fr_fixed.ts`). It does not outlive the process: a
 re-ask or resume starts with an empty one. A worker's temp directory is
-still its own `TMPDIR` (`<run-dir>/workers/<wid>/tmp/`; the CLI honours
+still its own `TMPDIR` (`/tmp/l/<id>/`, carried into that `/tmp`; the CLI honours
 it: measured 2026-11-01, with `TMPDIR` unset the confined CLI refused to
 start on `/tmp/claude-<uid>`, with it set it made `$TMPDIR/claude-<uid>/`
 and ran). Every worker with a shell is told where it can write. The notice
@@ -2614,7 +2617,9 @@ integrator (`collect-subtrees.sh`) is a run worker: it takes its grants from
 covers leerie's own code, never the repository's. The launcher and the
 scripts it runs on the host call `python3` dozens of times — small `-c`
 helpers, stdin programs, and seams that load `orchestrator/leerie.py` by
-path — from the operator's cwd, which is the user's checkout. A program
+path. They used to run from the operator's cwd, which was the user's
+checkout (the launcher now leaves it first; see *The host never runs a program the
+checkout chose* below). A program
 read from `-c` or stdin puts the cwd first on `sys.path`, so a `json.py` or
 `contextlib.py` at the checkout's root (a file a worker wrote, in a run
 whose branch the user merged) ran on the host, unconfined, with the
@@ -2624,12 +2629,268 @@ that the host interpreter took its import path from the place it was run
 from. The invariant: **no host-side Python resolves a module from the
 checkout.** Every host-side `python3` is isolated, spelled `python3 -I`
 at the call: no cwd or script directory on `sys.path`, no `PYTHON*`
-environment, no user site. That holds because every host-side program
-imports only the standard library, plus leerie's own `chain/` package,
-whose directory is put on `sys.path` explicitly. The one convention is
+environment, no user site. Every host-side program imports the standard
+library and leerie's own code. Three of them re-admit import paths `-I`
+removed, and only the operator's, never the cwd's. The chain synth-merge
+helper imports leerie's `chain/` package from the leerie directory, after
+the operator's absolute `PYTHONPATH` entries. The host rebaser and
+`config --recapture` seams run workers, and a worker's backoff imports
+`tenacity`, which the operator may have installed in the user site or on
+`PYTHONPATH`; those seams take back the absolute `PYTHONPATH` entries and
+the user site, in a plain interpreter's order. An empty or relative
+`PYTHONPATH` entry names the cwd and is dropped. An operator's path can
+still name the checkout: an editable install of the project in the user
+site (`pip install --user -e .`, or a hatch, pdm or poetry editable) leaves
+a `.pth` file holding `<checkout>/src`, and direnv's `PYTHONPATH=$PWD/src`
+is absolute. A `tenacity.py` a merged run put there was then imported on
+the first backoff, ahead of the system's own copy (review round 27,
+isolation I2). So every entry whose real path is the checkout, or the
+rebaser's tree, or lies beneath one, is dropped after the paths come back,
+`.pth` files processed; the chain helper drops the same from the operator's
+`PYTHONPATH`. A finder an editable install registers maps only the names
+that install declared, and is the operator's own install. The one convention is
 checked by a rule over every host-run file, so a new call without it
 fails the suite. Commands the host sends to a Fly or EC2 machine follow
 the same spelling.
+
+**The host never runs a program the checkout chose.** `-I` decides what
+an interpreter imports. It does not decide which interpreter runs. A
+version manager's shim on the operator's PATH (asdf, mise, pyenv, nodenv)
+chooses the program it runs from the version files of its working
+directory and of every directory above it. The launcher ran from the
+checkout, so a committed `.tool-versions` naming
+`python path:/proc/self/cwd/.evil` made every host `python3` the
+checkout's own program. Even `leerie --help` ran it, with the operator's
+credentials and no confinement (review round 26, isolation I2). The same
+held for every program a shim stands for: `bash` itself (the launcher's
+`#!/usr/bin/env bash` resolved it from the checkout), `git`, `gh`, `jq`,
+`nerdctl`, `flyctl`, `aws`, `ssh`, and `claude` with the `node` its
+`#!/usr/bin/env node` names. A relative PATH entry (`.`,
+`node_modules/.bin`) does the same without a shim. The root cause is that
+the host started programs with a checkout or a tree as their working
+directory. The invariant: **no host program leerie starts has a checkout
+or a tree, or a directory in either, as its working directory, nor is
+found through one.** A checkout here is the user's, and a tree is any
+other worktree of a repository a run wrote, such as the rebaser's
+worktree of the run branch, whose content is the workers' and which
+nobody has merged. The invariant is constructed in five parts.
+
+1. *The launcher leaves the checkout before it runs anything.* It starts
+   under `/bin/sh`, whose path no shim chooses. It records the checkout
+   (`pwd -P`), changes to `/`, and only then execs the `bash` that PATH
+   names from `/`, by absolute path. The process keeps its PID across the
+   exec, so a marker holding that PID tells the second pass it is done.
+   From there every program the launcher and its sourced scripts start
+   (`python3`, `git`, `gh`, `jq`, `nerdctl`, `flyctl`, `aws`, `ssh-agent`,
+   `ssh-add`) is found and started from `/`. The checkout is the top
+   level of the repository the operator stands in
+   (`git -C <where they stood> rev-parse --show-toplevel`). Nothing
+   scopes a run to a subdirectory: started from one, leerie still runs
+   the whole repository, mounts its top level at `/work`, and keys its
+   state directory by the top level's name. Before this, a run from a
+   subdirectory mounted only that subdirectory, which has no `.git`
+   (review round 27 O4). A path the operator gave relative to where they
+   started (a flag, `LEERIE_STATE_DIR`, `LEERIE_LOG_FILE`, a task file) is
+   anchored at that directory, not at the top level. A path the container
+   reads (a task file, `--answers`) is handed to it relative to the top
+   level, which is the container's working directory. Leaving the
+   checkout must not change what any host command means, so nothing on
+   the host takes the checkout from its working directory any more: a
+   recorded checkout that is empty (a deleted directory) stops the
+   launcher, a local git read names the checkout with `-C` (the Fly and
+   EC2 seeds' git identity, which a repository-local identity overrides),
+   and every host seam that loads the orchestrator is given the checkout
+   as `USER_REPO`, which its log lines are labelled with (review round 27,
+   exec M1, L1, L3).
+2. *git is pointed at a checkout or a tree, never started in it.* A local
+   git command names the repository with `-C`. git changes into the work
+   tree itself, and starts nothing there that the repository's content
+   chooses. A git command that reaches a remote (`push`, `fetch`,
+   `ls-remote`, `remote show`) starts the transport (`ssh`) and the
+   credential helper (`gh auth git-credential`) in its own working
+   directory. So it names the repository by its git directory and work
+   tree from `/` (`_repo_git_from_root`). A push does this too when the
+   operator has a `pre-push` hook: git runs the hooks of leerie's own
+   hooks directory (`core.hooksPath`), whose `pre-push` changes into the
+   work tree and execs the operator's hook with its arguments, its stdin
+   and its environment. So the hook alone starts in the work tree, as git
+   would start it, and the transport and the credential helper start in
+   `/`. Every fetch on the host carries `--no-recurse-submodules`. A fetch
+   that brings in a commit moving a submodule otherwise runs `git fetch`
+   inside that submodule's git directory in the checkout, which starts the
+   submodule's transport there. `gh` runs from `/` with `GIT_DIR` and
+   `GIT_WORK_TREE`, which it honours when it resolves the repository.
+3. *No shell git starts inside a submodule runs a program, and no
+   submodule path is parsed as text.* The seed's `git submodule foreach`
+   body only prints each submodule's path, as NUL-terminated records. A
+   path is repository content and may hold a newline or a tab, so a
+   line-based list let one submodule forge another entry naming any
+   repository on the host (review round 27, isolation I4). The bundling
+   runs from the caller's directory with `git -C`. Each bundle is named by
+   the hex of its path's bytes, so the name that reaches the machine's
+   shell is never shell syntax, and no two paths share a name. The
+   machine reads the same paths the same way. It lists each repository's
+   submodules from its `.gitmodules` as NUL-terminated name and path
+   records, points each submodule's URL, by name, at the bundle named by
+   the hex of its full path, checks out that submodule alone, and repeats
+   inside it, so a nested submodule is checked out too. A path is only
+   ever a quoted argument there. A submodule the host sent no bundle for
+   is left uninitialised, as it was on the host, so the machine never
+   fetches from a submodule's own URL (review round 28, exec L2: a path
+   with a space failed the seed, and a nested submodule was uploaded but
+   never checked out).
+4. *A host-side worker starts from a directory leerie owns.* The rebaser
+   and `config --chat` start `claude` in a fresh, empty directory that
+   leerie made outside every checkout and tree. They name the tree by
+   `--add-dir` and in the prompt. `claude` is found once, from `/`, as an
+   absolute path. The CLI reads its project settings and its `CLAUDE.md`
+   from its working directory, which is now that directory, not the run
+   branch. The rebaser's own git commands name the worktree with `-C` or
+   `--git-dir` from `/`. Its worktree is a tree of the run branch, which
+   the operator has not merged, so "the operator configured it" never
+   applied to it (review round 27, isolation I1).
+   The CLI still loads skills, slash commands and agents from every
+   `--add-dir` directory. With `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`
+   set in the environment or in a settings `env`, it also loads that
+   directory's `CLAUDE.md` (measured, CLI 2.1.316). `.claude/skills/` is a
+   path a worker may commit. A skill whose description targets the
+   session was invoked by the model in `config --chat`, and its
+   `` !`cmd` `` line and its frontmatter hook ran on the host, unconfined
+   (review round 28, isolation C1 and C2). So every host-side CLI (the
+   rebaser, host recapture and `config --chat`) reads only the operator's
+   user settings (`--setting-sources user`). Measured, that stops the CLI
+   loading any skill, command or agent from an `--add-dir` directory. Each
+   also has slash commands and skills off (`--disable-slash-commands`),
+   `Agent`, `Task` and `Skill` denied, and `--strict-mcp-config`. Each pins
+   `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` to `0`, both in its
+   environment and in its `--settings` `env`, which overrides the
+   operator's own settings file. The session loses the operator's own
+   skills and agents too, a cost accepted for workers whose job is fixed.
+5. *The exception is what must start in a tree by its own design.* These
+   are the operator's `pre-push` hook (part 2), the hooks and filters a
+   local git command runs in the work tree it names, and the commands the
+   rebaser's and the config session's own shell tool run in the tree they
+   were told to work on. That last case is the agentic exception (§12
+   *Scoped exception — finalize-time rebase*), not a program leerie
+   starts.
+
+A rule pins the class: a test puts a shim, built from shell builtins and
+absolute paths, in front of a bounded list of the programs above. It runs
+the launcher's host-only paths, the rebaser and a push with a hook from a
+hostile checkout, and asserts that no shim was started with its working
+directory inside the checkout or the tree. A static rule requires
+`--no-recurse-submodules` on every host fetch.
+
+**No text leerie did not write reaches the operator's terminal as a control
+sequence.** The operator's terminal is part of the host, and a terminal
+acts on what it is sent: OSC 52 sets the clipboard on many terminals, OSC 8
+disguises a link, CSI rewrites the screen, a bidirectional override
+reorders what is read. Leerie prints text a repository or a worker chose —
+a file name from the repository image (the `/home/leerie` extras message),
+a worker's JSON string (a JSON schema string admits `\u001b`: an
+acceptance `reason`, a classifier `question`), a path a worker declared —
+and printed it with its control characters intact, through `log()`,
+`die()`, the question UI and the launcher's relay of the container's
+output (review round 30 isolation T1). The rule is one function, applied
+where text leaves for the terminal: C0 controls but newline and tab, DEL
+and C1, U+061C, U+200E/U+200F, U+2028–U+202E, U+2066–U+2069 and a lone
+surrogate (a byte that was not UTF-8) are written as their escapes
+(`\x1b`, `\u202e`), which are printable, so the rule is idempotent.
+Inside the orchestrator it is `_terminal_text`: `log()` and `die()` apply
+it (the host seams that load the orchestrator call them without
+`main()`), `main()` makes `sys.stdout` and `sys.stderr` escaping streams
+before anything prints (the question UI, `list`, a traceback), and the run
+log's tee writes the escaped text to `orchestrator.log` too, which
+`attach` and an operator's `cat` show. The launcher relays what a
+container or a machine prints through `scripts/terminal-text.py`, the same
+rule (`_terminal_relay`): the piped run's relay and its `--log-file` copy,
+the Fly and EC2 log tails and attaches, and a failed Fly launch's stderr.
+The boundary is not a list of relays but every place the launcher or a
+host-side script it runs (`scripts/host-finalize.sh`, `scripts/remote/`)
+prints text a repository, a hook, a worker or a machine chose (review round
+31: the repository image's build output reached the terminal raw, and so did
+a pre-push hook's output and `leerie config`'s values). A stream of it goes
+through `_terminal_relay` on the producer's own exit status: the repository
+image's build, local (`nerdctl build`) and on Fly (`build-push.sh`),
+`leerie config`'s listing, the pre-push probe's and the push's hook output,
+`gh pr create`'s output, the rebaser's payload, and a machine's stderr in the
+seeding and fetch scripts. A value of it inside leerie's own message goes
+through `_terminal_safe`, the same rule: a `.leerie/config.toml` or
+`leerie.toml` value an error names, the PR base branch a repository's
+`leerie.toml` chose, the BLT commands named after a failed push, and a
+machine command's output. Review round 32 (execution X3, isolation P2)
+found the list form leaking again — a committed `seed_depth` named raw in
+its rejection, a stored `push_error` (a hook's output, kept in `run.json`)
+printed raw by `status` — so the rule is stated by source, not by site:
+every message the launcher or a host-side script prints that names a
+value read from `leerie.toml`, `.leerie/config.toml` or `run.json`, or a
+git command's names or text (a branch, an upstream, a commit's subject, a
+file name; not a count or an object id), passes it through
+`_terminal_safe`, and every table of stored values (`status`, `list`)
+writes each cell through the same rule. A static rule over the shell
+holds every such message to it.
+An interactive run (`-it`) hands the container a terminal, which no
+filter can sit in front of without taking the terminal from it; there
+the orchestrator's own streams are the boundary, and what else a container
+process writes to the terminal directly is leerie's own (the entry script,
+the broker).
+
+**No confined process holds or can open the operator's terminal.** In
+an interactive run the orchestrator's fds 0, 1 and 2 are the operator's
+pty, opened read-write, and a child inherits every descriptor it is not
+given in its place. Landlock checks opens, not inherited descriptors; a new
+`devpts` does not reach a descriptor already open; and a new session drops
+only the controlling terminal, not the fd. So a repository's `npm test`
+run with the orchestrator's fd 0 wrote OSC 52 straight to the operator's
+terminal, past every filter above, and could read what the operator typed
+(review round 32 isolation P1). The rule is enforced where every confined
+process passes, the Landlock shim, before it confines anything: a
+terminal on fd 0 becomes `/dev/null` (a confined command takes no input
+but a worker's prompt file); a terminal on any other descriptor is a
+spawner's defect, and the shim refuses to run (exit 126); and a
+controlling terminal is given up, so `/dev/tty`, which a worker's tools
+are granted, names nothing. Each spawner also passes no terminal: a
+confined command's stdin is `/dev/null` and its output a pipe. The
+processes leerie runs on the operator's terminal on purpose are
+unconfined and host-side (`leerie config --chat`), or leerie's own (the
+question UI).
+
+Holding none is not enough: a process can open one. Under `nerdctl run
+-it` runc binds the operator's pty at `/dev/console` (the same device as
+the orchestrator's fd 0), the container's `devpts` holds it as
+`/dev/pts/0`, and after the rootless drop it shows as owned by `leerie`.
+Every grant leerie derived read all of `/dev` (the reads outside the state
+root), and the isolation replaced `/dev/pts` but kept `/dev/console`, so
+any confined process could open it read-only — enough to read what the
+operator types and, with `tcsetattr`, to turn the terminal's echo and
+`ISIG` off, so Ctrl-C no longer stops the run (review round 33 isolation
+Q1). Masking one path would leave the class open (`/dev/tty0`,
+`/dev/ttyS*`, the outer `devpts`, whatever a runtime adds: a Fly machine's
+`/dev` is the VM's whole devtmpfs). So the rule is enforced in two
+independent layers, and a third checks it:
+
+1. **An isolated process's `/dev` is its own** (*Every confined process
+   has its own `/tmp`, `/dev/shm` and IPC*, step 3): a tmpfs holding only
+   the device nodes leerie grants, each bound from the container's (a
+   user namespace cannot `mknod`), the links every `/dev` has (`fd`,
+   `stdin`, `stdout`, `stderr`, and `ptmx` into the new `devpts`), its own
+   `/dev/shm` and a new `devpts` instance. No terminal of the container is
+   in it, whatever the grants say.
+2. **No grant names `/dev` but the devices** (the table above): the reads
+   outside the state root leave `/dev` out as they leave `/tmp` out, and
+   no grant names a pseudo-terminal; the shim grants an isolated process
+   its own `devpts`. This alone holds where there is no isolation, which
+   no run is (the confinement check every entry runs stops a run whose
+   runtime cannot isolate, *Fail closed*): Landlock refuses the console and
+   every pty of the container's `devpts`.
+3. **The shim checks**, once it is confined as the command will be, that
+   `/dev/console` does not open, and exits 126 if it does: one named path,
+   where the operator's terminal is under `-it`, never a scan for
+   terminals. Any other terminal is absent from an isolated `/dev` by
+   construction, and `/dev/tty` already names nothing (above).
+
+A process that needs a terminal makes its own: `script`, `expect` and
+node-pty open `/dev/ptmx` in the process's own `devpts`.
 
 **Residuals.** A committing worker can move any ref of its own tree
 repository, its tree's branch included; leerie takes only that branch, and
@@ -2649,6 +2910,531 @@ mount but the grants read-only to every confined process (§6 *Every
 confined process has its own `/tmp`, `/dev/shm` and IPC*), which closes
 the metadata writes. Names read by path walk outside a grant stay
 readable; they are names, not contents.
+
+### The orchestrator's root is leerie's; a repository's root is only a confined process's
+
+*Designed 2026-11-02 (review round 28, isolation E1 and E2).*
+
+**Root cause.** A repository chose the root filesystem the orchestrator
+runs in. The launcher built the run's image from the repository's
+`.leerie/Dockerfile` — committed, or generated from `.leerie/config.toml`
+and the repository's lockfiles — and the orchestrator, the root cgroup
+broker and `container-entry.sh` all ran in that image. Every line of it ran
+as root at build time with the repository's content: `npm ci` runs the root
+package's `preinstall`, `bundle install` evaluates the Gemfile, `poetry`
+and `uv sync` build the project, and a committed Dockerfile is any program
+at all. `package.json` and the lockfiles are a worker's to write and a run
+merges them. Measured (review round 28, isolation E1): a `preinstall`
+wrote a `.pth` into `/usr/lib/python3/dist-packages`, and the plant ran
+inside `python3 /opt/leerie-image/orchestrator/leerie.py` — as the
+orchestrator (uid 1000) and as root, the cgroup broker's interpreter. `-I`
+does not help: site-packages `.pth` files are still processed. The
+orchestrator holds the credentials, every held-out set and every run's
+state, and the same file could equally have replaced `ENTRYPOINT` (so
+nothing is confined), set `LD_PRELOAD`, or written `/etc/ld.so.preload`.
+Narrower fixes do not close it. `--ignore-scripts` leaves the Gemfile,
+source distributions and gems, and a lockfile names arbitrary sources.
+`--entrypoint` and a scrubbed environment leave the dynamic loader, which
+reads the image's `/etc/ld.so.preload`, libc and `.pth` files before any
+program leerie chose runs. Any dynamically linked process in a root whose
+`/etc` and `/lib` a repository wrote is the repository's. The fix has to
+choose the root itself.
+
+**Invariant.** No process of leerie's own — the orchestrator, the cgroup
+broker, `container-entry.sh`, the Landlock shim, a worker's CLI and the
+helpers it runs — runs in a root filesystem repository content shaped.
+Repository-derived filesystem content (a committed `.leerie/Dockerfile`,
+`setup_packages`, `language_installs`, the lockfile bake) is only ever the
+root of a confined process: a worker's command, a repository command
+leerie runs, a held-out sandbox's runner. It becomes their root only after
+they are confined.
+
+**Mechanism.**
+
+- *One image, two roots.* The launcher builds the repository image in two
+  builds and never edits the repository's Dockerfile (`build_repo_image`).
+  The first builds `.leerie/Dockerfile` as the repository wrote it, byte for
+  byte, from the build context below; what it produces is BuildKit's own
+  default target, the file's final stage, exported as an OCI image layout
+  into the launcher's build directory. The second builds leerie's own
+  Dockerfile (`_repo_image_wrap`), which holds no repository text: two
+  stages that record the base image's environment and the worker stage's
+  (`env -0`, at `/.leerie-base-env` and `/.leerie-worker-env`), the worker
+  stage being the first build's image, handed to BuildKit as a named build
+  context (`--build-context leerie-worker=oci-layout://<layout>`, the
+  layout holding exactly that one image, whose manifest digest nerdctl reads
+  from the layout's `index.json` and hands BuildKit pinned); and the final
+  stage, `FROM <leerie's base>` and one
+  `COPY --from=<worker stage> / /opt/leerie-worker-root/`, the file's
+  default target. The layout is read from the launcher's directory, not
+  from an image store, so no containerd namespace has to hold it (BuildKit
+  reads its worker's, `ensure_base_in_worker_ns`), no tag names it
+  between the two builds, and it is removed with the build directory.
+  After a local build the image is checked to be the base's layers plus
+  exactly one, with the base's configuration (`_check_repo_image`);
+  anything else is removed and the launch stops. The image's own root —
+  everything outside `/opt/leerie-worker-root` — is leerie's base, byte for
+  byte, and its entrypoint is `container-entry.sh`.
+  *Revised 2026-11-03 (review rounds 31 to 33).* Leerie used to build one
+  Dockerfile of its own making: the repository's, its last `FROM` found by
+  leerie's lexer and named, its parser directives moved above leerie's
+  comment, and leerie's stages appended after it under a target named with
+  a nonce. Every reading in which leerie's lexer and BuildKit's differed
+  could choose the stage leerie copied, and three consecutive review rounds
+  each found new ones: an instruction word split on a space only, a
+  continuation ended at an empty line or joined with a space, and
+  `# escape=` ignored (round 31 execution 6); a `$((1<<N))` shift or a `<<<`
+  here-string read as a heredoc (round 32 X1), so an earlier stage was named
+  the worker stage and the build succeeded; `${X//a/b}`, `${X:1:2}` or
+  `${X:?m}` on the line hiding a heredoc BuildKit reads, so a `FROM` in its
+  body became "the last `FROM`"; a `# check=error=true` file failing on
+  leerie's upper-case additions to its lower-case instructions; a byte-order
+  mark kept on a line that was no longer the first; a `\x1c` taken for
+  whitespace, opening a heredoc BuildKit does not read; and a BOM-led file
+  refused as having no `FROM` (round 33). Round 31's and 32's were patched
+  as instances. The class, round 33's findings with it, is closed by never
+  rewriting: only BuildKit reads the repository's file to build it, so no
+  reading of leerie's selects a stage, and BuildKit's own default target is
+  the stage leerie copies. The nonce went with the rewrite: no repository
+  text reaches leerie's file, so no line of the repository's can define,
+  swallow or name a stage in it. The layout (`REPO_IMAGE_LAYOUT`) moved with
+  it, so no image built from a rewritten file is reused, locally or on Fly.
+- *A repository's parser directives are its own build's; its frontend is
+  leerie's.* `# escape=` and `# check=` apply to the repository's file as
+  BuildKit applies them, and to nothing of leerie's. `# syntax=` is not
+  honoured. Every build leerie runs is given `--build-arg
+  BUILDKIT_SYNTAX=<LEERIE_DOCKERFILE_FRONTEND>`, `docker/dockerfile:1`
+  pinned by digest. BuildKit's Dockerfile frontend reads that argument
+  before it reads the file's `# syntax=` line, so the file is still built
+  byte for byte, and the frontend that builds it is the one leerie pinned.
+  A frontend is not one more build step. It is the code that turns the
+  build's options into what BuildKit solves, and `--no-cache` reaches
+  BuildKit only as one of those options (`no-cache`). Only the frontend
+  turns it into the solver's ignore-cache flag, and only a step given that
+  flag starts its cache mounts empty. So `--no-cache` holds only for a
+  frontend leerie chooses (*No build consumes what another build left in
+  BuildKit*, below). Leerie's own files, its base Dockerfile and the second
+  build's, are given the same pin. They name no frontend, so the built-in
+  one would build them, and that one is whichever the host's BuildKit
+  ships. With the pin, no build of leerie's runs a frontend chosen
+  anywhere but here, and the rule has no exception for a test of every
+  build site to argue about. What a repository loses: syntax beyond the
+  pinned `docker/dockerfile:1` release, such as the `labs` channel's
+  features, a newer release's, or a frontend of its own. A file that needs
+  them fails its build at parse time, with the frontend's error. The pin
+  is moved by a leerie release, never by a repository
+  (`scripts/dockerfile-frontend.sh` says how).
+  *Revised 2026-11-03 (review round 35, isolation I1).* Before, `# syntax=`
+  was honoured. The reasoning was that a frontend runs with what any build
+  step has, so it reaches nothing a `RUN` could not, and that a frontend
+  ignoring `no-cache` consumes cache only for the repository that chose
+  it. Both were false. A repository whose `# syntax=` named the official
+  `docker/dockerfile:1` image behind a two-line wrapper that drops the
+  `no-cache` option read, under `--no-cache`, a private file another
+  repository's `--no-cache` build had left in a cache mount (measured on
+  BuildKit 0.31.2). With the pin, the same build read nothing. The
+  victim's `--no-cache` empties the mount before its own step runs, not
+  after, so what that step writes stays under the mount's id for the next
+  build whose frontend does not ask for it to be emptied.
+- *The worker view.* A confined process's root was already one the shim
+  builds (`pivot_to_owned_root`: a tmpfs holding a bind of each entry of
+  `/`). Where the image has a worker root, the shim also builds the worker
+  view (`build_worker_view`, at `/.leerie-worker-view`): each top-level
+  entry of the worker root but the container's own (`/dev`, `/proc`,
+  `/sys`, `/run`, `/tmp`, `/home`, `/work`, `/inspect`, `/leerie-state`,
+  `/leerie-host`), those from the container — so the grants, the private
+  `/tmp` and the state root are the same mounts — and an `/opt` holding the
+  worker root's entries with leerie's own `/opt/leerie-*` over them (the
+  scripts the AST measurements run, the bundled `typescript`). The view's
+  `/etc` likewise holds the worker root's entries, but `/etc/hosts`,
+  `/etc/hostname` and `/etc/resolv.conf` are the container's: the runtime
+  provides them as mounts when the container starts (nerdctl rootless and
+  rootful, Fly's init), so no image snapshot holds them, and without them
+  `localhost` did not resolve in any confined command of a repository with
+  an image — a server bound to `localhost`, a `pg_isready -h localhost`, a
+  test URL (review round 29, execution H1). They are the run's name
+  service, as `/dev` and `/proc` are its kernel's. `/home` is the run's
+  own — its HOME, with leerie's caches and the CLI's credentials mounted
+  in it — never the repository's: what a repository's Dockerfile installs
+  beneath `/home/leerie` (a `curl | sh` installer, a user-site `pip
+  install`) would be missing from every confined command, so a run whose
+  worker root holds anything there the container's `/home/leerie` lacks
+  stops at its entry, naming the paths; such a Dockerfile installs beneath
+  `/opt` or `/usr/local` instead (review round 29, execution L3). Built after
+  the grants, so they are carried writable; every other mount of the view
+  is read-only, like every other mount. The worker root's entries are
+  granted read: a Landlock rule is on an inode, and the container's entries
+  are granted already where they are.
+- *Confined first, then the repository's root.* The shim never enters the
+  worker view, never imports or reads code from it, and never runs a
+  program in it: it lists directories and binds them. The command it
+  starts `chroot`s into the view in the forked child, after the Landlock
+  domain and the seccomp filter are in place and just before `exec`
+  (`_before_exec`, `enter_worker_view`): Landlock does not refuse `chroot`
+  and the seccomp filter does not list it, and the child holds
+  `CAP_SYS_CHROOT` in the shim's user namespace until its `exec` drops
+  every capability. The first code from the worker root that ever runs is
+  the confined command's own. A held-out sandbox's runner enters it the
+  same way, from its PID 1.
+- *A worker's CLI stays in leerie's root.* The CLI holds the stream leerie
+  reads a worker's record from, and its own spawns — `/bin/sh` for a hook,
+  `rg`, the `git` of `scripts/cli-bin` — run in its domain (§6 *A worker's
+  commands cannot reach its CLI*). So the CLI is `exec`ed in leerie's
+  root, from leerie's binaries and libraries, and holds one capability,
+  `CAP_SYS_CHROOT` in the shim's user namespace, made ambient
+  (`keep_chroot_across_exec`). `worker-shell.py`, the prefix every command
+  and hook runs through, nests its Landlock domain first, then `chroot`s
+  the command into the view, drops every ambient capability and lays the
+  worker stage's environment over the CLI's (`enter_worker_view`). Leerie's
+  own PreToolUse hook, recognised exactly as
+  `_forbidden_command_hook_settings` writes it, runs in leerie's root. The
+  capability gives a process no reach: `no_new_privs` is set, so no set-id
+  program in a root a worker shaped gains anything, and Landlock's rules
+  are on inodes, so a `chroot` widens no grant.
+- *The worker stage's environment reaches only confined commands.* A
+  committed Dockerfile's `ENV PATH=…`, a bake's `VIRTUAL_ENV` and
+  `BUNDLE_PATH`: the orchestrator's environment is the base image's and
+  never takes them (a `PATH` the repository chose would decide which `git`
+  the orchestrator runs). The shim and `worker-shell.py` lay the
+  difference between the two recorded environments over a command's
+  (`worker_env_changes`, `apply_worker_env`): a variable the orchestrator
+  did not set, or one beneath `/opt/` (what the worker stage built, as
+  `_BAKED_ROOT` already treats it), and the `PATH` entries the base's
+  `PATH` lacks, first. Leerie's, the CLI's and Anthropic's variables, the
+  proxy variables, `HOME` and `TMPDIR` are never taken. This replaces the
+  launcher's search of the Dockerfile for `ENV BUNDLE_PATH`.
+- *The build sees the committed tree.* The build context is taken from
+  the committed tree at `HEAD`, exported by `git archive` into a directory
+  of the launcher's own under the state root, never the checkout
+  directory: an untracked `.env` or `.claude/settings.local.json` never
+  reaches a build a repository's Dockerfile drives (the build has the
+  network), and a link the checkout holds is a link in the context, which
+  BuildKit does not follow out of it. The generator reads its inputs from
+  the same tree (§6 *Leerie never reads through a link a repository
+  holds*).
+- *A repository image is the one built from what it reads.* An image is
+  reused only for the context it was built from, so the context keys it:
+  the digest of the context as extracted (every path, kind, executable bit
+  and content; what git's export applied is in it, a tar's times are not)
+  is part of the local key and of the Fly tag. And the context is exactly
+  what the Dockerfile's instructions can read from it — each `COPY` and
+  `ADD` source (an `ONBUILD` one too) and each `RUN` bind mount's source,
+  `.dockerignore` — so a commit that changes nothing an instruction reads
+  changes neither the key nor the image. A source the launcher cannot
+  resolve exactly stands for more, never less: a variable, or a wildcard
+  before its last part, stands for its directory up to there (the whole
+  tree when that is the top), a wildcard in its last part for the names
+  it matches in that directory of `HEAD` (Go's `filepath.Match`, BuildKit's
+  rule). The Dockerfile is read as BuildKit reads it, by BuildKit's
+  lexing rules rather than an approximation of them (review round 31,
+  execution 6: a tab after `COPY`, an empty line inside a continuation and
+  a source through a committed link each read short, and builds that
+  passed with the whole tree failed): a source through a committed link
+  reads the link and what it names, within the tree. A byte-order mark is
+  dropped from the first line once, and a heredoc is read only where a
+  whole shell word is one, words split on Go's whitespace (`\x1c`–`\x1f`
+  are not), as BuildKit reads them. This reading is the only one leerie
+  makes of the file, and it only makes the context: it never selects a
+  stage (*One image, two roots*). Whatever the reading, the key covers the
+  context that was built, so a reading that is too narrow can only fail
+  the build (BuildKit names the missing source), and one too wide only
+  rebuilds more often; neither reuses an image built from other files. The
+  file is always read by the frontend leerie pins, `docker/dockerfile:1`
+  (*A repository's parser directives are its own build's; its frontend is
+  leerie's*), whose grammar this reading follows. A
+  base image's own `ONBUILD` instructions read only that context too.
+  *Designed 2026-11-03 (review round 30 isolation R1).* The image was
+  built from the whole of `git archive HEAD` but reused on the
+  Dockerfile's bytes alone: a run on a contributor's branch baked that
+  branch's `COPY`ed files into the worker root, and the next run on the
+  trusted branch, with the same Dockerfile, logged "per-repo image
+  up-to-date" and ran its confined commands, its measurements and its
+  held-out runner in the branch's root. Keying on the whole tree instead
+  would rebuild on every commit — a full build is 10–17 minutes — for a
+  Dockerfile that copies two lockfiles; the context is narrowed so the key
+  is exactly as wide as what the build reads. Leerie's generated
+  Dockerfile copies only the files it names, so its image is rebuilt when
+  one of them changes, as before.
+- *No build consumes what another build left in BuildKit.* One BuildKit
+  serves every build on a host: leerie's base, both builds of each
+  repository's image, and every branch of each repository. BuildKit lets one
+  build's result stand in for another's in four places (measured on
+  rootless nerdctl 2.3.5 with BuildKit 0.31.2):
+  - *The context snapshot.* BuildKit keeps a snapshot of a build context
+    under one key for every nerdctl build (`context:context:`). The next
+    build syncs onto that snapshot and skips any file whose size, mode,
+    owner and modification time are unchanged, without comparing content.
+  - *The cache.* A `RUN` step's cache key leaves out the proxy and the
+    extra hosts' addresses a frontend can give the step. So a frontend a
+    repository chose could run the step of leerie's base Dockerfile through
+    its own proxy, under the key leerie's next base build reused.
+  - *Cache mounts.* A `RUN --mount=type=cache` mount is shared by its id
+    across every build, so one repository's build read what another's
+    planted.
+  - *The image store.* A `FROM`, or a `RUN --mount=…,from=`, naming an
+    image the registry refuses is resolved from the image store of the
+    containerd namespace BuildKit's worker reads, by its name alone. A
+    repository image's name, `leerie-repo/<repo-id>-<checkout-id>:<version>`,
+    is no secret: each part is guessable. So one repository's Dockerfile
+    read another's whole worker root by naming it, with no race (below).
+
+  Every build leerie runs is given `--no-cache`: the base, both builds of a
+  repository image, and `build-push.sh`'s builds on either builder.
+  `--no-cache` is an option of the frontend, which turns it into the
+  solver's ignore-cache flag, so each of those builds is also given the
+  frontend leerie pinned (*A repository's parser directives are its own
+  build's; its frontend is leerie's*, above). BuildKit then reuses no cached
+  step. For a cache mount `--no-cache` is not enough: it empties the
+  mount's id once, when the build's steps are loaded, and does not separate
+  two builds that run at the same time. A mount is looked up by its id in
+  one table for the whole daemon, and a later step is handed the live
+  directory another build's running step holds (measured). So every build
+  leerie runs is also given `--build-arg
+  BUILDKIT_CACHE_MOUNT_NS=leerie-<random>`, a fresh value from a CSPRNG for
+  each build (`leerie_cache_mount_ns`). The pinned frontend puts that value
+  in front of every cache mount's id, an explicit `id=` included, so no two
+  builds name one mount, whenever they run. A repository cannot set it: the
+  frontend reads it only from the build's options, never from the file, and
+  `build-push.sh` refuses it from a caller as it refuses `BUILDKIT_SYNTAX`.
+  `--no-cache` does not reach the context snapshot. With it alone, a
+  contributor's branch still put its bytes in the trusted branch's worker
+  root (measured): the contributor dates the commit at the trusted HEAD's
+  committer time and keeps each copied file the same size, and `git
+  archive` gives every file the commit's time. So the launcher dates every
+  entry of a context it exports at one moment of the past year, chosen by
+  a CSPRNG, to the nanosecond (`_repo_context_retime`). No file of the
+  snapshot one build left can then match a file of the next build's
+  context. One date for every entry, as `git archive` gave them, keeps the
+  files' relative order, so a `make` that compares two copied files sees
+  what it saw before. A date in the past keeps working the tools that
+  refuse a future time or one before 1980 (`zipfile`). The context's digest
+  holds no dates, so the image key is unchanged. Leerie's base build reads
+  leerie's own directory, dated by its installer. No repository's context
+  can match those dates, since every one of its own is random.
+  `--no-cache` holds only for a frontend leerie chooses. A frontend that
+  ignores it reads every cache mount as another build left it, whoever's
+  build that was, so leerie pins the frontend and a repository's
+  `# syntax=` is not honoured (review round 35, isolation I1; above). The
+  pinned `docker/dockerfile:1` honours `no-cache` for the step cache and
+  the cache mounts alike (measured), and reads the cache-mount namespace.
+  No build resolves by name an image another repository's build produced.
+  Leerie keeps its images, and runs its containers, in a containerd
+  namespace of its own, `leerie` (`LEERIE_IMAGE_NS`), which no BuildKit
+  worker reads: its base, every repository image, and the images
+  `build-push.sh --local-build` tags with nerdctl. nerdctl, given a
+  namespace its daemon's worker does not read, exports the image and loads
+  it there, so no name leerie gives an image is in a namespace a build
+  reads. Before a repository's build the launcher asks the BuildKit daemon
+  nerdctl would use, found as nerdctl finds it, which containerd
+  namespaces its workers read (`buildctl debug workers`, each worker's
+  `org.mobyproject.buildkit.worker.containerd.namespace` label), and runs
+  both builds on that daemon (`--buildkit-host`); it refuses to build when
+  a worker reads `leerie`, or when the daemon cannot be asked
+  (`leerie_buildkit_check`). A repository's build still reads leerie's
+  base, which holds nothing secret, from a copy in the worker's namespace
+  (`ensure_base_in_worker_ns`, copied again whenever its id differs from
+  the base's), and the pinned frontend there
+  (`ensure_frontend_in_worker_ns`); nothing else of leerie's is there.
+  With repository images in a namespace of their own, the attacking
+  Dockerfile's `FROM` of the victim's name failed ("pull access denied")
+  and an honest `FROM $BASE_IMAGE` built (measured 2026-11-03, BuildKit
+  0.31.2). `--pull` does not do it: BuildKit's built-in frontend then
+  refuses the image store, but under the pinned frontend the read still
+  succeeded (measured). What leerie cannot keep apart is what the
+  operator keeps in the worker's namespace. On the standard rootless setup
+  (`containerd-rootless-setuptool.sh install-buildkit-containerd`, as
+  `scripts/runtime-install.sh` runs it) that namespace is `default`,
+  nerdctl's own, and any image the operator has there can be named by a
+  repository's build; Colima's worker reads `buildkit`, which holds only
+  what leerie copies there. *Cost:* where the worker read nerdctl's
+  namespace, BuildKit stored the image there itself; now nerdctl exports
+  each image leerie tags, its base and each repository image, and loads it
+  into `leerie`, as it always did on Colima, and the base is unpacked
+  twice, in `leerie` and in the worker's namespace, about 2.4 GB each (as
+  on Colima; on the rootless setup leerie's copy into `buildkit`, which no
+  worker read there, was already a second). The export's time at full size
+  is not measured.
+  *The images an earlier leerie left.* Up to 0.43.0 leerie tagged
+  repository images in nerdctl's namespace, `default`, which is the
+  worker's on the standard rootless setup, so they stay readable until they
+  are gone. None is reused: leerie looks its images up only in `leerie`,
+  so the first launch after the change builds its base and each repository
+  image again there. Before each repository build, leerie removes from every
+  namespace a worker reads each image named `leerie-repo/…` (its own name
+  for a repository image, and nothing else) that no container uses
+  (`nerdctl image rm`, never forced: nerdctl refuses to remove the name a
+  container was created from, which it records even for a container
+  created by digest, as leerie's are; measured 2026-11-03, nerdctl 2.3.5),
+  and refuses the build while one is left: an earlier leerie's run still runs from it, and the launch can be
+  repeated once that run ends. A removed image is a cache: the earlier
+  version builds it again on its next launch. The images an earlier
+  `--local-build` tagged (`registry.fly.io/<app>:…`) do not carry a name
+  only leerie uses, so they are not removed. A run an earlier leerie
+  launched keeps its container in `default`: `stop`, `kill`, `resume`'s
+  reaper and `prune` look a run's container up in `leerie` and then in
+  `default` (`_container_ns`).
+  *Revised 2026-11-03 (review round 36, isolation I2).* This section said
+  each cache mount "starts empty, whatever another build left in it", and
+  the namespace was considered and not used because `--no-cache` already
+  kept builds apart. That was measured with one build after another.
+  With two builds overlapping on one BuildKit, both under the pinned
+  frontend and `--no-cache`, an attacker's build that ran short cache-mount
+  steps while the victim's ran read the victim's committed file from the
+  mount, and the victim's image held what the attacker planted (measured
+  2026-11-03, BuildKit 0.31.2). With a namespace per build, the attacker
+  read nothing and the victim's step read its own mount.
+  *Designed 2026-11-03 (review round 34, isolation R1, R2 and its
+  observation).* R1: a contributor's branch got its bytes into the image
+  the trusted branch then reused, through the context snapshot. R2: a
+  frontend could set a proxy on a step identical to leerie's own base
+  step. The observation: cache mounts were shared across repositories.
+  Rejected: a BuildKit daemon per repository. It would keep repositories
+  apart, but not the branches of one, which would still share its
+  snapshot, its cache and its cache mounts. So R1 would still need the
+  dating, and a branch's cache would still stand in for another's. It
+  would also need the base image copied into its own namespace (about
+  2.4 GB unpacked, per repository) and a daemon the launcher starts inside
+  Colima's VM. And it has no form on Fly: the remote builder is one per
+  organization and shared by every app in it, so leerie cannot give a
+  repository its own there. nerdctl exposes no per-build context name or
+  session key that would keep the snapshots apart either.
+  *Designed 2026-11-03 (review round 37, isolation I3).* A hostile
+  repository's Dockerfile did `FROM leerie-repo/<owner>-<repo>-<hash>:<version>`,
+  another checkout's name, or `RUN --mount=type=bind,from=` it, and copied
+  that checkout's committed file out of its worker root, on a BuildKit whose
+  worker reads the namespace nerdctl tags in, as this host's does (measured
+  2026-11-03, BuildKit 0.31.2). Before the fix this section counted three
+  places; the image store is the fourth. *Fly:* the remote builder, the
+  default, is Fly's, one per organization: it keeps the images built there
+  and pulls with the organization's token, so a repository's Dockerfile
+  there can name the organization's other images; leerie cannot partition
+  it (not measured). With `--local-build` and nerdctl, every image is
+  tagged in `leerie`; with docker there is one image store, so the read
+  holds there (not covered).
+- *A repository's build carries no operator credential.* nerdctl runs
+  `buildctl`, which hands BuildKit every registry credential in the
+  invoking user's Docker config, so a repository's `FROM` could pull
+  anything the operator can, another repository's pushed image included
+  (measured 2026-11-03 with a registry of the review's own: `401
+  Unauthorized` with an empty Docker config, the victim's file with the
+  operator's). Both builds of a repository image run with `DOCKER_CONFIG`
+  set to an empty 0700 directory of leerie's own in the build directory
+  (`$_REPO_BUILD_DIR/registry-auth`), so they pull as no one, the same rule
+  as *A repository chooses no operator authority*. A repository's `FROM` a
+  public image still works; a private one is pulled by the operator into
+  the worker's namespace first (`nerdctl --namespace <worker namespace>
+  pull`), where the build resolves it by name: what a build may read is
+  the operator's choice, made image by image, so leerie has no setting
+  that shares a registry. Leerie's own builds, its base and the frontend
+  it pulls into the worker's namespace, keep the operator's config: no
+  repository text reaches them, they name only public images, and an
+  operator behind a mirror or a rate limit needs it. *Fly:* the
+  repository's stage is built `FROM` leerie's base in
+  `registry.fly.io/<app>`, so that build needs the app's registry
+  credential, and the one it can have reads every image of the
+  organization (the remote builder's token; with `--local-build`, the
+  operator's `flyctl auth docker`). `build-push.sh`'s build and push are
+  separate commands, so each could be given its own Docker config, but
+  the build itself needs the credential: on Fly a repository's build can
+  read the organization's images (not covered). *Designed 2026-11-03
+  (review round 37, isolation I4).*
+- *Fail closed, on every entry.* Where the image has a worker root, the
+  confinement check every entry runs (`_require_confinement`) runs `test
+  -e /.leerie-worker-env` confined and stops the run when it does not find
+  the worker stage's mark (`_require_worker_view`): leerie never runs the
+  repository's commands in its own root instead, nor its own in theirs.
+
+**Runtimes.** *Rootless:* the worker root is the image's, owned as the
+image built it (root's files appear as the running user, the image's
+`leerie` files as `nobody`, exactly as in leerie's own root); the view's
+binds of it are read-only, so no ownership question arises. *Rootful:* the
+same files are root's and the worker reads them through their mode bits,
+as it reads leerie's root today; `container-entry.sh`'s ownership fixes
+touch only leerie's root. Both run the same two `nerdctl build`s; the
+named OCI-layout context and the OCI export are BuildKit features nerdctl
+passes through (measured on rootless nerdctl 2.3.5 with BuildKit 0.31.2).
+*Fly:* `ensure_image` runs the same two builds through `build-push.sh`:
+the repository's file as committed, from the committed tree, pushed under
+its own tag, then leerie's, whose worker stage is that image's digest in
+the registry (`FROM registry.fly.io/<app>@<digest>`), checked as
+`_check_repo_image` checks it (`--layout-base`). The repository's image
+is never started as a container there (`--no-run`, where a local build
+would smoke-test it); the machine's root is the base. Each image is pushed
+under its own tag and a machine starts from the digest leerie pushed
+(§6½ *Per-repo container image*). *EC2:* the AMI is baked
+from leerie's base Dockerfile only, and no repository image is built
+there, so every process runs in leerie's root; a repository's image layers
+reach no EC2 machine. The machine's `/work/.leerie/Dockerfile` is not
+streamed back to the host on Fly or EC2 any more: a file a machine wrote
+never becomes a build input.
+
+**Cost.** `COPY --from=<worker stage> /` copies the whole worker root, which
+is the base's filesystem plus the repository's layers: about 2.4 GB more
+unpacked per repository image (one per checkout and leerie version), and
+the copy's time on each rebuild. Locally the first build's image is also
+written out once as an OCI layout in the build directory, about 1 GB and
+49 s for an image on leerie's base (measured 2026-11-03), removed with the
+directory; on Fly it is pushed under its own tag. A rebuild happens only when the
+Dockerfile, what it reads from the committed tree, leerie's version or the
+base image change (`.dockerfile-hash` records all four and
+`REPO_IMAGE_LAYOUT`). A Dockerfile that copies the whole tree (`COPY .`)
+is rebuilt on every commit. A rebuild runs every step of the repository's
+file, since no build reuses BuildKit's cache (*No build consumes what
+another build left in BuildKit*). An `apt-get install` step took 3.8 s
+from the cache and 25.8 s with `--no-cache` (measured 2026-11-03). On
+every rebuild the second build's copy of the whole root takes minutes
+anyway. A checkout that switches between two branches whose copied files
+differ rebuilds from nothing on each switch. Each launch exports, dates
+and hashes the context, which for a whole-tree copy is the size of the
+tree. A launch that needs no rebuild runs no build at all, whatever wrote
+the Dockerfile. Leerie's generated file is tested only by its own build:
+when its language-dep layer does not build, the launch builds the same
+file without that layer (*Language deps*, §6½), and records the image
+under the key of the file it generated, so the next launch, which
+generates the same file, reuses it, and warns that it does. *Revised
+2026-11-03 (review round 35, execution R35E-1).* A separate probe build of the generated file ran on
+every launch, before the rebuild check; once every build was given
+`--no-cache`, it reinstalled every language dependency on each launch and
+threw the result away (32 s instead of 11 s for a one-package bake,
+measured; minutes for a real lockfile), and each launch needed apt and the
+package registry. On a rebuild it doubled the build.
+
+**Residuals.** A worker's CLI reads with its `Read`, `Grep` and `Glob`
+tools in leerie's root: a path only the worker root has (`/opt/venv/…`)
+is found by a command, not by those tools. A worker stage whose last
+stage has no `/bin/sh` cannot record its environment, so its build fails.
+The pinned frontend image is a network pull (about 14 MB), as a
+`# syntax=` frontend was. The launcher pulls it into the containerd
+namespace BuildKit's worker reads before its first build
+(`ensure_frontend_in_worker_ns`, as `ensure_base_in_worker_ns` copies the
+base there) and keeps it there.
+BuildKit's own pull of a frontend lives only in BuildKit's cache: after a
+prune, a build on a host without the network failed to resolve it, while
+one whose namespace held the pulled image built (measured 2026-11-03,
+BuildKit 0.31.2, with the daemon's registry access cut). A host that has
+never had the network has no base image either, so the frontend adds no
+first-install case. On Fly the remote builder resolves the pin itself
+(not measured there), and the cache-mount namespace holds there only if
+the remote builder passes `--build-arg` through to the frontend (not
+measured there). With a namespace per build no build reuses another's
+cache mount, so the records a build leaves are dead once it ends, and
+BuildKit's collection did not reclaim them: 13 builds each filling a
+60 MB mount left 838 MB, above the default policy's 512 MB for cache
+mounts, with nothing removed after 90 s idle (measured 2026-11-03,
+BuildKit 0.31.2; the policy's 48-hour keep duration is the likely reason,
+not proven), leaving only the disk-wide rules (10 GB reserved, 39 GB
+kept free) as the bound. So after each build leerie removes the records
+its own namespace names (`leerie_prune_cache_mounts`: `buildctl prune
+--filter 'type==exec.cachemount,description~="<ns>/"'`, whose description
+names the mount's id, which the frontend prefixes with the namespace; it
+removed that build's record and no other's, measured): the base build,
+both of `build_repo_image`'s, and `build-push.sh --local-build`'s with
+nerdctl, whatever the build's status. A failed prune warns. Left to
+BuildKit's collection: the records of a build its launch was killed
+during, and every record on Fly's remote builder, which leerie cannot
+prune. *Revised 2026-11-03 (review round 37, execution E4).* This said a
+record is kept "until BuildKit's garbage collection removes it", one per
+build; the collection did not.
 
 ### A worker's commands cannot reach its CLI
 
@@ -2707,13 +3493,61 @@ would read is one a worker can write — its own configuration directory's
 left to the write grant). So a confined worker's CLI gets
 `--setting-sources ""` and its whole settings in `--settings`
 (`_confined_cli_settings`): the operator's settings from the run's
-read-only configuration template, the repository's project and local
-settings from the user's checkout (which no worker writes), then leerie's
+read-only configuration template, the checkout's project and local
+settings that git does not track (no worker writes the checkout, and a
+tracked one is the repository's, which adds nothing: §6 *A repository
+chooses no operator authority*), then leerie's
 own — the PreToolUse hook and the shell prefix, which nothing below them
 overrides (settings given on the command line win over every file scope,
 measured). Merged as the CLI merges scopes: objects key by key, arrays
 concatenated. The Fly recovery integrator gets the same from
-`worker-guard.py`.
+`worker-guard.py`. A layer below leerie's own contributes only what is
+listed, and every other key of it is dropped: `permissions.deny` and
+`permissions.ask`, which only narrow; and the operator's endpoint and
+credentials, which an untracked settings file may choose (*The names an
+untracked settings file may still set*). That list is three things the
+CLI names, none of which widens a worker's tools: the endpoint (the
+provider switches, the API's, Bedrock's, Vertex's and Foundry's base URLs,
+Foundry's resource, and the skip-auth switches a gateway uses), the
+credentials (the CLI's credential helpers `apiKeyHelper`,
+`awsCredentialExport`, `awsAuthRefresh` and `gcpAuthRefresh`; the API key
+and token; the headers a gateway authenticates by; `AWS_*`; Vertex's
+project and regions; Foundry's key) and the model mapping (`ANTHROPIC_DEFAULT_*_MODEL` and
+`ANTHROPIC_SMALL_FAST_MODEL`, which say what the alias leerie passes
+resolves to on that endpoint, where it can lag the API's by a
+generation). Review round 31 found the first list short: it kept
+`CLAUDE_CODE_USE_VERTEX` but not Vertex's project and region, so Vertex
+from settings always failed; `apiKeyHelper` but not its Bedrock
+siblings; and no model mapping, which IMPLEMENTATION §0.5 documents for
+Bedrock. Review round 32 found it short again: it kept
+`ANTHROPIC_BASE_URL` but not `ANTHROPIC_CUSTOM_HEADERS`, so a gateway's
+requests went out without the header that authenticates them; and it
+kept no name of Foundry, a provider the CLI documents beside Bedrock and
+Vertex. A name that holds a path on the operator's host (a client
+certificate and key, a Google credentials file, a unix socket) stays
+out: the path names nothing in the container. So does
+`CLAUDE_CODE_OAUTH_TOKEN`: the subscription credential is the one leerie
+seeds, and a settings layer does not replace it. So do the CLI's
+provider switches that no documented setup sets: the list holds only
+names a documented setup reads. A worker's tool scope is leerie's argv alone (§12 *L1*), and no other key
+can be trusted not to widen it: a permission mode (`defaultMode:
+bypassPermissions` approves every tool), an allow list,
+`additionalDirectories` (the directories the CLI's tools may reach), a
+hook (a PreToolUse hook that answers "allow" approves the call), an `env`
+name the CLI reads. A list of what to drop would miss the next such key,
+as the first one did (review round 30: it dropped `defaultMode` and
+`allow` and passed `additionalDirectories` and the hooks through).
+*Designed 2026-11-03 (the live 0.43.0 barnacle runs).*
+The operator's own `settings.json` on the host carried `defaultMode:
+bypassPermissions` and `allow: [Bash, Read, Edit, Write, …]`; merged into
+every confined worker's settings, it put every judgment worker in
+`bypassPermissions` (every transcript checked — the classifier, the three
+planners, five satisfied-probe logs — reports it), so its `--allowedTools`
+scope approved nothing it would not have approved anyway. A satisfied
+probe, read-only by its tools, ran `npx vitest` over twelve test files in
+its read-only tree; eleven failed on `mkdirSync`, which Landlock refused,
+and it answered `cannot_verify`, settling a subtask `unconverged` whose
+work a sibling had delivered.
 
 **Residuals.** The CLI's own spawns that are not commands: its `git`
 calls are on leerie's terms (§6 *The CLI's own git runs on leerie's
@@ -2874,7 +3708,7 @@ enforce, which a measurement reads as "could not measure", never a pass.
 | the verified stores | what `PIP_CACHE_DIR`, `POETRY_CACHE_DIR` and `YARN_GLOBAL_FOLDER` name (`_VERIFIED_STORE_VARS`): the manager refuses an edited entry on reuse | write (read only in a held-out run's grant, `_heldout_grants`: an evaluation installs nothing) |
 | the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
-| outside the state root | everything but `/tmp`, as a worker's | read |
+| outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
 | *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR`; `mise-state/` emptied first | write |
 | *store-fetch kind* (`_populate_leerie_store`, in its staging directory) | also leerie's store, its store variables left pointing there | write |
@@ -3118,6 +3952,383 @@ into a tree are git's, which refuses a path beyond a link; leerie names
 the repository for it (*Leerie's git never takes a tree's repository from
 the tree*).
 
+### Leerie never reads through a link a repository holds
+
+*Designed 2026-11-02 (review round 26, isolation I1).*
+
+**Root cause.** The section above closed leerie's *writes* through paths
+confined code shaped, and its reads of what confined code *wrote*. It left
+the reads of what a repository *holds*. The orchestrator is unconfined: its
+environment carries `CLAUDE_CODE_OAUTH_TOKEN`, and it can read the CLI's
+credentials and the state root with every held-out set. It read many of a
+repository's files by path, so the kernel followed every link the
+repository held. The most direct case was the PR template.
+`_compose_pr_via_llm` read `.github/pull_request_template.md` from `/work`
+(`is_file()`, `read_text()`), and `pr_writer` is told to fill the template
+into the PR body, which `gh pr create` publishes. A repository whose
+template is a committed link to `/proc/self/environ` or to
+`~/.claude/.credentials.json` therefore published the token. The
+repository did not need to know anything about the run. Its content is a
+worker's to shape:
+
+- a cloned third-party repository;
+- a merged run branch;
+- a worker's own tree or tree repository;
+- the output of a measurement.
+
+The same class reached:
+
+- the configuration (`leerie.toml`, `.leerie/config.toml`);
+- the manifests, README, workflows and contributing guide handed to the
+  provision and dependency-capture workers;
+- the CI files a `ci_checks` provenance check quotes;
+- the version files mise is pinned from;
+- the files the task names, and a task file itself;
+- the repository's `.claude` settings applied to every worker;
+- a worker-named checkpoint path;
+- a coverage summary a measurement wrote;
+- a tree repository's worktree records. Unlike the rest, these could hold
+  a FIFO, which made the orchestrator's read block for good.
+
+**Invariant: what leerie reads as a repository's content is that
+repository's content, never what a link in it points at.** It is
+constructed in three parts.
+
+1. *What leerie publishes from the commit the run planned against is a git
+   blob.* The PR template is read from the run's own repository at
+   `base_sha` (`git ls-tree`, then `git cat-file blob`; `_find_pr_template`),
+   never from the checkout. The read matches the committed view the run
+   planned against, so an uncommitted edit in the checkout is not
+   published either. A template committed as a link (mode 120000) is a blob
+   holding a path. It is not a template, and it is skipped.
+2. *Every other read of a repository's files by path walks from the
+   repository's root without following a link.* The roots are `/work`, a
+   worker's tree, a tree repository, a measurement's tree, and a subtask's
+   notes directory. Each read uses the same walk as part 2 above
+   (`_read_beneath`, `_read_text_beneath`, `_regular_file_beneath`), and a
+   link at the file or on the way to it reads as absent. A FIFO is refused,
+   never waited on. A listing keeps only entries it reached without a link
+   (`_glob_beneath`, `_listdir_beneath`, `_dir_beneath_exists`;
+   `os.walk` without `followlinks`). A checkpoint is read only beneath the
+   subtask's own notes directory, whatever path the worker names. A task
+   file in the checkout is read beneath it. One the operator names outside
+   it is theirs. A probe that only tests whether a file exists, to choose
+   between leerie's own commands, reads no content and is not covered.
+3. *The host reads the checkout the same way.* The launcher refuses to
+   start when `leerie.toml`, `.leerie`, `.leerie/config.toml`,
+   `.leerie/Dockerfile`, `.claude`, `.claude/settings.json` or
+   `.claude/settings.local.json` is a link (`_checkout_config_links`). It
+   reads and writes the checkout's files only at those paths (the two
+   settings files, when git does not track them, decide Bedrock mode and its
+   AWS profile, §6 *A repository chooses no operator authority*; a linked one
+   outside the checkout switched a run into Bedrock mode, review round 27,
+   execution L2), and the checkout is not written while leerie runs, so one
+   check holds for every read after it. Its other looks at the checkout only
+   test whether a file exists, to choose between leerie's own commands.
+   The operator's `config --apply-capture` rewrites `.leerie/config.toml`
+   through `_write_beneath`, so a link there is replaced, never read or
+   written through. The Dockerfile generator reads the committed tree from
+   git (`git ls-tree`, `git cat-file`, bounded), never the checkout's paths:
+   a linked `.npmrc` is a link, which is no input (review round 28,
+   isolation A2: it was hashed and named in a `COPY`, and one linked to
+   `/proc/self/pagemap` stopped every launch). It reads the operator's
+   `.leerie/config.toml` beneath the checkout without following a link,
+   bounded. `.leerie/Dockerfile` is read once per image, beneath the
+   checkout, bounded (`_repo_image_dockerfile`), and an image is keyed on
+   the digest of the bytes that read returned, never on a second read by
+   path (review round 29, isolation F4).
+
+A rule over the module holds the line. Every function that still calls a
+raw read primitive is classified by why what it reads is not a repository's
+content reached through a path the repository shapes:
+
+- leerie's install;
+- the run directory and the state root;
+- leerie's own copies of the held-out sets, made through `_read_beneath`;
+- the kernel's files;
+- a file the operator named;
+- a listing that follows no link.
+
+The functions that read a repository's content use no raw primitive, and
+decide what to read with no probe that follows a link
+(`tests/test_leerie_reads_never_follow_links.py`).
+
+**No read is unbounded.** The orchestrator is unconfined. A worker can make a
+sparse file of a terabyte at no disk cost (`truncate -s 1T`) in its tree, its
+notes or a measurement's output. A read of the whole file then cost the
+orchestrator that much memory: `MemoryError` past RAM and swap, which no caller
+caught, and below that the container's OOM killer (review round 27, isolation
+I3). Every read of a repository's file states its limit. The descriptor's size
+is checked after the open, and a file over the limit is refused like a link
+(`OSError` `EFBIG`). The read takes at most one byte more than the limit, so a
+file that grows after the check is refused too. A caller that uses only the
+start of a file reads only that much (`_read_head_beneath`). The limits are
+named, by what the file is: configuration, text read whole, and a measurement's
+report or a copy of the operator's files.
+
+### No host path comes from a repository
+
+*Designed 2026-11-02 (review round 27, isolation I6).*
+
+**Root cause.** `leerie.toml` is repository content (the section above): a
+cloned repository's, or a run branch's that the operator merged, since a
+worker may commit a root `leerie.toml`. Five of its keys named a location on
+the host or in the run directory, below only the operator's flag and
+environment. `log_file = "~/.bashrc"` made the launcher create that file and
+append the whole run's output to it, and that output carries worker text
+verbatim (a judge's `concrete_case`, a blocker's reason), with its newlines.
+The operator's next shell would run it. `state_dir = ".lstate"` put the state
+root inside the checkout. In the container that one directory is then both
+`/leerie-state` and `/work/.lstate`. Every grant is carved by path, and `/work`
+does not contain `/leerie-state`, so every worker's read of `/work` reached
+the held-out sets, every other worker's notes and the copies of the
+credentials. `inspect_dirs` chose a host directory to mount into the container,
+or on Fly and EC2 to copy to the machine. `judge_dir` and `heal_dir`, joined to
+the run directory, could name any path the orchestrator can write. "Always
+outside the target repo" was written down and never checked.
+
+**Invariant: no host path comes from a repository's content, and the state
+root is never at, inside or above the checkout.** It is constructed in three
+parts.
+
+1. *A location comes only from the operator.* `state_dir`, `log_file`,
+   `inspect_dirs`, `judge_dir` and `heal_dir` have no `leerie.toml` key. They
+   come from a flag or the environment (`--state-dir` / `LEERIE_STATE_DIR`,
+   `--log-file` / `LEERIE_LOG_FILE`, `--inspect-dir` / `LEERIE_INSPECT_DIRS`,
+   `--judge-dir` / `LEERIE_JUDGE_DIR`, `--heal-dir` / `LEERIE_HEAL_DIR`). A
+   `leerie.toml` that still sets one stops the launcher before anything else
+   reads it, and the message names the key's operator-side replacement: a
+   key silently ignored would move a run's state away from where its
+   operator looks for it. The orchestrator reads none of them from the file,
+   and its one reader of `leerie.toml` refuses those names
+   (`REPO_CONFIG_LOCATION_KEYS`). The section below extends this to every
+   setting that carries the operator's authority.
+2. *The launcher refuses a state root that overlaps the checkout.* It compares
+   the two by real path, after every tier is resolved. A state root equal to
+   the checkout, beneath it or above it stops the run. Beneath, the checkout's
+   mount shows the state root to every worker. Above, the state root's mount
+   holds the checkout writable.
+3. *The orchestrator refuses a state root reachable by a second name.* Inside
+   the container the two are separate mounts, and the launcher's check is the
+   only one that sees the host's paths. So the entry every invocation runs
+   (`_require_confinement`) resolves each of the two paths to its place on
+   disk: the device and the path within the filesystem that
+   `/proc/self/mountinfo` gives for the mount holding it. When one lies
+   at or beneath the other on disk, but not by path, the state root has a
+   second name that no grant carves out, and the run stops. A state root
+   nested in the checkout by path as well (the direct-call default,
+   `<repo>/.leerie`, which only tests use) is carved out of every grant by
+   path, as before.
+
+### A repository chooses no operator authority
+
+*Designed 2026-11-02 (generalizes *No host path comes from a repository*).*
+
+**Root cause.** The section above closed one class of a wider one. Everything
+in the checkout that git tracks is repository content: a cloned repository's,
+or a run branch's that the operator merged. A worker may commit a root
+`leerie.toml`, and leerie's own run branch is the operator's next base. A
+host path was one kind of choice that content made below only the operator's
+flag and environment. The others were the operator's authority too:
+
+- *credentials and identity.* `aws_profile` and `aws_region` chose the AWS
+  account and region leerie provisions in. `ec2_instance_profile` chose the
+  IAM identity the machine runs as. `ec2_key_name`, `ec2_security_group` and
+  `ec2_subnet_id` chose who can reach the machine that holds the run's
+  copied credentials, and from where. `ec2_ami` chose the system those
+  credentials are copied onto. `runtime` chose whether the code and the
+  credentials leave the host at all. The checkout's `.claude/settings.json`
+  and `.claude/settings.local.json` chose Bedrock mode, which stages
+  `~/.aws` into the container, and its AWS profile and region; and each
+  reached every confined worker's CLI as a settings layer, where an `env`
+  `ANTHROPIC_BASE_URL` sends the operator's token to another endpoint and an
+  `apiKeyHelper` or a hook runs in the CLI's own domain.
+- *spending.* `ec2_instance_type` and `fly_disk_gb` size a resource billed to
+  the operator's cloud account, outside the run. A model, an effort, a
+  worker budget or a round count is different: it is how much of the run's
+  own work the repository asks for, the operator overrides each per run, and
+  the budget preflight bounds it.
+- *waivers.* `dangerously_skip_permissions`, `dangerously_allow_uncapped` and
+  `dangerously_force_strict_output` each waive a guarantee by name. Each gate
+  key (`skip_overlap_judge`, `skip_budget_check`, `skip_satisfied_check`,
+  `skip_base_baseline`, `skip_acceptance_check`, `skip_adherence_check`,
+  `skip_coverage_check`, `skip_completeness_check`, `skip_integration_check`,
+  `skip_classification_check`) switches off a check of the result: a run
+  branch that wrote `skip_acceptance_check = true` turned off the held-out
+  gate for every later run once merged. `worker_pids_max` and
+  `worker_memory_max` are each worker's containment ceilings: no ceiling above
+  bounds a worker's PIDs, so raising `worker_pids_max` took the fork-bomb
+  bound away.
+
+**Invariant: a repository's content chooses no operator authority.** A host
+path, a credential or profile, where worker code runs and as whom, a resource
+billed to the operator, a waiver of a guarantee and a worker's containment
+ceiling come only from the operator: a flag, the environment, or the
+operator's own Claude settings (`~/.claude/settings.json`, and an untracked
+settings file in the checkout). Leerie has no user-level configuration file
+of its own. It is constructed in two parts.
+
+1. *`leerie.toml` has no key for any of them.* One list,
+   `REPO_CONFIG_OPERATOR_KEYS`, holds the five locations above
+   (`REPO_CONFIG_LOCATION_KEYS`) and the authority keys
+   (`REPO_CONFIG_AUTHORITY_KEYS`), each with its flag and environment
+   variable. The launcher holds the same list in the same order
+   (`_checkout_config_operator_keys`). It stops on a `leerie.toml` that sets
+   any of them, for every verb but `version`, before anything else reads the
+   file, and names each key's replacement: a key silently ignored would run
+   the operator's next run with a choice they did not make, or without one
+   they believe is set. The orchestrator's one reader of the file
+   (`_read_toml_key`) refuses every listed name, and no resolver of one has a
+   file tier. `.leerie/config.toml` is read only for repository facts, so a
+   listed name there is never read.
+2. *A tracked settings file is the repository's.* Round 24 layered the
+   checkout's settings files into every confined worker's settings, as the
+   operator's input, because no worker writes the checkout while leerie
+   runs. That holds for the run, not for what the operator merges after it,
+   or clones. So the boundary is git's: a checkout settings file that git
+   tracks (in the checkout's index) is repository content, and leerie reads
+   nothing from it. It is not a worker's settings layer
+   (`_checkout_settings_are_operators`) and does not choose Bedrock mode or
+   its profile and region (the launcher's `_OPERATOR_CLAUDE_SETTINGS`). No
+   merge or clone brings an untracked file, so an untracked one
+   (`.claude/settings.local.json`, usually ignored) is the operator's own and
+   is read as before. When git cannot answer, the file counts as tracked.
+   This is not a refusal, unlike `leerie.toml`: the same file configures the
+   repository's own interactive Claude Code users, so refusing would make the
+   operator edit shared content to run at all, while leaving it out can only
+   fall back to the operator's own credentials. Leerie says what it left
+   out: the launcher warns when a tracked file sets
+   `CLAUDE_CODE_USE_BEDROCK`, `AWS_PROFILE` or `AWS_REGION`, and the
+   orchestrator logs each tracked file it does not apply.
+   *Tracked* is a fact about the file leerie reads, not about the name it
+   asked for (§6 *A path is the file it names, not its spelling*).
+   *Untracked* means no repository holds the file, not only the
+   checkout's own index: a submodule's files are in no superproject index
+   entry of their own (`.claude` as a submodule is one gitlink entry,
+   `.claude`), so a check of the file's own entry read a cloned
+   submodule's `.claude/settings.json` as the operator's, and its
+   `apiKeyHelper` and `ANTHROPIC_BASE_URL` reached every worker (review
+   round 31, S1; `git clone --recurse-submodules` is all it takes). So a
+   checkout file is the operator's only when no index entry is the file or
+   any directory above it in the checkout, and no directory above it in the
+   checkout holds a `.git` (a submodule, or any repository nested there).
+   Every decision that a checkout file is the operator's because git does
+   not track it applies this one rule (`_checkout_file_tracked`; the
+   launcher's `_checkout_file_tracked`): the settings files above, a report
+   the task points at (§8 *A task that points at a report is bounded by the
+   report's own scenarios*), and the launcher's refresh of a generated
+   `.leerie/Dockerfile`, which leaves a committed one alone.
+
+**The names an untracked settings file may still set.** Round 28 suggested a
+further list of names no checkout settings layer may set, tracked or not:
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+`apiKeyHelper`, `CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX`, and
+`AWS_*`. Leerie does not refuse them in an untracked file. The boundary is
+who wrote the file. The only writers of an untracked checkout file are the
+operator and programs the operator ran on the host with their own
+authority, and such a program could write `~/.claude/settings.json` just as
+easily. Repository content reached that layer only by being misjudged as
+untracked, and the identity rule closes that. A refusal would therefore stop
+no writer that the operator's own domain does not already hold. It would
+also take away a documented operator channel: Bedrock mode from an
+untracked `.claude/settings.local.json`. The same holds for every name the
+keep-list carries (*The CLI reads no settings file*: endpoint, credentials
+and model mapping), and for each the tracked file sets nothing.
+
+**What a repository still chooses.** Facts about itself and how much work it
+asks for, all of which run confined or only tighten a check:
+`.leerie/config.toml`'s `build`, `lint`, `test`, the scoped runners,
+`test_file_globs`, `capture_deps`; the tool versions mise honours
+(`.mise.toml`, `.tool-versions`), installed by a confined command; and in
+`leerie.toml` the source-of-truth, clarify, model and effort keys, the round
+and budget caps, `max_parallel` (bounded by the per-worker ceilings and the
+admission gate), the worker and rate-limit timeouts, verbosity, `no_push`
+(it can only withhold a push), `pr_template`, `pr_base_branch`,
+`strict_conformer`, `stop_on_blocked`, `stop_on_repo_change` (each only
+tightens), `subtask_tests` (the final tree is measured whatever it says),
+`skip_repo_map` (context, not a check), the heal and judge tuning, the seed
+knobs and `bake_language_deps`. The operator's flag or environment overrides
+each.
+
+**Residual.** `.leerie/Dockerfile`, `setup_packages`, `language_installs` and
+a dependency lockfile build the image the run's container starts from, and
+that build is not confined: its steps run as root in the image, and the
+image holds the orchestrator itself. A repository's content therefore still
+shapes the orchestrator's own environment. This design does not close that.
+
+### A path is the file it names, not its spelling
+
+*Designed 2026-11-02 (review round 28, isolation A1).*
+
+**Root cause.** Leerie decided things about a path by comparing its
+spelling, but the filesystem resolves a path by its own rules. A
+case-insensitive filesystem (APFS by default, so every checkout and state
+root on macOS and Colima) treats `.Claude/Settings.json` and
+`.claude/settings.json` as one file. A normalization-insensitive one treats
+the NFC and NFD spellings of a name as one file, and HFS+ and APFS also
+ignore some invisible code points. Two decisions broke on this:
+
+- *Tracked or not.* `git ls-files -- .claude/settings.json` matches
+  spellings, case-sensitively. A repository that tracked
+  `.claude/Settings.json` was reported as tracking nothing, so the read of
+  `.claude/settings.json` (which opens the tracked file) counted as the
+  operator's own. Its `env` then went into every confined worker's
+  settings, and an `ANTHROPIC_BASE_URL` there sent the operator's token to
+  the repository's endpoint. The launcher's Bedrock reads had the same
+  flaw.
+- *Protected or not.* `_is_protected_path` compared prefixes
+  case-sensitively, so a worker could commit `.Claude/settings.json` or
+  `.Leerie/Dockerfile`. On a case-insensitive checkout, both are the
+  protected files once merged.
+
+**Invariant: a decision about a path a repository or a worker can spell is
+made about the file the filesystem resolves it to.** It is built in three
+parts.
+
+1. *Tracked is decided by identity.* Leerie opens the checkout's settings
+   file without following a link (§6 *Leerie never reads through a link a
+   repository holds*) and `fstat`s the descriptor. It then lists the index
+   (`git ls-files -z`, no pathspec), and `lstat`s each entry whose top
+   directory is the top directory it opened on the way (same device and
+   inode). If any of those entries is the same file, or the same directory
+   as one above it (a submodule's gitlink, §6 *A repository chooses no
+   operator authority*), the file is tracked. This covers case, Unicode normalisation and ignorable code
+   points without leerie knowing any filesystem's folding rules. When git
+   cannot answer, or the file is reached through a link or is not a regular
+   file, it is not read as the operator's. The orchestrator
+   (`_checkout_file_tracked`) and the launcher
+   (`_checkout_file_tracked`) apply the same test.
+2. *A protected path is compared folded.* Before the prefix test, a path is
+   normalised lexically and then folded: the code points HFS+ ignores are
+   removed (the same list git uses for `.git`), then the path is
+   NFKC-normalised, casefolded and NFKC-normalised again. A folded key
+   equates at least the spellings any of those filesystems equates, so over
+   them the test can only protect more. Every path list the test reads from
+   git is read NUL-separated (`-z`), because git quotes a name holding a
+   byte outside ASCII and the quoted form never matched a prefix.
+3. *No worker's diff adds a second spelling of a path.* A subtask whose
+   diff touches a path that, folded, equals a different path or directory
+   already in its tree is refused like a protected path
+   (`check_diff_scope`). On a case-insensitive filesystem the two names are
+   one file. Whichever is checked out last wins, so a worker could replace
+   a file it may not touch, such as a test the orchestrator owns, through
+   a name it may touch. A collision the tree already had before the subtask
+   is not the subtask's, and is not reported.
+
+**Decisions that need no change.** Each was checked against the same
+question.
+
+- The Landlock grants are resolved by the kernel to inodes.
+- The checkout deny rules (`Edit(//work/**)`) match a container mount point
+  on Linux, and `/work` is mounted read-only anyway.
+- The held-out sets live outside every tree.
+- The launcher's test for `.leerie/Dockerfile` reads repository content as
+  repository content: a worker can no longer commit a folded spelling of it
+  (part 2), and what a repository's Dockerfile can do is the residual of
+  *A repository chooses no operator authority* above.
+- `check_integrator_commit` uses the folded test of part 2 and reads its
+  list with `-z`.
+
 ### A confined command's scratch is short and private
 
 *Designed 2026-11-01 (review round 19, execution H1).*
@@ -3170,12 +4381,32 @@ and lint passed both ways. funeralworks' configured `test`
 1,287 files and 13,036 tests both ways, and `next build` compiled both
 ways with no SWC cache refusal.
 
-A worker's own temp directory is still `<run-dir>/workers/<wid>/tmp/`
-(§6 *Each worker's own configuration and temporary directories*), at the
-run directory's depth: a socket in it can exceed `sun_path` too. That is
-this design's open edge on the worker side, not closed here; a worker's
-own `/tmp` is now private and short, so pointing its `TMPDIR` there would
-close it.
+**A worker's temp directory is short and private too.** *Designed
+2026-11-03 (the live 0.43.0 barnacle runs).* A worker's `TMPDIR` was
+`<run-dir>/workers/<wid>/tmp/`, at the run directory's depth —
+`/leerie-state/runs/<64 hex>/workers/bugfix-003-conformer/tmp`, about 116
+characters — so tsx's `<dir>/tsx-<uid>/<pid>.pipe` passed `sun_path`'s
+limit and every test that spawns tsx failed inside a worker with `listen
+EINVAL` (18 log hits across 5 of the 7 runs; one worker had to invent
+`TMPDIR=/tmp/t` to run its tests, and three runs' risk registers carried
+the failure as a risk). The invariant above now holds for every worker
+too. A worker's `TMPDIR`, `TMP`, `TEMP` and `CLAUDE_CODE_TMPDIR` name
+`/tmp/l/<id>/` (`_worker_tmp`), `<id>` 16 hex digits of the hash of its
+`<run-dir>/workers/<wid>/`, made 0700 under the 0700 `/tmp/l` by the one
+builder of a confined CLI's directories (§6 *Every confined CLI is given
+its own directories, by one builder*) and granted by its write grant; the
+shim carries it into the worker's own `/tmp` as it carries a command's.
+Being a function of the worker's directory, it is removed by whoever
+removes that: when each of the worker's calls returns, at the release of
+the run's scratch (`_remove_worker_dirs`), and by the collection's exit
+for the integrators it confines; and, like a command's, at the exit of
+the process that made it, unless that process handed it on (the
+collection's guard, which exits before its integrator starts). Its `XDG_CACHE_HOME` stays in its side's
+shared cache (§6 *The stores a view installs from are leerie's*): a cache
+holds no socket, and one per worker removed at each call's end would
+fetch everything again each call. The host-side seam is not confined and
+runs on the operator's host, which leerie keeps out of `/tmp`: its
+`TMPDIR` stays in the run directory.
 
 ### Every confined process has its own `/tmp`, `/dev/shm` and IPC, and sees every other mount read-only
 
@@ -3241,8 +4472,12 @@ and runs anything (`--isolate`):
    `/tmp` as a cache root, failing 1 of funeralworks' 13,036 tests). After
    the pivot `/` is the caller's on both runtimes. This is the shape
    `bwrap` uses;
-3. a fresh `tmpfs` on `/tmp` and on `/dev/shm` (mode 1777, `nosuid`,
-   `nodev`), and a new `devpts` instance; a grant beneath `/tmp` (the
+3. a fresh `tmpfs` on `/tmp`, and a `/dev` of its own: a tmpfs holding
+   only the device nodes leerie grants, bound from the container's, the
+   standard links, a fresh `tmpfs` on `/dev/shm` (mode 1777, `nosuid`,
+   `nodev`) and a new `devpts` instance — never the container's `/dev`,
+   which holds the operator's terminal (*No confined process holds or can
+   open the operator's terminal*); a grant beneath `/tmp` (the
    command's private temp directory `/tmp/l/<id>/`, a host's state root)
    is carried into the new `/tmp` at its own path;
 4. every write grant bound onto itself, then every other mount remounted
@@ -3534,15 +4769,15 @@ It is constructed, not checked, in two halves.
    inside the sandbox, on its `/tmp` and loopback, and dies with it (*No
    database server leerie starts is ever unconfined*).
 2. **Time.** While an evaluation runs, no worker process and no other
-   command leerie runs on the repository's code exists — in the run, and
-   on the host. Every worker holds the execution lock shared for its
-   process's lifetime, as every confined command does, and an evaluation
-   holds it exclusive. What a namespace cannot hide — the evaluation's
+   command leerie runs on the repository's code exists in its run. Every
+   worker holds the run's execution lock shared for its process's
+   lifetime, as every confined command does, and an evaluation holds it
+   exclusive. What a namespace cannot hide — the evaluation's
    `/proc/<pid>/cmdline`, its cgroup's counters, CPU, memory, page-cache
-   and disk contention, a socket a worker holds open — has no observer
-   while it exists.
+   and disk contention, a socket a worker holds open — has no observer in
+   the run while it exists.
 
-**The execution lock.** Two levels, one rule.
+**The execution lock.** One per run.
 - *The run's* is the reader/writer lock the run's `/tmp` used
   (`_ExecLock`, `_exec_lock()`; one per event loop, writer preference, so
   a stream of measurements cannot starve an evaluation). New shared
@@ -3574,25 +4809,72 @@ It is constructed, not checked, in two halves.
   parallelism caps bound a phase's wall time.
 - *Inside an evaluation every concurrency gate is already the holder's.*
   While it holds the lock exclusive nothing else of the run runs a
-  command, and no confined process of any run on the host runs: the BLT
-  semaphore, the host build slot and the confirm lock — which bound how
-  many commands run at once — pass through for the holder instead of
-  waiting. Waiting on one there could wait on a holder that holds it while
-  it waits for the lock shared, which waits on the evaluation. The B*
-  pressure gate still runs inside (a bounded wait on host CPU pressure,
-  holding nothing another holder needs).
-- *The host's* is an `flock` on `exec.lock` in the host-wide directory
-  (`/leerie-host`, next to the build semaphore), taken after the run's:
-  shared by every worker and confined command of every run, exclusive by
-  an evaluation, with writer preference by a second file (`exec.intent`,
-  held exclusive by a waiting evaluation and briefly shared by every
-  shared taker first), since `flock` gives none and the host's workers
-  overlap continuously. Without the host directory (Fly and EC2, one run
-  per machine; a test) the run's lock is the whole lock.
-  *Cost:* an evaluation waits for every worker running on the host, and
-  while it waits no new worker starts on the host. Accepted: the user's
-  rule is "however obscure", and other runs' workers share the host's
-  cgroup tree (`--cgroupns=host`), CPU and memory with it.
+  command: the BLT semaphore, the host build slot and the confirm lock —
+  which bound how many commands run at once — pass through for the holder
+  instead of waiting. Waiting on one there could wait on a command of the
+  run that holds it while it waits for the lock shared, which waits on the
+  evaluation. The host build slot is the exception in one respect: an
+  evaluation takes one once it holds the exclusive, so it is one of the
+  host's builds, and its own commands then pass through the slot it
+  holds. *Designed 2026-11-03 (review round 30, execution):* with the
+  host level gone, evaluations of different runs overlap, and while they
+  skipped the slot the host's load during them was bounded by nothing,
+  though the build semaphore is what bounds contention between runs
+  (*There is no host level*, below). The B* pressure gate still runs
+  inside (a bounded wait on host CPU pressure, holding nothing another
+  holder needs).
+- *The run's execution lock, then a host build slot, everywhere.* A
+  command takes the lock shared and then its slot (`_build_class_slot`);
+  an evaluation takes it exclusive and then its slot
+  (`_held_out_section`). Round 30's order was the reverse, slot then
+  lock, and an evaluation held a host slot while it waited for its run's
+  workers, which hold the lock shared for their whole lives (up to the
+  worker timeout; the worker chooses how long): each queued evaluation of
+  a run held one more slot that nothing ran in, so one run's long workers
+  could hold every slot on the host and stall every other run's builds
+  and tests (review round 31, isolation E1, execution 5). With the lock
+  first, no slot is held while the run's own lock is waited for. It
+  cannot deadlock. A slot holder runs its one command and waits on
+  nothing else: nothing a slot is held around reaches a lock, a
+  semaphore, a second slot or a worker. A command waiting for a slot
+  holds the lock shared, so its run's evaluation waits for it, but it
+  waits only on slot holders. An evaluation waiting for a slot holds the
+  lock exclusive, so no command of its run holds a slot, and it waits
+  only on other runs' holders, which never wait on this run. The BLT
+  semaphore and the confirm lock stay outside the lock, as before. A slot
+  holder takes no second slot (one build, one slot) by the same rule, not
+  by a flag.
+- *A wait for the exclusive is logged at both ends.* An evaluation that
+  must wait logs, before it waits, how many shared holders of the run it
+  waits for and how many of them are workers, and, once it holds the lock,
+  how long it waited. Measured on barnacle with the host level below in
+  place: a run's acceptance sets took 56 minutes to validate with no line
+  in its log while every other run kept working, so the stall could not be
+  told from a hang.
+- *There is no host level.* *Designed 2026-11-03 (the user's decision, on
+  the live 0.43.0 barnacle runs).* An `flock` on `exec.lock` in the
+  host-wide directory, with writer preference through `exec.intent`, used
+  to extend the lock to every worker and confined command of every run on
+  the host. Its cost was a convoy: an evaluation waiting in one run
+  stopped new workers and commands in every run, then waited for every
+  shared holder on the host to drain — 20-minute measurements and
+  30-minute worker sessions of runs that had nothing to do with its sets.
+  It protected nothing I3 needs. I3's threat is a worker gaming its own
+  run's held-out set. Each run is a separate container, with its own PID,
+  mount, IPC and network namespaces, so another run's processes see no
+  `/proc` entry, socket or file of this run's evaluation; and its sets
+  are written fresh at its own start (§8 *Held-out acceptance tests*,
+  *The validity tree is the run's own start*) and never carried forward, so what
+  another run can still observe — the shared cgroup counters
+  (`--cgroupns=host`) and contention — concerns only a set that is
+  worthless to it. The run's lock is therefore the whole lock, on every
+  runtime: local rootless and rootful as on Fly and EC2, where one run
+  owns the machine and the host level was already absent. Host
+  contention between runs is the build semaphore's to bound (§6 *A
+  host-wide build semaphore*), not the execution lock's, and a run's
+  lock holds no host slot while it is waited for: a slot is taken only by
+  a holder of the run's lock (*The run's execution lock, then a host
+  build slot, everywhere*, above).
 
 **What the runtime must allow.** The shim needs a user namespace and the
 mounts above; the container's policy decides both.
@@ -3613,6 +4895,21 @@ mounts above; the container's policy decides both.
   through `colima ssh`): when it is missing or stale the launcher loads it
   itself when it has a terminal (and no `--no-runtime-install`), and
   otherwise stops naming the two commands.
+- *The profile only grows.* The profile is the host's, not a version's:
+  one file under `/etc/apparmor.d/` and one loaded policy, shared by every
+  leerie version on the host, and a reload applies at once to every
+  container already running under it. A container started by an older
+  version keeps its own shim after the operator upgrades and the new
+  launcher reloads the profile, so the profile allows the union of what
+  every version that can still be running needs. A rule is added when a
+  shim starts needing it and is not removed when a shim stops: a removal
+  is a change of its own, with a migration that first ensures no
+  container of a version that needed it can still be running. A rule a
+  broader one also matches is kept by name all the same (0.43.0's
+  `/dev/pts/ptmx -> /dev/ptmx` bind, which the `-> /**` bind rule also
+  matches), so the guard reads rules and does not evaluate policy: a test
+  pins the allow rules of the last release's profile, as a list written
+  out in the test.
 - *The launcher's detection gives the kernel's answer.* Whether the kernel
   runs AppArmor and whether the profile is loaded are read into a variable
   and tested with no pipe. They were pipelines into `grep -q`; under the
@@ -4018,7 +5315,12 @@ so those objects are on disk twice until the run directory goes.
 **I5's grant.** A committing worker's git metadata grant is its tree
 repository, whole (`<run-dir>/tree-repos/<tree>/`, write), and a read grant
 on `<run-dir>/repo/objects/` for the alternates. Nothing else of
-`<run-dir>/repo/` is granted.
+`<run-dir>/repo/` is granted. A worker that only reads a tree (the
+satisfied probe, a judge) is granted its tree repository read, never
+written, beside the run repository every non-committing worker reads: its
+`git status` in the tree it was started in read the tree's `.git` file,
+which names `tree-repos/<tree>/worktrees/<tree>`, and failed with "not a
+git repository" (review round 30, execution).
 
 **Runtimes.** Local rootless and rootful: everything is under the state
 root, made and used by the same identity. Fly and EC2: the same layout under
@@ -4785,6 +6087,21 @@ rootless and rootful containerd. A resume after the reap recreated all four work
 their branch tips with committed work intact and left no stale
 registration.
 
+**A launcher's logs go with the same retention.** Each launch writes its
+whole stream to `<state-root>/logs/leerie-<launcher pid>.log` (the
+`--log-file` default) and, piped, to `<state-root>/.runlog-<launcher
+pid>`; the second is removed when the launcher exits, the first never
+was. Nothing reaped either: measured on the barnacle state root, 926
+logs, 623 MB, back to 2026-08-17. Each is a copy of what the run's own
+`orchestrator.log` holds, so it is reaped like the idle runs' worktrees:
+`preflight` removes those not written for `WORKTREE_REAP_IDLE_DAYS` (a
+live launcher appends to its log whenever its run prints, and its
+`.runlog` whenever the container writes), and `leerie prune` those not
+written within its `--older-than` cutoff whose launcher PID no longer runs
+(the host side can see the PID; the container cannot). A log the operator
+pointed elsewhere with `--log-file` is the operator's and is never
+touched.
+
 ### One task, one run
 
 The flock above makes a *run directory* single-owner. It says nothing about
@@ -4795,7 +6112,7 @@ Measured: one brief ran twice three minutes apart, for $72.21 across 173
 worker calls, and produced two architecturally incompatible branches with
 14 files in collision — two PRs whose merge order decides which design
 survives. Neither run was wrong; nothing told either one the other existed
-(docs/POSTMORTEM-2026-08-14.md, F10).
+(tests/test_duplicate_task_guard.py).
 
 So a run records a fingerprint of its task text (`task_sha256` on
 `run.json`) and, before spawning its first worker, refuses to start when
@@ -5278,9 +6595,11 @@ the record, it cannot. A run that is pushed has its PR written by
 whenever its push choice was made: at finalize when the run is then to be
 pushed, and — because a resume may change the choice after finalize
 (`leerie resume <id> --push` of a finished `--no-push` run is the one way
-to push it) — on a resume of a finished run that continues with a push and
-whose `run.json` holds no `pr_title`, before that resume answers "nothing
-to resume". Binding the worker to finalize alone left such a push with the
+to push it) — on a resume of a finished run that continues with a push,
+that the host has not pushed yet (no `pushed_at`) and whose `run.json`
+holds no `pr_title`, before that resume returns. A run already pushed had
+its PR composed under the choice that pushed it, so a later resume does not
+compose it again. Binding the worker to finalize alone left such a push with the
 fallback body, its PR composed by a choice that was no longer the run's.
 `host_finalize` reads
 `run.json.no_push` unchanged on every runtime: on a remote runtime the
@@ -5316,9 +6635,12 @@ if the override branch isn't the actual fork point.
 
 The PR title and body are written by an LLM worker (`pr_writer`, defaults
 to Sonnet) that runs inside the container right before it exits, where
-`claude -p` and the bind-mounted repo are both available. The worker
-reads the target repo's PR template if one exists (canonical GitHub
-locations, then any `PULL_REQUEST_TEMPLATE/` directory) and fills it out
+`claude -p` and the run's own repository are both available. The worker
+is handed the target repo's PR template if one exists (canonical GitHub
+locations, then any `PULL_REQUEST_TEMPLATE/` directory), read as the blob
+committed at `base_sha` in the run's own repository and never from the
+checkout (*Leerie never reads through a link a repository holds*), and
+fills it out
 faithfully — preserving HTML comments, leaving checklists unticked unless
 the diff demonstrably satisfies them, honoring "delete if N/A" markers;
 absent a template it produces a default structure (Summary / What changed
@@ -5783,8 +7105,9 @@ back up on `resume` once the operator re-authenticates or sets
 
 **The same refresh-vs-static distinction applies to Bedrock auth.** The
 launcher's Bedrock support defaults to AWS SSO/profile auth:
-`detect_bedrock_mode()` reads `CLAUDE_CODE_USE_BEDROCK` out of the merged
-Claude `settings.json` files, then `bedrock_preflight()` requires the host
+`detect_bedrock_mode()` reads `CLAUDE_CODE_USE_BEDROCK` out of the operator's
+merged Claude `settings.json` files (never a tracked one in the checkout, §6
+*A repository chooses no operator authority*), then `bedrock_preflight()` requires the host
 `aws` CLI and a live `aws sts get-caller-identity` before staging `~/.aws/`
 read-only into the container. SSO access tokens are short-lived (~12h) and
 refreshed only by the host's interactive `aws sso login` browser flow — the
@@ -6399,6 +7722,21 @@ killed by hand. Three mechanisms close this gap, defense in depth:
    SIGKILL deliver an uncatchable signal, so the trap never runs in
    exactly the OOM case above — it complements the reaper, not
    substitutes for it.
+   The trap must also run *promptly*. bash runs a trap only between
+   commands, so while `nerdctl run` ran in the foreground a TERM sent to
+   the launcher waited for the whole run: the run finished, and the
+   launcher exited 143 about six minutes later (review round 27 O1). A
+   signal does interrupt the `wait` builtin. So the launcher starts the
+   container client in the background, with its standard input given to
+   it explicitly, and `wait`s for it. INT or TERM then reaches the trap at
+   once. The trap kills the container, waits for the client to exit, and
+   exits 130 or 143. The EXIT trap still brings the run's branch back.
+   The trap signals the client as well as killing the container, and
+   repeats both until the client has exited, for at most 30 s. nerdctl
+   writes the cidfile when it creates the container, before the task
+   starts, and `nerdctl kill` fails on a created container. A trap that
+   signalled the client only while the cidfile was empty therefore left a
+   TERM in that window waiting for the whole run (review round 28 B1).
 3. **Stale-container reaper (recovery).** Before spawning on the local
    `resume` path, the launcher checks for an already-`Up` container for
    this run whose owning launcher PID is dead (via a `leerie.launcher_pid`
@@ -6448,6 +7786,136 @@ mux, so a stuck master can no longer wedge the pipeline. Gated to the
 piped (`-i`, non-TTY-stdout) case; the interactive `-it` path has a real
 pty and thus no hang. The stale-container reaper above remains the
 backstop for the uncatchable SIGKILL case.
+
+**Nothing the launcher starts outlives it or keeps its output open.** A
+reader of the launcher's output (`leerie … | tee`, `$(leerie …)`, a CI
+log capture) gets end-of-file only when every process holding the write
+end has exited. The `$STAGE` keepalive's `sleep 3600` inherited the
+launcher's stdout and stderr. The EXIT trap killed the keepalive's shell,
+but not the `sleep` that shell was running, so the `sleep` held the pipe
+for up to an hour after the launcher had exited (review round 26 M1). So a
+helper the launcher leaves in the background holds none of the
+launcher's stdio, and stopping it stops its children. The keepalive
+`wait`s for its `sleep` and kills it on TERM. It also ends by itself once
+the launcher is gone, which bounds the case where no trap ran (SIGKILL)
+to one interval.
+
+**A staged copy of the credentials lives only as long as its launch.**
+`$STAGE` (`~/.cache/leerie/cfg-<launcher pid>-<random>`) holds copies of
+the Claude credentials, `~/.ssh`, `~/.gnupg` and, on EC2, `~/.aws`. Every
+exit path that runs any code removes it: the EXIT trap, set right after
+the directory is made, which bash also runs on INT, TERM and HUP, and on
+the remote runtimes the teardown's exit pass (*Finalization parity*).
+What no trap survives — SIGKILL, an out-of-memory kill, a host crash —
+is left to the next launch's sweep, which removes every `cfg-*` entry
+whose launch is over: one whose name carries a launcher PID that no
+longer runs, whatever its age; and, for a name with no PID (a launcher
+from before this rule) or a PID reused by a live process, one not
+touched for a day (`-mmin +1440`; a live launch's keepalive touches its
+directory hourly). Every entry type is swept, a regular file or a link
+named `cfg-*` included. Measured on the host of the 0.43.0 barnacle
+runs: 21 `cfg-*` entries, among them a 0-byte regular file from
+2026-08-03 the old sweep (`-type d`) skipped forever, and directories
+from the 2026-11-02 host crash its `-mtime +1` (more than 48 h, not the
+day it documented) had not reached yet.
+
+**A repository image's build directory lives only as long as its launch.**
+`.image-build/b.<launcher pid>.<random>` under the state root holds the
+exported context and, between a repository image's two builds, the first
+build's image as an OCI layout of about 1 GB. Every exit path that runs
+any code removes it. The launcher sets an EXIT trap before it makes the
+first build directory, and every EXIT trap it sets later removes the
+directory too. bash runs the EXIT trap on TERM and HUP as well, at once. A
+TERM trap would run only after the foreground build finished: measured,
+it ran 7 s after the TERM, at the end of an 8 s command, where the EXIT
+trap ran at once. What no trap survives (SIGKILL, an out-of-memory kill,
+a host crash) is left to the next launch's sweep (`_sweep_stale_builds`),
+the same rule as the credentials' stage. The sweep removes every `b.*`
+whose name carries a launcher PID that no longer runs, whatever its age.
+It also removes one untouched for a day: a name with no PID (a launcher
+from before this rule) or a PID a live process reuses.
+
+No build of a repository image outlives the launch that started it. Each
+build, local or through `build-push.sh`, runs as a background job in a
+process group of its own (`_build_job`), which the launcher waits on.
+Removing the directory (`_repo_build_done`) first kills that group and
+waits for it, so no build is left to write the directory again once it is
+gone. Ctrl-C at the terminal signals the launcher's group, not the
+build's, and the EXIT trap then ends the build's. The group is there only
+to be killed whole: it holds nerdctl's own children too (the `buildctl`
+that writes the export, a credential helper), which no list of the
+pipeline's PIDs names, and the launcher's own group cannot be killed
+instead, since it holds whatever else the operator's shell put in it
+(`leerie … | tee log`). It is never the terminal's foreground group, so
+the launcher states the signal handling that follows from that, instead
+of leaving it to the shell:
+- The job ignores SIGTTOU and SIGTTIN, and the commands it runs inherit
+  that. With `stty tostop` the kernel stops a background group that
+  writes to its terminal; the relay's first line of build output would
+  stop the whole build, and the launcher would wait for it forever. With
+  SIGTTOU ignored the write goes through; with SIGTTIN ignored a read of
+  the terminal fails instead of stopping the job (its stdin is
+  `/dev/null`, so only a program that opens the terminal itself reads it).
+- While the launcher waits for the job, SIGINT, SIGTERM and SIGHUP are
+  each cleaned up in the signal's own handler, not by the EXIT trap: the
+  handler removes the build directory and ends the build's group
+  (`_repo_build_done`), then the signal is re-raised with its default
+  handling, so the launcher dies of it (`_build_job_die`). Left to the
+  EXIT trap, a terminal that goes away (a closed window, a dropped ssh
+  session) delivers two SIGHUPs about a millisecond apart, one forwarded
+  by the operator's shell and one from the kernel's hangup, and bash 5
+  died of the second before its EXIT trap ran, in 4 of 6 hangups of the
+  real launcher; the build, in a group neither SIGHUP reaches, ran on,
+  reparented to init. Re-raising alone (`trap - INT; kill -INT $$`) lost
+  the same race for two SIGINTs (11 of 20 at 0.5 ms). And left to the
+  shell, bash 3.2, macOS's `/bin/bash`, exits 129 on SIGINT, which a
+  calling script reads as a normal exit. The earlier traps for these
+  signals are put back when the job ends.
+- A SIGTSTP (^Z) reaches only the launcher's group, so its handler stops
+  the build's group and then the launcher by the same signal
+  (`_build_job_stop`); once the launcher is continued (`fg`, `bg`), its
+  wait continues the build. Left to the shell, the launcher stopped and
+  the build ran on, writing over the operator's prompt, under `tostop`
+  too. The handler is set after `set +m`, which replaces it; bash 3.2
+  stops only after the handler returns, so the build is continued from
+  the wait, not from the handler. A trapped signal ends `wait` early, so
+  the launcher waits again while the job runs.
+
+Leerie's local base build is not one (on Fly it goes through
+`build-push.sh`, so it is): it reads only leerie's own directory and
+writes only the image store, and it runs before any build directory
+exists, so a base build that outlives its launch leaves no file behind and
+finishes the build the next launch would run.
+*Designed 2026-11-03 (review round 34, execution R34E-1).* A SIGTERM or
+SIGHUP 3 s after the first build finished left 931 MB each, and nothing
+removed it. Ctrl-C was cleaned up only because nerdctl turns it into a
+failed build. *Revised 2026-11-03 (review round 35, execution R35E-2;
+claims R1).* A SIGTERM to the launcher's PID alone removed the directory,
+but the build pipeline kept running, reparented to init, and its export
+wrote the directory again (44 MB of a layout 60 s later, measured), left
+for the next launch's sweep. The local run's EXIT trap, set after the
+directory is removed, did not call `_repo_build_done`; it had nothing to
+remove, but now it does call it, so the rule holds for every EXIT trap
+rather than for those set while a build directory can exist.
+*Revised 2026-11-03 (review round 36, execution X1, X2).* The job's own
+group, added in round 35, made every build hang on a terminal with
+`stty tostop`: the build and its relay stopped at their first write, the
+launcher printed nothing more and waited with no end (measured on real
+BuildKit and on a job of the launcher's text without it; the foreground
+pipeline before it finished). And on bash 3.2 a Ctrl-C during a build
+exited 129 instead of dying of SIGINT. Considered instead: no group of its
+own, the build a job in the launcher's group with its pipeline's PIDs
+recorded. It has no `tostop` case, but the recorded PIDs do not include
+nerdctl's child `buildctl`, which writes the export, so killing them
+would leave the export running (from the process tree, not measured),
+which is what round 35's group was made to stop; reaching it would take a
+walk of the process tree, a case of its own.
+*Revised 2026-11-03 (review round 37, execution E1, E2).* This section
+said SIGTERM and SIGHUP needed nothing, measured with one SIGHUP to the
+launcher's PID; a terminal's hangup sends two, and the second killed bash
+5 before its EXIT trap (above). And with the build in a group of its own,
+^Z stopped the launcher alone, where the foreground build on main had
+stopped with it.
 
 **Worker subtree termination — Memory containment via cgroup v2.** The
 kernel reap above handles *process lifecycle*, not memory: when a worker's
@@ -6604,7 +8072,8 @@ F4/P4 arm D). The same six builds through a flock semaphore finished 6 of
 6 in 562 s (arm S). So the commands that are themselves build or test
 runs — the orchestrator's own BLT measurements and B\* reruns, and a
 settle-by-execution command that is the repo's build or test command —
-take a slot first: `⌊(MemAvailable − 4 GiB) / peak⌋` slots, sized when the
+take a slot, once they hold their run's execution lock (§6 *The run's
+execution lock, then a host build slot, everywhere*): `⌊(MemAvailable − 4 GiB) / peak⌋` slots, sized when the
 peak is measured and never fewer than one, so a build too large for the
 host still runs alone rather than deadlocking. Before a peak is known the
 measured-constant build peak sizes it. The slots are lock files in a host
@@ -6616,7 +8085,12 @@ follows the runtime rule (§6 *Rootless exception*): rootless sees the
 host user's directory as its own (outer UID 0 → inner leerie), rootful's
 entry guard `chown`s it to leerie, and the slot files are opened
 read-only (`flock` needs no write access), so a slot another identity
-created still locks. Where no such mount exists (Fly, EC2 — one run per
+created still locks. For the same reason no confined process reads the
+host directory: Landlock does not handle `flock`, so a worker or a command
+of one run that could open a slot file held every slot from under the
+other runs (review round 30 isolation B1). It is left out of every grant
+as the state root is (`_reads_outside`, `_apart`); nothing confined needs
+it, since only the orchestrator takes a slot. Where no such mount exists (Fly, EC2 — one run per
 machine) the slots live under the state root, which is host-wide there.
 
 **At the measured ceiling, a resource kill is an environment limit.** Once
@@ -7570,7 +9044,8 @@ failed sync leaves the instance running; `flyctl` is never invoked for
 an EC2 run.
 
 When no sidecar exists, `stop`/`kill` probe for a live local nerdctl
-container via `_is_local_container` (`nerdctl inspect <run-id>`).
+container via `_is_local_container` (`nerdctl inspect <run-id>`, in
+`leerie` and then, for a run an earlier leerie launched, `default`).
 `stop` uses `nerdctl stop` (SIGTERM → grace → SIGKILL, letting the
 signal handler save state) or `aws ec2 stop-instances`; `kill` uses
 `nerdctl kill` (immediate SIGKILL) or `aws ec2 terminate-instances`
@@ -8614,38 +10089,118 @@ System packages requiring root (C libraries for native gems, fonts,
 specialized tooling) cannot be installed by `.leerie-setup.sh` — that
 hook runs as the unprivileged `leerie` user. A repo that needs such
 packages commits `.leerie/Dockerfile` that extends the base image with
-`ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds a derived
-image tagged `leerie-repo/<repo-id>:<version>` (where `<repo-id>` is
-derived from the git remote URL, sanitized to tag chars) and uses it for
-all subsequent `nerdctl run` invocations. When no `.leerie/Dockerfile`
-exists but `.leerie/config.toml` declares `setup_packages`, the launcher
+`ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds an image
+tagged `leerie-repo/<repo-id>-<checkout-id>:<version>` (where `<repo-id>`
+is derived from the git remote URL, sanitized to tag chars, and
+`<checkout-id>` from the checkout's path), in leerie's containerd namespace
+`leerie` (§6 *No build consumes what another build left in BuildKit*), and
+uses it for all subsequent `nerdctl run` invocations. When no
+`.leerie/Dockerfile` exists
+but `.leerie/config.toml` declares `setup_packages`, the launcher
 auto-generates an apt-install Dockerfile and proceeds through the same
 build path. A committed Dockerfile always takes precedence — `setup_packages`
 is ignored when both are present.
 
-Rebuild is triggered by any of: the derived image is absent, the sha256
-of the Dockerfile changed (stored as `<base_version>:<sha256>` at
-`$LEERIE_STATE_HOST_DIR/.dockerfile-hash`), or the base version changed.
-A second run with an unchanged Dockerfile skips the build entirely.
+The repository's Dockerfile builds only the *worker stage*: its result is
+copied whole to `/opt/leerie-worker-root` in an image whose own root is
+leerie's base, and it is only ever the root of a confined process (§6 *The
+orchestrator's root is leerie's; a repository's root is only a confined
+process's*). The build context is the committed tree at `HEAD`, never the
+checkout directory.
 
-The `nerdctl run` image argument uses `${REPO_IMAGE_TAG:-$IMAGE_TAG}`,
-so the base image is used transparently when no repo Dockerfile is
-present.
+**An image is reused only when it is the one built for this checkout.**
+A repository image's root is the root of every command its checkout's
+workers run, so an image another checkout built must never be run for
+this one. `<repo-id>` alone does not tell checkouts apart: origin's
+`owner/repo` tail is the same for `github.com/alice/app` and
+`evil.example/alice/app`, and the basename fallback is the same for any
+two directories of one name. Before review round 29 (isolation F2) the
+name was `leerie-repo/<repo-id>:<version>` and reuse was decided by a hash
+file in each checkout's own state directory and by the tag's presence, so
+when a second checkout with a colliding id built and retagged the shared
+name, the first checkout's next launch found its own hash unchanged and ran
+the other checkout's image. The name now carries the checkout, the hash
+file records the digest of the image this checkout built, and the image is
+reused only when its tag still names that digest. The container runs the
+digest, not the tag, so a tag moved between the check and the run changes
+nothing.
+
+Rebuild is triggered by any of: the image is absent, the sha256 of the
+Dockerfile changed, what it reads from the committed tree changed (the
+build context's digest, §6 *A repository image is the one built from what
+it reads*), the base image changed, leerie's version or the image's
+layout (`REPO_IMAGE_LAYOUT`) changed — stored as
+`<version>:<layout>:<base image id>:<sha256>:<context sha256>` at
+`$LEERIE_STATE_HOST_DIR/.dockerfile-hash`, followed by the digest of the
+image built — or the tag names an image other than that digest. A second
+run with an unchanged Dockerfile and unchanged inputs skips the build
+entirely.
+
+The `nerdctl run` image argument uses `${REPO_IMAGE_REF:-$IMAGE_TAG}`
+(`REPO_IMAGE_REF` is the recorded digest), so the base image is used
+transparently when no repo Dockerfile is present.
 
 **Fly runtime variant.** On `--runtime fly` the same `.leerie/Dockerfile`
 triggers a derived image at `registry.fly.io/$APP:$VERSION-$HASH` where
-`$HASH` is the first 12 hex characters of the Dockerfile's sha256. Before
+`$HASH` is the first 12 hex characters of the sha256 of the Dockerfile's
+sha256 and the build context's (`<df>:<context>`). Before
 `resolve_fly_image_tag()` is called, `_set_fly_per_repo_image()` detects the
 Dockerfile, computes the hash, and sets `LEERIE_FLY_IMAGE` to the per-repo
 tag — the existing override hook in `resolve_fly_image_tag()` picks it up
 transparently. `ensure_image()` then first guarantees the base image is
 published (checking `published-tags.txt`; building and pushing if absent),
-then calls `build-push.sh --dockerfile $USER_REPO/.leerie/Dockerfile
---build-arg BASE_IMAGE=$base_tag --tag $per_repo_tag` to build and push
-the derived image. Both the base tag and the per-repo tag are recorded in
-`published-tags.txt` so subsequent runs skip the build entirely. Without
-`.leerie/Dockerfile` the Fly path is unchanged — the base tag resolves and
-`ensure_image` proceeds as before.
+then builds and pushes the repository image with `build-push.sh` in the
+two builds of §6 *One image, two roots*: the repository's Dockerfile as
+committed (`--dockerfile`), what it reads of the committed tree as the
+context (`--context`), `BASE_IMAGE` the base's digest, `--tag
+$per_repo_tag-repo`; then leerie's Dockerfile, `FROM` the base's digest
+and the repository image's, `--tag $per_repo_tag`.
+Without `.leerie/Dockerfile` the Fly path is unchanged — the base tag
+resolves and `ensure_image` proceeds as before.
+
+**On Fly, an image is pushed under exactly the tag asked for, and a
+machine starts from the digest leerie pushed.** Before review round 29
+(isolation F1), `build-push.sh`'s remote-builder path ignored `--tag` and
+pushed every image as `registry.fly.io/$APP:$VERSION` (`flyctl deploy
+--image-label $VERSION`). A repository image was pushed over the base tag,
+and the tag it was meant to have was never pushed, so per-repo Fly runs
+failed at machine creation; meanwhile the base tag, already recorded in
+`published-tags.txt`, now named that repository's image, so every later
+Fly run of a repository with no image of its own ran its workers in that
+repository's worker root, and every later repository image was built
+`FROM` it, whose `COPY` merges into the earlier worker root rather than
+replacing it. Four rules close it:
+
+1. `build-push.sh` pushes exactly the tag it is given: the remote
+   builder's label is the tag's own, and a tag the remote builder cannot
+   push (outside `registry.fly.io/$APP`) is refused.
+2. `published-tags.txt` records the digest the registry holds under each
+   tag leerie pushed (`--digest-file`), and a machine starts from
+   `registry.fly.io/$APP@<digest>`, never from a tag, so a tag something
+   else overwrote since is never run. A line that records no digest is
+   not a hit.
+3. A repository image is built `FROM` the base's digest, and is reused only
+   while the base digest it was built on is the one recorded now and its
+   layout (`REPO_IMAGE_LAYOUT`) is the current one (review round 29,
+   execution L2: the cache ignored the layout, so an image in the layout
+   before the worker root was reused, and the orchestrator ran in a root
+   the repository shaped).
+4. Before a pushed repository image is recorded, the registry's copy is
+   checked to be the base's layers plus exactly one, with the base's
+   configuration (`--layout-base`, `scripts/remote/registry_image.py`): the
+   rule `_check_repo_image` applies locally, labels aside (a builder may add
+   its own; a label runs nothing).
+
+5. The orchestrator stops a run the launcher started on a repository
+   image (`LEERIE_REPO_IMAGE=1`, set locally and on Fly) whose image has no
+   worker root, before any command runs: whatever reuse rule fails, the
+   repository's commands never run in leerie's root, nor leerie's in the
+   repository's.
+
+The digest is read from the registry after the push, since Fly's remote
+builder reports none; a push of the same tag by someone else between the
+two is recorded instead, and for a repository image the layout check
+still holds of what was recorded.
 
 ### Auto-capture of repo dependencies
 
@@ -8676,8 +10231,9 @@ manifest files (with commands as a hint) is what delivers the "across all
 languages and frameworks" goal. Which files and commands the worker sees is
 deterministic corpus selection in code; the model still decides content (§12
 *Prompts are advisory, code enforces*). Structured output (`setup_packages`
-and `language_installs`) is validated against a JSON schema and written to
-`.leerie/config.toml` deterministically, by the host (*The host applies a
+and `language_installs`) is validated against a JSON schema and in code,
+recorded in the run directory, and written to `.leerie/config.toml`
+deterministically when the operator applies it (*The operator applies a
 capture* below). The `dep_capture` worker defaults to
 `sonnet`/`medium`, overridable via `LEERIE_MODEL_DEP_CAPTURE`.
 
@@ -8694,13 +10250,34 @@ install-intent loop stops.
 `bake_language_deps`, default true).** `dep_capture`'s `language_installs`
 output (per-manager `{manager, command, copy_inputs}` entries) is written to
 `.leerie/config.toml`, keyed by manager, never-clobber. When enabled, the
-auto-generated `.leerie/Dockerfile` (and the derived image, when
+auto-generated `.leerie/Dockerfile` (and the repository image, when
 `build_repo_image` builds it) also includes a language-dep layer: `COPY` for
 the lockfile, manifest files, and any ancillary inputs the package manager
-requires, followed by `RUN <command>` (`pnpm install --frozen-lockfile`,
-`pip install -r requirements.txt`, etc.). Workers that inherit this image find
+requires, followed by `RUN <command>`, where the command is leerie's own
+for that manager (`pnpm install --frozen-lockfile`, `pip install -r
+requirements.txt`, etc.; *A capture names packages and managers, never
+commands* below). Workers that inherit this image find
 `node_modules`/site-packages already populated — per-worker install drops to
 near-zero.
+The generated file's own build is its only test: when it fails, the launch
+builds the file again without the language-dep layer (apt only;
+`bake_language_deps=false` for that launch) and records that image under
+the key of the file it generated. The next launch generates the same file
+and reuses the image, so a layer that cannot build costs one failed build,
+not one per launch; a change to any input the key holds tries the layer
+again, and so does removing `.dockerfile-hash` from the state root. The
+record marks such an image as the apt-only one, and every launch that
+reuses it says so, naming that file: the checkout's generated
+`.leerie/Dockerfile` again shows the language-dep layer, so nothing else
+tells the operator that the image running lacks it, or that a failure that
+was only a registry outage is still being reused. *Revised 2026-11-03
+(review round 36, execution X3).* The warning said the apt-only bake was
+"for this run", and later launches reused the image without a word.
+Considered instead: never recording the apt-only image under the
+generated file's key, so every launch tries the layer again. That makes a
+transient failure heal itself, but it puts back what this paragraph rules
+out, a full failing build on every launch for a layer that cannot build;
+the record stays, and is no longer silent.
 
 **Rebuild tradeoff.** A dependency-input change triggers a full image rebuild
 (`build_repo_image` fires when the hash mismatches). To keep rebuilds narrow,
@@ -8731,8 +10308,9 @@ differs, the decision-maker does not:
   over them automatically, recording each capture in the current run's
   directory; and *on-demand `--recapture`* — `leerie config
   --recapture` resolves the target run, constructs and flocks its `State`
-  (refusing to race a live orchestrator via `StateLockedError`), and runs the
-  worker via `asyncio.run`.
+  (refusing to race a live orchestrator via `StateLockedError`), runs the
+  worker via `asyncio.run` and records the capture in that run's directory,
+  for `config --apply-capture`.
 
 **Union by default; replace only on `--recapture --force`.** Every automatic
 seam — finalize, cancel, backstop — writes as a never-clobber *union*, so
@@ -8744,33 +10322,65 @@ no longer captured) — an explicit "rebuild the dep set from current history"
 gesture. Even under `--force`, an empty capture leaves the existing config
 untouched, so a bad run can never blank a good config.
 
-**The host applies a capture.** The container never writes the user's
+**A capture names packages and managers, never commands.** The capture is
+an LLM worker's answer over the commands a run's workers ran, and those
+workers are hostile by assumption, so nothing in it reaches a `RUN` line
+as text (review round 28, isolation E2: a `setup_packages` item `&&` was
+word-split into the apt `RUN` line as shell, and an unknown manager's
+`command` was emitted verbatim as `RUN <command>`). Checked mechanically,
+three times, and refused rather than trimmed: in the schema (a
+`setup_packages` item matches the Debian package-name pattern
+`DEBIAN_PACKAGE_PATTERN`; a `manager` is a plain word; a `copy_inputs`
+path a plain relative one), in code before a capture is recorded or
+applied (`_capture_problems`: every item, every manager one of
+`BAKE_INSTALL_COMMANDS`, every input a relative path without `..`), and by
+the launcher before it writes a Dockerfile line (the same package pattern
+per word; the generator's own `_INSTALL_COMMANDS` table, which a test
+keeps equal to `BAKE_INSTALL_COMMANDS`). A recorded entry is
+`{manager, command, copy_inputs}` with the command taken from leerie's
+table; the generator reads only the manager and the inputs, never a
+`command` field, so a hand-edited or committed `language_installs` names
+which bake runs, not what it runs. A manager outside the table is dropped
+by `_filter_residual_deps`, which used to keep it verbatim.
+
+**The operator applies a capture.** The container never writes the user's
 checkout (§6 *The explicit channel*; locally it is mounted read-only), so a
 capture inside the container is recorded, not written:
-`capture_repo_deps(..., record_in=<the current run's directory>)` appends
+`capture_repo_deps(..., record_in=<the run's directory>)` appends
 `{setup_packages, language_installs, replace, from_run}` to
-`<run-dir>/captured-deps.json`. The host applies the file to
-`$USER_REPO/.leerie/config.toml` with the same union (or replace) merge,
-against the file as it is at that moment, then renames it
-`captured-deps.applied.json`, so a second apply is a no-op:
-- locally, in the launcher's EXIT trap, for the run that container ran,
-  whatever the exit (as the bring-back);
-- on Fly/EC2, in `fetch_branch`, from the run directory it streamed back.
+`<run-dir>/captured-deps.json`. Only the operator's `leerie config
+--apply-capture <run-id>` writes it into `$USER_REPO/.leerie/config.toml`
+(`host_apply_captured_deps` → `apply_captured_deps`), with the same union
+(or replace) merge, against the file as it is at that moment, logging the
+change as a diff; the file is then renamed `captured-deps.applied.json`, so
+a second apply is a no-op. A file `_capture_problems` refuses is kept and
+nothing is written. So is one whose merge would keep a value the config
+already holds that is not a capture leerie bakes: a merge is a union, so
+the merged value is valid only when the existing one is (review round 29,
+execution L4: barnacle's `setup_packages` held key names an older
+auto-apply wrote, and an apply extended it).
 
-The merge reads the host's config at apply time, so a key the user edited
-during the run is merged with, never overwritten by, a value read before.
-`leerie config --recapture` runs on the host and writes directly.
+The host used to apply it by itself — from the launcher's EXIT trap
+locally, from `fetch_branch` on Fly and EC2 — because the capture was
+meant to warm the next run's image without a step the operator might
+forget. That made a run choose what the next run's image runs, with no
+one reading it in between: the capture is the next build's input. With the
+image split (§6 *The orchestrator's root is leerie's*) a build reaches
+only a confined root, and the checks above bound what a capture can say;
+the explicit apply keeps the operator the one who changes their own
+configuration. At the end of a run that recorded one, the launcher (and
+`fetch_branch`) names the run and the command. `leerie config
+--recapture` records into the run it recaptured, the same way.
 
-**Idempotency.** After the capture is recorded (or, on the host, written),
+**Idempotency.** After the capture is recorded,
 `capture_repo_deps` writes a lightweight `<run_dir>/dep_capture.done`
 sentinel and sets `dep_capture_done = True` in `state.json`. The run-start
 backstop skips any run whose sentinel is already present. When the union
 merge finds nothing new, `.leerie/config.toml` is not touched.
 
-**No auto-commit.** Capture writes `.leerie/config.toml` (and, if generated,
-`.leerie/Dockerfile`) as uncommitted files. Leerie logs one line: *"captured N
-package(s)/install command — run `git add .leerie/ && git commit` to bake
-into the next run's image."* The user controls when to commit — this
+**No auto-commit.** An applied capture leaves `.leerie/config.toml` (and, if
+generated, `.leerie/Dockerfile`) as uncommitted files, and the operator
+commits them when they choose. The user controls when to commit — this
 preserves the committed-Dockerfile authority rule: a hand-authored
 `.leerie/Dockerfile` is never surprised by an auto-commit.
 
@@ -8795,13 +10405,13 @@ image* above).
 `--runtime fly` the workflow splits across two directions:
 - **Machine → host (stream-back).** The run-state tar brings
   `captured-deps.json` home with the run directory, and `fetch-branch.sh`
-  applies it as the local launcher does. It then best-effort streams
-  `/work/.leerie/Dockerfile` from the Fly Machine back to `$USER_REPO/.leerie/`
-  (or `$LEERIE_STATE_HOST_DIR`), existence-guarded on the remote side and
-  never clobbering a host-edited file; failure is non-fatal and doesn't
-  affect `fetch_branch`'s return code. This fires only on a clean finish (same condition gate that
-  runs `fetch_branch` at all — rc `0|10|11|75`). Cancel/kill recovery uses the
-  host-side `--recapture` / next-run backstop instead.
+  names the run and `leerie config --apply-capture <run-id>`, as the local
+  launcher does. Nothing the machine wrote under `/work/.leerie/` comes
+  back: the machine's `Dockerfile` used to be streamed to the host's
+  `.leerie/` when none was there, which made a machine-written file the
+  next run's build input. This fires only on a clean finish (same condition
+  gate that runs `fetch_branch` at all — rc `0|10|11|75`). Cancel/kill
+  recovery uses the host-side `--recapture` / next-run backstop instead.
 - **Host → machine (seed-repo whitelist).** Pre-existing committed `.leerie/`
   files (including a previously streamed-back and committed `config.toml` or
   `Dockerfile`) are included in `seed-repo.sh`'s dirty-delta filter so they
@@ -9006,27 +10616,21 @@ reads that file at every spawn of the call — a call that can last a
 nothing guarantees: anything that clears /tmp under a live run (a host
 cleanup, a lost overlay) took every in-flight worker's file with it, and 5
 runs died at their next spawn. It now lives under `<run-dir>/sysprompt/`,
-the state the run already depends on, deleted when its call ends. Another
-worker's instructions are not input to this one, so no worker may read
-there. How that holds depends on the worker:
-
-- **Acting workers** run with the boundary erased (§12 L1), so they get a
-  `Read` deny rule on the directory.
-- **Judgment workers** hold no blanket `Read`/`Grep`/`Glob` grant. The CLI
-  allows those tools inside the working directories and refuses them
-  outside, as it already refuses every allowlisted shell read outside. The
-  run directory lies outside every judgment cwd, so it is unreadable to
-  them with no rule at all.
-
-They must not carry the deny rule as well. While any `Read()` deny is
-configured, the CLI refuses a compound `cd <dir>; <read> <relative path>`
-whenever it cannot resolve the paths statically, and a grep pattern or a
-`--include=*.ts` is enough to prevent that. When this branch first gave
-every worker the deny, that refusal hit a satisfied-probe, a delivery
-judge and the PR reviewer in one smoke run, each in its own tree. Code
-decides by the worker's actual grant: any worker that is autonomous, or
-holds a bare `Read`, `Grep` or `Glob`, gets the deny. The system temp dir
-remains the fallback only when the run directory cannot hold the file.
+the state the run already depends on, deleted when its call ends. Every
+worker's CLI reads its own file there, so the directory is in every
+worker's read grant (I5). What it holds is no secret from any worker:
+each file is a shipped prompt (`prompts/*.md`, through `_load_prompt`),
+and leerie's own code, `prompts/` included, is in every worker's read
+grant too. So no rule hides it. A CLI `Read` deny on it used to, for
+acting workers and any worker holding a bare `Read`, `Grep` or `Glob`;
+it hid nothing a worker could not read one directory over, and it cost
+turns: while any `Read()` deny is configured, the CLI refuses a compound
+`cd <dir>; <read> <relative path>` whenever it cannot resolve the paths
+statically, and a grep pattern or a `--include=*.ts` is enough to
+prevent that. On the seven live 0.43.0 barnacle runs the refusal naming
+this directory appears on 39 log lines (streams and transcripts
+overlap, so lines, not refusals). The system temp dir remains the
+fallback only when the run directory cannot hold the file.
 
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a
@@ -10497,6 +12101,24 @@ the key does not name leaves no stale install either: the install runs
 again on the new tip and reads it, over its own earlier output — the package
 manager's incremental install, which is the residual difference from a fresh
 view.
+
+*A view lives no longer than its tree.* *Designed 2026-11-03 (the live
+0.43.0 barnacle runs).* A view was replaced or moved only when its tree's
+tip moved, so nothing removed it when its tree went: a subtask's tree is
+pruned once its branch is integrated, and reset before a retry, and its
+view — a full checkout with a copied install, about 650 MB on barnacle
+(603 MB of it `node_modules`, link count 1 by design: *A view's install
+never writes leerie's store*) — stayed until the run ended. Counted on the
+seven live runs: 43 views (37 of subtask trees, 6 of staging), about 27 GB
+of the runs' 40 GB by `du`; one run held 9 subtask views beside 2
+remaining subtask trees. And the in-process record of views
+does not survive a resume, so a view made before one was reachable by
+nothing for the rest of the run. Now the view of a tree, and the tree's
+view stores, are removed wherever the tree is: when a subtask's tree is
+pruned after integration (only once its branch is taken, as the tree
+itself) and when it is reset for a retry (`_drop_view`). The view's path is
+derived from the tree's name, never from the process's record, so a view a
+process before a resume made goes the same way.
 
 Measured with the confined install, copy import, the store fetch and the
 stores emptied on a move (review round 19), a new tip with unchanged install
@@ -12685,17 +14307,24 @@ is not an integration test — the skip is typed (`no_scoped_runner`, with
 the command) and logged as a warning, never silent.
 
 **Hidden from the fixers.** The sets live under the run's state root,
-and implementers and conformers carry `Read` denies on that directory
-and on every run-directory file that records them — the evaluation
-worktree, the logs (the writers' transcripts carry the test source), the
-orchestrator log, the captured-call log and the run state (case names
-and paths) — and on the CLI's own session transcripts; the fixers read
-nothing else there but their subtask specs, criteria and checkpoints.
-It is the same deny mechanism that keeps acting workers out of the
-user's checkout, and evaluation output is never echoed. Nothing of a set
-reaches staging at all (above). A shell `cat` is not covered by a `Read`
-deny; hiding is a best-effort reduction of the special-casing incentive,
-not a guarantee.
+and no fixer's grant (I5, §6 *A worker writes only where it is granted*)
+names that directory or any run-directory file that records them — the
+evaluation worktree, the logs (the writers' transcripts carry the test
+source), the orchestrator log, the captured-call log, the run state (case
+names and paths) and every other worker's configuration (its session
+transcripts). The fixers — implementer, conformer, the surrogate
+witness's fixer and the falsifier — read nothing of the state root but
+their own directories, their subtask specs, criteria and checkpoints, and
+the kernel refuses the rest to the Read tool and a shell `cat` alike.
+Their own configuration holds only their own sessions, and the home
+directory's `~/.claude/projects` holds none: every CLI leerie starts in
+the container is given its own configuration directory. Evaluation output
+is never echoed, and nothing of a set reaches staging at all (above).
+The CLI `Read` denies that hid these paths before Landlock covered them
+are gone: they added nothing the grant does not refuse, and any `Read()`
+deny makes the CLI refuse ordinary `cd <dir>; grep …` compounds — the
+refusal naming `acceptance/` appears on 45 log lines of the seven live
+0.43.0 barnacle runs.
 
 ### Mechanical-feedback loops (the CRITIC pattern)
 
@@ -13075,10 +14704,27 @@ Two further disciplines sit at the §12 axis:
      not run") is kind `process_note` and never enters the register: the
      orchestrator runs its own checks. (Bench Q7/G v5: of the 9 frozen
      late-chain subtasks, 8 of 9 first emissions carried only a
-     process note.) The `exercised: false` tier is typed
-     `unverified_external` — the worker could not exercise the path here.
-  2. **Routed by type, never dumped.** `gap: unverified_external` reaches
-     the PR's "Needs human verification" list (§6 *Finalization*);
+     process note.) **Only an entry naming an external resource is
+     external.** "Needs human verification" is for a check no step inside
+     the container can make: a live service, a real browser session, a
+     cloud account, a device — named, so the reviewer knows what to bring.
+     The `exercised: false` tier is typed `unverified_external` only when
+     the worker names that resource in `production_evidence`'s
+     `unexercisable_resource` (on the implementer and conformer schemas
+     both; the conformer's room for it came from giving its three
+     build/lint/test axes one `$defs` shape instead of three copies).
+     Otherwise it is `test_missing`: the worker did not run the path, which
+     is the gap the changed-line coverage measurement below settles or
+     re-drives. A self-reported `unverified_external` entry with no
+     `resource` is re-typed `test_missing` on the same rule, and the PR
+     renders no external entry without a resource (one an older leerie
+     stored that way included). Measured on the seven live 0.43.0 barnacle
+     runs: of 39 unaddressed external entries, 36 named no resource, every
+     one of them an `exercised: false` note — "docs-only change", "Diff is
+     a test only", "I only ran the two changed test files" — and 3 did.
+  2. **Routed by type, never dumped.** `gap: unverified_external` with its
+     `resource` reaches the PR's "Needs human verification" list, grouped
+     by that resource (§6 *Finalization*);
      `test_missing` / `test_weak` feed the coverage re-drive below (*Changed
      lines no test executes are re-driven*); `none` and every entry the
      conformer cleared stay in `state.json` only. The PR section is code's,
@@ -13354,7 +15000,7 @@ every later measurement can hit the same condition, and the loop predicate
 must treat it as unresolved rather than silently clean: reading an
 unmeasured axis as clean is how a run once shipped a PR whose test axis
 never ran at all, its unmeasurability swallowed by the same `red_axes`
-exclusion meant for the baseline (docs/POSTMORTEM-2026-08-14.md, F6). This
+exclusion meant for the baseline (tests/test_axis_unmeasurable.py). This
 is rare by construction, so treating it as unresolved costs almost nothing.
 
 The baseline was already handed to the *worker* as prose in a `BASELINE:`
@@ -13446,7 +15092,8 @@ subtask, backed by an expensive oracle run twice.
 **Not every runner can map source to tests, and the ones that cannot need
 the file list filtered.** `vitest related` and `jest --findRelatedTests`
 take *source* files and resolve their tests through the runner's own module
-graph, so `{files}` can be handed to them whole. pytest has no such
+graph, so `{files}` can be handed to them — its module sources, below.
+pytest has no such
 mechanism — it takes paths and collects what is under them, so a source or
 docs path is not merely uninformative, it is an error: `pytest
 orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4, and mixing
@@ -13454,6 +15101,51 @@ one bad path with a good one still exits 4 — one non-test path poisons an
 otherwise-valid invocation. Since a real subtask diff almost always mixes
 source and docs with its tests, a `{files}` template on such a repo reports
 RED on nearly every subtask.
+
+**An impact-analysis runner is handed only its own module sources.**
+*Designed 2026-11-03 (the live 0.43.0 barnacle runs).* Handing `{files}`
+over whole rested on a premise that is false: that a non-source operand
+is inert to `related`. Two kinds are not. vitest's `forceRerunTriggers`
+default to `**/package.json/**` and `**/{vitest,vite}.config.*/**`, and
+`related` honours them — an operand matching one makes it return every
+test file (vitest 4.1.11, `filterTestsBySource`). Measured on barnacle: a
+subtask whose diff changed only `.github/workflows/*.yml`, `.nvmrc`,
+`Dockerfile` and `package.json` rendered `npx vitest related --run
+<those> --passWithNoTests`, which ran all 1,299 test files in 4,716 s —
+the whole suite the task forbade, on a diff no test imports. So for a
+runner with impact analysis (vitest, jest; the template read as one, as
+`_derive_test_files_scoped` reads it) `{files}` substitutes only the
+changed files the runner's module graph holds, by extension
+(`_IMPACT_SOURCE_EXTS`: `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`,
+`.mts`, `.cts`, `.vue`, `.svelte`), never a manifest, lockfile, workflow,
+document or runner configuration. A diff with no such file renders
+nothing, and the absence rule defers the axis: a manifest, lockfile or CI
+change is measured by the axis that owns it — the install and build of
+the committed view, CI parity — and never by the whole suite. A changed
+runner configuration (`vitest.config.*`, `vite.config.*`,
+`vitest.workspace.*`, `jest.config.*`: a trigger with a source
+extension) changes how every test runs, so impact analysis cannot answer
+it: the axis is typed `runner_config_changed` and runs the runner's
+direct form (`resolve_test_files_scoped`'s derivation) over only the test
+files that are named — the diff's own and the planner's
+`files_likely_touched` — or, with none named, is deferred like any other
+axis with nothing to run. A trigger the repository adds in its own
+configuration (`setupFiles`, a custom `forceRerunTriggers`) is not known
+without reading that configuration and is not modelled; a setup file is
+usually a source file and can still reach `related`.
+
+The worker-side gate reads an impact-analysis run by the same rule
+(*A command the task forbids*). `vitest related <files>` and `jest
+--findRelatedTests <files>` are a scoped run only when every operand is
+one of the runner's module sources that is not its configuration — the
+run leerie itself would render, classified by the same
+`_IMPACT_SOURCE_EXTS` and `_is_runner_config`. Any other operand
+(`package.json`, a lockfile, a workflow, `vitest.config.ts`), or none at
+all, makes it a whole-suite run, which a whole-suite forbid denies: the
+gate cannot know which non-source operand the repository's
+`forceRerunTriggers` holds, and `package.json` alone, the default, ran
+all 1,299 of barnacle's test files. A worker that wants the tests a
+manifest change affects names those test files and runs them directly.
 
 So a template may instead ask for `{test_files}`, which substitutes only
 the test-shaped members of the changed-file set — a narrower proxy than the
@@ -13649,10 +15341,35 @@ mechanism exists to remove. Four mechanisms read that list:
   verify", since the declared-command check would accept only the refused
   command for it, and an over-match only drops a requirement. Agreement with
   the CLI is a per-shape claim, pinned against verdicts the CLI returned
-  live; a shape outside that set is unverified. The scan does not model
-  here-documents, comments or `$'…'` strings; an apostrophe inside one
-  leaves a quote unbalanced, and the scan then falls back to plain words,
-  which the wide match still catches but the anchored check does not.
+  live; a shape outside that set is unverified. A here-document is input,
+  not commands: its body is dropped, and only an unquoted delimiter's
+  `$(…)` and backtick substitutions — which the shell expands, and so runs
+  — are scanned. *Designed 2026-11-03 (the live 0.43.0 barnacle runs).*
+  The scan read a body as commands: a worker appending a test with `cat >>
+  f.test.ts <<'EOF'` whose body held `const { vi } = await
+  import("vitest");` was denied its following `npx vitest run <one file>`
+  twice as "forbidden command: vitest run", because the body's `(` split
+  off a bare `vitest`, a whole-suite run; every hook and rule that reads
+  subcommands (`_forbidden_command_hit`, the process-kill deny,
+  `_denied_by_full_suite_rules`) shares the scan. A body is dropped only
+  where the scan can show bash reads one, because a wrongly dropped line is
+  a command the hook never sees while a wrongly kept one costs at most a
+  false denial (round 30: `: # <<X`, `$((1<<2))`, `(( y = 1<<3 ))`,
+  `$[1<<2]`, `${x//<<X/b}` and a `$'X'` delimiter each hid a following
+  `pkill -f`, `kill $(pgrep -f …)` or whole-suite `npx vitest` that bash
+  ran). So `<<` starts a here-document only in plain command context — not
+  in a comment, an arithmetic expansion or command, or a parameter
+  expansion; its delimiter must be a plain word, or one wholly in single or
+  double quotes, with no `$`, backquote or backslash; and its terminating
+  line must be present. Anything else is read as before, as commands. An
+  unquoted body's substitutions are found by the same quote-aware scan in
+  a body mode, where only `$(` and backquotes open and the text between is
+  dropped, never by counting parentheses; inside any substitution a
+  `case` clause's pattern `)` ends the pattern, not the substitution. This
+  is pinned by a differential test against `bash -c` itself. It still does
+  not model comments beyond that or `$'…'` strings; an apostrophe inside one leaves a quote
+  unbalanced, and the scan then falls back to plain words, which the wide
+  match still catches but the anchored check does not.
 - **Settle-time exemption.** The declared-command check skips any entry the
   list refuses. This, not the strip, is the choke point: it also covers a
   spec written before the strip existed (a run resumed past scheduling).
@@ -13840,8 +15557,8 @@ Three layers follow, each derived from that one list:
   runner: vitest, jest, mocha, pytest, `go test`, `cargo test` (and its
   test binary's options behind `--`), rspec, `rails test`. A table names
   the options whose next word is their value; the subcommands that run the
-  suite (`vitest run`/`watch`/`dev` — `vitest related <files>` stays a
-  scoped run); the options that themselves select files or targets (jest
+  suite (`vitest run`/`watch`/`dev` — `vitest related <files>` is a
+  scoped run only over module sources, below); the options that themselves select files or targets (jest
   `--testPathPatterns`/`--onlyChanged`, cargo `--test`/`-p`); the options
   whose value is a test-path operand (mocha `--spec`, rspec `--pattern`);
   the operands that name the whole suite (`go test ./...`);
@@ -14473,7 +16190,7 @@ limits killed it (e.g. `pids.max` blocking a worker-thread spawn). Leaving
 the second uncovered pushed the judgment into workers, which then
 adjudicated it in prose — measured across a run corpus, 37 worker calls
 reasoned about `os error 11` and decided for themselves it was
-environmental (docs/POSTMORTEM-2026-08-14.md, F5). §12 says that decision
+environmental (tests/test_axis_unmeasurable.py). §12 says that decision
 belongs in code.
 
 A RED base is surfaced loudly (`log()` warning plus `run.json.health.base_suite`)
@@ -14562,8 +16279,9 @@ failure new / does this set still fail" verdict uses:
    discovery sizes from below): a file holding a candidate the final run
    itself failed ranks before one holding only a discovery find (the more
    informative observation), then the shortest first; a file is taken
-   while (Σ duration + one rerun's start-up) × 2 — one base/final pair —
-   fits the budget, and the first file always, since it may still finish a
+   while its cost — (Σ (duration + per-file overhead) + one rerun's
+   start-up) × 2, from the measured rerun cost below — for one
+   base/final pair fits the budget, and the first file always, since it may still finish a
    pair. One pair, not all `k`: one finished agreeing pair is what step 4
    needs to call a candidate new, so sizing for `k` left out files that
    could have been settled. When that first pass is done, the budget it
@@ -14574,7 +16292,7 @@ failure new / does this set still fail" verdict uses:
    out: its candidates are `budget_short_unsettled` (step 4), listed as
    "not rerun (sized out of the budget)" — apart from a rerun the budget
    cut, "could not confirm within the budget". A file with no measured
-   duration costs the start-up alone. When a candidate has no known file
+   duration costs the start-up and its per-file overhead. When a candidate has no known file
    the rerun is the whole command and nothing is sized. CI parity sizes
    its red checks the same way by their final-run times, shortest first,
    so a long check first in CI order no longer starves the checks after it.
@@ -14876,12 +16594,32 @@ adds two steps:
    a changed file directly (a transitive importer is never a discovery
    file, above), and among them one importing more of the changed files
    ranks first; then the shortest first, so the most files fit. A file is
-   taken while (Σ duration + one repeat's runner start-up) × R stays inside
-   what is left of the budget. A file with no measured duration is
-   calibrated first: the unmeasured files run once with a report, in rank
-   order and in chunks of 1, 2, 4 … files, inside one repeat's share of the
-   budget (`confirm_budget_sec` / R); a chunk that does not finish leaves
-   its files unmeasured and skipped. Calibration runs are not repeats: a
+   taken while (Σ (duration + per-file overhead) + one repeat's start-up)
+   × R stays inside what is left of the budget.
+
+   *A rerun's cost is measured, not assumed.* A report's per-file duration
+   is the file's tests alone: vitest's suite start/end excludes the file's
+   import and collection, which on barnacle are several times its test
+   time, and a duration recorded from a parallel run hides even that. The
+   old rule added one assumed 10 s start-up per repeat and calibrated only
+   when some file had no duration, so with every duration known nothing
+   was ever measured: live run a1f5 planned 263 of 375 files × 20 repeats
+   at 1,797 s and finished none of the 20 repeats. So every serial rerun
+   leerie runs over named files (calibration, discovery repeats, B\*
+   reruns) records its own wall time against the durations its report
+   gave, and a least-squares fit over those samples gives the start-up
+   per run and the overhead per file (`wall − Σ reported = start-up + n ×
+   per-file`, both kept non-negative; from samples of one size alone, all
+   of it is per-file, the conservative reading). Discovery first
+   calibrates — the unmeasured files, in rank order, then the measured
+   ones — in chunks of 1, 2, 4 … files inside one repeat's share of the
+   budget (`confirm_budget_sec` / R), until every file it could choose has
+   a duration and the samples span two run sizes; a chunk that does not
+   finish leaves its files unmeasured and skipped. With no sample at all,
+   nothing is planned: discovery records `skipped: "overhead not
+   measured"` and runs nothing, rather than plan from an assumption. B\*
+   sizes from the same fit once one exists, and until then from the 10 s
+   start-up alone. Calibration runs are not repeats: a
    file is counted only over its R repeats. A repeat that wrote no report is
    not counted as one either, and a repeat the budget cut short ends
    discovery (`budget_exhausted`): counted, it would inflate the "failed
@@ -15110,8 +16848,8 @@ stored inside it would vanish exactly when a successor worker needs it.
 Coordination state is **per-run**, rooted at `<state-root>/runs/<run-id>/`
 (where `<state-root>` is the resolved state directory — default
 `$HOME/.leerie/<basename>/`, overridable via `LEERIE_STATE_DIR` /
-`--state-dir` / `leerie.toml state_dir`; always outside the target
-repo). The default key is the repo basename only; cross-repo basename
+`--state-dir`, never a `leerie.toml` key; never at, inside or above the
+target repo, §6 *No host path comes from a repository*). The default key is the repo basename only; cross-repo basename
 collisions (two different abs_paths sharing a basename) are caught at
 use time via an `.owner` sidecar inside the dir that records the
 abs_path of the repo that owns it — the launcher refuses to write into
@@ -15339,7 +17077,12 @@ rejected every such attempt, naming the allowed working directory. **The
 working-directory boundary is real; the flag is what erases it.** A
 separate probe combined cwd = detached worktree with the flag still on, and
 the worker overwrote a tracked file in the real checkout and committed on
-its branch — the result behind L2's caveat below.
+its branch — the result behind L2's caveat below. The flag is not the
+only way to erase it: a settings layer's `defaultMode:
+bypassPermissions`, an allow list naming a tool, or a hook that answers
+"allow" does the same, so leerie's settings for a confined worker carry
+from a layer below its own only the keys that cannot (§6 *The CLI reads no
+settings file*).
 
 **L2 — they run in a disposable worktree.** A detached worktree per run,
 reset on entry to the recorded working branch's tip, else the checkout's
@@ -15436,7 +17179,7 @@ The accepted residuals, recorded here rather than only in commit
 history: some inputs read the checkout directly — the repo map,
 provisioning, decomposition greps, dependency capture's manifests, the
 build/lint/test commands in `.leerie/config.toml` (`resolve_blt_scoped`)
-and the PR template — so an operator's mid-run edits or branch switch
+— so an operator's mid-run edits or branch switch
 can colour them; `_coverage_citation_clears` checks a cited path's
 existence in the checkout rather than the merged staging tree; the
 acceptance writer copies every task-named file its worktree (at the

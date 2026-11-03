@@ -198,21 +198,18 @@ def test_rebaser_schema_confidence_not_required(leerie):
 
 
 def test_conformer_blt_axes_do_not_require_summary(leerie):
-    """P13: _CONFORMER_BLT_PROP is a single shared dict, assigned by
-    reference (not copy) to the conformer schema's build/lint/tests keys
-    (leerie.py:1711-1713). `summary` stays a valid property on each axis
-    but is no longer required. The is-identity check across all three
-    axes guards against a future refactor that copies the dict per-axis
-    and only edits one copy, leaving the others still requiring
-    `summary`."""
-    conformer = leerie.SCHEMAS["conformer"]["properties"]
-    build = conformer["build"]
-    lint = conformer["lint"]
-    tests = conformer["tests"]
-
-    assert build is lint is tests, (
-        "build/lint/tests axes must be the same shared object "
-        "(_CONFORMER_BLT_PROP) so a fix to one covers all three")
+    """P13: _CONFORMER_BLT_PROP is the one shape of the conformer schema's
+    build/lint/tests keys: each is a `$ref` to `$defs.blt`, which is that
+    shared dict. `summary` stays a valid property on each axis but is no
+    longer required. A per-axis copy would let one axis drift from the
+    others, so every axis must point at the one definition."""
+    schema = leerie.SCHEMAS["conformer"]
+    conformer = schema["properties"]
+    assert all(conformer[a] == {"$ref": "#/$defs/blt"}
+               for a in ("build", "lint", "tests")), (
+        "build/lint/tests axes must all reference the one shared shape")
+    build = schema["$defs"]["blt"]
+    assert build is leerie._CONFORMER_BLT_PROP
 
     assert "summary" not in set(build["required"])
     assert "summary" in build["properties"]

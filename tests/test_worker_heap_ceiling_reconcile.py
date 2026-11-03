@@ -163,8 +163,11 @@ def test_explicit_env_value_dies_when_undershooting_declared_heap(leerie, repo_r
         leerie.resolve_worker_memory_max(repo_root, max_parallel=4)
 
 
-def test_explicit_file_value_dies_when_undershooting_declared_heap(leerie, repo_root):
-    (repo_root / "leerie.toml").write_text("worker_memory_max = 4G\n")
+def test_explicit_env_value_dies_when_undershooting_declared_heap(
+        leerie, repo_root, monkeypatch):
+    # The env var, not leerie.toml: a containment ceiling has no file tier
+    # (DESIGN §6 *A repository chooses no operator authority*).
+    monkeypatch.setenv("LEERIE_WORKER_MEMORY_MAX", "4G")
     _write_config(
         repo_root,
         test_cmd="NODE_OPTIONS=--max-old-space-size=8192 pnpm test",

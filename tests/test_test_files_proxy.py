@@ -282,8 +282,11 @@ def test_unknown_placeholder_returns_None(leerie):
 ])
 def test_known_placeholders_still_render(leerie, cmd):
     """Anti-vacuity: a guard that rejected everything would pass the test
-    above while disabling every working proxy."""
-    assert leerie._render_scoped(cmd, ["tests/test_x.py"], "b") is not None
+    above while disabling every working proxy. The diff carries a module
+    source too: an impact-analysis template takes only those (DESIGN §9 *An
+    impact-analysis runner is handed only its own module sources*)."""
+    assert leerie._render_scoped(cmd, ["tests/test_x.py", "src/x.ts"],
+                                 "b") is not None
 
 
 @pytest.mark.parametrize("cmd", [

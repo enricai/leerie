@@ -409,7 +409,7 @@ def test_pr_payload_carries_the_resolved_preference(leerie, monkeypatch,
     try:
         asyncio.run(leerie._compose_pr_via_llm(
             st, dict(leerie.DEFAULT_CAPS), {"pr_writer": "sonnet"},
-            {"pr_writer": "medium"}, tmp_path, None))
+            {"pr_writer": "medium"}, None))
     except Exception:
         # The worker call is what this test is about; anything after it
         # (git plumbing, file writes) may legitimately fail in a bare

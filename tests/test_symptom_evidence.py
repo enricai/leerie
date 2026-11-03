@@ -42,7 +42,7 @@ from tests.source_strip import code_only as _code_only   # single owner; see tha
 # symptom: `_repair_prescribed_commands` synthesises `{prefix}{900+n:03d}` from
 # the HOST subtask's domain, and a duplicate-provider/overlap merge re-homes a
 # `feat-` subtask under a surviving `bugfix-` id.
-# See docs/POSTMORTEM-2026-08-14.md, F18.
+# See tests/test_no_id_prefix_dispatch.py.
 
 @pytest.mark.parametrize("sid", ["feat-001", "test-003", "docs-002",
                                  "refactor-001", "infra-004", "bugfix-007"])

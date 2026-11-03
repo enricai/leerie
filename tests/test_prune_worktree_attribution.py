@@ -22,7 +22,7 @@ Each has a recorded control against the shipped code — see the commit message
 for the A/B — because a test that passes on both the defect and the fix is not
 evidence of either.
 
-See docs/POSTMORTEM-2026-08-14.md, F19/F22.
+See tests/test_worktree_prune_scoping.py and tests/test_prune_verb.py.
 """
 from __future__ import annotations
 

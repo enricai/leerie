@@ -245,8 +245,15 @@ leerie_git_hooks_off
 # `workers/integrator-<sid>/` from the run's template, then exits) is this
 # process's: they and the template go when this payload exits, however it
 # exits (DESIGN §6 *No copy of the credentials outlives its run's process*).
+# Each integrator's private temp directory (`guard_tmp`, outside the run
+# directory: DESIGN §6 *A confined command's scratch is short and private*).
+guard_tmps=()
 _drop_integrator_copies() {
   local d
+  for d in ${guard_tmps[@]+"${guard_tmps[@]}"}; do
+    leerie_rm_owned "$d" \
+      || echo "collect-subtrees: could not remove $d" >&2
+  done
   for d in "$leerie_dir"/workers/integrator-*; do
     [ -e "$d" ] || [ -L "$d" ] || continue
     leerie_rm_owned "$d" \
@@ -321,6 +328,7 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
     guard_settings=""
     guard_env=()
     guard_confine=()
+    guard_tmp=""
     guard_sh=""
     if guard_sh=$(python3 -I "$SCRIPTS/worker-guard.py" \
         "$integrator_allowed_tools" "$staging" "$leerie_dir/state.json" \
@@ -328,6 +336,7 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
         2>/dev/null) && [ -n "$guard_sh" ]; then
       eval "$guard_sh"
     fi
+    [ -z "$guard_tmp" ] || guard_tmps+=("$guard_tmp")
     # Never unconfined (DESIGN §6 *A worker writes only where it is
     # granted*): without the guard's Landlock grants the branch is skipped.
     if [ "${#guard_confine[@]}" -eq 0 ]; then
@@ -358,6 +367,8 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
       --effort high \
       --strict-mcp-config \
       --dangerously-skip-permissions 2>/dev/null) || claude_rc=$?
+    # The integrator has ended: its private temp directory goes now.
+    [ -z "$guard_tmp" ] || leerie_rm_owned "$guard_tmp" || true
 
     if [ "$claude_rc" -ne 0 ]; then
       _back_out "$pre"
@@ -425,7 +436,7 @@ BASH_EOF
         | flyctl ssh console --app "$app" --machine "$machine" \
             --pty=false -C "bash -s" 2>&1)"; then
     remote_log "collect-subtrees: SSH to machine $machine failed"
-    remote_log "  output: $result"
+    remote_log "  output: $(_terminal_safe "$result")"
     return 1
   fi
 
@@ -436,7 +447,7 @@ BASH_EOF
               | tail -1 || true)"
   if [ -z "$sentinel" ]; then
     remote_log "collect-subtrees: no sentinel in remote output:"
-    remote_log "  $result"
+    remote_log "  $(_terminal_safe "$result")"
     return 1
   fi
 

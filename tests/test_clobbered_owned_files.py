@@ -213,7 +213,8 @@ def _staging_repo(tmp_path):
     Returns (path, working_branch, staging_before_sha). This is the shape the
     pre-existing fixtures above deliberately do not have — they compare against
     branch `run` while HEAD is on `main`, two different refs, which is why they
-    passed against the defect described in docs/POSTMORTEM-2026-08-14.md, F2.
+    passed against the defect `_merge_base_sha`'s docstring describes: with
+    HEAD on the run branch the base and HEAD became one ref.
     """
     d = tmp_path
     run_git_repo_first(d, "init", "-q", "-b", "main")

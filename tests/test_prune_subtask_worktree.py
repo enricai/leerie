@@ -213,3 +213,70 @@ def test_prune_then_reset_of_sibling_still_works(leerie, tmp_path, monkeypatch):
     show = _git_noraise("show-ref", "--verify", "--quiet",
                 "refs/heads/leerie/subtasks/run-id/sid-blocked", cwd=run_repo)
     assert show.returncode != 0
+
+
+def _subtask_with_view(leerie, repo: Path, sid: str):
+    """A subtask's tree in the run repository, its committed view beside it
+    (a detached checkout, as `_committed_view` makes one) with a bulky
+    install, and the view's own stores."""
+    leerie_dir = repo / ".leerie" / "runs" / "run-id"
+    run_repo = leerie_dir / "repo"
+    if not run_repo.exists():
+        (leerie_dir / "worktrees").mkdir(parents=True)
+        _run_repo(repo, leerie_dir)
+        _git("branch", "leerie/runs/run-id", "main", cwd=run_repo)
+    wt = leerie._subtask_worktree_path(leerie_dir, sid)
+    r = _git("worktree", "add", str(wt), "-b",
+             f"leerie/subtasks/run-id/{sid}", "leerie/runs/run-id",
+             cwd=run_repo)
+    assert r.returncode == 0, r.stderr
+    view = leerie_dir / "worktrees" / leerie._worktree_dirname(
+        "run-id", f"view-{wt.name}")
+    r = _git("worktree", "add", "--detach", str(view),
+             f"leerie/subtasks/run-id/{sid}", cwd=run_repo)
+    assert r.returncode == 0, r.stderr
+    (view / "node_modules").mkdir()
+    (view / "node_modules" / "dep.js").write_text("module.exports = {};\n")
+    stores = leerie_dir / leerie.TREE_STORES_DIRNAME / view.name
+    stores.mkdir(parents=True)
+    (stores / "uv").mkdir()
+    return leerie_dir, run_repo, wt, view, stores
+
+
+def test_prune_removes_the_trees_view_and_its_stores(leerie, tmp_path,
+                                                      monkeypatch):
+    """DESIGN §8 *A view lives no longer than its tree*: the live runs held
+    41 views (~27 GB), one run 9 views beside 2 remaining trees. Another
+    subtask's view stays."""
+    repo = _make_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+    leerie_dir, run_repo, wt, view, stores = _subtask_with_view(
+        leerie, repo, "sid-x")
+    *_, other_view, other_stores = _subtask_with_view(leerie, repo, "sid-y")
+    leerie._VIEWS[str(wt.resolve())] = ("tip", view)
+
+    asyncio.run(leerie._prune_subtask_worktree("sid-x", leerie_dir))
+
+    assert not wt.exists()
+    assert not view.exists() and not stores.exists()
+    assert str(wt.resolve()) not in leerie._VIEWS
+    listed = _git("worktree", "list", "--porcelain", cwd=run_repo).stdout
+    assert str(view) not in listed
+    assert other_view.is_dir() and other_stores.is_dir()
+    assert str(other_view) in listed
+
+
+def test_reset_removes_the_trees_view_and_its_stores(leerie, tmp_path,
+                                                      monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+    leerie_dir, run_repo, wt, view, stores = _subtask_with_view(
+        leerie, repo, "sid-x")
+
+    asyncio.run(leerie._reset_subtask_worktree("sid-x", leerie_dir,
+                                               "run-id"))
+
+    assert not wt.exists()
+    assert not view.exists() and not stores.exists()
+    assert str(view) not in _git("worktree", "list", "--porcelain",
+                                 cwd=run_repo).stdout

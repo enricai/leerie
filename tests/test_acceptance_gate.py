@@ -3364,32 +3364,37 @@ def test_residual_reaches_the_next_runs_planner_ctx(leerie, tmp_path):
     assert "acceptance_unmet" in leerie._load_prompt("planner")
 
 
-def test_fixers_cannot_read_the_sets(leerie, tmp_path):
+@pytest.mark.parametrize("fixer", ["implementer", "conformer",
+                                   "surrogate_fixer", "falsifier"])
+def test_fixers_cannot_read_the_sets(leerie, tmp_path, fixer):
+    """No fixer's grant (I5) reaches the sets or any run file that records
+    them (DESIGN §8 *Hidden from the fixers*): Landlock refuses them to the
+    Read tool and a shell `cat` alike, which the CLI `Read` denies this
+    replaced never did (`tests/test_worker_confinement.py` probes it in a
+    real confined shell)."""
     run_dir = tmp_path / "runs" / "r"
-    for w in ("implementer", "conformer"):
-        # Round-3 M4: the writers' stream transcripts (logs/acceptance-<k>.log)
-        # carry the test source, evaluation logs the runner output, and
-        # calls.ndjson the writers' responses.
-        assert leerie._acceptance_read_denials(w, run_dir).split(",") == [
-            f"Read(/{run_dir}/acceptance/**)",
-            # run-id-prefixed: the run directory's name is the run id
-            f"Read(/{run_dir}/worktrees/r-acceptance-eval/**)",
-            f"Read(/{run_dir}/logs/**)",
-            f"Read(/{run_dir}/orchestrator.log)",
-            f"Read(/{run_dir}/calls.ndjson)",
-            f"Read(/{run_dir}/state.json)",
-            # each worker's own CLI configuration, its transcripts included
-            f"Read(/{run_dir}/workers/*/config/**)",
-            "Read(~/.claude/projects/**)"]
-    # The fixers' prompts read only these run-directory paths, none denied.
-    for w in ("implementer", "conformer"):
-        prompt = leerie._load_prompt(w)
-        for used in ("subtasks/", "notes/"):
-            assert used in prompt
-    for w in ("planner", "acceptance_writer", "delivery_judge"):
-        assert leerie._acceptance_read_denials(w, run_dir) == ""
-    src = inspect.getsource(leerie.claude_p)
-    assert "_acceptance_read_denials(schema_key, st.run_dir)" in src
+    own = run_dir / "workers" / f"{fixer}-1"
+    env = {"CLAUDE_CONFIG_DIR": str(own / "config"),
+           "TMPDIR": str(own / "tmp")}
+    for p in env.values():
+        Path(p).mkdir(parents=True)
+    cwd = tmp_path / "fixer-tree"
+    cwd.mkdir()
+    g = leerie._worker_grants(
+        run_dir=run_dir, state={}, schema_key=fixer, cwd=cwd,
+        allowed_tools=leerie.ACT_TOOLS, env=env,
+        notes_id="s1" if fixer == "implementer" else None)
+    granted = [os.path.realpath(p) for p in g.rw + g.ro]
+    for hidden in ("acceptance/set-1/test_x.py",
+                   # run-id-prefixed: the run directory's name is the run id
+                   "worktrees/r-acceptance-eval/test_x.py",
+                   # the writers' stream transcripts carry the test source
+                   "logs/acceptance-1.log", "orchestrator.log",
+                   "calls.ndjson", "state.json",
+                   "workers/acceptance_writer-1/config/projects/s.jsonl"):
+        real = os.path.realpath(run_dir / hidden)
+        assert not any(Path(real).is_relative_to(p) for p in granted), (
+            fixer, hidden)
 
 
 def test_wiring_order_in_run_phases(leerie):

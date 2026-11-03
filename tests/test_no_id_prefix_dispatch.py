@@ -14,7 +14,7 @@ prose, but a subtask id is a string too, and the same failure follows: a
 
 Measured across the run corpus, `check_symptom_evidence` produced **10 of 10
 false positives** — every one a test, coverage or verification subtask that
-never had a symptom. See docs/POSTMORTEM-2026-08-14.md, F18.
+never had a symptom.
 
 The structured answers are `_sid_domain_map(plans)` for "what kind of work is
 this" and the planner's `fixes_reported_symptom` for "does this fix a reported

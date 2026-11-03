@@ -130,13 +130,14 @@ class TestReachesTheArgv:
                                schema_key, autonomous):
         argv = _argv_for(leerie, monkeypatch, schema_key=schema_key,
                          autonomous=autonomous, repo_root="/work")
-        # Containment, not position: the held-out acceptance Read deny
-        # (DESIGN §8) now follows it for implementer/conformer.
         assert ",Edit(//work/**)" in _deny_value(argv)
-        if schema_key == "implementer":
-            deny = _deny_value(argv)
-            assert "/acceptance/**)," in deny
-            assert ",Read(~/.claude/projects/**)," in deny
+        # The held-out sets and what records them are no longer CLI `Read`
+        # denies: the kernel refuses them to every fixer's process, a shell
+        # `cat` included (DESIGN §8 *Hidden from the fixers*;
+        # tests/test_worker_confinement.py::
+        # test_no_fixer_reads_what_records_a_held_out_set), and a `Read()`
+        # deny made the CLI refuse ordinary `cd <dir>; grep` compounds.
+        assert "Read(" not in _deny_value(argv)
 
     def test_the_acting_worker_really_does_carry_the_bypass_flag(
             self, leerie, monkeypatch):

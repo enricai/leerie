@@ -178,6 +178,48 @@ def test_profile_compiles():
     assert r.returncode == 0, r.stderr
 
 
+# Every allow rule of the released 0.43.0 profile, verbatim (read from the
+# `chore(release): 0.43.0` tree's scripts/apparmor/leerie-container; its
+# deny rules are pinned below for their own reason). Written out, not read
+# from git: a test cannot rely on a release ref being fetched. The profile
+# is host-global and a reload reaches running containers, so a 0.43.0
+# container still running after an upgrade runs under this checkout's
+# profile with its own shim (DESIGN §6 *The profile only grows*). A rule
+# leaves this list only in a change that carries its own migration.
+RELEASED_0_43_0_RULES = (
+    "network,", "capability,", "file,", "umount,", "userns,", "mqueue,",
+    "io_uring,",
+    "signal (receive) peer=unconfined,",
+    "signal (receive) peer=runc,",
+    "signal (receive) peer=crun,",
+    "signal (send,receive) peer=leerie-container,",
+    "signal (receive) peer=/usr/bin/rootlesskit,",
+    "mount options=(rw, rprivate) -> /,",
+    "mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /tmp/,",
+    "mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /dev/shm/,",
+    "mount fstype=devpts options=(rw, nosuid, noexec) devpts -> /dev/pts/,",
+    "mount options=(rw, bind) /dev/pts/ptmx -> /dev/ptmx,",
+    "mount options=(rw, bind) -> /**,",
+    "mount options=(rw, rbind) -> /**,",
+    "pivot_root,",
+    "mount fstype=overlay overlay -> /leerie-state/**,",
+    "remount /,",
+    "remount /**,",
+    "ptrace (trace,tracedby,read,readby) peer=leerie-container,",
+)
+
+
+def test_profile_keeps_every_rule_a_released_shim_needs():
+    """A profile reload must not take from a running older container a rule
+    its shim uses: each released allow rule is still a line of the
+    profile, inside its block."""
+    text = PROFILE.read_text()
+    body = text[text.index("profile leerie-container "):]
+    rules = {ln.strip() for ln in body[:body.index("\n}")].splitlines()}
+    missing = [r for r in RELEASED_0_43_0_RULES if r not in rules]
+    assert not missing, missing
+
+
 def test_profile_allows_exactly_the_shims_mounts():
     """Each mount the shim makes has its rule, by type and target, and the
     profile keeps nerdctl-default's denials (substance: the rules, read as
@@ -187,6 +229,8 @@ def test_profile_allows_exactly_the_shims_mounts():
             "userns,", "pivot_root,", "remount /,", "remount /**,",
             "mount options=(rw, rprivate) -> /,",
             "mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /tmp/,",
+            "mount fstype=tmpfs options=(rw, nosuid, nodev, noexec) tmpfs "
+            "-> /dev/,",
             "mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> "
             "/dev/shm/,",
             "mount fstype=devpts options=(rw, nosuid, noexec) devpts -> "

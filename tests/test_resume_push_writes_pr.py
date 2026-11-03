@@ -100,3 +100,19 @@ def test_a_written_pr_is_not_rewritten(leerie, finished_run, pr_writer_calls):
 
     assert pr_writer_calls == []
     assert _run_json(finished_run)["pr_title"] == "Already written"
+
+
+def test_a_pushed_run_whose_pr_writer_failed_is_not_rewritten(
+        leerie, finished_run, pr_writer_calls):
+    """review round 26, I1: a run the host already pushed had its chance at
+    `pr_writer`; when the worker failed, its PR is open with the fallback
+    body and `run.json` has no `pr_title`. A later resume must not run the
+    worker again — nothing would read the title."""
+    leerie._write_run_json(finished_run.run_dir, no_push=False,
+                           pushed_at="2026-10-30T00:05:00Z",
+                           pr_url="https://example.invalid/pr/1")
+
+    _resume(leerie, finished_run, _args(no_push=False))
+
+    assert pr_writer_calls == []
+    assert _run_json(finished_run).get("pr_title") is None

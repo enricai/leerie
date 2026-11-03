@@ -159,7 +159,8 @@ def test_schema_requires_only_exercised(leerie):
     assert sub["required"] == ["exercised"]
     assert sub["properties"]["exercised"] == {"type": "boolean"}
     assert set(sub["properties"]) == {
-        "exercised", "how", "observed", "unexercisable_reason"}
+        "exercised", "how", "observed", "unexercisable_reason",
+        "unexercisable_resource"}
     # Flat: no nested objects (the sharpest edge of that trigger profile).
     assert not any(p.get("type") == "object"
                    for p in sub["properties"].values())

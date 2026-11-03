@@ -35,6 +35,7 @@ import contextlib
 import contextvars
 import copy
 import ctypes
+import difflib
 import errno
 import fcntl
 import fnmatch
@@ -47,6 +48,7 @@ import ipaddress
 import json
 import math
 import os
+import posixpath
 import pwd
 import re
 import shlex
@@ -78,11 +80,58 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # tenacity is imported lazily inside claude_p() (its sole use site), not at
 # module scope, so orchestrator/leerie.py loads on a bare host python3 that
-# lacks requirements.txt deps. The `config --recapture` host seam
-# (leerie:864) exec_module()s this file on the host, where python3 is not
+# lacks requirements.txt deps. The launcher's `config --recapture` host seam
+# exec_module()s this file on the host, where python3 is not
 # guaranteed to have tenacity; a module-scope import there would crash before
 # run_recapture_deps()'s pathlib guards can print their diagnostic. Do not
 # hoist it back to the top.
+
+
+def admit_operator_import_paths(exclude: Iterable[str | Path]) -> None:
+    """Put the operator's own import paths back on `sys.path` in a host seam
+    that runs isolated (`python3 -I`) and can reach `claude_p` — the rebaser
+    and `config --recapture` seams. `-I` keeps the cwd off `sys.path`, and
+    with it the user site and `PYTHONPATH`, which is where an operator's
+    `pip install --user tenacity` or a `PYTHONPATH` entry put the one
+    third-party module those seams import (lazily, on a backoff). Those
+    paths come back, in the order a plain `python3` gives them:
+    `PYTHONPATH` first, the user site (unless `PYTHONNOUSERSITE`) ahead of
+    the interpreter's own site-packages. An empty or relative `PYTHONPATH`
+    entry names the cwd, so it is dropped (DESIGN §6 *The host never imports
+    the repository's code*).
+
+    An operator's path can still name the repository: an editable install's
+    `.pth` in the user site holds `<checkout>/src`, and direnv's
+    `PYTHONPATH=$PWD/src` is absolute (review round 27, isolation I2). So
+    once the paths are back, `.pth` files processed, every `sys.path` entry
+    whose real path is one of `exclude` (the checkout; for the rebaser, its
+    tree too), or lies beneath one, is dropped.
+
+    Called explicitly by those seams, never at import: the other programs
+    that load this file isolated (`scripts/worker-guard.py`, the read-only
+    verbs, the other host seams) import nothing outside the standard library,
+    and keep their import path as `-I` left it."""
+    import site
+    sys.path[:0] = [d for d in os.environ.get("PYTHONPATH", "").split(
+        os.pathsep) if os.path.isabs(d) and d not in sys.path]
+    if not os.environ.get("PYTHONNOUSERSITE"):
+        user_site = site.getusersitepackages()
+        if os.path.isdir(user_site) and user_site not in sys.path:
+            before = list(sys.path)
+            site.addsitedir(user_site)  # its .pth files too
+            added = [p for p in sys.path if p not in before]
+            system = set(site.getsitepackages())
+            i = next((k for k, p in enumerate(before) if p in system),
+                     len(before))
+            sys.path[:] = before[:i] + added + before[i:]
+    roots = [os.path.realpath(x) for x in exclude]
+
+    def _inside(entry: str) -> bool:
+        real = os.path.realpath(entry)
+        return any(real == r or real.startswith(r.rstrip("/") + "/")
+                   for r in roots)
+    sys.path[:] = [p for p in sys.path if not _inside(p)]
+
 
 ROOT = Path(__file__).resolve().parent.parent       # leerie plugin/repo root
 PROMPTS = ROOT / "prompts"
@@ -413,7 +462,7 @@ DEFAULT_CAPS = {
     # Colima VM showed agetty → journald → sshd → lima-guestagent killed
     # because a vitest worker blew past 1.85 GB RSS inside the
     # container's single memcg). Resolved at runtime by
-    # resolve_worker_memory_max — CLI > env > leerie.toml > default. The
+    # resolve_worker_memory_max — CLI > env > default. The
     # default value of None means "auto-derive from /proc/meminfo at run
     # start" (see _auto_worker_memory_max).
     "worker_memory_max_bytes": None,
@@ -449,7 +498,7 @@ DEFAULT_CAPS = {
     # that class of worker error rather than a re-derivation from the
     # workload — a genuine leak now issues twice as many forks before the
     # kernel starts refusing them here. Overridable per-repo via
-    # resolve_worker_pids_max (CLI > env > leerie.toml > this default).
+    # resolve_worker_pids_max (CLI > env > this default).
     "worker_pids_max": 2048,
     # Auth/quota backoff budget. When `claude -p` returns an envelope
     # whose `api_error_status` is 401/429/529 or whose result message
@@ -889,6 +938,10 @@ STATE_FIELDS = (
     # that size intermittent discovery to its budget (DESIGN §9 *An
     # intermittent failure the run introduced is evidence*).
     "test_file_durations",
+    # Serial reruns' own cost (DESIGN §9 *A rerun's cost is measured, not
+    # assumed*): `{files, wall_sec, reported_sec}` per serial rerun over
+    # named files, newest last, that `_rerun_cost` fits.
+    "test_run_overhead",
     # Settle by execution (DESIGN §8): per-sid record of every execution of
     # a subtask's `verify` argvs, whatever the verdict.
     "settled_by_execution",
@@ -1079,15 +1132,66 @@ _CLAUDE_DELIVERABLE_PREFIXES = (
 )
 
 
+# The code points HFS+ (and APFS's compatibility with it) leave out of a name
+# when it compares two: git's own list for `.git` (`is_hfs_dotgit`).
+_HFS_IGNORABLE = frozenset(
+    [*range(0x200C, 0x2010), *range(0x202A, 0x202F),
+     *range(0x206A, 0x2070), 0xFEFF])
+
+
+def _path_fold(path: str) -> str:
+    """`path` as one key for every spelling a case-, normalization- or
+    HFS-insensitive filesystem resolves to the same file (DESIGN §6 *A path
+    is the file it names, not its spelling*): lexically normalised, the
+    HFS-ignorable code points dropped, NFKC, casefolded, NFKC again. It
+    equates at least what those filesystems equate, so a test made on it
+    errs towards a match."""
+    p = posixpath.normpath(path) if path else path
+    p = "".join(c for c in p if ord(c) not in _HFS_IGNORABLE)
+    return unicodedata.normalize(
+        "NFKC", unicodedata.normalize("NFKC", p).casefold())
+
+
 def _is_protected_path(path: str) -> bool:
     """Return True if `path` is a meta-directory the implementer must not
     write to. See `_PROTECTED_PREFIXES` and `_CLAUDE_DELIVERABLE_PREFIXES`
-    for the rule."""
+    for the rule. Compared folded (`_path_fold`): on a case-insensitive
+    checkout `.Leerie/Dockerfile` is `.leerie/Dockerfile`."""
+    path = _path_fold(path) + "/"
     if any(path.startswith(p) for p in _PROTECTED_PREFIXES):
         return True
     if path.startswith(".claude/"):
         return not any(path.startswith(p) for p in _CLAUDE_DELIVERABLE_PREFIXES)
     return False
+
+
+def _path_spellings(paths: Iterable[str]) -> set[str]:
+    """Every path in `paths` and every directory above one, as spelled."""
+    out: set[str] = set()
+    for p in paths:
+        parts = p.split("/")
+        out.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+    return out
+
+
+def _fold_collisions(added: Iterable[str], tree: Iterable[str], *,
+                     before: Iterable[str] = ()) -> list[tuple[str, str]]:
+    """Each `(added path or directory, tree path or directory)` pair that is
+    spelled differently but folds to one key (`_path_fold`): on a case- or
+    normalization-insensitive filesystem the two are one file or one
+    directory (DESIGN §6 *A path is the file it names, not its spelling*,
+    part 3). A pair whose two spellings were both already among `before`'s
+    paths and directories is not reported: it was there before."""
+    known: dict[str, set[str]] = {}
+    for t in _path_spellings(tree):
+        known.setdefault(_path_fold(t), set()).add(t)
+    old = _path_spellings(before)
+    hits: list[tuple[str, str]] = []
+    for a in sorted(_path_spellings(added)):
+        for t in sorted(known.get(_path_fold(a), ())):
+            if t != a and not (a in old and t in old):
+                hits.append((a, t))
+    return hits
 
 _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
 # Judgment workers get no blanket Read/Grep/Glob grant. The CLI allows those
@@ -1096,8 +1200,9 @@ _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
 # Measured live (claude 2.1.310, a scratch run dir): with a bare `Read`
 # granted, a judgment worker read `<run-dir>/state.json` and a staged system
 # prompt; without it, both were refused while a file in its cwd still read.
-# The boundary is what keeps them out of the run directory, so they need no
-# `Read()` deny rule, and must not carry one (`_reads_beyond_cwd`).
+# The boundary is what keeps them out of the run directory; Landlock keeps
+# every worker there to its grants (I5). No worker carries a `Read()` deny
+# rule: any one makes the CLI refuse `cd <dir>; <read> <relative path>`.
 _JUDGE_READ_BASE = "WebSearch,WebFetch"
 # INSPECT_TOOLS is the read-only-with-shell bucket for every judgment worker
 # (PLANNING_WORKER_TYPES). Those workers run in a disposable detached worktree
@@ -1379,9 +1484,82 @@ def _widen_inspect_tools(base: str, repo_root: Path) -> str:
 # allowlisted Bash verbs in INSPECT_TOOLS are sandboxed to the repo cwd,
 # so cross-repo references like "~/src/enric/beacon" fail with "blocked,
 # outside allowed working directories". Repeatable on the CLI; env var is
-# colon-separated; TOML key is a comma-separated string. Empty by default.
+# colon-separated. No leerie.toml key: see REPO_CONFIG_LOCATION_KEYS. Empty by
+# default.
 INSPECT_DIRS_ENV = "LEERIE_INSPECT_DIRS"
-INSPECT_DIRS_FILE = "leerie.toml"
+
+# The settings that name a location, each with its operator-side spelling.
+# None has a leerie.toml key (DESIGN §6 *No host path comes from a
+# repository*): the file is repository content — a cloned repository's, or a
+# run branch's the operator merged — and `log_file = "~/.bashrc"` made the
+# launcher append the run's output there, `state_dir` put the state root
+# where every worker reads `/work`. `_read_toml_key` refuses these names, and
+# the launcher's `_checkout_config_operator_keys` (same list, pinned by
+# tests/test_repo_config_names_no_location.py) stops a run whose leerie.toml
+# still sets one, naming the replacement.
+REPO_CONFIG_LOCATION_KEYS: dict[str, str] = {
+    "state_dir": "--state-dir / LEERIE_STATE_DIR",
+    "log_file": "--log-file / LEERIE_LOG_FILE",
+    "inspect_dirs": "--inspect-dir / LEERIE_INSPECT_DIRS",
+    "judge_dir": "--judge-dir / LEERIE_JUDGE_DIR",
+    "heal_dir": "--heal-dir / LEERIE_HEAL_DIR",
+}
+
+# The settings that carry the operator's authority, each with its
+# operator-side spelling (DESIGN §6 *A repository chooses no operator
+# authority*). Same reason as the locations above: `leerie.toml` is
+# repository content, and a run branch the operator merges can write it. A
+# credential or profile (`aws_profile`), where worker code runs and as whom
+# (`runtime`, the `ec2_*` machine, its IAM identity), a cloud resource billed
+# to the operator (`ec2_instance_type`, `fly_disk_gb`), a waiver
+# (`dangerously_*`, every gate `skip_*`) and a worker's containment ceiling
+# (`worker_memory_max`, `worker_pids_max`) come only from a flag or the
+# environment. Same treatment as the locations: `_read_toml_key` refuses
+# them, and the launcher stops on a `leerie.toml` that sets one.
+REPO_CONFIG_AUTHORITY_KEYS: dict[str, str] = {
+    "runtime": "--runtime / LEERIE_RUNTIME",
+    "aws_region": "--aws-region / LEERIE_AWS_REGION",
+    "aws_profile": "--aws-profile / LEERIE_AWS_PROFILE",
+    "ec2_ami": "--ec2-ami / LEERIE_EC2_AMI",
+    "ec2_instance_type": "--ec2-instance-type / LEERIE_EC2_INSTANCE_TYPE",
+    "ec2_key_name": "--ec2-key-name / LEERIE_EC2_KEY_NAME",
+    "ec2_security_group": "--ec2-security-group / LEERIE_EC2_SECURITY_GROUP",
+    "ec2_subnet_id": "--ec2-subnet-id / LEERIE_EC2_SUBNET_ID",
+    "ec2_instance_profile":
+        "--ec2-instance-profile / LEERIE_EC2_INSTANCE_PROFILE",
+    "fly_disk_gb": "--fly-disk-gb / FLY_VM_DISK_GB",
+    "dangerously_skip_permissions":
+        "--dangerously-skip-permissions / LEERIE_DANGEROUSLY_SKIP_PERMISSIONS",
+    "dangerously_allow_uncapped":
+        "--dangerously-allow-uncapped / LEERIE_DANGEROUSLY_ALLOW_UNCAPPED",
+    "dangerously_force_strict_output":
+        "--dangerously-force-strict-output / "
+        "LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT",
+    "skip_overlap_judge": "--skip-overlap-judge / LEERIE_SKIP_OVERLAP_JUDGE",
+    "skip_budget_check": "--skip-budget-check / LEERIE_SKIP_BUDGET_CHECK",
+    "skip_satisfied_check":
+        "--skip-satisfied-check / LEERIE_SKIP_SATISFIED_CHECK",
+    "skip_base_baseline": "--skip-base-baseline / LEERIE_SKIP_BASE_BASELINE",
+    "skip_acceptance_check":
+        "--skip-acceptance-check / LEERIE_SKIP_ACCEPTANCE_CHECK",
+    "skip_adherence_check":
+        "--skip-adherence-check / LEERIE_SKIP_ADHERENCE_CHECK",
+    "skip_coverage_check": "--skip-coverage-check / LEERIE_SKIP_COVERAGE_CHECK",
+    "skip_completeness_check":
+        "--skip-completeness-check / LEERIE_SKIP_COMPLETENESS_CHECK",
+    "skip_integration_check":
+        "--skip-integration-check / LEERIE_SKIP_INTEGRATION_CHECK",
+    "skip_classification_check":
+        "--skip-classification-check / LEERIE_SKIP_CLASSIFICATION_CHECK",
+    "worker_memory_max": "--worker-memory-max / LEERIE_WORKER_MEMORY_MAX",
+    "worker_pids_max": "--worker-pids-max / LEERIE_WORKER_PIDS_MAX",
+}
+
+# Every setting a repository's configuration never sets: the launcher's
+# `_checkout_config_operator_keys` holds the same list, in this order
+# (tests/test_repo_config_names_no_location.py pins the two together).
+REPO_CONFIG_OPERATOR_KEYS: dict[str, str] = {
+    **REPO_CONFIG_LOCATION_KEYS, **REPO_CONFIG_AUTHORITY_KEYS}
 
 EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
 # Emitted by `check_budget_feasibility()` (DESIGN §13 *Budget feasibility —
@@ -1438,8 +1616,8 @@ SOURCE_OF_TRUTH_ENV = "LEERIE_SOURCE_OF_TRUTH"
 SOURCE_OF_TRUTH_FILE = "leerie.toml"
 
 # Runtime mode — see IMPLEMENTATION.md §2 "Runtime mode". Resolution order:
-# --runtime CLI flag → LEERIE_RUNTIME env var → per-repo leerie.toml → 'local'.
-# CLI/env are session knobs and outrank the committed file default.
+# --runtime CLI flag → LEERIE_RUNTIME env var → 'local'. No leerie.toml
+# tier: where worker code runs is the operator's (REPO_CONFIG_AUTHORITY_KEYS).
 RUNTIME_VALUES = ("local", "fly", "ec2")
 RUNTIME_ENV = "LEERIE_RUNTIME"
 RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
@@ -1457,10 +1635,10 @@ SUBTASK_TESTS_ENV = "LEERIE_SUBTASK_TESTS"
 SUBTASK_TESTS_FILE = SOURCE_OF_TRUTH_FILE
 
 # NOTE: leerie's own AWS region/profile knobs (LEERIE_AWS_REGION /
-# LEERIE_AWS_PROFILE, and the aws_region / aws_profile leerie.toml keys)
+# LEERIE_AWS_PROFILE; no leerie.toml key, REPO_CONFIG_AUTHORITY_KEYS)
 # are deliberately NOT resolved here. They are consumed only host-side,
 # when the launcher provisions --runtime ec2 machines, so the launcher
-# owns their full CLI > env > leerie.toml resolution; the orchestrator
+# owns their CLI > env resolution; the orchestrator
 # runs inside the container where the value is meaningless and declares
 # no --aws-region/--aws-profile flags. See `leerie`'s "AWS region/profile
 # prefs" block. Resolving them here previously produced a value nothing
@@ -1500,15 +1678,17 @@ MAX_PARALLEL_FILE = SOURCE_OF_TRUTH_FILE
 
 # Per-worker memory cap (cgroup v2 memory.max). Same resolution shape:
 # CLI --worker-memory-max wins; then LEERIE_WORKER_MEMORY_MAX env; then
-# worker_memory_max in leerie.toml; then auto-derive from /proc/meminfo
-# at startup. Accepted suffixes: K, M, G, T (case-insensitive, IEC
-# binary — 1G == 1024**3 bytes). See _parse_memory_size.
+# auto-derive from /proc/meminfo at startup (no leerie.toml tier: a
+# containment ceiling is the operator's, REPO_CONFIG_AUTHORITY_KEYS).
+# Accepted suffixes: K, M, G, T (case-insensitive, IEC binary — 1G ==
+# 1024**3 bytes). See _parse_memory_size.
 WORKER_MEMORY_MAX_ENV = "LEERIE_WORKER_MEMORY_MAX"
 WORKER_MEMORY_MAX_FILE = SOURCE_OF_TRUTH_FILE
 
 # Per-worker cgroup PID cap (cgroup v2 pids.max). Same resolution shape:
 # CLI --worker-pids-max wins; then LEERIE_WORKER_PIDS_MAX env; then
-# worker_pids_max in leerie.toml; then DEFAULT_CAPS["worker_pids_max"].
+# DEFAULT_CAPS["worker_pids_max"] (no leerie.toml tier: a containment
+# ceiling is the operator's, REPO_CONFIG_AUTHORITY_KEYS).
 # A positive integer — see resolve_worker_pids_max.
 WORKER_PIDS_MAX_ENV = "LEERIE_WORKER_PIDS_MAX"
 WORKER_PIDS_MAX_FILE = SOURCE_OF_TRUTH_FILE
@@ -1564,7 +1744,8 @@ CLARIFY_FILE = SOURCE_OF_TRUTH_FILE
 # ability to run arbitrary build commands, which can write outside its
 # worktree, so it is still a trust decision — just a far smaller one.
 # Resolution order: --dangerously-skip-permissions CLI
-# flag → LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env → leerie.toml → False.
+# flag → LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env → False (no leerie.toml
+# tier: a waiver is the operator's, REPO_CONFIG_AUTHORITY_KEYS).
 DANGEROUS_SKIP_PERMS_ENV = "LEERIE_DANGEROUSLY_SKIP_PERMISSIONS"
 DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1580,8 +1761,7 @@ DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 # EAGAIN crash). This flag downgrades that fatal gate to a loud warning and
 # continues uncapped, for operators on hosts that genuinely cannot delegate.
 # Resolution order: --dangerously-allow-uncapped CLI flag →
-# LEERIE_DANGEROUSLY_ALLOW_UNCAPPED env → dangerously_allow_uncapped in
-# leerie.toml → False.
+# LEERIE_DANGEROUSLY_ALLOW_UNCAPPED env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 DANGEROUS_ALLOW_UNCAPPED_ENV = "LEERIE_DANGEROUSLY_ALLOW_UNCAPPED"
 DANGEROUS_ALLOW_UNCAPPED_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1595,7 +1775,7 @@ DANGEROUS_FORCE_STRICT_OUTPUT_FILE = SOURCE_OF_TRUTH_FILE
 # bypassable by this flag; this flag only suppresses the worker spawn
 # on the runs where it would otherwise fire. Resolution order:
 # --skip-overlap-judge CLI flag → LEERIE_SKIP_OVERLAP_JUDGE env →
-# skip_overlap_judge in leerie.toml → False.
+# False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_OVERLAP_JUDGE_ENV = "LEERIE_SKIP_OVERLAP_JUDGE"
 SKIP_OVERLAP_JUDGE_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1608,7 +1788,7 @@ SKIP_OVERLAP_JUDGE_FILE = SOURCE_OF_TRUTH_FILE
 # planner/execute boundary. Use when the operator knows the conformer
 # phase will degrade heavily to advisory warnings or otherwise come in
 # under the estimate. Resolution order: --skip-budget-check CLI flag →
-# LEERIE_SKIP_BUDGET_CHECK env → skip_budget_check in leerie.toml → False.
+# LEERIE_SKIP_BUDGET_CHECK env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_BUDGET_CHECK_ENV = "LEERIE_SKIP_BUDGET_CHECK"
 SKIP_BUDGET_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1624,16 +1804,14 @@ STRICT_CONFORMER_FILE = SOURCE_OF_TRUTH_FILE
 # is green skip that up-front cost. When skipped, the conformer receives
 # no BASELINE context and falls back to its prior self-judgment of
 # "pre-existing" failures. Resolution order: --skip-base-baseline CLI
-# flag → LEERIE_SKIP_BASE_BASELINE env → skip_base_baseline in
-# leerie.toml → False.
+# flag → LEERIE_SKIP_BASE_BASELINE env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_BASE_BASELINE_ENV = "LEERIE_SKIP_BASE_BASELINE"
 SKIP_BASE_BASELINE_FILE = SOURCE_OF_TRUTH_FILE
 
 # --skip-acceptance-check bypass (DESIGN §8 *Held-out acceptance tests*).
 # Suppresses the acceptance_writer sets and the post-integration acceptance
 # gate. Resolution order: --skip-acceptance-check CLI flag →
-# LEERIE_SKIP_ACCEPTANCE_CHECK env → skip_acceptance_check in leerie.toml →
-# False.
+# LEERIE_SKIP_ACCEPTANCE_CHECK env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_ACCEPTANCE_CHECK_ENV = "LEERIE_SKIP_ACCEPTANCE_CHECK"
 SKIP_ACCEPTANCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1655,7 +1833,7 @@ SKIP_REPO_MAP_FILE = SOURCE_OF_TRUTH_FILE
 # instruction-adherence gate is producing false positives for this repo's
 # task shape and wants to bypass the discipline. Resolution order:
 # --skip-adherence-check CLI flag → LEERIE_SKIP_ADHERENCE_CHECK env →
-# skip_adherence_check in leerie.toml → False.
+# False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_ADHERENCE_CHECK_ENV = "LEERIE_SKIP_ADHERENCE_CHECK"
 SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1675,7 +1853,7 @@ SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # (_run_delivery_prejudge/_run_delivery_recheck — DESIGN §8 *The
 # delivery gate*). Resolution order:
 # --skip-coverage-check CLI flag → LEERIE_SKIP_COVERAGE_CHECK env →
-# skip_coverage_check in leerie.toml → False.
+# False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_COVERAGE_CHECK_ENV = "LEERIE_SKIP_COVERAGE_CHECK"
 SKIP_COVERAGE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1689,8 +1867,8 @@ SKIP_COVERAGE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # completeness gates advisory (found defects surface as warnings, never block/
 # die). Use only when the operator knows the completeness judge is producing
 # false positives for this repo. Resolution order: --skip-completeness-check
-# CLI flag → LEERIE_SKIP_COMPLETENESS_CHECK env → skip_completeness_check in
-# leerie.toml → False.
+# CLI flag → LEERIE_SKIP_COMPLETENESS_CHECK env → False (no leerie.toml
+# tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_COMPLETENESS_CHECK_ENV = "LEERIE_SKIP_COMPLETENESS_CHECK"
 SKIP_COMPLETENESS_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1700,7 +1878,7 @@ SKIP_COMPLETENESS_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # finding), this skips the worker spawn entirely, matching every sibling
 # advisory/gating check's escape hatch. Resolution order:
 # --skip-integration-check CLI flag → LEERIE_SKIP_INTEGRATION_CHECK env →
-# skip_integration_check in leerie.toml → False.
+# False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_INTEGRATION_CHECK_ENV = "LEERIE_SKIP_INTEGRATION_CHECK"
 SKIP_INTEGRATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1710,7 +1888,7 @@ SKIP_INTEGRATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # will not converge takes the entire run with it; every sibling gate already
 # carried an escape hatch and this one did not. Resolution order:
 # --skip-classification-check CLI flag → LEERIE_SKIP_CLASSIFICATION_CHECK env
-# → skip_classification_check in leerie.toml → False.
+# → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_CLASSIFICATION_CHECK_ENV = "LEERIE_SKIP_CLASSIFICATION_CHECK"
 SKIP_CLASSIFICATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -1749,8 +1927,7 @@ CAPTURE_DEPS_CONFIG = ".leerie/config.toml"
 # (a verification-only one is settled by executing its `verify` commands,
 # any other is re-driven — DESIGN §8 *Settled by execution*). Resolution
 # order: --skip-satisfied-check CLI
-# flag → LEERIE_SKIP_SATISFIED_CHECK env → skip_satisfied_check in
-# leerie.toml → False.
+# flag → LEERIE_SKIP_SATISFIED_CHECK env → False (no leerie.toml tier: REPO_CONFIG_AUTHORITY_KEYS).
 SKIP_SATISFIED_CHECK_ENV = "LEERIE_SKIP_SATISFIED_CHECK"
 SKIP_SATISFIED_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
@@ -2125,17 +2302,15 @@ MODEL_DEP_CAPTURE_ENV = "LEERIE_MODEL_DEP_CAPTURE"
 
 # Judge output directory name — relative to <run-dir>. Holds LLM judge
 # output files. Resolution order: --judge-dir CLI → LEERIE_JUDGE_DIR env →
-# judge_dir in leerie.toml → "judge-out".
+# "judge-out" (a location: no leerie.toml key, REPO_CONFIG_LOCATION_KEYS).
 JUDGE_DIR_DEFAULT = "judge-out"
 JUDGE_DIR_ENV = "LEERIE_JUDGE_DIR"
-JUDGE_DIR_FILE = "leerie.toml"
 
 # Heal output directory name — relative to <run-dir>. Holds LLM self-heal
 # loop output files. Resolution order: --heal-dir CLI → LEERIE_HEAL_DIR env →
-# heal_dir in leerie.toml → "heal-out".
+# "heal-out" (a location: no leerie.toml key, REPO_CONFIG_LOCATION_KEYS).
 HEAL_DIR_DEFAULT = "heal-out"
 HEAL_DIR_ENV = "LEERIE_HEAL_DIR"
-HEAL_DIR_FILE = "leerie.toml"
 
 # Heal-loop convergence knobs — see IMPLEMENTATION.md §2 "Heal-loop convergence
 # parameters". User-tunable knobs use the standard CLI/env/TOML/default
@@ -2378,8 +2553,8 @@ def _subtask_item_schema(
         # Does this subtask fix a symptom the task REPORTED as currently
         # broken? `check_symptom_evidence` gates on this, and on nothing
         # else — deliberately not on an id-prefix heuristic (CLAUDE.md
-        # *Language-to-JSON*: POSTMORTEM-2026-08-14 F18 measured 10/10 false
-        # positives from an id-prefix inference). Deliberately OPTIONAL, and
+        # *Language-to-JSON*: an id-prefix inference measured 10/10 false
+        # positives; tests/test_no_id_prefix_dispatch.py). Deliberately OPTIONAL, and
         # absence means "no" — the check is advisory, so a silent check is
         # strictly better than one at a 100% false-positive rate.
         properties["fixes_reported_symptom"] = {"type": "boolean"}
@@ -2557,6 +2732,11 @@ def _production_evidence_schema() -> dict:
             # "I could not make this fire here" is a legitimate answer and a
             # recorded one; silence is not.
             "unexercisable_reason": {"type": "string"},
+            # The external resource no in-container step can supply that
+            # kept the path from running, when one did; empty otherwise.
+            # Only a named one reaches "Needs human verification" (DESIGN §9
+            # *Self-reported risk is routed, not read*).
+            "unexercisable_resource": {"type": "string"},
         },
     }
 
@@ -2749,6 +2929,35 @@ _FORBIDDEN_COMMANDS_ARRAY_SCHEMA: dict = {
         },
     },
 }
+
+# DESIGN §6½ *A capture names packages and managers, never commands*. What
+# a `dep_capture` worker may record, checked in its schema, again in code
+# before a capture is recorded or applied (`_capture_problems`), and by the
+# launcher before it writes a Dockerfile line: a Debian package name (no
+# version, release or architecture suffix), a manager leerie bakes, a plain
+# relative path. The command a manager's bake runs is leerie's own, never
+# the capture's.
+DEBIAN_PACKAGE_PATTERN = r"^[a-z0-9][a-z0-9+.-]+$"
+CAPTURE_MANAGER_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+CAPTURE_INPUT_PATTERN = r"^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*/?$"
+# Equal to the launcher generator's `_INSTALL_COMMANDS`
+# (tests/test_capture_validation.py).
+BAKE_INSTALL_COMMANDS: dict[str, str] = {
+    "pnpm": "pnpm install --frozen-lockfile",
+    "yarn": "yarn install --frozen-lockfile",
+    "npm": "npm ci",
+    "uv": "uv sync",
+    "poetry": "poetry install",
+    "pipenv": "pipenv install",
+    "pip": "pip install -r requirements.txt",
+    "pip3": "pip install -r requirements.txt",
+    "go": "go mod download",
+    "cargo": "cargo fetch",
+    "bundle": "bundle install",
+    "composer": "composer install --no-interaction",
+    "dotnet": "dotnet restore",
+}
+
 
 SCHEMAS: dict[str, dict] = {
     "forbidden_command_extractor": {
@@ -3122,7 +3331,7 @@ SCHEMAS: dict[str, dict] = {
                         # COULD NOT PASS: measured, bugfix-008 took 3 drives
                         # ($1.96) and feat-003 took 3 ($3.00), one of them
                         # narrating the contradiction before being re-driven
-                        # for it (docs/POSTMORTEM-2026-08-14.md, F3).
+                        # for it (tests/test_conformance_owned_criteria.py).
                         #
                         # Optional, and absent means "this was mine to
                         # evaluate", so nothing changes for the ordinary case.
@@ -3606,6 +3815,9 @@ SCHEMAS: dict[str, dict] = {
         # arrays every consumer here was written against; no field a check
         # reads was dropped.
         "type": "object",
+        # The three axes' one shape, once: a `$ref` costs the wire (and the
+        # strict-output grammar) one shape instead of three.
+        "$defs": {"blt": _CONFORMER_BLT_PROP},
         "required": [
             "subtask_id", "rules_files_read",
             "rule_violations", "file_updates",
@@ -3650,9 +3862,9 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
-            "build": _CONFORMER_BLT_PROP,
-            "lint": _CONFORMER_BLT_PROP,
-            "tests": _CONFORMER_BLT_PROP,
+            "build": {"$ref": "#/$defs/blt"},
+            "lint": {"$ref": "#/$defs/blt"},
+            "tests": {"$ref": "#/$defs/blt"},
             "summary": {"type": "string"},
             # Anti-gaming: a defect gates only with a concrete_case + where
             # (_validate_conformance_result drops the rest as non-actionable).
@@ -3665,8 +3877,7 @@ SCHEMAS: dict[str, dict] = {
                     "properties": {
                         # True when the conformer fixed it here; absent
                         # means residual. Why it exists, and why a bool rather
-                        # than a status enum: POSTMORTEM-2026-08-14 F11 and
-                        # tests/test_conformer_fixed_defects.py.
+                        # than a status enum: tests/test_conformer_fixed_defects.py.
                         "fixed": {"type": "boolean"},
                         "kind": {"type": "string",
                                  "enum": _SOLUTION_DEFECT_KINDS},
@@ -3726,12 +3937,14 @@ SCHEMAS: dict[str, dict] = {
         "properties": {
             "setup_packages": {
                 # apt packages for the warm apt layer in .leerie/Dockerfile.
-                # minLength enforces "no empty package names" at the schema layer
-                # (DESIGN §12: guarantees that can be checked mechanically live in
-                # code) so an empty-item capture can't render to "" and blank the
-                # persisted config.
+                # A Debian package name and nothing else (DESIGN §6½ *A
+                # capture names packages and managers, never commands*): the
+                # launcher writes each one into an apt `RUN` line, so a
+                # word like `&&` would be shell. Checked again in code
+                # (`_capture_problems`) and by the launcher.
                 "type": "array",
-                "items": {"type": "string", "minLength": 1},
+                "items": {"type": "string",
+                          "pattern": DEBIAN_PACKAGE_PATTERN},
             },
             "language_installs": {
                 # Per-manager install commands the Dockerfile bakes in via
@@ -3740,15 +3953,20 @@ SCHEMAS: dict[str, dict] = {
                 # package.json). Hallucinated paths are validated against
                 # the repo and skipped; the RUN is still emitted.
                 "type": "array",
+                # The manager chooses the command, from leerie's own table
+                # (`BAKE_INSTALL_COMMANDS`); a `command` the worker writes
+                # is never run.
                 "items": {
                     "type": "object",
                     "required": ["manager", "command"],
                     "properties": {
-                        "manager": {"type": "string", "minLength": 1},
+                        "manager": {"type": "string",
+                                    "pattern": CAPTURE_MANAGER_PATTERN},
                         "command": {"type": "string", "minLength": 1},
                         "copy_inputs": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {"type": "string",
+                                      "pattern": CAPTURE_INPUT_PATTERN},
                         },
                     },
                 },
@@ -4534,7 +4752,7 @@ SCHEMAS: dict[str, dict] = {
                         #     the provider-exists predicate would have dismissed
                         #     it — but the parenthetical made the lookup miss
                         #     and killed the run: $20.32, 71 workers, 38
-                        #     minutes, no branch (POSTMORTEM-2026-08-14, F4).
+                        #     minutes, no branch (tests/test_wiring_defect_kind_coverage.py).
                         #
                         # The pattern forbids parentheses ONLY. It deliberately
                         # still allows spaces, commas and slashes, because
@@ -4762,8 +4980,61 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# DESIGN §6 *No text leerie did not write reaches the operator's terminal
+# as a control sequence*: C0 but newline and tab, DEL and C1, the
+# bidirectional and line/paragraph separators a terminal acts on, and a
+# lone surrogate (a byte that was not UTF-8, kept by `surrogateescape`).
+# `scripts/terminal-text.py` holds the same rule for the launcher's relay.
+_TERMINAL_CONTROL = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e"
+    "\u2066-\u2069\ud800-\udfff]")
+
+
+def _terminal_escape(m: "re.Match[str]") -> str:
+    o = ord(m.group())
+    if 0xdc80 <= o <= 0xdcff:
+        return f"\\x{o - 0xdc00:02x}"
+    return f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}"
+
+
+def _terminal_text(s: str) -> str:
+    """`s` with every control character written as its escape, so text a
+    repository or a worker chose (a file name, a worker's JSON string)
+    reaches the operator's terminal as text, never as a sequence the
+    terminal acts on (OSC 52 sets the clipboard). Idempotent: an escape is
+    printable."""
+    return _TERMINAL_CONTROL.sub(_terminal_escape, s)
+
+
+class _TerminalStream:
+    """`orig` with every write passed through `_terminal_text`: what
+    `main()` makes `sys.stdout` and `sys.stderr`, so nothing the process
+    prints — a `print` of the question UI or `list`, a traceback — reaches
+    the terminal as a control sequence. Attribute access falls through."""
+
+    def __init__(self, orig: TextIO) -> None:
+        self._orig = orig
+
+    def write(self, s: str) -> int:
+        self._orig.write(_terminal_text(s))
+        return len(s)
+
+    def __getattr__(self, name: str):
+        return getattr(self._orig, name)
+
+
+def _guard_terminal_streams() -> None:
+    """Make `sys.stdout` and `sys.stderr` `_TerminalStream`s, once."""
+    for name in ("stdout", "stderr"):
+        cur = getattr(sys, name)
+        if not isinstance(cur, (_TerminalStream, _TeeStream)):
+            setattr(sys, name, _TerminalStream(cur))
+
+
 def log(msg: str) -> None:
-    """Emit one orchestrator line. **Never raises.**
+    """Emit one orchestrator line. **Never raises.** `msg` is printed as
+    `_terminal_text` (the host-side seams that load this module call `log`
+    without `main()`'s streams).
 
     A logging call must not be able to kill a run, and here it could. On the
     remote runtime `sys.stdout` IS `<run_dir>/orchestrator.log` — the launcher
@@ -4798,7 +5069,7 @@ def log(msg: str) -> None:
     with contextlib.suppress(OSError, ValueError):
         repo = Path(os.environ.get("USER_REPO") or os.getcwd()).name or "?"
         ts = datetime.now().astimezone().isoformat(timespec="seconds")
-        print(f"{ts} [leerie] [{repo}] {msg}", flush=True)
+        print(_terminal_text(f"{ts} [leerie] [{repo}] {msg}"), flush=True)
 
 
 # Module-level run id, set once `State.__init__` has assigned a run
@@ -4823,7 +5094,7 @@ def _operator_path(p: "str | Path") -> str:
     The orchestrator runs inside a container where the state root is mounted at
     `/leerie-state`, so a message naming `<state-root>/runs/<id>/state.json`
     prints a path that does not exist on the machine reading it: `ls
-    /leerie-state` fails on the host (docs/POSTMORTEM-2026-08-14.md, F17).
+    /leerie-state` fails on the host (tests/test_operator_path_translation.py).
 
     The launcher forwards the host side of that bind-mount as
     `LEERIE_STATE_HOST_DIR_DISPLAY`. The `_DISPLAY` suffix is deliberate and
@@ -4847,7 +5118,8 @@ def die(msg: str, code: int = 1):
     if _CURRENT_RUN_ID:
         msg = f"{msg} (run {_CURRENT_RUN_ID})"
     with contextlib.suppress(OSError, ValueError):
-        print(f"leerie: error: {msg}", file=sys.stderr, flush=True)
+        print(_terminal_text(f"leerie: error: {msg}"), file=sys.stderr,
+              flush=True)
     sys.exit(code)
 
 
@@ -4868,6 +5140,9 @@ class _TeeStream:
         self._logf = logf
 
     def write(self, s: str) -> int:
+        # The terminal and the log file (which `leerie attach` and an
+        # operator's `cat` show) get the same escaped text.
+        s = _terminal_text(s)
         n = self._orig.write(s)
         try:
             self._logf.write(s)
@@ -6014,7 +6289,8 @@ def _reads_package_manager(tree: str | Path, wd: str) -> bool:
     """Whether `<tree>/<wd>/package.json` pins `packageManager` — which
     corepack honours over the seeded default."""
     try:
-        pj = json.loads((Path(tree) / wd / "package.json").read_text())
+        pj = json.loads(_read_text_beneath(
+            Path(tree), Path(tree) / wd / "package.json", errors="strict", limit=READ_LIMIT_CONFIG))
     except (OSError, ValueError):
         return False
     return bool(isinstance(pj, dict) and pj.get("packageManager"))
@@ -6188,7 +6464,7 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
     prune), so it drops the registration of every worktree whose path is absent
     from *this* namespace — including each host-side
     `/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates, which no container
-    can see (docs/POSTMORTEM-2026-08-14.md, F19).
+    can see (tests/test_worktree_prune_scoping.py).
 
     The shell scripts were converted first and these four Python sites were
     missed, because the sweep and its guard were both scoped to `scripts/*.sh`.
@@ -6329,6 +6605,30 @@ async def _rmtree_fallback_and_prune(worktree: Path, leerie_dir: Path) -> None:
     await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
 
 
+def _drop_view(leerie_dir: Path, tree: Path) -> None:
+    """Remove the committed view of the worker tree `tree` and its own
+    stores (DESIGN §8 *A view lives no longer than its tree*): the view at
+    `<run-dir>/worktrees/<prefix>-view-<tree name>` — a checkout of the run
+    repository — and `<run-dir>/tree-stores/<view name>`, with every record
+    this process keeps of it. Derived from the tree's name alone, so a view
+    a process before a resume made goes too. Absent ones are the idempotent
+    case."""
+    run_dir = Path(leerie_dir)
+    view = run_dir / "worktrees" / _worktree_dirname(
+        run_dir.name, f"view-{Path(tree).name}")
+    subprocess.run(["git", "--git-dir", str(run_dir / RUN_REPO_NAME),
+                    "worktree", "remove", "--force", str(view)],
+                   capture_output=True, check=False)
+    if view.exists() or view.is_symlink():
+        _rmtree_owned(view)
+    _rmtree_owned(run_dir / TREE_STORES_DIRNAME / view.name)
+    _VIEWS.pop(os.path.realpath(tree), None)
+    real = os.path.realpath(view)
+    for memo in (_VIEW_INSTALLS, _DEPS_FAILED, _DEPS_KEPT, _INSTALL_OUTPUTS):
+        memo.pop(real, None)
+    _DEPS_INSTALLED.discard(real)
+
+
 async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> None:
     """Remove the per-subtask worktree directory and branch so a corrective
     retry can start clean from `new-worktree.sh`'s "fresh subtask" path.
@@ -6360,6 +6660,7 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     # repository per committing tree (I6)*).
     await asyncio.to_thread(_drop_tree_repo, Path(leerie_dir),
                             worktree.name, take=False)
+    await asyncio.to_thread(_drop_view, Path(leerie_dir), worktree)
 
 
 async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
@@ -6377,11 +6678,12 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     worktree = _subtask_worktree_path(leerie_dir, sid)
     # A tree of its own repository: its branch is taken, then the tree and
     # its repository go (DESIGN §6 *A repository per committing tree (I6)*).
-    # A take that fails keeps both.
+    # A take that fails keeps both, and the view of what it holds.
     if (Path(leerie_dir) / TREE_REPOS_NAME / worktree.name / "HEAD").is_file():
         if await asyncio.to_thread(_drop_tree_repo, Path(leerie_dir),
                                    worktree.name, take=True):
             await asyncio.to_thread(_rmtree_owned, worktree)
+            await asyncio.to_thread(_drop_view, Path(leerie_dir), worktree)
         return
     try:
         await run_proc(["git", "--git-dir",
@@ -6391,6 +6693,7 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     except subprocess.TimeoutExpired:
         log(f"[{sid}] git worktree remove timed out; falling back to rmtree")
     await _rmtree_fallback_and_prune(worktree, leerie_dir)
+    await asyncio.to_thread(_drop_view, Path(leerie_dir), worktree)
 
 
 def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
@@ -6938,14 +7241,18 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             if not isinstance(e, dict) or e.get("addressed") is True:
                 continue
             simulated = e.get("simulated_interleaving") is True
-            if e.get("gap") != "unverified_external" and not simulated:
+            resource = _pr_entry(e.get("resource"))
+            # External only with the resource a human must supply: an
+            # entry recorded without one (an older leerie typed every
+            # unexercised path external) is a gap the run's own checks
+            # answer, not a check for a human (DESIGN §9).
+            if not simulated and not (
+                    e.get("gap") == "unverified_external" and resource):
                 continue
             detail = _pr_entry(e.get("detail"))
             if not detail:
                 continue
-            group = _pr_entry(e.get("resource")) or (
-                "A real concurrent engine" if simulated
-                else "Outside this repository's checks")
+            group = resource or "A real concurrent engine"
             add(group, f"- [ ] **{sid}**: {detail}"
                 + _pr_paths(e.get("where_paths"))
                 + (" — tests simulate the interleaving" if simulated
@@ -7260,7 +7567,7 @@ def _task_fingerprint(task: str) -> str:
     are invisible to each other. Measured: one task ran twice, three minutes
     apart, for $72.21 across 173 worker calls, producing two architecturally
     incompatible branches with 14 files in collision and two PRs whose merge
-    order matters (docs/POSTMORTEM-2026-08-14.md, F10)."""
+    order matters (tests/test_duplicate_task_guard.py)."""
     return hashlib.sha256((task or "").encode("utf-8")).hexdigest()
 
 
@@ -8144,10 +8451,31 @@ def _read_toml_key(path: Path, key: str) -> str | None:
     None when the file does not exist or the key is absent. Strips
     matched surrounding double or single quotes from the value. Used
     by both source-of-truth and model resolvers — keeping one parser
-    means a fix benefits both."""
-    if not path.exists():
+    means a fix benefits both.
+
+    The file is the repository's (`<root>/leerie.toml` or
+    `<root>/.leerie/config.toml`), read without following a link at it or
+    at `.leerie` (DESIGN §6 *Leerie never reads through a link a repository
+    holds*): one there reads as absent. A setting that names a location
+    (`REPO_CONFIG_LOCATION_KEYS`) or carries the operator's authority
+    (`REPO_CONFIG_AUTHORITY_KEYS`) is never read from it: asking is a
+    `ValueError` (DESIGN §6 *No host path comes from a repository*, *A
+    repository chooses no operator authority*)."""
+    if key in REPO_CONFIG_LOCATION_KEYS:
+        raise ValueError(f"{key} names a location and has no repository "
+                         "configuration key")
+    if key in REPO_CONFIG_AUTHORITY_KEYS:
+        raise ValueError(f"{key} is the operator's to set "
+                         f"({REPO_CONFIG_AUTHORITY_KEYS[key]}) and has no "
+                         "repository configuration key")
+    path = Path(path)
+    root = path.parent.parent if path.parent.name == ".leerie" \
+        else path.parent
+    try:
+        text = _read_text_beneath(root, path, errors="strict", limit=READ_LIMIT_CONFIG)
+    except (OSError, ValueError):
         return None
-    for raw in path.read_text().splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -8176,6 +8504,21 @@ def _is_task_file_reference(raw: str) -> bool:
 # (ENAMETOOLONG, ELOOP, EACCES, …) means the filesystem could not answer at
 # all, which is not the same as "no" — see resolve_task_argument.
 _DEFINITE_ABSENCE = frozenset({errno.ENOENT, errno.ENOTDIR})
+
+
+def _task_file_text(p: Path) -> str:
+    """The text of the task file `p`. One in the checkout (the working
+    directory) is the repository's, read beneath it without following a link
+    (DESIGN §6 *Leerie never reads through a link a repository holds*): a
+    committed `TASK.md` linked to the orchestrator's environment would
+    otherwise become the task every worker and the PR body carry. One
+    outside it is a file the operator named themselves."""
+    cwd = Path(os.getcwd())
+    try:
+        _beneath_parts(cwd, p)
+    except OSError:
+        return p.read_text()
+    return _read_text_beneath(cwd, cwd / p, errors="strict", limit=READ_LIMIT_TEXT)
 
 
 def resolve_task_argument(raw: str) -> str:
@@ -8211,7 +8554,11 @@ def resolve_task_argument(raw: str) -> str:
         if e.errno not in _DEFINITE_ABSENCE:
             stat_ok = False
     if is_task_file:
-        contents = p.read_text().strip()
+        try:
+            contents = _task_file_text(p).strip()
+        except (OSError, ValueError) as e:
+            die(f"task file {raw!r} cannot be read as a file of the "
+                f"checkout: {e}")
         if not contents:
             die(f"task file {raw!r} is empty")
         return contents
@@ -8239,11 +8586,12 @@ def resolve_leerie_root(repo_root: Path) -> Path:
 
 
 def _resolve_enum_pref(repo_root: Path, cli_value: str | None, *,
-                       env_var: str, file_key: str, file_name: str,
+                       env_var: str, file_key: str | None, file_name: str,
                        allowed: frozenset[str] | tuple[str, ...],
                        default: str) -> str:
     """Shared resolution for enum-valued prefs. CLI > env > file > default.
-    Bad env or file values die() at startup. Mirrors _resolve_bool_pref."""
+    Bad env or file values die() at startup. Mirrors _resolve_bool_pref.
+    `file_key` None: no file tier (an operator's setting)."""
     if cli_value:
         return cli_value
     env = os.environ.get(env_var, "").strip()
@@ -8251,6 +8599,8 @@ def _resolve_enum_pref(repo_root: Path, cli_value: str | None, *,
         if env not in allowed:
             die(f"{env_var}={env!r} is not one of {allowed}")
         return env
+    if file_key is None:
+        return default
     cfg = repo_root / file_name
     file_val = _read_toml_key(cfg, file_key)
     if file_val is not None:
@@ -8307,13 +8657,14 @@ def _effective_source_of_truth(st: "State") -> str:
 def resolve_runtime(repo_root: Path,
                     cli_value: str | None = None) -> str:
     """Resolve the runtime mode. Order:
-    --runtime CLI flag → LEERIE_RUNTIME env var → leerie.toml → default 'local'.
+    --runtime CLI flag → LEERIE_RUNTIME env var → default 'local'. No
+    leerie.toml tier (REPO_CONFIG_AUTHORITY_KEYS).
     argparse validates `cli_value` via choices=, so it is trusted when set.
     env and file values are rejected via die() if not in RUNTIME_VALUES — a
     bad config is caught at startup, not during a worker run."""
     return _resolve_enum_pref(
         repo_root, cli_value,
-        env_var=RUNTIME_ENV, file_key="runtime",
+        env_var=RUNTIME_ENV, file_key=None,
         file_name=RUNTIME_FILE,
         allowed=RUNTIME_VALUES, default="local")
 
@@ -8383,10 +8734,11 @@ def resolve_pr_base_branch(repo_root: Path,
 
 
 def _resolve_positive_int_pref(repo_root: Path, cli_value: int | None, *,
-                               env_var: str, file_key: str, file_name: str,
-                               default: int) -> int:
+                               env_var: str, file_key: str | None,
+                               file_name: str, default: int) -> int:
     """Shared resolution for positive-int prefs. CLI > env > file > default.
-    Bad env or file values die() at startup. Mirrors _resolve_bool_pref."""
+    Bad env or file values die() at startup. Mirrors _resolve_bool_pref.
+    `file_key` None: no file tier (an operator's setting)."""
     if cli_value is not None:
         return cli_value
     env = os.environ.get(env_var, "").strip()
@@ -8398,6 +8750,8 @@ def _resolve_positive_int_pref(repo_root: Path, cli_value: int | None, *,
         if n < 1:
             die(f"{env_var}={env!r} is not a positive integer")
         return n
+    if file_key is None:
+        return default
     cfg = repo_root / file_name
     file_val = _read_toml_key(cfg, file_key)
     if file_val is not None:
@@ -8980,9 +9334,11 @@ def resolve_worker_memory_max(repo_root: Path,
                               ) -> int:
     """Resolve the per-worker cgroup memory cap (bytes). Order:
     --worker-memory-max CLI flag → LEERIE_WORKER_MEMORY_MAX env →
-    leerie.toml `worker_memory_max` → auto-derive (`_auto_worker_memory_max`:
+    auto-derive (`_auto_worker_memory_max`:
     a fixed isolation ceiling from the shared `leerie.slice` budget, falling
-    back to /proc/meminfo only when no broker/slice budget is readable).
+    back to /proc/meminfo only when no broker/slice budget is readable). No
+    leerie.toml tier: a containment ceiling is the operator's
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     An explicit value bypasses the derivation only. The admission gate still
     runs — it reads shared slice headroom, which is orthogonal to any one
@@ -9001,7 +9357,7 @@ def resolve_worker_memory_max(repo_root: Path,
     (unclamped — the shared slice budget is a refusal condition, not a
     ceiling on the raise: a value exceeding it die()s rather than being
     silently trimmed); an explicit
-    CLI/env/file value is left as the operator's decision but refused with
+    CLI/env value is left as the operator's decision but refused with
     an actionable die() naming --worker-memory-max, since silently
     overriding an explicit cap would be a different kind of surprise."""
     explicit_source: str | None = None
@@ -9014,13 +9370,7 @@ def resolve_worker_memory_max(repo_root: Path,
             val = _parse_memory_size(env, WORKER_MEMORY_MAX_ENV)
             explicit_source = WORKER_MEMORY_MAX_ENV
         else:
-            cfg = repo_root / WORKER_MEMORY_MAX_FILE
-            file_val = _read_toml_key(cfg, "worker_memory_max")
-            if file_val is not None:
-                val = _parse_memory_size(file_val, f"{cfg}: worker_memory_max")
-                explicit_source = f"{cfg}: worker_memory_max"
-            else:
-                val = _auto_worker_memory_max(max_parallel)
+            val = _auto_worker_memory_max(max_parallel)
 
     # `declared_heap_bytes` is a parameter so `main()` can resolve it once
     # and reuse it for `resolve_worker_demand_estimate` without a second
@@ -9143,13 +9493,14 @@ def resolve_worker_pids_max(repo_root: Path,
                             cli_value: int | None = None) -> int:
     """Resolve the per-worker cgroup PID cap (pids.max). Order:
     --worker-pids-max CLI flag → LEERIE_WORKER_PIDS_MAX env →
-    leerie.toml `worker_pids_max` → DEFAULT_CAPS["worker_pids_max"].
+    DEFAULT_CAPS["worker_pids_max"]. No leerie.toml tier
+    (REPO_CONFIG_AUTHORITY_KEYS).
     argparse validates `cli_value` is a positive int via
     `type=_positive_int` so it is trusted when set; env and file values
     die() when not a positive int — bad config caught at startup."""
     return _resolve_positive_int_pref(
         repo_root, cli_value,
-        env_var=WORKER_PIDS_MAX_ENV, file_key="worker_pids_max",
+        env_var=WORKER_PIDS_MAX_ENV, file_key=None,
         file_name=WORKER_PIDS_MAX_FILE,
         default=DEFAULT_CAPS["worker_pids_max"])
 
@@ -9158,10 +9509,10 @@ def resolve_inspect_dirs(repo_root: Path,
                          cli_values: list[str] | None = None) -> list[str]:
     """Resolve the extra inspection directories for classifier/planner/
     reconciler/provision. Order: --inspect-dir CLI flags (one or more, repeatable) →
-    LEERIE_INSPECT_DIRS env var (colon-separated) → inspect_dirs in
-    leerie.toml (comma-separated string) → []. Paths are expanded
-    (~ → $HOME) and resolved to absolute form so a relative path in TOML
-    still works after the orchestrator changes cwd. Non-existent paths
+    LEERIE_INSPECT_DIRS env var (colon-separated) → []. No leerie.toml tier:
+    a host directory comes only from the operator (REPO_CONFIG_LOCATION_KEYS).
+    Paths are expanded (~ → $HOME) and resolved to absolute form so a
+    relative path still works after the orchestrator changes cwd. Non-existent paths
     are accepted at resolve time — the CLI surfaces a clearer error if
     --add-dir gets a bad path, and we want startup to fail fast at the
     use site rather than rejecting a typo before classify even runs."""
@@ -9196,13 +9547,6 @@ def resolve_inspect_dirs(repo_root: Path,
     if env:
         for p in env.split(":"):
             _add(p)
-        return out
-    cfg = repo_root / INSPECT_DIRS_FILE
-    file_val = _read_toml_key(cfg, "inspect_dirs")
-    if file_val is not None:
-        for p in file_val.split(","):
-            _add(p)
-        return out
     return out
 
 
@@ -9222,12 +9566,14 @@ def _parse_bool_envtoml(value: str) -> bool | None:
 
 
 def _resolve_bool_pref(repo_root: Path, cli_value: bool, *,
-                       env_var: str, file_key: str, file_name: str) -> bool:
+                       env_var: str, file_key: str | None,
+                       file_name: str) -> bool:
     """Shared resolution for `store_true` CLI flags that also have an
     env-var and per-repo TOML mirror (see DESIGN §11 / §6 patterns).
     Order: CLI True wins → env → file → False. Bad env or file values
     `die()` at startup, not mid-run. Used by `resolve_no_push` and
-    `resolve_clarify`; keep one shape so they cannot drift."""
+    `resolve_clarify`; keep one shape so they cannot drift. `file_key`
+    None: no file tier (an operator's setting, `REPO_CONFIG_AUTHORITY_KEYS`)."""
     if cli_value:
         return True
     env = os.environ.get(env_var, "").strip()
@@ -9239,6 +9585,8 @@ def _resolve_bool_pref(repo_root: Path, cli_value: bool, *,
                 "(use 1/0, true/false, yes/no, on/off)")
         if parsed is not None:
             return parsed
+    if file_key is None:
+        return False
     cfg = repo_root / file_name
     file_val = _read_toml_key(cfg, file_key)
     if file_val is not None:
@@ -9456,7 +9804,8 @@ def resolve_dangerously_skip_permissions(
     """Resolve the --dangerously-skip-permissions preference. Order:
     --dangerously-skip-permissions CLI flag (action='store_true') →
     LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env var →
-    dangerously_skip_permissions in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, judgment workers (PLANNING_WORKER_TYPES) get a WIDENED
     allowlist — the leading verbs of the repo's declared build/lint/test
@@ -9471,7 +9820,7 @@ def resolve_dangerously_skip_permissions(
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=DANGEROUS_SKIP_PERMS_ENV,
-        file_key="dangerously_skip_permissions",
+        file_key=None,
         file_name=DANGEROUS_SKIP_PERMS_FILE)
 
 
@@ -9480,7 +9829,8 @@ def resolve_dangerously_allow_uncapped(
     """Resolve the --dangerously-allow-uncapped preference. Order:
     --dangerously-allow-uncapped CLI flag (action='store_true') →
     LEERIE_DANGEROUSLY_ALLOW_UNCAPPED env var →
-    dangerously_allow_uncapped in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, a failed cgroup broker probe (workers would run without
     memory/PID containment) is a loud warning instead of a fatal error.
@@ -9489,7 +9839,7 @@ def resolve_dangerously_allow_uncapped(
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=DANGEROUS_ALLOW_UNCAPPED_ENV,
-        file_key="dangerously_allow_uncapped",
+        file_key=None,
         file_name=DANGEROUS_ALLOW_UNCAPPED_FILE)
 
 
@@ -9498,7 +9848,8 @@ def resolve_dangerously_force_strict_output(
     """Resolve the --dangerously-force-strict-output preference. Order:
     --dangerously-force-strict-output CLI flag (action='store_true') →
     LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT env var →
-    dangerously_force_strict_output in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, worker API traffic is routed through a per-run loopback proxy
     that sets `strict: true` on the `StructuredOutput` tool Claude Code
@@ -9511,7 +9862,7 @@ def resolve_dangerously_force_strict_output(
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=DANGEROUS_FORCE_STRICT_OUTPUT_ENV,
-        file_key="dangerously_force_strict_output",
+        file_key=None,
         file_name=DANGEROUS_FORCE_STRICT_OUTPUT_FILE)
 
 
@@ -9519,7 +9870,8 @@ def resolve_skip_overlap_judge(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-overlap-judge preference. Order:
     --skip-overlap-judge CLI flag (action='store_true') →
     LEERIE_SKIP_OVERLAP_JUDGE env var →
-    skip_overlap_judge in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `phase_overlap_judge` (DESIGN §5 *Cross-domain surface
     overlap*) skips the worker spawn even on multi-planner runs that
@@ -9531,7 +9883,7 @@ def resolve_skip_overlap_judge(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_OVERLAP_JUDGE_ENV,
-        file_key="skip_overlap_judge",
+        file_key=None,
         file_name=SKIP_OVERLAP_JUDGE_FILE)
 
 
@@ -9539,7 +9891,8 @@ def resolve_skip_budget_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-budget-check preference. Order:
     --skip-budget-check CLI flag (action='store_true') →
     LEERIE_SKIP_BUDGET_CHECK env var →
-    skip_budget_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `check_budget_feasibility()` (DESIGN §13 *Budget
     feasibility — fail fast at the cheapest moment*) is suppressed.
@@ -9553,7 +9906,7 @@ def resolve_skip_budget_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_BUDGET_CHECK_ENV,
-        file_key="skip_budget_check",
+        file_key=None,
         file_name=SKIP_BUDGET_CHECK_FILE)
 
 
@@ -9561,7 +9914,8 @@ def resolve_skip_satisfied_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-satisfied-check preference. Order:
     --skip-satisfied-check CLI flag (action='store_true') →
     LEERIE_SKIP_SATISFIED_CHECK env var →
-    skip_satisfied_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `_filter_satisfied_subtasks()` (DESIGN §8 *Already-
     satisfied subtask elimination*) is suppressed: no `satisfied_probe`
@@ -9577,7 +9931,7 @@ def resolve_skip_satisfied_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_SATISFIED_CHECK_ENV,
-        file_key="skip_satisfied_check",
+        file_key=None,
         file_name=SKIP_SATISFIED_CHECK_FILE)
 
 
@@ -9602,7 +9956,8 @@ def resolve_skip_base_baseline(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-base-baseline preference. Order:
     --skip-base-baseline CLI flag (action='store_true') →
     LEERIE_SKIP_BASE_BASELINE env var →
-    skip_base_baseline in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `_capture_conformance_baseline` is not run — the once-per-run
     install-into-staging + build/lint/test pass that records base-tree
@@ -9612,7 +9967,7 @@ def resolve_skip_base_baseline(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_BASE_BASELINE_ENV,
-        file_key="skip_base_baseline",
+        file_key=None,
         file_name=SKIP_BASE_BASELINE_FILE)
 
 
@@ -9620,7 +9975,8 @@ def resolve_skip_acceptance_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-acceptance-check preference. Order:
     --skip-acceptance-check CLI flag (action='store_true') →
     LEERIE_SKIP_ACCEPTANCE_CHECK env var →
-    skip_acceptance_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, no held-out acceptance sets are written and the
     post-integration acceptance gate does not run (DESIGN §8 *Held-out
@@ -9628,7 +9984,7 @@ def resolve_skip_acceptance_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_ACCEPTANCE_CHECK_ENV,
-        file_key="skip_acceptance_check",
+        file_key=None,
         file_name=SKIP_ACCEPTANCE_CHECK_FILE)
 
 
@@ -9654,7 +10010,8 @@ def resolve_skip_adherence_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-adherence-check preference. Order:
     --skip-adherence-check CLI flag (action='store_true') →
     LEERIE_SKIP_ADHERENCE_CHECK env var →
-    skip_adherence_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, the instruction-adherence gate is not run — the
     deterministic prescribed-command-coverage floor and the
@@ -9666,7 +10023,7 @@ def resolve_skip_adherence_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_ADHERENCE_CHECK_ENV,
-        file_key="skip_adherence_check",
+        file_key=None,
         file_name=SKIP_ADHERENCE_CHECK_FILE)
 
 
@@ -9674,7 +10031,8 @@ def resolve_skip_coverage_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-coverage-check preference. Order:
     --skip-coverage-check CLI flag (action='store_true') →
     LEERIE_SKIP_COVERAGE_CHECK env var →
-    skip_coverage_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, required-items checking is suppressed on BOTH sides:
     `phase_planning_coverage_gate` (the advisory `task_coverage_judge`
@@ -9687,7 +10045,7 @@ def resolve_skip_coverage_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_COVERAGE_CHECK_ENV,
-        file_key="skip_coverage_check",
+        file_key=None,
         file_name=SKIP_COVERAGE_CHECK_FILE)
 
 
@@ -9695,7 +10053,8 @@ def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-completeness-check preference. Order:
     --skip-completeness-check CLI flag (action='store_true') →
     LEERIE_SKIP_COMPLETENESS_CHECK env var →
-    skip_completeness_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, the conformer's gating `solution_defects` axis (DESIGN §9 *The
     one gating axis: solution completeness*) becomes advisory: found defects
@@ -9706,7 +10065,7 @@ def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_COMPLETENESS_CHECK_ENV,
-        file_key="skip_completeness_check",
+        file_key=None,
         file_name=SKIP_COMPLETENESS_CHECK_FILE)
 
 
@@ -9714,7 +10073,8 @@ def resolve_skip_integration_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-integration-check preference. Order:
     --skip-integration-check CLI flag (action='store_true') →
     LEERIE_SKIP_INTEGRATION_CHECK env var →
-    skip_integration_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `integrate_wave` never invokes `integration_judge` — the
     independent adversarial verification of a committed merge (DESIGN §8) —
@@ -9726,7 +10086,7 @@ def resolve_skip_integration_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_INTEGRATION_CHECK_ENV,
-        file_key="skip_integration_check",
+        file_key=None,
         file_name=SKIP_INTEGRATION_CHECK_FILE)
 
 
@@ -9734,7 +10094,8 @@ def resolve_skip_classification_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-classification-check preference. Order:
     --skip-classification-check CLI flag (action='store_true') →
     LEERIE_SKIP_CLASSIFICATION_CHECK env var →
-    skip_classification_check in leerie.toml → False.
+    False. No leerie.toml tier: an operator's waiver
+    (REPO_CONFIG_AUTHORITY_KEYS).
 
     When True, `phase_classification_gate` never invokes
     `classification_judge` and the classifier's own category set is used
@@ -9745,7 +10106,7 @@ def resolve_skip_classification_check(repo_root: Path, cli_value: bool) -> bool:
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_CLASSIFICATION_CHECK_ENV,
-        file_key="skip_classification_check",
+        file_key=None,
         file_name=SKIP_CLASSIFICATION_CHECK_FILE)
 
 
@@ -9984,28 +10345,31 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
     return efforts
 
 
+def _resolve_operator_str(cli_value: str | None, env_var: str,
+                          default: str) -> str:
+    """CLI > env > default, with no repository-file tier: for a setting that
+    names a location (REPO_CONFIG_LOCATION_KEYS)."""
+    if cli_value and cli_value.strip():
+        return cli_value.strip()
+    return os.environ.get(env_var, "").strip() or default
+
+
 def resolve_judge_dir(repo_root: Path, cli_value: str | None = None) -> str:
     """Resolve the judge output directory name. Order:
     --judge-dir CLI flag → LEERIE_JUDGE_DIR env var →
-    judge_dir in leerie.toml → JUDGE_DIR_DEFAULT ("judge-out").
-    The value is a plain directory name (or relative path) appended to
-    the run dir — not validated against the filesystem at resolve time."""
-    return _resolve_str_pref(
-        repo_root, cli_value,
-        env_var=JUDGE_DIR_ENV, file_key="judge_dir",
-        file_name=JUDGE_DIR_FILE, default=JUDGE_DIR_DEFAULT)
+    JUDGE_DIR_DEFAULT ("judge-out"). No leerie.toml tier: the value is a
+    location (REPO_CONFIG_LOCATION_KEYS). It is a plain directory name (or
+    relative path) appended to the run dir — not validated against the
+    filesystem at resolve time."""
+    return _resolve_operator_str(cli_value, JUDGE_DIR_ENV, JUDGE_DIR_DEFAULT)
 
 
 def resolve_heal_dir(repo_root: Path, cli_value: str | None = None) -> str:
     """Resolve the heal output directory name. Order:
     --heal-dir CLI flag → LEERIE_HEAL_DIR env var →
-    heal_dir in leerie.toml → HEAL_DIR_DEFAULT ("heal-out").
-    The value is a plain directory name (or relative path) appended to
-    the run dir — not validated against the filesystem at resolve time."""
-    return _resolve_str_pref(
-        repo_root, cli_value,
-        env_var=HEAL_DIR_ENV, file_key="heal_dir",
-        file_name=HEAL_DIR_FILE, default=HEAL_DIR_DEFAULT)
+    HEAL_DIR_DEFAULT ("heal-out"). No leerie.toml tier, as
+    `resolve_judge_dir`."""
+    return _resolve_operator_str(cli_value, HEAL_DIR_ENV, HEAL_DIR_DEFAULT)
 
 
 def resolve_heal_max_rounds(repo_root: Path, cli_value: int | None = None) -> int:
@@ -10073,6 +10437,10 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
         *cmd,
         cwd=cwd,
         env=env,
+        # Never the orchestrator's fd 0, the operator's terminal in an
+        # interactive run (DESIGN §6 *No confined process holds a
+        # descriptor of the operator's terminal*).
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
@@ -10117,68 +10485,6 @@ _EXEC_EXCLUSIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # while the first one holds the lock.
 _EXEC_SHARED: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_EXEC_SHARED", default=False)
-# The host-wide level, in the directory every local run on the host shares
-# (`_HOST_DIR_ENV`, next to the build semaphore): `flock` gives no writer
-# preference, so a waiting evaluation holds the intent file exclusive and
-# every shared taker passes through it shared first.
-HOST_EXEC_LOCK = "exec.lock"
-HOST_EXEC_INTENT = "exec.intent"
-
-
-def _host_flock(path: Path, op: int) -> int:
-    """Open `path` (made when missing) and `flock` it with `op`, blocking;
-    the descriptor, which holds the lock until closed."""
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
-    try:
-        fcntl.flock(fd, op)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
-@contextlib.asynccontextmanager
-async def _host_exec_lock(exclusive: bool) -> AsyncIterator[None]:
-    """The host's level of the execution lock: shared by every worker and
-    confined command of every run on the host, exclusive by a held-out
-    evaluation. No-op without the host directory (Fly and EC2 run one run
-    per machine; a test). Each holder opens its own descriptors; a blocking
-    `flock` runs in a thread, so the loop never waits on another run."""
-    host = os.environ.get(_HOST_DIR_ENV, "").strip()
-    if not host or not os.path.isdir(host):
-        yield
-        return
-    lock_p = Path(host) / HOST_EXEC_LOCK
-    intent_p = Path(host) / HOST_EXEC_INTENT
-    held: list[int] = []
-
-    async def _take(path: Path, op: int) -> int:
-        # Shielded: a cancelled wait leaves the thread blocked in `flock`;
-        # the descriptor it returns once it gets the lock is closed then,
-        # never stranded holding it.
-        fut = asyncio.ensure_future(asyncio.to_thread(_host_flock, path, op))
-        try:
-            fd = await asyncio.shield(fut)
-        except asyncio.CancelledError:
-            fut.add_done_callback(
-                lambda f: f.cancelled() or f.exception() is not None
-                or _close_fd(f.result()))
-            raise
-        held.append(fd)
-        return fd
-    try:
-        if exclusive:
-            await _take(intent_p, fcntl.LOCK_EX)
-            await _take(lock_p, fcntl.LOCK_EX)
-        else:
-            intent = await _take(intent_p, fcntl.LOCK_SH)
-            await _take(lock_p, fcntl.LOCK_SH)
-            held.remove(intent)
-            os.close(intent)
-        yield
-    finally:
-        for fd in held:
-            _close_fd(fd)
 
 
 class _ExecLock:
@@ -10190,13 +10496,15 @@ class _ExecLock:
     command on the repository's code exists. A waiting exclusive holder stops
     new shared ones, so a stream of measurements cannot starve it. Nothing
     that holds it shared waits on an evaluation — it is taken after every
-    semaphore, and a shared holder's commands pass through — so it cannot
-    deadlock; a worker spawned inside an evaluation stops the run instead of
-    waiting. The host's level (`_host_exec_lock`) is taken inside it, by the
-    outermost holder only."""
+    semaphore and before a host build slot, and a shared holder's commands
+    pass through — so it cannot deadlock; a worker spawned inside an evaluation stops the run instead of
+    waiting. It is the run's alone: no level spans runs (DESIGN §6 *There is
+    no host level*). An evaluation that must wait logs both ends of its
+    wait, so a stall is never silent."""
 
     def __init__(self) -> None:
         self.readers = 0
+        self.workers = 0
         self.writer = False
         self.writers_waiting = 0
         self._waiters: list[asyncio.Future] = []
@@ -10234,13 +10542,14 @@ class _ExecLock:
         while self.writer or self.writers_waiting:
             await self._wait()
         self.readers += 1
+        self.workers += worker
         token = _EXEC_SHARED.set(True)
         try:
-            async with _host_exec_lock(False):
-                yield
+            yield
         finally:
             _EXEC_SHARED.reset(token)
             self.readers -= 1
+            self.workers -= worker
             if not self.readers:
                 self._wake()
 
@@ -10256,17 +10565,25 @@ class _ExecLock:
                 "itself (DESIGN §6 *A held-out evaluation runs alone*). "
                 "Report this.")
         self.writers_waiting += 1
+        t0 = time.monotonic() if (self.writer or self.readers) else None
+        if t0 is not None:
+            behind = ", behind another evaluation" if self.writer else ""
+            log(f"  execution lock: held-out evaluation waits for "
+                f"{self.readers} shared holder(s) of this run "
+                f"({self.workers} worker(s)){behind}")
         try:
             while self.writer or self.readers:
                 await self._wait()
         finally:
             self.writers_waiting -= 1
             self._wake()
+        if t0 is not None:
+            log(f"  execution lock: held-out evaluation waited "
+                f"{time.monotonic() - t0:.0f}s")
         self.writer = True
         token = _EXEC_EXCLUSIVE.set(True)
         try:
-            async with _host_exec_lock(True):
-                yield True
+            yield True
         finally:
             _EXEC_EXCLUSIVE.reset(token)
             self.writer = False
@@ -10300,12 +10617,18 @@ async def _held_out_section(st: object) -> AsyncIterator[None]:
     """Hold the execution lock exclusive around a held-out file's sandboxed
     run (DESIGN §6 *A held-out evaluation runs alone, in a world that dies
     with it (I3)*): no worker process and no other command on the
-    repository's code exists meanwhile, in the run or on the host, so
-    nothing observes what a namespace cannot hide — its `/proc` entries,
+    repository's code exists meanwhile in the run, so nothing of the run
+    observes what a namespace cannot hide — its `/proc` entries,
     its cgroup's counters, its contention. Its own commands pass through;
-    nested sections are one. What it leaves is the sandbox's, gone with
-    it: nothing is inventoried or removed here."""
-    async with _exec_lock().exclusive():
+    nested sections are one. Then a host build slot, as every command takes
+    one after the lock (DESIGN §6 *Inside an evaluation every concurrency
+    gate is already the holder's*): the evaluation is one of the host's
+    builds, and it holds no slot while it waits for its run's workers. What
+    it leaves is the sandbox's, gone with it: nothing is inventoried or
+    removed here."""
+    async with _exec_lock().exclusive() as outermost, \
+            _host_build_slot(st, label="held-out evaluation",
+                             take=outermost):
         yield
 
 
@@ -10438,6 +10761,9 @@ async def _run_streaming(
                                    if fd is not None),
                     cwd=cwd,
                     env={**_repo_command_env(env), **dict(grants.env)},
+                    # DESIGN §6 *No confined process holds or can open
+                    # the operator's terminal*.
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
@@ -10641,16 +10967,21 @@ def _is_git_dir(p: Path) -> bool:
 def _admin_dir_of(common: Path, tree: Path) -> Path | None:
     """`common`'s administrative directory for its worktree `tree`, found
     from the repository's side (each `worktrees/*/gitdir`), never from
-    `tree/.git`."""
+    `tree/.git`. A tree repository is its committing worker's to write
+    whole, so each record is read beneath `common` and never through a link
+    or a FIFO (`_read_beneath`)."""
     want = os.path.realpath(tree)
+    common = Path(common)
     try:
-        dirs = sorted((Path(common) / "worktrees").iterdir())
+        dirs = [common / "worktrees" / n for n in sorted(
+            _listdir_beneath(common, common / "worktrees"))]
     except OSError:
         return None
     for d in dirs:
         try:
-            got = (d / "gitdir").read_text().strip()
-        except OSError:
+            got = _read_text_beneath(common, d / "gitdir",
+                                     errors="strict", limit=READ_LIMIT_CONFIG).strip()
+        except (OSError, ValueError):
             continue
         if os.path.realpath(os.path.dirname(got)) == want:
             return d
@@ -10692,8 +11023,9 @@ def _run_tree_location(tree: str | Path
             return shadow, shadow, run_dir
         return False
     try:
-        named = (admin / "commondir").read_text().strip()
-    except OSError:
+        named = _read_text_beneath(common, admin / "commondir",
+                                   errors="strict", limit=READ_LIMIT_CONFIG).strip()
+    except (OSError, ValueError):
         return False
     if os.path.realpath(admin / named) != os.path.realpath(common):
         return False
@@ -11511,21 +11843,24 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                         "see it")
                     continue
                 try:
-                    if src.is_dir():
+                    if _dir_beneath_exists(repo_root, src):
                         _copytree_beneath(
                             src, wt, dst,
-                            ignore=_ignore_repo_paths(repo_root, skip))
+                            ignore=_ignore_repo_paths(repo_root, skip),
+                            src_anchor=repo_root, limit=READ_LIMIT_LARGE)
                     else:
-                        _copy_beneath(src, wt, dst)
+                        _copy_beneath(src, wt, dst, src_anchor=repo_root, limit=READ_LIMIT_LARGE)
                     staged += 1
                 except Exception:
                     continue
         claude_src, claude_dst = repo_root / ".claude", wt / ".claude"
-        if claude_src.is_dir() and not _lexists_beneath(wt, claude_dst):
+        if _dir_beneath_exists(repo_root, claude_src) \
+                and not _lexists_beneath(wt, claude_dst):
             skip = _switched_branch_only_paths(repo_root, ".claude", wb_ref)
             try:
                 _copytree_beneath(claude_src, wt, claude_dst,
-                                  ignore=_ignore_repo_paths(repo_root, skip))
+                                  ignore=_ignore_repo_paths(repo_root, skip),
+                                  src_anchor=repo_root, limit=READ_LIMIT_LARGE)
                 staged += 1
             except Exception:
                 pass
@@ -12134,8 +12469,19 @@ def _resumed_wid(run_dir: Path, session: str | None) -> str | None:
     return None
 
 
-def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
-                 ) -> tuple[Path, Path]:
+def _worker_tmp(base: Path) -> Path:
+    """The worker's private temp directory, `/tmp/l/<id>/` (`<id>`: 16 hex
+    digits of the hash of the realpath of its `<run_dir>/workers/<wid>/`),
+    a pure function of the worker's directory, so whoever removes that
+    directory can remove it too (DESIGN §6 *A confined command's scratch is
+    short and private*): its length never depends on the run's id or the
+    worker's name, so a socket in it fits `sun_path`."""
+    key = os.path.realpath(base)
+    return PRIVATE_TMP_ROOT / hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None,
+                 private_tmp: bool = True) -> tuple[Path, Path]:
     """`(config, tmp)` of the worker: `<run_dir>/workers/<wid>/`, `<wid>`
     the directories that hold the resumed session, else `sid`. `config` is
     made when absent (in a sibling and renamed, so a crash never leaves
@@ -12143,10 +12489,12 @@ def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
     files (the settings, credentials and account state a worker may
     rewrite) and a link to each of its directories (plugins, skills and the
     like, read-only and shared rather than copied per worker). `tmp` is
-    made empty."""
+    made empty: the short private `_worker_tmp(<wid dir>)`, or with
+    `private_tmp` False (the host-side seam, which is not confined and runs
+    on the operator's host) `<wid dir>/tmp`."""
     wid = _resumed_wid(run_dir, resume_session) or sid
     base = Path(run_dir) / WORKERS_DIR / wid
-    config, tmp = base / "config", base / "tmp"
+    config = base / "config"
     if not config.is_dir():
         template = _claude_config_template(run_dir)
         part = base / f".config.tmp-{os.getpid()}"
@@ -12164,21 +12512,36 @@ def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
                 shutil.copy2(entry, dst)
                 os.chmod(dst, stat.S_IMODE(os.lstat(dst).st_mode) | 0o600)
         os.rename(part, config)
-    _rmtree_owned(tmp)
-    _mkdir_private(tmp, Path(run_dir))
+    if private_tmp:
+        tmp = _worker_tmp(base)
+        _rmtree_owned(tmp)
+        _own_private_dir(PRIVATE_TMP_ROOT)
+        _own_private_dir(tmp)
+        # This process's until it exits, as `_private_tmp`'s are; a process
+        # that hands it to another (`worker-guard.py`) gives it up.
+        if not _PRIVATE_TMPS:
+            atexit.register(_remove_private_tmps)
+        _PRIVATE_TMPS[str(tmp)] = os.getpid()
+    else:
+        tmp = base / "tmp"
+        _rmtree_owned(tmp)
+        _mkdir_private(tmp, Path(run_dir))
     return config, tmp
 
 
 def _confined_cli_env(run_dir: Path, sid: str,
-                      resume_session: str | None = None) -> dict[str, str]:
+                      resume_session: str | None = None,
+                      private_tmp: bool = True) -> dict[str, str]:
     """The one builder of a confined CLI's own directories (DESIGN §6
     *Every confined CLI is given its own directories, by one builder*):
     `_worker_dirs`' pair, named by every `_WORKER_ENV_DIRS` variable, to
     lay over the spawn's environment before its grant is derived from it.
     Every one is named, not only those the caller happens to have set: an
     inherited value (the orchestrator's `<run-dir>/tmp/`) lies outside the
-    grant, and the CLI's first act is to make `$TMPDIR/claude-<uid>`."""
-    config, tmp = _worker_dirs(Path(run_dir), sid, resume_session)
+    grant, and the CLI's first act is to make `$TMPDIR/claude-<uid>`.
+    `private_tmp` as `_worker_dirs`'."""
+    config, tmp = _worker_dirs(Path(run_dir), sid, resume_session,
+                               private_tmp)
     return {var: str(config if var == "CLAUDE_CONFIG_DIR" else tmp)
             for var in _WORKER_ENV_DIRS}
 
@@ -12190,6 +12553,12 @@ def _remove_worker_dirs(run_dir: Path) -> bool:
     the process that owns the run, and by the reap and prune of a run no
     process owns."""
     gone = True
+    # Each worker's private temp directory first: it is named by its
+    # worker's directory, which goes next (`_worker_tmp`).
+    with contextlib.suppress(OSError):
+        for base in (Path(run_dir) / WORKERS_DIR).iterdir():
+            if base.is_dir() and not base.is_symlink():
+                _rmtree_owned(_worker_tmp(base))
     for name in (WORKERS_DIR, CLAUDE_CONFIG_TEMPLATE):
         path = Path(run_dir) / name
         if not _rmtree_owned(path):
@@ -12289,6 +12658,38 @@ def _payload_only_cwd(st: object) -> str:
     return str(d)
 
 
+def _exe_from_root(name: str) -> str:
+    """`name` as PATH finds it from `/`, as an absolute path; `name` itself
+    when it holds a `/` or PATH has no such program. A relative or empty
+    PATH entry names a directory below the working directory, so it is
+    anchored at `/`, never at the directory a host program would start in
+    (DESIGN §6 *The host never runs a program the checkout chose*, part 4)."""
+    if "/" in name:
+        return name
+    entries = os.environ.get("PATH", os.defpath).split(os.pathsep)
+    found = shutil.which(name, path=os.pathsep.join(
+        os.path.join("/", d) for d in entries))
+    return os.path.abspath(found) if found else name
+
+
+def _host_worker_cwd(*trees: str | Path) -> Path:
+    """A fresh, empty, private directory for a host-side worker to start in
+    (DESIGN §6 *The host never runs a program the checkout chose*, part 4):
+    never a checkout or a tree, nor a directory in one, so no shim chooses
+    its CLI and the CLI reads no project settings from them. The trees it
+    works on are named to it by `--add-dir`. Raises OSError when the system
+    temporary directory is one of `trees` or lies beneath one."""
+    d = Path(tempfile.mkdtemp(prefix="leerie-host-cwd-"))
+    real = Path(os.path.realpath(d))
+    for t in trees:
+        rt = Path(os.path.realpath(t))
+        if real == rt or real.is_relative_to(rt):
+            _rmtree_owned(d)
+            raise OSError(errno.EINVAL,
+                          f"the temporary directory {real} is inside {rt}")
+    return d
+
+
 def _judgment_cwd(st: "State") -> str:
     """The cwd every judgment worker runs in.
 
@@ -12361,7 +12762,7 @@ async def _preflight_repo() -> None:
     which calls `preflight()`. So a refusal here used to leave a permanent run
     directory behind for a run that never started: four of them accumulated on
     one host from a single afternoon's dirty-tree refusals
-    (docs/POSTMORTEM-2026-08-14.md, F14).
+    (tests/test_irreversible_before_valid.py).
 
     These three need nothing but the checkout, so they run first and the run
     directory is only created once the repo is fit to run against. Everything
@@ -12403,7 +12804,7 @@ async def _preflight_repo() -> None:
         # measured case both files were leerie's OWN tracked config
         # (`leerie.toml`, `.leerie/config.toml`) — so tuning leerie dirtied the
         # tree leerie then refused to run in, with nothing in the message
-        # connecting the two (docs/POSTMORTEM-2026-08-14.md, F14).
+        # connecting the two (tests/test_irreversible_before_valid.py).
         _shown = [l[3:] for l in dirty[:10]]
         _own = [f for f in _shown
                 if f == "leerie.toml" or f.startswith(".leerie/")]
@@ -12565,6 +12966,41 @@ def _reap_idle_worktrees(runs_dir: Path, self_id: str,
     return report
 
 
+# A launcher's own logs in the state root, by name (the launcher's
+# `leerie-$$.log` default and its piped `.runlog-$$`): mechanical file names.
+_LAUNCHER_LOG_RE = re.compile(r"(?:leerie-\d+\.log|\.runlog-\d+)")
+
+
+def _reap_launcher_logs(state_root: Path,
+                        idle_days: float = WORKTREE_REAP_IDLE_DAYS,
+                        now: float | None = None) -> dict:
+    """Remove the launchers' logs (`logs/leerie-<pid>.log`, `.runlog-<pid>`)
+    not written for `idle_days` (DESIGN §6 *A launcher's logs go with the
+    same retention*): a copy of a run's own `orchestrator.log`, which a
+    live launcher appends to whenever its run prints. Regular files only,
+    never through a link. `{removed, bytes, errors}`; never raises."""
+    cutoff = (time.time() if now is None else now) - idle_days * 86400
+    report = {"removed": 0, "bytes": 0, "errors": 0}
+    for d in (state_root / "logs", state_root):
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            if not _LAUNCHER_LOG_RE.fullmatch(e.name):
+                continue
+            try:
+                st_ = e.stat(follow_symlinks=False)
+                if not stat.S_ISREG(st_.st_mode) or st_.st_mtime >= cutoff:
+                    continue
+                os.unlink(e.path)
+                report["removed"] += 1
+                report["bytes"] += st_.st_size
+            except OSError:
+                report["errors"] += 1
+    return report
+
+
 async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                     skip_smoke: bool = False, no_push: bool = False,
                     model: str = MODEL_DEFAULT) -> None:
@@ -12603,6 +13039,15 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                    if reap["errors"] else "") + ")")
     except Exception as e:  # housekeeping must never stop a run
         log(f"preflight: worktree reap skipped ({type(e).__name__}: {e})")
+    # The launchers' logs, by the same idle bound (DESIGN §6 *A launcher's
+    # logs go with the same retention*). Never raises.
+    logs = await asyncio.to_thread(_reap_launcher_logs,
+                                   leerie_dir.parent.parent)
+    if logs["removed"] or logs["errors"]:
+        log(f"preflight: removed {logs['removed']} launcher log(s) idle >= "
+            f"{WORKTREE_REAP_IDLE_DAYS}d, freed "
+            f"{logs['bytes'] / 1048576:.1f} MiB"
+            + (f" ({logs['errors']} error(s))" if logs["errors"] else ""))
 
     # 0.5. disk headroom (N30) — a run writes state.json/logs/calls.ndjson/
     # worktrees continuously, and the first failing write under a full disk
@@ -12837,7 +13282,7 @@ def _category_evidence_found(repo_root: Path, cat: str) -> bool:
         with os.scandir(repo_root) as entries:
             for entry in entries:
                 name = entry.name.lower()
-                if entry.is_dir():
+                if entry.is_dir(follow_symlinks=False):
                     if name in wanted_dirs:
                         return True
                     # One level down, for `src/infrastructure/`-style
@@ -12850,7 +13295,7 @@ def _category_evidence_found(repo_root: Path, cat: str) -> bool:
                     try:
                         with os.scandir(entry.path) as children:
                             for child in children:
-                                if (child.is_dir()
+                                if (child.is_dir(follow_symlinks=False)
                                         and child.name.lower() in wanted_dirs):
                                     return True
                     except OSError:
@@ -12861,7 +13306,7 @@ def _category_evidence_found(repo_root: Path, cat: str) -> bool:
     except OSError:
         # An unreadable or absent repo root is not evidence of absence.
         return True
-    return any(any(repo_root.glob(pat)) for pat in spec.get("globs", []))
+    return any(_glob_beneath(repo_root, pat) for pat in spec.get("globs", []))
 
 
 def _category_evidence_summary(cat: str) -> str:
@@ -13743,12 +14188,13 @@ def _subfile_split(subtask: dict, repo_root: Path,
             return []
         abs_path = repo_root / file
         try:
-            total_lines = abs_path.read_text(errors="replace").count("\n") + 1
+            total_lines = _read_text_beneath(
+                repo_root, abs_path, limit=READ_LIMIT_TEXT).count("\n") + 1
         except OSError:
             return []  # file unreadable — can't region-split; leave as leaf
         if total_lines <= max_span:
             return []  # whole file already within the cap — leaf
-        ranges = _extract_symbol_ranges(abs_path)
+        ranges = _extract_symbol_ranges(repo_root, abs_path)
         regions = _partition_symbols_by_line(ranges, total_lines, max_span)
         if len(regions) <= 1:
             # No usable boundaries (or one span covers the file): tier-2 fallback
@@ -13824,7 +14270,8 @@ def _peel_oversized_file(subtask: dict, repo_root: Path,
 
     def _line_count(f: str) -> int:
         try:
-            return (repo_root / f).read_text(errors="replace").count("\n") + 1
+            return _read_text_beneath(
+                repo_root, repo_root / f, limit=READ_LIMIT_TEXT).count("\n") + 1
         except OSError:
             return 0  # unreadable → treat as not-oversized (leaf-safe)
 
@@ -15248,7 +15695,7 @@ def check_implementer_output(
             # 1b9b52f5/test-007 was re-driven into a pure-rename commit
             # (+$0.49, 2.3 min) whose only content was moving a test from the
             # repo convention to the planner path
-            # (docs/POSTMORTEM-2026-08-14.md, F23). The label is still emitted
+            # (tests/test_advisory_signals_match_their_status.py). The label is still emitted
             # so the operator sees it; `_ADVISORY_ISSUES` keeps it out of the
             # retry decision.
             issues.append(
@@ -15354,7 +15801,7 @@ def check_symptom_evidence(result: dict, sid: str,
     re-homes a `feat-` subtask under a surviving `bugfix-` id. Measured across
     the run corpus, **10 of 10 findings were false positives** — every one of
     them a test, coverage or verification subtask that never had a symptom
-    (docs/POSTMORTEM-2026-08-14.md, F18). A warning at that rate is one nobody
+    (tests/test_no_id_prefix_dispatch.py). A warning at that rate is one nobody
     reads, which costs more than the check is worth.
 
     `fixes_reported_symptom` is optional on the subtask schema and its absence
@@ -15507,17 +15954,25 @@ def _typed_risks(result: dict | None, source: str) -> list[dict]:
     out: list[dict] = []
     ev = result.get("production_evidence")
     if isinstance(ev, dict) and ev.get("exercised") is False:
-        # The worker could not exercise the path here: typed external, so
-        # it reaches "Needs human verification" (DESIGN §9).
-        out.append({
+        # The worker could not exercise the path here. External only when it
+        # names the resource no in-container step can supply; otherwise the
+        # changed lines' coverage measurement settles or re-drives it (DESIGN
+        # §9: on the 0.43.0 barnacle runs 36 of 39 such entries named none —
+        # "docs-only change", "only ran the changed tests").
+        resource = _normalize_risk_text(ev.get("unexercisable_resource"),
+                                        _RISK_WHERE_MAX)
+        entry = {
             "kind": "unexercised_behavior",
             "detail": _normalize_risk_text(
                 ev.get("unexercisable_reason"), _RISK_DETAIL_MAX)
             or "path not exercised against real repo state",
             "source": source,
-            "gap": "unverified_external",
+            "gap": "unverified_external" if resource else "test_missing",
             "where_paths": [],
-        })
+        }
+        if resource:
+            entry["resource"] = resource
+        out.append(entry)
     for item in result.get("self_reported_risks") or []:
         if not isinstance(item, dict):
             continue
@@ -15545,6 +16000,10 @@ def _typed_risks(result: dict | None, source: str) -> list[dict]:
         resource = _normalize_risk_text(item.get("resource"), _RISK_WHERE_MAX)
         if resource:
             entry["resource"] = resource
+        elif gap == "unverified_external":
+            # External names what a human must supply; naming nothing, it is
+            # a gap leerie's own checks settle (DESIGN §9).
+            entry["gap"] = "test_missing"
         if item.get("simulated_interleaving") is True:
             entry["simulated_interleaving"] = True
         out.append(entry)
@@ -15752,7 +16211,8 @@ def _format_task_file_references(
     )
 
 
-def _is_same_document(path: Path, text_len: int, text: str) -> bool:
+def _is_same_document(root: Path, path: Path, text_len: int,
+                      text: str) -> bool:
     """True when `path` holds exactly `text` (modulo surrounding whitespace).
 
     Used to keep a task file out of its own reference list. The planner is
@@ -15766,9 +16226,9 @@ def _is_same_document(path: Path, text_len: int, text: str) -> bool:
     passed in rather than recomputed because this runs once per candidate and
     the task can be hundreds of KB."""
     try:
-        if abs(path.stat().st_size - text_len) > 8:
+        if abs(path.lstat().st_size - text_len) > 8:
             return False
-        return path.read_text(errors="replace").strip() == text
+        return _read_text_beneath(root, path, limit=READ_LIMIT_TEXT).strip() == text
     except (OSError, ValueError):
         return False
 
@@ -15821,6 +16281,12 @@ def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
         for expanded in _expand_braces(cand):
             for m in sorted(_glob.glob(str(repo_root / expanded))):
                 p = Path(m)
+                # A match reached through a link — the match itself, or a
+                # linked directory on the way — names what the link points
+                # at, not the repository's own file (DESIGN §6 *Leerie never
+                # reads through a link a repository holds*).
+                if not _no_link_beneath(repo_root, p):
+                    continue
                 # Containment re-check, independent of the token-level guard
                 # above: `../` segments survive the startswith("/") test and
                 # would otherwise escape the same way. `resolve()` follows
@@ -15833,8 +16299,9 @@ def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
                         continue
                 except (OSError, ValueError):
                     continue
-                if p.is_file() and str(p) not in seen:
-                    if _is_same_document(p, task_len, task_stripped):
+                if _regular_file_beneath(repo_root, p) and str(p) not in seen:
+                    if _is_same_document(repo_root, p, task_len,
+                                         task_stripped):
                         continue
                     seen.add(str(p))
                     matched.append(p)
@@ -15988,7 +16455,7 @@ def _walk_calls(node: "object") -> list[str]:
     return results
 
 
-def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
+def _parse_repo_file(root: Path, path: Path) -> tuple[list[str], list[str]]:
     """Parse one source file and return ``(defs, refs)``.
 
     *defs* — list of defined symbol names (functions, classes, methods).
@@ -16014,7 +16481,7 @@ def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
         lang = tslp.detect_language(str(path))
         if not lang:
             return [], []
-        source = path.read_text(errors="replace")
+        source = _read_text_beneath(root, path, limit=READ_LIMIT_TEXT)
         proc_result = tslp.process(
             source,
             tslp.ProcessConfig(language=lang, structure=True, imports=False),
@@ -16039,7 +16506,8 @@ def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
         return [], []
 
 
-def _extract_symbol_ranges(path: Path) -> list[tuple[str, int, int]]:
+def _extract_symbol_ranges(root: Path,
+                           path: Path) -> list[tuple[str, int, int]]:
     """Return the top-level symbols of *path* as ``(name, start_line, end_line)``,
     sorted by ``start_line`` — the ordered, exhaustive span sequence the sub-file
     splitter tiles into regions (DESIGN §5½ (P1) *Sub-file*).
@@ -16066,7 +16534,7 @@ def _extract_symbol_ranges(path: Path) -> list[tuple[str, int, int]]:
         lang = tslp.detect_language(str(path))
         if not lang:
             return []
-        source = path.read_text(errors="replace")
+        source = _read_text_beneath(root, path, limit=READ_LIMIT_TEXT)
         proc_result = tslp.process(
             source,
             tslp.ProcessConfig(language=lang, structure=True, imports=False),
@@ -16120,7 +16588,7 @@ def _tree_sitter_extraction_works() -> bool:
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "_probe.py"
             f.write_text("def _probe_sym():\n    return 1\n")
-            defs, _refs = _parse_repo_file(f)
+            defs, _refs = _parse_repo_file(Path(d), f)
         return "_probe_sym" in defs
     except Exception as e:
         _last_parse_error = f"{type(e).__name__}: {e}"
@@ -16212,7 +16680,7 @@ def _build_repo_map(
         try:
             with open(cp, "rb") as fh:
                 entry = pickle.load(fh)  # noqa: S301
-            if entry.get("mtime_ns") == abs_path.stat().st_mtime_ns:
+            if entry.get("mtime_ns") == abs_path.lstat().st_mtime_ns:
                 return entry["defs"], entry["refs"]
         except Exception:
             pass
@@ -16229,7 +16697,7 @@ def _build_repo_map(
         try:
             with open(cp, "wb") as fh:
                 pickle.dump({
-                    "mtime_ns": abs_path.stat().st_mtime_ns,
+                    "mtime_ns": abs_path.lstat().st_mtime_ns,
                     "defs": defs,
                     "refs": refs,
                 }, fh, protocol=4)
@@ -16252,7 +16720,7 @@ def _build_repo_map(
             if cached is not None:
                 defs, file_refs = cached
             else:
-                defs, file_refs = _parse_repo_file(abs_path)
+                defs, file_refs = _parse_repo_file(repo_root, abs_path)
                 _save_cache(abs_path, defs, file_refs)
             if not defs and not file_refs:
                 continue
@@ -16753,7 +17221,7 @@ def _sid_domain_map(plans: list[dict]) -> dict[str, str]:
     another and keeps the *survivor's* id, and `_repair_prescribed_commands`
     mints its verification subtask's id from the HOST subtask's domain. Reading
     the owning plan's domain is invariant under both
-    (docs/POSTMORTEM-2026-08-14.md, F18)."""
+    (tests/test_no_id_prefix_dispatch.py)."""
     out: dict[str, str] = {}
     for plan in plans:
         domain = plan.get("domain") or ""
@@ -17165,7 +17633,7 @@ def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
 # re-homed when a duplicate-provider/overlap merge folds one subtask into
 # another, and `_repair_prescribed_commands` synthesises ids from a *host*
 # subtask's domain — so an id prefix is not evidence of what the work is
-# (docs/POSTMORTEM-2026-08-14.md, F18).
+# (tests/test_no_id_prefix_dispatch.py).
 _TEST_OWNERSHIP_CODE_DOMAINS = frozenset(
     {"bug-fixing", "feature-implementation", "refactoring"})
 
@@ -17246,7 +17714,7 @@ def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
 # different thing entirely. Measured, both of its firings in one run were false:
 # `credential-field-docurl-support` (adding a docUrl to a form field spec) and
 # `passare-credential-check-helper` (a client-side API ping), neither touching
-# env files or wanting to (docs/POSTMORTEM-2026-08-14.md, F23). The remaining
+# env files or wanting to (tests/test_advisory_signals_match_their_status.py). The remaining
 # keywords name configuration plumbing rather than a subject area.
 _ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key"})
 
@@ -17478,7 +17946,7 @@ async def _filter_satisfied_subtasks(
     outranks the probe's reading)."""
     if st.data.get("skip_satisfied_check"):
         log("phase 3: satisfied-check skipped (--skip-satisfied-check / "
-            "LEERIE_SKIP_SATISFIED_CHECK / skip_satisfied_check=true)")
+            "LEERIE_SKIP_SATISFIED_CHECK)")
         return None
 
     # Flatten to (plan, subtask) pairs so the probe results can be applied
@@ -17904,10 +18372,11 @@ def _workspace_globs(repo_root: Path) -> list[str]:
     an exclusion and is kept with its `!`."""
     globs: list[str] = []
     ws = repo_root / "pnpm-workspace.yaml"
-    if ws.is_file():
+    if _regular_file_beneath(repo_root, ws):
         try:
             in_packages = False
-            for line in ws.read_text(encoding="utf-8").splitlines():
+            for line in _read_text_beneath(repo_root, ws,
+                                           errors="strict", limit=READ_LIMIT_CONFIG).splitlines():
                 bare = line.split("#", 1)[0].rstrip()
                 if not bare.strip():
                     continue
@@ -17922,8 +18391,8 @@ def _workspace_globs(repo_root: Path) -> list[str]:
         except (OSError, UnicodeDecodeError):
             pass
     try:
-        pkg = json.loads((repo_root / "package.json").read_text(
-            encoding="utf-8"))
+        pkg = json.loads(_read_text_beneath(
+            repo_root, repo_root / "package.json", errors="strict", limit=READ_LIMIT_CONFIG))
         w = pkg.get("workspaces") if isinstance(pkg, dict) else None
         if isinstance(w, dict):
             w = w.get("packages")
@@ -18399,10 +18868,8 @@ def _gather_dep_manifests(repo_root: Path) -> str:
     total = 0
     for name in _DEP_MANIFEST_NAMES:
         p = repo_root / name
-        if not p.is_file():
-            continue
         try:
-            text = p.read_text(errors="replace")
+            text = _read_text_beneath(repo_root, p, limit=READ_LIMIT_CONFIG)
         except OSError:
             continue
         if len(text.encode()) > _DEPCAP_MANIFEST_FILE_BUDGET:
@@ -18424,6 +18891,11 @@ def _normalize_setup_packages(pkgs: list[str]) -> str:
     return " ".join(dict.fromkeys(p for p in pkgs if p))
 
 
+def _split_setup_packages(value: str) -> list[str]:
+    """The items of a `setup_packages` value (comma- or space-separated)."""
+    return [p for p in re.split(r"[,\s]+", value.strip()) if p]
+
+
 def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
     """Union existing setup_packages with newly-captured packages.
 
@@ -18431,10 +18903,7 @@ def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
     discovered); returns None when captured is a subset of existing.
     Preserves user-narrowed lists — never removes packages.
     """
-    def _parse(s: str) -> list[str]:
-        return [p for p in re.split(r"[,\s]+", s.strip()) if p]
-
-    existing_list = _parse(existing) if existing else []
+    existing_list = _split_setup_packages(existing) if existing else []
     existing_set = dict.fromkeys(existing_list)  # preserves first-seen order
     new_pkgs = [p for p in captured if p not in existing_set]
     if not new_pkgs:
@@ -18480,13 +18949,29 @@ def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
 
     Creates cfg_path with a standard header if absent. For each key in
     updates: replaces the first uncommented `key = ...` line if present,
-    otherwise appends. Never touches commented lines. Uses os.replace
-    atomicity (mirrors State.save discipline).
+    otherwise appends. Never touches commented lines. Written as a new
+    file renamed into place (mirrors State.save discipline).
+
+    The file is the checkout's (`<root>/.leerie/config.toml`), whose content
+    a merged run may have committed: it is read and written beneath the
+    checkout without following a link (`_read_beneath`, `_write_beneath`) —
+    a link there is replaced, never read or written through, and a link at
+    `.leerie` refuses the write (DESIGN §6 *Leerie never reads through a
+    link a repository holds*).
     """
-    if cfg_path.exists():
-        lines = cfg_path.read_text().splitlines(keepends=True)
-    else:
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path = Path(cfg_path)
+    root = cfg_path.parent.parent if cfg_path.parent.name == ".leerie" \
+        else cfg_path.parent
+    try:
+        lines = _read_text_beneath(root, cfg_path, limit=READ_LIMIT_CONFIG).splitlines(keepends=True)
+    except OSError as e:
+        # Absent, or a link at the file itself, which the write below
+        # replaces; a link on the way (ENOTDIR, or ELOOP at `.leerie`)
+        # refuses the write there.
+        if not (isinstance(e, FileNotFoundError) or (
+                e.errno == errno.ELOOP
+                and not _link_on_the_way(root, cfg_path))):
+            raise
         lines = [
             "# leerie per-repo configuration — commit this file to version-control.\n",
             "# Generated by: leerie capture\n",
@@ -18512,9 +18997,7 @@ def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
     # Append any keys that were not found in the file.
     for k, v in remaining.items():
         out.append(f'{k} = {_toml_value(v)}\n')
-    tmp = Path(str(cfg_path) + f".tmp.{os.getpid()}")
-    tmp.write_text("".join(out))
-    os.replace(tmp, cfg_path)
+    _write_beneath(root, cfg_path, "".join(out).encode())
 
 
 def _extract_depcap_commands(log_dir: Path) -> tuple[str, bool]:
@@ -18641,10 +19124,64 @@ def _filter_residual_deps(language_installs: list[dict]) -> list[dict]:
                 residual.append(entry)
             continue
 
-        # Unknown managers: preserve as-is (conservative)
-        residual.append(entry)
+        # Any other manager: leerie bakes only `BAKE_INSTALL_COMMANDS`,
+        # each with its own command, so nothing else is ever recorded
+        # (DESIGN §6½ *A capture names packages and managers, never
+        # commands*).
+        if manager in BAKE_INSTALL_COMMANDS:
+            residual.append(entry)
 
     return residual
+
+
+def _capture_problems(setup_packages: object, language_installs: object
+                      ) -> list[str]:
+    """Why a capture cannot be recorded or applied, each named; [] when it
+    can (DESIGN §6½ *A capture names packages and managers, never
+    commands*): every `setup_packages` item a Debian package name, every
+    `language_installs` entry a manager leerie bakes and plain relative
+    input paths. The same rules as `SCHEMAS["dep_capture"]`, here because a
+    capture file is read back and the schema is not the only writer."""
+    out: list[str] = []
+    if not isinstance(setup_packages, list):
+        out.append("setup_packages is not a list")
+        setup_packages = []
+    for p in setup_packages:
+        if not (isinstance(p, str)
+                and re.fullmatch(DEBIAN_PACKAGE_PATTERN, p)):
+            out.append(f"setup_packages item {p!r} is not a Debian "
+                       "package name")
+    if not isinstance(language_installs, list):
+        out.append("language_installs is not a list")
+        language_installs = []
+    for e in language_installs:
+        if not isinstance(e, dict):
+            out.append(f"language_installs entry {e!r} is not an object")
+            continue
+        m = e.get("manager")
+        if not (isinstance(m, str) and m in BAKE_INSTALL_COMMANDS):
+            out.append(f"language_installs manager {m!r} is not one leerie "
+                       f"bakes ({', '.join(sorted(BAKE_INSTALL_COMMANDS))})")
+        ins = e.get("copy_inputs", [])
+        if not isinstance(ins, list):
+            out.append(f"language_installs copy_inputs {ins!r} is not a list")
+            continue
+        for ci in ins:
+            if not (isinstance(ci, str)
+                    and re.fullmatch(CAPTURE_INPUT_PATTERN, ci)
+                    and ".." not in ci.split("/")):
+                out.append(f"language_installs input {ci!r} is not a plain "
+                           "relative path")
+    return out
+
+
+def _table_installs(language_installs: list[dict]) -> list[dict]:
+    """Each entry as leerie records it: its manager, the command leerie's
+    table gives that manager (never the capture's own), and its inputs."""
+    return [{"manager": e["manager"],
+             "command": BAKE_INSTALL_COMMANDS[e["manager"]],
+             "copy_inputs": list(e.get("copy_inputs") or [])}
+            for e in language_installs]
 
 
 CAPTURED_DEPS_FILE = "captured-deps.json"
@@ -18656,7 +19193,14 @@ def _merge_capture_into_config(cfg_path: Path, setup_packages: list[str],
                                replace: bool) -> dict[str, str]:
     """Merge one capture into `cfg_path` as it is now (DESIGN §6½): union /
     never-clobber, or wholesale replace for `--recapture --force`. Returns
-    the keys written."""
+    the keys written. A capture `_capture_problems` refuses writes nothing:
+    refused whole, never trimmed to what passes."""
+    problems = _capture_problems(setup_packages, language_installs)
+    if problems:
+        log("capture: refused, nothing written to "
+            f"{cfg_path}: " + "; ".join(problems))
+        return {}
+    language_installs = _table_installs(language_installs)
     updates: dict[str, str] = {}
     if setup_packages:
         if replace:
@@ -18712,11 +19256,17 @@ def _merge_capture_into_config(cfg_path: Path, setup_packages: list[str],
 
 def _record_capture(record_in: Path, from_run: str, setup_packages: list[str],
                     language_installs: list[dict], replace: bool) -> None:
-    """Append one capture to `<record_in>/captured-deps.json` for the host to
-    apply (`apply_captured_deps`). Nothing is recorded for an empty one."""
+    """Append one capture to `<record_in>/captured-deps.json` for the
+    operator to apply (`apply_captured_deps`). Nothing is recorded for an
+    empty one, nor for one `_capture_problems` refuses."""
     if not setup_packages and not language_installs:
         log("capture: dep_capture found no deps to record")
         return
+    problems = _capture_problems(setup_packages, language_installs)
+    if problems:
+        log("capture: refused, nothing recorded: " + "; ".join(problems))
+        return
+    language_installs = _table_installs(language_installs)
     path = record_in / CAPTURED_DEPS_FILE
     try:
         entries = json.loads(path.read_text()) if path.is_file() else []
@@ -18732,19 +19282,37 @@ def _record_capture(record_in: Path, from_run: str, setup_packages: list[str],
     tmp.write_text(json.dumps(entries, indent=1) + "\n")
     os.replace(tmp, path)
     log(f"capture: recorded {len(setup_packages)} setup_packages and "
-        f"{len(language_installs)} language installs in {path.name}; the "
-        "host writes .leerie/config.toml after the run")
+        f"{len(language_installs)} language installs in {path}; review and "
+        f"apply them with `leerie config --apply-capture {record_in.name}`")
+
+
+def _config_capture_problems(cfg: Path) -> list[str]:
+    """`_capture_problems` of what `cfg` holds now: its `setup_packages`
+    items and its `language_installs`, which must be a JSON list."""
+    pkgs = _split_setup_packages(_read_toml_key(cfg, "setup_packages") or "")
+    raw = _read_toml_key(cfg, "language_installs") or ""
+    try:
+        installs = json.loads(raw) if raw else []
+    except ValueError:
+        return (_capture_problems(pkgs, [])
+                + [f"language_installs {raw!r} is not a JSON list"])
+    return _capture_problems(pkgs, installs)
 
 
 def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
-    """Host-side: apply the captures a run recorded (`_record_capture`) to
-    `repo_root/.leerie/config.toml`, each merged against the file as it is
-    now, so a key the user edited during the run is merged with rather than
-    overwritten. The applied entries move to `captured-deps.applied.json`,
-    so a second call is a no-op. Returns how many were applied; a file that
-    cannot be read is logged and kept."""
+    """The operator's `leerie config --apply-capture <run>` (DESIGN §6½ *The
+    operator applies a capture*): apply the captures that run recorded
+    (`_record_capture`) to `repo_root/.leerie/config.toml`, each merged
+    against the file as it is now, and log the change as a diff. Nothing
+    else applies a capture: a run never chooses what the next run's image
+    runs. Every entry is checked first (`_capture_problems`); one that
+    fails refuses the whole file, which is kept. The applied entries move
+    to `captured-deps.applied.json`, so a second call is a no-op. Returns
+    how many were applied; a file that cannot be read is logged and
+    kept."""
     path = Path(run_dir) / CAPTURED_DEPS_FILE
     if not path.is_file():
+        log(f"capture: {path} does not exist; nothing to apply")
         return 0
     try:
         entries = json.loads(path.read_text())
@@ -18753,11 +19321,42 @@ def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
     except (OSError, ValueError) as e:
         log(f"capture: could not read {path} ({e}); kept for a later apply")
         return 0
+    problems = [p for e in entries
+                for p in (_capture_problems(e.get("setup_packages") or [],
+                                            e.get("language_installs") or [])
+                          if isinstance(e, dict) else [f"{e!r}"])]
+    if problems:
+        die(f"capture: {path} is refused, nothing was applied: "
+            + "; ".join(problems))
     cfg = Path(repo_root) / ".leerie" / "config.toml"
+    root = Path(repo_root)
+    # A merge keeps what the file holds, so the merged value is valid only
+    # when that is: check it too (review round 29, execution L4).
+    if any(not (isinstance(e, dict) and e.get("replace")) for e in entries):
+        held = _config_capture_problems(cfg)
+        if held:
+            die(f"capture: {path} is refused, nothing was applied: the "
+                f"merged value would keep what {cfg} already holds, and "
+                "that is not a capture leerie bakes: " + "; ".join(held)
+                + ". Fix or remove those entries in .leerie/config.toml "
+                "and apply again.")
+    try:
+        before = _read_text_beneath(root, cfg, limit=READ_LIMIT_CONFIG)
+    except OSError:
+        before = ""
     for e in entries:
         _merge_capture_into_config(
             cfg, list(e.get("setup_packages") or []),
             list(e.get("language_installs") or []), bool(e.get("replace")))
+    try:
+        after = _read_text_beneath(root, cfg, limit=READ_LIMIT_CONFIG)
+    except OSError:
+        after = ""
+    for line in difflib.unified_diff(
+            before.splitlines(), after.splitlines(),
+            fromfile=".leerie/config.toml", tofile=".leerie/config.toml",
+            lineterm=""):
+        log(f"  {line}")
     done = path.with_name(CAPTURED_DEPS_APPLIED_FILE)
     try:
         prior = json.loads(done.read_text()) if done.is_file() else []
@@ -18780,15 +19379,14 @@ async def capture_repo_deps(
         replace: bool = False,
         record_in: Path | None = None,
 ) -> None:
-    """Invoke the dep_capture LLM worker and write deps to .leerie/config.toml (non-fatal).
+    """Invoke the dep_capture LLM worker and record what it captured (non-fatal).
 
-    record_in (every in-container seam, the current run's directory): the
-    capture is recorded in `<record_in>/captured-deps.json` instead, and the
-    host writes `.leerie/config.toml` after the container exits
-    (`apply_captured_deps`). The container never writes the user's checkout,
-    which is mounted read-only (DESIGN §6 *The explicit channel*, §6½ *The
-    host applies a capture*). None: the host's own `run_recapture_deps`,
-    which writes it now.
+    record_in (the current run's directory in the container; the target
+    run's for the host's `run_recapture_deps`): the capture is recorded in
+    `<record_in>/captured-deps.json`, and only the operator's `leerie config
+    --apply-capture <run>` writes `.leerie/config.toml`
+    (`apply_captured_deps`; DESIGN §6½ *The operator applies a capture*).
+    Nothing is recorded without it.
 
     replace=False (default, every automatic seam): union / never-clobber —
     only new packages/managers are added, existing entries are preserved.
@@ -18885,8 +19483,8 @@ async def capture_repo_deps(
         _record_capture(Path(record_in), Path(str(log_dir)).parent.name,
                         setup_packages, language_installs, replace)
     else:
-        _merge_capture_into_config(repo_root / ".leerie" / "config.toml",
-                                   setup_packages, language_installs, replace)
+        log("capture: no run directory to record the capture in; "
+            "nothing recorded")
     # Write idempotency sentinel. Both a state field (for in-run readers)
     # and a lightweight file (for the next-run backstop, which reads past
     # run dirs without constructing a full State).
@@ -19082,7 +19680,7 @@ def run_recapture_deps(
                     await capture_repo_deps(
                         repo_root, target_st,
                         caps=run_caps, models=models, efforts=efforts,
-                        replace=force,
+                        replace=force, record_in=target_run_dir,
                     )
                     return True
                 # See the backstop guard above: TerminalAuthFailure /
@@ -19134,8 +19732,11 @@ def run_rebaser(
     `worktree` is a worktree of the rebaser's own repository (DESIGN §6
     *The run's own repository*) checked out on `run_branch`,
     created by the caller (`host-finalize.sh`) BEFORE this runs and removed
-    by the caller AFTER — this function only operates inside it via the
-    `rebaser` worker's own `cwd`.
+    by the caller AFTER — this function only operates on it: the `rebaser`
+    worker is told its path and given it by `--add-dir`, and starts in an
+    empty directory of leerie's (`_host_worker_cwd`), never in the worktree,
+    which holds the run branch's content (DESIGN §6 *The host never runs a
+    program the checkout chose*, part 4).
 
     This is a scoped, fully-agentic exception to §12 ("prompts are advisory,
     code enforces"): the worker performs the entire rebase workflow itself —
@@ -19204,8 +19805,12 @@ def run_rebaser(
             "confidence": {"resolution": 0.0},
         }
 
+    # Leerie's own git names the worktree and starts from `/`; the worker's
+    # CLI starts in a directory of leerie's (DESIGN §6 *The host never runs
+    # a program the checkout chose*, part 4): the worktree is the run
+    # branch, which no operator has merged.
     pre_rebase_sha_r = asyncio.run(
-        run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd=str(worktree)))
+        run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd="/"))
     if pre_rebase_sha_r.returncode != 0:
         return {
             "status": "failed",
@@ -19241,6 +19846,7 @@ def run_rebaser(
     run_base = st.data.get("base_sha") or working_branch
     sys_prompt = _load_prompt("rebaser")
     user_prompt = (
+        f"The disposable worktree: {worktree}\n"
         f"Current branch (this worktree's checkout): {run_branch}\n"
         f"Base branch to rebase onto: {pr_base_branch}\n"
         f"Only replay commits unique to {run_branch} — i.e. the range "
@@ -19248,13 +19854,14 @@ def run_rebaser(
         f"{pr_base_branch}. Do not touch any other branch."
     )
 
-    async def _call_with_strict_output() -> dict:
+    async def _call_with_strict_output(cwd: Path) -> dict:
         async with _strict_output_proxy(caps, "rebaser"):
             return await claude_p(
                 user_prompt=user_prompt,
                 system_prompt=sys_prompt,
                 schema_key="rebaser",
-                cwd=str(worktree),
+                cwd=str(cwd),
+                add_dirs=[str(worktree)],
                 allowed_tools=ACT_TOOLS,
                 max_turns=60,
                 autonomous=True,
@@ -19265,9 +19872,11 @@ def run_rebaser(
                 sid=f"rebaser-{run_id}",
             )
 
+    neutral: Path | None = None
     try:
+        neutral = _host_worker_cwd(repo_root, worktree)
         st.bump_workers(caps)
-        result = asyncio.run(_call_with_strict_output())
+        result = asyncio.run(_call_with_strict_output(neutral))
     # See run_recapture_deps's identical guard above: TerminalAuthFailure /
     # RateLimitedExit are BaseException subclasses a bare `except Exception`
     # would miss, and this call must never propagate past host-finalize.sh's
@@ -19281,6 +19890,9 @@ def run_rebaser(
             "diagnosis": str(exc),
             "confidence": {"resolution": 0.0},
         }
+    finally:
+        if neutral is not None:
+            _rmtree_owned(neutral)
     # claude_p() returns the already schema-validated structured_output dict
     # directly (not an envelope) — it raises WorkerError, never returns a
     # dict missing required fields, so `result` here is always well-formed
@@ -19412,12 +20024,15 @@ def _extract_readme_sections(text: str) -> str:
     return cut[:boundary] if boundary > 0 else cut
 
 
-def _read_file_safely(path: Path, budget: int) -> str:
-    """Read a file with a byte ceiling, swallowing missing-file and
-    decode errors. Used by _gather_provision_fixtures to assemble the
-    fixture dict from optional repo files."""
+def _read_file_safely(root: Path, path: Path, budget: int) -> str:
+    """Read a file of the repository at `root` with a character ceiling,
+    swallowing missing-file and decode errors, and refusing a link. Only the
+    start is read (`_read_head_beneath`): `budget` characters of UTF-8 lie
+    within `4 * budget` bytes. Used by _gather_provision_fixtures to
+    assemble the fixture dict from optional repo files."""
     try:
-        return path.read_text(errors="replace")[:budget]
+        return _read_head_beneath(root, path, limit=4 * budget).decode(
+            "utf-8", "replace")[:budget]
     except (OSError, UnicodeError):
         return ""
 
@@ -19459,14 +20074,15 @@ def _sample_workspace_manifests(repo_root: Path, pkg_json_text: str,
             continue
         # glob via Path.glob (handles `packages/*` style).
         try:
-            for child in sorted(repo_root.glob(pattern + "/package.json")):
+            for child in _glob_beneath(repo_root, pattern + "/package.json"):
                 if len(sampled) >= max_files:
                     break
                 if child in seen:
                     continue
                 seen.add(child)
                 rel = child.relative_to(repo_root).as_posix()
-                sampled.append((rel, _read_file_safely(child, per_file_budget)))
+                sampled.append((rel, _read_file_safely(
+                    repo_root, child, per_file_budget)))
         except (OSError, ValueError):
             continue
     return sampled
@@ -19523,8 +20139,8 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
         repo_root / "README.adoc",
     ]
     for rp in readme_paths:
-        if rp.is_file():
-            raw = _read_file_safely(rp, _README_EXTRACT_BUDGET * 4)
+        if _regular_file_beneath(repo_root, rp):
+            raw = _read_file_safely(repo_root, rp, _README_EXTRACT_BUDGET * 4)
             extract = _extract_readme_sections(raw)
             if add_bytes(len(extract)):
                 out["readme"] = extract
@@ -19537,7 +20153,7 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
                 # classifying prose) lets the worker weight the manifests
                 # and workflows accordingly.
                 try:
-                    full = rp.stat().st_size
+                    full = rp.lstat().st_size
                 except OSError:
                     full = len(raw)
                 out["readme_bytes_unseen"] = max(0, full - len(extract))
@@ -19549,7 +20165,7 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
                 # rather than deriving from the same truncated buffer used
                 # for the extract itself.
                 try:
-                    full_text = rp.read_text(errors="replace")
+                    full_text = _read_text_beneath(repo_root, rp, limit=READ_LIMIT_TEXT)
                 except (OSError, UnicodeError):
                     full_text = raw
                 out["readme_sections_unseen"] = max(
@@ -19563,9 +20179,9 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
         if out["hit_ceiling"]:
             break
         p = repo_root / name
-        if not p.is_file():
+        if not _regular_file_beneath(repo_root, p):
             continue
-        text = _read_file_safely(p, 8192)
+        text = _read_file_safely(repo_root, p, 8192)
         if not add_bytes(len(text)):
             break
         out["manifests"][name] = text
@@ -19584,11 +20200,14 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
     # --- Workflows ---
     if not out["hit_ceiling"]:
         wf_dir = repo_root / ".github" / "workflows"
-        if wf_dir.is_dir():
+        if _dir_beneath_exists(repo_root, wf_dir):
             try:
-                candidates = [p for p in sorted(wf_dir.iterdir())
-                              if p.suffix in (".yml", ".yaml") and p.is_file()
-                              and not _PROVISION_WORKFLOW_SKIP_RE.search(p.name)]
+                candidates = [
+                    p for p in (wf_dir / n for n in sorted(
+                        _listdir_beneath(repo_root, wf_dir)))
+                    if p.suffix in (".yml", ".yaml")
+                    and _regular_file_beneath(repo_root, p)
+                    and not _PROVISION_WORKFLOW_SKIP_RE.search(p.name)]
             except OSError:
                 candidates = []
             # Prefer files whose names match ci/test/build/release.
@@ -19597,7 +20216,7 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
             others = [p for p in candidates if p not in preferred]
             ordered = preferred + others
             for p in ordered[:2]:
-                text = _read_file_safely(p, 4096)
+                text = _read_file_safely(repo_root, p, 4096)
                 if not add_bytes(len(text)):
                     break
                 out["workflows"].append((p.name, text))
@@ -19607,8 +20226,8 @@ def _gather_provision_fixtures(repo_root: Path) -> dict:
         for cand in (repo_root / "CONTRIBUTING.md",
                      repo_root / "docs" / "DEVELOPMENT.md",
                      repo_root / "DEVELOPMENT.md"):
-            if cand.is_file():
-                text = _read_file_safely(cand, 4096)
+            if _regular_file_beneath(repo_root, cand):
+                text = _read_file_safely(repo_root, cand, 4096)
                 if add_bytes(len(text)):
                     out["contributing"] = text
                 break
@@ -19666,7 +20285,8 @@ def _split_checkpoint_sections(content: str) -> dict[str, list[str]]:
 
 
 def _validate_checkpoint(path: str,
-                        worktree_root: Path | None = None) -> str | None:
+                        worktree_root: Path | None = None,
+                        notes_dir: Path | None = None) -> str | None:
     """Return an error description if the checkpoint is structurally incomplete,
     None if it looks good. A missing section produces a confused successor;
     so does a section that contains only a placeholder.
@@ -19674,11 +20294,25 @@ def _validate_checkpoint(path: str,
     `worktree_root`, when supplied, enables the freshness check on
     `## Files touched`: every path listed there must either exist in the
     worktree or carry a `[deleted]` annotation in its bullet line. Skip the
-    freshness check when the worktree is gone (e.g. cleaned up already)."""
+    freshness check when the worktree is gone (e.g. cleaned up already).
+
+    `notes_dir`: the subtask's own notes directory, where its checkpoint
+    lives (`_checkpoint_path`). The path is the worker's to name, so it is
+    read only beneath that directory and never through a link
+    (`_read_beneath`; DESIGN §6 *Leerie never reads through a link a
+    repository holds*) — a path elsewhere is not this subtask's checkpoint.
+    None: the directory holding `path`."""
     p = Path(path)
     if not p.exists():
         return f"checkpoint file does not exist: {path}"
-    content = p.read_text()
+    try:
+        content = _read_text_beneath(
+            p.parent if notes_dir is None else Path(notes_dir), p,
+            errors="strict", limit=READ_LIMIT_CONFIG)
+    except (OSError, ValueError) as e:
+        return (f"checkpoint {path} is not a readable regular file of at "
+                f"most {READ_LIMIT_CONFIG} bytes in this subtask's notes "
+                f"directory: {e}")
 
     missing = [s for s in _CHECKPOINT_SECTIONS if s not in content]
     if missing:
@@ -19968,13 +20602,17 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     (the branch doesn't exist), so the protected-path enforcement was off."""
     run_branch = await _branch_commit_for_tree_async(
         worktree, _compute_run_branch(st.run_id))
+    # NUL-separated: git quotes a name holding a byte outside ASCII, and the
+    # quoted form matched no protected prefix (DESIGN §6 *A path is the file
+    # it names, not its spelling*).
     r = await run_proc(
-        ["git", *_tree_git_args(worktree), "diff", "--name-only", f"{run_branch}..HEAD"],
+        ["git", *_tree_git_args(worktree), "diff", "--name-only", "-z",
+         f"{run_branch}..HEAD"],
         cwd=worktree,
     )
     if r.returncode != 0:
         return None
-    touched = [f for f in r.stdout.strip().splitlines() if f]
+    touched = [f for f in r.stdout.split("\0") if f]
     if not touched:
         return None
 
@@ -19987,6 +20625,28 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     if protected:
         return (f"{sid}: diff touches protected path(s): {protected} — "
                 "implementers must not modify meta-directories")
+
+    # fatal: a second spelling of a path or directory the tree already had
+    # (DESIGN §6 *A path is the file it names, not its spelling*, part 3).
+    # A pair both of whose spellings the run branch already had is not this
+    # subtask's; when git cannot list the run branch the check is skipped,
+    # like the diff above.
+    base = await run_proc(
+        ["git", *_tree_git_args(worktree), "ls-tree", "-r", "-z",
+         "--name-only", run_branch], cwd=worktree)
+    if base.returncode == 0:
+        ours = await run_proc(
+            ["git", *_tree_git_args(worktree), "ls-tree", "-r", "-z",
+             "--name-only", "HEAD"], cwd=worktree)
+        head = {f for f in ours.stdout.split("\0") if f} \
+            if ours.returncode == 0 else set()
+        collisions = _fold_collisions(
+            [f for f in touched if f in head], head,
+            before=[f for f in base.stdout.split("\0") if f])
+        if collisions:
+            return (f"{sid}: diff adds a second spelling of a path in the "
+                    f"tree: {collisions} — on a case- or normalization-"
+                    "insensitive filesystem each pair is one file")
 
     # non-fatal: log a warning for radically unexpected scope
     expected = subtask.get("files_likely_touched", [])
@@ -20068,13 +20728,14 @@ async def check_integrator_commit(staging: Path) -> str | None:
     """Return an error if the integrator's merge commit touched .leerie/ files.
     The integrator should only touch project files, never coordination artifacts."""
     r = await run_proc(
-        ["git", *_tree_git_args(staging), "show", "--name-only", "--format=", "HEAD"],
+        ["git", *_tree_git_args(staging), "show", "--name-only", "-z",
+         "--format=", "HEAD"],
         cwd=str(staging),
     )
     if r.returncode != 0:
         return None
-    bad = [f for f in r.stdout.strip().splitlines()
-           if f and f.startswith(".leerie/")]
+    bad = [f for f in r.stdout.strip("\n").split("\0")
+           if f and (_path_fold(f) + "/").startswith(".leerie/")]
     if bad:
         return f"integrator commit touched coordination files: {bad}"
     return None
@@ -20089,7 +20750,7 @@ async def _rebase_state_dirs(worktree: Path) -> list[str] | None:
     present = []
     for name in ("rebase-merge", "rebase-apply"):
         r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "--git-path", name],
-                           cwd=str(worktree))
+                           cwd="/")
         if r.returncode != 0:
             return None
         if (worktree / r.stdout.strip()).exists():
@@ -20109,7 +20770,7 @@ async def _conflict_marker_size(worktree: Path, path: str) -> int:
     r = await run_proc(
         ["git", *_tree_git_args(worktree), "--literal-pathspecs", "check-attr", "-z",
          "conflict-marker-size", "--", path],
-        cwd=str(worktree))
+        cwd="/")
     fields = r.stdout.split("\0") if r.returncode == 0 else []
     value = fields[2] if len(fields) > 2 else ""
     return int(value) if value.isdigit() and int(value) > 0 else 7
@@ -20132,7 +20793,7 @@ async def _introduced_conflict_markers(
     check = await run_proc(
         ["git", *_tree_git_args(worktree), "-c", "core.quotePath=off", "diff", "--no-color",
          "--no-renames", "--check", since, "--"],
-        cwd=str(worktree))
+        cwd="/")
     # 0 clean, 2 markers or whitespace errors; anything else is git failing
     if check.returncode not in (0, 2):
         return None
@@ -20142,24 +20803,24 @@ async def _introduced_conflict_markers(
 
     numstat = await run_proc(
         ["git", *_tree_git_args(worktree), "diff", "--numstat", "-z", "--no-renames", since, "--"],
-        cwd=str(worktree))
+        cwd="/")
     if numstat.returncode != 0:
         return None
     unchecked = [entry[4:] for entry in numstat.stdout.split("\0")
                  if entry.startswith("-\t-\t")]
     for path in unchecked:
         try:
-            with open(worktree / path, "rb") as f:
-                if b"\0" in f.read(8000):
-                    continue
-        except OSError:  # deleted by the rebase
+            if b"\0" in _read_head_beneath(worktree, worktree / path,
+                                            limit=8000):
+                continue
+        except OSError:  # deleted by the rebase, or a link
             continue
         size = await _conflict_marker_size(worktree, path)
         diff = await run_proc(
             ["git", *_tree_git_args(worktree), "--literal-pathspecs", "diff", "--text", "--no-textconv",
              "--no-ext-diff", "--no-color", "--no-renames", "-U0", since,
              "--", path],
-            cwd=str(worktree))
+            cwd="/")
         if diff.returncode != 0:
             return None
         lineno = None
@@ -20228,7 +20889,7 @@ async def check_rebaser_worktree_state(
         return (f"rebaser claimed {status!r} but worktree is still "
                 f"mid-rebase ({in_progress[0]} present) — abort did not "
                 f"complete")
-    r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd=str(worktree))
+    r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd="/")
     if r.returncode != 0:
         return f"could not verify worktree HEAD after rebaser claimed {status!r}"
     current_sha = r.stdout.strip()
@@ -20429,7 +21090,7 @@ async def _best_effort_capture_deps(
     tuple for the same reason: a terminal arm exists to record a disposition,
     so a second Ctrl-C during this best-effort capture must not escape and
     skip the exit_code/cleanup that arm was reached to set
-    (docs/POSTMORTEM-2026-08-14.md, F15).
+    (tests/test_irreversible_before_valid.py).
 
     `context_label` is interpolated into the non-fatal log line only — it
     names which pause this capture attempt belongs to (e.g. "disk-low
@@ -23323,7 +23984,7 @@ def _restore_git_pointer(tree: str | Path) -> bool:
         st = None
     if st is not None and stat.S_ISREG(st.st_mode):
         try:
-            text = dot.read_text()
+            text = _read_text_beneath(t, dot, limit=READ_LIMIT_CONFIG)
         except OSError:
             text = ""
         if (text.startswith("gitdir: ") and os.path.realpath(
@@ -23358,16 +24019,203 @@ def _landlock() -> types.ModuleType:
     return mod
 
 
-def _require_confinement(run_dir: Path) -> None:
+def _require_confinement(run_dir: Path, state_root: Path,
+                         checkout: Path) -> None:
     """The one entry every invocation that runs a worker or a repository
     command passes through, before it starts any (DESIGN §6 *Fail closed, on
-    every entry*): the kernel confines (`_require_landlock`) and the runtime
-    builds the held-out sandbox and isolation (`_require_heldout_sandbox`,
-    which turns isolation on). `main()` calls it for a fresh run, `resume`
-    and `--phase` alike; a resumed run used to skip both, so nothing it
-    spawned was isolated."""
+    every entry*): the kernel confines (`_require_landlock`), no grant on the
+    checkout reaches the state root by a second name
+    (`_require_state_root_apart`), and the runtime builds the held-out
+    sandbox and isolation (`_require_heldout_sandbox`, which turns isolation
+    on). `main()` calls it for a fresh run, `resume` and `--phase` alike; a
+    resumed run used to skip the checks, so nothing it spawned was
+    isolated."""
     _require_landlock()
+    _require_state_root_apart(state_root, checkout)
     _require_heldout_sandbox(run_dir)
+    _require_worker_view()
+
+
+# A file only the worker root has (the image's worker stage writes it), so a
+# command that finds it at `/` runs in the worker view.
+_WORKER_ENV_MARK = "/.leerie-worker-env"
+
+
+def _worker_home_extras(worker_root: Path,
+                        home: Path = Path("/home/leerie"),
+                        limit: int = 20) -> list[str]:
+    """The paths beneath the worker root's `/home/leerie` (the confined
+    commands' HOME) that the container's lacks: what a repository's
+    Dockerfile installed there, which the worker view hides (`/home` is a
+    container entry). Names only, no
+    link followed; a directory both have is descended into, but not one the
+    container mounts something on (an auth or cache mount owns it). `home`
+    is the container's `/home/leerie` (a test passes its own). At most
+    `limit` paths, each as the view would name it."""
+    found: list[str] = []
+    top = worker_root / "home" / "leerie"
+
+    def walk(rel: str) -> None:
+        w = top / rel if rel else top
+        c = home / rel if rel else home
+        if rel and os.path.ismount(c):
+            return
+        try:
+            names = sorted(_listdir_beneath(worker_root, w))
+        except OSError:
+            return
+        for n in names:
+            if len(found) >= limit:
+                return
+            r = f"{rel}/{n}" if rel else n
+            cp = c / n
+            if not os.path.lexists(cp):
+                found.append(f"/home/leerie/{r}")
+            elif (_dir_beneath_exists(worker_root, w / n) and cp.is_dir()
+                  and not cp.is_symlink()):
+                walk(r)
+
+    walk("")
+    return found
+
+
+def _require_worker_view() -> None:
+    """Fail closed (DESIGN §6 *The orchestrator's root is leerie's; a
+    repository's root is only a confined process's*): where the image has a
+    worker root, an isolated command must run in it — leerie never runs the
+    repository's commands in its own root instead, nor its own processes in
+    the repository's. Runs `test -e` on the worker stage's mark in the
+    worker view; stops the run naming the shim's reason when it is not
+    there. Only once the entry has turned isolation on (`_isolated()`): a
+    command enters the worker view only through the isolation, and where it
+    is off (a test, a host harness) nothing runs in it.
+
+    A run the launcher started on a repository image (`REPO_IMAGE_ENV` is
+    "1") whose image has no worker root stops first, whatever the
+    isolation: the image was built in an older layout or not by leerie,
+    and its own root is the repository's (review round 29, execution L2).
+    So does one whose worker root holds anything beneath `/home/leerie` the
+    container's lacks (`_worker_home_extras`): `/home` is the run's
+    own, and what a repository installed there would be missing from every
+    confined command (review round 29, execution L3).
+    """
+    if os.environ.get(REPO_IMAGE_ENV) == "1" and _worker_root() is None:
+        die(f"this run was started on a repository image, but the image has "
+            f"no repository root ({WORKER_ROOT}): it was built in an older "
+            "layout, or not by leerie, so its own root is the repository's. "
+            "Rebuild the repository image (launch again: leerie rebuilds an "
+            "image whose layout or base changed; on Fly, remove its lines "
+            "from ~/.cache/leerie/published-tags.txt). Leerie runs its own "
+            "processes only in its own root (DESIGN §6 *The orchestrator's "
+            "root is leerie's; a repository's root is only a confined "
+            "process's*).")
+    wr = _worker_root()
+    if wr is not None:
+        extras = _worker_home_extras(Path(wr))
+        if extras:
+            die("the repository image installs under /home/leerie, which a "
+                "confined command never sees: /home is the run's own (its HOME, "
+                "caches and credentials), taken from the container, not "
+                "from the repository's root. Found only in the repository's "
+                f"root: {', '.join(extras)}. Install these elsewhere in "
+                ".leerie/Dockerfile (beneath /opt or /usr/local, with an ENV "
+                "PATH entry for any binaries) and launch again (DESIGN §6 "
+                "*The orchestrator's root is leerie's; a repository's root "
+                "is only a confined process's*).")
+    if wr is None or not _isolated():
+        return
+    argv = _confined_argv(WorkerGrants(rw=("/dev/null",), ro=("/",)),
+                          ["test", "-e", _WORKER_ENV_MARK])
+    try:
+        r = subprocess.run(argv, cwd="/", stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60,
+                           check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        die(f"the confinement check could not run a command in the "
+            f"repository's root ({type(e).__name__}: {e}).")
+    if r.returncode != 0:
+        err = (r.stderr or "").strip()[-600:]
+        die(f"this image has a repository root ({WORKER_ROOT}), but a "
+            f"confined command did not run in it (exit {r.returncode}"
+            f"{': ' + err if err else ''}). Rebuild the repository image "
+            "(remove it with `nerdctl --namespace leerie image rm "
+            "leerie-repo/<repo>-<checkout>:<version>`"
+            " and launch again). Leerie runs the repository's commands only "
+            "in the repository's root, and its own only in its own (DESIGN "
+            "§6 *The orchestrator's root is leerie's; a repository's root is "
+            "only a confined process's*).")
+
+
+MOUNTINFO = Path("/proc/self/mountinfo")
+
+
+def _mountinfo_unescape(field: str) -> str:
+    """A mountinfo path field, its octal escapes (`\\040` for a space)
+    decoded."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _disk_place(path: Path) -> tuple[str, str]:
+    """Where `path` is on disk: the device and the path within its
+    filesystem, from the `/proc/self/mountinfo` line of the mount holding
+    its real path (the longest mount point at or above it; of equal ones the
+    last, which is the mount on top). Two names of one directory — a bind
+    mount of it, and its path under another mount of the same filesystem —
+    have one place. Without a readable mountinfo the place is the real path."""
+    real = os.path.realpath(path)
+    best: tuple[int, str, str] | None = None
+    try:
+        lines = MOUNTINFO.read_text().splitlines()
+    except OSError:
+        return ("", real)
+    for line in lines:
+        f = line.split(" ")
+        if len(f) < 5:
+            continue
+        dev, root, point = f[2], _mountinfo_unescape(f[3]), \
+            _mountinfo_unescape(f[4])
+        if real != point and not real.startswith(point.rstrip("/") + "/"):
+            continue
+        if best is None or len(point) >= best[0]:
+            rest = real[len(point.rstrip("/")):]
+            best = (len(point), dev, root.rstrip("/") + rest or "/")
+    if best is None:
+        return ("", real)
+    return (best[1], os.path.normpath(best[2]))
+
+
+def _nested(a: str, b: str) -> bool:
+    """`a` is `b` or beneath it, or `b` beneath `a`."""
+    a, b = a.rstrip("/") or "/", b.rstrip("/") or "/"
+    return (a == b or a.startswith(b.rstrip("/") + "/")
+            or b.startswith(a.rstrip("/") + "/"))
+
+
+def _require_state_root_apart(state_root: Path, checkout: Path) -> None:
+    """Stop the run when the state root has a second name through the
+    checkout (DESIGN §6 *No host path comes from a repository*, part 3).
+    Every grant is carved by path: `_around` takes the state root out of a
+    grant whose path contains it. A state root that is the checkout's
+    directory under another mount — `/leerie-state` bind-mounted from
+    `<checkout>/.lstate`, which `/work` shows too — is contained by no
+    grant's path, so every worker's read of `/work` reached the held-out sets
+    and the credentials' copies. A state root that holds the checkout under a
+    second name makes the checkout writable through it. The places on disk
+    are compared (`_disk_place`), and their nesting must be the paths'."""
+    s_dev, s_place = _disk_place(state_root)
+    c_dev, c_place = _disk_place(checkout)
+    on_disk = s_dev == c_dev and _nested(s_place, c_place)
+    by_path = _nested(os.path.realpath(state_root),
+                      os.path.realpath(checkout))
+    if on_disk and not by_path:
+        die(f"the state root {state_root} and the checkout {checkout} are "
+            f"one directory tree on disk ({s_place} and {c_place}) under "
+            "two names, so the checkout's mount would show every worker the "
+            "run's state, or the state root's would hold the checkout "
+            "writable. Keep the state root outside the checkout: set "
+            "--state-dir or LEERIE_STATE_DIR to a directory neither inside "
+            "nor above it (DESIGN §6 *No host path comes from a "
+            "repository*).")
 
 
 def _require_landlock() -> None:
@@ -23486,9 +24334,9 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
                 sandbox=HeldOutSandbox(view=str(view),
                                        place=((str(held), rel),),
                                        report=str(view / "report.json")),
-                report_fd=rep.fileno())
-            r = subprocess.run(argv, cwd=str(view), capture_output=True,
-                               text=True, timeout=60,
+                report_fd=rep.fileno(), worker_root=False)
+            r = subprocess.run(argv, cwd=str(view), stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=60,
                                pass_fds=(rep.fileno(),))
             rep.seek(0)
             raw = rep.read()
@@ -23606,8 +24454,8 @@ def _require_egress_relay() -> None:
                 "--ro", "/", "--", sys.executable, "-I", "-S", "-c",
                 _EGRESS_RELAY_PROBE, str(port)]
         try:
-            r = subprocess.run(argv, cwd="/", capture_output=True, text=True,
-                               timeout=60)
+            r = subprocess.run(argv, cwd="/", stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=60)
         except (OSError, subprocess.SubprocessError) as e:
             die("the confinement check every entry runs "
                 "(`_require_confinement`) could not run the network probe "
@@ -23676,14 +24524,38 @@ class WorkerGrants(NamedTuple):
 # never process state, so nothing else ever inherits it.
 HOST_SEAM_CAP = "_host_seam"
 
-# The device nodes a worker's tools write: not all of /dev. `/dev/shm`
-# holds POSIX semaphores and shared memory (Python's multiprocessing locks
-# and Chromium need it, measured); an isolated process's is its own, which
-# the shim maps it to (DESIGN §6 *Every confined process has its own
-# `/tmp`, `/dev/shm` and IPC*).
+# What every host-side CLI carries besides the shared containment (the
+# rebaser and host recapture through `claude_p`; the launcher's
+# `config --chat` the same flags, pinned equal by a test): it is handed a
+# checkout or a tree by `--add-dir`, from which the CLI loads skills,
+# commands and agents, and with HOST_CLI_ENV_PIN's variable set the tree's
+# CLAUDE.md (DESIGN §6 *The host never runs a program the checkout chose*,
+# part 4; review round 28 C1, C2). `--setting-sources user` is what stops
+# the `--add-dir` loading (measured, CLI 2.1.316); the rest is a second
+# layer that does not rest on that one CLI behaviour.
+HOST_CLI_ARGS = ("--setting-sources", "user", "--disable-slash-commands",
+                 "--strict-mcp-config")
+HOST_CLI_DENIED_TOOLS = ("Agent", "Task", "Skill")
+HOST_CLI_ENV_PIN = {"CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "0"}
+
+# The device nodes a confined process opens, and the only paths of `/dev`
+# any grant names (`_reads_outside` leaves `/dev` out): never a terminal
+# but `/dev/tty`, which names nothing once the shim has left its
+# controlling terminal (DESIGN §6 *No confined process holds or can open
+# the operator's terminal*). `/dev/shm` holds POSIX semaphores and shared
+# memory (Python's multiprocessing locks and Chromium need it, measured);
+# an isolated process's is its own, which the shim maps it to (DESIGN §6
+# *Every confined process has its own `/tmp`, `/dev/shm` and IPC*). A
+# pseudo-terminal (`/dev/ptmx`, `/dev/pts`) is granted by the shim with the
+# isolated process's own `devpts`, never the container's, which holds the
+# operator's pty.
 _WORKER_DEVICES = ("/dev/null", "/dev/zero", "/dev/full", "/dev/random",
-                   "/dev/urandom", "/dev/tty", "/dev/ptmx", "/dev/pts",
-                   "/dev/shm")
+                   "/dev/urandom", "/dev/tty", "/dev/shm")
+# Left out of every read grant `_reads_outside` makes: the container's
+# `/dev` holds the operator's terminal (`/dev/console` under `nerdctl run
+# -it`, its `devpts`), and a read-only descriptor of it reads keystrokes and
+# sets the terminal's modes (review round 33 isolation Q1).
+_DEV = Path("/dev")
 
 # The variables that name a worker's own directories, its temp dir and CLI
 # config (`_worker_dirs`). Each is granted only when it names a path beneath
@@ -23914,23 +24786,53 @@ def _beside(top: Path, root: Path) -> list[str]:
 
 
 def _reads_outside(root: Path, *, tmp: bool = True) -> list[str]:
-    """Read grants for everything outside the state root `root`; with `tmp`
-    False, for everything outside `root` and the container's `/tmp`
-    (`SHARED_TMP`), which no grant names: an isolated process's `/tmp` is
-    its own, granted by the shim (DESIGN §6 *Every confined process has its
-    own `/tmp`, `/dev/shm` and IPC*). An entry that resolves into `/tmp`
-    is left out with it."""
+    """Read grants for everything outside the state root `root` and the
+    host directory every run on the host shares (`_HOST_DIR_ENV`, its build
+    slots: `flock` needs only a read-only descriptor and Landlock does not
+    handle it, so a process that could open a slot file could hold every
+    slot from under the other runs — DESIGN §6 *A host-wide build
+    semaphore*); with `tmp` False, outside the container's `/tmp`
+    (`SHARED_TMP`) too, which no grant names: an isolated process's `/tmp`
+    is its own, granted by the shim (DESIGN §6 *Every confined process has
+    its own `/tmp`, `/dev/shm` and IPC*). An entry that resolves into
+    `/tmp` is left out with it. `/dev` (`_DEV`), and any entry that
+    resolves into it, is never in it: the devices a confined process opens
+    are named by `_WORKER_DEVICES` (DESIGN §6 *No confined process holds or
+    can open the operator's terminal*)."""
     if tmp:
-        return _beside(Path("/"), root)
-    shared = Path(os.path.realpath(SHARED_TMP))
-    if root.is_relative_to(shared):
-        return _beside(Path("/"), shared)
-    out = []
-    for p in _beside(Path("/"), root):
-        real = Path(os.path.realpath(p))
-        if not (real.is_relative_to(shared) or shared.is_relative_to(real)):
-            out.append(p)
-    return out
+        out = _beside(Path("/"), root)
+    else:
+        shared = Path(os.path.realpath(SHARED_TMP))
+        if root.is_relative_to(shared):
+            out = _beside(Path("/"), shared)
+        else:
+            out = []
+            for p in _beside(Path("/"), root):
+                real = Path(os.path.realpath(p))
+                if not (real.is_relative_to(shared)
+                        or shared.is_relative_to(real)):
+                    out.append(p)
+    out = [p for p in out
+           if not Path(os.path.realpath(p)).is_relative_to(_DEV)]
+    host = _host_dir()
+    return out if host is None else _around(out, host)
+
+
+def _host_dir() -> Path | None:
+    """The host directory every run on the host shares (`_HOST_DIR_ENV`),
+    resolved; None where there is none."""
+    host = os.environ.get(_HOST_DIR_ENV, "").strip()
+    return (Path(os.path.realpath(host)) if host and os.path.isdir(host)
+            else None)
+
+
+def _apart(paths: list[str], state_root: Path) -> list[str]:
+    """`paths` with the state root and the host directory (`_host_dir`)
+    taken out of each that contains one (`_around`): no grant covers
+    either."""
+    out = _around(paths, state_root)
+    host = _host_dir()
+    return out if host is None else _around(out, host)
 
 
 def _around(paths: list[str], root: Path) -> list[str]:
@@ -23947,17 +24849,50 @@ def _around(paths: list[str], root: Path) -> list[str]:
 
 def _worker_own_dirs(env: Mapping[str, str], run_dir: Path) -> list[str]:
     """The directories `_WORKER_ENV_DIRS` names in `env` that lie beneath
-    `<run_dir>/workers/`; any other value is shared, and granted nothing."""
+    `<run_dir>/workers/`, or that are the private temp directory
+    (`_worker_tmp`) of the worker whose configuration `CLAUDE_CONFIG_DIR`
+    names there; any other value is shared, and granted nothing."""
     workers = (run_dir / WORKERS_DIR).resolve()
+    config = env.get("CLAUDE_CONFIG_DIR")
+    own_tmp = (str(_worker_tmp(Path(os.path.realpath(config)).parent))
+               if config and Path(os.path.realpath(config)).parent.parent
+               == workers else None)
     out = []
     for var in _WORKER_ENV_DIRS:
         p = env.get(var)
-        if p and Path(os.path.realpath(p)).is_relative_to(workers):
+        if p and (Path(os.path.realpath(p)).is_relative_to(workers)
+                  or os.path.realpath(p) == own_tmp):
             out.append(os.path.realpath(p))
     return out
 
 
 TREE_REPOS_DIRNAME = "tree-repos"
+
+
+def _git_dirs(tree: Path) -> tuple[Path, Path] | None:
+    """`(git dir, common dir)` of the worktree or clone `tree`, resolved;
+    None when git cannot say."""
+    r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse",
+                        "--path-format=absolute", "--git-dir",
+                        "--git-common-dir"], capture_output=True, text=True,
+                       check=False, timeout=30)
+    lines = r.stdout.split("\n")
+    if r.returncode != 0 or len(lines) < 2:
+        return None
+    return Path(lines[0]).resolve(), Path(lines[1]).resolve()
+
+
+def _tree_repo_read(tree: Path, run_dir: Path) -> list[str]:
+    """The tree repository (`<run>/tree-repos/<tree>/`) `tree` is a worktree
+    of, for a worker that only reads `tree`; `[]` for any other tree (the
+    run repository is granted read on its own)."""
+    dirs = _git_dirs(tree)
+    if dirs is None or dirs[0].is_relative_to(tree):
+        return []
+    common = dirs[1]
+    if common.parent == (run_dir / TREE_REPOS_DIRNAME).resolve():
+        return [str(common)]
+    return []
 
 
 def _tree_git_dirs(tree: Path, run_dir: Path) -> tuple[list[str], list[str]]:
@@ -23970,14 +24905,10 @@ def _tree_git_dirs(tree: Path, run_dir: Path) -> tuple[list[str], list[str]]:
     remake one from a tree repository); writing it would grant the run
     repository's `refs/`, every branch, so the run stops instead.
     `([], [])` for a clone, whose `.git` is inside it."""
-    r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse",
-                        "--path-format=absolute", "--git-dir",
-                        "--git-common-dir"], capture_output=True, text=True,
-                       check=False, timeout=30)
-    lines = r.stdout.split("\n")
-    if r.returncode != 0 or len(lines) < 2:
+    dirs = _git_dirs(tree)
+    if dirs is None:
         return [], []
-    git_dir, common = Path(lines[0]).resolve(), Path(lines[1]).resolve()
+    git_dir, common = dirs
     run_repo = (run_dir / RUN_REPO_NAME).resolve()
     if git_dir.is_relative_to(tree):
         return [], []
@@ -24058,6 +24989,9 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     else:
         (rw if _bash_unrestricted(allowed_tools) else ro).append(str(cwd_r))
         ro.append(str(run_dir / RUN_REPO_NAME))
+        # A tree of its own repository: that repository read, never
+        # written, so the worker's `git` reads the tree it is in.
+        ro += _tree_repo_read(cwd_r, run_dir)
     if schema_key in _RUN_NOTES_READERS:
         ro += [str(run_dir / "subtasks"), str(run_dir / "task.md"),
                str(run_dir / NOTES_DIRNAME)]
@@ -24085,15 +25019,35 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     # Every worker reaches the API (and WebFetch, and what its shell
     # fetches) through the egress proxy.
     return WorkerGrants(
-        tuple(dict.fromkeys(_around(rw, state_root))),
+        tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
-                            + _around(ro, state_root))),
+                            + _apart(ro, state_root))),
         egress=True)
+
+
+# DESIGN §6 *The orchestrator's root is leerie's; a repository's root is
+# only a confined process's*: where the repository image's stages are, in
+# leerie's image (`leerie`'s `_repo_image_dockerfile`). Absent in the base
+# image, and wherever no repository image was built.
+WORKER_ROOT = Path("/opt/leerie-worker-root")
+# Set to "1" by the launcher when the run starts on a repository image
+# (`-e` locally, the launch wrapper's environment on Fly).
+REPO_IMAGE_ENV = "LEERIE_REPO_IMAGE"
+
+
+def _worker_root() -> str | None:
+    """`WORKER_ROOT` when this image has one (a directory, not a link)."""
+    try:
+        st = os.lstat(WORKER_ROOT)
+    except OSError:
+        return None
+    return str(WORKER_ROOT) if stat.S_ISDIR(st.st_mode) else None
 
 
 def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                    sandbox: HeldOutSandbox | None = None,
-                   report_fd: int | None = None) -> list[str]:
+                   report_fd: int | None = None, cli: bool = False,
+                   worker_root: bool = True) -> list[str]:
     """`cmd` started through the Landlock shim with `grants`. With
     `sandbox`, in a held-out sandbox (always: a held-out file never runs
     outside one, and the shim refuses where it cannot build one), its
@@ -24103,10 +25057,16 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
     `/tmp`, `/dev/shm` and IPC*), in a network namespace of its own: with
     an `egress` grant, the outside reached through the run's egress proxy
     (`_egress_server`), and the strict-output proxy's port relayed when it
-    is live (DESIGN §6 *A confined process has its own network*)."""
+    is live (DESIGN §6 *A confined process has its own network*). Where
+    the image has a worker root (`_worker_root`) and the command is
+    isolated, it runs in the worker view (`--worker-root`); a worker's CLI
+    (`cli`) stays in leerie's root and its commands run there instead
+    (`--cli`, `scripts/worker-shell.py`). `worker_root` False: leerie's
+    root, for the sandbox probe, which checks the shim's own machinery."""
     # `-S`: the shim imports only the standard library, and `site` cost
     # ~15 ms of every worker's start (measured).
     argv = [sys.executable, "-I", "-S", str(LANDLOCK_SCRIPT)]
+    wr = _worker_root() if worker_root else None
     if sandbox is not None:
         argv += ["--sandbox", "--view", sandbox.view]
         for src, rel in sandbox.place:
@@ -24114,6 +25074,8 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
         if sandbox.report is not None and report_fd is not None:
             argv += ["--report", sandbox.report, "--report-fd",
                      str(report_fd)]
+        if wr is not None:
+            argv += ["--worker-root", wr]
     elif _isolated():
         argv.append("--isolate")
         if grants.egress:
@@ -24124,6 +25086,8 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                 # loopback: the same port in the namespace, relayed.
                 argv += ["--forward", f"{_STRICT_PROXY.port}="
                          f"{proxy.forward(_STRICT_PROXY.port)}"]
+        if wr is not None:
+            argv += ["--worker-root", wr] + (["--cli"] if cli else [])
     for p in grants.rw:
         argv += ["--rw", p]
     for p in grants.ro:
@@ -24301,18 +25265,124 @@ def _write_beneath(anchor: Path, path: Path, data: bytes, *,
             raise
 
 
-def _read_beneath(anchor: Path, path: Path) -> bytes:
-    """The bytes of the regular file `path` beneath `anchor`, reached
-    without following a link (`OSError` otherwise, a FIFO included: it is
-    opened non-blocking and refused, never waited on)."""
+# How much of a repository's file leerie reads, by what the file is (DESIGN §6
+# *No read is unbounded*): a worker makes a terabyte sparse file at no disk
+# cost, and the orchestrator is unconfined. Every read states one.
+READ_LIMIT_CONFIG = 1 << 20      # configuration, manifests, pins, git admin
+READ_LIMIT_TEXT = 16 << 20       # text read whole: sources, task files
+READ_LIMIT_LARGE = 256 << 20     # a measurement's report; the operator's files
+_READ_CHUNK = 1 << 20
+
+
+def _read_regular_beneath(anchor: Path, path: Path, limit: int, *,
+                          whole: bool) -> bytes:
+    """At most `limit` bytes of the regular file `path` beneath `anchor`,
+    reached without following a link (`OSError` otherwise, a FIFO included:
+    it is opened non-blocking and refused, never waited on). `whole`: a file
+    over `limit` is refused (`EFBIG`), by its size after the open and by
+    what the read finds, so one that grows after the check is refused too;
+    otherwise its first `limit` bytes are the answer."""
     path = Path(path)
     with _dir_beneath(anchor, path.parent) as dfd:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                      | os.O_CLOEXEC, dir_fd=dfd)
         with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
                 raise OSError(errno.EINVAL, f"{path} is not a regular file")
-            return f.read()
+            if whole and st.st_size > limit:
+                raise OSError(errno.EFBIG, f"{path} is over {limit} bytes")
+            want = limit + 1 if whole else limit
+            chunks: list[bytes] = []
+            got = 0
+            while got < want:
+                b = f.read(min(_READ_CHUNK, want - got))
+                if not b:
+                    break
+                chunks.append(b)
+                got += len(b)
+            if whole and got > limit:
+                raise OSError(errno.EFBIG, f"{path} is over {limit} bytes")
+            return b"".join(chunks)
+
+
+def _read_beneath(anchor: Path, path: Path, *, limit: int) -> bytes:
+    """The bytes of the regular file `path` beneath `anchor`, reached
+    without following a link, refused (`OSError` `EFBIG`) over `limit`
+    bytes (DESIGN §6 *No read is unbounded*)."""
+    return _read_regular_beneath(anchor, path, limit, whole=True)
+
+
+def _read_head_beneath(anchor: Path, path: Path, *, limit: int) -> bytes:
+    """The first `limit` bytes of the regular file `path` beneath `anchor`,
+    reached without following a link: for a caller that uses only the
+    start of a file."""
+    return _read_regular_beneath(anchor, path, limit, whole=False)
+
+
+def _read_text_beneath(anchor: Path, path: Path, *, limit: int,
+                       errors: str = "replace") -> str:
+    """`_read_beneath`, decoded as UTF-8: a repository's file read without
+    following a link (DESIGN §6 *Leerie never reads through a link a
+    repository holds*), within `limit` bytes."""
+    return _read_beneath(anchor, path, limit=limit).decode("utf-8", errors)
+
+
+def _no_link_beneath(anchor: Path, path: Path) -> bool:
+    """True when `path` beneath `anchor` exists and is reached without a
+    link: neither it nor any directory on the way to it is one."""
+    path = Path(path)
+    if os.path.normpath(os.path.abspath(path)) == os.path.normpath(
+            os.path.abspath(anchor)):
+        return os.path.isdir(anchor)
+    try:
+        with _dir_beneath(anchor, path.parent) as dfd:
+            return not stat.S_ISLNK(os.stat(path.name, dir_fd=dfd,
+                                            follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _link_on_the_way(anchor: Path, path: Path) -> bool:
+    """True when a directory on the way from `anchor` to `path` cannot be
+    reached without following a link."""
+    try:
+        with _dir_beneath(anchor, Path(path).parent):
+            return False
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _dir_beneath_exists(anchor: Path, path: Path) -> bool:
+    """True when `path` beneath `anchor` is a directory reached without a
+    link."""
+    try:
+        with _dir_beneath(anchor, path):
+            return True
+    except OSError:
+        return False
+
+
+def _listdir_beneath(anchor: Path, path: Path) -> list[str]:
+    """The names in the directory `path` beneath `anchor`, reached without
+    a link (`OSError` otherwise). A name may itself be a link: read it with
+    `_read_beneath`, which refuses one."""
+    with _dir_beneath(anchor, path) as dfd:
+        return os.listdir(dfd)
+
+
+def _glob_beneath(anchor: Path, pattern: str) -> list[Path]:
+    """`anchor.glob(pattern)`, sorted, keeping only the matches reached
+    without a link (`_no_link_beneath`): a match through a linked directory
+    names another tree's files, and a match that is a link names whatever it
+    points at."""
+    try:
+        hits = sorted(Path(anchor).glob(pattern))
+    except (OSError, ValueError):
+        return []
+    return [p for p in hits if _no_link_beneath(anchor, p)]
 
 
 def _lexists_beneath(anchor: Path, path: Path) -> bool:
@@ -24416,12 +25486,16 @@ def _rmdirs_beneath(anchor: Path, path: Path) -> None:
 
 
 def _copy_beneath(src: Path, anchor: Path, dst: Path, *,
-                  src_anchor: Path | None = None) -> None:
+                  src_anchor: Path | None = None,
+                  limit: int | None = None) -> None:
     """Copy the file `src` to `dst` beneath `anchor` (`_write_beneath`),
     with its mode. `src_anchor`: `src` lies where confined code writes too,
-    and is read without following a link (`_read_beneath`)."""
+    and is read without following a link (`_read_beneath`), within `limit`
+    bytes, which such a copy must state."""
     if src_anchor is not None:
-        data = _read_beneath(src_anchor, src)
+        if limit is None:
+            raise TypeError("a copy read beneath src_anchor states its limit")
+        data = _read_beneath(src_anchor, src, limit=limit)
         with _dir_beneath(src_anchor, Path(src).parent) as sfd:
             m = os.stat(Path(src).name, dir_fd=sfd,
                         follow_symlinks=False).st_mode
@@ -24433,14 +25507,19 @@ def _copy_beneath(src: Path, anchor: Path, dst: Path, *,
 
 def _copytree_beneath(src: Path, anchor: Path, dst: Path, *,
                       ignore: Callable[[str, list[str]], Iterable[str]]
-                      | None = None) -> None:
+                      | None = None,
+                      src_anchor: Path | None = None,
+                      limit: int | None = None) -> None:
     """`shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True,
     ignore=ignore)` with every write beneath `anchor` (`_write_beneath`): a
-    link in `src` is copied as a link, never followed on either side."""
+    link in `src` is copied as a link, never followed on either side.
+    `src_anchor`: `src` is read beneath it (`_listdir_beneath`,
+    `_read_beneath`), so a link on the way to `src` refuses the copy."""
     src = Path(src)
     with _dir_beneath(anchor, dst, make=True):
         pass
-    names = os.listdir(src)
+    names = (_listdir_beneath(src_anchor, src) if src_anchor is not None
+             else os.listdir(src))
     skip = set(ignore(str(src), names)) if ignore is not None else set()
     for name in names:
         if name in skip:
@@ -24452,9 +25531,10 @@ def _copytree_beneath(src: Path, anchor: Path, dst: Path, *,
                     os.unlink(name, dir_fd=dfd)
                 os.symlink(os.readlink(s), name, dir_fd=dfd)
         elif s.is_dir():
-            _copytree_beneath(s, anchor, d, ignore=ignore)
+            _copytree_beneath(s, anchor, d, ignore=ignore,
+                              src_anchor=src_anchor, limit=limit)
         else:
-            _copy_beneath(s, anchor, d)
+            _copy_beneath(s, anchor, d, src_anchor=src_anchor, limit=limit)
 
 
 def _mkdir_private(path: Path, top: Path) -> None:
@@ -24609,7 +25689,7 @@ def _sweep_measure_dirs(root: Path) -> None:
         if not stale and id_file:
             try:
                 stale = _read_beneath(
-                    root.parent, Path(id_file)).decode().strip() != \
+                    root.parent, Path(id_file), limit=READ_LIMIT_CONFIG).decode().strip() != \
                     own.name.rsplit("-", 1)[-1]
             except (OSError, ValueError):
                 stale = True
@@ -24670,7 +25750,7 @@ def _measure_dir_at(run_dir: Path, tree: Path,
         # directories, or a fresh one.
         id_file = id_dir / _MEASURE_ID_FILE
         with contextlib.suppress(OSError, ValueError):
-            tid = _read_beneath(run_dir, id_file).decode().strip()
+            tid = _read_beneath(run_dir, id_file, limit=READ_LIMIT_CONFIG).decode().strip()
         if not _MEASURE_ID_RE.fullmatch(tid):
             tid = uuid.uuid4().hex[:16]
             with contextlib.suppress(OSError):
@@ -24870,9 +25950,9 @@ def _measurement_grants(st: "State", tree: str | Path,
     # confined process has its own network*, *An install reaches its
     # inputs*).
     return WorkerGrants(
-        tuple(dict.fromkeys(_around(rw, state_root))),
+        tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
-                            + _around(ro, state_root))),
+                            + _apart(ro, state_root))),
         tuple(env.items()), egress=kind != MEASURE_KIND)
 
 
@@ -25118,7 +26198,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # makes the two halves move together or not at all.
     #
     # Auto-derivation floors at 8 GiB so this is normally >= 5760, but
-    # --worker-memory-max / LEERIE_WORKER_MEMORY_MAX / leerie.toml let an
+    # --worker-memory-max / LEERIE_WORKER_MEMORY_MAX let an
     # operator set the cap below the reserve explicitly — clamp so V8 is
     # never handed a non-positive or degenerately small ceiling.
     if worker_memory_max_bytes is not None and _is_node_repo(cwd):
@@ -25299,8 +26379,11 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     except BaseException:
         await exec_hold.aclose()
         raise
-    spawn_cmd = (list(cmd) if grants is None
-                 else _confined_argv(grants, list(cmd)))
+    # Unconfined (the host-side seam): the CLI is found from `/`, never
+    # through PATH from the directory it starts in (DESIGN §6 *The host
+    # never runs a program the checkout chose*, part 4).
+    spawn_cmd = ([_exe_from_root(cmd[0]), *cmd[1:]] if grants is None
+                 else _confined_argv(grants, list(cmd), cli=True))
     gate_r: int | None = None
     gate_w: int | None = None
     if cgroup_sid is not None:
@@ -26384,8 +27467,8 @@ def _write_system_prompt_file(run_dir: str | Path | None, text: str) -> str:
     90-minute worker and its retries, and anything that clears /tmp under a
     live run (a host cleanup, a lost overlay) takes every in-flight file
     with it: 5 runs died that way at their next spawn. The run directory is
-    the state the run already depends on, and the directory is read-denied
-    to workers (`_sysprompt_read_denial`). Falls back to the system temp dir
+    the state the run already depends on; every worker's grant reads it (its
+    CLI reads its own file there). Falls back to the system temp dir
     only when the run directory cannot hold it."""
     import tempfile  # noqa: PLC0415
     d: str | None = None
@@ -26400,61 +27483,6 @@ def _write_system_prompt_file(run_dir: str | Path | None, text: str) -> str:
             mode="w", suffix=".txt", delete=False, dir=d) as f:
         f.write(text)
         return f.name
-
-
-def _reads_beyond_cwd(allowed_tools: str, autonomous: bool) -> bool:
-    """Whether a worker can read outside its working directories: an
-    acting worker (its boundary is erased), or one granted a bare `Read`,
-    `Grep` or `Glob`, which the CLI then allows on any path."""
-    tools = {t.strip() for t in (allowed_tools or "").split(",")}
-    return autonomous or bool(tools & {"Read", "Grep", "Glob"})
-
-
-def _sysprompt_read_denial(run_dir: str | Path | None, allowed_tools: str,
-                           autonomous: bool) -> str:
-    """`Read` deny on the staged system prompts, for every worker that can
-    read beyond its working directories: another worker's instructions are
-    not input to this one (DESIGN §7 *The system prompt is staged in the
-    run directory*). A worker held to the boundary gets none. Any `Read()`
-    deny makes the CLI refuse `cd <dir>; <read> <relative path>` compounds
-    it cannot resolve statically, and the boundary already keeps such a
-    worker out of the run directory."""
-    if run_dir is None or not _reads_beyond_cwd(allowed_tools, autonomous):
-        return ""
-    return f"Read(/{Path(run_dir) / SYSPROMPT_DIRNAME}/**)"
-
-
-def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
-    """Keep the held-out acceptance sets out of the fixers' reach (DESIGN §8
-    *Held-out acceptance tests*): `Read` denies for implementer, conformer
-    and the surrogate witness's `surrogate_fixer` on every run-directory file that records a set — the sets
-    themselves, the evaluation worktree, every log (the writers' stream
-    transcripts carry the test source), `orchestrator.log` (where streamed
-    output is echoed), `calls.ndjson` (the writers' responses) and
-    `state.json` (case names and paths) — and on the CLI's own session
-    transcripts. The fixers' prompts read only `subtasks/`, `task.md` and
-    `notes/` there. Joined with `_repo_write_denials`' rules at the
-    call site. A shell `cat` is not covered; hiding reduces the
-    special-casing incentive, it does not guarantee it. The delivery
-    `falsifier` is denied the same run state (bench Q2 F+ hid it): it gets
-    its own read-only copies of the valid sets as leads (DESIGN §8
-    *Delivery detection*)."""
-    if schema_key not in ("implementer", "conformer", "surrogate_fixer",
-                          "falsifier"):
-        return ""
-    rd = Path(run_dir)
-    # The evaluation worktree is run-id-prefixed (`_helper_worktree_path`);
-    # the run directory's own name is the run id.
-    eval_wt = rd / "worktrees" / _worktree_dirname(rd.name, "acceptance-eval")
-    # `//` anchors an absolute path for the CLI, as in _repo_write_denials.
-    return ",".join([f"Read(/{rd / 'acceptance'}/**)",
-                     f"Read(/{eval_wt}/**)",
-                     f"Read(/{rd / 'logs'}/**)",
-                     f"Read(/{rd / 'orchestrator.log'})",
-                     f"Read(/{rd / 'calls.ndjson'})",
-                     f"Read(/{rd / 'state.json'})",
-                     f"Read(/{rd / WORKERS_DIR}/*/config/**)",
-                     "Read(~/.claude/projects/**)"])
 
 
 def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
@@ -26776,7 +27804,7 @@ def _rule_matches(text: str, pattern: str) -> bool:
 _QUOTED_SPACE = "\x00"  # not str.isspace(), unlike the ASCII separators
 
 
-def _shell_subcommands(cmd: str) -> list[str]:
+def _shell_subcommands(cmd: str, *, heredoc_body: bool = False) -> list[str]:
     """`cmd` split into the subcommands the CLI matches rules against.
 
     Quote-aware. Inside single quotes everything is literal. Inside double
@@ -26792,13 +27820,25 @@ def _shell_subcommands(cmd: str) -> list[str]:
     a subshell's `(`/`)`, and `{`/`}` only as group words (whitespace or the
     string's edge on both sides) -- brace expansion such as `tests/{a,b}.py`
     is part of a word, which is how the CLI read it live. An unclosed
-    substitution still contributes its outer command. A backslash escapes
-    the next character (an escaped blank stays in its word, as
-    `_QUOTED_SPACE`), and a backslash-newline is removed, as bash removes
-    it. Redirections outside quotes (`> f`,
+    substitution still contributes its outer command. Inside a
+    substitution, while a `case` clause is open, a `)` ends a pattern, not
+    the substitution. A backslash escapes the next character (an escaped
+    blank stays in its word, as `_QUOTED_SPACE`), and a backslash-newline is
+    removed, as bash removes it. Redirections outside quotes (`> f`,
     `2>&1`, `<in`, `> "a b"`) are dropped with their target, unless the
     target holds a substitution, which runs and is scanned. Whitespace is
-    collapsed per subcommand."""
+    collapsed per subcommand.
+
+    A here-document (`<<word`, `<<-word`; not the here-string `<<<`) is
+    input, not commands, but its body is dropped only where the scan can
+    show bash reads one (DESIGN §9): `<<` in plain command context -- not
+    in a comment, nor inside `${…}`, `$[…]`, `$((…))` or `((…))` -- with a
+    plain delimiter (`_heredoc_delimiter`) whose terminating line is
+    present. Otherwise the text is read as commands, which at worst costs a
+    false denial. An unquoted delimiter's body still expands its `$(...)`
+    and backtick substitutions, which run and are scanned
+    (`_heredoc_substitutions`). With `heredoc_body`, `cmd` is such a body:
+    only its substitutions are read."""
     s = cmd
     n = len(s)
     segs: list[str] = []
@@ -26806,10 +27846,30 @@ def _shell_subcommands(cmd: str) -> list[str]:
     quote: str | None = None
     # Open substitutions: (closing char, quote to restore, outer text).
     subst: list[tuple[str, str | None, list[str]]] = []
+    # Open `case` clauses per substitution level (index 0: top level).
+    cases: list[int] = [0]
+    # Here-documents whose bodies start after the next newline:
+    # (delimiter, `<<-` strips leading tabs, delimiter was quoted).
+    heredocs: list[tuple[str, bool, bool]] = []
+    bodies: list[str] = []
+    # Open expansions in which `<<` is an operator, never a here-document:
+    # [closer, nesting depth, substitution level read at, index of the
+    # opener's own last bracket] for `${`, `$[`, `$((` / `((`. One whose
+    # substitution closed before it (the scan closes `$(( (a) ))` at the
+    # first `)`, as it always has) is never popped: the rest of the command
+    # then has no here-document, the safe direction.
+    expans: list[list] = []
+    comment = False
     i = 0
 
     def cut() -> None:
-        segs.append("".join(buf))
+        seg = "".join(buf)
+        first = seg.split()[:1]
+        if first == ["case"]:
+            cases[-1] += 1
+        elif first == ["esac"] and cases[-1]:
+            cases[-1] -= 1
+        segs.append(seg)
         buf.clear()
 
     def open_subst(closer: str, width: int) -> None:
@@ -26817,9 +27877,13 @@ def _shell_subcommands(cmd: str) -> list[str]:
         # substitutions quadratic.
         nonlocal buf, quote, i
         subst.append((closer, quote, buf))
+        cases.append(0)
         buf = []
         quote = None
         i += width
+
+    def word_start(at: int) -> bool:
+        return at == 0 or s[at - 1] in " \t\n;|&()"
 
     while i < n:
         ch = s[i]
@@ -26837,11 +27901,24 @@ def _shell_subcommands(cmd: str) -> list[str]:
                 i += 1
                 buf.append(s[i])
             elif s.startswith("$(", i) or ch == "`":
+                if s.startswith("$((", i):
+                    expans.append(["))", 0, len(subst) + 1, i + 2])
                 open_subst(")" if ch == "$" else "`", 2 if ch == "$" else 1)
                 continue
             else:
                 buf.append(_QUOTED_SPACE if ch.isspace() else ch)
             i += 1
+            continue
+        if heredoc_body and not subst:
+            # A body's own text: only an escape and a substitution are read.
+            if ch == "\\":
+                i += 2
+            elif s.startswith("$(", i) or ch == "`":
+                if s.startswith("$((", i):
+                    expans.append(["))", 0, len(subst) + 1, i + 2])
+                open_subst(")" if ch == "$" else "`", 2 if ch == "$" else 1)
+            else:
+                i += 1
             continue
         if ch in "'\"":
             quote = ch
@@ -26857,15 +27934,62 @@ def _shell_subcommands(cmd: str) -> list[str]:
                 buf.append(_QUOTED_SPACE if nxt.isspace() else nxt)
             i += 2
             continue
+        # Expansions in which `<<` is a shift or a pattern, never a
+        # here-document: observed only, the text read as before.
+        live = bool(expans) and expans[-1][2] == len(subst)
+        if live and i != expans[-1][3]:
+            closer = expans[-1][0]
+            if ch == {"}": "{", "]": "[", "))": "("}[closer]:
+                expans[-1][1] += 1
+            elif ch == closer[0] and expans[-1][1]:
+                expans[-1][1] -= 1
+            elif s.startswith(closer, i):
+                expans.pop()
+                live = False
+        if s.startswith("${", i) or s.startswith("$[", i):
+            expans.append(["}" if s[i + 1] == "{" else "]", 0, len(subst),
+                           i + 1])
+        elif s.startswith("$((", i):
+            # `$(` opens a substitution below; the expansion is read there.
+            expans.append(["))", 0, len(subst) + 1, i + 2])
+        elif s.startswith("((", i) and not comment and (
+                i == 0 or s[i - 1] != "$"):
+            expans.append(["))", 0, len(subst), i + 1])
+        if live and ch in "<>":
+            # An operator of the expression, never a redirect.
+            buf.append(ch)
+            i += 1
+            continue
         if subst and ch == subst[-1][0]:
+            first = "".join(buf).split()[:1]
+            if ch == ")" and (cases[-1] or first == ["case"]) \
+                    and first != ["esac"]:
+                # A `case` pattern's `)`: the clause's commands follow.
+                cut()
+                i += 1
+                continue
             cut()
             _closer, quote, buf = subst.pop()
+            cases.pop()
             buf.append("$_")
             i += 1
             continue
         if s.startswith("$(", i) or ch == "`":
             open_subst(")" if ch == "$" else "`", 2 if ch == "$" else 1)
             continue
+        if ch == "#" and word_start(i) and not expans:
+            comment = True
+        if ch == "\n":
+            comment = False
+            if heredocs:
+                cut()
+                i += 1
+                got = _heredoc_bodies(s, i, heredocs)
+                heredocs.clear()
+                if got is not None:
+                    i, texts = got
+                    bodies += texts
+                continue
         if ch in ";|&\n()":
             cut()
             i += 1
@@ -26875,6 +27999,18 @@ def _shell_subcommands(cmd: str) -> list[str]:
             cut()
             i += 1
             continue
+        if (s.startswith("<<", i) and not s.startswith("<<<", i)
+                and not comment and not expans):
+            delim = _heredoc_delimiter(s, i)
+            if delim is not None:
+                # A here-document: drop the operator and its delimiter word,
+                # and remember the delimiter for the body after the newline.
+                word, strip, quoted, i = delim
+                while buf and buf[-1].isdigit():
+                    buf.pop()
+                heredocs.append((word, strip, quoted))
+                buf.append(" ")
+                continue
         if ch in "<>":
             # Drop an fd number glued to the operator (`2>`), the operator,
             # an `&` dup, and the target word -- quoted targets included.
@@ -26902,6 +28038,9 @@ def _shell_subcommands(cmd: str) -> list[str]:
             continue
         buf.append(ch)
         i += 1
+    if heredoc_body:
+        # The top level is the body's text, never a command.
+        buf.clear()
     cut()
     # An unclosed substitution still leaves its outer command to match.
     while subst:
@@ -26911,7 +28050,80 @@ def _shell_subcommands(cmd: str) -> list[str]:
         # scan does not model) must not glue everything after it into one
         # word: fall back to plain spaces, as before quoted spaces existed.
         segs = [x.replace(_QUOTED_SPACE, " ") for x in segs]
-    return [seg for seg in (" ".join(x.split()) for x in segs) if seg]
+    out = [seg for seg in (" ".join(x.split()) for x in segs) if seg]
+    if heredoc_body:
+        out = [seg for seg in out if seg != "$_"]
+    for text in bodies:
+        out += _heredoc_substitutions(text)
+    return out
+
+
+def _heredoc_delimiter(s: str, at: int) -> tuple[str, bool, bool, int] | None:
+    """`(delimiter, strip_tabs, quoted, end)` of the here-document operator
+    at `s[at]` (`<<` or `<<-`) when its delimiter is one the scan can match
+    as bash does: a plain unquoted word, or a word wholly in `'…'` or
+    `"…"`, holding no `$`, backquote or backslash. None for any other
+    (`$'X'`, `E"O"F`, `\\EOF`, none at all): the caller then reads the text
+    as commands. Mechanical string handling only."""
+    n = len(s)
+    i = at + 2
+    strip = i < n and s[i] == "-"
+    i += strip
+    while i < n and s[i] in " \t":
+        i += 1
+    if i < n and s[i] in "'\"":
+        close = s.find(s[i], i + 1)
+        word = s[i + 1:close] if close > 0 else ""
+        end = close + 1
+        if close < 0 or not word or (end < n and not s[end].isspace()
+                                     and s[end] not in ";|&()<>"):
+            return None
+        quoted = True
+    else:
+        j = i
+        while j < n and not s[j].isspace() and s[j] not in ";|&()<>":
+            j += 1
+        word, end, quoted = s[i:j], j, False
+        if not word or any(c in word for c in "'\""):
+            return None
+    if any(c in word for c in "$`\\\n"):
+        return None
+    return word, strip, quoted, end
+
+
+def _heredoc_bodies(s: str, at: int, pending: list[tuple[str, bool, bool]]
+                    ) -> tuple[int, list[str]] | None:
+    """The here-document bodies starting at `s[at]` for the `pending`
+    delimiters, in order: `(index after the last terminating line, the
+    unquoted-delimiter bodies)`, or None when a terminating line is missing
+    -- bash then reads to the end as body, and the scan, unable to agree
+    line by line, reads the text as commands instead."""
+    n = len(s)
+    i = at
+    texts: list[str] = []
+    for delim, strip, quoted in pending:
+        lines: list[str] = []
+        while True:
+            if i >= n:
+                return None
+            end = s.find("\n", i)
+            line = s[i:] if end < 0 else s[i:end]
+            i = n if end < 0 else end + 1
+            if (line.lstrip("\t") if strip else line) == delim:
+                break
+            lines.append(line)
+        if not quoted:
+            texts.append("\n".join(lines))
+    return i, texts
+
+
+def _heredoc_substitutions(body: str) -> list[str]:
+    """The subcommands of every `$(...)` and backtick substitution in an
+    unquoted-delimiter here-document's `body`, which the shell expands and
+    so runs; the rest of the body is text. The same quote-aware scan, in
+    its body mode (`_shell_subcommands(body, heredoc_body=True)`), so a
+    quoted `)` or a `case` pattern does not end a substitution early."""
+    return _shell_subcommands(body, heredoc_body=True)
 
 
 def _strip_command_prefixes(seg: str) -> str:
@@ -27927,9 +29139,9 @@ _FORBID_NODE_MODULES_BIN = re.compile(
 
 # What, after a matched runner, is not a test-file operand (DESIGN §9 *A
 # command the task forbids*): `subs` are subcommands that run the suite
-# (`vitest run`/`watch`/`dev`; `related <files>` is a scoped run and stays
-# an operand); `value` the options whose next word is their value;
-# `select` the options that themselves narrow the run to some files or
+# (`vitest run`/`watch`/`dev`; `related <files>` stays an operand, read by
+# `_forbidden_impact_whole`); `value` the options whose next word is their
+# value; `select` the options that themselves narrow the run to some files or
 # targets (a scoped run whatever else is said, unless its value is one of
 # `select_all`, the runner's match-everything glob); `operand_opts` the
 # options whose value is a test-path operand (`mocha --spec`, `rspec
@@ -27961,7 +29173,7 @@ _FORBID_RUNNERS: dict[tuple[str, ...], dict[str, frozenset[str]]] = {
             "--testPathPatterns", "--testMatch", "--testRegex",
             "--onlyChanged", "-o", "--changedSince", "--lastCommit",
             "--changedFilesWithAncestor", "--onlyFailures", "-f",
-            "--findRelatedTests", "--selectProjects", "--ignoreProjects"})},
+            "--selectProjects", "--ignoreProjects"})},
     ("mocha",): {"value": _MOCHA_VALUE_OPTS,
                  "operand_opts": frozenset({"--spec"}),
                  "dot_scoped": frozenset({"no_recursion"})},
@@ -28181,10 +29393,42 @@ def _forbidden_glob_whole(w: str, norm: set[str]) -> bool:
     return w[k:].startswith("**") and w.rsplit("/", 1)[-1].startswith("*")
 
 
+def _forbidden_impact_whole(rest: list[str],
+                            spec: dict[str, frozenset[str]],
+                            value_opts: frozenset[str], impact: str
+                            ) -> bool | None:
+    """For an impact-analysis run of `impact` (a `_RUNNER_DIRECT_SELECTORS`
+    runner: vitest's `related` subcommand, jest's `--findRelatedTests`),
+    whether it runs the whole suite; None when `rest` is no such run. It is
+    scoped only over module sources leerie itself would hand it
+    (`_impact_module_source`, the classification `_render_scoped` filters
+    `{files}` by): no operand, or any other one — `package.json`, which
+    vitest's default `forceRerunTriggers` reads as rerun-everything, a
+    lockfile, the runner's own configuration — is a whole-suite run (DESIGN
+    §9 *An impact-analysis runner is handed only its own module sources*).
+    Mechanical path tests only."""
+    affected = _RUNNER_DIRECT_SELECTORS[impact][0]
+    if affected.startswith("-"):
+        if affected not in rest:
+            return None
+        pos = _forbidden_runner_operands(
+            [w for w in rest if w != affected], spec, value_opts)
+        if pos is None:
+            # Another selecting option narrows it as well.
+            return False
+    else:
+        pos = _forbidden_runner_operands(rest, spec, value_opts)
+        if not pos or pos[0] != affected:
+            return None
+        pos = pos[1:]
+    return not pos or not all(_impact_module_source(w, impact) for w in pos)
+
+
 def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
                                 value_opts: frozenset[str] = frozenset(),
                                 *, runner: dict[str, frozenset[str]]
-                                | None = None) -> bool:
+                                | None = None,
+                                impact: str | None = None) -> bool:
     """True when the words after a matched runner still run the whole suite
     — the whole-suite deny's semantics (`_suite_rule_bodies`: the bare
     runner, or one aimed at a test root), plus a flags-only runner, which
@@ -28196,8 +29440,14 @@ def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
     `runner` (a `_FORBID_RUNNERS` entry) adds its value options, its
     selecting options (a hit is a scoped run), its whole-suite operands
     and, after `--`, its test binary's value options
-    (`_forbidden_runner_operands`)."""
+    (`_forbidden_runner_operands`). `impact` names the runner when it has
+    impact analysis (`_RUNNER_DIRECT_SELECTORS`): its impact-analysis run is
+    read by `_forbidden_impact_whole`."""
     spec = runner or {}
+    if impact is not None:
+        whole = _forbidden_impact_whole(rest, spec, value_opts, impact)
+        if whole is not None:
+            return whole
     pos = _forbidden_runner_operands(rest, spec, value_opts)
     if pos is None:
         return False
@@ -28258,7 +29508,8 @@ def _forbidden_command_hit(command: str,
                             continue
                         if (scope == "any" or _forbidden_whole_suite_rest(
                                 c[len(head):], roots + ops,
-                                runner=_forbidden_runner(forb))):
+                                runner=_forbidden_runner(forb),
+                                impact=_forbidden_impact_runner(forb))):
                             return cmd
     except Exception:
         return None
@@ -28366,6 +29617,14 @@ def _process_constraints(result: dict, prescribed: dict | None,
             entries.append(d)
     return {"forbidden_commands": originals,
             "entries": entries, "dropped": dropped}
+
+
+def _forbidden_impact_runner(forb: list[str]) -> str | None:
+    """The `_RUNNER_DIRECT_SELECTORS` runner a canonical forbidden argv
+    names, else None."""
+    key = _forbidden_runner_key(forb)
+    return key[0] if key and len(key) == 1 \
+        and key[0] in _RUNNER_DIRECT_SELECTORS else None
 
 
 def _forbidden_runner_key(argv: list[str]) -> tuple[str, ...] | None:
@@ -28814,11 +30073,16 @@ def _merge_settings(low: dict, high: dict) -> dict:
     return out
 
 
-def _settings_file(path: Path) -> dict:
+def _settings_file(path: Path, *, root: Path | None = None) -> dict:
     """A settings file's object; {} when absent, and when unreadable or not
-    an object (logged: the CLI would have read it)."""
+    an object (logged: the CLI would have read it). `root`: the file is the
+    repository's, read beneath it without following a link (DESIGN §6
+    *Leerie never reads through a link a repository holds*); None for the
+    operator's own."""
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(
+            _read_text_beneath(root, path, errors="strict", limit=READ_LIMIT_CONFIG)
+            if root is not None else path.read_text())
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:
@@ -28828,6 +30092,126 @@ def _settings_file(path: Path) -> dict:
         log(f"  settings {path} not applied to workers: not a JSON object")
         return {}
     return data
+
+
+# The checkout's Claude Code settings files leerie reads (the launcher's
+# `detect_bedrock_mode` reads the same two).
+CHECKOUT_SETTINGS_FILES = ("settings.json", "settings.local.json")
+
+
+@functools.lru_cache(maxsize=None)
+def _checkout_settings_are_operators(repo_root: str, name: str) -> bool:
+    """Whether the checkout's `.claude/<name>` is the operator's own: a file
+    no repository holds (`_checkout_file_tracked`; DESIGN §6 *A repository
+    chooses no operator authority*). A tracked one is the repository's
+    content — a cloned repository's, a submodule's, or a run branch's the
+    operator merged — and a settings file carries credentials and endpoints
+    (`apiKeyHelper`, an `env` `ANTHROPIC_BASE_URL`), permissions and hooks,
+    so it adds nothing to a worker's settings. No merge or clone brings an
+    untracked file, so that one is the operator's (`settings.local.json`,
+    usually ignored). An absent one is the operator's (there is nothing to
+    read). Asked once per process: the checkout is not written while
+    leerie runs."""
+    rel = f".claude/{name}"
+    tracked = _checkout_file_tracked(Path(repo_root), rel)
+    if tracked:
+        log(f"  {rel} is tracked by the repository: not applied to workers "
+            "(a repository's settings choose no operator authority; put "
+            "your own in ~/.claude/settings.json or an untracked "
+            ".claude/settings.local.json)")
+    return not tracked
+
+
+def _checkout_file_tracked(root: Path, rel: str) -> bool:
+    """Whether the checkout file `rel` (`/`-separated) is a repository's
+    content rather than the operator's (DESIGN §6 *A repository chooses no
+    operator authority*): an index entry is the file or a directory above
+    it — a submodule is one gitlink entry, so its files have no entry of
+    their own — or a directory above it inside the checkout holds a `.git`
+    (a submodule, or a repository nested there).
+
+    Decided by the file, not by its name (DESIGN §6 *A path is the file it
+    names, not its spelling*): on a case-insensitive checkout a read of
+    `.claude/settings.json` opens a tracked `.claude/Settings.json`. So the
+    file is opened as `_read_text_beneath` reads it (beneath the checkout,
+    no link followed), and the index entries under the top directory it was
+    opened through are compared with it and its directories by `(st_dev,
+    st_ino)`. When git cannot answer, or the file is reached through a link
+    or is not a regular file, it is tracked; an absent one is not."""
+    *dirs, name = rel.split("/")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    fds: list[int] = []
+    above: list[os.stat_result] = []
+    try:
+        fds.append(os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
+        for d in dirs:
+            fds.append(os.open(d, flags | os.O_DIRECTORY, dir_fd=fds[-1]))
+            above.append(os.fstat(fds[-1]))
+            try:
+                os.stat(".git", dir_fd=fds[-1], follow_symlinks=False)
+                return True
+            except FileNotFoundError:
+                pass
+        fd = os.open(name, flags, dir_fd=fds[-1])
+        try:
+            mine = os.fstat(fd)
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    finally:
+        for fd in fds:
+            os.close(fd)
+    if not stat.S_ISREG(mine.st_mode):
+        return True
+    try:
+        r = _git_z_output(["git", "--literal-pathspecs",
+                           *_tree_git_args(root), "ls-files", "-z"],
+                          timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if r.returncode != 0:
+        return True
+    return _index_holds(root, [e for e in r.stdout.split("\0") if e],
+                        [mine, *above])
+
+
+def _index_holds(root: Path, entries: list[str],
+                 chain: list[os.stat_result]) -> bool:
+    """True when one of the index `entries` (paths beneath `root`) is, by
+    `lstat` from the root, one of `chain` — a file, then the directories
+    above it from the top, compared by `(st_dev, st_ino)` (DESIGN §6 *A path
+    is the file it names, not its spelling*). Only entries whose top
+    component is `chain`'s top (the directory first opened, or the file
+    itself at the top level) are looked at; an entry with no `/` is its own
+    top, so a submodule's gitlink is compared like any other entry."""
+    same = (lambda a, b: (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino))
+    top_of_chain = chain[1] if len(chain) > 1 else chain[0]
+    rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        tops: dict[str, bool] = {}
+        for e in entries:
+            top = e.partition("/")[0]
+            if top not in tops:
+                try:
+                    tops[top] = same(os.stat(top, dir_fd=rfd,
+                                             follow_symlinks=False),
+                                     top_of_chain)
+                except OSError:
+                    tops[top] = False
+            if not tops[top]:
+                continue
+            try:
+                st = os.stat(e, dir_fd=rfd, follow_symlinks=False)
+            except OSError:
+                continue
+            if any(same(st, c) for c in chain):
+                return True
+        return False
+    finally:
+        os.close(rfd)
 
 
 def _confined_cli_settings(hook_settings: str | None, *,
@@ -28842,10 +30226,12 @@ def _confined_cli_settings(hook_settings: str | None, *,
     without the shell prefix, measured) or unsets the prefix. In their place,
     lowest first: the operator's settings from the run's read-only
     configuration template (`run_dir`; with none, the operator's own
-    configuration directory), the repository's project and local settings
-    from the user's checkout (`repo_root`, which no worker writes), then
-    leerie's own — the PreToolUse hook (`hook_settings`) and the shell
-    prefix, which nothing below can override."""
+    configuration directory), the checkout's project and local settings
+    that git does not track (`repo_root`; the operator's own, DESIGN §6 *A
+    repository chooses no operator authority* — a tracked one is the
+    repository's and adds nothing), then leerie's own — the PreToolUse hook
+    (`hook_settings`) and the shell prefix, which nothing below can
+    override."""
     if run_dir is not None:
         user = Path(run_dir) / CLAUDE_CONFIG_TEMPLATE / "settings.json"
     else:
@@ -28854,17 +30240,19 @@ def _confined_cli_settings(hook_settings: str | None, *,
                 else Path.home() / ".claude") / "settings.json"
     layers = [_settings_file(user)]
     if repo_root is not None:
-        layers += [_settings_file(Path(repo_root) / ".claude" / name)
-                   for name in ("settings.json", "settings.local.json")]
-    # No layer below leerie's names a variable leerie's confinement reads
-    # (DESIGN §6 *The CLI's own git runs on leerie's terms*): leerie's own
-    # set them, last.
-    for layer in layers:
-        env = layer.get("env")
-        if isinstance(env, dict):
-            layer["env"] = {k: v for k, v in env.items()
-                            if k not in _CLI_PINNED_NAMES
-                            and not str(k).startswith("LEERIE_")}
+        layers += [_settings_file(Path(repo_root) / ".claude" / name,
+                                  root=Path(repo_root))
+                   for name in CHECKOUT_SETTINGS_FILES
+                   if _checkout_settings_are_operators(str(repo_root), name)]
+    # A layer below leerie's own contributes only what `_lower_layer_part`
+    # keeps (DESIGN §6 *The CLI reads no settings file*): what narrows a
+    # worker's tools and what names the operator's endpoint and
+    # credentials. Every other key is dropped — a permission mode or an
+    # allow list (an operator's `defaultMode: bypassPermissions` gave every
+    # judgment worker every tool, DESIGN §12 *L1*), `additionalDirectories`,
+    # a hook (one that answers "allow" approves the call), a variable
+    # leerie's confinement reads.
+    layers = [_lower_layer_part(layer) for layer in layers]
     if hook_settings:
         layers.append(json.loads(hook_settings))
     layers.append({"env": {SHELL_PREFIX_ENV: str(WORKER_SHELL)}})
@@ -28872,6 +30260,79 @@ def _confined_cli_settings(hook_settings: str | None, *,
     for layer in layers:
         merged = _merge_settings(merged, layer)
     return json.dumps(merged, separators=(",", ":"))
+
+
+# What a settings layer below leerie's own may give a confined worker, and
+# nothing else (DESIGN §6 *The CLI reads no settings file*): `permissions`
+# rules that only narrow; and the operator's endpoint, credentials and model
+# mapping, which an untracked settings file may choose (DESIGN §6 *The names
+# an untracked settings file may still set*) — none of them widens a
+# worker's tools. Every name is the CLI's own, from its settings schema and
+# the environment variables its Bedrock, Vertex and gateway setups document.
+_LOWER_LAYER_PERMISSIONS = frozenset({"deny", "ask"})
+# The CLI's credential helpers for the operator's endpoint.
+_LOWER_LAYER_KEYS = frozenset({
+    "apiKeyHelper",         # prints the Anthropic API key or token
+    "awsCredentialExport",  # Bedrock: prints the AWS credentials
+    "awsAuthRefresh",       # Bedrock: refreshes the AWS login (SSO)
+    "gcpAuthRefresh",       # Vertex: refreshes the Google login
+})
+_LOWER_LAYER_ENV = frozenset({
+    # Endpoint: the provider, and its base URL (a gateway's, which then
+    # authenticates itself).
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    # Foundry, the third provider the CLI documents beside Bedrock and
+    # Vertex: its switch, skip-auth switch, base URL and resource.
+    "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "ANTHROPIC_FOUNDRY_BASE_URL", "ANTHROPIC_FOUNDRY_RESOURCE",
+    # Credentials: the key and token, the headers a gateway at
+    # `ANTHROPIC_BASE_URL` authenticates by, and Foundry's key. A name that
+    # holds a path on the operator's host (`CLAUDE_CODE_CLIENT_CERT`/`_KEY`,
+    # `GOOGLE_APPLICATION_CREDENTIALS`, `ANTHROPIC_UNIX_SOCKET`) is left
+    # out: the path names nothing in the container. So is
+    # `CLAUDE_CODE_OAUTH_TOKEN`, the subscription credential leerie seeds.
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    # Vertex's project and default region (a model's own region is a
+    # `VERTEX_REGION_CLAUDE_*` name, below).
+    "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION",
+    # Model mapping: the model each alias leerie passes (`--model sonnet`)
+    # resolves to, which on Bedrock and Vertex can lag the API's by a
+    # generation; leerie still chooses the alias.
+    "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+})
+# Bedrock's credentials, profile and region; Vertex's per-model regions.
+_LOWER_LAYER_ENV_PREFIXES = ("AWS_", "VERTEX_REGION_CLAUDE_")
+
+
+def _lower_layer_part(layer: Mapping) -> dict:
+    """The part of a settings layer below leerie's own that a confined
+    worker gets: `_LOWER_LAYER_KEYS`, `permissions` cut to
+    `_LOWER_LAYER_PERMISSIONS`, and `env` cut to `_LOWER_LAYER_ENV` and
+    names starting with one of `_LOWER_LAYER_ENV_PREFIXES` (none of them
+    one leerie's own layer pins, `_CLI_PINNED_NAMES`). Every other key is
+    left out."""
+    out: dict = {k: layer[k] for k in _LOWER_LAYER_KEYS if k in layer}
+    perms = layer.get("permissions")
+    if isinstance(perms, dict):
+        kept = {k: v for k, v in perms.items()
+                if k in _LOWER_LAYER_PERMISSIONS}
+        if kept:
+            out["permissions"] = kept
+    env = layer.get("env")
+    if isinstance(env, dict):
+        kept = {k: v for k, v in env.items()
+                if isinstance(k, str) and (
+                    k in _LOWER_LAYER_ENV
+                    or k.startswith(_LOWER_LAYER_ENV_PREFIXES))}
+        if kept:
+            out["env"] = kept
+    return out
 
 
 # The CLI-environment variables leerie's confinement of a worker's CLI reads:
@@ -29174,6 +30635,28 @@ def _worker_guard(allowed_tools: str, repo_root: str | Path,
     }
 
 
+def _host_cli_settings(hook_settings: str | None) -> str:
+    """A host-side CLI's `--settings`: the hook's, if any, with
+    `HOST_CLI_ENV_PIN` laid over its `env` (a flag's settings override the
+    operator's settings file, which may set the variable too)."""
+    base = json.loads(hook_settings) if hook_settings else {}
+    return json.dumps(_merge_settings(base, {"env": dict(HOST_CLI_ENV_PIN)}),
+                      separators=(",", ":"))
+
+
+def _host_cli_extra_args(cmd: list[str]) -> list[str]:
+    """`HOST_CLI_ARGS`, less the shared builder's `--strict-mcp-config`
+    when `cmd` already carries it. The denials of
+    `HOST_CLI_DENIED_TOOLS` are `DISALLOWED_TOOLS`' (asserted, not
+    assumed)."""
+    denied = set(DISALLOWED_TOOLS.split(","))
+    missing = [t for t in HOST_CLI_DENIED_TOOLS if t not in denied]
+    if missing:
+        raise RuntimeError(f"DISALLOWED_TOOLS no longer denies {missing}")
+    return [a for a in HOST_CLI_ARGS
+            if not (a == "--strict-mcp-config" and a in cmd)]
+
+
 def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
                            model: str, prompt: str | None = None,
                            deny_extra: str = "",
@@ -29396,7 +30879,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # (`_confined_cli_settings`): the one `_worker_dirs` makes below.
     _wrun_dir = _wrun if isinstance(_wrun, (str, os.PathLike)) else None
     if isinstance(_wrun, (str, os.PathLike)):
-        own = _confined_cli_env(Path(_wrun), sid, resume_session)
+        own = _confined_cli_env(Path(_wrun), sid, resume_session,
+                                private_tmp=not caps.get(HOST_SEAM_CAP))
         worker_tmp = Path(own["TMPDIR"])
         env_extra = {**(env_extra or {}), **own}
 
@@ -29404,6 +30888,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # worker writes only where it is granted*); `_invoke` applies it. None
     # only on the host-side seam, which is not a run worker. After the
     # worker's own directories are named: the grants follow them.
+    if caps.get(HOST_SEAM_CAP):
+        env_extra = {**(env_extra or {}), **HOST_CLI_ENV_PIN}
     _genv = {**os.environ, **(env_extra or {})}
     grants = None if caps.get(HOST_SEAM_CAP) else _worker_grants(
         run_dir=leerie_dir, state=st.data, schema_key=schema_key, cwd=cwd,
@@ -29457,15 +30943,14 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 max_turns=max_turns, model=model,
                 deny_extra=",".join(d for d in (
                     _repo_write_denials(st.repo_root, st.run_dir),
-                    _acceptance_read_denials(schema_key, st.run_dir),
-                    _sysprompt_read_denial(getattr(st, "run_dir", None),
-                                           allowed_tools, autonomous),
                     guard["deny"]) if d),
-                settings=(hook_settings if grants is None
+                settings=(_host_cli_settings(hook_settings) if grants is None
                           else _confined_cli_settings(
                               hook_settings, run_dir=_wrun_dir,
                               repo_root=getattr(st, "repo_root", None))),
                 settings_only=grants is not None)
+            if grants is None:
+                cmd.extend(_host_cli_extra_args(cmd))
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
             else:
@@ -29620,7 +31105,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # claimed to detect is exactly what the branch above already reports,
             # from the CLI's own terminal signal, and because its premise (that
             # near-cap output is degraded) was never measured here.
-            # See docs/POSTMORTEM-2026-08-14.md, F7.
+            # See tests/test_turn_cap_signal.py.
 
             return envelope
 
@@ -29957,7 +31442,7 @@ def _usage_input_tokens(usage: dict) -> int:
     ~460 input tokens per call, which no worker that reads a repository can
     possibly use. Every leerie worker runs with prompt caching, so for these
     calls the cached fields are the bulk of the input, not a footnote
-    (docs/POSTMORTEM-2026-08-14.md, F21).
+    (tests/test_usage_input_tokens.py).
 
     `cost_usd` was unaffected — it comes from the CLI's own `total_cost_usd` —
     which is why the discrepancy went unnoticed: the number operators watch was
@@ -31002,7 +32487,7 @@ def _existing_mise_toml_path(repo_root: Path) -> Path | None:
     """
     for name in ("mise.toml", ".mise.toml"):
         p = repo_root / name
-        if p.is_file():
+        if _regular_file_beneath(repo_root, p):
             return p
     return None
 
@@ -31013,12 +32498,12 @@ def _go_already_pinned(repo_root: Path) -> bool:
     `[tools] go = "..."` in `mise.toml`/`.mise.toml`. In any of these
     cases leerie should NOT synthesize an override; the existing pin wins.
     """
-    if (repo_root / ".go-version").is_file():
+    if _regular_file_beneath(repo_root, repo_root / ".go-version"):
         return True
     tv = repo_root / ".tool-versions"
-    if tv.is_file():
+    if _regular_file_beneath(repo_root, tv):
         try:
-            for line in tv.read_text(errors="replace").splitlines():
+            for line in _read_text_beneath(repo_root, tv, limit=READ_LIMIT_CONFIG).splitlines():
                 stripped = line.strip()
                 if stripped.startswith("#") or not stripped:
                     continue
@@ -31031,7 +32516,7 @@ def _go_already_pinned(repo_root: Path) -> bool:
     mt = _existing_mise_toml_path(repo_root)
     if mt is not None:
         try:
-            content = mt.read_text(errors="replace")
+            content = _read_text_beneath(repo_root, mt, limit=READ_LIMIT_CONFIG)
             # Cheap text-level check — TOML parsing here would pull in
             # tomllib but the heuristic is sufficient: any `go =` line
             # under a [tools] section indicates a pin.
@@ -31124,10 +32609,10 @@ def _read_idiomatic_pins(repo_root: Path,
         if tool in already_pinned:
             continue
         path = repo_root / filename
-        if not path.is_file():
+        if not _regular_file_beneath(repo_root, path):
             continue
         try:
-            raw = path.read_text(errors="replace").strip()
+            raw = _read_text_beneath(repo_root, path, limit=READ_LIMIT_CONFIG).strip()
         except OSError:
             continue
         if not raw:
@@ -31143,9 +32628,9 @@ def _read_idiomatic_pins(repo_root: Path,
     # before the dedup check so we don't pin both `node` AND `nodejs`
     # (which mise treats as the same tool — ambiguous resolution).
     tv = repo_root / ".tool-versions"
-    if tv.is_file():
+    if _regular_file_beneath(repo_root, tv):
         try:
-            content = tv.read_text(errors="replace")
+            content = _read_text_beneath(repo_root, tv, limit=READ_LIMIT_CONFIG)
         except OSError:
             content = ""
         for line in content.splitlines():
@@ -31216,12 +32701,12 @@ def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     See DESIGN §6½ and IMPLEMENTATION §6½ step 3.
     """
     gomod = repo_root / "go.mod"
-    if not gomod.is_file():
+    if not _regular_file_beneath(repo_root, gomod):
         return None
     if _go_already_pinned(repo_root):
         return None
     try:
-        text = gomod.read_text(errors="replace")
+        text = _read_text_beneath(repo_root, gomod, limit=READ_LIMIT_CONFIG)
     except OSError:
         return None
     m = _GO_MOD_VERSION_RE.search(text)
@@ -31243,7 +32728,7 @@ def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     existing_text: str | None = None
     if existing is not None:
         try:
-            existing_text = existing.read_text(errors="replace")
+            existing_text = _read_text_beneath(repo_root, existing, limit=READ_LIMIT_CONFIG)
         except OSError:
             existing_text = None
 
@@ -31550,27 +33035,24 @@ def _d1_split_sections(text: str, source: str, start: int) -> list[dict]:
 
 def _d1_report_sources(task: str, repo_root: Path) -> dict[str, str]:
     """The reports to inline for the classifier: files the task names
-    (`_glob_task_references`) with a markdown suffix that `git ls-files`
-    does not list, each at most `D1_REPORT_MAX_BYTES`. Path and git-index
-    checks only; a file too large is named in the log and left to the
+    (`_glob_task_references`) with a markdown suffix that no repository
+    holds (`_checkout_file_tracked`: a submodule's file is the repository's
+    too), each at most `D1_REPORT_MAX_BYTES`. Path and git-index checks
+    only; a file too large is named in the log and left to the
     classifier's own tools."""
     out: dict[str, str] = {}
     for f in _glob_task_references(task, repo_root):
         if f.suffix.lower() not in _D1_REPORT_SUFFIXES:
             continue
         rel = _repo_rel(f, repo_root)
-        tracked = subprocess.run(
-            ["git", "--literal-pathspecs", *_tree_git_args(repo_root), "ls-files",
-             "--error-unmatch", "--", rel], capture_output=True,
-            check=False).returncode == 0
-        if tracked:
+        if _checkout_file_tracked(Path(repo_root), rel):
             continue
         try:
-            if f.stat().st_size > D1_REPORT_MAX_BYTES:
+            if f.lstat().st_size > D1_REPORT_MAX_BYTES:
                 log(f"  requirement coverage: {rel} is over "
                     f"{D1_REPORT_MAX_BYTES} bytes — not inlined")
                 continue
-            out[rel] = f.read_text(errors="replace")
+            out[rel] = _read_text_beneath(repo_root, f, limit=READ_LIMIT_TEXT)
         except OSError:
             continue
     return out
@@ -32288,8 +33770,7 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     `.get("miscategorizations", [])`."""
     if st.data.get("skip_classification_check"):
         log("  classification gate skipped (--skip-classification-check "
-            f"/ {SKIP_CLASSIFICATION_CHECK_ENV} / "
-            "skip_classification_check=true)")
+            f"/ {SKIP_CLASSIFICATION_CHECK_ENV})")
         return False
     sys_prompt = _load_prompt("classification_judge")
 
@@ -37470,7 +38951,7 @@ def _filter_provably_false_wiring_defects(
     `die()`. That killed run 3bc46e7d — $20.32, 71 workers, 38 minutes, no
     branch and no plan.json — on a finding whose named capability WAS provided
     by an in-plan subtask, i.e. exactly the shape this predicate refutes
-    (docs/POSTMORTEM-2026-08-14.md, F4). Note repairing a `missing_provides` by
+    (tests/test_wiring_defect_kind_coverage.py). Note repairing a `missing_provides` by
     appending the tag to the named subtask's `provides` was considered and
     rejected: unlike a `requires` edge, which only ORDERS existing work and
     cannot invent any, a `provides` tag CLAIMS the work exists, so a wrong
@@ -38230,14 +39711,13 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
     handling (see its docstring).
 
     Short-circuits entirely when `st.data["skip_adherence_check"]` is set
-    (`--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` /
-    `skip_adherence_check` in leerie.toml).
+    (`--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK`).
 
     Returns the (possibly re-planned) `plans` list, ready for
     `_schedule()` (this phase runs after `phase_overlap_judge`)."""
     if st.data.get("skip_adherence_check"):
         log("phase 2⅞: adherence-gate skipped (--skip-adherence-check / "
-            "LEERIE_SKIP_ADHERENCE_CHECK / skip_adherence_check=true)")
+            "LEERIE_SKIP_ADHERENCE_CHECK)")
         return plans
 
     prescribed_procedure = st.data.get("prescribed_procedure") or {}
@@ -38512,7 +39992,7 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
     Skipped entirely when `st.data["skip_coverage_check"]` is set."""
     if st.data.get("skip_coverage_check"):
         log("phase 2⅞½: task-coverage gate skipped (--skip-coverage-check / "
-            "LEERIE_SKIP_COVERAGE_CHECK / skip_coverage_check=true)")
+            "LEERIE_SKIP_COVERAGE_CHECK)")
         return plans
     log("phase 2⅞½: task-coverage gate (advisory)")
     st.data["current_phase"] = "phase 2⅞½: task-coverage-gate"
@@ -38861,7 +40341,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # Cheap-skip conditions, in order of cost.
     if st.data.get("skip_overlap_judge"):
         log("phase 2¾: overlap-judge skipped (--skip-overlap-judge / "
-            "LEERIE_SKIP_OVERLAP_JUDGE / skip_overlap_judge=true)")
+            "LEERIE_SKIP_OVERLAP_JUDGE)")
         return plans
 
     # Count planners that actually contributed subtasks, and total
@@ -40430,7 +41910,7 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
         # missing file: 11 wasted `tool-fail` reads across two runs, on the
         # highest-stakes prompt in the system, the one that also carries the
         # completeness gate's mandatory criteria
-        # (docs/POSTMORTEM-2026-08-14.md, F23). Opening a prompt with an
+        # (tests/test_advisory_signals_match_their_status.py). Opening a prompt with an
         # instruction that fails teaches the worker to discount what follows.
         _ckpt = _checkpoint_path(leerie_dir, sid)
         if _ckpt.is_file():
@@ -40740,10 +42220,10 @@ def _infer_build_lint_test(repo_root: Path) -> dict[str, str]:
     if (repo_root / "detekt.yml").is_file() or \
        (repo_root / "detekt.yaml").is_file():
         out["lint"] = out["lint"] or "detekt"
-    if next(repo_root.glob("*.sln"), None) is not None:
+    if _glob_beneath(repo_root, "*.sln"):
         out["build"] = out["build"] or "dotnet build"
         out["test"] = out["test"] or "dotnet test"
-    elif next(repo_root.glob("*.csproj"), None) is not None:
+    elif _glob_beneath(repo_root, "*.csproj"):
         out["build"] = out["build"] or "dotnet build"
         out["test"] = out["test"] or "dotnet test"
     if (repo_root / "phpunit.xml").is_file() or \
@@ -40864,6 +42344,57 @@ def _is_test_file(path: str, globs: list[str] | None = None) -> bool:
     return any(fnmatch.fnmatch(base, g) for g in _TEST_BASENAME_GLOBS)
 
 
+# The files an impact-analysis runner's module graph holds, by extension (a
+# fixed property of vitest's and jest's resolvers): what `{files}` hands
+# `vitest related` / `jest --findRelatedTests` (DESIGN §9 *An
+# impact-analysis runner is handed only its own module sources*). A
+# manifest, lockfile, workflow or document is not one: vitest reads
+# `package.json` as a force-rerun trigger and runs every test file.
+_IMPACT_SOURCE_EXTS: frozenset[str] = frozenset({
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue",
+    ".svelte"})
+# Each impact-analysis runner's own configuration, by basename: a force-
+# rerun trigger with a source extension, so the extension filter keeps it,
+# and a change to it changes how every test runs.
+_RUNNER_CONFIG_GLOBS: dict[str, tuple[str, ...]] = {
+    "vitest": ("vitest.config.*", "vite.config.*", "vitest.workspace.*"),
+    "jest": ("jest.config.*",),
+}
+
+
+def _impact_runner(template: str) -> str | None:
+    """The impact-analysis runner (`_RUNNER_DIRECT_SELECTORS`) whose
+    selector `template` invokes, read as `_derive_test_files_scoped` reads
+    one (`_shell_scan`, the runner word then its selector), or None."""
+    scanned = _shell_scan(template)
+    if scanned is None:
+        return None
+    tokens = scanned[0]
+    words = [t for _k, t, _d in tokens]
+    for runner, (affected, _direct) in _RUNNER_DIRECT_SELECTORS.items():
+        if any(affected in words[at + 1:]
+               for at in _runner_positions(tokens, runner)):
+            return runner
+    return None
+
+
+def _is_runner_config(path: str, runner: str) -> bool:
+    """`path`'s basename is one of `runner`'s configuration files."""
+    base = os.path.basename(path.replace("\\", "/"))
+    return any(fnmatch.fnmatch(base, g)
+               for g in _RUNNER_CONFIG_GLOBS.get(runner, ()))
+
+
+def _impact_module_source(path: str, runner: str) -> bool:
+    """`path` is one of the files `runner`'s module graph holds and not its
+    configuration: an operand impact analysis answers (DESIGN §9 *An
+    impact-analysis runner is handed only its own module sources*). The
+    one classification `_render_scoped` and the forbid gate
+    (`_forbidden_impact_whole`) share."""
+    return (os.path.splitext(path)[1] in _IMPACT_SOURCE_EXTS
+            and not _is_runner_config(path, runner))
+
+
 def _render_scoped(template: str | None, files: list[str],
                    base_ref: str,
                    test_globs: list[str] | None = None) -> str | None:
@@ -40873,13 +42404,17 @@ def _render_scoped(template: str | None, files: list[str],
     Returns None when the template wants `{files}` and there are none. That
     case must be a hard skip, not a bare runner invocation: rendering
     `vitest related --run` with an empty file list runs EVERYTHING, which is
-    the exact inversion of the feature.
+    the exact inversion of the feature. For an impact-analysis template
+    (`_impact_runner`) `{files}` is only the files its module graph holds
+    (`_IMPACT_SOURCE_EXTS`), under the same absence rule: `package.json`
+    handed to `vitest related` reruns every test file (DESIGN §9 *An
+    impact-analysis runner is handed only its own module sources*).
 
     `{test_files}` is the same substitution over the test-shaped members only,
     under the same absence rule, and exists for runners with no source→test
     impact analysis. `vitest related` / `jest --findRelatedTests` take SOURCE
     files and resolve dependents through the runner's own module graph, so
-    they want `{files}` whole. pytest instead collects under the paths it is
+    they want `{files}` — its module sources. pytest instead collects under the paths it is
     given, where a non-test path is an error rather than a no-op: measured,
     `pytest orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4,
     and `pytest docs/DESIGN.md tests/test_blt_semaphore.py` ALSO exits 4 —
@@ -40916,6 +42451,9 @@ def _render_scoped(template: str | None, files: list[str],
         _warn_unknown_placeholder_once(template, leftover.group(0))
         return None
     if "{files}" in template:
+        impact = _impact_runner(template)
+        if impact is not None:
+            files = [f for f in files if _impact_module_source(f, impact)]
         if not files:
             return None
         template = template.replace(
@@ -41018,11 +42556,11 @@ def _js_runner_scoped_templates(repo_root: Path) -> tuple[str, str] | None:
     them, measured 1.9-5x slower on the same files on barnacle (DESIGN §9
     *Operands that are already test files take the runner's direct
     form*)."""
-    if (next(repo_root.glob("vitest.config.*"), None) is not None
-            or next(repo_root.glob("vitest.workspace.*"), None) is not None):
+    if (_glob_beneath(repo_root, "vitest.config.*")
+            or _glob_beneath(repo_root, "vitest.workspace.*")):
         return ("npx vitest related --run {files} --passWithNoTests",
                 "npx vitest run {test_files} --passWithNoTests")
-    if next(repo_root.glob("jest.config.*"), None) is not None:
+    if _glob_beneath(repo_root, "jest.config.*"):
         return ("npx jest --findRelatedTests {files} --passWithNoTests",
                 "npx jest --runTestsByPath {test_files} --passWithNoTests")
     return None
@@ -41359,7 +42897,9 @@ def _warn_scoped_degraded_once(blt: dict[str, str], scoped: dict[str, str],
 
 def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
                          files: list[str], base_ref: str, mode: str,
-                         test_globs: list[str] | None = None
+                         test_globs: list[str] | None = None,
+                         direct: str | None = None,
+                         named_tests: list[str] | None = None
                          ) -> tuple[dict[str, str], str]:
     """`(axis name -> command, scope label)` for one subtask's conformance
     round, given the resolved canonical commands and proxy templates.
@@ -41374,7 +42914,14 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
     suites, and a compiled language's per-subtask build is its cheapest
     regression signal. The caller records
     a deferred axis explicitly (`_deferred_axes`) so it is never silently
-    absent. The scope label never claims a narrowing that did not happen."""
+    absent. The scope label never claims a narrowing that did not happen.
+
+    A diff that changes its impact-analysis runner's own configuration
+    (`_is_runner_config`) is labelled `runner_config_changed`: its `tests`
+    axis is `direct` (the runner's direct form, `resolve_test_files_scoped`)
+    over only the named test files — the diff's own and `named_tests` (the
+    planner's) — or deferred when none is named (DESIGN §9 *An
+    impact-analysis runner is handed only its own module sources*)."""
     canonical = {"build": (blt.get("build") or "").strip(),
                  "lint": (blt.get("lint") or "").strip(),
                  "tests": (blt.get("test") or "").strip()}
@@ -41385,12 +42932,22 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
     axes: dict[str, str] = {}
     used_proxy = False
     deferred = False
+    runner = _impact_runner(scoped.get("test") or "")
+    config_changed = runner is not None and any(
+        _is_runner_config(f, runner) for f in files)
     for axis in ("build", "lint", "tests"):
         # `scoped` is keyed like resolve_blt (`test`, singular); the axis
         # names are the conformer's (`tests`, plural). `_AXIS_CMD_KEY` is
         # the one place that mapping lives.
-        rendered = _render_scoped(
-            scoped.get(_AXIS_CMD_KEY[axis]), files, base_ref, test_globs)
+        if axis == "tests" and config_changed:
+            # Impact analysis cannot answer a change to how every test runs:
+            # only the named test files run, directly.
+            named = list(dict.fromkeys([*files, *(named_tests or [])]))
+            rendered = _render_scoped(direct, named, base_ref, test_globs)
+        else:
+            rendered = _render_scoped(
+                scoped.get(_AXIS_CMD_KEY[axis]), files, base_ref,
+                test_globs)
         if rendered:
             axes[axis] = rendered
             used_proxy = True
@@ -41399,6 +42956,8 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
         else:
             axes[axis] = canonical[axis]
     label = "scoped" if used_proxy else ("deferred" if deferred else "full")
+    if config_changed:
+        label = "runner_config_changed"
     return axes, label
 
 
@@ -41554,7 +43113,8 @@ def _package_json_name(repo_root: Path) -> str | None:
     """The repo's `package.json` `name`, or None when absent or not a
     non-empty string."""
     try:
-        data = json.loads((repo_root / "package.json").read_text())
+        data = json.loads(_read_text_beneath(
+            repo_root, repo_root / "package.json", errors="strict", limit=READ_LIMIT_CONFIG))
     except (OSError, ValueError):
         return None
     name = data.get("name") if isinstance(data, dict) else None
@@ -41565,7 +43125,8 @@ def _package_json_scripts(repo_root: Path) -> dict[str, str]:
     """The repo's `package.json` `scripts` map, or `{}` when absent or
     unparseable. Pure JSON — no natural-language interpretation."""
     try:
-        data = json.loads((repo_root / "package.json").read_text())
+        data = json.loads(_read_text_beneath(
+            repo_root, repo_root / "package.json", errors="strict", limit=READ_LIMIT_CONFIG))
     except (OSError, ValueError):
         return {}
     scripts = data.get("scripts") if isinstance(data, dict) else None
@@ -41786,9 +43347,13 @@ def _validate_conformance_result(result: dict, worktree: str) -> str | None:
 
     The JSON schema already enforces the *shape* (required fields, their
     types). This function enforces the cross-field rules the schema can't:
-    residuals require a non-empty `rules_files_read`, every fixed violation
-    cites a non-empty `rule`, every docs/tests update cites a path that
-    actually exists in the worktree.
+    a residual with no `axis` requires a non-empty `rules_files_read`, every
+    fixed violation cites a non-empty `rule`, every docs/tests update cites
+    a path that actually exists in the worktree. A residual with an `axis`
+    is leerie's own rule, `build/lint/tests must pass`, which the prompt
+    states and no repository file supplies: rejecting it for want of a
+    rules file threw away the round's result (7 times in the 0.43.0
+    barnacle runs, each a conformer reporting a red axis as told).
 
     Per DESIGN §12 this is the code-enforced honesty check; the worker's
     own judgment is not second-guessed beyond these structural minimums."""
@@ -41796,10 +43361,14 @@ def _validate_conformance_result(result: dict, worktree: str) -> str | None:
         return "conformer result is not an object"
 
     files_read = result.get("rules_files_read") or []
-    residuals = result.get("rule_violations_residual") or []
-    if residuals and not files_read:
-        return ("rule_violations_residual non-empty but rules_files_read "
-                "is empty — a violation cannot exist without a rule")
+    # `axis` is the typed mark of leerie's own rule: `_expand_conformer_
+    # output` keeps it only when it names one of `_BLT_AXES`.
+    repo_rule = [r for r in result.get("rule_violations_residual") or []
+                 if not (isinstance(r, dict) and r.get("axis") in _BLT_AXES)]
+    if repo_rule and not files_read:
+        return ("rule_violations_residual names a repository rule but "
+                "rules_files_read is empty — a violation cannot exist "
+                "without a rule")
 
     fixed = result.get("rule_violations_fixed") or []
     for i, item in enumerate(fixed):
@@ -41864,7 +43433,7 @@ def _actionable_solution_defects(conf_res: dict | None) -> list[dict]:
     gap shared one channel, so the gate read both as outstanding and blocked a
     run on work its own conformer had already committed — after which that
     subtask's branch was never integrated and the run shipped a backend with no
-    UI (docs/POSTMORTEM-2026-08-14.md, F11). Absent `fixed` means residual, so
+    UI (tests/test_conformer_fixed_defects.py). Absent `fixed` means residual, so
     a conformer that never sets it behaves exactly as before."""
     if not isinstance(conf_res, dict):
         return []
@@ -41960,7 +43529,7 @@ async def _merge_base_sha(worktree: str, a: str, b: str) -> str:
     that branch checked out — the name moves the instant the worktree commits,
     so the base and `HEAD` become the same ref and every comparison collapses
     (DESIGN §9 *No clobbering the implementer's work*; see
-    docs/POSTMORTEM-2026-08-14.md, F2, where exactly that produced a false
+    tests/test_clobbered_owned_files.py; exactly that produced a false
     clobber report on every run whose final conformer committed anything)."""
     if not a or not b:
         return ""
@@ -41985,12 +43554,13 @@ async def _protected_paths_since(worktree: str,
     if not before_sha:
         return []
     r = await run_proc(
-        ["git", *_tree_git_args(worktree), "diff", "--name-only", f"{before_sha}..HEAD"],
+        ["git", *_tree_git_args(worktree), "diff", "--name-only", "-z",
+         f"{before_sha}..HEAD"],
         cwd=worktree,
     )
     if r.returncode != 0:
         return []
-    touched = [f for f in r.stdout.strip().splitlines() if f]
+    touched = [f for f in r.stdout.split("\0") if f]
     return [f for f in touched if _is_protected_path(f)]
 
 
@@ -43002,7 +44572,7 @@ def _conformance_clean(conf_res: dict, baseline: dict | None = None) -> bool:
         # whose entire test axis never executed (its command did not exist on
         # that tree) because `tests` was independently in `red` from the
         # baseline, so this predicate returned clean without ever looking at
-        # `measured` (docs/POSTMORTEM-2026-08-14.md, F6). Checked BEFORE the
+        # `measured` (tests/test_axis_unmeasurable.py). Checked BEFORE the
         # red-axis exclusion for exactly that reason. Rare by construction —
         # measured, 1 of 46 final axes that ran — so this blocks almost never.
         if a.get("ran") and not a.get("measured"):
@@ -43381,7 +44951,10 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     changed = await _changed_files(worktree, run_branch)
     subtask_axes, blt_scope = _select_subtask_axes(
         blt, resolve_blt_scoped(repo_root), changed, run_branch, scoped_mode,
-        resolve_test_file_globs(repo_root))
+        resolve_test_file_globs(repo_root),
+        direct=resolve_test_files_scoped(repo_root),
+        named_tests=[str(f) for f in subtask.get("files_likely_touched")
+                     or [] if isinstance(f, str)])
     deferred = _deferred_axes(subtask_axes, blt, scoped_mode)
     if deferred:
         log(f"  {sid}: {', '.join(deferred)} deferred to the whole-tree pass "
@@ -44190,22 +45763,41 @@ async def _acquire_build_slot(
 
 
 @contextlib.asynccontextmanager
-async def _build_class_slot(st: "State", *,
-                            label: str) -> AsyncIterator[int | None]:
-    """Hold one host build slot around a build/test command (DESIGN §6
-    *A host-wide build semaphore*). Yields the slot index, None when
-    ungated — and inside a held-out evaluation's exclusive hold, which no
-    confined process of any run on the host overlaps, so the host's slots
-    are already its own (DESIGN §6 *Inside an evaluation every concurrency
-    gate is already the holder's*)."""
-    if _EXEC_EXCLUSIVE.get():
-        yield None
-        return
-    fd, slot, _n = await _acquire_build_slot(st, label=label)
+async def _host_build_slot(st: "State", *, label: str,
+                           take: bool = True) -> AsyncIterator[int | None]:
+    """Hold one of the host's build slots (`_acquire_build_slot`) for the
+    body; yields its index, None when ungated or when `take` is False.
+    Taken only by a holder of the run's execution lock (`_build_class_slot`
+    shared, `_held_out_section` exclusive): the order is the lock, then the
+    slot (DESIGN §6 *Inside an evaluation every concurrency gate is already
+    the holder's*)."""
+    fd, slot = None, None
+    if take:
+        fd, slot, _n = await _acquire_build_slot(st, label=label)
     try:
         yield slot
     finally:
         _close_fd(fd)
+
+
+@contextlib.asynccontextmanager
+async def _build_class_slot(st: "State", *,
+                            label: str) -> AsyncIterator[int | None]:
+    """Hold the run's execution lock shared and then one host build slot
+    around a build/test command (DESIGN §6 *A host-wide build semaphore*,
+    *Inside an evaluation every concurrency gate is already the holder's*).
+    Yields the slot index; None when ungated, and inside a held-out
+    evaluation's exclusive hold, whose own slot its commands run in. The
+    lock comes first: a command waiting for a slot holds no slot, and an
+    evaluation, which takes its slot only once it holds the lock exclusive
+    and no command of its run holds one, never holds a slot while it waits
+    for its run's shared holders."""
+    if _EXEC_EXCLUSIVE.get():
+        yield None
+        return
+    async with _exec_lock().shared(), \
+            _host_build_slot(st, label=label) as slot:
+        yield slot
 
 
 def _is_blt_build_test_argv(argv: list[str], blt: dict[str, str]) -> bool:
@@ -45585,7 +47177,8 @@ _CONFIRM_NO_BUDGET_GATE: dict = {"waited_sec": 0.0, "timed_out": False,
 
 def _confirm_select(units: list[str], durations: dict[str, float], *,
                     rank: dict[str, int], reps: int, budget: float,
-                    overhead: float, first_always: bool = True) -> dict:
+                    overhead: float, first_always: bool = True,
+                    per_file: float = 0.0) -> dict:
     """Which of a B* confirm's rerun `units` (test files, CI checks) to
     rerun, sized before the reruns start (DESIGN §9 *Which failures are
     new*, step 2): ranked by `rank` (lower is more informative — a unit
@@ -45594,15 +47187,16 @@ def _confirm_select(units: list[str], durations: dict[str, float], *,
     unmeasured unit last), then the name; taken while `(sum(duration) +
     overhead) * reps` stays inside `budget` (callers pass `reps = 2`: one
     base/final pair), the first always unless `first_always` is False (it
-    may still finish a pair). An unmeasured unit costs `overhead` alone.
-    Pure. `{chosen, sized_out}`."""
+    may still finish a pair). Each unit also costs `per_file` (its import
+    and collection, `_rerun_cost`); an unmeasured unit costs that and
+    `overhead` alone. Pure. `{chosen, sized_out}`."""
     order = sorted(units, key=lambda u: (rank.get(u, 0),
                                          durations.get(u, float("inf")), u))
     chosen: list[str] = []
     sized_out: list[str] = []
     total = 0.0
     for u in order:
-        d = float(durations.get(u) or 0.0)
+        d = float(durations.get(u) or 0.0) + per_file
         if ((first_always and not chosen)
                 or (total + d + overhead) * reps <= budget):
             chosen.append(u)
@@ -45863,7 +47457,8 @@ def _merge_confirm_passes(passes: list[dict]) -> dict:
 async def _confirm_sized(
         cand_unit: dict[str, str], durations: dict[str, float], *,
         rank: dict[str, int], caps: dict, overhead: float, label: str,
-        confirm: Callable[..., Awaitable[dict]]) -> dict:
+        confirm: Callable[..., Awaitable[dict]],
+        per_file: float = 0.0) -> dict:
     """A base-paired B* confirm over candidates grouped in rerun units (test
     files, CI checks), sized to `confirm_budget_sec` (DESIGN §9 *Which
     failures are new*, step 2). The first pass reruns the units
@@ -45890,7 +47485,7 @@ async def _confirm_sized(
         return [c for c in sorted(cand_unit) if cand_unit[c] in keep]
     sel = _confirm_select(sorted(set(cand_unit.values())), durations,
                           rank=rank, reps=2, budget=budget,
-                          overhead=overhead)
+                          overhead=overhead, per_file=per_file)
     # Breadth first only when a unit waits: a first pass that holds every
     # unit spends its whole budget on its own pairs, as before.
     one = {"max_pairs": 1} if sel["sized_out"] else {}
@@ -45904,7 +47499,7 @@ async def _confirm_sized(
         left = budget - used
         sel = _confirm_select(left_units, durations, rank=rank, reps=2,
                               budget=left, overhead=overhead,
-                              first_always=False)
+                              first_always=False, per_file=per_file)
         if not sel["chosen"]:
             break
         log(f"  B* {label}: {round(left)}s of the confirm budget left — "
@@ -46148,6 +47743,67 @@ def _record_test_durations(st: "State", durations: dict[str, float]) -> None:
         save()
 
 
+# The newest serial-rerun samples `_rerun_cost` fits; older ones go.
+_RERUN_COST_SAMPLES = 32
+
+
+def _record_rerun_cost(st: "State", files: int, wall_sec: float,
+                       reported_sec: float) -> None:
+    """Append one serial rerun's `{files, wall_sec, reported_sec}` to the
+    run-wide `test_run_overhead` (DESIGN §9 *A rerun's cost is measured,
+    not assumed*), keeping the newest `_RERUN_COST_SAMPLES`."""
+    data = getattr(st, "data", None)
+    if files <= 0 or wall_sec <= 0 or not isinstance(data, dict):
+        return
+    cur = data.get("test_run_overhead")
+    cur = [x for x in cur if isinstance(x, dict)] \
+        if isinstance(cur, list) else []
+    cur.append({"files": int(files), "wall_sec": round(wall_sec, 3),
+                "reported_sec": round(max(reported_sec, 0.0), 3)})
+    st.data["test_run_overhead"] = cur[-_RERUN_COST_SAMPLES:]
+    save = getattr(st, "save", None)
+    if callable(save):
+        save()
+
+
+def _rerun_cost(samples: object) -> dict | None:
+    """`{startup_sec, per_file_sec, samples, sizes}` fitted to serial-rerun
+    samples, or None with none (DESIGN §9 *A rerun's cost is measured, not
+    assumed*). Each sample's overhead `wall − Σ reported` is read as
+    `startup + files × per_file`, by least squares; both are kept
+    non-negative. With one run size only, the two cannot be told apart and
+    all of it is per-file — the conservative reading for any larger set.
+    Pure."""
+    pts = [(int(x["files"]), max(0.0, float(x["wall_sec"])
+                                 - float(x["reported_sec"])))
+           for x in (samples if isinstance(samples, list) else [])
+           if isinstance(x, dict)
+           and isinstance(x.get("files"), int) and x["files"] > 0
+           and isinstance(x.get("wall_sec"), (int, float))
+           and isinstance(x.get("reported_sec"), (int, float))]
+    if not pts:
+        return None
+    sizes = {n for n, _ in pts}
+    sum_n = sum(n for n, _ in pts)
+    sum_y = sum(y for _, y in pts)
+    startup, per_file = 0.0, sum_y / sum_n
+    if len(sizes) > 1:
+        k = len(pts)
+        mean_n, mean_y = sum_n / k, sum_y / k
+        var = sum((n - mean_n) ** 2 for n, _ in pts)
+        slope = sum((n - mean_n) * (y - mean_y) for n, y in pts) / var
+        icept = mean_y - slope * mean_n
+        if slope < 0:
+            startup, per_file = mean_y, 0.0
+        elif icept < 0:
+            startup, per_file = 0.0, sum_y / sum_n
+        else:
+            startup, per_file = icept, slope
+    return {"startup_sec": round(startup, 3),
+            "per_file_sec": round(per_file, 3),
+            "samples": len(pts), "sizes": len(sizes)}
+
+
 def _runner_report_failing_ids(kind: str, report: bytes | None,
                                tree: str) -> dict[str, str | None] | None:
     """Failing test ID -> repo-relative file (None when the report does not
@@ -46227,6 +47883,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                        _SERIAL_RUNNER_FLAGS[runner])
         if flagged is not None:
             attempts.append(flagged)
+    # Only the serial form's own wall time is a rerun's serial cost.
+    serial_first = len(attempts) == 1
     attempts.append(cmd)
     # The report is the command's output: beside its tree, in the tree's own
     # measurement directory (DESIGN §6 *Leerie's runs of the repository's
@@ -46273,11 +47931,14 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         # planted (DESIGN §6 *Leerie never writes through a path confined
         # code shaped*).
         got = bytearray()
+        run_wall = 0.0
         try:
             _mkdir_private(reports, own)
             _unlink_beneath(own, report)
+            # A held-out file's run is an evaluation, which takes its own
+            # slot once it holds the lock exclusive; any other run is a
+            # command, which takes one once it holds the lock shared.
             async with _blt_slot(caps), \
-                    _build_class_slot(st, label=f"{label}-ids"), \
                     _leaves_tree_as_found(tree, "test run", label):
                 t_run = time.monotonic()
                 try:
@@ -46293,13 +47954,16 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                     report=str(report)),
                                 report_into=got)
                     else:
-                        await _run_streaming(
-                            argv, grants=grants, cwd=str(tree), env=env,
-                            timeout=max(1.0, left), log_path=log_path,
-                            label=f"{label}-ids: {run_cmd}",
-                            verbosity="quiet")
+                        async with _build_class_slot(st,
+                                                     label=f"{label}-ids"):
+                            await _run_streaming(
+                                argv, grants=grants, cwd=str(tree), env=env,
+                                timeout=max(1.0, left), log_path=log_path,
+                                label=f"{label}-ids: {run_cmd}",
+                                verbosity="quiet")
                 finally:
-                    spent += time.monotonic() - t_run
+                    run_wall = time.monotonic() - t_run
+                    spent += run_wall
         except Exception:
             # A timeout or a spawn failure: no verdict from this run.
             with contextlib.suppress(OSError):
@@ -46308,13 +47972,18 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         data: bytes | None = bytes(got) if place else None
         if not place:
             with contextlib.suppress(OSError):
-                data = _read_beneath(own, report)
+                data = _read_beneath(own, report, limit=READ_LIMIT_LARGE)
             with contextlib.suppress(OSError):
                 _unlink_beneath(own, report)
         ids = _runner_report_failing_ids(kind, data or None, str(tree))
         durations = _runner_report_file_durations(kind, data or None,
                                                   str(tree))
         _record_test_durations(st, durations)
+        if serial_first and i == 0 and run_files and ids is not None:
+            # A serial run over named files: its own cost, for sizing every
+            # later rerun (DESIGN §9 *A rerun's cost is measured*).
+            _record_rerun_cost(st, len(run_files), run_wall,
+                               sum(durations.get(f, 0.0) for f in run_files))
         messages = {c["id"]: c.get("message", "")
                     for c in (_runner_report_cases(kind, data or None,
                                                    str(tree))
@@ -46322,7 +47991,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                     if ids and c["id"] in ids}
         if ids is not None:
             return {"ids": sorted(ids), "files": ids, "kind": kind,
-                    "messages": messages, "durations": durations}
+                    "messages": messages, "durations": durations,
+                    "wall_sec": round(run_wall, 3)}
     return None
 
 
@@ -46504,8 +48174,8 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                     {c: id_files[c] for c in all_cand},
                     dict(st.data.get("test_file_durations") or {}),
                     rank=rank, caps=caps,
-                    overhead=_DISCOVERY_RUN_OVERHEAD_SEC, label=label,
-                    confirm=_pass)
+                    overhead=_rerun_cost_or_default(st)[0], label=label,
+                    confirm=_pass, per_file=_rerun_cost_or_default(st)[1])
             else:
                 verdict = await _pass(None, all_cand, caps, None)
         finally:
@@ -46553,9 +48223,20 @@ _RESOURCE_FAILURE_RE = re.compile(
     re.IGNORECASE)
 
 
-# A repeat's cost beyond its files' own durations (runner start-up,
-# collection) when no calibration run has measured it.
+# A rerun's start-up the B* confirm sizes with until serial reruns have
+# measured one (`_rerun_cost`). Discovery never plans from it.
 _DISCOVERY_RUN_OVERHEAD_SEC = 10.0
+
+
+def _rerun_cost_or_default(st: "State") -> tuple[float, float]:
+    """`(startup_sec, per_file_sec)` for sizing B* reruns: the measured
+    `_rerun_cost`, else `_DISCOVERY_RUN_OVERHEAD_SEC` start-up and no
+    per-file overhead."""
+    cost = _rerun_cost((getattr(st, "data", None) or {}).get(
+        "test_run_overhead"))
+    if cost is None:
+        return _DISCOVERY_RUN_OVERHEAD_SEC, 0.0
+    return cost["startup_sec"], cost["per_file_sec"]
 
 
 def _discovery_rank(files: list[str], coupled: dict[str, list[str]],
@@ -46570,11 +48251,14 @@ def _discovery_rank(files: list[str], coupled: dict[str, list[str]],
 
 
 def _discovery_select(ranked: list[str], durations: dict[str, float],
-                      reps: int, budget: float, overhead: float) -> dict:
+                      reps: int, budget: float, overhead: float,
+                      per_file: float = 0.0) -> dict:
     """The files whose `reps` full repeats fit in `budget` seconds, taken in
-    `ranked` order while `(sum(duration) + overhead) * reps <= budget`.
-    Pure. `{chosen, skipped[{file, reason, duration_sec?}], planned_sec}`;
-    `reason` is `over budget` or `no measured duration`."""
+    `ranked` order while `(sum(duration + per_file) + overhead) * reps <=
+    budget` — `overhead` one repeat's start-up, `per_file` each file's
+    import and collection (`_rerun_cost`). Pure. `{chosen,
+    skipped[{file, reason, duration_sec?}], planned_sec}`; `reason` is
+    `over budget` or `no measured duration`."""
     chosen: list[str] = []
     skipped: list[dict] = []
     total = 0.0
@@ -46582,9 +48266,9 @@ def _discovery_select(ranked: list[str], durations: dict[str, float],
         d = durations.get(f)
         if d is None:
             skipped.append({"file": f, "reason": "no measured duration"})
-        elif (total + d + overhead) * reps <= budget:
+        elif (total + d + per_file + overhead) * reps <= budget:
             chosen.append(f)
-            total += d
+            total += d + per_file
         else:
             skipped.append({"file": f, "reason": "over budget",
                             "duration_sec": round(d, 3)})
@@ -46651,54 +48335,68 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
             durations = {f: float(v) for f, v in (
                 known.items() if isinstance(known, dict) else ())
                 if f in out["coupled"] and isinstance(v, (int, float))}
-            overhead = _DISCOVERY_RUN_OVERHEAD_SEC
-            # Calibrate the unmeasured files once, in rank order and in
-            # doubling chunks, inside one repeat's share of the budget: a
-            # chunk that does not finish leaves its files unmeasured.
+            # Calibrate (DESIGN §9 *A rerun's cost is measured, not
+            # assumed*): the unmeasured files first, then the measured ones,
+            # in rank order and doubling chunks, inside one repeat's share
+            # of the budget, until every file has a duration and the rerun
+            # samples span two run sizes. Each chunk is a serial rerun over
+            # named files, so `_capture_failing_test_ids` records its cost.
+            # A chunk that does not finish leaves its files unmeasured.
             unknown = [f for f in _discovery_rank(files, out["coupled"], {})
                        if f not in durations]
+            order = unknown + [f for f in _discovery_rank(
+                files, out["coupled"], durations) if f in durations]
             calib: dict = {"files": len(unknown), "runs": 0, "measured": 0,
                            "sec": 0.0}
+
+            def _fitted() -> dict | None:
+                return _rerun_cost(st.data.get("test_run_overhead"))
             c_end = (clock() - t0) + budget / reps
             size, i = 1, 0
-            while i < len(unknown):
+            while i < len(order) and (i < len(unknown) or (
+                    (_fitted() or {}).get("sizes", 0) < 2)):
                 left = min(c_end, budget) - (clock() - t0)
                 if left <= 0:
                     break
-                chunk = unknown[i:i + size]
-                c0 = clock()
+                chunk = order[i:i + size]
                 got = await _capture_failing_test_ids(
                     staging, cmd, st, caps,
                     label=f"{label}-calibrate{calib['runs'] + 1}",
                     log_path=log_path, timeout=left, serial=True,
                     files=chunk)
-                wall = clock() - c0
                 calib["runs"] += 1
                 if got is None:
                     break
                 rep = got.get("durations") or {}
-                got_d = {f: float(rep[f]) for f in chunk if f in rep}
-                if got_d:
-                    overhead = max(0.0, wall - sum(got_d.values()))
+                wall = float(got.get("wall_sec") or 0.0)
                 for f in chunk:
                     # A file the report gave no time for carries its share
                     # of the chunk's wall time, start-up included.
-                    durations[f] = got_d.get(f, wall / len(chunk))
+                    durations[f] = (float(rep[f]) if f in rep
+                                    else durations.get(f, wall / len(chunk)))
                 calib["measured"] += len(chunk)
                 i += size
                 size *= 2
             calib["sec"] = round(clock() - t0, 1)
             left = budget - (clock() - t0)
+            cost = _fitted()
             ranked = _discovery_rank(files, out["coupled"], durations)
-            sel = _discovery_select(ranked, durations, reps, left, overhead)
+            if cost is None:
+                sel = {"chosen": [], "planned_sec": 0.0,
+                       "skipped": [{"file": f, "reason": "overhead not "
+                                    "measured"} for f in ranked]}
+            else:
+                sel = _discovery_select(ranked, durations, reps, left,
+                                        cost["startup_sec"],
+                                        cost["per_file_sec"])
             out["files"] = sel["chosen"]
             out["skipped_files"] = sel["skipped"]
             out["selection"] = {"budget_sec": round(left, 1),
                                 "planned_sec": sel["planned_sec"],
-                                "overhead_sec": round(overhead, 1),
-                                "calibration": calib}
+                                "cost": cost, "calibration": calib}
             if not sel["chosen"]:
-                out["skipped"] = "over budget"
+                out["skipped"] = ("over budget" if cost is not None
+                                  else "overhead not measured")
             for n in range(reps if sel["chosen"] else 0):
                 left = budget - (clock() - t0)
                 if left <= 0:
@@ -46832,7 +48530,7 @@ def _axis_unmeasurable(output: str) -> bool:
     prose: measured across a run corpus, 37 worker calls reasoned about
     `OS can't spawn worker thread: Resource temporarily unavailable (os error
     11)` and each decided for itself that it was environmental. DESIGN §12 puts
-    that decision in code (docs/POSTMORTEM-2026-08-14.md, F5).
+    that decision in code (tests/test_axis_unmeasurable.py).
 
     Note what this deliberately does NOT catch. A vitest pool reporting
     `Worker forks emitted error` / `Worker exited unexpectedly`, or a Next.js
@@ -47172,22 +48870,20 @@ def _ci_flat(text: str) -> str:
 
 
 def _ci_safe_rel(tree: Path, rel: str) -> Path | None:
-    """`tree/rel` when `rel` is a relative path staying inside `tree`."""
+    """`tree/rel` when `rel` is a relative path staying inside `tree`,
+    lexically: it is read beneath `tree` (`_read_beneath`), which refuses a
+    link on the way, never resolved through one."""
     rel = (rel or ".").strip()
     if rel.startswith("/") or ".." in rel.split("/"):
         return None
-    p = (tree / rel).resolve()
-    root = tree.resolve()
-    if p != root and root not in p.parents:
-        return None
-    return p
+    return Path(os.path.normpath(tree / rel))
 
 
 def _ci_config_files(tree: Path) -> list[str]:
     out: set[str] = set()
     for pat in CI_CONFIG_GLOBS:
-        for f in glob.glob(str(tree / pat)):
-            if os.path.isfile(f):
+        for f in _glob_beneath(tree, pat):
+            if _regular_file_beneath(tree, f):
                 out.add(os.path.relpath(f, tree))
     return sorted(out)
 
@@ -47201,14 +48897,14 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
     list = the check may run."""
     probs: list[str] = []
     src = _ci_safe_rel(tree, ((check.get("source") or {}).get("file") or ""))
-    if src is None or not src.is_file():
+    if src is None or not _regular_file_beneath(tree, src):
         return ["source file missing or outside the repo"]
     try:
-        flat = _ci_flat(src.read_text(errors="replace"))
+        flat = _ci_flat(_read_text_beneath(tree, src, limit=READ_LIMIT_CONFIG))
     except OSError:
         return ["source file unreadable"]
     cwd = _ci_safe_rel(tree, check.get("cwd") or ".")
-    if cwd is None or not cwd.is_dir():
+    if cwd is None or not _dir_beneath_exists(tree, cwd):
         probs.append(f"cwd {check.get('cwd')!r} is not a directory in the "
                      "repo")
     argv = [str(a) for a in (check.get("argv") or [])]
@@ -47234,8 +48930,7 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
         for base in {cwd or tree, tree}:
             for m in CI_STRICT_MANIFESTS:
                 with contextlib.suppress(OSError):
-                    texts.append(_ci_flat((base / m).read_text(
-                        errors="replace")))
+                    texts.append(_ci_flat(_read_text_beneath(tree, base / m, limit=READ_LIMIT_CONFIG)))
         for t in strict:
             ft = _ci_flat(t)
             if ft and not t.startswith("-") and not any(
@@ -47247,13 +48942,14 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
         cfg = _ci_safe_rel(tree, cov.get("config_file") or "")
         summ = (cov.get("summary_path") or "").strip()
         ths = cov.get("thresholds") or []
-        if cfg is None or not cfg.is_file() or not summ or not ths or (
+        if (cfg is None or not _regular_file_beneath(tree, cfg) or not summ
+                or not ths) or (
                 _ci_safe_rel(cwd or tree, summ) is None):
             probs.append("coverage check without a readable config file, a "
                          "summary path or thresholds")
         else:
             try:
-                ctext = _ci_flat(cfg.read_text(errors="replace"))
+                ctext = _ci_flat(_read_text_beneath(tree, cfg, limit=READ_LIMIT_CONFIG))
             except OSError:
                 ctext = ""
             for th in ths:
@@ -47381,7 +49077,10 @@ def _ci_coverage_pcts(summary: Path, tree: Path, cwd: str,
     file matches."""
     out: dict[str, float | None] = {}
     try:
-        data = json.loads(summary.read_text())
+        # The measurement wrote it, in the tree: read beneath the tree,
+        # never through a link the code under measurement left.
+        data = json.loads(_read_text_beneath(Path(tree), Path(summary),
+                                             errors="strict", limit=READ_LIMIT_LARGE))
     except (OSError, ValueError):
         data = None
     for th in thresholds:
@@ -50148,9 +51847,10 @@ def _prisma_project(repo_root: str | Path) -> dict | None:
         d = Path(schema).parent
         while True:
             pkg = root / d / "package.json"
-            if pkg.is_file():
+            if _regular_file_beneath(root, pkg):
                 try:
-                    data = json.loads(pkg.read_text())
+                    data = json.loads(_read_text_beneath(root, pkg,
+                                                         errors="strict", limit=READ_LIMIT_CONFIG))
                 except (OSError, ValueError):
                     data = {}
                 deps = {**(data.get("dependencies") or {}),
@@ -50158,7 +51858,7 @@ def _prisma_project(repo_root: str | Path) -> dict | None:
                     if isinstance(data, dict) else {}
                 if any(p in deps for p in _PRISMA_PACKAGES):
                     try:
-                        text = (root / schema).read_text(errors="replace")
+                        text = _read_text_beneath(root, root / schema, limit=READ_LIMIT_TEXT)
                     except OSError:
                         text = ""
                     m = _PRISMA_PROVIDER_RE.search(text)
@@ -50179,7 +51879,8 @@ def _prisma_reset_scripts(repo_root: str | Path, project: dict) -> list[str]:
     left out: they cannot be written as a rule."""
     pkg = Path(str(repo_root)) / project["dir"] / "package.json"
     try:
-        scripts = (json.loads(pkg.read_text()).get("scripts") or {})
+        scripts = (json.loads(_read_text_beneath(
+            Path(str(repo_root)), pkg, errors="strict", limit=READ_LIMIT_CONFIG)).get("scripts") or {})
     except (OSError, ValueError, AttributeError):
         return []
     out = []
@@ -50389,9 +52090,9 @@ def _prisma_mock_hits(repo: str | Path, rev: str, wt: Path,
     hits = []
     for f in files:
         p = wt / f
-        if not f.endswith(_JS_SRC_EXT) or not p.is_file():
+        if not f.endswith(_JS_SRC_EXT) or not _regular_file_beneath(wt, p):
             continue
-        for m in _JS_MOCK_RE.finditer(p.read_text(errors="replace")):
+        for m in _JS_MOCK_RE.finditer(_read_text_beneath(wt, p, limit=READ_LIMIT_TEXT)):
             spec = m.group(1)
             if (_js_resolve(spec, f, allf, g["aliases"]) in client
                     or spec == "@prisma/client"
@@ -51652,9 +53353,10 @@ def _acceptance_cmd(st: "State", files: list[str],
         if tree is None or not all(f.endswith("_test.go") for f in files):
             return None
         names = sorted({n for f in files
-                        for n in _go_test_func_names(
-                            Path(placed[f]) if f in placed
-                            else Path(tree) / f)})
+                        for n in (_go_test_func_names(
+                            Path(placed[f]).parent, Path(placed[f]))
+                            if f in placed else _go_test_func_names(
+                                Path(tree), Path(tree) / f))})
         if not names:
             return None
         rendered += " -run " + shlex.quote("^(" + "|".join(names) + ")$")
@@ -51792,10 +53494,11 @@ _GO_TEST_FUNC_RE = re.compile(r"^func\s+(Test[A-Za-z0-9_]*)\s*\(",
                               re.MULTILINE)
 
 
-def _go_test_func_names(path: Path) -> list[str]:
-    """The test functions a Go test file declares, or [] when unreadable."""
+def _go_test_func_names(root: Path, path: Path) -> list[str]:
+    """The test functions the Go test file `path` beneath `root` declares,
+    or [] when unreadable or reached through a link."""
     try:
-        text = path.read_text(errors="replace")
+        text = _read_text_beneath(root, path, limit=READ_LIMIT_TEXT)
     except OSError:
         return []
     return [n for n in _GO_TEST_FUNC_RE.findall(text) if n != "TestMain"]
@@ -51886,8 +53589,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     sandbox = HeldOutSandbox(view=str(tree), place=tuple(place),
                              report=str(report) if spec is not None
                              else None)
-    # A held-out file's run is alone in the run and on the host, which
-    # bounds it more tightly than the BLT semaphore would (DESIGN §6 *A
+    # A held-out file's run is alone in the run, which bounds it more
+    # tightly than the BLT semaphore would (DESIGN §6 *A
     # held-out evaluation runs alone*).
     async with _held_out_section(st):
         try:
@@ -52296,7 +53999,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     _rmtree_owned(dest)
     for rel in defect + control + support:
         # Read from the writer's checkout without following a link it left.
-        _copy_beneath(wt / rel, st.run_dir, dest / rel, src_anchor=wt)
+        _copy_beneath(wt / rel, st.run_dir, dest / rel, src_anchor=wt, limit=READ_LIMIT_TEXT)
     out.update(valid=True, dir=str(dest), defect_files=defect,
                control_files=control, support_files=support, cases=cases,
                modes=modes, base_failing_cases=base_failing,
@@ -53497,12 +55200,13 @@ def _verify_set_audit_case(case: dict, *, set_texts: dict[str, str],
     if "prod" in need:
         pq = case.get("prod_quote") or {}
         rel = os.path.normpath(str(pq.get("file") or "_"))
-        path = (tree / rel).resolve()
+        path = Path(os.path.normpath(tree / rel))
         text = ""
         if (rel not in set_texts and not os.path.isabs(rel)
-                and ".." not in Path(rel).parts and path.is_file()):
+                and ".." not in Path(rel).parts
+                and _regular_file_beneath(tree, path)):
             with contextlib.suppress(OSError):
-                text = path.read_text(errors="replace")
+                text = _read_text_beneath(tree, path, limit=READ_LIMIT_TEXT)
         if not _audit_quote_in(text, pq.get("quote")):
             bad.append("prod_quote")
     if "task" in need and not _audit_quote_in(task_text,
@@ -53641,7 +55345,7 @@ def _copy_task_references(st: "State", wt: Path, task: str
         dst = wt / rel
         if not _lexists_beneath(wt, dst):
             with contextlib.suppress(OSError):
-                _copy_beneath(Path(f), wt, dst)
+                _copy_beneath(Path(f), wt, dst, src_anchor=st.repo_root, limit=READ_LIMIT_LARGE)
                 copied.append(dst)
         refs.append(rel)
     return copied, refs
@@ -53765,7 +55469,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
                 set_texts[rel] = (Path(set_["dir"]) / rel).read_text(
                     errors="replace")
         task_text = task + "\n" + "\n".join(
-            (wt / r).read_text(errors="replace") for r in refs
+            _read_text_beneath(wt, wt / r, limit=READ_LIMIT_TEXT) for r in refs
             if (wt / r).is_file())
         messages = {c["case"]: c["failure_message"] for c in failing}
         names = {c["case"] for c in failing}
@@ -56431,6 +58135,7 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
             "broken (DESIGN §6 *Leerie's runs of the repository's commands "
             "are confined too*). Report this.")
     return subprocess.run(_confined_argv(grants, argv), cwd=str(tree),
+                          stdin=subprocess.DEVNULL,
                           capture_output=True, text=text, timeout=timeout,
                           check=False,
                           env={**_ts_script_env(), **dict(grants.env)})
@@ -56731,7 +58436,7 @@ def _checkout_ignorable(wt: Path, rel: str) -> bool:
     if not _lexists_beneath(wt, gi):
         return True
     try:
-        return (_read_beneath(wt, gi).decode().splitlines()[:1]
+        return (_read_beneath(wt, gi, limit=READ_LIMIT_CONFIG).decode().splitlines()[:1]
                 == [_CHECKOUT_IGNORE_TAG])
     except (OSError, UnicodeDecodeError):
         return False
@@ -56763,7 +58468,7 @@ def _checkout_ignore(wt: Path, rels: Iterable[str]) -> list[str]:
         # writes through a path confined code shaped*).
         gi = wt / d / ".gitignore"
         try:
-            lines = _read_beneath(wt, gi).decode(
+            lines = _read_beneath(wt, gi, limit=READ_LIMIT_CONFIG).decode(
                 errors="replace").splitlines()
         except OSError:
             lines = [_CHECKOUT_IGNORE_TAG, "/.gitignore"]
@@ -56812,9 +58517,10 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
     for f in referenced:
         rel = _repo_rel(f, st.repo_root)
         dst = wt / rel
-        if not _lexists_beneath(wt, dst) and Path(f).is_file():
+        if not _lexists_beneath(wt, dst) and _regular_file_beneath(
+                st.repo_root, Path(f)):
             with contextlib.suppress(OSError):
-                _copy_beneath(Path(f), wt, dst)
+                _copy_beneath(Path(f), wt, dst, src_anchor=st.repo_root, limit=READ_LIMIT_LARGE)
                 excludes.append(rel)
         if _lexists_beneath(wt, dst):
             refs.append(rel)
@@ -56921,7 +58627,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         try:
             # Read from the lane, which its falsifier wrote, without
             # following a link it left there.
-            Path(src).write_bytes(_read_beneath(lane, lane / rel))
+            Path(src).write_bytes(_read_beneath(lane, lane / rel, limit=READ_LIMIT_TEXT))
             place = ((src, rel),)
 
             async def _run(left: float) -> set[str] | None:
@@ -56976,8 +58682,8 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
 def _falsifier_save_probe(st: "State", lane: Path, i: int,
                           res: dict) -> dict | None:
     """Keep a confirmed sample's probe beside the held-out sets, under
-    `<run_dir>/acceptance/probes/i<k>/` (Read-denied to every fixer,
-    `_acceptance_read_denials`), so the delivery re-drive can re-run it on a
+    `<run_dir>/acceptance/probes/i<k>/` (outside every fixer's grant,
+    `_worker_grants`), so the delivery re-drive can re-run it on a
     later tree (DESIGN §8 *Delivery re-drive*). `{dir, file}`, or None when
     it cannot be copied."""
     rel = _delivery_cite_rel(str(res.get("probe_path") or ""), lane)
@@ -56986,7 +58692,7 @@ def _falsifier_save_probe(st: "State", lane: Path, i: int,
     dst_dir = st.run_dir / "acceptance" / "probes" / f"i{i}"
     try:
         _rmtree_owned(dst_dir)
-        _copy_beneath(lane / rel, st.run_dir, dst_dir / rel, src_anchor=lane)
+        _copy_beneath(lane / rel, st.run_dir, dst_dir / rel, src_anchor=lane, limit=READ_LIMIT_TEXT)
     except OSError:
         return None
     return {"dir": str(dst_dir), "file": rel}
@@ -58379,8 +60085,8 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
                     {c: id_files[c] for c in cand},
                     dict(st.data.get("test_file_durations") or {}),
                     rank=rank, caps=caps,
-                    overhead=_DISCOVERY_RUN_OVERHEAD_SEC, label=label,
-                    confirm=_pass)
+                    overhead=_rerun_cost_or_default(st)[0], label=label,
+                    confirm=_pass, per_file=_rerun_cost_or_default(st)[1])
             else:
                 verdict = await _pass(None, cand, caps, None)
     finally:
@@ -60610,7 +62316,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # conformer committed nothing reported nothing, which is the control. Under
     # `--strict-conformer` the same false positive drives
     # `_restore_tree`, i.e. it would `git reset --hard` away every
-    # legitimate final-conformer fix (docs/POSTMORTEM-2026-08-14.md, F2).
+    # legitimate final-conformer fix (tests/test_clobbered_owned_files.py).
     #
     # `fork_point..staging_before` is what the owned-set docstring actually
     # means here: the union of all integrated implementer work. `git merge-base`
@@ -61467,7 +63173,7 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
     real = os.path.realpath(tree)
     status = {t: False for t in tests}
     with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
-        for tr in json.loads(_read_beneath(own, report)).get(
+        for tr in json.loads(_read_beneath(own, report, limit=READ_LIMIT_LARGE)).get(
                 "testResults") or []:
             rel = os.path.relpath(os.path.realpath(tr.get("name") or ""),
                                   real)
@@ -61478,7 +63184,7 @@ async def _vitest_run(exe: Path, tree: Path, tests: list[str],
     if coverage:
         with contextlib.suppress(OSError, ValueError, AttributeError,
                                  TypeError, KeyError):
-            for path, d in json.loads(_read_beneath(own, cf)).items():
+            for path, d in json.loads(_read_beneath(own, cf, limit=READ_LIMIT_LARGE)).items():
                 rel = os.path.relpath(os.path.realpath(path), real)
                 lh: dict[int, int] = {}
                 for k, loc in (d.get("statementMap") or {}).items():
@@ -62632,7 +64338,8 @@ def _binary_install_source(name: str, worktree: str, st: "State") -> str:
 
     def _json(rel: str) -> dict:
         try:
-            data = json.loads((wt / rel).read_text())
+            data = json.loads(_read_text_beneath(wt, wt / rel,
+                                                 errors="strict", limit=READ_LIMIT_CONFIG))
         except (OSError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
@@ -62652,11 +64359,11 @@ def _binary_install_source(name: str, worktree: str, st: "State") -> str:
 
     def _lines(rel: str) -> list[str]:
         try:
-            return (wt / rel).read_text(errors="replace").splitlines()
+            return _read_text_beneath(wt, wt / rel, limit=READ_LIMIT_CONFIG).splitlines()
         except OSError:
             return []
 
-    for req in sorted(wt.glob("requirements*.txt")):
+    for req in _glob_beneath(wt, "requirements*.txt"):
         for line in _lines(req.name):
             tok = _REQUIREMENT_NAME_END_RE.split(line.strip(), 1)[0]
             if tok and not tok.startswith(("#", "-")) \
@@ -63323,7 +65030,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         nonlocal continuations
         wt_root = _subtask_worktree_path(leerie_dir, sid)
         cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
-                                     worktree_root=wt_root)
+                                     worktree_root=wt_root,
+                                     notes_dir=_notes_dir(leerie_dir, sid))
         if cp_err:
             log(f"  bad checkpoint for {sid}: {cp_err}")
             return {"subtask_id": sid, "status": "blocked",
@@ -65016,7 +66724,7 @@ async def _run_integration_judge_gate(
     backed out. Skipped entirely under `skip_integration_check`."""
     if st.data.get("skip_integration_check"):
         log(f"  integration gate skipped for {sid} (--skip-integration-check "
-            f"/ {SKIP_INTEGRATION_CHECK_ENV} / skip_integration_check=true)")
+            f"/ {SKIP_INTEGRATION_CHECK_ENV})")
         return True
     leerie_dir = staging.parent.parent
     log_path = leerie_dir / "logs" / f"integration-{sid}.log"
@@ -66374,18 +68082,52 @@ _PR_TEMPLATE_MULTI_DIRS = (
 )
 
 
-def _find_pr_template(repo_root: Path,
-                     override: str | None = None) -> tuple[Path, str] | None:
-    """Locate the PR template the worker should fill out, or None when
-    the repo has no template.
+def _committed_blobs(git_dir: Path, rev: str, rel: str) -> list[tuple[str, str]]:
+    """`(path, blob)` of each regular file `git ls-tree` lists for `rel` at
+    `rev` in the repository at `git_dir` — `rel` itself, or the entries of
+    the directory `rel/`. A committed link (mode 120000) or a submodule is
+    not a file and is left out: its blob is a link's target text, never the
+    content it would reach. Empty when `rev` or `rel` is absent."""
+    r = _git_z_output(["git", "--literal-pathspecs", "--git-dir",
+                       str(git_dir), "ls-tree", "-z", "--full-tree", rev,
+                       "--", rel], timeout=60)
+    if r.returncode != 0:
+        return []
+    out: list[tuple[str, str]] = []
+    for entry in r.stdout.split("\0"):
+        meta, sep, path = entry.partition("\t")
+        fields = meta.split()
+        if sep and len(fields) == 3 and fields[1] == "blob" \
+                and fields[0] in ("100644", "100755"):
+            out.append((path, fields[2]))
+    return out
 
-    Returns `(absolute_path, relative_path_from_repo_root)` so the caller
-    can both read the file and report which template was used (the
-    relative path goes into run.json under `pr_template_used`).
+
+def _committed_text(git_dir: Path, blob: str, limit: int) -> str:
+    """At most `limit` bytes of the blob `blob`, decoded as UTF-8."""
+    r = subprocess.run(["git", "--git-dir", str(git_dir), "cat-file", "blob",
+                        blob], capture_output=True, check=True, timeout=60)
+    return r.stdout[:limit].decode("utf-8", "replace")
+
+
+def _find_pr_template(git_dir: Path, rev: str,
+                      override: str | None = None
+                      ) -> tuple[str, str, bool] | None:
+    """The PR template the worker should fill out, as committed at `rev`
+    in the run's own repository (`git_dir`), or None when it holds none.
+
+    Returns `(relative_path, text, truncated)`: the text is the blob's,
+    capped at `PR_WRITER_TEMPLATE_MAX_BYTES`. It is read from git, never
+    from the checkout: the orchestrator is unconfined and publishes what it
+    reads into the PR body, and a committed link at a template's path read
+    through the filesystem put its target there — the orchestrator's own
+    environment, the CLI's credentials (DESIGN §6 *Leerie never reads
+    through a link a repository holds*; review round 26 isolation I1). A
+    template committed as a link is not a template.
 
     Discovery order:
-      1. The four single-template locations in
-         `_PR_TEMPLATE_SINGLE_LOCATIONS` (GitHub's canonical order).
+      1. The single-template locations in `_PR_TEMPLATE_SINGLE_LOCATIONS`
+         (GitHub's canonical order).
       2. Any `PULL_REQUEST_TEMPLATE/` directory in
          `_PR_TEMPLATE_MULTI_DIRS`. When `override` matches a basename
          inside one of these directories (with or without `.md`), that
@@ -66397,28 +68139,32 @@ def _find_pr_template(repo_root: Path,
     leerie normalizes on the canonical casing rather than scanning every
     case-variant.
     """
+    def _found(rel: str, blob: str) -> tuple[str, str, bool]:
+        raw = _committed_text(git_dir, blob, PR_WRITER_TEMPLATE_MAX_BYTES + 1)
+        text, truncated = _cap_text(raw, PR_WRITER_TEMPLATE_MAX_BYTES,
+                                    "PR template")
+        return rel, text, truncated
+
     for rel in _PR_TEMPLATE_SINGLE_LOCATIONS:
-        candidate = repo_root / rel
-        if candidate.is_file():
-            return (candidate, rel)
+        hit = [b for p, b in _committed_blobs(git_dir, rev, rel) if p == rel]
+        if hit:
+            return _found(rel, hit[0])
     for rel_dir in _PR_TEMPLATE_MULTI_DIRS:
-        d = repo_root / rel_dir
-        if not d.is_dir():
-            continue
-        mds = sorted(p for p in d.iterdir()
-                     if p.is_file() and p.suffix == ".md")
+        mds = sorted((p.rsplit("/", 1)[-1], p, b) for p, b in
+                     _committed_blobs(git_dir, rev, f"{rel_dir}/")
+                     if p.endswith(".md") and p.rsplit("/", 1)[0] == rel_dir)
         if not mds:
             continue
         if override:
             wanted = override if override.endswith(".md") else f"{override}.md"
-            for p in mds:
-                if p.name == wanted:
-                    return (p, f"{rel_dir}/{p.name}")
+            for name, p, b in mds:
+                if name == wanted:
+                    return _found(p, b)
             # Override named, no match — fall through to the default rather
             # than die(), since a bad pr_template setting should not block
             # finalize. The fail-open path in _compose_pr_via_llm logs a
             # warning if pr_template was set but didn't resolve.
-        return (mds[0], f"{rel_dir}/{mds[0].name}")
+        return _found(mds[0][1], mds[0][2])
     return None
 
 
@@ -66661,7 +68407,6 @@ async def _compose_pr_via_llm(st: "State",
                               caps: dict,
                               models: dict[str, str],
                               efforts: dict[str, str | None],
-                              repo_root: Path,
                               pr_template_override: str | None) -> None:
     """Run the pr_writer worker and persist its title/body to run.json.
 
@@ -66678,22 +68423,23 @@ async def _compose_pr_via_llm(st: "State",
     body must never block finalize success.
     """
     try:
-        # 1. Locate the template (may be None).
-        tpl = _find_pr_template(repo_root, pr_template_override)
+        # 1. Locate the template (may be None): the one committed at the
+        # commit the run branch was cut from, read from the run's own
+        # repository (`_find_pr_template`).
         tpl_content = ""
         tpl_rel: str | None = None
         tpl_truncated = False
-        if tpl is not None:
-            tpl_path, tpl_rel = tpl
+        base = _diff_base(st)
+        if base:
             try:
-                raw = tpl_path.read_text()
-                tpl_content, tpl_truncated = _cap_text(
-                    raw, PR_WRITER_TEMPLATE_MAX_BYTES, "PR template")
-            except OSError as e:
-                log(f"pr_writer: failed to read template {tpl_rel}: {e} "
+                tpl = _find_pr_template(_run_repo(st), base,
+                                        pr_template_override)
+            except (OSError, subprocess.SubprocessError) as e:
+                log(f"pr_writer: failed to read the PR template: {e} "
                     "(falling back to no-template mode)")
                 tpl = None
-                tpl_rel = None
+            if tpl is not None:
+                tpl_rel, tpl_content, tpl_truncated = tpl
         if pr_template_override and tpl_rel is None:
             log(f"pr_writer: --pr-template={pr_template_override!r} did "
                 f"not match any template; using default discovery")
@@ -66883,17 +68629,22 @@ async def _compose_pr_for_a_push_chosen_after_finalize(
     pushed, and `leerie resume <id> --push` of a finished `--no-push` run
     changes the choice after it — the host then pushed with the fallback
     body. So the resume that finds nothing left to run writes the PR here
-    when it continues with a push and `run.json` holds no `pr_title`.
+    when it continues with a push, the host has not pushed it yet
+    (`run.json` holds no `pushed_at`), and `run.json` holds no `pr_title`.
+    A pushed run already had its chance at `pr_writer`, under the choice
+    that pushed it; if the worker failed then, its PR is open with the
+    fallback body and nothing would read a title written now (review round
+    26, I1).
     """
     if no_push:
         return
-    if (_read_run_json_sidecar(st.run_dir / "run.json") or {}).get("pr_title"):
+    run_json = _read_run_json_sidecar(st.run_dir / "run.json") or {}
+    if run_json.get("pushed_at") or run_json.get("pr_title"):
         return
     log("resume: the run is to be pushed and has no PR written; "
         "running pr_writer")
     await _compose_pr_via_llm(
         st, caps, models, efforts,
-        repo_root=Path(os.getcwd()),
         pr_template_override=pr_template_override,
     )
 
@@ -67083,7 +68834,6 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     if will_push and caps is not None and models is not None and efforts is not None:
         await _compose_pr_via_llm(
             st, caps, models, efforts,
-            repo_root=Path(os.getcwd()),
             pr_template_override=pr_template_override,
         )
 
@@ -67276,7 +69026,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # — the run simply has to begin. It restarts in place rather than asking
     # for a fresh run because the run directory, its id and its flock already
     # exist, and minting a second run for the same task is what the
-    # duplicate-task guard exists to prevent (POSTMORTEM-2026-08-14, F15).
+    # duplicate-task guard exists to prevent (tests/test_resume_planning_reentry.py).
     if args.resume and st.load():
         # "Never started" must exclude runs that TERMINATED without waves:
         # a completed run and a no-work run both reach the resume arm's own
@@ -67325,7 +69075,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # skipped the git-identity, dirty-tree and branch-collision checks
             # that every other fresh run gets. They live only in
             # `_preflight_repo()` since it was split out of `preflight()`
-            # (POSTMORTEM-2026-08-14, F14), so `preflight()` below does not
+            # (tests/test_irreversible_before_valid.py), so `preflight()` below does not
             # cover them. The skip-on-resume rationale does not apply here
             # either: its point is that a resumed run's directory already
             # exists so there is nothing left to protect, and what this path
@@ -67682,7 +69432,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 # text launched twice is otherwise invisible: measured, one
                 # task ran twice three minutes apart for $72.21, producing two
                 # architecturally incompatible branches with 14 files in
-                # collision (docs/POSTMORTEM-2026-08-14.md, F10).
+                # collision (tests/test_duplicate_task_guard.py).
                 #
                 # Checked here, before the first worker, because this is the
                 # last cheap moment. The escape hatch is an env var rather than
@@ -68338,6 +70088,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
 
 @_records_the_run_death
 def main() -> int | None:
+    # Before anything prints (DESIGN §6 *No text leerie did not write
+    # reaches the operator's terminal as a control sequence*).
+    _guard_terminal_streams()
     # Must precede every spawn — including _become_subreaper's descendants.
     _restore_sigchld_default()
     # Before any git runs: no git command of leerie's own fires a repository
@@ -68463,8 +70216,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "would run `claude --dangerously-skip-permissions` "
                          "against directly. Default: off (judgment "
                          "workers narrow-allowlisted). Also "
-                         f"{DANGEROUS_SKIP_PERMS_ENV} env var or "
-                         "dangerously_skip_permissions=true in leerie.toml.")
+                         f"{DANGEROUS_SKIP_PERMS_ENV} env var (never leerie.toml).")
     ap.add_argument("--dangerously-allow-uncapped", action="store_true",
                     help="DANGEROUS: continue even if worker cgroup "
                          "containment could not be enabled (cgroup broker "
@@ -68477,8 +70229,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "can exhaust the VM thread/PID table (DESIGN §6 "
                          "Memory containment). This downgrades that fatal gate "
                          "to a loud warning and runs workers uncapped. Also "
-                         f"{DANGEROUS_ALLOW_UNCAPPED_ENV} env var or "
-                         "dangerously_allow_uncapped=true in leerie.toml.")
+                         f"{DANGEROUS_ALLOW_UNCAPPED_ENV} env var (never leerie.toml).")
     ap.add_argument("--dangerously-force-strict-output", action="store_true",
                     help="DANGEROUS: route every worker's API traffic through "
                          "a per-run loopback proxy that rewrites the outbound "
@@ -68509,8 +70260,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "you already set that variable yourself. Default is "
                          "off — leerie uses the CLI's ordinary post-hoc "
                          "validation and absorbs the retries. Also "
-                         f"{DANGEROUS_FORCE_STRICT_OUTPUT_ENV} env var or "
-                         "dangerously_force_strict_output=true in leerie.toml.")
+                         f"{DANGEROUS_FORCE_STRICT_OUTPUT_ENV} env var (never leerie.toml).")
     ap.add_argument("--max-workers", type=_positive_int, metavar="N",
                     help=f"total worker-invocation budget "
                          f"(default {DEFAULT_CAPS['max_total_workers']}); "
@@ -68541,8 +70291,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "the worker cgroup rather than cascading to "
                          "sshd / orchestrator. Auto-derived from "
                          "/proc/meminfo when unset. Also "
-                         f"{WORKER_MEMORY_MAX_ENV} env var or "
-                         "worker_memory_max in leerie.toml")
+                         f"{WORKER_MEMORY_MAX_ENV} env var (never leerie.toml)")
     ap.add_argument("--max-rate-limit-wait", type=_positive_int,
                     metavar="SEC",
                     help="longest rate-limit reset to sleep through before "
@@ -68574,8 +70323,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "worker cgroup rather than exhausting the VM's "
                          "PID table. Raise it for repos whose conformance "
                          "step runs a subprocess-heavy full test suite. "
-                         f"Also {WORKER_PIDS_MAX_ENV} env var or "
-                         "worker_pids_max in leerie.toml")
+                         f"Also {WORKER_PIDS_MAX_ENV} env var (never leerie.toml)")
     ap.add_argument("--skip-smoke", action="store_true",
                     help="skip the live claude -p smoke test during preflight. "
                          "Default: off (smoke test runs)")
@@ -68585,8 +70333,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "overlap). The cheap-skip on single-planner / "
                          "<2-subtask runs is automatic; this flag only "
                          "affects runs where the worker would otherwise fire. "
-                         f"Also {SKIP_OVERLAP_JUDGE_ENV} env or "
-                         "skip_overlap_judge in leerie.toml. Default: off.")
+                         f"Also {SKIP_OVERLAP_JUDGE_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-adherence-check", action="store_true",
                     help="skip the instruction-adherence gate: the "
                          "deterministic prescribed-command-coverage floor "
@@ -68594,8 +70341,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "planner check loop. A plan that diverges from an "
                          "explicitly prescribed procedure is not caught "
                          "before phase_execute spends. "
-                         f"Also {SKIP_ADHERENCE_CHECK_ENV} env or "
-                         "skip_adherence_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_ADHERENCE_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-coverage-check", action="store_true",
                     help="skip required-items checking on BOTH sides: the "
                          "phase 2⅞½ advisory task_coverage_judge review "
@@ -68604,8 +70350,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "do not reproduce across re-samples) AND the "
                          "phase-5 delivery gate that verifies required "
                          "items on the integrated tree before finalize. "
-                         f"Also {SKIP_COVERAGE_CHECK_ENV} env or "
-                         "skip_coverage_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_COVERAGE_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-completeness-check", action="store_true",
                     help="demote the conformer's gating solution_defects "
                          "completeness axis (DESIGN §9) to advisory: found "
@@ -68614,8 +70359,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "final-tree pass. Use when a false-positive "
                          "completeness defect is blocking finalize on every "
                          "resume. "
-                         f"Also {SKIP_COMPLETENESS_CHECK_ENV} env or "
-                         "skip_completeness_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_COMPLETENESS_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-integration-check", action="store_true",
                     help="skip the integration_judge behavioral-defect gate "
                          "(DESIGN §8 Independent adversarial verification) "
@@ -68623,8 +70367,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "run. Independent of the accept-integration/"
                          "audit-key mechanism, which only accepts a finding "
                          "the judge already produced. "
-                         f"Also {SKIP_INTEGRATION_CHECK_ENV} env or "
-                         "skip_integration_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_INTEGRATION_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-classification-check", action="store_true",
                     help="skip the classification gate (DESIGN §8 "
                          "Independent adversarial verification) entirely: the "
@@ -68633,8 +70376,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "escape hatch for a gate that will not converge; a "
                          "miscategorized set produces the wrong planners, so "
                          "prefer refining the task description first. "
-                         f"Also {SKIP_CLASSIFICATION_CHECK_ENV} env or "
-                         "skip_classification_check in leerie.toml. "
+                         f"Also {SKIP_CLASSIFICATION_CHECK_ENV} env (never leerie.toml). "
                          "Default: off.")
     ap.add_argument("--stop-on-blocked", action="store_true",
                     help="stop the run and wait for `accept-blocked` when a "
@@ -68657,8 +70399,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "no-commits backstop still catches already-satisfied "
                          "work post-execution (_settle_subtask re-probes the "
                          "criteria against HEAD and settles complete if met). "
-                         f"Also {SKIP_SATISFIED_CHECK_ENV} env or "
-                         "skip_satisfied_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_SATISFIED_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-budget-check", action="store_true",
                     help="skip the post-_schedule budget-feasibility preflight "
                          "(DESIGN §13 Budget feasibility — fail fast at the "
@@ -68668,8 +70409,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "suppresses the early die() that catches "
                          "mathematically-unwinnable runs at the plan/execute "
                          "boundary. "
-                         f"Also {SKIP_BUDGET_CHECK_ENV} env or "
-                         "skip_budget_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_BUDGET_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--strict-conformer", action="store_true",
                     help="make the conformer phase blocking: conformer "
                          "residuals (failed build/lint/test, unresolved rule "
@@ -68702,14 +70442,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "any subtask ran. The pass runs the full suite once "
                          "(tens of seconds to a few minutes); skip it when the "
                          "base is known green or the up-front cost is unwanted. "
-                         f"Also {SKIP_BASE_BASELINE_ENV} env or "
-                         "skip_base_baseline in leerie.toml. Default: off.")
+                         f"Also {SKIP_BASE_BASELINE_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-acceptance-check", action="store_true",
                     help="skip the held-out acceptance tests (DESIGN §8): no "
                          "acceptance_writer sets are written and the "
                          "post-integration acceptance gate does not run. "
-                         f"Also {SKIP_ACCEPTANCE_CHECK_ENV} env or "
-                         "skip_acceptance_check in leerie.toml. Default: off.")
+                         f"Also {SKIP_ACCEPTANCE_CHECK_ENV} env (never leerie.toml). Default: off.")
     ap.add_argument("--skip-repo-map", action="store_true",
                     help="skip the P6 repo-map structural context (DESIGN §5½ (P6)): "
                          "suppresses _build_repo_map() and the ranked subgraph "
@@ -68728,7 +70466,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     metavar="MODE",
                     help=f"execution runtime "
                          f"({'|'.join(RUNTIME_VALUES)}, default local); "
-                         f"overrides {RUNTIME_ENV} and leerie.toml")
+                         f"overrides {RUNTIME_ENV} (never leerie.toml)")
     ap.add_argument("--inspect-dir", action="append", metavar="PATH",
                     dest="inspect_dir",
                     help="extra directory the inspect-bucket workers "
@@ -68736,8 +70474,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "Forwarded to `claude -p` as --add-dir. Repeatable. "
                          "Use for sibling repos referenced in the task that "
                          "live outside the current repo cwd. Default: none. "
-                         f"Also {INSPECT_DIRS_ENV} (colon-separated) or "
-                         "inspect_dirs in leerie.toml (comma-separated).")
+                         f"Also {INSPECT_DIRS_ENV} (colon-separated).")
     ap.add_argument("--model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for all workers "
                          f"({'|'.join(MODEL_VALUES)}); without an override, "
@@ -68819,11 +70556,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     ap.add_argument("--judge-dir", metavar="DIR",
                     help=f"subdirectory name under the run dir for LLM judge "
                          f"output (default '{JUDGE_DIR_DEFAULT}'); also "
-                         f"{JUDGE_DIR_ENV} or judge_dir in leerie.toml")
+                         f"{JUDGE_DIR_ENV}")
     ap.add_argument("--heal-dir", metavar="DIR",
                     help=f"subdirectory name under the run dir for LLM self-heal "
                          f"output (default '{HEAL_DIR_DEFAULT}'); also "
-                         f"{HEAL_DIR_ENV} or heal_dir in leerie.toml")
+                         f"{HEAL_DIR_ENV}")
     ap.add_argument("--phase", choices=["judge", "heal"], metavar="PHASE",
                     help="run a post-run skill phase against an existing run's "
                          "captured LLM calls instead of starting a new run. "
@@ -68989,7 +70726,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # `state.json`. Refusing after that leaves a permanent run directory for a
     # run that never started — four accumulated on one host from a single
     # afternoon of dirty-tree refusals, indistinguishable in `leerie list` from
-    # runs that did work (docs/POSTMORTEM-2026-08-14.md, F14). Skipped on
+    # runs that did work (tests/test_irreversible_before_valid.py). Skipped on
     # `resume`: a resumed run's directory already exists, so there is nothing
     # left to protect, and re-checking would refuse a resume for a dirty tree
     # the operator may be mid-way through fixing.
@@ -69052,7 +70789,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # *Fail closed, on every entry*). An unconditional statement of this
     # body on purpose: `tests/test_confinement_entry.py` proves by rule that
     # nothing above it spawns a confined process.
-    _require_confinement(st.run_dir)
+    _require_confinement(st.run_dir, leerie_root, repo_root)
 
     # Resolve per-worker cgroup memory cap; resolver die()s on a bad size
     # string. Auto-derives a fixed isolation CEILING from the shared
@@ -69211,8 +70948,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         repo_root, getattr(args, "pr_base_branch", None))
 
     # Resolve --inspect-dir: CLI flags (repeatable) → LEERIE_INSPECT_DIRS
-    # env (colon-separated) → inspect_dirs in leerie.toml (comma-separated)
-    # → []. Re-attached to args so _orchestrate() can fold it into state.
+    # env (colon-separated) → [] (no leerie.toml key:
+    # REPO_CONFIG_LOCATION_KEYS). Re-attached to args so _orchestrate() can fold it into state.
     args.inspect_dirs = resolve_inspect_dirs(
         repo_root, getattr(args, "inspect_dir", None))
 

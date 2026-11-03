@@ -17,6 +17,26 @@ remote_log() {
   printf '%s [leerie] [%s] %s\n' "$_ts" "$_repo" "$*" >&2
 }
 
+# _terminal_relay — standard input to standard output with every control
+# character escaped (scripts/terminal-text.py): what the launcher relays to
+# the operator's terminal from a container or a machine (DESIGN §6 *No text
+# leerie did not write reaches the operator's terminal as a control
+# sequence*). The host's python3, isolated, stdlib only. The filter is the
+# one beside this file (scripts/terminal-text.py), whoever sourced it.
+_terminal_relay() {
+  python3 -I -S "${BASH_SOURCE[0]%/*}/../terminal-text.py"
+}
+
+# _terminal_safe <text> — <text> as _terminal_relay writes it: for a message
+# leerie writes that names text a repository, a hook, a worker or a machine
+# chose (a configuration value, a branch a repository named, a command's
+# output), so that text reaches the terminal as text (DESIGN §6 *No text
+# leerie did not write reaches the operator's terminal as a control
+# sequence*).
+_terminal_safe() {
+  printf '%s' "$1" | _terminal_relay
+}
+
 # _seed_progress_bg <label> — background heartbeat for long bulk transfers
 # over `flyctl ssh console`. Emits `remote_log "<label>: still streaming
 # (Ns elapsed)"` every LEERIE_PROGRESS_INTERVAL_S seconds (default 10)

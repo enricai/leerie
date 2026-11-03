@@ -316,7 +316,8 @@ def _build_stub_transport_repo(dest: Path) -> Path:
     preamble-defined path variable.
 
     Every OTHER script (ec2-lib.sh, ec2-provision.sh,
-    ec2-resume-instance.sh, ec2-fetch-branch.sh, _log.sh) is a real copy —
+    ec2-resume-instance.sh, ec2-fetch-branch.sh, _log.sh, and
+    scripts/terminal-text.py) is a real copy —
     only the three transport-heavy scripts are swapped, so
     provision_instance()/resume_instance()/decide_ec2_teardown() and the
     credential-ordering assertions all still exercise the genuine code.
@@ -334,6 +335,10 @@ def _build_stub_transport_repo(dest: Path) -> Path:
     for src in real_remote_dir.glob("*.sh"):
         (dest_remote_dir / src.name).write_text(src.read_text())
         (dest_remote_dir / src.name).chmod(0o755)
+    # The relay the launcher pipes the instance's log tail through
+    # (`_terminal_relay`), real.
+    (dest / "scripts" / "terminal-text.py").write_text(
+        (REPO_ROOT / "scripts" / "terminal-text.py").read_text())
     (dest_remote_dir / "ec2-seed-auth.sh").write_text(
         "ec2_seed_auth() { remote_log \"stub: ec2_seed_auth\"; return 0; }\n"
     )

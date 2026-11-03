@@ -51,7 +51,7 @@ def test_extracts_ordered_in_bounds_ranges(leerie, tmp_path):
         "    return 3\n"        # line 9
     )
     total = f.read_text().count("\n") + 1
-    ranges = leerie._extract_symbol_ranges(f)
+    ranges = leerie._extract_symbol_ranges(tmp_path, f)
 
     names = [r[0] for r in ranges]
     assert "first" in names and "second" in names and "third" in names
@@ -68,8 +68,8 @@ def test_extracts_ordered_in_bounds_ranges(leerie, tmp_path):
 def test_unsupported_extension_returns_empty(leerie, tmp_path):
     f = tmp_path / "data.unknownext"
     f.write_text("nothing parseable here\n")
-    assert leerie._extract_symbol_ranges(f) == []
+    assert leerie._extract_symbol_ranges(tmp_path, f) == []
 
 
 def test_missing_file_returns_empty(leerie, tmp_path):
-    assert leerie._extract_symbol_ranges(tmp_path / "nope.py") == []
+    assert leerie._extract_symbol_ranges(tmp_path, tmp_path / "nope.py") == []

@@ -120,7 +120,7 @@ fi
 # directory or a stale tree repository goes with the remake. Under the
 # repository-wide worktree lock (`leerie_repo_lock`), like every other script
 # that adds a worktree; the run repository's own registry is pruned for this
-# run only (never a bare `git worktree prune`: POSTMORTEM-2026-08-14 F19).
+# run only (never a bare `git worktree prune`: tests/test_worktree_prune_scoping.py).
 leerie_repo_lock
 prune_leerie_worktrees "${RUN_DIR}"
 TREE_REPOS="$(cd "$RUN_DIR" && pwd -P)/tree-repos"

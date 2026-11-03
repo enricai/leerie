@@ -1,6 +1,7 @@
 """Tests for resolve_runtime().
 
-Covers the CLI flag → env var → per-repo file → 'local' resolution order,
+Covers the CLI flag → env var → 'local' resolution order (no leerie.toml
+tier: DESIGN §6 *A repository chooses no operator authority*),
 the value enum, comment/whitespace handling, and the die() path for
 invalid values.
 """
@@ -20,9 +21,11 @@ def test_default_is_local(leerie, repo_root):
     assert leerie.resolve_runtime(repo_root) == "local"
 
 
-def test_file_present_env_unset(leerie, repo_root):
+def test_file_is_never_read(leerie, repo_root):
+    """Where worker code runs is the operator's (DESIGN §6 *A repository
+    chooses no operator authority*): a `runtime` key is not taken."""
     (repo_root / "leerie.toml").write_text("runtime = fly\n")
-    assert leerie.resolve_runtime(repo_root) == "fly"
+    assert leerie.resolve_runtime(repo_root) == "local"
 
 
 def test_file_absent_env_set(leerie, repo_root, monkeypatch):
@@ -48,9 +51,9 @@ def test_cli_value_ec2_wins_over_env_and_file(leerie, repo_root, monkeypatch):
     assert leerie.resolve_runtime(repo_root, cli_value="ec2") == "ec2"
 
 
-def test_file_present_env_unset_ec2(leerie, repo_root):
+def test_file_is_never_read_ec2(leerie, repo_root):
     (repo_root / "leerie.toml").write_text("runtime = ec2\n")
-    assert leerie.resolve_runtime(repo_root) == "ec2"
+    assert leerie.resolve_runtime(repo_root) == "local"
 
 
 def test_file_absent_env_set_ec2(leerie, repo_root, monkeypatch):
@@ -69,27 +72,11 @@ def test_cli_value_none_falls_back(leerie, repo_root, monkeypatch):
     assert leerie.resolve_runtime(repo_root, cli_value=None) == "fly"
 
 
-def test_quoted_file_value(leerie, repo_root):
-    (repo_root / "leerie.toml").write_text('runtime = "fly"\n')
-    assert leerie.resolve_runtime(repo_root) == "fly"
-
-
-def test_single_quoted_file_value(leerie, repo_root):
-    (repo_root / "leerie.toml").write_text("runtime = 'local'\n")
-    assert leerie.resolve_runtime(repo_root) == "local"
-
-
-def test_comments_and_blank_lines_tolerated(leerie, repo_root):
+@pytest.mark.parametrize("value", ["fly", "ec2", '"fly"', "'ec2'"])
+def test_no_spelling_in_the_file_is_read(leerie, repo_root, value):
     (repo_root / "leerie.toml").write_text(
-        "# leerie config\n\n  runtime = fly  \n# trailing\n"
-    )
-    assert leerie.resolve_runtime(repo_root) == "fly"
-
-
-@pytest.mark.parametrize("value", ["local", "fly", "ec2"])
-def test_all_values_accepted_in_file(leerie, repo_root, value):
-    (repo_root / "leerie.toml").write_text(f"runtime = {value}\n")
-    assert leerie.resolve_runtime(repo_root) == value
+        f"# leerie config\n\n  runtime = {value}  \n")
+    assert leerie.resolve_runtime(repo_root) == "local"
 
 
 @pytest.mark.parametrize("value", ["local", "fly", "ec2"])
@@ -98,14 +85,9 @@ def test_all_values_accepted_in_env(leerie, repo_root, monkeypatch, value):
     assert leerie.resolve_runtime(repo_root) == value
 
 
-def test_bad_file_value_dies(leerie, repo_root, capsys):
+def test_bad_file_value_is_not_read(leerie, repo_root):
     (repo_root / "leerie.toml").write_text("runtime = bogus\n")
-    with pytest.raises(SystemExit) as exc:
-        leerie.resolve_runtime(repo_root)
-    assert exc.value.code != 0
-    err = capsys.readouterr().err
-    assert "is not one of" in err
-    assert "bogus" in err
+    assert leerie.resolve_runtime(repo_root) == "local"
 
 
 def test_bad_env_value_dies(leerie, repo_root, monkeypatch, capsys):

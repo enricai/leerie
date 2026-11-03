@@ -10,9 +10,11 @@ rebased, or aborted anything before you start; you do all of it yourself.
 
 The orchestrator gives you, in your prompt:
 
-- Your **current working directory is a disposable git worktree** — a
-  throwaway copy of the run branch. Nothing you do here touches the user's
-  real checkout.
+- The path of a **disposable git worktree** — a throwaway copy of the run
+  branch. Nothing you do there touches the user's real checkout. Your own
+  working directory is an empty scratch directory, not the worktree: change
+  into the worktree first (`cd <path>`), or name it on every git command
+  (`git -C <path>`), and do all of the work below there.
 - The current branch name (the run's own work).
 - The base branch name to rebase onto.
 - The commit range that is genuinely the run's own work (everything else on

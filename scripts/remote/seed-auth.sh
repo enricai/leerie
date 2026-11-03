@@ -188,14 +188,14 @@ seed_auth() {
     fi
     if [ "$attempt" -eq 1 ] \
        && grep -qE "tunnel unavailable|context deadline exceeded|i/o timeout" "$err_log"; then
-      cat "$err_log" >&2
+      _terminal_relay < "$err_log" >&2
       remote_log "remote: tunnel unavailable; restarting flyctl agent and retrying once..."
       flyctl agent restart >/dev/null 2>&1 || true
       sleep 2
       rm -f "$err_log"
       continue
     fi
-    cat "$err_log" >&2
+    _terminal_relay < "$err_log" >&2
     rm -f "$err_log"
     break
   done
@@ -247,9 +247,16 @@ seed_auth() {
   # --- 3. Set git identity on the remote machine -------------------------
   # Read user.name and user.email from the host git config and set them
   # globally on the machine. Workers commit as the host user.
+  # The checkout's identity, which a repository-local one overrides: named
+  # with -C, never taken from the working directory, which is `/` (DESIGN
+  # §6 *The host never runs a program the checkout chose*, part 1).
   local git_name git_email
-  git_name="$(git config user.name 2>/dev/null || true)"
-  git_email="$(git config user.email 2>/dev/null || true)"
+  if [ -z "${USER_REPO:-}" ]; then
+    remote_log "seed_auth: USER_REPO is not set; cannot read the checkout's git identity"
+    return 1
+  fi
+  git_name="$(git -C "$USER_REPO" config user.name 2>/dev/null || true)"
+  git_email="$(git -C "$USER_REPO" config user.email 2>/dev/null || true)"
 
   if [ -z "$git_name" ] || [ -z "$git_email" ]; then
     remote_log "seed_auth: git user.name or user.email is not configured on the host."
@@ -276,7 +283,7 @@ seed_auth() {
     return 1
   fi
 
-  remote_log "remote: git identity set (${git_name} <${git_email}>)"
+  remote_log "remote: git identity set ($(_terminal_safe "${git_name}") <$(_terminal_safe "${git_email}")>)"
 
   # Pre-warm the Claude CLI. The very first `claude --version` on a
   # cold Fly machine takes ~17 s (Node runtime warm-up, statsig

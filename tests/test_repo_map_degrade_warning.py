@@ -40,7 +40,7 @@ def _reset_warn_latch(leerie):
     leerie._repo_map_empty_warned = False
 
 
-def _empty_parse(path):
+def _empty_parse(root, path):
     return [], []
 
 
@@ -87,7 +87,7 @@ def test_warning_includes_probe_exception_detail(leerie, tmp_path, capsys):
     (tmp_path / "app.py").write_text("def x():\n    pass\n")
     lr = tmp_path / "leerie-root"
 
-    def _parse(path):
+    def _parse(root, path):
         if path.name == "_probe.py":
             raise AttributeError("module 'tree_sitter_language_pack' has no "
                                   "attribute 'process'")
@@ -130,7 +130,7 @@ def test_no_false_warning_when_parser_works_but_repo_symbolless(
 
     # Walk yields nothing for the repo's files, but the functional probe's
     # own snippet DOES extract its symbol → parser is fine → no warning.
-    def _parse(path):
+    def _parse(root, path):
         if path.name == "_probe.py":
             return ["_probe_sym"], []
         return [], []

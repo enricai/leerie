@@ -1,7 +1,7 @@
 """Tests for per-repo derived image resolve/build in the leerie launcher.
 
 Covers the bash functions added near the base-build block:
-  _leerie_sha256, _leerie_repo_id, resolve_repo_image_tag, build_repo_image,
+  _leerie_repo_id, resolve_repo_image_tag, build_repo_image,
   the rebuild-decision block, and setup_packages auto-generation.
 
 Uses the same bash-harness subprocess pattern as
@@ -13,6 +13,11 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.committed_tree import commit_tree
+from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
+from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
+                                            NERDCTL_IMAGE_INSPECT_STUB,
+                                            REPO_DIGEST)
 from tests.repo_image_block_extract import extract_block as _extract_block
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -42,16 +47,20 @@ remote_log() { echo "[leerie] $*" >&2; }
 
 # Stub nerdctl: dispatch on first two words of subcommand.
 nerdctl() {
+  # leerie names its namespace on every call (LEERIE_IMAGE_NS).
+  if [ "${1:-}" = "--namespace" ]; then shift 2; fi
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     image)
+      _stub_image_inspect "$@" && return 0
       return "${NERDCTL_INSPECT_RC:-0}"
       ;;
     build)
+      _stub_build_done "$@"
       return "${NERDCTL_BUILD_RC:-0}"
       ;;
     run)
-      echo "nerdctl-run: image=${REPO_IMAGE_TAG:-$IMAGE_TAG}"
+      echo "nerdctl-run: image=${REPO_IMAGE_REF:-$IMAGE_TAG}"
       return 0
       ;;
     *)
@@ -82,17 +91,22 @@ IMAGE_TAG="${IMAGE_TAG:-leerie:${LEERIE_VERSION}}"
 LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-/tmp/leerie-state-test}"
 
 """
+_HARNESS_PREFIX = (LOG_SH_SOURCE + FRONTEND_SH_SOURCE + BUILDCTL_STUB
+                   + _HARNESS_PREFIX)
 
 
 def _run_harness(body: str, env: dict | None = None) -> subprocess.CompletedProcess:
     launcher = _launcher_text()
     # Extract only the per-repo functions block from the launcher
-    # (from _leerie_sha256 through the end of the unset _leerie_dockerfile line).
+    # (from its banner through the end of the unset _leerie_dockerfile line).
     marker_start = "# --- per-repo derived image (local nerdctl) "
     marker_end = "\n# --- translate --inspect-dir paths"
     block = _extract_block(launcher, marker_start, marker_end)
 
-    script = _HARNESS_PREFIX + block + "\n" + body
+    if env and env.get("USER_REPO"):
+        commit_tree(env["USER_REPO"])
+    script = (_HARNESS_PREFIX + NERDCTL_IMAGE_INSPECT_STUB + block + "\n"
+              + body)
 
     base_env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -241,6 +255,7 @@ def test_build_repo_image_success(tmp_path):
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     result = _run_harness(
+        '_repo_image_prepare "$IMAGE_TAG"\n'
         'build_repo_image "leerie-repo/test:0.99.test" && echo "build-ok"',
         env={
             "USER_REPO": str(user_repo),
@@ -259,9 +274,13 @@ def test_build_repo_image_failure_exits_1(tmp_path):
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
     (leerie_dir / "Dockerfile").write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
     result = _run_harness(
+        '_repo_image_prepare "$IMAGE_TAG"\n'
         'build_repo_image "leerie-repo/test:0.99.test"',
-        env={"USER_REPO": str(user_repo), "NERDCTL_BUILD_RC": "1"},
+        env={"USER_REPO": str(user_repo), "NERDCTL_BUILD_RC": "1",
+             "LEERIE_STATE_HOST_DIR": str(state_dir)},
     )
     assert result.returncode == 1
     assert "error: per-repo container image build failed" in result.stderr
@@ -270,7 +289,7 @@ def test_build_repo_image_failure_exits_1(tmp_path):
 def test_build_repo_image_error_message_matches_launcher():
     """The error message literal must match what's in the launcher source."""
     launcher_text = _launcher_text()
-    assert 'remote_log "error: per-repo container image build failed"' in launcher_text
+    assert '_repo_build_fail "per-repo container image build failed"' in launcher_text
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +310,8 @@ def test_rebuild_skipped_when_image_present_and_hash_matches(tmp_path):
     import hashlib
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
-    (state_dir / ".dockerfile-hash").write_text(f"{version}:{sha}\n")
+    (state_dir / ".dockerfile-hash").write_text(
+        f"{version}:worker-root-2:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
 
     result = _run_harness(
         'echo "done"',
@@ -475,11 +495,13 @@ def test_existing_dockerfile_wins_over_setup_packages(tmp_path):
     assert "# CUSTOM" in result.stdout
 
 
-def test_nerdctl_run_uses_repo_image_tag_when_set(tmp_path):
-    """REPO_IMAGE_TAG is set when Dockerfile is present; fallback to IMAGE_TAG otherwise."""
+def test_nerdctl_run_uses_repo_image_ref_when_set(tmp_path):
+    """The container runs the repository image by the digest this checkout
+    built (REPO_IMAGE_REF), never by its tag; the base image otherwise."""
     launcher_text = _launcher_text()
     # The nerdctl run line must use the fallback expression
-    assert '"${REPO_IMAGE_TAG:-$IMAGE_TAG}"' in launcher_text
+    assert '"${REPO_IMAGE_REF:-$IMAGE_TAG}"' in launcher_text
+    assert '"${REPO_IMAGE_TAG:-$IMAGE_TAG}"' not in launcher_text
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +735,8 @@ def test_unrelated_file_change_no_rebuild(tmp_path):
     # Store hash matching current Dockerfile.
     sha = hashlib.sha256(df.read_bytes()).hexdigest()
     version = "0.99.test"
-    (state_dir / ".dockerfile-hash").write_text(f"{version}:{sha}\n")
+    (state_dir / ".dockerfile-hash").write_text(
+        f"{version}:worker-root-2:sha256:base-id:{sha}:{EMPTY_CONTEXT_SHA} {REPO_DIGEST}\n")
 
     # Mutate an unrelated source file — not a lockfile.
     src_dir = user_repo / "src"
@@ -1022,3 +1045,43 @@ def test_uncommitted_generated_dockerfile_still_refreshes_in_git_repo(tmp_path):
     assert "postgresql" in result.stdout, (
         "untracked generated Dockerfile should refresh from new setup_packages"
     )
+
+
+def test_a_submodules_generated_dockerfile_is_not_overwritten(tmp_path):
+    """Review round 31, S1's class: `.leerie` a submodule holding a generated
+    Dockerfile. `git ls-files --error-unmatch .leerie/Dockerfile` fails in
+    the superproject (the submodule is one gitlink entry), so the refresh
+    took the committed file for an uncommitted one and rewrote it. A file
+    another repository holds is committed (`_checkout_file_tracked`)."""
+    sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
+    committed = sentinel + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\nRUN echo MINE\n"
+    ident = ["-c", "user.email=t@t.co", "-c", "user.name=t",
+             "-c", "protocol.file.allow=always"]
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "config.toml").write_text('setup_packages = "postgresql"\n')
+    (sub / "Dockerfile").write_text(committed)
+    subprocess.run(["git", "init", "-q"], cwd=sub, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=sub, check=True)
+    subprocess.run(["git", *ident, "commit", "-qm", "s"], cwd=sub, check=True)
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=user_repo, check=True)
+    subprocess.run(["git", *ident, "submodule", "add", "-q", str(sub),
+                    ".leerie"], cwd=user_repo, check=True)
+    subprocess.run(["git", *ident, "commit", "-qm", "m"], cwd=user_repo,
+                   check=True)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == committed

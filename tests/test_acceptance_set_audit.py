@@ -647,11 +647,17 @@ def test_the_surrogate_witness_triggers_only_when_nothing_else_fired(
     final = _run(leerie, st, staging, sha, w, monkeypatch)
     (sur,) = w.of("surrogate_fixer")
     # Test-blind: no set file in its tree, none named in its prompt, and
-    # its Read denies cover the sets.
+    # its grant (I5) does not reach the sets.
     assert not any(f.startswith("acc/") for f in sur["_files_at_call"])
     assert "test_defect" not in sur["user_prompt"]
-    assert "acceptance" in leerie._acceptance_read_denials(
-        "surrogate_fixer", st.run_dir)
+    fixer_cwd = st.run_dir.parent / "surrogate-grant-probe"
+    fixer_cwd.mkdir()
+    g = leerie._worker_grants(
+        run_dir=st.run_dir, state=st.data, schema_key="surrogate_fixer",
+        cwd=fixer_cwd, allowed_tools=leerie.ACT_TOOLS, env={})
+    sets = os.path.realpath(st.run_dir / "acceptance")
+    assert not any(Path(sets).is_relative_to(os.path.realpath(p))
+                   for p in g.rw + g.ro)
     assert sur["autonomous"] is True and sur["allowed_tools"] == leerie.ACT_TOOLS
     s = st.data["acceptance"]["sets"][0]
     assert s["rewrite"]["triggers"] == ["surrogate_witness"]

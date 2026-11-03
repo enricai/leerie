@@ -385,9 +385,9 @@ fi
 
 if [ -d "$PREFIX/.git" ]; then
   log "updating existing Leerie checkout at $PREFIX"
-  run git -C "$PREFIX" fetch origin
+  run git -C "$PREFIX" fetch --no-recurse-submodules origin
   run git -C "$PREFIX" checkout "$REF"
-  run git -C "$PREFIX" pull --ff-only origin "$REF"
+  run git -C "$PREFIX" pull --ff-only --no-recurse-submodules origin "$REF"
 elif [ -e "$PREFIX" ]; then
   err "$PREFIX exists and is not a git checkout — refusing to overwrite."
   err "Pass --prefix DIR to choose a different install directory."

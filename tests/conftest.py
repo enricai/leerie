@@ -22,6 +22,34 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# The launcher's logging and terminal-filter helpers (`remote_log`,
+# `_terminal_relay`, `_terminal_safe`), sourced by a harness that runs an
+# extracted launcher block: the block prints text a repository or a machine
+# chose through the real filter (DESIGN §6 *No text leerie did not write
+# reaches the operator's terminal as a control sequence*). A harness that
+# stubs `remote_log` defines its stub after this line.
+LOG_SH_SOURCE = f'. "{REPO_ROOT}/scripts/remote/_log.sh"\n'
+# The launcher sources scripts/dockerfile-frontend.sh near its top
+# (LEERIE_DOCKERFILE_FRONTEND, ensure_frontend_in_worker_ns, LEERIE_IMAGE_NS);
+# a harness that runs an extracted block holding a build sources it the same
+# way.
+FRONTEND_SH_SOURCE = f'. "{REPO_ROOT}/scripts/dockerfile-frontend.sh"\n'
+# A bash `buildctl` stub for a harness that runs a repository build, defined
+# after FRONTEND_SH_SOURCE: leerie_buildkit_resolve asks BuildKit which
+# containerd namespaces its workers read (DESIGN §6 *No build consumes what
+# another build left in BuildKit*), and a test must not ask the host's daemon
+# (CI has none). One daemon, one containerd worker reading
+# `$STUB_WORKER_NS` (default `default`, the standard rootless setup's);
+# `$STUB_BUILDCTL_RC` non-zero makes no daemon answer; with `$BUILDCTL_LOG`
+# set each call's arguments are appended to it. Builtins only.
+BUILDCTL_STUB = r"""
+buildctl() {
+  [ -z "${BUILDCTL_LOG:-}" ] || printf '%s\n' "$*" >> "$BUILDCTL_LOG"
+  [ "${STUB_BUILDCTL_RC:-0}" = 0 ] || return "$STUB_BUILDCTL_RC"
+  printf '[{"id":"w0","labels":{"org.mobyproject.buildkit.worker.containerd.namespace":"%s"}}]\n' \
+    "${STUB_WORKER_NS:-default}"
+}
+"""
 
 # No test reaches the user's real `~/.leerie` (or anything else under their
 # home). The launcher resolves its state dir to `$HOME/.leerie/<repo>` and
@@ -31,8 +59,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # its own HOME before any test module is imported, with the git identity CI
 # sets globally (.github/workflows/test.yml); `REAL_HOME` is the user's, for
 # a test that must read a cache there on purpose.
+# The XDG base directories go with it: code under test derives its places
+# from `${XDG_CACHE_HOME:-$HOME/.cache}` (leerie's private ssh-agent, the
+# Fly image cache), so an inherited `XDG_CACHE_HOME` would put them back in
+# the user's home, beyond the session's cleanup and its agent guard.
 # Idempotent: a second import of this module (under another name) keeps the
 # first one's HOME and its record of the user's.
+XDG_BASE_DIRS = {"XDG_CACHE_HOME": ".cache", "XDG_CONFIG_HOME": ".config",
+                 "XDG_DATA_HOME": ".local/share",
+                 "XDG_STATE_HOME": ".local/state"}
 if os.environ.get("PYTEST_LEERIE_TEST_HOME") and \
         os.environ.get("PYTEST_LEERIE_TEST_HOME") == os.environ.get("HOME"):
     REAL_HOME = os.environ.get("PYTEST_LEERIE_REAL_HOME", "")
@@ -42,17 +77,167 @@ else:
     (_TEST_HOME / ".gitconfig").write_text(
         "[user]\n\temail = ci@leerie.invalid\n\tname = Leerie CI\n")
     os.environ["HOME"] = str(_TEST_HOME)
+    for _var, _rel in XDG_BASE_DIRS.items():
+        # The user's own value, so a test can be checked against it.
+        os.environ[f"PYTEST_LEERIE_REAL_{_var}"] = os.environ.get(_var, "")
+        os.environ[_var] = str(_TEST_HOME / _rel)
     os.environ["PYTEST_LEERIE_TEST_HOME"] = str(_TEST_HOME)
     os.environ["PYTEST_LEERIE_REAL_HOME"] = REAL_HOME
     atexit.register(shutil.rmtree, _TEST_HOME, True)
 
 
+def _real_leerie_entries() -> set[str] | None:
+    """The names in the user's real `~/.leerie` (read only, never written):
+    the state roots of the user's own runs. None when there is no user's
+    home to look at."""
+    if not REAL_HOME:
+        return None
+    try:
+        return set(os.listdir(Path(REAL_HOME) / ".leerie"))
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+
+
+# Taken at the first import, before any test runs.
+_REAL_LEERIE_AT_START = _real_leerie_entries()
+
+
+def _beneath(value: str, root: str) -> bool:
+    return bool(root) and (
+        value == root or value.startswith(root.rstrip("/") + "/"))
+
+
+def _is_users_place(value: str) -> bool:
+    """Whether `value` is the user's real home or beneath it — except the
+    system temp directory, which may itself sit beneath the user's home
+    (TMPDIR=~/.cache/...): the session HOME and every test's tmp_path are
+    made there, and are the session's."""
+    return _beneath(value, REAL_HOME) and not _beneath(
+        value, os.path.realpath(tempfile.gettempdir())) and not _beneath(
+        value, tempfile.gettempdir())
+
+
+def _session_places_are_the_sessions() -> None:
+    """HOME and the XDG base directories are never the user's: a test may
+    point one at its own tmp_path (unsetting one is fine too: the code under
+    test then falls back beneath the session HOME), never back at the
+    user's home or at a value inherited from the user's environment."""
+    assert not _is_users_place(os.environ.get("HOME", "")), "HOME"
+    for var in XDG_BASE_DIRS:
+        value = os.environ.get(var, "")
+        if not value:
+            continue
+        assert not _is_users_place(value), var
+        assert value != os.environ.get(f"PYTEST_LEERIE_REAL_{var}"), var
+
+
 @pytest.fixture(autouse=True)
 def _home_is_never_the_users():
-    """A test that points HOME back at the user's fails, before and after."""
-    assert os.environ.get("HOME") != REAL_HOME or not REAL_HOME
+    """A test that points HOME or an XDG base directory at the user's own
+    (their home, or the value inherited from their environment) fails,
+    before and after."""
+    _session_places_are_the_sessions()
     yield
-    assert os.environ.get("HOME") != REAL_HOME or not REAL_HOME
+    _session_places_are_the_sessions()
+
+
+def leerie_agent_dir() -> Path:
+    """The directory `_leerie_fly_agent_ensure` (scripts/remote/lib.sh)
+    puts leerie's private agent's socket in, derived as it derives it."""
+    cache = os.environ.get("XDG_CACHE_HOME") or \
+        os.path.join(os.environ["HOME"], ".cache")
+    return Path(cache) / "leerie" / "agent"
+
+
+def ssh_agents_under(directory: str | os.PathLike) -> list[int]:
+    """The PIDs of every `ssh-agent` whose argv names a path under
+    `directory`. leerie's private agent is `ssh-agent -a
+    <cache>/leerie/agent/ssh-agent.sock`; it daemonizes, so the test that
+    started it is not its parent and must stop it by PID (`SSH_AUTH_SOCK=…
+    ssh-agent -k` stops nothing without `SSH_AGENT_PID`)."""
+    prefix = os.fspath(directory).rstrip("/") + "/"
+    pids = []
+    if os.path.isdir("/proc"):
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    argv = f.read().split(b"\0")
+            except OSError:
+                continue
+            if os.path.basename(argv[0]) == b"ssh-agent" and any(
+                    prefix.encode() in a for a in argv[1:]):
+                pids.append(int(entry))
+        return pids
+    out = subprocess.run(["/bin/ps", "-A", "-o", "pid=", "-o", "command="],
+                         capture_output=True, text=True, check=False).stdout
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        argv = cmd.split()
+        if argv and os.path.basename(argv[0]) == "ssh-agent" and \
+                prefix in cmd:
+            pids.append(int(pid))
+    return pids
+
+
+def stop_ssh_agents_under(directory: str | os.PathLike) -> list[int]:
+    """Stop, by PID, every agent `ssh_agents_under(directory)` finds; the
+    PIDs it stopped."""
+    pids = ssh_agents_under(directory)
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, 15)
+    return pids
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """No leerie ssh-agent the session started outlives the session, and
+    the user's real ~/.leerie gains no entry.
+
+    Code on the Fly path (`_leerie_fly_agent_ensure`) starts leerie's private
+    agent in `leerie_agent_dir()`, under the session HOME; nothing stopped
+    it, so every run leaked one agent per pytest process, on CI too. Only the
+    controlling process checks: an xdist worker that finishes early shares
+    the HOME with workers still running. A leak fails the session, and the
+    agent is stopped either way, so a failing run leaks nothing."""
+    if hasattr(session.config, "workerinput"):
+        return
+    if not os.environ.get("PYTEST_LEERIE_TEST_HOME"):
+        return
+    # No test writes the user's real ~/.leerie: a launcher run with the
+    # user's HOME and no pinned state root made `<repo>/logs` there for every
+    # repository name a test used. Names only; nothing there is removed.
+    now = _real_leerie_entries()
+    if _REAL_LEERIE_AT_START is not None and now is not None:
+        gained = sorted(now - _REAL_LEERIE_AT_START)
+        if gained:
+            sys.stderr.write(
+                f"\nconftest: {Path(REAL_HOME) / '.leerie'} gained {gained} "
+                "during the session. A test that runs the launcher pins HOME "
+                "or LEERIE_STATE_DIR beneath its own tmp_path; nothing was "
+                "removed (if you made these yourself meanwhile, ignore "
+                "this).\n")
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    # A test may give the code an XDG_CACHE_HOME beneath its own tmp_path,
+    # so an agent it starts lives under the session's base temp directory
+    # (xdist workers' are beneath the controller's).
+    agent_dir = leerie_agent_dir()
+    leaked = stop_ssh_agents_under(agent_dir)
+    factory = getattr(session.config, "_tmp_path_factory", None)
+    if factory is not None:
+        leaked += stop_ssh_agents_under(factory.getbasetemp())
+    if leaked:
+        sys.stderr.write(
+            f"\nconftest: ssh-agent(s) {leaked} started in the session's "
+            f"{agent_dir} outlived the session (stopped now). A test that "
+            "starts an agent stops it by PID; a test whose subject is not "
+            "the agent must not reach `_leerie_fly_agent_ensure`'s spawn.\n")
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 
@@ -550,8 +735,8 @@ def _test_tmp_readable_by_measurements(request, monkeypatch):
     grant names — an isolated command's `/tmp` is its own (DESIGN §6 *Every
     confined process has its own `/tmp`, `/dev/shm` and IPC*) — so a fake
     runner or installer a test puts there could not even be executed. In
-    production no tool lives in `/tmp`. Never the state root
-    (`_around`), never the rest of `/tmp`."""
+    production no tool lives in `/tmp`. Never the state root or the host
+    directory (`_apart`), never the rest of `/tmp`."""
     if "tmp_path" not in request.fixturenames:
         return
     leerie = request.getfixturevalue("leerie")
@@ -561,13 +746,29 @@ def _test_tmp_readable_by_measurements(request, monkeypatch):
     def grants(st, tree, kind=leerie.MEASURE_KIND):
         g = real(st, tree, kind)
         root = leerie._run_dir_of(st).parent.parent
-        extra = tuple(p for p in leerie._around([str(tmp)], root)
+        extra = tuple(p for p in leerie._apart([str(tmp)], root)
                       if p not in g.rw + g.ro)
         return g._replace(ro=g.ro + extra)
     monkeypatch.setattr(leerie, "_measurement_grants", grants)
 
 
 HELDOUT_SANDBOX_EMULATOR = REPO_ROOT / "tests" / "heldout_sandbox_emulator.py"
+
+
+@pytest.fixture(autouse=True)
+def _no_image_worker_root(request, monkeypatch):
+    """Point `WORKER_ROOT` at a path that does not exist, so the suite runs
+    the same in leerie's base image and in a repository image, which has a
+    worker root at `/opt/leerie-worker-root` (DESIGN §6 *The orchestrator's
+    root is leerie's; a repository's root is only a confined process's*).
+    `tests/test_worker_root_view.py` drives the shim's `--worker-root`
+    itself; a test that needs the image's own opts out with
+    `@pytest.mark.real_worker_root`."""
+    if request.node.get_closest_marker("real_worker_root"):
+        return
+    leerie = request.getfixturevalue("leerie")
+    monkeypatch.setattr(leerie, "WORKER_ROOT",
+                        REPO_ROOT / "tests" / "no-worker-root-in-tests")
 
 
 @pytest.fixture(autouse=True)
@@ -588,9 +789,9 @@ def _emulated_heldout_sandbox(request, monkeypatch):
     leerie = request.getfixturevalue("leerie")
     real = leerie._confined_argv
 
-    def _argv(grants, cmd, *, sandbox=None, report_fd=None):
+    def _argv(grants, cmd, *, sandbox=None, report_fd=None, **kw):
         if sandbox is None:
-            return real(grants, cmd)
+            return real(grants, cmd, **kw)
         out = [sys.executable, "-I", str(HELDOUT_SANDBOX_EMULATOR),
                "--view", sandbox.view]
         for src, rel in sandbox.place:

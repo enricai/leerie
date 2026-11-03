@@ -117,7 +117,7 @@ re_seed() {
                              { print }')"
     if [ -n "$remote_dirty" ]; then
       remote_log "re_seed: machine /work has uncommitted edits to tracked files:"
-      printf '%s\n' "$remote_dirty" | sed -n 1,10p >&2
+      printf '%s\n' "$remote_dirty" | sed -n 1,10p | _terminal_relay >&2
       echo "" >&2
       echo "  These edits would be clobbered by re-seed." >&2
       echo "  Inspect via: leerie resume $LEERIE_RUN_ID --shell" >&2

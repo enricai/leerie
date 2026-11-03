@@ -561,7 +561,7 @@ def test_whole_tree_has_exactly_one_new_file_owner(leerie, tmp_path):
 # leaving it to whether a native parser happens to be installed.
 
 def _stub_ranges(monkeypatch, leerie, ranges):
-    monkeypatch.setattr(leerie, "_extract_symbol_ranges", lambda _p: ranges)
+    monkeypatch.setattr(leerie, "_extract_symbol_ranges", lambda _r, _p: ranges)
 
 
 def test_tier1_symbol_tiling_keeps_one_owner(leerie, tmp_path, monkeypatch):

@@ -397,12 +397,13 @@ def test_fetch_state_ec2_skips_bundle_and_preserves_no_push_when_branch_missing(
     )
 
 
-def test_fetch_state_ec2_streams_config_and_dockerfile_to_host(tmp_path):
+def test_fetch_state_ec2_names_the_capture_and_streams_nothing_back(
+        tmp_path):
     """Step 4: the run's recorded capture (its run directory came home with
-    the state stream-back) is applied to the user's .leerie/config.toml, and
-    .leerie/Dockerfile streams back when the host has none. The instance's
-    own config.toml is not streamed (DESIGN §6½ *The host applies a
-    capture*)."""
+    the state stream-back) is named with the command that applies it, and
+    nothing applies it (DESIGN §6½ *The operator applies a capture*). The
+    instance's config.toml and Dockerfile are not streamed: a file a
+    machine wrote never becomes a build input."""
     repo = _make_git_repo(tmp_path)
     instance_root, instance_work = _setup_instance(tmp_path)
 
@@ -429,14 +430,15 @@ def test_fetch_state_ec2_streams_config_and_dockerfile_to_host(tmp_path):
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
 
     host_leerie = repo / ".leerie"
-    assert (host_leerie / "config.toml").read_text().endswith(
-        'setup_packages = "curl"\n')
-    assert (host_leerie / "Dockerfile").read_text() == "FROM debian:13\n"
+    assert not (host_leerie / "config.toml").exists()
+    assert not (host_leerie / "Dockerfile").exists()
+    assert f"leerie config --apply-capture {run_id}" in (
+        result.stdout + result.stderr)
 
 
 def test_fetch_state_ec2_never_clobbers_existing_host_file(tmp_path):
-    """Step 4 never overwrites a pre-existing host-side config.toml, but
-    still writes an absent Dockerfile."""
+    """Step 4 never overwrites a pre-existing host-side config.toml, and
+    writes no Dockerfile either."""
     repo = _make_git_repo(tmp_path)
     instance_root, instance_work = _setup_instance(tmp_path)
 
@@ -465,9 +467,7 @@ def test_fetch_state_ec2_never_clobbers_existing_host_file(tmp_path):
     assert (host_leerie / "config.toml").read_text() == original_content, (
         "must not clobber an existing host-side config.toml"
     )
-    assert (host_leerie / "Dockerfile").exists(), (
-        "Dockerfile absent on host should still be written"
-    )
+    assert not (host_leerie / "Dockerfile").exists()
 
 
 def test_fetch_state_ec2_nonfatal_when_instance_leerie_files_absent(tmp_path):

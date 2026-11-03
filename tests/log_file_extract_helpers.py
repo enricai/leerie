@@ -47,11 +47,34 @@ def extract_reap_tail() -> str:
     return _extract("  _reap_tail() {\n", "  }\n")
 
 
+def extract_wait_run() -> str:
+    """`_run_pid` and `_wait_run`, which every invocation form calls: the
+    client runs in the background so a signal reaches the launcher's trap
+    at once (DESIGN §6 *container boundary's hidden precondition*)."""
+    return _extract('  _run_pid=""\n  _wait_run() {\n', "  }\n")
+
+
+def extract_terminal_relay() -> str:
+    """`scripts/remote/_log.sh`, sourced, for its `_terminal_relay`, which the
+    piped branch relays the container's output through (DESIGN §6 *No text
+    leerie did not write reaches the operator's terminal as a control
+    sequence*): the relay finds the filter beside `_log.sh`, so it is
+    sourced from its own file rather than copied out of it."""
+    return f'. "{REPO_ROOT}/scripts/remote/_log.sh"\n'
+
+
 def extract_invocation() -> str:
     """The full `if [ -n "$_run_log" ]; then ... fi` block: the piped
     tail/tee branch, the `script`-wrapped interactive/-it branch
-    (bugfix-005), and the unwrapped fallback."""
-    return _extract(
+    (bugfix-005), and the unwrapped fallback — preceded by the
+    `_wait_run` they call and the `_terminal_relay` the piped branch
+    calls."""
+    # The run names leerie's containerd namespace, LEERIE_IMAGE_NS, which
+    # the launcher takes from scripts/dockerfile-frontend.sh.
+    return (f'. "{REPO_ROOT}/scripts/dockerfile-frontend.sh"\n'
+            + extract_wait_run() + extract_terminal_relay()) + _extract(
         '  if [ -n "$_run_log" ]; then\n    # Decoupled: nerdctl',
-        '    nerdctl run "${_run_argv[@]}" || container_rc=$?\n  fi\n',
+        '    nerdctl --namespace "$LEERIE_IMAGE_NS" run "${_run_argv[@]}" <&0 &\n'
+        '    _run_pid=$!\n'
+        '    _wait_run\n  fi\n',
     )

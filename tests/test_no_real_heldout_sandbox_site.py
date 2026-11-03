@@ -29,7 +29,9 @@ sys.modules["leerie"] = m
 spec.loader.exec_module(m)
 print(m._require_heldout_sandbox.__name__)
 if sys.argv[2] == "call":
-    m._require_confinement(m.Path(sys.argv[3]))
+    run_dir = m.Path(sys.argv[3])
+    m._require_confinement(run_dir, run_dir.parent.parent,
+                           run_dir.parent.parent.parent / "repo")
     print("ENTRY PASSED")
 """
 

@@ -186,11 +186,12 @@ def test_falsified_by_reverting_the_tee_wiring(tmp_path, monkeypatch):
     log_file = tmp_path / "logs" / "leerie-run.log"
     reverted_invocation = _extract_invocation().replace(
         'if [ -n "$_log_tee_target" ]; then\n'
-        '      tail -n +1 -f "$_run_log" 2>/dev/null | tee -a "$_log_tee_target" &\n'
+        '      tail -n +1 -f "$_run_log" 2>/dev/null | _terminal_relay \\\n'
+        '        | tee -a "$_log_tee_target" &\n'
         "    else\n"
-        '      tail -n +1 -f "$_run_log" 2>/dev/null &\n'
+        '      tail -n +1 -f "$_run_log" 2>/dev/null | _terminal_relay &\n'
         "    fi",
-        '    tail -n +1 -f "$_run_log" 2>/dev/null &',
+        '    tail -n +1 -f "$_run_log" 2>/dev/null | _terminal_relay &',
     )
     assert "tee -a" not in reverted_invocation
     script = state_dir / "harness.sh"
@@ -293,7 +294,8 @@ def test_interactive_script_command_is_a_single_quoted_string(tmp_path):
     concatenation that would break on paths/values containing spaces or
     shell metacharacters."""
     invocation = _extract_invocation()
-    assert '_nerdctl_run_quoted="nerdctl run"' in invocation
+    assert ('_nerdctl_run_quoted="nerdctl --namespace $LEERIE_IMAGE_NS run"'
+            in invocation)
     assert "printf -v _rarg_q '%q' \"$_rarg\"" in invocation
     assert 'script -qe -c "$_nerdctl_run_quoted" -a "$_log_tee_target"' in invocation
 

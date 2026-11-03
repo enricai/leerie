@@ -4,7 +4,8 @@ conformance*).
 
 The JSON schema enforces the *shape* of the result. This function
 enforces the cross-field honesty rules the schema can't:
-- a non-empty rule_violations_residual requires a non-empty rules_files_read
+- a residual naming a repository rule (no `axis`) requires a non-empty
+  rules_files_read; one with an `axis` is leerie's own BLT rule
 - every rule_violations_fixed item must cite a non-empty `rule`
 - every docs_updates / tests_updates `path` must exist in the worktree
 """
@@ -226,3 +227,51 @@ def test_docs_update_path_unresolvable_rejected(leerie, tmp_path, monkeypatch):
     assert err is not None
     assert "docs_updates[0]" in err
     assert "could not be resolved" in err
+
+
+# --- leerie's own rule needs no rules file (0.43.0 barnacle, 7 rejections) ---
+
+def _wire(rules_files_read, *violations):
+    """The conformer's wire shape (`SCHEMAS["conformer"]`), expanded by the
+    real `_expand_conformer_output` exactly as the conformer loop does."""
+    return {"subtask_id": "t1", "rules_files_read": rules_files_read,
+            "rule_violations": list(violations), "file_updates": [],
+            "build": {"ran": False, "passed": False, "command": "",
+                      "summary": ""},
+            "lint": {"ran": False, "passed": False, "command": "",
+                     "summary": ""},
+            "tests": {"ran": True, "passed": False, "command": "",
+                      "summary": ""},
+            "summary": "s", "solution_defects": []}
+
+
+BLT = {"status": "residual", "rule": "build/lint/tests must pass",
+       "axis": "tests", "why_not_fixed": "30 s timeouts under host load"}
+
+
+def test_blt_residual_with_no_rules_file_is_accepted(leerie, tmp_path):
+    """The live rejection: no RULES_FILES, a red test axis reported as the
+    prompt says (`axis` set). The rule is leerie's own; no file supplies it."""
+    res = leerie._expand_conformer_output(_wire([], BLT))
+    assert res["rule_violations_residual"][0]["axis"] == "tests"
+    assert leerie._validate_conformance_result(res, str(tmp_path)) is None
+
+
+def test_repo_rule_residual_beside_a_blt_one_is_still_rejected(leerie,
+                                                               tmp_path):
+    """The exemption is per entry: a repository rule reported with no rules
+    file read is still fabricated, whatever else is in the list."""
+    other = {"status": "residual", "rule": "no new runtime dependencies",
+             "why_not_fixed": "y"}
+    res = leerie._expand_conformer_output(_wire([], BLT, other))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
+    assert err is not None and "rules_files_read" in err
+
+
+def test_an_axis_outside_the_three_is_no_exemption(leerie, tmp_path):
+    """Only a typed BLT axis marks leerie's rule: an invented one is dropped
+    by the expansion and the entry needs its rules file again."""
+    res = leerie._expand_conformer_output(
+        _wire([], dict(BLT, axis="perf")))
+    assert "axis" not in res["rule_violations_residual"][0]
+    assert leerie._validate_conformance_result(res, str(tmp_path)) is not None

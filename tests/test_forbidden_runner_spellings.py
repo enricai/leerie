@@ -135,6 +135,7 @@ def test_reviewer_negatives_are_not_refused(leerie, argv):
 
 @pytest.mark.parametrize("forb, cmd, hit", [
     # vitest: run/watch/dev run the suite; related <files> is scoped
+    # only over module sources
     ("vitest", "vitest run", True),
     ("vitest", "vitest run --reporter verbose", True),
     ("vitest", "vitest --reporter dot run", True),
@@ -149,6 +150,16 @@ def test_reviewer_negatives_are_not_refused(leerie, argv):
     ("vitest", "vitest run --bail 1 tests/b.test.mjs", False),
     ("vitest", "vitest run --globals true tests/b.test.mjs", False),
     ("vitest", "vitest related src/a.mjs --run", False),
+    # related is scoped only over module sources (DESIGN §9 *An
+    # impact-analysis runner is handed only its own module sources*): the
+    # live 0.43.0 barnacle command ran all 1,299 test files
+    ("vitest", "npx vitest related --run .github/workflows/build.yml .nvmrc "
+               "Dockerfile package.json --passWithNoTests", True),
+    ("vitest", "vitest related package.json --run", True),
+    ("vitest", "vitest related src/a.ts vitest.config.ts --run", True),
+    ("vitest", "vitest related src/a.ts pnpm-lock.yaml", True),
+    ("vitest", "vitest related --run", True),
+    ("vitest", "vitest related --run src/a.ts src/b.vue", False),
     ("vitest", "vitest run --changed", False),
     ("vitest", "vitest run --project x", False),
     # jest
@@ -159,6 +170,10 @@ def test_reviewer_negatives_are_not_refused(leerie, argv):
     ("jest", "jest --ci true tests/b.test.js", False),
     ("jest", "jest --testPathPatterns b.test", False),
     ("jest", "jest --findRelatedTests tests/a.test.js", False),
+    ("jest", "jest --findRelatedTests package.json", True),
+    ("jest", "jest --findRelatedTests src/a.js jest.config.js", True),
+    ("jest", "jest --findRelatedTests", True),
+    ("jest", "jest --findRelatedTests --onlyChanged package.json", False),
     ("jest", "jest -i tests/a.test.js", False),
     # mocha does not read true/false as a flag's value
     ("mocha", "mocha -R dot", True),
@@ -295,3 +310,20 @@ def test_wrapper_spellings_through_real_bash(leerie, stubbed, tool, cmd):
     if not ran:
         pytest.skip(f"{cmd!r} did not reach the stub here")
     assert all(e in leerie._forbidden_argvs(cmd) for e in ran), (ran, cmd)
+
+
+@pytest.mark.parametrize("files", [
+    ["src/a.ts"], ["src/a.ts", "package.json"], ["vitest.config.ts"],
+    ["src/a.ts", "vite.config.mjs"], [".nvmrc", "Dockerfile"],
+    ["src/a.ts", "src/b.svelte"]])
+def test_gate_and_renderer_share_one_classification(leerie, files):
+    """The worker-side gate admits a `related` run as scoped exactly when
+    `_render_scoped` would hand the runner every one of its operands: one
+    classification (`_impact_module_source`), read the same way twice."""
+    tpl = "npx vitest related --run {files}"
+    kept = (leerie._render_scoped(tpl, files, "base") or "").split()[4:]
+    whole = leerie._forbidden_command_hit(
+        "npx vitest related --run " + " ".join(files),
+        [{"command": "vitest run", "scope": "whole_suite",
+          "test_roots": ["tests"]}])
+    assert bool(whole) is (kept != files), (files, kept)

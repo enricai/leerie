@@ -178,15 +178,18 @@ def test_positional_mapping_matches_challenge_block_order(leerie):
 
 def test_conformer_own_unexercised_evidence_joins_unchallenged(leerie):
     """The conformer's own exercised:false rides the register too, but is
-    never challenged and so never addressed."""
-    conf = {"production_evidence": {"exercised": False,
-                                    "unexercisable_reason": "needs live API"},
+    never challenged and so never addressed. It is external because it
+    names the resource."""
+    conf = {"production_evidence": {
+        "exercised": False, "unexercisable_reason": "needs live API",
+        "unexercisable_resource": "the provider's live API"},
             "solution_defects": [], "file_updates": [],
             "risk_dispositions": []}
     out = leerie._collect_subtask_risks(None, conf)
     assert out == [{"kind": "unexercised_behavior",
                     "detail": "needs live API", "source": "conformer",
                     "gap": "unverified_external", "where_paths": [],
+                    "resource": "the provider's live API",
                     "addressed": False}]
 
 
@@ -214,6 +217,9 @@ def test_challenge_block_carries_each_detail_verbatim(leerie):
 # --- the PR section --------------------------------------------------------
 
 def _ext(detail, addressed=False, **kw):
+    # External names its resource (DESIGN §9); a test passes `resource=None`
+    # for an entry an older leerie stored without one.
+    kw.setdefault("resource", "the provider's sandbox")
     return {"kind": "external_contract_assumption", "detail": detail,
             "source": "implementer", "gap": "unverified_external",
             "where_paths": [], "addressed": addressed, **kw}
@@ -585,6 +591,7 @@ def test_long_and_multiline_details_are_normalized_not_rejected(leerie):
     assert len(out[0]["detail"]) == 300
 
     sneaky = _impl(reason="line one\n## Injected heading\nline two")
+    sneaky["production_evidence"]["unexercisable_resource"] = "a live API"
     out = leerie._collect_subtask_risks(sneaky, None)
     assert "\n" not in out[0]["detail"]
     sec = leerie._format_pr_end_state_section(
@@ -733,3 +740,58 @@ def test_no_disclosed_risks_means_no_confirmed_warning(
     assert res["status"] == "complete", res
     assert not any("confirmed_defect" in w
                    for w in res.get("conformance_warnings") or [])
+
+
+# --- only a named external resource is external (DESIGN §9; the 0.43.0
+# barnacle runs: 36 of 39 "Needs human verification" entries named none) -----
+
+def test_an_unexercised_path_with_no_resource_is_not_external(leerie):
+    """`exercised: false` with no `unexercisable_resource` (the live shapes:
+    "docs-only change", "I only ran the two changed test files") is a gap
+    the changed-line coverage measurement answers, kept in state only."""
+    for reason in ("docs-only change",
+                   "I only ran the two changed test files."):
+        res = _impl(reason=reason)
+        (e,) = leerie._collect_subtask_risks(res, None)
+        assert e["gap"] == "test_missing" and "resource" not in e
+        assert e["detail"] == reason
+        assert leerie._format_pr_end_state_section(
+            {"risk_register": {"feat-x": [e]}}) == ""
+
+
+def test_an_unexercised_path_naming_its_resource_is_external(leerie):
+    res = _impl(reason="needs a real browser session that defers the body")
+    res["production_evidence"]["unexercisable_resource"] = \
+        "a real Chrome/CDP session"
+    (e,) = leerie._collect_subtask_risks(res, None)
+    assert e["gap"] == "unverified_external"
+    assert e["resource"] == "a real Chrome/CDP session"
+    sec = leerie._format_pr_end_state_section(
+        {"risk_register": {"feat-x": [e]}})
+    assert ("**a real Chrome/CDP session**\n- [ ] **feat-x**: needs a real "
+            "browser session that defers the body") in sec
+
+
+def test_a_self_reported_external_risk_naming_nothing_is_retyped(leerie):
+    """External names what a human must supply; one that names nothing is
+    a gap leerie's checks settle — its paths kept for them."""
+    res = _impl(risks=[{"kind": "external_contract_assumption",
+                        "detail": "assumes the upstream header",
+                        "gap": "unverified_external",
+                        "where_paths": ["src/a.ts"]}])
+    res["production_evidence"] = {"exercised": True, "how": "x",
+                                  "observed": "y"}
+    (e,) = leerie._typed_risks(res, "implementer")
+    assert e["gap"] == "test_missing" and e["where_paths"] == ["src/a.ts"]
+
+
+def test_an_entry_an_older_leerie_stored_without_a_resource_never_renders(
+        leerie):
+    """A resumed run's register holds entries typed external with no
+    resource (every unexercised path was): they are not rendered."""
+    sec = leerie._format_pr_end_state_section({"risk_register": {"s": [
+        _ext("Only ran the changed tests; did not exercise the path.",
+             resource=None),
+        _ext("Needs a live origin", resource="a live HTTP origin")]}})
+    assert "Only ran the changed tests" not in sec
+    assert "**a live HTTP origin**\n- [ ] **s**: Needs a live origin" in sec

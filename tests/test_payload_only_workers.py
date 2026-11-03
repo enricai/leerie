@@ -67,15 +67,18 @@ def test_dep_capture_runs_outside_the_checkout(leerie, tmp_path,
     seen = _capture_invokes(leerie, monkeypatch, _DEP_CAPTURE_ENVELOPE)
     asyncio.run(leerie.capture_repo_deps(
         repo, st, caps=_CAPS, models={"dep_capture": "sonnet"},
-        efforts={"dep_capture": None}))
+        efforts={"dep_capture": None}, record_in=Path(st.run_dir)))
     assert seen, "dep_capture never ran; this test proves nothing"
     call = seen[0]
     assert Path(call["cwd"]) == Path(st.run_dir) / "payload-only"
     assert call["listing"] == []
     assert _tools(call["cmd"]) == "Read"
     assert "--dangerously-skip-permissions" not in call["cmd"]
-    # Its input still reached it: the manifest is in the payload.
-    assert (repo / ".leerie" / "config.toml").is_file()
+    # Its input still reached it: what it captured is recorded in the run,
+    # and the checkout is never written (DESIGN §6½ *The operator applies
+    # a capture*).
+    assert (Path(st.run_dir) / leerie.CAPTURED_DEPS_FILE).is_file()
+    assert not (repo / ".leerie" / "config.toml").exists()
 
 
 @pytest.mark.parametrize("skip_perms", [False, True])
@@ -89,7 +92,7 @@ def test_pr_writer_runs_outside_the_checkout(leerie, tmp_path, monkeypatch,
     try:
         asyncio.run(leerie._compose_pr_via_llm(
             st, dict(leerie.DEFAULT_CAPS), {"pr_writer": "sonnet"},
-            {"pr_writer": "medium"}, repo, None))
+            {"pr_writer": "medium"}, None))
     except Exception:
         pass        # git plumbing after the call may fail in a bare repo
     assert seen, "pr_writer never ran; this test proves nothing"

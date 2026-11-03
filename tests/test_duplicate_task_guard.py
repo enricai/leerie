@@ -6,8 +6,6 @@ invisible to each other. Measured: one task ran twice, three minutes apart, for
 branches — one dynamic test route versus two static ones, no persistence versus
 a Prisma migration — with **14 files in collision** and two PRs whose merge
 order matters.
-
-See docs/POSTMORTEM-2026-08-14.md, F10.
 """
 from __future__ import annotations
 

@@ -20,14 +20,14 @@ class TestIsSameDocument:
         text = "hello world\nline two"
         f = tmp_path / "task.md"
         f.write_text(text)
-        assert leerie._is_same_document(f, len(text.encode()), text) is True
+        assert leerie._is_same_document(tmp_path, f, len(text.encode()), text) is True
 
     def test_true_modulo_surrounding_whitespace(self, leerie, tmp_path):
         text = "hello world"
         f = tmp_path / "task.md"
         f.write_text("  \n" + text + "\n\n  ")
         assert leerie._is_same_document(
-            f, len(text.encode()), text
+            tmp_path, f, len(text.encode()), text
         ) is True
 
     def test_false_on_size_mismatch_beyond_threshold(self, leerie, tmp_path):
@@ -36,7 +36,7 @@ class TestIsSameDocument:
         # far longer than `text`, well past the documented 8-byte pre-check
         f.write_text("short" + "x" * 100)
         assert leerie._is_same_document(
-            f, len(text.encode()), text
+            tmp_path, f, len(text.encode()), text
         ) is False
 
     def test_size_precheck_prevents_reading_when_mismatched(
@@ -51,7 +51,7 @@ class TestIsSameDocument:
 
         monkeypatch.setattr(Path, "read_text", _boom, raising=True)
         assert leerie._is_same_document(
-            f, len(text.encode()), text
+            tmp_path, f, len(text.encode()), text
         ) is False
 
     def test_false_for_different_content_same_size(self, leerie, tmp_path):
@@ -59,14 +59,14 @@ class TestIsSameDocument:
         f = tmp_path / "task.md"
         f.write_text("bbbb")
         assert leerie._is_same_document(
-            f, len(text.encode()), text
+            tmp_path, f, len(text.encode()), text
         ) is False
 
     def test_false_on_missing_file(self, leerie, tmp_path):
         text = "hello"
         f = tmp_path / "missing.md"
         assert leerie._is_same_document(
-            f, len(text.encode()), text
+            tmp_path, f, len(text.encode()), text
         ) is False
 
 

@@ -14,8 +14,6 @@ prevent.
 
 `status: "fixed"` mirrors `rule_violations.status`, which has carried this
 distinction in the same schema all along.
-
-See docs/POSTMORTEM-2026-08-14.md, F11 and retraction R4.
 """
 from __future__ import annotations
 

@@ -2,7 +2,7 @@
 
 The resolution logic lives in the bash launcher (`leerie`); these tests
 extract the two real blocks under test — the `_state_dir_default` +
-CLI/env/toml resolution ladder, and the `_validate_state_ownership`
+CLI/env resolution ladder, and the `_validate_state_ownership`
 sidecar check — verbatim out of the launcher (mirroring
 `tests/test_resolve_ec2_vars.py`'s `_extract_resolve_ec2_knob`), rather
 than hand-reproducing them. A hand-copied reproduction is body-blind by
@@ -15,19 +15,19 @@ harness by construction.
 
 Precedence (lowest → highest):
   default ($HOME/.leerie/<basename>)
-  → leerie.toml `state_dir = ...`
   → LEERIE_STATE_DIR env var
   → --state-dir CLI flag
 
-Verified live per N13's documented trap: an inert sabotage (e.g.
-removing the `[ -f "$USER_REPO/leerie.toml" ]` guard around the toml
-read) is not a valid falsification — it passes with or without the
-extraction, since a missing toml file already makes the subsequent
-`grep` fail silently. The discriminating falsification used here is
+There is no leerie.toml tier (DESIGN §6 *No host path comes from a
+repository*): a `state_dir` there stops the launcher before this block runs
+(tests/test_repo_config_names_no_location.py), and this block never reads
+the file, which `test_toml_state_dir_is_never_read` pins.
+
+The discriminating falsification used here is
 inverting the CLI/env precedence in the resolution ladder (moving the
 `--state-dir` CLI block ahead of the env-var block so CLI no longer
 wins): with the extraction, `test_cli_overrides_env` and
-`test_precedence_cli_beats_env_beats_toml_beats_default` fail; against
+`test_precedence_cli_beats_env_beats_default` fail; against
 the old hand-copied harness they could not have, since that harness
 never read the launcher's source at all.
 """
@@ -42,7 +42,7 @@ LAUNCHER = REPO_ROOT / "leerie"
 
 
 def _extract_state_dir_block() -> str:
-    """The REAL `_state_dir_default` + CLI/env/toml resolution ladder,
+    """The REAL `_state_dir_default` + CLI/env resolution ladder,
     lifted out of the launcher verbatim, ending at
     `export LEERIE_STATE_HOST_DIR`. See module docstring for the
     body-blindness rationale and the live falsification result."""
@@ -210,47 +210,18 @@ def test_default_path_format(tmp_path):
     assert out == str(fake_home) + "/.leerie/myproject"
 
 
-# ── leerie.toml `state_dir` override ─────────────────────────────────────────
+# ── leerie.toml `state_dir`: never read ──────────────────────────────────────
 
 
-def test_toml_state_dir_overrides_default(tmp_path):
+def test_toml_state_dir_is_never_read(tmp_path):
+    """A repository's leerie.toml naming a state root — inside the checkout,
+    the shape that showed every worker the run's state through /work — moves
+    nothing: the ladder has no file tier."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     user_repo = tmp_path / "myproject"
     user_repo.mkdir()
-    toml_dir = tmp_path / "custom-state"
-    (user_repo / "leerie.toml").write_text(f"state_dir = {toml_dir}\n")
-    out, _ = _run(user_repo, fake_home, {}, [])
-    assert out == str(toml_dir)
-
-
-def test_toml_state_dir_quoted_value(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    toml_dir = str(tmp_path / "quoted-state")
-    (user_repo / "leerie.toml").write_text(f'state_dir = "{toml_dir}"\n')
-    out, _ = _run(user_repo, fake_home, {}, [])
-    assert out == toml_dir
-
-
-def test_toml_state_dir_tilde_expansion(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    (user_repo / "leerie.toml").write_text("state_dir = ~/mystate\n")
-    out, _ = _run(user_repo, fake_home, {}, [])
-    assert out == str(fake_home) + "/mystate"
-
-
-def test_toml_unrelated_key_leaves_default(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    (user_repo / "leerie.toml").write_text("runtime = local\n")
+    (user_repo / "leerie.toml").write_text('state_dir = ".lstate"\n')
     out, _ = _run(user_repo, fake_home, {}, [])
     assert out == str(fake_home) + "/.leerie/myproject"
 
@@ -264,18 +235,6 @@ def test_env_overrides_default(tmp_path):
     user_repo = tmp_path / "myproject"
     user_repo.mkdir()
     env_dir = str(tmp_path / "env-state")
-    out, _ = _run(user_repo, fake_home, {"LEERIE_STATE_DIR": env_dir}, [])
-    assert out == env_dir
-
-
-def test_env_overrides_toml(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    toml_dir = str(tmp_path / "toml-state")
-    env_dir = str(tmp_path / "env-state")
-    (user_repo / "leerie.toml").write_text(f"state_dir = {toml_dir}\n")
     out, _ = _run(user_repo, fake_home, {"LEERIE_STATE_DIR": env_dir}, [])
     assert out == env_dir
 
@@ -325,33 +284,17 @@ def test_cli_overrides_env(tmp_path):
     assert out == cli_dir
 
 
-def test_cli_overrides_toml(tmp_path):
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    user_repo = tmp_path / "myproject"
-    user_repo.mkdir()
-    toml_dir = str(tmp_path / "toml-state")
-    cli_dir = str(tmp_path / "cli-state")
-    (user_repo / "leerie.toml").write_text(f"state_dir = {toml_dir}\n")
-    out, _ = _run(user_repo, fake_home, {}, [f"--state-dir={cli_dir}"])
-    assert out == cli_dir
-
-
 # ── precedence summary ────────────────────────────────────────────────────────
 
 
-def test_precedence_cli_beats_env_beats_toml_beats_default(tmp_path):
-    """Full precedence ladder: CLI wins over env wins over toml wins over default."""
+def test_precedence_cli_beats_env_beats_default(tmp_path):
+    """Full precedence ladder: CLI wins over env wins over default."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     user_repo = tmp_path / "myproject"
     user_repo.mkdir()
-    toml_dir = str(tmp_path / "toml-state")
     env_dir = str(tmp_path / "env-state")
     cli_dir = str(tmp_path / "cli-state")
-    (user_repo / "leerie.toml").write_text(f"state_dir = {toml_dir}\n")
-
-    # All three set; CLI should win.
     out, _ = _run(
         user_repo,
         fake_home,
@@ -359,16 +302,10 @@ def test_precedence_cli_beats_env_beats_toml_beats_default(tmp_path):
         [f"--state-dir={cli_dir}"],
     )
     assert out == cli_dir
-
-    # Remove CLI; env should win over toml.
-    out, _ = _run(
-        user_repo, fake_home, {"LEERIE_STATE_DIR": env_dir}, []
-    )
+    out, _ = _run(user_repo, fake_home, {"LEERIE_STATE_DIR": env_dir}, [])
     assert out == env_dir
-
-    # Remove env; toml should win over default.
     out, _ = _run(user_repo, fake_home, {}, [])
-    assert out == toml_dir
+    assert out == str(fake_home) + "/.leerie/myproject"
 
 
 # ── ownership sidecar (.owner) ───────────────────────────────────────────────

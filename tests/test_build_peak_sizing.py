@@ -129,10 +129,20 @@ def test_slots_are_shared_through_the_host_dir(leerie, tmp_path, monkeypatch):
     st = _St(tmp_path, {"blt_peak": {"slots": 2}})
     assert leerie._build_sem_dir(st) == host / "build-slots"
 
+    # Two holders, each in its own task, both holding the run's lock
+    # shared (the lock, then the slot): each gets its own slot.
     async def go():
-        async with leerie._build_class_slot(st, label="a") as a, \
-                leerie._build_class_slot(st, label="b") as b:
-            return a, b
+        both = asyncio.Event()
+        held: list = []
+
+        async def hold(label):
+            async with leerie._build_class_slot(st, label=label) as slot:
+                held.append(slot)
+                if len(held) == 2:
+                    both.set()
+                await asyncio.wait_for(both.wait(), 10)
+                return slot
+        return await asyncio.gather(hold("a"), hold("b"))
     assert sorted(_run(go())) == [0, 1]
 
 

@@ -85,7 +85,11 @@ def main(argv: list[str]) -> int:
     from pathlib import Path
     # The worker's own CLI configuration and temp directories, from the
     # builder every confined spawn uses, and the run's shared caches.
-    env.update(leerie._confined_cli_env(Path(run_dir), argv[4]))
+    own = leerie._confined_cli_env(Path(run_dir), argv[4])
+    # The integrator runs after this process exits: its temp directory is
+    # the collection's to remove (`guard_tmp`), not this exit's.
+    leerie._PRIVATE_TMPS.pop(own["TMPDIR"], None)
+    env.update(own)
     cached = leerie._worker_cache_env(os.environ, Path(run_dir))
     env.update({k: v for k, v in cached.items()
                 if os.environ.get(k) != v})
@@ -116,7 +120,7 @@ def main(argv: list[str]) -> int:
         ["--settings", settings],
         leerie._cli_pinned_env({**genv, **env}))[1]
     confine = " ".join(shlex.quote(w) for w in
-                       leerie._confined_argv(grants, [])[:-1])
+                       leerie._confined_argv(grants, [], cli=True)[:-1])
     disallowed = leerie.DISALLOWED_TOOLS + (
         "," + guard["deny"] if guard["deny"] else "")
     notice = "".join(f"\nNOTE FROM ORCHESTRATOR: {n}" for n in notices)
@@ -127,7 +131,8 @@ def main(argv: list[str]) -> int:
         f"guard_notice={shlex.quote(notice)}\n"
         f"guard_settings={shlex.quote(settings)}\n"
         f"guard_env=({env_words})\n"
-        f"guard_confine=({confine} --)\n")
+        f"guard_confine=({confine} --)\n"
+        f"guard_tmp={shlex.quote(own['TMPDIR'])}\n")
     return 0
 
 

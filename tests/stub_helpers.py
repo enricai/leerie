@@ -53,6 +53,23 @@ exec "$@"
     stub.chmod(0o755)
 
 
+def _make_stub_ssh_agent(stub_dir: Path) -> None:
+    """No-op `ssh-agent` for a test whose subject is not the agent.
+
+    The Fly seed reaches `require_fly_ssh`, whose `_leerie_fly_agent_ensure`
+    starts leerie's private agent under `$HOME/.cache/leerie/agent/`. It
+    daemonizes, so nothing the test runs stops it: every seed test leaked
+    one per pytest session (conftest's `pytest_sessionfinish` now fails a
+    session that leaks one). With this stub on the stubbed PATH the spawn
+    starts nothing; `ssh-add -l` then reports no agent and `require_fly_ssh`
+    asks the stub `flyctl` for a certificate, which is all the seed needs.
+    Builtins only: a stub never runs a program found on PATH.
+    """
+    stub = stub_dir / "ssh-agent"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+
+
 def _stub_timeout(bin_dir: Path) -> None:
     """Real, group-killing `timeout` stub.
 

@@ -862,9 +862,20 @@ class TestRecaptureEndToEnd:
         assert result_force.returncode == 0, (
             f"stderr: {result_force.stderr}\nstdout: {result_force.stdout}"
         )
-        # git should appear in config.toml.
+        # The capture is recorded in the run it recaptured, with the command
+        # that applies it; the config is written only by that command
+        # (DESIGN §6½ *The operator applies a capture*).
+        assert (leerie_dir / "config.toml").read_text() == ""
+        rec = json.loads((run_dir / "captured-deps.json").read_text())
+        assert rec[-1]["setup_packages"] == ["git"] and rec[-1]["replace"]
+        assert "--apply-capture run-001" in (
+            result_force.stdout + result_force.stderr)
+        applied = _run_real_config_arm_with_state(
+            user_repo, ["--apply-capture", "run-001"], tmp_path,
+            state_dir=state_dir)
+        assert applied.returncode == 0, applied.stderr
         content = (leerie_dir / "config.toml").read_text()
-        assert "git" in content, "force recapture must write new deps"
+        assert "git" in content, "the applied recapture must write new deps"
 
     def test_recapture_leaves_generated_dockerfile_intact(self, tmp_path):
         """--recapture must NOT remove an existing generated Dockerfile."""

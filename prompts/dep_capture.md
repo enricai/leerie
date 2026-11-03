@@ -24,10 +24,17 @@ reinstalling them every run.
   package like `tenacity` or a JS package is NOT a setup_package; it belongs in a
   language install. Only include apt packages workers actually had to install.
   Do NOT include base-image packages (git, curl, ca-certificates, python3, bash).
+  Each item is one bare Debian package name (lowercase letters, digits, `+`,
+  `-`, `.`), with no version, release, flag or other word: leerie refuses a
+  capture holding anything else.
 
 - `language_installs`: per-manager installs the Dockerfile should bake. Each entry:
-  - `manager`: pip, pnpm, npm, yarn, uv, poetry, cargo, go, bundle, composer, etc.
-  - `command`: the install command (e.g. "pip install -r requirements.txt").
+  - `manager`: one of pnpm, yarn, npm, uv, poetry, pipenv, pip, pip3, go, cargo,
+    bundle, composer, dotnet. Leerie bakes only these, each with its own install
+    command; an entry for any other manager is dropped.
+  - `command`: the install command you observed (e.g. "pip install -r
+    requirements.txt"). Leerie records the command it runs for the manager,
+    never this one.
   - `copy_inputs`: repo-relative paths the command reads (e.g. ["requirements.txt"],
     ["package.json","pnpm-lock.yaml"]). Omit if uncertain; code validates paths.
 

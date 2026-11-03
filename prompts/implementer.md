@@ -395,6 +395,15 @@ a mechanical issue and costs you a retry.
 Node repo and this one is Python; the branch only runs on Fly. Saying so is
 required and useful. Silence is what is forbidden.
 
+When the cause is an **external resource no step inside this container can
+supply** — a live third-party service, a real browser session, a cloud
+account, a physical device — also name it in `unexercisable_resource`
+("a real Chrome/CDP session"). Only a named resource goes to the PR's
+"Needs human verification" list. Leave it empty for anything else: a
+docs- or test-only diff, a path you simply did not run, a missing install
+or a failing tool here — the orchestrator measures those itself (its own
+test, type-check and coverage runs) and sends the work back if they fail.
+
 Why this exists: a fix once ticked every criterion against a
 `.leerie/config.toml` fixture declaring a Node heap inline — a shape **0 of
 the 5 repos this project manages use** — and returned `None` on both repos

@@ -208,7 +208,7 @@ def test_fly_runtime_requires_app_env(tmp_path):
 def test_records_accepted_defects_and_timestamp(tmp_path):
     """The accepted-finding record must preserve what was waived (the
     dropped defects list) and when, not just flip the bool
-    (docs/POSTMORTEM-2026-08-14.md, F16)."""
+    (tests/test_accept_verbs_keep_their_evidence.py)."""
     sf = _make_state(
         tmp_path,
         {"feat-001": {"defects": ["INTEGRATION_DEFECT dropped call site"],

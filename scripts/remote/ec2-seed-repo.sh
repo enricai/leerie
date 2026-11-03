@@ -25,8 +25,8 @@
 #      containing exactly one file, since ec2_tar_pipe's receiver is
 #      `tar -xzC <dir>`, not a bare `cat >`). The instance then
 #      `git clone`s from the bundle (or untars + checks out the shallow
-#      .git), wires submodule URLs to their bundles, and runs
-#      `git -c protocol.file.allow=always submodule update --recursive`.
+#      .git) and checks out each bundled submodule, nested ones too,
+#      from its bundle (`_seed_machine_submodules`).
 #      Delivers committed state only.
 #
 #   2. `ec2_seed_repo_dirty` — laptop rsync's the dirty/untracked delta
@@ -142,8 +142,7 @@ _ec2_pipe_file_via_tar() {
     return "$rc"
   fi
   # tar preserves the source basename; rename to the requested remote name
-  # when they differ (the submodule bundle path flattens displaypath with
-  # "/" -> "_", which the source basename may not already match).
+  # when they differ.
   if [ "$(basename "$local_file")" != "$remote_name" ]; then
     ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" \
       "mv '$extract_dir/$(basename "$local_file")' '$extract_dir/$remote_name'" \
@@ -175,7 +174,7 @@ _ec2_seed_shallow_parent() {
   trap "rm -rf '$_tmp_shallow'" RETURN
   if ! git clone --quiet --depth="$LEERIE_SEED_DEPTH" --no-local \
          --branch "$_branch" "file://$USER_REPO" "$_tmp_shallow/repo" 2>/dev/null; then
-    remote_log "ec2_seed_repo: shallow clone (depth=$LEERIE_SEED_DEPTH) of $_branch failed"
+    remote_log "ec2_seed_repo: shallow clone (depth=$LEERIE_SEED_DEPTH) of $(_terminal_safe "$_branch") failed"
     return 1
   fi
 
@@ -219,13 +218,13 @@ ec2_seed_repo_clone() {
     if [ -z "$_branch" ] || [ "$_branch" = "HEAD" ]; then
       remote_log "ec2_seed_repo: detached/unresolvable HEAD; using full bundle (shallow needs a named branch)"
     elif ! _seed_branch_shallow_safe "$_branch"; then
-      remote_log "ec2_seed_repo: branch '$_branch' has non-shell-safe characters; using full bundle instead of shallow"
+      remote_log "ec2_seed_repo: branch '$(_terminal_safe "$_branch")' has non-shell-safe characters; using full bundle instead of shallow"
     else
       _shallow=true
     fi
   fi
   if [ "$_shallow" = "true" ]; then
-    remote_log "remote: seeding — shallow-cloning $USER_REPO ($_branch, .git > ${LEERIE_SEED_SHALLOW_THRESHOLD_MB}MB, depth=$LEERIE_SEED_DEPTH) + submodules to /work (ec2) ..."
+    remote_log "remote: seeding — shallow-cloning $USER_REPO ($(_terminal_safe "$_branch"), .git > ${LEERIE_SEED_SHALLOW_THRESHOLD_MB}MB, depth=$LEERIE_SEED_DEPTH) + submodules to /work (ec2) ..."
   else
     remote_log "remote: seeding — bundling $USER_REPO (parent + submodules) to /work (ec2) ..."
   fi
@@ -269,9 +268,9 @@ ec2_seed_repo_clone() {
   fi
 
   # 2. Bundle each submodule recursively, pipe each into
-  #    /tmp/leerie-subs/<flattened-displaypath>.bundle. Same displaypath
-  #    flattening ("/" -> "_") as seed-repo.sh, applied identically here
-  #    and in the machine-side clone script (step 3) below.
+  #    /tmp/leerie-subs/<hex of the displaypath>.bundle
+  #    (`_seed_bundle_name`), as seed-repo.sh does; the machine-side clone
+  #    script (step 3) below computes the same name.
   if [ -f "$USER_REPO/.gitmodules" ]; then
     local _hb_pid_subs _tmp_subs
     _tmp_subs="$(mktemp -d -t leerie-subs.XXXXXX)" || return 1
@@ -279,18 +278,17 @@ ec2_seed_repo_clone() {
     trap "rm -rf '$_tmp_subs'" RETURN
     _seed_progress_bg "ec2_seed_repo (submodule bundles)" &
     _hb_pid_subs=$!
+    # Listed by `_seed_submodule_dirs` and bundled from here, never from a
+    # shell git starts inside each submodule (DESIGN §6 *The host never runs
+    # a program the checkout chose*).
     if ! (
-      # shellcheck disable=SC2016  # single quotes are REQUIRED: $displaypath
-      # and $bn are expanded by git's own `foreach` shell, never by this one
-      cd "$USER_REPO" && \
-      LEERIE_EC2_INSTANCE_ID="$LEERIE_EC2_INSTANCE_ID" \
-      LEERIE_EC2_SSH_TARGET="$LEERIE_EC2_SSH_TARGET" \
-      LEERIE_TMP_SUBS="$_tmp_subs" \
-      git submodule --quiet foreach --recursive '
-        bn="$(printf %s "$displaypath" | tr / _).bundle"
-        git bundle create "$LEERIE_TMP_SUBS/$bn" --all 2>/dev/null \
-          || { echo "leerie: ec2_seed_repo: failed to bundle submodule $displaypath" >&2; exit 1; }
-      '
+      set -o pipefail
+      _seed_submodule_dirs "$USER_REPO" | while IFS= read -r -d '' _sm_disp \
+          && IFS= read -r -d '' _sm_dir; do
+        bn="$(_seed_bundle_name "$_sm_disp")"
+        git -C "$_sm_dir" bundle create "$_tmp_subs/$bn" --all 2>/dev/null </dev/null \
+          || { echo "leerie: ec2_seed_repo: failed to bundle a submodule" >&2; exit 1; }
+      done
     ); then
       kill "$_hb_pid_subs" 2>/dev/null || true
       wait "$_hb_pid_subs" 2>/dev/null || true
@@ -332,22 +330,18 @@ cd /work'
   _machine_script="$(cat <<'MACHINE_SCRIPT'
 set -e
 __PARENT_MATERIALIZE__
-if [ -f .gitmodules ]; then
-  git submodule init
-  git submodule status | awk "{print \$2}" | while read sm; do
-    bn=$(printf %s "$sm" | tr / _).bundle
-    if [ -f "/tmp/leerie-subs/$bn" ]; then
-      git config "submodule.$sm.url" "/tmp/leerie-subs/$bn"
-    fi
-  done
-  git -c protocol.file.allow=always submodule update --recursive
-fi
+__SUBMODULES__
 chown -R leerie: /work
 rm -rf __CLEANUP_TMP__
 MACHINE_SCRIPT
 )"
   _machine_script="${_machine_script//__PARENT_MATERIALIZE__/$_parent_materialize}"
   _machine_script="${_machine_script//__CLEANUP_TMP__/$_cleanup_tmp}"
+  # Spliced, not `${…//…/…}`-replaced: bash 5.2 reads `&` in a replacement
+  # as the matched text, and the snippet holds `&&`.
+  local _subs
+  _subs="$(_seed_machine_submodules /tmp/leerie-subs)"
+  _machine_script="${_machine_script%%__SUBMODULES__*}${_subs}${_machine_script#*__SUBMODULES__}"
 
   local _mode="clone-from-bundle"
   [ "$_shallow" = "true" ] && _mode="shallow-untar"
@@ -393,7 +387,13 @@ ec2_seed_repo_dirty() {
 
   local claude_files=""
   if [ -d "$USER_REPO/.claude" ]; then
-    claude_files="$(cd "$USER_REPO" && find .claude -type f 2>/dev/null)"
+    # `find` started from here and handed the directory, never from the
+    # checkout (DESIGN §6 *The host never runs a program the checkout
+    # chose*); each path is made checkout-relative as before.
+    claude_files="$(find "$USER_REPO/.claude" -type f 2>/dev/null \
+                    | while IFS= read -r _cf; do
+                        printf '%s\n' "${_cf#"$USER_REPO"/}"
+                      done)"
   fi
 
   if [ -z "$dirty_files" ] && [ -z "$claude_files" ]; then

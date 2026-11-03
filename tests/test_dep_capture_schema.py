@@ -261,14 +261,20 @@ def test_dep_capture_schema_rejects_language_installs_item_missing_command(leeri
 # and, under `--recapture --force` (replace path), could blank a good config.
 # minLength:1 enforces "no empty names" at the schema layer (DESIGN §12).
 
-def test_dep_capture_schema_declares_minlength_on_string_fields(leerie):
+def test_dep_capture_schema_declares_nonempty_string_fields(leerie):
     """Structural pin (works without jsonschema): setup_packages items and the
-    language_installs manager/command carry minLength:1."""
+    language_installs manager carry a pattern no empty string matches (the
+    Debian package-name and manager patterns, DESIGN §6½ *A capture names
+    packages and managers, never commands*), and command minLength:1."""
+    import re
     schema = leerie.SCHEMAS["dep_capture"]
     props = schema["properties"]
-    assert props["setup_packages"]["items"].get("minLength") == 1
+    pkg = props["setup_packages"]["items"]
+    assert pkg.get("pattern") == leerie.DEBIAN_PACKAGE_PATTERN
     li_item = props["language_installs"]["items"]["properties"]
-    assert li_item["manager"].get("minLength") == 1
+    assert li_item["manager"].get("pattern") == leerie.CAPTURE_MANAGER_PATTERN
+    for pat in (pkg["pattern"], li_item["manager"]["pattern"]):
+        assert not re.search(pat, "")
     assert li_item["command"].get("minLength") == 1
 
 

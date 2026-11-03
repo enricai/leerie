@@ -317,14 +317,14 @@ class TestParseRepoFileDegrade:
     def test_unsupported_extension_returns_empty(self, leerie, tmp_path):
         f = tmp_path / "binary.xyz"
         f.write_bytes(b"\x00\x01\x02\x03")
-        defs, refs = leerie._parse_repo_file(f)
+        defs, refs = leerie._parse_repo_file(f.parent, f)
         assert defs == []
         assert refs == []
 
     def test_markdown_file_returns_empty(self, leerie, tmp_path):
         f = tmp_path / "README.md"
         f.write_text("# Hello\n\nsome text\n")
-        defs, refs = leerie._parse_repo_file(f)
+        defs, refs = leerie._parse_repo_file(f.parent, f)
         # Markdown may not have a tree-sitter grammar in the pack;
         # either way defs should be empty (no function/class defs in MD)
         assert isinstance(defs, list)
@@ -333,14 +333,14 @@ class TestParseRepoFileDegrade:
     def test_python_file_returns_defs(self, leerie, tmp_path):
         f = tmp_path / "example.py"
         f.write_text("def my_func(x): return x\n\nclass MyClass: pass\n")
-        defs, refs = leerie._parse_repo_file(f)
+        defs, refs = leerie._parse_repo_file(f.parent, f)
         assert "my_func" in defs
         assert "MyClass" in defs
 
     def test_python_calls_returned_as_refs(self, leerie, tmp_path):
         f = tmp_path / "caller.py"
         f.write_text("def caller():\n    result = callee()\n    return result\n")
-        defs, refs = leerie._parse_repo_file(f)
+        defs, refs = leerie._parse_repo_file(f.parent, f)
         assert "caller" in defs
         assert "callee" in refs
 

@@ -332,8 +332,7 @@ def test_both_sites_share_the_builder(leerie, monkeypatch, tmp_path):
     assert smoke[smoke.index("--disallowedTools") + 1] == \
         leerie.DISALLOWED_TOOLS
     assert worker[worker.index("--disallowedTools") + 1] == \
-        leerie.DISALLOWED_TOOLS + ",Edit(//work/**)" \
-        + f",Read(/{fake_run_dir()}/sysprompt/**)"
+        leerie.DISALLOWED_TOOLS + ",Edit(//work/**)"
 
     # (b) break the single owner — BOTH must lose it. A site that rebuilt its
     #     own argv would keep the flag here and fail.

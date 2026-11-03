@@ -3,7 +3,7 @@ opt-out that suppresses the held-out acceptance sets and gate (DESIGN §8
 *Held-out acceptance tests*).
 
 Covers the precedence order: CLI flag → LEERIE_SKIP_ACCEPTANCE_CHECK env
-var → skip_acceptance_check in leerie.toml → False.
+var → False (no leerie.toml tier).
 
 Mirrors test_resolve_skip_base_baseline.py — both resolvers share
 `_resolve_bool_pref`, so this file locks the wiring (env var name +
@@ -39,11 +39,13 @@ def test_env_set_true(leerie, repo_root, monkeypatch):
         repo_root, cli_value=False) is True
 
 
-def test_file_set_true_no_env(leerie, repo_root):
+def test_file_is_never_read(leerie, repo_root):
+    """A waiver is the operator's (DESIGN §6 *A repository chooses no
+    operator authority*): `skip_acceptance_check = true` in leerie.toml is not taken."""
     (repo_root / "leerie.toml").write_text(
         "skip_acceptance_check = true\n")
     assert leerie.resolve_skip_acceptance_check(
-        repo_root, cli_value=False) is True
+        repo_root, cli_value=False) is False
 
 
 def test_env_wins_over_file(leerie, repo_root, monkeypatch):

@@ -326,6 +326,10 @@ _JUSTIFIED_DENYLISTED = {
     # ran*). A host value would point the launcher's bring-back at a file
     # it never reads.
     "LEERIE_RUN_ID_FILE",
+    # Launcher-computed: whether the run starts on a repository image (the
+    # orchestrator stops one with no worker root). A host value would
+    # contradict the image the launcher actually started.
+    "LEERIE_REPO_IMAGE",
 }
 
 

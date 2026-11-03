@@ -1,4 +1,4 @@
-"""Tests for the --runtime / LEERIE_RUNTIME / leerie.toml `runtime` launcher knob.
+"""Tests for the --runtime / LEERIE_RUNTIME launcher knob (no leerie.toml tier).
 
 The parsing logic lives in the bash launcher (`leerie`). These tests EXTRACT
 that block verbatim from the launcher and run it, rather than reproducing it
@@ -14,7 +14,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Precedence (lowest → highest): default → TOML → env → CLI.
+# Precedence (lowest → highest): default → env → CLI.
 LAUNCHER = REPO_ROOT / "leerie"
 LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
 
@@ -135,10 +135,14 @@ def test_leerie_runtime_ec2(tmp_path):
 # ── canonical TOML `runtime` ─────────────────────────────────────────────────
 
 
-def test_toml_runtime_fly(tmp_path):
+def test_toml_runtime_is_never_read(tmp_path):
+    """Where worker code runs is the operator's (DESIGN §6 *A repository
+    chooses no operator authority*); the launcher stops on the key before
+    this block (tests/test_repo_config_chooses_no_authority.py), and the
+    block itself reads no file."""
     (tmp_path / "leerie.toml").write_text("runtime = fly\n")
     out, _ = _run(tmp_path, {}, [])
-    assert out == "fly"
+    assert out == "local"
 
 
 def test_toml_runtime_local_explicit(tmp_path):
@@ -147,17 +151,16 @@ def test_toml_runtime_local_explicit(tmp_path):
     assert out == "local"
 
 
-def test_toml_runtime_ec2(tmp_path):
+def test_toml_runtime_ec2_is_never_read(tmp_path):
     (tmp_path / "leerie.toml").write_text("runtime = ec2\n")
     out, _ = _run(tmp_path, {}, [])
-    assert out == "ec2"
+    assert out == "local"
 
 
-def test_toml_runtime_invalid_exits_nonzero(tmp_path):
+def test_toml_runtime_invalid_is_never_read(tmp_path):
     (tmp_path / "leerie.toml").write_text("runtime = bogus\n")
-    _, err = _run(tmp_path, {}, [], expect_fail=True)
-    assert "is not one of local|fly|ec2" in err
-    assert "bogus" in err
+    out, _ = _run(tmp_path, {}, [])
+    assert out == "local"
 
 
 def test_toml_runtime_unrelated_key_stays_local(tmp_path):
@@ -262,9 +265,9 @@ def test_runtime_explicit_true_for_env(tmp_path):
     assert _run_explicit(tmp_path, {"LEERIE_RUNTIME": "fly"}, []) == "true"
 
 
-def test_runtime_explicit_true_for_toml(tmp_path):
+def test_runtime_not_explicit_for_toml(tmp_path):
     (tmp_path / "leerie.toml").write_text("runtime = fly\n")
-    assert _run_explicit(tmp_path, {}, []) == "true"
+    assert _run_explicit(tmp_path, {}, []) == "false"
 
 
 def test_runtime_explicit_true_even_when_value_is_the_default(tmp_path):

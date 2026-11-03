@@ -463,7 +463,7 @@ def test_fly_runtime_requires_app_env(tmp_path):
 
 
 def test_records_waiver_metadata_on_accept(tmp_path):
-    """The accepted_blocked record (docs/POSTMORTEM-2026-08-14.md, F16) must
+    """The accepted_blocked record (tests/test_accept_verbs_keep_their_evidence.py) must
     carry enough to reconstruct what was waived, not just that it was."""
     sf = _make_state(tmp_path, {"s1": "blocked"}, blocked={"s1": "needs postgres"})
     r = _run_accept(sf, "s1")

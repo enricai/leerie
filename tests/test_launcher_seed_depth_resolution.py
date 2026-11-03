@@ -153,6 +153,24 @@ def test_garbage_threshold_rejected(tmp_path, bad):
     assert "LEERIE_SEED_SHALLOW_THRESHOLD_MB" in result.stderr
 
 
+@pytest.mark.parametrize("key, name", [
+    ("seed_depth", "LEERIE_SEED_DEPTH"),
+    ("seed_shallow_threshold_mb", "LEERIE_SEED_SHALLOW_THRESHOLD_MB"),
+])
+def test_a_committed_value_reaches_the_terminal_escaped(tmp_path, key, name):
+    """Review round 32, execution X3: a repository's `leerie.toml` value
+    named in the rejection reached the terminal raw, an OSC 52 clipboard
+    write included (DESIGN §6 *No text leerie did not write reaches the
+    operator's terminal as a control sequence*)."""
+    (tmp_path / "leerie.toml").write_text(
+        f'{key} = "1\x1b]52;c;cHduZWQ=\x07"\n')
+    result = _run(tmp_path)
+    assert result.returncode != 0
+    assert name in result.stderr
+    assert "\x1b" not in result.stderr and "\x07" not in result.stderr
+    assert "1\\x1b]52;c;cHduZWQ=\\x07" in result.stderr
+
+
 def test_block_stripped_from_rewritten_args():
     """Coupling test: the two flags must be stripped from REWRITTEN_ARGS
     (launcher-only), so they never reach the orchestrator's strict

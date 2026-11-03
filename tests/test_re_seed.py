@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 from tests.conftest import run_bash
+from tests.stub_helpers import _make_stub_ssh_agent
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_REPO_SH = REPO_ROOT / "scripts" / "remote" / "seed-repo.sh"
@@ -125,6 +126,7 @@ def _stub_flyctl(tmp_path: Path, *, remote_status: str = "started",
         "exit 0\n"
     )
     fake.chmod(0o755)
+    _make_stub_ssh_agent(tmp_path)
 
     # Stub `timeout` so wait_for_fly_ssh_ready works on macOS hosts
     # where /usr/bin doesn't include it. Tests pin PATH to

@@ -105,7 +105,8 @@ def test_debian_cni_before_buildkit_before_rootless() -> None:
 
 def test_debian_buildkit_uses_containerd_worker_variant() -> None:
     # Must be install-buildkit-containerd (containerd worker; leerie's
-    # ensure_base_in_buildkit_ns needs the buildkit namespace), NOT the plain
+    # ensure_base_in_worker_ns needs a worker that reads a containerd
+    # namespace, `default` here), NOT the plain
     # OCI-worker install-buildkit.
     out = _run_linux_install("debian").stdout
     assert "install-buildkit-containerd" in out

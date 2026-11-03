@@ -1,10 +1,10 @@
 """Tests for the launcher's EC2 instance-shape var resolution.
 
 Brings the five `RunInstances`-shape params (AMI, instance type, key name,
-security group, subnet id) up to the same CLI > env > `leerie.toml` >
-(no default) precedence every other leerie knob already has (`FLY_VM_DISK_GB`,
-the shallow-seed knobs). Resolution mirrors `_resolve_seed_knob` exactly,
-minus a default tier — there is no sensible AMI/instance-type/key-pair/
+security group, subnet id) to a CLI > env > (no default) precedence. No
+`leerie.toml` tier: the machine, its network and its identity are the
+operator's (DESIGN §6 *A repository chooses no operator authority*). No
+default tier — there is no sensible AMI/instance-type/key-pair/
 security-group/subnet leerie can pick on the operator's behalf
 (docs/IMPLEMENTATION.md "EC2 instance-lifecycle vars"), so an all-unset var
 falls through to `scripts/remote/ec2-lib.sh`'s `_resolve_ec2_var`, which
@@ -13,7 +13,7 @@ error rather than a bare `${VAR:?}`.
 
 Two things are under test, mirroring the two existing precedent files:
 
-  - The launcher's CLI/env/toml resolution ladder (reproduced here, like
+  - The launcher's CLI/env resolution ladder (reproduced here, like
     `tests/test_launcher_seed_depth_resolution.py` reproduces
     `_resolve_seed_knob`, plus a coupling test pinning the real launcher
     source so a refactor that changes parsing surfaces a failure).
@@ -115,12 +115,12 @@ for arg in "$@"; do
     --ec2-instance-profile)  _prev_ec2_arg="instance-profile" ;;
   esac
 done
-LEERIE_EC2_AMI="$(_resolve_ec2_knob "$_cli_ec2_ami" LEERIE_EC2_AMI ec2_ami)"
-LEERIE_EC2_INSTANCE_TYPE="$(_resolve_ec2_knob "$_cli_ec2_instance_type" LEERIE_EC2_INSTANCE_TYPE ec2_instance_type)"
-LEERIE_EC2_KEY_NAME="$(_resolve_ec2_knob "$_cli_ec2_key_name" LEERIE_EC2_KEY_NAME ec2_key_name)"
-LEERIE_EC2_SECURITY_GROUP="$(_resolve_ec2_knob "$_cli_ec2_security_group" LEERIE_EC2_SECURITY_GROUP ec2_security_group)"
-LEERIE_EC2_SUBNET_ID="$(_resolve_ec2_knob "$_cli_ec2_subnet_id" LEERIE_EC2_SUBNET_ID ec2_subnet_id)"
-LEERIE_EC2_INSTANCE_PROFILE="$(_resolve_ec2_knob "$_cli_ec2_instance_profile" LEERIE_EC2_INSTANCE_PROFILE ec2_instance_profile)"
+LEERIE_EC2_AMI="$(_resolve_ec2_knob "$_cli_ec2_ami" LEERIE_EC2_AMI)"
+LEERIE_EC2_INSTANCE_TYPE="$(_resolve_ec2_knob "$_cli_ec2_instance_type" LEERIE_EC2_INSTANCE_TYPE)"
+LEERIE_EC2_KEY_NAME="$(_resolve_ec2_knob "$_cli_ec2_key_name" LEERIE_EC2_KEY_NAME)"
+LEERIE_EC2_SECURITY_GROUP="$(_resolve_ec2_knob "$_cli_ec2_security_group" LEERIE_EC2_SECURITY_GROUP)"
+LEERIE_EC2_SUBNET_ID="$(_resolve_ec2_knob "$_cli_ec2_subnet_id" LEERIE_EC2_SUBNET_ID)"
+LEERIE_EC2_INSTANCE_PROFILE="$(_resolve_ec2_knob "$_cli_ec2_instance_profile" LEERIE_EC2_INSTANCE_PROFILE)"
 """
 
 _ALL_ENV_VARS = [envname for _, envname, _ in _EC2_VARS]
@@ -191,11 +191,11 @@ def test_env_wins_over_toml(tmp_path, cli_flag, env_name, toml_key):
 
 
 @pytest.mark.parametrize("cli_flag,env_name,toml_key", _EC2_VARS)
-def test_toml_honored_when_cli_and_env_unset(tmp_path, cli_flag, env_name, toml_key):
+def test_toml_is_never_read(tmp_path, cli_flag, env_name, toml_key):
+    """The machine, its network and its identity are the operator's (DESIGN
+    §6 *A repository chooses no operator authority*)."""
     (tmp_path / "leerie.toml").write_text(f'{toml_key} = "from-toml"\n')
-    values = _resolve(tmp_path)
-    idx = [v[1] for v in _EC2_VARS].index(env_name)
-    assert values[idx] == "from-toml"
+    assert _resolve(tmp_path) == ("",) * 6
 
 
 def test_per_var_isolation_cli(tmp_path):
@@ -210,27 +210,18 @@ def test_per_var_isolation_env(tmp_path):
     assert values == ("", "", "key-only", "", "", "")
 
 
-def test_per_var_isolation_toml(tmp_path):
-    """Overriding one var's toml key must not bleed into the others."""
-    (tmp_path / "leerie.toml").write_text('ec2_subnet_id = "subnet-only"\n')
-    values = _resolve(tmp_path)
-    assert values == ("", "", "", "", "subnet-only", "")
-
-
 def test_all_five_resolved_independently_at_once(tmp_path):
     """Each var can be set through a different tier simultaneously without
     cross-contamination."""
-    (tmp_path / "leerie.toml").write_text(
-        'ec2_security_group = "sg-toml"\nec2_subnet_id = "subnet-toml"\n'
-    )
     values = _resolve(
         tmp_path,
         "--ec2-ami", "ami-cli",
         "--ec2-key-name=key-cli-eq",
-        env_extra={"LEERIE_EC2_INSTANCE_TYPE": "t3.env"},
+        env_extra={"LEERIE_EC2_INSTANCE_TYPE": "t3.env",
+                   "LEERIE_EC2_SUBNET_ID": "subnet-env"},
     )
     assert values == (
-        "ami-cli", "t3.env", "key-cli-eq", "sg-toml", "subnet-toml", "",
+        "ami-cli", "t3.env", "key-cli-eq", "", "subnet-env", "",
     )
 
 
@@ -245,8 +236,8 @@ def test_block_present_in_launcher():
     )
     for cli_flag, env_name, toml_key in _EC2_VARS:
         assert cli_flag in src, f"Launcher must scan the {cli_flag} CLI flag."
-        assert f'{env_name} {toml_key})"' in src or f"{env_name} {toml_key})" in src, (
-            f"Launcher's {env_name} resolution (toml key '{toml_key}') has drifted."
+        assert f'{env_name})"' in src, (
+            f"Launcher's {env_name} resolution has drifted."
         )
     # The six flags must be stripped from REWRITTEN_ARGS (launcher-only),
     # so they never reach the orchestrator's strict parse_args().
@@ -308,9 +299,10 @@ def test_resolve_ec2_var_empty_success_when_unset():
 
 def test_instance_profile_three_tiers_disagree(tmp_path):
     """Each tier carries a different value, so a swapped tier order or a
-    tier read from the wrong key yields a different string."""
+    tier read from the wrong key yields a different string; the
+    repository's file is not a tier."""
     (tmp_path / "leerie.toml").write_text('ec2_instance_profile = "prof-toml"\n')
-    assert _resolve(tmp_path)[5] == "prof-toml"
+    assert _resolve(tmp_path)[5] == ""
     assert _resolve(
         tmp_path, env_extra={"LEERIE_EC2_INSTANCE_PROFILE": "prof-env"},
     )[5] == "prof-env"

@@ -762,7 +762,7 @@ def test_no_progress_but_a_recorded_task_restarts_rather_than_dying(
     and nothing to inspect — the run simply has to begin — so it restarts in
     place rather than dying. Calling it "likely corrupt or hand-edited" sent an
     operator hunting a data-integrity problem that did not exist
-    (docs/POSTMORTEM-2026-08-14.md, F15).
+    (tests/test_irreversible_before_valid.py).
 
     Restarting in place rather than requiring a fresh run is deliberate: the
     run directory, its id and its flock already exist, and minting a second run

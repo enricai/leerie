@@ -1,5 +1,7 @@
 """Tests for `_find_pr_template()` — locating the target repo's PR
-template in GitHub's canonical order.
+template in GitHub's canonical order, as committed (a git blob of the
+repository at a commit, never a file of the checkout: DESIGN §6 *Leerie
+never reads through a link a repository holds*).
 
 Covers:
 - Single-template locations (.github/, root, docs/), priority order.
@@ -12,6 +14,7 @@ Covers:
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -19,7 +22,18 @@ import pytest
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     return tmp_path
+
+
+def _find(leerie, repo: Path, override: str | None = None):
+    """Commit the repository as it stands and look for its template at the
+    commit, in its git directory."""
+    (repo / ".keep").write_text("")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
+                    "user.name=t", "commit", "-qm", "x"], check=True)
+    return leerie._find_pr_template(repo / ".git", "HEAD", override)
 
 
 def _write(p: Path, content: str = "TEMPLATE\n") -> None:
@@ -28,45 +42,45 @@ def _write(p: Path, content: str = "TEMPLATE\n") -> None:
 
 
 def test_no_template_returns_none(leerie, repo):
-    assert leerie._find_pr_template(repo) is None
+    assert _find(leerie, repo) is None
 
 
 def test_dot_github_single_wins(leerie, repo):
     _write(repo / ".github/pull_request_template.md", "github-version")
-    result = leerie._find_pr_template(repo)
+    result = _find(leerie, repo)
     assert result is not None
-    path, rel = result
+    rel, text, truncated = result
     assert rel == ".github/pull_request_template.md"
-    assert path.read_text() == "github-version"
+    assert (text, truncated) == ("github-version", False)
 
 
 def test_root_single_when_no_dot_github(leerie, repo):
     _write(repo / "pull_request_template.md", "root-version")
-    result = leerie._find_pr_template(repo)
+    result = _find(leerie, repo)
     assert result is not None
-    _, rel = result
+    rel, _, _ = result
     assert rel == "pull_request_template.md"
 
 
 def test_docs_single_when_no_others(leerie, repo):
     _write(repo / "docs/pull_request_template.md", "docs-version")
-    result = leerie._find_pr_template(repo)
+    result = _find(leerie, repo)
     assert result is not None
-    _, rel = result
+    rel, _, _ = result
     assert rel == "docs/pull_request_template.md"
 
 
 def test_dot_github_beats_root(leerie, repo):
     _write(repo / ".github/pull_request_template.md")
     _write(repo / "pull_request_template.md")
-    _, rel = leerie._find_pr_template(repo)
+    rel, _, _ = _find(leerie, repo)
     assert rel == ".github/pull_request_template.md"
 
 
 def test_root_beats_docs(leerie, repo):
     _write(repo / "pull_request_template.md")
     _write(repo / "docs/pull_request_template.md")
-    _, rel = leerie._find_pr_template(repo)
+    rel, _, _ = _find(leerie, repo)
     assert rel == "pull_request_template.md"
 
 
@@ -74,24 +88,24 @@ def test_multi_dir_alphabetical_first(leerie, repo):
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/zebra.md", "z")
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/alpha.md", "a")
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/middle.md", "m")
-    result = leerie._find_pr_template(repo)
+    result = _find(leerie, repo)
     assert result is not None
-    path, rel = result
+    rel, text, _ = result
     assert rel == ".github/PULL_REQUEST_TEMPLATE/alpha.md"
-    assert path.read_text() == "a"
+    assert text == "a"
 
 
 def test_multi_dir_override_with_md_suffix(leerie, repo):
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/bug.md", "b")
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/feature.md", "f")
-    _, rel = leerie._find_pr_template(repo, override="feature.md")
+    rel, _, _ = _find(leerie, repo, override="feature.md")
     assert rel == ".github/PULL_REQUEST_TEMPLATE/feature.md"
 
 
 def test_multi_dir_override_without_md_suffix(leerie, repo):
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/bug.md", "b")
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/feature.md", "f")
-    _, rel = leerie._find_pr_template(repo, override="feature")
+    rel, _, _ = _find(leerie, repo, override="feature")
     assert rel == ".github/PULL_REQUEST_TEMPLATE/feature.md"
 
 
@@ -100,7 +114,7 @@ def test_multi_dir_override_no_match_falls_back_to_first(leerie, repo):
     # caller logs a warning; we just return the alphabetical default.
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/bug.md", "b")
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/feature.md", "f")
-    _, rel = leerie._find_pr_template(repo, override="nonexistent")
+    rel, _, _ = _find(leerie, repo, override="nonexistent")
     assert rel == ".github/PULL_REQUEST_TEMPLATE/bug.md"
 
 
@@ -109,7 +123,7 @@ def test_single_template_beats_multi_dir(leerie, repo):
     # outranks any PULL_REQUEST_TEMPLATE/ directory.
     _write(repo / ".github/pull_request_template.md", "single")
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/feature.md", "multi")
-    _, rel = leerie._find_pr_template(repo)
+    rel, _, _ = _find(leerie, repo)
     assert rel == ".github/pull_request_template.md"
 
 
@@ -117,25 +131,25 @@ def test_multi_dir_ignores_non_md(leerie, repo):
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/feature.md", "f")
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/README.txt", "ignore")
     _write(repo / ".github/PULL_REQUEST_TEMPLATE/.DS_Store", "ignore")
-    _, rel = leerie._find_pr_template(repo)
+    rel, _, _ = _find(leerie, repo)
     assert rel == ".github/PULL_REQUEST_TEMPLATE/feature.md"
 
 
 def test_multi_dir_empty_returns_none(leerie, repo):
-    (repo / ".github/PULL_REQUEST_TEMPLATE").mkdir(parents=True)
-    # Empty directory with no .md files — should fall through to None,
-    # not crash on sorted([]).
-    assert leerie._find_pr_template(repo) is None
+    # git keeps no empty directory; one with no .md files is the shape
+    # that falls through to None rather than crashing on sorted([]).
+    _write(repo / ".github/PULL_REQUEST_TEMPLATE/notes.txt", "x")
+    assert _find(leerie, repo) is None
 
 
 def test_multi_dir_falls_through_when_empty(leerie, repo):
-    # Empty .github/PULL_REQUEST_TEMPLATE should NOT block discovery of
-    # docs/PULL_REQUEST_TEMPLATE — the loop must keep scanning.
-    (repo / ".github/PULL_REQUEST_TEMPLATE").mkdir(parents=True)
+    # A .github/PULL_REQUEST_TEMPLATE holding no .md should NOT block
+    # discovery of docs/PULL_REQUEST_TEMPLATE — the loop must keep scanning.
+    _write(repo / ".github/PULL_REQUEST_TEMPLATE/notes.txt", "x")
     _write(repo / "docs/PULL_REQUEST_TEMPLATE/feature.md", "docs-f")
-    result = leerie._find_pr_template(repo)
+    result = _find(leerie, repo)
     assert result is not None
-    _, rel = result
+    rel, _, _ = result
     assert rel == "docs/PULL_REQUEST_TEMPLATE/feature.md"
 
 

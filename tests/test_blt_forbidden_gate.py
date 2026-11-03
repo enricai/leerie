@@ -113,6 +113,8 @@ EXEMPT = {
                                 "scripts/sandbox_probe.py under the shim",
     "_require_egress_relay": "preflight's network probe: leerie's own "
                              "inline script under the shim",
+    "_require_worker_view": "the confinement check's probe: leerie's own "
+                            "`test -e` of the view's mark, under the shim",
     "_git_z_output": "git commands with `-z` path output, read as bytes",
     "_ts_script_run": "leerie's own AST scripts (`node` + a scripts/ path), "
                       "confined: the argv its callers build is literal",

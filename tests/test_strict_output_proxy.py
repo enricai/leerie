@@ -523,13 +523,16 @@ def test_flag_defaults_off(leerie, tmp_path):
     assert leerie.resolve_dangerously_force_strict_output(tmp_path, False) is False
 
 
-def test_flag_resolves_from_all_three_tiers(leerie, tmp_path, monkeypatch):
+def test_flag_resolves_from_the_operators_two_tiers_only(leerie, tmp_path,
+                                                          monkeypatch):
+    """CLI and env; never leerie.toml (DESIGN §6 *A repository chooses no
+    operator authority*)."""
     assert leerie.resolve_dangerously_force_strict_output(tmp_path, True) is True
     monkeypatch.setenv(leerie.DANGEROUS_FORCE_STRICT_OUTPUT_ENV, "1")
     assert leerie.resolve_dangerously_force_strict_output(tmp_path, False) is True
     monkeypatch.delenv(leerie.DANGEROUS_FORCE_STRICT_OUTPUT_ENV)
     (tmp_path / "leerie.toml").write_text("dangerously_force_strict_output = true\n")
-    assert leerie.resolve_dangerously_force_strict_output(tmp_path, False) is True
+    assert leerie.resolve_dangerously_force_strict_output(tmp_path, False) is False
 
 
 def test_help_text_discloses_all_four_risks(leerie):
@@ -991,12 +994,17 @@ def test_the_transform_description_is_not_discarded(leerie):
 def test_claude_md_documents_the_flag_with_its_mirrors(leerie):
     """CLAUDE.md's Quick start is where the user-facing flag surface is
     enumerated, and it is loaded into context every session. Both sibling
-    dangerous flags are documented there."""
+    dangerous flags are documented there. The waiver is the operator's (the
+    flag or the environment): a repository's leerie.toml chooses none, so
+    the entry does not offer it, and says setting it there stops the
+    launcher."""
     import pathlib
     text = (pathlib.Path(__file__).resolve().parents[1] / "CLAUDE.md").read_text()
     assert "--dangerously-force-strict-output" in text
     assert leerie.DANGEROUS_FORCE_STRICT_OUTPUT_ENV in text
-    assert "dangerously_force_strict_output = true" in text
+    assert "dangerously_force_strict_output = true" not in text
+    entry = text.split("--dangerously-force-strict-output")[0][-1200:]
+    assert "never\n# leerie.toml" in entry and "stops the launcher" in entry
     assert "DANGEROUS" in text.split("--dangerously-force-strict-output")[0][-1200:], (
         "the Quick start entry must carry the risk, not just the flag name")
 

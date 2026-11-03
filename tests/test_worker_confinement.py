@@ -211,6 +211,34 @@ proc root escape|cat /proc/$$/root{rd}/state.json
             set() if under_tmp else {"user checkout"}), got
 
 
+@pytest.mark.parametrize("fixer", ["implementer", "conformer",
+                                   "surrogate_fixer", "falsifier"])
+def test_no_fixer_reads_what_records_a_held_out_set(leerie, run, fixer):
+    """DESIGN §8 *Hidden from the fixers*: every path the CLI `Read` denies
+    once named for the fixers is refused by the kernel to a shell `cat`
+    too, so those denies were redundant (they are gone: any `Read()` deny
+    makes the CLI refuse ordinary `cd <dir>; grep …` compounds)."""
+    rd = run["run_dir"]
+    files = {
+        "set": rd / "acceptance" / "set-1" / "test_held.py",
+        "eval tree": rd / "worktrees" / f"{RUN_ID}-acceptance-eval" / "t.py",
+        "writer log": rd / "logs" / "acceptance-1.log",
+        "orchestrator.log": rd / "orchestrator.log",
+        "calls.ndjson": rd / "calls.ndjson",
+        "state.json": rd / "state.json",
+        "writer transcript": rd / "workers" / "acceptance_writer-1"
+        / "config" / "projects" / "p" / "s.jsonl",
+    }
+    for f in files.values():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("held\n")
+    g = _grants(leerie, run, schema_key=fixer,
+                notes_id="wt-a" if fixer == "implementer" else None)
+    got = _probe(leerie, g, "\n".join(
+        f"{name}|cat {path}" for name, path in files.items()), run["env"])
+    assert not any(got.values()), got
+
+
 def test_a_judge_in_the_planning_worktree_writes_nothing_of_the_run(
         leerie, run):
     planning = run["wts"]["staging"]
@@ -241,6 +269,75 @@ own tmp|echo x > $TMPDIR/f
 """, run["env"])
     assert {k for k, v in got.items() if v} == {"its cwd", "run repo",
                                                "own tmp"}
+
+
+def test_a_read_only_worker_runs_git_in_a_tree_of_its_own_repository(
+        leerie, run):
+    """A worker that only reads a subtask tree whose repository is its own
+    (`<run>/tree-repos/<tree>/`, DESIGN §6 *A repository per committing tree
+    (I6)*) reads that repository, so its `git` works there; it writes
+    nothing of it (review round 30 execution: a satisfied probe's `git
+    status` failed with "not a git repository")."""
+    rd, wt = run["run_dir"], run["wts"]["wt-a"]
+    tr = rd / "tree-repos" / "wt-a"
+    g = leerie._worker_grants(
+        run_dir=rd, state={}, schema_key="satisfied_probe", cwd=wt,
+        allowed_tools=leerie.SATISFIED_PROBE_TOOLS, env=run["env"])
+    assert str(tr.resolve()) in g.ro
+    assert not [p for p in g.rw if Path(p).is_relative_to(tr.resolve())]
+    got = _probe(leerie, g, f"""
+git status|git -C {wt} status --porcelain
+git log|git -C {wt} log -1 --format=%H
+write tree repo|echo x > {tr}/planted
+move own branch|git -C {wt} update-ref refs/heads/b-wt-a HEAD~0
+write its cwd|echo x > {wt}/f
+""", run["env"])
+    assert got == {"git status": True, "git log": True,
+                   "write tree repo": False, "move own branch": False,
+                   "write its cwd": False}
+
+
+@pytest.mark.parametrize("kind", ["worker", "measurement"])
+def test_no_confined_process_reads_the_hosts_build_slots(
+        leerie, run, tmp_path, monkeypatch, kind):
+    """The host directory every run shares (`LEERIE_HOST_DIR`, its build
+    slots) is in no read grant: `flock` needs only a read-only descriptor
+    and Landlock does not handle it, so a confined process that could open
+    a slot file held every slot from under the other runs (review round 30
+    isolation B1). What lies beside it is still read."""
+    host = tmp_path / "host"
+    (host / "build-slots").mkdir(parents=True)
+    slot = host / "build-slots" / "slot-0"
+    slot.write_text("")
+    beside = tmp_path / "beside"
+    beside.mkdir()
+    (beside / "f").write_text("x\n")
+    monkeypatch.setenv("LEERIE_HOST_DIR", str(host))
+    if kind == "worker":
+        # `tmp_path` lies under the host's `/tmp` (unless TMPDIR moves it),
+        # which no worker grant names (DESIGN §6 *`/tmp` is not a
+        # worker's*): grant it the way conftest's
+        # `_test_tmp_readable_by_measurements` does for the measurement
+        # case, through `_apart`, which must still leave the host directory
+        # out. Without this the worker case read nothing beside it, and
+        # passed only with TMPDIR beneath $HOME.
+        g = _grants(leerie, run)
+        g = g._replace(ro=g.ro + tuple(
+            p for p in leerie._apart([str(tmp_path)], run["state_root"])
+            if p not in g.rw + g.ro))
+    else:
+        g = leerie._measurement_grants(
+            _St(run["user"], run["run_dir"]),
+            run["wts"][f"{RUN_ID}-view-staging"])
+    assert not [p for p in g.ro + g.rw
+                if host.resolve().is_relative_to(os.path.realpath(p))]
+    got = _probe(leerie, g, f"""
+hold a slot|python3 -c 'import fcntl, os; fcntl.flock(os.open("{slot}", os.O_RDONLY), fcntl.LOCK_EX | fcntl.LOCK_NB)'
+list the slots|ls {host}/build-slots
+read beside|cat {beside}/f
+""", {**run["env"], **dict(g.env)})
+    assert got == {"hold a slot": False, "list the slots": False,
+                   "read beside": True}
 
 
 def test_a_temp_dir_that_holds_the_state_root_never_grants_it(
@@ -427,7 +524,7 @@ def test_invoke_spawns_through_the_shim():
     body = body[:body.index("\nasync def ") if "\nasync def " in body
                 else len(body)]
     spawn = body.index("asyncio.create_subprocess_exec(")
-    assert body.index("_confined_argv(grants, list(cmd))") < spawn
+    assert body.index("_confined_argv(grants, list(cmd), cli=True)") < spawn
 
 
 def test_only_the_host_seam_runs_unconfined():
@@ -530,8 +627,8 @@ def test_claude_p_tells_a_shell_worker_its_grant(leerie, run, monkeypatch):
     assert line[0] == "NOTE FROM ORCHESTRATOR: " + \
         leerie._confined_writes_notice(
             seen["grants"][0], cwd=wt,
-            env={**os.environ, "TMPDIR": str(rd / "workers" / "w-True" /
-                                             "tmp"),
+            env={**os.environ, "TMPDIR": str(leerie._worker_tmp(
+                rd / "workers" / "w-True")),
                  "CLAUDE_CONFIG_DIR": str(rd / "workers" / "w-True" /
                                           "config")})
     assert f"`{rd / 'notes' / 'wt-a'}`" in line[0]

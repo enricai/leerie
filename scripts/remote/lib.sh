@@ -383,7 +383,8 @@ $_tail_script"
     _rc=0
     printf '%s' "$_tail_invocation" \
       | flyctl ssh console --app "$_app" --machine "$_machine_id" --pty=false -C "sh -s" \
-        2> >(tee "$_stderr_capture" >&2) \
+        2> >(tee "$_stderr_capture" | _terminal_relay >&2) \
+      | _terminal_relay \
       || _rc=$?
     if [ "$_rc" -eq 0 ]; then
       final_id="$(grep -oE "${_token}[^ ]+" "$_stderr_capture" 2>/dev/null \
@@ -404,7 +405,8 @@ $_tail_script"
     _tail_invocation="${_tail_invocation}
 $_tail_script"
     printf '%s' "$_tail_invocation" \
-      | flyctl ssh console --app "$_app" --machine "$_machine_id" --pty=false -C "sh -s"
+      | flyctl ssh console --app "$_app" --machine "$_machine_id" --pty=false -C "sh -s" \
+      | _terminal_relay
   fi
 }
 

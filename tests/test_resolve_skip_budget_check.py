@@ -3,7 +3,7 @@ opt-out (DESIGN §13 *Budget feasibility — fail fast at the cheapest
 moment*).
 
 Covers the precedence order: CLI flag → LEERIE_SKIP_BUDGET_CHECK env
-var → skip_budget_check in leerie.toml → False (the preflight runs by
+var → False (no leerie.toml tier) (the preflight runs by
 default on every fresh run; resume bypasses it independently because
 the resume path enters past _schedule()).
 
@@ -53,11 +53,13 @@ def test_env_set_false_falls_through_to_default(
         repo_root, cli_value=False) is False
 
 
-def test_file_set_true_no_env(leerie, repo_root):
+def test_file_is_never_read(leerie, repo_root):
+    """A waiver is the operator's (DESIGN §6 *A repository chooses no
+    operator authority*): `skip_budget_check = true` in leerie.toml is not taken."""
     (repo_root / "leerie.toml").write_text(
         "skip_budget_check = true\n")
     assert leerie.resolve_skip_budget_check(
-        repo_root, cli_value=False) is True
+        repo_root, cli_value=False) is False
 
 
 def test_env_wins_over_file(leerie, repo_root, monkeypatch):
@@ -94,12 +96,12 @@ def test_env_garbage_dies(leerie, repo_root, monkeypatch):
             repo_root, cli_value=False)
 
 
-def test_file_garbage_dies(leerie, repo_root):
+def test_file_garbage_is_not_read(leerie, repo_root):
+    """Never read, so not validated either."""
     (repo_root / "leerie.toml").write_text(
         "skip_budget_check = sometimes\n")
-    with pytest.raises(SystemExit):
-        leerie.resolve_skip_budget_check(
-            repo_root, cli_value=False)
+    assert leerie.resolve_skip_budget_check(
+        repo_root, cli_value=False) is False
 
 
 def test_env_empty_string_falls_through(leerie, repo_root, monkeypatch):

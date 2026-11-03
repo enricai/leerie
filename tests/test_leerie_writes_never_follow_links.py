@@ -81,11 +81,11 @@ def test_read_beneath_refuses_a_link_and_a_fifo(leerie, tmp_path):
     (tmp_path / "a").mkdir()
     (tmp_path / "a" / "r").symlink_to(secret)
     with pytest.raises(OSError):
-        leerie._read_beneath(tmp_path / "a", tmp_path / "a" / "r")
+        leerie._read_beneath(tmp_path / "a", tmp_path / "a" / "r", limit=64)
     os.mkfifo(tmp_path / "a" / "p")
     # Refused at once, never waited on for a writer.
     with pytest.raises(OSError):
-        leerie._read_beneath(tmp_path / "a", tmp_path / "a" / "p")
+        leerie._read_beneath(tmp_path / "a", tmp_path / "a" / "p", limit=64)
 
 
 def test_mkdir_private_replaces_a_planted_link_with_a_directory(leerie,
@@ -454,6 +454,7 @@ _LEERIE_ONLY = {
     "_selfcheck_prepare", "_require_heldout_sandbox", "_leerie_stores",
     "_store_fetch_lock", "_acquire_build_slot", "_populate_leerie_store",
     "_sweep_measure_dirs", "_measure_dir_at", "_reap_idle_worktrees",
+    "_reap_launcher_logs",
     "_acceptance_parse_probe", "_acceptance_parse_probe_run",
     "_falsifier_gates", "_drop_lying_index", "_move_view",
     # A grant root itself, whose entry lies in a directory no grant names:
@@ -461,8 +462,6 @@ _LEERIE_ONLY = {
     "_payload_only_cwd", "_acceptance_scope_judge_sets",
     "_ratchet_verifiability", "_worker_grants", "_measurement_grants",
     "preflight",
-    # Host-side: the user's checkout, outside the container.
-    "_write_config_toml_keys",
 }
 _CONFINED = {
     # Runs inside a confined worker's process tree (the re-drive's
@@ -543,5 +542,5 @@ def test_the_converted_sites_write_only_beneath():
                "_probe_case_facts_placed", "_acceptance_report_spec",
                "_redrive_ast_hits", "_rescue_integrator_work",
                "_writable_dirs_to", "_restore_write_bits",
-               "_tree_store_env", "_cache_vars"):
+               "_tree_store_env", "_cache_vars", "_write_config_toml_keys"):
         assert fn not in found, (fn, found.get(fn))

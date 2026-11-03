@@ -22,8 +22,30 @@ import subprocess
 from chain._log import die as _die
 
 
+# git commands that reach a remote, and so start the transport (`ssh`) and
+# the credential helper in git's own working directory.
+_REMOTE_GIT = ("fetch", "push", "ls-remote", "pull")
+
+
 def _run(args: list[str], cwd: str | Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(args, cwd=cwd, check=check, capture_output=True, text=True)
+    """`args` run from `/`. A git command is pointed at the repository
+    `cwd`, never started in it: a version manager's shim on PATH chooses
+    the program it runs from its working directory's version files, and a
+    member repository's content is a worker's (DESIGN §6 *The host never
+    runs a program the checkout chose*). A local command names it with
+    `-C`; one that reaches a remote names its git directory and work tree,
+    so git starts nothing in the checkout either."""
+    if cwd is not None and args[:1] == ["git"]:
+        if len(args) > 1 and args[1] in _REMOTE_GIT:
+            gd = subprocess.run(
+                ["git", "-C", str(cwd), "rev-parse", "--absolute-git-dir"],
+                cwd="/", check=True, capture_output=True, text=True
+            ).stdout.strip()
+            args = ["git", f"--git-dir={gd}", f"--work-tree={cwd}", *args[1:]]
+        else:
+            args = ["git", "-C", str(cwd), *args[1:]]
+    return subprocess.run(args, cwd="/", check=check, capture_output=True,
+                          text=True)
 
 
 def create_stage_branch(repo_path: str | Path, chain_id: str, base_branch: str = "main") -> str:
@@ -99,7 +121,8 @@ def synth_merge_branches(
     """
     repo_path = Path(repo_path)
 
-    fetch = _run(["git", "fetch", "origin"], cwd=repo_path, check=False)
+    fetch = _run(["git", "fetch", "--no-recurse-submodules", "origin"],
+                 cwd=repo_path, check=False)
     if fetch.returncode != 0:
         _die(f"synth_merge_branches: git fetch failed: {fetch.stderr.strip()}")
 

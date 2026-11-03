@@ -96,7 +96,10 @@ def hub(leerie, tmp_path, monkeypatch):
     """301 test files importing one changed module; each takes 3 s serially
     (one repeat of all of them ~15 min, as measured on barnacle). The fake
     runner advances a fake clock by the files' durations plus 5 s start-up
-    and reports a per-file duration for each."""
+    and reports a per-file duration for each. `model` changes the runner:
+    `per_file` is a file's real serial cost, `reported` what its report
+    says (a report excludes the file's import and collection). Like the
+    real capture, a serial run over named files records its own cost."""
     staging = tmp_path / "staging"
     files = [f"src/t{i:03d}.test.ts" for i in range(301)]
     for f in files:
@@ -104,18 +107,23 @@ def hub(leerie, tmp_path, monkeypatch):
         (staging / f).write_text("")
     clock = _Clock()
     calls: list[dict] = []
+    model = {"startup": 5.0, "per_file": 3.0, "reported": 3.0}
 
     async def capture(tree, cmd, st, caps, *, label, log_path, timeout,
                       serial=False, files=None, env_extra=None):
-        cost = 5.0 + 3.0 * len(files or [])
+        cost = model["startup"] + model["per_file"] * len(files or [])
         calls.append({"label": label, "files": list(files or []),
                       "timeout": timeout})
         if cost > timeout:
             clock.t += timeout
             return None
         clock.t += cost
+        durations = {f: model["reported"] for f in files or []}
+        if serial and files:
+            leerie._record_rerun_cost(st, len(files), cost,
+                                      sum(durations.values()))
         return {"ids": [], "files": {}, "kind": "jest-json", "messages": {},
-                "durations": {f: 3.0 for f in files or []}}
+                "durations": durations, "wall_sec": cost}
 
     async def head(_s):
         return "h"
@@ -139,7 +147,13 @@ def hub(leerie, tmp_path, monkeypatch):
     st.data = {}
     st.repo_root = tmp_path
     return {"st": st, "staging": staging, "files": files, "clock": clock,
-            "calls": calls}
+            "calls": calls, "model": model}
+
+
+# Earlier serial reruns of this run, two sizes, matching the fake runner's
+# default cost (5 s start-up, no per-file overhead beyond the reported 3 s).
+_MEASURED = [{"files": 1, "wall_sec": 8.0, "reported_sec": 3.0},
+             {"files": 2, "wall_sec": 11.0, "reported_sec": 6.0}]
 
 
 def _discover(leerie, hub, **caps):
@@ -149,9 +163,11 @@ def _discover(leerie, hub, **caps):
 
 
 def test_hub_file_gets_every_repeat_on_fewer_files(leerie, hub):
-    """Durations already measured (the final run's report): every chosen
-    file gets all 20 repeats, the whole discovery stays inside the budget,
-    and every other coupled file is recorded as skipped."""
+    """Durations already measured (the final run's report), the rerun cost
+    not yet: discovery calibrates two chunks (1 and 2 files, 19 s) to fit
+    it, then every chosen file gets all 20 repeats, the whole discovery
+    stays inside the budget, and every other coupled file is recorded as
+    skipped."""
     hub["st"].data["test_file_durations"] = {f: 3.0 for f in hub["files"]}
     d = _discover(leerie, hub)
     reps = leerie.DEFAULT_CAPS["confirm_intermittent_repeats"]
@@ -160,12 +176,14 @@ def test_hub_file_gets_every_repeat_on_fewer_files(leerie, hub):
     repeats = [c for c in hub["calls"] if "-repeat" in c["label"]]
     assert len(repeats) == reps
     assert all(c["files"] == d["files"] for c in repeats)
-    # (n*3 + 10) * 20 <= 1800  ->  n = 26.
-    assert len(d["files"]) == 26
-    assert len(d["skipped_files"]) == 301 - 26
+    # Fitted: 5 s start-up, 0 s per file. (n*3 + 5) * 20 <= 1781  ->  n = 28.
+    assert d["selection"]["cost"]["startup_sec"] == 5.0
+    assert d["selection"]["cost"]["per_file_sec"] == 0.0
+    assert len(d["files"]) == 28
+    assert len(d["skipped_files"]) == 301 - 28
     assert {x["reason"] for x in d["skipped_files"]} == {"over budget"}
     assert hub["clock"].t <= budget
-    assert d["selection"]["calibration"]["runs"] == 0
+    assert d["selection"]["calibration"]["runs"] == 2
 
 
 def test_unmeasured_hub_is_calibrated_within_one_repeats_share(leerie, hub):
@@ -186,6 +204,7 @@ def test_unmeasured_hub_is_calibrated_within_one_repeats_share(leerie, hub):
 
 def test_one_file_over_budget_runs_no_partial_repeats(leerie, hub):
     hub["st"].data["test_file_durations"] = {f: 600.0 for f in hub["files"]}
+    hub["st"].data["test_run_overhead"] = list(_MEASURED)
     d = _discover(leerie, hub)
     assert d["skipped"] == "over budget"
     assert d["repeats_run"] == 0 and d["files"] == []
@@ -195,7 +214,7 @@ def test_one_file_over_budget_runs_no_partial_repeats(leerie, hub):
 
 def test_gate_wait_does_not_starve_discovery(leerie, hub, monkeypatch):
     """A gate that waits its full 300 s on a loaded host: discovery still
-    sizes to the whole 1800 s budget and chooses the same 26 files it does
+    sizes to the whole 1800 s budget and chooses the same 28 files it does
     with no wait, and the call ends inside gate cap + budget (DESIGN §9
     *Which failures are new*, step 2)."""
     async def slow_gate(_caps, **_k):
@@ -204,26 +223,28 @@ def test_gate_wait_does_not_starve_discovery(leerie, hub, monkeypatch):
                 "readable": True}
     monkeypatch.setattr(leerie, "_confirm_gate", slow_gate)
     hub["st"].data["test_file_durations"] = {f: 3.0 for f in hub["files"]}
+    hub["st"].data["test_run_overhead"] = list(_MEASURED)
     d = _discover(leerie, hub)
     budget = leerie.DEFAULT_CAPS["confirm_budget_sec"]
     assert d["selection"]["budget_sec"] == budget
-    assert len(d["files"]) == 26 and d["repeats_run"] == 20
+    assert len(d["files"]) == 28 and d["repeats_run"] == 20
     assert not d["budget_exhausted"]
     assert 300.0 < hub["clock"].t <= 300.0 + budget
 
 
 def test_a_repeat_the_budget_cut_is_not_counted(leerie, hub):
     """Durations that understate the real cost (2.5 s known, 3 s real):
-    the chosen 32 files' repeats take 101 s each, so the 18th is cut by the
+    the chosen 34 files' repeats take 107 s each, so the 17th is cut by the
     budget. It wrote no report, so it is not a repeat run — counted, it
     would inflate the "failed x of n final runs" a typed row reports — and
     it ends discovery (DESIGN §9 *Sized to the budget*)."""
     hub["st"].data["test_file_durations"] = {f: 2.5 for f in hub["files"]}
+    hub["st"].data["test_run_overhead"] = list(_MEASURED)
     d = _discover(leerie, hub)
-    assert len(d["files"]) == 32
+    assert len(d["files"]) == 34
     repeats = [c for c in hub["calls"] if "-repeat" in c["label"]]
-    assert len(repeats) == 18
-    assert d["repeats_run"] == 17 and d["budget_exhausted"] is True
+    assert len(repeats) == 17
+    assert d["repeats_run"] == 16 and d["budget_exhausted"] is True
     assert hub["clock"].t == leerie.DEFAULT_CAPS["confirm_budget_sec"]
 
 
@@ -234,3 +255,59 @@ def test_capture_records_durations_run_wide(leerie, tmp_path):
     assert st.data["test_file_durations"] == {"a": 1.0, "b": 5.0, "c": 3.0}
     reloaded = json.loads(Path(st.run_dir / "state.json").read_text())
     assert reloaded["test_file_durations"]["b"] == 5.0
+
+
+# --- the rerun cost is measured, not assumed (live a1f5, 0.43.0) -------------
+
+def test_known_durations_that_omit_imports_still_fit_every_repeat(leerie,
+                                                                  hub):
+    """The live shape: every duration known from a report that leaves out
+    each file's import (1 s reported, 3 s real), so the old rule calibrated
+    nothing and planned with an assumed 10 s start-up — 80 files whose
+    repeats each take 243 s, 7 of 20 run. Measured, the start-up (3 s) and
+    the per-file overhead (2 s) size the set so all 20 repeats finish."""
+    hub["model"].update(startup=3.0, per_file=3.0, reported=1.0)
+    hub["st"].data["test_file_durations"] = {f: 1.0 for f in hub["files"]}
+    d = _discover(leerie, hub)
+    cost = d["selection"]["cost"]
+    assert (cost["startup_sec"], cost["per_file_sec"]) == (3.0, 2.0)
+    assert d["repeats_run"] == 20 and d["budget_exhausted"] is False
+    # (n * (1 + 2) + 3) * 20 <= 1800 - 15  ->  n = 28.
+    assert len(d["files"]) == 28
+    assert hub["clock"].t <= leerie.DEFAULT_CAPS["confirm_budget_sec"]
+
+
+def test_no_measured_cost_plans_nothing(leerie, hub):
+    """A first chunk that cannot finish inside one repeat's share leaves no
+    sample: discovery plans nothing rather than plan from an assumption."""
+    hub["model"].update(per_file=200.0)
+    hub["st"].data["test_file_durations"] = {f: 1.0 for f in hub["files"]}
+    d = _discover(leerie, hub)
+    assert d["skipped"] == "overhead not measured"
+    assert d["repeats_run"] == 0 and d["files"] == []
+    assert {x["reason"] for x in d["skipped_files"]} == {
+        "overhead not measured"}
+
+
+@pytest.mark.parametrize("samples, want", [
+    ([], None),
+    ([{"files": 4, "wall_sec": 20.0, "reported_sec": 4.0}], (0.0, 4.0)),
+    ([{"files": 1, "wall_sec": 6.0, "reported_sec": 1.0},
+      {"files": 3, "wall_sec": 12.0, "reported_sec": 3.0}], (3.0, 2.0)),
+    # Overhead falling with size (noise): all of it start-up.
+    ([{"files": 1, "wall_sec": 10.0, "reported_sec": 1.0},
+      {"files": 3, "wall_sec": 8.0, "reported_sec": 3.0}], (7.0, 0.0)),
+])
+def test_rerun_cost_fit(leerie, samples, want):
+    got = leerie._rerun_cost(samples)
+    assert (None if got is None
+            else (got["startup_sec"], got["per_file_sec"])) == want
+
+
+def test_confirm_select_charges_each_unit_its_overhead(leerie):
+    """B* sizing reads the same cost: with 2 s per file on top of 1 s
+    reported, one base/final pair of three units costs (9 + 3) * 2."""
+    sel = leerie._confirm_select(["a", "b", "c"], {"a": 1, "b": 1, "c": 1},
+                                 rank={}, reps=2, budget=20.0, overhead=3.0,
+                                 per_file=2.0)
+    assert sel == {"chosen": ["a", "b"], "sized_out": ["c"]}

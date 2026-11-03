@@ -14,8 +14,6 @@ sibling run spawned three workers, each invoking `new-worktree.sh` and each
 running a bare prune; the rebaser then reported its git metadata directory "has
 vanished … without any destructive action on my part".
 
-See docs/POSTMORTEM-2026-08-14.md, F19.
-
 These tests run the real helper against real git repositories — the mechanism is
 git's, so a stubbed one would prove nothing.
 """

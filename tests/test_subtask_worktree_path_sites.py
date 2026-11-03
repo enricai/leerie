@@ -10,8 +10,11 @@ was built at the same hand-joined path — stayed green.
 The rule, checked on the AST: a `... / "worktrees" / X` join may name a
 string literal, an f-string, a `_worktree_dirname(...)` call, or the
 parameter `name` of the helper-worktree builders (`ci-base`,
-`acceptance-eval`, ... — literal-derived, never a subtask id). Anything
-else is a hand-built subtask path and must go through the helper."""
+`acceptance-eval`, ... — literal-derived, never a subtask id), or a git
+repository's own administrative directory beneath its common dir
+(`common / "worktrees" / <admin name>`, `_admin_dir_of`: git's namespace,
+not leerie's). Anything else is a hand-built subtask path and must go
+through the helper."""
 from __future__ import annotations
 
 import ast
@@ -39,6 +42,8 @@ def _offending_joins(source: str) -> list[tuple[int, str]]:
                 and right.func.id == "_worktree_dirname"):
             continue
         if isinstance(right, ast.Name) and right.id in _ALLOWED_NAMES:
+            continue
+        if isinstance(left.left, ast.Name) and left.left.id == "common":
             continue
         out.append((node.lineno, ast.unparse(node)))
     return out
@@ -69,3 +74,10 @@ def test_helper_matches_the_script_layout(leerie, tmp_path):
     run_dir = tmp_path / "runs" / "20261028-abcdef-cov"
     got = leerie._subtask_worktree_path(run_dir, "feat-001")
     assert got == run_dir / "worktrees" / "20261028-abc-feat-001"
+
+
+def test_a_git_admin_directory_is_not_a_subtask_path():
+    """`_admin_dir_of`'s join names git's own `worktrees/<admin>` beneath a
+    repository's common dir, which leerie never names a subtask by."""
+    assert _offending_joins('d = common / "worktrees" / n') == []
+    assert _offending_joins('d = leerie_dir / "worktrees" / n')

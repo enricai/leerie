@@ -1,9 +1,10 @@
-# Dogfooding override. This repo's basename is `leerie`, so the launcher
-# default would resolve to $HOME/.leerie/leerie/ — adjacent to the
-# installer's clone at $HOME/.leerie/. Pinning state to a dedicated dir
-# keeps the layout unambiguous and lets `./leerie "task"` work zero-config
-# on this repo.
-state_dir = "~/.leerie/_self"
+# Dogfooding: this repo's basename is `leerie`, so the launcher default
+# would resolve to $HOME/.leerie/leerie, which is the installer's own
+# `leerie` executable when leerie was installed by its installer. Set
+# LEERIE_STATE_DIR=~/.leerie/_self (or pass --state-dir) when running leerie
+# on this repo. It can no longer be set here: a repository's leerie.toml
+# never names a host path (DESIGN §6 *No host path comes from a
+# repository*), and a `state_dir` key stops the launcher.
 
 # Effort defaults lowered high→medium after the Opus 5 release to cut per-call
 # output-token volume (Opus 5 thinks by default and emits ~+50% more output

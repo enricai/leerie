@@ -77,6 +77,8 @@ def _fake_orchestrator(tmp_path: Path) -> Path:
     noise = "\n".join(f'print({line!r}, flush=True)' for line in _LOG_NOISE)
     p.write_text(
         "import json\n\n\n"
+        "def admit_operator_import_paths(exclude):\n"
+        "    pass\n\n\n"
         "def run_rebaser(leerie_root, repo_root, run_id, worktree,\n"
         "                run_branch, working_branch, pr_base_branch):\n"
         f"    {noise.replace(chr(10), chr(10) + '    ')}\n"

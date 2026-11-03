@@ -15,7 +15,7 @@ control fell to the `*)` fallback arm on **9 of 9** runs that ever reached the
 rebaser — so the `rebased` and `irreconcilable|failed` arms had never once
 executed, and a rebaser returning a valid `{"status":"failed", …}` with a full
 conflict diagnosis had that diagnosis silently discarded rather than folded into
-the PR body. See docs/POSTMORTEM-2026-08-14.md, F1.
+the PR body.
 
 The rule this file enforces: a seam that imports `orchestrator/leerie.py` may
 have its stdout flow to the operator, and may have its exit code consumed, but
@@ -404,8 +404,8 @@ def test_bash_own_parse_sees_no_capture_in_host_finalize() -> None:
         REPO_ROOT / "scripts" / "host-finalize.sh", "rebaser",
         expect=("host_finalize",))
     assert not offenders, (
-        "these statements consume the rebaser seam's stdout (see "
-        "docs/POSTMORTEM-2026-08-14.md, F1):\n  " + "\n  ".join(offenders))
+        "these statements consume the rebaser seam's stdout (see this "
+        "file's docstring):\n  " + "\n  ".join(offenders))
 
 
 def test_the_canonical_audit_fails_closed_on_an_unparseable_script(tmp_path) -> None:
@@ -541,7 +541,7 @@ def test_no_seam_captures_the_orchestrator_stdout() -> None:
     assert not offenders, (
         "these seams capture the orchestrator's stdout, which carries the log "
         "stream and not a return value — give the seam an explicit output-path "
-        "argument instead (see docs/POSTMORTEM-2026-08-14.md, F1):\n  "
+        "argument instead (see this file's docstring):\n  "
         + "\n  ".join(offenders)
     )
 

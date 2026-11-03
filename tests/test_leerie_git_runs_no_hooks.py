@@ -176,13 +176,52 @@ def test_a_script_run_outside_the_orchestrator_fires_no_hook(leerie,
     assert not fired.exists()
 
 
+_SPAWNS = ("subprocess.run", "subprocess.Popen", "subprocess.call",
+           "subprocess.check_call", "subprocess.check_output",
+           "asyncio.create_subprocess", "os.fork", "os.posix_spawn",
+           "os.spawn", "os.system", "os.exec", "os.popen")
+
+
+def _spawns(module: ast.Module, roots: set[str]) -> set[str]:
+    """The process-starting calls reachable from the functions `roots`
+    through the functions the module defines."""
+    funcs = {n.name: n for n in ast.walk(module)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    seen, todo, found = set(roots), list(roots), set()
+    while todo:
+        fn = funcs.get(todo.pop())
+        if fn is None:
+            continue
+        for c in ast.walk(fn):
+            if not isinstance(c, ast.Call):
+                continue
+            name = ast.unparse(c.func)
+            if name.startswith(_SPAWNS):
+                found.add(name)
+            callee = name.rsplit(".", 1)[-1]
+            if callee not in seen:
+                seen.add(callee)
+                todo.append(callee)
+    return found
+
+
 def test_main_turns_hooks_off_before_anything_spawns(leerie):
-    """Structure, paired with the substance tests above and below: the
-    call is `main()`'s second statement, ahead of `_become_subreaper` and
-    every spawn."""
+    """Structure, paired with the substance tests above and below: in
+    `main()`, the call comes before `_become_subreaper` and before every
+    statement that can start a process — what precedes it reaches no spawn.
+    (A position pinned by index broke when `_guard_terminal_streams()`
+    rightly went first.)"""
+    module = ast.parse(Path(leerie.__file__).read_text())
     body = ast.parse(inspect.getsource(leerie.main)).body[0].body
-    calls = [ast.unparse(s) for s in body[:3]]
-    assert calls[1] == "_git_hooks_off(os.environ)"
+    stmts = [ast.unparse(s) for s in body]
+    at = stmts.index("_git_hooks_off(os.environ)")
+    assert at < stmts.index("_become_subreaper()")
+    before = {c.func.id for s in body[:at] for c in ast.walk(s)
+              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+    assert before, "nothing precedes it: the rule checked nothing"
+    assert _spawns(module, before) == set(), before
+    # The rule sees a spawn where there is one.
+    assert _spawns(module, {"run_proc"})
 
 
 def test_a_worker_spawn_gets_the_hooks_back(leerie, tmp_path, monkeypatch,

@@ -71,6 +71,7 @@ def test_seed_auth_fails_without_credentials_or_token(tmp_path):
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
+            "USER_REPO": str(tmp_path),
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -111,6 +112,7 @@ def test_seed_auth_fails_without_git_identity(tmp_path):
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
+            "USER_REPO": str(tmp_path),
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -141,8 +143,8 @@ def test_seed_auth_succeeds_with_credentials_file(tmp_path):
     fake_git = tmp_path / "git"
     fake_git.write_text(
         "#!/usr/bin/env bash\n"
-        "if [ \"$1\" = 'config' ] && [ \"$2\" = 'user.name' ]; then echo 'Test User'; exit 0; fi\n"
-        "if [ \"$1\" = 'config' ] && [ \"$2\" = 'user.email' ]; then echo 'test@example.com'; exit 0; fi\n"
+        "if [ \"$1\" = '-C' ] && [ \"$3\" = 'config' ] && [ \"$4\" = 'user.name' ]; then echo 'Test User'; exit 0; fi\n"
+        "if [ \"$1\" = '-C' ] && [ \"$3\" = 'config' ] && [ \"$4\" = 'user.email' ]; then echo 'test@example.com'; exit 0; fi\n"
         "exit 0\n"
     )
     fake_git.chmod(0o755)
@@ -151,6 +153,7 @@ def test_seed_auth_succeeds_with_credentials_file(tmp_path):
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
+            "USER_REPO": str(tmp_path),
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -182,8 +185,8 @@ def test_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
     fake_git = tmp_path / "git"
     fake_git.write_text(
         "#!/usr/bin/env bash\n"
-        "if [ \"$1\" = 'config' ] && [ \"$2\" = 'user.name' ]; then echo 'Test User'; exit 0; fi\n"
-        "if [ \"$1\" = 'config' ] && [ \"$2\" = 'user.email' ]; then echo 'test@example.com'; exit 0; fi\n"
+        "if [ \"$1\" = '-C' ] && [ \"$3\" = 'config' ] && [ \"$4\" = 'user.name' ]; then echo 'Test User'; exit 0; fi\n"
+        "if [ \"$1\" = '-C' ] && [ \"$3\" = 'config' ] && [ \"$4\" = 'user.email' ]; then echo 'test@example.com'; exit 0; fi\n"
         "exit 0\n"
     )
     fake_git.chmod(0o755)
@@ -192,6 +195,7 @@ def test_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
+            "USER_REPO": str(tmp_path),
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "my-oauth-token",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -225,6 +229,7 @@ def test_seed_auth_tar_failure_returns_nonzero(tmp_path):
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
+            "USER_REPO": str(tmp_path),
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "PATH": f"{tmp_path}:/usr/bin:/bin",

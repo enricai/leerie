@@ -9,8 +9,6 @@ The launcher forwards the host side of that mount as
 `LEERIE_STATE_HOST_DIR` is on the launcher's env deny-list precisely because a
 host path is meaningless AS A PATH inside the container, and this value inherits
 that restriction — it may be printed and must never be opened.
-
-See docs/POSTMORTEM-2026-08-14.md, F17.
 """
 from __future__ import annotations
 

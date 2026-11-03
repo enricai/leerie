@@ -16,7 +16,7 @@ hand-reproducing the function. A hand-copied reproduction is body-blind by
 construction — the tests would run a string literal defined in this file,
 so no change to the launcher's actual logic could affect them. This
 mattered in practice: the previous hand-copied harness predated the
-function's per-repo-Dockerfile branch (`_FLY_PER_REPO_DOCKERFILE`) and its
+function's per-repo-Dockerfile branch (then `_FLY_PER_REPO_DOCKERFILE`) and its
 switch from bare `echo ... >&2` to `remote_log`, so it was silently testing
 an old shape of the function.
 
@@ -34,20 +34,31 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import LOG_SH_SOURCE
 from tests.fly_stub import make_fake_flyctl
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
 
+DIGEST = "sha256:" + "d" * 64
+
+
 def _extract_ensure_image() -> str:
-    """The REAL `ensure_image()` function, lifted out of the launcher
-    verbatim. See module docstring for the body-blindness rationale and
-    the live falsification result."""
+    """The REAL `ensure_image()` function and its helpers (`_build_job`,
+    `_build_job_end`, `_fly_cache_get`, `_fly_digest_ok`, `_fly_push`),
+    lifted out of the launcher verbatim.
+    See module docstring for the body-blindness rationale and the live
+    falsification result."""
     src = LAUNCHER.read_text()
-    start = src.index("ensure_image() {")
-    end = src.index("\n}\n", start) + len("\n}\n")
-    return src[start:end]
+    start = src.index("# _fly_cache_get <cache-file> <tag>")
+    fn = src.index("ensure_image() {", start)
+    end = src.index("\n}\n", fn) + len("\n}\n")
+    # `_fly_push` runs build-push.sh through `_build_job` (DESIGN §6 *A
+    # repository image's build directory lives only as long as its launch*).
+    job = src.index('_BUILD_JOB_PID=""\n_build_job() {')
+    job_end = src.index("\n}\n", src.index("_build_job_end() {", job)) + 3
+    return src[job:job_end] + src[start:end]
 
 
 # Bash harness wrapping the REAL ensure_image() extracted above.
@@ -65,11 +76,13 @@ def _harness() -> str:
     return (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
+        + LOG_SH_SOURCE +
         # remote_log matches the real _log.sh format closely enough for
         # these tests' substring assertions ("[leerie] ..." on stderr).
         'remote_log() { echo "[leerie] $*" >&2; }\n'
         f"{_extract_ensure_image()}\n"
         'ensure_image "$1"\n'
+        'echo "ref=$FLY_IMAGE_REF"\n'
     )
 
 
@@ -115,7 +128,9 @@ def _run(tag: str, *, env: dict, cwd: Path,
 
 
 def _stub_build_push(repo: Path, *, exit_code: int = 0, log_file: Path | None = None) -> Path:
-    """Write a stub scripts/remote/build-push.sh that records its invocation."""
+    """Write a stub scripts/remote/build-push.sh that records its invocation
+    and, on success, reports `DIGEST` through `--digest-file` (builtins
+    only)."""
     scripts = repo / "scripts" / "remote"
     scripts.mkdir(parents=True)
     bp = scripts / "build-push.sh"
@@ -123,7 +138,14 @@ def _stub_build_push(repo: Path, *, exit_code: int = 0, log_file: Path | None = 
     bp.write_text(
         "#!/usr/bin/env bash\n"
         f'echo "build-push stub invoked: $*" >> {log_arg}\n'
-        f"exit {exit_code}\n"
+        f"[ {exit_code} -eq 0 ] || exit {exit_code}\n"
+        'while [ $# -gt 0 ]; do\n'
+        '  if [ "$1" = "--digest-file" ]; then\n'
+        f'    printf "%s\\n" "{DIGEST}" > "$2"\n'
+        '  fi\n'
+        '  shift\n'
+        'done\n'
+        "exit 0\n"
     )
     bp.chmod(0o755)
     return bp
@@ -141,7 +163,7 @@ def test_cache_hit_skips_build_push(tmp_path: Path):
     cache_dir = cache_home / "leerie"
     cache_dir.mkdir(parents=True)
     (cache_dir / "published-tags.txt").write_text(
-        "registry.fly.io/leerie:0.2.1\n"
+        f"registry.fly.io/leerie:0.2.1 {DIGEST}\n"
     )
 
     # No flyctl stub needed — cache hit skips that step.
@@ -158,6 +180,40 @@ def test_cache_hit_skips_build_push(tmp_path: Path):
     assert not log.exists() or log.read_text() == "", (
         "build-push.sh should not be invoked on cache hit"
     )
+    # The machine starts from the cached digest, never the tag.
+    assert f"ref=registry.fly.io/leerie@{DIGEST}" in result.stdout
+
+
+def test_a_cached_tag_without_a_digest_is_no_hit(tmp_path: Path):
+    """A cache line naming only a tag (as written before digests were
+    recorded) does not make the tag trusted: the image is pushed again and
+    its digest recorded (review round 29, isolation F1)."""
+    repo = tmp_path / "leerie-repo"
+    repo.mkdir()
+    log = tmp_path / "build-push-invocations.log"
+    _stub_build_push(repo, log_file=log)
+    _stub_flyctl(tmp_path, existing_apps=["leerie"])
+    cache_home = tmp_path / "cache"
+    cache_dir = cache_home / "leerie"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "published-tags.txt").write_text(
+        "registry.fly.io/leerie:0.2.1\n")
+
+    result = _run(
+        "registry.fly.io/leerie:0.2.1",
+        env={
+            "XDG_CACHE_HOME": str(cache_home),
+            "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "leerie",
+        },
+        cwd=tmp_path,
+        flyctl_dir=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--tag registry.fly.io/leerie:0.2.1" in log.read_text()
+    assert (cache_dir / "published-tags.txt").read_text().splitlines()[-1] \
+        == f"registry.fly.io/leerie:0.2.1 {DIGEST}"
+    assert f"ref=registry.fly.io/leerie@{DIGEST}" in result.stdout
 
 
 def test_cache_miss_invokes_build_push_and_records_tag(tmp_path: Path):
@@ -182,16 +238,19 @@ def test_cache_miss_invokes_build_push_and_records_tag(tmp_path: Path):
         flyctl_dir=tmp_path,
     )
     assert result.returncode == 0, result.stderr
-    # build-push.sh should have been invoked with --app leerie --push.
+    # build-push.sh should have been invoked with --app leerie --push, for
+    # exactly the tag asked for, reporting its digest.
     assert log.exists(), "build-push.sh should be invoked on cache miss"
     invocation = log.read_text().strip()
     assert "--app leerie --push" in invocation, invocation
+    assert "--tag registry.fly.io/leerie:9.9.9 --digest-file " in invocation
     # No --local-build forwarded by default.
     assert "--local-build" not in invocation, invocation
     # Tag should now be recorded in the cache.
     cache_file = cache_home / "leerie" / "published-tags.txt"
     assert cache_file.exists()
-    assert "registry.fly.io/leerie:9.9.9" in cache_file.read_text()
+    assert cache_file.read_text() == f"registry.fly.io/leerie:9.9.9 {DIGEST}\n"
+    assert f"ref=registry.fly.io/leerie@{DIGEST}" in result.stdout
     # flyctl apps list called, but apps create NOT called (app exists).
     flyctl_log = (tmp_path / "flyctl.log").read_text()
     assert "apps list --json" in flyctl_log
@@ -260,7 +319,7 @@ def test_positive_cache_only_unrelated_tags_still_probe(tmp_path: Path):
     cache_dir = cache_home / "leerie"
     cache_dir.mkdir(parents=True)
     (cache_dir / "published-tags.txt").write_text(
-        "registry.fly.io/leerie:0.1.0\n"
+        f"registry.fly.io/leerie:0.1.0 {DIGEST}\n"
     )
 
     result = _run(
@@ -298,13 +357,14 @@ def test_ensure_image_extraction_contains_load_bearing_lines():
     extracted = _extract_ensure_image()
     sentinels = [
         'cache_file="$cache_dir/published-tags.txt"',
-        'grep -Fxq "$tag" "$cache_file"',
+        '_fly_cache_get "$cache_file" "$tag"',
         # Part H: app auto-create + LOCAL_BUILD forwarding.
         'flyctl apps list --json',
         'flyctl apps create "$fly_app"',
         'build_args=(--app "$fly_app" --push)',
         'build_args+=(--local-build)',
-        'printf \'%s\\n\' "$tag" >> "$cache_file"',
+        'printf \'%s %s\\n\' "$tag" "$_FLY_PUSHED" >> "$cache_file"',
+        '"$build_push" "$@" --tag "$tag" --digest-file "$digest_file"',
     ]
     for s in sentinels:
         assert s in extracted, f"missing in extracted function body: {s}"

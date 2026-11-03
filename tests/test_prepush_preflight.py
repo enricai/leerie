@@ -223,7 +223,7 @@ def test_probe_disables_git_credential_prompts(repo):
     src = HOST_FINALIZE_SH.read_text()
     body = src[src.index("host_prepush_preflight() {"):]
     body = body[:body.index("\nhost_finalize() {")]
-    call = next(ln for ln in body.splitlines() if "push --dry-run" in ln)
+    call = next(ln for ln in body.splitlines() if "--dry-run" in ln and "push" in ln)
     assert "GIT_TERMINAL_PROMPT=0" in call, (
         "the probe can block run start on a credential prompt")
 

@@ -5,8 +5,6 @@ Measured on one repo after three weeks: **1.5 GB** across 71 run dirs and
 left in the user checkout — while leerie's own preflight dies on low disk
 headroom and tells the operator to prune by hand.
 
-See docs/POSTMORTEM-2026-08-14.md, F22.
-
 The verb is dry-run by default: it deletes run directories that may hold the
 only record of a paid-for run, so the safe mode is the one you get without
 asking for it.
@@ -475,3 +473,36 @@ def test_a_live_idle_run_keeps_its_worktrees(tmp_path):
         os.close(fd)
     assert r.returncode == 0, r.stderr
     assert (idle / "worktrees").is_dir()
+
+
+def _dead_pid() -> int:
+    pr = subprocess.Popen(["/bin/true"])
+    pr.wait()
+    return pr.pid
+
+
+def test_launcher_logs_go_with_the_runs(tmp_path):
+    """DESIGN §6 *A launcher's logs go with the same retention*: a log older
+    than the cutoff whose launcher is gone goes; a live launcher's log, a
+    recent one and a dry run keep theirs."""
+    root = tmp_path / "state"
+    (root / "logs").mkdir(parents=True)
+    dead = _dead_pid()
+    old_dead = root / "logs" / f"leerie-{dead}.log"
+    old_live = root / "logs" / f"leerie-{os.getpid()}.log"
+    new_dead = root / "logs" / f"leerie-{dead + 1000000}.log"
+    runlog = root / f".runlog-{dead}"
+    for f in (old_dead, old_live, new_dead, runlog):
+        f.write_text("x" * 2048)
+    for f in (old_dead, old_live, runlog):
+        os.utime(f, (OLD, OLD))
+    repo = _repo(tmp_path)
+    r = _prune(root, repo)
+    assert r.returncode == 0, r.stderr
+    assert "would remove 2 launcher log(s)" in r.stdout
+    assert old_dead.exists() and runlog.exists()
+    r = _prune(root, repo, "--apply")
+    assert r.returncode == 0, r.stderr
+    assert "removed 2 launcher log(s)" in r.stdout
+    assert not old_dead.exists() and not runlog.exists()
+    assert old_live.exists() and new_dead.exists()

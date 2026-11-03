@@ -389,8 +389,9 @@ One-time runtime setup (leerie runs in a container) and install steps are in
 # guarantee, and schema keywords the grammar cannot express are stripped
 # (full disclosure in docs/IMPLEMENTATION.md §2½). Fail-open; die()s on a
 # pre-set ANTHROPIC_BASE_URL or on Bedrock rather than silently running
-# without the guarantee. Also LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT=1 or
-# `dangerously_force_strict_output = true` in leerie.toml:
+# without the guarantee. Also LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT=1 (never
+# leerie.toml: a repository's file chooses no waiver, and setting it there
+# stops the launcher):
 ./leerie "task" --dangerously-force-strict-output
 ```
 

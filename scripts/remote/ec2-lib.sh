@@ -219,7 +219,7 @@ ec2_tar_pipe() {
 # One thin helper per RunInstances parameter (IMPLEMENTATION.md "EC2
 # instance-lifecycle vars"). By the time this is sourced, the `leerie`
 # launcher has already resolved each LEERIE_EC2_* var through its own
-# CLI > env > leerie.toml tier (mirroring FLY_VM_DISK_GB / the seed knobs)
+# CLI > env tier (no leerie.toml tier: these are the operator's)
 # and exported the result — this helper is just the final required-var
 # read against whatever that ladder produced. Each prints the var's value,
 # or nothing when unset: every knob is an optional override, and the

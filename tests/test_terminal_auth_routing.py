@@ -426,7 +426,7 @@ def test_handler_execution_sets_locals_and_calls_cleanup_and_capture(leerie):
         "the worktree-only cleanup (full_purge=False) must actually run — "
         "state and the run branch must survive so resume can pick it up")
     # Recorded in the run's directory: the container never writes the
-    # user's checkout (DESIGN §6½ *The host applies a capture*).
+    # user's checkout (DESIGN §6½ *The operator applies a capture*).
     assert capture_calls == [("/repo", {"c": 1}, {"m": 1}, {"e": 1},
                               "/state/runs/r-terminal-auth")]
 
