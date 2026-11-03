@@ -24,6 +24,7 @@ import ast
 import asyncio
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -107,6 +108,45 @@ def test_only_the_builder_makes_a_cli_s_own_directories():
     assert callers == {("leerie.py", "_confined_cli_env")}, callers
 
 
+def test_a_unix_socket_binds_in_a_workers_tmpdir(leerie, tmp_path,
+                                                 monkeypatch):
+    """A worker's `TMPDIR` is short (DESIGN §6 *A worker's temp directory is
+    short and private too*): tsx's IPC socket `<TMPDIR>/tsx-<uid>/<pid>.pipe`
+    binds there, for a worker of a run directory as deep as the container's
+    (`/leerie-state/runs/<64 hex>/workers/<wid>`), where the run-directory
+    temp directory it replaces passed `sun_path`'s 107 bytes."""
+    import socket
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    run_dir = tmp_path / "state" / "runs" / ("f" * 64)
+    run_dir.mkdir(parents=True)
+    env = leerie._confined_cli_env(run_dir, "bugfix-003-conformer")
+    tmp = Path(env["TMPDIR"])
+    try:
+        assert tmp.parent == leerie.PRIVATE_TMP_ROOT
+        assert len(tmp.name) == 16
+        assert stat.S_IMODE(os.lstat(tmp).st_mode) == 0o700
+        # And this process removes it at its exit if nothing else does.
+        assert leerie._PRIVATE_TMPS.get(str(tmp)) == os.getpid()
+        pipe = tmp / f"tsx-{os.getuid()}" / "4194304.pipe"
+        assert len(str(pipe).encode()) < 108, pipe
+        pipe.parent.mkdir()
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(str(pipe))
+        finally:
+            s.close()
+        # The grant names it: the worker's processes may write there.
+        grants = leerie._worker_grants(
+            run_dir=run_dir, state={}, schema_key="implementer",
+            cwd=tmp_path, allowed_tools=leerie.ACT_TOOLS,
+            env={**os.environ, **env})
+        assert str(tmp) in grants.rw
+    finally:
+        leerie._remove_worker_dirs(run_dir)
+    assert not tmp.exists()
+
+
 def test_the_builder_names_every_worker_env_dir(leerie, tmp_path,
                                                 monkeypatch):
     """Every `_WORKER_ENV_DIRS` variable, not only the ones a caller used to
@@ -117,10 +157,13 @@ def test_the_builder_names_every_worker_env_dir(leerie, tmp_path,
     run_dir.mkdir(parents=True)
     env = leerie._confined_cli_env(run_dir, "w1")
     own = run_dir / "workers" / "w1"
-    assert env == {var: str(own / ("config" if var == "CLAUDE_CONFIG_DIR"
-                                   else "tmp"))
+    tmp = leerie._worker_tmp(own)
+    assert env == {var: str(own / "config" if var == "CLAUDE_CONFIG_DIR"
+                            else tmp)
                    for var in leerie._WORKER_ENV_DIRS}
-    assert (own / "config").is_dir() and (own / "tmp").is_dir()
+    assert (own / "config").is_dir() and tmp.is_dir()
+    leerie._remove_worker_dirs(run_dir)
+    assert not tmp.exists()
 
 
 # --- the behaviour ---------------------------------------------------------
@@ -244,10 +287,10 @@ def test_the_smoke_test_runs_after_the_run_tmp_is_set(leerie, world,
                                  model="haiku", verbosity="quiet"))
     env = _assert_inside(leerie, st, log, grants)
     own = st.run_dir / "workers" / "smoke"
-    assert env["TMPDIR"] == str(own / "tmp") != str(run_tmp)
+    assert env["TMPDIR"] == str(leerie._worker_tmp(own)) != str(run_tmp)
     assert env["CLAUDE_CONFIG_DIR"] == str(own / "config")
     # Its temp directory goes with the call, as a worker's does.
-    assert not (own / "tmp").exists()
+    assert not leerie._worker_tmp(own).exists()
 
 
 @needs_landlock

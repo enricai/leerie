@@ -1792,7 +1792,9 @@ write grant (§6 *A worker writes only where it is granted (I5)*) grants
 and nothing else:
 
 - `<run-dir>/workers/<wid>/config/` — the worker's `CLAUDE_CONFIG_DIR`;
-- `<run-dir>/workers/<wid>/tmp/` — its `TMPDIR` (and `TMP`, `TEMP`);
+- `/tmp/l/<id>/` — its `TMPDIR` (and `TMP`, `TEMP`, `CLAUDE_CODE_TMPDIR`),
+  short and private (§6 *A confined command's scratch is short and
+  private*), `<id>` derived from `<run-dir>/workers/<wid>/`;
 - not its caches: those are one set per side of the run, shared by every
   worker of that side and never by leerie's measurements (§6 *The stores a
   view installs from are leerie's*): `<run-dir>/workers/cache/` for the
@@ -2513,7 +2515,7 @@ worker gets the first block, then its kind's.
 |---|---|---|---|
 | devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, `/dev/pts`, `/dev/shm` (POSIX semaphores: Python's multiprocessing locks and Chromium need it, measured); `/dev/pts` and `/dev/shm` are the process's own | write | — |
 | its own `/tmp` | a fresh tmpfs per process tree, made by the shim, gone when it ends | write | the shim |
-| own temp dir | what `TMPDIR`, `TMP` and `TEMP` name: `<run-dir>/workers/<wid>/tmp/` | write | `_worker_dirs` |
+| own temp dir | what `TMPDIR`, `TMP` and `TEMP` name: `/tmp/l/<id>/`, `<id>` derived from `<run-dir>/workers/<wid>/` (*A confined command's scratch is short and private*) | write | `_worker_dirs` |
 | own CLI config | what `CLAUDE_CONFIG_DIR` names: `<run-dir>/workers/<wid>/config/` (sessions live there, so `--resume` finds them) | write | `_worker_dirs` |
 | the CLI configuration template | `<run-dir>/claude-config/`, whose directories each worker's configuration links | read | `_claude_config_template` |
 | leerie's own code, the CLI, the worker's home | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check), the `claude` its `PATH` finds, and `$HOME` (the git identity, a package manager's config) unless it holds `/tmp`: each named, so that one under `/tmp` on a host is still read | read | — |
@@ -2547,7 +2549,7 @@ nothing in it is shared, and the worker reads and writes it freely — 155 of
 the 310 corpus sessions that wrote an absolute path wrote under `/tmp`
 (lane B, e.g. `/tmp/fr_fixed.ts`). It does not outlive the process: a
 re-ask or resume starts with an empty one. A worker's temp directory is
-still its own `TMPDIR` (`<run-dir>/workers/<wid>/tmp/`; the CLI honours
+still its own `TMPDIR` (`/tmp/l/<id>/`, carried into that `/tmp`; the CLI honours
 it: measured 2026-11-01, with `TMPDIR` unset the confined CLI refused to
 start on `/tmp/claude-<uid>`, with it set it made `$TMPDIR/claude-<uid>/`
 and ran). Every worker with a shell is told where it can write. The notice
@@ -3866,12 +3868,32 @@ and lint passed both ways. funeralworks' configured `test`
 1,287 files and 13,036 tests both ways, and `next build` compiled both
 ways with no SWC cache refusal.
 
-A worker's own temp directory is still `<run-dir>/workers/<wid>/tmp/`
-(§6 *Each worker's own configuration and temporary directories*), at the
-run directory's depth: a socket in it can exceed `sun_path` too. That is
-this design's open edge on the worker side, not closed here; a worker's
-own `/tmp` is now private and short, so pointing its `TMPDIR` there would
-close it.
+**A worker's temp directory is short and private too.** *Designed
+2026-11-03 (the live 0.43.0 barnacle runs).* A worker's `TMPDIR` was
+`<run-dir>/workers/<wid>/tmp/`, at the run directory's depth —
+`/leerie-state/runs/<64 hex>/workers/bugfix-003-conformer/tmp`, about 116
+characters — so tsx's `<dir>/tsx-<uid>/<pid>.pipe` passed `sun_path`'s
+limit and every test that spawns tsx failed inside a worker with `listen
+EINVAL` (18 log hits across 5 of the 7 runs; one worker had to invent
+`TMPDIR=/tmp/t` to run its tests, and three runs' risk registers carried
+the failure as a risk). The invariant above now holds for every worker
+too. A worker's `TMPDIR`, `TMP`, `TEMP` and `CLAUDE_CODE_TMPDIR` name
+`/tmp/l/<id>/` (`_worker_tmp`), `<id>` 16 hex digits of the hash of its
+`<run-dir>/workers/<wid>/`, made 0700 under the 0700 `/tmp/l` by the one
+builder of a confined CLI's directories (§6 *Every confined CLI is given
+its own directories, by one builder*) and granted by its write grant; the
+shim carries it into the worker's own `/tmp` as it carries a command's.
+Being a function of the worker's directory, it is removed by whoever
+removes that: when each of the worker's calls returns, at the release of
+the run's scratch (`_remove_worker_dirs`), and by the collection's exit
+for the integrators it confines; and, like a command's, at the exit of
+the process that made it, unless that process handed it on (the
+collection's guard, which exits before its integrator starts). Its `XDG_CACHE_HOME` stays in its side's
+shared cache (§6 *The stores a view installs from are leerie's*): a cache
+holds no socket, and one per worker removed at each call's end would
+fetch everything again each call. The host-side seam is not confined and
+runs on the operator's host, which leerie keeps out of `/tmp`: its
+`TMPDIR` stays in the run directory.
 
 ### Every confined process has its own `/tmp`, `/dev/shm` and IPC, and sees every other mount read-only
 

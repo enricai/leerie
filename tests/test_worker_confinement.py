@@ -530,8 +530,8 @@ def test_claude_p_tells_a_shell_worker_its_grant(leerie, run, monkeypatch):
     assert line[0] == "NOTE FROM ORCHESTRATOR: " + \
         leerie._confined_writes_notice(
             seen["grants"][0], cwd=wt,
-            env={**os.environ, "TMPDIR": str(rd / "workers" / "w-True" /
-                                             "tmp"),
+            env={**os.environ, "TMPDIR": str(leerie._worker_tmp(
+                rd / "workers" / "w-True")),
                  "CLAUDE_CONFIG_DIR": str(rd / "workers" / "w-True" /
                                           "config")})
     assert f"`{rd / 'notes' / 'wt-a'}`" in line[0]

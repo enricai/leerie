@@ -6262,7 +6262,7 @@ lookup bypassed, the `tmp` removal dropped, an empty `_CLAUDE_CONFIG_SKIP`,
 directories copied instead of linked, the template left writable, and the
 template kept at finalize.
 
-`tests/test_confined_cli_env.py` (7 tests, DESIGN §6 *Every confined CLI is
+`tests/test_confined_cli_env.py` (8 tests, DESIGN §6 *Every confined CLI is
 given its own directories, by one builder*; review round 22 exec H2). The
 rule: every function that derives a CLI's grant or builds its argv
 (`_worker_grants`, `_contained_claude_argv`, in `leerie.py` and
@@ -6279,7 +6279,12 @@ smoke test's environment dropped (the stub's `mkdir` fails as in the
 finding), `claude_p`'s old hand-built four variables, and the old
 `worker-guard.py`. A real smoke test (`claude` 2.1.316 in `leerie:r22`,
 rootless, `apparmor=leerie-container`) passed with the fix and died with the
-finding's EROFS without it.
+finding's EROFS without it. A worker's TMPDIR is
+`PRIVATE_TMP_ROOT/<16 hex>`, 0700, registered for removal at the process's
+exit, granted, and removed by `_remove_worker_dirs`; a tsx-shaped
+`<TMPDIR>/tsx-<uid>/<pid>.pipe` binds as an AF_UNIX socket from a run
+directory as deep as the container's (DESIGN §6 *A worker's temp directory
+is short and private too*).
 
 ## The CLI's own git, transcripts apart, and a run that died (review round 22)
 

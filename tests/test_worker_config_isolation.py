@@ -180,7 +180,8 @@ def test_each_worker_has_its_own_tmpdir_removed_after_the_call(
     _call(leerie, st, "worker-a")
     _call(leerie, st, "worker-b")
     a, b = _lines(log)
-    assert a["tmp"] == str(st.run_dir / "workers" / "worker-a" / "tmp")
+    assert a["tmp"] == str(leerie._worker_tmp(
+        st.run_dir / "workers" / "worker-a"))
     assert a["tmp"] != b["tmp"]
     # The stub wrote a scratch file there; the directory is gone now.
     assert not Path(a["tmp"]).exists() and not Path(b["tmp"]).exists()

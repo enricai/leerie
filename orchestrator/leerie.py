@@ -12361,8 +12361,19 @@ def _resumed_wid(run_dir: Path, session: str | None) -> str | None:
     return None
 
 
-def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
-                 ) -> tuple[Path, Path]:
+def _worker_tmp(base: Path) -> Path:
+    """The worker's private temp directory, `/tmp/l/<id>/` (`<id>`: 16 hex
+    digits of the hash of the realpath of its `<run_dir>/workers/<wid>/`),
+    a pure function of the worker's directory, so whoever removes that
+    directory can remove it too (DESIGN §6 *A confined command's scratch is
+    short and private*): its length never depends on the run's id or the
+    worker's name, so a socket in it fits `sun_path`."""
+    key = os.path.realpath(base)
+    return PRIVATE_TMP_ROOT / hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None,
+                 private_tmp: bool = True) -> tuple[Path, Path]:
     """`(config, tmp)` of the worker: `<run_dir>/workers/<wid>/`, `<wid>`
     the directories that hold the resumed session, else `sid`. `config` is
     made when absent (in a sibling and renamed, so a crash never leaves
@@ -12370,10 +12381,12 @@ def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
     files (the settings, credentials and account state a worker may
     rewrite) and a link to each of its directories (plugins, skills and the
     like, read-only and shared rather than copied per worker). `tmp` is
-    made empty."""
+    made empty: the short private `_worker_tmp(<wid dir>)`, or with
+    `private_tmp` False (the host-side seam, which is not confined and runs
+    on the operator's host) `<wid dir>/tmp`."""
     wid = _resumed_wid(run_dir, resume_session) or sid
     base = Path(run_dir) / WORKERS_DIR / wid
-    config, tmp = base / "config", base / "tmp"
+    config = base / "config"
     if not config.is_dir():
         template = _claude_config_template(run_dir)
         part = base / f".config.tmp-{os.getpid()}"
@@ -12391,21 +12404,36 @@ def _worker_dirs(run_dir: Path, sid: str, resume_session: str | None
                 shutil.copy2(entry, dst)
                 os.chmod(dst, stat.S_IMODE(os.lstat(dst).st_mode) | 0o600)
         os.rename(part, config)
-    _rmtree_owned(tmp)
-    _mkdir_private(tmp, Path(run_dir))
+    if private_tmp:
+        tmp = _worker_tmp(base)
+        _rmtree_owned(tmp)
+        _own_private_dir(PRIVATE_TMP_ROOT)
+        _own_private_dir(tmp)
+        # This process's until it exits, as `_private_tmp`'s are; a process
+        # that hands it to another (`worker-guard.py`) gives it up.
+        if not _PRIVATE_TMPS:
+            atexit.register(_remove_private_tmps)
+        _PRIVATE_TMPS[str(tmp)] = os.getpid()
+    else:
+        tmp = base / "tmp"
+        _rmtree_owned(tmp)
+        _mkdir_private(tmp, Path(run_dir))
     return config, tmp
 
 
 def _confined_cli_env(run_dir: Path, sid: str,
-                      resume_session: str | None = None) -> dict[str, str]:
+                      resume_session: str | None = None,
+                      private_tmp: bool = True) -> dict[str, str]:
     """The one builder of a confined CLI's own directories (DESIGN §6
     *Every confined CLI is given its own directories, by one builder*):
     `_worker_dirs`' pair, named by every `_WORKER_ENV_DIRS` variable, to
     lay over the spawn's environment before its grant is derived from it.
     Every one is named, not only those the caller happens to have set: an
     inherited value (the orchestrator's `<run-dir>/tmp/`) lies outside the
-    grant, and the CLI's first act is to make `$TMPDIR/claude-<uid>`."""
-    config, tmp = _worker_dirs(Path(run_dir), sid, resume_session)
+    grant, and the CLI's first act is to make `$TMPDIR/claude-<uid>`.
+    `private_tmp` as `_worker_dirs`'."""
+    config, tmp = _worker_dirs(Path(run_dir), sid, resume_session,
+                               private_tmp)
     return {var: str(config if var == "CLAUDE_CONFIG_DIR" else tmp)
             for var in _WORKER_ENV_DIRS}
 
@@ -12417,6 +12445,12 @@ def _remove_worker_dirs(run_dir: Path) -> bool:
     the process that owns the run, and by the reap and prune of a run no
     process owns."""
     gone = True
+    # Each worker's private temp directory first: it is named by its
+    # worker's directory, which goes next (`_worker_tmp`).
+    with contextlib.suppress(OSError):
+        for base in (Path(run_dir) / WORKERS_DIR).iterdir():
+            if base.is_dir() and not base.is_symlink():
+                _rmtree_owned(_worker_tmp(base))
     for name in (WORKERS_DIR, CLAUDE_CONFIG_TEMPLATE):
         path = Path(run_dir) / name
         if not _rmtree_owned(path):
@@ -24610,12 +24644,19 @@ def _around(paths: list[str], root: Path) -> list[str]:
 
 def _worker_own_dirs(env: Mapping[str, str], run_dir: Path) -> list[str]:
     """The directories `_WORKER_ENV_DIRS` names in `env` that lie beneath
-    `<run_dir>/workers/`; any other value is shared, and granted nothing."""
+    `<run_dir>/workers/`, or that are the private temp directory
+    (`_worker_tmp`) of the worker whose configuration `CLAUDE_CONFIG_DIR`
+    names there; any other value is shared, and granted nothing."""
     workers = (run_dir / WORKERS_DIR).resolve()
+    config = env.get("CLAUDE_CONFIG_DIR")
+    own_tmp = (str(_worker_tmp(Path(os.path.realpath(config)).parent))
+               if config and Path(os.path.realpath(config)).parent.parent
+               == workers else None)
     out = []
     for var in _WORKER_ENV_DIRS:
         p = env.get(var)
-        if p and Path(os.path.realpath(p)).is_relative_to(workers):
+        if p and (Path(os.path.realpath(p)).is_relative_to(workers)
+                  or os.path.realpath(p) == own_tmp):
             out.append(os.path.realpath(p))
     return out
 
@@ -30359,7 +30400,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # (`_confined_cli_settings`): the one `_worker_dirs` makes below.
     _wrun_dir = _wrun if isinstance(_wrun, (str, os.PathLike)) else None
     if isinstance(_wrun, (str, os.PathLike)):
-        own = _confined_cli_env(Path(_wrun), sid, resume_session)
+        own = _confined_cli_env(Path(_wrun), sid, resume_session,
+                                private_tmp=not caps.get(HOST_SEAM_CAP))
         worker_tmp = Path(own["TMPDIR"])
         env_extra = {**(env_extra or {}), **own}
 

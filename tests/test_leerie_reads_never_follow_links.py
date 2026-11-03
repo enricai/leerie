@@ -460,7 +460,7 @@ _LEERIE_OWN = {
     "run_recapture_deps", "_backstop_capture_prior_runs",
     "_remove_trees_private_tmps", "_sweep_measure_dirs", "_reap_idle_worktrees",
     "_cleanup_on_abnormal_exit", "_ensure_run_repo", "_resumed_wid",
-    "_worker_dirs", "_claude_config_template", "_run_last_activity",
+    "_worker_dirs", "_remove_worker_dirs", "_claude_config_template", "_run_last_activity",
     "_invoke", "_restore_settings",
     # The held-out sets and probes: leerie's copies, made through
     # `_read_beneath`, so regular files only.
