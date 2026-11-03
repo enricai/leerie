@@ -31,7 +31,8 @@ inside the container (DESIGN §6 / §0.5 below).
 | `Dockerfile` | Image recipe (Debian 13 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. Runs as **root** (rootful runtimes) or the **rootlesskit-mapped host UID** (rootless containerd — DESIGN §6 *Rootless exception*); the Dockerfile omits `USER leerie` so cgroup containment can be set up before privilege drop. Resolves `CGROUP_ROOT` (`/sys/fs/cgroup`, or the systemd-delegated user slice under rootless), creates `$CGROUP_ROOT/leerie.slice`, enables the memory+pids controllers; its final exec, `cgroup-broker.py --spawn -- <drop> python3 leerie.py`, starts the **cgroup broker** at the same pre-drop identity and hands the orchestrator its descriptor — worker cgroup enrollment can't be done post-drop (see `scripts/cgroup-broker.py`, DESIGN §6). With no argv (Fly/EC2) it starts no broker. Also at pre-drop identity: `ulimit -c 0`, `cd /work`, and chowning `/work`, `/home/leerie` (+ `.local`/`.cache`/`.gnupg`), `/tmp/.cache` (`chmod 1777`, since tools create their own subdirs there at runtime), and the `/leerie-host` mount (`chown leerie:` on the directory only — the build semaphore's slot dir) — skipped under rootless, where only outer UID 0 remaps to inner leerie, so leerie-owned dirs must stay root-owned at build time (the rootful path instead needs literal `leerie` ownership via a real UID switch, restored by this chown). Drops privilege via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...` (explicit `env`, not `--login`, which would `cd` away from `/work`): execs `python3 .../leerie.py "$@"` when given argv (local/nerdctl path), or wraps `sleep infinity` when invoked with none (remote/Fly path, where the orchestrator is dropped in separately via `Popen(user="leerie")`). |
 | `scripts/cgroup-broker.py` | Cgroup broker (DESIGN §6 *Memory containment*, *No leerie service is reachable by a path from a process it does not serve*), started at the slice-owning identity before the privilege drop and reached only through a descriptor. `spawn(log_path=None) -> int`: `socketpair(AF_UNIX, SOCK_SEQPACKET)`, fork a child (`setsid`, stdin `/dev/null`, stdout/stderr to `log_path` or `/dev/null`) that runs `_start()` (hierarchy detection, then the orphan sweep) and `serve()` on one end; return the other, inheritable. `serve(ctrl)`: per message, `socket.recv_fds(ctrl, 4096, 1)` — the request line plus the client's reply socket — then `_handle` and the response line on that socket (5 s send timeout); returns when every holder of the other end has closed it. `main(argv)`: `--spawn [--log PATH] -- CMD…` — `spawn`, set `FD_ENV` (`LEERIE_CGROUP_BROKER_FD`) to the descriptor (a failed start is logged and CMD runs without it), drop `LEERIE_CGROUP_V2_ROOT`, `execvp(CMD)`; no pathname mode exists. Callers: `container-entry.sh`'s final exec (CMD the privilege drop and the orchestrator), and the Fly/EC2 launch wrapper (`scripts/remote/seed-common.sh`'s `_render_launch_suffix`), which, as root, calls `spawn("/tmp/cgroup-broker.log")`, puts the descriptor in the orchestrator's `Popen(…, user="leerie", pass_fds=…)` and its environment, and closes its copy. Orchestrator side: `_adopt_cgroup_broker()`, first in `main()` — pops `LEERIE_CGROUP_BROKER_FD`, makes the descriptor non-inheritable, keeps it as `_CGROUP_BROKER` only when it is an `AF_UNIX`/`SOCK_SEQPACKET` socket (send timeout `_CGROUP_DESTROY_TIMEOUT_SEC`), else logs and leaves containment off; `_cgroup_request(payload, timeout=5.0)` — `OSError(ENOTCONN)` without one, else a fresh `socketpair(AF_UNIX, SOCK_STREAM)`, `socket.send_fds(_CGROUP_BROKER, [payload + "\n"], [theirs])`, and the response read from ours within `timeout`; `_hand_cgroup_broker_to_exec() -> undo` — inheritable and named in the environment for `_sleep_then_reexec`'s `os.execv` (undone when the exec fails). Handles `ping` / `probe` / `create <sid> <mem> <pids>` / `enroll <sid> <pid>` / `destroy <sid>` / `stat <sid>` / `slice`. The orchestrator calls `descendant_tracker.stop_and_reap()` **before** `_cgroup_destroy` (else a still-populated cgroup fails `rmdir` with EBUSY). `destroy` reads `cgroup.procs` on v2, writes `cgroup.kill`, polls `cgroup.procs` until it drains (bounded by `_DESTROY_DRAIN_TIMEOUT_SEC` on v2, shorter on v1), then `rmdir`s, retrying on EBUSY and returning the error once the budget is exhausted. On success it replies `OK`, followed on v2 by the PIDs it killed (`OK <pid> <pid>…`); `_cgroup_destroy` hands those PIDs to `_mark_reapable`, so the zombie reaper waits for every process a teardown killed, including a daemon that left the command's session and that no `_DescendantTracker` observed (DESIGN §6 *Zombie reaping*, "What a cgroup teardown kills, it also reaps"). v1 migrates survivors instead of killing them and replies a bare `OK`. The client-side `_CGROUP_DESTROY_TIMEOUT_SEC` (15.0s) must stay ≥ the broker's drain budget, or an abandoned client can leave a `leerie-w-<sid>` dir orphaned on the host cgroupfs (workers run with `--cgroupns=host`). `_cgroup_destroy` runs via `asyncio.to_thread` so one worker's teardown can't stall others. Leaked dirs (pre-fix images, a SIGKILLed orchestrator) are swept at broker startup, restricted to dirs both empty and older than `_ORPHAN_MIN_AGE_SEC` (1h) so a live or concurrent run isn't swept. `stat <sid>` → `OK <pids.current> <pids.max> <pids.events.max> <memory.events.oom_kill>` for PID-exhaustion/OOM detection. `peak <sid>` → `OK <memory peak> <pids peak>` (v2 `memory.peak` / `pids.peak`; v1 `memory.max_usage_in_bytes` and `-1`, no pids high-water mark; `-1` for anything unreadable), read by `_cgroup_peak` for the measured build peak. Enrollment order is the client's: create, spawn the process held behind `_spawn_gate_src()`, `enroll`, release (DESIGN §6 *Enrollment holds the spawn*). `slice` → `OK <leerie.slice memory.max> <live sibling worker cgroups> <unreclaimable bytes>`, used by `_cgroup_slice_info` to gate admission on measured headroom; the third field is deliberately **unreclaimable** usage, not `memory.current` (which counts reclaimable page cache); `-1` on either numeric field means unreadable and the caller fails open. The "live" count is diagnostic only, not an input to per-worker sizing (load-independent — see `worker_memory_max_bytes`). The `memory.events` `oom_kill` counter is the definitive OOM signal, mirroring `pids.events`' `max` for fork denial. The broker exists because enrollment/limit-setting needs cgroup ownership the dropped-privilege orchestrator lacks. Detects cgroup **v2** (unified `<V2_ROOT>/leerie.slice/leerie-w-<sid>/{pids,memory}.max`, `V2_ROOT` overridden via `LEERIE_CGROUP_V2_ROOT` under rootless) vs **v1/hybrid** (split `pids/`+`memory/` at `V1_ROOT`, seen on Fly Firecracker VMs). Validates every `<sid>` against `^[A-Za-z0-9._-]+$` and requires integer limits. The orchestrator composes a **run-scoped** sid (`<run-id[:12]>-<sid>`, `_cgroup_worker_sid`) so concurrent runs never collide; `phase_plan`'s `replan_round` similarly round-scopes re-plan sids (`planner-<category>-r<N>`). `_cgroup_enroll` returns the broker's failure reason (`str | None`) so `_invoke` can name it as a probable crash cause. |
-| `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines with no bind mount. Default mode is Fly's remote builder (no host Docker daemon needed); local-build (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder strips the `[build] image = ...` line from a tmp fly.toml to avoid flyctl#1686 (flyctl otherwise fetches the pre-pinned image instead of rebuilding). |
+| `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines with no bind mount. Default mode is Fly's remote builder (no host Docker daemon needed); local-build (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder strips the `[build] image = ...` line from a tmp fly.toml to avoid flyctl#1686 (flyctl otherwise fetches the pre-pinned image instead of rebuilding). It pushes exactly the `--tag` it is given (the remote builder's `--image-label` is that tag's label; a tag outside `registry.fly.io/<APP>` is refused there), and after the push `--digest-file` / `--layout-base` read the pushed image back through `registry_image.py`. |
+| `scripts/remote/registry_image.py` | Reads a registry (Docker Registry HTTP API v2) for `build-push.sh`: `digest <ref>` prints the digest of the manifest a reference names; `layout <base-ref> <ref>` exits 0 when `<ref>` is `<base-ref>`'s layers (`rootfs.diff_ids`) plus exactly one with `<base-ref>`'s `.config` apart from `Image` and `Labels`, 1 (naming the difference) when not, 2 when the registry cannot be read. The password is read from stdin and offered as user `x` through the registry's own challenge (Basic, or a Bearer token from its realm); `build-push.sh` passes `flyctl auth token` for `registry.fly.io` and nothing elsewhere. A multi-platform index is read for linux/amd64. Loopback hosts are spoken to over HTTP, every other over HTTPS. Manifests and blobs are checked against their digests and bounded at 4 MiB. |
 | `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `destroy_volume()`, `_try_fetch_branch_for_teardown()`, `decide_teardown()` (a wrapper around `_decide_teardown_body`; the EXIT trap registers it as `decide_teardown exit` and INT/TERM as plain `decide_teardown`, and only the `exit` pass ends by calling the launcher's `_remote_launcher_exit_cleanup` when defined — the `$STAGE` keepalive kill and `$STAGE` removal the launcher's EXIT trap did before `provision_machine()`/`resume_machine()` replaced it). On a clean exit whose run synced it calls `host_finalize`, which honors the run's `run.json.no_push` itself (DESIGN §6 *One push choice per run, on every runtime*). `destroy_volume()` reaps `$LEERIE_VOLUME_ID` independently of any machine id, since Fly volumes outlive their machines and there's no platform teardown hook; `destroy_machine` calls it last (Fly refuses to destroy an attached volume) and treats a failed volume destroy as a logged, non-fatal billing issue. The EXIT/INT/TERM trap's `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` into three dispositions: **sync-then-finalize-then-destroy** (terminal exits: 0, `EXIT_NEEDS_ANSWERS=10`, genuine `EX_TEMPFAIL=75`) — fetches the branch, pushes + opens the PR via `host_finalize`, and only destroys the machine if the push succeeds (else leaves it running with a recovery banner pointing at `leerie finalize <run-id> --runtime fly`); **detach** (host-side SIGINT/SIGTERM: orchestrator keeps running, machine left alone, reattach hints printed); or **pause-on-failure** (other non-zero rc: best-effort state sync via a 60s-bounded tar-pipe, then stop the machine and write `paused_at`/`pause_reason` to the sidecar). `die()` exits (rc=1) route to pause, not clean-exit, so partial failures are paused rather than destroyed. |
 | `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `_extract_flyctl_remote_rc()` (parses the real remote exit code out of `flyctl ssh console`'s stderr, since flyctl itself returns 1 for any non-zero remote exit), `update_run_json()` (atomic merge into the host's `run.json`), `wait_for_started()` (poll `flyctl machine status` until `started`, with timeout), `require_flyctl()` (detect/install `flyctl`, check `flyctl auth status`), `render_tail_wrapper()` (a POSIX-sh wrapper that tails `orchestrator.log`, cross-checks liveness via pid-file `kill -0` OR a `/proc` cmdline scan — closing the stale-pid contagion of DESIGN §6 *Single owner per run dir* — and on exit propagates `orchestrator.exit_code` as its own exit code so `decide_teardown` can route failures to pause; falls back to exit 0 if that file is absent), and `tail_with_optional_autofinalize()` (wraps the tail wrapper + `flyctl ssh console` with optional `AUTO_FINALIZE_TOKEN` plumbing: on clean exit, greps captured stderr for the token and `exec`s `leerie finalize <id>` on the host). Replaces four duplicated detection blocks across the remote scripts. |
 | `scripts/remote/seed-common.sh` | Transport-agnostic seeding helpers shared by the Fly path (`lib.sh`→`seed-repo.sh`) and EC2 path (`ec2-lib.sh`→`ec2-seed-repo.sh`): `_seed_timeout_prefix()`, `_seed_use_shallow()`, `_seed_branch_shallow_safe()`, `_seed_dirty_filter()`, `_seed_auth_tar_excludes()` (single owner, replacing prior per-transport duplicates). `_seed_auth_tar_excludes()` echoes the `tar --exclude=...` flags guarding git/ssh/gnupg auth material (`.gitconfig`, `.git-credentials`, `.netrc`, `.ssh`, `.gnupg`, `.config`, etc. — that material lives on the host per DESIGN §6 *Finalization*) from the `$STAGE` tar shipped to the remote machine. `_seed_dirty_filter()` shells out to `seed_dirty_filter.py`. Bash 3.2 portable. |
@@ -671,7 +672,7 @@ flyctl deploy --build-only --push --remote-only \
   --dockerfile <DOCKERFILE> \
   [--build-arg KEY=VAL ...] \
   [--build-target <STAGE>] \
-  --image-label <VERSION>
+  --image-label <LABEL>
 ```
 
 run from `<CONTEXT>` (flyctl's build context is its working directory).
@@ -682,6 +683,25 @@ KEY=VAL` is repeatable. `--context DIR` sets `<CONTEXT>` (default
 (`--target STAGE` to `nerdctl`/`docker build` on `--local-build`, whose
 context is `<CONTEXT>` too): `ensure_image()` passes the committed tree
 and the repository image's final stage.
+
+The image is pushed under exactly `--tag` (default
+`registry.fly.io/<APP>:<VERSION>`): `<LABEL>` is that tag's part after
+its last `:`. Fly's remote builder pushes only `registry.fly.io/<APP>:<LABEL>`,
+so in that mode a tag whose repository is anything else, or whose label is
+not `[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`, exits 1 before anything runs
+(review round 29, isolation F1: the label was `$LEERIE_VERSION` whatever
+`--tag` said, so a repository image was pushed over the base tag).
+
+After a successful push, with `--push`:
+
+- `--digest-file PATH` writes the digest the registry holds under the tag
+  (`registry_image.py digest`), one line, `sha256:<hex>`.
+- `--layout-base REF` requires `registry_image.py layout REF
+  <repository>@<digest>` to pass, else exits 1 and writes no digest.
+
+The registry password is `flyctl auth token` when the tag's host is
+`registry.fly.io`, and empty otherwise. `--dry-run` prints the
+`registry_image.py` commands instead. Either flag without `--push` exits 1.
 
 The `<tmp-fly.toml>` is a copy of the repo's `fly.toml` with the `[build]
 image = "..."` line stripped — that line tells flyctl "fetch the existing
@@ -705,10 +725,21 @@ an unfriendly "manifest unknown" error. `ensure_image()` in the
 launcher's `RUNTIME=fly` branch closes that gap, run before
 `provision_machine`. Two variants:
 
+`ensure_image` sets `FLY_IMAGE_REF` to `<repository>@<digest>` (the tag's
+part before its last `:`, and the digest pushed or cached), and the
+launcher hands that to `provision_machine` as `FLY_IMAGE_TAG`: a machine
+starts from the digest leerie pushed, never from a tag (DESIGN §6½
+*Per-repo container image*, Fly). Helpers: `_fly_cache_get <cache-file>
+<tag>` prints the digest and base digest of the last line for `<tag>`;
+`_fly_digest_ok` accepts only `sha256:<64 hex>`; `_fly_push <build-push>
+<cache-dir> <tag> <args...>` runs build-push.sh with `<args> --tag <tag>
+--digest-file <file>` (the file under the cache directory) and sets
+`_FLY_PUSHED` to the digest it reported.
+
 **Base image path** (no `.leerie/Dockerfile`):
 
-1. Cache check: if `$XDG_CACHE_HOME/leerie/published-tags.txt` already
-   has `$FLY_IMAGE_TAG`, skip everything.
+1. Cache check: if `$XDG_CACHE_HOME/leerie/published-tags.txt` has a
+   digest for `$FLY_IMAGE_TAG`, start from it and skip everything.
 2. Auto-create the Fly app if it doesn't exist. `flyctl apps list
    --json` is parsed for a name match; on miss, `flyctl apps create
    $LEERIE_FLY_APP` is invoked. Idempotent — "already exists" is a
@@ -717,7 +748,7 @@ launcher's `RUNTIME=fly` branch closes that gap, run before
    `--local-build` is forwarded if `LOCAL_BUILD=true` (set by the
    `--local-build` CLI flag or `LEERIE_LOCAL_BUILD=1` env var).
    build-push.sh handles the actual remote-vs-local mode dispatch.
-4. On success, append the tag to the positive cache.
+4. On success, append `<tag> <digest>` to the cache.
 
 **Per-repo derived image path** (`.leerie/Dockerfile` present):
 
@@ -726,8 +757,9 @@ The relevant bash surface:
 | Function / variable | Location in `leerie` | Purpose |
 |---|---|---|
 | `_set_fly_per_repo_image()` | before `resolve_fly_image_tag()` call in the `RUNTIME=fly` block | Detects `.leerie/Dockerfile`, writes leerie's Dockerfile for it (`_repo_image_prepare` on the base tag), computes the tag from `$_REPO_DF_SHA`, sets `LEERIE_FLY_IMAGE` + context vars; no-op when absent. The launcher removes the build directory after `ensure_image` (`_repo_build_done`) |
-| `_FLY_PER_REPO_DOCKERFILE` | module-level (set by `_set_fly_per_repo_image`) | Path of leerie's Dockerfile for the repository image (`$_REPO_BUILD_DIR/Dockerfile`), never the checkout's; empty string when no per-repo Dockerfile |
-| `_FLY_BASE_TAG` | module-level (set by `_set_fly_per_repo_image`) | Base Fly tag (`registry.fly.io/$APP:$VERSION`) passed as `BASE_IMAGE` build-arg |
+| `_FLY_REPO_DF_SHA` | module-level (set by `_set_fly_per_repo_image`) | The digest of the Dockerfile bytes the per-repo tag names (`$_REPO_DF_SHA`); `ensure_image` makes leerie's Dockerfile again on the base's digest and requires the same digest. Empty string when no per-repo Dockerfile |
+| `FLY_IMAGE_REF` | module-level (set by `ensure_image`) | `registry.fly.io/<APP>@<digest>`, what the machine starts from |
+| `_FLY_BASE_TAG` | module-level (set by `_set_fly_per_repo_image`) | Base Fly tag (`registry.fly.io/$APP:$VERSION`); the repository image is built `FROM` its digest |
 
 Before `resolve_fly_image_tag()` is called, `_set_fly_per_repo_image()`
 detects `.leerie/Dockerfile`, takes the digest of the bytes leerie's
@@ -736,28 +768,41 @@ Dockerfile was made from (`$_REPO_DF_SHA`, 12 hex chars), and sets
 `resolve_fly_image_tag()` returns via the existing override hook.
 `ensure_image()` then:
 
-1. Cache check on the per-repo tag — skip if already in
-   `published-tags.txt`.
-2. Ensure the base image is published: check the cache for the base tag
-   (`registry.fly.io/$APP:$VERSION`); on miss, invoke build-push.sh for
-   the base image first and cache the result.
-3. Build and push the per-repo image: `_repo_build_prepare` (the
-   context), then build-push.sh with `--dockerfile
-   $_FLY_PER_REPO_DOCKERFILE --context
-   $_REPO_BUILD_CTX --target leerie-final-<nonce> --build-arg
-   BASE_IMAGE=registry.fly.io/$APP:$VERSION --tag <per-repo-tag>`, then
-   `_repo_build_done` (on failure too). The remote builder's result is not
-   inspected (`_check_repo_image` is local); the nonce target and the
-   leading comment are what keep its final stage leerie's.
-4. Append the per-repo tag to the positive cache.
+1. Cache check: the per-repo tag's line records a digest, a base digest
+   and the layout, the base tag's line records that same base digest, and
+   the layout is `REPO_IMAGE_LAYOUT` — start from the per-repo digest and
+   skip everything.
+2. Ensure the base image is published: on no cached base digest, push the
+   base tag first (`_fly_push`) and append `<base-tag> <digest>`.
+3. Build and push the per-repo image: `_repo_image_prepare
+   registry.fly.io/$APP@<base digest>` (leerie's Dockerfile again, `FROM`
+   the base's digest; exit when `$_REPO_DF_SHA` is not
+   `$_FLY_REPO_DF_SHA`, the bytes the tag names), `_repo_build_prepare`
+   (the context), then `_fly_push` with `--dockerfile
+   $_REPO_BUILD_DIR/Dockerfile --context $_REPO_BUILD_CTX --target
+   leerie-final-<nonce> --build-arg BASE_IMAGE=<base ref> --layout-base
+   <base ref>` and the per-repo tag, then `_repo_build_done` (on failure
+   too). `--layout-base` applies `_check_repo_image`'s rule to the
+   registry's copy.
+4. Append `<per-repo-tag> <digest> <base digest> <REPO_IMAGE_LAYOUT>` to
+   the cache.
+
+The launch wrapper sets `LEERIE_REPO_IMAGE=1` in the orchestrator's
+environment when `_FLY_REPO_DF_SHA` is set (locally, `nerdctl run -e
+LEERIE_REPO_IMAGE=1` when `REPO_IMAGE_REF` is; the name is on the `LEERIE_*`
+auto-forward deny-list). `_require_worker_view` dies when it is "1" and the
+image has no `/opt/leerie-worker-root`.
 
 A rebuild fires automatically when the Dockerfile content or the leerie
-version changes, since either changes the hash and causes a cache miss.
+version changes, since either changes the tag and causes a cache miss, and
+when the base digest cached now is not the one the image was built on.
 
 Results are cached at `$XDG_CACHE_HOME/leerie/published-tags.txt`
-(default `~/.cache/leerie/published-tags.txt`), one line per known-present
-`<tag>`. It's a *positive* list only — a missing entry means "probe", not
-"absent" — so manual `flyctl image` deletions are self-healing.
+(default `~/.cache/leerie/published-tags.txt`), one line per image pushed:
+`<tag> <digest>`, and `<tag> <digest> <base digest> <layout>` for a
+repository image; the last line for a tag wins. A line without a digest (written
+before digests were recorded) is not a hit. It's a *positive* list only —
+a missing entry means "probe", not "absent".
 
 Flags:
 
@@ -4353,7 +4398,10 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   None` — its path when it is a directory (`lstat`, not a link), else
   None (DESIGN §6 *The orchestrator's root is leerie's; a repository's
   root is only a confined process's*).
-- `_require_worker_view() -> None` — nothing without `_worker_root()` or
+- `_require_worker_view() -> None` — first `die()`s when `REPO_IMAGE_ENV`
+  (`LEERIE_REPO_IMAGE`) is "1" and `_worker_root()` is None: the launcher
+  started the run on a repository image that has no worker root. Then
+  nothing without `_worker_root()` or
   without `_isolated()` (a command enters the view only through the
   isolation); else runs `_confined_argv(WorkerGrants(rw=("/dev/null",), ro=("/",)),
   ["test", "-e", "/.leerie-worker-env"])` (`_WORKER_ENV_MARK`) from `/`,

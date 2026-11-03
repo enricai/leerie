@@ -2931,7 +2931,9 @@ same files are root's and the worker reads them through their mode bits,
 as it reads leerie's root today; `container-entry.sh`'s ownership fixes
 touch only leerie's root. *Fly:* `ensure_image` builds the same two-stage
 Dockerfile through `build-push.sh` (`--context`, `--target`), from the
-committed tree; the machine's root is the base. *EC2:* the AMI is baked
+committed tree; the machine's root is the base. Each image is pushed
+under its own tag and a machine starts from the digest leerie pushed
+(§6½ *Per-repo container image*). *EC2:* the AMI is baked
 from leerie's base Dockerfile only, and no repository image is built
 there, so every process runs in leerie's root; a repository's image layers
 reach no EC2 machine. The machine's `/work/.leerie/Dockerfile` is not
@@ -9384,10 +9386,53 @@ published (checking `published-tags.txt`; building and pushing if absent),
 then builds and pushes the repository image with `build-push.sh`: leerie's
 two-stage Dockerfile around the repository's (`--dockerfile`), the
 committed tree as the context (`--context`), its final stage as the target
-(`--target`), `--build-arg BASE_IMAGE=$base_tag --tag $per_repo_tag`. Both the base tag and the per-repo tag are recorded in
-`published-tags.txt` so subsequent runs skip the build entirely. Without
-`.leerie/Dockerfile` the Fly path is unchanged — the base tag resolves and
-`ensure_image` proceeds as before.
+(`--target`), built `FROM` the base's digest, `--tag $per_repo_tag`.
+Without `.leerie/Dockerfile` the Fly path is unchanged — the base tag
+resolves and `ensure_image` proceeds as before.
+
+**On Fly, an image is pushed under exactly the tag asked for, and a
+machine starts from the digest leerie pushed.** Before review round 29
+(isolation F1), `build-push.sh`'s remote-builder path ignored `--tag` and
+pushed every image as `registry.fly.io/$APP:$VERSION` (`flyctl deploy
+--image-label $VERSION`). A repository image was pushed over the base tag,
+and the tag it was meant to have was never pushed, so per-repo Fly runs
+failed at machine creation; meanwhile the base tag, already recorded in
+`published-tags.txt`, now named that repository's image, so every later
+Fly run of a repository with no image of its own ran its workers in that
+repository's worker root, and every later repository image was built
+`FROM` it, whose `COPY` merges into the earlier worker root rather than
+replacing it. Four rules close it:
+
+1. `build-push.sh` pushes exactly the tag it is given: the remote
+   builder's label is the tag's own, and a tag the remote builder cannot
+   push (outside `registry.fly.io/$APP`) is refused.
+2. `published-tags.txt` records the digest the registry holds under each
+   tag leerie pushed (`--digest-file`), and a machine starts from
+   `registry.fly.io/$APP@<digest>`, never from a tag, so a tag something
+   else overwrote since is never run. A line that records no digest is
+   not a hit.
+3. A repository image is built `FROM` the base's digest, and is reused only
+   while the base digest it was built on is the one recorded now and its
+   layout (`REPO_IMAGE_LAYOUT`) is the current one (review round 29,
+   execution L2: the cache ignored the layout, so an image in the layout
+   before the worker root was reused, and the orchestrator ran in a root
+   the repository shaped).
+4. Before a pushed repository image is recorded, the registry's copy is
+   checked to be the base's layers plus exactly one, with the base's
+   configuration (`--layout-base`, `scripts/remote/registry_image.py`): the
+   rule `_check_repo_image` applies locally, labels aside (a builder may add
+   its own; a label runs nothing).
+
+5. The orchestrator stops a run the launcher started on a repository
+   image (`LEERIE_REPO_IMAGE=1`, set locally and on Fly) whose image has no
+   worker root, before any command runs: whatever reuse rule fails, the
+   repository's commands never run in leerie's root, nor leerie's in the
+   repository's.
+
+The digest is read from the registry after the push, since Fly's remote
+builder reports none; a push of the same tag by someone else between the
+two is recorded instead, and for a repository image the layout check
+still holds of what was recorded.
 
 ### Auto-capture of repo dependencies
 

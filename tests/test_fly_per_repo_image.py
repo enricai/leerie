@@ -208,23 +208,21 @@ def test_set_fly_per_repo_image_sets_base_tag_context(tmp_path):
 
 
 def test_set_fly_per_repo_image_sets_dockerfile_context(tmp_path):
-    """_FLY_PER_REPO_DOCKERFILE is leerie's Dockerfile, written from the
-    repository's, never the repository's own path."""
+    """_FLY_REPO_DF_SHA is the digest of the bytes leerie's Dockerfile was
+    made from, which ensure_image requires again."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
-    (leerie_dir / "Dockerfile").write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\n"
+    (leerie_dir / "Dockerfile").write_text(df_content)
 
     result = _run_harness(
-        '_set_fly_per_repo_image\necho "df=${_FLY_PER_REPO_DOCKERFILE:-UNSET}"',
+        '_set_fly_per_repo_image\necho "df=${_FLY_REPO_DF_SHA:-UNSET}"',
         env={"USER_REPO": str(user_repo)},
     )
     assert result.returncode == 0, result.stderr
-    df_path = Path(result.stdout.strip().removeprefix("df="))
-    assert "/.image-build/b." in str(df_path), df_path
-    wrapper = df_path.read_text()
-    assert "FROM $BASE_IMAGE AS leerie-worker-" in wrapper
-    assert "FROM registry.fly.io/testapp:0.99.test AS leerie-final-" in wrapper
+    assert result.stdout.strip() == (
+        "df=" + hashlib.sha256(df_content.encode()).hexdigest())
 
 
 def test_a_linked_dockerfile_is_never_read(tmp_path):
@@ -251,20 +249,95 @@ def test_a_linked_dockerfile_is_never_read(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ensure_image — base (no per-repo Dockerfile)
+# ensure_image (review round 29, isolation F1): each image is pushed under
+# exactly the tag asked for, recorded by digest, and started by digest; a
+# repository image is built FROM the base's digest and its layout checked.
 # ---------------------------------------------------------------------------
 
-def _make_build_push_stub(tmp_path: Path, rc: int = 0) -> Path:
-    """Create a build-push.sh stub that logs its args and returns rc."""
-    log_file = tmp_path / "build-push.log"
-    stub = tmp_path / "build-push.sh"
+BASE_DIGEST = "sha256:" + "b" * 64
+FLY_REPO_DIGEST = "sha256:" + "c" * 64
+OTHER_DIGEST = "sha256:" + "e" * 64
+BASE_TAG = "registry.fly.io/testapp:0.99.test"
+LAYOUT = re.search(r'^REPO_IMAGE_LAYOUT="([^"]+)"', _launcher_text(),
+                   re.M).group(1)
+
+
+def _install_build_push(tmp_path: Path, rc: int = 0) -> tuple[Path, Path]:
+    """A stub scripts/remote/build-push.sh under a stand-in LEERIE_REPO: it
+    records its argv, keeps a copy of the Dockerfile it is given
+    (`dockerfile.copy`), and on success reports through `--digest-file`
+    FLY_REPO_DIGEST for a push with `--layout-base` (a repository image),
+    BASE_DIGEST otherwise. Builtins only."""
+    log = tmp_path / "build-push.log"
+    copy = tmp_path / "dockerfile.copy"
+    leerie_repo = tmp_path / "leerie-repo"
+    scripts_dir = leerie_repo / "scripts" / "remote"
+    scripts_dir.mkdir(parents=True)
+    stub = scripts_dir / "build-push.sh"
     stub.write_text(
         "#!/usr/bin/env bash\n"
-        f"echo \"$@\" >> {log_file}\n"
-        f"exit {rc}\n"
+        f'echo "$@" >> "{log}"\n'
+        f"[ {rc} -eq 0 ] || exit {rc}\n"
+        f'd="{BASE_DIGEST}"\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        f'    --layout-base) d="{FLY_REPO_DIGEST}" ;;\n'
+        '    --dockerfile)\n'
+        '      while IFS= read -r l; do printf "%s\\n" "$l"; done < "$2" \\\n'
+        f'        > "{copy}" ;;\n'
+        '    --digest-file) df="$2" ;;\n'
+        '  esac\n'
+        '  shift\n'
+        'done\n'
+        'printf "%s\\n" "$d" > "$df"\n'
+        "exit 0\n"
     )
     stub.chmod(0o755)
-    return stub
+    return leerie_repo, log
+
+
+def _run_ensure(tmp_path: Path, *, per_repo: bool, cache: str = "",
+                rc: int = 0) -> tuple[subprocess.CompletedProcess, Path,
+                                      Path, str]:
+    """Run the launcher's real `_set_fly_per_repo_image` (per_repo) and
+    `ensure_image` on the tag `resolve_fly_image_tag` gives; return (result,
+    build-push log, cache file, tag)."""
+    launcher = _launcher_text()
+    build_block = repo_build_functions(launcher)
+    fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
+    leerie_repo, log = _install_build_push(tmp_path, rc)
+    _make_flyctl_stub(tmp_path)
+    user_repo = tmp_path / "user-repo"
+    user_repo.mkdir()
+    df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
+    tag = BASE_TAG
+    if per_repo:
+        (user_repo / ".leerie").mkdir()
+        (user_repo / ".leerie" / "Dockerfile").write_text(df_content)
+        repo_hash = hashlib.sha256(df_content.encode()).hexdigest()[:12]
+        tag = f"{BASE_TAG}-{repo_hash}"
+    cache_dir = tmp_path / "leerie"
+    cache_dir.mkdir()
+    cache_file = cache_dir / "published-tags.txt"
+    if cache:
+        cache_file.write_text(cache)
+    body = (("_set_fly_per_repo_image\n" if per_repo else "")
+            + 'ensure_image "$(resolve_fly_image_tag)"\n'
+            + 'echo "ref=$FLY_IMAGE_REF"\n')
+    script = _HARNESS_PREFIX + build_block + "\n" + fly_block + "\n" + body
+    env = {
+        "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
+        "HOME": str(tmp_path),
+        "XDG_CACHE_HOME": str(tmp_path),  # cache_dir = tmp_path/leerie/
+        "LEERIE_VERSION": "0.99.test",
+        "LEERIE_FLY_APP": "testapp",
+        "LEERIE_REPO": str(leerie_repo),
+        "USER_REPO": str(user_repo),
+        "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
+    }
+    result = subprocess.run(["bash", "-c", script], env=env,
+                            capture_output=True, text=True)
+    return result, log, cache_file, tag
 
 
 def _make_flyctl_stub(tmp_path: Path, app: str = "testapp") -> Path:
@@ -279,311 +352,139 @@ def _make_flyctl_stub(tmp_path: Path, app: str = "testapp") -> Path:
     return make_fake_flyctl(tmp_path, case_body)
 
 
-def _run_ensure_image(
-    tag: str,
-    tmp_path: Path,
-    extra_env: dict | None = None,
-    build_push_rc: int = 0,
-    cache_hits: list[str] | None = None,
-) -> tuple[subprocess.CompletedProcess, Path, Path]:
-    """Run ensure_image in a harness; return (result, build_push_log, cache_file).
-
-    ensure_image resolves cache_dir as ${XDG_CACHE_HOME:-$HOME/.cache}/leerie.
-    We set XDG_CACHE_HOME to tmp_path so cache_dir = tmp_path/leerie/.
-    """
-    launcher = _launcher_text()
-    build_block = repo_build_functions(launcher)
-    fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
-
-    build_push_stub = _make_build_push_stub(tmp_path, build_push_rc)
-    _make_flyctl_stub(tmp_path)
-    build_push_log = tmp_path / "build-push.log"
-    # cache_dir = XDG_CACHE_HOME/leerie = tmp_path/leerie
-    cache_dir = tmp_path / "leerie"
-    cache_dir.mkdir()
-    cache_file = cache_dir / "published-tags.txt"
-    if cache_hits:
-        cache_file.write_text("\n".join(cache_hits) + "\n")
-
-    # Override LEERIE_REPO to point build-push path at our stub.
-    leerie_repo = tmp_path / "leerie-repo"
-    leerie_repo.mkdir()
-    bp_dir = leerie_repo / "scripts" / "remote"
-    bp_dir.mkdir(parents=True)
-    import shutil
-    shutil.copy(build_push_stub, bp_dir / "build-push.sh")
-    (bp_dir / "build-push.sh").chmod(0o755)
-
-    body = f'ensure_image "{tag}"\necho "rc=$?"'
-    script = (
-        _HARNESS_PREFIX
-        + build_block
-        + "\n"
-        + fly_block
-        + "\n"
-        + body
-    )
-
-    env = {
-        "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
-        "HOME": str(tmp_path),
-        "XDG_CACHE_HOME": str(tmp_path),  # cache_dir = tmp_path/leerie/
-        "LEERIE_VERSION": "0.99.test",
-        "LEERIE_FLY_APP": "testapp",
-        "LEERIE_REPO": str(leerie_repo),
-        "USER_REPO": str(tmp_path / "user-repo"),
-    }
-    if extra_env:
-        env.update(extra_env)
-
-    result = subprocess.run(
-        ["bash", "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    return result, build_push_log, cache_file
-
-
 def test_ensure_image_base_cache_hit(tmp_path):
-    """When tag is already in published-tags.txt, build-push is not called."""
-    tag = "registry.fly.io/testapp:0.99.test"
-    result, bp_log, _ = _run_ensure_image(
-        tag, tmp_path, cache_hits=[tag]
-    )
+    """A cached digest for the tag: build-push is not called, and the
+    machine starts from that digest."""
+    result, bp_log, _, _ = _run_ensure(
+        tmp_path, per_repo=False, cache=f"{BASE_TAG} {BASE_DIGEST}\n")
     assert result.returncode == 0, result.stderr
     assert not bp_log.exists(), "build-push should not have been called on cache hit"
-    assert "rc=0" in result.stdout
+    assert f"ref=registry.fly.io/testapp@{BASE_DIGEST}" in result.stdout
 
 
 def test_ensure_image_base_cache_miss_calls_build_push(tmp_path):
-    """On cache miss, build-push.sh is called and tag appended to cache."""
-    tag = "registry.fly.io/testapp:0.99.test"
-    result, bp_log, cache_file = _run_ensure_image(tag, tmp_path)
+    """On a miss, build-push.sh pushes exactly the tag and reports its
+    digest, which is recorded and started from."""
+    result, bp_log, cache_file, _ = _run_ensure(tmp_path, per_repo=False)
     assert result.returncode == 0, result.stderr
-    assert bp_log.exists(), "build-push should have been called"
     log = bp_log.read_text()
     assert "--push" in log
     assert "--app testapp" in log
-    # Tag should now be in cache
-    assert tag in cache_file.read_text()
+    assert f"--tag {BASE_TAG} --digest-file " in log
+    assert cache_file.read_text() == f"{BASE_TAG} {BASE_DIGEST}\n"
+    assert f"ref=registry.fly.io/testapp@{BASE_DIGEST}" in result.stdout
 
 
 def test_ensure_image_base_build_push_failure(tmp_path):
-    """When build-push.sh fails, ensure_image returns 1."""
-    tag = "registry.fly.io/testapp:0.99.test"
-    result, _, _ = _run_ensure_image(tag, tmp_path, build_push_rc=1)
-    assert result.returncode != 0 or "rc=1" in result.stdout
+    """When build-push.sh fails, ensure_image fails and records nothing."""
+    result, _, cache_file, _ = _run_ensure(tmp_path, per_repo=False, rc=1)
+    assert result.returncode != 0
+    assert not cache_file.exists()
 
 
-# ---------------------------------------------------------------------------
-# ensure_image — per-repo derived image path
-# ---------------------------------------------------------------------------
-
-def _run_ensure_image_per_repo(
-    tmp_path: Path,
-    build_push_rc: int = 0,
-    base_cached: bool = False,
-) -> tuple[subprocess.CompletedProcess, Path, Path, str, str]:
-    """Run ensure_image with _FLY_PER_REPO_DOCKERFILE set (per-repo path)."""
-    launcher = _launcher_text()
-    build_block = repo_build_functions(launcher)
-    fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
-
-    user_repo = tmp_path / "user-repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
-    (leerie_dir / "Dockerfile").write_text(df_content)
-
-    repo_hash = hashlib.sha256(df_content.encode()).hexdigest()[:12]
-    base_tag = "registry.fly.io/testapp:0.99.test"
-    per_repo_tag = f"registry.fly.io/testapp:0.99.test-{repo_hash}"
-
-    build_push_log = tmp_path / "build-push.log"
-    build_push_stub = tmp_path / "build-push.sh"
-    build_push_stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f"echo \"$@\" >> {build_push_log}\n"
-        f"exit {build_push_rc}\n"
-    )
-    build_push_stub.chmod(0o755)
-
-    flyctl_stub = tmp_path / "flyctl"
-    flyctl_stub.write_text(
-        f'#!/usr/bin/env bash\n'
-        f'if [ "${{1:-}}" = "apps" ]; then\n'
-        f'  printf \'[{{"Name":"testapp"}}]\\n\'\n'
-        f'  exit 0\nfi\nexit 0\n'
-    )
-    flyctl_stub.chmod(0o755)
-
-    leerie_repo = tmp_path / "leerie-repo"
-    scripts_dir = leerie_repo / "scripts" / "remote"
-    scripts_dir.mkdir(parents=True)
-    import shutil
-    shutil.copy(build_push_stub, scripts_dir / "build-push.sh")
-    (scripts_dir / "build-push.sh").chmod(0o755)
-
-    # cache_dir = XDG_CACHE_HOME/leerie = tmp_path/leerie/
-    cache_dir = tmp_path / "leerie"
-    cache_dir.mkdir(parents=True)
-    cache_file = cache_dir / "published-tags.txt"
-    if base_cached:
-        cache_file.write_text(base_tag + "\n")
-
-    body = (
-        '_set_fly_per_repo_image\n'
-        f'ensure_image "{per_repo_tag}"\n'
-        f'echo "rc=$?"\n'
-    )
-    script = _HARNESS_PREFIX + build_block + "\n" + fly_block + "\n" + body
-
-    env = {
-        "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
-        "HOME": str(tmp_path),
-        "XDG_CACHE_HOME": str(tmp_path),  # cache_dir = tmp_path/leerie/
-        "LEERIE_VERSION": "0.99.test",
-        "LEERIE_FLY_APP": "testapp",
-        "LEERIE_REPO": str(leerie_repo),
-        "USER_REPO": str(user_repo),
-        "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
-    }
-
-    result = subprocess.run(
-        ["bash", "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    return result, build_push_log, cache_file, per_repo_tag, base_tag
-
-
-def test_ensure_image_per_repo_calls_build_push_with_dockerfile(tmp_path):
-    """Per-repo path calls build-push.sh with --dockerfile and --build-arg."""
-    result, bp_log, cache_file, per_repo_tag, base_tag = \
-        _run_ensure_image_per_repo(tmp_path, base_cached=True)
+def test_ensure_image_per_repo_pushes_its_own_tag_from_the_base_digest(
+        tmp_path):
+    """The repository image is pushed under its own tag, never the base's,
+    built FROM the base's digest, with its layout checked against that
+    base; the machine starts from the digest pushed."""
+    cache = f"{BASE_TAG} {BASE_DIGEST}\n"
+    result, bp_log, cache_file, tag = _run_ensure(tmp_path, per_repo=True,
+                                                  cache=cache)
     assert result.returncode == 0, result.stderr
-    assert bp_log.exists(), f"build-push not called. stderr: {result.stderr}"
-    log = bp_log.read_text()
+    invocations = bp_log.read_text().strip().split("\n")
+    assert len(invocations) == 1, invocations
+    log = invocations[0]
+    base_ref = f"registry.fly.io/testapp@{BASE_DIGEST}"
     # leerie's Dockerfile around the repository's, from the committed tree,
     # its final stage the target (DESIGN §6 *The orchestrator's root is
     # leerie's; a repository's root is only a confined process's*).
-    assert "--dockerfile" in log
-    assert "/.image-build/b." in log and ".leerie/Dockerfile" not in log
+    assert re.search(r"--dockerfile \S+/\.image-build/b\.\w+/Dockerfile", log)
     assert re.search(r"--context \S+/\.image-build/b\.\w+/context", log)
     assert re.search(r"--target leerie-final-[0-9a-f]{16}", log)
-    assert f"BASE_IMAGE={base_tag}" in log
-    assert "--tag" in log
-    assert per_repo_tag in log
+    assert f"--build-arg BASE_IMAGE={base_ref}" in log
+    assert f"--layout-base {base_ref}" in log
+    assert f"--tag {tag} --digest-file " in log
+    assert f"--tag {BASE_TAG} " not in log
+    wrapper = (tmp_path / "dockerfile.copy").read_text()
+    assert f"FROM {base_ref} AS leerie-final-" in wrapper
+    assert f"FROM {BASE_TAG} " not in wrapper
+    assert cache_file.read_text() == (
+        cache + f"{tag} {FLY_REPO_DIGEST} {BASE_DIGEST} {LAYOUT}\n")
+    assert f"ref=registry.fly.io/testapp@{FLY_REPO_DIGEST}" in result.stdout
     # The build directory is removed after the push.
     assert not list((tmp_path / "state" / ".image-build").glob("b.*"))
 
 
-def test_ensure_image_per_repo_caches_per_repo_tag(tmp_path):
-    """Per-repo tag is recorded in published-tags.txt after successful build."""
-    result, bp_log, cache_file, per_repo_tag, _ = \
-        _run_ensure_image_per_repo(tmp_path, base_cached=True)
-    assert result.returncode == 0, result.stderr
-    assert per_repo_tag in cache_file.read_text()
-
-
 def test_ensure_image_per_repo_ensures_base_first_when_not_cached(tmp_path):
-    """When base is not cached, build-push is called for base first, then per-repo."""
-    result, bp_log, cache_file, per_repo_tag, base_tag = \
-        _run_ensure_image_per_repo(tmp_path, base_cached=False)
+    """No cached base digest: the base is pushed under the base tag first,
+    then the repository image under its own."""
+    result, bp_log, cache_file, tag = _run_ensure(tmp_path, per_repo=True)
     assert result.returncode == 0, result.stderr
-    assert bp_log.exists()
-    # Two build-push invocations: one for base (no --dockerfile), one for per-repo
     invocations = bp_log.read_text().strip().split("\n")
-    assert len(invocations) >= 2, f"expected >=2 build-push calls, got: {invocations}"
-    # First call: no --dockerfile (base image)
+    assert len(invocations) == 2, invocations
     assert "--dockerfile" not in invocations[0], invocations[0]
-    # Second call: has --dockerfile (per-repo)
+    assert f"--tag {BASE_TAG} --digest-file " in invocations[0]
     assert "--dockerfile" in invocations[1], invocations[1]
-    # Both tags cached
-    cached = cache_file.read_text()
-    assert base_tag in cached
-    assert per_repo_tag in cached
+    assert f"--tag {tag} --digest-file " in invocations[1]
+    assert cache_file.read_text() == (
+        f"{BASE_TAG} {BASE_DIGEST}\n"
+        f"{tag} {FLY_REPO_DIGEST} {BASE_DIGEST} {LAYOUT}\n")
 
 
 def test_ensure_image_per_repo_cache_hit_skips_build(tmp_path):
-    """When per-repo tag is already in published-tags.txt, build is skipped."""
-    launcher = _launcher_text()
-    build_block = repo_build_functions(launcher)
-    fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
-
-    user_repo = tmp_path / "user-repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\n"
-    (leerie_dir / "Dockerfile").write_text(df_content)
-    repo_hash = hashlib.sha256(df_content.encode()).hexdigest()[:12]
-    per_repo_tag = f"registry.fly.io/testapp:0.99.test-{repo_hash}"
-
-    build_push_log = tmp_path / "build-push.log"
-    build_push_stub = tmp_path / "build-push.sh"
-    # Would fail if called — verifies cache hit skips it
-    build_push_stub.write_text(
-        f"#!/usr/bin/env bash\necho \"$@\" >> {build_push_log}\nexit 1\n"
-    )
-    build_push_stub.chmod(0o755)
-
-    leerie_repo = tmp_path / "leerie-repo"
-    scripts_dir = leerie_repo / "scripts" / "remote"
-    scripts_dir.mkdir(parents=True)
-    import shutil
-    shutil.copy(build_push_stub, scripts_dir / "build-push.sh")
-    (scripts_dir / "build-push.sh").chmod(0o755)
-
-    flyctl_stub = tmp_path / "flyctl"
-    flyctl_stub.write_text(
-        f'#!/usr/bin/env bash\nprintf \'[{{"Name":"testapp"}}]\\n\'\nexit 0\n'
-    )
-    flyctl_stub.chmod(0o755)
-
-    # cache_dir = XDG_CACHE_HOME/leerie = tmp_path/leerie/
-    cache_dir = tmp_path / "leerie"
-    cache_dir.mkdir(parents=True)
-    cache_file = cache_dir / "published-tags.txt"
-    # Pre-populate with per-repo tag
-    cache_file.write_text(per_repo_tag + "\n")
-
-    body = (
-        '_set_fly_per_repo_image\n'
-        f'ensure_image "{per_repo_tag}"\n'
-        f'echo "rc=$?"\n'
-    )
-    script = _HARNESS_PREFIX + build_block + "\n" + fly_block + "\n" + body
-
-    env = {
-        "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
-        "HOME": str(tmp_path),
-        "XDG_CACHE_HOME": str(tmp_path),  # cache_dir = tmp_path/leerie/
-        "LEERIE_VERSION": "0.99.test",
-        "LEERIE_FLY_APP": "testapp",
-        "LEERIE_REPO": str(leerie_repo),
-        "USER_REPO": str(user_repo),
-        "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
-    }
-    result = subprocess.run(
-        ["bash", "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    """The repository image cached on the base digest cached now: no build,
+    and the machine starts from its digest."""
+    df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
+    tag = f"{BASE_TAG}-{hashlib.sha256(df_content.encode()).hexdigest()[:12]}"
+    result, bp_log, _, _ = _run_ensure(
+        tmp_path, per_repo=True,
+        cache=(f"{BASE_TAG} {BASE_DIGEST}\n"
+               f"{tag} {FLY_REPO_DIGEST} {BASE_DIGEST} {LAYOUT}\n"))
     assert result.returncode == 0, result.stderr
-    assert "rc=0" in result.stdout
-    # build-push should NOT have been called (cache hit)
-    assert not build_push_log.exists(), f"build-push was called on cache hit: {build_push_log.read_text()}"
+    assert not bp_log.exists(), bp_log.read_text()
+    assert f"ref=registry.fly.io/testapp@{FLY_REPO_DIGEST}" in result.stdout
+
+
+def test_ensure_image_per_repo_on_another_base_is_rebuilt(tmp_path):
+    """A repository image cached on a base digest other than the one cached
+    now is built again on the current base."""
+    df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
+    tag = f"{BASE_TAG}-{hashlib.sha256(df_content.encode()).hexdigest()[:12]}"
+    result, bp_log, _, _ = _run_ensure(
+        tmp_path, per_repo=True,
+        cache=(f"{BASE_TAG} {BASE_DIGEST}\n"
+               f"{tag} {OTHER_DIGEST} {OTHER_DIGEST} {LAYOUT}\n"))
+    assert result.returncode == 0, result.stderr
+    assert f"--tag {tag} --digest-file " in bp_log.read_text()
+    assert f"ref=registry.fly.io/testapp@{FLY_REPO_DIGEST}" in result.stdout
+
+
+def test_ensure_image_per_repo_in_another_layout_is_rebuilt(tmp_path):
+    """A repository image cached in a layout other than REPO_IMAGE_LAYOUT
+    (or with none recorded) is built again, never reused (review round 29,
+    execution L2)."""
+    df_content = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
+    tag = f"{BASE_TAG}-{hashlib.sha256(df_content.encode()).hexdigest()[:12]}"
+    for stale in (f"{tag} {OTHER_DIGEST} {BASE_DIGEST} worker-root-0\n",
+                  f"{tag} {OTHER_DIGEST} {BASE_DIGEST}\n"):
+        sub = tmp_path / str(len(stale))
+        sub.mkdir()
+        result, bp_log, _, _ = _run_ensure(
+            sub, per_repo=True, cache=f"{BASE_TAG} {BASE_DIGEST}\n" + stale)
+        assert result.returncode == 0, result.stderr
+        assert f"--tag {tag} --digest-file " in bp_log.read_text()
+        assert f"ref=registry.fly.io/testapp@{FLY_REPO_DIGEST}" in \
+            result.stdout
 
 
 def test_ensure_image_per_repo_build_push_failure(tmp_path):
-    """When build-push.sh fails on per-repo build, ensure_image returns non-zero."""
-    result, _, _, _, _ = _run_ensure_image_per_repo(
-        tmp_path, build_push_rc=1, base_cached=True
-    )
-    assert result.returncode != 0 or "rc=1" in result.stdout
+    """When build-push.sh fails on per-repo build, ensure_image fails and
+    records nothing for the repository image."""
+    result, _, cache_file, tag = _run_ensure(
+        tmp_path, per_repo=True, rc=1,
+        cache=f"{BASE_TAG} {BASE_DIGEST}\n")
+    assert result.returncode != 0
+    assert tag not in cache_file.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -653,3 +554,34 @@ def test_fly_image_tag_pipeline_without_dockerfile(tmp_path):
     assert result.returncode == 0, result.stderr
     tag = result.stdout.strip().removeprefix("tag=")
     assert tag == "registry.fly.io/myapp:1.5.0", tag
+
+
+def test_the_machine_starts_from_the_digest_ensure_image_pushed(tmp_path):
+    """The launcher's Fly branch, verbatim from `_set_fly_per_repo_image`
+    through the build directory's removal: after `ensure_image`, the image
+    handed to provision_machine (FLY_IMAGE_TAG) is the digest reference it
+    set, not the tag (review round 29, isolation F1)."""
+    launcher = _launcher_text()
+    start = launcher.index("  _set_fly_per_repo_image\n  FLY_IMAGE_TAG=")
+    end = launcher.index("  _repo_build_done\n", start) + len(
+        "  _repo_build_done\n")
+    wiring = launcher[start:end]
+    digest = "sha256:" + "f" * 64
+    body = (
+        "_set_fly_per_repo_image() { :; }\n"
+        "_repo_build_done() { :; }\n"
+        'resolve_fly_image_tag() { echo "registry.fly.io/testapp:1.0"; }\n'
+        "ensure_image() {\n"
+        '  [ "$1" = "registry.fly.io/testapp:1.0" ] || return 1\n'
+        f'  FLY_IMAGE_REF="registry.fly.io/testapp@{digest}"\n'
+        "}\n"
+        'NO_AUTO_PUBLISH=false\n'
+        + wiring
+        + 'echo "machine=$FLY_IMAGE_TAG"\n'
+        + "bash -c 'echo \"exported=$FLY_IMAGE_TAG\"'\n")
+    result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + body],
+                            env={"PATH": "/usr/bin:/bin"},
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert f"machine=registry.fly.io/testapp@{digest}" in result.stdout
+    assert f"exported=registry.fly.io/testapp@{digest}" in result.stdout

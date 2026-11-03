@@ -21,6 +21,10 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.fake_registry import FakeRegistry
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_PUSH = REPO_ROOT / "scripts" / "remote" / "build-push.sh"
 
@@ -282,3 +286,77 @@ def test_unknown_arg_still_rejected(tmp_path: Path):
     r = _run(tmp_path, "--app", "testapp", "--unknown-flag")
     assert r.returncode == 1
     assert "unknown argument" in r.stderr
+
+
+# --- the image pushed is exactly the one asked for (review round 29,
+# isolation F1) -------------------------------------------------------------
+
+def test_remote_mode_pushes_exactly_the_requested_tag(tmp_path: Path):
+    """The remote builder's tag is `registry.fly.io/<app>:<--image-label>`,
+    so the label is the requested tag's own: a repository image's push never
+    lands on the base tag `<app>:<version>`."""
+    r = _run(tmp_path, "--app", "testapp", "--push",
+             "--tag", "registry.fly.io/testapp:1.2.3-0123456789ab")
+    assert r.returncode == 0, r.stderr
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert "--image-label 1.2.3-0123456789ab" in flyctl_log, flyctl_log
+
+
+@pytest.mark.parametrize("tag", [
+    "registry.fly.io/otherapp:1.0",
+    "example.com/testapp:1.0",
+    "registry.fly.io/testapp",
+])
+def test_remote_mode_refuses_a_tag_it_cannot_push(tmp_path: Path, tag):
+    r = _run(tmp_path, "--app", "testapp", "--push", "--tag", tag)
+    assert r.returncode == 1
+    assert "pushes only registry.fly.io/testapp:<label>" in r.stderr
+    assert not (tmp_path / "flyctl.log").exists()
+
+
+def _local_push(tmp_path: Path, registry: FakeRegistry, *extra: str):
+    return _run(tmp_path, "--app", "testapp", "--push", "--local-build",
+                "--registry", f"{registry.host}/testapp",
+                "--tag", f"{registry.host}/testapp:1.0-r", *extra)
+
+
+def test_digest_file_records_what_the_tag_names(tmp_path: Path):
+    with FakeRegistry() as registry:
+        d = registry.put_image("testapp", "1.0-r", ["sha256:" + "1" * 64],
+                               {"User": "root"})
+        out = tmp_path / "digest"
+        r = _local_push(tmp_path, registry, "--digest-file", str(out))
+    assert r.returncode == 0, r.stderr
+    assert out.read_text() == d + "\n"
+
+
+def test_layout_base_refuses_an_image_that_is_not_the_base_plus_one(
+        tmp_path: Path):
+    """The pushed repository image must be the base's layers plus one with
+    the base's configuration, as `_check_repo_image` requires locally; one
+    that is not is refused and no digest is reported for it."""
+    with FakeRegistry() as registry:
+        layers = ["sha256:" + "1" * 64]
+        base = registry.put_image("testapp", "1.0", layers, {"User": "root"})
+        registry.put_image("testapp", "1.0-r", layers + ["sha256:" + "2" * 64],
+                           {"User": "1000"})
+        out = tmp_path / "digest"
+        r = _local_push(tmp_path, registry, "--digest-file", str(out),
+                        "--layout-base", f"{registry.host}/testapp@{base}")
+        assert r.returncode == 1
+        assert "is not" in r.stderr and "plus its worker root" in r.stderr
+        assert not out.exists()
+
+        registry.put_image("testapp", "1.0-r", layers + ["sha256:" + "2" * 64],
+                           {"User": "root"})
+        r = _local_push(tmp_path, registry, "--digest-file", str(out),
+                        "--layout-base", f"{registry.host}/testapp@{base}")
+    assert r.returncode == 0, r.stderr
+    assert out.read_text().startswith("sha256:")
+
+
+def test_digest_file_without_push_is_refused(tmp_path: Path):
+    r = _run(tmp_path, "--app", "testapp", "--local-build",
+             "--digest-file", str(tmp_path / "d"))
+    assert r.returncode == 1
+    assert "pass --push" in r.stderr

@@ -510,7 +510,7 @@ def test_fly_heredoc_values_are_json_encoded_not_raw() -> None:
 # either a typo or prose that will be expanded anyway.
 _KNOWN_HEREDOC_SUBSTITUTIONS = {
     "fly": {
-        "_host_tz_json", "_leerie_commit_json",
+        "_host_tz_json", "_leerie_commit_json", "_repo_image_json",
         "_oauth_token_json", "_oauth_tokens_json",
         "_bedrock_bearer_token_json", "_bedrock_use_bedrock_json",
         "_bedrock_bearer_region_json", "_BEDROCK_BEARER_ACTIVE",

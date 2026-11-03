@@ -203,6 +203,32 @@ def test_confined_argv_names_the_worker_root_only_where_it_is_used(
     assert orch._worker_root() is None
 
 
+def test_a_run_started_on_a_repository_image_needs_its_worker_root(
+        orch, tmp_path, monkeypatch, capsys):
+    """The launcher says the run starts on a repository image; an image
+    without a worker root (an older layout reused, review round 29
+    execution L2) stops the run before anything runs, isolation or not."""
+    monkeypatch.setattr(orch, "WORKER_ROOT", tmp_path / "absent")
+    ran = []
+    monkeypatch.setattr(orch.subprocess, "run", lambda argv, **kw: (
+        ran.append(argv) or subprocess.CompletedProcess(argv, 0, "", "")))
+    monkeypatch.delenv(orch.REPO_IMAGE_ENV, raising=False)
+    orch._require_worker_view()          # the base image: nothing expected
+    monkeypatch.setenv(orch.REPO_IMAGE_ENV, "1")
+    with pytest.raises(SystemExit):
+        orch._require_worker_view()
+    assert "has no repository root" in capsys.readouterr().err
+    assert ran == []
+    root = tmp_path / "wr"
+    root.mkdir()
+    monkeypatch.setattr(orch, "WORKER_ROOT", root)
+    orch._require_worker_view()          # isolation off: nothing runs
+    launcher = (REPO_ROOT / "leerie").read_text()
+    assert '-e "LEERIE_REPO_IMAGE=${REPO_IMAGE_REF:+1}"' in launcher
+    assert 'child_env["LEERIE_REPO_IMAGE"] = ${_repo_image_json}' in launcher
+    assert '"${_FLY_REPO_DF_SHA:+1}")"' in launcher
+
+
 def test_the_entry_stops_a_run_whose_commands_miss_the_worker_root(
         orch, tmp_path, monkeypatch):
     root = tmp_path / "wr"

@@ -319,6 +319,34 @@ file that records no digest reuses nothing. The shared `nerdctl` stub
 branch has run. Falsified: with the launcher before this change, all four
 fail.
 
+On Fly, an image is pushed under exactly the tag asked for and a machine
+starts from the digest leerie pushed (review round 29, isolation F1).
+`tests/test_build_push_modes.py`: the remote builder's `--image-label` is
+the requested tag's label; a tag outside `registry.fly.io/<app>` is refused
+before flyctl runs; `--digest-file` records the digest a registry holds
+under the tag; `--layout-base` refuses a pushed image that is not the
+base's layers plus one with its configuration, and reports no digest for
+it. `tests/test_registry_image.py` drives `scripts/remote/registry_image.py`
+against `tests/fake_registry.py` (a loopback registry behind a Bearer token
+challenge): the digest, a registry whose digest disagrees with the body,
+the layout rule and each way to break it, labels left out, a linux/amd64
+pick from an index. `tests/test_fly_per_repo_image.py` and
+`tests/test_ensure_image.py` run the launcher's `ensure_image`: the cache
+records `<tag> <digest>` (and the base digest for a repository image); a
+repository image is pushed under its own tag, built `FROM` the base's
+digest with `--layout-base`; it is rebuilt when cached on another base; a
+cached tag without a digest is no hit; and the Fly branch hands
+`provision_machine` the digest reference. Falsified: with `build-push.sh`
+before this change, 7 of `test_build_push_modes.py`'s tests fail; with the
+launcher before it, the Fly-branch wiring test and every new
+`ensure_image` test fail. A repository image cached in another layout, or
+with none recorded, is rebuilt
+(`test_ensure_image_per_repo_in_another_layout_is_rebuilt`; fails with the
+layout condition dropped), and a run the launcher started on a repository
+image whose image has no worker root stops before anything runs
+(`tests/test_worker_root_view.py::test_a_run_started_on_a_repository_image_needs_its_worker_root`;
+fails with the check removed) (review round 29, execution L2).
+
 ## Worker cgroup containment
 
 Worker cgroup containment (DESIGN §6 *Memory containment*) is tested in

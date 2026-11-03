@@ -8553,15 +8553,19 @@ resolve_fly_image_tag() {
 
 # Module-level context set by _set_fly_per_repo_image() and read by
 # ensure_image() to build the per-repo derived image on Fly.
-_FLY_PER_REPO_DOCKERFILE=""
+_FLY_REPO_DF_SHA=""
 _FLY_BASE_TAG=""
+# The image a Fly Machine starts from: registry.fly.io/<app>@<digest>, the
+# digest leerie pushed under the tag (set by ensure_image).
+FLY_IMAGE_REF=""
 
 # When .leerie/Dockerfile is present (real or auto-generated), set
 # LEERIE_FLY_IMAGE to registry.fly.io/$APP:$VERSION-$REPO_HASH so that
-# resolve_fly_image_tag() returns the per-repo tag. Writes leerie's
-# Dockerfile for the repository image (_repo_image_prepare) and records it
-# and the base tag in _FLY_PER_REPO_DOCKERFILE / _FLY_BASE_TAG for
-# ensure_image() to use when invoking build-push.sh.
+# resolve_fly_image_tag() returns the per-repo tag. $REPO_HASH is the
+# digest of the Dockerfile bytes leerie's Dockerfile is made from
+# (_repo_image_prepare), recorded in _FLY_REPO_DF_SHA with the base tag in
+# _FLY_BASE_TAG for ensure_image(), which makes leerie's Dockerfile again
+# on the base's digest and requires the same bytes.
 # Idempotent: called once before resolve_fly_image_tag().
 _set_fly_per_repo_image() {
   if [ ! -f "$USER_REPO/.leerie/Dockerfile" ]; then
@@ -8579,31 +8583,81 @@ _set_fly_per_repo_image() {
   per_repo_tag="registry.fly.io/$fly_app:${version}-${repo_hash}"
   LEERIE_FLY_IMAGE="$per_repo_tag"
   export LEERIE_FLY_IMAGE
-  _FLY_PER_REPO_DOCKERFILE="$_REPO_BUILD_DIR/Dockerfile"
+  _FLY_REPO_DF_SHA="$_REPO_DF_SHA"
   _FLY_BASE_TAG="$base_tag"
   remote_log "remote: per-repo Fly image tag: $per_repo_tag (base: $base_tag)"
 }
 
 # --- remote: ensure published image -------------------------------------
 # Closes the operator-step gap where the first remote run fails because
-# the registry tag wasn't built/pushed yet. Strategy: cache positive hits
-# in ~/.cache/leerie/published-tags.txt; on miss, invoke build-push.sh
-# --push (which is idempotent at the registry — pushing an already-
-# present manifest just no-ops the layers). The cache is a *positive*
-# list only, so a manual `flyctl image` deletion is self-healing.
+# the registry tag wasn't built/pushed yet, and pins what a machine runs
+# (DESIGN §6½ *Per-repo container image*, Fly). The cache,
+# ~/.cache/leerie/published-tags.txt, holds one line per image leerie
+# pushed: `<tag> <digest>`, and for a repository image `<tag> <digest>
+# <base digest> <layout>` (REPO_IMAGE_LAYOUT). A machine starts from `<repository>@<digest>`, never from
+# the tag, so a tag something else overwrote since is never run; a line
+# without a digest is no hit. On a miss, build-push.sh pushes exactly the
+# tag (--tag) and reports the digest the registry holds under it
+# (--digest-file).
 #
-# When _FLY_PER_REPO_DOCKERFILE is set (a per-repo .leerie/Dockerfile
-# exists), the base image is ensured first; then build-push.sh is called
-# with --dockerfile and --build-arg BASE_IMAGE=<base_tag> to build and
-# push the derived per-repo image.
+# When _FLY_REPO_DF_SHA is set (a per-repo .leerie/Dockerfile exists), the
+# base image is ensured first; the repository image is then built FROM the
+# base's digest, and build-push.sh requires the pushed image to be that
+# base's layers plus one with its configuration (--layout-base), as
+# _check_repo_image does locally. A cached repository image is reused only
+# when it was built on the base digest cached now, in this layout.
 #
 # Skipped entirely when NO_AUTO_PUBLISH=true (the operator manages
 # publishes themselves and accepts the manifest-not-found failure mode).
+
+# _fly_cache_get <cache-file> <tag> — "<digest> <base digest> <layout>"
+# from the last line for <tag> (fields absent print empty).
+_fly_cache_get() {
+  [ -f "$1" ] || return 0
+  awk -v t="$2" '$1 == t { d = $2; b = $3; l = $4 } END { print d, b, l }' "$1"
+}
+
+# _fly_digest_ok <digest> — true for sha256:<64 hex>.
+_fly_digest_ok() {
+  [[ "${1:-}" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
+# _fly_push <build-push> <cache-dir> <tag> [build-push args...] — pushes
+# <tag> with the given arguments; sets _FLY_PUSHED to the digest pushed.
+_FLY_PUSHED=""
+_fly_push() {
+  local build_push="$1" cache_dir="$2" tag="$3" digest_file
+  shift 3
+  _FLY_PUSHED=""
+  mkdir -p "$cache_dir" && digest_file="$(mktemp "$cache_dir/.digest.XXXXXX")" || return 1
+  if ! "$build_push" "$@" --tag "$tag" --digest-file "$digest_file"; then
+    rm -f "$digest_file"
+    return 1
+  fi
+  _FLY_PUSHED="$(head -n 1 "$digest_file")"
+  rm -f "$digest_file"
+  if ! _fly_digest_ok "$_FLY_PUSHED"; then
+    remote_log "error: build-push.sh reported no digest for $tag"
+    return 1
+  fi
+}
+
 ensure_image() {
-  local tag="$1" cache_dir cache_file
+  local tag="$1" cache_dir cache_file digest base_digest cached_base cached_layout
   cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/leerie"
   cache_file="$cache_dir/published-tags.txt"
-  if [ -f "$cache_file" ] && grep -Fxq "$tag" "$cache_file" 2>/dev/null; then
+  FLY_IMAGE_REF=""
+  read -r digest cached_base cached_layout <<< "$(_fly_cache_get "$cache_file" "$tag")"
+  if [ -n "${_FLY_REPO_DF_SHA:-}" ]; then
+    read -r base_digest _ <<< "$(_fly_cache_get "$cache_file" "$_FLY_BASE_TAG")"
+    if _fly_digest_ok "$digest" && _fly_digest_ok "$base_digest" \
+       && [ "$cached_base" = "$base_digest" ] \
+       && [ "$cached_layout" = "$REPO_IMAGE_LAYOUT" ]; then
+      FLY_IMAGE_REF="${tag%:*}@$digest"
+      return 0
+    fi
+  elif _fly_digest_ok "$digest"; then
+    FLY_IMAGE_REF="${tag%:*}@$digest"
     return 0
   fi
   local build_push="$LEERIE_REPO/scripts/remote/build-push.sh"
@@ -8643,51 +8697,56 @@ except Exception:
   fi
 
   # Per-repo derived image: ensure the base image is published first, then
-  # build and push the derived image with the per-repo Dockerfile.
-  if [ -n "${_FLY_PER_REPO_DOCKERFILE:-}" ]; then
-    local base_tag="${_FLY_BASE_TAG}"
-    # Ensure base image is cached/published before building the derived one.
-    if [ ! -f "$cache_file" ] || ! grep -Fxq "$base_tag" "$cache_file" 2>/dev/null; then
+  # build and push the derived image FROM the base's digest.
+  if [ -n "${_FLY_REPO_DF_SHA:-}" ]; then
+    local base_tag="$_FLY_BASE_TAG" base_ref
+    if ! _fly_digest_ok "$base_digest"; then
       remote_log "remote: ensuring base image $base_tag is published (needed for per-repo build)"
-      if ! "$build_push" "${build_args[@]}"; then
+      if ! _fly_push "$build_push" "$cache_dir" "$base_tag" "${build_args[@]}"; then
         remote_log "error: build-push.sh failed for base image; remote run cannot proceed"
         return 1
       fi
-      mkdir -p "$cache_dir"
-      printf '%s\n' "$base_tag" >> "$cache_file"
+      base_digest="$_FLY_PUSHED"
+      printf '%s %s\n' "$base_tag" "$base_digest" >> "$cache_file"
     fi
+    base_ref="${base_tag%:*}@$base_digest"
     # Now build and push the repository image: leerie's two-stage
-    # Dockerfile around the repository's (_set_fly_per_repo_image wrote it),
-    # from the committed tree (_repo_build_prepare), its final stage
-    # leerie's base (DESIGN §6 *The orchestrator's root is leerie's; a
-    # repository's root is only a confined process's*).
+    # Dockerfile around the repository's, made again on the base's digest
+    # from the same bytes the tag names (_repo_image_prepare), from the
+    # committed tree (_repo_build_prepare), its final stage leerie's base
+    # (DESIGN §6 *The orchestrator's root is leerie's; a repository's root
+    # is only a confined process's*).
+    _repo_image_prepare "$base_ref"
+    if [ "$_REPO_DF_SHA" != "$_FLY_REPO_DF_SHA" ]; then
+      _repo_build_done
+      remote_log "error: .leerie/Dockerfile changed while leerie was launching; launch again"
+      return 1
+    fi
     _repo_build_prepare
-    local per_repo_args=("${build_args[@]}"
-      --dockerfile "$_FLY_PER_REPO_DOCKERFILE"
-      --context "$_REPO_BUILD_CTX"
-      --target "leerie-final-$_REPO_NONCE"
-      --build-arg "BASE_IMAGE=$base_tag"
-      --tag "$tag"
-    )
     remote_log "remote: ensuring per-repo image $tag is published (cache miss)"
-    if ! "$build_push" "${per_repo_args[@]}"; then
+    if ! _fly_push "$build_push" "$cache_dir" "$tag" "${build_args[@]}" \
+           --dockerfile "$_REPO_BUILD_DIR/Dockerfile" \
+           --context "$_REPO_BUILD_CTX" \
+           --target "leerie-final-$_REPO_NONCE" \
+           --build-arg "BASE_IMAGE=$base_ref" \
+           --layout-base "$base_ref"; then
       _repo_build_done
       remote_log "error: build-push.sh failed for per-repo image; remote run cannot proceed"
       return 1
     fi
     _repo_build_done
-    mkdir -p "$cache_dir"
-    printf '%s\n' "$tag" >> "$cache_file"
+    printf '%s %s %s %s\n' "$tag" "$_FLY_PUSHED" "$base_digest" "$REPO_IMAGE_LAYOUT" >> "$cache_file"
+    FLY_IMAGE_REF="${tag%:*}@$_FLY_PUSHED"
     return 0
   fi
 
   remote_log "remote: ensuring image $tag is published (cache miss)"
-  if ! "$build_push" "${build_args[@]}"; then
+  if ! _fly_push "$build_push" "$cache_dir" "$tag" "${build_args[@]}"; then
     remote_log "error: build-push.sh failed; remote run cannot proceed"
     return 1
   fi
-  mkdir -p "$cache_dir"
-  printf '%s\n' "$tag" >> "$cache_file"
+  printf '%s %s\n' "$tag" "$_FLY_PUSHED" >> "$cache_file"
+  FLY_IMAGE_REF="${tag%:*}@$_FLY_PUSHED"
   return 0
 }
 
@@ -8754,6 +8813,9 @@ if [ "$RUNTIME" = "fly" ]; then
     if ! ensure_image "$FLY_IMAGE_TAG"; then
       exit 1
     fi
+    # The machine starts from the digest leerie pushed, never the tag.
+    FLY_IMAGE_TAG="$FLY_IMAGE_REF"
+    export FLY_IMAGE_TAG
   fi
   _repo_build_done
 
@@ -9112,6 +9174,10 @@ print(json.dumps(sys.argv[1:]))
         # is alphanumeric and carries no such risk, but the pattern is the
         # pattern — and the stray-substitution guard fails loudly if skipped.
         _leerie_commit_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${LEERIE_COMMIT:-}")"
+        # "1" when the machine starts from a repository image (DESIGN §6½
+        # *Per-repo container image*): the orchestrator then stops a run
+        # whose image has no worker root.
+        _repo_image_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${_FLY_REPO_DF_SHA:+1}")"
         _bedrock_bearer_token_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_BEARER_TOKEN_BEDROCK:-}")"
         _bedrock_use_bedrock_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_USE_BEDROCK:-1}")"
         _bedrock_bearer_region_json="$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_REGION:-}")"
@@ -9196,6 +9262,9 @@ child_env["LOGNAME"] = "leerie"
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 child_env["TZ"] = ${_host_tz_json}
 child_env["LEERIE_COMMIT"] = ${_leerie_commit_json}
+# "1" when the machine starts from a repository image: the orchestrator
+# stops a run whose image has no worker root (_require_worker_view).
+child_env["LEERIE_REPO_IMAGE"] = ${_repo_image_json}
 if "${_BEDROCK_BEARER_ACTIVE}" == "true":
     child_env["AWS_BEARER_TOKEN_BEDROCK"] = ${_bedrock_bearer_token_json}
     child_env["CLAUDE_CODE_USE_BEDROCK"] = ${_bedrock_use_bedrock_json}
@@ -10004,6 +10073,7 @@ else
   _leerie_env_denylist=" \
     LEERIE_SKIP_PREPUSH_PREFLIGHT \
     LEERIE_STATE_DIR LEERIE_INSPECT_DIRS LEERIE_HOME LEERIE_REPO \
+    LEERIE_REPO_IMAGE \
     LEERIE_STATE_HOST_DIR LEERIE_HOST_DIR LEERIE_SELF_CMD LEERIE_VERSION \
     LEERIE_TASK_ARG LEERIE_RUN_ID_FILE \
     LEERIE_NO_PUSH LEERIE_GENERATED_SENTINEL LEERIE_RECAPTURE_WROTE \
@@ -10053,6 +10123,10 @@ else
     # launcher-computed, not a user knob, and the forward only carries vars
     # that are exported.
     -e "LEERIE_COMMIT=${LEERIE_COMMIT:-}"
+    # "1" when the run starts on a repository image: the orchestrator then
+    # stops a run whose image has no worker root rather than run the
+    # repository's commands in its own root (_require_worker_view).
+    -e "LEERIE_REPO_IMAGE=${REPO_IMAGE_REF:+1}"
     # The host path of the state root, for RENDERING OPERATOR TEXT ONLY --
     # never for filesystem access, which is why it is deliberately NOT
     # forwarded under its own name. LEERIE_STATE_HOST_DIR is on the deny-list

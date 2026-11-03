@@ -23872,7 +23872,23 @@ def _require_worker_view() -> None:
     worker view; stops the run naming the shim's reason when it is not
     there. Only once the entry has turned isolation on (`_isolated()`): a
     command enters the worker view only through the isolation, and where it
-    is off (a test, a host harness) nothing runs in it."""
+    is off (a test, a host harness) nothing runs in it.
+
+    A run the launcher started on a repository image (`REPO_IMAGE_ENV` is
+    "1") whose image has no worker root stops first, whatever the
+    isolation: the image was built in an older layout or not by leerie,
+    and its own root is the repository's (review round 29, execution L2).
+    """
+    if os.environ.get(REPO_IMAGE_ENV) == "1" and _worker_root() is None:
+        die(f"this run was started on a repository image, but the image has "
+            f"no repository root ({WORKER_ROOT}): it was built in an older "
+            "layout, or not by leerie, so its own root is the repository's. "
+            "Rebuild the repository image (launch again: leerie rebuilds an "
+            "image whose layout or base changed; on Fly, remove its lines "
+            "from ~/.cache/leerie/published-tags.txt). Leerie runs its own "
+            "processes only in its own root (DESIGN §6 *The orchestrator's "
+            "root is leerie's; a repository's root is only a confined "
+            "process's*).")
     if _worker_root() is None or not _isolated():
         return
     argv = _confined_argv(WorkerGrants(rw=("/dev/null",), ro=("/",)),
@@ -24708,6 +24724,9 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
 # leerie's image (`leerie`'s `_repo_image_dockerfile`). Absent in the base
 # image, and wherever no repository image was built.
 WORKER_ROOT = Path("/opt/leerie-worker-root")
+# Set to "1" by the launcher when the run starts on a repository image
+# (`-e` locally, the launch wrapper's environment on Fly).
+REPO_IMAGE_ENV = "LEERIE_REPO_IMAGE"
 
 
 def _worker_root() -> str | None:
