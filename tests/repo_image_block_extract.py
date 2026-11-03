@@ -49,8 +49,9 @@ _stub_image_inspect() {
 
 def repo_build_functions(launcher: str) -> str:
     """The launcher's repository-image build helpers, verbatim:
-    `REPO_IMAGE_LAYOUT`, `_repo_build_prepare`/`_done`/`_fail`,
-    `_repo_image_dockerfile`, `_repo_image_nonce` and `_check_repo_image`
-    (everything from the block's first comment up to `build_repo_image`)."""
+    `REPO_IMAGE_LAYOUT`, `_repo_build_dir`/`_prepare`/`_done`/`_fail`,
+    `_repo_image_dockerfile`, `_repo_image_nonce`, `_check_repo_image` and
+    `_repo_image_prepare` (everything from the block's first comment up to
+    `build_repo_image`)."""
     return extract_block(launcher, "# The repository image (DESIGN §6",
-                         "# Build the repository image. Caller")
+                         "# Build the repository image from")

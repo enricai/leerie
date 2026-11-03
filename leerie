@@ -6212,17 +6212,6 @@ fi
 # reuse the cached image; a rebuild fires only when the base version
 # or the Dockerfile content changes.
 
-# Return the sha256 of a file, portably across Linux (sha256sum) and
-# macOS (shasum). Outputs only the hex digest.
-_leerie_sha256() {
-  local f="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$f" | awk '{print $1}'
-  else
-    shasum -a 256 "$f" | awk '{print $1}'
-  fi
-}
-
 # Compute a sanitized repo identifier from the git remote URL (or
 # basename fallback) for use in the image tag. Tag chars: [a-z0-9._-].
 _leerie_repo_id() {
@@ -6369,9 +6358,10 @@ ensure_base_in_buildkit_ns() {
 # so an image built in an older one is rebuilt.
 REPO_IMAGE_LAYOUT="worker-root-1"
 
-# _repo_build_prepare — a directory of the launcher's own for the builds
-# below (never /tmp, never inside the checkout): $_REPO_BUILD_DIR, holding
-# leerie's Dockerfile, and $_REPO_BUILD_CTX, the build context — the
+# _repo_build_dir — a directory of the launcher's own for the builds below
+# (never /tmp, never inside the checkout): $_REPO_BUILD_DIR, holding
+# leerie's Dockerfile. _repo_build_prepare adds $_REPO_BUILD_CTX beneath
+# it, the build context — the
 # committed tree at HEAD, exported by git (`git archive`), never the
 # checkout directory. An untracked file — `.env`,
 # `.claude/settings.local.json` — never reaches a build the repository's
@@ -6381,11 +6371,15 @@ REPO_IMAGE_LAYOUT="worker-root-1"
 # _repo_build_done removes it, and _repo_build_fail on the way out.
 _REPO_BUILD_DIR=""
 _REPO_BUILD_CTX=""
-_repo_build_prepare() {
+_repo_build_dir() {
   [ -n "$_REPO_BUILD_DIR" ] && return 0
   mkdir -p "$LEERIE_STATE_HOST_DIR/.image-build" \
     && _REPO_BUILD_DIR="$(mktemp -d "$LEERIE_STATE_HOST_DIR/.image-build/b.XXXXXX")" \
     || { remote_log "error: could not make a build directory under $LEERIE_STATE_HOST_DIR"; exit 1; }
+}
+_repo_build_prepare() {
+  _repo_build_dir
+  [ -n "$_REPO_BUILD_CTX" ] && return 0
   _REPO_BUILD_CTX="$_REPO_BUILD_DIR/context"
   mkdir -p "$_REPO_BUILD_CTX" || _repo_build_fail "could not make the build context"
   if git -C "$USER_REPO" rev-parse -q --verify 'HEAD^{commit}' >/dev/null 2>&1; then
@@ -6399,6 +6393,7 @@ _repo_build_done() {
   fi
   _REPO_BUILD_DIR=""
   _REPO_BUILD_CTX=""
+  _REPO_NONCE=""
 }
 _repo_build_fail() {
   remote_log "error: $1"
@@ -6417,10 +6412,13 @@ _repo_build_fail() {
 # this build and is built with --target, so a repository file that swallows
 # leerie's lines (an unterminated heredoc, a trailing continuation) builds
 # nothing rather than a final stage of its own. The repository's file is
-# read beneath the checkout without following a link, and bounded.
+# read beneath the checkout without following a link, and bounded. Prints
+# the sha256 of the bytes it read: the one digest of the repository's
+# Dockerfile the launcher keys an image on, so no other read of the file by
+# its path (which would follow a committed link, unbounded) ever happens.
 _repo_image_dockerfile() {
   python3 -I - "$USER_REPO" "$@" <<'PY'
-import os, re, stat, sys
+import hashlib, os, re, stat, sys
 
 repo, out, nonce, base = sys.argv[1:5]
 LIMIT = 1 << 20
@@ -6446,15 +6444,15 @@ def read_beneath(root, rel):
         os.close(f)
     if len(data) > LIMIT:
         raise OSError(f"larger than {LIMIT} bytes")
-    return data.decode("utf-8", "surrogateescape")
+    return data
 
 
 try:
-    text = read_beneath(repo, ".leerie/Dockerfile")
+    raw = read_beneath(repo, ".leerie/Dockerfile")
 except OSError as e:
     sys.exit(f"leerie: .leerie/Dockerfile cannot be read as a regular file "
              f"beneath the checkout ({e})")
-lines = text.split("\n")
+lines = raw.decode("utf-8", "surrogateescape").split("\n")
 heredoc = re.compile(r"<<(-?)([\"']?)([A-Za-z_][A-Za-z0-9_]*)\2")
 last_from = None
 i = 0
@@ -6506,6 +6504,7 @@ with open(out, "w") as f:
             'RUN ["/bin/sh", "-c", "env -0 > /.leerie-worker-env"]\n'
             f"FROM {base} AS leerie-final-{nonce}\n"
             f"COPY --from=leerie-stage-{nonce} / /opt/leerie-worker-root/\n")
+print(hashlib.sha256(raw).hexdigest())
 PY
 }
 
@@ -6545,15 +6544,28 @@ sys.exit(0 if ok else 1)
   return 1
 }
 
-# Build the repository image. Caller has already verified the build is
-# needed (image absent, Dockerfile changed, or base changed).
+# _repo_image_prepare — draws the build's nonce ($_REPO_NONCE) and writes
+# leerie's Dockerfile for it into $_REPO_BUILD_DIR on base <base>; sets
+# $_REPO_DF_SHA, the sha256 of the repository Dockerfile bytes it read.
+_REPO_NONCE=""
+_REPO_DF_SHA=""
+_repo_image_prepare() {
+  _repo_build_dir
+  _REPO_NONCE="$(_repo_image_nonce)"
+  [ -n "$_REPO_NONCE" ] || _repo_build_fail "could not draw a build nonce"
+  if ! _REPO_DF_SHA="$(_repo_image_dockerfile "$_REPO_BUILD_DIR/Dockerfile" \
+                         "$_REPO_NONCE" "$1")" || [ -z "$_REPO_DF_SHA" ]; then
+    _repo_build_fail "could not prepare the repository image's Dockerfile"
+  fi
+}
+
+# Build the repository image from the Dockerfile _repo_image_prepare wrote.
+# Caller has already verified the build is needed (image absent, Dockerfile
+# changed, or base changed).
 build_repo_image() {
-  local repo_image_tag="$1" _nonce
+  local repo_image_tag="$1" _nonce="$_REPO_NONCE"
+  [ -n "$_nonce" ] || _repo_build_fail "the repository image's Dockerfile was not prepared"
   _repo_build_prepare
-  _nonce="$(_repo_image_nonce)"
-  [ -n "$_nonce" ] || _repo_build_fail "could not draw a build nonce"
-  _repo_image_dockerfile "$_REPO_BUILD_DIR/Dockerfile" "$_nonce" "$IMAGE_TAG" \
-    || _repo_build_fail "could not prepare the repository image's Dockerfile"
   remote_log "building per-repo container image ($repo_image_tag)..."
   nerdctl build \
     --build-arg BASE_IMAGE="$IMAGE_TAG" \
@@ -6727,12 +6739,13 @@ _leerie_do_gen=false
 if [ -f "$_leerie_config_toml" ]; then
   if [ ! -f "$_leerie_dockerfile" ]; then
     _leerie_do_gen=true
-  elif IFS= read -r _df_first_line < "$_leerie_dockerfile" 2>/dev/null && \
-       [ "$_df_first_line" = "$LEERIE_GENERATED_SENTINEL" ] && \
-       ! git -C "$USER_REPO" ls-files --error-unmatch \
-           ".leerie/Dockerfile" >/dev/null 2>&1; then
+  elif ! _checkout_file_tracked ".leerie/Dockerfile" && \
+       IFS= read -r _df_first_line < "$_leerie_dockerfile" 2>/dev/null && \
+       [ "$_df_first_line" = "$LEERIE_GENERATED_SENTINEL" ]; then
     # Uncommitted generated file → safe to refresh in place. (A committed one
-    # is authoritative even with the sentinel, so ls-files gating it out.)
+    # — a submodule's included — is authoritative even with the sentinel, so
+    # `_checkout_file_tracked` gates it out first, and a committed file or a
+    # link is never read by path.)
     _leerie_do_gen=true
   fi
   unset _df_first_line
@@ -7411,7 +7424,11 @@ if [ -f "$_leerie_dockerfile" ]; then
     # Hash file stores "<base_version>:<dockerfile_sha256>" so either
     # the base version or Dockerfile content change triggers a rebuild.
     _hash_file="$LEERIE_STATE_HOST_DIR/.dockerfile-hash"
-    _cur_df_sha="$(_leerie_sha256 "$_leerie_dockerfile")"
+    # The digest of the bytes leerie's Dockerfile was made from, never of
+    # the path (DESIGN §6 *Leerie never reads through a link a repository
+    # holds*).
+    _repo_image_prepare "$IMAGE_TAG"
+    _cur_df_sha="$_REPO_DF_SHA"
     # The base image's id too: the repository image is built on exactly it
     # (_check_repo_image), so a rebuilt base rebuilds it.
     _base_id="$(nerdctl image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)"
@@ -8507,26 +8524,28 @@ _FLY_BASE_TAG=""
 
 # When .leerie/Dockerfile is present (real or auto-generated), set
 # LEERIE_FLY_IMAGE to registry.fly.io/$APP:$VERSION-$REPO_HASH so that
-# resolve_fly_image_tag() returns the per-repo tag. Also records the
-# Dockerfile path and base tag in _FLY_PER_REPO_DOCKERFILE / _FLY_BASE_TAG
-# for ensure_image() to use when invoking build-push.sh.
+# resolve_fly_image_tag() returns the per-repo tag. Writes leerie's
+# Dockerfile for the repository image (_repo_image_prepare) and records it
+# and the base tag in _FLY_PER_REPO_DOCKERFILE / _FLY_BASE_TAG for
+# ensure_image() to use when invoking build-push.sh.
 # Idempotent: called once before resolve_fly_image_tag().
 _set_fly_per_repo_image() {
-  local dockerfile="$USER_REPO/.leerie/Dockerfile"
-  if [ ! -f "$dockerfile" ]; then
+  if [ ! -f "$USER_REPO/.leerie/Dockerfile" ]; then
     return 0
   fi
   local fly_app version base_tag repo_hash per_repo_tag
   fly_app="$LEERIE_FLY_APP"
   version="$LEERIE_VERSION"
   base_tag="registry.fly.io/$fly_app:$version"
-  # First 12 hex chars of the Dockerfile sha256 — short but collision-free
-  # at the scale of per-repo image variants for a single leerie installation.
-  repo_hash="$(_leerie_sha256 "$dockerfile" | cut -c1-12)"
+  _repo_image_prepare "$base_tag"
+  # First 12 hex chars of the sha256 of the Dockerfile bytes leerie's
+  # Dockerfile was made from — short but collision-free at the scale of
+  # per-repo image variants for a single leerie installation.
+  repo_hash="${_REPO_DF_SHA:0:12}"
   per_repo_tag="registry.fly.io/$fly_app:${version}-${repo_hash}"
   LEERIE_FLY_IMAGE="$per_repo_tag"
   export LEERIE_FLY_IMAGE
-  _FLY_PER_REPO_DOCKERFILE="$dockerfile"
+  _FLY_PER_REPO_DOCKERFILE="$_REPO_BUILD_DIR/Dockerfile"
   _FLY_BASE_TAG="$base_tag"
   remote_log "remote: per-repo Fly image tag: $per_repo_tag (base: $base_tag)"
 }
@@ -8604,23 +8623,15 @@ except Exception:
       printf '%s\n' "$base_tag" >> "$cache_file"
     fi
     # Now build and push the repository image: leerie's two-stage
-    # Dockerfile around the repository's (_repo_image_dockerfile), from the
-    # committed tree (_repo_build_prepare), its final stage leerie's base
-    # (DESIGN §6 *The orchestrator's root is leerie's; a repository's root
-    # is only a confined process's*).
-    local _nonce
+    # Dockerfile around the repository's (_set_fly_per_repo_image wrote it),
+    # from the committed tree (_repo_build_prepare), its final stage
+    # leerie's base (DESIGN §6 *The orchestrator's root is leerie's; a
+    # repository's root is only a confined process's*).
     _repo_build_prepare
-    _nonce="$(_repo_image_nonce)"
-    if [ -z "$_nonce" ] || ! _repo_image_dockerfile \
-         "$_REPO_BUILD_DIR/Dockerfile" "$_nonce" "$base_tag"; then
-      _repo_build_done
-      remote_log "error: could not prepare the repository image's Dockerfile"
-      return 1
-    fi
     local per_repo_args=("${build_args[@]}"
-      --dockerfile "$_REPO_BUILD_DIR/Dockerfile"
+      --dockerfile "$_FLY_PER_REPO_DOCKERFILE"
       --context "$_REPO_BUILD_CTX"
-      --target "leerie-final-$_nonce"
+      --target "leerie-final-$_REPO_NONCE"
       --build-arg "BASE_IMAGE=$base_tag"
       --tag "$tag"
     )
@@ -8710,6 +8721,7 @@ if [ "$RUNTIME" = "fly" ]; then
       exit 1
     fi
   fi
+  _repo_build_done
 
   PROVISION_SCRIPT="$LEERIE_REPO/scripts/remote/provision.sh"
   RESUME_SCRIPT="$LEERIE_REPO/scripts/remote/resume-machine.sh"

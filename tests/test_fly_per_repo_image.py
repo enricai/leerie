@@ -29,8 +29,8 @@ def _launcher_text() -> str:
 
 # ---------------------------------------------------------------------------
 # Harness: stubs for the Fly remote region of the launcher.
-# We need: _leerie_sha256, _leerie_repo_id, resolve_fly_image_tag,
-# _set_fly_per_repo_image, and ensure_image.
+# We need: the repository-image build helpers (repo_build_functions),
+# resolve_fly_image_tag, _set_fly_per_repo_image, and ensure_image.
 # ---------------------------------------------------------------------------
 
 _HARNESS_PREFIX = r"""
@@ -73,10 +73,6 @@ LOCAL_BUILD="${LOCAL_BUILD:-false}"
 
 """
 
-# Sha256 function block (extracted verbatim from launcher)
-_SHA256_MARKER_START = "# Return the sha256 of a file, portably across Linux"
-_SHA256_MARKER_END = "\n# Compute a sanitized repo identifier"
-
 # Fly image functions block (extracted verbatim from launcher)
 _FLY_MARKER_START = "# --- remote: resolve Fly.io image tag ---"
 _FLY_MARKER_END = "\n# --- run ---"
@@ -89,10 +85,10 @@ def _run_harness(
     flyctl_deploy_rc: int = 0,
 ) -> subprocess.CompletedProcess:
     launcher = _launcher_text()
-    sha256_block = _extract_block(launcher, _SHA256_MARKER_START, _SHA256_MARKER_END)
+    build_block = repo_build_functions(launcher)
     fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
 
-    script = _HARNESS_PREFIX + sha256_block + "\n" + fly_block + "\n" + body
+    script = _HARNESS_PREFIX + build_block + "\n" + fly_block + "\n" + body
 
     base_env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -104,6 +100,9 @@ def _run_harness(
     }
     if env:
         base_env.update(env)
+    if "USER_REPO" in base_env and "LEERIE_STATE_HOST_DIR" not in base_env:
+        base_env["LEERIE_STATE_HOST_DIR"] = str(
+            Path(base_env["USER_REPO"]).parent / "state")
 
     return subprocess.run(
         ["bash", "-c", script],
@@ -209,7 +208,8 @@ def test_set_fly_per_repo_image_sets_base_tag_context(tmp_path):
 
 
 def test_set_fly_per_repo_image_sets_dockerfile_context(tmp_path):
-    """_FLY_PER_REPO_DOCKERFILE is set to the .leerie/Dockerfile path."""
+    """_FLY_PER_REPO_DOCKERFILE is leerie's Dockerfile, written from the
+    repository's, never the repository's own path."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -220,8 +220,34 @@ def test_set_fly_per_repo_image_sets_dockerfile_context(tmp_path):
         env={"USER_REPO": str(user_repo)},
     )
     assert result.returncode == 0, result.stderr
-    df_path = result.stdout.strip().removeprefix("df=")
-    assert df_path.endswith("/.leerie/Dockerfile"), df_path
+    df_path = Path(result.stdout.strip().removeprefix("df="))
+    assert "/.image-build/b." in str(df_path), df_path
+    wrapper = df_path.read_text()
+    assert "FROM $BASE_IMAGE AS leerie-worker-" in wrapper
+    assert "FROM registry.fly.io/testapp:0.99.test AS leerie-final-" in wrapper
+
+
+def test_a_linked_dockerfile_is_never_read(tmp_path):
+    """A committed `.leerie/Dockerfile` that is a link out of the checkout:
+    the launcher reads nothing through it, so no digest of the file it names
+    names an image; the launch stops (DESIGN §6 *Leerie never reads through
+    a link a repository holds*)."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    outside = tmp_path / "operator-file"
+    outside.write_text("FROM debian:13\n")
+    (leerie_dir / "Dockerfile").symlink_to(outside)
+
+    result = _run_harness(
+        '_set_fly_per_repo_image\necho "fly_image=${LEERIE_FLY_IMAGE:-UNSET}"',
+        env={"USER_REPO": str(user_repo)},
+    )
+    digest = hashlib.sha256(outside.read_bytes()).hexdigest()[:12]
+    assert digest not in result.stdout + result.stderr
+    assert result.returncode == 1, result.stdout
+    assert "cannot be read as a regular file beneath the checkout" in \
+        result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +292,7 @@ def _run_ensure_image(
     We set XDG_CACHE_HOME to tmp_path so cache_dir = tmp_path/leerie/.
     """
     launcher = _launcher_text()
-    sha256_block = _extract_block(launcher, _SHA256_MARKER_START, _SHA256_MARKER_END)
+    build_block = repo_build_functions(launcher)
     fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
 
     build_push_stub = _make_build_push_stub(tmp_path, build_push_rc)
@@ -291,7 +317,7 @@ def _run_ensure_image(
     body = f'ensure_image "{tag}"\necho "rc=$?"'
     script = (
         _HARNESS_PREFIX
-        + sha256_block
+        + build_block
         + "\n"
         + fly_block
         + "\n"
@@ -361,7 +387,7 @@ def _run_ensure_image_per_repo(
 ) -> tuple[subprocess.CompletedProcess, Path, Path, str, str]:
     """Run ensure_image with _FLY_PER_REPO_DOCKERFILE set (per-repo path)."""
     launcher = _launcher_text()
-    sha256_block = _extract_block(launcher, _SHA256_MARKER_START, _SHA256_MARKER_END)
+    build_block = repo_build_functions(launcher)
     fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
 
     user_repo = tmp_path / "user-repo"
@@ -407,13 +433,11 @@ def _run_ensure_image_per_repo(
         cache_file.write_text(base_tag + "\n")
 
     body = (
-        f'_FLY_PER_REPO_DOCKERFILE="{leerie_dir / "Dockerfile"}"\n'
-        f'_FLY_BASE_TAG="{base_tag}"\n'
+        '_set_fly_per_repo_image\n'
         f'ensure_image "{per_repo_tag}"\n'
         f'echo "rc=$?"\n'
     )
-    script = (_HARNESS_PREFIX + repo_build_functions(launcher) + "\n"
-              + sha256_block + "\n" + fly_block + "\n" + body)
+    script = _HARNESS_PREFIX + build_block + "\n" + fly_block + "\n" + body
 
     env = {
         "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
@@ -486,7 +510,7 @@ def test_ensure_image_per_repo_ensures_base_first_when_not_cached(tmp_path):
 def test_ensure_image_per_repo_cache_hit_skips_build(tmp_path):
     """When per-repo tag is already in published-tags.txt, build is skipped."""
     launcher = _launcher_text()
-    sha256_block = _extract_block(launcher, _SHA256_MARKER_START, _SHA256_MARKER_END)
+    build_block = repo_build_functions(launcher)
     fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
 
     user_repo = tmp_path / "user-repo"
@@ -526,12 +550,11 @@ def test_ensure_image_per_repo_cache_hit_skips_build(tmp_path):
     cache_file.write_text(per_repo_tag + "\n")
 
     body = (
-        f'_FLY_PER_REPO_DOCKERFILE="{leerie_dir / "Dockerfile"}"\n'
-        f'_FLY_BASE_TAG="registry.fly.io/testapp:0.99.test"\n'
+        '_set_fly_per_repo_image\n'
         f'ensure_image "{per_repo_tag}"\n'
         f'echo "rc=$?"\n'
     )
-    script = _HARNESS_PREFIX + sha256_block + "\n" + fly_block + "\n" + body
+    script = _HARNESS_PREFIX + build_block + "\n" + fly_block + "\n" + body
 
     env = {
         "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
@@ -541,6 +564,7 @@ def test_ensure_image_per_repo_cache_hit_skips_build(tmp_path):
         "LEERIE_FLY_APP": "testapp",
         "LEERIE_REPO": str(leerie_repo),
         "USER_REPO": str(user_repo),
+        "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
     }
     result = subprocess.run(
         ["bash", "-c", script],
@@ -577,14 +601,14 @@ def test_fly_image_tag_pipeline_with_dockerfile(tmp_path):
     repo_hash = hashlib.sha256(df_content.encode()).hexdigest()[:12]
 
     launcher = _launcher_text()
-    sha256_block = _extract_block(launcher, _SHA256_MARKER_START, _SHA256_MARKER_END)
+    build_block = repo_build_functions(launcher)
     fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
 
     body = (
         "_set_fly_per_repo_image\n"
         'echo "tag=$(resolve_fly_image_tag)"\n'
     )
-    script = _HARNESS_PREFIX + sha256_block + "\n" + fly_block + "\n" + body
+    script = _HARNESS_PREFIX + build_block + "\n" + fly_block + "\n" + body
 
     env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -592,6 +616,7 @@ def test_fly_image_tag_pipeline_with_dockerfile(tmp_path):
         "LEERIE_VERSION": "1.5.0",
         "LEERIE_FLY_APP": "myapp",
         "USER_REPO": str(user_repo),
+        "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
     }
     result = subprocess.run(["bash", "-c", script], env=env,
                              capture_output=True, text=True)
@@ -606,14 +631,14 @@ def test_fly_image_tag_pipeline_without_dockerfile(tmp_path):
     user_repo.mkdir()
 
     launcher = _launcher_text()
-    sha256_block = _extract_block(launcher, _SHA256_MARKER_START, _SHA256_MARKER_END)
+    build_block = repo_build_functions(launcher)
     fly_block = _extract_block(launcher, _FLY_MARKER_START, _FLY_MARKER_END)
 
     body = (
         "_set_fly_per_repo_image\n"
         'echo "tag=$(resolve_fly_image_tag)"\n'
     )
-    script = _HARNESS_PREFIX + sha256_block + "\n" + fly_block + "\n" + body
+    script = _HARNESS_PREFIX + build_block + "\n" + fly_block + "\n" + body
 
     env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -621,6 +646,7 @@ def test_fly_image_tag_pipeline_without_dockerfile(tmp_path):
         "LEERIE_VERSION": "1.5.0",
         "LEERIE_FLY_APP": "myapp",
         "USER_REPO": str(user_repo),
+        "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
     }
     result = subprocess.run(["bash", "-c", script], env=env,
                              capture_output=True, text=True)

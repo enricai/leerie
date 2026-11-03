@@ -3503,7 +3503,10 @@ constructed in three parts.
    isolation A2: it was hashed and named in a `COPY`, and one linked to
    `/proc/self/pagemap` stopped every launch). It reads the operator's
    `.leerie/config.toml` beneath the checkout without following a link,
-   bounded.
+   bounded. `.leerie/Dockerfile` is read once per image, beneath the
+   checkout, bounded (`_repo_image_dockerfile`), and an image is keyed on
+   the digest of the bytes that read returned, never on a second read by
+   path (review round 29, isolation F4).
 
 A rule over the module holds the line. Every function that still calls a
 raw read primitive is classified by why what it reads is not a repository's

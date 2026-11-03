@@ -9,7 +9,7 @@ Verifies Phase-2 per-repo image identity and rebuild-trigger logic:
   - rebuild signals: image absent, Dockerfile hash mismatch, base version change
   - no rebuild when image present and hash matches
 
-Strategy: extract the real functions (`_leerie_sha256`, `_leerie_repo_id`,
+Strategy: extract the real functions (`_leerie_repo_id`,
 `_leerie_should_generate_dockerfile`, `resolve_repo_image_tag`,
 `ensure_base_in_buildkit_ns`, `build_repo_image`) and the top-level
 rebuild-decision block verbatim out of the launcher (mirroring
@@ -73,13 +73,16 @@ def _extracted_block() -> str:
         _extract_line("REPO_IMAGE_LAYOUT="),
         _extract_line('_REPO_BUILD_DIR=""'),
         _extract_line('_REPO_BUILD_CTX=""'),
+        _extract_line('_REPO_NONCE=""'),
+        _extract_line('_REPO_DF_SHA=""'),
+        _extract_fn("_repo_build_dir() {"),
         _extract_fn("_repo_build_prepare() {"),
         _extract_fn("_repo_build_done() {"),
         _extract_fn("_repo_build_fail() {"),
         _extract_fn("_repo_image_dockerfile() {"),
         _extract_fn("_repo_image_nonce() {"),
         _extract_fn("_check_repo_image() {"),
-        _extract_fn("_leerie_sha256() {"),
+        _extract_fn("_repo_image_prepare() {"),
         _extract_fn("_leerie_repo_id() {"),
         _extract_fn("_leerie_should_generate_dockerfile() {"),
         _extract_fn("resolve_repo_image_tag() {"),
@@ -427,3 +430,39 @@ def test_rebuild_false_when_image_present_and_hash_matches(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     assert "per-repo image up-to-date" in result.stderr
     assert "building per-repo container image" not in result.stderr
+
+
+def test_a_linked_dockerfile_is_never_read_nor_reused(tmp_path: Path):
+    """A committed `.leerie/Dockerfile` that is a link to a file outside the
+    checkout: the launcher keys the image on the bytes leerie's Dockerfile
+    was made from, read beneath the checkout without following a link, so
+    the link is refused before any reuse decision — even when the stored
+    hash is the digest of the file the link names and the image is present
+    (DESIGN §6 *Leerie never reads through a link a repository holds*)."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    outside = tmp_path / "operator-file"
+    outside.write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    (leerie_dir / "Dockerfile").symlink_to(outside)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    version = "0.99.test"
+    sha = hashlib.sha256(outside.read_bytes()).hexdigest()
+    (state_dir / ".dockerfile-hash").write_text(
+        f"{version}:worker-root-1:sha256:base-id:{sha}\n")
+    result = _run_with_rebuild_decision(
+        'echo "done"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "FAKE_GIT_REMOTE": "",
+            "LEERIE_VERSION": version,
+            "NERDCTL_INSPECT_RC": "0",  # image present
+        },
+    )
+    assert result.returncode == 1, result.stderr
+    assert "per-repo image up-to-date" not in result.stderr
+    assert "cannot be read as a regular file beneath the checkout" in \
+        result.stderr
+    assert "done" not in result.stdout

@@ -294,6 +294,19 @@ fires and precedes the build, and the idempotent skip when the base is
 already present) — is tested via bash-harness subprocess tests with
 stubbed `git` and `nerdctl`.
 
+An image is keyed on the bytes leerie's Dockerfile was made from (review
+round 29, isolation F4): with a committed `.leerie/Dockerfile` linked to a
+file outside the checkout, the reuse block refuses the link before any
+reuse decision even when the stored hash is that file's digest and the image
+is present (`tests/test_resolve_repo_image_tag.py::test_a_linked_dockerfile_is_never_read_nor_reused`),
+and `_set_fly_per_repo_image` names no Fly tag from that file's digest
+(`tests/test_fly_per_repo_image.py::test_a_linked_dockerfile_is_never_read`).
+Falsified: with the digest taken by path (`sha256sum`) again, each fails —
+the local block reports the image up to date and runs it, and the Fly tag
+carries the linked file's digest. In a full launch `_checkout_config_links`
+refuses a linked `.leerie/Dockerfile` first; these pin the sites
+themselves.
+
 ## Worker cgroup containment
 
 Worker cgroup containment (DESIGN §6 *Memory containment*) is tested in
