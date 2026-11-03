@@ -222,3 +222,37 @@ def test_a_reap_failure_never_stops_preflight(leerie, env, monkeypatch):
     me.mkdir()
     asyncio.run(leerie.preflight(me, skip_smoke=True))
     assert any("worktree reap skipped" in m for m in logs)
+
+
+# --- the launchers' logs (DESIGN §6 *A launcher's logs go with the same
+# retention*): 926 of them, 623 MB, on the live barnacle state root ----------
+
+def test_preflight_reaps_idle_launcher_logs(leerie, env, monkeypatch):
+    """Preflight, real: a launcher log or `.runlog` idle past the bound goes,
+    a recent one, a link and an unrelated file stay."""
+    _repo_, runs = env
+    root = runs.parent
+    (root / "logs").mkdir()
+    old_log = root / "logs" / "leerie-100969.log"
+    new_log = root / "logs" / "leerie-2424691.log"
+    old_runlog = root / ".runlog-3576198"
+    other = root / "logs" / "notes.log"
+    target = root / "keep.txt"
+    for f in (old_log, new_log, old_runlog, other, target):
+        f.write_text("x" * 100)
+    link = root / "logs" / "leerie-7.log"
+    link.symlink_to(target)
+    for f in (old_log, old_runlog, other, link):
+        os.utime(f, (OLD, OLD), follow_symlinks=False)
+    me = runs / "me"
+    me.mkdir()
+    logs: list[str] = []
+    monkeypatch.setattr(leerie, "_disk_free_ratio", lambda p: 1.0)
+    monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
+    monkeypatch.setattr(leerie, "log", lambda m: logs.append(m))
+    asyncio.run(leerie.preflight(me, skip_smoke=True))
+    assert not old_log.exists() and not old_runlog.exists()
+    assert new_log.exists() and other.exists()
+    assert link.is_symlink() and target.exists()
+    (line,) = [m for m in logs if "launcher log(s)" in m]
+    assert "removed 2 launcher log(s) idle >= 7d" in line

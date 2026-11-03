@@ -454,6 +454,7 @@ _LEERIE_ONLY = {
     "_selfcheck_prepare", "_require_heldout_sandbox", "_leerie_stores",
     "_store_fetch_lock", "_acquire_build_slot", "_populate_leerie_store",
     "_sweep_measure_dirs", "_measure_dir_at", "_reap_idle_worktrees",
+    "_reap_launcher_logs",
     "_acceptance_parse_probe", "_acceptance_parse_probe_run",
     "_falsifier_gates", "_drop_lying_index", "_move_view",
     # A grant root itself, whose entry lies in a directory no grant names:

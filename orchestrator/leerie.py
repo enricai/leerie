@@ -12889,6 +12889,41 @@ def _reap_idle_worktrees(runs_dir: Path, self_id: str,
     return report
 
 
+# A launcher's own logs in the state root, by name (the launcher's
+# `leerie-$$.log` default and its piped `.runlog-$$`): mechanical file names.
+_LAUNCHER_LOG_RE = re.compile(r"(?:leerie-\d+\.log|\.runlog-\d+)")
+
+
+def _reap_launcher_logs(state_root: Path,
+                        idle_days: float = WORKTREE_REAP_IDLE_DAYS,
+                        now: float | None = None) -> dict:
+    """Remove the launchers' logs (`logs/leerie-<pid>.log`, `.runlog-<pid>`)
+    not written for `idle_days` (DESIGN §6 *A launcher's logs go with the
+    same retention*): a copy of a run's own `orchestrator.log`, which a
+    live launcher appends to whenever its run prints. Regular files only,
+    never through a link. `{removed, bytes, errors}`; never raises."""
+    cutoff = (time.time() if now is None else now) - idle_days * 86400
+    report = {"removed": 0, "bytes": 0, "errors": 0}
+    for d in (state_root / "logs", state_root):
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            if not _LAUNCHER_LOG_RE.fullmatch(e.name):
+                continue
+            try:
+                st_ = e.stat(follow_symlinks=False)
+                if not stat.S_ISREG(st_.st_mode) or st_.st_mtime >= cutoff:
+                    continue
+                os.unlink(e.path)
+                report["removed"] += 1
+                report["bytes"] += st_.st_size
+            except OSError:
+                report["errors"] += 1
+    return report
+
+
 async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                     skip_smoke: bool = False, no_push: bool = False,
                     model: str = MODEL_DEFAULT) -> None:
@@ -12927,6 +12962,15 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                    if reap["errors"] else "") + ")")
     except Exception as e:  # housekeeping must never stop a run
         log(f"preflight: worktree reap skipped ({type(e).__name__}: {e})")
+    # The launchers' logs, by the same idle bound (DESIGN §6 *A launcher's
+    # logs go with the same retention*). Never raises.
+    logs = await asyncio.to_thread(_reap_launcher_logs,
+                                   leerie_dir.parent.parent)
+    if logs["removed"] or logs["errors"]:
+        log(f"preflight: removed {logs['removed']} launcher log(s) idle >= "
+            f"{WORKTREE_REAP_IDLE_DAYS}d, freed "
+            f"{logs['bytes'] / 1048576:.1f} MiB"
+            + (f" ({logs['errors']} error(s))" if logs["errors"] else ""))
 
     # 0.5. disk headroom (N30) — a run writes state.json/logs/calls.ndjson/
     # worktrees continuously, and the first failing write under a full disk

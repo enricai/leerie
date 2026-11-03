@@ -5598,6 +5598,21 @@ rootless and rootful containerd. A resume after the reap recreated all four work
 their branch tips with committed work intact and left no stale
 registration.
 
+**A launcher's logs go with the same retention.** Each launch writes its
+whole stream to `<state-root>/logs/leerie-<launcher pid>.log` (the
+`--log-file` default) and, piped, to `<state-root>/.runlog-<launcher
+pid>`; the second is removed when the launcher exits, the first never
+was. Nothing reaped either: measured on the barnacle state root, 926
+logs, 623 MB, back to 2026-08-17. Each is a copy of what the run's own
+`orchestrator.log` holds, so it is reaped like the idle runs' worktrees:
+`preflight` removes those not written for `WORKTREE_REAP_IDLE_DAYS` (a
+live launcher appends to its log whenever its run prints, and its
+`.runlog` whenever the container writes), and `leerie prune` those not
+written within its `--older-than` cutoff whose launcher PID no longer runs
+(the host side can see the PID; the container cannot). A log the operator
+pointed elsewhere with `--log-file` is the operator's and is never
+touched.
+
 ### One task, one run
 
 The flock above makes a *run directory* single-owner. It says nothing about

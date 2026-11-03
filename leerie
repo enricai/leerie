@@ -1767,7 +1767,7 @@ PY
     LEERIE_PRUNE_DAYS="$_prune_days" LEERIE_PRUNE_APPLY="$_prune_apply" \
       LEERIE_PRUNE_HOST_FINALIZE="$LEERIE_REPO/scripts/host-finalize.sh" \
       python3 -I - "$LEERIE_STATE_HOST_DIR" "$USER_REPO" <<'PY'
-import fcntl, json, os, pathlib, shutil, subprocess, sys, time
+import fcntl, json, os, pathlib, re, shutil, stat, subprocess, sys, time
 
 root = pathlib.Path(sys.argv[1])
 repo = pathlib.Path(sys.argv[2])
@@ -2153,6 +2153,41 @@ if cache.is_dir():
         except OSError:
             pass
 
+# The launchers' logs (DESIGN §6 *A launcher's logs go with the same
+# retention*): `logs/leerie-<pid>.log` and `.runlog-<pid>` not written
+# within the cutoff, whose launcher no longer runs. Regular files only.
+logs_removed = 0
+for _dir in (root / "logs", root):
+    try:
+        _entries = list(os.scandir(_dir))
+    except OSError:
+        continue
+    for _e in _entries:
+        _m = re.fullmatch(r"leerie-(\d+)\.log|\.runlog-(\d+)", _e.name)
+        if not _m:
+            continue
+        try:
+            _st = _e.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(_st.st_mode) or _st.st_mtime >= cutoff:
+            continue
+        try:
+            os.kill(int(_m.group(1) or _m.group(2)), 0)
+            continue  # its launcher still runs
+        except ProcessLookupError:
+            pass
+        except (PermissionError, OverflowError, OSError):
+            continue
+        freed += _st.st_size
+        logs_removed += 1
+        if apply:
+            try:
+                os.unlink(_e.path)
+            except OSError:
+                logs_removed -= 1
+                freed -= _st.st_size
+
 # Subtask branches, scoped to leerie/subtasks/<run-id>/* so a user branch is
 # never in scope.
 #
@@ -2225,6 +2260,7 @@ print(f"leerie prune ({'apply' if apply else 'dry-run'}, older than {days}d)")
 print(f"  {verb} {len(runs_removed)} terminal run dir(s)")
 print(f"  {verb} the worktrees of {worktrees_reaped} idle resumable run(s)")
 print(f"  {verb} {cache_removed} repo-map cache entr(y/ies)")
+print(f"  {verb} {logs_removed} launcher log(s)")
 print(f"  {verb} {len(branches_removed)} orphaned subtask branch(es)")
 if branches_kept:
     # Never silent. A branch that survived did so because it holds unmerged
