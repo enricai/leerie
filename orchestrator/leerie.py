@@ -41868,6 +41868,47 @@ def _is_test_file(path: str, globs: list[str] | None = None) -> bool:
     return any(fnmatch.fnmatch(base, g) for g in _TEST_BASENAME_GLOBS)
 
 
+# The files an impact-analysis runner's module graph holds, by extension (a
+# fixed property of vitest's and jest's resolvers): what `{files}` hands
+# `vitest related` / `jest --findRelatedTests` (DESIGN §9 *An
+# impact-analysis runner is handed only its own module sources*). A
+# manifest, lockfile, workflow or document is not one: vitest reads
+# `package.json` as a force-rerun trigger and runs every test file.
+_IMPACT_SOURCE_EXTS: frozenset[str] = frozenset({
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue",
+    ".svelte"})
+# Each impact-analysis runner's own configuration, by basename: a force-
+# rerun trigger with a source extension, so the extension filter keeps it,
+# and a change to it changes how every test runs.
+_RUNNER_CONFIG_GLOBS: dict[str, tuple[str, ...]] = {
+    "vitest": ("vitest.config.*", "vite.config.*", "vitest.workspace.*"),
+    "jest": ("jest.config.*",),
+}
+
+
+def _impact_runner(template: str) -> str | None:
+    """The impact-analysis runner (`_RUNNER_DIRECT_SELECTORS`) whose
+    selector `template` invokes, read as `_derive_test_files_scoped` reads
+    one (`_shell_scan`, the runner word then its selector), or None."""
+    scanned = _shell_scan(template)
+    if scanned is None:
+        return None
+    tokens = scanned[0]
+    words = [t for _k, t, _d in tokens]
+    for runner, (affected, _direct) in _RUNNER_DIRECT_SELECTORS.items():
+        if any(affected in words[at + 1:]
+               for at in _runner_positions(tokens, runner)):
+            return runner
+    return None
+
+
+def _is_runner_config(path: str, runner: str) -> bool:
+    """`path`'s basename is one of `runner`'s configuration files."""
+    base = os.path.basename(path.replace("\\", "/"))
+    return any(fnmatch.fnmatch(base, g)
+               for g in _RUNNER_CONFIG_GLOBS.get(runner, ()))
+
+
 def _render_scoped(template: str | None, files: list[str],
                    base_ref: str,
                    test_globs: list[str] | None = None) -> str | None:
@@ -41877,13 +41918,17 @@ def _render_scoped(template: str | None, files: list[str],
     Returns None when the template wants `{files}` and there are none. That
     case must be a hard skip, not a bare runner invocation: rendering
     `vitest related --run` with an empty file list runs EVERYTHING, which is
-    the exact inversion of the feature.
+    the exact inversion of the feature. For an impact-analysis template
+    (`_impact_runner`) `{files}` is only the files its module graph holds
+    (`_IMPACT_SOURCE_EXTS`), under the same absence rule: `package.json`
+    handed to `vitest related` reruns every test file (DESIGN §9 *An
+    impact-analysis runner is handed only its own module sources*).
 
     `{test_files}` is the same substitution over the test-shaped members only,
     under the same absence rule, and exists for runners with no source→test
     impact analysis. `vitest related` / `jest --findRelatedTests` take SOURCE
     files and resolve dependents through the runner's own module graph, so
-    they want `{files}` whole. pytest instead collects under the paths it is
+    they want `{files}` — its module sources. pytest instead collects under the paths it is
     given, where a non-test path is an error rather than a no-op: measured,
     `pytest orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4,
     and `pytest docs/DESIGN.md tests/test_blt_semaphore.py` ALSO exits 4 —
@@ -41920,6 +41965,9 @@ def _render_scoped(template: str | None, files: list[str],
         _warn_unknown_placeholder_once(template, leftover.group(0))
         return None
     if "{files}" in template:
+        if _impact_runner(template) is not None:
+            files = [f for f in files
+                     if os.path.splitext(f)[1] in _IMPACT_SOURCE_EXTS]
         if not files:
             return None
         template = template.replace(
@@ -42363,7 +42411,9 @@ def _warn_scoped_degraded_once(blt: dict[str, str], scoped: dict[str, str],
 
 def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
                          files: list[str], base_ref: str, mode: str,
-                         test_globs: list[str] | None = None
+                         test_globs: list[str] | None = None,
+                         direct: str | None = None,
+                         named_tests: list[str] | None = None
                          ) -> tuple[dict[str, str], str]:
     """`(axis name -> command, scope label)` for one subtask's conformance
     round, given the resolved canonical commands and proxy templates.
@@ -42378,7 +42428,14 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
     suites, and a compiled language's per-subtask build is its cheapest
     regression signal. The caller records
     a deferred axis explicitly (`_deferred_axes`) so it is never silently
-    absent. The scope label never claims a narrowing that did not happen."""
+    absent. The scope label never claims a narrowing that did not happen.
+
+    A diff that changes its impact-analysis runner's own configuration
+    (`_is_runner_config`) is labelled `runner_config_changed`: its `tests`
+    axis is `direct` (the runner's direct form, `resolve_test_files_scoped`)
+    over only the named test files — the diff's own and `named_tests` (the
+    planner's) — or deferred when none is named (DESIGN §9 *An
+    impact-analysis runner is handed only its own module sources*)."""
     canonical = {"build": (blt.get("build") or "").strip(),
                  "lint": (blt.get("lint") or "").strip(),
                  "tests": (blt.get("test") or "").strip()}
@@ -42389,12 +42446,22 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
     axes: dict[str, str] = {}
     used_proxy = False
     deferred = False
+    runner = _impact_runner(scoped.get("test") or "")
+    config_changed = runner is not None and any(
+        _is_runner_config(f, runner) for f in files)
     for axis in ("build", "lint", "tests"):
         # `scoped` is keyed like resolve_blt (`test`, singular); the axis
         # names are the conformer's (`tests`, plural). `_AXIS_CMD_KEY` is
         # the one place that mapping lives.
-        rendered = _render_scoped(
-            scoped.get(_AXIS_CMD_KEY[axis]), files, base_ref, test_globs)
+        if axis == "tests" and config_changed:
+            # Impact analysis cannot answer a change to how every test runs:
+            # only the named test files run, directly.
+            named = list(dict.fromkeys([*files, *(named_tests or [])]))
+            rendered = _render_scoped(direct, named, base_ref, test_globs)
+        else:
+            rendered = _render_scoped(
+                scoped.get(_AXIS_CMD_KEY[axis]), files, base_ref,
+                test_globs)
         if rendered:
             axes[axis] = rendered
             used_proxy = True
@@ -42403,6 +42470,8 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
         else:
             axes[axis] = canonical[axis]
     label = "scoped" if used_proxy else ("deferred" if deferred else "full")
+    if config_changed:
+        label = "runner_config_changed"
     return axes, label
 
 
@@ -44388,7 +44457,10 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     changed = await _changed_files(worktree, run_branch)
     subtask_axes, blt_scope = _select_subtask_axes(
         blt, resolve_blt_scoped(repo_root), changed, run_branch, scoped_mode,
-        resolve_test_file_globs(repo_root))
+        resolve_test_file_globs(repo_root),
+        direct=resolve_test_files_scoped(repo_root),
+        named_tests=[str(f) for f in subtask.get("files_likely_touched")
+                     or [] if isinstance(f, str)])
     deferred = _deferred_axes(subtask_axes, blt, scoped_mode)
     if deferred:
         log(f"  {sid}: {', '.join(deferred)} deferred to the whole-tree pass "

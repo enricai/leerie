@@ -28,11 +28,12 @@ def test_files_are_shell_quoted(leerie):
     `src/app/[locale]/(app)/settings/general/page.test.tsx`."""
     out = leerie._render_scoped(
         "npx vitest related --run {files}",
-        ["src/app/[locale]/(app)/general/page.test.tsx", "a b.ts", "x;rm -rf /"],
+        ["src/app/[locale]/(app)/general/page.test.tsx", "a b.ts",
+         "x;rm -rf .ts"],
         "base")
     assert "'src/app/[locale]/(app)/general/page.test.tsx'" in out
     assert "'a b.ts'" in out
-    assert "'x;rm -rf /'" in out
+    assert "'x;rm -rf .ts'" in out
 
 
 def test_base_is_substituted(leerie):
@@ -217,3 +218,71 @@ def test_changed_files_survives_awkward_paths(leerie, tmp_path):
 
 def test_changed_files_on_a_non_repo_is_empty(leerie, tmp_path):
     assert asyncio.run(leerie._changed_files(str(tmp_path), "base")) == []
+
+
+# --------------------------------------------------------------------------
+# An impact-analysis runner is handed only its own module sources (DESIGN §9)
+# --------------------------------------------------------------------------
+
+RELATED = {"test": "npx vitest related --run {files} --passWithNoTests"}
+DIRECT = "npx vitest run {test_files} --passWithNoTests"
+# The live barnacle diff that ran all 1,299 test files for 4,716 s.
+CONFIG_ONLY = [".github/workflows/build.yml", ".github/workflows/test.yml",
+               ".nvmrc", "Dockerfile", "package.json"]
+
+
+@pytest.mark.parametrize("files", [
+    CONFIG_ONLY, ["package.json"], [".github/workflows/build.yml"],
+    ["pnpm-lock.yaml", "docs/README.md"]])
+def test_a_diff_with_no_module_source_runs_no_related_selection(leerie,
+                                                                files):
+    axes, scope = leerie._select_subtask_axes(
+        BLT, RELATED, files, "base", "scoped", direct=DIRECT)
+    assert "tests" not in axes, axes
+    assert scope == "deferred"
+    assert not any("related" in c or c == BLT["test"] for c in axes.values())
+
+
+def test_a_mixed_diff_hands_related_only_its_sources(leerie):
+    axes, scope = leerie._select_subtask_axes(
+        BLT, RELATED, CONFIG_ONLY + ["src/a.ts", "src/b.test.tsx",
+                                     "web/c.vue"], "base", "scoped",
+        direct=DIRECT)
+    assert axes["tests"] == ("npx vitest related --run src/a.ts "
+                             "src/b.test.tsx web/c.vue --passWithNoTests")
+    assert scope == "scoped"
+
+
+def test_jest_impact_template_is_filtered_too(leerie):
+    out = leerie._render_scoped(
+        "npx jest --findRelatedTests {files} --passWithNoTests",
+        ["package.json", "src/a.js"], "base")
+    assert out == "npx jest --findRelatedTests src/a.js --passWithNoTests"
+
+
+def test_a_non_impact_files_template_keeps_every_file(leerie):
+    """Only a runner whose module graph decides what runs is filtered: a
+    declared `{files}` template for any other command gets the diff."""
+    assert leerie._render_scoped("lint-staged {files}", ["package.json"],
+                                 "base") == "lint-staged package.json"
+
+
+@pytest.mark.parametrize("config", ["vitest.config.ts", "vite.config.mjs",
+                                    "pkg/vitest.workspace.ts"])
+def test_a_runner_config_change_runs_only_the_named_test_files(leerie,
+                                                               config):
+    axes, scope = leerie._select_subtask_axes(
+        BLT, RELATED, [config, "src/a.ts", "src/a.test.ts"], "base",
+        "scoped", direct=DIRECT, named_tests=["src/b.test.ts", "src/x.ts"])
+    assert scope == "runner_config_changed"
+    assert axes["tests"] == ("npx vitest run src/a.test.ts src/b.test.ts "
+                             "--passWithNoTests")
+
+
+def test_a_runner_config_change_with_no_named_test_is_deferred(leerie):
+    axes, scope = leerie._select_subtask_axes(
+        BLT, RELATED, ["vitest.config.ts"], "base", "scoped",
+        direct=DIRECT, named_tests=[])
+    assert "tests" not in axes
+    assert scope == "runner_config_changed"
+    assert leerie._deferred_axes(axes, BLT, "scoped") == ["tests"]

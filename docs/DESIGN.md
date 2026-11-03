@@ -14354,7 +14354,8 @@ subtask, backed by an expensive oracle run twice.
 **Not every runner can map source to tests, and the ones that cannot need
 the file list filtered.** `vitest related` and `jest --findRelatedTests`
 take *source* files and resolve their tests through the runner's own module
-graph, so `{files}` can be handed to them whole. pytest has no such
+graph, so `{files}` can be handed to them — its module sources, below.
+pytest has no such
 mechanism — it takes paths and collects what is under them, so a source or
 docs path is not merely uninformative, it is an error: `pytest
 orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4, and mixing
@@ -14362,6 +14363,38 @@ one bad path with a good one still exits 4 — one non-test path poisons an
 otherwise-valid invocation. Since a real subtask diff almost always mixes
 source and docs with its tests, a `{files}` template on such a repo reports
 RED on nearly every subtask.
+
+**An impact-analysis runner is handed only its own module sources.**
+*Designed 2026-11-03 (the live 0.43.0 barnacle runs).* Handing `{files}`
+over whole rested on a premise that is false: that a non-source operand
+is inert to `related`. Two kinds are not. vitest's `forceRerunTriggers`
+default to `**/package.json/**` and `**/{vitest,vite}.config.*/**`, and
+`related` honours them — an operand matching one makes it return every
+test file (vitest 4.1.11, `filterTestsBySource`). Measured on barnacle: a
+subtask whose diff changed only `.github/workflows/*.yml`, `.nvmrc`,
+`Dockerfile` and `package.json` rendered `npx vitest related --run
+<those> --passWithNoTests`, which ran all 1,299 test files in 4,716 s —
+the whole suite the task forbade, on a diff no test imports. So for a
+runner with impact analysis (vitest, jest; the template read as one, as
+`_derive_test_files_scoped` reads it) `{files}` substitutes only the
+changed files the runner's module graph holds, by extension
+(`_IMPACT_SOURCE_EXTS`: `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`,
+`.mts`, `.cts`, `.vue`, `.svelte`), never a manifest, lockfile, workflow,
+document or runner configuration. A diff with no such file renders
+nothing, and the absence rule defers the axis: a manifest, lockfile or CI
+change is measured by the axis that owns it — the install and build of
+the committed view, CI parity — and never by the whole suite. A changed
+runner configuration (`vitest.config.*`, `vite.config.*`,
+`vitest.workspace.*`, `jest.config.*`: a trigger with a source
+extension) changes how every test runs, so impact analysis cannot answer
+it: the axis is typed `runner_config_changed` and runs the runner's
+direct form (`resolve_test_files_scoped`'s derivation) over only the test
+files that are named — the diff's own and the planner's
+`files_likely_touched` — or, with none named, is deferred like any other
+axis with nothing to run. A trigger the repository adds in its own
+configuration (`setupFiles`, a custom `forceRerunTriggers`) is not known
+without reading that configuration and is not modelled; a setup file is
+usually a source file and can still reach `related`.
 
 So a template may instead ask for `{test_files}`, which substitutes only
 the test-shaped members of the changed-file set — a narrower proxy than the
