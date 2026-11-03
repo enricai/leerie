@@ -7999,21 +7999,40 @@ fi
 # convention used for mise / pnpm / pip / go / cargo (see below).
 mkdir -p "$HOME/.cache/leerie"
 
-# Best-effort sweep of stale per-run staging dirs. The EXIT trap below removes
-# $STAGE on a clean exit, but a SIGKILL (OOM, `nerdctl kill`) or a hard crash
-# bypasses the trap and leaks the dir. Left unchecked these accumulate (each is
-# a few MB of staged ~/.claude). Remove cfg-* dirs older than a day. Backgrounded
-# so a large backlog never delays a launch. Mirrors the _reap_orphaned_container
-# idea. IMPORTANT: `-mtime` tests the cfg dir's OWN top-level mtime, which
-# freezes at staging-completion — writes the running container makes into
-# $STAGE/.claude/* do NOT bump it. So a genuinely LIVE long-running run (its
-# container's rw bind-mount is $STAGE) would look "old" to this sweep and be
-# deleted out from under itself. The keepalive below (which `touch`es $STAGE
-# hourly for the run's lifetime) is what keeps a live dir's mtime fresh, so
-# `-mtime +1` only ever matches truly-abandoned dirs.
-# Holds none of the launcher's stdio, like the keepalive below.
-( find "$HOME/.cache/leerie" -maxdepth 1 -type d -name 'cfg-*' -mtime +1 \
-    -exec rm -rf {} + ) </dev/null >/dev/null 2>&1 &
+# Sweep of the staging dirs whose launch is over (DESIGN §6 *A staged copy
+# of the credentials lives only as long as its launch*). The EXIT trap below
+# removes $STAGE on every exit that runs code; a SIGKILL, an OOM kill or a
+# host crash leaves it, with its copies of the credentials. A stage is named
+# cfg-<launcher pid>-<random>: one whose launcher no longer runs goes at
+# once. A name with no PID (a launcher from before this rule) or a PID a live
+# process reuses goes once untouched for a day (-mmin +1440; `-mtime +1`
+# meant more than 48 h). `-mmin` tests the entry's OWN mtime, which freezes
+# at staging-completion — the container's writes into $STAGE/.claude/* do
+# NOT bump it — so the keepalive below `touch`es a live $STAGE hourly. Every
+# entry type goes: a 0-byte regular `cfg-*` file sat beside the dirs for
+# months under the old `-type d`. Backgrounded so a backlog never delays a
+# launch; holds none of the launcher's stdio, like the keepalive below.
+_sweep_stale_stages() {
+  local _e _n _pid
+  for _e in "$HOME/.cache/leerie"/cfg-*; do
+    [ -e "$_e" ] || [ -L "$_e" ] || continue
+    _n=${_e##*/cfg-}
+    _pid=${_n%%-*}
+    case "$_pid" in
+      ''|*[!0-9]*) _pid="" ;;
+    esac
+    [ "$_pid" = "$_n" ] && _pid=""
+    if [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; then
+      rm -rf "$_e"
+      continue
+    fi
+    if [ -n "$(find "$_e" -maxdepth 0 -mmin +1440 2>/dev/null)" ]; then
+      rm -rf "$_e"
+    fi
+  done
+  return 0
+}
+( _sweep_stale_stages ) </dev/null >/dev/null 2>&1 &
 
 # The $STAGE keepalive, started below. It holds none of the launcher's
 # stdio, and stopping it stops its `sleep` (DESIGN §6 *Nothing the launcher
@@ -8034,9 +8053,9 @@ _stage_keepalive() {
     _sleep=""
   done
 }
-STAGE="$(mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX")"
+STAGE="$(mktemp -d "$HOME/.cache/leerie/cfg-$$-XXXXXX")"
 # Keepalive: touch $STAGE hourly so a live-but-long-running dir never looks
-# stale to the sweep above (see the -mtime note). Backgrounded; killed by the
+# stale to the sweep above (see the -mmin note). Backgrounded; killed by the
 # EXIT trap below (so it never outlives the run and leak a `touch` loop). The
 # 3600s interval is far tighter than the 1-day sweep floor, so a live dir's
 # mtime stays comfortably fresh even across an auto-resume re-exec (each re-exec

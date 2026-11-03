@@ -7296,6 +7296,25 @@ launcher's stdio, and stopping it stops its children. The keepalive
 the launcher is gone, which bounds the case where no trap ran (SIGKILL)
 to one interval.
 
+**A staged copy of the credentials lives only as long as its launch.**
+`$STAGE` (`~/.cache/leerie/cfg-<launcher pid>-<random>`) holds copies of
+the Claude credentials, `~/.ssh`, `~/.gnupg` and, on EC2, `~/.aws`. Every
+exit path that runs any code removes it: the EXIT trap, set right after
+the directory is made, which bash also runs on INT, TERM and HUP, and on
+the remote runtimes the teardown's exit pass (*Finalization parity*).
+What no trap survives — SIGKILL, an out-of-memory kill, a host crash —
+is left to the next launch's sweep, which removes every `cfg-*` entry
+whose launch is over: one whose name carries a launcher PID that no
+longer runs, whatever its age; and, for a name with no PID (a launcher
+from before this rule) or a PID reused by a live process, one not
+touched for a day (`-mmin +1440`; a live launch's keepalive touches its
+directory hourly). Every entry type is swept, a regular file or a link
+named `cfg-*` included. Measured on the host of the 0.43.0 barnacle
+runs: 21 `cfg-*` entries, among them a 0-byte regular file from
+2026-08-03 the old sweep (`-type d`) skipped forever, and directories
+from the 2026-11-02 host crash its `-mtime +1` (more than 48 h, not the
+day it documented) had not reached yet.
+
 **Worker subtree termination — Memory containment via cgroup v2.** The
 kernel reap above handles *process lifecycle*, not memory: when a worker's
 tool subtree (a `pnpm test` spawning vitest pools, a `tsc --noEmit`
