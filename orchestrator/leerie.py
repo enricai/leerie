@@ -10380,68 +10380,6 @@ _EXEC_EXCLUSIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # while the first one holds the lock.
 _EXEC_SHARED: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_EXEC_SHARED", default=False)
-# The host-wide level, in the directory every local run on the host shares
-# (`_HOST_DIR_ENV`, next to the build semaphore): `flock` gives no writer
-# preference, so a waiting evaluation holds the intent file exclusive and
-# every shared taker passes through it shared first.
-HOST_EXEC_LOCK = "exec.lock"
-HOST_EXEC_INTENT = "exec.intent"
-
-
-def _host_flock(path: Path, op: int) -> int:
-    """Open `path` (made when missing) and `flock` it with `op`, blocking;
-    the descriptor, which holds the lock until closed."""
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
-    try:
-        fcntl.flock(fd, op)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
-@contextlib.asynccontextmanager
-async def _host_exec_lock(exclusive: bool) -> AsyncIterator[None]:
-    """The host's level of the execution lock: shared by every worker and
-    confined command of every run on the host, exclusive by a held-out
-    evaluation. No-op without the host directory (Fly and EC2 run one run
-    per machine; a test). Each holder opens its own descriptors; a blocking
-    `flock` runs in a thread, so the loop never waits on another run."""
-    host = os.environ.get(_HOST_DIR_ENV, "").strip()
-    if not host or not os.path.isdir(host):
-        yield
-        return
-    lock_p = Path(host) / HOST_EXEC_LOCK
-    intent_p = Path(host) / HOST_EXEC_INTENT
-    held: list[int] = []
-
-    async def _take(path: Path, op: int) -> int:
-        # Shielded: a cancelled wait leaves the thread blocked in `flock`;
-        # the descriptor it returns once it gets the lock is closed then,
-        # never stranded holding it.
-        fut = asyncio.ensure_future(asyncio.to_thread(_host_flock, path, op))
-        try:
-            fd = await asyncio.shield(fut)
-        except asyncio.CancelledError:
-            fut.add_done_callback(
-                lambda f: f.cancelled() or f.exception() is not None
-                or _close_fd(f.result()))
-            raise
-        held.append(fd)
-        return fd
-    try:
-        if exclusive:
-            await _take(intent_p, fcntl.LOCK_EX)
-            await _take(lock_p, fcntl.LOCK_EX)
-        else:
-            intent = await _take(intent_p, fcntl.LOCK_SH)
-            await _take(lock_p, fcntl.LOCK_SH)
-            held.remove(intent)
-            os.close(intent)
-        yield
-    finally:
-        for fd in held:
-            _close_fd(fd)
 
 
 class _ExecLock:
@@ -10453,13 +10391,15 @@ class _ExecLock:
     command on the repository's code exists. A waiting exclusive holder stops
     new shared ones, so a stream of measurements cannot starve it. Nothing
     that holds it shared waits on an evaluation — it is taken after every
-    semaphore, and a shared holder's commands pass through — so it cannot
-    deadlock; a worker spawned inside an evaluation stops the run instead of
-    waiting. The host's level (`_host_exec_lock`) is taken inside it, by the
-    outermost holder only."""
+    semaphore and before a host build slot, and a shared holder's commands
+    pass through — so it cannot deadlock; a worker spawned inside an evaluation stops the run instead of
+    waiting. It is the run's alone: no level spans runs (DESIGN §6 *There is
+    no host level*). An evaluation that must wait logs both ends of its
+    wait, so a stall is never silent."""
 
     def __init__(self) -> None:
         self.readers = 0
+        self.workers = 0
         self.writer = False
         self.writers_waiting = 0
         self._waiters: list[asyncio.Future] = []
@@ -10497,13 +10437,14 @@ class _ExecLock:
         while self.writer or self.writers_waiting:
             await self._wait()
         self.readers += 1
+        self.workers += worker
         token = _EXEC_SHARED.set(True)
         try:
-            async with _host_exec_lock(False):
-                yield
+            yield
         finally:
             _EXEC_SHARED.reset(token)
             self.readers -= 1
+            self.workers -= worker
             if not self.readers:
                 self._wake()
 
@@ -10519,17 +10460,25 @@ class _ExecLock:
                 "itself (DESIGN §6 *A held-out evaluation runs alone*). "
                 "Report this.")
         self.writers_waiting += 1
+        t0 = time.monotonic() if (self.writer or self.readers) else None
+        if t0 is not None:
+            behind = ", behind another evaluation" if self.writer else ""
+            log(f"  execution lock: held-out evaluation waits for "
+                f"{self.readers} shared holder(s) of this run "
+                f"({self.workers} worker(s)){behind}")
         try:
             while self.writer or self.readers:
                 await self._wait()
         finally:
             self.writers_waiting -= 1
             self._wake()
+        if t0 is not None:
+            log(f"  execution lock: held-out evaluation waited "
+                f"{time.monotonic() - t0:.0f}s")
         self.writer = True
         token = _EXEC_EXCLUSIVE.set(True)
         try:
-            async with _host_exec_lock(True):
-                yield True
+            yield True
         finally:
             _EXEC_EXCLUSIVE.reset(token)
             self.writer = False
@@ -10563,12 +10512,18 @@ async def _held_out_section(st: object) -> AsyncIterator[None]:
     """Hold the execution lock exclusive around a held-out file's sandboxed
     run (DESIGN §6 *A held-out evaluation runs alone, in a world that dies
     with it (I3)*): no worker process and no other command on the
-    repository's code exists meanwhile, in the run or on the host, so
-    nothing observes what a namespace cannot hide — its `/proc` entries,
+    repository's code exists meanwhile in the run, so nothing of the run
+    observes what a namespace cannot hide — its `/proc` entries,
     its cgroup's counters, its contention. Its own commands pass through;
-    nested sections are one. What it leaves is the sandbox's, gone with
-    it: nothing is inventoried or removed here."""
-    async with _exec_lock().exclusive():
+    nested sections are one. Then a host build slot, as every command takes
+    one after the lock (DESIGN §6 *Inside an evaluation every concurrency
+    gate is already the holder's*): the evaluation is one of the host's
+    builds, and it holds no slot while it waits for its run's workers. What
+    it leaves is the sandbox's, gone with it: nothing is inventoried or
+    removed here."""
+    async with _exec_lock().exclusive() as outermost, \
+            _host_build_slot(st, label="held-out evaluation",
+                             take=outermost):
         yield
 
 
@@ -45200,22 +45155,41 @@ async def _acquire_build_slot(
 
 
 @contextlib.asynccontextmanager
-async def _build_class_slot(st: "State", *,
-                            label: str) -> AsyncIterator[int | None]:
-    """Hold one host build slot around a build/test command (DESIGN §6
-    *A host-wide build semaphore*). Yields the slot index, None when
-    ungated — and inside a held-out evaluation's exclusive hold, which no
-    confined process of any run on the host overlaps, so the host's slots
-    are already its own (DESIGN §6 *Inside an evaluation every concurrency
-    gate is already the holder's*)."""
-    if _EXEC_EXCLUSIVE.get():
-        yield None
-        return
-    fd, slot, _n = await _acquire_build_slot(st, label=label)
+async def _host_build_slot(st: "State", *, label: str,
+                           take: bool = True) -> AsyncIterator[int | None]:
+    """Hold one of the host's build slots (`_acquire_build_slot`) for the
+    body; yields its index, None when ungated or when `take` is False.
+    Taken only by a holder of the run's execution lock (`_build_class_slot`
+    shared, `_held_out_section` exclusive): the order is the lock, then the
+    slot (DESIGN §6 *Inside an evaluation every concurrency gate is already
+    the holder's*)."""
+    fd, slot = None, None
+    if take:
+        fd, slot, _n = await _acquire_build_slot(st, label=label)
     try:
         yield slot
     finally:
         _close_fd(fd)
+
+
+@contextlib.asynccontextmanager
+async def _build_class_slot(st: "State", *,
+                            label: str) -> AsyncIterator[int | None]:
+    """Hold the run's execution lock shared and then one host build slot
+    around a build/test command (DESIGN §6 *A host-wide build semaphore*,
+    *Inside an evaluation every concurrency gate is already the holder's*).
+    Yields the slot index; None when ungated, and inside a held-out
+    evaluation's exclusive hold, whose own slot its commands run in. The
+    lock comes first: a command waiting for a slot holds no slot, and an
+    evaluation, which takes its slot only once it holds the lock exclusive
+    and no command of its run holds one, never holds a slot while it waits
+    for its run's shared holders."""
+    if _EXEC_EXCLUSIVE.get():
+        yield None
+        return
+    async with _exec_lock().shared(), \
+            _host_build_slot(st, label=label) as slot:
+        yield slot
 
 
 def _is_blt_build_test_argv(argv: list[str], blt: dict[str, str]) -> bool:
@@ -47286,8 +47260,10 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         try:
             _mkdir_private(reports, own)
             _unlink_beneath(own, report)
+            # A held-out file's run is an evaluation, which takes its own
+            # slot once it holds the lock exclusive; any other run is a
+            # command, which takes one once it holds the lock shared.
             async with _blt_slot(caps), \
-                    _build_class_slot(st, label=f"{label}-ids"), \
                     _leaves_tree_as_found(tree, "test run", label):
                 t_run = time.monotonic()
                 try:
@@ -47303,11 +47279,13 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                     report=str(report)),
                                 report_into=got)
                     else:
-                        await _run_streaming(
-                            argv, grants=grants, cwd=str(tree), env=env,
-                            timeout=max(1.0, left), log_path=log_path,
-                            label=f"{label}-ids: {run_cmd}",
-                            verbosity="quiet")
+                        async with _build_class_slot(st,
+                                                     label=f"{label}-ids"):
+                            await _run_streaming(
+                                argv, grants=grants, cwd=str(tree), env=env,
+                                timeout=max(1.0, left), log_path=log_path,
+                                label=f"{label}-ids: {run_cmd}",
+                                verbosity="quiet")
                 finally:
                     spent += time.monotonic() - t_run
         except Exception:
@@ -52901,8 +52879,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     sandbox = HeldOutSandbox(view=str(tree), place=tuple(place),
                              report=str(report) if spec is not None
                              else None)
-    # A held-out file's run is alone in the run and on the host, which
-    # bounds it more tightly than the BLT semaphore would (DESIGN §6 *A
+    # A held-out file's run is alone in the run, which bounds it more
+    # tightly than the BLT semaphore would (DESIGN §6 *A
     # held-out evaluation runs alone*).
     async with _held_out_section(st):
         try:

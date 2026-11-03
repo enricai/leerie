@@ -4230,15 +4230,15 @@ It is constructed, not checked, in two halves.
    inside the sandbox, on its `/tmp` and loopback, and dies with it (*No
    database server leerie starts is ever unconfined*).
 2. **Time.** While an evaluation runs, no worker process and no other
-   command leerie runs on the repository's code exists — in the run, and
-   on the host. Every worker holds the execution lock shared for its
-   process's lifetime, as every confined command does, and an evaluation
-   holds it exclusive. What a namespace cannot hide — the evaluation's
+   command leerie runs on the repository's code exists in its run. Every
+   worker holds the run's execution lock shared for its process's
+   lifetime, as every confined command does, and an evaluation holds it
+   exclusive. What a namespace cannot hide — the evaluation's
    `/proc/<pid>/cmdline`, its cgroup's counters, CPU, memory, page-cache
-   and disk contention, a socket a worker holds open — has no observer
-   while it exists.
+   and disk contention, a socket a worker holds open — has no observer in
+   the run while it exists.
 
-**The execution lock.** Two levels, one rule.
+**The execution lock.** One per run.
 - *The run's* is the reader/writer lock the run's `/tmp` used
   (`_ExecLock`, `_exec_lock()`; one per event loop, writer preference, so
   a stream of measurements cannot starve an evaluation). New shared
@@ -4270,25 +4270,72 @@ It is constructed, not checked, in two halves.
   parallelism caps bound a phase's wall time.
 - *Inside an evaluation every concurrency gate is already the holder's.*
   While it holds the lock exclusive nothing else of the run runs a
-  command, and no confined process of any run on the host runs: the BLT
-  semaphore, the host build slot and the confirm lock — which bound how
-  many commands run at once — pass through for the holder instead of
-  waiting. Waiting on one there could wait on a holder that holds it while
-  it waits for the lock shared, which waits on the evaluation. The B*
-  pressure gate still runs inside (a bounded wait on host CPU pressure,
-  holding nothing another holder needs).
-- *The host's* is an `flock` on `exec.lock` in the host-wide directory
-  (`/leerie-host`, next to the build semaphore), taken after the run's:
-  shared by every worker and confined command of every run, exclusive by
-  an evaluation, with writer preference by a second file (`exec.intent`,
-  held exclusive by a waiting evaluation and briefly shared by every
-  shared taker first), since `flock` gives none and the host's workers
-  overlap continuously. Without the host directory (Fly and EC2, one run
-  per machine; a test) the run's lock is the whole lock.
-  *Cost:* an evaluation waits for every worker running on the host, and
-  while it waits no new worker starts on the host. Accepted: the user's
-  rule is "however obscure", and other runs' workers share the host's
-  cgroup tree (`--cgroupns=host`), CPU and memory with it.
+  command: the BLT semaphore, the host build slot and the confirm lock —
+  which bound how many commands run at once — pass through for the holder
+  instead of waiting. Waiting on one there could wait on a command of the
+  run that holds it while it waits for the lock shared, which waits on the
+  evaluation. The host build slot is the exception in one respect: an
+  evaluation takes one once it holds the exclusive, so it is one of the
+  host's builds, and its own commands then pass through the slot it
+  holds. *Designed 2026-11-03 (review round 30, execution):* with the
+  host level gone, evaluations of different runs overlap, and while they
+  skipped the slot the host's load during them was bounded by nothing,
+  though the build semaphore is what bounds contention between runs
+  (*There is no host level*, below). The B* pressure gate still runs
+  inside (a bounded wait on host CPU pressure, holding nothing another
+  holder needs).
+- *The run's execution lock, then a host build slot, everywhere.* A
+  command takes the lock shared and then its slot (`_build_class_slot`);
+  an evaluation takes it exclusive and then its slot
+  (`_held_out_section`). Round 30's order was the reverse, slot then
+  lock, and an evaluation held a host slot while it waited for its run's
+  workers, which hold the lock shared for their whole lives (up to the
+  worker timeout; the worker chooses how long): each queued evaluation of
+  a run held one more slot that nothing ran in, so one run's long workers
+  could hold every slot on the host and stall every other run's builds
+  and tests (review round 31, isolation E1, execution 5). With the lock
+  first, no slot is held while the run's own lock is waited for. It
+  cannot deadlock. A slot holder runs its one command and waits on
+  nothing else: nothing a slot is held around reaches a lock, a
+  semaphore, a second slot or a worker. A command waiting for a slot
+  holds the lock shared, so its run's evaluation waits for it, but it
+  waits only on slot holders. An evaluation waiting for a slot holds the
+  lock exclusive, so no command of its run holds a slot, and it waits
+  only on other runs' holders, which never wait on this run. The BLT
+  semaphore and the confirm lock stay outside the lock, as before. A slot
+  holder takes no second slot (one build, one slot) by the same rule, not
+  by a flag.
+- *A wait for the exclusive is logged at both ends.* An evaluation that
+  must wait logs, before it waits, how many shared holders of the run it
+  waits for and how many of them are workers, and, once it holds the lock,
+  how long it waited. Measured on barnacle with the host level below in
+  place: a run's acceptance sets took 56 minutes to validate with no line
+  in its log while every other run kept working, so the stall could not be
+  told from a hang.
+- *There is no host level.* *Designed 2026-11-03 (the user's decision, on
+  the live 0.43.0 barnacle runs).* An `flock` on `exec.lock` in the
+  host-wide directory, with writer preference through `exec.intent`, used
+  to extend the lock to every worker and confined command of every run on
+  the host. Its cost was a convoy: an evaluation waiting in one run
+  stopped new workers and commands in every run, then waited for every
+  shared holder on the host to drain — 20-minute measurements and
+  30-minute worker sessions of runs that had nothing to do with its sets.
+  It protected nothing I3 needs. I3's threat is a worker gaming its own
+  run's held-out set. Each run is a separate container, with its own PID,
+  mount, IPC and network namespaces, so another run's processes see no
+  `/proc` entry, socket or file of this run's evaluation; and its sets
+  are written fresh at its own start (§8 *Held-out acceptance tests*,
+  *The validity tree is the run's own start*) and never carried forward, so what
+  another run can still observe — the shared cgroup counters
+  (`--cgroupns=host`) and contention — concerns only a set that is
+  worthless to it. The run's lock is therefore the whole lock, on every
+  runtime: local rootless and rootful as on Fly and EC2, where one run
+  owns the machine and the host level was already absent. Host
+  contention between runs is the build semaphore's to bound (§6 *A
+  host-wide build semaphore*), not the execution lock's, and a run's
+  lock holds no host slot while it is waited for: a slot is taken only by
+  a holder of the run's lock (*The run's execution lock, then a host
+  build slot, everywhere*, above).
 
 **What the runtime must allow.** The shim needs a user namespace and the
 mounts above; the container's policy decides both.
@@ -7334,7 +7381,8 @@ F4/P4 arm D). The same six builds through a flock semaphore finished 6 of
 6 in 562 s (arm S). So the commands that are themselves build or test
 runs — the orchestrator's own BLT measurements and B\* reruns, and a
 settle-by-execution command that is the repo's build or test command —
-take a slot first: `⌊(MemAvailable − 4 GiB) / peak⌋` slots, sized when the
+take a slot, once they hold their run's execution lock (§6 *The run's
+execution lock, then a host build slot, everywhere*): `⌊(MemAvailable − 4 GiB) / peak⌋` slots, sized when the
 peak is measured and never fewer than one, so a build too large for the
 host still runs alone rather than deadlocking. Before a peak is known the
 measured-constant build peak sizes it. The slots are lock files in a host

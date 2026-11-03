@@ -6763,25 +6763,45 @@ sample's probe never counts for the next.
     end with it.
   - Leerie's own temp directory is in the run directory, and `_run_phases`
     moves it first.
-- `tests/test_exec_lock.py` (15 test functions, 16 cases; DESIGN §6 *A held-out evaluation
-  runs alone, in a world that dies with it (I3)*, the time half): an
-  evaluation runs with no measurement beside it and waits for running ones
-  without starving; it waits for a running real `_invoke` worker, and a
-  worker asked for meanwhile starts after it; a worker spawned inside an
-  evaluation stops the run before spawning; a cancelled worker and a
-  cancelled waiter release the lock; sections nest, a shared holder's own
-  commands pass through a waiting evaluation, and an evaluation inside a
-  shared hold stops the run; the host level makes an evaluation wait for
-  another process's shared holder and holds later shared takers behind it,
-  and releases both files; by rule over the module nothing reachable inside
-  `_held_out_section` spawns a worker or waits on a raw semaphore or lock
-  a shared holder may hold — stopping at the three gates that pass
+- `tests/test_exec_lock.py` (19 test functions, 21 cases; DESIGN §6 *A
+  held-out evaluation runs alone, in a world that dies with it (I3)*, the
+  time half; *The run's execution lock, then a host build slot,
+  everywhere*): an evaluation runs with no measurement beside it and waits
+  for running ones without starving; it waits for a running real `_invoke`
+  worker, and a worker asked for meanwhile starts after it; a worker
+  spawned inside an evaluation stops the run before spawning; a cancelled
+  worker and a cancelled waiter release the lock; sections nest, a shared
+  holder's own commands pass through a waiting evaluation, and an
+  evaluation inside a shared hold stops the run; two runs' locks never
+  block each other (the lock has no host level), and an evaluation that
+  must wait logs what it waits for and how long it waited, one that need
+  not logs nothing. By rule over the module, nothing reachable inside
+  `_held_out_section` spawns a worker or waits on a raw semaphore, lock or
+  second slot a shared holder may hold — stopping at the gates that pass
   through inside an exclusive hold (`_blt_slot`, `_build_class_slot`,
-  `_confirm_hold`) — with the rule's own catch of planted violations and
-  its acceptance of the gates; the gates entered inside an exclusive hold
-  while another task holds each raw resource pass through, and the same
-  entry outside one waits (the two arms disagree); and every shared holder
-  takes the lock after its semaphores.
+  `_confirm_hold`, and a nested `_held_out_section`) — with the rule's own
+  catch of planted violations and its acceptance of the gates; the gates
+  entered inside an exclusive hold while another holder has each raw
+  resource pass through, and the same entry outside one waits (the two arms
+  disagree); every shared holder takes the lock after its semaphores; and
+  nothing reachable inside a `_build_class_slot` hold takes a second slot,
+  a section, a semaphore or a worker (one build, one slot, by rule: this
+  replaced the `_BUILD_SLOT_HELD` flag). The order (review round 31,
+  isolation E1, execution 5): an evaluation takes its host slot once it
+  holds the lock exclusive (with the host's one slot held by another run it
+  waits holding the exclusive; with it free it enters at once — 2 cases),
+  a command takes its slot inside its shared hold, also when it already
+  holds the lock shared (round 30's order stopped the run there), and an
+  evaluation waiting for its run's workers holds no slot, so another run
+  (another event loop) gets the host's one slot at once. Falsified against
+  the round-30 order, 4 cases fail: the build-slot rule, the other two
+  order tests, and the first one's slot-held case (its slot-free case
+  passes either way; the slot-held case waited forever on a starter that
+  died, and now bounds that wait). Both cases of the pass-through test
+  hang against that order.
+  `tests/test_build_peak_sizing.py::test_slots_are_shared_through_the_host_dir`
+  is unchanged but for its comment: its two holders now each hold the
+  run's lock shared, then a slot.
 - `tests/test_falsifier_exec_queue.py` (3 test functions, 5 cases;
   DESIGN §6 *Evaluations queue on the lock itself*, review round 21
   execution M1): the real `_falsify_items`, `_falsifier_gates`,

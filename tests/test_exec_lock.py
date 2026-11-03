@@ -1,9 +1,8 @@
 """The execution lock (DESIGN §6 *A held-out evaluation runs alone, in a
 world that dies with it (I3)*, the time half): every worker holds it shared
 from its spawn until its process has exited, as every confined command does;
-a held-out evaluation holds it exclusive — in the run (`_ExecLock`) and on
-the host (`_host_exec_lock`). A worker spawned inside an evaluation stops the
-run, and by rule nothing reachable inside an evaluation spawns a worker or
+a held-out evaluation holds it exclusive, in its run only (`_ExecLock`; no
+level spans runs). A worker spawned inside an evaluation stops the run, and by rule nothing reachable inside an evaluation spawns a worker or
 waits on a semaphore a shared holder may hold, so the lock cannot deadlock.
 
 Real code throughout: the real `_invoke` spawning a real process (unconfined:
@@ -13,11 +12,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import fcntl
 import json
-import os
-import subprocess
-import sys
 import textwrap
 import time
 from pathlib import Path
@@ -271,89 +266,95 @@ def test_a_cancelled_waiter_does_not_wedge_the_lock(leerie):
     assert asyncio.run(asyncio.wait_for(go(), 5)) == (0, 0)
 
 
-# --- the host's level --------------------------------------------------------
+# --- the lock is the run's alone (DESIGN §6 *There is no host level*) -------
 
-_HOLDER = textwrap.dedent("""\
-    import fcntl, os, sys, time
-    fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_SH if sys.argv[2] == "sh" else fcntl.LOCK_EX)
-    print("held", flush=True)
-    time.sleep(float(sys.argv[3]))
-    """)
-
-
-def _hold(path: Path, mode: str, secs: float) -> subprocess.Popen:
-    p = subprocess.Popen([sys.executable, "-c", _HOLDER, str(path), mode,
-                          str(secs)], stdout=subprocess.PIPE, text=True)
-    assert p.stdout.readline().strip() == "held"
-    return p
-
-
-def test_an_evaluation_waits_for_another_runs_shared_holder(
-        leerie, tmp_path, monkeypatch):
-    """Another run's worker (a process holding `exec.lock` shared) delays
-    this run's evaluation until it lets go; this run's shared takers then
-    wait behind the evaluation (writer preference through `exec.intent`)."""
+def test_two_runs_locks_never_block_each_other(leerie, tmp_path, monkeypatch):
+    """Two runs (two event loops, as two orchestrators are) sharing the
+    host-wide directory: while one holds an evaluation, the other's workers
+    and its own evaluation start at once. The host level this replaces made
+    the second wait for the first."""
+    import threading
     monkeypatch.setenv(leerie._HOST_DIR_ENV, str(tmp_path))
-    other = _hold(tmp_path / leerie.HOST_EXEC_LOCK, "sh", 1.5)
-    events: list = []
+    holding, release = threading.Event(), threading.Event()
+    took: dict = {}
 
-    async def held():
-        events.append(("held-asked", time.monotonic()))
-        async with leerie._host_exec_lock(True):
-            events.append(("held-start", time.monotonic()))
-            await asyncio.sleep(0.3)
-            events.append(("held-end", time.monotonic()))
+    def run_a():
+        async def go():
+            async with leerie._exec_lock().exclusive():
+                holding.set()
+                await asyncio.to_thread(release.wait, 30)
+        asyncio.run(go())
 
-    async def shared_later():
-        await asyncio.sleep(0.5)
-        async with leerie._host_exec_lock(False):
-            events.append(("shared-start", time.monotonic()))
+    def run_b():
+        async def go():
+            t0 = time.monotonic()
+            async with leerie._exec_lock().shared(worker=True):
+                took["shared"] = time.monotonic() - t0
+            t0 = time.monotonic()
+            async with leerie._exec_lock().exclusive():
+                took["exclusive"] = time.monotonic() - t0
+        asyncio.run(asyncio.wait_for(go(), 10))
+
+    a = threading.Thread(target=run_a)
+    a.start()
+    try:
+        assert holding.wait(10)
+        b = threading.Thread(target=run_b)
+        b.start()
+        b.join(15)
+        assert not b.is_alive()
+    finally:
+        release.set()
+        a.join(15)
+    assert took["shared"] < 1.0 and took["exclusive"] < 1.0, took
+
+
+def test_an_evaluation_logs_both_ends_of_its_wait(leerie, monkeypatch):
+    """A stall is never silent: the wait names what it waits for, and its
+    end how long it took; an evaluation that need not wait logs nothing."""
+    lines: list[str] = []
+    monkeypatch.setattr(leerie, "log", lambda m, *a, **k: lines.append(m))
 
     async def go():
-        await asyncio.gather(held(), shared_later())
-    try:
-        asyncio.run(asyncio.wait_for(go(), 30))
-    finally:
-        other.wait(timeout=30)
-    at = dict(events)
-    assert at["held-start"] - at["held-asked"] >= 1.0, events
-    assert at["held-end"] <= at["shared-start"], events
-
-
-def test_the_host_level_is_released_and_absent_without_a_host_dir(
-        leerie, tmp_path, monkeypatch):
-    monkeypatch.delenv(leerie._HOST_DIR_ENV, raising=False)
-
-    async def none():
-        async with leerie._host_exec_lock(True):
-            return "ok"
-    assert asyncio.run(none()) == "ok"
-    monkeypatch.setenv(leerie._HOST_DIR_ENV, str(tmp_path))
-
-    async def twice():
-        async with leerie._exec_lock().exclusive():
+        lock = leerie._exec_lock()
+        async with lock.exclusive():
             pass
-        async with leerie._exec_lock().shared():
-            pass
-    asyncio.run(asyncio.wait_for(twice(), 10))
-    # Nothing still holds either file: an exclusive flock succeeds at once.
-    for name in (leerie.HOST_EXEC_LOCK, leerie.HOST_EXEC_INTENT):
-        fd = os.open(tmp_path / name, os.O_RDWR)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        finally:
-            os.close(fd)
+        quiet = list(lines)
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def holder(worker):
+            async with lock.shared(worker=worker):
+                held.set()
+                await release.wait()
+        hs = [asyncio.ensure_future(holder(w)) for w in (True, False)]
+        await held.wait()
+        await asyncio.sleep(0)
+        w = asyncio.ensure_future(lock.exclusive().__aenter__())
+        await asyncio.sleep(0.05)
+        asked = list(lines)
+        await asyncio.sleep(1.1)
+        release.set()
+        await asyncio.gather(*hs)
+        assert await w is True
+        return quiet, asked
+    quiet, asked = asyncio.run(asyncio.wait_for(go(), 10))
+    assert quiet == []
+    assert asked == ["  execution lock: held-out evaluation waits for 2 "
+                     "shared holder(s) of this run (1 worker(s))"], asked
+    assert len(lines) == 2 and lines[1].startswith(
+        "  execution lock: held-out evaluation waited "), lines
+    assert int(lines[1].split("waited ")[1].rstrip("s")) >= 1, lines
 
 
 # --- deadlock-freedom, by rule -----------------------------------------------
 
 # What may never be reached from inside an evaluation: a worker (which would
-# die by the guard), and every wait a shared holder may be holding while it
-# waits for the lock — a host build slot, the BLT semaphore, memory
-# admission, the confirm lock, the parallelism semaphores (a shared holder
-# takes the lock after them, so waiting for one inside an evaluation could
-# wait on a holder that waits on the evaluation).
+# die by the guard), every wait a shared holder may be holding while it
+# waits for the lock — the BLT semaphore, memory admission, the confirm
+# lock, the parallelism semaphores (a shared holder takes the lock after
+# them, so waiting for one inside an evaluation could wait on a holder that
+# waits on the evaluation) — and a second host build slot (the section
+# holds one; with the host's one slot it would wait on itself).
 _FORBIDDEN_IN_SECTION = frozenset({
     "claude_p", "_invoke", "_invoke_admitted",
     "_acquire_build_slot", "_blt_semaphore",
@@ -367,8 +368,10 @@ _FORBIDDEN_IN_SECTION = frozenset({
 # confirm reaches all three: its section spans its B* reruns (DESIGN §6
 # *Evaluations queue on the lock itself*). `_confirm_gate` is not a wait on
 # a holder: a bounded poll of host CPU pressure, holding nothing.
+# A section nested in a section is the same one: it takes no second slot
+# (`_host_build_slot(take=False)`), and its own body is a root of the rule.
 _PASS_THROUGH_GATES = frozenset({"_blt_slot", "_build_class_slot",
-                                 "_confirm_hold"})
+                                 "_confirm_hold", "_held_out_section"})
 
 
 def _reach(funcs: dict[str, ast.AST], roots: set[str],
@@ -482,8 +485,9 @@ def _exhausted(leerie):
 
     async def holder(started: asyncio.Event, release: asyncio.Event, st):
         sem = leerie._blt_semaphore(caps)
+        # Another run's slot holder: the slot alone, not this run's lock.
         async with sem, leerie._confirm_lock(), \
-                leerie._build_class_slot(st, label="other"):
+                leerie._host_build_slot(st, label="other"):
             started.set()
             await release.wait()
     return caps, holder
@@ -543,3 +547,171 @@ def test_every_shared_holder_takes_the_lock_after_its_semaphores():
         assert not bad, bad
     invoke = set(_reach(funcs, {"_invoke"}))
     assert not invoke & (_FORBIDDEN_IN_SECTION - {"_invoke", "Semaphore"})
+
+
+# --- an evaluation is one of the host's builds, after its run's lock --------
+# (DESIGN §6 *The run's execution lock, then a host build slot, everywhere*;
+# review round 31, isolation E1 and execution 5: with the slot taken first,
+# an evaluation held a host slot while it waited for its run's workers.)
+
+@pytest.mark.parametrize("slot_taken", [True, False])
+def test_an_evaluation_takes_a_host_slot_once_it_holds_the_lock(
+        leerie, run, slot_taken, monkeypatch):
+    """Evaluations of different runs overlap now that the lock is the
+    run's; each takes a host build slot, as every command does, so the
+    host's build semaphore bounds them (review round 30 execution). With
+    the host's only slot held elsewhere the section holds the lock and
+    waits for the slot; with it free it enters at once — the arms
+    disagree. Its own commands pass through the slot it holds."""
+    monkeypatch.delenv(leerie._HOST_DIR_ENV, raising=False)
+    st = _st(run)
+    st.data = {"blt_peak": {"slots": 1}}
+
+    async def main() -> tuple[bool, bool]:
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def other_run():
+            # Another run's holder: the slot alone, not this run's lock.
+            async with leerie._host_build_slot(st, label="other run"):
+                started.set()
+                await release.wait()
+        h = asyncio.ensure_future(other_run()) if slot_taken else None
+        if h is not None:
+            await asyncio.wait_for(started.wait(), 5)
+        locked = []
+
+        async def evaluate():
+            async with leerie._held_out_section(st):
+                async with leerie._build_class_slot(st, label="own"):
+                    return True
+
+        async def watch():
+            await asyncio.sleep(0.3)
+            locked.append(leerie._exec_lock().writer)
+        try:
+            w = asyncio.ensure_future(watch())
+            entered = await asyncio.wait_for(evaluate(), 1.5)
+        except asyncio.TimeoutError:
+            entered = False
+        finally:
+            release.set()
+            if h is not None:
+                await h
+        await w
+        return entered, locked[0]
+    entered, locked = asyncio.run(main())
+    assert entered is not slot_taken
+    # Waiting for the slot, it already held the lock exclusive.
+    assert locked is slot_taken
+
+
+def test_a_command_takes_its_slot_under_the_shared_lock(leerie, run,
+                                                        monkeypatch):
+    """The order is the lock, then the slot: a command's slot is taken
+    inside its shared hold, which an evaluation of its run waits for, and
+    a holder already sharing the lock takes a slot without a second hold.
+    Round 30's order stopped the run here."""
+    monkeypatch.delenv(leerie._HOST_DIR_ENV, raising=False)
+    st = _st(run)
+    st.data = {"blt_peak": {"slots": 1}}
+
+    async def main() -> tuple:
+        lock = leerie._exec_lock()
+        async with leerie._build_class_slot(st, label="cmd") as slot:
+            inside = (lock.readers, slot)
+        async with lock.shared():
+            async with leerie._build_class_slot(st, label="x") as slot:
+                nested = (lock.readers, slot)
+        return inside, nested, lock.readers
+    assert asyncio.run(asyncio.wait_for(main(), 5)) == ((1, 0), (1, 0), 0)
+
+
+def test_an_evaluation_waiting_for_its_runs_workers_holds_no_slot(
+        leerie, run, tmp_path, monkeypatch):
+    """Run A's worker holds A's lock shared; A's evaluation waits for it.
+    Run B (another event loop, as another orchestrator is) asks for the
+    host's only slot meanwhile and gets it at once: the waiting evaluation
+    holds none. With the slot taken before the lock, B waited until A's
+    worker exited (review round 31, isolation E1)."""
+    import threading
+    monkeypatch.setenv(leerie._HOST_DIR_ENV, str(tmp_path / "host"))
+    (tmp_path / "host").mkdir()
+    st = _st(run)
+    st.data = {"blt_peak": {"slots": 1}}
+    waiting, release = threading.Event(), threading.Event()
+    took: dict = {}
+
+    def run_a():
+        async def go():
+            lock = leerie._exec_lock()
+
+            async def worker():
+                async with lock.shared(worker=True):
+                    await asyncio.to_thread(release.wait, 30)
+
+            async def evaluate():
+                while not lock.readers:
+                    await asyncio.sleep(0.01)
+                async with leerie._held_out_section(st):
+                    took["a-evaluated"] = True
+
+            async def mark():
+                while not lock.writers_waiting:
+                    await asyncio.sleep(0.01)
+                waiting.set()
+            await asyncio.gather(worker(), evaluate(), mark())
+        asyncio.run(go())
+
+    def run_b():
+        async def go():
+            t0 = time.monotonic()
+            async with leerie._build_class_slot(st, label="run b") as slot:
+                took["b"] = (time.monotonic() - t0, slot)
+        try:
+            asyncio.run(asyncio.wait_for(go(), 2))
+        except asyncio.TimeoutError:
+            took["b"] = None
+
+    a = threading.Thread(target=run_a)
+    a.start()
+    try:
+        assert waiting.wait(10)
+        time.sleep(0.2)
+        b = threading.Thread(target=run_b)
+        b.start()
+        b.join(10)
+    finally:
+        release.set()
+        a.join(15)
+    assert took["b"] is not None and took["b"][0] < 1.0, took
+    assert took["b"][1] == 0
+    assert took.get("a-evaluated"), took
+
+
+def test_nothing_inside_a_build_slot_takes_another_gate():
+    """One build, one slot, by rule rather than by a flag: nothing reachable
+    inside a `_build_class_slot` hold takes a second slot, opens a section,
+    waits on a semaphore or spawns a worker — so a slot holder waits on
+    nothing but its own command, which is what makes the lock-then-slot
+    order deadlock-free."""
+    module = ast.parse(LEERIE_PY.read_text())
+    funcs = _top_level(module)
+    forbidden = (_FORBIDDEN_IN_SECTION
+                 | {"_build_class_slot", "_host_build_slot",
+                    "_held_out_section", "_blt_slot", "_confirm_hold"})
+    holds = [(fn.name, w) for fn in funcs.values() for w in ast.walk(fn)
+             if isinstance(w, ast.AsyncWith) and any(
+                 "_build_class_slot" in ast.unparse(i.context_expr)
+                 for i in w.items)]
+    assert len(holds) >= 5, "the rule found no build slot"
+    bad = []
+    for name, w in holds:
+        roots = {n.id if isinstance(n, ast.Name) else n.attr
+                 for stmt in w.body for c in ast.walk(stmt)
+                 if isinstance(c, ast.Call)
+                 for n in [c.func] + list(c.args)
+                 if isinstance(n, (ast.Name, ast.Attribute))}
+        hit = set(_reach(funcs, roots)) & forbidden
+        if hit:
+            bad.append((name, sorted(hit)))
+    assert bad == []

@@ -4633,7 +4633,7 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
 - `_run_streaming(cmd, *, grants, …)` and `_run_contained(argv, *,
   grants, sandbox=None, …)`: `grants` keyword-only, no default. The spawn
   is `_confined_argv(grants, cmd, sandbox=…)` (inside the spawn gate
-  when there is one), under `_exec_lock().shared()` and the host's lock,
+  when there is one), under `_exec_lock().shared()` (the run's; it has no host level),
   with environment `{**_repo_command_env(env), **dict(grants.env)}`.
   `_run_streaming` first `die()`s when `log_path` is a registered worker
   transcript (`_is_worker_transcript`; DESIGN §8 *What a worker ran is
@@ -5318,7 +5318,14 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   passes through when `_EXEC_EXCLUSIVE` is set, else waits while a writer
   holds or waits; `exclusive()` — yields False when nested, else waits for
   no writer and no reader, sets `_EXEC_EXCLUSIVE` in the holder's context,
-  yields True; one per running loop, a weak-key dictionary). Shared
+  yields True; one per running loop, a weak-key dictionary). The lock is
+  the run's alone: no level of it spans runs (DESIGN §6 *There is no host
+  level*). `shared(worker=True)` also counts the holder in `workers`.
+  `exclusive()` that must wait logs before waiting — `execution lock:
+  held-out evaluation waits for <readers> shared holder(s) of this run
+  (<workers> worker(s))<, behind another evaluation>` — and, once it holds
+  the lock, `execution lock: held-out evaluation waited <s>s`; an
+  `exclusive()` that need not wait logs nothing. Shared
   holders: `_run_streaming` (its whole spawn), the callers of
   `_ts_script_run` (synchronous: it checks `_exec_lock_held()` and
   `die()`s without it), the `mise ls` spawn, and `_invoke` (so
@@ -5331,16 +5338,22 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `exclusive()` called where `_EXEC_SHARED` is set `die()`s (`invariant:
   a held-out evaluation started while its own caller holds the execution
   lock shared`). A shared hold is taken after every semaphore its holder
-  takes (`_build_class_slot`, `_blt_slot`, memory admission,
-  `_confirm_hold`). Inside an exclusive hold those three gates pass
-  through instead of waiting (`_EXEC_EXCLUSIVE` set: the holder is alone
-  in the run and on the host), and nothing reachable inside
+  takes (`_blt_slot`, memory admission, `_confirm_hold`), and a host
+  build slot after the hold (`_build_class_slot`, `_held_out_section`;
+  DESIGN §6 *The run's execution lock, then a host build slot,
+  everywhere*). Inside an exclusive hold the three gates pass through
+  instead of waiting (`_EXEC_EXCLUSIVE` set: the holder is alone in the
+  run, and holds its own slot), and nothing reachable inside
   `_held_out_section` takes a raw one (`_blt_semaphore`,
   `_acquire_build_slot`, `_confirm_lock`, a `Semaphore`) or spawns a worker
   (`tests/test_exec_lock.py`, by rule over the module, stopping at the
-  three pass-through gates, whose pass-through it executes), so the lock
-  cannot deadlock. `_held_out_section(st)` — `exclusive()` around one
-  logical evaluation (held by `_run_acceptance_file`,
+  three pass-through gates, whose pass-through it executes); and nothing
+  reachable inside a `_build_class_slot` hold takes a slot, a section, a
+  semaphore or a worker (the same test), so the lock and the slots cannot
+  deadlock. `_held_out_section(st)` — `exclusive()`, then, for the
+  outermost section only, `_host_build_slot(st, label="held-out
+  evaluation", take=<outermost>)` inside it, around one logical
+  evaluation (held by `_run_acceptance_file`,
   `_acceptance_parse_probe`, `_capture_failing_test_ids` (with `place`) and
   `_probe_case_facts_placed` around their spawn, and by `_falsifier_gates`
   from the probe's placement check through its facts read, so the first
@@ -5356,22 +5369,19 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `_blt_slot(caps)` — async context manager: the BLT semaphore
   (`_blt_semaphore(caps)`), or nothing when `_EXEC_EXCLUSIVE` is set;
   `_build_class_slot(st, *, label)` — yields None without taking a host
-  slot when `_EXEC_EXCLUSIVE` is set; `_confirm_hold()` — async context
+  slot when `_EXEC_EXCLUSIVE` is set (the evaluation took one once it held
+  its `exclusive()`); otherwise `_exec_lock().shared()` and then
+  `_host_build_slot(st, label=label)` (`_acquire_build_slot`, its fd
+  closed on exit; `take=False` yields None and takes nothing).
+  `_capture_failing_test_ids` takes `_held_out_section` for a held-out
+  file and `_build_class_slot` for any other run, never both;
+  `_confirm_hold()` — async context
   manager: `_confirm_lock()`, or nothing when `_EXEC_EXCLUSIVE` is set.
   Every former `async with _blt_semaphore(caps)` and `async with
   _confirm_lock()` uses them (`_measure_axes`,
   `_capture_failing_test_ids`, `_confirm_new_failures`,
   `_confirm_still_failing`, `_intermittent_discovery`,
   `_acceptance_discover`, `_settle_by_execution`).
-- **The host's lock**: `_host_exec_lock(exclusive: bool)` — an async
-  context manager over `<LEERIE_HOST_DIR>/exec.lock` and
-  `<LEERIE_HOST_DIR>/exec.intent` (`HOST_EXEC_LOCK`,
-  `HOST_EXEC_INTENT`), taken inside the run's lock by every holder of it
-  (the outermost only): shared — `flock(intent, LOCK_SH)`,
-  `flock(lock, LOCK_SH)`, `flock(intent, LOCK_UN)`; exclusive —
-  `flock(intent, LOCK_EX)`, `flock(lock, LOCK_EX)`, both held to the end.
-  Each holder opens its own descriptors (`O_CLOEXEC`); a blocking `flock`
-  runs in `asyncio.to_thread`. No-op when `LEERIE_HOST_DIR` is unset.
 - **Deleted**: `WorkerGrants.shared_tmp`, `_confined_argv(…,
   shared_tmp=)`, `_argv_outside_grant(…, shared_tmp=)`,
   `_measurement_grants`' `shared_tmp`, `_TMP_GRANTED_TREES`,
@@ -5569,8 +5579,8 @@ a database it lacks. The set's validation runs keep `require=False`.
   `tests/test_rootless_seccomp.py`: the launcher's block executed with the
   runtime stubbed, the runtime-install helpers, the profile compiled with
   `apparmor_parser -Q` and its rules); `tests/test_exec_lock.py` (the execution lock: evaluations,
-  measurements and real `_invoke` workers ordered, the worker guard, the
-  host level across processes, and deadlock-freedom by rule over the
+  measurements and real `_invoke` workers ordered, the worker guard, two
+  runs' locks independent, the logged wait, and deadlock-freedom by rule over the
   module), `tests/test_heldout_sandbox_callers.py` (every held-out runner
   hands `_run_streaming` a sandbox in a section, the set never on disk,
   the report back through the descriptor; the per-command database: the
