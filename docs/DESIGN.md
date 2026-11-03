@@ -14084,10 +14084,27 @@ Two further disciplines sit at the §12 axis:
      not run") is kind `process_note` and never enters the register: the
      orchestrator runs its own checks. (Bench Q7/G v5: of the 9 frozen
      late-chain subtasks, 8 of 9 first emissions carried only a
-     process note.) The `exercised: false` tier is typed
-     `unverified_external` — the worker could not exercise the path here.
-  2. **Routed by type, never dumped.** `gap: unverified_external` reaches
-     the PR's "Needs human verification" list (§6 *Finalization*);
+     process note.) **Only an entry naming an external resource is
+     external.** "Needs human verification" is for a check no step inside
+     the container can make: a live service, a real browser session, a
+     cloud account, a device — named, so the reviewer knows what to bring.
+     The `exercised: false` tier is typed `unverified_external` only when
+     the worker names that resource in `production_evidence`'s
+     `unexercisable_resource` (on the implementer and conformer schemas
+     both; the conformer's room for it came from giving its three
+     build/lint/test axes one `$defs` shape instead of three copies).
+     Otherwise it is `test_missing`: the worker did not run the path, which
+     is the gap the changed-line coverage measurement below settles or
+     re-drives. A self-reported `unverified_external` entry with no
+     `resource` is re-typed `test_missing` on the same rule, and the PR
+     renders no external entry without a resource (one an older leerie
+     stored that way included). Measured on the seven live 0.43.0 barnacle
+     runs: of 39 unaddressed external entries, 36 named no resource, every
+     one of them an `exercised: false` note — "docs-only change", "Diff is
+     a test only", "I only ran the two changed test files" — and 3 did.
+  2. **Routed by type, never dumped.** `gap: unverified_external` with its
+     `resource` reaches the PR's "Needs human verification" list, grouped
+     by that resource (§6 *Finalization*);
      `test_missing` / `test_weak` feed the coverage re-drive below (*Changed
      lines no test executes are re-driven*); `none` and every entry the
      conformer cleared stay in `state.json` only. The PR section is code's,

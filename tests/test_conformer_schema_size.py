@@ -43,7 +43,10 @@ import pytest
 # to 2,722, carrying descriptions the reconstruction drops). Deliberately
 # NOT plan_overlap_judge's 894 — the conformer legitimately carries more
 # fields, and the work order's ~4.8K bracket was a source-byte figure that
-# belongs to the sibling file.
+# belongs to the sibling file. Re-measured 2026-11-03, when the three BLT axes
+# became one `$defs` shape and `production_evidence` gained
+# `unexercisable_resource`: current 2,431, reconstruction (its `$ref`s
+# inlined, as the pre-flatten literal had them) 2,875.
 _MAX_DUMPED_BYTES = 2750
 
 # Same discipline for the hardened form the grammar compiler actually
@@ -57,7 +60,10 @@ _MAX_DUMPED_BYTES = 2750
 # from a ~35-byte margin, and sizes inside (3,143, 3,178) are UNTESTED
 # against the compiler: the bound only proves reaching 3,178 fails, not
 # that 3,170 compiles. See _risk_dispositions_schema's docstring for
-# the shapes rejected as unaffordable.
+# the shapes rejected as unaffordable. Re-measured 2026-11-03 with the
+# BLT `$defs` shape and `unexercisable_resource`: 2,826 (reconstruction
+# 3,441) — the one shape alone takes 3,143 to 2,754, the new field adds
+# 72 (on the old shape it reached 3,215, over the bound).
 _MAX_HARDENED_BYTES = 3178
 
 
@@ -73,6 +79,12 @@ def _unflattened_conformer(schema: dict) -> dict:
     """
     node = copy.deepcopy(schema)
     props = node["properties"]
+    # The pre-N29 literal had no `$defs`: each axis carried its shape inline.
+    defs = node.pop("$defs", {})
+    for k, v in list(props.items()):
+        ref = v.get("$ref", "") if isinstance(v, dict) else ""
+        if ref.startswith("#/$defs/"):
+            props[k] = copy.deepcopy(defs[ref.rsplit("/", 1)[1]])
     rv_items = props.pop("rule_violations")["items"]
     fu_items = props.pop("file_updates")["items"]
     rv_p, fu_p = rv_items["properties"], fu_items["properties"]
@@ -189,8 +201,8 @@ def test_payload_missing_a_required_gating_field_is_rejected(leerie, missing_fie
 def test_hardened_wire_form_also_stays_small(leerie):
     """The strict-output proxy's `strict:true` rewrite is what actually
     reaches the grammar compiler, so it gets its own bound — measured on
-    real shapes (current 3,143; this file's reconstruction hardens to
-    3,369; the real 7721a6e~1 pre-flatten literal to exactly 3,178, the
+    real shapes (current 2,826; this file's reconstruction hardens to
+    3,441; the real 7721a6e~1 pre-flatten literal to exactly 3,178, the
     bound) rather than against the old 6,219 source-byte figure, which
     every hardened form trivially cleared."""
     node = copy.deepcopy(leerie.SCHEMAS["conformer"])

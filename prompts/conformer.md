@@ -339,6 +339,13 @@ two disagree, the fixture is wrong.
 Fly-only branch cannot be exercised on a local run, and saying so is more
 useful than a fabricated observation. Silence is what is forbidden.
 
+Name the cause in `unexercisable_resource` only when it is an **external
+resource no step inside this container can supply** (a live third-party
+service, a real browser session, a cloud account, a device): only a named
+resource reaches the PR's "Needs human verification" list. Leave it empty
+otherwise — a docs- or test-only diff, a path you did not run, a tool that
+failed here: the orchestrator's own measurements answer those.
+
 This axis is **advisory**: it surfaces as a conformance warning and never
 gates. `solution_defects` (§5) remains the only gating axis here.
 

@@ -1174,7 +1174,8 @@ def test_fallback_does_not_rerender_state_itself(tmp_path, leerie):
         {"kind": "external_contract_assumption",
          "detail": "matches the provider's error-message wording",
          "source": "implementer", "gap": "unverified_external",
-         "where_paths": [], "addressed": False}]},
+         "where_paths": [], "resource": "the provider's sandbox",
+         "addressed": False}]},
         "subtask_status": {"feat-001": "complete"}}
     assert leerie._format_pr_end_state_section(state)
     run_dir = _finalizable_run(tmp_path, "end-state-bbbb", extra_state=state)

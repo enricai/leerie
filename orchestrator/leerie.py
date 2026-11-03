@@ -2732,6 +2732,11 @@ def _production_evidence_schema() -> dict:
             # "I could not make this fire here" is a legitimate answer and a
             # recorded one; silence is not.
             "unexercisable_reason": {"type": "string"},
+            # The external resource no in-container step can supply that
+            # kept the path from running, when one did; empty otherwise.
+            # Only a named one reaches "Needs human verification" (DESIGN §9
+            # *Self-reported risk is routed, not read*).
+            "unexercisable_resource": {"type": "string"},
         },
     }
 
@@ -3810,6 +3815,9 @@ SCHEMAS: dict[str, dict] = {
         # arrays every consumer here was written against; no field a check
         # reads was dropped.
         "type": "object",
+        # The three axes' one shape, once: a `$ref` costs the wire (and the
+        # strict-output grammar) one shape instead of three.
+        "$defs": {"blt": _CONFORMER_BLT_PROP},
         "required": [
             "subtask_id", "rules_files_read",
             "rule_violations", "file_updates",
@@ -3854,9 +3862,9 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
-            "build": _CONFORMER_BLT_PROP,
-            "lint": _CONFORMER_BLT_PROP,
-            "tests": _CONFORMER_BLT_PROP,
+            "build": {"$ref": "#/$defs/blt"},
+            "lint": {"$ref": "#/$defs/blt"},
+            "tests": {"$ref": "#/$defs/blt"},
             "summary": {"type": "string"},
             # Anti-gaming: a defect gates only with a concrete_case + where
             # (_validate_conformance_result drops the rest as non-actionable).
@@ -7176,14 +7184,18 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             if not isinstance(e, dict) or e.get("addressed") is True:
                 continue
             simulated = e.get("simulated_interleaving") is True
-            if e.get("gap") != "unverified_external" and not simulated:
+            resource = _pr_entry(e.get("resource"))
+            # External only with the resource a human must supply: an
+            # entry recorded without one (an older leerie typed every
+            # unexercised path external) is a gap the run's own checks
+            # answer, not a check for a human (DESIGN §9).
+            if not simulated and not (
+                    e.get("gap") == "unverified_external" and resource):
                 continue
             detail = _pr_entry(e.get("detail"))
             if not detail:
                 continue
-            group = _pr_entry(e.get("resource")) or (
-                "A real concurrent engine" if simulated
-                else "Outside this repository's checks")
+            group = resource or "A real concurrent engine"
             add(group, f"- [ ] **{sid}**: {detail}"
                 + _pr_paths(e.get("where_paths"))
                 + (" — tests simulate the interleaving" if simulated
@@ -15878,17 +15890,25 @@ def _typed_risks(result: dict | None, source: str) -> list[dict]:
     out: list[dict] = []
     ev = result.get("production_evidence")
     if isinstance(ev, dict) and ev.get("exercised") is False:
-        # The worker could not exercise the path here: typed external, so
-        # it reaches "Needs human verification" (DESIGN §9).
-        out.append({
+        # The worker could not exercise the path here. External only when it
+        # names the resource no in-container step can supply; otherwise the
+        # changed lines' coverage measurement settles or re-drives it (DESIGN
+        # §9: on the 0.43.0 barnacle runs 36 of 39 such entries named none —
+        # "docs-only change", "only ran the changed tests").
+        resource = _normalize_risk_text(ev.get("unexercisable_resource"),
+                                        _RISK_WHERE_MAX)
+        entry = {
             "kind": "unexercised_behavior",
             "detail": _normalize_risk_text(
                 ev.get("unexercisable_reason"), _RISK_DETAIL_MAX)
             or "path not exercised against real repo state",
             "source": source,
-            "gap": "unverified_external",
+            "gap": "unverified_external" if resource else "test_missing",
             "where_paths": [],
-        })
+        }
+        if resource:
+            entry["resource"] = resource
+        out.append(entry)
     for item in result.get("self_reported_risks") or []:
         if not isinstance(item, dict):
             continue
@@ -15916,6 +15936,10 @@ def _typed_risks(result: dict | None, source: str) -> list[dict]:
         resource = _normalize_risk_text(item.get("resource"), _RISK_WHERE_MAX)
         if resource:
             entry["resource"] = resource
+        elif gap == "unverified_external":
+            # External names what a human must supply; naming nothing, it is
+            # a gap leerie's own checks settle (DESIGN §9).
+            entry["gap"] = "test_missing"
         if item.get("simulated_interleaving") is True:
             entry["simulated_interleaving"] = True
         out.append(entry)

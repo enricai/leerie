@@ -6328,7 +6328,9 @@ schemas, and emits `NO_PRODUCTION_EVIDENCE` (field absent or not an object),
 `UNSUPPORTED_PRODUCTION_EVIDENCE` (`exercised: true` with neither `how` nor
 `observed`), `UNEXERCISED_PRODUCTION_PATH` (`exercised: false` with no
 `unexercisable_reason`), or `MALFORMED_PRODUCTION_EVIDENCE` (`exercised` not a
-bool). It has **three call sites with deliberately different severities**.
+bool). The object's optional `unexercisable_resource` names an external
+resource no in-container step can supply; it is not checked here, only
+routed (`_typed_risks`, below). It has **three call sites with deliberately different severities**.
 From `check_implementer_output`, on the `status == "complete"` branch only (a
 blocked implementer has no finished path to exercise), it routes through the
 existing bounded `implementer_confidence_retries` retry and so never blocks a
@@ -6385,7 +6387,13 @@ kinds, and `_typed_risks` drops a `process_note` (and any unknown kind) on
 ingestion, so it reaches neither the register nor the conformer's challenge
 block. An entry without a valid `gap` (a result from before the field) is
 typed `none`; the `exercised: false` tier is typed `gap:
-unverified_external` with `where_paths: []`. `_verify_risk_paths(entries,
+unverified_external` with `resource` = its `production_evidence.unexercisable_resource`
+(the optional string `_production_evidence_schema()` adds, on both schemas)
+when that is non-empty, else `gap: test_missing` with no resource, always
+with `where_paths: []`; a tier-2 entry typed `unverified_external` with no
+`resource` is re-typed `test_missing` (DESIGN §9 *Self-reported risk is
+routed, not read*: only an entry naming the external resource a human must
+supply is external). `_verify_risk_paths(entries,
 worktree)` then keeps a `where_paths` entry only when it is a relative path
 with no `..` naming a file in the subtask's worktree, moving the rest to
 `where_paths_unverified`; `_settle_subtask` applies it before writing the
@@ -12658,7 +12666,7 @@ command line overrides it.
 | `blt_results` | dict[str, dict] | Per-run memo of orchestrator-measured build/lint/test verdicts (DESIGN §9). |
 | `unreviewed_subtasks` | list[str] | subtask ids whose conformer produced no result at all (worker crash, or the 5400 s timeout), so a subtask that was never reviewed is distinguishable from one that passed. |
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
-| `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier typed `unverified_external`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` (or `simulated_interleaving`) to the PR's "Needs human verification"; `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
+| `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier, typed `unverified_external` with its `resource` only when it names `unexercisable_resource`, else `test_missing`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` with a non-empty `resource` (or `simulated_interleaving`) to the PR's "Needs human verification", grouped by that resource (an `unverified_external` entry stored with none, by an older leerie, is not rendered); `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
 | `settled_heads` | dict[str, str] | per-sid subtask branch tip at the moment the subtask settled `complete` (`_record_settled_head`, DESIGN §6 *Integrated means the settled commit is on the run branch*); `integrate_wave` requires it to be an ancestor of staging after the merge; reset to the round's `pre_sha` by `_undo_interrupted_redrives`. |
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
@@ -12960,8 +12968,12 @@ Required fields, current shape:
 - **conformer** — required: `subtask_id`, `rules_files_read` (strings, empty
   when none found), `rule_violations` (`{status: fixed|residual, rule, fix,
   evidence, why_not_fixed}[]`), `file_updates` (`{kind: docs|tests, path,
-  reason}[]`), `build`/`lint`/`tests` (each `{ran, passed, command, summary?}`
-  — `ran: false` when not applicable), `summary`, and `solution_defects`
+  reason}[]`), `build`/`lint`/`tests` (each `{"$ref": "#/$defs/blt"}`, the
+  one shape `_CONFORMER_BLT_PROP` = `{ran, passed, command, summary?}` in the
+  schema's `$defs` — `ran: false` when not applicable; one definition instead
+  of three keeps the hardened wire form at 2,826 bytes with
+  `unexercisable_resource` added, under the 3,178-byte compiler failure point
+  `tests/test_conformer_schema_size.py` pins), `summary`, and `solution_defects`
   (`{kind: unhandled_input|unhandled_path|missing_guard|sibling_site_unedited|
   wrong_selector|decoy_or_shortcut|external_contract_assumption|
   unrevalidated_precondition, concrete_case, where, why_ships_a_defect}[]`,

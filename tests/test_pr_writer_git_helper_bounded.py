@@ -127,7 +127,8 @@ def test_risk_section_is_appended_to_the_llm_body(leerie, monkeypatch, st, repo)
         {"kind": "external_contract_assumption",
          "detail": "matches the provider's error-message wording",
          "source": "implementer", "gap": "unverified_external",
-         "where_paths": [], "addressed": False}]}
+         "where_paths": [], "resource": "the provider's sandbox",
+         "addressed": False}]}
 
     async def _fake_claude_p(**kwargs):
         return {"title": "add a feature", "body": "## Summary\n\nworker body"}
@@ -171,7 +172,8 @@ def test_worker_emitted_risk_section_is_stripped_not_doubled(
         {"kind": "external_contract_assumption",
          "detail": "no test covers the branch",
          "source": "implementer", "gap": "unverified_external",
-         "where_paths": [], "addressed": False}]}
+         "where_paths": [], "resource": "the provider's sandbox",
+         "addressed": False}]}
 
     async def _fake_claude_p(**kwargs):
         return {"title": "t",
@@ -198,7 +200,8 @@ def test_mid_body_worker_section_strip_preserves_trailing_content(
         {"kind": "external_contract_assumption",
          "detail": "real register entry",
          "source": "implementer", "gap": "unverified_external",
-         "where_paths": [], "addressed": False}]}
+         "where_paths": [], "resource": "the provider's sandbox",
+         "addressed": False}]}
 
     async def _fake_claude_p(**kwargs):
         return {"title": "t",
