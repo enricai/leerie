@@ -314,3 +314,12 @@ def test_a_shell_less_worker_gets_none_of_it(leerie, monkeypatch, tmp_path):
     # no hook.
     assert "hooks" not in json.loads(argv[argv.index("--settings") + 1])
     assert _kill_lines(prompt) == []
+
+
+def test_a_kill_inside_a_quoted_heredoc_body_is_text(leerie):
+    """A here-document's body is input (DESIGN §6): writing a script that
+    mentions `pkill` is not running it; running it still is."""
+    assert leerie._process_kill_hit(
+        "cat > stop.sh <<'EOF'\npkill node\nEOF\nchmod +x stop.sh") is None
+    assert leerie._process_kill_hit(
+        "cat > stop.sh <<'EOF'\necho hi\nEOF\npkill node")

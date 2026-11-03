@@ -27629,7 +27629,7 @@ def _rule_matches(text: str, pattern: str) -> bool:
 _QUOTED_SPACE = "\x00"  # not str.isspace(), unlike the ASCII separators
 
 
-def _shell_subcommands(cmd: str) -> list[str]:
+def _shell_subcommands(cmd: str, *, heredoc_body: bool = False) -> list[str]:
     """`cmd` split into the subcommands the CLI matches rules against.
 
     Quote-aware. Inside single quotes everything is literal. Inside double
@@ -27645,13 +27645,25 @@ def _shell_subcommands(cmd: str) -> list[str]:
     a subshell's `(`/`)`, and `{`/`}` only as group words (whitespace or the
     string's edge on both sides) -- brace expansion such as `tests/{a,b}.py`
     is part of a word, which is how the CLI read it live. An unclosed
-    substitution still contributes its outer command. A backslash escapes
-    the next character (an escaped blank stays in its word, as
-    `_QUOTED_SPACE`), and a backslash-newline is removed, as bash removes
-    it. Redirections outside quotes (`> f`,
+    substitution still contributes its outer command. Inside a
+    substitution, while a `case` clause is open, a `)` ends a pattern, not
+    the substitution. A backslash escapes the next character (an escaped
+    blank stays in its word, as `_QUOTED_SPACE`), and a backslash-newline is
+    removed, as bash removes it. Redirections outside quotes (`> f`,
     `2>&1`, `<in`, `> "a b"`) are dropped with their target, unless the
     target holds a substitution, which runs and is scanned. Whitespace is
-    collapsed per subcommand."""
+    collapsed per subcommand.
+
+    A here-document (`<<word`, `<<-word`; not the here-string `<<<`) is
+    input, not commands, but its body is dropped only where the scan can
+    show bash reads one (DESIGN §9): `<<` in plain command context -- not
+    in a comment, nor inside `${…}`, `$[…]`, `$((…))` or `((…))` -- with a
+    plain delimiter (`_heredoc_delimiter`) whose terminating line is
+    present. Otherwise the text is read as commands, which at worst costs a
+    false denial. An unquoted delimiter's body still expands its `$(...)`
+    and backtick substitutions, which run and are scanned
+    (`_heredoc_substitutions`). With `heredoc_body`, `cmd` is such a body:
+    only its substitutions are read."""
     s = cmd
     n = len(s)
     segs: list[str] = []
@@ -27659,10 +27671,30 @@ def _shell_subcommands(cmd: str) -> list[str]:
     quote: str | None = None
     # Open substitutions: (closing char, quote to restore, outer text).
     subst: list[tuple[str, str | None, list[str]]] = []
+    # Open `case` clauses per substitution level (index 0: top level).
+    cases: list[int] = [0]
+    # Here-documents whose bodies start after the next newline:
+    # (delimiter, `<<-` strips leading tabs, delimiter was quoted).
+    heredocs: list[tuple[str, bool, bool]] = []
+    bodies: list[str] = []
+    # Open expansions in which `<<` is an operator, never a here-document:
+    # [closer, nesting depth, substitution level read at, index of the
+    # opener's own last bracket] for `${`, `$[`, `$((` / `((`. One whose
+    # substitution closed before it (the scan closes `$(( (a) ))` at the
+    # first `)`, as it always has) is never popped: the rest of the command
+    # then has no here-document, the safe direction.
+    expans: list[list] = []
+    comment = False
     i = 0
 
     def cut() -> None:
-        segs.append("".join(buf))
+        seg = "".join(buf)
+        first = seg.split()[:1]
+        if first == ["case"]:
+            cases[-1] += 1
+        elif first == ["esac"] and cases[-1]:
+            cases[-1] -= 1
+        segs.append(seg)
         buf.clear()
 
     def open_subst(closer: str, width: int) -> None:
@@ -27670,9 +27702,13 @@ def _shell_subcommands(cmd: str) -> list[str]:
         # substitutions quadratic.
         nonlocal buf, quote, i
         subst.append((closer, quote, buf))
+        cases.append(0)
         buf = []
         quote = None
         i += width
+
+    def word_start(at: int) -> bool:
+        return at == 0 or s[at - 1] in " \t\n;|&()"
 
     while i < n:
         ch = s[i]
@@ -27690,11 +27726,24 @@ def _shell_subcommands(cmd: str) -> list[str]:
                 i += 1
                 buf.append(s[i])
             elif s.startswith("$(", i) or ch == "`":
+                if s.startswith("$((", i):
+                    expans.append(["))", 0, len(subst) + 1, i + 2])
                 open_subst(")" if ch == "$" else "`", 2 if ch == "$" else 1)
                 continue
             else:
                 buf.append(_QUOTED_SPACE if ch.isspace() else ch)
             i += 1
+            continue
+        if heredoc_body and not subst:
+            # A body's own text: only an escape and a substitution are read.
+            if ch == "\\":
+                i += 2
+            elif s.startswith("$(", i) or ch == "`":
+                if s.startswith("$((", i):
+                    expans.append(["))", 0, len(subst) + 1, i + 2])
+                open_subst(")" if ch == "$" else "`", 2 if ch == "$" else 1)
+            else:
+                i += 1
             continue
         if ch in "'\"":
             quote = ch
@@ -27710,15 +27759,62 @@ def _shell_subcommands(cmd: str) -> list[str]:
                 buf.append(_QUOTED_SPACE if nxt.isspace() else nxt)
             i += 2
             continue
+        # Expansions in which `<<` is a shift or a pattern, never a
+        # here-document: observed only, the text read as before.
+        live = bool(expans) and expans[-1][2] == len(subst)
+        if live and i != expans[-1][3]:
+            closer = expans[-1][0]
+            if ch == {"}": "{", "]": "[", "))": "("}[closer]:
+                expans[-1][1] += 1
+            elif ch == closer[0] and expans[-1][1]:
+                expans[-1][1] -= 1
+            elif s.startswith(closer, i):
+                expans.pop()
+                live = False
+        if s.startswith("${", i) or s.startswith("$[", i):
+            expans.append(["}" if s[i + 1] == "{" else "]", 0, len(subst),
+                           i + 1])
+        elif s.startswith("$((", i):
+            # `$(` opens a substitution below; the expansion is read there.
+            expans.append(["))", 0, len(subst) + 1, i + 2])
+        elif s.startswith("((", i) and not comment and (
+                i == 0 or s[i - 1] != "$"):
+            expans.append(["))", 0, len(subst), i + 1])
+        if live and ch in "<>":
+            # An operator of the expression, never a redirect.
+            buf.append(ch)
+            i += 1
+            continue
         if subst and ch == subst[-1][0]:
+            first = "".join(buf).split()[:1]
+            if ch == ")" and (cases[-1] or first == ["case"]) \
+                    and first != ["esac"]:
+                # A `case` pattern's `)`: the clause's commands follow.
+                cut()
+                i += 1
+                continue
             cut()
             _closer, quote, buf = subst.pop()
+            cases.pop()
             buf.append("$_")
             i += 1
             continue
         if s.startswith("$(", i) or ch == "`":
             open_subst(")" if ch == "$" else "`", 2 if ch == "$" else 1)
             continue
+        if ch == "#" and word_start(i) and not expans:
+            comment = True
+        if ch == "\n":
+            comment = False
+            if heredocs:
+                cut()
+                i += 1
+                got = _heredoc_bodies(s, i, heredocs)
+                heredocs.clear()
+                if got is not None:
+                    i, texts = got
+                    bodies += texts
+                continue
         if ch in ";|&\n()":
             cut()
             i += 1
@@ -27728,6 +27824,18 @@ def _shell_subcommands(cmd: str) -> list[str]:
             cut()
             i += 1
             continue
+        if (s.startswith("<<", i) and not s.startswith("<<<", i)
+                and not comment and not expans):
+            delim = _heredoc_delimiter(s, i)
+            if delim is not None:
+                # A here-document: drop the operator and its delimiter word,
+                # and remember the delimiter for the body after the newline.
+                word, strip, quoted, i = delim
+                while buf and buf[-1].isdigit():
+                    buf.pop()
+                heredocs.append((word, strip, quoted))
+                buf.append(" ")
+                continue
         if ch in "<>":
             # Drop an fd number glued to the operator (`2>`), the operator,
             # an `&` dup, and the target word -- quoted targets included.
@@ -27755,6 +27863,9 @@ def _shell_subcommands(cmd: str) -> list[str]:
             continue
         buf.append(ch)
         i += 1
+    if heredoc_body:
+        # The top level is the body's text, never a command.
+        buf.clear()
     cut()
     # An unclosed substitution still leaves its outer command to match.
     while subst:
@@ -27764,7 +27875,80 @@ def _shell_subcommands(cmd: str) -> list[str]:
         # scan does not model) must not glue everything after it into one
         # word: fall back to plain spaces, as before quoted spaces existed.
         segs = [x.replace(_QUOTED_SPACE, " ") for x in segs]
-    return [seg for seg in (" ".join(x.split()) for x in segs) if seg]
+    out = [seg for seg in (" ".join(x.split()) for x in segs) if seg]
+    if heredoc_body:
+        out = [seg for seg in out if seg != "$_"]
+    for text in bodies:
+        out += _heredoc_substitutions(text)
+    return out
+
+
+def _heredoc_delimiter(s: str, at: int) -> tuple[str, bool, bool, int] | None:
+    """`(delimiter, strip_tabs, quoted, end)` of the here-document operator
+    at `s[at]` (`<<` or `<<-`) when its delimiter is one the scan can match
+    as bash does: a plain unquoted word, or a word wholly in `'…'` or
+    `"…"`, holding no `$`, backquote or backslash. None for any other
+    (`$'X'`, `E"O"F`, `\\EOF`, none at all): the caller then reads the text
+    as commands. Mechanical string handling only."""
+    n = len(s)
+    i = at + 2
+    strip = i < n and s[i] == "-"
+    i += strip
+    while i < n and s[i] in " \t":
+        i += 1
+    if i < n and s[i] in "'\"":
+        close = s.find(s[i], i + 1)
+        word = s[i + 1:close] if close > 0 else ""
+        end = close + 1
+        if close < 0 or not word or (end < n and not s[end].isspace()
+                                     and s[end] not in ";|&()<>"):
+            return None
+        quoted = True
+    else:
+        j = i
+        while j < n and not s[j].isspace() and s[j] not in ";|&()<>":
+            j += 1
+        word, end, quoted = s[i:j], j, False
+        if not word or any(c in word for c in "'\""):
+            return None
+    if any(c in word for c in "$`\\\n"):
+        return None
+    return word, strip, quoted, end
+
+
+def _heredoc_bodies(s: str, at: int, pending: list[tuple[str, bool, bool]]
+                    ) -> tuple[int, list[str]] | None:
+    """The here-document bodies starting at `s[at]` for the `pending`
+    delimiters, in order: `(index after the last terminating line, the
+    unquoted-delimiter bodies)`, or None when a terminating line is missing
+    -- bash then reads to the end as body, and the scan, unable to agree
+    line by line, reads the text as commands instead."""
+    n = len(s)
+    i = at
+    texts: list[str] = []
+    for delim, strip, quoted in pending:
+        lines: list[str] = []
+        while True:
+            if i >= n:
+                return None
+            end = s.find("\n", i)
+            line = s[i:] if end < 0 else s[i:end]
+            i = n if end < 0 else end + 1
+            if (line.lstrip("\t") if strip else line) == delim:
+                break
+            lines.append(line)
+        if not quoted:
+            texts.append("\n".join(lines))
+    return i, texts
+
+
+def _heredoc_substitutions(body: str) -> list[str]:
+    """The subcommands of every `$(...)` and backtick substitution in an
+    unquoted-delimiter here-document's `body`, which the shell expands and
+    so runs; the rest of the body is text. The same quote-aware scan, in
+    its body mode (`_shell_subcommands(body, heredoc_body=True)`), so a
+    quoted `)` or a `case` pattern does not end a substitution early."""
+    return _shell_subcommands(body, heredoc_body=True)
 
 
 def _strip_command_prefixes(seg: str) -> str:

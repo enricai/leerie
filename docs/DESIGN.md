@@ -14590,10 +14590,35 @@ mechanism exists to remove. Four mechanisms read that list:
   verify", since the declared-command check would accept only the refused
   command for it, and an over-match only drops a requirement. Agreement with
   the CLI is a per-shape claim, pinned against verdicts the CLI returned
-  live; a shape outside that set is unverified. The scan does not model
-  here-documents, comments or `$'…'` strings; an apostrophe inside one
-  leaves a quote unbalanced, and the scan then falls back to plain words,
-  which the wide match still catches but the anchored check does not.
+  live; a shape outside that set is unverified. A here-document is input,
+  not commands: its body is dropped, and only an unquoted delimiter's
+  `$(…)` and backtick substitutions — which the shell expands, and so runs
+  — are scanned. *Designed 2026-11-03 (the live 0.43.0 barnacle runs).*
+  The scan read a body as commands: a worker appending a test with `cat >>
+  f.test.ts <<'EOF'` whose body held `const { vi } = await
+  import("vitest");` was denied its following `npx vitest run <one file>`
+  twice as "forbidden command: vitest run", because the body's `(` split
+  off a bare `vitest`, a whole-suite run; every hook and rule that reads
+  subcommands (`_forbidden_command_hit`, the process-kill deny,
+  `_denied_by_full_suite_rules`) shares the scan. A body is dropped only
+  where the scan can show bash reads one, because a wrongly dropped line is
+  a command the hook never sees while a wrongly kept one costs at most a
+  false denial (round 30: `: # <<X`, `$((1<<2))`, `(( y = 1<<3 ))`,
+  `$[1<<2]`, `${x//<<X/b}` and a `$'X'` delimiter each hid a following
+  `pkill -f`, `kill $(pgrep -f …)` or whole-suite `npx vitest` that bash
+  ran). So `<<` starts a here-document only in plain command context — not
+  in a comment, an arithmetic expansion or command, or a parameter
+  expansion; its delimiter must be a plain word, or one wholly in single or
+  double quotes, with no `$`, backquote or backslash; and its terminating
+  line must be present. Anything else is read as before, as commands. An
+  unquoted body's substitutions are found by the same quote-aware scan in
+  a body mode, where only `$(` and backquotes open and the text between is
+  dropped, never by counting parentheses; inside any substitution a
+  `case` clause's pattern `)` ends the pattern, not the substitution. This
+  is pinned by a differential test against `bash -c` itself. It still does
+  not model comments beyond that or `$'…'` strings; an apostrophe inside one leaves a quote
+  unbalanced, and the scan then falls back to plain words, which the wide
+  match still catches but the anchored check does not.
 - **Settle-time exemption.** The declared-command check skips any entry the
   list refuses. This, not the strip, is the choke point: it also covers a
   spec written before the strip existed (a run resumed past scheduling).

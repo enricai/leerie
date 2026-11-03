@@ -1312,3 +1312,51 @@ def test_the_fly_guard_script_reads_the_typed_scope(leerie, tmp_path):
     assert disallowed == leerie.DISALLOWED_TOOLS + "," + guard["deny"]
     assert "Bash(pnpm run test *)" not in disallowed.split(",")
     assert "specific test files" in notice
+
+
+# --- a here-document's body is input, not commands (DESIGN §6) -------------
+
+WHOLE_SUITE = [{"command": "vitest run", "scope": "whole_suite",
+                "test_roots": []}]
+# The live command (barnacle run 83674, bugfix-008) denied twice as
+# "forbidden command: vitest run".
+APPEND_A_TEST = ("cat >> src/a.test.ts <<'EOF'\n"
+                 "const { vi } = await import(\"vitest\");\n"
+                 "EOF\n"
+                 "npx vitest run src/a.test.ts")
+
+
+@pytest.mark.parametrize("cmd", [
+    APPEND_A_TEST,
+    APPEND_A_TEST.replace("<<'EOF'", "<<EOF"),
+    APPEND_A_TEST.replace("<<'EOF'", '<<"EOF"'),
+    APPEND_A_TEST.replace("<<'EOF'", "<<-EOF").replace("\nEOF\n", "\n\tEOF\n"),
+    "git commit -m \"$(cat <<'EOF'\nrun vitest\nEOF\n)\" && "
+    "npx vitest run src/a.test.ts",
+])
+def test_a_heredoc_body_is_not_read_as_a_command(leerie, cmd):
+    assert leerie._forbidden_command_hit(cmd, WHOLE_SUITE) is None
+
+
+def test_the_command_after_a_heredoc_is_still_read(leerie):
+    """The converse: the body is skipped, not everything after it."""
+    cmd = APPEND_A_TEST.replace("npx vitest run src/a.test.ts",
+                                "npx vitest run")
+    assert leerie._forbidden_command_hit(cmd, WHOLE_SUITE) == "vitest run"
+
+
+def test_an_unquoted_heredocs_substitution_still_runs(leerie):
+    """An unquoted delimiter's body expands `$(...)` and backticks, which
+    run; a quoted one's does not."""
+    unquoted = "cat <<EOF\n$(npx vitest run)\nEOF"
+    backtick = "cat <<EOF\n`npx vitest run`\nEOF"
+    quoted = "cat <<'EOF'\n$(npx vitest run)\nEOF"
+    assert leerie._forbidden_command_hit(unquoted, WHOLE_SUITE) == "vitest run"
+    assert leerie._forbidden_command_hit(backtick, WHOLE_SUITE) == "vitest run"
+    assert leerie._forbidden_command_hit(quoted, WHOLE_SUITE) is None
+
+
+def test_a_here_string_is_not_a_heredoc(leerie):
+    """`<<<` takes one word on its line; the next line is a command."""
+    assert leerie._shell_subcommands("cat <<< EOF\nnpx vitest run") == [
+        "cat", "npx vitest run"]

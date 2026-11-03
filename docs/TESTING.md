@@ -2784,6 +2784,25 @@ prescribed-command check reads it anchored, a prescribed command is never
 stripped or exempted, and a stripped paraphrase of one is resynthesised
 exactly.
 
+`tests/test_heredoc_scan_agrees_with_bash.py` (4 test functions, 25 cases;
+DESIGN §9 *Post-work conformance*, the forbidden-command scan's
+here-document rule; review round 30 isolation H1) is a differential test
+against `bash -c` itself, never a list of expected splits: each form runs in
+real bash under an empty `PATH`, with `pkill`, `kill`, `pgrep`, `cat` and
+`npx` as shell functions that mark what ran, and the scan's verdict
+(`_process_kill_hit`, `_forbidden_command_hit`) must be a hit exactly when
+bash runs the marked command. Its forms: round 30's twelve that hid a
+command bash ran (a `<<` in a comment, in `$((…))` or `((…))`, in a
+parameter expansion, an ANSI-C quoted delimiter, a `case` `)` inside a
+body's substitution, …), the same shapes nearby, controls that are bodies
+bash does read (quoted, unquoted, `<<-`), and the whole-suite scan's forms,
+the live 0.43.0 shape among them; `test_the_forms_are_what_bash_says_they_are` checks the forms
+themselves against bash, and the one deliberate disagreement is pinned
+alone: a body the scan cannot prove (no terminating line) is read as
+commands — a false denial, never a missed command. With the commit's
+parent's `leerie.py` 7 of the 25 fail; with the rule as this commit had it before
+review round 30's fold, 17.
+
 ## Pre-push preflight probe
 
 `tests/test_prepush_preflight.py` (25) covers `host_prepush_preflight`, the
