@@ -43145,9 +43145,13 @@ def _validate_conformance_result(result: dict, worktree: str) -> str | None:
 
     The JSON schema already enforces the *shape* (required fields, their
     types). This function enforces the cross-field rules the schema can't:
-    residuals require a non-empty `rules_files_read`, every fixed violation
-    cites a non-empty `rule`, every docs/tests update cites a path that
-    actually exists in the worktree.
+    a residual with no `axis` requires a non-empty `rules_files_read`, every
+    fixed violation cites a non-empty `rule`, every docs/tests update cites
+    a path that actually exists in the worktree. A residual with an `axis`
+    is leerie's own rule, `build/lint/tests must pass`, which the prompt
+    states and no repository file supplies: rejecting it for want of a
+    rules file threw away the round's result (7 times in the 0.43.0
+    barnacle runs, each a conformer reporting a red axis as told).
 
     Per DESIGN §12 this is the code-enforced honesty check; the worker's
     own judgment is not second-guessed beyond these structural minimums."""
@@ -43155,10 +43159,14 @@ def _validate_conformance_result(result: dict, worktree: str) -> str | None:
         return "conformer result is not an object"
 
     files_read = result.get("rules_files_read") or []
-    residuals = result.get("rule_violations_residual") or []
-    if residuals and not files_read:
-        return ("rule_violations_residual non-empty but rules_files_read "
-                "is empty — a violation cannot exist without a rule")
+    # `axis` is the typed mark of leerie's own rule: `_expand_conformer_
+    # output` keeps it only when it names one of `_BLT_AXES`.
+    repo_rule = [r for r in result.get("rule_violations_residual") or []
+                 if not (isinstance(r, dict) and r.get("axis") in _BLT_AXES)]
+    if repo_rule and not files_read:
+        return ("rule_violations_residual names a repository rule but "
+                "rules_files_read is empty — a violation cannot exist "
+                "without a rule")
 
     fixed = result.get("rule_violations_fixed") or []
     for i, item in enumerate(fixed):

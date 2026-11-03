@@ -117,8 +117,9 @@ backstop; simply never reach for the base tree this way.
 
 If `RULES_FILES` is empty or `(none)`, skip the rule-conformance axis
 entirely — you have no rules to apply, so you cannot report any rule
-violations (fixed or residual). Move directly to the
-docs+tests+build/lint/test axes.
+violations (fixed or residual) other than leerie's own
+`build/lint/tests must pass` (§4), which always carries its `axis`. Move
+directly to the docs+tests+build/lint/test axes.
 
 Otherwise, read each path in `RULES_FILES` end-to-end. In both cases,
 read the subtask spec and the implementer's success-criteria notes so
@@ -137,10 +138,12 @@ For each touched file, consider in order:
   WHAT", "no shell scripts in scripts/ without shellcheck-clean", "no new
   runtime dependencies".) Note each violation literally — quote the rule
   line and cite the diff location. **If `RULES_FILES` was empty or
-  `(none)`, you have no rules to violate** — leave `rule_violations`
-  empty. (The orchestrator rejects residuals reported when
-  `rules_files_read` is empty, so a phantom `status: "residual"` entry
-  marks your whole result as malformed.)
+  `(none)`, you have no repository rules to violate** — report no
+  violation of one. (The orchestrator rejects a residual with no `axis`
+  when `rules_files_read` is empty, so a phantom `status: "residual"`
+  entry marks your whole result as malformed. A `build/lint/tests must
+  pass` residual is leerie's own rule and carries its `axis`; it needs no
+  rules file.)
 - **Docs.** Did the change touch a function, flag, schema, file path,
   config key, or behavior that documentation in this repo describes?
   Find the documentation file (README.md, docs/*.md, inline docstrings
