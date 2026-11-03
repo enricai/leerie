@@ -2865,7 +2865,22 @@ they are confined.
   `/leerie-host`), those from the container — so the grants, the private
   `/tmp` and the state root are the same mounts — and an `/opt` holding the
   worker root's entries with leerie's own `/opt/leerie-*` over them (the
-  scripts the AST measurements run, the bundled `typescript`). Built after
+  scripts the AST measurements run, the bundled `typescript`). The view's
+  `/etc` likewise holds the worker root's entries, but `/etc/hosts`,
+  `/etc/hostname` and `/etc/resolv.conf` are the container's: the runtime
+  provides them as mounts when the container starts (nerdctl rootless and
+  rootful, Fly's init), so no image snapshot holds them, and without them
+  `localhost` did not resolve in any confined command of a repository with
+  an image — a server bound to `localhost`, a `pg_isready -h localhost`, a
+  test URL (review round 29, execution H1). They are the run's name
+  service, as `/dev` and `/proc` are its kernel's. `/home` is the run's
+  own — its HOME, with leerie's caches and the CLI's credentials mounted
+  in it — never the repository's: what a repository's Dockerfile installs
+  beneath `/home/leerie` (a `curl | sh` installer, a user-site `pip
+  install`) would be missing from every confined command, so a run whose
+  worker root holds anything there the container's `/home/leerie` lacks
+  stops at its entry, naming the paths; such a Dockerfile installs beneath
+  `/opt` or `/usr/local` instead (review round 29, execution L3). Built after
   the grants, so they are carried writable; every other mount of the view
   is read-only, like every other mount. The worker root's entries are
   granted read: a Landlock rule is on an inode, and the container's entries
@@ -9567,7 +9582,11 @@ capture inside the container is recorded, not written:
 (or replace) merge, against the file as it is at that moment, logging the
 change as a diff; the file is then renamed `captured-deps.applied.json`, so
 a second apply is a no-op. A file `_capture_problems` refuses is kept and
-nothing is written.
+nothing is written. So is one whose merge would keep a value the config
+already holds that is not a capture leerie bakes: a merge is a union, so
+the merged value is valid only when the existing one is (review round 29,
+execution L4: barnacle's `setup_packages` held key names an older
+auto-apply wrote, and an apply extended it).
 
 The host used to apply it by itself — from the launcher's EXIT trap
 locally, from `fetch_branch` on Fly and EC2 — because the capture was

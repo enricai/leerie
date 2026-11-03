@@ -957,6 +957,10 @@ WORKER_VIEW = "/.leerie-worker-view"
 CONTAINER_ENTRIES = frozenset({"dev", "proc", "sys", "run", "tmp", "home",
                                "work", "inspect", "leerie-state",
                                "leerie-host"})
+# The files of `/etc` the view takes from the container: the runtime mounts
+# them when the container starts, so no image snapshot holds them, and they
+# are the run's name service (`localhost` resolves through `hosts`).
+CONTAINER_ETC_FILES = frozenset({"hosts", "hostname", "resolv.conf"})
 # Files the image's last stages write at the worker root's top (`leerie`'s
 # `_repo_image_dockerfile`): the worker stage's environment and the base
 # image's, each `env -0`.
@@ -997,9 +1001,10 @@ def _bind_entry(src: str, dst: str) -> None:
 
 def build_worker_view(worker_root: str) -> list[str]:
     """Build `WORKER_VIEW` in the current root: each top-level entry of
-    `worker_root` but `CONTAINER_ENTRIES`, those from the container, and an
+    `worker_root` but `CONTAINER_ENTRIES`, those from the container, an
     `/opt` holding the worker root's entries with leerie's own
-    (`/opt/leerie-*`) over them. Returns the view's entries that come from
+    (`/opt/leerie-*`) over them, and an `/etc` holding the worker root's
+    entries but `CONTAINER_ETC_FILES`, the container's. Returns the view's entries that come from
     the worker root, which the caller grants read: a Landlock rule is on an
     inode, and the container's entries are already granted where they are.
     Lists and stats only: nothing in the worker root is opened or run."""
@@ -1024,6 +1029,18 @@ def build_worker_view(worker_root: str) -> list[str]:
                         _bind_entry(f"/opt/{sub}", f"{dst}/{sub}")
                     elif sub in w_opt:
                         _bind_entry(f"{worker_root}/opt/{sub}",
+                                    f"{dst}/{sub}")
+                granted.append(dst)
+            elif name == "etc" and os.path.isdir(f"{worker_root}/etc") \
+                    and not os.path.islink(f"{worker_root}/etc"):
+                os.mkdir(dst, 0o755)
+                w_etc = set(os.listdir(f"{worker_root}/etc"))
+                for sub in sorted(w_etc | CONTAINER_ETC_FILES):
+                    if sub in CONTAINER_ETC_FILES:
+                        if os.path.lexists(f"/etc/{sub}"):
+                            _bind_entry(f"/etc/{sub}", f"{dst}/{sub}")
+                    else:
+                        _bind_entry(f"{worker_root}/etc/{sub}",
                                     f"{dst}/{sub}")
                 granted.append(dst)
             elif name in CONTAINER_ENTRIES or name not in theirs:

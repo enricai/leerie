@@ -229,6 +229,50 @@ def test_a_run_started_on_a_repository_image_needs_its_worker_root(
     assert '"${_FLY_REPO_DF_SHA:+1}")"' in launcher
 
 
+def test_what_a_repository_installs_in_home_is_named(orch, tmp_path):
+    """`/home` is the run's own, so what the repository's Dockerfile put
+    beneath `/home/leerie` is missing from every confined command; those
+    paths are found by name, the base's own and a mounted place left out
+    (review round 29, execution L3)."""
+    wr, home = tmp_path / "wr", tmp_path / "home" / "leerie"
+    for d in (".local/share/mise", ".cache/leerie/pip"):
+        (wr / "home" / "leerie" / d).mkdir(parents=True)
+        (home / d).mkdir(parents=True)
+    (wr / "home" / "leerie" / ".bun" / "bin").mkdir(parents=True)
+    (wr / "home" / "leerie" / ".local" / "bin").mkdir()
+    (wr / "home" / "leerie" / ".local" / "share" / "mise" / "x").touch()
+    (home / ".local" / "share" / "mise" / "x").touch()
+    (wr / "home" / "leerie" / ".profile").symlink_to("/etc/passwd")
+    assert orch._worker_home_extras(wr, home) == [
+        "/home/leerie/.bun", "/home/leerie/.local/bin", "/home/leerie/.profile"]
+    # The base's own home, unchanged: nothing.
+    (wr / "home" / "leerie" / ".bun" / "bin").rmdir()
+    (wr / "home" / "leerie" / ".bun").rmdir()
+    (wr / "home" / "leerie" / ".local" / "bin").rmdir()
+    (wr / "home" / "leerie" / ".profile").unlink()
+    assert orch._worker_home_extras(wr, home) == []
+    # A worker root whose /home is a link is not walked.
+    other = tmp_path / "other"
+    (other / "leerie" / "x").mkdir(parents=True)
+    wr2 = tmp_path / "wr2"
+    wr2.mkdir()
+    (wr2 / "home").symlink_to(other)
+    assert orch._worker_home_extras(wr2, home) == []
+
+
+def test_the_entry_stops_a_run_whose_worker_root_installs_in_home(
+        orch, tmp_path, monkeypatch, capsys):
+    root = tmp_path / "wr"
+    (root / "home" / "leerie" / "zz-not-in-the-container").mkdir(
+        parents=True)
+    monkeypatch.setattr(orch, "WORKER_ROOT", root)
+    with pytest.raises(SystemExit):
+        orch._require_worker_view()
+    err = capsys.readouterr().err
+    assert "/home/leerie/zz-not-in-the-container" in err
+    assert "/opt or /usr/local" in err
+
+
 def test_the_entry_stops_a_run_whose_commands_miss_the_worker_root(
         orch, tmp_path, monkeypatch):
     root = tmp_path / "wr"
@@ -402,3 +446,48 @@ def test_a_cli_without_a_view_runs_commands_as_before(tmp_path):
               [sys.executable, "-I", "-S", "-c", probe], tmp_path)
     assert r.returncode == 0, r.stderr
     assert "ok" in r.stdout and "CapEff:\t0000000000000000" in r.stdout
+
+
+# --- the run's name service (review round 29, execution H1) ---------------
+
+def _python_in(root: Path) -> str:
+    """This interpreter and its standard library, copied into `root`: the
+    worker root's own python, as an image's would be."""
+    import sysconfig
+    _copy_with_libs(sys.executable, root)
+    std = sysconfig.get_paths()["stdlib"]
+    shutil.copytree(std, root / std.lstrip("/"), symlinks=True,
+                    ignore=shutil.ignore_patterns(
+                        "test", "tests", "__pycache__", "idlelib",
+                        "tkinter", "turtledemo", "ensurepip",
+                        "site-packages", "dist-packages"))
+    dyn = sysconfig.get_config_var("DESTSHARED")
+    if dyn and os.path.isdir(dyn) and not (root / dyn.lstrip("/")).exists():
+        shutil.copytree(dyn, root / dyn.lstrip("/"), symlinks=True)
+    return "/usr/bin/" + os.path.basename(sys.executable)
+
+
+@iso
+def test_localhost_resolves_and_answers_in_the_worker_view(wroot):
+    """No image snapshot holds `/etc/hosts`, `/etc/hostname` or
+    `/etc/resolv.conf` — the runtime mounts them when the container starts
+    — so the view takes them from the container: `localhost` resolves in a
+    repository's root, and a server bound to it answers a client that dials
+    it by name."""
+    _copy_with_libs("getent", wroot)
+    assert not (wroot / "etc" / "hosts").exists()
+    py = _python_in(wroot)
+    w = wroot.parent / "w"
+    roundtrip = (
+        "import socket\n"
+        "s = socket.socket(); s.bind(('localhost', 0)); s.listen(1)\n"
+        "c = socket.create_connection(('localhost', s.getsockname()[1]))\n"
+        "a, _ = s.accept(); c.sendall(b'ping'); print(a.recv(4).decode())\n")
+    r = _shim(["--isolate", "--worker-root", str(wroot), "--rw", str(w),
+               "--rw", "/dev/null", "--ro", "/"],
+              ["sh", "-c", f"cat /etc/mark; echo; getent hosts localhost; "
+               f"echo getent=$?; {py} -I -S -c \"$0\"", roundtrip], w)
+    assert r.returncode == 0, r.stderr
+    assert _MARK in r.stdout                     # the repository's root
+    assert "getent=0" in r.stdout and "localhost" in r.stdout
+    assert "ping" in r.stdout

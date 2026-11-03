@@ -18738,6 +18738,11 @@ def _normalize_setup_packages(pkgs: list[str]) -> str:
     return " ".join(dict.fromkeys(p for p in pkgs if p))
 
 
+def _split_setup_packages(value: str) -> list[str]:
+    """The items of a `setup_packages` value (comma- or space-separated)."""
+    return [p for p in re.split(r"[,\s]+", value.strip()) if p]
+
+
 def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
     """Union existing setup_packages with newly-captured packages.
 
@@ -18745,10 +18750,7 @@ def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
     discovered); returns None when captured is a subset of existing.
     Preserves user-narrowed lists — never removes packages.
     """
-    def _parse(s: str) -> list[str]:
-        return [p for p in re.split(r"[,\s]+", s.strip()) if p]
-
-    existing_list = _parse(existing) if existing else []
+    existing_list = _split_setup_packages(existing) if existing else []
     existing_set = dict.fromkeys(existing_list)  # preserves first-seen order
     new_pkgs = [p for p in captured if p not in existing_set]
     if not new_pkgs:
@@ -19131,6 +19133,19 @@ def _record_capture(record_in: Path, from_run: str, setup_packages: list[str],
         f"apply them with `leerie config --apply-capture {record_in.name}`")
 
 
+def _config_capture_problems(cfg: Path) -> list[str]:
+    """`_capture_problems` of what `cfg` holds now: its `setup_packages`
+    items and its `language_installs`, which must be a JSON list."""
+    pkgs = _split_setup_packages(_read_toml_key(cfg, "setup_packages") or "")
+    raw = _read_toml_key(cfg, "language_installs") or ""
+    try:
+        installs = json.loads(raw) if raw else []
+    except ValueError:
+        return (_capture_problems(pkgs, [])
+                + [f"language_installs {raw!r} is not a JSON list"])
+    return _capture_problems(pkgs, installs)
+
+
 def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
     """The operator's `leerie config --apply-capture <run>` (DESIGN §6½ *The
     operator applies a capture*): apply the captures that run recorded
@@ -19162,6 +19177,16 @@ def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
             + "; ".join(problems))
     cfg = Path(repo_root) / ".leerie" / "config.toml"
     root = Path(repo_root)
+    # A merge keeps what the file holds, so the merged value is valid only
+    # when that is: check it too (review round 29, execution L4).
+    if any(not (isinstance(e, dict) and e.get("replace")) for e in entries):
+        held = _config_capture_problems(cfg)
+        if held:
+            die(f"capture: {path} is refused, nothing was applied: the "
+                f"merged value would keep what {cfg} already holds, and "
+                "that is not a capture leerie bakes: " + "; ".join(held)
+                + ". Fix or remove those entries in .leerie/config.toml "
+                "and apply again.")
     try:
         before = _read_text_beneath(root, cfg, limit=READ_LIMIT_CONFIG)
     except OSError:
@@ -23863,6 +23888,44 @@ def _require_confinement(run_dir: Path, state_root: Path,
 _WORKER_ENV_MARK = "/.leerie-worker-env"
 
 
+def _worker_home_extras(worker_root: Path,
+                        home: Path = Path("/home/leerie"),
+                        limit: int = 20) -> list[str]:
+    """The paths beneath the worker root's `/home/leerie` (the confined
+    commands' HOME) that the container's lacks: what a repository's
+    Dockerfile installed there, which the worker view hides (`/home` is a
+    container entry). Names only, no
+    link followed; a directory both have is descended into, but not one the
+    container mounts something on (an auth or cache mount owns it). `home`
+    is the container's `/home/leerie` (a test passes its own). At most
+    `limit` paths, each as the view would name it."""
+    found: list[str] = []
+    top = worker_root / "home" / "leerie"
+
+    def walk(rel: str) -> None:
+        w = top / rel if rel else top
+        c = home / rel if rel else home
+        if rel and os.path.ismount(c):
+            return
+        try:
+            names = sorted(_listdir_beneath(worker_root, w))
+        except OSError:
+            return
+        for n in names:
+            if len(found) >= limit:
+                return
+            r = f"{rel}/{n}" if rel else n
+            cp = c / n
+            if not os.path.lexists(cp):
+                found.append(f"/home/leerie/{r}")
+            elif (_dir_beneath_exists(worker_root, w / n) and cp.is_dir()
+                  and not cp.is_symlink()):
+                walk(r)
+
+    walk("")
+    return found
+
+
 def _require_worker_view() -> None:
     """Fail closed (DESIGN §6 *The orchestrator's root is leerie's; a
     repository's root is only a confined process's*): where the image has a
@@ -23878,6 +23941,10 @@ def _require_worker_view() -> None:
     "1") whose image has no worker root stops first, whatever the
     isolation: the image was built in an older layout or not by leerie,
     and its own root is the repository's (review round 29, execution L2).
+    So does one whose worker root holds anything beneath `/home/leerie` the
+    container's lacks (`_worker_home_extras`): `/home` is the run's
+    own, and what a repository installed there would be missing from every
+    confined command (review round 29, execution L3).
     """
     if os.environ.get(REPO_IMAGE_ENV) == "1" and _worker_root() is None:
         die(f"this run was started on a repository image, but the image has "
@@ -23889,7 +23956,20 @@ def _require_worker_view() -> None:
             "processes only in its own root (DESIGN §6 *The orchestrator's "
             "root is leerie's; a repository's root is only a confined "
             "process's*).")
-    if _worker_root() is None or not _isolated():
+    wr = _worker_root()
+    if wr is not None:
+        extras = _worker_home_extras(Path(wr))
+        if extras:
+            die("the repository image installs under /home/leerie, which a "
+                "confined command never sees: /home is the run's own (its HOME, "
+                "caches and credentials), taken from the container, not "
+                "from the repository's root. Found only in the repository's "
+                f"root: {', '.join(extras)}. Install these elsewhere in "
+                ".leerie/Dockerfile (beneath /opt or /usr/local, with an ENV "
+                "PATH entry for any binaries) and launch again (DESIGN §6 "
+                "*The orchestrator's root is leerie's; a repository's root "
+                "is only a confined process's*).")
+    if wr is None or not _isolated():
         return
     argv = _confined_argv(WorkerGrants(rw=("/dev/null",), ro=("/",)),
                           ["test", "-e", _WORKER_ENV_MARK])

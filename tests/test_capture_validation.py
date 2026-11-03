@@ -155,6 +155,36 @@ def test_merge_refuses_a_hostile_capture(tmp_path):
     assert cfg.read_text() == 'build = "make"\n'
 
 
+@pytest.mark.parametrize("held, named", [
+    # barnacle's shape: an earlier auto-apply wrote key names as packages.
+    ('setup_packages = "tini dockerfile_notes language_installs"\n',
+     "'dockerfile_notes'"),
+    ('setup_packages = "curl"\nlanguage_installs = "[{nope"\n',
+     "is not a JSON list"),
+    ('language_installs = \'[{"manager": "curl|sh", "copy_inputs": []}]\'\n',
+     "manager 'curl|sh'"),
+])
+def test_apply_refuses_a_merge_into_a_value_that_already_fails(
+        tmp_path, capsys, held, named):
+    """The capture is valid, but a merge keeps what the file holds: a
+    merged value carrying an entry that is not a capture leerie bakes is
+    refused, naming it, and nothing is written (review round 29, execution
+    L4)."""
+    repo, run = _checkout(tmp_path), tmp_path / "run"
+    run.mkdir()
+    cfg = repo / ".leerie" / "config.toml"
+    cfg.write_text(held)
+    (run / M.CAPTURED_DEPS_FILE).write_text(json.dumps([{
+        "from_run": "x", "setup_packages": ["libpq-dev"],
+        "language_installs": [], "replace": False}]))
+    with pytest.raises(SystemExit):
+        M.apply_captured_deps(run, repo)
+    cap = capsys.readouterr()
+    assert named in cap.out + cap.err
+    assert cfg.read_text() == held
+    assert (run / M.CAPTURED_DEPS_FILE).exists()
+
+
 def test_apply_logs_the_change_as_a_diff(tmp_path, capsys):
     repo, run = _checkout(tmp_path), tmp_path / "run"
     run.mkdir()

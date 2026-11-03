@@ -743,11 +743,12 @@ def test_worker_budget_exhausted_skips_worker(leerie, tmp_path, monkeypatch):
     assert not (repo / ".leerie" / "config.toml").exists()
 
 
-def test_malformed_existing_language_installs_json_treated_as_empty(
+def test_malformed_existing_language_installs_json_refuses_the_apply(
         leerie, tmp_path, monkeypatch):
-    """A corrupted existing `language_installs` TOML value (invalid JSON)
-    must not raise — it is treated as an empty existing list, and the fresh
-    capture's entries are written as if nothing existed before."""
+    """A corrupted existing `language_installs` TOML value (invalid JSON):
+    a merge keeps what the file holds, so the apply is refused, naming it,
+    and the file is left as it is — never silently replaced by the fresh
+    capture (review round 29, execution L4)."""
     repo = tmp_path / "repo"
     leerie_dir = repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -758,11 +759,11 @@ def test_malformed_existing_language_installs_json_treated_as_empty(
     monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
     _patch_invoke(leerie, monkeypatch)  # default envelope carries a pnpm entry
 
-    _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
+    with pytest.raises(SystemExit):
+        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS,
+                            efforts=_EFFORTS)
 
-    content = cfg.read_text()
-    assert "pnpm" in content
-    assert "not-valid-json" not in content
+    assert cfg.read_text() == 'language_installs = "not-valid-json{["\n'
 
 
 def test_replace_true_worker_invoked_with_empty_capture_logs_unchanged(

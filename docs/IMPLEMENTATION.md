@@ -3203,7 +3203,7 @@ a container.
 | `config --chat` | Open an interactive `claude` session with a config-generation system prompt and `--add-dir` pointing at the current repo. The model can read the repo and write `.leerie/config.toml` (and optionally `.leerie/Dockerfile`). |
 | `config --recapture` | Host-only (no container). Consolidates across **all** finished runs' logs (not just the newest) via the dep_capture LLM worker and **records** each run's capture in that run's `captured-deps.json`, for `config --apply-capture`. Never-clobber union when applied: already-captured runs (sentinel present) are skipped and only new packages/managers are added. |
 | `config --recapture --force` | Re-runs the worker over runs already captured (drops the `dep_capture.done` sentinel) and records a capture that, when applied, **wholesale-replaces** the persisted `setup_packages` / `language_installs` — deps no longer captured are dropped. An empty capture leaves the existing config untouched (never blanks a good config). Use to re-derive deps from current run history. |
-| `config --apply-capture <run-id>` | Host-only. Applies `<state>/runs/<run-id>/captured-deps.json` to `.leerie/config.toml` and logs the change as a unified diff (`host_apply_captured_deps` → `apply_captured_deps`); the only way a capture reaches the config (DESIGN §6½ *The operator applies a capture*). A capture `_capture_problems` refuses is kept and nothing is written (exit 1). |
+| `config --apply-capture <run-id>` | Host-only. Applies `<state>/runs/<run-id>/captured-deps.json` to `.leerie/config.toml` and logs the change as a unified diff (`host_apply_captured_deps` → `apply_captured_deps`); the only way a capture reaches the config (DESIGN §6½ *The operator applies a capture*). A capture `_capture_problems` refuses is kept and nothing is written (exit 1); so is one whose merge (any entry without `replace`) would keep a value `.leerie/config.toml` already holds that fails: `_config_capture_problems(cfg)` runs `_capture_problems` on its `setup_packages` items (`_split_setup_packages`) and its `language_installs`, which must be a JSON list, and the message names each failing entry. |
 
 **Lifecycle (remote mode):**
 
@@ -4398,10 +4398,20 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   None` — its path when it is a directory (`lstat`, not a link), else
   None (DESIGN §6 *The orchestrator's root is leerie's; a repository's
   root is only a confined process's*).
+- `_worker_home_extras(worker_root, home=Path("/home/leerie"), limit=20) ->
+  list[str]` — the entries beneath `<worker_root>/home/leerie` the
+  container's `home` lacks, named `/home/leerie/<rel>`: walks by name
+  beneath the worker root without following a link (`_listdir_beneath`,
+  `_dir_beneath_exists`; a linked `home` or `home/leerie` is not walked),
+  descends a directory both have unless the container's is a
+  mount point (an auth or cache mount owns it), unreadable directories
+  skipped; at most `limit`.
 - `_require_worker_view() -> None` — first `die()`s when `REPO_IMAGE_ENV`
   (`LEERIE_REPO_IMAGE`) is "1" and `_worker_root()` is None: the launcher
   started the run on a repository image that has no worker root. Then
-  nothing without `_worker_root()` or
+  `die()`s, naming them, when `_worker_home_extras(WORKER_ROOT)` finds any
+  path, telling the operator to install beneath `/opt` or `/usr/local`.
+  Then nothing without `_worker_root()` or
   without `_isolated()` (a command enters the view only through the
   isolation); else runs `_confined_argv(WorkerGrants(rw=("/dev/null",), ro=("/",)),
   ["test", "-e", "/.leerie-worker-env"])` (`_WORKER_ENV_MARK`) from `/`,
@@ -5034,7 +5044,10 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `opt` (when the worker root's is a directory) → a directory holding each
   entry of both `/opt`s but those beneath `worker_root`, a `leerie-*`
   entry the container has from the container, any other from the worker
-  root; a name in `CONTAINER_ENTRIES` (`dev`, `proc`, `sys`, `run`, `tmp`,
+  root; `etc` (when the worker root's is a directory) → a directory
+  holding each entry of the worker root's `/etc`, but each name in
+  `CONTAINER_ETC_FILES` (`hosts`, `hostname`, `resolv.conf`) from the
+  container's `/etc` when it has it; a name in `CONTAINER_ENTRIES` (`dev`, `proc`, `sys`, `run`, `tmp`,
   `home`, `work`, `inspect`, `leerie-state`, `leerie-host`) or absent from
   the worker root → the container's (when it has it); else the worker
   root's. Each entry by `_bind_entry(src, dst)`: a link copied as a link,

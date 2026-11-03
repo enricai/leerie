@@ -7157,3 +7157,19 @@ sample's probe never counts for the next.
   `/proc/self/pagemap` no longer stops the launch) and hashes by blob id.
 - `tests/committed_tree.py` — the harnesses that write a lockfile into a
   test checkout commit it first, since the generator reads `HEAD`.
+- Review round 29 (execution H1, L3, L4).
+  `tests/test_worker_root_view.py::test_localhost_resolves_and_answers_in_the_worker_view`
+  (isolated; runs in the container): a worker root with no `/etc/hosts`
+  (as no image snapshot has one), `getent hosts localhost` succeeds in the
+  view and a server bound to `localhost` answers a client that dials it by
+  name, the worker root's own copied python. Falsified in the container
+  (rootless): with the view's `/etc` taken whole from the worker root
+  again, it fails. `test_what_a_repository_installs_in_home_is_named` and
+  `test_the_entry_stops_a_run_whose_worker_root_installs_in_home`: what a
+  worker root holds beneath `/home/leerie` that the container's lacks is
+  named (the base's own entries and a linked `home` are not), and the entry
+  stops naming it and the fix. `tests/test_capture_validation.py::test_apply_refuses_a_merge_into_a_value_that_already_fails`
+  (3 cases: barnacle's key names in `setup_packages`, `language_installs`
+  that is not JSON, a manager leerie does not bake): a valid capture is
+  refused, naming the entry, and nothing is written. Falsified on the host:
+  with the two checks removed, the entry test and the 3 cases fail.
