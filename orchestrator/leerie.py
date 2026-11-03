@@ -938,6 +938,10 @@ STATE_FIELDS = (
     # that size intermittent discovery to its budget (DESIGN §9 *An
     # intermittent failure the run introduced is evidence*).
     "test_file_durations",
+    # Serial reruns' own cost (DESIGN §9 *A rerun's cost is measured, not
+    # assumed*): `{files, wall_sec, reported_sec}` per serial rerun over
+    # named files, newest last, that `_rerun_cost` fits.
+    "test_run_overhead",
     # Settle by execution (DESIGN §8): per-sid record of every execution of
     # a subtask's `verify` argvs, whatever the verdict.
     "settled_by_execution",
@@ -47032,7 +47036,8 @@ _CONFIRM_NO_BUDGET_GATE: dict = {"waited_sec": 0.0, "timed_out": False,
 
 def _confirm_select(units: list[str], durations: dict[str, float], *,
                     rank: dict[str, int], reps: int, budget: float,
-                    overhead: float, first_always: bool = True) -> dict:
+                    overhead: float, first_always: bool = True,
+                    per_file: float = 0.0) -> dict:
     """Which of a B* confirm's rerun `units` (test files, CI checks) to
     rerun, sized before the reruns start (DESIGN §9 *Which failures are
     new*, step 2): ranked by `rank` (lower is more informative — a unit
@@ -47041,15 +47046,16 @@ def _confirm_select(units: list[str], durations: dict[str, float], *,
     unmeasured unit last), then the name; taken while `(sum(duration) +
     overhead) * reps` stays inside `budget` (callers pass `reps = 2`: one
     base/final pair), the first always unless `first_always` is False (it
-    may still finish a pair). An unmeasured unit costs `overhead` alone.
-    Pure. `{chosen, sized_out}`."""
+    may still finish a pair). Each unit also costs `per_file` (its import
+    and collection, `_rerun_cost`); an unmeasured unit costs that and
+    `overhead` alone. Pure. `{chosen, sized_out}`."""
     order = sorted(units, key=lambda u: (rank.get(u, 0),
                                          durations.get(u, float("inf")), u))
     chosen: list[str] = []
     sized_out: list[str] = []
     total = 0.0
     for u in order:
-        d = float(durations.get(u) or 0.0)
+        d = float(durations.get(u) or 0.0) + per_file
         if ((first_always and not chosen)
                 or (total + d + overhead) * reps <= budget):
             chosen.append(u)
@@ -47310,7 +47316,8 @@ def _merge_confirm_passes(passes: list[dict]) -> dict:
 async def _confirm_sized(
         cand_unit: dict[str, str], durations: dict[str, float], *,
         rank: dict[str, int], caps: dict, overhead: float, label: str,
-        confirm: Callable[..., Awaitable[dict]]) -> dict:
+        confirm: Callable[..., Awaitable[dict]],
+        per_file: float = 0.0) -> dict:
     """A base-paired B* confirm over candidates grouped in rerun units (test
     files, CI checks), sized to `confirm_budget_sec` (DESIGN §9 *Which
     failures are new*, step 2). The first pass reruns the units
@@ -47337,7 +47344,7 @@ async def _confirm_sized(
         return [c for c in sorted(cand_unit) if cand_unit[c] in keep]
     sel = _confirm_select(sorted(set(cand_unit.values())), durations,
                           rank=rank, reps=2, budget=budget,
-                          overhead=overhead)
+                          overhead=overhead, per_file=per_file)
     # Breadth first only when a unit waits: a first pass that holds every
     # unit spends its whole budget on its own pairs, as before.
     one = {"max_pairs": 1} if sel["sized_out"] else {}
@@ -47351,7 +47358,7 @@ async def _confirm_sized(
         left = budget - used
         sel = _confirm_select(left_units, durations, rank=rank, reps=2,
                               budget=left, overhead=overhead,
-                              first_always=False)
+                              first_always=False, per_file=per_file)
         if not sel["chosen"]:
             break
         log(f"  B* {label}: {round(left)}s of the confirm budget left — "
@@ -47595,6 +47602,67 @@ def _record_test_durations(st: "State", durations: dict[str, float]) -> None:
         save()
 
 
+# The newest serial-rerun samples `_rerun_cost` fits; older ones go.
+_RERUN_COST_SAMPLES = 32
+
+
+def _record_rerun_cost(st: "State", files: int, wall_sec: float,
+                       reported_sec: float) -> None:
+    """Append one serial rerun's `{files, wall_sec, reported_sec}` to the
+    run-wide `test_run_overhead` (DESIGN §9 *A rerun's cost is measured,
+    not assumed*), keeping the newest `_RERUN_COST_SAMPLES`."""
+    data = getattr(st, "data", None)
+    if files <= 0 or wall_sec <= 0 or not isinstance(data, dict):
+        return
+    cur = data.get("test_run_overhead")
+    cur = [x for x in cur if isinstance(x, dict)] \
+        if isinstance(cur, list) else []
+    cur.append({"files": int(files), "wall_sec": round(wall_sec, 3),
+                "reported_sec": round(max(reported_sec, 0.0), 3)})
+    st.data["test_run_overhead"] = cur[-_RERUN_COST_SAMPLES:]
+    save = getattr(st, "save", None)
+    if callable(save):
+        save()
+
+
+def _rerun_cost(samples: object) -> dict | None:
+    """`{startup_sec, per_file_sec, samples, sizes}` fitted to serial-rerun
+    samples, or None with none (DESIGN §9 *A rerun's cost is measured, not
+    assumed*). Each sample's overhead `wall − Σ reported` is read as
+    `startup + files × per_file`, by least squares; both are kept
+    non-negative. With one run size only, the two cannot be told apart and
+    all of it is per-file — the conservative reading for any larger set.
+    Pure."""
+    pts = [(int(x["files"]), max(0.0, float(x["wall_sec"])
+                                 - float(x["reported_sec"])))
+           for x in (samples if isinstance(samples, list) else [])
+           if isinstance(x, dict)
+           and isinstance(x.get("files"), int) and x["files"] > 0
+           and isinstance(x.get("wall_sec"), (int, float))
+           and isinstance(x.get("reported_sec"), (int, float))]
+    if not pts:
+        return None
+    sizes = {n for n, _ in pts}
+    sum_n = sum(n for n, _ in pts)
+    sum_y = sum(y for _, y in pts)
+    startup, per_file = 0.0, sum_y / sum_n
+    if len(sizes) > 1:
+        k = len(pts)
+        mean_n, mean_y = sum_n / k, sum_y / k
+        var = sum((n - mean_n) ** 2 for n, _ in pts)
+        slope = sum((n - mean_n) * (y - mean_y) for n, y in pts) / var
+        icept = mean_y - slope * mean_n
+        if slope < 0:
+            startup, per_file = mean_y, 0.0
+        elif icept < 0:
+            startup, per_file = 0.0, sum_y / sum_n
+        else:
+            startup, per_file = icept, slope
+    return {"startup_sec": round(startup, 3),
+            "per_file_sec": round(per_file, 3),
+            "samples": len(pts), "sizes": len(sizes)}
+
+
 def _runner_report_failing_ids(kind: str, report: bytes | None,
                                tree: str) -> dict[str, str | None] | None:
     """Failing test ID -> repo-relative file (None when the report does not
@@ -47674,6 +47742,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                        _SERIAL_RUNNER_FLAGS[runner])
         if flagged is not None:
             attempts.append(flagged)
+    # Only the serial form's own wall time is a rerun's serial cost.
+    serial_first = len(attempts) == 1
     attempts.append(cmd)
     # The report is the command's output: beside its tree, in the tree's own
     # measurement directory (DESIGN §6 *Leerie's runs of the repository's
@@ -47720,6 +47790,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         # planted (DESIGN §6 *Leerie never writes through a path confined
         # code shaped*).
         got = bytearray()
+        run_wall = 0.0
         try:
             _mkdir_private(reports, own)
             _unlink_beneath(own, report)
@@ -47750,7 +47821,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                 label=f"{label}-ids: {run_cmd}",
                                 verbosity="quiet")
                 finally:
-                    spent += time.monotonic() - t_run
+                    run_wall = time.monotonic() - t_run
+                    spent += run_wall
         except Exception:
             # A timeout or a spawn failure: no verdict from this run.
             with contextlib.suppress(OSError):
@@ -47766,6 +47838,11 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         durations = _runner_report_file_durations(kind, data or None,
                                                   str(tree))
         _record_test_durations(st, durations)
+        if serial_first and i == 0 and run_files and ids is not None:
+            # A serial run over named files: its own cost, for sizing every
+            # later rerun (DESIGN §9 *A rerun's cost is measured*).
+            _record_rerun_cost(st, len(run_files), run_wall,
+                               sum(durations.get(f, 0.0) for f in run_files))
         messages = {c["id"]: c.get("message", "")
                     for c in (_runner_report_cases(kind, data or None,
                                                    str(tree))
@@ -47773,7 +47850,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                     if ids and c["id"] in ids}
         if ids is not None:
             return {"ids": sorted(ids), "files": ids, "kind": kind,
-                    "messages": messages, "durations": durations}
+                    "messages": messages, "durations": durations,
+                    "wall_sec": round(run_wall, 3)}
     return None
 
 
@@ -47955,8 +48033,8 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                     {c: id_files[c] for c in all_cand},
                     dict(st.data.get("test_file_durations") or {}),
                     rank=rank, caps=caps,
-                    overhead=_DISCOVERY_RUN_OVERHEAD_SEC, label=label,
-                    confirm=_pass)
+                    overhead=_rerun_cost_or_default(st)[0], label=label,
+                    confirm=_pass, per_file=_rerun_cost_or_default(st)[1])
             else:
                 verdict = await _pass(None, all_cand, caps, None)
         finally:
@@ -48004,9 +48082,20 @@ _RESOURCE_FAILURE_RE = re.compile(
     re.IGNORECASE)
 
 
-# A repeat's cost beyond its files' own durations (runner start-up,
-# collection) when no calibration run has measured it.
+# A rerun's start-up the B* confirm sizes with until serial reruns have
+# measured one (`_rerun_cost`). Discovery never plans from it.
 _DISCOVERY_RUN_OVERHEAD_SEC = 10.0
+
+
+def _rerun_cost_or_default(st: "State") -> tuple[float, float]:
+    """`(startup_sec, per_file_sec)` for sizing B* reruns: the measured
+    `_rerun_cost`, else `_DISCOVERY_RUN_OVERHEAD_SEC` start-up and no
+    per-file overhead."""
+    cost = _rerun_cost((getattr(st, "data", None) or {}).get(
+        "test_run_overhead"))
+    if cost is None:
+        return _DISCOVERY_RUN_OVERHEAD_SEC, 0.0
+    return cost["startup_sec"], cost["per_file_sec"]
 
 
 def _discovery_rank(files: list[str], coupled: dict[str, list[str]],
@@ -48021,11 +48110,14 @@ def _discovery_rank(files: list[str], coupled: dict[str, list[str]],
 
 
 def _discovery_select(ranked: list[str], durations: dict[str, float],
-                      reps: int, budget: float, overhead: float) -> dict:
+                      reps: int, budget: float, overhead: float,
+                      per_file: float = 0.0) -> dict:
     """The files whose `reps` full repeats fit in `budget` seconds, taken in
-    `ranked` order while `(sum(duration) + overhead) * reps <= budget`.
-    Pure. `{chosen, skipped[{file, reason, duration_sec?}], planned_sec}`;
-    `reason` is `over budget` or `no measured duration`."""
+    `ranked` order while `(sum(duration + per_file) + overhead) * reps <=
+    budget` — `overhead` one repeat's start-up, `per_file` each file's
+    import and collection (`_rerun_cost`). Pure. `{chosen,
+    skipped[{file, reason, duration_sec?}], planned_sec}`; `reason` is
+    `over budget` or `no measured duration`."""
     chosen: list[str] = []
     skipped: list[dict] = []
     total = 0.0
@@ -48033,9 +48125,9 @@ def _discovery_select(ranked: list[str], durations: dict[str, float],
         d = durations.get(f)
         if d is None:
             skipped.append({"file": f, "reason": "no measured duration"})
-        elif (total + d + overhead) * reps <= budget:
+        elif (total + d + per_file + overhead) * reps <= budget:
             chosen.append(f)
-            total += d
+            total += d + per_file
         else:
             skipped.append({"file": f, "reason": "over budget",
                             "duration_sec": round(d, 3)})
@@ -48102,54 +48194,68 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
             durations = {f: float(v) for f, v in (
                 known.items() if isinstance(known, dict) else ())
                 if f in out["coupled"] and isinstance(v, (int, float))}
-            overhead = _DISCOVERY_RUN_OVERHEAD_SEC
-            # Calibrate the unmeasured files once, in rank order and in
-            # doubling chunks, inside one repeat's share of the budget: a
-            # chunk that does not finish leaves its files unmeasured.
+            # Calibrate (DESIGN §9 *A rerun's cost is measured, not
+            # assumed*): the unmeasured files first, then the measured ones,
+            # in rank order and doubling chunks, inside one repeat's share
+            # of the budget, until every file has a duration and the rerun
+            # samples span two run sizes. Each chunk is a serial rerun over
+            # named files, so `_capture_failing_test_ids` records its cost.
+            # A chunk that does not finish leaves its files unmeasured.
             unknown = [f for f in _discovery_rank(files, out["coupled"], {})
                        if f not in durations]
+            order = unknown + [f for f in _discovery_rank(
+                files, out["coupled"], durations) if f in durations]
             calib: dict = {"files": len(unknown), "runs": 0, "measured": 0,
                            "sec": 0.0}
+
+            def _fitted() -> dict | None:
+                return _rerun_cost(st.data.get("test_run_overhead"))
             c_end = (clock() - t0) + budget / reps
             size, i = 1, 0
-            while i < len(unknown):
+            while i < len(order) and (i < len(unknown) or (
+                    (_fitted() or {}).get("sizes", 0) < 2)):
                 left = min(c_end, budget) - (clock() - t0)
                 if left <= 0:
                     break
-                chunk = unknown[i:i + size]
-                c0 = clock()
+                chunk = order[i:i + size]
                 got = await _capture_failing_test_ids(
                     staging, cmd, st, caps,
                     label=f"{label}-calibrate{calib['runs'] + 1}",
                     log_path=log_path, timeout=left, serial=True,
                     files=chunk)
-                wall = clock() - c0
                 calib["runs"] += 1
                 if got is None:
                     break
                 rep = got.get("durations") or {}
-                got_d = {f: float(rep[f]) for f in chunk if f in rep}
-                if got_d:
-                    overhead = max(0.0, wall - sum(got_d.values()))
+                wall = float(got.get("wall_sec") or 0.0)
                 for f in chunk:
                     # A file the report gave no time for carries its share
                     # of the chunk's wall time, start-up included.
-                    durations[f] = got_d.get(f, wall / len(chunk))
+                    durations[f] = (float(rep[f]) if f in rep
+                                    else durations.get(f, wall / len(chunk)))
                 calib["measured"] += len(chunk)
                 i += size
                 size *= 2
             calib["sec"] = round(clock() - t0, 1)
             left = budget - (clock() - t0)
+            cost = _fitted()
             ranked = _discovery_rank(files, out["coupled"], durations)
-            sel = _discovery_select(ranked, durations, reps, left, overhead)
+            if cost is None:
+                sel = {"chosen": [], "planned_sec": 0.0,
+                       "skipped": [{"file": f, "reason": "overhead not "
+                                    "measured"} for f in ranked]}
+            else:
+                sel = _discovery_select(ranked, durations, reps, left,
+                                        cost["startup_sec"],
+                                        cost["per_file_sec"])
             out["files"] = sel["chosen"]
             out["skipped_files"] = sel["skipped"]
             out["selection"] = {"budget_sec": round(left, 1),
                                 "planned_sec": sel["planned_sec"],
-                                "overhead_sec": round(overhead, 1),
-                                "calibration": calib}
+                                "cost": cost, "calibration": calib}
             if not sel["chosen"]:
-                out["skipped"] = "over budget"
+                out["skipped"] = ("over budget" if cost is not None
+                                  else "overhead not measured")
             for n in range(reps if sel["chosen"] else 0):
                 left = budget - (clock() - t0)
                 if left <= 0:
@@ -59837,8 +59943,8 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
                     {c: id_files[c] for c in cand},
                     dict(st.data.get("test_file_durations") or {}),
                     rank=rank, caps=caps,
-                    overhead=_DISCOVERY_RUN_OVERHEAD_SEC, label=label,
-                    confirm=_pass)
+                    overhead=_rerun_cost_or_default(st)[0], label=label,
+                    confirm=_pass, per_file=_rerun_cost_or_default(st)[1])
             else:
                 verdict = await _pass(None, cand, caps, None)
     finally:

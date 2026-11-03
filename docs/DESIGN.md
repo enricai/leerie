@@ -15607,8 +15607,9 @@ failure new / does this set still fail" verdict uses:
    discovery sizes from below): a file holding a candidate the final run
    itself failed ranks before one holding only a discovery find (the more
    informative observation), then the shortest first; a file is taken
-   while (Σ duration + one rerun's start-up) × 2 — one base/final pair —
-   fits the budget, and the first file always, since it may still finish a
+   while its cost — (Σ (duration + per-file overhead) + one rerun's
+   start-up) × 2, from the measured rerun cost below — for one
+   base/final pair fits the budget, and the first file always, since it may still finish a
    pair. One pair, not all `k`: one finished agreeing pair is what step 4
    needs to call a candidate new, so sizing for `k` left out files that
    could have been settled. When that first pass is done, the budget it
@@ -15619,7 +15620,7 @@ failure new / does this set still fail" verdict uses:
    out: its candidates are `budget_short_unsettled` (step 4), listed as
    "not rerun (sized out of the budget)" — apart from a rerun the budget
    cut, "could not confirm within the budget". A file with no measured
-   duration costs the start-up alone. When a candidate has no known file
+   duration costs the start-up and its per-file overhead. When a candidate has no known file
    the rerun is the whole command and nothing is sized. CI parity sizes
    its red checks the same way by their final-run times, shortest first,
    so a long check first in CI order no longer starves the checks after it.
@@ -15921,12 +15922,32 @@ adds two steps:
    a changed file directly (a transitive importer is never a discovery
    file, above), and among them one importing more of the changed files
    ranks first; then the shortest first, so the most files fit. A file is
-   taken while (Σ duration + one repeat's runner start-up) × R stays inside
-   what is left of the budget. A file with no measured duration is
-   calibrated first: the unmeasured files run once with a report, in rank
-   order and in chunks of 1, 2, 4 … files, inside one repeat's share of the
-   budget (`confirm_budget_sec` / R); a chunk that does not finish leaves
-   its files unmeasured and skipped. Calibration runs are not repeats: a
+   taken while (Σ (duration + per-file overhead) + one repeat's start-up)
+   × R stays inside what is left of the budget.
+
+   *A rerun's cost is measured, not assumed.* A report's per-file duration
+   is the file's tests alone: vitest's suite start/end excludes the file's
+   import and collection, which on barnacle are several times its test
+   time, and a duration recorded from a parallel run hides even that. The
+   old rule added one assumed 10 s start-up per repeat and calibrated only
+   when some file had no duration, so with every duration known nothing
+   was ever measured: live run a1f5 planned 263 of 375 files × 20 repeats
+   at 1,797 s and finished none of the 20 repeats. So every serial rerun
+   leerie runs over named files (calibration, discovery repeats, B\*
+   reruns) records its own wall time against the durations its report
+   gave, and a least-squares fit over those samples gives the start-up
+   per run and the overhead per file (`wall − Σ reported = start-up + n ×
+   per-file`, both kept non-negative; from samples of one size alone, all
+   of it is per-file, the conservative reading). Discovery first
+   calibrates — the unmeasured files, in rank order, then the measured
+   ones — in chunks of 1, 2, 4 … files inside one repeat's share of the
+   budget (`confirm_budget_sec` / R), until every file it could choose has
+   a duration and the samples span two run sizes; a chunk that does not
+   finish leaves its files unmeasured and skipped. With no sample at all,
+   nothing is planned: discovery records `skipped: "overhead not
+   measured"` and runs nothing, rather than plan from an assumption. B\*
+   sizes from the same fit once one exists, and until then from the 10 s
+   start-up alone. Calibration runs are not repeats: a
    file is counted only over its R repeats. A repeat that wrote no report is
    not counted as one either, and a repeat the budget cut short ends
    discovery (`budget_exhausted`): counted, it would inflate the "failed

@@ -8207,9 +8207,22 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   through `_append_runner_flags` when `serial`, retrying once without them
   when the serial form produced no report — inside what is left of
   `timeout` after the serial run (`max(1.0, …)` floor; under 1 s left, no
-  retry and None). Returns `{ids, files, kind, messages, durations}` or
-  None (`durations` per file, merged into `test_file_durations`, which B\*
-  sizing reads). A separate run: the axis verdict `_measure_blt` records is never
+  retry and None). Returns `{ids, files, kind, messages, durations,
+  wall_sec}` or None (`durations` per file, merged into
+  `test_file_durations`, which B\* sizing reads; `wall_sec` the returned
+  attempt's own run time, slot waits and the view's install excluded).
+  When the serial form was the first attempt and it returned a report over
+  `files`, `_record_rerun_cost(st, len(files), wall_sec, Σ durations of
+  files)` appends `{files, wall_sec, reported_sec}` to
+  `state.data["test_run_overhead"]` (newest `_RERUN_COST_SAMPLES` = 32
+  kept). `_rerun_cost(samples) -> {startup_sec, per_file_sec, samples,
+  sizes} | None` (pure) fits `wall − reported = startup + files ×
+  per_file` by least squares over them: with one run size, `startup = 0`
+  and `per_file = Σ overhead / Σ files`; a negative slope gives
+  `per_file = 0, startup = mean`, a negative intercept the one-size
+  reading; None with no sample (DESIGN §9 *A rerun's cost is measured, not
+  assumed*). `_rerun_cost_or_default(st) -> (startup, per_file)` is the fit,
+  else `(_DISCOVERY_RUN_OVERHEAD_SEC, 0.0)`. A separate run: the axis verdict `_measure_blt` records is never
   measured with altered flags. The runner is found through
   `_runner_command(cmd, tree, known, files) -> (cmd, env overlay | None)`:
   `cmd` as written when `_acceptance_runner` finds a runner in it; else,
@@ -8257,10 +8270,12 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   confirm is `_confirm_sized(cand_unit, durations, *, rank, caps,
   overhead, label, confirm) -> dict` over `test_file_durations` (rank 0
   for a file holding a final-run candidate, 1 for one holding only
-  discovery finds; `overhead = _DISCOVERY_RUN_OVERHEAD_SEC`): pass 1
+  discovery finds; `overhead, per_file = _rerun_cost_or_default(st)`,
+  passed as `_confirm_sized(..., per_file=)`): pass 1
   reruns `_confirm_select(units, durations, *, rank, reps=2, budget,
-  overhead, first_always=True) -> {chosen, sized_out}` (taken while one
-  base/final pair, `(Σ + overhead) × 2`, fits; the first always), then
+  overhead, first_always=True, per_file=0.0) -> {chosen, sized_out}` (taken
+  while one base/final pair, `(Σ (duration + per_file) + overhead) × 2`,
+  fits; the first always), then
   while units remain and at least 1 s of `confirm_budget_sec` is left
   after the passes' `budget_used_sec`, the next pass reruns
   `_confirm_select(remaining, …, budget=left, first_always=False)`'s
@@ -8518,23 +8533,29 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   runner (`_acceptance_cmd`), and holding `_confirm_hold()` after one
   `_confirm_gate`, all inside one `confirm_budget_sec` counted from when
   the gate returns (DESIGN §9 *Sized to the budget*):
-  1. *Durations.* `state.data["test_file_durations"]` for the coupled
-     files. The unmeasured ones are calibrated in `_discovery_rank` order
-     (no durations) in chunks of 1, 2, 4 … files through
-     `_capture_failing_test_ids(..., serial=True, files=chunk)`, while the
-     elapsed time is under `confirm_budget_sec / confirm_intermittent_repeats`;
-     each run's timeout is what is left of that share. A chunk that
-     returns None stops calibration. A completed chunk's files take the
-     report's durations (a file it gave none takes `wall / len(chunk)`),
-     and the per-repeat overhead becomes `max(0, wall − Σ reported)`
-     (default `_DISCOVERY_RUN_OVERHEAD_SEC` = 10 s). Calibration runs are
-     not repeats: their IDs are not counted.
+  1. *Durations and cost.* `state.data["test_file_durations"]` for the
+     coupled files. Calibration runs the unmeasured files (in
+     `_discovery_rank` order with no durations), then the measured ones (in
+     `_discovery_rank` order), in chunks of 1, 2, 4 … files through
+     `_capture_failing_test_ids(..., serial=True, files=chunk)` — each such
+     run records its cost sample — while a file is still unmeasured or
+     `_rerun_cost(test_run_overhead)` has fewer than two `sizes`, and the
+     elapsed time is under `confirm_budget_sec /
+     confirm_intermittent_repeats`; each run's timeout is what is left of
+     that share. A chunk that returns None stops calibration. A completed
+     chunk's files take the report's durations (a file it gave none keeps
+     a known duration, else takes `wall_sec / len(chunk)`). Calibration
+     runs are not repeats: their IDs are not counted.
   2. *Selection.* `_discovery_rank(files, coupled, durations)`: by
-     `-len(coupled[f])`, then duration (unmeasured last), then path.
-     `_discovery_select(ranked, durations, reps, budget_left, overhead) ->
-     {chosen, skipped[{file, reason, duration_sec?}], planned_sec}` (pure)
-     takes a file while `(Σ chosen durations + overhead) × reps ≤
-     budget_left`; `reason` is `over budget` or `no measured duration`.
+     `-len(coupled[f])`, then duration (unmeasured last), then path. With
+     no fitted cost, nothing is chosen: every file is skipped with reason
+     `overhead not measured` and `skipped` is `overhead not measured`.
+     Otherwise `_discovery_select(ranked, durations, reps, budget_left,
+     overhead, per_file=0.0) -> {chosen, skipped[{file, reason,
+     duration_sec?}], planned_sec}` (pure), called with the fit's
+     `startup_sec` and `per_file_sec`, takes a file while `(Σ chosen
+     (duration + per_file) + overhead) × reps ≤ budget_left`; `reason` is
+     `over budget` or `no measured duration`.
   3. *Repeats.* The chosen files are rerun `confirm_intermittent_repeats`
      times (`serial=True, files=chosen`), each with the remaining budget as
      its timeout; with none chosen, nothing runs and `skipped` is `over
@@ -8543,11 +8564,12 @@ Test-ID plumbing for the failing-test-ID diff (E3):
      and ends the repeats; one that returned None earlier is skipped.
   Returns `{coupled, files (the chosen), repeats_required, repeats_run,
   budget_exhausted, gate, failed_ids, fail_counts, id_files, selection?
-  {budget_sec, planned_sec, overhead_sec, calibration{files, runs,
-  measured, sec}}, skipped_files?, skipped?}`. `skipped` is one of
+  {budget_sec, planned_sec, cost (the `_rerun_cost` fit or None),
+  calibration{files, runs, measured, sec}}, skipped_files?, skipped?}`. `skipped` is one of
   `disabled`, `no base commit`, `no test file imports a changed production
   file`, `no scoped test runner for the coupled files` (without one, a
-  repeat would run the whole suite), `over budget`, or `discovery errored
+  repeat would run the whole suite), `over budget`, `overhead not
+  measured`, or `discovery errored
   (…)`. A transient `_runs` key carries the messages and is popped before
   the verdict is stored. `clock` (default `time.monotonic`) is injectable.
   Never raises. `_ratchet_exec` (N5) calls the same function, so each of
@@ -12563,6 +12585,7 @@ command line overrides it.
 | `unclean_trees` | dict[str, dict] \| absent | `_record_unclean_tree`: `{"<worker>:<where>": {worker, where, lines[]}}` per conformer, final-conformer, acceptance-repair or re-drive round rolled back because its worker left its tree unclean past `clean_tree_reasks` (lines: the porcelain, first `_UNCLEAN_LINES_MAX`); `_decide_outcome` adds one reason per record (DESIGN §8 *A worker leaves its tree clean*). |
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
+| `test_run_overhead` | list[{files, wall_sec, reported_sec}] \| absent | the newest 32 serial reruns over named files (`_record_rerun_cost`), that `_rerun_cost` fits to a start-up and a per-file overhead for discovery and B\* sizing (DESIGN §9 *A rerun's cost is measured, not assumed*). |
 | `test_file_durations` | dict[str, float] \| absent | repo-relative test file → seconds, the newest measurement from any structured report leerie read (`_record_test_durations`); sizes intermittent discovery to its budget (DESIGN §9 *Sized to the budget*). |
 | `shipping_tests_gap` | dict \| None | written each time `_refresh_test_id_diff` measures (not when it reuses a diff of that tree, or the diff is already marked stale for it): `{"tree_sha", "why", "skip_kind"}` when it could not take a failing-test-ID diff of the tree that ships (`skip_kind` the test axis's, `forbidden_by_task` for a command the task forbids), None when it took one. `_unmeasured_on_shipping_tree` reads it for the outcome's reason (DESIGN §6 *The run outcome is decided once*, "`done` rests on measurements that ran"). |
 | `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed), and `base_unavailable: true` when the base worktree for the confirm could not be created (every candidate `no_verdict`), `stale_for_tree` (the shipping tree's sha) when staging's tree is not the diff's and the diff could not be measured on it (`_refresh_test_id_diff`: the re-drive's tail and phase 5's own refreshes), `sized_out` / `sized_out_files` / `budget_short_unsettled_files` when the confirm budget left candidates unsettled (`passes` when the sized confirm ran more than one) (DESIGN §9 step 4; never counted, they read as the test outcome's `unknown`); `new` non-empty makes the outcome `unconverged`, and the reason says how many of them are `budget_short`. |
