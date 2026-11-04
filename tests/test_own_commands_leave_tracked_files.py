@@ -22,7 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import measure_run_dir
+from tests.conftest import (measure_run_dir, needs_landlock,
+                            skip_without_landlock)
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_redrive_test_id_diff_refresh import _git  # noqa: E402
@@ -110,6 +111,8 @@ def _node_repo(leerie, tmp_path, monkeypatch, *, lock_rewrite: bool):
 # The four clean-run shapes: done, with an EMPTY end-state section
 
 
+@needs_landlock
+@skip_without_landlock
 def test_shape1_pytest_pycache_unignored(leerie, tmp_path, monkeypatch,
                                          capsys):
     run = _repo(leerie, tmp_path, monkeypatch)
@@ -121,6 +124,8 @@ def test_shape1_pytest_pycache_unignored(leerie, tmp_path, monkeypatch,
     assert (out, sec) == ("done", "")
 
 
+@needs_landlock
+@skip_without_landlock
 def test_shape2_vitest_shaped_coverage(leerie, tmp_path, monkeypatch, capsys):
     run = _node_repo(leerie, tmp_path, monkeypatch, lock_rewrite=False)
     _quiet_conformer(leerie, monkeypatch)
@@ -133,6 +138,8 @@ def test_shape2_vitest_shaped_coverage(leerie, tmp_path, monkeypatch, capsys):
     assert (out, sec) == ("done", "")
 
 
+@needs_landlock
+@skip_without_landlock
 def test_shape3_an_install_that_rewrites_the_lockfile(
         leerie, tmp_path, monkeypatch):
     """The reviewer's driver: the install appends to the tracked
@@ -163,6 +170,8 @@ SNAP_TEST = (
     "    assert True\n")
 
 
+@needs_landlock
+@skip_without_landlock
 def test_shape4_a_test_that_rewrites_a_tracked_snapshot(
         leerie, tmp_path, monkeypatch):
     """Round 10's fourth shape: a test rewrites the tracked
@@ -183,6 +192,8 @@ def test_shape4_a_test_that_rewrites_a_tracked_snapshot(
 
 
 @pytest.mark.parametrize("worker_runs_tests", [False, True])
+@needs_landlock
+@skip_without_landlock
 def test_a_conformer_rerunning_the_tests_ends_done_once_it_cleans_up(
         leerie, tmp_path, monkeypatch, worker_runs_tests):
     """Review round 11 M2's driver, rewritten for I1 + I2: shape 2, and the
@@ -267,6 +278,8 @@ def _deps(leerie, tree, recipe):
     ("uv", "uv.lock", ["sync"]),
     ("bundle", "Gemfile.lock", ["install"]),
 ])
+@needs_landlock
+@skip_without_landlock
 def test_an_install_that_relocks_is_put_back(leerie, tmp_path, monkeypatch,
                                              tool, lock, args):
     t = _tree(tmp_path, {lock: "version = 1\n"})
@@ -279,6 +292,8 @@ def test_an_install_that_relocks_is_put_back(leerie, tmp_path, monkeypatch,
     assert " M " not in _status(t)
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_build_that_rewrites_tsconfig_is_put_back(leerie, tmp_path,
                                                      monkeypatch):
     t = _tree(tmp_path, {"tsconfig.json": '{"a": 1}\n',
@@ -294,6 +309,8 @@ def test_a_build_that_rewrites_tsconfig_is_put_back(leerie, tmp_path,
     assert _status(t) == ""
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_workers_edit_to_the_same_file_survives(leerie, tmp_path,
                                                    monkeypatch):
     """Restored as it was just before the command — never to HEAD — so an
@@ -311,6 +328,8 @@ def test_a_workers_edit_to_the_same_file_survives(leerie, tmp_path,
     assert not (t / "gone.py").exists()
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_command_that_deletes_or_restores_a_file_is_undone(
         leerie, tmp_path, monkeypatch):
     t = _tree(tmp_path, {"keep.txt": "k\n", "back.txt": "b\n"})
@@ -326,6 +345,8 @@ def test_a_command_that_deletes_or_restores_a_file_is_undone(
 # `_measure_axes`: a measured build axis that rewrites a tracked file
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_measured_build_axis_puts_back_what_it_rewrote(leerie, tmp_path,
                                                          monkeypatch):
     t = _tree(tmp_path, {"tsconfig.json": '{"a": 1}\n'})
@@ -432,7 +453,13 @@ def test_a_put_back_never_moves_a_submodule(leerie, tmp_path):
     assert " M vendor/lib" in _status(t)             # left as the command did
 
 
-@pytest.mark.parametrize("edited", [False, True])
+# Only the `edited` case runs a confined command; `False` needs no
+# kernel and passes anywhere, so the gate is per case (the idiom at
+# `tests/test_confined_terminal.py`'s `isolate` parameter).
+@pytest.mark.parametrize("edited", [
+    False,
+    pytest.param(True, marks=[needs_landlock, skip_without_landlock]),
+])
 def test_a_tracked_file_a_command_replaced_with_a_directory_is_put_back(
         leerie, tmp_path, edited):
     """Review round 11 suspicion 1, proven: `_tracked_content` ran `git -C
@@ -511,6 +538,8 @@ def _assert_as_found(t, before: str, sub: str = "") -> None:
     assert (t / "worker.txt").exists()            # never deleted
 
 
+@needs_landlock
+@skip_without_landlock
 def test_i2_an_install_leaves_the_tree_as_found(leerie, tmp_path,
                                                monkeypatch):
     t, before = _family_tree(tmp_path)
@@ -521,6 +550,8 @@ def test_i2_an_install_leaves_the_tree_as_found(leerie, tmp_path,
 
 
 @pytest.mark.parametrize("axis", ["build", "lint", "tests"])
+@needs_landlock
+@skip_without_landlock
 def test_i2_a_measured_axis_leaves_the_tree_as_found(leerie, tmp_path,
                                                     axis):
     t, before = _family_tree(tmp_path)
@@ -542,6 +573,8 @@ PY_TEST = (
     "    assert False\n")
 
 
+@needs_landlock
+@skip_without_landlock
 def test_i2_a_test_id_run_leaves_the_tree_as_found(leerie, tmp_path,
                                                    monkeypatch):
     """`_capture_failing_test_ids`: the report run itself; its pytest also
@@ -565,6 +598,8 @@ def test_i2_a_test_id_run_leaves_the_tree_as_found(leerie, tmp_path,
 
 
 @pytest.mark.parametrize("sub", ["", "pkg"])
+@needs_landlock
+@skip_without_landlock
 def test_i2_a_coverage_command_leaves_the_tree_as_found(leerie, tmp_path,
                                                        sub):
     """`_cov_contained`, in the worktree and in a recipe `working_dir`
@@ -594,6 +629,8 @@ def test_i2_a_coverage_command_leaves_the_tree_as_found(leerie, tmp_path,
 # runtime, so the bracket restores the write bit and still leaves the tree
 # as it found it; what it truly cannot remove stops the run, named.
 
+@needs_landlock
+@skip_without_landlock
 def test_i2_a_read_only_directory_does_not_keep_the_commands_output(
         leerie, tmp_path, monkeypatch):
     t, before = _family_tree(tmp_path)

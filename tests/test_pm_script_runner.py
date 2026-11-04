@@ -23,6 +23,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import (needs_landlock,
+                            skip_without_landlock)
+
 BARNACLE_SCRIPTS = {
     "test": "vitest run",
     "test:unit": "pnpm run test:inner -- --project unit",
@@ -128,6 +131,8 @@ def _state(leerie, tmp_path, tree):
 WANT = "src/password.test.ts :: every sample has a special other than - or _"
 
 
+@needs_landlock
+@skip_without_landlock
 def test_the_axis_ids_are_captured_through_the_script(leerie, tmp_path):
     """`_attach_failing_ids` on a red `pnpm run test` axis — the call that
     left `baseline_failing_ids` null in all three replay passes."""
@@ -144,6 +149,8 @@ def test_the_axis_ids_are_captured_through_the_script(leerie, tmp_path):
     assert res["failing_id_files"] == {WANT: "src/password.test.ts"}
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_nested_script_serial_capture_reaches_the_runner(leerie, tmp_path):
     tree = _tree(tmp_path, {"test": "pnpm run test:inner",
                             "test:inner": "vitest run"})
@@ -158,6 +165,8 @@ def test_a_nested_script_serial_capture_reaches_the_runner(leerie, tmp_path):
     assert got["messages"][WANT].startswith("AssertionError")
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_held_out_set_file_run_through_a_script_gets_its_cases(leerie,
                                                                  tmp_path):
     """The held-out runs go through the same resolution: a scoped template

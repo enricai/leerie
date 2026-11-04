@@ -26,6 +26,7 @@ from types import ModuleType
 import pytest
 
 from tests.conftest import (fake_claude_on_path, init_git_repo,
+                            needs_landlock, skip_without_landlock,
                             run_git_repo_first)
 
 
@@ -493,6 +494,10 @@ def _resolved_by_main(leerie: ModuleType, monkeypatch: pytest.MonkeyPatch,
     return seen["v"]
 
 
+# Every test here drives the real `main()` through to a confined
+# measurement, so all three need a kernel that can confine.
+@needs_landlock
+@skip_without_landlock
 class TestMainWiring:
     def test_default_is_off(self, leerie, monkeypatch, tmp_path):
         monkeypatch.delenv("LEERIE_STOP_ON_REPO_CHANGE", raising=False)

@@ -8101,19 +8101,38 @@ bound, both measured on the first full local run under `--timeout=600`:
   them where they run (the same opt-in `tests/test_work_read_only.py` and
   `tests/test_pinned_runtime_runs.py` use). On macOS the Colima VM reports
   ABI 4, so the real feature is reachable from a dev host.
-  Twelve tests were failing for want of this gate, in four files: the five
-  in `tests/test_bstar_confirm.py` that drive a real confined measurement,
-  the three in `tests/test_collect_subtrees_sh.py` whose integrator the
-  payload refuses to run unconfined, two in
+  Thirty-nine tests were failing for want of this gate, in seven files.
+  Twelve came first: the five in `tests/test_bstar_confirm.py` that drive a
+  real confined measurement, the three in
+  `tests/test_collect_subtrees_sh.py` whose integrator the payload refuses
+  to run unconfined, two in
   `tests/test_confinement_refusal_stops_the_run.py` that the file's own
-  `_HAS_LANDLOCK` already gated its other tests with, and
-  and three of the four in `tests/test_commands_keep_default_signals.py`,
-  which read a signal mask out of `/proc/self/status` through the `outside`
-  fixture (its `_report` raised `StopIteration` as a collection error
-  instead of saying why). Deliberately three and not the module: the fourth
-  derives the ignored-signal list from a fresh interpreter, reads no `/proc`
-  and passes on a macOS host, so a module mark would have skipped a test
-  that works.
+  `_HAS_LANDLOCK` already gated its other tests with, and three of the four
+  in `tests/test_commands_keep_default_signals.py`, which read a signal mask
+  out of `/proc/self/status` through the `outside` fixture (its `_report`
+  raised `StopIteration` as a collection error instead of saying why).
+  Deliberately three and not the module: the fourth derives the
+  ignored-signal list from a fresh interpreter, reads no `/proc` and passes
+  on a macOS host, so a module mark would have skipped a test that works.
+
+  Twenty-seven more came from the next file-widening, all of them a confined
+  install or measurement that a host without Landlock cannot run: twenty-one
+  of the twenty-nine in `tests/test_own_commands_leave_tracked_files.py`
+  (the other eight exercise the snapshot helpers and submodule handling and
+  need no kernel, so they stay running), three in
+  `tests/test_pm_script_runner.py`, and `TestMainWiring`'s three in
+  `tests/test_repo_change_warn_default.py`, which drive the real `main()`
+  through to a measurement. Every one of the twenty-seven failed with
+  `ConfinementRefused` and passes on Linux; eighteen of them had been
+  failing on macOS for some time, and three only started once
+  `install_seccomp` was fixed to raise `OSError` — before that the shim
+  tracebacked and the failure was swallowed, so those three had never
+  exercised their subject there at all.
+  `test_a_tracked_file_a_command_replaced_with_a_directory_is_put_back` is
+  gated per case (`pytest.param(..., marks=...)`, as
+  `tests/test_confined_terminal.py` gates its `isolate` parameter): only the
+  `edited` case runs a confined command, and a whole-function mark would
+  have skipped a passing one.
 - `_quiet_host_pressure`. The B* confirm gate waits up to
   `confirm_gate_wait_sec` (300 s) a confirm for the HOST's CPU pressure to
   fall below `confirm_psi_cpu_max`. Tests not about that gate inherited the
