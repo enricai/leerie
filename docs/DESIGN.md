@@ -12341,6 +12341,70 @@ target / 148 control items, frozen labels): F+ k=3 caught 23/31 =
 77.1% and 8/144 = 5.6%; with the re-ask, 24/31 and 13/148 (adjudicated
 28/35 and 9/144). One sample alone caught 19/31.
 
+**A probe that breaks another part of its own item is a contested reading,
+not a finding.** *Status: designed, not built — see the last paragraph.*
+An item is the classifier's one-sentence wording of a span of the source,
+with `parts`; the falsifier is handed the sentence and its `source_ref`
+only, and told not to reinterpret it from other documents. So it cannot
+see that the reading it asserts breaks another part of the same item, and
+nothing checks. Measured on barnacle a192d275 (leerie 0.44.3): the item
+paraphrased a report's "add `redirect` … **and/or** follow redirects inside
+`rawFetch` … **at minimum** return headers and the final URL" as "call
+onResponse for every hop", with the part "Default behavior for existing
+callers preserved"; the falsifier's confirmed probe required per-hop
+callbacks in the *default* mode — reachable only by changing the default —
+noted the ambiguity in its own reason, and was confirmed. The readings are
+not unachievable: an opt-in follow loop satisfies both, and barnacle
+48c48629 had built the default-mode loop once and rolled it back because
+it broke a control case for a caller-supplied manual redirect. Chasing
+one reading through the fix loop swings between shipping the gap and
+breaking the default. The design:
+
+1. *The classifier records what the source leaves open.* An item whose
+   span offers alternatives or a floor carries them typed —
+   `alternatives[]` (each a verbatim quote of the span) and `minimum`
+   (the span's own floor, quoted) — instead of collapsing them into one
+   sentence. Code checks each quote is a substring of the span's source,
+   as it checks every quote.
+2. *The falsifier gets the item whole.* Its input adds the item's `parts`,
+   `alternatives` and `minimum`, and the span's source text, and it
+   returns, besides the part it probes, `other_parts_held[]`: per other
+   part, whether its probe's asserted behaviour can coexist with that
+   part, with the quote. A sample whose probe is confirmed but which
+   reports another part it cannot coexist with is typed
+   `contested_reading` (`{item_index, probed_part, contested_part,
+   quotes}`), never `confirmed`.
+3. *A contested reading goes to the conflict path, not the fix loop.* It
+   is recorded with the contract judge's `conflict` verdicts and handed to
+   the re-drive as a typed note whose instruction is to find one design
+   that satisfies both parts (here: opt-in per-hop following, default
+   untouched), measured by the probe AND the part it contested. A group
+   that satisfies one by breaking the other is a trade (rule 5,
+   `trade_pairs`); the same pair twice is the re-drive's `conflict`, the
+   run `unconverged`, and the PR a draft that names both readings.
+
+**A report-pointer task's no-work confirmation includes the report's own
+repro, executed.** *Status: designed, not built.* The `no_work_judge`
+reads and never runs: in two runs on the same report (331df50b,
+81028d11) it confirmed "already fixed" having run nothing, one saying it
+had not read the report; in a192d275 the
+acceptance writers, shown the fixed tree first, wrote tests of the
+reading the tree already met, and every set was discarded as
+`fixed_on_head_by_execution`. When the defect-scope audit recorded a
+`ground_truth.repro_command`, a no-work confirmation is held until that
+command has run on HEAD under the settle-by-execution machinery, and the
+audit types the report's stated buggy outcome so code — not prose
+reading — decides whether HEAD still shows it; still showing it is a
+dispute with the run's own evidence.
+
+These two rules change what the falsifier and the classifier are given,
+and *What ships is what was measured* binds the falsifier's input to the
+frozen F+ bench: shipping either without re-benching would leave the Q2
+numbers describing a different worker. What remains: the classifier and
+falsifier schema fields and prompt text; the `contested_reading` gate and
+its routing into `contradictions`/`trade_pairs`; the typed repro outcome;
+and a bench of the falsifier on the Q2 corpora plus the a192d275 and
+48c48629 items, held to F+'s catch and false-unmet rates.
 
 **Delivery re-drive: unmet work goes back to the subtasks that own it.**
 Detection alone ships a PR that says what is missing; the next run then
