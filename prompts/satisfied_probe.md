@@ -85,6 +85,39 @@ The disciplines are unchanged either way: judge only the current
 checkout, cite concrete on-tree facts, and never return `true` on a
 criterion you did not actually verify present.
 
+## Criteria the orchestrator already decided by running them
+
+At the post-execution call site your payload may include
+`decided_by_execution`: criteria whose command the orchestrator itself
+just ran on this HEAD, each exiting 0. That command passes; that part is
+decided. **Do not run it again.** Your tree is read-only, so a test that
+writes a file fails there for that reason alone, and its failure says
+nothing about the criterion. Judge what a passing command cannot show:
+that the substance the criterion describes is on this tree (the test case
+was written, the code it exercises is present). If you find a gap, type
+it as usual. Use `cannot_verify` only when you genuinely could not check
+the substance either.
+
+Each criterion has an id: the seed (`success_criteria_seed`) is `seed`,
+and each entry of `criteria` carries its own (`criterion-1`, …), which
+its `decided_by_execution` entry repeats. When you answer
+`cannot_verify` here, say exactly which criteria, by id:
+
+- `unverifiable`: every criterion you could not check by reading this
+  tree. List the seed too when it is one of them.
+- `covered_by_execution`: every criterion that one command of
+  `decided_by_execution` exercises **in full**: every file, test case and
+  behaviour the criterion names, not only some of them. A command that
+  runs two of the twelve files a criterion names does not cover it; nor
+  does it cover the seed when the seed asks for more than that command
+  runs. List the seed when a passing command covers all of it.
+
+The orchestrator settles on its own passing commands only when every
+criterion in `unverifiable` is also in `covered_by_execution`; anything
+else re-runs the subtask. So never list a criterion as covered because
+its command passed: list it only when that command, read against the
+criterion's words, runs everything the criterion asks for.
+
 ## A sibling's pending work can invalidate an already-met criterion
 
 **This section applies only at the pre-schedule call site** (judging the
@@ -262,6 +295,12 @@ Return **only** a JSON object per your schema:
   equivalent coverage is still reported `true`): whether the criterion's
   substance is already on this tree under another name, with citing
   evidence.
+- `unverifiable` and `covered_by_execution` (only when your payload has
+  `decided_by_execution` and you answer `cannot_verify`): the ids of the
+  criteria you could not check by reading, and of those a passing command
+  exercises in full — see *Criteria the orchestrator already decided by
+  running them*. Under forced-fields mode on any other verdict, emit both
+  as empty lists.
 - `sibling_invalidation_risk` (set when `equivalent_coverage_exists` is
   `true`; under forced-fields mode, on any verdict where you did NOT
   actually check the siblings, use the inert `true` — a verified

@@ -4164,6 +4164,17 @@ SCHEMAS: dict[str, dict] = {
             # by the typed path — mirroring the prose rule that
             # `surviving_siblings` context only ever drives keeps.
             "sibling_invalidation_risk": {"type": "boolean"},
+            # Post-execution settle only (`decided_by_execution` in the
+            # payload; DESIGN §8 *A no-op a sibling already delivered is
+            # settled on evidence*): on `cannot_verify`, the ids (`seed`,
+            # `criterion-<n>`) of the criteria the probe could not check by
+            # reading, and of those a passing command exercises in full.
+            # `_execution_answers_cannot_verify` lets execution answer the
+            # verdict only when the first set is inside the second; both
+            # absent (or empty) leave `cannot_verify` standing.
+            "unverifiable": {"type": "array", "items": {"type": "string"}},
+            "covered_by_execution": {"type": "array",
+                                     "items": {"type": "string"}},
         },
     },
     "artifact_registry": {
@@ -18286,7 +18297,8 @@ async def _filter_satisfied_subtasks(
 async def _probe_criteria_satisfied_on_head(
     subtask: dict, worktree: str, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
-    label: str = "head",
+    label: str = "head", *, executed: dict | None = None,
+    verdict: dict | None = None,
 ) -> dict | None:
     """Run-branch-HEAD analogue of `_filter_satisfied_subtasks`'s per-subtask
     probe, asked before a plan-time-flagged provider-subset subtask spawns
@@ -18314,7 +18326,13 @@ async def _probe_criteria_satisfied_on_head(
     but still HEAD-only, never history-spanning git, via the same
     `SATISFIED_PROBE_TOOLS` scope. HEAD here is the same ref the mechanical
     commit-presence gate measures against, so the probe cannot false-positive
-    on code present only on an unrelated branch."""
+    on code present only on an unrelated branch.
+
+    `executed`, a `pass` record of `_settle_by_execution`, tells the probe
+    which criteria leerie's own execution decided, so it judges substance
+    and never re-runs them in its read-only tree (DESIGN §8 *A no-op a
+    sibling already delivered is settled on evidence*). `verdict`, when
+    given, receives the probe's raw output for the caller to type."""
     sid = subtask.get("id", "?")
     seed = (subtask.get("success_criteria_seed") or "").strip()
     if not seed:
@@ -18329,12 +18347,15 @@ async def _probe_criteria_satisfied_on_head(
             subtask.get("files_likely_touched", []) or []),
     }
     # The subtask's own per-criterion list, when the planner typed one:
-    # each must be met too, not only the seed's summary of them.
-    criteria = [v["criterion"] for v in (subtask.get("verify") or [])
-                if isinstance(v, dict) and isinstance(v.get("criterion"), str)
-                and v["criterion"].strip()]
+    # each must be met too, not only the seed's summary of them. Each has an
+    # id the verdict names it by (the seed's is `seed`).
+    criteria = [{"id": cid, "criterion": v["criterion"]}
+                for cid, v in _probe_criteria(subtask)]
     if criteria:
         payload["criteria"] = criteria
+    decided = _criteria_decided_by_execution(subtask, executed)
+    if decided:
+        payload["decided_by_execution"] = decided
     user_prompt = (
         "SUBTASK:\n" + json.dumps(payload, indent=2) +
         "\n\nReturn only the JSON object per your schema. Judge the "
@@ -18342,6 +18363,19 @@ async def _probe_criteria_satisfied_on_head(
         "history. Default satisfied=false on any uncertainty."
         + (" `satisfied` means the seed AND every entry of `criteria` are "
            "met." if criteria else "")
+        + (" Each entry of `decided_by_execution` is a criterion whose "
+           "command the orchestrator itself just ran on this HEAD, exiting "
+           "0: that command passes. Do not run it again — your tree is "
+           "read-only, and a test that writes fails there for that reason "
+           "alone. Judge only what a passing command cannot show: that the "
+           "substance the criterion describes is on this tree. On "
+           "`cannot_verify`, list in `unverifiable` the id of every "
+           "criterion (`seed` included) you could not check by reading "
+           "this tree, and in `covered_by_execution` the id of every "
+           "criterion (`seed` included) that one passing command exercises "
+           "in full: every file, case and behaviour the criterion names, "
+           "not only some of them."
+           if decided else "")
     )
     # bump_workers OUTSIDE the try, same as _filter_satisfied_subtasks: a
     # budget-exhaustion WorkerError must propagate to abort the run, not be
@@ -18385,6 +18419,8 @@ async def _probe_criteria_satisfied_on_head(
             f"({_brief_worker_exc(e)}); not rescuing "
             "(fail-safe — no-op stays retryable)")
         return None
+    if verdict is not None and isinstance(out, dict):
+        verdict.update(out)
     if out.get("satisfied") is True:
         return {
             "reason": "already_satisfied_mid_run",
@@ -63838,6 +63874,12 @@ def _verification_only(subtask: dict) -> bool:
     every listed criterion carries an executable argv."""
     if subtask.get("verification_only") is not True:
         return False
+    return _every_criterion_has_argv(subtask)
+
+
+def _every_criterion_has_argv(subtask: dict) -> bool:
+    """Whether `verify` lists at least one criterion and every one carries
+    an executable argv: no criterion is left that only a reader decides."""
     entries = subtask.get("verify")
     if not isinstance(entries, list) or not entries:
         return False
@@ -64037,6 +64079,78 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
     return _done()
 
 
+# The satisfied-probe's id for a subtask's `success_criteria_seed`; each
+# `verify` criterion's is `_probe_criteria`'s.
+_PROBE_SEED_ID = "seed"
+
+
+def _probe_criteria(subtask: dict) -> list[tuple[str, dict]]:
+    """`(id, entry)` for each `verify` entry that names a criterion, as the
+    satisfied-probe is shown them: `criterion-<n>`, counted from 1 over
+    those entries. The verdict names a criterion by this id
+    (`unverifiable`, `covered_by_execution`)."""
+    out: list[tuple[str, dict]] = []
+    for v in subtask.get("verify") or []:
+        if (isinstance(v, dict) and isinstance(v.get("criterion"), str)
+                and v["criterion"].strip()):
+            out.append((f"criterion-{len(out) + 1}", v))
+    return out
+
+
+def _criteria_decided_by_execution(subtask: dict,
+                                   executed: dict | None) -> list[dict]:
+    """`[{id, criterion, argv, exit: 0}]`: each `verify` criterion whose
+    argv the `pass` record `executed` ran and passed. Empty without a
+    pass."""
+    if not isinstance(executed, dict) or executed.get("verdict") != "pass":
+        return []
+    passed = [c.get("argv") for c in executed.get("commands") or []
+              if isinstance(c, dict) and c.get("passed") is True]
+    return [{"id": cid, "criterion": v["criterion"], "argv": list(v["argv"]),
+             "exit": 0}
+            for cid, v in _probe_criteria(subtask)
+            if v.get("argv") and v.get("argv") in passed]
+
+
+def _execution_decides_criteria(subtask: dict, executed: dict | None) -> bool:
+    """Whether leerie's own execution decided every criterion of `subtask`:
+    each `verify` entry carries an argv and the `pass` record `executed` ran
+    and passed every one. Then a probe that could not check them
+    (`cannot_verify`) has found no gap (DESIGN §8 *A no-op a sibling already
+    delivered is settled on evidence*)."""
+    if not _every_criterion_has_argv(subtask):
+        return False
+    decided = _criteria_decided_by_execution(subtask, executed)
+    return len(decided) == len(subtask.get("verify") or [])
+
+
+def _execution_answers_cannot_verify(subtask: dict, executed: dict | None,
+                                     verdict: dict) -> bool:
+    """Whether leerie's own execution answers a satisfied-probe that could
+    not check (DESIGN §8 *A no-op a sibling already delivered is settled on
+    evidence*): the verdict is `cannot_verify`; the `pass` record
+    `executed` decided every `verify` criterion
+    (`_execution_decides_criteria`); and every criterion the probe lists as
+    one it could not check by reading (`unverifiable`, at least one) is one
+    it says a passing command exercises in full (`covered_by_execution`).
+    A command decides only what it exercises, and only the probe can read a
+    criterion's prose against an argv, so it says so as typed ids; code
+    compares the sets. Any other shape — an old verdict without the two
+    lists, an id it does not know, a criterion it could not check that no
+    command covers in full — leaves the probe's `cannot_verify` standing."""
+    if (verdict.get("satisfied") is not False
+            or verdict.get("unsatisfied_reason") != "cannot_verify"
+            or not _execution_decides_criteria(subtask, executed)):
+        return False
+    unverifiable = verdict.get("unverifiable")
+    covered = verdict.get("covered_by_execution")
+    if (not isinstance(unverifiable, list) or not unverifiable
+            or not isinstance(covered, list)):
+        return False
+    known = {_PROBE_SEED_ID} | {cid for cid, _v in _probe_criteria(subtask)}
+    return set(unverifiable) <= (set(covered) & known)
+
+
 def _untracked_files(worktree: str | Path) -> set[str] | None:
     """The worktree's untracked, not-ignored files (the one listing,
     `_untracked_listing`), or None when git cannot say."""
@@ -64155,7 +64269,11 @@ async def _settle_nothing_to_change(
     file on this subtask's `files_likely_touched` (`_sibling_deliveries`);
     its `verify` argvs pass on HEAD (`_settle_by_execution`; `executed`
     reuses a pass this settle already made); and the base-tree-only
-    `satisfied_probe` finds its criteria met on HEAD."""
+    `satisfied_probe` finds its criteria met on HEAD — or, told which
+    criteria that execution decided, answers only `cannot_verify`, and every
+    criterion it could not check is one a passing command exercises in full
+    (`_execution_answers_cannot_verify`): a probe that could not check
+    found no gap, and does not overrule leerie's own pass."""
     if await _branch_has_commits_ahead(worktree,
                                        _compute_run_branch(st.run_id)):
         return None, "the subtask branch carries commits"
@@ -64176,22 +64294,37 @@ async def _settle_nothing_to_change(
         if ex["verdict"] != "pass":
             return None, ("not settled on evidence: a sibling changed its "
                           "surface, but " + _execution_blocker(ex))
+    out: dict = {}
     drop = await _probe_criteria_satisfied_on_head(
-        subtask, worktree, st, caps, models, efforts, label="settle")
+        subtask, worktree, st, caps, models, efforts, label="settle",
+        executed=ex, verdict=out)
+    by_execution = False
     if drop is None:
-        return None, ("not settled on evidence: a sibling changed its "
-                      "surface, but the satisfied-probe did not find its "
-                      "criteria met on HEAD")
+        # The probe could not check, and leerie's own execution decided
+        # every criterion it could not check, by a command that exercises
+        # all of it: no gap was found, so it does not overrule that pass.
+        # Any gap it found, or a criterion no command covers, re-drives.
+        by_execution = _execution_answers_cannot_verify(subtask, ex, out)
+        if not by_execution:
+            return None, ("not settled on evidence: a sibling changed its "
+                          "surface, but the satisfied-probe did not find its "
+                          "criteria met on HEAD")
+        drop = {"evidence": out.get("evidence", ""),
+                "checked": list(out.get("checked") or [])}
     by = ", ".join(f"{d['sid']} ({d['commit'][:12]})" for d in landed)
     log(f"  {sid}: nothing to change, and the run shows why — {by} changed "
         "its surface"
         + (", its verify commands pass," if ex is not None else ",")
-        + " and the satisfied-probe finds its criteria met on HEAD; "
-        "settling complete")
+        + (" and they decide every criterion the satisfied-probe could not "
+           "check (it found no gap)" if by_execution else
+           " and the satisfied-probe finds its criteria met on HEAD")
+        + "; settling complete")
     record = {"reason": "satisfied_by_sibling",
               "satisfied_by": landed,
               "evidence": drop.get("evidence", ""),
               "checked": list(drop.get("checked") or [])}
+    if by_execution:
+        record["decided_by"] = "execution"
     if ex is not None:
         record["executed"] = [shlex.join(c["argv"]) for c in ex["commands"]]
     return _settle_already_satisfied(

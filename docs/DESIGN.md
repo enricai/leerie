@@ -697,7 +697,10 @@ attempt between them) settles `unconverged`
 not burn the budget*). An `environment_limit` is retried in place once,
 then settled `unconverged`. A `nothing_to_change` is settled `complete` only
 when a sibling integrated this run changed its surface, its verify commands
-(if any) pass, and the satisfied-probe finds its criteria met; a
+(if any) pass, and the satisfied-probe finds its criteria met — or, when
+every criterion has a command and each passed, finds no gap and names no
+criterion it could not check that a passing command does not exercise in
+full; a
 `cannot_reproduce` with no commits is settled `complete` when its verify commands pass. In
 both, a verify execution that hits the environment limit settles
 `unconverged`; any other unmet check re-drives it. Every other blocked subtask is re-driven once its wave finishes,
@@ -13449,16 +13452,69 @@ settles `complete` only when all of these hold:
 3. **The `satisfied_probe` finds its criteria met on HEAD.** This is the
    base-tree-only probe the pre-spawn check already uses. It is given the
    `success_criteria_seed` and each `verify` criterion, and it defaults to
-   not satisfied.
+   not satisfied. It is also told which criteria check 2 just decided:
+   the command leerie ran for each and that it exited 0. The probe judges
+   what a command cannot — that the case was written, that the substance
+   is on the tree — and never whether the command passes: it cannot run
+   one in its read-only tree, and leerie already has. A verdict of
+   `cannot_verify` (the probe could not check) is not a gap found, so it
+   does not overrule leerie's own execution where that execution decided
+   what the probe could not check. A command decides only what it
+   exercises: a criterion over twelve files is not decided by a command
+   that runs two of them, however that command exits. Whether an argv
+   exercises everything a criterion names is a reading of the criterion's
+   words, which code cannot make (§12 *Language-to-JSON*), so the probe
+   says it as typed ids. Each criterion has one (the seed's is `seed`,
+   each `verify` criterion's `criterion-<n>`); on `cannot_verify` the
+   probe lists `unverifiable`, the criteria it could not check by
+   reading, and `covered_by_execution`, the criteria one passing command
+   exercises in full. The claim settles only when every `verify`
+   criterion carries an argv and every one passed in check 2, and every
+   `unverifiable` id is one leerie knows and is also in
+   `covered_by_execution`. A gap the probe finds (`artifact_missing`,
+   `behavior_gap`, `partially_met`, or no type at all) still re-drives;
+   so does `cannot_verify` on a subtask with any criterion no command
+   decides, with no `verify` argv at all, without the two lists, or with
+   a criterion it could not check that no passing command covers in full.
+   *Decided 2026-11-04 (review round 39, execution E1):* settling on any
+   one passing argv attached to a criterion settled the live
+   `bugfix-006` shape untrimmed. Its seed reads "each listed test file
+   passes" over twelve files, its one command runs two, and a sibling had
+   left the twelfth broken. Leerie's run of the two passed, the probe
+   could not run tests, and the subtask settled `complete`, so its
+   dependent ran on a broken file.
 
 Each check covers a gap in the others. The probe alone once settled `e33`
 on a reading of the tree. Execution alone settled `e33` too (bench E4/d4,
 `exec_v1`), because running a test file passes whether or not the new
 case was written. A criterion with no command is decided only by the
-probe. The sibling precondition holds the rest to the one case where an
+probe. A criterion a command exercises in full is decided by that
+command: the probe can find a gap in it, but not undo the pass by failing
+to check it. The
+sibling precondition holds the rest to the one case where an
 earlier wave can have done the work. A settle records `dropped_subtasks
 [sid]` with reason `satisfied_by_sibling`, the `satisfied_by` merges, the
-probe's evidence and the executed commands. It goes through the same
+probe's evidence and the executed commands, and `decided_by:
+"execution"` when the probe answered `cannot_verify`.
+
+*Designed 2026-11-04 (the live barnacle run `54fb56c3`, started on 0.43.0
+and resumed on 0.44.0).* Wave 3's `bugfix-004` changed the generator and
+files on the surface of `bugfix-006`, which was planned to migrate twelve
+test files off the old field.
+`bugfix-006` reported `nothing_to_change`; its sibling precondition held,
+and its verify command (`pnpm vitest run` over two of the files) passed
+when leerie ran it. The probe then ran the tests itself, eleven of twelve
+failed on a `mkdirSync` its read-only tree refused, and it answered
+`cannot_verify` ("I could not confirm 'migrated files pass'") while
+reporting the migration present in all twelve. That outvoted the pass on
+the first try and on both re-drives; `bugfix-006` settled `unconverged`,
+and its dependent `bugfix-010` settled `unconverged` without running. The
+probe's tree is read-only to it (§6 *A worker writes only where it is
+granted (I5)*): without a command verb in its tools it cannot run the
+command, and with one a test that writes fails there. Either way, for a
+criterion that reads "these tests pass", `cannot_verify` is its honest
+answer every time, so the three checks as first written could never
+settle that claim. It goes through the same
 helper and branch rules as every no-commit settle, so its zero-commit
 branch integrates as a no-op. Anything short of all three keeps the
 re-drive, and the reason it was not settled joins the blocker. A
@@ -17894,7 +17950,7 @@ prose:
 
 | `blocker_kind` | Routing |
 |---|---|
-| `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
+| `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there — or, when every criterion has a command and each passed, finds no gap, answering only `cannot_verify` with every criterion it could not check one a passing command exercises in full (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
 | `external_precondition` (+ `external_resource`, `external_resource_claim`) | the only kind that may be accepted, and only when code verifies the typed resource (below): settled `accepted_external` and listed under "Needs human verification"; a claim the check does not verify is `other`, except that the same claim unverified for an environmental reason on two blocked attempts in a row (no completed attempt between them) settles `unconverged` (`external_unverified`, below) |
 | `environment_limit` | retried in place once, then `unconverged` (the rule of §6 *At the measured ceiling, a resource kill is an environment limit*) |
 | `upstream_missing` | re-driven |

@@ -6247,6 +6247,29 @@ warning-only settle was rewritten). The wiring guards in
 `tests/test_mid_run_satisfied_no_commits.py` were rewritten to the new
 placement: the HEAD probe survives only before the implementer.
 
+`tests/test_settle_decided_by_execution.py` (6 test functions, 11 cases;
+DESIGN §8 *A no-op a sibling already delivered is settled on evidence*,
+check 3; the live 54fb56c3 bugfix-006 episode; review round 39, execution
+E1) builds the live repository shape (a `leerie: integrate bugfix-004`
+merge on the run branch) and drives the real `_settle_subtask` with the
+live execution record and probe verdict: the subtask settles `complete`
+with `decided_by: "execution"`, `_unconverged_predecessors(...,
+bugfix-010)` is empty, and the payload carries `decided_by_execution`
+with each criterion's id. `cannot_verify` counts only when execution
+decided everything the probe could not check (6 cases, each re-driven:
+`partially_met`, an untyped verdict, a criterion with no command, a
+verdict without the `unverifiable`/`covered_by_execution` lists, the seed
+uncovered, an unknown id). A control: a failing verify is re-driven
+twice, then settles unconverged and holds bugfix-010 back. A unit test
+of `_execution_decides_criteria`; a unit test of
+`_execution_answers_cannot_verify`'s set rule; and the E1 reproduction,
+untrimmed (12 files, an argv over 2, a file outside it broken, the probe's
+`covered_by_execution` empty), which must re-drive. Falsified
+(2026-11-04): the set rule replaced by `return True` fails the
+reproduction, the seed-uncovered and unknown-id cases and the unit test;
+and, before E1's fold, the `_execution_decides_criteria` condition
+removed failed the uncommanded-criterion case.
+
 `tests/test_spawn_held_enrollment.py` spawns real processes through
 `_run_streaming`: at the moment the broker would enroll, after a pause long
 enough for an unheld child to have finished, the command has not run; the

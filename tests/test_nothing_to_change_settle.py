@@ -184,7 +184,8 @@ def test_sibling_delivered_noop_settles_complete_in_one_pass(
     # The probe judges the subtask's own criteria, not only the seed.
     payload = json.loads(seen[0]["prompt"].split("SUBTASK:\n", 1)[1]
                          .split("\n\nReturn only", 1)[0])
-    assert payload["criteria"] == ["regression test passes"]
+    assert payload["criteria"] == [{"id": "criterion-1",
+                                    "criterion": "regression test passes"}]
     st = env["st"].data
     assert st["subtask_status"][SID] == "complete"
     drop = st["dropped_subtasks"][SID]

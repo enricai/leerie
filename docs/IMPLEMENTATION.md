@@ -5985,11 +5985,11 @@ above.
 |-------|---------|-----------|
 | `_validate_result()` — `incomplete-handoff` with missing checkpoint file | session-limit no-op; `--max-turns` with no checkpoint written; **worker reaped mid-turn** (e.g. an OOM-killed backgrounded build before the checkpoint was written) | **Rescued when the worktree holds commits, else Retryable** (`failure_kind="empty_handoff"`). `_settle_subtask` calls `_branch_has_commits_ahead` (True only when the worktree exists, git succeeds, and there are commits ahead of the run branch — distinct from `check_branch_has_commits`'s indeterminate `None`); if there are commits ahead, the worker produced a real deliverable and is settled `complete` (advisory conformance records whatever step didn't finish) instead of discarded — `fail()` would `_reset_subtask_worktree` and destroy the committed diff. Only a genuine no-op (no commits) stays retryable; a gone worktree / git failure is never mistaken for a real deliverable. Confidence gate and dirty-worktree fail are skipped for a rescued result. See DESIGN §9. |
 | `_validate_result()` — other cross-field invariants | `handoff` with null `checkpoint_path`; `blocked` with no blocker; `failed` with no summary; `needs-clarification` with no `clarification_question` / invalid `checkpoint_path` | **Terminal** (`failure_kind="broken"`) |
-| `check_branch_has_commits()` | `complete` claim, nothing committed *and* no `artifacts` returned. A non-empty `artifacts` array (DESIGN §5 *Artifact passing*) is a substitute deliverable — research-style subtasks pass without commits. | **Settled by execution when verification-only, else re-driven (DESIGN §8 *Settled by execution*).** A no-commits `complete` on a subtask `_verification_only(subtask)` holds for is settled by `_settle_by_execution`: a `pass` settles it `complete` through `_settle_already_satisfied` (`dropped_subtasks` reason `"settled_by_execution"`, the `conformance[sid]` sentinel); an `environment_limit` settles it `unconverged` (`_settle_unconverged(..., kind="environment_limit")`). A claim that is not verification-only is settled `complete` by `_settle_nothing_to_change` only on all three of its pieces of evidence: a sibling's integration merge on its `files_likely_touched`, its verify commands passing, and the HEAD satisfied-probe (`dropped_subtasks` reason `"satisfied_by_sibling"`). The probe never settles a claim alone. Any other outcome returns `status: "blocked"` with a typed blocker (`_execution_blocker`, or the unmet check), which the wave-end re-drive takes from the shared budget (§6 *Shared re-drive budget*). |
+| `check_branch_has_commits()` | `complete` claim, nothing committed *and* no `artifacts` returned. A non-empty `artifacts` array (DESIGN §5 *Artifact passing*) is a substitute deliverable — research-style subtasks pass without commits. | **Settled by execution when verification-only, else re-driven (DESIGN §8 *Settled by execution*).** A no-commits `complete` on a subtask `_verification_only(subtask)` holds for is settled by `_settle_by_execution`: a `pass` settles it `complete` through `_settle_already_satisfied` (`dropped_subtasks` reason `"settled_by_execution"`, the `conformance[sid]` sentinel); an `environment_limit` settles it `unconverged` (`_settle_unconverged(..., kind="environment_limit")`). A claim that is not verification-only is settled `complete` by `_settle_nothing_to_change` only on all three of its pieces of evidence: a sibling's integration merge on its `files_likely_touched`, its verify commands passing, and the HEAD satisfied-probe (`dropped_subtasks` reason `"satisfied_by_sibling"`); a probe answering only `cannot_verify` does not block when every `verify` entry has an argv and each passed and every criterion it lists `unverifiable` it also lists `covered_by_execution` (`_execution_answers_cannot_verify`; `decided_by: "execution"`). The probe never settles a claim alone. Any other outcome returns `status: "blocked"` with a typed blocker (`_execution_blocker`, or the unmet check), which the wave-end re-drive takes from the shared budget (§6 *Shared re-drive budget*). |
 | dirty worktree check | uncommitted changes that vanish on integration | **Retryable** |
 | `check_diff_scope()` | `.leerie/` or `.git/` in the diff; any `.claude/` path except `.claude/agents/`, `.claude/commands/`, `.claude/skills/` (the documented user-deliverable subtrees — never `settings.json` or a top-level `.claude/` file), each compared folded (`_path_fold`; the diff read with `-z`). Also a touched path present at `HEAD` that folds to a different path or directory of `HEAD`'s tree (`git ls-tree -r -z --name-only`), less pairs whose two spellings both were in the run branch's tree (`_fold_collisions(added, tree, before=)`); skipped when the run branch's tree cannot be listed | **Terminal** (protected path, fold collision); scope-volume warning is non-fatal (touched > max(3× expected, 5), or > 15 regardless) |
 | `_validate_checkpoint()` — on `incomplete-handoff` | required section missing/empty/whitespace/placeholder-only (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing punctuation ignored); a `## Files touched` path no longer exists and isn't flagged `[deleted]` | returns `blocked` |
-| `_route_blocker_kind()` — on `status` `blocked` or `failed` from the worker | worker self-report of a blocker or failure, typed `blocker_kind` | **Routed by the kind** (DESIGN §13 *A blocked implementer says why, as a type*): `external_precondition` with a named resource → `accepted_external` only when the code check verifies it (`_verify_external_claim`), otherwise retyped `other` and re-driven — except that the same claim (`check.claim`) returning `unverified` with `reason: "environment"` on the blocked attempt after one that did, with no completed attempt between them, settles `unconverged` (`_settle_unconverged(..., kind="external_unverified")`, reason naming the claim); `environment_limit` → one in-place retry, then `unconverged`; `cannot_reproduce` → settled by execution, else re-driven, and `unconverged` when that execution hits the environment limit; `nothing_to_change` → settled `complete` on evidence when a sibling delivered its surface, its verify commands (if any) pass and the satisfied-probe finds its criteria met (`_settle_nothing_to_change`, §6 *Sibling-delivered no-op*), else re-driven, and `unconverged` when that execution hits the environment limit; every other kind (and a missing one) → `blocked`, re-driven at wave end from the shared budget. A self-reported `failed` is no longer terminal. |
+| `_route_blocker_kind()` — on `status` `blocked` or `failed` from the worker | worker self-report of a blocker or failure, typed `blocker_kind` | **Routed by the kind** (DESIGN §13 *A blocked implementer says why, as a type*): `external_precondition` with a named resource → `accepted_external` only when the code check verifies it (`_verify_external_claim`), otherwise retyped `other` and re-driven — except that the same claim (`check.claim`) returning `unverified` with `reason: "environment"` on the blocked attempt after one that did, with no completed attempt between them, settles `unconverged` (`_settle_unconverged(..., kind="external_unverified")`, reason naming the claim); `environment_limit` → one in-place retry, then `unconverged`; `cannot_reproduce` → settled by execution, else re-driven, and `unconverged` when that execution hits the environment limit; `nothing_to_change` → settled `complete` on evidence when a sibling delivered its surface, its verify commands (if any) pass and the satisfied-probe finds its criteria met, or answers only `cannot_verify` when every criterion has a command and each passed and every criterion it could not check is one a passing command exercises in full (`_settle_nothing_to_change`, §6 *Sibling-delivered no-op*), else re-driven, and `unconverged` when that execution hits the environment limit; every other kind (and a missing one) → `blocked`, re-driven at wave end from the shared budget. A self-reported `failed` is no longer terminal. |
 
 `_validate_result()` accepts `complete` regardless of what
 `criteria_results` carries — empty, missing, or `met:false` entries are all
@@ -9166,14 +9166,38 @@ re-drive blocker. The checks run in order, and each one stops the rest:
    `_settle_by_execution`. `environment_limit` returns `_settle_unconverged
    (..., kind="environment_limit")`; any other non-`pass` verdict means not
    settled, with `_execution_blocker`.
-4. `_probe_criteria_satisfied_on_head(..., label="settle")` (worker log
-   `satisfied_probe-settle-<sid>`). Its payload now carries `criteria`, the
-   subtask's `verify[].criterion` strings, whenever any exist (this applies
-   to the pre-spawn probe too). None means not settled.
+4. `_probe_criteria_satisfied_on_head(..., label="settle", executed=ex,
+   verdict=out)` (worker log `satisfied_probe-settle-<sid>`). Its payload
+   now carries `criteria: [{id, criterion}]`, the subtask's
+   `verify[].criterion` strings with the ids `_probe_criteria(subtask)`
+   gives (`criterion-<n>`, counted from 1 over the entries that name a
+   criterion; the seed's id is `_PROBE_SEED_ID = "seed"`), whenever any
+   exist (this applies to the pre-spawn probe too). With `executed` a
+   `pass` record, the payload also carries `decided_by_execution: [{id,
+   criterion, argv, exit: 0}]`, one per `verify` criterion whose argv that
+   execution ran and passed (`_criteria_decided_by_execution(subtask,
+   executed)`; empty without a `pass`), and the prompt says the probe judges
+   substance only, never re-runs them, and on `cannot_verify` lists the
+   ids it could not check by reading (`unverifiable`) and those one
+   passing command exercises in full (`covered_by_execution`; both
+   optional string arrays in `SCHEMAS["satisfied_probe"]`). `verdict`, a
+   dict the caller passes, receives the probe's raw output. A drop record
+   settles. With None, the claim settles only when
+   `_execution_answers_cannot_verify(subtask, ex, verdict)` holds: the raw
+   verdict is `satisfied: false` with `unsatisfied_reason:
+   "cannot_verify"`; `_execution_decides_criteria(subtask, ex)` — `ex` is
+   a `pass` and every `verify` entry carries an argv
+   (`_every_criterion_has_argv`, the half of `_verification_only` that
+   checks the entries) that passed; `unverifiable` is a non-empty list and
+   `covered_by_execution` a list; and `set(unverifiable)` is inside
+   `set(covered_by_execution)` intersected with the known ids. Every other
+   None (another reason, none, missing lists, a crashed probe) means not
+   settled.
 
 A settle goes through `_settle_already_satisfied` with `dropped_subtasks
 [sid] = {reason: "satisfied_by_sibling", satisfied_by: [{sid, commit,
-files}], evidence, checked, executed?}`. Its summary names the siblings.
+files}], evidence, checked, executed?, decided_by?}`; `decided_by` is
+`"execution"` on the `cannot_verify` arm. Its summary names the siblings.
 The subtask's zero-commit branch integrates as a no-op.
 
 ### Spawn-held enrollment and measured sizing
