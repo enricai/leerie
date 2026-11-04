@@ -85,7 +85,7 @@ def test_a_failed_install_on_the_tree_that_ships_is_not_done(
     measured without its dependencies, so the diff is not taken; the
     decider names why."""
     async def axes(tree, axes_, st_, caps, **kw):
-        return {"tests": {"ran": True, "measured": True, "passed": False,
+        return {"tests": {"ran": True, "measured": False, "passed": None,
                           "command": "true", "deps_failed": True,
                           "summary": "install failed"}}
     monkeypatch.setattr(leerie, "_measure_axes", axes)

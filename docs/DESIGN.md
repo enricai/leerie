@@ -17347,9 +17347,20 @@ that side unmeasured, never "failed like the base":
   503 at staging's first install made: every later measurement carried
   the failure for the whole run, and a clean run listed "not measured on
   the tree that ships";
-- a `tests` measurement taken after a failed install carries
-  `deps_failed`, is never memoised (an outage is not a fact about the
-  tree), and gives the final diff no final side — the refresh lists "not
+- a measurement of any axis — build, lint or tests — taken after a failed
+  install is unmeasured: it carries `deps_failed`, is never memoised (an
+  outage is not a fact about the tree), and is neither red nor green to
+  every reader: the result is recorded unmeasured where it is made, and
+  every reader judges a result by one test that honours `deps_failed`, so
+  a baseline saved in run state before this rule (an axis `measured` and
+  `deps_failed` at once, counted in its saved red list) is read the same
+  way on resume, not trusted. A base build that fails for want of its dependencies is
+  not pre-existing (web 6f147a0c: the install failed, `build` failed with
+  `prisma: not found`, and the baseline counted `build` red, so a real
+  build regression on that run would have been forgiven as the base's), and
+  a final build that fails that way is no regression to chase; on the tree
+  that ships it is "not measured", never "failed". A `tests` measurement
+  so taken gives the final diff no final side — the refresh lists "not
   measured on the tree that ships" with that reason;
 - a baseline measured that way records no failing IDs (they would make
   every final failure the base's own), and the gap says the base was
