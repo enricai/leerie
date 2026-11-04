@@ -58,9 +58,8 @@ def _view(run) -> Path:
 
 def test_an_install_is_a_measurement_with_egress_and_nothing_more(leerie,
                                                                   run):
-    """Same paths, same env (so leerie's fetched stores stay read-only to
-    it, and its own tree stores and the verified stores are written as a
-    measurement's are); only `egress` differs."""
+    """Same paths, same env (the run's stores and its own tree stores
+    written, as a measurement's are); only `egress` differs."""
     st = _St(run["user"], run["run_dir"])
     for tree in (_view(run), run["wts"]["wt-a"]):
         m = leerie._measurement_grants(st, tree, leerie.MEASURE_KIND)
@@ -71,8 +70,8 @@ def test_an_install_is_a_measurement_with_egress_and_nothing_more(leerie,
         me, ie = dict(m.env), dict(i.env)
         assert me.pop("GNUPGHOME") != ie.pop("GNUPGHOME")
         assert (i.rw, i.ro, ie) == (m.rw, m.ro, me)
-        stores = str(run["state_root"] / ".stores" / "leerie")
-        assert stores in i.ro and stores not in i.rw
+        stores = str(run["run_dir"] / "stores")
+        assert stores in i.rw and stores not in i.ro
 
 
 def test_an_unknown_kind_is_refused(leerie, run):
@@ -205,13 +204,10 @@ def _names(fn: ast.AST, name: str) -> bool:
 
 def _install_runners(tree: ast.Module) -> dict[str, ast.AST]:
     """Every function that runs an install: it reads a recipe's install
-    entries or a CI check's prerequisites, and spawns. Leerie's own store
-    fetch reads install entries too, but runs only its own script-free
-    fetch (`STORE_FETCH_KIND`), never the entry's command."""
+    entries or a CI check's prerequisites, and spawns."""
     return {fn.name: fn for fn in _functions(tree)
             if _calls_a_runner(fn)
-            and (_reads_install_entries(fn) or _reads_prerequisites(fn))
-            and not _names(fn, "STORE_FETCH_KIND")}
+            and (_reads_install_entries(fn) or _reads_prerequisites(fn))}
 
 
 def test_every_install_leerie_runs_uses_the_install_kind():
@@ -250,13 +246,7 @@ def test_the_rule_flags_an_install_without_the_kind():
         "                grants=_measurement_grants(st, tree))\n"
         "async def prep(rec):\n"
         "    for p in rec.get('prerequisites') or []:\n"
-        "        await _ci_run(p['argv'], kind=INSTALL_KIND)\n"
-        "async def fetch(recipe, st, stage):\n"
-        "    for e in recipe:\n"
-        "        if e.get('kind') == 'install':\n"
-        "            await _run_streaming(['pnpm', 'fetch'],\n"
-        "                grants=_measurement_grants(st, stage,\n"
-        "                                           STORE_FETCH_KIND))\n")
+        "        await _ci_run(p['argv'], kind=INSTALL_KIND)\n")
     runners = _install_runners(ast.parse(src))
     assert sorted(runners) == ["deps", "prep"]
     assert [n for n, fn in runners.items()

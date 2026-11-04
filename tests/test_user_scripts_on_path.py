@@ -64,7 +64,7 @@ def test_every_caller_that_moves_the_base_moves_its_scripts(leerie, run,
                                                             tmp_path):
     base = {"PATH": "/usr/bin:/home/leerie/.local/bin"}
     stores = dict(base)
-    leerie._leerie_stores(stores, run["state_root"])
+    leerie._leerie_stores(stores, run["run_dir"])
     mine = stores["PYTHONUSERBASE"]
     # The orchestrator's own environment: its stores, never its PATH.
     assert stores["PATH"] == base["PATH"]
@@ -201,7 +201,7 @@ def test_nothing_sets_the_orchestrators_path(leerie, tmp_path):
     for arg in updates:
         value = eval(arg, vars(leerie))          # module constants only
         assert "PATH" not in value, arg
-    root = tmp_path / "state"
+    root = tmp_path / "state" / "runs" / "r1"
     for name, mutates in _ENVIRON_TAKERS.items():
         if not mutates:
             continue
@@ -218,7 +218,7 @@ def test_a_confined_command_outside_every_tree_gets_the_stores_scripts(
     """The store's user base scripts reach a confined command's own `PATH`
     (`_run_streaming`), not leerie's: a command whose cwd is no run tree."""
     env = dict(os.environ)
-    leerie._leerie_stores(env, run["state_root"])
+    leerie._leerie_stores(env, run["run_dir"])
     base = env["PYTHONUSERBASE"]
     assert f"{base}/bin" not in env["PATH"].split(os.pathsep)
     st = _St(run["user"], run["run_dir"])
@@ -227,7 +227,7 @@ def test_a_confined_command_outside_every_tree_gets_the_stores_scripts(
     log = tmp_path / "path.log"
     rc, _tail = asyncio.run(leerie._run_streaming(
         ["sh", "-c", 'echo "PATH=$PATH"'],
-        grants=leerie._measurement_grants(st, stage, leerie.STORE_FETCH_KIND),
+        grants=leerie._measurement_grants(st, stage),
         cwd=str(stage), env=env, timeout=60, log_path=log, label="path",
         verbosity="quiet"))
     assert rc == 0, log.read_text()

@@ -29,6 +29,14 @@ The orchestrator gives you, in your prompt:
 
 3. **Complete the merge commit** once all conflicts are resolved.
 
+**Never edit an installed third-party dependency.** What a package manager
+installed — `node_modules`, a virtual environment's `site-packages`, a
+`vendor` directory and the like — is not the repository's code: an edit
+there is not committed, is not what CI installs, and can reach other
+installs that share the same package store. Change the repository's own
+code instead, or, when a dependency itself must change, use the project's
+own patch mechanism and commit that.
+
 ## What runs after you exit — and what does not
 
 What runs against your merged tree: a `<<<<<<<` conflict-marker scan, a

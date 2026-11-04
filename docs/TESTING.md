@@ -6734,7 +6734,7 @@ sample's probe never counts for the next.
   read-only and unreadable directories, never follows a link, and reports a
   survivor; the real `main()`, run in its own process with `_orchestrate`
   making a worker's configuration (so the template), `measure/`,
-  `tree-stores/` and `.store-fetch/`, leaves none of them, nor the secret,
+  `tree-stores/` and the run's `stores/`, leaves none of them, nor the secret,
   however it ends — a return, a return with no copy of the credentials, a
   real `phase_finalize` whose dependency capture makes the template again
   (it is there after finalize, gone after the exit), a forked child's own
@@ -6867,14 +6867,32 @@ sample's probe never counts for the next.
   untracked `.gitignore` and the `helper.py` it hid are not measured, and
   nothing is shared in from the worker's tree: dependencies are leerie's
   install from the committed lockfile, build outputs leerie's build.
-- `tests/test_stores_are_leeries.py` (9 tests, DESIGN §6 *The stores a view
-  installs from are leerie's*): leerie's commands read only
-  `<state-root>/.stores/leerie/`, a worker only its run's caches, and no
-  tree leerie installs into, a view included, links into leerie's store:
-  every leerie install copies from it, so neither an in-place edit of a
-  hard-linked file in a worker's `node_modules` nor a committed
-  `postinstall` reaches the store or a view. Driven with a pnpm-like
-  stand-in installer.
+- `tests/test_stores_are_leeries.py` (5 test functions, 6 cases; DESIGN
+  §6 *The stores a view installs from are leerie's*): leerie's commands use
+  the run's own stores (`<run-dir>/stores/`), a worker only its run's
+  caches; a worker's poisoned cache does not reach a view; an in-place edit
+  by a committed `postinstall` reaches its own run's store and never another
+  run's view, whose store is its own. Driven with a pnpm-like stand-in
+  installer.
+- `tests/test_run_stores.py` (4 test functions, 6 cases; DESIGN §6 *The
+  stores a view installs from are leerie's*; the user's `web` run 6f147a0c
+  on 0.44.3): real pnpm 10.4.1, 10.28.2 and 11.21.0 (from the user's
+  corepack cache; skipped without it) install through `_measured_tree` →
+  `_ensure_worktree_deps` under the real Landlock grant and write the run's
+  store (10.28.2 its `v10/projects/` registry); an in-place, same-size,
+  mtime-restored edit of an installed file in one run is absent from the
+  next run's fresh install, the two stores sharing no inode; every
+  run-wide store variable (npm's `_logs` included) is written by a
+  measured command and by no worker; two runs never share a store.
+  Live-falsified 2026-11-04: with the run's stores read-only in the grant,
+  the three installs, the cross-run case and the write probe fail; with one
+  store shared by both runs, the cross-run case fails on the shared inodes
+  (real pnpm 10.4.1 served the clean file there, so the inode check is the
+  discriminator; the stand-in test in `test_stores_are_leeries.py` fails on
+  the content). 0.44.3's own `_ensure_worktree_deps` fails web's real
+  pnpm 10.28.2 install with `EACCES … symlink …
+  pnpm-store/v10/projects/<hash>` (container proof, DESIGN §6 *corepack
+  never floats*).
 - `tests/test_worker_confinement.py` (23 test functions, 27 cases, DESIGN
   §6 *A worker writes only where it is granted (I5)*): a real child confined by
   `scripts/landlock_exec.py` with the grants `_worker_grants` derives, on
@@ -7030,22 +7048,16 @@ sample's probe never counts for the next.
   The gate records its result. Against the code before the fix, 3 of the
   4 fail. The fourth, finished provisioning not being redone, holds there
   too, because nothing was ever redone.
-- `tests/test_confined_store_install.py` (9 test functions, 10 cases;
-  DESIGN §6 *A measurement pins pnpm's version*, *Which stores an install
-  may share*; review round 19 exec H2, H3 and M2). Under real Landlock with
-  `_measurement_grants`: a measured command reads a fetched store and
-  cannot write it, and writes a verified store, its tree's own stores and
-  the measurement's state and runtime directories (where pnpm keeps its
-  lock and db); a measured Python's user base is its tree's store, not
-  `$HOME`; measurements open pnpm's store frozen and the fetch does not,
-  `frozen_store` under pnpm 11's spelling only; every `npm_config_<k>` a
-  measurement, install or fetch environment carries is a key npm knows or
-  pnpm 10 reads (DESIGN §6 *pnpm's settings are spelled for the pnpm that
-  reads them*; falsified 2026-11-04: both fail on the parent's grant).
-  corepack is bounded and never floats; `_reads_package_manager`; the pin
-  is seeded only for a tree that pins no version (2 cases); two concurrent
-  fetches into one store each get their own staging directory and take
-  turns under the store's lock.
+- `tests/test_confined_store_install.py` (6 test functions; DESIGN §6
+  *The stores a view installs from are leerie's*, *corepack never floats*,
+  *pnpm's settings are spelled for the pnpm that reads them*; review round
+  19 exec H2). Under real Landlock with `_measurement_grants`: a measured
+  install writes the run's stores, its tree's own stores and the
+  measurement's state and runtime directories, and neither reads nor
+  writes another run's store; a measured Python's user base is its tree's
+  store, not `$HOME`; no measurement kind carries a package-manager
+  setting; every `npm_config_<k>` a measurement or install environment
+  carries is a key npm knows or pnpm 10 reads; corepack is bounded.
 - `tests/test_measurement_tmp.py` (18 test functions, 19 cases; DESIGN §6
   *A confined command's scratch is short and private*, *Every confined
   process has its own `/tmp`, `/dev/shm` and IPC*, *A confined command's
@@ -7272,14 +7284,14 @@ sample's probe never counts for the next.
 - `tests/test_install_reaches_inputs.py` (9 test functions; DESIGN §6 *An
   install reaches its inputs*; review round 22 execution H3). Anywhere:
   `INSTALL_KIND` is `MEASURE_KIND`'s grant with `egress` and nothing else
-  (leerie's fetched stores still read-only); the consumers executed — a
+  (the run's stores written, as a measurement's are); the consumers executed — a
   recipe's `install` entries get egress and its `build` entry none
   (`_ensure_worktree_deps`), CI parity's recipe install and prerequisites
   get it and its check none (`_ci_prepare`, `_ci_run`), a `settle_by:
   install` re-install gets it and a coverage run none (`_install_settles`,
   `_cov_contained`); a rule over `leerie.py`: every function that reads a
   recipe's install entries or a check's prerequisites and spawns names
-  `INSTALL_KIND` (leerie's own store fetch aside), and no other function
+  `INSTALL_KIND`, and no other function
   names it, with the rule checked on a synthetic module. In a runtime
   that can isolate: a pip recipe in a committed view installs from PyPI
   through leerie's real egress proxy, while its `build` entry and a plain

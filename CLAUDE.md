@@ -163,10 +163,9 @@ the rest of the family stay denied.
   lint, tests, install, the held-out sets, CI parity, coverage, `verify`,
   the setup hook, `mise`, the AST scripts — writes its tree, its
   measurement directory, its tree's private temp directory
-  (`/tmp/l/<id>/`, 0700, its `TMPDIR` and `XDG_CACHE_HOME`), the verified
-  caches and its tree's own stores, and by kind `MISE_DATA_DIR`,
-  `~/.local/bin` or (the store fetch alone) leerie's stores
-  (`_measurement_grants`, through `_run_streaming`, whose `grants` has no
+  (`/tmp/l/<id>/`, 0700, its `TMPDIR` and `XDG_CACHE_HOME`), the run's
+  stores and its tree's own stores, and by kind `MISE_DATA_DIR` or
+  `~/.local/bin` (`_measurement_grants`, through `_run_streaming`, whose `grants` has no
   default). No grant names `/tmp`: once the confinement check every entry
   runs (`_require_confinement`) has built a sandbox,
   every confined process has its own `/tmp`, `/dev/shm` and IPC
@@ -192,10 +191,10 @@ the rest of the family stay denied.
   run branch by the host-side bring-back; only leerie moves the run
   repository's refs. DESIGN §6 *The run's own repository*, *A repository
   per committing tree (I6)*.
-- **Every measurement runs in a committed view installed from leerie's
-  own stores,** never in a worker's tree. DESIGN §8 *Every measurement
-  reads the committed view*; §6 *The stores a view installs from are
-  leerie's*.
+- **Every measurement runs in a committed view installed from the run's
+  own stores,** never in a worker's tree, and no store is shared across
+  runs or repositories. DESIGN §8 *Every measurement reads the committed
+  view*; §6 *The stores a view installs from are leerie's*.
 - **Worker outputs are JSON-schema-validated.** New worker types must
   define a schema in the `SCHEMAS` dict in `orchestrator/leerie.py` and
   pass it via `--json-schema` in `claude_p()`.

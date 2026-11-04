@@ -430,7 +430,7 @@ def test_a_held_out_side_workers_cache_is_never_a_fixers(leerie, run):
 _PRIMITIVES = {
     "_open_dir_beneath", "_write_beneath", "_unlink_beneath",
     "_remove_beneath", "_rmdirs_beneath", "_copytree_beneath",
-    "_copy_out_of_tree", "_add_dir_bits_beneath", "_mkdir_private",
+    "_add_dir_bits_beneath", "_mkdir_private",
     "_rmtree_owned", "_own_private_dir",
 }
 _LEERIE_ONLY = {
@@ -451,9 +451,8 @@ _LEERIE_ONLY = {
     "_claude_config_template", "_worker_dirs", "_record_run_id_for_launcher",
     "_record_capture", "apply_captured_deps", "capture_repo_deps",
     "run_recapture_deps", "_build_repo_map", "_tree_sitter_extraction_works",
-    "_selfcheck_prepare", "_require_heldout_sandbox", "_leerie_stores",
-    "_store_fetch_lock", "_acquire_build_slot", "_mise_install_lock",
-    "_populate_leerie_store",
+    "_selfcheck_prepare", "_require_heldout_sandbox",
+    "_acquire_build_slot", "_mise_install_lock",
     "_sweep_measure_dirs", "_measure_dir_at", "_reap_idle_worktrees",
     "_reap_launcher_logs",
     "_acceptance_parse_probe", "_acceptance_parse_probe_run",

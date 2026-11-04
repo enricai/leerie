@@ -168,12 +168,13 @@ rename out|mv {wt}/app.py {rd}/stolen.py
 def test_the_runs_shared_caches_and_config_template(leerie, run):
     """The run's download caches are written by every worker; the CLI
     configuration template each worker's configuration links is read and
-    never written; leerie's own stores are neither."""
+    never written; the run's own stores (leerie's commands') are
+    neither."""
     rd = run["run_dir"]
     (rd / "workers" / "cache").mkdir(parents=True, exist_ok=True)
     (rd / "claude-config").mkdir()
     (rd / "claude-config" / "settings.json").write_text("{}\n")
-    stores = run["state_root"] / ".stores" / "leerie" / "pnpm-store"
+    stores = rd / "stores" / "pnpm-store"
     stores.mkdir(parents=True)
     g = _grants(leerie, run)
     got = _probe(leerie, g, f"""

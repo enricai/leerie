@@ -117,7 +117,7 @@ def copies(st):
     # Named here, not read from leerie: the list under test.
     if kind != "scratch_only":
         m._worker_dirs(st.run_dir, "s1", None)
-    for name in ("measure", "tree-stores", ".store-fetch"):
+    for name in ("measure", "tree-stores", "stores"):
         (st.run_dir / name / "x").mkdir(parents=True, exist_ok=True)
 
 
@@ -270,7 +270,7 @@ def test_no_copy_outlives_the_process_however_main_ends(tmp_path, home,
     run = Path(report["run_dir"])
     assert run.is_dir() or kind == "unhandled", (r.returncode, r.stderr[-2000:])
     for name in ("claude-config", "workers", "measure", "tree-stores",
-                 ".store-fetch"):
+                 "stores"):
         assert not os.path.lexists(run / name), (name, r.stderr[-2000:])
     assert _no_secret_under(run)
     if kind == "finalize":

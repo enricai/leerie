@@ -41,7 +41,7 @@ def stores_env(leerie, run, monkeypatch):
     them, with no inherited user base."""
     monkeypatch.delenv("PYTHONUSERBASE", raising=False)
     env: dict[str, str] = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
-    leerie._leerie_stores(env, run["state_root"])
+    leerie._leerie_stores(env, run["run_dir"])
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     return env

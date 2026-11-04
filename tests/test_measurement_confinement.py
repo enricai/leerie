@@ -28,7 +28,7 @@ def test_a_measured_command_works_in_its_own_tree(leerie, run):
     view = run["wts"][f"{run['run_dir'].name}-view-staging"]
     g = _measure(leerie, run, view)
     own = leerie._measure_dir(_state(run), view)
-    stores = run["state_root"] / ".stores" / "leerie"
+    stores = run["run_dir"] / "stores"
     stores.mkdir(parents=True, exist_ok=True)
     (stores / "pkg.txt").write_text("stored\n")
     got = _probe(leerie, g, f"""
@@ -37,6 +37,7 @@ write own dir|echo x > {own}/report.xml
 read tree|cat {view}/app.py
 git status|git -C {view} status --porcelain
 read store|cat {stores}/pkg.txt
+write the run store|echo x > {stores}/planted
 """, dict(g.env))
     assert all(got.values()), got
 
@@ -45,7 +46,7 @@ def test_a_measured_command_is_refused_the_runs_state(leerie, run):
     rd, w = run["run_dir"], run["wts"]
     view = w[f"{rd.name}-view-staging"]
     g = _measure(leerie, run, view)
-    stores = run["state_root"] / ".stores" / "leerie"
+    stores = run["state_root"] / "runs" / "another-run" / "stores"
     stores.mkdir(parents=True, exist_ok=True)
     cache = rd / "workers" / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -56,7 +57,7 @@ write held-out dir|echo x > {rd}/acceptance/new.py
 read state|cat {rd}/state.json
 write state|echo x >> {rd}/state.json
 write worker cache|echo x > {cache}/planted
-write store|echo x > {stores}/planted
+write another run store|echo x > {stores}/planted
 move run repo ref|git --git-dir={run['repo']} update-ref refs/heads/main HEAD
 write run repo refs|echo x > {run['repo']}/refs/heads/planted
 write tree repo|echo x > {rd}/tree-repos/staging/planted

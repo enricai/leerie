@@ -607,7 +607,7 @@ def test_the_converted_sites_read_only_beneath():
                "_read_idiomatic_pins", "_synth_mise_go_override",
                "_existing_mise_toml_path", "_infer_build_lint_test",
                "_js_runner_scoped_templates", "_package_json_name",
-               "_package_json_scripts", "_reads_package_manager",
+               "_package_json_scripts",
                "_ci_config_files", "_ci_check_problems", "_ci_coverage_pcts",
                "_prisma_project", "_prisma_reset_scripts",
                "_prisma_mock_hits", "_go_test_func_names",

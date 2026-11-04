@@ -42,20 +42,17 @@ def test_no_separate_store_mount_remains():
 
 def test_both_sets_of_stores_are_in_the_state_root(leerie, tmp_path):
     """In the state root, so in the state mount locally (`/leerie-state`)
-    and on the state volume on Fly (`/work/.leerie`), beside the worktrees:
-    a worker's install can hard-link from its cache, and leerie's own
-    installs copy from its store."""
+    and on the state volume on Fly (`/work/.leerie`), beside the worktrees,
+    so an install can hard-link from its run's store; and both are the
+    run's own, going with its run directory."""
     root = tmp_path / "state-root"
+    run_dir = root / "runs" / "r1"
     env: dict[str, str] = {}
-    leerie._leerie_stores(env, root)
-    wenv = leerie._worker_cache_env(env, root / "runs" / "r1")
+    leerie._leerie_stores(env, run_dir)
+    wenv = leerie._worker_cache_env(env, run_dir)
     for v in (env["npm_config_store_dir"], wenv["npm_config_store_dir"]):
-        assert Path(v).is_relative_to(root), v
-    # Leerie's is not in a run tree, which `leerie prune` and the reaper
-    # delete; a run's worker store is, and goes with it.
-    assert "/runs/" not in env["npm_config_store_dir"]
-    assert Path(wenv["npm_config_store_dir"]).is_relative_to(
-        root / "runs" / "r1")
+        assert Path(v).is_relative_to(run_dir), v
+    assert env["npm_config_store_dir"] != wenv["npm_config_store_dir"]
     (run_root,) = re.findall(r'run_dir = "([^"]+)/runs/" \+ run_id',
                              SEED_COMMON)
     assert run_root.rstrip("/") == "/work/.leerie"

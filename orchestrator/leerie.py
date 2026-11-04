@@ -6133,12 +6133,15 @@ def _git_hooks_on(env: Mapping[str, str]) -> dict[str, str]:
 
 
 # The package stores and caches an install reads (DESIGN §6 *The stores a
-# view installs from are leerie's*): variable -> directory name. Leerie's own
-# commands get `<state-root>/.stores/leerie/<name>` (`_leerie_stores`, set on
-# the orchestrator's environment in `main()`); the run's workers share
-# `<run-dir>/workers/cache/<name>` (`_worker_cache_env`). Every installer the provision recipe can name is covered:
-# pnpm, npm, yarn (classic and berry), bun, corepack, pip, uv, poetry,
-# pipenv, go, cargo, bundler, composer, dotnet.
+# view installs from are leerie's*): variable -> directory name. Every one is
+# the run's own: leerie's commands get `<run-dir>/stores/<name>`
+# (`_leerie_stores`, set on the orchestrator's environment in `main()` once
+# the run directory exists), written by every command leerie runs in the
+# run; the run's workers share `<run-dir>/workers/cache/<name>`
+# (`_worker_cache_env`). No store is shared across runs or repositories.
+# Every installer the provision recipe can name is covered: pnpm, npm, yarn
+# (classic and berry), bun, corepack, pip, uv, poetry, pipenv, go, cargo,
+# bundler, composer, dotnet.
 _STORE_VARS: dict[str, str] = {
     "npm_config_store_dir": "pnpm-store",
     "npm_config_cache_dir": "pnpm-cache",
@@ -6172,13 +6175,12 @@ _STORE_VARS: dict[str, str] = {
 _BAKED_ROOT = "/opt/"
 # pnpm 10 reads its settings only as `npm_config_<key>`, pnpm 11 only as
 # `pnpm_config_<key>` (measured: each ignores the other's spelling for
-# `store-dir` and `package-import-method`). Every pnpm setting leerie relies
-# on is set under both (`_with_pnpm_spellings`), or pnpm 11 reads none of
-# them: under the worker's write boundary it then falls back to a store
-# inside the worker's tree, which a worker commits (review round 18 exec
-# H2), and leerie's installs link from a store leerie does not own.
-_PNPM_SETTINGS = frozenset({"store_dir", "cache_dir",
-                            "package_import_method"})
+# `store-dir`). The store variables are set under both
+# (`_with_pnpm_spellings`), or pnpm 11 reads neither: under the worker's
+# write boundary it then falls back to a store inside the worker's tree,
+# which a worker commits (review round 18 exec H2), and leerie's installs
+# link from a store that is not the run's.
+_PNPM_SETTINGS = frozenset({"store_dir", "cache_dir"})
 
 
 def _with_pnpm_spellings(env: MutableMapping[str, str]) -> None:
@@ -6194,83 +6196,19 @@ def _with_pnpm_spellings(env: MutableMapping[str, str]) -> None:
             env[f"pnpm_config_{k}"] = v
 
 
-# Import modes that never expose a store's own inode in the tree installed
-# into, so no install — not even a committed `postinstall` editing
-# `node_modules` — can reach leerie's store (`_ensure_worktree_deps`, every
-# tree; DESIGN §6 *A view's install never writes leerie's store*). `copy`,
-# not `clone-or-copy`: pnpm 11 silently drops `clone-or-copy` (measured:
-# `pnpm config get package-import-method` reads `undefined`) and falls back
-# to its default, which hard-links; both generations read `copy`. uv's
-# `copy` is the same for its cache.
-_COPY_IMPORT_ENV: dict[str, str] = {
-    "npm_config_package_import_method": "copy",
-    "pnpm_config_package_import_method": "copy",
-    "UV_LINK_MODE": "copy",
-}
-class _StoreFetch(NamedTuple):
-    """How to fill leerie's store for one manager with no committed code."""
-    argv: tuple[str, ...]
-    lockfiles: tuple[str, ...]      # any one present means "fetchable"
-    stage: tuple[str, ...]          # data files copied into the staging dir
-    env: tuple[tuple[str, str], ...] = ()
-
-
-# Filling leerie's store from a lockfile with no project or dependency code
-# (DESIGN §6 *Which stores an install may share*). The fetch runs in a
-# staging directory holding only the data files it reads — never a committed
-# `.pnpmfile.cjs`, `.npmrc`, `.yarnrc.yml`, plugin or script — so the store
-# is written only by a process that runs no committed code. Each was
-# measured: the fetch ran no hook, and the real install then succeeded
-# against the store made read-only.
-_STORE_FETCH: dict[str, _StoreFetch] = {
-    "pnpm": _StoreFetch(("pnpm", "fetch", "--ignore-scripts"),
-                        ("pnpm-lock.yaml",),
-                        ("pnpm-lock.yaml", "package.json",
-                         "pnpm-workspace.yaml", "patches")),
-    "npm": _StoreFetch(("npm", "ci", "--ignore-scripts", "--no-audit",
-                        "--no-fund"),
-                       ("package-lock.json", "npm-shrinkwrap.json"),
-                       ("package.json", "package-lock.json",
-                        "npm-shrinkwrap.json")),
-    # Classic and berry alike, by environment (their flags differ). Measured:
-    # `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=0` each let
-    # the root `postinstall` run; these two values stop it in both.
-    "yarn": _StoreFetch(("yarn", "install"), ("yarn.lock",),
-                        ("package.json", "yarn.lock"),
-                        (("YARN_IGNORE_SCRIPTS", "true"),
-                         ("YARN_ENABLE_SCRIPTS", "false"))),
-    "bun": _StoreFetch(("bun", "install", "--ignore-scripts"),
-                       ("bun.lock", "bun.lockb"),
-                       ("package.json", "bun.lock", "bun.lockb")),
-    "go": _StoreFetch(("go", "mod", "download"), ("go.sum",),
-                      ("go.mod", "go.sum")),
-    "composer": _StoreFetch(("composer", "install", "--no-scripts",
-                             "--no-plugins", "--no-autoloader",
-                             "--no-interaction"),
-                            ("composer.lock",),
-                            ("composer.json", "composer.lock")),
-}
-# Stores no other tree may read, one set per tree (DESIGN §6 *Which stores
-# an install may share*): bundler and NuGet run committed code on every
-# command (the Gemfile; MSBuild targets on restore), so no fetch is free of
-# it; uv's install of the project, cargo's lock and Go's build cache write
-# the store as they build. Each also served an edited entry on reuse. Set,
-# for every command leerie runs in a tree under `<run-dir>/worktrees/`, to
+# The stores of one tree, one set per tree (DESIGN §6 *Which stores an
+# install may share*): where an install puts the tree's own environment
+# (pip's user base, bundler's path and home, pipenv's environments, the
+# .NET CLI home) and what the tree's build writes as it builds (uv's install
+# of the project, cargo's lock, Go's build cache, NuGet's restore, pnpm's
+# metadata cache). Two trees at two commits never share an environment, and
+# a view whose tip moves starts them empty. Set, for every command leerie
+# runs in a tree under `<run-dir>/worktrees/`, to
 # `<run-dir>/tree-stores/<tree>/<name>` (`_tree_store_env`).
 _TREE_STORE_VARS: frozenset[str] = frozenset({
     "UV_CACHE_DIR", "CARGO_HOME", "BUNDLE_PATH", "NUGET_PACKAGES",
     "GOCACHE", "WORKON_HOME", "npm_config_cache_dir", "PYTHONUSERBASE",
     "DOTNET_CLI_HOME", "BUNDLE_USER_HOME"})
-# Shared and writable by an install, because the manager refuses an edited
-# entry on reuse (measured): pip and poetry against the lockfile's or the
-# index's hash, berry against `yarn.lock`'s checksum.
-_VERIFIED_STORE_VARS: frozenset[str] = frozenset({
-    "PIP_CACHE_DIR", "POETRY_CACHE_DIR", "YARN_GLOBAL_FOLDER"})
-# Shared, filled only by `_STORE_FETCH`, read-only to every install.
-_FETCHED_STORE_VARS: frozenset[str] = frozenset({
-    "npm_config_store_dir", "npm_config_cache", "YARN_CACHE_FOLDER",
-    "BUN_INSTALL_CACHE_DIR", "COREPACK_HOME", "GOMODCACHE",
-    "COMPOSER_CACHE_DIR"})
 
 
 def _tree_stores_dir(cwd: str | Path | None) -> tuple[Path, Path] | None:
@@ -6347,58 +6285,19 @@ def _granted_tree_stores(grants: "WorkerGrants | None",
     return any(os.path.realpath(p) == real for p in (*grants.rw, *grants.ro))
 
 
-# corepack resolves pnpm's version from the repo's `packageManager`, else a
-# "last known good" it keeps in `COREPACK_HOME`, else — floating — the
-# newest on the registry. A measurement must never float: a confined install
-# reads leerie's store read-only, and pnpm 11 keeps a SQLite db in the store
-# and pnpm 10.28 writes a project ref into it, both of which a read-only
-# store refuses, while pnpm 10.4.1 installs against it cleanly (measured on
-# barnacle and funeralworks). So corepack is bounded (`_COREPACK_PIN_ENV`),
-# and when a tree pins no version leerie seeds this one as the known good
-# (`_PNPM_DEFAULT_PIN`): it reads the current `lockfileVersion: 9` lockfiles.
-_PNPM_DEFAULT_PIN = "10.4.1"
+# corepack resolves a manager's version from the repo's `packageManager`,
+# else a "last known good" it keeps in `COREPACK_HOME` (the run's own), else
+# — with `COREPACK_DEFAULT_TO_LATEST` unset — the newest on the registry,
+# and it may prompt before a download and write `packageManager` into the
+# tree's `package.json`. A command leerie runs never waits on a prompt,
+# never edits the tree it measures (I2) and never floats (DESIGN §6 *corepack
+# never floats*): these hold for every manager corepack runs, whatever its
+# version.
 _COREPACK_PIN_ENV: dict[str, str] = {
     "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
     "COREPACK_ENABLE_AUTO_PIN": "0",
     "COREPACK_DEFAULT_TO_LATEST": "0",
 }
-
-
-def _reads_package_manager(tree: str | Path, wd: str) -> bool:
-    """Whether `<tree>/<wd>/package.json` pins `packageManager` — which
-    corepack honours over the seeded default."""
-    try:
-        pj = json.loads(_read_text_beneath(
-            Path(tree), Path(tree) / wd / "package.json", errors="strict", limit=READ_LIMIT_CONFIG))
-    except (OSError, ValueError):
-        return False
-    return bool(isinstance(pj, dict) and pj.get("packageManager"))
-
-
-async def _seed_pnpm_pin(st: "State", stage: Path, log_path: Path,
-                         log_prefix: str) -> None:
-    """Seed `_PNPM_DEFAULT_PIN` as corepack's last-known-good pnpm in
-    `COREPACK_HOME`, so a tree that pins no `packageManager` resolves it
-    rather than the floating latest. Run like the store fetch it precedes:
-    through the task's forbid, confined to `stage` and leerie's stores
-    (`STORE_FETCH_KIND`), running no committed code. Best-effort."""
-    try:
-        argv = _blt_shell_argv(
-            ["corepack", "install", "-g", "pnpm@" + _PNPM_DEFAULT_PIN],
-            _forbidden_specs(st.data))
-    except ForbiddenByTask as ex:
-        log(f"  {log_prefix}: pnpm pin not seeded — {ex}")
-        return
-    try:
-        await _run_streaming(
-            argv, grants=_measurement_grants(st, stage, STORE_FETCH_KIND),
-            cwd=str(stage), env={**os.environ, **_COREPACK_PIN_ENV},
-            timeout=300, log_path=log_path,
-            label=f"corepack install -g pnpm@{_PNPM_DEFAULT_PIN}",
-            verbosity="quiet")
-    except Exception as ex:
-        log(f"  {log_prefix}: could not seed pnpm@{_PNPM_DEFAULT_PIN} "
-            f"({type(ex).__name__}) — corepack will resolve its own")
 
 
 def _with_user_scripts(env: MutableMapping[str, str],
@@ -6421,18 +6320,21 @@ def _with_user_scripts(env: MutableMapping[str, str],
     env["PATH"] = os.pathsep.join([*parts, new])
 
 
-def _leerie_stores(env: MutableMapping[str, str], state_root: Path) -> None:
-    """Point every `_STORE_VARS` variable of `env` at leerie's own store,
-    `<state-root>/.stores/leerie/<name>`, made here (a value beneath the
-    image's bake root `_BAKED_ROOT` is kept). Only leerie's commands
-    read or write them; a worker's environment replaces every one
-    (`_worker_cache_env`), so nothing a worker can write reaches them."""
-    root = Path(state_root) / ".stores" / "leerie"
+def _leerie_stores(env: MutableMapping[str, str], run_dir: Path) -> None:
+    """Point every `_STORE_VARS` variable of `env` at the run's own store,
+    `<run-dir>/stores/<name>` (`RUN_STORES_DIRNAME`), made here (a value
+    beneath the image's bake root `_BAKED_ROOT` is kept). Every command
+    leerie runs in the run reads and writes them, and nothing outside the
+    run does: no store is shared across runs or repositories (DESIGN §6
+    *The stores a view installs from are leerie's*). A worker's environment
+    replaces every one (`_worker_cache_env`), and no worker's grant names
+    them."""
+    root = Path(run_dir) / RUN_STORES_DIRNAME
     for var, name in _STORE_VARS.items():
         if (env.get(var) or "").startswith(_BAKED_ROOT):
             continue
         d = root / name
-        d.mkdir(parents=True, exist_ok=True)
+        _mkdir_private(d, Path(run_dir))
         env[var] = str(d)
     _with_pnpm_spellings(env)
     # Not `PATH`: this is the orchestrator's own environment, and leerie's
@@ -6453,14 +6355,12 @@ def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
     never a measurement, and nothing a held-out-side worker's processes
     leave reaches a fixer (DESIGN §8 *Nothing a held-out evaluation produces
     reaches a fixer*); a cold set costs a worker a download (measured on
-    funeralworks: Playwright's chromium 20 s and 656 MB). None of them is a
-    leerie store, and pnpm never links one store's file into another
-    (DESIGN §6 *The stores a view installs from are leerie's*)."""
+    funeralworks: Playwright's chromium 20 s and 656 MB). None of them is
+    the run's store leerie's commands use (DESIGN §6 *The stores a view
+    installs from are leerie's*)."""
     if cache is None:
         cache = Path(run_dir) / "workers" / "cache"
     out = {**env, **_cache_vars(env, cache)}
-    for k in _COPY_IMPORT_ENV:
-        out.pop(k, None)
     _with_pnpm_spellings(out)
     _with_user_scripts(out, env.get("PYTHONUSERBASE"))
     return out
@@ -12749,9 +12649,8 @@ def _remove_worker_dirs(run_dir: Path) -> bool:
 
 # What a run's process makes in the run directory for its own use and no
 # later process reads: the measurement directories, the trees' own stores,
-# the store fetch's staging and the ref-less clones' git directories (DESIGN §6 *No copy of the credentials
-# outlives its run's process*).
-STORE_FETCH_DIRNAME = ".store-fetch"
+# the run's stores and the ref-less clones' git directories (DESIGN §6 *No
+# copy of the credentials outlives its run's process*).
 # realpath(run_dir) -> (the `State` that holds its lock, by weak reference,
 # or None; the pid that registered it: a forked child that exits is not the
 # run's process).
@@ -12761,7 +12660,10 @@ _OWNED_RUN_DIRS: dict[str, tuple[Callable[[], object] | None, int]] = {}
 def _run_scratch_names() -> tuple[str, ...]:
     # The ref-less clones' git directories (`CLONE_GITS_NAME`) too: each
     # belongs to a disposable checkout a later process makes again.
-    return (MEASURE_DIRNAME, TREE_STORES_DIRNAME, STORE_FETCH_DIRNAME,
+    # The run's stores too: a resumed process installs again, cold, rather
+    # than every finished run keeping a store until it is pruned (DESIGN §6
+    # *The stores a view installs from are leerie's*).
+    return (MEASURE_DIRNAME, TREE_STORES_DIRNAME, RUN_STORES_DIRNAME,
             CLONE_GITS_NAME)
 
 
@@ -25407,10 +25309,6 @@ SETUP_HOOK_KIND = "setup_hook"
 TOOLCHAIN_KIND = "toolchain"
 # mise's cache, beneath `MISE_DATA_DIR`, for the kinds that write that.
 MISE_CACHE_NAME = "cache"
-# Leerie's own scripts-free store fetch (`_populate_leerie_store`): also
-# writes leerie's store, the one writer it has, and keeps its store
-# variables pointing there.
-STORE_FETCH_KIND = "store_fetch"
 # Every install leerie runs on a repository's code (a recipe's `install`
 # entries, CI parity's prerequisites, `_install_settles`): a measurement's
 # grant on disk, with the outside network through the egress proxy, so
@@ -25418,10 +25316,14 @@ STORE_FETCH_KIND = "store_fetch"
 # install reaches its inputs*).
 INSTALL_KIND = "install"
 MEASUREMENT_KINDS = (MEASURE_KIND, INSTALL_KIND, SETUP_HOOK_KIND,
-                     TOOLCHAIN_KIND, STORE_FETCH_KIND)
+                     TOOLCHAIN_KIND)
 MEASURE_DIRNAME = "measure"
 # Where `_tree_store_env` puts a run tree's own installer stores.
 TREE_STORES_DIRNAME = "tree-stores"
+# The run's own package stores (`_leerie_stores`): every command leerie runs
+# in the run reads and writes them (DESIGN §6 *The stores a view installs
+# from are leerie's*).
+RUN_STORES_DIRNAME = "stores"
 _MEASURE_ID_FILE = "leerie-measure-id"
 _MEASURE_ID_RE = re.compile(r"[0-9a-f]{16}")
 _MEASURE_SUBDIRS = ("mise-state", "reports", "coverage")
@@ -25437,7 +25339,7 @@ _PRIVATE_TMPS: dict[str, int] = {}
 # The run directory's entries no measured tree may hold or lie beneath:
 # granting such a tree would grant them.
 _MEASURE_PRIVATE = ("state.json", "acceptance", "logs", WORKERS_DIR,
-                    TREE_STORES_DIRNAME, "tmp",
+                    TREE_STORES_DIRNAME, RUN_STORES_DIRNAME, "tmp",
                     RUN_REPO_SETTINGS_NAME, TREE_REPOS_DIRNAME,
                     RUN_REPO_NAME, MEASURE_DIRNAME)
 
@@ -25720,34 +25622,6 @@ def _unlink_beneath(anchor: Path, path: Path) -> None:
             os.unlink(path.name, dir_fd=dfd)
     except FileNotFoundError:
         pass
-
-
-def _copy_out_of_tree(tree: Path, src: Path, names: Iterable[str],
-                      dest: Path) -> None:
-    """Copy each of `names` in `src` (beneath `tree`, which confined code
-    writes) into `dest`, leerie's own: a directory with its links copied
-    as links, a regular file as itself. A name that is a link, or a link on
-    the way to `src`, is never followed, and the name is skipped."""
-    try:
-        sfd = _open_dir_beneath(tree, src)
-    except (OSError, ValueError):
-        return
-    try:
-        for name in names:
-            try:
-                st_ = os.stat(name, dir_fd=sfd, follow_symlinks=False)
-            except OSError:
-                continue
-            if stat.S_ISDIR(st_.st_mode):
-                # Through the descriptor's own path: the directory reached,
-                # never one a link on the way names.
-                shutil.copytree(f"/proc/self/fd/{sfd}/{name}", dest / name,
-                                symlinks=True)
-            elif stat.S_ISREG(st_.st_mode):
-                shutil.copy2(f"/proc/self/fd/{sfd}/{name}", dest / name,
-                             follow_symlinks=False)
-    finally:
-        os.close(sfd)
 
 
 def _remove_beneath(anchor: Path, path: Path) -> None:
@@ -26135,20 +26009,19 @@ def _measurement_grants(st: "State", tree: str | Path,
                         kind: str = MEASURE_KIND) -> WorkerGrants:
     """THE grant of a command leerie runs on a repository's code (DESIGN §6
     *Leerie's runs of the repository's commands are confined too*): write
-    the tree and its measurement directory (`_measure_dir`), read its git
-    metadata (`_measured_git_reads`), leerie's stores, the run's mise
-    overrides and everything outside the state root. The installer stores
-    by class (DESIGN §6 *Which stores an install may share*): the fetched
-    stores read only, the verified ones (`_VERIFIED_STORE_VARS`) and the
-    tree's own (`<run>/tree-stores/<tree>/`, `_tree_store_env`) written.
+    the tree, its measurement directory (`_measure_dir`), the run's own
+    stores (`<run-dir>/stores/`, `_leerie_stores`) and the tree's own
+    (`<run-dir>/tree-stores/<tree>/`, `_tree_store_env`; DESIGN §6 *The
+    stores a view installs from are leerie's*, *Which stores an install may
+    share*); read its git metadata (`_measured_git_reads`), the run's mise
+    overrides and everything outside the state root.
     `INSTALL_KIND` is `MEASURE_KIND` with egress.
     `SETUP_HOOK_KIND` also writes `MISE_DATA_DIR` and `~/.local/bin`,
     `TOOLCHAIN_KIND` `MISE_DATA_DIR` with its trust records
-    (`MISE_STATE_DIR`) emptied first; `STORE_FETCH_KIND` leerie's stores
-    whole, the fetched stores' one writer. `env` points the command's temp
+    (`MISE_STATE_DIR`) emptied first. `env` points the command's temp
     and `XDG_CACHE_HOME` at the tree's private temp directory
     (`/tmp/l/<id>/`, `_private_tmp`) and its mise state at the measurement
-    directory; the store variables stay as leerie's environment and
+    directory; the store variables stay as `_leerie_stores` and
     `_tree_store_env` set them. `/tmp` itself is never granted: an isolated
     command's own is added by the shim (DESIGN §6 *Every confined process
     has its own `/tmp`, `/dev/shm` and IPC*)."""
@@ -26170,17 +26043,11 @@ def _measurement_grants(st: "State", tree: str | Path,
                 "*Leerie's runs of the repository's commands are confined "
                 "too*). Report this.")
     own = _measure_dir_at(run_dir, t, dirs)
-    stores = state_root / ".stores" / "leerie"
-    rw: list[str] = list(_WORKER_DEVICES) + [str(t), str(own)]
-    if kind == STORE_FETCH_KIND:
-        # The fetch runs no committed code: the fetched stores' one writer.
-        rw.append(str(stores))
-    else:
-        # The verified stores: shared and written by an install, because
-        # the manager refuses an edited entry on reuse.
-        rw += [os.environ[v] for v in sorted(_VERIFIED_STORE_VARS)
-               if os.environ.get(v)
-               and not os.environ[v].startswith(_BAKED_ROOT)]
+    # The run's own stores, which every command leerie runs in the run
+    # writes and no other run reads.
+    stores = run_dir / RUN_STORES_DIRNAME
+    _mkdir_private(stores, run_dir)
+    rw: list[str] = list(_WORKER_DEVICES) + [str(t), str(own), str(stores)]
     if t.parent == (run_dir / "worktrees").resolve():
         # The tree's own stores (`_tree_store_env`), which no other tree
         # reads.
@@ -26191,8 +26058,7 @@ def _measurement_grants(st: "State", tree: str | Path,
     # are: `/tmp` is not in the reads outside the state root, and either
     # may lie beneath it.
     home = os.path.realpath(os.environ.get("HOME") or Path.home())
-    ro: list[str] = [str(ROOT), str(stores),
-                     str(run_dir / MISE_OVERRIDES_NAME),
+    ro: list[str] = [str(ROOT), str(run_dir / MISE_OVERRIDES_NAME),
                      *_measured_git_reads(t, run_dir, dirs)]
     if not Path(os.path.realpath(SHARED_TMP)).is_relative_to(home):
         ro.append(home)
@@ -26236,34 +26102,15 @@ def _measurement_grants(st: "State", tree: str | Path,
     # imported is one a later install trusts (DESIGN §6 *A confined
     # command's scratch is short and private*).
     gnupg = tempfile.mkdtemp(prefix="gnupg-", dir=tmp)
-    # pnpm keeps a lock and (pnpm 11) a SQLite db under its state and runtime
-    # dirs; there they are writable while leerie's store stays read-only
-    # (DESIGN §6 *A measurement pins pnpm's version*).
     env = {"TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
            "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": tmp,
            "XDG_STATE_HOME": str(state), "XDG_RUNTIME_DIR": str(runtime),
            "GNUPGHOME": gnupg}
     if mise_cache is not None:
         env["MISE_CACHE_DIR"] = str(mise_cache)
-    if kind != STORE_FETCH_KIND:
-        # pnpm 11 opens its store's SQLite index read-write for every install
-        # and before every `pnpm <script>`, so against the read-only fetched
-        # store each failed (review round 19 exec H3). `frozen-store` is
-        # pnpm's own read-only mode for an immutable store: measured, a
-        # pnpm 11 install then succeeds against it and shares no inode with
-        # it, and pnpm 10.4.1 accepts both settings unchanged.
-        # `frozen-store` is pnpm 11's alone, so only pnpm 11's spelling: an
-        # `npm_config_frozen_store` no pnpm reads, and every npm a command
-        # runs warns about it (DESIGN §6 *pnpm's settings are spelled for
-        # the pnpm that reads them*). `verify-deps-before-run` is both
-        # generations', so both spellings (pnpm 10 reads `npm_config_*`).
-        env["pnpm_config_frozen_store"] = "true"
-        env["npm_config_verify_deps_before_run"] = "false"
-        env["pnpm_config_verify_deps_before_run"] = "false"
     # A measurement reaches nothing outside its own loopback; the kinds
-    # that fetch (an install, a toolchain, the setup hook, leerie's store
-    # fetch) reach the outside through the egress proxy (DESIGN §6 *A
-    # confined process has its own network*, *An install reaches its
+    # that fetch (an install, a toolchain, the setup hook) reach the outside
+    # through the egress proxy (DESIGN §6 *A confined process has its own network*, *An install reaches its
     # inputs*).
     return WorkerGrants(
         tuple(dict.fromkeys(_apart(rw, state_root))),
@@ -26274,15 +26121,11 @@ def _measurement_grants(st: "State", tree: str | Path,
 
 def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:
     """The grant of a held-out file's run in `tree` (DESIGN §6 *A held-out
-    evaluation runs alone*): `_measurement_grants`, with the verified
-    stores (`_VERIFIED_STORE_VARS`) read, not written — inside the sandbox
-    every mount but its own is read-only, and an evaluation installs
-    nothing."""
-    g = _measurement_grants(st, tree)
-    verified = {os.environ[v] for v in _VERIFIED_STORE_VARS
-                if os.environ.get(v)}
-    return g._replace(rw=tuple(p for p in g.rw if p not in verified),
-                      ro=g.ro + tuple(p for p in g.rw if p in verified))
+    evaluation runs alone*): `_measurement_grants`. It runs only in a
+    sandbox, which lays an overlay over every write grant — the run's
+    stores among them — so whatever the evaluation writes there vanishes
+    with it and reaches no later command."""
+    return _measurement_grants(st, tree)
 
 
 def _argv_outside_grant(argv: list[str],
@@ -45714,100 +45557,6 @@ _DEPS_INSTALLED: set[str] = set()
 _DEPS_FAILED: dict[str, int] = {}
 
 
-def _recipe_manager(command: list[str] | None) -> str | None:
-    """The package manager a recipe entry's command runs, when it has a
-    `_STORE_FETCH` entry, else None: the first token of the list argv."""
-    return (command[0] if command and command[0] in _STORE_FETCH else None)
-
-
-@contextlib.asynccontextmanager
-async def _store_fetch_lock(st: "State"):
-    """Serialise every fetch into leerie's stores, across this process's
-    coroutines and across runs of the same repository (review round 19 exec
-    M2): an exclusive `flock` on `<state-root>/.stores/leerie/.fetch.lock`,
-    taken in a thread so the event loop keeps running."""
-    lock = _run_dir_of(st).parent.parent / ".stores" / "leerie" / ".fetch.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-
-
-async def _populate_leerie_store(tree: str, st: "State", caps: dict, *,
-                                 log_path: Path, label_prefix: str,
-                                 log_prefix: str) -> None:
-    """Fill leerie's store from each install entry's lockfile, running no
-    committed code (DESIGN §6 *A view's install never writes leerie's
-    store*). For each distinct (manager, working_dir) in the recipe whose
-    manager has a `_STORE_FETCH` entry, copy that entry's data files (the
-    lockfile and manifest — never `.pnpmfile.cjs`, `.npmrc` or a script)
-    into a run-private staging directory and run the fetch there, with
-    leerie's own store on the environment. Best-effort: a fetch that fails
-    leaves the install to populate what it can, and the install's
-    copy-import still keeps it off the store's inodes."""
-    recipe = (st.data.get("provision") or {}).get("recipe") or []
-    seen: set[tuple[str, str]] = set()
-    for e in recipe:
-        if e.get("kind") != "install":
-            continue
-        mgr = _recipe_manager(e.get("command"))
-        if mgr is None:
-            continue
-        wd_rel = e.get("working_dir") or "."
-        if (mgr, wd_rel) in seen:
-            continue
-        seen.add((mgr, wd_rel))
-        spec = _STORE_FETCH[mgr]
-        src = Path(tree) / wd_rel
-        if not any((src / lf).is_file() for lf in spec.lockfiles):
-            continue
-        # Each fetch its own staging directory: a name shared by manager and
-        # working dir let concurrent fetches remove each other's (review
-        # round 19 exec M2).
-        base = st.run_dir / STORE_FETCH_DIRNAME
-        base.mkdir(parents=True, exist_ok=True)
-        stage = Path(tempfile.mkdtemp(
-            prefix=_CGROUP_NAME_UNSAFE_RE.sub("-", f"{mgr}-{wd_rel}-"),
-            dir=base))
-        _copy_out_of_tree(Path(tree), src, spec.stage, stage)
-        try:
-            # A fetch is leerie's own, but the task's forbid binds it too
-            # (DESIGN §9): a forbidden fetch is skipped, and the install that
-            # follows still copies.
-            argv = _blt_shell_argv(list(spec.argv), _forbidden_specs(st.data))
-        except ForbiddenByTask as ex:
-            log(f"  {log_prefix}: store fetch not run — {ex}")
-            await asyncio.to_thread(_rmtree_owned, stage)
-            continue
-        try:
-            async with _store_fetch_lock(st):
-                if mgr == "pnpm" and not _reads_package_manager(tree, wd_rel):
-                    await _seed_pnpm_pin(st, stage, log_path, log_prefix)
-                # Confined to its stage directory and leerie's store, the one
-                # writer the store has (DESIGN §6 *Leerie's runs of the
-                # repository's commands are confined too*).
-                rc, _tail = await _run_streaming(
-                    argv, grants=_measurement_grants(st, stage, STORE_FETCH_KIND),
-                    cwd=str(stage),
-                    env={**os.environ, **dict(spec.env)} if spec.env else None,
-                    timeout=caps.get("worker_timeout_sec"), log_path=log_path,
-                    label=f"{label_prefix}-store-fetch: {' '.join(spec.argv)}",
-                    verbosity="quiet")
-                if rc != 0:
-                    log(f"  {log_prefix}: store fetch exited {rc} "
-                        f"({mgr} in {wd_rel}) — the install will populate it")
-        except Exception as ex:  # best-effort: the install still copies
-            log(f"  {log_prefix}: store fetch error "
-                f"({type(ex).__name__}): {mgr} in {wd_rel}")
-        finally:
-            await asyncio.to_thread(_rmtree_owned, stage)
-
-
 async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                                 log_path: Path, verbosity: str,
                                 label_prefix: str = "baseline",
@@ -45853,16 +45602,10 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     _DEPS_INSTALLED.add(key)
     ok = True
     recipe = (st.data.get("provision") or {}).get("recipe") or []
-    # The store is filled first, from the lockfile, running no committed code
-    # (`_populate_leerie_store`); the install below then runs the repository's
-    # own install — including its `postinstall` — but copies every package
-    # from the store (`_COPY_IMPORT_ENV`), so no file it writes shares an
-    # inode with the store and no `postinstall` can poison it, in this tree,
-    # a later view or a later run (DESIGN §6 *A view's install never writes
-    # leerie's store*; review round 18 H1).
-    await _populate_leerie_store(tree, st, caps, log_path=log_path,
-                                 label_prefix=label_prefix,
-                                 log_prefix=log_prefix)
+    # The repository's own install, as the repository runs it — its
+    # manager's defaults, its `postinstall` — against the run's own stores,
+    # which it writes and no other run reads (DESIGN §6 *The stores a view
+    # installs from are leerie's*).
     # In a committed view, the install's own outputs: the ignored paths its
     # `install` entries make — in a view moved with its install kept, the
     # ones that install made, still there (`_DEPS_KEPT`) — and their state
@@ -45914,15 +45657,7 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
             # PATH etc.
             entry_env = ({**os.environ, **e["env"]} if e.get("env")
                          else None)
-            entry_env = {**(entry_env or os.environ), **_COPY_IMPORT_ENV}
             command = list(e["command"])
-            # bun hard-links from its cache by default and reads its backend
-            # only from the command line (measured: no environment variable
-            # moves it), so a bun install copies through the flag.
-            if (command[:1] == ["bun"] and command[1:2] in (["install"],
-                                                            ["i"])
-                    and not any(a.startswith("--backend") for a in command)):
-                command.append("--backend=copyfile")
             try:
                 # A recipe entry is a repo command: the task's forbid binds it
                 # too (DESIGN §9 *Recipe install steps fall under the forbid
@@ -71340,11 +71075,8 @@ def main() -> int | None:
     leerie_root = resolve_leerie_root(repo_root)
     leerie_root.mkdir(parents=True, exist_ok=True)
     (leerie_root / "runs").mkdir(parents=True, exist_ok=True)
-    # Before any install: leerie's commands read only leerie's stores
-    # (DESIGN §6 *The stores a view installs from are leerie's*), and
-    # corepack never floats pnpm's version (DESIGN §6 *A measurement pins
-    # pnpm's version*).
-    _leerie_stores(os.environ, leerie_root)
+    # corepack never prompts, pins or floats (DESIGN §6 *corepack never
+    # floats*).
     os.environ.update(_COREPACK_PIN_ENV)
     if args.resume:
         run_id = resolve_run_id(leerie_root, args.run_id, resumable_only=True)
@@ -71409,6 +71141,10 @@ def main() -> int | None:
     _record_run_id_for_launcher(st.run_id)
     for sub in ("", "subtasks", NOTES_DIRNAME, "logs"):
         (st.run_dir / sub).mkdir(parents=True, exist_ok=True)
+    # Before any install: every command leerie runs installs into the run's
+    # own stores, which no other run reads (DESIGN §6 *The stores a view
+    # installs from are leerie's*).
+    _leerie_stores(os.environ, st.run_dir)
 
     # Persist the orchestrator's own stdout/stderr to
     # <run_dir>/orchestrator.log now that the run dir exists (DESIGN §6).

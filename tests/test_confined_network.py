@@ -315,8 +315,7 @@ def test_kinds_that_fetch_get_egress_and_a_measurement_does_not(leerie, run):
            for k in leerie.MEASUREMENT_KINDS}
     assert got == {leerie.MEASURE_KIND: False, leerie.INSTALL_KIND: True,
                    leerie.SETUP_HOOK_KIND: True,
-                   leerie.TOOLCHAIN_KIND: True,
-                   leerie.STORE_FETCH_KIND: True}
+                   leerie.TOOLCHAIN_KIND: True}
     assert leerie._heldout_grants(st, view).egress is False
     for key in ("implementer", "classifier", "integrator"):
         assert _grants(leerie, run, schema_key=key).egress is True

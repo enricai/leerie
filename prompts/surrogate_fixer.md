@@ -17,6 +17,9 @@ the files the task references; read it in full first, then the code it names.
 3. Do not commit. Leave your changes in the working tree. Modify no file the
    task references (the report), and never push or reset a database schema
    yourself.
+4. Never edit an installed third-party dependency (`node_modules`, a virtual
+   environment's `site-packages`, a `vendor` directory and the like): change
+   this repository's own code, or use the project's own patch mechanism.
 
 Return only the JSON object per your schema: `summary` (what you changed and
 why) and `files_changed` (repository-relative paths).

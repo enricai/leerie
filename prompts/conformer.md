@@ -168,6 +168,14 @@ commit back — the prefix is an observability signal, not a strict
 gate. Group related fixes into a single commit where it makes sense;
 one commit per fix is also fine.
 
+**Never edit an installed third-party dependency.** What a package manager
+installed — `node_modules`, a virtual environment's `site-packages`, a
+`vendor` directory and the like — is not the repository's code: an edit
+there is not committed, is not what CI installs, and can reach other
+installs that share the same package store. Change the repository's own
+code instead, or, when a dependency itself must change, use the project's
+own patch mechanism and commit that.
+
 You may not modify `LEERIE_DIR/notes/<id>/criteria.md`. The file is the
 implementer's success-criteria notes (DESIGN §9, informational); it is
 your input, not yours to edit. The orchestrator does not gate on its

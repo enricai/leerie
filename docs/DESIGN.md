@@ -1853,8 +1853,8 @@ return that was neither: each no-work exit of planning, the template
 dep-capture makes again after finalize removed it, and the rebaser's on
 the host (review round 19 claims H1, exec M1). The same exit removes the
 run's other per-process scratch: the measurement directories
-(`measure/`), the trees' own stores (`tree-stores/`), the store
-fetch's staging (`.store-fetch/`) and the ref-less clones' git directories
+(`measure/`), the trees' own stores (`tree-stores/`), the run's stores
+(`stores/`) and the ref-less clones' git directories
 (`clone-gits/`), which nothing reads once the process is gone (review
 round 19 exec L2). The auto-resume after a rate limit
 replaces the process image (`os.execv`), which runs no exit handlers, so
@@ -2537,9 +2537,9 @@ directory is granted only when it lies beneath `<run-dir>/workers/`
 grants nothing. The caches are granted as the one directory its side
 shares, and nothing a worker's caches name outside it is: `/tmp/.cache`, the image's
 `MISE_DATA_DIR`, `/opt/venv`, `/opt/bundle`, `/opt/cargo-target`,
-`/opt/go-cache` and leerie's own stores `<state-root>/.stores/leerie/` are
-never granted, so no store leerie's own commands install from can be
-written by a worker. The grants are computed after `claude_p` has named
+`/opt/go-cache` and the run's stores `<run-dir>/stores/` are never
+granted, so no store leerie's own commands install from can be written by
+a worker. The grants are computed after `claude_p` has named
 the worker's own directories, and follow them.
 
 **A worker's `/tmp` is its own.** Until 2026-11-01 `/tmp` was shared by
@@ -3866,14 +3866,12 @@ confinement failure stops the run; it is never a result*).
 | `/tmp`, `/dev/shm` | the command's own, made by the shim, every kind, every tree (*Every confined process has its own `/tmp`, `/dev/shm` and IPC*) | read and write |
 | leerie's install, the home | `ROOT` (the AST scripts), `HOME` (unless it holds `/tmp`), named as a worker's are | read |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
-| leerie's stores | `<state-root>/.stores/leerie/`: the fetched stores (*Which stores an install may share*) | read |
-| the verified stores | what `PIP_CACHE_DIR`, `POETRY_CACHE_DIR` and `YARN_GLOBAL_FOLDER` name (`_VERIFIED_STORE_VARS`): the manager refuses an edited entry on reuse | write (read only in a held-out run's grant, `_heldout_grants`: an evaluation installs nothing) |
+| the run's stores | `<run-dir>/stores/` (`_leerie_stores`): every store variable's run-wide directory (*The stores a view installs from are leerie's*) | write |
 | the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
 | outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
 | *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR`; `mise-state/` emptied first | write |
-| *store-fetch kind* (`_populate_leerie_store`, in its staging directory) | also leerie's store, its store variables left pointing there | write |
 | *install kind* (every install leerie runs: a recipe's `install` entries, CI parity's prerequisites, `_install_settles`) | nothing more on disk; the outside network through the egress proxy (*A confined process has its own network*, *An install reaches its inputs*) | — |
 
 Nothing else is granted: not `state.json`, `acceptance/`, `logs/`,
@@ -3913,24 +3911,23 @@ run's report never lands there at all.
 `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` point at the tree's private
 temp directory and `MISE_STATE_DIR` at the measurement directory, laid
 over the caller's environment last. The store
-variables stay as leerie's environment (`_leerie_stores`) and
-`_tree_store_env` set them, each in the class the grant writes or reads.
+variables stay as `_leerie_stores` and `_tree_store_env` set them, each
+where the grant writes.
 A recipe entry's or a CI check's own variables still apply; a temp or cache
 path they name outside the grant is refused, which is a finding, not a
 grant to widen. A fixed `/tmp/<name>` path is not: every command writes
 its own `/tmp` as it would outside leerie.
 
-**Leerie's stores, by class.** The fetched stores under
-`<state-root>/.stores/leerie/` (`_FETCHED_STORE_VARS`) are written by
-leerie's own scripts-free fetch alone (`_populate_leerie_store`, the
-store-fetch kind: no repository code runs there) and read only by every
-other measurement; a confined install copies from them
-(`_COPY_IMPORT_ENV`). The verified stores are written by installs, which a
-manager that refuses an edited entry makes safe to share. The tree's own
-stores are written by that tree's commands and read by no other tree; they
-follow the measurement directory's lifetime: a tree made again at the same
-path starts with them empty (`_measure_dir`). No worker is granted any of
-them.
+**The run's stores and the tree's.** The run's stores (`<run-dir>/stores/`)
+are written by every command leerie runs in the run and read by no other
+run (*The stores a view installs from are leerie's*). The tree's own stores
+are written by that tree's commands and read by no other tree; they follow
+the measurement directory's lifetime: a tree made again at the same path
+starts with them empty (`_measure_dir`). No worker is granted any of them.
+A held-out evaluation's grant names the run's stores too, but inside its
+sandbox every write grant is an overlay whose writes vanish with it (*A
+held-out evaluation runs alone*), so nothing it writes there reaches a
+later command.
 
 **The setup hook is the user's code, run once before any worker.**
 `.leerie-setup.sh` runs in phase 1½, in a throwaway checkout of the
@@ -4594,8 +4591,7 @@ Whether a version needs shims of its own was measured rather than assumed
 (leerie 0.44.1 image, a tree whose `.nvmrc` says 22.19.0, a confined
 measurement): bare `pnpm` and `corepack` in that tree are the pinned
 version's (§6½ *A repository's pinned runtime is the one its commands
-run*), as are `mise exec -- pnpm` and leerie's pnpm pin seed
-(`_seed_pnpm_pin`'s bare `corepack`): `pnpm` is that version's corepack,
+run*), as is `mise exec -- pnpm`: `pnpm` is that version's corepack,
 still at the pinned pnpm (10.4.1), with `pnpm exec node` at 22.19.0.
 Without its own shims a pinned version would silently borrow the baked
 Node's corepack. So the shims stay, made where they belong.
@@ -4871,8 +4867,8 @@ gets it from its grant (`WorkerGrants.egress`):
 - **Who.** Every worker (the API, WebFetch, the fetches its shell runs),
   and the kinds that fetch: every install leerie runs on a repository's
   code (`INSTALL_KIND`, *An install reaches its inputs*, below), the setup
-  hook, the toolchain install, the store fetch (`SETUP_HOOK_KIND`,
-  `TOOLCHAIN_KIND`, `STORE_FETCH_KIND`). A measurement (`MEASURE_KIND`:
+  hook and the toolchain install (`SETUP_HOOK_KIND`, `TOOLCHAIN_KIND`).
+  A measurement (`MEASURE_KIND`:
   build, lint, tests, a recipe's `build` entry, verify, CI parity's
   checks, coverage, the AST scripts) and a held-out evaluation reach
   nothing beyond their own loopback.
@@ -4921,23 +4917,21 @@ CI runner; a measurement measures the committed view, not the network.
 execution H3); decided the same day.* When the network namespaces above
 landed, every install leerie runs in a tree ran as a measurement, with no
 network, on the assumption that a view installs offline from leerie's
-stores. That holds only where a store fetch filled the store first
-(`_STORE_FETCH`: pnpm, npm, yarn, bun, go, composer); pip, uv, poetry,
-pipenv, cargo, bundler and NuGet have none, and some cannot have one that
-runs no committed code (*Which stores an install may share*). Measured on
+stores. That held only where a store fetch had filled the store first
+(pnpm, npm, yarn, bun, go, composer, in the read-only-store design used
+through 0.44.3, *The stores a view installs from are leerie's*); pip, uv,
+poetry, pipenv, cargo, bundler and NuGet had none. Measured on
 a real run of a pytest repository: the recipe's `pip install` failed
 name resolution in every view — the base baseline, each subtask's
 coverage install, the final conformance and the falsifier's checkout —
 so nothing was measured and the run ended `unconverged` for a reason
 that had nothing to do with its change. **Root cause:** the network rule
 treated an install as a measurement, so whether an install could reach
-its inputs depended on a store contract six managers meet and the rest do
+its inputs depended on a store contract six managers met and the rest did
 not. **Invariant: every install leerie runs on a repository's code can
 reach its inputs.** An install is its own grant kind, `INSTALL_KIND`:
-the measurement grant (the tree, its measurement directory, its own
-stores and the verified stores written; leerie's fetched stores read
-only, still filled by the script-free fetch alone) with egress through
-the proxy. It runs repository code a worker already runs with egress —
+the measurement grant (the tree, its measurement directory, the run's
+stores and its own stores written) with egress through the proxy. It runs repository code a worker already runs with egress —
 a `postinstall`, a `setup.py` — and the proxy refuses every destination
 inside the container, so it reaches nothing a worker cannot. It is every
 install, wherever it runs: a recipe's `install` entries in
@@ -5347,7 +5341,7 @@ serve can name them: every confined process has a `/tmp` of its own, and
 the shim carries the proxy's directory, read-only, into a process only when
 its grant has `egress` (`_confined_argv`'s `--egress`/`--forward`, the
 shim's `isolate(…, sockets=)`) — every worker, and the install, toolchain,
-setup-hook and store-fetch kinds of a repository command. A measurement
+setup-hook kinds of a repository command. A measurement
 (`MEASURE_KIND`) and a held-out sandbox get no egress, so neither can name
 them. The strict-output proxy listens on the orchestrator's loopback TCP,
 outside every confined process's network namespace; a worker reaches it
@@ -5538,7 +5532,7 @@ The mechanism:
 - `_confined_argv`, which builds every confined command's argv, takes
   the descriptor, every call names it (a test reads them all), and each
   place that spawns one (`_run_streaming` for the
-  measurements, installs and store fetches, `_invoke` for workers,
+  measurements and installs, `_invoke` for workers,
   `_ts_script_run` for the AST scripts, the `mise ls` capture) opens it
   with `_shim_refusals()` and checks it once the process has ended, before
   the caller sees an exit status or a worker's result. A refusal raises
@@ -7846,48 +7840,45 @@ behind the 51 GB, and the mid-run prune bounds coexistence to one wave's
 worth of trees.
 
 **The pnpm store shares the worktrees' mount.** Every package store lives
-in the state mount, beside the worktrees, so a worker's install can
-hard-link from its run's cache (a hard link cannot cross mounts); leerie's
-own installs copy from leerie's store instead (*A view's install never
-writes leerie's store*, below). There are three sets, all set by the
-orchestrator through environment variables, with no mount or `-e` of their
-own (*The stores a view installs from are leerie's*, *Which stores an
-install may share*, below): leerie's own, `<state-root>/.stores/leerie/
-<name>`, kept across runs; each run's workers', `<run-dir>/workers/cache/
-<name>` (the held-out side's at `<run-dir>/workers/cache-held-out/<name>`),
-which goes with the run; and each run tree's own,
-`<run-dir>/tree-stores/<tree>/<name>`. The state root is `/leerie-state` locally and `/work/.leerie` on Fly.
-The host cache mounts that used to hold them (pnpm, pip, Go, Cargo,
-corepack) are gone. Copying was not only a disk cost: concurrent installs
-copying whole trees ran past their timeouts, and three chains lost work to
-it (an install that "did not finish within 600 s", held-out sets discarded
-on install timeouts). pnpm's store is content-addressed with atomic
-writes, so concurrent installs into one store are safe. Ownership follows
-the worktrees on every runtime, because it is the same mount: measured
-rootful (real uid switch), five worktrees installed into one store with 0
-EACCES, the worker owning every new store file, one package file carrying
-6 links (the store's and one per worktree), and no chown. EC2 keeps its
-image-default store.
+in the state mount, beside the worktrees, so an install can hard-link from
+its run's store (a hard link cannot cross mounts). There are three sets, all
+set by the orchestrator through environment variables, with no mount or
+`-e` of their own (*The stores a view installs from are leerie's*, *Which
+stores an install may share*, below), and every one is inside its run's
+directory: the run's own, `<run-dir>/stores/<name>`, for every command
+leerie runs; each run's workers', `<run-dir>/workers/cache/<name>` (the
+held-out side's at `<run-dir>/workers/cache-held-out/<name>`); and each run
+tree's own, `<run-dir>/tree-stores/<tree>/<name>`. The state root is
+`/leerie-state` locally and `/work/.leerie` on Fly. The host cache mounts
+that used to hold them (pnpm, pip, Go, Cargo, corepack) are gone. Copying
+was not only a disk cost: concurrent installs copying whole trees ran past
+their timeouts, and three chains lost work to it (an install that "did not
+finish within 600 s", held-out sets discarded on install timeouts). pnpm's
+store is content-addressed with atomic writes, so concurrent installs into
+one store are safe. Ownership follows the worktrees on every runtime,
+because it is the same mount: measured rootful (real uid switch), five
+worktrees installed into one store with 0 EACCES, the worker owning every
+new store file, one package file carrying 6 links (the store's and one per
+worktree), and no chown. EC2 keeps its image-default store.
 
-**The stores a view installs from are leerie's.** One store, shared by
-leerie's installs and every worker's across runs, was a path from a worker
-to a committed view (§8 *Every measurement reads the committed view*):
-pnpm hard-links a package's files from its store, so a worker that edits
-`node_modules/<lib>/<file>` in its own tree in place edits the store's copy,
-and the next install anywhere links the edit. pnpm's own check does not see
-it when the size is kept and the mtime put back: measured with pnpm 10.4.1
-on barnacle, such an edit in one checkout's `node_modules` was in a fresh
-install of another. The invariant: *a committed view's environment comes
-only from stores that leerie alone writes.* So there are three sets:
+**The stores a view installs from are leerie's.** The invariant: *no
+store is shared across runs or repositories.* Every package store and cache
+an installer the provision recipe can name reads — pnpm, npm, yarn (classic
+and berry), bun, corepack, pip, uv, poetry, pipenv, go (modules and build),
+cargo, bundler, composer, NuGet (`_STORE_VARS`) — is the run's own, and
+writable by every command leerie runs in that run; one mechanism covers
+every manager, and no manager is configured differently because of it:
 
-- *Leerie's*, `<state-root>/.stores/leerie/<name>`, set on the
-  orchestrator's own environment before anything installs
-  (`_leerie_stores`): the pnpm store and every other cache an installer the
-  provision recipe can name reads — npm, yarn (classic and berry), bun,
-  corepack, pip, uv, poetry, pipenv, go (modules and build), cargo,
-  bundler, composer, NuGet (`_STORE_VARS`). Only leerie's commands use
-  them, so they are kept across runs: one cold install per repository
-  (measured: barnacle 9.0 s, funeralworks 23.2 s), warm after.
+- *The run's*, `<run-dir>/stores/<name>`, set on the orchestrator's own
+  environment once the run directory exists, before anything installs
+  (`_leerie_stores`). Every install, build, test and measurement leerie
+  runs in the run reads and writes it (the measurement grant names it,
+  *Leerie's runs of the repository's commands are confined too*); no
+  worker's grant does, and a worker's environment replaces every variable
+  (below). It is the run's process's scratch: removed at the process's
+  exit with the trees' stores (*No copy of the credentials outlives its
+  run's process*), so a resumed process installs cold again, and a
+  finished run keeps no store until it is pruned.
 - *The run's workers'*, `<run-dir>/workers/cache/<name>` with
   `XDG_CACHE_HOME` at `<run-dir>/workers/cache/xdg`
   (`_worker_cache_env`, in the worker's spawn), one set per side of the
@@ -7895,171 +7886,122 @@ only from stores that leerie alone writes.* So there are three sets:
   (`HELD_OUT_LOG_WORKERS`) have their own, `<run-dir>/workers/cache-held-out/`,
   which no fixer's grant names (§8 *Nothing a held-out evaluation produces
   reaches a fixer*). Per side rather than per worker, because what a worker
-  leaves in a cache can mislead only another worker of its side, never a
-  measurement, while every cold copy is paid again: a cold pnpm store
-  costs 9–23 s and 0.5–1.3 GB; on funeralworks, Playwright's chromium
-  costs 20.1 s and 656 MB cold against 2.1 s warm, and a warm-store
-  install with a cold `XDG_CACHE_HOME` 14.8 s against 11.8 s (corepack's
-  pnpm 23 MB, Prisma's engines 22 MB). A worker's configuration and
-  temporary directory stay its own: they carry hooks and sessions, a
-  cache carries neither. The set goes with the run directory.
+  leaves in a cache can mislead only another worker of its side, while
+  every cold copy is paid again: a cold pnpm store costs 9–23 s and
+  0.5–1.3 GB; on funeralworks, Playwright's chromium costs 20.1 s and
+  656 MB cold against 2.1 s warm, and a warm-store install with a cold
+  `XDG_CACHE_HOME` 14.8 s against 11.8 s (corepack's pnpm 23 MB, Prisma's
+  engines 22 MB). A worker's configuration and temporary directory stay its
+  own: they carry hooks and sessions, a cache carries neither. The set goes
+  with the run directory.
 - *Each run tree's own*, `<run-dir>/tree-stores/<tree>/<name>`
-  (`_tree_store_env`): the stores of the managers no other tree may share
+  (`_tree_store_env`): the stores that hold one tree's environment or build
   (*Which stores an install may share*, below).
 
-Since leerie's installs are confined (*Leerie's runs of the repository's
-commands are confined too*), the kernel holds each store class to its
-access: a fetched store read-only to an install, written by the fetch
-below alone.
+A variable pointing beneath the image's bake root (`/opt/`, the
+*persistent out-of-repo dependency bake*) is left alone on every side:
+those are dependencies leerie built into the image, which the recipe no
+longer installs.
 
-Two stores never share a file: each fetches its own copy (measured: 0
-inodes in common after the same lockfile was installed from both). A
-variable pointing beneath the image's bake root (`/opt/`, the *persistent
-out-of-repo dependency bake*) is left alone on both sides: those are
-dependencies leerie built into the image, which the recipe no longer
-installs.
+*Why the shared read-only store was replaced* (2026-11-04). Until 0.44.3
+leerie's commands shared one store per repository across runs,
+`<state-root>/.stores/leerie/`, filled by a scripts-free fetch
+(`pnpm fetch --ignore-scripts`, `npm ci --ignore-scripts`, …, in a
+staging directory holding only the lockfile) and read-only to every
+install, which copied from it (`package-import-method=copy`,
+`UV_LINK_MODE=copy`, bun's `--backend=copyfile`). It answered one measured
+attack: pnpm hard-links a package's files from its store, so an in-place,
+same-size, mtime-restored edit of `node_modules/<lib>/<file>` — by a worker
+in its tree, or by a committed `postinstall` — edited the store's own copy,
+and the next install anywhere linked the edit (pnpm 10.4.1 on barnacle;
+review round 18 H1). That attack came from a review round's demonstration,
+not from a run: across all 619 runs under `~/.leerie/*/runs` on the
+measuring host (2026-11-04), no worker's edit or write tool call touched a
+file inside `node_modules`. The protection, meanwhile, broke pnpm three
+times, each time with a package-manager-specific workaround: pnpm 11 opens
+its store's SQLite index read-write for every install (worked around with
+`frozen-store`, pnpm 11's alone); pnpm 11 opens it again before every
+`pnpm <script>` (worked around with `verify-deps-before-run=false`); and
+pnpm 10.27 onward symlinks every project it installs into
+`<store>/v10/projects/` (its project registry, read by `pnpm store prune`
+to sweep the global virtual store; registration is unconditional in
+`getContext`, with no setting that turns it off, and pnpm 11 skips it only
+under `frozen-store`), which failed every install of a repository pinning
+pnpm 10.28.2 (`EROFS … symlink … pnpm-store/v10/projects/<hash>`, the
+user's `web` run 6f147a0c on 0.44.3: the planning install, then the
+base-health baseline's install, so its build read `prisma: not found`).
+Leerie is multi-language: a store contract each manager must be fitted to,
+version by version, is the wrong shape. So the store is per run and
+writable, and every manager runs as the repository runs it, at whatever
+version it pins.
 
-**A view's install never writes leerie's store.** The invariant: *leerie's
-store is written only by a process that runs no committed code.* Review
-round 18 H1 found the gap the split above left. A committed view's install
-is the repository's own install — its `package.json` `postinstall` and
-every dependency's lifecycle script run — and it ran against leerie's
-store with hard links, so a committed `postinstall` that edits a file in
-`node_modules` edited the store's own copy, for every later view and every
-later run. Measured on barnacle's real store: a hard-linked install shares
-the store's inode (`nlink` 3), and an in-place edit through the view grew
-the store's file from 3,284 to 3,305 bytes. Two measures close it:
+What still holds: nothing one run's code writes reaches another run or
+another repository — a run's stores are its directory's, and a new run
+starts with none. What is given up, deliberately: *a measurement never
+sees a file its own run's code changed.* Within one run, a committed
+`postinstall` or a worker's in-place edit of an installed dependency can
+reach a later install of that run through a hard link into the run's
+store. Two things bound it. The workers that write code are told never to
+edit an installed third-party dependency (`node_modules`, a virtual
+environment's `site-packages`, `vendor` and the like) but to change the
+repository's own code or use the project's own patch mechanism
+(implementer, conformer — which also runs the acceptance gate's repairs —,
+integrator and surrogate fixer prompts). That rule is advisory (§12): what
+bounds the damage is the per-run store, which a run's process removes at
+its exit. A mechanical form was weighed and not added: the CLI's
+permission rules match paths, so a deny on "an installed dependency" is a
+per-ecosystem list of directory names (`node_modules`, `site-packages`,
+`vendor`, `.venv`, …) that grows with every manager and still misses a
+shell's `sed -i`; the one generic predicate, "ignored and untracked by the
+repository", also refuses a worker's legitimate writes to its own ignored
+files (a local `.env`, build outputs).
 
-- *The store is filled with no committed code* (`_populate_leerie_store`).
-  Before an install, each install entry's lockfile is fetched into leerie's
-  store by `pnpm fetch --ignore-scripts`, run in a staging directory that
-  holds only the data files the fetch reads — the lockfile, `package.json`
-  (for `patchedDependencies`), `pnpm-workspace.yaml` and `patches/` — and
-  never the committed `.pnpmfile.cjs`, `.npmrc` or a script. `pnpm fetch`
-  reads no manifest scripts; `--ignore-scripts` keeps dependency lifecycle
-  scripts from running, and it is load-bearing: measured with pnpm 10.4.1,
-  a crafted lockfile whose own `package.json` allow-lists a git-hosted
-  dependency and a tarball dependency ran their `prepare` and `postinstall`
-  during a plain `pnpm fetch`, and none of them with `--ignore-scripts`. The
-  fetch is confined like every command leerie runs (*Leerie's runs of the
-  repository's commands are confined too*), with the store-fetch grant:
-  its staging directory and leerie's store, of which it is the one writer;
-  its cost on barnacle is 6.8 s cold and 3.1 s warm, on funeralworks
-  14.7 s cold.
-- *Every install copies from the store* (`_COPY_IMPORT_ENV`, now for every
-  tree, a view included): pnpm's `package-import-method=copy` and
-  `UV_LINK_MODE=copy`. No file the install or its scripts write shares an
-  inode with the store, so a `postinstall` edits only the view's own copy.
-  Measured: a copied install leaves the view's file at `nlink` 1, sharing no
-  inode with the store. `copy`, not `clone-or-copy`, which would reflink on
-  a copy-on-write filesystem: pnpm 11 silently drops `clone-or-copy`
-  (`pnpm config get package-import-method` reads `undefined`) and falls
-  back to its default, which hard-links. The earlier exception that let a
-  view hard-link is gone.
+**Which stores an install may share.** Within a run, every manager's
+download store and cache is the run's (above). One class is narrower:
+*per tree* — uv, cargo, bundler, NuGet, Go's build cache, pipenv's
+environments, pnpm's metadata cache, pip's user base, the .NET CLI home and
+bundler's home (`_TREE_STORE_VARS`) — one set per tree, at
+`<run-dir>/tree-stores/<tree>/<name>`, set for every command leerie runs in
+a tree under `<run-dir>/worktrees/` (`_tree_store_env`, applied by
+`_run_streaming`), and emptied whenever a view's tip moves: a replaced
+view's go with it, and a moved view is a new tree to every measurement
+(§8 *A view moves to the next tip when the install's inputs are
+unchanged*). These hold one tree's environment or what its build writes as
+it builds — pip's user base and bundler's path are where an install puts
+the tree's dependencies, pipenv's environments are the tree's, and uv's
+install of the project, cargo's package lock and Go's build cache write
+the store as they build — so two trees at two commits never share an
+environment. The class also holds where a user-level install lands when
+the system location is not writable — pip's user base (`PYTHONUSERBASE`),
+the .NET CLI's home (`DOTNET_CLI_HOME`) and bundler's home
+(`BUNDLE_USER_HOME`) — because each otherwise falls back to `$HOME`, which
+no measurement grant writes. Review round 19 exec H2 found every pip
+recipe failing in every view that way. Measured as the leerie user with
+`$HOME` read-only: `pip install` answered "Defaulting to user
+installation" and failed, and succeeded with `PYTHONUSERBASE` set, the
+package importable from it; `dotnet restore` failed needing `~/.dotnet`;
+bundler warned and fell back to a temporary home. npm, yarn, bun, uv, cargo,
+go and composer needed no `$HOME` write once their store variables were
+set.
 
-The install still runs the repository's scripts, as it must to measure
-them; the install grant confines it — the measurement grant on disk, with
-the network through the egress proxy (§6 *An install reaches its
-inputs*) (*Leerie's runs of the
-repository's commands are confined too*), and with the store already
-filled it can run against a store it may only read (measured: a
-Landlock-confined `pnpm install` with the store read-only succeeds,
-barnacle 13–15 s, funeralworks 29–43 s with `prisma generate`). Copying is
-not the cost it looked: with the store read-only, a copied install of
-barnacle took 13.4 s against 12.9–14.6 s hard-linked, because the
-repository's own scripts dominate either way.
-
-**Which stores an install may share.** The same question, asked of every
-installer the recipe can name, measured in a container (Debian 13; npm
-11.19, yarn 1.22 and 4.9, bun 1.4, pip 25.1, uv 0.13, poetry 2.1, pipenv
-2024.0, cargo 1.85, go 1.24, bundler 2.6, composer 2.8, .NET SDK 8.0):
-does any command that writes the manager's store run committed code, and
-does the store refuse an entry edited in place when it is used again? A
-project carried a committed hook that wrote a marker (a `postinstall`, a
-`setup.py`, a `build.rs`, a `Gemfile` line, a `post-install-cmd`, an MSBuild
-target); an edit was a same-size, mtime-restored change to a cached file,
-or for an archive cache a valid rebuilt archive carrying a marker.
-
-| manager | a fetch that runs no committed code | edited entry on reuse |
-|---|---|---|
-| pnpm | `fetch --ignore-scripts` | served (mtime only) |
-| npm | `ci --ignore-scripts` | refused: content is looked up by its integrity, so an edited entry is a miss |
-| yarn classic | `install` with `YARN_IGNORE_SCRIPTS=true` | served |
-| yarn berry | `install` with `YARN_ENABLE_SCRIPTS=false` | refused: `yarn.lock` checksum |
-| bun | `install --ignore-scripts` | served, and hard-linked into the tree |
-| pip | `download --only-binary` | refused, with and without `--require-hashes` (the edited wheel was reported "Using cached" and not installed) |
-| uv | `sync --no-install-project` | served |
-| poetry | `install --no-root` | refused: `poetry.lock` hash |
-| pipenv | — | refused: `Pipfile.lock` hashes |
-| cargo | `cargo fetch` | served (`registry/src` reused unchecked) |
-| go | `go mod download` | served (`go mod verify` sees it; a build does not) |
-| composer | `install --no-scripts --no-plugins` | served |
-| bundler | none: the `Gemfile` is Ruby and runs on every command | served |
-| NuGet | none: `restore` runs the project's MSBuild targets | served |
-
-That puts each store in one class (`_FETCHED_STORE_VARS`,
-`_VERIFIED_STORE_VARS`, `_TREE_STORE_VARS`; every `_STORE_VARS` variable
-in exactly one):
-
-- *Fetched* — pnpm, npm, yarn classic, bun, corepack, go modules, composer:
-  shared, written only by the manager's `_STORE_FETCH` entry, one fetch at a
-  time under an exclusive lock on the store (`_store_fetch_lock`; review
-  round 19 exec M2 found concurrent fetches sharing one staging directory
-  and removing each other's), each in a staging directory of its own
-  (`tempfile.mkdtemp`) holding data files (never a committed `.npmrc`, `.yarnrc.yml`,
-  `.pnpmfile.cjs`, plugin or script), and read-only to every install.
-  Measured: each fetch ran no hook, and the real install then succeeded
-  against the store made read-only. For yarn the spelling matters:
-  `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=0` each let a
-  root `postinstall` run, while `YARN_IGNORE_SCRIPTS=true` with
-  `YARN_ENABLE_SCRIPTS=false` stopped it in both generations. bun hard-links from its cache and reads
-  its import backend only from the command line, so a recipe's bun install
-  gets `--backend=copyfile`.
-- *Verified* — pip, poetry, yarn berry's global cache: shared, and an
-  install may write them, because what it writes is checked against a hash
-  the commit pins before it is used.
-- *Per tree* — uv, cargo, bundler, NuGet, Go's build cache, pipenv's
-  environments, pnpm's metadata cache: one set per tree, at
-  `<run-dir>/tree-stores/<tree>/<name>`, set for every command leerie runs
-  in a tree under `<run-dir>/worktrees/` (`_tree_store_env`, applied by
-  `_run_streaming`), and emptied whenever a view's tip moves: a replaced
-  view's go with it, and a moved view is a new tree to every measurement
-  (§8 *A view moves to the next tip when the install's inputs are
-  unchanged*). bundler and
-  NuGet have no fetch free of committed code; uv's install of the project,
-  cargo's package lock and Go's build cache write the store as they build,
-  so an install could not run against it read-only (measured for uv: the
-  project build fails on a read-only cache). Nothing one tree's code leaves
-  there reaches another tree or a later commit. The class also holds where
-  a user-level install lands when the system location is not writable —
-  pip's user base (`PYTHONUSERBASE`), the .NET CLI's home
-  (`DOTNET_CLI_HOME`) and bundler's home (`BUNDLE_USER_HOME`) — because each
-  otherwise falls back to `$HOME`, which no measurement grant writes. Review
-  round 19 exec H2 found every pip recipe failing in every view that way.
-  Measured as the leerie user with `$HOME` read-only: `pip install`
-  answered "Defaulting to user installation" and failed, and succeeded
-  with `PYTHONUSERBASE` set, the package importable from it; `dotnet
-  restore` failed needing `~/.dotnet`; bundler warned and fell back to a
-  temporary home. npm, yarn, bun, uv, cargo, go and composer needed no
-  `$HOME` write once their store variables were set.
-  A user base carries one more property than its files: pip puts a
-  package's console scripts in `<user base>/bin`, which only `PATH` finds,
-  and the image has the default base's `~/.local/bin` last on `PATH` for
-  that. Relocated, the scripts were on no `PATH`: measured on a real run of
-  a pytest repository once its install reached PyPI (*An install reaches
-  its inputs*), pip installed pytest into the view's user base, warned
-  "installed in '…/pyuser/bin' which is not on PATH", and every test run
-  read `pytest: command not found`, so the base and every test axis went
-  unmeasured. *Wherever leerie points a confined process's
-  `PYTHONUSERBASE`, that process's `PATH` carries its `bin`, last*
-  (`_with_user_scripts`, in `_worker_cache_env`, `_tree_store_env` and
-  every command `_run_streaming` starts), in place of the value it replaces,
-  and after the image's tools, so a user-installed script never shadows a
-  baked one. A value beneath the bake root is the image's and is left
-  alone. Never on the orchestrator's own `PATH` (`_leerie_stores` sets the
-  store variables there, not `PATH`): leerie's unconfined process never
-  resolves a program from a store directory, which a confined fetch writes
-  (review round 23 isolation, an observation f0ce3e56 opened).
+A user base carries one more property than its files: pip puts a
+package's console scripts in `<user base>/bin`, which only `PATH` finds,
+and the image has the default base's `~/.local/bin` last on `PATH` for
+that. Relocated, the scripts were on no `PATH`: measured on a real run of
+a pytest repository once its install reached PyPI (*An install reaches
+its inputs*), pip installed pytest into the view's user base, warned
+"installed in '…/pyuser/bin' which is not on PATH", and every test run
+read `pytest: command not found`, so the base and every test axis went
+unmeasured. *Wherever leerie points a confined process's
+`PYTHONUSERBASE`, that process's `PATH` carries its `bin`, last*
+(`_with_user_scripts`, in `_worker_cache_env`, `_tree_store_env` and
+every command `_run_streaming` starts), in place of the value it replaces,
+and after the image's tools, so a user-installed script never shadows a
+baked one. A value beneath the bake root is the image's and is left
+alone. Never on the orchestrator's own `PATH` (`_leerie_stores` sets the
+store variables there, not `PATH`): leerie's unconfined process never
+resolves a program from a store directory, which a confined command writes
+(review round 23 isolation, an observation f0ce3e56 opened).
 
 **A worker started in a tree leerie installed for runs on that tree's
 stores.** Leerie prepares some trees for a worker: the acceptance writer's
@@ -8102,78 +8044,70 @@ staging, which leerie measures only through their committed views (§8
 keeps its workers on their side's cache, where those workers' own installs
 land.
 
-The measurement grant gives a confined install exactly this: the fetched
-stores read-only, the verified ones writable, and its own tree's
-`tree-stores` writable (*Leerie's runs of the repository's commands are
-confined too*).
+The measurement grant gives a confined install exactly this: the run's
+stores and its own tree's `tree-stores` writable (*Leerie's runs of the
+repository's commands are confined too*).
 
-**A measurement pins pnpm's version.** A confined install reads leerie's
-fetched store read-only, which only some pnpm versions can do. Measured
-under Landlock on barnacle and funeralworks, with the store read-only and
-`copy` import: pnpm 10.4.1 installs cleanly (barnacle 14.5 s with its
-scripts skipped; funeralworks 107.6 s with its scripts); pnpm 10.28.2 fails
-writing a project ref into the store (`<store>/v10/projects/`); pnpm 11
-fails writing its SQLite index (`v11/index.db`), which it opens read-write
-for every install and before every `pnpm <script>` (review round 19 exec
-H3). pnpm 11 has a mode for exactly this, `frozen-store` ("open the package
-store read-only and skip all store writes"): measured on a pnpm 11 project
-under Landlock, the install against the read-only store failed with
-`ERR_SQLITE_ERROR` without it and succeeded with it (2.2 s, no inode
-shared), and `pnpm run` succeeded too. So every measurement except the
-store fetch sets `frozen_store=true` and `verify_deps_before_run=false`
-(`_measurement_grants`); pnpm 10.4.1 accepts both unchanged (install and
-`pnpm run` succeed). `frozen_store` is spelled only as pnpm 11 reads it,
-`pnpm_config_frozen_store` (*pnpm's settings are spelled for the pnpm that
-reads them*). The fetched class can then hold
-pnpm 11's store as well as pnpm 10's. corepack picks the version from the
+**corepack never floats.** corepack picks a manager's version from the
 repository's `packageManager`, else a last-known-good it keeps in
-`COREPACK_HOME`, else the newest on the registry, which was pnpm 11.1.2. So
-corepack never floats (`_COREPACK_PIN_ENV`: `COREPACK_DEFAULT_TO_LATEST=0`,
-no auto-pin, no prompt, set in `main()`), and when a tree pins no
-`packageManager` the fetch phase first seeds `_PNPM_DEFAULT_PIN` (10.4.1)
-as the known-good version (`_seed_pnpm_pin`); a tree that pins one keeps
-it. pnpm also writes a lock and state under `XDG_STATE_HOME` and
-`XDG_RUNTIME_DIR`, which `_measurement_grants` points at the measurement
-directory and, for the runtime directory, which holds sockets, the tree's
-private temp directory (*A confined command's scratch is short and
-private*).
+`COREPACK_HOME` (the run's own), else the newest on the registry; it can
+also prompt before a download and write `packageManager` into the tree's
+`package.json`. So every command leerie runs has `_COREPACK_PIN_ENV`
+(`COREPACK_DEFAULT_TO_LATEST=0`, `COREPACK_ENABLE_AUTO_PIN=0`,
+`COREPACK_ENABLE_DOWNLOAD_PROMPT=0`, set in `main()`): it never waits on a
+prompt, never edits the tree it measures (I2), and a tree that pins no
+version gets corepack's own default rather than whatever is newest that
+day. A tree that pins a version gets it: with the run's store writable,
+every pnpm version installs as the repository runs it (measured below).
+Until 0.44.3 leerie also seeded pnpm 10.4.1 as the last-known-good, because
+only that generation could install against the read-only store; with the
+store per run that seed (`_seed_pnpm_pin`) is gone.
+
+Measured 2026-11-04 in the leerie 0.44.3 image (rootless; Landlock-confined
+through leerie's own `_ensure_worktree_deps`, `_measurement_grants` and
+`_leerie_stores`, a fresh run directory each time, so every install is
+cold: corepack's download of the pinned pnpm, every package and the
+repository's own `postinstall`): web (pnpm 10.28.2, its `prisma
+generate` included) installs in 27.4 s and 25.5 s, where 0.44.3's code
+fails both with `EACCES … symlink … pnpm-store/v10/projects/<hash>` (EACCES
+under Landlock alone, EROFS under the runtime's read-only mounts);
+barnacle (pnpm 10.4.1) in 13.4 s and 13.1 s, against 40.7 s for 0.44.3's
+first run on that host (its store fetch, then a copied install) and 36.2 s
+warm; a one-package `npm ci` in 3.5–3.6 s (0.44.3: 10.1 s, 5.6 s warm),
+npm's `_logs` written to the run's cache; a one-package `pip install` in
+2.1–3.1 s (0.44.3: 1.2–1.5 s). Rebased onto 0.44.4 and measured again on a
+host at load 49: all four succeed (web 78.6 s, barnacle 44.4 s, npm 3.6 s,
+pip 2.8 s). Each run's store is web 1.0 GB, barnacle 0.6 GB, gone at the
+process's exit. Under real Landlock on the host, pnpm 10.4.1, 10.28.2 and
+11.21.0 each install a tarball dependency through `_measured_tree`
+(`tests/test_run_stores.py`).
 
 **pnpm's settings are spelled for the pnpm that reads them.** pnpm 10
 reads a setting from the environment only as `npm_config_<key>`, pnpm 11
 only as `pnpm_config_<key>`. npm reads every `npm_config_<key>` too, and
 warns once per key it does not know, in every npm a command runs — a test
 script's `npx`, a `postinstall` — `npm warn Unknown env config
-"store-dir"` ("This will stop working in the next major version of npm"),
-four lines per npm in the user's 0.44.0 run (barnacle, 2026-11-03:
-`store-dir`, `cache-dir`, `frozen-store`, `verify-deps-before-run`). A
-setting reaches pnpm under npm's spelling only when the pnpm that reads
-that spelling has the setting: `frozen-store` is pnpm 11's alone (pnpm
-10.4.1's and 10.34.9's sources do not name it), so it is set as
-`pnpm_config_frozen_store` only. `store_dir`, `cache_dir`,
-`package_import_method` and `verify_deps_before_run` keep both spellings
-(`_PNPM_SETTINGS`, `_with_pnpm_spellings`), and npm still warns about
-them: pnpm 10 has no way to be given a setting that npm does not also read
-and that outranks the repository's own. Its other channel, its global rc
-(`$XDG_CONFIG_HOME/pnpm/rc`), which npm never reads, ranks below a
-committed `.npmrc`: measured with pnpm 10.4.1 and 10.34.9, a committed
-`store-dir=` and `package-import-method=hardlink` win over the rc and lose
-to the environment, so the rc would hand the repository leerie's choice of
-store and import mode (*The stores a view installs from are leerie's*, *A
-view's install never writes leerie's store*). pnpm 11 does not read that
+"store-dir"` ("This will stop working in the next major version of npm").
+Leerie sets only the store locations, `store_dir` and `cache_dir`, under
+both spellings (`_PNPM_SETTINGS`, `_with_pnpm_spellings`), or pnpm 11
+reads neither and falls back to a store inside the tree. npm still warns
+about those two: pnpm 10 has no way to be given a setting that npm does not
+also read and that outranks the repository's own. Its other channel, its
+global rc (`$XDG_CONFIG_HOME/pnpm/rc`), which npm never reads, ranks below
+a committed `.npmrc`: measured with pnpm 10.4.1 and 10.34.9, a committed
+`store-dir=` wins over the rc and loses to the environment, so the rc would
+hand the repository leerie's choice of store. pnpm 11 does not read that
 file at all. And pnpm 10 itself exports `npm_config_store_dir` and
 `npm_config_verify_deps_before_run` into every script it runs, whatever
-leerie sets (measured: a script's `npm` under pnpm 10.4.1 with no
-`npm_config_*` set by its caller still warns `verify-deps-before-run`), so
-a pnpm 10 repository's npm warns whatever spelling leerie chose. The
-warnings left are pnpm 10's; leerie adds none for a setting no pnpm reads
-under that name.
+leerie sets, so a pnpm 10 repository's npm warns whatever spelling leerie
+chose. Until 0.44.3 leerie also set `pnpm_config_frozen_store`,
+`verify_deps_before_run=false` and `package_import_method=copy`; each
+existed only for the read-only store, and each is gone with it.
 
-What this does not cover: a worker writing leerie's store, a view, `/opt`
-or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside
-the worker's own tree, which the worker's write boundary forbids; this
-removes the ones a worker made legitimately, through its own installs and
-the links they share, and the ones leerie's own install made through a
-committed `postinstall`.
+What this does not cover: a worker writing the run's stores, a view, `/opt`
+or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside the
+worker's own tree, which the worker's write boundary forbids; no worker's
+grant names the run's stores.
 
 This explains *why* worktrees are expensive; it deliberately does not
 drive a gate. A per-worktree measured bound was attempted and withdrawn
@@ -10421,9 +10355,7 @@ classification and planning, layered top-to-bottom by determinism:
    leerie's measurements, a worker's own Bash, a setup hook. After the
    change the same measurement gives `node` v22.19.0, `npm` 10.9.3, `pnpm
    exec node` v22.19.0, and in a tree of the same repository pinning
-   nothing `node` v24.22.2. Leerie's other Node users: its pnpm pin seed
-   (`_seed_pnpm_pin`) now runs the pinned version's `corepack`, which
-   seeds the same `COREPACK_HOME` (pnpm 10.4.1 either way); its AST
+   nothing `node` v24.22.2. Leerie's other Node users: its AST
    scripts run on the tree's Node, as they load the tree's own
    `typescript`, and parse under 22.19.0 with the bundled one. The
    operator-visible change is that a repository pinning a Node version now
@@ -12723,8 +12655,9 @@ view.
 tip moved, so nothing removed it when its tree went: a subtask's tree is
 pruned once its branch is integrated, and reset before a retry, and its
 view — a full checkout with a copied install, about 650 MB on barnacle
-(603 MB of it `node_modules`, link count 1 by design: *A view's install
-never writes leerie's store*) — stayed until the run ended. Counted on the
+(603 MB of it `node_modules`, link count 1 by the copy import of the
+read-only-store design used through 0.44.3, *The stores a view installs
+from are leerie's*) — stayed until the run ended. Counted on the
 seven live runs: 43 views (37 of subtask trees, 6 of staging), about 27 GB
 of the runs' 40 GB by `du`; one run held 9 subtask views beside 2
 remaining subtask trees. And the in-process record of views
@@ -12740,8 +12673,9 @@ Measured with the confined install, copy import, the store fetch and the
 stores emptied on a move (review round 19), a new tip with unchanged install
 inputs: barnacle 14.6–16.1 s moved against 28.8–34.6 s remade (three of
 each, idle host), funeralworks 24.4–25.6 s against 47.0–47.2 s (two of
-each, load under 9). What a move still pays is the store fetch, the install
-run again in place and the two walks of the install's output.
+each, load under 9). What a move still pays is the install run again in
+place and the two walks of the install's output (and, through 0.44.3, the
+store fetch).
 
 What this removes: the measurement no longer depends on I1's reading of
 staging, so the assertion every staging reader made — that staging was

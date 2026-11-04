@@ -255,6 +255,14 @@ prompt (the repo's authoritative design-system / component / style docs — read
 the ones relevant to your subtask). Commit your work to the branch with a clear
 message. Commit only code and project files — never the `.leerie/` directory.
 
+**Never edit an installed third-party dependency.** What a package manager
+installed — `node_modules`, a virtual environment's `site-packages`, a
+`vendor` directory and the like — is not the repository's code: an edit
+there is not committed, is not what CI installs, and can reach other
+installs that share the same package store. Change the repository's own
+code instead, or, when a dependency itself must change, use the project's
+own patch mechanism and commit that.
+
 **Commit as soon as the change is written and in scope — BEFORE running any
 verification step** (targeted tests, typecheck, and *especially* anything that
 could be expensive or memory-heavy). Verification comes after the commit. The
