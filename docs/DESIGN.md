@@ -3597,6 +3597,62 @@ prune. *Revised 2026-11-03 (review round 37, execution E4).* This said a
 record is kept "until BuildKit's garbage collection removes it", one per
 build; the collection did not.
 
+### Leerie names its own Python by path
+
+*Designed 2026-11-04.*
+
+**Root cause.** A repository chose the interpreter that ran leerie's own
+Python in leerie's root. `container-entry.sh` changes to `/work`, the
+repository, and then ran the cgroup broker and the orchestrator as
+`python3 …`. In the image `python3` is not the system's: PATH holds mise's
+user shims ahead of `/usr/bin`, and a shim picks the program it runs from
+the version files (`.python-version`, `.tool-versions`, `mise.toml`) of its
+working directory and every directory above it. Measured 2026-11-04 in
+`leerie:0.44.1`, rootless, through the real entrypoint with a checkout at
+`/work`: with `.python-version` holding `3.11`, PID 1, still root in the
+container, ran `mise`, which downloaded CPython 3.11.18 from GitHub and
+installed it. The broker (root), the orchestrator, the Landlock shim and
+the sandbox probe then all ran on that interpreter (`/proc/<pid>/exe`
+`…/mise/installs/python/3.11.18/bin/python3.11`). With `3.12` they ran on
+the mise-installed 3.12.16. With no pin, PID 1 still ran `mise` first, as
+root, reading the repository's configuration, before falling through to
+`/usr/bin/python3`. Every helper the orchestrator starts as
+`sys.executable` inherited the choice. The orchestrator's working directory
+has to be `/work`, so leaving the repository first, as the host launcher
+does (§6 *The host never runs a program the checkout chose*), cannot apply
+here. The Fly and EC2 launch wrapper started the orchestrator the same
+way, as `python3` with `cwd="/work"`, and Fly's subtree collection ran
+its Python from inside `/work/.leerie/runs/<id>/repo`, below the same
+version files.
+
+**Invariant.** Inside leerie's root (the container, a Fly machine, an EC2
+instance), leerie's own Python started from a directory a repository's
+files reach is named by its path, `/usr/bin/python3`, the image's
+interpreter. It is never found through PATH. What leerie starts from it as
+`sys.executable` follows. A repository's commands keep resolving through
+the shims, which is what lets them run the version the repository pins
+(§6½).
+
+**Mechanism.** `container-entry.sh` execs `/usr/bin/python3` for the
+broker and for the orchestrator after the privilege drop. The launch
+wrapper (`_render_launch_suffix`) starts the orchestrator as
+`/usr/bin/python3`. `collect-subtrees.sh`'s machine payload runs its three
+Python steps the same way. A static rule checks these sites, and every
+subprocess or `exec` call in leerie's own Python, for an interpreter named
+by a bare name (`tests/test_leerie_python_is_named.py`).
+
+**Scope.** Measured at the same time in the same image, from a directory
+holding `.python-version`, `.nvmrc` and `.tool-versions`: only `python3` and
+`python` resolve to a shim. `node` and `claude` resolve to the baked LTS
+Node's `bin`, which is ahead of the user shims on PATH. `git`, `bash`,
+`env`, `unshare` and `runuser` resolve to `/usr/bin` or `/usr/sbin`. So the
+names leerie starts bare there are not a repository's to choose today. A
+reordering of PATH would make them so, and would have to name them by path
+too. Commands the host sends to a machine with no working directory of
+their own (`flyctl ssh console -C`, the EC2 session) start in the session's
+own directory, not in `/work` (not measured on Fly), and are
+unchanged.
+
 ### A worker's commands cannot reach its CLI
 
 *Designed 2026-11-01 (review round 21, isolation R4).*
@@ -5315,7 +5371,7 @@ The descriptor reaches the orchestrator through each runtime's privilege
 drop (measured 2026-11-01 for the local two):
 
 - *Local rootless.* PID 1 (the rootlesskit-mapped host UID, the slice's
-  delegate) execs `cgroup-broker.py --spawn -- unshare --user … python3
+  delegate) execs `cgroup-broker.py --spawn -- unshare --user … /usr/bin/python3
   leerie.py`: the broker is forked with one end, and `unshare` (which
   `exec`s, no fork) passes the other to the orchestrator.
 - *Local rootful.* The same, with `runuser -u leerie --`, which keeps the

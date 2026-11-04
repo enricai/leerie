@@ -297,9 +297,12 @@ try:
     child_env[_broker.FD_ENV] = str(broker_fd)
 except Exception as e:
     sys.stderr.write("cgroup broker did not start: " + repr(e) + "\\n")
+# By path: from /work, a python3 found through PATH is the mise shim, which
+# runs the interpreter the repository pins (DESIGN section 6, Leerie names
+# its own Python by path).
 with open(log_path, "ab") as log_f:
     p = subprocess.Popen(
-        ["python3", "/opt/leerie-image/orchestrator/leerie.py", *orch_args],
+        ["/usr/bin/python3", "/opt/leerie-image/orchestrator/leerie.py", *orch_args],
         stdin=subprocess.DEVNULL,
         stdout=log_f,
         stderr=log_f,

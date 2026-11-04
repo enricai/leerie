@@ -79,6 +79,10 @@ def _flyctl_stub(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
         '    REWRITTEN="${SCRIPT//\\/opt\\/leerie-image\\/scripts/$SCRIPTS}"\n'
         '    REWRITTEN="${REWRITTEN//\\/opt\\/leerie-image\\/prompts/$PROMPTS}"\n'
         '    REWRITTEN="${REWRITTEN//\\/work\\/.leerie/$STATE_DIR}"\n'
+        # The payload names leerie's Python by path (DESIGN §6 *Leerie names
+        # its own Python by path*); a test stands its own in by this name.
+        '    [ -n "${LEERIE_TEST_PYTHON3:-}" ] && '
+        'REWRITTEN="${REWRITTEN//\\/usr\\/bin\\/python3/$LEERIE_TEST_PYTHON3}"\n'
         # The run's own repository (DESIGN §6 *The run's own repository*)
         # is `<run-dir>/repo`; the fixture repository's git dir stands in.
         '    for d in "$STATE_DIR"/runs/*/; do\n'
@@ -508,18 +512,18 @@ def test_the_integrator_never_runs_without_its_guard(tmp_path, leerie):
     shadow = tmp_path / "py"
     shadow.mkdir()
     # A python3 that fails only the guard script, so the payload's other
-    # python3 uses still work.
-    real = subprocess.run(["bash", "-c", "command -v python3"],
-                          capture_output=True, text=True).stdout.strip()
+    # python3 uses still work. The payload names its interpreter
+    # /usr/bin/python3, which the stub rewrites to this one.
     (shadow / "python3").write_text(
-        "#!/usr/bin/env bash\n"
+        "#!/bin/bash\n"
         'case "$*" in *worker-guard.py*) exit 1 ;; esac\n'
-        f'exec {real} "$@"\n')
+        'exec /usr/bin/python3 "$@"\n')
     (shadow / "python3").chmod(0o755)
     result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env={"LEERIE_REPO": str(REPO_ROOT), "TMPDIR": str(wdir),
-             "PATH": f"{shadow}:{stub.parent}:{os.environ['PATH']}"})
+             "LEERIE_TEST_PYTHON3": str(shadow / "python3"),
+             "PATH": f"{stub.parent}:{os.environ['PATH']}"})
     assert result.returncode == 0, f"stderr={result.stderr}"
     assert "integrated 1, skipped 1" in result.stderr.lower()
     assert not rec.exists()

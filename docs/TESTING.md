@@ -769,6 +769,19 @@ already pushed (`pushed_at` and `pr_url` set, no `pr_title`: its `pr_writer`
 failed at finalize and its PR is open with the fallback body; review round
 26, I1). Dropping the `pushed_at` check turns that last test red.
 
+`tests/test_leerie_python_is_named.py` (7 tests; DESIGN §6 *Leerie names its
+own Python by path*). Measured in `leerie:0.44.1`, a checkout's
+`.python-version` chose, through mise's shim, the interpreter of the cgroup
+broker and the orchestrator (`container-entry.sh` runs them from `/work`),
+and made root install CPython 3.11.18 from the network. A rule over the
+entry script's command lines, `collect-subtrees.sh`'s machine payload, the
+Fly/EC2 launch wrapper as `seed-common.sh` renders it (AST), and every
+subprocess or `exec` call in leerie's own Python (AST) fails a Python
+interpreter started by a bare name; the entry test also asserts both
+privilege-drop arms exec `/usr/bin/python3` for the broker and the
+orchestrator. Two controls prove each scan can fail. Reverting any one of
+the three fixed files turns its test red.
+
 `tests/test_host_python_is_isolated.py` (29 tests: 23 functions, two of
 them run four times each, over where the operator's `tenacity` is; DESIGN §6
 *The host never imports the repository's code* and *The host never runs a

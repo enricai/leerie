@@ -305,17 +305,21 @@ unset _is_resume _a
 # via unshare: outer UID 0 → inner UID leerie (explicit), so all
 # bind-mounts remain owned by us. Image dirs (outer UID leerie) are
 # traversed via their mode-755 bits, not by ownership.
+# The broker and the orchestrator are leerie's own Python, named by path:
+# PATH holds mise's shims, and a shim picks its interpreter from the version
+# files of its working directory, here /work, the repository (DESIGN §6
+# *Leerie names its own Python by path*).
 if [ "$ROOTLESS" = "true" ]; then
   _leerie_uid="$(id -u leerie)"
   _leerie_gid="$(id -g leerie)"
-  LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" exec python3 "$BROKER" --spawn \
+  LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" exec /usr/bin/python3 "$BROKER" --spawn \
     --log /tmp/cgroup-broker.log -- \
     unshare --user --map-user="$_leerie_uid" --map-group="$_leerie_gid" \
     env HOME=/home/leerie USER=leerie LOGNAME=leerie \
-    python3 /opt/leerie-image/orchestrator/leerie.py "$@"
+    /usr/bin/python3 /opt/leerie-image/orchestrator/leerie.py "$@"
 fi
-LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" exec python3 "$BROKER" --spawn \
+LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" exec /usr/bin/python3 "$BROKER" --spawn \
   --log /tmp/cgroup-broker.log -- \
   runuser -u leerie -- \
   env HOME=/home/leerie USER=leerie LOGNAME=leerie \
-  python3 /opt/leerie-image/orchestrator/leerie.py "$@"
+  /usr/bin/python3 /opt/leerie-image/orchestrator/leerie.py "$@"
