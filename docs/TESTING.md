@@ -7906,3 +7906,24 @@ sample's probe never counts for the next.
   that is not JSON, a manager leerie does not bake): a valid capture is
   refused, naming the entry, and nothing is written. Falsified on the host:
   with the two checks removed, the entry test and the 3 cases fail.
+
+## A test of one gate pins every other gate its path takes (CI, 2026-11-04)
+
+`tests/test_blt_semaphore.py::test_raising_the_cap_raises_the_peak` failed on
+every GitHub leg that finished (run 41777003910: py3.11 and py3.12, `cap=4
+peaked at 1`) and passed on every developer host. The measurement it drives
+(`_measure_axes`, a `tests` axis) holds two gates, not one: `blt_parallel`
+(`_blt_slot`), its subject, and a host build slot (`_build_class_slot`), whose
+count with no measured peak is `(MemAvailable - 4 GiB) // 6.3 GiB`
+(`_build_sem_slots`, `_WORKER_BUILD_PEAK_BYTES`) — one slot on any host with
+under about 16.6 GiB available, which a 16 GB runner is. There the host gate
+serialised the six measurements whatever `blt_parallel` said; on a 56 GiB
+host it gives 8 slots and never binds. The code is right (one 6.3 GiB build
+at a time is what that host can hold); the test measured a host fact.
+`_peak_under` now pins the host gate wide (`blt_peak.slots` = the number of
+measurements, read before memory), drops `LEERIE_HOST_DIR` so the slot files
+live under the test's own state root, and pins `_mem_available_bytes` to a
+14.5 GiB host, so removing the slot pin fails on every host, not only a small
+one. Falsified: with only the memory pin added the test fails here as on CI
+(`1 failed, 6 passed`); with the slot pin reverted it fails again; with both
+it passes, serial and under `-n 4`.
