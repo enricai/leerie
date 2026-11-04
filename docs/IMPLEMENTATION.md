@@ -1004,7 +1004,7 @@ The four host-auth mounts (`~/.config/gh`, `~/.git-credentials`, `~/.ssh`, `$SSH
 | `~/.cache/leerie/mise-data` | `/home/leerie/.local/share/mise` | rw | Mise's `MISE_DATA_DIR` (per-repo runtime installs, plugins, cache). Lives in the user dir so the resolver checks it first then falls through to the image-baked `MISE_SYSTEM_DATA_DIR=/usr/local/share/mise` for the LTS fallback (DESIGN §6½). Its `shims` subdir is on the image's `ENV PATH` (see §0.5 "Image build") so a worker's own ad-hoc Bash commands can reach a repo-pinned runtime (e.g. Ruby via `.ruby-version`) without an explicit `mise exec --`. |
 | (state mount) `$LEERIE_STATE_HOST_DIR/.stores/leerie/<name>`, `$LEERIE_STATE_HOST_DIR/runs/<run-id>/workers/cache/` | `/leerie-state/.stores/leerie/<name>`, `/leerie-state/runs/<run-id>/workers/cache/` | rw | Package stores and caches, **inside the state mount** next to the worktrees, so a worker's install can hard-link from its run's cache (a hard link cannot cross mounts); leerie's own installs copy from its store (`_COPY_IMPORT_ENV`; DESIGN §6 *The pnpm store shares the worktrees' mount*, *A view's install never writes leerie's store*). No mount and no `-e` of their own: the orchestrator sets them (`_leerie_stores`, `_worker_cache_env`; DESIGN §6 *The stores a view installs from are leerie's*), the same on Fly (state root `/work/.leerie`). Leerie's are kept across runs; a run's worker caches go with its run directory. The former `~/.cache/leerie/{pip,go-mod,cargo,corepack}` mounts, their `PIP_CACHE_DIR`/`GOMODCACHE`/`CARGO_HOME`/`COREPACK_HOME` `-e`s, the `npm_config_store_dir=/leerie-state/.pnpm-store` `-e` and Fly's `child_env["npm_config_store_dir"]` are gone: every worker of every earlier run wrote them. `COREPACK_HOME` is set explicitly on both sides, so corepack never falls back to `XDG_CACHE_HOME=/tmp/.cache` (the rootless mkdir failure the old mount fixed). |
 | `~/.cache/leerie/bundle` | `/home/leerie/.cache/leerie/bundle` | rw | `BUNDLE_PATH` for Bundler (Ruby gems). `BUNDLE_CACHE_ALL=1` instructs Bundler to cache all gems (including git-sourced ones) so each `bundle install` reuses downloaded gems across worktrees and runs. |
-| `~/.leerie/.host` (or `$LEERIE_HOST_DIR`, §2½) | `/leerie-host` | rw | Host-wide directory shared by every run on the host, whatever the repo; the launcher creates it with the cache dirs and passes `-e LEERIE_HOST_DIR=/leerie-host` after the `LEERIE_*` forward, so a host variable of that name cannot repoint it. Holds `build-slots/slot-<i>`, the lock files of the host build semaphore (DESIGN §6 *A host-wide build semaphore*; `_build_class_slot`). Ownership: rootless sees the host user's directory as its own (outer UID 0 → inner leerie); rootful's entry guard `chown`s the directory (not `-R`) to leerie; slot files are opened read-only, so one another identity created still locks. No such mount on Fly/EC2: `_build_sem_dir` falls back to `<state-root>/.host/build-slots`, host-wide there. Pinned by `tests/test_host_dir_ownership.py`. |
+| `~/.leerie/.host` (or `$LEERIE_HOST_DIR`, §2½) | `/leerie-host` | rw | Host-wide directory shared by every run on the host, whatever the repo; the launcher creates it with the cache dirs and passes `-e LEERIE_HOST_DIR=/leerie-host` after the `LEERIE_*` forward, so a host variable of that name cannot repoint it. Holds `build-slots/slot-<i>`, the lock files of the host build semaphore (DESIGN §6 *A host-wide build semaphore*; `_build_class_slot`), and `mise-install.lock`, the host's one toolchain-install lock (DESIGN §6 *One toolchain install at a time on a host*; `_mise_install_lock`). Ownership: rootless sees the host user's directory as its own (outer UID 0 → inner leerie); rootful's entry guard `chown`s the directory (not `-R`) to leerie; slot files are opened read-only, so one another identity created still locks. No such mount on Fly/EC2: `_host_shared_dir` falls back to `<state-root>/.host`, host-wide there. Pinned by `tests/test_host_dir_ownership.py`. |
 | Each `--inspect-dir` path (translated) | `/inspect/<basename>` | ro | See below. |
 
 ### `LEERIE_*` env-var forwarding (local `nerdctl run`)
@@ -4833,7 +4833,12 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   private*, a gpg home of its own: mise imports Node's release keys there; `~/.gnupg` is never
   granted; pinned by `tests/test_confined_gnupg_home.py`), `XDG_STATE_HOME` →
   `<measure-dir>/state`, `MISE_STATE_DIR` → `<measure-dir>/mise-state`
-  (emptied first for the toolchain kind); no store variable (leerie's environment and
+  (emptied first for the toolchain kind), and, for the kinds that write
+  `MISE_DATA_DIR` (toolchain, setup hook), `MISE_CACHE_DIR` →
+  `<MISE_DATA_DIR>/<MISE_CACHE_NAME>` (`"cache"`; inside the granted data
+  directory, shared with every run: mise's install lock and `incomplete`
+  markers live there — DESIGN §6 *One toolchain install at a time on a
+  host*); no store variable (leerie's environment and
   `_tree_store_env` set them). No grant names `/tmp` (the shim gives the
   command its own, DESIGN §6 *Every confined process has its own `/tmp`,
   `/dev/shm` and IPC*); the worker-tree distinction (`_is_worker_tree`,
@@ -9355,8 +9360,9 @@ environment limit*.
 - `_build_sem_slots(peak_bytes, mem_available=None) -> int` is
   `max(1, (MemAvailable − _BUILD_SEM_RESERVE_BYTES (4 GiB)) // peak)`
   (`_mem_available_bytes()` reads `/proc/meminfo`; unreadable → 1).
-  `_build_sem_dir(st)` is `$LEERIE_HOST_DIR/build-slots` when that directory
-  is writable, else `<state-root>/.host/build-slots`.
+  `_host_shared_dir(st) -> Path` is `$LEERIE_HOST_DIR` when that directory
+  is writable, else `<state-root>/.host`; `_build_sem_dir(st)` is its
+  `build-slots`.
   `_acquire_build_slot(st, *, label, sleep=None) -> (fd, slot, slots)` tries
   `slot-0 … slot-<n-1>` (`n` = `blt_peak.slots`, else
   `_build_sem_slots(_WORKER_BUILD_PEAK_BYTES)`), each opened `O_RDONLY |
@@ -10431,6 +10437,19 @@ branch, after the `_write_run_json(...)` block and before
    own failed enable failed the install. Never a directory under
    `MISE_SYSTEM_DATA_DIR` (DESIGN §6 *Each Node version's corepack shims
    go in its own `bin`*). Pinned by `tests/test_corepack_shim_dir.py`.
+   The install and the enables run inside `_mise_install_lock(st)` (an
+   async context manager): an exclusive `flock` on
+   `_host_shared_dir(st) / MISE_INSTALL_LOCK_NAME` (`"mise-install.lock"`,
+   opened `O_RDONLY | O_CREAT`), tried `LOCK_NB` every
+   `MISE_INSTALL_LOCK_POLL_SEC` (1 s) and logged once while it waits;
+   released (the descriptor closed) on exit, `die()` included; the version
+   capture below runs after it. The toolchain grant's env names
+   `MISE_CACHE_DIR` beneath `MISE_DATA_DIR`, so mise's own install lock and
+   `incomplete` markers are shared with the data (DESIGN §6 *One toolchain
+   install at a time on a host, against mise's own completeness record*).
+   Pinned by `tests/test_mise_install_lock.py`, whose real-container test
+   (opt-in, `LEERIE_TEST_CONTAINER_IMAGE`) runs two runs' installs of one
+   version with the first frozen mid-extract and then killed.
 5. **Version capture.** Runs `mise ls --current --json` (the
    subcommand `mise current --json` does not exist; verified
    against mise.usage.kdl) via `run_proc` bounded by

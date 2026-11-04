@@ -4600,6 +4600,61 @@ still at the pinned pnpm (10.4.1), with `pnpm exec node` at 22.19.0.
 Without its own shims a pinned version would silently borrow the baked
 Node's corepack. So the shims stay, made where they belong.
 
+**One toolchain install at a time on a host, against mise's own
+completeness record.** *Designed 2026-11-04 (three barnacle runs at
+03:11).* Three runs on one host began provisioning together. Every run
+shares one `MISE_DATA_DIR` (the bind-mounted `~/.cache/leerie/mise-data`).
+Two died installing node 22.19.0 at the corepack step above. The third
+printed "mise all tools are installed" and went on with "resolved
+versions: node 22.19.0": it had taken another run's install, still in
+progress, for a finished one. That install then failed and mise removed
+it, leaving `installs/node/22.19 -> ./22.19.0` dangling. mise does have the
+guard this needs, but in the wrong place. Its install takes a lock and
+re-checks after waiting, and "installed" means the install directory
+exists *and* no `incomplete` marker exists. The marker is made before the
+first byte is extracted and removed only after the post-install steps
+(mise v2026.5.4: `src/backend/mod.rs` `install_version`,
+`is_version_installed`, `create_install_dirs`). Both the lock
+(`lock_file.rs`) and the marker (`install_state.rs`) live in mise's
+*cache* directory, `MISE_CACHE_DIR`, which defaults to
+`$XDG_CACHE_HOME/mise`. A confined command's `XDG_CACHE_HOME` is its own
+private temp directory, so each install had a lock no one else took and a
+marker no one else saw, over a data directory everyone shares. Measured in
+one container with two cache directories: a second `mise install` started
+while the first was extracting printed "all tools are installed". With one
+cache directory it waited for the lock and returned without reinstalling.
+The dangling alias is how an install that trusted another's half-finished
+one looks after that one fails: the trusting run had rebuilt the
+version's aliases. A failed install on its own leaves nothing (mise's
+error cleanup removes the directory and the marker), and mise's next
+install removes a dangling alias (both measured).
+
+**Invariant: a toolchain install never trusts another's unfinished
+install, and leerie's own steps on an installed version are serialised
+with the install.** Two parts.
+
+1. mise's cache travels with its data: every kind that writes
+   `MISE_DATA_DIR` (the toolchain install, the setup hook) gets
+   `MISE_CACHE_DIR=$MISE_DATA_DIR/cache`. mise's own lock and completeness
+   check then hold across every run that shares the data. A crashed
+   install's marker outlives its container, so the next install redoes it
+   instead of trusting it. That cache is part of the data's state, not a
+   command's scratch, and it is shared exactly as widely as the data is.
+2. Leerie holds one host-wide lock across `mise install` and
+   `_enable_corepack_shims`: an exclusive `flock` on `mise-install.lock`
+   in the host directory every run shares (beside the build slots; the
+   state root's `.host` where there is none). The enable step is leerie's
+   and runs outside mise's lock. Without the host lock, two runs could
+   find the same version without shims and enable it at once, or one
+   could use a version whose shims another is still making. The lock is
+   not in `MISE_DATA_DIR`: a confined command can open that directory,
+   and Landlock does not govern `flock`, so a command could hold the lock
+   against every other run. No grant reaches the host directory.
+
+No leerie code removes a failed install's leftovers: mise removes them
+under its own lock, and with the lock shared no other install can see
+the gap.
+
 **A worker's temp directory is short and private too.** *Designed
 2026-11-03 (the live 0.43.0 barnacle runs).* A worker's `TMPDIR` was
 `<run-dir>/workers/<wid>/tmp/`, at the run directory's depth —

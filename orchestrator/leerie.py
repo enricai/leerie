@@ -25405,6 +25405,8 @@ MEASURE_KIND = "measure"
 SETUP_HOOK_KIND = "setup_hook"
 # `mise install` / `mise ls`: also writes `MISE_DATA_DIR`, trusting nothing.
 TOOLCHAIN_KIND = "toolchain"
+# mise's cache, beneath `MISE_DATA_DIR`, for the kinds that write that.
+MISE_CACHE_NAME = "cache"
 # Leerie's own scripts-free store fetch (`_populate_leerie_store`): also
 # writes leerie's store, the one writer it has, and keeps its store
 # variables pointing there.
@@ -26194,9 +26196,14 @@ def _measurement_grants(st: "State", tree: str | Path,
                      *_measured_git_reads(t, run_dir, dirs)]
     if not Path(os.path.realpath(SHARED_TMP)).is_relative_to(home):
         ro.append(home)
+    mise_cache: Path | None = None
     if kind in (SETUP_HOOK_KIND, TOOLCHAIN_KIND):
         tools = [Path(os.environ.get("MISE_DATA_DIR")
                       or Path.home() / ".local" / "share" / "mise")]
+        # mise's install lock and its `incomplete` markers live in its
+        # cache: there, they are shared as widely as the installs they
+        # guard (DESIGN §6 *One toolchain install at a time on a host*).
+        mise_cache = tools[0] / MISE_CACHE_NAME
         if kind == SETUP_HOOK_KIND:
             tools.append(Path.home() / ".local" / "bin")
         for d in tools:
@@ -26236,6 +26243,8 @@ def _measurement_grants(st: "State", tree: str | Path,
            "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": tmp,
            "XDG_STATE_HOME": str(state), "XDG_RUNTIME_DIR": str(runtime),
            "GNUPGHOME": gnupg}
+    if mise_cache is not None:
+        env["MISE_CACHE_DIR"] = str(mise_cache)
     if kind != STORE_FETCH_KIND:
         # pnpm 11 opens its store's SQLite index read-write for every install
         # and before every `pnpm <script>`, so against the read-only fetched
@@ -33193,6 +33202,42 @@ async def _enable_corepack_shims(grants: WorkerGrants, env: dict[str, str],
             die(f"{label} failed (exit {rc})\n(see {log_path})\n{tail}")
 
 
+MISE_INSTALL_LOCK_NAME = "mise-install.lock"
+MISE_INSTALL_LOCK_POLL_SEC = 1.0
+
+
+@contextlib.asynccontextmanager
+async def _mise_install_lock(st: "State") -> AsyncIterator[None]:
+    """Hold the host's one toolchain-install lock for the body: an exclusive
+    `flock` on `MISE_INSTALL_LOCK_NAME` in `_host_shared_dir`, which the
+    kernel drops when the holder exits, even on SIGKILL (DESIGN §6 *One
+    toolchain install at a time on a host*). Polled, so the event loop
+    keeps running while another run installs."""
+    d = _host_shared_dir(st)
+    d.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(d / MISE_INSTALL_LOCK_NAME), os.O_RDONLY | os.O_CREAT,
+                 0o644)
+    try:
+        t0 = time.monotonic()
+        logged = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not logged:
+                    log("  another run on this host is installing a "
+                        "toolchain — waiting for it")
+                    logged = True
+                await asyncio.sleep(MISE_INSTALL_LOCK_POLL_SEC)
+        if logged:
+            log(f"  toolchain install lock free after "
+                f"{time.monotonic() - t0:.0f}s")
+        yield
+    finally:
+        _close_fd(fd)
+
+
 async def _run_mise_install(repo_root: Path, log_dir: Path,
                             st: "State",
                             override_file: Path | None = None) -> None:
@@ -33250,22 +33295,27 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     # repository's commands are confined too*): one grant for the install
     # and the version read after it.
     grants = _measurement_grants(st, repo_root, TOOLCHAIN_KIND)
-    try:
-        rc, tail = await _run_streaming(
-            ["mise", "install"],
-            grants=grants,
-            cwd=str(repo_root),
-            env=env,
-            log_path=log_path,
-            label="mise install",
-            verbosity=verbosity,
-        )
-    except subprocess.TimeoutExpired as exc:
-        die(f"mise install timed out\n(see {log_path})\n{exc.output or ''}")
-    if rc != 0:
-        die(f"mise install failed (exit {rc})\n(see {log_path})\n{tail}")
-    await _enable_corepack_shims(grants, env, str(repo_root), log_path,
-                                 verbosity)
+    # One install and its corepack enable at a time across the host: every
+    # run shares `MISE_DATA_DIR` (DESIGN §6 *One toolchain install at a
+    # time on a host*).
+    async with _mise_install_lock(st):
+        try:
+            rc, tail = await _run_streaming(
+                ["mise", "install"],
+                grants=grants,
+                cwd=str(repo_root),
+                env=env,
+                log_path=log_path,
+                label="mise install",
+                verbosity=verbosity,
+            )
+        except subprocess.TimeoutExpired as exc:
+            die(f"mise install timed out\n(see {log_path})\n"
+                f"{exc.output or ''}")
+        if rc != 0:
+            die(f"mise install failed (exit {rc})\n(see {log_path})\n{tail}")
+        await _enable_corepack_shims(grants, env, str(repo_root), log_path,
+                                     verbosity)
 
     # Capture resolved versions. `mise ls --current --json` is the
     # documented machine-readable view; `mise current --json` does NOT
@@ -46085,14 +46135,20 @@ def _build_sem_slots(peak_bytes: int,
     return max(1, (avail - _BUILD_SEM_RESERVE_BYTES) // int(peak_bytes))
 
 
-def _build_sem_dir(st: "State") -> Path:
-    """Where the slot lock files live: the host-wide mount when the launcher
-    provided one, else the run's state root — host-wide on Fly/EC2, where
-    one run owns the machine."""
+def _host_shared_dir(st: "State") -> Path:
+    """The directory every run on the host shares for its locks: the
+    host-wide mount when the launcher provided one, else the run's state
+    root's `.host` — host-wide on Fly/EC2, where one run owns the machine.
+    No grant reaches it (`_reads_outside`, `_apart`)."""
     host = os.environ.get(_HOST_DIR_ENV, "").strip()
     if host and os.path.isdir(host) and os.access(host, os.W_OK | os.X_OK):
-        return Path(host) / "build-slots"
-    return Path(st.run_dir).parent.parent / ".host" / "build-slots"
+        return Path(host)
+    return Path(st.run_dir).parent.parent / ".host"
+
+
+def _build_sem_dir(st: "State") -> Path:
+    """Where the slot lock files live (`_host_shared_dir`)."""
+    return _host_shared_dir(st) / "build-slots"
 
 
 async def _acquire_build_slot(
