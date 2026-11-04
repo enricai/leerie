@@ -7828,6 +7828,14 @@ sample's probe never counts for the next.
   `tests/test_launcher_env_forwarding.py` and
   `tests/test_launcher_state_mount.py` stub `_code_dir`;
   `tests/test_run_repo_bring_back.py`'s launcher harnesses pass it.
+- `tests/test_host_finalize_runs_its_own_code.py` (2 test functions) —
+  `host-finalize.sh` runs the leerie code it was sourced from (review
+  round 40, execution F1). test_host_finalize_rebase's harness, with the
+  file sourced from a "snapshot" directory and `LEERIE_REPO` naming a
+  different "install": the rebaser seam and `host_apply_captured_deps`
+  are each given the snapshot's `orchestrator/leerie.py`, and the install's
+  appears in neither. Falsified (2026-11-04): the two arguments back on
+  `$LEERIE_REPO` fail both.
 - `tests/test_launch_snapshot_is_one_commit.py` (5 test functions) — the
   snapshot is one state of the install, and `LEERIE_COMMIT` names it
   (review round 39, execution E2 and E3). The launcher's snapshot span,

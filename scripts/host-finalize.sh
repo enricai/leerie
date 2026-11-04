@@ -66,6 +66,15 @@ _host_finalize_update_run_json() {
 # the operator's from the top of the work tree.
 _HOST_FINALIZE_PUSH_HOOKS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/push-hooks"
 
+# The leerie code this file belongs to: the orchestrator the rebaser and the
+# capture seam load (and, through it, their prompts) come from the tree this
+# file was sourced from, never from $LEERIE_REPO. The launcher sources it from
+# its launch's snapshot, so a finalize runs the code the run started with
+# even after the install was upgraded or edited (DESIGN §6 *A launch runs
+# only the leerie code it started with*); `leerie finalize <run-id>` and
+# `leerie config --apply-capture` source it from the install, and run that.
+_HOST_FINALIZE_CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
 # _host_finalize_hooks_dir <repo> — the hooks directory git itself would run
 # <repo>'s hooks from, printed absolute: `core.hooksPath` when set (a relative
 # one is relative to the top of the work tree, where git runs hooks), else
@@ -565,7 +574,7 @@ host_apply_captured_deps() {
   # The same value for the seam's log label as for its argument.
   # shellcheck disable=SC2097,SC2098
   USER_REPO="$USER_REPO" \
-    python3 -I - "$run_dir" "$USER_REPO" "$LEERIE_REPO/orchestrator/leerie.py" \
+    python3 -I - "$run_dir" "$USER_REPO" "$_HOST_FINALIZE_CODE/orchestrator/leerie.py" \
       <<'PY' >&2 || { echo "[leerie] capture: could not apply $run_dir/captured-deps.json; it is kept" >&2; return 1; }
 import importlib.util, pathlib, sys
 
@@ -869,7 +878,7 @@ PY
       ( USER_REPO="$USER_REPO" python3 -I "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
           "$USER_REPO" "$run_id" "$_rebase_worktree" "$run_branch" \
           "$working_branch" "$pr_base_branch" \
-          "$LEERIE_REPO/orchestrator/leerie.py" "$_rebaser_out" \
+          "$_HOST_FINALIZE_CODE/orchestrator/leerie.py" "$_rebaser_out" \
           >&2 ) || _rebaser_rc=$?
       if [ -f "$_rebaser_out" ]; then
         _rebaser_json="$(cat "$_rebaser_out" 2>/dev/null || true)"

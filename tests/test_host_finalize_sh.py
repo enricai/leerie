@@ -1073,14 +1073,14 @@ def test_rebase_fallback_arm_logs_and_persists_disposition(tmp_path):
                      'for _out; do :; done; '
                      'printf "not json at all" > "$_out"; exit 0',
         extra_env={
-            # Deliberately NOT REPO_ROOT. host-finalize.sh uses LEERIE_REPO for
-            # exactly one thing on this path — building the
-            # "$LEERIE_REPO/orchestrator/leerie.py" argument — and the stubbed
-            # `python3` never reads it. Pointing it at the real checkout gives a
-            # stub that miscounts its argv a live path to the orchestrator
+            # host-finalize.sh no longer reads LEERIE_REPO: the orchestrator
+            # argument is "$_HOST_FINALIZE_CODE/orchestrator/leerie.py", the
+            # tree the file was sourced from, here this checkout. So a stub
+            # that miscounts its argv has a live path to the orchestrator
             # source: an earlier revision of the stub below wrote to "${9}",
-            # which is that argument rather than the verdict file, and truncated
-            # the real orchestrator/leerie.py to 15 bytes.
+            # which is that argument rather than the verdict file, and
+            # truncated the real orchestrator/leerie.py to 15 bytes. The stub
+            # writes only its LAST argument for that reason.
             "LEERIE_REPO": str(tmp_path / "not-a-real-leerie-checkout"),
             "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
         },
@@ -1120,14 +1120,14 @@ def test_rebase_fallback_arm_persists_null_raw_json_when_payload_empty(tmp_path)
         tmp_path, run_dir,
         python3_body="exit 1",
         extra_env={
-            # Deliberately NOT REPO_ROOT. host-finalize.sh uses LEERIE_REPO for
-            # exactly one thing on this path — building the
-            # "$LEERIE_REPO/orchestrator/leerie.py" argument — and the stubbed
-            # `python3` never reads it. Pointing it at the real checkout gives a
-            # stub that miscounts its argv a live path to the orchestrator
+            # host-finalize.sh no longer reads LEERIE_REPO: the orchestrator
+            # argument is "$_HOST_FINALIZE_CODE/orchestrator/leerie.py", the
+            # tree the file was sourced from, here this checkout. So a stub
+            # that miscounts its argv has a live path to the orchestrator
             # source: an earlier revision of the stub below wrote to "${9}",
-            # which is that argument rather than the verdict file, and truncated
-            # the real orchestrator/leerie.py to 15 bytes.
+            # which is that argument rather than the verdict file, and
+            # truncated the real orchestrator/leerie.py to 15 bytes. The stub
+            # writes only its LAST argument for that reason.
             "LEERIE_REPO": str(tmp_path / "not-a-real-leerie-checkout"),
             "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
         },

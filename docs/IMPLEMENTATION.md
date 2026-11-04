@@ -725,7 +725,12 @@ started with*):
   also takes a `cfg-<pid>-code-*` a SIGKILL left); a remote runtime
   removes it.
 - `_bring_back_ran_run` and the post-exit `host_finalize` source
-  `$_code_dir/scripts/host-finalize.sh`, not the install's.
+  `$_code_dir/scripts/host-finalize.sh`, not the install's. The file
+  takes leerie's code from the tree it was sourced from,
+  `_HOST_FINALIZE_CODE` (`${BASH_SOURCE[0]%/*}/..`), never
+  `$LEERIE_REPO`: the rebaser seam and `host_apply_captured_deps` load
+  `$_HOST_FINALIZE_CODE/orchestrator/leerie.py`, whose `PROMPTS` are that
+  tree's `prompts/`.
 
 `scripts/remote/build-push.sh` provides the build-and-push path. By
 default it uses Fly's remote builder (no host Docker daemon required):
@@ -11091,8 +11096,9 @@ is canonical. Locally nothing in the container writes the user's checkout.
     `[A-Za-z0-9._-]`, not `.`/`..`; else usage, exit 1; exit 1 too when
     `<state>/runs/<run-id>/captured-deps.json` is absent) sources
     `scripts/host-finalize.sh` and runs `host_apply_captured_deps
-    <run-dir>`: host `python3` loads `$LEERIE_REPO/orchestrator/leerie.py`
-    by path (as the rebaser and `--recapture` seams do) and calls
+    <run-dir>`: host `python3` loads `orchestrator/leerie.py` of the tree
+    the file was sourced from (`_HOST_FINALIZE_CODE`; for this verb, the
+    install) by path (as the rebaser and `--recapture` seams do) and calls
     `apply_captured_deps(run_dir, $USER_REPO)`, which logs the change as a
     unified diff. Returns 1 (the verb exits 1) when the seam fails or the
     capture is refused.

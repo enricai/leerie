@@ -6270,7 +6270,12 @@ The mechanism:
   on the next `resume` of its run (`_reap_orphaned_container`).
 - The launcher's own steps after the container exits (bringing the run
   branch back, finalize) source `scripts/host-finalize.sh` from the same
-  copy, not from the install.
+  copy, not from the install, and that file runs every leerie file it
+  needs from the tree it was sourced from: the orchestrator the rebaser
+  loads, and with it the rebaser's prompt. *Review round 40 (execution
+  F1):* it loaded `$LEERIE_REPO/orchestrator/leerie.py`, the install, so
+  an install updated during the run ran the update's rebaser at this
+  run's finalize.
 - Why not the image's baked copy: the image is named by version
   (`leerie:<version>`), not by code. Every commit between two releases,
   and a contributor's edits, carry the version of the last release, so a
