@@ -22,6 +22,8 @@ import json
 
 import pytest
 
+from tests.conftest import source_segments
+
 
 def _schemas_dict_node(src: str) -> ast.expr:
     tree = ast.parse(src)
@@ -41,10 +43,11 @@ def _schemas_dict_node(src: str) -> ast.expr:
 def _schema_source_bytes(leerie_src_path) -> dict[str, int]:
     src = leerie_src_path.read_text()
     d = _schemas_dict_node(src)
+    segment = source_segments(src)
     out = {}
     for k, v in zip(d.keys, d.values):
         if isinstance(k, ast.Constant):
-            seg = ast.get_source_segment(src, v)
+            seg = segment(v)
             out[k.value] = len(seg.encode())
     return out
 

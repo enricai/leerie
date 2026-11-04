@@ -77,10 +77,24 @@ def _peak_under(leerie, monkeypatch, tmp_path, cap, n=6, tag=""):
 
     monkeypatch.setattr(leerie, "_run_streaming", _fake_run_streaming)
     leerie._DEPS_INSTALLED.clear()
+    # A `tests` axis also takes a host build slot (`_build_class_slot`), and
+    # that gate is sized from the host: `(MemAvailable - 4 GiB) // 6.3 GiB`
+    # with no measured peak, which is ONE slot on any host with under
+    # ~16.6 GiB available — a 16 GB GitHub runner. There it serialised every
+    # measurement whatever `blt_parallel` said, and the anti-vacuity partner
+    # below failed on CI only. This file's subject is `blt_parallel`, so the
+    # host gate is pinned wide (`blt_peak.slots`, which the slot count reads
+    # before memory) and its directory kept out of any shared host mount.
+    # The host's memory is pinned to that runner's, so dropping the pin
+    # fails here as it did there rather than only on a small host.
+    monkeypatch.setattr(leerie, "_mem_available_bytes",
+                        lambda *a: int(14.5 * 1024 ** 3))
+    monkeypatch.delenv(leerie._HOST_DIR_ENV, raising=False)
 
     async def _go():
         trees = [_tree(tmp_path, f"wt{tag}{i}") for i in range(n)]
-        sts = [types.SimpleNamespace(data={"provision": {"recipe": []}},
+        sts = [types.SimpleNamespace(data={"provision": {"recipe": []},
+                                           "blt_peak": {"slots": n}},
                                      save=lambda: None,
                                      run_dir=measure_run_dir(tmp_path))
                for _ in trees]

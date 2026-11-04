@@ -269,7 +269,14 @@ Current runtime deps:
   in-container AWS calls; none exist yet.
 
 `pytest` remains the sole dev dependency, run on the host against the
-bind-mounted source.
+bind-mounted source, with two of its plugins: `pytest-xdist` (CI runs the
+suite `-n 4`; every test is xdist-safe, and `tests/conftest.py` checks
+session-wide leaks from the controlling process only) and `pytest-timeout`
+(CI bounds each test with `--timeout`, so a hang fails one named test rather
+than the whole job). Neither is named in `pytest.ini`: under
+`--strict-config` an option a plugin owns is an error where the plugin is
+missing, so a host without them still runs the suite, serially and
+unbounded. CI also installs `pytest-cov` and `jsonschema`.
 
 ### Path A — Claude Code plugin marketplace (primary)
 

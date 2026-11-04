@@ -54,6 +54,7 @@ def test_host_psi_missing_file_is_none(leerie, tmp_path):
     assert leerie._host_cpu_psi(str(tmp_path / "absent")) is None
 
 
+@pytest.mark.real_host_pressure
 def test_gate_reads_the_host_file_never_a_cgroup(leerie):
     """The container cgroup's cpu.pressure reads ~0 while the host is
     saturated (Q9); the gate must read the host-wide /proc file."""
@@ -74,6 +75,24 @@ def test_gate_default_reader_is_the_module_reader(leerie, monkeypatch):
     monkeypatch.setattr(leerie, "_host_cpu_psi", fake)
     g = asyncio.run(leerie._confirm_gate(_caps(leerie)))
     assert seen and g["timed_out"] is False and g["psi"] == 1.0
+
+
+def test_conftest_makes_the_default_read_a_quiet_host(leerie, tmp_path):
+    """conftest's `_quiet_host_pressure`: a test whose subject is not the
+    gate does not wait on the host's load (up to 300 s a confirm), while a
+    named file is still parsed for real."""
+    f = tmp_path / "cpu"
+    f.write_text("some avg10=91.00 avg60=0.00 avg300=0.00 total=1\n")
+    assert leerie._host_cpu_psi() == 0.0
+    assert leerie._host_cpu_psi(str(f)) == 91.0
+    g = asyncio.run(leerie._confirm_gate(_caps(leerie)))
+    assert g["timed_out"] is False and g["waited_sec"] == 0.0
+
+
+@pytest.mark.real_host_pressure
+def test_the_marker_keeps_the_real_reader(leerie):
+    assert leerie._host_cpu_psi.__module__ == leerie.__name__
+    assert leerie._host_cpu_psi.__qualname__ == "_host_cpu_psi"
 
 
 # --- the gate --------------------------------------------------------------

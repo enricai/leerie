@@ -6,6 +6,7 @@ fixture.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import atexit
 import contextlib
@@ -13,10 +14,14 @@ import ctypes
 import importlib.util
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -398,6 +403,43 @@ def leerie():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+# The line breaks `ast` counts (`ast._splitlines_no_ff`): \r\n, \r and \n
+# only, so a form feed or U+2028 inside a line does not shift line numbers
+# the way `str.splitlines` would. A fixed format, matched mechanically.
+_AST_LINE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
+
+
+def source_segments(source: str) -> Callable[[ast.AST], str | None]:
+    """`ast.get_source_segment(source, node)`, with `source` split ONCE.
+
+    `ast.get_source_segment` re-splits the whole source on every call, and
+    on Python 3.10 and 3.11 that split is a pure-Python loop over every
+    character. Over leerie.py (about 1,700 functions in 3.5 MB) a loop of
+    calls cost about 26 minutes on 3.11 and more on 3.10, at COLLECTION
+    (tests/test_needs_human_sources_render.py derives its parameters at
+    import): the CI legs sat that long before their first test. Same result
+    for every node (tests/test_source_segments.py); the only one tests use.
+    """
+    lines = _AST_LINE.findall(source)
+
+    def segment(node: ast.AST) -> str | None:
+        try:
+            a, b = node.lineno, node.end_lineno
+            start, end = node.col_offset, node.end_col_offset
+        except AttributeError:
+            return None
+        if b is None or end is None:
+            return None
+        a, b = a - 1, b - 1
+        if a == b:
+            return lines[a].encode()[start:end].decode()
+        first = lines[a].encode()[start:].decode()
+        last = lines[b].encode()[:end].decode()
+        return "".join([first, *lines[a + 1:b], last])
+
+    return segment
 
 
 def _has_treesitter() -> bool:
@@ -1018,6 +1060,102 @@ def _restore_child_subreaper():
     """
     with child_subreaper_restored():
         yield
+
+
+# Every process a test starts carries this variable (its value is the test's
+# own), so it can be found after the test however it was started: in its own
+# process group or session, or reparented to init once its parent died.
+TEST_PROCESS_ENV = "PYTEST_LEERIE_TEST_ID"
+
+
+def processes_marked(marker: str) -> list[int]:
+    """The PIDs, other than this process, whose environment carries
+    `TEST_PROCESS_ENV=<marker>`. /proc is a fixed kernel format; a process
+    that is gone or not ours is skipped."""
+    needle = f"{TEST_PROCESS_ENV}={marker}".encode()
+    me, uid, out = os.getpid(), os.getuid(), []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == me:
+            continue
+        try:
+            if os.stat(f"/proc/{name}").st_uid != uid:
+                continue
+            with open(f"/proc/{name}/environ", "rb") as f:
+                env = f.read()
+        except OSError:
+            continue
+        if needle + b"\0" in env or env.endswith(needle):
+            out.append(int(name))
+    return out
+
+
+def kill_marked(marker: str, rounds: int = 5) -> list[int]:
+    """SIGKILL every process carrying `marker`, again while new ones appear
+    (a fork between a scan and its kill), and reap the ones that are this
+    process's own children. Returns what it killed."""
+    killed: list[int] = []
+    for _ in range(rounds):
+        pids = processes_marked(marker)
+        if not pids:
+            break
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+        for pid in pids:
+            with contextlib.suppress(ChildProcessError, OSError):
+                os.waitpid(pid, os.WNOHANG)
+    return killed
+
+
+@pytest.fixture(autouse=True)
+def _no_process_outlives_its_test(monkeypatch):
+    """Kill, at teardown, every process the test started that is still
+    alive.
+
+    A per-test timeout (pytest-timeout's signal method, CI) raises inside
+    the test, and `subprocess.run`'s own timeout kills only its direct
+    child: what that child started (the launcher's relay pipeline: `bash -c`
+    over `_log.sh`, its `bash` subshells, `terminal-text.py`) was left
+    running, reparented to init, for hours. Those children change process
+    group (`_build_job` puts a build in one of its own) and lose their
+    parent, so neither is a handle; the environment is, since every child
+    inherits it. Started after the session's and module's fixtures, so a
+    process one of those keeps across tests is not marked.
+    """
+    marker = uuid.uuid4().hex
+    monkeypatch.setenv(TEST_PROCESS_ENV, marker)
+    yield
+    kill_marked(marker)
+
+
+@pytest.fixture(autouse=True)
+def _quiet_host_pressure(request, monkeypatch):
+    """The B* confirm gate (`_confirm_gate`) waits, up to
+    `confirm_gate_wait_sec` (300 s) per confirm, for the HOST's CPU pressure
+    to fall below `confirm_psi_cpu_max`. A test whose subject is not that
+    gate then measured the host: on a loaded host (CI's 4 vCPUs under
+    `-n 4`, or a developer's) tests/test_clean_tree_gate.py's repair tests
+    took 559 s and 600 s, the second cut by the per-test timeout, against
+    39 s on a quieter one. A read of the default file is a quiet host here;
+    a read of a named file is real, so the reader's own tests still parse
+    one. Opt out with `@pytest.mark.real_host_pressure`.
+    """
+    if (request.node.get_closest_marker("real_host_pressure")
+            or "leerie" not in request.fixturenames):
+        yield
+        return
+    mod = request.getfixturevalue("leerie")
+    real = getattr(mod, "_host_cpu_psi", None)
+    if real is None:
+        yield
+        return
+
+    def quiet(path: str | None = None) -> float | None:
+        return 0.0 if path is None else real(path)
+
+    monkeypatch.setattr(mod, "_host_cpu_psi", quiet)
+    yield
 
 
 def judge_checkout_in_place(leerie, monkeypatch) -> None:

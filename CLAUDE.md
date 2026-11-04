@@ -10,7 +10,8 @@ Python 3.10+, stdlib-preferred orchestrator (runtime deps pinned in
 `requirements.txt` and listed in `docs/IMPLEMENTATION.md` §0). The
 orchestrator shells out to `claude -p` (Claude Code CLI, on the user's
 subscription — no API key) and uses git worktrees for parallel
-implementer isolation. `pytest` is the only dev dependency.
+implementer isolation. `pytest` is the only dev dependency, with two of its
+plugins: `pytest-xdist` and `pytest-timeout`, which CI runs it under.
 
 **Leerie runs inside a container.** The `leerie` launcher shells out to
 `nerdctl run` to start a container per run (DESIGN §6 *Worker subtree
@@ -45,7 +46,8 @@ deliberately kept as a single module rather than split across
 packages — the design goal is that you can read the whole control
 flow top-to-bottom in one sitting. Stdlib-preferred on the Python side
 — runtime deps are pinned in `requirements.txt` and listed in
-`docs/IMPLEMENTATION.md` §0; `pytest` is the sole dev dependency.
+`docs/IMPLEMENTATION.md` §0; `pytest` (with its `pytest-xdist` and
+`pytest-timeout` plugins) is the sole dev dependency.
 
 ## The three-layer rule (load-bearing — read first)
 
@@ -437,6 +439,13 @@ inventory itself.
   directly in any restore-test (pytest 9's fixture wrapper has no
   `__pytest_wrapped__`), and pin the flag to 0 *before* asserting, or an
   earlier test's leftover 1 makes a broken fixture pass by coincidence.
+- **No process outlives its test, and no test waits on the host's load.**
+  CI bounds every test (`--timeout=600`), which ends a hang by raising inside
+  the test; conftest's autouse `_no_process_outlives_its_test` then kills
+  every process carrying the test's `PYTEST_LEERIE_TEST_ID` (it survives a
+  new process group, `setsid` and reparenting), and `_quiet_host_pressure`
+  makes the B* confirm gate's default read a quiet host (opt out:
+  `@pytest.mark.real_host_pressure`). See `docs/TESTING.md` *CI time*.
 - `shellcheck` runs in CI but isn't on every dev host, and catches things
   `bash -n` cannot (SC1007 on a bare `LANGUAGE=` prefix; see
   `tests/test_launcher_integrity.py`).

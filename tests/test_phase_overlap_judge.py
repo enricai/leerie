@@ -28,7 +28,8 @@ try:
 except ImportError:
     jsonschema = None  # type: ignore
 
-from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
+from tests.conftest import (HAS_JSONSCHEMA, source_segments,
+                            validate_or_fallback_required)
 
 
 # --------------------------------------------------------------------- #
@@ -2117,6 +2118,7 @@ class TestProsePathParsingAbsent:
         import inspect
         src = inspect.getsource(leerie.check_overlap_judge_output)
         tree = ast.parse(src.lstrip())
+        segment = source_segments(src.lstrip())
         banned = {"split", "strip", "rstrip", "lstrip", "partition"}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -2125,7 +2127,7 @@ class TestProsePathParsingAbsent:
             if isinstance(fn, ast.Attribute) and fn.attr in banned:
                 # `.strip()` on a path entry is fine (mechanical string);
                 # what is banned is touching `artifact` itself.
-                seg = ast.get_source_segment(src.lstrip(), node) or ""
+                seg = segment(node) or ""
                 assert "artifact" not in seg or "artifact_paths" in seg, (
                     f"check_overlap_judge_output calls .{fn.attr}() on the "
                     f"artifact label: {seg!r}. `artifact` is prose; read "
