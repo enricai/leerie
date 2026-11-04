@@ -219,9 +219,15 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="${MISE_VERSION}" sh \
 # "idiomatic" files that are disabled by default. Without this flag,
 # a repo with `.nvmrc: 20.11.0` would silently run on baked LTS.
 #
-# NODE_COREPACK activates corepack so package.json's `packageManager`
-# field is honored — repo's pinned pnpm version wins, no global pin
-# needed.
+# NODE_COREPACK=false: mise's own `corepack enable` after a Node install
+# writes its shims next to the first `corepack` on PATH — the baked LTS
+# Node's bin below, whatever version mise installed — which a confined
+# toolchain install may not write (EROFS) and, unconfined, overwrote the
+# baked Node's pnpm. The baked Node is enabled into its own bin in the
+# `lts-current` step; leerie enables each version mise installs at runtime
+# into that version's bin (`_enable_corepack_shims`; DESIGN §6 *Each Node
+# version's corepack shims go in its own `bin`*). corepack still honors
+# package.json's `packageManager` — repo's pinned pnpm version wins.
 #
 # RUBY_COMPILE=false uses precompiled Ruby binaries instead of building
 # from source. Avoids needing the full ruby-build toolchain (autoconf,
@@ -233,7 +239,7 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="${MISE_VERSION}" sh \
 # lives (baked below). The resolver checks DATA_DIR first then falls
 # through to SYSTEM_DATA_DIR (mise.jdx.dev/mise-cookbook/docker.html).
 ENV MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=node,python,ruby,rust
-ENV MISE_NODE_COREPACK=true
+ENV MISE_NODE_COREPACK=false
 ENV MISE_RUBY_COMPILE=false
 ENV MISE_DATA_DIR=/home/leerie/.local/share/mise
 ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
@@ -270,7 +276,9 @@ RUN mise install --system node@lts python@3.12
 # because exactly one node version is installed in this layer.
 RUN set -eux; \
     node_dir="$(ls -d /usr/local/share/mise/installs/node/*/ | head -n1)"; \
-    ln -s "${node_dir%/}" /usr/local/share/mise/installs/node/lts-current
+    ln -s "${node_dir%/}" /usr/local/share/mise/installs/node/lts-current; \
+    "${node_dir%/}/bin/corepack" enable --install-directory "${node_dir%/}/bin"; \
+    test -L "${node_dir%/}/bin/pnpm"
 
 # PATH order:
 #   1. mise's system shims (mise install --system populates these).

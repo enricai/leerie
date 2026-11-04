@@ -500,9 +500,14 @@ Base layers (top-down):
   `ENV PATH` doesn't need the concrete version. These are the fallback
   versions mise's resolver uses when a repo declares none of its own
   (DESIGN §6½).
-- corepack activated via `MISE_NODE_COREPACK=true` so a repo's
-  `package.json` `packageManager` field selects its own pnpm/yarn (no
-  globally pinned pnpm baked). `npm install -g
+- corepack's shims for the baked LTS Node made at build by
+  `<lts>/bin/corepack enable --install-directory <lts>/bin` (in the
+  `lts-current` step), with mise's implicit enable off
+  (`MISE_NODE_COREPACK=false`): mise's enable writes next to the first
+  `corepack` on `PATH`, the baked Node's, whatever version it installed
+  (DESIGN §6 *Each Node version's corepack shims go in its own `bin`*). A
+  repo's `package.json` `packageManager` field still selects its own
+  pnpm/yarn (no globally pinned pnpm baked). `npm install -g
   '@anthropic-ai/claude-code@>=2.1.289'` installs the `claude` CLI
   (leerie enforces ≥2.1.22 at runtime for `--json-schema`, and ≥2.1.289
   only under `--dangerously-force-strict-output` — §2½ *Forced constrained
@@ -4805,7 +4810,8 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   (the tree's git toplevel; `kind=MEASURE_KIND`, `INSTALL_KIND` from
   `_install_settles`), `_settle_by_execution`, `_run_setup_hook`
   (`SETUP_HOOK_KIND`), `_run_mise_install` (`TOOLCHAIN_KIND`, one grant for
-  `mise install` and `mise ls --current --json`, the latter through
+  `mise install`, `_enable_corepack_shims`' enables and `mise ls --current
+  --json`, the latter through
   `run_proc(_confined_argv(…))`). The AST scripts take `grants` too:
   `_ts_resolvable(tree, *, grants)`, `_redrive_ast_hits(staging, base,
   head, *, grants)`, via `_redrive_ast_available(staging, *, grants)` and
@@ -10268,7 +10274,17 @@ branch, after the `_write_run_json(...)` block and before
    Ruby uses precompiled binaries (`MISE_RUBY_COMPILE=false` in the
    image) to avoid requiring the full ruby-build toolchain.
    Streams to `<state-root>/runs/<id>/logs/provision.log`. Nonzero exit
-   surfaces the failing tool+version to `die()`.
+   surfaces the failing tool+version to `die()`. The install's env sets
+   `MISE_NODE_COREPACK=false` whatever the image says; after a zero exit
+   `_enable_corepack_shims(grants, env, cwd, log_path, verbosity)` runs,
+   for each real directory `v` (not a symlink alias) under
+   `$MISE_DATA_DIR/installs/node/` holding `bin/corepack` but no
+   `bin/pnpm`, `[v/bin/corepack, "enable", "--install-directory",
+   v/bin]` through `_run_streaming` under the same toolchain grant
+   (label `corepack enable <version>`); a nonzero exit `die()`s, as mise's
+   own failed enable failed the install. Never a directory under
+   `MISE_SYSTEM_DATA_DIR` (DESIGN §6 *Each Node version's corepack shims
+   go in its own `bin`*). Pinned by `tests/test_corepack_shim_dir.py`.
 5. **Version capture.** Runs `mise ls --current --json` (the
    subcommand `mise current --json` does not exist; verified
    against mise.usage.kdl) via `run_proc` bounded by
