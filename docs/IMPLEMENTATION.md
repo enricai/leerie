@@ -236,9 +236,11 @@ name is hex on both sides).
 
 The orchestrator's
 source is baked into the image at `/opt/leerie-image/`; on local runs
-the launcher's bind mount (`-v $LEERIE_REPO:/opt/leerie-image:ro`)
-shadows the baked copy, so iterating on `orchestrator/leerie.py` needs
-no image rebuild.
+the launcher mounts its launch's own copy over it
+(`-v $_code_dir:/opt/leerie-image:ro`, `_snapshot_leerie_code`, §0.5
+*Baked source*), so iterating on `orchestrator/leerie.py` needs no image
+rebuild, and an edit or upgrade of the install never reaches a running
+run (DESIGN §6 *A launch runs only the leerie code it started with*).
 
 The orchestrator prefers stdlib. Third-party runtime libraries are
 permitted only when they replace non-trivial logic with a widely-used
@@ -519,8 +521,8 @@ Base layers (top-down):
   `/opt/leerie-vendor/node_modules/typescript` — `BUNDLED_TYPESCRIPT` in
   `leerie.py`, the fallback `scripts/load-typescript.cjs` loads when the
   tree's own `typescript` has no compiler API (DESIGN §8 *Delivery
-  detection*). Outside `/opt/leerie-image` because local runs bind-mount
-  over that path. Root-owned and world-readable (`a+rX`), read-only by
+  detection*). Outside `/opt/leerie-image` because local runs mount the
+  launch's copy of leerie's code over that path. Root-owned and world-readable (`a+rX`), read-only by
   every runtime: rootless (root-owned is readable to the remapped user),
   rootful `runuser -u leerie` and Fly/EC2 only ever read it, so no chown
   applies.
@@ -565,7 +567,7 @@ relevant bash surface:
 | `leerie_buildkit_resolve` | `scripts/dockerfile-frontend.sh` | Finds the BuildKit daemon `nerdctl --namespace $LEERIE_IMAGE_NS build` uses, as nerdctl 2.3.5 finds it: `$BUILDKIT_HOST`, else the first of `unix://<dir>/buildkit-$LEERIE_IMAGE_NS/buildkitd.sock`, `…/buildkit-default/…` and `…/buildkit/…` (`<dir>` = `$XDG_RUNTIME_DIR`, or `/run/user/<uid>` when unset; `/run` as root and on Darwin) for which `buildctl --addr <a> debug workers --format '{{json .}}'` succeeds (its stdout and stderr together; the first line that parses as JSON is the workers' list) — run through `_leerie_on_buildkit_side`, which on Darwin is `colima ssh -- sudo …` (not measured on macOS). Sets `LEERIE_BUILDKIT_HOST` to it and `LEERIE_BUILDKIT_WORKER_NS` to the space-separated, de-duplicated `org.mobyproject.buildkit.worker.containerd.namespace` labels of its workers (host `python3 -I -S`); returns 1 when no daemon answers, or the first that answers has no such label or one that is not a containerd namespace name (`[A-Za-z0-9]+([._-][A-Za-z0-9]+)*`), with why in `LEERIE_BUILDKIT_RESOLVE_ERROR`: the addresses asked, buildctl's last line of output, and the remedy (start buildkitd, or set `BUILDKIT_HOST`), or which daemon answered without a usable containerd worker. A set `LEERIE_BUILDKIT_HOST` returns 0 at once |
 | `leerie_buildkit_check` | `scripts/dockerfile-frontend.sh` | Returns 1, with the reason in `LEERIE_BUILDKIT_REFUSAL` (holding `LEERIE_BUILDKIT_RESOLVE_ERROR`), when `leerie_buildkit_resolve` fails or a namespace in `LEERIE_BUILDKIT_WORKER_NS` is `$LEERIE_IMAGE_NS`; else 0. Called before a repository build (the launcher, with `leerie_sweep_worker_images`), at the top of `build_repo_image` (`_repo_build_fail` on 1), and before `build-push.sh --local-build`'s nerdctl build (exit 1) |
 | `leerie_sweep_worker_images` | `scripts/dockerfile-frontend.sh` | For each namespace in `LEERIE_BUILDKIT_WORKER_NS`: lists `nerdctl --namespace <ns> images --format '{{.Repository}}:{{.Tag}}'`, runs `nerdctl --namespace <ns> image rm <name>` (never `-f`) on each name matching `leerie-repo/*` or `docker.io/leerie-repo/*`, lists again, and returns 1 with the reason in `LEERIE_BUILDKIT_REFUSAL` when a listing fails, or naming what is left and each container that holds it (`nerdctl --namespace <ns> ps -a --format '{{.ID}}|{{.Image}}|{{.Status}}'`, its image the name, with or without `docker.io/`), with its status and remedy: `Up…` → end its run (`leerie stop <run-id>`) or let it end; otherwise → `nerdctl --namespace <ns> rm <id>`. No `image rm` advice. Called after `leerie_buildkit_check`, before a repository build: by the launcher (`_repo_build_fail` on 1) and by `build-push.sh --local-build` with nerdctl (exit 1) |
-| `check_command_line(argv)` | `orchestrator/leerie.py` | Parse-only: `_parse_command_line(_leerie_arg_parser(), argv)`, then 0; argparse exits 2 with its usage and message on a line it refuses. `_leerie_arg_parser()` builds `main()`'s parser and nothing else; `_parse_command_line(ap, argv)` pops `resume`/`list` and `resume`'s positional run-id (`_extract_resume_run_id`) and returns `(args, run_id, is_resume, is_list)`, which `main()` uses too. The launcher runs it after the `--inspect-dir` translation and the `REWRITTEN_ARGS` pass (moved, with the `skip_repo_map` resolution, ahead of the base build) and before the base build: `python3 -I -S -B -c` on `$LEERIE_REPO/orchestrator/leerie.py`, over `REWRITTEN_ARGS` and `REWRITTEN_TAIL`, `exit $?` on a non-zero status; an exception loading the module exits 0 (DESIGN §6 *A command line is refused before any image step*). The program reads the module's bytes, and loads the code object kept at `$HOME/.cache/leerie/bytecode/<sha256(importlib.util.MAGIC_NUMBER + source)>` (`marshal`; the entry's mtime touched); a missing or unreadable entry is compiled (`compile(data, src, "exec", dont_inherit=True)`) and written there (directory 0700, a `.<pid>.tmp` file `os.replace`d), and every other entry but the three most recently used is removed. The code runs in a `types.ModuleType("leerie_orch")` with `__file__` the source path, registered in `sys.modules` |
+| `check_command_line(argv)` | `orchestrator/leerie.py` | Parse-only: `_parse_command_line(_leerie_arg_parser(), argv)`, then 0; argparse exits 2 with its usage and message on a line it refuses. `_leerie_arg_parser()` builds `main()`'s parser and nothing else; `_parse_command_line(ap, argv)` pops `resume`/`list` and `resume`'s positional run-id (`_extract_resume_run_id`) and returns `(args, run_id, is_resume, is_list)`, which `main()` uses too. The launcher runs it after the `--inspect-dir` translation and the `REWRITTEN_ARGS` pass (moved, with the `skip_repo_map` resolution, ahead of the base build) and before the base build: `python3 -I -S -B -c` on `$_code_snapshot/orchestrator/leerie.py` (the launch's snapshot, `_snapshot_leerie_code`), over `REWRITTEN_ARGS` and `REWRITTEN_TAIL`, `exit $?` on a non-zero status; an exception loading the module exits 0 (DESIGN §6 *A command line is refused before any image step*). The program reads the module's bytes, and loads the code object kept at `$HOME/.cache/leerie/bytecode/<sha256(importlib.util.MAGIC_NUMBER + source)>` (`marshal`; the entry's mtime touched); a missing or unreadable entry is compiled (`compile(data, src, "exec", dont_inherit=True)`) and written there (directory 0700, a `.<pid>.tmp` file `os.replace`d), and every other entry but the three most recently used is removed. The code runs in a `types.ModuleType("leerie_orch")` with `__file__` the source path, registered in `sys.modules` |
 | `leerie_lock <file> <what>` | `scripts/dockerfile-frontend.sh` | Takes an exclusive lock on `<file>` (`mkdir -p` of its directory) and returns once it is held, the holder's PID in `LEERIE_LOCK_HOLDER`; returns 0 with no lock and an empty holder when `<file>` is empty. The holder is `python3 -I -S -c "$_LEERIE_LOCK_PY" <file> <ready> $$`, backgrounded with no stdio: `fcntl.flock(LOCK_EX \| LOCK_NB)` every 0.2 s until held, exiting if the launcher (`$$`) is gone; then writes `<file>.ready.$$.$RANDOM`, which the shell polls every 0.1 s (logging "waiting for `<what>`..." once, after 2 s; returns 1 if the holder dies first) and removes; then exits within 0.5 s of the launcher's end, or at SIGTERM (status 0). No descriptor of the shell's holds the lock (DESIGN §6 *A host-wide image step runs once, under a host lock*) |
 | `leerie_unlock <holder>` | `scripts/dockerfile-frontend.sh` | `kill` and `wait` the holder; nothing for an empty one |
 | `_leerie_image_lock` | before the base-build block | `$_leerie_host_dir/image.lock` (the host-wide directory, resolved there now). The base build takes it when `image inspect "$IMAGE_TAG"` fails and inspects again under it, building only when still absent; the per-repo block takes it around `leerie_sweep_worker_images`, `ensure_base_in_worker_ns` and `ensure_frontend_in_worker_ns` |
@@ -672,9 +674,44 @@ as-is — no UID matching required.
 **Baked source.** The Dockerfile's `COPY` instructions bake
 `orchestrator/`, `scripts/`, `prompts/`, and `.claude-plugin/` into the
 image at `/opt/leerie-image/`, so a Fly Machine that pulls it can run the
-orchestrator with no bind mount. Local runs' `-v
-$LEERIE_REPO:/opt/leerie-image:ro` bind mount shadows the baked copy, so
-development iteration works without rebuilding.
+orchestrator with no bind mount. Local runs mount the launch's own copy
+of the four directories over it (`-v $_code_dir:/opt/leerie-image:ro`), so
+development iteration works without rebuilding; the install directory
+itself is never mounted (DESIGN §6 *A launch runs only the leerie code it
+started with*):
+
+- `_snapshot_leerie_code SRC DEST` (launcher, every runtime, before the
+  command-line check and so before any image step; `DEST` is
+  `$_code_snapshot`, `mktemp -d ~/.cache/leerie/cfg-<pid>-code-XXXXXX`):
+  `orchestrator/`, `scripts/`, `prompts/` and `.claude-plugin/` of `SRC`
+  (`$LEERIE_REPO`) into `DEST`, and sets `LEERIE_COMMIT` (no longer read
+  at launcher start). When `SRC/.git` exists, `HEAD` is read once (`rev-parse --verify -q
+  'HEAD^{commit}'`; unresolved, it returns 1, "has no commit to run"), and
+  when `git --no-optional-locks status
+  --porcelain --untracked-files=all -- <dirs>` is empty, `git archive
+  <HEAD> -- <dirs> | tar -xf - -C DEST` and `LEERIE_COMMIT=<short HEAD>`.
+  When the status is not empty: with the index lock
+  (`rev-parse --git-path index.lock`) absent and `_leerie_checkout_state`
+  (HEAD and `ls-files -s -- <dirs>`) read, `_leerie_worktree_tree` twice
+  (`GIT_INDEX_FILE=<private> read-tree HEAD; add -A -- <dirs>;
+  write-tree`, the private indexes in `mktemp -d ~/.cache/leerie/idx-…`,
+  removed); the two ids equal, the lock still absent and the state
+  unchanged, or it returns 1 ("changed while this launch read it");
+  `git archive <tree>` and `LEERIE_COMMIT=<short HEAD>-dirty.<tree:12>`.
+  No `SRC/.git` (not a git checkout): `cp -pR` of each directory, then `diff
+  -r -q` of each against `SRC`, a difference returns 1 ("changed while
+  this launch copied it"); `LEERIE_COMMIT` empty. Then the snapshot's
+  `plugin.json` version (the same `awk` extraction as `LEERIE_VERSION`)
+  must equal `LEERIE_VERSION`; otherwise it returns 1 naming both
+  versions. A return of 1 exits the launch 1. `$_code_snapshot` is
+  removed by the EXIT traps until `$STAGE` exists (`_code_snapshot_done`;
+  the trap the repository-image block sets removes it too), then the
+  local runtime `mv`s it to `$_code_dir` = `$STAGE/leerie-code`, which
+  lives and dies with `$STAGE` (its EXIT trap, `_sweep_stale_stages`, which
+  also takes a `cfg-<pid>-code-*` a SIGKILL left); a remote runtime
+  removes it.
+- `_bring_back_ran_run` and the post-exit `host_finalize` source
+  `$_code_dir/scripts/host-finalize.sh`, not the install's.
 
 `scripts/remote/build-push.sh` provides the build-and-push path. By
 default it uses Fly's remote builder (no host Docker daemon required):
@@ -926,7 +963,7 @@ LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" exec python3 "$BROKER" --spawn \
 
 The orchestrator's source lives at `/opt/leerie-image/`. It is present in two ways depending on execution mode:
 
-- **Local runs:** the launcher bind-mounts `$LEERIE_HOME` read-only at `/opt/leerie-image`. Iterating on `orchestrator/leerie.py` does not need an image rebuild — the bind mount shadows the baked copy and the host file is picked up on the next `leerie` invocation.
+- **Local runs:** the launcher mounts its launch's own copy of the code (`$STAGE/leerie-code`, `_snapshot_leerie_code`) read-only at `/opt/leerie-image`. Iterating on `orchestrator/leerie.py` does not need an image rebuild — the copy shadows the baked one, and an edit is picked up on the next `leerie` invocation, never by a run already running (DESIGN §6 *A launch runs only the leerie code it started with*).
 - **Fly.io Machines (remote):** there is no bind mount. The Dockerfile `COPY` instructions bake `orchestrator/`, `scripts/`, `prompts/`, and `.claude-plugin/` into the image at `/opt/leerie-image/` so the entrypoint resolves without any host-side path. A new leerie version requires rebuilding and pushing the image (see §0.5 "Registry publish path").
 
 ### Bind-mount table
@@ -937,7 +974,7 @@ The launcher passes the following mounts to `nerdctl run`:
 |---|---|---|---|
 | `$(pwd -P)` (user repo) | `/work` | ro | The repo leerie operates on, read only: leerie fetches from it into the run's own repository, and nothing in the container writes it (DESIGN §6 *The run's own repository*, *The explicit channel*). Every worktree, and all run state, lives under `/leerie-state` (see below); the run branch comes back by the host-side bring-back. |
 | `$LEERIE_STATE_HOST_DIR` (resolved host state dir) | `/leerie-state` | rw | *Local mode only.* Leerie run state (state.json, runs/, logs/, worktrees/). Mounted at a top-level container path distinct from `/work` so the repo checkout stays pristine — no `.leerie/` dir accumulates inside the project. The orchestrator reads the container path from `LEERIE_STATE_DIR=/leerie-state` (passed as `-e` in the same `nerdctl run` invocation). `LEERIE_STATE_HOST_DIR` is resolved on the host by the launcher before launch; see §2 "Host-side per-repo state directory". |
-| `$LEERIE_HOME` (leerie install dir) | `/opt/leerie-image` | ro | *Local mode only.* Orchestrator source + Dockerfile + prompts. Read-only because the container has no business mutating the install. Shadows the baked COPY layer so edits to `orchestrator/leerie.py` take effect without an image rebuild. Absent in registry / fly.io mode — the baked COPY layer is used directly. |
+| `$STAGE/leerie-code` (`$_code_dir`: the launch's snapshot of `orchestrator/`, `scripts/`, `prompts/`, `.claude-plugin/`, `_snapshot_leerie_code`) | `/opt/leerie-image` | ro | *Local mode only.* The leerie code this launch runs, one snapshot of the install taken when the launch starts (before any image step), never the install directory itself, so an upgrade or edit of the install never reaches a running run (DESIGN §6 *A launch runs only the leerie code it started with*). Read-only because the container has no business mutating it. Shadows the baked COPY layer so edits to `orchestrator/leerie.py` take effect on the next launch without an image rebuild. Absent in registry / fly.io mode — the baked COPY layer is used directly. |
 | `$STAGE` (per-run host scratch — same tree seed-auth.sh/ec2-seed-auth.sh tar-pipe to Fly/EC2) | `/opt/leerie-claude-json-src` | **ro** | The per-container copy of `~/.claude.json` (with `projects[]` stripped) lives at `$STAGE/.claude.json`; `$STAGE` is bind-mounted read-only at this staging path — `.claude.json` is never bind-mounted directly onto `/home/leerie/.claude.json`. A shared mount there is a documented `claude-code` corruption race (anthropics/claude-code #28847, #29217, #29395, #40226) and the CLI's atomic rename() write returns `EBUSY` on a bind-mounted single file, forcing a non-atomic truncate fallback with a demonstrated corruption window under concurrent workers. `scripts/container-entry.sh` instead copies it to `/home/leerie/.claude.json` as a real file at container start (root-owned under rootless, `chown`ed to `leerie:` under rootful) — mirroring the tar-copy pattern the remote runtimes use. |
 | `$STAGE/.claude` (per-run host scratch) | `/home/leerie/.claude` | rw | Per-container copy of `~/.claude/` with bulky/prior-session/history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `stats-cache.json`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`, `.last-cleanup`, `settings.json.*`, `plugins/cache/`, `plugins/marketplaces/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/installed_plugins.json` + siblings, `mcp-needs-auth-cache.json`, `settings.json`, `local/`, `statsig/`, `cache/`, `package.json`, `policy-limits.json`) ride along. `plugins/cache/`/`marketplaces/` are rebuilt on the remote for the fly runtime (`scripts/remote/seed-auth.sh` step 4). |
 | `_extract_claude_credentials_json` → `$STAGE/.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` | rw | Resolves which Claude OAuth credential to use, in order: `$CLAUDE_CODE_OAUTH_TOKEN` first when set (synthesized into `{"claudeAiOauth":{"accessToken":…,"scopes":["user:inference"]}}` — `scopes` is mandatory, the CLI rejects a scope-less blob); then Keychain (`security find-generic-password -w`, macOS only); then `$HOME/.claude/.credentials.json`. A container can't refresh a copied token, so the long-lived token wins over file-based sources (DESIGN §6 *Credential strategy*). Keychain/on-disk branches are shape-checked via `_claude_creds_has_oauth_token` (non-empty `claudeAiOauth.accessToken`), guarding an upstream CLI bug (steipete/CodexBar#1844) where Keychain can hold only `{"mcpOAuth": {...}}` with no usable token even while the host CLI works — `claude /login` does not repair this. A failing source is treated as empty and resolution falls through; rejection reason goes to a PID-scoped temp file (`$_CLAUDE_CREDS_REJECT_REASON_FILE`, since the caller reads the helper via `$(...)` subshell). All branches write the same JSON shape at mode 600. When `$CLAUDE_CODE_OAUTH_TOKEN` is set the launcher also forwards it as a container env var unconditionally, since that path survives past the file blob's `expiresAt`. Same helper populates `LEERIE_WORKER_ENV_JSON`'s `LEERIE_CLAUDE_CREDS_B64` for the `chain` arm. **On failure**, with no Bedrock auth mechanism active, the STAGE-assembly block `die()`s immediately rather than running a container doomed to fail the smoke test; the message names the mcpOAuth bug and recommends `claude setup-token` or standard `/login` guidance. Exempted when either Bedrock auth mode is active. |
@@ -12903,7 +12940,7 @@ command line overrides it.
 | `run_layout` | int | `RUN_LAYOUT_VERSION` at the run's fresh start, never rewritten by a resume. Absent on every run directory made before the field (an older layout). `resume` and `--phase` refuse a run whose value differs (`_refuse_other_run_layout`), and `leerie list` shows such a run with work left as `other-leerie` (DESIGN §6 *A run directory is continued only by a leerie of its layout*). |
 | `base_sha` | str | the commit `setup-run.sh` cut the run branch from, recorded once by `phase_execute`; every comparison leerie makes against the base reads it (`_diff_base`), never the working branch's name. |
 | `leerie_version` | str | the leerie version string from `.claude-plugin/plugin.json`, seeded once at the run's original start and **immutable across resumes** (N38) — a resume no longer overwrites it with whatever is installed at resume time, since doing so made a resumed run's failures read as attributable to the wrong release. |
-| `leerie_commit` | str \| null | short sha of `$LEERIE_REPO`'s HEAD, forwarded by the launcher as `LEERIE_COMMIT`, seeded once at the run's original start and **immutable across resumes** (N38), same rationale as `leerie_version`. |
+| `leerie_commit` | str \| null | short sha of the commit the launch's code snapshot holds (`<sha>-dirty.<tree>` for a checkout with edits; `_snapshot_leerie_code`), forwarded by the launcher as `LEERIE_COMMIT`, seeded once at the run's original start and **immutable across resumes** (N38), same rationale as `leerie_version`. |
 | `leerie_versions` | list[dict] | append-only resume history (N38), distinct from the immutable `leerie_version`/`leerie_commit` pair above. |
 | `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. |
 | `requirement_coverage` | dict | the requirement-coverage gate's record, written by `phase_classify` (DESIGN §8 *Requirement coverage*): `{spans[{id, parent}], sections[{id, source}], reports[], closure[], holes{}}`. `spans`/`sections` are the IDs `_d1_split_spans`/`_d1_split_sections` assigned (no text); `parent` is the mechanical nesting link `_d1_judge_packs` groups by; `reports` the inlined report paths; `closure` the S/R ids `_d1_closure` derives; `holes` the residual `_d1_coverage_holes` findings after the check rounds (`{}` when none). |

@@ -3,9 +3,11 @@
 # Built locally on first `leerie` run; tagged `leerie:<VERSION>` so a leerie upgrade
 # rebuilds once and reuses layers thereafter.
 #
-# LOCAL MODE: the launcher bind-mounts $LEERIE_HOME → /opt/leerie-image:ro at
-# runtime, shadowing the baked-in COPY layers. Editing orchestrator/leerie.py
-# on the host takes effect on the next run without an image rebuild.
+# LOCAL MODE: the launcher mounts its launch's own copy of the install's code
+# at /opt/leerie-image:ro (never the install itself: DESIGN §6 *A launch runs
+# only the leerie code it started with*), shadowing the baked-in COPY layers.
+# Editing orchestrator/leerie.py on the host takes effect on the next launch
+# without an image rebuild, and never on a run already running.
 #
 # REGISTRY / FLY MODE: the COPY instructions below bake orchestrator/,
 # scripts/, prompts/, and .claude-plugin/ into /opt/leerie-image/ so the
@@ -417,8 +419,8 @@ RUN chown -R leerie: /tmp/.cache \
 # Bake the orchestrator source into the image at /opt/leerie-image/ so the
 # image is self-contained on Fly.io Machines (no host bind mount available).
 # Lives OUTSIDE /work so the remote-seed phase can `rm -rf /work` without
-# clobbering the orchestrator code. Local runs bind-mount the host leerie
-# repo at /opt/leerie-image:ro (see launcher) — same path inside the
+# clobbering the orchestrator code. Local runs mount the launch's copy of the
+# host leerie code at /opt/leerie-image:ro (see launcher) — same path inside the
 # container, so /opt/leerie-image/orchestrator/leerie.py works identically
 # in both modes. COPY runs as root; chown transfers ownership to leerie.
 COPY orchestrator/ /opt/leerie-image/orchestrator/

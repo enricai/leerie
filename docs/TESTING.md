@@ -7760,6 +7760,38 @@ sample's probe never counts for the next.
   contents leave four entries, the current one among them. Falsified
   (2026-11-04): a compile forced on every run fails the first, and only
   it.
+- `tests/test_launch_runs_its_own_code.py` (3 test functions) — a launch
+  runs only the leerie code it started with (DESIGN §6 *A launch runs only
+  the leerie code it started with*; the 2026-11-03 upgrade under five
+  running 0.43.0 runs). The launcher's own snapshot and staging spans and
+  real `_run_argv`, against a fake `nerdctl` that, while "running", has
+  the test replace the install's `landlock_exec.py` and then reads the
+  shim through its `/opt/leerie-image` mount: it reads the old shim, from
+  a copy under `~/.cache/leerie`, removed at exit. An install that changed
+  version stops the launch before any container; the bring-back sources
+  the launch's copy of `host-finalize.sh`. Falsified (2026-11-04), each
+  failing its own test: `$LEERIE_REPO` mounted again, the version check
+  dropped, the install's `host-finalize.sh` sourced.
+  `tests/test_launcher_env_forwarding.py` and
+  `tests/test_launcher_state_mount.py` stub `_code_dir`;
+  `tests/test_run_repo_bring_back.py`'s launcher harnesses pass it.
+- `tests/test_launch_snapshot_is_one_commit.py` (5 test functions) — the
+  snapshot is one state of the install, and `LEERIE_COMMIT` names it
+  (review round 39, execution E2 and E3). The launcher's snapshot span,
+  verbatim: a clean checkout gives its commit's tree and short sha; a
+  contributor's edit and a new prompt run, `LEERIE_COMMIT` is
+  `<short>-dirty.<12 hex>`, `git archive <tree>` reproduces the snapshot,
+  and nothing is staged; a non-git install is copied with an empty commit;
+  a non-git install changed under the copy stops the launch; 25 snapshots
+  while `git checkout` flips the install between two same-version commits:
+  every accepted one is whole, one commit's and equal to the code its
+  `LEERIE_COMMIT` names, and every other one stopped with its reason.
+  Falsified (2026-11-04), one change at a time: a git checkout copied
+  with `cp -pR` instead of archived fails the flipping test; edits
+  recorded as the bare commit fail the edits test; the non-git copy left
+  uncompared fails the changed-under-copy test. `tests/test_leerie_commit.py`'s
+  two launcher pins run the span (a git install: the short sha; no git:
+  empty, status 0).
 - `tests/test_capture_validation.py` — E2's proof turned around: the schema,
   `_filter_residual_deps`, `_capture_problems`, `_record_capture`,
   `_merge_capture_into_config`, `apply_captured_deps`, the launcher's apt

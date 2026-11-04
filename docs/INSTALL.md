@@ -302,7 +302,7 @@ agent.
 |---|---|---|---|
 | `$(pwd)` (your repo) | `/work` | rw | Worktrees written under the repo, which stays clean. |
 | Resolved host state dir | `/leerie-state` | rw | Default `$HOME/.leerie/<basename>/` (`LEERIE_STATE_DIR`); outside the repo, no `.gitignore` needed. |
-| `$LEERIE_HOME` (leerie install) | `/opt/leerie-image` | ro | Edits picked up next run without a rebuild. |
+| A copy of the leerie install's code, taken at launch | `/opt/leerie-image` | ro | Edits picked up by the next launch without a rebuild; a running run keeps the code it started with, so upgrading never changes it. |
 | Scratch `~/.claude.json`/`.claude/`/credential | `/home/leerie/.claude*` | rw | `projects[]`-stripped; avoids a shared-file corruption race. Credential: token > Keychain > disk. |
 | Scratch git/SSH/GPG config | `/home/leerie/.<same>` | rw | Private copies vanish on exit. |
 | Each `--inspect-dir` path | `/inspect/<basename>` | ro | Read-only context for inspect-bucket workers. |

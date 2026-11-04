@@ -187,18 +187,26 @@ class TestRendering:
 
 
 class TestLauncher:
-    def test_computes_the_short_sha(self):
-        assert 'LEERIE_COMMIT="$(git -C "$LEERIE_REPO" rev-parse --short HEAD' \
-            in LAUNCHER
+    def test_computes_the_short_sha(self, tmp_path):
+        """Run, not read: the launcher's snapshot span over a git install
+        sets the short sha of the commit it snapshotted (the record and the
+        code are one read since review round 39, E2)."""
+        from tests.test_launch_snapshot_is_one_commit import (
+            _git, _install, _run)
+        inst = _install(tmp_path)
+        rc, out, err = _run(tmp_path, inst)
+        assert rc == 0, err
+        assert out.splitlines()[1] == _git(inst, "rev-parse", "--short",
+                                           "HEAD")
 
-    def test_git_failure_cannot_fail_a_run(self):
-        """A tarball install has no checkout; that is normal, not an error."""
-        m = re.search(r'LEERIE_COMMIT="\$\([^\n]*\)"', LAUNCHER)
-        assert m, "LEERIE_COMMIT assignment not found"
-        line = m.group(0)
-        assert "2>/dev/null" in line, "git stderr must not reach the operator"
-        assert "|| true" in line, (
-            "a non-checkout install must yield empty, not abort under set -e")
+    def test_git_failure_cannot_fail_a_run(self, tmp_path):
+        """An install that is not a git checkout is normal, not an error:
+        the launch goes on with an empty commit."""
+        from tests.test_launch_snapshot_is_one_commit import _install, _run
+        inst = _install(tmp_path, git=False)
+        rc, out, err = _run(tmp_path, inst)
+        assert rc == 0, err
+        assert (out.splitlines() + [""])[1] == ""
 
     def test_forwarded_into_the_container(self):
         # `${VAR:-}`, not a bare `$VAR`: the run-argv array is extracted and

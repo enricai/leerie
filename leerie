@@ -126,14 +126,14 @@ LEERIE_VERSION="$(awk -F'"' '/"version"/ {print $4; exit}' \
                   "$LEERIE_REPO/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
 IMAGE_TAG="leerie:$LEERIE_VERSION"
 
-# The commit the launcher is actually running, recorded alongside the version.
-# plugin.json only moves on a `chore(release):` commit, while install.sh tracks
-# `main` (DEFAULT_REF), so every run between releases reports the same version
-# whether or not it carries a given fix — enough to look attributable, not
-# enough to attribute. Empty when $LEERIE_REPO is not a git checkout (a tarball
-# install), which is a normal state, never an error: `rev-parse` is local-only,
-# so this cannot hang, and a failure here must never fail a run.
-LEERIE_COMMIT="$(git -C "$LEERIE_REPO" rev-parse --short HEAD 2>/dev/null || true)"
+# LEERIE_COMMIT, the commit the launch runs, recorded alongside the version:
+# set by _snapshot_leerie_code below, from the one snapshot of the code the
+# launch runs (DESIGN §6 *A launch runs only the leerie code it started
+# with*), never read from the install separately. plugin.json only moves on a
+# `chore(release):` commit, while install.sh tracks `main` (DEFAULT_REF), so
+# every run between releases reports the same version whether or not it
+# carries a given fix. Empty for an install that is not a git checkout.
+LEERIE_COMMIT=""
 
 # --- fast paths that don't need the container ----------------------------
 # `leerie version` should answer immediately without spinning up a container
@@ -6738,17 +6738,149 @@ if [ "$IS_RESUME" = "false" ] && [ "$NO_PUSH" = "true" ]; then
   REWRITTEN_ARGS+=("--no-push")
 fi
 
+# --- the leerie code this launch runs ----------------------------------
+# _snapshot_leerie_code SRC DEST — the leerie code this launch runs (DESIGN §6
+# *A launch runs only the leerie code it started with*): the four directories
+# the image bakes, taken from the install into DEST once, before any image
+# step and before the command line is checked, which loads the snapshot's
+# orchestrator. The container mounts DEST at /opt/leerie-image in place of
+# the install. Sets LEERIE_COMMIT to what DEST holds. One snapshot of one
+# state of the install, by the install's shape:
+# - a git checkout (SRC/.git exists) with nothing changed in those
+#   directories: `git archive`
+#   of the commit HEAD names, read once; LEERIE_COMMIT is that commit. A
+#   checkout an update rewrites meanwhile cannot tear it: the commit's
+#   objects never change. Measured (review round 39, E3): `cp -pR` of the
+#   working tree while `git checkout` flipped it gave 147 of 300 copies a
+#   partial leerie.py, every one accepted.
+# - a git checkout with edits there (a contributor's): the edits run, as they
+#   always did on the next launch. They are hashed into a tree object through
+#   a private index, twice; the two must agree, no git command may hold the
+#   checkout's index lock before or after, and HEAD and the index's entries
+#   must be the same before and after (a checkout or pull rewrites them), or
+#   the checkout changed while it was read and the launch stops. That tree is archived, and
+#   LEERIE_COMMIT is `<HEAD>-dirty.<tree>`: the record names exactly the code
+#   that ran (`git archive <tree>` in that checkout gives it back).
+# - not a git checkout (a plugin directory installed without git): copied,
+#   then compared with the install as it stands after the copy (`diff -r`); a
+#   difference means the install changed under the copy, and the launch
+#   stops. LEERIE_COMMIT stays empty: there is no commit.
+# The snapshot's plugin.json version must be the launcher's, which names the
+# image: an install that changed version since the launcher started stops the
+# launch rather than run one version's code in another's image.
+_snapshot_leerie_code() {
+  local _src=$1 _dst=$2 _head _ref _short _tree _tree2 _idx _lock _git_state
+  local _d _v
+  local _dirs=(orchestrator scripts prompts .claude-plugin)
+  LEERIE_COMMIT=""
+  if [ -e "$_src/.git" ]; then
+    _head="$(git -C "$_src" rev-parse --verify -q 'HEAD^{commit}')" \
+      || _head=""
+    if [ -z "$_head" ]; then
+      remote_log "the leerie checkout at $_src has no commit to run; launch again"
+      return 1
+    fi
+    _ref=$_head
+    _short="$(git -C "$_src" rev-parse --short "$_head")" || return 1
+    if [ -n "$(git -C "$_src" --no-optional-locks status --porcelain \
+                 --untracked-files=all -- "${_dirs[@]}")" ]; then
+      _lock="$(git -C "$_src" rev-parse --path-format=absolute \
+                 --git-path index.lock)" || return 1
+      _idx="$(mktemp -d "$HOME/.cache/leerie/idx-$$-XXXXXX")" || return 1
+      _tree=""
+      _tree2=""
+      _git_state="$(_leerie_checkout_state "$_src" "${_dirs[@]}")" || _git_state=""
+      if [ -n "$_git_state" ] && [ ! -e "$_lock" ]; then
+        if ! _tree="$(_leerie_worktree_tree "$_src" "$_head" "$_idx/1" "${_dirs[@]}")" \
+            || ! _tree2="$(_leerie_worktree_tree "$_src" "$_head" "$_idx/2" "${_dirs[@]}")"; then
+          _tree=""
+        fi
+        if [ -e "$_lock" ] || [ "$_git_state" != \
+             "$(_leerie_checkout_state "$_src" "${_dirs[@]}")" ]; then
+          _tree=""
+        fi
+      fi
+      rm -rf "$_idx"
+      if [ -z "$_tree" ] || [ "$_tree" != "$_tree2" ]; then
+        remote_log "the leerie checkout at $_src changed while this launch read it; launch again"
+        return 1
+      fi
+      _ref=$_tree
+      LEERIE_COMMIT="$_short-dirty.${_tree:0:12}"
+    else
+      LEERIE_COMMIT=$_short
+    fi
+    git -C "$_src" archive --format=tar "$_ref" -- "${_dirs[@]}" \
+      | tar -xf - -C "$_dst" || return 1
+  else
+    for _d in "${_dirs[@]}"; do
+      cp -pR "$_src/$_d" "$_dst/$_d" || return 1
+    done
+    for _d in "${_dirs[@]}"; do
+      diff -r -q "$_src/$_d" "$_dst/$_d" >/dev/null 2>&1 || {
+        remote_log "the leerie install at $_src changed while this launch copied it; launch again"
+        return 1
+      }
+    done
+  fi
+  _v="$(awk -F'"' '/"version"/ {print $4; exit}' \
+        "$_dst/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
+  if [ "$_v" != "$LEERIE_VERSION" ]; then
+    remote_log "the leerie install at $_src changed version while this launch started ($LEERIE_VERSION, now $_v); launch again"
+    return 1
+  fi
+  return 0
+}
+# _leerie_checkout_state SRC DIR... — HEAD and the index's entries for DIR...:
+# a git command that changed the checkout while it was read (a checkout, a
+# pull) changes one of them by the time it releases the index lock.
+_leerie_checkout_state() {
+  local _src=$1
+  shift
+  git -C "$_src" rev-parse --verify -q HEAD \
+    && git -C "$_src" ls-files -s -- "$@"
+}
+# _leerie_worktree_tree SRC HEAD INDEX DIR... — the tree object of HEAD with
+# DIR... as they stand in SRC's working tree, built through the private index
+# INDEX, never SRC's own; prints its id.
+_leerie_worktree_tree() {
+  local _src=$1 _head=$2 _index=$3
+  shift 3
+  GIT_INDEX_FILE="$_index" git -C "$_src" read-tree "$_head" \
+    && GIT_INDEX_FILE="$_index" git -C "$_src" add -A -- "$@" \
+    && GIT_INDEX_FILE="$_index" git -C "$_src" write-tree
+}
+# The snapshot lives in a directory of its own until $STAGE exists, which it
+# then moves into; removed by every exit before that (the EXIT traps up to
+# $STAGE's remove it), and by the next launch's sweep of stale stages when a
+# SIGKILL leaves it (cfg-<launcher pid>-…).
+_code_snapshot_done() {
+  [ -z "${_code_snapshot:-}" ] || rm -rf "$_code_snapshot"
+  _code_snapshot=""
+}
+mkdir -p "$HOME/.cache/leerie"
+_code_snapshot="$(mktemp -d "$HOME/.cache/leerie/cfg-$$-code-XXXXXX")" || {
+  remote_log "error: could not make a directory for the leerie code this launch runs"
+  exit 1
+}
+trap '_code_snapshot_done' EXIT
+_snapshot_leerie_code "$LEERIE_REPO" "$_code_snapshot" || {
+  remote_log "error: could not take the leerie code this launch runs from $LEERIE_REPO"
+  exit 1
+}
+
 # --- refuse a command line before any image step ------------------------
 # The orchestrator's own parser, on the host, over the argv the container
 # (or a remote machine) will be given: a line it refuses ends the launch here
 # with the parser's own message, before any image is built or copied
 # (DESIGN §6 *A command line is refused before any image step*). Measured:
 # `leerie promptresume <run-id> …` spent about 10 minutes on the image steps
-# before the container's parser refused it. `-I -S`: stdlib only, as the
-# host's other helpers; `check_command_line` builds the parser and parses,
-# and reads no state. A module this host's python3 cannot load is left to
-# the container, whose parser still refuses the line (only the parser's own
-# exit stops the launch here).
+# before the container's parser refused it. The parser is the snapshot's,
+# the code this launch runs. `-I -S`: stdlib only, as the host's other
+# helpers; `check_command_line` builds the parser and parses, and reads no
+# state. A module this host's python3 cannot load is left to the container,
+# whose parser still refuses the line (only the parser's own exit stops the
+# launch here).
 #
 # The module is compiled once per content, not per launch: its code object
 # is kept in $HOME/.cache/leerie/bytecode under the sha256 of the
@@ -6791,7 +6923,7 @@ try:
 except Exception:
     sys.exit(0)
 sys.exit(check(sys.argv[3:]))
-' "$LEERIE_REPO/orchestrator/leerie.py" "$HOME/.cache/leerie/bytecode" \
+' "$_code_snapshot/orchestrator/leerie.py" "$HOME/.cache/leerie/bytecode" \
   ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} \
   ${REWRITTEN_TAIL[@]+"${REWRITTEN_TAIL[@]}"} || exit $?
 
@@ -6864,7 +6996,7 @@ _sweep_stale_builds() {
   return 0
 }
 ( _sweep_stale_builds ) </dev/null >/dev/null 2>&1 &
-trap '_repo_build_done' EXIT
+trap '_repo_build_done; [ -z "${_code_snapshot:-}" ] || rm -rf "$_code_snapshot"' EXIT
 
 # --- per-repo derived image (local nerdctl) -----------------------------
 # When the repo supplies .leerie/Dockerfile (or setup_packages in
@@ -9055,6 +9187,23 @@ _stage_keepalive_pid=$!
 trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; rm -rf "$STAGE" 2>/dev/null' EXIT
 # `|| true`: under set -e a failed kill (keepalive already gone) would end
 # the trap before $STAGE — staged credentials — is removed.
+# The launch's snapshot of its code, taken before any image step
+# (_snapshot_leerie_code, above), moves into $STAGE, which every later exit
+# path removes; a remote runtime runs the code baked into its image and only
+# checked its command line with the snapshot.
+_code_dir=""
+if [ "$RUNTIME" = "local" ]; then
+  _code_dir="$STAGE/leerie-code"
+  mv "$_code_snapshot" "$_code_dir" || {
+    remote_log "error: could not move the leerie code this launch runs into $_code_dir"
+    _code_snapshot_done
+    exit 1
+  }
+  _code_snapshot=""
+else
+  _code_snapshot_done
+fi
+
 # The same duty as a named hook: the remote runtimes replace the EXIT trap
 # with their teardown (decide_teardown / decide_ec2_teardown), which calls
 # this last on the exit pass so the keepalive and the staged credentials
@@ -10894,8 +11043,10 @@ else
     _read_ran_run_id
     [ -n "$_ran_run_id" ] || return 0
     [ -f "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id/repo/HEAD" ] || return 0
+    # From the launch's copy (DESIGN §6 *A launch runs only the leerie code
+    # it started with*).
     # shellcheck source=scripts/host-finalize.sh
-    . "$LEERIE_REPO/scripts/host-finalize.sh" || return 0
+    . "$_code_dir/scripts/host-finalize.sh" || return 0
     host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
   }
 
@@ -11163,7 +11314,9 @@ else
     # the run gives it reaches it through the host after the container exits
     # (the bring-back, the captured deps). DESIGN §6 *The explicit channel*.
     -v "$USER_REPO:/work:ro"
-    -v "$LEERIE_REPO:/opt/leerie-image:ro"
+    # The launch's own copy of leerie's code, never the install itself
+    # (DESIGN §6 *A launch runs only the leerie code it started with*).
+    -v "$_code_dir:/opt/leerie-image:ro"
     -v "$LEERIE_STATE_HOST_DIR:/leerie-state"
     ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"}
     ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}
@@ -11340,8 +11493,10 @@ if [ "$RUNTIME" = "local" ]; then
 
   # Push + PR creation are shared with the `leerie finalize <run-id>`
   # fast-path; both source scripts/host-finalize.sh and call host_finalize.
+  # From the launch's copy, like everything the run executes (DESIGN §6 *A
+  # launch runs only the leerie code it started with*).
   # shellcheck disable=SC1091
-  . "$LEERIE_REPO/scripts/host-finalize.sh"
+  . "$_code_dir/scripts/host-finalize.sh"
   host_finalize "$_ran_run_dir" || exit $?
 fi
 # Fly path: decide_teardown's EXIT trap will source host-finalize.sh and

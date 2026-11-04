@@ -3477,10 +3477,10 @@ they are confined.
   the launcher reaches it only after the image steps, which take minutes
   when an image is built or copied. So before any of them the launcher
   runs that same parser on the host (`check_command_line`, through
-  `python3 -I -S` on the checkout's `orchestrator/leerie.py`, as its other
-  host helpers run), over the argv it will give the container, and a line
-  the parser refuses ends the launch there with the parser's own message
-  and status. The check builds the parser and parses; it
+  `python3 -I -S` on the launch's snapshot of `orchestrator/leerie.py`, as
+  its other host helpers run), over the argv it will give the container,
+  and a line the parser refuses ends the launch there with the parser's
+  own message and status. The check builds the parser and parses; it
   reads no state and starts nothing, and a module the host's Python cannot
   load leaves the line to the container, as before. The module is
   compiled once per content, not once per launch: its code object is
@@ -5081,7 +5081,8 @@ mounts above; the container's policy decides both.
   leerie version on the host, and a reload applies at once to every
   container already running under it. A container started by an older
   version keeps its own shim after the operator upgrades and the new
-  launcher reloads the profile, so the profile allows the union of what
+  launcher reloads the profile (*A launch runs only the leerie code it
+  started with*), so the profile allows the union of what
   every version that can still be running needs. A rule is added when a
   shim starts needing it and is not removed when a shim stops: a removal
   is a change of its own, with a migration that first ensures no
@@ -5992,6 +5993,112 @@ cross-check via a `/proc` scan for any process whose argv contains
 orchestrator is sufficient to declare "alive," making the pid file
 advisory: even a future race produces at worst a false-positive REFUSE,
 never silent corruption.
+
+### A launch runs only the leerie code it started with
+
+A local run's container read leerie's own code from the install
+directory itself: the launcher bind-mounted `$LEERIE_REPO` (the checkout
+`~/.local/bin/leerie` points to, `~/.leerie` by default) at
+`/opt/leerie-image` read-only, shadowing the copy baked into the image.
+The orchestrator's module is read once, at start, but everything else is
+read again at every use: `scripts/landlock_exec.py` at every confined
+spawn, `scripts/worker-shell.py` and the hooks at every tool call, a
+worker's prompt at every worker, the worktree scripts at every git step,
+and the orchestrator itself again when the container re-execs it to
+resume after a rate limit. `install.sh` updates the install with `git
+checkout`, which replaces each file, so an upgrade reached every
+container that was running at that moment.
+
+Measured on 2026-11-03: the operator installed 0.44.0 at 22:40 under five
+running 0.43.0 runs. From 22:41 every confined command and worker in
+them ran 0.44.0's shim, which makes a private `/dev` (`private_dev`), under
+the AppArmor profile 0.43.0 had loaded, which does not allow that mount:
+every one refused ("cannot isolate the command, so it does not run:
+tmpfs /dev: EACCES") until the operator stopped the runs. The tracebacks
+of the stopped 0.43.0 processes print 0.44.0's source lines, read from
+the replaced file. *The profile only grows* already assumed that "a
+container started by an older version keeps its own shim"; it did not.
+
+The invariant: **a launch runs only the leerie code it started with.**
+Upgrading or editing the install never changes a running run.
+
+The mechanism:
+
+- The launcher takes one snapshot of its own code, the four directories
+  the image bakes (`orchestrator/`, `scripts/`, `prompts/`,
+  `.claude-plugin/`), before any image step and before it checks the
+  command line (which loads the snapshot's orchestrator, *A command line
+  is refused before any image step*). The snapshot moves into the
+  launch's staging directory (`$STAGE/leerie-code`), and the container
+  mounts it at `/opt/leerie-image` read-only. The install directory is
+  never mounted. The snapshot's `plugin.json` version must be the
+  launcher's own (`LEERIE_VERSION`, which also names the image): an
+  install that changed version since the launcher started stops the
+  launch, naming the two versions, rather than run one version's code in
+  another's image.
+- The snapshot is one state of the install, and the run records that
+  state (`LEERIE_COMMIT`, `leerie_commit`), never one read at another
+  moment. Each shape of install has its own snapshot:
+  - A git checkout with nothing changed in those directories (an
+    `install.sh` install): `git archive` of the commit `HEAD` names, read
+    once. `LEERIE_COMMIT` is that commit. An update that rewrites the
+    checkout meanwhile cannot tear it, because a commit's objects never
+    change.
+  - A git checkout with edits there (a contributor's): the edits run on
+    the next launch, as they always did. They are hashed into a tree
+    object through a private index, twice. The two must agree, no git
+    command may hold the checkout's index lock, and `HEAD` and the
+    index's entries must be the same before and after; otherwise the
+    checkout changed while it was read, and the launch stops. That tree
+    is archived, and `LEERIE_COMMIT` is `<commit>-dirty.<tree>`, so the
+    record names exactly the code that ran (`git archive <tree>` in that
+    checkout gives it back). Nothing is staged in the checkout itself.
+  - An install that is not a git checkout (a plugin directory installed
+    without git): copied, then compared with the install as it stands
+    after the copy. A difference means the install changed under the
+    copy, and the launch stops. `LEERIE_COMMIT` is empty: there is no
+    commit.
+  *Measured 2026-11-04 (review round 39, execution E2 and E3):* the record
+  was read at the launcher's start and the copy taken after the image
+  steps, 7 minutes later on a first launch, so a same-version update in
+  between ran code the record did not name. And the copy was `cp -pR` of
+  the working tree: while `git checkout` flipped the install between two
+  same-version commits, 147 of 300 copies held a partial `leerie.py`, and
+  all were accepted (176 of 300 torn or mixed when re-measured on this
+  host). On the snapshot, under the same flipping, 123 of 600 attempts
+  took a snapshot and the other 477 stopped the launch; none of the 123
+  was torn or mixed, and each equals the code its `LEERIE_COMMIT` names.
+- The copy lives exactly as long as the launch: it is part of `$STAGE`,
+  which the launcher's exit removes and the next launch's sweep removes
+  when its launcher is gone (*A staged copy of the credentials lives only
+  as long as its launch*); a container whose launcher is gone is reaped
+  on the next `resume` of its run (`_reap_orphaned_container`).
+- The launcher's own steps after the container exits (bringing the run
+  branch back, finalize) source `scripts/host-finalize.sh` from the same
+  copy, not from the install.
+- Why not the image's baked copy: the image is named by version
+  (`leerie:<version>`), not by code. Every commit between two releases,
+  and a contributor's edits, carry the version of the last release, so a
+  run would silently execute the image's older code while
+  `LEERIE_COMMIT` named the checkout's. A copy per launch keeps "an edit
+  is picked up by the next launch, with no rebuild" and makes it the only
+  moment an edit is picked up.
+- A resume across versions is a new launch: it runs the resuming
+  leerie's code from its start to its end, and never two versions in one
+  container. Whether it may continue the run directory at all is the
+  layout rule below (*A run directory is continued only by a leerie of
+  its layout*): 0.43.0 and 0.44.0 share layout 3, so a 0.43.0 run resumed
+  by 0.44.0 is allowed, and runs 0.44.0 throughout.
+- Fly and EC2 are not affected on the machine: a Fly Machine runs the
+  code baked into the image it was started from, pinned by digest, and an
+  EC2 instance the code baked into its AMI; an upgrade on the operator's
+  host reaches neither. Their host-side teardown still sources
+  `host-finalize.sh` from the install when the launcher exits; that is
+  the host acting on a run already fetched home, not the run's own
+  process, and is not covered here.
+- What is shared across versions on one host is not code but host state:
+  the AppArmor profile (*The profile only grows*) and the run's records
+  (the layout rule).
 
 ### A run directory is continued only by a leerie of its layout
 

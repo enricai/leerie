@@ -55,6 +55,7 @@ APPARMOR_OPT=(--security-opt apparmor=leerie-container)
 REWRITTEN_ARGS=()
 _leerie_env_args=()
 _leerie_host_dir="$HOME/.leerie/.host"
+_code_dir="$HOME/.cache/leerie/cfg-1-x/leerie-code"
 """
     + extract_run_argv()
     + '\nnerdctl run "${_run_argv[@]}"\n'

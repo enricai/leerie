@@ -102,6 +102,7 @@ set -euo pipefail
 # Stub every var the array interpolates; USER_REPO is the one under test.
 USER_REPO=/Users/andres/src/enric/sibling-service
 LEERIE_REPO=/opt/leerie
+_code_dir=/home/test/.cache/leerie/cfg-1-x/leerie-code
 LEERIE_STATE_HOST_DIR=/tmp/state
 HOME=/home/test
 TTY_FLAGS=""
