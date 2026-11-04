@@ -12341,6 +12341,7 @@ target / 148 control items, frozen labels): F+ k=3 caught 23/31 =
 77.1% and 8/144 = 5.6%; with the re-ask, 24/31 and 13/148 (adjudicated
 28/35 and 9/144). One sample alone caught 19/31.
 
+
 **Delivery re-drive: unmet work goes back to the subtasks that own it.**
 Detection alone ships a PR that says what is missing; the next run then
 re-plans from scratch. After the repository's merge checks have run on the
@@ -12500,6 +12501,27 @@ re-drive's one group made no change (`pre_sha == post_sha`, `no_change`),
 and one sample on that same tree overturned the 2-of-3 unmet verdict on
 "cookies from intermediate hops carried by the following request"; the
 run shipped `done`.
+
+**An unmet item reaches its owner, or is recorded as reaching none.**
+Rule 2's "every claimer" includes a claimer that settled `unconverged`: it
+is the subtask whose work the item is, and the confirmed finding is the
+evidence it lacked. A claimer settled `blocked` (its blocker is typed
+outside the tree, §13 *A blocked implementer says why, as a type*), one
+the operator accepted, or one settled `accepted_external` is not driven.
+An item no group drives — no subtask the re-drive may drive can take it,
+or every group holding it was out of its members' re-drive rounds, or the
+re-drive's time budget ran out first — is recorded as a typed
+`unrouted_item` (`{item_index, item, reason: no_owner | budget}`). It is
+never dropped: it stays unmet, so the run is `unconverged`; the outcome's
+reasons name it; and the next run on the task is handed it in its
+residual. Measured on barnacle a192d275 (leerie 0.44.3): the falsifier
+confirmed an item unmet whose only claimer, feat-001, had settled
+`unconverged`; the re-drive excluded it, routed the item to nobody and
+logged "done" one second after naming "1 unmet item(s)". The run's
+outcome was `unconverged` on the unmet item, but nothing recorded that
+the finding reached no worker. Under this rule the item goes to feat-001,
+whose two re-drive rounds were spent before the falsifier ran, so it is
+recorded `unrouted_item` with reason `budget`.
 
 The diff is re-measured because nothing else is. Before review round 6
 the re-drive re-applied the test-outcome verdict recorded at detection,

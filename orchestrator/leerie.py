@@ -41196,6 +41196,21 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                    else ", and the tree that ships could not be read"))
         elif unmet:
             reasons.append(f"{len(unmet)} required item(s) still unmet")
+            # An unmet item the re-drive could hand to no worker is said
+            # so, typed (DESIGN §8 *An unmet item reaches its owner, or is
+            # recorded as reaching none*).
+            open_idx = {u.get("item_index") for u in unmet
+                        if isinstance(u, dict)}
+            unrouted = [u for u in ((st.data.get("delivery_redrive") or {})
+                                    .get("unrouted_items") or [])
+                        if isinstance(u, dict)
+                        and u.get("item_index") in open_idx]
+            if unrouted:
+                reasons.append(
+                    f"{len(unrouted)} unmet item(s) reached no re-drive "
+                    "worker (unrouted_item): " + ", ".join(
+                        f"item {u['item_index']} ({u.get('reason')})"
+                        for u in unrouted))
     ci_unmet = _ci_parity_unmet(st)
     if ci_unmet:
         reasons.append(f"{len(ci_unmet)} of the repository's own merge "
@@ -50373,6 +50388,20 @@ def _prior_delivery_residual(st: "State") -> dict | None:
                 {"item": (u.get("item") or "")[:200],
                  "evidence": (u.get("evidence") or "")[:400]}
                 for u in unmet_after[:3]]
+            # The items no worker of that run was handed, typed, so the
+            # next plan owns them (DESIGN §8 *An unmet item reaches its
+            # owner, or is recorded as reaching none*).
+            still = {u.get("item_index") for u in unmet_after
+                     if isinstance(u, dict)}
+            unrouted = [u for u in ((data.get("delivery_redrive") or {})
+                                    .get("unrouted_items") or [])
+                        if isinstance(u, dict)
+                        and u.get("item_index") in still]
+            if unrouted:
+                residual["unrouted_items"] = [
+                    {"item": str(u.get("item") or "")[:200],
+                     "reason": str(u.get("reason") or "")}
+                    for u in unrouted[:3]]
         # The repository's own merge checks that run left red (DESIGN §9
         # *The repository's own merge checks run too*): typed, never output.
         ci_final = (data.get("ci_parity") or {}).get("final") or {}
@@ -59647,6 +59676,28 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
     return groups
 
 
+def _redrive_unrouted_items(open_items: list[dict], driven: Iterable[int],
+                            budget_skipped: Iterable[int],
+                            stopped_on_budget: bool) -> list[dict]:
+    """The still-open unmet items no re-drive group drove, typed
+    `unrouted_item` (DESIGN §8 *An unmet item reaches its owner, or is
+    recorded as reaching none*): `{item_index, item, reason}`, `reason`
+    `budget` when a group held it but none of its members had a re-drive
+    round left, or the re-drive stopped on its time budget first, else
+    `no_owner` — no subtask the re-drive may drive claimed it or could take
+    it."""
+    done, skipped = set(driven), set(budget_skipped)
+    out: list[dict] = []
+    for n in open_items:
+        i = n.get("item_index")
+        if not isinstance(i, int) or i in done:
+            continue
+        out.append({"item_index": i, "item": str(n.get("item") or "")[:400],
+                    "reason": ("budget" if i in skipped or stopped_on_budget
+                               else "no_owner")})
+    return out
+
+
 def _redrive_failing(results: list[dict], sets: list[dict],
                      indices: set) -> tuple[dict[str, dict], list]:
     """`"<index>:<file>"` -> `{set_index, file, kind, failing_cases}` for
@@ -62012,11 +62063,15 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         specs = {}
     statuses = st.data.get("subtask_status") or {}
     accepted = st.data.get("accepted_blocked") or {}
+    # An `unconverged` subtask is re-driven too (rule 2: every claimer):
+    # it owns the work, and the confirmed finding is the evidence it
+    # lacked. A blocked one's blocker is outside the tree (§13), and an
+    # accepted one is the operator's call (DESIGN §8 *An unmet item reaches
+    # its owner, or is recorded as reaching none*).
     subfiles = {sid: _redrive_subtask_files(staging, sid, spec)
                 for sid, spec in specs.items()
                 if isinstance(spec, dict)
-                and statuses.get(sid) not in ("blocked", "unconverged",
-                                              "accepted_external")
+                and statuses.get(sid) not in ("blocked", "accepted_external")
                 and sid not in accepted}
     claims = _item_claims(specs)
     site_claimers = [sid for sid, spec in specs.items()
@@ -62136,9 +62191,16 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rnd = len(rec["rounds"])
     max_rounds = cap * max(1, len(subfiles)) + 1
     start_items = sorted({u["item_index"] for u in open_items()})
+    # Items a group drove, and items a group held but could not drive for
+    # its members' budget: what is left reached no worker
+    # (`_redrive_unrouted_items`).
+    rec.setdefault("items_driven", [])
+    rec.setdefault("items_budget_skipped", [])
+    stopped_on_budget = False
     while not rec.get("conflict") and not rec.get("rollback_failed"):
         if float(st.data.get("redrive_spent_sec") or 0.0) >= budget:
             log("  delivery re-drive: redrive_budget_sec spent — stopping")
+            stopped_on_budget = True
             break
         rnd += 1
         if rnd > max_rounds:
@@ -62203,6 +62265,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                        if _redrive_allowed(st, caps, m)]
             if not members:
                 ge["skipped"] = "budget"
+                rec["items_budget_skipped"] = sorted(
+                    set(rec["items_budget_skipped"])
+                    | {n["item_index"] for n in live
+                       if n["kind"] == "unmet_item"})
                 _save()
                 continue
             pend = [n for n in rec["pending_controls"]
@@ -62303,6 +62369,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             prior_members += [m for m in members if m not in prior_members]
             routed_items |= {n["item_index"] for n in live
                              if n["kind"] == "unmet_item"}
+            rec["items_driven"] = sorted(set(rec["items_driven"])
+                                         | routed_items)
             routed_checks = routed_checks or any(n["kind"] == "ci_check"
                                                  for n in live)
             post_sha = await _branch_head_sha(str(staging))
@@ -62571,6 +62639,18 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                         "final_tree": _shipping_tree(st)}
             st.save()
     rec["final_sha"] = final
+    unrouted = _redrive_unrouted_items(
+        open_items(), rec["items_driven"], rec["items_budget_skipped"],
+        stopped_on_budget)
+    if unrouted:
+        rec["unrouted_items"] = unrouted
+        log("  WARNING: delivery re-drive: "
+            f"{len(unrouted)} unmet item(s) reached no worker — "
+            + "; ".join(f"item {u['item_index']} ({u['reason']})"
+                        for u in unrouted)
+            + " — recorded as unrouted_item; the run stays unconverged")
+    else:
+        rec.pop("unrouted_items", None)
     rec["done"] = True
     _save()
     log("  delivery re-drive: done"
