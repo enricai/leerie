@@ -394,7 +394,9 @@ def _digest_state(leerie, tmp_path, commit, tree):
             "final_sha": commit,
             "final": [{"index": 1, "passed": True},
                       {"index": 2, "passed": False,
-                       "failing_files": ["acc/test_d.py"]},
+                       "failing_files": ["acc/test_d.py"],
+                       "failing_cases": {"acc/test_d.py": [
+                           "acc/test_d.py :: test_x"]}},
                       {"index": 3, "passed": False, "unmeasured": True}],
             "residual": {"cases_by_set": {"2": ["acc/test_d.py :: test_x"]}}}},
     }
@@ -420,6 +422,50 @@ def test_orchestrator_results_digest_values_and_order(leerie, tmp_path):
     assert "result: passed — ok" in d and "result: failed — 1 failed" in d
     st.data = {}
     assert leerie._orchestrator_results_digest(st, staging) == ""
+
+
+def test_the_record_states_only_work_as_failed(leerie, tmp_path):
+    """DESIGN §8 *Delivery re-drive* rule 1, the judge's record (barnacle
+    ddd383ea): a broken set and a variant set never read as plain failed,
+    and a failing shown set names its FAILING cases — a declared case that
+    passed (listed first, as in the live run) is not among them."""
+    staging = _delivery_tree(tmp_path / "staging")
+    commit, tree = _head(staging)
+    st = _digest_state(leerie, tmp_path, commit, tree)
+    f1, f2, f5 = "acc/one.py", "acc/two.py", "acc/five.py"
+    st.data["acceptance"] = {
+        "sets": [
+            {"index": 1, "defect_files": [f1], "broken": True,
+             "scope": {"bounded": True, "counted_cases": {f1: []}}},
+            {"index": 2, "defect_files": [f2],
+             "cases": {f2: ["declared passes", "declared fails"]},
+             "scope": {"bounded": True,
+                       "counted_cases": {f2: ["declared fails"]}}},
+            {"index": 3, "defect_files": ["acc/three.py"],
+             "scope": {"bounded": True, "counted_cases": {}}},
+            {"index": 4}, {"index": 5, "defect_files": [f5]}],
+        "gate": {"final_sha": commit, "final": [
+            {"index": 1, "passed": False, "failing_files": [f1],
+             "failing_cases": {f1: ["variant: a"]}},
+            {"index": 2, "passed": False, "failing_files": [f2],
+             "failing_cases": {f2: ["declared fails"]}},
+            {"index": 3, "passed": False, "failing_files": ["acc/three.py"]},
+            {"index": 4, "passed": True},
+            {"index": 5, "passed": False, "failing_files": [f5]},
+            {"index": 9, "passed": False, "failing_files": ["acc/x.py"]}],
+            "residual": {"cases_by_set": {
+                "2": ["declared passes", "declared fails"]}}}}
+    lines = [ln.split("result on the final tree: ", 1)[1]
+             for ln in leerie._orchestrator_results_digest(
+                 st, staging).splitlines() if "acceptance set" in ln]
+    assert lines == [
+        "failed — typed broken by the set audit: settled, not unfinished "
+        "work",
+        f"failed: {f2} (cases: declared fails)",
+        "failed only on cases outside the report's own scenarios (a variant "
+        "set): not unfinished work",
+        "passed",
+        "failed (a held-back set: its tests are not named)"]
 
 
 def test_a_result_of_another_tree_is_not_on_the_record(leerie, tmp_path):

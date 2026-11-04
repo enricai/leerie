@@ -1279,3 +1279,158 @@ def test_a_budget_spent_on_entry_measures_nothing(leerie, tmp_path,
     assert ("redrive-ids0" in labels) is measured
     assert (len(w.calls) == 1) is measured
     assert w.st.data["delivery_redrive"]["done"]
+
+
+# === the re-drive routes only work its self-check reproduces ================
+#
+# Barnacle ddd383ea (leerie 0.44.7): shown sets {1, 2}, set 1 typed broken by
+# the set audit AND a variant set (no counted case), set 2 passing; held-back
+# {3, 4}, set 3 a failing variant set. The router counted set 1 as failing
+# work — `_redrive_failing` was handed the unbroken sets and looked set 1 up
+# as `{}`, which reads as unbounded and unbroken — so four implementers were
+# told to fix set 1's file, ran a self-check holding only set 2 ("Tests 9
+# passed"), and changed nothing (DESIGN §8 *Delivery re-drive* rules 1, 4).
+
+ONE = "src/one.test.ts"
+
+
+def _ddd383ea_sets() -> list[dict]:
+    return [_set(1, defect_files=[ONE], broken=True,
+                 scope={"bounded": True, "counted_cases": {ONE: []}}),
+            # The twin: broken but unbounded, so "broken" is proven to
+            # exclude a set on its own, apart from "variant".
+            _set(2, broken=True),
+            _set(3), _set(4), _set(5), _set(6)]
+
+
+@pytest.mark.parametrize("which", ["all_sets", "unbroken_sets"])
+def test_a_broken_shown_set_is_never_redrive_work(leerie, which):
+    """Every valid set (the caller's argument now) and the unbroken ones
+    (its argument before): neither makes a broken set work. Before the fix
+    the second returned both broken sets' keys."""
+    all_sets = _ddd383ea_sets()
+    shown_idx = leerie._acceptance_shown_indices(all_sets)
+    assert shown_idx == {1, 2, 3, 4}
+    final = [{"index": 1, "passed": False, "failing_files": [ONE],
+              "failing_cases": {ONE: ["variant: a"]}},
+             {"index": 2, "passed": False, "failing_files": ["d.ts"]},
+             {"index": 3, "passed": True, "failing_files": []},
+             {"index": 4, "passed": True, "failing_files": []}]
+    sets = (all_sets if which == "all_sets" else
+            [s_ for s_ in all_sets if not leerie._acceptance_set_broken(s_)])
+    assert leerie._redrive_failing(final, sets, shown_idx) == ({}, [])
+    # The same lookup, read for "does any measured failure need work".
+    assert leerie._acceptance_work_fails(final, sets) is False
+
+
+def test_unreproducible_notes_are_named(leerie):
+    shown = [_set(1, broken=True), _set(2)]
+    notes = [
+        {"kind": "defect", "key": "1:d.ts", "set_index": 1, "file": "d.ts"},
+        {"kind": "defect", "key": "2:x.ts", "set_index": 2, "file": "x.ts"},
+        {"kind": "defect", "key": "3:d.ts", "set_index": 3, "file": "d.ts"},
+        {"kind": "control_regression", "key": "2:c.ts", "set_index": 2,
+         "file": "c.ts"},
+        {"kind": "defect", "key": "2:d.ts", "set_index": 2, "file": "d.ts"},
+        {"kind": "held_defect", "key": "4:h.ts", "set_index": 4,
+         "file": "h.ts"},
+        {"kind": "control_regression", "key": "t", "test": "t"},
+        {"kind": "unmet_item", "key": "item-0", "item_index": 0}]
+    assert leerie._redrive_unreproducible(notes, shown) == [
+        "1:d.ts", "2:x.ts", "3:d.ts"]
+
+
+def _ddd383ea_world(leerie, tmp_path, monkeypatch, *, unmet):
+    items = [{"item": "a does X", "span": "S1", "verifiability": "tree"}]
+    w = World(leerie, tmp_path, n_sets=4, items=items, unmet=unmet,
+              claims={"s1": [{"item_index": 0, "kind": "deliverable"}]})
+    s1, s2, s3, _s4 = w.sets
+    # Set 1's file is not set 2's, as in the live run: a note naming it
+    # cannot be reproduced by a self-check of set 2.
+    (Path(s1["dir"]) / ONE).write_text("import { a } from './a';\n")
+    s1.update(defect_files=[ONE], cases={ONE: ["variant: a"]}, broken=True,
+              scope={"bounded": True, "counted_cases": {ONE: []}})
+    s3["scope"] = {"bounded": True, "counted_cases": {HELD: []}}
+    w.install(monkeypatch)
+    w.write("export const a = 1; // FIXED\n")   # set 2 passes on HEAD
+    head = _git(w.staging, "rev-parse", "HEAD")
+    w.st.data["acceptance"]["gate"] = {"final_sha": head, "final": [
+        {"index": 1, "passed": False, "unmeasured": False,
+         "failing_files": [ONE], "failing_cases": {ONE: ["variant: a"]}},
+        {"index": 2, "passed": True, "unmeasured": False,
+         "failing_files": []},
+        {"index": 3, "passed": False, "unmeasured": False,
+         "failing_files": [HELD], "failing_cases": {HELD: ["variant: h"]}},
+        {"index": 4, "passed": True, "unmeasured": False,
+         "failing_files": []}]}
+    w.st.data["delivery_gate"]["final_sha"] = head
+
+    async def fake_judge(*a, **kw):
+        return [], 1, None
+    monkeypatch.setattr(leerie, "_delivery_judge_unmet", fake_judge)
+    monkeypatch.setattr(leerie, "_delivery_record", lambda *a, **k: "")
+    monkeypatch.setattr(leerie, "_delivery_typed_evidence",
+                        lambda *a, **k: ([], {}))
+    return w
+
+
+def _note_work_and_selfcheck(prompt: str) -> tuple[list[dict], list[str]]:
+    """The typed work list and the SELF-CHECK file list, parsed from the
+    prompt the implementer was given."""
+    at = prompt.index("DELIVERY RE-DRIVE")
+    work, _ = json.JSONDecoder().raw_decode(prompt, prompt.index("\n[", at)
+                                            + 1)
+    tail = prompt.split("its test files are:\n", 1)[1]
+    files = []
+    for ln in tail.splitlines():
+        if not ln.startswith("  - "):
+            break
+        files.append(ln[4:])
+    return work, files
+
+
+def test_a_broken_variant_set_alone_drives_nothing(leerie, tmp_path,
+                                                   monkeypatch):
+    w = _ddd383ea_world(leerie, tmp_path, monkeypatch, unmet=[])
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    assert w.calls == [] and rec["done"] and rec["rounds"] == []
+
+
+def test_every_set_file_a_note_names_is_in_its_selfcheck(leerie, tmp_path,
+                                                         monkeypatch):
+    """Executes the router and reads the note the implementer got: the
+    re-drive runs for the unmet item, and no set file it names is outside
+    the self-check (before the fix set 1's file was a `defect` entry with
+    `cases: []`, the self-check ran set 2 alone)."""
+    unmet = [{"item_index": 0, "item": "a does X", "evidence": "missing",
+              "by": ["judge"]}]
+    w = _ddd383ea_world(leerie, tmp_path, monkeypatch, unmet=unmet)
+    w.run()
+    # One drive per round the item stays unmet (the stub changes nothing).
+    assert [c["sid"] for c in w.calls] == ["delivery-redrive-r1-g0",
+                                           "delivery-redrive-r2-g0"]
+    for c in w.calls:
+        work, selfcheck = _note_work_and_selfcheck(c["prompt"])
+        assert sorted(selfcheck) == sorted([DEFECT, CONTROL])   # set 2's
+        assert [e["kind"] for e in work] == ["unmet_item"]
+        named = [e["test_file"] for e in work if "test_file" in e]
+        assert all(f in selfcheck for f in named)
+        assert ONE not in c["prompt"]
+
+
+def test_a_note_outside_the_selfcheck_is_raised_never_driven(
+        leerie, tmp_path, monkeypatch):
+    """The invariant is checked in code: a set note the self-check cannot
+    reproduce (here forced through the start verdict) stops the re-drive
+    before any worker is spawned."""
+    w = _ddd383ea_world(leerie, tmp_path, monkeypatch, unmet=[])
+
+    def forced(results, sets, indices):
+        return ({f"1:{ONE}": {"set_index": 1, "file": ONE, "kind": "defect",
+                              "failing_cases": []}}
+                if indices == {1, 2} else {}), []
+    monkeypatch.setattr(leerie, "_redrive_failing", forced)
+    with pytest.raises(RuntimeError, match=f"1:{ONE}"):
+        w.run()
+    assert w.calls == []

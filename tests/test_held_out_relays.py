@@ -127,6 +127,7 @@ def test_the_judge_record_gives_a_held_back_set_its_verdict_only(
         leerie, tmp_path):
     sets = _sets()
     res = _results(sets, {1, 4})
+    res[0]["failing_cases"] = {"acc/set1.py": [SHOWN_NAME]}
     staging, sha = _staging(tmp_path)
     st = _state(leerie, tmp_path / "state", "run-a", acceptance={
         "sets": sets, "gate": {

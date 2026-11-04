@@ -9469,10 +9469,17 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   (`conformance._final.result`'s measured build/lint/test axes when
   `_final.tree_sha` is staging's `HEAD^{tree}`, `test_id_diff.new` when
   its `tree_sha` is, and each `acceptance.gate.final` set's verdict when
-  `gate.final_sha` is staging's HEAD — with its failing files and residual
-  case names for a shown set (`_acceptance_shown_indices(acceptance.sets)`),
-  `failed (a held-back set: its tests are not named)` for a held-back one
-  (DESIGN §8 *Nothing a held-out evaluation produces reaches a fixer*) —
+  `gate.final_sha` is staging's HEAD — work-aware: a failing set typed
+  broken (`_acceptance_set_broken`) reads `failed — typed broken by the set
+  audit: settled, not unfinished work`, one whose failure is not work
+  (`_acceptance_result_has_work(set, failing_files, failing_cases)` false: a
+  variant set) `failed only on cases outside the report's own scenarios (a
+  variant set): not unfinished work`, a held-back one with work `failed (a
+  held-back set: its tests are not named)`, and a shown one with work its
+  failing files and its failing case IDs (`failing_cases[file]`, first 5),
+  never the declared `residual.cases_by_set` (DESIGN §8 *Delivery re-drive*
+  rule 1, *Nothing a held-out evaluation produces reaches a fixer*); a
+  result whose index has no set record is left out —
   `_head_identity(tree) -> (head_sha, head_tree)`, empty strings without
   a tree or on a git failure, so nothing is included; the same record
   every delivery pass now gets). `judged_after`, else
@@ -9963,13 +9970,30 @@ a staging worktree or a readable HEAD, and records `done` with nothing
 driven when nothing is open. A recorded `in_flight` group (a crash
 mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
 
-- **Open work.** Sets: the valid sets not typed broken, split by
-  `_acceptance_shown_indices` into shown and held-back. `_redrive_failing
-  (results, sets, indices)` keys each failing file of a measured set that
-  has work (`_acceptance_result_has_work`) as `"<index>:<file>"` →
-  `{set_index, file, kind: defect | control, failing_cases[]}`; in a
-  bounded set only a defect file with work (`_acceptance_file_has_work`, per
-  case) is kept. The start verdict is `acceptance.gate.final`
+- **Open work.** Sets: the shown/held-back split is
+  `_acceptance_shown_indices` over **every** valid set, broken ones
+  included, so the held-back identity is the one the run held back all
+  along (re-splitting over the unbroken sets would move a held-back set to
+  shown and name it, I3); shown and held-back are then that split's sets
+  not typed broken, and only they are measured or given to a self-check.
+  `_redrive_failing(results, sets, indices)` receives every valid set,
+  broken ones included (`by_index` in `_run_delivery_redrive`, which
+  `set_note` reads too), and keys each failing file of a measured set in
+  `indices` that has work (`_acceptance_result_has_work`) as
+  `"<index>:<file>"` → `{set_index, file, kind: defect | control,
+  failing_cases[]}`; in a bounded set only a defect file with work
+  (`_acceptance_file_has_work`, per case) is kept. A result whose index has
+  no set record is skipped, never looked up as `{}` (which
+  `_acceptance_result_has_work` reads as unbounded and unbroken); the same
+  holds in `_acceptance_work_fails`. **Reproducibility check** (DESIGN §8
+  *Delivery re-drive* rule 4): before routing each round,
+  `_redrive_unreproducible(notes, shown) -> list[str]` (pure) returns the
+  key of every `defect` / `control_regression` note with a `set_index`
+  (the round's notes and `pending_controls`) whose set is not a shown set
+  not typed broken or whose file is not among that set's defect and
+  control files — the `run_files` `_selfcheck_prepare(…, shown, …)` gives
+  the group; any such key raises `RuntimeError` (a leerie defect, never a
+  note handed to a worker; `_run_phases` logs it as advisory). The start verdict is `acceptance.gate.final`
   when `gate.final_sha` is the staging HEAD, else one
   `_evaluate_acceptance_sets` of the shown sets (B*-confirmed). Items:
   `delivery_gate.unmet_final`, minus items every claimer types `process`.
