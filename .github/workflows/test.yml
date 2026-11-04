@@ -23,10 +23,25 @@ jobs:
     #
     # Raised again from 20 on 2026-11-03: on PR #297 all three matrix
     # legs (3.10/3.11/3.12) reported "Cancelled after 20m" — killed by
-    # this cap, not by a failing test. 40 restores roughly the 2x
-    # headroom over observed runtime that the 20 min cap originally
-    # had. Headroom, not a licence to let the suite grow.
-    timeout-minutes: 40
+    # this cap, not by a failing test. 40 was an estimate, and it was
+    # wrong: runs 41732738003 and 41756388905 were both cancelled at
+    # 40.3 min.
+    #
+    # Raised to 120 on 2026-11-04, this time against measurement rather
+    # than a guess. At the 40 min cut the py3.12 leg was only at 48% and
+    # still emitting steady per-file progress — a slow suite, not a hung
+    # test — which extrapolates to a full run of roughly 75-85 min. 60
+    # would have been cancelled too; 120 leaves about 1.5x headroom.
+    # (GitHub's own job ceiling is 360 min.)
+    #
+    # The underlying regression is NOT addressed here: the last green
+    # run, 40607416970 on 2026-10-28, finished in ~14-15 min, so the
+    # suite grew roughly 5x across #296/#297. The single costliest file
+    # is tests/test_acceptance_held_case_intermittent.py at 435s. There
+    # is no pytest-timeout, so nothing bounds an individual test and a
+    # real hang would look exactly like this.
+    # Headroom, not a licence to let the suite grow.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
