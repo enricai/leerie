@@ -228,6 +228,14 @@ def _tree(tmp_path, files: dict[str, str]):
     _git(t, "init", "-q", "-b", "main")
     _git(t, "config", "user.email", "t@t")
     _git(t, "config", "user.name", "t")
+    # As leerie seals a run repository (`_seal_run_repo_config`): no git
+    # housekeeping of its own. A commit otherwise starts `git maintenance
+    # run --auto --detach`, and from git 2.55 the detached process holds
+    # .git/objects/maintenance.lock after the commit returns, so a count of
+    # .git/objects read it as an object that later vanished (CI, git 2.56:
+    # `assert 3 == 4`).
+    _git(t, "config", "maintenance.auto", "false")
+    _git(t, "config", "gc.auto", "0")
     for rel, body in files.items():
         (t / rel).parent.mkdir(parents=True, exist_ok=True)
         (t / rel).write_text(body)

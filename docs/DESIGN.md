@@ -6308,8 +6308,19 @@ The mechanism:
     the next launch, as they always did. They are hashed into a tree
     object through a private index, twice. The two must agree, no git
     command may hold the checkout's index lock, and `HEAD` and the
-    index's entries must be the same before and after; otherwise the
-    checkout changed while it was read, and the launch stops. That tree
+    index's entries, with the file status each entry records, must be the
+    same before and after; otherwise the checkout changed while it was
+    read, and the launch stops. Equal entries alone do not show that
+    nothing changed: an update that flips the checkout to another commit
+    and back (A to B to A) while it is read leaves the same `HEAD` and
+    the same blob ids, but every file it wrote is a new file, and the
+    entry records that file's status (its times, inode and size). CI on
+    main 8c69b8c0 (py3.12, under `-n 4` load) accepted a snapshot whose
+    `leerie.py` was not one commit's; the one sequence the comparison of
+    entries admits is a checkout stalled mid-write across both reads, then
+    completed and flipped back, and a stand-in `git` that plays it was
+    accepted with a torn `leerie.py` until the status was compared
+    (2026-11-04). That tree
     is archived, and `LEERIE_COMMIT` is `<commit>-dirty.<tree>`, so the
     record names exactly the code that ran. `git archive <tree>` in that
     checkout gives it back for as long as git keeps the tree: no ref holds

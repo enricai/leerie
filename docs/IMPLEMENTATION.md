@@ -717,7 +717,9 @@ started with*):
   <HEAD> -- <dirs> | tar -xf - -C DEST` and `LEERIE_COMMIT=<short HEAD>`.
   When the status is not empty: with the index lock
   (`rev-parse --git-path index.lock`) absent and `_leerie_checkout_state`
-  (HEAD and `ls-files -s -- <dirs>`) read, `_leerie_worktree_tree` twice
+  (HEAD and `ls-files -s --debug -- <dirs>`: each entry's blob id and the
+  file status it records, so a flip to another commit and back reads as a
+  change) read, `_leerie_worktree_tree` twice
   (`GIT_INDEX_FILE=<private> read-tree HEAD; add -A -- <dirs>;
   write-tree`, the private indexes in `DEST/.idx`, removed before the
   archive is extracted, and with `DEST` on any other exit); the two ids equal, the lock still absent and the state

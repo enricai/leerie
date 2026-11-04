@@ -191,12 +191,44 @@ def test_a_checkout_an_update_rewrites_during_the_snapshot_never_tears_it(
         snap, commit = out.splitlines()
         got = _files(Path(snap))
         letter = got["scripts/landlock_exec.py"][2]
-        # Whole, and every file the same commit's.
-        assert got["orchestrator/leerie.py"] == f"# {letter}\n" * 200000, i
+        # Whole, and every file the same commit's. Compared to a bool: on a
+        # mismatch pytest's diff of two 200,000-line strings ran past the
+        # 600 s per-test timeout on CI and hid the finding.
+        whole = got["orchestrator/leerie.py"] == f"# {letter}\n" * 200000
+        assert whole, (i, commit, len(got["orchestrator/leerie.py"]))
         assert got["prompts/planner.md"] == f"# {letter}\n", i
         ref = commit.partition("-dirty.")[2] or commit
         assert got == _archive(inst, ref, tmp_path / f"chk{i}"), i
     assert accepted, "no snapshot was taken"
+
+
+def test_a_checkout_flipped_away_and_back_while_it_is_read_stops(tmp_path):
+    """A checkout to B stalls mid-write (index lock held, `leerie.py`
+    half-written) while both private-index reads run, then completes, and
+    the update flips the install back to A before the second look. The
+    lock is absent at both looks and HEAD and the blob ids are A's again,
+    so a comparison of entries alone accepted a torn `leerie.py` (CI,
+    main 8c69b8c0, py3.12). The stat each entry records shows the files
+    were rewritten. A stand-in `git` (by name; the real one by absolute
+    path) plays the update at each `add`."""
+    inst = _install(tmp_path, "A")
+    _write(inst, "B")
+    _commit(inst, "B")
+    _git(inst, "checkout", "-q", "-f", "cA")
+    (inst / "prompts" / "new.md").write_text("# new\n")
+    lock = inst / ".git" / "index.lock"
+    half = inst / "orchestrator" / "leerie.py"
+    pre = ('git() { case " $* " in *" add "*) '
+           f': > "{lock}"; printf "# B\\n" > "{half}"; '
+           '/usr/bin/git "$@"; _r=$?; '
+           f'/bin/rm -f "{lock}"; '
+           '( unset GIT_INDEX_FILE; '
+           f'/usr/bin/git -C "{inst}" checkout -q -f cB; '
+           f'/usr/bin/git -C "{inst}" checkout -q -f cA ); '
+           'return $_r;; esac; /usr/bin/git "$@"; }\n')
+    rc, out, err = _run(tmp_path, inst, pre)
+    assert rc == 1, out
+    assert "changed while this launch read it; launch again" in err, err
 
 
 def test_a_checkout_git_cannot_read_is_copied_with_gits_reason(tmp_path):
@@ -207,8 +239,14 @@ def test_a_checkout_git_cannot_read_is_copied_with_gits_reason(tmp_path):
     with git's reason named and no commit recorded."""
     inst = _install(tmp_path)
     (inst / "prompts" / "edited.md").write_text("# edited\n")
+    # The host's system config is not read: a GitHub runner's /etc/gitconfig
+    # carries `safe.directory = *` (actions/runner-images, install-git.sh),
+    # which marks every checkout safe, so git read this one and the launch
+    # took the git path. The refusal is the subject; whether a host waives
+    # it is not.
     rc, out, err = _run(tmp_path, inst,
-                        env={"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"})
+                        env={"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+                             "GIT_CONFIG_NOSYSTEM": "1"})
     assert rc == 0, err
     snap, commit = (out.splitlines() + [""])[:2]
     assert commit == ""
