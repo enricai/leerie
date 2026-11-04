@@ -6954,6 +6954,20 @@ sample's probe never counts for the next.
   tests); `_run_streaming` ignoring the taken pipe; taken checked before
   the refusal; `run()` without `_undumpable`. `tests/heldout_sandbox_emulator.py`
   and `tests/conftest.py` pass and honour `--taken-fd`.
+- `tests/test_relay_holds_no_refusal.py` (3 test functions; DESIGN §6 *A
+  confinement failure stops the run; it is never a result*; review round
+  40, isolation F1) — the relay is forked from a non-dumpable shim and
+  holds neither descriptor. The real `serve_relays`, in a process of its
+  own given both descriptors, holds neither once it has relayed a
+  connection; the real `main()`, with the namespace and Landlock steps
+  stood in for, calls `_undumpable` before `start_relays`, and a failure
+  there refuses with the listeners closed and no relay; isolated (runs in
+  the container), the running relay of the real `--isolate --egress`
+  shim refuses its parent `/proc/<relay>/environ`. Falsified
+  (2026-11-04): `serve_relays` without the closes fails the first;
+  `main()` without its `_undumpable` fails the second; both, run in a
+  container of the 0.44.1 image, fail all three (all three pass there
+  with the fix).
 - `tests/test_run_settings.py` (54 tests, review rounds 17 H2 and 18 H1,
   DESIGN §8 *The settings are leerie's*): both checker halves and both
   restore halves. A setting written from a worker's tree (each key DESIGN
@@ -7828,7 +7842,16 @@ sample's probe never counts for the next.
   `tests/test_launcher_env_forwarding.py` and
   `tests/test_launcher_state_mount.py` stub `_code_dir`;
   `tests/test_run_repo_bring_back.py`'s launcher harnesses pass it.
-- `tests/test_launch_snapshot_is_one_commit.py` (5 test functions) — the
+- `tests/test_host_finalize_runs_its_own_code.py` (2 test functions) —
+  `host-finalize.sh` runs the leerie code it was sourced from (review
+  round 40, execution F1). test_host_finalize_rebase's harness, with the
+  file sourced from a "snapshot" directory and `LEERIE_REPO` naming a
+  different "install": the rebaser seam and `host_apply_captured_deps`
+  are each given the snapshot's `orchestrator/leerie.py`, and the install's
+  appears in neither. Falsified (2026-11-04): the two arguments back on
+  `$LEERIE_REPO` fail both.
+- `tests/test_launch_snapshot_is_one_commit.py` (7 test functions, 9
+  cases) — the
   snapshot is one state of the install, and `LEERIE_COMMIT` names it
   (review round 39, execution E2 and E3). The launcher's snapshot span,
   verbatim: a clean checkout gives its commit's tree and short sha; a
@@ -7842,7 +7865,17 @@ sample's probe never counts for the next.
   Falsified (2026-11-04), one change at a time: a git checkout copied
   with `cp -pR` instead of archived fails the flipping test; edits
   recorded as the bare commit fail the edits test; the non-git copy left
-  uncompared fails the changed-under-copy test. `tests/test_leerie_commit.py`'s
+  uncompared fails the changed-under-copy test. Review round 40: a
+  checkout git refuses to read (`GIT_TEST_ASSUME_DIFFERENT_OWNER=1`, git's
+  own hook for its ownership check) is copied with git's reason logged, no
+  commit recorded and no "launch again" (execution F3); and a SIGINT or
+  SIGTERM to the launch's process group, or a SIGKILL, while a stand-in
+  `git` holds the snapshot in `add` leaves nothing in `~/.cache/leerie`
+  once the EXIT trap or the next launch's `_sweep_stale_stages` has run
+  (execution F2, isolation F2; 3 cases). Falsified (2026-11-04): the
+  private index back in `~/.cache/leerie/idx-<pid>-*` fails the 3 signal
+  cases; the old stop on an unreadable checkout fails the git case.
+  `tests/test_leerie_commit.py`'s
   two launcher pins run the span (a git install: the short sha; no git:
   empty, status 0).
 - `tests/test_capture_validation.py` — E2's proof turned around: the schema,

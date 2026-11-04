@@ -1442,9 +1442,16 @@ def _relay_accept(listener: socket.socket, target: str) -> None:
 def serve_relays(relays: list[tuple[socket.socket, str]]) -> None:
     """The relay process: forward every connection to each listener to its
     unix socket, until the shim ends it with the command. Stdin is closed:
-    the relay reads only its sockets."""
+    the relay reads only its sockets. So are the caller's refusal and taken
+    descriptors, which only the shim writes: the relay lives as long as the
+    command, and holds nothing a refusal could be forged through (DESIGN §6
+    *A confinement failure stops the run; it is never a result*)."""
     import threading  # noqa: PLC0415 - only the relay process needs it
     os.close(0)
+    for fd in (_REFUSAL_FD, _TAKEN_FD):
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
     threads = [threading.Thread(target=_relay_accept, args=pair, daemon=True)
                for pair in relays]
     for t in threads:
@@ -1879,6 +1886,15 @@ def main(argv: list[str]) -> int:
             for s, _t in relays:
                 s.close()
             return _isolation_failed(e)
+        # Non-dumpable before the relay is forked, not only before the
+        # command is (`run`): the relay inherits it, and lives as long as
+        # the command (DESIGN §6 *A confinement failure stops the run; it is
+        # never a result*). After `isolate`, as in `run_sandbox`.
+        why = _undumpable()
+        if why is not None:
+            for s, _t in relays:
+                s.close()
+            return _isolation_failed(OSError(why))
         if o["egress"]:
             os.environ.update(proxy_env(relays[-1][0].getsockname()[1]))
         rw = rw + list(PRIVATE)

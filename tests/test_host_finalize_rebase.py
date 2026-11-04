@@ -88,7 +88,7 @@ def _make_stub_python3(bin_dir: Path, rebaser_json: str, marker: str = "run_reba
     shifted by those. A stub that read the script from `$1` saw `-I`, fell
     through to the real interpreter, ran the real rebaser and never returned. Hard-coding the wrong index here is
     not a benign test bug — an earlier revision of a sibling stub wrote to the
-    slot holding "$LEERIE_REPO/orchestrator/leerie.py" and truncated the real
+    slot holding the orchestrator path (`.../orchestrator/leerie.py`) and truncated the real
     orchestrator source to 15 bytes.
     """
     p = bin_dir / "python3"

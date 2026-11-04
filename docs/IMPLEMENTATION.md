@@ -700,7 +700,11 @@ started with*):
   `orchestrator/`, `scripts/`, `prompts/` and `.claude-plugin/` of `SRC`
   (`$LEERIE_REPO`) into `DEST`, and sets `LEERIE_COMMIT` (no longer read
   at launcher start). When `SRC/.git` exists, `HEAD` is read once (`rev-parse --verify -q
-  'HEAD^{commit}'`; unresolved, it returns 1, "has no commit to run"), and
+  'HEAD^{commit}'`, its stderr in `DEST/.git-err`, removed). Unresolved (git
+  cannot read the checkout, e.g. its `safe.directory` refusal, or there is
+  no commit), the launch logs "git cannot read the leerie checkout at SRC
+  (<git's first stderr line>); taking it as a copy, with no commit
+  recorded" and takes the non-git shape below. Resolved, and
   when `git --no-optional-locks status
   --porcelain --untracked-files=all -- <dirs>` is empty, `git archive
   <HEAD> -- <dirs> | tar -xf - -C DEST` and `LEERIE_COMMIT=<short HEAD>`.
@@ -708,11 +712,11 @@ started with*):
   (`rev-parse --git-path index.lock`) absent and `_leerie_checkout_state`
   (HEAD and `ls-files -s -- <dirs>`) read, `_leerie_worktree_tree` twice
   (`GIT_INDEX_FILE=<private> read-tree HEAD; add -A -- <dirs>;
-  write-tree`, the private indexes in `mktemp -d ~/.cache/leerie/idx-…`,
-  removed); the two ids equal, the lock still absent and the state
+  write-tree`, the private indexes in `DEST/.idx`, removed before the
+  archive is extracted, and with `DEST` on any other exit); the two ids equal, the lock still absent and the state
   unchanged, or it returns 1 ("changed while this launch read it");
   `git archive <tree>` and `LEERIE_COMMIT=<short HEAD>-dirty.<tree:12>`.
-  No `SRC/.git` (not a git checkout): `cp -pR` of each directory, then `diff
+  No `SRC/.git` (not a git checkout), or `HEAD` unresolved: `cp -pR` of each directory, then `diff
   -r -q` of each against `SRC`, a difference returns 1 ("changed while
   this launch copied it"); `LEERIE_COMMIT` empty. Then the snapshot's
   `plugin.json` version (the same `awk` extraction as `LEERIE_VERSION`)
@@ -725,7 +729,12 @@ started with*):
   also takes a `cfg-<pid>-code-*` a SIGKILL left); a remote runtime
   removes it.
 - `_bring_back_ran_run` and the post-exit `host_finalize` source
-  `$_code_dir/scripts/host-finalize.sh`, not the install's.
+  `$_code_dir/scripts/host-finalize.sh`, not the install's. The file
+  takes leerie's code from the tree it was sourced from,
+  `_HOST_FINALIZE_CODE` (`${BASH_SOURCE[0]%/*}/..`), never
+  `$LEERIE_REPO`: the rebaser seam and `host_apply_captured_deps` load
+  `$_HOST_FINALIZE_CODE/orchestrator/leerie.py`, whose `PROMPTS` are that
+  tree's `prompts/`.
 
 `scripts/remote/build-push.sh` provides the build-and-push path. By
 default it uses Fly's remote builder (no host Docker daemon required):
@@ -4502,7 +4511,12 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   command's own exit codes write nothing. Before it forks the command
   (`run()`, and `run_sandbox` before it forks PID 1), the shim calls
   `_undumpable()`, `prctl(PR_SET_DUMPABLE, 0)`, so the command cannot open
-  `/proc/<shim>/fd/N` (a failure is a refusal). `--taken-fd N`
+  `/proc/<shim>/fd/N` (a failure is a refusal). Under `--isolate`,
+  `main()` calls `_undumpable()` after `isolate()` and before
+  `start_relays()` (a failure: the listeners closed,
+  `_isolation_failed`), so the relay is forked non-dumpable, and
+  `serve_relays` closes `_REFUSAL_FD` and `_TAKEN_FD` before it relays.
+  `--taken-fd N`
   (`--sandbox` only; close-on-exec first thing in `main()` like `N`): a
   `PlacementTaken` from `place()` goes through `_taken(e) -> int` — the
   message to stderr, the same bytes to the taken descriptor, nothing to
@@ -11118,8 +11132,9 @@ is canonical. Locally nothing in the container writes the user's checkout.
     `[A-Za-z0-9._-]`, not `.`/`..`; else usage, exit 1; exit 1 too when
     `<state>/runs/<run-id>/captured-deps.json` is absent) sources
     `scripts/host-finalize.sh` and runs `host_apply_captured_deps
-    <run-dir>`: host `python3` loads `$LEERIE_REPO/orchestrator/leerie.py`
-    by path (as the rebaser and `--recapture` seams do) and calls
+    <run-dir>`: host `python3` loads `orchestrator/leerie.py` of the tree
+    the file was sourced from (`_HOST_FINALIZE_CODE`; for this verb, the
+    install) by path (as the rebaser and `--recapture` seams do) and calls
     `apply_captured_deps(run_dir, $USER_REPO)`, which logs the change as a
     unified diff. Returns 1 (the verb exits 1) when the seam fails or the
     capture is refused.

@@ -6760,33 +6760,49 @@ fi
 #   must be the same before and after (a checkout or pull rewrites them), or
 #   the checkout changed while it was read and the launch stops. That tree is archived, and
 #   LEERIE_COMMIT is `<HEAD>-dirty.<tree>`: the record names exactly the code
-#   that ran (`git archive <tree>` in that checkout gives it back).
-# - not a git checkout (a plugin directory installed without git): copied,
-#   then compared with the install as it stands after the copy (`diff -r`); a
-#   difference means the install changed under the copy, and the launch
-#   stops. LEERIE_COMMIT stays empty: there is no commit.
+#   that ran, and `git archive <tree>` in that checkout gives it back for as
+#   long as git keeps the tree (no ref holds it, so `git gc` prunes it once
+#   older than gc.pruneExpire, two weeks by default). The private indexes
+#   live in DEST/.idx, removed with DEST by every exit and by the sweep.
+# - not a git checkout (a plugin directory installed without git), or a
+#   checkout git cannot read (git's safe.directory refusal of another user's
+#   install; no commit): copied, then compared with the install as it stands
+#   after the copy (`diff -r`); a difference means the install changed under
+#   the copy, and the launch stops. LEERIE_COMMIT stays empty: there is no
+#   commit. The copy-and-compare needs nothing of git, so it holds the same
+#   one-state guarantee whatever git can read.
 # The snapshot's plugin.json version must be the launcher's, which names the
 # image: an install that changed version since the launcher started stops the
 # launch rather than run one version's code in another's image.
 _snapshot_leerie_code() {
-  local _src=$1 _dst=$2 _head _ref _short _tree _tree2 _idx _lock _git_state
-  local _d _v
+  local _src=$1 _dst=$2 _head="" _ref _short _tree _tree2 _idx _lock _git_state
+  local _d _v _gerr
   local _dirs=(orchestrator scripts prompts .claude-plugin)
   LEERIE_COMMIT=""
   if [ -e "$_src/.git" ]; then
-    _head="$(git -C "$_src" rev-parse --verify -q 'HEAD^{commit}')" \
-      || _head=""
+    # A checkout git cannot read (another user's, which git's safe.directory
+    # check refuses; a damaged one; one with no commit) is not a moving
+    # checkout: it is taken as a copy, below, with git's own reason.
+    _head="$(git -C "$_src" rev-parse --verify -q 'HEAD^{commit}' \
+               2>"$_dst/.git-err")" || _head=""
     if [ -z "$_head" ]; then
-      remote_log "the leerie checkout at $_src has no commit to run; launch again"
-      return 1
+      _gerr=""
+      IFS= read -r _gerr <"$_dst/.git-err" || true
+      remote_log "git cannot read the leerie checkout at $_src (${_gerr:-HEAD names no commit}); taking it as a copy, with no commit recorded"
     fi
+    rm -f "$_dst/.git-err"
+  fi
+  if [ -n "$_head" ]; then
     _ref=$_head
     _short="$(git -C "$_src" rev-parse --short "$_head")" || return 1
     if [ -n "$(git -C "$_src" --no-optional-locks status --porcelain \
                  --untracked-files=all -- "${_dirs[@]}")" ]; then
       _lock="$(git -C "$_src" rev-parse --path-format=absolute \
                  --git-path index.lock)" || return 1
-      _idx="$(mktemp -d "$HOME/.cache/leerie/idx-$$-XXXXXX")" || return 1
+      # Inside DEST, so whatever removes the snapshot (the EXIT traps, the
+      # sweep of a SIGKILLed launch's cfg-<pid>-code-*) removes it too.
+      _idx="$_dst/.idx"
+      mkdir "$_idx" || return 1
       _tree=""
       _tree2=""
       _git_state="$(_leerie_checkout_state "$_src" "${_dirs[@]}")" || _git_state=""

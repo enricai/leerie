@@ -5510,6 +5510,15 @@ The mechanism:
   container's root user instead, in a container of this image, the same
   forge under `--isolate` succeeded too (2026-11-04, the shim before this
   rule). The non-dumpable shim refuses it in both (`EACCES`), by design.
+- No other process of the shim's holds the descriptor or can be opened
+  for it. The relay (`--egress`, `--forward`) is a fork of the shim that
+  never `exec`s and lives as long as the command. It is forked from the
+  already non-dumpable shim, and it closes the refusal and taken
+  descriptors, which only the shim writes. *Review round 40 (isolation
+  F1):* the relay was forked before the shim became non-dumpable, so it
+  was dumpable and held the refusal pipe for the command's whole life;
+  the command's open of it was refused only by the capability asymmetry
+  the rule above no longer rests on.
 - A held-out file the tree leaves no room for is a fact about the tree,
   not a refusal. A worker can commit a link, or a file, where a set's
   directory must be (`tests -> spec_real`). The shim places each file
@@ -6246,13 +6255,35 @@ The mechanism:
     index's entries must be the same before and after; otherwise the
     checkout changed while it was read, and the launch stops. That tree
     is archived, and `LEERIE_COMMIT` is `<commit>-dirty.<tree>`, so the
-    record names exactly the code that ran (`git archive <tree>` in that
-    checkout gives it back). Nothing is staged in the checkout itself.
+    record names exactly the code that ran. `git archive <tree>` in that
+    checkout gives it back for as long as git keeps the tree: no ref holds
+    it, so `git gc` removes it once it is older than `gc.pruneExpire` (two
+    weeks by default). Leerie keeps no ref to it: one install serves the
+    runs of every repository on the host, each pruned on its own (`leerie
+    prune`), so the install cannot tell which recorded trees a kept run
+    still names, and a ref per launch that is never removed grows without
+    bound (each edit of the 3.6 MB `leerie.py` is a new object). *Review
+    round 40 (execution F4) measured it:* after `git -c
+    gc.pruneExpire=now gc` the recorded tree was gone. Nothing is staged
+    in the checkout itself, and the private index lives inside the
+    snapshot's own directory, so whatever removes the snapshot removes
+    it. *Review round 40 (execution
+    F2, isolation F2):* it was a directory of its own beside the
+    snapshot, removed only on the straight path; a Ctrl-C, `SIGTERM` or
+    `SIGKILL` during the snapshot left one in 8 or 9 of 20 signalled
+    launches, and no sweep took it.
   - An install that is not a git checkout (a plugin directory installed
-    without git): copied, then compared with the install as it stands
-    after the copy. A difference means the install changed under the
-    copy, and the launch stops. `LEERIE_COMMIT` is empty: there is no
-    commit.
+    without git), or a checkout git cannot read (another user's, which
+    git's `safe.directory` check refuses; one with no commit): copied,
+    then compared with the install as it stands after the copy. A
+    difference means the install changed under the copy, and the launch
+    stops. `LEERIE_COMMIT` is empty: there is no commit. The comparison
+    needs nothing of git, so the copy is one state of the install
+    whatever git can read; the launch names git's reason and goes on.
+    *Review round 40 (execution F3):* a checkout git could not read
+    stopped every launch with "has no commit to run; launch again", which
+    no relaunch changes, where before the snapshot the launch went on
+    with an empty record.
   *Measured 2026-11-04 (review round 39, execution E2 and E3):* the record
   was read at the launcher's start and the copy taken after the image
   steps, 7 minutes later on a first launch, so a same-version update in
@@ -6270,7 +6301,12 @@ The mechanism:
   on the next `resume` of its run (`_reap_orphaned_container`).
 - The launcher's own steps after the container exits (bringing the run
   branch back, finalize) source `scripts/host-finalize.sh` from the same
-  copy, not from the install.
+  copy, not from the install, and that file runs every leerie file it
+  needs from the tree it was sourced from: the orchestrator the rebaser
+  loads, and with it the rebaser's prompt. *Review round 40 (execution
+  F1):* it loaded `$LEERIE_REPO/orchestrator/leerie.py`, the install, so
+  an install updated during the run ran the update's rebaser at this
+  run's finalize.
 - Why not the image's baked copy: the image is named by version
   (`leerie:<version>`), not by code. Every commit between two releases,
   and a contributor's edits, carry the version of the last release, so a
