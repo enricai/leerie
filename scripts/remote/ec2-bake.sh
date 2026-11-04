@@ -108,6 +108,10 @@ mise install --system node@lts python@3.12
 
 node_dir="$(find /usr/local/share/mise/installs/node -mindepth 1 -maxdepth 1 -type d | sed -n 1p)/"
 ln -sfn "${node_dir%/}" /usr/local/share/mise/installs/node/lts-current
+# The Dockerfile's `lts-current` step: corepack's shims in the baked Node's own
+# bin, since MISE_NODE_COREPACK=false (DESIGN §6 *Each Node version's corepack
+# shims go in its own `bin`*).
+"${node_dir%/}/bin/corepack" enable --install-directory "${node_dir%/}/bin"
 
 # Login shells (an operator's `ssh` + `sudo -iu leerie`) get the same set.
 printf 'set -a\n. %s\nset +a\n' "$LEERIE_ENV_FILE" > /etc/profile.d/leerie.sh

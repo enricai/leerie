@@ -32826,6 +32826,54 @@ def _repo_has_version_signal(repo_root: Path,
 MISE_LS_TIMEOUT = 30
 
 
+async def _enable_corepack_shims(grants: WorkerGrants, env: dict[str, str],
+                                 cwd: str, log_path: Path,
+                                 verbosity: str) -> None:
+    """Enable corepack for each Node version in `MISE_DATA_DIR` that has no
+    shims yet, into that version's own `bin` (DESIGN §6 *Each Node version's
+    corepack shims go in its own `bin`*). Without `--install-directory`
+    corepack writes next to the first `corepack` on PATH — the image's baked
+    Node, which the toolchain grant does not write. A version left shimless
+    by a failed run is enabled here too. Symlinked aliases are skipped: their
+    target is a real directory of its own.
+
+    `MISE_DATA_DIR` is written by confined commands (the toolchain and setup
+    hook grants), so it is read as a repository's place is: names listed
+    beneath it and directories reached without a link (DESIGN §6 *Leerie
+    never reads through a link a repository holds*). `bin/corepack` is
+    itself a link in a Node install; leerie only names it, and the kernel
+    resolves it inside the confined command."""
+    data = Path(env.get("MISE_DATA_DIR")
+                or Path.home() / ".local" / "share" / "mise")
+    root = data / "installs" / "node"
+    try:
+        names = _listdir_beneath(data, root)
+    except OSError:
+        return
+    for name in sorted(names):
+        v = root / name
+        if not _dir_beneath_exists(data, v):
+            continue
+        bin_dir = v / "bin"
+        try:
+            present = set(_listdir_beneath(data, bin_dir))
+        except OSError:
+            continue
+        if "corepack" not in present or "pnpm" in present:
+            continue
+        label = f"corepack enable {v.name}"
+        try:
+            rc, tail = await _run_streaming(
+                [str(bin_dir / "corepack"), "enable", "--install-directory",
+                 str(bin_dir)],
+                grants=grants, cwd=cwd, env=env, log_path=log_path,
+                label=label, verbosity=verbosity)
+        except subprocess.TimeoutExpired as exc:
+            die(f"{label} timed out\n(see {log_path})\n{exc.output or ''}")
+        if rc != 0:
+            die(f"{label} failed (exit {rc})\n(see {log_path})\n{tail}")
+
+
 async def _run_mise_install(repo_root: Path, log_dir: Path,
                             st: "State",
                             override_file: Path | None = None) -> None:
@@ -32862,6 +32910,11 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     env = os.environ.copy()
     if override_file is not None:
         env["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override_file)
+    # mise's own corepack enable writes beside the first `corepack` on PATH,
+    # the image's baked Node, not the version it installed; leerie enables
+    # each version into its own bin after the install instead (DESIGN §6
+    # *Each Node version's corepack shims go in its own `bin`*).
+    env["MISE_NODE_COREPACK"] = "false"
 
     # `mise install` with no tool args reads the active config and
     # installs every declared tool. We let the resolver figure out the
@@ -32892,6 +32945,8 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
         die(f"mise install timed out\n(see {log_path})\n{exc.output or ''}")
     if rc != 0:
         die(f"mise install failed (exit {rc})\n(see {log_path})\n{tail}")
+    await _enable_corepack_shims(grants, env, str(repo_root), log_path,
+                                 verbosity)
 
     # Capture resolved versions. `mise ls --current --json` is the
     # documented machine-readable view; `mise current --json` does NOT

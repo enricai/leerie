@@ -4401,6 +4401,44 @@ is not given one: a worker installs no toolchain (a toolchain under
 `MISE_DATA_DIR` is outside its write boundary), and its `~/.gnupg`
 stays the home a signed commit reads.
 
+**Each Node version's corepack shims go in its own `bin`.** *Designed
+2026-11-04 (barnacle's Node floor, the step after the gpg home).* With a
+gpg home of its own, `mise install node@22.19.0` downloaded and verified,
+then died enabling corepack: "EROFS: read-only file system, unlink
+'/usr/local/share/mise/installs/node/24.22.2/bin/pnpm'". The image had
+mise run each new version's `corepack enable` (`MISE_NODE_COREPACK=true`),
+and `corepack enable` without `--install-directory` writes its shims next
+to the first `corepack` on `PATH` — the image's baked LTS Node, whose `bin`
+comes before `MISE_DATA_DIR` on `PATH`, not the version just installed.
+Confined, that is a write outside the toolchain kind's grant; before
+confinement it silently replaced the baked Node's own `pnpm` and `yarn`
+with links into another version's corepack. **Invariant: every Node
+version leerie's `mise install` puts in `MISE_DATA_DIR` gets its corepack
+shims in its own `bin` (`corepack enable --install-directory
+<version>/bin`, run by leerie under the same toolchain grant), and nothing
+leerie's toolchain install runs writes the image's baked Node.** mise's
+implicit enable is off (`MISE_NODE_COREPACK=false`, in the image and on
+`mise install`'s own environment), since it cannot be pointed at a
+directory. The baked LTS Node is enabled into its own `bin` explicitly at
+image build, as root, before any confinement. Granting the baked Node's
+directory would keep the overwrite; putting the new version's `bin` first
+on `PATH` during the install would rely on corepack's `which` lookup
+rather than naming the directory. A version left without shims by a failed
+run is enabled by the next one.
+
+Whether a version needs shims of its own was measured rather than assumed
+(leerie 0.44.1 image, a tree whose `.nvmrc` says 22.19.0, a confined
+measurement): no command leerie runs reaches them through a bare `pnpm` —
+the baked Node's `bin` is first on `PATH`, so bare `node`, `pnpm` and
+`corepack` are the baked Node's, and leerie's pnpm pin
+(`_COREPACK_PIN_ENV`, `_seed_pnpm_pin`'s bare `corepack`) goes through
+them. What does reach them is the version's own toolchain: `mise exec --
+pnpm` resolves `pnpm` from the active version's `bin` first, and with
+that `bin` first on `PATH` `pnpm` is that version's corepack, still at the
+pinned pnpm (10.4.1), with `pnpm exec node` at 22.19.0. Without its own
+shims a pinned version would silently borrow the baked Node's corepack.
+So the shims stay, made where they belong.
+
 **A worker's temp directory is short and private too.** *Designed
 2026-11-03 (the live 0.43.0 barnacle runs).* A worker's `TMPDIR` was
 `<run-dir>/workers/<wid>/tmp/`, at the run directory's depth —
