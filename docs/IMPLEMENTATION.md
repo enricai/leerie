@@ -1039,7 +1039,11 @@ VirtioFS is the mount type leerie documents (`colima start --runtime containerd 
 operator's terminal as a control sequence*). `_TERMINAL_CONTROL` (C0 but
 `\n`/`\t`, `\x7f`–`\x9f`, U+061C, U+200E, U+200F, U+2028–U+202E,
 U+2066–U+2069, U+D800–U+DFFF); `_terminal_text(s) -> str` writes each as
-`\xNN` (a `surrogateescape` byte as its byte) or `\uNNNN`.
+`\xNN` (a `surrogateescape` byte as its byte) or `\uNNNN`, and the same
+regex's first alternative, a complete 7-bit CSI (`\x1b\[[0-?]{0,64}[ -/]{0,8}[@-~]`),
+is replaced by nothing (one `sub` pass, so no removal joins a new
+sequence). No `NO_COLOR`/`FORCE_COLOR` is set on any command leerie runs
+for this.
 `_TerminalStream(orig)`: `write` passes `_terminal_text(s)` on and returns
 `len(s)`; attributes fall through. `_guard_terminal_streams()` wraps
 `sys.stdout` and `sys.stderr` once (not a `_TerminalStream` or `_TeeStream`
@@ -1048,7 +1052,9 @@ already); `main()`'s first statement. `log()` and `die()` print
 writes either copy. `scripts/terminal-text.py` (host `python3 -I -S`,
 stdlib): `text(s)` is the same rule (pinned equal over U+0000–U+2FFF and
 surrogates), `main()` relays fd 0 to fd 1 through an incremental UTF-8
-`surrogateescape` decoder. `scripts/remote/_log.sh`'s `_terminal_relay`
+`surrogateescape` decoder, holding back a chunk's trailing incomplete CSI
+(`_CSI_PREFIX`, the same bounds: at most 74 characters) until the next chunk
+or end of input. `scripts/remote/_log.sh`'s `_terminal_relay`
 runs it; the launcher's piped relay (`tail -f $_run_log | _terminal_relay
 [| tee -a <log-file>]`), the Fly tail and launch-stderr, the EC2 tail,
 `lib.sh`'s `tail_with_optional_autofinalize` (stdout, and stderr after its

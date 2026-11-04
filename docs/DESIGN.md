@@ -2796,6 +2796,38 @@ where text leaves for the terminal: C0 controls but newline and tab, DEL
 and C1, U+061C, U+200E/U+200F, U+2028–U+202E, U+2066–U+2069 and a lone
 surrogate (a byte that was not UTF-8) are written as their escapes
 (`\x1b`, `\u202e`), which are printable, so the rule is idempotent.
+One shape is dropped instead of escaped: a complete 7-bit CSI sequence —
+`ESC [`, at most 64 parameter bytes `0`–`?`, at most 8 intermediate bytes
+space–`/`, one final byte `@`–`~` — is removed whole (a longer one is no
+sequence a tool writes, and is escaped). Test runners and package managers colour
+what they print even into a pipe (tinyrainbow, which vitest uses, colours
+unless `NO_COLOR` is set; picocolors whenever `CI` is), and escaping every
+SGR made a relayed test run unreadable: `\x1b[32m✓\x1b[39m src/…` (the
+user's 0.44.0 run, 2026-11-03). Dropping keeps the guarantee — nothing of
+the sequence reaches the terminal — and every CSI, not SGR alone, because
+a CSI carries no text the operator should read: it sets rendition, moves
+the cursor, erases, sets modes or asks the terminal to report (`CSI 6n`,
+whose reply a terminal types as input). Dropping a cursor move or an erase
+only ever leaves more of the text visible than the terminal would have
+shown. Every other control stays visible as its escape: OSC and DCS carry
+a payload (a clipboard, a title, a link), so the operator sees it; a lone
+or incomplete `ESC`, the C1 CSI (`\x9b`), C1, bidi and separators are
+escaped as before. The rule is one left-to-right pass, so a removal can
+never join two pieces into a new sequence: what remains holds no `ESC`.
+The launcher's relay reads its input in chunks; it holds back a chunk's
+trailing incomplete CSI (within the same bounds) until the next chunk or
+the end of the stream, so a split sequence is dropped like a whole one.
+Leerie does not set `NO_COLOR` or `FORCE_COLOR` for the repository's
+commands to the same end: either changes what a colour library prints
+(measured, node 24, output piped: picocolors 1.1.1 and tinyrainbow 3.2.0
+print plain under `NO_COLOR=1` and colour under `CI=1 FORCE_COLOR=0`; both
+test `FORCE_COLOR` for presence, so `0` turns colour on),
+so a test asserting on its coloured output — a snapshot recorded in a
+terminal — would fail in leerie's measurement and pass in the repository's
+own CI, a false red the workers would then chase. The display rule makes
+the output readable without changing what is measured. Nor for a worker's
+own commands: their output reaches the worker, not the terminal, and a
+worker reproducing a measurement must see the outcome the measurement saw.
 Inside the orchestrator it is `_terminal_text`: `log()` and `die()` apply
 it (the host seams that load the orchestrator call them without
 `main()`), `main()` makes `sys.stdout` and `sys.stderr` escaping streams

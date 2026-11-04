@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -297,3 +298,100 @@ def test_a_pre_push_hooks_output_reaches_the_terminal_as_text(tmp_path):
     assert "rc=1" in r.stdout, (r.stdout, r.stderr)
     assert "lint: src/\\x1b]52;c;" in r.stderr, r.stderr
     assert _clean(r.stderr), repr(r.stderr)
+
+
+# --- colour: a complete CSI is dropped, every other control escaped ----------
+#
+# 0.44.0 escaped every SGR a test runner printed, so the user's relayed vitest
+# run read `\x1b[32m✓\x1b[39m src/…` (barnacle, 2026-11-03). The lines below
+# are that run's, as vitest wrote them.
+
+VITEST = [
+    "\x1b[1m\x1b[30m\x1b[46m RUN \x1b[49m\x1b[39m\x1b[22m \x1b[36mv4.1.11 "
+    "\x1b[39m\x1b[90m/w/view\x1b[39m",
+    " \x1b[32m✓\x1b[39m src/a.test.ts \x1b[2m(\x1b[22m\x1b[2m1 test\x1b[22m"
+    "\x1b[2m)\x1b[22m\x1b[33m 9600\x1b[2mms\x1b[22m\x1b[39m",
+    "\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m1 passed\x1b[39m\x1b[22m"
+    "\x1b[90m (1)\x1b[39m",
+]
+VITEST_PLAIN = [" RUN  v4.1.11 /w/view",
+                " ✓ src/a.test.ts (1 test) 9600ms",
+                "      Tests  1 passed (1)"]
+# Each stays visible as its escape: a payload (OSC 52, OSC 8, DCS), a lone
+# ESC, an ESC before a non-CSI byte, a CSI cut short by a control or by
+# the end, the C1 CSI, a bidi override.
+KEPT = {
+    OSC52: "\\x1b]52;c;",
+    "\x1b]8;;http://evil.example\x1b\\link\x1b]8;;\x1b\\": "\\x1b]8;;http",
+    "\x1bPq#0;2;0;0;0\x1b\\": "\\x1bPq#0",
+    "a \x1b b": "a \\x1b b",
+    "\x1b(0": "\\x1b(0",
+    "\x1b[31\x07m": "\\x1b[31\\x07m",
+    "end \x1b[": "end \\x1b[",
+    "\x9b31m": "\\x9b31m",
+    "\u202eabc": "\\u202eabc",
+    # Past the bound (64 parameter bytes): no sequence a tool writes.
+    "\x1b[" + "1;" * 40 + "m": "\\x1b[1;1;",
+}
+# Dropped whole: SGR, cursor movement, erase, a private mode, a report
+# request (the terminal's reply would arrive as typed input).
+DROPPED = ["\x1b[0m", "\x1b[38;5;196m", "\x1b[1A", "\x1b[2K", "\x1b[10;20H",
+           "\x1b[?1049h", "\x1b[?25l", "\x1b[6n", "\x1b[21t", "\x1b[ q",
+           "\x1b[" + "1;" * 32 + "m"]
+CSI_CORPUS = "\n".join([*VITEST, *KEPT, *DROPPED,
+                        "\x1b\x1b[0m[31m"])
+
+
+def test_a_coloured_test_runner_line_reaches_the_terminal_plain(leerie):
+    m = _filter_module()
+    for line, plain in zip(VITEST, VITEST_PLAIN):
+        assert leerie._terminal_text(line) == plain
+        assert m.text(line) == plain
+
+
+def test_a_payload_or_a_partial_sequence_stays_visible(leerie):
+    for raw, shown in KEPT.items():
+        got = leerie._terminal_text(raw)
+        assert shown in got and "\x1b" not in got, (raw, got)
+    for raw in DROPPED:
+        assert leerie._terminal_text("a" + raw + "b") == "ab", raw
+
+
+def test_a_removal_never_joins_a_new_sequence(leerie):
+    """One pass: the ESC before a CSI is escaped, the CSI dropped, and what
+    follows is text."""
+    got = leerie._terminal_text("\x1b\x1b[0m[31mred")
+    assert got == "\\x1b[31mred"
+    assert leerie._terminal_text(got) == got
+
+
+def test_the_launchers_filter_drops_the_same_sequences(leerie):
+    m = _filter_module()
+    assert m.text(CSI_CORPUS) == leerie._terminal_text(CSI_CORPUS)
+    for raw in [*KEPT, *DROPPED]:
+        assert m.text(raw) == leerie._terminal_text(raw), raw
+
+
+def test_the_relay_drops_a_sequence_split_across_reads(leerie, monkeypatch):
+    """The relay's reads cut the stream into one-byte chunks, so every
+    sequence is split: its output is still the rule applied to the whole
+    stream, and an incomplete sequence at the end is escaped."""
+    m = _filter_module()
+    data = (CSI_CORPUS + "\n").encode() + b"tail \x1b[3"
+    chunks = [data[i:i + 1] for i in range(len(data))] + [b""]
+    out = bytearray()
+
+    def write(fd, b):
+        assert fd == 1
+        out.extend(b)
+        return len(b)
+
+    # The module's own `os` only, never the process's.
+    monkeypatch.setattr(m, "os", types.SimpleNamespace(
+        read=lambda fd, n: chunks.pop(0), write=write))
+    assert m.main() == 0
+    text = out.decode("utf-8")
+    assert text == leerie._terminal_text(data.decode("utf-8")), repr(text)
+    assert text.endswith("tail \\x1b[3")
+    for plain in VITEST_PLAIN:
+        assert plain in text

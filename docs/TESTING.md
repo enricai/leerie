@@ -985,7 +985,7 @@ pass `--setting-sources user`, `--disable-slash-commands`,
 `--settings` env, and put `--` before the first message. All 6 fail with
 the wiring removed.
 
-`tests/test_terminal_text.py` (13 test functions, 16 cases; DESIGN §6 *No
+`tests/test_terminal_text.py` (18 test functions, 21 cases; DESIGN §6 *No
 text leerie did not
 write reaches the operator's terminal as a control sequence*; review round
 30 isolation T1), with an OSC 52 sequence, a CSI, a C1 CSI, a bidi
@@ -1028,6 +1028,18 @@ stand in for the rebaser seam (`tests/test_host_finalize_sh.py`,
 `/usr/bin/python3` by absolute path — one of them ended in `exec
 /usr/bin/env python3`, which found the stub again and looped once the
 filter called `python3`.
+The colour rule (a complete CSI dropped, everything else escaped; the
+user's 0.44.0 vitest output, 2026-11-03) added 5 functions: the run's
+vitest lines come out plain from both implementations; OSC 52, OSC 8,
+DCS, a lone ESC, a CSI cut by a control or by the end, the C1 CSI and a
+bidi override stay escaped while SGR, cursor moves, erases, private modes
+and report requests are dropped; a removal never joins a new sequence; the
+two implementations agree on that corpus; and the relay's `main()`, fed
+one byte per read (its module's `os` replaced, so every sequence is split),
+emits the rule applied to the whole stream. Falsified: with both
+implementations reverted 4 fail (the agreement case passes, both sides
+escaping alike); with only the relay's hold-back removed, the split-read
+case.
 
 Review round 32. `tests/test_confined_terminal.py` (11 test functions, 17
 cases; DESIGN §6 *No confined process holds or can open the operator's

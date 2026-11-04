@@ -4984,13 +4984,20 @@ def now() -> str:
 # as a control sequence*: C0 but newline and tab, DEL and C1, the
 # bidirectional and line/paragraph separators a terminal acts on, and a
 # lone surrogate (a byte that was not UTF-8, kept by `surrogateescape`).
-# `scripts/terminal-text.py` holds the same rule for the launcher's relay.
+# The first alternative, a complete 7-bit CSI (colour, cursor, erase), is
+# dropped rather than escaped: it carries no text, and escaping every SGR
+# made a relayed test run unreadable. One pass, so no removal can join a new
+# sequence. `scripts/terminal-text.py` holds the same rule for the
+# launcher's relay.
 _TERMINAL_CONTROL = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e"
+    "\x1b\\[[0-?]{0,64}[ -/]{0,8}[@-~]"
+    "|[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e"
     "\u2066-\u2069\ud800-\udfff]")
 
 
 def _terminal_escape(m: "re.Match[str]") -> str:
+    if len(m.group()) > 1:
+        return ""
     o = ord(m.group())
     if 0xdc80 <= o <= 0xdcff:
         return f"\\x{o - 0xdc00:02x}"
@@ -4998,11 +5005,12 @@ def _terminal_escape(m: "re.Match[str]") -> str:
 
 
 def _terminal_text(s: str) -> str:
-    """`s` with every control character written as its escape, so text a
-    repository or a worker chose (a file name, a worker's JSON string)
+    """`s` with every complete CSI sequence removed and every other control
+    character written as its escape, so text a repository or a worker chose
+    (a file name, a worker's JSON string, a test runner's coloured line)
     reaches the operator's terminal as text, never as a sequence the
-    terminal acts on (OSC 52 sets the clipboard). Idempotent: an escape is
-    printable."""
+    terminal acts on (OSC 52 sets the clipboard). Idempotent: what remains
+    holds no control character."""
     return _TERMINAL_CONTROL.sub(_terminal_escape, s)
 
 
