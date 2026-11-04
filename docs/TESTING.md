@@ -7643,6 +7643,24 @@ sample's probe never counts for the next.
   All 13 opt-in cases and the 9 under bash 3.2 passed on this tree
   (measured 2026-11-04, BuildKit 0.31.2, rootless nerdctl 2.3.5,
   containerd 2.2.2).
+- `tests/test_image_steps_run_once.py` (5 functions) — a host-wide image
+  step runs once, under a host lock (DESIGN §6 *A host-wide image step runs
+  once, under a host lock*; the operator's live 0.44.0 launches: five
+  launches on one checkout each exported the base to /tmp and loaded it at
+  once). The launcher's own text, 5 launches at once against one stub
+  image store kept in files: with no base, one base build and one frontend
+  pull; on one checkout, one copy of the base (streamed, nothing in
+  `TMPDIR`), one pull and one repository build, every launch ending with
+  the image's digest and one warning of a shared content store; on five
+  checkouts, one copy and one pull. `leerie_lock`: a second taker waits for
+  the first's release and says so once; a launch SIGKILLed while holding it
+  frees it within seconds though a child it started still runs, and leaves
+  no ready file. Falsified live (2026-11-03), each restored: the lock
+  dropped from the base build (more than one build), from the per-repo host steps (5
+  loads on five checkouts), the checkout's lock dropped, the holder's
+  liveness check removed. In `tests/test_build_repo_image.py`, the copy
+  streams `save` into `load` and a failure of either side is logged with
+  its stderr (2); falsified with `PIPESTATUS[0]` dropped.
 - `tests/test_capture_validation.py` — E2's proof turned around: the schema,
   `_filter_residual_deps`, `_capture_problems`, `_record_capture`,
   `_merge_capture_into_config`, `apply_captured_deps`, the launcher's apt

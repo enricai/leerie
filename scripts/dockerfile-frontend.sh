@@ -61,6 +61,85 @@ _leerie_on_buildkit_side() {
   fi
 }
 
+# leerie_lock <file> <what> — takes an exclusive lock on <file> for this
+# launch and returns once it holds it, with the holder's PID in
+# LEERIE_LOCK_HOLDER for leerie_unlock (DESIGN §6 *A host-wide image step
+# runs once, under a host lock*); <what> names, in the one line logged while
+# it waits, what another launch is doing. An empty <file> takes no lock
+# (LEERIE_LOCK_HOLDER empty): the launcher always names one, a harness that
+# runs a block of its text may not. The lock is held by a python3 process,
+# not by a descriptor of this shell's: every program the shell starts would
+# inherit that descriptor, and one that outlives the step (Colima's SSH
+# ControlMaster keeps what it inherited) would hold the lock for good. The
+# holder lets go when it is killed (leerie_unlock) or within half a second
+# of this launch's end, however it ends. Returns 1 when the holder cannot
+# start or dies before it holds the lock.
+LEERIE_LOCK_HOLDER=""
+_LEERIE_LOCK_PY='
+import fcntl, os, signal, sys, time
+path, ready, owner = sys.argv[1], sys.argv[2], int(sys.argv[3])
+signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+def alive():
+    try:
+        os.kill(owner, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if not alive():
+            sys.exit(0)
+        time.sleep(0.2)
+with open(ready, "w") as f:
+    f.write("held\n")
+while alive():
+    time.sleep(0.5)
+'
+leerie_lock() {
+  local _f="${1:-}" _what="${2:-another launch}" _r _n=0
+  LEERIE_LOCK_HOLDER=""
+  [ -n "$_f" ] || return 0
+  mkdir -p "${_f%/*}" || return 1
+  _r="$_f.ready.$$.$RANDOM"
+  rm -f "$_r"
+  python3 -I -S -c "$_LEERIE_LOCK_PY" "$_f" "$_r" "$$" \
+    </dev/null >/dev/null 2>&1 &
+  LEERIE_LOCK_HOLDER=$!
+  while [ ! -e "$_r" ]; do
+    if ! kill -0 "$LEERIE_LOCK_HOLDER" 2>/dev/null; then
+      LEERIE_LOCK_HOLDER=""
+      rm -f "$_r"
+      return 1
+    fi
+    _n=$((_n + 1))
+    if [ "$_n" -eq 20 ]; then
+      if command -v remote_log >/dev/null 2>&1; then
+        remote_log "waiting for $_what..."
+      else
+        echo "waiting for $_what..." >&2
+      fi
+    fi
+    sleep 0.1
+  done
+  rm -f "$_r"
+  return 0
+}
+
+# leerie_unlock <holder> — lets go of the lock leerie_lock took (its
+# LEERIE_LOCK_HOLDER); nothing for an empty one.
+leerie_unlock() {
+  [ -n "${1:-}" ] || return 0
+  kill "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+  return 0
+}
+
 # leerie_containerd_config — prints the config file the containerd nerdctl
 # talks to reads on this host: $XDG_CONFIG_HOME/containerd/config.toml
 # for rootless containerd (containerd-rootless.sh binds that directory

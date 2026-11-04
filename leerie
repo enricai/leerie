@@ -6325,13 +6325,43 @@ if [ "$IS_RESUME" = "false" ] && [ "$_skip_freshness_check" = "false" ]; then
 fi
 unset _skip_freshness_check
 
-# --- build image if not present (one-time, ~60-120s) --------------------
+# The host-wide dir (build semaphore, DESIGN §6 *A host-wide build
+# semaphore*; the image lock, *A host-wide image step runs once, under a
+# host lock*) defaults to ~/.leerie/.host and must stay shared: the
+# semaphore bounds only the runs that mount the same dir. LEERIE_HOST_DIR
+# repoints it for an isolated run (a bench) that must never touch
+# ~/.leerie. Inside the container the same name means the mount point, set
+# after the LEERIE_* forward below, so this host value never leaks in.
+_leerie_host_dir="${LEERIE_HOST_DIR:-$HOME/.leerie/.host}"
+case "$_leerie_host_dir" in
+  "~")   _leerie_host_dir="$HOME" ;;
+  \~/*)  _leerie_host_dir="$HOME/${_leerie_host_dir#"~/"}" ;;
+esac
+case "$_leerie_host_dir" in
+  /*) ;;
+  *)
+    echo "leerie: error: LEERIE_HOST_DIR='$_leerie_host_dir' is not an absolute path" >&2
+    exit 1
+    ;;
+esac
+# The lock every host-wide image step takes (leerie_lock): leerie's base
+# build, and the copy and pull into BuildKit's worker namespace.
+_leerie_image_lock="$_leerie_host_dir/image.lock"
+
+# --- build image if not present (once per version) ----------------------
 # In leerie's containerd namespace, which no BuildKit worker reads (DESIGN §6
 # *No build consumes what another build left in BuildKit*); nerdctl exports
 # the image there. With the operator's Docker config: leerie's own
-# Dockerfile names only public images.
+# Dockerfile names only public images. Once per host and version: under the
+# host's image lock, where a launch that waited finds the image another
+# built (DESIGN §6 *A host-wide image step runs once, under a host lock*).
 if ! nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
-  remote_log "building container image (one-time; ~60-120s)..."
+  leerie_lock "${_leerie_image_lock:-}" "another launch's build of $IMAGE_TAG" \
+    || { remote_log "error: could not take the host's image lock (${_leerie_image_lock:-})"; exit 1; }
+  _image_lock_holder="$LEERIE_LOCK_HOLDER"
+fi
+if ! nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+  remote_log "building container image (once per version; 18 minutes measured on a fresh host)..."
   ensure_frontend_in_worker_ns
   _base_ns="$(leerie_cache_mount_ns)" \
     || { remote_log "error: could not draw a cache-mount namespace for the build"; exit 1; }
@@ -6350,6 +6380,8 @@ if ! nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect "$IMAGE_TAG" >/dev/nul
     || remote_log "warning: could not remove the build's cache-mount records ($_base_ns); BuildKit's garbage collection keeps them"
   unset _base_ns
 fi
+leerie_unlock "${_image_lock_holder:-}"
+unset _image_lock_holder
 
 # --- a repository image's build directory -------------------------------
 # $_REPO_BUILD_DIR (.image-build/b.<launcher pid>.<random>, _repo_build_dir)
@@ -6537,22 +6569,21 @@ resolve_repo_image_tag() {
 # with. Best-effort and non-fatal — if the copy fails, the build still
 # attempts and surfaces its own error.
 ensure_base_in_worker_ns() {
-  local _w _id _wid _save_load_tar _save_load_err
+  local _w _id _wid _err _rc
   _id="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null)" || _id=""
   for _w in $LEERIE_BUILDKIT_WORKER_NS; do
     _wid="$(nerdctl --namespace "$_w" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null)" || _wid=""
     if [ -n "$_id" ] && [ "$_wid" = "$_id" ]; then
       continue
     fi
-    remote_log "copying base image into $_w, the namespace BuildKit's worker reads (one-time; ~15-20s)..."
-    _save_load_tar="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image.XXXXXX.tar")"
-    _save_load_err="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image-copy.XXXXXX.log")"
-    if ! { nerdctl --namespace "$LEERIE_IMAGE_NS" save -o "$_save_load_tar" "$IMAGE_TAG" && \
-           nerdctl --namespace "$_w" load -i "$_save_load_tar"; } >"$_save_load_err" 2>&1; then
-      remote_log "warning: could not copy base image into $_w — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
-      remote_log "warning: save/load error output: $(cat "$_save_load_err")"
-    fi
-    rm -f "$_save_load_tar" "$_save_load_err"
+    remote_log "copying base image into $_w, the namespace BuildKit's worker reads (once per base; minutes for its 2.4 GB)..."
+    # Streamed, never through a file: no copy of the base lands on disk.
+    _err="$( { nerdctl --namespace "$LEERIE_IMAGE_NS" save "$IMAGE_TAG" \
+               | nerdctl --namespace "$_w" load >/dev/null; \
+               _rc="${PIPESTATUS[0]}${PIPESTATUS[1]}"; \
+               [ "$_rc" = 00 ]; } 2>&1)" \
+      || { remote_log "warning: could not copy base image into $_w — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
+           remote_log "warning: save/load error output: $(_terminal_safe "$_err")"; }
   done
 }
 
@@ -8302,6 +8333,13 @@ if [ -f "$_leerie_dockerfile" ]; then
     # is reused only when it is the one this checkout built — the digest
     # its tag names now is the digest recorded when it was built.
     _hash_file="$LEERIE_STATE_HOST_DIR/.dockerfile-hash"
+    # One decision and build at a time per checkout: a launch that waited
+    # reads the record the one before it wrote, and reuses its image
+    # (DESIGN §6 *A host-wide image step runs once, under a host lock*).
+    leerie_lock "$LEERIE_STATE_HOST_DIR/.image-build.lock" \
+      "another launch's build of $(_terminal_safe "$REPO_IMAGE_TAG")" \
+      || _repo_build_fail "could not take the checkout's image lock"
+    _repo_lock_holder="$LEERIE_LOCK_HOLDER"
     # The digest of the repository's Dockerfile bytes the build is given,
     # never of the path (DESIGN §6 *Leerie never reads through a link a
     # repository holds*).
@@ -8336,9 +8374,17 @@ if [ -f "$_leerie_dockerfile" ]; then
       # never does (DESIGN §6 *No build consumes what another build left in
       # BuildKit*, *The content store*).
       leerie_content_sharing_check || remote_log "warning: $LEERIE_CONTENT_SHARING_HINT"
+      # The sweep, the base's copy and the frontend's pull change the
+      # worker's namespace, which every launch on the host shares: once at
+      # a time, under the host's image lock.
+      leerie_lock "${_leerie_image_lock:-}" "another launch's copy of $IMAGE_TAG into BuildKit's namespace" \
+        || _repo_build_fail "could not take the host's image lock (${_leerie_image_lock:-})"
+      _image_lock_holder="$LEERIE_LOCK_HOLDER"
       leerie_sweep_worker_images || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
       ensure_base_in_worker_ns
       ensure_frontend_in_worker_ns
+      leerie_unlock "$_image_lock_holder"
+      unset _image_lock_holder
       if [ -z "${_REPO_GEN_FALLBACK:-}" ]; then
         build_repo_image "$REPO_IMAGE_TAG"
       elif ! build_repo_image "$REPO_IMAGE_TAG" soft; then
@@ -8364,8 +8410,9 @@ if [ -f "$_leerie_dockerfile" ]; then
         remote_log "warning: this image is the apt-only fallback: its language-dep layer failed to build, so no language dependency is installed in it; to retry the layer, remove $(_terminal_safe "$_hash_file")"
       fi
     fi
+    leerie_unlock "$_repo_lock_holder"
     REPO_IMAGE_REF="$_cur_ref"
-    unset _hash_file _cur_df_sha _cur_hash _stored_hash _stored_ref _stored_mark _cur_mark _cur_ref _need_build _base_id
+    unset _repo_lock_holder _hash_file _cur_df_sha _cur_hash _stored_hash _stored_ref _stored_mark _cur_mark _cur_ref _need_build _base_id
   fi
 fi
 _repo_build_done
@@ -9386,24 +9433,6 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/
 # failure modes on first run. Concurrency-safety per cache is documented
 # in IMPLEMENTATION §0.5.
 #
-# The host-wide dir (build semaphore, DESIGN §6 *A host-wide build
-# semaphore*) defaults to ~/.leerie/.host and must stay shared: the
-# semaphore bounds only the runs that mount the same dir. LEERIE_HOST_DIR
-# repoints it for an isolated run (a bench) that must never touch
-# ~/.leerie. Inside the container the same name means the mount point, set
-# after the LEERIE_* forward below, so this host value never leaks in.
-_leerie_host_dir="${LEERIE_HOST_DIR:-$HOME/.leerie/.host}"
-case "$_leerie_host_dir" in
-  "~")   _leerie_host_dir="$HOME" ;;
-  \~/*)  _leerie_host_dir="$HOME/${_leerie_host_dir#"~/"}" ;;
-esac
-case "$_leerie_host_dir" in
-  /*) ;;
-  *)
-    echo "leerie: error: LEERIE_HOST_DIR='$_leerie_host_dir' is not an absolute path" >&2
-    exit 1
-    ;;
-esac
 mkdir -p "$HOME/.cache/leerie/mise-data" \
          "$HOME/.cache/leerie/bundle" \
          "$LEERIE_STATE_HOST_DIR" \

@@ -3410,6 +3410,31 @@ they are confined.
   their Docker config and so pulled as no one; with
   `docker-credential-secretservice` on PATH they pulled with the
   operator's login (the review's proof, through `build_repo_image`).
+- *A host-wide image step runs once, under a host lock.* Leerie's base
+  image, its copy in the namespace BuildKit's worker reads, the frontend
+  pulled there and the sweep of an earlier leerie's images are each one
+  per host and version, whatever launch asks for them; a repository image
+  is one per checkout. Each such step runs under a lock and checks again,
+  once it holds the lock, whether the step is still needed: the base build
+  under the host's image lock (`<host dir>/image.lock`, the host-wide
+  directory of *A host-wide build semaphore*), where a launch that waited
+  finds the image another built; the sweep, the base's copy and the
+  frontend's pull together under the same lock, where the copy is skipped
+  when the worker's namespace already holds the base's id; and a
+  repository image's decision and build under its checkout's lock
+  (`<state root>/.image-build.lock`), where a launch that waited reads the
+  record the one before it wrote and reuses its image. The lock is held by
+  a small process of its own (`leerie_lock`), never by a descriptor of the
+  launcher's shell, which every program it starts would inherit (Colima's
+  SSH ControlMaster keeps what it inherited); that process lets go when
+  the step ends or within half a second of its launch's end, however it
+  ends. The base's copy streams `nerdctl save` into `nerdctl load` and
+  writes no file. *Designed 2026-11-03 (the operator's live 0.44.0
+  launches):* five launches started within about two minutes on one
+  checkout each exported the base to its own tarball in `/tmp` and loaded
+  it at once, about 2.4 GB each; nothing serialised them. *Cost:* a launch
+  waits for another's base build, copy or repository build instead of
+  repeating it, and says once that it waits.
 - *Fail closed, on every entry.* Where the image has a worker root, the
   confinement check every entry runs (`_require_confinement`) runs `test
   -e /.leerie-worker-env` confined and stops the run when it does not find
