@@ -7988,7 +7988,14 @@ bound, both measured on the first full local run under `--timeout=600`:
   out for real in an inner pytest whose shell started one grandchild in the
   test's session and one under `setsid`: with the fixture both are gone;
   without it both are alive (its anti-vacuity case). A process a child
-  starts with a fresh environment escapes the marker.
+  starts with a fresh environment escapes the marker. Linux only, both
+  sides: `processes_marked` reads `/proc/<pid>/environ`, so it returns
+  nothing where there is no `/proc` (a macOS dev host reads as "nothing
+  left behind", as it did before the scan existed) and its test file is
+  skipped off Linux, since `setsid` -- the arm a process-group kill would
+  miss -- is not in base macOS. Shipped without those guards, the bare
+  `os.listdir("/proc")` raised `FileNotFoundError` inside the autouse
+  teardown and so errored the teardown of every test on macOS.
 - `_quiet_host_pressure`. The B* confirm gate waits up to
   `confirm_gate_wait_sec` (300 s) a confirm for the HOST's CPU pressure to
   fall below `confirm_psi_cpu_max`. Tests not about that gate inherited the

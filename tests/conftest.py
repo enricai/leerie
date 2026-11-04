@@ -1071,7 +1071,15 @@ TEST_PROCESS_ENV = "PYTEST_LEERIE_TEST_ID"
 def processes_marked(marker: str) -> list[int]:
     """The PIDs, other than this process, whose environment carries
     `TEST_PROCESS_ENV=<marker>`. /proc is a fixed kernel format; a process
-    that is gone or not ours is skipped."""
+    that is gone or not ours is skipped.
+
+    Empty where there is no /proc. The guarantee this backs is CI's (Linux),
+    and a bare os.listdir("/proc") here raised FileNotFoundError in the
+    autouse teardown that calls it, erroring the teardown of every test on
+    macOS -- a dev host reads as "nothing left behind", the same answer it
+    gave before this scan existed."""
+    if not os.path.isdir("/proc"):
+        return []
     needle = f"{TEST_PROCESS_ENV}={marker}".encode()
     me, uid, out = os.getpid(), os.getuid(), []
     for name in os.listdir("/proc"):

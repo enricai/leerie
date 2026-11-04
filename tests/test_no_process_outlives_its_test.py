@@ -27,6 +27,16 @@ from tests.conftest import TEST_PROCESS_ENV, kill_marked, processes_marked
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# The guarantee is CI's (Linux): the fixture finds a process through
+# /proc/<pid>/environ, and `setsid` -- the session the proof turns on -- is
+# not in base macOS, so SPAWN's absolute paths do not exist there. Skipping
+# beats substituting the host's paths, which would drop the setsid arm and
+# leave a weaker test wearing this one's name.
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="needs /proc and setsid: the Linux guarantee this fixture backs",
+)
+
 # Absolute paths only: nothing here resolves a program on PATH.
 SPAWN = ("/usr/bin/sleep 300 & echo $! >> {pids}; "
          "/usr/bin/setsid /usr/bin/sleep 300 & echo $! >> {pids}; wait")
