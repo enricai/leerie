@@ -6954,6 +6954,20 @@ sample's probe never counts for the next.
   tests); `_run_streaming` ignoring the taken pipe; taken checked before
   the refusal; `run()` without `_undumpable`. `tests/heldout_sandbox_emulator.py`
   and `tests/conftest.py` pass and honour `--taken-fd`.
+- `tests/test_relay_holds_no_refusal.py` (3 test functions; DESIGN §6 *A
+  confinement failure stops the run; it is never a result*; review round
+  40, isolation F1) — the relay is forked from a non-dumpable shim and
+  holds neither descriptor. The real `serve_relays`, in a process of its
+  own given both descriptors, holds neither once it has relayed a
+  connection; the real `main()`, with the namespace and Landlock steps
+  stood in for, calls `_undumpable` before `start_relays`, and a failure
+  there refuses with the listeners closed and no relay; isolated (runs in
+  the container), the running relay of the real `--isolate --egress`
+  shim refuses its parent `/proc/<relay>/environ`. Falsified
+  (2026-11-04): `serve_relays` without the closes fails the first;
+  `main()` without its `_undumpable` fails the second; both, run in a
+  container of the 0.44.1 image, fail all three (all three pass there
+  with the fix).
 - `tests/test_run_settings.py` (54 tests, review rounds 17 H2 and 18 H1,
   DESIGN §8 *The settings are leerie's*): both checker halves and both
   restore halves. A setting written from a worker's tree (each key DESIGN

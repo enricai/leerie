@@ -4511,7 +4511,12 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   command's own exit codes write nothing. Before it forks the command
   (`run()`, and `run_sandbox` before it forks PID 1), the shim calls
   `_undumpable()`, `prctl(PR_SET_DUMPABLE, 0)`, so the command cannot open
-  `/proc/<shim>/fd/N` (a failure is a refusal). `--taken-fd N`
+  `/proc/<shim>/fd/N` (a failure is a refusal). Under `--isolate`,
+  `main()` calls `_undumpable()` after `isolate()` and before
+  `start_relays()` (a failure: the listeners closed,
+  `_isolation_failed`), so the relay is forked non-dumpable, and
+  `serve_relays` closes `_REFUSAL_FD` and `_TAKEN_FD` before it relays.
+  `--taken-fd N`
   (`--sandbox` only; close-on-exec first thing in `main()` like `N`): a
   `PlacementTaken` from `place()` goes through `_taken(e) -> int` — the
   message to stderr, the same bytes to the taken descriptor, nothing to

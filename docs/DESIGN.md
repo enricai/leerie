@@ -5510,6 +5510,15 @@ The mechanism:
   container's root user instead, in a container of this image, the same
   forge under `--isolate` succeeded too (2026-11-04, the shim before this
   rule). The non-dumpable shim refuses it in both (`EACCES`), by design.
+- No other process of the shim's holds the descriptor or can be opened
+  for it. The relay (`--egress`, `--forward`) is a fork of the shim that
+  never `exec`s and lives as long as the command. It is forked from the
+  already non-dumpable shim, and it closes the refusal and taken
+  descriptors, which only the shim writes. *Review round 40 (isolation
+  F1):* the relay was forked before the shim became non-dumpable, so it
+  was dumpable and held the refusal pipe for the command's whole life;
+  the command's open of it was refused only by the capability asymmetry
+  the rule above no longer rests on.
 - A held-out file the tree leaves no room for is a fact about the tree,
   not a refusal. A worker can commit a link, or a file, where a set's
   directory must be (`tests -> spec_real`). The shim places each file
