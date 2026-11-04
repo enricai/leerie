@@ -344,3 +344,177 @@ def test_version_order(a, b, older):
         ["bash", "-c", FRONTEND_SH_SOURCE + '_leerie_version_older "$1" "$2"',
          "x", a, b], capture_output=True, text=True, timeout=30)
     assert (r.returncode == 0) is older, (a, b, r.stderr)
+
+
+# --- the base's copies where BuildKit reads (DESIGN §6 *The base's copies
+# where BuildKit reads*) ------------------------------------------------------
+# The launcher's own repository block, run as test_image_steps_run_once runs
+# it, against its file-backed store for every step, but with `images` and
+# `image rm` answered per namespace from `images.<ns>` / `inuse.<ns>`: the
+# worker's namespace (`default`, BUILDCTL_STUB's) and leerie's.
+
+from tests.committed_tree import commit_tree  # noqa: E402
+from tests.conftest import BUILDCTL_STUB, LOG_SH_SOURCE  # noqa: E402
+from tests.repo_image_block_extract import extract_block  # noqa: E402
+from tests.test_image_steps_run_once import (  # noqa: E402
+    _STORE_NERDCTL, REPO_BLOCK)
+
+W_CUR = "9.9.9"
+_PER_NS = r'''
+nerdctl() {
+  printf '%s\n' "$*" >> "$STUB_DIR/calls"
+  local ns="" a prev="" fmt="" n s o l name found keep=()
+  [ "${1:-}" != --namespace ] || ns="$2"
+  case "${3:-}:${4:-}" in
+    images:*)
+      for a in "$@"; do [ "$prev" = --format ] && fmt=$a; prev=$a; done
+      [ -f "$STUB_DIR/images.$ns" ] || return 0
+      while IFS='|' read -r n s; do
+        [ -n "$n" ] || continue
+        o="${fmt//\{\{.Repository\}\}/${n%:*}}"
+        o="${o//\{\{.Tag\}\}/${n##*:}}"
+        printf '%s\n' "${o//\{\{.Size\}\}/$s}"
+      done < "$STUB_DIR/images.$ns"
+      return 0 ;;
+    image:rm)
+      name="${!#}"
+      if [ -f "$STUB_DIR/inuse.$ns" ]; then
+        while IFS= read -r l; do
+          [ "$l" != "$name" ] || { echo "Error: $name: in use" >&2; return 1; }
+        done < "$STUB_DIR/inuse.$ns"
+      fi
+      [ -f "$STUB_DIR/images.$ns" ] || return 1
+      while IFS= read -r l; do
+        if [ "${l%%|*}" = "$name" ]; then found=1; else keep+=("$l"); fi
+      done < "$STUB_DIR/images.$ns"
+      [ -n "$found" ] || return 1
+      printf '%s\n' ${keep[@]+"${keep[@]}"} > "$STUB_DIR/images.$ns"
+      return 0 ;;
+  esac
+  _store_nerdctl "$@"
+}
+'''
+
+WORKER_OLD = ["leerie:0.0.1", "docker.io/library/leerie:0.0.2"]
+WORKER_KEPT = [f"leerie:{W_CUR}", "leerie:999.0.0", "leerie:dev",
+               "docker/dockerfile:1", "postgres:0.0.1", "acme/leerie:0.0.1",
+               "<none>:<none>"]
+LEERIE_NS = ["leerie:0.0.1", "leerie-repo/acme-web-0123456789ab:0.0.1"]
+
+
+def _repo_block_world(tmp_path: Path, worker: list[str],
+                      inuse: list[str] = ()) -> dict:
+    for d in ("home", "tmp", "store", "host", "state"):
+        (tmp_path / d).mkdir()
+    (tmp_path / "store" / "base").touch()
+    repo = tmp_path / "repo"
+    (repo / ".leerie").mkdir(parents=True)
+    (repo / ".leerie" / "Dockerfile").write_text(
+        "ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    commit_tree(repo)
+    (tmp_path / "store" / "images.default").write_text(
+        "".join(f"{n}|{i + 1}.4GB\n" for i, n in enumerate(worker)))
+    (tmp_path / "store" / "images.leerie").write_text(
+        "".join(f"{n}|1GB\n" for n in LEERIE_NS))
+    (tmp_path / "store" / "inuse.default").write_text(
+        "".join(f"{n}\n" for n in inuse))
+    return {"tmp": tmp_path, "repo": repo, "store": tmp_path / "store"}
+
+
+def _run_repo_block(w: dict, runtime: str) -> subprocess.CompletedProcess:
+    store = _STORE_NERDCTL.replace("\nnerdctl() {", "\n_store_nerdctl() {", 1)
+    assert store != _STORE_NERDCTL
+    t = w["tmp"]
+    body = (f'_leerie_image_lock="{t}/host/image.lock"\n'
+            f'_leerie_host_dir="{t}/host"\nRUNTIME={runtime}\n'
+            'USER_REPO="$STUB_REPO"\n'
+            + extract_block((REPO_ROOT / "leerie").read_text(), *REPO_BLOCK)
+            + '\necho "REF=$REPO_IMAGE_REF"\n')
+    script = ("set -euo pipefail\n" + LOG_SH_SOURCE + FRONTEND_SH_SOURCE
+              + BUILDCTL_STUB + 'remote_log() { echo "$*" >&2; }\n'
+              + store + _PER_NS + body)
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=120,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(t / "home"),
+             "TMPDIR": str(t / "tmp"), "STUB_DIR": str(w["store"]),
+             "IMAGE_TAG": f"leerie:{W_CUR}", "LEERIE_VERSION": W_CUR,
+             "LEERIE_STATE_HOST_DIR": str(t / "state"),
+             "STUB_REPO": str(w["repo"])})
+
+
+def _ns_store(w: dict, ns: str) -> list[str]:
+    return [l.split("|")[0] for l in
+            (w["store"] / f"images.{ns}").read_text().splitlines() if l]
+
+
+def _ns_calls(w: dict) -> list[str]:
+    f = w["store"] / "calls"
+    return f.read_text().splitlines() if f.exists() else []
+
+
+def test_older_base_copies_leave_the_worker_namespace_before_the_copy(
+        tmp_path):
+    """A launch that builds a repository image removes, from the namespace
+    BuildKit's worker reads, each `leerie:<v>` of an older version, never
+    forced, and before this version's base is copied there; the frontend,
+    a newer version, a non-version tag, the operator's images and `<none>`
+    are never asked to go, and leerie's own namespace is not touched here.
+    Falsified: the call removed from the repository block (nothing
+    removed); the reaper's name filter dropped in worker mode (the frontend
+    and `postgres` removed)."""
+    w = _repo_block_world(tmp_path, WORKER_OLD + WORKER_KEPT)
+    r = _run_repo_block(w, "local")
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert r.stdout.strip().endswith("REF=sha256:" + "a" * 64), r.stderr[-2000:]
+    calls = _ns_calls(w)
+    rms = [c for c in calls if " image rm " in f" {c} "]
+    assert sorted(rms) == sorted(
+        f"--namespace default image rm {n}" for n in WORKER_OLD), calls
+    assert sorted(_ns_store(w, "default")) == sorted(WORKER_KEPT)
+    assert sorted(_ns_store(w, "leerie")) == sorted(LEERIE_NS)
+    assert "leerie:0.0.1 in default (1.4GB)" in r.stderr, r.stderr
+    assert "docker.io/library/leerie:0.0.2 in default (2.4GB)" in r.stderr
+    load = next(i for i, c in enumerate(calls)
+                if c == "--namespace default load")
+    assert max(calls.index(c) for c in rms) < load, calls
+
+
+def test_a_held_versions_base_copy_stays(tmp_path):
+    """A launch of 0.0.1 holds its version (here, the test): its base copy
+    stays in the worker's namespace (it may be about to build `FROM` it);
+    0.0.2's goes."""
+    w = _repo_block_world(tmp_path, WORKER_OLD + WORKER_KEPT)
+    fd = _hold(tmp_path / "host" / "image-holds" / "0.0.1.lock",
+               fcntl.LOCK_SH)
+    try:
+        r = _run_repo_block(w, "local")
+    finally:
+        os.close(fd)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert sorted(_ns_store(w, "default")) == sorted(
+        ["leerie:0.0.1"] + WORKER_KEPT)
+    assert "kept leerie 0.0.1's images: a launch of leerie 0.0.1 is using them" in r.stderr
+
+
+def test_a_base_copy_a_container_uses_is_kept(tmp_path):
+    """containerd's refusal in the worker's namespace keeps the copy, names
+    it, and the repository image is still built."""
+    w = _repo_block_world(tmp_path, WORKER_OLD + WORKER_KEPT,
+                          inuse=["leerie:0.0.1"])
+    r = _run_repo_block(w, "local")
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert r.stdout.strip().endswith("REF=sha256:" + "a" * 64)
+    assert sorted(_ns_store(w, "default")) == sorted(
+        ["leerie:0.0.1"] + WORKER_KEPT)
+    assert ("kept images of older leerie versions a container still uses: "
+            "leerie:0.0.1 in default") in r.stderr, r.stderr
+
+
+def test_a_remote_launch_removes_no_base_copy(tmp_path):
+    """`RUNTIME=fly`: the same block removes nothing from the worker's
+    namespace. Falsified: the `RUNTIME=local` guard on the call removed."""
+    w = _repo_block_world(tmp_path, WORKER_OLD + WORKER_KEPT)
+    r = _run_repo_block(w, "fly")
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert not [c for c in _ns_calls(w) if " image rm " in f" {c} "]
+    assert sorted(_ns_store(w, "default")) == sorted(WORKER_OLD + WORKER_KEPT)

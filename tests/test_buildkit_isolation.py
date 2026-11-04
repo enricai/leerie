@@ -1303,6 +1303,8 @@ _OTHER_NS = {
     '"$_cns"': "_reap_orphaned_container, from _container_ns",
     '"$_stop_cns"': "stop, from _container_ns",
     '"$_kill_cns"': "kill, from _container_ns",
+    '"$_ns"': ("leerie_reap_old_images: $LEERIE_IMAGE_NS, or, with `worker`, "
+               "a namespace BuildKit's worker reads other than it"),
     "$_w": "the refusal's instruction to the operator",
 }
 
@@ -1348,8 +1350,8 @@ def test_every_nerdctl_command_names_leeries_namespace():
         ns = c.split()[2] if c.split()[1:2] == ["--namespace"] else None
         assert ns in _OTHER_NS, c
     verbs = sorted({c.split()[3] for c in own})
-    assert verbs == ["build", "image", "images", "kill", "run", "save"], verbs
-    assert len(own) == 19, own
+    assert verbs == ["build", "image", "kill", "run", "save"], verbs
+    assert len(own) == 17, own
     # The run's quoted forms (macOS `script`) name it too.
     assert leerie.count(
         '_nerdctl_run_quoted="nerdctl --namespace $LEERIE_IMAGE_NS run"') == 2

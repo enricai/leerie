@@ -366,48 +366,77 @@ _leerie_own_image() {
   return 1
 }
 
-# leerie_reap_old_images <hold dir> — removes from $LEERIE_IMAGE_NS every
-# image of leerie's own (_leerie_own_image) whose tag is a version older
-# than $LEERIE_VERSION (_leerie_version_older), and nothing else (DESIGN §6
-# *An image no launch can use any more is removed by leerie*). A version's
-# images are removed only while this launch holds <hold dir>/<version>.lock
-# exclusively, taken without waiting (leerie_lock … try): a launch of that
-# version holds it shared from before its first image check to its end, and
-# its images are then left alone. `nerdctl image rm`, never forced:
-# containerd refuses an image a container uses, and a refusal keeps the
-# image. Logs each name removed with the size `nerdctl images` lists, each
-# kept, and each version a launch holds. Returns 0 always: a listing that
-# fails leaves every image for a later launch. Needs remote_log.
+# _leerie_own_base <name> — returns 0 when <name> (`<repository>:<tag>`) is
+# leerie's base, `leerie:<v>`, with or without the `docker.io/library/`
+# nerdctl may show: the only name leerie puts in a namespace BuildKit's
+# workers read (ensure_base_in_worker_ns).
+_leerie_own_base() {
+  case "${1%:*}" in
+    leerie|docker.io/library/leerie) return 0 ;;
+  esac
+  return 1
+}
+
+# leerie_reap_old_images <hold dir> [worker] — removes every image of
+# leerie's own whose tag is a version older than $LEERIE_VERSION
+# (_leerie_version_older), and nothing else (DESIGN §6 *An image no launch
+# can use any more is removed by leerie*). Without `worker`, from
+# $LEERIE_IMAGE_NS, the names _leerie_own_image accepts; with it, from each
+# namespace in $LEERIE_BUILDKIT_WORKER_NS (set by leerie_buildkit_resolve,
+# which this never calls) but $LEERIE_IMAGE_NS, the base's copies only
+# (_leerie_own_base). A version's images are removed only while this launch
+# holds <hold dir>/<version>.lock exclusively, taken without waiting
+# (leerie_lock … try): a launch of that version holds it shared from before
+# its first image check to its end, and its images are then left alone.
+# `nerdctl image rm`, never forced: containerd refuses an image a container
+# uses, and a refusal keeps the image. Logs each name removed with the size
+# `nerdctl images` lists, each kept, and each version a launch holds.
+# Returns 0 always: a listing that fails leaves that namespace's images for
+# a later launch. Needs remote_log.
 leerie_reap_old_images() {
-  local _dir="${1:-}" _out _n _size _t _tags="" _removed="" _kept=""
+  local _dir="${1:-}" _where="${2:-}" _nss _ns _out _n _size _t _e
+  local _tags="" _cands="" _removed="" _kept=""
   [ -n "$_dir" ] || return 0
-  _out="$(nerdctl --namespace "$LEERIE_IMAGE_NS" images \
-            --format '{{.Repository}}:{{.Tag}}|{{.Size}}' 2>/dev/null)" || {
-    remote_log "warning: could not list the images in $LEERIE_IMAGE_NS; older leerie versions' images stay until a later launch"
-    return 0
-  }
-  while IFS='|' read -r _n _size; do
-    _leerie_own_image "$_n" || continue
-    _leerie_version_older "${_n##*:}" "$LEERIE_VERSION" || continue
-    case " $_tags " in *" ${_n##*:} "*) ;; *) _tags="$_tags ${_n##*:}" ;; esac
-  done <<EOF_IMAGES
+  _nss="$LEERIE_IMAGE_NS"
+  [ "$_where" != worker ] || _nss="$LEERIE_BUILDKIT_WORKER_NS"
+  for _ns in $_nss; do
+    [ "$_where" != worker ] || [ "$_ns" != "$LEERIE_IMAGE_NS" ] || continue
+    _out="$(nerdctl --namespace "$_ns" images \
+              --format '{{.Repository}}:{{.Tag}}|{{.Size}}' 2>/dev/null)" || {
+      remote_log "warning: could not list the images in $_ns; older leerie versions' images there stay until a later launch"
+      continue
+    }
+    while IFS='|' read -r _n _size; do
+      if [ "$_where" = worker ]; then
+        _leerie_own_base "$_n" || continue
+      else
+        _leerie_own_image "$_n" || continue
+      fi
+      _leerie_version_older "${_n##*:}" "$LEERIE_VERSION" || continue
+      _cands="$_cands$_ns|$_n|$_size
+"
+      case " $_tags " in *" ${_n##*:} "*) ;; *) _tags="$_tags ${_n##*:}" ;; esac
+    done <<EOF_IMAGES
 $_out
 EOF_IMAGES
+  done
   for _t in $_tags; do
     if ! leerie_lock "$_dir/$_t.lock" "" try; then
       remote_log "kept leerie $_t's images: a launch of leerie $_t is using them"
       continue
     fi
-    while IFS='|' read -r _n _size; do
-      _leerie_own_image "$_n" && [ "${_n##*:}" = "$_t" ] || continue
-      if nerdctl --namespace "$LEERIE_IMAGE_NS" image rm "$_n" >/dev/null 2>&1; then
-        _removed="$_removed, $_n (${_size:-size unknown})"
+    while IFS='|' read -r _ns _n _size; do
+      [ -n "$_n" ] && [ "${_n##*:}" = "$_t" ] || continue
+      _e="$_n"
+      [ "$_ns" = "$LEERIE_IMAGE_NS" ] || _e="$_n in $_ns"
+      if nerdctl --namespace "$_ns" image rm "$_n" >/dev/null 2>&1; then
+        _removed="$_removed, $_e (${_size:-size unknown})"
       else
-        _kept="$_kept, $_n"
+        _kept="$_kept, $_e"
       fi
-    done <<EOF_IMAGES
-$_out
-EOF_IMAGES
+    done <<EOF_CANDS
+$_cands
+EOF_CANDS
     leerie_unlock "$LEERIE_LOCK_HOLDER"
   done
   [ -z "$_removed" ] || remote_log "removed images of older leerie versions: ${_removed#, }"

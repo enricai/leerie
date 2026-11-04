@@ -3486,7 +3486,8 @@ they are confined.
   older version than its own (`leerie_reap_old_images`). Nothing else is a
   candidate: no other name (the operator's images, the
   `registry.fly.io/…` names `build-push.sh --local-build` tags), no other
-  namespace, never BuildKit's cache. Removal is `nerdctl image rm`, never
+  namespace but the base's copies where BuildKit reads (below), never
+  BuildKit's cache. Removal is `nerdctl image rm`, never
   forced, so containerd itself refuses an image a container still uses,
   running or exited; a refusal means "in use" and the image stays, named
   in the log. Each removed name is logged with the size `nerdctl images`
@@ -3521,6 +3522,24 @@ they are confined.
   numbers; a tag that is not one (and every tag, when the launch's own
   version is not one) is never removed. A version newer than the launch's
   stays until a launch newer still removes it.
+  *The base's copies where BuildKit reads.* Leerie also copies its base,
+  under the same name, into each namespace BuildKit's workers read
+  (`ensure_base_in_worker_ns`; `buildkit` on Colima, `default` on the
+  standard rootless setup), so a repository's `FROM $BASE_IMAGE` resolves.
+  Those copies are leerie's too, 2.4 GB each, and piled up the same way
+  (one host's `buildkit` held `leerie:` 0.44.0 to 0.44.10). So the same
+  reaper, under the same per-version holds and with the same unforced
+  `image rm`, removes from each such namespace every `leerie:<v>` whose
+  `<v>` is an older version, and nothing else there: not the pinned
+  frontend, not the operator's images, not an image with no name. It runs
+  where those namespaces are already known and the copy is made: on a
+  launch that builds a repository image, under the host's image lock,
+  after the sweep of an earlier leerie's repository images and before the
+  base's copy. Asking BuildKit for its workers on every launch would cost
+  a daemon query a launch with nothing to build never needs, and a copy is
+  only ever added there, so each new version's copy removes the older
+  ones. A version held by a launch of it keeps its copy too: that launch
+  may be about to build `FROM` it.
   *Local only.* Fly and EC2 keep their images in their own registries, on
   their own lifetimes; a remote launch takes no hold and removes nothing.
   *Rootless and rootful.* The reaper and the holds run in the launcher,
@@ -3536,10 +3555,9 @@ they are confined.
   its check and its run; it fails at `nerdctl run` and builds them again on
   its next launch. The holds are as wide as the host-wide directory, as
   the image lock is: launches given different `LEERIE_HOST_DIR`s on one
-  containerd do not see each other's holds. The copies of leerie's base in
-  BuildKit's worker namespace (`ensure_base_in_worker_ns`) are not removed:
-  that namespace is the operator's (`default` on the standard rootless
-  setup). `leerie prune` does not remove images: its scope is one
+  containerd do not see each other's holds. An older base's copy where
+  BuildKit reads stays until the next launch on the host that builds a
+  repository image. `leerie prune` does not remove images: its scope is one
   repository's state, chosen by age, and the images are host-wide and need
   no age; a launch reaps them before the disk is needed, while the disk
   check that stops a launch on a full disk would stop it before any prune.

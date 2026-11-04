@@ -8987,6 +8987,13 @@ if [ -f "$_leerie_dockerfile" ]; then
         || _repo_build_fail "could not take the host's image lock (${_leerie_image_lock:-})"
       _image_lock_holder="$LEERIE_LOCK_HOLDER"
       leerie_sweep_worker_images || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
+      # Older versions' copies of the base, which ensure_base_in_worker_ns
+      # put here, go before this version's is copied, under the same
+      # per-version holds as leerie's own namespace (DESIGN §6 *An image no
+      # launch can use any more is removed by leerie*, *The base's copies
+      # where BuildKit reads*). Local only.
+      [ "${RUNTIME:-}" != "local" ] \
+        || leerie_reap_old_images "${_leerie_host_dir:+$_leerie_host_dir/image-holds}" worker
       ensure_base_in_worker_ns
       ensure_frontend_in_worker_ns
       leerie_unlock "$_image_lock_holder"
