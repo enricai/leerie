@@ -176,8 +176,10 @@ def test_a_held_out_set_file_run_through_a_script_gets_its_cases(leerie,
         st, dict(leerie.DEFAULT_CAPS), str(tree), "src/password.test.ts",
         st.run_dir / "logs" / "a.log", "acceptance-t", cases_out=obs))
     assert v is False
-    # Evaluation's case IDs are the report's own names (absolute here, as
-    # validation records them too).
+    # A case's ID names its file relative to the tree it ran in, though
+    # vitest's report names it absolutely (DESIGN §8 *A case has one name in
+    # every tree*): validation and evaluation run in different trees.
     (cid,) = obs["failing_cases"]
-    assert cid == f"{tree}/{WANT}"
+    assert cid == WANT
+    assert str(tree) not in cid
     assert obs["failing_messages"][cid].startswith("AssertionError")
