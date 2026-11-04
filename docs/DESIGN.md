@@ -3472,6 +3472,85 @@ they are confined.
   it at once, about 2.4 GB each; nothing serialised them. *Cost:* a launch
   waits for another's base build, copy or repository build instead of
   repeating it, and says once that it waits.
+- *An image no launch can use any more is removed by leerie.* Every image
+  leerie makes in its own namespace is named for the version that made it:
+  its base `leerie:<version>`, each repository image
+  `leerie-repo/<repo-id>-<checkout-id>:<version>`. A launch uses only its
+  own version's (`IMAGE_TAG`, `resolve_repo_image_tag`), a `resume`
+  included: a run started on an older version resumes on the installed
+  version's images, and nothing reads the version a run started on to
+  choose one. So an older version's image is used only by a container that
+  still exists, or by a launch of that older version still on the host.
+  Each local launch removes, before its own image steps, every image in
+  `leerie` named `leerie:<v>` or `leerie-repo/…:<v>` whose `<v>` is an
+  older version than its own (`leerie_reap_old_images`). Nothing else is a
+  candidate: no other name (the operator's images, the
+  `registry.fly.io/…` names `build-push.sh --local-build` tags), no other
+  namespace, never BuildKit's cache. Removal is `nerdctl image rm`, never
+  forced, so containerd itself refuses an image a container still uses,
+  running or exited; a refusal means "in use" and the image stays, named
+  in the log. Each removed name is logged with the size `nerdctl images`
+  lists for it; the sizes are not summed, since a repository image shares
+  its base's layers and a sum would count them twice.
+  *The hold.* A launch checks for its images, builds or copies what is
+  missing, releases the host's image lock, and only later creates its
+  container: between the check and the container, its images exist with
+  nothing referencing them, and a launch of a newer version would remove
+  them. So each local launch takes, before its first image check, a shared
+  hold on its version's hold file (`<host dir>/image-holds/<version>.lock`,
+  through `leerie_lock`'s holder process, as every image lock is held), and
+  keeps it until the launch ends; the reaper removes a version's images
+  only while it holds that version's file exclusively, taken without
+  waiting, and leaves the version alone when it cannot. Either a launch
+  holds its version and no reaper removes that version's images, or a
+  reaper holds it, and the launch waits for it before its first check,
+  which then sees whatever the reaper removed and builds it again. No
+  launch's check and run straddle a removal, by construction rather than
+  by any age. The hold is per version, so the reaper never waits on a
+  launch of its own version, and a launch blocks only behind the removal
+  of its own version's images. It lasts the whole launch, not only until
+  the container exists, which needs no watch of the container's creation
+  and keeps nothing a live container does not already keep.
+  *Older, not every other.* A host commonly runs two copies at once: the
+  installed one and a contributor's checkout, often a release ahead.
+  Removing every other version's images would make each rebuild the
+  other's on every alternation, about 18 minutes for the base alone.
+  Removing only older ones lets the newest copy's images stay; an older
+  copy still on the host rebuilds when it next launches, as the first
+  launch of a version always has. A version is compared as dot-separated
+  numbers; a tag that is not one (and every tag, when the launch's own
+  version is not one) is never removed. A version newer than the launch's
+  stays until a launch newer still removes it.
+  *Local only.* Fly and EC2 keep their images in their own registries, on
+  their own lifetimes; a remote launch takes no hold and removes nothing.
+  *Rootless and rootful.* The reaper and the holds run in the launcher,
+  as the host user, before any container exists, and touch no container's
+  files: the hold files live in the host-wide directory the launcher
+  creates, never chowned (the rootful entry guard chowns that directory
+  itself, not its contents). `nerdctl image rm` refuses an image in use on
+  rootless containerd and on Colima's rootful one in its VM alike, where
+  the launcher's `nerdctl` is a shim into the VM and the holds are files on
+  the macOS host shared by every launch there.
+  *Residuals.* A launcher from before this change takes no hold, so a
+  launch of such a version can lose its images to a newer launch between
+  its check and its run; it fails at `nerdctl run` and builds them again on
+  its next launch. The holds are as wide as the host-wide directory, as
+  the image lock is: launches given different `LEERIE_HOST_DIR`s on one
+  containerd do not see each other's holds. The copies of leerie's base in
+  BuildKit's worker namespace (`ensure_base_in_worker_ns`) are not removed:
+  that namespace is the operator's (`default` on the standard rootless
+  setup). `leerie prune` does not remove images: its scope is one
+  repository's state, chosen by age, and the images are host-wide and need
+  no age; a launch reaps them before the disk is needed, while the disk
+  check that stops a launch on a full disk would stop it before any prune.
+  *Designed 2026-11-04 (the operator's host):* the disk filled (191 of
+  193 GB), a repository image build died with `no space left on device`
+  and a run was stopped by leerie's own disk check (`only 2.0% free`).
+  `leerie` held every version's images, and nothing removed any:
+  `leerie:` 0.44.0, .1, .3, .6, .7 and .8 at 2.4 GB each, one repository's
+  image per version at 4.76 GB each, another's at 5.9 GB for two
+  versions; about 10-13 GB more per release per host. Removing the stale
+  ones by hand freed 24 GB.
 - *A command line is refused before any image step.* The orchestrator's
   parser, in the container, is the one authority on its command line, and
   the launcher reaches it only after the image steps, which take minutes

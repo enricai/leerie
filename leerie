@@ -6883,7 +6883,7 @@ _code_snapshot="$(mktemp -d "$HOME/.cache/leerie/cfg-$$-code-XXXXXX")" || {
   remote_log "error: could not make a directory for the leerie code this launch runs"
   exit 1
 }
-trap '_code_snapshot_done' EXIT
+trap '_code_snapshot_done; leerie_unlock "${_image_hold_holder:-}" || true' EXIT
 _snapshot_leerie_code "$LEERIE_REPO" "$_code_snapshot" || {
   remote_log "error: could not take the leerie code this launch runs from $LEERIE_REPO"
   exit 1
@@ -6950,6 +6950,35 @@ sys.exit(check(sys.argv[4:], state_root=sys.argv[3] or None))
   "$([ "$RUNTIME" = local ] && printf '%s' "$LEERIE_STATE_HOST_DIR")" \
   ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} \
   ${REWRITTEN_TAIL[@]+"${REWRITTEN_TAIL[@]}"} || exit $?
+
+# --- hold this version's images; remove older versions' ----------------
+# DESIGN §6 *An image no launch can use any more is removed by leerie*. A
+# shared hold on this version's hold file, from before the first image check
+# to this launch's end: a newer launch's reaper removes a version's images
+# only while it holds that file exclusively, so no image this launch checked
+# is removed before its container uses it. Then the images of every older
+# version no launch holds and no container uses are removed, before this
+# launch's own build needs the disk. Local only: Fly and EC2 keep their
+# images in their registries. A version that is not a filename takes no
+# hold: it is never a numeric version, so no reaper removes its images.
+# Every EXIT trap from here on lets the hold go (leerie_unlock
+# "$_image_hold_holder"), so its holder never outlives the launch; the
+# holder's own watch of the launcher is the backstop for a SIGKILL. Letting
+# go before the container is gone is safe: containerd refuses to remove an
+# image a container uses.
+_image_hold_holder=""
+if [ "$RUNTIME" = "local" ]; then
+  case "$LEERIE_VERSION" in
+    ''|*[!A-Za-z0-9._-]*) ;;
+    *)
+      leerie_lock "$_leerie_host_dir/image-holds/$LEERIE_VERSION.lock" \
+        "another launch's removal of leerie $LEERIE_VERSION's images" shared \
+        || { remote_log "error: could not take this launch's hold on leerie $LEERIE_VERSION's images ($_leerie_host_dir/image-holds)"; exit 1; }
+      _image_hold_holder="$LEERIE_LOCK_HOLDER"
+      ;;
+  esac
+  leerie_reap_old_images "$_leerie_host_dir/image-holds"
+fi
 
 # --- build image if not present (once per version) ----------------------
 # In leerie's containerd namespace, which no BuildKit worker reads (DESIGN §6
@@ -7020,7 +7049,7 @@ _sweep_stale_builds() {
   return 0
 }
 ( _sweep_stale_builds ) </dev/null >/dev/null 2>&1 &
-trap '_repo_build_done; [ -z "${_code_snapshot:-}" ] || rm -rf "$_code_snapshot"' EXIT
+trap '_repo_build_done; [ -z "${_code_snapshot:-}" ] || rm -rf "$_code_snapshot"; leerie_unlock "${_image_hold_holder:-}" || true' EXIT
 
 # --- per-repo derived image (local nerdctl) -----------------------------
 # When the repo supplies .leerie/Dockerfile (or setup_packages in
@@ -9208,7 +9237,7 @@ _stage_keepalive_pid=$!
 # container-arm EXIT trap is set. Bash keeps only the last EXIT trap per scope;
 # the container arm re-sets it (adding container-kill) and still removes $STAGE
 # + kills the keepalive, so this early trap only matters for exits before that.
-trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; rm -rf "$STAGE" 2>/dev/null' EXIT
+trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; leerie_unlock "${_image_hold_holder:-}" || true; rm -rf "$STAGE" 2>/dev/null' EXIT
 # `|| true`: under set -e a failed kill (keepalive already gone) would end
 # the trap before $STAGE — staged credentials — is removed.
 # The launch's snapshot of its code, taken before any image step
@@ -9644,7 +9673,7 @@ fi
 
 # Best-effort host cleanup. Container is --rm; its writes inside the
 # mounts vanish with the container. This removes the host scratch.
-trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null; leerie_unlock "${_image_hold_holder:-}" || true' EXIT
 
 # --- finalize-phase auth is host-side now -------------------------------
 # Previous versions of leerie bind-mounted ~/.config/gh, ~/.git-credentials,
@@ -11220,7 +11249,7 @@ else
       _kill_container_from_cidfile || true
     fi
   }
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _note_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true' EXIT
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _note_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true; leerie_unlock "${_image_hold_holder:-}" || true' EXIT
   trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 130' INT
   trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 143' TERM
 
