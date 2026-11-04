@@ -25925,12 +25925,19 @@ def _measurement_grants(st: "State", tree: str | Path,
     _mkdir_private(state, run_dir)
     with contextlib.suppress(FileExistsError):
         os.mkdir(runtime, 0o700)
+    # gpg's home: mise verifies a Node download by importing Node's release
+    # keys, and `~/.gnupg` is not granted. A new one per grant (`mkdtemp`,
+    # 0700), so verification stays on and no key a repository's command
+    # imported is one a later install trusts (DESIGN §6 *A confined
+    # command's scratch is short and private*).
+    gnupg = tempfile.mkdtemp(prefix="gnupg-", dir=tmp)
     # pnpm keeps a lock and (pnpm 11) a SQLite db under its state and runtime
     # dirs; there they are writable while leerie's store stays read-only
     # (DESIGN §6 *A measurement pins pnpm's version*).
     env = {"TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
            "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": tmp,
-           "XDG_STATE_HOME": str(state), "XDG_RUNTIME_DIR": str(runtime)}
+           "XDG_STATE_HOME": str(state), "XDG_RUNTIME_DIR": str(runtime),
+           "GNUPGHOME": gnupg}
     if kind != STORE_FETCH_KIND:
         # pnpm 11 opens its store's SQLite index read-write for every install
         # and before every `pnpm <script>`, so against the read-only fetched

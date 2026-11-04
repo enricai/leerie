@@ -112,5 +112,7 @@ def test_its_temp_and_cache_are_its_trees_private_dir(leerie, run):
                if k not in places)
     got = _probe(leerie, g, 'temp write|echo x > "$TMPDIR/t"', env)
     assert got == {"temp write": True}
-    # Its runtime directory is in it too, made with it.
-    assert sorted(os.listdir(tmp)) == ["run", "t"]
+    # Its runtime directory and its gpg home are in it too, made with it.
+    gnupg = Path(env["GNUPGHOME"])
+    assert gnupg.parent == tmp
+    assert sorted(os.listdir(tmp)) == sorted(["run", "t", gnupg.name])

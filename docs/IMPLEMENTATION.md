@@ -4711,7 +4711,11 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `_tree_store_env` names); the fetched stores stay under the `ro`
   `<state-root>/.stores/leerie`. `env`: `TMPDIR`/`TMP`/`TEMP` and
   `XDG_CACHE_HOME` → the private temp directory (remade on every call),
-  `XDG_RUNTIME_DIR` → `<private-tmp>/run`, `XDG_STATE_HOME` →
+  `XDG_RUNTIME_DIR` → `<private-tmp>/run`, `GNUPGHOME` → a new
+  `tempfile.mkdtemp(prefix="gnupg-", dir=<private-tmp>)` (0700) on every
+  call and every kind (DESIGN §6 *A confined command's scratch is short and
+  private*, a gpg home of its own: mise imports Node's release keys there; `~/.gnupg` is never
+  granted; pinned by `tests/test_confined_gnupg_home.py`), `XDG_STATE_HOME` →
   `<measure-dir>/state`, `MISE_STATE_DIR` → `<measure-dir>/mise-state`
   (emptied first for the toolchain kind); no store variable (leerie's environment and
   `_tree_store_env` set them). No grant names `/tmp` (the shim gives the
