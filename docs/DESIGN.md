@@ -3700,7 +3700,7 @@ enforce, which a measurement reads as "could not measure", never a pass.
 | devices | as a worker's | write |
 | the measured tree | the checkout the command runs in (a committed view, an evaluation tree, a helper checkout, a worker tree an install runs in) | write |
 | its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `mise-state/` (`MISE_STATE_DIR`), `state/` (`XDG_STATE_HOME`), `reports/` (the runner report of every run that is not held-out; a held-out run's report path is there inside its sandbox only), `coverage/` (the coverage detector's output) | write |
-| its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, and its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) (*A confined command's scratch is short and private*), carried into its own `/tmp` | write |
+| its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) and a new `gnupg-<random>/` per grant (`GNUPGHOME`) (*A confined command's scratch is short and private*), carried into its own `/tmp` | write |
 | `/tmp`, `/dev/shm` | the command's own, made by the shim, every kind, every tree (*Every confined process has its own `/tmp`, `/dev/shm` and IPC*) | read and write |
 | leerie's install, the home | `ROOT` (the AST scripts), `HOME` (unless it holds `/tmp`), named as a worker's are | read |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
@@ -4380,6 +4380,26 @@ and lint passed both ways. funeralworks' configured `test`
 `-k /tmp`, its lock at a fixed `/tmp` path, tsx in `pretest`) passed all
 1,287 files and 13,036 tests both ways, and `next build` compiled both
 ways with no SWC cache refusal.
+
+**A confined command has a gpg home of its own.** *Designed 2026-11-04
+(barnacle's Node floor raised to 22.19.0).* mise verifies a Node download
+with gpg, importing Node's release keys into gpg's home first. Confined as
+the toolchain kind, `mise install` could write `MISE_DATA_DIR` and its temp
+directory, but gpg's home defaulted to `~/.gnupg`, which no grant writes,
+so every Node version not yet installed died in provisioning: "gpg: no
+writable keyring found", "Failed to install core:node@22.19.0". The defect
+was there since confinement came in and showed only when a run needed a
+Node it had not installed. **Invariant: every confined command leerie runs
+has `GNUPGHOME` at a new directory of its own, `gnupg-<random>/` inside its
+private temp directory, made 0700 for each grant (`mkdtemp`).** One rule
+for every kind, since a directory costs nothing and any command may run
+gpg. Signature verification stays on. `~/.gnupg` stays unwritable: it holds
+the operator's staged keyrings, and a key a repository's command could
+plant there, or in a gpg home shared between commands, is one a later
+install would trust. The directory goes with the temp directory. A worker
+is not given one: a worker installs no toolchain (a toolchain under
+`MISE_DATA_DIR` is outside its write boundary), and its `~/.gnupg`
+stays the home a signed commit reads.
 
 **A worker's temp directory is short and private too.** *Designed
 2026-11-03 (the live 0.43.0 barnacle runs).* A worker's `TMPDIR` was
