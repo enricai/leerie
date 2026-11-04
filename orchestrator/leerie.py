@@ -25994,13 +25994,15 @@ def _measurement_grants(st: "State", tree: str | Path,
         # store each failed (review round 19 exec H3). `frozen-store` is
         # pnpm's own read-only mode for an immutable store: measured, a
         # pnpm 11 install then succeeds against it and shares no inode with
-        # it, and pnpm 10.4.1 accepts both settings unchanged. Both
-        # spellings (`_PNPM_SETTINGS`): pnpm 10 reads `npm_config_*`, pnpm 11
-        # `pnpm_config_*`.
-        for k, v in (("frozen_store", "true"),
-                     ("verify_deps_before_run", "false")):
-            env[f"npm_config_{k}"] = v
-            env[f"pnpm_config_{k}"] = v
+        # it, and pnpm 10.4.1 accepts both settings unchanged.
+        # `frozen-store` is pnpm 11's alone, so only pnpm 11's spelling: an
+        # `npm_config_frozen_store` no pnpm reads, and every npm a command
+        # runs warns about it (DESIGN §6 *pnpm's settings are spelled for
+        # the pnpm that reads them*). `verify-deps-before-run` is both
+        # generations', so both spellings (pnpm 10 reads `npm_config_*`).
+        env["pnpm_config_frozen_store"] = "true"
+        env["npm_config_verify_deps_before_run"] = "false"
+        env["pnpm_config_verify_deps_before_run"] = "false"
     # A measurement reaches nothing outside its own loopback; the kinds
     # that fetch (an install, a toolchain, the setup hook, leerie's store
     # fetch) reach the outside through the egress proxy (DESIGN §6 *A

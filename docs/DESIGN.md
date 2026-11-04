@@ -7782,8 +7782,10 @@ under Landlock, the install against the read-only store failed with
 `ERR_SQLITE_ERROR` without it and succeeded with it (2.2 s, no inode
 shared), and `pnpm run` succeeded too. So every measurement except the
 store fetch sets `frozen_store=true` and `verify_deps_before_run=false`
-under both spellings (`_measurement_grants`); pnpm 10.4.1 accepts both
-unchanged (install and `pnpm run` succeed). The fetched class can then hold
+(`_measurement_grants`); pnpm 10.4.1 accepts both unchanged (install and
+`pnpm run` succeed). `frozen_store` is spelled only as pnpm 11 reads it,
+`pnpm_config_frozen_store` (*pnpm's settings are spelled for the pnpm that
+reads them*). The fetched class can then hold
 pnpm 11's store as well as pnpm 10's. corepack picks the version from the
 repository's `packageManager`, else a last-known-good it keeps in
 `COREPACK_HOME`, else the newest on the registry, which was pnpm 11.1.2. So
@@ -7796,6 +7798,36 @@ it. pnpm also writes a lock and state under `XDG_STATE_HOME` and
 directory and, for the runtime directory, which holds sockets, the tree's
 private temp directory (*A confined command's scratch is short and
 private*).
+
+**pnpm's settings are spelled for the pnpm that reads them.** pnpm 10
+reads a setting from the environment only as `npm_config_<key>`, pnpm 11
+only as `pnpm_config_<key>`. npm reads every `npm_config_<key>` too, and
+warns once per key it does not know, in every npm a command runs — a test
+script's `npx`, a `postinstall` — `npm warn Unknown env config
+"store-dir"` ("This will stop working in the next major version of npm"),
+four lines per npm in the user's 0.44.0 run (barnacle, 2026-11-03:
+`store-dir`, `cache-dir`, `frozen-store`, `verify-deps-before-run`). A
+setting reaches pnpm under npm's spelling only when the pnpm that reads
+that spelling has the setting: `frozen-store` is pnpm 11's alone (pnpm
+10.4.1's and 10.34.9's sources do not name it), so it is set as
+`pnpm_config_frozen_store` only. `store_dir`, `cache_dir`,
+`package_import_method` and `verify_deps_before_run` keep both spellings
+(`_PNPM_SETTINGS`, `_with_pnpm_spellings`), and npm still warns about
+them: pnpm 10 has no way to be given a setting that npm does not also read
+and that outranks the repository's own. Its other channel, its global rc
+(`$XDG_CONFIG_HOME/pnpm/rc`), which npm never reads, ranks below a
+committed `.npmrc`: measured with pnpm 10.4.1 and 10.34.9, a committed
+`store-dir=` and `package-import-method=hardlink` win over the rc and lose
+to the environment, so the rc would hand the repository leerie's choice of
+store and import mode (*The stores a view installs from are leerie's*, *A
+view's install never writes leerie's store*). pnpm 11 does not read that
+file at all. And pnpm 10 itself exports `npm_config_store_dir` and
+`npm_config_verify_deps_before_run` into every script it runs, whatever
+leerie sets (measured: a script's `npm` under pnpm 10.4.1 with no
+`npm_config_*` set by its caller still warns `verify-deps-before-run`), so
+a pnpm 10 repository's npm warns whatever spelling leerie chose. The
+warnings left are pnpm 10's; leerie adds none for a setting no pnpm reads
+under that name.
 
 What this does not cover: a worker writing leerie's store, a view, `/opt`
 or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside

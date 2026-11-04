@@ -6943,14 +6943,18 @@ sample's probe never counts for the next.
   The gate records its result. Against the code before the fix, 3 of the
   4 fail. The fourth, finished provisioning not being redone, holds there
   too, because nothing was ever redone.
-- `tests/test_confined_store_install.py` (8 test functions, 9 cases;
+- `tests/test_confined_store_install.py` (9 test functions, 10 cases;
   DESIGN §6 *A measurement pins pnpm's version*, *Which stores an install
   may share*; review round 19 exec H2, H3 and M2). Under real Landlock with
   `_measurement_grants`: a measured command reads a fetched store and
   cannot write it, and writes a verified store, its tree's own stores and
   the measurement's state and runtime directories (where pnpm keeps its
   lock and db); a measured Python's user base is its tree's store, not
-  `$HOME`; measurements open pnpm's store frozen and the fetch does not.
+  `$HOME`; measurements open pnpm's store frozen and the fetch does not,
+  `frozen_store` under pnpm 11's spelling only; every `npm_config_<k>` a
+  measurement, install or fetch environment carries is a key npm knows or
+  pnpm 10 reads (DESIGN §6 *pnpm's settings are spelled for the pnpm that
+  reads them*; falsified 2026-11-04: both fail on the parent's grant).
   corepack is bounded and never floats; `_reads_package_manager`; the pin
   is seeded only for a tree that pins no version (2 cases); two concurrent
   fetches into one store each get their own staging directory and take
