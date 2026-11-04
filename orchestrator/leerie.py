@@ -4494,6 +4494,26 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
+            # Per audited site resting on an untyped (`other`) resolution
+            # the payload lists (DESIGN §8 *A site resting on an untyped
+            # resolution is settled by the run*): code settles a site only
+            # on a majority of `resolved` votes whose every cite verifies.
+            "site_verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["site_id", "resolved", "cites",
+                                 "evidence"],
+                    "properties": {
+                        "site_id": {"type": "string"},
+                        "resolved": {"type": "boolean"},
+                        "cites": {"type": "array",
+                                  "items": {"$ref": "#/$defs/cite"}},
+                        "evidence": {"type": "string"},
+                    },
+                },
+            },
             "rationale": {"type": "string"},
         },
     },
@@ -7265,18 +7285,38 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
                 + _pr_paths(e.get("where_paths"))
                 + (" — tests simulate the interleaving" if simulated
                    else ""))
-    claims = state.get("site_claims")
-    for row in ((claims.get("sites") or []) if isinstance(claims, dict)
-                else []):
-        if not isinstance(row, dict) or row.get("surface_other") is not True:
+    return groups
+
+
+def _untyped_sites(state: dict) -> list[dict]:
+    """The `site_claims` rows resting on an untyped (`other`) resolution
+    (`surface_other`), which the delivery gate settles (DESIGN §8 *A site
+    resting on an untyped resolution is settled by the run*)."""
+    claims = state.get("site_claims") if isinstance(state, dict) else None
+    return [r for r in ((claims.get("sites") or [])
+                        if isinstance(claims, dict) else [])
+            if isinstance(r, dict) and r.get("surface_other") is True
+            and isinstance(r.get("site_id"), str)]
+
+
+def _untyped_site_lines(state: dict) -> list[str]:
+    """The advisory lines for the untyped sites the gate did not settle —
+    never a human check: the run can read its own code (DESIGN §6 *The
+    PR's end-state section*)."""
+    out: list[str] = []
+    for row in _untyped_sites(state):
+        settlement = row.get("settlement")
+        if isinstance(settlement, dict) and settlement.get("settled") is True:
             continue
         where = " ".join(_pr_code(row[k]) for k in ("file", "symbol")
                          if isinstance(row.get(k), str) and row[k].strip())
-        add("Fix sites resolved by an untyped change",
-            f"- [ ] Check {where or 'the site'} "
-            f"({_pr_entry(row.get('site_id'))}) is resolved: "
-            f"{_pr_entry(row.get('resolution')) or 'no resolution recorded'}")
-    return groups
+        ev = (_pr_entry(settlement.get("evidence"))
+              if isinstance(settlement, dict) else "")
+        out.append(
+            f"- {where or 'the site'} ({_pr_entry(row.get('site_id'))}): "
+            f"{_pr_entry(row.get('resolution')) or 'no resolution recorded'}"
+            + (f" — the delivery judge: {ev}" if ev else ""))
+    return out
 
 
 def _pr_advisory(state: dict) -> list[str]:
@@ -7320,6 +7360,8 @@ def _pr_advisory(state: dict) -> list[str]:
                     + f"({_pr_entry(r.get('why')) or 'flagged'})")
     block("Contract literals another subtask may not honour",
           "contract_literal_checks", rows)
+    block("Fix sites resting on an untyped change the run did not settle",
+          "site_claims", _untyped_site_lines(state))
     acc = state.get("acceptance")
     gate = acc.get("gate") if isinstance(acc, dict) else None
     final = gate.get("final") if isinstance(gate, dict) else None
@@ -51056,6 +51098,9 @@ async def _delivery_judge_unmet(
     # wrapper, losing the residual line (round 2).
     normalized = [_delivery_norm_item(item) for item in items]
     n_items = len(normalized)
+    # Asked with the contract, in its pack (DESIGN §8 *A site resting on an
+    # untyped resolution is settled by the run*).
+    untyped = _untyped_sites(st.data) if contract_ctx is not None else []
     # Routing (DESIGN §8 *Grouped judging at coverage item counts*): code
     # settles what code can before any judge prompt is built.
     own_start = _acceptance_own_start(st)
@@ -51164,6 +51209,18 @@ async def _delivery_judge_unmet(
             avail = _format_ground_truth_availability(ground_truth)
             if avail:
                 sections.append(avail)
+            if untyped:
+                sections.append(
+                    "SITES RESTING ON AN UNTYPED RESOLUTION (DESIGN §8: "
+                    "resolved by a change no typed kind describes, so "
+                    "nothing has checked them): also return one "
+                    "`site_verdicts` entry per site_id below, per your "
+                    "schema — resolved=true only with cites quoting the "
+                    "code that resolves it on this tree.\n"
+                    + json.dumps([{k: r.get(k, "") for k in
+                                   ("site_id", "file", "symbol",
+                                    "resolution")} for r in untyped],
+                                 indent=2))
         sections.extend(typed_evidence or [])
         sections.append(
             "Return one verdict per item_index per your schema. met=true "
@@ -51203,7 +51260,8 @@ async def _delivery_judge_unmet(
         # for: shape + per-site disposition is measured at roughly two
         # items' worth of verification (DESIGN §8).
         judge_max_turns = min(
-            30 + 6 * len(pack) + (12 if with_contract else 0), 90)
+            30 + 6 * len(pack) + (12 if with_contract else 0)
+            + (2 * len(untyped) if with_contract else 0), 90)
         sid_base = (f"delivery_judge-{phase_label}"
                     + (f"-p{p}" if len(packs) > 1 else ""))
         allowed = set(pack)
@@ -51227,6 +51285,14 @@ async def _delivery_judge_unmet(
                 _relative_cites(v, judge_cwd[0])
                 for v in (smp.get("verdicts") or [])
                 if isinstance(v, dict) and v.get("item_index") in allowed]}
+            if isinstance(smp.get("site_verdicts"), list):
+                smp["site_verdicts"] = [
+                    {**sv, "cites": _relative_cites(
+                        {"parts": [{"cites": sv["cites"]}]},
+                        judge_cwd[0])["parts"][0]["cites"]}
+                    if isinstance(sv, dict)
+                    and isinstance(sv.get("cites"), list) else sv
+                    for sv in smp["site_verdicts"]]
             # A met resting only on a worker's command run is unknown, not
             # unmet: it goes to a human, never to a re-drive (review round
             # 12 L3; leerie never re-runs it, round 14).
@@ -51312,6 +51378,9 @@ async def _delivery_judge_unmet(
                               "evidence": evidence})
     confirmed.sort(key=lambda u: u["item_index"])
     _set_record_worker_gap(st, judge_idx, human)
+    if untyped and per_pack:
+        _settle_untyped_sites(st, untyped, per_pack[0], staging,
+                              exec_digest, cite_cache)
     if routing is not None and human:
         routing["human_verification"] = sorted(human)
     contract_result: dict | None = None
@@ -51356,6 +51425,41 @@ async def _delivery_judge_unmet(
         contract_result = _downgrade_ungrounded_met(
             contract_result, ground_truth)
     return confirmed, n_samples, contract_result
+
+
+def _settle_untyped_sites(st: "State", untyped: list[dict],
+                          samples: list[dict], tree: str | Path,
+                          record: str, cache: dict) -> None:
+    """Record on each untyped site's `site_claims` row whether this pass
+    settled it (DESIGN §8 *A site resting on an untyped resolution is
+    settled by the run*): `settled` only when more than half of `samples`
+    voted `resolved` with at least one citation, every one verified
+    against HEAD (`_verify_delivery_cite`). Replaces the row's earlier
+    settlement: the last tree judged decides."""
+    for row in untyped:
+        votes, evidence = 0, ""
+        for smp in samples:
+            sv = next((v for v in reversed(smp.get("site_verdicts") or [])
+                       if isinstance(v, dict)
+                       and v.get("site_id") == row["site_id"]), None)
+            if sv is None:
+                continue
+            cites = [c for c in (sv.get("cites") or [])
+                     if isinstance(c, dict)]
+            ok = (sv.get("resolved") is True and bool(cites)
+                  and len(cites) == len(sv.get("cites") or [])
+                  and all(_verify_delivery_cite(c, tree, record, cache)
+                          in _DELIVERY_CITE_OK for c in cites))
+            votes += 1 if ok else 0
+            if not ok and not evidence:
+                evidence = (str(sv.get("evidence") or "").strip()
+                            if sv.get("resolved") is not True else
+                            "claimed resolved, but its citations do not "
+                            "verify on the tree")
+        row["settlement"] = {"settled": 2 * votes > len(samples),
+                             "votes": votes, "samples": len(samples),
+                             "evidence": evidence[:600]}
+    st.save()
 
 
 # --- held-out acceptance tests (DESIGN §8 *Held-out acceptance tests*) ----

@@ -5009,6 +5009,21 @@ of a worker-emitted copy of every code-owned heading, whole-line anchored.
 `tests/test_finalize_execution.py::test_phase_finalize_writes_the_end_state_after_the_outcome`
 pins that `pr_end_state` is rendered after `_decide_outcome`.
 
+**A site resting on an untyped resolution is settled by the run** (DESIGN §8;
+the user's 0.44.0 run 48c48629, barnacle#665, listed a `surface_other` site
+under "Needs human verification"), in `tests/test_untyped_site_settlement.py`
+(5 functions): such a site renders no "Needs human verification" entry
+whether unsettled, voted unresolved or settled; a settled one renders
+nothing; an unsettled one is advisory, with the judge's evidence when it
+gave one; and `_delivery_judge_unmet`, its judge stubbed, asks for the site
+in the contract pack's prompt (and not for a typed site), settles it on a
+`resolved` vote whose quote is the tree's own line, and settles nothing on
+a fabricated quote, an empty `cites` or a `resolved: false`.
+`tests/test_pr_end_state.py`'s full-state line moves to the advisory form.
+Falsified 2026-11-04: on the parent's code all 5 and the full-state case
+fail; with the citation check replaced by `True`, the fabricated-quote case
+fails.
+
 **The coverage re-drive** (DESIGN §9 *Changed lines no test executes are
 re-driven*), in `tests/test_coverage_redrive.py`: real git worktrees and a
 stand-in `node_modules/.bin/vitest` that speaks vitest's JSON reporter and

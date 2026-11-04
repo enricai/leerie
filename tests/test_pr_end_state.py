@@ -107,9 +107,8 @@ def test_every_source_renders_in_order(leerie):
         "retry header (`src/client.ts`)",
         "**A real concurrent engine**\n- [ ] **feat-001**: two writers race"
         " — tests simulate the interleaving",
-        "**Fix sites resolved by an untyped change**\n- [ ] Check "
-        "`src/sync.ts` `flush` (D2) is resolved: re-run the flush after "
-        "the lock",
+        "**Fix sites resting on an untyped change the run did not settle**"
+        "\n- `src/sync.ts` `flush` (D2): re-run the flush after the lock",
         "- **feat-002**: `src/parse.ts` lines 12, 14",
         "- **feat-002**: [test_missing] no test for the parser "
         "(`src/parse.ts`)",

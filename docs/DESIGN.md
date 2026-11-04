@@ -481,7 +481,9 @@ subtask it tests). Three mechanisms reconcile that coupling:
   value into a decision, recomputing it and tightening its predicate
   are routinely one edit described three ways). `other` contradicts
   nothing — an `other` on either side never makes a mismatch — but the
-  site is recorded as resting on an untyped resolution, for the PR. A
+  site then rests on an untyped resolution no table checks, so the
+  delivery gate settles it on the integrated tree (§8 *A site resting on
+  an untyped resolution is settled by the run*). A
   `fix` site that no fix subtask claims needs either a claim or a typed
   `sites_not_needed` entry (`{site_id, reason}`); one claimed only with
   kinds outside the audit's class is a mismatch. Recursive decomposition
@@ -503,7 +505,7 @@ subtask it tests). Three mechanisms reconcile that coupling:
   blind annotator reading the final plans found no claim on the target
   whose kind contradicted its intent, and the only contradictions it
   read on a control (4 sites, one run) were all `other` claims — which
-  is why `other` is surfaced instead of contradicting.
+  is why `other` is settled at the gate instead of contradicting.
 
   **Required items are claimed too.** On every run, not only a defect
   fix, each planner subtask lists in `claims.items` the required items
@@ -6850,9 +6852,7 @@ present only when it has an entry:
   typed `external`, subtasks accepted on an `external_precondition`
   blocker (§13), risks a worker typed `gap: unverified_external` (a
   concurrency risk whose tests can only stub the interleaving is labelled
-  so — `simulated_interleaving`), audited fix sites resolved by an
-  untyped (`other`) change (§5 *Every `fix` site is claimed*), and
-  held-out acceptance sets the final tree left unmeasured, with why (§8
+  so — `simulated_interleaving`), and held-out acceptance sets the final tree left unmeasured, with why (§8
   *A held-out set the final tree leaves unmeasured is never silent*).
 - `## Untested after re-drive` — changed lines that no test executes after
   the coverage re-drive spent its rounds (§9 *Changed lines no test
@@ -6862,8 +6862,13 @@ present only when it has an entry:
 - `## Repository merge checks still red` — the CI-parity checks confirmed
   red on the final tree (§9 *The repository's own merge checks run too*).
 - `## Advisory (not verified by this run)` — the whole-PR review's verified
-  findings, the contract-literal flags and the site-token hits (§8, §9),
-  labelled advisory because nothing waited on them.
+  findings, the contract-literal flags, the site-token hits (§8, §9) and
+  the audited fix sites resting on an untyped (`other`) change that the
+  delivery gate did not settle (§8 *A site resting on an untyped
+  resolution is settled by the run*), labelled advisory because nothing
+  waited on them. A check of the repository's own code is never a
+  "Needs human verification" entry: that list is for what a human must
+  bring.
 
 *Every entry the run records for a human renders.* The invariant: an
 entry in `needs_human_verification` is a check the run handed to a human,
@@ -11605,6 +11610,32 @@ under the same dispute vote.
   violations flagged, 0 of 288 false flags. The checks read JavaScript/TypeScript repos;
   the code-file and test-file patterns also take other languages'
   usual suffixes.
+
+**A site resting on an untyped resolution is settled by the run.** An
+audited `fix` site whose resolution kind — the audit's or a claim's — is
+`other` passes the claims check without a typed match (§5 *Every `fix`
+site is claimed*), so nothing has compared it with what changed. 0.44.0
+handed every such site to a human: the user's run 48c48629
+(barnacle#665) listed "Check `src/scraper/session-shared.ts` … (D8) is
+resolved" under "Needs human verification" — a reading of the
+repository's own code, which the run can make as well as any reviewer,
+under the heading kept for a resource only a human can bring (§9 *Only
+an entry naming an external resource is external*), and the user found
+the section confusing for it. So the call that asks the contract verdict
+(below) also asks, per such site, one typed answer: `site_verdicts`
+entries of `site_id`, `resolved` and the citations of the code that
+resolves it. Code settles a site only on a majority of that pass's
+samples voting `resolved` with at least one citation, every one of which
+verifies against HEAD (`_verify_delivery_cite`, the items' rule); a
+fabricated quote settles nothing. The settlement is recorded on the
+site's `site_claims` row and re-taken by every pass that asks the
+contract, so the last tree judged decides. A settled site is not shown.
+One the gate did not settle — never asked (no gate ran, it crashed), voted
+unresolved, or cited nothing that verifies — is listed under "Advisory
+(not verified by this run)" with the judge's evidence when it gave one,
+never under "Needs human verification". It does not gate: the contract
+verdict already judges every audited site, and an unmet contract is what
+re-drives.
 
 **The gate judges the finding, not only the items.** Measured across
 three reports' repeat-run loops (14 of the 17 v0.32.x runs,
