@@ -700,7 +700,7 @@ def test_a_timeout_only_vote_file_is_named_in_the_pr(leerie, tmp_path,
     assert res["unmeasured_files"] == {REL: "timed_out"}
     assert _outcome(leerie, st, [s_], res) == "unconverged"
     body = leerie._format_pr_end_state_section(st.data)
-    nhv = body.split("## Needs human verification", 1)[1]
+    nhv = body.split("## Not verified by this run", 1)[1]
     line = next(x for x in nhv.splitlines() if "held-out set 1" in x)
     assert f"`{REL}` timed out on its first run" in line
     assert "made hang" in line

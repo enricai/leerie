@@ -985,7 +985,7 @@ pass `--setting-sources user`, `--disable-slash-commands`,
 `--settings` env, and put `--` before the first message. All 6 fail with
 the wiring removed.
 
-`tests/test_terminal_text.py` (13 test functions, 16 cases; DESIGN §6 *No
+`tests/test_terminal_text.py` (18 test functions, 21 cases; DESIGN §6 *No
 text leerie did not
 write reaches the operator's terminal as a control sequence*; review round
 30 isolation T1), with an OSC 52 sequence, a CSI, a C1 CSI, a bidi
@@ -1028,6 +1028,18 @@ stand in for the rebaser seam (`tests/test_host_finalize_sh.py`,
 `/usr/bin/python3` by absolute path — one of them ended in `exec
 /usr/bin/env python3`, which found the stub again and looped once the
 filter called `python3`.
+The colour rule (a complete CSI dropped, everything else escaped; the
+user's 0.44.0 vitest output, 2026-11-03) added 5 functions: the run's
+vitest lines come out plain from both implementations; OSC 52, OSC 8,
+DCS, a lone ESC, a CSI cut by a control or by the end, the C1 CSI and a
+bidi override stay escaped while SGR, cursor moves, erases, private modes
+and report requests are dropped; a removal never joins a new sequence; the
+two implementations agree on that corpus; and the relay's `main()`, fed
+one byte per read (its module's `os` replaced, so every sequence is split),
+emits the rule applied to the whole stream. Falsified: with both
+implementations reverted 4 fail (the agreement case passes, both sides
+escaping alike); with only the relay's hold-back removed, the split-read
+case.
 
 Review round 32. `tests/test_confined_terminal.py` (11 test functions, 17
 cases; DESIGN §6 *No confined process holds or can open the operator's
@@ -4997,6 +5009,43 @@ of a worker-emitted copy of every code-owned heading, whole-line anchored.
 `tests/test_finalize_execution.py::test_phase_finalize_writes_the_end_state_after_the_outcome`
 pins that `pr_end_state` is rendered after `_decide_outcome`.
 
+**A site resting on an untyped resolution is settled by the run** (DESIGN §8;
+the user's 0.44.0 run 48c48629, barnacle#665, listed a `surface_other` site
+under "Needs human verification"), in `tests/test_untyped_site_settlement.py`
+(5 functions): such a site renders no "Needs human verification" entry
+whether unsettled, voted unresolved or settled; a settled one renders
+nothing; an unsettled one is under "Not verified by this run", with the
+judge's evidence when it
+gave one; and `_delivery_judge_unmet`, its judge stubbed, asks for the site
+in the contract pack's prompt (and not for a typed site), settles it on a
+`resolved` vote whose quote is the tree's own line, and settles nothing on
+a fabricated quote, an empty `cites` or a `resolved: false`.
+`tests/test_pr_end_state.py`'s full-state line moves to that section.
+Falsified 2026-11-04: on the parent's code all 5 and the full-state case
+fail; with the citation check replaced by `True`, the fabricated-quote case
+fails.
+
+**Only a typed external resource reaches "Needs human verification"**
+(DESIGN §6; the user's runs 48c48629, barnacle#665, and ebe36d49,
+barnacle#670, listed a fix site to read, a confirm budget that ran out and
+intermittent test IDs there), in `tests/test_needs_human_sources_render.py`:
+`test_only_a_typed_external_resource_reaches_needs_human` builds one state
+with an entry of every source — every `needs_human_verification` source
+derived from the code, a blocker and an external risk with and without a
+resource, a simulated interleaving, an unmeasured held-out set, an
+intermittent failure, an unsettled untyped site — and fails on any line
+under "Needs human verification" that is not a typed external entry, or on
+any other entry missing from "Not verified by this run"; the per-source
+case places each derived source in its section. Callers that read the
+non-external groups moved from `_pr_needs_human` to `_pr_not_verified`
+(`test_bstar_confirm`, `test_bstar_sized_passes`, `test_test_outcome_settlement`,
+`test_nhv_one_fact_instruction_first`, `test_forbidden_commands`,
+`test_bstar_one_off_flake_budget`, `test_final_test_id_diff_ships`), and
+the body-reading cases (`test_delivery_detection`,
+`test_acceptance_held_case_intermittent`, `test_acceptance_unmeasured_pr`,
+`test_risk_register`, `test_pr_end_state`, `test_untyped_site_settlement`)
+read the new section.
+
 **The coverage re-drive** (DESIGN §9 *Changed lines no test executes are
 re-driven*), in `tests/test_coverage_redrive.py`: real git worktrees and a
 stand-in `node_modules/.bin/vitest` that speaks vitest's JSON reporter and
@@ -6198,6 +6247,29 @@ warning-only settle was rewritten). The wiring guards in
 `tests/test_mid_run_satisfied_no_commits.py` were rewritten to the new
 placement: the HEAD probe survives only before the implementer.
 
+`tests/test_settle_decided_by_execution.py` (6 test functions, 11 cases;
+DESIGN §8 *A no-op a sibling already delivered is settled on evidence*,
+check 3; the live 54fb56c3 bugfix-006 episode; review round 39, execution
+E1) builds the live repository shape (a `leerie: integrate bugfix-004`
+merge on the run branch) and drives the real `_settle_subtask` with the
+live execution record and probe verdict: the subtask settles `complete`
+with `decided_by: "execution"`, `_unconverged_predecessors(...,
+bugfix-010)` is empty, and the payload carries `decided_by_execution`
+with each criterion's id. `cannot_verify` counts only when execution
+decided everything the probe could not check (6 cases, each re-driven:
+`partially_met`, an untyped verdict, a criterion with no command, a
+verdict without the `unverifiable`/`covered_by_execution` lists, the seed
+uncovered, an unknown id). A control: a failing verify is re-driven
+twice, then settles unconverged and holds bugfix-010 back. A unit test
+of `_execution_decides_criteria`; a unit test of
+`_execution_answers_cannot_verify`'s set rule; and the E1 reproduction,
+untrimmed (12 files, an argv over 2, a file outside it broken, the probe's
+`covered_by_execution` empty), which must re-drive. Falsified
+(2026-11-04): the set rule replaced by `return True` fails the
+reproduction, the seed-uncovered and unknown-id cases and the unit test;
+and, before E1's fold, the `_execution_decides_criteria` condition
+removed failed the uncommanded-criterion case.
+
 `tests/test_spawn_held_enrollment.py` spawns real processes through
 `_run_streaming`: at the moment the broker would enroll, after a pause long
 enough for an unheld child to have finished, the command has not run; the
@@ -6655,7 +6727,7 @@ sample's probe never counts for the next.
   throwaway checkout; the checkout snapshot never rewrites the user's index;
   with no run repository the prune and the abnormal-exit clean-up write
   nothing in the cwd's `.git`.
-- `tests/test_credentials_never_outlive_the_run.py` (10 test functions, 24
+- `tests/test_credentials_never_outlive_the_run.py` (10 test functions, 25
   cases; DESIGN §6 *No copy of the credentials outlives its run's process*,
   *Every deleter of a run's directories deletes them*; review round 18 M1,
   round 19 claims H1, exec M1 and L2): the owner-aware removal takes
@@ -6762,9 +6834,10 @@ sample's probe never counts for the next.
   and `tests/test_hidden_dirt.py` assert the same contract: what a setting
   hid is the file's own line, and every key DESIGN §8 lists is put back by
   either checker half alone.
-- `tests/test_needs_human_sources_render.py` (14 tests, DESIGN §6 *The
-  PR's end-state section*, review round 14 H1): every "Needs human
-  verification" source the code can write renders in the PR; the sources
+- `tests/test_needs_human_sources_render.py` (7 test functions, 15
+  cases; DESIGN §6 *The PR's end-state section*, review round 14 H1):
+  every "Needs human verification" source the code can write renders in
+  the PR; the sources
   are derived from the code (`*_GAP_SOURCE` constants and literal `source`
   keys of dicts written to `needs_human_verification`), never listed by
   hand.
@@ -6822,6 +6895,47 @@ sample's probe never counts for the next.
   `tmp_path` — without it the worker case read nothing beside the host
   directory and passed only with `TMPDIR` beneath `$HOME`. With `_host_dir()`
   returning None both cases fail.
+- `tests/test_confinement_refusal_stops_the_run.py` (10 test functions;
+  DESIGN §6 *A confinement failure stops the run; it is never a result*;
+  the 2026-11-03 22:41 incident, where a refusing shim was recorded as
+  build failures, a crashed worker and a non-fatal capture error). The
+  real shim writes its refusal to `--refusal-fd` (a pty on one of its
+  fds); a command's own exit 126 under the real shim writes nothing, and
+  its attempt to write the descriptor fails; an AST rule that no exit 126
+  in the shim bypasses `_refused` (and, since the round-39 fold, `_taken`
+  beside it); `_isolation_failed` writes it. With a refusing shim stub (os
+  and sys only), `_run_streaming`, `_invoke` and `_ts_script_run` raise
+  `ConfinementRefused`, not an `Exception`; with the real shim a command's
+  own 126 is returned as status 126; every `_confined_argv` call names
+  `refusal_fd`; the real `main()` exits `EXIT_CONFINEMENT_REFUSED` (78)
+  with `state.json` as the step left it, no `finished_at`, and no capture
+  attempted. Falsified (2026-11-04), each failing exactly its test:
+  `_refused` not writing the descriptor; the descriptor left inheritable;
+  `_run_streaming` or `_invoke` closing it instead of checking;
+  `_ts_script_run` with an unchecked descriptor; `main()` exiting 1.
+  `tests/test_credentials_never_outlive_the_run.py` drives the new
+  `main()` arm.
+- `tests/test_held_out_path_taken_is_not_a_refusal.py` (9 test functions,
+  15 cases; DESIGN §6 *A confinement failure stops the run; it is never a
+  result*, *A held-out evaluation runs alone*; review round 39, isolation
+  R1 and D2). The real shim's `place()` raises `PlacementTaken` for a
+  link, a file, or a file at the path (3), and places a plain directory
+  (control); an `ENOSPC` while placing is still an `IsolationError`;
+  `run_sandbox` with the real `place` writes the `--taken-fd` descriptor
+  and leaves the refusal descriptor empty (3); the attack (`tests ->
+  spec_real` under a held-out `tests/acceptance/acc.test.js`) through
+  `_acceptance_run_placed` with the real `_run_streaming` records
+  `path_in_use`, spawns nothing and writes nothing through the link (2);
+  the set audit and the parse check find the path taken (2);
+  `_run_streaming` raises `HeldOutPathTaken`, an `OSError` and not
+  `ConfinementRefused`; a refusal outranks a taken path; and the
+  command's open of `/proc/<shim>/fd/N` without `--isolate` is refused
+  with `EACCES` (`_undumpable`), the pipe left empty. Falsified
+  (2026-11-04), one change at a time: the old acceptance pre-check, audit
+  and parse checks; every placing errno reported as a refusal (6 shim
+  tests); `_run_streaming` ignoring the taken pipe; taken checked before
+  the refusal; `run()` without `_undumpable`. `tests/heldout_sandbox_emulator.py`
+  and `tests/conftest.py` pass and honour `--taken-fd`.
 - `tests/test_run_settings.py` (54 tests, review rounds 17 H2 and 18 H1,
   DESIGN §8 *The settings are leerie's*): both checker halves and both
   restore halves. A setting written from a worker's tree (each key DESIGN
@@ -6916,14 +7030,18 @@ sample's probe never counts for the next.
   The gate records its result. Against the code before the fix, 3 of the
   4 fail. The fourth, finished provisioning not being redone, holds there
   too, because nothing was ever redone.
-- `tests/test_confined_store_install.py` (8 test functions, 9 cases;
+- `tests/test_confined_store_install.py` (9 test functions, 10 cases;
   DESIGN §6 *A measurement pins pnpm's version*, *Which stores an install
   may share*; review round 19 exec H2, H3 and M2). Under real Landlock with
   `_measurement_grants`: a measured command reads a fetched store and
   cannot write it, and writes a verified store, its tree's own stores and
   the measurement's state and runtime directories (where pnpm keeps its
   lock and db); a measured Python's user base is its tree's store, not
-  `$HOME`; measurements open pnpm's store frozen and the fetch does not.
+  `$HOME`; measurements open pnpm's store frozen and the fetch does not,
+  `frozen_store` under pnpm 11's spelling only; every `npm_config_<k>` a
+  measurement, install or fetch environment carries is a key npm knows or
+  pnpm 10 reads (DESIGN §6 *pnpm's settings are spelled for the pnpm that
+  reads them*; falsified 2026-11-04: both fail on the parent's grant).
   corepack is bounded and never floats; `_reads_package_manager`; the pin
   is seeded only for a tree that pins no version (2 cases); two concurrent
   fetches into one store each get their own staging directory and take
@@ -7421,8 +7539,9 @@ sample's probe never counts for the next.
   image's own root); E1's planted `.pth` is in the worker root and never
   runs in the image root's interpreter, as leerie or root, and the
   untracked `.env` is not in the image.
-- `tests/test_buildkit_isolation.py` (26 functions, 53 cases, 12 of them
-  opt-in: 6 real builds, and 6 under bash 3.2): no build consumes what
+- `tests/test_buildkit_isolation.py` (49 functions, 100 cases, 22 of them
+  opt-in: 12 real builds, one containerd of the test's own, and 9 under
+  bash 3.2): no build consumes what
   another build left in BuildKit, every
   build is given leerie's frontend, and a repository image's build
   directory lives only as long as its launch, which no build outlives
@@ -7600,6 +7719,120 @@ sample's probe never counts for the next.
   before it discriminated: sent back to back, the two merged into one and
   passed against both mutations. All 11 opt-in real cases pass on this
   tree (BuildKit 0.31.2, rootless nerdctl 2.3.5).
+  Round 38 (review round 38, isolation X1-X3, claims F3, execution X1
+  and X2; DESIGN §6 *A repository's build carries no operator
+  credential*, *The content store*, *The images an earlier leerie left*).
+  Both builds see `DOCKER_CONFIG=<build dir>/registry-auth`, mode 700,
+  holding only `config.json` = `{"auths":{"leerie.invalid":{}}}`, and
+  `DOCKER_AUTH_CONFIG` empty, with the operator's config and
+  `DOCKER_AUTH_CONFIG` in the environment (in `test_build_repo_image.py`).
+  `build-push.sh --local-build` sweeps before its build: an unused
+  `leerie-repo/…` image is gone by the build, and one a container holds
+  refuses it with no build (2). The base build's failed prune warns,
+  naming its namespace. `leerie_content_sharing_check` passes only for a
+  config setting `content_sharing_policy` to "isolated" (v2 and v3
+  quoting), and otherwise gives the file, the lines and the restart (7).
+  The sweep's refusal names each container that holds a left image, its
+  state and its remedy, `leerie stop` for a running one and `nerdctl rm
+  <id>` for an exited one, and never `image rm` (2 of its 4 cases). The
+  real launcher's local `stop` and `kill` follow with `nerdctl rm -f` of
+  the container (2), as `resume`'s reaper does after its kill
+  (`tests/test_oom_wedge_prevention.py::test_reaper_removes_what_it_killed`). With no BuildKit daemon answering, the refusal names
+  the three addresses asked, buildctl's last error and the remedy.
+  Opt-in: with a fake `docker-credential-secretservice` on PATH holding the
+  operator's login, and then with the credential in `DOCKER_AUTH_CONFIG`,
+  an attacking repository's private `FROM` through `build_repo_image`
+  fails with 401 and the helper is never asked, while the same Dockerfile
+  built directly with an empty config and the helper on PATH reads the
+  file and asks it; on a containerd of the test's own, the config
+  `_runtime_linux_containerd_config` writes refuses an ingest by digest
+  with no body in another namespace, which containerd's default config
+  accepts. Falsified live (measured 2026-11-03), each restored, each
+  failing the cases it targets: the `config.json` write removed, or
+  `DOCKER_AUTH_CONFIG=''` dropped from the first build (the stub sees
+  them); the sweep's call removed from `build-push.sh`; the base prune's
+  warning back to `|| true`; the check made to pass always; the holders'
+  listing dropped; the `rm` dropped from `stop`, from `kill` or from the
+  reaper; buildctl's
+  stderr discarded again. Opt-in, live: the build's config left without
+  `config.json` (the helper case read the file), `DOCKER_AUTH_CONFIG=''`
+  dropped (the env case read it), and the installer's policy line dropped
+  (the ingest succeeded).
+  All 13 opt-in cases and the 9 under bash 3.2 passed on this tree
+  (measured 2026-11-04, BuildKit 0.31.2, rootless nerdctl 2.3.5,
+  containerd 2.2.2).
+- `tests/test_image_steps_run_once.py` (5 functions) — a host-wide image
+  step runs once, under a host lock (DESIGN §6 *A host-wide image step runs
+  once, under a host lock*; the operator's live 0.44.0 launches: five
+  launches on one checkout each exported the base to /tmp and loaded it at
+  once). The launcher's own text, 5 launches at once against one stub
+  image store kept in files: with no base, one base build and one frontend
+  pull; on one checkout, one copy of the base (streamed, nothing in
+  `TMPDIR`), one pull and one repository build, every launch ending with
+  the image's digest and one warning of a shared content store; on five
+  checkouts, one copy and one pull. `leerie_lock`: a second taker waits for
+  the first's release and says so once; a launch SIGKILLed while holding it
+  frees it within seconds though a child it started still runs, and leaves
+  no ready file. Falsified live (2026-11-03), each restored: the lock
+  dropped from the base build (more than one build), from the per-repo host steps (5
+  loads on five checkouts), the checkout's lock dropped, the holder's
+  liveness check removed. In `tests/test_build_repo_image.py`, the copy
+  streams `save` into `load` and a failure of either side is logged with
+  its stderr (2); falsified with `PIPESTATUS[0]` dropped.
+- `tests/test_command_line_refused_before_images.py` (6 functions, 7
+  cases) — a command line is refused before any image step (DESIGN §6 *A
+  command line is refused before any image step*; the live `leerie
+  promptresume <run-id> …`). The real launcher against a stub `nerdctl`:
+  a garbled verb and a bad `--max-workers` end with the parser's message
+  and status 2, no nerdctl command that builds, copies, inspects or runs
+  an image, and no run (2); an accepted line still runs. Run, not read:
+  `check_command_line` and `main` share `_parse_command_line` and
+  `_leerie_arg_parser`; under `python3 -I -S` in an empty directory and
+  HOME it spawns nothing, writes nothing and answers in under 5 s.
+  Falsified live (2026-11-03): the launcher's `exit` on the check's
+  status removed (the stub container ran). The check compiles a content
+  once (review round 39, execution E4), on the launcher's own check
+  program extracted verbatim:
+  `test_the_check_runs_the_kept_code_object_of_its_source` swaps the
+  entry kept under the source's key for another module's code object and
+  the check answers with that module's status, so it runs the kept code;
+  an edited source is a new entry with its own answer, and a broken entry
+  is compiled again. `test_the_check_keeps_four_code_objects`: six
+  contents leave four entries, the current one among them. Falsified
+  (2026-11-04): a compile forced on every run fails the first, and only
+  it.
+- `tests/test_launch_runs_its_own_code.py` (3 test functions) — a launch
+  runs only the leerie code it started with (DESIGN §6 *A launch runs only
+  the leerie code it started with*; the 2026-11-03 upgrade under five
+  running 0.43.0 runs). The launcher's own snapshot and staging spans and
+  real `_run_argv`, against a fake `nerdctl` that, while "running", has
+  the test replace the install's `landlock_exec.py` and then reads the
+  shim through its `/opt/leerie-image` mount: it reads the old shim, from
+  a copy under `~/.cache/leerie`, removed at exit. An install that changed
+  version stops the launch before any container; the bring-back sources
+  the launch's copy of `host-finalize.sh`. Falsified (2026-11-04), each
+  failing its own test: `$LEERIE_REPO` mounted again, the version check
+  dropped, the install's `host-finalize.sh` sourced.
+  `tests/test_launcher_env_forwarding.py` and
+  `tests/test_launcher_state_mount.py` stub `_code_dir`;
+  `tests/test_run_repo_bring_back.py`'s launcher harnesses pass it.
+- `tests/test_launch_snapshot_is_one_commit.py` (5 test functions) — the
+  snapshot is one state of the install, and `LEERIE_COMMIT` names it
+  (review round 39, execution E2 and E3). The launcher's snapshot span,
+  verbatim: a clean checkout gives its commit's tree and short sha; a
+  contributor's edit and a new prompt run, `LEERIE_COMMIT` is
+  `<short>-dirty.<12 hex>`, `git archive <tree>` reproduces the snapshot,
+  and nothing is staged; a non-git install is copied with an empty commit;
+  a non-git install changed under the copy stops the launch; 25 snapshots
+  while `git checkout` flips the install between two same-version commits:
+  every accepted one is whole, one commit's and equal to the code its
+  `LEERIE_COMMIT` names, and every other one stopped with its reason.
+  Falsified (2026-11-04), one change at a time: a git checkout copied
+  with `cp -pR` instead of archived fails the flipping test; edits
+  recorded as the bare commit fail the edits test; the non-git copy left
+  uncompared fails the changed-under-copy test. `tests/test_leerie_commit.py`'s
+  two launcher pins run the span (a git install: the short sha; no git:
+  empty, status 0).
 - `tests/test_capture_validation.py` — E2's proof turned around: the schema,
   `_filter_residual_deps`, `_capture_problems`, `_record_capture`,
   `_merge_capture_into_config`, `apply_captured_deps`, the launcher's apt

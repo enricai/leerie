@@ -88,6 +88,7 @@ def _full_state() -> dict:
 
 
 HEADINGS = ["## Unconverged", "## Needs human verification",
+            "## Not verified by this run",
             "## Untested after re-drive", "## Integration content loss",
             "## Repository merge checks still red",
             "## Advisory (not verified by this run)"]
@@ -105,11 +106,10 @@ def test_every_source_renders_in_order(leerie):
         "**a staging database**\n- [ ] **feat-004** was not done, waiting "
         "on it: needs a seed\n- [ ] **feat-001**: relies on the provider's "
         "retry header (`src/client.ts`)",
-        "**A real concurrent engine**\n- [ ] **feat-001**: two writers race"
-        " — tests simulate the interleaving",
-        "**Fix sites resolved by an untyped change**\n- [ ] Check "
-        "`src/sync.ts` `flush` (D2) is resolved: re-run the flush after "
-        "the lock",
+        "**Concurrency the tests only simulate**\n- [ ] **feat-001**: two "
+        "writers race — tests simulate the interleaving",
+        "**Fix sites resting on an untyped change the run did not settle**"
+        "\n- [ ] `src/sync.ts` `flush` (D2): re-run the flush after the lock",
         "- **feat-002**: `src/parse.ts` lines 12, 14",
         "- **feat-002**: [test_missing] no test for the parser "
         "(`src/parse.ts`)",

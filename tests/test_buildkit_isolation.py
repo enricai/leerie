@@ -49,6 +49,7 @@ and a registry credential in the operator's Docker config."""
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import pty
@@ -536,6 +537,32 @@ def test_every_build_prunes_its_own_cache_mount_records(tmp_path):
     assert r.returncode == 0, r.stderr
     assert _pruned(bp / "buildctl.log") == _namespaces(
         (bp / "nerdctl.log").read_text()), r.stderr
+
+def test_the_base_builds_failed_prune_warns(tmp_path):
+    """Review round 38, claims F3: the base build's prune warns when it
+    fails, naming the namespace, as `build_repo_image`'s and
+    `build-push.sh`'s do (DESIGN §6 *Residuals*: "A failed prune warns").
+    Falsified live (2026-11-03): the warning replaced by `|| true` again
+    (no warning)."""
+    log = tmp_path / "nerdctl.log"
+    script = ("set -euo pipefail\n" + LOG_SH_SOURCE + FRONTEND_SH_SOURCE
+              + BUILDCTL_STUB + 'remote_log() { echo "$*" >&2; }\n'
+              + NERDCTL_IMAGE_INSPECT_STUB + _RECORD
+              + "leerie_prune_cache_mounts() { return 1; }\n"
+              + "_repo_build_done() { :; }\n"
+              + extract_block(_text(), *BASE_BLOCK))
+    r = subprocess.run(["bash", "-c", script], capture_output=True,
+                       text=True, timeout=120,
+                       env={"PATH": "/usr/bin:/bin", "TMPDIR": str(tmp_path),
+                            "NERDCTL_LOG": str(log), "IMAGE_TAG": "leerie:9.9.9",
+                            "LEERIE_REPO": str(tmp_path),
+                            "LEERIE_STATE_HOST_DIR": str(tmp_path)})
+    assert r.returncode == 0, r.stderr
+    ns = _namespaces(log.read_text())
+    assert len(ns) == 1, ns
+    assert ("warning: could not remove the build's cache-mount records "
+            f"({ns[0]})") in r.stderr, r.stderr
+
 
 def test_no_build_runs_without_a_namespace(tmp_path):
     """`leerie_cache_mount_ns` prints nothing and returns 1 when it reads no
@@ -1322,7 +1349,7 @@ def test_every_nerdctl_command_names_leeries_namespace():
         assert ns in _OTHER_NS, c
     verbs = sorted({c.split()[3] for c in own})
     assert verbs == ["build", "image", "kill", "run", "save"], verbs
-    assert len(own) == 16, own
+    assert len(own) == 17, own
     # The run's quoted forms (macOS `script`) name it too.
     assert leerie.count(
         '_nerdctl_run_quoted="nerdctl --namespace $LEERIE_IMAGE_NS run"') == 2
@@ -1478,6 +1505,40 @@ def test_resolve_finds_the_daemon_nerdctl_uses(tmp_path, env, answers,
                          "unix://R/buildkit/buildkitd.sock"][:len(asked)]
 
 
+_BUILDCTL_DOWN = r'''
+buildctl() {
+  echo "error: listing workers: connection error: desc = \"transport: Error while dialing: dial unix ${2#unix://}: connect: no such file or directory\"" >&2
+  return 1
+}
+'''
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="as root, nerdctl's runtime "
+                    "directory is /run, not $XDG_RUNTIME_DIR")
+def test_the_refusal_says_where_it_asked_and_why_it_failed(tmp_path):
+    """Review round 38, execution X2: when no BuildKit daemon answers, the
+    refusal names each address asked, buildctl's own last error, and what
+    to do (start buildkitd, or set BUILDKIT_HOST), where it said only
+    "could not ask BuildKit". Falsified live (2026-11-03): buildctl's
+    stderr discarded again (no error in the refusal)."""
+    r = subprocess.run(
+        ["bash", "-c", "set -uo pipefail\n" + FRONTEND_SH_SOURCE
+         + _BUILDCTL_DOWN + 'leerie_buildkit_check || '
+         'echo "REFUSED $LEERIE_BUILDKIT_REFUSAL"\n'],
+        capture_output=True, text=True, timeout=60,
+        env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": "R"})
+    out = r.stdout
+    assert out.startswith("REFUSED could not ask BuildKit"), (out, r.stderr)
+    for a in ("unix://R/buildkit-leerie/buildkitd.sock",
+              "unix://R/buildkit-default/buildkitd.sock",
+              "unix://R/buildkit/buildkitd.sock"):
+        assert a in out, out
+    assert ("(buildctl: error: listing workers: connection error: desc = "
+            '"transport: Error while dialing: dial unix R/buildkit/'
+            'buildkitd.sock: connect: no such file or directory")') in out
+    assert "start buildkitd" in out and "set BUILDKIT_HOST" in out, out
+
+
 _SWEEP_NERDCTL = r'''
 nerdctl() {
   echo "$*" >> "$NERDCTL_LOG"
@@ -1497,25 +1558,35 @@ nerdctl() {
       done < "$IMAGES.$_ns"
       printf '%s' "$_keep" > "$IMAGES.$_ns"
       return 0 ;;
+    "ps -a")
+      printf '%s' "${CONTAINERS:-}"
+      return 0 ;;
   esac
   return 9
 }
 '''
 
 
-@pytest.mark.parametrize("in_use,list_fail,refused", [
-    ("", "", False),
-    ("leerie-repo/enricai-barnacle:0.43.0", "", True),
-    ("", "1", True),
+@pytest.mark.parametrize("in_use,list_fail,refused,holder", [
+    ("", "", False, ""),
+    ("leerie-repo/enricai-barnacle:0.43.0", "", True, "Up 3 hours"),
+    ("leerie-repo/enricai-barnacle:0.43.0", "", True,
+     "Exited (137) 2 days ago"),
+    ("", "1", True, ""),
 ])
 def test_leeries_old_repository_images_are_swept_from_the_workers(
-        tmp_path, in_use, list_fail, refused):
+        tmp_path, in_use, list_fail, refused, holder):
     """`leerie_sweep_worker_images`: from each namespace a worker reads,
     every `leerie-repo/…` image is removed, never forced, and nothing else;
-    one a container still uses is left and the build refused, naming it;
-    a namespace that cannot be listed refuses too. Falsified (2026-11-03):
+    one a container still uses is left and the build refused, naming it,
+    the container that holds it, its state and what ends it: `leerie stop`
+    for a running one, `nerdctl rm <id>` for one that no longer runs (its
+    client died, so its `--rm` never ran: review round 38, execution X1),
+    never `image rm`, which fails while a container holds the image; a
+    namespace that cannot be listed refuses too. Falsified (2026-11-03):
     the second listing dropped (the in-use case passes); `image rm -f`
-    (the stub refuses no forced removal, so the log shows it: fails)."""
+    (the stub refuses no forced removal, so the log shows it: fails); the
+    holders' listing dropped (the refusal names no container)."""
     images = tmp_path / "images"
     (tmp_path / "images.default").write_text(
         "leerie-repo/enricai-barnacle:0.43.0\n"
@@ -1531,7 +1602,10 @@ def test_leeries_old_repository_images_are_swept_from_the_workers(
         capture_output=True, text=True, timeout=60,
         env={"PATH": "/usr/bin:/bin", "NERDCTL_LOG": str(log),
              "IMAGES": str(images), "IN_USE": in_use,
-             "LIST_FAIL": list_fail})
+             "LIST_FAIL": list_fail,
+             "CONTAINERS": (f"0c1d2e3f4a5b|{in_use}|{holder}\n"
+                            "9a8b7c6d5e4f|my-company/app:1|Up 1 hour\n")
+             if in_use else ""})
     calls = log.read_text().splitlines()
     rms = [c for c in calls if " image rm " in f" {c} "]
     assert all(c.startswith("--namespace default ") for c in calls), calls
@@ -1550,11 +1624,106 @@ def test_leeries_old_repository_images_are_swept_from_the_workers(
     if refused:
         assert r.stdout.startswith("REFUSED ") and in_use in r.stdout, \
             r.stdout
-        assert "nerdctl --namespace default image rm" in r.stdout
+        assert "image rm" not in r.stdout, r.stdout
+        assert f"container 0c1d2e3f4a5b ({holder})" in r.stdout, r.stdout
+        assert "9a8b7c6d5e4f" not in r.stdout, r.stdout
+        if holder.startswith("Up"):
+            assert "end its run (leerie stop <run-id>)" in r.stdout
+        else:
+            assert ("remove it with: nerdctl --namespace default rm "
+                    "0c1d2e3f4a5b") in r.stdout, r.stdout
     else:
         assert r.stdout == "SWEPT\n", (r.stdout, r.stderr)
         assert not any(x.startswith(("leerie-repo/", "docker.io/leerie-repo/"))
                        for x in left), left
+
+
+@pytest.mark.parametrize("in_use", ["", "leerie-repo/enricai-barnacle:0.43.0"])
+def test_build_push_local_build_sweeps_before_it_builds(tmp_path, in_use):
+    """Review round 38, isolation X3: `build-push.sh --local-build` builds
+    the repository's own file too (the launcher's `_fly_push
+    --dockerfile`), so it runs `leerie_sweep_worker_images` after the
+    check, before its build: an unused `leerie-repo/…` image an earlier
+    leerie left where the worker reads is removed first, and one a
+    container still uses refuses the build, naming it, with no build run.
+    Falsified live (2026-11-03): the sweep's call removed from
+    build-push.sh (the unused image is still there at the build, and the
+    in-use case builds)."""
+    sd = tmp_path / "sweep-bin"
+    sd.mkdir()
+    stub = sd / "nerdctl"
+    stub.write_text("#!/bin/bash\n" + _SWEEP_NERDCTL
+                    + 'nerdctl "$@"; _rc=$?\n[ "$_rc" -eq 9 ] && exit 0\n'
+                      'exit "$_rc"\n')
+    stub.chmod(0o755)
+    images = tmp_path / "images"
+    (tmp_path / "images.default").write_text(
+        "leerie-repo/enricai-barnacle:0.43.0\nmy-company/app:1\n")
+    log = tmp_path / "sweep.log"
+    r = _build_push(tmp_path, "--app", "testapp", "--push", "--local-build",
+                    env_extra={"PATH": f"{sd}:{tmp_path}:/usr/bin:/bin",
+                               "NERDCTL_LOG": str(log), "IMAGES": str(images),
+                               "IN_USE": in_use, "LIST_FAIL": ""})
+    calls = log.read_text().splitlines()
+    builds = [i for i, c in enumerate(calls) if _is_build(c)]
+    rms = [i for i, c in enumerate(calls) if " image rm " in f" {c} "]
+    assert rms, calls
+    if in_use:
+        assert r.returncode == 1, (r.stdout, r.stderr)
+        assert in_use in r.stderr and "build-push: " in r.stderr, r.stderr
+        assert builds == [], calls
+    else:
+        assert r.returncode == 0, r.stderr
+        assert len(builds) == 1 and max(rms) < builds[0], calls
+        left = (tmp_path / "images.default").read_text().split()
+        assert left == ["my-company/app:1"], left
+
+
+@pytest.mark.skipif(sys.platform == "darwin" or os.geteuid() == 0,
+                    reason="reads the rootless user's containerd config")
+@pytest.mark.parametrize("config,isolated", [
+    (None, False),
+    ("", False),
+    ("version = 2\n", False),
+    ('[plugins."io.containerd.metadata.v1.bolt"]\n'
+     '  content_sharing_policy = "shared"\n', False),
+    ('[plugins."io.containerd.metadata.v1.bolt"]\n'
+     '  # content_sharing_policy = "isolated"\n', False),
+    ('version = 2\n\n[plugins."io.containerd.metadata.v1.bolt"]\n'
+     '  content_sharing_policy = "isolated"\n', True),
+    ("version = 3\n[plugins.'io.containerd.metadata.v1.bolt']\n"
+     "    content_sharing_policy = 'isolated'", True),
+])
+def test_a_shared_content_store_is_warned_of_before_a_build(
+        tmp_path, config, isolated):
+    """Review round 38, isolation X2: `leerie_content_sharing_check` reads
+    the rootless containerd's config and passes only when it sets
+    `content_sharing_policy` to "isolated" (either quoting, as containerd
+    writes v2 and v3); otherwise its hint names the file, the lines and the
+    restart, and that the restart stops every running container (the
+    launcher's warning, run, is in test_image_steps_run_once.py).
+    Falsified live (2026-11-03): the check made to return 0 always (every
+    non-isolated case fails)."""
+    xdg = tmp_path / "xdg"
+    if config is not None:
+        (xdg / "containerd").mkdir(parents=True)
+        (xdg / "containerd" / "config.toml").write_text(config)
+    r = subprocess.run(
+        ["bash", "-c", FRONTEND_SH_SOURCE
+         + 'if leerie_content_sharing_check; then echo PASS; '
+           'else echo "HINT $LEERIE_CONTENT_SHARING_HINT"; fi\n'],
+        capture_output=True, text=True, timeout=60,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+             "XDG_CONFIG_HOME": str(xdg)})
+    if isolated:
+        assert r.stdout == "PASS\n", (r.stdout, r.stderr)
+        return
+    hint = r.stdout
+    assert hint.startswith("HINT containerd shares stored content"), hint
+    assert f"{xdg}/containerd/config.toml" in hint
+    assert 'content_sharing_policy = \"isolated\"' in hint
+    assert "systemctl --user restart containerd (it stops every running " \
+           "container)" in hint
 
 
 def test_a_runs_container_is_found_in_leeries_namespace_then_default(
@@ -1578,6 +1747,47 @@ def test_a_runs_container_is_found_in_leeries_namespace_then_default(
         assert r.stdout == want, (holder, r.stdout, r.stderr)
         assert log.read_text().splitlines()[0] == \
             "--namespace leerie inspect run-1"
+
+
+@pytest.mark.parametrize("verb", [["stop"], ["kill", "--force"]])
+def test_stop_and_kill_remove_the_container_they_end(tmp_path, verb):
+    """Review round 38, execution X1: `--rm` is the nerdctl client's, so a
+    container whose client died stays Exited after `nerdctl stop`/`kill`
+    and holds its image for good (measured). The real launcher's local
+    `stop` and `kill`, against a builtins-only `nerdctl`, follow the stop or
+    kill with `nerdctl rm -f` of the same container, in the namespace it
+    was found in. Falsified live (2026-11-03): the `rm` dropped from either
+    (no rm in the log)."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "nerdctl.log"
+    stub = bindir / "nerdctl"
+    stub.write_text("#!/bin/bash\n"
+                    f'printf \'%s\\n\' "$*" >> "{log}"\n'
+                    '[ "$1 $2 $3" = "--namespace default inspect" ] && exit 0\n'
+                    '[ "$3" = inspect ] && exit 1\n'
+                    "exit 0\n")
+    stub.chmod(0o755)
+    state = tmp_path / "state"
+    # Not UUID-shaped: a UUID is taken as a chain or group id first.
+    run = "run-x1"
+    (state / "runs" / run).mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git_out(repo, "init", "-q")
+    r = subprocess.run(
+        [str(LAUNCHER), *verb, run, "--runtime", "local"],
+        capture_output=True, text=True, timeout=120, cwd=repo,
+        env={"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(home),
+             "LEERIE_STATE_DIR": str(state),
+             "LEERIE_HOST_DIR": str(tmp_path / "host")})
+    calls = log.read_text().splitlines() if log.exists() else []
+    end = "stop" if verb[0] == "stop" else "kill"
+    i = calls.index(f"--namespace default {end} {run}")
+    assert f"--namespace default rm -f {run}" in calls[i + 1:], \
+        (calls, r.stdout, r.stderr)
 
 
 # --- the real builds (opt-in), on a BuildKit of the test's own ---------------
@@ -2254,6 +2464,101 @@ def test_a_repositorys_build_pulls_with_no_operator_credential(
         srv.wait(timeout=30)
 
 
+# A Docker credential helper standing for the operator's
+# `docker-credential-secretservice` (golang-docker-credential-helpers),
+# which `docker login` fills: builtins only, no PATH program. It logs each
+# call and answers a `get` for the test's registry with the operator's
+# credential, any other host with "not found", as the real one does.
+_CRED_HELPER = r'''#!/bin/bash
+read -r _url
+printf '%s %s\n' "$1" "$_url" >> "@LOG@"
+case "$1:$_url" in
+  get:@REG@|get:http://@REG@|get:https://@REG@) printf '{"ServerURL":"%s","Username":"operator","Secret":"s3cret-pw"}\n' "$_url" ;;
+  get:*) printf 'credentials not found in native keychain\n'; exit 1 ;;
+  *) exit 1 ;;
+esac
+'''
+
+
+@_real
+def test_a_repositorys_build_asks_no_credential_helper_and_reads_no_env(
+        buildkit, tmp_path):
+    """Review round 38, isolation X1, made from its proof: buildctl takes
+    the platform's default credential helper from PATH when its Docker
+    config names no auth entry, store or helper, and reads
+    DOCKER_AUTH_CONFIG before any file. With a fake
+    `docker-credential-secretservice` on PATH holding the operator's login
+    (the operator's config `{"credsStore":"secretservice"}`), and then with
+    the credential in DOCKER_AUTH_CONFIG, an attacking repository's
+    Dockerfile names a private image of the operator's registry: through
+    `build_repo_image` both fail with 401, and the helper is never asked.
+    Control: the same Dockerfile built directly, with an empty Docker
+    config and the helper on PATH, reads the private file and the helper
+    is asked. Falsified live (2026-11-03): with `build_repo_image`'s config
+    left empty (no config.json) the helper case read the file; with
+    `DOCKER_AUTH_CONFIG=''` dropped from its first build the env case
+    did."""
+    secret = f"V-PRIVATE-{secrets.token_hex(6)}"
+    portfile = tmp_path / "port"
+    srv = subprocess.Popen(
+        [_SETUPTOOL, "nsenter", "--", sys.executable, "-I", "-c",
+         _AUTH_REGISTRY, str(portfile), "operator", "s3cret-pw", secret],
+        start_new_session=True, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 30
+        while not portfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert portfile.exists(), srv.stderr.read() if srv.poll() is not None \
+            else "the registry did not start"
+        reg = f"127.0.0.1:{portfile.read_text()}"
+        hdir = tmp_path / "helper-bin"
+        hdir.mkdir()
+        log = tmp_path / "helper.log"
+        helper = hdir / "docker-credential-secretservice"
+        helper.write_text(_CRED_HELPER.replace("@LOG@", str(log))
+                          .replace("@REG@", reg))
+        helper.chmod(0o755)
+        path = f"{hdir}:{os.environ['PATH']}"
+        op = tmp_path / "operator-docker"
+        op.mkdir()
+        (op / "config.json").write_text('{"credsStore":"secretservice"}')
+        df = (f"ARG BASE_IMAGE\nFROM {reg}/victim/app:leerie-repo AS v\n"
+              "FROM $BASE_IMAGE\nCOPY --from=v /srv/private.txt /loot\n")
+        cases = {
+            "helper": {"DOCKER_CONFIG": str(op), "PATH": path},
+            "env": {"DOCKER_AUTH_CONFIG": json.dumps({"auths": {reg: {
+                "auth": base64.b64encode(b"operator:s3cret-pw").decode()}}})},
+        }
+        for name, env in cases.items():
+            log.unlink(missing_ok=True)
+            a = _one_file_repo(tmp_path / f"a-{name}", df)
+            err = _real_repo_build_end(_real_repo_build_start(
+                buildkit, a, tmp_path / f"s-{name}", f"leerie-test-x1:{name}",
+                **env), ok=False)
+            assert "401" in err or "nauthorized" in err, (name, err[-3000:])
+            assert not log.exists(), (name, log.read_text())
+        # The control: the helper on PATH, an empty Docker config, built
+        # directly.
+        empty = tmp_path / "empty-docker"
+        empty.mkdir()
+        ctx = tmp_path / "ctx"
+        ctx.mkdir()
+        (ctx / "Dockerfile").write_text(df)
+        ctl = subprocess.run(
+            [*buildkit["rc"], "build", "--buildkit-host", buildkit["host"],
+             "--no-cache", "--build-arg", "BASE_IMAGE=leerie-test-base:1",
+             "-t", "leerie-test-x1:ctl", str(ctx)],
+            capture_output=True, text=True, timeout=900,
+            env={**os.environ, "DOCKER_CONFIG": str(empty), "PATH": path})
+        assert ctl.returncode == 0, ctl.stderr[-3000:]
+        assert _cat(buildkit, "leerie-test-x1:ctl", "/loot") == secret + "\n"
+        assert f"get {reg}" in log.read_text()
+    finally:
+        os.killpg(srv.pid, signal.SIGTERM)
+        srv.wait(timeout=30)
+
+
 def _cache_mount_records(bk: dict) -> list[str]:
     out = subprocess.run(
         [shutil.which("buildctl") or "buildctl", "--addr", bk["host"], "du",
@@ -2278,3 +2583,83 @@ def test_a_repository_build_leaves_no_cache_mount_record(buildkit, tmp_path):
         "target=/c dd if=/dev/zero of=/c/f bs=1M count=20\n"))
     _real_repo_build(buildkit, a, tmp_path / "s", "leerie-test-e4:a")
     assert sorted(_cache_mount_records(buildkit)) == sorted(before)
+
+
+_CONTAINERD = shutil.which("containerd")
+_CTR = shutil.which("ctr")
+
+
+def _private_containerd_ingest(tmp_path: Path, name: str,
+                               policy_file: str | None) -> tuple[int, int]:
+    """A containerd of the test's own (its own config, root, state and
+    socket under `tmp_path`, in the rootless user's RootlessKit namespace,
+    never the operator's daemon), its config the installer's lines when
+    `policy_file` is given. A blob is ingested in one namespace, then by its
+    digest alone, with no body, in another. Returns both statuses."""
+    d = tmp_path / name
+    d.mkdir()
+    sock = d / "c.sock"
+    (d / "config.toml").write_text(
+        f'version = 2\nroot = "{d}/root"\nstate = "{d}/state"\n'
+        'disabled_plugins = ["io.containerd.grpc.v1.cri", '
+        '"io.containerd.nri.v1.nri"]\n'
+        f'[grpc]\n  address = "{sock}"\n[ttrpc]\n  address = "{sock}.ttrpc"\n'
+        + ("\n" + policy_file.split("\n", 1)[1] if policy_file else ""))
+    p = subprocess.Popen([_SETUPTOOL, "nsenter", "--", _CONTAINERD,
+                          "--config", str(d / "config.toml")],
+                         start_new_session=True, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 60
+        while not sock.exists() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert sock.exists(), "the test's containerd did not start"
+        blob = secrets.token_bytes(64)
+        dg = "sha256:" + hashlib.sha256(blob).hexdigest()
+        ctr = [_CTR, "--address", str(sock)]
+        args = ["content", "ingest", "--expected-digest", dg,
+                "--expected-size", "64"]
+        a = subprocess.run([*ctr, "-n", "leerie", *args, "a"], input=blob,
+                           capture_output=True, timeout=60)
+        empty = d / "empty"
+        empty.write_bytes(b"")
+        with empty.open("rb") as f:
+            b = subprocess.run([*ctr, "-n", "worker", *args, "b"], stdin=f,
+                               capture_output=True, timeout=60)
+        return a.returncode, b.returncode
+    finally:
+        os.killpg(p.pid, signal.SIGTERM)
+        try:
+            p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait(timeout=30)
+        # The root is owned by the namespace's root; remove it from there.
+        subprocess.run([_SETUPTOOL, "nsenter", "--", "/bin/rm", "-rf",
+                        str(d)], capture_output=True, timeout=120)
+
+
+@_real
+@pytest.mark.skipif(not (_CONTAINERD and _CTR), reason="needs containerd "
+                    "and ctr")
+def test_the_installers_containerd_config_shares_no_content(tmp_path):
+    """Review round 38, isolation X2: containerd's default
+    `content_sharing_policy = "shared"` gives a namespace's ingest a blob
+    another namespace holds, by its digest alone (a build then read
+    another repository's image by `FROM <registry>/x@<digest>`, its
+    registry serving no body). On a containerd of the test's own, with the
+    lines `_runtime_linux_containerd_config` writes, an ingest by digest
+    with no body in another namespace fails; with containerd's default
+    config (the control) it succeeds. Falsified live (2026-11-03): the
+    policy line dropped from the installer (the ingest succeeds)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    subprocess.run(
+        ["bash", "-c", f'. "{REPO_ROOT}/scripts/runtime-install.sh"\n'
+         "_runtime_linux_containerd_config\n"],
+        check=True, capture_output=True, timeout=60,
+        env={"DRY_RUN": "false", "PATH": "/usr/bin:/bin", "HOME": str(home)})
+    installed = (home / ".config" / "containerd" / "config.toml").read_text()
+    a, b = _private_containerd_ingest(tmp_path, "isolated", installed)
+    assert a == 0 and b != 0, (a, b)
+    assert _private_containerd_ingest(tmp_path, "default", None) == (0, 0)

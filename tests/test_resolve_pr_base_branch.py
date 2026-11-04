@@ -161,7 +161,11 @@ class TestArgparseFlagWired:
     exactly like --pr-template is threaded through resolve_pr_template()."""
 
     def _main_source(self, leerie) -> str:
-        return inspect.getsource(leerie.main)
+        # main builds its parser with _leerie_arg_parser() before it resolves
+        # anything, so the parser's text comes first.
+        assert "_leerie_arg_parser()" in inspect.getsource(leerie.main)
+        return (inspect.getsource(leerie._leerie_arg_parser)
+                + inspect.getsource(leerie.main))
 
     def test_flag_registered(self, leerie):
         src = self._main_source(leerie)

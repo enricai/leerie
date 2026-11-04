@@ -1145,7 +1145,7 @@ def test_measure_axes_defers_at_the_baseline_and_flags_a_gap(
     assert res["tests"]["skip_kind"] == "forbidden_no_coupled_tests"
     (entry,) = st.data["needs_human_verification"]
     assert entry["source"] == "regression_check"
-    lines = leerie._pr_needs_human(st.data, lambda _s: True)
+    lines = leerie._pr_not_verified(st.data, lambda _s: True)
     assert any("pnpm run test" in ln for ln in
                lines["Regression checks the run could not settle"])
     # The same state on a tree the replacement does measure clears it.

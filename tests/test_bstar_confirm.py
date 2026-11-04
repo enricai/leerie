@@ -888,7 +888,7 @@ def test_intermittent_regression_is_found_typed_and_never_counted(
     sec = leerie._intermittent_regression_evidence_section(
         leerie._intermittent_regression_rows(st.data))
     assert INTERMITTENT in sec and TIMEOUT_SHAPED not in sec
-    groups = leerie._pr_needs_human(st.data, lambda _s: True)
+    groups = leerie._pr_not_verified(st.data, lambda _s: True)
     (line,) = groups["Intermittent failures the run may have introduced"]
     assert "test_intermittent" in line and "`app/core.py`" in line
 

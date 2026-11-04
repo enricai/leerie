@@ -226,8 +226,9 @@ def _ext(detail, addressed=False, **kw):
 
 
 def test_pr_section_routes_register_entries_by_gap(leerie):
-    """Only typed external entries (and simulated interleavings) reach the
-    PR, under "Needs human verification" grouped by resource; an addressed
+    """Only typed external entries reach "Needs human verification", grouped
+    by resource; a simulated interleaving with no resource is listed under
+    "Not verified by this run"; an addressed
     entry, a `test_missing` gap and a `none` entry stay in state only. The
     retired dump rendered all four verbatim."""
     state = {"risk_register": {"feat-x": [
@@ -250,8 +251,14 @@ def test_pr_section_routes_register_entries_by_gap(leerie):
     assert "## Needs human verification" in sec
     assert ("**the provider's live API**\n- [ ] **feat-x**: matches the "
             "provider's error-message wording (`app/services/x.rb`)") in sec
-    assert ("**A real concurrent engine**\n- [ ] **feat-x**: two writers "
-            "race — tests simulate the interleaving") in sec
+    # Names no resource: a limit on what the run measured, not a human
+    # check (DESIGN §6 *Only a typed external resource reaches "Needs
+    # human verification"*).
+    nhv = sec.split("## Needs human verification", 1)[1].split("\n## ")[0]
+    assert "two writers race" not in nhv
+    assert ("## Not verified by this run" in sec
+            and "**Concurrency the tests only simulate**\n- [ ] **feat-x**: "
+            "two writers race — tests simulate the interleaving") in sec
     for gone in ("already mitigated", "no test for the parser",
                  "informational note"):
         assert gone not in sec

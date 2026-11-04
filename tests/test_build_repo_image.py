@@ -104,19 +104,21 @@ nerdctl() {{
       return 0
       ;;
     build)
-      # What the build's Docker config is: its path, mode, and whether it
-      # holds anything (builtins and absolute paths only).
+      # What the build's Docker credentials are: the config's path, its
+      # mode, the names it holds and config.json's text, and
+      # DOCKER_AUTH_CONFIG (builtins and absolute paths only).
       {{
         printf 'DOCKER_CONFIG=%s' "${{DOCKER_CONFIG-unset}}"
         if [ -n "${{DOCKER_CONFIG:-}}" ] && [ -d "$DOCKER_CONFIG" ]; then
-          printf ' mode=%s' "$(/usr/bin/stat -c %a "$DOCKER_CONFIG")"
-          if compgen -G "$DOCKER_CONFIG/*" >/dev/null \
-             || compgen -G "$DOCKER_CONFIG/.[!.]*" >/dev/null; then
-            printf ' nonempty'
-          else
-            printf ' empty'
-          fi
+          printf ' mode=%s files=' "$(/usr/bin/stat -c %a "$DOCKER_CONFIG")"
+          local _e
+          for _e in "$DOCKER_CONFIG"/* "$DOCKER_CONFIG"/.[!.]*; do
+            [ -e "$_e" ] && printf '%s,' "${{_e##*/}}"
+          done
+          [ -f "$DOCKER_CONFIG/config.json" ] \
+            && printf ' config.json=%s' "$(< "$DOCKER_CONFIG/config.json")"
         fi
+        printf ' DOCKER_AUTH_CONFIG=%s' "${{DOCKER_AUTH_CONFIG-unset}}"
         echo
       }} >> "$NERDCTL_LOG.env"
       # NERDCTL_FAIL_LANG_LAYER: a build whose -f file holds a language-dep
@@ -166,7 +168,7 @@ def _run_harness(
     """Run the per-repo image block from the real launcher + `body` in a bash subprocess."""
     launcher = _launcher_text()
     marker_start = "# --- per-repo derived image (local nerdctl) "
-    marker_end = "\n# --- translate --inspect-dir paths"
+    marker_end = "\n# --- assemble auth/config mounts"
     block = _extract_block(launcher, marker_start, marker_end)
 
     if env and env.get("USER_REPO"):
@@ -219,8 +221,10 @@ def test_build_repo_image_argv_contains_required_flags(tmp_path):
             "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
             "LEERIE_VERSION": "1.2.3",
             "IMAGE_TAG": "leerie:1.2.3",
-            # The operator's Docker config, which no repository build reads.
+            # The operator's Docker config and DOCKER_AUTH_CONFIG, which no
+            # repository build reads.
             "DOCKER_CONFIG": str(operator_cfg),
+            "DOCKER_AUTH_CONFIG": '{"auths":{"r.example":{"auth":"eDp5"}}}',
         },
     )
     assert result.returncode == 0, result.stderr
@@ -264,11 +268,15 @@ def test_build_repo_image_argv_contains_required_flags(tmp_path):
     # build consumes what another build left in BuildKit*)...
     for b in (first, second):
         assert b.startswith("--namespace leerie build --buildkit-host unix://"), b
-    # ...and with an empty, 0700 Docker config of leerie's own in the build
-    # directory, never the operator's (DESIGN §6 *A repository's build
-    # carries no operator credential*).
+    # ...and with a 0700 Docker config of leerie's own in the build
+    # directory, never the operator's, whose one file names one auth entry
+    # with no credential (so buildctl looks for no default credential helper
+    # on PATH), and DOCKER_AUTH_CONFIG empty, though the operator's is set
+    # (DESIGN §6 *A repository's build carries no operator credential*).
     envs = (tmp_path / "nerdctl.log.env").read_text().splitlines()
-    assert envs == [f"DOCKER_CONFIG={d}/registry-auth mode=700 empty"] * 2, envs
+    assert envs == [f"DOCKER_CONFIG={d}/registry-auth mode=700 "
+                    'files=config.json, config.json={"auths":'
+                    '{"leerie.invalid":{}}} DOCKER_AUTH_CONFIG='] * 2, envs
     # And the build directory is gone afterwards.
     assert not list((state_dir / ".image-build").glob("b.*"))
 
@@ -312,10 +320,11 @@ def test_base_copied_into_the_workers_namespace_before_build(tmp_path):
 
     log_content = (tmp_path / "nerdctl.log").read_text()
     lines = log_content.splitlines()
-    # The copy path: `--namespace leerie save -o <tmpfile> leerie:1.2.3` and
-    # a `--namespace default load -i <tmpfile>`.
-    assert any(l.startswith("--namespace leerie save ") and l.endswith(" leerie:1.2.3") for l in lines), log_content
-    assert any(l.startswith("--namespace default load -i ") for l in lines), log_content
+    # The copy path, streamed: `--namespace leerie save leerie:1.2.3` into
+    # `--namespace default load`, through no file (DESIGN §6 *A host-wide
+    # image step runs once, under a host lock*).
+    assert "--namespace leerie save leerie:1.2.3" in lines, log_content
+    assert "--namespace default load" in lines, log_content
     # The probe is `--namespace default image inspect -f {{.Id}} leerie:1.2.3`.
     assert any(l.startswith("--namespace default image inspect ")
                and l.endswith(" leerie:1.2.3") for l in lines), log_content
@@ -386,7 +395,7 @@ def test_base_copied_again_when_the_workers_copy_is_another_image(tmp_path):
     assert result.returncode == 0, result.stderr
     lines = (tmp_path / "nerdctl.log").read_text().splitlines()
     assert any(l.startswith("--namespace leerie save ") for l in lines), lines
-    assert any(l.startswith("--namespace default load -i ") for l in lines), lines
+    assert "--namespace default load" in lines, lines
 
 
 @pytest.mark.parametrize("in_use", ["", "leerie-repo/enricai-barnacle:0.43.0"])
@@ -424,7 +433,7 @@ def test_old_repository_images_are_swept_before_a_build(tmp_path, in_use):
     builds = [l for l in lines if l.startswith("--namespace leerie build ")]
     if in_use:
         assert result.returncode == 1, result.stderr
-        assert in_use in result.stderr and "still uses" in result.stderr, result.stderr
+        assert in_use in result.stderr and "still holds an image" in result.stderr, result.stderr
         assert builds == [], lines
     else:
         assert result.returncode == 0, result.stderr
@@ -997,20 +1006,26 @@ def test_a_language_layer_that_does_not_build_falls_back_once(tmp_path):
 
 
 
-def test_save_load_uses_tempfile_and_logs_stderr_on_failure(tmp_path):
-    """ensure_base_in_worker_ns must save/load through temp files (not a
-    bare `nerdctl save | nerdctl load` pipe) so a failure's stderr survives,
-    and must log that captured stderr via remote_log on failure. Falsify by
-    reverting to the piped, stderr-discarding form."""
+@pytest.mark.parametrize("failing", ["save", "load"])
+def test_save_load_streams_and_logs_stderr_on_failure(tmp_path, failing):
+    """ensure_base_in_worker_ns streams `nerdctl save` into `nerdctl load`
+    through no file (DESIGN §6 *A host-wide image step runs once, under a
+    host lock*: five launches each wrote a 2.4 GB tarball to /tmp), and a
+    failure of either side is detected through `PIPESTATUS`, its stderr
+    logged via remote_log. Falsified live (2026-11-03): the status taken
+    from the pipeline alone, without `PIPESTATUS[0]` (a failed save passes
+    silently); the tempfile form restored (a file in `TMPDIR`)."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
     (leerie_dir / "Dockerfile").write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
 
-    # A nerdctl stub whose `save` subcommand prints a diagnostic to stderr
-    # and fails, simulating a real save failure.
+    # A nerdctl stub whose `save` or `load` prints a diagnostic to stderr
+    # and fails; `load` reads what it is given (builtins only).
     body = r"""
 nerdctl() {
   echo "$*" >> "$NERDCTL_LOG"
@@ -1019,7 +1034,14 @@ nerdctl() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     image) [ "$ns" = "default" ] && return 1; _stub_image_inspect "$@" && return 0; return "${NERDCTL_INSPECT_RC:-0}" ;;
-    save) echo "nerdctl-save-failure: disk quota exceeded" >&2; return 1 ;;
+    save)
+      [ "$FAILING" = save ] && { echo "nerdctl-save-failure: disk quota exceeded" >&2; return 1; }
+      echo "image-bytes"; return 0 ;;
+    load)
+      local _l
+      while IFS= read -r _l; do echo "$_l" >> "$NERDCTL_LOG.loaded"; done
+      [ "$FAILING" = load ] && { echo "nerdctl-load-failure: no space left" >&2; return 1; }
+      return 0 ;;
     build) return "${NERDCTL_BUILD_RC:-0}" ;;
     *) return 0 ;;
   esac
@@ -1036,21 +1058,24 @@ ensure_base_in_worker_ns
             "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
             "LEERIE_VERSION": "1.2.3",
             "IMAGE_TAG": "leerie:1.2.3",
+            "FAILING": failing,
+            "TMPDIR": str(tmpdir),
         },
     )
     assert result.returncode == 0, result.stderr
 
-    log_content = (tmp_path / "nerdctl.log").read_text()
-    # A file-based save is used (an `-o <path>` output flag), not a bare pipe.
-    save_lines = [l for l in log_content.splitlines() if l.startswith("--namespace leerie save ")]
-    assert save_lines, f"no save call found:\n{log_content}"
-    assert " -o " in save_lines[0], save_lines[0]
-    # load must never be reached — save failed, so the `&&` guard short-circuits.
-    assert not any(l.startswith("--namespace default load") or "load -i" in l
-                    for l in log_content.splitlines()), log_content
-
-    # The captured stderr diagnostic must be surfaced via remote_log.
-    assert "nerdctl-save-failure: disk quota exceeded" in result.stderr, result.stderr
+    lines = (tmp_path / "nerdctl.log").read_text().splitlines()
+    # Streamed: no `-o`/`-i` file argument, and nothing left in TMPDIR.
+    assert "--namespace leerie save leerie:1.2.3" in lines, lines
+    assert "--namespace default load" in lines, lines
+    assert not list(tmpdir.iterdir())
+    if failing == "load":
+        assert (tmp_path / "nerdctl.log.loaded").read_text() == "image-bytes\n"
+    diag = {"save": "nerdctl-save-failure: disk quota exceeded",
+            "load": "nerdctl-load-failure: no space left"}[failing]
+    assert "warning: could not copy base image into default" in result.stderr, \
+        result.stderr
+    assert diag in result.stderr, result.stderr
 # must point at /opt/bundle only when the Dockerfile actually baked there,
 # else keep the pre-existing cache-mount fallback path.
 # ---------------------------------------------------------------------------

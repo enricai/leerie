@@ -154,9 +154,40 @@ def test_measurements_open_pnpms_store_frozen_but_the_fetch_does_not(
     fetch = dict(leerie._measurement_grants(
         _state(run), view, leerie.STORE_FETCH_KIND).env)
     for spelling in ("npm_config_", "pnpm_config_"):
-        assert measure[spelling + "frozen_store"] == "true"
         assert measure[spelling + "verify_deps_before_run"] == "false"
         assert spelling + "frozen_store" not in fetch      # the one writer
+    # pnpm 11's setting, under pnpm 11's spelling only: no pnpm reads
+    # `npm_config_frozen_store`, and every npm warns `Unknown env config
+    # "frozen-store"` on it (DESIGN §6 *pnpm's settings are spelled for the
+    # pnpm that reads them*).
+    assert measure["pnpm_config_frozen_store"] == "true"
+    assert "npm_config_frozen_store" not in measure
+
+
+def test_every_npm_spelled_setting_is_one_npm_or_pnpm_10_reads(leerie, run):
+    """Every `npm_config_<k>` a measurement's environment carries is a key
+    npm knows or one pnpm 10 reads: npm warns, once per npm, on any other
+    (DESIGN §6 *pnpm's settings are spelled for the pnpm that reads
+    them*). `NPM_KNOWN` and `PNPM10` are what npm 11.19.1's definitions and
+    pnpm 10.4.1's/10.34.9's sources name (measured 2026-11-04)."""
+    npm_known = {"cache", "script_shell"}
+    pnpm10 = {"store_dir", "cache_dir", "package_import_method",
+              "verify_deps_before_run"}
+    view = run["wts"][f"{run['run_dir'].name}-view-staging"]
+    for kind in (leerie.MEASURE_KIND, leerie.INSTALL_KIND,
+                 leerie.STORE_FETCH_KIND):
+        # The orchestrator's own environment as `main()` makes it, then the
+        # tree's stores, an install's copy mode and the grant's variables.
+        env = {k: v for k, v in os.environ.items()
+               if not k.lower().startswith(("npm_config_", "pnpm_config_"))}
+        leerie._leerie_stores(env, run["run_dir"] / "state-root")
+        leerie._tree_store_env(env, view)
+        env.update(leerie._COPY_IMPORT_ENV)
+        env.update(dict(leerie._measurement_grants(_state(run), view,
+                                                   kind).env))
+        keys = {k[len("npm_config_"):] for k in env
+                if k.startswith("npm_config_")}
+        assert keys <= npm_known | pnpm10, (kind, keys - npm_known - pnpm10)
 
 
 def test_concurrent_fetches_get_their_own_stage_and_take_turns(

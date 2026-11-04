@@ -401,6 +401,29 @@ _runtime_linux_ensure_subid() {
   return 0
 }
 
+# containerd's own config for a fresh rootless install, written before the
+# setuptool first starts containerd: content_sharing_policy = "isolated",
+# so a blob one namespace holds is never handed to another namespace's
+# ingest by digest alone (DESIGN §6 *No build consumes what another build
+# left in BuildKit*, *The content store*). `version = 2` is read by
+# containerd 1.x and 2.x alike. An existing file is never edited, and
+# containerd is never restarted here: the launcher warns before a
+# repository build instead, naming the lines and the restart.
+_runtime_linux_containerd_config() {
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/containerd/config.toml"
+  if [ -e "$cfg" ]; then
+    return 0   # the operator's own — don't mutate
+  fi
+  _runtime_log "writing $cfg (content_sharing_policy = \"isolated\")"
+  if [ "$DRY_RUN" = "true" ]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$cfg")" || return 1
+  printf '%s\n' 'version = 2' '' \
+    '[plugins."io.containerd.metadata.v1.bolt"]' \
+    '  content_sharing_policy = "isolated"' > "$cfg"
+}
+
 # Run the rootless containerd setup as the invoking (non-root) user — the
 # setuptool installs a `systemctl --user` unit and must NOT run under sudo.
 # Then install the BuildKit containerd-worker (the variant leerie needs: its
@@ -417,6 +440,7 @@ _runtime_linux_rootless_setup() {
   # prepend both to be safe. Same inline-PATH technique the install.sh claude
   # re-verify uses. Scoped to this function via `local` so it doesn't leak.
   local PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+  _runtime_linux_containerd_config || return 1
   _runtime_log "setting up rootless containerd (containerd-rootless-setuptool.sh install)"
   _runtime_run containerd-rootless-setuptool.sh install || return 1
   _runtime_log "installing the rootless BuildKit containerd-worker"

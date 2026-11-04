@@ -209,7 +209,10 @@ def test_invoke_creates_the_cgroup_before_spawning_held(leerie, tmp_path,
     assert cmd[-3:] == ["claude", "-p", "x"]
     assert cmd[cmd.index("-c") + 1] == leerie._spawn_gate_src()
     gate_fd = int(cmd[cmd.index("-c") + 2])
-    assert spawned["pass_fds"] == (gate_fd,)
+    # The gate's descriptor, then the shim's refusal descriptor (DESIGN §6
+    # *A confinement failure stops the run; it is never a result*).
+    refusal_fd = int(cmd[cmd.index("--refusal-fd") + 1])
+    assert spawned["pass_fds"] == (gate_fd, refusal_fd)
 
 
 def test_invoke_without_caps_spawns_the_worker_directly(leerie, tmp_path,
@@ -230,8 +233,10 @@ def test_invoke_without_caps_spawns_the_worker_directly(leerie, tmp_path,
             grants=grants))
     # No spawn gate; the Landlock shim is the one wrapper (DESIGN §6 *A
     # worker writes only where it is granted*).
-    assert list(spawned["cmd"]) == leerie._confined_argv(
-        grants, ["claude", "-p", "x"])
+    cmd = list(spawned["cmd"])
+    assert cmd == leerie._confined_argv(
+        grants, ["claude", "-p", "x"],
+        refusal_fd=int(cmd[cmd.index("--refusal-fd") + 1]), cli=True)
 
 
 def test_invoke_spawn_failure_destroys_the_precreated_cgroup(

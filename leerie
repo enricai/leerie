@@ -126,14 +126,14 @@ LEERIE_VERSION="$(awk -F'"' '/"version"/ {print $4; exit}' \
                   "$LEERIE_REPO/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
 IMAGE_TAG="leerie:$LEERIE_VERSION"
 
-# The commit the launcher is actually running, recorded alongside the version.
-# plugin.json only moves on a `chore(release):` commit, while install.sh tracks
-# `main` (DEFAULT_REF), so every run between releases reports the same version
-# whether or not it carries a given fix — enough to look attributable, not
-# enough to attribute. Empty when $LEERIE_REPO is not a git checkout (a tarball
-# install), which is a normal state, never an error: `rev-parse` is local-only,
-# so this cannot hang, and a failure here must never fail a run.
-LEERIE_COMMIT="$(git -C "$LEERIE_REPO" rev-parse --short HEAD 2>/dev/null || true)"
+# LEERIE_COMMIT, the commit the launch runs, recorded alongside the version:
+# set by _snapshot_leerie_code below, from the one snapshot of the code the
+# launch runs (DESIGN §6 *A launch runs only the leerie code it started
+# with*), never read from the install separately. plugin.json only moves on a
+# `chore(release):` commit, while install.sh tracks `main` (DEFAULT_REF), so
+# every run between releases reports the same version whether or not it
+# carries a given fix. Empty for an install that is not a git checkout.
+LEERIE_COMMIT=""
 
 # --- fast paths that don't need the container ----------------------------
 # `leerie version` should answer immediately without spinning up a container
@@ -984,8 +984,12 @@ _reap_orphaned_container() {
   fi
   remote_log "resume: reaping orphaned container for run $run_id (owning launcher pid $owner_pid is dead)"
   nerdctl --namespace "$_cns" kill "$run_id" >/dev/null 2>&1 || true
-  # nerdctl --rm removes it on kill; give the kernel a moment to release the
-  # run-dir flock before the fresh orchestrator tries to acquire it.
+  # `--rm` is the nerdctl client's, and this container's client is dead (an
+  # OOM, typically), so nothing else removes it: left Exited, it would hold
+  # its image for good (review round 38, execution X1; measured).
+  nerdctl --namespace "$_cns" rm -f "$run_id" >/dev/null 2>&1 || true
+  # Give the kernel a moment to release the run-dir flock before the fresh
+  # orchestrator tries to acquire it.
   sleep 1
 }
 
@@ -3394,12 +3398,16 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     if [ "$_stop_runtime" = "local" ]; then
       # Local container: nerdctl stop sends SIGTERM (orchestrator saves
       # state via InterruptedBySignal handler) then SIGKILL after grace.
-      # --rm on the original nerdctl run auto-removes the container.
+      # --rm on the original nerdctl run removes the container only while
+      # its client lives; the `rm` below covers a client that died.
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/lib.sh"
       remote_log "stop: stopping local container $(_terminal_safe "$LEERIE_RUN_ID")..."
       _stop_cns="$(_container_ns "$_stop_run_id")" || _stop_cns="$LEERIE_IMAGE_NS"
       nerdctl --namespace "$_stop_cns" stop "$_stop_run_id" >/dev/null 2>&1 || true
+      # Its client's `--rm` removes it only while the client lives; a resume
+      # starts a new container, so the stopped one goes either way.
+      nerdctl --namespace "$_stop_cns" rm -f "$_stop_run_id" >/dev/null 2>&1 || true
       _ensure_run_json "$_stop_run_dir" || true
       update_run_json "$_stop_sidecar" \
         paused_at "$(iso_now)" \
@@ -3589,6 +3597,8 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       remote_log "kill: destroying local container $_kill_run_id"
       _kill_cns="$(_container_ns "$_kill_run_id")" || _kill_cns="$LEERIE_IMAGE_NS"
       nerdctl --namespace "$_kill_cns" kill "$_kill_run_id" >/dev/null 2>&1 || true
+      # As stop: `--rm` is the client's, and the client may be dead.
+      nerdctl --namespace "$_kill_cns" rm -f "$_kill_run_id" >/dev/null 2>&1 || true
       if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
         _ensure_run_json "$_kill_run_dir" || true
         _kill_sidecar="$_kill_run_dir/run.json"
@@ -6315,13 +6325,622 @@ if [ "$IS_RESUME" = "false" ] && [ "$_skip_freshness_check" = "false" ]; then
 fi
 unset _skip_freshness_check
 
-# --- build image if not present (one-time, ~60-120s) --------------------
+# The host-wide dir (build semaphore, DESIGN §6 *A host-wide build
+# semaphore*; the image lock, *A host-wide image step runs once, under a
+# host lock*) defaults to ~/.leerie/.host and must stay shared: the
+# semaphore bounds only the runs that mount the same dir. LEERIE_HOST_DIR
+# repoints it for an isolated run (a bench) that must never touch
+# ~/.leerie. Inside the container the same name means the mount point, set
+# after the LEERIE_* forward below, so this host value never leaks in.
+_leerie_host_dir="${LEERIE_HOST_DIR:-$HOME/.leerie/.host}"
+case "$_leerie_host_dir" in
+  "~")   _leerie_host_dir="$HOME" ;;
+  \~/*)  _leerie_host_dir="$HOME/${_leerie_host_dir#"~/"}" ;;
+esac
+case "$_leerie_host_dir" in
+  /*) ;;
+  *)
+    echo "leerie: error: LEERIE_HOST_DIR='$_leerie_host_dir' is not an absolute path" >&2
+    exit 1
+    ;;
+esac
+# The lock every host-wide image step takes (leerie_lock): leerie's base
+# build, and the copy and pull into BuildKit's worker namespace.
+_leerie_image_lock="$_leerie_host_dir/image.lock"
+
+# Resolve skip_repo_map preference.
+# Precedence: LEERIE_SKIP_REPO_MAP env > skip_repo_map in leerie.toml > false.
+# Used by the launcher to inject --skip-repo-map into REWRITTEN_ARGS when the
+# user has not passed the flag explicitly (e.g. on Fly runs where leerie.toml
+# is on the host but not on the machine). Python-side resolve_skip_repo_map()
+# provides the authoritative resolution inside the orchestrator; this block
+# ensures the flag propagates correctly on Fly.
+_SKIP_REPO_MAP=false
+if [ -n "${LEERIE_SKIP_REPO_MAP:-}" ]; then
+  case "${LEERIE_SKIP_REPO_MAP}" in
+    0|false|no) _SKIP_REPO_MAP=false ;;
+    1|true|yes)  _SKIP_REPO_MAP=true ;;
+  esac
+elif [ -f "$USER_REPO/leerie.toml" ]; then
+  _srm_toml="$( { grep -E '^[[:space:]]*skip_repo_map[[:space:]]*=' \
+                      "$USER_REPO/leerie.toml" 2>/dev/null \
+                  | sed -n 1p \
+                  | sed -E 's/^[[:space:]]*skip_repo_map[[:space:]]*=[[:space:]]*//;
+                            s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
+  case "${_srm_toml:-}" in
+    0|false|no) _SKIP_REPO_MAP=false ;;
+    1|true|yes)  _SKIP_REPO_MAP=true ;;
+  esac
+  unset _srm_toml
+fi
+
+
+# --- translate --inspect-dir paths into bind-mounts ---------------------
+# Each --inspect-dir path points at a host-absolute directory the
+# inspect-bucket workers need read access to (--add-dir under the hood).
+# Bind-mount each one read-only at /inspect/<basename> and rewrite the arg
+# so the in-container view matches. Paths from LEERIE_INSPECT_DIRS (colon-sep)
+# need the same treatment — we resolve them on the host and emit
+# --inspect-dir CLI flags. (leerie.toml has no inspect_dirs key: a host
+# directory to mount comes only from the operator.) LEERIE_INSPECT_DIRS
+# is cleared inside the container so resolve_inspect_dirs() picks up only
+# our rewritten CLI flags.
+INSPECT_MOUNTS=()
+REWRITTEN_ARGS=()
+REWRITTEN_TAIL=()
+INSPECT_NAMES=()
+# Parallel to INSPECT_MOUNTS: pairs of "<host-path>\t<remote-target>" used by
+# the remote (Fly) runtime to rsync each inspect dir to /inspect/<basename>
+# on the machine. The local runtime ignores this — it uses INSPECT_MOUNTS
+# directly. Populated only for inspect dirs OUTSIDE $USER_REPO; in-repo
+# inspect dirs (the skip-redundant-mount branch in collect_inspect_path)
+# arrive on the machine via seed_repo at /work/<subpath> and need no
+# separate transport. See docs/IMPLEMENTATION.md §0.5 "Remote runtime
+# (Fly.io) transport".
+INSPECT_HOST_TARGETS=()
+
+collect_inspect_path() {
+  local host_path expanded resolved base mount_target user_repo_resolved
+  host_path="$1"
+  # Expand leading ~ — `cd` won't on its own.
+  case "$host_path" in
+    "~")   expanded="$HOME" ;;
+    "~/"*) expanded="$HOME/${host_path#~/}" ;;
+    *)     expanded="$(_from_checkout "$host_path")" ;;
+  esac
+  resolved="$(cd -P "$expanded" 2>/dev/null && pwd)" || {
+    remote_log "--inspect-dir path not found: $host_path"
+    exit 1
+  }
+  # If the path is inside $USER_REPO it's already visible at /work/<sub>,
+  # so a second mount under /inspect/ would be redundant. Warn and skip.
+  user_repo_resolved="$(cd -P "$USER_REPO" && pwd)"
+  case "$resolved" in
+    "$user_repo_resolved"|"$user_repo_resolved"/*)
+      # Quote $user_repo_resolved inside ${...#...} so bash strips a literal
+      # prefix instead of treating the value as a glob pattern (shellcheck
+      # SC2295). Paths typically lack glob metachars, but the cost of
+      # defensiveness is one quote-pair.
+      local rel="${resolved#"$user_repo_resolved"}"
+      remote_log "--inspect-dir '$host_path' is inside the repo; skipping redundant mount"
+      REWRITTEN_ARGS+=(--inspect-dir "/work${rel}")
+      return 0
+      ;;
+  esac
+  base="$(basename "$resolved")"
+  # Disambiguate basename collisions (e.g. two paths both named "src") by
+  # appending a numeric suffix. Use [[ ]] for glob-style membership test;
+  # surround with spaces so adjacent words don't match a substring.
+  local existing=" ${INSPECT_NAMES[*]:-} "
+  local candidate="$base"
+  local i=2
+  while [[ "$existing" == *" $candidate "* ]]; do
+    candidate="$base-$i"
+    i=$((i + 1))
+  done
+  base="$candidate"
+  mount_target="/inspect/$base"
+  INSPECT_NAMES+=("$base")
+  INSPECT_MOUNTS+=(-v "$resolved:$mount_target:ro")
+  REWRITTEN_ARGS+=(--inspect-dir "$mount_target")
+  # Remote (Fly) runtime needs the host-path → /inspect/<basename> mapping to
+  # rsync each dir onto the machine. Tab separator is safe: POSIX paths
+  # cannot contain \t (they can contain `:` and ` `).
+  INSPECT_HOST_TARGETS+=("$resolved"$'\t'"$mount_target")
+}
+
+# Serialize INSPECT_HOST_TARGETS for the remote-runtime helper. Empty array
+# → empty env var → seed_inspect_dirs short-circuits. Newline-separated
+# records, each "<host>\t<remote>", matching the format seed_inspect_dirs
+# parses with `read -r`. See docs/IMPLEMENTATION.md §0.5 "Remote runtime
+# (Fly.io) transport".
+_serialize_inspect_host_targets() {
+  if [ "${#INSPECT_HOST_TARGETS[@]}" -eq 0 ]; then
+    LEERIE_INSPECT_HOST_TARGETS=""
+  else
+    LEERIE_INSPECT_HOST_TARGETS="$(printf '%s\n' "${INSPECT_HOST_TARGETS[@]}")"
+  fi
+  export LEERIE_INSPECT_HOST_TARGETS
+}
+
+# Pre-pass: LEERIE_INSPECT_DIRS env (colon-separated).
+if [ -n "${LEERIE_INSPECT_DIRS:-}" ]; then
+  OIFS="$IFS"; IFS=":"
+  for p in $LEERIE_INSPECT_DIRS; do
+    [ -z "$p" ] || collect_inspect_path "$p"
+  done
+  IFS="$OIFS"
+fi
+# Main pass: rewrite --inspect-dir in $@. The orchestrator's argparse
+# declares only --inspect-dir (no -i alias — see leerie.py:6079), so we
+# intercept exactly that one form and let everything else flow through.
+prev_was_inspect=false
+_prev_was_chain_id=false
+_prev_was_fly_app_rewrite=false
+_prev_was_state_dir_rewrite=false
+_prev_was_seed_knob=false
+_prev_was_ec2_knob=false
+_prev_was_aws_knob=false
+_prev_was_log_file_rewrite=false
+_rw_argi=0
+_rw_after_dd=false
+_prev_was_answers=false
+for arg in "$@"; do
+  _rw_argi=$((_rw_argi + 1))
+  # Everything after `--` is positional and goes to the orchestrator as it
+  # is, after every flag (REWRITTEN_TAIL); a flag the launcher adds below
+  # goes into REWRITTEN_ARGS, so it never lands after `--`.
+  if [ "$_rw_after_dd" = "true" ] || [ "$arg" = "--" ]; then
+    _rw_after_dd=true
+    if [ "$_rw_argi" -eq "$_task_argi" ] && [ -n "$_task_arg_for_container" ]; then
+      arg="$_task_arg_for_container"
+    fi
+    REWRITTEN_TAIL+=("$arg")
+    continue
+  fi
+  # A relative task file or --answers file is read in the container from
+  # /work, the repository's top level, not from where the operator stood.
+  if [ "$_rw_argi" -eq "$_task_argi" ] && [ -n "$_task_arg_for_container" ]; then
+    arg="$_task_arg_for_container"
+  fi
+  if [ "$_prev_was_answers" = "true" ]; then
+    _prev_was_answers=false
+    case "$arg" in
+      /*|"") ;;
+      *) [ -z "$OPERATOR_SUBDIR" ] || arg="$OPERATOR_SUBDIR/$arg" ;;
+    esac
+    REWRITTEN_ARGS+=("$arg")
+    continue
+  fi
+  # `resume` and `list` (and any positional run-id after `resume`) flow
+  # through untouched — orchestrator/leerie.py pops the bare verb itself,
+  # exactly like the launcher's own `case "${1:-}"` dispatch one level up,
+  # and takes `resume`'s positional run-id via `_extract_resume_run_id`
+  # BEFORE argparse runs.
+  #
+  # That last part was NOT true until 2026-08-05, and this comment used to
+  # assert "No rewrite needed" without it. The orchestrator popped only the
+  # verb, so a positional run-id bound to argparse's `task` positional,
+  # `--run-id` stayed None, and `resolve_run_id` AUTO-PICKED A DIFFERENT RUN
+  # — measured live against a running one, where only the flock prevented a
+  # duplicate orchestrator. Do not restore the shorter claim: forwarding
+  # untouched is correct only because the orchestrator now handles it.
+  if [ "$_prev_was_state_dir_rewrite" = "true" ]; then
+    _prev_was_state_dir_rewrite=false
+    continue
+  fi
+  if [ "$_prev_was_fly_app_rewrite" = "true" ]; then
+    _prev_was_fly_app_rewrite=false
+    continue
+  fi
+  if [ "$_prev_was_seed_knob" = "true" ]; then
+    # Consume the value of --seed-depth / --seed-shallow-threshold-mb.
+    _prev_was_seed_knob=false
+    continue
+  fi
+  if [ "$_prev_was_ec2_knob" = "true" ]; then
+    # Consume the value of --ec2-ami / --ec2-instance-type / --ec2-key-name /
+    # --ec2-security-group / --ec2-subnet-id / --ec2-instance-profile.
+    _prev_was_ec2_knob=false
+    continue
+  fi
+  if [ "$_prev_was_aws_knob" = "true" ]; then
+    # Consume the value of --aws-region / --aws-profile.
+    _prev_was_aws_knob=false
+    continue
+  fi
+  if [ "$_prev_was_log_file_rewrite" = "true" ]; then
+    # Consume the value of --log-file.
+    _prev_was_log_file_rewrite=false
+    continue
+  fi
+  if $prev_was_inspect; then
+    collect_inspect_path "$arg"
+    prev_was_inspect=false
+    continue
+  fi
+  # Consume the value of --chain-id (next arg after --chain-id <val>).
+  # The chain_id is a launcher-side tag written to run.json post-
+  # finalize by the wave loop; the orchestrator doesn't need to know it.
+  if $_prev_was_chain_id; then
+    _prev_was_chain_id=false
+    export LEERIE_CHAIN_ID="$arg"
+    continue
+  fi
+  case "$arg" in
+    --inspect-dir)
+      prev_was_inspect=true
+      ;;
+    --inspect-dir=*)
+      collect_inspect_path "${arg#--inspect-dir=}"
+      ;;
+    --chain-id)
+      _prev_was_chain_id=true
+      ;;
+    --answers)
+      _prev_was_answers=true
+      REWRITTEN_ARGS+=("$arg")
+      ;;
+    --answers=*)
+      _answers_val="${arg#--answers=}"
+      case "$_answers_val" in
+        /*|"") ;;
+        *) [ -z "$OPERATOR_SUBDIR" ] || _answers_val="$OPERATOR_SUBDIR/$_answers_val" ;;
+      esac
+      REWRITTEN_ARGS+=("--answers=$_answers_val")
+      unset _answers_val
+      ;;
+    --chain-id=*)
+      export LEERIE_CHAIN_ID="${arg#--chain-id=}"
+      ;;
+    --no-runtime-install)
+      # Launcher-only flag; consumed by the runtime preflight above.
+      # The orchestrator's argparse doesn't know it.
+      ;;
+    --no-auto-publish)
+      # Launcher-only flag; consumed by ensure_image() in the remote path.
+      ;;
+    --state-dir)
+      # Launcher-only flag; consumed by the state-dir resolver above.
+      _prev_was_state_dir_rewrite=true
+      ;;
+    --state-dir=*)
+      # Launcher-only flag (=form); consumed above.
+      ;;
+    --fly-app)
+      # Launcher-only flag; consumed by the LEERIE_FLY_APP resolver above.
+      _prev_was_fly_app_rewrite=true
+      ;;
+    --fly-app=*)
+      # Launcher-only flag (=form); consumed above.
+      ;;
+    --local-build)
+      # Launcher-only flag; consumed by ensure_image() to forward
+      # --local-build to build-push.sh (legacy local nerdctl/docker
+      # build instead of the default Fly remote builder).
+      ;;
+    --seed-depth|--seed-shallow-threshold-mb)
+      # Launcher-only flags (DESIGN §6 *Shallow seeding for heavy repos*);
+      # resolved into LEERIE_SEED_DEPTH / LEERIE_SEED_SHALLOW_THRESHOLD_MB
+      # above and consumed by seed-repo.sh. The orchestrator's argparse
+      # doesn't know them — strip both the flag and its value so they don't
+      # leak to parse_args() (which is strict, not parse_known_args).
+      _prev_was_seed_knob=true
+      ;;
+    --seed-depth=*|--seed-shallow-threshold-mb=*)
+      # =form; consumed above.
+      ;;
+    --ec2-ami|--ec2-instance-type|--ec2-key-name|--ec2-security-group|--ec2-subnet-id|--ec2-instance-profile)
+      # Launcher-only flags (EC2 instance-shape CLI tier); resolved into
+      # LEERIE_EC2_AMI / LEERIE_EC2_INSTANCE_TYPE / LEERIE_EC2_KEY_NAME /
+      # LEERIE_EC2_SECURITY_GROUP / LEERIE_EC2_SUBNET_ID above and consumed
+      # by ec2-lib.sh's resolve_*() functions. The orchestrator's argparse
+      # doesn't know them — strip both the flag and its value so they don't
+      # leak to parse_args() (which is strict, not parse_known_args).
+      _prev_was_ec2_knob=true
+      ;;
+    --ec2-ami=*|--ec2-instance-type=*|--ec2-key-name=*|--ec2-security-group=*|--ec2-subnet-id=*|--ec2-instance-profile=*)
+      # =form; consumed above.
+      ;;
+    --aws-region|--aws-profile)
+      # Launcher-only flags (leerie's own AWS region/profile knobs);
+      # resolved into LEERIE_AWS_REGION / LEERIE_AWS_PROFILE far above --
+      # above the verb dispatch, since accept-blocked/stop/kill/finalize
+      # consume them -- and read by ec2-lib.sh / ec2-ssm.sh /
+      # ec2-provision.sh host-side. The orchestrator runs inside the
+      # container and declares no such flags, so strip both the flag and
+      # its value; parse_args() is strict, not parse_known_args.
+      _prev_was_aws_knob=true
+      ;;
+    --aws-region=*|--aws-profile=*)
+      # =form; consumed above.
+      ;;
+    --log-file)
+      # Launcher-only flag (N5b); resolved into LEERIE_LOG_FILE_RESOLVED
+      # above. The orchestrator's argparse doesn't know it — strip both
+      # the flag and its value so they don't leak to parse_args() (which
+      # is strict, not parse_known_args).
+      _prev_was_log_file_rewrite=true
+      ;;
+    --log-file=*)
+      # =form; consumed above.
+      ;;
+    --no-re-seed)
+      # Launcher-only flag (Phase 4); consumed by the auto-re-seed-on-resume
+      # block. The orchestrator's argparse doesn't know it.
+      ;;
+    --force)
+      # Launcher-only flag (Phase 4); bypasses re_seed's safety check.
+      ;;
+    --shell)
+      # Launcher-only flag; opts into bash shell on the resume rc=75 pivot
+      # (DESIGN §6 *Smart resume in remote mode*). The orchestrator's
+      # argparse doesn't know it.
+      ;;
+    --auto-finalize)
+      # Launcher-only flag; triggers `leerie finalize` on clean exit via
+      # tail_with_optional_autofinalize. The orchestrator's argparse
+      # doesn't know it.
+      ;;
+    finalize|stop|kill|re-seed|accept-blocked|accept-integration|attach|chain|group|config|prune|status|version)
+      # Launcher-only verbs — normally dispatched at the top-level case
+      # (line ~945) when they appear as $1. If one appears here it was
+      # in a non-$1 position (e.g. `leerie <id> finalize --runtime fly`
+      # instead of `leerie finalize <id> --runtime fly`). Error instead
+      # of leaking to the orchestrator's argparse.
+      remote_log "error: '$arg' is a verb and must be the first argument."
+      remote_log "  Run: leerie $arg [args...]"
+      exit 1
+      ;;
+    resume|list)
+      # Unlike the other launcher verbs above, `resume` and `list` can
+      # legitimately reach this loop AT position 1 (their case arms fall
+      # through instead of exiting — see `resume)`'s non-UUID fallthrough
+      # and `list)`'s plain/failed-flyctl fallthrough) and orchestrator/
+      # leerie.py now understands the bare verb natively, so position 1
+      # must flow through to the orchestrator rather than error. A
+      # non-$1 occurrence is still a user error.
+      if [ "$_rw_argi" -eq 1 ]; then
+        REWRITTEN_ARGS+=("$arg")
+      else
+        remote_log "error: '$arg' is a verb and must be the first argument."
+        remote_log "  Run: leerie $arg [args...]"
+        exit 1
+      fi
+      ;;
+    *)
+      REWRITTEN_ARGS+=("$arg")
+      ;;
+  esac
+done
+
+# Inject --skip-repo-map when resolved from env/toml but not already on CLI.
+# Guards against double-injection (the user may have also passed it explicitly).
+if [ "$_SKIP_REPO_MAP" = "true" ]; then
+  _srm_already=false
+  for _srm_arg in ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}; do
+    [ "$_srm_arg" = "--skip-repo-map" ] && { _srm_already=true; break; }
+  done
+  unset _srm_arg
+  [ "$_srm_already" = "false" ] && REWRITTEN_ARGS+=("--skip-repo-map")
+  unset _srm_already
+fi
+unset _SKIP_REPO_MAP
+
+# The run's push choice, recorded once at its start (DESIGN §6 *One push
+# choice per run, on every runtime*). A fresh run hands the launcher's
+# resolved NO_PUSH to the orchestrator as --no-push on every runtime:
+# neither the container nor a remote machine sees LEERIE_NO_PUSH, and a
+# remote machine may not see an untracked leerie.toml. A resume adds
+# nothing: the orchestrator continues its record, and only this command
+# line's own --no-push / --push (already in REWRITTEN_ARGS) override it.
+if [ "$IS_RESUME" = "false" ] && [ "$NO_PUSH" = "true" ]; then
+  REWRITTEN_ARGS+=("--no-push")
+fi
+
+# --- the leerie code this launch runs ----------------------------------
+# _snapshot_leerie_code SRC DEST — the leerie code this launch runs (DESIGN §6
+# *A launch runs only the leerie code it started with*): the four directories
+# the image bakes, taken from the install into DEST once, before any image
+# step and before the command line is checked, which loads the snapshot's
+# orchestrator. The container mounts DEST at /opt/leerie-image in place of
+# the install. Sets LEERIE_COMMIT to what DEST holds. One snapshot of one
+# state of the install, by the install's shape:
+# - a git checkout (SRC/.git exists) with nothing changed in those
+#   directories: `git archive`
+#   of the commit HEAD names, read once; LEERIE_COMMIT is that commit. A
+#   checkout an update rewrites meanwhile cannot tear it: the commit's
+#   objects never change. Measured (review round 39, E3): `cp -pR` of the
+#   working tree while `git checkout` flipped it gave 147 of 300 copies a
+#   partial leerie.py, every one accepted.
+# - a git checkout with edits there (a contributor's): the edits run, as they
+#   always did on the next launch. They are hashed into a tree object through
+#   a private index, twice; the two must agree, no git command may hold the
+#   checkout's index lock before or after, and HEAD and the index's entries
+#   must be the same before and after (a checkout or pull rewrites them), or
+#   the checkout changed while it was read and the launch stops. That tree is archived, and
+#   LEERIE_COMMIT is `<HEAD>-dirty.<tree>`: the record names exactly the code
+#   that ran (`git archive <tree>` in that checkout gives it back).
+# - not a git checkout (a plugin directory installed without git): copied,
+#   then compared with the install as it stands after the copy (`diff -r`); a
+#   difference means the install changed under the copy, and the launch
+#   stops. LEERIE_COMMIT stays empty: there is no commit.
+# The snapshot's plugin.json version must be the launcher's, which names the
+# image: an install that changed version since the launcher started stops the
+# launch rather than run one version's code in another's image.
+_snapshot_leerie_code() {
+  local _src=$1 _dst=$2 _head _ref _short _tree _tree2 _idx _lock _git_state
+  local _d _v
+  local _dirs=(orchestrator scripts prompts .claude-plugin)
+  LEERIE_COMMIT=""
+  if [ -e "$_src/.git" ]; then
+    _head="$(git -C "$_src" rev-parse --verify -q 'HEAD^{commit}')" \
+      || _head=""
+    if [ -z "$_head" ]; then
+      remote_log "the leerie checkout at $_src has no commit to run; launch again"
+      return 1
+    fi
+    _ref=$_head
+    _short="$(git -C "$_src" rev-parse --short "$_head")" || return 1
+    if [ -n "$(git -C "$_src" --no-optional-locks status --porcelain \
+                 --untracked-files=all -- "${_dirs[@]}")" ]; then
+      _lock="$(git -C "$_src" rev-parse --path-format=absolute \
+                 --git-path index.lock)" || return 1
+      _idx="$(mktemp -d "$HOME/.cache/leerie/idx-$$-XXXXXX")" || return 1
+      _tree=""
+      _tree2=""
+      _git_state="$(_leerie_checkout_state "$_src" "${_dirs[@]}")" || _git_state=""
+      if [ -n "$_git_state" ] && [ ! -e "$_lock" ]; then
+        if ! _tree="$(_leerie_worktree_tree "$_src" "$_head" "$_idx/1" "${_dirs[@]}")" \
+            || ! _tree2="$(_leerie_worktree_tree "$_src" "$_head" "$_idx/2" "${_dirs[@]}")"; then
+          _tree=""
+        fi
+        if [ -e "$_lock" ] || [ "$_git_state" != \
+             "$(_leerie_checkout_state "$_src" "${_dirs[@]}")" ]; then
+          _tree=""
+        fi
+      fi
+      rm -rf "$_idx"
+      if [ -z "$_tree" ] || [ "$_tree" != "$_tree2" ]; then
+        remote_log "the leerie checkout at $_src changed while this launch read it; launch again"
+        return 1
+      fi
+      _ref=$_tree
+      LEERIE_COMMIT="$_short-dirty.${_tree:0:12}"
+    else
+      LEERIE_COMMIT=$_short
+    fi
+    git -C "$_src" archive --format=tar "$_ref" -- "${_dirs[@]}" \
+      | tar -xf - -C "$_dst" || return 1
+  else
+    for _d in "${_dirs[@]}"; do
+      cp -pR "$_src/$_d" "$_dst/$_d" || return 1
+    done
+    for _d in "${_dirs[@]}"; do
+      diff -r -q "$_src/$_d" "$_dst/$_d" >/dev/null 2>&1 || {
+        remote_log "the leerie install at $_src changed while this launch copied it; launch again"
+        return 1
+      }
+    done
+  fi
+  _v="$(awk -F'"' '/"version"/ {print $4; exit}' \
+        "$_dst/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
+  if [ "$_v" != "$LEERIE_VERSION" ]; then
+    remote_log "the leerie install at $_src changed version while this launch started ($LEERIE_VERSION, now $_v); launch again"
+    return 1
+  fi
+  return 0
+}
+# _leerie_checkout_state SRC DIR... — HEAD and the index's entries for DIR...:
+# a git command that changed the checkout while it was read (a checkout, a
+# pull) changes one of them by the time it releases the index lock.
+_leerie_checkout_state() {
+  local _src=$1
+  shift
+  git -C "$_src" rev-parse --verify -q HEAD \
+    && git -C "$_src" ls-files -s -- "$@"
+}
+# _leerie_worktree_tree SRC HEAD INDEX DIR... — the tree object of HEAD with
+# DIR... as they stand in SRC's working tree, built through the private index
+# INDEX, never SRC's own; prints its id.
+_leerie_worktree_tree() {
+  local _src=$1 _head=$2 _index=$3
+  shift 3
+  GIT_INDEX_FILE="$_index" git -C "$_src" read-tree "$_head" \
+    && GIT_INDEX_FILE="$_index" git -C "$_src" add -A -- "$@" \
+    && GIT_INDEX_FILE="$_index" git -C "$_src" write-tree
+}
+# The snapshot lives in a directory of its own until $STAGE exists, which it
+# then moves into; removed by every exit before that (the EXIT traps up to
+# $STAGE's remove it), and by the next launch's sweep of stale stages when a
+# SIGKILL leaves it (cfg-<launcher pid>-…).
+_code_snapshot_done() {
+  [ -z "${_code_snapshot:-}" ] || rm -rf "$_code_snapshot"
+  _code_snapshot=""
+}
+mkdir -p "$HOME/.cache/leerie"
+_code_snapshot="$(mktemp -d "$HOME/.cache/leerie/cfg-$$-code-XXXXXX")" || {
+  remote_log "error: could not make a directory for the leerie code this launch runs"
+  exit 1
+}
+trap '_code_snapshot_done' EXIT
+_snapshot_leerie_code "$LEERIE_REPO" "$_code_snapshot" || {
+  remote_log "error: could not take the leerie code this launch runs from $LEERIE_REPO"
+  exit 1
+}
+
+# --- refuse a command line before any image step ------------------------
+# The orchestrator's own parser, on the host, over the argv the container
+# (or a remote machine) will be given: a line it refuses ends the launch here
+# with the parser's own message, before any image is built or copied
+# (DESIGN §6 *A command line is refused before any image step*). Measured:
+# `leerie promptresume <run-id> …` spent about 10 minutes on the image steps
+# before the container's parser refused it. The parser is the snapshot's,
+# the code this launch runs. `-I -S`: stdlib only, as the host's other
+# helpers; `check_command_line` builds the parser and parses, and reads no
+# state. A module this host's python3 cannot load is left to the container,
+# whose parser still refuses the line (only the parser's own exit stops the
+# launch here).
+#
+# The module is compiled once per content, not per launch: its code object
+# is kept in $HOME/.cache/leerie/bytecode under the sha256 of the
+# interpreter's bytecode magic and the source, so an edit or another version
+# is a different entry, and only the four most recently used are kept.
+# Measured (2026-11-04, this host): compiling the 3.5 MB leerie.py took 3.1 s
+# of every launch; loading the kept code object takes 0.3 s.
+python3 -I -S -B -c '
+import hashlib, importlib.util, marshal, os, sys, types
+try:
+    src, cache = sys.argv[1], sys.argv[2]
+    with open(src, "rb") as f:
+        data = f.read()
+    key = hashlib.sha256(importlib.util.MAGIC_NUMBER + data).hexdigest()
+    path = os.path.join(cache, key)
+    try:
+        with open(path, "rb") as f:
+            code = marshal.load(f)
+        os.utime(path)
+    except (OSError, EOFError, ValueError, TypeError):
+        code = compile(data, src, "exec", dont_inherit=True)
+        try:
+            os.makedirs(cache, mode=0o700, exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as f:
+                marshal.dump(code, f)
+            os.replace(tmp, path)
+            older = sorted((e for e in os.scandir(cache)
+                            if len(e.name) == 64 and e.name != key),
+                           key=lambda e: e.stat().st_mtime, reverse=True)
+            for e in older[3:]:
+                os.unlink(e.path)
+        except OSError:
+            pass
+    m = types.ModuleType("leerie_orch")
+    m.__file__ = src
+    sys.modules["leerie_orch"] = m
+    exec(code, m.__dict__)
+    check = m.check_command_line
+except Exception:
+    sys.exit(0)
+sys.exit(check(sys.argv[3:]))
+' "$_code_snapshot/orchestrator/leerie.py" "$HOME/.cache/leerie/bytecode" \
+  ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} \
+  ${REWRITTEN_TAIL[@]+"${REWRITTEN_TAIL[@]}"} || exit $?
+
+# --- build image if not present (once per version) ----------------------
 # In leerie's containerd namespace, which no BuildKit worker reads (DESIGN §6
 # *No build consumes what another build left in BuildKit*); nerdctl exports
 # the image there. With the operator's Docker config: leerie's own
-# Dockerfile names only public images.
+# Dockerfile names only public images. Once per host and version: under the
+# host's image lock, where a launch that waited finds the image another
+# built (DESIGN §6 *A host-wide image step runs once, under a host lock*).
 if ! nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
-  remote_log "building container image (one-time; ~60-120s)..."
+  leerie_lock "${_leerie_image_lock:-}" "another launch's build of $IMAGE_TAG" \
+    || { remote_log "error: could not take the host's image lock (${_leerie_image_lock:-})"; exit 1; }
+  _image_lock_holder="$LEERIE_LOCK_HOLDER"
+fi
+if ! nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+  remote_log "building container image (once per version; 18 minutes measured on a fresh host)..."
   ensure_frontend_in_worker_ns
   _base_ns="$(leerie_cache_mount_ns)" \
     || { remote_log "error: could not draw a cache-mount namespace for the build"; exit 1; }
@@ -6333,11 +6952,15 @@ if ! nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect "$IMAGE_TAG" >/dev/nul
     --build-arg HOST_GID="$(id -g)" \
     -t "$IMAGE_TAG" \
     "$LEERIE_REPO" \
-    || { leerie_prune_cache_mounts "$_base_ns" || true
+    || { leerie_prune_cache_mounts "$_base_ns" \
+           || remote_log "warning: could not remove the build's cache-mount records ($_base_ns); BuildKit's garbage collection keeps them"
          remote_log "error: container image build failed"; exit 1; }
-  leerie_prune_cache_mounts "$_base_ns" || true
+  leerie_prune_cache_mounts "$_base_ns" \
+    || remote_log "warning: could not remove the build's cache-mount records ($_base_ns); BuildKit's garbage collection keeps them"
   unset _base_ns
 fi
+leerie_unlock "${_image_lock_holder:-}"
+unset _image_lock_holder
 
 # --- a repository image's build directory -------------------------------
 # $_REPO_BUILD_DIR (.image-build/b.<launcher pid>.<random>, _repo_build_dir)
@@ -6373,7 +6996,7 @@ _sweep_stale_builds() {
   return 0
 }
 ( _sweep_stale_builds ) </dev/null >/dev/null 2>&1 &
-trap '_repo_build_done' EXIT
+trap '_repo_build_done; [ -z "${_code_snapshot:-}" ] || rm -rf "$_code_snapshot"' EXIT
 
 # --- per-repo derived image (local nerdctl) -----------------------------
 # When the repo supplies .leerie/Dockerfile (or setup_packages in
@@ -6525,22 +7148,21 @@ resolve_repo_image_tag() {
 # with. Best-effort and non-fatal — if the copy fails, the build still
 # attempts and surfaces its own error.
 ensure_base_in_worker_ns() {
-  local _w _id _wid _save_load_tar _save_load_err
+  local _w _id _wid _err _rc
   _id="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null)" || _id=""
   for _w in $LEERIE_BUILDKIT_WORKER_NS; do
     _wid="$(nerdctl --namespace "$_w" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null)" || _wid=""
     if [ -n "$_id" ] && [ "$_wid" = "$_id" ]; then
       continue
     fi
-    remote_log "copying base image into $_w, the namespace BuildKit's worker reads (one-time; ~15-20s)..."
-    _save_load_tar="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image.XXXXXX.tar")"
-    _save_load_err="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image-copy.XXXXXX.log")"
-    if ! { nerdctl --namespace "$LEERIE_IMAGE_NS" save -o "$_save_load_tar" "$IMAGE_TAG" && \
-           nerdctl --namespace "$_w" load -i "$_save_load_tar"; } >"$_save_load_err" 2>&1; then
-      remote_log "warning: could not copy base image into $_w — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
-      remote_log "warning: save/load error output: $(cat "$_save_load_err")"
-    fi
-    rm -f "$_save_load_tar" "$_save_load_err"
+    remote_log "copying base image into $_w, the namespace BuildKit's worker reads (once per base; minutes for its 2.4 GB)..."
+    # Streamed, never through a file: no copy of the base lands on disk.
+    _err="$( { nerdctl --namespace "$LEERIE_IMAGE_NS" save "$IMAGE_TAG" \
+               | nerdctl --namespace "$_w" load >/dev/null; \
+               _rc="${PIPESTATUS[0]}${PIPESTATUS[1]}"; \
+               [ "$_rc" = 00 ]; } 2>&1)" \
+      || { remote_log "warning: could not copy base image into $_w — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
+           remote_log "warning: save/load error output: $(_terminal_safe "$_err")"; }
   done
 }
 
@@ -7408,9 +8030,10 @@ _repo_image_prepare() {
 # cache-mount namespace of their own (DESIGN §6 *No build consumes what
 # another build left in BuildKit*). Both run in leerie's containerd
 # namespace on the daemon leerie_buildkit_check vetted, whose workers read
-# another (same section), and with DOCKER_CONFIG an empty 0700 directory of
-# leerie's own, so neither pulls with the operator's registry credentials
-# (DESIGN §6 *A repository's build carries no operator credential*).
+# another (same section), and with DOCKER_CONFIG a 0700 directory of
+# leerie's own holding LEERIE_REGISTRY_AUTH_CONFIG and DOCKER_AUTH_CONFIG
+# empty, so neither pulls with the operator's registry credentials (DESIGN
+# §6 *A repository's build carries no operator credential*).
 build_repo_image() {
   local repo_image_tag="$1" _soft="${2:-}" _layout _q _digest _ns _auth _rc=0
   [ -f "$_REPO_BUILD_DIR/repo/Dockerfile" ] \
@@ -7419,7 +8042,9 @@ build_repo_image() {
   _repo_build_prepare
   _auth="$_REPO_BUILD_DIR/registry-auth"
   rm -rf "$_auth"
-  mkdir -m 0700 "$_auth" || _repo_build_fail "could not make the build's empty Docker config"
+  mkdir -m 0700 "$_auth" || _repo_build_fail "could not make the build's Docker config"
+  printf '%s\n' "$LEERIE_REGISTRY_AUTH_CONFIG" > "$_auth/config.json" \
+    || _repo_build_fail "could not write the build's Docker config"
   remote_log "building per-repo container image ($repo_image_tag)..."
   _layout="$_REPO_BUILD_DIR/worker"
   # `-o` is CSV: the path quoted, a quote in it doubled.
@@ -7431,7 +8056,7 @@ build_repo_image() {
   # is given a cache-mount namespace of its own (leerie_cache_mount_ns).
   _ns="$(leerie_cache_mount_ns)" \
     || _repo_build_fail "could not draw a cache-mount namespace for the build"
-  DOCKER_CONFIG="$_auth" _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
+  DOCKER_CONFIG="$_auth" DOCKER_AUTH_CONFIG='' _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
     --buildkit-host "$LEERIE_BUILDKIT_HOST" --no-cache \
     --build-arg BUILDKIT_SYNTAX="$LEERIE_DOCKERFILE_FRONTEND" \
     --build-arg BUILDKIT_CACHE_MOUNT_NS="$_ns" \
@@ -7456,7 +8081,7 @@ build_repo_image() {
   _rc=0
   _ns="$(leerie_cache_mount_ns)" \
     || _repo_build_fail "could not draw a cache-mount namespace for the build"
-  DOCKER_CONFIG="$_auth" _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
+  DOCKER_CONFIG="$_auth" DOCKER_AUTH_CONFIG='' _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
     --buildkit-host "$LEERIE_BUILDKIT_HOST" --no-cache \
     --build-arg BUILDKIT_SYNTAX="$LEERIE_DOCKERFILE_FRONTEND" \
     --build-arg BUILDKIT_CACHE_MOUNT_NS="$_ns" \
@@ -7510,32 +8135,6 @@ elif [ -f "$_leerie_config_toml" ]; then
     1|true|yes)  _BAKE_LANGUAGE_DEPS=true ;;
   esac
   unset _bld_cfg
-fi
-
-# Resolve skip_repo_map preference.
-# Precedence: LEERIE_SKIP_REPO_MAP env > skip_repo_map in leerie.toml > false.
-# Used by the launcher to inject --skip-repo-map into REWRITTEN_ARGS when the
-# user has not passed the flag explicitly (e.g. on Fly runs where leerie.toml
-# is on the host but not on the machine). Python-side resolve_skip_repo_map()
-# provides the authoritative resolution inside the orchestrator; this block
-# ensures the flag propagates correctly on Fly.
-_SKIP_REPO_MAP=false
-if [ -n "${LEERIE_SKIP_REPO_MAP:-}" ]; then
-  case "${LEERIE_SKIP_REPO_MAP}" in
-    0|false|no) _SKIP_REPO_MAP=false ;;
-    1|true|yes)  _SKIP_REPO_MAP=true ;;
-  esac
-elif [ -f "$USER_REPO/leerie.toml" ]; then
-  _srm_toml="$( { grep -E '^[[:space:]]*skip_repo_map[[:space:]]*=' \
-                      "$USER_REPO/leerie.toml" 2>/dev/null \
-                  | sed -n 1p \
-                  | sed -E 's/^[[:space:]]*skip_repo_map[[:space:]]*=[[:space:]]*//;
-                            s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
-  case "${_srm_toml:-}" in
-    0|false|no) _SKIP_REPO_MAP=false ;;
-    1|true|yes)  _SKIP_REPO_MAP=true ;;
-  esac
-  unset _srm_toml
 fi
 
 # Whether the checkout file $1 (a path relative to the checkout) is a
@@ -8287,6 +8886,13 @@ if [ -f "$_leerie_dockerfile" ]; then
     # is reused only when it is the one this checkout built — the digest
     # its tag names now is the digest recorded when it was built.
     _hash_file="$LEERIE_STATE_HOST_DIR/.dockerfile-hash"
+    # One decision and build at a time per checkout: a launch that waited
+    # reads the record the one before it wrote, and reuses its image
+    # (DESIGN §6 *A host-wide image step runs once, under a host lock*).
+    leerie_lock "$LEERIE_STATE_HOST_DIR/.image-build.lock" \
+      "another launch's build of $(_terminal_safe "$REPO_IMAGE_TAG")" \
+      || _repo_build_fail "could not take the checkout's image lock"
+    _repo_lock_holder="$LEERIE_LOCK_HOLDER"
     # The digest of the repository's Dockerfile bytes the build is given,
     # never of the path (DESIGN §6 *Leerie never reads through a link a
     # repository holds*).
@@ -8317,9 +8923,21 @@ if [ -f "$_leerie_dockerfile" ]; then
       # not leerie's, where the base was built — copy it across first
       # (idempotent) or the build 401s against the registry.
       leerie_buildkit_check || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
+      # A warning, not a refusal: the fix restarts containerd, which leerie
+      # never does (DESIGN §6 *No build consumes what another build left in
+      # BuildKit*, *The content store*).
+      leerie_content_sharing_check || remote_log "warning: $LEERIE_CONTENT_SHARING_HINT"
+      # The sweep, the base's copy and the frontend's pull change the
+      # worker's namespace, which every launch on the host shares: once at
+      # a time, under the host's image lock.
+      leerie_lock "${_leerie_image_lock:-}" "another launch's copy of $IMAGE_TAG into BuildKit's namespace" \
+        || _repo_build_fail "could not take the host's image lock (${_leerie_image_lock:-})"
+      _image_lock_holder="$LEERIE_LOCK_HOLDER"
       leerie_sweep_worker_images || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
       ensure_base_in_worker_ns
       ensure_frontend_in_worker_ns
+      leerie_unlock "$_image_lock_holder"
+      unset _image_lock_holder
       if [ -z "${_REPO_GEN_FALLBACK:-}" ]; then
         build_repo_image "$REPO_IMAGE_TAG"
       elif ! build_repo_image "$REPO_IMAGE_TAG" soft; then
@@ -8345,376 +8963,14 @@ if [ -f "$_leerie_dockerfile" ]; then
         remote_log "warning: this image is the apt-only fallback: its language-dep layer failed to build, so no language dependency is installed in it; to retry the layer, remove $(_terminal_safe "$_hash_file")"
       fi
     fi
+    leerie_unlock "$_repo_lock_holder"
     REPO_IMAGE_REF="$_cur_ref"
-    unset _hash_file _cur_df_sha _cur_hash _stored_hash _stored_ref _stored_mark _cur_mark _cur_ref _need_build _base_id
+    unset _repo_lock_holder _hash_file _cur_df_sha _cur_hash _stored_hash _stored_ref _stored_mark _cur_mark _cur_ref _need_build _base_id
   fi
 fi
 _repo_build_done
 unset _REPO_GEN_FALLBACK
 unset _leerie_dockerfile
-
-# --- translate --inspect-dir paths into bind-mounts ---------------------
-# Each --inspect-dir path points at a host-absolute directory the
-# inspect-bucket workers need read access to (--add-dir under the hood).
-# Bind-mount each one read-only at /inspect/<basename> and rewrite the arg
-# so the in-container view matches. Paths from LEERIE_INSPECT_DIRS (colon-sep)
-# need the same treatment — we resolve them on the host and emit
-# --inspect-dir CLI flags. (leerie.toml has no inspect_dirs key: a host
-# directory to mount comes only from the operator.) LEERIE_INSPECT_DIRS
-# is cleared inside the container so resolve_inspect_dirs() picks up only
-# our rewritten CLI flags.
-INSPECT_MOUNTS=()
-REWRITTEN_ARGS=()
-REWRITTEN_TAIL=()
-INSPECT_NAMES=()
-# Parallel to INSPECT_MOUNTS: pairs of "<host-path>\t<remote-target>" used by
-# the remote (Fly) runtime to rsync each inspect dir to /inspect/<basename>
-# on the machine. The local runtime ignores this — it uses INSPECT_MOUNTS
-# directly. Populated only for inspect dirs OUTSIDE $USER_REPO; in-repo
-# inspect dirs (the skip-redundant-mount branch in collect_inspect_path)
-# arrive on the machine via seed_repo at /work/<subpath> and need no
-# separate transport. See docs/IMPLEMENTATION.md §0.5 "Remote runtime
-# (Fly.io) transport".
-INSPECT_HOST_TARGETS=()
-
-collect_inspect_path() {
-  local host_path expanded resolved base mount_target user_repo_resolved
-  host_path="$1"
-  # Expand leading ~ — `cd` won't on its own.
-  case "$host_path" in
-    "~")   expanded="$HOME" ;;
-    "~/"*) expanded="$HOME/${host_path#~/}" ;;
-    *)     expanded="$(_from_checkout "$host_path")" ;;
-  esac
-  resolved="$(cd -P "$expanded" 2>/dev/null && pwd)" || {
-    remote_log "--inspect-dir path not found: $host_path"
-    exit 1
-  }
-  # If the path is inside $USER_REPO it's already visible at /work/<sub>,
-  # so a second mount under /inspect/ would be redundant. Warn and skip.
-  user_repo_resolved="$(cd -P "$USER_REPO" && pwd)"
-  case "$resolved" in
-    "$user_repo_resolved"|"$user_repo_resolved"/*)
-      # Quote $user_repo_resolved inside ${...#...} so bash strips a literal
-      # prefix instead of treating the value as a glob pattern (shellcheck
-      # SC2295). Paths typically lack glob metachars, but the cost of
-      # defensiveness is one quote-pair.
-      local rel="${resolved#"$user_repo_resolved"}"
-      remote_log "--inspect-dir '$host_path' is inside the repo; skipping redundant mount"
-      REWRITTEN_ARGS+=(--inspect-dir "/work${rel}")
-      return 0
-      ;;
-  esac
-  base="$(basename "$resolved")"
-  # Disambiguate basename collisions (e.g. two paths both named "src") by
-  # appending a numeric suffix. Use [[ ]] for glob-style membership test;
-  # surround with spaces so adjacent words don't match a substring.
-  local existing=" ${INSPECT_NAMES[*]:-} "
-  local candidate="$base"
-  local i=2
-  while [[ "$existing" == *" $candidate "* ]]; do
-    candidate="$base-$i"
-    i=$((i + 1))
-  done
-  base="$candidate"
-  mount_target="/inspect/$base"
-  INSPECT_NAMES+=("$base")
-  INSPECT_MOUNTS+=(-v "$resolved:$mount_target:ro")
-  REWRITTEN_ARGS+=(--inspect-dir "$mount_target")
-  # Remote (Fly) runtime needs the host-path → /inspect/<basename> mapping to
-  # rsync each dir onto the machine. Tab separator is safe: POSIX paths
-  # cannot contain \t (they can contain `:` and ` `).
-  INSPECT_HOST_TARGETS+=("$resolved"$'\t'"$mount_target")
-}
-
-# Serialize INSPECT_HOST_TARGETS for the remote-runtime helper. Empty array
-# → empty env var → seed_inspect_dirs short-circuits. Newline-separated
-# records, each "<host>\t<remote>", matching the format seed_inspect_dirs
-# parses with `read -r`. See docs/IMPLEMENTATION.md §0.5 "Remote runtime
-# (Fly.io) transport".
-_serialize_inspect_host_targets() {
-  if [ "${#INSPECT_HOST_TARGETS[@]}" -eq 0 ]; then
-    LEERIE_INSPECT_HOST_TARGETS=""
-  else
-    LEERIE_INSPECT_HOST_TARGETS="$(printf '%s\n' "${INSPECT_HOST_TARGETS[@]}")"
-  fi
-  export LEERIE_INSPECT_HOST_TARGETS
-}
-
-# Pre-pass: LEERIE_INSPECT_DIRS env (colon-separated).
-if [ -n "${LEERIE_INSPECT_DIRS:-}" ]; then
-  OIFS="$IFS"; IFS=":"
-  for p in $LEERIE_INSPECT_DIRS; do
-    [ -z "$p" ] || collect_inspect_path "$p"
-  done
-  IFS="$OIFS"
-fi
-# Main pass: rewrite --inspect-dir in $@. The orchestrator's argparse
-# declares only --inspect-dir (no -i alias — see leerie.py:6079), so we
-# intercept exactly that one form and let everything else flow through.
-prev_was_inspect=false
-_prev_was_chain_id=false
-_prev_was_fly_app_rewrite=false
-_prev_was_state_dir_rewrite=false
-_prev_was_seed_knob=false
-_prev_was_ec2_knob=false
-_prev_was_aws_knob=false
-_prev_was_log_file_rewrite=false
-_rw_argi=0
-_rw_after_dd=false
-_prev_was_answers=false
-for arg in "$@"; do
-  _rw_argi=$((_rw_argi + 1))
-  # Everything after `--` is positional and goes to the orchestrator as it
-  # is, after every flag (REWRITTEN_TAIL); a flag the launcher adds below
-  # goes into REWRITTEN_ARGS, so it never lands after `--`.
-  if [ "$_rw_after_dd" = "true" ] || [ "$arg" = "--" ]; then
-    _rw_after_dd=true
-    if [ "$_rw_argi" -eq "$_task_argi" ] && [ -n "$_task_arg_for_container" ]; then
-      arg="$_task_arg_for_container"
-    fi
-    REWRITTEN_TAIL+=("$arg")
-    continue
-  fi
-  # A relative task file or --answers file is read in the container from
-  # /work, the repository's top level, not from where the operator stood.
-  if [ "$_rw_argi" -eq "$_task_argi" ] && [ -n "$_task_arg_for_container" ]; then
-    arg="$_task_arg_for_container"
-  fi
-  if [ "$_prev_was_answers" = "true" ]; then
-    _prev_was_answers=false
-    case "$arg" in
-      /*|"") ;;
-      *) [ -z "$OPERATOR_SUBDIR" ] || arg="$OPERATOR_SUBDIR/$arg" ;;
-    esac
-    REWRITTEN_ARGS+=("$arg")
-    continue
-  fi
-  # `resume` and `list` (and any positional run-id after `resume`) flow
-  # through untouched — orchestrator/leerie.py pops the bare verb itself,
-  # exactly like the launcher's own `case "${1:-}"` dispatch one level up,
-  # and takes `resume`'s positional run-id via `_extract_resume_run_id`
-  # BEFORE argparse runs.
-  #
-  # That last part was NOT true until 2026-08-05, and this comment used to
-  # assert "No rewrite needed" without it. The orchestrator popped only the
-  # verb, so a positional run-id bound to argparse's `task` positional,
-  # `--run-id` stayed None, and `resolve_run_id` AUTO-PICKED A DIFFERENT RUN
-  # — measured live against a running one, where only the flock prevented a
-  # duplicate orchestrator. Do not restore the shorter claim: forwarding
-  # untouched is correct only because the orchestrator now handles it.
-  if [ "$_prev_was_state_dir_rewrite" = "true" ]; then
-    _prev_was_state_dir_rewrite=false
-    continue
-  fi
-  if [ "$_prev_was_fly_app_rewrite" = "true" ]; then
-    _prev_was_fly_app_rewrite=false
-    continue
-  fi
-  if [ "$_prev_was_seed_knob" = "true" ]; then
-    # Consume the value of --seed-depth / --seed-shallow-threshold-mb.
-    _prev_was_seed_knob=false
-    continue
-  fi
-  if [ "$_prev_was_ec2_knob" = "true" ]; then
-    # Consume the value of --ec2-ami / --ec2-instance-type / --ec2-key-name /
-    # --ec2-security-group / --ec2-subnet-id / --ec2-instance-profile.
-    _prev_was_ec2_knob=false
-    continue
-  fi
-  if [ "$_prev_was_aws_knob" = "true" ]; then
-    # Consume the value of --aws-region / --aws-profile.
-    _prev_was_aws_knob=false
-    continue
-  fi
-  if [ "$_prev_was_log_file_rewrite" = "true" ]; then
-    # Consume the value of --log-file.
-    _prev_was_log_file_rewrite=false
-    continue
-  fi
-  if $prev_was_inspect; then
-    collect_inspect_path "$arg"
-    prev_was_inspect=false
-    continue
-  fi
-  # Consume the value of --chain-id (next arg after --chain-id <val>).
-  # The chain_id is a launcher-side tag written to run.json post-
-  # finalize by the wave loop; the orchestrator doesn't need to know it.
-  if $_prev_was_chain_id; then
-    _prev_was_chain_id=false
-    export LEERIE_CHAIN_ID="$arg"
-    continue
-  fi
-  case "$arg" in
-    --inspect-dir)
-      prev_was_inspect=true
-      ;;
-    --inspect-dir=*)
-      collect_inspect_path "${arg#--inspect-dir=}"
-      ;;
-    --chain-id)
-      _prev_was_chain_id=true
-      ;;
-    --answers)
-      _prev_was_answers=true
-      REWRITTEN_ARGS+=("$arg")
-      ;;
-    --answers=*)
-      _answers_val="${arg#--answers=}"
-      case "$_answers_val" in
-        /*|"") ;;
-        *) [ -z "$OPERATOR_SUBDIR" ] || _answers_val="$OPERATOR_SUBDIR/$_answers_val" ;;
-      esac
-      REWRITTEN_ARGS+=("--answers=$_answers_val")
-      unset _answers_val
-      ;;
-    --chain-id=*)
-      export LEERIE_CHAIN_ID="${arg#--chain-id=}"
-      ;;
-    --no-runtime-install)
-      # Launcher-only flag; consumed by the runtime preflight above.
-      # The orchestrator's argparse doesn't know it.
-      ;;
-    --no-auto-publish)
-      # Launcher-only flag; consumed by ensure_image() in the remote path.
-      ;;
-    --state-dir)
-      # Launcher-only flag; consumed by the state-dir resolver above.
-      _prev_was_state_dir_rewrite=true
-      ;;
-    --state-dir=*)
-      # Launcher-only flag (=form); consumed above.
-      ;;
-    --fly-app)
-      # Launcher-only flag; consumed by the LEERIE_FLY_APP resolver above.
-      _prev_was_fly_app_rewrite=true
-      ;;
-    --fly-app=*)
-      # Launcher-only flag (=form); consumed above.
-      ;;
-    --local-build)
-      # Launcher-only flag; consumed by ensure_image() to forward
-      # --local-build to build-push.sh (legacy local nerdctl/docker
-      # build instead of the default Fly remote builder).
-      ;;
-    --seed-depth|--seed-shallow-threshold-mb)
-      # Launcher-only flags (DESIGN §6 *Shallow seeding for heavy repos*);
-      # resolved into LEERIE_SEED_DEPTH / LEERIE_SEED_SHALLOW_THRESHOLD_MB
-      # above and consumed by seed-repo.sh. The orchestrator's argparse
-      # doesn't know them — strip both the flag and its value so they don't
-      # leak to parse_args() (which is strict, not parse_known_args).
-      _prev_was_seed_knob=true
-      ;;
-    --seed-depth=*|--seed-shallow-threshold-mb=*)
-      # =form; consumed above.
-      ;;
-    --ec2-ami|--ec2-instance-type|--ec2-key-name|--ec2-security-group|--ec2-subnet-id|--ec2-instance-profile)
-      # Launcher-only flags (EC2 instance-shape CLI tier); resolved into
-      # LEERIE_EC2_AMI / LEERIE_EC2_INSTANCE_TYPE / LEERIE_EC2_KEY_NAME /
-      # LEERIE_EC2_SECURITY_GROUP / LEERIE_EC2_SUBNET_ID above and consumed
-      # by ec2-lib.sh's resolve_*() functions. The orchestrator's argparse
-      # doesn't know them — strip both the flag and its value so they don't
-      # leak to parse_args() (which is strict, not parse_known_args).
-      _prev_was_ec2_knob=true
-      ;;
-    --ec2-ami=*|--ec2-instance-type=*|--ec2-key-name=*|--ec2-security-group=*|--ec2-subnet-id=*|--ec2-instance-profile=*)
-      # =form; consumed above.
-      ;;
-    --aws-region|--aws-profile)
-      # Launcher-only flags (leerie's own AWS region/profile knobs);
-      # resolved into LEERIE_AWS_REGION / LEERIE_AWS_PROFILE far above --
-      # above the verb dispatch, since accept-blocked/stop/kill/finalize
-      # consume them -- and read by ec2-lib.sh / ec2-ssm.sh /
-      # ec2-provision.sh host-side. The orchestrator runs inside the
-      # container and declares no such flags, so strip both the flag and
-      # its value; parse_args() is strict, not parse_known_args.
-      _prev_was_aws_knob=true
-      ;;
-    --aws-region=*|--aws-profile=*)
-      # =form; consumed above.
-      ;;
-    --log-file)
-      # Launcher-only flag (N5b); resolved into LEERIE_LOG_FILE_RESOLVED
-      # above. The orchestrator's argparse doesn't know it — strip both
-      # the flag and its value so they don't leak to parse_args() (which
-      # is strict, not parse_known_args).
-      _prev_was_log_file_rewrite=true
-      ;;
-    --log-file=*)
-      # =form; consumed above.
-      ;;
-    --no-re-seed)
-      # Launcher-only flag (Phase 4); consumed by the auto-re-seed-on-resume
-      # block. The orchestrator's argparse doesn't know it.
-      ;;
-    --force)
-      # Launcher-only flag (Phase 4); bypasses re_seed's safety check.
-      ;;
-    --shell)
-      # Launcher-only flag; opts into bash shell on the resume rc=75 pivot
-      # (DESIGN §6 *Smart resume in remote mode*). The orchestrator's
-      # argparse doesn't know it.
-      ;;
-    --auto-finalize)
-      # Launcher-only flag; triggers `leerie finalize` on clean exit via
-      # tail_with_optional_autofinalize. The orchestrator's argparse
-      # doesn't know it.
-      ;;
-    finalize|stop|kill|re-seed|accept-blocked|accept-integration|attach|chain|group|config|prune|status|version)
-      # Launcher-only verbs — normally dispatched at the top-level case
-      # (line ~945) when they appear as $1. If one appears here it was
-      # in a non-$1 position (e.g. `leerie <id> finalize --runtime fly`
-      # instead of `leerie finalize <id> --runtime fly`). Error instead
-      # of leaking to the orchestrator's argparse.
-      remote_log "error: '$arg' is a verb and must be the first argument."
-      remote_log "  Run: leerie $arg [args...]"
-      exit 1
-      ;;
-    resume|list)
-      # Unlike the other launcher verbs above, `resume` and `list` can
-      # legitimately reach this loop AT position 1 (their case arms fall
-      # through instead of exiting — see `resume)`'s non-UUID fallthrough
-      # and `list)`'s plain/failed-flyctl fallthrough) and orchestrator/
-      # leerie.py now understands the bare verb natively, so position 1
-      # must flow through to the orchestrator rather than error. A
-      # non-$1 occurrence is still a user error.
-      if [ "$_rw_argi" -eq 1 ]; then
-        REWRITTEN_ARGS+=("$arg")
-      else
-        remote_log "error: '$arg' is a verb and must be the first argument."
-        remote_log "  Run: leerie $arg [args...]"
-        exit 1
-      fi
-      ;;
-    *)
-      REWRITTEN_ARGS+=("$arg")
-      ;;
-  esac
-done
-
-# Inject --skip-repo-map when resolved from env/toml but not already on CLI.
-# Guards against double-injection (the user may have also passed it explicitly).
-if [ "$_SKIP_REPO_MAP" = "true" ]; then
-  _srm_already=false
-  for _srm_arg in ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}; do
-    [ "$_srm_arg" = "--skip-repo-map" ] && { _srm_already=true; break; }
-  done
-  unset _srm_arg
-  [ "$_srm_already" = "false" ] && REWRITTEN_ARGS+=("--skip-repo-map")
-  unset _srm_already
-fi
-unset _SKIP_REPO_MAP
-
-# The run's push choice, recorded once at its start (DESIGN §6 *One push
-# choice per run, on every runtime*). A fresh run hands the launcher's
-# resolved NO_PUSH to the orchestrator as --no-push on every runtime:
-# neither the container nor a remote machine sees LEERIE_NO_PUSH, and a
-# remote machine may not see an untracked leerie.toml. A resume adds
-# nothing: the orchestrator continues its record, and only this command
-# line's own --no-push / --push (already in REWRITTEN_ARGS) override it.
-if [ "$IS_RESUME" = "false" ] && [ "$NO_PUSH" = "true" ]; then
-  REWRITTEN_ARGS+=("--no-push")
-fi
 
 # --- assemble auth/config mounts ----------------------------------------
 # Per-container config isolation. The shared host ~/.claude.json is a
@@ -8931,6 +9187,23 @@ _stage_keepalive_pid=$!
 trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; rm -rf "$STAGE" 2>/dev/null' EXIT
 # `|| true`: under set -e a failed kill (keepalive already gone) would end
 # the trap before $STAGE — staged credentials — is removed.
+# The launch's snapshot of its code, taken before any image step
+# (_snapshot_leerie_code, above), moves into $STAGE, which every later exit
+# path removes; a remote runtime runs the code baked into its image and only
+# checked its command line with the snapshot.
+_code_dir=""
+if [ "$RUNTIME" = "local" ]; then
+  _code_dir="$STAGE/leerie-code"
+  mv "$_code_snapshot" "$_code_dir" || {
+    remote_log "error: could not move the leerie code this launch runs into $_code_dir"
+    _code_snapshot_done
+    exit 1
+  }
+  _code_snapshot=""
+else
+  _code_snapshot_done
+fi
+
 # The same duty as a named hook: the remote runtimes replace the EXIT trap
 # with their teardown (decide_teardown / decide_ec2_teardown), which calls
 # this last on the exit pass so the keepalive and the staged credentials
@@ -9367,24 +9640,6 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/
 # failure modes on first run. Concurrency-safety per cache is documented
 # in IMPLEMENTATION §0.5.
 #
-# The host-wide dir (build semaphore, DESIGN §6 *A host-wide build
-# semaphore*) defaults to ~/.leerie/.host and must stay shared: the
-# semaphore bounds only the runs that mount the same dir. LEERIE_HOST_DIR
-# repoints it for an isolated run (a bench) that must never touch
-# ~/.leerie. Inside the container the same name means the mount point, set
-# after the LEERIE_* forward below, so this host value never leaks in.
-_leerie_host_dir="${LEERIE_HOST_DIR:-$HOME/.leerie/.host}"
-case "$_leerie_host_dir" in
-  "~")   _leerie_host_dir="$HOME" ;;
-  \~/*)  _leerie_host_dir="$HOME/${_leerie_host_dir#"~/"}" ;;
-esac
-case "$_leerie_host_dir" in
-  /*) ;;
-  *)
-    echo "leerie: error: LEERIE_HOST_DIR='$_leerie_host_dir' is not an absolute path" >&2
-    exit 1
-    ;;
-esac
 mkdir -p "$HOME/.cache/leerie/mise-data" \
          "$HOME/.cache/leerie/bundle" \
          "$LEERIE_STATE_HOST_DIR" \
@@ -10788,8 +11043,10 @@ else
     _read_ran_run_id
     [ -n "$_ran_run_id" ] || return 0
     [ -f "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id/repo/HEAD" ] || return 0
+    # From the launch's copy (DESIGN §6 *A launch runs only the leerie code
+    # it started with*).
     # shellcheck source=scripts/host-finalize.sh
-    . "$LEERIE_REPO/scripts/host-finalize.sh" || return 0
+    . "$_code_dir/scripts/host-finalize.sh" || return 0
     host_bring_back_run_branch "$LEERIE_STATE_HOST_DIR/runs/$_ran_run_id" || true
   }
 
@@ -11057,7 +11314,9 @@ else
     # the run gives it reaches it through the host after the container exits
     # (the bring-back, the captured deps). DESIGN §6 *The explicit channel*.
     -v "$USER_REPO:/work:ro"
-    -v "$LEERIE_REPO:/opt/leerie-image:ro"
+    # The launch's own copy of leerie's code, never the install itself
+    # (DESIGN §6 *A launch runs only the leerie code it started with*).
+    -v "$_code_dir:/opt/leerie-image:ro"
     -v "$LEERIE_STATE_HOST_DIR:/leerie-state"
     ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"}
     ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}
@@ -11234,8 +11493,10 @@ if [ "$RUNTIME" = "local" ]; then
 
   # Push + PR creation are shared with the `leerie finalize <run-id>`
   # fast-path; both source scripts/host-finalize.sh and call host_finalize.
+  # From the launch's copy, like everything the run executes (DESIGN §6 *A
+  # launch runs only the leerie code it started with*).
   # shellcheck disable=SC1091
-  . "$LEERIE_REPO/scripts/host-finalize.sh"
+  . "$_code_dir/scripts/host-finalize.sh"
   host_finalize "$_ran_run_dir" || exit $?
 fi
 # Fly path: decide_teardown's EXIT trap will source host-finalize.sh and

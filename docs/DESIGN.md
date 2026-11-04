@@ -481,7 +481,9 @@ subtask it tests). Three mechanisms reconcile that coupling:
   value into a decision, recomputing it and tightening its predicate
   are routinely one edit described three ways). `other` contradicts
   nothing — an `other` on either side never makes a mismatch — but the
-  site is recorded as resting on an untyped resolution, for the PR. A
+  site then rests on an untyped resolution no table checks, so the
+  delivery gate settles it on the integrated tree (§8 *A site resting on
+  an untyped resolution is settled by the run*). A
   `fix` site that no fix subtask claims needs either a claim or a typed
   `sites_not_needed` entry (`{site_id, reason}`); one claimed only with
   kinds outside the audit's class is a mismatch. Recursive decomposition
@@ -503,7 +505,7 @@ subtask it tests). Three mechanisms reconcile that coupling:
   blind annotator reading the final plans found no claim on the target
   whose kind contradicted its intent, and the only contradictions it
   read on a control (4 sites, one run) were all `other` claims — which
-  is why `other` is surfaced instead of contradicting.
+  is why `other` is settled at the gate instead of contradicting.
 
   **Required items are claimed too.** On every run, not only a defect
   fix, each planner subtask lists in `claims.items` the required items
@@ -695,7 +697,10 @@ attempt between them) settles `unconverged`
 not burn the budget*). An `environment_limit` is retried in place once,
 then settled `unconverged`. A `nothing_to_change` is settled `complete` only
 when a sibling integrated this run changed its surface, its verify commands
-(if any) pass, and the satisfied-probe finds its criteria met; a
+(if any) pass, and the satisfied-probe finds its criteria met — or, when
+every criterion has a command and each passed, finds no gap and names no
+criterion it could not check that a passing command does not exercise in
+full; a
 `cannot_reproduce` with no commits is settled `complete` when its verify commands pass. In
 both, a verify execution that hits the environment limit settles
 `unconverged`; any other unmet check re-drives it. Every other blocked subtask is re-driven once its wave finishes,
@@ -2796,6 +2801,38 @@ where text leaves for the terminal: C0 controls but newline and tab, DEL
 and C1, U+061C, U+200E/U+200F, U+2028–U+202E, U+2066–U+2069 and a lone
 surrogate (a byte that was not UTF-8) are written as their escapes
 (`\x1b`, `\u202e`), which are printable, so the rule is idempotent.
+One shape is dropped instead of escaped: a complete 7-bit CSI sequence —
+`ESC [`, at most 64 parameter bytes `0`–`?`, at most 8 intermediate bytes
+space–`/`, one final byte `@`–`~` — is removed whole (a longer one is no
+sequence a tool writes, and is escaped). Test runners and package managers colour
+what they print even into a pipe (tinyrainbow, which vitest uses, colours
+unless `NO_COLOR` is set; picocolors whenever `CI` is), and escaping every
+SGR made a relayed test run unreadable: `\x1b[32m✓\x1b[39m src/…` (the
+user's 0.44.0 run, 2026-11-03). Dropping keeps the guarantee — nothing of
+the sequence reaches the terminal — and every CSI, not SGR alone, because
+a CSI carries no text the operator should read: it sets rendition, moves
+the cursor, erases, sets modes or asks the terminal to report (`CSI 6n`,
+whose reply a terminal types as input). Dropping a cursor move or an erase
+only ever leaves more of the text visible than the terminal would have
+shown. Every other control stays visible as its escape: OSC and DCS carry
+a payload (a clipboard, a title, a link), so the operator sees it; a lone
+or incomplete `ESC`, the C1 CSI (`\x9b`), C1, bidi and separators are
+escaped as before. The rule is one left-to-right pass, so a removal can
+never join two pieces into a new sequence: what remains holds no `ESC`.
+The launcher's relay reads its input in chunks; it holds back a chunk's
+trailing incomplete CSI (within the same bounds) until the next chunk or
+the end of the stream, so a split sequence is dropped like a whole one.
+Leerie does not set `NO_COLOR` or `FORCE_COLOR` for the repository's
+commands to the same end: either changes what a colour library prints
+(measured, node 24, output piped: picocolors 1.1.1 and tinyrainbow 3.2.0
+print plain under `NO_COLOR=1` and colour under `CI=1 FORCE_COLOR=0`; both
+test `FORCE_COLOR` for presence, so `0` turns colour on),
+so a test asserting on its coloured output — a snapshot recorded in a
+terminal — would fail in leerie's measurement and pass in the repository's
+own CI, a false red the workers would then chase. The display rule makes
+the output readable without changing what is measured. Nor for a worker's
+own commands: their output reaches the worker, not the terminal, and a
+worker reproducing a measurement must see the outcome the measurement saw.
 Inside the orchestrator it is `_terminal_text`: `log()` and `die()` apply
 it (the host seams that load the orchestrator call them without
 `main()`), `main()` makes `sys.stdout` and `sys.stderr` escaping streams
@@ -3259,14 +3296,25 @@ they are confined.
   worker's on the standard rootless setup, so they stay readable until they
   are gone. None is reused: leerie looks its images up only in `leerie`,
   so the first launch after the change builds its base and each repository
-  image again there. Before each repository build, leerie removes from every
+  image again there. Before each repository build, local or with
+  `build-push.sh --local-build`, leerie removes from every
   namespace a worker reads each image named `leerie-repo/…` (its own name
   for a repository image, and nothing else) that no container uses
   (`nerdctl image rm`, never forced: nerdctl refuses to remove the name a
   container was created from, which it records even for a container
   created by digest, as leerie's are; measured 2026-11-03, nerdctl 2.3.5),
-  and refuses the build while one is left: an earlier leerie's run still runs from it, and the launch can be
-  repeated once that run ends. A removed image is a cache: the earlier
+  and refuses the build while one is left, naming each container that
+  holds it, its state, and what ends it: a running one's run (`leerie
+  stop`), and a container that no longer runs is removed with `nerdctl
+  rm`. nerdctl's `--rm` is done by the client that started the container,
+  so a container whose client died (an OOM) stays `Exited` after `nerdctl
+  kill` and holds its image for good (measured 2026-11-03, nerdctl 2.3.5);
+  `stop`, `kill` and `resume`'s reaper therefore remove the container they
+  end (`nerdctl rm -f`). *Revised 2026-11-03 (review round 38, execution
+  X1).* The refusal said to launch again once the run ended, or to `nerdctl
+  image rm` the image; with an exited container neither cleared it, and the
+  image's removal had already failed before the refusal was given. A
+  removed image is a cache: the earlier
   version builds it again on its next launch. The images an earlier
   `--local-build` tagged (`registry.fly.io/<app>:…`) do not carry a name
   only leerie uses, so they are not removed. A run an earlier leerie
@@ -3311,24 +3359,81 @@ they are confined.
   it (not measured). With `--local-build` and nerdctl, every image is
   tagged in `leerie`; with docker there is one image store, so the read
   holds there (not covered).
+  *The content store.* The namespaces keep names apart, not bytes:
+  containerd keeps one content store, and with its default
+  `content_sharing_policy = "shared"` an ingest in one namespace of a blob
+  another namespace holds succeeds by its digest alone. A repository's
+  `FROM <any registry>/x@sha256:<digest of another repository's image>`,
+  the registry answering only the manifest's `HEAD`, then built with that
+  image's worker root, read from `leerie` (measured 2026-11-03 through
+  `build_repo_image` on a containerd of the review's own, BuildKit
+  0.31.2, containerd 2.2.2). With `"isolated"` the same build failed (the
+  registry got the `GET`), while `ensure_base_in_worker_ns`, a repository
+  build and its export into `leerie` worked as before (`debian:13-slim`
+  as the base: copied in 5.5 s, the build 37 s, against 6.0 s and 44 s
+  shared; at the base's full size not measured; content is then written
+  once per namespace that holds it, where shared it was linked). So
+  `scripts/runtime-install.sh` writes `content_sharing_policy =
+  "isolated"` into a fresh rootless install's
+  `~/.config/containerd/config.toml` before containerd first starts, and
+  leaves an existing file alone. Before each repository build the launcher
+  (and `build-push.sh --local-build`) reads that file and warns, naming the
+  lines and the restart, when it does not set the policy
+  (`leerie_content_sharing_check`); it neither refuses nor restarts.
+  *Decided 2026-11-03 (review round 38, isolation X2).* The setting takes
+  effect only when containerd restarts, and a restart of the rootless
+  unit stops every container it runs (its `KillMode=mixed`; not measured
+  here), every leerie run on the host included. A refusal would make the
+  upgrade an outage for every existing install until the operator
+  restarted it, and leerie restarting it would end runs it does not own.
+  What the read needs is the digest of another repository's image, which
+  no channel the review found gives a build, and a branch of the same
+  repository mostly holds the content already; on an install that keeps
+  `"shared"`, that digest is the one secret, an accepted residual. The
+  check reads the file, not the daemon: a file changed and not yet
+  restarted passes (asking the daemon needs `ctr` on its own socket, whose
+  address differs per runtime, and a probe write, which under
+  `"isolated"` left an unfinished ingest each time, measured). Not checked
+  on macOS, where containerd runs in Colima's VM, nor for a rootful
+  containerd's own unit beyond its file (not measured).
 - *A repository's build carries no operator credential.* nerdctl runs
-  `buildctl`, which hands BuildKit every registry credential in the
-  invoking user's Docker config, so a repository's `FROM` could pull
+  `buildctl`, which hands BuildKit every registry credential the invoking
+  user's Docker client would use, so a repository's `FROM` could pull
   anything the operator can, another repository's pushed image included
   (measured 2026-11-03 with a registry of the review's own: `401
-  Unauthorized` with an empty Docker config, the victim's file with the
-  operator's). Both builds of a repository image run with `DOCKER_CONFIG`
-  set to an empty 0700 directory of leerie's own in the build directory
-  (`$_REPO_BUILD_DIR/registry-auth`), so they pull as no one, the same rule
-  as *A repository chooses no operator authority*. A repository's `FROM` a
-  public image still works; a private one is pulled by the operator into
-  the worker's namespace first (`nerdctl --namespace <worker namespace>
-  pull`), where the build resolves it by name: what a build may read is
-  the operator's choice, made image by image, so leerie has no setting
-  that shares a registry. Leerie's own builds, its base and the frontend
-  it pulls into the worker's namespace, keep the operator's config: no
-  repository text reaches them, they name only public images, and an
-  operator behind a mirror or a rate limit needs it. *Fly:* the
+  Unauthorized` without the operator's credential, the victim's file with
+  it). buildctl finds a credential in three places (docker/cli's
+  `LoadDefaultConfigFile` and `GetCredentialsStore`, as BuildKit 0.31.2
+  vendors them): the Docker config in `$DOCKER_CONFIG`; when that config
+  names no auth entry, credential store or helper, the platform's default
+  credential helper if it is on PATH (`docker-credential-pass` when `pass`
+  is on PATH, else `docker-credential-secretservice`; `osxkeychain` on
+  macOS), which is how `docker login` keeps a login wherever
+  golang-docker-credential-helpers is installed; and `DOCKER_AUTH_CONFIG`,
+  read before either. Both builds of a repository image run with
+  `DOCKER_CONFIG` set to a 0700 directory of leerie's own in the build
+  directory (`$_REPO_BUILD_DIR/registry-auth`) whose `config.json` is
+  `{"auths":{"leerie.invalid":{}}}`, and with `DOCKER_AUTH_CONFIG` empty,
+  so they pull as no one, the same rule as *A repository chooses no
+  operator authority*. The one entry, for a name no registry can have
+  (`.invalid`, RFC 2606) and with no credential, is what makes the config
+  count as holding auth, so that no default helper is looked for: with a
+  helper on PATH that holds the operator's login, an empty directory, `{}`,
+  `{"credsStore":""}` (read as no store) and `{"auths":{}}` each pulled the
+  private image, the helper asked each time, while this file got `401` and
+  the helper was not asked; a `DOCKER_AUTH_CONFIG` holding the credential
+  pulled it whatever the file said (measured 2026-11-03, BuildKit 0.31.2).
+  A repository's `FROM` a public image still works; a private one is
+  pulled by the operator into the worker's namespace first (`nerdctl
+  --namespace <worker namespace> pull`), where the build resolves it by
+  name: what a build may read is the operator's choice, made image by
+  image, so leerie has no setting that shares a registry. Leerie's own
+  builds, its base and the frontend it pulls into the worker's namespace,
+  keep the operator's config: no repository text reaches them, they name
+  only public images, and an operator behind a mirror or a rate limit
+  needs it. *macOS:* nerdctl is Colima's shim into its VM, and whether
+  `DOCKER_CONFIG` and `DOCKER_AUTH_CONFIG` reach buildctl there, and which
+  helper the VM has, is not measured. *Fly:* the
   repository's stage is built `FROM` leerie's base in
   `registry.fly.io/<app>`, so that build needs the app's registry
   credential, and the one it can have reads every image of the
@@ -3337,7 +3442,63 @@ they are confined.
   separate commands, so each could be given its own Docker config, but
   the build itself needs the credential: on Fly a repository's build can
   read the organization's images (not covered). *Designed 2026-11-03
-  (review round 37, isolation I4).*
+  (review round 37, isolation I4).* *Revised 2026-11-03 (review round 38,
+  isolation X1).* This said both builds ran with an empty directory as
+  their Docker config and so pulled as no one; with
+  `docker-credential-secretservice` on PATH they pulled with the
+  operator's login (the review's proof, through `build_repo_image`).
+- *A host-wide image step runs once, under a host lock.* Leerie's base
+  image, its copy in the namespace BuildKit's worker reads, the frontend
+  pulled there and the sweep of an earlier leerie's images are each one
+  per host and version, whatever launch asks for them; a repository image
+  is one per checkout. Each such step runs under a lock and checks again,
+  once it holds the lock, whether the step is still needed: the base build
+  under the host's image lock (`<host dir>/image.lock`, the host-wide
+  directory of *A host-wide build semaphore*), where a launch that waited
+  finds the image another built; the sweep, the base's copy and the
+  frontend's pull together under the same lock, where the copy is skipped
+  when the worker's namespace already holds the base's id; and a
+  repository image's decision and build under its checkout's lock
+  (`<state root>/.image-build.lock`), where a launch that waited reads the
+  record the one before it wrote and reuses its image. The lock is held by
+  a small process of its own (`leerie_lock`), never by a descriptor of the
+  launcher's shell, which every program it starts would inherit (Colima's
+  SSH ControlMaster keeps what it inherited); that process lets go when
+  the step ends or within half a second of its launch's end, however it
+  ends. The base's copy streams `nerdctl save` into `nerdctl load` and
+  writes no file. *Designed 2026-11-03 (the operator's live 0.44.0
+  launches):* five launches started within about two minutes on one
+  checkout each exported the base to its own tarball in `/tmp` and loaded
+  it at once, about 2.4 GB each; nothing serialised them. *Cost:* a launch
+  waits for another's base build, copy or repository build instead of
+  repeating it, and says once that it waits.
+- *A command line is refused before any image step.* The orchestrator's
+  parser, in the container, is the one authority on its command line, and
+  the launcher reaches it only after the image steps, which take minutes
+  when an image is built or copied. So before any of them the launcher
+  runs that same parser on the host (`check_command_line`, through
+  `python3 -I -S` on the launch's snapshot of `orchestrator/leerie.py`, as
+  its other host helpers run), over the argv it will give the container,
+  and a line the parser refuses ends the launch there with the parser's
+  own message and status. The check builds the parser and parses; it
+  reads no state and starts nothing, and a module the host's Python cannot
+  load leaves the line to the container, as before. The module is
+  compiled once per content, not once per launch: its code object is
+  kept under `~/.cache/leerie/bytecode`, named by the sha256 of the
+  interpreter's bytecode magic and the source, so the parser that runs is
+  always the source's own, an edit is a new entry, and the four most
+  recently used are kept. *Measured 2026-11-04 (review round 39,
+  execution E4):* compiling the 3.5 MB module took 3.1 s of every launch,
+  and a refused line took 4-7 s in all, not the "about a second" first
+  claimed; loading the kept code object takes 0.3 s. The alternative, the
+  parser in a module of its own, was rejected: its options read the
+  orchestrator's constants, so the one parser would have to move out of
+  the one file. *Designed 2026-11-03 (the
+  operator's live 0.44.0 launches):* `leerie promptresume <run-id>
+  --max-workers 2000 …`, a mistyped `resume`, spent about 10 minutes on
+  the image steps before the container printed `leerie: error:
+  unrecognized arguments: <run-id>`. A second copy of the orchestrator's
+  options in the launcher was rejected: it would drift from the parser.
 - *Fail closed, on every entry.* Where the image has a worker root, the
   confinement check every entry runs (`_require_confinement`) runs `test
   -e /.leerie-worker-env` confined and stops the run when it does not find
@@ -3690,8 +3851,9 @@ read as a void round — every escalated round on a JS/TS repository was
 rolled back that way once leerie's temp files moved to `<run-dir>/tmp/`
 (review round 20, execution H1).
 Fail closed as for a worker: the invocation's entry has already required
-Landlock (`_require_confinement`), and the shim refuses (exit 126) where it cannot
-enforce, which a measurement reads as "could not measure", never a pass.
+Landlock (`_require_confinement`), and the shim refuses where it cannot
+enforce, which stops the run, never a pass and never a measurement (*A
+confinement failure stops the run; it is never a result*).
 
 **The grant, by kind.** Every kind gets the first block.
 
@@ -4817,8 +4979,10 @@ It is constructed, not checked, in two halves.
    upper layer is on its private `/tmp`, every other write grant overlaid
    the same way (a grant beneath `/tmp` is a fresh, empty copy of its
    directories); the set's files placed into the overlay by the shim,
-   never into a tree on disk (it refuses when the tree already has a file
-   at a set's path); loopback as its only network. The shim is the
+   never into a tree on disk (it does not place one, and does not run the
+   command, when the tree already has a set's path or a link or a
+   non-directory on its way: *A confinement failure stops the run; it is
+   never a result*); loopback as its only network. The shim is the
    namespace's PID 1: when the command exits it sends every process in the
    namespace SIGTERM, then SIGKILL, copies the runner's report to a
    descriptor leerie holds, and exits as the command did; the kernel frees
@@ -4958,7 +5122,8 @@ mounts above; the container's policy decides both.
   leerie version on the host, and a reload applies at once to every
   container already running under it. A container started by an older
   version keeps its own shim after the operator upgrades and the new
-  launcher reloads the profile, so the profile allows the union of what
+  launcher reloads the profile (*A launch runs only the leerie code it
+  started with*), so the profile allows the union of what
   every version that can still be running needs. A rule is added when a
   shim starts needing it and is not removed when a shim stops: a removal
   is a change of its own, with a migration that first ensures no
@@ -5238,6 +5403,112 @@ that outer shim, which exits the same way (an init cannot die of a signal
 it raises on itself). The first prototype walked the outer `/proc` from
 inside the namespace and hung; with `kill(-1)` the namespace ended in
 under a second after the command.
+
+### A confinement failure stops the run; it is never a result
+
+Once the confinement check every entry runs (`_require_confinement`) has
+passed, the shim can still refuse to start a command: the kernel or the
+container's policy may change under a running run, or a step the check
+does not probe may fail. Before this rule a refusal was an exit 126 like
+any other, and each caller read it as its own kind of outcome. Measured on
+2026-11-03 at 22:41, while the five runs of *A launch runs only the leerie
+code it started with* ran a shim their AppArmor profile refused, the same
+"cannot isolate the command" became, by caller:
+
+- a measurement's failure: `build-failed: 'pnpm run build': leerie: cannot
+  isolate…`, and the run's final conformance was recorded with false
+  build and test failures;
+- a worker crash downgraded to an advisory ("conformer round 0: worker
+  crashed; phase surfaced as advisory");
+- "dependency install failed … no evidence either way" at the acceptance
+  gate, after a store fetch "exited 126";
+- a "non-fatal error" of the dependency capture, whose result was lost.
+
+Each was saved, and `resume` then skipped the phase as already complete
+("final conformance already complete"). The root cause is that the
+refusal had no type of its own: it reached each caller as data.
+
+The invariant: **a confinement failure is an environment failure, never
+a measurement or a worker's result. It stops the run, with an exit that
+names it, before anything of the step is recorded; `resume` then redoes
+the step it interrupted.**
+
+The mechanism:
+
+- The shim reports a refusal on a descriptor of its own, `--refusal-fd`,
+  which leerie opens for every confined spawn (a pipe) and the command
+  never holds: the shim makes it close-on-exec before anything else, so
+  only the shim and its own forks before `exec` can write it. Every place
+  the shim refuses (leaving the terminal, building the isolation or the
+  sandbox, the Landlock ruleset and the seccomp filter, becoming a
+  subreaper, entering the worker view) writes its reason there and exits
+  126; the reason is the same text it prints. An exit 126 with nothing on
+  the descriptor is the command's own exit 126 (an exec refused by
+  permissions inside the repository's script), and stays the ordinary
+  outcome it always was. The signal is the descriptor, not the status and
+  not the text.
+- The command cannot reach the descriptor through `/proc` either. The
+  shim makes itself non-dumpable (`PR_SET_DUMPABLE` 0) before it starts
+  the command, and the kernel then lets only a process with
+  `CAP_SYS_PTRACE` over the shim open `/proc/<shim>/fd/N`. Without it, a
+  command could forge a refusal: review round 39 (isolation, D2) read
+  `--refusal-fd N` from `/proc/$PPID/cmdline`, opened
+  `/proc/$PPID/fd/N` for writing and wrote "cannot isolate the command"
+  into it, exit 0, under a shim without `--isolate`, on the host and in
+  the container; Landlock does not mediate pipes. Under `--isolate`, which
+  every spawn after `_require_confinement` uses, the review measured the
+  open refused, which nothing in the shim chose: it rested on the
+  capabilities the shim kept in the user namespace it made. Run as the
+  container's root user instead, in a container of this image, the same
+  forge under `--isolate` succeeded too (2026-11-04, the shim before this
+  rule). The non-dumpable shim refuses it in both (`EACCES`), by design.
+- A held-out file the tree leaves no room for is a fact about the tree,
+  not a refusal. A worker can commit a link, or a file, where a set's
+  directory must be (`tests -> spec_real`). The shim places each file
+  following no link (`_place_one`), so it cannot place that one; until
+  review round 39 (isolation, R1) it said so through the refusal
+  descriptor, and the committed tree turned into exit 78 on every
+  `resume`, because the evaluation runs again over the same tree. Now:
+  - every caller that places a file checks its path first by the shim's
+    own rule, `_lexists_beneath`: a file at the path, or a link or a
+    non-directory on any component on its way, makes the path taken (the
+    acceptance gate records it `path_in_use`, the set unmeasured; the set
+    audit, the parse check and the falsifier's confirm skip it), and the
+    file is never handed to the shim;
+  - the shim itself reports a path it finds taken (`EEXIST`, `ENOTDIR`,
+    `ELOOP`) on a descriptor of its own, `--taken-fd`, never on the
+    refusal descriptor, and does not run the command; leerie raises
+    `HeldOutPathTaken`, an `OSError`, which each caller reads as the run
+    it could not make. Any other placement failure (no space, a read-only
+    overlay, a policy denial) is the environment's and stays a refusal.
+- `_confined_argv`, which builds every confined command's argv, takes
+  the descriptor, every call names it (a test reads them all), and each
+  place that spawns one (`_run_streaming` for the
+  measurements, installs and store fetches, `_invoke` for workers,
+  `_ts_script_run` for the AST scripts, the `mise ls` capture) opens it
+  with `_shim_refusals()` and checks it once the process has ended, before
+  the caller sees an exit status or a worker's result. A refusal raises
+  `ConfinementRefused`, a `BaseException` like the other run-ending
+  signals, so no caller's `except Exception` can read it as a failure,
+  record it, or downgrade it to an advisory.
+- `main()` stops the run on it: it saves the state as it was before the
+  step (the step had recorded nothing), cleans up worktrees only, does not
+  attempt the dependency capture (a confined worker, which would refuse
+  again), names the command and the shim's reason, and exits
+  `EXIT_CONFINEMENT_REFUSED` (78, `EX_CONFIG`). On Fly and EC2 that exit is
+  not a clean one, so the machine is paused for the resume. The
+  confinement probes inside `_require_confinement` keep their own `die()`:
+  they are the check, and they read the shim's exit themselves.
+- The one confined step a refusal does not stop is the dependency
+  capture (*§6½*): it is best-effort by design and never blocks a run, so
+  its guards catch `ConfinementRefused` with the other run-ending signals
+  and log it as "not run — the confinement shim refused it, nothing
+  recorded". Nothing is recorded, not a wrong result: a capture is
+  recorded only once it succeeds, so `leerie config --recapture` captures
+  the run later.
+- Not covered: a refusal inside a worker, by `scripts/worker-shell.py`
+  for one of the worker's tool calls, reaches the worker as that call's
+  exit 126; the worker reads its own tool results.
 
 ### A command leerie runs starts with the signal dispositions it would have outside leerie
 
@@ -5869,6 +6140,112 @@ cross-check via a `/proc` scan for any process whose argv contains
 orchestrator is sufficient to declare "alive," making the pid file
 advisory: even a future race produces at worst a false-positive REFUSE,
 never silent corruption.
+
+### A launch runs only the leerie code it started with
+
+A local run's container read leerie's own code from the install
+directory itself: the launcher bind-mounted `$LEERIE_REPO` (the checkout
+`~/.local/bin/leerie` points to, `~/.leerie` by default) at
+`/opt/leerie-image` read-only, shadowing the copy baked into the image.
+The orchestrator's module is read once, at start, but everything else is
+read again at every use: `scripts/landlock_exec.py` at every confined
+spawn, `scripts/worker-shell.py` and the hooks at every tool call, a
+worker's prompt at every worker, the worktree scripts at every git step,
+and the orchestrator itself again when the container re-execs it to
+resume after a rate limit. `install.sh` updates the install with `git
+checkout`, which replaces each file, so an upgrade reached every
+container that was running at that moment.
+
+Measured on 2026-11-03: the operator installed 0.44.0 at 22:40 under five
+running 0.43.0 runs. From 22:41 every confined command and worker in
+them ran 0.44.0's shim, which makes a private `/dev` (`private_dev`), under
+the AppArmor profile 0.43.0 had loaded, which does not allow that mount:
+every one refused ("cannot isolate the command, so it does not run:
+tmpfs /dev: EACCES") until the operator stopped the runs. The tracebacks
+of the stopped 0.43.0 processes print 0.44.0's source lines, read from
+the replaced file. *The profile only grows* already assumed that "a
+container started by an older version keeps its own shim"; it did not.
+
+The invariant: **a launch runs only the leerie code it started with.**
+Upgrading or editing the install never changes a running run.
+
+The mechanism:
+
+- The launcher takes one snapshot of its own code, the four directories
+  the image bakes (`orchestrator/`, `scripts/`, `prompts/`,
+  `.claude-plugin/`), before any image step and before it checks the
+  command line (which loads the snapshot's orchestrator, *A command line
+  is refused before any image step*). The snapshot moves into the
+  launch's staging directory (`$STAGE/leerie-code`), and the container
+  mounts it at `/opt/leerie-image` read-only. The install directory is
+  never mounted. The snapshot's `plugin.json` version must be the
+  launcher's own (`LEERIE_VERSION`, which also names the image): an
+  install that changed version since the launcher started stops the
+  launch, naming the two versions, rather than run one version's code in
+  another's image.
+- The snapshot is one state of the install, and the run records that
+  state (`LEERIE_COMMIT`, `leerie_commit`), never one read at another
+  moment. Each shape of install has its own snapshot:
+  - A git checkout with nothing changed in those directories (an
+    `install.sh` install): `git archive` of the commit `HEAD` names, read
+    once. `LEERIE_COMMIT` is that commit. An update that rewrites the
+    checkout meanwhile cannot tear it, because a commit's objects never
+    change.
+  - A git checkout with edits there (a contributor's): the edits run on
+    the next launch, as they always did. They are hashed into a tree
+    object through a private index, twice. The two must agree, no git
+    command may hold the checkout's index lock, and `HEAD` and the
+    index's entries must be the same before and after; otherwise the
+    checkout changed while it was read, and the launch stops. That tree
+    is archived, and `LEERIE_COMMIT` is `<commit>-dirty.<tree>`, so the
+    record names exactly the code that ran (`git archive <tree>` in that
+    checkout gives it back). Nothing is staged in the checkout itself.
+  - An install that is not a git checkout (a plugin directory installed
+    without git): copied, then compared with the install as it stands
+    after the copy. A difference means the install changed under the
+    copy, and the launch stops. `LEERIE_COMMIT` is empty: there is no
+    commit.
+  *Measured 2026-11-04 (review round 39, execution E2 and E3):* the record
+  was read at the launcher's start and the copy taken after the image
+  steps, 7 minutes later on a first launch, so a same-version update in
+  between ran code the record did not name. And the copy was `cp -pR` of
+  the working tree: while `git checkout` flipped the install between two
+  same-version commits, 147 of 300 copies held a partial `leerie.py`, and
+  all were accepted (176 of 300 torn or mixed when re-measured on this
+  host). On the snapshot, under the same flipping, 123 of 600 attempts
+  took a snapshot and the other 477 stopped the launch; none of the 123
+  was torn or mixed, and each equals the code its `LEERIE_COMMIT` names.
+- The copy lives exactly as long as the launch: it is part of `$STAGE`,
+  which the launcher's exit removes and the next launch's sweep removes
+  when its launcher is gone (*A staged copy of the credentials lives only
+  as long as its launch*); a container whose launcher is gone is reaped
+  on the next `resume` of its run (`_reap_orphaned_container`).
+- The launcher's own steps after the container exits (bringing the run
+  branch back, finalize) source `scripts/host-finalize.sh` from the same
+  copy, not from the install.
+- Why not the image's baked copy: the image is named by version
+  (`leerie:<version>`), not by code. Every commit between two releases,
+  and a contributor's edits, carry the version of the last release, so a
+  run would silently execute the image's older code while
+  `LEERIE_COMMIT` named the checkout's. A copy per launch keeps "an edit
+  is picked up by the next launch, with no rebuild" and makes it the only
+  moment an edit is picked up.
+- A resume across versions is a new launch: it runs the resuming
+  leerie's code from its start to its end, and never two versions in one
+  container. Whether it may continue the run directory at all is the
+  layout rule below (*A run directory is continued only by a leerie of
+  its layout*): 0.43.0 and 0.44.0 share layout 3, so a 0.43.0 run resumed
+  by 0.44.0 is allowed, and runs 0.44.0 throughout.
+- Fly and EC2 are not affected on the machine: a Fly Machine runs the
+  code baked into the image it was started from, pinned by digest, and an
+  EC2 instance the code baked into its AMI; an upgrade on the operator's
+  host reaches neither. Their host-side teardown still sources
+  `host-finalize.sh` from the install when the launcher exits; that is
+  the host acting on a run already fetched home, not the run's own
+  process, and is not covered here.
+- What is shared across versions on one host is not code but host state:
+  the AppArmor profile (*The profile only grows*) and the run's records
+  (the layout rule).
 
 ### A run directory is continued only by a leerie of its layout
 
@@ -6721,21 +7098,33 @@ richer body must never block finalize success.
 
 **The PR's end-state section is rendered by code, from typed state, on
 every composition path.** `_format_pr_end_state_section` turns what the run
-recorded into at most six short lists, each under its own heading, each
+recorded into at most seven short lists, each under its own heading, each
 present only when it has an entry:
 
 - `## Unconverged` — why the PR is a draft: the outcome decider's reasons
   (§6 *The run outcome is decided once*) and every `unconverged` subtask
   with its own reason.
 - `## Needs human verification` — one checkbox list, grouped by the
-  resource a human must supply: the task's required items the classifier
-  typed `external`, subtasks accepted on an `external_precondition`
-  blocker (§13), risks a worker typed `gap: unverified_external` (a
-  concurrency risk whose tests can only stub the interleaving is labelled
-  so — `simulated_interleaving`), audited fix sites resolved by an
-  untyped (`other`) change (§5 *Every `fix` site is claimed*), and
-  held-out acceptance sets the final tree left unmeasured, with why (§8
-  *A held-out set the final tree leaves unmeasured is never silent*).
+  resource a human must supply, and only entries that carry a typed
+  external resource: the task's required items the classifier typed
+  `verifiability: external`, subtasks accepted on an
+  `external_precondition` blocker that names its `resource` (§13), and
+  risks a worker typed `gap: unverified_external` with the `resource`
+  it names (§9 *Only an entry naming an external resource is
+  external*).
+- `## Not verified by this run` — everything else the run could not
+  settle, grouped by why: required items whose only evidence is a
+  worker's command or whose judge crashed, regression checks the confirm
+  budget or a sized-out pass left open, intermittent failures the run may
+  have introduced, held-out acceptance sets the final tree left
+  unmeasured (§8 *A held-out set the final tree leaves unmeasured is
+  never silent*), concurrency risks whose tests only simulate the
+  interleaving (`simulated_interleaving`), a blocker that names no
+  resource, and audited fix sites resting on an untyped (`other`) change
+  that the delivery gate did not settle (§8 *A site resting on an
+  untyped resolution is settled by the run*). Each is a limit on what the
+  run measured, stated with its reason; the reviewer may check it, but
+  nothing outside the repository is needed to.
 - `## Untested after re-drive` — changed lines that no test executes after
   the coverage re-drive spent its rounds (§9 *Changed lines no test
   executes are re-driven*). Listed, never a reason to draft.
@@ -6747,11 +7136,30 @@ present only when it has an entry:
   findings, the contract-literal flags and the site-token hits (§8, §9),
   labelled advisory because nothing waited on them.
 
+*Only a typed external resource reaches "Needs human verification".* The
+section answers one question — what must a human bring that the run could
+not — and an entry the run could have settled with more budget, a rerun or
+a reading of its own code answers a different one. 0.44.0 stated the rule
+for risks only, and the renderer still filed every other source there: the
+user's run 48c48629 (barnacle#665) listed an untyped fix site to read, and
+run ebe36d49 (barnacle#670) "Check by hand that no existing test newly
+fails … the confirm budget ran out after 2 of 3 base/final rerun pair(s)"
+and intermittent test IDs, none of which needs anything outside the
+repository; the user found the section confusing for it. So the rule is
+structural: the "Needs human verification" renderer reads only the three
+typed external shapes above, and every other source renders under "Not
+verified by this run" through its own function. A guard test builds one
+entry of every source — the ones derived from the code's writers and the
+ones read from other state — and fails on any line in "Needs human
+verification" that did not come from a typed external resource.
+
 *Every entry the run records for a human renders.* The invariant: an
-entry in `needs_human_verification` is a check the run handed to a human,
-so the PR shows every one of them — a group per source where the source
-has one, and an "Other checks the run could not make" group for any
-source that does not. Review round 14 H1 drove the root cause: the
+entry in `needs_human_verification` is a check the run could not make
+itself, so the PR shows every one of them — under "Needs human
+verification" when it carries a typed external resource, else under "Not
+verified by this run", in a group per source where the source has one, and
+an "Other checks the run could not make" group for any source that does
+not. (The state key keeps its name.) Review round 14 H1 drove the root cause: the
 renderer was a hand-kept chain of one branch per source, unconnected to
 the writers, so the two sources that round added — a final delivery
 judge that crashed on every attempt (`delivery_judge_unknown`) and a
@@ -7659,8 +8067,10 @@ under Landlock, the install against the read-only store failed with
 `ERR_SQLITE_ERROR` without it and succeeded with it (2.2 s, no inode
 shared), and `pnpm run` succeeded too. So every measurement except the
 store fetch sets `frozen_store=true` and `verify_deps_before_run=false`
-under both spellings (`_measurement_grants`); pnpm 10.4.1 accepts both
-unchanged (install and `pnpm run` succeed). The fetched class can then hold
+(`_measurement_grants`); pnpm 10.4.1 accepts both unchanged (install and
+`pnpm run` succeed). `frozen_store` is spelled only as pnpm 11 reads it,
+`pnpm_config_frozen_store` (*pnpm's settings are spelled for the pnpm that
+reads them*). The fetched class can then hold
 pnpm 11's store as well as pnpm 10's. corepack picks the version from the
 repository's `packageManager`, else a last-known-good it keeps in
 `COREPACK_HOME`, else the newest on the registry, which was pnpm 11.1.2. So
@@ -7673,6 +8083,36 @@ it. pnpm also writes a lock and state under `XDG_STATE_HOME` and
 directory and, for the runtime directory, which holds sockets, the tree's
 private temp directory (*A confined command's scratch is short and
 private*).
+
+**pnpm's settings are spelled for the pnpm that reads them.** pnpm 10
+reads a setting from the environment only as `npm_config_<key>`, pnpm 11
+only as `pnpm_config_<key>`. npm reads every `npm_config_<key>` too, and
+warns once per key it does not know, in every npm a command runs — a test
+script's `npx`, a `postinstall` — `npm warn Unknown env config
+"store-dir"` ("This will stop working in the next major version of npm"),
+four lines per npm in the user's 0.44.0 run (barnacle, 2026-11-03:
+`store-dir`, `cache-dir`, `frozen-store`, `verify-deps-before-run`). A
+setting reaches pnpm under npm's spelling only when the pnpm that reads
+that spelling has the setting: `frozen-store` is pnpm 11's alone (pnpm
+10.4.1's and 10.34.9's sources do not name it), so it is set as
+`pnpm_config_frozen_store` only. `store_dir`, `cache_dir`,
+`package_import_method` and `verify_deps_before_run` keep both spellings
+(`_PNPM_SETTINGS`, `_with_pnpm_spellings`), and npm still warns about
+them: pnpm 10 has no way to be given a setting that npm does not also read
+and that outranks the repository's own. Its other channel, its global rc
+(`$XDG_CONFIG_HOME/pnpm/rc`), which npm never reads, ranks below a
+committed `.npmrc`: measured with pnpm 10.4.1 and 10.34.9, a committed
+`store-dir=` and `package-import-method=hardlink` win over the rc and lose
+to the environment, so the rc would hand the repository leerie's choice of
+store and import mode (*The stores a view installs from are leerie's*, *A
+view's install never writes leerie's store*). pnpm 11 does not read that
+file at all. And pnpm 10 itself exports `npm_config_store_dir` and
+`npm_config_verify_deps_before_run` into every script it runs, whatever
+leerie sets (measured: a script's `npm` under pnpm 10.4.1 with no
+`npm_config_*` set by its caller still warns `verify-deps-before-run`), so
+a pnpm 10 repository's npm warns whatever spelling leerie chose. The
+warnings left are pnpm 10's; leerie adds none for a setting no pnpm reads
+under that name.
 
 What this does not cover: a worker writing leerie's store, a view, `/opt`
 or a toolchain under `MISE_DATA_DIR` directly. Those are writes outside
@@ -11488,6 +11928,32 @@ under the same dispute vote.
   the code-file and test-file patterns also take other languages'
   usual suffixes.
 
+**A site resting on an untyped resolution is settled by the run.** An
+audited `fix` site whose resolution kind — the audit's or a claim's — is
+`other` passes the claims check without a typed match (§5 *Every `fix`
+site is claimed*), so nothing has compared it with what changed. 0.44.0
+handed every such site to a human: the user's run 48c48629
+(barnacle#665) listed "Check `src/scraper/session-shared.ts` … (D8) is
+resolved" under "Needs human verification" — a reading of the
+repository's own code, which the run can make as well as any reviewer,
+under the heading kept for a resource only a human can bring (§9 *Only
+an entry naming an external resource is external*), and the user found
+the section confusing for it. So the call that asks the contract verdict
+(below) also asks, per such site, one typed answer: `site_verdicts`
+entries of `site_id`, `resolved` and the citations of the code that
+resolves it. Code settles a site only on a majority of that pass's
+samples voting `resolved` with at least one citation, every one of which
+verifies against HEAD (`_verify_delivery_cite`, the items' rule); a
+fabricated quote settles nothing. The settlement is recorded on the
+site's `site_claims` row and re-taken by every pass that asks the
+contract, so the last tree judged decides. A settled site is not shown.
+One the gate did not settle — never asked (no gate ran, it crashed), voted
+unresolved, or cited nothing that verifies — is listed under "Not
+verified by this run" with the judge's evidence when it gave one,
+never under "Needs human verification". It does not gate: the contract
+verdict already judges every audited site, and an unmet contract is what
+re-drives.
+
 **The gate judges the finding, not only the items.** Measured across
 three reports' repeat-run loops (14 of the 17 v0.32.x runs,
 2026-09-28..30): every run that shipped a fix shipped an
@@ -13240,16 +13706,69 @@ settles `complete` only when all of these hold:
 3. **The `satisfied_probe` finds its criteria met on HEAD.** This is the
    base-tree-only probe the pre-spawn check already uses. It is given the
    `success_criteria_seed` and each `verify` criterion, and it defaults to
-   not satisfied.
+   not satisfied. It is also told which criteria check 2 just decided:
+   the command leerie ran for each and that it exited 0. The probe judges
+   what a command cannot — that the case was written, that the substance
+   is on the tree — and never whether the command passes: it cannot run
+   one in its read-only tree, and leerie already has. A verdict of
+   `cannot_verify` (the probe could not check) is not a gap found, so it
+   does not overrule leerie's own execution where that execution decided
+   what the probe could not check. A command decides only what it
+   exercises: a criterion over twelve files is not decided by a command
+   that runs two of them, however that command exits. Whether an argv
+   exercises everything a criterion names is a reading of the criterion's
+   words, which code cannot make (§12 *Language-to-JSON*), so the probe
+   says it as typed ids. Each criterion has one (the seed's is `seed`,
+   each `verify` criterion's `criterion-<n>`); on `cannot_verify` the
+   probe lists `unverifiable`, the criteria it could not check by
+   reading, and `covered_by_execution`, the criteria one passing command
+   exercises in full. The claim settles only when every `verify`
+   criterion carries an argv and every one passed in check 2, and every
+   `unverifiable` id is one leerie knows and is also in
+   `covered_by_execution`. A gap the probe finds (`artifact_missing`,
+   `behavior_gap`, `partially_met`, or no type at all) still re-drives;
+   so does `cannot_verify` on a subtask with any criterion no command
+   decides, with no `verify` argv at all, without the two lists, or with
+   a criterion it could not check that no passing command covers in full.
+   *Decided 2026-11-04 (review round 39, execution E1):* settling on any
+   one passing argv attached to a criterion settled the live
+   `bugfix-006` shape untrimmed. Its seed reads "each listed test file
+   passes" over twelve files, its one command runs two, and a sibling had
+   left the twelfth broken. Leerie's run of the two passed, the probe
+   could not run tests, and the subtask settled `complete`, so its
+   dependent ran on a broken file.
 
 Each check covers a gap in the others. The probe alone once settled `e33`
 on a reading of the tree. Execution alone settled `e33` too (bench E4/d4,
 `exec_v1`), because running a test file passes whether or not the new
 case was written. A criterion with no command is decided only by the
-probe. The sibling precondition holds the rest to the one case where an
+probe. A criterion a command exercises in full is decided by that
+command: the probe can find a gap in it, but not undo the pass by failing
+to check it. The
+sibling precondition holds the rest to the one case where an
 earlier wave can have done the work. A settle records `dropped_subtasks
 [sid]` with reason `satisfied_by_sibling`, the `satisfied_by` merges, the
-probe's evidence and the executed commands. It goes through the same
+probe's evidence and the executed commands, and `decided_by:
+"execution"` when the probe answered `cannot_verify`.
+
+*Designed 2026-11-04 (the live barnacle run `54fb56c3`, started on 0.43.0
+and resumed on 0.44.0).* Wave 3's `bugfix-004` changed the generator and
+files on the surface of `bugfix-006`, which was planned to migrate twelve
+test files off the old field.
+`bugfix-006` reported `nothing_to_change`; its sibling precondition held,
+and its verify command (`pnpm vitest run` over two of the files) passed
+when leerie ran it. The probe then ran the tests itself, eleven of twelve
+failed on a `mkdirSync` its read-only tree refused, and it answered
+`cannot_verify` ("I could not confirm 'migrated files pass'") while
+reporting the migration present in all twelve. That outvoted the pass on
+the first try and on both re-drives; `bugfix-006` settled `unconverged`,
+and its dependent `bugfix-010` settled `unconverged` without running. The
+probe's tree is read-only to it (§6 *A worker writes only where it is
+granted (I5)*): without a command verb in its tools it cannot run the
+command, and with one a test that writes fails there. Either way, for a
+criterion that reads "these tests pass", `cannot_verify` is its honest
+answer every time, so the three checks as first written could never
+settle that claim. It goes through the same
 helper and branch rules as every no-commit settle, so its zero-commit
 branch integrates as a no-op. Anything short of all three keeps the
 re-drive, and the reason it was not settled joins the blocker. A
@@ -14780,6 +15299,14 @@ Two further disciplines sit at the §12 axis:
      runs: of 39 unaddressed external entries, 36 named no resource, every
      one of them an `exercised: false` note — "docs-only change", "Diff is
      a test only", "I only ran the two changed test files" — and 3 did.
+     The rule binds every source the PR renders, not risks alone: a
+     regression check the confirm budget left open, an intermittent
+     failure, an unmeasured held-out set or an unsettled fix site is a
+     limit on what the run measured, rendered under "Not verified by this
+     run" with its reason, never as a human check (§6 *Only a typed
+     external resource reaches "Needs human verification"*). A risk whose
+     tests only simulate an interleaving names no resource either, so it
+     is listed there too.
   2. **Routed by type, never dumped.** `gap: unverified_external` with its
      `resource` reaches the PR's "Needs human verification" list, grouped
      by that resource (§6 *Finalization*);
@@ -17677,7 +18204,7 @@ prose:
 
 | `blocker_kind` | Routing |
 |---|---|
-| `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
+| `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there — or, when every criterion has a command and each passed, finds no gap, answering only `cannot_verify` with every criterion it could not check one a passing command exercises in full (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
 | `external_precondition` (+ `external_resource`, `external_resource_claim`) | the only kind that may be accepted, and only when code verifies the typed resource (below): settled `accepted_external` and listed under "Needs human verification"; a claim the check does not verify is `other`, except that the same claim unverified for an environmental reason on two blocked attempts in a row (no completed attempt between them) settles `unconverged` (`external_unverified`, below) |
 | `environment_limit` | retried in place once, then `unconverged` (the rule of §6 *At the measured ceiling, a resource kill is an environment limit*) |
 | `upstream_missing` | re-driven |

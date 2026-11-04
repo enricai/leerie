@@ -228,6 +228,21 @@ audited sites), also return the `contract` object:
   and mislabeling it `unmet` sends a conformer to break one of the two.
 - `verdict: "unverifiable"`: see the next section.
 
+## Sites resting on an untyped resolution
+
+When your payload carries a SITES RESTING ON AN UNTYPED RESOLUTION
+section, each listed site was resolved by a change no typed kind
+describes, so nothing has yet checked it against the code. Return one
+`site_verdicts` entry per listed `site_id`:
+
+- `resolved: true` only when this tree resolves the site as its
+  `resolution` describes, with `cites` (the same citation shape as an
+  item's parts) quoting the code that does it. The orchestrator checks
+  every quote against `HEAD`; a site whose citations do not all verify
+  counts as not resolved.
+- `resolved: false` otherwise, with `evidence` saying what you found or
+  could not verify, and where.
+
 ## Ground-truth availability
 
 When your payload carries a GROUND-TRUTH AVAILABILITY section, the

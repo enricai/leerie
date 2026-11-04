@@ -789,13 +789,16 @@ def _emulated_heldout_sandbox(request, monkeypatch):
     leerie = request.getfixturevalue("leerie")
     real = leerie._confined_argv
 
-    def _argv(grants, cmd, *, sandbox=None, report_fd=None, **kw):
+    def _argv(grants, cmd, *, sandbox=None, report_fd=None, taken_fd=None,
+              **kw):
         if sandbox is None:
             return real(grants, cmd, **kw)
         out = [sys.executable, "-I", str(HELDOUT_SANDBOX_EMULATOR),
                "--view", sandbox.view]
         for src, rel in sandbox.place:
             out += ["--place", f"{src}={rel}"]
+        if taken_fd is not None:
+            out += ["--taken-fd", str(taken_fd)]
         if sandbox.report is not None and report_fd is not None:
             out += ["--report", sandbox.report, "--report-fd",
                     str(report_fd)]

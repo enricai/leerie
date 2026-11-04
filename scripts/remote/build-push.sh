@@ -342,6 +342,15 @@ _build_push_local() {
         echo "build-push: $LEERIE_BUILDKIT_REFUSAL" >&2
         return 1
       }
+      # The repository's own file is built here too (the launcher's
+      # _fly_push --dockerfile), so an image an earlier leerie left where the
+      # worker reads must be gone first, as before a local repository build.
+      leerie_sweep_worker_images || {
+        echo "build-push: $LEERIE_BUILDKIT_REFUSAL" >&2
+        return 1
+      }
+      leerie_content_sharing_check \
+        || echo "build-push: warning: $LEERIE_CONTENT_SHARING_HINT" >&2
       bk_flags=(--buildkit-host "$LEERIE_BUILDKIT_HOST")
     fi
   fi

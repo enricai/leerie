@@ -250,6 +250,10 @@ def _post_run(user: Path, state_root: Path, run_id_file: Path,
         ["bash", "-c", script],
         env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(state_root),
              "USER_REPO": str(user), "LEERIE_REPO": str(REPO_ROOT),
+             # The launch's copy of the code, which the bring-back sources
+             # (DESIGN §6 *A launch runs only the leerie code it started
+             # with*).
+             "_code_dir": str(REPO_ROOT),
              "LEERIE_STATE_HOST_DIR": str(state_root)},
         capture_output=True, text=True)
 
@@ -340,6 +344,7 @@ def _post_exit(tmp_path, state, fake, *, ran: str | None, rc: int = 0,
         ["bash", "-c", script],
         env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(tmp_path),
              "USER_REPO": str(tmp_path), "LEERIE_REPO": str(fake),
+             "_code_dir": str(fake),
              "LEERIE_STATE_HOST_DIR": str(state)},
         capture_output=True, text=True)
 
@@ -454,6 +459,10 @@ def test_ctrl_c_still_brings_the_branch_back(run, tmp_path):
         ["bash", "-c", script], start_new_session=True,
         env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(tmp_path),
              "USER_REPO": str(user), "LEERIE_REPO": str(REPO_ROOT),
+             # The launch's copy of the code, which the bring-back sources
+             # (DESIGN §6 *A launch runs only the leerie code it started
+             # with*).
+             "_code_dir": str(REPO_ROOT),
              "LEERIE_STATE_HOST_DIR": str(state_root)},
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 20

@@ -109,7 +109,8 @@ not parse or interpret the reason text — quote it as-is. Do not
 invent ordering constraints beyond what the data says.
 
 Do **not** write any of these sections yourself: `## Unconverged`,
-`## Needs human verification`, `## Untested after re-drive`,
+`## Needs human verification`, `## Not verified by this run`,
+`## Untested after re-drive`,
 `## Integration content loss`, `## Repository merge checks still red`,
 `## Advisory (not verified by this run)` (nor a `## ⚠ Residual risks`
 section). The orchestrator renders them from the run's typed state and

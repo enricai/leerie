@@ -1582,6 +1582,14 @@ EXIT_BUDGET_INFEASIBLE = 11
 # the BSD sysexits.h EX_TEMPFAIL convention.
 EXIT_LOCKED = 75
 
+# Emitted when the confinement shim refused to start a command after the
+# confinement check every entry runs (`_require_confinement`) had passed
+# (`ConfinementRefused`; DESIGN §6 *A confinement failure stops the run; it is
+# never a result*). 78 is sysexits.h EX_CONFIG: the environment, not the work,
+# is what failed. Resumable once the environment is fixed; not a clean exit
+# for the Fly/EC2 teardown, which pauses the machine for that resume.
+EXIT_CONFINEMENT_REFUSED = 78
+
 # Fixed backoff before auto-resuming a rate-limit that carried NO parseable
 # reset time — chiefly the out-of-credits mid-stream kill, where the kill left
 # no `resetsAt` to compute a wake time from (DESIGN §6 *Rate-limited →
@@ -4164,6 +4172,17 @@ SCHEMAS: dict[str, dict] = {
             # by the typed path — mirroring the prose rule that
             # `surviving_siblings` context only ever drives keeps.
             "sibling_invalidation_risk": {"type": "boolean"},
+            # Post-execution settle only (`decided_by_execution` in the
+            # payload; DESIGN §8 *A no-op a sibling already delivered is
+            # settled on evidence*): on `cannot_verify`, the ids (`seed`,
+            # `criterion-<n>`) of the criteria the probe could not check by
+            # reading, and of those a passing command exercises in full.
+            # `_execution_answers_cannot_verify` lets execution answer the
+            # verdict only when the first set is inside the second; both
+            # absent (or empty) leave `cannot_verify` standing.
+            "unverifiable": {"type": "array", "items": {"type": "string"}},
+            "covered_by_execution": {"type": "array",
+                                     "items": {"type": "string"}},
         },
     },
     "artifact_registry": {
@@ -4491,6 +4510,26 @@ SCHEMAS: dict[str, dict] = {
                     "conflicting_contracts": {
                         "type": "array",
                         "items": {"type": "string"},
+                    },
+                },
+            },
+            # Per audited site resting on an untyped (`other`) resolution
+            # the payload lists (DESIGN §8 *A site resting on an untyped
+            # resolution is settled by the run*): code settles a site only
+            # on a majority of `resolved` votes whose every cite verifies.
+            "site_verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["site_id", "resolved", "cites",
+                                 "evidence"],
+                    "properties": {
+                        "site_id": {"type": "string"},
+                        "resolved": {"type": "boolean"},
+                        "cites": {"type": "array",
+                                  "items": {"$ref": "#/$defs/cite"}},
+                        "evidence": {"type": "string"},
                     },
                 },
             },
@@ -4984,13 +5023,20 @@ def now() -> str:
 # as a control sequence*: C0 but newline and tab, DEL and C1, the
 # bidirectional and line/paragraph separators a terminal acts on, and a
 # lone surrogate (a byte that was not UTF-8, kept by `surrogateescape`).
-# `scripts/terminal-text.py` holds the same rule for the launcher's relay.
+# The first alternative, a complete 7-bit CSI (colour, cursor, erase), is
+# dropped rather than escaped: it carries no text, and escaping every SGR
+# made a relayed test run unreadable. One pass, so no removal can join a new
+# sequence. `scripts/terminal-text.py` holds the same rule for the
+# launcher's relay.
 _TERMINAL_CONTROL = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e"
+    "\x1b\\[[0-?]{0,64}[ -/]{0,8}[@-~]"
+    "|[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e"
     "\u2066-\u2069\ud800-\udfff]")
 
 
 def _terminal_escape(m: "re.Match[str]") -> str:
+    if len(m.group()) > 1:
+        return ""
     o = ord(m.group())
     if 0xdc80 <= o <= 0xdcff:
         return f"\\x{o - 0xdc00:02x}"
@@ -4998,11 +5044,12 @@ def _terminal_escape(m: "re.Match[str]") -> str:
 
 
 def _terminal_text(s: str) -> str:
-    """`s` with every control character written as its escape, so text a
-    repository or a worker chose (a file name, a worker's JSON string)
+    """`s` with every complete CSI sequence removed and every other control
+    character written as its escape, so text a repository or a worker chose
+    (a file name, a worker's JSON string, a test runner's coloured line)
     reaches the operator's terminal as text, never as a sequence the
-    terminal acts on (OSC 52 sets the clipboard). Idempotent: an escape is
-    printable."""
+    terminal acts on (OSC 52 sets the clipboard). Idempotent: what remains
+    holds no control character."""
     return _TERMINAL_CONTROL.sub(_terminal_escape, s)
 
 
@@ -5366,6 +5413,38 @@ class TerminalAuthFailure(BaseException):
     def __init__(self, raw_message: str):
         super().__init__(raw_message)
         self.raw_message = raw_message
+
+
+class ConfinementRefused(BaseException):
+    """The confinement shim refused to start a command or a worker after
+    the entry's confinement check had passed (DESIGN §6 *A confinement
+    failure stops the run; it is never a result*). Raised by
+    `_ShimRefusals.check` when the shim wrote its refusal descriptor
+    (`--refusal-fd`), never inferred from an exit status or a message.
+
+    A BaseException, like `TerminalAuthFailure`: a caller's `except
+    Exception` must not read it as a build failure, a worker crash or "no
+    evidence", record it, or downgrade it to an advisory, as every caller
+    did with the bare exit 126 on 2026-11-03 at 22:41. `main()` stops the
+    run on it with `EXIT_CONFINEMENT_REFUSED`, having recorded nothing of
+    the interrupted step, which `resume` then redoes.
+
+    `what`: the command or worker refused; `reason`: the shim's own text."""
+    def __init__(self, what: str, reason: str):
+        super().__init__(f"{what}: {reason}")
+        self.what = what
+        self.reason = reason
+
+
+class HeldOutPathTaken(FileExistsError):
+    """The confinement shim did not place a held-out file, because the tree
+    already has its path: a file there, or a link or a non-directory on its
+    way (`--taken-fd`). A fact about the tree a worker committed, not a
+    confinement failure: an `OSError`, so each caller reads it as the run
+    it could not make, never as `ConfinementRefused` (DESIGN §6 *A
+    confinement failure stops the run; it is never a result*). Each caller
+    checks the path first (`_lexists_beneath`, the shim's own rule); this
+    is the shim saying so where that check was not made."""
 
 
 # Literal Claude Code subscription rate-limit message format, observed
@@ -7058,6 +7137,7 @@ _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     _RISK_SECTION_HEADING,
     "## Unconverged",
     "## Needs human verification",
+    "## Not verified by this run",
     "## Untested after re-drive",
     "## Integration content loss",
     "## Repository merge checks still red",
@@ -7195,7 +7275,66 @@ def _needs_human_detail_groups() -> dict[str, str]:
 def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
                     ) -> dict[str, list[str]]:
     """The "Needs human verification" checkboxes, grouped by the resource a
-    human must supply, in first-seen order and de-duplicated."""
+    human must supply, in first-seen order and de-duplicated. Only the three
+    shapes that carry a typed external resource are read here (DESIGN §6
+    *Only a typed external resource reaches "Needs human verification"*):
+    a required item the classifier typed `verifiability: external`, a
+    `blocker` naming its `resource`, and an unaddressed risk typed `gap:
+    unverified_external` with its `resource`. Everything else the run could
+    not settle is `_pr_not_verified`'s."""
+    groups: dict[str, list[str]] = {}
+
+    def add(group: str, line: str) -> None:
+        bucket = groups.setdefault(group, [])
+        if line not in bucket:
+            bucket.append(line)
+
+    for e in state.get("needs_human_verification") or []:
+        if not isinstance(e, dict):
+            continue
+        if e.get("source") == "required_item" and _pr_entry(e.get("item")):
+            add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
+        elif (e.get("source") == "blocker"
+              and isinstance(e.get("subtask"), str)
+              and _pr_entry(e.get("resource"))):
+            add(_pr_entry(e.get("resource")),
+                f"- [ ] **{e['subtask']}** was not done, waiting on it: "
+                f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
+    for sid, e in _pr_open_risks(state, in_pr):
+        resource = _pr_entry(e.get("resource"))
+        # External only with the resource a human must supply: an entry
+        # recorded without one (an older leerie typed every unexercised
+        # path external) is a gap the run's own checks answer (DESIGN §9).
+        if e.get("gap") == "unverified_external" and resource:
+            add(resource, f"- [ ] **{sid}**: {_pr_entry(e.get('detail'))}"
+                + _pr_paths(e.get("where_paths"))
+                + (" — tests simulate the interleaving"
+                   if e.get("simulated_interleaving") is True else ""))
+    return groups
+
+
+def _pr_open_risks(state: dict, in_pr: Callable[[str], bool]
+                   ) -> list[tuple[str, dict]]:
+    """`(sid, entry)` for every unaddressed `risk_register` entry with a
+    detail, of a subtask whose work the PR contains."""
+    out: list[tuple[str, dict]] = []
+    register = state.get("risk_register")
+    for sid, entries in (register.items()
+                         if isinstance(register, dict) else ()):
+        if not in_pr(sid) or not isinstance(entries, list):
+            continue
+        out += [(sid, e) for e in entries
+                if isinstance(e, dict) and e.get("addressed") is not True
+                and _pr_entry(e.get("detail"))]
+    return out
+
+
+def _pr_not_verified(state: dict, in_pr: Callable[[str], bool]
+                     ) -> dict[str, list[str]]:
+    """The "Not verified by this run" checkboxes: every check the run could
+    not settle that needs nothing outside the repository, grouped by why
+    (DESIGN §6 *Only a typed external resource reaches "Needs human
+    verification"*), in first-seen order and de-duplicated."""
     groups: dict[str, list[str]] = {}
 
     def add(group: str, line: str) -> None:
@@ -7209,12 +7348,13 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             continue
         source = e.get("source")
         if source == "required_item":
-            if _pr_entry(e.get("item")):
-                add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
-        elif source == "blocker" and isinstance(e.get("subtask"), str):
-            add(_pr_entry(e.get("resource")) or "Unnamed resource",
-                f"- [ ] **{e['subtask']}** was not done, waiting on it: "
-                f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
+            continue
+        if source == "blocker":
+            if (isinstance(e.get("subtask"), str)
+                    and not _pr_entry(e.get("resource"))):
+                add("Work waiting on a precondition no one named",
+                    f"- [ ] **{e['subtask']}** was not done, waiting on: "
+                    f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
         elif _pr_entry(e.get("detail")):
             # Every other entry is a `detail` line. One a group table does
             # not name still renders: an entry in state that the PR leaves
@@ -7232,43 +7372,49 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             "base; it imports "
             + ", ".join(_pr_code(p) for p in row.get("imports_changed") or [])
             + " (changed here). Re-run it repeatedly before merging.")
-    register = state.get("risk_register")
-    for sid, entries in (register.items()
-                         if isinstance(register, dict) else ()):
-        if not in_pr(sid) or not isinstance(entries, list):
-            continue
-        for e in entries:
-            if not isinstance(e, dict) or e.get("addressed") is True:
-                continue
-            simulated = e.get("simulated_interleaving") is True
-            resource = _pr_entry(e.get("resource"))
-            # External only with the resource a human must supply: an
-            # entry recorded without one (an older leerie typed every
-            # unexercised path external) is a gap the run's own checks
-            # answer, not a check for a human (DESIGN §9).
-            if not simulated and not (
-                    e.get("gap") == "unverified_external" and resource):
-                continue
-            detail = _pr_entry(e.get("detail"))
-            if not detail:
-                continue
-            group = resource or "A real concurrent engine"
-            add(group, f"- [ ] **{sid}**: {detail}"
+    for sid, e in _pr_open_risks(state, in_pr):
+        if (e.get("simulated_interleaving") is True
+                and not (e.get("gap") == "unverified_external"
+                         and _pr_entry(e.get("resource")))):
+            add("Concurrency the tests only simulate",
+                f"- [ ] **{sid}**: {_pr_entry(e.get('detail'))}"
                 + _pr_paths(e.get("where_paths"))
-                + (" — tests simulate the interleaving" if simulated
-                   else ""))
-    claims = state.get("site_claims")
-    for row in ((claims.get("sites") or []) if isinstance(claims, dict)
-                else []):
-        if not isinstance(row, dict) or row.get("surface_other") is not True:
+                + " — tests simulate the interleaving")
+    for line in _untyped_site_lines(state):
+        add("Fix sites resting on an untyped change the run did not settle",
+            line)
+    return groups
+
+
+def _untyped_sites(state: dict) -> list[dict]:
+    """The `site_claims` rows resting on an untyped (`other`) resolution
+    (`surface_other`), which the delivery gate settles (DESIGN §8 *A site
+    resting on an untyped resolution is settled by the run*)."""
+    claims = state.get("site_claims") if isinstance(state, dict) else None
+    return [r for r in ((claims.get("sites") or [])
+                        if isinstance(claims, dict) else [])
+            if isinstance(r, dict) and r.get("surface_other") is True
+            and isinstance(r.get("site_id"), str)]
+
+
+def _untyped_site_lines(state: dict) -> list[str]:
+    """The "Not verified by this run" lines for the untyped sites the gate
+    did not settle — never a human check: the run can read its own code
+    (DESIGN §6 *The PR's end-state section*)."""
+    out: list[str] = []
+    for row in _untyped_sites(state):
+        settlement = row.get("settlement")
+        if isinstance(settlement, dict) and settlement.get("settled") is True:
             continue
         where = " ".join(_pr_code(row[k]) for k in ("file", "symbol")
                          if isinstance(row.get(k), str) and row[k].strip())
-        add("Fix sites resolved by an untyped change",
-            f"- [ ] Check {where or 'the site'} "
-            f"({_pr_entry(row.get('site_id'))}) is resolved: "
-            f"{_pr_entry(row.get('resolution')) or 'no resolution recorded'}")
-    return groups
+        ev = (_pr_entry(settlement.get("evidence"))
+              if isinstance(settlement, dict) else "")
+        out.append(
+            f"- [ ] {where or 'the site'} ({_pr_entry(row.get('site_id'))}): "
+            f"{_pr_entry(row.get('resolution')) or 'no resolution recorded'}"
+            + (f" — the delivery judge: {ev}" if ev else ""))
+    return out
 
 
 def _pr_advisory(state: dict) -> list[str]:
@@ -7341,9 +7487,10 @@ def _pr_advisory(state: dict) -> list[str]:
 def _format_pr_end_state_section(state: dict) -> str:
     """The PR body's end-state section, rendered from typed run state, or ""
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
-    rendered by code, from typed state*). Up to six headed lists, each only
-    when non-empty, in this order: `## Unconverged` (why the PR is a draft),
-    `## Needs human verification`, `## Untested after re-drive`,
+    rendered by code, from typed state*). Up to seven headed lists, each
+    only when non-empty, in this order: `## Unconverged` (why the PR is a
+    draft), `## Needs human verification` (typed external resources only),
+    `## Not verified by this run`, `## Untested after re-drive`,
     `## Integration content loss`, `## Repository merge checks still red`,
     `## Advisory (not verified by this run)`.
 
@@ -7399,6 +7546,14 @@ def _format_pr_end_state_section(state: dict) -> str:
         for group, items in groups.items():
             lines += [f"**{group}**", *items, ""]
         sections.append(("## Needs human verification", lines[:-1]))
+
+    groups = _pr_not_verified(state, in_pr)
+    if groups:
+        lines = ["Checks the run could not settle, each with why. None needs "
+                 "anything outside the repository.", ""]
+        for group, items in groups.items():
+            lines += [f"**{group}**", *items, ""]
+        sections.append(("## Not verified by this run", lines[:-1]))
 
     lines = []
     for sid, rec in sorted(_dict("coverage_redrive").items()):
@@ -10417,6 +10572,7 @@ def resolve_heal_success_threshold(repo_root: Path,
 async def run_proc(cmd: list[str], *, cwd: str | None = None,
                    timeout: float | None = None,
                    env: dict[str, str] | None = None,
+                   pass_fds: tuple[int, ...] = (),
                    ) -> subprocess.CompletedProcess:
     """Async equivalent of `subprocess.run(cmd, capture_output=True, text=True)`.
     On timeout, kills the process and raises `subprocess.TimeoutExpired` — same
@@ -10432,11 +10588,13 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     `env` defaults to None, which inherits the orchestrator's environment
     (asyncio's own default) — so every existing call site is unchanged.
     Callers pass it to scope a variable to one command, e.g.
-    `_rescue_integrator_work`'s throwaway `GIT_INDEX_FILE`."""
+    `_rescue_integrator_work`'s throwaway `GIT_INDEX_FILE`. `pass_fds`: a
+    confined command's refusal descriptor (`_shim_refusals`)."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
         env=env,
+        pass_fds=pass_fds,
         # Never the orchestrator's fd 0, the operator's terminal in an
         # interactive run (DESIGN §6 *No confined process holds a
         # descriptor of the operator's terminal*).
@@ -10738,10 +10896,20 @@ async def _run_streaming(
                  if sandbox is not None and sandbox.report is not None
                  else None)
     report_fd = report_fh.fileno() if report_fh is not None else None
+    # Checked in the `finally`, before the caller sees an exit status (DESIGN
+    # §6 *A confinement failure stops the run; it is never a result*). A
+    # held-out file the tree leaves no room for comes back on a descriptor
+    # of its own: a fact about the tree, never a refusal.
+    refusals = _ShimRefusals(label or " ".join(cmd))
+    taken = (_ShimTaken(label or " ".join(cmd))
+             if sandbox is not None and sandbox.place else None)
     try:
         async with _exec_lock().shared():
             spawn_cmd = _confined_argv(grants, list(cmd), sandbox=sandbox,
-                                       report_fd=report_fd)
+                                       report_fd=report_fd,
+                                       refusal_fd=refusals.fd,
+                                       taken_fd=(taken.fd if taken is not None
+                                                 else None))
             # A command in a run's tree reads that tree's own stores
             # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may
             # share*).
@@ -10757,7 +10925,10 @@ async def _run_streaming(
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *spawn_cmd,
-                    pass_fds=tuple(fd for fd in (gate_r, report_fd)
+                    pass_fds=tuple(fd for fd in (gate_r, report_fd,
+                                                 refusals.fd,
+                                                 taken.fd if taken is not None
+                                                 else None)
                                    if fd is not None),
                     cwd=cwd,
                     env={**_repo_command_env(env), **dict(grants.env)},
@@ -10859,6 +11030,14 @@ async def _run_streaming(
     finally:
         if report_fh is not None:
             report_fh.close()
+        try:
+            refusals.check()
+        except ConfinementRefused:
+            if taken is not None:
+                taken.close()
+            raise
+        if taken is not None:
+            taken.check()
 
 
 async def _gather_or_cancel(*aws):
@@ -18182,7 +18361,8 @@ async def _filter_satisfied_subtasks(
 async def _probe_criteria_satisfied_on_head(
     subtask: dict, worktree: str, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
-    label: str = "head",
+    label: str = "head", *, executed: dict | None = None,
+    verdict: dict | None = None,
 ) -> dict | None:
     """Run-branch-HEAD analogue of `_filter_satisfied_subtasks`'s per-subtask
     probe, asked before a plan-time-flagged provider-subset subtask spawns
@@ -18210,7 +18390,13 @@ async def _probe_criteria_satisfied_on_head(
     but still HEAD-only, never history-spanning git, via the same
     `SATISFIED_PROBE_TOOLS` scope. HEAD here is the same ref the mechanical
     commit-presence gate measures against, so the probe cannot false-positive
-    on code present only on an unrelated branch."""
+    on code present only on an unrelated branch.
+
+    `executed`, a `pass` record of `_settle_by_execution`, tells the probe
+    which criteria leerie's own execution decided, so it judges substance
+    and never re-runs them in its read-only tree (DESIGN §8 *A no-op a
+    sibling already delivered is settled on evidence*). `verdict`, when
+    given, receives the probe's raw output for the caller to type."""
     sid = subtask.get("id", "?")
     seed = (subtask.get("success_criteria_seed") or "").strip()
     if not seed:
@@ -18225,12 +18411,15 @@ async def _probe_criteria_satisfied_on_head(
             subtask.get("files_likely_touched", []) or []),
     }
     # The subtask's own per-criterion list, when the planner typed one:
-    # each must be met too, not only the seed's summary of them.
-    criteria = [v["criterion"] for v in (subtask.get("verify") or [])
-                if isinstance(v, dict) and isinstance(v.get("criterion"), str)
-                and v["criterion"].strip()]
+    # each must be met too, not only the seed's summary of them. Each has an
+    # id the verdict names it by (the seed's is `seed`).
+    criteria = [{"id": cid, "criterion": v["criterion"]}
+                for cid, v in _probe_criteria(subtask)]
     if criteria:
         payload["criteria"] = criteria
+    decided = _criteria_decided_by_execution(subtask, executed)
+    if decided:
+        payload["decided_by_execution"] = decided
     user_prompt = (
         "SUBTASK:\n" + json.dumps(payload, indent=2) +
         "\n\nReturn only the JSON object per your schema. Judge the "
@@ -18238,6 +18427,19 @@ async def _probe_criteria_satisfied_on_head(
         "history. Default satisfied=false on any uncertainty."
         + (" `satisfied` means the seed AND every entry of `criteria` are "
            "met." if criteria else "")
+        + (" Each entry of `decided_by_execution` is a criterion whose "
+           "command the orchestrator itself just ran on this HEAD, exiting "
+           "0: that command passes. Do not run it again — your tree is "
+           "read-only, and a test that writes fails there for that reason "
+           "alone. Judge only what a passing command cannot show: that the "
+           "substance the criterion describes is on this tree. On "
+           "`cannot_verify`, list in `unverifiable` the id of every "
+           "criterion (`seed` included) you could not check by reading "
+           "this tree, and in `covered_by_execution` the id of every "
+           "criterion (`seed` included) that one passing command exercises "
+           "in full: every file, case and behaviour the criterion names, "
+           "not only some of them."
+           if decided else "")
     )
     # bump_workers OUTSIDE the try, same as _filter_satisfied_subtasks: a
     # budget-exhaustion WorkerError must propagate to abort the run, not be
@@ -18281,6 +18483,8 @@ async def _probe_criteria_satisfied_on_head(
             f"({_brief_worker_exc(e)}); not rescuing "
             "(fail-safe — no-op stays retryable)")
         return None
+    if verdict is not None and isinstance(out, dict):
+        verdict.update(out)
     if out.get("satisfied") is True:
         return {
             "reason": "already_satisfied_mid_run",
@@ -19565,7 +19769,8 @@ async def _backstop_capture_prior_runs(
         # abort the backstop loop (or, in main()'s exit handlers, skip the
         # EXIT_LOCKED pause). Catch them here so capture stays non-fatal.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as exc:
+                ContextOverflow, DiskLowSpace,
+                ConfinementRefused) as exc:
             log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
 
 
@@ -19691,7 +19896,8 @@ def run_recapture_deps(
                 # exactly that shape and fails loudly if the guard and the
                 # call it guards ever drift apart.
                 except (Exception, TerminalAuthFailure, RateLimitedExit,
-                        ContextOverflow, DiskLowSpace) as exc:
+                        ContextOverflow, DiskLowSpace,
+                        ConfinementRefused) as exc:
                     log(f"recapture: error during dep_capture for "
                         f"{target_run_dir.name}: {exc}")
                     return False
@@ -19706,7 +19912,8 @@ def run_recapture_deps(
             if asyncio.run(_capture_with_strict_output()):
                 ran_any = True
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as exc:
+                ContextOverflow, DiskLowSpace,
+                ConfinementRefused) as exc:
             log(f"recapture: error during dep_capture for "
                 f"{target_run_dir.name}: {exc}")
 
@@ -21069,6 +21276,18 @@ def _save_state_best_effort(st: "State", where: str) -> None:
             "stands and `leerie resume` still works from it")
 
 
+def _capture_failure_note(exc: BaseException) -> str:
+    """How a best-effort dependency capture's failure is logged. A refusal
+    of the confinement shim is named as one: the capture is the one
+    confined step that never stops a run (DESIGN §6½), and a refused one
+    recorded nothing, so a later `leerie config --recapture` still
+    captures it (DESIGN §6 *A confinement failure stops the run; it is
+    never a result*)."""
+    if isinstance(exc, ConfinementRefused):
+        return "not run — the confinement shim refused it, nothing recorded,"
+    return "non-fatal error"
+
+
 async def _best_effort_capture_deps(
         repo_root: Path,
         st: "State",
@@ -21103,9 +21322,10 @@ async def _best_effort_capture_deps(
             record_in=st.run_dir,
         )
     except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-            RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-        log(f"capture: non-fatal error during {context_label} "
-            f"({_cap_exc})")
+            RateLimitedExit, ContextOverflow, DiskLowSpace,
+            ConfinementRefused) as _cap_exc:
+        log(f"capture: {_capture_failure_note(_cap_exc)} during "
+            f"{context_label} ({_cap_exc})")
 
 
 def _brief_worker_exc(exc: BaseException) -> str:
@@ -24125,7 +24345,7 @@ def _require_worker_view() -> None:
     if wr is None or not _isolated():
         return
     argv = _confined_argv(WorkerGrants(rw=("/dev/null",), ro=("/",)),
-                          ["test", "-e", _WORKER_ENV_MARK])
+                          ["test", "-e", _WORKER_ENV_MARK], refusal_fd=None)
     try:
         r = subprocess.run(argv, cwd="/", stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=60,
@@ -24334,7 +24554,7 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
                 sandbox=HeldOutSandbox(view=str(view),
                                        place=((str(held), rel),),
                                        report=str(view / "report.json")),
-                report_fd=rep.fileno(), worker_root=False)
+                report_fd=rep.fileno(), worker_root=False, refusal_fd=None)
             r = subprocess.run(argv, cwd=str(view), stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, timeout=60,
                                pass_fds=(rep.fileno(),))
@@ -25044,10 +25264,78 @@ def _worker_root() -> str | None:
     return str(WORKER_ROOT) if stat.S_ISDIR(st.st_mode) else None
 
 
+class _ShimRefusals:
+    """The shim's refusal descriptor for one confined spawn (DESIGN §6 *A
+    confinement failure stops the run; it is never a result*): a pipe whose
+    write end `fd` is passed to the shim (`--refusal-fd`, `pass_fds`). The
+    shim writes it only when it refuses, and makes it close-on-exec, so
+    the command itself never holds it: a command's own exit 126 leaves it
+    empty. `check()` once the process has ended: raises
+    `ConfinementRefused` when the shim wrote it."""
+
+    def __init__(self, what: str) -> None:
+        self.what = what
+        self._r, self.fd = os.pipe()
+        os.set_blocking(self._r, False)
+        self._closed = False
+
+    def close(self) -> bytes:
+        """Close both ends; returns what the shim wrote, if anything."""
+        if self._closed:
+            return b""
+        self._closed = True
+        _close_fd(self.fd)
+        raw = b""
+        try:
+            while True:
+                chunk = os.read(self._r, 65536)
+                if not chunk:
+                    break
+                raw += chunk
+        except OSError:
+            pass
+        finally:
+            _close_fd(self._r)
+        return raw
+
+    def check(self) -> None:
+        raw = self.close()
+        if raw:
+            raise ConfinementRefused(
+                self.what, raw.decode(errors="replace").strip())
+
+
+class _ShimTaken(_ShimRefusals):
+    """The shim's taken descriptor for one held-out sandbox (`--taken-fd`):
+    the same pipe, written only when a held-out file could not be placed
+    because the tree has its path. `check()` raises `HeldOutPathTaken`."""
+
+    def check(self) -> None:
+        raw = self.close()
+        if raw:
+            raise HeldOutPathTaken(
+                f"{self.what}: {raw.decode(errors='replace').strip()}")
+
+
+@contextlib.contextmanager
+def _shim_refusals(what: str) -> Iterator[int]:
+    """A `_ShimRefusals` around a spawn's whole life: yields the descriptor
+    to pass to `_confined_argv` and `pass_fds`, and checks it on the way
+    out, whatever the body raised — a refusal replaces the exit status or
+    error the body was reading it as."""
+    refusals = _ShimRefusals(what)
+    try:
+        yield refusals.fd
+    finally:
+        refusals.check()
+
+
 def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
+                   refusal_fd: int | None = None,
                    sandbox: HeldOutSandbox | None = None,
                    report_fd: int | None = None, cli: bool = False,
-                   worker_root: bool = True) -> list[str]:
+                   worker_root: bool = True,
+                   taken_fd: int | None = None) -> list[str]:
     """`cmd` started through the Landlock shim with `grants`. With
     `sandbox`, in a held-out sandbox (always: a held-out file never runs
     outside one, and the shim refuses where it cannot build one), its
@@ -25062,15 +25350,25 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
     isolated, it runs in the worker view (`--worker-root`); a worker's CLI
     (`cli`) stays in leerie's root and its commands run there instead
     (`--cli`, `scripts/worker-shell.py`). `worker_root` False: leerie's
-    root, for the sandbox probe, which checks the shim's own machinery."""
+    root, for the sandbox probe, which checks the shim's own machinery.
+    `refusal_fd`: the write end of the spawn's `_ShimRefusals`, which the
+    spawn also passes in `pass_fds`. Every call in this module names it
+    (a test reads every call): None only for `_require_confinement`'s own
+    probes, which read the shim's exit themselves. `taken_fd` (with
+    `sandbox`): the write end of the spawn's `_ShimTaken`, where the shim
+    says a held-out file's path is the tree's."""
     # `-S`: the shim imports only the standard library, and `site` cost
     # ~15 ms of every worker's start (measured).
     argv = [sys.executable, "-I", "-S", str(LANDLOCK_SCRIPT)]
+    if refusal_fd is not None:
+        argv += ["--refusal-fd", str(refusal_fd)]
     wr = _worker_root() if worker_root else None
     if sandbox is not None:
         argv += ["--sandbox", "--view", sandbox.view]
         for src, rel in sandbox.place:
             argv += ["--place", f"{src}={rel}"]
+        if taken_fd is not None:
+            argv += ["--taken-fd", str(taken_fd)]
         if sandbox.report is not None and report_fd is not None:
             argv += ["--report", sandbox.report, "--report-fd",
                      str(report_fd)]
@@ -25944,13 +26242,15 @@ def _measurement_grants(st: "State", tree: str | Path,
         # store each failed (review round 19 exec H3). `frozen-store` is
         # pnpm's own read-only mode for an immutable store: measured, a
         # pnpm 11 install then succeeds against it and shares no inode with
-        # it, and pnpm 10.4.1 accepts both settings unchanged. Both
-        # spellings (`_PNPM_SETTINGS`): pnpm 10 reads `npm_config_*`, pnpm 11
-        # `pnpm_config_*`.
-        for k, v in (("frozen_store", "true"),
-                     ("verify_deps_before_run", "false")):
-            env[f"npm_config_{k}"] = v
-            env[f"pnpm_config_{k}"] = v
+        # it, and pnpm 10.4.1 accepts both settings unchanged.
+        # `frozen-store` is pnpm 11's alone, so only pnpm 11's spelling: an
+        # `npm_config_frozen_store` no pnpm reads, and every npm a command
+        # runs warns about it (DESIGN §6 *pnpm's settings are spelled for
+        # the pnpm that reads them*). `verify-deps-before-run` is both
+        # generations', so both spellings (pnpm 10 reads `npm_config_*`).
+        env["pnpm_config_frozen_store"] = "true"
+        env["npm_config_verify_deps_before_run"] = "false"
+        env["pnpm_config_verify_deps_before_run"] = "false"
     # A measurement reaches nothing outside its own loopback; the kinds
     # that fetch (an install, a toolchain, the setup hook, leerie's store
     # fetch) reach the outside through the egress proxy (DESIGN §6 *A
@@ -26389,8 +26689,14 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # Unconfined (the host-side seam): the CLI is found from `/`, never
     # through PATH from the directory it starts in (DESIGN §6 *The host
     # never runs a program the checkout chose*, part 4).
+    # A confined worker's refusal descriptor, checked as the last step of the
+    # teardown below, before the envelope or exit status is read (DESIGN §6
+    # *A confinement failure stops the run; it is never a result*).
+    refusals = (_ShimRefusals(f"worker {sid}") if grants is not None
+                else None)
     spawn_cmd = ([_exe_from_root(cmd[0]), *cmd[1:]] if grants is None
-                 else _confined_argv(grants, list(cmd), cli=True))
+                 else _confined_argv(grants, list(cmd), cli=True,
+                                     refusal_fd=refusals.fd))
     gate_r: int | None = None
     gate_w: int | None = None
     if cgroup_sid is not None:
@@ -26398,7 +26704,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     try:
         proc = await asyncio.create_subprocess_exec(
             *spawn_cmd,
-            pass_fds=(gate_r,) if gate_r is not None else (),
+            pass_fds=tuple(fd for fd in (
+                gate_r, refusals.fd if refusals is not None else None)
+                if fd is not None),
             cwd=cwd,
             # The staged prompt file when the caller has a prompt to feed (the
             # normal `claude_p` path — the user prompt no longer travels on
@@ -26436,6 +26744,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         if stdin_path is not None:
             with contextlib.suppress(OSError):
                 os.unlink(stdin_path)
+        if refusals is not None:
+            refusals.close()
         await exec_hold.aclose()
         raise
     _close_fd(gate_r)
@@ -26486,6 +26796,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         except BaseException:
             # The closed gate exits without running the worker.
             _release_spawn_gate(gate_w, run=False)
+            if refusals is not None:
+                refusals.close()
             await exec_hold.aclose()
             raise
         _release_spawn_gate(gate_w)
@@ -26956,6 +27268,10 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # Its process tree has ended and been reaped: the worker no longer
         # exists.
         await exec_hold.aclose()
+        # Last, so every step above has run: a refusal replaces whatever
+        # this worker's exit is about to be read as.
+        if refusals is not None:
+            refusals.check()
 
     if envelope is None:
         stderr_txt = b"".join(stderr_chunks).decode(errors="replace").strip()
@@ -32957,12 +33273,16 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     try:
         # A confined command: under the execution lock, as `_run_streaming`.
         async with _exec_lock().shared():
-            result = await run_proc(
-                _confined_argv(grants, ["mise", "ls", "--current", "--json"]),
-                cwd=str(repo_root),
-                env={**_repo_command_env(env), **dict(grants.env)},
-                timeout=MISE_LS_TIMEOUT,
-            )
+            with _shim_refusals("mise ls --current --json") as refusal_fd:
+                result = await run_proc(
+                    _confined_argv(grants,
+                                   ["mise", "ls", "--current", "--json"],
+                                   refusal_fd=refusal_fd),
+                    cwd=str(repo_root),
+                    env={**_repo_command_env(env), **dict(grants.env)},
+                    timeout=MISE_LS_TIMEOUT,
+                    pass_fds=(refusal_fd,),
+                )
     except subprocess.TimeoutExpired:
         # Not fatal — workers run their own install commands via prompt
         # injection (DESIGN §6½ "Worker-driven install"); they don't
@@ -51103,6 +51423,9 @@ async def _delivery_judge_unmet(
     # wrapper, losing the residual line (round 2).
     normalized = [_delivery_norm_item(item) for item in items]
     n_items = len(normalized)
+    # Asked with the contract, in its pack (DESIGN §8 *A site resting on an
+    # untyped resolution is settled by the run*).
+    untyped = _untyped_sites(st.data) if contract_ctx is not None else []
     # Routing (DESIGN §8 *Grouped judging at coverage item counts*): code
     # settles what code can before any judge prompt is built.
     own_start = _acceptance_own_start(st)
@@ -51211,6 +51534,18 @@ async def _delivery_judge_unmet(
             avail = _format_ground_truth_availability(ground_truth)
             if avail:
                 sections.append(avail)
+            if untyped:
+                sections.append(
+                    "SITES RESTING ON AN UNTYPED RESOLUTION (DESIGN §8: "
+                    "resolved by a change no typed kind describes, so "
+                    "nothing has checked them): also return one "
+                    "`site_verdicts` entry per site_id below, per your "
+                    "schema — resolved=true only with cites quoting the "
+                    "code that resolves it on this tree.\n"
+                    + json.dumps([{k: r.get(k, "") for k in
+                                   ("site_id", "file", "symbol",
+                                    "resolution")} for r in untyped],
+                                 indent=2))
         sections.extend(typed_evidence or [])
         sections.append(
             "Return one verdict per item_index per your schema. met=true "
@@ -51250,7 +51585,8 @@ async def _delivery_judge_unmet(
         # for: shape + per-site disposition is measured at roughly two
         # items' worth of verification (DESIGN §8).
         judge_max_turns = min(
-            30 + 6 * len(pack) + (12 if with_contract else 0), 90)
+            30 + 6 * len(pack) + (12 if with_contract else 0)
+            + (2 * len(untyped) if with_contract else 0), 90)
         sid_base = (f"delivery_judge-{phase_label}"
                     + (f"-p{p}" if len(packs) > 1 else ""))
         allowed = set(pack)
@@ -51274,6 +51610,14 @@ async def _delivery_judge_unmet(
                 _relative_cites(v, judge_cwd[0])
                 for v in (smp.get("verdicts") or [])
                 if isinstance(v, dict) and v.get("item_index") in allowed]}
+            if isinstance(smp.get("site_verdicts"), list):
+                smp["site_verdicts"] = [
+                    {**sv, "cites": _relative_cites(
+                        {"parts": [{"cites": sv["cites"]}]},
+                        judge_cwd[0])["parts"][0]["cites"]}
+                    if isinstance(sv, dict)
+                    and isinstance(sv.get("cites"), list) else sv
+                    for sv in smp["site_verdicts"]]
             # A met resting only on a worker's command run is unknown, not
             # unmet: it goes to a human, never to a re-drive (review round
             # 12 L3; leerie never re-runs it, round 14).
@@ -51359,6 +51703,9 @@ async def _delivery_judge_unmet(
                               "evidence": evidence})
     confirmed.sort(key=lambda u: u["item_index"])
     _set_record_worker_gap(st, judge_idx, human)
+    if untyped and per_pack:
+        _settle_untyped_sites(st, untyped, per_pack[0], staging,
+                              exec_digest, cite_cache)
     if routing is not None and human:
         routing["human_verification"] = sorted(human)
     contract_result: dict | None = None
@@ -51403,6 +51750,41 @@ async def _delivery_judge_unmet(
         contract_result = _downgrade_ungrounded_met(
             contract_result, ground_truth)
     return confirmed, n_samples, contract_result
+
+
+def _settle_untyped_sites(st: "State", untyped: list[dict],
+                          samples: list[dict], tree: str | Path,
+                          record: str, cache: dict) -> None:
+    """Record on each untyped site's `site_claims` row whether this pass
+    settled it (DESIGN §8 *A site resting on an untyped resolution is
+    settled by the run*): `settled` only when more than half of `samples`
+    voted `resolved` with at least one citation, every one verified
+    against HEAD (`_verify_delivery_cite`). Replaces the row's earlier
+    settlement: the last tree judged decides."""
+    for row in untyped:
+        votes, evidence = 0, ""
+        for smp in samples:
+            sv = next((v for v in reversed(smp.get("site_verdicts") or [])
+                       if isinstance(v, dict)
+                       and v.get("site_id") == row["site_id"]), None)
+            if sv is None:
+                continue
+            cites = [c for c in (sv.get("cites") or [])
+                     if isinstance(c, dict)]
+            ok = (sv.get("resolved") is True and bool(cites)
+                  and len(cites) == len(sv.get("cites") or [])
+                  and all(_verify_delivery_cite(c, tree, record, cache)
+                          in _DELIVERY_CITE_OK for c in cites))
+            votes += 1 if ok else 0
+            if not ok and not evidence:
+                evidence = (str(sv.get("evidence") or "").strip()
+                            if sv.get("resolved") is not True else
+                            "claimed resolved, but its citations do not "
+                            "verify on the tree")
+        row["settlement"] = {"settled": 2 * votes > len(samples),
+                             "votes": votes, "samples": len(samples),
+                             "evidence": evidence[:600]}
+    st.save()
 
 
 # --- held-out acceptance tests (DESIGN §8 *Held-out acceptance tests*) ----
@@ -53289,7 +53671,7 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     Returned with a short reason for the log. Short of True, the
     declaration is not honoured."""
     probe = _acceptance_probe_rel(st, test_rel)
-    if (Path(tree) / probe).exists():
+    if _lexists_beneath(Path(tree), Path(tree) / probe):
         return None, "the parse check's name is taken in the tree"
     # The probe is placed in the sandbox, never written into the tree: its
     # source is a file of leerie's own, outside every grant.
@@ -54404,11 +54786,12 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         try:
             for rel in ((s_.get("support_files") or [])
                         + s_["defect_files"] + s_["control_files"]):
-                dst = wt / rel
-                if dst.exists() or dst.is_symlink():
+                if _lexists_beneath(wt, wt / rel):
                     # Never placed over (or run in place of) a file the
-                    # tree already has — and never count the set as
-                    # passing on a file it could not run.
+                    # tree already has, nor through a link or a
+                    # non-directory on its way (the shim's own rule) — and
+                    # never count the set as passing on a file it could
+                    # not run.
                     unmeasured = True
                     why_files[rel] = "path_in_use"
                     continue
@@ -55487,8 +55870,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
     out: dict = {"failing_cases": [], "findings": [], "kinds": [],
                  "sample_kinds": [], "samples": 0}
     log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
-    if any((wt / rel).exists() or (wt / rel).is_symlink()
-           for rel in _set_files(set_)):
+    if any(_lexists_beneath(wt, wt / rel) for rel in _set_files(set_)):
         out["skipped"] = "a set path already exists in the audited tree"
         return out
     # The set's runs place it in their sandboxes; only then is it staged on
@@ -58196,11 +58578,12 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
             "whose grant does not reach it — leerie's own invariant is "
             "broken (DESIGN §6 *Leerie's runs of the repository's commands "
             "are confined too*). Report this.")
-    return subprocess.run(_confined_argv(grants, argv), cwd=str(tree),
-                          stdin=subprocess.DEVNULL,
-                          capture_output=True, text=text, timeout=timeout,
-                          check=False,
-                          env={**_ts_script_env(), **dict(grants.env)})
+    with _shim_refusals(" ".join(argv)) as refusal_fd:
+        return subprocess.run(
+            _confined_argv(grants, argv, refusal_fd=refusal_fd),
+            cwd=str(tree), stdin=subprocess.DEVNULL, capture_output=True,
+            text=text, timeout=timeout, check=False, pass_fds=(refusal_fd,),
+            env={**_ts_script_env(), **dict(grants.env)})
 # Coupling policy over those facts (bench n2d coupling.py, frozen). Every
 # pattern reads code tokens, paths or shell commands — mechanical strings
 # (DESIGN §12), never prose.
@@ -61830,7 +62213,13 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             staging, grants=_measurement_grants(st, staging))
     trade_pairs = {tuple(p) for p in rec["trade_pairs"]}
     prior_members: list[str] = []
-    ids_before = await _redrive_test_ids(st, caps, staging, "redrive-ids0")
+    # The baseline is the first thing a round spends, so a budget already
+    # spent on entry (a resume after the stop) does not measure it: the
+    # loop below stops before any round reads it (DESIGN §13: the hard
+    # stop for every re-drive).
+    ids_before = (None if float(st.data.get("redrive_spent_sec") or 0.0)
+                  >= budget else
+                  await _redrive_test_ids(st, caps, staging, "redrive-ids0"))
     rechecked_sha = rec.get("items_rechecked_sha")
 
     def set_note(k: str, v: dict, kind: str) -> dict:
@@ -63725,6 +64114,12 @@ def _verification_only(subtask: dict) -> bool:
     every listed criterion carries an executable argv."""
     if subtask.get("verification_only") is not True:
         return False
+    return _every_criterion_has_argv(subtask)
+
+
+def _every_criterion_has_argv(subtask: dict) -> bool:
+    """Whether `verify` lists at least one criterion and every one carries
+    an executable argv: no criterion is left that only a reader decides."""
     entries = subtask.get("verify")
     if not isinstance(entries, list) or not entries:
         return False
@@ -63924,6 +64319,78 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
     return _done()
 
 
+# The satisfied-probe's id for a subtask's `success_criteria_seed`; each
+# `verify` criterion's is `_probe_criteria`'s.
+_PROBE_SEED_ID = "seed"
+
+
+def _probe_criteria(subtask: dict) -> list[tuple[str, dict]]:
+    """`(id, entry)` for each `verify` entry that names a criterion, as the
+    satisfied-probe is shown them: `criterion-<n>`, counted from 1 over
+    those entries. The verdict names a criterion by this id
+    (`unverifiable`, `covered_by_execution`)."""
+    out: list[tuple[str, dict]] = []
+    for v in subtask.get("verify") or []:
+        if (isinstance(v, dict) and isinstance(v.get("criterion"), str)
+                and v["criterion"].strip()):
+            out.append((f"criterion-{len(out) + 1}", v))
+    return out
+
+
+def _criteria_decided_by_execution(subtask: dict,
+                                   executed: dict | None) -> list[dict]:
+    """`[{id, criterion, argv, exit: 0}]`: each `verify` criterion whose
+    argv the `pass` record `executed` ran and passed. Empty without a
+    pass."""
+    if not isinstance(executed, dict) or executed.get("verdict") != "pass":
+        return []
+    passed = [c.get("argv") for c in executed.get("commands") or []
+              if isinstance(c, dict) and c.get("passed") is True]
+    return [{"id": cid, "criterion": v["criterion"], "argv": list(v["argv"]),
+             "exit": 0}
+            for cid, v in _probe_criteria(subtask)
+            if v.get("argv") and v.get("argv") in passed]
+
+
+def _execution_decides_criteria(subtask: dict, executed: dict | None) -> bool:
+    """Whether leerie's own execution decided every criterion of `subtask`:
+    each `verify` entry carries an argv and the `pass` record `executed` ran
+    and passed every one. Then a probe that could not check them
+    (`cannot_verify`) has found no gap (DESIGN §8 *A no-op a sibling already
+    delivered is settled on evidence*)."""
+    if not _every_criterion_has_argv(subtask):
+        return False
+    decided = _criteria_decided_by_execution(subtask, executed)
+    return len(decided) == len(subtask.get("verify") or [])
+
+
+def _execution_answers_cannot_verify(subtask: dict, executed: dict | None,
+                                     verdict: dict) -> bool:
+    """Whether leerie's own execution answers a satisfied-probe that could
+    not check (DESIGN §8 *A no-op a sibling already delivered is settled on
+    evidence*): the verdict is `cannot_verify`; the `pass` record
+    `executed` decided every `verify` criterion
+    (`_execution_decides_criteria`); and every criterion the probe lists as
+    one it could not check by reading (`unverifiable`, at least one) is one
+    it says a passing command exercises in full (`covered_by_execution`).
+    A command decides only what it exercises, and only the probe can read a
+    criterion's prose against an argv, so it says so as typed ids; code
+    compares the sets. Any other shape — an old verdict without the two
+    lists, an id it does not know, a criterion it could not check that no
+    command covers in full — leaves the probe's `cannot_verify` standing."""
+    if (verdict.get("satisfied") is not False
+            or verdict.get("unsatisfied_reason") != "cannot_verify"
+            or not _execution_decides_criteria(subtask, executed)):
+        return False
+    unverifiable = verdict.get("unverifiable")
+    covered = verdict.get("covered_by_execution")
+    if (not isinstance(unverifiable, list) or not unverifiable
+            or not isinstance(covered, list)):
+        return False
+    known = {_PROBE_SEED_ID} | {cid for cid, _v in _probe_criteria(subtask)}
+    return set(unverifiable) <= (set(covered) & known)
+
+
 def _untracked_files(worktree: str | Path) -> set[str] | None:
     """The worktree's untracked, not-ignored files (the one listing,
     `_untracked_listing`), or None when git cannot say."""
@@ -64042,7 +64509,11 @@ async def _settle_nothing_to_change(
     file on this subtask's `files_likely_touched` (`_sibling_deliveries`);
     its `verify` argvs pass on HEAD (`_settle_by_execution`; `executed`
     reuses a pass this settle already made); and the base-tree-only
-    `satisfied_probe` finds its criteria met on HEAD."""
+    `satisfied_probe` finds its criteria met on HEAD — or, told which
+    criteria that execution decided, answers only `cannot_verify`, and every
+    criterion it could not check is one a passing command exercises in full
+    (`_execution_answers_cannot_verify`): a probe that could not check
+    found no gap, and does not overrule leerie's own pass."""
     if await _branch_has_commits_ahead(worktree,
                                        _compute_run_branch(st.run_id)):
         return None, "the subtask branch carries commits"
@@ -64063,22 +64534,37 @@ async def _settle_nothing_to_change(
         if ex["verdict"] != "pass":
             return None, ("not settled on evidence: a sibling changed its "
                           "surface, but " + _execution_blocker(ex))
+    out: dict = {}
     drop = await _probe_criteria_satisfied_on_head(
-        subtask, worktree, st, caps, models, efforts, label="settle")
+        subtask, worktree, st, caps, models, efforts, label="settle",
+        executed=ex, verdict=out)
+    by_execution = False
     if drop is None:
-        return None, ("not settled on evidence: a sibling changed its "
-                      "surface, but the satisfied-probe did not find its "
-                      "criteria met on HEAD")
+        # The probe could not check, and leerie's own execution decided
+        # every criterion it could not check, by a command that exercises
+        # all of it: no gap was found, so it does not overrule that pass.
+        # Any gap it found, or a criterion no command covers, re-drives.
+        by_execution = _execution_answers_cannot_verify(subtask, ex, out)
+        if not by_execution:
+            return None, ("not settled on evidence: a sibling changed its "
+                          "surface, but the satisfied-probe did not find its "
+                          "criteria met on HEAD")
+        drop = {"evidence": out.get("evidence", ""),
+                "checked": list(out.get("checked") or [])}
     by = ", ".join(f"{d['sid']} ({d['commit'][:12]})" for d in landed)
     log(f"  {sid}: nothing to change, and the run shows why — {by} changed "
         "its surface"
         + (", its verify commands pass," if ex is not None else ",")
-        + " and the satisfied-probe finds its criteria met on HEAD; "
-        "settling complete")
+        + (" and they decide every criterion the satisfied-probe could not "
+           "check (it found no gap)" if by_execution else
+           " and the satisfied-probe finds its criteria met on HEAD")
+        + "; settling complete")
     record = {"reason": "satisfied_by_sibling",
               "satisfied_by": landed,
               "evidence": drop.get("evidence", ""),
               "checked": list(drop.get("checked") or [])}
+    if by_execution:
+        record["decided_by"] = "execution"
     if ex is not None:
         record["executed"] = [shlex.join(c["argv"]) for c in ex["commands"]]
     return _settle_already_satisfied(
@@ -68876,8 +69362,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # bare `except Exception` would let escape — derailing a clean finalize into
     # a crash. Capture is best-effort; catch them so it never blocks the run.
     except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-            RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-        log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
+            RateLimitedExit, ContextOverflow, DiskLowSpace,
+            ConfinementRefused) as _cap_exc:
+        log(f"capture: {_capture_failure_note(_cap_exc)} during dep capture "
+            f"({_cap_exc}); "
             "continuing")
 
     # Run-health surfacing (DESIGN §9 / F4): fold the slowest worker and
@@ -70148,27 +70636,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                             args, "pr_template", None))
 
 
-@_records_the_run_death
-def main() -> int | None:
-    # Before anything prints (DESIGN §6 *No text leerie did not write
-    # reaches the operator's terminal as a control sequence*).
-    _guard_terminal_streams()
-    # Must precede every spawn — including _become_subreaper's descendants.
-    _restore_sigchld_default()
-    # Before any git runs: no git command of leerie's own fires a repository
-    # hook (DESIGN §6½ *Hooks off*); `_invoke` gives a worker them back.
-    _git_hooks_off(os.environ)
-    # The cgroup broker's descriptor, before anything is started that could
-    # inherit it (DESIGN §6 *No leerie service is reachable by a path from a
-    # process it does not serve*).
-    _adopt_cgroup_broker()
-
-    # Install the child-subreaper role first thing, before any worker (or any
-    # subprocess this process spawns) exists, so every descendant inherits the
-    # reparent-to-us behavior. This is what makes `_zombie_reaper` able to reap
-    # orphaned git/ssh-agent subprocesses that would otherwise pile up as
-    # zombies against the worker cgroup's pids.max (DESIGN §6 *Zombie reaping*).
-    _become_subreaper()
+def _leerie_arg_parser() -> argparse.ArgumentParser:
+    """The orchestrator's one command-line parser. Builds it and nothing
+    else: no state, no file, no process (the launcher's `check_command_line`
+    runs it on the host before any image step)."""
     ap = argparse.ArgumentParser(
         prog="leerie", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -70643,13 +71114,20 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "otherwise. See DESIGN.md §20 and IMPLEMENTATION.md "
                          "'Run-group verbs'.")
 
+    return ap
+
+
+def _parse_command_line(ap: argparse.ArgumentParser, argv: list[str]
+                        ) -> tuple[argparse.Namespace, str | None, bool, bool]:
+    """`argv` (the command line without the program) parsed as `main` takes
+    it: `(args, resume's positional run-id, is_resume, is_list)`. argparse
+    exits 2 with its usage and message on a line it does not accept."""
     # `resume` and `list` are bare leading verbs (git-style), not `--flag`s —
     # they occupy the same argv[1] slot the launcher's own `case "${1:-}"`
     # dispatch uses. argparse's `task` positional would otherwise swallow
     # the bare word as a literal task string, so pop it off before parsing
     # and record it as a plain bool, exactly like the launcher already
     # does for its own verbs. Never rewritten into a `--flag` anywhere.
-    argv = sys.argv[1:]
     is_resume = bool(argv) and argv[0] == "resume"
     is_list = bool(argv) and argv[0] == "list"
     if is_resume or is_list:
@@ -70660,7 +71138,44 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # `list chains`) that must reach argparse untouched.
     positional_run_id, argv = (
         _extract_resume_run_id(argv) if is_resume else (None, argv))
-    args = ap.parse_args(argv)
+    return ap.parse_args(argv), positional_run_id, is_resume, is_list
+
+
+def check_command_line(argv: list[str]) -> int:
+    """Parse-only (DESIGN §6 *A command line is refused before any image
+    step*): the launcher runs this on the host, through `python3 -I -S`,
+    with the argv it will give the container, before it builds or copies any
+    image. A line the parser refuses exits 2 here with the message the
+    container would print; one it accepts returns 0. Reads no state and
+    starts nothing."""
+    _parse_command_line(_leerie_arg_parser(), argv)
+    return 0
+
+
+@_records_the_run_death
+def main() -> int | None:
+    # Before anything prints (DESIGN §6 *No text leerie did not write
+    # reaches the operator's terminal as a control sequence*).
+    _guard_terminal_streams()
+    # Must precede every spawn — including _become_subreaper's descendants.
+    _restore_sigchld_default()
+    # Before any git runs: no git command of leerie's own fires a repository
+    # hook (DESIGN §6½ *Hooks off*); `_invoke` gives a worker them back.
+    _git_hooks_off(os.environ)
+    # The cgroup broker's descriptor, before anything is started that could
+    # inherit it (DESIGN §6 *No leerie service is reachable by a path from a
+    # process it does not serve*).
+    _adopt_cgroup_broker()
+
+    # Install the child-subreaper role first thing, before any worker (or any
+    # subprocess this process spawns) exists, so every descendant inherits the
+    # reparent-to-us behavior. This is what makes `_zombie_reaper` able to reap
+    # orphaned git/ssh-agent subprocesses that would otherwise pile up as
+    # zombies against the worker cgroup's pids.max (DESIGN §6 *Zombie reaping*).
+    _become_subreaper()
+    ap = _leerie_arg_parser()
+    args, positional_run_id, is_resume, is_list = _parse_command_line(
+        ap, sys.argv[1:])
     # What this command line itself gave, before any resolver rewrites
     # `args`: a resume's override of a recorded run choice is exactly a value
     # here (DESIGN §6 *A resumed run continues under the choices it was
@@ -71324,6 +71839,29 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # set at the top of this arm, before the guarded save, so that every
         # statement below them is best-effort.
 
+    except ConfinementRefused as e:
+        # The shim refused a command or worker after the entry's
+        # confinement check passed: the environment changed under the run
+        # (DESIGN §6 *A confinement failure stops the run; it is never a
+        # result*). Nothing of the interrupted step was recorded — the
+        # refusal propagated past every caller — so the state saved here is
+        # the state before it, and `resume` redoes it. No dependency
+        # capture: it is a confined worker and would refuse again.
+        full_purge = False
+        abnormal = False
+        exit_code = EXIT_CONFINEMENT_REFUSED
+        _save_state_best_effort(st, "ConfinementRefused exit")
+        log(f"confinement refused — {e.what}: {e.reason}")
+        log("  leerie runs no command and no worker it cannot confine, and "
+            "records no result for one; the run stops here, with nothing "
+            "of this step recorded.")
+        log("  Fix the environment the message names (the kernel, the "
+            "container's AppArmor profile or seccomp), then resume with: "
+            f"leerie resume {st.run_id}")
+        try:
+            _cleanup_on_abnormal_exit(st, full_purge=False)
+        except BaseException as cleanup_err:
+            log(f"cleanup failed (non-fatal): {cleanup_err}")
     except TerminalAuthFailure as e:
         # Expired/absent OAuth session (`claude /login` required) —
         # unlike the transient 401/429/529 case, Claude Code sends no

@@ -3,11 +3,13 @@ build one (DESIGN §6 *A held-out evaluation runs alone, in a world that dies
 with it (I3)*; `tests/conftest.py::_emulated_heldout_sandbox`).
 
     heldout_sandbox_emulator.py --view V [--place SRC=REL]...
-        [--report PATH --report-fd N] -- INNER...
+        [--report PATH --report-fd N] [--taken-fd N] -- INNER...
 
 It keeps the sandbox's contract with leerie, not its isolation: each placed
-file is copied to `V/REL` for the run (refused, exit 126, when the view
-already has one or a directory on its path is a link), INNER (the real
+file is copied to `V/REL` for the run (not placed, exit 126, the reason on
+the taken descriptor, when the view already has one or a link or a
+non-directory is on its path; refused, exit 126, for a path that is not
+plain), INNER (the real
 shim, without `--sandbox`) runs, the report is copied to descriptor N from
 offset 0 and the copy truncated, and then the placed files, the directories
 made for them and the report are removed — so what leerie reads comes back
@@ -29,6 +31,7 @@ def main(argv: list[str]) -> int:
     place: list[tuple[str, str]] = []
     report = None
     report_fd = None
+    taken_fd = None
     i = 0
     while i < len(opts):
         k, v = opts[i], opts[i + 1]
@@ -41,28 +44,39 @@ def main(argv: list[str]) -> int:
             report = Path(v)
         elif k == "--report-fd":
             report_fd = int(v)
+        elif k == "--taken-fd":
+            taken_fd = int(v)
         else:
             print(f"emulator: unknown option {k}", file=sys.stderr)
             return 126
         i += 2
     assert view is not None
-    def _linked(rel: str) -> bool:
-        # The shim resolves each directory with O_NOFOLLOW: a link on the
-        # path refuses the placement (it would leave the view).
+    def _blocked(rel: str) -> bool:
+        # The shim resolves each directory with O_NOFOLLOW | O_DIRECTORY: a
+        # link or a non-directory on the path leaves no room for the file.
         d = view
         for part in Path(rel).parts[:-1]:
             d = d / part
-            if d.is_symlink():
+            if d.is_symlink() or (os.path.lexists(d) and not d.is_dir()):
                 return True
         return False
 
-    taken = [rel for _src, rel in place
-             if os.path.lexists(view / rel) or rel.startswith("/")
-             or ".." in Path(rel).parts or _linked(rel)]
-    if taken:
+    bad = [rel for _src, rel in place
+           if rel.startswith("/") or ".." in Path(rel).parts]
+    if bad:
         print("leerie: cannot isolate the command, so it does not run: "
-              f"place: a set path is taken: {', '.join(taken)}",
+              f"place: the view cannot hold {', '.join(bad)}",
               file=sys.stderr)
+        return 126
+    taken = [rel for _src, rel in place
+             if _blocked(rel) or os.path.lexists(view / rel)]
+    if taken:
+        msg = ("leerie: the held-out file is not placed, so the command "
+               f"does not run: place: a set path is taken: "
+               f"{', '.join(taken)}")
+        print(msg, file=sys.stderr)
+        if taken_fd is not None:
+            os.write(taken_fd, msg.encode() + b"\n")
         return 126
     made_files: list[Path] = []
     made_dirs: list[Path] = []

@@ -1665,7 +1665,7 @@ def test_an_unsettled_candidate_is_unknown_and_reaches_the_pr(
     assert cand in gap[0]["detail"] and item["item"] in gap[0]["detail"]
     assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
     pr = leerie._format_pr_end_state_section(st.data)
-    section = pr.split("## Needs human verification", 1)[1]
+    section = pr.split("## Not verified by this run", 1)[1]
     assert cand in section and "no rerun produced a verdict" in section
     # The same candidate failing on every base rerun is pre_existing:
     # confirmed not this run's, so met, and the gap is cleared.
