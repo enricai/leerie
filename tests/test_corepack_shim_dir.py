@@ -77,7 +77,7 @@ def _drive(leerie, tmp_path, monkeypatch, *, data, on_install=None,
     monkeypatch.setattr(leerie, "_measurement_grants", lambda *a: GRANTS)
     monkeypatch.setattr(leerie, "_run_streaming", fake_streaming)
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
-    monkeypatch.setattr(leerie, "_confined_argv", lambda g, a: a)
+    monkeypatch.setattr(leerie, "_confined_argv", lambda g, a, **kw: a)
     monkeypatch.setattr(leerie, "_exec_lock", lambda: _Lock())
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -101,7 +101,8 @@ def test_install_disables_implicit_enable_and_enables_into_own_bin(
     assert install[1]["MISE_NODE_COREPACK"] == "false"
     v = made[0]
     assert [c[0] for c in rest] == [
-        [str(v / "corepack"), "enable", "--install-directory", str(v)]]
+        [str(v / "node"), str(v / "corepack"), "enable",
+         "--install-directory", str(v)]]
     assert rest[0][2] is GRANTS                     # the toolchain grant
     assert all(str(sys_bin) not in " ".join(c[0]) for c in calls)
 
@@ -115,8 +116,8 @@ def test_skips_enabled_versions_aliases_and_versions_without_corepack(
     (data / "installs" / "node" / "22").symlink_to("22.19.0")
     calls = _drive(leerie, tmp_path, monkeypatch, data=data)
     assert [c[0] for c in calls[1:]] == [
-        [str(shimless / "corepack"), "enable", "--install-directory",
-         str(shimless)]]
+        [str(shimless / "node"), str(shimless / "corepack"), "enable",
+         "--install-directory", str(shimless)]]
 
 
 def test_a_failed_enable_fails_provisioning(leerie, tmp_path, monkeypatch):
@@ -131,8 +132,36 @@ def test_image_turns_off_implicit_enable_and_enables_baked_node_itself():
     assert re.findall(r"^ENV MISE_NODE_COREPACK=(\S+)$", df, re.M) == ["false"]
     step = df[df.index("RUN set -eux; \\\n    node_dir="):]
     step = step[:step.index("\n\n")]
-    assert ('"${node_dir%/}/bin/corepack" enable --install-directory '
-            '"${node_dir%/}/bin"') in step
+    want = ('"${node_dir%/}/bin/node" "${node_dir%/}/bin/corepack" enable '
+            '--install-directory "${node_dir%/}/bin"')
+    assert want in " ".join(step.replace("\\\n", " ").split())
     bake = (REPO / "scripts/remote/ec2-bake.sh").read_text()
-    assert ('"${node_dir%/}/bin/corepack" enable --install-directory '
-            '"${node_dir%/}/bin"') in bake
+    assert want in " ".join(bake.replace("\\\n", " ").split())
+
+
+def test_the_image_step_runs_with_no_node_on_path(tmp_path):
+    """The Dockerfile's `lts-current` step, run as the image build runs it:
+    by /bin/sh, with no node on PATH. corepack is a `#!/usr/bin/env node`
+    script, so run by name it fails with exit 127 (`env: 'node': No such
+    file or directory`), which is how the 0.44.2 base build failed. Run by
+    its own version's node it enables the shims."""
+    df = (REPO / "Dockerfile").read_text()
+    step = df[df.index("RUN set -eux; \\\n    node_dir="):]
+    step = step[len("RUN "):step.index("\n\n")]
+    root = tmp_path / "mise"
+    b = root / "installs" / "node" / "24.0.0" / "bin"
+    b.mkdir(parents=True)
+    # node: a builtin-only stand-in that does what `corepack enable
+    # --install-directory D` does, link D/pnpm (argv: corepack enable
+    # --install-directory D).
+    (b / "node").write_text(
+        '#!/bin/sh\nexec /bin/ln -s corepack "$4/pnpm"\n')
+    (b / "corepack").write_text("#!/usr/bin/env node\n")
+    for f in (b / "node", b / "corepack"):
+        f.chmod(0o755)
+    script = step.replace("/usr/local/share/mise", str(root))
+    r = subprocess.run(["/bin/sh", "-c", script],
+                       env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (b / "pnpm").is_symlink()

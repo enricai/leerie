@@ -110,8 +110,11 @@ node_dir="$(find /usr/local/share/mise/installs/node -mindepth 1 -maxdepth 1 -ty
 ln -sfn "${node_dir%/}" /usr/local/share/mise/installs/node/lts-current
 # The Dockerfile's `lts-current` step: corepack's shims in the baked Node's own
 # bin, since MISE_NODE_COREPACK=false (DESIGN §6 *Each Node version's corepack
-# shims go in its own `bin`*).
-"${node_dir%/}/bin/corepack" enable --install-directory "${node_dir%/}/bin"
+# shims go in its own `bin`*). corepack runs under its own version's node,
+# named explicitly: its `#!/usr/bin/env node` would take whatever node PATH
+# holds, and at this point PATH holds none.
+"${node_dir%/}/bin/node" "${node_dir%/}/bin/corepack" enable \
+    --install-directory "${node_dir%/}/bin"
 
 # Login shells (an operator's `ssh` + `sudo -iu leerie`) get the same set.
 printf 'set -a\n. %s\nset +a\n' "$LEERIE_ENV_FILE" > /etc/profile.d/leerie.sh

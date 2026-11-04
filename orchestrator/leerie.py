@@ -33175,13 +33175,16 @@ async def _enable_corepack_shims(grants: WorkerGrants, env: dict[str, str],
             present = set(_listdir_beneath(data, bin_dir))
         except OSError:
             continue
-        if "corepack" not in present or "pnpm" in present:
+        if not {"node", "corepack"} <= present or "pnpm" in present:
             continue
         label = f"corepack enable {v.name}"
+        # corepack is a `#!/usr/bin/env node` script: run by name it takes
+        # whichever node comes first on PATH (the baked LTS, or none in an
+        # image build). Its own version's node runs it.
         try:
             rc, tail = await _run_streaming(
-                [str(bin_dir / "corepack"), "enable", "--install-directory",
-                 str(bin_dir)],
+                [str(bin_dir / "node"), str(bin_dir / "corepack"), "enable",
+                 "--install-directory", str(bin_dir)],
                 grants=grants, cwd=cwd, env=env, log_path=log_path,
                 label=label, verbosity=verbosity)
         except subprocess.TimeoutExpired as exc:

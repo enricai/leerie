@@ -276,10 +276,15 @@ RUN mise install --system node@lts python@3.12
 # stable name so PATH and the claude global-install below don't have
 # to know the concrete version. The wildcard expansion is safe
 # because exactly one node version is installed in this layer.
+# corepack is a `#!/usr/bin/env node` script and no node is on PATH yet
+# at this layer, so it runs under its own version's node, named
+# explicitly (DESIGN §6 *Each Node version's corepack shims go in its
+# own `bin`*).
 RUN set -eux; \
     node_dir="$(ls -d /usr/local/share/mise/installs/node/*/ | head -n1)"; \
     ln -s "${node_dir%/}" /usr/local/share/mise/installs/node/lts-current; \
-    "${node_dir%/}/bin/corepack" enable --install-directory "${node_dir%/}/bin"; \
+    "${node_dir%/}/bin/node" "${node_dir%/}/bin/corepack" enable \
+        --install-directory "${node_dir%/}/bin"; \
     test -L "${node_dir%/}/bin/pnpm"
 
 # PATH order:
