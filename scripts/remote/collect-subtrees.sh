@@ -103,6 +103,9 @@ if [ ! -f "$run_dir/repo/HEAD" ]; then
   exit 0
 fi
 cd "$run_dir/repo" || { echo "COLLECT-ERROR:cannot enter $run_dir/repo"; exit 0; }
+# Below /work, a python3 found through PATH is the mise shim, which runs the
+# interpreter the repository pins, so leerie names its Python /usr/bin/python3
+# (DESIGN section 6, Leerie names its own Python by path).
 # Named, never discovered (safe.bareRepository=explicit): the scripts' and
 # this payload's repository-level git.
 LEERIE_GIT_DIR="$run_dir/repo"
@@ -152,7 +155,7 @@ if [ -f "$state_json" ]; then
   while IFS= read -r sid; do
     [ -n "$sid" ] || continue
     ordered_sids+=("$sid")
-  done < <(python3 -I -c '
+  done < <(/usr/bin/python3 -I -c '
 import json, sys
 try:
     st = json.load(open(sys.argv[1]))
@@ -330,7 +333,7 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
     guard_confine=()
     guard_tmp=""
     guard_sh=""
-    if guard_sh=$(python3 -I "$SCRIPTS/worker-guard.py" \
+    if guard_sh=$(/usr/bin/python3 -I "$SCRIPTS/worker-guard.py" \
         "$integrator_allowed_tools" "$staging" "$leerie_dir/state.json" \
         "integrator-${sid}" \
         2>/dev/null) && [ -n "$guard_sh" ]; then
@@ -377,7 +380,7 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
     fi
 
     # Extract status from structured_output.
-    status=$(printf '%s' "$claude_out" | python3 -I -c '
+    status=$(printf '%s' "$claude_out" | /usr/bin/python3 -I -c '
 import json, sys
 try:
     d = json.load(sys.stdin)

@@ -124,7 +124,8 @@ def _machine_orchestrator_argv(orch_args: list[str], tmp_path: Path
     with pytest.raises(_Spawned):
         exec(compile(r.stdout, "launch-suffix", "exec"), ns)
     (argv,) = got
-    assert argv[:2] == ["python3", "/opt/leerie-image/orchestrator/leerie.py"]
+    assert argv[:2] == ["/usr/bin/python3",
+                        "/opt/leerie-image/orchestrator/leerie.py"]
     return argv[2:]
 
 
