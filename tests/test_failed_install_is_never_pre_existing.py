@@ -22,7 +22,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_redrive_test_id_diff_refresh import SUITE, _git  # noqa: E402
+from test_redrive_test_id_diff_refresh import CMD, SUITE, _git  # noqa: E402
 from test_shipping_tree_is_committed import (  # noqa: E402
     _phase5, _quiet_conformer, _repo)
 
@@ -166,7 +166,13 @@ def test_a_baseline_measured_without_its_deps_has_no_failing_ids(
         log_path=tmp_path / "m.log", verbosity="quiet",
         failing_ids_axes={"tests"}))
     assert axes["tests"]["deps_failed"] is True
-    assert axes["tests"]["failing_ids"]           # everything failed
+    # Unmeasured, so no report run and no IDs: every test failed, for want
+    # of its dependencies. (Before every axis was unmeasured here, this
+    # pinned the opposite: a measured red axis whose IDs were then dropped
+    # by `_capture_conformance_baseline` alone.)
+    assert axes["tests"]["measured"] is False
+    assert axes["tests"]["passed"] is None
+    assert "failing_ids" not in axes["tests"]
     st.data["conformance"]["_baseline"]["axes"] = axes
     assert leerie._final_diff_base_gap(st, {}).startswith(
         "failing-test-ID diff: run the tests on the PR branch and on the "
@@ -283,3 +289,136 @@ def test_baseline_retries_are_bounded_per_process(leerie, tmp_path,
     flag.unlink()
     assert asyncio.run(leerie._retry_failed_baseline(
         st, run["caps"], log_path=tmp_path / "b.log")) is True
+
+
+# Fails only without the installed dependency, as `prisma: not found` did on
+# web 6f147a0c — an exit code no runner-missing check reads as unmeasured.
+BUILD = (f"{sys.executable} -c \"import os, sys; "
+         "sys.exit(not os.path.exists('deps/ok'))\"")
+
+
+def _fresh_baseline(leerie, run, monkeypatch, blt: dict) -> dict:
+    st = run["st"]
+    del st.data["conformance"]["_baseline"]
+    st.save()
+    monkeypatch.setattr(leerie, "resolve_blt", lambda root: blt)
+    asyncio.run(leerie._capture_conformance_baseline(
+        run["run_dir"], st, run["caps"]))
+    return st.data["conformance"]["_baseline"]
+
+
+def test_a_build_failing_for_want_of_its_deps_is_not_base_red(
+        leerie, tmp_path, monkeypatch):
+    """Web 6f147a0c, driven through the real phase-4 baseline: the install
+    failed, `build` failed for want of it, and the baseline counted `build`
+    red (`base tree is RED on build, tests`), so a real build regression
+    would have been forgiven as pre-existing. Every axis measured after a
+    failed install is unmeasured, not only `tests`."""
+    run, flag = _setup(leerie, tmp_path, monkeypatch)
+    st = run["st"]
+    flag.write_text("")
+    base = _fresh_baseline(leerie, run, monkeypatch,
+                           {"build": BUILD, "test": CMD})
+    assert base["red_axes"] == []
+    for axis in ("build", "tests"):
+        ax = base["axes"][axis]
+        assert ax["ran"] is True and ax["measured"] is False, (axis, ax)
+        assert ax["passed"] is None and ax["deps_failed"] is True
+        assert ax["summary"].startswith(
+            "not measured: the dependency install failed")
+    assert leerie._baseline_red_axes(base) == set()
+    assert st.data["baseline_failing_ids"] is None
+    assert leerie._base_health_payload(st)["base_red_axes"] == []
+    section = leerie._format_baseline_section(base)
+    assert "dependency install failed" in section
+    assert "runner was not available" not in section
+    # Once the registry is back, the base is measured again and builds.
+    flag.unlink()
+    assert asyncio.run(leerie._retry_failed_baseline(
+        st, run["caps"], log_path=tmp_path / "b.log")) is True
+    base = st.data["conformance"]["_baseline"]
+    assert base["red_axes"] == []
+    assert base["axes"]["build"]["passed"] is True
+
+
+def test_a_baseline_with_no_test_command_is_measured_again(
+        leerie, tmp_path, monkeypatch):
+    """The re-measure keys on the tree's install, not on the `tests` axis:
+    a repository whose only axis is `build` had its base build measured
+    without dependencies too, and must not keep that for the run."""
+    run, flag = _setup(leerie, tmp_path, monkeypatch)
+    st = run["st"]
+    flag.write_text("")
+    base = _fresh_baseline(leerie, run, monkeypatch, {"build": BUILD})
+    assert base["axes"]["build"]["deps_failed"] is True
+    flag.unlink()
+    assert asyncio.run(leerie._retry_failed_baseline(
+        st, run["caps"], log_path=tmp_path / "b.log")) is True
+    base = st.data["conformance"]["_baseline"]
+    assert base["axes"]["build"]["measured"] is True
+    assert base["axes"]["build"]["passed"] is True
+    assert not base["axes"]["build"].get("deps_failed")
+
+
+def test_a_final_build_failing_for_want_of_its_deps_is_no_regression(
+        leerie, tmp_path, monkeypatch):
+    """The final side: the build passed before a conformer round and fails
+    after it only because the install failed in between. That is no
+    regression to chase, and not a result the base can forgive either —
+    it is unmeasured, which `_conformance_clean` reads as not clean."""
+    run, flag = _setup(leerie, tmp_path, monkeypatch)
+    st, staging = run["st"], run["staging"]
+
+    def measure() -> dict:
+        return asyncio.run(leerie._measure_axes(
+            str(staging), {"build": BUILD}, st, run["caps"],
+            log_path=tmp_path / "m.log", verbosity="quiet", memo=False))
+    pre = measure()
+    assert pre["build"]["measured"] is True and pre["build"]["passed"]
+    flag.write_text("")
+    leerie._DEPS_INSTALLED.clear()          # a fresh process installs again
+    post = measure()
+    assert post["build"]["measured"] is False
+    assert post["build"]["deps_failed"] is True
+    assert leerie._round_axis_regressions(pre, post) == []
+    res = leerie._apply_measured_axes({}, post)
+    # A baseline that counted `build` red (state saved before this fix)
+    # does not make the unmeasured final build clean.
+    assert leerie._conformance_clean(res, {"red_axes": ["build"]}) is False
+    blt = leerie._format_blt_results_section(post, scope="canonical")
+    assert "dependency install failed" in blt and "FAILED" not in blt
+
+
+def test_a_saved_baseline_from_before_the_rule_counts_nothing_red(
+        leerie, tmp_path, monkeypatch):
+    """Web 6f147a0c's saved state, written by 0.44.6: `red_axes` holds
+    build and tests, each `measured: True, passed: False, deps_failed:
+    True`. A resume skips phase 4 and reuses it, so the readers must not
+    trust the saved list: a real final build failure is not forgiven, and
+    no reader calls the base red."""
+    run, _flag = _setup(leerie, tmp_path, monkeypatch)
+    st = run["st"]
+    old = {"ran": True, "measured": True, "passed": False,
+           "deps_failed": True}
+    st.data["conformance"]["_baseline"] = {
+        "sha": st.data["conformance"]["_baseline"]["sha"],
+        "axes": {"build": {**old, "command": BUILD},
+                 "tests": {**old, "command": CMD}},
+        "red_axes": ["build", "tests"]}
+    st.save()
+    monkeypatch.setattr(leerie, "resolve_blt",
+                        lambda root: {"build": BUILD, "test": CMD})
+    asyncio.run(leerie._capture_conformance_baseline(      # a resume
+        run["run_dir"], st, run["caps"]))
+    base = st.data["conformance"]["_baseline"]
+    assert base["red_axes"] == ["build", "tests"]          # reused as saved
+    assert leerie._baseline_red_axes(base) == set()
+    assert leerie._base_health_payload(st)["base_red_axes"] == []
+    section = leerie._format_baseline_section(base)
+    assert "already RED" not in section
+    assert "dependency install failed" in section
+    # A build the run really broke, measured with its dependencies, fails
+    # the clean check instead of reading as the base's.
+    final = {"build": {"ran": True, "measured": True, "passed": False,
+                       "command": BUILD}}
+    assert leerie._conformance_clean(final, base) is False

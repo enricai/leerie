@@ -44730,9 +44730,12 @@ def _format_blt_results_section(measured: dict[str, dict],
         if not a.get("ran"):
             lines.append(f"- {axis}: not applicable to this repo")
             continue
-        if not a.get("measured"):
+        if not _axis_measured(a):
+            why = ("the dependency install failed in this worktree"
+                   if a.get("deps_failed")
+                   else "its runner is not on PATH")
             lines.append(f"- {axis}: COULD NOT MEASURE — `{a.get('command', '')}` "
-                         "(its runner is not on PATH; attribute failures "
+                         f"({why}; attribute failures "
                          "yourself for this axis)")
             continue
         lines.append(f"- {axis}: {'PASSED' if a.get('passed') else 'FAILED'} "
@@ -44765,6 +44768,20 @@ def _apply_measured_axes(conf_res: dict,
     return out
 
 
+def _axis_measured(ax: dict | None) -> bool:
+    """True when the axis result `ax` is a verdict: it ran, was measured,
+    and was not measured after a failed install (DESIGN §9 *A failed
+    install is no measurement*). The one predicate every reader of a
+    build/lint/test result keeps red and green to. `_measure_axes` already
+    records a failed-install result unmeasured; `deps_failed` is read here
+    too because a baseline is saved run state and outlives the version that
+    wrote it — one saved before every axis was unmeasured there carries
+    `measured: True` beside `deps_failed: True`, and would otherwise count
+    its build red for every resume (web 6f147a0c)."""
+    return bool(isinstance(ax, dict) and ax.get("ran") and ax.get("measured")
+                and not ax.get("deps_failed"))
+
+
 def _round_axis_regressions(pre: dict[str, dict],
                             post: dict[str, dict]) -> list[str]:
     """Axes measured green *before* a conformer round and red *after* it.
@@ -44785,7 +44802,7 @@ def _round_axis_regressions(pre: dict[str, dict],
     for axis in ("build", "lint", "tests"):
         a = (pre or {}).get(axis) or {}
         b = (post or {}).get(axis) or {}
-        if not a.get("measured") or not b.get("measured"):
+        if not _axis_measured(a) or not _axis_measured(b):
             continue
         if a.get("command") != b.get("command"):
             continue
@@ -44815,7 +44832,13 @@ def _baseline_red_axes(baseline: dict | None) -> set[str]:
     red = baseline.get("red_axes")
     if not isinstance(red, list):
         return set()
-    return {a for a in red if a in _BLT_AXES}
+    # The stored list is not trusted past the axes it was taken from: one
+    # saved before a failed install made every axis unmeasured counts an
+    # axis red that has no verdict (`_axis_measured`).
+    axes = baseline.get("axes")
+    axes = axes if isinstance(axes, dict) else {}
+    return {a for a in red if a in _BLT_AXES
+            and not (axes.get(a) or {}).get("deps_failed")}
 
 
 def _conformance_clean(conf_res: dict, baseline: dict | None = None) -> bool:
@@ -44871,7 +44894,7 @@ def _conformance_clean(conf_res: dict, baseline: dict | None = None) -> bool:
         # `measured` (tests/test_axis_unmeasurable.py). Checked BEFORE the
         # red-axis exclusion for exactly that reason. Rare by construction —
         # measured, 1 of 46 final axes that ran — so this blocks almost never.
-        if a.get("ran") and not a.get("measured"):
+        if a.get("ran") and not _axis_measured(a):
             return False
         if a.get("ran") and not a.get("passed") and axis not in red:
             return False
@@ -46977,6 +47000,10 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
     which deliberately does not cache a crashed probe — a verdict that was
     never actually reached must be re-measured, not remembered.
 
+    Every result measured after a failed install, on any axis, is
+    unmeasured and carries `deps_failed` (DESIGN §9 *A failed install is
+    no measurement*), and is never stored either.
+
     A build or test axis (`_BUILD_CLASS_AXES`) holds a host build slot
     around its command (DESIGN §6 *A host-wide build semaphore*).
     `measure_peak` runs each command in an uncapped measurement cgroup and
@@ -47073,17 +47100,28 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                     log_path=log_path, verbosity=verbosity,
                     label_prefix=label_prefix, measure_peak=measure_peak,
                     run_id=getattr(st, "run_id", None), forbidden=forbidden)
+        if not deps_ok:
+            # Measured without its dependencies: the result says nothing
+            # about the tree, on any axis (DESIGN §9 *A failed install is no
+            # measurement*). Unmeasured HERE, where the result is made, so
+            # every reader that keeps an unmeasured axis neither red nor
+            # green — `red_axes`, `_conformance_clean`,
+            # `_round_axis_regressions` — does so with no case of its own:
+            # a base build failing for want of its dependencies is not
+            # pre-existing, a final one is no regression. `deps_failed` says
+            # why, for the readers that name it. No failing IDs either:
+            # there is no verdict to take them from.
+            res = {**res, "measured": False, "passed": None,
+                   "deps_failed": True,
+                   "summary": ("not measured: the dependency install "
+                               "failed — "
+                               + str(res.get("summary") or "")).strip()}
         if axis in failing_ids_axes:
             await _attach_failing_ids(res, tree, cmd, st, caps,
                                       log_path=log_path,
                                       label=f"{label_prefix}-{axis}")
         if replacement is not None:
             res["scoped_replacement"] = replacement
-        if not deps_ok:
-            # Measured without its dependencies: what failed says nothing
-            # about the change (DESIGN §9 *A failed install is no
-            # measurement*), and an outage is not a fact about the tree.
-            res["deps_failed"] = True
         results[axis] = res
 
         if not (memo and tree_sha) or not deps_ok:
@@ -48227,13 +48265,14 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         # task forbids*): every final failure is a candidate, and B*'s base
         # reruns keep one the base already had from being called new.
         base_ids = []
-    if not tests.get("measured"):
-        return None
     if tests.get("deps_failed"):
         # Every test may fail for want of its dependencies: no final side
-        # (DESIGN §9 *A failed install is no measurement*).
+        # (DESIGN §9 *A failed install is no measurement*). Ahead of the
+        # unmeasured check, which such a result also fails, to say why.
         log(f"  {label}: the failing-test-ID diff is not taken — the "
             "dependency install failed in the tree measured")
+        return None
+    if not tests.get("measured"):
         return None
     final_ids = tests.get("failing_ids")
     ids_unknown = base_ids is None or final_ids is None
@@ -48770,16 +48809,14 @@ def _format_baseline_section(baseline: dict | None) -> str | None:
     axes = baseline.get("axes") or {}
 
     def _measured(a: str) -> bool:
-        ax = axes.get(a) or {}
-        return bool(ax.get("ran") and ax.get("measured"))
+        return _axis_measured(axes.get(a))
 
     red = [a for a in ("build", "lint", "tests")
            if _measured(a) and not (axes.get(a) or {}).get("passed")]
     green = [a for a in ("build", "lint", "tests")
              if _measured(a) and (axes.get(a) or {}).get("passed")]
     unmeasured = [a for a in ("build", "lint", "tests")
-                  if (axes.get(a) or {}).get("ran")
-                  and not (axes.get(a) or {}).get("measured")]
+                  if (axes.get(a) or {}).get("ran") and not _measured(a)]
 
     lines = ["", "BASELINE:"]
     # Only claim GREEN when an axis was *actually* measured and passed —
@@ -48812,7 +48849,8 @@ def _format_baseline_section(baseline: dict | None) -> str | None:
     if unmeasured:
         lines.append(
             "  The following axis/axes COULD NOT be measured on the base "
-            "tree (the runner was not available): " + ", ".join(unmeasured)
+            f"tree ({_unmeasured_why(axes, unmeasured)}): "
+            + ", ".join(unmeasured)
             + ". There is no baseline for them — attribute any failure on "
             "these axes yourself, honestly, by whether the failing files "
             "are in `git diff DIFF_BASE..HEAD`. Do NOT check out or reset "
@@ -48830,23 +48868,35 @@ def _format_baseline_green_message(baseline: dict) -> str:
     measured-and-passed or unmeasured — never measured-and-failed."""
     axes = baseline.get("axes") or {}
     measured = [a for a in ("build", "lint", "tests")
-                if (axes.get(a) or {}).get("ran")
-                and (axes.get(a) or {}).get("measured")]
+                if _axis_measured(axes.get(a))]
     unmeasured = [a for a in ("build", "lint", "tests")
                   if (axes.get(a) or {}).get("ran")
-                  and not (axes.get(a) or {}).get("measured")]
+                  and not _axis_measured(axes.get(a))]
     if not measured:
+        why = ("the dependency install failed"
+               if _any_deps_failed(axes) else
+               "no runner was available for any of them")
         return ("phase 4: base tree health could not be measured on any "
-                "axis (build/lint/tests) — no runner was available for "
-                "any of them. Failures on these axes will not be "
-                "attributed to this run.")
+                f"axis (build/lint/tests) — {why}. Failures on these "
+                "axes will not be attributed to this run.")
     msg = (f"phase 4: base tree is GREEN ({'/'.join(measured)}) — new "
            f"{'/'.join(measured)} failures will be attributed to this run.")
     if unmeasured:
-        msg += (f" ({'/'.join(unmeasured)} could not be measured — no "
-                "runner was available; failures on these axes will not "
-                "be attributed to this run.)")
+        why = ("the dependency install failed"
+               if _any_deps_failed({a: axes.get(a) for a in unmeasured})
+               else "no runner was available")
+        msg += (f" ({'/'.join(unmeasured)} could not be measured — {why}; "
+                "failures on these axes will not be attributed to this "
+                "run.)")
     return msg
+
+
+def _unmeasured_why(axes: dict, unmeasured: list[str]) -> str:
+    """Why the base axes `unmeasured` carry no verdict, for the conformer:
+    the install that failed in the tree (`deps_failed`), else the runner."""
+    if _any_deps_failed({a: axes.get(a) for a in unmeasured}):
+        return "the dependency install failed in the base tree"
+    return "the runner was not available"
 
 
 async def _capture_conformance_baseline(
@@ -48901,8 +48951,10 @@ async def _capture_conformance_baseline(
 
     # Install the provision recipe into staging so the suite can run.
     # Deps live only in worktrees (§6½); staging starts bare. Failure to
-    # install is non-fatal — a subsequent BLT command that needs deps will
-    # simply exit non-zero, which is itself recorded as a RED axis.
+    # install is non-fatal, and never makes an axis RED: `_measure_axes`
+    # records every axis measured after it unmeasured (`deps_failed`, DESIGN
+    # §9 *A failed install is no measurement*), so `red_axes` below leaves
+    # it out and `_retry_failed_baseline` measures the base again later.
     # label_prefix / log_prefix differ, and deliberately: the pre-extraction
     # code streamed each entry under `baseline-install:` while logging its
     # failures as `base-baseline:`. Collapsing them to one prefix would be a
@@ -48928,11 +48980,11 @@ async def _capture_conformance_baseline(
     _record_blt_peak(st, axes, caps)
 
     # An axis is RED only if it actually ran AND was measurable AND failed.
-    # Unmeasurable axes (runner missing) are neither red nor green — they
-    # carry no delta and are surfaced separately to the conformer.
+    # Unmeasurable axes (runner missing, or measured after a failed install)
+    # are neither red nor green — they carry no delta and are surfaced
+    # separately to the conformer.
     red = [a for a in ("build", "lint", "tests")
-           if axes[a].get("ran") and axes[a].get("measured")
-           and not axes[a].get("passed")]
+           if _axis_measured(axes[a]) and not axes[a].get("passed")]
     baseline = {"axes": axes, "red_axes": red, "sha": base_sha}
     conf = st.data.setdefault("conformance", {})
     conf["_baseline"] = baseline
@@ -48963,6 +49015,15 @@ async def _capture_conformance_baseline(
                                                "red_axes": []}})
 
 
+def _any_deps_failed(axes: dict | None) -> bool:
+    """True when any axis in `axes` was measured after a failed install.
+    One install serves every axis of a tree, so this is the tree's, not one
+    axis's: a baseline whose `tests` axis has no command still had its
+    build measured without dependencies."""
+    return isinstance(axes, dict) and any(
+        isinstance(a, dict) and a.get("deps_failed") for a in axes.values())
+
+
 # Baseline re-measures taken in THIS process, keyed by the base commit
 # (`_retry_failed_baseline`): per-process like `_DEPS_FAILED`, so a resume
 # tries again.
@@ -48986,8 +49047,7 @@ async def _retry_failed_baseline(st: "State", caps: dict, *,
     if not isinstance(base, dict):
         return False
     sha = str(base.get("sha") or "")
-    if not sha or not (((base.get("axes") or {}).get("tests") or {})
-                       .get("deps_failed")):
+    if not sha or not _any_deps_failed(base.get("axes")):
         return False
     retries = int(caps.get("deps_install_retries",
                            DEFAULT_CAPS["deps_install_retries"]))
@@ -49014,13 +49074,12 @@ async def _retry_failed_baseline(st: "State", caps: dict, *,
             failing_ids_axes={"tests"})
     finally:
         _remove_acceptance_checkout(st, wt)
-    if (axes.get("tests") or {}).get("deps_failed"):
+    if _any_deps_failed(axes):
         log("  base-baseline: the install failed again — the baseline stays "
             "unmeasured")
         return False
     red = [a for a in ("build", "lint", "tests")
-           if (axes.get(a) or {}).get("ran") and axes[a].get("measured")
-           and not axes[a].get("passed")]
+           if _axis_measured(axes.get(a)) and not axes[a].get("passed")]
     conf = st.data.setdefault("conformance", {})
     conf["_baseline"] = {**base, "axes": axes, "red_axes": red}
     ids = (axes.get("tests") or {}).get("failing_ids")
@@ -50932,6 +50991,7 @@ def _orchestrator_results_digest(st: "State",
         if not isinstance(a, dict) or not a.get("command"):
             continue
         verdict = ("not measured" if not a.get("measured", True)
+                   or a.get("deps_failed")
                    else "passed" if a.get("passed") else "failed")
         summary = str(a.get("summary") or "").replace("\n", " | ")[:200]
         lines.append(f"[orchestrator final-tree {axis}] $ "
@@ -68803,14 +68863,13 @@ def _base_health_payload(st: "State") -> dict | None:
     # _format_baseline_section. An unmeasurable axis (runner missing)
     # carries no verdict and must not colour base_status red.
     red = [a for a in ("build", "lint", "tests")
-           if ran[a].get("ran") and ran[a].get("measured")
-           and not ran[a].get("passed")]
+           if _axis_measured(ran[a]) and not ran[a].get("passed")]
     return {
         "base_status": "red" if red else "green",
         "base_red_axes": red,
         # Per-axis ran/measured/passed so the pr_writer can phrase "net of base".
         "axes": {a: {"ran": bool(ran[a].get("ran")),
-                     "measured": bool(ran[a].get("measured")),
+                     "measured": _axis_measured(ran[a]),
                      "passed": ran[a].get("passed")}
                  for a in ("build", "lint", "tests")},
     }

@@ -539,7 +539,7 @@ def test_measure_axes_does_not_run_a_forbidden_command(leerie, tmp_path,
                 "summary": "", "command": cmd}
 
     async def no_deps(*a, **k):
-        return None
+        return True                 # the install succeeded (its contract: bool)
 
     monkeypatch.setattr(leerie, "_measure_blt", fake_measure_blt)
     monkeypatch.setattr(leerie, "_ensure_worktree_deps", no_deps)
@@ -1083,7 +1083,7 @@ def _stub_measure(leerie, monkeypatch):
                 "summary": "", "command": cmd}
 
     async def no_deps(*a, **k):
-        return None
+        return True                 # the install succeeded (its contract: bool)
 
     monkeypatch.setattr(leerie, "_measure_blt", fake_measure_blt)
     monkeypatch.setattr(leerie, "_ensure_worktree_deps", no_deps)
