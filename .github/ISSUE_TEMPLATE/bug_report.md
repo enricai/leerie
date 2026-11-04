@@ -20,7 +20,7 @@ labels: bug
 
 - OS:
 - Container runtime: `colima version` (macOS) or `nerdctl --version` (Linux)
-- Image tag: `nerdctl images leerie --format '{{.Repository}}:{{.Tag}}'`
+- Image tag: `nerdctl --namespace leerie images leerie --format '{{.Repository}}:{{.Tag}}'`
 - `claude --version`
 - Leerie commit: `git -C ~/.leerie rev-parse HEAD`
 

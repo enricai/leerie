@@ -163,6 +163,14 @@ command -v buildkitd   # must print a path before continuing
 # 5. Subuid/subgid (idempotent — skip if already in /etc/subuid)
 sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
 
+# 6a. containerd keeps each namespace's content its own (only when the file
+#     does not exist yet; otherwise add the two lines to it). DESIGN §6
+#     *The content store*.
+mkdir -p ~/.config/containerd
+[ -e ~/.config/containerd/config.toml ] || printf '%s\n' 'version = 2' '' \
+  '[plugins."io.containerd.metadata.v1.bolt"]' \
+  '  content_sharing_policy = "isolated"' > ~/.config/containerd/config.toml
+
 # 6. Rootless containerd + BuildKit worker (as your user, NOT sudo);
 #    install-buildkit-containerd is the containerd-worker variant leerie needs.
 containerd-rootless-setuptool.sh install
@@ -175,6 +183,22 @@ buildctl --addr unix:///run/user/$(id -u)/buildkit-default/buildkitd.sock debug 
 ```
 
 Then re-run the installer with `--no-runtime-install`.
+
+**An install made before the installer wrote this file** has containerd's default
+`content_sharing_policy = "shared"`, and leerie warns before each
+repository build: a build that names one of leerie's images by its digest
+can read it from another namespace. To close it, add to
+`~/.config/containerd/config.toml` (into its
+`[plugins."io.containerd.metadata.v1.bolt"]` table if it has one):
+
+```toml
+[plugins."io.containerd.metadata.v1.bolt"]
+  content_sharing_policy = "isolated"
+```
+
+then, when no leerie run or other container is running, `systemctl --user
+restart containerd` (it stops every running container). Leerie never edits
+the file or restarts containerd itself.
 
 **Optional: `gh`** enables automatic PR creation at the end of a run
 (without it, leerie prints a `gh pr create` command to run manually).

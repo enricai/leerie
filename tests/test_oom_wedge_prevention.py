@@ -162,13 +162,16 @@ nerdctl() {{
       esac ;;
     *) [ "$1" = "kill" ] && KILLED="yes" ;;
   esac
+  [ "$1" = "rm" ] && [ -n "$KILLED" ] && REMOVED="yes"
   return 0
 }}
 LEERIE_IMAGE_NS=leerie
 {cns}
 {fn}
+REMOVED=""
 _reap_orphaned_container "fakeid"
 echo "KILLED=${{KILLED}}"
+echo "REMOVED=${{REMOVED}}"
 """
 
 
@@ -201,6 +204,20 @@ def _run_reaper(status: str, pid: str) -> bool:
 def test_reaper_kills_running_dead_owner():
     """Running container + dead owner PID → reap."""
     assert _run_reaper("running", "999999") is True
+
+
+def test_reaper_removes_what_it_killed():
+    """`--rm` is the nerdctl client's, and an orphan's client is dead: after
+    the kill the reaper removes the container itself (`nerdctl rm -f`), or
+    it stays Exited and holds its image for good (review round 38,
+    execution X1; measured). Falsified live (2026-11-03): the `rm` dropped
+    (REMOVED stays empty)."""
+    script = _REAPER_HARNESS.format(status="running", pid="999999",
+                                    fn=_reaper_fn_source(),
+                                    cns=_container_ns_source())
+    out = subprocess.run(["bash", "-c", script], capture_output=True,
+                         text=True, timeout=30).stdout
+    assert "KILLED=yes" in out and "REMOVED=yes" in out, out
 
 
 def test_reaper_spares_running_live_owner():

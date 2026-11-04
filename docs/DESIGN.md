@@ -3259,14 +3259,25 @@ they are confined.
   worker's on the standard rootless setup, so they stay readable until they
   are gone. None is reused: leerie looks its images up only in `leerie`,
   so the first launch after the change builds its base and each repository
-  image again there. Before each repository build, leerie removes from every
+  image again there. Before each repository build, local or with
+  `build-push.sh --local-build`, leerie removes from every
   namespace a worker reads each image named `leerie-repo/…` (its own name
   for a repository image, and nothing else) that no container uses
   (`nerdctl image rm`, never forced: nerdctl refuses to remove the name a
   container was created from, which it records even for a container
   created by digest, as leerie's are; measured 2026-11-03, nerdctl 2.3.5),
-  and refuses the build while one is left: an earlier leerie's run still runs from it, and the launch can be
-  repeated once that run ends. A removed image is a cache: the earlier
+  and refuses the build while one is left, naming each container that
+  holds it, its state, and what ends it: a running one's run (`leerie
+  stop`), and a container that no longer runs is removed with `nerdctl
+  rm`. nerdctl's `--rm` is done by the client that started the container,
+  so a container whose client died (an OOM) stays `Exited` after `nerdctl
+  kill` and holds its image for good (measured 2026-11-03, nerdctl 2.3.5);
+  `stop`, `kill` and `resume`'s reaper therefore remove the container they
+  end (`nerdctl rm -f`). *Revised 2026-11-03 (review round 38, execution
+  X1).* The refusal said to launch again once the run ended, or to `nerdctl
+  image rm` the image; with an exited container neither cleared it, and the
+  image's removal had already failed before the refusal was given. A
+  removed image is a cache: the earlier
   version builds it again on its next launch. The images an earlier
   `--local-build` tagged (`registry.fly.io/<app>:…`) do not carry a name
   only leerie uses, so they are not removed. A run an earlier leerie
@@ -3311,24 +3322,81 @@ they are confined.
   it (not measured). With `--local-build` and nerdctl, every image is
   tagged in `leerie`; with docker there is one image store, so the read
   holds there (not covered).
+  *The content store.* The namespaces keep names apart, not bytes:
+  containerd keeps one content store, and with its default
+  `content_sharing_policy = "shared"` an ingest in one namespace of a blob
+  another namespace holds succeeds by its digest alone. A repository's
+  `FROM <any registry>/x@sha256:<digest of another repository's image>`,
+  the registry answering only the manifest's `HEAD`, then built with that
+  image's worker root, read from `leerie` (measured 2026-11-03 through
+  `build_repo_image` on a containerd of the review's own, BuildKit
+  0.31.2, containerd 2.2.2). With `"isolated"` the same build failed (the
+  registry got the `GET`), while `ensure_base_in_worker_ns`, a repository
+  build and its export into `leerie` worked as before (`debian:13-slim`
+  as the base: copied in 5.5 s, the build 37 s, against 6.0 s and 44 s
+  shared; at the base's full size not measured; content is then written
+  once per namespace that holds it, where shared it was linked). So
+  `scripts/runtime-install.sh` writes `content_sharing_policy =
+  "isolated"` into a fresh rootless install's
+  `~/.config/containerd/config.toml` before containerd first starts, and
+  leaves an existing file alone. Before each repository build the launcher
+  (and `build-push.sh --local-build`) reads that file and warns, naming the
+  lines and the restart, when it does not set the policy
+  (`leerie_content_sharing_check`); it neither refuses nor restarts.
+  *Decided 2026-11-03 (review round 38, isolation X2).* The setting takes
+  effect only when containerd restarts, and a restart of the rootless
+  unit stops every container it runs (its `KillMode=mixed`; not measured
+  here), every leerie run on the host included. A refusal would make the
+  upgrade an outage for every existing install until the operator
+  restarted it, and leerie restarting it would end runs it does not own.
+  What the read needs is the digest of another repository's image, which
+  no channel the review found gives a build, and a branch of the same
+  repository mostly holds the content already; on an install that keeps
+  `"shared"`, that digest is the one secret, an accepted residual. The
+  check reads the file, not the daemon: a file changed and not yet
+  restarted passes (asking the daemon needs `ctr` on its own socket, whose
+  address differs per runtime, and a probe write, which under
+  `"isolated"` left an unfinished ingest each time, measured). Not checked
+  on macOS, where containerd runs in Colima's VM, nor for a rootful
+  containerd's own unit beyond its file (not measured).
 - *A repository's build carries no operator credential.* nerdctl runs
-  `buildctl`, which hands BuildKit every registry credential in the
-  invoking user's Docker config, so a repository's `FROM` could pull
+  `buildctl`, which hands BuildKit every registry credential the invoking
+  user's Docker client would use, so a repository's `FROM` could pull
   anything the operator can, another repository's pushed image included
   (measured 2026-11-03 with a registry of the review's own: `401
-  Unauthorized` with an empty Docker config, the victim's file with the
-  operator's). Both builds of a repository image run with `DOCKER_CONFIG`
-  set to an empty 0700 directory of leerie's own in the build directory
-  (`$_REPO_BUILD_DIR/registry-auth`), so they pull as no one, the same rule
-  as *A repository chooses no operator authority*. A repository's `FROM` a
-  public image still works; a private one is pulled by the operator into
-  the worker's namespace first (`nerdctl --namespace <worker namespace>
-  pull`), where the build resolves it by name: what a build may read is
-  the operator's choice, made image by image, so leerie has no setting
-  that shares a registry. Leerie's own builds, its base and the frontend
-  it pulls into the worker's namespace, keep the operator's config: no
-  repository text reaches them, they name only public images, and an
-  operator behind a mirror or a rate limit needs it. *Fly:* the
+  Unauthorized` without the operator's credential, the victim's file with
+  it). buildctl finds a credential in three places (docker/cli's
+  `LoadDefaultConfigFile` and `GetCredentialsStore`, as BuildKit 0.31.2
+  vendors them): the Docker config in `$DOCKER_CONFIG`; when that config
+  names no auth entry, credential store or helper, the platform's default
+  credential helper if it is on PATH (`docker-credential-pass` when `pass`
+  is on PATH, else `docker-credential-secretservice`; `osxkeychain` on
+  macOS), which is how `docker login` keeps a login wherever
+  golang-docker-credential-helpers is installed; and `DOCKER_AUTH_CONFIG`,
+  read before either. Both builds of a repository image run with
+  `DOCKER_CONFIG` set to a 0700 directory of leerie's own in the build
+  directory (`$_REPO_BUILD_DIR/registry-auth`) whose `config.json` is
+  `{"auths":{"leerie.invalid":{}}}`, and with `DOCKER_AUTH_CONFIG` empty,
+  so they pull as no one, the same rule as *A repository chooses no
+  operator authority*. The one entry, for a name no registry can have
+  (`.invalid`, RFC 2606) and with no credential, is what makes the config
+  count as holding auth, so that no default helper is looked for: with a
+  helper on PATH that holds the operator's login, an empty directory, `{}`,
+  `{"credsStore":""}` (read as no store) and `{"auths":{}}` each pulled the
+  private image, the helper asked each time, while this file got `401` and
+  the helper was not asked; a `DOCKER_AUTH_CONFIG` holding the credential
+  pulled it whatever the file said (measured 2026-11-03, BuildKit 0.31.2).
+  A repository's `FROM` a public image still works; a private one is
+  pulled by the operator into the worker's namespace first (`nerdctl
+  --namespace <worker namespace> pull`), where the build resolves it by
+  name: what a build may read is the operator's choice, made image by
+  image, so leerie has no setting that shares a registry. Leerie's own
+  builds, its base and the frontend it pulls into the worker's namespace,
+  keep the operator's config: no repository text reaches them, they name
+  only public images, and an operator behind a mirror or a rate limit
+  needs it. *macOS:* nerdctl is Colima's shim into its VM, and whether
+  `DOCKER_CONFIG` and `DOCKER_AUTH_CONFIG` reach buildctl there, and which
+  helper the VM has, is not measured. *Fly:* the
   repository's stage is built `FROM` leerie's base in
   `registry.fly.io/<app>`, so that build needs the app's registry
   credential, and the one it can have reads every image of the
@@ -3337,7 +3405,11 @@ they are confined.
   separate commands, so each could be given its own Docker config, but
   the build itself needs the credential: on Fly a repository's build can
   read the organization's images (not covered). *Designed 2026-11-03
-  (review round 37, isolation I4).*
+  (review round 37, isolation I4).* *Revised 2026-11-03 (review round 38,
+  isolation X1).* This said both builds ran with an empty directory as
+  their Docker config and so pulled as no one; with
+  `docker-credential-secretservice` on PATH they pulled with the
+  operator's login (the review's proof, through `build_repo_image`).
 - *Fail closed, on every entry.* Where the image has a worker root, the
   confinement check every entry runs (`_require_confinement`) runs `test
   -e /.leerie-worker-env` confined and stops the run when it does not find

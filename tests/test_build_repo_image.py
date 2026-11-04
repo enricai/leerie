@@ -104,19 +104,21 @@ nerdctl() {{
       return 0
       ;;
     build)
-      # What the build's Docker config is: its path, mode, and whether it
-      # holds anything (builtins and absolute paths only).
+      # What the build's Docker credentials are: the config's path, its
+      # mode, the names it holds and config.json's text, and
+      # DOCKER_AUTH_CONFIG (builtins and absolute paths only).
       {{
         printf 'DOCKER_CONFIG=%s' "${{DOCKER_CONFIG-unset}}"
         if [ -n "${{DOCKER_CONFIG:-}}" ] && [ -d "$DOCKER_CONFIG" ]; then
-          printf ' mode=%s' "$(/usr/bin/stat -c %a "$DOCKER_CONFIG")"
-          if compgen -G "$DOCKER_CONFIG/*" >/dev/null \
-             || compgen -G "$DOCKER_CONFIG/.[!.]*" >/dev/null; then
-            printf ' nonempty'
-          else
-            printf ' empty'
-          fi
+          printf ' mode=%s files=' "$(/usr/bin/stat -c %a "$DOCKER_CONFIG")"
+          local _e
+          for _e in "$DOCKER_CONFIG"/* "$DOCKER_CONFIG"/.[!.]*; do
+            [ -e "$_e" ] && printf '%s,' "${{_e##*/}}"
+          done
+          [ -f "$DOCKER_CONFIG/config.json" ] \
+            && printf ' config.json=%s' "$(< "$DOCKER_CONFIG/config.json")"
         fi
+        printf ' DOCKER_AUTH_CONFIG=%s' "${{DOCKER_AUTH_CONFIG-unset}}"
         echo
       }} >> "$NERDCTL_LOG.env"
       # NERDCTL_FAIL_LANG_LAYER: a build whose -f file holds a language-dep
@@ -219,8 +221,10 @@ def test_build_repo_image_argv_contains_required_flags(tmp_path):
             "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
             "LEERIE_VERSION": "1.2.3",
             "IMAGE_TAG": "leerie:1.2.3",
-            # The operator's Docker config, which no repository build reads.
+            # The operator's Docker config and DOCKER_AUTH_CONFIG, which no
+            # repository build reads.
             "DOCKER_CONFIG": str(operator_cfg),
+            "DOCKER_AUTH_CONFIG": '{"auths":{"r.example":{"auth":"eDp5"}}}',
         },
     )
     assert result.returncode == 0, result.stderr
@@ -264,11 +268,15 @@ def test_build_repo_image_argv_contains_required_flags(tmp_path):
     # build consumes what another build left in BuildKit*)...
     for b in (first, second):
         assert b.startswith("--namespace leerie build --buildkit-host unix://"), b
-    # ...and with an empty, 0700 Docker config of leerie's own in the build
-    # directory, never the operator's (DESIGN §6 *A repository's build
-    # carries no operator credential*).
+    # ...and with a 0700 Docker config of leerie's own in the build
+    # directory, never the operator's, whose one file names one auth entry
+    # with no credential (so buildctl looks for no default credential helper
+    # on PATH), and DOCKER_AUTH_CONFIG empty, though the operator's is set
+    # (DESIGN §6 *A repository's build carries no operator credential*).
     envs = (tmp_path / "nerdctl.log.env").read_text().splitlines()
-    assert envs == [f"DOCKER_CONFIG={d}/registry-auth mode=700 empty"] * 2, envs
+    assert envs == [f"DOCKER_CONFIG={d}/registry-auth mode=700 "
+                    'files=config.json, config.json={"auths":'
+                    '{"leerie.invalid":{}}} DOCKER_AUTH_CONFIG='] * 2, envs
     # And the build directory is gone afterwards.
     assert not list((state_dir / ".image-build").glob("b.*"))
 
@@ -424,7 +432,7 @@ def test_old_repository_images_are_swept_before_a_build(tmp_path, in_use):
     builds = [l for l in lines if l.startswith("--namespace leerie build ")]
     if in_use:
         assert result.returncode == 1, result.stderr
-        assert in_use in result.stderr and "still uses" in result.stderr, result.stderr
+        assert in_use in result.stderr and "still holds an image" in result.stderr, result.stderr
         assert builds == [], lines
     else:
         assert result.returncode == 0, result.stderr

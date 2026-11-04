@@ -7421,8 +7421,9 @@ sample's probe never counts for the next.
   image's own root); E1's planted `.pth` is in the worker root and never
   runs in the image root's interpreter, as leerie or root, and the
   untracked `.env` is not in the image.
-- `tests/test_buildkit_isolation.py` (26 functions, 53 cases, 12 of them
-  opt-in: 6 real builds, and 6 under bash 3.2): no build consumes what
+- `tests/test_buildkit_isolation.py` (49 functions, 100 cases, 22 of them
+  opt-in: 12 real builds, one containerd of the test's own, and 9 under
+  bash 3.2): no build consumes what
   another build left in BuildKit, every
   build is given leerie's frontend, and a repository image's build
   directory lives only as long as its launch, which no build outlives
@@ -7600,6 +7601,48 @@ sample's probe never counts for the next.
   before it discriminated: sent back to back, the two merged into one and
   passed against both mutations. All 11 opt-in real cases pass on this
   tree (BuildKit 0.31.2, rootless nerdctl 2.3.5).
+  Round 38 (review round 38, isolation X1-X3, claims F3, execution X1
+  and X2; DESIGN §6 *A repository's build carries no operator
+  credential*, *The content store*, *The images an earlier leerie left*).
+  Both builds see `DOCKER_CONFIG=<build dir>/registry-auth`, mode 700,
+  holding only `config.json` = `{"auths":{"leerie.invalid":{}}}`, and
+  `DOCKER_AUTH_CONFIG` empty, with the operator's config and
+  `DOCKER_AUTH_CONFIG` in the environment (in `test_build_repo_image.py`).
+  `build-push.sh --local-build` sweeps before its build: an unused
+  `leerie-repo/…` image is gone by the build, and one a container holds
+  refuses it with no build (2). The base build's failed prune warns,
+  naming its namespace. `leerie_content_sharing_check` passes only for a
+  config setting `content_sharing_policy` to "isolated" (v2 and v3
+  quoting), and otherwise gives the file, the lines and the restart (7).
+  The sweep's refusal names each container that holds a left image, its
+  state and its remedy, `leerie stop` for a running one and `nerdctl rm
+  <id>` for an exited one, and never `image rm` (2 of its 4 cases). The
+  real launcher's local `stop` and `kill` follow with `nerdctl rm -f` of
+  the container (2), as `resume`'s reaper does after its kill
+  (`tests/test_oom_wedge_prevention.py::test_reaper_removes_what_it_killed`). With no BuildKit daemon answering, the refusal names
+  the three addresses asked, buildctl's last error and the remedy.
+  Opt-in: with a fake `docker-credential-secretservice` on PATH holding the
+  operator's login, and then with the credential in `DOCKER_AUTH_CONFIG`,
+  an attacking repository's private `FROM` through `build_repo_image`
+  fails with 401 and the helper is never asked, while the same Dockerfile
+  built directly with an empty config and the helper on PATH reads the
+  file and asks it; on a containerd of the test's own, the config
+  `_runtime_linux_containerd_config` writes refuses an ingest by digest
+  with no body in another namespace, which containerd's default config
+  accepts. Falsified live (measured 2026-11-03), each restored, each
+  failing the cases it targets: the `config.json` write removed, or
+  `DOCKER_AUTH_CONFIG=''` dropped from the first build (the stub sees
+  them); the sweep's call removed from `build-push.sh`; the base prune's
+  warning back to `|| true`; the check made to pass always; the holders'
+  listing dropped; the `rm` dropped from `stop`, from `kill` or from the
+  reaper; buildctl's
+  stderr discarded again. Opt-in, live: the build's config left without
+  `config.json` (the helper case read the file), `DOCKER_AUTH_CONFIG=''`
+  dropped (the env case read it), and the installer's policy line dropped
+  (the ingest succeeded).
+  All 13 opt-in cases and the 9 under bash 3.2 passed on this tree
+  (measured 2026-11-04, BuildKit 0.31.2, rootless nerdctl 2.3.5,
+  containerd 2.2.2).
 - `tests/test_capture_validation.py` — E2's proof turned around: the schema,
   `_filter_residual_deps`, `_capture_problems`, `_record_capture`,
   `_merge_capture_into_config`, `apply_captured_deps`, the launcher's apt

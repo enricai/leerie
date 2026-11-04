@@ -640,3 +640,56 @@ def test_runtime_install_macos_leaves_running_vm_alone_and_hints(
     assert "brew install colima" not in calls
     assert "Colima is running with 2 cpu / 4 GB" in r.stdout
     assert "without leerie's swap provisioning" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# containerd's content sharing (DESIGN §6 *No build consumes what another
+# build left in BuildKit*, *The content store*; review round 38, isolation
+# X2): a fresh rootless install gets content_sharing_policy = "isolated"
+# before containerd first starts; an existing config is never edited.
+# ---------------------------------------------------------------------------
+
+_ISOLATED_CONFIG = ('version = 2\n\n[plugins."io.containerd.metadata.v1.bolt"]\n'
+                    '  content_sharing_policy = "isolated"\n')
+
+
+def _run_containerd_config(home: Path, dry_run: str) -> subprocess.CompletedProcess:
+    script = f"""
+      set -u
+      . "{RUNTIME_INSTALL}"
+      _runtime_linux_containerd_config
+      echo "__rc=$?"
+    """
+    return subprocess.run(["bash", "-c", script], capture_output=True,
+                          text=True, env={"DRY_RUN": dry_run,
+                                          "PATH": "/usr/bin:/bin",
+                                          "HOME": str(home)})
+
+
+def test_fresh_install_writes_an_isolated_containerd_config(tmp_path) -> None:
+    """Falsified live (2026-11-03): the call removed from
+    `_runtime_linux_rootless_setup` (the plan has no write before the
+    setuptool), and the policy line dropped from the file (fails)."""
+    r = _run_containerd_config(tmp_path, "false")
+    assert "__rc=0" in r.stdout, r.stdout + r.stderr
+    cfg = tmp_path / ".config" / "containerd" / "config.toml"
+    assert cfg.read_text() == _ISOLATED_CONFIG
+    out = _run_linux_install("debian").stdout
+    w = out.index("writing /home/tester/.config/containerd/config.toml")
+    assert w < out.index("containerd-rootless-setuptool.sh install"), out
+
+
+def test_an_existing_containerd_config_is_never_edited(tmp_path) -> None:
+    cfg = tmp_path / ".config" / "containerd" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("version = 2\n# the operator's own\n")
+    r = _run_containerd_config(tmp_path, "false")
+    assert "__rc=0" in r.stdout, r.stdout + r.stderr
+    assert cfg.read_text() == "version = 2\n# the operator's own\n"
+    assert "writing" not in r.stdout
+
+
+def test_the_containerd_config_is_not_written_under_dry_run(tmp_path) -> None:
+    r = _run_containerd_config(tmp_path, "true")
+    assert "__rc=0" in r.stdout, r.stdout + r.stderr
+    assert not (tmp_path / ".config").exists()

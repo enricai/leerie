@@ -28,12 +28,27 @@ LEERIE_DOCKERFILE_FRONTEND="docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8c
 # command leerie runs on its own images and containers names it.
 LEERIE_IMAGE_NS="leerie"
 
+# LEERIE_REGISTRY_AUTH_CONFIG — the config.json of a repository build's
+# Docker config (DESIGN §6 *A repository's build carries no operator
+# credential*), which build_repo_image writes. buildctl reads its
+# config with docker/cli's LoadDefaultConfigFile, which, for a config with
+# no auth entry, credential store or helper (an empty directory, `{}`,
+# `{"credsStore":""}`, `{"auths":{}}`), takes the platform's default
+# credential helper when it is on PATH (docker-credential-secretservice or
+# -pass, holding the operator's `docker login`): the build then pulled with
+# the operator's credential (review round 38, isolation X1; measured). One
+# entry with no credential, for a name no registry can have, does not.
+LEERIE_REGISTRY_AUTH_CONFIG='{"auths":{"leerie.invalid":{}}}'
+
 # The BuildKit daemon leerie's builds run on and the containerd namespaces
 # its workers read (space-separated), set by leerie_buildkit_resolve; and
 # why leerie_buildkit_check or leerie_sweep_worker_images refused.
 LEERIE_BUILDKIT_HOST=""
 LEERIE_BUILDKIT_WORKER_NS=""
 LEERIE_BUILDKIT_REFUSAL=""
+# Why leerie_buildkit_resolve failed: the daemons it asked and buildctl's
+# last error, or what the daemon that answered lacked.
+LEERIE_BUILDKIT_RESOLVE_ERROR=""
 
 # _leerie_on_buildkit_side <cmd> [args...] — runs <cmd> where nerdctl runs
 # buildctl: on this host, or as root in Colima's VM on macOS, whose nerdctl
@@ -44,6 +59,45 @@ _leerie_on_buildkit_side() {
   else
     "$@"
   fi
+}
+
+# leerie_containerd_config — prints the config file the containerd nerdctl
+# talks to reads on this host: $XDG_CONFIG_HOME/containerd/config.toml
+# for rootless containerd (containerd-rootless.sh binds that directory
+# over /etc/containerd), /etc/containerd/config.toml as root. Prints
+# nothing on macOS, where containerd runs in Colima's VM (not measured).
+leerie_containerd_config() {
+  [ "$(uname -s)" = "Darwin" ] && return 0
+  if [ "$(id -u)" = "0" ]; then
+    printf '%s\n' /etc/containerd/config.toml
+  else
+    printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/containerd/config.toml"
+  fi
+}
+
+# leerie_content_sharing_check — returns 0 when the file
+# leerie_containerd_config names sets content_sharing_policy = "isolated"
+# (or no file is named); else 1, with what to do in
+# LEERIE_CONTENT_SHARING_HINT (DESIGN §6 *No build consumes what another
+# build left in BuildKit*, *The content store*). It reads the file, not the
+# daemon: a daemon not restarted since the file changed passes. Never
+# edits the file or restarts containerd, whose restart stops every running
+# container.
+LEERIE_CONTENT_SHARING_HINT=""
+leerie_content_sharing_check() {
+  local _cfg _l _re='^[[:space:]]*content_sharing_policy[[:space:]]*=[[:space:]]*["'"'"']isolated["'"'"']'
+  local _restart='systemctl --user restart containerd'
+  LEERIE_CONTENT_SHARING_HINT=""
+  _cfg="$(leerie_containerd_config)"
+  [ -n "$_cfg" ] || return 0
+  if [ -f "$_cfg" ]; then
+    while IFS= read -r _l || [ -n "$_l" ]; do
+      [[ "$_l" =~ $_re ]] && return 0
+    done < "$_cfg"
+  fi
+  [ "$(id -u)" = "0" ] && _restart='systemctl restart containerd'
+  LEERIE_CONTENT_SHARING_HINT="containerd shares stored content across its namespaces (no content_sharing_policy = \"isolated\" in $_cfg), so a repository's build that names an image of leerie's by its digest can read it (DESIGN §6 *No build consumes what another build left in BuildKit*). To close it, add to $_cfg (into its [plugins.\"io.containerd.metadata.v1.bolt\"] table if it has one): [plugins.\"io.containerd.metadata.v1.bolt\"] content_sharing_policy = \"isolated\" -- then, when no leerie run or other container is running, $_restart (it stops every running container)"
+  return 1
 }
 
 # leerie_buildkit_resolve — finds the BuildKit daemon that `nerdctl
@@ -58,7 +112,8 @@ _leerie_on_buildkit_side() {
 # label that is not a containerd namespace name. Asks once per process.
 leerie_buildkit_resolve() {
   [ -n "$LEERIE_BUILDKIT_HOST" ] && return 0
-  local _d _a _out _w _c=()
+  local _d _a _out _w _c=() _err=""
+  LEERIE_BUILDKIT_RESOLVE_ERROR=""
   if [ -n "${BUILDKIT_HOST:-}" ]; then
     _c=("$BUILDKIT_HOST")
   else
@@ -72,15 +127,24 @@ leerie_buildkit_resolve() {
         "unix://$_d/buildkit/buildkitd.sock")
   fi
   for _a in "${_c[@]}"; do
-    _out="$(_leerie_on_buildkit_side buildctl --addr "$_a" debug workers \
-              --format '{{json .}}' 2>/dev/null)" || continue
+    # Its error kept for the refusal: the last line buildctl wrote.
+    if ! _out="$(_leerie_on_buildkit_side buildctl --addr "$_a" debug workers \
+                   --format '{{json .}}' 2>&1)"; then
+      _err="${_out##*$'\n'}"
+      continue
+    fi
     # The first daemon that answers is nerdctl's, whatever its workers.
     _w="$(printf '%s' "$_out" | python3 -I -S -c '
 import json, re, sys
-try:
-    ws = json.load(sys.stdin)
-except ValueError:
-    sys.exit(1)
+# The one JSON line the json format prints; a warning buildctl wrote
+# to stderr with it is passed over.
+ws = None
+for line in sys.stdin.read().splitlines():
+    try:
+        ws = json.loads(line)
+        break
+    except ValueError:
+        continue
 if not isinstance(ws, list):
     sys.exit(1)
 out = []
@@ -97,12 +161,13 @@ for w in ws:
     if ns not in out:
         out.append(ns)
 print(" ".join(out))
-')" || return 1
-    [ -n "$_w" ] || return 1
+')" || { LEERIE_BUILDKIT_RESOLVE_ERROR="the BuildKit daemon at $_a answered, but its workers are not containerd workers with a readable namespace"; return 1; }
+    [ -n "$_w" ] || { LEERIE_BUILDKIT_RESOLVE_ERROR="the BuildKit daemon at $_a has no containerd worker"; return 1; }
     LEERIE_BUILDKIT_HOST="$_a"
     LEERIE_BUILDKIT_WORKER_NS="$_w"
     return 0
   done
+  LEERIE_BUILDKIT_RESOLVE_ERROR="no BuildKit daemon answered at ${_c[*]}${_err:+ (buildctl: $_err)}; start buildkitd (rootless: containerd-rootless-setuptool.sh install-buildkit-containerd, then systemctl --user start buildkit), or set BUILDKIT_HOST to its address"
   return 1
 }
 
@@ -115,7 +180,7 @@ leerie_buildkit_check() {
   local _w
   LEERIE_BUILDKIT_REFUSAL=""
   if ! leerie_buildkit_resolve; then
-    LEERIE_BUILDKIT_REFUSAL="could not ask BuildKit which containerd namespace its worker reads (buildctl debug workers): leerie builds a repository's image only where it can tell which images the build can name (DESIGN §6 *No build consumes what another build left in BuildKit*)"
+    LEERIE_BUILDKIT_REFUSAL="could not ask BuildKit which containerd namespace its worker reads (buildctl debug workers): $LEERIE_BUILDKIT_RESOLVE_ERROR. Leerie builds a repository's image only where it can tell which images the build can name (DESIGN §6 *No build consumes what another build left in BuildKit*)"
     return 1
   fi
   for _w in $LEERIE_BUILDKIT_WORKER_NS; do
@@ -132,10 +197,14 @@ leerie_buildkit_check() {
 # for a repository image, and nothing else; an earlier leerie tagged them
 # in nerdctl's namespace) that no container uses: `nerdctl image rm`, never
 # forced. Returns 1, with the reason in LEERIE_BUILDKIT_REFUSAL, when one is
-# left, or when a namespace's images cannot be listed. Needs
-# leerie_buildkit_resolve first.
+# left, or when a namespace's images cannot be listed. The reason names
+# each container that holds a left image (`nerdctl ps -a`), its state, and
+# what ends it: a running one's run (`leerie stop <run-id>`, or its end),
+# and a container that is no longer running is removed with `nerdctl rm`:
+# nerdctl's `--rm` is its client's, so a container whose client died stays
+# (review round 38, execution X1). Needs leerie_buildkit_resolve first.
 leerie_sweep_worker_images() {
-  local _w _n _out _left=""
+  local _w _n _out _left="" _ps _id _img _st _holders _c
   LEERIE_BUILDKIT_REFUSAL=""
   for _w in $LEERIE_BUILDKIT_WORKER_NS; do
     _out="$(nerdctl --namespace "$_w" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)" \
@@ -158,7 +227,25 @@ EOF_IMAGES
 $_out
 EOF_IMAGES
     if [ -n "$_left" ]; then
-      LEERIE_BUILDKIT_REFUSAL="the containerd namespace BuildKit's worker reads ($_w) still holds an image an earlier leerie built for a repository, which a container still uses:$_left. A repository's build could read it by name; launch again once that run has ended, or remove it with: nerdctl --namespace $_w image rm <name> (DESIGN §6 *No build consumes what another build left in BuildKit*)"
+      _ps="$(nerdctl --namespace "$_w" ps -a --format '{{.ID}}|{{.Image}}|{{.Status}}' 2>/dev/null)" || _ps=""
+      _holders=""
+      while IFS='|' read -r _id _img _st; do
+        [ -n "$_id" ] || continue
+        for _c in $_left; do
+          case "$_img" in
+            "$_c"|"docker.io/$_c"|"${_c#docker.io/}") ;;
+            *) continue ;;
+          esac
+          case "$_st" in
+            Up*) _holders="$_holders; container $_id ($_st) runs $_c: end its run (leerie stop <run-id>) or let it end" ;;
+            *) _holders="$_holders; container $_id ($_st) holds $_c: remove it with: nerdctl --namespace $_w rm $_id" ;;
+          esac
+        done
+      done <<EOF_PS
+$_ps
+EOF_PS
+      [ -n "$_holders" ] || _holders="; no container in $_w names it (nerdctl --namespace $_w ps -a)"
+      LEERIE_BUILDKIT_REFUSAL="the containerd namespace BuildKit's worker reads ($_w) still holds an image an earlier leerie built for a repository:$_left. A repository's build could read it by name, and nerdctl removes it only when no container holds it$_holders. Then launch again (DESIGN §6 *No build consumes what another build left in BuildKit*)"
       return 1
     fi
   done

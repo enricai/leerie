@@ -400,9 +400,15 @@ def test_no_run_never_starts_the_image_it_built(tmp_path: Path, no_run,
              *(["--no-run"] if no_run else []))
     assert r.returncode == 0, r.stderr
     calls = (tmp_path / "nerdctl.log").read_text().splitlines()
-    # Every call is in leerie's containerd namespace (DESIGN §6 *No build
+    # The sweep of an earlier leerie's images lists the worker's namespace
+    # before the build, and only lists it (the stub holds none); every
+    # other call is in leerie's containerd namespace (DESIGN §6 *No build
     # consumes what another build left in BuildKit*).
-    assert [c.split()[:3] for c in calls] == [
+    sweep = [c for c in calls if c.startswith("--namespace default ")]
+    assert sweep == ["--namespace default images --format "
+                     "{{.Repository}}:{{.Tag}}"] * 2, calls
+    assert calls[:2] == sweep, calls
+    assert [c.split()[:3] for c in calls[2:]] == [
         ["--namespace", "leerie", v] for v in verbs], calls
 
 

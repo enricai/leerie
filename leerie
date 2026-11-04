@@ -984,8 +984,12 @@ _reap_orphaned_container() {
   fi
   remote_log "resume: reaping orphaned container for run $run_id (owning launcher pid $owner_pid is dead)"
   nerdctl --namespace "$_cns" kill "$run_id" >/dev/null 2>&1 || true
-  # nerdctl --rm removes it on kill; give the kernel a moment to release the
-  # run-dir flock before the fresh orchestrator tries to acquire it.
+  # `--rm` is the nerdctl client's, and this container's client is dead (an
+  # OOM, typically), so nothing else removes it: left Exited, it would hold
+  # its image for good (review round 38, execution X1; measured).
+  nerdctl --namespace "$_cns" rm -f "$run_id" >/dev/null 2>&1 || true
+  # Give the kernel a moment to release the run-dir flock before the fresh
+  # orchestrator tries to acquire it.
   sleep 1
 }
 
@@ -3394,12 +3398,16 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     if [ "$_stop_runtime" = "local" ]; then
       # Local container: nerdctl stop sends SIGTERM (orchestrator saves
       # state via InterruptedBySignal handler) then SIGKILL after grace.
-      # --rm on the original nerdctl run auto-removes the container.
+      # --rm on the original nerdctl run removes the container only while
+      # its client lives; the `rm` below covers a client that died.
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/lib.sh"
       remote_log "stop: stopping local container $(_terminal_safe "$LEERIE_RUN_ID")..."
       _stop_cns="$(_container_ns "$_stop_run_id")" || _stop_cns="$LEERIE_IMAGE_NS"
       nerdctl --namespace "$_stop_cns" stop "$_stop_run_id" >/dev/null 2>&1 || true
+      # Its client's `--rm` removes it only while the client lives; a resume
+      # starts a new container, so the stopped one goes either way.
+      nerdctl --namespace "$_stop_cns" rm -f "$_stop_run_id" >/dev/null 2>&1 || true
       _ensure_run_json "$_stop_run_dir" || true
       update_run_json "$_stop_sidecar" \
         paused_at "$(iso_now)" \
@@ -3589,6 +3597,8 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       remote_log "kill: destroying local container $_kill_run_id"
       _kill_cns="$(_container_ns "$_kill_run_id")" || _kill_cns="$LEERIE_IMAGE_NS"
       nerdctl --namespace "$_kill_cns" kill "$_kill_run_id" >/dev/null 2>&1 || true
+      # As stop: `--rm` is the client's, and the client may be dead.
+      nerdctl --namespace "$_kill_cns" rm -f "$_kill_run_id" >/dev/null 2>&1 || true
       if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
         _ensure_run_json "$_kill_run_dir" || true
         _kill_sidecar="$_kill_run_dir/run.json"
@@ -6333,9 +6343,11 @@ if ! nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect "$IMAGE_TAG" >/dev/nul
     --build-arg HOST_GID="$(id -g)" \
     -t "$IMAGE_TAG" \
     "$LEERIE_REPO" \
-    || { leerie_prune_cache_mounts "$_base_ns" || true
+    || { leerie_prune_cache_mounts "$_base_ns" \
+           || remote_log "warning: could not remove the build's cache-mount records ($_base_ns); BuildKit's garbage collection keeps them"
          remote_log "error: container image build failed"; exit 1; }
-  leerie_prune_cache_mounts "$_base_ns" || true
+  leerie_prune_cache_mounts "$_base_ns" \
+    || remote_log "warning: could not remove the build's cache-mount records ($_base_ns); BuildKit's garbage collection keeps them"
   unset _base_ns
 fi
 
@@ -7408,9 +7420,10 @@ _repo_image_prepare() {
 # cache-mount namespace of their own (DESIGN §6 *No build consumes what
 # another build left in BuildKit*). Both run in leerie's containerd
 # namespace on the daemon leerie_buildkit_check vetted, whose workers read
-# another (same section), and with DOCKER_CONFIG an empty 0700 directory of
-# leerie's own, so neither pulls with the operator's registry credentials
-# (DESIGN §6 *A repository's build carries no operator credential*).
+# another (same section), and with DOCKER_CONFIG a 0700 directory of
+# leerie's own holding LEERIE_REGISTRY_AUTH_CONFIG and DOCKER_AUTH_CONFIG
+# empty, so neither pulls with the operator's registry credentials (DESIGN
+# §6 *A repository's build carries no operator credential*).
 build_repo_image() {
   local repo_image_tag="$1" _soft="${2:-}" _layout _q _digest _ns _auth _rc=0
   [ -f "$_REPO_BUILD_DIR/repo/Dockerfile" ] \
@@ -7419,7 +7432,9 @@ build_repo_image() {
   _repo_build_prepare
   _auth="$_REPO_BUILD_DIR/registry-auth"
   rm -rf "$_auth"
-  mkdir -m 0700 "$_auth" || _repo_build_fail "could not make the build's empty Docker config"
+  mkdir -m 0700 "$_auth" || _repo_build_fail "could not make the build's Docker config"
+  printf '%s\n' "$LEERIE_REGISTRY_AUTH_CONFIG" > "$_auth/config.json" \
+    || _repo_build_fail "could not write the build's Docker config"
   remote_log "building per-repo container image ($repo_image_tag)..."
   _layout="$_REPO_BUILD_DIR/worker"
   # `-o` is CSV: the path quoted, a quote in it doubled.
@@ -7431,7 +7446,7 @@ build_repo_image() {
   # is given a cache-mount namespace of its own (leerie_cache_mount_ns).
   _ns="$(leerie_cache_mount_ns)" \
     || _repo_build_fail "could not draw a cache-mount namespace for the build"
-  DOCKER_CONFIG="$_auth" _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
+  DOCKER_CONFIG="$_auth" DOCKER_AUTH_CONFIG='' _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
     --buildkit-host "$LEERIE_BUILDKIT_HOST" --no-cache \
     --build-arg BUILDKIT_SYNTAX="$LEERIE_DOCKERFILE_FRONTEND" \
     --build-arg BUILDKIT_CACHE_MOUNT_NS="$_ns" \
@@ -7456,7 +7471,7 @@ build_repo_image() {
   _rc=0
   _ns="$(leerie_cache_mount_ns)" \
     || _repo_build_fail "could not draw a cache-mount namespace for the build"
-  DOCKER_CONFIG="$_auth" _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
+  DOCKER_CONFIG="$_auth" DOCKER_AUTH_CONFIG='' _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
     --buildkit-host "$LEERIE_BUILDKIT_HOST" --no-cache \
     --build-arg BUILDKIT_SYNTAX="$LEERIE_DOCKERFILE_FRONTEND" \
     --build-arg BUILDKIT_CACHE_MOUNT_NS="$_ns" \
@@ -8317,6 +8332,10 @@ if [ -f "$_leerie_dockerfile" ]; then
       # not leerie's, where the base was built — copy it across first
       # (idempotent) or the build 401s against the registry.
       leerie_buildkit_check || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
+      # A warning, not a refusal: the fix restarts containerd, which leerie
+      # never does (DESIGN §6 *No build consumes what another build left in
+      # BuildKit*, *The content store*).
+      leerie_content_sharing_check || remote_log "warning: $LEERIE_CONTENT_SHARING_HINT"
       leerie_sweep_worker_images || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
       ensure_base_in_worker_ns
       ensure_frontend_in_worker_ns
