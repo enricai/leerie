@@ -6246,13 +6246,35 @@ The mechanism:
     index's entries must be the same before and after; otherwise the
     checkout changed while it was read, and the launch stops. That tree
     is archived, and `LEERIE_COMMIT` is `<commit>-dirty.<tree>`, so the
-    record names exactly the code that ran (`git archive <tree>` in that
-    checkout gives it back). Nothing is staged in the checkout itself.
+    record names exactly the code that ran. `git archive <tree>` in that
+    checkout gives it back for as long as git keeps the tree: no ref holds
+    it, so `git gc` removes it once it is older than `gc.pruneExpire` (two
+    weeks by default). Leerie keeps no ref to it: one install serves the
+    runs of every repository on the host, each pruned on its own (`leerie
+    prune`), so the install cannot tell which recorded trees a kept run
+    still names, and a ref per launch that is never removed grows without
+    bound (each edit of the 3.6 MB `leerie.py` is a new object). *Review
+    round 40 (execution F4) measured it:* after `git -c
+    gc.pruneExpire=now gc` the recorded tree was gone. Nothing is staged
+    in the checkout itself, and the private index lives inside the
+    snapshot's own directory, so whatever removes the snapshot removes
+    it. *Review round 40 (execution
+    F2, isolation F2):* it was a directory of its own beside the
+    snapshot, removed only on the straight path; a Ctrl-C, `SIGTERM` or
+    `SIGKILL` during the snapshot left one in 8 or 9 of 20 signalled
+    launches, and no sweep took it.
   - An install that is not a git checkout (a plugin directory installed
-    without git): copied, then compared with the install as it stands
-    after the copy. A difference means the install changed under the
-    copy, and the launch stops. `LEERIE_COMMIT` is empty: there is no
-    commit.
+    without git), or a checkout git cannot read (another user's, which
+    git's `safe.directory` check refuses; one with no commit): copied,
+    then compared with the install as it stands after the copy. A
+    difference means the install changed under the copy, and the launch
+    stops. `LEERIE_COMMIT` is empty: there is no commit. The comparison
+    needs nothing of git, so the copy is one state of the install
+    whatever git can read; the launch names git's reason and goes on.
+    *Review round 40 (execution F3):* a checkout git could not read
+    stopped every launch with "has no commit to run; launch again", which
+    no relaunch changes, where before the snapshot the launch went on
+    with an empty record.
   *Measured 2026-11-04 (review round 39, execution E2 and E3):* the record
   was read at the launcher's start and the copy taken after the image
   steps, 7 minutes later on a first launch, so a same-version update in

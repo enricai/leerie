@@ -700,7 +700,11 @@ started with*):
   `orchestrator/`, `scripts/`, `prompts/` and `.claude-plugin/` of `SRC`
   (`$LEERIE_REPO`) into `DEST`, and sets `LEERIE_COMMIT` (no longer read
   at launcher start). When `SRC/.git` exists, `HEAD` is read once (`rev-parse --verify -q
-  'HEAD^{commit}'`; unresolved, it returns 1, "has no commit to run"), and
+  'HEAD^{commit}'`, its stderr in `DEST/.git-err`, removed). Unresolved (git
+  cannot read the checkout, e.g. its `safe.directory` refusal, or there is
+  no commit), the launch logs "git cannot read the leerie checkout at SRC
+  (<git's first stderr line>); taking it as a copy, with no commit
+  recorded" and takes the non-git shape below. Resolved, and
   when `git --no-optional-locks status
   --porcelain --untracked-files=all -- <dirs>` is empty, `git archive
   <HEAD> -- <dirs> | tar -xf - -C DEST` and `LEERIE_COMMIT=<short HEAD>`.
@@ -708,11 +712,11 @@ started with*):
   (`rev-parse --git-path index.lock`) absent and `_leerie_checkout_state`
   (HEAD and `ls-files -s -- <dirs>`) read, `_leerie_worktree_tree` twice
   (`GIT_INDEX_FILE=<private> read-tree HEAD; add -A -- <dirs>;
-  write-tree`, the private indexes in `mktemp -d ~/.cache/leerie/idx-…`,
-  removed); the two ids equal, the lock still absent and the state
+  write-tree`, the private indexes in `DEST/.idx`, removed before the
+  archive is extracted, and with `DEST` on any other exit); the two ids equal, the lock still absent and the state
   unchanged, or it returns 1 ("changed while this launch read it");
   `git archive <tree>` and `LEERIE_COMMIT=<short HEAD>-dirty.<tree:12>`.
-  No `SRC/.git` (not a git checkout): `cp -pR` of each directory, then `diff
+  No `SRC/.git` (not a git checkout), or `HEAD` unresolved: `cp -pR` of each directory, then `diff
   -r -q` of each against `SRC`, a difference returns 1 ("changed while
   this launch copied it"); `LEERIE_COMMIT` empty. Then the snapshot's
   `plugin.json` version (the same `awk` extraction as `LEERIE_VERSION`)

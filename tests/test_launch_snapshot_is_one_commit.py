@@ -18,7 +18,10 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import time
 from pathlib import Path
+
+import pytest
 
 from tests.conftest import run_git_out as _git
 from tests.launcher_argv_extract import LAUNCHER
@@ -62,23 +65,28 @@ def _commit(inst: Path, letter: str) -> str:
     return _git(inst, "rev-parse", "HEAD")
 
 
-def _run(root: Path, inst: Path, pre: str = "") -> tuple[int, str, str]:
+def _script(home: Path, inst: Path, pre: str = "") -> str:
+    return ("set -euo pipefail\n"
+            f'HOME="{home}"; LEERIE_REPO="{inst}"; '
+            f'LEERIE_VERSION="{VERSION}"\n'
+            'remote_log() { printf "LOG: %s\\n" "$*" >&2; }\n'
+            + pre + _span()
+            + 'printf "%s\\n%s\\n" "$_code_snapshot" "$LEERIE_COMMIT"\n'
+            # The EXIT trap would remove it; the test reads it first.
+            + "trap - EXIT\n")
+
+
+def _run(root: Path, inst: Path, pre: str = "",
+         env: dict[str, str] | None = None) -> tuple[int, str, str]:
     """The snapshot span in a launcher-shaped shell; prints the snapshot's
     path and LEERIE_COMMIT. `pre`: bash run first (a stand-in, by name)."""
     home = root / "home"
     home.mkdir(exist_ok=True)
-    script = ("set -euo pipefail\n"
-              f'HOME="{home}"; LEERIE_REPO="{inst}"; '
-              f'LEERIE_VERSION="{VERSION}"\n'
-              'remote_log() { printf "LOG: %s\\n" "$*" >&2; }\n'
-              + pre + _span()
-              + 'printf "%s\\n%s\\n" "$_code_snapshot" "$LEERIE_COMMIT"\n'
-              # The EXIT trap would remove it; the test reads it first.
-              + "trap - EXIT\n")
-    r = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
-                       text=True, timeout=120,
+    r = subprocess.run(["/bin/bash", "-c", _script(home, inst, pre)],
+                       capture_output=True, text=True, timeout=120,
                        env={"PATH": "/usr/bin:/bin",
-                            "GIT_CEILING_DIRECTORIES": str(root)})
+                            "GIT_CEILING_DIRECTORIES": str(root),
+                            **(env or {})})
     return r.returncode, r.stdout, r.stderr
 
 
@@ -189,3 +197,72 @@ def test_a_checkout_an_update_rewrites_during_the_snapshot_never_tears_it(
         ref = commit.partition("-dirty.")[2] or commit
         assert got == _archive(inst, ref, tmp_path / f"chk{i}"), i
     assert accepted, "no snapshot was taken"
+
+
+def test_a_checkout_git_cannot_read_is_copied_with_gits_reason(tmp_path):
+    """Review round 40, execution F3: an install git refuses to read
+    (another user's: git's own safe.directory test hook) stopped every
+    launch with "has no commit to run; launch again", which no relaunch
+    changes. It is taken as a copy, compared like any non-git install,
+    with git's reason named and no commit recorded."""
+    inst = _install(tmp_path)
+    (inst / "prompts" / "edited.md").write_text("# edited\n")
+    rc, out, err = _run(tmp_path, inst,
+                        env={"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"})
+    assert rc == 0, err
+    snap, commit = (out.splitlines() + [""])[:2]
+    assert commit == ""
+    assert "dubious ownership" in err and "taking it as a copy" in err, err
+    assert "launch again" not in err, err
+    want = {f"{d}/{k}": v for d in DIRS for k, v in _files(inst / d).items()}
+    assert _files(Path(snap)) == want
+
+
+def _sweep() -> str:
+    src = LAUNCHER.read_text()
+    return src[src.index("_sweep_stale_stages() {"):
+               src.index("( _sweep_stale_stages )")]
+
+
+@pytest.mark.parametrize("sig", ["SIGINT", "SIGTERM", "SIGKILL"])
+def test_a_signal_during_the_snapshot_leaves_nothing_behind(tmp_path, sig):
+    """Review round 40, execution F2 and isolation F2: the private index of
+    a contributor's snapshot was a directory of its own,
+    ~/.cache/leerie/idx-<pid>-*, removed only on the straight path; a
+    signal during `git add` left it, and no sweep removed it. A stand-in
+    `git` (by name; the real one by absolute path) holds the snapshot in
+    `add` until the signal lands. SIGINT and SIGTERM go to the launch's
+    process group (a Ctrl-C, a service stop) and its EXIT trap runs;
+    SIGKILL leaves the rest to the next launch's sweep of stale stages."""
+    inst = _install(tmp_path)
+    (inst / "scripts" / "landlock_exec.py").write_text("# edited\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    in_add = tmp_path / "in-add"
+    pre = ('git() { case " $* " in *" add "*) '
+           f': > "{in_add}"; /usr/bin/sleep 30;; esac; '
+           '/usr/bin/git "$@"; }\n')
+    p = subprocess.Popen(["/bin/bash", "-c", _script(home, inst, pre)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env={"PATH": "/usr/bin:/bin",
+                              "GIT_CEILING_DIRECTORIES": str(tmp_path)},
+                         start_new_session=True)
+    try:
+        deadline = time.monotonic() + 60
+        while not in_add.exists():
+            assert p.poll() is None and time.monotonic() < deadline
+            time.sleep(0.02)
+        cache = home / ".cache" / "leerie"
+        assert any(cache.iterdir())
+        os.killpg(p.pid, getattr(signal, sig))
+        p.wait(timeout=60)
+    finally:
+        if p.poll() is None:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+    if sig != "SIGKILL":
+        assert sorted(e.name for e in cache.iterdir()) == []
+    subprocess.run(["/bin/bash", "-c",
+                    f'HOME="{home}"\n' + _sweep() + "_sweep_stale_stages\n"],
+                   env={"PATH": "/usr/bin:/bin"}, check=True, timeout=60)
+    assert sorted(e.name for e in cache.iterdir()) == []

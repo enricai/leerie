@@ -7836,7 +7836,8 @@ sample's probe never counts for the next.
   are each given the snapshot's `orchestrator/leerie.py`, and the install's
   appears in neither. Falsified (2026-11-04): the two arguments back on
   `$LEERIE_REPO` fail both.
-- `tests/test_launch_snapshot_is_one_commit.py` (5 test functions) — the
+- `tests/test_launch_snapshot_is_one_commit.py` (7 test functions, 9
+  cases) — the
   snapshot is one state of the install, and `LEERIE_COMMIT` names it
   (review round 39, execution E2 and E3). The launcher's snapshot span,
   verbatim: a clean checkout gives its commit's tree and short sha; a
@@ -7850,7 +7851,17 @@ sample's probe never counts for the next.
   Falsified (2026-11-04), one change at a time: a git checkout copied
   with `cp -pR` instead of archived fails the flipping test; edits
   recorded as the bare commit fail the edits test; the non-git copy left
-  uncompared fails the changed-under-copy test. `tests/test_leerie_commit.py`'s
+  uncompared fails the changed-under-copy test. Review round 40: a
+  checkout git refuses to read (`GIT_TEST_ASSUME_DIFFERENT_OWNER=1`, git's
+  own hook for its ownership check) is copied with git's reason logged, no
+  commit recorded and no "launch again" (execution F3); and a SIGINT or
+  SIGTERM to the launch's process group, or a SIGKILL, while a stand-in
+  `git` holds the snapshot in `add` leaves nothing in `~/.cache/leerie`
+  once the EXIT trap or the next launch's `_sweep_stale_stages` has run
+  (execution F2, isolation F2; 3 cases). Falsified (2026-11-04): the
+  private index back in `~/.cache/leerie/idx-<pid>-*` fails the 3 signal
+  cases; the old stop on an unreadable checkout fails the git case.
+  `tests/test_leerie_commit.py`'s
   two launcher pins run the span (a git install: the short sha; no git:
   empty, status 0).
 - `tests/test_capture_validation.py` — E2's proof turned around: the schema,
