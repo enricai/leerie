@@ -1068,6 +1068,22 @@ def _restore_child_subreaper():
 TEST_PROCESS_ENV = "PYTEST_LEERIE_TEST_ID"
 
 
+# What the teardown scan calls, bound when this module is imported. The
+# scan runs at `_no_process_outlives_its_test`'s teardown, and that is
+# before the test's monkeypatches are undone: `monkeypatch` is one instance
+# per test, set up by the first autouse fixture that requests it (several
+# above this one do), so it is torn down after every fixture set up later,
+# this one included. Looked up at call time, `open` was the stub of a test
+# that forbids reading files (tests/test_repo_change_warn_default.py's
+# `test_fingerprint_never_reads_contents`, which then errored at teardown
+# on every run), and any test patching `os.listdir`, `os.stat` or `os.kill`
+# would have blinded or broken the scan the same way.
+_open = open
+_os_getpid, _os_getuid = os.getpid, os.getuid
+_os_isdir, _os_listdir, _os_stat = os.path.isdir, os.listdir, os.stat
+_os_kill, _os_waitpid = os.kill, os.waitpid
+
+
 def processes_marked(marker: str) -> list[int]:
     """The PIDs, other than this process, whose environment carries
     `TEST_PROCESS_ENV=<marker>`. /proc is a fixed kernel format; a process
@@ -1078,17 +1094,17 @@ def processes_marked(marker: str) -> list[int]:
     autouse teardown that calls it, erroring the teardown of every test on
     macOS -- a dev host reads as "nothing left behind", the same answer it
     gave before this scan existed."""
-    if not os.path.isdir("/proc"):
+    if not _os_isdir("/proc"):
         return []
     needle = f"{TEST_PROCESS_ENV}={marker}".encode()
-    me, uid, out = os.getpid(), os.getuid(), []
-    for name in os.listdir("/proc"):
+    me, uid, out = _os_getpid(), _os_getuid(), []
+    for name in _os_listdir("/proc"):
         if not name.isdigit() or int(name) == me:
             continue
         try:
-            if os.stat(f"/proc/{name}").st_uid != uid:
+            if _os_stat(f"/proc/{name}").st_uid != uid:
                 continue
-            with open(f"/proc/{name}/environ", "rb") as f:
+            with _open(f"/proc/{name}/environ", "rb") as f:
                 env = f.read()
         except OSError:
             continue
@@ -1108,11 +1124,11 @@ def kill_marked(marker: str, rounds: int = 5) -> list[int]:
             break
         for pid in pids:
             with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGKILL)
+                _os_kill(pid, signal.SIGKILL)
                 killed.append(pid)
         for pid in pids:
             with contextlib.suppress(ChildProcessError, OSError):
-                os.waitpid(pid, os.WNOHANG)
+                _os_waitpid(pid, os.WNOHANG)
     return killed
 
 
