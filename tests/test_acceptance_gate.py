@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import needs_landlock, skip_without_landlock
 from tests.conftest import run_git_cwd_first_stdout as _git
 
 BUGGY = "def add(a, b):\n    return a - b\n"
@@ -393,6 +394,8 @@ def test_a_crashed_evaluations_worktree_is_replaced(leerie, tmp_path):
     assert not stale.exists()
 
 
+@needs_landlock
+@skip_without_landlock
 def test_each_evaluation_installs_into_its_fresh_worktree(
         leerie, tmp_path, monkeypatch):
     """The evaluation worktree's path is reused; a stale install memo would
@@ -449,6 +452,8 @@ def test_a_failed_install_is_no_evidence(leerie, tmp_path):
     {"command": ["no-such-binary-xyz"]},                         # raises
 ])
 @pytest.mark.parametrize("kind,want", [("build", True), ("install", False)])
+@needs_landlock
+@skip_without_landlock
 def test_only_a_failed_install_counts(leerie, tmp_path, failure, kind, want):
     """Round-6: a fix that breaks the build is evidence against the fix,
     not a missing dependency — whichever way the build step fails."""
@@ -1186,6 +1191,8 @@ _IMPORT_DEFECT = ("from calc import mul\n\n"
 
 @pytest.mark.parametrize("mode,want", [("import", False),
                                        ("assertion", None)])
+@needs_landlock
+@skip_without_landlock
 def test_a_declared_import_defect_counts_as_failing(leerie, tmp_path, mode,
                                                     want):
     """The report's defect is that `mul` does not exist: a defect file that
@@ -1351,6 +1358,8 @@ def test_a_probe_the_template_deselects_is_unrunnable_not_unparseable(
     ("from calc import mul\n", ""),
     ("", "--no-such-plugin-flag"),                    # unknown option: exit 4
 ])
+@needs_landlock
+@skip_without_landlock
 def test_a_probe_that_never_reaches_its_check_says_so(leerie, tmp_path,
                                                      monkeypatch, conftest,
                                                      addopts):
@@ -1922,6 +1931,8 @@ def test_a_fork_exhaustion_kill_is_no_verdict(leerie, tmp_path):
         st.run_dir / "logs" / "p.log", "p")) is None
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_timeout_fails(leerie, tmp_path):
     """A hung test is the fix failing to finish, not "no verdict"."""
     repo, head = _repo(tmp_path)
@@ -1939,6 +1950,8 @@ def test_a_timeout_fails(leerie, tmp_path):
     "def f():\n    return 1\n",           # a fix that removed the entry point
     "def add(a, b):\n    return a +\n",  # a fix that broke the module
 ])
+@needs_landlock
+@skip_without_landlock
 def test_an_unimportable_module_under_test_is_a_failure(leerie, tmp_path,
                                                         module):
     """Round-6 M1: pytest's collection error (exit 2) is also what a fix
@@ -1954,6 +1967,8 @@ def test_an_unimportable_module_under_test_is_a_failure(leerie, tmp_path,
         st.run_dir / "logs" / "p.log", "p")) is False
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_broken_module_a_conftest_imports_is_a_failure(leerie, tmp_path):
     """Round-7 M1: pytest reports a conftest ImportError as exit 4 — at
     evaluation, still the fix's doing."""
@@ -2016,6 +2031,8 @@ def test_runner_output_never_reaches_the_orchestrator_log(
     assert "test_defect_1" not in out
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_failed_install_in_the_writer_discards_the_set(
         leerie, tmp_path, monkeypatch, capsys):
     repo, head = _repo(tmp_path)
@@ -2178,6 +2195,8 @@ def test_gate_repairs_at_high_effort_and_records_a_clean_final(
     assert gate["final_sha"] != gate["initial_sha"]
 
 
+@needs_landlock
+@skip_without_landlock
 def test_unfixed_tree_ships_with_a_residual_after_two_rounds(
         leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
@@ -2257,6 +2276,8 @@ def test_a_confirmation_that_raises_falls_back_to_the_red_run(
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
+@needs_landlock
+@skip_without_landlock
 def test_resume_mid_repair_still_rolls_back_a_red_repair(
         leerie, tmp_path, monkeypatch):
     """Round-2 M2: the pre-repair verdict is persisted, so a resume after a
@@ -2282,6 +2303,8 @@ def test_resume_mid_repair_still_rolls_back_a_red_repair(
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
+@needs_landlock
+@skip_without_landlock
 def test_repair_rounds_follow_the_cap(leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
@@ -2301,6 +2324,8 @@ def test_repair_rounds_follow_the_cap(leerie, tmp_path, monkeypatch):
     assert "round 1 of 1" in calls[0]["user_prompt"]
 
 
+@needs_landlock
+@skip_without_landlock
 def test_pre_repair_state_is_persisted_before_the_first_round(
         leerie, tmp_path, monkeypatch):
     """A resume reads before_sha and pre_tests_passed from disk, so both
@@ -2366,6 +2391,8 @@ def test_evaluation_installs_deps_before_running(leerie, tmp_path, monkeypatch):
     assert events[1] == ("run", eval_wt)
 
 
+@needs_landlock
+@skip_without_landlock
 def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
                                                       monkeypatch):
     """Round 1 commits a repair that turns the test axis red; round 2's
@@ -2406,6 +2433,8 @@ def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
     assert gate["final"] is not None
 
 
+@needs_landlock
+@skip_without_landlock
 def test_no_hidden_sets_means_no_claim_of_hidden_tests(leerie, tmp_path,
                                                       monkeypatch, capsys):
     repo, head = _repo(tmp_path)
@@ -2818,6 +2847,8 @@ def test_a_red_repair_rolls_back_even_when_evaluation_breaks(
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up(
         leerie, tmp_path, monkeypatch):
     """Round-6 M2: an exception setting up the evaluation worktree after a
@@ -2847,6 +2878,8 @@ def test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up(
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
+@needs_landlock
+@skip_without_landlock
 def test_an_unmeasurable_final_keeps_the_last_measured_residual(
         leerie, tmp_path, monkeypatch):
     """A final tree that cannot be measured at all (here: no repair commit,
@@ -2872,6 +2905,8 @@ def test_an_unmeasurable_final_keeps_the_last_measured_residual(
     assert res["failing_sets"] == 5 and res["unmeasured_final"] is True
 
 
+@needs_landlock
+@skip_without_landlock
 def test_two_unreadable_heads_still_count_as_moved(leerie, tmp_path,
                                                    monkeypatch):
     """The verdict's commit and the HEAD after an errored round both
@@ -2950,6 +2985,8 @@ def test_branch_head_sha_never_raises(leerie, tmp_path, monkeypatch):
     assert asyncio.run(leerie._branch_head_sha(str(tmp_path))) == ""
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
         leerie, tmp_path, monkeypatch):
     """Round-7 M3: reading HEAD after a red repair raised EAGAIN out of the
@@ -2996,6 +3033,8 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_failure_spawning_a_later_round_still_rolls_back(
         leerie, tmp_path, monkeypatch):
     """Round-8 M1: `claude_p` lets an OSError spawning the worker through;
@@ -3239,6 +3278,8 @@ def test_a_test_axis_measurement_that_raises_never_escapes(
     assert st.data["acceptance"]["gate"]["final"] is not None
 
 
+@needs_landlock
+@skip_without_landlock
 def test_no_rollback_target_means_no_repair(leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
@@ -3445,6 +3486,8 @@ def test_a_round_that_fixes_no_failing_case_is_reset_to_its_own_start(
     assert "round_pre" not in gate
 
 
+@needs_landlock
+@skip_without_landlock
 def test_two_rounds_that_fix_nothing_leave_the_tree_they_started_from(
         leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
@@ -3786,6 +3829,8 @@ def test_a_file_with_no_case_evidence_is_not_a_collapse(leerie):
         {"2:b.py": {"failing_cases": ["d1"]}}, keys) == []
 
 
+@needs_landlock
+@skip_without_landlock
 def test_a_resume_finishes_a_decided_round_rollback(leerie, tmp_path,
                                                     monkeypatch):
     repo, head = _repo(tmp_path)
@@ -3810,6 +3855,8 @@ def test_a_resume_finishes_a_decided_round_rollback(leerie, tmp_path,
 
 # --- repair rounds see the task and its required items (lane A 3d item 3) --
 
+@needs_landlock
+@skip_without_landlock
 def test_repair_rounds_get_the_task_and_required_items_not_held_data(
         leerie, tmp_path, monkeypatch):
     """Not blind: the task text and every required item, with its typed

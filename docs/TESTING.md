@@ -2768,6 +2768,40 @@ dominated by environment noise trains people to ignore it.
 `scripts/worktree-lib.sh` and its sourcers are part of this surface: the
 collect-subtrees tests drive them under the host's own bash.
 
+### Measuring this surface
+
+Two ways to get a wrong answer about it, both met while gating it (#308,
+#310). They are recorded because the counts look authoritative either way.
+
+- **A count means nothing unless the host is idle and the files run one
+  selection at a time.** CLAUDE.md's "never run two copies of the suite
+  concurrently" gives the magnitude (two overlapping suites measured 78 and
+  57 flaky failures); this surface is where it bites hardest, because these
+  tests fork real processes and spawn real confined commands. Measured here: a
+  widened selection read **98 failed** with a baseline suite still running in
+  the background, and a 97-vs-122 before/after comparison was contaminated the
+  same way -- both unusable. Re-run one selection at a time on an idle host
+  and the files that had looked changed read *identically* on either side
+  (`tests/test_build_repo_image.py`: 24 failed, 4 passed before and after;
+  `tests/test_blt_memo.py` + `tests/test_capture_deps.py`: 100 passed both).
+  Watch the wall-clock as a tell: the same file took 384 s idle and 778 s
+  with another suite alongside, and the slow run reported a different count.
+  The cheapest check that a count is junk is `pgrep -f pytest` before
+  believing it.
+- **A `failure` conclusion on the `test` workflow does not imply a failing
+  test.** On the 0.44.10 release commit every Python leg reported
+  `14111 passed, 161 skipped, 0 failed` with no `FAILED` name anywhere in the
+  log, and the step still exited 1 -- on a shutdown-time
+  `PytestUnraisableExceptionWarning` (`Exception ignored in
+  BaseSubprocessTransport.__del__` -> `RuntimeError: Event loop is closed`),
+  raised after the summary was printed. The same exit appears on unrelated
+  heads, so it says nothing about any one change. Read CI's summary line
+  first, then grep the log for `FAILED`; none means the tests passed, and a
+  local count that disagrees is measuring the host, not the code.
+
+Both rules point the same way: compare *sets* of failing test IDs, not totals,
+and prefer CI's own summary over re-deriving it locally.
+
 Two further files pin contracts this surface exposed:
 
 - `tests/test_shim_refuses_on_a_libc_without_prctl.py` --
@@ -8101,7 +8135,7 @@ bound, both measured on the first full local run under `--timeout=600`:
   them where they run (the same opt-in `tests/test_work_read_only.py` and
   `tests/test_pinned_runtime_runs.py` use). On macOS the Colima VM reports
   ABI 4, so the real feature is reachable from a dev host.
-  Thirty-nine tests were failing for want of this gate, in seven files.
+  Sixty-six tests were failing for want of this gate; twelve files carry it.
   Twelve came first: the five in `tests/test_bstar_confirm.py` that drive a
   real confined measurement, the three in
   `tests/test_collect_subtrees_sh.py` whose integrator the payload refuses
@@ -8133,6 +8167,14 @@ bound, both measured on the first full local run under `--timeout=600`:
   `tests/test_confined_terminal.py` gates its `isolate` parameter): only the
   `edited` case runs a confined command, and a whole-function mark would
   have skipped a passing one.
+
+  Twenty-seven more, in `tests/test_acceptance_gate.py` (23 functions), came
+  from the same `install_seccomp` fix and were found the same way: that file
+  read 67 failed before the fix and 92 after, and a `comm` of the failing
+  test IDs named the 27 exactly. Every one of them passes on Linux, where
+  `prctl` exists and the fix is a no-op, so on macOS they had been reporting
+  a verdict the shim never actually produced. The file's other 58 failures
+  are a separate, pre-existing shape and are left visible.
 - `_quiet_host_pressure`. The B* confirm gate waits up to
   `confirm_gate_wait_sec` (300 s) a confirm for the HOST's CPU pressure to
   fall below `confirm_psi_cpu_max`. Tests not about that gate inherited the
