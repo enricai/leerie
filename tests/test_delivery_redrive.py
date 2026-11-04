@@ -1253,3 +1253,29 @@ def test_solution_defect_file_is_a_path_match(leerie):
     assert leerie._solution_defect_file("./src/a.ts", files) == "src/a.ts"
     assert leerie._solution_defect_file("handleEnter()", files) is None
     assert leerie._solution_defect_file("src/b.tsx:3", files) is None
+
+
+@pytest.mark.parametrize("spent, measured", [(14400.0, False), (0.0, True)],
+                         ids=["spent_on_entry", "budget_left"])
+def test_a_budget_spent_on_entry_measures_nothing(leerie, tmp_path,
+                                                  monkeypatch, spent,
+                                                  measured):
+    """The live barnacle run `54fb56c3`: the re-drive stopped on its
+    budget, the run was resumed, and the re-drive's entry ran the 1000
+    coupled test files for 10m38s before its first budget check stopped it
+    with no round. The budget is the hard stop for every re-drive (DESIGN
+    §13), so nothing a round would spend is measured once it is spent."""
+    w = World(leerie, tmp_path)
+    w.install(monkeypatch)
+    labels = []
+
+    async def ids(st, caps, staging, label):
+        labels.append(label)
+        return None
+    monkeypatch.setattr(leerie, "_redrive_test_ids", ids)
+    w.st.data["redrive_spent_sec"] = spent
+    w.edits = [lambda w: w.write("export const a = 1; // FIXED\n")]
+    w.run()
+    assert ("redrive-ids0" in labels) is measured
+    assert (len(w.calls) == 1) is measured
+    assert w.st.data["delivery_redrive"]["done"]

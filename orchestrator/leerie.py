@@ -61979,7 +61979,13 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             staging, grants=_measurement_grants(st, staging))
     trade_pairs = {tuple(p) for p in rec["trade_pairs"]}
     prior_members: list[str] = []
-    ids_before = await _redrive_test_ids(st, caps, staging, "redrive-ids0")
+    # The baseline is the first thing a round spends, so a budget already
+    # spent on entry (a resume after the stop) does not measure it: the
+    # loop below stops before any round reads it (DESIGN §13: the hard
+    # stop for every re-drive).
+    ids_before = (None if float(st.data.get("redrive_spent_sec") or 0.0)
+                  >= budget else
+                  await _redrive_test_ids(st, caps, staging, "redrive-ids0"))
     rechecked_sha = rec.get("items_rechecked_sha")
 
     def set_note(k: str, v: dict, kind: str) -> dict:

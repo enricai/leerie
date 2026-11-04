@@ -9845,7 +9845,11 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `claims.items`), else the defect claimers, else every subtask. Subtasks
   sharing a file are unioned into one group; groups and members keep plan
   order; every group also carries the pending `control_regression` notes.
-- **Rounds.** At most as many as the members' shared counters allow. A
+- **Rounds.** At most as many as the members' shared counters allow, and
+  none once `redrive_spent_sec` reaches `redrive_budget_sec`, checked
+  before each round. With the budget already spent on entry (a resume after
+  that stop), the pre-round baseline `_redrive_test_ids(…, "redrive-ids0")`
+  is not measured either. A
   round is held-back when no shown file fails, held-back sets exist and the
   held-back round has not run: the held-back sets are measured and their
   failing files become names-only notes (`HELD-BACK ACCEPTANCE FAILURES`).
