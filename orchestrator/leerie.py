@@ -32835,18 +32835,31 @@ async def _enable_corepack_shims(grants: WorkerGrants, env: dict[str, str],
     corepack writes next to the first `corepack` on PATH — the image's baked
     Node, which the toolchain grant does not write. A version left shimless
     by a failed run is enabled here too. Symlinked aliases are skipped: their
-    target is a real directory of its own."""
+    target is a real directory of its own.
+
+    `MISE_DATA_DIR` is written by confined commands (the toolchain and setup
+    hook grants), so it is read as a repository's place is: names listed
+    beneath it and directories reached without a link (DESIGN §6 *Leerie
+    never reads through a link a repository holds*). `bin/corepack` is
+    itself a link in a Node install; leerie only names it, and the kernel
+    resolves it inside the confined command."""
     data = Path(env.get("MISE_DATA_DIR")
                 or Path.home() / ".local" / "share" / "mise")
     root = data / "installs" / "node"
     try:
-        versions = sorted(p for p in root.iterdir()
-                          if p.is_dir() and not p.is_symlink())
+        names = _listdir_beneath(data, root)
     except OSError:
         return
-    for v in versions:
+    for name in sorted(names):
+        v = root / name
+        if not _dir_beneath_exists(data, v):
+            continue
         bin_dir = v / "bin"
-        if not (bin_dir / "corepack").exists() or (bin_dir / "pnpm").exists():
+        try:
+            present = set(_listdir_beneath(data, bin_dir))
+        except OSError:
+            continue
+        if "corepack" not in present or "pnpm" in present:
             continue
         label = f"corepack enable {v.name}"
         try:
