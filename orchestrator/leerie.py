@@ -1582,6 +1582,14 @@ EXIT_BUDGET_INFEASIBLE = 11
 # the BSD sysexits.h EX_TEMPFAIL convention.
 EXIT_LOCKED = 75
 
+# Emitted when the confinement shim refused to start a command after the
+# confinement check every entry runs (`_require_confinement`) had passed
+# (`ConfinementRefused`; DESIGN §6 *A confinement failure stops the run; it is
+# never a result*). 78 is sysexits.h EX_CONFIG: the environment, not the work,
+# is what failed. Resumable once the environment is fixed; not a clean exit
+# for the Fly/EC2 teardown, which pauses the machine for that resume.
+EXIT_CONFINEMENT_REFUSED = 78
+
 # Fixed backoff before auto-resuming a rate-limit that carried NO parseable
 # reset time — chiefly the out-of-credits mid-stream kill, where the kill left
 # no `resetsAt` to compute a wake time from (DESIGN §6 *Rate-limited →
@@ -5405,6 +5413,38 @@ class TerminalAuthFailure(BaseException):
     def __init__(self, raw_message: str):
         super().__init__(raw_message)
         self.raw_message = raw_message
+
+
+class ConfinementRefused(BaseException):
+    """The confinement shim refused to start a command or a worker after
+    the entry's confinement check had passed (DESIGN §6 *A confinement
+    failure stops the run; it is never a result*). Raised by
+    `_ShimRefusals.check` when the shim wrote its refusal descriptor
+    (`--refusal-fd`), never inferred from an exit status or a message.
+
+    A BaseException, like `TerminalAuthFailure`: a caller's `except
+    Exception` must not read it as a build failure, a worker crash or "no
+    evidence", record it, or downgrade it to an advisory, as every caller
+    did with the bare exit 126 on 2026-11-03 at 22:41. `main()` stops the
+    run on it with `EXIT_CONFINEMENT_REFUSED`, having recorded nothing of
+    the interrupted step, which `resume` then redoes.
+
+    `what`: the command or worker refused; `reason`: the shim's own text."""
+    def __init__(self, what: str, reason: str):
+        super().__init__(f"{what}: {reason}")
+        self.what = what
+        self.reason = reason
+
+
+class HeldOutPathTaken(FileExistsError):
+    """The confinement shim did not place a held-out file, because the tree
+    already has its path: a file there, or a link or a non-directory on its
+    way (`--taken-fd`). A fact about the tree a worker committed, not a
+    confinement failure: an `OSError`, so each caller reads it as the run
+    it could not make, never as `ConfinementRefused` (DESIGN §6 *A
+    confinement failure stops the run; it is never a result*). Each caller
+    checks the path first (`_lexists_beneath`, the shim's own rule); this
+    is the shim saying so where that check was not made."""
 
 
 # Literal Claude Code subscription rate-limit message format, observed
@@ -10532,6 +10572,7 @@ def resolve_heal_success_threshold(repo_root: Path,
 async def run_proc(cmd: list[str], *, cwd: str | None = None,
                    timeout: float | None = None,
                    env: dict[str, str] | None = None,
+                   pass_fds: tuple[int, ...] = (),
                    ) -> subprocess.CompletedProcess:
     """Async equivalent of `subprocess.run(cmd, capture_output=True, text=True)`.
     On timeout, kills the process and raises `subprocess.TimeoutExpired` — same
@@ -10547,11 +10588,13 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     `env` defaults to None, which inherits the orchestrator's environment
     (asyncio's own default) — so every existing call site is unchanged.
     Callers pass it to scope a variable to one command, e.g.
-    `_rescue_integrator_work`'s throwaway `GIT_INDEX_FILE`."""
+    `_rescue_integrator_work`'s throwaway `GIT_INDEX_FILE`. `pass_fds`: a
+    confined command's refusal descriptor (`_shim_refusals`)."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
         env=env,
+        pass_fds=pass_fds,
         # Never the orchestrator's fd 0, the operator's terminal in an
         # interactive run (DESIGN §6 *No confined process holds a
         # descriptor of the operator's terminal*).
@@ -10853,10 +10896,20 @@ async def _run_streaming(
                  if sandbox is not None and sandbox.report is not None
                  else None)
     report_fd = report_fh.fileno() if report_fh is not None else None
+    # Checked in the `finally`, before the caller sees an exit status (DESIGN
+    # §6 *A confinement failure stops the run; it is never a result*). A
+    # held-out file the tree leaves no room for comes back on a descriptor
+    # of its own: a fact about the tree, never a refusal.
+    refusals = _ShimRefusals(label or " ".join(cmd))
+    taken = (_ShimTaken(label or " ".join(cmd))
+             if sandbox is not None and sandbox.place else None)
     try:
         async with _exec_lock().shared():
             spawn_cmd = _confined_argv(grants, list(cmd), sandbox=sandbox,
-                                       report_fd=report_fd)
+                                       report_fd=report_fd,
+                                       refusal_fd=refusals.fd,
+                                       taken_fd=(taken.fd if taken is not None
+                                                 else None))
             # A command in a run's tree reads that tree's own stores
             # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may
             # share*).
@@ -10872,7 +10925,10 @@ async def _run_streaming(
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *spawn_cmd,
-                    pass_fds=tuple(fd for fd in (gate_r, report_fd)
+                    pass_fds=tuple(fd for fd in (gate_r, report_fd,
+                                                 refusals.fd,
+                                                 taken.fd if taken is not None
+                                                 else None)
                                    if fd is not None),
                     cwd=cwd,
                     env={**_repo_command_env(env), **dict(grants.env)},
@@ -10974,6 +11030,14 @@ async def _run_streaming(
     finally:
         if report_fh is not None:
             report_fh.close()
+        try:
+            refusals.check()
+        except ConfinementRefused:
+            if taken is not None:
+                taken.close()
+            raise
+        if taken is not None:
+            taken.check()
 
 
 async def _gather_or_cancel(*aws):
@@ -19705,7 +19769,8 @@ async def _backstop_capture_prior_runs(
         # abort the backstop loop (or, in main()'s exit handlers, skip the
         # EXIT_LOCKED pause). Catch them here so capture stays non-fatal.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as exc:
+                ContextOverflow, DiskLowSpace,
+                ConfinementRefused) as exc:
             log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
 
 
@@ -19831,7 +19896,8 @@ def run_recapture_deps(
                 # exactly that shape and fails loudly if the guard and the
                 # call it guards ever drift apart.
                 except (Exception, TerminalAuthFailure, RateLimitedExit,
-                        ContextOverflow, DiskLowSpace) as exc:
+                        ContextOverflow, DiskLowSpace,
+                        ConfinementRefused) as exc:
                     log(f"recapture: error during dep_capture for "
                         f"{target_run_dir.name}: {exc}")
                     return False
@@ -19846,7 +19912,8 @@ def run_recapture_deps(
             if asyncio.run(_capture_with_strict_output()):
                 ran_any = True
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as exc:
+                ContextOverflow, DiskLowSpace,
+                ConfinementRefused) as exc:
             log(f"recapture: error during dep_capture for "
                 f"{target_run_dir.name}: {exc}")
 
@@ -21209,6 +21276,18 @@ def _save_state_best_effort(st: "State", where: str) -> None:
             "stands and `leerie resume` still works from it")
 
 
+def _capture_failure_note(exc: BaseException) -> str:
+    """How a best-effort dependency capture's failure is logged. A refusal
+    of the confinement shim is named as one: the capture is the one
+    confined step that never stops a run (DESIGN §6½), and a refused one
+    recorded nothing, so a later `leerie config --recapture` still
+    captures it (DESIGN §6 *A confinement failure stops the run; it is
+    never a result*)."""
+    if isinstance(exc, ConfinementRefused):
+        return "not run — the confinement shim refused it, nothing recorded,"
+    return "non-fatal error"
+
+
 async def _best_effort_capture_deps(
         repo_root: Path,
         st: "State",
@@ -21243,9 +21322,10 @@ async def _best_effort_capture_deps(
             record_in=st.run_dir,
         )
     except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-            RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-        log(f"capture: non-fatal error during {context_label} "
-            f"({_cap_exc})")
+            RateLimitedExit, ContextOverflow, DiskLowSpace,
+            ConfinementRefused) as _cap_exc:
+        log(f"capture: {_capture_failure_note(_cap_exc)} during "
+            f"{context_label} ({_cap_exc})")
 
 
 def _brief_worker_exc(exc: BaseException) -> str:
@@ -24265,7 +24345,7 @@ def _require_worker_view() -> None:
     if wr is None or not _isolated():
         return
     argv = _confined_argv(WorkerGrants(rw=("/dev/null",), ro=("/",)),
-                          ["test", "-e", _WORKER_ENV_MARK])
+                          ["test", "-e", _WORKER_ENV_MARK], refusal_fd=None)
     try:
         r = subprocess.run(argv, cwd="/", stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=60,
@@ -24474,7 +24554,7 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
                 sandbox=HeldOutSandbox(view=str(view),
                                        place=((str(held), rel),),
                                        report=str(view / "report.json")),
-                report_fd=rep.fileno(), worker_root=False)
+                report_fd=rep.fileno(), worker_root=False, refusal_fd=None)
             r = subprocess.run(argv, cwd=str(view), stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, timeout=60,
                                pass_fds=(rep.fileno(),))
@@ -25184,10 +25264,78 @@ def _worker_root() -> str | None:
     return str(WORKER_ROOT) if stat.S_ISDIR(st.st_mode) else None
 
 
+class _ShimRefusals:
+    """The shim's refusal descriptor for one confined spawn (DESIGN §6 *A
+    confinement failure stops the run; it is never a result*): a pipe whose
+    write end `fd` is passed to the shim (`--refusal-fd`, `pass_fds`). The
+    shim writes it only when it refuses, and makes it close-on-exec, so
+    the command itself never holds it: a command's own exit 126 leaves it
+    empty. `check()` once the process has ended: raises
+    `ConfinementRefused` when the shim wrote it."""
+
+    def __init__(self, what: str) -> None:
+        self.what = what
+        self._r, self.fd = os.pipe()
+        os.set_blocking(self._r, False)
+        self._closed = False
+
+    def close(self) -> bytes:
+        """Close both ends; returns what the shim wrote, if anything."""
+        if self._closed:
+            return b""
+        self._closed = True
+        _close_fd(self.fd)
+        raw = b""
+        try:
+            while True:
+                chunk = os.read(self._r, 65536)
+                if not chunk:
+                    break
+                raw += chunk
+        except OSError:
+            pass
+        finally:
+            _close_fd(self._r)
+        return raw
+
+    def check(self) -> None:
+        raw = self.close()
+        if raw:
+            raise ConfinementRefused(
+                self.what, raw.decode(errors="replace").strip())
+
+
+class _ShimTaken(_ShimRefusals):
+    """The shim's taken descriptor for one held-out sandbox (`--taken-fd`):
+    the same pipe, written only when a held-out file could not be placed
+    because the tree has its path. `check()` raises `HeldOutPathTaken`."""
+
+    def check(self) -> None:
+        raw = self.close()
+        if raw:
+            raise HeldOutPathTaken(
+                f"{self.what}: {raw.decode(errors='replace').strip()}")
+
+
+@contextlib.contextmanager
+def _shim_refusals(what: str) -> Iterator[int]:
+    """A `_ShimRefusals` around a spawn's whole life: yields the descriptor
+    to pass to `_confined_argv` and `pass_fds`, and checks it on the way
+    out, whatever the body raised — a refusal replaces the exit status or
+    error the body was reading it as."""
+    refusals = _ShimRefusals(what)
+    try:
+        yield refusals.fd
+    finally:
+        refusals.check()
+
+
 def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
+                   refusal_fd: int | None = None,
                    sandbox: HeldOutSandbox | None = None,
                    report_fd: int | None = None, cli: bool = False,
-                   worker_root: bool = True) -> list[str]:
+                   worker_root: bool = True,
+                   taken_fd: int | None = None) -> list[str]:
     """`cmd` started through the Landlock shim with `grants`. With
     `sandbox`, in a held-out sandbox (always: a held-out file never runs
     outside one, and the shim refuses where it cannot build one), its
@@ -25202,15 +25350,25 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
     isolated, it runs in the worker view (`--worker-root`); a worker's CLI
     (`cli`) stays in leerie's root and its commands run there instead
     (`--cli`, `scripts/worker-shell.py`). `worker_root` False: leerie's
-    root, for the sandbox probe, which checks the shim's own machinery."""
+    root, for the sandbox probe, which checks the shim's own machinery.
+    `refusal_fd`: the write end of the spawn's `_ShimRefusals`, which the
+    spawn also passes in `pass_fds`. Every call in this module names it
+    (a test reads every call): None only for `_require_confinement`'s own
+    probes, which read the shim's exit themselves. `taken_fd` (with
+    `sandbox`): the write end of the spawn's `_ShimTaken`, where the shim
+    says a held-out file's path is the tree's."""
     # `-S`: the shim imports only the standard library, and `site` cost
     # ~15 ms of every worker's start (measured).
     argv = [sys.executable, "-I", "-S", str(LANDLOCK_SCRIPT)]
+    if refusal_fd is not None:
+        argv += ["--refusal-fd", str(refusal_fd)]
     wr = _worker_root() if worker_root else None
     if sandbox is not None:
         argv += ["--sandbox", "--view", sandbox.view]
         for src, rel in sandbox.place:
             argv += ["--place", f"{src}={rel}"]
+        if taken_fd is not None:
+            argv += ["--taken-fd", str(taken_fd)]
         if sandbox.report is not None and report_fd is not None:
             argv += ["--report", sandbox.report, "--report-fd",
                      str(report_fd)]
@@ -26531,8 +26689,14 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # Unconfined (the host-side seam): the CLI is found from `/`, never
     # through PATH from the directory it starts in (DESIGN §6 *The host
     # never runs a program the checkout chose*, part 4).
+    # A confined worker's refusal descriptor, checked as the last step of the
+    # teardown below, before the envelope or exit status is read (DESIGN §6
+    # *A confinement failure stops the run; it is never a result*).
+    refusals = (_ShimRefusals(f"worker {sid}") if grants is not None
+                else None)
     spawn_cmd = ([_exe_from_root(cmd[0]), *cmd[1:]] if grants is None
-                 else _confined_argv(grants, list(cmd), cli=True))
+                 else _confined_argv(grants, list(cmd), cli=True,
+                                     refusal_fd=refusals.fd))
     gate_r: int | None = None
     gate_w: int | None = None
     if cgroup_sid is not None:
@@ -26540,7 +26704,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     try:
         proc = await asyncio.create_subprocess_exec(
             *spawn_cmd,
-            pass_fds=(gate_r,) if gate_r is not None else (),
+            pass_fds=tuple(fd for fd in (
+                gate_r, refusals.fd if refusals is not None else None)
+                if fd is not None),
             cwd=cwd,
             # The staged prompt file when the caller has a prompt to feed (the
             # normal `claude_p` path — the user prompt no longer travels on
@@ -26578,6 +26744,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         if stdin_path is not None:
             with contextlib.suppress(OSError):
                 os.unlink(stdin_path)
+        if refusals is not None:
+            refusals.close()
         await exec_hold.aclose()
         raise
     _close_fd(gate_r)
@@ -26628,6 +26796,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         except BaseException:
             # The closed gate exits without running the worker.
             _release_spawn_gate(gate_w, run=False)
+            if refusals is not None:
+                refusals.close()
             await exec_hold.aclose()
             raise
         _release_spawn_gate(gate_w)
@@ -27098,6 +27268,10 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # Its process tree has ended and been reaped: the worker no longer
         # exists.
         await exec_hold.aclose()
+        # Last, so every step above has run: a refusal replaces whatever
+        # this worker's exit is about to be read as.
+        if refusals is not None:
+            refusals.check()
 
     if envelope is None:
         stderr_txt = b"".join(stderr_chunks).decode(errors="replace").strip()
@@ -33044,12 +33218,16 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     try:
         # A confined command: under the execution lock, as `_run_streaming`.
         async with _exec_lock().shared():
-            result = await run_proc(
-                _confined_argv(grants, ["mise", "ls", "--current", "--json"]),
-                cwd=str(repo_root),
-                env={**_repo_command_env(env), **dict(grants.env)},
-                timeout=MISE_LS_TIMEOUT,
-            )
+            with _shim_refusals("mise ls --current --json") as refusal_fd:
+                result = await run_proc(
+                    _confined_argv(grants,
+                                   ["mise", "ls", "--current", "--json"],
+                                   refusal_fd=refusal_fd),
+                    cwd=str(repo_root),
+                    env={**_repo_command_env(env), **dict(grants.env)},
+                    timeout=MISE_LS_TIMEOUT,
+                    pass_fds=(refusal_fd,),
+                )
     except subprocess.TimeoutExpired:
         # Not fatal — workers run their own install commands via prompt
         # injection (DESIGN §6½ "Worker-driven install"); they don't
@@ -53438,7 +53616,7 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     Returned with a short reason for the log. Short of True, the
     declaration is not honoured."""
     probe = _acceptance_probe_rel(st, test_rel)
-    if (Path(tree) / probe).exists():
+    if _lexists_beneath(Path(tree), Path(tree) / probe):
         return None, "the parse check's name is taken in the tree"
     # The probe is placed in the sandbox, never written into the tree: its
     # source is a file of leerie's own, outside every grant.
@@ -54553,11 +54731,12 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         try:
             for rel in ((s_.get("support_files") or [])
                         + s_["defect_files"] + s_["control_files"]):
-                dst = wt / rel
-                if dst.exists() or dst.is_symlink():
+                if _lexists_beneath(wt, wt / rel):
                     # Never placed over (or run in place of) a file the
-                    # tree already has — and never count the set as
-                    # passing on a file it could not run.
+                    # tree already has, nor through a link or a
+                    # non-directory on its way (the shim's own rule) — and
+                    # never count the set as passing on a file it could
+                    # not run.
                     unmeasured = True
                     why_files[rel] = "path_in_use"
                     continue
@@ -55636,8 +55815,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
     out: dict = {"failing_cases": [], "findings": [], "kinds": [],
                  "sample_kinds": [], "samples": 0}
     log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
-    if any((wt / rel).exists() or (wt / rel).is_symlink()
-           for rel in _set_files(set_)):
+    if any(_lexists_beneath(wt, wt / rel) for rel in _set_files(set_)):
         out["skipped"] = "a set path already exists in the audited tree"
         return out
     # The set's runs place it in their sandboxes; only then is it staged on
@@ -58345,11 +58523,12 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
             "whose grant does not reach it — leerie's own invariant is "
             "broken (DESIGN §6 *Leerie's runs of the repository's commands "
             "are confined too*). Report this.")
-    return subprocess.run(_confined_argv(grants, argv), cwd=str(tree),
-                          stdin=subprocess.DEVNULL,
-                          capture_output=True, text=text, timeout=timeout,
-                          check=False,
-                          env={**_ts_script_env(), **dict(grants.env)})
+    with _shim_refusals(" ".join(argv)) as refusal_fd:
+        return subprocess.run(
+            _confined_argv(grants, argv, refusal_fd=refusal_fd),
+            cwd=str(tree), stdin=subprocess.DEVNULL, capture_output=True,
+            text=text, timeout=timeout, check=False, pass_fds=(refusal_fd,),
+            env={**_ts_script_env(), **dict(grants.env)})
 # Coupling policy over those facts (bench n2d coupling.py, frozen). Every
 # pattern reads code tokens, paths or shell commands — mechanical strings
 # (DESIGN §12), never prose.
@@ -69128,8 +69307,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # bare `except Exception` would let escape — derailing a clean finalize into
     # a crash. Capture is best-effort; catch them so it never blocks the run.
     except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-            RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-        log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
+            RateLimitedExit, ContextOverflow, DiskLowSpace,
+            ConfinementRefused) as _cap_exc:
+        log(f"capture: {_capture_failure_note(_cap_exc)} during dep capture "
+            f"({_cap_exc}); "
             "continuing")
 
     # Run-health surfacing (DESIGN §9 / F4): fold the slowest worker and
@@ -71603,6 +71784,29 @@ def main() -> int | None:
         # set at the top of this arm, before the guarded save, so that every
         # statement below them is best-effort.
 
+    except ConfinementRefused as e:
+        # The shim refused a command or worker after the entry's
+        # confinement check passed: the environment changed under the run
+        # (DESIGN §6 *A confinement failure stops the run; it is never a
+        # result*). Nothing of the interrupted step was recorded — the
+        # refusal propagated past every caller — so the state saved here is
+        # the state before it, and `resume` redoes it. No dependency
+        # capture: it is a confined worker and would refuse again.
+        full_purge = False
+        abnormal = False
+        exit_code = EXIT_CONFINEMENT_REFUSED
+        _save_state_best_effort(st, "ConfinementRefused exit")
+        log(f"confinement refused — {e.what}: {e.reason}")
+        log("  leerie runs no command and no worker it cannot confine, and "
+            "records no result for one; the run stops here, with nothing "
+            "of this step recorded.")
+        log("  Fix the environment the message names (the kernel, the "
+            "container's AppArmor profile or seccomp), then resume with: "
+            f"leerie resume {st.run_id}")
+        try:
+            _cleanup_on_abnormal_exit(st, full_purge=False)
+        except BaseException as cleanup_err:
+            log(f"cleanup failed (non-fatal): {cleanup_err}")
     except TerminalAuthFailure as e:
         # Expired/absent OAuth session (`claude /login` required) —
         # unlike the transient 401/429/529 case, Claude Code sends no

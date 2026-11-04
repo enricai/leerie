@@ -4476,6 +4476,52 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   Landlock scopes; `--isolate` and `--sandbox` build its namespaces and
   mounts first (§ *Isolation and the held-out sandbox (I3)* below). The
   orchestrator loads it as a module (`_landlock()`).
+- **A refusal is typed, not an exit status** (DESIGN §6 *A confinement
+  failure stops the run; it is never a result*). `--refusal-fd N`: the
+  shim makes `N` close-on-exec first thing in `main()` (a bad or closed
+  `N` is a usage error, exit 2), keeps it across the sandbox's
+  `_close_fds_except`, and every refusal goes through `_refused(msg) ->
+  int`: the message to stderr (unchanged text), the same bytes written to
+  `N`, return 126 — `leave_terminal`'s reason, `_isolation_failed`,
+  `_confine_or_126`, the subreaper refusal in `run()`, `_before_exec` in
+  the child (then `os._exit(126)`). An exec failure (127) and the
+  command's own exit codes write nothing. Before it forks the command
+  (`run()`, and `run_sandbox` before it forks PID 1), the shim calls
+  `_undumpable()`, `prctl(PR_SET_DUMPABLE, 0)`, so the command cannot open
+  `/proc/<shim>/fd/N` (a failure is a refusal). `--taken-fd N`
+  (`--sandbox` only; close-on-exec first thing in `main()` like `N`): a
+  `PlacementTaken` from `place()` goes through `_taken(e) -> int` — the
+  message to stderr, the same bytes to the taken descriptor, nothing to
+  the refusal descriptor, return 126, the command not run. Orchestrator side:
+  `_shim_refusals(what: str)`, a context manager around a
+  `_ShimRefusals(what)` (the pipe class: `fd`, `close() -> bytes`,
+  `check()`), yielding the write end of
+  a fresh pipe (`os.pipe()`, both ends non-inheritable, the read end
+  non-blocking); on exit, whatever the body raised, it closes the write
+  end and reads the read end, and non-empty bytes raise
+  `ConfinementRefused(what, reason)` (a `BaseException`, chained over any
+  exception in flight). `_confined_argv(..., refusal_fd: int | None = None)`
+  appends `--refusal-fd N`, and `taken_fd=` appends `--taken-fd N` with a
+  `sandbox`; every call in `leerie.py` names `refusal_fd`
+  (a test reads every call, so no spawn can omit it), and every spawn
+  passes `N` in `pass_fds`: `_run_streaming`, `_invoke` (workers; checked
+  as the last step of its teardown `finally`, before the envelope or exit
+  status is read), `_ts_script_run`, the `mise ls` capture in
+  `phase_provision`. `_run_streaming` also opens a `_ShimTaken` (the same
+  pipe class; `check()` raises `HeldOutPathTaken`, a `FileExistsError`)
+  for a `sandbox` with `place` pairs and checks it after the refusal
+  descriptor, which outranks it. `None` only in `_require_confinement`'s own probes,
+  which read the shim's exit themselves and `die()`. `main()`'s
+  `except ConfinementRefused` arm: `_save_state_best_effort`, the log
+  naming `e.what` and `e.reason`, worktree-only cleanup, no dependency
+  capture, `exit_code = EXIT_CONFINEMENT_REFUSED = 78`, returned (a pause,
+  not a death). Every best-effort dependency-capture guard
+  (`_best_effort_capture_deps`, `_backstop_capture_prior_runs`,
+  `run_recapture_deps`, `phase_finalize`'s) catches it with the other
+  run-ending signals and logs `_capture_failure_note(exc)` ("not run — the
+  confinement shim refused it, nothing recorded,"); a capture records
+  only on success. Pinned by
+  `tests/test_confinement_refusal_stops_the_run.py`.
 - `_require_landlock()` — `die()` unless `abi() >= MIN_ABI`; on every
   runtime, first in `_require_confinement`.
 - `_require_confinement(run_dir: Path, state_root: Path, checkout: Path)
@@ -5292,12 +5338,17 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   made with `mkdirat` when absent and opened `O_NOFOLLOW | O_DIRECTORY`
   from its parent's descriptor, the file created `O_CREAT | O_EXCL |
   O_NOFOLLOW`, mode `0444`. Refused (exit 126, step `place …`) when `REL`
-  is absolute, empty or holds `.`, `..` or an empty component, when the
-  view already has a file there (a set is never placed over the tree's own
-  file, the rule `_place_set` held), or when a directory on its path is a
-  link (review round 21, isolation R6: a committed `tests -> <worker
-  tree>` link sent the file onto disk in the worker's tree, because the
-  placement followed it, with every mount still writable).
+  is absolute, empty or holds `.`, `..` or an empty component, or when
+  placing fails for any reason but the three below. `PlacementTaken`
+  (`_taken`, the taken descriptor, never a refusal) when `_place_one`
+  fails `EEXIST`, `ENOTDIR` or `ELOOP` (`_TAKEN_ERRNOS`): the view already
+  has a file there (a set is never placed over the tree's own file, the
+  rule `_place_set` held), or a link or a non-directory is on its path
+  (review round 21, isolation R6: a committed `tests -> <worker tree>`
+  link sent the file onto disk in the worker's tree, because the
+  placement followed it, with every mount still writable; review round
+  39, isolation R1: reported as a refusal, the same link stopped the run
+  with exit 78 on every `resume`).
   `tests/heldout_sandbox_emulator.py` refuses the same paths.
 - `loopback_up() -> None` (both) — `SIOCGIFFLAGS` and `SIOCSIFFLAGS`
   (`IFF_UP`) on `lo`; a failure is step `bring up lo`.
@@ -5461,8 +5512,9 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
     database is the wrapper's (*The per-command database*).
   - `_acceptance_run_placed(st, caps, wt, sets, label, *, confirm=True)`
     — per set, the `place` pairs of every file whose path `wt` does not
-    already have (`exists()` or a symlink: `path_in_use`, the set
-    unmeasured, as before), handed to every run, confirm rerun and
+    already have by the shim's rule (`_lexists_beneath`: a file there, or a
+    link or a non-directory on its way: `path_in_use`, the set
+    unmeasured), handed to every run, confirm rerun and
     discovery rerun (`_acceptance_discover(…, place, note, …)`, the
     positional slot `env_extra` had); nothing is copied, no section held
     across the loop. The writer's validation runs its own files where the
@@ -5470,7 +5522,7 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   - `_acceptance_parse_probe` — the probe's source is written to a
     `tempfile.mkstemp` file of leerie's own (removed after) and placed at
     the probe's path (`None` with "the parse check's name is taken" when
-    the tree has that path); its marker is the sandbox's `report`, so
+    `_lexists_beneath` finds that path taken); its marker is the sandbox's `report`, so
     "ran"/"ok" come back through the descriptor.
   - `_acceptance_case_failures(st, caps, wt, set_, log_path, label)` —
     the set's files as `place`; `_acceptance_audit_in` checks no set path

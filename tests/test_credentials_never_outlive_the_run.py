@@ -157,6 +157,8 @@ def at_exec(*a):
 RAISE = {
     "worker_error": lambda: m.WorkerError("boom"),
     "context_overflow": lambda: m.ContextOverflow("too long"),
+    "confinement_refused": lambda: m.ConfinementRefused("pnpm run build",
+                                                        "refused"),
     "disk_low": lambda: m.DiskLowSpace("no space"),
     "auth": lambda: m.TerminalAuthFailure("401"),
     "out_of_credits": lambda: m.RateLimitedExit(None, "credits",
@@ -213,6 +215,7 @@ finally:
 # every arm is driven (a new arm fails the derivation test below).
 ARMS = {
     "WorkerError": ["worker_error"], "ContextOverflow": ["context_overflow"],
+    "ConfinementRefused": ["confinement_refused"],
     "DiskLowSpace": ["disk_low"], "TerminalAuthFailure": ["auth"],
     "RateLimitedExit": ["out_of_credits", "rate_limit_exec"],
     "KeyboardInterrupt": ["interrupt"], "InterruptedBySignal": ["signal"],

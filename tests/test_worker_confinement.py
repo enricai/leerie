@@ -524,7 +524,7 @@ def test_invoke_spawns_through_the_shim():
     body = body[:body.index("\nasync def ") if "\nasync def " in body
                 else len(body)]
     spawn = body.index("asyncio.create_subprocess_exec(")
-    assert body.index("_confined_argv(grants, list(cmd), cli=True)") < spawn
+    assert body.index("_confined_argv(grants, list(cmd), cli=True,") < spawn
 
 
 def test_only_the_host_seam_runs_unconfined():

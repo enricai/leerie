@@ -4,11 +4,26 @@
 command's processes end with it*).
 
 Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...
-                         [--worker-root DIR [--cli]]]
+                         [--worker-root DIR [--cli]]] [--refusal-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
        landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
                         [--report PATH --report-fd N] [--worker-root DIR]
+                        [--refusal-fd N] [--taken-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
+
+`--refusal-fd N`: every refusal (each exit 126 the shim makes itself, never
+CMD's) also writes its reason to descriptor N, which the shim makes
+close-on-exec before anything else, so CMD never holds it (DESIGN §6 *A
+confinement failure stops the run; it is never a result*). The caller
+tells the shim's refusal from CMD's own exit 126 by that descriptor, never
+by the status or the text. The shim makes itself non-dumpable before CMD
+starts, so CMD cannot reopen N through `/proc/<shim>/fd/N` either.
+
+`--taken-fd N` (`--sandbox`): a held-out file that cannot be placed because
+the tree already has its path — a file there, or a link or a non-directory
+on its way — is a fact about the tree, not a refusal. The shim writes that
+reason to N (never to the refusal descriptor), exits 126 and does not run
+CMD.
 
 Every write-class right (write, truncate, create, remove, rename and link)
 and every read right (read a file, list a directory) is handled: allowed
@@ -74,6 +89,7 @@ orchestrator imports `abi()` and `MIN_ABI` from here for its preflight, so
 the requirement has one spelling."""
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import fcntl
@@ -101,6 +117,7 @@ _CREATE_RULESET_VERSION = 1
 _RULE_PATH_BENEATH = 1
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_SET_CHILD_SUBREAPER = 36
+_PR_SET_DUMPABLE = 4
 
 # How long the descendants of a command that exited get between SIGTERM and
 # SIGKILL: long enough for a test database to shut down cleanly (and remove
@@ -374,6 +391,52 @@ def _die_of(sig: int) -> int:
     return 128 + sig
 
 
+# The caller's refusal descriptor (`--refusal-fd`), or None.
+_REFUSAL_FD: int | None = None
+# The caller's descriptor for a held-out path the tree has (`--taken-fd`), or
+# None.
+_TAKEN_FD: int | None = None
+
+
+def _refused(msg: str) -> int:
+    """Refuse to run the command: `msg` to stderr and, when the caller gave
+    one, to the refusal descriptor; returns 126. The only way the shim
+    refuses (DESIGN §6 *A confinement failure stops the run; it is never a
+    result*)."""
+    print(msg, file=sys.stderr)
+    if _REFUSAL_FD is not None:
+        with contextlib.suppress(OSError):
+            os.write(_REFUSAL_FD, msg.encode(errors="replace") + b"\n")
+    return 126
+
+
+def _taken(e: "PlacementTaken") -> int:
+    """A held-out file the tree leaves no room for: its reason to stderr
+    and, when the caller gave one, to the taken descriptor — never to the
+    refusal descriptor, so a tree a worker committed can never read as a
+    confinement failure (DESIGN §6 *A confinement failure stops the run; it
+    is never a result*). The command does not run; returns 126."""
+    msg = f"leerie: the held-out file is not placed, so the command does " \
+          f"not run: {e}"
+    print(msg, file=sys.stderr)
+    if _TAKEN_FD is not None:
+        with contextlib.suppress(OSError):
+            os.write(_TAKEN_FD, msg.encode(errors="replace") + b"\n")
+    return 126
+
+
+def _undumpable() -> str | None:
+    """Make the shim non-dumpable before the command starts, so no process
+    without `CAP_SYS_PTRACE` over it — the command included, whatever its
+    namespaces — can open `/proc/<shim>/fd/N`: the refusal descriptor stays
+    the shim's to write (DESIGN §6 *A confinement failure stops the run; it
+    is never a result*). Inherited by each fork until its `exec`. Returns
+    why it could not, or None."""
+    if _libc().prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        return f"prctl(PR_SET_DUMPABLE): errno {ctypes.get_errno()}"
+    return None
+
+
 def _before_exec(enter: "tuple | None") -> None:
     """In a forked child, just before it `exec`s the command: `enter` is
     `("view", VIEW, changes)` — put it in the worker view — or
@@ -390,11 +453,11 @@ def _before_exec(enter: "tuple | None") -> None:
             os.environ[VIEW_ENV] = enter[1]
             os.environ[WORKER_ROOT_ENV] = enter[2]
     except OSError as e:
-        print(f"leerie: cannot start the command in the repository's root, "
-              f"so it does not run: {e} (DESIGN §6 *The orchestrator's root "
-              "is leerie's; a repository's root is only a confined "
-              "process's*)", file=sys.stderr)
-        os._exit(126)
+        os._exit(_refused(
+            f"leerie: cannot start the command in the repository's root, "
+            f"so it does not run: {e} (DESIGN §6 *The orchestrator's root "
+            "is leerie's; a repository's root is only a confined "
+            "process's*)"))
 
 
 def run(cmd: list[str], relay: int | None = None,
@@ -410,11 +473,15 @@ def run(cmd: list[str], relay: int | None = None,
     Python parent (`restore_default_signals`)."""
     libc = _libc()
     if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
-        print(f"leerie: cannot make the shim a subreaper (errno "
-              f"{ctypes.get_errno()}), so the command does not run "
-              "(DESIGN §6 *A confined command's processes end with it*)",
-              file=sys.stderr)
-        return 126
+        return _refused(
+            f"leerie: cannot make the shim a subreaper (errno "
+            f"{ctypes.get_errno()}), so the command does not run "
+            "(DESIGN §6 *A confined command's processes end with it*)")
+    why = _undumpable()
+    if why is not None:
+        return _refused(
+            f"leerie: the command does not run, because {why} (DESIGN §6 "
+            "*A confinement failure stops the run; it is never a result*)")
     watched = {signal.SIGCHLD, *_STOP_SIGNALS}
     old = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
     child = os.fork()
@@ -628,6 +695,18 @@ _OVERLAY_DIR = "/tmp/.leerie-overlay"
 # The most of a runner's report PID 1 copies out (a larger one is cut short
 # and reads as unreadable, which a caller treats as "could not measure").
 REPORT_MAX_BYTES = 64 << 20
+
+
+class PlacementTaken(Exception):
+    """A held-out file's path is already the tree's: a file is there, or a
+    link or a non-directory stands on its way (`EEXIST`, `ENOTDIR`,
+    `ELOOP`). A fact about the tree a worker committed, never a confinement
+    failure (`_taken`)."""
+
+
+# The errors of `_place_one` that say the tree has the path: anything else
+# (no space, a read-only overlay, a policy denial) is the environment's.
+_TAKEN_ERRNOS = frozenset({errno.EEXIST, errno.ENOTDIR, errno.ELOOP})
 
 
 class IsolationError(Exception):
@@ -937,10 +1016,11 @@ def _place_one(view_fd: int, src: str, rel: str) -> None:
 
 def place(pairs: list[tuple[str, str]], view: str) -> None:
     """Copy each held-out file into the overlaid view, read-only. Refused
-    when a destination is not a plain relative path, the view already has a
-    file there, or a directory on its path is a link (`_place_one`): a set
-    is never placed over the tree's own file, nor anywhere but beneath the
-    overlay. Runs after every other mount is read-only."""
+    when a destination is not a plain relative path; `PlacementTaken` when
+    the view already has a file there, or a link or a non-directory is on
+    its path (`_place_one`): a set is never placed over the tree's own
+    file, nor anywhere but beneath the overlay. Runs after every other
+    mount is read-only."""
     bad = []
     for src, rel in pairs:
         parts = rel.split("/")
@@ -960,9 +1040,12 @@ def place(pairs: list[tuple[str, str]], view: str) -> None:
             try:
                 _place_one(view_fd, src, rel)
             except OSError as e:
-                raise IsolationError(
-                    f"place {rel}: the view already has it, or a directory "
-                    f"on its path is a link ({e})", e.errno or 0) from None
+                if e.errno in _TAKEN_ERRNOS:
+                    raise PlacementTaken(
+                        f"place {rel}: the view already has it, or a link "
+                        f"or a non-directory is on its path ({e})") from None
+                raise IsolationError(f"place {rel}: {e}", e.errno or 0) \
+                    from None
     finally:
         os.close(view_fd)
 
@@ -1528,26 +1611,25 @@ def _confine_or_126(rw: list[str], ro: list[str]) -> int | None:
         # anyway (it is outside the state root).
         confine(rw, ro + ["/proc"])
     except OSError as e:
-        print(f"leerie: cannot confine the worker, so it does not run: {e} "
-              "(DESIGN §6 *A worker writes only where it is granted*)",
-              file=sys.stderr)
-        return 126
+        return _refused(
+            f"leerie: cannot confine the worker, so it does not run: {e} "
+            "(DESIGN §6 *A worker writes only where it is granted*)")
     # Confined as the command will be: an isolated process's `/dev` has no
     # console, and no grant names one, so an open that succeeds is a broken
     # invariant, refused rather than run.
     if console_open():
-        print(f"leerie: the command does not run, because it could open "
-              f"{CONSOLE} (DESIGN §6 *No confined process holds or can "
-              "open the operator's terminal*)", file=sys.stderr)
-        return 126
+        return _refused(
+            f"leerie: the command does not run, because it could open "
+            f"{CONSOLE} (DESIGN §6 *No confined process holds or can "
+            "open the operator's terminal*)")
     return None
 
 
 def _isolation_failed(e: BaseException) -> int:
-    print(f"leerie: cannot isolate the command, so it does not run: {e} "
-          "(DESIGN §6 *Every confined process has its own `/tmp`, "
-          "`/dev/shm` and IPC*)", file=sys.stderr)
-    return 126
+    return _refused(
+        f"leerie: cannot isolate the command, so it does not run: {e} "
+        "(DESIGN §6 *Every confined process has its own `/tmp`, "
+        "`/dev/shm` and IPC*)")
 
 
 def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
@@ -1563,8 +1645,13 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
         if worker_root is not None:
             ro = ro + view_ro
             enter = ("view", WORKER_VIEW, worker_env_changes(worker_root))
+    except PlacementTaken as e:
+        return _taken(e)
     except (IsolationError, OSError) as e:
         return _isolation_failed(e)
+    why = _undumpable()
+    if why is not None:
+        return _isolation_failed(OSError(why))
     if report_fd is not None:
         os.set_inheritable(report_fd, False)
     status_r, status_w = os.pipe()
@@ -1580,7 +1667,9 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
         except IsolationError as e:
             os._exit(_isolation_failed(e))
         _close_fds_except({0, 1, 2, status_w}
-                          | ({report_fd} if report_fd is not None else set()))
+                          | ({report_fd} if report_fd is not None else set())
+                          | ({_REFUSAL_FD} if _REFUSAL_FD is not None
+                             else set()))
         rc = _confine_or_126(rw + [view] + list(PRIVATE), ro)
         if rc is not None:
             os.write(status_w, f"E{rc}".encode())
@@ -1671,7 +1760,8 @@ def _parse(argv: list[str]) -> dict | str:
     o: dict = {"rw": [], "ro": [], "isolate": False, "sandbox": False,
                "view": None, "place": [], "report": None,
                "report_fd": None, "egress": None, "forward": [],
-               "worker_root": None, "cli": False,
+               "worker_root": None, "cli": False, "refusal_fd": None,
+               "taken_fd": None,
                "cmd": argv[sep + 1:]}
     opts = argv[:sep]
     i = 0
@@ -1683,7 +1773,7 @@ def _parse(argv: list[str]) -> dict | str:
             continue
         if k not in ("--rw", "--ro", "--view", "--place", "--report",
                      "--report-fd", "--egress", "--forward",
-                     "--worker-root") \
+                     "--worker-root", "--refusal-fd", "--taken-fd") \
                 or i + 1 >= len(opts):
             return f"landlock_exec.py: bad option {k!r}"
         v = opts[i + 1]
@@ -1712,6 +1802,10 @@ def _parse(argv: list[str]) -> dict | str:
             if not v.isdigit():
                 return f"landlock_exec.py: bad --report-fd {v!r}"
             o["report_fd"] = int(v)
+        elif k in ("--refusal-fd", "--taken-fd"):
+            if not v.isdigit() or int(v) < 3:
+                return f"landlock_exec.py: bad {k} {v!r}"
+            o[k[2:].replace("-", "_")] = int(v)
         else:
             o[k[2:]] = v
         i += 2
@@ -1722,8 +1816,10 @@ def _parse(argv: list[str]) -> dict | str:
     if o["sandbox"] and not o["view"]:
         return "landlock_exec.py: --sandbox needs --view"
     if not o["sandbox"] and (o["view"] or o["place"] or o["report"]
-                             or o["report_fd"] is not None):
-        return "landlock_exec.py: --view, --place and --report need --sandbox"
+                             or o["report_fd"] is not None
+                             or o["taken_fd"] is not None):
+        return ("landlock_exec.py: --view, --place, --report and --taken-fd "
+                "need --sandbox")
     if not o["isolate"] and (o["egress"] or o["forward"]):
         return "landlock_exec.py: --egress and --forward need --isolate"
     if (o["report"] is None) != (o["report_fd"] is None):
@@ -1740,12 +1836,24 @@ def main(argv: list[str]) -> int:
     if isinstance(o, str):
         print(o, file=sys.stderr)
         return 2
+    global _REFUSAL_FD, _TAKEN_FD
+    for key, opt in (("refusal_fd", "--refusal-fd"), ("taken_fd",
+                                                      "--taken-fd")):
+        if o[key] is not None:
+            # Close-on-exec before anything else: no command ever holds it.
+            try:
+                os.set_inheritable(o[key], False)
+            except OSError as e:
+                print(f"landlock_exec.py: bad {opt}: {e}", file=sys.stderr)
+                return 2
+    _REFUSAL_FD = o["refusal_fd"]
+    _TAKEN_FD = o["taken_fd"]
     why = leave_terminal()
     if why is not None:
-        print(f"leerie: the command does not run, because {why} (DESIGN §6 "
-              "*No confined process holds or can open the operator's "
-              "terminal*)", file=sys.stderr)
-        return 126
+        return _refused(
+            f"leerie: the command does not run, because {why} (DESIGN §6 "
+            "*No confined process holds or can open the operator's "
+            "terminal*)")
     rw, ro, cmd = o["rw"], o["ro"], o["cmd"]
     wr = o["worker_root"]
     if o["sandbox"]:

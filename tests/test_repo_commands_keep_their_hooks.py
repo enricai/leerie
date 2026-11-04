@@ -232,5 +232,5 @@ def test_leeries_scripts_that_load_tree_code_are_confined():
     assert bad == []
     funcs = {f.name: f for f in ast.walk(tree)
              if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    assert "_confined_argv(grants, argv)" in ast.unparse(
+    assert "_confined_argv(grants, argv, refusal_fd=refusal_fd)" in ast.unparse(
         funcs["_ts_script_run"])

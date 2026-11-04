@@ -3851,8 +3851,9 @@ read as a void round — every escalated round on a JS/TS repository was
 rolled back that way once leerie's temp files moved to `<run-dir>/tmp/`
 (review round 20, execution H1).
 Fail closed as for a worker: the invocation's entry has already required
-Landlock (`_require_confinement`), and the shim refuses (exit 126) where it cannot
-enforce, which a measurement reads as "could not measure", never a pass.
+Landlock (`_require_confinement`), and the shim refuses where it cannot
+enforce, which stops the run, never a pass and never a measurement (*A
+confinement failure stops the run; it is never a result*).
 
 **The grant, by kind.** Every kind gets the first block.
 
@@ -4940,8 +4941,10 @@ It is constructed, not checked, in two halves.
    upper layer is on its private `/tmp`, every other write grant overlaid
    the same way (a grant beneath `/tmp` is a fresh, empty copy of its
    directories); the set's files placed into the overlay by the shim,
-   never into a tree on disk (it refuses when the tree already has a file
-   at a set's path); loopback as its only network. The shim is the
+   never into a tree on disk (it does not place one, and does not run the
+   command, when the tree already has a set's path or a link or a
+   non-directory on its way: *A confinement failure stops the run; it is
+   never a result*); loopback as its only network. The shim is the
    namespace's PID 1: when the command exits it sends every process in the
    namespace SIGTERM, then SIGKILL, copies the runner's report to a
    descriptor leerie holds, and exits as the command did; the kernel frees
@@ -5362,6 +5365,112 @@ that outer shim, which exits the same way (an init cannot die of a signal
 it raises on itself). The first prototype walked the outer `/proc` from
 inside the namespace and hung; with `kill(-1)` the namespace ended in
 under a second after the command.
+
+### A confinement failure stops the run; it is never a result
+
+Once the confinement check every entry runs (`_require_confinement`) has
+passed, the shim can still refuse to start a command: the kernel or the
+container's policy may change under a running run, or a step the check
+does not probe may fail. Before this rule a refusal was an exit 126 like
+any other, and each caller read it as its own kind of outcome. Measured on
+2026-11-03 at 22:41, while the five runs of *A launch runs only the leerie
+code it started with* ran a shim their AppArmor profile refused, the same
+"cannot isolate the command" became, by caller:
+
+- a measurement's failure: `build-failed: 'pnpm run build': leerie: cannot
+  isolate…`, and the run's final conformance was recorded with false
+  build and test failures;
+- a worker crash downgraded to an advisory ("conformer round 0: worker
+  crashed; phase surfaced as advisory");
+- "dependency install failed … no evidence either way" at the acceptance
+  gate, after a store fetch "exited 126";
+- a "non-fatal error" of the dependency capture, whose result was lost.
+
+Each was saved, and `resume` then skipped the phase as already complete
+("final conformance already complete"). The root cause is that the
+refusal had no type of its own: it reached each caller as data.
+
+The invariant: **a confinement failure is an environment failure, never
+a measurement or a worker's result. It stops the run, with an exit that
+names it, before anything of the step is recorded; `resume` then redoes
+the step it interrupted.**
+
+The mechanism:
+
+- The shim reports a refusal on a descriptor of its own, `--refusal-fd`,
+  which leerie opens for every confined spawn (a pipe) and the command
+  never holds: the shim makes it close-on-exec before anything else, so
+  only the shim and its own forks before `exec` can write it. Every place
+  the shim refuses (leaving the terminal, building the isolation or the
+  sandbox, the Landlock ruleset and the seccomp filter, becoming a
+  subreaper, entering the worker view) writes its reason there and exits
+  126; the reason is the same text it prints. An exit 126 with nothing on
+  the descriptor is the command's own exit 126 (an exec refused by
+  permissions inside the repository's script), and stays the ordinary
+  outcome it always was. The signal is the descriptor, not the status and
+  not the text.
+- The command cannot reach the descriptor through `/proc` either. The
+  shim makes itself non-dumpable (`PR_SET_DUMPABLE` 0) before it starts
+  the command, and the kernel then lets only a process with
+  `CAP_SYS_PTRACE` over the shim open `/proc/<shim>/fd/N`. Without it, a
+  command could forge a refusal: review round 39 (isolation, D2) read
+  `--refusal-fd N` from `/proc/$PPID/cmdline`, opened
+  `/proc/$PPID/fd/N` for writing and wrote "cannot isolate the command"
+  into it, exit 0, under a shim without `--isolate`, on the host and in
+  the container; Landlock does not mediate pipes. Under `--isolate`, which
+  every spawn after `_require_confinement` uses, the review measured the
+  open refused, which nothing in the shim chose: it rested on the
+  capabilities the shim kept in the user namespace it made. Run as the
+  container's root user instead, in a container of this image, the same
+  forge under `--isolate` succeeded too (2026-11-04, the shim before this
+  rule). The non-dumpable shim refuses it in both (`EACCES`), by design.
+- A held-out file the tree leaves no room for is a fact about the tree,
+  not a refusal. A worker can commit a link, or a file, where a set's
+  directory must be (`tests -> spec_real`). The shim places each file
+  following no link (`_place_one`), so it cannot place that one; until
+  review round 39 (isolation, R1) it said so through the refusal
+  descriptor, and the committed tree turned into exit 78 on every
+  `resume`, because the evaluation runs again over the same tree. Now:
+  - every caller that places a file checks its path first by the shim's
+    own rule, `_lexists_beneath`: a file at the path, or a link or a
+    non-directory on any component on its way, makes the path taken (the
+    acceptance gate records it `path_in_use`, the set unmeasured; the set
+    audit, the parse check and the falsifier's confirm skip it), and the
+    file is never handed to the shim;
+  - the shim itself reports a path it finds taken (`EEXIST`, `ENOTDIR`,
+    `ELOOP`) on a descriptor of its own, `--taken-fd`, never on the
+    refusal descriptor, and does not run the command; leerie raises
+    `HeldOutPathTaken`, an `OSError`, which each caller reads as the run
+    it could not make. Any other placement failure (no space, a read-only
+    overlay, a policy denial) is the environment's and stays a refusal.
+- `_confined_argv`, which builds every confined command's argv, takes
+  the descriptor, every call names it (a test reads them all), and each
+  place that spawns one (`_run_streaming` for the
+  measurements, installs and store fetches, `_invoke` for workers,
+  `_ts_script_run` for the AST scripts, the `mise ls` capture) opens it
+  with `_shim_refusals()` and checks it once the process has ended, before
+  the caller sees an exit status or a worker's result. A refusal raises
+  `ConfinementRefused`, a `BaseException` like the other run-ending
+  signals, so no caller's `except Exception` can read it as a failure,
+  record it, or downgrade it to an advisory.
+- `main()` stops the run on it: it saves the state as it was before the
+  step (the step had recorded nothing), cleans up worktrees only, does not
+  attempt the dependency capture (a confined worker, which would refuse
+  again), names the command and the shim's reason, and exits
+  `EXIT_CONFINEMENT_REFUSED` (78, `EX_CONFIG`). On Fly and EC2 that exit is
+  not a clean one, so the machine is paused for the resume. The
+  confinement probes inside `_require_confinement` keep their own `die()`:
+  they are the check, and they read the shim's exit themselves.
+- The one confined step a refusal does not stop is the dependency
+  capture (*§6½*): it is best-effort by design and never blocks a run, so
+  its guards catch `ConfinementRefused` with the other run-ending signals
+  and log it as "not run — the confinement shim refused it, nothing
+  recorded". Nothing is recorded, not a wrong result: a capture is
+  recorded only once it succeeds, so `leerie config --recapture` captures
+  the run later.
+- Not covered: a refusal inside a worker, by `scripts/worker-shell.py`
+  for one of the worker's tool calls, reaches the worker as that call's
+  exit 126; the worker reads its own tool results.
 
 ### A command leerie runs starts with the signal dispositions it would have outside leerie
 

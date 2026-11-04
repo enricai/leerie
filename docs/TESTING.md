@@ -6727,7 +6727,7 @@ sample's probe never counts for the next.
   throwaway checkout; the checkout snapshot never rewrites the user's index;
   with no run repository the prune and the abnormal-exit clean-up write
   nothing in the cwd's `.git`.
-- `tests/test_credentials_never_outlive_the_run.py` (10 test functions, 24
+- `tests/test_credentials_never_outlive_the_run.py` (10 test functions, 25
   cases; DESIGN §6 *No copy of the credentials outlives its run's process*,
   *Every deleter of a run's directories deletes them*; review round 18 M1,
   round 19 claims H1, exec M1 and L2): the owner-aware removal takes
@@ -6895,6 +6895,47 @@ sample's probe never counts for the next.
   `tmp_path` — without it the worker case read nothing beside the host
   directory and passed only with `TMPDIR` beneath `$HOME`. With `_host_dir()`
   returning None both cases fail.
+- `tests/test_confinement_refusal_stops_the_run.py` (10 test functions;
+  DESIGN §6 *A confinement failure stops the run; it is never a result*;
+  the 2026-11-03 22:41 incident, where a refusing shim was recorded as
+  build failures, a crashed worker and a non-fatal capture error). The
+  real shim writes its refusal to `--refusal-fd` (a pty on one of its
+  fds); a command's own exit 126 under the real shim writes nothing, and
+  its attempt to write the descriptor fails; an AST rule that no exit 126
+  in the shim bypasses `_refused` (and, since the round-39 fold, `_taken`
+  beside it); `_isolation_failed` writes it. With a refusing shim stub (os
+  and sys only), `_run_streaming`, `_invoke` and `_ts_script_run` raise
+  `ConfinementRefused`, not an `Exception`; with the real shim a command's
+  own 126 is returned as status 126; every `_confined_argv` call names
+  `refusal_fd`; the real `main()` exits `EXIT_CONFINEMENT_REFUSED` (78)
+  with `state.json` as the step left it, no `finished_at`, and no capture
+  attempted. Falsified (2026-11-04), each failing exactly its test:
+  `_refused` not writing the descriptor; the descriptor left inheritable;
+  `_run_streaming` or `_invoke` closing it instead of checking;
+  `_ts_script_run` with an unchecked descriptor; `main()` exiting 1.
+  `tests/test_credentials_never_outlive_the_run.py` drives the new
+  `main()` arm.
+- `tests/test_held_out_path_taken_is_not_a_refusal.py` (9 test functions,
+  15 cases; DESIGN §6 *A confinement failure stops the run; it is never a
+  result*, *A held-out evaluation runs alone*; review round 39, isolation
+  R1 and D2). The real shim's `place()` raises `PlacementTaken` for a
+  link, a file, or a file at the path (3), and places a plain directory
+  (control); an `ENOSPC` while placing is still an `IsolationError`;
+  `run_sandbox` with the real `place` writes the `--taken-fd` descriptor
+  and leaves the refusal descriptor empty (3); the attack (`tests ->
+  spec_real` under a held-out `tests/acceptance/acc.test.js`) through
+  `_acceptance_run_placed` with the real `_run_streaming` records
+  `path_in_use`, spawns nothing and writes nothing through the link (2);
+  the set audit and the parse check find the path taken (2);
+  `_run_streaming` raises `HeldOutPathTaken`, an `OSError` and not
+  `ConfinementRefused`; a refusal outranks a taken path; and the
+  command's open of `/proc/<shim>/fd/N` without `--isolate` is refused
+  with `EACCES` (`_undumpable`), the pipe left empty. Falsified
+  (2026-11-04), one change at a time: the old acceptance pre-check, audit
+  and parse checks; every placing errno reported as a refusal (6 shim
+  tests); `_run_streaming` ignoring the taken pipe; taken checked before
+  the refusal; `run()` without `_undumpable`. `tests/heldout_sandbox_emulator.py`
+  and `tests/conftest.py` pass and honour `--taken-fd`.
 - `tests/test_run_settings.py` (54 tests, review rounds 17 H2 and 18 H1,
   DESIGN §8 *The settings are leerie's*): both checker halves and both
   restore halves. A setting written from a worker's tree (each key DESIGN
