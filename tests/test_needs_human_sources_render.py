@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import source_segments
+
 LEERIE_PY = Path(__file__).resolve().parent.parent / "orchestrator" / "leerie.py"
 SPECIAL = {"required_item", "blocker"}
 
@@ -30,12 +32,14 @@ def _written_sources() -> set[str]:
                 and isinstance(node.value.value, str)):
             consts[node.targets[0].id] = node.value.value
     out = set(consts.values())
-    src = LEERIE_PY.read_text()
+    # Split once (`source_segments`): this runs at collection, once per
+    # function of leerie.py, and `ast.get_source_segment` re-splits the whole
+    # module per call — about 26 minutes of collection on Python 3.11.
+    segment = source_segments(LEERIE_PY.read_text())
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if "needs_human_verification" not in (ast.get_source_segment(src, fn)
-                                              or ""):
+        if "needs_human_verification" not in (segment(fn) or ""):
             continue
         for d in ast.walk(fn):
             if not isinstance(d, ast.Dict):

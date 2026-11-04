@@ -16,32 +16,38 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # Raised from 10 on 2026-08-19. Observed runtime had reached
-    # 7.9-9.7 min against the old 10 min cap, so a fully green suite
-    # was one slow runner away from failing on the timeout rather than
-    # on a test.
+    # History: 10 min until 2026-08-19, then 20, 40 and 120 as the suite
+    # outgrew each (PR #297's legs and runs 41732738003 / 41756388905 were
+    # cancelled by the cap, not by a test).
     #
-    # Raised again from 20 on 2026-11-03: on PR #297 all three matrix
-    # legs (3.10/3.11/3.12) reported "Cancelled after 20m" — killed by
-    # this cap, not by a failing test. 40 was an estimate, and it was
-    # wrong: runs 41732738003 and 41756388905 were both cancelled at
-    # 40.3 min.
+    # Lowered to 60 on 2026-11-04, after the cause was found rather than
+    # outrun. Run 41777003910 (serial, no per-test bound) measured, per leg,
+    # the time from the step's start to its first test and then to its last:
+    #   py3.10  48.5 min before the first test, cancelled at 120 at 96%
+    #   py3.11  29.1 min before the first test, 82.9 min in all
+    #   py3.12   2.8 min before the first test, 69.4 min in all
+    # The time before the first test was collection:
+    # tests/test_needs_human_sources_render.py derived its parameters at
+    # import with one `ast.get_source_segment` per function of leerie.py,
+    # and that call re-splits the whole 3.5 MB module in a pure-Python loop
+    # on 3.10/3.11 (measured on 3.11: 0.9 s a call, about 26 min for the
+    # module's ~1,700 functions). Tests now split once
+    # (`tests/conftest.py::source_segments`), so that cost is gone from
+    # every leg. What remains is about 54-74 min of test execution
+    # serially; `-n 4` runs it on this runner's 4 vCPUs. 60 min is about
+    # twice what that leaves if the 4 workers achieve only a 3x speedup, and
+    # still below the 69 min that a serial 3.12 leg needed: a suite that
+    # drifts back to serial speed fails here, at a timeout, rather than
+    # passing slowly.
     #
-    # Raised to 120 on 2026-11-04, this time against measurement rather
-    # than a guess. At the 40 min cut the py3.12 leg was only at 48% and
-    # still emitting steady per-file progress — a slow suite, not a hung
-    # test — which extrapolates to a full run of roughly 75-85 min. 60
-    # would have been cancelled too; 120 leaves about 1.5x headroom.
-    # (GitHub's own job ceiling is 360 min.)
-    #
-    # The underlying regression is NOT addressed here: the last green
-    # run, 40607416970 on 2026-10-28, finished in ~14-15 min, so the
-    # suite grew roughly 5x across #296/#297. The single costliest file
-    # is tests/test_acceptance_held_case_intermittent.py at 435s. There
-    # is no pytest-timeout, so nothing bounds an individual test and a
-    # real hang would look exactly like this.
-    # Headroom, not a licence to let the suite grow.
-    timeout-minutes: 120
+    # `--timeout=600` bounds each test, so a hang fails one named test
+    # instead of the job, and conftest kills whatever the test started.
+    # The slowest legitimate test measured locally under `-n 4` was 150 s
+    # (tests/test_delivery_ratchet.py, on a host at load 50-90 / 32 cores);
+    # 600 is 4x that, and 6x below this job's own bound. Two that ran 559 s
+    # and 600 s were waiting on the host's CPU pressure, not working:
+    # conftest's `_quiet_host_pressure` took that wait out (45 s, 36 s).
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +70,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest pytest-cov jsonschema
+          pip install pytest pytest-cov pytest-timeout pytest-xdist jsonschema
 
       # The AST-script tests (scripts/test-case-facts.cjs in
       # tests/test_delivery_detection.py, scripts/redrive-ast-gate.cjs in
@@ -89,7 +95,7 @@ jobs:
           git config --global user.name "Leerie CI"
 
       - name: Run tests with coverage
-        run: pytest tests/ -ra --cov=orchestrator --cov-report=term --cov-report=xml
+        run: pytest tests/ -n 4 --timeout=600 -ra --cov=orchestrator --cov-report=term --cov-report=xml
 
       - name: Coverage summary
         if: always()

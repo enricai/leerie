@@ -7927,3 +7927,63 @@ live under the test's own state root, and pins `_mem_available_bytes` to a
 one. Falsified: with only the memory pin added the test fails here as on CI
 (`1 failed, 6 passed`); with the slot pin reverted it fails again; with both
 it passes, serial and under `-n 4`.
+
+## CI time: collection that re-split leerie.py, xdist and a per-test bound (2026-11-04)
+
+No PR's test job finished after #296/#297: the last green run (40607416970)
+took about 15 min, and run 41777003910 took 69 min (py3.12), 83 min (py3.11)
+and over 120 (py3.10, cancelled at 96%). The per-leg time from the step's
+start to its first test was 2.8, 29.1 and 48.5 min. That was collection:
+`tests/test_needs_human_sources_render.py` derives its parameters at import
+with one `ast.get_source_segment` per function of leerie.py, and that call
+re-splits its whole source each time — on Python 3.10 and 3.11 a pure-Python
+loop over every character. Measured on 3.11 against this tree: 0.91 s a call,
+about 1,570 s for the module's 1,729 functions; split once, 0.07 s.
+`tests/conftest.py::source_segments` is `ast.get_source_segment` with the
+source split once; `tests/test_source_segments.py` pins it equal to the stdlib
+on every node of a synthetic source holding each line-break shape `ast` and
+`str.splitlines` disagree on, and on three functions of leerie.py, and fails
+any file under `tests/` that calls `get_source_segment` itself (the two other
+callers, `test_conformer_schema_shrink.py` and `test_phase_overlap_judge.py`,
+moved too).
+
+The workflow now runs `pytest -n 4 --timeout=600` with `pytest-xdist` and
+`pytest-timeout` installed, and `timeout-minutes` is back to 60.
+`tests/test_ci_test_workflow.py` pins the run line's `-n 4` and `--timeout`,
+that each flag's plugin is in the install line, and that the per-test bound is
+below the job's — then runs the line's own options against a one-test
+directory where both plugins are installed, since an option no installed
+plugin owns is a usage error that fails the job before any test. Neither
+option is in `pytest.ini`: under `--strict-config` a plugin's option is an
+error where the plugin is missing. A test that sets its own `SIGALRM`
+(`tests/test_orchestrate_cleanup_bound.py`'s backstop) disarms
+pytest-timeout's timer for its own duration only; the next test re-arms it.
+
+Two suite-wide autouse fixtures in `tests/conftest.py` came with the per-test
+bound, both measured on the first full local run under `--timeout=600`:
+
+- `_no_process_outlives_its_test`. The bound ends a hung test by raising
+  inside it, and `subprocess.run` then kills only its direct child: a run
+  killed mid-test had already left the launcher's relay pipeline (`bash -c`
+  over `_log.sh`, its `bash` subshells, `terminal-text.py`) reparented to
+  init for hours. Neither parent nor process group is a handle on those
+  (`_build_job` gives a build a group of its own), so every test sets
+  `PYTEST_LEERIE_TEST_ID` to its own value, which every child inherits, and
+  teardown SIGKILLs every process of the user's whose environment carries it
+  (`processes_marked`, `kill_marked`; about 37 ms a test with 778 processes
+  on the host). `tests/test_no_process_outlives_its_test.py` times a test
+  out for real in an inner pytest whose shell started one grandchild in the
+  test's session and one under `setsid`: with the fixture both are gone;
+  without it both are alive (its anti-vacuity case). A process a child
+  starts with a fresh environment escapes the marker.
+- `_quiet_host_pressure`. The B* confirm gate waits up to
+  `confirm_gate_wait_sec` (300 s) a confirm for the HOST's CPU pressure to
+  fall below `confirm_psi_cpu_max`. Tests not about that gate inherited the
+  host's load: `tests/test_clean_tree_gate.py`'s two acceptance-repair tests
+  took 559 s and 600 s (the second cut by the bound) on a loaded host,
+  against 39 s on a quieter one, and 45 s and 36 s with the fixture. A read
+  of the default `/proc/pressure/cpu` is a quiet host (0.0) for a test that
+  uses the `leerie` fixture; a named file is still parsed; the gate's own
+  tests opt out with `@pytest.mark.real_host_pressure`.
+  `tests/test_bstar_confirm.py::test_conftest_makes_the_default_read_a_quiet_host`
+  pins it.
