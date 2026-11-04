@@ -6756,8 +6756,9 @@ fi
 # - a git checkout with edits there (a contributor's): the edits run, as they
 #   always did on the next launch. They are hashed into a tree object through
 #   a private index, twice; the two must agree, no git command may hold the
-#   checkout's index lock before or after, and HEAD and the index's entries
-#   must be the same before and after (a checkout or pull rewrites them), or
+#   checkout's index lock before or after, and HEAD and the index's entries,
+#   with the file status each records, must be the same before and after (a
+#   checkout or pull rewrites them, even one that flips back), or
 #   the checkout changed while it was read and the launch stops. That tree is archived, and
 #   LEERIE_COMMIT is `<HEAD>-dirty.<tree>`: the record names exactly the code
 #   that ran, and `git archive <tree>` in that checkout gives it back for as
@@ -6847,14 +6848,17 @@ _snapshot_leerie_code() {
   fi
   return 0
 }
-# _leerie_checkout_state SRC DIR... — HEAD and the index's entries for DIR...:
-# a git command that changed the checkout while it was read (a checkout, a
-# pull) changes one of them by the time it releases the index lock.
+# _leerie_checkout_state SRC DIR... — HEAD and the index's entries for DIR...,
+# with the file status each entry records (`--debug`: times, inode, size): a
+# git command that changed the checkout while it was read (a checkout, a
+# pull) changes one of them by the time it releases the index lock. The
+# status is what shows a flip to another commit and back (A to B to A): the
+# same HEAD and blob ids, but every file it wrote is a new one.
 _leerie_checkout_state() {
   local _src=$1
   shift
   git -C "$_src" rev-parse --verify -q HEAD \
-    && git -C "$_src" ls-files -s -- "$@"
+    && git -C "$_src" ls-files -s --debug -- "$@"
 }
 # _leerie_worktree_tree SRC HEAD INDEX DIR... — the tree object of HEAD with
 # DIR... as they stand in SRC's working tree, built through the private index
