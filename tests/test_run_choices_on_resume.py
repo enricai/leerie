@@ -550,11 +550,12 @@ class TestContinueRunChoices:
 # --------------------------------------------------------------------------
 
 def _main_argparse_dests(leerie) -> dict[str, list[str]]:
-    """dest -> option strings, for every `add_argument` in `main()`, derived
-    from the source (per-worker f-string options expanded)."""
+    """dest -> option strings, for every `add_argument` in the parser
+    `main()` builds (`_leerie_arg_parser()`), derived from the source
+    (per-worker f-string options expanded)."""
     tree = ast.parse(LEERIE_PY.read_text())
-    main = next(n for n in tree.body
-                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == "_leerie_arg_parser")
     out: dict[str, list[str]] = {}
     for n in ast.walk(main):
         if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)

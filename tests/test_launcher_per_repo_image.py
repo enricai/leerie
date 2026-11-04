@@ -100,7 +100,7 @@ def _run_harness(body: str, env: dict | None = None) -> subprocess.CompletedProc
     # Extract only the per-repo functions block from the launcher
     # (from its banner through the end of the unset _leerie_dockerfile line).
     marker_start = "# --- per-repo derived image (local nerdctl) "
-    marker_end = "\n# --- translate --inspect-dir paths"
+    marker_end = "\n# --- assemble auth/config mounts"
     block = _extract_block(launcher, marker_start, marker_end)
 
     if env and env.get("USER_REPO"):

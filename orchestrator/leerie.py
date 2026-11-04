@@ -70093,27 +70093,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                             args, "pr_template", None))
 
 
-@_records_the_run_death
-def main() -> int | None:
-    # Before anything prints (DESIGN §6 *No text leerie did not write
-    # reaches the operator's terminal as a control sequence*).
-    _guard_terminal_streams()
-    # Must precede every spawn — including _become_subreaper's descendants.
-    _restore_sigchld_default()
-    # Before any git runs: no git command of leerie's own fires a repository
-    # hook (DESIGN §6½ *Hooks off*); `_invoke` gives a worker them back.
-    _git_hooks_off(os.environ)
-    # The cgroup broker's descriptor, before anything is started that could
-    # inherit it (DESIGN §6 *No leerie service is reachable by a path from a
-    # process it does not serve*).
-    _adopt_cgroup_broker()
-
-    # Install the child-subreaper role first thing, before any worker (or any
-    # subprocess this process spawns) exists, so every descendant inherits the
-    # reparent-to-us behavior. This is what makes `_zombie_reaper` able to reap
-    # orphaned git/ssh-agent subprocesses that would otherwise pile up as
-    # zombies against the worker cgroup's pids.max (DESIGN §6 *Zombie reaping*).
-    _become_subreaper()
+def _leerie_arg_parser() -> argparse.ArgumentParser:
+    """The orchestrator's one command-line parser. Builds it and nothing
+    else: no state, no file, no process (the launcher's `check_command_line`
+    runs it on the host before any image step)."""
     ap = argparse.ArgumentParser(
         prog="leerie", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -70588,13 +70571,20 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "otherwise. See DESIGN.md §20 and IMPLEMENTATION.md "
                          "'Run-group verbs'.")
 
+    return ap
+
+
+def _parse_command_line(ap: argparse.ArgumentParser, argv: list[str]
+                        ) -> tuple[argparse.Namespace, str | None, bool, bool]:
+    """`argv` (the command line without the program) parsed as `main` takes
+    it: `(args, resume's positional run-id, is_resume, is_list)`. argparse
+    exits 2 with its usage and message on a line it does not accept."""
     # `resume` and `list` are bare leading verbs (git-style), not `--flag`s —
     # they occupy the same argv[1] slot the launcher's own `case "${1:-}"`
     # dispatch uses. argparse's `task` positional would otherwise swallow
     # the bare word as a literal task string, so pop it off before parsing
     # and record it as a plain bool, exactly like the launcher already
     # does for its own verbs. Never rewritten into a `--flag` anywhere.
-    argv = sys.argv[1:]
     is_resume = bool(argv) and argv[0] == "resume"
     is_list = bool(argv) and argv[0] == "list"
     if is_resume or is_list:
@@ -70605,7 +70595,44 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # `list chains`) that must reach argparse untouched.
     positional_run_id, argv = (
         _extract_resume_run_id(argv) if is_resume else (None, argv))
-    args = ap.parse_args(argv)
+    return ap.parse_args(argv), positional_run_id, is_resume, is_list
+
+
+def check_command_line(argv: list[str]) -> int:
+    """Parse-only (DESIGN §6 *A command line is refused before any image
+    step*): the launcher runs this on the host, through `python3 -I -S`,
+    with the argv it will give the container, before it builds or copies any
+    image. A line the parser refuses exits 2 here with the message the
+    container would print; one it accepts returns 0. Reads no state and
+    starts nothing."""
+    _parse_command_line(_leerie_arg_parser(), argv)
+    return 0
+
+
+@_records_the_run_death
+def main() -> int | None:
+    # Before anything prints (DESIGN §6 *No text leerie did not write
+    # reaches the operator's terminal as a control sequence*).
+    _guard_terminal_streams()
+    # Must precede every spawn — including _become_subreaper's descendants.
+    _restore_sigchld_default()
+    # Before any git runs: no git command of leerie's own fires a repository
+    # hook (DESIGN §6½ *Hooks off*); `_invoke` gives a worker them back.
+    _git_hooks_off(os.environ)
+    # The cgroup broker's descriptor, before anything is started that could
+    # inherit it (DESIGN §6 *No leerie service is reachable by a path from a
+    # process it does not serve*).
+    _adopt_cgroup_broker()
+
+    # Install the child-subreaper role first thing, before any worker (or any
+    # subprocess this process spawns) exists, so every descendant inherits the
+    # reparent-to-us behavior. This is what makes `_zombie_reaper` able to reap
+    # orphaned git/ssh-agent subprocesses that would otherwise pile up as
+    # zombies against the worker cgroup's pids.max (DESIGN §6 *Zombie reaping*).
+    _become_subreaper()
+    ap = _leerie_arg_parser()
+    args, positional_run_id, is_resume, is_list = _parse_command_line(
+        ap, sys.argv[1:])
     # What this command line itself gave, before any resolver rewrites
     # `args`: a resume's override of a recorded run choice is exactly a value
     # here (DESIGN §6 *A resumed run continues under the choices it was

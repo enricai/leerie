@@ -64,10 +64,14 @@ class TestWiring:
     def test_main_extracts_before_parse_args(self, leerie):
         """ORDER IS THE WHOLE BUG. After `parse_args` the run-id has already
         been swallowed by `task` and the damage is done."""
-        src = inspect.getsource(leerie.main)
+        # main's command line goes through _parse_command_line, which the
+        # launcher's host-side check shares (DESIGN §6 *A command line is
+        # refused before any image step*).
+        assert "_parse_command_line(" in inspect.getsource(leerie.main)
+        src = inspect.getsource(leerie._parse_command_line)
         assert "_extract_resume_run_id(" in src, "helper never called"
         assert (src.index("_extract_resume_run_id(")
-                < src.index("args = ap.parse_args(argv)")), (
+                < src.index("return ap.parse_args(argv)")), (
             "extraction must happen BEFORE parse_args")
 
     def test_main_assigns_it_to_run_id(self, leerie):
@@ -79,7 +83,7 @@ class TestWiring:
     def test_extraction_is_scoped_to_resume(self, leerie):
         """ANTI-VACUITY: `list` has its own positionals (`list status paused`,
         `list chains`). Taking argv[0] there would break them."""
-        src = inspect.getsource(leerie.main)
+        src = inspect.getsource(leerie._parse_command_line)
         i = src.index("_extract_resume_run_id(")
         window = src[max(0, i - 200):i + 120]
         assert "is_resume" in window, (
@@ -149,7 +153,7 @@ class TestTheHazardThatMadeThisSevere:
     def test_resume_is_the_only_verb_through_argparse(self, leerie):
         """`stop`/`kill`/`accept-blocked` handle their positional inside the
         launcher and exit; only `resume` and `list` round-trip here."""
-        src = inspect.getsource(leerie.main)
+        src = inspect.getsource(leerie._parse_command_line)
         assert 'argv[0] == "resume"' in src
         assert 'argv[0] == "list"' in src
         for verb in ("stop", "kill", "accept-blocked"):

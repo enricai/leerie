@@ -7661,6 +7661,28 @@ sample's probe never counts for the next.
   liveness check removed. In `tests/test_build_repo_image.py`, the copy
   streams `save` into `load` and a failure of either side is logged with
   its stderr (2); falsified with `PIPESTATUS[0]` dropped.
+- `tests/test_command_line_refused_before_images.py` (6 functions, 7
+  cases) — a command line is refused before any image step (DESIGN §6 *A
+  command line is refused before any image step*; the live `leerie
+  promptresume <run-id> …`). The real launcher against a stub `nerdctl`:
+  a garbled verb and a bad `--max-workers` end with the parser's message
+  and status 2, no nerdctl command that builds, copies, inspects or runs
+  an image, and no run (2); an accepted line still runs. Run, not read:
+  `check_command_line` and `main` share `_parse_command_line` and
+  `_leerie_arg_parser`; under `python3 -I -S` in an empty directory and
+  HOME it spawns nothing, writes nothing and answers in under 5 s.
+  Falsified live (2026-11-03): the launcher's `exit` on the check's
+  status removed (the stub container ran). The check compiles a content
+  once (review round 39, execution E4), on the launcher's own check
+  program extracted verbatim:
+  `test_the_check_runs_the_kept_code_object_of_its_source` swaps the
+  entry kept under the source's key for another module's code object and
+  the check answers with that module's status, so it runs the kept code;
+  an edited source is a new entry with its own answer, and a broken entry
+  is compiled again. `test_the_check_keeps_four_code_objects`: six
+  contents leave four entries, the current one among them. Falsified
+  (2026-11-04): a compile forced on every run fails the first, and only
+  it.
 - `tests/test_capture_validation.py` — E2's proof turned around: the schema,
   `_filter_residual_deps`, `_capture_problems`, `_record_capture`,
   `_merge_capture_into_config`, `apply_captured_deps`, the launcher's apt

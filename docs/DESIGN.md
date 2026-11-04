@@ -3435,6 +3435,33 @@ they are confined.
   it at once, about 2.4 GB each; nothing serialised them. *Cost:* a launch
   waits for another's base build, copy or repository build instead of
   repeating it, and says once that it waits.
+- *A command line is refused before any image step.* The orchestrator's
+  parser, in the container, is the one authority on its command line, and
+  the launcher reaches it only after the image steps, which take minutes
+  when an image is built or copied. So before any of them the launcher
+  runs that same parser on the host (`check_command_line`, through
+  `python3 -I -S` on the checkout's `orchestrator/leerie.py`, as its other
+  host helpers run), over the argv it will give the container, and a line
+  the parser refuses ends the launch there with the parser's own message
+  and status. The check builds the parser and parses; it
+  reads no state and starts nothing, and a module the host's Python cannot
+  load leaves the line to the container, as before. The module is
+  compiled once per content, not once per launch: its code object is
+  kept under `~/.cache/leerie/bytecode`, named by the sha256 of the
+  interpreter's bytecode magic and the source, so the parser that runs is
+  always the source's own, an edit is a new entry, and the four most
+  recently used are kept. *Measured 2026-11-04 (review round 39,
+  execution E4):* compiling the 3.5 MB module took 3.1 s of every launch,
+  and a refused line took 4-7 s in all, not the "about a second" first
+  claimed; loading the kept code object takes 0.3 s. The alternative, the
+  parser in a module of its own, was rejected: its options read the
+  orchestrator's constants, so the one parser would have to move out of
+  the one file. *Designed 2026-11-03 (the
+  operator's live 0.44.0 launches):* `leerie promptresume <run-id>
+  --max-workers 2000 …`, a mistyped `resume`, spent about 10 minutes on
+  the image steps before the container printed `leerie: error:
+  unrecognized arguments: <run-id>`. A second copy of the orchestrator's
+  options in the launcher was rejected: it would drift from the parser.
 - *Fail closed, on every entry.* Where the image has a worker root, the
   confinement check every entry runs (`_require_confinement`) runs `test
   -e /.leerie-worker-env` confined and stops the run when it does not find

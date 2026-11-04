@@ -30,7 +30,7 @@ N = 5
 BASE_BLOCK = ("# --- build image if not present",
               "# --- per-repo derived image (local nerdctl)")
 REPO_BLOCK = ("# --- per-repo derived image (local nerdctl) ",
-              "\n# --- translate --inspect-dir paths")
+              "\n# --- assemble auth/config mounts")
 
 
 def _launcher() -> str:
