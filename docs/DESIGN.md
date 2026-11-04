@@ -12485,6 +12485,22 @@ a falsifier proved unmet by re-running its saved probe on the new tree.
 Every row's test-outcome part is then re-read from the diff of the tree
 that ships. That verdict is what `_decide_outcome` reads.
 
+**A re-check replaces a verdict only on a tree that changed, and only by
+the vote that made it.** A routed item is re-judged only when the tree has
+moved since the verdict it would replace: the commit the detection verdict
+was measured on (`delivery_gate.final_sha`) until a re-check records its
+own. And an item a 2-of-3 vote confirmed unmet is re-judged by all three
+samples under the same majority: confirm-on-first-pass (one sample, two
+more only when it flags something) is for a first look, where a clean
+sample ends the vote, never for overturning a majority. Before this the
+re-check's last-seen commit started empty, so the first round re-judged
+even when its group changed nothing, and the re-judge's first sample,
+saying met, ended its own vote. Measured on barnacle 48c48629: the
+re-drive's one group made no change (`pre_sha == post_sha`, `no_change`),
+and one sample on that same tree overturned the 2-of-3 unmet verdict on
+"cookies from intermediate hops carried by the following request"; the
+run shipped `done`.
+
 The diff is re-measured because nothing else is. Before review round 6
 the re-drive re-applied the test-outcome verdict recorded at detection,
 and `_decide_outcome` read detection's `new`, on a tree the diff never

@@ -446,12 +446,16 @@ def _with_unmet_before(leerie, tmp_path):
 
 def test_recheck_records_remedied(leerie, tmp_path, monkeypatch):
     st, run_dir = _with_unmet_before(leerie, tmp_path)
-    calls = _patch_judge(leerie, monkeypatch, [_verdicts(True, True)])
+    calls = _patch_judge(leerie, monkeypatch, [_verdicts(True, True)] * 3)
     asyncio.run(leerie._run_delivery_recheck(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
     gate = st.data["delivery_gate"]
-    assert gate["unmet_after"] == [] and gate["samples_after"] == 1
-    assert len(calls) == 1
+    # The 2-of-3 unmet verdict it replaces is re-voted whole: one met
+    # sample never overturns a majority (DESIGN §8 *A re-check replaces a
+    # verdict only on a tree that changed, and only by the vote that made
+    # it*).
+    assert gate["unmet_after"] == [] and gate["samples_after"] == 3
+    assert len(calls) == 3
 
 
 def test_recheck_records_residual(leerie, tmp_path, monkeypatch):
@@ -775,10 +779,12 @@ def test_pre_pass_conflict_with_unmet_items_rechecks_the_contract(
                                      ["contract A", "contract B"])}
     st.save()
     calls = _patch_judge(leerie, monkeypatch, [
-        {**_verdicts(True, True), "contract": _contract("met", "resolved")}])
+        {**_verdicts(True, True), "contract": _contract("met", "resolved")}
+    ] * 3)
     asyncio.run(leerie._run_delivery_recheck(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
-    assert len(calls) == 1
+    # Item 0's majority-unmet verdict is re-voted whole.
+    assert len(calls) == 3
     gate = st.data["delivery_gate"]
     assert gate["unmet_after"] == []
     assert gate["contract_after"]["verdict"] == "met"

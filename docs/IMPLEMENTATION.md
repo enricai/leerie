@@ -9485,7 +9485,15 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   entries, rendered under "Task requirements". `items` is always the
   whole `required_items`, so `judge_idx` and every `item_index` are the
   run's own; a pass over some items passes `only=<indices>`
-  (`_redrive_recheck_items` does — review round 14 M4), and
+  (`_redrive_recheck_items` does — review round 14 M4). `full_vote=
+  <indices>` names items whose 2-of-3 unmet verdict this pass replaces
+  (`_judge_majority_items(rows)`: the rows whose `by`/`settled_by` names
+  the judge or nothing): a pack holding one runs all three samples and the
+  same majority decides, so one met sample never overturns a majority
+  (DESIGN §8 *A re-check replaces a verdict only on a tree that changed,
+  and only by the vote that made it*). `_redrive_recheck_items` passes
+  the prior `unmet_final`'s, `_run_delivery_recheck` the `unmet_before`'s;
+  and
   `routing["human_verification"]` lists them
   (`tests/test_record_worker_only.py`). With `item_details`, each such
   item's detail carries `worker_only: true`. Every reader treats it as
@@ -10125,10 +10133,14 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   success-shaped `if (<null test>) return …` before an error in the same
   function, D3 a new catch that swallows an error class some changed file
   throws under a null guard; a script that yields no JSON voids the round.
-- **Re-check and record.** At a round's end, when HEAD moved: routed items
+- **Re-check and record.** At a round's end, when HEAD differs from the
+  commit the verdict being replaced was made on (`items_rechecked_sha`,
+  which starts as `delivery_gate.final_sha` — never empty, so a round that
+  changed nothing re-judges nothing): routed items
   are re-checked (`_redrive_recheck_items`: judge-unmet and
   untouched-paths items through `_delivery_judge_unmet(<all required
-  items>, phase_label="redrive", only=<those indices>)` with
+  items>, phase_label="redrive", only=<those indices>,
+  full_vote=_judge_majority_items(<unmet_final>))` with
   `_delivery_record`, falsifier-confirmed items by
   re-running their saved probe — `falsifier.samples[].probe_saved` — as a
   one-file set through `_evaluate_acceptance_sets`; unmet if either says

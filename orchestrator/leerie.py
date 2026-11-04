@@ -51209,6 +51209,7 @@ async def _delivery_judge_unmet(
         typed_evidence: list[str] | None = None,
         item_details: dict | None = None,
         only: Iterable[int] | None = None,
+        full_vote: Iterable[int] | None = None,
         ) -> tuple[list[dict], int, dict | None]:
     """Run the delivery_judge over the staging tree; return
     (confirmed_unmet, samples_used, contract_result).
@@ -51261,6 +51262,11 @@ async def _delivery_judge_unmet(
     majority — single-trial LLM judging is measurably noisy, majority
     over 3 samples recovers most of the reliability, and voting on
     DISPUTES only keeps the clean-pass common case at one spawn.
+    `full_vote` names the items whose verdict this pass REPLACES a 2-of-3
+    majority for: a pack holding one runs all three samples whatever the
+    first says, so the same rule decides — one met sample never overturns
+    a majority (DESIGN §8 *A re-check replaces a verdict only on a tree
+    that changed, and only by the vote that made it*).
     Exceptions (WorkerError / timeout) propagate; the callers treat the
     whole gate as advisory."""
     # Normalize BEFORE numbering (review rounds 1–2): required_items
@@ -51426,6 +51432,8 @@ async def _delivery_judge_unmet(
     # below); their cites are made relative to it.
     judge_cwd: list[Path] = [staging]
 
+    majority_held = set(full_vote or ())
+
     async def _judge_pack(p: int, pack: list[int]) -> list[dict]:
         with_contract = contract_ctx is not None and p == 0
         user_prompt = _pack_prompt(pack, with_contract)
@@ -51483,7 +51491,8 @@ async def _delivery_judge_unmet(
 
         async with limit:
             samples = [await _sample(0)]
-            if (_delivery_unmet_majority(samples, n_items)
+            if (allowed & majority_held
+                    or _delivery_unmet_majority(samples, n_items)
                     or _contract_flagged(samples[0], with_contract)):
                 for k in (1, 2):
                     samples.append(await _sample(k))
@@ -57708,7 +57717,8 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
             efforts, phase_label="recheck", contract_ctx=contract_ctx,
             exec_digest=exec_digest, ground_truth=ground_truth,
             routing=routing, typed_evidence=evidence,
-            item_details=details)
+            item_details=details,
+            full_vote=_judge_majority_items(unmet_before))
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge recheck crashed ({_brief_worker_exc(e)}); "
             "residual unrecorded (advisory)")
@@ -61576,6 +61586,23 @@ async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
         return {"error": f"{type(e).__name__}: {e}"[:300]}
 
 
+def _judge_majority_items(unmet: Iterable[object]) -> list[int]:
+    """The indices of `unmet` rows (a delivery verdict's unmet list) the
+    delivery judge's 2-of-3 vote settled — `settled_by`/`by` naming the
+    judge, or naming nothing (the judge is the default) — the ones a
+    re-judge must re-vote whole (`_delivery_judge_unmet(full_vote=)`)."""
+    out: list[int] = []
+    for u in unmet:
+        if not isinstance(u, dict) or not isinstance(u.get("item_index"),
+                                                     int):
+            continue
+        by = u.get("by") if isinstance(u.get("by"), list) else (
+            [u["settled_by"]] if u.get("settled_by") else [])
+        if not by or "judge" in by:
+            out.append(u["item_index"])
+    return sorted(set(out))
+
+
 async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                                  models: dict, efforts: dict,
                                  staging: Path, indices: list[int]
@@ -61607,7 +61634,8 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
             unmet, _n, _x = await _delivery_judge_unmet(
                 st.data.get("task", ""), items, staging, st, caps, models,
                 efforts, phase_label="redrive", exec_digest=record,
-                typed_evidence=evidence, only=judge_idx, routing=routing)
+                typed_evidence=evidence, only=judge_idx, routing=routing,
+                full_vote=_judge_majority_items(prior.values()))
             hit = {u["item_index"]: u for u in unmet
                    if u.get("item_index") in judge_idx}
             human = set(routing.get("human_verification") or [])
@@ -62092,7 +62120,11 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     ids_before = (None if float(st.data.get("redrive_spent_sec") or 0.0)
                   >= budget else
                   await _redrive_test_ids(st, caps, staging, "redrive-ids0"))
-    rechecked_sha = rec.get("items_rechecked_sha")
+    # The commit the verdict a re-check would replace was made on: the last
+    # re-check's, else detection's. Re-judging an unchanged tree only lets
+    # sampling noise overturn it (DESIGN §8 *A re-check replaces a verdict
+    # only on a tree that changed*; barnacle 48c48629's no-change group).
+    rechecked_sha = rec.get("items_rechecked_sha") or det_sha or None
 
     def set_note(k: str, v: dict, kind: str) -> dict:
         s_ = by_index.get(v["set_index"]) or {}
