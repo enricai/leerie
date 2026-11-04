@@ -7,24 +7,24 @@ being a git hook whose embedded interpreter path points at a Python that
 doesn't have the package installed.
 
 Position is load-bearing, not incidental: the entry sits *after* $PATH so
-image-baked tooling (the mise shims and the LTS Node bin that carry
-`claude` itself — see the PATH comment in the Dockerfile) always wins
+image-baked tooling (leerie's `claude` link, the mise shims and the LTS
+Node bin — see the PATH comment in the Dockerfile) always wins
 over anything a repo's setup step later `pip install --user`s. Moving it
 ahead of $PATH would let a user-installed package silently shadow a baked-in
 binary, which is why the ordering is pinned here rather than just membership.
 
-/home/leerie/.local/share/mise/shims (`MISE_DATA_DIR/shims`): populated at
-runtime by `mise install` reading a repo's .tool-versions / .ruby-version /
-rust-toolchain.toml (DESIGN §6½ "Worker-driven install"). Without this dir
-on PATH, a worker's own ad-hoc Bash commands (e.g. `bin/rails test`) fail
-with `env: 'ruby': No such file or directory` on their first invocation
-every single session, even though `phase_provision` already installed the
-pinned runtime — the worker then has to rediscover `mise exec --` from
-scratch. Position is load-bearing here too, in the opposite direction from
-`.local/bin`: it sits *before* $PATH (so a repo's pinned runtime is actually
-reachable) but *after* the system mise shims and the LTS Node bin, so a
-repo pinning its own Node/Python version can never shadow the baked LTS
-Node that hosts `claude` itself.
+/home/leerie/.local/share/mise/shims (`MISE_DATA_DIR/shims`): populated by
+`mise install` reading a repo's .nvmrc / .python-version / .tool-versions /
+.ruby-version / rust-toolchain.toml (DESIGN §6½ "Worker-driven install").
+Without this dir on PATH, a worker's own ad-hoc Bash commands (e.g.
+`bin/rails test`) fail with `env: 'ruby': No such file or directory` on their
+first invocation every single session, even though `phase_provision` already
+installed the pinned runtime. Position is load-bearing here too, in the
+opposite direction from `.local/bin`: it sits *before* $PATH and before the
+baked LTS Node's bin, so a repo's pinned runtime is the one its commands run
+(DESIGN §6½ *A repository's pinned runtime is the one its commands run*;
+pinned in full, with the `claude` link ahead of it, by
+tests/test_pinned_runtime_runs.py).
 
 Source-coupling tests (mirroring tests/test_tmp_cache_writable.py and
 tests/test_home_leerie_ownership.py): the real container behavior needs a
@@ -77,14 +77,13 @@ def test_mise_user_shims_is_on_path():
     assert "/home/leerie/.local/share/mise/shims" in _env_path_line()
 
 
-def test_mise_user_shims_comes_after_baked_tooling():
-    """A repo's pinned Node/Python must never shadow the LTS Node that
-    hosts `claude` itself."""
+def test_mise_user_shims_comes_before_the_baked_lts_node():
+    """A repo's pinned Node is found before the baked LTS Node's bin, which
+    is only the fallback when nothing is pinned."""
     line = _env_path_line()
     assert (
-        line.index("/usr/local/share/mise/shims")
+        line.index("/home/leerie/.local/share/mise/shims")
         < line.index("/usr/local/share/mise/installs/node/lts-current/bin")
-        < line.index("/home/leerie/.local/share/mise/shims")
     )
 
 

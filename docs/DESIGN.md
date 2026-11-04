@@ -4571,7 +4571,9 @@ then died enabling corepack: "EROFS: read-only file system, unlink
 mise run each new version's `corepack enable` (`MISE_NODE_COREPACK=true`),
 and `corepack enable` without `--install-directory` writes its shims next
 to the first `corepack` on `PATH` — the image's baked LTS Node, whose `bin`
-comes before `MISE_DATA_DIR` on `PATH`, not the version just installed.
+came before `MISE_DATA_DIR` on `PATH` through 0.44.3 (§6½ *A repository's
+pinned runtime is the one its commands run*), not the version just
+installed.
 Confined, that is a write outside the toolchain kind's grant; before
 confinement it silently replaced the baked Node's own `pnpm` and `yarn`
 with links into another version's corepack. **Invariant: every Node
@@ -4590,16 +4592,13 @@ run is enabled by the next one.
 
 Whether a version needs shims of its own was measured rather than assumed
 (leerie 0.44.1 image, a tree whose `.nvmrc` says 22.19.0, a confined
-measurement): no command leerie runs reaches them through a bare `pnpm` —
-the baked Node's `bin` is first on `PATH`, so bare `node`, `pnpm` and
-`corepack` are the baked Node's, and leerie's pnpm pin
-(`_COREPACK_PIN_ENV`, `_seed_pnpm_pin`'s bare `corepack`) goes through
-them. What does reach them is the version's own toolchain: `mise exec --
-pnpm` resolves `pnpm` from the active version's `bin` first, and with
-that `bin` first on `PATH` `pnpm` is that version's corepack, still at the
-pinned pnpm (10.4.1), with `pnpm exec node` at 22.19.0. Without its own
-shims a pinned version would silently borrow the baked Node's corepack.
-So the shims stay, made where they belong.
+measurement): bare `pnpm` and `corepack` in that tree are the pinned
+version's (§6½ *A repository's pinned runtime is the one its commands
+run*), as are `mise exec -- pnpm` and leerie's pnpm pin seed
+(`_seed_pnpm_pin`'s bare `corepack`): `pnpm` is that version's corepack,
+still at the pinned pnpm (10.4.1), with `pnpm exec node` at 22.19.0.
+Without its own shims a pinned version would silently borrow the baked
+Node's corepack. So the shims stay, made where they belong.
 
 **A worker's temp directory is short and private too.** *Designed
 2026-11-03 (the live 0.43.0 barnacle runs).* A worker's `TMPDIR` was
@@ -10336,6 +10335,44 @@ classification and planning, layered top-to-bottom by determinism:
    resolver checks the per-run cache first, falls through to the
    image-baked layer. Runtime selection has no model in the loop; the
    version manager's parser is the enforcement.
+
+   **A repository's pinned runtime is the one its commands run.**
+   *Designed 2026-11-04 (barnacle's `.nvmrc`, found proving the corepack
+   fix in §6).* Installing the pinned version is not enough: a command
+   runs whatever `PATH` finds first. The image put the baked LTS Node's
+   `bin` ahead of `MISE_DATA_DIR/shims`, so in a confined measurement on a
+   tree whose `.nvmrc` said 22.19.0, after leerie's own `mise install` had
+   installed it, bare `node` was v24.22.2, `npm` 11.19.1 and `pnpm exec
+   node` v24.22.2 (leerie 0.44.1 image, real `_run_mise_install` and
+   `_run_streaming`): the repository's builds, tests and installs ran on a
+   Node it did not choose, and could differ from its own CI. Python was
+   already right (`.python-version` 3.11 gave 3.11.18) because no
+   concrete Python `bin` precedes the shims; Ruby has no baked version to
+   shadow. The order existed so that a repository's pin "can never shadow
+   the baked LTS Node that hosts `claude`". **Invariant: the version a
+   repository pins is the version its commands run; the baked LTS is only
+   the fallback when nothing is pinned; and leerie's own CLI is never
+   chosen by the repository.** So `MISE_DATA_DIR/shims` comes before every
+   concrete install's `bin` — a mise shim resolves the version the
+   caller's cwd pins and, with none pinned, falls through to the next
+   entry, the baked LTS Node's `bin` — and `claude`, which is leerie's and
+   not the repository's, is linked alone into a directory ahead of both
+   (`/opt/leerie-vendor/bin`). It must not go through a shim: the CLI is a
+   native binary that needs no Node, but its shim resolves from the
+   caller's cwd, and in a tree pinning a version not yet installed mise
+   tries to install that version before running anything — `claude
+   --version` there exited 1 (measured). The order, not a per-command
+   `mise exec`, carries the invariant, so it holds for every command:
+   leerie's measurements, a worker's own Bash, a setup hook. After the
+   change the same measurement gives `node` v22.19.0, `npm` 10.9.3, `pnpm
+   exec node` v22.19.0, and in a tree of the same repository pinning
+   nothing `node` v24.22.2. Leerie's other Node users: its pnpm pin seed
+   (`_seed_pnpm_pin`) now runs the pinned version's `corepack`, which
+   seeds the same `COREPACK_HOME` (pnpm 10.4.1 either way); its AST
+   scripts run on the tree's Node, as they load the tree's own
+   `typescript`, and parse under 22.19.0 with the bundled one. The
+   operator-visible change is that a repository pinning a Node version now
+   builds and tests on it.
 3. **Deterministic install-command detection.** A lockfile-keyed table
    maps observable file presence to the install command(s): a pnpm
    lockfile means `pnpm install`, a `uv.lock` means `uv sync`, a

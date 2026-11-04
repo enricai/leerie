@@ -79,7 +79,7 @@ def test_env_file_from_real_dockerfile_carries_every_env_line():
     got = [l.split("=", 1)[0] for l in _extract(_env_snippet()).splitlines()]
     assert got == want and "MISE_RUBY_COMPILE" in got and "PATH" in got
     path = dict(l.split("=", 1) for l in _extract(_env_snippet()).splitlines())["PATH"]
-    assert "$PATH" not in path and path.startswith("/usr/local/share/mise/shims:")
+    assert "$PATH" not in path and path.startswith("/opt/leerie-vendor/bin:")
 
 
 def test_env_file_written_before_mise_install_and_sourced_for_it():
