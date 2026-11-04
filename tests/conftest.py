@@ -25,6 +25,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from _pytest import outcomes as _pytest_outcomes
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # The launcher's logging and terminal-filter helpers (`remote_log`,
@@ -484,6 +485,223 @@ HAS_TREESITTER = _has_treesitter()
 # Do NOT "fix" a skip here by installing jq into the image: that buys a green
 # tick, not working code, and erodes the boundary.
 HAS_JQ = shutil.which("jq") is not None
+
+
+def _landlock_abi() -> int:
+    """The host kernel's Landlock ABI, 0 where it has none (not Linux, the
+    LSM off, a seccomp profile refusing the syscall). The shim's own `abi()`,
+    loaded by path so this needs no package import."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "lk_conftest", REPO_ROOT / "scripts" / "landlock_exec.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return int(m.abi())
+
+
+# Evaluated once at collection; test modules whose SUBJECT is the kernel's
+# confinement import this.
+#
+# Why a gate and not an emulation: Landlock is a Linux LSM with no macOS
+# equivalent (`sandbox-exec` is deprecated by Apple and its profiles do not
+# express leerie's grants), and faking it away would make a confinement test
+# pass on a kernel that cannot confine — a green tick over the one guarantee
+# the shim exists to provide. leerie runs in a Linux container, so these
+# tests' subject is always on Linux in production; CI (ubuntu-latest) has
+# ABI >= 3 and runs every one of them for real.
+#
+# Where the host has no Landlock, the test runs where leerie runs: with
+# LEERIE_TEST_CONTAINER_IMAGE naming a leerie image and `nerdctl` on PATH,
+# `_landlock_container_runner` below re-runs it inside the container, which
+# has the real LSM (a macOS Colima VM reports ABI 4). Gated on the variable
+# as `tests/test_pinned_runtime_runs.py` and `tests/test_work_read_only.py`
+# gate theirs, so the reason never names a remedy that does nothing.
+LANDLOCK_ABI = _landlock_abi()
+MIN_LANDLOCK_ABI = 3
+LANDLOCK_IMAGE = os.environ.get("LEERIE_TEST_CONTAINER_IMAGE", "")
+# Under CI's per-test cap (`--timeout=600`, .github/workflows/test.yml), and
+# matching `tests/test_work_read_only.py`'s own container test. Measured need
+# is about 10 s a test, so this is 30x headroom: a longer ceiling than the cap
+# it runs under would be killed by pytest-timeout mid-`nerdctl`, and `--rm`
+# does not run when the client is SIGKILLed.
+LANDLOCK_CONTAINER_TIMEOUT_SEC = 300
+
+
+def _landlock_users_env() -> dict[str, str]:
+    """The user's own HOME and XDG directories: rootless nerdctl finds its
+    network configuration there, and the session's test home has none. Same
+    reason as `tests/test_pinned_runtime_runs.py`'s `_users_env`."""
+    env = {**os.environ, "HOME": REAL_HOME}
+    for var in XDG_BASE_DIRS:
+        real = os.environ.get(f"PYTEST_LEERIE_REAL_{var}", "")
+        if real:
+            env[var] = real
+        else:
+            env.pop(var, None)
+    # The child pytest must not recurse into this hook.
+    env.pop("LEERIE_TEST_CONTAINER_IMAGE", None)
+    return env
+
+def _container_runtime_usable() -> bool:
+    """True when `nerdctl` is there AND its daemon answers.
+
+    `shutil.which` alone is not enough: with Colima installed but stopped --
+    an ordinary state on a laptop -- every `nerdctl run` exits fatal on the
+    containerd socket, which would turn each gated test into a failure whose
+    text says nothing about its subject. A test that cannot be run here must
+    skip, so the runtime is probed once.
+    """
+    if not shutil.which("nerdctl"):
+        return False
+    try:
+        # `_landlock_users_env`, not this process's: conftest has already
+        # pointed HOME at a test directory, where rootless nerdctl finds no
+        # configuration and reports "colima is not running" on a host where
+        # it is running. The runner itself uses the same environment.
+        return subprocess.run(["nerdctl", "version"], capture_output=True,
+                              timeout=60,
+                              env=_landlock_users_env()).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# Public: a module with its own kernel precondition (a `/proc` read, say)
+# composes its skipif with this, so its reason stays true too. The probe runs
+# only where an image is configured, so it costs a host without one nothing
+# (and CI, which sets no image, never pays it).
+CAN_RUN_IN_CONTAINER = bool(LANDLOCK_IMAGE) and _container_runtime_usable()
+# TWO marks, applied as a list -- never `pytest.mark.needs_landlock(skipif)`,
+# which makes the skipif an ARGUMENT of the outer mark instead of a mark of
+# its own, so nothing skips and every confined test runs against a kernel
+# that cannot confine (measured: 15 such failures).
+#   - `needs_landlock` is the name `pytest_collection_modifyitems` looks for;
+#     a bare skipif mark is named "skipif", so a name lookup finds nothing.
+#   - the skipif stops a test this host can neither run nor hand to a
+#     container.
+# A list is what pytest applies as a stack of marks, for both a decorator
+# (`@needs_landlock`) and a module `pytestmark`.
+needs_landlock = pytest.mark.needs_landlock
+skip_without_landlock = pytest.mark.skipif(
+    LANDLOCK_ABI < MIN_LANDLOCK_ABI and not CAN_RUN_IN_CONTAINER,
+    reason=f"the host kernel has no Landlock ABI {MIN_LANDLOCK_ABI} "
+           f"(it reports {LANDLOCK_ABI}) and this test's subject is the "
+           "kernel's confinement; leerie runs in a Linux container, so "
+           "set LEERIE_TEST_CONTAINER_IMAGE to a leerie image and start "
+           "the container runtime (`nerdctl version` must answer) and it "
+           "runs there instead. CI runs it directly.")
+
+
+def _landlock_container_argv(node_id: str) -> list[str]:
+    """`nerdctl run` argv that runs one test, by node id, inside a leerie
+    image. The repo is copied in, never used in place: the suite writes.
+
+    The security options mirror `tests/test_pinned_runtime_runs.py`'s real
+    container test — rootless containerd needs `seccomp=unconfined` for the
+    shim's own seccomp filter, and the sandbox's mounts need the
+    `leerie-container` AppArmor profile where it is loaded.
+    """
+    rootless = Path(f"/run/user/{os.getuid()}/containerd-rootless/child_pid")
+    sec = (["--security-opt", "seccomp=unconfined"]
+           if rootless.is_file() else [])
+    if Path("/etc/apparmor.d/leerie-container").is_file():
+        sec += ["--security-opt", "apparmor=leerie-container"]
+    # pytest is not in the image (it is a runtime image, not a test one), so
+    # it is installed per run: ~5 s, measured. `safe.directory` is needed
+    # because the copy is not owned by the user git sees.
+    script = (
+        "set -e\n"
+        "cp -a /src /w\n"
+        "cd /w\n"
+        # Not `>/dev/null 2>&1`: `--quiet` already drops the normal chatter,
+        # and under `set -e` a swallowed failure (no egress, no index --
+        # jsonschema is in neither requirements.txt nor the image) left the
+        # operator a verdict with an empty body.
+        "/usr/bin/python3 -m pip install --quiet --break-system-packages "
+        "  --root-user-action=ignore pytest jsonschema\n"
+        "git config --global --add safe.directory /w\n"
+        f"exec /usr/bin/python3 -m pytest -q -p no:cacheprovider {node_id!r}\n")
+    return ["nerdctl", "run", "--rm", *sec, "--entrypoint", "bash",
+            "-v", f"{REPO_ROOT}:/src:ro", LANDLOCK_IMAGE, "-c", script]
+
+
+
+
+def _runs_in_container(item) -> bool:
+    """This test's verdict comes from the container, not from this kernel."""
+    return (LANDLOCK_ABI < MIN_LANDLOCK_ABI and CAN_RUN_IN_CONTAINER
+            and item.get_closest_marker("needs_landlock") is not None)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Hand every `needs_landlock` test to the container, where this kernel
+    has no Landlock and an image is configured.
+
+    The item's own `setup` is replaced, so none of its fixtures is built on
+    a kernel that cannot confine: `tests/test_commands_keep_default_signals`'s
+    module-scoped `outside` reads `/proc/self/status` and raised
+    StopIteration at setup, long before any body ran. The container's verdict
+    becomes the test's. Inside the container the ABI is >= 3 and
+    LEERIE_TEST_CONTAINER_IMAGE is cleared from the child's environment, so
+    the marker is inert there and the re-run executes the body normally —
+    there is no recursion.
+    """
+    for item in items:
+        if _runs_in_container(item):
+            item.setup = _landlock_container_setup(item)      # type: ignore[method-assign]
+
+
+def _landlock_container_setup(item):
+    """`item.setup` that runs the test in the container instead.
+
+    The verdict is only recorded here, never raised: a `pytest.fail` at setup
+    reports as an ERROR, which reads as "the harness broke" and which `-ra`
+    groups away from real failures. `pytest_runtest_call` raises it in the
+    call phase instead, where a failure is a failure.
+    """
+    def setup() -> None:
+        r = subprocess.run(_landlock_container_argv(item.nodeid),
+                           capture_output=True, text=True,
+                           timeout=LANDLOCK_CONTAINER_TIMEOUT_SEC,
+                           env=_landlock_users_env())
+        item._landlock_container = (
+            r.returncode,
+            f"in {LANDLOCK_IMAGE} (this host has no Landlock ABI "
+            f"{MIN_LANDLOCK_ABI}):\n{r.stdout[-4000:]}{r.stderr[-4000:]}")
+    return setup
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item):
+    """The container already decided this test; run no local body."""
+    got = getattr(item, "_landlock_container", None)
+    if got is None:
+        return
+    rc, said = got
+    if rc != 0:
+        pytest.fail(said, pytrace=False)
+    raise _RanInContainer("the container passed this test")
+
+
+class _RanInContainer(_pytest_outcomes.Skipped):
+    """Carries "the container passed this" out of the call phase, where
+    `pytest_runtest_makereport` turns it into the pass it was.
+
+    A `Skipped` subclass, not a plain Exception: `check_interactive_exception`
+    exempts `Skipped` by name, so `--pdb` does not open a debugger on a test
+    that PASSED in the container. Everything else about the outcome is set by
+    the report hook below.
+    """
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """A test the container passed reports as passed here."""
+    out = yield
+    rep = out.get_result()
+    exc = call.excinfo.value if call.excinfo else None
+    if call.when == "call" and isinstance(exc, _RanInContainer):
+        rep.outcome = "passed"
+        rep.longrepr = None
 
 
 def _make_caps(leerie, **overrides) -> dict:

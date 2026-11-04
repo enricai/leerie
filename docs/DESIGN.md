@@ -3637,7 +3637,10 @@ the shims, which is what lets them run the version the repository pins
 broker and for the orchestrator after the privilege drop. The launch
 wrapper (`_render_launch_suffix`) starts the orchestrator as
 `/usr/bin/python3`. `collect-subtrees.sh`'s machine payload runs its three
-Python steps the same way. A static rule checks these sites, and every
+Python steps the same way, and `worktree-lib.sh`'s `leerie_repo_lock` takes
+the worktree lock the same way: its callers run with a working directory
+under the run's own repository, where a repository's version files would
+otherwise choose the interpreter that holds leerie's lock. A static rule checks these sites, and every
 subprocess or `exec` call in leerie's own Python, for an interpreter named
 by a bare name (`tests/test_leerie_python_is_named.py`).
 
@@ -6602,12 +6605,27 @@ run deaths across 4 chains. Four rules close it:
   another run is that run's to clean (on resume) or the reaper's (below).
 - **One repository-wide lock.** Every script that adds a worktree
   (`setup-run.sh`, `new-worktree.sh`, `planning-worktree.sh`), `cleanup.sh`'s
-  prune and the Python prune take `flock` on
+  prune and the Python prune take an exclusive advisory lock on
   `<git-common-dir>/leerie-worktree.lock` around the prune → orphan check →
   add sequence. The per-run lock it replaces serialised one run's siblings
   but not two runs, nor a run's planning worktree against its subtasks. The
   lock file sits where git writes its own worktree admin entries, so it is
   writable wherever `worktree add` is, on every runtime.
+
+  The lock is the kernel's, on the open file description the holder owns, and
+  the kernel releases it once no process holds that descriptor — a normal
+  exit, a crash or a SIGKILL alike, with a child that inherited it keeping
+  the lock until it too is gone. A Fly `machine stop` SIGKILLs a run
+  mid-`worktree add`, and a lock that outlived it would wedge every later
+  run. The shell side takes it through `fcntl.flock` on the descriptor it
+  already holds (`exec 201>`), not through the `flock` binary: macOS does not
+  ship that binary, and the scripts run on a developer's host under the
+  tests. Both reach one kernel lock on one file, as they always have, so the
+  change is the shell's mechanism and not the exclusion itself; the two
+  differ only in how they wait (the scripts block, the Python prune polls to
+  a 30 s deadline and then skips). Measured on both kernels: 6 concurrent
+  holders × 200 iterations of read-modify-write lose no update, and a
+  SIGKILLed holder releases exactly as the binary's callers did.
 - **Re-check before deleting.** git's "prunable" verdict is read before the
   loop reaches an entry; an entry is deleted only if its worktree's `.git`
   link is still gone at that moment.

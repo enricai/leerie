@@ -18,14 +18,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import needs_landlock, skip_without_landlock
+
 from tests.test_held_out_relays import _claude_p_state, _Proc
-from tests.test_worker_confinement import _abi, _St, run  # noqa: F401
+from tests.test_worker_confinement import _St, run  # noqa: F401
 
 FORGED = "FORGED_RUN_PASSED"
 REAL = "REAL_RUN_RESULT"
 
-needs_landlock = pytest.mark.skipif(
-    _abi() < 3, reason="the host kernel has no Landlock ABI 3")
 
 
 def _events(sid: str, cmd: str, result: str) -> list[str]:
@@ -138,6 +138,7 @@ def test_conformer_axes_are_not_measured_into_its_transcript(leerie, tmp_path):
 
 
 @needs_landlock
+@skip_without_landlock
 def test_a_measured_commands_forged_tool_call_never_enters_the_record(
         leerie, run, monkeypatch):
     """The real `_run_streaming`, confined, running a command that prints a
@@ -161,6 +162,7 @@ def test_a_measured_commands_forged_tool_call_never_enters_the_record(
 
 
 @needs_landlock
+@skip_without_landlock
 def test_a_command_is_refused_a_workers_transcript(leerie, run, monkeypatch):
     run_dir = run["run_dir"]
     tree = run["wts"][f"{run_dir.name}-view-staging"]

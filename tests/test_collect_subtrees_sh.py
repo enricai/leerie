@@ -19,7 +19,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from tests.conftest import run_bash, run_git_repo_first
+from tests.conftest import needs_landlock, skip_without_landlock, run_bash, run_git_repo_first
 from tests.fly_stub import make_fake_flyctl
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -239,6 +239,11 @@ def test_collected_all_clean_merges(tmp_path):
     assert show_b.returncode == 0, "file_b.txt missing from run branch"
 
 
+# The payload refuses to run an unconfined integrator (collect-subtrees.sh:
+# `guard_confine` empty -> the branch is skipped), so a conflict is only
+# ever resolved where the kernel can confine.
+@needs_landlock
+@skip_without_landlock
 def test_conflict_resolved_by_integrator(tmp_path):
     """When two subtasks modify the same file region, one merges cleanly
     and the other is resolved by the claude integrator."""
@@ -444,6 +449,11 @@ def _conflicting_run(tmp_path: Path, run_id: str, extra_state: dict):
     return repo, state_dir
 
 
+# The payload refuses to run an unconfined integrator (collect-subtrees.sh:
+# `guard_confine` empty -> the branch is skipped), so a conflict is only
+# ever resolved where the kernel can confine.
+@needs_landlock
+@skip_without_landlock
 def test_the_integrator_gets_the_shared_kill_deny_notice_and_hook(
         tmp_path, leerie):
     run_id = "test-guard-abc"
@@ -594,6 +604,11 @@ def test_a_skipped_branch_leaves_staging_as_it_found_it(tmp_path, status):
         cwd=staging, capture_output=True, text=True).stdout == ""
 
 
+# The payload refuses to run an unconfined integrator (collect-subtrees.sh:
+# `guard_confine` empty -> the branch is skipped), so a conflict is only
+# ever resolved where the kernel can confine.
+@needs_landlock
+@skip_without_landlock
 def test_a_reset_that_fails_stops_the_collection(tmp_path):
     """A back-out that cannot restore staging (here an `index.lock` the
     integrator left, which every git write then refuses) stops the

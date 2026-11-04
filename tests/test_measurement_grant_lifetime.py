@@ -22,13 +22,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.conftest import fake_run_dir
+from tests.conftest import needs_landlock, skip_without_landlock, fake_run_dir
 from tests.test_worker_confinement import (  # noqa: F401  (fixture)
-    _abi, _grants, _probe, run)
+    _grants, _probe, run)
 from tests.conftest import run_git_out  # noqa: E402
 
-needs_landlock = pytest.mark.skipif(
-    _abi() < 3, reason="the host kernel has no Landlock ABI 3")
 
 
 _git = run_git_out
@@ -207,6 +205,7 @@ def test_claude_p_records_the_first_committing_worker(leerie, monkeypatch,
 
 
 @needs_landlock
+@skip_without_landlock
 def test_a_confined_worker_reads_the_runs_mise_overrides(leerie, run,
                                                          tmp_path):
     """A Go repository's run names `<run>/mise-overrides.toml` to every

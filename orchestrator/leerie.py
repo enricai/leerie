@@ -24976,7 +24976,13 @@ def _worker_own_dirs(env: Mapping[str, str], run_dir: Path) -> list[str]:
     names there; any other value is shared, and granted nothing."""
     workers = (run_dir / WORKERS_DIR).resolve()
     config = env.get("CLAUDE_CONFIG_DIR")
-    own_tmp = (str(_worker_tmp(Path(os.path.realpath(config)).parent))
+    # Resolved, because the loop below compares `os.path.realpath(p)` against
+    # it: `_worker_tmp` names `PRIVATE_TMP_ROOT`, under `/tmp`, which is a
+    # directory in the image but a symlink to `private/tmp` on a macOS host.
+    # Unresolved, the two spellings never matched there and the worker's own
+    # temp directory was granted nothing.
+    own_tmp = (os.path.realpath(_worker_tmp(
+                   Path(os.path.realpath(config)).parent))
                if config and Path(os.path.realpath(config)).parent.parent
                == workers else None)
     out = []
@@ -48196,8 +48202,19 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                 finally:
                     run_wall = time.monotonic() - t_run
                     spent += run_wall
-        except Exception:
-            # A timeout or a spawn failure: no verdict from this run.
+        except Exception as e:
+            # A timeout or a spawn failure: no verdict from this run, and the
+            # reason is said. A bare `return None` reported "no verdict" for
+            # every cause alike, so a shim that refused to run at all read as
+            # a measurement that found nothing (the confinement shim exiting
+            # 126 on a kernel with no `prctl` cost a debugging session this
+            # way). `_brief_worker_exc`, never `{e}`: a TimeoutExpired
+            # renders the whole argv, system prompt included.
+            # `ConfinementRefused` is a BaseException and passes through
+            # untouched (DESIGN §6 *A confinement failure stops the run; it
+            # is never a result*).
+            log(f"  {label}: test IDs not captured — "
+                f"{type(e).__name__}: {_brief_worker_exc(e)}")
             with contextlib.suppress(OSError):
                 _unlink_beneath(own, report)
             return None

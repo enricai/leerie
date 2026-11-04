@@ -135,11 +135,39 @@ prune_leerie_worktrees() {
 # names, run-scoped prune and re-check (6 concurrent runs x 200 iterations,
 # once with no other worktrees and once with 40 live ones): 0 failed
 # iterations of 2400.
+#
+# The lock is taken on the open file description THIS shell owns, by a
+# short-lived helper: it therefore outlives the helper, and the kernel
+# releases it once no process holds that descriptor -- a normal exit, a
+# crash or a SIGKILL alike (a child that inherited fd 201 keeps it until it
+# too is gone, exactly as it did under `flock(1)`). A Fly `machine stop`
+# SIGKILLs a run mid-`worktree add`, and a lock that outlived it would wedge
+# every later run. Not the `flock` binary: macOS does not ship one, and
+# these scripts run on a developer's host under the tests, where `flock 201`
+# exited 127 and took every `setup-run.sh` with it. `_prune_leerie_worktrees`
+# takes the same lock on the same file, but not the same way: non-blocking
+# with a 30 s deadline (`_WORKTREE_LOCK_WAIT_SEC`), and it skips the prune
+# rather than wait forever. Measured on both kernels: 6 holders x 200
+# read-modify-write iterations lose no update, and util-linux `flock(1)`
+# releases on SIGKILL exactly as this does.
+#
+# The interpreter is named by path (DESIGN section 6 *Leerie names its own
+# Python by path*): a caller's working directory is inside the run's own
+# repository, where a repository's version files would otherwise choose the
+# interpreter that holds leerie's lock.
 leerie_repo_lock() {
   local common
   common="$(leerie_repo_git rev-parse --git-common-dir)"
   exec 201>"$common/leerie-worktree.lock"
-  flock 201
+  # Checked explicitly, not left to the caller's `set -e`: an unheld lock
+  # that the script proceeds past is the one outcome worse than not starting
+  # (on macOS `/usr/bin/python3` can be an Xcode stub that exits non-zero).
+  # `201>&201` is not needed -- bash passes fd 201 to the child anyway -- but
+  # it says at the call site which descriptor is being locked.
+  if ! /usr/bin/python3 -I -S -c 'import fcntl; fcntl.flock(201, fcntl.LOCK_EX)' 201>&201; then
+    echo "leerie_repo_lock: could not take $common/leerie-worktree.lock" >&2
+    return 1
+  fi
 }
 
 # leerie_worktree_name <run-id> <name>

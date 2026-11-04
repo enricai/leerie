@@ -33,7 +33,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import REPO_ROOT
+from tests.conftest import (REPO_ROOT, needs_landlock,
+                            skip_without_landlock)
 
 SHIM = REPO_ROOT / "scripts" / "landlock_exec.py"
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
@@ -77,6 +78,11 @@ def _read_all(fd: int) -> bytes:
 
 # --- the real shim ----------------------------------------------------------
 
+# The refusal this asserts is the shim's `/dev/console` check, which only a
+# kernel that can confine ever reaches: without Landlock the shim refuses
+# earlier, naming the missing `prctl` instead.
+@needs_landlock
+@skip_without_landlock
 def test_the_shims_refusal_is_written_to_its_refusal_descriptor():
     """A real refusal of the real shim (a terminal on one of its
     descriptors, the first check it makes, needing no kernel feature)."""
@@ -237,6 +243,8 @@ def test_every_confined_spawn_names_its_refusal_descriptor():
 
 # --- the run stops ------------------------------------------------------------
 
+@needs_landlock
+@skip_without_landlock
 def test_main_stops_the_run_with_the_typed_exit_and_records_nothing(
         leerie, monkeypatch, tmp_path):
     from tests.test_main_exception_arms import _run_main, _state_json

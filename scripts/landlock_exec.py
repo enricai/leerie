@@ -622,11 +622,23 @@ def install_seccomp() -> None:
     buf = ctypes.create_string_buffer(prog, len(prog))
     fp = _SockFprog(len(prog) // 8, ctypes.cast(buf, ctypes.c_void_p))
     libc = _libc()
-    if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+    try:
+        prctl = libc.prctl
+    except AttributeError as e:
+        # A libc with no `prctl` (not Linux). The contract above is an OSError
+        # naming the step, and `_confine_or_126` catches only that: an
+        # AttributeError escaping here made the shim traceback and exit 1
+        # instead of writing its refusal and exiting 126, so a caller read
+        # "no verdict" where the shim meant "I will not run this". `abi()`
+        # also catches this missing symbol rather than letting it escape,
+        # though to the opposite end: it answers 0, because its caller asks
+        # a question, while this one is a step that must refuse.
+        raise OSError(f"prctl: {e}") from None
+    if prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
         raise OSError(f"prctl(PR_SET_NO_NEW_PRIVS): errno "
                       f"{ctypes.get_errno()}")
-    if libc.prctl(_PR_SET_SECCOMP, _SECCOMP_MODE_FILTER,
-                  ctypes.byref(fp), 0, 0) != 0:
+    if prctl(_PR_SET_SECCOMP, _SECCOMP_MODE_FILTER,
+             ctypes.byref(fp), 0, 0) != 0:
         raise OSError(f"seccomp filter: errno {ctypes.get_errno()}")
 
 
