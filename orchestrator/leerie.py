@@ -71201,14 +71201,22 @@ def _parse_command_line(ap: argparse.ArgumentParser, argv: list[str]
     return ap.parse_args(argv), positional_run_id, is_resume, is_list
 
 
-def check_command_line(argv: list[str]) -> int:
-    """Parse-only (DESIGN §6 *A command line is refused before any image
-    step*): the launcher runs this on the host, through `python3 -I -S`,
-    with the argv it will give the container, before it builds or copies any
-    image. A line the parser refuses exits 2 here with the message the
-    container would print; one it accepts returns 0. Reads no state and
-    starts nothing."""
-    _parse_command_line(_leerie_arg_parser(), argv)
+def check_command_line(argv: list[str], state_root: str | None = None
+                       ) -> int:
+    """DESIGN §6 *A command line is refused before any image step*: the
+    launcher runs this on the host, through `python3 -I -S`, with the argv it
+    will give the container, before it builds or copies any image. A line
+    the parser refuses exits 2 here with the message the container would
+    print; one it accepts returns 0. A `resume` naming a run is resolved
+    against `state_root` (the local runtime's state root, which the
+    container mounts) with the container's own `resolve_run_id`, so an ID
+    that names no run dies here, not after the image steps. Starts nothing;
+    reads only that run list, and only then."""
+    args, positional_run_id, is_resume, _ = _parse_command_line(
+        _leerie_arg_parser(), argv)
+    run_id = positional_run_id or args.run_id
+    if is_resume and run_id and state_root:
+        resolve_run_id(Path(state_root), run_id, resumable_only=True)
     return 0
 
 

@@ -3499,6 +3499,18 @@ they are confined.
   the image steps before the container printed `leerie: error:
   unrecognized arguments: <run-id>`. A second copy of the orchestrator's
   options in the launcher was rejected: it would drift from the parser.
+  A `resume` that names a run is checked the same way, for the same
+  reason. On the local runtime the container mounts the host's state root.
+  The launcher therefore gives the check that root, and the check resolves
+  the named run there with the orchestrator's own `resolve_run_id`, which
+  reads the runs' state files and nothing else. So a run ID that names no
+  run ends the launch before any image step, with the message the
+  container would print. That run list is the only state the check reads,
+  and only for a local `resume`. A remote runtime's runs are resolved
+  where they live, as before. *Designed 2026-11-04 (the operator's live
+  0.44.7 launch):* `leerie resume <run-id less its last character> …`
+  waited 16 minutes on two image builds before the container printed
+  `run-id … does not match any known run`.
 - *Fail closed, on every entry.* Where the image has a worker root, the
   confinement check every entry runs (`_require_confinement`) runs `test
   -e /.leerie-worker-env` confined and stops the run when it does not find

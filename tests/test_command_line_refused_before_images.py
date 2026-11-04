@@ -134,12 +134,12 @@ def _check_snippet() -> str:
 
 
 def _module(rc: int) -> str:
-    return f"def check_command_line(argv):\n    return {rc}\n"
+    return f"def check_command_line(argv, state_root=None):\n    return {rc}\n"
 
 
 def _check(src: Path, cache: Path) -> int:
     return subprocess.run([sys.executable, "-I", "-S", "-B", "-c",
-                           _check_snippet(), str(src), str(cache), "x"],
+                           _check_snippet(), str(src), str(cache), "", "x"],
                           capture_output=True, text=True, timeout=60,
                           env={"PATH": "/usr/bin:/bin"}).returncode
 
@@ -178,3 +178,58 @@ def test_the_check_keeps_four_code_objects(tmp_path):
         assert _check(src, cache) == 0
     assert len(list(cache.iterdir())) == 4
     assert (cache / _key(src.read_bytes())).is_file()
+
+
+# --- a resume naming no run is refused before any image step --------------
+# The operator's live 0.44.7 launch (2026-11-04): `leerie resume <run-id
+# less its last character> …` waited 16 minutes on two image builds before
+# the container printed `run-id … does not match any known run`.
+
+LIVE_ID = "ddd383ea32d0f0c7690e9e55669dbc5a0905e1494d23d4c68b6725bfe43774ae"
+
+
+def _a_run(state: Path, run_id: str) -> None:
+    d = state / "runs" / run_id
+    d.mkdir(parents=True)
+    (d / "state.json").write_text(
+        '{"task": "t", "started_at": "2026-11-04T00:00:00Z"}')
+
+
+@pytest.mark.parametrize("argv", [
+    ["resume", LIVE_ID[:-1], "--max-workers", "2000"],
+    ["resume", "--run-id", LIVE_ID[:-1]],
+])
+def test_the_check_resolves_a_resumes_run_in_the_state_root(tmp_path, argv,
+                                                            capsys):
+    """Run, not read: the check dies with the container's own message for
+    an ID naming no run, and passes the run that exists. Without a state
+    root (a remote runtime) it stays parse-only."""
+    m = _orchestrator()
+    _a_run(tmp_path, LIVE_ID)
+    with pytest.raises(SystemExit) as e:
+        m.check_command_line(argv, state_root=str(tmp_path))
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert f"run-id {LIVE_ID[:-1]!r} does not match any known run" in err
+    assert f"Available: {LIVE_ID}" in err
+    good = [LIVE_ID if a == LIVE_ID[:-1] else a for a in argv]
+    assert m.check_command_line(good, state_root=str(tmp_path)) == 0
+    assert m.check_command_line(argv) == 0
+    assert m.check_command_line(argv, state_root=None) == 0
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_a_resume_naming_no_run_runs_no_image_step(tmp_path):
+    """The real launcher, against a stub `nerdctl`, with the live run's
+    state root: a mistyped run ID ends the launch with the container's
+    message before any image step; the right one reaches the container."""
+    w = make_world(tmp_path)
+    _a_run(w["state"], LIVE_ID)
+    rc, out = run_to_end(w, ["resume", LIVE_ID[:-1], "--no-push", "--max-workers", "2"])
+    assert rc == 1, out
+    assert f"run-id {LIVE_ID[:-1]!r} does not match any known run" in out, out
+    assert not [c for c in _calls(w) if any(s in f" {c} " for s in _IMAGE_STEP)], \
+        _calls(w)
+    assert run_argv(w) == []
+    rc, out = run_to_end(w, ["resume", LIVE_ID, "--no-push", "--max-workers", "2"])
+    assert run_argv(w), out
