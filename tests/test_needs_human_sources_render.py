@@ -79,19 +79,92 @@ def _entry(source: str) -> tuple[dict, str]:
     return {"source": source, "detail": text}, text
 
 
+def _section(body: str, heading: str) -> str:
+    """The text under `heading`, up to the next `## ` heading."""
+    if heading + "\n" not in body:
+        return ""
+    return body.split(heading + "\n", 1)[1].split("\n## ", 1)[0]
+
+
+NHV, NOT_VERIFIED = "## Needs human verification", "## Not verified by this run"
+
+
 @pytest.mark.parametrize("source", SOURCES)
 def test_an_entry_of_every_source_renders_in_the_pr(leerie, source):
     entry, text = _entry(source)
     body = leerie._format_pr_end_state_section(
         {"needs_human_verification": [entry]})
-    assert "## Needs human verification" in body
-    assert text in body
+    # The two typed external shapes (the classifier's external item, a
+    # blocker naming its resource) are a human's; every other source is a
+    # limit on what the run measured.
+    where = NHV if source in SPECIAL else NOT_VERIFIED
+    assert text in _section(body, where), (source, body)
+
+
+def test_only_a_typed_external_resource_reaches_needs_human(leerie):
+    """The guard (DESIGN §6 *Only a typed external resource reaches "Needs
+    human verification"*): one state holding an entry of every source the
+    PR renders — each `needs_human_verification` source derived from the
+    code above, a blocker and an external risk each with and without a
+    resource, a simulated interleaving, an unmeasured held-out set, an
+    intermittent failure and an unsettled untyped fix site. Every line
+    under "Needs human verification" must be one of the typed external
+    entries, and every other entry must be under "Not verified by this
+    run". Driven by the user's runs 48c48629 (barnacle#665) and ebe36d49
+    (barnacle#670)."""
+    external, other = [], []
+    nhv_entries = []
+    for src in SOURCES:
+        entry, text = _entry(src)
+        nhv_entries.append(entry)
+        (external if src in SPECIAL else other).append(text)
+    nhv_entries.append({"source": "blocker", "subtask": "s2",
+                        "resource": "", "blocker": "waiting on nobody named"})
+    other.append("waiting on nobody named")
+    risk = {"kind": "unexercised_behavior", "source": "implementer",
+            "where_paths": [], "addressed": False}
+    state = {
+        "needs_human_verification": nhv_entries,
+        "risk_register": {"s1": [
+            {**risk, "detail": "live tenant behaviour",
+             "gap": "unverified_external", "resource": "the live tenant"},
+            {**risk, "detail": "external with no resource",
+             "gap": "unverified_external"},
+            {**risk, "detail": "two writers race", "gap": "test_weak",
+             "simulated_interleaving": True}]},
+        "acceptance": {"sets": [{"index": 1, "valid": True,
+                                 "defect_files": ["src/a.test.ts"],
+                                 "control_files": []}],
+                       "gate": {}},
+        "test_id_diff": {"intermittent_regression": [
+            {"id": "src/x.test.ts :: flaky", "final_failed": 1,
+             "final_runs": 24, "base_failed": 0, "base_runs": 24,
+             "imports_changed": ["src/x.ts"]}]},
+        "site_claims": {"sites": [
+            {"site_id": "D8", "file": "src/s.ts", "symbol": "m",
+             "resolution": "share one helper", "surface_other": True}]},
+    }
+    external.append("live tenant behaviour")
+    other += ["two writers race", "held-out set(s) 1",
+              "src/x.test.ts :: flaky", "share one helper"]
+    body = leerie._format_pr_end_state_section(state)
+    nhv, rest = _section(body, NHV), _section(body, NOT_VERIFIED)
+    lines = [x for x in nhv.splitlines() if x.startswith("- ")]
+    for line in lines:
+        assert any(t in line for t in external), (line, body)
+    for t in external:
+        assert t in nhv, (t, body)
+    for t in other:
+        assert t not in nhv and t in rest, (t, body)
+    # The entry typed external without a resource names nothing a human
+    # could bring, and is not rendered as one.
+    assert "external with no resource" not in nhv
 
 
 def test_the_two_round_14_sources_render_as_task_requirements(leerie):
     for src in (leerie.DELIVERY_JUDGE_GAP_SOURCE,
                 leerie.RATCHET_UNVERIFIED_GAP_SOURCE):
-        groups = leerie._pr_needs_human(
+        groups = leerie._pr_not_verified(
             {"needs_human_verification": [
                 {"source": src, "detail": f"Check by hand: {src}"}]},
             lambda _s: True)
@@ -102,7 +175,7 @@ def test_the_two_round_14_sources_render_as_task_requirements(leerie):
 def test_a_source_no_table_names_still_renders(leerie):
     """The catch-all: an entry is never silent, even from a source a later
     change forgets to place."""
-    groups = leerie._pr_needs_human(
+    groups = leerie._pr_not_verified(
         {"needs_human_verification": [
             {"source": "some_new_gap", "detail": "look at this"}]},
         lambda _s: True)

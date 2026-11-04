@@ -30,7 +30,7 @@ class _St:
 
 
 def _lines(leerie, data: dict) -> list[str]:
-    return leerie._pr_needs_human(data, lambda _s: True).get(GROUP, [])
+    return leerie._pr_not_verified(data, lambda _s: True).get(GROUP, [])
 
 
 def _forbid(leerie, st, monkeypatch) -> None:

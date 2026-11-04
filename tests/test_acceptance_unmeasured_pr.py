@@ -78,8 +78,8 @@ def _finish(leerie, st, sets, final):
 
 
 def _nhv_line(body: str, needle: str) -> str:
-    assert "## Needs human verification" in body, body
-    nhv = body.split("## Needs human verification", 1)[1]
+    assert "## Not verified by this run" in body, body
+    nhv = body.split("## Not verified by this run", 1)[1]
     assert HEADING in nhv, nhv
     line = next(x for x in nhv.splitlines() if needle in x)
     # The line sits under its own group heading, not another group's.

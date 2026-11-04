@@ -237,7 +237,7 @@ def test_an_unmeasurable_shipping_tree_is_an_explicit_unknown(
     asyncio.run(leerie._refresh_shipping_test_id_diff(
         run_dir, st, broken_run["caps"], label="test-id-diff-final"))
     assert "test_id_diff" not in st.data
-    groups = leerie._pr_needs_human(st.data, lambda sid: True)
+    groups = leerie._pr_not_verified(st.data, lambda sid: True)
     lines = groups["Regression checks the run could not settle"]
     assert len(lines) == 1 and "runner missing" in lines[0]
     assert "not measured on the tree that ships" in lines[0]

@@ -5,8 +5,8 @@ The driver: the user's 0.44.0 run 48c48629 (barnacle#665) put "Check
 `src/scraper/session-shared.ts` … (D8) is resolved" under "Needs human
 verification" — a reading of the repository's own code, under the heading
 kept for a resource a human must bring. The delivery judge now settles each
-such site with citations code verifies; what it does not settle is
-advisory. Each test executes the renderer or the gate pass and reads the
+such site with citations code verifies; what it does not settle is listed
+under "Not verified by this run". Each test executes the renderer or the gate pass and reads the
 rendered text or the recorded settlement.
 """
 from __future__ import annotations
@@ -46,18 +46,18 @@ def test_a_settled_site_renders_nothing(leerie):
     assert leerie._format_pr_end_state_section(state) == ""
 
 
-def test_an_unsettled_site_is_advisory_with_the_judges_evidence(leerie):
+def test_an_unsettled_site_is_not_verified_with_the_judges_evidence(leerie):
     for settlement, tail in (
             (None, ""),
             ({"settled": False, "evidence": "the helper is still copied"},
              " — the delivery judge: the helper is still copied")):
         sec = leerie._format_pr_end_state_section(
             {"site_claims": _claims(settlement)})
-        assert sec.startswith("\n## Advisory (not verified by this run)\n")
-        assert (ADVISORY + "\n- `src/scraper/session-shared.ts` `module "
+        assert sec.startswith("\n## Not verified by this run\n")
+        assert (ADVISORY + "\n- [ ] `src/scraper/session-shared.ts` `module "
                 "(shared session helpers)` (D8): share one session helper"
                 + tail) in sec, sec
-        assert "(D1)" not in sec and "- [ ]" not in sec
+        assert "(D1)" not in sec and "Needs human verification" not in sec
 
 
 def _gate(leerie, tmp_path, monkeypatch, site_verdicts) -> dict:

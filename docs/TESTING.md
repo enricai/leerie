@@ -5014,15 +5014,37 @@ the user's 0.44.0 run 48c48629, barnacle#665, listed a `surface_other` site
 under "Needs human verification"), in `tests/test_untyped_site_settlement.py`
 (5 functions): such a site renders no "Needs human verification" entry
 whether unsettled, voted unresolved or settled; a settled one renders
-nothing; an unsettled one is advisory, with the judge's evidence when it
+nothing; an unsettled one is under "Not verified by this run", with the
+judge's evidence when it
 gave one; and `_delivery_judge_unmet`, its judge stubbed, asks for the site
 in the contract pack's prompt (and not for a typed site), settles it on a
 `resolved` vote whose quote is the tree's own line, and settles nothing on
 a fabricated quote, an empty `cites` or a `resolved: false`.
-`tests/test_pr_end_state.py`'s full-state line moves to the advisory form.
+`tests/test_pr_end_state.py`'s full-state line moves to that section.
 Falsified 2026-11-04: on the parent's code all 5 and the full-state case
 fail; with the citation check replaced by `True`, the fabricated-quote case
 fails.
+
+**Only a typed external resource reaches "Needs human verification"**
+(DESIGN §6; the user's runs 48c48629, barnacle#665, and ebe36d49,
+barnacle#670, listed a fix site to read, a confirm budget that ran out and
+intermittent test IDs there), in `tests/test_needs_human_sources_render.py`:
+`test_only_a_typed_external_resource_reaches_needs_human` builds one state
+with an entry of every source — every `needs_human_verification` source
+derived from the code, a blocker and an external risk with and without a
+resource, a simulated interleaving, an unmeasured held-out set, an
+intermittent failure, an unsettled untyped site — and fails on any line
+under "Needs human verification" that is not a typed external entry, or on
+any other entry missing from "Not verified by this run"; the per-source
+case places each derived source in its section. Callers that read the
+non-external groups moved from `_pr_needs_human` to `_pr_not_verified`
+(`test_bstar_confirm`, `test_bstar_sized_passes`, `test_test_outcome_settlement`,
+`test_nhv_one_fact_instruction_first`, `test_forbidden_commands`,
+`test_bstar_one_off_flake_budget`, `test_final_test_id_diff_ships`), and
+the body-reading cases (`test_delivery_detection`,
+`test_acceptance_held_case_intermittent`, `test_acceptance_unmeasured_pr`,
+`test_risk_register`, `test_pr_end_state`, `test_untyped_site_settlement`)
+read the new section.
 
 **The coverage re-drive** (DESIGN §9 *Changed lines no test executes are
 re-driven*), in `tests/test_coverage_redrive.py`: real git worktrees and a
@@ -6789,9 +6811,10 @@ sample's probe never counts for the next.
   and `tests/test_hidden_dirt.py` assert the same contract: what a setting
   hid is the file's own line, and every key DESIGN §8 lists is put back by
   either checker half alone.
-- `tests/test_needs_human_sources_render.py` (14 tests, DESIGN §6 *The
-  PR's end-state section*, review round 14 H1): every "Needs human
-  verification" source the code can write renders in the PR; the sources
+- `tests/test_needs_human_sources_render.py` (7 test functions, 15
+  cases; DESIGN §6 *The PR's end-state section*, review round 14 H1):
+  every "Needs human verification" source the code can write renders in
+  the PR; the sources
   are derived from the code (`*_GAP_SOURCE` constants and literal `source`
   keys of dicts written to `needs_human_verification`), never listed by
   hand.

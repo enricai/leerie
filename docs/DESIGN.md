@@ -6841,19 +6841,33 @@ richer body must never block finalize success.
 
 **The PR's end-state section is rendered by code, from typed state, on
 every composition path.** `_format_pr_end_state_section` turns what the run
-recorded into at most six short lists, each under its own heading, each
+recorded into at most seven short lists, each under its own heading, each
 present only when it has an entry:
 
 - `## Unconverged` — why the PR is a draft: the outcome decider's reasons
   (§6 *The run outcome is decided once*) and every `unconverged` subtask
   with its own reason.
 - `## Needs human verification` — one checkbox list, grouped by the
-  resource a human must supply: the task's required items the classifier
-  typed `external`, subtasks accepted on an `external_precondition`
-  blocker (§13), risks a worker typed `gap: unverified_external` (a
-  concurrency risk whose tests can only stub the interleaving is labelled
-  so — `simulated_interleaving`), and held-out acceptance sets the final tree left unmeasured, with why (§8
-  *A held-out set the final tree leaves unmeasured is never silent*).
+  resource a human must supply, and only entries that carry a typed
+  external resource: the task's required items the classifier typed
+  `verifiability: external`, subtasks accepted on an
+  `external_precondition` blocker that names its `resource` (§13), and
+  risks a worker typed `gap: unverified_external` with the `resource`
+  it names (§9 *Only an entry naming an external resource is
+  external*).
+- `## Not verified by this run` — everything else the run could not
+  settle, grouped by why: required items whose only evidence is a
+  worker's command or whose judge crashed, regression checks the confirm
+  budget or a sized-out pass left open, intermittent failures the run may
+  have introduced, held-out acceptance sets the final tree left
+  unmeasured (§8 *A held-out set the final tree leaves unmeasured is
+  never silent*), concurrency risks whose tests only simulate the
+  interleaving (`simulated_interleaving`), a blocker that names no
+  resource, and audited fix sites resting on an untyped (`other`) change
+  that the delivery gate did not settle (§8 *A site resting on an
+  untyped resolution is settled by the run*). Each is a limit on what the
+  run measured, stated with its reason; the reviewer may check it, but
+  nothing outside the repository is needed to.
 - `## Untested after re-drive` — changed lines that no test executes after
   the coverage re-drive spent its rounds (§9 *Changed lines no test
   executes are re-driven*). Listed, never a reason to draft.
@@ -6862,19 +6876,33 @@ present only when it has an entry:
 - `## Repository merge checks still red` — the CI-parity checks confirmed
   red on the final tree (§9 *The repository's own merge checks run too*).
 - `## Advisory (not verified by this run)` — the whole-PR review's verified
-  findings, the contract-literal flags, the site-token hits (§8, §9) and
-  the audited fix sites resting on an untyped (`other`) change that the
-  delivery gate did not settle (§8 *A site resting on an untyped
-  resolution is settled by the run*), labelled advisory because nothing
-  waited on them. A check of the repository's own code is never a
-  "Needs human verification" entry: that list is for what a human must
-  bring.
+  findings, the contract-literal flags and the site-token hits (§8, §9),
+  labelled advisory because nothing waited on them.
+
+*Only a typed external resource reaches "Needs human verification".* The
+section answers one question — what must a human bring that the run could
+not — and an entry the run could have settled with more budget, a rerun or
+a reading of its own code answers a different one. 0.44.0 stated the rule
+for risks only, and the renderer still filed every other source there: the
+user's run 48c48629 (barnacle#665) listed an untyped fix site to read, and
+run ebe36d49 (barnacle#670) "Check by hand that no existing test newly
+fails … the confirm budget ran out after 2 of 3 base/final rerun pair(s)"
+and intermittent test IDs, none of which needs anything outside the
+repository; the user found the section confusing for it. So the rule is
+structural: the "Needs human verification" renderer reads only the three
+typed external shapes above, and every other source renders under "Not
+verified by this run" through its own function. A guard test builds one
+entry of every source — the ones derived from the code's writers and the
+ones read from other state — and fails on any line in "Needs human
+verification" that did not come from a typed external resource.
 
 *Every entry the run records for a human renders.* The invariant: an
-entry in `needs_human_verification` is a check the run handed to a human,
-so the PR shows every one of them — a group per source where the source
-has one, and an "Other checks the run could not make" group for any
-source that does not. Review round 14 H1 drove the root cause: the
+entry in `needs_human_verification` is a check the run could not make
+itself, so the PR shows every one of them — under "Needs human
+verification" when it carries a typed external resource, else under "Not
+verified by this run", in a group per source where the source has one, and
+an "Other checks the run could not make" group for any source that does
+not. (The state key keeps its name.) Review round 14 H1 drove the root cause: the
 renderer was a hand-kept chain of one branch per source, unconnected to
 the writers, so the two sources that round added — a final delivery
 judge that crashed on every attempt (`delivery_judge_unknown`) and a
@@ -11663,8 +11691,8 @@ fabricated quote settles nothing. The settlement is recorded on the
 site's `site_claims` row and re-taken by every pass that asks the
 contract, so the last tree judged decides. A settled site is not shown.
 One the gate did not settle — never asked (no gate ran, it crashed), voted
-unresolved, or cited nothing that verifies — is listed under "Advisory
-(not verified by this run)" with the judge's evidence when it gave one,
+unresolved, or cited nothing that verifies — is listed under "Not
+verified by this run" with the judge's evidence when it gave one,
 never under "Needs human verification". It does not gate: the contract
 verdict already judges every audited site, and an unmet contract is what
 re-drives.
@@ -14961,6 +14989,14 @@ Two further disciplines sit at the §12 axis:
      runs: of 39 unaddressed external entries, 36 named no resource, every
      one of them an `exercised: false` note — "docs-only change", "Diff is
      a test only", "I only ran the two changed test files" — and 3 did.
+     The rule binds every source the PR renders, not risks alone: a
+     regression check the confirm budget left open, an intermittent
+     failure, an unmeasured held-out set or an unsettled fix site is a
+     limit on what the run measured, rendered under "Not verified by this
+     run" with its reason, never as a human check (§6 *Only a typed
+     external resource reaches "Needs human verification"*). A risk whose
+     tests only simulate an interleaving names no resource either, so it
+     is listed there too.
   2. **Routed by type, never dumped.** `gap: unverified_external` with its
      `resource` reaches the PR's "Needs human verification" list, grouped
      by that resource (§6 *Finalization*);

@@ -206,7 +206,7 @@ class TestGate:
         assert entries[0]["detail"] == (
             "Check by hand that no existing test newly fails: why it is "
             f"open (required by: {NO_REGRESSIONS})")
-        groups = leerie._pr_needs_human(st.data, lambda sid: True)
+        groups = leerie._pr_not_verified(st.data, lambda sid: True)
         assert any(NO_REGRESSIONS in line
                    for lines in groups.values() for line in lines)
         leerie._set_test_outcome_gap(st, [])

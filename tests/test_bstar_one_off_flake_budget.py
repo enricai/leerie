@@ -103,7 +103,7 @@ def test_a_one_off_flake_the_budget_cut_is_unsettled_not_new(
         assert len(gaps) == 1 and ("could not confirm within the budget: "
                                    "tests/test_suite.py") in gaps[0]["detail"]
         # The PR lists it under the checks the run could not settle.
-        groups = leerie._pr_needs_human(st.data, lambda _s: True)
+        groups = leerie._pr_not_verified(st.data, lambda _s: True)
         assert any("could not confirm within the budget" in line
                    for line in groups.get(
                        "Regression checks the run could not settle", []))

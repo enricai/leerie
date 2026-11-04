@@ -7086,6 +7086,7 @@ _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     _RISK_SECTION_HEADING,
     "## Unconverged",
     "## Needs human verification",
+    "## Not verified by this run",
     "## Untested after re-drive",
     "## Integration content loss",
     "## Repository merge checks still red",
@@ -7223,7 +7224,66 @@ def _needs_human_detail_groups() -> dict[str, str]:
 def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
                     ) -> dict[str, list[str]]:
     """The "Needs human verification" checkboxes, grouped by the resource a
-    human must supply, in first-seen order and de-duplicated."""
+    human must supply, in first-seen order and de-duplicated. Only the three
+    shapes that carry a typed external resource are read here (DESIGN §6
+    *Only a typed external resource reaches "Needs human verification"*):
+    a required item the classifier typed `verifiability: external`, a
+    `blocker` naming its `resource`, and an unaddressed risk typed `gap:
+    unverified_external` with its `resource`. Everything else the run could
+    not settle is `_pr_not_verified`'s."""
+    groups: dict[str, list[str]] = {}
+
+    def add(group: str, line: str) -> None:
+        bucket = groups.setdefault(group, [])
+        if line not in bucket:
+            bucket.append(line)
+
+    for e in state.get("needs_human_verification") or []:
+        if not isinstance(e, dict):
+            continue
+        if e.get("source") == "required_item" and _pr_entry(e.get("item")):
+            add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
+        elif (e.get("source") == "blocker"
+              and isinstance(e.get("subtask"), str)
+              and _pr_entry(e.get("resource"))):
+            add(_pr_entry(e.get("resource")),
+                f"- [ ] **{e['subtask']}** was not done, waiting on it: "
+                f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
+    for sid, e in _pr_open_risks(state, in_pr):
+        resource = _pr_entry(e.get("resource"))
+        # External only with the resource a human must supply: an entry
+        # recorded without one (an older leerie typed every unexercised
+        # path external) is a gap the run's own checks answer (DESIGN §9).
+        if e.get("gap") == "unverified_external" and resource:
+            add(resource, f"- [ ] **{sid}**: {_pr_entry(e.get('detail'))}"
+                + _pr_paths(e.get("where_paths"))
+                + (" — tests simulate the interleaving"
+                   if e.get("simulated_interleaving") is True else ""))
+    return groups
+
+
+def _pr_open_risks(state: dict, in_pr: Callable[[str], bool]
+                   ) -> list[tuple[str, dict]]:
+    """`(sid, entry)` for every unaddressed `risk_register` entry with a
+    detail, of a subtask whose work the PR contains."""
+    out: list[tuple[str, dict]] = []
+    register = state.get("risk_register")
+    for sid, entries in (register.items()
+                         if isinstance(register, dict) else ()):
+        if not in_pr(sid) or not isinstance(entries, list):
+            continue
+        out += [(sid, e) for e in entries
+                if isinstance(e, dict) and e.get("addressed") is not True
+                and _pr_entry(e.get("detail"))]
+    return out
+
+
+def _pr_not_verified(state: dict, in_pr: Callable[[str], bool]
+                     ) -> dict[str, list[str]]:
+    """The "Not verified by this run" checkboxes: every check the run could
+    not settle that needs nothing outside the repository, grouped by why
+    (DESIGN §6 *Only a typed external resource reaches "Needs human
+    verification"*), in first-seen order and de-duplicated."""
     groups: dict[str, list[str]] = {}
 
     def add(group: str, line: str) -> None:
@@ -7237,12 +7297,13 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             continue
         source = e.get("source")
         if source == "required_item":
-            if _pr_entry(e.get("item")):
-                add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
-        elif source == "blocker" and isinstance(e.get("subtask"), str):
-            add(_pr_entry(e.get("resource")) or "Unnamed resource",
-                f"- [ ] **{e['subtask']}** was not done, waiting on it: "
-                f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
+            continue
+        if source == "blocker":
+            if (isinstance(e.get("subtask"), str)
+                    and not _pr_entry(e.get("resource"))):
+                add("Work waiting on a precondition no one named",
+                    f"- [ ] **{e['subtask']}** was not done, waiting on: "
+                    f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
         elif _pr_entry(e.get("detail")):
             # Every other entry is a `detail` line. One a group table does
             # not name still renders: an entry in state that the PR leaves
@@ -7260,31 +7321,17 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             "base; it imports "
             + ", ".join(_pr_code(p) for p in row.get("imports_changed") or [])
             + " (changed here). Re-run it repeatedly before merging.")
-    register = state.get("risk_register")
-    for sid, entries in (register.items()
-                         if isinstance(register, dict) else ()):
-        if not in_pr(sid) or not isinstance(entries, list):
-            continue
-        for e in entries:
-            if not isinstance(e, dict) or e.get("addressed") is True:
-                continue
-            simulated = e.get("simulated_interleaving") is True
-            resource = _pr_entry(e.get("resource"))
-            # External only with the resource a human must supply: an
-            # entry recorded without one (an older leerie typed every
-            # unexercised path external) is a gap the run's own checks
-            # answer, not a check for a human (DESIGN §9).
-            if not simulated and not (
-                    e.get("gap") == "unverified_external" and resource):
-                continue
-            detail = _pr_entry(e.get("detail"))
-            if not detail:
-                continue
-            group = resource or "A real concurrent engine"
-            add(group, f"- [ ] **{sid}**: {detail}"
+    for sid, e in _pr_open_risks(state, in_pr):
+        if (e.get("simulated_interleaving") is True
+                and not (e.get("gap") == "unverified_external"
+                         and _pr_entry(e.get("resource")))):
+            add("Concurrency the tests only simulate",
+                f"- [ ] **{sid}**: {_pr_entry(e.get('detail'))}"
                 + _pr_paths(e.get("where_paths"))
-                + (" — tests simulate the interleaving" if simulated
-                   else ""))
+                + " — tests simulate the interleaving")
+    for line in _untyped_site_lines(state):
+        add("Fix sites resting on an untyped change the run did not settle",
+            line)
     return groups
 
 
@@ -7300,9 +7347,9 @@ def _untyped_sites(state: dict) -> list[dict]:
 
 
 def _untyped_site_lines(state: dict) -> list[str]:
-    """The advisory lines for the untyped sites the gate did not settle —
-    never a human check: the run can read its own code (DESIGN §6 *The
-    PR's end-state section*)."""
+    """The "Not verified by this run" lines for the untyped sites the gate
+    did not settle — never a human check: the run can read its own code
+    (DESIGN §6 *The PR's end-state section*)."""
     out: list[str] = []
     for row in _untyped_sites(state):
         settlement = row.get("settlement")
@@ -7313,7 +7360,7 @@ def _untyped_site_lines(state: dict) -> list[str]:
         ev = (_pr_entry(settlement.get("evidence"))
               if isinstance(settlement, dict) else "")
         out.append(
-            f"- {where or 'the site'} ({_pr_entry(row.get('site_id'))}): "
+            f"- [ ] {where or 'the site'} ({_pr_entry(row.get('site_id'))}): "
             f"{_pr_entry(row.get('resolution')) or 'no resolution recorded'}"
             + (f" — the delivery judge: {ev}" if ev else ""))
     return out
@@ -7360,8 +7407,6 @@ def _pr_advisory(state: dict) -> list[str]:
                     + f"({_pr_entry(r.get('why')) or 'flagged'})")
     block("Contract literals another subtask may not honour",
           "contract_literal_checks", rows)
-    block("Fix sites resting on an untyped change the run did not settle",
-          "site_claims", _untyped_site_lines(state))
     acc = state.get("acceptance")
     gate = acc.get("gate") if isinstance(acc, dict) else None
     final = gate.get("final") if isinstance(gate, dict) else None
@@ -7391,9 +7436,10 @@ def _pr_advisory(state: dict) -> list[str]:
 def _format_pr_end_state_section(state: dict) -> str:
     """The PR body's end-state section, rendered from typed run state, or ""
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
-    rendered by code, from typed state*). Up to six headed lists, each only
-    when non-empty, in this order: `## Unconverged` (why the PR is a draft),
-    `## Needs human verification`, `## Untested after re-drive`,
+    rendered by code, from typed state*). Up to seven headed lists, each
+    only when non-empty, in this order: `## Unconverged` (why the PR is a
+    draft), `## Needs human verification` (typed external resources only),
+    `## Not verified by this run`, `## Untested after re-drive`,
     `## Integration content loss`, `## Repository merge checks still red`,
     `## Advisory (not verified by this run)`.
 
@@ -7449,6 +7495,14 @@ def _format_pr_end_state_section(state: dict) -> str:
         for group, items in groups.items():
             lines += [f"**{group}**", *items, ""]
         sections.append(("## Needs human verification", lines[:-1]))
+
+    groups = _pr_not_verified(state, in_pr)
+    if groups:
+        lines = ["Checks the run could not settle, each with why. None needs "
+                 "anything outside the repository.", ""]
+        for group, items in groups.items():
+            lines += [f"**{group}**", *items, ""]
+        sections.append(("## Not verified by this run", lines[:-1]))
 
     lines = []
     for sid, rec in sorted(_dict("coverage_redrive").items()):

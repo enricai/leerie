@@ -275,7 +275,7 @@ def test_a_kept_groups_unsettled_candidates_are_listed(leerie):
     assert "not rerun (sized out of the budget): tests/b.py" in e["detail"]
     assert "a re-drive group that was kept" in e["detail"]
     assert "no existing test breaks" in e["detail"]
-    groups = leerie._pr_needs_human(st.data, lambda _s: True)
+    groups = leerie._pr_not_verified(st.data, lambda _s: True)
     assert groups["Regression checks the run could not settle"]
 
 
