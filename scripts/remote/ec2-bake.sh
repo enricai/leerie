@@ -122,6 +122,11 @@ printf 'set -a\n. %s\nset +a\n' "$LEERIE_ENV_FILE" > /etc/profile.d/leerie.sh
 # --- Claude Code CLI (pinned spec comes from the Dockerfile) ---
 export PATH=/usr/local/share/mise/installs/node/lts-current/bin:$PATH
 npm install -g "$CLAUDE_SPEC"
+# The Dockerfile's link: `claude` alone, first on the image PATH, so the
+# worker CLI never resolves through a mise shim (DESIGN §6½ *A repository's
+# pinned runtime is the one its commands run*).
+mkdir -p /opt/leerie-vendor/bin
+ln -sfn /usr/local/share/mise/installs/node/lts-current/bin/claude /opt/leerie-vendor/bin/claude
 
 git config --system --add safe.directory '*'
 

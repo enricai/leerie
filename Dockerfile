@@ -222,13 +222,13 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="${MISE_VERSION}" sh \
 # a repo with `.nvmrc: 20.11.0` would silently run on baked LTS.
 #
 # NODE_COREPACK=false: mise's own `corepack enable` after a Node install
-# writes its shims next to the first `corepack` on PATH — the baked LTS
-# Node's bin below, whatever version mise installed — which a confined
-# toolchain install may not write (EROFS) and, unconfined, overwrote the
-# baked Node's pnpm. The baked Node is enabled into its own bin in the
-# `lts-current` step; leerie enables each version mise installs at runtime
-# into that version's bin (`_enable_corepack_shims`; DESIGN §6 *Each Node
-# version's corepack shims go in its own `bin`*). corepack still honors
+# writes its shims next to the first `corepack` on PATH, whatever version
+# mise installed — under the PATH this image had until 0.44.3, the baked LTS
+# Node's bin, which a confined toolchain install may not write (EROFS) and,
+# unconfined, overwrote the baked Node's pnpm. The baked Node is enabled into
+# its own bin in the `lts-current` step; leerie enables each version mise
+# installs at runtime into that version's bin (`_enable_corepack_shims`;
+# DESIGN §6 *Each Node version's corepack shims go in its own `bin`*). corepack still honors
 # package.json's `packageManager` — repo's pinned pnpm version wins.
 #
 # RUBY_COMPILE=false uses precompiled Ruby binaries instead of building
@@ -287,27 +287,34 @@ RUN set -eux; \
         --install-directory "${node_dir%/}/bin"; \
     test -L "${node_dir%/}/bin/pnpm"
 
-# PATH order:
-#   1. mise's system shims (mise install --system populates these).
-#   2. LTS Node bin (image-baked claude lives here).
-#   3. mise's user-dir shims (MISE_DATA_DIR/shims, populated at runtime by
-#      `mise install` reading a repo's .tool-versions / .ruby-version /
-#      rust-toolchain.toml — see DESIGN §6½ "Worker-driven install"). A
-#      mise shim resolves the active version from the caller's cwd at
-#      invocation time, so simply being on PATH doesn't hardcode a
-#      version — it just lets a worker's own ad-hoc Bash commands (e.g.
-#      `bin/rails test`) find a runtime that phase_provision already
-#      installed, instead of failing with e.g. `env: 'ruby': No such
-#      file or directory` and having to rediscover `mise exec --` from
-#      scratch every single worker session. Placed after #1/#2 so a
-#      repo pinning its own Node/Python version can never shadow the
-#      baked LTS Node that hosts `claude` itself.
-#   4. (then the pre-existing PATH)
+# PATH order (DESIGN §6½ *A repository's pinned runtime is the one its
+# commands run*):
+#   1. /opt/leerie-vendor/bin — leerie's own CLI, `claude`, alone (linked
+#      after its install below). The worker CLI is leerie's, not the
+#      repository's: it must never resolve through a mise shim, which picks a
+#      version from the caller's cwd and, for a pinned version not yet
+#      installed, tries to install it first (measured: `claude --version` in
+#      a tree whose `.nvmrc` named an uninstalled 22.19.0 exited 1 on that
+#      install). Nothing else lives here, so it shadows no repository tool.
+#   2. mise's user-dir shims (MISE_DATA_DIR/shims, populated by `mise
+#      install`/`mise reshim`, which shim the image's baked tools too). A
+#      shim resolves the version the caller's cwd pins — `.nvmrc`,
+#      `.python-version`, `.tool-versions` — so a repository's builds, tests
+#      and installs, and a worker's own ad-hoc Bash commands, run the
+#      version the repository chose; with nothing pinned it falls through
+#      to the next entry. Ahead of every concrete install's `bin`: when the
+#      baked LTS Node's `bin` came first, bare `node`/`npm`/`pnpm` were Node
+#      24 in a tree pinning 22.19.0 (measured, leerie 0.44.1).
+#   3. LTS Node bin: the fallback when nothing is pinned, and the only
+#      `node` before any `mise reshim` has run in a fresh MISE_DATA_DIR.
+#   4. (then the pre-existing PATH; /usr/bin/python3 is the unpinned Python)
 #   5. /home/leerie/.local/bin — where `pip install --user` puts console
 #      scripts (e.g. pre-commit). Deliberately LAST: image-baked tooling
 #      must win, so a user-installed package can never shadow a baked-in
 #      binary. Pinned by tests/test_dockerfile_path.py.
-ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:/home/leerie/.local/share/mise/shims:$PATH:/home/leerie/.local/bin
+# There is no system shims directory: `mise install --system` makes none
+# (measured, leerie 0.44.1: /usr/local/share/mise/shims does not exist).
+ENV PATH=/opt/leerie-vendor/bin:/home/leerie/.local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:$PATH:/home/leerie/.local/bin
 
 # Claude Code CLI. Leerie enforces ≥ 2.1.22 at runtime (leerie.py:1245) for
 # --json-schema. The install is pinned ≥ 2.1.219: that release fixed `claude
@@ -325,8 +332,13 @@ ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-cur
 # enforced for that flag only by MIN_CLAUDE_CLI_STRICT_OUTPUT).
 # Installs globally against the LTS Node — lands at
 # /usr/local/share/mise/installs/node/lts-current/lib/node_modules
-# with a bin shim at .../bin/claude (on PATH via the line above).
-RUN npm install -g '@anthropic-ai/claude-code@>=2.1.289'
+# with a bin link at .../bin/claude, linked into /opt/leerie-vendor/bin,
+# first on PATH (above), so `claude` is this install whatever version a
+# repository pins.
+RUN npm install -g '@anthropic-ai/claude-code@>=2.1.289' \
+    && mkdir -p /opt/leerie-vendor/bin \
+    && ln -s /usr/local/share/mise/installs/node/lts-current/bin/claude /opt/leerie-vendor/bin/claude \
+    && test -x /opt/leerie-vendor/bin/claude
 
 # A pinned JS-API `typescript` for leerie's two AST scripts
 # (scripts/load-typescript.cjs falls back to it when the tree under test's

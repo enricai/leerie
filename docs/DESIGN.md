@@ -4571,7 +4571,9 @@ then died enabling corepack: "EROFS: read-only file system, unlink
 mise run each new version's `corepack enable` (`MISE_NODE_COREPACK=true`),
 and `corepack enable` without `--install-directory` writes its shims next
 to the first `corepack` on `PATH` — the image's baked LTS Node, whose `bin`
-comes before `MISE_DATA_DIR` on `PATH`, not the version just installed.
+came before `MISE_DATA_DIR` on `PATH` through 0.44.3 (§6½ *A repository's
+pinned runtime is the one its commands run*), not the version just
+installed.
 Confined, that is a write outside the toolchain kind's grant; before
 confinement it silently replaced the baked Node's own `pnpm` and `yarn`
 with links into another version's corepack. **Invariant: every Node
@@ -4590,16 +4592,68 @@ run is enabled by the next one.
 
 Whether a version needs shims of its own was measured rather than assumed
 (leerie 0.44.1 image, a tree whose `.nvmrc` says 22.19.0, a confined
-measurement): no command leerie runs reaches them through a bare `pnpm` —
-the baked Node's `bin` is first on `PATH`, so bare `node`, `pnpm` and
-`corepack` are the baked Node's, and leerie's pnpm pin
-(`_COREPACK_PIN_ENV`, `_seed_pnpm_pin`'s bare `corepack`) goes through
-them. What does reach them is the version's own toolchain: `mise exec --
-pnpm` resolves `pnpm` from the active version's `bin` first, and with
-that `bin` first on `PATH` `pnpm` is that version's corepack, still at the
-pinned pnpm (10.4.1), with `pnpm exec node` at 22.19.0. Without its own
-shims a pinned version would silently borrow the baked Node's corepack.
-So the shims stay, made where they belong.
+measurement): bare `pnpm` and `corepack` in that tree are the pinned
+version's (§6½ *A repository's pinned runtime is the one its commands
+run*), as are `mise exec -- pnpm` and leerie's pnpm pin seed
+(`_seed_pnpm_pin`'s bare `corepack`): `pnpm` is that version's corepack,
+still at the pinned pnpm (10.4.1), with `pnpm exec node` at 22.19.0.
+Without its own shims a pinned version would silently borrow the baked
+Node's corepack. So the shims stay, made where they belong.
+
+**One toolchain install at a time on a host, against mise's own
+completeness record.** *Designed 2026-11-04 (three barnacle runs at
+03:11).* Three runs on one host began provisioning together. Every run
+shares one `MISE_DATA_DIR` (the bind-mounted `~/.cache/leerie/mise-data`).
+Two died installing node 22.19.0 at the corepack step above. The third
+printed "mise all tools are installed" and went on with "resolved
+versions: node 22.19.0": it had taken another run's install, still in
+progress, for a finished one. That install then failed and mise removed
+it, leaving `installs/node/22.19 -> ./22.19.0` dangling. mise does have the
+guard this needs, but in the wrong place. Its install takes a lock and
+re-checks after waiting, and "installed" means the install directory
+exists *and* no `incomplete` marker exists. The marker is made before the
+first byte is extracted and removed only after the post-install steps
+(mise v2026.5.4: `src/backend/mod.rs` `install_version`,
+`is_version_installed`, `create_install_dirs`). Both the lock
+(`lock_file.rs`) and the marker (`install_state.rs`) live in mise's
+*cache* directory, `MISE_CACHE_DIR`, which defaults to
+`$XDG_CACHE_HOME/mise`. A confined command's `XDG_CACHE_HOME` is its own
+private temp directory, so each install had a lock no one else took and a
+marker no one else saw, over a data directory everyone shares. Measured in
+one container with two cache directories: a second `mise install` started
+while the first was extracting printed "all tools are installed". With one
+cache directory it waited for the lock and returned without reinstalling.
+The dangling alias is how an install that trusted another's half-finished
+one looks after that one fails: the trusting run had rebuilt the
+version's aliases. A failed install on its own leaves nothing (mise's
+error cleanup removes the directory and the marker), and mise's next
+install removes a dangling alias (both measured).
+
+**Invariant: a toolchain install never trusts another's unfinished
+install, and leerie's own steps on an installed version are serialised
+with the install.** Two parts.
+
+1. mise's cache travels with its data: every kind that writes
+   `MISE_DATA_DIR` (the toolchain install, the setup hook) gets
+   `MISE_CACHE_DIR=$MISE_DATA_DIR/cache`. mise's own lock and completeness
+   check then hold across every run that shares the data. A crashed
+   install's marker outlives its container, so the next install redoes it
+   instead of trusting it. That cache is part of the data's state, not a
+   command's scratch, and it is shared exactly as widely as the data is.
+2. Leerie holds one host-wide lock across `mise install` and
+   `_enable_corepack_shims`: an exclusive `flock` on `mise-install.lock`
+   in the host directory every run shares (beside the build slots; the
+   state root's `.host` where there is none). The enable step is leerie's
+   and runs outside mise's lock. Without the host lock, two runs could
+   find the same version without shims and enable it at once, or one
+   could use a version whose shims another is still making. The lock is
+   not in `MISE_DATA_DIR`: a confined command can open that directory,
+   and Landlock does not govern `flock`, so a command could hold the lock
+   against every other run. No grant reaches the host directory.
+
+No leerie code removes a failed install's leftovers: mise removes them
+under its own lock, and with the lock shared no other install can see
+the gap.
 
 **A worker's temp directory is short and private too.** *Designed
 2026-11-03 (the live 0.43.0 barnacle runs).* A worker's `TMPDIR` was
@@ -10336,6 +10390,44 @@ classification and planning, layered top-to-bottom by determinism:
    resolver checks the per-run cache first, falls through to the
    image-baked layer. Runtime selection has no model in the loop; the
    version manager's parser is the enforcement.
+
+   **A repository's pinned runtime is the one its commands run.**
+   *Designed 2026-11-04 (barnacle's `.nvmrc`, found proving the corepack
+   fix in §6).* Installing the pinned version is not enough: a command
+   runs whatever `PATH` finds first. The image put the baked LTS Node's
+   `bin` ahead of `MISE_DATA_DIR/shims`, so in a confined measurement on a
+   tree whose `.nvmrc` said 22.19.0, after leerie's own `mise install` had
+   installed it, bare `node` was v24.22.2, `npm` 11.19.1 and `pnpm exec
+   node` v24.22.2 (leerie 0.44.1 image, real `_run_mise_install` and
+   `_run_streaming`): the repository's builds, tests and installs ran on a
+   Node it did not choose, and could differ from its own CI. Python was
+   already right (`.python-version` 3.11 gave 3.11.18) because no
+   concrete Python `bin` precedes the shims; Ruby has no baked version to
+   shadow. The order existed so that a repository's pin "can never shadow
+   the baked LTS Node that hosts `claude`". **Invariant: the version a
+   repository pins is the version its commands run; the baked LTS is only
+   the fallback when nothing is pinned; and leerie's own CLI is never
+   chosen by the repository.** So `MISE_DATA_DIR/shims` comes before every
+   concrete install's `bin` — a mise shim resolves the version the
+   caller's cwd pins and, with none pinned, falls through to the next
+   entry, the baked LTS Node's `bin` — and `claude`, which is leerie's and
+   not the repository's, is linked alone into a directory ahead of both
+   (`/opt/leerie-vendor/bin`). It must not go through a shim: the CLI is a
+   native binary that needs no Node, but its shim resolves from the
+   caller's cwd, and in a tree pinning a version not yet installed mise
+   tries to install that version before running anything — `claude
+   --version` there exited 1 (measured). The order, not a per-command
+   `mise exec`, carries the invariant, so it holds for every command:
+   leerie's measurements, a worker's own Bash, a setup hook. After the
+   change the same measurement gives `node` v22.19.0, `npm` 10.9.3, `pnpm
+   exec node` v22.19.0, and in a tree of the same repository pinning
+   nothing `node` v24.22.2. Leerie's other Node users: its pnpm pin seed
+   (`_seed_pnpm_pin`) now runs the pinned version's `corepack`, which
+   seeds the same `COREPACK_HOME` (pnpm 10.4.1 either way); its AST
+   scripts run on the tree's Node, as they load the tree's own
+   `typescript`, and parse under 22.19.0 with the bundled one. The
+   operator-visible change is that a repository pinning a Node version now
+   builds and tests on it.
 3. **Deterministic install-command detection.** A lockfile-keyed table
    maps observable file presence to the install command(s): a pnpm
    lockfile means `pnpm install`, a `uv.lock` means `uv sync`, a
