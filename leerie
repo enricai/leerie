@@ -6897,7 +6897,10 @@ _snapshot_leerie_code "$LEERIE_REPO" "$_code_snapshot" || {
 # `leerie promptresume <run-id> …` spent about 10 minutes on the image steps
 # before the container's parser refused it. The parser is the snapshot's,
 # the code this launch runs. `-I -S`: stdlib only, as the host's other
-# helpers; `check_command_line` builds the parser and parses, and reads no
+# helpers; `check_command_line` builds the parser and parses. For a local
+# `resume` naming a run it also resolves the run in the state root the
+# container will mount, so a run ID naming no run stops here: a mistyped one
+# waited 16 minutes on two image builds (2026-11-04). It reads no other
 # state. A module this host's python3 cannot load is left to the container,
 # whose parser still refuses the line (only the parser's own exit stops the
 # launch here).
@@ -6942,8 +6945,9 @@ try:
     check = m.check_command_line
 except Exception:
     sys.exit(0)
-sys.exit(check(sys.argv[3:]))
+sys.exit(check(sys.argv[4:], state_root=sys.argv[3] or None))
 ' "$_code_snapshot/orchestrator/leerie.py" "$HOME/.cache/leerie/bytecode" \
+  "$([ "$RUNTIME" = local ] && printf '%s' "$LEERIE_STATE_HOST_DIR")" \
   ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} \
   ${REWRITTEN_TAIL[@]+"${REWRITTEN_TAIL[@]}"} || exit $?
 
