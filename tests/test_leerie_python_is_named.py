@@ -31,6 +31,7 @@ REPO = Path(__file__).resolve().parent.parent
 ENTRY = REPO / "scripts" / "container-entry.sh"
 COLLECT = REPO / "scripts" / "remote" / "collect-subtrees.sh"
 SEED_COMMON = REPO / "scripts" / "remote" / "seed-common.sh"
+WORKTREE_LIB = REPO / "scripts" / "worktree-lib.sh"
 
 # A Python interpreter named by a bare name: what PATH, and so a shim,
 # resolves. A mechanical program name, never prose.
@@ -156,6 +157,38 @@ def test_entry_script_execs_the_image_interpreter() -> None:
         assert words[words.index("exec") + 1] == "/usr/bin/python3", line
         orch = [i for i, w in enumerate(words) if w.endswith("leerie.py")]
         assert orch and words[orch[0] - 1] == "/usr/bin/python3", line
+
+
+def test_worktree_lib_names_python_by_path() -> None:
+    """`leerie_repo_lock` takes the worktree lock through an interpreter, and
+    its callers run with a working directory inside the run's own repository
+    — where a repository's version files would otherwise choose the Python
+    that holds leerie's lock."""
+    assert _bare_python_words(WORKTREE_LIB.read_text()) == []
+
+
+def test_worktree_lib_takes_the_lock_with_the_image_interpreter() -> None:
+    """Substance, not only absence: the lock is taken by /usr/bin/python3,
+    and it blocks.
+
+    The lock outlives the short-lived helper because it lives on the open
+    file description the SHELL opened with `exec 201>`, which the helper only
+    inherits — not because of any redirect on the helper's own line (bash
+    passes fd 201 to the child either way; measured). So the load-bearing
+    facts are the interpreter's path and `LOCK_EX` without `LOCK_NB`: a
+    non-blocking take would turn the prune → check → add sequence this
+    serialises into a race.
+    """
+    body = WORKTREE_LIB.read_text()
+    line = next((ln for _, ln in _logical_lines(body)
+                 if "fcntl.flock" in ln), None)
+    assert line is not None, "no fcntl.flock call in worktree-lib.sh"
+    # The interpreter is named by path, wherever the word sits on the line
+    # (it is inside an `if !` so the failure can be reported).
+    assert "/usr/bin/python3" in line.split(), line
+    assert not {w for w in line.split()
+                if w.endswith("python3") and w != "/usr/bin/python3"}, line
+    assert "fcntl.LOCK_EX" in line and "LOCK_NB" not in line, line
 
 
 def test_collect_subtrees_payload_names_python_by_path() -> None:

@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from tests.conftest import run_git_out  # noqa: E402
+from tests.conftest import needs_landlock, skip_without_landlock, run_git_out  # noqa: E402
 
 
 class _Clock:
@@ -294,6 +294,67 @@ def test_raising_rerun_is_no_verdict_not_a_crash(leerie):
     v = asyncio.run(leerie._confirm_new_failures(
         ["x"], boom, final, _caps(leerie), label="t", read_psi=lambda: 0.0))
     assert v["new"] == [] and v["pairs_run"] == 3
+
+
+def test_a_capture_that_cannot_spawn_says_why(leerie, e3_repo, capsys):
+    """A measurement with no verdict says WHY it had none.
+
+    `_capture_failing_test_ids` returned None for a timeout, a spawn
+    failure and a confinement refusal alike, so "no verdict from this run"
+    was the only trace a shim exiting 126 left — which is how the cause of
+    five failing tests stayed invisible for a debugging session.
+    """
+    async def blow_up(*a, **kw):
+        raise OSError("cannot confine the worker, so it does not run")
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(leerie, "_run_streaming", blow_up)
+    try:
+        st = e3_repo["st"]
+        got = asyncio.run(leerie._capture_failing_test_ids(
+            str(e3_repo["staging"]), CMD, st, _caps(leerie),
+            label="t", log_path=st.run_dir / "logs" / "t.log", timeout=120,
+            serial=True))
+    finally:
+        monkey.undo()
+    assert got is None
+    # One read: `readouterr()` DRAINS the capture, so a second call
+    # returns empty and its `.err` would always be "".
+    got = capsys.readouterr()
+    said = got.out + got.err
+    assert "test IDs not captured" in said, said
+    assert "OSError" in said and "cannot confine" in said, said
+
+
+def test_a_capture_timeout_never_logs_the_argv(leerie, e3_repo, capsys):
+    """A TimeoutExpired renders its whole `cmd` — for leerie an argv that
+    can carry a system prompt. The reason goes through
+    `_brief_worker_exc`, which says the ceiling instead (CLAUDE.md: a
+    timeout is infrastructure, never interpolated verbatim).
+    """
+    secret = "SHOULD-NEVER-BE-LOGGED-" + "x" * 200
+
+    async def too_slow(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd=["claude", "-p", secret],
+                                        timeout=1236)
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(leerie, "_run_streaming", too_slow)
+    try:
+        st = e3_repo["st"]
+        got = asyncio.run(leerie._capture_failing_test_ids(
+            str(e3_repo["staging"]), CMD, st, _caps(leerie),
+            label="t", log_path=st.run_dir / "logs" / "t.log", timeout=120,
+            serial=True))
+    finally:
+        monkey.undo()
+    assert got is None
+    # One read: `readouterr()` DRAINS the capture, so a second call
+    # returns empty and its `.err` would always be "".
+    got = capsys.readouterr()
+    said = got.out + got.err
+    assert "1236" in said, said
+    assert secret not in said, "the argv reached the log"
 
 
 def test_budget_bounds_the_confirm(leerie):
@@ -595,6 +656,10 @@ def e3_repo(leerie, tmp_path):
 CMD = "python3 -m pytest -q -p no:cacheprovider tests"
 
 
+# Drives a real confined measurement (`_confined_argv` -> the Landlock
+# shim), which refuses to run where the kernel cannot confine.
+@needs_landlock
+@skip_without_landlock
 def test_capture_failing_ids_runs_the_real_suite(leerie, e3_repo):
     st = e3_repo["st"]
     # A checkout of the base beside the user's: the user's holds this run's
@@ -612,6 +677,10 @@ def test_capture_failing_ids_runs_the_real_suite(leerie, e3_repo):
         "tests/test_suite.py :: tests.test_suite.test_pre_existing"]
 
 
+# Drives a real confined measurement (`_confined_argv` -> the Landlock
+# shim), which refuses to run where the kernel cannot confine.
+@needs_landlock
+@skip_without_landlock
 def test_e3_confirms_the_real_regression_and_types_the_flake(
         leerie, e3_repo, monkeypatch):
     """The failing-ID diff end to end: the pre-existing failure is not a
@@ -649,6 +718,10 @@ def test_e3_confirms_the_real_regression_and_types_the_flake(
     assert not leerie._helper_worktree_path(st, "confirm-base").exists()
 
 
+# Drives a real confined measurement (`_confined_argv` -> the Landlock
+# shim), which refuses to run where the kernel cannot confine.
+@needs_landlock
+@skip_without_landlock
 def test_e3_a_regression_the_budget_cut_short_is_still_new(
         leerie, e3_repo, monkeypatch):
     """The consumer, end to end on a real suite (review round 5 H1, swept to
@@ -870,6 +943,10 @@ TIMEOUT_SHAPED = "tests/test_core.py :: tests.test_core.test_slow_box"
 CLOCK = "tests/test_clock.py :: tests.test_clock.test_wall_clock"
 
 
+# Drives a real confined measurement (`_confined_argv` -> the Landlock
+# shim), which refuses to run where the kernel cannot confine.
+@needs_landlock
+@skip_without_landlock
 def test_intermittent_regression_is_found_typed_and_never_counted(
         leerie, coupled_repo, monkeypatch):
     """End to end on a real suite: the final run surfaced nothing. Discovery
@@ -1202,6 +1279,10 @@ def test_unknown_baseline_discovery_find_is_never_new_on_a_cut(
     assert leerie._decide_outcome(st, any_commits=True) == "done"
 
 
+# Drives a real confined measurement (`_confined_argv` -> the Landlock
+# shim), which refuses to run where the kernel cannot confine.
+@needs_landlock
+@skip_without_landlock
 def test_final_diff_sizes_out_a_file_too_slow_for_its_pairs(
         leerie, e3_repo, monkeypatch):
     """Sizing by the recorded per-file durations: a candidate file whose

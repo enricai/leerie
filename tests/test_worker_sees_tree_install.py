@@ -27,12 +27,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import needs_landlock, skip_without_landlock
+
 from tests.test_confined_network import needs_isolation, proxy  # noqa: F401
 from tests.test_invoke_token_env import _patch_invoke_internals
-from tests.test_worker_confinement import _St, _abi, run  # noqa: F401
+from tests.test_worker_confinement import _St, run  # noqa: F401
 
-needs_landlock = pytest.mark.skipif(
-    _abi() < 3, reason="the host kernel has no Landlock ABI 3")
 
 
 @pytest.fixture()
@@ -157,6 +157,7 @@ def test_a_tree_leerie_never_installed_for_keeps_the_worker_cache(
 
 
 @needs_landlock
+@skip_without_landlock
 def test_a_worker_runs_a_script_leeries_install_put_in_the_tree(
         leerie, run, stores_env, installed, monkeypatch):
     """Leerie's install-kind command writes a console script where pip's

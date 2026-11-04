@@ -32,23 +32,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import REPO_ROOT
+from tests.conftest import needs_landlock, skip_without_landlock, REPO_ROOT
 
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 GUARD_PY = REPO_ROOT / "scripts" / "worker-guard.py"
-SHIM = REPO_ROOT / "scripts" / "landlock_exec.py"
-
-
-def _abi() -> int:
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("lk", SHIM)
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m.abi()
-
-
-needs_landlock = pytest.mark.skipif(
-    _abi() < 3, reason="the host kernel has no Landlock ABI 3")
 
 
 # --- the rule --------------------------------------------------------------
@@ -141,7 +128,13 @@ def test_a_unix_socket_binds_in_a_workers_tmpdir(leerie, tmp_path,
             run_dir=run_dir, state={}, schema_key="implementer",
             cwd=tmp_path, allowed_tools=leerie.ACT_TOOLS,
             env={**os.environ, **env})
-        assert str(tmp) in grants.rw
+        # Compared as `_worker_own_dirs` builds them, through `realpath`:
+        # in the image `/tmp` is a directory and the two spellings are one,
+        # but on a macOS host `/tmp` is a symlink to `private/tmp`, so the
+        # grant holds the resolved form and a literal `str(tmp)` never
+        # matched (the grant is right either way; only this read was wrong).
+        assert os.path.realpath(tmp) in [os.path.realpath(p)
+                                         for p in grants.rw]
     finally:
         leerie._remove_worker_dirs(run_dir)
     assert not tmp.exists()
@@ -274,6 +267,7 @@ def _assert_inside(leerie, st, log, grants):
 
 
 @needs_landlock
+@skip_without_landlock
 def test_the_smoke_test_runs_after_the_run_tmp_is_set(leerie, world,
                                                       monkeypatch):
     """The finding's shape, end to end: `_use_run_tmp`, then preflight's
@@ -294,6 +288,7 @@ def test_the_smoke_test_runs_after_the_run_tmp_is_set(leerie, world,
 
 
 @needs_landlock
+@skip_without_landlock
 def test_a_worker_spawned_by_claude_p_too(leerie, world):
     st, log, grants, run_tmp = world
     asyncio.run(leerie.claude_p(
@@ -306,6 +301,7 @@ def test_a_worker_spawned_by_claude_p_too(leerie, world):
 
 
 @needs_landlock
+@skip_without_landlock
 def test_the_fly_integrators_environment_too(leerie, world, tmp_path):
     """`worker-guard.py` prints the integrator's environment and its shim
     argv; the same rule over what it printed."""
@@ -331,6 +327,7 @@ def test_the_fly_integrators_environment_too(leerie, world, tmp_path):
 
 
 @needs_landlock
+@skip_without_landlock
 def test_the_fly_guard_refuses_to_confine_without_a_worker_id(leerie,
                                                               tmp_path):
     """Without a `<wid>` there are no own directories to name, so there is

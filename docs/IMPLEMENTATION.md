@@ -4600,7 +4600,12 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `TMPDIR`, `TMP`, `TEMP`, `CLAUDE_CODE_TMPDIR`, `CLAUDE_CONFIG_DIR`, as
   every confined spawn sets from `_confined_cli_env` — whose realpath lies beneath
   `<run>/workers/` (`WORKERS_DIR`) or is `_worker_tmp` of the worker
-  directory whose `config/` `CLAUDE_CONFIG_DIR` names there; any other
+  directory whose `config/` `CLAUDE_CONFIG_DIR` names there, that
+  `_worker_tmp` taken through `os.path.realpath` so the two sides of the
+  comparison are resolved alike — it names `PRIVATE_TMP_ROOT`, under `/tmp`,
+  a directory in the image but a symlink to `private/tmp` on a macOS host,
+  where the unresolved form never matched and a worker's own temp directory
+  was granted nothing; any other
   value grants nothing) and
   its side's cache set `_worker_cache_dir(run_dir, schema_key)` (made by
   `_mkdir_private`): `<run>/workers/cache-held-out/` (`HELD_OUT_CACHE_DIR`)
@@ -12223,9 +12228,16 @@ created".
 `scripts/worktree-lib.sh` exports `prune_leerie_worktrees <leerie-root>`,
 sourced by `setup-run.sh`, `new-worktree.sh`, `planning-worktree.sh` and
 `cleanup.sh`, which previously each ran a bare `git worktree prune`. It
-also exports `leerie_repo_lock` (takes `flock` on fd 201 over
-`<git-common-dir>/leerie-worktree.lock` for the rest of the calling
-script) and `leerie_worktree_name <run-id> <name>` (prints
+also exports `leerie_repo_lock` (takes an exclusive `fcntl.flock` on fd 201
+over `<git-common-dir>/leerie-worktree.lock` for the rest of the calling
+script: the shell opens the descriptor with `exec 201>` and
+`/usr/bin/python3 -I -S -c 'import fcntl; fcntl.flock(201, fcntl.LOCK_EX)'
+201>&201` takes the lock on it, so the lock outlives that helper and the
+kernel releases it when the calling script dies. Not the `flock` binary,
+which macOS does not ship — the scripts run on a developer's host under the
+tests, where a bare `flock` exited 127 and every `setup-run.sh` failed. The
+interpreter is named by path for the reason in DESIGN §6 *Leerie names its
+own Python by path*) and `leerie_worktree_name <run-id> <name>` (prints
 `<run-id[:12]>-<name>`; Python mirror `_worktree_dirname(run_id, name)`,
 with `_subtask_worktree_path(leerie_dir, sid)` for a subtask's path).
 Every Python site that needs a subtask's worktree takes it from
@@ -12277,7 +12289,11 @@ Every script that adds a worktree (`setup-run.sh`, `new-worktree.sh`,
 repository's registry or makes a tree; `cleanup.sh` takes it in a subshell around
 its prune; `_prune_leerie_worktrees` takes the same file with
 `fcntl.flock`, polling up to 30 s and skipping the prune (deleting
-nothing) when it cannot. `planning-worktree.sh` prunes **before** its
+nothing) when it cannot. Both sides have always taken the same kernel lock
+on the same file -- `flock(1)` and `fcntl.flock` are one interface -- so
+what changed is only how the shell reaches it, not whether the two exclude
+each other. They differ in how they wait: the scripts block, the prune
+polls to a deadline and then skips. `planning-worktree.sh` prunes **before** its
 orphan check, as `new-worktree.sh` does. Every registration check
 captures `git worktree list --porcelain` before `grep -qxF` reads it
 (`grep -qxF "worktree $WT" <<<"$(git worktree list --porcelain)"`) —

@@ -2734,6 +2734,55 @@ what made bare `resume` die naming an id the user never typed. The
 injection block is extracted from the real script at test time (the
 `_extract_config_arm` pattern) so it cannot drift.
 
+## The macOS developer surface
+
+CI is `ubuntu-latest`, so it **structurally cannot** catch a macOS-only
+break. Three defect shapes have reached `main` this way; each cost a
+developer's whole failure list, which is worse than it sounds -- a list
+dominated by environment noise trains people to ignore it.
+
+- **A binary macOS does not ship.** `leerie_repo_lock` took the lock with
+  `flock(1)` (#296), which macOS has none of: it exited 127 and took every
+  `setup-run.sh` with it, so 9 of `tests/test_collect_subtrees_sh.py` failed
+  there while CI stayed green. The lock is now `fcntl.flock` on the
+  descriptor the shell itself opened, which is what `flock(1)` locks too --
+  measured on both kernels: 6 holders x 200 read-modify-write iterations lose
+  no update, and a SIGKILLed holder releases identically (the lock survives
+  in an inherited child either way, binary or not). Pinned by
+  `tests/test_repo_lock_is_portable.py`, whose last case drives the real
+  function on a PATH with no `flock` at all. The repo knew the fact already
+  (`scripts/remote/lib.sh`'s "mkdir-as-mutex (portable; macOS has no `flock`
+  binary)") in a different file, which is the shape to watch for.
+- **A path that is a symlink there.** `/tmp` is `private/tmp` on macOS, so
+  `_worker_own_dirs` compared an unresolved `_worker_tmp` against
+  `os.path.realpath(p)` and never matched: a worker's own temp directory was
+  granted nothing. Latent in the image, where `/tmp` is a directory and the
+  two spellings are one. A real grant bug, found only because the test ran on
+  a Mac (`tests/test_confined_cli_env.py`'s socket case).
+- **A `/proc` that is not there.** Both `tests/conftest.py`'s
+  `processes_marked` (autouse, so it errored the teardown of every test) and
+  `tests/test_commands_keep_default_signals.py`'s probe read `/proc`. Gated
+  now; see the `needs_landlock` entry above and
+  `_no_process_outlives_its_test`.
+
+`scripts/worktree-lib.sh` and its sourcers are part of this surface: the
+collect-subtrees tests drive them under the host's own bash.
+
+Two further files pin contracts this surface exposed:
+
+- `tests/test_shim_refuses_on_a_libc_without_prctl.py` --
+  `install_seccomp`'s docstring has always promised "Raises OSError naming
+  the step", but the `prctl` lookup is a `ctypes` attribute access, so on a
+  libc without the symbol it raised `AttributeError`, which
+  `_confine_or_126`'s `except OSError` does not catch: the shim tracebacked
+  and exited 1 instead of writing its refusal and exiting 126, and a caller
+  read "no verdict from this run" where the shim meant "I will not run
+  this". That silence hid the cause of five failing tests for a whole
+  debugging session. The contract is now driven by injection, so it is
+  checked on every kernel, including the Linux one where `prctl` exists.
+- `tests/test_landlock_gate_wiring.py` -- the gate's own wiring; see the
+  `needs_landlock` entry above.
+
 ## Bash 3.2 portability (EC2 shell surface)
 
 **The EC2 shell surface must run on bash 3.2** — macOS's `/bin/bash`, and
@@ -7996,6 +8045,75 @@ bound, both measured on the first full local run under `--timeout=600`:
   miss -- is not in base macOS. Shipped without those guards, the bare
   `os.listdir("/proc")` raised `FileNotFoundError` inside the autouse
   teardown and so errored the teardown of every test on macOS.
+- **`needs_landlock` + `skip_without_landlock` (one owner,
+  `tests/conftest.py`).** The kernel's Landlock ABI, read once at collection
+  through the shim's own `abi()`. A test whose SUBJECT is the confinement
+  carries **both** marks; they are inert on CI (ubuntu-latest reports
+  ABI >= 3 and runs every one of them for real -- measured on the 0.44.7
+  run: zero "no Landlock ABI 3" skips in 14,078 passes, the 135
+  Landlock-area skips there being the unprivileged-userns gate,
+  `setgroups: EACCES`, which is a different thing).
+  The marker's definition was copied in five files; those five now import
+  the pair from conftest. The consolidation is **partial on purpose**: the
+  modules that gate a whole file on the kernel
+  (`tests/test_worker_confinement.py`, `tests/test_tree_git_is_addressed.py`
+  and their importers, `tests/test_user_scripts_on_path.py`,
+  `tests/test_held_out_path_taken_is_not_a_refusal.py`, and the two
+  remaining `_HAS_LANDLOCK` sites in
+  `tests/test_confinement_refusal_stops_the_run.py`) still carry their own
+  `_abi()` loader and skipif, so they skip on a host without Landlock and
+  are not handed to a container. Migrating them is follow-up work, not
+  something this change did.
+
+  **Two marks, never one wrapping the other.**
+  `pytest.mark.needs_landlock(pytest.mark.skipif(...))` reads as composition
+  but is not: the skipif becomes an *argument* of the named mark, no skip is
+  applied, and every confined test runs against a kernel that cannot confine
+  (measured: 15 such failures, where the same files had been clean). The
+  named mark is what the container runner looks for -- a bare skipif mark is
+  named `skipif`, so a name lookup finds nothing -- and the skipif is what
+  stops a test this host can neither run nor hand to a container.
+  `tests/test_landlock_gate_wiring.py` guards both halves, mirroring
+  `tests/test_jq_gate_wiring.py`: it fails if any `needs_landlock` test
+  lacks a skip, and pins that the antipattern really is silent.
+
+  **Where the host has no Landlock, the test runs where leerie runs.** With
+  `LEERIE_TEST_CONTAINER_IMAGE` naming a leerie image and `nerdctl` on PATH,
+  conftest's `pytest_collection_modifyitems` replaces the item's `setup` so
+  the test is re-run inside that container and its verdict becomes the
+  test's. Replacing `setup`, not hooking the call, is deliberate: a fixture
+  of such a test may itself need the kernel (the signals module's
+  module-scoped `outside` reads `/proc/self/status` and raised
+  `StopIteration` at setup, before any body ran), so no local fixture is
+  built at all. The child's environment has the variable cleared and the
+  container's ABI is 4, so the marker is inert there and nothing recurses.
+  Measured: the 5 `test_bstar_confirm` cases that shell out to
+  `python3 -m pytest` pass this way, and a bad image fails loudly rather
+  than passing. pytest is not in the image (it is a runtime image), so the
+  runner installs it per run -- about 5 s.
+  Why a gate and not an emulation: Landlock is a Linux LSM with no macOS
+  equivalent (`sandbox-exec` is deprecated by Apple, and its profiles do
+  not express leerie's grants), so emulating it would make a confinement
+  test pass on a kernel that cannot confine -- a green tick over the one
+  guarantee the shim exists to provide. leerie runs in a Linux container,
+  so the subject is always on Linux in production; where a dev host has no
+  Landlock the reason says to set `LEERIE_TEST_CONTAINER_IMAGE` and run
+  them where they run (the same opt-in `tests/test_work_read_only.py` and
+  `tests/test_pinned_runtime_runs.py` use). On macOS the Colima VM reports
+  ABI 4, so the real feature is reachable from a dev host.
+  Twelve tests were failing for want of this gate, in four files: the five
+  in `tests/test_bstar_confirm.py` that drive a real confined measurement,
+  the three in `tests/test_collect_subtrees_sh.py` whose integrator the
+  payload refuses to run unconfined, two in
+  `tests/test_confinement_refusal_stops_the_run.py` that the file's own
+  `_HAS_LANDLOCK` already gated its other tests with, and
+  and three of the four in `tests/test_commands_keep_default_signals.py`,
+  which read a signal mask out of `/proc/self/status` through the `outside`
+  fixture (its `_report` raised `StopIteration` as a collection error
+  instead of saying why). Deliberately three and not the module: the fourth
+  derives the ignored-signal list from a fresh interpreter, reads no `/proc`
+  and passes on a macOS host, so a module mark would have skipped a test
+  that works.
 - `_quiet_host_pressure`. The B* confirm gate waits up to
   `confirm_gate_wait_sec` (300 s) a confirm for the HOST's CPU pressure to
   fall below `confirm_psi_cpu_max`. Tests not about that gate inherited the
