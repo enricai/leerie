@@ -141,7 +141,7 @@ def test_a_held_out_run_end_to_end_reads_its_report_through_the_descriptor(
         captured["report"] = report
         return (cmd, {**os.environ, "LEERIE_REPORT": str(report)}, "probe")
 
-    def parse(kind, report):
+    def parse(kind, report, tree):
         captured["read"] = report.decode()
         return {"collection_error": False, "executed": 1,
                 "cases": {"held.sh::a": "failed"}, "messages": {}}

@@ -665,7 +665,7 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
                                               want):
     p = tmp_path / "report"
     p.write_text(text)
-    got = leerie._parse_runner_report(kind, p.read_bytes())
+    got = leerie._parse_runner_report(kind, p.read_bytes(), str(tmp_path))
     if want is None:
         assert got is None
     else:
@@ -673,7 +673,7 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
         assert {k: got[k] for k in ("executed", "collection_error")} == want
         assert set(got["cases"].values()) <= {"passed", "failed", "skipped",
                                               "load_error"}
-    assert leerie._parse_runner_report(kind, None) is None
+    assert leerie._parse_runner_report(kind, None, str(tmp_path)) is None
 
 
 @pytest.mark.parametrize("cmd,placed", [
@@ -767,7 +767,7 @@ def test_an_appended_junit_path_is_the_report_pytest_writes(
     subprocess.run(run_cmd, shell=True, cwd=tmp_path, env=env,
                    capture_output=True, check=False)
     assert leerie._parse_runner_report(
-            kind, (tmp_path / "r.xml").read_bytes()) == {
+            kind, (tmp_path / "r.xml").read_bytes(), str(tmp_path)) == {
         "executed": 1, "collection_error": False,
         "cases": {"test_a :: test_a.test_a": "passed"}}
 

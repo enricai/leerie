@@ -12341,6 +12341,71 @@ target / 148 control items, frozen labels): F+ k=3 caught 23/31 =
 77.1% and 8/144 = 5.6%; with the re-ask, 24/31 and 13/148 (adjudicated
 28/35 and 9/144). One sample alone caught 19/31.
 
+**A probe that breaks another part of its own item is a contested reading,
+not a finding.** *Status: designed, not built — see the last paragraph.*
+An item is the classifier's one-sentence wording of a span of the source,
+with `parts`; the falsifier is handed the sentence and its `source_ref`
+only, and told not to reinterpret it from other documents. So it cannot
+see that the reading it asserts breaks another part of the same item, and
+nothing checks. Measured on barnacle a192d275 (leerie 0.44.3): the item
+paraphrased a report's "add `redirect` … **and/or** follow redirects inside
+`rawFetch` … **at minimum** return headers and the final URL" as "call
+onResponse for every hop", with the part "Default behavior for existing
+callers preserved"; the falsifier's confirmed probe required per-hop
+callbacks in the *default* mode — reachable only by changing the default —
+noted the ambiguity in its own reason, and was confirmed. The readings are
+not unachievable: an opt-in follow loop satisfies both, and barnacle
+48c48629 had built the default-mode loop once and rolled it back because
+it broke a control case for a caller-supplied manual redirect. Chasing
+one reading through the fix loop swings between shipping the gap and
+breaking the default. The design:
+
+1. *The classifier records what the source leaves open.* An item whose
+   span offers alternatives or a floor carries them typed —
+   `alternatives[]` (each a verbatim quote of the span) and `minimum`
+   (the span's own floor, quoted) — instead of collapsing them into one
+   sentence. Code checks each quote is a substring of the span's source,
+   as it checks every quote.
+2. *The falsifier gets the item whole.* Its input adds the item's `parts`,
+   `alternatives` and `minimum`, and the span's source text, and it
+   returns, besides the part it probes, `other_parts_held[]`: per other
+   part, whether its probe's asserted behaviour can coexist with that
+   part, with the quote. A sample whose probe is confirmed but which
+   reports another part it cannot coexist with is typed
+   `contested_reading` (`{item_index, probed_part, contested_part,
+   quotes}`), never `confirmed`.
+3. *A contested reading goes to the conflict path, not the fix loop.* It
+   is recorded with the contract judge's `conflict` verdicts and handed to
+   the re-drive as a typed note whose instruction is to find one design
+   that satisfies both parts (here: opt-in per-hop following, default
+   untouched), measured by the probe AND the part it contested. A group
+   that satisfies one by breaking the other is a trade (rule 5,
+   `trade_pairs`); the same pair twice is the re-drive's `conflict`, the
+   run `unconverged`, and the PR a draft that names both readings.
+
+**A report-pointer task's no-work confirmation includes the report's own
+repro, executed.** *Status: designed, not built.* The `no_work_judge`
+reads and never runs: in two runs on the same report (331df50b,
+81028d11) it confirmed "already fixed" having run nothing, one saying it
+had not read the report; in a192d275 the
+acceptance writers, shown the fixed tree first, wrote tests of the
+reading the tree already met, and every set was discarded as
+`fixed_on_head_by_execution`. When the defect-scope audit recorded a
+`ground_truth.repro_command`, a no-work confirmation is held until that
+command has run on HEAD under the settle-by-execution machinery, and the
+audit types the report's stated buggy outcome so code — not prose
+reading — decides whether HEAD still shows it; still showing it is a
+dispute with the run's own evidence.
+
+These two rules change what the falsifier and the classifier are given,
+and *What ships is what was measured* binds the falsifier's input to the
+frozen F+ bench: shipping either without re-benching would leave the Q2
+numbers describing a different worker. What remains: the classifier and
+falsifier schema fields and prompt text; the `contested_reading` gate and
+its routing into `contradictions`/`trade_pairs`; the typed repro outcome;
+and a bench of the falsifier on the Q2 corpora plus the a192d275 and
+48c48629 items, held to F+'s catch and false-unmet rates.
+
 **Delivery re-drive: unmet work goes back to the subtasks that own it.**
 Detection alone ships a PR that says what is missing; the next run then
 re-plans from scratch. After the repository's merge checks have run on the
@@ -12484,6 +12549,43 @@ each routed item is re-checked: re-judged by the cited judge, and an item
 a falsifier proved unmet by re-running its saved probe on the new tree.
 Every row's test-outcome part is then re-read from the diff of the tree
 that ships. That verdict is what `_decide_outcome` reads.
+
+**A re-check replaces a verdict only on a tree that changed, and only by
+the vote that made it.** A routed item is re-judged only when the tree has
+moved since the verdict it would replace: the commit the detection verdict
+was measured on (`delivery_gate.final_sha`) until a re-check records its
+own. And an item a 2-of-3 vote confirmed unmet is re-judged by all three
+samples under the same majority: confirm-on-first-pass (one sample, two
+more only when it flags something) is for a first look, where a clean
+sample ends the vote, never for overturning a majority. Before this the
+re-check's last-seen commit started empty, so the first round re-judged
+even when its group changed nothing, and the re-judge's first sample,
+saying met, ended its own vote. Measured on barnacle 48c48629: the
+re-drive's one group made no change (`pre_sha == post_sha`, `no_change`),
+and one sample on that same tree overturned the 2-of-3 unmet verdict on
+"cookies from intermediate hops carried by the following request"; the
+run shipped `done`.
+
+**An unmet item reaches its owner, or is recorded as reaching none.**
+Rule 2's "every claimer" includes a claimer that settled `unconverged`: it
+is the subtask whose work the item is, and the confirmed finding is the
+evidence it lacked. A claimer settled `blocked` (its blocker is typed
+outside the tree, §13 *A blocked implementer says why, as a type*), one
+the operator accepted, or one settled `accepted_external` is not driven.
+An item no group drives — no subtask the re-drive may drive can take it,
+or every group holding it was out of its members' re-drive rounds, or the
+re-drive's time budget ran out first — is recorded as a typed
+`unrouted_item` (`{item_index, item, reason: no_owner | budget}`). It is
+never dropped: it stays unmet, so the run is `unconverged`; the outcome's
+reasons name it; and the next run on the task is handed it in its
+residual. Measured on barnacle a192d275 (leerie 0.44.3): the falsifier
+confirmed an item unmet whose only claimer, feat-001, had settled
+`unconverged`; the re-drive excluded it, routed the item to nobody and
+logged "done" one second after naming "1 unmet item(s)". The run's
+outcome was `unconverged` on the unmet item, but nothing recorded that
+the finding reached no worker. Under this rule the item goes to feat-001,
+whose two re-drive rounds were spent before the falsifier ran, so it is
+recorded `unrouted_item` with reason `budget`.
 
 The diff is re-measured because nothing else is. Before review round 6
 the re-drive re-applied the test-outcome verdict recorded at detection,
@@ -14861,6 +14963,25 @@ under option a): 242 of 246 in-scope failing cases counted and 102 of 102
 out-of-scope ones dropped; per set-sample, 15 of 15 with an in-scope case
 kept and 30 of 30 without one dropped; and the late runs of the two replayed
 chains (12 and 4) all converged, in every sample.
+
+**A case has one name in every tree.** A set runs in several trees: its
+validation and its scope judge in its own (`acceptance-N`,
+`acceptance-rewrite-N`), the evaluation in another (`acceptance-eval`), the
+audit and the surrogate witness in others still. Some runners name a case by
+its file's absolute path — vitest's jest-compatible JSON does — so one case
+read in two trees had two names, and every per-case comparison across trees
+(the counted cases against the failing ones, the held cases against a
+rerun's) found nothing in common. Measured on barnacle 48c48629 (leerie
+0.43.0, replayed under 0.44.3's functions on 2026-11-04): set 5 still failed
+at ship on its counted cases, the per-case test found none of them failing,
+the run ended `done`, and the residual read back as nothing, so the next run
+on the task (a192d275) was handed no `acceptance_unmet`; 0.44.3 runs
+237ea25c, 7cff429a and ddd383ea recorded the same absolute names. A case's
+name is therefore made relative to the tree it ran in when the runner's
+report is read, so every reader compares like with like. Names a run
+recorded before this rule are made relative when its state is read — on
+resume, and when a later run reads it for its residual — against the set's
+own file paths, never by guessing at a tree.
 
 **Scoped runners for every runner leerie can read.** A set runs only
 through a scoped test template — the canonical command over the set's own

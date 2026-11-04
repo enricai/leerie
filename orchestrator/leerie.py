@@ -31808,7 +31808,10 @@ class State:
 
     def load(self) -> bool:
         if self.path.exists():
-            self.data = json.loads(self.path.read_text())
+            # Case IDs a run recorded per worktree read as one name per case
+            # (DESIGN §8 *A case has one name in every tree*).
+            self.data = _acceptance_case_ids_relative(
+                json.loads(self.path.read_text()))
             return True
         return False
 
@@ -41193,6 +41196,21 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                    else ", and the tree that ships could not be read"))
         elif unmet:
             reasons.append(f"{len(unmet)} required item(s) still unmet")
+            # An unmet item the re-drive could hand to no worker is said
+            # so, typed (DESIGN §8 *An unmet item reaches its owner, or is
+            # recorded as reaching none*).
+            open_idx = {u.get("item_index") for u in unmet
+                        if isinstance(u, dict)}
+            unrouted = [u for u in ((st.data.get("delivery_redrive") or {})
+                                    .get("unrouted_items") or [])
+                        if isinstance(u, dict)
+                        and u.get("item_index") in open_idx]
+            if unrouted:
+                reasons.append(
+                    f"{len(unrouted)} unmet item(s) reached no re-drive "
+                    "worker (unrouted_item): " + ", ".join(
+                        f"item {u['item_index']} ({u.get('reason')})"
+                        for u in unrouted))
     ci_unmet = _ci_parity_unmet(st)
     if ci_unmet:
         reasons.append(f"{len(ci_unmet)} of the repository's own merge "
@@ -50103,6 +50121,63 @@ def _downgrade_ungrounded_met(contract: dict | None,
             "evidence": (evidence + "\n" + note).strip()}
 
 
+def _case_id_relative(cid: str, rels: Iterable[str]) -> str:
+    """`cid` with an absolute file part (`<tree>/<rel> :: <title>`) made
+    `<rel> :: <title>`, `rel` the longest of `rels` the path ends in; any
+    other ID unchanged. A case ID is leerie's own mechanical string (the
+    runner's file, ` :: `, its title — `_runner_report_cases`), so this is
+    path arithmetic, not interpretation (DESIGN §12)."""
+    head, sep, rest = cid.partition(" :: ")
+    if not sep or not os.path.isabs(head):
+        return cid
+    for rel in sorted({os.path.normpath(r) for r in rels
+                       if isinstance(r, str) and r and not os.path.isabs(r)},
+                      key=len, reverse=True):
+        if head.endswith("/" + rel):
+            return f"{rel}{sep}{rest}"
+    return cid
+
+
+def _acceptance_case_ids_relative(data: dict) -> dict:
+    """`data` (a run's state) with every case ID its `acceptance` block
+    recorded made relative to the tree it ran in, in place
+    (`_case_id_relative` over every set file the block names). A run before
+    `_parse_runner_report` took the tree recorded absolute, per-worktree IDs
+    (DESIGN §8 *A case has one name in every tree*); read through here — on
+    every `State.load` and by `_prior_delivery_residual` — a resumed run and
+    the next run's residual compare like with like. Idempotent."""
+    acc = data.get("acceptance") if isinstance(data, dict) else None
+    if not isinstance(acc, dict):
+        return data
+    rels: set[str] = set()
+
+    def _gather(x: object) -> None:
+        if isinstance(x, dict):
+            for k in ("defect_files", "control_files", "support_files"):
+                if isinstance(x.get(k), list):
+                    rels.update(r for r in x[k] if isinstance(r, str))
+            for v in x.values():
+                _gather(v)
+        elif isinstance(x, list):
+            for v in x:
+                _gather(v)
+    _gather(acc)
+    if not rels:
+        return data
+
+    def _fix(x: object) -> object:
+        if isinstance(x, str):
+            return _case_id_relative(x, rels)
+        if isinstance(x, list):
+            return [_fix(v) for v in x]
+        if isinstance(x, dict):
+            return {(_case_id_relative(k, rels) if isinstance(k, str)
+                     else k): _fix(v) for k, v in x.items()}
+        return x
+    data["acceptance"] = _fix(acc)
+    return data
+
+
 def _acceptance_set_broken(set_: dict) -> bool:
     """Whether a held-out set has been typed `broken` — a test no correct
     fix could pass. The set audit (DESIGN §8) is what types it; this is the
@@ -50259,6 +50334,7 @@ def _prior_delivery_residual(st: "State") -> dict | None:
             continue
         if (data.get("task") or "").strip() != task:
             continue
+        _acceptance_case_ids_relative(data)
         # A run that never COMPLETED resolved nothing: skip it rather
         # than stopping — the operator's normal loop is to re-run
         # after a crash, and stopping here would throw away the last
@@ -50312,6 +50388,20 @@ def _prior_delivery_residual(st: "State") -> dict | None:
                 {"item": (u.get("item") or "")[:200],
                  "evidence": (u.get("evidence") or "")[:400]}
                 for u in unmet_after[:3]]
+            # The items no worker of that run was handed, typed, so the
+            # next plan owns them (DESIGN §8 *An unmet item reaches its
+            # owner, or is recorded as reaching none*).
+            still = {u.get("item_index") for u in unmet_after
+                     if isinstance(u, dict)}
+            unrouted = [u for u in ((data.get("delivery_redrive") or {})
+                                    .get("unrouted_items") or [])
+                        if isinstance(u, dict)
+                        and u.get("item_index") in still]
+            if unrouted:
+                residual["unrouted_items"] = [
+                    {"item": str(u.get("item") or "")[:200],
+                     "reason": str(u.get("reason") or "")}
+                    for u in unrouted[:3]]
         # The repository's own merge checks that run left red (DESIGN §9
         # *The repository's own merge checks run too*): typed, never output.
         ci_final = (data.get("ci_parity") or {}).get("final") or {}
@@ -51148,6 +51238,7 @@ async def _delivery_judge_unmet(
         typed_evidence: list[str] | None = None,
         item_details: dict | None = None,
         only: Iterable[int] | None = None,
+        full_vote: Iterable[int] | None = None,
         ) -> tuple[list[dict], int, dict | None]:
     """Run the delivery_judge over the staging tree; return
     (confirmed_unmet, samples_used, contract_result).
@@ -51200,6 +51291,11 @@ async def _delivery_judge_unmet(
     majority — single-trial LLM judging is measurably noisy, majority
     over 3 samples recovers most of the reliability, and voting on
     DISPUTES only keeps the clean-pass common case at one spawn.
+    `full_vote` names the items whose verdict this pass REPLACES a 2-of-3
+    majority for: a pack holding one runs all three samples whatever the
+    first says, so the same rule decides — one met sample never overturns
+    a majority (DESIGN §8 *A re-check replaces a verdict only on a tree
+    that changed, and only by the vote that made it*).
     Exceptions (WorkerError / timeout) propagate; the callers treat the
     whole gate as advisory."""
     # Normalize BEFORE numbering (review rounds 1–2): required_items
@@ -51365,6 +51461,8 @@ async def _delivery_judge_unmet(
     # below); their cites are made relative to it.
     judge_cwd: list[Path] = [staging]
 
+    majority_held = set(full_vote or ())
+
     async def _judge_pack(p: int, pack: list[int]) -> list[dict]:
         with_contract = contract_ctx is not None and p == 0
         user_prompt = _pack_prompt(pack, with_contract)
@@ -51422,7 +51520,8 @@ async def _delivery_judge_unmet(
 
         async with limit:
             samples = [await _sample(0)]
-            if (_delivery_unmet_majority(samples, n_items)
+            if (allowed & majority_held
+                    or _delivery_unmet_majority(samples, n_items)
                     or _contract_flagged(samples[0], with_contract)):
                 for k in (1, 2):
                     samples.append(await _sample(k))
@@ -53215,14 +53314,23 @@ def _command_word(tokens: list[tuple[str, str, int]]) -> str | None:
     return None
 
 
-def _parse_runner_report(kind: str, report: bytes | None) -> dict | None:
+def _parse_runner_report(kind: str, report: bytes | None,
+                         tree: str | None) -> dict | None:
     """`{executed, collection_error, cases}` from a runner's structured
     report — `cases` maps each case ID to its status (`passed`, `failed`,
     `skipped` or `load_error`), the per-case verdict validation reads
     (DESIGN §8 *Held-out acceptance tests*) — or None when there is none to
     read (the runner ignored the request, or it died before writing). Reads
-    fixed machine formats only (DESIGN §12)."""
-    cases = _runner_report_cases(kind, report)
+    fixed machine formats only (DESIGN §12).
+
+    `tree` is the tree the runner ran in, and has no default: a case ID
+    names its file relative to it, so one case has one ID in every tree
+    (DESIGN §8 *A case has one name in every tree*). Read without it,
+    vitest's absolute suite paths kept each worktree's prefix, and a set's
+    counted cases (validated in `acceptance-N`) never met its failing ones
+    (evaluated in `acceptance-eval`) — barnacle 48c48629 ended `done` with a
+    counted case still failing."""
+    cases = _runner_report_cases(kind, report, tree, class_files=False)
     if cases is None:
         return None
     return {"executed": sum(1 for c in cases
@@ -53240,7 +53348,8 @@ def _parse_runner_report(kind: str, report: bytes | None) -> dict | None:
 
 
 def _runner_report_cases(kind: str, report: bytes | None,
-                         tree: str | None = None) -> list[dict] | None:
+                         tree: str | None = None, *,
+                         class_files: bool = True) -> list[dict] | None:
     """Every case a runner's structured report records, as
     `{id, file, status}` — `status` one of `passed`, `failed` (a setup error
     included: it ran and failed), `skipped`, or `load_error` (the file or
@@ -53249,7 +53358,12 @@ def _runner_report_cases(kind: str, report: bytes | None,
     when there is no readable report of a known kind. Fixed machine formats
     only (DESIGN §12): pytest's JUnit XML, the jest-compatible JSON of jest
     and vitest, rspec's JSON formatter, leerie's minitest reporter
-    (`MINITEST_REPORT_LIB`), `go test -json` and libtest's JSON events."""
+    (`MINITEST_REPORT_LIB`), `go test -json` and libtest's JSON events.
+
+    `class_files=False` never looks a JUnit class's file up in `tree`: what
+    is on disk there differs between trees (a held-out set is placed in a
+    sandbox overlay, never on disk), so an ID that must be one name in
+    every tree cannot depend on it."""
 
     if report is None:
         return None
@@ -53302,7 +53416,7 @@ def _runner_report_cases(kind: str, report: bytes | None,
                          "load_error")
                     continue
                 f = case.get("file")
-                if not f and classname and tree is not None:
+                if not f and classname and tree is not None and class_files:
                     f = _junit_class_file(classname, tree)
                 rel = _rel(f) if f else None
                 status = ("skipped" if "skipped" in tags
@@ -53851,7 +53965,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
         return None
     if not validating:
         if cases_out is not None:
-            got = (_parse_runner_report(spec[2], bytes(got_report) or None)
+            got = (_parse_runner_report(spec[2], bytes(got_report) or None,
+                                        str(tree))
                    if spec is not None else None)
             if got is None and _rc_is_resource_signal(rc):
                 # Killed (an OOM kill, a signal) before writing a report.
@@ -53869,7 +53984,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                     cid: m for cid, m in (got.get("messages") or {}).items()
                     if cid in cases_out["failing_cases"]}
         return rc == 0
-    parsed = (_parse_runner_report(spec[2], bytes(got_report) or None)
+    parsed = (_parse_runner_report(spec[2], bytes(got_report) or None,
+                                   str(tree))
               if spec else None)
     if parsed is None:
         if rc in _acceptance_no_verdict_exits(cmd, [rel]):
@@ -57630,7 +57746,8 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
             efforts, phase_label="recheck", contract_ctx=contract_ctx,
             exec_digest=exec_digest, ground_truth=ground_truth,
             routing=routing, typed_evidence=evidence,
-            item_details=details)
+            item_details=details,
+            full_vote=_judge_majority_items(unmet_before))
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge recheck crashed ({_brief_worker_exc(e)}); "
             "residual unrecorded (advisory)")
@@ -59557,6 +59674,28 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
                                                      for m in members])),
                        "notes": gnotes})
     return groups
+
+
+def _redrive_unrouted_items(open_items: list[dict], driven: Iterable[int],
+                            budget_skipped: Iterable[int],
+                            stopped_on_budget: bool) -> list[dict]:
+    """The still-open unmet items no re-drive group drove, typed
+    `unrouted_item` (DESIGN §8 *An unmet item reaches its owner, or is
+    recorded as reaching none*): `{item_index, item, reason}`, `reason`
+    `budget` when a group held it but none of its members had a re-drive
+    round left, or the re-drive stopped on its time budget first, else
+    `no_owner` — no subtask the re-drive may drive claimed it or could take
+    it."""
+    done, skipped = set(driven), set(budget_skipped)
+    out: list[dict] = []
+    for n in open_items:
+        i = n.get("item_index")
+        if not isinstance(i, int) or i in done:
+            continue
+        out.append({"item_index": i, "item": str(n.get("item") or "")[:400],
+                    "reason": ("budget" if i in skipped or stopped_on_budget
+                               else "no_owner")})
+    return out
 
 
 def _redrive_failing(results: list[dict], sets: list[dict],
@@ -61498,6 +61637,23 @@ async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
         return {"error": f"{type(e).__name__}: {e}"[:300]}
 
 
+def _judge_majority_items(unmet: Iterable[object]) -> list[int]:
+    """The indices of `unmet` rows (a delivery verdict's unmet list) the
+    delivery judge's 2-of-3 vote settled — `settled_by`/`by` naming the
+    judge, or naming nothing (the judge is the default) — the ones a
+    re-judge must re-vote whole (`_delivery_judge_unmet(full_vote=)`)."""
+    out: list[int] = []
+    for u in unmet:
+        if not isinstance(u, dict) or not isinstance(u.get("item_index"),
+                                                     int):
+            continue
+        by = u.get("by") if isinstance(u.get("by"), list) else (
+            [u["settled_by"]] if u.get("settled_by") else [])
+        if not by or "judge" in by:
+            out.append(u["item_index"])
+    return sorted(set(out))
+
+
 async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                                  models: dict, efforts: dict,
                                  staging: Path, indices: list[int]
@@ -61529,7 +61685,8 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
             unmet, _n, _x = await _delivery_judge_unmet(
                 st.data.get("task", ""), items, staging, st, caps, models,
                 efforts, phase_label="redrive", exec_digest=record,
-                typed_evidence=evidence, only=judge_idx, routing=routing)
+                typed_evidence=evidence, only=judge_idx, routing=routing,
+                full_vote=_judge_majority_items(prior.values()))
             hit = {u["item_index"]: u for u in unmet
                    if u.get("item_index") in judge_idx}
             human = set(routing.get("human_verification") or [])
@@ -61906,11 +62063,15 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         specs = {}
     statuses = st.data.get("subtask_status") or {}
     accepted = st.data.get("accepted_blocked") or {}
+    # An `unconverged` subtask is re-driven too (rule 2: every claimer):
+    # it owns the work, and the confirmed finding is the evidence it
+    # lacked. A blocked one's blocker is outside the tree (§13), and an
+    # accepted one is the operator's call (DESIGN §8 *An unmet item reaches
+    # its owner, or is recorded as reaching none*).
     subfiles = {sid: _redrive_subtask_files(staging, sid, spec)
                 for sid, spec in specs.items()
                 if isinstance(spec, dict)
-                and statuses.get(sid) not in ("blocked", "unconverged",
-                                              "accepted_external")
+                and statuses.get(sid) not in ("blocked", "accepted_external")
                 and sid not in accepted}
     claims = _item_claims(specs)
     site_claimers = [sid for sid, spec in specs.items()
@@ -62014,7 +62175,11 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     ids_before = (None if float(st.data.get("redrive_spent_sec") or 0.0)
                   >= budget else
                   await _redrive_test_ids(st, caps, staging, "redrive-ids0"))
-    rechecked_sha = rec.get("items_rechecked_sha")
+    # The commit the verdict a re-check would replace was made on: the last
+    # re-check's, else detection's. Re-judging an unchanged tree only lets
+    # sampling noise overturn it (DESIGN §8 *A re-check replaces a verdict
+    # only on a tree that changed*; barnacle 48c48629's no-change group).
+    rechecked_sha = rec.get("items_rechecked_sha") or det_sha or None
 
     def set_note(k: str, v: dict, kind: str) -> dict:
         s_ = by_index.get(v["set_index"]) or {}
@@ -62026,9 +62191,16 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rnd = len(rec["rounds"])
     max_rounds = cap * max(1, len(subfiles)) + 1
     start_items = sorted({u["item_index"] for u in open_items()})
+    # Items a group drove, and items a group held but could not drive for
+    # its members' budget: what is left reached no worker
+    # (`_redrive_unrouted_items`).
+    rec.setdefault("items_driven", [])
+    rec.setdefault("items_budget_skipped", [])
+    stopped_on_budget = False
     while not rec.get("conflict") and not rec.get("rollback_failed"):
         if float(st.data.get("redrive_spent_sec") or 0.0) >= budget:
             log("  delivery re-drive: redrive_budget_sec spent — stopping")
+            stopped_on_budget = True
             break
         rnd += 1
         if rnd > max_rounds:
@@ -62093,6 +62265,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                        if _redrive_allowed(st, caps, m)]
             if not members:
                 ge["skipped"] = "budget"
+                rec["items_budget_skipped"] = sorted(
+                    set(rec["items_budget_skipped"])
+                    | {n["item_index"] for n in live
+                       if n["kind"] == "unmet_item"})
                 _save()
                 continue
             pend = [n for n in rec["pending_controls"]
@@ -62193,6 +62369,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             prior_members += [m for m in members if m not in prior_members]
             routed_items |= {n["item_index"] for n in live
                              if n["kind"] == "unmet_item"}
+            rec["items_driven"] = sorted(set(rec["items_driven"])
+                                         | routed_items)
             routed_checks = routed_checks or any(n["kind"] == "ci_check"
                                                  for n in live)
             post_sha = await _branch_head_sha(str(staging))
@@ -62461,6 +62639,18 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                         "final_tree": _shipping_tree(st)}
             st.save()
     rec["final_sha"] = final
+    unrouted = _redrive_unrouted_items(
+        open_items(), rec["items_driven"], rec["items_budget_skipped"],
+        stopped_on_budget)
+    if unrouted:
+        rec["unrouted_items"] = unrouted
+        log("  WARNING: delivery re-drive: "
+            f"{len(unrouted)} unmet item(s) reached no worker — "
+            + "; ".join(f"item {u['item_index']} ({u['reason']})"
+                        for u in unrouted)
+            + " — recorded as unrouted_item; the run stays unconverged")
+    else:
+        rec.pop("unrouted_items", None)
     rec["done"] = True
     _save()
     log("  delivery re-drive: done"

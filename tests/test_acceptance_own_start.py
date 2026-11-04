@@ -307,7 +307,8 @@ def test_real_runner_reports_give_per_case_statuses(leerie, kind, fixture,
                                                     failed, passed):
     """The C9 bench's real reports (one failing case of four each)."""
     parsed = leerie._parse_runner_report(kind,
-                                         (FIXTURES / fixture).read_bytes())
+                                         (FIXTURES / fixture).read_bytes(),
+                                         None)
     statuses = parsed["cases"]
     got_failed = [c for c, s in statuses.items() if s == "failed"]
     assert len(got_failed) == 1 and failed[0] in got_failed[0]
@@ -321,7 +322,8 @@ def test_a_go_package_that_did_not_build_is_a_load_error(leerie, tmp_path):
         {"Action": "start", "Package": "m/calc"},
         {"Action": "output", "Package": "m/calc", "Output": "build failed\n"},
         {"Action": "fail", "Package": "m/calc", "Elapsed": 0}]) + "\nnoise\n")
-    parsed = leerie._parse_runner_report("go-json", rep.read_bytes())
+    parsed = leerie._parse_runner_report("go-json", rep.read_bytes(),
+                                         str(tmp_path))
     assert parsed == {"executed": 0, "collection_error": True,
                       "cases": {"m/calc :: (package failed to build)":
                                 "load_error"}}

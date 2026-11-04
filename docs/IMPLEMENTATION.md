@@ -4946,10 +4946,21 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   bytes the shim copied to the descriptor and writes nothing to disk
   (`die()` when a sandbox names a report and `report_into` is None). The
   readers take the bytes: `_runner_report_cases(kind, report: bytes |
-  None, tree=None)`, `_runner_report_failing_ids(kind, report, tree)`,
+  None, tree=None, *, class_files=True)`,
+  `_runner_report_failing_ids(kind, report, tree)`,
   `_runner_report_file_durations(kind, report, tree=None)`,
-  `_parse_runner_report(kind, report)` (JUnit through
-  `ElementTree.fromstring`). The minitest reporter is a file of leerie's
+  `_parse_runner_report(kind, report, tree)` (JUnit through
+  `ElementTree.fromstring`; `tree` has no default — every case ID names its
+  file relative to the tree the runner ran in, DESIGN §8 *A case has one
+  name in every tree*; it reads with `class_files=False`, so a JUnit case
+  with no `file` attribute keeps its class name rather than a file looked
+  up in the tree, whose disk differs between trees — a set is placed in
+  the sandbox overlay only). Case IDs a run's state recorded before that rule
+  are made relative on read by `_acceptance_case_ids_relative(data)`
+  (`_case_id_relative(cid, rels)` over every `defect_files`/`control_files`/
+  `support_files` path the `acceptance` block names; idempotent), called by
+  `State.load` and by `_prior_delivery_residual` on each sibling run's
+  state. The minitest reporter is a file of leerie's
   install, `scripts/minitest-report/minitest/leeriereport_plugin.rb`, put
   on `RUBYLIB` as `MINITEST_REPORT_LIB`; `_acceptance_report_spec` writes
   nothing. Nothing is written under `<run>/acceptance/reports/`,
@@ -9474,7 +9485,15 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   entries, rendered under "Task requirements". `items` is always the
   whole `required_items`, so `judge_idx` and every `item_index` are the
   run's own; a pass over some items passes `only=<indices>`
-  (`_redrive_recheck_items` does — review round 14 M4), and
+  (`_redrive_recheck_items` does — review round 14 M4). `full_vote=
+  <indices>` names items whose 2-of-3 unmet verdict this pass replaces
+  (`_judge_majority_items(rows)`: the rows whose `by`/`settled_by` names
+  the judge or nothing): a pack holding one runs all three samples and the
+  same majority decides, so one met sample never overturns a majority
+  (DESIGN §8 *A re-check replaces a verdict only on a tree that changed,
+  and only by the vote that made it*). `_redrive_recheck_items` passes
+  the prior `unmet_final`'s, `_run_delivery_recheck` the `unmet_before`'s;
+  and
   `routing["human_verification"]` lists them
   (`tests/test_record_worker_only.py`). With `item_details`, each such
   item's detail carries `worker_only: true`. Every reader treats it as
@@ -9928,8 +9947,10 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   integrated source file that `where` names (the whole string, or its part
   before a `:`), else none.
 - **Routing** (`_redrive_route(notes, subfiles, *, fallback, pending)`,
-  pure). `subfiles` maps each integrated subtask — plan order, status not
-  `blocked` / `unconverged` / `accepted_external`, not accept-blocked — to
+  pure). `subfiles` maps each planned subtask — plan order, status not
+  `blocked` / `accepted_external`, not accept-blocked; an `unconverged` one
+  is included (DESIGN §8 *An unmet item reaches its owner, or is recorded
+  as reaching none*) — to
   `_redrive_subtask_files`: the source files (`_CONTRACT_CODE_FILE_RE`, not
   `_is_test_file`) its `leerie: integrate <sid>` merge changed
   (`_integration_commit`, `git diff --name-only <merge>^1 <merge>`), else
@@ -9960,7 +9981,9 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   Per group, in order: the notes still open are kept (a set note only when
   its file still fails; items and checks always), and a group with none is
   skipped (`skipped: nothing_left`); members whose `_redrive_allowed` is
-  false are dropped (`skipped: budget` when none is left); each member's
+  false are dropped (`skipped: budget` when none is left, its unmet items
+  added to `items_budget_skipped`); a group that drives adds its items to
+  `items_driven`; each member's
   counter is consumed (`_consume_redrive`); `in_flight {pre_sha, round,
   group}` is saved; with shown sets, in a Prisma/PostgreSQL repo the
   implementer is spawned through `scripts/sandbox-db.sh`
@@ -10114,10 +10137,14 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   success-shaped `if (<null test>) return …` before an error in the same
   function, D3 a new catch that swallows an error class some changed file
   throws under a null guard; a script that yields no JSON voids the round.
-- **Re-check and record.** At a round's end, when HEAD moved: routed items
+- **Re-check and record.** At a round's end, when HEAD differs from the
+  commit the verdict being replaced was made on (`items_rechecked_sha`,
+  which starts as `delivery_gate.final_sha` — never empty, so a round that
+  changed nothing re-judges nothing): routed items
   are re-checked (`_redrive_recheck_items`: judge-unmet and
   untouched-paths items through `_delivery_judge_unmet(<all required
-  items>, phase_label="redrive", only=<those indices>)` with
+  items>, phase_label="redrive", only=<those indices>,
+  full_vote=_judge_majority_items(<unmet_final>))` with
   `_delivery_record`, falsifier-confirmed items by
   re-running their saved probe — `falsifier.samples[].probe_saved` — as a
   one-file set through `_evaluate_acceptance_sets`; unmet if either says
@@ -13003,7 +13030,7 @@ command line overrides it.
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `integration_unjudged` | dict[str, str] | per-sid write-ahead marker of an integrator merge not yet judged (`_mark_integration_unjudged`, DESIGN §6 *A committed resolution is not a judged one*): the merge's first parent, saved before the integrator is spawned and dropped once the integration is decided (`_clear_integration_unjudged`); a resume that finds it with no `integration_gate[sid]` and the sid merged runs the integration gate on the committed merge. |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[], unverified?{item_index: {sha, label}}}` (`unverified`: items a failed ratchet did not read on the commit it kept, `_ratchet_mark_unverified`) — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
-| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), selfcheck_calls?[{args[], subset[], name_filter, rc, secs_total}] (the group's self-check calls, first 50), unclean_tree?[] (the porcelain lines a group's implementer left past `clean_tree_reasks`; the group is then `rolled_back`), committed_staged[] (shown set paths a commit names — `git log --name-only -m pre..post` — and paths whose committed blob holds a span of a shown set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], kept_unsettled?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
+| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), selfcheck_calls?[{args[], subset[], name_filter, rc, secs_total}] (the group's self-check calls, first 50), unclean_tree?[] (the porcelain lines a group's implementer left past `clean_tree_reasks`; the group is then `rolled_back`), committed_staged[] (shown set paths a commit names — `git log --name-only -m pre..post` — and paths whose committed blob holds a span of a shown set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], items_driven[item indices a group drove], items_budget_skipped[item indices a group held with no member left a re-drive round], unrouted_items?[{item_index, item, reason: no_owner | budget}] (`_redrive_unrouted_items` at the end: still-open items no group drove; read by `_decide_outcome`'s reasons and `_prior_delivery_residual`'s `unrouted_items`), kept_unsettled?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½), plus `gate` (`skipped` \| `degraded` \| `passed`, `_record_provision_gate`) once `phase_provision_gate` has a result. `_run_phases` runs both after the `plans_after_classify` block, keyed on `recipe` and on `gate` (DESIGN §6 *Resumable planning*). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution` or `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*). |
