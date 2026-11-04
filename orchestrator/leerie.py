@@ -31808,7 +31808,10 @@ class State:
 
     def load(self) -> bool:
         if self.path.exists():
-            self.data = json.loads(self.path.read_text())
+            # Case IDs a run recorded per worktree read as one name per case
+            # (DESIGN §8 *A case has one name in every tree*).
+            self.data = _acceptance_case_ids_relative(
+                json.loads(self.path.read_text()))
             return True
         return False
 
@@ -50103,6 +50106,63 @@ def _downgrade_ungrounded_met(contract: dict | None,
             "evidence": (evidence + "\n" + note).strip()}
 
 
+def _case_id_relative(cid: str, rels: Iterable[str]) -> str:
+    """`cid` with an absolute file part (`<tree>/<rel> :: <title>`) made
+    `<rel> :: <title>`, `rel` the longest of `rels` the path ends in; any
+    other ID unchanged. A case ID is leerie's own mechanical string (the
+    runner's file, ` :: `, its title — `_runner_report_cases`), so this is
+    path arithmetic, not interpretation (DESIGN §12)."""
+    head, sep, rest = cid.partition(" :: ")
+    if not sep or not os.path.isabs(head):
+        return cid
+    for rel in sorted({os.path.normpath(r) for r in rels
+                       if isinstance(r, str) and r and not os.path.isabs(r)},
+                      key=len, reverse=True):
+        if head.endswith("/" + rel):
+            return f"{rel}{sep}{rest}"
+    return cid
+
+
+def _acceptance_case_ids_relative(data: dict) -> dict:
+    """`data` (a run's state) with every case ID its `acceptance` block
+    recorded made relative to the tree it ran in, in place
+    (`_case_id_relative` over every set file the block names). A run before
+    `_parse_runner_report` took the tree recorded absolute, per-worktree IDs
+    (DESIGN §8 *A case has one name in every tree*); read through here — on
+    every `State.load` and by `_prior_delivery_residual` — a resumed run and
+    the next run's residual compare like with like. Idempotent."""
+    acc = data.get("acceptance") if isinstance(data, dict) else None
+    if not isinstance(acc, dict):
+        return data
+    rels: set[str] = set()
+
+    def _gather(x: object) -> None:
+        if isinstance(x, dict):
+            for k in ("defect_files", "control_files", "support_files"):
+                if isinstance(x.get(k), list):
+                    rels.update(r for r in x[k] if isinstance(r, str))
+            for v in x.values():
+                _gather(v)
+        elif isinstance(x, list):
+            for v in x:
+                _gather(v)
+    _gather(acc)
+    if not rels:
+        return data
+
+    def _fix(x: object) -> object:
+        if isinstance(x, str):
+            return _case_id_relative(x, rels)
+        if isinstance(x, list):
+            return [_fix(v) for v in x]
+        if isinstance(x, dict):
+            return {(_case_id_relative(k, rels) if isinstance(k, str)
+                     else k): _fix(v) for k, v in x.items()}
+        return x
+    data["acceptance"] = _fix(acc)
+    return data
+
+
 def _acceptance_set_broken(set_: dict) -> bool:
     """Whether a held-out set has been typed `broken` — a test no correct
     fix could pass. The set audit (DESIGN §8) is what types it; this is the
@@ -50259,6 +50319,7 @@ def _prior_delivery_residual(st: "State") -> dict | None:
             continue
         if (data.get("task") or "").strip() != task:
             continue
+        _acceptance_case_ids_relative(data)
         # A run that never COMPLETED resolved nothing: skip it rather
         # than stopping — the operator's normal loop is to re-run
         # after a crash, and stopping here would throw away the last
@@ -53215,14 +53276,23 @@ def _command_word(tokens: list[tuple[str, str, int]]) -> str | None:
     return None
 
 
-def _parse_runner_report(kind: str, report: bytes | None) -> dict | None:
+def _parse_runner_report(kind: str, report: bytes | None,
+                         tree: str | None) -> dict | None:
     """`{executed, collection_error, cases}` from a runner's structured
     report — `cases` maps each case ID to its status (`passed`, `failed`,
     `skipped` or `load_error`), the per-case verdict validation reads
     (DESIGN §8 *Held-out acceptance tests*) — or None when there is none to
     read (the runner ignored the request, or it died before writing). Reads
-    fixed machine formats only (DESIGN §12)."""
-    cases = _runner_report_cases(kind, report)
+    fixed machine formats only (DESIGN §12).
+
+    `tree` is the tree the runner ran in, and has no default: a case ID
+    names its file relative to it, so one case has one ID in every tree
+    (DESIGN §8 *A case has one name in every tree*). Read without it,
+    vitest's absolute suite paths kept each worktree's prefix, and a set's
+    counted cases (validated in `acceptance-N`) never met its failing ones
+    (evaluated in `acceptance-eval`) — barnacle 48c48629 ended `done` with a
+    counted case still failing."""
+    cases = _runner_report_cases(kind, report, tree, class_files=False)
     if cases is None:
         return None
     return {"executed": sum(1 for c in cases
@@ -53240,7 +53310,8 @@ def _parse_runner_report(kind: str, report: bytes | None) -> dict | None:
 
 
 def _runner_report_cases(kind: str, report: bytes | None,
-                         tree: str | None = None) -> list[dict] | None:
+                         tree: str | None = None, *,
+                         class_files: bool = True) -> list[dict] | None:
     """Every case a runner's structured report records, as
     `{id, file, status}` — `status` one of `passed`, `failed` (a setup error
     included: it ran and failed), `skipped`, or `load_error` (the file or
@@ -53249,7 +53320,12 @@ def _runner_report_cases(kind: str, report: bytes | None,
     when there is no readable report of a known kind. Fixed machine formats
     only (DESIGN §12): pytest's JUnit XML, the jest-compatible JSON of jest
     and vitest, rspec's JSON formatter, leerie's minitest reporter
-    (`MINITEST_REPORT_LIB`), `go test -json` and libtest's JSON events."""
+    (`MINITEST_REPORT_LIB`), `go test -json` and libtest's JSON events.
+
+    `class_files=False` never looks a JUnit class's file up in `tree`: what
+    is on disk there differs between trees (a held-out set is placed in a
+    sandbox overlay, never on disk), so an ID that must be one name in
+    every tree cannot depend on it."""
 
     if report is None:
         return None
@@ -53302,7 +53378,7 @@ def _runner_report_cases(kind: str, report: bytes | None,
                          "load_error")
                     continue
                 f = case.get("file")
-                if not f and classname and tree is not None:
+                if not f and classname and tree is not None and class_files:
                     f = _junit_class_file(classname, tree)
                 rel = _rel(f) if f else None
                 status = ("skipped" if "skipped" in tags
@@ -53851,7 +53927,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
         return None
     if not validating:
         if cases_out is not None:
-            got = (_parse_runner_report(spec[2], bytes(got_report) or None)
+            got = (_parse_runner_report(spec[2], bytes(got_report) or None,
+                                        str(tree))
                    if spec is not None else None)
             if got is None and _rc_is_resource_signal(rc):
                 # Killed (an OOM kill, a signal) before writing a report.
@@ -53869,7 +53946,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                     cid: m for cid, m in (got.get("messages") or {}).items()
                     if cid in cases_out["failing_cases"]}
         return rc == 0
-    parsed = (_parse_runner_report(spec[2], bytes(got_report) or None)
+    parsed = (_parse_runner_report(spec[2], bytes(got_report) or None,
+                                   str(tree))
               if spec else None)
     if parsed is None:
         if rc in _acceptance_no_verdict_exits(cmd, [rel]):

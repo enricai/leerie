@@ -4946,10 +4946,21 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   bytes the shim copied to the descriptor and writes nothing to disk
   (`die()` when a sandbox names a report and `report_into` is None). The
   readers take the bytes: `_runner_report_cases(kind, report: bytes |
-  None, tree=None)`, `_runner_report_failing_ids(kind, report, tree)`,
+  None, tree=None, *, class_files=True)`,
+  `_runner_report_failing_ids(kind, report, tree)`,
   `_runner_report_file_durations(kind, report, tree=None)`,
-  `_parse_runner_report(kind, report)` (JUnit through
-  `ElementTree.fromstring`). The minitest reporter is a file of leerie's
+  `_parse_runner_report(kind, report, tree)` (JUnit through
+  `ElementTree.fromstring`; `tree` has no default — every case ID names its
+  file relative to the tree the runner ran in, DESIGN §8 *A case has one
+  name in every tree*; it reads with `class_files=False`, so a JUnit case
+  with no `file` attribute keeps its class name rather than a file looked
+  up in the tree, whose disk differs between trees — a set is placed in
+  the sandbox overlay only). Case IDs a run's state recorded before that rule
+  are made relative on read by `_acceptance_case_ids_relative(data)`
+  (`_case_id_relative(cid, rels)` over every `defect_files`/`control_files`/
+  `support_files` path the `acceptance` block names; idempotent), called by
+  `State.load` and by `_prior_delivery_residual` on each sibling run's
+  state. The minitest reporter is a file of leerie's
   install, `scripts/minitest-report/minitest/leeriereport_plugin.rb`, put
   on `RUBYLIB` as `MINITEST_REPORT_LIB`; `_acceptance_report_spec` writes
   nothing. Nothing is written under `<run>/acceptance/reports/`,

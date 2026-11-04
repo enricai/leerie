@@ -1,0 +1,304 @@
+{
+ "_source": "barnacle run 48c48629 state.json (leerie 0.43.0), acceptance.sets (index, files, scope.bounded, scope.counted_cases) and acceptance.gate.{final,residual}, verbatim, extracted 2026-11-04",
+ "acceptance": {
+  "sets": [
+   {
+    "index": 1,
+    "valid": true,
+    "defect_files": [
+     "test/acceptance-engine/raw-fetch-redirect.defect.test.ts",
+     "test/acceptance-engine/node-range.defect.test.ts",
+     "test/acceptance-engine/session-release.defect.test.ts"
+    ],
+    "control_files": [
+     "test/acceptance-engine/raw-fetch-redirect.control.test.ts",
+     "test/acceptance-engine/node-range.control.test.ts",
+     "test/acceptance-engine/session-release.control.test.ts"
+    ],
+    "support_files": [],
+    "scope": {
+     "bounded": true,
+     "counted_cases": {
+      "test/acceptance-engine/raw-fetch-redirect.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-1/test/acceptance-engine/raw-fetch-redirect.defect.test.ts :: rawFetch opt-in manual redirect handling with redirect manual, onResponse receives the 302 hop's Set-Cookie and Location and the 302 is returned",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-1/test/acceptance-engine/raw-fetch-redirect.defect.test.ts :: rawFetch opt-in manual redirect handling a caller can walk a chain hop by hand, carrying each hop's cookie to the next",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-1/test/acceptance-engine/raw-fetch-redirect.defect.test.ts :: rawFetch opt-in manual redirect handling forwards the redirect mode to the fetch implementation"
+      ],
+      "test/acceptance-engine/node-range.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-1/test/acceptance-engine/node-range.defect.test.ts :: advertised Node range matches undici's requirement engines.node lower bound is at least the undici dependency's floor",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-1/test/acceptance-engine/node-range.defect.test.ts :: advertised Node range matches undici's requirement Dockerfile node images are pinned to at least the floor",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-1/test/acceptance-engine/node-range.defect.test.ts :: advertised Node range matches undici's requirement CI node-version values are at least the floor"
+      ],
+      "test/acceptance-engine/session-release.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-1/test/acceptance-engine/session-release.defect.test.ts :: browserbase close() provider release releases the provider session even when stagehand.close() never settles",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-1/test/acceptance-engine/session-release.defect.test.ts :: browserbase close() provider release close() itself resolves when stagehand.close() hangs forever"
+      ]
+     }
+    }
+   },
+   {
+    "index": 2,
+    "valid": true,
+    "defect_files": [
+     "src/acceptance_engine_contract/node-range.defect.test.ts",
+     "src/acceptance_engine_contract/raw-fetch-redirect.defect.test.ts",
+     "src/acceptance_engine_contract/session-close.defect.test.ts"
+    ],
+    "control_files": [
+     "src/acceptance_engine_contract/node-range.control.test.ts",
+     "src/acceptance_engine_contract/raw-fetch-redirect.control.test.ts",
+     "src/acceptance_engine_contract/session-close.control.test.ts"
+    ],
+    "support_files": [],
+    "scope": {
+     "bounded": true,
+     "counted_cases": {
+      "src/acceptance_engine_contract/node-range.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-2/src/acceptance_engine_contract/node-range.defect.test.ts :: advertised Node range matches what undici 8 can load on engines.node lower bound is at least 22.19.0",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-2/src/acceptance_engine_contract/node-range.defect.test.ts :: advertised Node range matches what undici 8 can load on Dockerfile node base images are not an unpinned node 22 major",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-2/src/acceptance_engine_contract/node-range.defect.test.ts :: advertised Node range matches what undici 8 can load on CI workflows do not use an unpinned node 22 major"
+      ],
+      "src/acceptance_engine_contract/raw-fetch-redirect.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-2/src/acceptance_engine_contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes redirect hops redirect: manual returns the 302 itself and onResponse sees its Set-Cookie and Location",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-2/src/acceptance_engine_contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes redirect hops redirect: manual works for a different chain start (301 with another cookie)",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-2/src/acceptance_engine_contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes redirect hops result carries the response headers and the final URL"
+      ],
+      "src/acceptance_engine_contract/session-close.defect.test.ts": []
+     }
+    }
+   },
+   {
+    "index": 3,
+    "valid": true,
+    "defect_files": [
+     "src/held-out-acceptance/engine-range.defect.test.ts",
+     "src/held-out-acceptance/session-close-release.defect.test.ts",
+     "src/held-out-acceptance/raw-fetch-redirect-hops.defect.test.ts"
+    ],
+    "control_files": [
+     "src/held-out-acceptance/raw-fetch-redirect-hops.control.test.ts",
+     "src/held-out-acceptance/session-close-release.control.test.ts"
+    ],
+    "support_files": [],
+    "scope": {
+     "bounded": true,
+     "counted_cases": {
+      "src/held-out-acceptance/engine-range.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-3/src/held-out-acceptance/engine-range.defect.test.ts :: engine Node range matches undici 8 package.json engines.node lower bound is at least 22.19.0",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-3/src/held-out-acceptance/engine-range.defect.test.ts :: engine Node range matches undici 8 Dockerfile node base images are not bare 22 tags below 22.19",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-3/src/held-out-acceptance/engine-range.defect.test.ts :: engine Node range matches undici 8 CI workflows do not use a bare node-version 22"
+      ],
+      "src/held-out-acceptance/session-close-release.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-3/src/held-out-acceptance/session-close-release.defect.test.ts :: session close() guarantees provider release releases the remote session even when stagehand.close() never settles",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-3/src/held-out-acceptance/session-close-release.defect.test.ts :: session close() guarantees provider release close() resolves within a bounded time when stagehand.close() hangs"
+      ],
+      "src/held-out-acceptance/raw-fetch-redirect-hops.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-3/src/held-out-acceptance/raw-fetch-redirect-hops.defect.test.ts :: rawFetch redirect hops (opt-in manual redirect handling) redirect manual: onResponse sees the Set-Cookie and Location of the 302 and status is the 302",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-rewrite-3/src/held-out-acceptance/raw-fetch-redirect-hops.defect.test.ts :: rawFetch redirect hops (opt-in manual redirect handling) redirect manual: carrying the intermediate cookie to the next hop lets the final page see it"
+      ]
+     }
+    }
+   },
+   {
+    "index": 4,
+    "valid": true,
+    "defect_files": [
+     "src/held-out-acceptance/node-range.defect.test.ts",
+     "src/held-out-acceptance/raw-fetch-hops.defect.test.ts",
+     "src/held-out-acceptance/session-close.defect.test.ts"
+    ],
+    "control_files": [
+     "src/held-out-acceptance/node-range.control.test.ts",
+     "src/held-out-acceptance/raw-fetch-hops.control.test.ts",
+     "src/held-out-acceptance/session-close.control.test.ts"
+    ],
+    "support_files": [],
+    "scope": {
+     "bounded": true,
+     "counted_cases": {
+      "src/held-out-acceptance/node-range.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/node-range.defect.test.ts :: node range matches what undici 8 can load on engines.node lower bound is at least 22.19.0",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/node-range.defect.test.ts :: node range matches what undici 8 can load on every Dockerfile base image pins a Node version undici 8 can load on",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/node-range.defect.test.ts :: node range matches what undici 8 can load on every CI workflow node-version admits only Node versions undici 8 can load on"
+      ],
+      "src/held-out-acceptance/raw-fetch-hops.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/raw-fetch-hops.defect.test.ts :: rawFetch redirect visibility redirect manual surfaces the 302 with its Set-Cookie and Location through onResponse",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/raw-fetch-hops.defect.test.ts :: rawFetch redirect visibility redirect manual works for a different path, status and cookie",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/raw-fetch-hops.defect.test.ts :: rawFetch redirect visibility redirect manual result exposes the response headers",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/raw-fetch-hops.defect.test.ts :: rawFetch redirect visibility the redirect option reaches an injected fetchImpl",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/raw-fetch-hops.defect.test.ts :: rawFetch redirect visibility a followed redirect result carries the final response headers and the final URL",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/raw-fetch-hops.defect.test.ts :: rawFetch redirect visibility a followed redirect on another path reports its own final URL"
+      ],
+      "src/held-out-acceptance/session-close.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/session-close.defect.test.ts :: browserbase session close() always releases the provider session issues REQUEST_RELEASE even when stagehand.close() never settles",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-4/src/held-out-acceptance/session-close.defect.test.ts :: browserbase session close() always releases the provider session close() itself resolves after a hung stagehand.close()"
+      ]
+     }
+    }
+   },
+   {
+    "index": 5,
+    "valid": true,
+    "defect_files": [
+     "test/acceptance-engine-contract/engines.defect.test.ts",
+     "test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts",
+     "test/acceptance-engine-contract/session-close-timeout.defect.test.ts"
+    ],
+    "control_files": [
+     "test/acceptance-engine-contract/raw-fetch-redirect.control.test.ts"
+    ],
+    "support_files": [],
+    "scope": {
+     "bounded": true,
+     "counted_cases": {
+      "test/acceptance-engine-contract/engines.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-5/test/acceptance-engine-contract/engines.defect.test.ts :: engine Node range matches the undici dependency engines.node floor is at least the floor undici itself declares",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-5/test/acceptance-engine-contract/engines.defect.test.ts :: engine Node range matches the undici dependency every Dockerfile node base image is pinned to at least undici's floor",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-5/test/acceptance-engine-contract/engines.defect.test.ts :: engine Node range matches the undici dependency every CI workflow node-version is at least undici's floor"
+      ],
+      "test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-5/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop report example onResponse sees the 302's Set-Cookie and Location",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-5/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop report example onResponse is called once per hop, in order, ending with the final response"
+      ],
+      "test/acceptance-engine-contract/session-close-timeout.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-5/test/acceptance-engine-contract/session-close-timeout.defect.test.ts :: browserbase close() releases the provider session even when stagehand.close() hangs REQUEST_RELEASE is issued within a bounded time when stagehand.close() never settles",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-5/test/acceptance-engine-contract/session-close-timeout.defect.test.ts :: browserbase close() releases the provider session even when stagehand.close() hangs close() resolves within a bounded time when stagehand.close() takes an hour to settle"
+      ]
+     }
+    }
+   }
+  ],
+  "gate": {
+   "final": [
+    {
+     "index": 1,
+     "passed": true,
+     "unmeasured": false,
+     "failing_files": [],
+     "discovery": {
+      "files": [
+       "test/acceptance-engine/raw-fetch-redirect.defect.test.ts",
+       "test/acceptance-engine/node-range.defect.test.ts",
+       "test/acceptance-engine/session-release.defect.test.ts"
+      ],
+      "repeats_required": 10,
+      "repeats_run": 8,
+      "budget_exhausted": true,
+      "found": [],
+      "incomplete": true,
+      "reason": "budget_exhausted"
+     }
+    },
+    {
+     "index": 2,
+     "passed": true,
+     "unmeasured": false,
+     "failing_files": [],
+     "discovery": {
+      "files": [
+       "src/acceptance_engine_contract/node-range.defect.test.ts",
+       "src/acceptance_engine_contract/raw-fetch-redirect.defect.test.ts"
+      ],
+      "repeats_required": 10,
+      "repeats_run": 10,
+      "budget_exhausted": false,
+      "found": [],
+      "incomplete": false,
+      "reason": ""
+     }
+    },
+    {
+     "index": 3,
+     "passed": true,
+     "unmeasured": false,
+     "failing_files": [],
+     "discovery": {
+      "files": [
+       "src/held-out-acceptance/engine-range.defect.test.ts",
+       "src/held-out-acceptance/session-close-release.defect.test.ts",
+       "src/held-out-acceptance/raw-fetch-redirect-hops.defect.test.ts"
+      ],
+      "repeats_required": 10,
+      "repeats_run": 7,
+      "budget_exhausted": true,
+      "found": [],
+      "incomplete": true,
+      "reason": "budget_exhausted"
+     }
+    },
+    {
+     "index": 4,
+     "passed": true,
+     "unmeasured": false,
+     "failing_files": [],
+     "discovery": {
+      "files": [
+       "src/held-out-acceptance/node-range.defect.test.ts",
+       "src/held-out-acceptance/raw-fetch-hops.defect.test.ts",
+       "src/held-out-acceptance/session-close.defect.test.ts"
+      ],
+      "repeats_required": 10,
+      "repeats_run": 10,
+      "budget_exhausted": false,
+      "found": [],
+      "incomplete": false,
+      "reason": ""
+     }
+    },
+    {
+     "index": 5,
+     "passed": false,
+     "unmeasured": false,
+     "failing_files": [
+      "test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts"
+     ],
+     "failing_cases": {
+      "test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-eval/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop report example onResponse is called once per hop, in order, ending with the final response",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-eval/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop report example onResponse sees the 302's Set-Cookie and Location",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-eval/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop variants a 303 after a POST reports the redirect hop's headers",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-eval/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop variants a three-hop chain with different paths and cookies reports every hop"
+      ]
+     },
+     "discovery": {
+      "files": [
+       "test/acceptance-engine-contract/engines.defect.test.ts",
+       "test/acceptance-engine-contract/session-close-timeout.defect.test.ts"
+      ],
+      "repeats_required": 10,
+      "repeats_run": 7,
+      "budget_exhausted": true,
+      "found": [],
+      "incomplete": true,
+      "reason": "budget_exhausted"
+     }
+    }
+   ],
+   "residual": {
+    "failing_sets": 1,
+    "held_back_failing_sets": 1,
+    "total_sets": 5,
+    "cases": [],
+    "sets": [
+     5
+    ],
+    "cases_by_set": {},
+    "files_by_set": {
+     "5": [
+      "test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts"
+     ]
+    },
+    "failing_cases_by_set": {
+     "5": {
+      "test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts": [
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-eval/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop report example onResponse is called once per hop, in order, ending with the final response",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-eval/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop report example onResponse sees the 302's Set-Cookie and Location",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-eval/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop variants a 303 after a POST reports the redirect hop's headers",
+       "/leerie-state/runs/48c4862937fd1522bfcf6ac724655899618c485a339dafbc6dfaee09e1efa386/worktrees/48c4862937fd-acceptance-eval/test/acceptance-engine-contract/raw-fetch-redirect.defect.test.ts :: rawFetch exposes every redirect hop variants a three-hop chain with different paths and cookies reports every hop"
+      ]
+     }
+    }
+   }
+  }
+ }
+}

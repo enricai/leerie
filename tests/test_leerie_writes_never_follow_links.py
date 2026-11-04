@@ -220,7 +220,7 @@ def test_a_held_out_report_is_parsed_from_its_descriptor_never_from_disk(
     def spec(cmd, report, files):
         return (cmd, {**os.environ, "LEERIE_REPORT": str(report)}, "probe")
 
-    def parse(kind, report):
+    def parse(kind, report, tree):
         read["bytes"] = report
         return {"collection_error": False, "executed": 1,
                 "cases": {"held.sh::a": "failed"}, "messages": {}}

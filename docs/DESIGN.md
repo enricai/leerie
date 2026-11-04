@@ -14862,6 +14862,25 @@ out-of-scope ones dropped; per set-sample, 15 of 15 with an in-scope case
 kept and 30 of 30 without one dropped; and the late runs of the two replayed
 chains (12 and 4) all converged, in every sample.
 
+**A case has one name in every tree.** A set runs in several trees: its
+validation and its scope judge in its own (`acceptance-N`,
+`acceptance-rewrite-N`), the evaluation in another (`acceptance-eval`), the
+audit and the surrogate witness in others still. Some runners name a case by
+its file's absolute path — vitest's jest-compatible JSON does — so one case
+read in two trees had two names, and every per-case comparison across trees
+(the counted cases against the failing ones, the held cases against a
+rerun's) found nothing in common. Measured on barnacle 48c48629 (leerie
+0.43.0, replayed under 0.44.3's functions on 2026-11-04): set 5 still failed
+at ship on its counted cases, the per-case test found none of them failing,
+the run ended `done`, and the residual read back as nothing, so the next run
+on the task (a192d275) was handed no `acceptance_unmet`; 0.44.3 runs
+237ea25c, 7cff429a and ddd383ea recorded the same absolute names. A case's
+name is therefore made relative to the tree it ran in when the runner's
+report is read, so every reader compares like with like. Names a run
+recorded before this rule are made relative when its state is read — on
+resume, and when a later run reads it for its residual — against the set's
+own file paths, never by guessing at a tree.
+
 **Scoped runners for every runner leerie can read.** A set runs only
 through a scoped test template — the canonical command over the set's own
 files, in the runner's direct form (`vitest run`, `jest --runTestsByPath`,
