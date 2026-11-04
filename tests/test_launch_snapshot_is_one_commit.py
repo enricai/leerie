@@ -207,8 +207,14 @@ def test_a_checkout_git_cannot_read_is_copied_with_gits_reason(tmp_path):
     with git's reason named and no commit recorded."""
     inst = _install(tmp_path)
     (inst / "prompts" / "edited.md").write_text("# edited\n")
+    # The host's system config is not read: a GitHub runner's /etc/gitconfig
+    # carries `safe.directory = *` (actions/runner-images, install-git.sh),
+    # which marks every checkout safe, so git read this one and the launch
+    # took the git path. The refusal is the subject; whether a host waives
+    # it is not.
     rc, out, err = _run(tmp_path, inst,
-                        env={"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"})
+                        env={"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+                             "GIT_CONFIG_NOSYSTEM": "1"})
     assert rc == 0, err
     snap, commit = (out.splitlines() + [""])[:2]
     assert commit == ""
