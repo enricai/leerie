@@ -10683,7 +10683,14 @@ How dependencies reach the worker:
    normal exit machinery — a hard-failing build/test in the
    implementer becomes a `failed` or `blocked` status; in the
    conformer it surfaces as a `tests-failed: …` advisory warning
-   (DESIGN §9).
+   (DESIGN §9). `_summarize_residuals` writes a failing axis as
+   `<axis>-failed: <summary> — '<command>'`, the command cut to
+   `_RESIDUAL_COMMAND_CHARS` (160) characters with its full length named,
+   and, for tests, `; failing: <files>` from the axis's own report
+   (`failing_id_files`, else the `failing_ids`), at most
+   `_RESIDUAL_FAILING_FILES` (10) and `(+N more)`. A cleanup failure is
+   logged through `_exc_text` (message, or the exception type when the
+   message is empty).
 
 Why this shape (persistent bake + residual worker install):
 
