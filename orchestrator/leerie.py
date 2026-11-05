@@ -50319,11 +50319,14 @@ def _acceptance_work_fails(results: list[dict], sets: list[dict]) -> bool:
     """`_acceptance_any_fails` for the has-work readers: True when a MEASURED
     set failed AND that failure is work (`_acceptance_result_has_work`). The
     repair rounds and the audit keep reading `_acceptance_any_fails`, so a
-    variant set is still repaired."""
+    variant set is still repaired. A result whose set is not in `sets` is
+    not work: an empty record would read as unbounded and unbroken (DESIGN
+    §8 *Delivery re-drive* rule 1)."""
     by_index = {s_.get("index"): s_ for s_ in sets if isinstance(s_, dict)}
-    return any(_acceptance_result_has_work(by_index.get(r["index"]) or {},
-                                           r.get("failing_files") or [],
-                                           r.get("failing_cases"))
+    return any(r["index"] in by_index
+               and _acceptance_result_has_work(by_index[r["index"]],
+                                               r.get("failing_files") or [],
+                                               r.get("failing_cases"))
                for r in _acceptance_measured(results) if not r["passed"])
 
 
@@ -50987,8 +50990,11 @@ def _orchestrator_results_digest(st: "State",
     B* confirmed newly failing, and each held-out acceptance set's final
     verdict — a held-back set's verdict alone, never its files or case
     names: the judge's evidence reaches the fixers (DESIGN §8 *Nothing a
-    held-out evaluation produces reaches a fixer*). Read from typed state
-    only; "" when none of it exists yet.
+    held-out evaluation produces reaches a fixer*). A failing set that is
+    not work — typed broken, or failing only on variant cases — says so,
+    never plain "failed", and a shown set names its FAILING cases, never
+    its declared ones (DESIGN §8 *Delivery re-drive* rule 1). Read from
+    typed state only; "" when none of it exists yet.
 
     Each result is in the record only while it describes `tree`'s HEAD
     (DESIGN §8 *Every post-execution verdict is of the committed tree*): a
@@ -51033,26 +51039,42 @@ def _orchestrator_results_digest(st: "State",
     final_sets = (gate.get("final") if isinstance(gate, dict) and head_sha
                   and gate.get("final_sha") == head_sha else None)
     if isinstance(final_sets, list):
-        cases = ((gate.get("residual") or {}).get("cases_by_set") or {}
-                 if isinstance(gate.get("residual"), dict) else {})
-        shown = _acceptance_shown_indices(
-            [s_ for s_ in (acc.get("sets") or [])
-             if isinstance(s_, dict) and "index" in s_])
+        all_sets = [s_ for s_ in (acc.get("sets") or [])
+                    if isinstance(s_, dict) and "index" in s_]
+        by_index = {s_["index"]: s_ for s_ in all_sets}
+        shown = _acceptance_shown_indices(all_sets)
         for r in final_sets:
             if not isinstance(r, dict):
                 continue
             k = r.get("index")
+            set_ = by_index.get(k)
+            if set_ is None:
+                continue   # no set record: no verdict on any set
+            failing = list(r.get("failing_files") or [])
+            ids = (r.get("failing_cases")
+                   if isinstance(r.get("failing_cases"), dict) else {})
             if r.get("unmeasured"):
                 verdict = "not measured"
             elif r.get("passed"):
                 verdict = "passed"
+            elif _acceptance_set_broken(set_):
+                # DESIGN §8 *Delivery re-drive* rule 1: settled, so it
+                # makes no item unmet through this record either.
+                verdict = ("failed — typed broken by the set audit: "
+                           "settled, not unfinished work")
+            elif not _acceptance_result_has_work(set_, failing, ids):
+                verdict = ("failed only on cases outside the report's own "
+                           "scenarios (a variant set): not unfinished work")
             elif k not in shown:
                 verdict = "failed (a held-back set: its tests are not named)"
             else:
-                names = [str(c)[:160] for c in
-                         (cases.get(str(k)) or cases.get(k) or [])][:5]
+                # The cases that FAILED, never every case the writer
+                # declared in a failing file: a declared case that passed
+                # is false evidence (ddd383ea).
+                names = [str(c)[:160] for rel in failing
+                         for c in (ids.get(rel) or [])][:5]
                 verdict = ("failed: " + ", ".join(
-                    str(f) for f in (r.get("failing_files") or [])[:5])
+                    str(f) for f in failing[:5])
                     + (f" (cases: {'; '.join(names)})" if names else ""))
             lines.append(f"[orchestrator held-out acceptance set {k}] "
                          f"result on the final tree: {verdict}")
@@ -59782,8 +59804,13 @@ def _redrive_failing(results: list[dict], sets: list[dict],
     (`_acceptance_result_has_work`; in a bounded set only a defect file
     with a counted case failing, `_acceptance_file_has_work`), and the
     indices that produced no verdict. `failing_cases` are the runner's
-    failing case IDs in that file, `[]` when its report named none."""
-    by = {s_.get("index"): s_ for s_ in sets}
+    failing case IDs in that file, `[]` when its report named none.
+
+    `sets` is every valid set, broken ones included: a result whose set is
+    not in it is skipped, never looked up as an empty record, which reads
+    as unbounded and unbroken — maximal work (DESIGN §8 *Delivery re-drive*
+    rule 1; barnacle ddd383ea routed its broken set 1 so)."""
+    by = {s_.get("index"): s_ for s_ in sets if isinstance(s_, dict)}
     out: dict[str, dict] = {}
     unmeasured: list = []
     for r in results or []:
@@ -59793,7 +59820,9 @@ def _redrive_failing(results: list[dict], sets: list[dict],
         if r.get("unmeasured"):
             unmeasured.append(i)
             continue
-        s_ = by.get(i) or {}
+        s_ = by.get(i)
+        if s_ is None:
+            continue
         failing = list(r.get("failing_files") or [])
         cases = r.get("failing_cases") if isinstance(
             r.get("failing_cases"), dict) else {}
@@ -59813,6 +59842,24 @@ def _redrive_failing(results: list[dict], sets: list[dict],
                 **({"no_case_evidence": True}
                    if rel in (r.get("no_case_evidence_files") or []) else {})}
     return out, unmeasured
+
+
+def _redrive_unreproducible(notes: list[dict],
+                            shown: list[dict]) -> list[str]:
+    """The keys of every set note a re-drive group would hand on (`defect`,
+    `control_regression` with a `set_index`) whose failure its self-check
+    cannot reproduce (DESIGN §8 *Delivery re-drive* rule 4): its set is not
+    a shown set not typed broken, or its file is not one of that set's
+    defect or control files — the files `_selfcheck_prepare(shown)` runs.
+    Held-back notes are names only and never reach the note's work list."""
+    files = {s_.get("index"): set(list(s_.get("defect_files") or [])
+                                  + list(s_.get("control_files") or []))
+             for s_ in shown if isinstance(s_, dict)
+             and not _acceptance_set_broken(s_)}
+    return [str(n.get("key")) for n in notes
+            if isinstance(n, dict) and "set_index" in n
+            and n.get("kind") in ("defect", "control_regression")
+            and n.get("file") not in files.get(n["set_index"], ())]
 
 
 def _redrive_carry(before: dict[str, dict], after: dict[str, dict],
@@ -62125,7 +62172,12 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     acc = st.data.get("acceptance") or {}
     all_sets = [s_ for s_ in (acc.get("sets") or []) if isinstance(s_, dict)]
     sets = [s_ for s_ in all_sets if not _acceptance_set_broken(s_)]
-    by_index = {s_.get("index"): s_ for s_ in sets}
+    # Every valid set, broken ones included: a result is looked up in it,
+    # and a broken set's own record is what says it is not work (DESIGN §8
+    # *Delivery re-drive* rule 1).
+    by_index = {s_.get("index"): s_ for s_ in all_sets}
+    # Split over every valid set, broken ones included, so the held-back
+    # identity is the one the run held back all along (I3).
     shown_idx = _acceptance_shown_indices(all_sets) if all_sets else set()
     shown = [s_ for s_ in sets if s_.get("index") in shown_idx]
     held = [s_ for s_ in sets if s_.get("index") not in shown_idx]
@@ -62214,12 +62266,13 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         sha = await _branch_head_sha(str(staging))
         res = await _evaluate_acceptance_sets(
             st, caps, str(staging), subset, label, rev=sha or "HEAD")
-        return _redrive_failing(res, sets, {s_["index"] for s_ in subset})
+        return _redrive_failing(res, all_sets,
+                                {s_["index"] for s_ in subset})
 
     if gate.get("final_sha") and gate.get("final_sha") == head and isinstance(
             gate.get("final"), list):
-        F, _u = _redrive_failing(gate["final"], sets, shown_idx)
-        H_known, _u = _redrive_failing(gate["final"], sets, held_idx)
+        F, _u = _redrive_failing(gate["final"], all_sets, shown_idx)
+        H_known, _u = _redrive_failing(gate["final"], all_sets, held_idx)
     elif shown or held:
         F, _u = await measure(shown, "redrive-start")
         H_known = None
@@ -62259,7 +62312,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rechecked_sha = rec.get("items_rechecked_sha") or det_sha or None
 
     def set_note(k: str, v: dict, kind: str) -> dict:
-        s_ = by_index.get(v["set_index"]) or {}
+        s_ = by_index[v["set_index"]]
         return {"kind": kind, "key": k, "set_index": v["set_index"],
                 "file": v["file"],
                 "cases": list((s_.get("cases") or {}).get(v["file"], [])),
@@ -62311,6 +62364,14 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                      for k, v in F.items()]
             fallback = site_claimers
         notes += items_open + checks_open + defects_open
+        # The self-check every group is given runs the shown sets: a note
+        # it cannot reproduce is a leerie defect, never handed on (DESIGN §8
+        # *Delivery re-drive* rule 4).
+        bad = _redrive_unreproducible(notes + rec["pending_controls"], shown)
+        if bad:
+            raise RuntimeError(
+                "delivery re-drive: set note(s) outside the self-check of "
+                f"the shown sets: {', '.join(bad[:10])}")
         groups = _redrive_route(notes, subfiles, fallback=fallback,
                                 pending=rec["pending_controls"])
         entry_round = {"round": rnd, "held_mode": held_mode, "groups": []}

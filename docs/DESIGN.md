@@ -12647,7 +12647,21 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    under B\*, forces unmet — whatever the judge said. A set typed `broken`
    (the set audit) is settled and never chased; a variant set of a
    report-pointer task never counts as work (*A task that points at a
-   report is bounded by the report's own scenarios*). An item in
+   report is bounded by the report's own scenarios*). Neither one makes
+   an item unmet by any road: not through the gate, and not through the
+   delivery judge's record, which states such a set's failure as settled
+   (broken) or as outside the report's own scenarios (variant), never as
+   plain failed, and names a failing set's failing cases, never the cases
+   its writer declared. In a live run (barnacle ddd383ea, leerie 0.44.7)
+   the record told the judge "set 1 … failed" for a set typed broken whose
+   counted cases were none, listing declared cases that had passed; the
+   judge marked two items unmet on it, and no tree change ever re-judged
+   them (*A re-check replaces a verdict only on a tree that changed*), so
+   the run ended `unconverged` on failures rule 1 calls settled. The
+   re-drive reads every result against the run's record of every set,
+   broken ones included, and a result whose set it has no record of is not
+   routed: the lookup never defaults an unknown set to an unbounded,
+   unbroken one. An item in
    `delivery_gate.unmet_final`, and a red merge check
    (`ci_parity.final.unmet`), are unmet too. So is a solution defect the
    final-tree conformance left unfixed after its last round
@@ -12678,7 +12692,15 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    outside that tree (*A held-out set never enters a tree a worker commits
    from*, below), and the sets' source, readable outside the tree: without
    a self-check (bench Q3 arm L3) whole-set closure was 0 of 4, against 18
-   of 24 with one (every one of the 24 closed its sets). After each
+   of 24 with one (every one of the 24 closed its sets). The self-check
+   reproduces every failure a note hands on: every set a group's note
+   names is a shown set that is not typed broken, and every set file it
+   names is among that self-check's files. The re-drive never hands a
+   worker a failure its self-check cannot reproduce, and the code checks
+   it before a group is driven: a note outside its self-check is a leerie
+   defect, raised, never driven. In ddd383ea it was driven: four
+   implementers were told to fix set 1's defect file, ran a self-check
+   holding only set 2, read "Tests 9 passed", and changed nothing. After each
    group the orchestrator re-runs the sets and the repository's tests — a
    test command the task forbids replaced by the scoped run of the coupled
    tests, as at final and in the ratchet, never run raw; a
@@ -14792,7 +14814,10 @@ relays, each closed where it relayed:
 - *The delivery judge's record.* `_orchestrator_results_digest` named
   every failing set's files and cases. The judge's evidence reaches the
   final conformer, the re-drive's implementers and the next run's
-  planner, so a held-back set's line gives its verdict only.
+  planner, so a held-back set's line gives its verdict only. A shown
+  set's line names its failing cases, never every case its writer
+  declared in a failing file: a declared case that passed, listed under
+  "failed", is false evidence (*Delivery re-drive* rule 1).
 - *The logs the record reads.* The record took every `logs/*.log` for a
   worker's transcript: the acceptance writer's included, whose runs of
   its own tests carry their output, and leerie's runs of set files, whose
