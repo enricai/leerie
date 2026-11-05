@@ -220,3 +220,12 @@ def test_satisfied_probe_call_site_uses_satisfied_probe_tools():
     assert "allowed_tools=INSPECT_TOOLS" not in body
     assert "allowed_tools=ACT_TOOLS" not in body
     assert "allowed_tools=RUN_TOOLS" not in body
+
+
+def test_inspect_tools_lets_a_judge_search_tracked_files(leerie):
+    """A judgment worker can run `git grep` (measured 2026-11-05: 13 runs'
+    logs held a judge refused `git grep` at the permission prompt; 7f2dfa66's
+    delivery judge voted item 0 unmet because "I could not run a site-name
+    search here, because git grep needed approval"). Value, not presence of a
+    substring: the exact prefix pattern, with its wildcard, is an entry."""
+    assert "Bash(git grep:*)" in set(_entries(leerie.INSPECT_TOOLS))

@@ -1237,7 +1237,15 @@ INSPECT_TOOLS = (
     "Bash(wc:*),Bash(grep:*),Bash(rg:*),Bash(file:*),Bash(stat:*),"
     "Bash(tree:*),Bash(pwd),Bash(echo:*),"
     "Bash(git log:*),Bash(git show:*),Bash(git diff:*),"
-    "Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*)"
+    "Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*),"
+    # `git grep` searches the tracked files, as `grep`/`rg` above search the
+    # tree, and reads nothing `git show` cannot. Without it a judge asked to
+    # confirm "no site names in the code" was refused at the permission
+    # prompt and voted unmet for want of the search (measured 2026-11-05:
+    # the refusal in 13 runs' logs; 7f2dfa66's item 0 evidence reads "I
+    # could not run a site-name search here, because git grep needed
+    # approval").
+    "Bash(git grep:*)"
 )
 # NotebookEdit sits here with Write/Edit rather than in DISALLOWED_TOOLS.
 # The tempting argument for denying it — judgment workers can reach a file
