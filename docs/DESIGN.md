@@ -10541,6 +10541,41 @@ classification and planning, layered top-to-bottom by determinism:
    configuration. The hook runs once, before any worker that commits: one
    that would run after one has started stops the run instead.
 
+   A tool the workers run goes in `~/.local/bin`: the hook writes it, and
+   every worker reads it and has it on `PATH`. The rest of the hook's
+   environment belongs to its checkout:
+   - *pip's user base.* `pip install --user` installs into the checkout's
+     user base (`<run-dir>/tree-stores/<tree>/pyuser`, §6 *Which stores an
+     install may share*), which no worker reads; a worker has its own
+     (`_worker_cache_env`). A Python tool goes in with
+     `pip install --target ~/.local/bin/.<tool> <tool>` and a launcher
+     script at `~/.local/bin/<tool>` that sets `PYTHONPATH` to that
+     directory and runs `python3 -m <module>`. The image has no
+     `ensurepip`, so `python3 -m venv` makes no environment with pip.
+   - *Its cache.* `XDG_CACHE_HOME` is the checkout's private temp directory,
+     and a worker's is its side's cache (`_worker_cache_env`). The worker
+     that first runs a tool builds whatever that tool caches, such as the
+     environments of `pre-commit install-hooks`.
+   - *Git hooks.* The hook installs none. The checkout's `.git` is a file,
+     and the run's repository has `core.hooksPath` at the user's hooks
+     directory (§6 *The run's own repository*), so `pre-commit install`
+     refuses to run. A worker's commit runs the hooks the user installed in
+     their checkout on the host. `pre-commit install` on the host embeds the
+     host's interpreter in the hook file (`INSTALL_PYTHON`), and when that
+     path also exists in the container, as `/usr/bin/python3` does, the
+     worker's commit fails with `No module named pre_commit`. An
+     `INSTALL_PYTHON` naming a path the container lacks makes the hook file
+     run `pre-commit` from `PATH`. A git hook that runs the repository's
+     dependencies, such as a linter from its lockfile, finds them in the
+     image (§6½ *Per-repo container image*) or after the committing worker
+     has installed them.
+
+   Measured on the image's Python 3.13 with pre-commit 4.7.0: a commit in a
+   worktree of a bare repository, with its own user base and cache and a
+   read-only hooks directory reached through `core.hooksPath`, ran
+   pre-commit installed this way, and failed with a `pip install --user`
+   install in another user base.
+
    System packages requiring root (apt-get-installable libraries,
    anything writing to `/usr/*` or `/etc/*`) are out of scope for the
    hook — the container's unprivileged user model can't satisfy them.

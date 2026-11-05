@@ -32594,8 +32594,10 @@ async def _run_setup_hook(repo_root: Path, log_dir: Path,
     **What the hook CAN do** (runs unprivileged):
     - `mise install <lang>@<version>` to add a language runtime mise
       supports beyond the image-baked LTS bake (Ruby, Java, Rust, etc.).
-    - Install user-space CLI tools into `~/.local/bin` or any other
-      user-writable location.
+    - Install user-space CLI tools into `~/.local/bin`, where the workers
+      find them. A Python tool goes in with `pip install --target` and a
+      launcher script: `pip install --user` installs into a user base no
+      worker reads (DESIGN §6½ step 1).
     - Pre-populate fixtures the workers need (sample data, config).
     - Set per-run environment variables via `~/.bashrc` (note: the
       orchestrator does not source bashrc by default; the hook would
@@ -32606,6 +32608,8 @@ async def _run_setup_hook(repo_root: Path, log_dir: Path,
       root. The container intentionally does NOT ship sudo.
     - Write to `/usr/*`, `/etc/*`, or any other system directory.
     - Install system services.
+    - Install git hooks: `.git` is a file in its checkout and the run's
+      repository sets `core.hooksPath` (DESIGN §6½ step 1).
 
     If a repo needs a system package the language layer can't provide,
     the documented workaround is to maintain a fork of the leerie

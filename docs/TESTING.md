@@ -7090,12 +7090,16 @@ sample's probe never counts for the next.
   `state.json`, the worker cache, leerie's store, the run repository's
   refs, sibling trees, another tree's measurement directory); its temp and
   caches point at its own directory.
-- `tests/test_measurement_grant_lifetime.py` (8 tests, same section): a
+- `tests/test_measurement_grant_lifetime.py` (9 tests, same section): a
   tree made again at a path gets a fresh measurement directory and a
   removed tree's is swept; the grant kinds differ only where designed; the
   toolchain kind empties the hook's trust records; a tree holding the run
   directory is refused; `claude_p` records the first committing worker; a
-  confined worker reads the run's mise overrides.
+  confined worker reads the run's mise overrides; through the real
+  `_run_setup_hook`, a tool beneath `~/.local/bin` is written and a confined
+  worker imports it, while the hook's pip user base is its checkout's and no
+  worker reads it, and the checkout has `core.hooksPath` set and a `.git`
+  file (DESIGN §6½ step 1).
 - `tests/test_store_classes.py` (12 tests, DESIGN §6 *Which stores an
   install may share*): every store variable has exactly one class; a run
   tree's commands get that tree's own stores, each made 0700 (review round
