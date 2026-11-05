@@ -5405,11 +5405,13 @@ in a sandbox over the pristine checkout of the final commit, never copied
 into a checkout (it was, for its confirm runs and its facts read, and the
 checkout outlives the sample); a saved probe (`acceptance/probes/`) is
 re-run only through the evaluation (`_evaluate_acceptance_sets`). What
-reaches a fixer from a confirmed sample is the span of the item's own
-words the probe tests (checked verbatim in the item) and the fact that it
-fails under B\* — never the probe's text, its case title, or the sample's
-prose — and no fixer's grant reaches `acceptance/`, where saved probes are
-kept.
+leaves a confirmed sample is the span of the item's own words the probe
+tests (checked verbatim in the item) and the fact that it fails under
+B\* — never the probe's text, its case title, or the sample's prose — and
+no fixer's grant reaches `acceptance/`, where saved probes are kept. That
+evidence names no failure a fixer can run, so it is never handed to one:
+an item unmet on it alone is not re-driven, and the span goes to the
+outcome and the PR instead (§8 *Delivery re-drive* rule 4).
 
 **Residual.** The verdict itself (which files of which set failed), which
 is the evaluation's purpose; and its duration, which a later worker can
@@ -12700,7 +12702,35 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    it before a group is driven: a note outside its self-check is a leerie
    defect, raised, never driven. In ddd383ea it was driven: four
    implementers were told to fix set 1's defect file, ran a self-check
-   holding only set 2, read "Tests 9 passed", and changed nothing. After each
+   holding only set 2, read "Tests 9 passed", and changed nothing.
+   The rule covers every note, not only a set's. A note hands on only
+   evidence its fixer can reproduce or read: a shown set's failing file,
+   through its self-check; a delivery judge's confirmed vote, whose
+   evidence and verified cites name code on the tree the fixer holds; a
+   change under paths the item keeps unchanged, which `git` shows; a red
+   merge check, whose command the note carries; a solution defect's
+   concrete case. A confirmed falsifier probe is none of these: it is
+   held-out content (§6 *A falsifier's probe is held-out content*), so
+   its fixer can neither run nor read it, and all a note could say is
+   that some input in the item's words fails. An item whose only unmet
+   evidence (`by`) is a falsifier probe is therefore not driven: it is
+   recorded as an `unrouted_item` with reason `unreproducible` (*An unmet
+   item reaches its owner, or is recorded as reaching none*, below),
+   stays unmet, and spends no round. An item unmet on a probe and on
+   reproducible evidence too is driven on the reproducible part alone:
+   its note carries only that evidence, never the probe's, and the
+   re-check after the drive still re-runs the saved probe, so the item
+   leaves `unmet_final` only when both are met. Code decides this from
+   the item's typed `by` and the evidence each source recorded
+   (`unmet_final[].evidence_by`), never from the evidence's prose, and
+   the same pre-drive check raises on an item note naming a falsifier
+   source. In barnacle 4b5c564d (leerie 0.44.10) item 1 was unmet on a
+   confirmed probe alone; its implementers were handed "a falsifier probe
+   of the item's words … fails under B\*", ran a self-check of the shown
+   sets that passed 18 of 18, and changed nothing in two rounds (about
+   413 s of re-drive budget and $0.30); across the 24 runs whose state
+   carried a delivery gate in the three days before, four such items in
+   four runs, and a re-drive closed none of them. After each
    group the orchestrator re-runs the sets and the repository's tests — a
    test command the task forbids replaced by the scoped run of the coupled
    tests, as at final and in the ratchet, never run raw; a
@@ -12827,7 +12857,12 @@ the operator accepted, or one settled `accepted_external` is not driven.
 An item no group drives — no subtask the re-drive may drive can take it,
 or every group holding it was out of its members' re-drive rounds, or the
 re-drive's time budget ran out first — is recorded as a typed
-`unrouted_item` (`{item_index, item, reason: no_owner | budget}`). It is
+`unrouted_item` (`{item_index, item, reason: no_owner | budget |
+unreproducible}`). So is an item rule 4 does not drive, with reason
+`unreproducible` and the item words its probe tested (`probed`); the
+outcome's reasons say for it that a confirmed falsifier probe of those
+words fails under B\* and that the probe is held-out content no fixer
+could see, so a reader knows why no worker was handed it. It is
 never dropped: it stays unmet, so the run is `unconverged`; the outcome's
 reasons name it; and the next run on the task is handed it in its
 residual. Measured on barnacle a192d275 (leerie 0.44.3): the falsifier
@@ -12835,9 +12870,11 @@ confirmed an item unmet whose only claimer, feat-001, had settled
 `unconverged`; the re-drive excluded it, routed the item to nobody and
 logged "done" one second after naming "1 unmet item(s)". The run's
 outcome was `unconverged` on the unmet item, but nothing recorded that
-the finding reached no worker. Under this rule the item goes to feat-001,
-whose two re-drive rounds were spent before the falsifier ran, so it is
-recorded `unrouted_item` with reason `budget`.
+the finding reached no worker. Under this rule the item would go to
+feat-001, whose two re-drive rounds were spent before the falsifier ran,
+so it would be recorded `unrouted_item` with reason `budget`; its only
+evidence was a falsifier probe, so under rule 4 it is recorded with
+reason `unreproducible` before any routing.
 
 The diff is re-measured because nothing else is. Before review round 6
 the re-drive re-applied the test-outcome verdict recorded at detection,
