@@ -426,7 +426,7 @@ EOF_IMAGES
       continue
     fi
     while IFS='|' read -r _ns _n _size; do
-      [ -n "$_n" ] && [ "${_n##*:}" = "$_t" ] || continue
+      if [ -z "$_n" ] || [ "${_n##*:}" != "$_t" ]; then continue; fi
       _e="$_n"
       [ "$_ns" = "$LEERIE_IMAGE_NS" ] || _e="$_n in $_ns"
       if nerdctl --namespace "$_ns" image rm "$_n" >/dev/null 2>&1; then
