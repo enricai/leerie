@@ -1123,6 +1123,16 @@ def test_falsifier_probe_saved_and_rechecked(leerie, tmp_path, monkeypatch):
         tmp_path, st, dict(leerie.DEFAULT_CAPS), {}, {}, tmp_path, [3]))
     # No verdict keeps the item unmet.
     assert got[3]["unmet"] and got[3]["by"] == ["falsifier"]
+    # Its evidence stays typed by source through the rewrite, so the next
+    # round still hands it to no fixer (DESIGN §8 *Delivery re-drive* rule
+    # 4).
+    assert got[3]["evidence_by"] == {"falsifier": "probe fails"}
+    leerie._redrive_apply_item_verdicts(st, got, "sha2")
+    left = st.data["delivery_gate"]["unmet_final"]
+    assert left[0]["evidence_by"] == {"falsifier": "probe fails"}
+    notes, unrepro = leerie._redrive_item_notes(
+        left, {}, 4, st.data["delivery_gate"]["items"])
+    assert notes == [] and [u["item_index"] for u in unrepro] == [3]
 
 
 def test_run_phases_redrives_after_the_merge_checks(leerie):
@@ -1335,9 +1345,21 @@ def test_unreproducible_notes_are_named(leerie):
         {"kind": "held_defect", "key": "4:h.ts", "set_index": 4,
          "file": "h.ts"},
         {"kind": "control_regression", "key": "t", "test": "t"},
-        {"kind": "unmet_item", "key": "item-0", "item_index": 0}]
+        {"kind": "unmet_item", "key": "item-0", "item_index": 0,
+         "by": ["judge"]},
+        {"kind": "unmet_item", "key": "item-5", "item_index": 5,
+         "by": ["untouched_paths"]},
+        # Rule 4 covers item notes too: a falsifier probe is held-out
+        # content, and a note naming no source names nothing to reproduce.
+        {"kind": "unmet_item", "key": "item-1", "item_index": 1,
+         "by": ["falsifier"]},
+        {"kind": "unmet_item", "key": "item-2", "item_index": 2,
+         "by": ["judge", "falsifier"]},
+        {"kind": "unmet_item", "key": "item-3", "item_index": 3, "by": []},
+        {"kind": "unmet_item", "key": "item-4", "item_index": 4}]
     assert leerie._redrive_unreproducible(notes, shown) == [
-        "1:d.ts", "2:x.ts", "3:d.ts"]
+        "1:d.ts", "2:x.ts", "3:d.ts", "item-1", "item-2", "item-3",
+        "item-4"]
 
 
 def _ddd383ea_world(leerie, tmp_path, monkeypatch, *, unmet):

@@ -1266,6 +1266,10 @@ class TestRunDeliveryDetection:
         assert [u["item_index"] for u in gate["unmet_final"]] == [0]
         assert gate["unmet_final"][0]["by"] == ["falsifier"]
         assert "fails under B*" in gate["unmet_final"][0]["evidence"]
+        # Each source's evidence, typed, so the re-drive hands on none of
+        # the falsifier's (DESIGN §8 *Delivery re-drive* rule 4).
+        assert gate["unmet_final"][0]["evidence_by"] == {
+            "falsifier": gate["unmet_final"][0]["evidence"]}
         verdicts = [(r["item_index"], r["verdict"]) for r in gate["items"]]
         assert verdicts == [(0, "unmet"), (1, "external"), (2, "met"),
                             (3, "met")]
@@ -1368,6 +1372,9 @@ class TestRunDeliveryDetection:
         assert gate["final_judge"]["source"] == "final"
         assert [(u["item_index"], u["by"]) for u in gate["unmet_final"]] == [
             (3, ["judge"])]
+        assert gate["unmet_final"][0]["evidence_by"] == {
+            "judge": gate["unmet_final"][0]["evidence"]}
+        assert gate["unmet_final"][0]["evidence"]
         # No typescript resolvable: the falsifier is off, never spawned.
         assert gate["falsifier"]["enabled"] is False
         assert "typescript" in gate["falsifier"]["skipped"]
