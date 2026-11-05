@@ -434,7 +434,10 @@ def test_mark_dispute_unacted(leerie, tmp_path, dispute, marked):
     (_results([True, False]), {"s0"}, {"s0"}),          # a tie protects
 ])
 def test_pre_sweep_protect(leerie, tmp_path, monkeypatch, res, fix_ids, want):
-    st = _st(leerie, tmp_path)
+    # The results are the state's own sets' (`_acceptance_results_on_head`
+    # runs `acceptance.sets`): a result whose set has no record is no work
+    # (DESIGN §8 *Delivery re-drive* rule 1, #312).
+    st = _st(leerie, tmp_path, acceptance={"sets": _SETS})
     ran = []
 
     async def fake(st_, caps):
@@ -577,7 +580,7 @@ def test_dispute_then_probe_drops_everything_keeps_the_fix(
 # --- A4 and wiring -------------------------------------------------------------
 
 def test_passes_on_head_helper(leerie, tmp_path, monkeypatch):
-    st = _st(leerie, tmp_path)
+    st = _st(leerie, tmp_path, acceptance={"sets": _SETS})
     unmeasured = [dict(r, unmeasured=True) for r in _results([False] * 3)]
     for res, want in ((None, False), (_results([True, True, True]), True),
                       (_results([True, True, False]), False),
