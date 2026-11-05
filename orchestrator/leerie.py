@@ -44396,9 +44396,43 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
         return None
 
 
+def _exc_text(exc: BaseException) -> str:
+    """An exception for a log line: its message, or its type when the
+    message is empty — an interrupt or cancellation raised during cleanup
+    carries no text, and `cleanup failed (non-fatal): ` with nothing after
+    it named no cause (live, 2026-11-05: run ab17a3a2's Ctrl-C)."""
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+# A scoped test command names every file it runs: one run's `tests-failed:`
+# line was 78,009 characters (2026-11-05, run 80e66fce, 1,037 files), its
+# outcome at the very end and the failing files nowhere. The command is cut
+# to this many characters in the advisory line; the axis result keeps it
+# whole.
+_RESIDUAL_COMMAND_CHARS = 160
+# How many failing test files the advisory line names before "+N more".
+_RESIDUAL_FAILING_FILES = 10
+
+
+def _residual_failing_files(a: dict) -> list[str]:
+    """The test files an axis result records as failing, from its own
+    report (`failing_id_files`, else the `<file> :: <case>` IDs), sorted."""
+    by_id = a.get("failing_id_files")
+    files = ({str(f) for f in by_id.values() if f}
+             if isinstance(by_id, dict) else set())
+    if not files:
+        files = {str(i).split(" :: ", 1)[0]
+                 for i in (a.get("failing_ids") or []) if str(i).strip()}
+    return sorted(files)
+
+
 def _summarize_residuals(conf_res: dict) -> list[str]:
     """One advisory string per residual / failing build-lint-test axis.
-    Empty list when the conformer reports a fully clean pass."""
+    Empty list when the conformer reports a fully clean pass. A failing
+    axis names its outcome first and, for tests, the failing files its
+    report recorded; a long command is shortened (the axis result keeps the
+    whole command)."""
     out: list[str] = []
     for item in conf_res.get("rule_violations_residual") or []:
         rule = (item.get("rule") or "").strip()
@@ -44408,7 +44442,18 @@ def _summarize_residuals(conf_res: dict) -> list[str]:
         a = conf_res.get(axis) or {}
         if a.get("ran") and not a.get("passed"):
             summary = (a.get("summary") or "").strip() or "(no summary)"
-            out.append(f"{axis}-failed: {a.get('command', '')!r}: {summary}")
+            cmd = str(a.get("command", ""))
+            if len(cmd) > _RESIDUAL_COMMAND_CHARS:
+                cmd = (cmd[:_RESIDUAL_COMMAND_CHARS]
+                       + f"… ({len(cmd)} characters)")
+            line = f"{axis}-failed: {summary} — {cmd!r}"
+            files = _residual_failing_files(a) if axis == "tests" else []
+            if files:
+                shown = files[:_RESIDUAL_FAILING_FILES]
+                more = len(files) - len(shown)
+                line += ("; failing: " + ", ".join(shown)
+                         + (f" (+{more} more)" if more else ""))
+            out.append(line)
     return out
 
 
@@ -72140,7 +72185,7 @@ def main() -> int | None:
         try:
             _cleanup_on_abnormal_exit(st, full_purge=False)
         except BaseException as cleanup_err:
-            log(f"cleanup failed (non-fatal): {cleanup_err}")
+            log(f"cleanup failed (non-fatal): {_exc_text(cleanup_err)}")
     except TerminalAuthFailure as e:
         # Expired/absent OAuth session (`claude /login` required) —
         # unlike the transient 401/429/529 case, Claude Code sends no
@@ -72159,7 +72204,7 @@ def main() -> int | None:
         try:
             _cleanup_on_abnormal_exit(st, full_purge=False)
         except BaseException as cleanup_err:
-            log(f"cleanup failed (non-fatal): {cleanup_err}")
+            log(f"cleanup failed (non-fatal): {_exc_text(cleanup_err)}")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Non-fatal. Mirrors the RateLimitedExit post-loop pattern.
         asyncio.run(_best_effort_capture_deps(
@@ -72203,7 +72248,7 @@ def main() -> int | None:
             try:
                 _cleanup_on_abnormal_exit(st, full_purge=False)
             except BaseException as cleanup_err:
-                log(f"cleanup failed (non-fatal): {cleanup_err}")
+                log(f"cleanup failed (non-fatal): {_exc_text(cleanup_err)}")
             # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
             # Non-fatal. Mirrors the cancel-arm pattern.
             asyncio.run(_best_effort_capture_deps(
@@ -72250,7 +72295,7 @@ def main() -> int | None:
                 try:
                     _cleanup_on_abnormal_exit(st, full_purge=False)
                 except BaseException as cleanup_err:
-                    log(f"cleanup failed (non-fatal): {cleanup_err}")
+                    log(f"cleanup failed (non-fatal): {_exc_text(cleanup_err)}")
                 asyncio.run(_best_effort_capture_deps(
                     repo_root, st, caps, models, efforts,
                     "rate-limit pause (wait exceeds ceiling)"))
@@ -72359,7 +72404,7 @@ def main() -> int | None:
             except BaseException as cleanup_err:
                 # Cleanup failure is non-fatal; the user can re-run
                 # `scripts/cleanup.sh --run-id <id>` manually.
-                log(f"cleanup failed (non-fatal): {cleanup_err}")
+                log(f"cleanup failed (non-fatal): {_exc_text(cleanup_err)}")
     # Write exit code for the tail wrapper (DESIGN §6 teardown
     # disposition table). The SystemExit handler writes it eagerly
     # (before re-raise); this covers the non-raise paths
