@@ -1,6 +1,6 @@
 """Regression pins for the image's `ENV PATH=...` construction.
 
-/home/leerie/.local/bin: `pip install --user` lands console scripts (e.g.
+/home/leerie/.local/bin: a setup hook puts the tools the workers run (e.g.
 `pre-commit`) here. Without that dir on PATH they are unreachable whenever
 a caller doesn't resolve them through an absolute path — the observed case
 being a git hook whose embedded interpreter path points at a Python that
@@ -9,8 +9,8 @@ doesn't have the package installed.
 Position is load-bearing, not incidental: the entry sits *after* $PATH so
 image-baked tooling (leerie's `claude` link, the mise shims and the LTS
 Node bin — see the PATH comment in the Dockerfile) always wins
-over anything a repo's setup step later `pip install --user`s. Moving it
-ahead of $PATH would let a user-installed package silently shadow a baked-in
+over anything a repo's setup hook later puts there. Moving it
+ahead of $PATH would let a user-installed tool silently shadow a baked-in
 binary, which is why the ordering is pinned here rather than just membership.
 
 /home/leerie/.local/share/mise/shims (`MISE_DATA_DIR/shims`): populated by
@@ -51,14 +51,14 @@ def _env_path_line() -> str:
 
 
 def test_user_local_bin_is_on_path():
-    """`pip install --user` console scripts must be reachable by name."""
+    """A tool a setup hook installs must be reachable by name."""
     assert "/home/leerie/.local/bin" in _env_path_line()
 
 
 def test_user_local_bin_comes_after_inherited_path():
     """Image-baked tooling must win over user-installed packages.
 
-    A `pip install --user` package that happens to ship a binary named
+    A tool a setup hook installs that happens to ship a binary named
     like a baked-in one (or like `claude` itself) must not shadow it, so
     the user bin dir has to sit after $PATH, never before.
     """

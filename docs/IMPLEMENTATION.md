@@ -549,8 +549,9 @@ Base layers (top-down):
   are the version the caller's cwd pins; the LTS Node's `bin` follows as the
   unpinned fallback (and the only `node` before any `mise reshim` in a fresh
   `MISE_DATA_DIR`). No `/usr/local/share/mise/shims` entry: `mise install
-  --system` makes no such directory. `pip install --user` console scripts
-  land last, so they can never shadow a baked-in binary. Pinned by
+  --system` makes no such directory. A tool a setup hook puts in
+  `/home/leerie/.local/bin` comes last, so it can never shadow a baked-in
+  binary. Pinned by
   `tests/test_dockerfile_path.py` and `tests/test_pinned_runtime_runs.py`
   (whose real-container test, opt-in through
   `LEERIE_TEST_CONTAINER_IMAGE`, runs `_run_mise_install` and confined
@@ -10474,6 +10475,10 @@ branch, after the `_write_run_json(...)` block and before
    cannot `apt-get install` or write to system directories. Repos
    that need root-level system packages maintain a fork of the leerie
    Dockerfile and override `IMAGE_TAG`; out of scope for the hook.
+   `_tree_store_env` sets its `PYTHONUSERBASE` and `_measurement_grants` its
+   `XDG_CACHE_HOME` to the checkout's own, and no worker reads either, so a
+   tool for the workers goes beneath `~/.local/bin` (`pip install --target`
+   and a launcher script, DESIGN §6½ step 1). It installs no git hooks.
 3. **Mise go-override synthesis.** `_synth_mise_go_override(
    repo_root, run_dir) -> Path | None`: if `go.mod` exists but the
    repo has no `.go-version`, no `.tool-versions` go entry, and no

@@ -308,10 +308,10 @@ RUN set -eux; \
 #   3. LTS Node bin: the fallback when nothing is pinned, and the only
 #      `node` before any `mise reshim` has run in a fresh MISE_DATA_DIR.
 #   4. (then the pre-existing PATH; /usr/bin/python3 is the unpinned Python)
-#   5. /home/leerie/.local/bin — where `pip install --user` puts console
-#      scripts (e.g. pre-commit). Deliberately LAST: image-baked tooling
-#      must win, so a user-installed package can never shadow a baked-in
-#      binary. Pinned by tests/test_dockerfile_path.py.
+#   5. /home/leerie/.local/bin: where a setup hook puts a tool the workers
+#      run (e.g. pre-commit, DESIGN §6½ step 1). Deliberately LAST:
+#      image-baked tooling must win, so a user-installed tool can never
+#      shadow a baked-in binary. Pinned by tests/test_dockerfile_path.py.
 # There is no system shims directory: `mise install --system` makes none
 # (measured, leerie 0.44.1: /usr/local/share/mise/shims does not exist).
 ENV PATH=/opt/leerie-vendor/bin:/home/leerie/.local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:$PATH:/home/leerie/.local/bin
