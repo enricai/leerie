@@ -1303,6 +1303,8 @@ _OTHER_NS = {
     '"$_cns"': "_reap_orphaned_container, from _container_ns",
     '"$_stop_cns"': "stop, from _container_ns",
     '"$_kill_cns"': "kill, from _container_ns",
+    '"$_ns"': ("leerie_reap_old_images: $LEERIE_IMAGE_NS, or, with `worker`, "
+               "a namespace BuildKit's worker reads other than it"),
     "$_w": "the refusal's instruction to the operator",
 }
 
