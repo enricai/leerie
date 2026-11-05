@@ -107,6 +107,7 @@ LEERIE_STATE_HOST_DIR=/tmp/state
 HOME=/home/test
 TTY_FLAGS=""
 _cidfile=/tmp/cid
+_container_name="leerie-1793883015-4242"
 REPO_IMAGE_TAG=""
 IMAGE_TAG=leerie:test
 _leerie_env_args=()

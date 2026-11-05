@@ -44,6 +44,7 @@ _HARNESS = (
 nerdctl() { for a in "$@"; do printf '%s\\n' "$a"; done; }
 TTY_FLAGS="-i"
 _cidfile="/dev/null"
+_container_name="leerie-1793883015-4242"
 REPO_IMAGE_REF=""
 LEERIE_COMMIT=""
 AUTH_MOUNTS=()

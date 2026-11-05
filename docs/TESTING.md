@@ -6187,6 +6187,17 @@ every other `cat` to the real one. `make_world(apparmor=)` is `current`
   after `nerdctl kill`, with the client gone and the cidfile removed. A
   TERM in the created window (the cidfile written, the task not started)
   ends the launcher with 143 within 5 s, and the container never starts.
+- `tests/test_launcher_removes_its_container.py` (2026-11-05: seven
+  Ctrl-C'd launches left four `Created` containers pinning about 15 GB of
+  older versions' images): the stub's container store, whose `--rm` is the
+  client's. INT, TERM and HUP during a run leave no container and no marked
+  process; a run that ends leaves none, with the client's `--rm` or without
+  it; the EXIT trap removes after the kill and before the cidfile goes, by
+  the cidfile's ID or else the name; the skip line still names the run the
+  run-id file named. The next launch removes, before its run, only
+  leerie-named, matching-labelled, `Created`/`Exited` containers whose
+  launcher is dead, with `rm` never forced, and the image such a container
+  held goes in the same launch.
 - `tests/test_launcher_double_dash.py` (review round 27 O3): `--no-push --
   <task>` for `-task`, `--no-push` and `--state-dir` hands the container
   every flag before `--` and `-- <task>` last. `-- --no-push` is a task, not

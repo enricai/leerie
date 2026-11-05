@@ -3310,7 +3310,9 @@ they are confined.
   so a container whose client died (an OOM) stays `Exited` after `nerdctl
   kill` and holds its image for good (measured 2026-11-03, nerdctl 2.3.5);
   `stop`, `kill` and `resume`'s reaper therefore remove the container they
-  end (`nerdctl rm -f`). *Revised 2026-11-03 (review round 38, execution
+  end (`nerdctl rm -f`), as a launch's own exit does, and the next launch
+  removes what a launch killed by SIGKILL left (*A container a launch
+  starts never outlives that launch*). *Revised 2026-11-03 (review round 38, execution
   X1).* The refusal said to launch again once the run ended, or to `nerdctl
   image rm` the image; with an exited container neither cleared it, and the
   image's removal had already failed before the refusal was given. A
@@ -3481,6 +3483,9 @@ they are confined.
   version's images, and nothing reads the version a run started on to
   choose one. So an older version's image is used only by a container that
   still exists, or by a launch of that older version still on the host.
+  A container no launch owns any more is removed first, by the same launch
+  (*A container a launch starts never outlives that launch*): left, it
+  would keep its image "in use" for good.
   Each local launch removes, before its own image steps, every image in
   `leerie` named `leerie:<v>` or `leerie-repo/…:<v>` whose `<v>` is an
   older version than its own (`leerie_reap_old_images`). Nothing else is a
@@ -8460,7 +8465,64 @@ killed by hand. Three mechanisms close this gap, defense in depth:
    this run whose owning launcher PID is dead (via a `leerie.launcher_pid`
    label set at spawn) and `nerdctl kill`s it first — the load-bearing
    fix for the OOM case, making `resume` self-heal the orphaned-flock
-   wedge regardless of how the orphan was created.
+   wedge regardless of how the orphan was created. *Residual:* it looks
+   the container up by the run id, which is the ID of the container that
+   first ran the run; a resume's container has an ID of its own, so the
+   orphan of a resumed launch is not found, and that resume still exits
+   `EXIT_LOCKED`.
+
+**A container a launch starts never outlives that launch.** The kernel's
+teardown ends the container's processes; the container itself, and the
+image it pins, is a containerd record that only a removal ends. nerdctl's
+`--rm` is done by the *client* that started the container, once it sees
+the container exit, and the client dies with the launcher: Ctrl-C reaches
+the whole process group, and the INT/TERM trap TERMs it (and KILLs it
+after 30 s). So a launch interrupted before its client got there left its
+container `Created` or `Exited` for good. Measured 2026-11-05: seven
+running launches Ctrl-C'd at once left four containers `Created`
+(`leerie-1793883015-926055` on a 0.44.11 repository image,
+`leerie-1793880586-924508` and `leerie-1793845709-2468912` on another
+0.44.11 one, `leerie-1793836494-1921097` on a 0.44.10 one), their
+launchers dead, and the next launches' image reaper kept those versions'
+images, about 15 GB, as "still used by a container" (*An image no launch
+can use any more is removed by leerie*). The EXIT trap killed the container
+and never removed it.
+
+- *The launch removes its own.* The launcher's EXIT trap removes the
+  container this launch created with `nerdctl rm -f`, by the ID nerdctl
+  wrote to the cidfile, or, with none there, by the `--name` this launch
+  gave it, and never names another. It runs on every exit bash can trap: a
+  normal end and an error (where the client's `--rm` normally got there
+  first, and the removal finds nothing), and INT, TERM and HUP, whose traps
+  stop the client and exit through the EXIT trap. The removal comes after
+  the kill and before the cidfile it reads is deleted. Nothing after the
+  container exits reads the container: the run-id file, the bring-back and
+  finalize read the state root, so the removal's place in the EXIT trap
+  costs them nothing.
+- *The next launch removes what a SIGKILLed one left.* SIGKILL (an OOM)
+  runs no trap. Each local launch, before the image reaper looks for
+  images no container uses, removes from leerie's namespace each container
+  for which all of these hold, and no other: its name is leerie's own,
+  `leerie-<digits>-<digits>`; its `leerie.launcher_pid` label is the PID
+  that name ends in (both written by the launch that made it); `nerdctl ps
+  -a` lists it `Created` or `Exited`; and that launcher is dead. Dead means
+  `kill -0` fails and `ps -p` finds no such process, since `kill -0` also
+  fails on a live process of another user who shares a rootful containerd;
+  without `ps` it counts as alive. The removal is `nerdctl rm`, never
+  forced: nerdctl refuses a running or paused container, so one that
+  started after the listing is refused, not killed. A running orphan
+  stays the reaper's above, on `resume`: its orchestrator may still be
+  doing the run's work. The PID check can err only towards keeping: a PID
+  reused by an unrelated live process keeps the container until that
+  process ends. Running before the image reaper makes the removed
+  containers' images reclaimable in the same launch; running after it, the
+  images would wait one launch more.
+- *Runtimes.* The launcher, its `kill -0` and the PID in the label are all
+  the host's, on Linux (rootless or rootful) and on macOS, where nerdctl
+  runs in Colima's VM through the shim and the cidfile is under the shared
+  home; containerd records the label and the name as given. Fly and EC2
+  start no local container; their machine's end is `provision.sh`'s
+  teardown.
 
 The container boundary holds across both invocation modes:
 

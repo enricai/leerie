@@ -993,6 +993,62 @@ _reap_orphaned_container() {
   sleep 1
 }
 
+# --- _reap_dead_launch_containers -----------------------------------------
+# DESIGN §6 *A container a launch starts never outlives that launch*. The
+# launcher removes its own container on every exit it can trap (its EXIT,
+# INT, TERM and HUP traps, `_remove_launch_container`); a launcher killed by
+# SIGKILL (an OOM) runs no trap, and its client, whose `--rm` it is, died
+# with it. Each local launch therefore removes, before the image reaper
+# looks for images no container uses, every container in $LEERIE_IMAGE_NS
+# that a dead launch left behind, and nothing else. A container is one only
+# when all four hold:
+#   - its name is leerie's own, `leerie-<digits>-<digits>`, exactly;
+#   - its `leerie.launcher_pid` label equals the `<pid>` its name ends in
+#     (both written by the one launch that created it);
+#   - `nerdctl ps -a` lists it `Created` or `Exited`, never `Up`, `Paused`
+#     or anything else;
+#   - that launcher is dead (`_launcher_alive`).
+# The removal is `nerdctl rm`, never forced, so a container that started
+# running after it was listed is refused rather than killed. A running
+# orphan stays the run-id reaper's (`_reap_orphaned_container`, on resume).
+# Best-effort: a listing or a probe that fails leaves everything as it is.
+_reap_dead_launch_containers() {
+  local _list _n _status _ts _pid _owner _removed=""
+  _list="$(nerdctl --namespace "$LEERIE_IMAGE_NS" ps -a \
+             --format '{{.Names}}|{{.Status}}' 2>/dev/null)" || return 0
+  while IFS='|' read -r _n _status; do
+    case "$_n" in leerie-?*-?*) ;; *) continue ;; esac
+    _pid="${_n##*-}"
+    _ts="${_n#leerie-}"
+    _ts="${_ts%-*}"
+    case "$_ts$_pid" in *[!0-9]*) continue ;; esac
+    case "$_status" in Created|Exited|Exited\ *) ;; *) continue ;; esac
+    [ "$_pid" != "$$" ] || continue
+    _owner="$(nerdctl --namespace "$LEERIE_IMAGE_NS" inspect \
+                -f '{{index .Config.Labels "leerie.launcher_pid"}}' "$_n" \
+                2>/dev/null)" || continue
+    [ "$_owner" = "$_pid" ] || continue
+    ! _launcher_alive "$_pid" || continue
+    if nerdctl --namespace "$LEERIE_IMAGE_NS" rm "$_n" >/dev/null 2>&1; then
+      _removed="$_removed, $_n"
+    fi
+  done <<EOF_CONTAINERS
+$_list
+EOF_CONTAINERS
+  [ -z "$_removed" ] || remote_log "removed containers launches that are gone left behind: ${_removed#, }"
+  return 0
+}
+
+# _launcher_alive <pid> — returns 0 when process <pid> exists. `kill -0`
+# also fails on a live process of another user (EPERM), whose launch shares
+# a rootful containerd, so `ps -p` decides then; without `ps` the process
+# counts as alive and its container is kept.
+_launcher_alive() {
+  kill -0 "$1" 2>/dev/null && return 0
+  command -v ps >/dev/null 2>&1 || return 0
+  ps -p "$1" >/dev/null 2>&1
+}
+
 # --- host-side per-repo state directory ----------------------------------
 # Resolves LEERIE_STATE_HOST_DIR: the host path for this repo's leerie run
 # state (runs/, worktrees/, etc.). Lives under $HOME so Colima auto-shares
@@ -6977,6 +7033,10 @@ if [ "$RUNTIME" = "local" ]; then
       _image_hold_holder="$LEERIE_LOCK_HOLDER"
       ;;
   esac
+  # First the containers dead launches left: an image one of them was
+  # created from is otherwise "in use" for good (DESIGN §6 *A container a
+  # launch starts never outlives that launch*).
+  _reap_dead_launch_containers
   leerie_reap_old_images "$_leerie_host_dir/image-holds"
 fi
 
@@ -10935,7 +10995,10 @@ $_ec2_tail_script"
   fi
 else
   # --- local container execution path ----------------------------------
-  # --rm: container is removed on exit. Worktrees persist on the host via
+  # --rm: the client removes the container when it sees it exit; the EXIT
+  #       trap removes it on every other exit (_remove_launch_container),
+  #       and the next launch a dead launch's (_reap_dead_launch_containers).
+  #       Worktrees persist on the host via
   #       the /work bind mount; run state persists via the /leerie-state
   #       bind mount (LEERIE_STATE_HOST_DIR), so `resume` still works.
   # Mount-table rationale lives in docs/IMPLEMENTATION.md §0.5.
@@ -11069,6 +11132,10 @@ else
 
   _cidfile="$LEERIE_STATE_HOST_DIR/.cidfile-$$"
   rm -f "$_cidfile"
+  # The container's name, which the EXIT trap removes it by when no ID was
+  # recorded (`_remove_launch_container`). `<pid>` is this launcher's, as in
+  # its `leerie.launcher_pid` label: the next launch's sweep reads both.
+  _container_name="leerie-$(date +%s)-$$"
   # Where the orchestrator names the run this container runs (DESIGN §6
   # *Which run the container ran*): its own resolution, a bare `resume`'s
   # pick included, is the one source the bring-back below reads. In the
@@ -11129,7 +11196,9 @@ else
   # boundary or that arrive before/after nerdctl owns the tty.
   #   Limitation, by design: SIGKILL (signal 9, what OOM delivers) is
   #   uncatchable — this trap never runs in the OOM case. The stale-container
-  #   reaper on the next `resume` (Fix E) is the backstop for that.
+  #   reaper on the next `resume` (Fix E) is the backstop for a running
+  #   orphan, and the next launch's `_reap_dead_launch_containers` for one
+  #   left Created or Exited.
   # The EXIT arm reorders vs the outer host-scratch trap (set earlier) so the
   # kill happens BEFORE the cidfile is removed; it then chains the original
   # cleanup so $STAGE and the cidfile are still removed.
@@ -11139,6 +11208,27 @@ else
       _cid="$(cat "$_cidfile" 2>/dev/null)"
       [ -n "$_cid" ] && nerdctl --namespace "$LEERIE_IMAGE_NS" kill "$_cid" >/dev/null 2>&1 || true
     fi
+  }
+
+  # _remove_launch_container — remove the container this launch created,
+  # and no other (DESIGN §6 *A container a launch starts never outlives that
+  # launch*): by the ID nerdctl wrote to the cidfile, or, with none there,
+  # by the name this launch gave it. nerdctl's `--rm` is the client's, done
+  # only by a client that sees the container exit: a client that dies with
+  # the launcher (Ctrl-C reaches the whole process group; `_stop_run` TERMs
+  # and may KILL it) leaves the container `Created` or `Exited` for good,
+  # holding its image (measured 2026-11-05: four after seven Ctrl-C'd
+  # launches, pinning about 15 GB of older versions' images). From the EXIT
+  # trap, after the kill and before the cidfile goes; on a normal exit the
+  # client's `--rm` already removed it and this fails, ignored. Nothing
+  # after the container exits reads the container itself: the bring-back
+  # and finalize read the state root.
+  _remove_launch_container() {
+    local _cid=""
+    [ -f "${_cidfile:-}" ] && _cid="$(cat "$_cidfile" 2>/dev/null)"
+    [ -n "$_cid" ] || _cid="${_container_name:-}"
+    [ -n "$_cid" ] || return 0
+    nerdctl --namespace "$LEERIE_IMAGE_NS" rm -f "$_cid" >/dev/null 2>&1 || true
   }
 
   # Decoupled streaming (DESIGN §6 *Launcher hang on abnormal container exit*).
@@ -11232,8 +11322,9 @@ else
   # client only while the cidfile was empty left a TERM in that window
   # waiting for the whole run (review round 28 B1). A started container
   # gets the client's TERM through nerdctl's signal proxy; a client stopped
-  # before the start leaves a created container, which `--rm` and the EXIT
-  # trap's kill handle. Bounded at 30 s, then the client is killed.
+  # before the start leaves a created container, which the EXIT trap
+  # removes (`_remove_launch_container`; the client's `--rm` died with it).
+  # Bounded at 30 s, then the client is killed.
   _stop_run() {
     local _n=0
     _kill_container_from_cidfile || true
@@ -11256,9 +11347,10 @@ else
       _kill_container_from_cidfile || true
     fi
   }
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _bring_back_ran_run || true; _note_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true; leerie_unlock "${_image_hold_holder:-}" || true' EXIT
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; _reap_tail || true; _kill_container_from_cidfile || true; _remove_launch_container || true; _bring_back_ran_run || true; _note_ran_run_captures || true; rm -rf "$STAGE" || true; rm -f "${_cidfile:-}" "${_run_id_file:-}" 2>/dev/null || true; leerie_unlock "${_image_hold_holder:-}" || true' EXIT
   trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 130' INT
   trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 143' TERM
+  trap '_stop_run; _reap_tail; _kill_container_from_cidfile; exit 129' HUP
 
   # Forward orchestrator-side LEERIE_* env overrides into the container.
   # The orchestrator's resolve_* functions read os.environ *inside* the
@@ -11324,7 +11416,7 @@ else
   # via variable expansion in bash, so the run is spelled out in each branch).
   _run_argv=(
     --rm $TTY_FLAGS
-    --name "leerie-$(date +%s)-$$"
+    --name "$_container_name"
     --label "leerie.launcher_pid=$$"
     --cidfile "$_cidfile"
     -v "$_cidfile:/run/leerie-cidfile:ro"

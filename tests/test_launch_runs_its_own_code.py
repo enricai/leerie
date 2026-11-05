@@ -70,6 +70,7 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 LEERIE_STATE_HOST_DIR="$HOME/state"
 TTY_FLAGS="-i"
 _cidfile="/dev/null"
+_container_name="leerie-1793883015-4242"
 REPO_IMAGE_REF=""
 LEERIE_COMMIT=""
 AUTH_MOUNTS=()

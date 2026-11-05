@@ -1350,8 +1350,12 @@ def test_every_nerdctl_command_names_leeries_namespace():
         ns = c.split()[2] if c.split()[1:2] == ["--namespace"] else None
         assert ns in _OTHER_NS, c
     verbs = sorted({c.split()[3] for c in own})
-    assert verbs == ["build", "image", "kill", "run", "save"], verbs
-    assert len(own) == 17, own
+    # `ps`, `inspect` and `rm`: the launch's removal of its own container
+    # and of what dead launches left (DESIGN §6 *A container a launch
+    # starts never outlives that launch*), in leerie's namespace only.
+    assert verbs == ["build", "image", "inspect", "kill", "ps", "rm", "run",
+                     "save"], verbs
+    assert len(own) == 21, own
     # The run's quoted forms (macOS `script`) name it too.
     assert leerie.count(
         '_nerdctl_run_quoted="nerdctl --namespace $LEERIE_IMAGE_NS run"') == 2
