@@ -10,7 +10,14 @@ The stubs are built from shell builtins and absolute paths only (they never
 call a program by name, so they can never resolve to themselves), and they
 are two: `nerdctl` and `cat`. `run` records its argv, writes the cidfile, and "runs the
 container": a `sleep` whose PID it records, so `kill` can end it the way
-`nerdctl kill` ends a container.
+`nerdctl kill` ends a container. It also keeps leerie's namespace's
+container store (`containers(w)`, `seed_container`), which `ps -a`, `inspect`
+and `rm` read: `run` puts its container there, and its `--rm` is the
+client's, as nerdctl's is, so it happens only if the client is still alive
+once the container exits (`STUB_RM_LAG` delays it, `STUB_CLIENT_RM=0`
+withholds it). `rm` without `-f` refuses a running container, as nerdctl's
+does; removing a container takes one line naming its image out of the
+world's `inuse` file, when there is one.
 
 The world decides its own AppArmor state, not the host: the launcher's
 probes (`runtime_has_apparmor`, `runtime_apparmor_current` in
@@ -74,32 +81,153 @@ w="__WORLD__"
 printf '%s\n' "$*" >> "$w/nerdctl.calls"
 ns=""
 if [ "$1" = "--namespace" ]; then ns=$2; shift 2; fi
+# The container store, leerie's namespace's: one `name|id|status|pid
+# label|image` line per container, rewritten with builtins only.
+cstore="$w/containers"
+c_get() {
+  local n i s l m
+  [ -f "$cstore" ] || return 1
+  while IFS='|' read -r n i s l m; do
+    if [ -n "$n" ] && { [ "$n" = "$1" ] || [ "$i" = "$1" ]; }; then
+      C_NAME=$n C_ID=$i C_ST=$s C_LB=$l C_IM=$m
+      return 0
+    fi
+  done < "$cstore"
+  return 1
+}
+c_put() {
+  local keep=() l
+  if [ -f "$cstore" ]; then
+    while IFS= read -r l; do
+      [ -z "$l" ] || [ "${l%%|*}" = "$1" ] || keep+=("$l")
+    done < "$cstore"
+  fi
+  keep+=("$1|$2|$3|$4|$5")
+  printf '%s\n' "${keep[@]}" > "$cstore"
+}
+c_del() {
+  local keep=() l gone=""
+  while IFS= read -r l; do
+    [ -z "$l" ] || [ "${l%%|*}" = "$1" ] || keep+=("$l")
+  done < "$cstore"
+  printf '%s\n' ${keep[@]+"${keep[@]}"} > "$cstore"
+  # The image it was created from is one container less in use.
+  if [ -n "$C_IM" ] && [ -f "$w/inuse" ]; then
+    keep=()
+    while IFS= read -r l; do
+      if [ -z "$gone" ] && [ "$l" = "$C_IM" ]; then gone=1; else keep+=("$l"); fi
+    done < "$w/inuse"
+    printf '%s\n' ${keep[@]+"${keep[@]}"} > "$w/inuse"
+  fi
+}
 case "$1" in
   run)
     { for a in "$@"; do printf '%s\n' "$a"; done; } > "$w/run.argv"
     printf '%s\n' "$ns" > "$w/run.ns"
-    cid="" prev=""
-    for a in "$@"; do [ "$prev" = "--cidfile" ] && cid=$a; prev=$a; done
+    cid="" prev="" name="" label="" image="" crm="" img_next=""
+    for a in "$@"; do
+      [ -z "$img_next" ] || { image=$a; img_next=""; }
+      [ "$prev" = "--cidfile" ] && cid=$a
+      [ "$prev" = "--name" ] && name=$a
+      [ "$prev" = "-w" ] && img_next=1
+      if [ "$prev" = "--label" ]; then
+        case "$a" in leerie.launcher_pid=*) label=${a#*=} ;; esac
+      fi
+      [ "$a" = "--rm" ] && crm=1
+      prev=$a
+    done
     if [ -n "${STUB_CREATED_SECONDS:-}" ]; then
       # nerdctl writes the cidfile at create, before the task starts; a
       # created container cannot be killed.
       [ -z "$cid" ] || printf 'stubcid\n' > "$cid"
+      c_put "$name" stubcid created "$label" "$image"
       printf 'created\n' > "$w/container.state"
       "__SLEEP__" "$STUB_CREATED_SECONDS"
     fi
+    c_put "$name" stubcid running "$label" "$image"
     printf 'running\n' > "$w/container.state"
+    # The run the orchestrator names in its run-id file (STUB_RUN_ID), at
+    # the host path the state root's bind mount gives it.
+    if [ -n "${STUB_RUN_ID:-}" ]; then
+      sroot="" ridf=""
+      for a in "$@"; do
+        case "$a" in
+          *:/leerie-state) sroot=${a%:/leerie-state} ;;
+          LEERIE_RUN_ID_FILE=/leerie-state/*) ridf=${a#LEERIE_RUN_ID_FILE=/leerie-state/} ;;
+        esac
+      done
+      printf '%s\n' "$STUB_RUN_ID" > "$sroot/$ridf"
+    fi
     # What the container prints, for a test of the launcher's relay.
     [ -z "${STUB_RUN_PRINT:-}" ] || printf '%s\n' "$STUB_RUN_PRINT"
     "__SLEEP__" "${STUB_RUN_SECONDS:-0}" &
     printf '%s\n' "$!" > "$w/container.pid"
     [ -z "$cid" ] || printf 'stubcid\n' > "$cid"
     wait "$!"
-    exit $? ;;
+    rc=$?
+    # The orchestrator's exit status, for a run that ends (STUB_RUN_RC).
+    [ -z "${STUB_RUN_RC:-}" ] || rc=$STUB_RUN_RC
+    # `--rm` is the client's: done only by a client alive after the
+    # container exits (STUB_RM_LAG: how long it takes to get there), and
+    # never with STUB_CLIENT_RM=0. A client killed first leaves it.
+    # A TERM there ends the client (and its lag) without the `--rm`. The
+    # trap is set before the lag starts and names it as `$!`: a TERM between
+    # the fork and an assignment would otherwise leave the lag running.
+    if [ -n "${STUB_RM_LAG:-}" ]; then
+      trap 'kill -KILL "$!" 2>/dev/null; exit 143' TERM
+      "__SLEEP__" "$STUB_RM_LAG" &
+      wait "$!"
+      trap - TERM
+    fi
+    if c_get "$name"; then
+      if [ -n "$crm" ] && [ "${STUB_CLIENT_RM:-1}" = 1 ]; then
+        c_del "$name"
+      else
+        c_put "$name" stubcid exited "$label" "$image"
+      fi
+    fi
+    exit $rc ;;
   kill)
     if [ -f "$w/container.state" ] && [ "$(< "$w/container.state")" = created ]; then
       printf 'container not running\n' >&2; exit 1
     fi
     [ ! -f "$w/container.pid" ] || kill -KILL "$(< "$w/container.pid")" 2>/dev/null
+    if c_get "${!#}"; then c_put "$C_NAME" "$C_ID" exited "$C_LB" "$C_IM"; fi
+    exit 0 ;;
+  ps)
+    [ "$ns" = leerie ] && [ -f "$cstore" ] || exit 0
+    while IFS='|' read -r n i s l m; do
+      [ -n "$n" ] || continue
+      case "$s" in
+        created) s=Created ;;
+        running) s=Up ;;
+        exited) s="Exited (0) 2 minutes ago" ;;
+        paused) s=Paused ;;
+      esac
+      printf '%s|%s\n' "$n" "$s"
+    done < "$cstore"
+    exit 0 ;;
+  inspect)
+    fmt="" prev=""
+    for a in "$@"; do [ "$prev" = -f ] && fmt=$a; prev=$a; done
+    { [ "$ns" = leerie ] && c_get "${!#}"; } || exit 0
+    case "$fmt" in
+      *leerie.launcher_pid*) printf '%s\n' "$C_LB" ;;
+      *State.Status*) printf '%s\n' "$C_ST" ;;
+    esac
+    exit 0 ;;
+  rm)
+    [ "$ns" = leerie ] || exit 0
+    c_get "${!#}" || { printf 'Error: no such container: %s\n' "${!#}" >&2; exit 1; }
+    if [ "$C_ST" = running ] || [ "$C_ST" = paused ]; then
+      if [ "$2" != -f ]; then
+        printf 'Error: cannot remove a %s container\n' "$C_ST" >&2; exit 1
+      fi
+      if [ "$C_ID" = stubcid ] && [ -f "$w/container.pid" ]; then
+        kill -KILL "$(< "$w/container.pid")" 2>/dev/null
+      fi
+    fi
+    c_del "$C_NAME"
     exit 0 ;;
   info|version) printf 'Version: 2.0.0\n'; exit 0 ;;
   *) exit 0 ;;
@@ -203,6 +331,25 @@ def run_argv(w: dict) -> list[str]:
     """The argv the launcher gave `nerdctl run` (empty: it never ran)."""
     f = w["world"] / "run.argv"
     return f.read_text().splitlines() if f.exists() else []
+
+
+def containers(w: dict) -> dict[str, str]:
+    """The stub's container store, leerie's namespace's: name -> status
+    (`created`, `running`, `exited`, `paused`)."""
+    f = w["world"] / "containers"
+    if not f.exists():
+        return {}
+    return {l.split("|")[0]: l.split("|")[2]
+            for l in f.read_text().splitlines() if l}
+
+
+def seed_container(w: dict, name: str, status: str, launcher_pid: str = "",
+                   image: str = "", cid: str = "") -> None:
+    """Put a container in the stub's store, as a launch or the operator
+    left it."""
+    with open(w["world"] / "containers", "a") as f:
+        f.write(f"{name}|{cid or name + '-id'}|{status}|{launcher_pid}|"
+                f"{image}\n")
 
 
 def marked_pids(mark: str) -> list[int]:

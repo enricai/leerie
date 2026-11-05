@@ -444,7 +444,8 @@ def test_ctrl_c_still_brings_the_branch_back(run, tmp_path):
     traps = [ln.strip() for ln in src.splitlines()
              if ln.strip().startswith("trap '")
              and "_kill_container_from_cidfile" in ln]
-    assert [t.rsplit(" ", 1)[-1] for t in traps] == ["EXIT", "INT", "TERM"]
+    assert [t.rsplit(" ", 1)[-1] for t in traps] == ["EXIT", "INT", "TERM",
+                                                      "HUP"]
     ready = tmp_path / "ready"
     script = ("set -euo pipefail\nRUNTIME=local\n"
               f'_run_id_file="{rid}"\n_cidfile=""\nSTAGE="{tmp_path}/stage"\n'
@@ -452,6 +453,7 @@ def test_ctrl_c_still_brings_the_branch_back(run, tmp_path):
               # `set -e` that must not end the trap before the bring-back.
               "_stage_keepalive_pid=999999\n"
               "_reap_tail() { :; }\n_kill_container_from_cidfile() { :; }\n"
+              "_remove_launch_container() { :; }\n"
               "_stop_run() { :; }\n"
               + _functions_block() + "\n".join(traps) + "\n"
               f'touch "{ready}"\nsleep 30\necho NOT-INTERRUPTED\n')
