@@ -2485,6 +2485,7 @@ def _subtask_item_schema(
     include_fixes_reported_symptom: bool = False,
     include_change_shape: bool = False,
     include_verify: bool = False,
+    include_verification_only: bool = False,
     include_claims: bool = False,
 ) -> dict:
     """Build the child-subtask item schema shared by planner.subtasks,
@@ -2592,9 +2593,11 @@ def _subtask_item_schema(
                 },
             },
         }
+    if include_verification_only:
         # True only when the subtask writes nothing and every criterion is
         # decided by its `verify` argv. `_verification_only` holds it to the
-        # second half in code; absence means false.
+        # second half in code; absence means false. Planner-only: a split
+        # child has work to do and never claims it.
         properties["verification_only"] = {"type": "boolean"}
     required = ["id", "title", "success_criteria_seed"]
     if include_change_shape:
@@ -3179,6 +3182,7 @@ SCHEMAS: dict[str, dict] = {
                     include_fixes_reported_symptom=True,
                     include_change_shape=True,
                     include_verify=True,
+                    include_verification_only=True,
                     include_claims=True,
                 ),
             },
@@ -3319,6 +3323,18 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "risk": _risk_item_schema(),
+            # Where a criterion's evidence was read (DESIGN §8 *A no-op the
+            # base already carries*): a repo-relative path and its lines. A
+            # no-op claim's locations go to the settle probe to check.
+            "location": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                },
+            },
         },
         "properties": {
             "subtask_id": {"type": "string"},
@@ -3352,6 +3368,10 @@ SCHEMAS: dict[str, dict] = {
                         # Optional, and absent means "this was mine to
                         # evaluate", so nothing changes for the ordinary case.
                         "not_applicable": {"type": "boolean"},
+                        # Optional: the files and lines the evidence was
+                        # read from. Asked for on a no-op claim.
+                        "locations": {"type": "array",
+                                      "items": {"$ref": "#/$defs/location"}},
                     },
                 },
             },
@@ -4157,6 +4177,22 @@ SCHEMAS: dict[str, dict] = {
         "type": "object",
         "additionalProperties": False,
         "required": ["satisfied", "evidence"],
+        "$defs": {
+            # One gap the settle probe found (DESIGN §8 *A no-op the base
+            # already carries*): the criterion id, where, and what is
+            # missing. Relayed to the re-driven worker; never parsed.
+            "gap": {
+                "type": "object",
+                "required": ["criterion", "missing"],
+                "properties": {
+                    "criterion": {"type": "string"},
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                    "missing": {"type": "string"},
+                },
+            },
+        },
         "properties": {
             "satisfied": {"type": "boolean"},
             "evidence": {"type": "string"},
@@ -4164,6 +4200,7 @@ SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "items": {"type": "string"},
             },
+            "gaps": {"type": "array", "items": {"$ref": "#/$defs/gap"}},
             "unsatisfied_reason": {
                 "type": "string",
                 "enum": [
@@ -4281,7 +4318,12 @@ SCHEMAS: dict[str, dict] = {
                 # more (a single-child split being a no-op), and every empty
                 # return was rejected and retried before the consumer that
                 # already handled it could ever see it.
-                "items": _subtask_item_schema(include_requires=True),
+                #
+                # `verify` per child (DESIGN §8 *A no-op the base already
+                # carries*): a child without it loses the settle-by-execution
+                # its parent had. Never `verification_only`.
+                "items": _subtask_item_schema(include_requires=True,
+                                              include_verify=True),
             },
         },
     },
@@ -13858,7 +13900,37 @@ def _inherited_subtask_fields(subtask: dict) -> dict:
         "independent_sites": subtask.get("independent_sites"),
         "sweep_sites": list(subtask.get("sweep_sites") or []),
         **_site_claim_fields(subtask),
+        **_inherited_verify(subtask),
     }
+
+
+def _inherited_verify(subtask: dict) -> dict:
+    """The parent's `verify` entries, for a child built by code (DESIGN §8
+    *A no-op the base already carries*): its criteria are the parent's seed
+    copied verbatim plus a scope clause, so the commands that decide the
+    parent's criteria decide the child's. Without them every split child
+    lost settle-by-execution. `verification_only` is never inherited: a
+    child of a subtask that was split has work to do, and absence means
+    false. Absent when the parent has no `verify`."""
+    entries = subtask.get("verify")
+    if not isinstance(entries, list) or not entries:
+        return {}
+    return {"verify": copy.deepcopy(entries)}
+
+
+def _split_children_missing_verify(parent: dict,
+                                   children: list[dict]) -> list[str]:
+    """The ids of splitter-made children that carry no `verify` entry under
+    a parent whose `verify` had an executable argv — a plan defect (DESIGN
+    §8 *A no-op the base already carries*): each such child loses the
+    settle-by-execution its parent had. Logged, never repaired: which of
+    the parent's commands decides a child's own criterion is the
+    splitter's reading, not code's."""
+    if not _subtask_verify_argvs(parent):
+        return []
+    return [str(c.get("id")) for c in children
+            if isinstance(c, dict) and not (
+                isinstance(c.get("verify"), list) and c["verify"])]
 
 
 def _inherit_split_fields(parent: dict, children: list[dict]) -> None:
@@ -13871,6 +13943,9 @@ def _inherit_split_fields(parent: dict, children: list[dict]) -> None:
             child["change_shape"] = parent.get("change_shape")
             child["independent_sites"] = parent.get("independent_sites")
             child["sweep_sites"] = list(parent.get("sweep_sites") or [])
+            # Planner-only (DESIGN §8 *A no-op the base already carries*):
+            # a split child has work to do, whatever the splitter wrote.
+            child.pop("verification_only", None)
 
 
 def _site_claim_fields(subtask: dict) -> dict:
@@ -13892,7 +13967,8 @@ def _site_claim_fields(subtask: dict) -> dict:
 
 def _migration_child(subtask: dict, chunk: list[str], cid: str,
                      title: str, criteria: str,
-                     newfile_owner_id: str | None = None) -> dict:
+                     newfile_owner_id: str | None = None,
+                     verify: list | None = None) -> dict:
     """Build one migration-chunk child subtask from its (code-fixed) file
     partition plus a title + success_criteria_seed. Inherits the parent's
     graph edges/intent; the files are the pre-computed chunk, never re-decided.
@@ -13938,6 +14014,10 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
     if newfile_owner_id is not None:
         criteria = _apply_newfile_clause(
             criteria, is_owner=is_owner, owner_id=newfile_owner_id)
+    # `verify`, when given, is the label-only splitter's own entries for
+    # this chunk's rewritten criteria; it replaces the parent's.
+    own_verify = ({"verify": copy.deepcopy(verify)}
+                  if isinstance(verify, list) and verify else {})
     return {
         "id": cid,
         "title": title,
@@ -13954,6 +14034,7 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
         # ownerless and keeps naming the original owner.
         "_newfile_owner": is_owner if newfile_owner_id is not None else None,
         "_newfile_owner_id": newfile_owner_id,
+        **own_verify,
     }
 
 
@@ -14103,6 +14184,9 @@ async def _label_migration_chunks(
 
     chunk_spec = [{"id": cid, "files_likely_touched": chunk}
                   for cid, chunk in zip(ids, chunks)]
+    # The splitter's `verify` per relabelled chunk; a chunk it gave none
+    # keeps the parent's (`_inherited_verify`).
+    verifies: dict[str, list] = {}
     try:
         _bump_decompose_workers(st, caps)
     except DecompositionBudgetExceeded:
@@ -14123,9 +14207,10 @@ async def _label_migration_chunks(
     user_prompt = wrap_repo_map(
         "LABEL PRE-PARTITIONED MIGRATION CHUNKS (label-only mode).\n"
         "The file partition below is FIXED — do NOT move, add, or drop files. "
-        "For each chunk id, write a concise distinct `title` and a "
-        "`success_criteria_seed`. Return one child per id, preserving ids and "
-        "files_likely_touched exactly.\n\n"
+        "For each chunk id, write a concise distinct `title`, a "
+        "`success_criteria_seed`, and `verify`: one entry per criterion with "
+        "the argv that decides it on that chunk alone. Return one child per "
+        "id, preserving ids and files_likely_touched exactly.\n\n"
         "PARENT SUBTASK:\n"
         f"{json.dumps(subtask, indent=2)}\n\n"
         "CHUNKS TO LABEL:\n"
@@ -14142,6 +14227,8 @@ async def _label_migration_chunks(
             crit = (child.get("success_criteria_seed") or "").strip()
             if cid in labels and title and crit:
                 labels[cid] = (title, crit)
+                if isinstance(child.get("verify"), list):
+                    verifies[cid] = child["verify"]
     except (WorkerError, subprocess.TimeoutExpired):
         # Worker crashed — keep the distinct deterministic labels (§12: a
         # split must never silently produce identical children).
@@ -14151,7 +14238,8 @@ async def _label_migration_chunks(
     owner_id, _ = _newfile_designation(subtask, ids[0])
     return [
         _migration_child(subtask, chunk, cid, *labels[cid],
-                         newfile_owner_id=owner_id)
+                         newfile_owner_id=owner_id,
+                         verify=verifies.get(cid))
         for cid, chunk in zip(ids, chunks)
     ]
 
@@ -14666,6 +14754,13 @@ async def _recursive_decompose(
             return [subtask]
         children = split_result.get("children") or []
         _inherit_split_fields(subtask, children)
+        missing = _split_children_missing_verify(subtask, children)
+        if missing:
+            log(f"  plan defect SPLIT_CHILD_NO_VERIFY: "
+                f"{subtask.get('id', '?')} had verify commands, but split "
+                f"child(ren) {', '.join(missing)} carry none — they lose "
+                "settle-by-execution (DESIGN §8 *A no-op the base already "
+                "carries*)")
         # The splitter's schema carries no claims; the code stamps the
         # parent's, as `_inherited_subtask_fields` does for code-built
         # children.
@@ -18272,7 +18367,7 @@ async def _probe_criteria_satisfied_on_head(
     subtask: dict, worktree: str, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
     label: str = "head", *, executed: dict | None = None,
-    verdict: dict | None = None,
+    verdict: dict | None = None, claimed: list[dict] | None = None,
 ) -> dict | None:
     """Run-branch-HEAD analogue of `_filter_satisfied_subtasks`'s per-subtask
     probe, asked before a plan-time-flagged provider-subset subtask spawns
@@ -18306,7 +18401,10 @@ async def _probe_criteria_satisfied_on_head(
     which criteria leerie's own execution decided, so it judges substance
     and never re-runs them in its read-only tree (DESIGN §8 *A no-op a
     sibling already delivered is settled on evidence*). `verdict`, when
-    given, receives the probe's raw output for the caller to type."""
+    given, receives the probe's raw output for the caller to type.
+    `claimed`, the implementer's per-criterion evidence for a no-op claim
+    (`_no_op_claim_evidence`), is shown as a claim to check, never as a
+    finding (DESIGN §8 *A no-op the base already carries*)."""
     sid = subtask.get("id", "?")
     seed = (subtask.get("success_criteria_seed") or "").strip()
     if not seed:
@@ -18330,6 +18428,8 @@ async def _probe_criteria_satisfied_on_head(
     decided = _criteria_decided_by_execution(subtask, executed)
     if decided:
         payload["decided_by_execution"] = decided
+    if claimed:
+        payload["implementer_claim"] = claimed
     user_prompt = (
         "SUBTASK:\n" + json.dumps(payload, indent=2) +
         "\n\nReturn only the JSON object per your schema. Judge the "
@@ -18350,6 +18450,15 @@ async def _probe_criteria_satisfied_on_head(
            "in full: every file, case and behaviour the criterion names, "
            "not only some of them."
            if decided else "")
+        + (" `implementer_claim` is the implementer's own account of why "
+           "nothing needs changing: per criterion, what it says it saw and "
+           "the files and lines it says it read. It is a claim to check, "
+           "not evidence: read every location it cites, judge each "
+           "criterion yourself, and look past the cited lines for what the "
+           "criterion asks that they do not show. For every gap you find, "
+           "add an entry to `gaps` naming the criterion id, the file and "
+           "lines, and what is missing."
+           if claimed else "")
     )
     # bump_workers OUTSIDE the try, same as _filter_satisfied_subtasks: a
     # budget-exhaustion WorkerError must propagate to abort the run, not be
@@ -63720,8 +63829,21 @@ def _unconverged_predecessors(leerie_dir: Path, st: "State",
                               sid: str) -> list[str]:
     """The transitive predecessors of `sid` (the scheduler's graph, from
     `plan.json`) that settled `unconverged`. A dependent of unfinished work
-    is not run on top of it."""
-    return _settled_predecessors(leerie_dir, st, sid, "unconverged")
+    is not run on top of it. An `undecidable_no_op` is not unfinished work
+    on the branch: it settles only with zero commits, so the run branch a
+    dependent starts from is the one it would have had, and the
+    dependent's own checks then test the no-op's claim (DESIGN §8 *A no-op
+    the base already carries*). The run stays `unconverged` either way."""
+    records = st.data.get("unconverged_subtasks") or {}
+    return [p for p in _settled_predecessors(leerie_dir, st, sid,
+                                             "unconverged")
+            if not (isinstance(records.get(p), dict)
+                    and records[p].get("kind") == _UNDECIDABLE_NO_OP)]
+
+
+# `unconverged_subtasks[sid].kind` of a zero-commit no-op neither execution
+# nor the satisfied-probe could decide (`_settle_nothing_to_change`).
+_UNDECIDABLE_NO_OP = "undecidable_no_op"
 
 
 def _accepted_external_predecessors(leerie_dir: Path, st: "State",
@@ -64808,6 +64930,85 @@ async def _sibling_deliveries(worktree: str, sid: str,
     return out
 
 
+# The implementer's no-op evidence the settle probe is shown is bounded, so
+# one verbose claim cannot crowd the probe's own reading out of its turns.
+_NO_OP_CLAIM_MAX_CRITERIA = 12
+_NO_OP_CLAIM_MAX_LOCATIONS = 8
+_NO_OP_CLAIM_TEXT_CHARS = 600
+
+
+def _no_op_claim_evidence(res: dict, worktree: str) -> list[dict]:
+    """The implementer's typed per-criterion evidence for a no-op claim
+    (`criteria_results`, each with the `locations` it read), for the settle
+    probe to check (DESIGN §8 *A no-op the base already carries*). Only
+    mechanical filtering: a location is kept when its `path` is a relative
+    path to a file in `worktree` and its lines are positive integers.
+    Text is passed through, bounded, and never read by code."""
+    out: list[dict] = []
+    root = Path(worktree)
+    for cr in res.get("criteria_results") or []:
+        if not isinstance(cr, dict) or len(out) >= _NO_OP_CLAIM_MAX_CRITERIA:
+            continue
+        locs: list[dict] = []
+        for loc in cr.get("locations") or []:
+            if (not isinstance(loc, dict)
+                    or len(locs) >= _NO_OP_CLAIM_MAX_LOCATIONS):
+                continue
+            path = loc.get("path")
+            if (not isinstance(path, str) or not path.strip()
+                    or path.startswith("/") or ".." in Path(path).parts
+                    or not (root / path).is_file()):
+                continue
+            kept: dict = {"path": path}
+            for k in ("start_line", "end_line"):
+                v = loc.get(k)
+                if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                    kept[k] = v
+            locs.append(kept)
+        entry: dict = {
+            "criterion": str(cr.get("criterion") or "")[
+                :_NO_OP_CLAIM_TEXT_CHARS],
+            "evidence": str(cr.get("evidence") or "")[
+                :_NO_OP_CLAIM_TEXT_CHARS],
+            "locations": locs}
+        if isinstance(cr.get("met"), bool):
+            entry["met"] = cr["met"]
+        if entry["criterion"] or entry["evidence"] or locs:
+            out.append(entry)
+    return out
+
+
+def _probe_gap_text(verdict: dict) -> str:
+    """The settle probe's gap, for the re-drive note: its typed reason, its
+    evidence, and each `gaps` entry with its location. Relayed to the
+    worker as the probe's finding; code reads only the typed fields."""
+    reason = verdict.get("unsatisfied_reason") or "untyped"
+    text = (f"the satisfied-probe found the criteria not met on HEAD "
+            f"({reason}): {str(verdict.get('evidence') or '').strip()}")
+    for g in verdict.get("gaps") or []:
+        if not isinstance(g, dict):
+            continue
+        where = str(g.get("path") or "")
+        if where and isinstance(g.get("start_line"), int):
+            where += f":{g['start_line']}"
+            if isinstance(g.get("end_line"), int):
+                where += f"-{g['end_line']}"
+        text += (f"\n- {g.get('criterion') or '?'}"
+                 + (f" at {where}" if where else "")
+                 + f": {str(g.get('missing') or '').strip()}")
+    return text
+
+
+def _no_op_verify_failed_before(prev: object, st: "State", sid: str) -> bool:
+    """Whether this subtask's previous attempt was a no-op claim its verify
+    commands refuted (`settled_by_execution[sid]` with `no_op` and verdict
+    `fail`) and it has since been re-driven: the one re-drive a refuted
+    no-op gets is spent (DESIGN §8 *A no-op the base already carries*)."""
+    rounds = int((st.data.get("redrive_rounds") or {}).get(sid, 0) or 0)
+    return (isinstance(prev, dict) and prev.get("no_op") is True
+            and prev.get("verdict") == "fail" and rounds >= 1)
+
+
 async def _settle_nothing_to_change(
         sid: str, subtask: dict, worktree: str, st: "State", caps: dict,
         models: dict[str, str], efforts: dict[str, str | None], *,
@@ -64815,70 +65016,104 @@ async def _settle_nothing_to_change(
     """Settle a claim that there is nothing to change: a `nothing_to_change`
     blocker, or a `complete` with nothing committed. It settles only on the
     orchestrator's own evidence, never on the implementer's word (DESIGN §8
-    *A no-op a sibling already delivered is settled on evidence*). Returns
-    `(result, why)`. `result` is the terminal result when the claim settles
-    (`complete`, or `unconverged` on an `environment_limit` execution);
-    otherwise it is None, and `why` says which check failed, for the
-    re-drive blocker.
+    *A no-op the base already carries*, *A no-op a sibling already
+    delivered is settled on evidence*). Returns `(result, why)`. `result`
+    is the terminal result when the claim settles; otherwise it is None,
+    and `why` says which check failed, for the re-drive blocker.
 
-    Three checks, all required: a sibling integrated this run changed a
-    file on this subtask's `files_likely_touched` (`_sibling_deliveries`);
-    its `verify` argvs pass on HEAD (`_settle_by_execution`; `executed`
-    reuses a pass this settle already made); and the base-tree-only
-    `satisfied_probe` finds its criteria met on HEAD — or, told which
-    criteria that execution decided, answers only `cannot_verify`, and every
-    criterion it could not check is one a passing command exercises in full
-    (`_execution_answers_cannot_verify`): a probe that could not check
-    found no gap, and does not overrule leerie's own pass."""
+    (a) Its `verify` argvs run on HEAD (`_settle_by_execution`; `executed`
+    reuses a pass this settle already made). An `environment_limit` settles
+    `unconverged`. A failure re-drives with the command and its output tail
+    — once: a no-op its commands refute again after that re-drive settles
+    `unconverged` (`no_op_refuted`).
+    (b) Nothing failed: the base-tree-only `satisfied_probe` judges its
+    criteria on HEAD, shown the implementer's per-criterion evidence
+    (`_no_op_claim_evidence`) as a claim to check. `satisfied` settles
+    `complete` — `satisfied_by_sibling` when a sibling integrated this run
+    changed its surface (`_sibling_deliveries`, provenance only),
+    `satisfied_on_base` otherwise. So does `cannot_verify` when leerie's
+    own passing commands cover every criterion the probe could not check
+    (`_execution_answers_cannot_verify`). Any other `cannot_verify` settles
+    `unconverged` at once (`undecidable_no_op`): nothing a re-drive does
+    changes what the probe can read or what no command decides. A gap
+    re-drives, with the probe's typed gaps in the blocker."""
     if await _branch_has_commits_ahead(worktree,
                                        _compute_run_branch(st.run_id)):
         return None, "the subtask branch carries commits"
     planned = [f for f in (subtask.get("files_likely_touched") or [])
                if isinstance(f, str)]
     landed = await _sibling_deliveries(worktree, sid, planned)
-    if not landed:
-        return None, ("not settled on evidence: no sibling integrated this "
-                      "run changed a file this subtask plans to touch")
     ex = None
     if _subtask_verify_argvs(subtask):
+        prev = (st.data.get("settled_by_execution") or {}).get(sid)
+        prev = dict(prev) if isinstance(prev, dict) else None
         ex = executed or await _settle_by_execution(subtask, worktree, st,
                                                     caps, sid=sid)
+        if ex is not executed:
+            # Marks the record as a no-op's, for the one-re-drive rule.
+            ex["no_op"] = True
+            st.save()
         if ex["verdict"] == "environment_limit":
             return _settle_unconverged(
                 st, sid, "environment_limit: " + ex["why"],
                 previous_status="blocked", kind="environment_limit"), ""
         if ex["verdict"] != "pass":
-            return None, ("not settled on evidence: a sibling changed its "
-                          "surface, but " + _execution_blocker(ex))
+            if ex["verdict"] == "fail" and _no_op_verify_failed_before(
+                    prev, st, sid):
+                return _settle_unconverged(
+                    st, sid, "nothing_to_change claimed again after a "
+                    "re-drive, and its verify commands still refute it: "
+                    + _execution_blocker(ex),
+                    previous_status="blocked", kind="no_op_refuted"), ""
+            return None, ("not settled on evidence: "
+                          + _execution_blocker(ex))
     out: dict = {}
+    claimed = _no_op_claim_evidence(res, worktree)
     drop = await _probe_criteria_satisfied_on_head(
         subtask, worktree, st, caps, models, efforts, label="settle",
-        executed=ex, verdict=out)
+        executed=ex, verdict=out, claimed=claimed)
     by_execution = False
     if drop is None:
         # The probe could not check, and leerie's own execution decided
         # every criterion it could not check, by a command that exercises
         # all of it: no gap was found, so it does not overrule that pass.
-        # Any gap it found, or a criterion no command covers, re-drives.
         by_execution = _execution_answers_cannot_verify(subtask, ex, out)
         if not by_execution:
-            return None, ("not settled on evidence: a sibling changed its "
-                          "surface, but the satisfied-probe did not find its "
-                          "criteria met on HEAD")
+            if not out:
+                # No verdict (a crash, or no criterion to judge): fail safe
+                # to the re-drive, as the probe's own contract says.
+                return None, ("not settled on evidence: the satisfied-probe "
+                              "reached no verdict on HEAD")
+            if (out.get("satisfied") is False
+                    and out.get("unsatisfied_reason") == "cannot_verify"):
+                return _settle_unconverged(
+                    st, sid, "undecidable_no_op: nothing_to_change, and "
+                    "neither a passing verify command nor the "
+                    "satisfied-probe can decide its criteria on HEAD: "
+                    + str(out.get("evidence") or "").strip(),
+                    previous_status="blocked",
+                    kind=_UNDECIDABLE_NO_OP), ""
+            return None, "not settled on evidence: " + _probe_gap_text(out)
         drop = {"evidence": out.get("evidence", ""),
                 "checked": list(out.get("checked") or [])}
     by = ", ".join(f"{d['sid']} ({d['commit'][:12]})" for d in landed)
-    log(f"  {sid}: nothing to change, and the run shows why — {by} changed "
-        "its surface"
+    log(f"  {sid}: nothing to change"
+        + (f", and the run shows why — {by} changed its surface" if landed
+           else ", and the base already carries it")
         + (", its verify commands pass," if ex is not None else ",")
         + (" and they decide every criterion the satisfied-probe could not "
            "check (it found no gap)" if by_execution else
            " and the satisfied-probe finds its criteria met on HEAD")
         + "; settling complete")
-    record = {"reason": "satisfied_by_sibling",
-              "satisfied_by": landed,
-              "evidence": drop.get("evidence", ""),
-              "checked": list(drop.get("checked") or [])}
+    record: dict = {"reason": ("satisfied_by_sibling" if landed
+                               else "satisfied_on_base"),
+                    "evidence": drop.get("evidence", ""),
+                    "checked": list(drop.get("checked") or [])}
+    if landed:
+        record["satisfied_by"] = landed
+    if claimed:
+        record["claimed_locations"] = sum(len(c["locations"])
+                                          for c in claimed)
     if by_execution:
         record["decided_by"] = "execution"
     if ex is not None:
@@ -64886,7 +65121,11 @@ async def _settle_nothing_to_change(
     return _settle_already_satisfied(
         sid, record, st,
         summary=(f"nothing to change: {by} already delivered this "
-                 "subtask's criteria, confirmed on HEAD by the orchestrator"),
+                 "subtask's criteria, confirmed on HEAD by the orchestrator"
+                 if landed else
+                 "nothing to change: the run branch already carries this "
+                 "subtask's criteria, confirmed on HEAD by the "
+                 "orchestrator"),
         criteria_results=res.get("criteria_results")), ""
 
 
@@ -66386,12 +66625,11 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 # subtask has nothing to commit by definition — its claim is
                 # decided by running its typed `verify` commands, here, by
                 # the orchestrator. Any other no-commit claim settles only
-                # on evidence that a sibling already delivered it: the run's
-                # own integration merges, the verify commands executed, and
-                # the HEAD satisfied-probe, all three
-                # (`_settle_nothing_to_change`). Otherwise it is re-driven
-                # from the shared budget and settles `unconverged` when that
-                # is spent.
+                # on the orchestrator's evidence: the verify commands
+                # executed, then the HEAD satisfied-probe shown the
+                # implementer's evidence (`_settle_nothing_to_change`). A
+                # gap or failure is re-driven from the shared budget; a
+                # claim neither can decide settles `unconverged` at once.
                 if _verification_only(subtask):
                     ex = executed or await _settle_by_execution(
                         subtask, worktree, st, caps, sid=sid)

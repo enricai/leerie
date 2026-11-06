@@ -11,9 +11,9 @@ branch. These tests build that repo shape for real: the sibling's
 `leerie: integrate bugfix-001` merge on the run branch, with the wave-2
 worktree cut from it. They drive the real `_settle_subtask` with only the
 implementer, the verify execution and the probe's `claude_p` stubbed. The
-claim settles `complete` only when all three pieces of evidence agree, and
-the e33 shape is still re-driven: nothing landed on the surface, so the
-probe and execution are never asked.
+claim settles `complete` on execution and the probe; the sibling merge is
+now provenance (`satisfied_by_sibling`), and the e33 shape is re-driven on
+the probe's gap (DESIGN §8 *A no-op the base already carries*).
 """
 from __future__ import annotations
 
@@ -214,10 +214,12 @@ def test_without_verify_argvs_the_probe_decides_with_the_precondition(
     assert drop["reason"] == "satisfied_by_sibling" and "executed" not in drop
 
 
-def test_e33_shape_nothing_landed_on_its_surface_is_redriven(
+def test_e33_shape_nothing_landed_is_decided_by_execution_and_the_probe(
         leerie, tmp_path, monkeypatch):
-    """Wave 1, nothing integrated yet: the claim cannot be a sibling's
-    delivery, so neither execution nor the probe is asked."""
+    """Wave 1, nothing integrated yet. The sibling check no longer refuses
+    the claim outright (DESIGN §8 *A no-op the base already carries*): the
+    verify commands run and the probe judges; a probe that finds the case
+    missing keeps it re-driven, never complete."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
@@ -245,27 +247,30 @@ def test_e33_shape_nothing_landed_on_its_surface_is_redriven(
     _spec(env)
     _implementer(env, monkeypatch, NOTHING)
     ran = _execution(env, monkeypatch, "pass")
-    seen = _probe(env, monkeypatch, True)
+    seen = _probe(env, monkeypatch, False)
 
     res = _settle(env)
 
     assert res["status"] == "blocked"
-    assert ran == [] and seen == []
-    assert "no sibling integrated this run" in res["blocker"]
+    assert ran == [str(wt)] and len(seen) == 1
+    assert "satisfied-probe found the criteria not met" in res["blocker"]
     assert st.data["subtask_status"][SID] == "blocked"
+    assert SID not in (st.data.get("dropped_subtasks") or {})
 
 
-def test_a_sibling_on_another_surface_is_not_evidence(synth, monkeypatch):
+def test_a_sibling_on_another_surface_is_not_provenance(synth, monkeypatch):
     env = synth
     _spec(env, files_likely_touched=["docs/usage.md"])
     _implementer(env, monkeypatch, NOTHING)
-    ran = _execution(env, monkeypatch, "pass")
-    seen = _probe(env, monkeypatch, True)
+    _execution(env, monkeypatch, "pass")
+    _probe(env, monkeypatch, True)
 
     res = _settle(env)
 
-    assert res["status"] == "blocked"
-    assert ran == [] and seen == []
+    assert res["status"] == "complete"
+    drop = env["st"].data["dropped_subtasks"][SID]
+    assert drop["reason"] == "satisfied_on_base"
+    assert "satisfied_by" not in drop
 
 
 def test_failed_execution_redrives_and_skips_the_probe(synth, monkeypatch):
@@ -296,7 +301,7 @@ def test_probe_not_satisfied_redrives(synth, monkeypatch):
     res = _settle(env)
 
     assert res["status"] == "blocked"
-    assert "satisfied-probe did not find" in res["blocker"]
+    assert "satisfied-probe found the criteria not met" in res["blocker"]
     assert env["st"].data["subtask_status"][SID] == "blocked"
 
 

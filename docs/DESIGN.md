@@ -696,11 +696,13 @@ attempt between them) settles `unconverged`
 (`external_unverified`, §13 *An environment that cannot check a claim does
 not burn the budget*). An `environment_limit` is retried in place once,
 then settled `unconverged`. A `nothing_to_change` is settled `complete` only
-when a sibling integrated this run changed its surface, its verify commands
-(if any) pass, and the satisfied-probe finds its criteria met — or, when
-every criterion has a command and each passed, finds no gap and names no
-criterion it could not check that a passing command does not exercise in
-full; a
+when its verify commands (if any) pass on HEAD and the satisfied-probe,
+shown the implementer's per-criterion evidence, finds its criteria met — or,
+when every criterion has a command and each passed, finds no gap and names
+no criterion it could not check that a passing command does not exercise in
+full; a probe that can decide nothing no command decides settles it
+`unconverged` at once (`undecidable_no_op`, §8 *A no-op the base already
+carries*); a
 `cannot_reproduce` with no commits is settled `complete` when its verify commands pass. In
 both, a verify execution that hits the environment limit settles
 `unconverged`; any other unmet check re-drives it. Every other blocked subtask is re-driven once its wave finishes,
@@ -709,7 +711,8 @@ subtask*);
 when that budget is spent — or a subtask `failed` (the two-tier retry policy
 already spent its retries) — it is settled **`unconverged`**: a terminal
 status that is never left `blocked`, whose branch is not integrated, whose
-dependents settle `unconverged` without running, and which makes the run's
+dependents settle `unconverged` without running (bar a zero-commit
+`undecidable_no_op`'s, which run), and which makes the run's
 outcome `unconverged` (§6 *The run outcome is decided once*), so the PR
 opens as a draft. Accepting an auto-accepted blocker as `complete` used to
 present unfinished work as done; `unconverged` says what happened. With
@@ -14199,7 +14202,9 @@ settles nothing, so the claim is settled by evidence the orchestrator
 gathers itself (§12: prompts are advisory, code enforces). This applies to
 a `nothing_to_change` blocker and to a `complete` claim with nothing
 committed, including one whose declared commands went unrun. A claim
-settles `complete` only when all of these hold:
+settles `complete` only when all of these hold (as first designed; check 1
+no longer gates — *A no-op the base already carries*, below, supersedes
+it, and keeps the sibling merges as the settle's recorded provenance):
 
 1. **A sibling changed this subtask's surface this run.** This check is
    mechanical. Code walks the first-parent `leerie: integrate <sid>`
@@ -14290,6 +14295,103 @@ re-driven attempt that reports the same claim is checked again, with the
 same evidence and against the same budget. A verify command killed at the
 measured ceiling settles `unconverged` as `environment_limit`, as the
 other execution arms do.
+
+**A no-op the base already carries.** The sibling precondition made one
+shape unsettleable: a no-op whose work was already on the base before the
+run began, so no sibling of this run ever touched its surface. Its claim
+was re-driven on the same inputs until the budget ran out, and its
+dependents never ran. *Designed 2026-11-05 (the live barnacle run
+`2a663a3e`):* split child `bugfix-005-1`, an audit of eight call sites
+planned to relink any that lacked an argument, reported
+`nothing_to_change` three times, each time listing the eight sites and the
+arguments each already passed. Its claim was most likely true. Nothing
+had integrated on its surface, so the settle returned before any command
+or probe ran; it was re-driven twice and settled `unconverged`, and its
+dependents `bugfix-005-3` (the parity test that would have checked the
+claim) and `bugfix-006` settled `unconverged` without running. The
+sibling check was the `e33` guard (above), but it guarded by refusing
+every claim nothing had landed under, true or false. The guard now comes
+from evidence about the claim itself, and a claim with nothing landed
+under it is settled the same way as one a sibling delivered:
+
+1. **(a) Run the commands.** The subtask's `verify` argvs run on HEAD,
+   exactly as settle-by-execution runs them. A failure re-drives, with the
+   failing command and its output tail in the note — once: a no-op claim
+   its commands still refute after that re-drive settles `unconverged`
+   (`no_op_refuted`), because a worker that reads the failure and still
+   claims there is nothing to change will not be moved by a third round.
+   An environment limit settles `unconverged`, as before.
+2. **(b) Ask the probe, with the implementer's evidence.** When nothing
+   failed, the HEAD `satisfied_probe` judges the criteria as before, and
+   is now also shown the implementer's typed per-criterion evidence:
+   `criteria_results` with the `locations` (file, start and end line) it
+   read for each. The probe is told this is a claim to check, never a
+   finding: it reads every location cited, then looks past them for what
+   the criterion asks that they do not show. Code filters the locations
+   mechanically (a relative path to a file on the tree, positive line
+   numbers) and never reads the text. `satisfied` settles `complete`,
+   recorded as `satisfied_on_base` — or `satisfied_by_sibling`, with the
+   `satisfied_by` merges, when a sibling did change its surface: check 1
+   above is now provenance, not a gate. `cannot_verify` that leerie's own
+   passing commands answer in full settles too, as above. A gap re-drives,
+   with the probe's typed `gaps` (criterion id, file, lines, what is
+   missing) in the note.
+3. **`cannot_verify` with no command covering it settles `unconverged` at
+   once,** typed `undecidable_no_op`, and spends no re-drive round. The
+   probe could not decide a criterion by reading, and no passing command
+   decides it; a re-driven worker reports the same tree, and nothing in
+   another round changes what can be read or run. A round spent there buys
+   nothing but the delay of the dependents.
+
+**A dependent of an `undecidable_no_op` runs.** Every other `unconverged`
+predecessor keeps its dependents from running, because they would be
+built on unfinished work that never reaches the run branch. An
+`undecidable_no_op` settles only with zero commits ahead of the run
+branch, so there is no unfinished work: the dependent starts from exactly
+the tree it would have had had the claim settled `complete`. Running it is
+the one way left to test the claim: in `2a663a3e` the dependent was the
+parity test over every audited site, which passes only if the audit's
+claim holds. If the claim was false, the dependent's own checks fail and
+it is re-driven or settles `unconverged` on its own evidence. Nothing is
+presented as done: the predecessor stays `unconverged`, so the run's
+outcome is `unconverged` and its PR opens as a draft. Skipping the
+dependent instead discards the cheapest available evidence about the
+claim and leaves its work undone for a reason that is not on the tree.
+
+**Split children carry `verify`.** The `e33` guard and both checks above
+lean on `verify`, and a split used to drop it: the splitter's schema had no
+`verify`, and code-built children copied every other field but that one.
+In `2a663a3e` the planner gave `bugfix-005` a `verify` (the parity and
+bypass-site acceptance tests) and neither child had one, so
+`bugfix-005-1` could not be settled by execution at all. The splitter now
+emits `verify` per child, from the parent's commands narrowed to the
+child's criteria — but not `verification_only`, which stays planner-only
+(code drops one a splitter child carries). A child code builds — a region,
+peel or migration-chunk child whose criteria are the parent's seed
+verbatim plus a scope clause — inherits the parent's `verify`; a chunk the
+label-only splitter re-wrote keeps the `verify` it gave, else the
+parent's. `verification_only` is never inherited either: a child of a
+split subtask has work to do, and absence means false. A splitter-made child with no `verify`
+under a parent that had one is logged as a plan defect
+(`SPLIT_CHILD_NO_VERIFY`) and not repaired: which of the parent's
+commands decides a child's own criterion is a reading the splitter makes.
+
+**The `e33` guard holds on the evidence.** A no-op whose commands pass but
+whose criterion the probe, shown the implementer's evidence, finds not met
+does not settle `complete`: it is re-driven with the gap. The probe's input
+changed, so the rule ships behind a bench, not on reasoning: the 22 E4/d4
+cases plus every live no-op settled `unconverged` for want of a sibling,
+with zero false settles required (`e33` among them) and at least the four
+E4/d4 misses and `bugfix-005-1` settled. *Measured 2026-11-06* (3
+samples per case; arm 4 is this rule, arm 1 the sibling-only rule before
+it): zero false settles on every arm, `e33` settled 0/3; true settles 41
+(arm 1: 10) at 17 re-drive rounds (arm 1: 124); `e163`, `e78`, `e90` and
+`bugfix-005-1` settled 3/3. `e165` settled 0/3 on every arm, measured only
+on a stand-in tree: its own tree and spec were pruned, so the bench ran it
+on its run's start commit, where the artifact is genuinely absent and the
+probe rightly says so; it is unmeasurable here, not a miss. The splitter,
+re-run on 14 past split parents that had `verify`, gave 16 children over 42
+samples, all carrying `verify`, none `verification_only`.
 
 **Probing a flagged subtask before it spends.** Settling a no-op only after
 its implementer has run is wasteful in ordering: `_warn_provider_subset_subtasks` (§5
@@ -18735,7 +18837,9 @@ in-settle re-drive plus the wave-end re-drive rounds, since siblings re-drive
 in parallel.
 
 An exhausted subtask is settled `unconverged` (§5), never left `blocked`;
-its dependents settle `unconverged` without running; and `resume` treats
+its dependents settle `unconverged` without running (except a dependent of
+a zero-commit `undecidable_no_op`, which runs: §8 *A no-op the base already
+carries*); and `resume` treats
 `unconverged` (like `complete`, and `accepted_external` once typed blockers
 exist) as settled, so a resumed run does not loop on it. Every subtask of a
 wave therefore ends terminal and `completed_waves` advances. Benched as the
@@ -18751,7 +18855,8 @@ prose:
 
 | `blocker_kind` | Routing |
 |---|---|
-| `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there — or, when every criterion has a command and each passed, finds no gap, answering only `cannot_verify` with every criterion it could not check one a passing command exercises in full (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
+| `nothing_to_change` | settled `complete` on evidence when its `verify` commands pass on HEAD and the satisfied-probe, shown the implementer's per-criterion evidence (files and lines), finds its criteria met there — or, when every criterion has a command and each passed, finds no gap, answering only `cannot_verify` with every criterion it could not check one a passing command exercises in full; recorded `satisfied_by_sibling` when a sibling changed its surface this run, else `satisfied_on_base` (§8 *A no-op a sibling already delivered is settled on evidence*, *A no-op the base already carries*) |
+| `nothing_to_change`, not settled | a failing `verify` command re-drives once with its output tail, then `unconverged` (`no_op_refuted`); a probe gap re-drives with its typed gaps; `cannot_verify` no passing command answers settles `unconverged` at once (`undecidable_no_op`), spending no round, and its dependents still run (zero commits); an environment limit settles `unconverged` (§8 *A no-op the base already carries*) |
 | `external_precondition` (+ `external_resource`, `external_resource_claim`) | the only kind that may be accepted, and only when code verifies the typed resource (below): settled `accepted_external` and listed under "Needs human verification"; a claim the check does not verify is `other`, except that the same claim unverified for an environmental reason on two blocked attempts in a row (no completed attempt between them) settles `unconverged` (`external_unverified`, below) |
 | `environment_limit` | retried in place once, then `unconverged` (the rule of §6 *At the measured ceiling, a resource kill is an environment limit*) |
 | `upstream_missing` | re-driven |

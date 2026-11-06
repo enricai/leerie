@@ -327,7 +327,9 @@ def test_no_commits_verification_only_failing_execution_is_blocked(
 def test_no_commits_not_verification_only_is_blocked_without_execution(
         env, monkeypatch):  # noqa: F811
     """ANTI-VACUITY: the planner said verification_only, but one criterion
-    has no command — code refuses the label, nothing is executed, and the
+    has no command — code refuses the label, so the verification-only arm
+    does not settle it. The claim goes to the no-op settle (DESIGN §8 *A
+    no-op the base already carries*), whose execution fails here, and the
     unbacked claim is re-driven rather than failed or settled."""
     leerie_mod = env["leerie"]
     calls: list = []
@@ -335,17 +337,21 @@ def test_no_commits_not_verification_only_is_blocked_without_execution(
     _write_subtask(env, verification_only=True, verify=[
         {"criterion": "suite passes", "argv": ["pytest"]},
         {"criterion": "docs mention it", "argv": []}])
+    ran: list = []
 
-    async def _exec(*a, **k):
-        raise AssertionError("must not execute a non-verification-only "
-                             "subtask's commands")
+    async def _exec(subtask, worktree, st, caps, *, sid):
+        ran.append(sid)
+        return {"verdict": "fail", "why": "`pytest` exited 1 on 1 run(s)",
+                "dirty": [], "commands": [{"argv": ["pytest"], "rc": 1,
+                                           "tail": "1 failed"}]}
     monkeypatch.setattr(leerie_mod, "_settle_by_execution", _exec)
 
     res = _settle(leerie_mod, env, caps_overrides={"failed_retries": 0})
 
     assert res["status"] == "blocked"
     assert "not verification-only" in res["blocker"]
-    assert len(calls) == 1
+    assert "`pytest` exited 1" in res["blocker"]
+    assert len(calls) == 1 and len(ran) == 1
 
 
 def test_no_commits_environment_limit_settles_unconverged(env, monkeypatch):  # noqa: F811

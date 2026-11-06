@@ -21,7 +21,8 @@ When `files_likely_touched` has already been partitioned into per-chunk
 lists by the orchestrator's `_partition_files()` function, your job is to:
 
 1. **Label each chunk** with a precise `title` and `success_criteria_seed`
-   that accurately describes what implementing that file chunk entails.
+   that accurately describes what implementing that file chunk entails,
+   and its `verify` (see *Output format*).
 2. **Do NOT reorder, merge, or move files between chunks.** The
    `files_likely_touched` for each child must be exactly the chunk you were
    given. 100% coverage is guaranteed by construction in the calling code;
@@ -60,6 +61,18 @@ Return an array of `children`, each with:
 - `requires` / `provides` (optional, mirror parent's tags when relevant)
 - `size` (string: "small" or "medium")
 - `investigation_notes` (optional string)
+- `verify` (array): one entry per criterion in this child's
+  `success_criteria_seed`, `{"criterion": "...", "argv": [...]}`, where
+  `argv` is the exact command that decides that criterion on this child's
+  work alone, split into arguments as it would be exec'd (no shell, no
+  `&&`, pipes or `cd`). Start from the parent's `verify`: give each child
+  the parent commands that check its own criteria, narrowed to its files
+  where the command takes file arguments. A command must exist in the
+  repository (a script in its manifest, a test file on the tree), and must
+  not depend on a sibling child's work that has not landed. A criterion no
+  command decides still gets an entry, with `argv: []`. When the parent
+  has `verify`, every child must have it: a child without one loses the
+  orchestrator's own check of its claim.
 
 ## P1 principles for children
 

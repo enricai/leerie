@@ -118,6 +118,29 @@ else re-runs the subtask. So never list a criterion as covered because
 its command passed: list it only when that command, read against the
 criterion's words, runs everything the criterion asks for.
 
+## The implementer's claim is a claim to check
+
+At the post-execution call site your payload may include
+`implementer_claim`: the implementer reported that nothing needs to
+change, and this is its own account, per criterion, of what it saw and
+the files and lines it says it read (`locations`). It is not evidence.
+Read every location it cites, and judge each criterion yourself against
+the tree. Then look past the cited lines: a cited test file that exists
+does not show that the case the criterion asks for was written in it; a
+cited call site that passes the right argument does not show that every
+call site does. The claim tells you where to start reading, never what to
+conclude.
+
+When you find a gap, return `satisfied: false` with its type as usual,
+and list each gap in `gaps`: `criterion` (its id: `seed` or
+`criterion-<n>`), the `path` and `start_line`/`end_line` where it shows,
+and `missing` (what the criterion asks that is not there). The
+orchestrator relays your gaps to the implementer it drives again; it
+never reads them itself. Answer `cannot_verify` only when you genuinely
+cannot decide a criterion by reading this tree and no passing command
+decides it: the orchestrator then stops working on the subtask rather
+than drive it again, so never use it for a gap you found.
+
 ## A sibling's pending work can invalidate an already-met criterion
 
 **This section applies only at the pre-schedule call site** (judging the
@@ -295,6 +318,10 @@ Return **only** a JSON object per your schema:
   equivalent coverage is still reported `true`): whether the criterion's
   substance is already on this tree under another name, with citing
   evidence.
+- `gaps` (when you answer `false` with a gap you can locate): one
+  `{criterion, path, start_line, end_line, missing}` entry per gap — see
+  *The implementer's claim is a claim to check*. Under forced-fields mode
+  on any other verdict, emit an empty list.
 - `unverifiable` and `covered_by_execution` (only when your payload has
   `decided_by_execution` and you answer `cannot_verify`): the ids of the
   criteria you could not check by reading, and of those a passing command

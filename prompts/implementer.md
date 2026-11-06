@@ -325,7 +325,8 @@ container-hostile build to satisfy a criterion.
 ### 5. Self-check against your criteria (informational)
 
 Walk your criteria file and record what you observed for each item in
-`criteria_results` (criterion text, `met: true|false`, brief evidence).
+`criteria_results` (criterion text, `met: true|false`, brief evidence,
+and optionally `locations`: the files and lines you read it from).
 This is for telemetry and conformance-phase context only — the
 orchestrator does not gate on it. Whether the subtask is complete is
 determined by your §8 confidence gate: `root_cause` and `solution`
@@ -627,8 +628,14 @@ value. The orchestrator routes on it, not on your `blocker` text:
 
 - `nothing_to_change` — the requested change is already present in the
   tree (or your owned scope contains nothing to change); no edit is needed.
-  The subtask is driven again with your blocker as input, so say exactly
-  what you checked.
+  Say exactly what you checked, and back it with `criteria_results`: one
+  entry per criterion, `met` as you found it, `evidence` saying what you
+  saw, and `locations` listing each file you read for it as
+  `{"path": "<repo-relative path>", "start_line": N, "end_line": M}`. The
+  orchestrator runs the subtask's verify commands, then has an independent
+  reader check every location you cite against the criteria. A claim it
+  finds a gap in is driven again with that gap as input; a claim neither
+  can decide ends the subtask unconverged without another round.
 - `external_precondition` — the work needs something that only a human
   outside this run can supply: credentials or secrets, a live third-party
   service or account, a human decision or approval, physical hardware. Set
