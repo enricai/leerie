@@ -7522,7 +7522,12 @@ accept the subtask as leaf); then splits via one of:
   into a single-file child scoped to the one oversized file (which
   re-enters recursion and hits the sub-file tiling above) and a sibling
   child owning the remaining file(s). Both children inherit the parent's
-  `depends_on`/`requires`/`provides` verbatim. Guard: if **zero** or **≥2**
+  `depends_on`/`requires`/`provides` verbatim; then, with `globs =
+  resolve_test_file_globs(repo_root)`, when one child's files hold a
+  `_is_test_case_file(f, globs)` file and the other's hold none, the test
+  child's `depends_on` gains the other child's id (DESIGN §5½ *a test child
+  runs after the code child it was peeled from*); both or neither → no edge.
+  Guard: if **zero** or **≥2**
   files exceed the cap it returns `[]` and the split falls through
   unchanged.
 

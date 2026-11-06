@@ -916,7 +916,8 @@ def test_subfile_bump_workers_not_called_for_region_children(leerie, tmp_path):
 def test_peel_unit_two_file_impl_test(leerie, tmp_path):
     """`_peel_oversized_file` on the measured feat-005 shape (dense impl +
     small test) → a single-file dense child + a sibling owning the test file,
-    both inheriting the parent's edges."""
+    both inheriting the parent's edges, and the test sibling ordered after
+    the dense child (DESIGN §5½ *Oversized-file peel*)."""
     _write_lines(tmp_path / "flow-runner.ts", 2000)     # oversized
     _write_lines(tmp_path / "flow-runner.test.ts", 50)  # small
     parent = {
@@ -933,10 +934,14 @@ def test_peel_unit_two_file_impl_test(leerie, tmp_path):
     assert ("flow-runner.ts",) in by_files          # dense peeled to its own child
     assert ("flow-runner.test.ts",) in by_files      # test file is the sibling
     for c in children:
-        # edges inherited verbatim (copied, not aliased)
-        assert c["depends_on"] == ["feat-004"]
+        # edges inherited (copied, not aliased)
+        assert c["depends_on"][0] == "feat-004"
         assert c["provides"] == ["frame-target"]
         assert c["depends_on"] is not parent["depends_on"]
+    assert by_files[("flow-runner.ts",)]["depends_on"] == ["feat-004"]
+    assert by_files[("flow-runner.test.ts",)]["depends_on"] == \
+        ["feat-004", "feat-005-f1"]
+    assert parent["depends_on"] == ["feat-004"]
 
 
 def test_peel_unit_no_oversized_file_falls_through(leerie, tmp_path):
@@ -1513,3 +1518,115 @@ def test_splitter_children_inherit_the_split_gate(leerie, tmp_path):
     pointed = run({"change_shape": "point", "independent_sites": False})
     assert not [l for l in pointed if l.get("owned_region")]
     assert {l["id"] for l in pointed} == {"feat-007-1", "feat-007-2"}
+
+
+# ---------------------------------------------------------------------------
+# A test child runs after the code child it was peeled from (DESIGN §5½
+# *Oversized-file peel*). Run c33bef9e (0.44.11): the peel put the parent's
+# end-to-end test (bugfix-004-f2) beside the generator it tests
+# (bugfix-004-f1) in one wave; f2 blocked `upstream_missing` on f1's work.
+# ---------------------------------------------------------------------------
+
+def _wl(path: Path, n: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_lines(path, n)
+
+
+_C33_GEN = "src/scripts/recon-generate.ts"
+_C33_E2E = ("src/scripts/recon-generate-cart-then-update-writes-threaded-"
+            "e2e.test.ts")
+
+
+def _c33_parent():
+    return {"id": "bugfix-004", "title": "Keep marker-body writes ordered",
+            "success_criteria_seed": "writes ordered",
+            "files_likely_touched": [_C33_GEN, _C33_E2E],
+            "depends_on": ["bugfix-003"],
+            "requires": [{"tag": "mutating-body-capture-guaranteed",
+                          "extent": "in_plan"}],
+            "provides": ["ordered-writes-emitted"]}
+
+
+def test_peel_c33_test_child_runs_after_the_generator(leerie, tmp_path):
+    """c33bef9e's split shape, through the real peel and `_schedule`: f2 (the
+    e2e test) depends on f1 (the generator) and lands in a later wave; the
+    downstream verification subtask follows both."""
+    _wl(tmp_path / _C33_GEN, 9000)
+    _wl(tmp_path / _C33_E2E, 120)
+    f1, f2 = leerie._peel_oversized_file(_c33_parent(), tmp_path, 700, 8)
+    assert (f1["id"], f1["files_likely_touched"]) == ("bugfix-004-f1",
+                                                      [_C33_GEN])
+    assert f1["depends_on"] == ["bugfix-003"]
+    assert f2["depends_on"] == ["bugfix-003", "bugfix-004-f1"]
+    base = {"title": "t", "success_criteria_seed": "c", "provides": [],
+            "requires": []}
+    plan = {"domain": "bug-fixing", "status": "ready", "subtasks": [
+        {**base, "id": "bugfix-003", "files_likely_touched": [_C33_GEN],
+         "provides": ["mutating-body-capture-guaranteed"]},
+        f1, f2,
+        {**base, "id": "bugfix-006", "files_likely_touched": [_C33_E2E],
+         "depends_on": ["bugfix-004-f1", "bugfix-004-f2"],
+         "requires": [{"tag": "ordered-writes-emitted",
+                       "extent": "in_plan"}]}]}
+    _, waves = leerie._schedule([plan])
+    at = {sid: i for i, w in enumerate(waves) for sid in w}
+    assert at["bugfix-003"] < at["bugfix-004-f1"] < at["bugfix-004-f2"] \
+        < at["bugfix-006"]
+
+
+def test_peel_dense_test_file_runs_after_the_code(leerie, tmp_path):
+    """The mirror: the oversized file is the test, the rest is code."""
+    _wl(tmp_path / "big.test.ts", 2000)
+    _wl(tmp_path / "small.ts", 50)
+    parent = {"id": "feat-001", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["big.test.ts", "small.ts"]}
+    f1, f2 = leerie._peel_oversized_file(parent, tmp_path, 700, 8)
+    assert f1["depends_on"] == ["feat-001-f2"]
+    assert f2["depends_on"] == []
+
+
+@pytest.mark.parametrize("dense, rest", [
+    ("big.ts", ["other.ts"]),                       # neither is a test
+    ("big.test.ts", ["other.spec.ts"]),             # both are tests
+    ("big.ts", ["tests/helpers.ts"]),               # a helper, not a test
+])
+def test_peel_without_a_test_signal_adds_no_edge(leerie, tmp_path, dense,
+                                                  rest):
+    _wl(tmp_path / dense, 2000)
+    for r in rest:
+        _wl(tmp_path / r, 50)
+    parent = {"id": "feat-001", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": [dense, *rest], "depends_on": ["x"]}
+    f1, f2 = leerie._peel_oversized_file(parent, tmp_path, 700, 8)
+    assert f1["depends_on"] == ["x"] and f2["depends_on"] == ["x"]
+
+
+def test_peel_reads_the_repositorys_test_file_globs(leerie, tmp_path):
+    """`test_file_globs` replaces the built-in shapes: a file only the
+    repository calls a test orders the peel; a built-in shape it does not
+    list no longer does."""
+    (tmp_path / ".leerie").mkdir()
+    (tmp_path / ".leerie" / "config.toml").write_text(
+        'test_file_globs = "checks/*.ts"\n')
+    _wl(tmp_path / "big.ts", 2000)
+    _wl(tmp_path / "checks" / "big_check.ts", 50)
+    parent = {"id": "feat-001", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["big.ts", "checks/big_check.ts"]}
+    f1, f2 = leerie._peel_oversized_file(parent, tmp_path, 700, 8)
+    assert f2["depends_on"] == ["feat-001-f1"]
+    _wl(tmp_path / "x.test.ts", 50)
+    parent["files_likely_touched"] = ["big.ts", "x.test.ts"]
+    f1, f2 = leerie._peel_oversized_file(parent, tmp_path, 700, 8)
+    assert f2["depends_on"] == []
+
+
+def test_peel_edge_fans_out_when_the_code_child_tiles(leerie, tmp_path):
+    """The dense child tiles into regions; the test sibling's edge on it is
+    remapped to every region leaf, never left dangling."""
+    leaves = _peel_leaves(leerie, tmp_path)
+    regions = sorted(l["id"] for l in leaves
+                     if l["files_likely_touched"] == ["flow-runner.ts"])
+    test_leaf = next(l for l in leaves
+                     if l["files_likely_touched"] == ["flow-runner.test.ts"])
+    assert len(regions) >= 2
+    assert sorted(test_leaf["depends_on"]) == regions
