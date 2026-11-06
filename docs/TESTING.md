@@ -742,9 +742,96 @@ with an `XDG_CACHE_HOME` inherited from outside, the agent lived beyond the HOME
 agent survived (review round 29 isolation F3).
 `tests/test_session_agent_guard.py` (1 test) runs a child session given an
 outside `XDG_CACHE_HOME` that starts the agent and does not stop it: the
-session fails, the agent was under the child's HOME, and none survives.
+child session exits 1, the agent was under the child's HOME, and none
+survives. What it asserts about the *wording* changed when the per-test guard
+below landed: the per-test guard reaches the agent first, so the session
+guard's own `conftest: ssh-agent(s)` line is no longer what a reader sees, and
+the test now pins that the leak is reported against a NAMED test
+(`test_inner.py::test_starts_leeries_agent`) instead. Asserting the session
+wording alone would land the fail-fast guard red while the leak was in fact
+caught earlier and better.
 Falsified: with the conftest before this, the agent's socket is under the
 outside directory and the test fails.
+
+**A leak fails the test that caused it, not just the session.** The session
+hook above is a poor first responder: under CI's `-n 4` it speaks only after
+the full suite (~23 min) and names a PID, not a test — so a leak arrives as
+`14188 passed, 161 skipped` plus `exit code 1`, a red check with no test to
+click through to — the shape that prompted `_no_ssh_agent_outlives_its_test`,
+observed on PR #322's branch runs (whose logs have since expired).
+`_no_ssh_agent_outlives_its_test` (`tests/conftest.py`, autouse) closes that:
+it fails the leaking test, by nodeid, at that test's own teardown.
+
+It attributes by DIFFING the agents present before and after the `yield`,
+never by absolute presence. CI's four xdist workers share one session HOME, so
+an agent another worker started is already there when a test begins; blaming
+it would fail an innocent test and, worse, stop an agent a legitimate
+agent-test is still using (`tests/test_require_fly_ssh_isolation.py`, whose
+own agents live under its `/tmp`-based `short_home` rather than
+`leerie_agent_dir()`, so the scan cannot reach them either way). Only the
+agents that test added are stopped, so one leak fails one test instead of
+cascading into every test after it. Measured during development: with a
+foreign agent (pid 14) already present and the test spawning its own (pid 16),
+the diff yields `[16]` alone.
+
+It scans argv (`ssh_agents_under`), not the `TEST_PROCESS_ENV` marker
+`kill_marked` uses, because `ssh-agent` is setgid: `/proc/<pid>/environ` is
+EACCES and the marker is unreadable. That is exactly why
+`_no_process_outlives_its_test` never caught this leak despite covering every
+other stray process.
+
+**A teardown scan must use the import-time bindings.** A scan called from an
+autouse fixture's teardown runs BEFORE the test's monkeypatches are undone
+(`monkeypatch` is one instance per test, torn down after every fixture set up
+later). Looked up at call time, `open` was the stub of
+`tests/test_repo_change_warn_default.py::test_fingerprint_never_reads_contents`,
+whose `no_open` raises `AssertionError` — which `ssh_agents_under`'s
+`except OSError` does not catch, so the scan errored that test's teardown on
+`test (3.10)` and `test (3.12)` of run 42177993710 (`1 error`, exit 1, on a
+`14188 passed` summary); that run's `test (3.11)` was cancelled before it
+could report. `ssh_agents_under` and `stop_ssh_agents_under` therefore read
+/proc through `_open`, `_os_listdir`, `_os_isdir` and kill through `_os_kill`,
+the bindings `_no_process_outlives_its_test`'s scan already used; both kill
+sites suppress `OSError`, not just `ProcessLookupError`, since a stubbed or
+permission-denied kill is not a reason to fail a teardown. The bindings sit
+above the first scan that uses them, and globals resolve at call time, so both
+scans share one set. Note the residual: `ssh_agents_under`'s `/bin/ps`
+fallback still calls the live `subprocess.run`, so a test stubbing that at
+teardown would blind the fallback the same way — harmless on CI (Linux,
+`/proc` present) but not the same guarantee as the `/proc` arm.
+
+**A unit test reached the public internet and ran an installer.**
+`tests/test_seed_repo_sh.py::test_seed_repo_fails_when_flyctl_missing` pins
+`PATH="/usr/bin:/bin"` to make flyctl absent, which is its premise. Without
+`LEERIE_NONINTERACTIVE=1` that premise destroyed itself: `require_flyctl`
+(`scripts/remote/lib.sh`) took its auto-install arm instead of its hint arm,
+and since `run_bash` passes `input=None` the child inherited pytest's stdin at
+EOF, so `_require_flyctl_install`'s `read -r ans` returned empty and
+`case "${ans:-Y}"` read it as **yes** (measured: `READ_RC=1 ANS=[]
+DECISION=INSTALL`). The test really ran `curl -L https://fly.io/install.sh |
+sh`; flyctl was then ON PATH, so `_seed_repo_preflight` passed, control
+reached `require_fly_ssh` -> `_leerie_fly_agent_ensure`, and the private agent
+it spawns daemonized and outlived the session. The test stayed GREEN
+throughout — its assertion was satisfied by flyctl's *auth* failure, not its
+absence — so only the session guard's exit 1 showed anything was wrong. This
+is the same hazard as the `finalize` dispatch defect recorded further below,
+where a local run fell into the Fly path and `require_flyctl` offered to
+install flyctl for a run that never touched Fly. The fix is per-test, not
+class-wide: any future test reaching `require_flyctl` without
+`LEERIE_NONINTERACTIVE=1` repeats it.
+
+**This class of failure needs a Linux container to reproduce.** macOS cannot:
+the session HOME is `tempfile.mkdtemp`'s `/var/folders/...`, so the agent
+socket path measures 109 bytes against `sun_path`'s ~104 and the spawn cannot
+bind (`OSError: AF_UNIX path too long`). On CI's `/tmp`-based HOME the same
+path is 65 bytes (`/tmp/leerie-test-home-` + `mkdtemp`'s 8 characters +
+`/.cache/leerie/agent/ssh-agent.sock`), so it binds and survives. That single
+fact is the whole local-green / CI-red split, and it is why
+`tests/test_require_fly_ssh_isolation.py` needs its `/tmp`-based `short_home`
+fixture. Reproduce on `ubuntu:24.04` carrying CI's dependency set
+(`requirements.txt` plus pytest, pytest-cov, pytest-timeout, pytest-xdist,
+jsonschema); flyctl is absent from GitHub's `ubuntu-latest` image, so CI takes
+the flyctl-absent path above.
 
 **No test writes the user's real `~/.leerie`.** The same hook fails the
 session when the user's real `~/.leerie` (`REAL_HOME`) gains a top-level

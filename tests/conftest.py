@@ -1398,7 +1398,11 @@ def _no_ssh_agent_outlives_its_test(request):
     `kill_marked` uses: `ssh-agent` is setgid, so `/proc/<pid>/environ` is
     EACCES and the marker is unreadable -- which is why
     `_no_process_outlives_its_test` never caught this leak. `ssh_agents_under`
-    also has a `/bin/ps` fallback, so it works where there is no /proc.
+    also has a `/bin/ps` fallback, so it works where there is no /proc --
+    though that arm calls the live `subprocess.run`, so unlike the /proc arm
+    (which reads through the import-time `_open`/`_os_listdir`/`_os_isdir`) a
+    test stubbing `subprocess.run` would blind it at teardown. Harmless on
+    CI, which is Linux and always has /proc.
 
     Only the agents this test added are stopped, so one leak fails one test
     instead of cascading into every test after it.
