@@ -1372,6 +1372,54 @@ def _no_process_outlives_its_test(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_ssh_agent_outlives_its_test(request):
+    """Fail the test that started leerie's private ssh-agent and left it
+    running, naming it, rather than leaving the whole session to fail at
+    `pytest_sessionfinish` with a bare PID.
+
+    The session guard is a poor first responder: under CI's `-n 4` it speaks
+    only after the full suite (~23 min) and names a PID, not a test. One
+    `test_seed_repo_sh.py` test leaked for exactly that reason while every
+    job reported `14188 passed` and exit 1 -- a red check with no test to
+    click through to.
+
+    Attributes by DIFFING the agents present before and after, never by
+    absolute presence: CI's four xdist workers share one session HOME, so an
+    agent another worker started is already there when this test begins.
+    Blaming it would fail an innocent test and, worse, stop an agent a
+    legitimate agent-test is still using
+    (`tests/test_require_fly_ssh_isolation.py`).
+
+    Scans argv (`ssh_agents_under`), not the `TEST_PROCESS_ENV` marker
+    `kill_marked` uses: `ssh-agent` is setgid, so `/proc/<pid>/environ` is
+    EACCES and the marker is unreadable -- which is why
+    `_no_process_outlives_its_test` never caught this leak. `ssh_agents_under`
+    also has a `/bin/ps` fallback, so it works where there is no /proc.
+
+    Only the agents this test added are stopped, so one leak fails one test
+    instead of cascading into every test after it.
+    """
+    agent_dir = leerie_agent_dir()
+    before = set(ssh_agents_under(agent_dir))
+    yield
+    leaked = sorted(set(ssh_agents_under(agent_dir)) - before)
+    for pid in leaked:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+    if leaked:
+        pytest.fail(
+            f"{request.node.nodeid} started leerie's private ssh-agent "
+            f"{leaked} under {agent_dir} and left it running (stopped now). "
+            "It daemonizes, so nothing else stops it: a test whose subject "
+            "is not the agent must not reach `_leerie_fly_agent_ensure`'s "
+            "spawn (stub it with `stub_helpers._make_stub_ssh_agent`, or "
+            "keep flyctl absent with LEERIE_NONINTERACTIVE=1 so "
+            "`require_flyctl` takes its hint arm instead of installing it), "
+            "and a test that starts one on purpose stops it by PID.",
+            pytrace=False)
+
+
+@pytest.fixture(autouse=True)
 def _quiet_host_pressure(request, monkeypatch):
     """The B* confirm gate (`_confirm_gate`) waits, up to
     `confirm_gate_wait_sec` (300 s) per confirm, for the HOST's CPU pressure

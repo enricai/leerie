@@ -184,13 +184,32 @@ def test_seed_repo_fails_without_user_repo():
 
 
 def test_seed_repo_fails_when_flyctl_missing():
-    """seed_repo returns 1 with an actionable error when flyctl is absent."""
+    """seed_repo returns 1 with an actionable error when flyctl is absent.
+
+    `LEERIE_NONINTERACTIVE=1` is what keeps this test's premise true. Without
+    it `require_flyctl` (lib.sh) takes its auto-install arm instead of the
+    hint arm: `run_bash` merges onto `os.environ` and leaves stdin open, so
+    the `Run it now? [Y/n]` prompt read as yes and the test actually ran
+    `curl -L https://fly.io/install.sh | sh`. flyctl then WAS on PATH, so
+    `_seed_repo_preflight` passed, control reached `require_fly_ssh` ->
+    `_leerie_fly_agent_ensure`, and the private ssh-agent it spawns
+    daemonized and outlived the session -- failing the whole run at
+    conftest's `pytest_sessionfinish` guard with no failing test to point at
+    (CI exit 1 on a `14188 passed` summary). The assertions below passed
+    throughout, on flyctl's *auth* failure rather than its absence.
+
+    Not reproducible on macOS: the session HOME sits under `/var/folders/...`,
+    so the agent socket path exceeds sun_path (~104 bytes) and the spawn
+    cannot bind. On CI's `/tmp` it binds and survives.
+    """
     result = run_bash(
         f"source {SEED_SH}; seed_repo",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
             "USER_REPO": "/tmp",
             "PATH": "/usr/bin:/bin",  # no flyctl here
+            # Take require_flyctl's hint arm, never its installing one.
+            "LEERIE_NONINTERACTIVE": "1",
         },
     )
     assert result.returncode != 0
