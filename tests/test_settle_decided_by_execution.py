@@ -244,16 +244,26 @@ def test_cannot_verify_counts_only_when_execution_decided_everything(
 
     res = _settle(env)
 
-    assert res["status"] == "blocked", why
-    assert "satisfied-probe did not find" in res["blocker"]
+    # A gap re-drives; a `cannot_verify` execution does not answer settles
+    # `unconverged` at once (DESIGN §8 *A no-op the base already carries*).
+    # Neither is ever `complete`.
+    if verdict.get("unsatisfied_reason") == "cannot_verify":
+        assert res["status"] == "unconverged", why
+        assert env["st"].data["unconverged_subtasks"][SID]["kind"] == \
+            "undecidable_no_op"
+    else:
+        assert res["status"] == "blocked", why
+        assert "satisfied-probe found the criteria not met" in \
+            res["blocker"]
     assert SID not in (env["st"].data.get("dropped_subtasks") or {})
 
 
 def test_control_failing_verify_redrives_and_ends_unconverged(
         live, monkeypatch):
-    """`nothing_to_change` with a failing verify is re-driven, the probe is
-    never asked, and once the shared budget is spent it settles
-    `unconverged` and holds its dependent back."""
+    """`nothing_to_change` with a failing verify is re-driven once with the
+    command's output, the probe is never asked, and the same refuted claim
+    after that re-drive settles `unconverged` (`no_op_refuted`, DESIGN §8
+    *A no-op the base already carries*) and holds its dependent back."""
     env = live
     c = env["leerie"]
     _spec(env)
@@ -267,16 +277,13 @@ def test_control_failing_verify_redrives_and_ends_unconverged(
     assert seen == []
 
     st = env["st"]
-    for _ in range(env["caps"]["subtask_redrive_rounds"]):
-        assert c._redrive_allowed(st, env["caps"], SID)
-        n = c._consume_redrive(st, SID)
-        again = _settle(env, note=f"RE-DRIVE {n}: {first['blocker']}")
-        assert again["status"] == "blocked"
-    assert not c._redrive_allowed(st, env["caps"], SID)
-    assert len(calls) == 1 + env["caps"]["subtask_redrive_rounds"]
-
-    c._settle_unconverged(st, SID, first["blocker"],
-                          previous_status="blocked")
+    assert c._redrive_allowed(st, env["caps"], SID)
+    n = c._consume_redrive(st, SID)
+    again = _settle(env, note=f"RE-DRIVE {n}: {first['blocker']}")
+    assert again["status"] == "unconverged"
+    assert st.data["unconverged_subtasks"][SID]["kind"] == "no_op_refuted"
+    assert seen == []
+    assert len(calls) == 2
     assert st.data["subtask_status"][SID] == "unconverged"
     assert c._unconverged_predecessors(env["run_dir"], st, DEP) == [SID]
 
@@ -381,8 +388,10 @@ def test_a_command_over_part_of_a_criterion_does_not_settle_it(
         live12, monkeypatch):
     """r39e `test_r39e_settle_uncovered_file`: the 2-file argv passes, the
     probe could not run tests and says no passing command covers the seed
-    or the criterion in full. The claim re-drives, and the dependent is
-    not run on the broken file."""
+    or the criterion in full. The claim is never settled complete: it
+    settles `unconverged` as `undecidable_no_op` (DESIGN §8 *A no-op the
+    base already carries*), with zero commits, so the run is unconverged
+    and the dependent runs to test the claim with its own checks."""
     env = live12
     c = env["leerie"]
     _spec(env, files_likely_touched=list(ALL12))
@@ -394,8 +403,10 @@ def test_a_command_over_part_of_a_criterion_does_not_settle_it(
 
     res = _settle(env)
 
-    assert res["status"] == "blocked", res
-    assert "satisfied-probe did not find" in res["blocker"]
+    # Undecidable, not complete (DESIGN §8 *A no-op the base already
+    # carries*): no round is spent on it.
+    assert res["status"] == "unconverged", res
     st = env["st"].data
+    assert st["unconverged_subtasks"][SID]["kind"] == "undecidable_no_op"
     assert SID not in (st.get("dropped_subtasks") or {})
     assert st["subtask_status"].get(SID) != "complete"

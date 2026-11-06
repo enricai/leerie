@@ -24,6 +24,7 @@ def test_planner_subtasks_items_built_by_shared_helper(leerie):
         include_fixes_reported_symptom=True,
         include_change_shape=True,
         include_verify=True,
+        include_verification_only=True,
         include_claims=True,
     )
     assert json.dumps(items, sort_keys=True) == json.dumps(
@@ -40,7 +41,8 @@ def test_reconciler_added_subtasks_items_built_by_shared_helper(leerie):
 
 def test_splitter_children_items_built_by_shared_helper(leerie):
     items = leerie.SCHEMAS["splitter"]["properties"]["children"]["items"]
-    rebuilt = leerie._subtask_item_schema(include_requires=True)
+    rebuilt = leerie._subtask_item_schema(include_requires=True,
+                                          include_verify=True)
     assert json.dumps(items, sort_keys=True) == json.dumps(
         rebuilt, sort_keys=True)
 
@@ -77,12 +79,15 @@ def test_three_call_sites_are_not_independently_written_literals(leerie):
     assert "fixes_reported_symptom" not in reconciler_props
     assert "fixes_reported_symptom" not in splitter_props
 
-    # Settle by execution: only the planner types per-criterion commands; a
-    # split child or a reconciler bridge never claims verification-only.
+    # Settle by execution: the planner types per-criterion commands, and a
+    # split child carries its own (DESIGN §8 *A no-op the base already
+    # carries*); a split child or a reconciler bridge never claims
+    # verification-only.
     for field in ("verify", "verification_only"):
         assert field in planner_props
         assert field not in reconciler_props
-        assert field not in splitter_props
+    assert "verify" in splitter_props
+    assert "verification_only" not in splitter_props
 
 
 def test_planner_prompt_teaches_the_verify_fields(leerie):
