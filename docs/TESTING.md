@@ -816,9 +816,35 @@ throughout — its assertion was satisfied by flyctl's *auth* failure, not its
 absence — so only the session guard's exit 1 showed anything was wrong. This
 is the same hazard as the `finalize` dispatch defect recorded further below,
 where a local run fell into the Fly path and `require_flyctl` offered to
-install flyctl for a run that never touched Fly. The fix is per-test, not
-class-wide: any future test reaching `require_flyctl` without
-`LEERIE_NONINTERACTIVE=1` repeats it.
+install flyctl for a run that never touched Fly.
+
+**The class is closed session-wide, not per-test.** Fixing the one test left
+the class open: any other test reaching `require_flyctl` repeated it.
+`tests/conftest.py` therefore sets `LEERIE_NONINTERACTIVE=1` and
+`LEERIE_NO_RUNTIME_INSTALL=1` for every session, at import, before any test
+module loads. Both, because lib.sh gates on them separately:
+`LEERIE_NO_RUNTIME_INSTALL` skips only the install (`lib.sh:481`), while
+`LEERIE_NONINTERACTIVE` also declines the `flyctl auth login` prompt (`:503`).
+`setdefault`, so an operator debugging one arm locally can export a different
+value, and a test needing the install arm sets it in its own subprocess env.
+Deliberately NOT a session-wide no-op `ssh-agent` first on PATH, the other
+candidate: `tests/test_require_fly_ssh_isolation.py` needs a REAL agent and
+gates on `shutil.which("ssh-agent")`, so a stub ahead of it would silently
+hollow out the one file whose subject this is. The env knobs stop the install
+that leads to the spawn; `tests/stub_helpers.py::_make_stub_ssh_agent` stays
+the per-test tool for stubbing the spawn itself.
+`tests/test_no_test_installs_a_runtime.py` (4 tests) keeps it honest, and does
+it by EXECUTION rather than by structure: it sources `lib.sh` and runs
+`require_flyctl` with flyctl genuinely absent and tripwire `curl`/`wget` stubs
+first on PATH that record and fail any call, then pins the hint arm's own
+words (`flyctl not found on PATH`), rc 1, an unwritten tripwire log, and no
+`fly.io/install.sh` in the output. The other three pin that both knobs are
+armed (named separately, since one is not the other), that a child `bash`
+inherits them -- the property that makes them load-bearing rather than
+decorative -- and that no test asserts the prompting arm, which is the
+condition making the default safe. Falsified: with the two `setdefault` lines
+removed, 3 of the 4 fail, and the executing one fails showing `Run it now?
+[Y/n]` in the captured output -- the prompt firing and taking the install arm.
 
 **This class of failure needs a Linux container to reproduce.** macOS cannot:
 the session HOME is `tempfile.mkdtemp`'s `/var/folders/...`, so the agent
