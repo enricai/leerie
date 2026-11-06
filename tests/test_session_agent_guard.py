@@ -64,7 +64,15 @@ def test_a_leaked_agent_fails_the_session_whatever_xdg_cache_home_held():
                     if line.startswith("SOCK="))
         assert not Path(sock).is_relative_to(outside), sock
         assert r.returncode == 1, out
-        assert "conftest: ssh-agent(s)" in out, out
+        # The per-test guard (`_no_ssh_agent_outlives_its_test`) reaches the
+        # agent first and names the test that started it, so the session
+        # guard's own line is not what a reader sees any more. Both still
+        # fail the child session; what this test pins is that a leak is
+        # reported against a NAMED test, and that no agent survives either
+        # way. Asserting the session wording alone let the fail-fast guard
+        # land red while the leak was in fact caught earlier and better.
+        assert "test_inner.py::test_starts_leeries_agent" in out, out
+        assert "ssh-agent" in out, out
         assert ssh_agents_under(Path(sock).parent) == []
         assert ssh_agents_under(outside) == []
     finally:

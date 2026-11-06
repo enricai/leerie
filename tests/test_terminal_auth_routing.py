@@ -467,6 +467,8 @@ def test_handler_execution_survives_a_cleanup_that_raises(leerie):
         "log": logs.append,
         "_save_state_best_effort": fake_save,
         "_cleanup_on_abnormal_exit": raising_cleanup,
+        # The handler names a cleanup failure through `_exc_text` (#319).
+        "_exc_text": leerie._exc_text,
         "asyncio": asyncio,
         "repo_root": "/repo",
         "caps": {},
