@@ -8207,6 +8207,26 @@ bound, both measured on the first full local run under `--timeout=600`:
   miss -- is not in base macOS. Shipped without those guards, the bare
   `os.listdir("/proc")` raised `FileNotFoundError` inside the autouse
   teardown and so errored the teardown of every test on macOS.
+
+  A spawn is asynchronous in a way the pidfile does not cover, and the
+  test polls for that: `echo $!` reports the pid when `fork` returns and
+  `/proc/<pid>/stat` exists from that instant, but `/proc/<pid>/environ`
+  carries the marker only once `exec` has installed the new environment,
+  so a single scan in between sees a live, markerless process. That made
+  this test CI-flaky rather than wrong -- `assert {218511, 218512} <=
+  {218511}` on test (3.12) of run 42238184378 while (3.10) and (3.11) of
+  the same commit passed. Measured in an ubuntu:24.04 CI-parity container:
+  94 of 400 spawns (~24%) had at least one pid whose environ was not yet
+  readable at the instant the pidfile held both, and the failure
+  reproduces on a pristine main at 1 in 12 runs of the test, so it
+  predates the branch that surfaced it. `_marked()` polls
+  `processes_marked` until every pid is visible (10 s bound, 20 ms step),
+  which keeps the assertion exactly as strong -- both pids must still be
+  found THROUGH THEIR ENVIRONMENT, the property the test exists for --
+  instead of weakening it to one pid or sleeping a guessed interval.
+  Falsified: 0 failures in 25 container runs with the helper, against the
+  1-in-12 above without it. `kill_marked` needs no such change: it already
+  rescans for five rounds, for a fork between a scan and its kill.
 - **`needs_landlock` + `skip_without_landlock` (one owner,
   `tests/conftest.py`).** The kernel's Landlock ABI, read once at collection
   through the shim's own `abi()`. A test whose SUBJECT is the confinement
