@@ -70,6 +70,39 @@ def _pids(path: Path) -> list[int]:
     raise AssertionError(f"the spawned processes never wrote {path}")
 
 
+def _marked(pids: list[int], marker: str, within: float = 10.0) -> list[int]:
+    """`processes_marked(marker)` once it can see every pid in `pids`.
+
+    A spawn is asynchronous in a way `_pids` and `_alive` do not cover, and
+    asserting on one scan made this test flaky on CI rather than wrong:
+    `echo $!` reports the pid when `fork` returns, and `/proc/<pid>/stat`
+    exists from that moment, but `/proc/<pid>/environ` carries the marker
+    only once `exec` has installed the new environment. Scanning in between
+    sees a live, markerless process and the set comparison fails -- `assert
+    {218511, 218512} <= {218511}`, test (3.12) of run 42238184378, while
+    (3.10) and (3.11) of the same commit passed. Measured in an ubuntu:24.04
+    CI-parity container: 94 of 400 spawns (~24%) had at least one pid whose
+    environ was not yet readable at the instant the pidfile held both, and
+    the failure reproduces on a pristine main (1 in 12 runs of this test),
+    so it predates the change that surfaced it.
+
+    Polling is the fix rather than a sleep: it keeps the assertion exactly
+    as strong -- both pids must be found through their environment, which is
+    the property this test exists for -- and returns as soon as that is
+    true. The window is microseconds in practice; the generous bound only
+    has to beat a loaded CI host.
+    """
+    end = time.monotonic() + within
+    wanted = set(pids)
+    while True:
+        found = processes_marked(marker)
+        if wanted <= set(found):
+            return found
+        if time.monotonic() >= end:
+            return found
+        time.sleep(0.02)
+
+
 def test_kill_marked_finds_a_process_by_its_environment(tmp_path):
     """Neither parent, group nor session is the handle: the setsid child
     is in none of the test's, and both outlive the shell that started
@@ -82,7 +115,7 @@ def test_kill_marked_finds_a_process_by_its_environment(tmp_path):
                    env=env, check=True)
     pids = _pids(pidfile)
     assert all(_alive(p) for p in pids)
-    assert set(pids) <= set(processes_marked(marker))
+    assert set(pids) <= set(_marked(pids, marker))
     killed = kill_marked(marker)
     assert set(pids) <= set(killed)
     assert _gone(pids)

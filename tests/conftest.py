@@ -91,6 +91,38 @@ else:
     os.environ["PYTEST_LEERIE_REAL_HOME"] = REAL_HOME
     atexit.register(shutil.rmtree, _TEST_HOME, True)
 
+# No test installs a runtime over the network, and no test prompts. Set for
+# every session (not only the `else` branch above: a second import of this
+# module under another name must not leave a session un-armed), and
+# unconditionally, since no test asserts the prompting or installing arm --
+# `grep -rn 'Run it now' tests/` finds only prose.
+#
+# `require_flyctl` (scripts/remote/lib.sh) auto-installs flyctl when it is
+# absent, and `run_bash` leaves the child's stdin at pytest's, which is at
+# EOF: `read -r ans` then returns empty and `case "${ans:-Y}"` reads that as
+# YES, so the hint arm a reader expects was the installing arm in fact.
+# `tests/test_seed_repo_sh.py::test_seed_repo_fails_when_flyctl_missing` pinned
+# PATH without flyctl to assert it was missing and thereby ran
+# `curl -L https://fly.io/install.sh | sh`, after which flyctl WAS present,
+# preflight passed, and `require_fly_ssh` spawned the daemonizing private
+# ssh-agent that outlived the session. That test sets these itself; this is
+# the same arm for every other test that reaches the same code, since the
+# per-test fix does not generalise.
+#
+# Both knobs, because they are not the same gate (lib.sh:481, :503):
+# LEERIE_NO_RUNTIME_INSTALL is install-only, LEERIE_NONINTERACTIVE also
+# declines the `flyctl auth login` prompt. A test wanting either arm can still
+# override its own subprocess's env; `os.environ.setdefault` is deliberate so
+# an operator debugging one locally can export a different value.
+#
+# Not a PATH stub for `ssh-agent`: `tests/test_require_fly_ssh_isolation.py`
+# needs a REAL agent (it gates on `shutil.which("ssh-agent")`), so a
+# session-wide no-op first on PATH would silently hollow out the one file
+# whose subject this is. Env knobs stop the install that leads to the spawn;
+# `_make_stub_ssh_agent` remains the per-test tool for stubbing the spawn.
+os.environ.setdefault("LEERIE_NONINTERACTIVE", "1")
+os.environ.setdefault("LEERIE_NO_RUNTIME_INSTALL", "1")
+
 
 def _real_leerie_entries() -> set[str] | None:
     """The names in the user's real `~/.leerie` (read only, never written):
@@ -1398,7 +1430,11 @@ def _no_ssh_agent_outlives_its_test(request):
     `kill_marked` uses: `ssh-agent` is setgid, so `/proc/<pid>/environ` is
     EACCES and the marker is unreadable -- which is why
     `_no_process_outlives_its_test` never caught this leak. `ssh_agents_under`
-    also has a `/bin/ps` fallback, so it works where there is no /proc.
+    also has a `/bin/ps` fallback, so it works where there is no /proc --
+    though that arm calls the live `subprocess.run`, so unlike the /proc arm
+    (which reads through the import-time `_open`/`_os_listdir`/`_os_isdir`) a
+    test stubbing `subprocess.run` would blind it at teardown. Harmless on
+    CI, which is Linux and always has /proc.
 
     Only the agents this test added are stopped, so one leak fails one test
     instead of cascading into every test after it.
