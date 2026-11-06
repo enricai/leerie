@@ -1642,7 +1642,20 @@ split mechanism therefore separates by structural type:
     files is nothing to peel, and ≥2 oversized files is genuinely coupled
     multi-file work the LLM splitter should own — both fall through unchanged.
     The peeled children inherit the parent's edges exactly as the migration/tier
-    children do, so `_schedule()`/overlap/integration are unaffected.
+    children do, plus one: *a test child runs after the code child it was
+    peeled from.* When one child's files include a test file and the other's
+    do not — by the test-file classification leerie already uses for test
+    runs (`_is_test_case_file`, a test-shaped basename or the repository's
+    own `test_file_globs`), never by reading the subtask's prose — the test
+    child gains `depends_on` on the other. Run `c33bef9e` (0.44.11) is why:
+    the peel put `bugfix-004-f2`, the parent's end-to-end test, beside
+    `bugfix-004-f1`, the generator it tests, in one wave; f2 blocked
+    `upstream_missing` on f1's work twice and spent its re-drive rounds
+    where that work could not appear. When both children hold test files, or
+    neither does, there is no mechanical signal for an order, and none is
+    added: the children stay parallel as before. The edge costs a wave, the
+    price of the test running against the code it tests; a further split of
+    the code child fans the edge out to its leaves (`_remap_vanished_deps`).
 
 **`_recursive_decompose(subtask, depth) → list[leaf_subtasks]`** is the loop:
 

@@ -14391,6 +14391,20 @@ def _peel_oversized_file(subtask: dict, repo_root: Path,
         (f"{seed}\nScope: only these files — {', '.join(rest)}. A sibling "
          f"subtask owns {dense}.").strip(),
         newfile_owner_id=newfile_owner)
+    # A test child runs after the code child it was peeled from (DESIGN §5½
+    # *Oversized-file peel*): by leerie's own test-file classification of
+    # the paths, never the prose. Run c33bef9e's f2 (the end-to-end test)
+    # ran beside f1 (the generator it tests) and blocked `upstream_missing`.
+    # Both children holding tests, or neither, is no signal: no edge.
+    globs = resolve_test_file_globs(repo_root)
+    dense_tests = _is_test_case_file(dense, globs)
+    rest_tests = any(_is_test_case_file(f, globs) for f in rest)
+    if rest_tests and not dense_tests:
+        rest_child["depends_on"] = [*rest_child["depends_on"],
+                                    dense_child["id"]]
+    elif dense_tests and not rest_tests:
+        dense_child["depends_on"] = [*dense_child["depends_on"],
+                                     rest_child["id"]]
     return [dense_child, rest_child]
 
 
