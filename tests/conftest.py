@@ -149,6 +149,23 @@ def _home_is_never_the_users():
     _session_places_are_the_sessions()
 
 
+# What the teardown scans call, bound when this module is imported. A scan
+# runs at an autouse fixture's teardown, and that is before the test's
+# monkeypatches are undone: `monkeypatch` is one instance per test, set up by
+# the first autouse fixture that requests it, so it is torn down after every
+# fixture set up later. Looked up at call time, `open` was the stub of a test
+# that forbids reading files (tests/test_repo_change_warn_default.py's
+# `test_fingerprint_never_reads_contents`, whose `no_open` raises
+# AssertionError -- which `ssh_agents_under`'s `except OSError` does not
+# catch, so it errored that test's teardown on every 3.10 run), and any test
+# patching `os.listdir`, `os.stat` or `os.kill` would have blinded or broken
+# a scan the same way.
+_open = open
+_os_getpid, _os_getuid = os.getpid, os.getuid
+_os_isdir, _os_listdir, _os_stat = os.path.isdir, os.listdir, os.stat
+_os_kill, _os_waitpid = os.kill, os.waitpid
+
+
 def leerie_agent_dir() -> Path:
     """The directory `_leerie_fly_agent_ensure` (scripts/remote/lib.sh)
     puts leerie's private agent's socket in, derived as it derives it."""
@@ -165,12 +182,12 @@ def ssh_agents_under(directory: str | os.PathLike) -> list[int]:
     ssh-agent -k` stops nothing without `SSH_AGENT_PID`)."""
     prefix = os.fspath(directory).rstrip("/") + "/"
     pids = []
-    if os.path.isdir("/proc"):
-        for entry in os.listdir("/proc"):
+    if _os_isdir("/proc"):
+        for entry in _os_listdir("/proc"):
             if not entry.isdigit():
                 continue
             try:
-                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                with _open(f"/proc/{entry}/cmdline", "rb") as f:
                     argv = f.read().split(b"\0")
             except OSError:
                 continue
@@ -194,8 +211,8 @@ def stop_ssh_agents_under(directory: str | os.PathLike) -> list[int]:
     PIDs it stopped."""
     pids = ssh_agents_under(directory)
     for pid in pids:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, 15)
+        with contextlib.suppress(OSError):
+            _os_kill(pid, 15)
     return pids
 
 
@@ -1286,20 +1303,7 @@ def _restore_child_subreaper():
 TEST_PROCESS_ENV = "PYTEST_LEERIE_TEST_ID"
 
 
-# What the teardown scan calls, bound when this module is imported. The
-# scan runs at `_no_process_outlives_its_test`'s teardown, and that is
-# before the test's monkeypatches are undone: `monkeypatch` is one instance
-# per test, set up by the first autouse fixture that requests it (several
-# above this one do), so it is torn down after every fixture set up later,
-# this one included. Looked up at call time, `open` was the stub of a test
-# that forbids reading files (tests/test_repo_change_warn_default.py's
-# `test_fingerprint_never_reads_contents`, which then errored at teardown
-# on every run), and any test patching `os.listdir`, `os.stat` or `os.kill`
-# would have blinded or broken the scan the same way.
-_open = open
-_os_getpid, _os_getuid = os.getpid, os.getuid
-_os_isdir, _os_listdir, _os_stat = os.path.isdir, os.listdir, os.stat
-_os_kill, _os_waitpid = os.kill, os.waitpid
+# (The real bindings live above `ssh_agents_under`, which needs them too.)
 
 
 def processes_marked(marker: str) -> list[int]:
@@ -1404,8 +1408,9 @@ def _no_ssh_agent_outlives_its_test(request):
     yield
     leaked = sorted(set(ssh_agents_under(agent_dir)) - before)
     for pid in leaked:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGTERM)
+        # `_os_kill`, not `os.kill`: a test patching it would break this.
+        with contextlib.suppress(OSError):
+            _os_kill(pid, signal.SIGTERM)
     if leaked:
         pytest.fail(
             f"{request.node.nodeid} started leerie's private ssh-agent "
