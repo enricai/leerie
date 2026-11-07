@@ -974,6 +974,9 @@ STATE_FIELDS = (
     # Delivery re-drive (DESIGN §8 *Delivery re-drive*): rounds, groups,
     # pending control notes, trade pairs, conflict and contradictions.
     "delivery_redrive",
+    # Every worker round rolled back, with its reason (DESIGN §8 *A rollback
+    # says why*).
+    "round_rollbacks",
     # Delivery ratchet (DESIGN §8 *A repair that regresses met work is
     # rolled back*): the cached verifiability classification, the prior
     # evidence kept repairs re-verified, their intermittent regressions.
@@ -7228,6 +7231,7 @@ def _needs_human_detail_groups() -> dict[str, str]:
         CONFIRM_BUDGET_GAP_SOURCE:
             "Regression checks the run could not settle",
         FINAL_DIFF_GAP_SOURCE: "Regression checks the run could not settle",
+        ROLLBACK_GAP_SOURCE: "Work the run tried and rolled back",
     }
 
 
@@ -45645,11 +45649,12 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                 max_turns=60),
             branch=sub_branch, base=before_sha)
         if unclean:
-            await _restore_tree(worktree, before_sha,
-                                where=f"{sid} conformer rollback",
-                                branch=sub_branch)
-            warnings.append(f"conformer round {c_round}: "
-                            + _unclean_reason("the conformer", unclean))
+            why = _unclean_reason("the conformer", unclean)
+            await _roll_back_round(
+                st, worktree, before_sha, worker="conformer",
+                label=f"{sid} round {c_round}", reason=why,
+                where=f"{sid} conformer rollback", branch=sub_branch)
+            warnings.append(f"conformer round {c_round}: {why}")
             _record_unclean_tree(st, "conformer", f"{sid} round {c_round}",
                                  unclean)
             if last_res is not None:
@@ -45680,9 +45685,11 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         # side-channel and does not surface here.
         scope_err = await check_diff_scope(sid, worktree, subtask, st)
         if scope_err:
-            await _restore_tree(worktree, before_sha,
-                                where=f"{sid} conformer rollback",
-                                branch=sub_branch)
+            await _roll_back_round(
+                st, worktree, before_sha, worker="conformer",
+                label=f"{sid} round {c_round}",
+                reason=f"protected-path violation ({scope_err})",
+                where=f"{sid} conformer rollback", branch=sub_branch)
             warnings.append(f"conformer round {c_round}: protected-path "
                             f"violation reverted ({scope_err})")
             # The rollback just reverted every commit this round made, so
@@ -45786,9 +45793,12 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                 f"conformer round {c_round}: reverted/deleted "
                 f"{len(clobbered)} implementer-owned file(s): {clobbered}")
             if caps.get("strict_conformer"):
-                await _restore_tree(worktree, impl_head_sha,
-                                    where=f"{sid} conformer rollback",
-                                    branch=sub_branch)
+                await _roll_back_round(
+                    st, worktree, impl_head_sha, worker="conformer",
+                    label=f"{sid} round {c_round}",
+                    reason=("strict mode: it reverted or deleted the "
+                            f"implementer's files {clobbered}"),
+                    where=f"{sid} conformer rollback", branch=sub_branch)
                 warnings.append(
                     f"conformer round {c_round}: strict mode — rolled "
                     "conformer commits back to implementer HEAD to restore "
@@ -56974,20 +56984,16 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 final, final_sha = prev, prev_sha
 
         async def _undo_round(entry: dict) -> None:
-            ok = await _restore_tree(staging, entry["pre_sha"],
-                                     where="acceptance repair rollback",
-                                     branch=_compute_run_branch(st.run_id))
+            ok = await _roll_back_round(
+                st, staging, entry["pre_sha"], worker="acceptance repair",
+                label=f"round {entry['round']}",
+                reason=entry["rollback_reason"],
+                where="acceptance repair rollback",
+                branch=_compute_run_branch(st.run_id))
             entry["rolled_back"] = ok
-            if ok:
-                log(f"  acceptance repair round {entry['round']} "
-                    f"{entry['rollback_reason']} — its commits were reset "
-                    "away")
-            else:
+            if not ok:
                 entry["rollback_failed"] = True
                 gate["rollback_failed"] = True
-                log(f"  WARNING: acceptance repair round {entry['round']} "
-                    f"{entry['rollback_reason']} but resetting staging to "
-                    f"{entry['pre_sha'][:12]} FAILED — its commits remain")
             _save_gate()
 
         async def _round_unclean(rnd: int, round_pre: str | None,
@@ -57205,18 +57211,15 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
         if gate.get("rolled_back"):
             # Also the path a resume after the decision takes: the reset is
             # idempotent. Its result is checked, never assumed.
-            if await _restore_tree(staging, before_sha,
-                                   where="acceptance gate rollback",
-                                   branch=_compute_run_branch(st.run_id)):
-                log(f"  acceptance repair {gate.get('rollback_reason') or ''}"
-                    " — its commits were reset away; residual recorded")
+            if await _roll_back_round(
+                    st, staging, before_sha, worker="acceptance repair",
+                    label="whole gate",
+                    reason=gate.get("rollback_reason") or "no reason recorded",
+                    where="acceptance gate rollback",
+                    branch=_compute_run_branch(st.run_id)):
                 final = initial
             else:
                 gate["rollback_failed"] = True
-                log(f"  WARNING: acceptance repair "
-                    f"{gate.get('rollback_reason') or ''} but resetting staging "
-                    f"to {before_sha[:12] or '(unknown)'} FAILED — the "
-                    "repair's commits remain on the branch")
                 # `final` keeps describing the repair's tree: it is what
                 # ships.
     if (not gate.get("audited") and _acceptance_measured(final)
@@ -57497,6 +57500,69 @@ def _drop_lying_index(tree: str | Path, prefix: list[str],
     with contextlib.suppress(FileNotFoundError):
         os.unlink(idx)
     return True
+
+
+ROLLBACK_GAP_SOURCE = "round_rolled_back"
+
+
+def _record_round_rollback(st: "State", worker: str, label: str, reason: str,
+                           *, pre_sha: str, post_sha: str = "",
+                           landed: bool = True) -> None:
+    """Say why a worker's round was rolled back (DESIGN §8 *A rollback says
+    why*): a `round_rollbacks` row, a log line and a `Not verified by this
+    run` entry, all from the one reason. Keyed by worker, label and start
+    commit: a resume that finishes the same reset updates its row and entry
+    rather than listing the round twice, and keeps the head the first pass
+    read, which by then the reset has moved."""
+    if landed:
+        log(f"  {worker} {label}: rolled back to {pre_sha[:12] or '?'} — "
+            f"{reason}")
+    else:
+        log(f"  WARNING: {worker} {label}: rollback to {pre_sha[:12] or '?'} "
+            f"FAILED, its commits remain — {reason}")
+    data = getattr(st, "data", None)
+    if not isinstance(data, dict):
+        return
+    site = f"{worker} {label} {pre_sha}"
+    rows = list(data.get("round_rollbacks") or [])
+    prior = next((r for r in rows if isinstance(r, dict)
+                  and r.get("site") == site), None)
+    if prior is not None:
+        rows.remove(prior)
+        post_sha = str(prior.get("post_sha") or "") or post_sha
+    rows.append({"site": site, "worker": worker, "label": label,
+                 "reason": reason, "pre_sha": pre_sha, "post_sha": post_sha,
+                 "rolled_back": landed})
+    data["round_rollbacks"] = rows
+    # What the reviewer is to do first: `_PR_ENTRY_MAX` cuts the reason, and
+    # must not cut that.
+    what = ("check whether this PR still needs what it tried, since its "
+            "commits are not in the PR" if landed else
+            "its commits are STILL ON THE BRANCH, though the run decided to "
+            "drop them; review them before merging")
+    data["needs_human_verification"] = [
+        e for e in (data.get("needs_human_verification") or [])
+        if not (isinstance(e, dict) and e.get("source") == ROLLBACK_GAP_SOURCE
+                and e.get("site") == site)
+    ] + [{"source": ROLLBACK_GAP_SOURCE, "site": site,
+          "detail": f"{worker} {label}: {what}. Why: {reason}"}]
+    with contextlib.suppress(Exception):
+        st.save()
+
+
+async def _roll_back_round(st: "State", tree: str | Path, rev: str, *,
+                           worker: str, label: str, reason: str, where: str,
+                           branch: str | None) -> bool:
+    """Roll a worker's round back to `rev` (`_restore_tree`, whose `where`
+    names the step) and record why (`_record_round_rollback`). The one way
+    to take a round's work away: the reason is a required argument, so no
+    round is reset without one. Returns the reset's result."""
+    head = await _branch_head_sha(str(tree))
+    ok = await _restore_tree(tree, rev, where=where, branch=branch)
+    _record_round_rollback(st, worker, label, reason, pre_sha=rev,
+                           post_sha="" if head == rev else (head or ""),
+                           landed=ok)
+    return ok
 
 
 async def _restore_tree(tree: str | Path, rev: str, *, where: str,
@@ -60492,10 +60558,11 @@ def _redrive_verdict(F: dict, F1: dict, new_ids: list[str], *,
 # is not a line of code and is never in a span (`_heldout_pieces`), so a
 # value the test asserts — even one a formatter breaks over many lines —
 # is no span, and a span needs at least two code lines (review round 13
-# M1); four, because an honest sibling test
-# written in the same idiom shares at most a three-line header with it
-# (framework import, subject import, one client/fixture line), while a
-# copied case — signature, call, assertion and the line before it — is four.
+# M1); four, because a copied case — signature, call, assertion and the
+# line before it — is four. Length alone does not separate it from a sibling
+# in the same idiom, whose shared fixture can be longer (run d7c06fe3): what
+# does is that a window of lines the base already holds is dropped
+# (`_heldout_fingerprints`).
 _HELDOUT_SPAN_LINES = 4
 # Lines are read in pieces of at most this many bytes, on both sides alike,
 # so one huge line (an inline base64 fixture, a minified bundle) is never
@@ -60870,13 +60937,6 @@ def _span_digest(lines: Iterable[bytes]) -> bytes:
     return hashlib.blake2b(b"\n".join(lines), digest_size=16).digest()
 
 
-def _span_digests(lines: list[bytes], sizes: Iterable[int]
-                  ) -> dict[int, set[bytes]]:
-    """Every window of each length in `sizes` over `lines`, digested."""
-    return {n: {_span_digest(lines[i:i + n])
-                for i in range(len(lines) - n + 1)} for n in sizes}
-
-
 def _holds_heldout_span(pieces: Iterable[bytes],
                         prints: dict[int, frozenset[bytes]]) -> bool:
     """True when `pieces` (normalised lines, `_heldout_pieces`) hold one of
@@ -60901,13 +60961,14 @@ def _heldout_fingerprints(staging: Path, staged: list[dict],
     length: every window of `_HELDOUT_SPAN_LINES` consecutive normalised
     code lines (`_heldout_pieces`) of each staged file, or one window of
     all of a shorter file's when it has at least `_HELDOUT_SPAN_MIN`,
-    less every window `base_rev`'s tree already contains — a span the
-    repository has is its idiom, not the test. The base's candidates are
-    found by `git grep -l -F -f <file>` over the files' lines (a pattern
+    less every window all of whose lines `base_rev`'s tree already holds,
+    in any file and any order — such a span says nothing the repository
+    does not already say, so it is its idiom, not the test. The base's
+    candidates are found by `git grep -l -F -f <file>` over the files' lines (a pattern
     file, never argv) and read through one `git cat-file --batch`, at most
     `_HELDOUT_BASE_SCAN_MAX` bytes. A digest, never a value: a literal the
     test asserts matches nothing on its own."""
-    spans: dict[int, set[bytes]] = {}
+    windows: dict[int, set[tuple[bytes, ...]]] = {}
     lines_all: set[bytes] = set()
     for s_ in staged:
         for rel in s_["files"]:
@@ -60920,9 +60981,11 @@ def _heldout_fingerprints(staging: Path, staged: list[dict],
             n = min(_HELDOUT_SPAN_LINES, len(lines))
             if n < _HELDOUT_SPAN_MIN:
                 continue
-            spans.setdefault(n, set()).update(_span_digests(lines, [n])[n])
+            windows.setdefault(n, set()).update(
+                tuple(lines[i:i + n]) for i in range(len(lines) - n + 1))
             lines_all.update(lines)
-    if spans and base_rev and lines_all:
+    in_base: set[bytes] = set()
+    if windows and base_rev and lines_all:
         with tempfile.NamedTemporaryFile("wb", prefix="leerie-heldout-",
                                          suffix=".pat") as pat:
             pat.write(b"\n".join(sorted(lines_all)) + b"\n")
@@ -60953,10 +61016,11 @@ def _heldout_fingerprints(staging: Path, staged: list[dict],
                 body = out[nl + 1:nl + 1 + size]
                 pos = nl + 1 + size + 1
                 read += size
-                have = _span_digests(list(_bytes_pieces(body)), spans)
-                for n in spans:
-                    spans[n] -= have[n]
-    return {n: frozenset(v) for n, v in spans.items() if v}
+                in_base.update(lines_all.intersection(_bytes_pieces(body)))
+    prints = {n: frozenset(_span_digest(w) for w in v
+                           if not in_base.issuperset(w))
+              for n, v in windows.items()}
+    return {n: v for n, v in prints.items() if v}
 
 
 def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
@@ -62931,6 +62995,40 @@ def _redrive_key_text(key: str) -> str:
     return f"existing test `{key}`"
 
 
+def _redrive_rollback_reason(ge: dict) -> str:
+    """Every condition of a group's record that rolls it back, in words
+    (DESIGN §8 *A rollback says why*). `_run_delivery_redrive` reaches this
+    only when one holds, and a group can meet several: all are named, so a
+    reader never has to re-derive which one voided it."""
+    why: list[str] = []
+    if ge.get("committed_staged"):
+        why.append("its commits hold a shown held-out set's source or path: "
+                   + ", ".join(ge["committed_staged"]))
+    if ge.get("zero_progress"):
+        why.append("it fixed no failing case it could be measured on")
+    if ge.get("broke_cases") or ge.get("held_broke_cases"):
+        why.append(f"it broke {len(ge.get('broke_cases') or [])} shown and "
+                   f"{len(ge.get('held_broke_cases') or [])} held-back "
+                   "held-out case(s)")
+    if ge.get("ctl_new"):
+        why.append(f"it broke {len(ge['ctl_new'])} held-out control(s)")
+    if ge.get("new_failures"):
+        why.append(f"{len(ge['new_failures'])} test(s) newly fail: "
+                   + ", ".join(ge["new_failures"]))
+    gate = ge.get("gate") or {}
+    if gate.get("void"):
+        parts = [f"{k} {gate[k]}" for k in ("weakened", "schema", "ast")
+                 if gate.get(k)]
+        why.append("the escalation gate voided it"
+                   + (f": {'; '.join(parts)}" if parts else
+                      " (its check could not run)"))
+    if ge.get("ratchet_regressed"):
+        why.append("it made required item(s) "
+                   f"{ge['ratchet_regressed']}, met before it, unmet")
+    return "; ".join(why) or ("its verdict was worse: a held-back round that "
+                              "fixed no held-back case or broke a control")
+
+
 async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                 models: dict[str, str],
                                 efforts: dict[str, str | None]) -> None:
@@ -62957,11 +63055,13 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         # self-check directory (never in staging) goes too.
         _rmtree_owned(st.run_dir / "selfcheck")
         if flight.get("pre_sha"):
-            ok = await _restore_tree(staging, flight["pre_sha"],
-                                     where="re-drive rollback",
-                                     branch=_compute_run_branch(st.run_id))
-            log(f"  delivery re-drive: resumed — the interrupted group was "
-                f"{'rolled back' if ok else 'NOT rolled back (reset failed)'}")
+            await _roll_back_round(
+                st, staging, flight["pre_sha"],
+                worker="delivery re-drive",
+                label=f"r{flight.get('round')}g{flight.get('group')}",
+                reason="interrupted before it reached a verdict",
+                where="re-drive rollback",
+                branch=_compute_run_branch(st.run_id))
         rec.pop("in_flight", None)
         _save()
     head = await _branch_head_sha(str(staging))
@@ -63311,9 +63411,13 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 ge["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
                 _record_unclean_tree(st, "delivery re-drive implementer",
                                      f"r{rnd} g{gi}", unclean)
-                ok = await _restore_tree(staging, pre_sha,
-                                         where="re-drive rollback",
-                                         branch=_compute_run_branch(st.run_id))
+                ge["rollback_reason"] = _unclean_reason("its implementer",
+                                                        unclean)
+                ok = await _roll_back_round(
+                    st, staging, pre_sha, worker="delivery re-drive",
+                    label=f"r{rnd}g{gi}", reason=ge["rollback_reason"],
+                    where="re-drive rollback",
+                    branch=_compute_run_branch(st.run_id))
                 ge["rolled_back"] = ok
                 drove = True
                 prior_members += [m for m in members
@@ -63323,8 +63427,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 if not ok:
                     ge["rollback_failed"] = True
                     rec["rollback_failed"] = True
-                    log("  WARNING: delivery re-drive: rollback FAILED — "
-                        "stopping with the group's commits on staging")
+                    log("  WARNING: delivery re-drive: stopping with the "
+                        "group's commits on staging")
                     _save()
                     break
                 _save()
@@ -63436,14 +63540,17 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         ge["ratchet_regressed"] = list(rat["regressed"])
                         void = True
                 if v["worse"] or void:
-                    ok = await _restore_tree(
-                        staging, pre_sha, where="re-drive rollback",
+                    ge["rollback_reason"] = _redrive_rollback_reason(ge)
+                    ok = await _roll_back_round(
+                        st, staging, pre_sha, worker="delivery re-drive",
+                        label=f"r{rnd}g{gi}", reason=ge["rollback_reason"],
+                        where="re-drive rollback",
                         branch=_compute_run_branch(st.run_id))
                     ge["rolled_back"] = ok
                     if not ok:
                         ge["rollback_failed"] = True
-                        log("  WARNING: delivery re-drive: rollback FAILED — "
-                            "stopping with the group's commits on staging")
+                        log("  WARNING: delivery re-drive: stopping with the "
+                            "group's commits on staging")
                         rec["rollback_failed"] = True
                         rec.pop("in_flight", None)
                         _charge_redrive_time(st, time.monotonic() - t0)
@@ -63833,12 +63940,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                 effort=efforts.get("conformer"), max_turns=60),
             branch=_compute_run_branch(st.run_id), base=before_sha)
         if unclean:
-            await _restore_tree(staging, before_sha,
-                                where="final conformer rollback",
-                                branch=_compute_run_branch(st.run_id))
-            warnings.append(f"final conformer round {c_round}: "
-                            + _unclean_reason("the final conformer",
-                                              unclean))
+            why = _unclean_reason("the final conformer", unclean)
+            await _roll_back_round(
+                st, staging, before_sha, worker="final conformer",
+                label=f"round {c_round}", reason=why,
+                where="final conformer rollback",
+                branch=_compute_run_branch(st.run_id))
+            warnings.append(f"final conformer round {c_round}: {why}")
             _record_unclean_tree(st, "final conformer", f"round {c_round}",
                                  unclean)
             break
@@ -63889,9 +63997,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # (those were caught by the per-subtask gates).
         protected = await _protected_paths_since(str(staging), before_sha)
         if protected:
-            await _restore_tree(staging, before_sha,
-                                where="final conformer rollback",
-                                branch=_compute_run_branch(st.run_id))
+            await _roll_back_round(
+                st, staging, before_sha, worker="final conformer",
+                label=f"round {c_round}",
+                reason=f"protected-path violation (touched {protected})",
+                where="final conformer rollback",
+                branch=_compute_run_branch(st.run_id))
             warnings.append(f"final conformer round {c_round}: "
                             f"protected-path violation reverted "
                             f"(touched {protected})")
@@ -63911,9 +64022,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                 f"final conformer round {c_round}: reverted/deleted "
                 f"{len(clobbered)} integrated file(s): {clobbered}")
             if caps.get("strict_conformer"):
-                await _restore_tree(staging, staging_before_sha,
-                                    where="final conformer rollback",
-                                    branch=_compute_run_branch(st.run_id))
+                await _roll_back_round(
+                    st, staging, staging_before_sha,
+                    worker="final conformer", label=f"round {c_round}",
+                    reason=("strict mode: it reverted or deleted integrated "
+                            f"files {clobbered}"),
+                    where="final conformer rollback",
+                    branch=_compute_run_branch(st.run_id))
                 warnings.append(
                     f"final conformer round {c_round}: strict mode — "
                     "rolled conformer commits back to restore clobbered work")
@@ -64280,6 +64395,13 @@ async def _undo_interrupted_redrives(st: "State", leerie_dir: Path,
                 rec.pop("final", None)
                 if rec.get("rounds"):
                     rec["rounds"][-1]["interrupted"] = True
+        if pre:
+            # Either way of putting the branch back, or a failure of both.
+            _record_round_rollback(
+                st, f"{m.get('kind')} re-drive",
+                f"{sid} round {m.get('round')}",
+                "interrupted before it reached a verdict", pre_sha=pre,
+                landed=ok)
         log(f"  {sid}: {m.get('kind')} re-drive round {m.get('round')} was "
             "interrupted — "
             + (f"rolled back to {pre[:12]}, status {statuses.get(sid)}"
@@ -65010,8 +65132,12 @@ async def _redrive_uncovered_subtasks(
             # commit the subtask completed at, and its earlier result.
             tree = _subtask_worktree_path(leerie_dir, s)
             if pre[s]:
-                await _restore_tree(
-                    tree, pre[s], where=f"{s} coverage re-drive rollback",
+                await _roll_back_round(
+                    st, tree, pre[s], worker="coverage re-drive", label=s,
+                    reason=(f"it ended {r.get('status')}: "
+                            + (_pr_entry(r.get("blocker") or r.get("summary"))
+                               or "no reason recorded")),
+                    where=f"{s} coverage re-drive rollback",
                     branch=_compute_subtask_branch(st.run_id, s))
             st.data.setdefault("subtask_status", {})[s] = "complete"
             (st.data.get("unconverged_subtasks") or {}).pop(s, None)
@@ -68368,9 +68494,11 @@ async def _run_integration_judge_gate(
         log(f"  integration gate for {sid}: repair round {n} was "
             f"interrupted{' again — counted as spent' if again else ''} "
             f"(reset to {str(flight['pre'])[:12]})")
-        await _restore_tree(staging, str(flight["pre"]),
-                            where=f"integration gate for {sid} (resume)",
-                            branch=run_branch)
+        await _roll_back_round(
+            st, staging, str(flight["pre"]), worker="integration repair",
+            label=f"{sid} round {n}",
+            reason="interrupted before it reached a verdict",
+            where=f"integration gate for {sid} (resume)", branch=run_branch)
         if again:
             rec["repair_rounds"] = max(int(rec.get("repair_rounds") or 0), n)
         else:
@@ -68591,22 +68719,27 @@ async def _integration_repair_round(
     for w in warnings:
         log(f"  integrator-repair-{sid}: {w}")
 
-    async def _reset(verdict: str) -> dict:
-        await _restore_tree(staging, pre,
-                            where=f"integration repair round of {sid}",
-                            branch=_compute_run_branch(st.run_id))
+    async def _reset(verdict: str, why: str) -> dict:
+        await _roll_back_round(
+            st, staging, pre, worker="integration repair",
+            label=f"{sid} round {entry.get('round')}", reason=why,
+            where=f"integration repair round of {sid}",
+            branch=_compute_run_branch(st.run_id))
         entry["verdict"] = verdict
         return {"verdict": verdict}
 
     if ires is None:
-        return await _reset("crashed")
+        return await _reset("crashed", "its integrator crashed")
     status = ires.get("status")
     entry["integrator_status"] = status
     sup = [e for e in (ires.get("superseded") or []) if isinstance(e, dict)]
     if sup:
         rec.setdefault("superseded", []).extend(sup)
     if status in ("design-conflict", "failed"):
-        await _reset(status)
+        await _reset(status, f"its integrator reported {status}: "
+                     + (_pr_entry(ires.get("diagnosis")
+                                  or ires.get("resolution_summary"))
+                        or "no diagnosis given"))
         return {"verdict": status, "diagnosis": ires.get("diagnosis")
                 or ires.get("resolution_summary")}
     # I1 (DESIGN §8 *A worker leaves its tree clean*): untracked files
@@ -68638,7 +68771,9 @@ async def _integration_repair_round(
         log(f"  integration repair {sid}: round {entry['round']} failed its "
             f"mechanical checks ({', '.join(k for k, v in mech.items() if not v) or status}); "
             "reset")
-        return await _reset("mech_fail")
+        return await _reset("mech_fail", "it failed its mechanical checks ("
+                            + (", ".join(k for k, v in mech.items() if not v)
+                               or f"status {status}") + ")")
     tests = await _integration_test_failures(
         st, sid, staging, p1, p2, merge_sha, caps, log_path=log_path,
         parent_cache=parent_cache)

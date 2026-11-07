@@ -996,6 +996,10 @@ def test_resumed_in_flight_group_is_rolled_back(leerie, tmp_path,
                            "--is-ancestor", partial, "HEAD"]).returncode == 1
     assert _git(w.staging, "rev-parse", "HEAD~1") == pre
     assert "FIXED" in w.a_text("HEAD")
+    (row,) = w.st.data["round_rollbacks"]
+    assert (row["worker"], row["label"]) == ("delivery re-drive", "r1g0")
+    assert row["reason"] == "interrupted before it reached a verdict"
+    assert row["pre_sha"] == pre and row["post_sha"] == partial
     assert w.st.data["redrive_rounds"] == {"s1": 2}
 
 

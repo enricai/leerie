@@ -6888,6 +6888,13 @@ sample's probe never counts for the next.
   diff describes the tree that ships*): the real `setup-run.sh` resets a
   staging worktree a SIGKILL left registered — tracked edits, untracked
   files and a merge in progress go; ignored files and the run branch stay.
+- `tests/test_rollback_says_why.py` (9 tests, DESIGN §8 *A rollback says
+  why*, run d7c06fe3): the real re-drive over a real repository, a group
+  voided by a span named in its record, the log and the PR; a derived guard on
+  every direct caller of `_restore_tree`; the other sites' rows are pinned
+  beside the tests that already drive them. The span rule it drove (a window
+  of lines the base already holds is no span) is in
+  `tests/test_heldout_bytes_never_reach_history.py`.
 - `tests/test_one_restore.py` (8 tests, DESIGN §8 *One restore*, review
   round 15 M2): `_restore_tree` and `leerie_reset_worktree` are the one
   restore — write bits restored, a nested repository removed, and I1's

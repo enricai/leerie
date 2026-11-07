@@ -374,6 +374,10 @@ def test_a_redrive_that_does_not_complete_is_rolled_back(leerie, env):
     assert "blocked" not in env["st"].data
     assert rec["final"] == "rolled_back"
     assert rec["rolled_back"] == {"status": "blocked", "reason": "gave up"}
+    (row,) = env["st"].data["round_rollbacks"]
+    assert (row["worker"], row["label"]) == ("coverage re-drive", "feat-001")
+    assert row["reason"] == "it ended blocked: gave up"
+    assert row["pre_sha"] == done_at
 
 
 def test_settled_record_is_skipped_on_resume(leerie, env):
