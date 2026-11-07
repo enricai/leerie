@@ -55656,9 +55656,11 @@ def _scope_judge_counted(out: dict, haystack: str, names: list[str],
     widened to the hull of the verified ranges of its unit it overlaps. A
     case counts when it failed, its origin is not `other_scenario`, its own
     `span_quote` verifies, and every param naming a verified range of the
-    same unit lies inside that hull (any other param is neutral). Returns
-    `{case id: {origin, in_range, quote_ok, counted}}` for the cases the
-    judge typed."""
+    same unit lies inside that hull (any other param is neutral). A failing
+    case the judge left untyped counts (`typed` False): an omission is the
+    judge's, never evidence of a variant. Returns `{case id: {origin,
+    in_range, quote_ok, typed, counted}}` for the cases the judge typed and
+    the failing ones it did not."""
     ranges: list[dict] = []
     for r in out.get("report_ranges") or []:
         if not isinstance(r, dict):
@@ -55704,9 +55706,15 @@ def _scope_judge_counted(out: dict, haystack: str, names: list[str],
         name = names[idx]
         verdicts[name] = {
             "origin": origin, "in_range": in_range, "quote_ok": quote_ok,
+            "typed": True,
             "counted": (name in failing and origin in SCOPE_ORIGINS
                         and origin != "other_scenario" and in_range
                         and quote_ok)}
+    for name in names:
+        if name in failing and name not in verdicts:
+            verdicts[name] = {"origin": None, "in_range": True,
+                              "quote_ok": False, "typed": False,
+                              "counted": True}
     return verdicts
 
 
