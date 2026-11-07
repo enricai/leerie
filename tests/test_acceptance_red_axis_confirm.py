@@ -118,16 +118,18 @@ def test_redrive_test_ids_never_runs_a_forbidden_command(leerie, tmp_path,
     st = _st(leerie, tmp_path, repo,
              process_constraints={"forbidden_commands": [PYTEST]})
     ran: list[str] = []
-    real = leerie._capture_failing_test_ids
+    real = leerie._run_streaming
 
-    async def spy(tree, cmd, *a, **kw):
-        ran.append(cmd)
-        return await real(tree, cmd, *a, **kw)
-    monkeypatch.setattr(leerie, "_capture_failing_test_ids", spy)
+    async def spy(cmd, **kw):
+        ran.append(" ".join(cmd))
+        return await real(cmd, **kw)
+    monkeypatch.setattr(leerie, "_run_streaming", spy)
     caps = dict(leerie.DEFAULT_CAPS)
     got = asyncio.run(leerie._redrive_test_ids(st, caps, repo, "ids0"))
     assert got is None and ran == []
-    # Allowed, it runs the repository's command as before.
+    # Allowed, it runs the repository's command as before: once, the verdict
+    # and the IDs from the same run.
     st.data.pop("process_constraints")
     got = asyncio.run(leerie._redrive_test_ids(st, caps, repo, "ids1"))
-    assert got is not None and got["ids"] == [] and ran == [PYTEST]
+    assert got is not None and got["ids"] == []
+    assert len(ran) == 1 and PYTEST in ran[0]
