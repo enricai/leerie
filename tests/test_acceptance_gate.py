@@ -3097,6 +3097,9 @@ def test_a_repair_that_breaks_the_install_is_rolled_back(
     assert gate["rolled_back"] is True
     assert gate["rollback_reason"] == "left the held-out sets unmeasurable"
     assert _git(staging, "rev-parse", "HEAD") == before
+    (row,) = st.data["round_rollbacks"]
+    assert (row["worker"], row["label"]) == ("acceptance repair", "whole gate")
+    assert row["reason"] == "left the held-out sets unmeasurable"
     assert gate["residual"]["failing_sets"] == 5
 
 

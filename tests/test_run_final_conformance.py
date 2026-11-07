@@ -601,6 +601,10 @@ def test_final_conformer_left_dirty_is_rolled_back_and_unconverged(
                for w in block["warnings"]), block["warnings"]
     assert env["st"].data["unclean_trees"][
         "final conformer:round 0"]["lines"] == ["?? helper.py"]
+    (row,) = env["st"].data["round_rollbacks"]
+    assert (row["worker"], row["label"]) == ("final conformer", "round 0")
+    assert row["pre_sha"] == before and "?? helper.py" in row["reason"]
+    assert row["post_sha"] not in ("", before)
     assert c._decide_outcome(env["st"], any_commits=True) == "unconverged"
 
 
@@ -635,6 +639,8 @@ def test_clobbered_owned_file_strict_mode_rolls_back_and_blocks(env):
     assert head_after == head_before, "strict rollback did not reset HEAD"
     assert (env["staging"] / "src.py").exists(), (
         "the clobbered implementer file must be restored")
+    (row,) = env["st"].data["round_rollbacks"]
+    assert "strict mode" in row["reason"] and "src.py" in row["reason"]
 
     block = env["st"].data["conformance"]["_final"]
     assert block["blocked"] is True

@@ -286,7 +286,7 @@ def test_the_redrive_records_a_kept_groups_unsettled_candidates(leerie):
     i_keep = src.index("_ratchet_kept(st, rat)")
     i_rec = src.index('rec.setdefault("kept_unsettled", [])')
     i_gap = src.index("_set_redrive_unsettled_gap(")
-    i_roll = src.index("ok = await _restore_tree(staging, pre_sha,")
+    i_roll = src.index('ge["rollback_reason"] = _redrive_rollback_reason(ge)')
     assert i_roll < i_keep < i_rec < i_gap
 
 

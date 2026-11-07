@@ -460,3 +460,116 @@ def test_a_fingerprinting_crash_leaves_nothing_in_staging(
     assert seen and DEFECT in seen[0]
     assert "test.ts" not in _git(w.staging, "status", "--porcelain",
                                  "--ignored", "--untracked-files=all")
+
+
+# --------------------------------------------------------------------------
+# Run d7c06fe3: a regression test sharing four fixture lines with a shown set
+# file voided the run's only re-drive group, which had fixed six held-back
+# cases. Every one of those lines was already in the repository, three of
+# them consecutively; only the fourth, on one line there, wrapped differently.
+# A span all of whose lines the repository holds says nothing it does not
+# already say.
+
+FIXTURE = ("const vocabulary: Vocab = {\n"
+           "  subject: /candidate/i,\n"
+           "  exclusions: [],\n"
+           "  table: [\n")
+SET_FILE = ("import { emit } from './gen';\n\n" + FIXTURE
+            + "    [/phone/i, 'MobilePhone'],\n  ],\n};\n\n"
+            "it('emits the phone field only this set names', () => {\n"
+            "  const out = emit('phone', vocabulary);\n"
+            "  expect(out.fields).toEqual(['MobilePhone']);\n"
+            "  expect(out.warnings).toHaveLength(0);\n"
+            "  expect(out.errors).toHaveLength(0);\n"
+            "  expect(out.notes).toHaveLength(0);\n"
+            "  expect(out.steps).toHaveLength(1);\n"
+            "});\n")
+HONEST = ("import { resolve } from './gen';\n\n" + FIXTURE
+          + "    [/country/i, 'Country'],\n  ],\n};\n\n"
+          "it('ignores the answer when matching the label', () => {\n"
+          "  expect(resolve('Country Code', vocabulary)).toBeNull();\n"
+          "});\n")
+
+
+def _idiom_repo(leerie, tmp_path, monkeypatch):
+    """A repository holding each fixture line, never the four in a row."""
+    s = _repo(tmp_path, monkeypatch)
+    (s / "tests" / "one.test.ts").write_text(
+        "const vocabulary: Vocab = {\n  subject: /candidate/i,\n"
+        "  exclusions: [],\n  table: [[/x/i, 'X']],\n};\n")
+    (s / "tests" / "two.test.ts").write_text(
+        "const other = {\n  table: [\n    [/y/i, 'Y'],\n  ],\n};\n")
+    _git(s, "add", "-A")
+    _git(s, "commit", "-qm", "the repository's own fixtures")
+    held = tmp_path / "held"
+    (held / "tests").mkdir(parents=True)
+    (held / "tests" / "h.test.ts").write_text(SET_FILE)
+    staged = _shown(leerie, [{
+        "index": 0, "dir": str(held), "defect_files": ["tests/h.test.ts"]}])
+    return s, _git(s, "rev-parse", "HEAD"), staged
+
+
+def _commit_file(s, rel, text):
+    (s / rel).write_text(text)
+    _git(s, "add", rel)
+    _git(s, "commit", "-qm", "a test")
+    return _git(s, "rev-parse", "HEAD")
+
+
+def test_a_fixture_of_lines_the_repository_holds_is_no_span(
+        leerie, tmp_path, monkeypatch):
+    s, base, staged = _idiom_repo(leerie, tmp_path, monkeypatch)
+    prints = leerie._heldout_fingerprints(s, staged, base)
+    head = _commit_file(s, "tests/honest.test.ts", HONEST)
+    assert leerie._history_heldout_hits(s, base, head, staged, prints) == []
+    # The same check with the base's lines out of reach: this was a hit.
+    naive = leerie._heldout_fingerprints(s, staged, "")
+    assert leerie._history_heldout_hits(s, base, head, staged, naive) == [
+        "tests/honest.test.ts"]
+
+
+def test_a_real_copy_of_a_case_is_still_caught(leerie, tmp_path, monkeypatch):
+    s, base, staged = _idiom_repo(leerie, tmp_path, monkeypatch)
+    prints = leerie._heldout_fingerprints(s, staged, base)
+    case = SET_FILE[SET_FILE.index("it('emits"):]
+    head = _commit_file(s, "tests/copied.test.ts", case)
+    assert leerie._history_heldout_hits(s, base, head, staged, prints) == [
+        "tests/copied.test.ts"]
+
+
+def test_a_whole_file_copy_is_still_caught(leerie, tmp_path, monkeypatch):
+    s, base, staged = _idiom_repo(leerie, tmp_path, monkeypatch)
+    prints = leerie._heldout_fingerprints(s, staged, base)
+    head = _commit_file(s, "tests/copied.test.ts", SET_FILE)
+    assert leerie._history_heldout_hits(s, base, head, staged, prints) == [
+        "tests/copied.test.ts"]
+
+
+def test_a_renamed_copy_is_caught_by_the_lines_a_rename_leaves(
+        leerie, tmp_path, monkeypatch):
+    """Lines compare exactly, so a rename costs the windows it touches and
+    no others, before and after this rule: an identifier renamed on one line
+    leaves the case's other run of four; renamed on all of them, none."""
+    s, base, staged = _idiom_repo(leerie, tmp_path, monkeypatch)
+    prints = leerie._heldout_fingerprints(s, staged, base)
+    case = SET_FILE[SET_FILE.index("it('emits"):]
+    one = case.replace("emit('phone'", "emitIt('phone'")
+    head = _commit_file(s, "tests/one.copy.test.ts", one)
+    assert leerie._history_heldout_hits(s, base, head, staged, prints) == [
+        "tests/one.copy.test.ts"]
+    every = _commit_file(s, "tests/every.copy.test.ts",
+                         case.replace("out", "res").replace("emit", "gen"))
+    assert leerie._history_heldout_hits(s, head, every, staged, prints) == []
+
+
+def test_one_line_the_repository_lacks_keeps_a_span(
+        leerie, tmp_path, monkeypatch):
+    """The correction's edge: all four lines held is idiom; three held and
+    one of the test's own is not (replay: c33bef9e r2g0, whose worker read
+    the helper it then shared a line with)."""
+    s, base, staged = _idiom_repo(leerie, tmp_path, monkeypatch)
+    prints = leerie._heldout_fingerprints(s, staged, base)
+    probe = tmp_path / "probe.ts"
+    probe.write_text("  subject: /candidate/i,\n  exclusions: [],\n"
+                     "  table: [\n    [/phone/i, 'MobilePhone'],\n")
+    assert _holds(leerie, probe, prints)

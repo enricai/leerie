@@ -279,6 +279,10 @@ def test_redrive_bash_made_file_left_uncommitted_ends_unconverged(
     assert not (w.staging / "src" / "helpers.ts").exists()
     rec = w.st.data["unclean_trees"]
     assert list(rec) == ["delivery re-drive implementer:r1 g0"]
+    (row,) = w.st.data["round_rollbacks"]
+    assert (row["worker"], row["label"]) == ("delivery re-drive", "r1g0")
+    assert row["reason"] == ge["rollback_reason"]
+    assert "src/helpers.ts" in row["reason"]
     assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
     assert any("src/helpers.ts" in r for r in w.st.data["outcome_reasons"])
 
@@ -354,6 +358,9 @@ def test_acceptance_repair_left_dirty_is_rolled_back_and_recorded(
     assert _git(staging, "rev-parse", "HEAD") == before
     assert not (staging / "scratch.py").exists()
     assert "acceptance repair:round 1" in st.data["unclean_trees"]
+    (row,) = st.data["round_rollbacks"]
+    assert (row["worker"], row["label"]) == ("acceptance repair", "round 1")
+    assert row["reason"] == "left its tree unclean" and row["pre_sha"] == before
 
 
 # --- the integrator -----------------------------------------------------------

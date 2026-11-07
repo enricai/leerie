@@ -262,6 +262,9 @@ def test_design_conflict_during_repair_backs_out(leerie, tmp_path,
     assert _run(leerie, st, staging, monkeypatch, w) is False
     assert "design-conflict" in \
         st.data["integration_gate"][SID]["fallback_reason"]
+    (row,) = st.data["round_rollbacks"]
+    assert row["worker"] == "integration repair"
+    assert row["reason"].startswith("its integrator reported design-conflict")
     assert _git(staging, "rev-parse", "HEAD").strip() == p1
 
 
@@ -291,6 +294,9 @@ def test_no_new_commit_is_a_spent_round_reset(leerie, tmp_path,
     rounds = st.data["integration_gate"][SID]["rounds"]
     assert rounds[0]["verdict"] == "mech_fail"
     assert rounds[0]["mech"]["new_commit"] is False
+    (row,) = st.data["round_rollbacks"]
+    assert row["reason"] == ("it failed its mechanical checks "
+                             "(new_commit, clean)")
     assert rounds[0]["mech"]["clean"] is False
     assert rounds[1]["verdict"] == "pass"
     assert _git(staging, "rev-parse", "HEAD^").strip() == merge

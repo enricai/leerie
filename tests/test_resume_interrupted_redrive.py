@@ -172,6 +172,10 @@ def test_the_reviewers_case_a_crash_in_a_coverage_session(
     # The round is not done: it is marked, and the record evaluated again.
     assert rec["rounds"][0].get("interrupted") is True
     assert rec["final"] == "covered"
+    (row,) = st2.data["round_rollbacks"]
+    assert (row["worker"], row["label"]) == ("coverage re-drive", "a round 1")
+    assert row["reason"] == "interrupted before it reached a verdict"
+    assert row["rolled_back"] is True
 
 
 def test_a_crash_in_a_blocked_session_is_rolled_back_and_retried(

@@ -7423,7 +7423,8 @@ present only when it has an entry:
   interleaving (`simulated_interleaving`), a blocker that names no
   resource, and audited fix sites resting on an untyped (`other`) change
   that the delivery gate did not settle (§8 *A site resting on an
-  untyped resolution is settled by the run*). Each is a limit on what the
+  untyped resolution is settled by the run*), and every worker round the
+  run rolled back, with why (§8 *A rollback says why*). Each is a limit on what the
   run measured, stated with its reason; the reviewer may check it, but
   nothing outside the repository is needed to.
 - `## Untested after re-drive` — changed lines that no test executes after
@@ -13761,6 +13762,23 @@ orchestrator's own (Fly's root-run subtree collection, §6½, is the one
 known producer) and stops the run there, with the lines. In shell it also checks out the expected branch
 (§8 *The final diff describes the tree that ships*, the resume).
 
+**A rollback says why.** A worker's round whose work is taken away — a
+conformer, acceptance-repair, delivery or coverage re-drive or integration
+repair round, whatever rolled it back, a crash included — is recorded with
+its reason in three places from one call: the run's state
+(`round_rollbacks`), the log, and the PR's *Not verified by this run*. The
+reason is an argument of the operation that rolls the round back
+(`_roll_back_round`), so a new rollback cannot be written without one. Run
+d7c06fe3 drove this: its only delivery re-drive group fixed six held-back
+cases and was reset for a span of its regression test, and neither the log
+nor the group's record said so; the reason had to be reconstructed by
+replaying the check. A PR that lacks work the run tried is the fact the
+reviewer needs, whether or not a later round did the same work, so the
+entry stays. Resets that take away no worker's round are not this: the
+falsifier's checkout between samples, a reaped implementer's uncommitted
+debris, and an integration merge restarted or backed out, which has its own
+record (§6 *When integration cannot succeed*).
+
 Superseded by this: the leftovers commit with its artifact-name list, its
 caps and its saved archive, the "Files a re-drive left uncommitted" PR
 entry, the conformers' advisory dirty-tree warnings, and the per-subtask
@@ -13932,12 +13950,33 @@ specification, and the code that makes the test pass has to contain them.
    specification however many lines a formatter breaks it over, and the
    fix has to contain it (review round 13 M1). A file shorter than four
    code lines is one span of all of them, and one with fewer than two has
-   none: one line is a value. A span the group's starting commit already
-   contains is dropped: it is the repository's idiom, not the test. Why
-   four: an honest sibling test written in the same idiom shares at most
-   a short header with it (the framework import, the subject import, one
-   client or fixture line), while a copied case — its signature, its call,
-   its assertion, and the line before it — does not. The input is bounded
+   none: one line is a value. A span all of whose lines the group's
+   starting commit already holds, in any file and any order, is dropped:
+   it says nothing the repository does not already say, so it is the
+   repository's idiom, not the test. Why four: a copied case — its
+   signature, its call, its assertion, and the line before it — is four,
+   and its title or its call is a line the repository does not have. Four
+   alone does not separate a copy from a sibling written in the same idiom:
+   the header and fixture such a test shares can run past three lines, which
+   is why the rule reads lines, not windows, of the base. Run d7c06fe3 drove
+   this: a regression test with its own subject and cases shared four
+   fixture lines with a shown set file, all four already in the repository,
+   three of them consecutive with the fourth wrapped differently, and its
+   group, which had fixed six held-back cases, was reset. The worker had
+   read that set file, so the shape may well have come from it; what it
+   carried over was nothing the repository lacked. Replayed over the
+   recorded rounds with the check's own functions, this rule takes re-drive
+   hits from 2 of 12 rounds to 1 and acceptance-repair hits from 6 of 48 to
+   1. No tool call of those six repair workers names a set directory, so
+   their hits were matches by idiom alone; the one left (a window with one
+   line of its own, a rename of `URLS` in an existing test) is a false match
+   this rule does not remove, on a round the check does not gate. The
+   re-drive hit it keeps is a worker that read the helper it then shared a
+   new line with. The rule gives up a copy built only from lines the
+   repository has: over 374 recorded set files copied whole none is lost, of
+   802 cases with their titles 799 are caught before and after, of 583 case
+   bodies with the title dropped 581 become 578, and of 600 cases with every
+   local renamed 102 become 100. The input is bounded
    (lines read in pieces of at most 4 KiB, 1 MiB of each set file, 64 MiB
    of the base), and the lines go to `git grep` through a pattern file,
    never the argument vector (review round 12 L1: a 160 KB inline base64

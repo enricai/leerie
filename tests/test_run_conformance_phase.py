@@ -1255,6 +1255,9 @@ def test_strict_clobber_rollback_neutralizes_repair_records(env):
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert any("strict mode" in w for w in warnings), warnings
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    (row,) = env["st"].data["round_rollbacks"]
+    assert row["worker"] == "conformer" and "strict mode" in row["reason"]
+    assert "src.py" in row["reason"] and row["rolled_back"] is True
     risks = c._collect_subtask_risks(
         {"production_evidence": {"exercised": False,
                                  "unexercisable_reason": "r"}},
@@ -1417,6 +1420,9 @@ def test_conformer_left_dirty_is_rolled_back_and_recorded(env, monkeypatch):
     assert not (wt / "notes.txt").exists()       # untracked files too
     rec = env["st"].data["unclean_trees"]["conformer:t1 round 0"]
     assert rec["lines"] == [" M src.py", "?? notes.txt"]
+    (row,) = env["st"].data["round_rollbacks"]
+    assert (row["worker"], row["label"]) == ("conformer", "t1 round 0")
+    assert row["pre_sha"] == before and "?? notes.txt" in row["reason"]
     risks = c._collect_subtask_risks(
         {"production_evidence": {"exercised": False,
                                  "unexercisable_reason": "r"}},
