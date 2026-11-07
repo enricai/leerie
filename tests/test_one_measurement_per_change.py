@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 import sys
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tests.conftest import relocate_into_run_repo  # noqa: E402
+from tests.conftest import run_git_cwd_first_stdout  # noqa: E402
 
 CMD = "python3 -m pytest -q -p no:cacheprovider tests"
 SCOPED = "python3 -m pytest -q -p no:cacheprovider {test_files}"
@@ -29,11 +29,6 @@ def _test_file(module: str | None, name: str, ok: str = "True") -> str:
     return f"{PREAMBLE}{imp}\ndef test_{name}():\n    assert {ok}\n"
 
 
-def _git(cwd, *a) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *a], capture_output=True,
-                          text=True, check=True).stdout.strip()
-
-
 class Run:
     """A repository with `hub.py` (reached by two tests), `leaf.py` (by one)
     and one test that imports nothing, on a staging tree."""
@@ -45,9 +40,9 @@ class Run:
         repo = tmp_path / "repo"
         (repo / "tests").mkdir(parents=True)
         (repo / ".leerie").mkdir()
-        _git(repo, "init", "-q", "-b", "main")
-        _git(repo, "config", "user.email", "t@t")
-        _git(repo, "config", "user.name", "t")
+        run_git_cwd_first_stdout(repo, "init", "-q", "-b", "main")
+        run_git_cwd_first_stdout(repo, "config", "user.email", "t@t")
+        run_git_cwd_first_stdout(repo, "config", "user.name", "t")
         (repo / ".leerie" / "config.toml").write_text(
             f'test = "{CMD}"\ntest_scoped = "{SCOPED}"\n')
         (repo / ".gitignore").write_text(".leerie/\n__pycache__/\n")
@@ -62,16 +57,16 @@ class Run:
             _test_file("leaf", "leaf", "leaf.L == 1"))
         (repo / "tests" / "test_other.py").write_text(
             _test_file(None, "other", test_other_ok))
-        _git(repo, "add", "-A")
-        _git(repo, "commit", "-qm", "base")
-        base = _git(repo, "rev-parse", "HEAD")
+        run_git_cwd_first_stdout(repo, "add", "-A")
+        run_git_cwd_first_stdout(repo, "commit", "-qm", "base")
+        base = run_git_cwd_first_stdout(repo, "rev-parse", "HEAD")
         run_id = "fix-001-abcdef"
-        _git(repo, "branch", f"leerie/runs/{run_id}")
+        run_git_cwd_first_stdout(repo, "branch", f"leerie/runs/{run_id}")
         root = tmp_path / "state"
         self.run_dir = root / "runs" / run_id
         (self.run_dir / "logs").mkdir(parents=True)
         self.staging = self.run_dir / "worktrees" / "staging"
-        _git(repo, "worktree", "add", "-q", str(self.staging),
+        run_git_cwd_first_stdout(repo, "worktree", "add", "-q", str(self.staging),
              f"leerie/runs/{run_id}")
         st = leerie.State(root, run_id)
         st.data = {"task": "x", "working_branch": "main",
@@ -100,8 +95,8 @@ class Run:
             path = self.staging / name.replace("__", "/").replace("_DOT_", ".")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
-        _git(self.staging, "add", "-A")
-        _git(self.staging, "commit", "-qm", "round")
+        run_git_cwd_first_stdout(self.staging, "add", "-A")
+        run_git_cwd_first_stdout(self.staging, "commit", "-qm", "round")
 
     def measure(self, label: str = "m") -> dict:
         return asyncio.run(self.leerie._measure_axes(
@@ -158,7 +153,7 @@ def test_an_identical_tree_is_never_measured_again(run):
     assert len(run.runs) == n
     assert second["passed"] is True
     # A new commit with the same tree is the same measurement.
-    _git(run.staging, "commit", "-q", "--allow-empty", "-m", "empty")
+    run_git_cwd_first_stdout(run.staging, "commit", "-q", "--allow-empty", "-m", "empty")
     assert run.measure()["passed"] is True
     assert len(run.runs) == n
 
@@ -191,9 +186,9 @@ def test_a_leaf_change_reruns_its_tests_and_carries_the_rest(run):
     first = run.measure()
     assert "carried" not in first
     assert len(run.runs) == 1 and run.ran_whole()
-    tree0 = _git(run.staging, "rev-parse", "HEAD^{tree}")
+    tree0 = run_git_cwd_first_stdout(run.staging, "rev-parse", "HEAD^{tree}")
     run.commit(leaf_DOT_py="L = 1\n# touched\n")
-    tree1 = _git(run.staging, "rev-parse", "HEAD^{tree}")
+    tree1 = run_git_cwd_first_stdout(run.staging, "rev-parse", "HEAD^{tree}")
     res = run.measure()
     assert len(run.runs) == 2
     assert run.ran_files() == {"tests/test_leaf.py"}
@@ -256,15 +251,15 @@ def test_a_change_nobody_can_scope_invalidates_everything(run, name, text):
     assert run.ran_whole(), run.runs[-1]
     assert "carried" not in res
     # And the whole measurement replaces the ledger: every file on this tree.
-    tree = _git(run.staging, "rev-parse", "HEAD^{tree}")
+    tree = run_git_cwd_first_stdout(run.staging, "rev-parse", "HEAD^{tree}")
     assert {e["tree"] for e in run.ledger().values()} == {tree}
 
 
 def test_a_deleted_source_file_invalidates_everything(run):
     run.measure()
     (run.staging / "leaf.py").unlink()
-    _git(run.staging, "add", "-A")
-    _git(run.staging, "commit", "-qm", "gone")
+    run_git_cwd_first_stdout(run.staging, "add", "-A")
+    run_git_cwd_first_stdout(run.staging, "commit", "-qm", "gone")
     res = run.measure()
     assert run.ran_whole()
     assert "carried" not in res
@@ -312,11 +307,11 @@ def test_staleness_is_the_tree_diff_not_the_order_of_rounds(run):
 
 def test_a_rollback_to_a_measured_tree_reuses_it(run):
     run.measure()
-    good = _git(run.staging, "rev-parse", "HEAD")
+    good = run_git_cwd_first_stdout(run.staging, "rev-parse", "HEAD")
     run.commit(leaf_DOT_py="L = 2\n")
     assert run.measure()["passed"] is False
     n = len(run.runs)
-    _git(run.staging, "reset", "-q", "--hard", good)
+    run_git_cwd_first_stdout(run.staging, "reset", "-q", "--hard", good)
     assert run.measure()["passed"] is True
     assert len(run.runs) == n
     # The ledger still holds the red: a move on from here re-runs it.
@@ -330,7 +325,7 @@ def test_a_red_run_no_case_accounts_for_is_no_ledger(run):
     says nothing a file can carry, so the next measurement is whole."""
     leerie = run.leerie
     run.measure()
-    tree = _git(run.staging, "rev-parse", "HEAD^{tree}")
+    tree = run_git_cwd_first_stdout(run.staging, "rev-parse", "HEAD^{tree}")
     # Control: a green run with the same cases is entered.
     cases = [{"id": "tests/test_leaf.py :: t", "file": "tests/test_leaf.py",
               "status": "passed"}]
@@ -413,7 +408,7 @@ def test_a_scoped_runner_the_task_forbids_runs_the_whole_replacement(
                                "tests/test_leaf.py"]}
     assert asyncio.run(leerie._carried_selection(
         run.st, str(run.staging),
-        _git(run.staging, "rev-parse", "HEAD^{tree}"), CMD, None,
+        run_git_cwd_first_stdout(run.staging, "rev-parse", "HEAD^{tree}"), CMD, None,
         leerie._forbidden_specs(run.st.data), log_prefix="x")) is None
 
 
@@ -470,9 +465,9 @@ def test_final_rounds_and_phase_five_measure_only_what_changed(run, leerie,
 def js(tmp_path):
     d = tmp_path / "js"
     d.mkdir()
-    _git(d, "init", "-q", "-b", "main")
-    _git(d, "config", "user.email", "t@t")
-    _git(d, "config", "user.name", "t")
+    run_git_cwd_first_stdout(d, "init", "-q", "-b", "main")
+    run_git_cwd_first_stdout(d, "config", "user.email", "t@t")
+    run_git_cwd_first_stdout(d, "config", "user.name", "t")
     files = {
         "src/hub.ts": "export const h = 1;\n",
         "src/mid.ts": "import { h } from './hub';\nexport const m = h;\n",
@@ -493,9 +488,9 @@ def js(tmp_path):
         p = d / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text)
-    _git(d, "add", "-A")
-    _git(d, "commit", "-qm", "x")
-    return d, _git(d, "rev-parse", "HEAD")
+    run_git_cwd_first_stdout(d, "add", "-A")
+    run_git_cwd_first_stdout(d, "commit", "-qm", "x")
+    return d, run_git_cwd_first_stdout(d, "rev-parse", "HEAD")
 
 
 def test_reach_follows_the_closure(leerie, js):
