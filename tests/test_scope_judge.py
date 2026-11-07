@@ -101,7 +101,21 @@ def test_unverified_range_is_neutral_and_overlapping_ranges_merge(leerie):
 
 def test_bad_indices_and_bool_index_are_ignored(leerie):
     out = _out([_case(5), _case(True), _case(-1)])
-    assert leerie._scope_judge_counted(out, _hay(leerie), ["a"], {"a"}) == {}
+    v = leerie._scope_judge_counted(out, _hay(leerie), ["a", "b"], {"a"})
+    # Nothing typed `a`; it is reported as untyped, `b` (passing) not at all.
+    assert list(v) == ["a"] and v["a"]["typed"] is False
+
+
+def test_a_failing_case_the_judge_left_out_counts(leerie):
+    """The a2a825c2 shape: an answer typing the first cases only. The
+    left-out failing ones count, an omission never being a variant, while a
+    left-out passing case and a typed variant do not."""
+    out = _out([_case(0), _case(1, origin="other_scenario")])
+    v = leerie._scope_judge_counted(out, _hay(leerie), list("abcd"),
+                                    {"a", "b", "c"})
+    assert {n: v[n]["counted"] for n in v} == {
+        "a": True, "b": False, "c": True}
+    assert [v[n]["typed"] for n in "abc"] == [True, True, False]
 
 
 # --- has-work readers ----------------------------------------------------------

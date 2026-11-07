@@ -15470,7 +15470,11 @@ it failed at the own start, its origin is not `other_scenario`, every value
 it sets lies inside its range (milliseconds and seconds compared in one
 unit; overlapping verified ranges for one unit merge), and its
 `span_quote` — like every range's — is a substring of the task or report
-after NFC and whitespace normalisation. A set with no counted case is a
+after NFC and whitespace normalisation. A failing case the judge leaves out
+of its answer counts: an omission is the judge's, never evidence of a
+variant. It used to be dropped silently: in a2a825c2 (0.45.0) two of the
+judge's answers typed 5 of 10 and 1 of 10 cases, and the 14 failing cases
+they left out never counted. A set with no counted case is a
 **variant set**: it is still repaired in the same pass, but it never
 creates a run — the no-work settle, the already-fixed check, the
 satisfied-probe protection, the delivery re-drive and the run outcome read
